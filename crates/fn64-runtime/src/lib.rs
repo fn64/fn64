@@ -10,6 +10,7 @@
 //! inline; see `docs/DESIGN.md` section 6 for the full provenance table.
 
 pub mod device;
+pub mod dpc_schedule;
 pub mod executor;
 pub mod mesgqueue;
 pub mod mmio;
@@ -43,6 +44,11 @@ pub use device::{
     SP_SET_YIELD, SP_SET_YIELDED, SP_STATUS_BROKE, SP_STATUS_DMA_BUSY, SP_STATUS_DMA_FULL,
     SP_STATUS_HALT, SP_STATUS_INTERRUPT_ON_BREAK, SP_STATUS_SIGNAL_0, SP_STATUS_SIGNAL_1,
     SP_STATUS_SINGLE_STEP, SP_STATUS_YIELD, SP_STATUS_YIELDED,
+};
+pub use dpc_schedule::{
+    DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus, DpcCursor,
+    DpcQuantumId, DpcQuantumPlan, DpcScheduleError, DpcScheduledExecution, DpcScheduledPhase,
+    DpcTransactionId,
 };
 pub use executor::{
     EventRegistrationEvidenceSnapshot, Executor, ExecutorControlEvidenceSnapshot,

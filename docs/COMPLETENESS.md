@@ -235,14 +235,14 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 |---|---|---|---|
 | core/OS | `__osInitialize_common_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:46` |
 | core/OS | `osInitialize_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:57` |
-| core/OS | `osGetMemSize_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:82` |
+| core/OS | `osGetMemSize_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:83` |
 | core/OS | `osSetIntMask_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:11` |
-| core/OS | `__osDisableInt_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:94` |
-| core/OS | `__osRestoreInt_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:108` |
+| core/OS | `__osDisableInt_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:95` |
+| core/OS | `__osRestoreInt_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:109` |
 | core/OS | `osVirtualToPhysical_recomp` | **implemented** | `crates/fn64-abi/src/pi.rs:1931` |
-| core/OS | `osGetCount_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:147` |
-| core/OS | `osSetCount_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:166` |
-| core/OS | `__osSetFpcCsr_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:181` |
+| core/OS | `osGetCount_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:148` |
+| core/OS | `osSetCount_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:167` |
+| core/OS | `__osSetFpcCsr_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:182` |
 | core/OS | `osInvalDCache_recomp` | **implemented** | `crates/fn64-abi/src/cache.rs:16` |
 | core/OS | `osInvalICache_recomp` | **implemented** | `crates/fn64-abi/src/cache.rs:27` |
 | core/OS | `osWritebackDCache_recomp` | **implemented** | `crates/fn64-abi/src/cache.rs:36` |
@@ -273,8 +273,8 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | message queue | `osSendMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:33` |
 | message queue | `osJamMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:206` |
 | message queue | `osSetEventMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:171` |
-| timer | `osGetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:126` |
-| timer | `osSetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:197` |
+| timer | `osGetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:127` |
+| timer | `osSetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:198` |
 | timer | `osSetTimer_recomp` | **implemented** | `crates/fn64-abi/src/timer.rs:30` |
 | timer | `osStopTimer_recomp` | **implemented** | `crates/fn64-abi/src/timer.rs:69` |
 | PI/ROM DMA | `osCartRomInit_recomp` | **implemented** | `crates/fn64-abi/src/pi.rs:1699` |
@@ -320,10 +320,10 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | Rumble Pak | `osMotorInit_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1352` |
 | Rumble Pak | `osMotorStart_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1429` |
 | Rumble Pak | `osMotorStop_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1440` |
-| AI/audio | `osAiGetLength_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:114` |
-| AI/audio | `osAiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:88` |
-| AI/audio | `osAiSetFrequency_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:31` |
-| AI/audio | `osAiSetNextBuffer_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:156` |
+| AI/audio | `osAiGetLength_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:121` |
+| AI/audio | `osAiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:95` |
+| AI/audio | `osAiSetFrequency_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:38` |
+| AI/audio | `osAiSetNextBuffer_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:163` |
 | VI/DP | `osViSetXScale_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:143` |
 | VI/DP | `osViSetYScale_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:127` |
 | VI/DP | `osCreateViManager_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:33` |
@@ -335,10 +335,10 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | VI/DP | `osViSetMode_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:66` |
 | VI/DP | `osViSetEvent_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:48` |
 | VI/DP | `osDpSetNextBuffer_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:60` |
-| RSP/SP | `osSpTaskLoad_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:2807` |
-| RSP/SP | `osSpTaskStartGo_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:2916` |
-| RSP/SP | `osSpTaskYield_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:3201` |
-| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:2012` |
+| RSP/SP | `osSpTaskLoad_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:2945` |
+| RSP/SP | `osSpTaskStartGo_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:3054` |
+| RSP/SP | `osSpTaskYield_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:3339` |
+| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch.rs:2150` |
 | RSP/SP | `__osSpSetPc_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:12` |
 | Voice/ISV | `osVoiceSetWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:233` |
 | Voice/ISV | `osVoiceCheckWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:200` |

@@ -1538,6 +1538,144 @@ impl Drop for LiveDpcTransaction {
     }
 }
 
+/// Own the ABI side of an explicitly scheduled raw-DPC renderer transaction.
+///
+/// The renderer receives only a shadow image. Once it has been called, any
+/// error or malformed success poisons the schedule: the backend may already
+/// have consumed its private continuation, so retrying the same request would
+/// duplicate work. A valid acknowledgment publishes schedule state, shadow
+/// memory, continuation, and cumulative FullSync evidence as one transition.
+#[cfg(test)]
+struct ScheduledRawDpcTransaction {
+    execution: fn64_runtime::DpcScheduledExecution,
+    continuation: Option<fn64_render::RenderRawDpcContinuation>,
+    full_sync: fn64_render::DpFullSyncStatus,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum ScheduledRawDpcError {
+    Schedule(fn64_runtime::DpcScheduleError),
+    Backend(fn64_render::RenderError),
+    UnidentifiedFullSync,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScheduledRawDpcAdvance {
+    Reached {
+        at: fn64_runtime::Cycles,
+    },
+    Committed {
+        at: fn64_runtime::Cycles,
+        phase: fn64_runtime::DpcScheduledPhase,
+        full_sync: fn64_render::DpFullSyncStatus,
+    },
+}
+
+#[cfg(test)]
+impl ScheduledRawDpcTransaction {
+    fn new(execution: fn64_runtime::DpcScheduledExecution) -> Self {
+        Self {
+            execution,
+            continuation: None,
+            full_sync: fn64_render::DpFullSyncStatus::NotReached,
+        }
+    }
+
+    fn advance_one(
+        &mut self,
+        requested: fn64_runtime::Cycles,
+        backend: &mut dyn RenderBackend,
+        rdram: &mut [u8],
+        output_addr: u32,
+    ) -> Result<ScheduledRawDpcAdvance, ScheduledRawDpcError> {
+        let (at, action) = match self
+            .execution
+            .advance_to(requested)
+            .map_err(ScheduledRawDpcError::Schedule)?
+        {
+            fn64_runtime::DpcAdvance::Reached { at } => {
+                return Ok(ScheduledRawDpcAdvance::Reached { at });
+            }
+            fn64_runtime::DpcAdvance::Blocked { at, action } => (at, action),
+        };
+
+        let step = self.continuation.take().map_or(
+            fn64_render::RawDpcStep::Start,
+            fn64_render::RawDpcStep::Resume,
+        );
+        let mut shadow = rdram.to_vec();
+        let ack = match backend.process_rdp_command_chunk(
+            &mut shadow,
+            fn64_render::RawDpcQuantum {
+                request: action,
+                output_addr,
+            },
+            step,
+        ) {
+            Ok(ack) => ack,
+            Err(error) => {
+                self.execution.poison();
+                return Err(ScheduledRawDpcError::Backend(error));
+            }
+        };
+        if ack.full_sync == fn64_render::DpFullSyncStatus::Unidentified {
+            self.execution.poison();
+            return Err(ScheduledRawDpcError::UnidentifiedFullSync);
+        }
+        let (status, continuation) = match ack.status {
+            fn64_render::RawDpcChunkStatus::Continue(token) => {
+                (fn64_runtime::DpcBackendQuantumStatus::Continue, Some(token))
+            }
+            fn64_render::RawDpcChunkStatus::Complete => {
+                (fn64_runtime::DpcBackendQuantumStatus::Complete, None)
+            }
+        };
+        if let Err(error) = self
+            .execution
+            .acknowledge(fn64_runtime::DpcBackendQuantumAck {
+                transaction: ack.transaction,
+                quantum: ack.quantum,
+                committed_through: ack.committed_through,
+                status,
+            })
+        {
+            self.execution.poison();
+            return Err(ScheduledRawDpcError::Schedule(error));
+        }
+
+        // No fallible work follows this point. These fields form the ABI's
+        // publication boundary for the already-validated backend result.
+        rdram.copy_from_slice(&shadow);
+        self.continuation = continuation;
+        if ack.full_sync == fn64_render::DpFullSyncStatus::Reached {
+            self.full_sync = fn64_render::DpFullSyncStatus::Reached;
+        }
+        Ok(ScheduledRawDpcAdvance::Committed {
+            at,
+            phase: self.execution.phase(),
+            full_sync: self.full_sync,
+        })
+    }
+
+    fn phase(&self) -> fn64_runtime::DpcScheduledPhase {
+        self.execution.phase()
+    }
+
+    fn cursor(&self) -> fn64_runtime::DpcCursor {
+        self.execution.cursor()
+    }
+
+    fn continuation(&self) -> Option<fn64_render::RenderRawDpcContinuation> {
+        self.continuation
+    }
+
+    fn full_sync(&self) -> fn64_render::DpFullSyncStatus {
+        self.full_sync
+    }
+}
+
 fn complete_committed_dpc(
     transaction: LiveDpcTransaction,
     full_sync: fn64_render::DpFullSyncStatus,
@@ -6723,5 +6861,469 @@ mod tests {
             Some(vec![0x34, 0x12, 0xfe, 0xff])
         );
         set_audio_digest_capture(false);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScheduledRawDpcReply {
+        BackendError,
+        WrongTransaction,
+        WrongQuantum,
+        WrongCursor,
+        Continue(fn64_render::DpFullSyncStatus),
+        Complete(fn64_render::DpFullSyncStatus),
+    }
+
+    struct ScheduledRawDpcBackend {
+        replies: std::collections::VecDeque<ScheduledRawDpcReply>,
+        calls: usize,
+        steps: Vec<fn64_render::RawDpcStep>,
+    }
+
+    impl ScheduledRawDpcBackend {
+        fn new(replies: impl IntoIterator<Item = ScheduledRawDpcReply>) -> Self {
+            Self {
+                replies: replies.into_iter().collect(),
+                calls: 0,
+                steps: Vec::new(),
+            }
+        }
+    }
+
+    impl RenderBackend for ScheduledRawDpcBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            unreachable!("scheduled raw-DPC test cannot dispatch an HLE task")
+        }
+
+        fn raw_dpc_progression(&self) -> fn64_render::RawDpcProgression {
+            fn64_render::RawDpcProgression::Acknowledged
+        }
+
+        fn process_rdp_command_chunk(
+            &mut self,
+            rdram: &mut [u8],
+            quantum: fn64_render::RawDpcQuantum,
+            step: fn64_render::RawDpcStep,
+        ) -> Result<fn64_render::RawDpcChunkAck, RenderError> {
+            self.calls += 1;
+            self.steps.push(step);
+            rdram[self.calls - 1] = 0xa0 + self.calls as u8;
+            let reply = self
+                .replies
+                .pop_front()
+                .expect("scheduled raw-DPC test exhausted backend replies");
+            let mut ack = fn64_render::RawDpcChunkAck {
+                transaction: quantum.request.transaction,
+                quantum: quantum.request.quantum,
+                committed_through: quantum.request.end,
+                status: fn64_render::RawDpcChunkStatus::Continue(
+                    fn64_render::RenderRawDpcContinuation::new(91),
+                ),
+                full_sync: fn64_render::DpFullSyncStatus::NotReached,
+            };
+            match reply {
+                ScheduledRawDpcReply::BackendError => Err(RenderError::Backend {
+                    backend: "scheduled-raw-dpc-test",
+                    reason: "injected failure after shadow mutation".into(),
+                }),
+                ScheduledRawDpcReply::WrongTransaction => {
+                    ack.transaction = fn64_runtime::DpcTransactionId::from_submission(
+                        fn64_runtime::DpcSubmission {
+                            token: quantum.request.transaction.get() + 1,
+                            source: quantum.request.start.source(),
+                            start: quantum.request.start.address(),
+                            end: quantum.request.end.address(),
+                        },
+                    );
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::WrongQuantum => {
+                    ack.quantum =
+                        fn64_runtime::DpcQuantumId::new(quantum.request.quantum.get() + 1);
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::WrongCursor => {
+                    ack.committed_through = quantum.request.start;
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::Continue(full_sync) => {
+                    ack.full_sync = full_sync;
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::Complete(full_sync) => {
+                    ack.status = fn64_render::RawDpcChunkStatus::Complete;
+                    ack.full_sync = full_sync;
+                    Ok(ack)
+                }
+            }
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    fn scheduled_raw_dpc_transaction() -> ScheduledRawDpcTransaction {
+        let source = fn64_runtime::DpcSubmissionSource::Rdram;
+        let cursor = |address| fn64_runtime::DpcCursor::new(source, address).unwrap();
+        ScheduledRawDpcTransaction::new(
+            fn64_runtime::DpcScheduledExecution::new(
+                fn64_runtime::DpcSubmission {
+                    token: 5,
+                    source,
+                    start: 0x100,
+                    end: 0x110,
+                },
+                fn64_runtime::Cycles::new(0),
+                vec![
+                    fn64_runtime::DpcQuantumPlan {
+                        at: fn64_runtime::Cycles::new(2),
+                        id: fn64_runtime::DpcQuantumId::new(1),
+                        start: cursor(0x100),
+                        end: cursor(0x108),
+                    },
+                    fn64_runtime::DpcQuantumPlan {
+                        at: fn64_runtime::Cycles::new(3),
+                        id: fn64_runtime::DpcQuantumId::new(2),
+                        start: cursor(0x108),
+                        end: cursor(0x110),
+                    },
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn malformed_or_failed_raw_dpc_backend_result_poisons_without_publication() {
+        use ScheduledRawDpcReply::{BackendError, WrongCursor, WrongQuantum, WrongTransaction};
+
+        for reply in [BackendError, WrongTransaction, WrongQuantum, WrongCursor] {
+            let mut transaction = scheduled_raw_dpc_transaction();
+            let start = transaction.cursor();
+            let mut backend = ScheduledRawDpcBackend::new([reply]);
+            let mut live = vec![0x11; 16];
+            let error = transaction
+                .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0)
+                .unwrap_err();
+            match error {
+                ScheduledRawDpcError::Backend(error) => {
+                    assert!(error.to_string().contains("injected failure"));
+                }
+                ScheduledRawDpcError::Schedule(_) => {}
+                ScheduledRawDpcError::UnidentifiedFullSync => {
+                    panic!("identity-mismatch cases cannot fail FullSync validation")
+                }
+            }
+            assert_eq!(live, vec![0x11; 16]);
+            assert_eq!(transaction.cursor(), start);
+            assert_eq!(transaction.continuation(), None);
+            assert_eq!(
+                transaction.phase(),
+                fn64_runtime::DpcScheduledPhase::Poisoned
+            );
+            assert!(matches!(
+                transaction.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,),
+                Err(ScheduledRawDpcError::Schedule(
+                    fn64_runtime::DpcScheduleError::Poisoned
+                ))
+            ));
+            assert_eq!(backend.calls, 1, "a poisoned transaction cannot retry work");
+        }
+    }
+
+    #[test]
+    fn raw_dpc_status_must_match_remaining_schedule_before_publication() {
+        let mut early = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([ScheduledRawDpcReply::Complete(
+            fn64_render::DpFullSyncStatus::NotReached,
+        )]);
+        let mut live = vec![0x22; 16];
+        assert!(matches!(
+            early.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0),
+            Err(ScheduledRawDpcError::Schedule(
+                fn64_runtime::DpcScheduleError::EarlyComplete { .. }
+            ))
+        ));
+        assert_eq!(live, vec![0x22; 16]);
+        assert_eq!(early.phase(), fn64_runtime::DpcScheduledPhase::Poisoned);
+
+        let mut final_continue = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::NotReached),
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::NotReached),
+        ]);
+        let mut live = vec![0x33; 16];
+        final_continue
+            .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0)
+            .unwrap();
+        let first_image = live.clone();
+        assert!(matches!(
+            final_continue.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,),
+            Err(ScheduledRawDpcError::Schedule(
+                fn64_runtime::DpcScheduleError::FinalContinue { .. }
+            ))
+        ));
+        assert_eq!(
+            live, first_image,
+            "the malformed final shadow stays private"
+        );
+        assert_eq!(
+            final_continue.phase(),
+            fn64_runtime::DpcScheduledPhase::Poisoned
+        );
+        assert_eq!(final_continue.continuation(), None);
+    }
+
+    #[test]
+    fn second_raw_dpc_backend_error_preserves_only_the_first_commit() {
+        let mut transaction = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::Reached),
+            ScheduledRawDpcReply::BackendError,
+        ]);
+        let mut live = vec![0x55; 16];
+
+        transaction
+            .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0)
+            .unwrap();
+        let first_image = live.clone();
+        assert_eq!(first_image[0], 0xa1);
+        assert_eq!(first_image[1], 0x55);
+        assert_eq!(
+            transaction.continuation(),
+            Some(fn64_render::RenderRawDpcContinuation::new(91))
+        );
+        assert_eq!(
+            transaction.full_sync(),
+            fn64_render::DpFullSyncStatus::Reached
+        );
+
+        assert!(matches!(
+            transaction.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0),
+            Err(ScheduledRawDpcError::Backend(_))
+        ));
+        assert_eq!(
+            backend.steps,
+            vec![
+                fn64_render::RawDpcStep::Start,
+                fn64_render::RawDpcStep::Resume(fn64_render::RenderRawDpcContinuation::new(91)),
+            ]
+        );
+        assert_eq!(live, first_image, "the second shadow stays unpublished");
+        assert_eq!(live[1], 0x55, "the second backend mutation stayed private");
+        assert_eq!(transaction.continuation(), None);
+        assert_eq!(
+            transaction.full_sync(),
+            fn64_render::DpFullSyncStatus::Reached,
+            "a rejected later quantum cannot erase prior committed FullSync evidence"
+        );
+        assert_eq!(
+            transaction.phase(),
+            fn64_runtime::DpcScheduledPhase::Poisoned
+        );
+        assert!(matches!(
+            transaction.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0),
+            Err(ScheduledRawDpcError::Schedule(
+                fn64_runtime::DpcScheduleError::Poisoned
+            ))
+        ));
+        assert_eq!(backend.calls, 2, "poison prevents a second-quantum retry");
+    }
+
+    #[test]
+    fn raw_dpc_full_sync_is_identified_and_sticky_across_valid_commits() {
+        let mut transaction = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::Reached),
+            ScheduledRawDpcReply::Complete(fn64_render::DpFullSyncStatus::NotReached),
+        ]);
+        let mut live = vec![0; 16];
+        for expected_phase in [
+            fn64_runtime::DpcScheduledPhase::Scheduled,
+            fn64_runtime::DpcScheduledPhase::Complete,
+        ] {
+            assert!(matches!(
+                transaction
+                    .advance_one(
+                        fn64_runtime::Cycles::new(10),
+                        &mut backend,
+                        &mut live,
+                        0,
+                    )
+                    .unwrap(),
+                ScheduledRawDpcAdvance::Committed {
+                    phase,
+                    full_sync: fn64_render::DpFullSyncStatus::Reached,
+                    ..
+                } if phase == expected_phase
+            ));
+        }
+
+        let mut unidentified = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([ScheduledRawDpcReply::Continue(
+            fn64_render::DpFullSyncStatus::Unidentified,
+        )]);
+        let mut live = vec![0x44; 16];
+        assert!(matches!(
+            unidentified.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,),
+            Err(ScheduledRawDpcError::UnidentifiedFullSync)
+        ));
+        assert_eq!(live, vec![0x44; 16]);
+        assert_eq!(
+            unidentified.phase(),
+            fn64_runtime::DpcScheduledPhase::Poisoned
+        );
+    }
+
+    #[test]
+    fn synthetic_scheduled_dpc_keeps_renderer_continuation_in_the_abi_lane() {
+        struct Backend;
+
+        impl RenderBackend for Backend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn observe_non_rdp_write16(
+                &mut self,
+                _write: fn64_render::NonRdpWrite16,
+            ) -> fn64_render::NonRdpWrite16Disposition {
+                fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+            }
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                unreachable!("synthetic raw-DPC test cannot dispatch an HLE task")
+            }
+
+            fn raw_dpc_progression(&self) -> fn64_render::RawDpcProgression {
+                fn64_render::RawDpcProgression::Acknowledged
+            }
+
+            fn process_rdp_command_chunk(
+                &mut self,
+                rdram: &mut [u8],
+                quantum: fn64_render::RawDpcQuantum,
+                step: fn64_render::RawDpcStep,
+            ) -> Result<fn64_render::RawDpcChunkAck, RenderError> {
+                let index = usize::try_from(quantum.request.start.address() - 0x100).unwrap();
+                rdram[index] = quantum.request.quantum.get() as u8;
+                let status = match step {
+                    fn64_render::RawDpcStep::Start => fn64_render::RawDpcChunkStatus::Continue(
+                        fn64_render::RenderRawDpcContinuation::new(77),
+                    ),
+                    fn64_render::RawDpcStep::Resume(token) if token.get() == 77 => {
+                        fn64_render::RawDpcChunkStatus::Complete
+                    }
+                    fn64_render::RawDpcStep::Resume(token) => {
+                        panic!("ABI supplied stale raw-DPC continuation {}", token.get())
+                    }
+                };
+                Ok(fn64_render::RawDpcChunkAck {
+                    transaction: quantum.request.transaction,
+                    quantum: quantum.request.quantum,
+                    committed_through: quantum.request.end,
+                    status,
+                    full_sync: fn64_render::DpFullSyncStatus::NotReached,
+                })
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        let source = fn64_runtime::DpcSubmissionSource::Rdram;
+        let cursor = |address| fn64_runtime::DpcCursor::new(source, address).unwrap();
+        let execution = fn64_runtime::DpcScheduledExecution::new(
+            fn64_runtime::DpcSubmission {
+                token: 5,
+                source,
+                start: 0x100,
+                end: 0x110,
+            },
+            fn64_runtime::Cycles::new(0),
+            vec![
+                fn64_runtime::DpcQuantumPlan {
+                    at: fn64_runtime::Cycles::new(2),
+                    id: fn64_runtime::DpcQuantumId::new(1),
+                    start: cursor(0x100),
+                    end: cursor(0x108),
+                },
+                fn64_runtime::DpcQuantumPlan {
+                    at: fn64_runtime::Cycles::new(3),
+                    id: fn64_runtime::DpcQuantumId::new(2),
+                    start: cursor(0x108),
+                    end: cursor(0x110),
+                },
+            ],
+        )
+        .unwrap();
+        let mut backend = Backend;
+        let mut transaction = ScheduledRawDpcTransaction::new(execution);
+        let mut live = vec![0u8; 16];
+
+        for (expected_at, expected_phase) in [
+            (2, fn64_runtime::DpcScheduledPhase::Scheduled),
+            (3, fn64_runtime::DpcScheduledPhase::Complete),
+        ] {
+            assert_eq!(
+                transaction
+                    .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,)
+                    .unwrap(),
+                ScheduledRawDpcAdvance::Committed {
+                    at: fn64_runtime::Cycles::new(expected_at),
+                    phase: expected_phase,
+                    full_sync: fn64_render::DpFullSyncStatus::NotReached,
+                }
+            );
+        }
+        assert_eq!(live[0], 1);
+        assert_eq!(live[8], 2);
+        assert_eq!(transaction.continuation(), None);
+        assert_eq!(
+            transaction.phase(),
+            fn64_runtime::DpcScheduledPhase::Complete
+        );
     }
 }
