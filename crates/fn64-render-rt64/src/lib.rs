@@ -1577,6 +1577,40 @@ impl Rt64Backend {
         }
     }
 
+    /// Process a non-ROM public legacy-S2DEX display list for negative evidence.
+    ///
+    /// This exists to prove bounded S2DEX2 adapter overlays do not accidentally
+    /// broaden the shared upstream handler to the legacy wire family.
+    #[cfg(feature = "synthetic-s2dex-evidence")]
+    pub fn process_synthetic_legacy_s2dex_for_evidence(
+        &mut self,
+        rdram: &mut [u8],
+        display_list: u32,
+        output_addr: u32,
+    ) -> Result<(), RenderError> {
+        #[cfg(feature = "rt64")]
+        {
+            self.context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .process_synthetic_s2dex_wire(rdram, display_list, output_addr, true)
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64-synthetic-legacy-s2dex",
+                    reason,
+                })
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            let _ = (rdram, display_list, output_addr);
+            Err(RenderError::Backend {
+                backend: "rt64-synthetic-legacy-s2dex",
+                reason: "fn64-render-rt64 was built without the opt-in `rt64` Cargo feature"
+                    .to_string(),
+            })
+        }
+    }
+
     /// Process a hand-authored, non-ROM F3DEX2 display list through RT64's
     /// normal interpreter/workload/render path for Extended-GBI evidence.
     ///
