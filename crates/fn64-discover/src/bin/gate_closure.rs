@@ -39,9 +39,9 @@ use fn64_discover::block_pack::{
 };
 use fn64_discover::snapshot::{compose_materialized_banks_v1, MaterializedBankInput};
 use fn64_discover::{
-    aki_reference, oot_reference, run_discovery, run_discovery_with_tables_and_request_dma,
+    aki_reference, run_discovery, run_discovery_with_recovered_vrom_and_request_dma,
     run_discovery_with_recovered_overlay_regions, DescriptorTableInput, Fact, FactDb,
-    NormalizedRom, RecoveredOverlayInput, RomAddressSpace,
+    NormalizedRom, RecoveredOverlayInput, RecoveredVromOverlayInput, RomAddressSpace,
 };
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -59,15 +59,16 @@ const EMIT_BLOCK_PROGRAM_VAR: &str = "FN64_EMIT_BLOCK_PROGRAM";
 enum Discovery {
     /// Boot bank + an AKI-family descriptor table (NW4E).
     Descriptor(Option<DescriptorTableInput>),
-    /// Boot bank + explicitly located load-image tables, plus the static
-    /// request-DMA claims that recover files (OoT's resident `code`) whose
-    /// VRAM destination no table supplies.
-    LoadImageTables(
-        Vec<banks::LoadImageTableInput>,
-        Vec<banks::StaticRequestDmaInput>,
-    ),
     /// Boot bank + mechanically recovered overlay descriptor table (NWXE).
     RecoveredOverlays(RecoveredOverlayInput),
+    /// Boot bank + mechanically recovered VROM overlay geometry, plus the
+    /// static request-DMA claims for images loaded by an explicit DMA call
+    /// (OoT). No table location, stride, record count, or destination is a
+    /// caller-supplied game fact.
+    RecoveredVrom(
+        Box<RecoveredVromOverlayInput>,
+        Vec<banks::StaticRequestDmaInput>,
+    ),
 }
 
 struct RomSpec {
@@ -237,14 +238,14 @@ fn discover(rom_bytes: &[u8], discovery: Discovery) -> Result<(NormalizedRom, Fa
         Discovery::Descriptor(descriptor) => {
             run_discovery(rom_bytes, descriptor).map_err(|error| error.to_string())
         }
-        Discovery::LoadImageTables(tables, request_dma) => {
-            run_discovery_with_tables_and_request_dma(rom_bytes, None, &tables, &request_dma)
-                .map(|(rom, facts, _report)| (rom, facts))
-                .map_err(|error| error.to_string())
-        }
         Discovery::RecoveredOverlays(input) => {
             run_discovery_with_recovered_overlay_regions(rom_bytes, &input)
                 .map(|(rom, facts, _recovery)| (rom, facts))
+                .map_err(|error| error.to_string())
+        }
+        Discovery::RecoveredVrom(input, request_dma) => {
+            run_discovery_with_recovered_vrom_and_request_dma(rom_bytes, &input, &request_dma)
+                .map(|(rom, facts, _recovery, _report)| (rom, facts))
                 .map_err(|error| error.to_string())
         }
     }
@@ -625,8 +626,22 @@ fn oot_discovery() -> Discovery {
     let text = include_str!("../../reference/oot-ntsc-1.0-request-dma.toml");
     let file: RequestDmaFile =
         toml::from_str(text).expect("bundled OoT request-DMA reference must parse");
-    Discovery::LoadImageTables(
-        oot_reference::oot_load_image_tables().to_vec(),
+    // Mechanical VROM overlay recovery rather than hand-written load-image
+    // tables: `gate_d1_oot_overlays` proves this recovers all 468 OoT overlay
+    // regions with 0 wrong and 0 missed, so the closure scoreboard need not be
+    // anchored to per-ROM table geometry. Only the request-DMA callee VA
+    // remains a cited anchor.
+    Discovery::RecoveredVrom(
+        Box::new(RecoveredVromOverlayInput {
+            search: SearchConfig::vrom_family(),
+            delta_vote: DeltaVoteConfig::default(),
+            file_table_search: fn64_discover::file_table::FileTableSearchConfig::n64_family(),
+            vrom_min_records: 2,
+            min_mapped_regions: 2,
+            file_table_name: "recovered_file_table".to_string(),
+            table_name: "recovered_vrom_overlay_descriptors".to_string(),
+            bank_name: BankNamePattern::new("recovered_overlay_", 0, ""),
+        }),
         file.request_dma,
     )
 }

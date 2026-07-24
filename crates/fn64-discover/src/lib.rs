@@ -369,6 +369,28 @@ pub fn run_discovery_with_recovered_vrom_overlay_regions(
     rom_bytes: &[u8],
     input: &RecoveredVromOverlayInput,
 ) -> Result<(NormalizedRom, FactDb, overlay_regions::VromOverlayRecovery), RomRejectReason> {
+    run_discovery_with_recovered_vrom_and_request_dma(rom_bytes, input, &[])
+        .map(|(rom, db, recovery, _report)| (rom, db, recovery))
+}
+
+/// [`run_discovery_with_recovered_vrom_overlay_regions`] plus a static
+/// request-DMA scan over the proven boot image. Mechanical overlay geometry
+/// recovers files a descriptor table names; the request-DMA scan recovers the
+/// resident images a game loads by an explicit DMA call instead, which no
+/// table describes. Neither supplies per-ROM table geometry.
+pub fn run_discovery_with_recovered_vrom_and_request_dma(
+    rom_bytes: &[u8],
+    input: &RecoveredVromOverlayInput,
+    request_dma: &[banks::StaticRequestDmaInput],
+) -> Result<
+    (
+        NormalizedRom,
+        FactDb,
+        overlay_regions::VromOverlayRecovery,
+        banks::StaticRequestDmaReport,
+    ),
+    RomRejectReason,
+> {
     use banks::{
         DestinationEnd, DestinationRangeFields, DestinationSpace, LoadImageTableInput,
         LoadImageTableShape, SourceRangeFields, TableLocation,
@@ -476,9 +498,10 @@ pub fn run_discovery_with_recovered_vrom_overlay_regions(
     let mut db = FactDb::new();
     banks::discover_boot_bank(&rom, &mut db);
     banks::scan_load_image_tables(&rom, &recovered_inputs, &mut db);
+    let request_dma_report = banks::scan_static_request_dma(&rom, request_dma, &mut db);
     harvest::harvest_discovered_candidates(&rom, &mut db)
         .expect("Phase 2 produced a malformed recovered VROM overlay mapping");
-    Ok((rom, db, recovery))
+    Ok((rom, db, recovery, request_dma_report))
 }
 
 /// Run discovery from a serializable external evidence manifest. The
