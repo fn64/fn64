@@ -1202,9 +1202,32 @@ fn run_block_program(
                     });
             }
             BlockExit::ThreadReturn => return,
-            BlockExit::Fault(fault) => recompiled_gap_panic(format!(
-                "live BlockProgram stopped on unresolved guest fault: {fault:?}"
-            )),
+            BlockExit::Fault(fault) => {
+                assert!(
+                    dispatched.instructions > 0,
+                    "live BlockProgram returned {:?} without guest progress",
+                    dispatched.exit
+                );
+                // Architectural exceptions (mid-function BREAK/SYSCALL and the
+                // conditional traps, which the block emitter renders as
+                // `BlockExit::Fault { kind: Exception }`) are vectored through
+                // the installed handler exactly like the executable-write
+                // boundary above: `enter_exception` commits EPC/EXL/Cause.BD
+                // and returns the BEV-selected vector, then the handler bank is
+                // resolved as an ordinary transfer. Only a genuinely
+                // non-architectural fault (a real lane gap) stays loud.
+                let fault_bank = fault.at.bank;
+                let vector = fault.enter_exception(ctx).unwrap_or_else(|| {
+                    recompiled_gap_panic(format!(
+                        "live BlockProgram stopped on non-architectural guest fault: {fault:?}"
+                    ))
+                });
+                entry = live.resolve_transfer(fault_bank, vector).unwrap_or_else(|mapping_fault| {
+                    recompiled_gap_panic(format!(
+                        "live BlockProgram exception vector {vector} does not resolve: {mapping_fault:?}"
+                    ))
+                });
+            }
             BlockExit::Transfer(_)
             | BlockExit::ResolveTransfer { .. }
             | BlockExit::ResolveCall { .. } => {
@@ -3037,6 +3060,123 @@ mod tests {
         );
         assert!(crate::run_one_step());
         assert!(crate::is_thread_dead(thread_id));
+    }
+
+    const BRK_BANK: BankId = BankId::new(0xB4EA);
+    // Entry and the 0x8000_0180 general exception vector must sit in the same
+    // registered code bank so the vectored handler PC is admitted; 33 words
+    // from 0x8000_0100 spans [0x100, 0x184).
+    const BRK_ENTRY: GuestPc = GuestPc::new(0x8000_0100);
+    const BRK_VECTOR: GuestPc = GuestPc::new(0x8000_0180);
+
+    // A block that hits a mid-function BREAK: the emitter renders this as
+    // `BlockExit::Fault { kind: Exception { Breakpoint } }`. Before the driver
+    // fix this reached `recompiled_gap_panic`; now it must vector to the
+    // general exception handler like any architectural exception.
+    fn brk_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        ctx: &mut RsContext,
+        mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        match entry.pc {
+            BRK_ENTRY => BlockRun::new(
+                BlockExit::Fault(CpuFault {
+                    at: ExecutionKey::new(BRK_BANK, BRK_ENTRY),
+                    kind: CpuFaultKind::Exception {
+                        exception: fn64_recomp_rs::CpuException::Breakpoint,
+                        epc: BRK_ENTRY,
+                        branch_delay: false,
+                        instruction_code: 0,
+                        bad_vaddr: None,
+                        coprocessor: None,
+                    },
+                }),
+                1,
+            ),
+            BRK_VECTOR => {
+                // Record the architectural state the vectoring produced so the
+                // test can prove we reached the handler with a real BREAK frame.
+                mem.store_w(0xFFFF_FFFF_8000_0000, ctx.cop0_epc);
+                mem.store_w(0xFFFF_FFFF_8000_0004, ctx.cop0_cause);
+                BlockRun::new(BlockExit::ThreadReturn, 1)
+            }
+            pc => BlockRun::new(
+                BlockExit::Fault(CpuFault {
+                    at: ExecutionKey::new(BRK_BANK, pc),
+                    kind: CpuFaultKind::UnmappedPc {
+                        bank_start: BRK_ENTRY.get(),
+                        bank_end: BRK_VECTOR.get() + 4,
+                    },
+                }),
+                0,
+            ),
+        }
+    }
+
+    fn brk_lookup(pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        let key = ExecutionKey::new(BRK_BANK, pc);
+        if matches!(pc, BRK_ENTRY | BRK_VECTOR) {
+            Ok(key)
+        } else {
+            Err(CpuFault {
+                at: key,
+                kind: CpuFaultKind::UnmappedPc {
+                    bank_start: BRK_ENTRY.get(),
+                    bank_end: BRK_ENTRY.get() + 4,
+                },
+            })
+        }
+    }
+
+    fn brk_transfer_lookup(_source: BankId, pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        brk_lookup(pc)
+    }
+
+    #[test]
+    fn block_program_vectors_mid_function_break_instead_of_panicking() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = super::super::HostState::default());
+        let mut bytes = vec![0u8; 0x1000];
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(BRK_BANK, BRK_ENTRY, vec![0; 33]).unwrap(),
+                GeneratedBankRunner::new(BRK_BANK, brk_runner),
+            )
+            .unwrap();
+        let thread_id = 0xB4EA;
+
+        // SAFETY: `bytes` remains live through the thread's final return.
+        unsafe {
+            boot_thread0_block_program(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                program,
+                ExecutionKey::new(BRK_BANK, BRK_ENTRY),
+                brk_lookup,
+                brk_transfer_lookup,
+                InstructionBudget::new(8).unwrap(),
+                thread_id,
+                10,
+            );
+        }
+
+        // Runs to completion — reaching the handler and returning — rather than
+        // hitting recompiled_gap_panic on the BREAK fault. The entry block, the
+        // vectored handler, and the thread-return retire across steps; drive the
+        // executor until the thread is dead (bounded so a regression can't spin).
+        let mut steps = 0;
+        while !crate::is_thread_dead(thread_id) {
+            assert!(crate::run_one_step(), "executor stalled before thread return");
+            steps += 1;
+            assert!(steps < 8, "BREAK vectoring did not converge to thread return");
+        }
+
+        let mem = Rdram::new(&mut bytes);
+        // EPC captured the faulting PC, and Cause.ExcCode == 9 (Breakpoint).
+        assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000) as u32, BRK_ENTRY.get());
+        assert_eq!((mem.load_w(0xFFFF_FFFF_8000_0004) as u32 >> 2) & 0x1F, 9);
     }
 
     #[test]
