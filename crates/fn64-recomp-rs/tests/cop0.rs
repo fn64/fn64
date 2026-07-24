@@ -34,9 +34,9 @@
 //! Decoder and structural emitter tests keep that boundary explicit.
 
 use fn64_recomp_rs::{
-    decode, emit_bank_runner, emit_function, run_bank, BankId, BankInput, BlockExit, CodeBank,
-    CodeCatalog, ExecutionKey, FuncInput, GuestPc, Instruction, InstructionBudget, Rdram,
-    RecompContext,
+    decode, emit_bank_runner, emit_function, emit_sparse_bank_runner, run_bank, BankBlockInput,
+    BankId, BankInput, BlockExit, CodeBank, CodeCatalog, ExecutionKey, FuncInput, GuestPc,
+    Instruction, InstructionBudget, Rdram, RecompContext, SparseBankInput,
 };
 
 /// Real ROM bytes of `osGetCount` (big-endian words).
@@ -221,6 +221,143 @@ fn decode_cop0_privileged() {
     assert_eq!(decode(0x42000008), Instruction::Tlbp);
     // eret  funct 0x18 = 0x42000018
     assert_eq!(decode(0x42000018), Instruction::Eret);
+}
+
+#[test]
+fn every_decoded_cop0_shape_requires_kernel_or_cu0() {
+    let cop0_words = [
+        0x4002_4800, // MFC0
+        0x4022_3800, // DMFC0, deliberately unsupported register shape
+        0x4084_5800, // MTC0
+        0x40A2_3800, // DMTC0, deliberately unsupported register shape
+        0x4100_0001, // BC0F
+        0x4101_0001, // BC0T
+        0x4102_0001, // BC0FL
+        0x4103_0001, // BC0TL
+        0x4200_0001, // TLBR
+        0x4200_0002, // TLBWI
+        0x4200_0006, // TLBWR
+        0x4200_0008, // TLBP
+        0x4200_0018, // ERET
+    ];
+    for word in cop0_words {
+        let instruction = decode(word);
+        assert!(
+            instruction.requires_cop0(),
+            "decoded COP0 instruction omitted authority guard: {instruction:?}"
+        );
+        let words = if instruction.has_delay_slot() {
+            vec![word, 0]
+        } else {
+            vec![word]
+        };
+        let name = format!("cop0_guard_{word:08x}");
+        let emitted = emit_bank_runner(&BankInput {
+            name: &name,
+            bank: BankId::new(u64::from(word)),
+            vram: 0x8000_0000,
+            words: &words,
+        });
+        let sparse_name = format!("sparse_{name}");
+        let sparse = emit_sparse_bank_runner(&SparseBankInput {
+            name: &sparse_name,
+            bank: BankId::new(u64::from(word)),
+            blocks: &[BankBlockInput {
+                vram: 0x8000_0000,
+                words: &words,
+            }],
+        });
+        for (lane, source) in [("contiguous", emitted), ("sparse", sparse)] {
+            assert!(
+                source.contains("if !ctx.cop0_usable()"),
+                "{lane} AOT bank omitted COP0 guard for {instruction:?}"
+            );
+        }
+    }
+    assert!(!decode(0x4402_2000).requires_cop0()); // MFC1
+    assert!(!decode(0x8C82_0000).requires_cop0()); // LW
+}
+
+#[test]
+fn every_recognized_cop0_decode_selector_is_fail_closed() {
+    // COP0 decoding currently selects only on `rs`, `rt`, and `funct`.
+    // Sweep their complete domains so a new recognized selector cannot enter
+    // either execution lane without first joining the authority classifier.
+    for format in 0..32u32 {
+        for target in 0..32u32 {
+            for function in 0..64u32 {
+                let word = (0x10 << 26) | (format << 21) | (target << 16) | function;
+                let instruction = decode(word);
+                if !matches!(instruction, Instruction::Unknown { .. }) {
+                    assert!(
+                        instruction.requires_cop0(),
+                        "recognized COP0 selector omitted authority: \
+                         word={word:#010x} instruction={instruction:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cop0_branch_authority_follows_indivisible_pair_budget_admission() {
+    let words = [
+        0x2403_0001, // addiu $v1,$zero,1
+        0x4101_0001, // bc0t +1
+        0x2404_0007, // addiu $a0,$zero,7 (delay)
+        0,
+    ];
+    let contiguous = emit_bank_runner(&BankInput {
+        name: "cop0_budget_contiguous",
+        bank: BankId::new(0xC0),
+        vram: 0x8000_1000,
+        words: &words,
+    });
+    let sparse = emit_sparse_bank_runner(&SparseBankInput {
+        name: "cop0_budget_sparse",
+        bank: BankId::new(0xC1),
+        blocks: &[BankBlockInput {
+            vram: 0x8000_1000,
+            words: &words,
+        }],
+    });
+
+    for (lane, emitted) in [("contiguous", contiguous), ("sparse", sparse)] {
+        let checkpoint = emitted
+            .find("if executed != 0 && executed + 2 > budget.get()")
+            .expect("BC0 pair budget checkpoint");
+        let authority = emitted
+            .find("if !ctx.cop0_usable()")
+            .expect("BC0 authority guard");
+        let retirement = emitted.find("executed += 2;").expect("BC0 pair retirement");
+        assert!(
+            checkpoint < authority && authority < retirement,
+            "{lane} BC0 ordering must be budget, authority, then retirement:\n{emitted}"
+        );
+    }
+}
+
+#[test]
+fn cop0_authority_accepts_kernel_exl_erl_and_cu0_only() {
+    const EXL: u32 = 1 << 1;
+    const ERL: u32 = 1 << 2;
+    const KSU_SUPERVISOR: u32 = 1 << 3;
+    const KSU_USER: u32 = 2 << 3;
+    const CU0: u32 = 1 << 28;
+
+    for status in [0, KSU_USER | EXL, KSU_SUPERVISOR | ERL] {
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = status;
+        assert!(ctx.cop0_usable(), "kernel-forcing status={status:#x}");
+    }
+    for status in [KSU_USER, KSU_SUPERVISOR] {
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = status;
+        assert!(!ctx.cop0_usable(), "unguarded status={status:#x}");
+        ctx.cop0_status |= CU0;
+        assert!(ctx.cop0_usable(), "CU0 status={:#x}", ctx.cop0_status);
+    }
 }
 
 #[test]

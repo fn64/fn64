@@ -39,6 +39,8 @@ pub const RELEASE_MICROCODE_TEXT_PATH_ENV: &str = "FN64_RELEASE_MICROCODE_TEXT_P
 pub const RELEASE_MICROCODE_DATA_PATH_ENV: &str = "FN64_RELEASE_MICROCODE_DATA_PATH";
 pub const REPOSITORY_SYNTHETIC_RELEASE_SCENARIO: &str =
     "synthetic-runtime-device-render-fixed-cycle-v1";
+pub const REPOSITORY_SYNTHETIC_NATIVE_RELEASE_SCENARIO: &str =
+    "synthetic-native-archive-runtime-device-render-fixed-cycle-v1";
 pub const REPOSITORY_SYNTHETIC_RELEASE_CYCLE: u64 = 1_562_500;
 pub const REPOSITORY_SYNTHETIC_RELEASE_MANIFEST_BYTES: &[u8] =
     b"repository synthetic runner manifest v1\n";
@@ -47,7 +49,7 @@ pub const REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES: &[u8] =
 pub const REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES: &[u8] =
     b"fn64 synthetic non-game release input v1";
 
-const RELEASE_REPORT_SCHEMA: &str = "fn64.release-gate.v23";
+const RELEASE_REPORT_SCHEMA: &str = crate::release_gate::REPORT_SCHEMA;
 const CONTRACT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-run-contract-digest.v3\0";
 const RUN_EVENT_DOMAIN: &[u8] = b"fn64.private-release-run-event.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"fn64.private-release-series-receipt-digest.v1\0";
@@ -944,6 +946,119 @@ fn identity_matches_bytes(identity: &PrivateFileIdentity, bytes: &[u8]) -> bool 
 pub fn verify_repository_synthetic_private_release_run_contract(
     contract: PrivateReleaseRunContract,
 ) -> Result<VerifiedPrivateReleaseRunContract, PrivateReleaseSeriesError> {
+    verify_repository_synthetic_contract_common(&contract)?;
+    if contract.report_scenario != REPOSITORY_SYNTHETIC_RELEASE_SCENARIO
+        || !contract.admitted_artifacts.is_empty()
+        || contract.expected_execution_source != ExecutionDestinationSource::NoProgram
+    {
+        return Err(error(
+            "no-program synthetic runner authority requires the exact repository no-program scenario",
+        ));
+    }
+    contract.verify_bound_files()?;
+    Ok(VerifiedPrivateReleaseRunContract { contract })
+}
+
+/// Validate, execute, and reverify one caller-bound identified-native
+/// synthetic series.
+///
+/// The archive and child values are caller-supplied consistency bounds, not
+/// repository acceptance anchors. The verified contract remains inside this
+/// operation so this path cannot mint the general production-runner
+/// capability. A platform-specific gate separately compares the resulting
+/// reports with an exact checked-in semantic fingerprint.
+pub fn run_synthetic_native_private_release_series(
+    contract: PrivateReleaseRunContract,
+    caller_bound_archives: [PrivateArtifactIdentity; 2],
+    caller_bound_child: PrivateChildCommand,
+    output_directory: impl AsRef<Path>,
+) -> Result<PrivateReleaseSeriesReceipt, PrivateReleaseSeriesError> {
+    let verified_contract = verify_synthetic_native_private_release_run_contract(
+        contract,
+        caller_bound_archives,
+        caller_bound_child,
+    )?;
+    let receipt = run_private_release_series(&verified_contract, &output_directory)?;
+    verify_private_release_series(&verified_contract, output_directory, &receipt)?;
+    Ok(receipt)
+}
+
+fn verify_synthetic_native_private_release_run_contract(
+    contract: PrivateReleaseRunContract,
+    caller_bound_archives: [PrivateArtifactIdentity; 2],
+    caller_bound_child: PrivateChildCommand,
+) -> Result<VerifiedPrivateReleaseRunContract, PrivateReleaseSeriesError> {
+    verify_repository_synthetic_contract_common(&contract)?;
+    if contract.report_scenario != REPOSITORY_SYNTHETIC_NATIVE_RELEASE_SCENARIO
+        || contract.admitted_artifacts != caller_bound_archives
+        || contract.child != caller_bound_child
+    {
+        return Err(error(
+            "identified-native synthetic series requires the exact caller-bound archives and child invocation",
+        ));
+    }
+    let roles = contract
+        .admitted_artifacts
+        .iter()
+        .map(|artifact| artifact.role.as_str())
+        .collect::<Vec<_>>();
+    if roles
+        != [
+            "synthetic_generated_archive",
+            "synthetic_section_bridge_archive",
+        ]
+        || contract
+            .admitted_artifacts
+            .iter()
+            .any(|artifact| artifact.provenance != "repository_defined_synthetic")
+    {
+        return Err(error(
+            "identified-native synthetic series requires the exact generated-code and section-bridge archive roles",
+        ));
+    }
+    contract.verify_bound_files()?;
+    let ExecutionDestinationSource::NativeArchive { artifact_sha256 } =
+        &contract.expected_execution_source
+    else {
+        return Err(error(
+            "identified-native synthetic series requires the native-archive execution source",
+        ));
+    };
+    let archives = contract
+        .admitted_artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| {
+            fs::read(&artifact.path)
+                .map(|bytes| {
+                    let label = match index {
+                        0 => "synthetic-generated-code",
+                        1 => "synthetic-section-bridge",
+                        _ => unreachable!("archive roles were checked above"),
+                    };
+                    (label.to_owned(), bytes)
+                })
+                .map_err(|source| {
+                    error(format!(
+                        "read identified-native synthetic archive {}: {source}",
+                        artifact.path
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let observed = hex(&crate::native_program_archives_sha256(archives));
+    if &observed != artifact_sha256 {
+        return Err(error(format!(
+            "identified-native synthetic archive identity mismatch: contract={artifact_sha256}, observed={observed}"
+        )));
+    }
+    contract.verify_bound_files()?;
+    Ok(VerifiedPrivateReleaseRunContract { contract })
+}
+
+fn verify_repository_synthetic_contract_common(
+    contract: &PrivateReleaseRunContract,
+) -> Result<(), PrivateReleaseSeriesError> {
     contract.verify_integrity()?;
     let input_file = PrivateFileIdentity {
         path: contract.input.path.clone(),
@@ -957,7 +1072,6 @@ pub fn verify_repository_synthetic_private_release_run_contract(
     })?;
     if contract.purpose != "synthetic_mechanism"
         || contract.rom_class != ReleaseRomClass::Unclassified
-        || contract.report_scenario != REPOSITORY_SYNTHETIC_RELEASE_SCENARIO
         || contract.guest_cycle != REPOSITORY_SYNTHETIC_RELEASE_CYCLE
         || contract.input.role != "synthetic_input"
         || contract.input.provenance != "repository_defined_synthetic"
@@ -970,16 +1084,13 @@ pub fn verify_repository_synthetic_private_release_run_contract(
             REPOSITORY_SYNTHETIC_RELEASE_READINESS_BYTES,
         )
         || !identity_matches_bytes(&input_file, REPOSITORY_SYNTHETIC_RELEASE_INPUT_BYTES)
-        || !contract.admitted_artifacts.is_empty()
-        || contract.expected_execution_source != ExecutionDestinationSource::NoProgram
         || Path::new(&contract.child.executable.path) != current_executable
     {
         return Err(error(
-            "synthetic runner authority is confined to fn64's exact repository-defined fixture, NoProgram source, and current test executable",
+            "synthetic runner authority is confined to fn64's exact repository-defined fixture, typed synthetic source, and current test executable",
         ));
     }
-    contract.verify_bound_files()?;
-    Ok(VerifiedPrivateReleaseRunContract { contract })
+    Ok(())
 }
 
 pub fn run_private_release_series(
@@ -2191,6 +2302,11 @@ mod tests {
     const FIXTURE_ENV: &str = "FN64_TEST_RELEASE_CHILD";
     const TEMPLATE_ENV: &str = "FN64_TEST_RELEASE_TEMPLATE";
 
+    #[test]
+    fn private_series_tracks_the_current_release_report_schema() {
+        assert_eq!(RELEASE_REPORT_SCHEMA, "fn64.release-gate.v28");
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -2336,6 +2452,33 @@ mod tests {
         };
         contract.contract_sha256 = contract.recompute_contract_sha256().unwrap();
         (contract, template)
+    }
+
+    fn native_fixture_contract(directory: &Path) -> PrivateReleaseRunContract {
+        let (mut contract, _) = fixture_contract(directory);
+        let generated = directory.join("synthetic-generated.a");
+        let bridge = directory.join("synthetic-bridge.a");
+        fs::write(&generated, b"repository generated archive").unwrap();
+        fs::write(&bridge, b"repository bridge archive").unwrap();
+        contract.report_scenario = REPOSITORY_SYNTHETIC_NATIVE_RELEASE_SCENARIO.to_owned();
+        contract.admitted_artifacts = vec![
+            artifact_identity(&generated, "synthetic_generated_archive"),
+            artifact_identity(&bridge, "synthetic_section_bridge_archive"),
+        ];
+        contract.expected_execution_source = ExecutionDestinationSource::NativeArchive {
+            artifact_sha256: hex(&crate::native_program_archives_sha256([
+                (
+                    "synthetic-generated-code".to_owned(),
+                    fs::read(&generated).unwrap(),
+                ),
+                (
+                    "synthetic-section-bridge".to_owned(),
+                    fs::read(&bridge).unwrap(),
+                ),
+            ])),
+        };
+        contract.contract_sha256 = contract.recompute_contract_sha256().unwrap();
+        contract
     }
 
     #[test]
@@ -2650,6 +2793,92 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a native"));
+    }
+
+    #[test]
+    fn identified_native_synthetic_series_binds_both_archives() {
+        let directory = TestDirectory::new();
+        let contract = native_fixture_contract(&directory.0);
+        let expected_archives: [PrivateArtifactIdentity; 2] =
+            contract.admitted_artifacts.clone().try_into().unwrap();
+        let expected_child = contract.child.clone();
+        let verify = |candidate| {
+            verify_synthetic_native_private_release_run_contract(
+                candidate,
+                expected_archives.clone(),
+                expected_child.clone(),
+            )
+        };
+        verify(contract.clone()).unwrap();
+
+        let mut wrong_identity = contract.clone();
+        let ExecutionDestinationSource::NativeArchive { artifact_sha256 } =
+            &mut wrong_identity.expected_execution_source
+        else {
+            panic!("native fixture lost its execution source")
+        };
+        *artifact_sha256 = "00".repeat(32);
+        wrong_identity.contract_sha256 = wrong_identity.recompute_contract_sha256().unwrap();
+        assert!(verify(wrong_identity)
+            .unwrap_err()
+            .to_string()
+            .contains("archive identity mismatch"));
+
+        let mut extra = contract.clone();
+        let extra_path = directory.0.join("synthetic-extra.a");
+        fs::write(&extra_path, b"extra archive").unwrap();
+        extra
+            .admitted_artifacts
+            .push(artifact_identity(&extra_path, "synthetic_z_extra"));
+        extra.contract_sha256 = extra.recompute_contract_sha256().unwrap();
+        assert!(verify(extra)
+            .unwrap_err()
+            .to_string()
+            .contains("exact caller-bound archives"));
+
+        let mut reordered = contract.clone();
+        reordered.admitted_artifacts.reverse();
+        reordered.contract_sha256 = reordered.recompute_contract_sha256().unwrap();
+        assert!(reordered
+            .verify_integrity()
+            .unwrap_err()
+            .to_string()
+            .contains("strictly sorted"));
+
+        let mut relabelled = contract.clone();
+        relabelled.report_scenario = REPOSITORY_SYNTHETIC_RELEASE_SCENARIO.to_owned();
+        relabelled.contract_sha256 = relabelled.recompute_contract_sha256().unwrap();
+        assert!(verify(relabelled).is_err());
+
+        for mutation in ["argv", "environment", "working_directory"] {
+            let mut changed = contract.clone();
+            match mutation {
+                "argv" => changed.child.argv.push("forged".to_owned()),
+                "environment" => changed.child.environment[0].value = "forged".to_owned(),
+                "working_directory" => changed.child.working_directory.push_str("-forged"),
+                _ => unreachable!(),
+            }
+            changed.contract_sha256 = changed.recompute_contract_sha256().unwrap();
+            assert!(verify(changed).is_err());
+        }
+
+        let replacement_directory = directory.0.join("replacement");
+        fs::create_dir(&replacement_directory).unwrap();
+        let mut replaced = native_fixture_contract(&replacement_directory);
+        replaced.child = contract.child.clone();
+        replaced.contract_sha256 = replaced.recompute_contract_sha256().unwrap();
+        assert!(verify(replaced)
+            .unwrap_err()
+            .to_string()
+            .contains("exact caller-bound archives"));
+
+        let mutated = contract;
+        let archive = PathBuf::from(&mutated.admitted_artifacts[0].path);
+        fs::write(&archive, b"mutated after contract admission").unwrap();
+        assert!(verify(mutated)
+            .unwrap_err()
+            .to_string()
+            .contains("admitted_artifacts"));
     }
 
     #[test]

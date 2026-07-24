@@ -103,10 +103,12 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         host.save_operations.clear();
         host.controller_operations.clear();
         host.rsp_rdp_observations.clear();
+        host.rsp_boot_images.clear();
         host.loaded_rsp_task = None;
         host.rsp_task_lineages.clear();
         host.native_execution_destinations.clear();
     });
+    crate::task_dispatch::reset_audio_task_execution_for_rom();
 }
 
 /// Register the guest BSS address of libultra's cartridge `OSPiHandle`.
@@ -652,8 +654,20 @@ fn live_device_mmio_addr(vaddr: u64, write: bool) -> Option<MmioAddr> {
         );
     let is_mi_read = !write && matches!(addr, 0xA430_0008 | 0xA430_000C);
     let is_mi_write = write && addr == 0xA430_000C;
-    let is_dpc_read =
-        !write && matches!(addr, 0xA410_0000 | 0xA410_0004 | 0xA410_0008 | 0xA410_000C);
+    let is_dpc_read = !write
+        && matches!(
+            addr,
+            0xA410_0000
+                | 0xA410_0004
+                | 0xA410_0008
+                | 0xA410_000C
+                // Performance counters (clock/cmd/pipe/tmem) -- readable so the
+                // STATUS counter-clear commands are observable over raw MMIO.
+                | 0xA410_0010
+                | 0xA410_0014
+                | 0xA410_0018
+                | 0xA410_001C
+        );
     let is_dpc_write = write && matches!(addr, 0xA410_0000 | 0xA410_0004 | 0xA410_000C);
     let is_vi = (0xA440_0000..=0xA440_0034).contains(&addr);
     let is_ai = matches!(

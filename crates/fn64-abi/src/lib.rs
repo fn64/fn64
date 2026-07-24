@@ -644,6 +644,7 @@ pub struct RspTaskDataIdentityEvidenceSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadedRspTaskEvidenceSnapshot {
     pub task_offset: u32,
+    pub admission_generation: u64,
     pub header: OsTaskHeader,
     pub resumed_data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
 }
@@ -660,6 +661,7 @@ pub enum RspTaskLineagePhaseEvidenceSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RspTaskLineageEvidenceSnapshot {
     pub task_offset: u32,
+    pub admission_generation: u64,
     pub original_header: OsTaskHeader,
     pub data_identity: Option<RspTaskDataIdentityEvidenceSnapshot>,
     pub phase: RspTaskLineagePhaseEvidenceSnapshot,
@@ -805,6 +807,9 @@ pub struct AbiHostEvidenceSnapshot {
     pub rsp_boot_images: Vec<RspBootImageEvidenceSnapshot>,
     pub loaded_rsp_task: Option<LoadedRspTaskEvidenceSnapshot>,
     pub rsp_task_lineages: Vec<RspTaskLineageEvidenceSnapshot>,
+    pub next_rsp_task_admission_generation: u64,
+    pub rsp_interpreter_state: task_dispatch::RspInterpreterStateEvidenceSnapshot,
+    pub audio_task_execution: task_dispatch::AudioTaskExecutionPolicy,
     pub rom_installed: bool,
     pub installed_rom: Option<InstalledRomEvidenceSnapshot>,
     pub cartridge_save: CartridgeSaveEvidenceSnapshot,
@@ -885,10 +890,24 @@ struct HostState {
     /// only StartGo path consumes this token; it never rereads mutable guest
     /// task fields after Load returns.
     loaded_rsp_task: Option<task_dispatch::LoadedRspTask>,
+    /// Process-monotonic identity minted after each successful `osSpTaskLoad`
+    /// device admission. Address reuse cannot alias a prior commit authority.
+    next_rsp_task_admission_generation: task_dispatch::RspTaskAdmissionGeneration,
     /// Original task/data identities retained independently of append-only
     /// observation history so a yielded reload cannot inherit evidence from
     /// an unrelated task that reused the same guest address.
     rsp_task_lineages: std::collections::HashMap<u32, task_dispatch::RspTaskLineage>,
+    /// Non-memory RSP interpreter state survives task boundaries on the
+    /// physical core. Keeping it above the device fabric avoids making the
+    /// runtime depend on the audio interpreter while still binding every
+    /// future-visible scalar/VU latch into ABI evidence.
+    rsp_interpreter_state: task_dispatch::RspInterpreterStateEvidenceSnapshot,
+    /// Installed-ROM audio microcode executor selected atomically with any
+    /// translated callback identity. It is reset only when a new ROM is
+    /// installed and is immutable for that ROM session.
+    audio_task_execution: task_dispatch::AudioTaskExecutionPolicy,
+    audio_task_execution_admitted: bool,
+    audio_task_execution_started: bool,
     /// Guest-visible `OSPiHandle*` returned by `osCartRomInit`. The handle
     /// storage is game-owned BSS, so the boot host supplies its link address;
     /// leaving it unset is a loud trap rather than returning a stale `$v0`.
@@ -1001,7 +1020,12 @@ impl Default for HostState {
             runtime_rdram_len: 0,
             rsp_boot_images: std::collections::HashMap::new(),
             loaded_rsp_task: None,
+            next_rsp_task_admission_generation: task_dispatch::RspTaskAdmissionGeneration::first(),
             rsp_task_lineages: std::collections::HashMap::new(),
+            rsp_interpreter_state: task_dispatch::RspInterpreterStateEvidenceSnapshot::Reset,
+            audio_task_execution: task_dispatch::AudioTaskExecutionPolicy::Unconfigured,
+            audio_task_execution_admitted: false,
+            audio_task_execution_started: false,
             cart_rom_handle_vram: None,
             flash_handle_vram: None,
             leo_disk: None,
@@ -1208,7 +1232,14 @@ fn classify_host_evidence_fields(host: &HostState) {
         runtime_rdram_len: _,
         rsp_boot_images: _,
         loaded_rsp_task: _,
+        next_rsp_task_admission_generation: _,
         rsp_task_lineages: _,
+        rsp_interpreter_state: _,
+        audio_task_execution: _,
+        // Configuration guard only; with an immutable installed policy it
+        // cannot change a later guest result independently of that policy.
+        audio_task_execution_admitted: _,
+        audio_task_execution_started: _,
         cart_rom_handle_vram: _,
         flash_handle_vram: _,
         leo_disk: _,
@@ -1343,6 +1374,9 @@ pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
             rsp_boot_images,
             loaded_rsp_task,
             rsp_task_lineages,
+            next_rsp_task_admission_generation: host.next_rsp_task_admission_generation.get(),
+            rsp_interpreter_state: host.rsp_interpreter_state.clone(),
+            audio_task_execution: host.audio_task_execution,
             rom_installed: host.rom_installed,
             installed_rom: host.installed_rom,
             cartridge_save: host.cartridge_save,
@@ -1799,8 +1833,102 @@ impl RecompContext {
         unsafe { std::mem::zeroed() }
     }
 
-    /// Point `f_odd` at this context's own FPR file so recompiled `mtc1`/
-    /// `sdc1`-to-odd-register stores land in-register instead of faulting.
+    // Used only by the recompiled-C adapter path (`call_c` and its
+    // round-trip tests), which compiles under `recomp-rs`; gated to match so a
+    // featureless build does not flag it as dead.
+    #[cfg(feature = "recomp-rs")]
+    pub(crate) fn fpr_u64_bits(&self) -> [u64; 32] {
+        // Safety: each union contains a valid raw 64-bit pattern regardless
+        // of which typed member the generated shim last wrote.
+        unsafe {
+            [
+                self.f0.u64_bits,
+                self.f1.u64_bits,
+                self.f2.u64_bits,
+                self.f3.u64_bits,
+                self.f4.u64_bits,
+                self.f5.u64_bits,
+                self.f6.u64_bits,
+                self.f7.u64_bits,
+                self.f8.u64_bits,
+                self.f9.u64_bits,
+                self.f10.u64_bits,
+                self.f11.u64_bits,
+                self.f12.u64_bits,
+                self.f13.u64_bits,
+                self.f14.u64_bits,
+                self.f15.u64_bits,
+                self.f16.u64_bits,
+                self.f17.u64_bits,
+                self.f18.u64_bits,
+                self.f19.u64_bits,
+                self.f20.u64_bits,
+                self.f21.u64_bits,
+                self.f22.u64_bits,
+                self.f23.u64_bits,
+                self.f24.u64_bits,
+                self.f25.u64_bits,
+                self.f26.u64_bits,
+                self.f27.u64_bits,
+                self.f28.u64_bits,
+                self.f29.u64_bits,
+                self.f30.u64_bits,
+                self.f31.u64_bits,
+            ]
+        }
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    pub(crate) fn set_fpr_u64_bits(&mut self, bits: [u64; 32]) {
+        self.f0 = Fpr { u64_bits: bits[0] };
+        self.f1 = Fpr { u64_bits: bits[1] };
+        self.f2 = Fpr { u64_bits: bits[2] };
+        self.f3 = Fpr { u64_bits: bits[3] };
+        self.f4 = Fpr { u64_bits: bits[4] };
+        self.f5 = Fpr { u64_bits: bits[5] };
+        self.f6 = Fpr { u64_bits: bits[6] };
+        self.f7 = Fpr { u64_bits: bits[7] };
+        self.f8 = Fpr { u64_bits: bits[8] };
+        self.f9 = Fpr { u64_bits: bits[9] };
+        self.f10 = Fpr { u64_bits: bits[10] };
+        self.f11 = Fpr { u64_bits: bits[11] };
+        self.f12 = Fpr { u64_bits: bits[12] };
+        self.f13 = Fpr { u64_bits: bits[13] };
+        self.f14 = Fpr { u64_bits: bits[14] };
+        self.f15 = Fpr { u64_bits: bits[15] };
+        self.f16 = Fpr { u64_bits: bits[16] };
+        self.f17 = Fpr { u64_bits: bits[17] };
+        self.f18 = Fpr { u64_bits: bits[18] };
+        self.f19 = Fpr { u64_bits: bits[19] };
+        self.f20 = Fpr { u64_bits: bits[20] };
+        self.f21 = Fpr { u64_bits: bits[21] };
+        self.f22 = Fpr { u64_bits: bits[22] };
+        self.f23 = Fpr { u64_bits: bits[23] };
+        self.f24 = Fpr { u64_bits: bits[24] };
+        self.f25 = Fpr { u64_bits: bits[25] };
+        self.f26 = Fpr { u64_bits: bits[26] };
+        self.f27 = Fpr { u64_bits: bits[27] };
+        self.f28 = Fpr { u64_bits: bits[28] };
+        self.f29 = Fpr { u64_bits: bits[29] };
+        self.f30 = Fpr { u64_bits: bits[30] };
+        self.f31 = Fpr { u64_bits: bits[31] };
+    }
+
+    pub(crate) fn assert_float_mode_matches_status(&self) {
+        const STATUS_FR: u32 = 1 << 26;
+        assert!(
+            self.mips3_float_mode <= 1,
+            "recomp_context mips3_float_mode must be 0 or 1"
+        );
+        assert_eq!(
+            self.mips3_float_mode == 1,
+            self.status_reg & STATUS_FR != 0,
+            "recomp_context status_reg.FR and mips3_float_mode diverged"
+        );
+    }
+
+    /// Point `f_odd` at this context's active FPR view so recompiled odd
+    /// single-register accesses land in-register instead of faulting.
     ///
     /// Generated C addresses an odd float register `$fN` (N odd) as
     /// `ctx->f_odd[(N-1)*2]`, treating `f_odd` as a `uint32_t*` cursor into
@@ -1811,7 +1939,9 @@ impl RecompContext {
     /// holds exactly when `f_odd == &f0.u32h` (the fpr union's second u32,
     /// byte 4 of `f0`): `&f0.u32h + 0x40` == byte `0x44` == `f8`'s high word.
     /// This matches the `recomp.h` fpr layout (`{u32l, u32h}` at bytes 0/4,
-    /// 8-byte stride) the generated C was emitted against.
+    /// 8-byte stride) the generated C was emitted against. With FR=1 the
+    /// cursor instead starts at `f1.u32l`, making the same index expression
+    /// reach each odd independent FPR's low word.
     ///
     /// Was the OoT-boot SIGSEGV-at-0x40 root cause: `f_odd` stayed null from
     /// `zeroed()`, so `guLookAtHiliteF`'s first `mtc1 $at, $f9`
@@ -1823,10 +1953,14 @@ impl RecompContext {
     /// sites, which build the context and immediately run the entry function
     /// with it, never relocating it mid-run).
     pub fn arm_fpr_alias(&mut self) {
-        // `u32_halves.1` is the high 32-bit word of `f0` (byte offset 4),
-        // i.e. recomp.h's `f0.u32h` -- the FR=0 base the index math above
-        // requires.
-        self.f_odd = unsafe { &mut self.f0.u32_halves.1 as *mut u32 };
+        self.assert_float_mode_matches_status();
+        self.f_odd = if self.mips3_float_mode == 0 {
+            // Safety: taking a union field address does not read that field.
+            unsafe { &mut self.f0.u32_halves.1 as *mut u32 }
+        } else {
+            // Safety: taking a union field address does not read that field.
+            unsafe { &mut self.f1.u32_halves.0 as *mut u32 }
+        };
     }
 }
 

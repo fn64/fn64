@@ -15,7 +15,7 @@ fn64-runtime   core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram
 fn64-abi       the extern "C" surface recompiled code links against
 fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdram allocation
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
-fn64-render    backend-neutral render seam, exact microcode admission, and raw-DPC completion inspection
+fn64-render    backend-neutral render seam, exact microcode admission, and diagnostic raw-DPC inspection
 fn64-render-reference deterministic pure-Rust ReferenceBackend
 fn64-render-rt64 FFI bridge to RT64 (C++)
 fn64-certification executable behavioral evidence gates over the public renderer seams
@@ -277,17 +277,23 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v23` and the
+`fn64.release-gate.v28` also freezes the install-once audio-task execution
+policy and admits only execution of the live RSP image through `LleAccuracy`;
+the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
 
 This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series are historical under schema v23 and require regeneration. They bind
+series are historical under schema v28 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
-series binds the same denominator without acquiring private-ROM authority.
+series binds the same denominator without acquiring private-ROM authority. Its
+specialized runner operation exposes only a self-hashed receipt; repository
+acceptance is instead anchored solely by the exact target-named macOS arm64
+semantic fingerprint, including both build-produced archive hashes. Compiler,
+SDK, or target drift fails closed until a separately reviewed golden exists.
 Their combined incomplete matrix accepted all 30 reports, satisfied 12 of 162
 requirements, and retained 150 explicit gaps. Self-hashed receipts are
 retained integrity evidence, not transferable process attestation, and the
@@ -298,7 +304,7 @@ Report-only matrix v5 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
-and bound inputs. It exact-matches the v23 semantic report and ordered run-event
+and bound inputs. It exact-matches the v28 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
 inside verified-matrix v18. The retained
 self-hash proves canonical integrity, not signer identity or transferable
@@ -454,7 +460,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v23 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v28 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -466,7 +472,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v23` binds it independently.
+clears it and report schema `fn64.release-gate.v28` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -756,11 +762,22 @@ task calls out:
   register latches and two-slot FIFO; shim calls and raw register writes do not
   retain a second DAC-rate, source-address, or control authority.
   It derives deterministic drain deadlines from stereo-frame count, the
-  93.75 MHz CPU clock, and libultra's quantized DAC rate, then raises MI AI and
-  returns OS_EVENT_AI only after the current buffer drains. This is guest-time
-  ordering, not a claim of hardware-verified AI bus timing. Its DAC divisor
-  uses the same IPL-selected NTSC/PAL/MPAL video clock as VI. Exact AI bus
-  timing, hardware counter edge behavior, and native-C instruction-interior
+  93.75 MHz CPU clock, and the exact public `VI_CLOCK / (DACRATE + 1)`
+  rational, with one final ceiling; the integer rate returned by
+  `osAiSetFrequency` remains ABI/backend metadata rather than a device-clock
+  input. The shim computes its divisor with exact integer round-to-nearest and
+  admits fn64's bounded 132..=16384 range without mutating state on rejection.
+  Typed starts reject unaligned or out-of-field DRAM/LEN values and 24-bit
+  range overflow; raw register writes apply their public masks first.
+  Per public `rcp.h`, retiring the current slot while a next slot exists raises
+  MI AI and returns OS_EVENT_AI after promotion makes FIFO FULL transition
+  1-to-0. A lone/final BUSY transition does not fabricate that edge. This is
+  guest-time ordering, not a claim of hardware-verified AI bus timing. DACRATE
+  and BITRATE writes while either FIFO slot is occupied fail with named faults
+  because their active-transfer hardware behavior is not yet admitted. Its DAC
+  divisor uses the same IPL-selected NTSC/PAL/MPAL video clock as VI. Exact AI bus
+  clock-domain phase, per-edge `AI_LEN` decrement timing, other interrupt
+  causes, hardware counter edge behavior, and native-C instruction-interior
   observation remain open. SP, SI, VI, PI,
   AI, and DP pending bits and masks are
   one level-sensitive gate. Typed raw writes apply the acknowledgement commands
@@ -875,6 +892,16 @@ task calls out:
   failure before an ordinary rspboot handoff traps loudly. Exact HLE calls consume
   the public task contract, while a transactional LLE fallback carries a typed
   snapshot of all non-memory RSP state from rspboot into the interpreter.
+  Audio's next migration seam can instead acquire the exact Running task
+  generation as a non-cloneable `InFlight` owner before copying any state,
+  then execute pure owned rspboot once and fork its proven entry into HLE and
+  LLE lanes. The reference with no deferred DPC submission retains the pre-boot 8 MiB/RSP baseline,
+  exact boot-plus-ucode write intent, ordered IMEM generations, final LLE
+  machine state, and measured phase work without publishing an intermediate
+  boot state. It carries no commit authority and is not selected by live
+  policy until a concrete audio-family HLE executor compares exactly; the
+  current memory-command characterization and missing DSP arithmetic keep that
+  frontier loud.
   Graphics microcode selection is an explicit host policy:
   `HleOptimized` preserves the interactive compatibility path and its exact-
   digest transactional fallback, while `LleAccuracy` always continues the
@@ -892,8 +919,11 @@ task calls out:
   view. Registration must cover that complete device, including its final
   byte, while the generated-code allocation's appended MMIO/non-RDRAM backing is
   never exposed or transactionally cloned. Captured XBUS/LLE command words use
-  a private immutable staging suffix at the physical boundary; only the
-  physical prefix is copied back. One fabric-owned DPC register file and typed
+  a synthetic suffix and only the physical prefix is copied back, but RDP
+  commands can address that suffix during execution. Exact RT64 LLE captured-
+  DPC execution therefore remains a release residual until the native seam
+  accepts a separate command buffer and enforces physical-memory bounds. One
+  fabric-owned DPC register file and typed
   pending transaction retain START, END, CURRENT, STATUS, source (RDRAM or
   DMEM), range, and ownership token until the renderer commits or cancels it;
   raw MMIO, LLE, and shim submissions cannot bypass that state. The synchronous DPC model treats
@@ -902,7 +932,17 @@ task calls out:
   repeated `END` writes cannot replay an already-rendered prefix. Exact
   hardware DPC counters and latency, FREEZE/FLUSH interaction, subword register
   access, native execution paused mid-transaction, and silicon bus behavior
-  remain open. Graphics HLE preflight is
+  remain open. An additive phase-A scheduling seam can represent future
+  evidence-derived progress without changing that production model: runtime-owned
+  transaction/quantum/cursor types stop at an exact external-work barrier and
+  accept only the matching acknowledgment, while the ABI owns any renderer
+  continuation. Its schedules are explicit inputs used by deterministic synthetic
+  tests; they grant no RDP-cycle, intermediate-CURRENT, counter, FREEZE, or FLUSH
+  authority. The production atomic path represents its existing single
+  synchronous backend call as one identity-only acknowledgment through the
+  same validator before shadow publication; this changes no timing, device,
+  interrupt, rollback, or digest authority and does not select chunking.
+  Existing backends remain on the atomic path. Graphics HLE preflight is
   transactional and content-addressed: selecting an HLE decode mode admits no
   content. Both HLE backends return `NeedsLle` when the task-entry IMEM digest
   is unregistered; the reference renderer additionally decodes admitted tasks
@@ -1231,7 +1271,7 @@ task calls out:
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v23; artifact-identified mapped AOT retains its
+  release evidence under schema v28; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -1806,7 +1846,22 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v23 verification.
+artifacts are historical only; they cannot satisfy current v28 verification.
+DeviceState v11 binds the audio-task execution policy and translated artifact
+identity. DeviceState v12 additionally binds DPC CLOCK, BUFBUSY, PIPEBUSY, and
+TMEM. DeviceState v13 binds the ABI-owned RSP interpreter continuation:
+distinct exact/compatibility/unavailable/in-flight lifecycle tags, complete
+scalar and vector state, SP/DPC registers, and ordered pending DPC submissions.
+DeviceState v14 additionally binds each loaded/lineage/owner admission
+generation and the next process-monotonic generation so task-address reuse
+cannot alias a prior commit authority.
+DeviceState v15 narrows DPC CLOCK, BUFBUSY, PIPEBUSY, and TMEM to their public
+24-bit domains at the runtime import boundary and rejects a noncanonical value
+at release encoding. It does not claim modeled counter increments or close the
+still-open STATUS counter-clear/transaction interleavings.
+Fixed-cycle report construction admits only
+`AudioTaskExecutionPolicy::LleAccuracy`; translated callbacks cannot prove a
+match to live IMEM, and diagnostic skip is explicitly non-release.
 Pointer identity is excluded while the one-process-RDRAM
 invariant, buffer length, and guest-visible delivery fields are retained.
 MBC3 powered-off persistence keeps this boundary deterministic: the host
@@ -2125,9 +2180,9 @@ lives under `N64ModernRuntime`'s GPL-3.0-licensed tree (verified: that repo's
 top-level `COPYING` is GPL-3.0; `librecomp/` is not under the MIT-carved-out
 `N64Recomp/` subdirectory) — a real, load-bearing clean-room blocker, not
 routed around. The audio task-dispatch plumbing now owned by
-`osSpTaskStartGo_recomp` (`set_audio_ucode_fn`) is real and tested against a stand-in function; the
-genuine ucode requires either an MIT-clean RSP interpreter or a forked
-RSPRecomp codegen target, both future work.
+`osSpTaskStartGo_recomp` now executes admitted live audio-task IMEM through
+fn64's clean-room RSP interpreter. Optional translated callbacks carry an exact
+artifact identity but are not release authority for arbitrary live IMEM.
 
 **Wave 4 — `fn64-rt64` bridge (parallelizes against wave 3, converges at
 the RSP task boundary).**

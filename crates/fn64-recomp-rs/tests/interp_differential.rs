@@ -451,8 +451,8 @@ fn programs() -> Vec<Program> {
             budget: 64,
             init_regs: &[
                 (31, 0x8000_9000),
-                (8, 0xC040_0000),  // -3.0f
-                (9, 0x40E0_0000),  // 7.0f
+                (8, 0xC040_0000), // -3.0f
+                (9, 0x40E0_0000), // 7.0f
             ],
             rdram_len: 0,
             init_mem: &[],
@@ -554,9 +554,9 @@ fn programs() -> Vec<Program> {
             budget: 64,
             init_regs: &[
                 (31, 0x8000_9000),
-                (8, 0x4008_0000_0000_0000),  // 3.0
-                (9, 0x401C_0000_0000_0000),  // 7.0
-                (10, 0x2400_0000),           // Status = CU1(1<<29) | FR(1<<26)
+                (8, 0x4008_0000_0000_0000), // 3.0
+                (9, 0x401C_0000_0000_0000), // 7.0
+                (10, 0x2400_0000),          // Status = CU1(1<<29) | FR(1<<26)
             ],
             rdram_len: 0,
             init_mem: &[],
@@ -572,6 +572,479 @@ fn programs() -> Vec<Program> {
             ],
             entry: BASE,
             budget: 64,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        // Switching FR changes only the architectural view. The physical upper
+        // words seeded by the harness must survive FR=0 paired writes and both
+        // lanes must expose exactly the same state after repeated transitions.
+        Program {
+            name: "p_fpu_fr_transition",
+            bank: 0x2C,
+            vram: BASE,
+            words: &[
+                0x44A4_0000, // dmtc1 $a0,$f0 in FR=0 paired view
+                0x4086_6000, // mtc0 $a2,Status -> CU1|FR
+                0x4422_0000, // dmfc1 $v0,$f0 in FR=1
+                0x4423_0800, // dmfc1 $v1,$f1 in FR=1
+                0x4087_6000, // mtc0 $a3,Status -> CU1, FR=0
+                0x4408_0800, // mfc1 $t0,$f1 in FR=0
+                0x4086_6000, // mtc0 $a2,Status -> CU1|FR again
+                0x4429_0000, // dmfc1 $t1,$f0 recovers latent upper word
+            ],
+            entry: BASE,
+            budget: 10,
+            init_regs: &[
+                (4, 0x1122_3344_5566_7788),
+                (6, (1 << 29) | (1 << 26)),
+                (7, 1 << 29),
+            ],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_word_moves",
+            bank: 0x1E,
+            vram: BASE,
+            words: &[
+                0x4482_1800, // mtc1 $v0,$f3 (FR=0 high-word alias)
+                0x4404_1800, // mfc1 $a0,$f3
+            ],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[(2, 0x8123_4567)],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_dword_moves",
+            bank: 0x1F,
+            vram: BASE,
+            words: &[
+                0x44A2_2000, // dmtc1 $v0,$f4
+                0x4424_2000, // dmfc1 $a0,$f4
+            ],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[(2, 0x8123_4567_89AB_CDEF)],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_fcr_moves",
+            bank: 0x20,
+            vram: BASE,
+            words: &[
+                0x44C2_F800, // ctc1 $v0,$fcr31
+                0x4444_F800, // cfc1 $a0,$fcr31
+            ],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[(2, 0x0180_007F)],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_ctc1_trap",
+            bank: 0x21,
+            vram: BASE,
+            words: &[
+                0x44C2_F800, // ctc1 $v0,$fcr31: writes, then FPE
+                0x2404_0007, // mutation sentinel (must not execute)
+            ],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[(2, 0x0001_0804)], // Cause.V + Enable.V + prior Flag.I
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_ctc1_delay_trap",
+            bank: 0x22,
+            vram: BASE,
+            words: &[
+                0x1000_0001, // beq $zero,$zero,+1
+                0x44C2_F800, // ctc1 trap in delay slot
+                0,
+            ],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[(2, 1 << 17)], // Cause.E is unconditionally enabled
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_compare_s",
+            bank: 0x23,
+            vram: BASE,
+            words: &[0x4602_003C], // c.lt.s $f0,$f2
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_compare_d",
+            bank: 0x24,
+            vram: BASE,
+            words: &[0x4622_0032], // c.eq.d $f0,$f2
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_compare_disabled_invalid",
+            bank: 0x25,
+            vram: BASE,
+            words: &[0x4602_0038], // c.sf.s QNaN: Invalid, disabled
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_compare_enabled_invalid",
+            bank: 0x26,
+            vram: BASE,
+            words: &[
+                0x4602_0032, // c.eq.s SNaN: precise enabled Invalid
+                0x2404_0007, // mutation sentinel
+            ],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_compare_delay_invalid",
+            bank: 0x27,
+            vram: BASE,
+            words: &[
+                0x1000_0001, // beq $zero,$zero,+1
+                0x4622_0032, // c.eq.d SNaN in delay slot
+                0,
+            ],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_w_s_inexact",
+            bank: 0x28,
+            vram: BASE,
+            words: &[0x4600_0124], // cvt.w.s $f4,$f0
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_w_s_enabled_inexact",
+            bank: 0x29,
+            vram: BASE,
+            words: &[0x4600_0124, 0x2404_0007],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_l_d_delay_e",
+            bank: 0x2A,
+            vram: BASE,
+            words: &[0x1000_0001, 0x4620_0125, 0],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_fixed_to_float_rounding",
+            bank: 0x2D,
+            vram: BASE,
+            words: &[
+                0x4680_0120, // cvt.s.w $f4,$f0
+                0x4680_01A1, // cvt.d.w $f6,$f0
+                0x46A0_1220, // cvt.s.l $f8,$f2
+                0x46A0_12A1, // cvt.d.l $f10,$f2
+            ],
+            entry: BASE,
+            budget: 6,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_fixed_to_float_enabled_inexact",
+            bank: 0x2E,
+            vram: BASE,
+            words: &[
+                0x46A0_1121, // cvt.d.l $f4,$f2
+                0x2404_0007, // mutation sentinel
+            ],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_fixed_to_float_signed_56_e",
+            bank: 0x2F,
+            vram: BASE,
+            words: &[
+                0x46A0_1120, // cvt.s.l $f4,$f2
+                0x2404_0007, // mutation sentinel
+            ],
+            entry: BASE,
+            budget: 3,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_fixed_to_float_delay_enabled_inexact",
+            bank: 0x30,
+            vram: BASE,
+            words: &[
+                0x1000_0001, // beq $zero,$zero,+1
+                0x46A0_1121, // cvt.d.l $f4,$f2 -- enabled Inexact
+                0,
+            ],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_fixed_to_float_delay_signed_56_e",
+            bank: 0x31,
+            vram: BASE,
+            words: &[
+                0x1000_0001, // beq $zero,$zero,+1
+                0x46A0_1120, // cvt.s.l $f4,$f2 -- signed-56 E
+                0,
+            ],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_fixed_to_float_fr1_odd_l",
+            bank: 0x32,
+            vram: BASE,
+            words: &[0x46A0_1961], // cvt.d.l $f5,$f3
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_mfc0",
+            bank: 0x33,
+            vram: BASE,
+            words: &[0x4002_4800], // mfc0 $v0,Count
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_invalid_dmfc0",
+            bank: 0x34,
+            vram: BASE,
+            words: &[0x4022_3800], // dmfc0 $v0,$7 -- unsupported shape after guard
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_mtc0",
+            bank: 0x35,
+            vram: BASE,
+            words: &[0x4084_6000], // mtc0 $a0,Status
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_tlbwi",
+            bank: 0x36,
+            vram: BASE,
+            words: &[0x4200_0002],
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_eret",
+            bank: 0x37,
+            vram: BASE,
+            words: &[0x4200_0018],
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_bc0",
+            bank: 0x38,
+            vram: BASE,
+            words: &[0x4101_0001, 0x2404_0007, 0],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_delay_mtc0",
+            bank: 0x39,
+            vram: BASE,
+            words: &[0x1000_0001, 0x4084_6000, 0],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_kernel_authorized",
+            bank: 0x3A,
+            vram: BASE,
+            words: &[0x4084_7000], // mtc0 $a0,EPC
+            entry: BASE,
+            budget: 2,
+            init_regs: &[(4, 0x8123_4567)],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_user_cu0_authorized",
+            bank: 0x3B,
+            vram: BASE,
+            words: &[0x4084_7000],
+            entry: BASE,
+            budget: 2,
+            init_regs: &[(4, 0x8123_4567)],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop0_supervisor_cu0_authorized",
+            bank: 0x3C,
+            vram: BASE,
+            words: &[0x4084_7000],
+            entry: BASE,
+            budget: 2,
+            init_regs: &[(4, 0x8123_4567)],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        // An unauthorized BC0 pair is not admitted when one prior retirement
+        // leaves insufficient budget. Both lanes checkpoint before the
+        // authority check or any branch/delay effect.
+        Program {
+            name: "p_cop0_user_bc0_checkpoint",
+            bank: 0x3D,
+            vram: BASE,
+            words: &[
+                0x2403_0001, // addiu $v1,$zero,1 -- retires
+                0x4101_0001, // bc0t +1 -- pair does not fit
+                0x2404_0007, // addiu $a0,$zero,7 -- delay must not run
+                0,
+            ],
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_d_s_exact",
+            bank: 0x3E,
+            vram: BASE,
+            words: &[0x4600_1121], // cvt.d.s $f4,$f2
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_s_d_round",
+            bank: 0x3F,
+            vram: BASE,
+            words: &[0x4620_1120], // cvt.s.d $f4,$f2
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_s_d_enabled_inexact",
+            bank: 0x40,
+            vram: BASE,
+            words: &[0x4620_1120],
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_s_d_delay_overflow",
+            bank: 0x41,
+            vram: BASE,
+            words: &[0x1000_0001, 0x4620_1120, 0],
+            entry: BASE,
+            budget: 4,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_s_d_fr1_odd",
+            bank: 0x42,
+            vram: BASE,
+            words: &[0x4620_1960], // cvt.s.d $f5,$f3
+            entry: BASE,
+            budget: 2,
+            init_regs: &[],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        Program {
+            name: "p_cop1_cvt_s_d_qnan_e",
+            bank: 0x43,
+            vram: BASE,
+            words: &[0x4620_1120], // cvt.s.d $f4,$f2
+            entry: BASE,
+            budget: 2,
             init_regs: &[],
             rdram_len: 0,
             init_mem: &[],
@@ -669,29 +1142,34 @@ fn interpreter_matches_aot_bank_runner_on_ordinary_programs() {
 use fn64_recomp_rs::{{
     run_bank, BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeCatalog, CodeSpan,
     CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc,
-    InstructionBudget, ProgramError, Rdram, RecompContext,
+    InstructionBudget, PhysicalFgrState, ProgramError, Rdram, RecompContext,
 }};
 
 {emitted}
 
 type AotRunner = fn(ExecutionKey, InstructionBudget, &mut RecompContext, &mut Rdram) -> BlockRun;
 
-/// A comparable snapshot of all *observable* architectural state. The FPU-
-/// exercising programs make the COP1 register file and FCSR part of the
-/// differential surface, so this snapshots the full 32-slot FPR file and FCR31
-/// alongside the GPRs, HI/LO, COP0 Count/Compare/Random/cond, the FPU cond flag,
-/// and the complete RDRAM image.
+/// A comparable snapshot of the observable architectural state, including the
+/// complete physical FGR image across FR=0/FR=1. The physical snapshot retains
+/// every upper word that is latent in FR=0, so a matching active view cannot
+/// hide state lost by either lane.
 #[derive(PartialEq, Eq, Debug)]
 struct State {{
     gprs: [u64; 32],
     hi: u64,
     lo: u64,
+    fprs: PhysicalFgrState,
+    cop0_status: u32,
     cop0_count: u32,
     cop0_compare: u32,
     cop0_random: u32,
+    cop0_epc: u32,
+    cop0_error_epc: u32,
+    cop0_index: u32,
+    cop0_page_mask: u32,
+    cop0_entry_hi: u64,
     cop0_cond: bool,
     fpu_cond: bool,
-    fpr: [u64; 32],
     fcr31: u32,
     mem: Vec<u8>,
 }}
@@ -701,18 +1179,251 @@ fn snapshot(ctx: &RecompContext, mem: &[u8]) -> State {{
         gprs: ctx.gprs(),
         hi: ctx.hi,
         lo: ctx.lo,
+        fprs: ctx.physical_fgr_state(),
+        cop0_status: ctx.cop0_status,
         cop0_count: ctx.cop0_count,
         cop0_compare: ctx.cop0_compare,
         cop0_random: ctx.read_cop0(1),
+        cop0_epc: ctx.cop0_epc,
+        cop0_error_epc: ctx.cop0_error_epc,
+        cop0_index: ctx.cop0_index,
+        cop0_page_mask: ctx.cop0_page_mask,
+        cop0_entry_hi: ctx.cop0_entry_hi,
         cop0_cond: ctx.cop0_cond,
         fpu_cond: ctx.fpu_cond,
-        fpr: ctx.fpr_slots(),
         fcr31: ctx.read_fcr(31),
         mem: mem.to_vec(),
     }}
 }}
 
-fn make_ctx(init_regs: &[(u8, u64)]) -> RecompContext {{
+fn state_d_bits(state: &State, reg: usize) -> u64 {{
+    let physical = state.fprs.into_words();
+    if state.cop0_status & (1 << 26) != 0 {{
+        physical[reg]
+    }} else {{
+        assert_eq!(reg & 1, 0);
+        u64::from(physical[reg] as u32) | (u64::from(physical[reg + 1] as u32) << 32)
+    }}
+}}
+
+fn assert_fixed_to_float_case(
+    name: &str,
+    bank: BankId,
+    vram: u32,
+    run: &BlockRun,
+    state: &State,
+) {{
+    match name {{
+        "p_cop1_fixed_to_float_delay_enabled_inexact" => {{
+            assert!(matches!(
+                &run.exit,
+                BlockExit::Fault(CpuFault {{
+                    at,
+                    kind: CpuFaultKind::Exception {{
+                        exception: CpuException::FloatingPoint,
+                        epc,
+                        branch_delay: true,
+                        ..
+                    }},
+                }}) if *at == ExecutionKey::new(bank, GuestPc::new(vram + 4))
+                    && *epc == GuestPc::new(vram)
+            ));
+            assert_eq!(run.instructions, 2);
+            assert_eq!(state_d_bits(state, 4), 0x1122_3344_5566_7788);
+            assert_eq!(state.fcr31, (1 << 12) | (1 << 7));
+        }}
+        "p_cop1_fixed_to_float_delay_signed_56_e" => {{
+            assert!(matches!(
+                &run.exit,
+                BlockExit::Fault(CpuFault {{
+                    at,
+                    kind: CpuFaultKind::Exception {{
+                        exception: CpuException::FloatingPoint,
+                        epc,
+                        branch_delay: true,
+                        ..
+                    }},
+                }}) if *at == ExecutionKey::new(bank, GuestPc::new(vram + 4))
+                    && *epc == GuestPc::new(vram)
+            ));
+            assert_eq!(run.instructions, 2);
+            assert_eq!(state.fprs.into_words()[4] as u32, 0x5566_7788);
+            assert_eq!(state.fcr31, (1 << 17) | (1 << 2));
+        }}
+        "p_cop1_fixed_to_float_fr1_odd_l" => {{
+            assert_eq!(run.instructions, 1);
+            let physical = state.fprs.into_words();
+            assert_eq!(physical[3], 0x0020_0000_0000_0001);
+            assert_eq!(physical[5], 0x4340_0000_0000_0001);
+            assert_eq!(state.fcr31, 2 | (1 << 12) | (1 << 2));
+        }}
+        _ => {{}}
+    }}
+}}
+
+fn assert_float_to_float_case(
+    name: &str,
+    bank: BankId,
+    vram: u32,
+    run: &BlockRun,
+    state: &State,
+) {{
+    match name {{
+        "p_cop1_cvt_d_s_exact" => {{
+            assert_eq!(run.instructions, 1);
+            assert_eq!(state_d_bits(state, 4), 0x3FF8_0000_0000_0000);
+            assert_eq!(state.fcr31, 0);
+        }}
+        "p_cop1_cvt_s_d_round" => {{
+            assert_eq!(run.instructions, 1);
+            assert_eq!(state.fprs.into_words()[4] as u32, 0x3F80_0001);
+            assert_eq!(state.fcr31, 2 | (1 << 12) | (1 << 2));
+        }}
+        "p_cop1_cvt_s_d_enabled_inexact" => {{
+            assert!(matches!(
+                &run.exit,
+                BlockExit::Fault(CpuFault {{
+                    at,
+                    kind: CpuFaultKind::Exception {{
+                        exception: CpuException::FloatingPoint,
+                        epc,
+                        branch_delay: false,
+                        ..
+                    }},
+                }}) if *at == ExecutionKey::new(bank, GuestPc::new(vram))
+                    && *epc == GuestPc::new(vram)
+            ));
+            assert_eq!(run.instructions, 1);
+            assert_eq!(state.fprs.into_words()[4] as u32, 0xA5A5_5A5A);
+            assert_eq!(state.fcr31, (1 << 7) | (1 << 12));
+        }}
+        "p_cop1_cvt_s_d_delay_overflow" => {{
+            assert!(matches!(
+                &run.exit,
+                BlockExit::Fault(CpuFault {{
+                    at,
+                    kind: CpuFaultKind::Exception {{
+                        exception: CpuException::FloatingPoint,
+                        epc,
+                        branch_delay: true,
+                        ..
+                    }},
+                }}) if *at == ExecutionKey::new(bank, GuestPc::new(vram + 4))
+                    && *epc == GuestPc::new(vram)
+            ));
+            assert_eq!(run.instructions, 2);
+            assert_eq!(state.fprs.into_words()[4] as u32, 0xA5A5_5A5A);
+            assert_eq!(state.fcr31, (1 << 9) | (1 << 14) | (1 << 12));
+        }}
+        "p_cop1_cvt_s_d_fr1_odd" => {{
+            assert_eq!(run.instructions, 1);
+            assert_eq!(state.fprs.into_words()[5] as u32, 0x3FC0_0000);
+            assert_eq!(state.fcr31, 0);
+        }}
+        "p_cop1_cvt_s_d_qnan_e" => {{
+            assert!(matches!(
+                &run.exit,
+                BlockExit::Fault(CpuFault {{
+                    at,
+                    kind: CpuFaultKind::Exception {{
+                        exception: CpuException::FloatingPoint,
+                        epc,
+                        branch_delay: false,
+                        ..
+                    }},
+                }}) if *at == ExecutionKey::new(bank, GuestPc::new(vram))
+                    && *epc == GuestPc::new(vram)
+            ));
+            assert_eq!(run.instructions, 1);
+            assert_eq!(state.fprs.into_words()[4] as u32, 0xA5A5_5A5A);
+            assert_eq!(state.fcr31, (1 << 17) | (1 << 2));
+        }}
+        _ => {{}}
+    }}
+}}
+
+fn assert_cop0_authority_case(
+    name: &str,
+    bank: BankId,
+    vram: u32,
+    run: &BlockRun,
+    state: &State,
+) {{
+    if name == "p_cop0_user_bc0_checkpoint" {{
+        assert_eq!(
+            run.exit,
+            BlockExit::Checkpoint(ExecutionKey::new(bank, GuestPc::new(vram + 4)))
+        );
+        assert_eq!(run.instructions, 1);
+        assert_eq!(state.cop0_status, 2 << 3);
+        assert_eq!(state.cop0_random, 30);
+        assert_eq!(state.cop0_epc, 0x8000_2000);
+        assert_eq!(state.cop0_error_epc, 0x8000_3000);
+        assert_eq!(state.cop0_index, 7);
+        assert_eq!(state.cop0_page_mask, 0x6000);
+        assert_eq!(state.cop0_entry_hi, 0x1234_500A);
+        assert_eq!(state.gprs[2], 0x1122_3344_5566_7788);
+        assert_eq!(state.gprs[3], 1);
+        assert_eq!(state.gprs[4], 0);
+        return;
+    }}
+
+    let unauthorized = matches!(
+        name,
+        "p_cop0_user_mfc0"
+            | "p_cop0_user_invalid_dmfc0"
+            | "p_cop0_user_mtc0"
+            | "p_cop0_user_tlbwi"
+            | "p_cop0_user_eret"
+            | "p_cop0_user_bc0"
+            | "p_cop0_user_delay_mtc0"
+    );
+    if unauthorized {{
+        let delay = name == "p_cop0_user_delay_mtc0";
+        let at = if delay {{ vram + 4 }} else {{ vram }};
+        assert!(matches!(
+            &run.exit,
+            BlockExit::Fault(CpuFault {{
+                at: actual_at,
+                kind: CpuFaultKind::Exception {{
+                    exception: CpuException::CoprocessorUnusable,
+                    epc,
+                    branch_delay,
+                    instruction_code: 0,
+                    bad_vaddr: None,
+                    coprocessor: Some(0),
+                }},
+            }}) if *actual_at == ExecutionKey::new(bank, GuestPc::new(at))
+                && *epc == GuestPc::new(vram)
+                && *branch_delay == delay
+        ));
+        assert_eq!(run.instructions, if delay {{ 2 }} else {{ 1 }});
+        assert_eq!(state.cop0_status, 2 << 3);
+        assert_eq!(state.cop0_random, if delay {{ 30 }} else {{ 31 }});
+        assert_eq!(state.cop0_epc, 0x8000_2000);
+        assert_eq!(state.cop0_error_epc, 0x8000_3000);
+        assert_eq!(state.cop0_index, 7);
+        assert_eq!(state.cop0_page_mask, 0x6000);
+        assert_eq!(state.cop0_entry_hi, 0x1234_500A);
+        assert_eq!(state.gprs[2], 0x1122_3344_5566_7788);
+        if name == "p_cop0_user_bc0" {{
+            assert_eq!(state.gprs[4], 0, "BC0 guard must precede its delay slot");
+        }}
+        return;
+    }}
+
+    if matches!(
+        name,
+        "p_cop0_kernel_authorized"
+            | "p_cop0_user_cu0_authorized"
+            | "p_cop0_supervisor_cu0_authorized"
+    ) {{
+        assert_eq!(run.instructions, 1);
+        assert_eq!(state.cop0_epc, 0x8123_4567);
+    }}
+}}
+
+fn make_ctx(name: &str, init_regs: &[(u8, u64)]) -> RecompContext {{
     let mut ctx = RecompContext::new();
     // Enable COP1 (Status.CU1, bit 29) so the FPU programs run in both lanes;
     // harmless for the integer/control/memory programs. Real N64 code runs with
@@ -720,6 +1431,124 @@ fn make_ctx(init_regs: &[(u8, u64)]) -> RecompContext {{
     ctx.write_cop0(12, 1 << 29);
     for &(i, v) in init_regs {{
         ctx.set_r(i, v);
+    }}
+    if name.starts_with("p_cop0_user_") {{
+        ctx.cop0_status = 2 << 3;
+        ctx.set_r(2, 0x1122_3344_5566_7788);
+        ctx.cop0_epc = 0x8000_2000;
+        ctx.cop0_error_epc = 0x8000_3000;
+        ctx.cop0_index = 7;
+        ctx.cop0_page_mask = 0x6000;
+        ctx.cop0_entry_hi = 0x1234_500A;
+    }}
+    if name == "p_fpu_fr_transition" {{
+        ctx.replace_physical_fgr_state(PhysicalFgrState::from_words(
+            std::array::from_fn(|idx| {{
+                ((0xA500_0000u64 + idx as u64) << 32) | (0x5A00_0000u64 + idx as u64)
+            }}),
+        ));
+    }}
+    match name {{
+        "p_cop1_compare_s" => {{
+            ctx.set_f_s(0, 1.0);
+            ctx.set_f_s(2, 2.0);
+        }}
+        "p_cop1_compare_d" => {{
+            ctx.set_f_d(0, 4.0);
+            ctx.set_f_d(2, 4.0);
+        }}
+        "p_cop1_compare_disabled_invalid" => {{
+            ctx.set_f_bits(0, 0x7F80_0001);
+            ctx.set_f_s(2, 1.0);
+            ctx.write_fcr(31, 1 << 2);
+        }}
+        "p_cop1_compare_enabled_invalid" => {{
+            ctx.set_f_bits(0, 0x7FC0_0001);
+            ctx.set_f_s(2, 1.0);
+            ctx.write_fcr(31, (1 << 23) | (1 << 11) | (1 << 2) | 3);
+        }}
+        "p_cop1_compare_delay_invalid" => {{
+            ctx.set_d_bits(0, 0x7FF8_0000_0000_0001);
+            ctx.set_f_d(2, 1.0);
+            ctx.write_fcr(31, (1 << 23) | (1 << 11) | (1 << 2) | 3);
+        }}
+        "p_cop1_cvt_w_s_inexact" => {{
+            ctx.set_f_s(0, 1.5);
+        }}
+        "p_cop1_cvt_w_s_enabled_inexact" => {{
+            ctx.set_f_s(0, 1.5);
+            ctx.set_f_bits(4, 0xA5A5_5A5A);
+            ctx.write_fcr(31, 1 << 7);
+        }}
+        "p_cop1_cvt_l_d_delay_e" => {{
+            ctx.set_d_bits(0, 0x7FF0_0000_0000_0001);
+            ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+            ctx.write_fcr(31, 1 << 2);
+        }}
+        "p_cop1_fixed_to_float_rounding" => {{
+            ctx.set_f_bits(0, 0x0100_0001);
+            ctx.set_d_bits(2, 0x0020_0000_0000_0001);
+            ctx.write_fcr(31, 2);
+        }}
+        "p_cop1_fixed_to_float_enabled_inexact" => {{
+            ctx.set_d_bits(2, 0x0020_0000_0000_0001);
+            ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+            ctx.write_fcr(31, 1 << 7);
+        }}
+        "p_cop1_fixed_to_float_signed_56_e" => {{
+            ctx.set_d_bits(2, 1 << 55);
+            ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+            ctx.write_fcr(31, 1 << 2);
+        }}
+        "p_cop1_fixed_to_float_delay_enabled_inexact" => {{
+            ctx.set_d_bits(2, 0x0020_0000_0000_0001);
+            ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+            ctx.write_fcr(31, 1 << 7);
+        }}
+        "p_cop1_fixed_to_float_delay_signed_56_e" => {{
+            ctx.set_d_bits(2, 1 << 55);
+            ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+            ctx.write_fcr(31, 1 << 2);
+        }}
+        "p_cop1_fixed_to_float_fr1_odd_l" => {{
+            ctx.cop0_status |= 1 << 26;
+            ctx.set_d_bits(3, 0x0020_0000_0000_0001);
+            ctx.set_d_bits(5, 0x1122_3344_5566_7788);
+            ctx.write_fcr(31, 2);
+        }}
+        "p_cop1_cvt_d_s_exact" => {{
+            ctx.set_f_bits(2, 0x3FC0_0000);
+        }}
+        "p_cop1_cvt_s_d_round" => {{
+            ctx.set_d_bits(2, 0x3FF0_0000_1000_0000);
+            ctx.write_fcr(31, 2);
+        }}
+        "p_cop1_cvt_s_d_enabled_inexact" => {{
+            ctx.set_d_bits(2, 0x3FF0_0000_1000_0000);
+            ctx.set_f_bits(4, 0xA5A5_5A5A);
+            ctx.write_fcr(31, 1 << 7);
+        }}
+        "p_cop1_cvt_s_d_delay_overflow" => {{
+            ctx.set_d_bits(2, 0x47F0_0000_0000_0000);
+            ctx.set_f_bits(4, 0xA5A5_5A5A);
+            ctx.write_fcr(31, 1 << 9);
+        }}
+        "p_cop1_cvt_s_d_fr1_odd" => {{
+            ctx.cop0_status |= 1 << 26;
+            ctx.set_d_bits(3, 0x3FF8_0000_0000_0000);
+        }}
+        "p_cop1_cvt_s_d_qnan_e" => {{
+            ctx.set_d_bits(2, 0x7FF0_0000_0000_0001);
+            ctx.set_f_bits(4, 0xA5A5_5A5A);
+            ctx.write_fcr(31, 1 << 2);
+        }}
+        "p_cop0_user_cu0_authorized" => {{
+            ctx.cop0_status = (2 << 3) | (1 << 28);
+        }}
+        "p_cop0_supervisor_cu0_authorized" => {{
+            ctx.cop0_status = (1 << 3) | (1 << 28);
+        }}
+        _ => {{}}
     }}
     ctx
 }}
@@ -741,7 +1570,7 @@ fn check(
     let budget = InstructionBudget::new(budget).expect("budget >= 2");
 
     // Interpreter lane.
-    let mut interp_ctx = make_ctx(init_regs);
+    let mut interp_ctx = make_ctx(name, init_regs);
     let mut interp_storage = vec![0u8; rdram_len];
     for &(o, v) in init_mem {{
         interp_storage[o] = v;
@@ -758,7 +1587,7 @@ fn check(
     let interp_state = snapshot(&interp_ctx, &interp_storage);
 
     // AOT lane, identical initial state.
-    let mut aot_ctx = make_ctx(init_regs);
+    let mut aot_ctx = make_ctx(name, init_regs);
     let mut aot_storage = vec![0u8; rdram_len];
     for &(o, v) in init_mem {{
         aot_storage[o] = v;
@@ -768,6 +1597,13 @@ fn check(
         aot(key, budget, &mut aot_ctx, &mut mem)
     }};
     let aot_state = snapshot(&aot_ctx, &aot_storage);
+
+    assert_fixed_to_float_case(name, bank, vram, &interp_run, &interp_state);
+    assert_fixed_to_float_case(name, bank, vram, &aot_run, &aot_state);
+    assert_float_to_float_case(name, bank, vram, &interp_run, &interp_state);
+    assert_float_to_float_case(name, bank, vram, &aot_run, &aot_state);
+    assert_cop0_authority_case(name, bank, vram, &interp_run, &interp_state);
+    assert_cop0_authority_case(name, bank, vram, &aot_run, &aot_state);
 
     assert_eq!(
         interp_run, aot_run,

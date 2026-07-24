@@ -4,7 +4,7 @@ Status: local admission, typed program/microcode-kickoff identity checks, and
 the trusted series mechanism are wired. Representative private NTSC full-ROM
 reference and RT64 LLE/post-VI exact-ten series completed under schema v22 and
 were reverified on 2026-07-22. They are retained historical evidence and must
-be regenerated under current schema v23. Their private content remains outside the
+be regenerated under current schema v28. Their private content remains outside the
 repository. Combined with the retained public synthetic identified-native
 XBUS series, the matrix assessment accepted 3 scenarios and 30 reports,
 satisfied 12 of 162 requirements, and retained the other 150 as explicit
@@ -202,7 +202,7 @@ digits, dots, underscores, or hyphens, beginning with a letter or digit. A raw
 
 `program_evidence_lane` is the pre-run executable-authority contract. A
 `full_rom` or `combined` run must select `typed_observed_function`,
-`typed_block_program`, or `identified_native_archive`; the resulting v23
+`typed_block_program`, or `identified_native_archive`; the resulting v28
 report must carry that exact execution-destination source.
 `typed_observed_function` asserts that the host installed the generated
 artifact's `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker and that the
@@ -215,7 +215,7 @@ ten-run series spends time booting the game.
 
 The v7 `runner` section retains the v6 contract: it binds the exact native entry image, program-build
 receipt, working directory, argument vector, fixed child environment, gate
-cycle, and expected v23 execution source. The executable and receipt must be
+cycle, and expected v28 execution source. The executable and receipt must be
 built before admission. The trusted runner clears the ambient environment,
 launches the executable directly, and owns `ROM`,
 `FN64_RELEASE_ROM_CLASS`, the gate/report/event variables, and the staged
@@ -244,8 +244,8 @@ mechanism coverage from each validated committed-boundary report. A backend-
 recognized microcode family is diagnostic/optimization evidence only.
 Public-microcode credit requires independent exact digest-to-family
 adjudication by the immutable project-owned catalog v1, which is currently
-empty pending allowed-source digest provenance; matrix v18 therefore cannot yet
-satisfy any public-microcode requirement. Schema v23 binds RT64's resolved
+empty pending allowed-source digest provenance; matrix v19 therefore cannot yet
+satisfy any public-microcode requirement. Schema v28 binds RT64's resolved
 graphics API independently of the requested settings and derives
 `macos-metal` or `linux-vulkan` target credit only from an authoritative
 matching RT64 post-VI report. Windows D3D12 and Vulkan are distinguished, and
@@ -413,7 +413,7 @@ Rust. This is a local single-owner execution guarantee: a malicious same-UID
 process able to discover, chmod, and replace child or microcode stages between
 verification and operating-system open/spawn is outside scope. Each child gets a distinct derived event
 identity and new report/journal/log paths.
-The runner verifies each terminal v3 journal, exact v23
+The runner verifies each terminal v3 journal, exact v28
 scenario/cycle/input/source, the five fixed-cycle artifacts, live-minimum
 closure, zero reached unsupported events, and the admitted microcode pair
 before starting the next child. For a
@@ -524,7 +524,7 @@ attestation connecting those identities.
 
 The build receipt does not claim microcode-data consumption. At graphics-task
 start, the ABI hashes the exact logical RDRAM bytes at the original task
-microcode-data address and length. Report schema `fn64.release-gate.v23`
+microcode-data address and length. Report schema `fn64.release-gate.v28`
 records those fields in
 the same recognition event as the live 4 KiB IMEM SHA-256 and recognized
 family, using `fn64.rsp-rdp-observations.v2`. Pinned raw-window classification
@@ -543,7 +543,7 @@ it does not independently trace every later RSP read of the data image.
 These checks make a valid production contract launchable. Representative
 private reference and RT64 LLE/post-VI exact-ten series completed under v22 on
 2026-07-22 and were independently reverified from their retained contracts,
-runner, receipts, reports, and journals. They are historical under v23 and
+runner, receipts, reports, and journals. They are historical under v28 and
 must be regenerated before current certification. The retained private receipts carry
 the exact semantic-report and series identities. The matrix path accepted
 those 20 private reports plus 10 retained public XBUS reports and emitted a
@@ -585,8 +585,21 @@ The Rust integration test makes the trusted runner launch ten fresh test
 processes. Every child executes the real executor, PI/SI/AI device fabric,
 graphics-task RSP path, raw RDP submission, reference renderer, and committed
 VI boundary before producing its five-channel report and journal. No private
-fixture is required for these checks, and none of the synthetic paths,
-lengths, or hashes is written into a tracked file.
+fixture is required for these checks. The no-program path retains no content
+identity; the feature-gated native path intentionally checks in only its
+public synthetic semantic fingerprint, never private input or output.
+
+The feature-gated native form measures both caller-supplied build-produced
+archives and child invocation inside a specialized operation that returns only
+a self-hashed receipt, never a verified-contract, verified-series, or matrix
+authority. Repository acceptance comes only from equality with the complete
+checked-in `aarch64-apple-darwin` schema-v28 fingerprint. That golden includes
+the target/platform, each archive hash, their combined execution identity, and
+all report semantics. It passed 10/10 consecutive parent invocations (100 fresh
+children) on macOS arm64 on 2026-07-24. Compiler, SDK, or target drift fails
+closed and requires a separately reviewed target-specific golden. This remains
+public synthetic mechanism evidence and supplies no private-ROM or
+representative-ROM authority.
 
 This admission self-test is separate from the live non-default
 `extended-gbi-evidence` renderer fixture. That fixture substitutes RT64's

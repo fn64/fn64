@@ -1,19 +1,30 @@
 use super::*;
 use sha2::{Digest, Sha256};
+use std::num::NonZeroU64;
 
-/// The `OOT_*` spellings these knobs shipped under before they were renamed to
-/// the game-agnostic `FN64_*` prefix. Nothing about dumping PCM or skipping
-/// audio ucode is OoT-specific; the names were bring-up residue.
+/// The `OOT_*` spellings these diagnostic knobs shipped under before they were
+/// renamed to the game-agnostic `FN64_*` prefix. The audio skip knob is retired
+/// entirely below because task execution policy must be explicit and typed.
 ///
 /// An unset env var means "feature off", so a bare rename would make a stale
-/// `OOT_SKIP_AUDIO_UCODE=1` invocation silently do nothing -- the run would
+/// `OOT_DUMP_AUDIO_PCM=1` invocation silently do nothing -- the run would
 /// look fine and quietly measure the wrong thing. Trap it instead.
 const RENAMED_ENV_VARS: &[(&str, &str)] = &[
-    ("OOT_SKIP_AUDIO_UCODE", "FN64_SKIP_AUDIO_UCODE"),
     ("OOT_DUMP_AUDIO_PCM", "FN64_DUMP_AUDIO_PCM"),
     ("OOT_DUMP_AUDIO_TASK", "FN64_DUMP_AUDIO_TASK"),
     ("OOT_AUDIO_UCODE_TIMING", "FN64_AUDIO_UCODE_TIMING"),
     ("OOT_PHASE_TIMING", "FN64_PHASE_TIMING"),
+];
+
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "OOT_SKIP_AUDIO_UCODE",
+        "call fn64_abi::set_audio_task_diagnostic_skip() explicitly",
+    ),
+    (
+        "FN64_SKIP_AUDIO_UCODE",
+        "call fn64_abi::set_audio_task_diagnostic_skip() explicitly",
+    ),
 ];
 
 /// Panic if any pre-rename `OOT_*` knob is still set, naming its replacement.
@@ -26,6 +37,11 @@ pub(crate) fn assert_no_legacy_env_vars() {
     for (old, new) in RENAMED_ENV_VARS {
         if std::env::var_os(old).is_some() {
             panic!("{}", legacy_env_var_message(old, new));
+        }
+    }
+    for (name, replacement) in RETIRED_ENV_VARS {
+        if std::env::var_os(name).is_some() {
+            panic!("{name} was retired; {replacement}");
         }
     }
 }
@@ -493,6 +509,42 @@ struct PendingImemReplacement {
     image: [u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
 }
 
+/// Canonical ABI owner for the RSP interpreter registers that are not stored
+/// in [`fn64_runtime::LiveDeviceFabric`].
+///
+/// The device fabric owns DMEM, IMEM, PC, and the guest-visible SP/DPC
+/// register image. This value owns the scalar register file, complete vector
+/// unit, branch/overlay continuation latches, and a matching copy of the
+/// device latches needed to restore one interpreter atomically. Diagnostic
+/// instruction accounting is deliberately absent from the carried state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RspInterpreterStateEvidenceSnapshot {
+    /// IPL/ROM reset has not yet entered the interpreter.
+    Reset,
+    /// Complete future-visible state after the last committed interpreter
+    /// phase. `RspMachineState::from_architectural_state` restores it with a
+    /// fresh diagnostic counter.
+    Exact(fn64_audio::rsp::runtime::RspArchitecturalState),
+    /// An optimized HLE backend completed successfully but did not expose
+    /// the ucode's true terminal scalar/VU image. The carried value is the
+    /// rspboot-entry image with its consumed overlay continuation cleared.
+    HleCompatibility(fn64_audio::rsp::runtime::RspArchitecturalState),
+    /// A direct-IMEM HLE task completed without entering rspboot and without
+    /// exposing any terminal scalar/VU image. No later interpreter task may
+    /// silently reuse the older exact snapshot.
+    HleCompatibilityUnavailable {
+        task_offset: u32,
+        admission_generation: RspTaskAdmissionGeneration,
+    },
+    /// A synchronous interpreter phase has consumed the ready state. If that
+    /// phase unwinds, another task traps instead of silently creating a fresh
+    /// core and hiding the interrupted continuation.
+    InFlight {
+        task_offset: u32,
+        admission_generation: RspTaskAdmissionGeneration,
+    },
+}
+
 fn imem_sha256(imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE]) -> [u8; 32] {
     Sha256::digest(imem).into()
 }
@@ -533,6 +585,7 @@ impl RspTaskLineagePhase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RspTaskLineage {
+    admission_generation: RspTaskAdmissionGeneration,
     original_header: OsTaskHeader,
     data_identity: Option<TaskMicrocodeDataIdentity>,
     phase: RspTaskLineagePhase,
@@ -542,6 +595,7 @@ impl RspTaskLineage {
     pub(crate) fn evidence_snapshot(&self, task_offset: u32) -> RspTaskLineageEvidenceSnapshot {
         RspTaskLineageEvidenceSnapshot {
             task_offset,
+            admission_generation: self.admission_generation.get(),
             original_header: self.original_header,
             data_identity: self
                 .data_identity
@@ -560,9 +614,45 @@ impl RspTaskLineage {
     }
 }
 
+/// Process-monotonic identity of one successfully admitted `osSpTaskLoad`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RspTaskAdmissionGeneration(NonZeroU64);
+
+impl RspTaskAdmissionGeneration {
+    /// Constructs an evidence value from a nonzero admission generation.
+    ///
+    /// Runtime admission mints these monotonically; this constructor exists
+    /// for evidence-schema consumers and fixtures that must reproduce an
+    /// already-observed generation without making zero representable.
+    pub const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn first() -> Self {
+        Self::new(NonZeroU64::MIN)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    fn advance(&mut self) -> Self {
+        let current = *self;
+        self.0 = NonZeroU64::new(
+            self.0
+                .get()
+                .checked_add(1)
+                .expect("RSP task admission generation overflow"),
+        )
+        .expect("incremented RSP task generation cannot be zero");
+        current
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LoadedRspTask {
     task_addr: RdramAddr,
+    admission_generation: RspTaskAdmissionGeneration,
     header: OsTaskHeader,
     resumed_data_identity: Option<TaskMicrocodeDataIdentity>,
 }
@@ -571,6 +661,7 @@ impl LoadedRspTask {
     pub(crate) fn evidence_snapshot(&self) -> LoadedRspTaskEvidenceSnapshot {
         LoadedRspTaskEvidenceSnapshot {
             task_offset: self.task_addr.offset(),
+            admission_generation: self.admission_generation.get(),
             header: self.header,
             resumed_data_identity: self
                 .resumed_data_identity
@@ -602,7 +693,8 @@ unsafe fn task_microcode_data_identity(
         task_addr.offset()
     );
     assert_eq!(
-        registered_rdram, rdram,
+        registered_rdram,
+        rdram,
         "RSP task {:#010x} microcode-data capture does not use the registered process RDRAM allocation",
         task_addr.offset()
     );
@@ -726,14 +818,17 @@ enum AdmittedTaskImageShape {
 #[derive(Clone, Debug)]
 enum AdmittedHleEntry {
     BootOverlay(Box<HleBootResult>),
-    DirectImem { task: OsTaskHeader },
+    DirectImem {
+        task: OsTaskHeader,
+        lle_machine_state: Option<Box<fn64_audio::rsp::runtime::RspMachineState>>,
+    },
 }
 
 impl AdmittedHleEntry {
     fn task(&self) -> OsTaskHeader {
         match self {
             Self::BootOverlay(boot) => boot.task,
-            Self::DirectImem { task } => *task,
+            Self::DirectImem { task, .. } => *task,
         }
     }
 
@@ -747,9 +842,106 @@ impl AdmittedHleEntry {
     fn into_lle_machine_state(self) -> Option<fn64_audio::rsp::runtime::RspMachineState> {
         match self {
             Self::BootOverlay(boot) => Some(boot.machine_state),
+            Self::DirectImem {
+                lle_machine_state, ..
+            } => lle_machine_state.map(|state| *state),
+        }
+    }
+
+    fn hle_compatibility_state(&self) -> Option<fn64_audio::rsp::runtime::RspMachineState> {
+        match self {
+            Self::BootOverlay(boot) => Some(boot.machine_state.clone()),
             Self::DirectImem { .. } => None,
         }
     }
+}
+
+/// Acquire the persistent interpreter owner for a direct-IMEM optimized phase
+/// before any backend can mutate renderer state or schedule completion.
+///
+/// The returned snapshot is the untouched PC-zero continuation used if HLE
+/// preflight requests LLE. A prior implementation waited until the final
+/// compatibility commit: a different task could remain `InFlight` while this
+/// task mutated the backend, then trap only after that mutation. Acquiring the
+/// owner here closes that exact interleaving; a backend unwind deliberately
+/// leaves this same-task owner `InFlight`.
+unsafe fn begin_direct_hle_phase(
+    rdram: *mut u8,
+    task_addr: RdramAddr,
+) -> fn64_audio::rsp::runtime::RspMachineState {
+    let (dmem, rdram_len, static_aliases) = with_host(|host| {
+        (
+            *host
+                .device_fabric
+                .rsp_memory()
+                .bank(fn64_runtime::RspMemoryBank::Dmem),
+            host.runtime_rdram_len,
+            host.sections.loaded_static_storage_ranges(),
+        )
+    });
+    assert!(
+        !rdram.is_null() && rdram_len != 0,
+        "direct-IMEM HLE task has no registered process RDRAM allocation"
+    );
+    let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
+    let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
+    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
+    machine.set_dma_rdram_ranges(dma_ranges);
+    machine.load_dmem_logical(&dmem);
+    begin_rsp_interpreter_phase(task_addr, &mut machine);
+    machine.snapshot_state()
+}
+
+fn resume_direct_hle_phase(task_addr: RdramAddr) {
+    let admission_generation = running_task_admission_generation(task_addr);
+    with_host(|host| match host.rsp_interpreter_state {
+        RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+            task_offset,
+            admission_generation: prior_generation,
+        } if task_offset == task_addr.offset()
+            && prior_generation.get() < admission_generation.get() =>
+        {
+            host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset,
+                admission_generation,
+            };
+        }
+        RspInterpreterStateEvidenceSnapshot::InFlight { task_offset, .. }
+        | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+            task_offset, ..
+        } => {
+            panic!(
+                "direct-IMEM HLE task {:#010x} cannot resume state owned by task {task_offset:#010x}",
+                task_addr.offset()
+            )
+        }
+        _ => panic!(
+            "direct-IMEM HLE task {:#010x} cannot resume without its suspended compatibility owner",
+            task_addr.offset()
+        ),
+    });
+}
+
+fn running_task_admission_generation(task_addr: RdramAddr) -> RspTaskAdmissionGeneration {
+    with_host(|host| {
+        let lineage = host
+            .rsp_task_lineages
+            .get(&task_addr.offset())
+            .unwrap_or_else(|| {
+                panic!(
+                    "RSP task {:#010x} has no admitted task lineage",
+                    task_addr.offset()
+                )
+            });
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::Running,
+            "RSP task {:#010x} cannot acquire interpreter ownership from lineage phase {:?}",
+            task_addr.offset(),
+            lineage.phase
+        );
+        lineage.admission_generation
+    })
 }
 
 fn aligned_sp_image_size(size: u32) -> Option<u32> {
@@ -795,6 +987,25 @@ pub enum GraphicsTaskExecutionPolicy {
     LleAccuracy,
 }
 
+/// Installed-ROM executor for admitted `M_AUDTASK` microcode.
+///
+/// `Translated` identifies the exact host artifact but is not an accuracy
+/// claim: the callback ABI does not itself prove that artifact corresponds to
+/// the task's complete live IMEM image. Fixed-cycle release evidence therefore
+/// admits only `LleAccuracy`, which executes that image directly. The explicit
+/// diagnostic mode preserves fast render-only probes without letting a skipped
+/// synth masquerade as an unconfigured or executed task.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioTaskExecutionPolicy {
+    #[default]
+    Unconfigured,
+    Translated {
+        artifact_sha256: [u8; 32],
+    },
+    LleAccuracy,
+    DiagnosticSkip,
+}
+
 /// Exact registered renderer state frozen for fixed-cycle release evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderEnvironmentEvidenceSnapshot {
@@ -826,6 +1037,681 @@ fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
 
 #[cfg(not(feature = "recomp-rs"))]
 fn commit_rsp_rdram_writes(_written: &[(usize, usize)]) {}
+
+/// Same-task authority required to replace one in-flight interpreter phase.
+/// Construction is confined to the live owner check below; publication
+/// consumes it only after rechecking that ownership under the final HostState
+/// borrow.
+#[cfg(test)]
+struct VerifiedAudioCommitOwner {
+    task_addr: RdramAddr,
+    admission_generation: RspTaskAdmissionGeneration,
+}
+
+#[cfg(test)]
+fn verified_audio_commit_owner(
+    task_addr: RdramAddr,
+    admission_generation: NonZeroU64,
+) -> VerifiedAudioCommitOwner {
+    let admission_generation = RspTaskAdmissionGeneration(admission_generation);
+    with_host(|host| {
+        match host.rsp_interpreter_state {
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } if task_offset == task_addr.offset() && owner_generation == admission_generation => {
+                let lineage = host
+                    .rsp_task_lineages
+                    .get(&task_addr.offset())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "verified audio task {:#010x} has no Running task lineage",
+                            task_addr.offset()
+                        )
+                    });
+                assert_eq!(
+                    lineage.phase,
+                    RspTaskLineagePhase::Running,
+                    "verified audio task {:#010x} cannot commit lineage phase {:?}",
+                    task_addr.offset(),
+                    lineage.phase
+                );
+                assert_eq!(
+                    lineage.admission_generation,
+                    admission_generation,
+                    "verified audio task {:#010x} admission generation {} does not own Running generation {}",
+                    task_addr.offset(),
+                    admission_generation.get(),
+                    lineage.admission_generation.get()
+                );
+                VerifiedAudioCommitOwner {
+                    task_addr,
+                    admission_generation,
+                }
+            }
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } => panic!(
+            "verified audio task {:#010x} generation {} cannot commit interpreter state owned by task {task_offset:#010x} generation {}",
+            task_addr.offset(),
+            admission_generation.get(),
+            owner_generation.get()
+        ),
+        _ => panic!(
+            "verified audio task {:#010x} cannot commit without an in-flight interpreter owner",
+            task_addr.offset()
+        ),
+    }
+    })
+}
+
+#[cfg(test)]
+fn verified_rsp_execution_state(
+    machine: &fn64_audio::rsp::runtime::RspMachineState,
+    pc_low12: u32,
+) -> fn64_runtime::RspExecutionState {
+    rsp_execution_state_from_architectural(machine.architectural_state(), pc_low12)
+}
+
+fn rsp_execution_state_from_architectural(
+    state: &fn64_audio::rsp::runtime::RspArchitecturalState,
+    pc_low12: u32,
+) -> fn64_runtime::RspExecutionState {
+    fn64_runtime::RspExecutionState {
+        pc: pc_low12,
+        sp_status: state.sp_status(),
+        sp_semaphore: state.sp_semaphore(),
+        sp_dma_mem_addr: fn64_runtime::RspMemAddr::from_register(state.dma_mem_address()),
+        sp_dma_dram_addr: RdramAddr::from_offset(state.dma_dram_address() & 0x00ff_ffff),
+        sp_dma_read_length: state.dma_read_length(),
+        sp_dma_write_length: state.dma_write_length(),
+        dpc_start: state.dp_start(),
+        dpc_end: state.dp_end(),
+        dpc_current: state.dp_current(),
+        dpc_status: state.dp_status(),
+        dpc_clock: state.dp_clock(),
+        dpc_busy: state.dp_busy(),
+        dpc_pipe_busy: state.dp_pipe_busy(),
+        dpc_tmem_busy: state.dp_tmem_busy(),
+    }
+}
+
+fn begin_rsp_interpreter_phase(
+    task_addr: RdramAddr,
+    machine: &mut fn64_audio::rsp::runtime::RspMachine<'_>,
+) {
+    let prior = with_host(|host| {
+        let lineage = host
+            .rsp_task_lineages
+            .get(&task_addr.offset())
+            .unwrap_or_else(|| {
+                panic!(
+                    "RSP task {:#010x} has no admitted task lineage",
+                    task_addr.offset()
+                )
+            });
+        assert_eq!(
+            lineage.phase,
+            RspTaskLineagePhase::Running,
+            "RSP task {:#010x} cannot acquire interpreter ownership from lineage phase {:?}",
+            task_addr.offset(),
+            lineage.phase
+        );
+        let admission_generation = lineage.admission_generation;
+        match &host.rsp_interpreter_state {
+            RspInterpreterStateEvidenceSnapshot::InFlight { task_offset, .. } => panic!(
+                "RSP task {:#010x} cannot start: task {task_offset:#010x} left a pending interpreter continuation",
+                task_addr.offset()
+            ),
+            RspInterpreterStateEvidenceSnapshot::Reset => None,
+            RspInterpreterStateEvidenceSnapshot::Exact(state)
+            | RspInterpreterStateEvidenceSnapshot::HleCompatibility(state) => {
+                Some(state.clone())
+            }
+            RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                task_offset,
+                ..
+            } => panic!(
+                "RSP task {:#010x} cannot start after direct-IMEM HLE task {task_offset:#010x}: terminal scalar/VU state is unavailable",
+                task_addr.offset()
+            ),
+        }
+        .inspect(|state| {
+            assert_eq!(
+                state.resume_address(),
+                0,
+                "RSP task {:#010x} cannot inherit pending overlay resume address {:#06x}",
+                task_addr.offset(),
+                state.resume_address()
+            );
+            assert!(
+                !state.resume_delay(),
+                "RSP task {:#010x} cannot inherit a pending branch-delay continuation",
+                task_addr.offset()
+            );
+            assert!(
+                state.dp_submissions().is_empty(),
+                "RSP task {:#010x} cannot inherit {} uncommitted DPC submission(s)",
+                task_addr.offset(),
+                state.dp_submissions().len()
+            );
+        });
+        let prior = std::mem::replace(
+            &mut host.rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: task_addr.offset(),
+                admission_generation,
+            },
+        );
+        match prior {
+            RspInterpreterStateEvidenceSnapshot::Reset => None,
+            RspInterpreterStateEvidenceSnapshot::Exact(state)
+            | RspInterpreterStateEvidenceSnapshot::HleCompatibility(state) => Some(state),
+            RspInterpreterStateEvidenceSnapshot::InFlight { .. }
+            | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { .. } => {
+                unreachable!("invalid prior interpreter state rejected before acquisition")
+            }
+        }
+    });
+
+    if let Some(state) = prior {
+        machine.restore_architectural_state(state);
+    }
+    // CPU MMIO and osSpTaskLoad execute outside the interpreter between task
+    // snapshots. The fabric is authoritative for every duplicated SP/DPC
+    // latch; scalar, VU, and continuation state remain owned above.
+    let fabric = with_host(|host| host.device_fabric.rsp_execution_state());
+    machine.overlay_device_execution_state(fabric);
+    machine.set_sp_status_raw(
+        machine.sp_status() & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE),
+    );
+}
+
+/// Sole live-runtime authority paired with one speculative whole-audio-task
+/// capture. Deliberately non-cloneable: publication will eventually consume
+/// this value after rechecking the same task admission generation.
+#[allow(dead_code)]
+struct AudioWholeTaskOwner {
+    task_addr: RdramAddr,
+    admission_generation: RspTaskAdmissionGeneration,
+}
+
+/// Owned pre-rspboot input paired with the live interpreter owner acquired
+/// before any physical-device state is cloned.
+#[allow(dead_code)]
+struct CapturedAudioWholeTask {
+    owner: AudioWholeTaskOwner,
+    input: fn64_audio::hle_rspboot::AudioRspbootInput,
+}
+
+/// Capture one boot-overlay audio task without executing rspboot or mutating
+/// any live device owner other than the persistent interpreter state token.
+///
+/// Acquiring `InFlight` first closes the same-address reuse interleaving: any
+/// later failure intentionally retains that owner, so a second task cannot
+/// hide an incomplete speculative phase behind a fresh interpreter snapshot.
+#[allow(dead_code)]
+unsafe fn capture_audio_whole_task_input(
+    rdram: *mut u8,
+    task_addr: RdramAddr,
+    loaded_header: OsTaskHeader,
+) -> CapturedAudioWholeTask {
+    let mut scratch_rdram = [];
+    let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut scratch_rdram);
+    begin_rsp_interpreter_phase(task_addr, &mut machine);
+    let initial_machine_state = machine.snapshot_state();
+    drop(machine);
+
+    let (owner, registered_rdram, allocation_len, rsp_memory, initial_pc_low12) = with_host(
+        |host| {
+            let (task_offset, admission_generation) = match host.rsp_interpreter_state {
+                RspInterpreterStateEvidenceSnapshot::InFlight {
+                    task_offset,
+                    admission_generation,
+                } if task_offset == task_addr.offset() => (task_offset, admission_generation),
+                _ => unreachable!("begin_rsp_interpreter_phase installed this task owner"),
+            };
+            let lineage = host
+                .rsp_task_lineages
+                .get(&task_offset)
+                .expect("whole-audio capture lost its Running task lineage after acquisition");
+            assert_eq!(
+                (lineage.admission_generation, lineage.phase),
+                (admission_generation, RspTaskLineagePhase::Running),
+                "whole-audio capture task {task_offset:#010x} lost its exact Running admission after acquisition"
+            );
+            (
+                AudioWholeTaskOwner {
+                    task_addr,
+                    admission_generation,
+                },
+                host.runtime_rdram,
+                host.runtime_rdram_len,
+                host.device_fabric.rsp_memory().snapshot(),
+                host.device_fabric.sp_pc(),
+            )
+        },
+    );
+
+    assert!(
+        !rdram.is_null()
+            && rdram == registered_rdram
+            && allocation_len >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "whole-audio capture must use the registered complete physical RDRAM allocation"
+    );
+    // SAFETY: process registration owns this allocation for the runtime and
+    // the length check covers exactly the physical device. `InFlight` is only
+    // protocol ownership of this RSP task; the physical copy is atomic because
+    // this synchronous shim runs with one runnable guest and invokes no host
+    // callback between registration validation and the copy.
+    let physical_rdram = unsafe {
+        std::slice::from_raw_parts(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE).to_vec()
+    };
+    let input = fn64_audio::hle_rspboot::AudioRspbootInput::new(
+        task_addr,
+        loaded_header,
+        physical_rdram,
+        rsp_memory,
+        initial_pc_low12,
+        initial_machine_state,
+    )
+    .unwrap_or_else(|error| panic!("whole-audio preboot capture rejected: {error:?}"));
+
+    CapturedAudioWholeTask { owner, input }
+}
+
+fn continue_rsp_interpreter_phase(
+    task_addr: RdramAddr,
+    machine: &mut fn64_audio::rsp::runtime::RspMachine<'_>,
+    state: fn64_audio::rsp::runtime::RspMachineState,
+) {
+    let admission_generation = running_task_admission_generation(task_addr);
+    let architectural = state.into_architectural_state();
+    with_host(|host| {
+        match &host.rsp_interpreter_state {
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } if *task_offset == task_addr.offset() && *owner_generation == admission_generation => {}
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } => panic!(
+            "RSP task {:#010x} generation {} cannot continue interpreter state owned by task {task_offset:#010x} generation {}",
+            task_addr.offset(),
+            admission_generation.get(),
+            owner_generation.get()
+        ),
+        RspInterpreterStateEvidenceSnapshot::Reset
+        | RspInterpreterStateEvidenceSnapshot::Exact(_)
+        | RspInterpreterStateEvidenceSnapshot::HleCompatibility(_)
+        | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { .. } => panic!(
+            "RSP task {:#010x} has a same-task machine snapshot without an in-flight rspboot owner",
+            task_addr.offset()
+        ),
+    }
+    });
+    // rspboot's instruction count contributes to task latency, but is not a
+    // hardware register and must not seed the ucode phase's diagnostics.
+    machine.restore_architectural_state(architectural);
+}
+
+fn commit_rsp_interpreter_phase(
+    task_addr: RdramAddr,
+    state: fn64_audio::rsp::runtime::RspArchitecturalState,
+) {
+    let admission_generation = running_task_admission_generation(task_addr);
+    assert_eq!(
+        state.resume_address(),
+        0,
+        "RSP task {:#010x} reached a commit boundary with pending overlay resume address {:#06x}",
+        task_addr.offset(),
+        state.resume_address()
+    );
+    assert!(
+        !state.resume_delay(),
+        "RSP task {:#010x} reached a commit boundary in a branch-delay continuation",
+        task_addr.offset()
+    );
+    assert!(
+        state.dp_submissions().is_empty(),
+        "RSP task {:#010x} reached a commit boundary with {} uncommitted DPC submission(s)",
+        task_addr.offset(),
+        state.dp_submissions().len()
+    );
+    with_host(|host| {
+        match host.rsp_interpreter_state {
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+        {
+            host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Exact(state);
+        }
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } => panic!(
+            "RSP task {:#010x} generation {} cannot commit interpreter state owned by task {task_offset:#010x} generation {}",
+            task_addr.offset(),
+            admission_generation.get(),
+            owner_generation.get()
+        ),
+        _ => panic!(
+            "RSP task {:#010x} cannot commit without an in-flight interpreter owner",
+            task_addr.offset()
+        ),
+    }
+    });
+}
+
+fn commit_rsp_hle_compatibility(
+    task_addr: RdramAddr,
+    state: Option<fn64_audio::rsp::runtime::RspMachineState>,
+) {
+    let admission_generation = running_task_admission_generation(task_addr);
+    let Some(state) = state else {
+        with_host(|host| {
+            match host.rsp_interpreter_state {
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset,
+                admission_generation: owner_generation,
+            } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+            {
+                host.rsp_interpreter_state =
+                    RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                        task_offset: task_addr.offset(),
+                        admission_generation,
+                    };
+            }
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset,
+                admission_generation: owner_generation,
+            } => panic!(
+                "direct-IMEM HLE task {:#010x} generation {} cannot replace in-flight interpreter task {task_offset:#010x} generation {}",
+                task_addr.offset(),
+                admission_generation.get(),
+                owner_generation.get()
+            ),
+            _ => panic!(
+                "direct-IMEM HLE task {:#010x} cannot commit compatibility state without its in-flight owner",
+                task_addr.offset()
+            ),
+        }
+        });
+        return;
+    };
+    let state = state.into_hle_compatibility_architectural_state();
+    assert!(state.dp_submissions().is_empty());
+    with_host(|host| {
+        match host.rsp_interpreter_state {
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+        {
+            host.rsp_interpreter_state =
+                RspInterpreterStateEvidenceSnapshot::HleCompatibility(state);
+        }
+        RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation: owner_generation,
+        } => panic!(
+            "RSP HLE task {:#010x} generation {} cannot commit compatibility state owned by task {task_offset:#010x} generation {}",
+            task_addr.offset(),
+            admission_generation.get(),
+            owner_generation.get()
+        ),
+        _ => panic!(
+            "RSP HLE task {:#010x} cannot commit compatibility state without an in-flight rspboot owner",
+            task_addr.offset()
+        ),
+    }
+    });
+}
+
+#[cfg(test)]
+fn apply_verified_audio_rdram_patches(
+    storage: &mut [u8],
+    patches: &fn64_audio::hle_outcome::CanonicalRdramPatches,
+) -> Vec<(usize, usize)> {
+    assert_eq!(
+        storage.len(),
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "verified audio commit requires the exact 8 MiB physical RDRAM device"
+    );
+    let mut writes = Vec::with_capacity(patches.as_slice().len());
+    let mut view = fn64_runtime::RdramViewMut::from_storage(storage);
+    for patch in patches.as_slice() {
+        let range = patch.range();
+        let start = range.start() as usize;
+        let end = range.end() as usize;
+        assert!(
+            end <= view.len(),
+            "verified audio RDRAM patch [{start:#x}, {end:#x}) exceeds the physical device"
+        );
+        view.write_logical_bytes(RdramAddr::from_offset(range.start()), patch.bytes());
+        writes.push((start, end));
+    }
+    writes
+}
+
+#[cfg(test)]
+fn validate_verified_audio_rdram_patches(
+    storage_len: usize,
+    patches: &fn64_audio::hle_outcome::CanonicalRdramPatches,
+) {
+    assert_eq!(
+        storage_len,
+        fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "verified audio commit requires the exact 8 MiB physical RDRAM device"
+    );
+    for patch in patches.as_slice() {
+        let range = patch.range();
+        assert!(
+            range.end() as usize <= storage_len,
+            "verified audio RDRAM patch [{:#x}, {:#x}) exceeds the physical device",
+            range.start(),
+            range.end()
+        );
+    }
+}
+
+#[cfg(test)]
+fn deferred_audio_dpc_batch(
+    submissions: Vec<fn64_audio::hle_outcome::DeferredDpcSubmission>,
+) -> Option<fn64_render::RawDpcBatch> {
+    if submissions.is_empty() {
+        return None;
+    }
+    let submissions = submissions
+        .into_iter()
+        .map(|submission| match submission.source() {
+            fn64_audio::hle_outcome::DpcSubmissionSource::Rdram => {
+                fn64_render::OwnedRawDpcSubmission::from_rdram_words(
+                    submission.start(),
+                    submission.end(),
+                    submission.command_words(),
+                )
+            }
+            fn64_audio::hle_outcome::DpcSubmissionSource::Dmem => {
+                fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
+                    submission.start(),
+                    submission.end(),
+                    submission
+                        .xbus_payload()
+                        .expect("verified XBUS DPC submission lost its captured DMEM payload")
+                        .to_vec(),
+                )
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| panic!("verified audio DPC conversion rejected: {error:?}"));
+    Some(
+        fn64_render::RawDpcBatch::new(submissions)
+            .unwrap_or_else(|error| panic!("verified audio DPC batch rejected: {error:?}")),
+    )
+}
+
+#[cfg(test)]
+fn canonical_changed_rdram_ranges(before: &[u8], after: &[u8]) -> Vec<(usize, usize)> {
+    assert_eq!(before.len(), after.len());
+    let before = fn64_runtime::RdramView::from_storage(before);
+    let after = fn64_runtime::RdramView::from_storage(after);
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for offset in 0..before.len() {
+        let address = RdramAddr::from_offset(offset as u32);
+        let changed = before.read_u8(address) != after.read_u8(address);
+        match (start, changed) {
+            (None, true) => start = Some(offset),
+            (Some(range_start), false) => {
+                ranges.push((range_start, offset));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(range_start) = start {
+        ranges.push((range_start, before.len()));
+    }
+    ranges
+}
+
+#[cfg(test)]
+fn merge_canonical_rdram_write_ranges(
+    mut ranges: Vec<(usize, usize)>,
+    additional: Vec<(usize, usize)>,
+) -> Vec<(usize, usize)> {
+    ranges.extend(additional);
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, prior_end)) if start <= *prior_end => {
+                *prior_end = (*prior_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+unsafe fn commit_verified_audio_effects(
+    rdram: *mut u8,
+    task_addr: RdramAddr,
+    task_admission_generation: NonZeroU64,
+    rdram_patches: fn64_audio::hle_outcome::CanonicalRdramPatches,
+    rsp_memory: fn64_runtime::rsp::RspMemorySnapshot,
+    machine_state: fn64_audio::rsp::runtime::RspMachineState,
+    pc_low12: u32,
+    dpc_submissions: Vec<fn64_audio::hle_outcome::DeferredDpcSubmission>,
+) -> fn64_render::DpFullSyncStatus {
+    let owner = verified_audio_commit_owner(task_addr, task_admission_generation);
+    let (registered, allocation_len) =
+        with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    assert!(
+        !rdram.is_null()
+            && rdram == registered
+            && allocation_len >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "verified audio commit must target the registered physical RDRAM allocation"
+    );
+    validate_verified_audio_rdram_patches(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE, &rdram_patches);
+
+    let execution_state = verified_rsp_execution_state(&machine_state, pc_low12);
+    if deferred_audio_dpc_batch(dpc_submissions).is_some() {
+        let reason = "verified audio DPC publication requires exact per-CMD_END memory, device-timing, interrupt, and FullSync-order authority; the staged-RDRAM renderer seam is diagnostic-only";
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Render,
+            "render.raw-dpc-batch.non-certifying",
+            reason,
+            Some(fn64_runtime::Cycles::new(crate::sim_time())),
+            fn64_runtime::UnsupportedDisposition::LoudTrap,
+        );
+        panic!("{reason}");
+    }
+
+    let live =
+        unsafe { std::slice::from_raw_parts_mut(rdram, fn64_runtime::rdram::DEFAULT_RDRAM_SIZE) };
+    let mut shadow = live.to_vec();
+    let verified_writes = apply_verified_audio_rdram_patches(&mut shadow, &rdram_patches);
+    let architectural_state = machine_state.into_architectural_state();
+
+    let writes = merge_canonical_rdram_write_ranges(
+        verified_writes,
+        canonical_changed_rdram_ranges(live, &shadow),
+    );
+    #[cfg(feature = "recomp-rs")]
+    if let Err(reason) = crate::recompiled::preflight_non_executable_host_writes(&writes) {
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Recompiler,
+            "recompiler.verified-audio.executable-write",
+            &reason,
+            Some(fn64_runtime::Cycles::new(crate::sim_time())),
+            fn64_runtime::UnsupportedDisposition::LoudTrap,
+        );
+        panic!("verified audio publication rejected: {reason}");
+    }
+
+    with_host(|host| {
+        host.device_fabric
+            .preflight_complete_rsp_execution_state(&execution_state)
+            .unwrap_or_else(|error| panic!("verified audio RSP-state preflight rejected: {error}"));
+        // A later load may reuse this OSTask address with generation N+1
+        // after generation N's speculative verification. Rechecking the exact
+        // generation and Running lineage in this exclusive HostState borrow
+        // prevents stale generation N from publishing any effect.
+        match host.rsp_interpreter_state {
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset,
+                admission_generation,
+            } if task_offset == owner.task_addr.offset()
+                && admission_generation == owner.admission_generation => {}
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset,
+                admission_generation,
+            } => panic!(
+                "verified audio task {:#010x} generation {} lost ownership to task {task_offset:#010x} generation {} before publication",
+                owner.task_addr.offset(),
+                owner.admission_generation.get(),
+                admission_generation.get()
+            ),
+            _ => panic!(
+                "verified audio task {:#010x} lost its in-flight owner before publication",
+                owner.task_addr.offset()
+            ),
+        }
+        let lineage = host
+            .rsp_task_lineages
+            .get(&owner.task_addr.offset())
+            .unwrap_or_else(|| {
+                panic!(
+                    "verified audio task {:#010x} lost its Running lineage before publication",
+                    owner.task_addr.offset()
+                )
+            });
+        assert_eq!(
+            (lineage.admission_generation, lineage.phase),
+            (owner.admission_generation, RspTaskLineagePhase::Running),
+            "verified audio task {:#010x} lost admission generation {} Running authority before publication",
+            owner.task_addr.offset(),
+            owner.admission_generation.get()
+        );
+        host.device_fabric
+            .commit_complete_rsp_execution_state(execution_state)
+            .expect("exclusive verified-audio device preflight became invalid");
+        host.device_fabric.rsp_memory_mut().restore(rsp_memory);
+        host.rsp_interpreter_state =
+            RspInterpreterStateEvidenceSnapshot::Exact(architectural_state);
+        live.copy_from_slice(&shadow);
+    });
+    commit_rsp_rdram_writes(&writes);
+
+    fn64_render::DpFullSyncStatus::NotReached
+}
 
 fn rsp_visible_rdram_len(allocation_len: usize) -> usize {
     allocation_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
@@ -1048,8 +1934,7 @@ fn commit_rsp_memory_state(
     dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
     imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
     overlays: u64,
-    pc: u32,
-    status: u32,
+    execution_state: fn64_runtime::RspExecutionState,
 ) {
     with_host(|host| {
         let memory = host.device_fabric.rsp_memory_mut();
@@ -1067,7 +1952,9 @@ fn commit_rsp_memory_state(
                 )
                 .expect("RSP IMEM generation commit failed");
         }
-        host.device_fabric.commit_rsp_execution_state(pc, status);
+        host.device_fabric
+            .commit_complete_rsp_execution_state(execution_state)
+            .unwrap_or_else(|error| panic!("RSP interpreter-state commit rejected: {error}"));
     });
 }
 
@@ -1085,13 +1972,12 @@ unsafe fn dispatch_lle_task(
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
 
-    let (mut dmem, mut imem, status, mut pc, imem_generation, rdram_len, static_aliases) =
+    let (mut dmem, mut imem, mut pc, imem_generation, rdram_len, static_aliases) =
         with_host(|host| {
             let fabric = &host.device_fabric;
             (
                 *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Dmem),
                 *fabric.rsp_memory().bank(fn64_runtime::RspMemoryBank::Imem),
-                fabric.sp_status(),
                 fabric.sp_pc(),
                 fabric.rsp_memory().imem_generation(),
                 host.runtime_rdram_len,
@@ -1112,11 +1998,10 @@ unsafe fn dispatch_lle_task(
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
-    machine.set_sp_status_raw(
-        status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE),
-    );
     if let Some(state) = machine_state {
-        machine.restore_state(state);
+        continue_rsp_interpreter_phase(task_addr, &mut machine, state);
+    } else {
+        begin_rsp_interpreter_phase(task_addr, &mut machine);
     }
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
@@ -1199,13 +2084,18 @@ unsafe fn dispatch_lle_task(
     }
 
     dmem = machine.dmem_logical();
-    let final_status = machine.sp_status();
     let dp_submissions = machine.take_dp_submissions();
+    let final_architectural_state = machine.snapshot_architectural_state();
     let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
     commit_rsp_rdram_writes(&rdram_writes);
-    commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
+    commit_rsp_memory_state(
+        &dmem,
+        &imem,
+        overlays,
+        rsp_execution_state_from_architectural(&final_architectural_state, pc & 0x0fff),
+    );
     let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
     assert_eq!(
         committed_generation,
@@ -1282,9 +2172,9 @@ unsafe fn dispatch_lle_task(
                 .request_dpc_submission(source, start, end)
         })
         .unwrap_or_else(|error| panic!("RSP DPC submission rejected: {error}"));
-        let transaction = LiveDpcTransaction::new(submission);
+        let mut transaction = LiveDpcTransaction::new(submission);
         let (full_sync, observation) =
-            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus) };
+            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, &mut transaction) };
         transaction.commit();
         dpc_observations.push(observation);
         if full_sync == fn64_render::DpFullSyncStatus::Reached {
@@ -1334,6 +2224,7 @@ unsafe fn dispatch_lle_task(
     }
     observations.extend(dpc_observations);
     record_rsp_rdp_observations(observations);
+    commit_rsp_interpreter_phase(task_addr, final_architectural_state);
 
     LleTaskResult {
         steps: total_steps.max(1),
@@ -1376,9 +2267,7 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
-    machine.set_sp_status_raw(
-        status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE),
-    );
+    begin_rsp_interpreter_phase(task_addr, &mut machine);
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
     let mut loaded_spans = Vec::new();
@@ -1460,9 +2349,9 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
                 .expect("four OSTask DMEM bytes"),
         )
     });
-    let final_status = machine.sp_status();
     let dp_submissions = machine.take_dp_submissions();
     let machine_state = machine.snapshot_state();
+    let final_architectural_state = machine_state.architectural_state().clone();
     assert!(
         dp_submissions.is_empty(),
         "RSP HLE rspboot submitted {} DPC range(s) before entering ucode",
@@ -1472,7 +2361,12 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
     drop(machine);
 
     commit_rsp_rdram_writes(&rdram_writes);
-    commit_rsp_memory_state(&dmem, &imem, overlays, pc, final_status);
+    commit_rsp_memory_state(
+        &dmem,
+        &imem,
+        overlays,
+        rsp_execution_state_from_architectural(&final_architectural_state, pc & 0x0fff),
+    );
     let committed_generation = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
     assert_eq!(
         committed_generation,
@@ -1505,6 +2399,7 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
 /// range cannot remain busy or later advance CURRENT as if it had rendered.
 struct LiveDpcTransaction {
     token: Option<u64>,
+    acknowledgment: Option<fn64_runtime::DpcScheduledExecution>,
 }
 
 impl LiveDpcTransaction {
@@ -1516,15 +2411,92 @@ impl LiveDpcTransaction {
                 "renderer received DPC transaction which the device fabric does not own"
             );
         });
-        Self {
+        // Install cancellation ownership before any shared-ack construction.
+        // If an admitted fabric range cannot form the compatibility quantum,
+        // unwinding this guard restores the exact pre-admission DPC state.
+        // The exact-token assertion stays first so a bad caller cannot make
+        // this guard cancel some other transaction while unwinding.
+        let mut transaction = Self {
             token: Some(submission.token),
-        }
+            acknowledgment: None,
+        };
+        let source = submission.source;
+        let start = fn64_runtime::DpcCursor::new(source, submission.start)
+            .unwrap_or_else(|error| panic!("fabric admitted invalid DPC start cursor: {error:?}"));
+        let end = fn64_runtime::DpcCursor::new(source, submission.end)
+            .unwrap_or_else(|error| panic!("fabric admitted invalid DPC end cursor: {error:?}"));
+        // Phase B deliberately assigns no device-time meaning to this one
+        // compatibility quantum. Zero is an internal acknowledgment sentinel;
+        // production still performs one synchronous atomic backend call.
+        let sentinel = fn64_runtime::Cycles::new(0);
+        let mut acknowledgment = fn64_runtime::DpcScheduledExecution::new(
+            submission,
+            sentinel,
+            vec![fn64_runtime::DpcQuantumPlan {
+                at: sentinel,
+                id: fn64_runtime::DpcQuantumId::new(1),
+                start,
+                end,
+            }],
+        )
+        .unwrap_or_else(|error| {
+            panic!("fabric DPC transaction cannot form an atomic ack: {error:?}")
+        });
+        let fn64_runtime::DpcAdvance::Blocked { at, action } = acknowledgment
+            .advance_to(sentinel)
+            .unwrap_or_else(|error| panic!("arming atomic DPC acknowledgment: {error:?}"))
+        else {
+            panic!("atomic DPC acknowledgment passed its sole external-work barrier")
+        };
+        assert_eq!(at, sentinel);
+        assert_eq!(action.transaction, acknowledgment.transaction());
+        assert_eq!(action.start, start);
+        assert_eq!(action.end, end);
+        transaction.acknowledgment = Some(acknowledgment);
+        transaction
+    }
+
+    /// Validate the compatibility backend's sole atomic completion before
+    /// publishing its shadow memory. This carries no timing authority.
+    fn validate_atomic_completion(&mut self) {
+        let acknowledgment = self
+            .acknowledgment
+            .as_mut()
+            .expect("atomic DPC transaction has no acknowledgment owner");
+        let fn64_runtime::DpcScheduledPhase::AwaitingAck(request) = acknowledgment.phase() else {
+            panic!("atomic DPC transaction lost its acknowledgment owner before validation")
+        };
+        acknowledgment
+            .acknowledge(fn64_runtime::DpcBackendQuantumAck {
+                transaction: request.transaction,
+                quantum: request.quantum,
+                committed_through: request.end,
+                status: fn64_runtime::DpcBackendQuantumStatus::Complete,
+            })
+            .unwrap_or_else(|error| panic!("validating atomic DPC acknowledgment: {error:?}"));
+        assert_eq!(
+            acknowledgment.phase(),
+            fn64_runtime::DpcScheduledPhase::Complete,
+            "atomic DPC acknowledgment did not consume its sole quantum"
+        );
     }
 
     fn commit(mut self) {
-        let token = self.token.take().expect("DPC transaction committed twice");
+        let token = *self
+            .token
+            .as_ref()
+            .expect("DPC transaction committed twice");
+        assert_eq!(
+            self.acknowledgment
+                .as_ref()
+                .expect("atomic DPC transaction has no acknowledgment owner")
+                .phase(),
+            fn64_runtime::DpcScheduledPhase::Complete,
+            "atomic DPC transaction committed before acknowledgment validation"
+        );
         with_host(|host| host.device_fabric.commit_dpc_submission(token))
             .unwrap_or_else(|error| panic!("committing rendered DPC transaction: {error}"));
+        self.token.take();
     }
 }
 
@@ -1535,6 +2507,144 @@ impl Drop for LiveDpcTransaction {
         };
         with_host(|host| host.device_fabric.cancel_dpc_submission(token))
             .unwrap_or_else(|error| panic!("cancelling rejected DPC transaction: {error}"));
+    }
+}
+
+/// Own the ABI side of an explicitly scheduled raw-DPC renderer transaction.
+///
+/// The renderer receives only a shadow image. Once it has been called, any
+/// error or malformed success poisons the schedule: the backend may already
+/// have consumed its private continuation, so retrying the same request would
+/// duplicate work. A valid acknowledgment publishes schedule state, shadow
+/// memory, continuation, and cumulative FullSync evidence as one transition.
+#[cfg(test)]
+struct ScheduledRawDpcTransaction {
+    execution: fn64_runtime::DpcScheduledExecution,
+    continuation: Option<fn64_render::RenderRawDpcContinuation>,
+    full_sync: fn64_render::DpFullSyncStatus,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum ScheduledRawDpcError {
+    Schedule(fn64_runtime::DpcScheduleError),
+    Backend(fn64_render::RenderError),
+    UnidentifiedFullSync,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScheduledRawDpcAdvance {
+    Reached {
+        at: fn64_runtime::Cycles,
+    },
+    Committed {
+        at: fn64_runtime::Cycles,
+        phase: fn64_runtime::DpcScheduledPhase,
+        full_sync: fn64_render::DpFullSyncStatus,
+    },
+}
+
+#[cfg(test)]
+impl ScheduledRawDpcTransaction {
+    fn new(execution: fn64_runtime::DpcScheduledExecution) -> Self {
+        Self {
+            execution,
+            continuation: None,
+            full_sync: fn64_render::DpFullSyncStatus::NotReached,
+        }
+    }
+
+    fn advance_one(
+        &mut self,
+        requested: fn64_runtime::Cycles,
+        backend: &mut dyn RenderBackend,
+        rdram: &mut [u8],
+        output_addr: u32,
+    ) -> Result<ScheduledRawDpcAdvance, ScheduledRawDpcError> {
+        let (at, action) = match self
+            .execution
+            .advance_to(requested)
+            .map_err(ScheduledRawDpcError::Schedule)?
+        {
+            fn64_runtime::DpcAdvance::Reached { at } => {
+                return Ok(ScheduledRawDpcAdvance::Reached { at });
+            }
+            fn64_runtime::DpcAdvance::Blocked { at, action } => (at, action),
+        };
+
+        let step = self.continuation.take().map_or(
+            fn64_render::RawDpcStep::Start,
+            fn64_render::RawDpcStep::Resume,
+        );
+        let mut shadow = rdram.to_vec();
+        let ack = match backend.process_rdp_command_chunk(
+            &mut shadow,
+            fn64_render::RawDpcQuantum {
+                request: action,
+                output_addr,
+            },
+            step,
+        ) {
+            Ok(ack) => ack,
+            Err(error) => {
+                self.execution.poison();
+                return Err(ScheduledRawDpcError::Backend(error));
+            }
+        };
+        if ack.full_sync == fn64_render::DpFullSyncStatus::Unidentified {
+            self.execution.poison();
+            return Err(ScheduledRawDpcError::UnidentifiedFullSync);
+        }
+        let (status, continuation) = match ack.status {
+            fn64_render::RawDpcChunkStatus::Continue(token) => {
+                (fn64_runtime::DpcBackendQuantumStatus::Continue, Some(token))
+            }
+            fn64_render::RawDpcChunkStatus::Complete => {
+                (fn64_runtime::DpcBackendQuantumStatus::Complete, None)
+            }
+        };
+        if let Err(error) = self
+            .execution
+            .acknowledge(fn64_runtime::DpcBackendQuantumAck {
+                transaction: ack.transaction,
+                quantum: ack.quantum,
+                committed_through: ack.committed_through,
+                status,
+            })
+        {
+            self.execution.poison();
+            return Err(ScheduledRawDpcError::Schedule(error));
+        }
+
+        // No fallible work follows this point. These fields form the ABI's
+        // publication boundary for the already-validated backend result.
+        rdram.copy_from_slice(&shadow);
+        self.continuation = continuation;
+        if ack.full_sync == fn64_render::DpFullSyncStatus::Reached {
+            self.full_sync = fn64_render::DpFullSyncStatus::Reached;
+        }
+        Ok(ScheduledRawDpcAdvance::Committed {
+            at,
+            phase: self.execution.phase(),
+            full_sync: self.full_sync,
+        })
+    }
+
+    fn phase(&self) -> fn64_runtime::DpcScheduledPhase {
+        self.execution.phase()
+    }
+
+    fn cursor(&self) -> fn64_runtime::DpcCursor {
+        self.execution.cursor()
+    }
+
+    fn continuation(&self) -> Option<fn64_render::RenderRawDpcContinuation> {
+        self.continuation
+    }
+
+    fn full_sync(&self) -> fn64_render::DpFullSyncStatus {
+        self.full_sync
     }
 }
 
@@ -1598,7 +2708,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
 ) {
     let start = submission.start;
     let end = submission.end;
-    let transaction = LiveDpcTransaction::new(submission);
+    let mut transaction = LiveDpcTransaction::new(submission);
     let (full_sync, observation, operation) = match submission.source {
         fn64_runtime::DpcSubmissionSource::Rdram => {
             let (words, full_sync) = {
@@ -1638,6 +2748,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 let rendered = require_committed_full_sync_evidence(result, "dispatch_raw_rdp");
                 let full_sync =
                     require_matching_raw_dpc_completion(inspected, rendered, "dispatch_raw_rdp");
+                transaction.validate_atomic_completion();
                 real.copy_from_slice(&image);
                 (words, full_sync)
             };
@@ -1658,8 +2769,9 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 .chunks_exact(4)
                 .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
                 .collect::<Vec<_>>();
-            let (full_sync, observation) =
-                unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
+            let (full_sync, observation) = unsafe {
+                dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction)
+            };
             (full_sync, observation, "dispatch_raw_rdp_xbus")
         }
     };
@@ -1681,8 +2793,9 @@ unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
 
 /// Submit an XBUS DPC range whose command bytes live in persistent RSP DMEM.
 /// The renderer seam accepts an RDRAM image, so the command span is staged
-/// after the real allocation in a private image. Only the original RDRAM
-/// prefix is copied back after rendering; the staging range is unobservable.
+/// after the real allocation in a synthetic image. Only the original RDRAM
+/// prefix is copied back after rendering, but RDP commands can still address
+/// the suffix while executing; this is not exact physical-memory isolation.
 #[cfg_attr(not(test), allow(dead_code))]
 unsafe fn dispatch_raw_rdp_xbus(
     rdram: *mut u8,
@@ -1714,23 +2827,25 @@ unsafe fn dispatch_raw_rdp_xbus(
         )
     })
     .unwrap_or_else(|error| panic!("dispatch_raw_rdp_xbus: DPC submission rejected: {error}"));
-    let transaction = LiveDpcTransaction::new(submission);
+    let mut transaction = LiveDpcTransaction::new(submission);
     let (full_sync, observation) =
-        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
+        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction) };
     complete_committed_dpc(transaction, full_sync, observation, "dispatch_raw_rdp_xbus");
 }
 
 /// Submit command words already captured at the DPC CMD_END boundary through
-/// an address-disjoint staging range. RDP commands carry physical image and
-/// texture addresses in their payload; their own fetch address is not part of
-/// command semantics, so staging preserves those references while preventing
-/// framebuffer writeback from corrupting a later captured FIFO range.
+/// a synthetic staging suffix. Prefix-only copyback prevents the synthetic
+/// bytes themselves from entering guest RDRAM, but does not stop commands from
+/// reading or targeting the suffix through the RDP's 24-bit address space.
+/// Exact native LLE capture therefore still requires a separate command buffer
+/// and a physical-memory access bound at the renderer seam.
 unsafe fn dispatch_captured_raw_rdp(
     rdram: *mut u8,
     words: &[u32],
     source_start: u32,
     source_end: u32,
     xbus: bool,
+    transaction: &mut LiveDpcTransaction,
 ) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
     assert!(
         !words.is_empty() && words.len().is_multiple_of(2),
@@ -1831,6 +2946,7 @@ unsafe fn dispatch_captured_raw_rdp(
     let rendered = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
     let full_sync =
         require_matching_raw_dpc_completion(inspected, rendered, "dispatch_captured_raw_rdp");
+    transaction.validate_atomic_completion();
     if xbus && std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
         let mut offset = 0usize;
         while offset < physical_len {
@@ -1875,19 +2991,16 @@ fn require_committed_full_sync_evidence(
     }
 }
 
-/// Dispatch an audio task (`M_AUDTASK`) once, at the point the RSP is kicked.
-/// Two halves, both symmetric with `dispatch_gfx_task`:
-///  1. Run the registered translated audio ucode (`AUDIO_UCODE_FN`,
-///     `set_audio_ucode_fn`) with `(rdram, task_offset)` -- `o` is the OSTask's
-///     rdram OFFSET, which the recompiled ucode's FFI wrapper uses to seed RSP
-///     DMEM[0xFC0] (`osSpTaskLoad` pre-loads the 64-byte OSTask there; aspMain's
-///     first act is `lw 0x18(0xFC0)` = read `ucode_data`). No ucode registered -> the
-///     task is still counted by the caller's `submit_task`, honestly reflecting
-///     "submitted but this process never ran its ucode."
-///  2. Sample delivery happens later at `osAiSetNextBuffer_recomp`, the public
-///     AI DMA boundary where the CPU names the actual finished PCM range. It
-///     cannot happen here: OoT's live task has zero `OSTask.output_buff`
-///     fields and selects output destinations through `A_SAVEBUFF` commands.
+/// Dispatch a translated audio task (`M_AUDTASK`) once, at the point the RSP
+/// is kicked. `o` is the OSTask's RDRAM offset, which the translated ucode's
+/// FFI wrapper uses to seed RSP DMEM[0xFC0]. Missing execution policy and every
+/// callback result other than RSP BREAK trap before completion or an
+/// execution-qualified task trace can be produced.
+///
+/// Sample delivery happens later at `osAiSetNextBuffer_recomp`, the public AI
+/// DMA boundary where the CPU names the actual finished PCM range. It cannot
+/// happen here: OoT's live task has zero `OSTask.output_buff` fields and
+/// selects output destinations through `A_SAVEBUFF` commands.
 ///
 /// This runs only from `osSpTaskStartGo_recomp`, the Load+StartGo path OoT's
 /// audio driver uses (`AudioMgr_HandleRetrace` -> scheduler -> `Sched_RunTask`
@@ -1898,88 +3011,49 @@ fn require_committed_full_sync_evidence(
 /// # Safety
 /// `rdram` valid for the call; `o` a valid task-header offset within it and
 /// `header` the task header read from that offset.
-unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
+unsafe fn dispatch_audio_task(
+    rdram: *mut u8,
+    o: usize,
+    header: &OsTaskHeader,
+    callback: AudioUcodeFn,
+) {
     debug_assert_eq!(header.task_type, M_AUDTASK);
     // Before PHASE_TIMING's thread_local initializer reads the NEW name: a run
     // that set only the old spelling must trap here, not silently proceed.
     assert_no_legacy_env_vars();
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
-    // Debug/perf escape hatch: `FN64_SKIP_AUDIO_UCODE` skips running the
-    // recompiled audio ucode (the per-frame RSP synth, currently unoptimized
-    // and the dominant per-swap cost). The CPU-side audio driver
-    // (AudioThread_UpdateImpl) and this task's completion event still run, so
-    // the audio-reset handshake that unblocks Play_Init still completes -- the
-    // ucode only produces the actual samples. Use it to iterate on the RENDERER
-    // at normal boot speed; a real audio run must NOT set it. No sound when set.
-    // Diagnostic: dump the exact rdram + task offset of one audio task so the
-    // recompiled ucode can be replayed offline against the real command list.
-    // `FN64_DUMP_AUDIO_TASK_INDEX` is one-based and defaults to the first task;
-    // use a later task to capture audible music instead of startup silence.
-    if let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_TASK") {
-        let target_index = std::env::var("FN64_DUMP_AUDIO_TASK_INDEX")
-            .ok()
-            .map(|raw| {
-                raw.parse::<u64>().unwrap_or_else(|_| {
-                    panic!("FN64_DUMP_AUDIO_TASK_INDEX must be a positive integer, got {raw:?}")
-                })
-            })
-            .unwrap_or(1);
-        assert!(
-            target_index != 0,
-            "FN64_DUMP_AUDIO_TASK_INDEX is one-based; got 0"
+    // Phase timing measures the translated audio ucode (the per-frame RSP
+    // synth, currently unoptimized and the dominant per-swap cost).
+    // The shared task dump happens before policy dispatch in
+    // `osSpTaskStartGo_recomp`, so translated and LLE tasks expose the same
+    // immutable input boundary.
+    //
+    // The CPU-side audio driver (AudioThread_UpdateImpl) and this task's
+    // completion event still run, so the audio-reset handshake that unblocks
+    // Play_Init still completes.
+    // Safety: translated registration atomically pairs this callback with its
+    // process-lifetime evidence identity. `o` is the admitted OSTask offset.
+    let reason = if AUDIO_UCODE_TIMING.with(|c| c.get()) {
+        let t = std::time::Instant::now();
+        let reason = unsafe { callback(rdram, o as u32) };
+        let ns = t.elapsed().as_nanos() as u64;
+        AUDIO_UCODE_NS.with(|c| c.set(c.get() + ns));
+        AUDIO_UCODE_CALLS.with(|c| c.set(c.get() + 1));
+        reason
+    } else {
+        unsafe { callback(rdram, o as u32) }
+    };
+    if reason != 0 {
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Audio,
+            "audio.translated-ucode.exit-reason",
+            format!("task_offset={o:#010x} exit_reason={reason}"),
+            Some(fn64_runtime::Cycles::new(crate::sim_time())),
+            fn64_runtime::UnsupportedDisposition::LoudTrap,
         );
-        AUDIO_TASK_DUMP.with(|dump| {
-            let mut state = dump.get();
-            state.seen = state.seen.saturating_add(1);
-            if !state.dumped && state.seen == target_index {
-                let mut rdram_len = AUDIO_RDRAM_LEN.with(|cell| cell.get());
-                if rdram_len == 0 {
-                    rdram_len = RDRAM_LEN.with(|cell| cell.get());
-                }
-                // The harness allocation includes a sparse MMIO/non-RDRAM
-                // window hundreds of MiB above physical RDRAM. Audio ucode masks DMA
-                // addresses to the N64's physical RDRAM window, so replay only
-                // needs the real 8 MiB image; dumping the whole host mapping
-                // made one diagnostic task capture 656 MiB.
-                rdram_len = rdram_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE);
-                if rdram_len > 0 {
-                    let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
-                    let p = std::path::Path::new(&path);
-                    let _ = std::fs::write(p, bytes);
-                    let meta =
-                        format!("task_offset={o}\nrdram_len={rdram_len}\ntask_index={}\n", state.seen);
-                    let _ = std::fs::write(p.with_extension("meta"), meta);
-                    eprintln!("[fn64-abi] dumped audio task #{} rdram ({rdram_len} B) + task_offset={o} to {path:?}", state.seen);
-                }
-                state.dumped = true;
-            }
-            dump.set(state);
-        });
-    }
-    let skip_ucode = std::env::var_os("FN64_SKIP_AUDIO_UCODE").is_some();
-    if !skip_ucode {
-        AUDIO_UCODE_FN.with(|cell| {
-            if let Some(f) = cell.get() {
-                // Safety: `set_audio_ucode_fn`'s doc comment is the contract --
-                // `f` must be the real translated ucode function. See this
-                // function's doc comment for why `o` (the OSTask rdram offset) is
-                // the second argument, and `AudioUcodeFn`'s doc comment for the
-                // widened meaning.
-                if AUDIO_UCODE_TIMING.with(|c| c.get()) {
-                    let t = std::time::Instant::now();
-                    unsafe {
-                        f(rdram, o as u32);
-                    }
-                    let ns = t.elapsed().as_nanos() as u64;
-                    AUDIO_UCODE_NS.with(|c| c.set(c.get() + ns));
-                    AUDIO_UCODE_CALLS.with(|c| c.set(c.get() + 1));
-                } else {
-                    unsafe {
-                        f(rdram, o as u32);
-                    }
-                }
-            }
-        });
+        panic!(
+            "audio.translated-ucode.exit-reason: task {o:#010x} returned non-BREAK reason {reason}"
+        );
     }
     if let Some(started) = started {
         AUDIO_DISPATCH_NS.with(|total| {
@@ -1991,6 +3065,76 @@ unsafe fn dispatch_audio_task(rdram: *mut u8, o: usize, header: &OsTaskHeader) {
         });
         AUDIO_DISPATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
+}
+
+/// Capture one immutable audio-task input before translated or LLE execution.
+///
+/// The output is private diagnostic material and remains outside git. Keeping
+/// this at the common task-kick boundary makes a capture independent of the
+/// installed execution policy, which is required for later LLE/HLE replay.
+///
+/// # Safety
+/// `rdram` must cover the registered process RDRAM length, and `task_offset`
+/// must name the admitted `OSTask` inside it.
+unsafe fn maybe_dump_audio_task_input(rdram: *mut u8, task_offset: usize) {
+    let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_TASK") else {
+        return;
+    };
+    let target_index = std::env::var("FN64_DUMP_AUDIO_TASK_INDEX")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u64>().unwrap_or_else(|_| {
+                panic!("FN64_DUMP_AUDIO_TASK_INDEX must be a positive integer, got {raw:?}")
+            })
+        })
+        .unwrap_or(1);
+    assert!(
+        target_index != 0,
+        "FN64_DUMP_AUDIO_TASK_INDEX is one-based; got 0"
+    );
+    AUDIO_TASK_DUMP.with(|dump| {
+        let mut state = dump.get();
+        state.seen = state.seen.saturating_add(1);
+        if !state.dumped && state.seen == target_index {
+            let (registered_rdram, registered_len) =
+                with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+            assert_eq!(
+                registered_rdram, rdram,
+                "FN64_DUMP_AUDIO_TASK task pointer does not match registered process RDRAM"
+            );
+            let rdram_len = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE;
+            assert!(
+                registered_len >= rdram_len,
+                "FN64_DUMP_AUDIO_TASK registered process RDRAM is {registered_len:#x} bytes; \
+                 physical capture requires {rdram_len:#x}"
+            );
+            assert!(
+                task_offset
+                    .checked_add(core::mem::size_of::<OsTaskHeader>())
+                    .is_some_and(|end| end <= rdram_len),
+                "FN64_DUMP_AUDIO_TASK task offset {task_offset:#x} is outside physical RDRAM"
+            );
+            let bytes = unsafe { std::slice::from_raw_parts(rdram, rdram_len) };
+            let path = std::path::Path::new(&path);
+            std::fs::write(path, bytes).unwrap_or_else(|error| {
+                panic!("write private audio task capture {path:?}: {error}")
+            });
+            let meta = format!(
+                "task_offset={task_offset}\nrdram_len={rdram_len}\ntask_index={}\n",
+                state.seen
+            );
+            let meta_path = path.with_extension("meta");
+            std::fs::write(&meta_path, meta).unwrap_or_else(|error| {
+                panic!("write private audio task metadata {meta_path:?}: {error}")
+            });
+            eprintln!(
+                "[fn64-abi] dumped audio task #{} input ({rdram_len} B, task_offset={task_offset}) to {path:?}",
+                state.seen
+            );
+            state.dumped = true;
+        }
+        dump.set(state);
+    });
 }
 
 /// `osSpTaskYielded(OSTask *task) -> OSYieldResult` observes the public RSP
@@ -2148,7 +3292,7 @@ enum HleRenderContinuationPhase {
     Suspended,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct HleRenderContinuation {
     phase: HleRenderContinuationPhase,
     token: fn64_render::RenderTaskContinuation,
@@ -2158,6 +3302,7 @@ struct HleRenderContinuation {
     output_addr: u32,
     dp_full_sync: fn64_render::DpFullSyncStatus,
     completion_latency: u64,
+    rspboot_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
 }
 
 fn merge_dp_full_sync(
@@ -2218,13 +3363,18 @@ pub(crate) fn advance_hle_render_task() {
     // next chunk would run past the sole representable yield boundary.
     if crate::pi::live_sp_status() & fn64_runtime::SP_STATUS_YIELD != 0 {
         pending.phase = HleRenderContinuationPhase::Suspended;
+        let completion_latency = pending.completion_latency;
+        let task_addr = pending.task_addr;
+        let rspboot_state = pending.rspboot_state.clone();
+        let dp_full_sync = pending.dp_full_sync;
         HLE_RENDER_CONTINUATION.with(|cell| cell.replace(Some(pending)));
         crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
         crate::pi::finish_live_rcp_task(
-            rcp_completion_plan(pending.dp_full_sync, "chunk-boundary HLE yield"),
-            pending.completion_latency,
+            rcp_completion_plan(dp_full_sync, "chunk-boundary HLE yield"),
+            completion_latency,
         )
         .unwrap_or_else(|error| panic!("chunk-boundary HLE yield completion: {error}"));
+        commit_rsp_hle_compatibility(task_addr, rspboot_state);
         return;
     }
 
@@ -2252,6 +3402,7 @@ pub(crate) fn advance_hle_render_task() {
                 1,
             )
             .unwrap_or_else(|error| panic!("complete HLE chunk completion: {error}"));
+            commit_rsp_hle_compatibility(pending.task_addr, pending.rspboot_state);
             retire_running_rsp_task_lineage(pending.task_addr, "complete HLE chunk");
         }
         fn64_render::RenderTaskChunkStatus::Yielded => {
@@ -2263,6 +3414,7 @@ pub(crate) fn advance_hle_render_task() {
             crate::pi::write_live_sp_status(fn64_runtime::SP_SET_YIELDED);
             crate::pi::finish_live_rcp_task(fn64_runtime::RcpTaskCompletionPlan::SpOnly, 1)
                 .unwrap_or_else(|error| panic!("cooperative HLE chunk completion: {error}"));
+            commit_rsp_hle_compatibility(pending.task_addr, pending.rspboot_state);
         }
         fn64_render::RenderTaskChunkStatus::NeedsLle { .. } => {
             panic!("resumed HLE continuation requested LLE after committing an earlier chunk")
@@ -2273,6 +3425,7 @@ pub(crate) fn advance_hle_render_task() {
 pub(crate) fn hle_render_needs_progress() -> bool {
     HLE_RENDER_CONTINUATION.with(|cell| {
         cell.borrow()
+            .as_ref()
             .is_some_and(|pending| pending.phase == HleRenderContinuationPhase::Running)
     })
 }
@@ -2425,10 +3578,7 @@ pub fn last_audio_error() -> Option<String> {
 /// read. The host must separately call [`crate::register_process_rdram`] (or
 /// [`crate::boot_thread0`], which performs that registration) before the
 /// first VI retrace. `rdram_len` must match that allocation's size; a mismatch
-/// is a caller bug. Mirrors
-/// `set_audio_ucode_fn`'s "the shell wires this once at startup" shape,
-/// generalized to a trait object since a graphics backend is stateful
-/// (unlike a single ucode function pointer). This compatibility entry point
+/// is a caller bug. This compatibility entry point
 /// intentionally selects [`GraphicsTaskExecutionPolicy::HleOptimized`]; a
 /// caller making an accuracy claim must use [`set_render_backend_with_policy`]
 /// and opt in explicitly.
@@ -2545,32 +3695,114 @@ pub fn render_environment_evidence_snapshot() -> RenderEnvironmentEvidenceSnapsh
 /// IMEM text in and instead needs the task structure to seed its RSP DMEM
 /// (rspboot loads the 64-byte OSTask into DMEM 0xFC0; the audio ucode reads
 /// `ucode_data`@0x18 from there). `RspExitReason` is an RSPRecomp-defined enum
-/// this crate does not interpret beyond "it ran" -- a plain `u32` return.
+/// this crate accepts only at the public BREAK discriminant (`0`) -- a plain
+/// `u32` return keeps the generated module's enum out of this ABI.
 pub type AudioUcodeFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
 
 thread_local! {
-    /// The real, out-of-tree translated audio ucode function, if the host
-    /// (the boot harness) has linked and registered one via
-    /// `set_audio_ucode_fn`. `None` in any test/context that never calls
-    /// that -- `osSpTaskYielded_recomp` treats that as "can't actually run
-    /// the ucode" (see its doc comment), never a silent substitute.
+    /// The out-of-tree translated audio ucode paired atomically with the
+    /// installed ROM's `Translated` policy. All other policies own `None`.
     static AUDIO_UCODE_FN: Cell<Option<AudioUcodeFn>> = const { Cell::new(None) };
 }
 
-/// Register the real translated audio ucode function. Called once by the
-/// boot harness (`examples/wm2000-boot`) after linking WM2000's
-/// out-of-tree-compiled `wm2000_audio.cpp` -- `fn64-abi` never contains
-/// this function's body itself (`README.md`'s "no game content ships in
-/// this repo" rule), only the call-site plumbing that invokes whatever the
-/// harness supplies.
+pub(crate) fn reset_audio_task_execution_for_rom() {
+    with_host(|host| {
+        host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Reset;
+        host.audio_task_execution = AudioTaskExecutionPolicy::Unconfigured;
+        host.audio_task_execution_admitted = false;
+        host.audio_task_execution_started = false;
+    });
+    AUDIO_UCODE_FN.with(|cell| cell.set(None));
+}
+
+fn install_audio_task_execution(policy: AudioTaskExecutionPolicy, callback: Option<AudioUcodeFn>) {
+    assert_no_legacy_env_vars();
+    assert_ne!(policy, AudioTaskExecutionPolicy::Unconfigured);
+    assert_eq!(
+        matches!(policy, AudioTaskExecutionPolicy::Translated { .. }),
+        callback.is_some(),
+        "translated audio execution must own exactly one callback"
+    );
+    with_host(|host| {
+        assert!(
+            host.rom_installed,
+            "audio task execution policy requires an installed ROM"
+        );
+        assert_eq!(
+            host.audio_task_execution,
+            AudioTaskExecutionPolicy::Unconfigured,
+            "audio task execution policy was already installed for this ROM as {:?}",
+            host.audio_task_execution
+        );
+        assert!(
+            !host.audio_task_execution_admitted && !host.audio_task_execution_started,
+            "audio task execution policy cannot be installed after an audio task was admitted"
+        );
+        host.audio_task_execution = policy;
+    });
+    AUDIO_UCODE_FN.with(|cell| cell.set(callback));
+}
+
+/// Atomically register a translated audio ucode and its exact host artifact
+/// identity. The identity distinguishes executable configurations but does not
+/// prove a correspondence with arbitrary live IMEM; release evidence uses LLE.
 ///
 /// # Safety
 /// `f` must have the real `RspExitReason(uint8_t*, uint32_t)` signature
 /// RSPRecomp generates and must remain valid for the process's lifetime
 /// (true for a file-scope C function with static storage duration, which is
-/// what RSPRecomp emits).
-pub unsafe fn set_audio_ucode_fn(f: AudioUcodeFn) {
-    AUDIO_UCODE_FN.with(|cell| cell.set(Some(f)));
+/// what RSPRecomp emits). `artifact_sha256` must identify the exact translated
+/// module containing `f`.
+pub unsafe fn set_translated_audio_ucode(f: AudioUcodeFn, artifact_sha256: [u8; 32]) {
+    assert_ne!(
+        artifact_sha256, [0; 32],
+        "translated audio artifact identity cannot be all zero"
+    );
+    install_audio_task_execution(
+        AudioTaskExecutionPolicy::Translated { artifact_sha256 },
+        Some(f),
+    );
+}
+
+/// Execute every admitted audio microcode instruction through the clean-room
+/// RSP interpreter.
+pub fn set_audio_task_lle_accuracy() {
+    install_audio_task_execution(AudioTaskExecutionPolicy::LleAccuracy, None);
+}
+
+/// Explicitly skip audio synthesis for render-only diagnostic probes.
+/// Fixed-cycle release evidence rejects this policy.
+pub fn set_audio_task_diagnostic_skip() {
+    install_audio_task_execution(AudioTaskExecutionPolicy::DiagnosticSkip, None);
+}
+
+fn require_audio_task_execution_policy(
+    task_addr: RdramAddr,
+    header: &OsTaskHeader,
+) -> AudioTaskExecutionPolicy {
+    debug_assert_eq!(header.task_type, M_AUDTASK);
+    let policy = with_host(|host| {
+        host.audio_task_execution_started = true;
+        host.audio_task_execution
+    });
+    if policy == AudioTaskExecutionPolicy::Unconfigured {
+        let context = format!(
+            "task={:#010x} type={} ucode={:#010x}/size={:#x}",
+            task_addr.offset(),
+            header.task_type,
+            header.ucode,
+            header.ucode_size
+        );
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Audio,
+            "audio.task.missing-execution-policy",
+            context.clone(),
+            Some(fn64_runtime::Cycles::new(crate::sim_time())),
+            fn64_runtime::UnsupportedDisposition::LoudTrap,
+        );
+        panic!("audio.task.missing-execution-policy: {context}")
+    }
+    policy
 }
 
 /// Read the public libultra manual's documented `OSTask_t` field layout
@@ -2623,7 +3855,14 @@ unsafe fn write_os_task_word(rdram: *mut u8, base: usize, field: usize, value: u
     };
 }
 
-fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> LoadedRspTask {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingLoadedRspTask {
+    task_addr: RdramAddr,
+    header: OsTaskHeader,
+    resumed_data_identity: Option<TaskMicrocodeDataIdentity>,
+}
+
+fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> PendingLoadedRspTask {
     let resumed_data_identity = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
         let lineage = with_host(|host| host.rsp_task_lineages.get(&task_addr.offset()).copied())
             .unwrap_or_else(|| {
@@ -2649,15 +3888,24 @@ fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> Lo
     } else {
         None
     };
-    LoadedRspTask {
+    PendingLoadedRspTask {
         task_addr,
         header,
         resumed_data_identity,
     }
 }
 
-fn retain_loaded_rsp_task(loaded: LoadedRspTask) {
+fn retain_loaded_rsp_task(pending: PendingLoadedRspTask) {
     with_host(|host| {
+        let loaded = LoadedRspTask {
+            task_addr: pending.task_addr,
+            admission_generation: host.next_rsp_task_admission_generation.advance(),
+            header: pending.header,
+            resumed_data_identity: pending.resumed_data_identity,
+        };
+        if loaded.header.task_type == M_AUDTASK {
+            host.audio_task_execution_admitted = true;
+        }
         if let Some(replaced) = host.loaded_rsp_task.take() {
             let remove_replaced_lineage = host
                 .rsp_task_lineages
@@ -2680,6 +3928,7 @@ fn retain_loaded_rsp_task(loaded: LoadedRspTask) {
                 "osSpTaskLoad_recomp: yielded RSP task {:#010x} consumed a stale resume authorization",
                 loaded.task_addr.offset()
             );
+            lineage.admission_generation = loaded.admission_generation;
             lineage.phase = RspTaskLineagePhase::ResumeLoaded;
         }
         // RSP has one admitted task image. A later successful Load replaces
@@ -2697,7 +3946,8 @@ fn take_loaded_rsp_task(task_addr: RdramAddr) -> LoadedRspTask {
             )
         });
         assert_eq!(
-            loaded.task_addr, task_addr,
+            loaded.task_addr,
+            task_addr,
             "osSpTaskStartGo_recomp: task {:#010x} does not own the loaded RSP task token for {:#010x}",
             task_addr.offset(),
             loaded.task_addr.offset()
@@ -2736,7 +3986,8 @@ fn retain_started_rsp_task_lineage(
                     )
                 });
             assert_eq!(
-                lineage.data_identity, data_identity,
+                lineage.data_identity,
+                data_identity,
                 "osSpTaskStartGo_recomp: yielded RSP task {:#010x} changed its original microcode-data identity",
                 loaded.task_addr.offset()
             );
@@ -2751,6 +4002,7 @@ fn retain_started_rsp_task_lineage(
             let previous = host.rsp_task_lineages.insert(
                 loaded.task_addr.offset(),
                 RspTaskLineage {
+                    admission_generation: loaded.admission_generation,
                     original_header: loaded.header,
                     data_identity,
                     phase: RspTaskLineagePhase::Running,
@@ -2878,10 +4130,11 @@ pub unsafe extern "C" fn osSpTaskLoad_recomp(rdram: *mut u8, ctx: *mut RecompCon
 ///
 /// This crate classifies boot-overlay versus direct-IMEM admission. It either
 /// executes rspboot through its IMEM-DMA handoff or enters the already-loaded
-/// image at PC zero, then runs the selected task effect (audio HLE, or the
-/// graphics policy's HLE/LLE ucode phase) synchronously while the shim owns
-/// the guest. Its externally visible completion is scheduled separately, with
-/// measured pre-ucode work included in SP latency. What a real
+/// image at PC zero, then runs the selected task effect (audio translated/LLE
+/// execution, or the graphics policy's HLE/LLE ucode phase) synchronously
+/// while the shim owns the guest. Its externally visible completion is
+/// scheduled separately, with measured pre-ucode work included in SP latency.
+/// What a real
 /// `osSpTaskStartGo` DOES have that this stub was missing: kicking the RSP
 /// eventually raises the SP-done interrupt (and, for a task that drives the
 /// RDP to a `DPFullSync`, the DP-done interrupt), which libultra delivers
@@ -2920,6 +4173,11 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let o = task_addr.offset() as usize;
     let header = loaded.header;
     let is_gfx = header.task_type == M_GFXTASK;
+    let audio_policy = (header.task_type == M_AUDTASK)
+        .then(|| require_audio_task_execution_policy(task_addr, &header));
+    if header.task_type == M_AUDTASK {
+        unsafe { maybe_dump_audio_task_input(rdram, o) };
+    }
     let recognition_header = if header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
         with_host(|host| {
             host.rsp_task_lineages
@@ -2956,7 +4214,9 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         None
     };
     retain_started_rsp_task_lineage(loaded, initial_microcode_data);
-    with_executor(|exec| exec.start_task(header));
+    if header.task_type != M_AUDTASK {
+        with_executor(|exec| exec.start_task(header));
+    }
 
     // Kicking the RSP is where the selected task effect runs, so the work
     // happens here -- this is the path OoT uses (Load then
@@ -2965,6 +4225,21 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     // the scheduler is woken. A graphics task rasterizes; an audio task
     // runs its registered ucode + forwards samples (previously dispatched only
     // from the never-taken yield path -- same latent bug the gfx path hit).
+    let resumes_hle_continuation = HLE_RENDER_CONTINUATION.with(|cell| {
+        let retained = cell.borrow();
+        retained.as_ref().is_some_and(|pending| {
+            assert_eq!(
+                pending.phase,
+                HleRenderContinuationPhase::Suspended,
+                "osSpTaskStartGo_recomp: cannot start while an HLE continuation is running"
+            );
+            assert_eq!(
+                pending.task_addr, task_addr,
+                "osSpTaskStartGo_recomp: task does not own the retained renderer continuation"
+            );
+            true
+        })
+    });
     let mut hle_entry = if is_gfx || header.task_type == M_AUDTASK {
         Some(match admitted_task_image_shape(&header) {
             AdmittedTaskImageShape::BootOverlay => {
@@ -2980,12 +4255,28 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             // zero and reset PC to zero. Executing it as rspboot would consume
             // the ucode's legitimate terminal BREAK while waiting for an IMEM
             // DMA generation that this admission shape does not require.
-            AdmittedTaskImageShape::DirectImem => AdmittedHleEntry::DirectImem { task: header },
+            AdmittedTaskImageShape::DirectImem => {
+                let lle_machine_state = if resumes_hle_continuation {
+                    resume_direct_hle_phase(task_addr);
+                    None
+                } else {
+                    Some(Box::new(unsafe {
+                        begin_direct_hle_phase(rdram, task_addr)
+                    }))
+                };
+                AdmittedHleEntry::DirectImem {
+                    task: header,
+                    lle_machine_state,
+                }
+            }
         })
     } else {
         None
     };
     let hle_header = hle_entry.as_ref().map_or(header, AdmittedHleEntry::task);
+    let hle_compatibility_state = hle_entry
+        .as_ref()
+        .and_then(AdmittedHleEntry::hle_compatibility_state);
     let dp_full_sync = if is_gfx
         && GRAPHICS_TASK_EXECUTION_POLICY.with(Cell::get)
             == GraphicsTaskExecutionPolicy::LleAccuracy
@@ -3076,6 +4367,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                         output_addr,
                         dp_full_sync: prior_full_sync,
                         completion_latency: chunk_completion_latency,
+                        rspboot_state: hle_compatibility_state.clone(),
                     },
                     result,
                     if resumed_internal {
@@ -3145,8 +4437,46 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             }
         }
     } else if header.task_type == M_AUDTASK {
-        unsafe { dispatch_audio_task(rdram, o, &hle_header) };
-        fn64_render::DpFullSyncStatus::NotReached
+        match audio_policy.expect("audio task must preflight its execution policy") {
+            AudioTaskExecutionPolicy::Unconfigured => {
+                unreachable!("audio execution policy preflight rejects unconfigured tasks")
+            }
+            AudioTaskExecutionPolicy::Translated { .. } => {
+                let callback = AUDIO_UCODE_FN
+                    .with(Cell::get)
+                    .expect("translated audio execution lost its atomically registered callback");
+                unsafe { dispatch_audio_task(rdram, o, &hle_header, callback) };
+                with_executor(|exec| exec.start_task(header));
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+            AudioTaskExecutionPolicy::LleAccuracy => {
+                let entry = hle_entry
+                    .take()
+                    .expect("audio accuracy LLE requires an admitted task entry");
+                let pre_ucode_steps = entry.pre_ucode_steps();
+                let lle = unsafe {
+                    dispatch_lle_task(
+                        rdram,
+                        task_addr,
+                        false,
+                        entry.into_lle_machine_state(),
+                        None,
+                        None,
+                    )
+                };
+                crate::pi::start_live_rcp_task_with_latency(
+                    rcp_completion_plan(lle.dp_full_sync, "audio accuracy LLE"),
+                    pre_ucode_steps.saturating_add(lle.steps),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("osSpTaskStartGo_recomp audio accuracy LLE completion: {error}")
+                });
+                with_executor(|exec| exec.start_task(header));
+                retire_rsp_task_lineage_after_synchronous_result(task_addr, "audio accuracy LLE");
+                return;
+            }
+            AudioTaskExecutionPolicy::DiagnosticSkip => fn64_render::DpFullSyncStatus::NotReached,
+        }
     } else {
         let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None, None, None) };
         crate::pi::start_live_rcp_task_with_latency(
@@ -3166,6 +4496,12 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         pre_ucode_steps.saturating_add(1),
     )
     .unwrap_or_else(|error| panic!("osSpTaskStartGo_recomp: {error}"));
+    // LLEAccuracy commits an exact terminal image inside dispatch_lle_task.
+    // Optimized HLE has no post-ucode scalar/VU result, so only a successful
+    // backend + device scheduling path may publish its explicitly labeled
+    // rspboot-entry compatibility image. A backend panic leaves InFlight and
+    // the next task traps rather than disguising a partial renderer effect.
+    commit_rsp_hle_compatibility(task_addr, hle_compatibility_state);
     retire_rsp_task_lineage_after_synchronous_result(task_addr, "known HLE task");
 }
 
@@ -3210,6 +4546,483 @@ mod tests {
     use fn64_runtime::RecvMesgOutcome;
     use std::rc::Rc;
 
+    fn install_running_task_lineage(
+        task_addr: RdramAddr,
+        admission_generation: RspTaskAdmissionGeneration,
+    ) {
+        with_host(|host| {
+            host.rsp_task_lineages.insert(
+                task_addr.offset(),
+                RspTaskLineage {
+                    admission_generation,
+                    original_header: OsTaskHeader::default(),
+                    data_identity: None,
+                    phase: RspTaskLineagePhase::Running,
+                },
+            );
+        });
+    }
+
+    fn write_test_task_header(rdram: &mut [u8], task_offset: usize, header: OsTaskHeader) {
+        for (index, word) in [
+            header.task_type,
+            header.flags,
+            header.ucode_boot,
+            header.ucode_boot_size,
+            header.ucode,
+            header.ucode_size,
+            header.ucode_data,
+            header.ucode_data_size,
+            header.dram_stack,
+            header.dram_stack_size,
+            header.output_buff,
+            header.output_buff_size,
+            header.data_ptr,
+            header.data_size,
+            header.yield_data_ptr,
+            header.yield_data_size,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = task_offset + index * 4;
+            rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+    }
+
+    fn prepare_audio_capture_task(
+        rdram: &mut Vec<u8>,
+        header: OsTaskHeader,
+    ) -> (RdramAddr, RspTaskAdmissionGeneration) {
+        const TASK_OFFSET: usize = 0x40;
+        crate::load_rom(Vec::new());
+        rdram.resize(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE, 0);
+        write_test_task_header(rdram, TASK_OFFSET, header);
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + TASK_OFFSET as u64;
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let task_addr = RdramAddr::from_offset(TASK_OFFSET as u32);
+        let loaded = take_loaded_rsp_task(task_addr);
+        let admission_generation = loaded.admission_generation;
+        retain_started_rsp_task_lineage(loaded, None);
+        (task_addr, admission_generation)
+    }
+
+    fn boot_overlay_audio_header() -> OsTaskHeader {
+        OsTaskHeader {
+            task_type: fn64_runtime::M_AUDTASK,
+            ucode_boot: 0x8000_0100,
+            ucode_boot_size: 8,
+            ucode: 0xa000_0120,
+            ucode_size: 8,
+            ..OsTaskHeader::default()
+        }
+    }
+
+    #[test]
+    fn task_admission_generation_public_constructor_preserves_nonzero_value() {
+        let generation = RspTaskAdmissionGeneration::new(NonZeroU64::new(7).unwrap());
+        assert_eq!(generation.get(), 7);
+    }
+
+    #[test]
+    fn rsp_interpreter_owner_preserves_core_state_and_overlays_device_latches() {
+        with_host(|host| *host = HostState::default());
+        let mut first_rdram = vec![0u8; 0x1000];
+        let mut first = fn64_audio::rsp::runtime::RspMachine::new(&mut first_rdram);
+        let first_task = RdramAddr::from_offset(0x40);
+        install_running_task_lineage(first_task, RspTaskAdmissionGeneration::first());
+        begin_rsp_interpreter_phase(first_task, &mut first);
+        first.ctx.r[3] = 0x1122_3344;
+        first.ctx.jump_target = 0x1550;
+        first.ctx.rsp.regs.r[7] = [1, -2, 3, -4, 5, -6, 7, -8];
+        first.ctx.rsp.acc.set(2, -0x1234_5678);
+        first.ctx.rsp.flags.vco = 0x55aa;
+        first.ctx.rsp.flags.vcc = 0xaa55;
+        first.ctx.rsp.flags.vce = 0x69;
+        first.ctx.rsp.div_in = 0x4567;
+        first.ctx.rsp.div_in_loaded = true;
+        first.ctx.rsp.div_out = 0x89ab;
+        first.ctx.steps = 91;
+        let committed = first.snapshot_architectural_state();
+        commit_rsp_interpreter_phase(first_task, committed.clone());
+
+        let fabric = with_host(|host| {
+            let mut state = host.device_fabric.rsp_execution_state();
+            state.sp_status = 0x0000_0403;
+            state.sp_semaphore = true;
+            state.sp_dma_mem_addr = fn64_runtime::RspMemAddr::from_register(0x1230);
+            state.sp_dma_dram_addr = RdramAddr::from_offset(0x456788);
+            state.sp_dma_read_length = 0x0102_0304;
+            state.sp_dma_write_length = 0x1112_1314;
+            state.dpc_start = 0x100;
+            state.dpc_end = 0x180;
+            state.dpc_current = 0x140;
+            state.dpc_status = 0x21;
+            state.dpc_clock = 0x3132_3334;
+            state.dpc_busy = 0x4142_4344;
+            state.dpc_pipe_busy = 0x5152_5354;
+            state.dpc_tmem_busy = 0x6162_6364;
+            host.device_fabric
+                .commit_complete_rsp_execution_state(state)
+                .unwrap();
+            host.device_fabric.rsp_execution_state()
+        });
+
+        let mut second_rdram = vec![0u8; 0x1000];
+        let mut second = fn64_audio::rsp::runtime::RspMachine::new(&mut second_rdram);
+        let second_task = RdramAddr::from_offset(0x80);
+        install_running_task_lineage(
+            second_task,
+            RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap()),
+        );
+        begin_rsp_interpreter_phase(second_task, &mut second);
+        let restored = second.snapshot_architectural_state();
+        assert_eq!(restored.gprs(), committed.gprs());
+        assert_eq!(restored.jump_target(), committed.jump_target());
+        assert_eq!(restored.vu(), committed.vu());
+        assert_eq!(
+            second.ctx.steps, 0,
+            "diagnostics must not cross task boundaries"
+        );
+        assert_eq!(restored.sp_semaphore(), fabric.sp_semaphore);
+        assert_eq!(
+            restored.dma_mem_address(),
+            u32::from(fabric.sp_dma_mem_addr.get())
+        );
+        assert_eq!(
+            restored.dma_dram_address(),
+            fabric.sp_dma_dram_addr.offset()
+        );
+        assert_eq!(restored.dma_read_length(), fabric.sp_dma_read_length);
+        assert_eq!(restored.dma_write_length(), fabric.sp_dma_write_length);
+        assert_eq!(restored.dp_start(), fabric.dpc_start);
+        assert_eq!(restored.dp_end(), fabric.dpc_end);
+        assert_eq!(restored.dp_current(), fabric.dpc_current);
+        assert_eq!(restored.dp_status(), fabric.dpc_status);
+        assert_eq!(restored.dp_clock(), fabric.dpc_clock);
+        assert_eq!(restored.dp_busy(), fabric.dpc_busy);
+        assert_eq!(restored.dp_pipe_busy(), fabric.dpc_pipe_busy);
+        assert_eq!(restored.dp_tmem_busy(), fabric.dpc_tmem_busy);
+        assert_eq!(restored.dp_submissions(), &[]);
+        assert_eq!(
+            restored.sp_status(),
+            fabric.sp_status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE)
+        );
+        commit_rsp_interpreter_phase(second_task, restored);
+    }
+
+    #[test]
+    fn whole_audio_capture_matches_begin_state_and_mutates_only_its_owner() {
+        let mut rdram = Vec::new();
+        let header = boot_overlay_audio_header();
+        let (task_addr, admission_generation) = prepare_audio_capture_task(&mut rdram, header);
+
+        let mut prior_storage = [];
+        let mut prior_machine = fn64_audio::rsp::runtime::RspMachine::new(&mut prior_storage);
+        prior_machine.ctx.r[3] = 0x1122_3344;
+        prior_machine.ctx.rsp.regs.r[7] = [1, -2, 3, -4, 5, -6, 7, -8];
+        prior_machine.ctx.rsp.flags.vco = 0x55aa;
+        let prior = prior_machine.snapshot_architectural_state();
+        with_host(|host| {
+            host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Exact(prior.clone());
+            let mut fabric = host.device_fabric.rsp_execution_state();
+            fabric.sp_status = fn64_runtime::SP_STATUS_HALT
+                | fn64_runtime::SP_STATUS_BROKE
+                | fn64_runtime::SP_STATUS_SIGNAL_0;
+            fabric.sp_semaphore = true;
+            fabric.sp_dma_mem_addr = fn64_runtime::RspMemAddr::from_register(0x1230);
+            fabric.sp_dma_dram_addr = RdramAddr::from_offset(0x456780);
+            host.device_fabric
+                .commit_complete_rsp_execution_state(fabric)
+                .unwrap();
+        });
+
+        let mut expected_storage = [];
+        let mut expected_machine = fn64_audio::rsp::runtime::RspMachine::new(&mut expected_storage);
+        begin_rsp_interpreter_phase(task_addr, &mut expected_machine);
+        let expected_state = expected_machine.snapshot_state();
+        with_host(|host| {
+            host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Exact(prior);
+        });
+        let before = crate::host_evidence_snapshot();
+
+        let captured =
+            unsafe { capture_audio_whole_task_input(rdram.as_mut_ptr(), task_addr, header) };
+
+        assert_eq!(captured.owner.task_addr, task_addr);
+        assert_eq!(captured.owner.admission_generation, admission_generation);
+        assert_eq!(captured.input.initial_machine_state(), &expected_state);
+        assert_eq!(captured.input.initial_pc_low12(), 0);
+        assert_eq!(captured.input.rdram_storage(), &rdram[..]);
+        assert_eq!(
+            captured.input.rsp_memory(),
+            &with_host(|host| host.device_fabric.rsp_memory().snapshot())
+        );
+        let mut expected_after = before;
+        expected_after.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset: task_addr.offset(),
+            admission_generation,
+        };
+        assert_eq!(crate::host_evidence_snapshot(), expected_after);
+    }
+
+    #[test]
+    fn whole_audio_capture_rejects_same_address_stale_inflight_generation() {
+        let mut rdram = Vec::new();
+        let header = boot_overlay_audio_header();
+        let (task_addr, first_generation) = prepare_audio_capture_task(&mut rdram, header);
+        let second_generation =
+            RspTaskAdmissionGeneration::new(NonZeroU64::new(first_generation.get() + 1).unwrap());
+        with_host(|host| {
+            host.rsp_task_lineages
+                .get_mut(&task_addr.offset())
+                .unwrap()
+                .admission_generation = second_generation;
+            host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: task_addr.offset(),
+                admission_generation: first_generation,
+            };
+        });
+        let before = crate::host_evidence_snapshot();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            capture_audio_whole_task_input(rdram.as_mut_ptr(), task_addr, header)
+        }));
+
+        let panic = match rejected {
+            Err(panic) => panic,
+            Ok(_) => panic!("stale same-address owner unexpectedly captured"),
+        };
+        assert!(panic_message(panic.as_ref()).contains("left a pending interpreter continuation"));
+        assert_eq!(crate::host_evidence_snapshot(), before);
+    }
+
+    #[test]
+    fn whole_audio_direct_imem_rejection_retains_acquired_owner() {
+        let mut rdram = Vec::new();
+        let header = OsTaskHeader {
+            ucode: 0xa000_0100,
+            ..boot_overlay_audio_header()
+        };
+        let (task_addr, admission_generation) = prepare_audio_capture_task(&mut rdram, header);
+        let before_rdram = rdram.clone();
+        let before_rsp = with_host(|host| host.device_fabric.rsp_memory().snapshot());
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            capture_audio_whole_task_input(rdram.as_mut_ptr(), task_addr, header)
+        }));
+
+        let panic = match rejected {
+            Err(panic) => panic,
+            Ok(_) => panic!("direct-IMEM input unexpectedly captured"),
+        };
+        assert!(panic_message(panic.as_ref()).contains("DirectImemUnsupported"));
+        assert_eq!(rdram, before_rdram);
+        assert_eq!(
+            with_host(|host| host.device_fabric.rsp_memory().snapshot()),
+            before_rsp
+        );
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: task_addr.offset(),
+                admission_generation,
+            }
+        );
+    }
+
+    #[test]
+    fn whole_audio_static_alias_rejection_retains_acquired_owner() {
+        let mut rdram = Vec::new();
+        let header = OsTaskHeader {
+            ucode: 0xa000_0000 | fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32,
+            ..boot_overlay_audio_header()
+        };
+        let (task_addr, admission_generation) = prepare_audio_capture_task(&mut rdram, header);
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            capture_audio_whole_task_input(rdram.as_mut_ptr(), task_addr, header)
+        }));
+
+        let panic = match rejected {
+            Err(panic) => panic,
+            Ok(_) => panic!("static-alias input unexpectedly captured"),
+        };
+        assert!(panic_message(panic.as_ref()).contains("StaticAliasNotAllowed"));
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: task_addr.offset(),
+                admission_generation,
+            }
+        );
+    }
+
+    #[test]
+    fn whole_audio_wrong_registered_pointer_rejects_before_physical_read() {
+        let mut rdram = Vec::new();
+        let header = boot_overlay_audio_header();
+        let (task_addr, admission_generation) = prepare_audio_capture_task(&mut rdram, header);
+        let before_rdram = rdram.clone();
+        let (before_device, before_rsp) = with_host(|host| {
+            (
+                host.device_fabric.rsp_execution_state(),
+                host.device_fabric.rsp_memory().snapshot(),
+            )
+        });
+        let unreadable_wrong_pointer = std::ptr::NonNull::<u8>::dangling().as_ptr();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            capture_audio_whole_task_input(unreadable_wrong_pointer, task_addr, header)
+        }));
+
+        let panic = match rejected {
+            Err(panic) => panic,
+            Ok(_) => panic!("wrong registered RDRAM pointer unexpectedly captured"),
+        };
+        assert!(panic_message(panic.as_ref())
+            .contains("must use the registered complete physical RDRAM allocation"));
+        assert_eq!(rdram, before_rdram);
+        with_host(|host| {
+            assert_eq!(host.device_fabric.rsp_execution_state(), before_device);
+            assert_eq!(host.device_fabric.rsp_memory().snapshot(), before_rsp);
+        });
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: task_addr.offset(),
+                admission_generation,
+            }
+        );
+    }
+
+    #[test]
+    fn whole_audio_short_registered_allocation_rejects_before_physical_read() {
+        let mut rdram = Vec::new();
+        let header = boot_overlay_audio_header();
+        let (task_addr, admission_generation) = prepare_audio_capture_task(&mut rdram, header);
+        with_host(|host| host.runtime_rdram_len = 0x1000);
+        let before_rdram = rdram.clone();
+        let (before_device, before_rsp) = with_host(|host| {
+            (
+                host.device_fabric.rsp_execution_state(),
+                host.device_fabric.rsp_memory().snapshot(),
+            )
+        });
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            capture_audio_whole_task_input(rdram.as_mut_ptr(), task_addr, header)
+        }));
+
+        let panic = match rejected {
+            Err(panic) => panic,
+            Ok(_) => panic!("short registered RDRAM allocation unexpectedly captured"),
+        };
+        assert!(panic_message(panic.as_ref())
+            .contains("must use the registered complete physical RDRAM allocation"));
+        assert_eq!(rdram, before_rdram);
+        with_host(|host| {
+            assert_eq!(host.device_fabric.rsp_execution_state(), before_device);
+            assert_eq!(host.device_fabric.rsp_memory().snapshot(), before_rsp);
+        });
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: task_addr.offset(),
+                admission_generation,
+            }
+        );
+    }
+
+    #[test]
+    fn rsp_interpreter_owner_rejects_pending_cross_task_continuation() {
+        with_host(|host| *host = HostState::default());
+        let mut source_rdram = vec![0u8; 0x1000];
+        let mut source = fn64_audio::rsp::runtime::RspMachine::new(&mut source_rdram);
+        source.ctx.resume_address = 0x1180;
+        with_host(|host| {
+            host.rsp_interpreter_state =
+                RspInterpreterStateEvidenceSnapshot::Exact(source.snapshot_architectural_state());
+        });
+        let mut target_rdram = vec![0u8; 0x1000];
+        let mut target = fn64_audio::rsp::runtime::RspMachine::new(&mut target_rdram);
+        install_running_task_lineage(
+            RdramAddr::from_offset(0x90),
+            RspTaskAdmissionGeneration::first(),
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            begin_rsp_interpreter_phase(RdramAddr::from_offset(0x90), &mut target);
+        }))
+        .expect_err("pending overlay continuation must not become a fresh task");
+        assert!(panic_message(panic.as_ref()).contains("pending overlay resume address"));
+        assert!(matches!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::Exact(_)
+        ));
+    }
+
+    #[test]
+    fn rom_install_resets_rsp_interpreter_owner() {
+        with_host(|host| *host = HostState::default());
+        let mut rdram = vec![0u8; 0x1000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram);
+        let task = RdramAddr::from_offset(0x40);
+        install_running_task_lineage(task, RspTaskAdmissionGeneration::first());
+        begin_rsp_interpreter_phase(task, &mut machine);
+        machine.ctx.r[9] = 0xfeed_beef;
+        commit_rsp_interpreter_phase(task, machine.snapshot_architectural_state());
+        assert!(matches!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::Exact(_)
+        ));
+
+        crate::load_rom(vec![0x12, 0x34]);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::Reset
+        );
+    }
+
+    #[test]
+    fn direct_imem_hle_cannot_leave_prior_state_labeled_exact() {
+        with_host(|host| *host = HostState::default());
+        let mut rdram = vec![0u8; 0x1000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram);
+        with_host(|host| {
+            host.rsp_interpreter_state =
+                RspInterpreterStateEvidenceSnapshot::Exact(machine.snapshot_architectural_state());
+        });
+
+        let task = RdramAddr::from_offset(0x88);
+        install_running_task_lineage(task, RspTaskAdmissionGeneration::first());
+        begin_rsp_interpreter_phase(task, &mut machine);
+        commit_rsp_hle_compatibility(task, None);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                task_offset: 0x88,
+                admission_generation: RspTaskAdmissionGeneration::first(),
+            }
+        );
+
+        let mut next_rdram = vec![0u8; 0x1000];
+        let mut next = fn64_audio::rsp::runtime::RspMachine::new(&mut next_rdram);
+        install_running_task_lineage(
+            RdramAddr::from_offset(0x90),
+            RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap()),
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            begin_rsp_interpreter_phase(RdramAddr::from_offset(0x90), &mut next);
+        }))
+        .expect_err("unavailable direct-IMEM HLE state must not reuse a stale exact snapshot");
+        assert!(panic_message(panic.as_ref()).contains("terminal scalar/VU state is unavailable"));
+    }
+
     macro_rules! no_rust_hidden_sidecar {
         () => {
             fn observe_non_rdp_write16(
@@ -3227,6 +5040,492 @@ mod tests {
             host.runtime_rdram = rdram.as_mut_ptr();
             host.runtime_rdram_len = rdram.len();
         });
+    }
+
+    const VERIFIED_AUDIO_TASK_OFFSET: u32 = 0x80;
+    const VERIFIED_AUDIO_GENERATION: NonZeroU64 = NonZeroU64::MIN;
+
+    fn prepare_verified_audio_rdram(rdram: &mut Vec<u8>) -> (RdramAddr, NonZeroU64) {
+        prepare_renderer_rdram(rdram);
+        let task_addr = RdramAddr::from_offset(VERIFIED_AUDIO_TASK_OFFSET);
+        with_host(|host| {
+            host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: task_addr.offset(),
+                admission_generation: RspTaskAdmissionGeneration::new(VERIFIED_AUDIO_GENERATION),
+            };
+            host.rsp_task_lineages.insert(
+                task_addr.offset(),
+                RspTaskLineage {
+                    admission_generation: RspTaskAdmissionGeneration(VERIFIED_AUDIO_GENERATION),
+                    original_header: OsTaskHeader::default(),
+                    data_identity: None,
+                    phase: RspTaskLineagePhase::Running,
+                },
+            );
+            host.next_rsp_task_admission_generation =
+                RspTaskAdmissionGeneration(NonZeroU64::new(2).unwrap());
+        });
+        (task_addr, VERIFIED_AUDIO_GENERATION)
+    }
+
+    #[test]
+    fn verified_audio_patches_use_logical_guest_byte_order() {
+        let patches = fn64_audio::hle_outcome::CanonicalRdramPatches::new(vec![
+            fn64_audio::hle_outcome::RdramPatch::new(1, vec![0x11, 0x22, 0x33, 0x44, 0x55])
+                .unwrap(),
+        ])
+        .unwrap();
+        let mut storage = vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+
+        let writes = apply_verified_audio_rdram_patches(&mut storage, &patches);
+
+        assert_eq!(writes, vec![(1, 6)]);
+        assert_eq!(&storage[..8], &[0x33, 0x22, 0x11, 0, 0, 0, 0x55, 0x44]);
+        let view = fn64_runtime::RdramView::from_storage(&storage);
+        let mut logical = [0; 5];
+        view.copy_logical_bytes(RdramAddr::from_offset(1), &mut logical);
+        assert_eq!(logical, [0x11, 0x22, 0x33, 0x44, 0x55]);
+    }
+
+    #[test]
+    fn verified_audio_rsp_mapping_covers_every_runtime_register() {
+        let mut storage = vec![0; 0x4000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+        machine.set_sp_status_raw(
+            fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE | (1 << 10),
+        );
+        machine.set_dma_dram(0x100);
+        machine.set_dma_mem(0x180);
+        let _ = machine.write_cp0(2, 7);
+        machine.set_dma_dram(0x200);
+        machine.set_dma_mem(0x280);
+        let _ = machine.write_cp0(3, 15);
+        let _ = machine.read_cp0(7);
+        let _ = machine.write_cp0(11, 1 << 1);
+        let _ = machine.write_cp0(8, 0x100);
+        let _ = machine.write_cp0(9, 0x108);
+        let _ = machine.write_cp0(9, 0x110);
+        let complete = machine.snapshot_state();
+        let architectural = complete.architectural_state();
+
+        let mapped = verified_rsp_execution_state(&complete, 0x0abc);
+
+        assert_eq!(mapped.pc, 0x0abc);
+        assert_eq!(mapped.sp_status, architectural.sp_status());
+        assert_eq!(mapped.sp_semaphore, architectural.sp_semaphore());
+        assert_eq!(
+            mapped.sp_dma_mem_addr,
+            fn64_runtime::RspMemAddr::from_register(architectural.dma_mem_address())
+        );
+        assert_eq!(
+            mapped.sp_dma_dram_addr,
+            RdramAddr::from_offset(architectural.dma_dram_address() & 0x00ff_ffff)
+        );
+        assert_eq!(mapped.sp_dma_read_length, architectural.dma_read_length());
+        assert_eq!(mapped.sp_dma_write_length, architectural.dma_write_length());
+        assert_eq!(mapped.dpc_start, architectural.dp_start());
+        assert_eq!(mapped.dpc_end, architectural.dp_end());
+        assert_eq!(mapped.dpc_current, architectural.dp_current());
+        assert_eq!(mapped.dpc_status, architectural.dp_status());
+        assert_eq!(mapped.dpc_clock, architectural.dp_clock());
+        assert_eq!(mapped.dpc_busy, architectural.dp_busy());
+        assert_eq!(mapped.dpc_pipe_busy, architectural.dp_pipe_busy());
+        assert_eq!(mapped.dpc_tmem_busy, architectural.dp_tmem_busy());
+        assert_eq!(mapped.dpc_start, 0x100);
+        assert_eq!(mapped.dpc_end, 0x110);
+        assert_eq!(mapped.dpc_current, 0x110);
+    }
+
+    #[test]
+    fn verified_audio_rsp_memory_restore_preserves_exact_generation() {
+        with_host(|host| *host = HostState::default());
+        let mut expected = fn64_runtime::RspMemory::new();
+        expected
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0x20),
+                &[0x12, 0x34],
+            )
+            .unwrap();
+        expected
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0x30),
+                &[0x56, 0x78],
+            )
+            .unwrap();
+        expected
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Dmem, 0x40),
+                &[0x9a, 0xbc],
+            )
+            .unwrap();
+        let expected_snapshot = expected.snapshot();
+        let state = with_host(|host| host.device_fabric.rsp_execution_state());
+
+        with_host(|host| {
+            host.device_fabric
+                .commit_complete_rsp_execution_state(state)
+                .unwrap();
+            host.device_fabric
+                .rsp_memory_mut()
+                .restore(expected_snapshot.clone());
+        });
+
+        with_host(|host| {
+            assert_eq!(
+                host.device_fabric.rsp_memory().snapshot(),
+                expected_snapshot
+            );
+            assert_eq!(host.device_fabric.rsp_memory().imem_generation(), 2);
+        });
+    }
+
+    #[test]
+    fn pending_dpc_rejects_rsp_commit_without_mutating_rsp_state() {
+        with_host(|host| *host = HostState::default());
+        let mut live_rdram = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let (task_addr, task_generation) = prepare_verified_audio_rdram(&mut live_rdram);
+        let pending = with_host(|host| {
+            host.device_fabric
+                .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Rdram, 0x100, 0x108)
+                .unwrap()
+        });
+        let before_rdram = live_rdram.clone();
+        let (before_memory, before_registers) = with_host(|host| {
+            (
+                host.device_fabric.rsp_memory().snapshot(),
+                host.device_fabric.rsp_execution_state(),
+            )
+        });
+        let mut replacement = fn64_runtime::RspMemory::new();
+        replacement
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                &[0xde, 0xad, 0xbe, 0xef],
+            )
+            .unwrap();
+        let mut replacement_registers = before_registers;
+        replacement_registers.pc = 0x080;
+        let mut machine_storage = vec![0; 0x1000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut machine_storage);
+        machine.set_sp_status_raw(replacement_registers.sp_status);
+        let machine_state = machine.snapshot_state();
+        let patches = fn64_audio::hle_outcome::CanonicalRdramPatches::new(vec![
+            fn64_audio::hle_outcome::RdramPatch::new(1, vec![1, 2, 3]).unwrap(),
+        ])
+        .unwrap();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe {
+                commit_verified_audio_effects(
+                    live_rdram.as_mut_ptr(),
+                    task_addr,
+                    task_generation,
+                    patches,
+                    replacement.snapshot(),
+                    machine_state,
+                    replacement_registers.pc,
+                    Vec::new(),
+                )
+            };
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(live_rdram, before_rdram);
+        with_host(|host| {
+            assert_eq!(host.device_fabric.rsp_memory().snapshot(), before_memory);
+            assert_eq!(host.device_fabric.rsp_execution_state(), before_registers);
+            host.device_fabric
+                .cancel_dpc_submission(pending.token)
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn deferred_audio_dpc_words_survive_source_mutation() {
+        let captured = vec![0xe900_0000, 0, 0x1122_3344, 0x5566_7788];
+        let deferred = fn64_audio::hle_outcome::DeferredDpcSubmission::from_rdram_words(
+            0x100,
+            0x110,
+            captured.clone(),
+        )
+        .unwrap();
+        let mut later_source = captured;
+
+        later_source.fill(0xa5a5_a5a5);
+
+        assert_eq!(
+            deferred.command_words(),
+            vec![0xe900_0000, 0, 0x1122_3344, 0x5566_7788]
+        );
+        assert_ne!(deferred.command_words(), later_source);
+    }
+
+    #[test]
+    fn deferred_audio_dpc_conversion_preserves_owned_identity() {
+        let deferred = fn64_audio::hle_outcome::DeferredDpcSubmission::from_rdram_words(
+            0x100,
+            0x108,
+            vec![0xe900_0000, 0],
+        )
+        .unwrap();
+        let expected_words = deferred.command_words();
+
+        let batch = deferred_audio_dpc_batch(vec![deferred]).unwrap();
+
+        assert_eq!(batch.submissions().len(), 1);
+        assert_eq!(
+            batch.submissions()[0].source(),
+            fn64_render::RawDpcSource::Rdram
+        );
+        assert_eq!(batch.submissions()[0].command_words(), expected_words);
+    }
+
+    #[test]
+    fn verified_audio_empty_dpc_batch_needs_no_renderer() {
+        with_host(|host| *host = HostState::default());
+        RENDER_BACKEND.with(|cell| cell.replace(None));
+        let mut live = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let (task_addr, task_generation) = prepare_verified_audio_rdram(&mut live);
+        let machine = verified_audio_test_machine();
+        let expected = machine.architectural_state().clone();
+
+        let status = unsafe {
+            commit_verified_audio_effects(
+                live.as_mut_ptr(),
+                task_addr,
+                task_generation,
+                empty_verified_audio_patches(),
+                fn64_runtime::RspMemory::new().snapshot(),
+                machine,
+                0,
+                Vec::new(),
+            )
+        };
+
+        assert_eq!(status, fn64_render::DpFullSyncStatus::NotReached);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::Exact(expected)
+        );
+    }
+
+    fn verified_audio_test_machine() -> fn64_audio::rsp::runtime::RspMachineState {
+        let mut storage = vec![0; 0x1000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut storage);
+        machine.ctx.r[7] = 0x1234_5678;
+        machine.snapshot_state()
+    }
+
+    fn full_sync_deferred_submission() -> fn64_audio::hle_outcome::DeferredDpcSubmission {
+        fn64_audio::hle_outcome::DeferredDpcSubmission::from_rdram_words(
+            0x100,
+            0x108,
+            vec![0xe900_0000, 0],
+        )
+        .unwrap()
+    }
+
+    fn empty_verified_audio_patches() -> fn64_audio::hle_outcome::CanonicalRdramPatches {
+        fn64_audio::hle_outcome::CanonicalRdramPatches::new(Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn verified_audio_diagnostic_dpc_rejects_before_live_mutation() {
+        use fn64_render_reference::ReferenceBackend;
+
+        with_host(|host| *host = HostState::default());
+        let mut live = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let (task_addr, task_generation) = prepare_verified_audio_rdram(&mut live);
+        let mut backend = ReferenceBackend::new().with_f3dex2();
+        backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
+        set_render_backend(Box::new(backend), live.len());
+        let before_rdram = live.clone();
+        let before_host = crate::host_evidence_snapshot();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            commit_verified_audio_effects(
+                live.as_mut_ptr(),
+                task_addr,
+                task_generation,
+                empty_verified_audio_patches(),
+                fn64_runtime::RspMemory::new().snapshot(),
+                verified_audio_test_machine(),
+                0,
+                vec![full_sync_deferred_submission()],
+            )
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(live, before_rdram);
+        assert_eq!(crate::host_evidence_snapshot(), before_host);
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    #[test]
+    fn verified_audio_identical_patch_rejects_planned_executable_overlap_without_mutation() {
+        with_host(|host| *host = HostState::default());
+        let mut live = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let (task_addr, task_generation) = prepare_verified_audio_rdram(&mut live);
+        let executable_start = 0x120;
+        let _preflight = crate::recompiled::scoped_test_executable_write_preflight_state(
+            vec![(executable_start, executable_start + 0x40)],
+            Vec::new(),
+        );
+        let patches = fn64_audio::hle_outcome::CanonicalRdramPatches::new(vec![
+            fn64_audio::hle_outcome::RdramPatch::new(executable_start, vec![0x5a; 4]).unwrap(),
+        ])
+        .unwrap();
+        let mut replacement_memory = fn64_runtime::RspMemory::new();
+        replacement_memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0x20),
+                &[0xde, 0xad, 0xbe, 0xef],
+            )
+            .unwrap();
+        let before_rdram = live.clone();
+        let before_host = crate::host_evidence_snapshot();
+        let (before_device, before_rsp_memory) = with_host(|host| {
+            (
+                host.device_fabric.rsp_execution_state(),
+                host.device_fabric.rsp_memory().snapshot(),
+            )
+        });
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            commit_verified_audio_effects(
+                live.as_mut_ptr(),
+                task_addr,
+                task_generation,
+                patches,
+                replacement_memory.snapshot(),
+                verified_audio_test_machine(),
+                0x80,
+                Vec::new(),
+            )
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(live, before_rdram);
+        assert_eq!(crate::host_evidence_snapshot(), before_host);
+        with_host(|host| {
+            assert_eq!(host.device_fabric.rsp_execution_state(), before_device);
+            assert_eq!(
+                host.device_fabric.rsp_memory().snapshot(),
+                before_rsp_memory
+            );
+        });
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    #[test]
+    fn verified_audio_pending_executable_overlap_rejects_empty_publication_without_mutation() {
+        with_host(|host| *host = HostState::default());
+        let mut live = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let (task_addr, task_generation) = prepare_verified_audio_rdram(&mut live);
+        let _preflight = crate::recompiled::scoped_test_executable_write_preflight_state(
+            vec![(0x100, 0x180)],
+            vec![(0x120, 4)],
+        );
+        let mut replacement_memory = fn64_runtime::RspMemory::new();
+        replacement_memory
+            .write_bytes(
+                fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0x20),
+                &[0xde, 0xad, 0xbe, 0xef],
+            )
+            .unwrap();
+        let before_rdram = live.clone();
+        let before_host = crate::host_evidence_snapshot();
+        let (before_device, before_rsp_memory) = with_host(|host| {
+            (
+                host.device_fabric.rsp_execution_state(),
+                host.device_fabric.rsp_memory().snapshot(),
+            )
+        });
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            commit_verified_audio_effects(
+                live.as_mut_ptr(),
+                task_addr,
+                task_generation,
+                empty_verified_audio_patches(),
+                replacement_memory.snapshot(),
+                verified_audio_test_machine(),
+                0x80,
+                Vec::new(),
+            )
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(live, before_rdram);
+        assert_eq!(crate::host_evidence_snapshot(), before_host);
+        with_host(|host| {
+            assert_eq!(host.device_fabric.rsp_execution_state(), before_device);
+            assert_eq!(
+                host.device_fabric.rsp_memory().snapshot(),
+                before_rsp_memory
+            );
+        });
+    }
+
+    #[test]
+    fn verified_audio_wrong_task_owner_rejects_before_live_mutation() {
+        with_host(|host| *host = HostState::default());
+        let mut live = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let (_owner, task_generation) = prepare_verified_audio_rdram(&mut live);
+        let before_rdram = live.clone();
+        let before_host = crate::host_evidence_snapshot();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            commit_verified_audio_effects(
+                live.as_mut_ptr(),
+                RdramAddr::from_offset(VERIFIED_AUDIO_TASK_OFFSET + 8),
+                task_generation,
+                empty_verified_audio_patches(),
+                fn64_runtime::RspMemory::new().snapshot(),
+                verified_audio_test_machine(),
+                0,
+                Vec::new(),
+            )
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(live, before_rdram);
+        assert_eq!(crate::host_evidence_snapshot(), before_host);
+    }
+
+    #[test]
+    fn verified_audio_same_address_reuse_rejects_stale_generation() {
+        with_host(|host| *host = HostState::default());
+        let mut live = vec![0x5a; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let (task_addr, stale_generation) = prepare_verified_audio_rdram(&mut live);
+        retain_loaded_rsp_task(PendingLoadedRspTask {
+            task_addr,
+            header: OsTaskHeader::default(),
+            resumed_data_identity: None,
+        });
+        let replacement = take_loaded_rsp_task(task_addr);
+        let replacement_generation = replacement.admission_generation;
+        retain_started_rsp_task_lineage(replacement, None);
+        assert_ne!(replacement_generation.get(), stale_generation.get());
+        let before_rdram = live.clone();
+        let before_host = crate::host_evidence_snapshot();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            commit_verified_audio_effects(
+                live.as_mut_ptr(),
+                task_addr,
+                stale_generation,
+                empty_verified_audio_patches(),
+                fn64_runtime::RspMemory::new().snapshot(),
+                verified_audio_test_machine(),
+                0,
+                Vec::new(),
+            )
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(live, before_rdram);
+        assert_eq!(crate::host_evidence_snapshot(), before_host);
     }
 
     struct StatusRenderBackend(FrameStatus);
@@ -3267,6 +5566,51 @@ mod tests {
 
         fn supported_ucodes(&self) -> &[UcodeId] {
             &[]
+        }
+    }
+
+    struct CountingPanicRenderBackend(std::rc::Rc<Cell<u32>>);
+
+    impl RenderBackend for CountingPanicRenderBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        no_rust_hidden_sidecar!();
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            self.0.set(self.0.get() + 1);
+            panic!("intentional direct-IMEM backend panic")
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    fn direct_imem_test_header(image: u32) -> OsTaskHeader {
+        OsTaskHeader {
+            task_type: fn64_runtime::M_GFXTASK,
+            ucode_boot: 0x8000_0000 | image,
+            ucode_boot_size: 8,
+            ucode: 0xa000_0000 | image,
+            ucode_size: 8,
+            ..OsTaskHeader::default()
         }
     }
 
@@ -4171,6 +6515,82 @@ mod tests {
     }
 
     #[test]
+    fn atomic_ack_validation_failure_precedes_xbus_publication_and_rolls_back() {
+        const MUTATION: usize = 0x400;
+
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        rdram[MUTATION] = 0x5a;
+        let before_rdram = rdram.clone();
+        let before_device = with_host(|host| host.device_fabric.snapshot());
+        let calls = Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(MutatingRawBackend {
+                calls: Rc::clone(&calls),
+                outcome: RawMutationOutcome::Complete,
+                mutation_offset: MUTATION,
+            }),
+            rdram.len(),
+        );
+        let submission = with_host(|host| {
+            host.device_fabric
+                .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Dmem, 0, 8)
+        })
+        .unwrap();
+        let mut transaction = LiveDpcTransaction::new(submission);
+        let fn64_runtime::DpcScheduledPhase::AwaitingAck(request) = transaction
+            .acknowledgment
+            .as_ref()
+            .expect("test transaction owns its atomic acknowledgment")
+            .phase()
+        else {
+            panic!("production atomic transaction did not stop at its sole ack barrier")
+        };
+        assert_eq!(
+            request.transaction,
+            fn64_runtime::DpcTransactionId::from_submission(submission)
+        );
+        assert_eq!(request.quantum, fn64_runtime::DpcQuantumId::new(1));
+        assert_eq!(request.start.source(), submission.source);
+        assert_eq!(request.start.address(), submission.start);
+        assert_eq!(request.end.source(), submission.source);
+        assert_eq!(request.end.address(), submission.end);
+        transaction
+            .acknowledgment
+            .as_mut()
+            .expect("test transaction owns its atomic acknowledgment")
+            .poison();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_captured_raw_rdp(
+                rdram.as_mut_ptr(),
+                &[0xe900_0000, 0],
+                0,
+                8,
+                true,
+                &mut transaction,
+            )
+        }))
+        .expect_err("poisoned atomic acknowledgment must remain loud");
+        assert!(panic_message(rejected.as_ref())
+            .contains("lost its acknowledgment owner before validation"));
+        assert_eq!(
+            calls.get(),
+            1,
+            "validation remains after backend acceptance"
+        );
+        assert_eq!(rdram, before_rdram, "ack failure published the XBUS shadow");
+        assert!(copy_rsp_rdp_observations().is_empty());
+
+        drop(transaction);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot()),
+            before_device,
+            "ack failure did not restore the pre-admission DPC state"
+        );
+    }
+
+    #[test]
     fn second_raw_full_sync_rejects_before_renderer_or_rdram_mutation() {
         const FIRST: usize = 0x100;
         const SECOND: usize = 0x108;
@@ -4389,6 +6809,9 @@ mod tests {
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER, &mut ctx);
+        let task_addr = RdramAddr::from_offset(HEADER as u32);
+        let loaded = take_loaded_rsp_task(task_addr);
+        retain_started_rsp_task_lineage(loaded, None);
         let ucode_off = u32::from_ne_bytes(rdram[HEADER + 0x10..HEADER + 0x14].try_into().unwrap());
         for (index, word) in [0x2405_5678u32, 0xac05_0100].into_iter().enumerate() {
             let offset = ucode_off as usize + index * 4;
@@ -4396,9 +6819,7 @@ mod tests {
         }
         let generation_before = with_host(|host| host.device_fabric.rsp_memory().imem_generation());
 
-        let boot = unsafe {
-            dispatch_hle_rspboot(rdram.as_mut_ptr(), RdramAddr::from_offset(HEADER as u32))
-        };
+        let boot = unsafe { dispatch_hle_rspboot(rdram.as_mut_ptr(), task_addr) };
 
         assert_eq!(boot.steps, 7);
         assert_eq!(boot.task.task_type, fn64_runtime::M_GFXTASK);
@@ -4438,6 +6859,9 @@ mod tests {
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
         admit_synthetic_hle_task(&mut rdram, HEADER, &mut ctx);
+        let task_addr = RdramAddr::from_offset(HEADER as u32);
+        let loaded = take_loaded_rsp_task(task_addr);
+        retain_started_rsp_task_lineage(loaded, None);
         with_host(|host| {
             host.device_fabric
                 .rsp_memory_mut()
@@ -4449,7 +6873,7 @@ mod tests {
         });
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            dispatch_hle_rspboot(rdram.as_mut_ptr(), RdramAddr::from_offset(HEADER as u32))
+            dispatch_hle_rspboot(rdram.as_mut_ptr(), task_addr)
         }))
         .expect_err("rspboot BREAK before ucode must trap");
         assert!(panic_message(panic.as_ref())
@@ -4477,6 +6901,121 @@ mod tests {
             }),
             AdmittedTaskImageShape::BootOverlay,
             "equal pointers alone must not bypass rspboot when the admitted copy is incomplete"
+        );
+    }
+
+    #[test]
+    fn direct_imem_rejects_prior_inflight_owner_before_backend_entry() {
+        const TASK: u32 = 0x40;
+        const IMAGE: u32 = 0x100;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x200];
+        prepare_renderer_rdram(&mut rdram);
+        let calls = std::rc::Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(CountingPanicRenderBackend(calls.clone())),
+            rdram.len(),
+        );
+        install_running_task_lineage(
+            RdramAddr::from_offset(TASK),
+            RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap()),
+        );
+        with_host(|host| {
+            host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: 0x180,
+                admission_generation: RspTaskAdmissionGeneration::first(),
+            };
+        });
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state =
+                unsafe { begin_direct_hle_phase(rdram.as_mut_ptr(), RdramAddr::from_offset(TASK)) };
+            let _ = unsafe {
+                dispatch_gfx_task_chunk(
+                    rdram.as_mut_ptr(),
+                    &direct_imem_test_header(IMAGE),
+                    fn64_render::RenderTaskStep::Start,
+                    0,
+                )
+            };
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(calls.get(), 0, "backend ran before owner admission");
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: 0x180,
+                admission_generation: RspTaskAdmissionGeneration::first(),
+            }
+        );
+    }
+
+    #[test]
+    fn direct_imem_backend_panic_leaves_same_task_inflight() {
+        const TASK: u32 = 0x40;
+        const IMAGE: u32 = 0x100;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x200];
+        prepare_renderer_rdram(&mut rdram);
+        let calls = std::rc::Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(CountingPanicRenderBackend(calls.clone())),
+            rdram.len(),
+        );
+        install_running_task_lineage(
+            RdramAddr::from_offset(TASK),
+            RspTaskAdmissionGeneration::first(),
+        );
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state =
+                unsafe { begin_direct_hle_phase(rdram.as_mut_ptr(), RdramAddr::from_offset(TASK)) };
+            let _ = unsafe {
+                dispatch_gfx_task_chunk(
+                    rdram.as_mut_ptr(),
+                    &direct_imem_test_header(IMAGE),
+                    fn64_render::RenderTaskStep::Start,
+                    0,
+                )
+            };
+        }));
+
+        assert!(rejected.is_err());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: TASK,
+                admission_generation: RspTaskAdmissionGeneration::first(),
+            }
+        );
+    }
+
+    #[test]
+    fn direct_imem_resume_reclaims_same_suspended_owner() {
+        const TASK: u32 = 0x40;
+        with_host(|host| {
+            *host = HostState::default();
+            host.rsp_interpreter_state =
+                RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                    task_offset: TASK,
+                    admission_generation: RspTaskAdmissionGeneration::first(),
+                };
+        });
+        install_running_task_lineage(
+            RdramAddr::from_offset(TASK),
+            RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap()),
+        );
+
+        resume_direct_hle_phase(RdramAddr::from_offset(TASK));
+
+        assert_eq!(
+            crate::host_evidence_snapshot().rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: TASK,
+                admission_generation: RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap(),),
+            }
         );
     }
 
@@ -4529,13 +7068,23 @@ mod tests {
         ctx.r4 = 0x8000_0000 + HEADER as u64;
         let admitted_header = unsafe { read_os_task_header(rdram.as_mut_ptr(), HEADER) };
         unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let admitted_snapshot = crate::host_evidence_snapshot();
+        let admission_generation = admitted_snapshot
+            .loaded_rsp_task
+            .expect("loaded task evidence")
+            .admission_generation;
         assert_eq!(
-            crate::host_evidence_snapshot().loaded_rsp_task,
+            admitted_snapshot.loaded_rsp_task,
             Some(LoadedRspTaskEvidenceSnapshot {
                 task_offset: HEADER as u32,
+                admission_generation,
                 header: admitted_header,
                 resumed_data_identity: None,
             })
+        );
+        assert_eq!(
+            admitted_snapshot.next_rsp_task_admission_generation,
+            admission_generation + 1
         );
         // StartGo hashes current bytes at the address/size admitted by Load.
         // Mutating the CPU header to a second source must not change that
@@ -4569,6 +7118,10 @@ mod tests {
             host_evidence.rsp_task_lineages.is_empty(),
             "a synchronous normal completion must retire its Running lineage"
         );
+        assert!(matches!(
+            host_evidence.rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::Exact(_)
+        ));
 
         with_host(|host| {
             let fabric = &host.device_fabric;
@@ -4601,6 +7154,67 @@ mod tests {
             }]
         );
         crate::advance_virtual_time(3);
+    }
+
+    #[test]
+    fn direct_imem_hle_needs_lle_replays_untouched_pc_zero_entry_through_public_task_path() {
+        const HEADER: usize = 0x40;
+        const IMAGE: usize = 0x100;
+        const DATA: u32 = 0x180;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x200];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_GFXTASK),
+            (0x08, 0x8000_0000 | IMAGE as u32),
+            (0x0c, 12),
+            (0x10, 0xa000_0000 | IMAGE as u32),
+            (0x14, 12),
+            (0x18, 0x8000_0000 | DATA),
+            (0x1c, 4),
+        ] {
+            rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        for (index, word) in [0x2408_1234u32, 0xac08_0100, 0x0000_000d]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = IMAGE + index * 4;
+            rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        prepare_renderer_rdram(&mut rdram);
+        set_render_backend_with_policy(
+            Box::new(StatusRenderBackend(FrameStatus::NeedsLle {
+                ucode_sha256: [0x42; 32],
+            })),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::HleOptimized,
+        );
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+
+        let evidence = crate::host_evidence_snapshot();
+        let RspInterpreterStateEvidenceSnapshot::Exact(state) = evidence.rsp_interpreter_state
+        else {
+            panic!("direct-IMEM NeedsLle fallback did not publish exact terminal state")
+        };
+        assert_eq!(state.gprs()[8], 0x1234);
+        assert!(evidence.loaded_rsp_task.is_none());
+        assert!(evidence.rsp_task_lineages.is_empty());
+        with_host(|host| {
+            assert_eq!(
+                host.device_fabric
+                    .rsp_memory()
+                    .read_word(fn64_runtime::RspMemAddr::from_parts(
+                        fn64_runtime::RspMemoryBank::Dmem,
+                        0x100,
+                    ))
+                    .unwrap(),
+                0x0000_1234
+            );
+        });
     }
 
     #[test]
@@ -4647,11 +7261,14 @@ mod tests {
             host.rsp_task_lineages.insert(
                 task_addr.offset(),
                 RspTaskLineage {
+                    admission_generation: RspTaskAdmissionGeneration::first(),
                     original_header: initial_header,
                     data_identity: Some(original),
                     phase: RspTaskLineagePhase::ResumeAuthorized,
                 },
             );
+            host.next_rsp_task_admission_generation =
+                RspTaskAdmissionGeneration(NonZeroU64::new(2).unwrap());
         });
 
         let resumed_header = OsTaskHeader {
@@ -4676,10 +7293,20 @@ mod tests {
         );
 
         retain_loaded_rsp_task(resumed);
+        let resumed_load = crate::host_evidence_snapshot();
         assert_eq!(
-            crate::host_evidence_snapshot().rsp_task_lineages[0].phase,
+            resumed_load.rsp_task_lineages[0].phase,
             RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded
         );
+        assert_eq!(resumed_load.rsp_task_lineages[0].admission_generation, 2);
+        assert_eq!(
+            resumed_load
+                .loaded_rsp_task
+                .expect("yielded reload token")
+                .admission_generation,
+            2
+        );
+        assert_eq!(resumed_load.next_rsp_task_admission_generation, 3);
         let replay =
             std::panic::catch_unwind(|| loaded_rsp_task_from_header(task_addr, resumed_header))
                 .unwrap_err();
@@ -4705,7 +7332,7 @@ mod tests {
     #[test]
     fn rom_reset_invalidates_unconsumed_loaded_task_authority() {
         let task_addr = RdramAddr::from_offset(0x40);
-        retain_loaded_rsp_task(LoadedRspTask {
+        retain_loaded_rsp_task(PendingLoadedRspTask {
             task_addr,
             header: OsTaskHeader {
                 task_type: M_GFXTASK,
@@ -4732,11 +7359,13 @@ mod tests {
         let first_addr = RdramAddr::from_offset(0x40);
         let second_addr = RdramAddr::from_offset(0x80);
         let first = RspTaskLineage {
+            admission_generation: RspTaskAdmissionGeneration::first(),
             original_header: original(0x180),
             data_identity: None,
             phase: RspTaskLineagePhase::ResumeAuthorized,
         };
         let second = RspTaskLineage {
+            admission_generation: RspTaskAdmissionGeneration(NonZeroU64::new(2).unwrap()),
             original_header: original(0x1c0),
             data_identity: None,
             phase: RspTaskLineagePhase::ResumeAuthorized,
@@ -4782,6 +7411,7 @@ mod tests {
             host.rsp_task_lineages.insert(
                 task_addr.offset(),
                 RspTaskLineage {
+                    admission_generation: RspTaskAdmissionGeneration::first(),
                     original_header: OsTaskHeader {
                         yield_data_ptr: 0x180,
                         yield_data_size: 0x40,
@@ -4793,7 +7423,7 @@ mod tests {
             );
         });
 
-        retain_loaded_rsp_task(LoadedRspTask {
+        retain_loaded_rsp_task(PendingLoadedRspTask {
             task_addr,
             header: OsTaskHeader::default(),
             resumed_data_identity: None,
@@ -5394,6 +8024,7 @@ mod tests {
     #[test]
     fn unknown_task_lle_executes_persistent_imem_through_break() {
         let mut rdram = vec![0u8; 0x1000];
+        let task_addr = RdramAddr::from_offset(0);
         with_host(|host| {
             host.runtime_rdram = rdram.as_mut_ptr();
             host.runtime_rdram_len = rdram.len();
@@ -5407,17 +8038,10 @@ mod tests {
                 )
                 .unwrap();
         });
+        install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
 
-        let result = unsafe {
-            dispatch_lle_task(
-                rdram.as_mut_ptr(),
-                RdramAddr::from_offset(0),
-                false,
-                None,
-                None,
-                None,
-            )
-        };
+        let result =
+            unsafe { dispatch_lle_task(rdram.as_mut_ptr(), task_addr, false, None, None, None) };
 
         assert_eq!(
             result,
@@ -5466,7 +8090,7 @@ mod tests {
         });
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_0000 + HEADER as u64;
-        retain_loaded_rsp_task(LoadedRspTask {
+        retain_loaded_rsp_task(PendingLoadedRspTask {
             task_addr: RdramAddr::from_offset(HEADER as u32),
             header: OsTaskHeader::default(),
             resumed_data_identity: None,
@@ -5515,7 +8139,7 @@ mod tests {
         for task_offset in [0x40, 0x80] {
             crate::pi::set_live_sp_pc(0);
             let task_addr = RdramAddr::from_offset(task_offset);
-            retain_loaded_rsp_task(LoadedRspTask {
+            retain_loaded_rsp_task(PendingLoadedRspTask {
                 task_addr,
                 header: OsTaskHeader::default(),
                 resumed_data_identity: None,
@@ -5597,6 +8221,7 @@ mod tests {
         let expected_at = Cycles::new(sim_time());
 
         let task_addr = RdramAddr::from_offset(0x40);
+        install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
         let task = OsTaskHeader {
             ucode_data: 0x8000_0000 | DATA,
             ucode_data_size: DATA_BYTES.len() as u32,
@@ -6246,11 +8871,154 @@ mod tests {
         });
     }
 
-    /// A NON-graphics RSP task (e.g. `M_AUDTASK`) posts ONLY the SP-done
-    /// event, never DP-done -- OoT's audio task doesn't set OS_SC_NEEDS_RDP,
-    /// so injecting a spurious RDP_DONE_MSG would desync the scheduler's
-    /// `curRDPTask` bookkeeping. Reintroducing the `is_gfx` gate as an
-    /// unconditional DP inject makes the final `WouldBlock` assert fail.
+    #[test]
+    fn direct_imem_chunk_yield_public_resume_completes_with_resumed_generation_owner() {
+        use std::sync::{Arc, Mutex};
+
+        struct DirectChunkBackend {
+            steps: Arc<Mutex<Vec<fn64_render::RenderTaskStep>>>,
+        }
+
+        impl RenderBackend for DirectChunkBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                panic!("direct chunk fixture must use its resumable entry")
+            }
+
+            fn process_task_chunk(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+                step: fn64_render::RenderTaskStep,
+            ) -> Result<fn64_render::RenderTaskChunkStatus, RenderError> {
+                self.steps.lock().unwrap().push(step);
+                Ok(match step {
+                    fn64_render::RenderTaskStep::Start => {
+                        fn64_render::RenderTaskChunkStatus::Continue(
+                            fn64_render::RenderTaskContinuation::new(7),
+                        )
+                    }
+                    fn64_render::RenderTaskStep::Resume(token) if token.get() == 7 => {
+                        fn64_render::RenderTaskChunkStatus::Complete
+                    }
+                    fn64_render::RenderTaskStep::Resume(token) => {
+                        panic!("unexpected direct continuation token {}", token.get())
+                    }
+                })
+            }
+
+            fn task_chunking(&self) -> fn64_render::RenderTaskChunking {
+                fn64_render::RenderTaskChunking::Resumable
+            }
+
+            fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        const HEADER: usize = 0x40;
+        const IMAGE: usize = 0x100;
+        const INITIAL_DATA: u32 = 0x180;
+        const YIELD_DATA: u32 = 0x200;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x280];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_GFXTASK),
+            (0x08, 0x8000_0000 | IMAGE as u32),
+            (0x0c, 8),
+            (0x10, 0xa000_0000 | IMAGE as u32),
+            (0x14, 8),
+            (0x18, 0x8000_0000 | INITIAL_DATA),
+            (0x1c, 4),
+            (0x38, 0xa000_0000 | YIELD_DATA),
+            (0x3c, 0x40),
+        ] {
+            rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        prepare_renderer_rdram(&mut rdram);
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        set_render_backend_with_policy(
+            Box::new(DirectChunkBackend {
+                steps: Arc::clone(&steps),
+            }),
+            rdram.len(),
+            GraphicsTaskExecutionPolicy::HleOptimized,
+        );
+        let mut ctx = ctx_zeroed();
+        ctx.r4 = 0x8000_0000 + HEADER as u64;
+
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        unsafe { osSpTaskYield_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        crate::advance_virtual_time(8);
+        unsafe { osSpTaskYielded_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        assert_eq!(ctx.r2, u64::from(fn64_runtime::OS_TASK_YIELDED));
+
+        unsafe { osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let resumed_generation = crate::host_evidence_snapshot()
+            .loaded_rsp_task
+            .expect("yielded reload owns a fresh admission")
+            .admission_generation;
+        unsafe { osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        let deadline = crate::next_device_deadline().expect("resumed completion deadline");
+        crate::advance_virtual_time(deadline);
+
+        assert_eq!(
+            steps.lock().unwrap().as_slice(),
+            [
+                fn64_render::RenderTaskStep::Start,
+                fn64_render::RenderTaskStep::Resume(fn64_render::RenderTaskContinuation::new(7),),
+            ]
+        );
+        let evidence = crate::host_evidence_snapshot();
+        assert_eq!(
+            evidence.rsp_interpreter_state,
+            RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                task_offset: HEADER as u32,
+                admission_generation: RspTaskAdmissionGeneration::new(
+                    NonZeroU64::new(resumed_generation).unwrap(),
+                ),
+            }
+        );
+        assert!(evidence.loaded_rsp_task.is_none());
+        assert!(evidence.rsp_task_lineages.is_empty());
+        assert!(HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_none()));
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert!(!snapshot.sp_busy);
+            assert!(!snapshot.dp_busy);
+        });
+    }
+
+    /// An explicitly skipped audio task with no DPC FullSync posts only the
+    /// SP-done event. Injecting a spurious RDP_DONE_MSG would desync OoT's
+    /// scheduler `curRDPTask` bookkeeping.
     #[test]
     fn os_sp_task_start_go_audio_task_posts_only_sp() {
         const OS_EVENT_SP: u32 = 4;
@@ -6258,6 +9026,8 @@ mod tests {
         const RSP_DONE_MSG: u32 = 667;
         const RDP_DONE_MSG: u32 = 668;
 
+        crate::load_rom(Vec::new());
+        set_audio_task_diagnostic_skip();
         let interrupt_q = RdramAddr::from_offset(0x0009_1000);
         with_executor(|exec| {
             exec.create_mesg_queue(interrupt_q, 4);
@@ -6423,10 +9193,10 @@ mod tests {
             SEEN_UCODE_ADDR.store(task_offset, Ordering::SeqCst);
             0
         }
-        unsafe { set_audio_ucode_fn(fake_ucode) };
+        crate::load_rom(Vec::new());
+        unsafe { set_translated_audio_ucode(fake_ucode, [0x51; 32]) };
         CALLED.store(false, Ordering::SeqCst);
         SEEN_UCODE_ADDR.store(0, Ordering::SeqCst);
-        crate::load_rom(Vec::new());
 
         let mut rdram = vec![0u8; 128];
         let header_off = 0x20usize;
@@ -6461,10 +9231,10 @@ mod tests {
             SEEN_OFFSET.store(task_offset, Ordering::SeqCst);
             0
         }
-        unsafe { set_audio_ucode_fn(fake_ucode) };
+        crate::load_rom(Vec::new());
+        unsafe { set_translated_audio_ucode(fake_ucode, [0x52; 32]) };
         CALLED.store(false, Ordering::SeqCst);
         SEEN_OFFSET.store(0, Ordering::SeqCst);
-        crate::load_rom(Vec::new());
         crate::set_trace_enabled(true);
 
         let mut rdram = vec![0u8; 128];
@@ -6545,7 +9315,7 @@ mod tests {
         const HEADER: usize = 0x40;
         const IMAGE: usize = 0x200;
         crate::load_rom(Vec::new());
-        unsafe { set_audio_ucode_fn(fake_ucode) };
+        unsafe { set_translated_audio_ucode(fake_ucode, [0x53; 32]) };
         CALLED.store(false, Ordering::SeqCst);
         let mut rdram = vec![0u8; IMAGE + fn64_runtime::RSP_MEMORY_BANK_SIZE];
         for (field, value) in [
@@ -6626,6 +9396,7 @@ mod tests {
             host.rsp_task_lineages.insert(
                 HEADER_OFF as u32,
                 RspTaskLineage {
+                    admission_generation: RspTaskAdmissionGeneration::first(),
                     original_header: OsTaskHeader {
                         flags: FLAGS,
                         ucode_data: OLD_UCODE_DATA,
@@ -6723,5 +9494,469 @@ mod tests {
             Some(vec![0x34, 0x12, 0xfe, 0xff])
         );
         set_audio_digest_capture(false);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScheduledRawDpcReply {
+        BackendError,
+        WrongTransaction,
+        WrongQuantum,
+        WrongCursor,
+        Continue(fn64_render::DpFullSyncStatus),
+        Complete(fn64_render::DpFullSyncStatus),
+    }
+
+    struct ScheduledRawDpcBackend {
+        replies: std::collections::VecDeque<ScheduledRawDpcReply>,
+        calls: usize,
+        steps: Vec<fn64_render::RawDpcStep>,
+    }
+
+    impl ScheduledRawDpcBackend {
+        fn new(replies: impl IntoIterator<Item = ScheduledRawDpcReply>) -> Self {
+            Self {
+                replies: replies.into_iter().collect(),
+                calls: 0,
+                steps: Vec::new(),
+            }
+        }
+    }
+
+    impl RenderBackend for ScheduledRawDpcBackend {
+        fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn observe_non_rdp_write16(
+            &mut self,
+            _write: fn64_render::NonRdpWrite16,
+        ) -> fn64_render::NonRdpWrite16Disposition {
+            fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+        }
+
+        fn process_task(
+            &mut self,
+            _rdram: &mut [u8],
+            _rsp_memory: &mut fn64_runtime::RspMemory,
+            _task: &fn64_render::OsTask,
+            _output_addr: u32,
+        ) -> Result<FrameStatus, RenderError> {
+            unreachable!("scheduled raw-DPC test cannot dispatch an HLE task")
+        }
+
+        fn raw_dpc_progression(&self) -> fn64_render::RawDpcProgression {
+            fn64_render::RawDpcProgression::Acknowledged
+        }
+
+        fn process_rdp_command_chunk(
+            &mut self,
+            rdram: &mut [u8],
+            quantum: fn64_render::RawDpcQuantum,
+            step: fn64_render::RawDpcStep,
+        ) -> Result<fn64_render::RawDpcChunkAck, RenderError> {
+            self.calls += 1;
+            self.steps.push(step);
+            rdram[self.calls - 1] = 0xa0 + self.calls as u8;
+            let reply = self
+                .replies
+                .pop_front()
+                .expect("scheduled raw-DPC test exhausted backend replies");
+            let mut ack = fn64_render::RawDpcChunkAck {
+                transaction: quantum.request.transaction,
+                quantum: quantum.request.quantum,
+                committed_through: quantum.request.end,
+                status: fn64_render::RawDpcChunkStatus::Continue(
+                    fn64_render::RenderRawDpcContinuation::new(91),
+                ),
+                full_sync: fn64_render::DpFullSyncStatus::NotReached,
+            };
+            match reply {
+                ScheduledRawDpcReply::BackendError => Err(RenderError::Backend {
+                    backend: "scheduled-raw-dpc-test",
+                    reason: "injected failure after shadow mutation".into(),
+                }),
+                ScheduledRawDpcReply::WrongTransaction => {
+                    ack.transaction = fn64_runtime::DpcTransactionId::from_submission(
+                        fn64_runtime::DpcSubmission {
+                            token: quantum.request.transaction.get() + 1,
+                            source: quantum.request.start.source(),
+                            start: quantum.request.start.address(),
+                            end: quantum.request.end.address(),
+                        },
+                    );
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::WrongQuantum => {
+                    ack.quantum =
+                        fn64_runtime::DpcQuantumId::new(quantum.request.quantum.get() + 1);
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::WrongCursor => {
+                    ack.committed_through = quantum.request.start;
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::Continue(full_sync) => {
+                    ack.full_sync = full_sync;
+                    Ok(ack)
+                }
+                ScheduledRawDpcReply::Complete(full_sync) => {
+                    ack.status = fn64_render::RawDpcChunkStatus::Complete;
+                    ack.full_sync = full_sync;
+                    Ok(ack)
+                }
+            }
+        }
+
+        fn present(
+            &mut self,
+            _request: fn64_render::PresentRequest<'_>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _w: u32, _h: u32) {}
+
+        fn supported_ucodes(&self) -> &[UcodeId] {
+            &[]
+        }
+    }
+
+    fn scheduled_raw_dpc_transaction() -> ScheduledRawDpcTransaction {
+        let source = fn64_runtime::DpcSubmissionSource::Rdram;
+        let cursor = |address| fn64_runtime::DpcCursor::new(source, address).unwrap();
+        ScheduledRawDpcTransaction::new(
+            fn64_runtime::DpcScheduledExecution::new(
+                fn64_runtime::DpcSubmission {
+                    token: 5,
+                    source,
+                    start: 0x100,
+                    end: 0x110,
+                },
+                fn64_runtime::Cycles::new(0),
+                vec![
+                    fn64_runtime::DpcQuantumPlan {
+                        at: fn64_runtime::Cycles::new(2),
+                        id: fn64_runtime::DpcQuantumId::new(1),
+                        start: cursor(0x100),
+                        end: cursor(0x108),
+                    },
+                    fn64_runtime::DpcQuantumPlan {
+                        at: fn64_runtime::Cycles::new(3),
+                        id: fn64_runtime::DpcQuantumId::new(2),
+                        start: cursor(0x108),
+                        end: cursor(0x110),
+                    },
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn malformed_or_failed_raw_dpc_backend_result_poisons_without_publication() {
+        use ScheduledRawDpcReply::{BackendError, WrongCursor, WrongQuantum, WrongTransaction};
+
+        for reply in [BackendError, WrongTransaction, WrongQuantum, WrongCursor] {
+            let mut transaction = scheduled_raw_dpc_transaction();
+            let start = transaction.cursor();
+            let mut backend = ScheduledRawDpcBackend::new([reply]);
+            let mut live = vec![0x11; 16];
+            let error = transaction
+                .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0)
+                .unwrap_err();
+            match error {
+                ScheduledRawDpcError::Backend(error) => {
+                    assert!(error.to_string().contains("injected failure"));
+                }
+                ScheduledRawDpcError::Schedule(_) => {}
+                ScheduledRawDpcError::UnidentifiedFullSync => {
+                    panic!("identity-mismatch cases cannot fail FullSync validation")
+                }
+            }
+            assert_eq!(live, vec![0x11; 16]);
+            assert_eq!(transaction.cursor(), start);
+            assert_eq!(transaction.continuation(), None);
+            assert_eq!(
+                transaction.phase(),
+                fn64_runtime::DpcScheduledPhase::Poisoned
+            );
+            assert!(matches!(
+                transaction.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,),
+                Err(ScheduledRawDpcError::Schedule(
+                    fn64_runtime::DpcScheduleError::Poisoned
+                ))
+            ));
+            assert_eq!(backend.calls, 1, "a poisoned transaction cannot retry work");
+        }
+    }
+
+    #[test]
+    fn raw_dpc_status_must_match_remaining_schedule_before_publication() {
+        let mut early = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([ScheduledRawDpcReply::Complete(
+            fn64_render::DpFullSyncStatus::NotReached,
+        )]);
+        let mut live = vec![0x22; 16];
+        assert!(matches!(
+            early.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0),
+            Err(ScheduledRawDpcError::Schedule(
+                fn64_runtime::DpcScheduleError::EarlyComplete { .. }
+            ))
+        ));
+        assert_eq!(live, vec![0x22; 16]);
+        assert_eq!(early.phase(), fn64_runtime::DpcScheduledPhase::Poisoned);
+
+        let mut final_continue = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::NotReached),
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::NotReached),
+        ]);
+        let mut live = vec![0x33; 16];
+        final_continue
+            .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0)
+            .unwrap();
+        let first_image = live.clone();
+        assert!(matches!(
+            final_continue.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,),
+            Err(ScheduledRawDpcError::Schedule(
+                fn64_runtime::DpcScheduleError::FinalContinue { .. }
+            ))
+        ));
+        assert_eq!(
+            live, first_image,
+            "the malformed final shadow stays private"
+        );
+        assert_eq!(
+            final_continue.phase(),
+            fn64_runtime::DpcScheduledPhase::Poisoned
+        );
+        assert_eq!(final_continue.continuation(), None);
+    }
+
+    #[test]
+    fn second_raw_dpc_backend_error_preserves_only_the_first_commit() {
+        let mut transaction = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::Reached),
+            ScheduledRawDpcReply::BackendError,
+        ]);
+        let mut live = vec![0x55; 16];
+
+        transaction
+            .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0)
+            .unwrap();
+        let first_image = live.clone();
+        assert_eq!(first_image[0], 0xa1);
+        assert_eq!(first_image[1], 0x55);
+        assert_eq!(
+            transaction.continuation(),
+            Some(fn64_render::RenderRawDpcContinuation::new(91))
+        );
+        assert_eq!(
+            transaction.full_sync(),
+            fn64_render::DpFullSyncStatus::Reached
+        );
+
+        assert!(matches!(
+            transaction.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0),
+            Err(ScheduledRawDpcError::Backend(_))
+        ));
+        assert_eq!(
+            backend.steps,
+            vec![
+                fn64_render::RawDpcStep::Start,
+                fn64_render::RawDpcStep::Resume(fn64_render::RenderRawDpcContinuation::new(91)),
+            ]
+        );
+        assert_eq!(live, first_image, "the second shadow stays unpublished");
+        assert_eq!(live[1], 0x55, "the second backend mutation stayed private");
+        assert_eq!(transaction.continuation(), None);
+        assert_eq!(
+            transaction.full_sync(),
+            fn64_render::DpFullSyncStatus::Reached,
+            "a rejected later quantum cannot erase prior committed FullSync evidence"
+        );
+        assert_eq!(
+            transaction.phase(),
+            fn64_runtime::DpcScheduledPhase::Poisoned
+        );
+        assert!(matches!(
+            transaction.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0),
+            Err(ScheduledRawDpcError::Schedule(
+                fn64_runtime::DpcScheduleError::Poisoned
+            ))
+        ));
+        assert_eq!(backend.calls, 2, "poison prevents a second-quantum retry");
+    }
+
+    #[test]
+    fn raw_dpc_full_sync_is_identified_and_sticky_across_valid_commits() {
+        let mut transaction = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([
+            ScheduledRawDpcReply::Continue(fn64_render::DpFullSyncStatus::Reached),
+            ScheduledRawDpcReply::Complete(fn64_render::DpFullSyncStatus::NotReached),
+        ]);
+        let mut live = vec![0; 16];
+        for expected_phase in [
+            fn64_runtime::DpcScheduledPhase::Scheduled,
+            fn64_runtime::DpcScheduledPhase::Complete,
+        ] {
+            assert!(matches!(
+                transaction
+                    .advance_one(
+                        fn64_runtime::Cycles::new(10),
+                        &mut backend,
+                        &mut live,
+                        0,
+                    )
+                    .unwrap(),
+                ScheduledRawDpcAdvance::Committed {
+                    phase,
+                    full_sync: fn64_render::DpFullSyncStatus::Reached,
+                    ..
+                } if phase == expected_phase
+            ));
+        }
+
+        let mut unidentified = scheduled_raw_dpc_transaction();
+        let mut backend = ScheduledRawDpcBackend::new([ScheduledRawDpcReply::Continue(
+            fn64_render::DpFullSyncStatus::Unidentified,
+        )]);
+        let mut live = vec![0x44; 16];
+        assert!(matches!(
+            unidentified.advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,),
+            Err(ScheduledRawDpcError::UnidentifiedFullSync)
+        ));
+        assert_eq!(live, vec![0x44; 16]);
+        assert_eq!(
+            unidentified.phase(),
+            fn64_runtime::DpcScheduledPhase::Poisoned
+        );
+    }
+
+    #[test]
+    fn synthetic_scheduled_dpc_keeps_renderer_continuation_in_the_abi_lane() {
+        struct Backend;
+
+        impl RenderBackend for Backend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn observe_non_rdp_write16(
+                &mut self,
+                _write: fn64_render::NonRdpWrite16,
+            ) -> fn64_render::NonRdpWrite16Disposition {
+                fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+            }
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                unreachable!("synthetic raw-DPC test cannot dispatch an HLE task")
+            }
+
+            fn raw_dpc_progression(&self) -> fn64_render::RawDpcProgression {
+                fn64_render::RawDpcProgression::Acknowledged
+            }
+
+            fn process_rdp_command_chunk(
+                &mut self,
+                rdram: &mut [u8],
+                quantum: fn64_render::RawDpcQuantum,
+                step: fn64_render::RawDpcStep,
+            ) -> Result<fn64_render::RawDpcChunkAck, RenderError> {
+                let index = usize::try_from(quantum.request.start.address() - 0x100).unwrap();
+                rdram[index] = quantum.request.quantum.get() as u8;
+                let status = match step {
+                    fn64_render::RawDpcStep::Start => fn64_render::RawDpcChunkStatus::Continue(
+                        fn64_render::RenderRawDpcContinuation::new(77),
+                    ),
+                    fn64_render::RawDpcStep::Resume(token) if token.get() == 77 => {
+                        fn64_render::RawDpcChunkStatus::Complete
+                    }
+                    fn64_render::RawDpcStep::Resume(token) => {
+                        panic!("ABI supplied stale raw-DPC continuation {}", token.get())
+                    }
+                };
+                Ok(fn64_render::RawDpcChunkAck {
+                    transaction: quantum.request.transaction,
+                    quantum: quantum.request.quantum,
+                    committed_through: quantum.request.end,
+                    status,
+                    full_sync: fn64_render::DpFullSyncStatus::NotReached,
+                })
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+        }
+
+        let source = fn64_runtime::DpcSubmissionSource::Rdram;
+        let cursor = |address| fn64_runtime::DpcCursor::new(source, address).unwrap();
+        let execution = fn64_runtime::DpcScheduledExecution::new(
+            fn64_runtime::DpcSubmission {
+                token: 5,
+                source,
+                start: 0x100,
+                end: 0x110,
+            },
+            fn64_runtime::Cycles::new(0),
+            vec![
+                fn64_runtime::DpcQuantumPlan {
+                    at: fn64_runtime::Cycles::new(2),
+                    id: fn64_runtime::DpcQuantumId::new(1),
+                    start: cursor(0x100),
+                    end: cursor(0x108),
+                },
+                fn64_runtime::DpcQuantumPlan {
+                    at: fn64_runtime::Cycles::new(3),
+                    id: fn64_runtime::DpcQuantumId::new(2),
+                    start: cursor(0x108),
+                    end: cursor(0x110),
+                },
+            ],
+        )
+        .unwrap();
+        let mut backend = Backend;
+        let mut transaction = ScheduledRawDpcTransaction::new(execution);
+        let mut live = vec![0u8; 16];
+
+        for (expected_at, expected_phase) in [
+            (2, fn64_runtime::DpcScheduledPhase::Scheduled),
+            (3, fn64_runtime::DpcScheduledPhase::Complete),
+        ] {
+            assert_eq!(
+                transaction
+                    .advance_one(fn64_runtime::Cycles::new(10), &mut backend, &mut live, 0,)
+                    .unwrap(),
+                ScheduledRawDpcAdvance::Committed {
+                    at: fn64_runtime::Cycles::new(expected_at),
+                    phase: expected_phase,
+                    full_sync: fn64_render::DpFullSyncStatus::NotReached,
+                }
+            );
+        }
+        assert_eq!(live[0], 1);
+        assert_eq!(live[8], 2);
+        assert_eq!(transaction.continuation(), None);
+        assert_eq!(
+            transaction.phase(),
+            fn64_runtime::DpcScheduledPhase::Complete
+        );
     }
 }

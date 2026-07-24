@@ -816,7 +816,7 @@ int fn64_rt64_process_synthetic_hfr_f3dex2(
 #endif
 
 #if defined(FN64_RT64_SYNTHETIC_S2DEX_EVIDENCE)
-/* Evidence-only HLE admission for a hand-authored public S2DEX2 display list.
+/* Evidence-only HLE admission for a hand-authored public S2DEX/S2DEX2 display list.
  * Production task processing continues to require exact recognized microcode. */
 int fn64_rt64_process_synthetic_s2dex2(
     Fn64Rt64Context *context,
@@ -824,6 +824,7 @@ int fn64_rt64_process_synthetic_s2dex2(
     size_t rdram_len,
     uint32_t display_list,
     uint32_t output_addr,
+    uint32_t legacy_wire,
     char *error,
     size_t error_capacity);
 #endif

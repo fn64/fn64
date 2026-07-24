@@ -88,11 +88,48 @@ mistake the guest's swap request for a completed native presentation. A step
 budget or steady-idle exit before that capture is a loud failure, not a
 successful partial capture.
 
-This remains an integration/boot harness, not a complete full-ROM release
-certificate: it contains the explicitly documented voice-map virgin-memory
-reproduction in `src/main.rs`. A digest from this harness proves which native
-pixels were produced and whether a bounded run repeats; it does not by itself
-prove hardware pixel correctness or zero unsupported behavior.
+Ordinary runs remain diagnostics: they retain the explicitly documented
+voice-map virgin-memory reproduction in `src/main.rs`. A diagnostic digest
+proves which native pixels were produced and whether a bounded run repeats;
+it does not by itself prove hardware pixel correctness or zero unsupported
+behavior.
+
+## Voice-map-intervention-free schema-v28 release path
+
+The generic runner-owned release tuple enables the fail-closed RT64/LLE path:
+
+```text
+FN64_RELEASE_GATE_CYCLE=C
+FN64_RELEASE_REPORT=/private/path/report.json
+FN64_RELEASE_ROM_CLASS=retail_cartridge
+FN64_RELEASE_RUN_EVENT_SHA256=LOWERCASE_SHA256_FROM_THE_RUNNER_EVENT
+FN64_RELEASE_MICROCODE_TEXT_PATH=/private/staged/imem.bin
+FN64_RELEASE_MICROCODE_DATA_PATH=/private/staged/ucode-data.bin
+FN64_RENDER=rt64
+WM2000_GRAPHICS_POLICY=lle
+```
+
+The four `FN64_RELEASE_{GATE_CYCLE,REPORT,ROM_CLASS,RUN_EVENT_SHA256}`
+variables are one indivisible tuple; partial tuples and the historical
+`OOT_RELEASE_*` aliases fail. The private-series runner owns the event digest,
+staged microcode pair, report path, and ROM-class authority. The target cycle
+must be an exact scheduled VI edge with a completed RT64 post-VI presentation.
+The host arms `LiveReleaseGate` and its crash-flushed unsupported-event journal
+before thread 0 runs, freezes the native archive identity and all fixed-cycle
+channels at that edge, writes the schema-v28 report, completes the unsupported
+journal, and then requires closed-gate state. A failed closure may retain an
+incomplete report for diagnosis, but the private-series runner rejects it.
+Stopping early or skipping the requested cycle is a loud failure.
+
+Release mode forces RT64 post-VI capture, requires a clean authoritative RT64
+source identity, and requires LLE graphics execution. Most importantly, it
+never writes the diagnostic voice-map zeros. If a fresh channel allocation
+reaches the point where that reproduction would have fired, the process traps
+before report creation and leaves the unsupported journal incomplete. An
+accepted closed report therefore certifies that this voice-map intervention
+did not occur in the measured execution. It still certifies deterministic executed
+closure, not silicon pixel correctness; exact-ten fresh-process evidence and
+independent hardware pixel validation remain separate requirements.
 
 ## Step budget (`WM2000_MAX_STEPS`)
 
@@ -740,10 +777,6 @@ pointer, and a pervasive native-vs-big-endian `MEM_W` mistranscription)
 were found and fixed along the way, each with a regression test in
 `fn64-abi`/`fn64-runtime`.
 
-The real translated `wm2000_audio_ucode` (RSPRecomp-generated) could not be
-linked in this harness: RSPRecomp's own codegen template unconditionally
-`#include`s `librecomp/rsp.hpp`, which is GPL-3.0-licensed
-(`N64ModernRuntime`'s top-level `COPYING`), disallowed by `AGENTS.md`'s
-clean-room protocol. `stand_in_audio_ucode` in `src/main.rs` exercises the
-real `M_AUDTASK` dispatch plumbing without linking the disallowed
-dependency — it does nothing to rdram, and says so loudly when invoked.
+That historical run used a non-executing audio stand-in. The harness now
+selects `LleAccuracy`, so admitted live audio-task IMEM executes through
+fn64's clean-room RSP interpreter without linking external runtime code.

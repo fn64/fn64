@@ -78,7 +78,11 @@ Everything RT64-specific (D3D12/Vulkan/Metal and native HLE execution) lives
 behind that. Backend-neutral content-addressed microcode catalogs, immutable
 ordered task/self-load plans, and raw-DPC FullSync inspection live in
 `fn64-render`, so native and reference backends cannot drift on those handoff
-invariants. `fn64-rt64` (→
+invariants. The same crate owns a source-preserving diagnostic raw-DPC
+transport. It concatenates only same-source contiguous ranges; that grouping
+is a conservative transport heuristic, not a reconstruction of silicon
+START/END state. Its synthetic RDRAM suffix is RDP-visible and replay sees the
+final memory image rather than per-CMD_END temporal state. `fn64-rt64` (→
 `fn64-render-rt64`) already exists as the intended quarantine crate.
 
 ### The shared seam (crate: `fn64-render`)
@@ -96,6 +100,13 @@ pub trait RenderBackend {
         task: &OsTask,
         output_addr: u32,
     ) -> Result<FrameStatus, RenderError>;
+    fn raw_dpc_batch_capability(&self) -> RawDpcBatchCapability;
+    fn process_raw_dpc_batch(
+        &mut self,
+        rdram: &mut [u8],
+        batch: PreflightedRawDpcBatch,
+        output_addr: u32,
+    ) -> Result<RawDpcBatchOutcome, RenderError>;
     fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError>;
     fn resize(&mut self, w: u32, h: u32);
     /// Which microcode GBIs this backend actually implements — a task using an
@@ -127,6 +138,41 @@ plan. Its pinned pre-cache observer forces native recognition and requires
 exact ordered exhaustion, including same-address and `A -> B -> A` generations;
 precommit incompatibility returns typed `NeedsLle`, while divergence after
 execution begins poisons the context.
+
+Raw-DPC diagnostic input owns canonical RDRAM command words or the exact
+logical big-endian XBUS payload captured at CMD_END, plus the original source
+range and content digest. Preflight validates the diagnostic grouping and
+24-bit staging image before a backend borrow. `ReferenceBackend` exposes this
+only as `DiagnosticOnly`; its result cannot publish guest/device state or
+satisfy release evidence. RT64 reports `Unsupported` until its native seam
+accepts a separate command buffer with the original memory/timing authority.
+Exact replay still needs per-CMD_END DPC observations, intermediate memory,
+interrupt/FullSync order, and silicon timing.
+
+The shared seam also has an opt-in acknowledged raw-DPC chunk contract. A
+runtime-issued quantum carries typed transaction, quantum, and aligned cursor
+identities; a backend may return a continuation only with an exact matching
+commit acknowledgment. The ABI, not the runtime or backend, owns that opaque
+continuation between calls and publishes each shadow memory image only after
+validation. `Continue` is valid only while another schedule quantum remains;
+`Complete` is valid only for the final quantum. Once a backend is entered, an
+error or malformed success poisons the orchestration transaction instead of
+retrying possibly consumed backend state, and neither its shadow image nor its
+continuation is published. FullSync evidence must be identified and is retained
+cumulatively across valid commits. This is a representational phase-A
+mechanism: default backends are still atomic, no production timing policy
+selects chunking, and a host chunk boundary is not an RDP clock, DMA-fetch,
+CURRENT, busy-counter, FREEZE, or FLUSH claim.
+
+Phase B routes the existing production atomic raw-DPC path through that same
+transaction/quantum/cursor acknowledgment validator as one identity-only
+quantum. Its internal zero deadline is a sentinel with no guest-time meaning.
+Atomic backends still receive exactly one `process_rdp_commands` call; the
+validated `Complete` acknowledgment occurs after the existing renderer and
+FullSync checks but before shadow-memory publication. Fabric CURRENT/status,
+rollback, observation ordering, DP interrupt scheduling, counters, and release
+digests retain their prior owners and commit order. No scheduled production
+execution or renderer continuation is enabled by this migration.
 
 `PresentRequest` co-binds `ViPresentation`'s V-blank-latched scanout state with
 a move-only `PhysicalRdramRead` capability for that exact retrace. Integrated
