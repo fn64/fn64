@@ -60,15 +60,33 @@ heavily), the whole-function lane omits real code.
 
 ## What closes it
 
-The arbitrary-PC block/interpreter lane already handles exactly these cases:
-`break` becomes `CpuException::Breakpoint` and `eret` becomes a typed control
-transfer, vectored through the installed handler rather than panicking (see
-`crates/fn64-recomp-rs/src/execution.rs`, `crates/fn64-recomp-rs/src/interp.rs`,
-and the `ISA-COVERAGE.md` C/P/T/R audit). That lane is currently opt-in
-(`FN64_RS_EXECUTION=block`). Promoting it to the default whole-ROM execution
-path — not retrofitting an exception-return ABI into the whole-function lane —
-is the work that turns "recompiles OoT" into "runs arbitrary N64 ROMs." It is
-tracked separately from this baseline.
+The arbitrary-PC block/interpreter lane is where these cases belong: its AOT
+emitter renders `break`/`syscall`/traps as architectural exceptions and `eret`
+as a typed control transfer (see `crates/fn64-recomp-rs/src/execution.rs`,
+`crates/fn64-recomp-rs/src/emit.rs`, and the `ISA-COVERAGE.md` C/P/T/R audit).
+Promoting that lane to the default whole-ROM execution path — not retrofitting
+an exception-return ABI into the whole-function lane — is the work that turns
+"recompiles OoT" into "runs arbitrary N64 ROMs."
+
+That promotion has several pieces, being landed incrementally:
+
+- **Driver exception vectoring (done).** The block-lane driver
+  `run_block_program` (`crates/fn64-abi/src/recompiled.rs`) now vectors a
+  `BlockExit::Fault` carrying an architectural exception through the installed
+  handler, exactly like the executable-write boundary; previously only
+  executable-write faults were vectored and a mid-function `break` panicked the
+  driver.
+- **Whole-ROM `BlockProgram` emitter (open).** The emitter
+  `emit_block_program_source` (`crates/fn64-discover/src/block_pack.rs`) is
+  correct but is only driven over single banks / synthetic fixtures for OoT
+  today; a whole-ROM OoT/SM64 pack producer is the long pole.
+- **Interpreter fallback holes (open).** The interpreter
+  (`crates/fn64-recomp-rs/src/interp.rs`) does not yet implement
+  `break`/`syscall`/traps/COP2; it is off the hot path only while every admitted
+  bank runs through its AOT runner.
+- **Default wiring (open).** `FN64_RS_EXECUTION=block` remains opt-in until the
+  above land and both OoT and SM64 boot through the block lane with zero
+  gap-panics.
 
 ## C shell-out retirement
 
