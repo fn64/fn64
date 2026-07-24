@@ -35,9 +35,10 @@ pub unsafe extern "C" fn __osSpSetStatus_recomp(_rdram: *mut u8, ctx: *mut Recom
 /// `osDpSetStatus(u32 status)` -- `a0`=`ctx->r4` (verified: `funcs_55.c:22`,
 /// `ctx->r4 = ADD32(0, 0x28);` immediately before the call). Real hardware
 /// effect: writes the RDP `DP_STATUS` command register (clear/set flags for
-/// XBUS/freeze/flush, per public N64 hardware documentation). The command is
-/// applied to the same `DpRegs` state returned by `osDpGetStatus` and raw
-/// MMIO synchronization.
+/// XBUS/freeze/flush, plus the four counter-clear commands for the
+/// clock/cmd/pipe/tmem performance counters, per public N64 hardware
+/// documentation). The command is applied to the same `DpRegs` state returned
+/// by `osDpGetStatus` and raw MMIO synchronization.
 ///
 /// # Safety
 /// Same contract as every other shim in this file.
@@ -393,5 +394,64 @@ mod tests {
         set.r4 = 1 << 3;
         unsafe { __osSpSetStatus_recomp(std::ptr::null_mut(), &mut set) };
         assert!(!crate::pi::cpu_interrupt_pending());
+    }
+
+    // Seed the four DPC counters to 1,2,3,4 in the live device via the RSP
+    // execution-state commit path (they are read-only over MMIO).
+    fn seed_live_dpc_counters() {
+        with_host(|host| {
+            let mut state = host.device_fabric.rsp_execution_state();
+            state.dpc_start = 0;
+            state.dpc_end = 0;
+            state.dpc_current = 0;
+            state.dpc_status = 0;
+            state.dpc_clock = 1;
+            state.dpc_busy = 2;
+            state.dpc_pipe_busy = 3;
+            state.dpc_tmem_busy = 4;
+            host.device_fabric
+                .commit_complete_rsp_execution_state(state)
+                .unwrap();
+        });
+    }
+
+    fn live_dpc_counters() -> (u32, u32, u32, u32) {
+        (
+            crate::pi::read_raw_mmio_word(0xFFFF_FFFF_A410_0010).unwrap(),
+            crate::pi::read_raw_mmio_word(0xFFFF_FFFF_A410_0014).unwrap(),
+            crate::pi::read_raw_mmio_word(0xFFFF_FFFF_A410_0018).unwrap(),
+            crate::pi::read_raw_mmio_word(0xFFFF_FFFF_A410_001C).unwrap(),
+        )
+    }
+
+    #[test]
+    fn dp_counter_clear_commands_converge_between_shim_and_raw_mmio() {
+        // (command bit, expected (clock, busy, pipe, tmem) after clearing from 1,2,3,4)
+        let cases = [
+            (0x0200u32, (0, 2, 3, 4)), // CLEAR_CLOCK
+            (0x0100u32, (1, 0, 3, 4)), // CLEAR_CMD -> busy
+            (0x0080u32, (1, 2, 0, 4)), // CLEAR_PIPE
+            (0x0040u32, (1, 2, 3, 0)), // CLEAR_TMEM
+        ];
+        for (command, expected) in cases {
+            // Shim path (osDpSetStatus_recomp with a0 = command).
+            crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+            seed_live_dpc_counters();
+            let mut set = ctx_zeroed();
+            set.r4 = command as u64;
+            unsafe { osDpSetStatus_recomp(std::ptr::null_mut(), &mut set) };
+            let via_shim = live_dpc_counters();
+            assert_eq!(via_shim, expected, "shim path, command {command:#06x}");
+
+            // Raw MMIO path (write DPC_STATUS directly).
+            crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
+            seed_live_dpc_counters();
+            assert!(crate::pi::write_raw_mmio_word(0xFFFF_FFFF_A410_000C, command));
+            let via_raw = live_dpc_counters();
+            assert_eq!(
+                via_raw, via_shim,
+                "shim and raw MMIO disagree for command {command:#06x}"
+            );
+        }
     }
 }
