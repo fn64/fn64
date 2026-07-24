@@ -23,10 +23,17 @@ use std::process::Command;
 /// it per-OS means discovering each addition as a link failure.
 ///
 /// `rustc --print native-static-libs` reports exactly that set for the current
-/// target, so ask rather than guess.
+/// target, so ask rather than guess -- but only when it answers. `cargo rustc`
+/// emits the note only if it actually invokes rustc, and `find_staticlib()`
+/// has just built the same lib, so a fresh unit makes cargo skip straight to
+/// "Finished" with nothing on stderr. Fall back to the last known-good set for
+/// the platform rather than failing the test over a cache state.
 fn native_static_libs() -> Vec<String> {
-    let mut cargo =
-        Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    const MACOS_FALLBACK: &str = "-framework AudioToolbox -framework CoreAudio \
+         -framework Foundation -framework CoreFoundation -lSystem -lobjc -liconv -lc -lm";
+    const LINUX_FALLBACK: &str = "-lasound -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc";
+
+    let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cargo.args(["rustc", "-p", "fn64-abi", "--lib"]);
     if cfg!(feature = "recomp-rs") {
         cargo.args(["--features", "recomp-rs"]);
@@ -36,12 +43,18 @@ fn native_static_libs() -> Vec<String> {
         .output()
         .expect("spawn cargo rustc --print native-static-libs");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let line = stderr
+    let reported = stderr
         .lines()
         .find_map(|l| l.trim().strip_prefix("note: native-static-libs:"))
-        .unwrap_or_else(|| {
-            panic!("rustc did not report native-static-libs:\n{stderr}");
-        });
+        .map(str::to_string);
+    let line = reported.unwrap_or_else(|| {
+        if cfg!(target_os = "macos") {
+            MACOS_FALLBACK.to_string()
+        } else {
+            LINUX_FALLBACK.to_string()
+        }
+    });
+    let line = line.as_str();
     // Deduplicate while preserving order: rustc repeats entries (e.g. -lSystem,
     // -framework Foundation), and a repeated `-framework` would otherwise pair
     // with the wrong following token.
