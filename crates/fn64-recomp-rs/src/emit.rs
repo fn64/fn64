@@ -499,6 +499,7 @@ pub fn emit_bank_runner_with_host_calls(bank: &BankInput<'_>, host_calls: &[u32]
         } else {
             if !emit_bank_eret(&mut out, instr, bank.bank)
                 && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
+                && !emit_bank_fpu_trap(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_exception(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_address_exception(
                     &mut out, instr, vram, vram, false, bank.bank, false,
@@ -770,6 +771,7 @@ fn emit_sparse_bank_runner_inner(
         } else {
             if !emit_bank_eret(&mut out, instr, bank.bank)
                 && !emit_bank_overflow(&mut out, instr, vram, vram, false, bank.bank, false)
+                && !emit_bank_fpu_trap(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_exception(&mut out, instr, vram, vram, false, bank.bank, false)
                 && !emit_bank_address_exception(
                     &mut out, instr, vram, vram, false, bank.bank, false,
@@ -960,6 +962,7 @@ fn emit_bank_control_transfer(
             } else {
                 emit_bank_cop1_guard(out, delay, delay_vram, vram, true, bank, true);
                 if !emit_bank_overflow(out, delay, delay_vram, vram, true, bank, true)
+                    && !emit_bank_fpu_trap(out, delay, delay_vram, vram, true, bank, true)
                     && !emit_bank_exception(out, delay, delay_vram, vram, true, bank, true)
                     && !emit_bank_address_exception(out, delay, delay_vram, vram, true, bank, true)
                 {
@@ -1700,6 +1703,75 @@ fn emit_sc(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg, off: i16, 
     }
 }
 
+/// Wrap a `ctx.fpu_*(...)` arithmetic call (which returns `true` on an enabled
+/// FP exception) for the whole-function / straight-line lane, which has no
+/// exception-return ABI: a trap panics loudly, mirroring the
+/// `.expect("MIPS ADD integer overflow")` shape the integer arithmetic uses.
+/// The bank lane never reaches here for these ops — it short-circuits with
+/// [`emit_bank_fpu_trap`] to produce a typed `BlockExit::Fault` instead.
+fn emit_fpu_arith_call(call: &str) -> String {
+    format!("if {call} {{ fn64_recomp_rs::trap_unsupported(\"enabled COP1 exception\"); }}")
+}
+
+/// If `instr` is a COP1 arithmetic op that can raise an enabled FP exception,
+/// emit the bank-lane trap check and return `true` (short-circuiting
+/// `emit_straight`, exactly as [`emit_bank_overflow`] does for integer
+/// arithmetic). The emitted `ctx.fpu_*` call returns `true` when an enabled
+/// exception fired — the FCSR Cause field is written but the destination
+/// register and sticky Flags are not — and that turns into a typed ExcCode-15
+/// `BlockExit::Fault` carrying the exact EPC/BD.
+fn emit_bank_fpu_trap(
+    out: &mut String,
+    instr: Instruction,
+    fault_vram: u32,
+    epc: u32,
+    branch_delay: bool,
+    bank: BankId,
+    already_counted: bool,
+) -> bool {
+    use Instruction::*;
+    let call = match instr {
+        AddS { fd, fs, ft } => format!("ctx.fpu_add_s({fd}, {fs}, {ft})"),
+        SubS { fd, fs, ft } => format!("ctx.fpu_sub_s({fd}, {fs}, {ft})"),
+        MulS { fd, fs, ft } => format!("ctx.fpu_mul_s({fd}, {fs}, {ft})"),
+        DivS { fd, fs, ft } => format!("ctx.fpu_div_s({fd}, {fs}, {ft})"),
+        AbsS { fd, fs } => format!("ctx.fpu_abs_s({fd}, {fs})"),
+        NegS { fd, fs } => format!("ctx.fpu_neg_s({fd}, {fs})"),
+        SqrtS { fd, fs } => format!("ctx.fpu_sqrt_s({fd}, {fs})"),
+        AddD { fd, fs, ft } => format!("ctx.fpu_add_d({fd}, {fs}, {ft})"),
+        SubD { fd, fs, ft } => format!("ctx.fpu_sub_d({fd}, {fs}, {ft})"),
+        MulD { fd, fs, ft } => format!("ctx.fpu_mul_d({fd}, {fs}, {ft})"),
+        DivD { fd, fs, ft } => format!("ctx.fpu_div_d({fd}, {fs}, {ft})"),
+        AbsD { fd, fs } => format!("ctx.fpu_abs_d({fd}, {fs})"),
+        NegD { fd, fs } => format!("ctx.fpu_neg_d({fd}, {fs})"),
+        SqrtD { fd, fs } => format!("ctx.fpu_sqrt_d({fd}, {fs})"),
+        _ => return false,
+    };
+    let _ = writeln!(out, "            if {call} {{");
+    if !already_counted {
+        let _ = writeln!(out, "                executed += 1;");
+    }
+    let _ = writeln!(out, "                finish!(BlockExit::Fault(CpuFault {{");
+    let _ = writeln!(out, "                    at: ExecutionKey::new(BankId::new({:#018X}), GuestPc::new({fault_vram:#010X})),", bank.get());
+    let _ = writeln!(out, "                    kind: CpuFaultKind::Exception {{");
+    let _ = writeln!(
+        out,
+        "                        exception: CpuException::FloatingPoint,"
+    );
+    let _ = writeln!(
+        out,
+        "                        epc: GuestPc::new({epc:#010X}),"
+    );
+    let _ = writeln!(out, "                        branch_delay: {branch_delay},");
+    let _ = writeln!(out, "                        instruction_code: 0,");
+    let _ = writeln!(out, "                        bad_vaddr: None,");
+    let _ = writeln!(out, "                        coprocessor: None,");
+    let _ = writeln!(out, "                    }},");
+    let _ = writeln!(out, "                }}));");
+    let _ = writeln!(out, "            }}");
+    true
+}
+
 /// Emit a straight-line (non-control-transfer) instruction as typed Rust.
 fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &MemFault) {
     use Instruction::*;
@@ -2146,24 +2218,31 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         // sets the FCSR Cause/Flag bits (`crate::fpu` via the `ctx.fpu_*`
         // helpers). The raw-host `+`/`*`/`.sqrt()` path (round-to-nearest,
         // no flags) is retired.
-        AddS { fd, fs, ft } => line(out, format!("ctx.fpu_add_s({}, {}, {});", fd, fs, ft)),
-        SubS { fd, fs, ft } => line(out, format!("ctx.fpu_sub_s({}, {}, {});", fd, fs, ft)),
-        MulS { fd, fs, ft } => line(out, format!("ctx.fpu_mul_s({}, {}, {});", fd, fs, ft)),
-        DivS { fd, fs, ft } => line(out, format!("ctx.fpu_div_s({}, {}, {});", fd, fs, ft)),
-        AbsS { fd, fs } => line(out, format!("ctx.fpu_abs_s({}, {});", fd, fs)),
-        NegS { fd, fs } => line(out, format!("ctx.fpu_neg_s({}, {});", fd, fs)),
-        SqrtS { fd, fs } => line(out, format!("ctx.fpu_sqrt_s({}, {});", fd, fs)),
+        // The `fpu_*` shim helpers return `true` when an ENABLED FP exception
+        // trapped (destination left unwritten). The whole-function / straight-
+        // line lane has no exception-return ABI yet, so it panics loudly on a
+        // trap, mirroring the `.expect("MIPS ADD integer overflow")` shape the
+        // integer-arithmetic arms use. The bank lane instead short-circuits this
+        // via `emit_bank_fpu_trap`, which turns the same `true` into a typed
+        // `BlockExit::Fault(CpuException::FloatingPoint)` (ExcCode 15).
+        AddS { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_add_s({fd}, {fs}, {ft})"))),
+        SubS { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_sub_s({fd}, {fs}, {ft})"))),
+        MulS { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_mul_s({fd}, {fs}, {ft})"))),
+        DivS { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_div_s({fd}, {fs}, {ft})"))),
+        AbsS { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_abs_s({fd}, {fs})"))),
+        NegS { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_neg_s({fd}, {fs})"))),
+        SqrtS { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_sqrt_s({fd}, {fs})"))),
         // MOV.S is a bit-exact copy (not an arithmetic op): move the raw word.
         MovS { fd, fs } => line(out, format!("ctx.set_f_bits({}, ctx.f_bits({}));", fd, fs)),
 
         // --- Double-precision arithmetic (routed through the shim). ---
-        AddD { fd, fs, ft } => line(out, format!("ctx.fpu_add_d({}, {}, {});", fd, fs, ft)),
-        SubD { fd, fs, ft } => line(out, format!("ctx.fpu_sub_d({}, {}, {});", fd, fs, ft)),
-        MulD { fd, fs, ft } => line(out, format!("ctx.fpu_mul_d({}, {}, {});", fd, fs, ft)),
-        DivD { fd, fs, ft } => line(out, format!("ctx.fpu_div_d({}, {}, {});", fd, fs, ft)),
-        AbsD { fd, fs } => line(out, format!("ctx.fpu_abs_d({}, {});", fd, fs)),
-        NegD { fd, fs } => line(out, format!("ctx.fpu_neg_d({}, {});", fd, fs)),
-        SqrtD { fd, fs } => line(out, format!("ctx.fpu_sqrt_d({}, {});", fd, fs)),
+        AddD { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_add_d({fd}, {fs}, {ft})"))),
+        SubD { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_sub_d({fd}, {fs}, {ft})"))),
+        MulD { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_mul_d({fd}, {fs}, {ft})"))),
+        DivD { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_div_d({fd}, {fs}, {ft})"))),
+        AbsD { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_abs_d({fd}, {fs})"))),
+        NegD { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_neg_d({fd}, {fs})"))),
+        SqrtD { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_sqrt_d({fd}, {fs})"))),
         MovD { fd, fs } => line(out, format!("ctx.set_d_bits({}, ctx.d_bits({}));", fd, fs)),
 
         // --- Conversions. Float->float use lossless/rounding `as` casts; the

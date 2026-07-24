@@ -259,9 +259,13 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
                 // 0x80100008: Lwc1 { ft: 6, base: 5, off: 0 }
                 ctx.set_f_bits(6, mem.load_w(Rdram::eff_addr(ctx.r(5), 0)) as u32);
                 // 0x8010000C: MulS { fd: 8, fs: 4, ft: 6 }
-                ctx.fpu_mul_s(8, 4, 6);
+                if ctx.fpu_mul_s(8, 4, 6) {
+                    fn64_recomp_rs::trap_unsupported("enabled COP1 exception");
+                }
                 // 0x80100010: AddS { fd: 0, fs: 8, ft: 4 }
-                ctx.fpu_add_s(0, 8, 4);
+                if ctx.fpu_add_s(0, 8, 4) {
+                    fn64_recomp_rs::trap_unsupported("enabled COP1 exception");
+                }
                 // 0x80100014: CLtS { fs: 0, ft: 6 }
                 ctx.fpu_compare_s(0, 6, 12);
                 // 0x80100018: Bc1t { off: 2 }
@@ -850,18 +854,23 @@ fn arithmetic_arms_emit_shim_calls() {
             words: &[word, 0x03E00008, 0],
         })
     };
-    // add.s $f0,$f2,$f4 / div.s / sqrt.s / mul.d must all call ctx.fpu_*.
-    assert!(emit1(0x46041000).contains("ctx.fpu_add_s(0, 2, 4);")); // ADD.S
-    assert!(emit1(0x46041001).contains("ctx.fpu_sub_s(0, 2, 4);")); // SUB.S
-    assert!(emit1(0x46062202).contains("ctx.fpu_mul_s(8, 4, 6);")); // MUL.S
-    assert!(emit1(0x46041003).contains("ctx.fpu_div_s(0, 2, 4);")); // DIV.S
-    assert!(emit1(0x46006004).contains("ctx.fpu_sqrt_s(0, 12);")); // SQRT.S
-    assert!(emit1(0x46001005).contains("ctx.fpu_abs_s(0, 2);")); // ABS.S
-    assert!(emit1(0x46001007).contains("ctx.fpu_neg_s(0, 2);")); // NEG.S
-    assert!(emit1(0x46241000).contains("ctx.fpu_add_d(0, 2, 4);")); // ADD.D
-    assert!(emit1(0x46241002).contains("ctx.fpu_mul_d(0, 2, 4);")); // MUL.D
-    assert!(emit1(0x46201004).contains("ctx.fpu_sqrt_d(0, 2);")); // SQRT.D
-                                                                  // MOV.S/MOV.D are bit copies, not arithmetic: still a raw bit move.
+    // add.s $f0,$f2,$f4 / div.s / sqrt.s / mul.d must all call ctx.fpu_*. In the
+    // whole-function lane each call is wrapped `if ctx.fpu_*(..) { trap }` so an
+    // enabled FP exception panics loudly (the bank lane turns that same `true`
+    // into a typed ExcCode-15 fault); the call substring must still be present.
+    assert!(emit1(0x46041000).contains("ctx.fpu_add_s(0, 2, 4)")); // ADD.S
+    assert!(emit1(0x46041001).contains("ctx.fpu_sub_s(0, 2, 4)")); // SUB.S
+    assert!(emit1(0x46062202).contains("ctx.fpu_mul_s(8, 4, 6)")); // MUL.S
+    assert!(emit1(0x46041003).contains("ctx.fpu_div_s(0, 2, 4)")); // DIV.S
+    assert!(emit1(0x46006004).contains("ctx.fpu_sqrt_s(0, 12)")); // SQRT.S
+    assert!(emit1(0x46001005).contains("ctx.fpu_abs_s(0, 2)")); // ABS.S
+    assert!(emit1(0x46001007).contains("ctx.fpu_neg_s(0, 2)")); // NEG.S
+    assert!(emit1(0x46241000).contains("ctx.fpu_add_d(0, 2, 4)")); // ADD.D
+    assert!(emit1(0x46241002).contains("ctx.fpu_mul_d(0, 2, 4)")); // MUL.D
+    assert!(emit1(0x46201004).contains("ctx.fpu_sqrt_d(0, 2)")); // SQRT.D
+                                                                 // The arithmetic call is wrapped so an enabled exception traps.
+    assert!(emit1(0x46041000).contains("if ctx.fpu_add_s(0, 2, 4) {")); // ADD.S trap-wrap
+                                                                        // MOV.S/MOV.D are bit copies, not arithmetic: still a raw bit move.
     assert!(emit1(0x46001006).contains("ctx.set_f_bits(0, ctx.f_bits(2));")); // MOV.S
                                                                               // No raw host float arithmetic operators leak into the emitted arithmetic.
     let divs = emit1(0x46041003);
@@ -878,9 +887,11 @@ fn arithmetic_arms_emit_shim_calls() {
 /// nearest and ignored the mode).
 #[test]
 fn emitted_div_block_honors_fcsr_rm_and_matches_shim() {
-    // Pasted emitter body for `div.s $f0, $f2, $f4; jr $ra`.
+    // Pasted emitter body for `div.s $f0, $f2, $f4; jr $ra`. Exceptions are
+    // disabled here (RM-only FCSR), so the shim never traps; the returned trap
+    // flag is `false` and discarded.
     fn div_block(ctx: &mut RecompContext, _mem: &mut Rdram) {
-        ctx.fpu_div_s(0, 2, 4);
+        let _ = ctx.fpu_div_s(0, 2, 4);
     }
     let a = 1.0f32;
     let b = 3.0f32; // 1/3 is inexact — the mode is observable in the last bit.
@@ -937,8 +948,8 @@ fn emitted_arith_sets_fcsr_cause_flags() {
     let mut ctx = RecompContext::new();
     ctx.set_f_s(2, 1.0);
     ctx.set_f_s(4, 0.0);
-    // Pasted `div.s $f0,$f2,$f4`.
-    ctx.fpu_div_s(0, 2, 4);
+    // Pasted `div.s $f0,$f2,$f4`. Exceptions disabled: no trap, result committed.
+    assert!(!ctx.fpu_div_s(0, 2, 4));
     let fcsr = ctx.read_fcr(31);
     assert_ne!(fcsr & (1 << 15), 0, "Cause.DivByZero (Z)");
     assert_ne!(fcsr & (1 << 5), 0, "Flag.DivByZero (Z)");
@@ -950,7 +961,7 @@ fn emitted_arith_sets_fcsr_cause_flags() {
     let mut ctx = RecompContext::new();
     ctx.set_f_s(2, -1.0);
     // Pasted `sqrt.s $f0,$f2`.
-    ctx.fpu_sqrt_s(0, 2);
+    assert!(!ctx.fpu_sqrt_s(0, 2));
     let fcsr = ctx.read_fcr(31);
     assert_ne!(fcsr & (1 << 16), 0, "Cause.Invalid (V)");
     assert_ne!(fcsr & (1 << 6), 0, "Flag.Invalid (V)");
@@ -959,8 +970,207 @@ fn emitted_arith_sets_fcsr_cause_flags() {
     let mut ctx = RecompContext::new();
     ctx.set_f_s(2, f32::MAX);
     ctx.set_f_s(4, f32::MAX);
-    ctx.fpu_mul_s(0, 2, 4);
+    assert!(!ctx.fpu_mul_s(0, 2, 4));
     let fcsr = ctx.read_fcr(31);
     assert_ne!(fcsr & (1 << 14), 0, "Cause.Overflow (O)");
     assert_ne!(fcsr & (1 << 4), 0, "Flag.Overflow (O)");
+}
+
+// ============================================================================
+// Enabled FP exception (ExcCode 15) — sub-step 2 of the FPU environment.
+//
+// When an arithmetic op raises an IEEE condition whose FCSR Enable bit is set,
+// the VR4300 (User's Manual section 6.6) traps BEFORE writing the destination:
+// the FCSR Cause field records the condition, the destination register and the
+// sticky Flags field are left untouched, and the pipeline vectors to the
+// ExcCode-15 general exception. The `ctx.fpu_*` shim helpers signal this by
+// returning `true`; the emitted block lane turns that into a typed
+// `BlockExit::Fault(CpuException::FloatingPoint)` (see the bank-runner gate).
+//
+// FCSR bit layout used below: Enable.V = bit 11 (index 4, 7+4), Cause.V =
+// bit 16 (12+4), Flag.V = bit 6 (2+4). Inexact index 0: Enable bit 7, Cause
+// bit 12, Flag bit 2.
+// ============================================================================
+
+/// An enabled Invalid (V) exception on `sqrt(-1)` traps: `fpu_sqrt_s` returns
+/// `true`, the FCSR Cause.V bit is set, the destination register is NOT written,
+/// and the sticky Flag.V bit is NOT set (only Cause records a trapped exception).
+#[test]
+fn enabled_invalid_traps_without_committing_result_or_flag() {
+    let mut ctx = RecompContext::new();
+    // Enable.V (bit 11); leave a recognizable sentinel in the destination $f0.
+    ctx.write_fcr(31, 1 << 11);
+    ctx.set_f_bits(0, 0xDEAD_BEEF);
+    ctx.set_f_s(2, -1.0);
+
+    // sqrt(-1) signals Invalid, which is enabled -> trap.
+    let trapped = ctx.fpu_sqrt_s(0, 2);
+    assert!(trapped, "enabled Invalid must trap");
+
+    let fcsr = ctx.read_fcr(31);
+    assert_ne!(fcsr & (1 << 16), 0, "Cause.Invalid (V) set on a trapped op");
+    assert_eq!(
+        fcsr & (1 << 6),
+        0,
+        "sticky Flag.Invalid must NOT be set on a trapped op"
+    );
+    assert_eq!(
+        ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "destination register must be untouched when the op traps"
+    );
+    // The Enable bits are unchanged by the op.
+    assert_ne!(fcsr & (1 << 11), 0, "Enable.V preserved");
+}
+
+/// The disabled path is the sub-step-1 behavior: no trap, the result is
+/// committed, and both Cause AND the sticky Flag bit are set. This is the
+/// regression guard that enabling the trap path did not change the common case.
+#[test]
+fn disabled_invalid_commits_result_and_sets_sticky_flag() {
+    let mut ctx = RecompContext::new();
+    // Enables all clear (default FCSR).
+    ctx.set_f_bits(0, 0xDEAD_BEEF);
+    ctx.set_f_s(2, -1.0);
+
+    let trapped = ctx.fpu_sqrt_s(0, 2);
+    assert!(!trapped, "disabled Invalid must not trap");
+
+    let fcsr = ctx.read_fcr(31);
+    assert_ne!(fcsr & (1 << 16), 0, "Cause.Invalid (V) set");
+    assert_ne!(
+        fcsr & (1 << 6),
+        0,
+        "sticky Flag.Invalid set on the non-trapped path"
+    );
+    assert_ne!(
+        ctx.f_bits(0),
+        0xDEAD_BEEF,
+        "destination must be written with the canonical-NaN result"
+    );
+    // sqrt(-1) yields the MIPS canonical NaN 0x7FBF_FFFF.
+    assert_eq!(ctx.f_bits(0), 0x7FBF_FFFF, "canonical qNaN written");
+}
+
+/// The Cause-vs-Flags distinction, side by side: enabling the matching bit
+/// flips a divide-by-zero from "sticky Flag set, result committed" to
+/// "Cause only, no Flag, no result". Uses DIV.S 1/0 -> Z (index 3): Enable
+/// bit 10, Cause bit 15, Flag bit 5.
+#[test]
+fn enabled_vs_disabled_divbyzero_flag_and_commit_differ() {
+    // Disabled: Flag.Z set, result committed (+inf), no trap.
+    let mut disabled = RecompContext::new();
+    disabled.set_f_s(2, 1.0);
+    disabled.set_f_s(4, 0.0);
+    disabled.set_f_bits(0, 0x1111_1111);
+    assert!(!disabled.fpu_div_s(0, 2, 4));
+    let d = disabled.read_fcr(31);
+    assert_ne!(d & (1 << 15), 0, "Cause.Z set (disabled)");
+    assert_ne!(d & (1 << 5), 0, "Flag.Z set (disabled)");
+    assert_eq!(
+        disabled.f_bits(0),
+        f32::INFINITY.to_bits(),
+        "1/0 result committed when disabled"
+    );
+
+    // Enabled: Cause.Z set, Flag.Z NOT set, result NOT committed, trap fires.
+    let mut enabled = RecompContext::new();
+    enabled.write_fcr(31, 1 << 10); // Enable.Z (index 3)
+    enabled.set_f_s(2, 1.0);
+    enabled.set_f_s(4, 0.0);
+    enabled.set_f_bits(0, 0x1111_1111);
+    assert!(enabled.fpu_div_s(0, 2, 4), "enabled Z must trap");
+    let e = enabled.read_fcr(31);
+    assert_ne!(e & (1 << 15), 0, "Cause.Z set (enabled+trapped)");
+    assert_eq!(e & (1 << 5), 0, "Flag.Z NOT set on a trapped op");
+    assert_eq!(
+        enabled.f_bits(0),
+        0x1111_1111,
+        "destination untouched on a trapped op"
+    );
+}
+
+/// A raised condition whose Enable bit is clear does not trap even when a
+/// DIFFERENT Enable bit is set. Overflow (index 2) is enabled but the op only
+/// signals Inexact (index 0): no trap, result committed, sticky Inexact flag
+/// set. Guards against enabling the trap on the wrong condition.
+#[test]
+fn unrelated_enable_bit_does_not_trap() {
+    let mut ctx = RecompContext::new();
+    // Enable.O (bit 9, index 2) only. 1/3 is Inexact (index 0), not Overflow.
+    ctx.write_fcr(31, 1 << 9);
+    ctx.set_f_s(2, 1.0);
+    ctx.set_f_s(4, 3.0);
+    let trapped = ctx.fpu_div_s(0, 2, 4);
+    assert!(
+        !trapped,
+        "Inexact must not trap when only Overflow is enabled"
+    );
+    let fcsr = ctx.read_fcr(31);
+    assert_ne!(fcsr & (1 << 12), 0, "Cause.Inexact set");
+    assert_ne!(fcsr & (1 << 2), 0, "Flag.Inexact set (committed path)");
+    assert_eq!(fcsr & (1 << 14), 0, "Cause.Overflow not set");
+}
+
+/// The FloatingPoint exception maps to ExcCode 15 with no Cause.CE (it is a
+/// general exception, unlike CoprocessorUnusable's ExcCode 11). Drives
+/// `enter_exception` directly so the CP0 side effects are asserted precisely:
+/// EPC, Cause.ExcCode, Cause.BD, Status.EXL, and the BEV=0 general vector.
+#[test]
+fn floating_point_exception_vectors_to_exccode_15() {
+    use fn64_recomp_rs::{BankId, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GuestPc};
+
+    let fault = CpuFault {
+        at: ExecutionKey::new(BankId::new(0x1), GuestPc::new(0x8000_2000)),
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::FloatingPoint,
+            epc: GuestPc::new(0x8000_2000),
+            branch_delay: false,
+            instruction_code: 0,
+            bad_vaddr: None,
+            coprocessor: None,
+        },
+    };
+    assert_eq!(CpuException::FloatingPoint.cause_code(), 15);
+
+    let mut ctx = RecompContext::new();
+    let vector = fault.enter_exception(&mut ctx);
+    assert_eq!(
+        vector,
+        Some(GuestPc::new(0x8000_0180)),
+        "general vector, BEV=0"
+    );
+    assert_eq!(ctx.cop0_epc, 0x8000_2000, "EPC = faulting instruction");
+    assert_eq!((ctx.cop0_cause >> 2) & 0x1F, 15, "Cause.ExcCode = 15");
+    assert_eq!(
+        ctx.cop0_cause & (1 << 31),
+        0,
+        "Cause.BD clear (not a delay slot)"
+    );
+    assert_eq!((ctx.cop0_cause >> 28) & 0b11, 0, "Cause.CE not set for FPE");
+    assert_ne!(ctx.cop0_status & (1 << 1), 0, "Status.EXL set");
+
+    // A delay-slot fault sets Cause.BD and points EPC at the branch.
+    let mut delay_ctx = RecompContext::new();
+    let delay_fault = CpuFault {
+        at: ExecutionKey::new(BankId::new(0x1), GuestPc::new(0x8000_2008)),
+        kind: CpuFaultKind::Exception {
+            exception: CpuException::FloatingPoint,
+            epc: GuestPc::new(0x8000_2004),
+            branch_delay: true,
+            instruction_code: 0,
+            bad_vaddr: None,
+            coprocessor: None,
+        },
+    };
+    delay_fault.enter_exception(&mut delay_ctx);
+    assert_eq!(
+        delay_ctx.cop0_epc, 0x8000_2004,
+        "EPC = the branch, not the slot"
+    );
+    assert_ne!(
+        delay_ctx.cop0_cause & (1 << 31),
+        0,
+        "Cause.BD set in a delay slot"
+    );
 }
