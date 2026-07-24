@@ -187,6 +187,13 @@ pub enum CpuException {
     Breakpoint,
     Trap,
     IntegerOverflow,
+    /// An enabled COP1 (FPU) IEEE exception. The VR4300 raises ExcCode 15 (FPE)
+    /// through the general exception vector when an arithmetic/conversion op sets
+    /// an FCSR Cause bit whose matching Enable bit is set. Unlike
+    /// [`Self::CoprocessorUnusable`] (ExcCode 11) it does NOT set Cause.CE — FPE
+    /// is a normal general exception, and the handler reads FCSR.Cause to learn
+    /// which IEEE condition trapped.
+    FloatingPoint,
 }
 
 /// One of the VR4300 Cause.IP / Status.IM interrupt lines.
@@ -343,6 +350,7 @@ impl CpuException {
             Self::CoprocessorUnusable => 11,
             Self::IntegerOverflow => 12,
             Self::Trap => 13,
+            Self::FloatingPoint => 15,
         }
     }
 

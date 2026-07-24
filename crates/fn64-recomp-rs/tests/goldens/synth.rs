@@ -13,9 +13,9 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x80100008: Lwc1 { ft: 6, base: 5, off: 0 }
             ctx.set_f_bits(6, mem.load_w(Rdram::eff_addr(ctx.r(5), 0)) as u32);
             // 0x8010000C: MulS { fd: 8, fs: 4, ft: 6 }
-            ctx.fpu_mul_s(8, 4, 6);
+            if ctx.fpu_mul_s(8, 4, 6) { fn64_recomp_rs::trap_unsupported("enabled COP1 exception"); }
             // 0x80100010: AddS { fd: 0, fs: 8, ft: 4 }
-            ctx.fpu_add_s(0, 8, 4);
+            if ctx.fpu_add_s(0, 8, 4) { fn64_recomp_rs::trap_unsupported("enabled COP1 exception"); }
             // 0x80100014: CLtS { fs: 0, ft: 6 }
             ctx.fpu_compare_s(0, 6, 12);
             // 0x80100018: Bc1t { off: 2 }
