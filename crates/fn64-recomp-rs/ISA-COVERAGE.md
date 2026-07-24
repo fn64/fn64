@@ -226,8 +226,10 @@ Visibility inside an indivisible emitted block remains checkpoint-granular.
 
 | fmt | operation family | decode | runtime |
 |---:|---|:---:|:---:|
-| 00/01/02 | MFC1 / DMFC1 / CFC1 | yes | C |
-| 04/05/06 | MTC1 / DMTC1 / CTC1 | yes | C |
+| 00/01 | MFC1 / DMFC1 | yes | C (AOT + interpreter) |
+| 02 | CFC1 FCR0/FCR31 | yes | C (AOT + interpreter) |
+| 04/05 | MTC1 / DMTC1 | yes | C (AOT + interpreter) |
+| 06 | CTC1 FCR31 | yes | C (AOT + interpreter) |
 | 08 | BC1F/T/FL/TL | yes | C |
 | 10 | S format | all MIPS III functs | P |
 | 11 | D format | all MIPS III functs | P |
@@ -265,12 +267,29 @@ Enabled IEEE conditions and Unimplemented Operation return typed
 FloatingPoint/ExcCode 15 before destination commit in both arbitrary-PC lanes.
 MOVF/MOVT and MOVZ/MOVN copy raw S/D bits only when their condition is true.
 
-COP1 remains **partial**. Float-to-float and fixed-to-float conversions still
-use host conversions and therefore do not implement every FCSR.RM,
-exception, and NaN/denormal boundary. Float-to-fixed conversion and compare
-retain their existing bounded behavior; neither those slices nor the
-soft-float arithmetic establish cycle timing or complete VR4300 silicon
-parity.
+CFC1 reads are admitted only for FCR0 and FCR31, and CTC1 writes only FCR31.
+CTC1 first commits the masked FCSR fields, then returns typed
+FloatingPoint/ExcCode 15 when Cause.E is set or an IEEE Cause intersects its
+Enable. Reserved FCR accesses remain named loud traps. The typed ABI owns one
+FCSR per emulated thread; initialization installs the libultra initial value,
+while the reset thread starts from zero.
+
+All sixteen S/D comparison predicates classify raw legacy NaNs and implement
+their quiet/signaling Invalid rules. S/D-to-W/L conversions implement every
+fixed and FCSR-selected rounding form, integer-indefinite Invalid results, and
+typed E/V/I destination suppression. W/L-to-S/D uses an integer-only encoder
+for all four rounding modes, including signed-56 Cause.E admission and enabled
+Inexact suppression. CVT.D.S/CVT.S.D also use raw-bit integer conversion for
+all rounding modes, legacy NaN and denormal precedence, atomic O+I/U+I, FS
+flush rules, and after-rounding tininess. These paths share the same precise
+straight/delay-slot exception boundary in AOT and interpreter execution and
+retain the physical FR=0/FR=1 register view.
+
+COP1 remains **partial as a silicon model**. The implemented arithmetic,
+comparison, conversion, transfer, and FCSR semantics do not establish exact
+instruction latency, pipeline timing, or every undocumented VR4300 NaN payload
+and exception-priority quirk. Those claims require hardware differential
+evidence rather than further host-language replacement.
 
 The arbitrary-PC lanes classify every COP1 move, memory, arithmetic, compare,
 conversion, and branch instruction in the decoder and check Status.CU1 before
@@ -293,7 +312,9 @@ therefore become compile-time errors, never silent no-ops.
 - `tests/isa_completeness.rs`: missing-slot decoder words; all rounding and
   compare functs; all byte offsets for LWL/LWR/SWL/SWR and LDL/LDR/SDL/SDR;
   LL/SC reservation behavior; DIV boundaries; FCSR modes/flags/predicates;
-  FR=0; branch-likely nullification; JALR ordering.
+  exact conversion precision, directed rounding, enabled-exception
+  suppression, NaN/denormal, signed-56, FR=0/FR=1 odd-register, branch-likely
+  nullification, and JALR ordering.
 - OoT `func_80B3C964`: its LWL/LWR/SWL/SWR register/offset shape is constructed
   from public I-format fields and decoder-checked; the same pair semantics are
   exhaustively byte-checked. No game ROM bytes or generated-game output are
@@ -341,7 +362,8 @@ Bottom line: encoding coverage is complete for the documented MIPS III CPU
 table, with COP2 decoded as architecturally unusable. Execution is complete
 for the ordinary integer, control-flow, aligned/unaligned memory, shift, and
 HI/LO paths OoT can execute. It is not a complete VR4300 CPU model until the
-remaining P items—especially full FPU environment behavior, 64-bit instruction
-PC/catalog identity, translated physical device routing, COP0/COP2 exception behavior, and the
-whole-function lane's exception boundary—are implemented or deliberately moved
-behind a documented host ABI boundary.
+remaining P items—especially silicon-certified FPU timing and edge behavior,
+64-bit instruction PC/catalog identity, translated physical device routing,
+COP0/COP2 exception behavior, and the whole-function lane's exception
+boundary—are implemented or deliberately moved behind a documented host ABI
+boundary.

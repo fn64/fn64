@@ -187,6 +187,126 @@ impl DataAccessError {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FixedFloatFormat {
+    Single,
+    Double,
+}
+
+impl FixedFloatFormat {
+    const fn fraction_bits(self) -> u32 {
+        match self {
+            Self::Single => 23,
+            Self::Double => 52,
+        }
+    }
+
+    const fn exponent_bias(self) -> u32 {
+        match self {
+            Self::Single => 127,
+            Self::Double => 1023,
+        }
+    }
+}
+
+/// Encode one signed fixed-point integer as IEEE S or D without entering the
+/// host floating-point environment. The returned boolean reports discarded
+/// nonzero source bits, independently of whether rounding changes the retained
+/// significand.
+fn encode_fixed_float(value: i64, format: FixedFloatFormat, mode: u8) -> (u64, bool) {
+    assert!(mode < 4, "FCSR.RM exceeds two bits");
+    if value == 0 {
+        return (0, false);
+    }
+
+    let negative = value < 0;
+    let magnitude = value.unsigned_abs();
+    let fraction_bits = format.fraction_bits();
+    let mut exponent = 63 - magnitude.leading_zeros();
+    let (mut significand, remainder, shift) = if exponent > fraction_bits {
+        let shift = exponent - fraction_bits;
+        (magnitude >> shift, magnitude & ((1u64 << shift) - 1), shift)
+    } else {
+        (magnitude << (fraction_bits - exponent), 0, 0)
+    };
+    let inexact = remainder != 0;
+    let increment = if !inexact {
+        false
+    } else {
+        match mode {
+            0 => {
+                let half = 1u64 << (shift - 1);
+                remainder > half || (remainder == half && significand & 1 != 0)
+            }
+            1 => false,
+            2 => !negative,
+            3 => negative,
+            _ => unreachable!("rounding mode was range-checked"),
+        }
+    };
+    if increment {
+        significand += 1;
+        if significand == 1u64 << (fraction_bits + 1) {
+            significand >>= 1;
+            exponent += 1;
+        }
+    }
+
+    let sign = u64::from(negative)
+        << (fraction_bits
+            + match format {
+                FixedFloatFormat::Single => 8,
+                FixedFloatFormat::Double => 11,
+            });
+    let exponent = u64::from(exponent + format.exponent_bias()) << fraction_bits;
+    let fraction = significand & ((1u64 << fraction_bits) - 1);
+    (sign | exponent | fraction, inexact)
+}
+
+const FPU_CAUSE_I: u8 = 1 << 0;
+const FPU_CAUSE_U: u8 = 1 << 1;
+const FPU_CAUSE_O: u8 = 1 << 2;
+
+/// Round an unsigned significand after a right shift without consulting the
+/// host floating-point environment. `mode` is FCSR.RM and `negative` selects
+/// the direction for RP/RM.
+fn round_shift_right(value: u64, shift: u32, mode: u8, negative: bool) -> (u64, bool) {
+    assert!(mode < 4, "FCSR.RM exceeds two bits");
+    if shift == 0 {
+        return (value, false);
+    }
+    let (retained, remainder, half) = if shift < 64 {
+        (
+            value >> shift,
+            value & ((1u64 << shift) - 1),
+            Some(1u64 << (shift - 1)),
+        )
+    } else {
+        (0, value, (shift == 64).then_some(1u64 << 63))
+    };
+    let inexact = remainder != 0;
+    let increment = inexact
+        && match mode {
+            0 => half
+                .is_some_and(|half| remainder > half || (remainder == half && retained & 1 != 0)),
+            1 => false,
+            2 => !negative,
+            3 => negative,
+            _ => unreachable!("rounding mode was range-checked"),
+        };
+    (retained + u64::from(increment), inexact)
+}
+
+fn overflowed_single(mode: u8, negative: bool, max: u32, infinity: u32) -> u32 {
+    match (mode, negative) {
+        (0, _) => infinity,
+        (1, _) => max,
+        (2, false) | (3, true) => infinity,
+        (2, true) | (3, false) => max,
+        _ => unreachable!("FCSR.RM exceeds two bits"),
+    }
+}
+
 const COP0_STATUS_FR: u32 = 1 << 26;
 
 /// View-independent contents of the 32 physical COP1 FGRs.
@@ -261,6 +381,30 @@ impl FprFile {
         self.fgr = state.into_words();
     }
 }
+/// A precise COP1 operation requested guest floating-point exception entry.
+/// The operation has already updated FCSR.Cause, but has not committed its
+/// architectural destination or an enabled exception's sticky Flag bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpuException;
+
+/// One FCSR Cause/Enable/Flag lane. This is deliberately an enum rather than
+/// a bit mask: [`RecompContext::record_fpu_exception`] is valid only for an
+/// operation that raises one cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SingleFpuCause {
+    Inexact,
+    Invalid,
+}
+
+impl SingleFpuCause {
+    const fn index(self) -> u8 {
+        match self {
+            Self::Inexact => 0,
+            Self::Invalid => 4,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RecompContext {
     /// r[0] is `$zero`; kept in the array for uniform indexing but never
@@ -466,7 +610,8 @@ impl RecompContext {
     }
 
     /// Read FCR0/FCR31. The VR4300 implements only those two control
-    /// registers (User's Manual section 6.3.2); reserved FCRs read as zero.
+    /// registers (User's Manual section 6.3.2); reserved FCR reads remain a
+    /// loud, unverified host boundary.
     #[inline]
     pub fn read_fcr(&self, idx: u8) -> u32 {
         match idx {
@@ -477,8 +622,9 @@ impl RecompContext {
         }
     }
 
-    /// Write FCR31. Writes to FCR0/reserved FCRs have no architectural
-    /// effect. Reserved bits are discarded rather than becoming hidden state.
+    /// Write FCR31. Writes to read-only FCR0 or reserved FCRs remain a loud,
+    /// unverified host boundary. Reserved FCR31 bits are discarded rather than
+    /// becoming hidden state.
     #[inline]
     pub fn write_fcr(&mut self, idx: u8, value: u32) {
         if idx != 31 {
@@ -489,6 +635,18 @@ impl RecompContext {
         const WRITABLE: u32 = (1 << 24) | (1 << 23) | 0x0003_FFFF;
         self.fpu_cond = value & (1 << 23) != 0;
         self.fcsr = value & WRITABLE & !(1 << 23);
+    }
+
+    /// Whether the current FCSR value demands a precise floating-point
+    /// exception. VR4300 User's Manual section 6.3.2.2 specifies that Cause.E is
+    /// always enabled and each IEEE Cause bit traps when its matching Enable
+    /// bit is set. CTC1 writes FCSR before this condition is observed.
+    #[inline]
+    pub fn fcsr_exception_pending(&self) -> bool {
+        const CAUSE_E: u32 = 1 << 17;
+        let ieee_causes = (self.fcsr >> 12) & 0x1f;
+        let enables = (self.fcsr >> 7) & 0x1f;
+        self.fcsr & CAUSE_E != 0 || ieee_causes & enables != 0
     }
 
     /// Establish the single architectural LLbit reservation.
@@ -1095,44 +1253,374 @@ impl RecompContext {
         self.hi = dividend % divisor;
     }
 
-    /// Convert a floating value to an integer using FCSR.RM (or a fixed mode
-    /// for ROUND/TRUNC/CEIL/FLOOR). Cause bits are per-operation and Flag bits
-    /// accumulate as specified by VR4300 User's Manual section 6.3.2.2.
-    pub fn fpu_to_i32(&mut self, value: f64, fixed_mode: Option<u8>) -> i32 {
-        let rounded = self.round_for_mode(value, fixed_mode);
-        if !rounded.is_finite() || !(-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
-            self.raise_fpu(4);
-            i32::MIN
-        } else {
-            if rounded != value {
-                self.raise_fpu(0);
-            }
-            rounded as i32
-        }
-    }
+    fn try_fixed_to_float_raw(
+        &mut self,
+        value: i64,
+        format: FixedFloatFormat,
+        signed_56_source: bool,
+    ) -> Result<u64, FpuException> {
+        const SIGNED_56_MIN: i64 = -(1i64 << 55);
+        const SIGNED_56_MAX: i64 = (1i64 << 55) - 1;
 
-    /// 64-bit counterpart of [`RecompContext::fpu_to_i32`].
-    pub fn fpu_to_i64(&mut self, value: f64, fixed_mode: Option<u8>) -> i64 {
-        let rounded = self.round_for_mode(value, fixed_mode);
-        // i64::MAX is not exactly representable as f64; 2^63 itself is the
-        // exclusive upper bound, while -2^63 is representable and valid.
-        if !rounded.is_finite()
-            || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded)
-        {
-            self.raise_fpu(4);
-            i64::MIN
-        } else {
-            if rounded != value {
-                self.raise_fpu(0);
-            }
-            rounded as i64
-        }
-    }
-
-    #[inline]
-    fn round_for_mode(&mut self, value: f64, fixed_mode: Option<u8>) -> f64 {
-        // Cause is rewritten by every arithmetic/conversion operation.
         self.fcsr &= !(0x3F << 12);
+        if signed_56_source && !(SIGNED_56_MIN..=SIGNED_56_MAX).contains(&value) {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        let (bits, inexact) = encode_fixed_float(value, format, (self.fcsr & 3) as u8);
+        if inexact {
+            self.record_fpu_exception(SingleFpuCause::Inexact)?;
+        }
+        Ok(bits)
+    }
+
+    /// Exact typed CVT.S.W result. The source is the low word of `fs`; `fd`
+    /// remains unmodified until the caller commits this immutable bit result.
+    pub fn try_cvt_s_w_bits(&mut self, fs: u8) -> Result<u32, FpuException> {
+        self.try_fixed_to_float_raw(
+            i64::from(self.f_bits(fs) as i32),
+            FixedFloatFormat::Single,
+            false,
+        )
+        .map(|bits| bits as u32)
+    }
+
+    /// Exact typed CVT.D.W result.
+    pub fn try_cvt_d_w_bits(&mut self, fs: u8) -> Result<u64, FpuException> {
+        self.try_fixed_to_float_raw(
+            i64::from(self.f_bits(fs) as i32),
+            FixedFloatFormat::Double,
+            false,
+        )
+    }
+
+    /// Exact typed CVT.S.L result. VR4300's L-format conversion accepts only
+    /// values representable as a signed 56-bit integer; other sources raise
+    /// the always-enabled Unimplemented Operation cause.
+    pub fn try_cvt_s_l_bits(&mut self, fs: u8) -> Result<u32, FpuException> {
+        self.try_fixed_to_float_raw(self.d_bits(fs) as i64, FixedFloatFormat::Single, true)
+            .map(|bits| bits as u32)
+    }
+
+    /// Exact typed CVT.D.L result with the same signed-56 admission rule.
+    pub fn try_cvt_d_l_bits(&mut self, fs: u8) -> Result<u64, FpuException> {
+        self.try_fixed_to_float_raw(self.d_bits(fs) as i64, FixedFloatFormat::Double, true)
+    }
+
+    fn whole_function_fixed_to_float<T>(result: Result<T, FpuException>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => {
+                trap_unsupported("enabled COP1 fixed-to-float exception in whole-function lane")
+            }
+        }
+    }
+
+    pub fn cvt_s_w_bits(&mut self, fs: u8) -> u32 {
+        let result = self.try_cvt_s_w_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    pub fn cvt_d_w_bits(&mut self, fs: u8) -> u64 {
+        let result = self.try_cvt_d_w_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    pub fn cvt_s_l_bits(&mut self, fs: u8) -> u32 {
+        let result = self.try_cvt_s_l_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    pub fn cvt_d_l_bits(&mut self, fs: u8) -> u64 {
+        let result = self.try_cvt_d_l_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    fn fpu_unimplemented(&mut self) -> FpuException {
+        self.fcsr &= !(0x3F << 12);
+        self.fcsr |= 1 << 17;
+        FpuException
+    }
+
+    /// Exact CVT.D.S result. VR4300 treats a denormal or legacy QNaN operand
+    /// as Unimplemented; an SNaN raises Invalid and otherwise produces the
+    /// MIPS-IV canonical double QNaN. Every finite normal single widens
+    /// exactly, so FCSR.RM is immaterial.
+    pub fn try_cvt_d_s_bits(&mut self, fs: u8) -> Result<u64, FpuException> {
+        const D_QNAN: u64 = 0x7FF7_FFFF_FFFF_FFFF;
+        let bits = self.f_bits(fs);
+        let sign = u64::from(bits >> 31) << 63;
+        let exponent = (bits >> 23) & 0xFF;
+        let fraction = bits & 0x007F_FFFF;
+        self.fcsr &= !(0x3F << 12);
+
+        if exponent == 0 {
+            return if fraction == 0 {
+                Ok(sign)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+        if exponent == 0xFF {
+            return if fraction == 0 {
+                Ok(sign | 0x7FF0_0000_0000_0000)
+            } else if is_snan32(bits) {
+                self.record_fpu_exception(SingleFpuCause::Invalid)?;
+                Ok(D_QNAN)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+
+        let double_exponent = u64::from(exponent - 127 + 1023) << 52;
+        Ok(sign | double_exponent | (u64::from(fraction) << 29))
+    }
+
+    /// Exact CVT.S.D result using integer IEEE decoding and FCSR.RM. VR4300
+    /// detects tininess after rounding. A denormal result is supported only
+    /// when FS is set and U/I are both disabled; that path flushes to signed
+    /// zero or signed minimum-normal and raises U+I together.
+    pub fn try_cvt_s_d_bits(&mut self, fs: u8) -> Result<u32, FpuException> {
+        const S_QNAN: u32 = 0x7FBF_FFFF;
+        const S_MAX: u32 = 0x7F7F_FFFF;
+        const S_INFINITY: u32 = 0x7F80_0000;
+        const S_MIN_NORMAL: u32 = 0x0080_0000;
+        const FCSR_FS: u32 = 1 << 24;
+        let bits = self.d_bits(fs);
+        let negative = bits >> 63 != 0;
+        let sign = (bits >> 32) as u32 & 0x8000_0000;
+        let exponent = ((bits >> 52) & 0x7FF) as u32;
+        let fraction = bits & 0x000F_FFFF_FFFF_FFFF;
+        self.fcsr &= !(0x3F << 12);
+
+        if exponent == 0 {
+            return if fraction == 0 {
+                Ok(sign)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+        if exponent == 0x7FF {
+            return if fraction == 0 {
+                Ok(sign | S_INFINITY)
+            } else if is_snan64(bits) {
+                self.record_fpu_exception(SingleFpuCause::Invalid)?;
+                Ok(S_QNAN)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+
+        let mode = (self.fcsr & 3) as u8;
+        let unbiased = exponent as i32 - 1023;
+        let significand = (1u64 << 52) | fraction;
+        if unbiased > 127 {
+            self.record_fpu_exceptions(FPU_CAUSE_O | FPU_CAUSE_I)?;
+            return Ok(sign | overflowed_single(mode, negative, S_MAX, S_INFINITY));
+        }
+
+        if unbiased >= -126 {
+            let (mut rounded, inexact) = round_shift_right(significand, 29, mode, negative);
+            let mut output_exponent = unbiased;
+            if rounded == 1 << 24 {
+                rounded >>= 1;
+                output_exponent += 1;
+            }
+            if output_exponent > 127 {
+                self.record_fpu_exceptions(FPU_CAUSE_O | FPU_CAUSE_I)?;
+                return Ok(sign | overflowed_single(mode, negative, S_MAX, S_INFINITY));
+            }
+            if inexact {
+                self.record_fpu_exception(SingleFpuCause::Inexact)?;
+            }
+            return Ok(sign
+                | (((output_exponent + 127) as u32) << 23)
+                | (rounded as u32 & 0x007F_FFFF));
+        }
+
+        let shift = (-unbiased - 97) as u32;
+        let (rounded, inexact) = round_shift_right(significand, shift, mode, negative);
+        if rounded == 1 << 23 {
+            if inexact {
+                self.record_fpu_exception(SingleFpuCause::Inexact)?;
+            }
+            return Ok(sign | S_MIN_NORMAL);
+        }
+
+        let enables = ((self.fcsr >> 7) & 0x1F) as u8;
+        if self.fcsr & FCSR_FS == 0 || enables & (FPU_CAUSE_U | FPU_CAUSE_I) != 0 {
+            return Err(self.fpu_unimplemented());
+        }
+        self.record_fpu_exceptions(FPU_CAUSE_U | FPU_CAUSE_I)?;
+        let magnitude = match (mode, negative) {
+            (2, false) | (3, true) => S_MIN_NORMAL,
+            _ => 0,
+        };
+        Ok(sign | magnitude)
+    }
+
+    fn whole_function_float_to_float<T>(result: Result<T, FpuException>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => trap_unsupported("COP1 float-to-float exception in whole-function lane"),
+        }
+    }
+
+    pub fn cvt_d_s_bits(&mut self, fs: u8) -> u64 {
+        let result = self.try_cvt_d_s_bits(fs);
+        Self::whole_function_float_to_float(result)
+    }
+
+    pub fn cvt_s_d_bits(&mut self, fs: u8) -> u32 {
+        let result = self.try_cvt_s_d_bits(fs);
+        Self::whole_function_float_to_float(result)
+    }
+
+    fn try_fpu_to_i32_raw(
+        &mut self,
+        value: f64,
+        signaling_nan: bool,
+        unimplemented_operand: bool,
+        fixed_mode: Option<u8>,
+    ) -> Result<i32, FpuException> {
+        self.fcsr &= !(0x3F << 12);
+        if signaling_nan {
+            self.record_fpu_exception(SingleFpuCause::Invalid)?;
+            return Ok(i32::MAX);
+        }
+        if unimplemented_operand {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        let rounded = self.rounded_for_mode(value, fixed_mode);
+        if !(-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        if rounded != value {
+            self.record_fpu_exception(SingleFpuCause::Inexact)?;
+        }
+        Ok(rounded as i32)
+    }
+
+    fn try_fpu_to_i64_raw(
+        &mut self,
+        value: f64,
+        signaling_nan: bool,
+        unimplemented_operand: bool,
+        fixed_mode: Option<u8>,
+    ) -> Result<i64, FpuException> {
+        self.fcsr &= !(0x3F << 12);
+        if signaling_nan {
+            self.record_fpu_exception(SingleFpuCause::Invalid)?;
+            return Ok(i64::MAX);
+        }
+        if unimplemented_operand {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        let rounded = self.rounded_for_mode(value, fixed_mode);
+        if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded) {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        if rounded != value {
+            self.record_fpu_exception(SingleFpuCause::Inexact)?;
+        }
+        Ok(rounded as i64)
+    }
+
+    /// Convert a raw single-precision operand to a W result. The immutable
+    /// typed result is returned before the caller commits `fd`.
+    pub fn try_fpu_to_i32_s(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i32, FpuException> {
+        let bits = self.f_bits(fs);
+        self.try_fpu_to_i32_raw(
+            f32::from_bits(bits) as f64,
+            is_snan32(bits),
+            is_qnan32(bits) || is_subnormal32(bits) || f32::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    /// Double-precision counterpart of [`RecompContext::try_fpu_to_i32_s`].
+    pub fn try_fpu_to_i32_d(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i32, FpuException> {
+        let bits = self.d_bits(fs);
+        self.try_fpu_to_i32_raw(
+            f64::from_bits(bits),
+            is_snan64(bits),
+            is_qnan64(bits) || is_subnormal64(bits) || f64::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    /// Convert a raw single-precision operand to an L result.
+    pub fn try_fpu_to_i64_s(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i64, FpuException> {
+        let bits = self.f_bits(fs);
+        self.try_fpu_to_i64_raw(
+            f32::from_bits(bits) as f64,
+            is_snan32(bits),
+            is_qnan32(bits) || is_subnormal32(bits) || f32::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    /// Double-precision counterpart of [`RecompContext::try_fpu_to_i64_s`].
+    pub fn try_fpu_to_i64_d(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i64, FpuException> {
+        let bits = self.d_bits(fs);
+        self.try_fpu_to_i64_raw(
+            f64::from_bits(bits),
+            is_snan64(bits),
+            is_qnan64(bits) || is_subnormal64(bits) || f64::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    fn whole_function_conversion<T>(result: Result<T, FpuException>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => {
+                trap_unsupported("enabled COP1 float-to-fixed exception in whole-function lane")
+            }
+        }
+    }
+
+    pub fn fpu_to_i32_s(&mut self, fs: u8, fixed_mode: Option<u8>) -> i32 {
+        let result = self.try_fpu_to_i32_s(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    pub fn fpu_to_i32_d(&mut self, fs: u8, fixed_mode: Option<u8>) -> i32 {
+        let result = self.try_fpu_to_i32_d(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    pub fn fpu_to_i64_s(&mut self, fs: u8, fixed_mode: Option<u8>) -> i64 {
+        let result = self.try_fpu_to_i64_s(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    pub fn fpu_to_i64_d(&mut self, fs: u8, fixed_mode: Option<u8>) -> i64 {
+        let result = self.try_fpu_to_i64_d(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    fn rounded_for_mode(&self, value: f64, fixed_mode: Option<u8>) -> f64 {
         match fixed_mode.unwrap_or((self.fcsr & 3) as u8) {
             0 => value.round_ties_even(),
             1 => value.trunc(),
@@ -1142,14 +1630,28 @@ impl RecompContext {
         }
     }
 
+    /// Record one precise IEEE exception after the operation has cleared its
+    /// per-operation Cause field. VR4300 User's Manual section 6.3.2.2: Cause
+    /// is set in either case; an enabled exception traps without changing Flag,
+    /// while a disabled exception completes and accumulates the sticky Flag.
+    /// This helper is single-cause-only. A future operation with several
+    /// simultaneous causes must set every Cause, test all matching Enables,
+    /// and set no new Flags if any cause is enabled; sequential calls here
+    /// would incorrectly commit a disabled cause's Flag before a later enabled
+    /// cause is observed.
     #[inline]
-    fn raise_fpu(&mut self, exception: u8) {
-        // exception 0..4 = Inexact, Underflow, Overflow, Divide-by-zero,
-        // Invalid. Cause adds bit 12; sticky Flag adds bit 2.
-        self.fcsr |= 1 << (12 + exception);
-        self.fcsr |= 1 << (2 + exception);
-        if self.fcsr & (1 << (7 + exception)) != 0 {
-            trap_unsupported(format!("enabled COP1 exception {exception}"));
+    fn record_fpu_exception(&mut self, exception: SingleFpuCause) -> Result<(), FpuException> {
+        self.record_fpu_exceptions(1 << exception.index())
+    }
+
+    fn record_fpu_exceptions(&mut self, exceptions: u8) -> Result<(), FpuException> {
+        assert_eq!(exceptions & !0x1F, 0, "IEEE FPU cause mask exceeds VZOUI");
+        self.fcsr |= u32::from(exceptions) << 12;
+        if ((self.fcsr >> 7) as u8) & exceptions != 0 {
+            Err(FpuException)
+        } else {
+            self.fcsr |= u32::from(exceptions) << 2;
+            Ok(())
         }
     }
 
@@ -1464,41 +1966,68 @@ impl RecompContext {
     /// Evaluate any of the sixteen C.cond.fmt predicates. The low three funct
     /// bits select unordered/equal/less participation; bit 3 selects signaling
     /// behavior. Quiet compares still signal on an SNaN.
-    pub fn fpu_compare(&mut self, lhs: f64, rhs: f64, lhs_snan: bool, rhs_snan: bool, cond: u8) {
+    pub fn try_fpu_compare(
+        &mut self,
+        lhs: f64,
+        rhs: f64,
+        lhs_snan: bool,
+        rhs_snan: bool,
+        cond: u8,
+    ) -> Result<(), FpuException> {
+        assert!(cond < 16, "COP1 compare predicate exceeds four bits");
         self.fcsr &= !(0x3F << 12);
         let unordered = lhs.is_nan() || rhs.is_nan();
-        if (unordered && cond & 0x8 != 0) || lhs_snan || rhs_snan {
-            self.raise_fpu(4);
-        }
-        self.fpu_cond = (unordered && cond & 1 != 0)
+        let condition = (unordered && cond & 1 != 0)
             || (!unordered && lhs == rhs && cond & 2 != 0)
             || (!unordered && lhs < rhs && cond & 4 != 0);
+        if (unordered && cond & 0x8 != 0) || lhs_snan || rhs_snan {
+            self.record_fpu_exception(SingleFpuCause::Invalid)?;
+        }
+        self.fpu_cond = condition;
+        Ok(())
     }
 
     #[inline]
-    pub fn fpu_compare_s(&mut self, fs: u8, ft: u8, cond: u8) {
+    pub fn try_fpu_compare_s(&mut self, fs: u8, ft: u8, cond: u8) -> Result<(), FpuException> {
         let a = self.f_bits(fs);
         let b = self.f_bits(ft);
-        self.fpu_compare(
+        self.try_fpu_compare(
             f32::from_bits(a) as f64,
             f32::from_bits(b) as f64,
             is_snan32(a),
             is_snan32(b),
             cond,
-        );
+        )
     }
 
     #[inline]
-    pub fn fpu_compare_d(&mut self, fs: u8, ft: u8, cond: u8) {
+    pub fn try_fpu_compare_d(&mut self, fs: u8, ft: u8, cond: u8) -> Result<(), FpuException> {
         let a = self.d_bits(fs);
         let b = self.d_bits(ft);
-        self.fpu_compare(
+        self.try_fpu_compare(
             f64::from_bits(a),
             f64::from_bits(b),
             is_snan64(a),
             is_snan64(b),
             cond,
-        );
+        )
+    }
+
+    /// Whole-function compatibility boundary. Arbitrary-PC lanes use the
+    /// typed `try_` form so they can enter the guest exception vector.
+    #[inline]
+    pub fn fpu_compare_s(&mut self, fs: u8, ft: u8, cond: u8) {
+        if self.try_fpu_compare_s(fs, ft, cond).is_err() {
+            trap_unsupported("enabled COP1 compare exception in whole-function lane");
+        }
+    }
+
+    /// Double-precision counterpart of [`RecompContext::fpu_compare_s`].
+    #[inline]
+    pub fn fpu_compare_d(&mut self, fs: u8, ft: u8, cond: u8) {
+        if self.try_fpu_compare_d(fs, ft, cond).is_err() {
+            trap_unsupported("enabled COP1 compare exception in whole-function lane");
+        }
     }
 
     // ================================================================
@@ -1597,14 +2126,36 @@ impl RecompContext {
 
 #[inline]
 fn is_snan32(bits: u32) -> bool {
-    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 && bits & 0x0040_0000 == 0
+    // VR4300 User's Manual p.151 uses the legacy convention: fraction MSB 1
+    // denotes signaling NaN, opposite the modern IEEE host convention.
+    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 && bits & 0x0040_0000 != 0
+}
+
+#[inline]
+fn is_qnan32(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x003F_FFFF != 0
+}
+
+#[inline]
+fn is_subnormal32(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0
 }
 
 #[inline]
 fn is_snan64(bits: u64) -> bool {
     bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000
         && bits & 0x000F_FFFF_FFFF_FFFF != 0
-        && bits & 0x0008_0000_0000_0000 == 0
+        && bits & 0x0008_0000_0000_0000 != 0
+}
+
+#[inline]
+fn is_qnan64(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && bits & 0x0007_FFFF_FFFF_FFFF != 0
+}
+
+#[inline]
+fn is_subnormal64(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0 && bits & 0x000F_FFFF_FFFF_FFFF != 0
 }
 
 /// Round an `f32` to the nearest integer, ties to even — the FPU's default
