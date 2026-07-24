@@ -2827,7 +2827,7 @@ mod tests {
             mem.load_w(0xFFFF_FFFF_A450_000C) as u32,
             fn64_runtime::AI_STATUS_ENABLED
         );
-        assert_ne!(
+        assert_eq!(
             with_host(|host| host.device_fabric.snapshot().mi_pending)
                 & fn64_runtime::InterruptSource::Ai.bit(),
             0

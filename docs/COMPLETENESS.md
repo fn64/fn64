@@ -320,10 +320,10 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | Rumble Pak | `osMotorInit_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1352` |
 | Rumble Pak | `osMotorStart_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1429` |
 | Rumble Pak | `osMotorStop_recomp` | **implemented** | `crates/fn64-abi/src/si.rs:1440` |
-| AI/audio | `osAiGetLength_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:121` |
-| AI/audio | `osAiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:95` |
-| AI/audio | `osAiSetFrequency_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:38` |
-| AI/audio | `osAiSetNextBuffer_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:163` |
+| AI/audio | `osAiGetLength_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:131` |
+| AI/audio | `osAiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:105` |
+| AI/audio | `osAiSetFrequency_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:47` |
+| AI/audio | `osAiSetNextBuffer_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:173` |
 | VI/DP | `osViSetXScale_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:143` |
 | VI/DP | `osViSetYScale_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:127` |
 | VI/DP | `osCreateViManager_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:33` |
