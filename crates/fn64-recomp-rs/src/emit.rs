@@ -2234,6 +2234,10 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         SqrtS { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_sqrt_s({fd}, {fs})"))),
         // MOV.S is a bit-exact copy (not an arithmetic op): move the raw word.
         MovS { fd, fs } => line(out, format!("ctx.set_f_bits({}, ctx.f_bits({}));", fd, fs)),
+        // Conditional moves: pure register copies, never trap (no `if`-guard).
+        MovcfS { fd, fs, tf } => line(out, format!("ctx.fpu_movcf_s({fd}, {fs}, {tf});")),
+        MovzS { fd, fs, rt } => line(out, format!("ctx.fpu_movz_s({fd}, {fs}, {rt});")),
+        MovnS { fd, fs, rt } => line(out, format!("ctx.fpu_movn_s({fd}, {fs}, {rt});")),
 
         // --- Double-precision arithmetic (routed through the shim). ---
         AddD { fd, fs, ft } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_add_d({fd}, {fs}, {ft})"))),
@@ -2244,6 +2248,9 @@ fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, mem_fault: &M
         NegD { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_neg_d({fd}, {fs})"))),
         SqrtD { fd, fs } => line(out, emit_fpu_arith_call(&format!("ctx.fpu_sqrt_d({fd}, {fs})"))),
         MovD { fd, fs } => line(out, format!("ctx.set_d_bits({}, ctx.d_bits({}));", fd, fs)),
+        MovcfD { fd, fs, tf } => line(out, format!("ctx.fpu_movcf_d({fd}, {fs}, {tf});")),
+        MovzD { fd, fs, rt } => line(out, format!("ctx.fpu_movz_d({fd}, {fs}, {rt});")),
+        MovnD { fd, fs, rt } => line(out, format!("ctx.fpu_movn_d({fd}, {fs}, {rt});")),
 
         // --- Conversions. Float->float use lossless/rounding `as` casts; the
         //     int destinations write the RAW 32/64 bits of the result into the

@@ -47,6 +47,14 @@ pub struct Flags {
     /// Invalid operation (V) — e.g. 0*inf, inf-inf, sqrt(-x), SNaN input.
     /// FCSR exception index 4.
     pub invalid: bool,
+    /// Unimplemented Operation (E) — the VR4300 does NOT process denormalized
+    /// (subnormal) operands or results in hardware; it raises this exception
+    /// instead (FCSR Cause bit 17, index 5). Unlike the five IEEE conditions
+    /// above, E has NO Enable bit — it ALWAYS traps to the ExcCode-15 handler
+    /// (VR4300 User's Manual section 7.4 / 7.5, "Unimplemented Operation
+    /// Exception"). It is why real N64 titles keep their FP math out of the
+    /// subnormal range: hitting one takes a trap, not a flush-to-zero.
+    pub unimplemented: bool,
 }
 
 impl Flags {
@@ -56,7 +64,25 @@ impl Flags {
         overflow: false,
         divbyzero: false,
         invalid: false,
+        unimplemented: false,
     };
+
+    /// The Unimplemented-Operation-only flag set (a denormal operand or result).
+    const UNIMPL: Flags = Flags {
+        unimplemented: true,
+        ..Flags::NONE
+    };
+}
+
+/// A finite nonzero *subnormal* single: biased exponent field zero, nonzero
+/// mantissa (VR4300 does not process these — they raise Unimplemented Operation).
+pub fn is_denormal_s(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0
+}
+
+/// Double-precision counterpart of [`is_denormal_s`].
+pub fn is_denormal_d(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0 && bits & 0x000F_FFFF_FFFF_FFFF != 0
 }
 
 /// Map an apfloat [`Status`] bitset onto MIPS FCSR [`Flags`].
@@ -72,6 +98,7 @@ fn flags_from_status(status: Status) -> Flags {
         overflow: status.contains(Status::OVERFLOW),
         divbyzero: status.contains(Status::DIV_BY_ZERO),
         invalid: status.contains(Status::INVALID_OP),
+        unimplemented: false,
     }
 }
 
@@ -169,6 +196,59 @@ fn snan_short_circuit_d(a: u64, b: u64) -> Option<(u64, Flags)> {
 }
 
 // ---------------------------------------------------------------------------
+// Denormal → Unimplemented Operation (VR4300 User's Manual section 7.5).
+//
+// The VR4300 flushes NOTHING and computes NOTHING when a denormalized operand
+// or result is involved: it raises the Unimplemented Operation exception (E),
+// which is unmaskable and always traps to ExcCode 15. So the shim detects a
+// denormal OPERAND up front (before touching apfloat, since the hardware never
+// forms the op) and a denormal RESULT after the op (apfloat produces a proper
+// gradual-underflow subnormal that the VR4300 would instead trap on). In both
+// cases the reported flags are UNIMPL only — the destination is not committed
+// and no IEEE flag is disturbed (the caller discards the result on a trap).
+// ---------------------------------------------------------------------------
+
+/// Unimplemented-Operation short-circuit for a single-precision op whose
+/// operand bits are `a`/`b` (`b` may be `a` for a unary op): `Some` when either
+/// is a denormal, so the op traps as E before it is even performed.
+fn denorm_operand_s(a: u32, b: u32) -> Option<(u32, Flags)> {
+    if is_denormal_s(a) || is_denormal_s(b) {
+        // Result bits are irrelevant on a trap (not committed); return the
+        // input so callers that ignore the trap still see a defined value.
+        Some((a, Flags::UNIMPL))
+    } else {
+        None
+    }
+}
+
+fn denorm_operand_d(a: u64, b: u64) -> Option<(u64, Flags)> {
+    if is_denormal_d(a) || is_denormal_d(b) {
+        Some((a, Flags::UNIMPL))
+    } else {
+        None
+    }
+}
+
+/// If `bits` is a denormal single result, replace the computed `(bits, flags)`
+/// with an Unimplemented-Operation trap (the VR4300 never produces a subnormal
+/// result — it traps E instead of the gradual-underflow value apfloat gives).
+fn denorm_result_s(bits: u32, flags: Flags) -> (u32, Flags) {
+    if is_denormal_s(bits) {
+        (bits, Flags::UNIMPL)
+    } else {
+        (bits, flags)
+    }
+}
+
+fn denorm_result_d(bits: u64, flags: Flags) -> (u64, Flags) {
+    if is_denormal_d(bits) {
+        (bits, Flags::UNIMPL)
+    } else {
+        (bits, flags)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Single-precision binary arithmetic.
 //
 // Each op decodes the operand bits into apfloat `Single`s, runs the op under the
@@ -182,42 +262,54 @@ fn snan_short_circuit_d(a: u64, b: u64) -> Option<(u64, Flags)> {
 /// `fd = fs + ft` (single). Honors FCSR.RM; returns the MIPS result bits and
 /// IEEE flags.
 pub fn add_s(a: u32, b: u32, fcsr_rm: u8) -> (u32, Flags) {
+    if let Some(e) = denorm_operand_s(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_s(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Single::from_bits(a as u128).add_r(Single::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_s(value), flags_from_status(status))
+    denorm_result_s(canon_s(value), flags_from_status(status))
 }
 
 /// `fd = fs - ft` (single).
 pub fn sub_s(a: u32, b: u32, fcsr_rm: u8) -> (u32, Flags) {
+    if let Some(e) = denorm_operand_s(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_s(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Single::from_bits(a as u128).sub_r(Single::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_s(value), flags_from_status(status))
+    denorm_result_s(canon_s(value), flags_from_status(status))
 }
 
 /// `fd = fs * ft` (single).
 pub fn mul_s(a: u32, b: u32, fcsr_rm: u8) -> (u32, Flags) {
+    if let Some(e) = denorm_operand_s(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_s(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Single::from_bits(a as u128).mul_r(Single::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_s(value), flags_from_status(status))
+    denorm_result_s(canon_s(value), flags_from_status(status))
 }
 
 /// `fd = fs / ft` (single).
 pub fn div_s(a: u32, b: u32, fcsr_rm: u8) -> (u32, Flags) {
+    if let Some(e) = denorm_operand_s(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_s(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Single::from_bits(a as u128).div_r(Single::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_s(value), flags_from_status(status))
+    denorm_result_s(canon_s(value), flags_from_status(status))
 }
 
 // ---------------------------------------------------------------------------
@@ -226,42 +318,54 @@ pub fn div_s(a: u32, b: u32, fcsr_rm: u8) -> (u32, Flags) {
 
 /// `fd = fs + ft` (double).
 pub fn add_d(a: u64, b: u64, fcsr_rm: u8) -> (u64, Flags) {
+    if let Some(e) = denorm_operand_d(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_d(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Double::from_bits(a as u128).add_r(Double::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_d(value), flags_from_status(status))
+    denorm_result_d(canon_d(value), flags_from_status(status))
 }
 
 /// `fd = fs - ft` (double).
 pub fn sub_d(a: u64, b: u64, fcsr_rm: u8) -> (u64, Flags) {
+    if let Some(e) = denorm_operand_d(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_d(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Double::from_bits(a as u128).sub_r(Double::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_d(value), flags_from_status(status))
+    denorm_result_d(canon_d(value), flags_from_status(status))
 }
 
 /// `fd = fs * ft` (double).
 pub fn mul_d(a: u64, b: u64, fcsr_rm: u8) -> (u64, Flags) {
+    if let Some(e) = denorm_operand_d(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_d(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Double::from_bits(a as u128).mul_r(Double::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_d(value), flags_from_status(status))
+    denorm_result_d(canon_d(value), flags_from_status(status))
 }
 
 /// `fd = fs / ft` (double).
 pub fn div_d(a: u64, b: u64, fcsr_rm: u8) -> (u64, Flags) {
+    if let Some(e) = denorm_operand_d(a, b) {
+        return e;
+    }
     if let Some(sc) = snan_short_circuit_d(a, b) {
         return sc;
     }
     let StatusAnd { status, value } =
         Double::from_bits(a as u128).div_r(Double::from_bits(b as u128), round_of(fcsr_rm));
-    (canon_d(value), flags_from_status(status))
+    denorm_result_d(canon_d(value), flags_from_status(status))
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +424,11 @@ pub fn sqrt_s(a: u32, fcsr_rm: u8) -> (u32, Flags) {
                 ..Flags::NONE
             },
         );
+    }
+    // Denormal operand: Unimplemented Operation (the VR4300 never processes a
+    // subnormal input — it traps E instead of computing sqrt of it).
+    if is_denormal_s(a) {
+        return (a, Flags::UNIMPL);
     }
     // Quiet NaN input: propagate canonical NaN, no exception.
     if x.is_nan() {
@@ -465,6 +574,10 @@ pub fn sqrt_d(a: u64, fcsr_rm: u8) -> (u64, Flags) {
                 ..Flags::NONE
             },
         );
+    }
+    // Denormal operand: Unimplemented Operation (see `sqrt_s`).
+    if is_denormal_d(a) {
+        return (a, Flags::UNIMPL);
     }
     if x.is_nan() {
         return (CANON_QNAN_D, Flags::NONE);
