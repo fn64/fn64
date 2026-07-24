@@ -4,8 +4,8 @@
 //! contract this binary requires -- this crate itself contains zero game
 //! content, per `fn64/README.md`. Structurally identical to
 //! `examples/wm2000-boot/src/main.rs`; only the always-resident section
-//! set and the audio-ucode stand-in's doc comment differ (see below) --
-//! this is the "does fn64 generalize past the AKI titles" test, so
+//! set and game-specific evidence controls differ. This is the "does fn64
+//! generalize past the AKI titles" test, so
 //! deliberately reusing the SAME harness code proves that, rather than a
 //! bespoke per-game rewrite.
 //!
