@@ -1,11 +1,9 @@
 //! Load an N64Recomp `oot.toml` (`[input]` + `[patches]`) plus its
 //! `symbols_file_path` symbol table (`dump.toml`) into a typed
-//! [`RecompConfig`]. This is the READ side of the format the [`n64recomp`]
-//! module already WRITES: it parses the exact on-disk shape real AKI/OoT
-//! configs use and produces our own typed representation, so a caller can
-//! drive `Recompiler::recompile` over a whole real ROM's symbol dump.
-//!
-//! [`n64recomp`]: crate::n64recomp
+//! [`RecompConfig`]. This is the READ side of the N64Recomp config format:
+//! it parses the exact on-disk shape real AKI/OoT configs use and produces
+//! our own typed representation, so a caller can drive
+//! `Recompiler::recompile` over a whole real ROM's symbol dump.
 //!
 //! # Format (observed, `aki-recomp/games/OOTU/{oot.toml,syms/dump.toml}`)
 //!
@@ -121,8 +119,8 @@ struct PatchesDoc {
 #[derive(Debug, Deserialize)]
 struct InstructionPatchDoc {
     func: String,
-    /// N64Recomp writes these as hex STRINGS (`vram = "0x..."`), matching
-    /// `n64recomp::to_input_toml`. Parsed leniently via [`parse_u32_flexible`].
+    /// N64Recomp writes these as hex STRINGS (`vram = "0x..."`). Parsed
+    /// leniently via [`parse_u32_flexible`].
     vram: StringOrInt,
     value: StringOrInt,
 }
@@ -478,7 +476,7 @@ size = 0x10
 functions = [ { name = "entrypoint", vram = 0x80000400, size = 0x10 } ]
 "#,
         );
-        // n64recomp::to_input_toml writes vram/value as quoted hex strings.
+        // The N64Recomp config format writes vram/value as quoted hex strings.
         let config = write(
             &dir,
             "oot.toml",
