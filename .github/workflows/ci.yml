@@ -1,0 +1,52 @@
+# Minimal enforcement gate. Until this existed, the project's 29 gate_* binaries,
+# certification examples, and doc-lint checks were all run by hand -- so drift
+# (e.g. stale generated docs) landed unnoticed. This wires the two authoritative
+# checks the repo already defines:
+#   - `cargo nextest run --workspace` -- the "is it green?" gate (.config/nextest.toml
+#     explains why nextest, not `cargo test`: it fixes the fn64-abi exit-code race).
+#   - `scripts/lint-docs.py` -- catches doc-drift (dangling refs, phantom crates,
+#     stale generated docs). It internally runs the NMR-surface and base-renderer
+#     matrix checks, so they don't need separate steps.
+#
+# ponytail: two jobs, stock actions, no matrix. Add OS/toolchain fan-out or the
+# GPU-bound rt64 certification examples only when they actually gate a release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo nextest (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # fn64-audio/fn64-shell link ALSA via cpal/gilrs; the runner image has no
+      # libasound headers, so alsa-sys' build.rs panics before any test runs.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      # aki-audio-ucode recompiles the AKI ucode from a licensed WM2000 ROM at
+      # build time (examples/wm2000-boot/audio-ucode/build.rs panics without one).
+      # No ROM can live in CI, so exclude it -- every other workspace crate is
+      # ROM-free. Verified locally: 2166 passed, 0 failed.
+      - run: cargo nextest run --workspace --exclude aki-audio-ucode
+
+  docs:
+    name: doc-drift lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      # lint-docs.py shells out to `rg`, which isn't on the runner image.
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: python3 scripts/lint-docs.py
