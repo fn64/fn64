@@ -187,6 +187,80 @@ impl DataAccessError {
     }
 }
 
+const COP0_STATUS_FR: u32 = 1 << 26;
+
+/// View-independent contents of the 32 physical COP1 FGRs.
+///
+/// This is the state-transfer currency for ABI bridges, coroutine ownership,
+/// and deterministic evidence. It deliberately does not expose an FR-shaped
+/// array: FR is a view selected by the receiving [`RecompContext`]'s Status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhysicalFgrState([u64; 32]);
+
+impl PhysicalFgrState {
+    pub const fn from_words(words: [u64; 32]) -> Self {
+        Self(words)
+    }
+
+    pub const fn into_words(self) -> [u64; 32] {
+        self.0
+    }
+}
+
+/// The 32 physical COP1 Floating-Point General registers (FGRs).
+///
+/// VR4300 User's Manual section 5.2 defines each FGR as 32 bits wide when
+/// Status.FR=0 and 64 bits wide when FR=1. Section 5.3 defines an FR=0
+/// doubleword FPR as the low words of adjacent even/odd FGRs, while an FR=1
+/// FPR is one complete 64-bit FGR. Retaining all 64 bits in every physical
+/// FGR makes changing FR a view change: bits inaccessible in FR=0 survive and
+/// become visible again when FR=1 is restored.
+#[derive(Clone, Debug, Default)]
+struct FprFile {
+    fgr: [u64; 32],
+}
+
+impl FprFile {
+    #[inline]
+    fn word(&self, idx: u8) -> u32 {
+        self.fgr[idx as usize] as u32
+    }
+
+    #[inline]
+    fn set_word(&mut self, idx: u8, bits: u32) {
+        let slot = &mut self.fgr[idx as usize];
+        *slot = (*slot & 0xFFFF_FFFF_0000_0000) | u64::from(bits);
+    }
+
+    #[inline]
+    fn doubleword(&self, idx: u8, fr: bool) -> u64 {
+        if fr {
+            self.fgr[idx as usize]
+        } else {
+            assert_eq!(idx & 1, 0, "FR=0 doubleword read from odd FPR f{idx}");
+            u64::from(self.word(idx)) | (u64::from(self.word(idx + 1)) << 32)
+        }
+    }
+
+    #[inline]
+    fn set_doubleword(&mut self, idx: u8, bits: u64, fr: bool) {
+        if fr {
+            self.fgr[idx as usize] = bits;
+        } else {
+            assert_eq!(idx & 1, 0, "FR=0 doubleword write to odd FPR f{idx}");
+            self.set_word(idx, bits as u32);
+            self.set_word(idx + 1, (bits >> 32) as u32);
+        }
+    }
+
+    fn physical_state(&self) -> PhysicalFgrState {
+        PhysicalFgrState::from_words(self.fgr)
+    }
+
+    fn replace_physical_state(&mut self, state: PhysicalFgrState) {
+        self.fgr = state.into_words();
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct RecompContext {
     /// r[0] is `$zero`; kept in the array for uniform indexing but never
@@ -198,14 +272,10 @@ pub struct RecompContext {
     /// The LO result register of MULT/DIV.
     pub lo: u64,
 
-    /// The COP1 (FPU) register file, stored as 32 raw 64-bit slots. See the
-    /// [`RecompContext`] FPU accessors for how the FR=0 even/odd pairing maps a
-    /// single-precision register index onto these slots — this mirrors
-    /// `fn64-abi`'s `f_odd` model (an odd `$fN` aliases the HIGH 32-bit word of
-    /// its even partner `$f(N-1)`) so the byte layout matches the recompiled C
-    /// exactly. We keep raw bits (not `f32`/`f64`) so a bit-copy `MOV`/`MTC1`
-    /// never perturbs a NaN payload and the aliasing is pure integer indexing.
-    fpr: [u64; 32],
+    /// Physical COP1 FGR state. Accessors select the FR=0 paired or FR=1
+    /// independent view from `cop0_status`; no emitter or interpreter arm may
+    /// open-code that mapping.
+    fpr: FprFile,
     /// The FPU condition flag (FCSR bit 23). Set by the `C.cond.fmt` compares,
     /// tested by `BC1T`/`BC1F`. This is N64Recomp's per-function `c1cs`
     /// promoted to context state (equivalent: a compare always precedes the
@@ -1434,114 +1504,40 @@ impl RecompContext {
     // ================================================================
     // COP1 / FPU register file.
     //
-    // # The FR bit selects between two register-file organizations
-    //
-    // COP0 Status bit 26 (FR) selects how the 32 physical 64-bit FPU registers
-    // are addressed (VR4300 User's Manual section 6.3.1, "Floating-Point
-    // General Registers", and the FR-bit description in the Status register,
-    // section 6.3.1.2 / Table 6-3):
-    //
-    // * **FR=0** (libultra's default; every OSThread boots this way). There are
-    //   16 *logical* 64-bit FGRs addressed by EVEN register numbers only. A
-    //   64-bit value (double / `ldc1`/`sdc1`/`dmtc1`) lives in an even register
-    //   `$f(2k)`; the odd register `$f(2k+1)` is NOT independent — it aliases
-    //   the HIGH 32 bits of that same 64-bit slot, so a single-precision
-    //   `$f(2k+1)` reads/writes the top word of `$f(2k)`. This is exactly the
-    //   `f_odd[(N-1)*2]` addressing the recompiled C uses
-    //   (`fn64-abi::RecompContext::arm_fpr_alias`).
-    //
-    //   A *doubleword* op naming an ODD register in FR=0 is architecturally
-    //   UNDEFINED (the manual specifies doubleword ops take an even register in
-    //   this mode). The VR4300 has no separate physical storage for an odd
-    //   64-bit register here — the register number's low bit does not select an
-    //   independent register — so we model the documented physical addressing:
-    //   the low bit is dropped and the access lands on the even partner
-    //   `$f(idx & !1)`. That is a defined, non-panicking behavior consistent
-    //   with the silicon's register decode (no 17th..32nd physical double
-    //   exists to address in this mode); it is NOT a correctness claim about
-    //   undefined guest code, only a refusal to panic on it.
-    //
-    // * **FR=1**. All 32 registers are INDEPENDENT 64-bit FGRs: any register
-    //   number (even or odd) is a full, separate 64-bit register, and single-
-    //   precision `$fN` is the low 32 bits of its own slot `N` (no high-word
-    //   aliasing between an even/odd pair). This is the mode MIPS III 64-bit
-    //   code and any program that sets Status.FR uses.
-    //
-    // We store the file as 32 `u64` slots. The single/double accessors resolve
-    // the register number to (slot, is_high_word) *as a function of FR*. All
-    // accessors move raw *bits* (`f32::from_bits`/`to_bits`), never a lossy
-    // cast, so a `MOV.S`/`MTC1` of a signalling-NaN pattern is preserved
-    // bit-exactly.
+    // The VR4300 manual sections 5.2 and 5.3 define 32 physical FGRs. In FR=0
+    // each contributes one 32-bit word and an even doubleword FPR joins the
+    // adjacent even/odd words. In FR=1 each FPR is one independent 64-bit FGR.
+    // Keeping that physical shape means toggling Status.FR never rearranges or
+    // discards state. All typed operations route through these raw accessors.
     // ================================================================
 
-    /// Snapshot the raw 32-slot COP1 register file (all bits, mode-independent).
-    /// Used by the differential gate to compare the complete FPU state between
-    /// the block and interpreter lanes without going through the FR-aware
-    /// accessors (which alias in FR=0).
+    /// Snapshot every physical FGR without applying the active FR view.
+    ///
+    /// This compatibility accessor retains the legacy differential-test name,
+    /// but its entries are physical registers rather than FR-shaped slots.
     pub fn fpr_slots(&self) -> [u64; 32] {
-        self.fpr
+        self.fpr.physical_state().into_words()
     }
 
-    /// Read COP0 Status.FR (register 12, bit 26): the FPU register-file mode.
-    /// `false` = FR=0 (16 paired 64-bit FGRs, even-addressed); `true` = FR=1
-    /// (32 independent 64-bit FGRs). VR4300 User's Manual section 6.3.1.2.
+    /// Whether Status.FR selects 32 independent 64-bit FPRs.
     #[inline]
     pub fn fpu_fr(&self) -> bool {
-        self.cop0_status & (1 << 26) != 0
+        self.cop0_status & COP0_STATUS_FR != 0
     }
 
-    /// The 64-bit slot and whether the low (false) or high (true) 32-bit word
-    /// holds single-precision register `idx`, honoring FR.
-    ///
-    /// FR=0: even N -> (N, low word); odd N -> (N-1, high word) — the even/odd
-    /// pairing. FR=1: every N is its own slot's low word (no aliasing).
-    #[inline]
-    fn fpr_single_slot(&self, idx: u8) -> (usize, bool) {
-        // FR=1: every register is its own slot's low word (no aliasing).
-        // FR=0: even N -> (N, low word); odd N -> the even partner's high word.
-        if self.fpu_fr() || idx & 1 == 0 {
-            (idx as usize, false)
-        } else {
-            ((idx - 1) as usize, true)
-        }
-    }
-
-    /// The 64-bit slot backing doubleword register `idx`, honoring FR.
-    ///
-    /// FR=1: slot `idx` (all 32 independent). FR=0: the even partner
-    /// `idx & !1` — a doubleword op naming an odd register is architecturally
-    /// undefined in FR=0 and maps to the even physical register (see the
-    /// module comment above); it never panics.
-    #[inline]
-    fn fpr_double_slot(&self, idx: u8) -> usize {
-        if self.fpu_fr() {
-            idx as usize
-        } else {
-            (idx & !1) as usize
-        }
-    }
-
-    /// Read single-precision FPR `idx` as raw 32 bits.
+    /// Read the low word of physical FGR `idx`. Under FR=0 these 32 words are
+    /// the complete FGR file; under FR=1 this is the single/W view of the same
+    /// independent 64-bit register.
     #[inline]
     pub fn f_bits(&self, idx: u8) -> u32 {
-        let (slot, high) = self.fpr_single_slot(idx);
-        if high {
-            (self.fpr[slot] >> 32) as u32
-        } else {
-            self.fpr[slot] as u32
-        }
+        self.fpr.word(idx)
     }
 
-    /// Write raw 32 bits into single-precision FPR `idx` (leaving the paired
-    /// word of the even slot untouched).
+    /// Write the low word of physical FGR `idx`, preserving the upper word
+    /// that is latent in FR=0 and independently visible in FR=1.
     #[inline]
     pub fn set_f_bits(&mut self, idx: u8, bits: u32) {
-        let (slot, high) = self.fpr_single_slot(idx);
-        if high {
-            self.fpr[slot] = (self.fpr[slot] & 0x0000_0000_FFFF_FFFF) | ((bits as u64) << 32);
-        } else {
-            self.fpr[slot] = (self.fpr[slot] & 0xFFFF_FFFF_0000_0000) | (bits as u64);
-        }
+        self.fpr.set_word(idx, bits);
     }
 
     /// Read single-precision FPR `idx` as an `f32`.
@@ -1556,18 +1552,34 @@ impl RecompContext {
         self.set_f_bits(idx, val.to_bits());
     }
 
-    /// Read a doubleword (double / `dmtc1` / `ldc1`) FPR `idx` as raw 64 bits,
-    /// resolving the register number through the current FR mode.
+    /// Read a doubleword FPR. FR=0 joins the low words of adjacent even/odd
+    /// FGRs; FR=1 reads one complete FGR and permits odd indices.
     #[inline]
     pub fn d_bits(&self, idx: u8) -> u64 {
-        self.fpr[self.fpr_double_slot(idx)]
+        self.fpr.doubleword(idx, self.fpu_fr())
     }
 
-    /// Write raw 64 bits into doubleword FPR `idx`.
+    /// Write a doubleword through the active FR view. An FR=0 paired write
+    /// preserves both physical FGR upper words so a later FR=1 view recovers
+    /// them unchanged.
     #[inline]
     pub fn set_d_bits(&mut self, idx: u8, bits: u64) {
-        let slot = self.fpr_double_slot(idx);
-        self.fpr[slot] = bits;
+        let fr = self.fpu_fr();
+        self.fpr.set_doubleword(idx, bits, fr);
+    }
+
+    /// Complete physical FGR state for deterministic state/evidence snapshots.
+    /// This is view-independent: unlike 32 single reads it retains every upper
+    /// word that FR=0 makes temporarily inaccessible.
+    pub fn physical_fgr_state(&self) -> PhysicalFgrState {
+        self.fpr.physical_state()
+    }
+
+    /// Replace the complete physical FGR file without interpreting the active
+    /// FR view. ABI adapters use this only after validating that their packed
+    /// C context mode agrees with CP0.Status.FR.
+    pub fn replace_physical_fgr_state(&mut self, state: PhysicalFgrState) {
+        self.fpr.replace_physical_state(state);
     }
 
     /// Read double-precision FPR `idx` as an `f64`.

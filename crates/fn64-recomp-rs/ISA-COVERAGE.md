@@ -244,17 +244,36 @@ including unordered/signaling invalid behavior.
 FCR0 reports VR4300 implementation `0x0B`; FCR31 preserves FS, condition,
 Cause, Enable, Flag, and RM fields. CVT.W/L and all fixed rounding instructions
 obey RM/fixed direction, return the integer-indefinite value on invalid, set
-Cause and sticky Flag bits, and trap loudly when enabled. FR=0 odd singles
-alias the high word of the preceding even FGR; double/64-bit access to an odd
-FGR traps as a reserved encoding.
+Cause and sticky Flag bits, and trap loudly when enabled.
 
-COP1 remains **partial** because host `f32`/`f64` ADD/SUB/MUL/DIV/SQRT and
-float-to-float/int-to-float conversion do not honor non-nearest FCSR.RM, FS
-flush-to-zero, or reproduce every VR4300 IEEE exception/NaN payload bit. This
-is the principal user-mode blocker to a truthful “complete CPU” claim.
+The physical FGR file follows VR4300 User's Manual sections 5.2 and 5.3:
+FR=0 exposes the low word of each of 32 physical FGRs and joins adjacent
+even/odd low words for an even-indexed doubleword FPR; FR=1 exposes 32
+independent 64-bit FPRs, including odd doubleword operands. Changing Status.FR
+changes only the view and preserves every latent upper word. FR=0
+double/64-bit access to an odd FPR traps loudly as an invalid encoding.
+`PhysicalFgrState` is the view-independent import/export currency for ABI
+bridges, coroutine ownership, and deterministic state snapshots. This models
+the documented register organization; it is not a silicon-parity claim.
 
-The arbitrary-PC lane classifies every COP1 move, memory, arithmetic, compare,
-conversion, and branch instruction in the decoder and checks Status.CU1 before
+S/D ADD, SUB, MUL, DIV, and SQRT use the host-independent soft-float shim,
+honor all four FCSR rounding modes, canonicalize legacy-encoded NaNs, and
+produce the modeled IEEE Cause/Flag conditions. ABS and NEG preserve raw
+non-NaN bits while applying their sign operation and canonicalize NaNs. A
+denormal operand or result raises the unmaskable Unimplemented Operation cause.
+Enabled IEEE conditions and Unimplemented Operation return typed
+FloatingPoint/ExcCode 15 before destination commit in both arbitrary-PC lanes.
+MOVF/MOVT and MOVZ/MOVN copy raw S/D bits only when their condition is true.
+
+COP1 remains **partial**. Float-to-float and fixed-to-float conversions still
+use host conversions and therefore do not implement every FCSR.RM,
+exception, and NaN/denormal boundary. Float-to-fixed conversion and compare
+retain their existing bounded behavior; neither those slices nor the
+soft-float arithmetic establish cycle timing or complete VR4300 silicon
+parity.
+
+The arbitrary-PC lanes classify every COP1 move, memory, arithmetic, compare,
+conversion, and branch instruction in the decoder and check Status.CU1 before
 any visible effect. A disabled COP1 produces Coprocessor Unusable (ExcCode 11)
 with Cause.CE=1. COP1 branches fault before their delay instruction; a COP1
 instruction in another branch's delay slot records the branch EPC and sets BD.
@@ -308,6 +327,15 @@ therefore become compile-time errors, never silent no-ops.
   source-lineage/deferred-continuation tests cover the typed negative and
   unresolved exits; the ABI live stale-sentinel gate proves generation A is
   retired before its next instruction and B owns the resume PC.
+- `tests/interp_differential.rs`: compiles generated AOT bank runners and
+  compares them in-process with the dynamic interpreter. Its snapshot binds
+  GPR/HI/LO, all 32 physical 64-bit FGRs, FCR31, selected COP0
+  Count/Compare/Random/condition state, complete RDRAM, `BlockExit`, and
+  instruction count. The FR-transition vector
+  seeds latent upper words and repeatedly switches FR=0/FR=1 so either lane
+  losing physical register state is observable. This differential does not
+  claim the interpreter exception families which remain listed outside its
+  implemented surface.
 
 Bottom line: encoding coverage is complete for the documented MIPS III CPU
 table, with COP2 decoded as architecturally unusable. Execution is complete
