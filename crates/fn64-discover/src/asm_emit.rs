@@ -510,6 +510,14 @@ fn emit_instruction(
         NegS { fd, fs } => ff!("neg.s", fd, fs),
         SqrtS { fd, fs } => ff!("sqrt.s", fd, fs),
         MovS { fd, fs } => ff!("mov.s", fd, fs),
+        MovcfS { fd, fs, tf } => line!(
+            "{} {},{},$fcc0",
+            if tf { "movt.s" } else { "movf.s" },
+            fpr(fd),
+            fpr(fs)
+        ),
+        MovzS { fd, fs, rt } => line!("movz.s {},{},{}", fpr(fd), fpr(fs), gpr(rt)),
+        MovnS { fd, fs, rt } => line!("movn.s {},{},{}", fpr(fd), fpr(fs), gpr(rt)),
         AddD { fd, fs, ft } => fff!("add.d", fd, fs, ft),
         SubD { fd, fs, ft } => fff!("sub.d", fd, fs, ft),
         MulD { fd, fs, ft } => fff!("mul.d", fd, fs, ft),
@@ -518,6 +526,14 @@ fn emit_instruction(
         NegD { fd, fs } => ff!("neg.d", fd, fs),
         SqrtD { fd, fs } => ff!("sqrt.d", fd, fs),
         MovD { fd, fs } => ff!("mov.d", fd, fs),
+        MovcfD { fd, fs, tf } => line!(
+            "{} {},{},$fcc0",
+            if tf { "movt.d" } else { "movf.d" },
+            fpr(fd),
+            fpr(fs)
+        ),
+        MovzD { fd, fs, rt } => line!("movz.d {},{},{}", fpr(fd), fpr(fs), gpr(rt)),
+        MovnD { fd, fs, rt } => line!("movn.d {},{},{}", fpr(fd), fpr(fs), gpr(rt)),
 
         CvtSW { fd, fs } => ff!("cvt.s.w", fd, fs),
         CvtDW { fd, fs } => ff!("cvt.d.w", fd, fs),

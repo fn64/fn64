@@ -766,6 +766,46 @@ impl Interp<'_> {
                 word,
             })
         };
+        // An enabled/unmaskable FP exception vectors to ExcCode 15, identical to
+        // the AOT bank lane's `emit_bank_fpu_trap`: the destination register and
+        // sticky Flags are left unwritten (the `ctx.fpu_*` helper already did
+        // that), and the fault carries the precise EPC/BD for this site.
+        let fpu_trap = || StepFault::Cpu {
+            fault: CpuFault {
+                at: self.key(site.pc),
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::FloatingPoint,
+                    epc: GuestPc::new(site.epc),
+                    branch_delay: site.branch_delay,
+                    instruction_code: 0,
+                    bad_vaddr: None,
+                    coprocessor: None,
+                },
+            },
+            attempted: if site.branch_delay { 2 } else { 1 },
+        };
+
+        // Status.CU1 guard: a COP1-visible instruction with coprocessor 1
+        // disabled (Status bit 29 clear) is a Coprocessor Unusable exception
+        // (ExcCode 11, coprocessor 1), identical to the AOT bank lane's
+        // `emit_bank_cop1_guard`. Checked before the op runs so the two lanes
+        // agree on the fault vs. execute decision.
+        if instr.requires_cop1() && ctx.cop0_status & (1 << 29) == 0 {
+            return Err(StepFault::Cpu {
+                fault: CpuFault {
+                    at: self.key(site.pc),
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        epc: GuestPc::new(site.epc),
+                        branch_delay: site.branch_delay,
+                        instruction_code: 0,
+                        bad_vaddr: None,
+                        coprocessor: Some(1),
+                    },
+                },
+                attempted: if site.branch_delay { 2 } else { 1 },
+            });
+        }
 
         // The MMIO seam: after architectural alignment/TLB checks, a word
         // load/store is offered to the device `port`. The port is the sole authority on which effective addresses are
@@ -848,7 +888,15 @@ impl Interp<'_> {
             _ => {}
         }
 
-        exec_straight(instr, ctx, mem, &mem_fault, &unsupported, retired_before)?;
+        exec_straight(
+            instr,
+            ctx,
+            mem,
+            &mem_fault,
+            &unsupported,
+            &fpu_trap,
+            retired_before,
+        )?;
         ctx.advance_cop0_random(1);
         ok
     }
@@ -950,6 +998,7 @@ fn exec_straight(
     mem: &mut Rdram<'_>,
     mem_fault: &dyn Fn(DataAccessError) -> StepFault,
     unsupported: &dyn Fn() -> StepFault,
+    fpu_trap: &dyn Fn() -> StepFault,
     retired_before: u32,
 ) -> Result<(), StepFault> {
     use Instruction::*;
@@ -1252,14 +1301,157 @@ fn exec_straight(
         Cache { .. } | Sync => {}
 
         // ================================================================
+        // COP1 / FPU. Routed through the SAME typed `RecompContext` accessors
+        // and the SAME `crate::fpu` soft-float shim the AOT bank lane emits, so
+        // the two lanes produce bit-identical FPU results (FCSR.RM, IEEE flags,
+        // canonical NaN, FR-mode register addressing, and the ExcCode-15
+        // enabled/unmaskable-exception trap are all shared). Every `ctx.fpu_*`
+        // arithmetic helper returns `true` when an enabled/unmaskable FP
+        // exception trapped (destination left unwritten); that maps to the
+        // `fpu_trap()` ExcCode-15 fault, exactly as `emit_bank_fpu_trap` does.
+        // ================================================================
+
+        // GPR <-> FPR moves.
+        Mfc1 { rt, fs } => ctx.set_r32(rt, ctx.f_bits(fs) as i32),
+        Mtc1 { rt, fs } => ctx.set_f_bits(fs, ctx.r_u32(rt)),
+        Dmfc1 { rt, fs } => ctx.set_r(rt, ctx.d_bits(fs)),
+        Dmtc1 { rt, fs } => ctx.set_d_bits(fs, ctx.r_u64(rt)),
+        Cfc1 { rt, fs } => {
+            let v = ctx.read_fcr(fs);
+            ctx.set_r32(rt, v as i32);
+        }
+        Ctc1 { rt, fs } => ctx.write_fcr(fs, ctx.r_u32(rt)),
+
+        // COP1 loads/stores.
+        Lwc1 { ft, base, off } => {
+            let v = mem
+                .try_load_w_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
+            ctx.set_f_bits(ft, v as u32);
+        }
+        Swc1 { ft, base, off } => {
+            mem.try_store_w_translated(ctx, eff(ctx, base, off), ctx.f_bits(ft))
+                .map_err(mem_fault)?;
+        }
+        Ldc1 { ft, base, off } => {
+            let v = mem
+                .try_load_d_translated(ctx, eff(ctx, base, off))
+                .map_err(mem_fault)?;
+            ctx.set_d_bits(ft, v);
+        }
+        Sdc1 { ft, base, off } => {
+            mem.try_store_d_translated(ctx, eff(ctx, base, off), ctx.d_bits(ft))
+                .map_err(mem_fault)?;
+        }
+
+        // Single-precision arithmetic (shim; may trap ExcCode 15).
+        AddS { fd, fs, ft } if ctx.fpu_add_s(fd, fs, ft) => return Err(fpu_trap()),
+        AddS { .. } => {}
+        SubS { fd, fs, ft } if ctx.fpu_sub_s(fd, fs, ft) => return Err(fpu_trap()),
+        SubS { .. } => {}
+        MulS { fd, fs, ft } if ctx.fpu_mul_s(fd, fs, ft) => return Err(fpu_trap()),
+        MulS { .. } => {}
+        DivS { fd, fs, ft } if ctx.fpu_div_s(fd, fs, ft) => return Err(fpu_trap()),
+        DivS { .. } => {}
+        AbsS { fd, fs } if ctx.fpu_abs_s(fd, fs) => return Err(fpu_trap()),
+        AbsS { .. } => {}
+        NegS { fd, fs } if ctx.fpu_neg_s(fd, fs) => return Err(fpu_trap()),
+        NegS { .. } => {}
+        SqrtS { fd, fs } if ctx.fpu_sqrt_s(fd, fs) => return Err(fpu_trap()),
+        SqrtS { .. } => {}
+        MovS { fd, fs } => ctx.set_f_bits(fd, ctx.f_bits(fs)),
+        MovcfS { fd, fs, tf } => ctx.fpu_movcf_s(fd, fs, tf),
+        MovzS { fd, fs, rt } => ctx.fpu_movz_s(fd, fs, rt),
+        MovnS { fd, fs, rt } => ctx.fpu_movn_s(fd, fs, rt),
+
+        // Double-precision arithmetic (shim; may trap ExcCode 15).
+        AddD { fd, fs, ft } if ctx.fpu_add_d(fd, fs, ft) => return Err(fpu_trap()),
+        AddD { .. } => {}
+        SubD { fd, fs, ft } if ctx.fpu_sub_d(fd, fs, ft) => return Err(fpu_trap()),
+        SubD { .. } => {}
+        MulD { fd, fs, ft } if ctx.fpu_mul_d(fd, fs, ft) => return Err(fpu_trap()),
+        MulD { .. } => {}
+        DivD { fd, fs, ft } if ctx.fpu_div_d(fd, fs, ft) => return Err(fpu_trap()),
+        DivD { .. } => {}
+        AbsD { fd, fs } if ctx.fpu_abs_d(fd, fs) => return Err(fpu_trap()),
+        AbsD { .. } => {}
+        NegD { fd, fs } if ctx.fpu_neg_d(fd, fs) => return Err(fpu_trap()),
+        NegD { .. } => {}
+        SqrtD { fd, fs } if ctx.fpu_sqrt_d(fd, fs) => return Err(fpu_trap()),
+        SqrtD { .. } => {}
+        MovD { fd, fs } => ctx.set_d_bits(fd, ctx.d_bits(fs)),
+        MovcfD { fd, fs, tf } => ctx.fpu_movcf_d(fd, fs, tf),
+        MovzD { fd, fs, rt } => ctx.fpu_movz_d(fd, fs, rt),
+        MovnD { fd, fs, rt } => ctx.fpu_movn_d(fd, fs, rt),
+
+        // Conversions — mirror the AOT emit arms exactly (same casts, same
+        // `fpu_to_i32`/`i64` rounding through FCSR.RM or the fixed mode).
+        CvtSW { fd, fs } => ctx.set_f_s(fd, (ctx.f_bits(fs) as i32) as f32),
+        CvtDW { fd, fs } => ctx.set_f_d(fd, (ctx.f_bits(fs) as i32) as f64),
+        CvtSL { fd, fs } => ctx.set_f_s(fd, (ctx.d_bits(fs) as i64) as f32),
+        CvtDL { fd, fs } => ctx.set_f_d(fd, (ctx.d_bits(fs) as i64) as f64),
+        CvtDS { fd, fs } => ctx.set_f_d(fd, ctx.f_s(fs) as f64),
+        CvtSD { fd, fs } => ctx.set_f_s(fd, ctx.f_d(fs) as f32),
+        CvtWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, None),
+        CvtWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, None),
+        CvtLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, None),
+        CvtLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, None),
+        TruncWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(1)),
+        TruncWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(1)),
+        TruncLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(1)),
+        TruncLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(1)),
+        RoundWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(0)),
+        RoundWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(0)),
+        RoundLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(0)),
+        RoundLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(0)),
+        CeilWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(2)),
+        CeilWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(2)),
+        CeilLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(2)),
+        CeilLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(2)),
+        FloorWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(3)),
+        FloorWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(3)),
+        FloorLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(3)),
+        FloorLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(3)),
+
+        // FP compares (set the condition flag).
+        CEqS { fs, ft } => ctx.fpu_compare_s(fs, ft, 2),
+        CLtS { fs, ft } => ctx.fpu_compare_s(fs, ft, 12),
+        CLeS { fs, ft } => ctx.fpu_compare_s(fs, ft, 14),
+        CEqD { fs, ft } => ctx.fpu_compare_d(fs, ft, 2),
+        CLtD { fs, ft } => ctx.fpu_compare_d(fs, ft, 12),
+        CLeD { fs, ft } => ctx.fpu_compare_d(fs, ft, 14),
+        CCondS { fs, ft, cond } => ctx.fpu_compare_s(fs, ft, cond),
+        CCondD { fs, ft, cond } => ctx.fpu_compare_d(fs, ft, cond),
+
+        // ================================================================
         // Out of scope for this slice — a loud typed unsupported fault naming
         // the opcode, mirroring the AOT lane's host `panic!` for the same
-        // words. FPU/COP0/COP2/TLB/exceptions are the named next frontier
+        // words. COP2/TLB/exceptions are the named next frontier
         // (docs/UNIVERSAL-RUNTIME-PLAN.md, U4). Nothing here is a silent nop.
         // ================================================================
         _ => return Err(unsupported()),
     }
     Ok(())
+}
+
+/// Float/double -> int32 conversion, identical to the AOT lane's `emit_fpu_i32`:
+/// read the source as `f64`, round with `fpu_to_i32` (FCSR.RM or a fixed mode
+/// for TRUNC/ROUND/CEIL/FLOOR), and store the raw i32 bits into the FPR single
+/// word. `single` selects the source width; `mode` is the fixed rounding mode
+/// (or `None` for CVT.W, which follows FCSR.RM).
+#[inline]
+fn cvt_to_i32(ctx: &mut RecompContext, fd: u8, fs: u8, single: bool, mode: Option<u8>) {
+    let v = if single { ctx.f_s(fs) as f64 } else { ctx.f_d(fs) };
+    let r = ctx.fpu_to_i32(v, mode);
+    ctx.set_f_bits(fd, r as u32);
+}
+
+/// Float/double -> int64 conversion, identical to the AOT lane's `emit_fpu_i64`.
+#[inline]
+fn cvt_to_i64(ctx: &mut RecompContext, fd: u8, fs: u8, single: bool, mode: Option<u8>) {
+    let v = if single { ctx.f_s(fs) as f64 } else { ctx.f_d(fs) };
+    let r = ctx.fpu_to_i64(v, mode);
+    ctx.set_d_bits(fd, r as u64);
 }
 
 #[cfg(test)]
