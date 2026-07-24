@@ -266,8 +266,10 @@ mod tests {
         }
         assert!(!cmake.contains("${CMAKE_CURRENT_SOURCE_DIR}/fn64_rt64_raster_ps.hlsl"));
 
-        assert!(cmake
-            .contains("Alpha compare and coverage intentionally observe the original combiner"));
+        assert!(
+            cmake
+                .contains("Alpha compare and coverage intentionally observe the original combiner")
+        );
         assert!(cmake.contains("Only the combiner input to blending receives this bounded policy"));
         assert!(cmake.contains("Fn64RdpTakeFragmentNoiseSample(randomSeed);"));
         assert_eq!(
@@ -304,5 +306,82 @@ mod tests {
         assert!(!shader.contains("nextRand("));
         assert!(!shader.contains("shadeColor"));
         assert!(!shader.contains("fogColor"));
+    }
+
+    #[test]
+    fn s2dex_object_rectangle_overlay_is_exact_guarded_and_bounded() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = if manifest_dir.join("src/ffi.rs").is_file() {
+            manifest_dir.to_path_buf()
+        } else {
+            manifest_dir.join("../fn64-render-rt64")
+        };
+        let cmake = fs::read_to_string(root.join("ffi/CMakeLists.txt")).unwrap();
+        for mechanism in [
+            "7c8e779092eb7e2ddc8794694c0c04176a3e29958dc288952d577750673acc3f",
+            "struct Fn64ObjSprite",
+            "static_assert(sizeof(Fn64ObjSprite) == 24)",
+            "static_assert(std::is_trivially_copyable_v<uObjTxtr>)",
+            "G_OBJ_LDTX_RECT unsupported by bounded fn64 slice",
+            "active microcode is not S2DEX2",
+            "texture command is not exact public G_OBJLT_TXTRBLOCK",
+            "objRenderMode is not zero",
+            "RDP state is not point-filtered one-cycle mode",
+            "RDP sampler state is not tile LOD, clamp detail, no TLUT, and no perspective",
+            "scale is not exact 1:1 u5.10",
+            "image is not non-paletted RGBA16",
+            "image flip flags are nonzero",
+            "block tsize, TMEM origin, and sprite stride/extent disagree",
+            "block tline does not match the exact sprite stride",
+            "block source range escapes physical RDRAM",
+            "block source is not public 8-byte aligned",
+            "block source uses non-public segment bits",
+            "compound source range escapes physical RDRAM",
+            "compound source is not public 8-byte aligned",
+            "compound source uses non-public segment bits",
+            "DMA length low24 is not exact public 0x2f",
+            "std::memcpy(",
+            "static_assert(offsetof(Fn64ObjSprite, imageFmt) == 23)",
+            "uint64_t(state->rsp->segments[segment]) + uint64_t(offset)",
+            "std::memcpy(&texture, objectBytes, sizeof(texture));",
+            "doFn64ObjLoadTxRect(state, state->rsp->S2D.struct_buffer.data());",
+            "fn64_rt64_gbi_s2dex.cpp",
+            "TARGET_DIRECTORY rt64",
+            "HEADER_FILE_ONLY TRUE",
+        ] {
+            assert!(cmake.contains(mechanism), "S2DEX overlay lost {mechanism}");
+        }
+        let validation = cmake
+            .find("if (texture.type != 0x00001033U)")
+            .expect("bounded validation remains present");
+        let dma_validation = cmake
+            .find("if (((*dl)->w0 & 0x00FFFFFFU) != 0x2FU)")
+            .expect("exact compound DMA validation remains present");
+        let object_validation = cmake
+            .find("const uint32_t objectAddress = resolveFn64ObjRdramSpan(")
+            .expect("compound pointer validation remains present");
+        let sprite_read = cmake
+            .find("state->fromRDRAM(objectAddress),")
+            .expect("exact compound DMA read remains present");
+        let mutation = cmake
+            .find("doLoadTxtr(state, &texture);")
+            .expect("texture load remains present");
+        assert!(
+            validation < mutation,
+            "unsupported shapes must reject before mutation"
+        );
+        assert!(
+            dma_validation < object_validation && object_validation < sprite_read,
+            "length and pointer validation must precede the compound read"
+        );
+        assert!(!cmake.contains("readS2DStruct(state, (*dl)->w1, 0x30U);"));
+        assert_eq!(
+            cmake
+                .matches("(uObjTxSprite*)state->rsp->S2D.struct_buffer.data()")
+                .count(),
+            1,
+            "the typed cast may appear only in the upstream source guard, never the patch"
+        );
+        assert!(!cmake.contains("const Fn64ObjSprite *sprite = reinterpret_cast"));
     }
 }

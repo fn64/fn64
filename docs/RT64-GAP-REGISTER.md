@@ -18,7 +18,7 @@ targets games using these needs them. (For OoT specifically, most are irrelevant
 
 | Site | Gap | Fix direction |
 |---|---|---|
-| `src/gbi/rt64_gbi_s2dex.cpp:576,595,614` | S2DEX `objLoadTxSprite/objLoadTxRect/objLoadTxRectR` draw side is `assert(false)` — texture load runs but `doObjSprite/doObjRectangle(R)` unimplemented | Implement the sprite/rect draw path (2D microcode) |
+| `src/gbi/rt64_gbi_s2dex.cpp:576,595,614` | S2DEX `objLoadTxSprite/objLoadTxRect/objLoadTxRectR` draw side is `assert(false)` — texture load runs but `doObjSprite/doObjRectangle(R)` unimplemented | **Partially closed by an exact-source fn64 adapter overlay:** S2DEX2 `G_OBJ_LDTX_RECT` now admits only exact-length, 8-byte-source-aligned, axis-aligned point-filtered RGBA16 block loads at 1:1 with whole-texel extents, tile/clamp/no-TLUT/no-perspective sampler state, no flips, and zero object render mode. Ten fresh v3 Metal processes match an independently encoded raw-RDP control exactly in RDRAM and post-VI output and retain a final successful post-rejection workload. Sprite, matrix-relative rectangle, legacy-wire, filtering/scaling/flips, other texture formats/loaders, and render-mode corrections remain named loud frontiers. |
 | `src/gbi/rt64_gbi_s2dex.cpp:403,415,450` | Pinned RT64 S2DEX BG (`objRenderMode`, `bgLoadTile`-only, texrect count) is approximate/partial: "Reimplement more accurately to match the microcode"; only `S2DEX_G_BGLT_LOADTILE` is handled upstream | **Closed and evidenced in fn64's Rust reference path:** the public Copy partition is shared by both S2DEX wire families and both `G_BGLT_LOADTILE`/`G_BGLT_LOADBLOCK`; a 2×2 real-load matrix proves a six-row TMEM strip plus exact two-row final remainder bounds and pixels. Filtered/fractional-`imageYorig` scaled partitions remain hardware-trace work rather than being inferred from this integer-Copy result. |
 | `src/gbi/rt64_gbi_s2dex.cpp:19,30,37 & s2dex2.cpp:19,30` | Bare `assert(false)` stubs in S2DEX/S2DEX2 dispatch | Implement remaining S2DEX(2) opcodes |
 | `src/gbi/rt64_gbi_f3dex2.cpp:58,91,130,134` | Unimplemented `moveMem`, `moveWord`, "combine matrices mode", `special1` | fn64 closes public LookAt/light/viewport/force-matrix DMA, segment/light/fog/clip/perspective/force-marker writes, and persistent debug `G_DMA_IO` in its Rust reference path. Non-public point/matrix subindices and all three reserved `G_SPECIAL_*` encodings trap rather than fabricate behavior. |
@@ -356,7 +356,23 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   edges whose integer parts select the inclusive span, source-sized mismatched-
   descriptor transfers, and mask-sized domains for wrapped unclamped axes.
 - **S2DEX 2D sprite/rect microcode** — upstream RT64's draw side remains
-  unimplemented (§A1). fn64's Rust reference lane now content-admits
+  unimplemented (§A1). fn64's exact-source adapter overlay now removes the
+  S2DEX2 `G_OBJ_LDTX_RECT` hard stop only for axis-aligned point-filtered
+  RGBA16 block loads at 1:1 in one-cycle mode with whole-texel extents, no
+  flips, and zero object render mode. Admission requires the active S2DEX2
+  family, exact public block type/structure offsets, and coherent
+  tsize/tmem/tline/stride/extent/TMEM/RDRAM spans, exact `0x2f` DMA length,
+  8-byte source alignment, and tile/clamp/no-TLUT/no-perspective sampler state
+  before mutation. Its
+  synthetic gate proves the texture-only command cannot draw,
+  then matches exact RDRAM and post-VI output against an independently encoded
+  raw-RDP rectangle in 10/10 fresh v3 Metal processes. Flip, upper-bit type,
+  descriptor-mismatch, source-alignment,
+  stale-tail short-DMA, bilerp, LOD, detail/sharpen, TLUT, perspective, and
+  legacy-S2DEX negatives all reject by name;
+  see
+  `RT64-S2DEX-OBJECT-EVIDENCE.md`. Every broader native combination remains
+  named loud. fn64's Rust reference lane content-admits
   F3DEX_GBI_2 object rectangles, matrix-relative rectangles, and rotating
   sprites; block/tile/TLUT object loads and their compound draw forms; full and
   sub object matrices; S/T flips and matched bilerp mode; Copy/OneCycle
