@@ -15,11 +15,11 @@ The overlay admits only:
 - the active S2DEX2 GBI family and its `G_OBJ_LDTX_RECT` wire command;
 - the exact public `G_OBJLT_TXTRBLOCK` type `0x00001033`, public structure ID
   offsets 0/4/8/12, and a descriptor whose `tsize`, `tmem`, `tline`, stride,
-  extents, TMEM span, public four-bit segment encoding, resolved
+  extents, TMEM span, public 16-entry segmented or KSEG0/KSEG1 encoding, resolved
   8-byte-aligned block source, and complete physical-RDRAM span all agree
   before mutation;
 - the exact public 48-byte compound DMA encoding (`w0` low 24 bits `0x2f`),
-  with public four-bit segment encoding, resolved 8-byte alignment, and its
+  with public 16-entry segmented or KSEG0/KSEG1 encoding, resolved 8-byte alignment, and its
   complete physical-RDRAM span checked before the first byte is read or the
   persistent structure buffer can expose a stale tail;
 - axis-aligned, 1:1, whole-texel rectangles;
@@ -52,7 +52,9 @@ fresh process it:
    admission (`process_task` returns `NeedsLle` for an unknown image);
 2. runs `G_OBJ_LOADTXTR` alone and proves the guarded target remains all zero;
 3. runs the compound load/draw with an asymmetric 4x2 texture at nonzero screen
-   origin and captures downstream load/workload telemetry;
+   origin, a KSEG0 compound pointer, and a KSEG1 texture pointer, and captures
+   downstream load/workload telemetry; canonical segmented addressing remains
+   exercised by the texture-only control and final recovery workload;
 4. independently encodes the equivalent raw RDP texture load, render tile, and
    texture rectangle into a separate guarded target;
 5. requires byte-identical RDRAM targets and byte-identical Metal post-VI BGRA8
@@ -87,7 +89,7 @@ The stable exact outputs are:
 The generated adapter identity for this run is
 `fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3`,
 with exact adapter-source SHA-256
-`6ec2849acf1b4d129f290f0f1dee996140bf16048494a15a8aa44298fd751ed5`.
+`c94e6ee0436295471e5a696ece735793895f552dde9e1fbc3853ea100ceec7b9`.
 
 On 2026-07-24 in America/New_York the v3 gate passed 10/10 fresh processes on
 the recorded macOS 26.5 arm64 Apple M5 Pro host. Every process retained exact
