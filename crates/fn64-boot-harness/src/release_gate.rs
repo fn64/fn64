@@ -29,7 +29,7 @@ use crate::{
     ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v27";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v28";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -1467,7 +1467,7 @@ impl FixedCycleDigestGate {
         program: crate::ProgramEvidenceSnapshot,
     ) -> Result<(), GateError> {
         let observed_cycle = snapshot.guest.now.get();
-        let bytes = encode_device_snapshot(snapshot, executor, host, program);
+        let bytes = try_encode_device_snapshot(snapshot, executor, host, program)?;
         self.capture(observed_cycle, ArtifactKind::DeviceState, &bytes)
     }
 
@@ -2285,7 +2285,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v27 evidence digest after loading a retained JSON
+    /// Recompute the schema-v28 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -2435,6 +2435,10 @@ pub enum GateError {
         start: u32,
         end: u32,
         limit: u32,
+    },
+    NonCanonicalDpcCounter {
+        register: &'static str,
+        value: u32,
     },
     InvalidMicrocodeDataObservationRange {
         start: u32,
@@ -2715,6 +2719,10 @@ impl fmt::Display for GateError {
             } => write!(
                 f,
                 "{source} DPC observation range [{start:#010x}, {end:#010x}) must be nonempty, 8-byte aligned, and end at or below {limit:#010x}"
+            ),
+            Self::NonCanonicalDpcCounter { register, value } => write!(
+                f,
+                "device evidence {register} value {value:#010x} exceeds the canonical 24-bit DPC counter domain"
             ),
             Self::InvalidMicrocodeDataObservationRange {
                 start,
@@ -4021,14 +4029,25 @@ fn encode_program(out: &mut Vec<u8>, snapshot: crate::ProgramEvidenceSnapshot) {
     }
 }
 
-fn encode_device_snapshot(
+fn try_encode_device_snapshot(
     snapshot: DeviceEvidenceSnapshot,
     executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
     host: fn64_abi::AbiHostEvidenceSnapshot,
     program: crate::ProgramEvidenceSnapshot,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, GateError> {
+    const DPC_COUNTER_MASK: u32 = 0x00ff_ffff;
+    for (register, value) in [
+        ("DPC_CLOCK", snapshot.guest.dpc_clock),
+        ("DPC_BUFBUSY", snapshot.guest.dpc_busy),
+        ("DPC_PIPEBUSY", snapshot.guest.dpc_pipe_busy),
+        ("DPC_TMEM", snapshot.guest.dpc_tmem_busy),
+    ] {
+        if value & !DPC_COUNTER_MASK != 0 {
+            return Err(GateError::NonCanonicalDpcCounter { register, value });
+        }
+    }
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v14\0");
+    out.extend_from_slice(b"fn64.device-evidence.v15\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -4160,7 +4179,7 @@ fn encode_device_snapshot(
     encode_executor_control(&mut out, executor);
     encode_abi_host(&mut out, host);
     encode_program(&mut out, program);
-    out
+    Ok(out)
 }
 
 fn encode_timing_trace(events: &[TraceEvent]) -> Vec<u8> {
@@ -4929,6 +4948,16 @@ mod tests {
         RSP_MEMORY_BANK_SIZE,
     };
 
+    fn encode_device_snapshot(
+        snapshot: DeviceEvidenceSnapshot,
+        executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
+        host: fn64_abi::AbiHostEvidenceSnapshot,
+        program: crate::ProgramEvidenceSnapshot,
+    ) -> Vec<u8> {
+        try_encode_device_snapshot(snapshot, executor, host, program)
+            .expect("test device evidence must be canonical")
+    }
+
     fn admission_generation(value: u64) -> fn64_abi::RspTaskAdmissionGeneration {
         fn64_abi::RspTaskAdmissionGeneration::new(
             std::num::NonZeroU64::new(value).expect("test admission generation must be nonzero"),
@@ -5671,17 +5700,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v27_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v28_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "c35081813d99df5705e5644a94115517ef73e71a44b9dff41a47b01c66a30771"
+            "56e31e60b0b75ebef56d87b98859ae7a3a28223446257383b345fa2bba452224"
         );
     }
 
     #[test]
-    fn schema_v27_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v28_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -6337,8 +6366,91 @@ mod tests {
         );
     }
 
+    fn assert_noncanonical_dpc_counter_rejected(
+        register: &'static str,
+        value: u32,
+        mutate: impl FnOnce(&mut DeviceEvidenceSnapshot),
+    ) {
+        let mut malformed = snapshot(42);
+        mutate(&mut malformed);
+        assert!(matches!(
+            try_encode_device_snapshot(
+                malformed.clone(),
+                executor_snapshot(),
+                host_snapshot(),
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ),
+            Err(GateError::NonCanonicalDpcCounter {
+                register: observed_register,
+                value: observed_value,
+            }) if observed_register == register && observed_value == value
+        ));
+
+        let mut gate = FixedCycleDigestGate::new(42);
+        assert!(matches!(
+            gate.capture_device_snapshot(
+                malformed,
+                executor_snapshot(),
+                host_snapshot(),
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ),
+            Err(GateError::NonCanonicalDpcCounter {
+                register: observed_register,
+                value: observed_value,
+            }) if observed_register == register && observed_value == value
+        ));
+    }
+
     #[test]
-    fn device_state_v14_wire_binds_executor_and_abi_host_families() {
+    fn device_state_v15_rejects_noncanonical_dpc_clock() {
+        const VALUE: u32 = 0x0100_0041;
+        assert_noncanonical_dpc_counter_rejected("DPC_CLOCK", VALUE, |snapshot| {
+            snapshot.guest.dpc_clock = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_rejects_noncanonical_dpc_bufbusy() {
+        const VALUE: u32 = 0x0200_0042;
+        assert_noncanonical_dpc_counter_rejected("DPC_BUFBUSY", VALUE, |snapshot| {
+            snapshot.guest.dpc_busy = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_rejects_noncanonical_dpc_pipebusy() {
+        const VALUE: u32 = 0x0400_0043;
+        assert_noncanonical_dpc_counter_rejected("DPC_PIPEBUSY", VALUE, |snapshot| {
+            snapshot.guest.dpc_pipe_busy = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_rejects_noncanonical_dpc_tmem() {
+        const VALUE: u32 = 0x0800_0044;
+        assert_noncanonical_dpc_counter_rejected("DPC_TMEM", VALUE, |snapshot| {
+            snapshot.guest.dpc_tmem_busy = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_accepts_maximum_canonical_dpc_counters() {
+        let mut device = snapshot(42);
+        device.guest.dpc_clock = 0x00ff_ffff;
+        device.guest.dpc_busy = 0x00ff_ffff;
+        device.guest.dpc_pipe_busy = 0x00ff_ffff;
+        device.guest.dpc_tmem_busy = 0x00ff_ffff;
+        assert!(try_encode_device_snapshot(
+            device,
+            executor_snapshot(),
+            host_snapshot(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn device_state_v15_wire_binds_executor_and_abi_host_families() {
         use fn64_runtime::{
             EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
             ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -6356,7 +6468,7 @@ mod tests {
             host.clone(),
             crate::ProgramEvidenceSnapshot::NoProgram,
         );
-        assert!(encoded.starts_with(b"fn64.device-evidence.v14\0"));
+        assert!(encoded.starts_with(b"fn64.device-evidence.v15\0"));
         assert!(!encoded.starts_with(b"fn64.device-evidence.v12\0"));
         let baseline = sha256_hex(&encode_device_snapshot(
             device.clone(),
@@ -6377,7 +6489,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v14 evidence omitted executor family {}",
+                    "device-state-v15 evidence omitted executor family {}",
                     $name
                 );
             }};
@@ -6477,7 +6589,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v14 evidence omitted ABI HostState family {}",
+                    "device-state-v15 evidence omitted ABI HostState family {}",
                     $name
                 );
             }};
@@ -6594,7 +6706,7 @@ mod tests {
             }
         );
         changed_host!(
-             "next RSP task admission generation",
+            "next RSP task admission generation",
             |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
                 value.next_rsp_task_admission_generation = value
                     .next_rsp_task_admission_generation
@@ -6608,8 +6720,8 @@ mod tests {
                 value.audio_task_execution = fn64_abi::AudioTaskExecutionPolicy::LleAccuracy;
             }
         );
-         changed_host!(
-             "installed ROM identity",
+        changed_host!(
+            "installed ROM identity",
             |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
                 value.rom_installed = true;
                 value.installed_rom = Some(fn64_abi::InstalledRomEvidenceSnapshot {
@@ -6678,7 +6790,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v14_wire_binds_complete_rsp_interpreter_state() {
+    fn device_state_v15_wire_binds_complete_rsp_interpreter_state() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let baseline_state = rsp_architectural_state(|_| {});
@@ -6700,7 +6812,7 @@ mod tests {
                 assert_ne!(
                     digest(rsp_architectural_state($body)),
                     baseline,
-                    "device-state-v14 evidence omitted RSP interpreter family {}",
+                    "device-state-v15 evidence omitted RSP interpreter family {}",
                     $name
                 );
             }};
@@ -6817,12 +6929,12 @@ mod tests {
         assert_ne!(
             ordered_digest(false),
             ordered_digest(true),
-            "device-state-v14 evidence omitted queued DPC submission order"
+            "device-state-v15 evidence omitted queued DPC submission order"
         );
     }
 
     #[test]
-    fn device_state_v14_wire_distinguishes_rsp_interpreter_variants() {
+    fn device_state_v15_wire_distinguishes_rsp_interpreter_variants() {
         let state = rsp_architectural_state(|_| {});
         let encoded = |value| {
             let mut out = Vec::new();
@@ -6894,7 +7006,7 @@ mod tests {
                     admission_generation: admission_generation(8),
                 },
             ),
-            "device-state-v14 unavailable evidence omitted task admission generation"
+            "device-state-v15 unavailable evidence omitted task admission generation"
         );
         assert_ne!(
             encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
@@ -6905,12 +7017,12 @@ mod tests {
                 task_offset: 0x80,
                 admission_generation: admission_generation(8),
             }),
-            "device-state-v14 in-flight evidence omitted task admission generation"
+            "device-state-v15 in-flight evidence omitted task admission generation"
         );
     }
 
     #[test]
-    fn device_state_v14_wire_distinguishes_rsp_task_admission_generations() {
+    fn device_state_v15_wire_distinguishes_rsp_task_admission_generations() {
         let encoded = |host| {
             let mut out = Vec::new();
             encode_abi_host(&mut out, host);
@@ -6934,7 +7046,7 @@ mod tests {
         assert_ne!(
             encoded(loaded_first),
             encoded(loaded_second),
-            "device-state-v14 loaded-task evidence omitted admission generation"
+            "device-state-v15 loaded-task evidence omitted admission generation"
         );
 
         let mut lineage_first = baseline.clone();
@@ -6952,7 +7064,7 @@ mod tests {
         assert_ne!(
             encoded(lineage_first),
             encoded(lineage_second),
-            "device-state-v14 lineage evidence omitted admission generation"
+            "device-state-v15 lineage evidence omitted admission generation"
         );
 
         let mut next_first = baseline.clone();
@@ -6962,12 +7074,12 @@ mod tests {
         assert_ne!(
             encoded(next_first),
             encoded(next_second),
-            "device-state-v14 evidence omitted next admission generation"
+            "device-state-v15 evidence omitted next admission generation"
         );
     }
 
     #[test]
-    fn device_state_v14_wire_distinguishes_rsp_task_lineage_phases() {
+    fn device_state_v15_wire_distinguishes_rsp_task_lineage_phases() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let digest = |phase| {
@@ -7007,7 +7119,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v14_wire_distinguishes_every_audio_execution_policy() {
+    fn device_state_v15_wire_distinguishes_every_audio_execution_policy() {
         let digest = |policy| {
             let mut host = host_snapshot();
             host.audio_task_execution = policy;
@@ -7038,7 +7150,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v14_wire_distinguishes_native_program_classes_and_identity() {
+    fn device_state_v15_wire_distinguishes_native_program_classes_and_identity() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
@@ -7068,7 +7180,7 @@ mod tests {
 
     #[cfg(feature = "recomp-rs")]
     #[test]
-    fn device_state_v14_wire_binds_typed_program_identity_and_dynamic_state() {
+    fn device_state_v15_wire_binds_typed_program_identity_and_dynamic_state() {
         use fn64_abi::recompiled::{
             LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
             RecompiledProgramEvidenceSnapshot,
@@ -7480,11 +7592,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v26".to_owned();
+        stale_schema.schema = "fn64.release-gate.v27".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v26"
+                if schema == "fn64.release-gate.v27"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -7501,7 +7613,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v27_report_wire_binds_every_release_environment_field() {
+    fn schema_v28_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -8362,7 +8474,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v27_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v28_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),

@@ -1,0 +1,123 @@
+{
+  "schema": "fn64.release-gate.v28",
+  "scenario": "synthetic-native-archive-runtime-device-render-fixed-cycle-v1",
+  "input_sha256": "2f649b8679196b22f2809dcdb012294ca0153faff2d772141762d42155241c76",
+  "guest_cycle": 1562500,
+  "artifacts": [
+    {
+      "kind": "framebuffer",
+      "bytes": 16,
+      "sha256": "1d0b1c95617fee6534fcd749643b469d148ece8ef0971d8343ed0fd24f8b8285"
+    },
+    {
+      "kind": "audio",
+      "bytes": 32,
+      "sha256": "37d37faa860b7183c4b7b8fe5ad4263c850baf0cc38eb575b2b28fdf40ca5058"
+    },
+    {
+      "kind": "memory",
+      "bytes": 8388608,
+      "sha256": "ceb173d12ce74e73e446e04f592bc54835e4f190fbdeaad1ece06f8d374715e8"
+    },
+    {
+      "kind": "device_state",
+      "bytes": 10152,
+      "sha256": "38784c03ae9171b8ca20bdf97f6aed53b7d9daddca11de3ffd95274a38657df0"
+    },
+    {
+      "kind": "timing_trace",
+      "bytes": 821,
+      "sha256": "2cc0a8cc6df0dbfab086c7809ed2237cb5dce9788cedb28d4492e7df1bbed41b"
+    }
+  ],
+  "artifact_root_sha256": "dd32633435f0b9a9f56593a6b328267c662dfafa67017b8b0e5ab4c842a2a8ab",
+  "unsupported_instrumentation": {
+    "schema": "fn64.unsupported-instrumentation.v1",
+    "sha256": "ed12331755d6875c5a9a08b5c5fded952d2cdf2aa8ada88a93de2fbeab3f81fd"
+  },
+  "closure": [
+    { "name": "ai.pcm", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "controller.standard-input-read", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "cpu.thread-switch", "observations": 11, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "device.ai-dma-complete", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "device.pi-dma-commit", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "device.si-dma-commit", "observations": 3, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "device.sp-task-load-commit", "observations": 2, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "execution.unsupported-event-source", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "memory.rdram", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "os.message-queue", "observations": 11, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "rsp.audio-task", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "rsp.graphics-task", "observations": 2, "status": "exercised_zero_unsupported", "unsupported": [] },
+    { "name": "vi.framebuffer", "observations": 1, "status": "exercised_zero_unsupported", "unsupported": [] }
+  ],
+  "execution_destinations": {
+    "source": {
+      "kind": "native_archive",
+      "artifact_sha256": "bd360ac4b77418efbbd09c47d7880388f66b9ae89ac420af4783c606ad75d9da"
+    },
+    "total_observations": 1,
+    "unique_destinations": 1,
+    "ordered_sha256": "43d566a9cf8aca4924cf3da55d7f7f32a20a751ecf8ad32f23829071fa440718",
+    "unique_sha256": "0f5209f5aa788a9d355c77965262a4f343a3d8b6072b840a4f574e01b1d7d588",
+    "ordered": [
+      {
+        "guest_cycle": 0,
+        "destination": {
+          "lane": "native",
+          "section_index": 0,
+          "function_offset": 0,
+          "link_vram": 2147487744
+        }
+      }
+    ],
+    "unique": [
+      {
+        "destination": {
+          "lane": "native",
+          "section_index": 0,
+          "function_offset": 0,
+          "link_vram": 2147487744
+        },
+        "observations": 1
+      }
+    ]
+  },
+  "rsp_rdp": {
+    "total_observations": 3,
+    "ordered_sha256": "26250d6e4fad515cbce83881fb6373d4ef1744fe5a19f1bee331ed7c9b93518d",
+    "ordered": [
+      {
+        "guest_cycle": 750,
+        "observation": {
+          "kind": "dram_dpc_committed",
+          "start": 2048,
+          "end": 2080,
+          "command_sha256": "d139d34f0949ff5710c163cd74e5dbc6b06b5da86ba9bc846ceb94ecb1c93378"
+        }
+      },
+      {
+        "guest_cycle": 1000,
+        "observation": {
+          "kind": "microcode_recognition",
+          "task_address": 1536,
+          "imem_generation": 2,
+          "text_sha256": "f0a2066bd5e39daf238452db7399162990a9975e023579236adb38decfd8b160",
+          "data_address": 1920,
+          "data_bytes": 8,
+          "data_sha256": "fb714505dd3b2600138555037caa205d8ee91b2b3beadee482fd0fab103e7085",
+          "family": null
+        }
+      },
+      {
+        "guest_cycle": 1000,
+        "observation": {
+          "kind": "xbus_dpc_committed",
+          "start": 0,
+          "end": 40,
+          "command_sha256": "3819185a21f2e3fa74c8214f813cd09555775a8c90da83564c7536436f30c0ec"
+        }
+      }
+    ]
+  },
+  "report_sha256": "ec5fe74500ec5c2eff2d407b63dc6a38835a5567c8433a61065261532fea456c"
+}
