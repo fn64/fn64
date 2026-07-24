@@ -1,19 +1,29 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-/// The `OOT_*` spellings these knobs shipped under before they were renamed to
-/// the game-agnostic `FN64_*` prefix. Nothing about dumping PCM or skipping
-/// audio ucode is OoT-specific; the names were bring-up residue.
+/// The `OOT_*` spellings these diagnostic knobs shipped under before they were
+/// renamed to the game-agnostic `FN64_*` prefix. The audio skip knob is retired
+/// entirely below because task execution policy must be explicit and typed.
 ///
 /// An unset env var means "feature off", so a bare rename would make a stale
-/// `OOT_SKIP_AUDIO_UCODE=1` invocation silently do nothing -- the run would
+/// `OOT_DUMP_AUDIO_PCM=1` invocation silently do nothing -- the run would
 /// look fine and quietly measure the wrong thing. Trap it instead.
 const RENAMED_ENV_VARS: &[(&str, &str)] = &[
-    ("OOT_SKIP_AUDIO_UCODE", "FN64_SKIP_AUDIO_UCODE"),
     ("OOT_DUMP_AUDIO_PCM", "FN64_DUMP_AUDIO_PCM"),
     ("OOT_DUMP_AUDIO_TASK", "FN64_DUMP_AUDIO_TASK"),
     ("OOT_AUDIO_UCODE_TIMING", "FN64_AUDIO_UCODE_TIMING"),
     ("OOT_PHASE_TIMING", "FN64_PHASE_TIMING"),
+];
+
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "OOT_SKIP_AUDIO_UCODE",
+        "call fn64_abi::set_audio_task_diagnostic_skip() explicitly",
+    ),
+    (
+        "FN64_SKIP_AUDIO_UCODE",
+        "call fn64_abi::set_audio_task_diagnostic_skip() explicitly",
+    ),
 ];
 
 /// Panic if any pre-rename `OOT_*` knob is still set, naming its replacement.
@@ -26,6 +36,11 @@ pub(crate) fn assert_no_legacy_env_vars() {
     for (old, new) in RENAMED_ENV_VARS {
         if std::env::var_os(old).is_some() {
             panic!("{}", legacy_env_var_message(old, new));
+        }
+    }
+    for (name, replacement) in RETIRED_ENV_VARS {
+        if std::env::var_os(name).is_some() {
+            panic!("{name} was retired; {replacement}");
         }
     }
 }
@@ -793,6 +808,25 @@ pub enum GraphicsTaskExecutionPolicy {
     HleOptimized,
     /// Execute every loaded graphics microcode instruction through LLE.
     LleAccuracy,
+}
+
+/// Installed-ROM executor for admitted `M_AUDTASK` microcode.
+///
+/// `Translated` identifies the exact host artifact but is not an accuracy
+/// claim: the callback ABI does not itself prove that artifact corresponds to
+/// the task's complete live IMEM image. Fixed-cycle release evidence therefore
+/// admits only `LleAccuracy`, which executes that image directly. The explicit
+/// diagnostic mode preserves fast render-only probes without letting a skipped
+/// synth masquerade as an unconfigured or executed task.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioTaskExecutionPolicy {
+    #[default]
+    Unconfigured,
+    Translated {
+        artifact_sha256: [u8; 32],
+    },
+    LleAccuracy,
+    DiagnosticSkip,
 }
 
 /// Exact registered renderer state frozen for fixed-cycle release evidence.
@@ -2793,32 +2827,113 @@ pub fn render_environment_evidence_snapshot() -> RenderEnvironmentEvidenceSnapsh
 /// IMEM text in and instead needs the task structure to seed its RSP DMEM
 /// (rspboot loads the 64-byte OSTask into DMEM 0xFC0; the audio ucode reads
 /// `ucode_data`@0x18 from there). `RspExitReason` is an RSPRecomp-defined enum
-/// this crate does not interpret beyond "it ran" -- a plain `u32` return.
+/// this crate accepts only at the public BREAK discriminant (`0`) -- a plain
+/// `u32` return keeps the generated module's enum out of this ABI.
 pub type AudioUcodeFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
 
 thread_local! {
-    /// The real, out-of-tree translated audio ucode function, if the host
-    /// (the boot harness) has linked and registered one via
-    /// `set_audio_ucode_fn`. `None` in any test/context that never calls
-    /// that -- `osSpTaskYielded_recomp` treats that as "can't actually run
-    /// the ucode" (see its doc comment), never a silent substitute.
+    /// The out-of-tree translated audio ucode paired atomically with the
+    /// installed ROM's `Translated` policy. All other policies own `None`.
     static AUDIO_UCODE_FN: Cell<Option<AudioUcodeFn>> = const { Cell::new(None) };
 }
 
-/// Register the real translated audio ucode function. Called once by the
-/// boot harness (`examples/wm2000-boot`) after linking WM2000's
-/// out-of-tree-compiled `wm2000_audio.cpp` -- `fn64-abi` never contains
-/// this function's body itself (`README.md`'s "no game content ships in
-/// this repo" rule), only the call-site plumbing that invokes whatever the
-/// harness supplies.
+pub(crate) fn reset_audio_task_execution_for_rom() {
+    with_host(|host| {
+        host.audio_task_execution = AudioTaskExecutionPolicy::Unconfigured;
+        host.audio_task_execution_admitted = false;
+        host.audio_task_execution_started = false;
+    });
+    AUDIO_UCODE_FN.with(|cell| cell.set(None));
+}
+
+fn install_audio_task_execution(policy: AudioTaskExecutionPolicy, callback: Option<AudioUcodeFn>) {
+    assert_no_legacy_env_vars();
+    assert_ne!(policy, AudioTaskExecutionPolicy::Unconfigured);
+    assert_eq!(
+        matches!(policy, AudioTaskExecutionPolicy::Translated { .. }),
+        callback.is_some(),
+        "translated audio execution must own exactly one callback"
+    );
+    with_host(|host| {
+        assert!(
+            host.rom_installed,
+            "audio task execution policy requires an installed ROM"
+        );
+        assert_eq!(
+            host.audio_task_execution,
+            AudioTaskExecutionPolicy::Unconfigured,
+            "audio task execution policy was already installed for this ROM as {:?}",
+            host.audio_task_execution
+        );
+        assert!(
+            !host.audio_task_execution_admitted && !host.audio_task_execution_started,
+            "audio task execution policy cannot be installed after an audio task was admitted"
+        );
+        host.audio_task_execution = policy;
+    });
+    AUDIO_UCODE_FN.with(|cell| cell.set(callback));
+}
+
+/// Atomically register a translated audio ucode and its exact host artifact
+/// identity. The identity distinguishes executable configurations but does not
+/// prove a correspondence with arbitrary live IMEM; release evidence uses LLE.
 ///
 /// # Safety
 /// `f` must have the real `RspExitReason(uint8_t*, uint32_t)` signature
 /// RSPRecomp generates and must remain valid for the process's lifetime
 /// (true for a file-scope C function with static storage duration, which is
-/// what RSPRecomp emits).
-pub unsafe fn set_audio_ucode_fn(f: AudioUcodeFn) {
-    AUDIO_UCODE_FN.with(|cell| cell.set(Some(f)));
+/// what RSPRecomp emits). `artifact_sha256` must identify the exact translated
+/// module containing `f`.
+pub unsafe fn set_translated_audio_ucode(f: AudioUcodeFn, artifact_sha256: [u8; 32]) {
+    assert_ne!(
+        artifact_sha256, [0; 32],
+        "translated audio artifact identity cannot be all zero"
+    );
+    install_audio_task_execution(
+        AudioTaskExecutionPolicy::Translated { artifact_sha256 },
+        Some(f),
+    );
+}
+
+/// Execute every admitted audio microcode instruction through the clean-room
+/// RSP interpreter.
+pub fn set_audio_task_lle_accuracy() {
+    install_audio_task_execution(AudioTaskExecutionPolicy::LleAccuracy, None);
+}
+
+/// Explicitly skip audio synthesis for render-only diagnostic probes.
+/// Fixed-cycle release evidence rejects this policy.
+pub fn set_audio_task_diagnostic_skip() {
+    install_audio_task_execution(AudioTaskExecutionPolicy::DiagnosticSkip, None);
+}
+
+fn require_audio_task_execution_policy(
+    task_addr: RdramAddr,
+    header: &OsTaskHeader,
+) -> AudioTaskExecutionPolicy {
+    debug_assert_eq!(header.task_type, M_AUDTASK);
+    let policy = with_host(|host| {
+        host.audio_task_execution_started = true;
+        host.audio_task_execution
+    });
+    if policy == AudioTaskExecutionPolicy::Unconfigured {
+        let context = format!(
+            "task={:#010x} type={} ucode={:#010x}/size={:#x}",
+            task_addr.offset(),
+            header.task_type,
+            header.ucode,
+            header.ucode_size
+        );
+        fn64_runtime::record_unsupported_event(
+            fn64_runtime::UnsupportedSubsystem::Audio,
+            "audio.task.missing-execution-policy",
+            context.clone(),
+            Some(fn64_runtime::Cycles::new(crate::sim_time())),
+            fn64_runtime::UnsupportedDisposition::LoudTrap,
+        );
+        panic!("audio.task.missing-execution-policy: {context}")
+    }
+    policy
 }
 
 /// Read the public libultra manual's documented `OSTask_t` field layout
@@ -2906,6 +3021,9 @@ fn loaded_rsp_task_from_header(task_addr: RdramAddr, header: OsTaskHeader) -> Lo
 
 fn retain_loaded_rsp_task(loaded: LoadedRspTask) {
     with_host(|host| {
+        if loaded.header.task_type == M_AUDTASK {
+            host.audio_task_execution_admitted = true;
+        }
         if let Some(replaced) = host.loaded_rsp_task.take() {
             let remove_replaced_lineage = host
                 .rsp_task_lineages
@@ -3210,7 +3328,9 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         None
     };
     retain_started_rsp_task_lineage(loaded, initial_microcode_data);
-    with_executor(|exec| exec.start_task(header));
+    if header.task_type != M_AUDTASK {
+        with_executor(|exec| exec.start_task(header));
+    }
 
     // Kicking the RSP is where the selected task effect runs, so the work
     // happens here -- this is the path OoT uses (Load then
@@ -3399,8 +3519,46 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             }
         }
     } else if header.task_type == M_AUDTASK {
-        unsafe { dispatch_audio_task(rdram, o, &hle_header) };
-        fn64_render::DpFullSyncStatus::NotReached
+        match audio_policy.expect("audio task must preflight its execution policy") {
+            AudioTaskExecutionPolicy::Unconfigured => {
+                unreachable!("audio execution policy preflight rejects unconfigured tasks")
+            }
+            AudioTaskExecutionPolicy::Translated { .. } => {
+                let callback = AUDIO_UCODE_FN
+                    .with(Cell::get)
+                    .expect("translated audio execution lost its atomically registered callback");
+                unsafe { dispatch_audio_task(rdram, o, &hle_header, callback) };
+                with_executor(|exec| exec.start_task(header));
+                fn64_render::DpFullSyncStatus::NotReached
+            }
+            AudioTaskExecutionPolicy::LleAccuracy => {
+                let entry = hle_entry
+                    .take()
+                    .expect("audio accuracy LLE requires an admitted task entry");
+                let pre_ucode_steps = entry.pre_ucode_steps();
+                let lle = unsafe {
+                    dispatch_lle_task(
+                        rdram,
+                        task_addr,
+                        false,
+                        entry.into_lle_machine_state(),
+                        None,
+                        None,
+                    )
+                };
+                crate::pi::start_live_rcp_task_with_latency(
+                    rcp_completion_plan(lle.dp_full_sync, "audio accuracy LLE"),
+                    pre_ucode_steps.saturating_add(lle.steps),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("osSpTaskStartGo_recomp audio accuracy LLE completion: {error}")
+                });
+                with_executor(|exec| exec.start_task(header));
+                retire_rsp_task_lineage_after_synchronous_result(task_addr, "audio accuracy LLE");
+                return;
+            }
+            AudioTaskExecutionPolicy::DiagnosticSkip => fn64_render::DpFullSyncStatus::NotReached,
+        }
     } else {
         let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None, None, None) };
         crate::pi::start_live_rcp_task_with_latency(
@@ -6588,6 +6746,8 @@ mod tests {
         const RSP_DONE_MSG: u32 = 667;
         const RDP_DONE_MSG: u32 = 668;
 
+        crate::load_rom(Vec::new());
+        set_audio_task_diagnostic_skip();
         let interrupt_q = RdramAddr::from_offset(0x0009_1000);
         with_executor(|exec| {
             exec.create_mesg_queue(interrupt_q, 4);
@@ -6753,10 +6913,10 @@ mod tests {
             SEEN_UCODE_ADDR.store(task_offset, Ordering::SeqCst);
             0
         }
-        unsafe { set_audio_ucode_fn(fake_ucode) };
+        crate::load_rom(Vec::new());
+        unsafe { set_translated_audio_ucode(fake_ucode, [0x51; 32]) };
         CALLED.store(false, Ordering::SeqCst);
         SEEN_UCODE_ADDR.store(0, Ordering::SeqCst);
-        crate::load_rom(Vec::new());
 
         let mut rdram = vec![0u8; 128];
         let header_off = 0x20usize;
@@ -6791,10 +6951,10 @@ mod tests {
             SEEN_OFFSET.store(task_offset, Ordering::SeqCst);
             0
         }
-        unsafe { set_audio_ucode_fn(fake_ucode) };
+        crate::load_rom(Vec::new());
+        unsafe { set_translated_audio_ucode(fake_ucode, [0x52; 32]) };
         CALLED.store(false, Ordering::SeqCst);
         SEEN_OFFSET.store(0, Ordering::SeqCst);
-        crate::load_rom(Vec::new());
         crate::set_trace_enabled(true);
 
         let mut rdram = vec![0u8; 128];
@@ -6875,7 +7035,7 @@ mod tests {
         const HEADER: usize = 0x40;
         const IMAGE: usize = 0x200;
         crate::load_rom(Vec::new());
-        unsafe { set_audio_ucode_fn(fake_ucode) };
+        unsafe { set_translated_audio_ucode(fake_ucode, [0x53; 32]) };
         CALLED.store(false, Ordering::SeqCst);
         let mut rdram = vec![0u8; IMAGE + fn64_runtime::RSP_MEMORY_BANK_SIZE];
         for (field, value) in [

@@ -103,10 +103,12 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         host.save_operations.clear();
         host.controller_operations.clear();
         host.rsp_rdp_observations.clear();
+        host.rsp_boot_images.clear();
         host.loaded_rsp_task = None;
         host.rsp_task_lineages.clear();
         host.native_execution_destinations.clear();
     });
+    crate::task_dispatch::reset_audio_task_execution_for_rom();
 }
 
 /// Register the guest BSS address of libultra's cartridge `OSPiHandle`.

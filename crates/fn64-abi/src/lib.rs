@@ -805,6 +805,7 @@ pub struct AbiHostEvidenceSnapshot {
     pub rsp_boot_images: Vec<RspBootImageEvidenceSnapshot>,
     pub loaded_rsp_task: Option<LoadedRspTaskEvidenceSnapshot>,
     pub rsp_task_lineages: Vec<RspTaskLineageEvidenceSnapshot>,
+    pub audio_task_execution: task_dispatch::AudioTaskExecutionPolicy,
     pub rom_installed: bool,
     pub installed_rom: Option<InstalledRomEvidenceSnapshot>,
     pub cartridge_save: CartridgeSaveEvidenceSnapshot,
@@ -889,6 +890,12 @@ struct HostState {
     /// observation history so a yielded reload cannot inherit evidence from
     /// an unrelated task that reused the same guest address.
     rsp_task_lineages: std::collections::HashMap<u32, task_dispatch::RspTaskLineage>,
+    /// Installed-ROM audio microcode executor selected atomically with any
+    /// translated callback identity. It is reset only when a new ROM is
+    /// installed and is immutable for that ROM session.
+    audio_task_execution: task_dispatch::AudioTaskExecutionPolicy,
+    audio_task_execution_admitted: bool,
+    audio_task_execution_started: bool,
     /// Guest-visible `OSPiHandle*` returned by `osCartRomInit`. The handle
     /// storage is game-owned BSS, so the boot host supplies its link address;
     /// leaving it unset is a loud trap rather than returning a stale `$v0`.
@@ -1002,6 +1009,9 @@ impl Default for HostState {
             rsp_boot_images: std::collections::HashMap::new(),
             loaded_rsp_task: None,
             rsp_task_lineages: std::collections::HashMap::new(),
+            audio_task_execution: task_dispatch::AudioTaskExecutionPolicy::Unconfigured,
+            audio_task_execution_admitted: false,
+            audio_task_execution_started: false,
             cart_rom_handle_vram: None,
             flash_handle_vram: None,
             leo_disk: None,
@@ -1209,6 +1219,11 @@ fn classify_host_evidence_fields(host: &HostState) {
         rsp_boot_images: _,
         loaded_rsp_task: _,
         rsp_task_lineages: _,
+        audio_task_execution: _,
+        // Configuration guard only; with an immutable installed policy it
+        // cannot change a later guest result independently of that policy.
+        audio_task_execution_admitted: _,
+        audio_task_execution_started: _,
         cart_rom_handle_vram: _,
         flash_handle_vram: _,
         leo_disk: _,
@@ -1343,6 +1358,7 @@ pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
             rsp_boot_images,
             loaded_rsp_task,
             rsp_task_lineages,
+            audio_task_execution: host.audio_task_execution,
             rom_installed: host.rom_installed,
             installed_rom: host.installed_rom,
             cartridge_save: host.cartridge_save,
