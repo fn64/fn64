@@ -7,7 +7,14 @@
 # Inputs are named and declared, never defaulted (DESIGN.md section 1.0):
 #   FN64_DISCOVER_NW4E_ROM   path to a WWF No Mercy (U) v1.1 .z64
 #   FN64_DISCOVER_NWXE_ROM   path to a WWF WrestleMania 2000 (U) .z64
-#   FN64_DISCOVER_OOT_ROM    path to an OoT NTSC 1.0 .z64 (gate_coverage only)
+#   FN64_DISCOVER_OOT_ROM    path to an OoT NTSC 1.0 .z64
+#   FN64_DISCOVER_NW4E_DUMP  } held-out answer keys. Optional for the script to
+#   FN64_DISCOVER_NWXE_DUMP  } run, but several digests below -- notably
+#   FN64_DISCOVER_OOT_DUMP   } expected_closure -- were recorded with all three
+#                            } set, because a gate's stdout (and therefore its
+#                            } hash) changes with which ROMs it grades. Running
+#                            } with the ROMs alone yields a different but
+#                            } equally deterministic digest and a false failure.
 #
 # Usage: scripts/gate-determinism.sh [runs]   (default 10)
 set -eu
@@ -44,8 +51,21 @@ expected_d1_overlays=9b0dc15f92aac10586edf98a02873c0acfc57f4ff6f00f857546fcb1ec1
 expected_d1_oot_overlays=c8fcb6a1fb013492cce964e71c4985ba10aa197cc0e66b9cbab57ed23493ecf7
 # gate_closure: per-ROM execution-closure scoreboard (reachable destinations
 # by exact_aot/block_aot/dynamic_mips/unsupported). The "unsupported" count is
-# the distance to a full-game build. Needs all 3 AKI+OoT ROMs.
-expected_closure=c8455706cbc12a7c7fc5d771017a70217236d0cc66663b112356554d4ef5e207
+# the distance to a full-game build.
+#
+# This digest needs ALL SIX vars, not just the three ROMs: the gate prints a
+# skip line per unset ROM and grades per ROM whose DUMP is set, so its stdout
+# -- and therefore this hash -- changes with any of
+#   FN64_DISCOVER_{NW4E,NWXE,OOT}_{ROM,DUMP}
+# The three DUMP vars are NOT required by this script's preamble, so running
+# it with only the ROMs set produces a different, equally deterministic digest
+# and a false failure here. Recorded under all six.
+#
+# Moved c8455706 -> efd25aca when OoT gained mechanical VROM overlay
+# composition and the static request-DMA scan: composed banks 1 -> 923 and the
+# gate grew an open_indirect_site clarification line. See the OoT rows in
+# docs/DISCOVER-PLAN.md for the numbers behind the move.
+expected_closure=efd25aca320304290166087b4aba4d5e2f2e14ab08740f8e8fd1f4482752f6ff
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
 # digest moved when Phase-6 indirect closure strengthened: unresolved_indirect
