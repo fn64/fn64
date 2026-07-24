@@ -24,6 +24,7 @@ type Lookup = fn(u32) -> RecompFunc;
 type CShim = unsafe extern "C" fn(*mut u8, *mut CContext);
 const STATUS_FR: u32 = 1 << 26;
 const THREAD_RETURN_SENTINEL: u32 = 0xFFFF_FFFC;
+const INITIAL_FPCSR: u32 = crate::system::FPCSR_FS | crate::system::FPCSR_EV;
 pub type ProgramEntryLookup = fn(GuestPc) -> Result<ExecutionKey, CpuFault>;
 pub type ProgramTransferLookup = fn(BankId, GuestPc) -> Result<ExecutionKey, CpuFault>;
 pub type LiveGenerationBuilder = fn(&[u8], u64) -> Result<(CodeBank, GeneratedBankRunner), String>;
@@ -1150,7 +1151,7 @@ pub(super) unsafe fn run_registered_entry(
         // SAFETY: inherited from the caller's shared-allocation contract.
         let bytes = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
         let mut mem = Rdram::new(bytes);
-        let mut ctx = RsContext::new();
+        let mut ctx = new_osthread_context();
         ctx.set_r(4, arg);
         ctx.set_r(29, sp);
         ctx.set_r32(31, THREAD_RETURN_SENTINEL as i32);
@@ -1165,7 +1166,7 @@ pub(super) unsafe fn run_registered_entry(
     // SAFETY: inherited from the caller's shared-allocation contract.
     let bytes = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
     let mut mem = Rdram::new(bytes);
-    let mut ctx = RsContext::new();
+    let mut ctx = new_osthread_context();
     ctx.set_r(4, arg);
     ctx.set_r(29, sp);
     lookup(entry_vram)(&mut ctx, &mut mem);
@@ -1283,6 +1284,15 @@ fn is_test_c_shim(shim: CShim) -> bool {
 
 fn is_admitted_fr_stable_c_shim(shim: CShim) -> bool {
     is_generated_adapter_c_shim(shim)
+        || [
+            super::__osInitialize_common_recomp as CShim,
+            super::osInitialize_recomp as CShim,
+            super::__osInitialize_msp_recomp as CShim,
+            super::__osInitialize_kmc_recomp as CShim,
+            super::__osInitialize_isv_recomp as CShim,
+        ]
+        .into_iter()
+        .any(|allowed| std::ptr::fn_addr_eq(allowed, shim))
         || cfg!(test) && {
             #[cfg(test)]
             {
@@ -1325,6 +1335,81 @@ fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static str, shim: CS
     copy_c_back(&c, ctx);
 }
 
+/// Construct the architectural context installed by public `osCreateThread`.
+/// The libultra `osCreateThread` manual's DESCRIPTION section specifies that
+/// every new thread starts with denormal-result flushing and Invalid exceptions
+/// enabled. Keeping this in the context makes coroutine suspension itself the
+/// FCSR save/restore boundary.
+fn new_osthread_context() -> RsContext {
+    let mut ctx = RsContext::new();
+    ctx.write_fcr(31, INITIAL_FPCSR);
+    ctx
+}
+
+fn initialize_typed_fpcsr(
+    ctx: &mut RsContext,
+    mem: &mut Rdram<'_>,
+    name: &'static str,
+    shim: CShim,
+) {
+    call_c(ctx, mem, name, shim);
+    ctx.write_fcr(31, INITIAL_FPCSR);
+}
+
+pub fn os_initialize_common(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_common_recomp",
+        super::__osInitialize_common_recomp,
+    );
+}
+
+pub fn os_initialize(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(ctx, mem, "osInitialize_recomp", super::osInitialize_recomp);
+}
+
+pub fn os_initialize_msp(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_msp_recomp",
+        super::__osInitialize_msp_recomp,
+    );
+}
+
+pub fn os_initialize_kmc(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_kmc_recomp",
+        super::__osInitialize_kmc_recomp,
+    );
+}
+
+pub fn os_initialize_isv(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+    initialize_typed_fpcsr(
+        ctx,
+        mem,
+        "__osInitialize_isv_recomp",
+        super::__osInitialize_isv_recomp,
+    );
+}
+
+/// Typed `__osSetFpcCsr`: use the same per-OSThread FCSR authority as emitted
+/// CFC1/CTC1. A write which requests an exception stays loud because a host
+/// call cannot return the arbitrary-PC lane's typed guest transfer.
+pub fn os_set_fpc_csr(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
+    let previous = ctx.read_fcr(31);
+    ctx.write_fcr(31, ctx.r_u32(4));
+    ctx.set_r32(2, previous as i32);
+    if ctx.fcsr_exception_pending() {
+        fn64_recomp_rs::trap_unsupported(
+            "__osSetFpcCsr wrote an enabled FCSR cause through a host-call boundary",
+        );
+    }
+}
+
 macro_rules! c_adapters {
     ($(($recompiled:ident, $shim:ident)),+ $(,)?) => {
         fn is_generated_adapter_c_shim(shim: CShim) -> bool {
@@ -1340,14 +1425,10 @@ macro_rules! c_adapters {
 }
 
 c_adapters!(
-    (os_initialize_common, __osInitialize_common_recomp),
     (is_prout_sync_printf, is_proutSyncPrintf_recomp),
     (check_hardware_msp, __checkHardware_msp_recomp),
     (check_hardware_kmc, __checkHardware_kmc_recomp),
     (check_hardware_isv, __checkHardware_isv_recomp),
-    (os_initialize_msp, __osInitialize_msp_recomp),
-    (os_initialize_kmc, __osInitialize_kmc_recomp),
-    (os_initialize_isv, __osInitialize_isv_recomp),
     (os_rdb_send, __osRdbSend_recomp),
     (os_create_thread, osCreateThread_recomp),
     (os_start_thread, osStartThread_recomp),
@@ -1396,7 +1477,6 @@ c_adapters!(
     (os_virtual_to_physical, osVirtualToPhysical_recomp),
     (os_create_pi_manager, osCreatePiManager_recomp),
     (os_si_raw_start_dma, __osSiRawStartDma_recomp),
-    (os_initialize, osInitialize_recomp),
     (os_ai_set_frequency, osAiSetFrequency_recomp),
     (os_ai_get_length, osAiGetLength_recomp),
     (os_ai_set_next_buffer, osAiSetNextBuffer_recomp),
@@ -1409,7 +1489,6 @@ c_adapters!(
     (os_get_thread_id, osGetThreadId_recomp),
     (os_get_time, osGetTime_recomp),
     (os_set_count, osSetCount_recomp),
-    (os_set_fpc_csr, __osSetFpcCsr_recomp),
     (os_sp_task_yielded, osSpTaskYielded_recomp),
     (os_create_vi_manager, osCreateViManager_recomp),
     (os_vi_set_event, osViSetEvent_recomp),
@@ -1573,6 +1652,9 @@ mod tests {
         static REWRITE_B_ENTRIES: std::cell::RefCell<Vec<ExecutionKey>> = const {
             std::cell::RefCell::new(Vec::new())
         };
+        static BOOT_FPCSR_OBSERVATIONS: std::cell::RefCell<Vec<u32>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
     }
 
     fn evidence_callable(_ctx: &mut RsContext, _mem: &mut Rdram<'_>) {}
@@ -1585,6 +1667,12 @@ mod tests {
 
     fn alternate_evidence_lookup(_vram: u32) -> RecompFunc {
         alternate_evidence_callable
+    }
+
+    fn observe_thread0_fpcsr_boot(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().push(ctx.read_fcr(31)));
+        os_initialize(ctx, mem);
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().push(ctx.read_fcr(31)));
     }
 
     fn unused_evidence_builder(
@@ -2938,6 +3026,137 @@ mod tests {
         ctx.set_r(2, 0);
         os_get_sr(&mut ctx, &mut mem);
         assert_eq!(ctx.r_u32(2), 0x3400_0001);
+    }
+
+    #[test]
+    fn typed_fpcsr_setter_and_new_thread_use_the_generated_cop1_authority() {
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut first = new_osthread_context();
+        let mut second = new_osthread_context();
+
+        assert_eq!(first.read_fcr(31), INITIAL_FPCSR);
+        assert_eq!(second.read_fcr(31), INITIAL_FPCSR);
+
+        first.set_r(4, 3);
+        os_set_fpc_csr(&mut first, &mut mem);
+        assert_eq!(first.r_u32(2), INITIAL_FPCSR);
+        assert_eq!(first.read_fcr(31), 3);
+        assert_eq!(second.read_fcr(31), INITIAL_FPCSR);
+
+        second.set_r(4, 2);
+        os_set_fpc_csr(&mut second, &mut mem);
+        assert_eq!(second.r_u32(2), INITIAL_FPCSR);
+        assert_eq!(second.read_fcr(31), 2);
+        assert_eq!(first.read_fcr(31), 3);
+
+        let pending: u32 = (1 << 16) | (1 << 11);
+        first.set_r(4, u64::from(pending));
+        let loud = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            os_set_fpc_csr(&mut first, &mut mem);
+        }));
+        assert!(
+            loud.is_err(),
+            "enabled Cause written by host call must stay loud"
+        );
+        assert_eq!(first.r_u32(2), 3);
+        assert_eq!(first.read_fcr(31), pending);
+        assert_eq!(second.read_fcr(31), 2);
+    }
+
+    /// Public osCreateThread gives each OSThread its own saved FPCSR. This
+    /// drives real executor coroutine suspension and alternates A/B/A/B/A/B;
+    /// the context-local values must survive switches through another thread.
+    #[test]
+    fn alternating_osthread_coroutines_preserve_independent_fpcsr() {
+        const THREAD_A: ThreadId = 0xF5A0;
+        const THREAD_B: ThreadId = 0xF5B0;
+
+        let observed_a = Rc::new(RefCell::new(Vec::new()));
+        let observed_b = Rc::new(RefCell::new(Vec::new()));
+        let observed_a_body = Rc::clone(&observed_a);
+        let observed_b_body = Rc::clone(&observed_b);
+
+        with_executor(|exec| {
+            exec.create_thread(THREAD_A, 5, move |yielder, first_input| {
+                let _ = first_input;
+                let mut ctx = new_osthread_context();
+                ctx.write_fcr(31, 3);
+                observed_a_body.borrow_mut().push(ctx.read_fcr(31));
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_a_body.borrow_mut().push(ctx.read_fcr(31));
+                ctx.write_fcr(31, 1);
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_a_body.borrow_mut().push(ctx.read_fcr(31));
+            });
+            exec.create_thread(THREAD_B, 5, move |yielder, first_input| {
+                let _ = first_input;
+                let mut ctx = new_osthread_context();
+                ctx.write_fcr(31, 2);
+                observed_b_body.borrow_mut().push(ctx.read_fcr(31));
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_b_body.borrow_mut().push(ctx.read_fcr(31));
+                ctx.write_fcr(31, 0);
+                let _ = yielder.suspend(fn64_runtime::Yield::PauseSelf);
+                observed_b_body.borrow_mut().push(ctx.read_fcr(31));
+            });
+            exec.start_thread(THREAD_A);
+            exec.start_thread(THREAD_B);
+        });
+
+        for _ in 0..6 {
+            assert!(crate::run_one_step());
+        }
+
+        assert_eq!(&*observed_a.borrow(), &[3, 3, 1]);
+        assert_eq!(&*observed_b.borrow(), &[2, 2, 0]);
+        with_executor(|exec| {
+            assert!(exec.is_thread_dead(THREAD_A));
+            assert!(exec.is_thread_dead(THREAD_B));
+        });
+    }
+
+    /// Thread 0 is the reset context, not an osCreateThread context. The
+    /// public osInitialize contract performs the observable 0 -> FS|EV
+    /// transition at the real typed boot entry.
+    #[test]
+    fn thread0_boot_path_transitions_fpcsr_only_at_os_initialize() {
+        const THREAD0: ThreadId = 0xF500;
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| observed.borrow_mut().clear());
+        let mut bytes = [0u8; 8];
+
+        unsafe {
+            boot_thread0(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                evidence_lookup,
+                observe_thread0_fpcsr_boot,
+                THREAD0,
+                10,
+            );
+        }
+        crate::run_to_idle();
+
+        BOOT_FPCSR_OBSERVATIONS.with(|observed| {
+            assert_eq!(&*observed.borrow(), &[0, INITIAL_FPCSR]);
+        });
+        assert!(crate::is_thread_dead(THREAD0));
+    }
+
+    #[test]
+    fn typed_os_initialize_replaces_the_current_context_fpcsr() {
+        crate::configure_tv_type(fn64_runtime::TvType::Ntsc);
+        crate::load_rom_with_fixed_pi_latency(Vec::new(), 1);
+        let mut bytes = [0; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RsContext::new();
+        ctx.write_fcr(31, 3);
+
+        os_initialize(&mut ctx, &mut mem);
+
+        assert_eq!(ctx.read_fcr(31), INITIAL_FPCSR);
     }
 
     #[test]

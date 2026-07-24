@@ -9,7 +9,7 @@ pub fn synth_recomp(ctx: &mut RecompContext, mem: &mut Rdram) {
             // 0x80100000: Mtc1 { rt: 4, fs: 4 }
             ctx.set_f_bits(4, ctx.r_u32(4));
             // 0x80100004: CvtSW { fd: 4, fs: 4 }
-            ctx.set_f_s(4, (ctx.f_bits(4) as i32) as f32);
+            { let r = ctx.cvt_s_w_bits(4); ctx.set_f_bits(4, r); }
             // 0x80100008: Lwc1 { ft: 6, base: 5, off: 0 }
             ctx.set_f_bits(6, mem.load_w(Rdram::eff_addr(ctx.r(5), 0)) as u32);
             // 0x8010000C: MulS { fd: 8, fs: 4, ft: 6 }

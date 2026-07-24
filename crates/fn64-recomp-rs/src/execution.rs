@@ -1973,6 +1973,32 @@ mod tests {
     }
 
     #[test]
+    fn floating_point_exception_enters_general_vector_with_exc_code_15() {
+        let bank = BankId::new(0xF1);
+        let mut ctx = RecompContext::new();
+        let fault = CpuFault {
+            at: ExecutionKey::new(bank, GuestPc::new(0x8000_1804)),
+            kind: CpuFaultKind::Exception {
+                exception: CpuException::FloatingPoint,
+                epc: GuestPc::new(0x8000_1800),
+                branch_delay: true,
+                instruction_code: 0,
+                bad_vaddr: None,
+                coprocessor: None,
+            },
+        };
+
+        assert_eq!(
+            fault.enter_exception(&mut ctx),
+            Some(GuestPc::new(0x8000_0180))
+        );
+        assert_eq!(ctx.cop0_epc, 0x8000_1800);
+        assert_eq!((ctx.cop0_cause >> 2) & 0x1f, 15);
+        assert_ne!(ctx.cop0_cause & (1 << 31), 0);
+        assert_ne!(ctx.cop0_status & (1 << 1), 0);
+    }
+
+    #[test]
     fn nested_exception_preserves_first_epc_bd_and_bev_selects_boot_vector() {
         let bank = BankId::new(8);
         let mut ctx = RecompContext::new();

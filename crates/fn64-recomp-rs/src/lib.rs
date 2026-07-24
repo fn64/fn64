@@ -76,11 +76,12 @@ pub use runtime::{
     round_ties_even_f32, round_ties_even_f64, set_function_entry_observer,
     set_guest_write_boundary_observer, set_host_lookup, set_host_pause, set_mmio_hooks,
     set_unsupported_observer, set_write_observer, take_executable_write_boundary, trap_unsupported,
-    DataAccessError, DataAccessKind, FunctionEntryObservationSchema, FunctionEntryObserver,
-    GuestWriteBoundary, GuestWriteBoundaryObserver, GuestWriteEvent, HostLookup, HostPause,
-    MmioRead, MmioWrite, PhysicalFgrState, Rdram, RecompContext, RecompFunc, TlbEntryRaw, TlbFault,
-    TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity, TranslatedInstructionAddress,
-    UnsupportedObserver, WriteObserver, FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
+    DataAccessError, DataAccessKind, FpuException, FunctionEntryObservationSchema,
+    FunctionEntryObserver, GuestWriteBoundary, GuestWriteBoundaryObserver, GuestWriteEvent,
+    HostLookup, HostPause, MmioRead, MmioWrite, PhysicalFgrState, Rdram, RecompContext, RecompFunc,
+    TlbEntryRaw, TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity,
+    TranslatedInstructionAddress, UnsupportedObserver, WriteObserver,
+    FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
 };
 
 use fn64_recomp::{AbiVersion, RecompConfig, RecompError, RecompOutput, Recompiler, RspConfig};
