@@ -619,18 +619,10 @@ fn nwxe_discovery() -> Discovery {
 /// reads that geometry out of the boot image's own instruction bytes; the
 /// callee VA is a cited anchor claim (see the reference TOML's header).
 fn oot_discovery() -> Discovery {
-    #[derive(Deserialize)]
-    struct RequestDmaFile {
-        request_dma: Vec<banks::StaticRequestDmaInput>,
-    }
-    let text = include_str!("../../reference/oot-ntsc-1.0-request-dma.toml");
-    let file: RequestDmaFile =
-        toml::from_str(text).expect("bundled OoT request-DMA reference must parse");
-    // Mechanical VROM overlay recovery rather than hand-written load-image
-    // tables: `gate_d1_oot_overlays` proves this recovers all 468 OoT overlay
-    // regions with 0 wrong and 0 missed, so the closure scoreboard need not be
-    // anchored to per-ROM table geometry. Only the request-DMA callee VA
-    // remains a cited anchor.
+    // Fully mechanical: overlay geometry is recovered from the ROM, and the
+    // DMA-request routine that loads the resident image is recovered from its
+    // own corroborated call-site operands. No per-ROM table geometry and no
+    // cited callee address.
     Discovery::RecoveredVrom(
         Box::new(RecoveredVromOverlayInput {
             search: SearchConfig::vrom_family(),
@@ -642,6 +634,6 @@ fn oot_discovery() -> Discovery {
             table_name: "recovered_vrom_overlay_descriptors".to_string(),
             bank_name: BankNamePattern::new("recovered_overlay_", 0, ""),
         }),
-        file.request_dma,
+        Vec::new(),
     )
 }
