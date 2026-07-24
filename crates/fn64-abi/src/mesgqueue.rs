@@ -81,9 +81,9 @@ pub unsafe extern "C" fn osSendMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
         ),
     };
     // Return value in $v0: 0 on enqueue, -1 when a NOBLOCK send found the
-    // queue full (libultra's `s32 osSendMesg` contract; ref impl
-    // `mesgqueue.cpp` `return sent ? 0 : -1`). Symmetric with the recv
-    // return above -- previously never written, same class of stale-$v0 bug.
+    // queue full (public libultra Function Reference, Message Manager `osSendMesg`,
+    // "Explanation"; see `docs/DESIGN.md` § "OSMesgQueue semantics" for provenance).
+    // Symmetric with the recv below -- previously never written, same stale-$v0 bug.
     ctx.r2 = if sent { 0 } else { -1i64 as u64 };
 }
 
@@ -151,8 +151,8 @@ pub unsafe extern "C" fn osRecvMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
     }
 
     // Return value in $v0 (`ctx.r2`): 0 on delivery, -1 when a NOBLOCK recv
-    // found the queue empty (libultra's documented `s32 osRecvMesg` contract;
-    // ref impl `ultramodern/src/mesgqueue.cpp` `return received ? 0 : -1`).
+    // found the queue empty (public libultra Function Reference, Message Manager
+    // `osRecvMesg`, "Explanation"; see `docs/DESIGN.md` § "OSMesgQueue semantics").
     // NOBLOCK drain loops (e.g. OoT's `Sched_HandleNotification`, asm
     // 0x800A3180 `beq $v0, -1`) test exactly this to detect an empty queue and
     // stop. Leaving $v0 stale (the prior omission -- `ctx` was borrowed `&*`,
@@ -317,9 +317,9 @@ mod tests {
     /// Scheduler thread (`Sched_HandleNotification`, asm 0x800A3174 does a
     /// NOBLOCK `osRecvMesg` then 0x800A3180 `beq $v0, -1` to exit) -- the
     /// spin pinned `run_one_step` always-runnable, so virtual time never
-    /// advanced (`examples/oot-boot`: sim_time stuck at 0). The libultra
-    /// contract (ref impl `ultramodern/src/mesgqueue.cpp`:
-    /// `return received ? 0 : -1`) is: NOBLOCK recv on an empty queue -> -1.
+    /// advanced (`examples/oot-boot`: sim_time stuck at 0). The public libultra
+    /// Function Reference, Message Manager `osRecvMesg`, "Explanation",
+    /// specifies that a NOBLOCK receive on an empty queue returns -1.
     ///
     /// Seed `ctx.r2` with a realistic STALE non-`-1` value first, so a
     /// regression that stops writing `$v0` fails here even though a
