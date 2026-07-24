@@ -30,6 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # fn64-audio/fn64-shell link ALSA via cpal/gilrs; the runner image has no
+      # libasound headers, so alsa-sys' build.rs panics before any test runs.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       # aki-audio-ucode recompiles the AKI ucode from a licensed WM2000 ROM at
       # build time (examples/wm2000-boot/audio-ucode/build.rs panics without one).
       # No ROM can live in CI, so exclude it -- every other workspace crate is
@@ -44,4 +47,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      # lint-docs.py shells out to `rg`, which isn't on the runner image.
+      - uses: taiki-e/install-action@ripgrep
       - run: python3 scripts/lint-docs.py
