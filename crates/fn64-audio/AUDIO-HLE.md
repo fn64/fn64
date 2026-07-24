@@ -68,9 +68,19 @@ The HLE foundation has ten independent pieces:
 
 `AUDIO-ABI-CHARACTERIZATION.md` documents a separate private-input black-box
 harness. It constructs hand-authored tasks, packets, and sentinels around the
-same owned rspboot/LLE kernels and emits content-free canonical evidence. Its
-ordered SP DMA journal is diagnostic-only: it is excluded from architectural
-snapshots, outcome comparison, and commit authority.
+same owned rspboot/LLE kernels. Request v2 separates independently cloned
+control/probe trials from intentional cross-task persistence phases, binds the
+common pre-rspboot baseline, and emits content-free exact first-divergence and
+range evidence. It retains rspboot patches and DMA/IMEM-replacement journals
+for every phase, so same-valued boot writes and persistence-phase provenance
+remain part of trial equivalence. Ordered SP DMA journals are diagnostic-only:
+they are excluded from architectural snapshots and commit authority, though
+v2 compares them as evidence. Deferred DPC submissions drained before the
+terminal machine snapshot are retained and compared separately. Private LLE
+and rspboot/snapshot/memory-install failures cross this boundary through
+exhaustive static variant names without addresses, PCs, counts, digests, raw
+command words, or other error context. The v2 RDRAM difference union covers
+both boot and ucode patches from both lanes.
 
 The standard ABI decoder is a separate layer. Possessing a valid standard
 packet does not prove that the loaded microcode implements that packet family.
@@ -204,12 +214,15 @@ runtime synchronization change requires at least twenty and a comment naming
 the closed interleaving. Private ROM-derived captures remain outside git; only
 hand-authored public fixtures and non-content evidence belong in the tree.
 
-The first memory-command differential matrix varies counts around
+The first memory-command differential matrix uses v2 trial zero as the
+same-baseline control and varies counts around
 `0,1,2,7,8,15,16,17`, all low-three/low-four address alignments, both
 DMEMMOVE overlap directions and exact aliasing, segment zero/nonzero and
 base-plus-offset overflow, repeated SETBUFF with `A_AUX`, partial/oversized
 codebook reloads, and SETLOOP pointer mutation before looped ADPCM. Paired
-tasks establish whether any command state survives a task boundary.
+phases inside each persistence trial establish whether command state survives
+a task boundary. The report identifies exact RDRAM write-coverage, DMEM, IMEM,
+architectural-state, journal, or work divergence without exposing guest bytes.
 
 ## Release frontier
 
