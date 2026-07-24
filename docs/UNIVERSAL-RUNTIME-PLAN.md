@@ -353,6 +353,93 @@ separately and never promotes either into a silent function-boundary claim.
 
 ## 4. Milestones and acceptance gates
 
+### 4.0 Sequencing and blockers
+
+The U0-U7 milestones below specify *what* closure means for each area. They do
+not say what order to work in, and two of the largest remaining gaps are not
+engineering problems at all. This subsection is the critical path; it changes
+what the next session picks up, and nothing below it repeats.
+
+**Not every open gap is code.** Three distinct blocker classes exist, and only
+one of them closes by writing Rust:
+
+- **Sourcing** — the work is blocked on obtaining an allowed-source artifact.
+  No amount of implementation moves it.
+- **Capture** — blocked on physical hardware observation that has not been
+  performed.
+- **Implementation** — ordinary engineering, the only class an agent wave can
+  close unattended.
+
+**The long pole is capture, not code.** `BASE-RENDERER-BEHAVIOR-MATRIX.md`
+records 4 of 24 base-render rows as exact public contract, 18 as bounded
+reference, and 2 as missing; **19 rows are blocked on hardware trace** and the
+repository contains zero physical captures. `RDP-SILICON-VECTORS.md` states
+the position plainly: no hardware capture has been performed and no
+silicon-accuracy claim is made. `VI-ANALOG-CAPTURE-PROGRAM.md` defines the
+ten-run power-cycle cohort methodology, and it is unpopulated. Until captures
+exist, those 19 rows cannot close **by any amount of implementation work**,
+and every bounded-reference policy beneath them stays bounded. Treat the
+capture program as a parallel long-lead track started early, not as a
+follow-up to U6. Its absence is the single largest determinant of when base
+accuracy can be called closed.
+
+Two different bars are in play and must not be conflated. Render/VI silicon
+accuracy needs **physical capture** and is genuinely blocked. Device *timing*
+needs only **reference-emulator parity** through the differential oracle in
+step 1 below — no hardware, no capture cohort. Do not let the blocked capture
+program stall the timing work; they are independent.
+
+**The certified-public-microcode catalog gates U6 and therefore U7.** Catalog
+v1 is empty pending allowed-source digest provenance (`MICROCODE-DENOMINATOR.md`),
+so no matrix can satisfy any of the twelve public-microcode requirements
+today. F3DZEX2 — the family OoT and MM actually run — is named but unadmitted.
+That chain is `catalog provenance -> F3DZEX2 admission -> U6 -> U7
+full-rom-zero-unsupported`, currently 12 of 162 requirements satisfied with
+150 explicit gaps retained. The head of that chain is a **sourcing** task with
+no code in it, and it silently blocks the release gate. Start it before, not
+alongside, the U6 implementation waves that depend on it.
+
+**Recommended order.** U4 and U5 are implementation-class and mutually
+independent — they touch disjoint crates and can run as parallel waves. U6
+depends on the catalog head above. U7 is terminal by construction: it consumes
+every other milestone's evidence, so it cannot start early and must not be
+partially credited.
+
+1. **Blocked on a review decision, and blocking the most work:** two
+   foundation sub-specs are written and awaiting approval before
+   implementation. Both gate large downstream sets, so approving them is the
+   highest-leverage action available:
+   - `superpowers/specs/2026-07-23-u4-fpu-environment-design.md` — the FPU
+     environment, U4's critical path and the single largest behavior item.
+     fn64's FPU is currently a round-to-nearest fast path: FCSR.RM is ignored
+     on ADD/SUB/MUL/DIV/SQRT, arithmetic raises no IEEE flags, there is no
+     ExcCode-15 path (an enabled exception panics), host NaNs are emitted
+     rather than the MIPS canonical forms, FR=0 is hardcoded, FP conditional
+     moves are absent, and the interpreter lane implements no COP1 arithmetic
+     at all. Open decision: approving `rustc_apfloat`, the first soft-float
+     dependency — host `fesetround` is rejected because it breaks `wrong == 0`
+     determinism.
+   - `superpowers/specs/2026-07-23-timing-oracle-design.md` — the differential
+     timing harness. Every timing item in U2/U5/U6 is currently deterministic
+     *policy*, and none can be called done without a reference oracle to
+     measure against. Open decision: tolerance philosophy. Note the bar here
+     is **reference-emulator parity, not cycle-exact silicon** — a
+     deliberately different and cheaper bar than the render capture program,
+     and not blocked on hardware.
+2. **Immediately, in parallel and unattended:** the rest of U4 CPU
+   architectural closure and U5 device closure. These touch disjoint crates.
+3. **Immediately, as long-lead non-code tracks:** microcode catalog
+   provenance; the hardware capture program.
+4. **On catalog admission:** U6 RSP/RDP closure.
+5. **Terminal:** U7, once the above retain evidence.
+
+**Unowned gap: RDRAM sizing.** `rdram.rs`'s `DEFAULT_RDRAM_SIZE` is a
+hard-asserted 8 MiB constant, and `osGetMemSize_recomp` returns it
+unconditionally. No 4 MiB stock-console configuration exists, so a ROM whose
+behavior differs without an Expansion Pak cannot be modeled. This is
+implementation-class, cheap, and belongs to U5. It appeared in no milestone
+before this revision.
+
 ### U0 — execution identity
 
 - Introduce `BankId`, `GuestPc`, `ExecutionKey`, `CpuFault`, and `BlockExit`.
