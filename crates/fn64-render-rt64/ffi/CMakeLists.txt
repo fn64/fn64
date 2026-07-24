@@ -115,17 +115,20 @@ set(FN64_RT64_S2DEX_NAMESPACE_PATCHED [=[namespace RT64 {
             const char *alignmentReason,
             const char *rangeReason)
         {
-            // Public segmented addresses use exactly four segment bits. RT64's
-            // general helper deliberately ignores the upper nibble and masks
-            // DMA alignment/address bits; this bounded path must reject those
-            // aliases before it reads or mutates anything.
-            if ((segmentedAddress & 0xF0000000U) != 0U) {
+            // Public inputs are a 16-entry segmented address or KSEG0/KSEG1.
+            // RT64's general helper deliberately aliases other upper bytes and
+            // masks DMA alignment/address bits; this bounded path must reject
+            // those aliases before it reads or mutates anything.
+            const uint32_t addressClass = segmentedAddress >> 24;
+            const bool directPhysical =
+                (addressClass == 0x80U) || (addressClass == 0xA0U);
+            if (!directPhysical && (addressClass > 0x0FU)) {
                 rejectFn64ObjLoadTxRect(segmentReason);
             }
-            const uint32_t segment = segmentedAddress >> 24;
             const uint32_t offset = segmentedAddress & 0x00FFFFFFU;
-            const uint64_t resolved =
-                uint64_t(state->rsp->segments[segment]) + uint64_t(offset);
+            const uint64_t resolved = directPhysical
+                ? uint64_t(offset)
+                : uint64_t(state->rsp->segments[addressClass]) + uint64_t(offset);
             if ((resolved & 7U) != 0U) {
                 rejectFn64ObjLoadTxRect(alignmentReason);
             }

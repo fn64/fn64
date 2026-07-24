@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3";
-const ADAPTER_SHA256: &str = "6ec2849acf1b4d129f290f0f1dee996140bf16048494a15a8aa44298fd751ed5";
+const ADAPTER_SHA256: &str = "c94e6ee0436295471e5a696ece735793895f552dde9e1fbc3853ea100ceec7b9";
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const WIDTH: u32 = 8;
 const HEIGHT: u32 = 4;
@@ -319,6 +319,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         0xef00_0000,
         false,
     );
+    // Public S2DEX pointers also admit KSEG0/KSEG1 low-24 physical forms.
+    RdramViewMut::from_storage(&mut rdram)
+        .write_u32(RdramAddr::from_offset(TXSP + 4), 0xa000_3000);
+    overwrite_compound_pointer(&mut rdram, S2DEX_DL, 0x8000_2000);
     backend.enable_deferred_workload_capture_for_evidence()?;
     backend.process_synthetic_s2dex2(&mut rdram, S2DEX_DL as u32, S2DEX_TARGET)?;
     let route = backend.s2dex_fast_path_evidence()?;
