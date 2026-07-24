@@ -79,12 +79,11 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
     let mut cc = Command::new("cc");
     cc.arg(&smoke_c).arg(&staticlib).arg("-o").arg(&out_bin);
     // fn64-abi now statically links fn64-audio's cpal dependency (the real
-    // CpalBackend, see fn64-audio's crate doc), which on macOS pulls in
-    // CoreAudio/AudioToolbox/objc2 -- a plain `cc a.c lib.a` link needs
-    // those frameworks named explicitly, the same way any other consumer
-    // of a Rust staticlib with platform-audio deps would. Not needed on
-    // other platforms (cpal's non-Darwin backends link via other means
-    // already covered by the .a's own build).
+    // CpalBackend, see fn64-audio's crate doc), which pulls in the platform
+    // audio stack -- a plain `cc a.c lib.a` link needs those named
+    // explicitly, the same way any other consumer of a Rust staticlib with
+    // platform-audio deps would. A staticlib records no dependency libs, so
+    // each host's cpal backend has to be named here.
     if cfg!(target_os = "macos") {
         cc.args([
             "-framework",
@@ -97,6 +96,9 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
             "Foundation",
             "-lobjc",
         ]);
+    } else if cfg!(target_os = "linux") {
+        // cpal's ALSA backend: libasound provides snd_pcm_*/snd_hctl_*.
+        cc.arg("-lasound");
     }
     let compile = cc
         .output()
