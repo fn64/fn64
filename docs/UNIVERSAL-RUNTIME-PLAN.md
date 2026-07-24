@@ -203,8 +203,11 @@ is enabled; `osInitialize` establishes the initial enable used by raw libultra
 DRAM/LEN callers, and the managed submission repeats that idempotent write.
 The public source does not define a mid-transfer disable/pause transition, so
 changing CONTROL while either FIFO slot is active remains a named unsupported fault.
-Exact AI/DPC timing and counters, the precise AI-interrupt phase, mid-transfer
-AI control, FREEZE/FLUSH, subword raw access, native-C mid-task visibility,
+DACRATE and BITRATE changes are rejected under the same live-FIFO rule; typed
+requests must match the public integer rate derived from the admitted divisor.
+Exact silicon AI/DPC timing and counters, the precise AI-interrupt phase, the
+hardware semantics of mid-transfer AI control/rate writes, FREEZE/FLUSH,
+subword raw access, native-C mid-task visibility,
 and silicon bus behavior remain outside the current model.
 
 Translated blocks consume a deterministic cycle budget. At block boundaries,
@@ -479,14 +482,22 @@ starts consume the same DRAM/CONTROL/DACRATE/BITRATE state. DPC START/END/
 CURRENT/STATUS and each pending RDRAM-or-DMEM submission likewise live in the
 fabric until explicit commit or cancellation; no shim, LLE, or raw path retains
 a second range authority. The fabric computes completion deadlines from
-buffered stereo frames, the 93.75 MHz CPU clock, and the quantized DAC rate;
-`AI_LEN` decreases with guest time, FIFO-full submissions fail, completion
-raises MI AI, and OS_EVENT_AI is posted only after that state is visible.
-CONTROL-disabled starts fail loudly and the ENABLED status bit reflects the
-same latch; mid-transfer CONTROL behavior and the precise hardware interrupt
-phase remain explicitly unclaimed. Exact AI/DPC timing and counters,
-FREEZE/FLUSH, subword raw access, native-C mid-task visibility, and silicon
-behavior remain open. The
+buffered stereo frames, the 93.75 MHz CPU clock, and the exact public
+`VI_CLOCK / (DACRATE + 1)` rational with one final ceiling. The truncated
+integer ABI rate remains backend metadata. The ABI computes its divisor with
+exact integer round-to-nearest, uses fn64's bounded 132..=16384 admission, and
+publishes metadata only after successful register admission. `AI_LEN`
+decreases in eight-byte units; typed starts reject unrepresentable
+address/length/range inputs, while raw writes mask them first. FIFO-full
+submissions fail. FIFO FULL 1-to-0 raises MI AI and posts OS_EVENT_AI only
+after queue promotion is visible; lone/final BUSY retirement does not
+fabricate that edge. CONTROL-disabled starts remain accepted into the dormant
+two-slot FIFO and the ENABLED bit reflects the same latch; 0-to-1 begins drain.
+Mid-transfer CONTROL/DACRATE/BITRATE writes fail with named unsupported faults.
+The hardware interrupt phase, other assertion causes, DAC clock-domain phase,
+and per-edge `AI_LEN` timing remain explicitly unclaimed. Exact silicon AI/DPC
+timing and counters, FREEZE/FLUSH, subword raw access, native-C mid-task
+visibility, and silicon behavior remain open. The
 public `rcp.h` command semantics also converge SP/SI/VI/AI/DP acknowledgement
 on the common MI source. That RCP/MI authority exists from host-state creation,
 independent of cartridge ROM installation; PI separately retains a loud

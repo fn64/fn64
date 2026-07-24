@@ -756,11 +756,22 @@ task calls out:
   register latches and two-slot FIFO; shim calls and raw register writes do not
   retain a second DAC-rate, source-address, or control authority.
   It derives deterministic drain deadlines from stereo-frame count, the
-  93.75 MHz CPU clock, and libultra's quantized DAC rate, then raises MI AI and
-  returns OS_EVENT_AI only after the current buffer drains. This is guest-time
-  ordering, not a claim of hardware-verified AI bus timing. Its DAC divisor
-  uses the same IPL-selected NTSC/PAL/MPAL video clock as VI. Exact AI bus
-  timing, hardware counter edge behavior, and native-C instruction-interior
+  93.75 MHz CPU clock, and the exact public `VI_CLOCK / (DACRATE + 1)`
+  rational, with one final ceiling; the integer rate returned by
+  `osAiSetFrequency` remains ABI/backend metadata rather than a device-clock
+  input. The shim computes its divisor with exact integer round-to-nearest and
+  admits fn64's bounded 132..=16384 range without mutating state on rejection.
+  Typed starts reject unaligned or out-of-field DRAM/LEN values and 24-bit
+  range overflow; raw register writes apply their public masks first.
+  Per public `rcp.h`, retiring the current slot while a next slot exists raises
+  MI AI and returns OS_EVENT_AI after promotion makes FIFO FULL transition
+  1-to-0. A lone/final BUSY transition does not fabricate that edge. This is
+  guest-time ordering, not a claim of hardware-verified AI bus timing. DACRATE
+  and BITRATE writes while either FIFO slot is occupied fail with named faults
+  because their active-transfer hardware behavior is not yet admitted. Its DAC
+  divisor uses the same IPL-selected NTSC/PAL/MPAL video clock as VI. Exact AI bus
+  clock-domain phase, per-edge `AI_LEN` decrement timing, other interrupt
+  causes, hardware counter edge behavior, and native-C instruction-interior
   observation remain open. SP, SI, VI, PI,
   AI, and DP pending bits and masks are
   one level-sensitive gate. Typed raw writes apply the acknowledgement commands
