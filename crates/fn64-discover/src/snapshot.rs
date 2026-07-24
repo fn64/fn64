@@ -234,9 +234,6 @@ pub enum SnapshotError {
         va_end: u32,
         count: usize,
     },
-    UnsupportedVirtualBacking {
-        bank: String,
-    },
     MalformedPhysicalMapping {
         bank: String,
     },
@@ -282,10 +279,6 @@ impl std::fmt::Display for SnapshotError {
             Self::AmbiguousProvenMapping { bank, va_start, va_end, count } => write!(
                 f,
                 "{count} proven mappings for {bank} cover [0x{va_start:08x},0x{va_end:08x})"
-            ),
-            Self::UnsupportedVirtualBacking { bank } => write!(
-                f,
-                "snapshot V1 cannot byte-verify virtual/compressed ROM backing for {bank}"
             ),
             Self::MalformedPhysicalMapping { bank } => {
                 write!(f, "proven physical mapping for {bank} has unequal ROM and VA extents")
@@ -435,17 +428,20 @@ fn prepare_materialized_bank(
             });
         }
     };
-    if mapping.rom_space != RomAddressSpace::Physical {
-        return Err(SnapshotError::UnsupportedVirtualBacking {
-            bank: input.bank.into(),
-        });
-    }
-    if mapping.rom_end.checked_sub(mapping.rom_start)
-        != mapping.va_end.checked_sub(mapping.va_start)
-    {
-        return Err(SnapshotError::MalformedPhysicalMapping {
-            bank: input.bank.into(),
-        });
+    // A DMA-loaded overlay's VA extent may exceed its ROM extent: the trailing
+    // `.bss` is allocated at load time and has no backing bytes. Accept that
+    // shape, but never let a materialized window reach past the ROM-backed
+    // prefix (checked once `rom_end` is known below).
+    match (
+        mapping.rom_end.checked_sub(mapping.rom_start),
+        mapping.va_end.checked_sub(mapping.va_start),
+    ) {
+        (Some(rom_extent), Some(va_extent)) if rom_extent <= va_extent => {}
+        _ => {
+            return Err(SnapshotError::MalformedPhysicalMapping {
+                bank: input.bank.into(),
+            });
+        }
     }
     let offset = input.va_start - mapping.va_start;
     let rom_start =
@@ -461,10 +457,27 @@ fn prepare_materialized_bank(
             .ok_or(SnapshotError::MalformedPhysicalMapping {
                 bank: input.bank.into(),
             })?;
-    let backing = rom
-        .bytes
-        .get(rom_start as usize..rom_end as usize)
-        .ok_or(SnapshotError::RomBackingOutsideImage { rom_start, rom_end })?;
+    // The requested window must stay inside the mapping's ROM-backed bytes; a
+    // bank that tried to include its `.bss` tail is rejected loudly rather than
+    // silently materializing bytes that the ROM does not carry.
+    if rom_end > mapping.rom_end {
+        return Err(SnapshotError::MalformedPhysicalMapping {
+            bank: input.bank.into(),
+        });
+    }
+    // Materialize through the shared ROM-range resolver: a physical bank is
+    // sliced from the image, while a VROM (DMA-loaded) overlay is resolved and
+    // byte-verified through its one proven file-table record. Both therefore
+    // reach the same materialized-bytes check below.
+    let backing = crate::banks::materialize_rom_range(
+        rom,
+        base_facts,
+        mapping.rom_space,
+        rom_start,
+        rom_end,
+    )
+    .map_err(|_| SnapshotError::RomBackingOutsideImage { rom_start, rom_end })?;
+    let backing = backing.bytes.as_slice();
     if backing != input.bytes {
         return Err(SnapshotError::MaterializedBytesMismatch {
             bank: input.bank.into(),
