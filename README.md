@@ -81,8 +81,9 @@ Function-boundary discovery is graded against decomp answer keys under a strict
 fails the grade — only machine-checked evidence promotes a boundary, nothing is
 guessed. The numbers below grade the ROM's **resident boot bank** (the code
 present at the entrypoint before any overlay DMA — a few hundred functions per
-game, not the whole ROM; OoT's 10,833 total live mostly in later banks and
-overlays). Recall on merged `main`:
+game, not the whole ROM; OoT's 13,358 total — the count
+`gate_d1_oot_overlays` asserts against its held-out dump — live mostly in
+later banks and overlays). Recall on merged `main`:
 
 | Game | Boot-bank matched / total | Recall | Wrong |
 |------|---------------------------|-------:|------:|
