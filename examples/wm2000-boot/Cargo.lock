@@ -233,6 +233,8 @@ version = "0.0.0"
 dependencies = [
  "cpal",
  "fn64-runtime",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

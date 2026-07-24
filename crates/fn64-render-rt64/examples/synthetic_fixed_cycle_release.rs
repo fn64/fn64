@@ -161,7 +161,7 @@ fn run_invocation(invocation: ReleaseInvocation) -> Result<(), Box<dyn Error>> {
     fn64_abi::configure_no_cartridge_save();
     fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
     fn64_abi::set_audio_rdram_len(rdram.len());
-    unsafe { fn64_abi::set_audio_ucode_fn(synthetic_audio_ucode) };
+    fn64_abi::set_audio_task_lle_accuracy();
     let fixed_cycle = fn64_abi::next_vi_deadline()
         .ok_or_else(|| io::Error::other("NTSC configuration did not schedule a VI edge"))?;
     if let Some(expected_cycle) = expected_cycle {
@@ -360,12 +360,31 @@ fn prepare_synthetic_memory(rdram: &mut [u8]) {
         GFX_RSP_UCODE,
         gfx_ucode.len() * 4,
     );
-    write_task(rdram, AUDIO_TASK, M_AUDTASK, AUDIO_RSP_BOOT, 8);
+    let audio_ucode = [
+        0x3c08_4155,
+        0x3508_42c9,
+        0xac08_0000,
+        0x2402_0000,
+        mtc0(2, 0),
+        0x2403_1040,
+        mtc0(3, 1),
+        0x2404_0003,
+        mtc0(4, 3),
+        0x0000_000d,
+    ];
+    write_task(
+        rdram,
+        AUDIO_TASK,
+        M_AUDTASK,
+        AUDIO_RSP_BOOT,
+        audio_ucode.len() * 4,
+    );
     for (index, word) in gfx_ucode.into_iter().enumerate() {
         write_word(rdram, GFX_RSP_UCODE + index * 4, word);
     }
-    write_word(rdram, AUDIO_RSP_BOOT, 0x0000_000d);
-    write_word(rdram, AUDIO_RSP_BOOT + 4, 0);
+    for (index, word) in audio_ucode.into_iter().enumerate() {
+        write_word(rdram, AUDIO_RSP_BOOT + index * 4, word);
+    }
     write_word(rdram, RSP_UCODE_DATA, 0x666e_3634);
     write_word(rdram, RSP_UCODE_DATA + 4, 0x6461_7461);
 
@@ -489,18 +508,6 @@ unsafe extern "C" fn synthetic_entry(rdram: *mut u8, ctx: *mut fn64_abi::RecompC
     ctx.r6 = 1;
     unsafe { fn64_abi::osRecvMesg_recomp(rdram, ctx) };
     assert_eq!(ctx.r2, 0, "synthetic graphics task completion wait failed");
-}
-
-unsafe extern "C" fn synthetic_audio_ucode(rdram: *mut u8, task_offset: u32) -> u32 {
-    let marker = AUDIO_EXECUTION_MAGIC ^ task_offset;
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            marker.to_ne_bytes().as_ptr(),
-            rdram.add(AUDIO_EXECUTION_MARKER),
-            4,
-        );
-    }
-    0
 }
 
 fn write_word(rdram: &mut [u8], offset: usize, value: u32) {

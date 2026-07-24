@@ -35,29 +35,6 @@ use std::io::Write;
 #[cfg(fn64_recomp_rs)]
 use oot_recompiled as recompiled;
 
-/// Audio ucode stand-in. No RSPRecomp pass has been run against OoT's audio
-/// microcode in this bring-up (out of scope for the decomp-driven-recompile
-/// gate this harness proves) -- and even if one had been, the same
-/// clean-room blocker `examples/wm2000-boot/src/main.rs` documents applies
-/// identically: RSPRecomp's own codegen template unconditionally
-/// `#include`s the GPL-3.0-licensed `librecomp/rsp.hpp`
-/// (`N64RecompSource/RSPRecomp/src/rsp_recomp.cpp:1179`), disallowed by
-/// `fn64/AGENTS.md`'s clean-room protocol regardless of which game it's
-/// generated for. This stand-in exercises the REAL plumbing
-/// (`fn64_abi::set_audio_ucode_fn`/`osSpTaskYielded_recomp`'s M_AUDTASK
-/// dispatch) without linking the disallowed dependency or claiming a real
-/// ucode was ported. It does nothing to rdram, just proves the call
-/// happened.
-unsafe extern "C" fn stand_in_audio_ucode(_rdram: *mut u8, ucode_addr: u32) -> u32 {
-    eprintln!(
-        "[oot-boot] STAND-IN audio ucode invoked for ucode_addr={ucode_addr:#010x} -- NOT a real \
-         translated ucode (no RSPRecomp pass has been run for OoT in this bring-up; see main.rs's \
-         doc comment for the clean-room reason a real one couldn't be linked in even if it had \
-         been). Plumbing is real; ucode execution is not."
-    );
-    0
-}
-
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var(name)
         .unwrap_or_else(|_| panic!("oot-boot: required environment variable {name} not set"))
@@ -420,8 +397,6 @@ fn main() {
         );
     }
 
-    let _ = stand_in_audio_ucode; // kept for reference; real ucode wired below
-
     // Typed IPL video standard is the shared VI/AI clock authority. The first
     // field uses that standard's nominal field rate; the latched OSViMode H/V
     // registers then refine it from the corresponding public VI clock.
@@ -659,25 +634,10 @@ fn main() {
 
     wire_audio_output(rdram.len());
 
-    // Register the REAL recompiled OoT aspMain audio ucode (typed Rust from
-    // fn64-audio's clean-room RSP recompiler, compiled in the out-of-tree
-    // `oot-audio-ucode` crate). This replaces the stand-in: M_AUDTASK
-    // dispatch now actually runs the translated 1004-instruction ucode
-    // against rdram. The ucode's FFI wrapper rebuilds a bounds-checked
-    // `&mut [u8]` from the raw pointer, so it needs the rdram length first.
-    #[cfg(feature = "oot-audio")]
-    {
-        oot_audio_ucode::set_rdram_len(rdram.len());
-        unsafe { fn64_abi::set_audio_ucode_fn(oot_audio_ucode::oot_audio_ucode) };
-        println!(
-            "[oot-boot] registered recompiled OoT aspMain audio ucode (1004 instrs) \
-             as the real M_AUDTASK ucode function"
-        );
-    }
-    #[cfg(not(feature = "oot-audio"))]
-    println!(
-        "[oot-boot] oot-audio feature disabled; use FN64_SKIP_AUDIO_UCODE=1 for this boot probe"
-    );
+    // Release/parity evidence executes the task's live IMEM through the
+    // clean-room interpreter; translated callbacks are not task-byte authority.
+    fn64_abi::set_audio_task_lle_accuracy();
+    println!("[oot-boot] registered audio task policy: LLE accuracy");
 
     println!("[oot-boot] booting thread 0 (recomp_entrypoint)...");
     #[cfg(all(fn64_recomp_rs, not(fn64_recomp_rs_block_program)))]

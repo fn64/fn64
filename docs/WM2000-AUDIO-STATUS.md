@@ -40,7 +40,7 @@ So the LLE/clean-room audio subsystem is real and complete enough to make
 - The command list the ucode consumes lives at the OSTask's `data_ptr` /
   `data_size` fields; ucode text/data at `ucode`/`ucode_data` (masked to
   physical with `& 0x1fff_ffff` / `& 0x00ff_ffff`).
-- Registration hook (recompiled-ucode path): `set_audio_ucode_fn`
+- Accuracy policy (live-task IMEM): `set_audio_task_lle_accuracy`
   (`task_dispatch.rs:2400`), type `AudioUcodeFn = unsafe extern "C"
   fn(*mut u8, u32) -> u32`.
 - Output boundary: `osAiSetNextBuffer_recomp` — where finished PCM is named and
@@ -53,12 +53,11 @@ So the LLE/clean-room audio subsystem is real and complete enough to make
   dumps the exact rdram image + task offset of one audio task, so an AKI audio
   ucode can be replayed offline against the real command list. Masked to the
   real 8 MiB RDRAM window.
-- `FN64_SKIP_AUDIO_UCODE`: skips the per-frame RSP synth (dominant per-swap
-  cost) while keeping the audio-reset handshake — iterate on the renderer at
-  boot speed. A real audio run must NOT set it.
+- `set_audio_task_diagnostic_skip`: explicitly skips synthesis for
+  non-certifying render diagnostics. Fixed-cycle release evidence rejects it.
 - `crates/fn64-audio/examples/rsp_replay.rs`: offline RSP replay harness.
 
-## The one remaining step for WM2000 sound
+## WM2000 audio execution
 
 WM2000 (and the AKI family: WT / Revenge / VPW2 / No Mercy) do NOT use OoT's
 aspMain. They ship the **AKI shared audio library** ucode: 3156 bytes
@@ -67,18 +66,15 @@ ROM 0x39510 → vram 0x80038910 (see
 `aki-recomp/games/NWXE/rsp/wm2000_audio.toml`; a single unique full-length
 match against Revenge's `revenge_audio.toml`).
 
-The remaining work is therefore NOT "build an RSP interpreter" — it's:
+The harness now executes admitted live IMEM through fn64's clean-room RSP
+interpreter. Remaining work is evidence and performance:
 
 1. Run the AKI audio ucode text (0x39510, 0xC54) through the **existing**
    clean-room RSP → typed-Rust recompiler (`fn64-audio/src/rsp/recomp/`), the
    same path that produced `oot-audio-ucode`, to emit an `aki-audio-ucode`
    crate. One implementation covers the whole AKI family (identical bytes).
-2. Register it for WM2000 in place of the stand-in:
-   - `examples/wm2000-boot/src/main.rs:119` still wires
-     `stand_in_audio_ucode` — replace with the AKI ucode fn.
-   - `fn64-shell` currently only has an `oot-audio` feature
-     (`wire_audio_ucode`, `main.rs:~965`); add the AKI ucode crate the same
-     way (non-cross-pinning generated crate, mirroring the OoT lane).
+2. Compare any optional translated AKI artifact against the live-IMEM LLE
+   baseline. Translated execution is not release authority by itself.
 3. Verify AKI RSP ops the recompiler emits are all covered by the interpreter
    (the AKI audio library may exercise VU/scalar ops OoT's aspMain didn't);
    add differential-oracle vectors for any new ones. This is where real

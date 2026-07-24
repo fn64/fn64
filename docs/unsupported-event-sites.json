@@ -107,6 +107,20 @@
       "trigger": "fn64_runtime::UnsupportedSubsystem::Abi,\n        \"abi.pi.epi-handle\""
     },
     {
+      "operation": "audio.task.missing-execution-policy",
+      "subsystem": "audio",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "trigger": "task={:#010x} type={} ucode={:#010x}/size={:#x}"
+    },
+    {
+      "operation": "audio.translated-ucode.exit-reason",
+      "subsystem": "audio",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "trigger": "task_offset={o:#010x} exit_reason={reason}"
+    },
+    {
       "operation": "audio.rsp.unknown-instruction",
       "subsystem": "audio",
       "disposition": "returned_error",
