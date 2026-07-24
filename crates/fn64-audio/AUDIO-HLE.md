@@ -58,13 +58,12 @@ The HLE foundation has ten independent pieces:
   intent using final LLE bytes, so later ucode writes win overlaps while
   same-valued DMA writes remain visible to publication preflight. The value is
   deliberately not a commit token: no complete family HLE executor exists yet.
-- `hle_commit.rs` consumes matching LLE/HLE ucode-phase outcomes into a
-  non-cloneable commit authority. The ABI adapter can publish the empty-DPC
-  ucode phase once; boot-phase patches remain outside that authority. No
-  whole-task comparison or commit authority exists until a real family
-  executor can mint a completed-result seal by consuming the exact paired HLE
-  lane. An arbitrary outcome, even one from another matching LLE run, is not
-  same-snapshot provenance.
+- `hle_commit.rs` is quarantined as test-only characterization. Its reduced
+  `RspVisibleState` projection does not bind complete architectural state, and
+  its comparison does not consume the exact paired HLE lane. No production
+  commit token or ABI adapter surface exists. Reintroduction requires complete
+  RSP architectural state and a completed-result seal that consumes the paired
+  same-snapshot `WholeAudioTaskHleLane`.
 
 `AUDIO-ABI-CHARACTERIZATION.md` documents a separate private-input black-box
 harness. It constructs hand-authored tasks, packets, and sentinels around the

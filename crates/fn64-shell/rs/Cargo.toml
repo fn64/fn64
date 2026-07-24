@@ -21,9 +21,6 @@ description = "Rust-recompiled whole-ROM configuration of the fn64 windowed shel
 [workspace]
 
 [features]
-default = ["oot-audio"]
-oot-audio = ["dep:oot-audio-ucode"]
-oot-audio-ucode = []
 rt64 = ["fn64-render-rt64/rt64"]
 
 [[bin]]
@@ -56,4 +53,3 @@ fn64-audio = { path = "../../fn64-audio" }
 oot-recompiled = { path = "recompiled" }
 # The recompiled OoT aspMain ucode, via oot-boot's harness-local build
 # adapter (resolves fn64-audio from THIS tree, no cross-pin).
-oot-audio-ucode = { path = "../../../examples/oot-boot/audio-ucode", optional = true }

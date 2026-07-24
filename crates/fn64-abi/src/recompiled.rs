@@ -712,6 +712,7 @@ pub(crate) fn scoped_test_executable_write_preflight_state(
 /// and native-code installation. This read-only check lets ordinary audio-data
 /// writes proceed while forcing executable writes to remain on the interpreter
 /// path until such a transaction exists.
+#[cfg(test)]
 pub(crate) fn preflight_non_executable_host_writes(
     writes: &[(usize, usize)],
 ) -> Result<(), String> {

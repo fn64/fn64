@@ -1,8 +1,8 @@
 # WM2000 audio: status and the remaining step
 
 Status note, not a from-scratch spec. fn64 already has the MIT-clean audio
-machinery; this documents what exists, what runs today, and the one remaining
-step to get WM2000 sound — so nobody rebuilds what's already there.
+machinery; this documents the current live-IMEM LLE path and its remaining
+WM2000 evidence frontier.
 
 ## What already exists (MIT-clean, do NOT rebuild)
 
@@ -16,11 +16,8 @@ GPL-3.0 `librecomp/rsp.hpp` the RSPRecomp-generated ucode `#include`s:
   replacement for the GPL runtime header. Differential VU oracle tests exist
   (`test(rsp): add independent VU differential oracle`).
 - **Clean-room RSP → typed-Rust recompiler** — `crates/fn64-audio/src/rsp/
-  recomp/` (`feat(fn64-audio): clean-room RSP -> typed-Rust recompiler +
-  OoT aspMain`). Turns a raw RSP ucode text image into runnable Rust.
-- **A recompiled, runnable OoT audio ucode** — the `oot-audio-ucode` generated
-  crate (`rsp/recomp/mod.rs:209`), produced by the recompiler above. OoT's
-  aspMain synthesizes real PCM through this path.
+  recomp/`. It supports optional content-bound experiments, but translated
+  artifacts are not the boot harness or release-authority path.
 - **Live output path** — `fn64_audio::CpalBackend` + drain-aware AI pacing
   (`fix(audio): drain-aware osAiGetLength restores the game's own audio
   pacing`). Verified working end to end in `fn64-shell` (32kHz guest →
@@ -31,18 +28,13 @@ So the LLE/clean-room audio subsystem is real and complete enough to make
 
 ## The actual entry points (correct citations)
 
-- Audio task dispatch: `dispatch_audio_task` in
-  `crates/fn64-abi/src/task_dispatch.rs` (~line 1712). Runs the registered
-  audio ucode with `(rdram, task_offset)`, where `task_offset` is the OSTask's
-  rdram OFFSET used to seed RSP DMEM[0xFC0] (rspboot loads the 64-byte OSTask
-  there; the audio ucode reads `ucode_data`@0x18). Called from
-  `osSpTaskStartGo_recomp` (the Load+StartGo path AKI/OoT audio drivers use).
+- Audio task dispatch: `osSpTaskStartGo_recomp` admits the loaded `OSTask`,
+  runs rspboot, then executes live IMEM through the clean-room interpreter
+  when `LleAccuracy` is selected.
 - The command list the ucode consumes lives at the OSTask's `data_ptr` /
   `data_size` fields; ucode text/data at `ucode`/`ucode_data` (masked to
   physical with `& 0x1fff_ffff` / `& 0x00ff_ffff`).
-- Accuracy policy (live-task IMEM): `set_audio_task_lle_accuracy`
-  (`task_dispatch.rs:2400`), type `AudioUcodeFn = unsafe extern "C"
-  fn(*mut u8, u32) -> u32`.
+- Accuracy policy (live-task IMEM): `set_audio_task_lle_accuracy`.
 - Output boundary: `osAiSetNextBuffer_recomp` — where finished PCM is named and
   flows to the cpal backend (NOT inside `dispatch_audio_task`; AKI/OoT tasks
   carry zero `OSTask.output_buff` and select destinations via ucode commands).
@@ -69,16 +61,11 @@ match against Revenge's `revenge_audio.toml`).
 The harness now executes admitted live IMEM through fn64's clean-room RSP
 interpreter. Remaining work is evidence and performance:
 
-1. Run the AKI audio ucode text (0x39510, 0xC54) through the **existing**
-   clean-room RSP → typed-Rust recompiler (`fn64-audio/src/rsp/recomp/`), the
-   same path that produced `oot-audio-ucode`, to emit an `aki-audio-ucode`
-   crate. One implementation covers the whole AKI family (identical bytes).
-2. Compare any optional translated AKI artifact against the live-IMEM LLE
-   baseline. Translated execution is not release authority by itself.
-3. Verify AKI RSP ops the recompiler emits are all covered by the interpreter
-   (the AKI audio library may exercise VU/scalar ops OoT's aspMain didn't);
-   add differential-oracle vectors for any new ones. This is where real
-   effort may hide — unknown until the AKI ucode is decoded.
+1. Run repeated content-bound WM2000 tasks through live-IMEM LLE and retain
+   fixed-cycle framebuffer/audio/device/memory evidence.
+2. Verify every exercised AKI RSP operation and loud unsupported frontier.
+3. Compare any optional translated artifact against the live-IMEM baseline;
+   it remains diagnostic evidence, not release authority.
 4. Confirm WM2000 menu music / SFX is audible through the already-live cpal
    path; add decode/resample/envmix unit vectors.
 
@@ -90,15 +77,12 @@ RSPRecomp-generated `.cpp`, or N64ModernRuntime GPL code
 "librecomp/rsp.hpp"`; the include is emitted unconditionally by
 `RSPRecomp/src/rsp_recomp.cpp:1179`). fn64's recompiler consumes the raw ucode
 TEXT BYTES (public N64 machine code from the ROM) and emits fn64-owned Rust
-against fn64-owned headers — that is the whole point, and it is already how
-`oot-audio-ucode` was produced. Permissively-licensed emulator RSP-HLE audio
+against fn64-owned headers. Permissively-licensed emulator RSP-HLE audio
 may be read for documented command semantics only after verifying the specific
 file's license.
 
 ## Bottom line
 
-fn64's audio subsystem is MIT-clean and complete enough to make OoT audible.
-WM2000 needs the AKI shared-audio-library ucode run through the **existing**
-recompiler (like OoT's aspMain was) and registered — plus filling any RSP-op
-gaps the AKI library exercises. It is an extension of a working system, not a
-new build.
+fn64's production accuracy path is live-IMEM LLE. WM2000 still needs repeated
+private-input audio validation and any exercised RSP gaps closed before an
+end-to-end sound claim is made.

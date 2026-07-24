@@ -1,16 +1,17 @@
-//! One-time commit authority for exactly matched speculative audio effects.
+//! Test-only characterization of a quarantined speculative commit design.
 //!
 //! The speculative runner owns no live runtime handle. This module preserves
-//! that property while making the transition from evidence to mutation
-//! explicit: a lane result is first checked against its modeled outcome, then
-//! that outcome must compare exactly with the reference outcome. Only the
-//! resulting non-cloneable token can yield a non-cloneable commit payload.
+//! that property, but this reduced projection is not commit authority:
+//! `RspVisibleState` omits architectural state and the comparison does not
+//! consume the paired `WholeAudioTaskHleLane` that owns the same snapshot.
 //!
 //! This is intentionally a *ucode-phase* commit. The current post-rspboot
 //! snapshot starts after rspboot has already run, so it cannot carry rspboot's
 //! earlier RDRAM patches or pre-entry device effects. A whole-task commit must
-//! add those boot effects to a separate owned value before this seam may be
-//! used by the live dispatcher; this module does not invent them.
+//! add those boot effects, complete RSP architectural state, and a paired
+//! same-snapshot seal before any seam may be used by the live dispatcher.
+//! `lib.rs` therefore keeps this module crate-private with no production
+//! activation caller.
 
 use core::num::NonZeroU64;
 
@@ -112,13 +113,13 @@ pub enum PrepareUcodeCommitError {
 /// Construction consumes the speculative result. Callers cannot substitute a
 /// second effect image after its outcome has been checked.
 #[derive(Debug)]
-pub struct UcodePhaseCommitCandidate {
+pub(crate) struct UcodePhaseCommitCandidate {
     outcome: AudioTaskOutcome,
     effects: CommitReadyUcodeEffects,
 }
 
 impl UcodePhaseCommitCandidate {
-    pub fn from_lle_result(
+    pub(crate) fn from_lle_result(
         outcome: AudioTaskOutcome,
         result: SpeculativeAudioLleResult,
     ) -> Result<Self, PrepareUcodeCommitError> {
@@ -133,25 +134,15 @@ impl UcodePhaseCommitCandidate {
         })
     }
 
-    pub const fn outcome(&self) -> &AudioTaskOutcome {
+    pub(crate) const fn outcome(&self) -> &AudioTaskOutcome {
         &self.outcome
     }
 }
 
-/// Non-forgeable proof, within this module, that both complete outcomes match.
-///
-/// This type intentionally implements neither `Clone` nor `Copy`. Consuming it
-/// is the only public route to a commit payload.
-///
-/// ```compile_fail
-/// use fn64_audio::hle_commit::VerifiedUcodePhaseCommitToken;
-///
-/// fn duplicate(token: VerifiedUcodePhaseCommitToken) {
-///     let _second_authority = token.clone();
-/// }
-/// ```
+/// Test-only representation retained to characterize the rejected design.
+/// It is not production commit authority.
 #[derive(Debug)]
-pub struct VerifiedUcodePhaseCommitToken {
+pub(crate) struct VerifiedUcodePhaseCommitToken {
     candidate: UcodePhaseCommitCandidate,
     _verified: ExactOutcomeSeal,
 }
@@ -159,8 +150,8 @@ pub struct VerifiedUcodePhaseCommitToken {
 #[derive(Debug)]
 struct ExactOutcomeSeal;
 
-/// Compare in the stable first-divergence order and mint one commit authority.
-pub fn verify_ucode_phase_commit(
+/// Compare the reduced projections for characterization only.
+pub(crate) fn verify_ucode_phase_commit(
     reference: &AudioTaskOutcome,
     candidate: UcodePhaseCommitCandidate,
 ) -> Result<VerifiedUcodePhaseCommitToken, AudioTaskOutcomeMismatch> {
@@ -173,7 +164,7 @@ pub fn verify_ucode_phase_commit(
 
 impl VerifiedUcodePhaseCommitToken {
     /// Consume the comparison proof and expose the owned ucode-phase effects.
-    pub fn into_commit(self) -> VerifiedUcodePhaseCommit {
+    pub(crate) fn into_commit(self) -> VerifiedUcodePhaseCommit {
         let UcodePhaseCommitCandidate { outcome, effects } = self.candidate;
         VerifiedUcodePhaseCommit {
             selection: outcome.selection(),
@@ -195,7 +186,7 @@ impl VerifiedUcodePhaseCommitToken {
 /// commit call. It contains no device, renderer, JIT, scheduler, interrupt,
 /// timing, or RDRAM pointer.
 #[derive(Debug)]
-pub struct VerifiedUcodePhaseCommit {
+pub(crate) struct VerifiedUcodePhaseCommit {
     selection: AudioHleSelection,
     terminal: AudioTaskTerminalReason,
     rdram_patches: CanonicalRdramPatches,
@@ -208,44 +199,44 @@ pub struct VerifiedUcodePhaseCommit {
 }
 
 impl VerifiedUcodePhaseCommit {
-    pub const fn selection(&self) -> AudioHleSelection {
+    pub(crate) const fn selection(&self) -> AudioHleSelection {
         self.selection
     }
 
-    pub const fn terminal(&self) -> AudioTaskTerminalReason {
+    pub(crate) const fn terminal(&self) -> AudioTaskTerminalReason {
         self.terminal
     }
 
-    pub const fn rdram_patches(&self) -> &CanonicalRdramPatches {
+    pub(crate) const fn rdram_patches(&self) -> &CanonicalRdramPatches {
         &self.rdram_patches
     }
 
-    pub const fn pcm_ranges(&self) -> &CanonicalRdramRanges {
+    pub(crate) const fn pcm_ranges(&self) -> &CanonicalRdramRanges {
         &self.pcm_ranges
     }
 
-    pub const fn rsp_memory(&self) -> &RspMemorySnapshot {
+    pub(crate) const fn rsp_memory(&self) -> &RspMemorySnapshot {
         &self.rsp_memory
     }
 
-    pub const fn machine_state(&self) -> &RspMachineState {
+    pub(crate) const fn machine_state(&self) -> &RspMachineState {
         &self.machine_state
     }
 
-    pub const fn pc_low12(&self) -> u32 {
+    pub(crate) const fn pc_low12(&self) -> u32 {
         self.pc_low12
     }
 
-    pub fn dpc_submissions(&self) -> &[DeferredDpcSubmission] {
+    pub(crate) fn dpc_submissions(&self) -> &[DeferredDpcSubmission] {
         &self.dpc_submissions
     }
 
-    pub const fn steps(&self) -> AudioTaskStepTotals {
+    pub(crate) const fn steps(&self) -> AudioTaskStepTotals {
         self.steps
     }
 
     /// Move every field into the dependency-direction-neutral adapter parts.
-    pub fn into_parts(
+    pub(crate) fn into_parts(
         self,
         task_admission_generation: NonZeroU64,
     ) -> VerifiedUcodePhaseCommitParts {
@@ -264,31 +255,9 @@ impl VerifiedUcodePhaseCommit {
     }
 }
 
-/// Opaque authority accepted by a higher-layer commit adapter.
-///
-/// This value remains non-cloneable and its fields are private. The sole
-/// consuming accessor moves every component into one callback, so a caller
-/// cannot construct commit authority from otherwise-valid effect values or
-/// apply the same verified authority twice.
-///
-/// ```compile_fail
-/// use fn64_audio::hle_commit::VerifiedUcodePhaseCommitParts;
-///
-/// let forged = VerifiedUcodePhaseCommitParts {
-///     task_admission_generation: todo!(),
-///     selection: todo!(),
-///     terminal: todo!(),
-///     rdram_patches: todo!(),
-///     pcm_ranges: todo!(),
-///     rsp_memory: todo!(),
-///     machine_state: todo!(),
-///     pc_low12: 0,
-///     dpc_submissions: Vec::new(),
-///     steps: todo!(),
-/// };
-/// ```
+/// Test-only adapter parts retained to characterize the rejected design.
 #[derive(Debug)]
-pub struct VerifiedUcodePhaseCommitParts {
+pub(crate) struct VerifiedUcodePhaseCommitParts {
     task_admission_generation: NonZeroU64,
     selection: AudioHleSelection,
     terminal: AudioTaskTerminalReason,
@@ -304,7 +273,7 @@ pub struct VerifiedUcodePhaseCommitParts {
 impl VerifiedUcodePhaseCommitParts {
     /// Consume this authority exactly once and move all verified components
     /// into the adapter operation.
-    pub fn consume_with<T>(
+    pub(crate) fn consume_with<T>(
         self,
         apply: impl FnOnce(
             NonZeroU64,
