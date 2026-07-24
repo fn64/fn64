@@ -59,7 +59,7 @@ impl Overlay {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = SMOKE;
         visuals.window_fill = SMOKE;
-        visuals.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x2A, 0x2A, 0x2F));
+        visuals.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x2A, 0x2A, 0x2F));
         visuals.window_rounding = Rounding::same(6.0);
         visuals.override_text_color = Some(INK);
         ctx.set_visuals(visuals);
@@ -436,7 +436,7 @@ fn stick_scope(ui: &mut egui::Ui, config: &mut InputConfig, gamepads: &Gamepads,
     let center = rect.center();
     let radius = rect.width() / 2.0 - 6.0;
 
-    painter.circle_stroke(center, radius, Stroke::new(1.0, MUTED));
+    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, MUTED));
     painter.circle_filled(
         center,
         radius * config.deadzone,
@@ -445,7 +445,7 @@ fn stick_scope(ui: &mut egui::Ui, config: &mut InputConfig, gamepads: &Gamepads,
     painter.circle_stroke(
         center,
         radius * config.deadzone,
-        Stroke::new(1.0, Color32::from_rgb(0x3A, 0x3A, 0x41)),
+        Stroke::new(1.0_f32, Color32::from_rgb(0x3A, 0x3A, 0x41)),
     );
 
     // egui y grows downward; stick y grows upward.
@@ -457,7 +457,7 @@ fn stick_scope(ui: &mut egui::Ui, config: &mut InputConfig, gamepads: &Gamepads,
     painter.circle_filled(to_screen(fx, fy), 4.5, C_YELLOW);
     painter.line_segment(
         [to_screen(rx, ry), to_screen(fx, fy)],
-        Stroke::new(1.0, Color32::from_rgb(0x3A, 0x3A, 0x41)),
+        Stroke::new(1.0_f32, Color32::from_rgb(0x3A, 0x3A, 0x41)),
     );
 
     ui.add_space(4.0);
