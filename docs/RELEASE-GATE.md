@@ -21,13 +21,13 @@ zero-unsupported full-ROM claim has been made.
 The digest rejects a wrong-cycle, duplicate, reordered, or omitted channel.
 Each channel has a canonical lowercase SHA-256, and both live construction and
 retained-report verification recompute the artifact root from the
-`fn64.release-gate.v23` schema, cycle, exact ordered channel set, byte lengths,
-and channel hashes. Schema v23 emits each closure path's typed observation
+`fn64.release-gate.v28` schema, cycle, exact ordered channel set, byte lengths,
+and channel hashes. Schema v28 emits each closure path's typed observation
 count and `report_sha256`, an explicit wire digest over the schema, scenario,
 private input hash, complete fixed-cycle digest, and canonical counted closure
 ledger.
 
-For ROM input, v23 additionally binds the declared class, source z64/n64/v64
+For ROM input, v28 additionally binds the declared class, source z64/n64/v64
 order, byte length, SHA-256 after canonical big-endian normalization, raw
 destination code, decoded NTSC/PAL/M-PAL or region-free class, and the concrete
 TV standard configured in the device and renderer. Construction compares the
@@ -38,7 +38,7 @@ mismatches fail loudly. Region-free codes retain the concrete host choice but
 satisfy no fixed TV-region requirement. ROM class is never inferred from
 bytes. A generic declaration remains audit data, not certification authority;
 only the private admission/contract path described below can authorize class
-credit. On Windows, v23 also requires an exact native workstation identity:
+credit. On Windows, v28 also requires an exact native workstation identity:
 kernel major/minor/build, update build revision (UBR), and the Windows 10 or 11
 family derived from that build. Server products, detected Wine hosts, missing
 UBR, and caller-relabeled families fail closed. Non-Windows reports cannot
@@ -93,7 +93,7 @@ requested `Automatic` setting is never an evidence identity. The exact API is
 observed from the completed capture framebuffer and command-list types and
 must agree with any explicit request, the host platform, and the authoritative
 backend identity's post-VI capture API. V22 and earlier reports are rejected
-rather than reinterpreted under the v23 device-authority wire.
+rather than reinterpreted under the v28 device-authority wire.
 The Memory
 artifact byte count must be exactly eight
 MiB. A reference Framebuffer artifact count must equal its RGBA16 payload; a
@@ -105,7 +105,7 @@ truly program-free fixture from an unidentified linked native/C program. V10
 lacks the boundary-frozen platform, four-port, cartridge-save, and renderer
 environment, while v11 omits Controller Pak bank geometry and the active bank
 latch. Cite the report SHA for cross-run evidence; the artifact root
-alone does not bind the scenario's private-input or environment (although v23's
+alone does not bind the scenario's private-input or environment (although v28's
 DeviceState component binds installed-ROM and executable-program identities). The
 report never serializes ROM, framebuffer,
 audio, trace source, or RDRAM bytes. Device and trace encodings have explicit
@@ -113,10 +113,18 @@ big-endian wire formats; Rust `Debug`, host wall time, and the diagnostic
 sequence counter do not enter the root.
 
 The artifact-root wire is itself domain-separated by the release-report
-schema. Moving from v22 to v23 intentionally changes both the artifact root
-and `report_sha256`: v23 requires the expanded internal DeviceState v10 wire,
-so a retained v22 report cannot be accepted under the new owner-state
-semantics. V22 added DeviceState v9's executor, HostState, mapped-fetch/AOT,
+schema. Moving from v27 to v28 intentionally changes both the artifact root
+and `report_sha256`: v28 requires internal DeviceState v15, which canonicalizes
+DPC CLOCK, BUFBUSY, PIPEBUSY, and TMEM to their public 24-bit domains. A
+retained v27 report cannot be reinterpreted under those narrower counter
+semantics. The earlier v26-to-v27 transition introduced DeviceState v14 and
+bound the process-monotonic admission generation of every loaded, running,
+yielded, or in-flight RSP task owner. V26 introduced
+DeviceState v13's complete ABI-owned RSP interpreter continuation described
+below. The earlier v24-to-v25 transition added DeviceState v12's DPC
+CLOCK, BUFBUSY, PIPEBUSY, and TMEM projection. V24 added DeviceState
+v11's frozen audio-task execution policy and translated artifact identity. V23 added DeviceState v10's AI
+and DPC latches and pending transactions. V22 added DeviceState v9's executor, HostState, mapped-fetch/AOT,
 and SI/PFS transaction projection. V21 made memory/audio/trace observations boundary-owned,
 cross-checks reference pixels against frozen RDRAM, and binds the compiled
 `fn64.unsupported-instrumentation.v1` schema/SHA-256. V20 added exact native
@@ -128,20 +136,20 @@ active graphics API to the canonical RT64 environment. The preceding v17 transit
 v1 RSP/RDP observation wire with `fn64.rsp-rdp-observations.v2`, adding
 task-start microcode-data address, exact length, and digest to each recognition
 event. V16 had already added the ordered stream with text identity; no older
-root can be relabeled as v23 evidence.
+root can be relabeled as v28 evidence.
 
 Consumers call `ReleaseGateReport::verify_integrity()` after deserializing a
 retained JSON artifact. `require_closed()` performs that verification first,
 so a mutated scenario, input hash, digest, observation descriptor, or ledger
 cannot be accepted with a stale report SHA. Verification also rejects a stale
-pre-v23 artifact root and contradictory closure states: unexercised means zero
+pre-v28 artifact root and contradictory closure states: unexercised means zero
 observations and events, zero-unsupported requires a positive count and no
 events, and unsupported requires a positive count covering a nonempty event
 list.
 
-Schema v23 retains `execution.unsupported-event-source` as a twelfth mandatory
+Schema v28 retains `execution.unsupported-event-source` as a twelfth mandatory
 path and the host-owned machine-readable observation geometry introduced by
-v6. Its internal `fn64.device-evidence.v10` channel retains schema v7's compact guest register projection,
+v6. Its internal `fn64.device-evidence.v15` channel retains schema v7's compact guest register projection,
 PI timing-policy identity, pending PI/SI/AI/SP/RCP work and exact scheduled
 event ordering, the complete VI register file and epoch, PIF RAM, RSP DMEM and
 IMEM, SP DMA/register/semaphore state, and installed cartridge-save bytes plus
@@ -154,11 +162,32 @@ ROM/RAM, mapper, RTC, and guest-clock state; high-level VI manager and
 compatibility-retrace state; and ABI-owned PI/SI completion and VI-latch
 metadata. DeviceState v10 additionally binds every guest-visible AI latch,
 every DPC START/END/CURRENT/STATUS register, and the tokenized pending DPC
-range and RDRAM-or-DMEM source. The DeviceState v7 wire additionally binds the future-affecting raw
+range and RDRAM-or-DMEM source. DeviceState v11 added the install-once
+audio-task execution policy and, for translated diagnostic mode, the exact
+host-artifact SHA-256. DeviceState v12 additionally binds DPC CLOCK, BUFBUSY,
+PIPEBUSY, and TMEM. DeviceState v13 added the ABI-owned RSP interpreter state
+with distinct `Reset`, `Exact`, `HleCompatibility`,
+`HleCompatibilityUnavailable`, and `InFlight` tags. Exact and compatibility
+states bind all 32 scalar registers, SP DMA addresses and lengths,
+jump/resume state, all 32 eight-lane vector registers, every signed 48-bit
+accumulator lane, VCO/VCC/VCE, divider input/valid/output latches, SP status
+and semaphore, all eight DPC registers, and every ordered queued DPC
+submission with source, range, payload, and canonical words. DeviceState v14
+adds process-monotonic admission generations to the loaded-task token, sorted
+task lineage, next-generation allocator, and unavailable/in-flight owner tags;
+the latter two bind both task offset and generation. DeviceState v15
+additionally requires all four public DPC performance counters to be canonical
+24-bit values before encoding. It does not claim counter increments or STATUS
+counter-clear/transaction interleavings that the runtime does not yet model.
+Report construction freezes the same policy
+at the committed VI edge and accepts only `LleAccuracy`; unconfigured,
+translated, and diagnostic-skip execution cannot satisfy a fixed-cycle release
+claim. The DeviceState v7 wire additionally binds the future-affecting raw
 VRU initialization-sequence position, the authoritative loaded-RSP-task token,
 and sorted yielded-task lineage with original headers and exact microcode-data
 identities plus its `Running`/`ResumeAuthorized`/`ResumeLoaded` lifecycle
-phase. Host pointer values are excluded while
+phase. V14 additionally binds each token and lineage generation plus the next
+generation that a successful `osSpTaskLoad` will mint. Host pointer values are excluded while
 their validated one-RDRAM length and guest-visible delivery metadata are bound. A field-family
 perturbation sweep and explicit collision regressions ensure those
 future-affecting states cannot retain the same DeviceState digest. V9 adds
@@ -179,7 +208,7 @@ the complete typed pending or posted-before-resume `osPfsIsPlug` transaction,
 including its thread, queue/message route, checked result address, and latched
 bitmap. Append-only save and controller-operation
 histories are also excluded from DeviceState v7 because they cannot affect a
-future device result; their typed observations instead enter the canonical v23
+future device result; their typed observations instead enter the canonical v28
 closure ledger and therefore the report SHA. V18 likewise keeps historical
 execution outside DeviceState. Identified native archives retain guest cycle,
 section index, function offset, and link VRAM from the injected first-body-entry
@@ -192,10 +221,10 @@ holes, failed destinations, and host calls do not count. A no-program fixture
 must have an empty stream. Unidentified native programs, typed function lanes
 without a regenerated entry-observation schema marker, cross-lane entries, missing block-runner identity,
 future cycle-stamped entries, and any entry appended after the committed
-boundary fail closed. The v23 RSP/RDP stream is likewise append-only release
+boundary fail closed. The v28 RSP/RDP stream is likewise append-only release
 observation rather than future-affecting DeviceState. Previously retained v7
 through v22 reports remain historical evidence but are not valid inputs to the
-v23 series verifier.
+v28 series verifier.
 Regenerate each scenario's ten-report series; do not reinterpret or edit old
 reports.
 
@@ -207,7 +236,7 @@ the producer-supplied artifact identity, stable `(link VRAM, symbol)` identity,
 and current guest cycle. Artifact identity alone is insufficient: authoritative
 installation must consume the regenerated artifact's exported
 `FN64_FUNCTION_ENTRY_OBSERVATION_SCHEMA` marker. The committed-boundary freeze,
-v23 report, private admission, and paired verifier consume that stream as the
+v28 report, private admission, and paired verifier consume that stream as the
 distinct `typed_observed_function` lane. The stale `typed_function` label and
 identity-only installations remain rejected.
 
@@ -306,7 +335,7 @@ retain execution order; an undrained storage-owner history is a loud invariant
 failure rather than a best-effort merge with unknowable order.
 
 The live gate derives those entries from captured bytes and typed trace events;
-its host cannot mark them covered by declaration, and the schema-v23 report
+its host cannot mark them covered by declaration, and the schema-v28 report
 factory is crate-private so external callers cannot bypass the typed live
 capture methods accidentally. `unexercised` means no corresponding
 observation reached the gate. `exercised_zero_unsupported` means the path ran
@@ -337,7 +366,7 @@ typed event is appended and flushed immediately. Journal v3 binds a canonical,
 caller-supplied run-event SHA-256 in that armed header, then writes its
 completion record only after the fixed-cycle report itself is durable and
 binds the exact guest cycle, the report's `report_sha256`, and the same run
-identity. A closed v23 report is release evidence only when paired with that
+identity. A closed v28 report is release evidence only when paired with that
 terminal v3 journal. A
 journal with events but no completion identifies a reached loud trap; an
 armed-only journal identifies an early abort or otherwise unobserved path; and
@@ -425,7 +454,7 @@ Reference pixels must equal the named range of that frozen RDRAM image.
 An instruction checkpoint reaching `C` never captures a report; a later step
 past `C` fails loudly. A step limit, swap limit, or idle exit before `C` also
 cannot return success without a report. This opaque-boundary rule is
-independent of the schema-v23 wire shape and its geometry-bound encoding.
+independent of the schema-v28 wire shape and its geometry-bound encoding.
 
 The cycle, report, and run-event variables are an inseparable triple. A
 partial, mixed generic/OoT, non-Unicode, relative-report-path, or noncanonical
@@ -450,7 +479,7 @@ The OoT host supplies presentation evidence from live state, not fixture buffers
 - memory bytes come only from the boundary-owned complete physical eight-MiB
   RDRAM image in logical byte order.
 
-Schema v23 binds both paths through one typed descriptor. Reference capture can
+Schema v28 binds both paths through one typed descriptor. Reference capture can
 only construct physical-RDRAM RGBA16 evidence, RT64 capture can only construct
 post-VI BGRA8 evidence, and both require a complete logical-byte observation of
 physical eight-MiB RDRAM. The release-matrix verifier derives presentation
@@ -550,7 +579,7 @@ same private child build and first verifies that its SHA-256 equals the build's
 typed-function artifact identity. The concrete commands live in
 `PRIVATE-INPUT-ADMISSION.md`.
 
-Build evidence does not stand in for runtime microcode kickoff identity. Each v23
+Build evidence does not stand in for runtime microcode kickoff identity. Each v28
 production report must contain at least one individual recognized microcode event whose
 text SHA-256, data length, and data SHA-256 equal the admitted
 `microcode_text`/`microcode_data` pair and whose family is present. Split
@@ -560,21 +589,21 @@ text-only HLE recognition cannot populate it. The ABI hashes logical RDRAM data 
 at authoritative task start; replacement IMEM generations retain that original
 identity, and a one-way typed lifecycle retires ordinary completion while
 making each public yielded-resume authorization load-consumable exactly once.
-Retained v23 validation requires every task address to name a complete 64-byte
+Retained v28 validation requires every task address to name a complete 64-byte
 header inside physical 8 MiB RDRAM, every nonempty microcode-data and DRAM-DPC
 range to fit there, and every XBUS-DPC range to fit the 4 KiB DMEM bank.
 These mechanisms make a valid contract launchable. Representative private NTSC
 full-ROM schema-v22 exact-ten series for reference and RT64 LLE/post-VI
 completed and were reverified locally on 2026-07-22. Those historical results
 exercise the orchestration and evidence path for two private full-ROM scenarios
-but require schema-v23 regeneration and do not close the remaining
+but require schema-v28 regeneration and do not close the remaining
 release-matrix denominator. A separately retained public
 synthetic XBUS series supplies a third generic mechanism scenario without
 private-ROM authority.
 
 The production loader no longer resolves or launches `/usr/bin/python3` and
 cross-compiles with its stable Windows file-ID path for
-`x86_64-pc-windows-msvc`. Native Windows execution and positive Windows v23
+`x86_64-pc-windows-msvc`. Native Windows execution and positive Windows v28
 full-ROM/platform-case evidence remain missing and therefore uncredited.
 Receipt re-verification also requires the current verifier executable to hash
 to the exact runner image recorded by the receipt, so that binary is part of
@@ -598,7 +627,7 @@ cargo run -p fn64-boot-harness --bin verify-release-evidence-series -- \
 ```
 
 The required `--program-lane` value must match the content-free readiness
-report emitted before the run. The checker compares it with every v23
+report emitted before the run. The checker compares it with every v28
 report's `execution_destinations.source`; stale `typed_function` and
 `unidentified_native` are rejected with the exact remediation before any
 report pair is accepted, and a source mismatch says to rerun rather than
@@ -636,7 +665,7 @@ command. It then writes DPC START/END, reaches BREAK, and forwards the captured
 command image through the production LLE task path to the reference renderer.
 A separate DRAM-DPC submission preserves both mechanism observations. The
 scenario presents the resulting framebuffer, commits the exact scheduled VI
-edge, and captures all five schema-v23 channels plus the ABI-owned RSP/RDP
+edge, and captures all five schema-v28 channels plus the ABI-owned RSP/RDP
 stream.
 One invocation writes one report and
 one bound v3 journal. The runner must generate a fresh canonical event identity
@@ -725,33 +754,26 @@ actually enters it through the ABI-owned native-entry hook before committing
 `IdentifiedNativeArchive` at the VI edge. Filesystem paths do not enter the
 archive identity or report.
 
-Ten independent feature-enabled processes on 2026-07-20 produced ten distinct
-report/journal pairs. The paired series verifier accepted all ten at guest
-cycle `1562500` under scenario
-`synthetic-native-archive-runtime-device-render-fixed-cycle-v1`. Their exact
-digests are historical manual evidence, not tested by the current schema, and
-therefore are not release gates. Together with the schema-v10 program-family
-collision sweep, this proves the native archive build/link/identity/capture
-mechanism over exact public fixture bytes. It does not certify a real generated-C
-archive, callable-body completeness, a private ROM, representative execution,
-or full-ROM unsupported-event closure.
-
-The historical schema-v22 XBUS extension passed ten independent feature-enabled
-processes on 2026-07-22 at guest cycle `1562500`. All ten reports had semantic
-SHA-256 `5fcb34d990ed0e17939028cdbe048ae5888084cf8c8d74c78aa20a95bd1000b4`
-and artifact-root SHA-256
-`333dc943a42af3e8e1115160201198e12bcc6dc34c9ef712ee63d9c0f1bfc77f`;
-the paired series verifier accepted all ten distinct v3 journals. After the
-DMA-busy wait and valid Controller Manager call sequence landed, the
-feature-gated integration test passed ten consecutive parent invocations,
-each launching and verifying its own ten fresh children (100 children total,
-not one 100-event series). It requires zero unsupported events and the exact
-40-byte XBUS observation in every report, then feeds each series to matrix v5.
+The current schema-v28 XBUS gate measures both caller-supplied archives and
+child invocation inside a specialized synthetic-only series operation. That
+operation returns only its self-hashed receipt; it cannot expose the general
+verified-contract, verified-series, or matrix-authority capabilities. Repository
+acceptance comes solely from exact comparison with the checked-in
+`aarch64-apple-darwin` semantic fingerprint. That fingerprint includes the
+target, host platform, individual build-produced archive hashes, their combined
+native-program identity, and every report semantic field. The feature-gated
+integration test passed ten consecutive parent invocations on macOS arm64
+on 2026-07-24, each launching and verifying its own ten fresh children (100
+children total, not one 100-event series). It re-verifies the receipt, requires
+zero unsupported events and the exact 40-byte XBUS observation in every report,
+then feeds each series to matrix v5.
 The synthetic-only incomplete assessment satisfies five project-owned rows, including
 `rsp_rdp_mechanism:xbus-dpc`; the report label does not supply that credit.
 Because this identified-native series is generic public evidence, it has no
-private-ROM authority and no trusted-runner receipt. Caller-supplied run-event
-identities retain series integrity but are not process attestation.
+private-ROM authority. Its receipt is local integrity evidence, not repository
+acceptance, matrix authority, or external process attestation. Compiler, SDK,
+or target drift fails the exact golden comparison closed; another target needs
+a separately reviewed target-named golden rather than a dynamic replacement.
 
 Schema v11 added environment evidence derived exclusively from owners frozen
 at the committed VI boundary: supported host target, exact four-port PIF
@@ -799,7 +821,7 @@ blockers on each target. Synthetic fixtures are mechanism evidence and cannot
 satisfy a real full-ROM class.
 
 Each of at most 64 scenario declarations binds only a stable diagnostic ID,
-one exact schema-v23 `report_scenario`, private-input SHA-256, report SHA-256,
+one exact schema-v28 `report_scenario`, private-input SHA-256, report SHA-256,
 and a canonical v5 `declaration_sha256` over those identities. The verifier
 first validates every report, then routes it by the report's own `scenario`
 value, which must match exactly one manifest declaration; command-line IDs
@@ -818,7 +840,7 @@ can satisfy program/renderer-lane, save, controller, and RSP/RDP mechanism
 requirements. It also credits `macos-metal` or `linux-vulkan` only when a
 validated RT64 report binds the matching concrete active API, authoritative
 post-VI identity, and host platform. Scenario labels, reference rendering, and
-coarse platform coverage cannot manufacture that credit. A Windows v23 report
+coarse platform coverage cannot manufacture that credit. A Windows v28 report
 derives exactly one of the four versioned Windows targets only when its native
 build-derived family and observed D3D12/Vulkan API agree. No positive Windows
 report is retained or claimed by this mechanism work.
@@ -830,11 +852,11 @@ applicable; a controller with an accessory projects both
 `standard_controller` and that accessory. RT64 evidence requires the
 authoritative clean fn64 adapter identity, matching post-VI settings identity,
 LLE-accuracy policy, and exact post-VI capture. Every scenario still requires
-exactly ten schema-v23 reports, each paired with its terminal v3 journal and a
+exactly ten schema-v28 reports, each paired with its terminal v3 journal and a
 globally unique run-event identity, while proving all five fixed-cycle
 artifacts, every live-minimum path, and zero reached unsupported events.
 
-Schema v23 exposes normalized ROM identity, a host-supplied typed ROM class,
+Schema v28 exposes normalized ROM identity, a host-supplied typed ROM class,
 and decoded TV region. A fixed NTSC/PAL/MPAL header earns TV-region coverage
 only after the report has also proved agreement with the boundary-frozen device
 and renderer TV standards; a region-free header earns no regional credit.
@@ -855,14 +877,14 @@ homebrew-shaped fixture: the Rust test admission helper emits the contract
 wire, a typed-block build receipt binds the child, the trusted runner
 retains ten fresh processes, and the opaque series earns only its exact
 fixture ROM-class row. Reordered supplied run events and a changed retained
-report both fail. The child's schema-v23 report template makes this authority-
+report both fail. The child's schema-v28 report template makes this authority-
 plumbing evidence, not representative-ROM, runtime, renderer, or microcode
 behavioral evidence; its `Other` microcode identity cannot enter the empty
 certified-public-microcode catalog.
 
 RT64 target-case credit has a separate opaque
 `VerifiedRt64PlatformCaseSeries` boundary. Its retained projection binds the
-exact v23 report scenario and semantic report SHA, exact ordered matrix run
+exact v28 report scenario and semantic report SHA, exact ordered matrix run
 events, native host identity, observed graphics/capture API, pinned RT64 and
 adapter identities, the fn64 certification-source digest, the builder Cargo
 binary digest, child identity, case semantic digest, and the case's exact 10-
@@ -885,7 +907,7 @@ the verifier or sources during execution. No capability has yet been retained
 through this constructor, so no new target-case credit or positive Windows
 evidence is claimed here.
 
-Schema v23 still cannot expose blocker closure. Valid v23 evidence
+Schema v28 still cannot expose blocker closure. Valid v28 evidence
 therefore returns a typed `Incomplete` assessment listing the exact
 unsatisfied project-owned requirements; it never emits a smaller passing
 denominator. Allowed-source identities in a successor certified-public-
@@ -1033,7 +1055,7 @@ rejects operation paths outside the frozen environment (including PFS without
 a Controller Pak), re-derives scenario coverage from the retained report,
 enforces renderer combinations and exact program-lane agreement, proves that
 every member of the immutable profile has a validated evidence assignment,
-recomputes every declaration SHA, reconstructs each retained v23 report and
+recomputes every declaration SHA, reconstructs each retained v28 report and
 its report SHA, reconstructs the canonical manifest SHA, and re-derives any
 ROM-class assignment only from its retained authority record. This standalone
 check proves the artifact's canonical semantic integrity; without a signature
@@ -1053,7 +1075,7 @@ report/journal pairs rather than relabeling it as v18. V14 lacks schema-v19 ROM
 identity, decoded TV-region coverage, renderer TV-standard binding, and the
 separately retained verified-series ROM-class authority, so it is intentionally
 rejected. V15 lacks schema-v20 Windows host identity and retained opaque RT64
-platform-case authorities. V16 lacks v23's boundary-owned observations and
+platform-case authorities. V16 lacks v28's boundary-owned observations and
 unsupported-instrumentation identity. Both are intentionally rejected.
 
 Keep populated results private when their scenario names or hashes disclose
@@ -1078,16 +1100,18 @@ cargo run -p fn64-boot-harness --bin verify-release-matrix -- \
 As of this document revision, **no complete representative full-ROM
 certification matrix exists**. Two private representative v22 scenarios and
 one public synthetic mechanism scenario carry historical verified-series
-credit inside the previous canonical incomplete assessment. Schema v23 now
-requires regeneration before any of them are current. The exact state is:
+credit inside the previous canonical incomplete assessment. The public
+synthetic scenario now has a current schema-v28 exact-ten macOS arm64 gate;
+the private scenarios and joint matrix still require regeneration. The exact
+state is:
 
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
-| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | Ten retained public identified-native XBUS v22 reports historically supplied generic native/reference, no-cartridge-save, standard-controller, DRAM-DPC, and XBUS-DPC mechanism rows. They have no private-ROM authority or trusted private-series receipt, and require v23 regeneration; an incomplete assessment is not a complete retained matrix. |
-| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v23 report additionally owns memory/audio/trace bytes at the boundary, binds the unsupported-instrumentation denominator, and requires DeviceState v10. | Ten fresh schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities, but they are historical under v23. |
-| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit program identity, and runner-staged exact ROM/microcode-pair admission exist. | Ten fresh pinned-Metal schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities, but they are historical under v23. |
+| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | The schema-v28 macOS arm64 gate measures both supplied build-produced archives, launches ten fresh children, verifies its self-hashed receipt, and accepts only the exact target-named fingerprint containing the individual archive hashes and complete report semantics. It passed 10/10 parent invocations on 2026-07-24. Compiler/SDK/target drift fails closed and requires a separately reviewed target-specific golden. Historical v22 evidence supplied generic native/reference, no-cartridge-save, standard-controller, DRAM-DPC, and XBUS-DPC mechanism rows. Neither result has private-ROM authority, and an incomplete assessment is not a complete retained matrix. |
+| OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v28 report additionally owns memory/audio/trace bytes at the boundary, binds the unsupported-instrumentation denominator, and requires DeviceState v15. | Ten fresh schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities, but they are historical under v28. |
+| OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit program identity, and runner-staged exact ROM/microcode-pair admission exist. | Ten fresh pinned-Metal schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities, but they are historical under v28. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |
-| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v5 derives the schema-v23-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability; its production runner owns the exact child and repeat bar, and all 13 macOS/Metal examples emit the required identity envelope. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and an actual retained production platform-case authority remain unsupplied. |
+| Other Fast3D/F3DEX-family, S2DEX, regional, save-medium, controller/accessory, and platform ROM classes | Matrix v6 derives the schema-v28-visible fixed TV region, save, PFS, controller input, Rumble, Transfer Pak, Voice, renderer, program-lane, committed RSP/RDP-mechanism, and authoritative platform/API assignments while retaining the remaining project-owned profile entries as missing. Backend microcode labels are diagnostic only; independent public-microcode adjudication uses the empty project-owned catalog v1. Generic report verification deliberately cannot turn the retained ROM-class label into profile credit; the separate private-series path revalidates its contract, receipt, exact output files, raw ROM, and runner before retaining `fn64.verified-rom-class-authority.v1`. RT64 target-case credit additionally requires the opaque platform-series capability; its production runner owns the exact child and repeat bar, and all 13 macOS/Metal examples emit the required identity envelope. | No public-microcode requirement can be credited until allowed-source identities populate a successor catalog; regional and additional save/controller/render scenarios, positive native Windows evidence, and an actual retained production platform-case authority remain unsupplied. |
 
 Historical schema-v22 joint verification over all three scenarios revalidated 30
 reports and satisfied exactly 12 of 162 FullParityV1 requirements:
@@ -1098,8 +1122,8 @@ reports and satisfied exactly 12 of 162 FullParityV1 requirements:
 `imem-replacement`, and `macos-metal`. The other 150 remain explicit in
 the previous incomplete assessment v6. Current code emits v7 and must be
 remeasured before that assessment is current. Both private exact-ten series and the public XBUS
-series bind the same compiled unsupported-instrumentation denominator; no v23
-series or assessment has yet been retained. The
+series bind the same compiled unsupported-instrumentation denominator. No
+current private series or joint v28 assessment has yet been retained. The
 private capabilities and combined manifest bind their distinct authorities
 and exact identities.
 
@@ -1123,7 +1147,7 @@ classes.
 
 ## Remaining release frontier
 
-- Schema v23 aggregates the modeled device fabric, executor control,
+- Schema v28 aggregates the modeled device fabric, executor control,
   ABI HostState, typed-Rust program identity, and exact native/C linked-archive
   identity plus actual platform, four-port controller/accessory placement,
   typed cartridge-save configuration, and renderer identity/active API/policy at the
@@ -1132,8 +1156,8 @@ classes.
   canonical or portable, and archive identity does not prove callable-body
   completeness. Exact ordered native/typed-function/block execution
   destinations and the ordered RSP/RDP observation stream are bound, but equal
-  v23 digests do not claim excluded
-  continuation state is equal.
+  v28 digests do not assert byte-equivalent native coroutine stack frames;
+  those host-language frames remain the specifically excluded continuation.
 - Extend the typed unsupported-site registry whenever a new runtime, ABI, or
   renderer boundary is added; preserve failed-run journals with reports.
 - Populate and verify a representative private release matrix across the
@@ -1154,8 +1178,10 @@ make them hardware-cycle measurements. Provenance is fn64's typed
 `DeviceFabric`, shared trace contract, and live host state; no external runtime
 implementation was consulted.
 
-DeviceState v10 proves equality only for the modeled single-owner state. It
+DeviceState v15 proves equality only for the modeled single-owner state and
+canonical 24-bit DPC counter projection. It
 does not close measured AI/RDP timing or counters, DPC FREEZE/FLUSH behavior,
-subword RCP accesses, native-C observation while a task is in flight, or
-silicon bus/cache details. Those residuals remain explicit even when every v23
+STATUS counter-clear/transaction interleavings, subword RCP accesses,
+native-C observation while a task is in flight, or
+silicon bus/cache details. Those residuals remain explicit even when every v28
 digest channel matches.

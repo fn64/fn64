@@ -4,10 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AudioBackend trait: the audio seam per docs/DECOUPLING.md, symmetric with fn64-render. Real cpal sample-delivery backend; ucode EXECUTION is a loud named stub (GPL question pending)."
+description = "N64 host-audio delivery, clean-room RSP LLE, and exact-family audio HLE substrate"
 
 [dependencies]
 cpal = "0.18"
 fn64-runtime = { path = "../fn64-runtime" }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]

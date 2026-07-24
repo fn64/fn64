@@ -187,6 +187,224 @@ impl DataAccessError {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FixedFloatFormat {
+    Single,
+    Double,
+}
+
+impl FixedFloatFormat {
+    const fn fraction_bits(self) -> u32 {
+        match self {
+            Self::Single => 23,
+            Self::Double => 52,
+        }
+    }
+
+    const fn exponent_bias(self) -> u32 {
+        match self {
+            Self::Single => 127,
+            Self::Double => 1023,
+        }
+    }
+}
+
+/// Encode one signed fixed-point integer as IEEE S or D without entering the
+/// host floating-point environment. The returned boolean reports discarded
+/// nonzero source bits, independently of whether rounding changes the retained
+/// significand.
+fn encode_fixed_float(value: i64, format: FixedFloatFormat, mode: u8) -> (u64, bool) {
+    assert!(mode < 4, "FCSR.RM exceeds two bits");
+    if value == 0 {
+        return (0, false);
+    }
+
+    let negative = value < 0;
+    let magnitude = value.unsigned_abs();
+    let fraction_bits = format.fraction_bits();
+    let mut exponent = 63 - magnitude.leading_zeros();
+    let (mut significand, remainder, shift) = if exponent > fraction_bits {
+        let shift = exponent - fraction_bits;
+        (magnitude >> shift, magnitude & ((1u64 << shift) - 1), shift)
+    } else {
+        (magnitude << (fraction_bits - exponent), 0, 0)
+    };
+    let inexact = remainder != 0;
+    let increment = if !inexact {
+        false
+    } else {
+        match mode {
+            0 => {
+                let half = 1u64 << (shift - 1);
+                remainder > half || (remainder == half && significand & 1 != 0)
+            }
+            1 => false,
+            2 => !negative,
+            3 => negative,
+            _ => unreachable!("rounding mode was range-checked"),
+        }
+    };
+    if increment {
+        significand += 1;
+        if significand == 1u64 << (fraction_bits + 1) {
+            significand >>= 1;
+            exponent += 1;
+        }
+    }
+
+    let sign = u64::from(negative)
+        << (fraction_bits
+            + match format {
+                FixedFloatFormat::Single => 8,
+                FixedFloatFormat::Double => 11,
+            });
+    let exponent = u64::from(exponent + format.exponent_bias()) << fraction_bits;
+    let fraction = significand & ((1u64 << fraction_bits) - 1);
+    (sign | exponent | fraction, inexact)
+}
+
+const FPU_CAUSE_I: u8 = 1 << 0;
+const FPU_CAUSE_U: u8 = 1 << 1;
+const FPU_CAUSE_O: u8 = 1 << 2;
+
+/// Round an unsigned significand after a right shift without consulting the
+/// host floating-point environment. `mode` is FCSR.RM and `negative` selects
+/// the direction for RP/RM.
+fn round_shift_right(value: u64, shift: u32, mode: u8, negative: bool) -> (u64, bool) {
+    assert!(mode < 4, "FCSR.RM exceeds two bits");
+    if shift == 0 {
+        return (value, false);
+    }
+    let (retained, remainder, half) = if shift < 64 {
+        (
+            value >> shift,
+            value & ((1u64 << shift) - 1),
+            Some(1u64 << (shift - 1)),
+        )
+    } else {
+        (0, value, (shift == 64).then_some(1u64 << 63))
+    };
+    let inexact = remainder != 0;
+    let increment = inexact
+        && match mode {
+            0 => half
+                .is_some_and(|half| remainder > half || (remainder == half && retained & 1 != 0)),
+            1 => false,
+            2 => !negative,
+            3 => negative,
+            _ => unreachable!("rounding mode was range-checked"),
+        };
+    (retained + u64::from(increment), inexact)
+}
+
+fn overflowed_single(mode: u8, negative: bool, max: u32, infinity: u32) -> u32 {
+    match (mode, negative) {
+        (0, _) => infinity,
+        (1, _) => max,
+        (2, false) | (3, true) => infinity,
+        (2, true) | (3, false) => max,
+        _ => unreachable!("FCSR.RM exceeds two bits"),
+    }
+}
+
+const COP0_STATUS_FR: u32 = 1 << 26;
+
+/// View-independent contents of the 32 physical COP1 FGRs.
+///
+/// This is the state-transfer currency for ABI bridges, coroutine ownership,
+/// and deterministic evidence. It deliberately does not expose an FR-shaped
+/// array: FR is a view selected by the receiving [`RecompContext`]'s Status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhysicalFgrState([u64; 32]);
+
+impl PhysicalFgrState {
+    pub const fn from_words(words: [u64; 32]) -> Self {
+        Self(words)
+    }
+
+    pub const fn into_words(self) -> [u64; 32] {
+        self.0
+    }
+}
+
+/// The 32 physical COP1 Floating-Point General registers (FGRs).
+///
+/// VR4300 User's Manual section 5.2 defines each FGR as 32 bits wide when
+/// Status.FR=0 and 64 bits wide when FR=1. Section 5.3 defines an FR=0
+/// doubleword FPR as the low words of adjacent even/odd FGRs, while an FR=1
+/// FPR is one complete 64-bit FGR. Retaining all 64 bits in every physical
+/// FGR makes changing FR a view change: bits inaccessible in FR=0 survive and
+/// become visible again when FR=1 is restored.
+#[derive(Clone, Debug, Default)]
+struct FprFile {
+    fgr: [u64; 32],
+}
+
+impl FprFile {
+    #[inline]
+    fn word(&self, idx: u8) -> u32 {
+        self.fgr[idx as usize] as u32
+    }
+
+    #[inline]
+    fn set_word(&mut self, idx: u8, bits: u32) {
+        let slot = &mut self.fgr[idx as usize];
+        *slot = (*slot & 0xFFFF_FFFF_0000_0000) | u64::from(bits);
+    }
+
+    #[inline]
+    fn doubleword(&self, idx: u8, fr: bool) -> u64 {
+        if fr {
+            self.fgr[idx as usize]
+        } else {
+            assert_eq!(idx & 1, 0, "FR=0 doubleword read from odd FPR f{idx}");
+            u64::from(self.word(idx)) | (u64::from(self.word(idx + 1)) << 32)
+        }
+    }
+
+    #[inline]
+    fn set_doubleword(&mut self, idx: u8, bits: u64, fr: bool) {
+        if fr {
+            self.fgr[idx as usize] = bits;
+        } else {
+            assert_eq!(idx & 1, 0, "FR=0 doubleword write to odd FPR f{idx}");
+            self.set_word(idx, bits as u32);
+            self.set_word(idx + 1, (bits >> 32) as u32);
+        }
+    }
+
+    fn physical_state(&self) -> PhysicalFgrState {
+        PhysicalFgrState::from_words(self.fgr)
+    }
+
+    fn replace_physical_state(&mut self, state: PhysicalFgrState) {
+        self.fgr = state.into_words();
+    }
+}
+/// A precise COP1 operation requested guest floating-point exception entry.
+/// The operation has already updated FCSR.Cause, but has not committed its
+/// architectural destination or an enabled exception's sticky Flag bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpuException;
+
+/// One FCSR Cause/Enable/Flag lane. This is deliberately an enum rather than
+/// a bit mask: [`RecompContext::record_fpu_exception`] is valid only for an
+/// operation that raises one cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SingleFpuCause {
+    Inexact,
+    Invalid,
+}
+
+impl SingleFpuCause {
+    const fn index(self) -> u8 {
+        match self {
+            Self::Inexact => 0,
+            Self::Invalid => 4,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RecompContext {
     /// r[0] is `$zero`; kept in the array for uniform indexing but never
@@ -198,14 +416,10 @@ pub struct RecompContext {
     /// The LO result register of MULT/DIV.
     pub lo: u64,
 
-    /// The COP1 (FPU) register file, stored as 32 raw 64-bit slots. See the
-    /// [`RecompContext`] FPU accessors for how the FR=0 even/odd pairing maps a
-    /// single-precision register index onto these slots — this mirrors
-    /// `fn64-abi`'s `f_odd` model (an odd `$fN` aliases the HIGH 32-bit word of
-    /// its even partner `$f(N-1)`) so the byte layout matches the recompiled C
-    /// exactly. We keep raw bits (not `f32`/`f64`) so a bit-copy `MOV`/`MTC1`
-    /// never perturbs a NaN payload and the aliasing is pure integer indexing.
-    fpr: [u64; 32],
+    /// Physical COP1 FGR state. Accessors select the FR=0 paired or FR=1
+    /// independent view from `cop0_status`; no emitter or interpreter arm may
+    /// open-code that mapping.
+    fpr: FprFile,
     /// The FPU condition flag (FCSR bit 23). Set by the `C.cond.fmt` compares,
     /// tested by `BC1T`/`BC1F`. This is N64Recomp's per-function `c1cs`
     /// promoted to context state (equivalent: a compare always precedes the
@@ -396,7 +610,8 @@ impl RecompContext {
     }
 
     /// Read FCR0/FCR31. The VR4300 implements only those two control
-    /// registers (User's Manual section 6.3.2); reserved FCRs read as zero.
+    /// registers (User's Manual section 6.3.2); reserved FCR reads remain a
+    /// loud, unverified host boundary.
     #[inline]
     pub fn read_fcr(&self, idx: u8) -> u32 {
         match idx {
@@ -407,8 +622,9 @@ impl RecompContext {
         }
     }
 
-    /// Write FCR31. Writes to FCR0/reserved FCRs have no architectural
-    /// effect. Reserved bits are discarded rather than becoming hidden state.
+    /// Write FCR31. Writes to read-only FCR0 or reserved FCRs remain a loud,
+    /// unverified host boundary. Reserved FCR31 bits are discarded rather than
+    /// becoming hidden state.
     #[inline]
     pub fn write_fcr(&mut self, idx: u8, value: u32) {
         if idx != 31 {
@@ -419,6 +635,18 @@ impl RecompContext {
         const WRITABLE: u32 = (1 << 24) | (1 << 23) | 0x0003_FFFF;
         self.fpu_cond = value & (1 << 23) != 0;
         self.fcsr = value & WRITABLE & !(1 << 23);
+    }
+
+    /// Whether the current FCSR value demands a precise floating-point
+    /// exception. VR4300 User's Manual section 6.3.2.2 specifies that Cause.E is
+    /// always enabled and each IEEE Cause bit traps when its matching Enable
+    /// bit is set. CTC1 writes FCSR before this condition is observed.
+    #[inline]
+    pub fn fcsr_exception_pending(&self) -> bool {
+        const CAUSE_E: u32 = 1 << 17;
+        let ieee_causes = (self.fcsr >> 12) & 0x1f;
+        let enables = (self.fcsr >> 7) & 0x1f;
+        self.fcsr & CAUSE_E != 0 || ieee_causes & enables != 0
     }
 
     /// Establish the single architectural LLbit reservation.
@@ -584,6 +812,21 @@ impl RecompContext {
                 "reserved VR4300 Status.KSU={mode} cannot classify an address"
             )),
         }
+    }
+
+    /// Whether COP0 is usable for the current Status. EXL/ERL force kernel
+    /// mode; ordinary KSU=Kernel is always authorized; User and Supervisor
+    /// require CU0. This predicate is shared by emitted-bank and interpreter
+    /// guards so privilege is checked before any COP0-specific effect.
+    pub fn cop0_usable(&self) -> bool {
+        const STATUS_EXL: u32 = 1 << 1;
+        const STATUS_ERL: u32 = 1 << 2;
+        const STATUS_KSU_MASK: u32 = 0b11 << 3;
+        const STATUS_CU0: u32 = 1 << 28;
+
+        self.cop0_status & (STATUS_EXL | STATUS_ERL) != 0
+            || self.cop0_status & STATUS_KSU_MASK == 0
+            || self.cop0_status & STATUS_CU0 != 0
     }
 
     /// Classify one effective address before translation.
@@ -1025,44 +1268,374 @@ impl RecompContext {
         self.hi = dividend % divisor;
     }
 
-    /// Convert a floating value to an integer using FCSR.RM (or a fixed mode
-    /// for ROUND/TRUNC/CEIL/FLOOR). Cause bits are per-operation and Flag bits
-    /// accumulate as specified by VR4300 User's Manual section 6.3.2.2.
-    pub fn fpu_to_i32(&mut self, value: f64, fixed_mode: Option<u8>) -> i32 {
-        let rounded = self.round_for_mode(value, fixed_mode);
-        if !rounded.is_finite() || !(-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
-            self.raise_fpu(4);
-            i32::MIN
-        } else {
-            if rounded != value {
-                self.raise_fpu(0);
-            }
-            rounded as i32
-        }
-    }
+    fn try_fixed_to_float_raw(
+        &mut self,
+        value: i64,
+        format: FixedFloatFormat,
+        signed_56_source: bool,
+    ) -> Result<u64, FpuException> {
+        const SIGNED_56_MIN: i64 = -(1i64 << 55);
+        const SIGNED_56_MAX: i64 = (1i64 << 55) - 1;
 
-    /// 64-bit counterpart of [`RecompContext::fpu_to_i32`].
-    pub fn fpu_to_i64(&mut self, value: f64, fixed_mode: Option<u8>) -> i64 {
-        let rounded = self.round_for_mode(value, fixed_mode);
-        // i64::MAX is not exactly representable as f64; 2^63 itself is the
-        // exclusive upper bound, while -2^63 is representable and valid.
-        if !rounded.is_finite()
-            || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded)
-        {
-            self.raise_fpu(4);
-            i64::MIN
-        } else {
-            if rounded != value {
-                self.raise_fpu(0);
-            }
-            rounded as i64
-        }
-    }
-
-    #[inline]
-    fn round_for_mode(&mut self, value: f64, fixed_mode: Option<u8>) -> f64 {
-        // Cause is rewritten by every arithmetic/conversion operation.
         self.fcsr &= !(0x3F << 12);
+        if signed_56_source && !(SIGNED_56_MIN..=SIGNED_56_MAX).contains(&value) {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        let (bits, inexact) = encode_fixed_float(value, format, (self.fcsr & 3) as u8);
+        if inexact {
+            self.record_fpu_exception(SingleFpuCause::Inexact)?;
+        }
+        Ok(bits)
+    }
+
+    /// Exact typed CVT.S.W result. The source is the low word of `fs`; `fd`
+    /// remains unmodified until the caller commits this immutable bit result.
+    pub fn try_cvt_s_w_bits(&mut self, fs: u8) -> Result<u32, FpuException> {
+        self.try_fixed_to_float_raw(
+            i64::from(self.f_bits(fs) as i32),
+            FixedFloatFormat::Single,
+            false,
+        )
+        .map(|bits| bits as u32)
+    }
+
+    /// Exact typed CVT.D.W result.
+    pub fn try_cvt_d_w_bits(&mut self, fs: u8) -> Result<u64, FpuException> {
+        self.try_fixed_to_float_raw(
+            i64::from(self.f_bits(fs) as i32),
+            FixedFloatFormat::Double,
+            false,
+        )
+    }
+
+    /// Exact typed CVT.S.L result. VR4300's L-format conversion accepts only
+    /// values representable as a signed 56-bit integer; other sources raise
+    /// the always-enabled Unimplemented Operation cause.
+    pub fn try_cvt_s_l_bits(&mut self, fs: u8) -> Result<u32, FpuException> {
+        self.try_fixed_to_float_raw(self.d_bits(fs) as i64, FixedFloatFormat::Single, true)
+            .map(|bits| bits as u32)
+    }
+
+    /// Exact typed CVT.D.L result with the same signed-56 admission rule.
+    pub fn try_cvt_d_l_bits(&mut self, fs: u8) -> Result<u64, FpuException> {
+        self.try_fixed_to_float_raw(self.d_bits(fs) as i64, FixedFloatFormat::Double, true)
+    }
+
+    fn whole_function_fixed_to_float<T>(result: Result<T, FpuException>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => {
+                trap_unsupported("enabled COP1 fixed-to-float exception in whole-function lane")
+            }
+        }
+    }
+
+    pub fn cvt_s_w_bits(&mut self, fs: u8) -> u32 {
+        let result = self.try_cvt_s_w_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    pub fn cvt_d_w_bits(&mut self, fs: u8) -> u64 {
+        let result = self.try_cvt_d_w_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    pub fn cvt_s_l_bits(&mut self, fs: u8) -> u32 {
+        let result = self.try_cvt_s_l_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    pub fn cvt_d_l_bits(&mut self, fs: u8) -> u64 {
+        let result = self.try_cvt_d_l_bits(fs);
+        Self::whole_function_fixed_to_float(result)
+    }
+
+    fn fpu_unimplemented(&mut self) -> FpuException {
+        self.fcsr &= !(0x3F << 12);
+        self.fcsr |= 1 << 17;
+        FpuException
+    }
+
+    /// Exact CVT.D.S result. VR4300 treats a denormal or legacy QNaN operand
+    /// as Unimplemented; an SNaN raises Invalid and otherwise produces the
+    /// MIPS-IV canonical double QNaN. Every finite normal single widens
+    /// exactly, so FCSR.RM is immaterial.
+    pub fn try_cvt_d_s_bits(&mut self, fs: u8) -> Result<u64, FpuException> {
+        const D_QNAN: u64 = 0x7FF7_FFFF_FFFF_FFFF;
+        let bits = self.f_bits(fs);
+        let sign = u64::from(bits >> 31) << 63;
+        let exponent = (bits >> 23) & 0xFF;
+        let fraction = bits & 0x007F_FFFF;
+        self.fcsr &= !(0x3F << 12);
+
+        if exponent == 0 {
+            return if fraction == 0 {
+                Ok(sign)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+        if exponent == 0xFF {
+            return if fraction == 0 {
+                Ok(sign | 0x7FF0_0000_0000_0000)
+            } else if is_snan32(bits) {
+                self.record_fpu_exception(SingleFpuCause::Invalid)?;
+                Ok(D_QNAN)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+
+        let double_exponent = u64::from(exponent - 127 + 1023) << 52;
+        Ok(sign | double_exponent | (u64::from(fraction) << 29))
+    }
+
+    /// Exact CVT.S.D result using integer IEEE decoding and FCSR.RM. VR4300
+    /// detects tininess after rounding. A denormal result is supported only
+    /// when FS is set and U/I are both disabled; that path flushes to signed
+    /// zero or signed minimum-normal and raises U+I together.
+    pub fn try_cvt_s_d_bits(&mut self, fs: u8) -> Result<u32, FpuException> {
+        const S_QNAN: u32 = 0x7FBF_FFFF;
+        const S_MAX: u32 = 0x7F7F_FFFF;
+        const S_INFINITY: u32 = 0x7F80_0000;
+        const S_MIN_NORMAL: u32 = 0x0080_0000;
+        const FCSR_FS: u32 = 1 << 24;
+        let bits = self.d_bits(fs);
+        let negative = bits >> 63 != 0;
+        let sign = (bits >> 32) as u32 & 0x8000_0000;
+        let exponent = ((bits >> 52) & 0x7FF) as u32;
+        let fraction = bits & 0x000F_FFFF_FFFF_FFFF;
+        self.fcsr &= !(0x3F << 12);
+
+        if exponent == 0 {
+            return if fraction == 0 {
+                Ok(sign)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+        if exponent == 0x7FF {
+            return if fraction == 0 {
+                Ok(sign | S_INFINITY)
+            } else if is_snan64(bits) {
+                self.record_fpu_exception(SingleFpuCause::Invalid)?;
+                Ok(S_QNAN)
+            } else {
+                Err(self.fpu_unimplemented())
+            };
+        }
+
+        let mode = (self.fcsr & 3) as u8;
+        let unbiased = exponent as i32 - 1023;
+        let significand = (1u64 << 52) | fraction;
+        if unbiased > 127 {
+            self.record_fpu_exceptions(FPU_CAUSE_O | FPU_CAUSE_I)?;
+            return Ok(sign | overflowed_single(mode, negative, S_MAX, S_INFINITY));
+        }
+
+        if unbiased >= -126 {
+            let (mut rounded, inexact) = round_shift_right(significand, 29, mode, negative);
+            let mut output_exponent = unbiased;
+            if rounded == 1 << 24 {
+                rounded >>= 1;
+                output_exponent += 1;
+            }
+            if output_exponent > 127 {
+                self.record_fpu_exceptions(FPU_CAUSE_O | FPU_CAUSE_I)?;
+                return Ok(sign | overflowed_single(mode, negative, S_MAX, S_INFINITY));
+            }
+            if inexact {
+                self.record_fpu_exception(SingleFpuCause::Inexact)?;
+            }
+            return Ok(sign
+                | (((output_exponent + 127) as u32) << 23)
+                | (rounded as u32 & 0x007F_FFFF));
+        }
+
+        let shift = (-unbiased - 97) as u32;
+        let (rounded, inexact) = round_shift_right(significand, shift, mode, negative);
+        if rounded == 1 << 23 {
+            if inexact {
+                self.record_fpu_exception(SingleFpuCause::Inexact)?;
+            }
+            return Ok(sign | S_MIN_NORMAL);
+        }
+
+        let enables = ((self.fcsr >> 7) & 0x1F) as u8;
+        if self.fcsr & FCSR_FS == 0 || enables & (FPU_CAUSE_U | FPU_CAUSE_I) != 0 {
+            return Err(self.fpu_unimplemented());
+        }
+        self.record_fpu_exceptions(FPU_CAUSE_U | FPU_CAUSE_I)?;
+        let magnitude = match (mode, negative) {
+            (2, false) | (3, true) => S_MIN_NORMAL,
+            _ => 0,
+        };
+        Ok(sign | magnitude)
+    }
+
+    fn whole_function_float_to_float<T>(result: Result<T, FpuException>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => trap_unsupported("COP1 float-to-float exception in whole-function lane"),
+        }
+    }
+
+    pub fn cvt_d_s_bits(&mut self, fs: u8) -> u64 {
+        let result = self.try_cvt_d_s_bits(fs);
+        Self::whole_function_float_to_float(result)
+    }
+
+    pub fn cvt_s_d_bits(&mut self, fs: u8) -> u32 {
+        let result = self.try_cvt_s_d_bits(fs);
+        Self::whole_function_float_to_float(result)
+    }
+
+    fn try_fpu_to_i32_raw(
+        &mut self,
+        value: f64,
+        signaling_nan: bool,
+        unimplemented_operand: bool,
+        fixed_mode: Option<u8>,
+    ) -> Result<i32, FpuException> {
+        self.fcsr &= !(0x3F << 12);
+        if signaling_nan {
+            self.record_fpu_exception(SingleFpuCause::Invalid)?;
+            return Ok(i32::MAX);
+        }
+        if unimplemented_operand {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        let rounded = self.rounded_for_mode(value, fixed_mode);
+        if !(-2_147_483_648.0..2_147_483_648.0).contains(&rounded) {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        if rounded != value {
+            self.record_fpu_exception(SingleFpuCause::Inexact)?;
+        }
+        Ok(rounded as i32)
+    }
+
+    fn try_fpu_to_i64_raw(
+        &mut self,
+        value: f64,
+        signaling_nan: bool,
+        unimplemented_operand: bool,
+        fixed_mode: Option<u8>,
+    ) -> Result<i64, FpuException> {
+        self.fcsr &= !(0x3F << 12);
+        if signaling_nan {
+            self.record_fpu_exception(SingleFpuCause::Invalid)?;
+            return Ok(i64::MAX);
+        }
+        if unimplemented_operand {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        let rounded = self.rounded_for_mode(value, fixed_mode);
+        if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&rounded) {
+            self.fcsr |= 1 << 17;
+            return Err(FpuException);
+        }
+        if rounded != value {
+            self.record_fpu_exception(SingleFpuCause::Inexact)?;
+        }
+        Ok(rounded as i64)
+    }
+
+    /// Convert a raw single-precision operand to a W result. The immutable
+    /// typed result is returned before the caller commits `fd`.
+    pub fn try_fpu_to_i32_s(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i32, FpuException> {
+        let bits = self.f_bits(fs);
+        self.try_fpu_to_i32_raw(
+            f32::from_bits(bits) as f64,
+            is_snan32(bits),
+            is_qnan32(bits) || is_subnormal32(bits) || f32::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    /// Double-precision counterpart of [`RecompContext::try_fpu_to_i32_s`].
+    pub fn try_fpu_to_i32_d(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i32, FpuException> {
+        let bits = self.d_bits(fs);
+        self.try_fpu_to_i32_raw(
+            f64::from_bits(bits),
+            is_snan64(bits),
+            is_qnan64(bits) || is_subnormal64(bits) || f64::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    /// Convert a raw single-precision operand to an L result.
+    pub fn try_fpu_to_i64_s(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i64, FpuException> {
+        let bits = self.f_bits(fs);
+        self.try_fpu_to_i64_raw(
+            f32::from_bits(bits) as f64,
+            is_snan32(bits),
+            is_qnan32(bits) || is_subnormal32(bits) || f32::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    /// Double-precision counterpart of [`RecompContext::try_fpu_to_i64_s`].
+    pub fn try_fpu_to_i64_d(
+        &mut self,
+        fs: u8,
+        fixed_mode: Option<u8>,
+    ) -> Result<i64, FpuException> {
+        let bits = self.d_bits(fs);
+        self.try_fpu_to_i64_raw(
+            f64::from_bits(bits),
+            is_snan64(bits),
+            is_qnan64(bits) || is_subnormal64(bits) || f64::from_bits(bits).is_infinite(),
+            fixed_mode,
+        )
+    }
+
+    fn whole_function_conversion<T>(result: Result<T, FpuException>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => {
+                trap_unsupported("enabled COP1 float-to-fixed exception in whole-function lane")
+            }
+        }
+    }
+
+    pub fn fpu_to_i32_s(&mut self, fs: u8, fixed_mode: Option<u8>) -> i32 {
+        let result = self.try_fpu_to_i32_s(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    pub fn fpu_to_i32_d(&mut self, fs: u8, fixed_mode: Option<u8>) -> i32 {
+        let result = self.try_fpu_to_i32_d(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    pub fn fpu_to_i64_s(&mut self, fs: u8, fixed_mode: Option<u8>) -> i64 {
+        let result = self.try_fpu_to_i64_s(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    pub fn fpu_to_i64_d(&mut self, fs: u8, fixed_mode: Option<u8>) -> i64 {
+        let result = self.try_fpu_to_i64_d(fs, fixed_mode);
+        Self::whole_function_conversion(result)
+    }
+
+    fn rounded_for_mode(&self, value: f64, fixed_mode: Option<u8>) -> f64 {
         match fixed_mode.unwrap_or((self.fcsr & 3) as u8) {
             0 => value.round_ties_even(),
             1 => value.trunc(),
@@ -1072,14 +1645,28 @@ impl RecompContext {
         }
     }
 
+    /// Record one precise IEEE exception after the operation has cleared its
+    /// per-operation Cause field. VR4300 User's Manual section 6.3.2.2: Cause
+    /// is set in either case; an enabled exception traps without changing Flag,
+    /// while a disabled exception completes and accumulates the sticky Flag.
+    /// This helper is single-cause-only. A future operation with several
+    /// simultaneous causes must set every Cause, test all matching Enables,
+    /// and set no new Flags if any cause is enabled; sequential calls here
+    /// would incorrectly commit a disabled cause's Flag before a later enabled
+    /// cause is observed.
     #[inline]
-    fn raise_fpu(&mut self, exception: u8) {
-        // exception 0..4 = Inexact, Underflow, Overflow, Divide-by-zero,
-        // Invalid. Cause adds bit 12; sticky Flag adds bit 2.
-        self.fcsr |= 1 << (12 + exception);
-        self.fcsr |= 1 << (2 + exception);
-        if self.fcsr & (1 << (7 + exception)) != 0 {
-            trap_unsupported(format!("enabled COP1 exception {exception}"));
+    fn record_fpu_exception(&mut self, exception: SingleFpuCause) -> Result<(), FpuException> {
+        self.record_fpu_exceptions(1 << exception.index())
+    }
+
+    fn record_fpu_exceptions(&mut self, exceptions: u8) -> Result<(), FpuException> {
+        assert_eq!(exceptions & !0x1F, 0, "IEEE FPU cause mask exceeds VZOUI");
+        self.fcsr |= u32::from(exceptions) << 12;
+        if ((self.fcsr >> 7) as u8) & exceptions != 0 {
+            Err(FpuException)
+        } else {
+            self.fcsr |= u32::from(exceptions) << 2;
+            Ok(())
         }
     }
 
@@ -1394,154 +1981,107 @@ impl RecompContext {
     /// Evaluate any of the sixteen C.cond.fmt predicates. The low three funct
     /// bits select unordered/equal/less participation; bit 3 selects signaling
     /// behavior. Quiet compares still signal on an SNaN.
-    pub fn fpu_compare(&mut self, lhs: f64, rhs: f64, lhs_snan: bool, rhs_snan: bool, cond: u8) {
+    pub fn try_fpu_compare(
+        &mut self,
+        lhs: f64,
+        rhs: f64,
+        lhs_snan: bool,
+        rhs_snan: bool,
+        cond: u8,
+    ) -> Result<(), FpuException> {
+        assert!(cond < 16, "COP1 compare predicate exceeds four bits");
         self.fcsr &= !(0x3F << 12);
         let unordered = lhs.is_nan() || rhs.is_nan();
-        if (unordered && cond & 0x8 != 0) || lhs_snan || rhs_snan {
-            self.raise_fpu(4);
-        }
-        self.fpu_cond = (unordered && cond & 1 != 0)
+        let condition = (unordered && cond & 1 != 0)
             || (!unordered && lhs == rhs && cond & 2 != 0)
             || (!unordered && lhs < rhs && cond & 4 != 0);
+        if (unordered && cond & 0x8 != 0) || lhs_snan || rhs_snan {
+            self.record_fpu_exception(SingleFpuCause::Invalid)?;
+        }
+        self.fpu_cond = condition;
+        Ok(())
     }
 
     #[inline]
-    pub fn fpu_compare_s(&mut self, fs: u8, ft: u8, cond: u8) {
+    pub fn try_fpu_compare_s(&mut self, fs: u8, ft: u8, cond: u8) -> Result<(), FpuException> {
         let a = self.f_bits(fs);
         let b = self.f_bits(ft);
-        self.fpu_compare(
+        self.try_fpu_compare(
             f32::from_bits(a) as f64,
             f32::from_bits(b) as f64,
             is_snan32(a),
             is_snan32(b),
             cond,
-        );
+        )
     }
 
     #[inline]
-    pub fn fpu_compare_d(&mut self, fs: u8, ft: u8, cond: u8) {
+    pub fn try_fpu_compare_d(&mut self, fs: u8, ft: u8, cond: u8) -> Result<(), FpuException> {
         let a = self.d_bits(fs);
         let b = self.d_bits(ft);
-        self.fpu_compare(
+        self.try_fpu_compare(
             f64::from_bits(a),
             f64::from_bits(b),
             is_snan64(a),
             is_snan64(b),
             cond,
-        );
+        )
+    }
+
+    /// Whole-function compatibility boundary. Arbitrary-PC lanes use the
+    /// typed `try_` form so they can enter the guest exception vector.
+    #[inline]
+    pub fn fpu_compare_s(&mut self, fs: u8, ft: u8, cond: u8) {
+        if self.try_fpu_compare_s(fs, ft, cond).is_err() {
+            trap_unsupported("enabled COP1 compare exception in whole-function lane");
+        }
+    }
+
+    /// Double-precision counterpart of [`RecompContext::fpu_compare_s`].
+    #[inline]
+    pub fn fpu_compare_d(&mut self, fs: u8, ft: u8, cond: u8) {
+        if self.try_fpu_compare_d(fs, ft, cond).is_err() {
+            trap_unsupported("enabled COP1 compare exception in whole-function lane");
+        }
     }
 
     // ================================================================
     // COP1 / FPU register file.
     //
-    // # The FR bit selects between two register-file organizations
-    //
-    // COP0 Status bit 26 (FR) selects how the 32 physical 64-bit FPU registers
-    // are addressed (VR4300 User's Manual section 6.3.1, "Floating-Point
-    // General Registers", and the FR-bit description in the Status register,
-    // section 6.3.1.2 / Table 6-3):
-    //
-    // * **FR=0** (libultra's default; every OSThread boots this way). There are
-    //   16 *logical* 64-bit FGRs addressed by EVEN register numbers only. A
-    //   64-bit value (double / `ldc1`/`sdc1`/`dmtc1`) lives in an even register
-    //   `$f(2k)`; the odd register `$f(2k+1)` is NOT independent — it aliases
-    //   the HIGH 32 bits of that same 64-bit slot, so a single-precision
-    //   `$f(2k+1)` reads/writes the top word of `$f(2k)`. This is exactly the
-    //   `f_odd[(N-1)*2]` addressing the recompiled C uses
-    //   (`fn64-abi::RecompContext::arm_fpr_alias`).
-    //
-    //   A *doubleword* op naming an ODD register in FR=0 is architecturally
-    //   UNDEFINED (the manual specifies doubleword ops take an even register in
-    //   this mode). The VR4300 has no separate physical storage for an odd
-    //   64-bit register here — the register number's low bit does not select an
-    //   independent register — so we model the documented physical addressing:
-    //   the low bit is dropped and the access lands on the even partner
-    //   `$f(idx & !1)`. That is a defined, non-panicking behavior consistent
-    //   with the silicon's register decode (no 17th..32nd physical double
-    //   exists to address in this mode); it is NOT a correctness claim about
-    //   undefined guest code, only a refusal to panic on it.
-    //
-    // * **FR=1**. All 32 registers are INDEPENDENT 64-bit FGRs: any register
-    //   number (even or odd) is a full, separate 64-bit register, and single-
-    //   precision `$fN` is the low 32 bits of its own slot `N` (no high-word
-    //   aliasing between an even/odd pair). This is the mode MIPS III 64-bit
-    //   code and any program that sets Status.FR uses.
-    //
-    // We store the file as 32 `u64` slots. The single/double accessors resolve
-    // the register number to (slot, is_high_word) *as a function of FR*. All
-    // accessors move raw *bits* (`f32::from_bits`/`to_bits`), never a lossy
-    // cast, so a `MOV.S`/`MTC1` of a signalling-NaN pattern is preserved
-    // bit-exactly.
+    // The VR4300 manual sections 5.2 and 5.3 define 32 physical FGRs. In FR=0
+    // each contributes one 32-bit word and an even doubleword FPR joins the
+    // adjacent even/odd words. In FR=1 each FPR is one independent 64-bit FGR.
+    // Keeping that physical shape means toggling Status.FR never rearranges or
+    // discards state. All typed operations route through these raw accessors.
     // ================================================================
 
-    /// Snapshot the raw 32-slot COP1 register file (all bits, mode-independent).
-    /// Used by the differential gate to compare the complete FPU state between
-    /// the block and interpreter lanes without going through the FR-aware
-    /// accessors (which alias in FR=0).
+    /// Snapshot every physical FGR without applying the active FR view.
+    ///
+    /// This compatibility accessor retains the legacy differential-test name,
+    /// but its entries are physical registers rather than FR-shaped slots.
     pub fn fpr_slots(&self) -> [u64; 32] {
-        self.fpr
+        self.fpr.physical_state().into_words()
     }
 
-    /// Read COP0 Status.FR (register 12, bit 26): the FPU register-file mode.
-    /// `false` = FR=0 (16 paired 64-bit FGRs, even-addressed); `true` = FR=1
-    /// (32 independent 64-bit FGRs). VR4300 User's Manual section 6.3.1.2.
+    /// Whether Status.FR selects 32 independent 64-bit FPRs.
     #[inline]
     pub fn fpu_fr(&self) -> bool {
-        self.cop0_status & (1 << 26) != 0
+        self.cop0_status & COP0_STATUS_FR != 0
     }
 
-    /// The 64-bit slot and whether the low (false) or high (true) 32-bit word
-    /// holds single-precision register `idx`, honoring FR.
-    ///
-    /// FR=0: even N -> (N, low word); odd N -> (N-1, high word) — the even/odd
-    /// pairing. FR=1: every N is its own slot's low word (no aliasing).
-    #[inline]
-    fn fpr_single_slot(&self, idx: u8) -> (usize, bool) {
-        // FR=1: every register is its own slot's low word (no aliasing).
-        // FR=0: even N -> (N, low word); odd N -> the even partner's high word.
-        if self.fpu_fr() || idx & 1 == 0 {
-            (idx as usize, false)
-        } else {
-            ((idx - 1) as usize, true)
-        }
-    }
-
-    /// The 64-bit slot backing doubleword register `idx`, honoring FR.
-    ///
-    /// FR=1: slot `idx` (all 32 independent). FR=0: the even partner
-    /// `idx & !1` — a doubleword op naming an odd register is architecturally
-    /// undefined in FR=0 and maps to the even physical register (see the
-    /// module comment above); it never panics.
-    #[inline]
-    fn fpr_double_slot(&self, idx: u8) -> usize {
-        if self.fpu_fr() {
-            idx as usize
-        } else {
-            (idx & !1) as usize
-        }
-    }
-
-    /// Read single-precision FPR `idx` as raw 32 bits.
+    /// Read the low word of physical FGR `idx`. Under FR=0 these 32 words are
+    /// the complete FGR file; under FR=1 this is the single/W view of the same
+    /// independent 64-bit register.
     #[inline]
     pub fn f_bits(&self, idx: u8) -> u32 {
-        let (slot, high) = self.fpr_single_slot(idx);
-        if high {
-            (self.fpr[slot] >> 32) as u32
-        } else {
-            self.fpr[slot] as u32
-        }
+        self.fpr.word(idx)
     }
 
-    /// Write raw 32 bits into single-precision FPR `idx` (leaving the paired
-    /// word of the even slot untouched).
+    /// Write the low word of physical FGR `idx`, preserving the upper word
+    /// that is latent in FR=0 and independently visible in FR=1.
     #[inline]
     pub fn set_f_bits(&mut self, idx: u8, bits: u32) {
-        let (slot, high) = self.fpr_single_slot(idx);
-        if high {
-            self.fpr[slot] = (self.fpr[slot] & 0x0000_0000_FFFF_FFFF) | ((bits as u64) << 32);
-        } else {
-            self.fpr[slot] = (self.fpr[slot] & 0xFFFF_FFFF_0000_0000) | (bits as u64);
-        }
+        self.fpr.set_word(idx, bits);
     }
 
     /// Read single-precision FPR `idx` as an `f32`.
@@ -1556,18 +2096,34 @@ impl RecompContext {
         self.set_f_bits(idx, val.to_bits());
     }
 
-    /// Read a doubleword (double / `dmtc1` / `ldc1`) FPR `idx` as raw 64 bits,
-    /// resolving the register number through the current FR mode.
+    /// Read a doubleword FPR. FR=0 joins the low words of adjacent even/odd
+    /// FGRs; FR=1 reads one complete FGR and permits odd indices.
     #[inline]
     pub fn d_bits(&self, idx: u8) -> u64 {
-        self.fpr[self.fpr_double_slot(idx)]
+        self.fpr.doubleword(idx, self.fpu_fr())
     }
 
-    /// Write raw 64 bits into doubleword FPR `idx`.
+    /// Write a doubleword through the active FR view. An FR=0 paired write
+    /// preserves both physical FGR upper words so a later FR=1 view recovers
+    /// them unchanged.
     #[inline]
     pub fn set_d_bits(&mut self, idx: u8, bits: u64) {
-        let slot = self.fpr_double_slot(idx);
-        self.fpr[slot] = bits;
+        let fr = self.fpu_fr();
+        self.fpr.set_doubleword(idx, bits, fr);
+    }
+
+    /// Complete physical FGR state for deterministic state/evidence snapshots.
+    /// This is view-independent: unlike 32 single reads it retains every upper
+    /// word that FR=0 makes temporarily inaccessible.
+    pub fn physical_fgr_state(&self) -> PhysicalFgrState {
+        self.fpr.physical_state()
+    }
+
+    /// Replace the complete physical FGR file without interpreting the active
+    /// FR view. ABI adapters use this only after validating that their packed
+    /// C context mode agrees with CP0.Status.FR.
+    pub fn replace_physical_fgr_state(&mut self, state: PhysicalFgrState) {
+        self.fpr.replace_physical_state(state);
     }
 
     /// Read double-precision FPR `idx` as an `f64`.
@@ -1585,14 +2141,36 @@ impl RecompContext {
 
 #[inline]
 fn is_snan32(bits: u32) -> bool {
-    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 && bits & 0x0040_0000 == 0
+    // VR4300 User's Manual p.151 uses the legacy convention: fraction MSB 1
+    // denotes signaling NaN, opposite the modern IEEE host convention.
+    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 && bits & 0x0040_0000 != 0
+}
+
+#[inline]
+fn is_qnan32(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x003F_FFFF != 0
+}
+
+#[inline]
+fn is_subnormal32(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0
 }
 
 #[inline]
 fn is_snan64(bits: u64) -> bool {
     bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000
         && bits & 0x000F_FFFF_FFFF_FFFF != 0
-        && bits & 0x0008_0000_0000_0000 == 0
+        && bits & 0x0008_0000_0000_0000 != 0
+}
+
+#[inline]
+fn is_qnan64(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && bits & 0x0007_FFFF_FFFF_FFFF != 0
+}
+
+#[inline]
+fn is_subnormal64(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0 && bits & 0x000F_FFFF_FFFF_FFFF != 0
 }
 
 /// Round an `f32` to the nearest integer, ties to even — the FPU's default

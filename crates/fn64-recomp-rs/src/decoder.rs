@@ -1600,7 +1600,7 @@ pub fn decode(w: u32) -> Instruction {
         // rs bit 25 (the "CO" bit) selects the funct-encoded ops (ERET/TLB*).
         0x10 => {
             let fmt = rs(w);
-            if fmt & 0x10 != 0 {
+            let instruction = if fmt & 0x10 != 0 {
                 // CO=1: TLB / ERET, selected by funct (bits 5..0).
                 match funct(w) {
                     0x01 => Tlbr,
@@ -1637,7 +1637,13 @@ pub fn decode(w: u32) -> Instruction {
                     },
                     _ => Unknown { word: w },
                 }
-            }
+            };
+            assert!(
+                matches!(instruction, Unknown { .. }) || instruction.requires_cop0(),
+                "recognized COP0 decode omitted the mandatory authority classification: \
+                 word={w:#010x} instruction={instruction:?}"
+            );
+            instruction
         }
         // COP2 (opcode 0x12): move ops, sub-dispatched on the rs/format field.
         0x12 => match rs(w) {
@@ -2253,6 +2259,29 @@ fn decode_cop1_d(w: u32) -> Instruction {
 }
 
 impl Instruction {
+    /// Whether executing this instruction requires kernel mode or Status.CU0.
+    /// Keeping the complete decoded COP0 family here prevents either
+    /// arbitrary-PC lane from accidentally admitting a new shape unguarded.
+    pub const fn requires_cop0(&self) -> bool {
+        use Instruction::*;
+        matches!(
+            self,
+            Mfc0 { .. }
+                | Dmfc0 { .. }
+                | Mtc0 { .. }
+                | Dmtc0 { .. }
+                | Bc0f { .. }
+                | Bc0t { .. }
+                | Bc0fl { .. }
+                | Bc0tl { .. }
+                | Eret
+                | Tlbwi
+                | Tlbwr
+                | Tlbp
+                | Tlbr
+        )
+    }
+
     /// Whether executing this instruction requires Status.CU1. Keeping this
     /// classification beside the decoder makes the block emitter's
     /// coprocessor guard exhaustive across arithmetic, moves, memory, compare,

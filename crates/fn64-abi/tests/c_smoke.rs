@@ -17,29 +17,45 @@ use std::process::Command;
 /// `.a` is guaranteed present in the same profile's `deps` output dir by
 /// the time this test executes).
 fn find_staticlib() -> PathBuf {
-    // A prior staticlib can exist while `cargo test` has rebuilt only the
-    // test/rlib targets. Refresh it unconditionally so new exported ABI hooks
-    // cannot be hidden by a stale archive that merely has the expected name.
+    // Derive the exact target/profile before spawning the nested build.
+    // `cargo --target-dir ... test` does not export CARGO_TARGET_DIR to the
+    // test process, so an unqualified nested build would silently place the
+    // archive in the workspace default while this test searches the fresh
+    // target that owns its executable.
     let exe = std::env::current_exe().expect("current_exe");
     let deps_dir = exe.parent().expect("deps dir");
     let profile_dir = deps_dir.parent().expect("profile dir");
-    let mut build =
-        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    build.args(["build", "-p", "fn64-abi"]);
-    if profile_dir
+    let target_dir = profile_dir.parent().expect("target dir");
+    let profile = profile_dir
         .file_name()
-        .is_some_and(|name| name == "release")
-    {
-        build.arg("--release");
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 cargo profile directory");
+
+    // A prior staticlib can exist while `cargo test` has rebuilt only the
+    // test/rlib targets. Refresh it unconditionally so new exported ABI hooks
+    // cannot be hidden by a stale archive that merely has the expected name.
+    let mut cargo =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cargo
+        .args(["build", "-p", "fn64-abi", "--target-dir"])
+        .arg(target_dir);
+    match profile {
+        "debug" => {}
+        "release" => {
+            cargo.arg("--release");
+        }
+        custom => {
+            cargo.args(["--profile", custom]);
+        }
     }
-    let status = build
+    if cfg!(feature = "recomp-rs") {
+        cargo.args(["--features", "recomp-rs"]);
+    }
+    let status = cargo
         .status()
         .expect("spawn cargo build -p fn64-abi for the staticlib");
     assert!(status.success(), "cargo build -p fn64-abi failed");
 
-    // CARGO_TARGET_TMPDIR isn't quite what we want here; derive the
-    // profile dir from the test binary's own path, which cargo places at
-    // <target>/<profile>/deps/<test-binary>.
     for dir in [deps_dir, profile_dir] {
         let candidate = dir.join("libfn64_abi.a");
         if candidate.exists() {

@@ -22,14 +22,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    FramebufferObservationSource, ObservationEvidenceError, ReleaseCartridgeSave,
-    ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGraphicsApi,
+    FramebufferObservationSource, ObservationEvidenceError, ReleaseAudioTaskExecutionPolicy,
+    ReleaseCartridgeSave, ReleaseControllerPort, ReleaseEnvironmentEvidence, ReleaseGraphicsApi,
     ReleaseGraphicsExecutionPolicy, ReleaseHostPlatform, ReleaseObservationGeometry,
     ReleaseRendererEvidence, ReleaseWindowsFamily, ReleaseWindowsProductType,
     ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v23";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v28";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -1467,7 +1467,7 @@ impl FixedCycleDigestGate {
         program: crate::ProgramEvidenceSnapshot,
     ) -> Result<(), GateError> {
         let observed_cycle = snapshot.guest.now.get();
-        let bytes = encode_device_snapshot(snapshot, executor, host, program);
+        let bytes = try_encode_device_snapshot(snapshot, executor, host, program)?;
         self.capture(observed_cycle, ArtifactKind::DeviceState, &bytes)
     }
 
@@ -1866,11 +1866,28 @@ fn environment_from_frozen(
             replacement_packs_active,
         },
     };
+    let audio_task_execution = match host.audio_task_execution {
+        fn64_abi::AudioTaskExecutionPolicy::Unconfigured => {
+            ReleaseAudioTaskExecutionPolicy::Unconfigured
+        }
+        fn64_abi::AudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            ReleaseAudioTaskExecutionPolicy::Translated {
+                artifact_sha256: hex(&artifact_sha256),
+            }
+        }
+        fn64_abi::AudioTaskExecutionPolicy::LleAccuracy => {
+            ReleaseAudioTaskExecutionPolicy::LleAccuracy
+        }
+        fn64_abi::AudioTaskExecutionPolicy::DiagnosticSkip => {
+            ReleaseAudioTaskExecutionPolicy::DiagnosticSkip
+        }
+    };
     Ok(ReleaseEnvironmentEvidence {
         platform,
         windows_version,
         controller_ports,
         cartridge_save,
+        audio_task_execution,
         renderer,
     })
 }
@@ -1944,6 +1961,19 @@ fn validate_environment_evidence(
             }
         }
     }
+    match &environment.audio_task_execution {
+        ReleaseAudioTaskExecutionPolicy::LleAccuracy => {}
+        ReleaseAudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            decode_sha256(artifact_sha256).ok_or(GateError::InvalidReportSha256(
+                "environment.audio_task_execution.artifact_sha256",
+            ))?;
+            return Err(GateError::NonAccuracyAudioTaskPolicy);
+        }
+        ReleaseAudioTaskExecutionPolicy::Unconfigured
+        | ReleaseAudioTaskExecutionPolicy::DiagnosticSkip => {
+            return Err(GateError::NonAccuracyAudioTaskPolicy);
+        }
+    }
     if let ReleaseRendererEvidence::Rt64 {
         graphics_api,
         backend_identity,
@@ -2013,6 +2043,7 @@ fn test_release_environment(
             ReleaseControllerPort::Absent,
         ],
         cartridge_save: ReleaseCartridgeSave::NoCartridgeSave,
+        audio_task_execution: ReleaseAudioTaskExecutionPolicy::LleAccuracy,
         renderer,
     }
 }
@@ -2254,7 +2285,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v23 evidence digest after loading a retained JSON
+    /// Recompute the schema-v28 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -2405,6 +2436,10 @@ pub enum GateError {
         end: u32,
         limit: u32,
     },
+    NonCanonicalDpcCounter {
+        register: &'static str,
+        value: u32,
+    },
     InvalidMicrocodeDataObservationRange {
         start: u32,
         bytes: u32,
@@ -2465,6 +2500,7 @@ pub enum GateError {
     UnidentifiedCartridgeSave,
     UnidentifiedRenderBackend,
     NonAccuracyRenderPolicy,
+    NonAccuracyAudioTaskPolicy,
     InvalidWindowsVersionEvidence(&'static str),
     RendererObservationMismatch(&'static str),
     InvalidViBoundary(crate::ViBoundaryError),
@@ -2684,6 +2720,10 @@ impl fmt::Display for GateError {
                 f,
                 "{source} DPC observation range [{start:#010x}, {end:#010x}) must be nonempty, 8-byte aligned, and end at or below {limit:#010x}"
             ),
+            Self::NonCanonicalDpcCounter { register, value } => write!(
+                f,
+                "device evidence {register} value {value:#010x} exceeds the canonical 24-bit DPC counter domain"
+            ),
             Self::InvalidMicrocodeDataObservationRange {
                 start,
                 bytes,
@@ -2787,6 +2827,10 @@ impl fmt::Display for GateError {
             Self::NonAccuracyRenderPolicy => write!(
                 f,
                 "live release evidence requires GraphicsTaskExecutionPolicy::LleAccuracy"
+            ),
+            Self::NonAccuracyAudioTaskPolicy => write!(
+                f,
+                "live release evidence requires AudioTaskExecutionPolicy::LleAccuracy"
             ),
             Self::InvalidWindowsVersionEvidence(detail) => {
                 write!(f, "invalid Windows release identity: {detail}")
@@ -3073,6 +3117,10 @@ fn encode_guest_device_snapshot(out: &mut Vec<u8>, snapshot: DeviceSnapshot) {
         snapshot.dpc_end,
         snapshot.dpc_current,
         snapshot.dpc_status,
+        snapshot.dpc_clock,
+        snapshot.dpc_busy,
+        snapshot.dpc_pipe_busy,
+        snapshot.dpc_tmem_busy,
     ] {
         push_u32(out, value);
     }
@@ -3671,6 +3719,103 @@ fn encode_rsp_task_data_identity(
     }
 }
 
+macro_rules! encode_rsp_architectural_state {
+    ($out:expr, $state:expr) => {{
+        let out = $out;
+        let state = $state;
+        for register in state.gprs() {
+            push_u32(out, *register);
+        }
+        for register in [
+            state.dma_dram_address(),
+            state.dma_mem_address(),
+            state.jump_target(),
+            state.resume_address(),
+        ] {
+            push_u32(out, register);
+        }
+        out.push(state.resume_delay() as u8);
+
+        let vu = state.vu();
+        for register in &vu.regs.r {
+            for lane in register {
+                push_u16(out, *lane as u16);
+            }
+        }
+        for lane in 0..8 {
+            let bits = (vu.acc.signed(lane) as u64) & 0x0000_ffff_ffff_ffff;
+            out.extend_from_slice(&bits.to_be_bytes()[2..]);
+        }
+        push_u16(out, vu.flags.vco);
+        push_u16(out, vu.flags.vcc);
+        out.push(vu.flags.vce);
+        push_u16(out, vu.div_in);
+        out.push(vu.div_in_loaded as u8);
+        push_u16(out, vu.div_out);
+
+        push_u32(out, state.sp_status());
+        out.push(state.sp_semaphore() as u8);
+        for register in [
+            state.dma_read_length(),
+            state.dma_write_length(),
+            state.dp_start(),
+            state.dp_end(),
+            state.dp_current(),
+            state.dp_status(),
+            state.dp_clock(),
+            state.dp_busy(),
+            state.dp_pipe_busy(),
+            state.dp_tmem_busy(),
+        ] {
+            push_u32(out, register);
+        }
+        push_u64(out, state.dp_submissions().len() as u64);
+        for submission in state.dp_submissions() {
+            push_u32(out, submission.start);
+            push_u32(out, submission.end);
+            out.push(submission.xbus as u8);
+            push_bytes(out, &submission.payload);
+            push_u64(out, submission.words.len() as u64);
+            for word in &submission.words {
+                push_u32(out, *word);
+            }
+        }
+    }};
+}
+
+fn encode_rsp_interpreter_state(
+    out: &mut Vec<u8>,
+    state: fn64_abi::RspInterpreterStateEvidenceSnapshot,
+) {
+    match state {
+        fn64_abi::RspInterpreterStateEvidenceSnapshot::Reset => out.push(0),
+        fn64_abi::RspInterpreterStateEvidenceSnapshot::Exact(state) => {
+            out.push(1);
+            encode_rsp_architectural_state!(out, &state);
+        }
+        fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibility(state) => {
+            out.push(2);
+            encode_rsp_architectural_state!(out, &state);
+        }
+        fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+            task_offset,
+            admission_generation,
+        } => {
+            out.push(3);
+            push_u32(out, task_offset);
+            push_u64(out, admission_generation.get());
+        }
+        fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
+            task_offset,
+            admission_generation,
+        } => {
+            out.push(4);
+            push_u32(out, task_offset);
+            push_u64(out, admission_generation.get());
+        }
+    }
+}
+
 fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapshot) {
     encode_runtime_peripherals(out, snapshot.runtime_peripherals);
     out.push(snapshot.controller_manager.initialized as u8);
@@ -3696,6 +3841,7 @@ fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapsho
         Some(task) => {
             out.push(1);
             push_u32(out, task.task_offset);
+            push_u64(out, task.admission_generation);
             encode_os_task_header(out, &task.header);
             encode_rsp_task_data_identity(out, task.resumed_data_identity);
         }
@@ -3704,6 +3850,7 @@ fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapsho
     push_u64(out, snapshot.rsp_task_lineages.len() as u64);
     for lineage in snapshot.rsp_task_lineages {
         push_u32(out, lineage.task_offset);
+        push_u64(out, lineage.admission_generation);
         encode_os_task_header(out, &lineage.original_header);
         encode_rsp_task_data_identity(out, lineage.data_identity);
         out.push(match lineage.phase {
@@ -3711,6 +3858,17 @@ fn encode_abi_host(out: &mut Vec<u8>, snapshot: fn64_abi::AbiHostEvidenceSnapsho
             fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized => 1,
             fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeLoaded => 2,
         });
+    }
+    push_u64(out, snapshot.next_rsp_task_admission_generation);
+    encode_rsp_interpreter_state(out, snapshot.rsp_interpreter_state);
+    match snapshot.audio_task_execution {
+        fn64_abi::AudioTaskExecutionPolicy::Unconfigured => out.push(0),
+        fn64_abi::AudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            out.push(1);
+            out.extend_from_slice(&artifact_sha256);
+        }
+        fn64_abi::AudioTaskExecutionPolicy::LleAccuracy => out.push(2),
+        fn64_abi::AudioTaskExecutionPolicy::DiagnosticSkip => out.push(3),
     }
     out.push(snapshot.rom_installed as u8);
     match snapshot.installed_rom {
@@ -3871,14 +4029,25 @@ fn encode_program(out: &mut Vec<u8>, snapshot: crate::ProgramEvidenceSnapshot) {
     }
 }
 
-fn encode_device_snapshot(
+fn try_encode_device_snapshot(
     snapshot: DeviceEvidenceSnapshot,
     executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
     host: fn64_abi::AbiHostEvidenceSnapshot,
     program: crate::ProgramEvidenceSnapshot,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, GateError> {
+    const DPC_COUNTER_MASK: u32 = 0x00ff_ffff;
+    for (register, value) in [
+        ("DPC_CLOCK", snapshot.guest.dpc_clock),
+        ("DPC_BUFBUSY", snapshot.guest.dpc_busy),
+        ("DPC_PIPEBUSY", snapshot.guest.dpc_pipe_busy),
+        ("DPC_TMEM", snapshot.guest.dpc_tmem_busy),
+    ] {
+        if value & !DPC_COUNTER_MASK != 0 {
+            return Err(GateError::NonCanonicalDpcCounter { register, value });
+        }
+    }
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v10\0");
+    out.extend_from_slice(b"fn64.device-evidence.v15\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -4010,7 +4179,7 @@ fn encode_device_snapshot(
     encode_executor_control(&mut out, executor);
     encode_abi_host(&mut out, host);
     encode_program(&mut out, program);
-    out
+    Ok(out)
 }
 
 fn encode_timing_trace(events: &[TraceEvent]) -> Vec<u8> {
@@ -4675,6 +4844,17 @@ pub(crate) fn encode_report_evidence(report: &ReleaseGateReport) -> Result<Vec<u
         ReleaseCartridgeSave::Sram32Kib => 3,
         ReleaseCartridgeSave::FlashRam128Kib => 4,
     });
+    match &report.environment.audio_task_execution {
+        ReleaseAudioTaskExecutionPolicy::Unconfigured => out.push(0),
+        ReleaseAudioTaskExecutionPolicy::Translated { artifact_sha256 } => {
+            out.push(1);
+            out.extend_from_slice(&decode_sha256(artifact_sha256).ok_or(
+                GateError::InvalidReportSha256("environment.audio_task_execution.artifact_sha256"),
+            )?);
+        }
+        ReleaseAudioTaskExecutionPolicy::LleAccuracy => out.push(2),
+        ReleaseAudioTaskExecutionPolicy::DiagnosticSkip => out.push(3),
+    }
     match &report.environment.renderer {
         ReleaseRendererEvidence::Reference {
             execution_policy, ..
@@ -4767,6 +4947,22 @@ mod tests {
         PiDomainTiming, RdramAddr, RspMemAddr, SaveOperationKind, SiDmaRequest, TvType,
         RSP_MEMORY_BANK_SIZE,
     };
+
+    fn encode_device_snapshot(
+        snapshot: DeviceEvidenceSnapshot,
+        executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
+        host: fn64_abi::AbiHostEvidenceSnapshot,
+        program: crate::ProgramEvidenceSnapshot,
+    ) -> Vec<u8> {
+        try_encode_device_snapshot(snapshot, executor, host, program)
+            .expect("test device evidence must be canonical")
+    }
+
+    fn admission_generation(value: u64) -> fn64_abi::RspTaskAdmissionGeneration {
+        fn64_abi::RspTaskAdmissionGeneration::new(
+            std::num::NonZeroU64::new(value).expect("test admission generation must be nonzero"),
+        )
+    }
 
     fn observations() -> ReleaseObservationGeometry {
         ReleaseObservationGeometry::reference_rdram(0, 1, 1).unwrap()
@@ -4942,6 +5138,10 @@ mod tests {
                 dpc_end: 0x180,
                 dpc_current: 0x180,
                 dpc_status: 0,
+                dpc_clock: 0,
+                dpc_busy: 0,
+                dpc_pipe_busy: 0,
+                dpc_tmem_busy: 0,
                 pending_dpc: None,
                 mi_pending: 8,
                 mi_mask: 8,
@@ -5004,6 +5204,35 @@ mod tests {
         let mut snapshot = fn64_abi::host_evidence_snapshot();
         snapshot.runtime_peripherals = peripherals_snapshot();
         snapshot
+    }
+
+    fn rsp_architectural_state(
+        change: impl FnOnce(&mut fn64_audio::rsp::runtime::RspMachine<'_>),
+    ) -> fn64_audio::rsp::runtime::RspArchitecturalState {
+        let mut rdram = vec![0; 0x1000];
+        let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram);
+        change(&mut machine);
+        machine.snapshot_architectural_state()
+    }
+
+    fn rsp_execution_state() -> fn64_runtime::RspExecutionState {
+        fn64_runtime::RspExecutionState {
+            pc: 0,
+            sp_status: 0,
+            sp_semaphore: false,
+            sp_dma_mem_addr: RspMemAddr::from_register(0),
+            sp_dma_dram_addr: RdramAddr::from_offset(0),
+            sp_dma_read_length: 0,
+            sp_dma_write_length: 0,
+            dpc_start: 0,
+            dpc_end: 0,
+            dpc_current: 0,
+            dpc_status: 0,
+            dpc_clock: 0,
+            dpc_busy: 0,
+            dpc_pipe_busy: 0,
+            dpc_tmem_busy: 0,
+        }
     }
 
     fn encode_test_device(
@@ -5471,17 +5700,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v23_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v28_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "20bbd97ab01691b75a884ecda3bec510a5f1f106509082ab071b14d60859361e"
+            "56e31e60b0b75ebef56d87b98859ae7a3a28223446257383b345fa2bba452224"
         );
     }
 
     #[test]
-    fn schema_v23_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v28_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -5647,6 +5876,21 @@ mod tests {
             "DPC STATUS register",
             |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_status ^= 1 }
         );
+        changed!(
+            "DPC CLOCK register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_clock ^= 1 }
+        );
+        changed!(
+            "DPC BUFBUSY register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_busy ^= 1 }
+        );
+        changed!(
+            "DPC PIPEBUSY register",
+            |value: &mut DeviceEvidenceSnapshot| { value.guest.dpc_pipe_busy ^= 1 }
+        );
+        changed!("DPC TMEM register", |value: &mut DeviceEvidenceSnapshot| {
+            value.guest.dpc_tmem_busy ^= 1
+        });
         changed!(
             "guest pending DPC token",
             |value: &mut DeviceEvidenceSnapshot| {
@@ -6122,8 +6366,91 @@ mod tests {
         );
     }
 
+    fn assert_noncanonical_dpc_counter_rejected(
+        register: &'static str,
+        value: u32,
+        mutate: impl FnOnce(&mut DeviceEvidenceSnapshot),
+    ) {
+        let mut malformed = snapshot(42);
+        mutate(&mut malformed);
+        assert!(matches!(
+            try_encode_device_snapshot(
+                malformed.clone(),
+                executor_snapshot(),
+                host_snapshot(),
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ),
+            Err(GateError::NonCanonicalDpcCounter {
+                register: observed_register,
+                value: observed_value,
+            }) if observed_register == register && observed_value == value
+        ));
+
+        let mut gate = FixedCycleDigestGate::new(42);
+        assert!(matches!(
+            gate.capture_device_snapshot(
+                malformed,
+                executor_snapshot(),
+                host_snapshot(),
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ),
+            Err(GateError::NonCanonicalDpcCounter {
+                register: observed_register,
+                value: observed_value,
+            }) if observed_register == register && observed_value == value
+        ));
+    }
+
     #[test]
-    fn device_state_v10_wire_binds_executor_and_abi_host_families() {
+    fn device_state_v15_rejects_noncanonical_dpc_clock() {
+        const VALUE: u32 = 0x0100_0041;
+        assert_noncanonical_dpc_counter_rejected("DPC_CLOCK", VALUE, |snapshot| {
+            snapshot.guest.dpc_clock = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_rejects_noncanonical_dpc_bufbusy() {
+        const VALUE: u32 = 0x0200_0042;
+        assert_noncanonical_dpc_counter_rejected("DPC_BUFBUSY", VALUE, |snapshot| {
+            snapshot.guest.dpc_busy = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_rejects_noncanonical_dpc_pipebusy() {
+        const VALUE: u32 = 0x0400_0043;
+        assert_noncanonical_dpc_counter_rejected("DPC_PIPEBUSY", VALUE, |snapshot| {
+            snapshot.guest.dpc_pipe_busy = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_rejects_noncanonical_dpc_tmem() {
+        const VALUE: u32 = 0x0800_0044;
+        assert_noncanonical_dpc_counter_rejected("DPC_TMEM", VALUE, |snapshot| {
+            snapshot.guest.dpc_tmem_busy = VALUE;
+        });
+    }
+
+    #[test]
+    fn device_state_v15_accepts_maximum_canonical_dpc_counters() {
+        let mut device = snapshot(42);
+        device.guest.dpc_clock = 0x00ff_ffff;
+        device.guest.dpc_busy = 0x00ff_ffff;
+        device.guest.dpc_pipe_busy = 0x00ff_ffff;
+        device.guest.dpc_tmem_busy = 0x00ff_ffff;
+        assert!(try_encode_device_snapshot(
+            device,
+            executor_snapshot(),
+            host_snapshot(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn device_state_v15_wire_binds_executor_and_abi_host_families() {
         use fn64_runtime::{
             EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
             ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -6135,6 +6462,14 @@ mod tests {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
+        let encoded = encode_device_snapshot(
+            device.clone(),
+            executor.clone(),
+            host.clone(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        );
+        assert!(encoded.starts_with(b"fn64.device-evidence.v15\0"));
+        assert!(!encoded.starts_with(b"fn64.device-evidence.v12\0"));
         let baseline = sha256_hex(&encode_device_snapshot(
             device.clone(),
             executor.clone(),
@@ -6154,7 +6489,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v9 evidence omitted executor family {}",
+                    "device-state-v15 evidence omitted executor family {}",
                     $name
                 );
             }};
@@ -6254,7 +6589,7 @@ mod tests {
                         crate::ProgramEvidenceSnapshot::NoProgram,
                     )),
                     baseline,
-                    "device-state-v9 evidence omitted ABI HostState family {}",
+                    "device-state-v15 evidence omitted ABI HostState family {}",
                     $name
                 );
             }};
@@ -6318,6 +6653,7 @@ mod tests {
             |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
                 value.loaded_rsp_task = Some(fn64_abi::LoadedRspTaskEvidenceSnapshot {
                     task_offset: 0x200,
+                    admission_generation: 7,
                     header: fn64_runtime::OsTaskHeader {
                         task_type: fn64_runtime::M_GFXTASK,
                         flags: fn64_runtime::OS_TASK_YIELDED,
@@ -6351,6 +6687,7 @@ mod tests {
                     .rsp_task_lineages
                     .push(fn64_abi::RspTaskLineageEvidenceSnapshot {
                         task_offset: 0x200,
+                        admission_generation: 7,
                         original_header: fn64_runtime::OsTaskHeader {
                             task_type: fn64_runtime::M_GFXTASK,
                             ucode_data: 0x3000,
@@ -6366,6 +6703,21 @@ mod tests {
                         }),
                         phase: fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::ResumeAuthorized,
                     });
+            }
+        );
+        changed_host!(
+            "next RSP task admission generation",
+            |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
+                value.next_rsp_task_admission_generation = value
+                    .next_rsp_task_admission_generation
+                    .checked_add(1)
+                    .expect("test admission generation overflow");
+            }
+        );
+        changed_host!(
+            "audio task execution policy",
+            |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
+                value.audio_task_execution = fn64_abi::AudioTaskExecutionPolicy::LleAccuracy;
             }
         );
         changed_host!(
@@ -6438,7 +6790,296 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v10_wire_distinguishes_rsp_task_lineage_phases() {
+    fn device_state_v15_wire_binds_complete_rsp_interpreter_state() {
+        let device = snapshot(42);
+        let executor = executor_snapshot();
+        let baseline_state = rsp_architectural_state(|_| {});
+        let digest = |state| {
+            let mut host = host_snapshot();
+            host.rsp_interpreter_state =
+                fn64_abi::RspInterpreterStateEvidenceSnapshot::Exact(state);
+            sha256_hex(&encode_device_snapshot(
+                device.clone(),
+                executor.clone(),
+                host,
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ))
+        };
+        let baseline = digest(baseline_state);
+
+        macro_rules! changed {
+            ($name:literal, $body:expr) => {{
+                assert_ne!(
+                    digest(rsp_architectural_state($body)),
+                    baseline,
+                    "device-state-v15 evidence omitted RSP interpreter family {}",
+                    $name
+                );
+            }};
+        }
+
+        changed!("scalar GPRs", |machine| machine.ctx.r[7] = 1);
+        changed!("DMA DRAM address", |machine| machine.ctx.dma_dram_address =
+            8);
+        changed!("DMA MEM address", |machine| machine.ctx.dma_mem_address = 8);
+        changed!("jump target", |machine| machine.ctx.jump_target = 4);
+        changed!("resume address", |machine| machine.ctx.resume_address = 4);
+        changed!("resume delay", |machine| machine.ctx.resume_delay = true);
+        changed!("VU registers", |machine| machine.ctx.rsp.regs.r[3][5] = -2);
+        changed!("VU accumulator", |machine| machine.ctx.rsp.acc.set(6, -3));
+        changed!("VU VCO", |machine| machine.ctx.rsp.flags.vco = 1);
+        changed!("VU VCC", |machine| machine.ctx.rsp.flags.vcc = 1);
+        changed!("VU VCE", |machine| machine.ctx.rsp.flags.vce = 1);
+        changed!("VU divider input", |machine| machine.ctx.rsp.div_in = 1);
+        changed!("VU divider input-valid latch", |machine| machine
+            .ctx
+            .rsp
+            .div_in_loaded =
+            true);
+        changed!("VU divider output", |machine| machine.ctx.rsp.div_out = 1);
+        changed!("SP status", |machine| {
+            let mut state = rsp_execution_state();
+            state.sp_status = 1;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("SP semaphore", |machine| {
+            let mut state = rsp_execution_state();
+            state.sp_semaphore = true;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("SP read length", |machine| {
+            let mut state = rsp_execution_state();
+            state.sp_dma_read_length = 7;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("SP write length", |machine| {
+            let mut state = rsp_execution_state();
+            state.sp_dma_write_length = 7;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC START", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_start = 8;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC END", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_end = 8;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC CURRENT", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_current = 8;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC STATUS", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_status = 1;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC CLOCK", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_clock = 1;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC BUFBUSY", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_busy = 1;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC PIPEBUSY", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_pipe_busy = 1;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("DPC TMEM", |machine| {
+            let mut state = rsp_execution_state();
+            state.dpc_tmem_busy = 1;
+            machine.overlay_device_execution_state(state);
+        });
+        changed!("RDRAM DPC submission words", |machine| {
+            machine.rdram[8..16].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            machine.write_cp0(8, 8);
+            machine.write_cp0(9, 16);
+        });
+        changed!("XBUS DPC submission payload and words", |machine| {
+            for (offset, byte) in (1_u8..=8).enumerate() {
+                machine.dmem.write_bu(0x20 + offset as u32, byte);
+            }
+            machine.write_cp0(11, 1 << 1);
+            machine.write_cp0(8, 0x20);
+            machine.write_cp0(9, 0x28);
+        });
+
+        let ordered_digest = |reverse| {
+            digest(rsp_architectural_state(|machine| {
+                machine.rdram[8..24]
+                    .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+                let ranges = if reverse {
+                    [(16, 24), (8, 16)]
+                } else {
+                    [(8, 16), (16, 24)]
+                };
+                for (start, end) in ranges {
+                    machine.write_cp0(8, start);
+                    machine.write_cp0(9, end);
+                }
+            }))
+        };
+        assert_ne!(
+            ordered_digest(false),
+            ordered_digest(true),
+            "device-state-v15 evidence omitted queued DPC submission order"
+        );
+    }
+
+    #[test]
+    fn device_state_v15_wire_distinguishes_rsp_interpreter_variants() {
+        let state = rsp_architectural_state(|_| {});
+        let encoded = |value| {
+            let mut out = Vec::new();
+            encode_rsp_interpreter_state(&mut out, value);
+            out
+        };
+        let variants = [
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::Reset),
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::Exact(
+                state.clone(),
+            )),
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibility(state)),
+            encoded(
+                fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                    task_offset: 0x80,
+                    admission_generation: admission_generation(7),
+                },
+            ),
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: 0x80,
+                admission_generation: admission_generation(7),
+            }),
+        ];
+        assert_eq!(
+            variants.iter().map(|value| value[0]).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            variants
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            variants.len()
+        );
+        assert_ne!(
+            encoded(
+                fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                    task_offset: 0x80,
+                    admission_generation: admission_generation(7),
+                },
+            ),
+            encoded(
+                fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                    task_offset: 0x84,
+                    admission_generation: admission_generation(7),
+                },
+            )
+        );
+        assert_ne!(
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: 0x80,
+                admission_generation: admission_generation(7),
+            }),
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: 0x84,
+                admission_generation: admission_generation(7),
+            })
+        );
+        assert_ne!(
+            encoded(
+                fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                    task_offset: 0x80,
+                    admission_generation: admission_generation(7),
+                },
+            ),
+            encoded(
+                fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                    task_offset: 0x80,
+                    admission_generation: admission_generation(8),
+                },
+            ),
+            "device-state-v15 unavailable evidence omitted task admission generation"
+        );
+        assert_ne!(
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: 0x80,
+                admission_generation: admission_generation(7),
+            }),
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
+                task_offset: 0x80,
+                admission_generation: admission_generation(8),
+            }),
+            "device-state-v15 in-flight evidence omitted task admission generation"
+        );
+    }
+
+    #[test]
+    fn device_state_v15_wire_distinguishes_rsp_task_admission_generations() {
+        let encoded = |host| {
+            let mut out = Vec::new();
+            encode_abi_host(&mut out, host);
+            out
+        };
+        let baseline = host_snapshot();
+
+        let mut loaded_first = baseline.clone();
+        loaded_first.loaded_rsp_task = Some(fn64_abi::LoadedRspTaskEvidenceSnapshot {
+            task_offset: 0x200,
+            admission_generation: 7,
+            header: fn64_runtime::OsTaskHeader::default(),
+            resumed_data_identity: None,
+        });
+        let mut loaded_second = loaded_first.clone();
+        loaded_second
+            .loaded_rsp_task
+            .as_mut()
+            .unwrap()
+            .admission_generation = 8;
+        assert_ne!(
+            encoded(loaded_first),
+            encoded(loaded_second),
+            "device-state-v15 loaded-task evidence omitted admission generation"
+        );
+
+        let mut lineage_first = baseline.clone();
+        lineage_first
+            .rsp_task_lineages
+            .push(fn64_abi::RspTaskLineageEvidenceSnapshot {
+                task_offset: 0x200,
+                admission_generation: 7,
+                original_header: fn64_runtime::OsTaskHeader::default(),
+                data_identity: None,
+                phase: fn64_abi::RspTaskLineagePhaseEvidenceSnapshot::Running,
+            });
+        let mut lineage_second = lineage_first.clone();
+        lineage_second.rsp_task_lineages[0].admission_generation = 8;
+        assert_ne!(
+            encoded(lineage_first),
+            encoded(lineage_second),
+            "device-state-v15 lineage evidence omitted admission generation"
+        );
+
+        let mut next_first = baseline.clone();
+        next_first.next_rsp_task_admission_generation = 7;
+        let mut next_second = next_first.clone();
+        next_second.next_rsp_task_admission_generation = 8;
+        assert_ne!(
+            encoded(next_first),
+            encoded(next_second),
+            "device-state-v15 evidence omitted next admission generation"
+        );
+    }
+
+    #[test]
+    fn device_state_v15_wire_distinguishes_rsp_task_lineage_phases() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let digest = |phase| {
@@ -6446,6 +7087,7 @@ mod tests {
             host.rsp_task_lineages
                 .push(fn64_abi::RspTaskLineageEvidenceSnapshot {
                     task_offset: 0x200,
+                    admission_generation: 7,
                     original_header: fn64_runtime::OsTaskHeader {
                         task_type: fn64_runtime::M_GFXTASK,
                         ucode_data: 0x3000,
@@ -6477,7 +7119,38 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v10_wire_distinguishes_native_program_classes_and_identity() {
+    fn device_state_v15_wire_distinguishes_every_audio_execution_policy() {
+        let digest = |policy| {
+            let mut host = host_snapshot();
+            host.audio_task_execution = policy;
+            sha256_hex(&encode_device_snapshot(
+                snapshot(42),
+                executor_snapshot(),
+                host,
+                crate::ProgramEvidenceSnapshot::NoProgram,
+            ))
+        };
+
+        let digests = [
+            digest(fn64_abi::AudioTaskExecutionPolicy::Unconfigured),
+            digest(fn64_abi::AudioTaskExecutionPolicy::Translated {
+                artifact_sha256: [0x11; 32],
+            }),
+            digest(fn64_abi::AudioTaskExecutionPolicy::Translated {
+                artifact_sha256: [0x22; 32],
+            }),
+            digest(fn64_abi::AudioTaskExecutionPolicy::LleAccuracy),
+            digest(fn64_abi::AudioTaskExecutionPolicy::DiagnosticSkip),
+        ];
+        for left in 0..digests.len() {
+            for right in (left + 1)..digests.len() {
+                assert_ne!(digests[left], digests[right]);
+            }
+        }
+    }
+
+    #[test]
+    fn device_state_v15_wire_distinguishes_native_program_classes_and_identity() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
@@ -6507,7 +7180,7 @@ mod tests {
 
     #[cfg(feature = "recomp-rs")]
     #[test]
-    fn device_state_v10_wire_binds_typed_program_identity_and_dynamic_state() {
+    fn device_state_v15_wire_binds_typed_program_identity_and_dynamic_state() {
         use fn64_abi::recompiled::{
             LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
             RecompiledProgramEvidenceSnapshot,
@@ -6919,11 +7592,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v22".to_owned();
+        stale_schema.schema = "fn64.release-gate.v27".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v22"
+                if schema == "fn64.release-gate.v27"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -6940,7 +7613,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v23_report_wire_binds_every_release_environment_field() {
+    fn schema_v28_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -7263,6 +7936,7 @@ mod tests {
             windows_version: crate::test_release_windows_version(),
             controller_ports: [ReleaseControllerPort::Absent; 4],
             cartridge_save: ReleaseCartridgeSave::NoCartridgeSave,
+            audio_task_execution: ReleaseAudioTaskExecutionPolicy::LleAccuracy,
             renderer: ReleaseRendererEvidence::Rt64 {
                 execution_policy: ReleaseGraphicsExecutionPolicy::LleAccuracy,
                 tv_type: ReleaseTvStandard::Ntsc,
@@ -7800,7 +8474,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v23_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v28_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),

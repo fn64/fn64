@@ -113,6 +113,40 @@ impl fmt::Display for RspMemoryError {
 
 impl std::error::Error for RspMemoryError {}
 
+/// An owned, pointer-free image of all architecturally visible RSP memory.
+///
+/// The IMEM generation is part of the snapshot because it identifies which
+/// complete instruction-memory image is live. Restoring through ordinary
+/// writes would manufacture new generations, so snapshots can only become
+/// live through [`RspMemory::from_snapshot`] or [`RspMemory::restore`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RspMemorySnapshot {
+    dmem: [u8; RSP_MEMORY_BANK_SIZE],
+    imem: [u8; RSP_MEMORY_BANK_SIZE],
+    imem_generation: u64,
+}
+
+impl RspMemorySnapshot {
+    pub const fn imem_generation(&self) -> u64 {
+        self.imem_generation
+    }
+
+    pub fn bank(&self, bank: RspMemoryBank) -> &[u8; RSP_MEMORY_BANK_SIZE] {
+        match bank {
+            RspMemoryBank::Dmem => &self.dmem,
+            RspMemoryBank::Imem => &self.imem,
+        }
+    }
+
+    fn into_memory(self) -> RspMemory {
+        RspMemory {
+            dmem: self.dmem,
+            imem: self.imem,
+            imem_generation: self.imem_generation,
+        }
+    }
+}
+
 /// The one persistent DMEM/IMEM image owned by a running console.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RspMemory {
@@ -134,6 +168,26 @@ impl Default for RspMemory {
 impl RspMemory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Captures both complete memory banks and the exact live IMEM generation.
+    pub fn snapshot(&self) -> RspMemorySnapshot {
+        RspMemorySnapshot {
+            dmem: self.dmem,
+            imem: self.imem,
+            imem_generation: self.imem_generation,
+        }
+    }
+
+    /// Constructs memory from a snapshot without replaying writes.
+    pub fn from_snapshot(snapshot: RspMemorySnapshot) -> Self {
+        snapshot.into_memory()
+    }
+
+    /// Atomically replaces both banks and their generation under this
+    /// exclusive borrow, without exposing an intermediate memory image.
+    pub fn restore(&mut self, snapshot: RspMemorySnapshot) {
+        *self = Self::from_snapshot(snapshot);
     }
 
     pub const fn imem_generation(&self) -> u64 {
@@ -312,6 +366,80 @@ mod tests {
             memory.write_bytes(addr, &[0; 8]),
             Err(RspMemoryError::CrossesBank { addr, len: 8 })
         );
+    }
+
+    #[test]
+    fn snapshot_round_trips_complete_banks_and_exact_generation() {
+        let mut memory = RspMemory::new();
+        let dmem = std::array::from_fn(|index| (index as u8).wrapping_mul(3));
+        let mut imem = std::array::from_fn(|index| (index as u8).wrapping_mul(5));
+
+        memory
+            .write_bytes(RspMemAddr::from_parts(RspMemoryBank::Dmem, 0), &dmem)
+            .unwrap();
+        memory
+            .write_bytes(RspMemAddr::from_parts(RspMemoryBank::Imem, 0), &imem)
+            .unwrap();
+        imem[0x321] ^= 0xff;
+        memory
+            .write_bytes(
+                RspMemAddr::from_parts(RspMemoryBank::Imem, 0x321),
+                &imem[0x321..0x322],
+            )
+            .unwrap();
+        assert_eq!(memory.imem_generation(), 2);
+
+        let snapshot = memory.snapshot();
+        memory
+            .write_bytes(
+                RspMemAddr::from_parts(RspMemoryBank::Dmem, 0),
+                &[0xaa; RSP_MEMORY_BANK_SIZE],
+            )
+            .unwrap();
+        memory
+            .write_bytes(
+                RspMemAddr::from_parts(RspMemoryBank::Imem, 0),
+                &[0x55; RSP_MEMORY_BANK_SIZE],
+            )
+            .unwrap();
+
+        memory.restore(snapshot);
+
+        assert_eq!(memory.bank(RspMemoryBank::Dmem), &dmem);
+        assert_eq!(memory.bank(RspMemoryBank::Imem), &imem);
+        assert_eq!(memory.imem_generation(), 2);
+    }
+
+    #[test]
+    fn snapshots_are_independent_owned_images() {
+        let mut memory = RspMemory::new();
+        let dmem_addr = RspMemAddr::from_parts(RspMemoryBank::Dmem, 0x80);
+        let imem_addr = RspMemAddr::from_parts(RspMemoryBank::Imem, 0x180);
+
+        memory.write_bytes(dmem_addr, &[0x11]).unwrap();
+        memory.write_bytes(imem_addr, &[0x22]).unwrap();
+        let first = memory.snapshot();
+
+        memory.write_bytes(dmem_addr, &[0x33]).unwrap();
+        memory.write_bytes(imem_addr, &[0x44]).unwrap();
+        let second = memory.snapshot();
+
+        memory.write_bytes(dmem_addr, &[0x55]).unwrap();
+        memory.write_bytes(imem_addr, &[0x66]).unwrap();
+
+        assert_eq!(first.bank(RspMemoryBank::Dmem)[0x80], 0x11);
+        assert_eq!(first.bank(RspMemoryBank::Imem)[0x180], 0x22);
+        assert_eq!(first.imem_generation(), 1);
+        assert_eq!(second.bank(RspMemoryBank::Dmem)[0x80], 0x33);
+        assert_eq!(second.bank(RspMemoryBank::Imem)[0x180], 0x44);
+        assert_eq!(second.imem_generation(), 2);
+
+        let first_memory = RspMemory::from_snapshot(first);
+        let second_memory = RspMemory::from_snapshot(second);
+        assert_eq!(first_memory.bank(RspMemoryBank::Dmem)[0x80], 0x11);
+        assert_eq!(second_memory.bank(RspMemoryBank::Dmem)[0x80], 0x33);
+        assert_eq!(first_memory.imem_generation(), 1);
+        assert_eq!(second_memory.imem_generation(), 2);
     }
 
     #[test]

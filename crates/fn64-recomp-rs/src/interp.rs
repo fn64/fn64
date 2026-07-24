@@ -42,10 +42,15 @@
 //! precedence and LLbit clear, resolved as an unconditional
 //! [`BlockExit::ResolveTransfer`]).
 //!
-//! Explicitly OUT (each a loud [`StepFault::Unsupported`] naming the opcode, the
-//! same frontier the AOT lane leaves open — see `Still open in U4` in
-//! `docs/UNIVERSAL-RUNTIME-PLAN.md`): the entire COP1/FPU environment, COP2,
-//! 64-bit TLB translation, `SYSCALL`/`BREAK`, and the conditional trap ops.
+//! COP1 transfers, memory operations, branches, arithmetic, conditional moves,
+//! comparisons, and conversions share the AOT lane's softfloat/FCSR helpers;
+//! disabled COP1 use becomes a typed Coprocessor Unusable fault. Their register
+//! accesses use the physical-FGR model: FR=0 singles address each physical low
+//! word, FR=0 doubles require an even register and join adjacent low words, and
+//! FR=1 exposes each full 64-bit FGR. Explicitly OUT are COP2,
+//! `SYSCALL`/`BREAK`, conditional traps, 64-bit instruction admission, typed
+//! integer-overflow exceptions, and the remaining privileged-CPU surface.
+//! Unsupported decoded instructions remain loud [`StepFault::Unsupported`]s.
 //! Canonical 32-bit instruction translation is supplied by the one-unit
 //! [`crate::fetch::run_mapped_bank`] wrapper, which fetches by physical identity
 //! before constructing this interpreter's execution-local virtual view.
@@ -60,7 +65,7 @@ use crate::execution::{
     GuestPc, InstructionBudget,
 };
 use crate::runtime::{
-    DataAccessError, DataAccessKind, Rdram, RecompContext, TranslatedDataAddress,
+    DataAccessError, DataAccessKind, FpuException, Rdram, RecompContext, TranslatedDataAddress,
 };
 
 /// A hardware-register (KSEG1 MMIO) access the interpreter recognizes as
@@ -368,34 +373,6 @@ impl Interp<'_> {
             };
             let instr = decode(word);
 
-            // ERET is a privileged transfer without a delay slot (mirrors
-            // `emit_bank_eret` in emit.rs exactly, including its ALWAYS
-            // `BlockExit::ResolveTransfer` — never a proven in-bank
-            // `Transfer` — because the target is a runtime EPC/ErrorEPC
-            // value, never a statically provable one): apply the VR4300
-            // ERET state transition (ErrorEPC/ERL precedence over EPC/EXL,
-            // LLbit clear — both inside
-            // `RecompContext::exception_return_pc`) and resolve to the
-            // returned virtual PC. It is handled here, before the
-            // `has_delay_slot()`/`straight()` split, because it is neither a
-            // delay-slot control transfer nor an ordinary fallthrough
-            // instruction.
-            if matches!(instr, Instruction::Eret) {
-                let executed = executed + 1;
-                let target = ctx.exception_return_pc();
-                ctx.advance_cop0_random(1);
-                return Ok(BlockRun::new(
-                    crate::execution::finalize_executable_write_exit(
-                        self.bank,
-                        BlockExit::ResolveTransfer {
-                            source_bank: self.bank,
-                            target_pc: GuestPc::new(target),
-                        },
-                    ),
-                    executed,
-                ));
-            }
-
             if instr.has_delay_slot() {
                 // A control transfer and its delay slot are one indivisible
                 // dispatch unit. Charge/checkpoint identically to the AOT runner:
@@ -503,8 +480,12 @@ impl Interp<'_> {
                         ));
                     }
                 }
-                Ok(Step::Exit { .. }) => {
-                    unreachable!("a straight-line instruction never produces a transfer exit")
+                Ok(Step::Exit { exit, retired }) => {
+                    executed += retired;
+                    return Ok(BlockRun::new(
+                        crate::execution::finalize_executable_write_exit(self.bank, exit),
+                        executed,
+                    ));
                 }
                 Err(StepFault::Cpu { fault, attempted }) => {
                     return Ok(BlockRun::new(BlockExit::Fault(fault), executed + attempted));
@@ -588,6 +569,23 @@ impl Interp<'_> {
         retired_before: u32,
     ) -> Result<Step, StepFault> {
         use Instruction::*;
+
+        if instr.requires_cop0() && !ctx.cop0_usable() {
+            return Err(StepFault::Cpu {
+                fault: CpuFault {
+                    at: self.key(pc),
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        epc: GuestPc::new(pc),
+                        branch_delay: false,
+                        instruction_code: 0,
+                        bad_vaddr: None,
+                        coprocessor: Some(0),
+                    },
+                },
+                attempted: 1,
+            });
+        }
 
         let fallthrough = delay_pc.wrapping_add(4);
         let target = branch_target(&instr, pc);
@@ -785,6 +783,23 @@ impl Interp<'_> {
             attempted: if site.branch_delay { 2 } else { 1 },
         };
 
+        if instr.requires_cop0() && !ctx.cop0_usable() {
+            return Err(StepFault::Cpu {
+                fault: CpuFault {
+                    at: self.key(site.pc),
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        epc: GuestPc::new(site.epc),
+                        branch_delay: site.branch_delay,
+                        instruction_code: 0,
+                        bad_vaddr: None,
+                        coprocessor: Some(0),
+                    },
+                },
+                attempted: if site.branch_delay { 2 } else { 1 },
+            });
+        }
+
         // Status.CU1 guard: a COP1-visible instruction with coprocessor 1
         // disabled (Status bit 29 clear) is a Coprocessor Unusable exception
         // (ExcCode 11, coprocessor 1), identical to the AOT bank lane's
@@ -804,6 +819,21 @@ impl Interp<'_> {
                     },
                 },
                 attempted: if site.branch_delay { 2 } else { 1 },
+            });
+        }
+
+        // ERET has no delay slot, but it is a transfer rather than ordinary
+        // fallthrough. Its COP0 authority guard above must precede the status
+        // transition and LLbit clear performed by `exception_return_pc`.
+        if matches!(instr, Instruction::Eret) {
+            let target = ctx.exception_return_pc();
+            ctx.advance_cop0_random(1);
+            return Ok(Step::Exit {
+                exit: BlockExit::ResolveTransfer {
+                    source_bank: self.bank,
+                    target_pc: GuestPc::new(target),
+                },
+                retired: 1,
             });
         }
 
@@ -972,6 +1002,38 @@ fn aligned_memory_access(instr: Instruction) -> Option<(u8, i16, u64, CpuExcepti
         }
         _ => return None,
     })
+}
+
+fn convert_fpu_i32(
+    ctx: &mut RecompContext,
+    fd: u8,
+    fs: u8,
+    single: bool,
+    mode: Option<u8>,
+) -> Result<(), FpuException> {
+    let value = if single {
+        ctx.try_fpu_to_i32_s(fs, mode)?
+    } else {
+        ctx.try_fpu_to_i32_d(fs, mode)?
+    };
+    ctx.set_f_bits(fd, value as u32);
+    Ok(())
+}
+
+fn convert_fpu_i64(
+    ctx: &mut RecompContext,
+    fd: u8,
+    fs: u8,
+    single: bool,
+    mode: Option<u8>,
+) -> Result<(), FpuException> {
+    let value = if single {
+        ctx.try_fpu_to_i64_s(fs, mode)?
+    } else {
+        ctx.try_fpu_to_i64_d(fs, mode)?
+    };
+    ctx.set_d_bits(fd, value as u64);
+    Ok(())
 }
 
 /// Execute one straight-line instruction, driving `ctx`/`mem` through the SAME
@@ -1320,7 +1382,96 @@ fn exec_straight(
             let v = ctx.read_fcr(fs);
             ctx.set_r32(rt, v as i32);
         }
-        Ctc1 { rt, fs } => ctx.write_fcr(fs, ctx.r_u32(rt)),
+        Ctc1 { rt, fs } => {
+            ctx.write_fcr(fs, ctx.r_u32(rt));
+            if ctx.fcsr_exception_pending() {
+                return Err(fpu_trap());
+            }
+        }
+        CEqS { fs, ft } => ctx.try_fpu_compare_s(fs, ft, 2).map_err(|_| fpu_trap())?,
+        CLtS { fs, ft } => ctx.try_fpu_compare_s(fs, ft, 12).map_err(|_| fpu_trap())?,
+        CLeS { fs, ft } => ctx.try_fpu_compare_s(fs, ft, 14).map_err(|_| fpu_trap())?,
+        CEqD { fs, ft } => ctx.try_fpu_compare_d(fs, ft, 2).map_err(|_| fpu_trap())?,
+        CLtD { fs, ft } => ctx.try_fpu_compare_d(fs, ft, 12).map_err(|_| fpu_trap())?,
+        CLeD { fs, ft } => ctx.try_fpu_compare_d(fs, ft, 14).map_err(|_| fpu_trap())?,
+        CCondS { fs, ft, cond } => ctx
+            .try_fpu_compare_s(fs, ft, cond)
+            .map_err(|_| fpu_trap())?,
+        CCondD { fs, ft, cond } => ctx
+            .try_fpu_compare_d(fs, ft, cond)
+            .map_err(|_| fpu_trap())?,
+        CvtSW { fd, fs } => {
+            let value = ctx.try_cvt_s_w_bits(fs).map_err(|_| fpu_trap())?;
+            ctx.set_f_bits(fd, value);
+        }
+        CvtDW { fd, fs } => {
+            let value = ctx.try_cvt_d_w_bits(fs).map_err(|_| fpu_trap())?;
+            ctx.set_d_bits(fd, value);
+        }
+        CvtSL { fd, fs } => {
+            let value = ctx.try_cvt_s_l_bits(fs).map_err(|_| fpu_trap())?;
+            ctx.set_f_bits(fd, value);
+        }
+        CvtDL { fd, fs } => {
+            let value = ctx.try_cvt_d_l_bits(fs).map_err(|_| fpu_trap())?;
+            ctx.set_d_bits(fd, value);
+        }
+        CvtDS { fd, fs } => {
+            let value = ctx.try_cvt_d_s_bits(fs).map_err(|_| fpu_trap())?;
+            ctx.set_d_bits(fd, value);
+        }
+        CvtSD { fd, fs } => {
+            let value = ctx.try_cvt_s_d_bits(fs).map_err(|_| fpu_trap())?;
+            ctx.set_f_bits(fd, value);
+        }
+        CvtWS { fd, fs } => convert_fpu_i32(ctx, fd, fs, true, None).map_err(|_| fpu_trap())?,
+        CvtWD { fd, fs } => convert_fpu_i32(ctx, fd, fs, false, None).map_err(|_| fpu_trap())?,
+        CvtLS { fd, fs } => convert_fpu_i64(ctx, fd, fs, true, None).map_err(|_| fpu_trap())?,
+        CvtLD { fd, fs } => convert_fpu_i64(ctx, fd, fs, false, None).map_err(|_| fpu_trap())?,
+        RoundWS { fd, fs } => {
+            convert_fpu_i32(ctx, fd, fs, true, Some(0)).map_err(|_| fpu_trap())?
+        }
+        RoundWD { fd, fs } => {
+            convert_fpu_i32(ctx, fd, fs, false, Some(0)).map_err(|_| fpu_trap())?
+        }
+        RoundLS { fd, fs } => {
+            convert_fpu_i64(ctx, fd, fs, true, Some(0)).map_err(|_| fpu_trap())?
+        }
+        RoundLD { fd, fs } => {
+            convert_fpu_i64(ctx, fd, fs, false, Some(0)).map_err(|_| fpu_trap())?
+        }
+        TruncWS { fd, fs } => {
+            convert_fpu_i32(ctx, fd, fs, true, Some(1)).map_err(|_| fpu_trap())?
+        }
+        TruncWD { fd, fs } => {
+            convert_fpu_i32(ctx, fd, fs, false, Some(1)).map_err(|_| fpu_trap())?
+        }
+        TruncLS { fd, fs } => {
+            convert_fpu_i64(ctx, fd, fs, true, Some(1)).map_err(|_| fpu_trap())?
+        }
+        TruncLD { fd, fs } => {
+            convert_fpu_i64(ctx, fd, fs, false, Some(1)).map_err(|_| fpu_trap())?
+        }
+        CeilWS { fd, fs } => convert_fpu_i32(ctx, fd, fs, true, Some(2)).map_err(|_| fpu_trap())?,
+        CeilWD { fd, fs } => {
+            convert_fpu_i32(ctx, fd, fs, false, Some(2)).map_err(|_| fpu_trap())?
+        }
+        CeilLS { fd, fs } => convert_fpu_i64(ctx, fd, fs, true, Some(2)).map_err(|_| fpu_trap())?,
+        CeilLD { fd, fs } => {
+            convert_fpu_i64(ctx, fd, fs, false, Some(2)).map_err(|_| fpu_trap())?
+        }
+        FloorWS { fd, fs } => {
+            convert_fpu_i32(ctx, fd, fs, true, Some(3)).map_err(|_| fpu_trap())?
+        }
+        FloorWD { fd, fs } => {
+            convert_fpu_i32(ctx, fd, fs, false, Some(3)).map_err(|_| fpu_trap())?
+        }
+        FloorLS { fd, fs } => {
+            convert_fpu_i64(ctx, fd, fs, true, Some(3)).map_err(|_| fpu_trap())?
+        }
+        FloorLD { fd, fs } => {
+            convert_fpu_i64(ctx, fd, fs, false, Some(3)).map_err(|_| fpu_trap())?
+        }
 
         // COP1 loads/stores.
         Lwc1 { ft, base, off } => {
@@ -1386,43 +1537,6 @@ fn exec_straight(
 
         // Conversions — mirror the AOT emit arms exactly (same casts, same
         // `fpu_to_i32`/`i64` rounding through FCSR.RM or the fixed mode).
-        CvtSW { fd, fs } => ctx.set_f_s(fd, (ctx.f_bits(fs) as i32) as f32),
-        CvtDW { fd, fs } => ctx.set_f_d(fd, (ctx.f_bits(fs) as i32) as f64),
-        CvtSL { fd, fs } => ctx.set_f_s(fd, (ctx.d_bits(fs) as i64) as f32),
-        CvtDL { fd, fs } => ctx.set_f_d(fd, (ctx.d_bits(fs) as i64) as f64),
-        CvtDS { fd, fs } => ctx.set_f_d(fd, ctx.f_s(fs) as f64),
-        CvtSD { fd, fs } => ctx.set_f_s(fd, ctx.f_d(fs) as f32),
-        CvtWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, None),
-        CvtWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, None),
-        CvtLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, None),
-        CvtLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, None),
-        TruncWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(1)),
-        TruncWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(1)),
-        TruncLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(1)),
-        TruncLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(1)),
-        RoundWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(0)),
-        RoundWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(0)),
-        RoundLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(0)),
-        RoundLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(0)),
-        CeilWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(2)),
-        CeilWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(2)),
-        CeilLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(2)),
-        CeilLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(2)),
-        FloorWS { fd, fs } => cvt_to_i32(ctx, fd, fs, true, Some(3)),
-        FloorWD { fd, fs } => cvt_to_i32(ctx, fd, fs, false, Some(3)),
-        FloorLS { fd, fs } => cvt_to_i64(ctx, fd, fs, true, Some(3)),
-        FloorLD { fd, fs } => cvt_to_i64(ctx, fd, fs, false, Some(3)),
-
-        // FP compares (set the condition flag).
-        CEqS { fs, ft } => ctx.fpu_compare_s(fs, ft, 2),
-        CLtS { fs, ft } => ctx.fpu_compare_s(fs, ft, 12),
-        CLeS { fs, ft } => ctx.fpu_compare_s(fs, ft, 14),
-        CEqD { fs, ft } => ctx.fpu_compare_d(fs, ft, 2),
-        CLtD { fs, ft } => ctx.fpu_compare_d(fs, ft, 12),
-        CLeD { fs, ft } => ctx.fpu_compare_d(fs, ft, 14),
-        CCondS { fs, ft, cond } => ctx.fpu_compare_s(fs, ft, cond),
-        CCondD { fs, ft, cond } => ctx.fpu_compare_d(fs, ft, cond),
-
         // ================================================================
         // Out of scope for this slice — a loud typed unsupported fault naming
         // the opcode, mirroring the AOT lane's host `panic!` for the same
@@ -1432,26 +1546,6 @@ fn exec_straight(
         _ => return Err(unsupported()),
     }
     Ok(())
-}
-
-/// Float/double -> int32 conversion, identical to the AOT lane's `emit_fpu_i32`:
-/// read the source as `f64`, round with `fpu_to_i32` (FCSR.RM or a fixed mode
-/// for TRUNC/ROUND/CEIL/FLOOR), and store the raw i32 bits into the FPR single
-/// word. `single` selects the source width; `mode` is the fixed rounding mode
-/// (or `None` for CVT.W, which follows FCSR.RM).
-#[inline]
-fn cvt_to_i32(ctx: &mut RecompContext, fd: u8, fs: u8, single: bool, mode: Option<u8>) {
-    let v = if single { ctx.f_s(fs) as f64 } else { ctx.f_d(fs) };
-    let r = ctx.fpu_to_i32(v, mode);
-    ctx.set_f_bits(fd, r as u32);
-}
-
-/// Float/double -> int64 conversion, identical to the AOT lane's `emit_fpu_i64`.
-#[inline]
-fn cvt_to_i64(ctx: &mut RecompContext, fd: u8, fs: u8, single: bool, mode: Option<u8>) {
-    let v = if single { ctx.f_s(fs) as f64 } else { ctx.f_d(fs) };
-    let r = ctx.fpu_to_i64(v, mode);
-    ctx.set_d_bits(fd, r as u64);
 }
 
 #[cfg(test)]
@@ -2340,5 +2434,415 @@ mod tests {
             assert!(!crate::runtime::take_executable_write_boundary());
         }
         crate::runtime::set_guest_write_boundary_observer(None);
+    }
+
+    #[test]
+    fn enabled_cop1_register_and_control_moves_are_bit_exact() {
+        let catalog = catalog_of(&[
+            0x4482_1800, // mtc1 $v0,$f3
+            0x4404_1800, // mfc1 $a0,$f3
+            0x44A3_2000, // dmtc1 $v1,$f4
+            0x4425_2000, // dmfc1 $a1,$f4
+            0x44C6_F800, // ctc1 $a2,$fcr31
+            0x4447_F800, // cfc1 $a3,$fcr31
+            0x4448_0000, // cfc1 $t0,$fcr0
+        ]);
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = 1 << 29;
+        ctx.set_d_bits(2, 0x1122_3344_5566_7788);
+        ctx.set_r(2, 0x8123_4567);
+        ctx.set_r(3, 0x89AB_CDEF_0123_4567);
+        ctx.set_r(6, 0x0180_007F);
+
+        let run = run(&catalog, VA, 8, &mut ctx).unwrap();
+        assert_eq!(run.instructions, 7);
+        assert_eq!(ctx.d_bits(2), 0x8123_4567_5566_7788);
+        assert_eq!(ctx.r(4), 0xFFFF_FFFF_8123_4567);
+        assert_eq!(ctx.d_bits(4), 0x89AB_CDEF_0123_4567);
+        assert_eq!(ctx.r(5), 0x89AB_CDEF_0123_4567);
+        assert_eq!(ctx.read_fcr(31), 0x0180_007F);
+        assert_eq!(ctx.r(7), 0x0180_007F);
+        assert_eq!(ctx.r(8), 0x0000_0B00);
+    }
+
+    #[test]
+    fn ctc1_writes_fcsr_then_raises_precise_fpe_with_delay_context() {
+        for (words, expected_at, expected_epc, branch_delay, instructions, value) in [
+            (
+                vec![0x44C2_F800, 0x2404_0007],
+                VA,
+                VA,
+                false,
+                1,
+                0x0001_0804,
+            ),
+            (
+                vec![0x1000_0001, 0x44C2_F800, 0],
+                VA + 4,
+                VA,
+                true,
+                2,
+                1 << 17,
+            ),
+        ] {
+            let catalog = catalog_of(&words);
+            let mut ctx = RecompContext::new();
+            ctx.cop0_status = 1 << 29;
+            ctx.set_r(2, value);
+            let run = run(&catalog, VA, 4, &mut ctx).unwrap();
+            assert!(matches!(
+                run.exit,
+                BlockExit::Fault(CpuFault {
+                    at,
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::FloatingPoint,
+                        epc,
+                        branch_delay: got_bd,
+                        instruction_code: 0,
+                        bad_vaddr: None,
+                        coprocessor: None,
+                    },
+                }) if at == ExecutionKey::new(BANK, GuestPc::new(expected_at))
+                    && epc == GuestPc::new(expected_epc)
+                    && got_bd == branch_delay
+            ));
+            assert_eq!(run.instructions, instructions);
+            assert_eq!(ctx.read_fcr(31), value as u32);
+            assert_eq!(ctx.r(4), 0, "post-CTC1 sentinel executed");
+        }
+    }
+
+    #[test]
+    fn disabled_cop1_moves_fault_before_fpr_or_fcsr_mutation() {
+        for word in [
+            0x4482_1800, // mtc1 $v0,$f3
+            0x44A2_2000, // dmtc1 $v0,$f4
+            0x44C2_F800, // ctc1 $v0,$fcr31
+        ] {
+            let catalog = catalog_of(&[word]);
+            let mut ctx = RecompContext::new();
+            ctx.set_r(2, u64::MAX);
+            ctx.set_d_bits(2, 0x1122_3344_5566_7788);
+            ctx.set_d_bits(4, 0x99AA_BBCC_DDEE_FF00);
+            ctx.write_fcr(31, 3);
+
+            let run = run(&catalog, VA, 2, &mut ctx).unwrap();
+            assert!(matches!(
+                run.exit,
+                BlockExit::Fault(CpuFault {
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        coprocessor: Some(1),
+                        ..
+                    },
+                    ..
+                })
+            ));
+            assert_eq!(run.instructions, 1);
+            assert_eq!(ctx.d_bits(2), 0x1122_3344_5566_7788);
+            assert_eq!(ctx.d_bits(4), 0x99AA_BBCC_DDEE_FF00);
+            assert_eq!(ctx.read_fcr(31), 3);
+        }
+    }
+
+    #[test]
+    fn every_decoded_cop0_family_checks_authority_before_shape_or_effect() {
+        for word in [
+            0x4002_4800, // MFC0
+            0x4022_3800, // DMFC0 unsupported register shape
+            0x4084_6000, // MTC0 Status
+            0x40A2_3800, // DMTC0 unsupported register shape
+            0x4100_0001, // BC0F
+            0x4101_0001, // BC0T
+            0x4102_0001, // BC0FL
+            0x4103_0001, // BC0TL
+            0x4200_0001, // TLBR
+            0x4200_0002, // TLBWI
+            0x4200_0006, // TLBWR
+            0x4200_0008, // TLBP
+            0x4200_0018, // ERET
+        ] {
+            let instruction = decode(word);
+            let words = if instruction.has_delay_slot() {
+                vec![word, 0x2404_0007, 0]
+            } else {
+                vec![word]
+            };
+            let catalog = catalog_of(&words);
+            let mut ctx = RecompContext::new();
+            ctx.cop0_status = 2 << 3;
+            ctx.set_r(2, 0x1122_3344_5566_7788);
+            ctx.cop0_epc = 0x8000_2000;
+            ctx.cop0_error_epc = 0x8000_3000;
+            ctx.cop0_index = 7;
+            ctx.cop0_page_mask = 0x6000;
+            ctx.cop0_entry_hi = 0x1234_500A;
+            ctx.set_ll_reservation(0x8000_0040, 4);
+            let random = ctx.read_cop0(1);
+
+            let run = run(&catalog, VA, 4, &mut ctx).unwrap();
+            assert!(matches!(
+                run.exit,
+                BlockExit::Fault(CpuFault {
+                    at,
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::CoprocessorUnusable,
+                        epc,
+                        branch_delay: false,
+                        coprocessor: Some(0),
+                        ..
+                    },
+                }) if at == ExecutionKey::new(BANK, GuestPc::new(VA))
+                    && epc == GuestPc::new(VA)
+            ));
+            assert_eq!(run.instructions, 1, "instruction={instruction:?}");
+            assert_eq!(ctx.cop0_status, 2 << 3);
+            assert_eq!(ctx.r(2), 0x1122_3344_5566_7788);
+            assert_eq!(ctx.r(4), 0, "COP0 branch delay executed");
+            assert_eq!(ctx.cop0_epc, 0x8000_2000);
+            assert_eq!(ctx.cop0_error_epc, 0x8000_3000);
+            assert_eq!(ctx.cop0_index, 7);
+            assert_eq!(ctx.cop0_page_mask, 0x6000);
+            assert_eq!(ctx.cop0_entry_hi, 0x1234_500A);
+            assert_eq!(ctx.read_cop0(1), random);
+            assert!(ctx.take_ll_reservation(0x8000_0040, 4));
+        }
+    }
+
+    #[test]
+    fn enabled_cop1_single_and_double_compares_commit_exact_predicates() {
+        let single = catalog_of(&[0x4602_003C]); // c.lt.s $f0,$f2
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = 1 << 29;
+        ctx.set_f_s(0, 1.0);
+        ctx.set_f_s(2, 2.0);
+        let first = run(&single, VA, 2, &mut ctx).unwrap();
+        assert!(ctx.fpu_cond);
+        assert_eq!(first.instructions, 1);
+
+        let double = catalog_of(&[0x4622_0032]); // c.eq.d $f0,$f2
+        ctx.set_f_d(0, 4.0);
+        ctx.set_f_d(2, 4.0);
+        let second = run(&double, VA, 2, &mut ctx).unwrap();
+        assert!(ctx.fpu_cond);
+        assert_eq!(second.instructions, 1);
+        assert_eq!(ctx.read_fcr(31) & (0x3F << 12), 0);
+    }
+
+    #[test]
+    fn enabled_compare_invalid_suppresses_condition_with_precise_delay_context() {
+        const CAUSE_V: u32 = 1 << 16;
+        const ENABLE_V: u32 = 1 << 11;
+        const FLAG_V: u32 = 1 << 6;
+        const FLAG_I: u32 = 1 << 2;
+
+        for (words, expected_at, branch_delay, instructions, double) in [
+            (vec![0x4602_0032, 0x2404_0007], VA, false, 1, false),
+            (vec![0x1000_0001, 0x4622_0032, 0], VA + 4, true, 2, true),
+        ] {
+            let catalog = catalog_of(&words);
+            let mut ctx = RecompContext::new();
+            ctx.cop0_status = 1 << 29;
+            ctx.write_fcr(31, (1 << 23) | ENABLE_V | FLAG_I | 3);
+            if double {
+                ctx.set_d_bits(0, 0x7FF8_0000_0000_0001);
+                ctx.set_f_d(2, 1.0);
+            } else {
+                ctx.set_f_bits(0, 0x7FC0_0001);
+                ctx.set_f_s(2, 1.0);
+            }
+
+            let run = run(&catalog, VA, 4, &mut ctx).unwrap();
+            assert!(matches!(
+                run.exit,
+                BlockExit::Fault(CpuFault {
+                    at,
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::FloatingPoint,
+                        epc,
+                        branch_delay: got_bd,
+                        ..
+                    },
+                }) if at == ExecutionKey::new(BANK, GuestPc::new(expected_at))
+                    && epc == GuestPc::new(VA)
+                    && got_bd == branch_delay
+            ));
+            assert_eq!(run.instructions, instructions);
+            assert!(ctx.fpu_cond, "enabled Invalid committed condition");
+            assert_eq!(
+                ctx.read_fcr(31),
+                (1 << 23) | CAUSE_V | ENABLE_V | FLAG_I | 3
+            );
+            assert_eq!(ctx.read_fcr(31) & FLAG_V, 0);
+            assert_eq!(ctx.r(4), 0, "post-compare sentinel executed");
+        }
+    }
+
+    #[test]
+    fn float_to_fixed_commits_only_a_typed_success() {
+        const CAUSE_I: u32 = 1 << 12;
+        const ENABLE_I: u32 = 1 << 7;
+        const FLAG_I: u32 = 1 << 2;
+
+        let success = catalog_of(&[0x4600_0124]); // cvt.w.s $f4,$f0
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = 1 << 29;
+        ctx.set_f_s(0, 1.5);
+        let success_run = run(&success, VA, 2, &mut ctx).unwrap();
+        assert_eq!(success_run.instructions, 1);
+        assert_eq!(ctx.f_bits(4), 2);
+        assert_eq!(ctx.read_fcr(31), CAUSE_I | FLAG_I);
+
+        ctx.set_f_s(0, 1.5);
+        ctx.set_f_bits(4, 0xA5A5_5A5A);
+        ctx.write_fcr(31, ENABLE_I);
+        let enabled_run = run(&success, VA, 2, &mut ctx).unwrap();
+        assert!(matches!(
+            enabled_run.exit,
+            BlockExit::Fault(CpuFault {
+                at,
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::FloatingPoint,
+                    epc,
+                    branch_delay: false,
+                    ..
+                },
+            }) if at == ExecutionKey::new(BANK, GuestPc::new(VA))
+                && epc == GuestPc::new(VA)
+        ));
+        assert_eq!(enabled_run.instructions, 1);
+        assert_eq!(ctx.f_bits(4), 0xA5A5_5A5A);
+        assert_eq!(ctx.read_fcr(31), CAUSE_I | ENABLE_I);
+
+        let delay = catalog_of(&[
+            0x1000_0001, // beq $zero,$zero,+1
+            0x4620_0125, // cvt.l.d $f4,$f0 -- QNaN => E
+            0,
+        ]);
+        ctx.set_d_bits(0, 0x7FF0_0000_0000_0001);
+        ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+        ctx.write_fcr(31, FLAG_I);
+        let run = run(&delay, VA, 4, &mut ctx).unwrap();
+        assert!(matches!(
+            run.exit,
+            BlockExit::Fault(CpuFault {
+                at,
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::FloatingPoint,
+                    epc,
+                    branch_delay: true,
+                    ..
+                },
+            }) if at == ExecutionKey::new(BANK, GuestPc::new(VA + 4))
+                && epc == GuestPc::new(VA)
+        ));
+        assert_eq!(run.instructions, 2);
+        assert_eq!(ctx.d_bits(4), 0x1122_3344_5566_7788);
+        assert_eq!(ctx.read_fcr(31), (1 << 17) | FLAG_I);
+    }
+
+    #[test]
+    fn fixed_to_float_commits_only_a_typed_success() {
+        const CAUSE_I: u32 = 1 << 12;
+        const CAUSE_E: u32 = 1 << 17;
+        const ENABLE_I: u32 = 1 << 7;
+        const FLAG_I: u32 = 1 << 2;
+
+        let conversion = catalog_of(&[0x46A0_1121]); // cvt.d.l $f4,$f2
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = 1 << 29;
+        ctx.set_d_bits(2, 0x0020_0000_0000_0001);
+        ctx.write_fcr(31, 2);
+        let success = run(&conversion, VA, 2, &mut ctx).unwrap();
+        assert_eq!(success.instructions, 1);
+        assert_eq!(ctx.d_bits(4), 0x4340_0000_0000_0001);
+        assert_eq!(ctx.read_fcr(31), 2 | CAUSE_I | FLAG_I);
+
+        ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+        ctx.write_fcr(31, ENABLE_I);
+        let enabled = run(&conversion, VA, 2, &mut ctx).unwrap();
+        assert!(matches!(
+            enabled.exit,
+            BlockExit::Fault(CpuFault {
+                at,
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::FloatingPoint,
+                    epc,
+                    branch_delay: false,
+                    ..
+                },
+            }) if at == ExecutionKey::new(BANK, GuestPc::new(VA))
+                && epc == GuestPc::new(VA)
+        ));
+        assert_eq!(enabled.instructions, 1);
+        assert_eq!(ctx.d_bits(4), 0x1122_3344_5566_7788);
+        assert_eq!(ctx.read_fcr(31), CAUSE_I | ENABLE_I);
+
+        ctx.set_d_bits(2, 1 << 55);
+        ctx.set_d_bits(4, 0x8877_6655_4433_2211);
+        ctx.write_fcr(31, FLAG_I);
+        let unimplemented = run(&conversion, VA, 2, &mut ctx).unwrap();
+        assert!(matches!(
+            unimplemented.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::Exception {
+                    exception: CpuException::FloatingPoint,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(ctx.d_bits(4), 0x8877_6655_4433_2211);
+        assert_eq!(ctx.read_fcr(31), CAUSE_E | FLAG_I);
+    }
+
+    #[test]
+    fn all_float_to_fixed_opcodes_map_and_commit_the_destination_width() {
+        let cases = [
+            ("round.l.s", 0x4600_0008, true, false),
+            ("trunc.l.s", 0x4600_0009, true, false),
+            ("ceil.l.s", 0x4600_000A, true, false),
+            ("floor.l.s", 0x4600_000B, true, false),
+            ("round.w.s", 0x4600_000C, false, false),
+            ("trunc.w.s", 0x4600_000D, false, false),
+            ("ceil.w.s", 0x4600_000E, false, false),
+            ("floor.w.s", 0x4600_000F, false, false),
+            ("cvt.w.s", 0x4600_0024, false, false),
+            ("cvt.l.s", 0x4600_0025, true, false),
+            ("round.l.d", 0x4620_0008, true, true),
+            ("trunc.l.d", 0x4620_0009, true, true),
+            ("ceil.l.d", 0x4620_000A, true, true),
+            ("floor.l.d", 0x4620_000B, true, true),
+            ("round.w.d", 0x4620_000C, false, true),
+            ("trunc.w.d", 0x4620_000D, false, true),
+            ("ceil.w.d", 0x4620_000E, false, true),
+            ("floor.w.d", 0x4620_000F, false, true),
+            ("cvt.w.d", 0x4620_0024, false, true),
+            ("cvt.l.d", 0x4620_0025, true, true),
+        ];
+
+        for (name, encoding, long, double) in cases {
+            let catalog = catalog_of(&[encoding | (4 << 6)]);
+            let mut ctx = RecompContext::new();
+            ctx.cop0_status = 1 << 29;
+            if double {
+                ctx.set_f_d(0, 1.0);
+            } else {
+                ctx.set_f_s(0, 1.0);
+            }
+            ctx.set_d_bits(4, 0xA5A5_5A5A_DEAD_BEEF);
+
+            let result = run(&catalog, VA, 2, &mut ctx).unwrap();
+            assert_eq!(result.instructions, 1, "{name}");
+            if long {
+                assert_eq!(ctx.d_bits(4), 1, "{name} must commit all 64 bits");
+            } else {
+                assert_eq!(
+                    ctx.d_bits(4),
+                    0xA5A5_5A5A_0000_0001,
+                    "{name} must preserve the paired high word"
+                );
+            }
+        }
     }
 }

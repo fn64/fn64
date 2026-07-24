@@ -143,7 +143,7 @@ and scope limits that make an open item meaningful.
   into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
   pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
   production-context PAL/MPAL workload sequences `[0,0,0,50]` and
-  `[0,0,0,60]` without an Extended refresh override. Report schema v23 now
+  `[0,0,0,60]` without an Extended refresh override. Report schema v28 now
   co-binds normalized ROM TV region, committed device TV state, and renderer
   create-time TV configuration; representative private PAL/MPAL exact-ten
   evidence remains to be retained. cpal
@@ -592,15 +592,33 @@ and deterministic output traces.
   DACRATE/BITRATE latches and the deterministic two-slot current/next FIFO,
   while DPC START/END/CURRENT/STATUS and each typed RDRAM-or-DMEM pending range
   remain owned until explicit renderer commit or cancellation. AI shim and
-  typed raw submissions share CONTROL enable, BUSY/FULL, guest-cycle drain deadlines,
-  decrementing `AI_LEN`, MI AI assertion, and OS_EVENT_AI delivery after the
-  device transition. The duration uses the 93.75 MHz CPU clock and libultra's
-  quantized playback rate and the IPL-selected NTSC/PAL/MPAL video clock;
-  hardware timing traces remain open. CONTROL-disabled raw starts and
-  CONTROL changes while a FIFO slot is active fail loudly because the public
-  register definition names the enable bit but does not define the latter
-  transition. Exact AI/DPC timing and counters, the hardware AI-interrupt
-  phase, mid-transfer AI control, FREEZE/FLUSH, subword raw access, native-C
+  typed raw submissions share CONTROL enable, BUSY/FULL, guest-cycle drain
+  deadlines, eight-byte-granular decrementing `AI_LEN`, and the documented
+  FIFO FULL 1-to-0 MI AI/OS_EVENT_AI edge after queue promotion; a lone or
+  final BUSY transition does not fabricate that edge. Typed submissions reject
+  invalid alignment, register-field overflow, and 24-bit range overflow without
+  mutation. Drain deadlines use the 93.75 MHz CPU clock and the exact public
+  `VI_CLOCK / (DACRATE + 1)` rational selected by the IPL NTSC/PAL/MPAL clock,
+  with one final ceiling. The shim uses integer round-to-nearest and admits
+  fn64's bounded 132..=16384 divisor policy without mutating rejected state;
+  exact out-of-range libultra behavior remains a permitted black-box/reference
+  capture item. Hardware clock-domain phase and per-edge `AI_LEN` timing remain
+  open. DACRATE and BITRATE writes with an occupied FIFO fail loudly because
+  their active-transfer behavior is not admitted. `AI_LEN` fills the two-slot
+  FIFO while CONTROL is disabled without scheduling drain; the 0-to-1 transition
+  starts the dormant current slot at that exact guest cycle. Disabling CONTROL while
+  either slot is busy remains a named loud frontier. Phase A of scheduled DPC
+  execution is additive and non-production:
+  typed transaction/quantum/cursor ownership, an external-work barrier, exact
+  acknowledgment validation, and an opt-in renderer continuation contract are
+  exercised by synthetic schedules. Phase B also routes each production atomic
+  submission through one identity-only `Complete` acknowledgment before shadow
+  publication, while retaining the existing single backend call and every
+  device/interrupt/rollback/digest owner. It enables no scheduled timing.
+  Atomic backends and their digests are unchanged. Exact silicon AI/DPC timing and DPC
+  counter increments, other silicon AI-interrupt causes and the sub-cycle phase
+  of the documented edge, mid-transfer AI control, FREEZE/FLUSH, subword raw
+  access, native-C
   mid-task visibility, and silicon behavior remain open. SI now has a scheduled 64-byte DRAM/PIF
   engine with persistent
   PIF RAM, BUSY/error/interrupt status, distinct write/execute/read phases,
@@ -713,7 +731,7 @@ and deterministic output traces.
   evidence binds the physical spans/words and each mapped entry's exact
   `BankId`/PA sequence, preflight-expected words, and generated artifact
   identity. Artifact-identified mapped AOT destination observations carry that
-  real artifact and are schema-v23 fixed-cycle eligible; compatibility AOT
+  real artifact and are schema-v28 fixed-cycle eligible; compatibility AOT
   without one and mapped-interpreter observations are not. The latter remain
   operational/differential-only until a successor typed destination schema
   exists. Multiple matches remain loud. Data-side Status.KSU plus UX/SX/KX now

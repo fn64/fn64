@@ -18,7 +18,7 @@ targets games using these needs them. (For OoT specifically, most are irrelevant
 
 | Site | Gap | Fix direction |
 |---|---|---|
-| `src/gbi/rt64_gbi_s2dex.cpp:576,595,614` | S2DEX `objLoadTxSprite/objLoadTxRect/objLoadTxRectR` draw side is `assert(false)` — texture load runs but `doObjSprite/doObjRectangle(R)` unimplemented | Implement the sprite/rect draw path (2D microcode) |
+| `src/gbi/rt64_gbi_s2dex.cpp:576,595,614` | S2DEX `objLoadTxSprite/objLoadTxRect/objLoadTxRectR` draw side is `assert(false)` — texture load runs but `doObjSprite/doObjRectangle(R)` unimplemented | **Partially closed by an exact-source fn64 adapter overlay:** S2DEX2 `G_OBJ_LDTX_RECT` now admits only exact-length, 8-byte-source-aligned, axis-aligned point-filtered RGBA16 block loads at 1:1 with whole-texel extents, tile/clamp/no-TLUT/no-perspective sampler state, no flips, and zero object render mode. Ten fresh v3 Metal processes match an independently encoded raw-RDP control exactly in RDRAM and post-VI output and retain a final successful post-rejection workload. Sprite, matrix-relative rectangle, legacy-wire, filtering/scaling/flips, other texture formats/loaders, and render-mode corrections remain named loud frontiers. |
 | `src/gbi/rt64_gbi_s2dex.cpp:403,415,450` | Pinned RT64 S2DEX BG (`objRenderMode`, `bgLoadTile`-only, texrect count) is approximate/partial: "Reimplement more accurately to match the microcode"; only `S2DEX_G_BGLT_LOADTILE` is handled upstream | **Closed and evidenced in fn64's Rust reference path:** the public Copy partition is shared by both S2DEX wire families and both `G_BGLT_LOADTILE`/`G_BGLT_LOADBLOCK`; a 2×2 real-load matrix proves a six-row TMEM strip plus exact two-row final remainder bounds and pixels. Filtered/fractional-`imageYorig` scaled partitions remain hardware-trace work rather than being inferred from this integer-Copy result. |
 | `src/gbi/rt64_gbi_s2dex.cpp:19,30,37 & s2dex2.cpp:19,30` | Bare `assert(false)` stubs in S2DEX/S2DEX2 dispatch | Implement remaining S2DEX(2) opcodes |
 | `src/gbi/rt64_gbi_f3dex2.cpp:58,91,130,134` | Unimplemented `moveMem`, `moveWord`, "combine matrices mode", `special1` | fn64 closes public LookAt/light/viewport/force-matrix DMA, segment/light/fog/clip/perspective/force-marker writes, and persistent debug `G_DMA_IO` in its Rust reference path. Non-public point/matrix subindices and all three reserved `G_SPECIAL_*` encodings trap rather than fabricate behavior. |
@@ -120,7 +120,12 @@ accepts bounded raw DPC state/fill/texture ranges from both the shim and MMIO
 entry paths. The RT64 C ABI exposes the matching bounded LLE entry through its
 public `Application::processDisplayLists(..., false)` path, including
 render-to-RAM workload synchronization; task-entry GBI HLE remains gated by an
-explicit exact IMEM digest. Raw Load/Pipe/Tile/Full Sync accepts its unassigned
+explicit exact IMEM digest. fn64's current captured-XBUS/LLE adapter stages
+commands in an RDP-addressable synthetic RDRAM suffix; prefix-only copyback
+does not isolate that suffix from command memory references. Exact RT64 LLE
+captured-DPC release authority remains blocked on a native separate-command-
+buffer entry point with an explicit physical-memory access bound. Raw
+Load/Pipe/Tile/Full Sync accepts its unassigned
 second word per SGI *RDP Command Summary*, while atomic F3DEX2 macro decode
 keeps the stricter reserved-payload check. All eight raw RDP triangle record layouts (`0x08..0x0f`) now have
 bounded widths and typed signed edge/shade/texture/Z coefficient ingestion
@@ -356,7 +361,23 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   edges whose integer parts select the inclusive span, source-sized mismatched-
   descriptor transfers, and mask-sized domains for wrapped unclamped axes.
 - **S2DEX 2D sprite/rect microcode** — upstream RT64's draw side remains
-  unimplemented (§A1). fn64's Rust reference lane now content-admits
+  unimplemented (§A1). fn64's exact-source adapter overlay now removes the
+  S2DEX2 `G_OBJ_LDTX_RECT` hard stop only for axis-aligned point-filtered
+  RGBA16 block loads at 1:1 in one-cycle mode with whole-texel extents, no
+  flips, and zero object render mode. Admission requires the active S2DEX2
+  family, exact public block type/structure offsets, and coherent
+  tsize/tmem/tline/stride/extent/TMEM/RDRAM spans, exact `0x2f` DMA length,
+  8-byte source alignment, and tile/clamp/no-TLUT/no-perspective sampler state
+  before mutation. Its
+  synthetic gate proves the texture-only command cannot draw,
+  then matches exact RDRAM and post-VI output against an independently encoded
+  raw-RDP rectangle in 10/10 fresh v3 Metal processes. Flip, upper-bit type,
+  descriptor-mismatch, source-alignment,
+  stale-tail short-DMA, bilerp, LOD, detail/sharpen, TLUT, perspective, and
+  legacy-S2DEX negatives all reject by name;
+  see
+  `RT64-S2DEX-OBJECT-EVIDENCE.md`. Every broader native combination remains
+  named loud. fn64's Rust reference lane content-admits
   F3DEX_GBI_2 object rectangles, matrix-relative rectangles, and rotating
   sprites; block/tile/TLUT object loads and their compound draw forms; full and
   sub object matrices; S/T flips and matched bilerp mode; Copy/OneCycle
@@ -395,7 +416,7 @@ Only **#254** (tile-sampling sync) and **#246** (no scalar-block-layout assumpti
   creation and ordinary VI events, then observe exact completed-workload rate
   sequences `[0,0,0,50]` and `[0,0,0,60]` without an Extended override. The
   overlay does not alter the later Extended-GBI refresh-rate override. A
-  schema-v23 full-ROM path now co-binds normalized destination-code TV region,
+  schema-v28 full-ROM path now co-binds normalized destination-code TV region,
   committed device TV state, and renderer create-time configuration. No
   representative private exact-ten PAL/MPAL series has yet been retained;
   physical compositor cadence, field timing, and analog PAL output remain

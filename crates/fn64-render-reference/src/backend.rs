@@ -330,6 +330,7 @@ pub enum DecodeMode {
     RawRdp,
 }
 
+#[derive(Clone)]
 pub struct ReferenceBackend {
     /// TV standard accepted by the last successful `create`. Clearing this
     /// before recreation prevents failed attempts from retaining stale
@@ -386,12 +387,17 @@ pub struct ReferenceBackend {
     /// task index whether or not PNG auto-dumping is on.
     #[cfg(not(test))]
     diag_task_index: u64,
+    /// Suppress non-rollbackable environment-driven diagnostic files while a
+    /// complete raw-DPC batch is executing against a speculative clone.
+    #[cfg(not(test))]
+    suppress_task_diagnostics: bool,
     /// Backend-owned checkpoint for the one HLE task currently between
     /// committed operation boundaries.
     continuation: Option<ReferenceTaskContinuation>,
     next_continuation_token: u64,
 }
 
+#[derive(Clone)]
 struct ReferenceTaskContinuation {
     token: fn64_render::RenderTaskContinuation,
     task: OsTask,
@@ -416,6 +422,7 @@ enum PreparedReferenceTask {
     NeedsLle([u8; 32]),
 }
 
+#[derive(Clone)]
 struct AutoDump {
     dir: std::path::PathBuf,
     prefix: String,
@@ -454,6 +461,8 @@ impl ReferenceBackend {
             auto_dump: None,
             #[cfg(not(test))]
             diag_task_index: 0,
+            #[cfg(not(test))]
+            suppress_task_diagnostics: false,
             continuation: None,
             next_continuation_token: 1,
         }
@@ -797,36 +806,40 @@ impl ReferenceBackend {
 
         #[cfg(not(test))]
         {
-            let dump_index = self.diag_task_index;
-            self.diag_task_index += 1;
-            if let Some(spec) = std::env::var_os("FN64_GFX_TASK_DUMP") {
-                let selected = spec.to_string_lossy().split(',').any(|entry| {
-                    entry.trim().parse::<u64>().unwrap_or_else(|error| {
-                        panic!(
-                            "FN64_GFX_TASK_DUMP entry {entry:?} is not a u64 task index: {error}"
-                        )
-                    }) == dump_index
-                });
-                if selected {
-                    let directory = std::env::var_os("FN64_GFX_TASK_DUMP_DIR")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/fn64-gfx-task-dumps"));
-                    std::fs::create_dir_all(&directory).unwrap_or_else(|error| {
-                        panic!("failed to create FN64_GFX_TASK_DUMP_DIR {directory:?}: {error}")
+            if !self.suppress_task_diagnostics {
+                let dump_index = self.diag_task_index;
+                self.diag_task_index += 1;
+                if let Some(spec) = std::env::var_os("FN64_GFX_TASK_DUMP") {
+                    let selected = spec.to_string_lossy().split(',').any(|entry| {
+                        entry.trim().parse::<u64>().unwrap_or_else(|error| {
+                            panic!(
+                                "FN64_GFX_TASK_DUMP entry {entry:?} is not a u64 task index: {error}"
+                            )
+                        }) == dump_index
                     });
-                    let command_trace = gbi::trace_display_list_f3dex2(&*rdram, task.data_ptr);
-                    let report = format!(
-                        "task_index={dump_index}\noutput_addr={output_addr:#010x}\n\
-                         reference_triangle_count={tri_count}\ntask={task:#?}\n{command_trace}",
-                    );
-                    let path = directory.join(format!("task-{dump_index:04}.txt"));
-                    std::fs::write(&path, report).unwrap_or_else(|error| {
-                        panic!("failed to write gfx task diagnostic {path:?}: {error}")
-                    });
-                    eprintln!(
-                        "[fn64-render-reference] dumped gfx task #{dump_index} ({tri_count} reference \
-                         triangles) to {path:?}"
-                    );
+                    if selected {
+                        let directory = std::env::var_os("FN64_GFX_TASK_DUMP_DIR")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| {
+                                std::path::PathBuf::from("/tmp/fn64-gfx-task-dumps")
+                            });
+                        std::fs::create_dir_all(&directory).unwrap_or_else(|error| {
+                            panic!("failed to create FN64_GFX_TASK_DUMP_DIR {directory:?}: {error}")
+                        });
+                        let command_trace = gbi::trace_display_list_f3dex2(&*rdram, task.data_ptr);
+                        let report = format!(
+                            "task_index={dump_index}\noutput_addr={output_addr:#010x}\n\
+                             reference_triangle_count={tri_count}\ntask={task:#?}\n{command_trace}",
+                        );
+                        let path = directory.join(format!("task-{dump_index:04}.txt"));
+                        std::fs::write(&path, report).unwrap_or_else(|error| {
+                            panic!("failed to write gfx task diagnostic {path:?}: {error}")
+                        });
+                        eprintln!(
+                            "[fn64-render-reference] dumped gfx task #{dump_index} ({tri_count} reference \
+                             triangles) to {path:?}"
+                        );
+                    }
                 }
             }
         }
@@ -1482,6 +1495,66 @@ impl RenderBackend for ReferenceBackend {
             rdram.copy_from_slice(&image[..rdram.len()]);
         }
         result
+    }
+
+    fn raw_dpc_batch_capability(&self) -> fn64_render::RawDpcBatchCapability {
+        fn64_render::RawDpcBatchCapability::DiagnosticOnly
+    }
+
+    fn process_raw_dpc_batch(
+        &mut self,
+        rdram: &mut [u8],
+        batch: fn64_render::PreflightedRawDpcBatch,
+        output_addr: u32,
+    ) -> Result<fn64_render::RawDpcBatchOutcome, RenderError> {
+        let expected_full_sync = batch.aggregate_full_sync();
+        let outcome = batch.outcome();
+        let groups = batch.stream_groups().to_vec();
+        let mut image = batch.staged_image(rdram)?;
+        let mut speculative = self.clone();
+        // A diagnostic file cannot be rolled back if a later stream group
+        // rejects. Retain the configured sink and its counters outside the
+        // speculative backend, then restore them only at the batch commit.
+        let retained_auto_dump = speculative.auto_dump.take();
+        #[cfg(not(test))]
+        {
+            speculative.suppress_task_diagnostics = true;
+        }
+        for group in groups {
+            let mut group_image = image.clone();
+            let status = speculative.process_rdp_commands(
+                &mut group_image,
+                group.staging_start(),
+                group.staging_end(),
+                output_addr,
+            )?;
+            if status != FrameStatus::Complete {
+                return Err(RenderError::Backend {
+                    backend: "reference-raw-dpc-batch",
+                    reason: format!("raw-DPC stream group returned nonterminal status {status:?}"),
+                });
+            }
+            if speculative.last_dp_full_sync() != group.full_sync() {
+                return Err(RenderError::Backend {
+                    backend: "reference-raw-dpc-batch",
+                    reason: format!(
+                        "renderer reported {:?} after group preflight proved {:?}",
+                        speculative.last_dp_full_sync(),
+                        group.full_sync()
+                    ),
+                });
+            }
+            image[..rdram.len()].copy_from_slice(&group_image[..rdram.len()]);
+        }
+        speculative.last_dp_full_sync = expected_full_sync;
+        speculative.auto_dump = retained_auto_dump;
+        #[cfg(not(test))]
+        {
+            speculative.suppress_task_diagnostics = false;
+        }
+        rdram.copy_from_slice(&image[..rdram.len()]);
+        *self = speculative;
+        Ok(outcome)
     }
 
     fn last_dp_full_sync(&self) -> fn64_render::DpFullSyncStatus {
@@ -3374,6 +3447,87 @@ mod tests {
         );
         assert_eq!(rdram, rdram_before);
         assert_eq!(rsp_memory, rsp_before);
+    }
+
+    fn raw_submission(
+        source: fn64_render::RawDpcSource,
+        start: u32,
+        opcode: u8,
+    ) -> fn64_render::OwnedRawDpcSubmission {
+        let words = vec![u32::from(opcode) << 24, 0];
+        match source {
+            fn64_render::RawDpcSource::Rdram => {
+                fn64_render::OwnedRawDpcSubmission::from_rdram_words(start, start + 8, words)
+                    .unwrap()
+            }
+            fn64_render::RawDpcSource::XbusDmem => {
+                fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
+                    start,
+                    start + 8,
+                    words.into_iter().flat_map(u32::to_be_bytes).collect(),
+                )
+                .unwrap()
+            }
+        }
+    }
+
+    #[test]
+    fn reference_raw_dpc_batch_commits_mixed_sources_in_one_boundary() {
+        let submissions = vec![
+            raw_submission(fn64_render::RawDpcSource::Rdram, 0x100, 0xe6),
+            raw_submission(fn64_render::RawDpcSource::XbusDmem, 0x20, 0xe9),
+        ];
+        let identities = submissions
+            .iter()
+            .map(fn64_render::OwnedRawDpcSubmission::identity)
+            .collect::<Vec<_>>();
+        let mut rdram = vec![0x5a; 0x400];
+        let before = rdram.clone();
+        let batch = fn64_render::RawDpcBatch::new(submissions)
+            .unwrap()
+            .preflight(rdram.len())
+            .unwrap();
+        let mut backend = ReferenceBackend::new();
+        backend.create(&RenderConfig::ntsc(2, 2)).unwrap();
+
+        let outcome = backend.process_raw_dpc_batch(&mut rdram, batch, 0).unwrap();
+
+        assert_eq!(
+            backend.raw_dpc_batch_capability(),
+            fn64_render::RawDpcBatchCapability::DiagnosticOnly
+        );
+        assert_eq!(outcome.identities.as_ref(), identities);
+        assert_eq!(outcome.full_sync, fn64_render::DpFullSyncStatus::Reached);
+        assert_eq!(outcome.stream_groups.len(), 2);
+        assert_eq!(backend.last_dp_full_sync(), outcome.full_sync);
+        assert_eq!(rdram, before, "private command staging leaked into RDRAM");
+    }
+
+    #[test]
+    fn reference_raw_dpc_batch_not_ready_rejects_without_mutation() {
+        let mut rdram = vec![0x5a; 0x400];
+        let before = rdram.clone();
+        let batch = fn64_render::RawDpcBatch::new(vec![raw_submission(
+            fn64_render::RawDpcSource::Rdram,
+            0x100,
+            0xe9,
+        )])
+        .unwrap()
+        .preflight(rdram.len())
+        .unwrap();
+        let mut backend = ReferenceBackend::new();
+
+        let error = backend
+            .process_raw_dpc_batch(&mut rdram, batch, 0)
+            .unwrap_err();
+
+        assert!(matches!(error, RenderError::NotReady(_)));
+        assert_eq!(rdram, before);
+        assert_eq!(
+            backend.last_dp_full_sync(),
+            fn64_render::DpFullSyncStatus::Unidentified
+        );
+        assert!(backend.framebuffer().is_none());
     }
 
     #[test]
