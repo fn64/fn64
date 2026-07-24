@@ -596,15 +596,21 @@ and deterministic output traces.
   decrementing `AI_LEN`, MI AI assertion, and OS_EVENT_AI delivery after the
   device transition. The duration uses the 93.75 MHz CPU clock and libultra's
   quantized playback rate and the IPL-selected NTSC/PAL/MPAL video clock;
-  hardware timing traces remain open. CONTROL-disabled raw starts and
-  CONTROL changes while a FIFO slot is active fail loudly because the public
-  register definition names the enable bit but does not define the latter
-  transition. Phase A of scheduled DPC execution is additive and non-production:
+  hardware timing traces remain open. `AI_LEN` fills the two-slot FIFO while
+  CONTROL is disabled without scheduling drain; the 0-to-1 transition starts
+  the dormant current slot at that exact guest cycle. Disabling CONTROL while
+  either slot is busy remains a named loud frontier. Phase A of scheduled DPC
+  execution is additive and non-production:
   typed transaction/quantum/cursor ownership, an external-work barrier, exact
   acknowledgment validation, and an opt-in renderer continuation contract are
-  exercised only by synthetic schedules. Atomic backends and their digests are
-  unchanged. Exact AI/DPC timing and counters, the hardware AI-interrupt
-  phase, mid-transfer AI control, FREEZE/FLUSH, subword raw access, native-C
+  exercised by synthetic schedules. Phase B also routes each production atomic
+  submission through one identity-only `Complete` acknowledgment before shadow
+  publication, while retaining the existing single backend call and every
+  device/interrupt/rollback/digest owner. It enables no scheduled timing.
+  Atomic backends and their digests are unchanged. Exact AI/DPC timing and DPC
+  counter increments, other silicon AI-interrupt causes and the sub-cycle phase
+  of the documented edge, mid-transfer AI control, FREEZE/FLUSH, subword raw
+  access, native-C
   mid-task visibility, and silicon behavior remain open. SI now has a scheduled 64-byte DRAM/PIF
   engine with persistent
   PIF RAM, BUSY/error/interrupt status, distinct write/execute/read phases,

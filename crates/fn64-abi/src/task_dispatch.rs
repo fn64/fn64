@@ -1282,9 +1282,9 @@ unsafe fn dispatch_lle_task(
                 .request_dpc_submission(source, start, end)
         })
         .unwrap_or_else(|error| panic!("RSP DPC submission rejected: {error}"));
-        let transaction = LiveDpcTransaction::new(submission);
+        let mut transaction = LiveDpcTransaction::new(submission);
         let (full_sync, observation) =
-            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus) };
+            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, &mut transaction) };
         transaction.commit();
         dpc_observations.push(observation);
         if full_sync == fn64_render::DpFullSyncStatus::Reached {
@@ -1505,6 +1505,7 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
 /// range cannot remain busy or later advance CURRENT as if it had rendered.
 struct LiveDpcTransaction {
     token: Option<u64>,
+    acknowledgment: Option<fn64_runtime::DpcScheduledExecution>,
 }
 
 impl LiveDpcTransaction {
@@ -1516,15 +1517,92 @@ impl LiveDpcTransaction {
                 "renderer received DPC transaction which the device fabric does not own"
             );
         });
-        Self {
+        // Install cancellation ownership before any shared-ack construction.
+        // If an admitted fabric range cannot form the compatibility quantum,
+        // unwinding this guard restores the exact pre-admission DPC state.
+        // The exact-token assertion stays first so a bad caller cannot make
+        // this guard cancel some other transaction while unwinding.
+        let mut transaction = Self {
             token: Some(submission.token),
-        }
+            acknowledgment: None,
+        };
+        let source = submission.source;
+        let start = fn64_runtime::DpcCursor::new(source, submission.start)
+            .unwrap_or_else(|error| panic!("fabric admitted invalid DPC start cursor: {error:?}"));
+        let end = fn64_runtime::DpcCursor::new(source, submission.end)
+            .unwrap_or_else(|error| panic!("fabric admitted invalid DPC end cursor: {error:?}"));
+        // Phase B deliberately assigns no device-time meaning to this one
+        // compatibility quantum. Zero is an internal acknowledgment sentinel;
+        // production still performs one synchronous atomic backend call.
+        let sentinel = fn64_runtime::Cycles::new(0);
+        let mut acknowledgment = fn64_runtime::DpcScheduledExecution::new(
+            submission,
+            sentinel,
+            vec![fn64_runtime::DpcQuantumPlan {
+                at: sentinel,
+                id: fn64_runtime::DpcQuantumId::new(1),
+                start,
+                end,
+            }],
+        )
+        .unwrap_or_else(|error| {
+            panic!("fabric DPC transaction cannot form an atomic ack: {error:?}")
+        });
+        let fn64_runtime::DpcAdvance::Blocked { at, action } = acknowledgment
+            .advance_to(sentinel)
+            .unwrap_or_else(|error| panic!("arming atomic DPC acknowledgment: {error:?}"))
+        else {
+            panic!("atomic DPC acknowledgment passed its sole external-work barrier")
+        };
+        assert_eq!(at, sentinel);
+        assert_eq!(action.transaction, acknowledgment.transaction());
+        assert_eq!(action.start, start);
+        assert_eq!(action.end, end);
+        transaction.acknowledgment = Some(acknowledgment);
+        transaction
+    }
+
+    /// Validate the compatibility backend's sole atomic completion before
+    /// publishing its shadow memory. This carries no timing authority.
+    fn validate_atomic_completion(&mut self) {
+        let acknowledgment = self
+            .acknowledgment
+            .as_mut()
+            .expect("atomic DPC transaction has no acknowledgment owner");
+        let fn64_runtime::DpcScheduledPhase::AwaitingAck(request) = acknowledgment.phase() else {
+            panic!("atomic DPC transaction lost its acknowledgment owner before validation")
+        };
+        acknowledgment
+            .acknowledge(fn64_runtime::DpcBackendQuantumAck {
+                transaction: request.transaction,
+                quantum: request.quantum,
+                committed_through: request.end,
+                status: fn64_runtime::DpcBackendQuantumStatus::Complete,
+            })
+            .unwrap_or_else(|error| panic!("validating atomic DPC acknowledgment: {error:?}"));
+        assert_eq!(
+            acknowledgment.phase(),
+            fn64_runtime::DpcScheduledPhase::Complete,
+            "atomic DPC acknowledgment did not consume its sole quantum"
+        );
     }
 
     fn commit(mut self) {
-        let token = self.token.take().expect("DPC transaction committed twice");
+        let token = *self
+            .token
+            .as_ref()
+            .expect("DPC transaction committed twice");
+        assert_eq!(
+            self.acknowledgment
+                .as_ref()
+                .expect("atomic DPC transaction has no acknowledgment owner")
+                .phase(),
+            fn64_runtime::DpcScheduledPhase::Complete,
+            "atomic DPC transaction committed before acknowledgment validation"
+        );
         with_host(|host| host.device_fabric.commit_dpc_submission(token))
             .unwrap_or_else(|error| panic!("committing rendered DPC transaction: {error}"));
+        self.token.take();
     }
 }
 
@@ -1736,7 +1814,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
 ) {
     let start = submission.start;
     let end = submission.end;
-    let transaction = LiveDpcTransaction::new(submission);
+    let mut transaction = LiveDpcTransaction::new(submission);
     let (full_sync, observation, operation) = match submission.source {
         fn64_runtime::DpcSubmissionSource::Rdram => {
             let (words, full_sync) = {
@@ -1776,6 +1854,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 let rendered = require_committed_full_sync_evidence(result, "dispatch_raw_rdp");
                 let full_sync =
                     require_matching_raw_dpc_completion(inspected, rendered, "dispatch_raw_rdp");
+                transaction.validate_atomic_completion();
                 real.copy_from_slice(&image);
                 (words, full_sync)
             };
@@ -1796,8 +1875,9 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 .chunks_exact(4)
                 .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
                 .collect::<Vec<_>>();
-            let (full_sync, observation) =
-                unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
+            let (full_sync, observation) = unsafe {
+                dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction)
+            };
             (full_sync, observation, "dispatch_raw_rdp_xbus")
         }
     };
@@ -1852,9 +1932,9 @@ unsafe fn dispatch_raw_rdp_xbus(
         )
     })
     .unwrap_or_else(|error| panic!("dispatch_raw_rdp_xbus: DPC submission rejected: {error}"));
-    let transaction = LiveDpcTransaction::new(submission);
+    let mut transaction = LiveDpcTransaction::new(submission);
     let (full_sync, observation) =
-        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true) };
+        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction) };
     complete_committed_dpc(transaction, full_sync, observation, "dispatch_raw_rdp_xbus");
 }
 
@@ -1869,6 +1949,7 @@ unsafe fn dispatch_captured_raw_rdp(
     source_start: u32,
     source_end: u32,
     xbus: bool,
+    transaction: &mut LiveDpcTransaction,
 ) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
     assert!(
         !words.is_empty() && words.len().is_multiple_of(2),
@@ -1969,6 +2050,7 @@ unsafe fn dispatch_captured_raw_rdp(
     let rendered = require_committed_full_sync_evidence(result, "dispatch_captured_raw_rdp");
     let full_sync =
         require_matching_raw_dpc_completion(inspected, rendered, "dispatch_captured_raw_rdp");
+    transaction.validate_atomic_completion();
     if xbus && std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
         let mut offset = 0usize;
         while offset < physical_len {
@@ -4306,6 +4388,82 @@ mod tests {
             before_device
         );
         assert!(copy_rsp_rdp_observations().is_empty());
+    }
+
+    #[test]
+    fn atomic_ack_validation_failure_precedes_xbus_publication_and_rolls_back() {
+        const MUTATION: usize = 0x400;
+
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        rdram[MUTATION] = 0x5a;
+        let before_rdram = rdram.clone();
+        let before_device = with_host(|host| host.device_fabric.snapshot());
+        let calls = Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(MutatingRawBackend {
+                calls: Rc::clone(&calls),
+                outcome: RawMutationOutcome::Complete,
+                mutation_offset: MUTATION,
+            }),
+            rdram.len(),
+        );
+        let submission = with_host(|host| {
+            host.device_fabric
+                .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Dmem, 0, 8)
+        })
+        .unwrap();
+        let mut transaction = LiveDpcTransaction::new(submission);
+        let fn64_runtime::DpcScheduledPhase::AwaitingAck(request) = transaction
+            .acknowledgment
+            .as_ref()
+            .expect("test transaction owns its atomic acknowledgment")
+            .phase()
+        else {
+            panic!("production atomic transaction did not stop at its sole ack barrier")
+        };
+        assert_eq!(
+            request.transaction,
+            fn64_runtime::DpcTransactionId::from_submission(submission)
+        );
+        assert_eq!(request.quantum, fn64_runtime::DpcQuantumId::new(1));
+        assert_eq!(request.start.source(), submission.source);
+        assert_eq!(request.start.address(), submission.start);
+        assert_eq!(request.end.source(), submission.source);
+        assert_eq!(request.end.address(), submission.end);
+        transaction
+            .acknowledgment
+            .as_mut()
+            .expect("test transaction owns its atomic acknowledgment")
+            .poison();
+
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            dispatch_captured_raw_rdp(
+                rdram.as_mut_ptr(),
+                &[0xe900_0000, 0],
+                0,
+                8,
+                true,
+                &mut transaction,
+            )
+        }))
+        .expect_err("poisoned atomic acknowledgment must remain loud");
+        assert!(panic_message(rejected.as_ref())
+            .contains("lost its acknowledgment owner before validation"));
+        assert_eq!(
+            calls.get(),
+            1,
+            "validation remains after backend acceptance"
+        );
+        assert_eq!(rdram, before_rdram, "ack failure published the XBUS shadow");
+        assert!(copy_rsp_rdp_observations().is_empty());
+
+        drop(transaction);
+        assert_eq!(
+            with_host(|host| host.device_fabric.snapshot()),
+            before_device,
+            "ack failure did not restore the pre-admission DPC state"
+        );
     }
 
     #[test]
