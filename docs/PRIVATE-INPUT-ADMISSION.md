@@ -589,12 +589,17 @@ fixture is required for these checks. The no-program path retains no content
 identity; the feature-gated native path intentionally checks in only its
 public synthetic semantic fingerprint, never private input or output.
 
-The feature-gated native form additionally binds both exact repository
-archives, verifies their combined execution identity and trusted-runner
-receipt, and requires every report to equal the complete checked-in
-schema-v28 semantic fingerprint. It passed 10/10 consecutive parent
-invocations (100 fresh children) on 2026-07-24. This remains public synthetic
-mechanism evidence and supplies no private-ROM or representative-ROM authority.
+The feature-gated native form measures both caller-supplied build-produced
+archives and child invocation inside a specialized operation that returns only
+a self-hashed receipt, never a verified-contract, verified-series, or matrix
+authority. Repository acceptance comes only from equality with the complete
+checked-in `aarch64-apple-darwin` schema-v28 fingerprint. That golden includes
+the target/platform, each archive hash, their combined execution identity, and
+all report semantics. It passed 10/10 consecutive parent invocations (100 fresh
+children) on macOS arm64 on 2026-07-24. Compiler, SDK, or target drift fails
+closed and requires a separately reviewed target-specific golden. This remains
+public synthetic mechanism evidence and supplies no private-ROM or
+representative-ROM authority.
 
 This admission self-test is separate from the live non-default
 `extended-gbi-evidence` renderer fixture. That fixture substitutes RT64's

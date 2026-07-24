@@ -78,9 +78,11 @@ The usable evidence stack is deliberately split:
   LLE/post-VI exact-ten schema-v22 series completed and were independently
   reverified on 2026-07-22 with zero unsupported events; these are historical
   and require schema-v28 regeneration. The public synthetic identified-native
-  XBUS scenario has a current schema-v28 trusted-runner exact-ten repository
-  gate with a complete semantic fingerprint. It passed 10/10 consecutive
-  parent invocations (100 fresh children) on 2026-07-24. Combined with the
+  XBUS scenario has a current schema-v28 macOS arm64 exact-ten gate whose sole
+  repository acceptance anchor is a complete target-named semantic fingerprint
+  including both build-produced archive hashes. It passed 10/10 consecutive
+  parent invocations (100 fresh children) on 2026-07-24. Compiler, SDK, or
+  target drift fails closed pending a separately reviewed golden. Combined with the
   retained historical public synthetic exact-ten series, the
   previous three-scenario matrix credited 12 of 162 requirements and retained the
   other 150 explicitly. The public series adds mechanism coverage, not another

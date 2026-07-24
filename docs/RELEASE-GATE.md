@@ -754,10 +754,15 @@ actually enters it through the ABI-owned native-entry hook before committing
 `IdentifiedNativeArchive` at the VI edge. Filesystem paths do not enter the
 archive identity or report.
 
-The current schema-v28 XBUS gate admits both exact repository archives through
-the typed synthetic contract and trusted series runner and checks every
-semantic field against the complete repository fingerprint. The feature-gated
-integration test passed ten consecutive parent invocations
+The current schema-v28 XBUS gate measures both caller-supplied archives and
+child invocation inside a specialized synthetic-only series operation. That
+operation returns only its self-hashed receipt; it cannot expose the general
+verified-contract, verified-series, or matrix-authority capabilities. Repository
+acceptance comes solely from exact comparison with the checked-in
+`aarch64-apple-darwin` semantic fingerprint. That fingerprint includes the
+target, host platform, individual build-produced archive hashes, their combined
+native-program identity, and every report semantic field. The feature-gated
+integration test passed ten consecutive parent invocations on macOS arm64
 on 2026-07-24, each launching and verifying its own ten fresh children (100
 children total, not one 100-event series). It re-verifies the receipt, requires
 zero unsupported events and the exact 40-byte XBUS observation in every report,
@@ -765,8 +770,10 @@ then feeds each series to matrix v5.
 The synthetic-only incomplete assessment satisfies five project-owned rows, including
 `rsp_rdp_mechanism:xbus-dpc`; the report label does not supply that credit.
 Because this identified-native series is generic public evidence, it has no
-private-ROM authority. Its trusted-runner receipt is local integrity evidence,
-not external process attestation.
+private-ROM authority. Its receipt is local integrity evidence, not repository
+acceptance, matrix authority, or external process attestation. Compiler, SDK,
+or target drift fails the exact golden comparison closed; another target needs
+a separately reviewed target-named golden rather than a dynamic replacement.
 
 Schema v11 added environment evidence derived exclusively from owners frozen
 at the committed VI boundary: supported host target, exact four-port PIF
@@ -1094,13 +1101,13 @@ As of this document revision, **no complete representative full-ROM
 certification matrix exists**. Two private representative v22 scenarios and
 one public synthetic mechanism scenario carry historical verified-series
 credit inside the previous canonical incomplete assessment. The public
-synthetic scenario now has a current schema-v28 exact-ten trusted-runner gate;
+synthetic scenario now has a current schema-v28 exact-ten macOS arm64 gate;
 the private scenarios and joint matrix still require regeneration. The exact
 state is:
 
 | ROM/report class | Mechanism available | Certified evidence retained |
 | --- | --- | --- |
-| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | The schema-v28 repository gate admits both exact archives, launches ten fresh children through the trusted runner, verifies its receipt, and pins the complete semantic fingerprint. It passed 10/10 parent invocations on 2026-07-24. Historical v22 evidence supplied generic native/reference, no-cartridge-save, standard-controller, DRAM-DPC, and XBUS-DPC mechanism rows. Neither result has private-ROM authority, and an incomplete assessment is not a complete retained matrix. |
+| Synthetic fixtures and end-to-end runner | Five-channel fixed-cycle reports, v3 report/journal/run-event binding, real executor/device/RSP/RDP/VI/reference-render boundaries, derived matrix coverage, and the canonical incomplete assessment are available. | The schema-v28 macOS arm64 gate measures both supplied build-produced archives, launches ten fresh children, verifies its self-hashed receipt, and accepts only the exact target-named fingerprint containing the individual archive hashes and complete report semantics. It passed 10/10 parent invocations on 2026-07-24. Compiler/SDK/target drift fails closed and requires a separately reviewed target-specific golden. Historical v22 evidence supplied generic native/reference, no-cartridge-save, standard-controller, DRAM-DPC, and XBUS-DPC mechanism rows. Neither result has private-ROM authority, and an incomplete assessment is not a complete retained matrix. |
 | OoT NTSC 1.0, Rust lane, reference LLE | Private host wiring, committed-VI capture, complete-RDRAM observation, an explicit source-hash-bound `BlockProgram` host-selection seam, an artifact/schema-bound whole-function entry stream, a create-new receipt/source-wire producer, runner-staged exact ROM/microcode-pair admission, and same-event kickoff check exist. The v28 report additionally owns memory/audio/trace bytes at the boundary, binds the unsupported-instrumentation denominator, and requires DeviceState v15. | Ten fresh schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities, but they are historical under v28. |
 | OoT NTSC 1.0, Rust lane, RT64 LLE/post-VI | Exact-cycle presentation discovery, workload/present-bound v3 post-VI envelope, resolved graphics-API and TV-standard evidence, explicit program identity, and runner-staged exact ROM/microcode-pair admission exist. | Ten fresh pinned-Metal schema-v22 processes completed and reverified on 2026-07-22 at cycle `722368695`; the retained private receipt binds their exact semantic report and ten run identities, but they are historical under v28. |
 | OoT NTSC 1.0, legacy C lane | Observation tooling and exact linked-archive identity wiring exist. | Non-authoritative: measured framebuffer parity is only claimed through swap 60, and the C oracle's missing bodies prevent deeper arbitration beyond the known swap-231 frontier. |

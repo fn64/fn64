@@ -170,6 +170,7 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
     let target = env::var("TARGET").expect("Cargo must set TARGET");
+    println!("cargo:rustc-env=FN64_SYNTHETIC_NATIVE_TARGET={target}");
     let enabled_features = env::vars_os()
         .filter_map(|(name, _)| {
             name.to_str()

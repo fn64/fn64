@@ -42,9 +42,9 @@ pub use private_input_admission::{
     VerifiedPrivateF3dzex2CharacterizationInput,
 };
 pub use private_release_series::{
-    load_private_release_run_contract, run_private_release_series, verify_private_release_series,
+    load_private_release_run_contract, run_private_release_series,
+    run_synthetic_native_private_release_series, verify_private_release_series,
     verify_private_release_series_with_runner,
-    verify_repository_synthetic_native_private_release_run_contract,
     verify_repository_synthetic_private_release_run_contract, PrivateArtifactIdentity,
     PrivateChildCommand, PrivateEnvironmentEntry, PrivateFileIdentity, PrivateReleaseRunContract,
     PrivateReleaseSeriesError, PrivateReleaseSeriesReceipt, PrivateReleaseSeriesRun,

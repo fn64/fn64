@@ -959,20 +959,42 @@ pub fn verify_repository_synthetic_private_release_run_contract(
     Ok(VerifiedPrivateReleaseRunContract { contract })
 }
 
-/// Admit the repository's identified-native fixture only when trusted caller
-/// code supplies the exact build-produced archives and child invocation.
-pub fn verify_repository_synthetic_native_private_release_run_contract(
+/// Validate, execute, and reverify one caller-bound identified-native
+/// synthetic series.
+///
+/// The archive and child values are caller-supplied consistency bounds, not
+/// repository acceptance anchors. The verified contract remains inside this
+/// operation so this path cannot mint the general production-runner
+/// capability. A platform-specific gate separately compares the resulting
+/// reports with an exact checked-in semantic fingerprint.
+pub fn run_synthetic_native_private_release_series(
     contract: PrivateReleaseRunContract,
-    expected_archives: [PrivateArtifactIdentity; 2],
-    expected_child: PrivateChildCommand,
+    caller_bound_archives: [PrivateArtifactIdentity; 2],
+    caller_bound_child: PrivateChildCommand,
+    output_directory: impl AsRef<Path>,
+) -> Result<PrivateReleaseSeriesReceipt, PrivateReleaseSeriesError> {
+    let verified_contract = verify_synthetic_native_private_release_run_contract(
+        contract,
+        caller_bound_archives,
+        caller_bound_child,
+    )?;
+    let receipt = run_private_release_series(&verified_contract, &output_directory)?;
+    verify_private_release_series(&verified_contract, output_directory, &receipt)?;
+    Ok(receipt)
+}
+
+fn verify_synthetic_native_private_release_run_contract(
+    contract: PrivateReleaseRunContract,
+    caller_bound_archives: [PrivateArtifactIdentity; 2],
+    caller_bound_child: PrivateChildCommand,
 ) -> Result<VerifiedPrivateReleaseRunContract, PrivateReleaseSeriesError> {
     verify_repository_synthetic_contract_common(&contract)?;
     if contract.report_scenario != REPOSITORY_SYNTHETIC_NATIVE_RELEASE_SCENARIO
-        || contract.admitted_artifacts != expected_archives
-        || contract.child != expected_child
+        || contract.admitted_artifacts != caller_bound_archives
+        || contract.child != caller_bound_child
     {
         return Err(error(
-            "identified-native synthetic authority requires the exact trusted archives and child invocation",
+            "identified-native synthetic series requires the exact caller-bound archives and child invocation",
         ));
     }
     let roles = contract
@@ -991,7 +1013,7 @@ pub fn verify_repository_synthetic_native_private_release_run_contract(
             .any(|artifact| artifact.provenance != "repository_defined_synthetic")
     {
         return Err(error(
-            "identified-native synthetic authority requires the exact generated-code and section-bridge archive roles",
+            "identified-native synthetic series requires the exact generated-code and section-bridge archive roles",
         ));
     }
     contract.verify_bound_files()?;
@@ -999,7 +1021,7 @@ pub fn verify_repository_synthetic_native_private_release_run_contract(
         &contract.expected_execution_source
     else {
         return Err(error(
-            "identified-native synthetic authority requires the native-archive execution source",
+            "identified-native synthetic series requires the native-archive execution source",
         ));
     };
     let archives = contract
@@ -2774,14 +2796,14 @@ mod tests {
     }
 
     #[test]
-    fn repository_identified_native_synthetic_authority_binds_both_archives() {
+    fn identified_native_synthetic_series_binds_both_archives() {
         let directory = TestDirectory::new();
         let contract = native_fixture_contract(&directory.0);
         let expected_archives: [PrivateArtifactIdentity; 2] =
             contract.admitted_artifacts.clone().try_into().unwrap();
         let expected_child = contract.child.clone();
         let verify = |candidate| {
-            verify_repository_synthetic_native_private_release_run_contract(
+            verify_synthetic_native_private_release_run_contract(
                 candidate,
                 expected_archives.clone(),
                 expected_child.clone(),
@@ -2812,7 +2834,7 @@ mod tests {
         assert!(verify(extra)
             .unwrap_err()
             .to_string()
-            .contains("exact trusted archives"));
+            .contains("exact caller-bound archives"));
 
         let mut reordered = contract.clone();
         reordered.admitted_artifacts.reverse();
@@ -2848,7 +2870,7 @@ mod tests {
         assert!(verify(replaced)
             .unwrap_err()
             .to_string()
-            .contains("exact trusted archives"));
+            .contains("exact caller-bound archives"));
 
         let mutated = contract;
         let archive = PathBuf::from(&mutated.admitted_artifacts[0].path);
