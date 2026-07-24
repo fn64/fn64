@@ -1174,3 +1174,225 @@ fn floating_point_exception_vectors_to_exccode_15() {
         "Cause.BD set in a delay slot"
     );
 }
+
+// ============================================================================
+// FR=1 register file (sub-step 3, item 1).
+//
+// Status.FR (COP0 reg 12, bit 26) selects the FPU register organization. Set it
+// via `write_cop0(12, 1 << 26)`.
+// ============================================================================
+
+const STATUS_FR: u32 = 1 << 26;
+
+/// FR=1: all 32 registers are independent 64-bit FGRs. An ODD double register
+/// is a full, separate register — a write to `$f3` must NOT touch `$f2`.
+#[test]
+fn fr1_odd_double_is_independent_register() {
+    let mut ctx = RecompContext::new();
+    ctx.write_cop0(12, STATUS_FR);
+    assert!(ctx.fpu_fr(), "FR set");
+
+    ctx.set_d_bits(2, 0xAAAA_AAAA_AAAA_AAAA);
+    ctx.set_d_bits(3, 0x5555_5555_5555_5555);
+    assert_eq!(ctx.d_bits(2), 0xAAAA_AAAA_AAAA_AAAA, "$f2 unchanged by $f3 write");
+    assert_eq!(ctx.d_bits(3), 0x5555_5555_5555_5555, "$f3 is its own register");
+}
+
+/// FR=1: single-precision `$fN` is the low 32 bits of slot N — there is NO
+/// even/odd high-word aliasing. The odd single `$f5` is independent of `$f4`.
+#[test]
+fn fr1_odd_single_is_independent_no_aliasing() {
+    let mut ctx = RecompContext::new();
+    ctx.write_cop0(12, STATUS_FR);
+    ctx.set_f_bits(4, 0x1111_1111);
+    ctx.set_f_bits(5, 0x2222_2222);
+    assert_eq!(ctx.f_bits(4), 0x1111_1111, "FR=1: $f4 own low word");
+    assert_eq!(ctx.f_bits(5), 0x2222_2222, "FR=1: $f5 own low word, not $f4 high");
+    // $f4's slot high word is untouched by the $f5 write (no aliasing).
+    assert_eq!(ctx.d_bits(4) >> 32, 0, "FR=1: no write bled into $f4 high word");
+}
+
+/// FR=0 even-pairing is preserved after this change: the even/odd single alias
+/// and the even-only double addressing still hold (regression guard).
+#[test]
+fn fr0_pairing_preserved() {
+    let mut ctx = RecompContext::new(); // FR=0.
+    assert!(!ctx.fpu_fr());
+    ctx.set_d_bits(4, 0x1122_3344_5566_7788);
+    assert_eq!(ctx.f_bits(4), 0x5566_7788, "FR=0 even single = low word");
+    assert_eq!(ctx.f_bits(5), 0x1122_3344, "FR=0 odd single = even partner high word");
+}
+
+/// The SAME program run under FR=0 vs FR=1 behaves per spec: writing $f2 then
+/// reading $f3 as a double sees the aliased value in FR=0 but garbage/zero (the
+/// independent register) in FR=1.
+#[test]
+fn fr_mode_changes_odd_double_semantics() {
+    let mut fr0 = RecompContext::new();
+    fr0.set_d_bits(2, 0x0102_0304_0506_0708);
+    let fr0_odd = fr0.d_bits(3); // aliases $f2
+
+    let mut fr1 = RecompContext::new();
+    fr1.write_cop0(12, STATUS_FR);
+    fr1.set_d_bits(2, 0x0102_0304_0506_0708);
+    let fr1_odd = fr1.d_bits(3); // independent (still zero)
+
+    assert_eq!(fr0_odd, 0x0102_0304_0506_0708, "FR=0: $f3 aliases $f2");
+    assert_eq!(fr1_odd, 0, "FR=1: $f3 is its own (untouched) register");
+    assert_ne!(fr0_odd, fr1_odd, "the FR bit changes the observable semantics");
+}
+
+// ============================================================================
+// FP conditional moves (sub-step 3, item 2).
+// ============================================================================
+
+/// MOVT moves the source when the FPU condition flag is SET (and MOVF does not);
+/// MOVF moves when clear. The destination is left unchanged when the predicate
+/// fails. Both S and D.
+#[test]
+fn movt_movf_honor_condition_flag() {
+    // MOVT.S: cond set -> move; cond clear -> no move.
+    let mut ctx = RecompContext::new();
+    ctx.set_f_bits(0, 0xDEAD_BEEF); // fd sentinel
+    ctx.set_f_bits(2, 0x4048_0000); // fs = 3.125f
+    ctx.fpu_cond = true;
+    ctx.fpu_movcf_s(0, 2, true); // MOVT.S: cond==true -> move
+    assert_eq!(ctx.f_bits(0), 0x4048_0000, "MOVT.S moves when cond set");
+
+    ctx.set_f_bits(0, 0xDEAD_BEEF);
+    ctx.fpu_cond = false;
+    ctx.fpu_movcf_s(0, 2, true); // MOVT.S: cond==false -> no move
+    assert_eq!(ctx.f_bits(0), 0xDEAD_BEEF, "MOVT.S leaves fd when cond clear");
+
+    // MOVF.S: cond clear -> move.
+    ctx.set_f_bits(0, 0xDEAD_BEEF);
+    ctx.fpu_cond = false;
+    ctx.fpu_movcf_s(0, 2, false);
+    assert_eq!(ctx.f_bits(0), 0x4048_0000, "MOVF.S moves when cond clear");
+
+    // MOVT.D on doubles.
+    let mut d = RecompContext::new();
+    d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
+    d.set_d_bits(2, 0x4009_0000_0000_0000); // 3.125
+    d.fpu_cond = true;
+    d.fpu_movcf_d(0, 2, true);
+    assert_eq!(d.d_bits(0), 0x4009_0000_0000_0000, "MOVT.D moves when cond set");
+    d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
+    d.fpu_cond = false;
+    d.fpu_movcf_d(0, 2, true);
+    assert_eq!(d.d_bits(0), 0xDEAD_BEEF_DEAD_BEEF, "MOVT.D no move when cond clear");
+}
+
+/// MOVZ moves when the GPR reads zero; MOVN moves when nonzero. Both S and D.
+#[test]
+fn movz_movn_honor_gpr() {
+    let mut ctx = RecompContext::new();
+    ctx.set_f_bits(0, 0xDEAD_BEEF);
+    ctx.set_f_bits(2, 0x4048_0000);
+    ctx.set_r(8, 0);
+    ctx.fpu_movz_s(0, 2, 8); // rt==0 -> move
+    assert_eq!(ctx.f_bits(0), 0x4048_0000, "MOVZ.S moves when GPR==0");
+
+    ctx.set_f_bits(0, 0xDEAD_BEEF);
+    ctx.set_r(8, 5);
+    ctx.fpu_movz_s(0, 2, 8); // rt!=0 -> no move
+    assert_eq!(ctx.f_bits(0), 0xDEAD_BEEF, "MOVZ.S no move when GPR!=0");
+
+    ctx.set_f_bits(0, 0xDEAD_BEEF);
+    ctx.set_r(8, 5);
+    ctx.fpu_movn_s(0, 2, 8); // rt!=0 -> move
+    assert_eq!(ctx.f_bits(0), 0x4048_0000, "MOVN.S moves when GPR!=0");
+
+    // Double variants.
+    let mut d = RecompContext::new();
+    d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
+    d.set_d_bits(2, 0x4009_0000_0000_0000);
+    d.set_r(8, 0);
+    d.fpu_movz_d(0, 2, 8);
+    assert_eq!(d.d_bits(0), 0x4009_0000_0000_0000, "MOVZ.D moves when GPR==0");
+    d.set_d_bits(0, 0xDEAD_BEEF_DEAD_BEEF);
+    d.fpu_movn_d(0, 2, 8); // GPR still 0 -> no move
+    assert_eq!(d.d_bits(0), 0xDEAD_BEEF_DEAD_BEEF, "MOVN.D no move when GPR==0");
+}
+
+/// The MOVF/MOVT/MOVZ/MOVN.fmt words decode to the right typed instructions
+/// (funct 0x11/0x12/0x13, `tf` = bit 16, GPR in the ft field).
+#[test]
+fn conditional_moves_decode() {
+    use fn64_recomp_rs::Instruction::*;
+    // Layout: op(0x11)<<26 | fmt<<21 | ft<<16 | fs<<11 | fd<<6 | funct.
+    // MOVT.S $f4,$f2,cc0: fmt=S(0x10), tf=1 (ft bit0), funct=0x11.
+    let movt_s = (0x11 << 26) | (0x10 << 21) | (0x1 << 16) | (2 << 11) | (4 << 6) | 0x11;
+    assert_eq!(decode(movt_s), MovcfS { fd: 4, fs: 2, tf: true });
+    let movf_s = (0x11 << 26) | (0x10 << 21) | (2 << 11) | (4 << 6) | 0x11; // ft=0 => tf=0
+    assert_eq!(decode(movf_s), MovcfS { fd: 4, fs: 2, tf: false });
+    // MOVZ.S $f4,$f2,$t0(=8): ft carries the GPR index.
+    let movz_s = (0x11 << 26) | (0x10 << 21) | (8 << 16) | (2 << 11) | (4 << 6) | 0x12;
+    assert_eq!(decode(movz_s), MovzS { fd: 4, fs: 2, rt: 8 });
+    let movn_d = (0x11 << 26) | (0x11 << 21) | (8 << 16) | (2 << 11) | (4 << 6) | 0x13;
+    assert_eq!(decode(movn_d), MovnD { fd: 4, fs: 2, rt: 8 });
+}
+
+// ============================================================================
+// Denormal -> Unimplemented Operation (sub-step 3, item 3).
+//
+// The VR4300 does not process subnormal operands/results; it raises the
+// Unimplemented Operation exception (FCSR Cause bit E, bit 17), which is
+// UNMASKABLE — it always traps to ExcCode 15 regardless of the Enable field.
+// FCSR Cause.E = bit 17.
+// ============================================================================
+
+const CAUSE_E: u32 = 1 << 17;
+
+/// A denormal OPERAND raises Unimplemented Operation and traps even with ALL
+/// Enable bits clear (E is unmaskable). Cause.E is set; the destination is not
+/// committed.
+#[test]
+fn denormal_operand_traps_unimplemented_even_with_enables_clear() {
+    let mut ctx = RecompContext::new(); // all Enables clear.
+    // Smallest positive single subnormal: exponent 0, mantissa 1.
+    let denorm = 0x0000_0001u32;
+    ctx.set_f_bits(2, denorm);
+    ctx.set_f_bits(4, 1.0f32.to_bits());
+    ctx.set_f_bits(0, 0xDEAD_BEEF); // fd sentinel
+    let trapped = ctx.fpu_add_s(0, 2, 4);
+    assert!(trapped, "denormal operand traps (E is unmaskable)");
+    assert_ne!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E set");
+    assert_eq!(ctx.f_bits(0), 0xDEAD_BEEF, "destination not committed on trap");
+}
+
+/// A denormal RESULT (from a normal op that underflows into subnormal range)
+/// also raises Unimplemented Operation. `MIN_POSITIVE * 0.5` is subnormal.
+#[test]
+fn denormal_result_traps_unimplemented() {
+    let mut ctx = RecompContext::new();
+    ctx.set_f_bits(2, f32::MIN_POSITIVE.to_bits()); // smallest normal
+    ctx.set_f_bits(4, 0.5f32.to_bits());
+    let trapped = ctx.fpu_mul_s(0, 2, 4); // -> subnormal result
+    assert!(trapped, "a subnormal result traps E");
+    assert_ne!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E set on denormal result");
+}
+
+/// A normal op with normal operands and a normal result does NOT raise E.
+#[test]
+fn normal_op_does_not_trap_unimplemented() {
+    let mut ctx = RecompContext::new();
+    ctx.set_f_bits(2, 1.5f32.to_bits());
+    ctx.set_f_bits(4, 2.25f32.to_bits());
+    let trapped = ctx.fpu_add_s(0, 2, 4);
+    assert!(!trapped, "normal op does not trap");
+    assert_eq!(ctx.read_fcr(31) & CAUSE_E, 0, "Cause.E clear");
+    assert_eq!(ctx.f_bits(0), (1.5f32 + 2.25f32).to_bits(), "result committed");
+}
+
+/// The shim's denormal predicates directly (double precision too).
+#[test]
+fn denormal_predicates() {
+    assert!(fpu::is_denormal_s(0x0000_0001));
+    assert!(fpu::is_denormal_s(0x007F_FFFF));
+    assert!(!fpu::is_denormal_s(0), "zero is not a denormal");
+    assert!(!fpu::is_denormal_s(f32::MIN_POSITIVE.to_bits()), "smallest normal is not denormal");
+    assert!(fpu::is_denormal_d(0x0000_0000_0000_0001));
+    assert!(!fpu::is_denormal_d(0), "zero is not a denormal");
+    assert!(!fpu::is_denormal_d(f64::MIN_POSITIVE.to_bits()));
+}
