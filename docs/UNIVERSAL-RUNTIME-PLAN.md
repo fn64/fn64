@@ -1,6 +1,8 @@
 # Universal N64 execution plan
 
-Status: active design, 2026-07-17. This is the execution-closure companion to
+Status: active design, updated 2026-07-24. The current integration checkpoint
+and exact resume sequence are recorded in `RUNTIME-RENDER-HANDOFF.md`. This is
+the execution-closure companion to
 `DISCOVER-PLAN.md`. Discovery explains what is known about a ROM; this document
 defines how fn64 runs every reachable instruction even when historical
 function boundaries, overlays, or generated code are not known ahead of time.
