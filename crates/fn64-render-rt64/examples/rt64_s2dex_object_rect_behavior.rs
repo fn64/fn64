@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 const PINNED_SOURCE: &str = "git:f0728a2520d5aa735886240de3fee75cc805f6d6";
 const OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3";
-const ADAPTER_SHA256: &str = "c94e6ee0436295471e5a696ece735793895f552dde9e1fbc3853ea100ceec7b9";
+const ADAPTER_SHA256: &str = "25228837544d1903b3dcafc079d365b7654d942afc29d3f2fbb09d724eddee83";
 const RDRAM_LEN: usize = 8 * 1024 * 1024;
 const WIDTH: u32 = 8;
 const HEIGHT: u32 = 4;
@@ -100,6 +100,14 @@ fn write_s2dex_list(
         (0xed00_0000, (WIDTH * 4) << 12 | (HEIGHT * 4)),
         (0xfc8f_ff1f, 0x88fc_f279),
         (other_mode_high, 0),
+        (
+            if legacy_wire {
+                0xbc00_0006
+            } else {
+                0xdb06_0000
+            },
+            0,
+        ),
         ((u32::from(command) << 24) | dma_length, TXSP),
         (0xe900_0000, 0),
         (
@@ -117,7 +125,11 @@ fn write_s2dex_list(
 }
 
 fn overwrite_compound_pointer(rdram: &mut [u8], start: usize, pointer: u32) {
-    write_command(rdram, start + 4 * 8, 0x0700_002f, pointer);
+    write_command(rdram, start + 5 * 8, 0x0700_002f, pointer);
+}
+
+fn insert_segment_zero_base(rdram: &mut [u8], start: usize, base: u32) {
+    write_command(rdram, start + 4 * 8, 0xdb06_0000, base);
 }
 
 fn write_raw_control(rdram: &mut [u8]) -> u32 {
@@ -323,6 +335,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     RdramViewMut::from_storage(&mut rdram)
         .write_u32(RdramAddr::from_offset(TXSP + 4), 0xa000_3000);
     overwrite_compound_pointer(&mut rdram, S2DEX_DL, 0x8000_2000);
+    insert_segment_zero_base(&mut rdram, S2DEX_DL, 0x0010_0000);
     backend.enable_deferred_workload_capture_for_evidence()?;
     backend.process_synthetic_s2dex2(&mut rdram, S2DEX_DL as u32, S2DEX_TARGET)?;
     let route = backend.s2dex_fast_path_evidence()?;
@@ -550,6 +563,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         0xef00_0000,
         false,
     );
+    insert_segment_zero_base(&mut rdram, S2DEX_DL, 0);
     backend.enable_deferred_workload_capture_for_evidence()?;
     backend.process_synthetic_s2dex2(&mut rdram, S2DEX_DL as u32, S2DEX_TARGET)?;
     let final_route = backend.s2dex_fast_path_evidence()?;

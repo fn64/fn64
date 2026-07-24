@@ -99,8 +99,6 @@ set(FN64_RT64_S2DEX_NAMESPACE_PATCHED [=[namespace RT64 {
         static_assert(std::is_trivially_copyable_v<uObjTxtr>);
         static_assert(std::is_trivially_copyable_v<Fn64ObjSprite>);
 
-        void doLoadTxtr(State *state, const uObjTxtr *obj);
-
         [[noreturn]] void rejectFn64ObjLoadTxRect(const char *reason) {
             throw std::runtime_error(
                 std::string("S2DEX2 G_OBJ_LDTX_RECT unsupported by bounded fn64 slice: ") +
@@ -137,6 +135,61 @@ set(FN64_RT64_S2DEX_NAMESPACE_PATCHED [=[namespace RT64 {
                 rejectFn64ObjLoadTxRect(rangeReason);
             }
             return uint32_t(resolved);
+        }
+
+        void doFn64ObjLoadTxtr(
+            State *state,
+            const uObjTxtr &texture,
+            uint32_t imageAddress)
+        {
+            const int32_t previousLoad = state->rsp->S2D.data_02AE;
+            const uint32_t sid = uint8_t(texture.sid);
+            const uint32_t status = state->rsp->S2D.statuses[sid / 4U];
+            if ((status & texture.mask) == texture.flag) {
+                return;
+            }
+            state->rsp->S2D.statuses[sid / 4U] =
+                (status & ~texture.mask) | (texture.flag & texture.mask);
+            state->rsp->S2D.data_02AE = -127;
+            if (previousLoad == -127) {
+                // Public S2DEX would emit a tile sync; RT64 does not need it.
+            }
+
+            const uint32_t textureWords = texture.val1;
+            state->rdp->setTextureImage(
+                G_IM_FMT_RGBA,
+                G_IM_SIZ_16b,
+                textureWords + 1U,
+                imageAddress);
+            const uint32_t typeMask = uint32_t(int32_t(int8_t(texture.type >> 16)));
+            const uint32_t setTileWord =
+                texture.tmem |
+                (((textureWords + 1U) & typeMask) << 7) |
+                (uint32_t(uint8_t(texture.type >> 8)) << 16);
+            state->rdp->setTile(
+                G_TX_LOADTILE,
+                (setTileWord >> 21) & 7U,
+                (setTileWord >> 19) & 3U,
+                (setTileWord >> 9) & 0x1FFU,
+                setTileWord & 0x1FFU,
+                0,
+                G_TX_WRAP | G_TX_NOMIRROR,
+                G_TX_WRAP | G_TX_NOMIRROR,
+                G_TX_NOMASK,
+                G_TX_NOMASK,
+                G_TX_NOLOD,
+                G_TX_NOLOD);
+            if (previousLoad >= 0) {
+                // Public S2DEX would emit a load sync; RT64 does not need it.
+            }
+            const uint32_t loadWord =
+                ((textureWords << 14) | texture.val2) & 0x00FFFFFFU;
+            state->rdp->loadBlock(
+                G_TX_LOADTILE,
+                0,
+                0,
+                (loadWord >> 12) & 0xFFFU,
+                loadWord & 0xFFFU);
         }
 
         void doFn64ObjLoadTxRect(State *state, const uint8_t *objectBytes) {
@@ -222,7 +275,7 @@ set(FN64_RT64_S2DEX_NAMESPACE_PATCHED [=[namespace RT64 {
                 rejectFn64ObjLoadTxRect("image extent exceeds the RDP tile coordinate range");
             }
 
-            doLoadTxtr(state, &texture);
+            doFn64ObjLoadTxtr(state, texture, imageAddress);
             RDP *rdp = state->rdp.get();
             rdp->setTile(
                 G_TX_RENDERTILE, G_IM_FMT_RGBA, G_IM_SIZ_16b,
