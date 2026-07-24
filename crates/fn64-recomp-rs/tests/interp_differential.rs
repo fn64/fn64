@@ -424,6 +424,143 @@ fn programs() -> Vec<Program> {
             rdram_len: 16,
             init_mem: &[],
         },
+        // --- FPU parity programs (sub-step 3, item 4). Each moves float bits
+        //     from GPRs into FPRs, runs a family of COP1 ops, and ends jr $ra.
+        //     The differential over the full FPR file + FCR31 proves the
+        //     interpreter routes COP1 through the SAME shim as the block lane.
+        //     All non-trapping (no enabled exceptions, no denormals) so both
+        //     lanes complete normally. $t0 = -3.0f bits, $t1 = 7.0f bits. ---
+        Program {
+            name: "p_fpu_arith_s",
+            bank: 0x13,
+            vram: BASE,
+            words: &[
+                0x4488_0000, // mtc1  $t0,$f0     ($f0 = -3.0)
+                0x4489_1000, // mtc1  $t1,$f2     ($f2 = 7.0)
+                0x4602_0100, // add.s $f4,$f0,$f2
+                0x4600_1181, // sub.s $f6,$f2,$f0
+                0x4602_0202, // mul.s $f8,$f0,$f2
+                0x4600_1283, // div.s $f10,$f2,$f0
+                0x4600_1304, // sqrt.s $f12,$f2
+                0x4600_0385, // abs.s $f14,$f0
+                0x4600_1407, // neg.s $f16,$f2
+                0x03E0_0008, // jr $ra
+                0x0000_0000, // nop
+            ],
+            entry: BASE,
+            budget: 64,
+            init_regs: &[
+                (31, 0x8000_9000),
+                (8, 0xC040_0000),  // -3.0f
+                (9, 0x40E0_0000),  // 7.0f
+            ],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        // Rounding-mode honored on arithmetic: CTC1 sets FCSR.RM=RZ before an
+        // inexact DIV/MUL. Both lanes must round identically (and set FCR31).
+        Program {
+            name: "p_fpu_rm",
+            bank: 0x14,
+            vram: BASE,
+            words: &[
+                0x4488_0000, // mtc1  $t0,$f0     (1.0)
+                0x4489_1000, // mtc1  $t1,$f2     (3.0)
+                0x44CA_F800, // ctc1  $t2,fcr31   (RM = RZ = 1)
+                0x4602_0103, // div.s $f4,$f0,$f2 (1/3 inexact, toward zero)
+                0x4602_0182, // mul.s $f6,$f0,$f2
+                0x03E0_0008, // jr $ra
+                0x0000_0000, // nop
+            ],
+            entry: BASE,
+            budget: 64,
+            init_regs: &[
+                (31, 0x8000_9000),
+                (8, 0x3F80_0000), // 1.0f
+                (9, 0x4040_0000), // 3.0f
+                (10, 1),          // FCSR = RM(RZ)
+            ],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        // Conditional moves: a C.LT.S sets the flag, then MOVT/MOVF/MOVZ/MOVN.S.
+        Program {
+            name: "p_fpu_condmove",
+            bank: 0x15,
+            vram: BASE,
+            words: &[
+                0x4488_0000, // mtc1  $t0,$f0     (2.0)
+                0x4489_1000, // mtc1  $t1,$f2     (7.0)
+                0x4602_003C, // c.lt.s $f0,$f2    -> cond = (2<7) = true
+                0x4601_1111, // movt.s $f4,$f2    (tf=1, cond set -> moves)
+                0x4600_1191, // movf.s $f6,$f2    (tf=0, cond set -> no move)
+                0x460B_1212, // movz.s $f8,$f2,$t3 ($t3!=0 -> no move)
+                0x460B_1293, // movn.s $f10,$f2,$t3 ($t3!=0 -> moves)
+                0x03E0_0008, // jr $ra
+                0x0000_0000, // nop
+            ],
+            entry: BASE,
+            budget: 64,
+            init_regs: &[
+                (31, 0x8000_9000),
+                (8, 0x4000_0000), // 2.0f
+                (9, 0x40E0_0000), // 7.0f
+                (11, 1),          // $t3 nonzero
+            ],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        // Double-precision arithmetic parity (DMTC1 builds 64-bit operands).
+        Program {
+            name: "p_fpu_double",
+            bank: 0x16,
+            vram: BASE,
+            words: &[
+                0x44A8_0000, // dmtc1 $t0,$f0     (3.0)
+                0x44A9_1000, // dmtc1 $t1,$f2     (7.0)
+                0x4622_0100, // add.d $f4,$f0,$f2
+                0x4622_0182, // mul.d $f6,$f0,$f2
+                0x4620_1203, // div.d $f8,$f2,$f0
+                0x4620_1284, // sqrt.d $f10,$f2
+                0x03E0_0008, // jr $ra
+                0x0000_0000, // nop
+            ],
+            entry: BASE,
+            budget: 64,
+            init_regs: &[
+                (31, 0x8000_9000),
+                (8, 0x4008_0000_0000_0000), // 3.0
+                (9, 0x401C_0000_0000_0000), // 7.0
+            ],
+            rdram_len: 0,
+            init_mem: &[],
+        },
+        // FR=1 register file parity: set Status.FR via MTC0, then use ODD double
+        // registers ($f3,$f5,$f7) that are only independent in FR=1. Both lanes
+        // must honor FR the same way (add.d over odd regs -> $f7 = 3.0 + 7.0).
+        Program {
+            name: "p_fpu_fr1",
+            bank: 0x17,
+            vram: BASE,
+            words: &[
+                0x408A_6000, // mtc0  $t2,$12   (Status = CU1 | FR)
+                0x44A8_1800, // dmtc1 $t0,$f3   (3.0 into odd $f3)
+                0x44A9_2800, // dmtc1 $t1,$f5   (7.0 into odd $f5)
+                0x4625_19C0, // add.d $f7,$f3,$f5
+                0x03E0_0008, // jr $ra
+                0x0000_0000, // nop
+            ],
+            entry: BASE,
+            budget: 64,
+            init_regs: &[
+                (31, 0x8000_9000),
+                (8, 0x4008_0000_0000_0000),  // 3.0
+                (9, 0x401C_0000_0000_0000),  // 7.0
+                (10, 0x2400_0000),           // Status = CU1(1<<29) | FR(1<<26)
+            ],
+            rdram_len: 0,
+            init_mem: &[],
+        },
         // Self-loop yield: `beq $zero,$zero,self` runs its delay slot and yields.
         Program {
             name: "p_selfloop",
@@ -539,10 +676,11 @@ use fn64_recomp_rs::{{
 
 type AotRunner = fn(ExecutionKey, InstructionBudget, &mut RecompContext, &mut Rdram) -> BlockRun;
 
-/// A comparable snapshot of all *observable* architectural state. FPU register
-/// bits and FCSR are private and untouched by this integer/control/memory slice,
-/// so the observable set (GPRs, HI/LO, COP0 Count/Compare/Random/cond, FPU cond
-/// flag) plus the full RDRAM image is the complete differential surface here.
+/// A comparable snapshot of all *observable* architectural state. The FPU-
+/// exercising programs make the COP1 register file and FCSR part of the
+/// differential surface, so this snapshots the full 32-slot FPR file and FCR31
+/// alongside the GPRs, HI/LO, COP0 Count/Compare/Random/cond, the FPU cond flag,
+/// and the complete RDRAM image.
 #[derive(PartialEq, Eq, Debug)]
 struct State {{
     gprs: [u64; 32],
@@ -553,6 +691,8 @@ struct State {{
     cop0_random: u32,
     cop0_cond: bool,
     fpu_cond: bool,
+    fpr: [u64; 32],
+    fcr31: u32,
     mem: Vec<u8>,
 }}
 
@@ -566,12 +706,18 @@ fn snapshot(ctx: &RecompContext, mem: &[u8]) -> State {{
         cop0_random: ctx.read_cop0(1),
         cop0_cond: ctx.cop0_cond,
         fpu_cond: ctx.fpu_cond,
+        fpr: ctx.fpr_slots(),
+        fcr31: ctx.read_fcr(31),
         mem: mem.to_vec(),
     }}
 }}
 
 fn make_ctx(init_regs: &[(u8, u64)]) -> RecompContext {{
     let mut ctx = RecompContext::new();
+    // Enable COP1 (Status.CU1, bit 29) so the FPU programs run in both lanes;
+    // harmless for the integer/control/memory programs. Real N64 code runs with
+    // CU1 set. FR stays 0 (libultra default), which the FPU programs rely on.
+    ctx.write_cop0(12, 1 << 29);
     for &(i, v) in init_regs {{
         ctx.set_r(i, v);
     }}
