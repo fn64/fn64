@@ -532,17 +532,89 @@ pub enum RspInterpreterStateEvidenceSnapshot {
     /// A direct-IMEM HLE task completed without entering rspboot and without
     /// exposing any terminal scalar/VU image. No later interpreter task may
     /// silently reuse the older exact snapshot.
-    HleCompatibilityUnavailable {
-        task_offset: u32,
-        admission_generation: RspTaskAdmissionGeneration,
-    },
+    HleCompatibilityUnavailable { owner: RspInterpreterOwner },
     /// A synchronous interpreter phase has consumed the ready state. If that
     /// phase unwinds, another task traps instead of silently creating a fresh
     /// core and hiding the interrupted continuation.
-    InFlight {
-        task_offset: u32,
+    InFlight { owner: RspInterpreterOwner },
+}
+
+/// Who holds the RSP interpreter.
+///
+/// Ownership used to be a bare `(task_offset, admission_generation)` pair,
+/// compared jointly at every guard. Folding the pair into one value makes that
+/// a single `==` and removes the failure mode where a site checks the offset
+/// and forgets the generation — the address-reuse aliasing the generation
+/// exists to catch.
+///
+/// It also lets a **task-free** owner exist. A guest that kicks the RSP with a
+/// raw `SP_STATUS` clear-halt has no `OSTask`, so no task offset describes it;
+/// inventing one would fabricate admission evidence, and `0` is a legal offset
+/// a real task can occupy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RspInterpreterOwner {
+    /// An admitted `OSTask`: its RDRAM offset plus the generation that admitted
+    /// it. Both are load-bearing — the same address can be reused by a later
+    /// task, and only the generation distinguishes them.
+    Task {
+        offset: u32,
         admission_generation: RspTaskAdmissionGeneration,
     },
+    /// A raw `SP_STATUS` clear-halt started the RSP outside the task lane.
+    /// Carries a generation so successive kicks stay distinguishable, but has
+    /// no lineage and never enters `rsp_task_lineages`.
+    RawKick {
+        admission_generation: RspTaskAdmissionGeneration,
+    },
+}
+
+impl RspInterpreterOwner {
+    /// An owner for an admitted task at `offset`.
+    pub const fn task(offset: u32, admission_generation: RspTaskAdmissionGeneration) -> Self {
+        Self::Task {
+            offset,
+            admission_generation,
+        }
+    }
+
+    /// The admitting generation, whichever owner kind this is.
+    pub const fn admission_generation(self) -> RspTaskAdmissionGeneration {
+        match self {
+            Self::Task {
+                admission_generation,
+                ..
+            }
+            | Self::RawKick {
+                admission_generation,
+            } => admission_generation,
+        }
+    }
+
+    /// The owning task's RDRAM offset, or `None` for a raw kick. Callers that
+    /// need a task — lineage lookup, observation labelling — must handle the
+    /// `None` rather than substitute a placeholder offset.
+    pub const fn task_offset(self) -> Option<u32> {
+        match self {
+            Self::Task { offset, .. } => Some(offset),
+            Self::RawKick { .. } => None,
+        }
+    }
+
+    /// How to name this owner in a diagnostic. A raw kick has no task address,
+    /// so messages say what it is rather than printing a placeholder offset.
+    /// The generation is always included: it is the field that catches aliasing
+    /// between two owners that share an address.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Task {
+                offset,
+                admission_generation,
+            } => format!("task {offset:#010x} generation {}", admission_generation.get()),
+            Self::RawKick {
+                admission_generation,
+            } => format!("raw SP kick generation {}", admission_generation.get()),
+        }
+    }
 }
 
 fn imem_sha256(imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE]) -> [u8; 32] {
@@ -895,25 +967,32 @@ unsafe fn begin_direct_hle_phase(
 fn resume_direct_hle_phase(task_addr: RdramAddr) {
     let admission_generation = running_task_admission_generation(task_addr);
     with_host(|host| match host.rsp_interpreter_state {
+        // Same task address, strictly older generation: this is the suspended
+        // owner being reclaimed by its own readmission.
         RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-            task_offset,
-            admission_generation: prior_generation,
-        } if task_offset == task_addr.offset()
+            owner: RspInterpreterOwner::Task {
+                offset,
+                admission_generation: prior_generation,
+            },
+        } if offset == task_addr.offset()
             && prior_generation.get() < admission_generation.get() =>
         {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation,
+                owner: RspInterpreterOwner::task(offset, admission_generation),
             };
         }
-        RspInterpreterStateEvidenceSnapshot::InFlight { task_offset, .. }
-        | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-            task_offset, ..
-        } => {
-            panic!(
-                "direct-IMEM HLE task {:#010x} cannot resume state owned by task {task_offset:#010x}",
-                task_addr.offset()
-            )
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner }
+        | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { owner } => {
+            match owner.task_offset() {
+                Some(task_offset) => panic!(
+                    "direct-IMEM HLE task {:#010x} cannot resume state owned by task {task_offset:#010x}",
+                    task_addr.offset()
+                ),
+                None => panic!(
+                    "direct-IMEM HLE task {:#010x} cannot resume state owned by a raw SP kick",
+                    task_addr.offset()
+                ),
+            }
         }
         _ => panic!(
             "direct-IMEM HLE task {:#010x} cannot resume without its suspended compatibility owner",
@@ -1054,12 +1133,10 @@ fn verified_audio_commit_owner(
     admission_generation: NonZeroU64,
 ) -> VerifiedAudioCommitOwner {
     let admission_generation = RspTaskAdmissionGeneration(admission_generation);
+    let expected_owner = RspInterpreterOwner::task(task_addr.offset(), admission_generation);
     with_host(|host| {
         match host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if task_offset == task_addr.offset() && owner_generation == admission_generation => {
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner => {
                 let lineage = host
                     .rsp_task_lineages
                     .get(&task_addr.offset())
@@ -1089,14 +1166,11 @@ fn verified_audio_commit_owner(
                     admission_generation,
                 }
             }
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "verified audio task {:#010x} generation {} cannot commit interpreter state owned by task {task_offset:#010x} generation {}",
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "verified audio task {:#010x} generation {} cannot commit interpreter state owned by {}",
             task_addr.offset(),
             admission_generation.get(),
-            owner_generation.get()
+            owner.describe()
         ),
         _ => panic!(
             "verified audio task {:#010x} cannot commit without an in-flight interpreter owner",
@@ -1160,21 +1234,20 @@ fn begin_rsp_interpreter_phase(
         );
         let admission_generation = lineage.admission_generation;
         match &host.rsp_interpreter_state {
-            RspInterpreterStateEvidenceSnapshot::InFlight { task_offset, .. } => panic!(
-                "RSP task {:#010x} cannot start: task {task_offset:#010x} left a pending interpreter continuation",
-                task_addr.offset()
+            RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+                "RSP task {:#010x} cannot start: {} left a pending interpreter continuation",
+                task_addr.offset(),
+                owner.describe()
             ),
             RspInterpreterStateEvidenceSnapshot::Reset => None,
             RspInterpreterStateEvidenceSnapshot::Exact(state)
             | RspInterpreterStateEvidenceSnapshot::HleCompatibility(state) => {
                 Some(state.clone())
             }
-            RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                task_offset,
-                ..
-            } => panic!(
-                "RSP task {:#010x} cannot start after direct-IMEM HLE task {task_offset:#010x}: terminal scalar/VU state is unavailable",
-                task_addr.offset()
+            RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { owner } => panic!(
+                "RSP task {:#010x} cannot start after direct-IMEM HLE {}: terminal scalar/VU state is unavailable",
+                task_addr.offset(),
+                owner.describe()
             ),
         }
         .inspect(|state| {
@@ -1200,8 +1273,7 @@ fn begin_rsp_interpreter_phase(
         let prior = std::mem::replace(
             &mut host.rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             },
         );
         match prior {
@@ -1267,9 +1339,12 @@ unsafe fn capture_audio_whole_task_input(
         |host| {
             let (task_offset, admission_generation) = match host.rsp_interpreter_state {
                 RspInterpreterStateEvidenceSnapshot::InFlight {
-                    task_offset,
-                    admission_generation,
-                } if task_offset == task_addr.offset() => (task_offset, admission_generation),
+                    owner:
+                        RspInterpreterOwner::Task {
+                            offset,
+                            admission_generation,
+                        },
+                } if offset == task_addr.offset() => (offset, admission_generation),
                 _ => unreachable!("begin_rsp_interpreter_phase installed this task owner"),
             };
             let lineage = host
@@ -1327,21 +1402,16 @@ fn continue_rsp_interpreter_phase(
     state: fn64_audio::rsp::runtime::RspMachineState,
 ) {
     let admission_generation = running_task_admission_generation(task_addr);
+    let expected_owner = RspInterpreterOwner::task(task_addr.offset(), admission_generation);
     let architectural = state.into_architectural_state();
     with_host(|host| {
         match &host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if *task_offset == task_addr.offset() && *owner_generation == admission_generation => {}
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "RSP task {:#010x} generation {} cannot continue interpreter state owned by task {task_offset:#010x} generation {}",
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if *owner == expected_owner => {}
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "RSP task {:#010x} generation {} cannot continue interpreter state owned by {}",
             task_addr.offset(),
             admission_generation.get(),
-            owner_generation.get()
+            owner.describe()
         ),
         RspInterpreterStateEvidenceSnapshot::Reset
         | RspInterpreterStateEvidenceSnapshot::Exact(_)
@@ -1380,23 +1450,18 @@ fn commit_rsp_interpreter_phase(
         task_addr.offset(),
         state.dp_submissions().len()
     );
+    let expected_owner = RspInterpreterOwner::task(task_addr.offset(), admission_generation);
     with_host(|host| {
         match host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner =>
         {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Exact(state);
         }
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "RSP task {:#010x} generation {} cannot commit interpreter state owned by task {task_offset:#010x} generation {}",
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "RSP task {:#010x} generation {} cannot commit interpreter state owned by {}",
             task_addr.offset(),
             admission_generation.get(),
-            owner_generation.get()
+            owner.describe()
         ),
         _ => panic!(
             "RSP task {:#010x} cannot commit without an in-flight interpreter owner",
@@ -1411,28 +1476,22 @@ fn commit_rsp_hle_compatibility(
     state: Option<fn64_audio::rsp::runtime::RspMachineState>,
 ) {
     let admission_generation = running_task_admission_generation(task_addr);
+    let expected_owner = RspInterpreterOwner::task(task_addr.offset(), admission_generation);
     let Some(state) = state else {
         with_host(|host| {
             match host.rsp_interpreter_state {
-            RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation: owner_generation,
-            } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+            RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner =>
             {
                 host.rsp_interpreter_state =
                     RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                        task_offset: task_addr.offset(),
-                        admission_generation,
+                        owner: expected_owner,
                     };
             }
-            RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation: owner_generation,
-            } => panic!(
-                "direct-IMEM HLE task {:#010x} generation {} cannot replace in-flight interpreter task {task_offset:#010x} generation {}",
+            RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+                "direct-IMEM HLE task {:#010x} generation {} cannot replace in-flight interpreter owner {}",
                 task_addr.offset(),
                 admission_generation.get(),
-                owner_generation.get()
+                owner.describe()
             ),
             _ => panic!(
                 "direct-IMEM HLE task {:#010x} cannot commit compatibility state without its in-flight owner",
@@ -1446,22 +1505,16 @@ fn commit_rsp_hle_compatibility(
     assert!(state.dp_submissions().is_empty());
     with_host(|host| {
         match host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner =>
         {
             host.rsp_interpreter_state =
                 RspInterpreterStateEvidenceSnapshot::HleCompatibility(state);
         }
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "RSP HLE task {:#010x} generation {} cannot commit compatibility state owned by task {task_offset:#010x} generation {}",
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "RSP HLE task {:#010x} generation {} cannot commit compatibility state owned by {}",
             task_addr.offset(),
             admission_generation.get(),
-            owner_generation.get()
+            owner.describe()
         ),
         _ => panic!(
             "RSP HLE task {:#010x} cannot commit compatibility state without an in-flight rspboot owner",
@@ -1664,20 +1717,19 @@ unsafe fn commit_verified_audio_effects(
         // after generation N's speculative verification. Rechecking the exact
         // generation and Running lineage in this exclusive HostState borrow
         // prevents stale generation N from publishing any effect.
+        let expected_owner =
+            RspInterpreterOwner::task(owner.task_addr.offset(), owner.admission_generation);
         match host.rsp_interpreter_state {
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation,
-            } if task_offset == owner.task_addr.offset()
-                && admission_generation == owner.admission_generation => {}
+                owner: interpreter_owner,
+            } if interpreter_owner == expected_owner => {}
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation,
+                owner: interpreter_owner,
             } => panic!(
-                "verified audio task {:#010x} generation {} lost ownership to task {task_offset:#010x} generation {} before publication",
+                "verified audio task {:#010x} generation {} lost ownership to {} before publication",
                 owner.task_addr.offset(),
                 owner.admission_generation.get(),
-                admission_generation.get()
+                interpreter_owner.describe()
             ),
             _ => panic!(
                 "verified audio task {:#010x} lost its in-flight owner before publication",
@@ -4793,8 +4845,7 @@ mod tests {
         );
         let mut expected_after = before;
         expected_after.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset: task_addr.offset(),
-            admission_generation,
+            owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
         };
         assert_eq!(crate::host_evidence_snapshot(), expected_after);
     }
@@ -4812,8 +4863,7 @@ mod tests {
                 .unwrap()
                 .admission_generation = second_generation;
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation: first_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), first_generation),
             };
         });
         let before = crate::host_evidence_snapshot();
@@ -4858,8 +4908,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -4885,8 +4934,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -4923,8 +4971,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -4961,8 +5008,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -5033,8 +5079,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                task_offset: 0x88,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(0x88, RspTaskAdmissionGeneration::first()),
             }
         );
 
@@ -5078,8 +5123,7 @@ mod tests {
         let task_addr = RdramAddr::from_offset(VERIFIED_AUDIO_TASK_OFFSET);
         with_host(|host| {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation: RspTaskAdmissionGeneration::new(VERIFIED_AUDIO_GENERATION),
+                owner: RspInterpreterOwner::task(task_addr.offset(), RspTaskAdmissionGeneration::new(VERIFIED_AUDIO_GENERATION)),
             };
             host.rsp_task_lineages.insert(
                 task_addr.offset(),
@@ -6950,8 +6994,7 @@ mod tests {
         );
         with_host(|host| {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x180,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(0x180, RspTaskAdmissionGeneration::first()),
             };
         });
 
@@ -6973,8 +7016,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x180,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(0x180, RspTaskAdmissionGeneration::first()),
             }
         );
     }
@@ -7014,8 +7056,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: TASK,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(TASK, RspTaskAdmissionGeneration::first()),
             }
         );
     }
@@ -7027,8 +7068,7 @@ mod tests {
             *host = HostState::default();
             host.rsp_interpreter_state =
                 RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                    task_offset: TASK,
-                    admission_generation: RspTaskAdmissionGeneration::first(),
+                    owner: RspInterpreterOwner::task(TASK, RspTaskAdmissionGeneration::first()),
                 };
         });
         install_running_task_lineage(
@@ -7041,8 +7081,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: TASK,
-                admission_generation: RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap(),),
+                owner: RspInterpreterOwner::task(TASK, RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap(),)),
             }
         );
     }
@@ -9028,9 +9067,11 @@ mod tests {
         assert_eq!(
             evidence.rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                task_offset: HEADER as u32,
-                admission_generation: RspTaskAdmissionGeneration::new(
-                    NonZeroU64::new(resumed_generation).unwrap(),
+                owner: RspInterpreterOwner::task(
+                    HEADER as u32,
+                    RspTaskAdmissionGeneration::new(
+                        NonZeroU64::new(resumed_generation).unwrap(),
+                    ),
                 ),
             }
         );
