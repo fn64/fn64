@@ -279,6 +279,28 @@ fn every_decoded_cop0_shape_requires_kernel_or_cu0() {
 }
 
 #[test]
+fn every_recognized_cop0_decode_selector_is_fail_closed() {
+    // COP0 decoding currently selects only on `rs`, `rt`, and `funct`.
+    // Sweep their complete domains so a new recognized selector cannot enter
+    // either execution lane without first joining the authority classifier.
+    for format in 0..32u32 {
+        for target in 0..32u32 {
+            for function in 0..64u32 {
+                let word = (0x10 << 26) | (format << 21) | (target << 16) | function;
+                let instruction = decode(word);
+                if !matches!(instruction, Instruction::Unknown { .. }) {
+                    assert!(
+                        instruction.requires_cop0(),
+                        "recognized COP0 selector omitted authority: \
+                         word={word:#010x} instruction={instruction:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn cop0_branch_authority_follows_indivisible_pair_budget_admission() {
     let words = [
         0x2403_0001, // addiu $v1,$zero,1
