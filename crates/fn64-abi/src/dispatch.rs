@@ -364,11 +364,11 @@ mod tests {
         // section registry (the execution-critical path is untouched)...
         assert_eq!(
             get_function(0x8032_2D70u32 as i32) as usize,
-            folded_host_shim as usize
+            folded_host_shim as *const () as usize
         );
         assert_eq!(
             get_function(0x8032_4080u32 as i32) as usize,
-            folded_host_shim as usize
+            folded_host_shim as *const () as usize
         );
         // ...but the folded shim pointer was deliberately NOT inserted into the
         // observability map, so the false 1:1 collision never arises.
