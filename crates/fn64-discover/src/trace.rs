@@ -1300,6 +1300,97 @@ mod tests {
         }
 
         #[test]
+        fn adjacent_chunks_of_one_streamed_load_coalesce_into_one_image() {
+            // Measured shape: SM64 streams a file as sequential 4 KiB chunks at
+            // rising ROM offsets mapping to rising VAs. One bank per chunk would
+            // describe the transport, not the program.
+            let mut db = FactDb::new();
+            let facts: Vec<_> = (0..4)
+                .map(|i| dma(i + 1, 0xf5580 + i as u32 * 0x1000, 0x378800 + i as u32 * 0x1000, 0x1000))
+                .collect();
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
+
+            assert_eq!(report.facts_added, 1, "four chunks are one load image");
+            assert_eq!(report.coalesced_transfers, 3);
+            let mapping = db
+                .facts()
+                .iter()
+                .find_map(|fact| match fact {
+                    Fact::RomMapping { rom_start, rom_end, va_start, va_end, .. } => {
+                        Some((*rom_start, *rom_end, *va_start, *va_end))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(mapping, (0xf5580, 0xf9580, 0x8037_8800, 0x8037_c800));
+        }
+
+        #[test]
+        fn a_destination_written_from_many_sources_is_a_buffer_not_a_load_image() {
+            // Measured on WCW vs. nWo World Tour: 4,411 transfers, of which one
+            // destination alone was written from 2,598 distinct ROM sources.
+            // Concluding a mapping per transfer would assert thousands of
+            // mutually contradictory backings for a single address.
+            let mut db = FactDb::new();
+            let mut facts: Vec<_> = (0..8)
+                .map(|i| dma(i + 1, 0x20_0000 + i as u32 * 0x4000, 0x50_0000, 0x800))
+                .collect();
+            // One genuine load image alongside the streaming, to prove the rule
+            // excludes the buffer without discarding real evidence.
+            facts.push(dma(99, 0x10_0000, 0x40_0000, 0x2000));
+
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
+
+            assert_eq!(report.facts_added, 1, "only the single-source image");
+            assert_eq!(report.reused_destination_skipped, 8);
+            assert_eq!(
+                report.reused_destinations.iter().copied().collect::<Vec<_>>(),
+                vec![0x8050_0000]
+            );
+        }
+
+        #[test]
+        fn chunks_adjacent_in_only_one_space_do_not_merge() {
+            // The condition is adjacency in ROM *and* VA. Two files that happen
+            // to sit next to each other in ROM but load to unrelated addresses
+            // are two images, and merging them would invent a region that was
+            // never transferred.
+            let mut db = FactDb::new();
+            let facts = vec![
+                dma(1, 0x10_0000, 0x40_0000, 0x1000),
+                // Contiguous in ROM, but a different load address.
+                dma(2, 0x10_1000, 0x60_0000, 0x1000),
+                // Contiguous in VA with the first, but from elsewhere in ROM.
+                dma(3, 0x90_0000, 0x40_1000, 0x1000),
+            ];
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
+
+            assert_eq!(report.coalesced_transfers, 0);
+            assert_eq!(report.facts_added, 3, "three distinct load images");
+        }
+
+        #[test]
+        fn coalescing_is_order_independent() {
+            // Chunks need not be observed in address order; the result must not
+            // depend on the order the emulator happened to emit them.
+            let ordered: Vec<_> = (0..4)
+                .map(|i| dma(i + 1, 0x2000 + i as u32 * 0x800, 0x1_0000 + i as u32 * 0x800, 0x800))
+                .collect();
+            let mut shuffled = ordered.clone();
+            shuffled.swap(0, 3);
+            shuffled.swap(1, 2);
+
+            let mut a = FactDb::new();
+            let mut b = FactDb::new();
+            let ra = fold_pi_dmas_into_fact_db(&mut a, "t", &ordered);
+            let rb = fold_pi_dmas_into_fact_db(&mut b, "t", &shuffled);
+
+            assert_eq!(ra.facts_added, 1);
+            assert_eq!(ra.new_mappings, rb.new_mappings);
+            assert_eq!(ra.coalesced_transfers, rb.coalesced_transfers);
+        }
+
+        #[test]
         fn a_transfer_from_another_pi_device_is_counted_not_mistranslated() {
             // 0x0500_0000 is the 64DD, 0x1FC0_0000 is PIF ROM. Neither is this
             // cartridge, so subtracting the domain-1 base would invent a ROM
@@ -1550,6 +1641,18 @@ pub struct PiDmaFoldReport {
     pub non_load_skipped: u64,
     /// Zero-length transfers, or ones whose end address overflows `u32`.
     pub degenerate_skipped: u64,
+    /// Transfers whose destination was written from more than one distinct ROM
+    /// source in this trace. Such a destination is a buffer, not a load image:
+    /// it has no single backing, so no mapping is concluded for it.
+    pub reused_destination_skipped: u64,
+    /// The distinct destination VAs that behaved as buffers. Reported because a
+    /// streaming buffer is a real and useful thing to know about, even though
+    /// it is not composition evidence.
+    pub reused_destinations: BTreeSet<u32>,
+    /// Transfers merged into a preceding one because they were strictly
+    /// adjacent in both ROM and VA -- i.e. chunks of a single streamed load
+    /// image rather than distinct regions.
+    pub coalesced_transfers: u64,
     /// Transfers whose source is not PI cartridge domain 1 -- the 64DD or PIF
     /// ROM, which are different devices, not this cartridge. Counted so they
     /// are visibly excluded rather than silently mistranslated.
@@ -1596,6 +1699,16 @@ fn cart_address_to_rom_offset(cart_address: u32) -> Option<u32> {
         .then(|| cart_address - PI_CART_DOMAIN1_BASE)
 }
 
+/// One admitted cart-to-RDRAM transfer, before adjacent chunks are merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedTransfer {
+    rom_start: u32,
+    rom_end: u32,
+    va_start: u32,
+    /// The earliest observation sequence that contributed, for diagnostics.
+    first_sequence: u64,
+}
+
 pub fn fold_pi_dmas_into_fact_db(
     db: &mut crate::facts::FactDb,
     trace_id: &str,
@@ -1606,6 +1719,7 @@ pub fn fold_pi_dmas_into_fact_db(
 
     let mut report = PiDmaFoldReport::default();
     let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+    let mut transfers: Vec<ObservedTransfer> = Vec::new();
 
     // Proven VA -> (bank, rom_start), so an observation can be checked against
     // static composition instead of silently duplicating or contradicting it.
@@ -1666,9 +1780,89 @@ pub fn fold_pi_dmas_into_fact_db(
         // KSEG0 is the address the guest executes a loaded image at; the DMA
         // destination is the physical RDRAM offset.
         let va_start = 0x8000_0000 | dram_address;
-        let va_end = 0x8000_0000 | dram_end;
-        let rom_end = rom_offset + byte_len;
-        let bank = format!("observed_dma_{rom_offset:08x}_{dram_address:08x}_{byte_len:x}");
+        let _ = dram_end;
+        transfers.push(ObservedTransfer {
+            rom_start: rom_offset,
+            rom_end: rom_offset + byte_len,
+            va_start,
+            first_sequence: *sequence,
+        });
+    }
+
+    // Coalesce transfer CHUNKS into logical load images.
+    //
+    // A game does not DMA a file in one go; it streams it in fixed-size pieces.
+    // Measured on WCW vs. nWo World Tour: 4,410 transfers against 78 distinct
+    // destinations, and on SM64 sequential 4 KiB chunks at rising ROM offsets
+    // mapping to rising VAs. Concluding one bank per chunk would describe the
+    // transport rather than the program, and would bury a real load image under
+    // dozens of fragments that no consumer can recognise as one region.
+    //
+    // Merge only STRICTLY adjacent pairs -- contiguous in ROM *and* in VA. That
+    // is exactly the condition under which the pieces are one image at one
+    // load address; it preserves the (va - rom) delta by construction, and it
+    // never joins two files that merely happen to sit next to each other in
+    // only one of the two spaces.
+    transfers.sort_unstable_by_key(|transfer| (transfer.rom_start, transfer.va_start));
+    let mut coalesced: Vec<ObservedTransfer> = Vec::new();
+    for transfer in transfers {
+        match coalesced.last_mut() {
+            Some(previous)
+                if previous.rom_end == transfer.rom_start
+                    && previous.va_start + (previous.rom_end - previous.rom_start)
+                        == transfer.va_start =>
+            {
+                previous.rom_end = transfer.rom_end;
+                report.coalesced_transfers += 1;
+            }
+            _ => coalesced.push(transfer),
+        }
+    }
+
+    // A RomMapping claims a STABLE correspondence: these ROM bytes back this
+    // VA range. A destination that is written from more than one ROM source
+    // across the trace does not have that property -- it is a buffer, and
+    // concluding a mapping for it would assert thousands of mutually
+    // contradictory backings for one address.
+    //
+    // Measured on WCW vs. nWo World Tour: of 4,411 transfers, two destinations
+    // account for 4,331, one of them written from 2,598 DISTINCT ROM sources.
+    // That is streaming (audio/FMV), not overlay loading.
+    //
+    // The rule is deliberately threshold-free -- one source or more than one --
+    // because "how many reloads before it stops being a load image" has no
+    // principled answer. Note this correctly excludes overlay POOLS too: a slot
+    // that holds overlay A then overlay B has no single backing either, and
+    // representing those needs the per-activation bank identity the trace
+    // schema already carries, not a mapping.
+    let mut sources_per_destination: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for transfer in &coalesced {
+        sources_per_destination
+            .entry(transfer.va_start)
+            .or_default()
+            .insert(transfer.rom_start);
+    }
+
+    for transfer in coalesced {
+        if sources_per_destination
+            .get(&transfer.va_start)
+            .is_some_and(|sources| sources.len() > 1)
+        {
+            report.reused_destination_skipped += 1;
+            report
+                .reused_destinations
+                .insert(transfer.va_start);
+            continue;
+        }
+        let ObservedTransfer {
+            rom_start: rom_offset,
+            rom_end,
+            va_start,
+            first_sequence: sequence,
+        } = transfer;
+        let byte_len = rom_end - rom_offset;
+        let va_end = va_start + byte_len;
+        let bank = format!("observed_dma_{rom_offset:08x}_{va_start:08x}_{byte_len:x}");
 
         match proven.get(&va_start) {
             Some((proven_bank, proven_rom_start)) if *proven_rom_start == rom_offset => {
@@ -1678,7 +1872,7 @@ pub fn fold_pi_dmas_into_fact_db(
             Some((proven_bank, proven_rom_start)) => {
                 report.conflicts.push(ObservedMappingConflict {
                     trace_id: trace_id.to_string(),
-                    sequence: *sequence,
+                    sequence,
                     va_start,
                     observed_rom_start: rom_offset,
                     proven_bank: proven_bank.clone(),
@@ -1700,10 +1894,10 @@ pub fn fold_pi_dmas_into_fact_db(
         let evidence = db.insert(Fact::Evidence {
             subject: BankAddr::new(&bank, va_start),
             note: format!(
-                "observed PI DMA (trace {trace_id}, seq {sequence}): cart \
-                 0x{cart_address:x} (ROM 0x{rom_offset:x})+0x{byte_len:x} -> RDRAM 0x{dram_address:x} \
-                 (VA 0x{va_start:x}). One completed transfer in one run; Supported, \
-                 not Proven -- neither exhaustive nor evidence the image is code."
+                "observed PI DMA load image (trace {trace_id}, from seq {sequence}): \
+                 ROM 0x{rom_offset:x}..0x{rom_end:x} -> VA 0x{va_start:x}, coalesced from \
+                 strictly adjacent transfers. Observed in one run; Supported, not Proven \
+                 -- neither exhaustive nor evidence the image is code."
             ),
         });
         report.facts_added += 1;

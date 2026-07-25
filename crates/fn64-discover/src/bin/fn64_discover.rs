@@ -158,11 +158,15 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
             fn64_discover::trace::fold_pi_dmas_into_fact_db(&mut facts, &report.header.trace_id, &report.facts);
         eprintln!(
             "observed load images ({}): {} new, {} corroborating a proven mapping, {} conflicts, \
-             {} reloads, {} off-cartridge, {} write-backs, {} degenerate",
+             {} chunks coalesced, {} transfers into {} reused destinations (buffers, not load \
+             images), {} reloads, {} off-cartridge, {} write-backs, {} degenerate",
             report.header.trace_id,
             fold.new_mappings.len(),
             fold.corroborated.len(),
             fold.conflicts.len(),
+            fold.coalesced_transfers,
+            fold.reused_destination_skipped,
+            fold.reused_destinations.len(),
             fold.repeated,
             fold.off_cartridge_skipped,
             fold.non_load_skipped,
