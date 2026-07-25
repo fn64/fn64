@@ -258,15 +258,93 @@ static void emit_event(FILE *out, uint64_t ordinal, const char *event_kind,
             (unsigned long long)cycle, addr_or_source, value_or_len);
 }
 
+/* ---- Headless-bridge emission, matching headless.rs's
+ * HeadlessObservationRecord exactly (serde tag = "event", rename_all =
+ * "snake_case", deny_unknown_fields -- so an extra field is a hard reject,
+ * not a warning). Selected by passing a run-bundle SHA-256 as an 8th
+ * argument; without it this producer's timing output is byte-identical to
+ * what it always emitted.
+ *
+ * Unlike the timing schema (two payload fields, sized for cycle stamps) this
+ * carries the full DMA triple, which is what
+ * trace::fold_pi_dmas_into_fact_db needs to conclude a load-image mapping. ---- */
+
+static void emit_hl_header(FILE *out, const char *trace_id, const char *bundle_sha256) {
+    fprintf(out,
+            "{\"event\":\"header\",\"sequence\":0,\"schema_version\":1,"
+            "\"trace_id\":\"%s\",\"run_bundle_sha256\":\"%s\"}\n",
+            trace_id, bundle_sha256);
+}
+
+static void emit_hl_pi_dma(FILE *out, uint64_t sequence, const char *probe_id,
+                            uint32_t cart, uint32_t dram, uint32_t len) {
+    /* active_bank is Unknown: this producer observes the device, not the
+     * CPU's current bank identity, and headless.rs preserves unknown-bank
+     * identity rather than letting a producer guess one. */
+    fprintf(out,
+            "{\"event\":\"pi_dma_completed\",\"sequence\":%llu,\"probe_id\":\"%s\","
+            "\"direction\":\"cart_to_rdram\",\"cart_address\":%u,\"dram_address\":%u,"
+            "\"byte_len\":%u,\"active_bank\":{\"status\":\"unknown\"}}\n",
+            (unsigned long long)sequence, probe_id, cart, dram, len);
+}
+
+static void emit_hl_end(FILE *out, uint64_t sequence, const char *reason_json,
+                         uint64_t instructions, uint64_t time_ns) {
+    fprintf(out,
+            "{\"event\":\"end\",\"sequence\":%llu,\"stop_reason\":%s,"
+            "\"instructions_executed\":%llu,\"emulated_time_ns\":%llu}\n",
+            (unsigned long long)sequence, reason_json,
+            (unsigned long long)instructions, (unsigned long long)time_ns);
+}
+
 static void emit_end(FILE *out, uint64_t ordinal, const char *completion) {
     fprintf(out, "{\"record\":\"end\",\"ordinal\":%llu,\"completion\":\"%s\"}\n",
             (unsigned long long)ordinal, completion);
+}
+
+/* The core-side PI DMA emitter (FN64_PI_DMA_TRACE, a patch on the pinned
+ * mupen fork) flushes every record, but this process exits via _exit(), which
+ * runs no atexit handler -- so the core never writes the stream's terminating
+ * `end` record and normalize rejects the file as truncated. The launcher knows
+ * exactly when the run stopped, so it writes the terminator.
+ *
+ * The next sequence number is the record count already in the file: the header
+ * is sequence 0 and every record increments by one, so a line count is the
+ * next value by construction. */
+static void fn64_append_end_record(void) {
+    const char *path = getenv("FN64_PI_DMA_TRACE");
+    if (path == NULL || path[0] == '\0')
+        return;
+    FILE *count = fopen(path, "r");
+    if (count == NULL)
+        return;
+    unsigned long long lines = 0;
+    int c;
+    while ((c = fgetc(count)) != EOF)
+        if (c == '\n')
+            lines++;
+    fclose(count);
+    FILE *append = fopen(path, "a");
+    if (append == NULL) {
+        fprintf(stderr, "warning: cannot append end record to %s\n", path);
+        return;
+    }
+    fprintf(append,
+            "{\"event\":\"end\",\"sequence\":%llu,\"stop_reason\":{\"reason\":"
+            "\"producer_abort\",\"detail\":\"producer step limit reached\"},"
+            "\"instructions_executed\":0,\"emulated_time_ns\":0}\n",
+            lines);
+    fclose(append);
+    fprintf(stderr, "fn64 PI DMA trace: %llu records, end record appended\n", lines - 1);
 }
 
 /* ---- per-device previous-poll state, for edge detection ---- */
 struct pi_state {
     int busy;
     uint32_t cart_addr;
+    /* The timing schema had no room for this; the headless schema needs it,
+     * and it must be captured on the SAME poll as cart_addr and len. */
+    uint32_t dram_addr;
     uint32_t len;
 };
 struct si_state {
@@ -280,12 +358,18 @@ struct ai_state {
 };
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
+    if (argc != 7 && argc != 8) {
         fprintf(stderr,
-                "usage: %s <core.dylib> <rom.z64> <rsp.dylib> <out.jsonl> <steps> <trace_id>\n",
+                "usage: %s <core.dylib> <rom.z64> <rsp.dylib> <out.jsonl> <steps> <trace_id> "
+                "[run_bundle_sha256]\n"
+                "  with run_bundle_sha256: emit headless-bridge observations "
+                "(feed to `headless-bridge normalize`)\n"
+                "  without it:            emit the timing device-event schema, unchanged\n",
                 argv[0]);
         return 2;
     }
+    /* NULL selects the timing schema, so existing invocations are untouched. */
+    const char *bundle_sha256 = (argc == 8) ? argv[7] : NULL;
     const char *core_path = argv[1];
     const char *rom_path = argv[2];
     const char *rsp_path = argv[3];
@@ -425,7 +509,10 @@ int main(int argc, char **argv) {
     snprintf(producer, sizeof(producer),
              "mupen-devtrace v1 (mupen64plus-core DEBUGGER=1 pure-interpreter + rsp plugin, "
              "single-step device-register polling via public m64p_debugger API)");
-    emit_header(out, producer, trace_id);
+    if (bundle_sha256)
+        emit_hl_header(out, trace_id, bundle_sha256);
+    else
+        emit_header(out, producer, trace_id);
     uint64_t ordinal = 1;
 
     /* First pause establishes the CP0 register file pointer (stable for the
@@ -447,6 +534,7 @@ int main(int argc, char **argv) {
     struct ai_state ai_prev;
     pi_prev.busy = DebugMemRead32(PI_STATUS) & PI_STATUS_DMA_BUSY;
     pi_prev.cart_addr = DebugMemRead32(PI_CART_ADDR);
+    pi_prev.dram_addr = DebugMemRead32(PI_DRAM_ADDR);
     pi_prev.len = 0;
     si_prev.busy = DebugMemRead32(SI_STATUS) & SI_STATUS_DMA_BUSY;
     si_prev.dram_addr = DebugMemRead32(SI_DRAM_ADDR);
@@ -476,10 +564,59 @@ int main(int argc, char **argv) {
             uint32_t wr_len = DebugMemRead32(PI_WR_LEN);
             uint32_t len = (rd_len != 0x7F) ? (rd_len + 1) : ((wr_len != 0x7F) ? (wr_len + 1) : 0);
             pi_prev.cart_addr = DebugMemRead32(PI_CART_ADDR);
+            pi_prev.dram_addr = DebugMemRead32(PI_DRAM_ADDR);
             pi_prev.len = len;
-            emit_event(out, ordinal++, "dma_start", "pi", cycle, pi_prev.cart_addr, len);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_start", "pi", cycle, pi_prev.cart_addr, len);
         } else if (!pi_busy && pi_prev.busy) {
-            emit_event(out, ordinal++, "dma_complete", "pi", cycle, pi_prev.cart_addr, pi_prev.len);
+            if (bundle_sha256) {
+                /* Falling edge only. headless.rs names this record
+                 * PiDmaCompleted deliberately: a register write or a
+                 * DMA-start notification is explicitly NOT sufficient
+                 * evidence, because a started transfer need not complete
+                 * with the geometry it started with. */
+                if (pi_prev.len) {
+                    emit_hl_pi_dma(out, ordinal++, "pi_dma_loads", pi_prev.cart_addr,
+                                   pi_prev.dram_addr, pi_prev.len);
+                } else {
+                    /* LOUD TRAP, and it fires on every real ROM.
+                     *
+                     * read_pi_regs() in mupen64plus-core returns 0x7F
+                     * UNCONDITIONALLY for PI_WR_LEN_REG and PI_RD_LEN_REG
+                     * (pi_controller.c) -- faithful N64 behaviour, those
+                     * registers genuinely read back 0x7F on hardware. So the
+                     * transfer length is not recoverable through the public
+                     * debugger memory-read path AT ANY TIME. Cart and DRAM
+                     * addresses are readable; length is not.
+                     *
+                     * Measured on NW4E: 6,735 PI DMA edges in 20M steps, every
+                     * one with an unreadable length and a real cart address
+                     * (0x10101000, 0x116f6f10, ...).
+                     *
+                     * Emitting nothing here would produce a valid, empty,
+                     * entirely misleading observation stream -- the exact
+                     * silent shrug AGENTS.md forbids. Abort by name instead.
+                     * The fix is a core-side patch emitting from
+                     * dma_pi_read/dma_pi_write, where all three operands are
+                     * in hand; see the PR discussion. */
+                    fprintf(stderr,
+                            "FATAL: PI DMA at cart 0x%08x -> dram 0x%08x has an unreadable "
+                            "length (read_pi_regs returns 0x7F unconditionally). The debugger "
+                            "path cannot produce a complete PiDmaCompleted record; a core-side "
+                            "emitter is required. Refusing to write a misleadingly empty "
+                            "trace.\n",
+                            pi_prev.cart_addr, pi_prev.dram_addr);
+                    emit_hl_end(out, ordinal,
+                                "{\"reason\":\"producer_abort\",\"detail\":"
+                                "\"pi dma length unreadable via debugger path\"}",
+                                recorded, 0);
+                    fclose(out);
+                    _exit(3);
+                }
+            } else {
+                emit_event(out, ordinal++, "dma_complete", "pi", cycle, pi_prev.cart_addr,
+                           pi_prev.len);
+            }
         }
         pi_prev.busy = pi_busy;
 
@@ -489,9 +626,11 @@ int main(int argc, char **argv) {
         int si_busy = (si_status & SI_STATUS_DMA_BUSY) != 0;
         if (si_busy && !si_prev.busy) {
             si_prev.dram_addr = DebugMemRead32(SI_DRAM_ADDR);
-            emit_event(out, ordinal++, "dma_start", "si", cycle, si_prev.dram_addr, 0);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_start", "si", cycle, si_prev.dram_addr, 0);
         } else if (!si_busy && si_prev.busy) {
-            emit_event(out, ordinal++, "dma_complete", "si", cycle, si_prev.dram_addr, 0);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_complete", "si", cycle, si_prev.dram_addr, 0);
         }
         si_prev.busy = si_busy;
 
@@ -501,9 +640,11 @@ int main(int argc, char **argv) {
         if (ai_busy && !ai_prev.busy) {
             ai_prev.dram_addr = DebugMemRead32(AI_DRAM_ADDR);
             ai_prev.len = DebugMemRead32(AI_LEN);
-            emit_event(out, ordinal++, "dma_start", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_start", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
         } else if (!ai_busy && ai_prev.busy) {
-            emit_event(out, ordinal++, "dma_complete", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_complete", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
         }
         ai_prev.busy = ai_busy;
 
@@ -513,9 +654,11 @@ int main(int argc, char **argv) {
         uint32_t acked = mi_prev & ~mi_now;
         for (uint32_t bit = 0x01; bit <= 0x20; bit <<= 1) {
             if (raised & bit)
-                emit_event(out, ordinal++, "mi_raise", "mi", cycle, bit, 0);
+                if (!bundle_sha256)
+                    emit_event(out, ordinal++, "mi_raise", "mi", cycle, bit, 0);
             if (acked & bit)
-                emit_event(out, ordinal++, "mi_ack", "mi", cycle, bit, 0);
+                if (!bundle_sha256)
+                    emit_event(out, ordinal++, "mi_ack", "mi", cycle, bit, 0);
         }
         mi_prev = mi_now;
 
@@ -524,16 +667,29 @@ int main(int argc, char **argv) {
          * moves on VI's own clock, not per R4300 step. ---- */
         uint32_t vi_now = DebugMemRead32(VI_CURRENT);
         if (vi_now < vi_prev)
-            emit_event(out, ordinal++, "vi_retrace", "vi", cycle, 0, 0);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "vi_retrace", "vi", cycle, 0, 0);
         vi_prev = vi_now;
 
         recorded++;
         if (recorded >= steps) {
-            emit_end(out, ordinal, "completed");
+            if (bundle_sha256)
+                /* NOT budget_reached: this producer stops on ITS OWN step
+                 * limit, which is not one of the plan's three budgets, and
+                 * headless.rs rejects a budget_reached that did not actually
+                 * reach the stated limit. Reporting the real reason keeps a
+                 * short run from masquerading as an exhausted budget. */
+                emit_hl_end(out, ordinal,
+                            "{\"reason\":\"producer_abort\","
+                            "\"detail\":\"producer step limit reached\"}",
+                            recorded, 0);
+            else
+                emit_end(out, ordinal, "completed");
             if (fclose(out) != 0) {
                 fprintf(stderr, "closing %s failed\n", out_path);
                 _exit(1);
             }
+            fn64_append_end_record();
             fprintf(stderr,
                     "trace complete: %llu steps polled, %llu device-event records, "
                     "final ordinal %llu, last guest cycle %llu\n",

@@ -48,6 +48,10 @@ name = "fn64-discover"
 path = "src/bin/fn64_discover.rs"
 
 [[bin]]
+name = "headless-bridge"
+path = "src/bin/headless_bridge.rs"
+
+[[bin]]
 name = "gate_regions"
 path = "src/bin/gate_regions.rs"
 
