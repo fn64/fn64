@@ -444,19 +444,42 @@ int main(int argc, char **argv) {
         fprintf(stderr, "missing config API symbols\n");
         return 1;
     }
+    /* Full-speed capture. The core-side PI DMA emitter observes transfers from
+     * inside dma_pi_write(), so nothing here needs the debugger -- and the
+     * debugger is what forced the pure interpreter (EnableDebugger requires
+     * R4300Emulator=0). Dropping it moves a capture from ~190k single-steps/sec
+     * to dynarec speed, which is the difference between seconds of emulated
+     * time and minutes of it. Selected by FN64_CAPTURE_SECONDS, a wall-clock
+     * budget, because without single-stepping there is no step counter to
+     * bound. */
+    const char *seconds_env = getenv("FN64_CAPTURE_SECONDS");
+    long capture_seconds = (seconds_env && seconds_env[0]) ? strtol(seconds_env, NULL, 10) : 0;
+    int full_speed = capture_seconds > 0;
+    if (full_speed && getenv("FN64_PI_DMA_TRACE") == NULL) {
+        fprintf(stderr,
+                "FN64_CAPTURE_SECONDS is set but FN64_PI_DMA_TRACE is not: full-speed mode "
+                "observes nothing without the core-side emitter, and this producer's own "
+                "polling needs the debugger it disables\n");
+        return 2;
+    }
+
     m64p_handle core_section = NULL;
     int one = 1;
+    int zero = 0;
     int interpreter = 0; /* pure interpreter: deterministic, debuggable */
+    int dynarec = 2;
     if (ConfigOpenSection("Core", &core_section) != M64ERR_SUCCESS ||
-        ConfigSetParameter(core_section, "EnableDebugger", M64TYPE_BOOL, &one) != M64ERR_SUCCESS ||
-        ConfigSetParameter(core_section, "R4300Emulator", M64TYPE_INT, &interpreter) !=
-            M64ERR_SUCCESS) {
+        ConfigSetParameter(core_section, "EnableDebugger", M64TYPE_BOOL,
+                           full_speed ? &zero : &one) != M64ERR_SUCCESS ||
+        ConfigSetParameter(core_section, "R4300Emulator", M64TYPE_INT,
+                           full_speed ? &dynarec : &interpreter) != M64ERR_SUCCESS) {
         fprintf(stderr, "failed to set [Core] EnableDebugger/R4300Emulator\n");
         return 1;
     }
 
     /* Arm the debugger BEFORE ROM open (documented ordering requirement). */
-    DebugSetCallbacks(dbg_init, dbg_update, dbg_vi);
+    if (!full_speed)
+        DebugSetCallbacks(dbg_init, dbg_update, dbg_vi);
 
     rc = CoreDoCommand(M64CMD_ROM_OPEN, (int)romlen, rombuf);
     if (rc != M64ERR_SUCCESS) {
@@ -490,6 +513,31 @@ int main(int argc, char **argv) {
     g_do_command = CoreDoCommand;
     pthread_t exec_thread;
     pthread_create(&exec_thread, NULL, exec_trampoline, NULL);
+
+    if (full_speed) {
+        /* Nothing to poll: the core writes the observation stream itself. Let
+         * the dynarec run for the wall-clock budget, stop, and terminate the
+         * stream. */
+        fprintf(stderr,
+                "full-speed capture: running %ld s with the dynarec, no debugger\n"
+                "  WARNING: this mode is NOT deterministic for every ROM. The budget is\n"
+                "  wall-clock, not a step count, so how far a title gets depends on host\n"
+                "  scheduling. Measured: Super Mario 64 reproduced byte-identically over\n"
+                "  three runs and GoldenEye over two, but Perfect Dark produced 2 and 240\n"
+                "  transfers on two runs of the same budget. Verify reproducibility per ROM\n"
+                "  before treating this output as evidence; the single-step mode is bounded\n"
+                "  by a step count and is deterministic by construction.\n",
+                capture_seconds);
+        struct timespec budget;
+        budget.tv_sec = capture_seconds;
+        budget.tv_nsec = 0;
+        nanosleep(&budget, NULL);
+        CoreDoCommand(M64CMD_STOP, 0, NULL);
+        pthread_join(exec_thread, NULL);
+        fclose(out);
+        fn64_append_end_record();
+        return 0;
+    }
 
     for (int waited_ms = 0; !g_dbg_ready; waited_ms += 10) {
         if (waited_ms > MAX_INIT_WAIT_MS) {
