@@ -1192,11 +1192,15 @@ mod tests {
         use super::*;
         use crate::facts::{Fact, FactDb, ProofState, RomAddressSpace};
 
-        fn dma(sequence: u64, cart: u32, dram: u32, len: u32) -> ObservedTraceFact {
+        /// `rom_offset` is a ROM file offset; the observation carries the
+        /// cart-BUS address the hardware saw, so it is offset into PI cart
+        /// domain 1. Keeping the test inputs in bus space is the point -- the
+        /// translation is what a live capture proved was missing.
+        fn dma(sequence: u64, rom_offset: u32, dram: u32, len: u32) -> ObservedTraceFact {
             ObservedTraceFact::PiDma {
                 sequence,
                 direction: PiDmaDirection::CartToRdram,
-                cart_address: cart,
+                cart_address: PI_CART_DOMAIN1_BASE + rom_offset,
                 dram_address: dram,
                 byte_len: len,
                 active_bank: BankContext::Unknown,
@@ -1296,6 +1300,62 @@ mod tests {
         }
 
         #[test]
+        fn a_transfer_from_another_pi_device_is_counted_not_mistranslated() {
+            // 0x0500_0000 is the 64DD, 0x1FC0_0000 is PIF ROM. Neither is this
+            // cartridge, so subtracting the domain-1 base would invent a ROM
+            // offset for bytes that never came from the ROM.
+            let mut db = FactDb::new();
+            let facts = vec![
+                ObservedTraceFact::PiDma {
+                    sequence: 1,
+                    direction: PiDmaDirection::CartToRdram,
+                    cart_address: 0x0500_0000,
+                    dram_address: 0x40_0000,
+                    byte_len: 0x1000,
+                    active_bank: BankContext::Unknown,
+                },
+                ObservedTraceFact::PiDma {
+                    sequence: 2,
+                    direction: PiDmaDirection::CartToRdram,
+                    cart_address: 0x1FC0_0000,
+                    dram_address: 0x40_0000,
+                    byte_len: 0x1000,
+                    active_bank: BankContext::Unknown,
+                },
+            ];
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
+
+            assert_eq!(report.off_cartridge_skipped, 2);
+            assert_eq!(report.facts_added, 0);
+        }
+
+        #[test]
+        fn the_cart_bus_address_is_translated_to_a_rom_offset() {
+            // The live-capture bug: the IPL3 boot copy reads cart 0x10001000,
+            // which is ROM offset 0x1000. Folding the bus address verbatim put
+            // every mapping outside the image and made corroboration with the
+            // proven boot bank impossible.
+            let mut db = FactDb::new();
+            prove_mapping(&mut db, "boot", 0x1000, 0x8000_0400, 0x10_0000);
+
+            let report = fold_pi_dmas_into_fact_db(
+                &mut db,
+                "t",
+                &[dma(1, 0x1000, 0x400, 0x10_0000)],
+            );
+
+            assert!(
+                report.conflicts.is_empty(),
+                "the boot copy must corroborate, not conflict: {:?}",
+                report.conflicts
+            );
+            assert_eq!(
+                report.corroborated.iter().cloned().collect::<Vec<_>>(),
+                vec!["boot".to_string()]
+            );
+        }
+
+        #[test]
         fn write_back_and_degenerate_transfers_are_skipped_and_counted() {
             let mut db = FactDb::new();
             let facts = vec![
@@ -1308,7 +1368,15 @@ mod tests {
                     active_bank: BankContext::Unknown,
                 },
                 dma(2, 0x10_0000, 0x40_0000, 0),
-                dma(3, 0xffff_ffff, 0x40_0000, 0x2000),
+                // Already at the top of the address space: end overflows u32.
+                ObservedTraceFact::PiDma {
+                    sequence: 3,
+                    direction: PiDmaDirection::CartToRdram,
+                    cart_address: 0x1FBF_FFFF,
+                    dram_address: 0x40_0000,
+                    byte_len: 0xFFFF_FFFF,
+                    active_bank: BankContext::Unknown,
+                },
             ];
             let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
 
@@ -1482,6 +1550,10 @@ pub struct PiDmaFoldReport {
     pub non_load_skipped: u64,
     /// Zero-length transfers, or ones whose end address overflows `u32`.
     pub degenerate_skipped: u64,
+    /// Transfers whose source is not PI cartridge domain 1 -- the 64DD or PIF
+    /// ROM, which are different devices, not this cartridge. Counted so they
+    /// are visibly excluded rather than silently mistranslated.
+    pub off_cartridge_skipped: u64,
 }
 
 /// Fold every cart-to-RDRAM `PiDma` observation into `db` as an observed
@@ -1508,6 +1580,22 @@ pub struct PiDmaFoldReport {
 ///
 /// Deduplicated by `(cart, dram, len)`: a game reloading the same overlay
 /// yields one mapping and a `repeated` count, not N conclusions.
+/// PI cartridge domain 1: the address window a game's ROM is visible at on the
+/// PI bus. An observation carries the address the hardware saw, which is a
+/// cart-bus address; a `RomMapping` wants a ROM file offset. Domain 2
+/// (0x0500_0000, 64DD) and PIF ROM (0x1FC0_0000) are different devices and are
+/// NOT this ROM, so a transfer from them is reported rather than translated.
+const PI_CART_DOMAIN1_BASE: u32 = 0x1000_0000;
+const PI_CART_DOMAIN1_END: u32 = 0x1FC0_0000;
+
+/// Translate a PI cart-bus address to a ROM file offset, or `None` when the
+/// transfer's source is not this cartridge.
+fn cart_address_to_rom_offset(cart_address: u32) -> Option<u32> {
+    (PI_CART_DOMAIN1_BASE..PI_CART_DOMAIN1_END)
+        .contains(&cart_address)
+        .then(|| cart_address - PI_CART_DOMAIN1_BASE)
+}
+
 pub fn fold_pi_dmas_into_fact_db(
     db: &mut crate::facts::FactDb,
     trace_id: &str,
@@ -1551,7 +1639,7 @@ pub fn fold_pi_dmas_into_fact_db(
             report.non_load_skipped += 1;
             continue;
         }
-        let (Some(rom_end), Some(dram_end)) = (
+        let (Some(_), Some(dram_end)) = (
             cart_address.checked_add(*byte_len),
             dram_address.checked_add(*byte_len),
         ) else {
@@ -1562,7 +1650,15 @@ pub fn fold_pi_dmas_into_fact_db(
             report.degenerate_skipped += 1;
             continue;
         }
-        if !seen.insert((*cart_address, *dram_address, *byte_len)) {
+        // The observation records a cart-BUS address; a mapping wants a ROM
+        // file offset. Without this the boot copy reads as ROM 0x10001000
+        // instead of 0x1000 and every mapping lands outside the image --
+        // caught by a live capture conflicting with the proven boot bank.
+        let Some(rom_offset) = cart_address_to_rom_offset(*cart_address) else {
+            report.off_cartridge_skipped += 1;
+            continue;
+        };
+        if !seen.insert((rom_offset, *dram_address, *byte_len)) {
             report.repeated += 1;
             continue;
         }
@@ -1571,10 +1667,11 @@ pub fn fold_pi_dmas_into_fact_db(
         // destination is the physical RDRAM offset.
         let va_start = 0x8000_0000 | dram_address;
         let va_end = 0x8000_0000 | dram_end;
-        let bank = format!("observed_dma_{cart_address:08x}_{dram_address:08x}_{byte_len:x}");
+        let rom_end = rom_offset + byte_len;
+        let bank = format!("observed_dma_{rom_offset:08x}_{dram_address:08x}_{byte_len:x}");
 
         match proven.get(&va_start) {
-            Some((proven_bank, proven_rom_start)) if proven_rom_start == cart_address => {
+            Some((proven_bank, proven_rom_start)) if *proven_rom_start == rom_offset => {
                 report.corroborated.insert(proven_bank.clone());
                 continue;
             }
@@ -1583,7 +1680,7 @@ pub fn fold_pi_dmas_into_fact_db(
                     trace_id: trace_id.to_string(),
                     sequence: *sequence,
                     va_start,
-                    observed_rom_start: *cart_address,
+                    observed_rom_start: rom_offset,
                     proven_bank: proven_bank.clone(),
                     proven_rom_start: *proven_rom_start,
                 });
@@ -1595,7 +1692,7 @@ pub fn fold_pi_dmas_into_fact_db(
         let mapping = db.insert(Fact::RomMapping {
             bank: bank.clone(),
             rom_space: RomAddressSpace::Physical,
-            rom_start: *cart_address,
+            rom_start: rom_offset,
             rom_end,
             va_start,
             va_end,
@@ -1604,7 +1701,7 @@ pub fn fold_pi_dmas_into_fact_db(
             subject: BankAddr::new(&bank, va_start),
             note: format!(
                 "observed PI DMA (trace {trace_id}, seq {sequence}): cart \
-                 0x{cart_address:x}+0x{byte_len:x} -> RDRAM 0x{dram_address:x} \
+                 0x{cart_address:x} (ROM 0x{rom_offset:x})+0x{byte_len:x} -> RDRAM 0x{dram_address:x} \
                  (VA 0x{va_start:x}). One completed transfer in one run; Supported, \
                  not Proven -- neither exhaustive nor evidence the image is code."
             ),
