@@ -258,6 +258,45 @@ static void emit_event(FILE *out, uint64_t ordinal, const char *event_kind,
             (unsigned long long)cycle, addr_or_source, value_or_len);
 }
 
+/* ---- Headless-bridge emission, matching headless.rs's
+ * HeadlessObservationRecord exactly (serde tag = "event", rename_all =
+ * "snake_case", deny_unknown_fields -- so an extra field is a hard reject,
+ * not a warning). Selected by passing a run-bundle SHA-256 as an 8th
+ * argument; without it this producer's timing output is byte-identical to
+ * what it always emitted.
+ *
+ * Unlike the timing schema (two payload fields, sized for cycle stamps) this
+ * carries the full DMA triple, which is what
+ * trace::fold_pi_dmas_into_fact_db needs to conclude a load-image mapping. ---- */
+
+static void emit_hl_header(FILE *out, const char *trace_id, const char *bundle_sha256) {
+    fprintf(out,
+            "{\"event\":\"header\",\"sequence\":0,\"schema_version\":1,"
+            "\"trace_id\":\"%s\",\"run_bundle_sha256\":\"%s\"}\n",
+            trace_id, bundle_sha256);
+}
+
+static void emit_hl_pi_dma(FILE *out, uint64_t sequence, const char *probe_id,
+                            uint32_t cart, uint32_t dram, uint32_t len) {
+    /* active_bank is Unknown: this producer observes the device, not the
+     * CPU's current bank identity, and headless.rs preserves unknown-bank
+     * identity rather than letting a producer guess one. */
+    fprintf(out,
+            "{\"event\":\"pi_dma_completed\",\"sequence\":%llu,\"probe_id\":\"%s\","
+            "\"direction\":\"cart_to_rdram\",\"cart_address\":%u,\"dram_address\":%u,"
+            "\"byte_len\":%u,\"active_bank\":{\"status\":\"unknown\"}}\n",
+            (unsigned long long)sequence, probe_id, cart, dram, len);
+}
+
+static void emit_hl_end(FILE *out, uint64_t sequence, const char *reason_json,
+                         uint64_t instructions, uint64_t time_ns) {
+    fprintf(out,
+            "{\"event\":\"end\",\"sequence\":%llu,\"stop_reason\":%s,"
+            "\"instructions_executed\":%llu,\"emulated_time_ns\":%llu}\n",
+            (unsigned long long)sequence, reason_json,
+            (unsigned long long)instructions, (unsigned long long)time_ns);
+}
+
 static void emit_end(FILE *out, uint64_t ordinal, const char *completion) {
     fprintf(out, "{\"record\":\"end\",\"ordinal\":%llu,\"completion\":\"%s\"}\n",
             (unsigned long long)ordinal, completion);
@@ -267,6 +306,9 @@ static void emit_end(FILE *out, uint64_t ordinal, const char *completion) {
 struct pi_state {
     int busy;
     uint32_t cart_addr;
+    /* The timing schema had no room for this; the headless schema needs it,
+     * and it must be captured on the SAME poll as cart_addr and len. */
+    uint32_t dram_addr;
     uint32_t len;
 };
 struct si_state {
@@ -280,12 +322,18 @@ struct ai_state {
 };
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
+    if (argc != 7 && argc != 8) {
         fprintf(stderr,
-                "usage: %s <core.dylib> <rom.z64> <rsp.dylib> <out.jsonl> <steps> <trace_id>\n",
+                "usage: %s <core.dylib> <rom.z64> <rsp.dylib> <out.jsonl> <steps> <trace_id> "
+                "[run_bundle_sha256]\n"
+                "  with run_bundle_sha256: emit headless-bridge observations "
+                "(feed to `headless-bridge normalize`)\n"
+                "  without it:            emit the timing device-event schema, unchanged\n",
                 argv[0]);
         return 2;
     }
+    /* NULL selects the timing schema, so existing invocations are untouched. */
+    const char *bundle_sha256 = (argc == 8) ? argv[7] : NULL;
     const char *core_path = argv[1];
     const char *rom_path = argv[2];
     const char *rsp_path = argv[3];
@@ -425,7 +473,10 @@ int main(int argc, char **argv) {
     snprintf(producer, sizeof(producer),
              "mupen-devtrace v1 (mupen64plus-core DEBUGGER=1 pure-interpreter + rsp plugin, "
              "single-step device-register polling via public m64p_debugger API)");
-    emit_header(out, producer, trace_id);
+    if (bundle_sha256)
+        emit_hl_header(out, trace_id, bundle_sha256);
+    else
+        emit_header(out, producer, trace_id);
     uint64_t ordinal = 1;
 
     /* First pause establishes the CP0 register file pointer (stable for the
@@ -447,6 +498,7 @@ int main(int argc, char **argv) {
     struct ai_state ai_prev;
     pi_prev.busy = DebugMemRead32(PI_STATUS) & PI_STATUS_DMA_BUSY;
     pi_prev.cart_addr = DebugMemRead32(PI_CART_ADDR);
+    pi_prev.dram_addr = DebugMemRead32(PI_DRAM_ADDR);
     pi_prev.len = 0;
     si_prev.busy = DebugMemRead32(SI_STATUS) & SI_STATUS_DMA_BUSY;
     si_prev.dram_addr = DebugMemRead32(SI_DRAM_ADDR);
@@ -476,10 +528,24 @@ int main(int argc, char **argv) {
             uint32_t wr_len = DebugMemRead32(PI_WR_LEN);
             uint32_t len = (rd_len != 0x7F) ? (rd_len + 1) : ((wr_len != 0x7F) ? (wr_len + 1) : 0);
             pi_prev.cart_addr = DebugMemRead32(PI_CART_ADDR);
+            pi_prev.dram_addr = DebugMemRead32(PI_DRAM_ADDR);
             pi_prev.len = len;
-            emit_event(out, ordinal++, "dma_start", "pi", cycle, pi_prev.cart_addr, len);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_start", "pi", cycle, pi_prev.cart_addr, len);
         } else if (!pi_busy && pi_prev.busy) {
-            emit_event(out, ordinal++, "dma_complete", "pi", cycle, pi_prev.cart_addr, pi_prev.len);
+            if (bundle_sha256) {
+                /* Falling edge only. headless.rs names this record
+                 * PiDmaCompleted deliberately: a register write or a
+                 * DMA-start notification is explicitly NOT sufficient
+                 * evidence, because a started transfer need not complete
+                 * with the geometry it started with. */
+                if (pi_prev.len)
+                    emit_hl_pi_dma(out, ordinal++, "pi_dma_loads", pi_prev.cart_addr,
+                                   pi_prev.dram_addr, pi_prev.len);
+            } else {
+                emit_event(out, ordinal++, "dma_complete", "pi", cycle, pi_prev.cart_addr,
+                           pi_prev.len);
+            }
         }
         pi_prev.busy = pi_busy;
 
@@ -529,7 +595,18 @@ int main(int argc, char **argv) {
 
         recorded++;
         if (recorded >= steps) {
-            emit_end(out, ordinal, "completed");
+            if (bundle_sha256)
+                /* NOT budget_reached: this producer stops on ITS OWN step
+                 * limit, which is not one of the plan's three budgets, and
+                 * headless.rs rejects a budget_reached that did not actually
+                 * reach the stated limit. Reporting the real reason keeps a
+                 * short run from masquerading as an exhausted budget. */
+                emit_hl_end(out, ordinal,
+                            "{\"reason\":\"producer_abort\","
+                            "\"detail\":\"producer step limit reached\"}",
+                            recorded, 0);
+            else
+                emit_end(out, ordinal, "completed");
             if (fclose(out) != 0) {
                 fprintf(stderr, "closing %s failed\n", out_path);
                 _exit(1);
