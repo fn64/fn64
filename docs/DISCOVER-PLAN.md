@@ -598,21 +598,26 @@ folds into 499,997 facts / 1,868 Supported code-existence conclusions.
 A breakpoint-accelerated driver (`tools/mupen-bfs/mupen_bfs.c`) was built to
 reach past the ~500k single-step wall to the selector dispatcher's flag
 stores. Measured negative finding, recorded so it is not re-attempted the
-same way: on this DEBUGGER=1 / pure-interpreter / NO_ASM macOS-arm64 core
-build, `M64P_DBG_RUNSTATE_RUNNING` does NOT free-run once a breakpoint is
-installed — `sample` backtraces show it parks on a per-instruction semaphore
-and only `DebugStep()` advances it, so every instruction still costs one
-step round trip. Execution breakpoints at the byte-verified dispatcher PCs
-plus a write watchpoint on `0x800a10b0` do fire correctly and
-deterministically (4/4 byte-identical runs): the driver reaches the init
-store and the R2 flag load with flag/mode at their zero-init values, but a
-114M-step / ~10-minute run never reached the R3/R5/loop branches or any
-overlay flag store — the interpreter spends that time in a hardware-timing
-poll loop. Deep selector-state observation is therefore blocked by
-interpreter speed, not driver correctness; the next attempt needs a
-dynarec-capable core (x86_64/Rosetta) or a coarser skip mechanism, not more
-breakpoints. Traces contain executed-PC sequences from a user's ROM and stay
-out of git; compiled drivers are gitignored build artifacts.
+same way: on this DEBUGGER=1 macOS-arm64 core build, `M64P_DBG_RUNSTATE_RUNNING`
+does NOT free-run once a breakpoint is installed — `sample` backtraces show it
+parks on a per-instruction semaphore and only `DebugStep()` advances it, so
+every instruction still costs one step round trip. Execution breakpoints at
+the byte-verified dispatcher PCs plus a write watchpoint on `0x800a10b0` do
+fire correctly and deterministically (4/4 byte-identical runs): the driver
+reaches the init store and the R2 flag load with flag/mode at their zero-init
+values, but a 114M-step / ~10-minute run never reached the R3/R5/loop branches
+or any overlay flag store — the interpreter spends that time in a
+hardware-timing poll loop. Deep selector-state observation is therefore
+blocked by interpreter speed, not driver correctness. **This is not an arm64
+dynarec gap** (a native Apple Silicon dynarec was added to the pinned core
+build later, see `tools/mupen-trace/README.md`) — the debugger path itself
+forces the pure interpreter, because `EnableDebugger` requires
+`R4300Emulator=0` regardless of host architecture. The actual unblock is
+either a full-speed capture that skips the debugger entirely (see
+`FN64_CAPTURE_SECONDS` below) or a coarser breakpoint/watchpoint mechanism
+that needs fewer step round trips, not a faster host CPU. Traces contain
+executed-PC sequences from a user's ROM and stay out of git; compiled drivers
+are gitignored build artifacts.
 
 ### 5. Function entries and ownership
 
@@ -947,14 +952,34 @@ objdiff); indirect targets and boundaries are resolved statically with manual
 jump-table annotation, not by dynamic PC capture. fn64's dynamic-trace ambition
 is therefore closer to a recompilation workflow than a decompilation one — novel
 capability, not a missing standard tool. Consequences: static discovery remains
-the main line (where all measured leverage is); the one dynamic-speed
-investment worth making is an **x86_64/dynarec rebuild of the custom
-DEBUGGER=1 mupen core** (the arm64 build is `NO_ASM=1` pure-interpreter; mupen's
-Makefile only disables the dynarec for arm64, so an x86_64 build under Rosetta
-regains it — expected 100-300x, the tool we already own), and ares is parked as
-an accuracy oracle reachable only via its GDB stub, not a bulk tracer.
-BizHawk's mupen core has `ITraceable` file tracing but is the same slow
-interpreter class and pulls GPL, so it is not preferred.
+the main line (where all measured leverage is), and ares is parked as an
+accuracy oracle reachable only via its GDB stub, not a bulk tracer. BizHawk's
+mupen core has `ITraceable` file tracing but is the same slow interpreter
+class and pulls GPL, so it is not preferred.
+
+**Retraction (2026-07-25):** this section originally recommended an
+"x86_64/dynarec rebuild ... under Rosetta" of the custom DEBUGGER=1 mupen
+core, on the premise that "the arm64 build is `NO_ASM=1` pure-interpreter"
+because "mupen's Makefile only disables the dynarec for arm64." That premise
+is now obsolete and the remedy was never the right one. A native Apple
+Silicon (darwin-arm64) dynarec was added upstream (in flight as PR #1184; see
+the pin in `tools/mupen-trace/README.md` and `build-core.sh`), so the arm64
+build is no longer forced to `NO_ASM`. But this doesn't touch the actual
+bottleneck: the debugger path used for single-stepping is interpreter-speed
+on *any* architecture, because `EnableDebugger` requires `R4300Emulator=0` —
+mupen64plus disables the dynarec whenever the debugger is armed, x86_64 and
+arm64 alike. An x86_64/Rosetta build would not have fixed this; it would
+still run the interpreter while debugging, just on emulated x86_64 instead of
+native arm64 — strictly worse, not better. The conclusion "the debugger-driven
+trace path is slow" therefore survives, but both the stated cause and the
+Rosetta remedy were wrong. The real fix that shipped instead: a full-speed
+capture mode (`FN64_CAPTURE_SECONDS`, `tools/mupen-trace/mupen_devtrace.c`)
+that skips the debugger entirely and drives the core-side PI DMA emitter at
+native arm64 dynarec speed, trading single-step determinism for wall-clock
+throughput (measured: minutes of single-stepped emulated time collapse to
+seconds). It is not deterministic for every ROM (measured, not assumed — SM64
+was byte-identical across runs, GoldenEye and Perfect Dark were not), so it
+complements rather than replaces the debugger path.
 
 ## WM2000 (NWXE) whole-ROM recompile — milestone status (2026-07-18)
 
@@ -1090,12 +1115,16 @@ the mode sequence matching the documented R2-branch value. One transient
 out-of-set word (`0x20004002` ≈ 2 ms after interpreter start) decodes as a
 MIPS instruction and precedes any plausible dispatcher execution, so it is
 attributed to the boot-stage segment copy transiting that address, not a
-flag store. Deep-boot flag transitions were NOT reached: the macOS arm64
-build runs as a pure interpreter (upstream's own forced `NO_ASM`), too slow
-to leave the logo screens within the observed budget. Open next steps:
-a longer unattended run, an x86_64/Rosetta core for dynarec speed, or a
-`DebugBreakpointCommand` write watchpoint instead of polling. No
-selector-state coverage is claimed beyond the values actually observed.
+flag store. Deep-boot flag transitions were NOT reached: the debugger session
+runs as a pure interpreter, too slow to leave the logo screens within the
+observed budget. This is a `DEBUGGER=1` constraint, not an arm64 one — mupen's
+`EnableDebugger` requires `R4300Emulator=0` on every host architecture, so an
+x86_64/Rosetta build would not have helped (see the retraction under
+"Dynamic-tracing tooling decision" above). Open next steps: a longer
+unattended run, a full-speed capture that skips the debugger
+(`FN64_CAPTURE_SECONDS`, see above), or a `DebugBreakpointCommand` write
+watchpoint instead of polling. No selector-state coverage is claimed beyond
+the values actually observed.
 
 An aligned-pointer-run experiment (four or more words targeting one load image)
 was measured and rejected from the canonical harvest: it produced only 3.10%
