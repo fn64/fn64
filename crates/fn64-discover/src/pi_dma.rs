@@ -1509,3 +1509,123 @@ mod tests {
         assert!(slices[0].candidate().is_none());
     }
 }
+
+/// A routine that accesses the PI registers directly -- the primitive every
+/// cart-to-RDRAM load ultimately goes through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiPrimitive {
+    pub entry_va: u32,
+    /// `lui rt, 0xA460` sites inside the routine. The primitive touches the PI
+    /// register block several times (address, address, length); a routine with
+    /// one incidental reference is a weaker candidate and the count says so.
+    pub register_sites: u32,
+    /// Direct `jal` sites targeting this routine, anywhere in the scanned image.
+    pub callers: Vec<u32>,
+}
+
+/// PI registers occupy `0xA460_xxxx`. An access materializes that upper half
+/// with `lui`, which is a fixed absolute constant no engine convention can move.
+const PI_REGISTER_UPPER: u32 = 0xA460;
+
+fn is_lui_pi_register(word: u32) -> bool {
+    (word >> 26) == 0x0f && (word & 0xFFFF) == PI_REGISTER_UPPER
+}
+
+fn is_jr_ra(word: u32) -> bool {
+    word == 0x03e0_0008
+}
+
+/// Locate the routines that drive the PI registers, and who calls them.
+///
+/// This is the non-circular half of static DMA recovery. Recovering a transfer's
+/// OPERANDS statically is circular on most ROMs -- the vrom/size arguments are
+/// read from the very table a scan would be trying to find -- but locating the
+/// ROUTINE is not circular at all. PI registers sit at a fixed absolute address,
+/// an access has to materialize `0xA460` with `lui`, and the IPL3 boot image is
+/// always uncompressed at an address the ROM header states. So the primitive is
+/// findable with no table, no answer key, and no emulator.
+///
+/// Measured `lui rt,0xA460` sites in the boot image: Super Mario 64 9,
+/// GoldenEye 42, Perfect Dark 12, WCW World Tour 47, Majora's Mask 51 --
+/// present in every ROM, including all five that compose to the boot bank alone.
+///
+/// Enclosing-routine attribution walks back to the nearest `jr $ra` and takes
+/// the following delay slot's successor as the entry. That is the o32 shape of
+/// a function boundary and needs no symbol; a site with no preceding return in
+/// the image is attributed to the image start.
+///
+/// # Callers are only found inside the image you pass
+///
+/// Measured on Majora's Mask, whose DMA wrapper is known independently to live
+/// at 0x80090270 (recovered from a live capture: 888 of 889 transfers issued
+/// from it): that address has ZERO `jal` callers in the boot image, out of 6,221
+/// distinct jal targets there. Its callers are in `code`, a separately-loaded
+/// file outside the 1 MiB boot window.
+///
+/// So the boot image locates the PRIMITIVE but generally not its callers. To
+/// recover those, pass a composed image -- the banks a composition strategy or
+/// [`crate::delta_vote::sweep_untabled_regions`] produced -- rather than the
+/// boot copy alone. The API takes arbitrary `(bytes, va_start)` for exactly
+/// that reason.
+///
+/// Everything here is a CANDIDATE. Instruction bytes do not prove a routine is
+/// reached, and a `jal` in the image does not prove the call executes.
+pub fn recover_pi_primitives(image_bytes: &[u8], image_va_start: u32) -> Vec<PiPrimitive> {
+    use std::collections::BTreeMap;
+
+    let words: Vec<u32> = image_bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_be_bytes(chunk.try_into().expect("four bytes")))
+        .collect();
+    let va_at = |index: usize| image_va_start.wrapping_add((index as u32).wrapping_mul(4));
+
+    // Attribute every PI register access to its enclosing routine.
+    let mut sites_per_entry: BTreeMap<u32, u32> = BTreeMap::new();
+    for (index, word) in words.iter().enumerate() {
+        if !is_lui_pi_register(*word) {
+            continue;
+        }
+        let mut entry_index = 0usize;
+        for back in (0..index).rev() {
+            if is_jr_ra(words[back]) {
+                // `jr $ra` plus its delay slot ends the routine; the next word
+                // begins the following one.
+                entry_index = (back + 2).min(words.len().saturating_sub(1));
+                break;
+            }
+        }
+        *sites_per_entry.entry(va_at(entry_index)).or_default() += 1;
+    }
+    if sites_per_entry.is_empty() {
+        return Vec::new();
+    }
+
+    // Callers: one pass over the image collecting direct calls to any candidate.
+    let mut callers_per_entry: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (index, word) in words.iter().enumerate() {
+        let pc = va_at(index);
+        if let Some(target) = direct_jal_target(*word, VirtualAddress::new(pc)) {
+            if sites_per_entry.contains_key(&target) {
+                callers_per_entry.entry(target).or_default().push(pc);
+            }
+        }
+    }
+
+    let mut primitives: Vec<PiPrimitive> = sites_per_entry
+        .into_iter()
+        .map(|(entry_va, register_sites)| PiPrimitive {
+            entry_va,
+            register_sites,
+            callers: callers_per_entry.remove(&entry_va).unwrap_or_default(),
+        })
+        .collect();
+    // Most register-driving first, then most-called, then address: deterministic
+    // and puts the likeliest primitive at the front.
+    primitives.sort_by(|a, b| {
+        b.register_sites
+            .cmp(&a.register_sites)
+            .then(b.callers.len().cmp(&a.callers.len()))
+            .then(a.entry_va.cmp(&b.entry_va))
+    });
+    primitives
+}
