@@ -839,6 +839,31 @@ mod tests {
 /// than a fixed window is what makes this work at all. WCW's 352 KiB image admits
 /// at 328 votes against 25 over its whole extent, where individual 32 KiB windows
 /// scored 2-3 votes and returned `Open`.
+/// The largest RDRAM a retail N64 reaches, with the Expansion Pak. A recovered
+/// image has to LIVE somewhere; an address beyond this cannot be where any code
+/// loads, whatever the vote said.
+const RDRAM_LEN: u32 = 0x0080_0000;
+
+/// Is this the KSEG0 or KSEG1 view of real RDRAM?
+///
+/// A vote fixes its 256 MiB segment from the region's dominant `lui` upper half,
+/// so a region whose `lui`s are noise yields a confidently-scored delta pointing
+/// somewhere impossible. Measured across the corpus before this check: 6 of 21
+/// admitted regions named an address outside RDRAM entirely -- 0x8f0cc4d0,
+/// 0x701f97b0, 0x7fffa5e4. A dominating vote is not the same as a possible
+/// answer.
+fn addressable(va_start: u32, va_end: u32) -> bool {
+    if va_end <= va_start {
+        return false;
+    }
+    for base in [0x8000_0000u32, 0xa000_0000] {
+        if va_start >= base && va_end <= base.saturating_add(RDRAM_LEN) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn prove_region(
     rom_bytes: &[u8],
     rom_start: u32,
@@ -856,6 +881,13 @@ pub fn prove_region(
     for (attempt, cfg) in [config, &escalated].into_iter().enumerate() {
         let result = infer_region_delta(bytes, rom_start, &[], cfg);
         if let DeltaVoteOutcome::Admitted { delta, va_start } = result.outcome {
+            let va_end = va_start.wrapping_add(rom_end - rom_start);
+            if !addressable(va_start, va_end) {
+                // Do not fall through to the escalation: a wider candidate set
+                // cannot make an unaddressable region addressable, and the
+                // exhaustive sweep is the expensive path.
+                return None;
+            }
             return Some(UntabledRegion {
                 rom_start,
                 rom_end: end as u32,
@@ -891,6 +923,10 @@ pub struct UntabledRegion {
     #[serde(default)]
     pub full_sweep_required: bool,
 }
+
+/// The ROM header plus the IPL3 blob, whose extent is fixed by hardware. Never
+/// copied to RDRAM as part of a load image.
+const HEADER_AND_IPL3_END: u32 = 0x1000;
 
 /// Tuning for [`sweep_untabled_regions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -943,7 +979,11 @@ pub fn sweep_untabled_regions(
     assert!(config.stride > 0, "stride must advance");
 
     let mut merged: Vec<UntabledRegion> = Vec::new();
-    let mut offset: u32 = 0;
+    // Start past the header and IPL3. Those bytes are never loaded to RDRAM, so
+    // a window covering them reports where ROM offset 0 *would* load -- an
+    // address the game never uses. Measured: three corpus regions began at ROM 0
+    // and reported va 0x7ffff400 for exactly this reason.
+    let mut offset: u32 = HEADER_AND_IPL3_END;
     while (offset as usize) + (config.window_len as usize) <= rom_bytes.len() {
         let start = offset as usize;
         let end = start + config.window_len as usize;
@@ -953,6 +993,12 @@ pub fn sweep_untabled_regions(
         let DeltaVoteOutcome::Admitted { delta, va_start } = result.outcome else {
             continue;
         };
+        if !addressable(
+            va_start,
+            va_start.wrapping_add(result.rom_end - result.rom_start),
+        ) {
+            continue;
+        }
 
         // Merge with the previous region when it is the same image: same delta,
         // and contiguous in ROM. Same delta alone is not enough -- two copies of
