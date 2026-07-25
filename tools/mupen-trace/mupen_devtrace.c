@@ -302,6 +302,42 @@ static void emit_end(FILE *out, uint64_t ordinal, const char *completion) {
             (unsigned long long)ordinal, completion);
 }
 
+/* The core-side PI DMA emitter (FN64_PI_DMA_TRACE, a patch on the pinned
+ * mupen fork) flushes every record, but this process exits via _exit(), which
+ * runs no atexit handler -- so the core never writes the stream's terminating
+ * `end` record and normalize rejects the file as truncated. The launcher knows
+ * exactly when the run stopped, so it writes the terminator.
+ *
+ * The next sequence number is the record count already in the file: the header
+ * is sequence 0 and every record increments by one, so a line count is the
+ * next value by construction. */
+static void fn64_append_end_record(void) {
+    const char *path = getenv("FN64_PI_DMA_TRACE");
+    if (path == NULL || path[0] == '\0')
+        return;
+    FILE *count = fopen(path, "r");
+    if (count == NULL)
+        return;
+    unsigned long long lines = 0;
+    int c;
+    while ((c = fgetc(count)) != EOF)
+        if (c == '\n')
+            lines++;
+    fclose(count);
+    FILE *append = fopen(path, "a");
+    if (append == NULL) {
+        fprintf(stderr, "warning: cannot append end record to %s\n", path);
+        return;
+    }
+    fprintf(append,
+            "{\"event\":\"end\",\"sequence\":%llu,\"stop_reason\":{\"reason\":"
+            "\"producer_abort\",\"detail\":\"producer step limit reached\"},"
+            "\"instructions_executed\":0,\"emulated_time_ns\":0}\n",
+            lines);
+    fclose(append);
+    fprintf(stderr, "fn64 PI DMA trace: %llu records, end record appended\n", lines - 1);
+}
+
 /* ---- per-device previous-poll state, for edge detection ---- */
 struct pi_state {
     int busy;
@@ -653,6 +689,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "closing %s failed\n", out_path);
                 _exit(1);
             }
+            fn64_append_end_record();
             fprintf(stderr,
                     "trace complete: %llu steps polled, %llu device-event records, "
                     "final ordinal %llu, last guest cycle %llu\n",
