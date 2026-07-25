@@ -812,6 +812,67 @@ mod tests {
     }
 }
 
+/// Prove a candidate ROM extent is a consistent MIPS image, and recover the
+/// address it loads at.
+///
+/// This is one question that answers two: a region admits a dominating delta
+/// only if its own calls land on its own function entries under that hypothesis,
+/// which data essentially never does. So the same call is both a VA oracle and a
+/// code filter, and the heuristic "does this look like code" test is not needed
+/// as a gate.
+///
+/// Measured on the eight OoT spans a prologue-presence heuristic wrongly called
+/// code: **0 of 8 admit** (all `InsufficientVotes`, top_votes=1), while OoT's
+/// known boot file admits at `va=0x80000460` -- its true load address.
+///
+/// Two escalations, in cost order, because the default configuration leaves real
+/// images on the table:
+///
+/// 1. **Default.** The `lui`-window narrowing keeps the candidate set small.
+/// 2. **`full_sweep`.** The narrowing can EXCLUDE the correct delta. Measured on
+///    WCW World Tour's 216 KiB image at ROM 0xa21000: default returns
+///    `NearTie{12,10}`, `full_sweep` admits `va=0x8008f6c0`. Subdividing that
+///    same region does not help (every half and quarter near-ties), so the fix is
+///    a wider candidate set, not a smaller window.
+///
+/// Extent choice matters more than either: voting over a natural extent rather
+/// than a fixed window is what makes this work at all. WCW's 352 KiB image admits
+/// at 328 votes against 25 over its whole extent, where individual 32 KiB windows
+/// scored 2-3 votes and returned `Open`.
+pub fn prove_region(
+    rom_bytes: &[u8],
+    rom_start: u32,
+    rom_end: u32,
+    config: &DeltaVoteConfig,
+) -> Option<UntabledRegion> {
+    let (start, end) = (rom_start as usize, rom_end.min(rom_bytes.len() as u32) as usize);
+    if end.saturating_sub(start) < 0x400 {
+        return None;
+    }
+    let bytes = &rom_bytes[start..end];
+
+    let mut escalated = *config;
+    escalated.full_sweep = true;
+    for (attempt, cfg) in [config, &escalated].into_iter().enumerate() {
+        let result = infer_region_delta(bytes, rom_start, &[], cfg);
+        if let DeltaVoteOutcome::Admitted { delta, va_start } = result.outcome {
+            return Some(UntabledRegion {
+                rom_start,
+                rom_end: end as u32,
+                va_start,
+                delta,
+                // A whole-extent proof is one agreement over the entire region,
+                // not N independent window votes; `windows` stays 1 so it is
+                // never confused with the corroboration count the windowed
+                // sweep reports.
+                windows: 1,
+                full_sweep_required: attempt == 1,
+            });
+        }
+    }
+    None
+}
+
 /// One ROM region whose load address was inferred with NO table of any kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UntabledRegion {
@@ -824,6 +885,11 @@ pub struct UntabledRegion {
     /// several adjacent independent votes is far stronger evidence than one
     /// window that happened to dominate.
     pub windows: u32,
+    /// The default candidate-set narrowing excluded the winning delta and the
+    /// exhaustive sweep was needed. Recorded because it is a real signal about
+    /// the region, not just about cost.
+    #[serde(default)]
+    pub full_sweep_required: bool,
 }
 
 /// Tuning for [`sweep_untabled_regions`].
@@ -905,6 +971,7 @@ pub fn sweep_untabled_regions(
                 va_start,
                 delta,
                 windows: 1,
+                full_sweep_required: false,
             }),
         }
     }
