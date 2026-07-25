@@ -65,7 +65,18 @@ expected_d1_oot_overlays=c8fcb6a1fb013492cce964e71c4985ba10aa197cc0e66b9cbab57ed
 # composition and the static request-DMA scan: composed banks 1 -> 923 and the
 # gate grew an open_indirect_site clarification line. See the OoT rows in
 # docs/DISCOVER-PLAN.md for the numbers behind the move.
-expected_closure=efd25aca320304290166087b4aba4d5e2f2e14ab08740f8e8fd1f4482752f6ff
+#
+# Moved efd25aca -> 1c6db903 for two reporting changes. NO headline count
+# moved -- per_class, unsupported, and dynamic_mips are identical on all three
+# ROMs; efd25aca was verified to still reproduce before the move.
+#   1. `proven_code_no_owner` split out of `mapped_not_proven_code`, which had
+#      been absorbing WordClass::ProvenCode through a catch-all arm. It is 96-99%
+#      of that bucket (NW4E 632/650, NWXE 1756/1833, OoT 11386/11549), so the
+#      old label read as "discovery could not decode this" for words discovery
+#      had already proven were code.
+#   2. `block_proof_blockers=` added: why block proof refused, which is the
+#      actionable half of dynamic_mips.
+expected_closure=1c6db90343e63b1f482c403b1b3a057d225dc4cc9baeb6ddd5adcc4b924dc317
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
 # digest moved when Phase-6 indirect closure strengthened: unresolved_indirect

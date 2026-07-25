@@ -188,25 +188,41 @@ CPU transfer destination is classified `exact_aot` (inside a proven exact
 owner) / `block_aot` (proven reachable code, no source-level owner claimed) /
 `dynamic_mips` (open/bounded indirect the interpreter fallback covers) /
 `unsupported` (lands outside every known mapping — the release-blocker). Per
-ROM (destinations): NW4E block_aot 22,051 / dynamic_mips 892 / **unsupported
-11**; NWXE exact_aot 349 / block_aot 17,622 / dynamic_mips 2,169 /
-**unsupported 20**; OoT (whole ROM: the resident boot bank plus 468 composed
-VROM overlay banks) exact_aot 1,891 / block_aot 1,314 / dynamic_mips 12,247 /
-**unsupported 8**. OoT's large `dynamic_mips` figure is overlay code that
-closure reaches as a destination but block proof declines to prove
-(`entry_not_authoritative`/`owner_missing`/`partition_ambiguity`); it is
-classified as interpreter-coverable rather than unsupported, but that fallback
-lane is itself still unimplemented — see the roadmap entry below. Held-out
-grading found
-`misclassified_as_code = 0` on all three: no exact_aot/block_aot destination
-lands where the dump says data. The headline: the distance to a full-game
-build is not thousands of destinations but **6–20 per ROM** — each an
-enumerable frontier (boot-DMA/hardware targets and CFG computed-jump
-over-approximations). This reframes "recompile it all" from an open-ended
-recall question into a small, inspectable punch-list, and confirms the
-architecture's design: the large `dynamic_mips` counts (the AKI dynamic-
-dispatch `jalr` sites that indirect backward-slicing proved irreducibly static-
-open) are fallback-covered, not blockers.
+ROM (destinations, re-measured at gate digest `1c6db903…`): NW4E block_aot
+22,215 / dynamic_mips 732 / **unsupported 11**; NWXE exact_aot 349 / block_aot
+17,642 / dynamic_mips 1,898 / **unsupported 20**; OoT (whole ROM: the resident
+boot bank plus 468 composed VROM overlay banks) exact_aot 2,693 / block_aot
+14,683 / dynamic_mips 11,829 / **unsupported 568**.
+
+**Retraction.** An earlier revision of this paragraph reported OoT `unsupported
+8` and headlined "**6–20 per ROM**". That was measured before whole-ROM VROM
+composition (1 composed bank, not 923); at HEAD OoT measures **568**, all of
+them `outside_all_mappings` — zero land in proven data. The "6–20 per ROM"
+headline does not survive and is withdrawn. NW4E (11) and NWXE (20) are
+unchanged.
+
+**What `dynamic_mips` actually is.** Splitting the `proven_code_no_owner`
+label out of `mapped_not_proven_code` showed the old bucket was 96–99%
+mislabelled: NW4E 632/650, NWXE 1,756/1,833, OoT 11,386/11,549 are words the
+CFG had **already proven are code**, which block proof then declined to admit.
+They were being reported as if discovery could not decode them. This is a
+block-admission problem, not a decoding or recall problem.
+
+The `block_proof_blockers` histogram — the first such measurement recorded for
+these ROMs — says which refusal dominates, and it differs by ROM:
+
+| ROM | top blocker | second |
+|---|---|---|
+| NW4E | `ambiguous_owners` 7,094 | `entry_not_authoritative` 2,068 |
+| NWXE | `ambiguous_owners` 6,146 | `entry_not_authoritative` 4,303 |
+| OoT | `entry_not_authoritative` 59,488 | `ambiguous_owners` 3,358 |
+
+One block can carry several blockers, so these exceed the refused-block count;
+they rank causes, they do not count blocks. For OoT the single largest lever on
+AOT coverage is entry authority; for the two AKI titles it is owner ambiguity.
+
+Held-out grading found `misclassified_as_code = 0` on all three: no
+exact_aot/block_aot destination lands where the dump says data.
 
 Phase-6 indirect closure was then strengthened on the recovered NWXE overlay
 banks (three sound `sltiu`-bounded switch-table recognizers, each with a
