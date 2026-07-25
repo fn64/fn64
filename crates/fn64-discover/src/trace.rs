@@ -1188,6 +1188,136 @@ mod tests {
         }
     }
 
+    mod pi_dma_fold {
+        use super::*;
+        use crate::facts::{Fact, FactDb, ProofState, RomAddressSpace};
+
+        fn dma(sequence: u64, cart: u32, dram: u32, len: u32) -> ObservedTraceFact {
+            ObservedTraceFact::PiDma {
+                sequence,
+                direction: PiDmaDirection::CartToRdram,
+                cart_address: cart,
+                dram_address: dram,
+                byte_len: len,
+                active_bank: BankContext::Unknown,
+            }
+        }
+
+        fn prove_mapping(db: &mut FactDb, bank: &str, rom_start: u32, va_start: u32, len: u32) {
+            let mapping = db.insert(Fact::RomMapping {
+                bank: bank.to_string(),
+                rom_space: RomAddressSpace::Physical,
+                rom_start,
+                rom_end: rom_start + len,
+                va_start,
+                va_end: va_start + len,
+            });
+            db.conclude(format!("bank:{bank}"), ProofState::Proven, vec![mapping], "test")
+                .unwrap();
+        }
+
+        #[test]
+        fn a_cart_to_rdram_transfer_becomes_a_supported_mapping() {
+            let mut db = FactDb::new();
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(1, 0x10_0000, 0x40_0000, 0x2000)]);
+
+            assert_eq!(report.facts_added, 1);
+            assert_eq!(report.new_mappings.len(), 1);
+            let bank = report.new_mappings.iter().next().unwrap();
+            let conclusion = db.conclusion(&format!("bank:{bank}")).unwrap();
+            // The whole point of the evidence class: observed, never proven.
+            assert_eq!(conclusion.state, ProofState::Supported);
+            assert!(
+                db.proven_rom_mappings().is_empty(),
+                "an observation must not appear as a proven mapping"
+            );
+            let mapping = db
+                .facts()
+                .iter()
+                .find_map(|fact| match fact {
+                    Fact::RomMapping { va_start, rom_start, .. } => Some((*rom_start, *va_start)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(mapping, (0x10_0000, 0x8040_0000), "KSEG0 destination");
+        }
+
+        #[test]
+        fn a_reloaded_overlay_concludes_once_and_counts_the_repeat() {
+            // Games reload the same overlay constantly. That is one mapping and
+            // N sightings, not N mappings.
+            let mut db = FactDb::new();
+            let facts = vec![
+                dma(1, 0x10_0000, 0x40_0000, 0x2000),
+                dma(9, 0x10_0000, 0x40_0000, 0x2000),
+                dma(17, 0x10_0000, 0x40_0000, 0x2000),
+            ];
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
+
+            assert_eq!(report.facts_added, 1);
+            assert_eq!(report.repeated, 2);
+            assert_eq!(report.new_mappings.len(), 1);
+        }
+
+        #[test]
+        fn an_observation_matching_a_proven_mapping_corroborates_instead_of_duplicating() {
+            // This is the case worth having: an independent producer agreeing
+            // with static composition is corroboration static analysis cannot
+            // give itself.
+            let mut db = FactDb::new();
+            prove_mapping(&mut db, "code", 0x10_0000, 0x8040_0000, 0x2000);
+
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(1, 0x10_0000, 0x40_0000, 0x2000)]);
+
+            assert_eq!(report.facts_added, 0, "no duplicate mapping was added");
+            assert!(report.new_mappings.is_empty());
+            assert_eq!(
+                report.corroborated.iter().cloned().collect::<Vec<_>>(),
+                vec!["code".to_string()]
+            );
+            assert!(report.conflicts.is_empty());
+        }
+
+        #[test]
+        fn an_observation_contradicting_a_proven_mapping_is_reported_not_resolved() {
+            let mut db = FactDb::new();
+            prove_mapping(&mut db, "code", 0x10_0000, 0x8040_0000, 0x2000);
+
+            // Same VA, different ROM source: one of the two is wrong.
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(4, 0x99_0000, 0x40_0000, 0x2000)]);
+
+            assert_eq!(report.conflicts.len(), 1);
+            let conflict = &report.conflicts[0];
+            assert_eq!(conflict.va_start, 0x8040_0000);
+            assert_eq!(conflict.observed_rom_start, 0x99_0000);
+            assert_eq!(conflict.proven_rom_start, 0x10_0000);
+            assert_eq!(conflict.proven_bank, "code");
+            assert_eq!(report.facts_added, 0, "a conflict must not be silently admitted");
+        }
+
+        #[test]
+        fn write_back_and_degenerate_transfers_are_skipped_and_counted() {
+            let mut db = FactDb::new();
+            let facts = vec![
+                ObservedTraceFact::PiDma {
+                    sequence: 1,
+                    direction: PiDmaDirection::RdramToCart,
+                    cart_address: 0x10_0000,
+                    dram_address: 0x40_0000,
+                    byte_len: 0x2000,
+                    active_bank: BankContext::Unknown,
+                },
+                dma(2, 0x10_0000, 0x40_0000, 0),
+                dma(3, 0xffff_ffff, 0x40_0000, 0x2000),
+            ];
+            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
+
+            assert_eq!(report.non_load_skipped, 1, "a write-back is not a load image");
+            assert_eq!(report.degenerate_skipped, 2);
+            assert_eq!(report.facts_added, 0);
+        }
+    }
+
     mod indirect_fold {
         use super::*;
         use crate::cfg::WordClass;
@@ -1313,4 +1443,181 @@ mod tests {
             assert_eq!(report.target_conflicts[0].site, BankAddr::new("code", 0x200));
         }
     }
+}
+
+/// A proven static mapping and an observed DMA disagree about what backs a VA.
+///
+/// Reported, never resolved by fiat: one of the two is wrong, and which one is
+/// a question this adapter has no standing to answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedMappingConflict {
+    pub trace_id: String,
+    pub sequence: u64,
+    pub va_start: u32,
+    pub observed_rom_start: u32,
+    pub proven_bank: String,
+    pub proven_rom_start: u32,
+}
+
+/// The measured effect of folding one trace's `PiDma` observations into a
+/// [`crate::facts::FactDb`] as observed load-image mappings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiDmaFoldReport {
+    /// `Fact::RomMapping` records appended (one per distinct transfer).
+    pub facts_added: u64,
+    /// Banks concluded from a transfer no proven mapping already described.
+    pub new_mappings: BTreeSet<String>,
+    /// Transfers whose geometry a proven static mapping already asserts. These
+    /// add no reach, and they are the valuable ones: an independent producer
+    /// agreeing with static composition is corroboration static analysis
+    /// cannot give itself.
+    pub corroborated: BTreeSet<String>,
+    /// Transfers that land on a VA a proven mapping backs from a DIFFERENT ROM
+    /// offset.
+    pub conflicts: Vec<ObservedMappingConflict>,
+    /// Distinct transfers seen more than once (an overlay reloaded). Counted,
+    /// not re-concluded.
+    pub repeated: u64,
+    /// `FromRdram` transfers. A write-back is not a load image.
+    pub non_load_skipped: u64,
+    /// Zero-length transfers, or ones whose end address overflows `u32`.
+    pub degenerate_skipped: u64,
+}
+
+/// Fold every cart-to-RDRAM `PiDma` observation into `db` as an observed
+/// load-image mapping, and return the exact measured delta.
+///
+/// **Why this is the one universal composition mechanism.** Every static
+/// strategy has to recognise a structure -- a dmadata-shaped file table, an
+/// AKI descriptor table -- and is therefore bound to the engine families whose
+/// structure it knows. Static PI-DMA operand slicing does not escape that: at
+/// the interesting call sites the vrom/size operands are READ FROM the very
+/// table the scan is trying to avoid needing, so it cannot bootstrap (measured
+/// negative, see `DISCOVER-PLAN`). An observed DMA has no such circularity. It
+/// does not matter whether the address came from a table, a decompressor, a
+/// TLB-mapped pointer, or a custom IPL3 -- by the time the transfer completes,
+/// the geometry is a fact.
+///
+/// **Evidence class.** `Supported`, never `Proven`. A completed transfer shows
+/// bytes moved cart->RDRAM at one moment of one run; it does not show the
+/// destination is code, that the mapping is stable, or that the set of
+/// transfers observed is exhaustive. `headless.rs` requires a genuinely
+/// completed DMA for this record -- a register write or a DMA-start
+/// notification is explicitly not sufficient -- so the observation is sound
+/// even though the conclusion drawn from it is bounded.
+///
+/// Deduplicated by `(cart, dram, len)`: a game reloading the same overlay
+/// yields one mapping and a `repeated` count, not N conclusions.
+pub fn fold_pi_dmas_into_fact_db(
+    db: &mut crate::facts::FactDb,
+    trace_id: &str,
+    facts: &[ObservedTraceFact],
+) -> PiDmaFoldReport {
+    use crate::facts::{BankAddr, Fact, ProofState, RomAddressSpace};
+    use std::collections::BTreeMap;
+
+    let mut report = PiDmaFoldReport::default();
+    let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+
+    // Proven VA -> (bank, rom_start), so an observation can be checked against
+    // static composition instead of silently duplicating or contradicting it.
+    let proven: BTreeMap<u32, (String, u32)> = db
+        .proven_rom_mappings()
+        .iter()
+        .filter_map(|fact| match fact {
+            Fact::RomMapping {
+                bank,
+                rom_start,
+                va_start,
+                ..
+            } => Some((*va_start, (bank.clone(), *rom_start))),
+            _ => None,
+        })
+        .collect();
+
+    for observed in facts {
+        let ObservedTraceFact::PiDma {
+            sequence,
+            direction,
+            cart_address,
+            dram_address,
+            byte_len,
+            ..
+        } = observed
+        else {
+            continue;
+        };
+        if *direction != PiDmaDirection::CartToRdram {
+            report.non_load_skipped += 1;
+            continue;
+        }
+        let (Some(rom_end), Some(dram_end)) = (
+            cart_address.checked_add(*byte_len),
+            dram_address.checked_add(*byte_len),
+        ) else {
+            report.degenerate_skipped += 1;
+            continue;
+        };
+        if *byte_len == 0 {
+            report.degenerate_skipped += 1;
+            continue;
+        }
+        if !seen.insert((*cart_address, *dram_address, *byte_len)) {
+            report.repeated += 1;
+            continue;
+        }
+
+        // KSEG0 is the address the guest executes a loaded image at; the DMA
+        // destination is the physical RDRAM offset.
+        let va_start = 0x8000_0000 | dram_address;
+        let va_end = 0x8000_0000 | dram_end;
+        let bank = format!("observed_dma_{cart_address:08x}_{dram_address:08x}_{byte_len:x}");
+
+        match proven.get(&va_start) {
+            Some((proven_bank, proven_rom_start)) if proven_rom_start == cart_address => {
+                report.corroborated.insert(proven_bank.clone());
+                continue;
+            }
+            Some((proven_bank, proven_rom_start)) => {
+                report.conflicts.push(ObservedMappingConflict {
+                    trace_id: trace_id.to_string(),
+                    sequence: *sequence,
+                    va_start,
+                    observed_rom_start: *cart_address,
+                    proven_bank: proven_bank.clone(),
+                    proven_rom_start: *proven_rom_start,
+                });
+                continue;
+            }
+            None => {}
+        }
+
+        let mapping = db.insert(Fact::RomMapping {
+            bank: bank.clone(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: *cart_address,
+            rom_end,
+            va_start,
+            va_end,
+        });
+        let evidence = db.insert(Fact::Evidence {
+            subject: BankAddr::new(&bank, va_start),
+            note: format!(
+                "observed PI DMA (trace {trace_id}, seq {sequence}): cart \
+                 0x{cart_address:x}+0x{byte_len:x} -> RDRAM 0x{dram_address:x} \
+                 (VA 0x{va_start:x}). One completed transfer in one run; Supported, \
+                 not Proven -- neither exhaustive nor evidence the image is code."
+            ),
+        });
+        report.facts_added += 1;
+        db.conclude(
+            format!("bank:{bank}"),
+            ProofState::Supported,
+            vec![mapping, evidence],
+            "trace_observed_pi_dma",
+        )
+        .expect("observed-DMA bank names encode their own geometry and never collide");
+        report.new_mappings.insert(bank);
+    }
+    report
 }

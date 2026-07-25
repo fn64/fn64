@@ -381,5 +381,49 @@ fn report(rom_bytes: &[u8], trace_path: &str) -> Result<String, String> {
         )
         .unwrap();
     }
+
+    // Load-image fold. Unlike the two above, this one composes GEOMETRY rather
+    // than annotating words the composition already reached: an observed
+    // cart->RDRAM transfer is a mapping, and it is the one composition
+    // mechanism that is not bound to an engine family. Static table-shape
+    // recognition only works on structures it knows, and static PI-DMA operand
+    // slicing cannot bootstrap one (the operands are read FROM the table it
+    // would need). A completed transfer has neither limitation.
+    let dma_report = fn64_discover::trace::fold_pi_dmas_into_fact_db(
+        &mut db,
+        &ingest.header.trace_id,
+        &ingest.facts,
+    );
+    writeln!(
+        out,
+        "FactDb load-image delta: {} facts added ({} new observed mappings, {} corroborations of \
+         a proven mapping, {} observed-vs-proven mapping conflicts, {} reloads, {} write-backs \
+         skipped, {} degenerate transfers skipped)",
+        dma_report.facts_added,
+        dma_report.new_mappings.len(),
+        dma_report.corroborated.len(),
+        dma_report.conflicts.len(),
+        dma_report.repeated,
+        dma_report.non_load_skipped,
+        dma_report.degenerate_skipped,
+    )
+    .unwrap();
+    for bank in &dma_report.new_mappings {
+        writeln!(out, "  observed mapping: {bank}").unwrap();
+    }
+    for conflict in &dma_report.conflicts {
+        writeln!(
+            out,
+            "  CONFLICT: trace={:?} seq={} VA 0x{:08x} observed from ROM 0x{:08x}, but proven \
+             bank {:?} backs it from ROM 0x{:08x}",
+            conflict.trace_id,
+            conflict.sequence,
+            conflict.va_start,
+            conflict.observed_rom_start,
+            conflict.proven_bank,
+            conflict.proven_rom_start,
+        )
+        .unwrap();
+    }
     Ok(out)
 }
