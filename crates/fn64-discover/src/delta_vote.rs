@@ -811,3 +811,102 @@ mod tests {
         );
     }
 }
+
+/// One ROM region whose load address was inferred with NO table of any kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UntabledRegion {
+    pub rom_start: u32,
+    pub rom_end: u32,
+    pub va_start: u32,
+    /// `va_start - rom_start`, constant across every window that merged here.
+    pub delta: u32,
+    /// Windows that independently agreed on this delta. A region that survived
+    /// several adjacent independent votes is far stronger evidence than one
+    /// window that happened to dominate.
+    pub windows: u32,
+}
+
+/// Tuning for [`sweep_untabled_regions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UntabledSweepConfig {
+    /// Bytes per voting window. Large enough that a window holds enough
+    /// intra-region calls to vote, small enough that two differently-loaded
+    /// images rarely share one.
+    pub window_len: u32,
+    /// Advance between windows. Equal to `window_len` means no overlap.
+    pub stride: u32,
+    pub vote: DeltaVoteConfig,
+}
+
+impl Default for UntabledSweepConfig {
+    fn default() -> Self {
+        Self {
+            window_len: 0x8000,
+            stride: 0x8000,
+            vote: DeltaVoteConfig::default(),
+        }
+    }
+}
+
+/// Infer load addresses for a whole ROM with no file table, no descriptor
+/// table, and no emulator.
+///
+/// The mechanism is a property of the instruction encoding rather than of any
+/// engine convention: a `jal` carries an ABSOLUTE target, so a blob of code
+/// states, in its own bytes, the address it expects to run at. Score candidate
+/// load addresses by how much internal evidence lands consistently, and the
+/// winner is where that blob loads.
+///
+/// This is why it reaches ROMs that every table-shape search returns zero for.
+/// [`infer_region_delta`] already did all of the hard part and documents itself
+/// as mapping-independent; it had only ever been pointed at regions a table
+/// search had already located, which is precisely the case where a load address
+/// is least needed.
+///
+/// Windows that agree on a delta and are adjacent in ROM are merged, and the
+/// count of independently agreeing windows is retained: one dominating window
+/// is a hypothesis, six adjacent ones voting identically is a region.
+///
+/// Every region is a CANDIDATE. Instruction bytes do not prove a mapping is
+/// reachable, resident, or ever loaded -- promotion stays with the caller.
+pub fn sweep_untabled_regions(
+    rom_bytes: &[u8],
+    config: &UntabledSweepConfig,
+) -> Vec<UntabledRegion> {
+    assert!(config.window_len >= 0x100, "a window must hold enough calls to vote");
+    assert!(config.stride > 0, "stride must advance");
+
+    let mut merged: Vec<UntabledRegion> = Vec::new();
+    let mut offset: u32 = 0;
+    while (offset as usize) + (config.window_len as usize) <= rom_bytes.len() {
+        let start = offset as usize;
+        let end = start + config.window_len as usize;
+        let result = infer_region_delta(&rom_bytes[start..end], offset, &[], &config.vote);
+        offset = offset.saturating_add(config.stride);
+
+        let DeltaVoteOutcome::Admitted { delta, va_start } = result.outcome else {
+            continue;
+        };
+
+        // Merge with the previous region when it is the same image: same delta,
+        // and contiguous in ROM. Same delta alone is not enough -- two copies of
+        // one library at the same relative offset in different files would join
+        // regions that were never one image.
+        match merged.last_mut() {
+            Some(previous)
+                if previous.delta == delta && previous.rom_end == result.rom_start =>
+            {
+                previous.rom_end = result.rom_end;
+                previous.windows += 1;
+            }
+            _ => merged.push(UntabledRegion {
+                rom_start: result.rom_start,
+                rom_end: result.rom_end,
+                va_start,
+                delta,
+                windows: 1,
+            }),
+        }
+    }
+    merged
+}
