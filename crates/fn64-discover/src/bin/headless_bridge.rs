@@ -30,8 +30,8 @@ use fn64_discover::headless::{
     HeadlessProducerIdentity, HeadlessRegion, HeadlessResetKind, PreparedHeadlessRun,
 };
 use fn64_discover::probe::{
-    ExpectedInformationGain, InputTimelineDigest, Probe, ProbeBudget, ProbePlan, ProbeTarget,
-    ScenarioIdentity, ValidatedProbePlan,
+    AddressRange, BankScope, ExpectedInformationGain, InputTimelineDigest, Probe, ProbeBudget,
+    ProbePlan, ProbeTarget, ScenarioIdentity, ValidatedProbePlan,
 };
 use fn64_discover::trace::{NormalizedRomDigest, PiDmaDirection};
 use sha2::{Digest, Sha256};
@@ -49,7 +49,9 @@ const MAX_EMULATED_TIME_NS: u64 = 600_000_000_000;
 fn usage() -> String {
     "usage: headless-bridge plan      --rom ROM --trace-id ID --emulator LIB --out bundle.json\n\
      \x20      headless-bridge normalize --rom ROM --trace-id ID --emulator LIB \
-     --observations obs.jsonl --out trace.jsonl"
+     --observations obs.jsonl --out trace.jsonl\n\
+     \x20      headless-bridge terminate --observations obs.jsonl \
+     (append an end record a crashed producer never wrote)"
         .to_string()
 }
 
@@ -61,14 +63,14 @@ fn main() {
 }
 
 struct Args {
-    rom: PathBuf,
-    trace_id: String,
-    out: PathBuf,
+    rom: Option<PathBuf>,
+    trace_id: Option<String>,
+    out: Option<PathBuf>,
     observations: Option<PathBuf>,
     /// The emulator binary the wrapper drives. Hashed into the run bundle, so
     /// an observation stream is bound to the exact build that produced it --
     /// and so `normalize` refuses a stream from a different one.
-    emulator: PathBuf,
+    emulator: Option<PathBuf>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -86,11 +88,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     Ok(Args {
-        rom: rom.ok_or_else(usage)?,
-        trace_id: trace_id.ok_or_else(usage)?,
-        out: out.ok_or_else(usage)?,
+        rom,
+        trace_id,
+        out,
         observations,
-        emulator: emulator.ok_or_else(usage)?,
+        emulator,
     })
 }
 
@@ -121,7 +123,8 @@ fn build_plan(rom_sha256: &str) -> Result<ValidatedProbePlan, String> {
         // domain") except the direction: a cart->RDRAM transfer is a load
         // image, an RDRAM->cart transfer is a save, and only the first is
         // composition evidence.
-        probes: vec![Probe {
+        probes: vec![
+        Probe {
             probe_id: "pi_dma_loads".to_string(),
             target: ProbeTarget::PiDma {
                 direction: Some(PiDmaDirection::CartToRdram),
@@ -134,7 +137,31 @@ fn build_plan(rom_sha256: &str) -> Result<ValidatedProbePlan, String> {
                                       a ROM whose table shape no static strategy recognizes"
                     .to_string(),
             },
-        }],
+        },
+        // The PC that issued each transfer. Bank-agnostic and covering the whole
+        // address space: the point is to learn WHERE the loader lives, so
+        // constraining it to a range already believed would defeat it.
+        Probe {
+            probe_id: "dma_caller_pc".to_string(),
+            target: ProbeTarget::ExecutedPcRange {
+                bank: BankScope::Any,
+                // Four-byte aligned: probe validation requires it, and an
+                // instruction address cannot be unaligned anyway. u32::MAX is
+                // not a multiple of four and makes the plan unbuildable.
+                range: AddressRange {
+                    start: 0,
+                    end: 0xFFFF_FFFC,
+                },
+            },
+            expected_information_gain: ExpectedInformationGain {
+                priority: 90,
+                unresolved_question: "which routine issues a ROM load, for a ROM whose DMA \
+                                      wrapper static operand slicing cannot recover because the \
+                                      operands come from the table being sought"
+                    .to_string(),
+            },
+        },
+        ],
     };
     plan.validate().map_err(|error| error.message)
 }
@@ -178,28 +205,83 @@ fn rom_digest(path: &PathBuf) -> Result<String, String> {
     Ok(rom.sha256)
 }
 
+/// Append the stream terminator a crashed producer never wrote.
+///
+/// A capture is complete but UNTERMINATED whenever the emulator dies during
+/// shutdown, which mupen's dynarec does reliably after a long run: every
+/// observation is on disk (the core flushes per record) but the stream has no
+/// `end`, and normalize then rejects the whole file as truncated -- discarding
+/// good data because the producer could not exit cleanly.
+///
+/// Terminating out-of-process cannot be defeated by a crashing emulator. The
+/// stop reason states exactly what happened rather than claiming a scenario
+/// completed.
+fn terminate(args: &Args) -> Result<(), String> {
+    let observations = args
+        .observations
+        .as_ref()
+        .ok_or_else(|| "terminate requires --observations".to_string())?;
+    let text = std::fs::read_to_string(observations)
+        .map_err(|error| format!("reading {}: {error}", observations.display()))?;
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    if lines
+        .last()
+        .is_some_and(|line| line.contains("\"event\":\"end\""))
+    {
+        eprintln!("already terminated: {} records", lines.len().saturating_sub(1));
+        return Ok(());
+    }
+    // Sequence zero is the header and every record increments by one, so the
+    // record count is the next sequence by construction.
+    let next = lines.len();
+    let end = format!(
+        "{{\"event\":\"end\",\"sequence\":{next},\"stop_reason\":{{\"reason\":\"producer_abort\",\
+         \"detail\":\"producer did not terminate the stream\"}},\"instructions_executed\":0,\
+         \"emulated_time_ns\":0}}"
+    );
+    std::fs::write(observations, format!("{}\n{end}\n", lines.join("\n")))
+        .map_err(|error| format!("writing {}: {error}", observations.display()))?;
+    eprintln!(
+        "terminated {} with {} observation records",
+        observations.display(),
+        next.saturating_sub(1)
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut argv = std::env::args().skip(1);
     let command = argv.next().ok_or_else(usage)?;
     let args = parse_args(argv)?;
-    let sha256 = rom_digest(&args.rom)?;
+
+    // `terminate` only rewrites an observation file: no ROM, no plan, no
+    // emulator digest. Handle it before anything that would demand them.
+    if command == "terminate" {
+        return terminate(&args);
+    }
+
+    let rom = args.rom.clone().ok_or_else(usage)?;
+    let trace_id = args.trace_id.clone().ok_or_else(usage)?;
+    let out = args.out.clone().ok_or_else(usage)?;
+    let emulator = args.emulator.clone().ok_or_else(usage)?;
+    let sha256 = rom_digest(&rom)?;
     let plan = build_plan(&sha256)?;
-    let producer = producer(&args.emulator)?;
+    let producer = producer(&emulator)?;
     let launch = launch();
     let prepared: PreparedHeadlessRun<'_> =
-        prepare_headless_run(&args.trace_id, &producer, &launch, &plan)
+        prepare_headless_run(&trace_id, &producer, &launch, &plan)
             .map_err(|error| error.message)?;
 
     match command.as_str() {
         "plan" => {
-            let file = std::fs::File::create(&args.out)
-                .map_err(|error| format!("creating {}: {error}", args.out.display()))?;
+            let file = std::fs::File::create(&out)
+                .map_err(|error| format!("creating {}: {error}", out.display()))?;
             prepared
                 .write_json(file)
                 .map_err(|error| error.message)?;
             eprintln!(
                 "wrote run bundle {} (bundle_sha256={})",
-                args.out.display(),
+                out.display(),
                 prepared.bundle_sha256()
             );
             eprintln!("  rom normalized sha256 = {sha256}");
@@ -214,12 +296,12 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("opening {}: {error}", observations.display()))?;
             let normalized = normalize_headless_jsonl(BufReader::new(file), &prepared)
                 .map_err(|error| format!("line {}: {}", error.line, error.message))?;
-            let out = std::fs::File::create(&args.out)
-                .map_err(|error| format!("creating {}: {error}", args.out.display()))?;
+            let file = std::fs::File::create(&out)
+                .map_err(|error| format!("creating {}: {error}", out.display()))?;
             let count = normalized.records.len();
-            normalized.write_jsonl(out).map_err(|error| error.message)?;
-            eprintln!("wrote {count} canonical trace records to {}", args.out.display());
-            eprintln!("  feed with: fn64-discover <rom> --trace {}", args.out.display());
+            normalized.write_jsonl(file).map_err(|error| error.message)?;
+            eprintln!("wrote {count} canonical trace records to {}", out.display());
+            eprintln!("  feed with: fn64-discover <rom> --trace {}", out.display());
             Ok(())
         }
         other => Err(format!("unknown subcommand {other:?}\n{}", usage())),
