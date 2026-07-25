@@ -3797,22 +3797,45 @@ fn encode_rsp_interpreter_state(
             out.push(2);
             encode_rsp_architectural_state!(out, &state);
         }
-        fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-            task_offset,
-            admission_generation,
-        } => {
-            out.push(3);
-            push_u32(out, task_offset);
-            push_u64(out, admission_generation.get());
+        // Tags 3 and 4 are the task-owned encodings and must stay byte-for-byte
+        // what they were before ownership became a typed enum: every retained
+        // `device_state` digest and `report_sha256` from a task-driven run
+        // depends on them. Raw SP kicks get appended tags 5 and 6 instead, so no
+        // schema bump is needed and no existing report becomes unreproducible.
+        fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { owner } => {
+            match owner {
+                fn64_abi::RspInterpreterOwner::Task {
+                    offset,
+                    admission_generation,
+                } => {
+                    out.push(3);
+                    push_u32(out, offset);
+                    push_u64(out, admission_generation.get());
+                }
+                fn64_abi::RspInterpreterOwner::RawKick {
+                    admission_generation,
+                } => {
+                    out.push(5);
+                    push_u64(out, admission_generation.get());
+                }
+            }
         }
-        fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation,
-        } => {
-            out.push(4);
-            push_u32(out, task_offset);
-            push_u64(out, admission_generation.get());
-        }
+        fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight { owner } => match owner {
+            fn64_abi::RspInterpreterOwner::Task {
+                offset,
+                admission_generation,
+            } => {
+                out.push(4);
+                push_u32(out, offset);
+                push_u64(out, admission_generation.get());
+            }
+            fn64_abi::RspInterpreterOwner::RawKick {
+                admission_generation,
+            } => {
+                out.push(6);
+                push_u64(out, admission_generation.get());
+            }
+        },
     }
 }
 
@@ -6949,18 +6972,39 @@ mod tests {
             encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibility(state)),
             encoded(
                 fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                    task_offset: 0x80,
-                    admission_generation: admission_generation(7),
+                    owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(7)),
                 },
             ),
             encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x80,
-                admission_generation: admission_generation(7),
+                owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(7)),
+            }),
+            encoded(
+                fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
+                    owner: fn64_abi::RspInterpreterOwner::RawKick {
+                        admission_generation: admission_generation(7),
+                    },
+                },
+            ),
+            encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
+                owner: fn64_abi::RspInterpreterOwner::RawKick {
+                    admission_generation: admission_generation(7),
+                },
             }),
         ];
         assert_eq!(
             variants.iter().map(|value| value[0]).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![0, 1, 2, 3, 4, 5, 6]
+        );
+        // Tags 3 and 4 are pinned byte-for-byte, not merely distinct: retained
+        // reports from task-driven runs hash these exact bytes, so appending the
+        // raw-kick tags must not perturb them.
+        assert_eq!(
+            variants[3],
+            [&[3u8][..], &0x80u32.to_be_bytes()[..], &7u64.to_be_bytes()[..]].concat()
+        );
+        assert_eq!(
+            variants[4],
+            [&[4u8][..], &0x80u32.to_be_bytes()[..], &7u64.to_be_bytes()[..]].concat()
         );
         assert_eq!(
             variants
@@ -6972,50 +7016,42 @@ mod tests {
         assert_ne!(
             encoded(
                 fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                    task_offset: 0x80,
-                    admission_generation: admission_generation(7),
+                    owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(7)),
                 },
             ),
             encoded(
                 fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                    task_offset: 0x84,
-                    admission_generation: admission_generation(7),
+                    owner: fn64_abi::RspInterpreterOwner::task(0x84, admission_generation(7)),
                 },
             )
         );
         assert_ne!(
             encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x80,
-                admission_generation: admission_generation(7),
+                owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(7)),
             }),
             encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x84,
-                admission_generation: admission_generation(7),
+                owner: fn64_abi::RspInterpreterOwner::task(0x84, admission_generation(7)),
             })
         );
         assert_ne!(
             encoded(
                 fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                    task_offset: 0x80,
-                    admission_generation: admission_generation(7),
+                    owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(7)),
                 },
             ),
             encoded(
                 fn64_abi::RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                    task_offset: 0x80,
-                    admission_generation: admission_generation(8),
+                    owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(8)),
                 },
             ),
             "device-state-v15 unavailable evidence omitted task admission generation"
         );
         assert_ne!(
             encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x80,
-                admission_generation: admission_generation(7),
+                owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(7)),
             }),
             encoded(fn64_abi::RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x80,
-                admission_generation: admission_generation(8),
+                owner: fn64_abi::RspInterpreterOwner::task(0x80, admission_generation(8)),
             }),
             "device-state-v15 in-flight evidence omitted task admission generation"
         );
