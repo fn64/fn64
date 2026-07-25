@@ -557,6 +557,15 @@ fn print_scoreboard(
         "  reasons={}",
         serde_json::to_string(&board.per_reason).unwrap_or_else(|_| "<error>".to_string())
     );
+    // Why block proof REFUSED, which is the actionable half of the score:
+    // `dynamic_mips` says the interpreter has to cover a destination, and this
+    // says what stopped it being AOT. One block can carry several blockers, so
+    // the total exceeds the refused-block count.
+    println!(
+        "  block_proof_blockers={}",
+        serde_json::to_string(&fn64_discover::block_proof::blocker_histogram(snapshots))
+            .unwrap_or_else(|_| "<error>".to_string())
+    );
     // `open_indirect_site` counts only sites inside blocks this composed
     // program actually built. It is NOT the ROM's open-indirect frontier --
     // the D1/D2 measurements report several hundred for the same ROM.
