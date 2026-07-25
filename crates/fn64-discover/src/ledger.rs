@@ -38,7 +38,13 @@ pub enum SpanClass {
     CodeLike,
     /// High byte-entropy with no code evidence: compressed or asset payload.
     HighEntropy,
-    /// Accounted as examined, and none of the above matched.
+    /// Examined, carries content, and shows NO code evidence at a resolution
+    /// where the code test is measured to fire on 92-100% of genuine code.
+    /// That measurement is what licenses a positive name here rather than a
+    /// shrug: level data, uncompressed textures, audio tables.
+    StructuredData,
+    /// Reached the end of classification without matching anything. Should be
+    /// zero; a nonzero count is a bug in the ledger, not a property of the ROM.
     Unclassified,
 }
 
@@ -51,6 +57,7 @@ impl SpanClass {
             Self::Container => "container",
             Self::CodeLike => "code_like",
             Self::HighEntropy => "high_entropy",
+            Self::StructuredData => "structured_data",
             Self::Unclassified => "unclassified",
         }
     }
@@ -83,6 +90,10 @@ impl RomLedger {
     /// Bytes carrying MIPS code that no composition maps. The number to drive
     /// toward zero: unlike "% of ROM covered", it does not count assets against
     /// the score.
+    ///
+    /// A FLOOR whose gap is measured rather than guessed: the code test misses
+    /// roughly 0-8% of genuine code chunks at this resolution (100% of OoT's
+    /// boot extent detected, 92% of Majora's Mask's).
     pub fn undiscovered_code_bytes(&self) -> u64 {
         self.bytes(SpanClass::CodeLike)
     }
@@ -152,7 +163,10 @@ fn classify_residue(bytes: &[u8], rom_start: u32, vote: &DeltaVoteConfig) -> Spa
     if entropy_bits(bytes) >= HIGH_ENTROPY_BITS {
         return SpanClass::HighEntropy;
     }
-    SpanClass::Unclassified
+    // Positively typed, not a shrug. The code test above is measured to fire on
+    // 92-100% of genuine code at this resolution (tests/ledger_code_sensitivity),
+    // so a span reaching here is content that is not code.
+    SpanClass::StructuredData
 }
 
 /// Account for every byte of a ROM.
