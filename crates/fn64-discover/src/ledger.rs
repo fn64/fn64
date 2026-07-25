@@ -157,7 +157,23 @@ fn classify_residue(bytes: &[u8], rom_start: u32, vote: &DeltaVoteConfig) -> Spa
     // holding function prologues AND calls is code, and those are exactly the
     // signals delta_vote already extracts and is tested on.
     let scan = infer_region_delta(bytes, rom_start, &[], vote).scan;
-    if scan.prologue_sites > 0 && scan.jal_sites > 0 {
+    // Every function returns; data does not. Requiring RETURNS, not merely a
+    // prologue, is what stops one coincidental `addiu $sp,$sp,-N` admitting a
+    // whole span of asset bytes.
+    //
+    // Measured: OoT's known boot code shows 33-65 returns per 8 KiB and WCW's
+    // two real images 666 and 667 across their extents, while the eight spans a
+    // prologue-presence test wrongly called code show ZERO returns against
+    // 43-126 `jal`s -- the latter being just the chance rate, since opcode 0x03
+    // matches one word in 64.
+    //
+    // The ratio guard is the point: a lone return is as coincidental as a lone
+    // prologue. Real code pairs them, because every function has both.
+    let has_functions = scan.return_sites > 0
+        && scan.prologue_sites > 0
+        && scan.return_sites * 4 >= scan.prologue_sites
+        && scan.prologue_sites * 4 >= scan.return_sites;
+    if has_functions && scan.jal_sites > 0 {
         return SpanClass::CodeLike;
     }
     if entropy_bits(bytes) >= HIGH_ENTROPY_BITS {

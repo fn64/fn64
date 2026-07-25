@@ -749,14 +749,54 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
         ) {
             proved.insert(region.rom_start, region);
         }
-        for span in baseline_ledger
+        // Code runs, with small internal gaps bridged.
+        //
+        // A code image is not uniformly code: jump tables and constant pools sit
+        // inside it and carry no function returns, so the classifier punches
+        // holes through a single image. Those holes are fatal here because the
+        // proof needs a large extent to accumulate votes -- measured on
+        // n64-systemtest, requiring returns split two contiguous runs (416K and
+        // 160K, both proven whole) into eight fragments of which only two could
+        // still be proven, losing 212 KB that had previously been recovered.
+        //
+        // The bridge is SCALE-RELATIVE, not a fixed size: a gap is interior to an
+        // image only if it is smaller than the code on both sides of it. A
+        // genuine boundary between two images is not dwarfed by its neighbours.
+        // Merged hulls are offered ALONGSIDE the fragments, never instead of
+        // them, so bridging can only add candidates; a hull that is not really
+        // one image simply fails to prove.
+        let code_runs: Vec<(u32, u32)> = baseline_ledger
             .spans
             .iter()
             .filter(|span| span.class == ledger::SpanClass::CodeLike)
-        {
-            if let Some(region) =
-                delta_vote::prove_region(&rom.bytes, span.rom_start, span.rom_end, &vote)
-            {
+            .map(|span| (span.rom_start, span.rom_end))
+            .collect();
+        let mut hulls: Vec<(u32, u32)> = Vec::new();
+        for &(start, end) in &code_runs {
+            // Bridge when the gap is small relative to the code ALREADY
+            // accumulated, not to the next fragment. A jump table sitting
+            // between 176 KiB of code and an 8 KiB tail is interior to the
+            // image; comparing against the smaller neighbour would refuse it on
+            // a tie, which is exactly what left n64-systemtest's 416 KiB run
+            // split at its first data island.
+            //
+            // Self-limiting in practice: a genuine boundary between two images
+            // is large, not dwarfed by its left-hand neighbour. And an
+            // over-merged hull costs only compute, because hulls are offered
+            // alongside the fragments and a hull that is not one image simply
+            // fails to prove.
+            let bridged = hulls.last().is_some_and(|&(hull_start, hull_end)| {
+                let gap = start.saturating_sub(hull_end);
+                gap > 0 && gap < hull_end - hull_start
+            });
+            if bridged {
+                hulls.last_mut().expect("checked above").1 = end;
+            } else {
+                hulls.push((start, end));
+            }
+        }
+        for (start, end) in code_runs.into_iter().chain(hulls) {
+            if let Some(region) = delta_vote::prove_region(&rom.bytes, start, end, &vote) {
                 proved.insert(region.rom_start, region);
             }
         }

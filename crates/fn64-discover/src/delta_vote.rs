@@ -174,6 +174,12 @@ pub struct RegionScanStats {
     pub distinct_hilo_addresses: usize,
     /// (c) sanity statistic: PC-relative branches, delta-invariant.
     pub branch_sites: usize,
+    /// `jr $ra` sites. Every function returns; data does not. Measured across
+    /// the corpus, this separates code from asset bytes more sharply than any
+    /// other single signal -- OoT's known boot code shows 33-65 returns per
+    /// 8 KiB, while eight spans a prologue-presence test wrongly called code
+    /// show ZERO.
+    pub return_sites: usize,
     pub branch_targets_in_region: usize,
     pub lui_sites: usize,
     /// Upper halves that opened candidate windows (0 when `full_sweep`).
@@ -237,6 +243,9 @@ struct RegionScan {
     hilo_sites: usize,
     branch_sites: usize,
     branch_targets_in_region: usize,
+    /// `jr $ra` sites -- function returns. Delta-invariant, and the signal that
+    /// separates code from data most sharply.
+    return_sites: usize,
     lui_sites: usize,
     /// upper half -> occurrence count.
     lui_uppers: BTreeMap<u16, u32>,
@@ -255,6 +264,7 @@ fn scan_region(region_bytes: &[u8]) -> RegionScan {
         hilo_sites: 0,
         branch_sites: 0,
         branch_targets_in_region: 0,
+        return_sites: 0,
         lui_sites: 0,
         lui_uppers: BTreeMap::new(),
     };
@@ -271,6 +281,11 @@ fn scan_region(region_bytes: &[u8]) -> RegionScan {
         let off = (index as u32) * 4;
         let this_is_delay_slot = clear_after_this_word;
         clear_after_this_word = false;
+        // `jr $ra` -- a function return. Counted before the control match so it
+        // is tallied regardless of how that match classifies an indirect jump.
+        if word == 0x03e0_0008 {
+            scan.return_sites += 1;
+        }
         let control = classify_control(word);
 
         match control {
@@ -464,6 +479,7 @@ pub fn infer_region_delta(
         hilo_sites: scan.hilo_sites,
         distinct_hilo_addresses: scan.hilo_addresses.len(),
         branch_sites: scan.branch_sites,
+        return_sites: scan.return_sites,
         branch_targets_in_region: scan.branch_targets_in_region,
         lui_sites: scan.lui_sites,
         retained_lui_uppers: if config.full_sweep {
