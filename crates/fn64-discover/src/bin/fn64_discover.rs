@@ -1,6 +1,9 @@
 use fn64_discover::block_pack::{emit_block_program_source, BlockPackV1, BlockProgramSourceConfig};
 use fn64_discover::evidence::EvidenceManifest;
-use fn64_discover::{run_discovery, run_discovery_with_manifest, FactDb, NormalizedRom};
+use fn64_discover::{
+    run_discovery_auto, run_discovery_with_manifest, AutoDiscovery, DiscoveryStrategy, FactDb,
+    NormalizedRom, StrategyOutcome,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -14,8 +17,37 @@ struct DiscoveryArtifact<'a> {
     rom: &'a NormalizedRom,
     facts: &'a FactDb,
     coverage: fn64_discover::coverage::CoverageReport,
+    /// Which composition strategy was selected, and what every attempted
+    /// strategy found. Absent when an evidence manifest supplied the
+    /// composition, because then nothing was selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_strategy: Option<DiscoveryStrategy>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    strategy_outcomes: Vec<StrategyOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     traces: Vec<fn64_discover::trace::IngestReport>,
+}
+
+/// Report every strategy attempt on stderr, so a run that recovered nothing
+/// says so out loud instead of returning a quiet boot-bank-only artifact that
+/// looks the same as a successful one.
+fn report_strategies(auto: &AutoDiscovery) {
+    eprintln!("strategy: {} (selected)", auto.selected.label());
+    for outcome in &auto.outcomes {
+        eprintln!(
+            "  {:<20} candidates={:<5} admitted={:<4} intervals={:<5} proven_mappings={}",
+            outcome.strategy.label(),
+            outcome.candidate_tables,
+            outcome.admitted_tables,
+            outcome.admitted_intervals,
+            outcome.proven_mappings,
+        );
+    }
+    if auto.selected == DiscoveryStrategy::BootBankOnly {
+        eprintln!(
+            "  NOTE: no overlay geometry corroborated -- this ROM produced the IPL3 boot copy only."
+        );
+    }
 }
 
 fn main() {
@@ -70,13 +102,23 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
 
     let rom_bytes = std::fs::read(&rom_path)
         .map_err(|error| format!("reading ROM {}: {error}", rom_path.display()))?;
-    let (rom, facts) = if let Some(path) = evidence_path {
+    let (rom, facts, selected_strategy, strategy_outcomes) = if let Some(path) = evidence_path {
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("reading evidence {}: {error}", path.display()))?;
         let manifest = EvidenceManifest::from_toml(&text).map_err(|error| error.to_string())?;
-        run_discovery_with_manifest(&rom_bytes, &manifest).map_err(|error| error.to_string())?
+        let (rom, facts) =
+            run_discovery_with_manifest(&rom_bytes, &manifest).map_err(|error| error.to_string())?;
+        (rom, facts, None, Vec::new())
     } else {
-        run_discovery(&rom_bytes, None).map_err(|error| error.to_string())?
+        let auto = run_discovery_auto(&rom_bytes).map_err(|error| error.to_string())?;
+        report_strategies(&auto);
+        let AutoDiscovery {
+            rom,
+            facts,
+            selected,
+            outcomes,
+        } = auto;
+        (rom, facts, Some(selected), outcomes)
     };
     trace_paths.sort();
     trace_paths.dedup();
@@ -98,10 +140,13 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         traces.push(report);
     }
     let artifact = DiscoveryArtifact {
-        schema_version: 1,
+        // v2 adds selected_strategy / strategy_outcomes.
+        schema_version: 2,
         rom: &rom,
         facts: &facts,
         coverage: fn64_discover::coverage::report(rom.len(), &facts),
+        selected_strategy,
+        strategy_outcomes,
         traces,
     };
     let json = serde_json::to_string_pretty(&artifact)
