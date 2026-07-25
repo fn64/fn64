@@ -296,8 +296,21 @@ fn legacy_discovery_invocation_remains_available_without_a_subcommand() {
     assert_success(&output);
     let artifact: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
-    assert_eq!(artifact["schema_version"], 1);
+    // v2 added selected_strategy / strategy_outcomes: the legacy invocation now
+    // runs mechanical strategy selection instead of the boot bank alone, and
+    // records what every strategy found.
+    assert_eq!(artifact["schema_version"], 2);
     assert_eq!(artifact["rom"]["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(artifact["selected_strategy"], "boot_bank_only");
+    let outcomes = artifact["strategy_outcomes"].as_array().unwrap();
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome["strategy"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["boot_bank_only", "recovered_vrom", "recovered_overlays"],
+        "the fixture ROM has no overlay geometry, but every attempt must still be reported"
+    );
 }
 
 fn run_emit(rom: &Path, pack: &Path, out: &Path, entry_pc: u32) -> Output {

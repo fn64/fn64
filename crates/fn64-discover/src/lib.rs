@@ -534,6 +534,168 @@ pub fn run_discovery_with_recovered_vrom_and_request_dma(
     Ok((rom, db, recovery, request_dma_report))
 }
 
+/// Which mechanical composition strategy corroborated a ROM's overlay
+/// geometry.
+///
+/// Declaration order is the evaluation order and the tie-break order, so a
+/// ROM that corroborates two strategies equally always selects the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryStrategy {
+    /// Nothing beyond the IPL3 boot copy corroborated. This is a real result,
+    /// not a failure: it says the ROM carries no overlay geometry this build
+    /// knows how to recover.
+    BootBankOnly,
+    /// Mechanically recovered VROM overlay geometry behind a recovered file
+    /// table -- a dmadata-shaped table addressing virtual ROM (OoT-class).
+    RecoveredVrom,
+    /// Mechanically recovered overlay descriptor table addressing physical
+    /// ROM (AKI-class).
+    RecoveredOverlays,
+}
+
+impl DiscoveryStrategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BootBankOnly => "boot_bank_only",
+            Self::RecoveredVrom => "recovered_vrom",
+            Self::RecoveredOverlays => "recovered_overlays",
+        }
+    }
+}
+
+/// What one strategy found on this ROM, recorded whether or not it was
+/// selected. Every strategy attempted reports an outcome: a strategy that
+/// recovered nothing is stated, never omitted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StrategyOutcome {
+    pub strategy: DiscoveryStrategy,
+    pub candidate_tables: usize,
+    pub admitted_tables: usize,
+    pub admitted_intervals: usize,
+    /// Proven `RomMapping` facts the strategy's database ended with, including
+    /// the boot bank every strategy establishes.
+    pub proven_mappings: usize,
+}
+
+/// The result of trying every mechanical composition strategy against one ROM.
+#[derive(Debug, Clone)]
+pub struct AutoDiscovery {
+    pub rom: NormalizedRom,
+    pub facts: FactDb,
+    pub selected: DiscoveryStrategy,
+    /// Every strategy attempted, in evaluation order.
+    pub outcomes: Vec<StrategyOutcome>,
+}
+
+/// Run discovery without being told what kind of ROM this is.
+///
+/// The per-strategy recovery passes are already mechanical -- no table
+/// location, stride, record count, or destination is a caller-supplied game
+/// fact -- but until now the CHOICE of which to run was hardcoded per game in
+/// the gates, so the generic entry point ran none of them and every ROM came
+/// back with the boot copy alone. This tries each and keeps whichever
+/// corroborates, which is the difference between "recompiles ROMs we
+/// hand-wired" and "works out what a ROM is".
+///
+/// Selection rule: a strategy is admitted only if it proves strictly more ROM
+/// mappings than the boot copy alone, and the strategy proving the most wins.
+/// Ties break by [`DiscoveryStrategy`] declaration order, so the choice is
+/// deterministic. Nothing is merged across strategies -- the winner's database
+/// is returned whole -- so no strategy can contribute a mapping that its own
+/// admission rules did not justify.
+///
+/// A ROM that corroborates nothing returns [`DiscoveryStrategy::BootBankOnly`]
+/// with every attempt's outcome recorded. That is the honest answer, and it is
+/// reported rather than presented as success.
+pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectReason> {
+    // The floor every strategy must beat. Each strategy below also establishes
+    // the boot bank, so this is a like-for-like comparison.
+    let (rom, baseline_db) = run_discovery(rom_bytes, None)?;
+    let baseline_mappings = baseline_db.proven_rom_mappings().len();
+    let mut outcomes = vec![StrategyOutcome {
+        strategy: DiscoveryStrategy::BootBankOnly,
+        candidate_tables: 0,
+        admitted_tables: 0,
+        admitted_intervals: 0,
+        proven_mappings: baseline_mappings,
+    }];
+    let mut best: Option<(DiscoveryStrategy, FactDb, usize)> = None;
+
+    let vrom_input = RecoveredVromOverlayInput {
+        search: overlay_regions::SearchConfig::vrom_family(),
+        delta_vote: delta_vote::DeltaVoteConfig::default(),
+        file_table_search: file_table::FileTableSearchConfig::n64_family(),
+        vrom_min_records: 2,
+        min_mapped_regions: 2,
+        file_table_name: "recovered_file_table".to_string(),
+        table_name: "recovered_vrom_overlay_descriptors".to_string(),
+        bank_name: banks::BankNamePattern::new("recovered_overlay_", 0, ""),
+    };
+    let (_, vrom_db, vrom_recovery, _) =
+        run_discovery_with_recovered_vrom_and_request_dma(rom_bytes, &vrom_input, &[])?;
+    let vrom_mappings = vrom_db.proven_rom_mappings().len();
+    outcomes.push(StrategyOutcome {
+        strategy: DiscoveryStrategy::RecoveredVrom,
+        candidate_tables: vrom_recovery.candidate_tables.len(),
+        admitted_tables: vrom_recovery
+            .admissions
+            .iter()
+            .filter(|admission| admission.admitted)
+            .count(),
+        admitted_intervals: vrom_recovery.admitted_intervals().len(),
+        proven_mappings: vrom_mappings,
+    });
+    if vrom_mappings > baseline_mappings {
+        best = Some((DiscoveryStrategy::RecoveredVrom, vrom_db, vrom_mappings));
+    }
+
+    let overlay_search = overlay_regions::SearchConfig::aki_family();
+    let overlay_input = RecoveredOverlayInput {
+        min_mapped_regions: overlay_search.min_records,
+        search: overlay_search,
+        delta_vote: delta_vote::DeltaVoteConfig::default(),
+        table_name: "recovered_overlay_descriptors".to_string(),
+        bank_name: banks::BankNamePattern::new("recovered_overlay_", 0, ""),
+    };
+    let (_, overlay_db, overlay_recovery) =
+        run_discovery_with_recovered_overlay_regions(rom_bytes, &overlay_input)?;
+    let overlay_mappings = overlay_db.proven_rom_mappings().len();
+    outcomes.push(StrategyOutcome {
+        strategy: DiscoveryStrategy::RecoveredOverlays,
+        candidate_tables: overlay_recovery.candidate_tables.len(),
+        admitted_tables: overlay_recovery
+            .admissions
+            .iter()
+            .filter(|admission| admission.admitted)
+            .count(),
+        admitted_intervals: overlay_recovery.admitted_intervals().len(),
+        proven_mappings: overlay_mappings,
+    });
+    if overlay_mappings > baseline_mappings
+        && best
+            .as_ref()
+            .is_none_or(|(_, _, best_mappings)| overlay_mappings > *best_mappings)
+    {
+        best = Some((
+            DiscoveryStrategy::RecoveredOverlays,
+            overlay_db,
+            overlay_mappings,
+        ));
+    }
+
+    let (selected, facts) = match best {
+        Some((strategy, db, _)) => (strategy, db),
+        None => (DiscoveryStrategy::BootBankOnly, baseline_db),
+    };
+    Ok(AutoDiscovery {
+        rom,
+        facts,
+        selected,
+        outcomes,
+    })
+}
+
 /// Run discovery from a serializable external evidence manifest. The
 /// manifest is checked against the normalized ROM SHA-256 before any claim is
 /// consumed. It may describe mappings and executable intervals, but never
@@ -579,6 +741,52 @@ mod tests {
         buf[0x20..0x24].copy_from_slice(b"TEST");
         buf[0x3b..0x3f].copy_from_slice(b"CTSE");
         buf
+    }
+
+    #[test]
+    fn auto_discovery_reports_every_strategy_even_when_none_corroborate() {
+        // A ROM with a boot copy and no overlay geometry of any shape. The
+        // point is not that it recovers nothing -- it is that recovering
+        // nothing is REPORTED. A quiet boot-bank-only artifact is otherwise
+        // indistinguishable from a successful composition.
+        let auto = run_discovery_auto(&make_test_rom()).expect("synthetic ROM normalizes");
+
+        assert_eq!(auto.selected, DiscoveryStrategy::BootBankOnly);
+        assert_eq!(
+            auto.outcomes
+                .iter()
+                .map(|outcome| outcome.strategy)
+                .collect::<Vec<_>>(),
+            vec![
+                DiscoveryStrategy::BootBankOnly,
+                DiscoveryStrategy::RecoveredVrom,
+                DiscoveryStrategy::RecoveredOverlays,
+            ],
+            "every strategy attempted must report an outcome, in evaluation order"
+        );
+        for outcome in &auto.outcomes {
+            assert_eq!(
+                outcome.admitted_tables, 0,
+                "{:?} admitted a table on a ROM with no overlay geometry",
+                outcome.strategy
+            );
+        }
+        // The boot bank is still established, and is the only proven mapping.
+        assert_eq!(auto.facts.proven_rom_mappings().len(), 1);
+    }
+
+    #[test]
+    fn auto_discovery_selection_is_deterministic() {
+        // Selection must not depend on map iteration order or anything else
+        // that varies run to run; a gate that pins a strategy is worthless if
+        // the strategy can change underneath it.
+        let rom = make_test_rom();
+        let first = run_discovery_auto(&rom).expect("synthetic ROM normalizes");
+        for _ in 0..3 {
+            let again = run_discovery_auto(&rom).expect("synthetic ROM normalizes");
+            assert_eq!(first.selected, again.selected);
+            assert_eq!(first.outcomes, again.outcomes);
+        }
     }
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
