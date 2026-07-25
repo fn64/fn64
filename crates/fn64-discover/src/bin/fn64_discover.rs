@@ -27,6 +27,8 @@ struct DiscoveryArtifact<'a> {
     /// trace was supplied.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     observed_load_images: Vec<PiDmaFoldReport>,
+    /// Byte-level accounting: every ROM byte carries a typed claim.
+    ledger: fn64_discover::ledger::RomLedger,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     strategy_outcomes: Vec<StrategyOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -185,6 +187,24 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         }
         observed_load_images.push(fold);
     }
+    // Byte accounting. Coverage as "% of ROM mapped" counts assets against the
+    // score and cannot say how much CODE is undiscovered; this can.
+    let ledger = fn64_discover::ledger::build_ledger(&rom.bytes, &facts);
+    eprintln!("byte ledger ({} MiB):", ledger.total_bytes / 1_048_576);
+    for (class, bytes) in &ledger.bytes_by_class {
+        eprintln!(
+            "  {:<16} {:>10} B  {:>5.1}%",
+            class,
+            bytes,
+            100.0 * *bytes as f64 / ledger.total_bytes as f64
+        );
+    }
+    eprintln!(
+        "  UNDISCOVERED CODE: {} B ({:.2}% of ROM)",
+        ledger.undiscovered_code_bytes(),
+        100.0 * ledger.undiscovered_code_bytes() as f64 / ledger.total_bytes as f64
+    );
+
     let artifact = DiscoveryArtifact {
         // v2 adds selected_strategy / strategy_outcomes.
         schema_version: 2,
@@ -192,6 +212,7 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         facts: &facts,
         coverage: fn64_discover::coverage::report(rom.len(), &facts),
         selected_strategy,
+        ledger,
         observed_load_images,
         strategy_outcomes,
         traces,
