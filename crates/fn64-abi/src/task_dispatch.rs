@@ -532,17 +532,89 @@ pub enum RspInterpreterStateEvidenceSnapshot {
     /// A direct-IMEM HLE task completed without entering rspboot and without
     /// exposing any terminal scalar/VU image. No later interpreter task may
     /// silently reuse the older exact snapshot.
-    HleCompatibilityUnavailable {
-        task_offset: u32,
-        admission_generation: RspTaskAdmissionGeneration,
-    },
+    HleCompatibilityUnavailable { owner: RspInterpreterOwner },
     /// A synchronous interpreter phase has consumed the ready state. If that
     /// phase unwinds, another task traps instead of silently creating a fresh
     /// core and hiding the interrupted continuation.
-    InFlight {
-        task_offset: u32,
+    InFlight { owner: RspInterpreterOwner },
+}
+
+/// Who holds the RSP interpreter.
+///
+/// Ownership used to be a bare `(task_offset, admission_generation)` pair,
+/// compared jointly at every guard. Folding the pair into one value makes that
+/// a single `==` and removes the failure mode where a site checks the offset
+/// and forgets the generation — the address-reuse aliasing the generation
+/// exists to catch.
+///
+/// It also lets a **task-free** owner exist. A guest that kicks the RSP with a
+/// raw `SP_STATUS` clear-halt has no `OSTask`, so no task offset describes it;
+/// inventing one would fabricate admission evidence, and `0` is a legal offset
+/// a real task can occupy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RspInterpreterOwner {
+    /// An admitted `OSTask`: its RDRAM offset plus the generation that admitted
+    /// it. Both are load-bearing — the same address can be reused by a later
+    /// task, and only the generation distinguishes them.
+    Task {
+        offset: u32,
         admission_generation: RspTaskAdmissionGeneration,
     },
+    /// A raw `SP_STATUS` clear-halt started the RSP outside the task lane.
+    /// Carries a generation so successive kicks stay distinguishable, but has
+    /// no lineage and never enters `rsp_task_lineages`.
+    RawKick {
+        admission_generation: RspTaskAdmissionGeneration,
+    },
+}
+
+impl RspInterpreterOwner {
+    /// An owner for an admitted task at `offset`.
+    pub const fn task(offset: u32, admission_generation: RspTaskAdmissionGeneration) -> Self {
+        Self::Task {
+            offset,
+            admission_generation,
+        }
+    }
+
+    /// The admitting generation, whichever owner kind this is.
+    pub const fn admission_generation(self) -> RspTaskAdmissionGeneration {
+        match self {
+            Self::Task {
+                admission_generation,
+                ..
+            }
+            | Self::RawKick {
+                admission_generation,
+            } => admission_generation,
+        }
+    }
+
+    /// The owning task's RDRAM offset, or `None` for a raw kick. Callers that
+    /// need a task — lineage lookup, observation labelling — must handle the
+    /// `None` rather than substitute a placeholder offset.
+    pub const fn task_offset(self) -> Option<u32> {
+        match self {
+            Self::Task { offset, .. } => Some(offset),
+            Self::RawKick { .. } => None,
+        }
+    }
+
+    /// How to name this owner in a diagnostic. A raw kick has no task address,
+    /// so messages say what it is rather than printing a placeholder offset.
+    /// The generation is always included: it is the field that catches aliasing
+    /// between two owners that share an address.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Task {
+                offset,
+                admission_generation,
+            } => format!("task {offset:#010x} generation {}", admission_generation.get()),
+            Self::RawKick {
+                admission_generation,
+            } => format!("raw SP kick generation {}", admission_generation.get()),
+        }
+    }
 }
 
 fn imem_sha256(imem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE]) -> [u8; 32] {
@@ -888,38 +960,83 @@ unsafe fn begin_direct_hle_phase(
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
-    begin_rsp_interpreter_phase(task_addr, &mut machine);
+    begin_rsp_interpreter_phase(task_interpreter_owner(task_addr), &mut machine);
     machine.snapshot_state()
 }
 
 fn resume_direct_hle_phase(task_addr: RdramAddr) {
     let admission_generation = running_task_admission_generation(task_addr);
     with_host(|host| match host.rsp_interpreter_state {
+        // Same task address, strictly older generation: this is the suspended
+        // owner being reclaimed by its own readmission.
         RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-            task_offset,
-            admission_generation: prior_generation,
-        } if task_offset == task_addr.offset()
+            owner: RspInterpreterOwner::Task {
+                offset,
+                admission_generation: prior_generation,
+            },
+        } if offset == task_addr.offset()
             && prior_generation.get() < admission_generation.get() =>
         {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation,
+                owner: RspInterpreterOwner::task(offset, admission_generation),
             };
         }
-        RspInterpreterStateEvidenceSnapshot::InFlight { task_offset, .. }
-        | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-            task_offset, ..
-        } => {
-            panic!(
-                "direct-IMEM HLE task {:#010x} cannot resume state owned by task {task_offset:#010x}",
-                task_addr.offset()
-            )
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner }
+        | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { owner } => {
+            match owner.task_offset() {
+                Some(task_offset) => panic!(
+                    "direct-IMEM HLE task {:#010x} cannot resume state owned by task {task_offset:#010x}",
+                    task_addr.offset()
+                ),
+                None => panic!(
+                    "direct-IMEM HLE task {:#010x} cannot resume state owned by a raw SP kick",
+                    task_addr.offset()
+                ),
+            }
         }
         _ => panic!(
             "direct-IMEM HLE task {:#010x} cannot resume without its suspended compatibility owner",
             task_addr.offset()
         ),
     });
+}
+
+/// Resolves the interpreter owner for a task that is already admitted and
+/// Running. A raw SP kick has no lineage and must use
+/// [`acquire_raw_kick_interpreter_owner`] instead.
+fn task_interpreter_owner(task_addr: RdramAddr) -> RspInterpreterOwner {
+    RspInterpreterOwner::task(
+        task_addr.offset(),
+        running_task_admission_generation(task_addr),
+    )
+}
+
+/// Mints the owner for a raw `SP_STATUS` clear-halt kick, which arrives with no
+/// `OSTask` and therefore no admitted lineage.
+///
+/// The generation comes from the same process-monotonic counter task admissions
+/// use: a raw kick is a real RSP start and must be distinguishable from every
+/// other one, including a later kick that would otherwise alias it.
+///
+/// Mutual exclusion with the task lane is asserted here rather than left to the
+/// interpreter-state check alone: a Running lineage means a task owns the RSP
+/// even at moments when the interpreter state is not yet `InFlight`.
+fn acquire_raw_kick_interpreter_owner() -> RspInterpreterOwner {
+    with_host(|host| {
+        if let Some((offset, lineage)) = host
+            .rsp_task_lineages
+            .iter()
+            .find(|(_, lineage)| lineage.phase == RspTaskLineagePhase::Running)
+        {
+            panic!(
+                "raw SP kick cannot start while task {offset:#010x} generation {} owns the RSP",
+                lineage.admission_generation.get()
+            );
+        }
+        RspInterpreterOwner::RawKick {
+            admission_generation: host.next_rsp_task_admission_generation.advance(),
+        }
+    })
 }
 
 fn running_task_admission_generation(task_addr: RdramAddr) -> RspTaskAdmissionGeneration {
@@ -1054,12 +1171,10 @@ fn verified_audio_commit_owner(
     admission_generation: NonZeroU64,
 ) -> VerifiedAudioCommitOwner {
     let admission_generation = RspTaskAdmissionGeneration(admission_generation);
+    let expected_owner = RspInterpreterOwner::task(task_addr.offset(), admission_generation);
     with_host(|host| {
         match host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if task_offset == task_addr.offset() && owner_generation == admission_generation => {
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner => {
                 let lineage = host
                     .rsp_task_lineages
                     .get(&task_addr.offset())
@@ -1089,14 +1204,11 @@ fn verified_audio_commit_owner(
                     admission_generation,
                 }
             }
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "verified audio task {:#010x} generation {} cannot commit interpreter state owned by task {task_offset:#010x} generation {}",
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "verified audio task {:#010x} generation {} cannot commit interpreter state owned by {}",
             task_addr.offset(),
             admission_generation.get(),
-            owner_generation.get()
+            owner.describe()
         ),
         _ => panic!(
             "verified audio task {:#010x} cannot commit without an in-flight interpreter owner",
@@ -1138,71 +1250,52 @@ fn rsp_execution_state_from_architectural(
 }
 
 fn begin_rsp_interpreter_phase(
-    task_addr: RdramAddr,
+    owner: RspInterpreterOwner,
     machine: &mut fn64_audio::rsp::runtime::RspMachine<'_>,
 ) {
     let prior = with_host(|host| {
-        let lineage = host
-            .rsp_task_lineages
-            .get(&task_addr.offset())
-            .unwrap_or_else(|| {
-                panic!(
-                    "RSP task {:#010x} has no admitted task lineage",
-                    task_addr.offset()
-                )
-            });
-        assert_eq!(
-            lineage.phase,
-            RspTaskLineagePhase::Running,
-            "RSP task {:#010x} cannot acquire interpreter ownership from lineage phase {:?}",
-            task_addr.offset(),
-            lineage.phase
-        );
-        let admission_generation = lineage.admission_generation;
         match &host.rsp_interpreter_state {
-            RspInterpreterStateEvidenceSnapshot::InFlight { task_offset, .. } => panic!(
-                "RSP task {:#010x} cannot start: task {task_offset:#010x} left a pending interpreter continuation",
-                task_addr.offset()
+            RspInterpreterStateEvidenceSnapshot::InFlight { owner: prior } => panic!(
+                "RSP {} cannot start: {} left a pending interpreter continuation",
+                owner.describe(),
+                prior.describe()
             ),
             RspInterpreterStateEvidenceSnapshot::Reset => None,
             RspInterpreterStateEvidenceSnapshot::Exact(state)
             | RspInterpreterStateEvidenceSnapshot::HleCompatibility(state) => {
                 Some(state.clone())
             }
-            RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                task_offset,
-                ..
-            } => panic!(
-                "RSP task {:#010x} cannot start after direct-IMEM HLE task {task_offset:#010x}: terminal scalar/VU state is unavailable",
-                task_addr.offset()
-            ),
+            RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { owner: prior } => {
+                panic!(
+                    "RSP {} cannot start after direct-IMEM HLE {}: terminal scalar/VU state is unavailable",
+                    owner.describe(),
+                    prior.describe()
+                )
+            }
         }
         .inspect(|state| {
             assert_eq!(
                 state.resume_address(),
                 0,
-                "RSP task {:#010x} cannot inherit pending overlay resume address {:#06x}",
-                task_addr.offset(),
+                "RSP {} cannot inherit pending overlay resume address {:#06x}",
+                owner.describe(),
                 state.resume_address()
             );
             assert!(
                 !state.resume_delay(),
-                "RSP task {:#010x} cannot inherit a pending branch-delay continuation",
-                task_addr.offset()
+                "RSP {} cannot inherit a pending branch-delay continuation",
+                owner.describe()
             );
             assert!(
                 state.dp_submissions().is_empty(),
-                "RSP task {:#010x} cannot inherit {} uncommitted DPC submission(s)",
-                task_addr.offset(),
+                "RSP {} cannot inherit {} uncommitted DPC submission(s)",
+                owner.describe(),
                 state.dp_submissions().len()
             );
         });
         let prior = std::mem::replace(
             &mut host.rsp_interpreter_state,
-            RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
-            },
+            RspInterpreterStateEvidenceSnapshot::InFlight { owner },
         );
         match prior {
             RspInterpreterStateEvidenceSnapshot::Reset => None,
@@ -1259,7 +1352,7 @@ unsafe fn capture_audio_whole_task_input(
 ) -> CapturedAudioWholeTask {
     let mut scratch_rdram = [];
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut scratch_rdram);
-    begin_rsp_interpreter_phase(task_addr, &mut machine);
+    begin_rsp_interpreter_phase(task_interpreter_owner(task_addr), &mut machine);
     let initial_machine_state = machine.snapshot_state();
     drop(machine);
 
@@ -1267,9 +1360,12 @@ unsafe fn capture_audio_whole_task_input(
         |host| {
             let (task_offset, admission_generation) = match host.rsp_interpreter_state {
                 RspInterpreterStateEvidenceSnapshot::InFlight {
-                    task_offset,
-                    admission_generation,
-                } if task_offset == task_addr.offset() => (task_offset, admission_generation),
+                    owner:
+                        RspInterpreterOwner::Task {
+                            offset,
+                            admission_generation,
+                        },
+                } if offset == task_addr.offset() => (offset, admission_generation),
                 _ => unreachable!("begin_rsp_interpreter_phase installed this task owner"),
             };
             let lineage = host
@@ -1322,33 +1418,25 @@ unsafe fn capture_audio_whole_task_input(
 }
 
 fn continue_rsp_interpreter_phase(
-    task_addr: RdramAddr,
+    expected_owner: RspInterpreterOwner,
     machine: &mut fn64_audio::rsp::runtime::RspMachine<'_>,
     state: fn64_audio::rsp::runtime::RspMachineState,
 ) {
-    let admission_generation = running_task_admission_generation(task_addr);
     let architectural = state.into_architectural_state();
     with_host(|host| {
         match &host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if *task_offset == task_addr.offset() && *owner_generation == admission_generation => {}
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "RSP task {:#010x} generation {} cannot continue interpreter state owned by task {task_offset:#010x} generation {}",
-            task_addr.offset(),
-            admission_generation.get(),
-            owner_generation.get()
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if *owner == expected_owner => {}
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "RSP {} cannot continue interpreter state owned by {}",
+            expected_owner.describe(),
+            owner.describe()
         ),
         RspInterpreterStateEvidenceSnapshot::Reset
         | RspInterpreterStateEvidenceSnapshot::Exact(_)
         | RspInterpreterStateEvidenceSnapshot::HleCompatibility(_)
         | RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable { .. } => panic!(
-            "RSP task {:#010x} has a same-task machine snapshot without an in-flight rspboot owner",
-            task_addr.offset()
+            "RSP {} has a same-task machine snapshot without an in-flight rspboot owner",
+            expected_owner.describe()
         ),
     }
     });
@@ -1358,49 +1446,41 @@ fn continue_rsp_interpreter_phase(
 }
 
 fn commit_rsp_interpreter_phase(
-    task_addr: RdramAddr,
+    expected_owner: RspInterpreterOwner,
     state: fn64_audio::rsp::runtime::RspArchitecturalState,
 ) {
-    let admission_generation = running_task_admission_generation(task_addr);
     assert_eq!(
         state.resume_address(),
         0,
-        "RSP task {:#010x} reached a commit boundary with pending overlay resume address {:#06x}",
-        task_addr.offset(),
+        "RSP {} reached a commit boundary with pending overlay resume address {:#06x}",
+        expected_owner.describe(),
         state.resume_address()
     );
     assert!(
         !state.resume_delay(),
-        "RSP task {:#010x} reached a commit boundary in a branch-delay continuation",
-        task_addr.offset()
+        "RSP {} reached a commit boundary in a branch-delay continuation",
+        expected_owner.describe()
     );
     assert!(
         state.dp_submissions().is_empty(),
-        "RSP task {:#010x} reached a commit boundary with {} uncommitted DPC submission(s)",
-        task_addr.offset(),
+        "RSP {} reached a commit boundary with {} uncommitted DPC submission(s)",
+        expected_owner.describe(),
         state.dp_submissions().len()
     );
     with_host(|host| {
         match host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner =>
         {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Exact(state);
         }
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "RSP task {:#010x} generation {} cannot commit interpreter state owned by task {task_offset:#010x} generation {}",
-            task_addr.offset(),
-            admission_generation.get(),
-            owner_generation.get()
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "RSP {} cannot commit interpreter state owned by {}",
+            expected_owner.describe(),
+            owner.describe()
         ),
         _ => panic!(
-            "RSP task {:#010x} cannot commit without an in-flight interpreter owner",
-            task_addr.offset()
+            "RSP {} cannot commit without an in-flight interpreter owner",
+            expected_owner.describe()
         ),
     }
     });
@@ -1411,28 +1491,22 @@ fn commit_rsp_hle_compatibility(
     state: Option<fn64_audio::rsp::runtime::RspMachineState>,
 ) {
     let admission_generation = running_task_admission_generation(task_addr);
+    let expected_owner = RspInterpreterOwner::task(task_addr.offset(), admission_generation);
     let Some(state) = state else {
         with_host(|host| {
             match host.rsp_interpreter_state {
-            RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation: owner_generation,
-            } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+            RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner =>
             {
                 host.rsp_interpreter_state =
                     RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                        task_offset: task_addr.offset(),
-                        admission_generation,
+                        owner: expected_owner,
                     };
             }
-            RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation: owner_generation,
-            } => panic!(
-                "direct-IMEM HLE task {:#010x} generation {} cannot replace in-flight interpreter task {task_offset:#010x} generation {}",
+            RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+                "direct-IMEM HLE task {:#010x} generation {} cannot replace in-flight interpreter owner {}",
                 task_addr.offset(),
                 admission_generation.get(),
-                owner_generation.get()
+                owner.describe()
             ),
             _ => panic!(
                 "direct-IMEM HLE task {:#010x} cannot commit compatibility state without its in-flight owner",
@@ -1446,22 +1520,16 @@ fn commit_rsp_hle_compatibility(
     assert!(state.dp_submissions().is_empty());
     with_host(|host| {
         match host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } if task_offset == task_addr.offset() && owner_generation == admission_generation =>
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner =>
         {
             host.rsp_interpreter_state =
                 RspInterpreterStateEvidenceSnapshot::HleCompatibility(state);
         }
-        RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset,
-            admission_generation: owner_generation,
-        } => panic!(
-            "RSP HLE task {:#010x} generation {} cannot commit compatibility state owned by task {task_offset:#010x} generation {}",
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
+            "RSP HLE task {:#010x} generation {} cannot commit compatibility state owned by {}",
             task_addr.offset(),
             admission_generation.get(),
-            owner_generation.get()
+            owner.describe()
         ),
         _ => panic!(
             "RSP HLE task {:#010x} cannot commit compatibility state without an in-flight rspboot owner",
@@ -1664,20 +1732,19 @@ unsafe fn commit_verified_audio_effects(
         // after generation N's speculative verification. Rechecking the exact
         // generation and Running lineage in this exclusive HostState borrow
         // prevents stale generation N from publishing any effect.
+        let expected_owner =
+            RspInterpreterOwner::task(owner.task_addr.offset(), owner.admission_generation);
         match host.rsp_interpreter_state {
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation,
-            } if task_offset == owner.task_addr.offset()
-                && admission_generation == owner.admission_generation => {}
+                owner: interpreter_owner,
+            } if interpreter_owner == expected_owner => {}
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset,
-                admission_generation,
+                owner: interpreter_owner,
             } => panic!(
-                "verified audio task {:#010x} generation {} lost ownership to task {task_offset:#010x} generation {} before publication",
+                "verified audio task {:#010x} generation {} lost ownership to {} before publication",
                 owner.task_addr.offset(),
                 owner.admission_generation.get(),
-                admission_generation.get()
+                interpreter_owner.describe()
             ),
             _ => panic!(
                 "verified audio task {:#010x} lost its in-flight owner before publication",
@@ -1963,7 +2030,9 @@ fn commit_rsp_memory_state(
 /// This is the universal clean-room path for custom/unknown task types.
 unsafe fn dispatch_lle_task(
     rdram: *mut u8,
-    task_addr: RdramAddr,
+    // `None` is a raw `SP_STATUS` clear-halt kick: the RSP was started directly
+    // through MMIO with no `OSTask` behind it.
+    task_addr: Option<RdramAddr>,
     recognize_graphics_microcode: bool,
     machine_state: Option<fn64_audio::rsp::runtime::RspMachineState>,
     microcode_data: Option<TaskMicrocodeDataIdentity>,
@@ -1988,6 +2057,10 @@ unsafe fn dispatch_lle_task(
         !rdram.is_null() && rdram_len != 0,
         "RSP LLE task has no registered process RDRAM allocation"
     );
+    let owner = match task_addr {
+        Some(task_addr) => task_interpreter_owner(task_addr),
+        None => acquire_raw_kick_interpreter_owner(),
+    };
     let initial_imem = imem;
     unsafe { trace_rsp_rdram_words(rdram, rdram_len) };
     let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
@@ -1999,9 +2072,9 @@ unsafe fn dispatch_lle_task(
     machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
     if let Some(state) = machine_state {
-        continue_rsp_interpreter_phase(task_addr, &mut machine, state);
+        continue_rsp_interpreter_phase(owner, &mut machine, state);
     } else {
-        begin_rsp_interpreter_phase(task_addr, &mut machine);
+        begin_rsp_interpreter_phase(owner, &mut machine);
     }
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
@@ -2183,48 +2256,62 @@ unsafe fn dispatch_lle_task(
     }
 
     let mut observations = Vec::new();
-    let recognition_data = if recognize_graphics_microcode {
-        Some(microcode_data.unwrap_or_else(|| {
-            panic!(
-                "RSP graphics task {:#010x} has no task-start microcode-data identity",
-                task_addr.offset()
-            )
-        }))
-    } else {
-        None
-    };
-    if let Some(data) = recognition_data {
-        observations.push(RspRdpObservationKind::MicrocodeRecognition {
-            task_addr,
-            imem_generation,
-            text_sha256: imem_sha256(&initial_imem),
-            data_addr: data.addr,
-            data_size: data.size,
-            data_sha256: data.sha256,
-            family: identify_microcode_pair(&initial_imem, data, authoritative_family),
-        });
-    }
-    for replacement in replacements {
-        observations.push(RspRdpObservationKind::ImemReplacementCommitted {
-            task_addr,
-            imem_generation: replacement.generation,
-            text_sha256: imem_sha256(&replacement.image),
-        });
+    // LOUD: `fn64.rsp-rdp-observations.v2` types `MicrocodeRecognition` and
+    // `ImemReplacementCommitted`'s `task_address` as a non-optional u32 under
+    // `deny_unknown_fields`, so a raw SP kick's overlays are NOT REPRESENTED in
+    // that stream. Emitting nothing is deliberate: any placeholder address would
+    // be indistinguishable from a real task at that offset. Representing them
+    // needs a v3 wire and a schema bump. DPC observations carry no task address
+    // and are emitted for both owners.
+    if let Some(task_addr) = task_addr {
+        let recognition_data = if recognize_graphics_microcode {
+            Some(microcode_data.unwrap_or_else(|| {
+                panic!(
+                    "RSP graphics task {:#010x} has no task-start microcode-data identity",
+                    task_addr.offset()
+                )
+            }))
+        } else {
+            None
+        };
         if let Some(data) = recognition_data {
             observations.push(RspRdpObservationKind::MicrocodeRecognition {
                 task_addr,
-                imem_generation: replacement.generation,
-                text_sha256: imem_sha256(&replacement.image),
+                imem_generation,
+                text_sha256: imem_sha256(&initial_imem),
                 data_addr: data.addr,
                 data_size: data.size,
                 data_sha256: data.sha256,
-                family: identify_microcode_pair(&replacement.image, data, authoritative_family),
+                family: identify_microcode_pair(&initial_imem, data, authoritative_family),
             });
         }
+        for replacement in replacements {
+            observations.push(RspRdpObservationKind::ImemReplacementCommitted {
+                task_addr,
+                imem_generation: replacement.generation,
+                text_sha256: imem_sha256(&replacement.image),
+            });
+            if let Some(data) = recognition_data {
+                observations.push(RspRdpObservationKind::MicrocodeRecognition {
+                    task_addr,
+                    imem_generation: replacement.generation,
+                    text_sha256: imem_sha256(&replacement.image),
+                    data_addr: data.addr,
+                    data_size: data.size,
+                    data_sha256: data.sha256,
+                    family: identify_microcode_pair(&replacement.image, data, authoritative_family),
+                });
+            }
+        }
+    } else {
+        assert!(
+            !recognize_graphics_microcode && microcode_data.is_none(),
+            "a raw SP kick has no OSTask and cannot carry microcode-data identity"
+        );
     }
     observations.extend(dpc_observations);
     record_rsp_rdp_observations(observations);
-    commit_rsp_interpreter_phase(task_addr, final_architectural_state);
+    commit_rsp_interpreter_phase(owner, final_architectural_state);
 
     LleTaskResult {
         steps: total_steps.max(1),
@@ -2267,7 +2354,7 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.set_dma_rdram_ranges(dma_ranges);
     machine.load_dmem_logical(&dmem);
-    begin_rsp_interpreter_phase(task_addr, &mut machine);
+    begin_rsp_interpreter_phase(task_interpreter_owner(task_addr), &mut machine);
     let mut total_steps = 0u64;
     let mut overlays = 0u64;
     let mut loaded_spans = Vec::new();
@@ -3975,6 +4062,20 @@ fn retain_started_rsp_task_lineage(
             loaded.task_addr.offset(),
             running.unwrap_or_default(),
         );
+        // The other direction of the same exclusion: a raw SP kick owns the
+        // interpreter without any lineage, so the Running scan above cannot see
+        // it. Without this a task would start on top of a live raw kick and
+        // inherit its scalar/VU state as if it were its own.
+        if let RspInterpreterStateEvidenceSnapshot::InFlight {
+            owner: owner @ RspInterpreterOwner::RawKick { .. },
+        } = host.rsp_interpreter_state
+        {
+            panic!(
+                "osSpTaskStartGo_recomp: task {:#010x} cannot start while {} owns the interpreter",
+                loaded.task_addr.offset(),
+                owner.describe()
+            );
+        }
         if loaded.header.flags & fn64_runtime::OS_TASK_YIELDED != 0 {
             let lineage = host
                 .rsp_task_lineages
@@ -4290,7 +4391,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
         let lle = unsafe {
             dispatch_lle_task(
                 rdram,
-                task_addr,
+                Some(task_addr),
                 true,
                 entry.into_lle_machine_state(),
                 Some(microcode_data),
@@ -4418,7 +4519,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 let lle = unsafe {
                     dispatch_lle_task(
                         rdram,
-                        task_addr,
+                        Some(task_addr),
                         true,
                         entry.into_lle_machine_state(),
                         Some(microcode_data),
@@ -4457,7 +4558,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
                 let lle = unsafe {
                     dispatch_lle_task(
                         rdram,
-                        task_addr,
+                        Some(task_addr),
                         false,
                         entry.into_lle_machine_state(),
                         None,
@@ -4478,7 +4579,7 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
             AudioTaskExecutionPolicy::DiagnosticSkip => fn64_render::DpFullSyncStatus::NotReached,
         }
     } else {
-        let lle = unsafe { dispatch_lle_task(rdram, task_addr, false, None, None, None) };
+        let lle = unsafe { dispatch_lle_task(rdram, Some(task_addr), false, None, None, None) };
         crate::pi::start_live_rcp_task_with_latency(
             rcp_completion_plan(lle.dp_full_sync, "custom-task LLE"),
             lle.steps,
@@ -4541,29 +4642,28 @@ pub unsafe extern "C" fn osSpTaskYield_recomp(_rdram: *mut u8, _ctx: *mut Recomp
 /// A guest started the RSP by clearing HALT through raw `SP_STATUS` MMIO
 /// rather than through the libultra task shim.
 ///
-/// The device reports that edge as
-/// [`fn64_runtime::DeviceMmioWriteEffect::RspStartRequested`] so it is no
-/// longer silently latched, but executing it is not wired yet: the LLE runner
-/// keys interpreter ownership on an OSTask address
-/// ([`begin_rsp_interpreter_phase`] panics on a missing lineage) and a raw kick
-/// has no task to key on.
+/// This runs the same LLE interpreter the task lane runs; the only difference
+/// is that interpreter ownership is a [`RspInterpreterOwner::RawKick`] rather
+/// than a task lineage, because there is no `OSTask` to key on. SP_PC and IMEM
+/// are already latched in the fabric, so `pc` is diagnostic only.
 ///
-/// This fails by name instead of returning. Returning would reproduce the
-/// original defect exactly — the guest waits forever on an SP interrupt that
-/// never arrives, with no diagnostic — which is the failure shape `AGENTS.md`'s
-/// "loud traps, no silent shrugs" rule exists to prevent.
-pub(crate) fn raw_rsp_start_unsupported(pc: u32) -> ! {
-    let reason = "raw SP_STATUS clear-halt started the RSP outside the libultra task lane; \
-                  task-free RSP execution is not wired (the LLE runner requires an OSTask \
-                  lineage)";
-    fn64_runtime::record_unsupported_event(
-        fn64_runtime::UnsupportedSubsystem::Abi,
-        "abi.rsp.raw-sp-status-start",
-        reason,
-        Some(fn64_runtime::Cycles::new(crate::sim_time())),
-        fn64_runtime::UnsupportedDisposition::LoudTrap,
+/// This is what makes an unknown ROM able to drive the RSP at all: a guest
+/// running its own libultra kicks the RSP itself, so `osSpTaskStartGo` never
+/// needs to be identified for the RSP to run.
+pub(crate) unsafe fn dispatch_raw_rsp_start(rdram: *mut u8, pc: u32) {
+    assert!(
+        !rdram.is_null(),
+        "raw SP_STATUS clear-halt at SP_PC {pc:#06x} has no registered process RDRAM"
     );
-    panic!("{reason}; SP_PC {pc:#06x}");
+    let lle = unsafe { dispatch_lle_task(rdram, None, false, None, None, None) };
+    crate::pi::start_live_rcp_task_with_latency(
+        rcp_completion_plan(lle.dp_full_sync, "raw SP kick"),
+        lle.steps,
+    )
+    .unwrap_or_else(|error| {
+        panic!("raw SP_STATUS clear-halt at SP_PC {pc:#06x} completion: {error}")
+    });
+    // No lineage to retire: a raw kick never entered `rsp_task_lineages`.
 }
 
 #[cfg(test)]
@@ -4664,7 +4764,7 @@ mod tests {
         let mut first = fn64_audio::rsp::runtime::RspMachine::new(&mut first_rdram);
         let first_task = RdramAddr::from_offset(0x40);
         install_running_task_lineage(first_task, RspTaskAdmissionGeneration::first());
-        begin_rsp_interpreter_phase(first_task, &mut first);
+        begin_rsp_interpreter_phase(task_interpreter_owner(first_task), &mut first);
         first.ctx.r[3] = 0x1122_3344;
         first.ctx.jump_target = 0x1550;
         first.ctx.rsp.regs.r[7] = [1, -2, 3, -4, 5, -6, 7, -8];
@@ -4677,7 +4777,7 @@ mod tests {
         first.ctx.rsp.div_out = 0x89ab;
         first.ctx.steps = 91;
         let committed = first.snapshot_architectural_state();
-        commit_rsp_interpreter_phase(first_task, committed.clone());
+        commit_rsp_interpreter_phase(task_interpreter_owner(first_task), committed.clone());
 
         let fabric = with_host(|host| {
             let mut state = host.device_fabric.rsp_execution_state();
@@ -4708,7 +4808,7 @@ mod tests {
             second_task,
             RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap()),
         );
-        begin_rsp_interpreter_phase(second_task, &mut second);
+        begin_rsp_interpreter_phase(task_interpreter_owner(second_task), &mut second);
         let restored = second.snapshot_architectural_state();
         assert_eq!(restored.gprs(), committed.gprs());
         assert_eq!(restored.jump_target(), committed.jump_target());
@@ -4741,7 +4841,7 @@ mod tests {
             restored.sp_status(),
             fabric.sp_status & !(fn64_runtime::SP_STATUS_HALT | fn64_runtime::SP_STATUS_BROKE)
         );
-        commit_rsp_interpreter_phase(second_task, restored);
+        commit_rsp_interpreter_phase(task_interpreter_owner(second_task), restored);
     }
 
     #[test]
@@ -4772,7 +4872,7 @@ mod tests {
 
         let mut expected_storage = [];
         let mut expected_machine = fn64_audio::rsp::runtime::RspMachine::new(&mut expected_storage);
-        begin_rsp_interpreter_phase(task_addr, &mut expected_machine);
+        begin_rsp_interpreter_phase(task_interpreter_owner(task_addr), &mut expected_machine);
         let expected_state = expected_machine.snapshot_state();
         with_host(|host| {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Exact(prior);
@@ -4793,8 +4893,7 @@ mod tests {
         );
         let mut expected_after = before;
         expected_after.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-            task_offset: task_addr.offset(),
-            admission_generation,
+            owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
         };
         assert_eq!(crate::host_evidence_snapshot(), expected_after);
     }
@@ -4812,8 +4911,7 @@ mod tests {
                 .unwrap()
                 .admission_generation = second_generation;
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation: first_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), first_generation),
             };
         });
         let before = crate::host_evidence_snapshot();
@@ -4858,8 +4956,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -4885,8 +4982,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -4923,8 +5019,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -4961,8 +5056,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation,
+                owner: RspInterpreterOwner::task(task_addr.offset(), admission_generation),
             }
         );
     }
@@ -4984,7 +5078,7 @@ mod tests {
             RspTaskAdmissionGeneration::first(),
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            begin_rsp_interpreter_phase(RdramAddr::from_offset(0x90), &mut target);
+            begin_rsp_interpreter_phase(task_interpreter_owner(RdramAddr::from_offset(0x90)), &mut target);
         }))
         .expect_err("pending overlay continuation must not become a fresh task");
         assert!(panic_message(panic.as_ref()).contains("pending overlay resume address"));
@@ -5001,9 +5095,9 @@ mod tests {
         let mut machine = fn64_audio::rsp::runtime::RspMachine::new(&mut rdram);
         let task = RdramAddr::from_offset(0x40);
         install_running_task_lineage(task, RspTaskAdmissionGeneration::first());
-        begin_rsp_interpreter_phase(task, &mut machine);
+        begin_rsp_interpreter_phase(task_interpreter_owner(task), &mut machine);
         machine.ctx.r[9] = 0xfeed_beef;
-        commit_rsp_interpreter_phase(task, machine.snapshot_architectural_state());
+        commit_rsp_interpreter_phase(task_interpreter_owner(task), machine.snapshot_architectural_state());
         assert!(matches!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::Exact(_)
@@ -5028,13 +5122,12 @@ mod tests {
 
         let task = RdramAddr::from_offset(0x88);
         install_running_task_lineage(task, RspTaskAdmissionGeneration::first());
-        begin_rsp_interpreter_phase(task, &mut machine);
+        begin_rsp_interpreter_phase(task_interpreter_owner(task), &mut machine);
         commit_rsp_hle_compatibility(task, None);
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                task_offset: 0x88,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(0x88, RspTaskAdmissionGeneration::first()),
             }
         );
 
@@ -5045,7 +5138,7 @@ mod tests {
             RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap()),
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            begin_rsp_interpreter_phase(RdramAddr::from_offset(0x90), &mut next);
+            begin_rsp_interpreter_phase(task_interpreter_owner(RdramAddr::from_offset(0x90)), &mut next);
         }))
         .expect_err("unavailable direct-IMEM HLE state must not reuse a stale exact snapshot");
         assert!(panic_message(panic.as_ref()).contains("terminal scalar/VU state is unavailable"));
@@ -5078,8 +5171,7 @@ mod tests {
         let task_addr = RdramAddr::from_offset(VERIFIED_AUDIO_TASK_OFFSET);
         with_host(|host| {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: task_addr.offset(),
-                admission_generation: RspTaskAdmissionGeneration::new(VERIFIED_AUDIO_GENERATION),
+                owner: RspInterpreterOwner::task(task_addr.offset(), RspTaskAdmissionGeneration::new(VERIFIED_AUDIO_GENERATION)),
             };
             host.rsp_task_lineages.insert(
                 task_addr.offset(),
@@ -6950,8 +7042,7 @@ mod tests {
         );
         with_host(|host| {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x180,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(0x180, RspTaskAdmissionGeneration::first()),
             };
         });
 
@@ -6973,8 +7064,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: 0x180,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(0x180, RspTaskAdmissionGeneration::first()),
             }
         );
     }
@@ -7014,8 +7104,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: TASK,
-                admission_generation: RspTaskAdmissionGeneration::first(),
+                owner: RspInterpreterOwner::task(TASK, RspTaskAdmissionGeneration::first()),
             }
         );
     }
@@ -7027,8 +7116,7 @@ mod tests {
             *host = HostState::default();
             host.rsp_interpreter_state =
                 RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                    task_offset: TASK,
-                    admission_generation: RspTaskAdmissionGeneration::first(),
+                    owner: RspInterpreterOwner::task(TASK, RspTaskAdmissionGeneration::first()),
                 };
         });
         install_running_task_lineage(
@@ -7041,8 +7129,7 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                task_offset: TASK,
-                admission_generation: RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap(),),
+                owner: RspInterpreterOwner::task(TASK, RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap(),)),
             }
         );
     }
@@ -8069,7 +8156,7 @@ mod tests {
         install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
 
         let result =
-            unsafe { dispatch_lle_task(rdram.as_mut_ptr(), task_addr, false, None, None, None) };
+            unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None) };
 
         assert_eq!(
             result,
@@ -8141,6 +8228,63 @@ mod tests {
             assert!(
                 fabric.snapshot().sp_busy,
                 "LLE BREAK schedules externally visible SP completion"
+            );
+        });
+    }
+
+    #[test]
+    fn raw_sp_status_clear_halt_runs_the_rsp_without_the_task_shim() {
+        // The raw-MMIO analogue of
+        // `os_sp_task_start_go_routes_unknown_task_through_lle`: same IMEM
+        // program, same expected DMEM result, but no OSTask, no shim call, and
+        // no admitted lineage -- only SP_PC, IMEM, and a SP_STATUS write that
+        // clears HALT. A guest running its own libultra kicks the RSP exactly
+        // this way, which is why an unknown ROM does not need `osSpTaskStartGo`
+        // identified to drive the RSP.
+        let mut rdram = vec![0u8; 0x1000];
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+            let program = [0x2402_3456u32, 0xAC02_0108, 0x0000_000D];
+            let bytes: Vec<u8> = program.into_iter().flat_map(u32::to_be_bytes).collect();
+            host.device_fabric
+                .rsp_memory_mut()
+                .write_bytes(
+                    fn64_runtime::RspMemAddr::from_parts(fn64_runtime::RspMemoryBank::Imem, 0),
+                    &bytes,
+                )
+                .unwrap();
+            assert!(
+                host.rsp_task_lineages.is_empty(),
+                "the raw kick path must not depend on any admitted task lineage"
+            );
+        });
+        crate::pi::set_live_sp_pc(0);
+
+        // SP_STATUS bit 0 is clear-halt. The device is halted out of reset, so
+        // this is the starting edge.
+        assert!(crate::pi::write_live_device_mmio(0xFFFF_FFFF_A404_0010, 1 << 0));
+
+        with_host(|host| {
+            let fabric = &host.device_fabric;
+            assert_eq!(
+                fabric
+                    .rsp_memory()
+                    .read_word(fn64_runtime::RspMemAddr::from_parts(
+                        fn64_runtime::RspMemoryBank::Dmem,
+                        0x108,
+                    ))
+                    .unwrap(),
+                0x0000_3456,
+                "the raw kick executed the IMEM program and its store landed"
+            );
+            assert!(
+                fabric.snapshot().sp_busy,
+                "raw kick BREAK schedules externally visible SP completion"
+            );
+            assert!(
+                host.rsp_task_lineages.is_empty(),
+                "a raw kick must never fabricate a task lineage"
             );
         });
     }
@@ -8266,7 +8410,7 @@ mod tests {
         let result = unsafe {
             dispatch_lle_task(
                 rdram.as_mut_ptr(),
-                task_addr,
+                Some(task_addr),
                 true,
                 None,
                 Some(microcode_data),
@@ -9028,9 +9172,11 @@ mod tests {
         assert_eq!(
             evidence.rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
-                task_offset: HEADER as u32,
-                admission_generation: RspTaskAdmissionGeneration::new(
-                    NonZeroU64::new(resumed_generation).unwrap(),
+                owner: RspInterpreterOwner::task(
+                    HEADER as u32,
+                    RspTaskAdmissionGeneration::new(
+                        NonZeroU64::new(resumed_generation).unwrap(),
+                    ),
                 ),
             }
         );

@@ -107,13 +107,6 @@
       "trigger": "fn64_runtime::UnsupportedSubsystem::Abi,\n        \"abi.pi.epi-handle\""
     },
     {
-      "operation": "abi.rsp.raw-sp-status-start",
-      "subsystem": "abi",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch.rs",
-      "trigger": "raw SP_STATUS clear-halt started the RSP outside the libultra task lane"
-    },
-    {
       "operation": "audio.task.missing-execution-policy",
       "subsystem": "audio",
       "disposition": "loud_trap",
