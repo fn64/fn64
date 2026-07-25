@@ -308,7 +308,12 @@ fn legacy_discovery_invocation_remains_available_without_a_subcommand() {
             .iter()
             .map(|outcome| outcome["strategy"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["boot_bank_only", "recovered_vrom", "recovered_overlays"],
+        vec![
+            "boot_bank_only",
+            "recovered_vrom",
+            "recovered_overlays",
+            "untabled_delta_vote",
+        ],
         "the fixture ROM has no overlay geometry, but every attempt must still be reported"
     );
 }
