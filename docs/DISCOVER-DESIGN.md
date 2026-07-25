@@ -433,10 +433,24 @@ authoritative entries merely because the CFG visited them. The full owner
 report remains in the snapshot and a payload-independent blocker histogram
 adds fast feedback without discarding site-specific evidence. Each category
 also reports how many assessments have no other blocker, so a pass can be
-prioritized by its immediate exact-owner payoff. Virtual or
-compressed backing is rejected in V1 until a proof-carrying materialization
-transform can bind its output bytes to source bytes; accepting an unverified
-slice would defeat the snapshot's purpose.
+prioritized by its immediate exact-owner payoff.
+
+**Correction:** this section previously claimed virtual/compressed backing
+was rejected in V1 pending a proof-carrying materialization transform. That
+claim is retracted — the transform exists and is wired in. Virtual (VROM)
+and Yaz0-compressed backing are accepted, not rejected, provided they carry
+that proof: `snapshot::compose_materialized_bank_v1` resolves a bank's bytes
+through `banks::materialize_rom_range`
+(`crates/fn64-discover/src/snapshot.rs:472`), which for a VROM range
+requires exactly one proven `LoadImageTableRecord` file-table mapping
+(`crates/fn64-discover/src/banks.rs:625-652`) and, when the mapped file
+starts with a `Yaz0` header, decodes it with a bounded decoder that verifies
+the stream's declared output length against the VROM interval before
+trusting any byte (`banks.rs:664-674`, decoder at `banks.rs:1319-1370`). An
+unproven VROM range (zero or more than one candidate mapping) or a
+non-Yaz0 file whose length disagrees with the VROM interval is still
+rejected loudly rather than silently materializing unverified bytes — that
+part of the original rationale still holds.
 
 The boot bank's normalized ROM-header entry is a typed, authoritative
 `HardwareEntrypoint` / `RomHeaderEntrypoint` claim justified by the same IPL3
