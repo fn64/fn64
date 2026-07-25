@@ -318,12 +318,39 @@ static void fn64_append_end_record(void) {
     FILE *count = fopen(path, "r");
     if (count == NULL)
         return;
+    /* Idempotent: the core registers an atexit handler that writes this same
+     * record, and whether it runs depends on dlopen/dlclose teardown order,
+     * which is not something to build on. Writing unconditionally produced two
+     * terminators ("record appears after end"); trusting atexit produced none
+     * ("missing end record"). So: look at what is actually in the file.
+     *
+     * The last line is scanned for the end event rather than parsed -- the
+     * consumer validates the schema, this only needs to know whether a
+     * terminator is already present. */
     unsigned long long lines = 0;
     int c;
-    while ((c = fgetc(count)) != EOF)
-        if (c == '\n')
+    char tail[256];
+    size_t tail_len = 0;
+    while ((c = fgetc(count)) != EOF) {
+        if (c == '\n') {
             lines++;
+            tail_len = 0;
+        } else if (tail_len + 1 < sizeof(tail)) {
+            tail[tail_len++] = (char)c;
+        }
+    }
+    /* Re-read the final complete line. */
+    fseek(count, 0, SEEK_SET);
+    char line[4096];
+    int already_terminated = 0;
+    while (fgets(line, sizeof(line), count) != NULL)
+        already_terminated = (strstr(line, "\"event\":\"end\"") != NULL);
     fclose(count);
+    if (already_terminated) {
+        fprintf(stderr, "fn64 PI DMA trace: %llu records, already terminated\n", lines - 1);
+        return;
+    }
+    count = NULL;
     FILE *append = fopen(path, "a");
     if (append == NULL) {
         fprintf(stderr, "warning: cannot append end record to %s\n", path);
