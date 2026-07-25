@@ -1,5 +1,6 @@
 use fn64_discover::block_pack::{emit_block_program_source, BlockPackV1, BlockProgramSourceConfig};
 use fn64_discover::evidence::EvidenceManifest;
+use fn64_discover::trace::PiDmaFoldReport;
 use fn64_discover::{
     run_discovery_auto, run_discovery_with_manifest, AutoDiscovery, DiscoveryStrategy, FactDb,
     NormalizedRom, StrategyOutcome,
@@ -22,6 +23,10 @@ struct DiscoveryArtifact<'a> {
     /// composition, because then nothing was selected.
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_strategy: Option<DiscoveryStrategy>,
+    /// What each ingested trace's observed PI DMAs contributed. Absent when no
+    /// trace was supplied.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    observed_load_images: Vec<PiDmaFoldReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     strategy_outcomes: Vec<StrategyOutcome>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -139,6 +144,43 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         }
         traces.push(report);
     }
+
+    // Fold observed load images into the SAME database the static strategies
+    // built. This is the point of ingesting a trace at all: a static strategy
+    // has to recognise a structure and is bound to the engine families whose
+    // structure it knows, while an observed transfer is bound to nothing. Until
+    // now the CLI ingested traces and then dropped every observation on the
+    // floor.
+    let mut facts = facts;
+    let mut observed_load_images = Vec::new();
+    for report in &traces {
+        let fold =
+            fn64_discover::trace::fold_pi_dmas_into_fact_db(&mut facts, &report.header.trace_id, &report.facts);
+        eprintln!(
+            "observed load images ({}): {} new, {} corroborating a proven mapping, {} conflicts, \
+             {} reloads, {} off-cartridge, {} write-backs, {} degenerate",
+            report.header.trace_id,
+            fold.new_mappings.len(),
+            fold.corroborated.len(),
+            fold.conflicts.len(),
+            fold.repeated,
+            fold.off_cartridge_skipped,
+            fold.non_load_skipped,
+            fold.degenerate_skipped,
+        );
+        for conflict in &fold.conflicts {
+            eprintln!(
+                "  CONFLICT seq={} VA 0x{:08x}: observed from ROM 0x{:08x}, proven bank {:?} \
+                 backs it from ROM 0x{:08x}",
+                conflict.sequence,
+                conflict.va_start,
+                conflict.observed_rom_start,
+                conflict.proven_bank,
+                conflict.proven_rom_start,
+            );
+        }
+        observed_load_images.push(fold);
+    }
     let artifact = DiscoveryArtifact {
         // v2 adds selected_strategy / strategy_outcomes.
         schema_version: 2,
@@ -146,6 +188,7 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         facts: &facts,
         coverage: fn64_discover::coverage::report(rom.len(), &facts),
         selected_strategy,
+        observed_load_images,
         strategy_outcomes,
         traces,
     };
