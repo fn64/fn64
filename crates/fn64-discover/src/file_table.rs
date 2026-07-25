@@ -181,6 +181,15 @@ fn record_at(bytes: &[u8], fields_start: u32) -> Option<FileTableRecord> {
     })
 }
 
+/// The dmadata convention for a file present in the VROM address space but
+/// with NO physical backing in this build: both physical fields are all-ones.
+pub const NO_PHYSICAL_BACKING: u32 = 0xFFFF_FFFF;
+
+/// Does this record declare a VROM extent with no bytes behind it?
+pub fn has_no_physical_backing(record: FileTableRecord) -> bool {
+    record.rom_start == NO_PHYSICAL_BACKING && record.rom_end == NO_PHYSICAL_BACKING
+}
+
 fn record_valid(
     record: FileTableRecord,
     previous_vrom_end: u32,
@@ -188,10 +197,27 @@ fn record_valid(
     rom_len: u32,
 ) -> bool {
     let aligned_start = align_up(previous_vrom_end, vrom_alignment);
-    if !(record.vrom_start == previous_vrom_end || aligned_start == Some(record.vrom_start))
-        || record.vrom_end <= record.vrom_start
-        || !record.vrom_start.is_multiple_of(4)
-        || !record.vrom_end.is_multiple_of(4)
+    let chains = record.vrom_start == previous_vrom_end || aligned_start == Some(record.vrom_start);
+    let vrom_well_formed = chains
+        && record.vrom_end > record.vrom_start
+        && record.vrom_start.is_multiple_of(4)
+        && record.vrom_end.is_multiple_of(4);
+
+    // An unbacked file still OWNS its VROM interval: every later record chains
+    // from its `vrom_end`. Rejecting it does not skip one entry, it truncates
+    // the table there -- which is exactly what happened to Majora's Mask,
+    // whose records 8 and 9 are unbacked. The table stopped at 8 records
+    // instead of ~1500, so `code` was never reached and no overlay descriptor
+    // table could be found in a ROM that plainly has them.
+    //
+    // Validate the VROM extent and accept; the record contributes no physical
+    // mapping, and `materialize_vrom_range` still refuses to produce bytes for
+    // it, so nothing downstream can mistake it for backed content.
+    if has_no_physical_backing(record) {
+        return vrom_well_formed;
+    }
+
+    if !vrom_well_formed
         || !record.rom_start.is_multiple_of(4)
         || record.rom_start >= rom_len
     {
@@ -440,6 +466,64 @@ mod tests {
         assert_eq!(table.field_vrom_start, 0);
         assert_eq!(table.records, records);
         assert_eq!(table.translate_uncompressed(0x3120), Some(0x8120));
+    }
+
+    #[test]
+    fn an_unbacked_file_does_not_truncate_the_table() {
+        // A file present in VROM with no physical backing writes all-ones into
+        // both physical fields. It still OWNS its VROM interval, so every later
+        // record chains from its end -- rejecting it truncates the table there
+        // rather than skipping one entry.
+        //
+        // Measured consequence before this was handled: Majora's Mask records 8
+        // and 9 are unbacked, so its table stopped at 8 records instead of
+        // ~1500. `code` was never reached, no overlay descriptor table could be
+        // found, and a ROM that plainly has them composed to the boot bank
+        // alone.
+        let mut rom = vec![0xff; 0x20_000];
+        let records = [
+            FileTableRecord {
+                vrom_start: 0,
+                vrom_end: 0x900,
+                rom_start: 0,
+                rom_end: 0,
+            },
+            FileTableRecord {
+                vrom_start: 0x1000,
+                vrom_end: 0x2800,
+                rom_start: 0x4000,
+                rom_end: 0,
+            },
+            FileTableRecord {
+                vrom_start: 0x3000,
+                vrom_end: 0x5000,
+                rom_start: NO_PHYSICAL_BACKING,
+                rom_end: NO_PHYSICAL_BACKING,
+            },
+            // The record that would be lost: it chains from the unbacked
+            // file's vrom_end, so it is unreachable unless the run continues.
+            FileTableRecord {
+                vrom_start: 0x5000,
+                vrom_end: 0x6000,
+                rom_start: 0x8000,
+                rom_end: 0,
+            },
+        ];
+        for (index, record) in records.into_iter().enumerate() {
+            plant_record(&mut rom, 0x2000 + index * 0x10, record);
+        }
+        let recovery = recover_file_table(&rom, &FileTableSearchConfig::n64_family());
+        let table = recovery.admitted_table.expect("one file table");
+
+        assert_eq!(table.records, records, "the run must span the unbacked file");
+        assert!(has_no_physical_backing(table.records[2]));
+        // The unbacked file yields no bytes, so nothing downstream can mistake
+        // it for backed content.
+        assert!(table
+            .materialize_vrom_range(&rom, 0x3000, 0x5000)
+            .is_err());
+        // And the record after it is reachable, which is the whole point.
+        assert_eq!(table.translate_uncompressed(0x5100), Some(0x8100));
     }
 
     #[test]
