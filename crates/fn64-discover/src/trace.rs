@@ -1827,7 +1827,18 @@ pub fn fold_pi_dmas_into_fact_db(
     //
     // Measured on WCW vs. nWo World Tour: of 4,411 transfers, two destinations
     // account for 4,331, one of them written from 2,598 DISTINCT ROM sources.
-    // That is streaming (audio/FMV), not overlay loading.
+    //
+    // What those transfers actually are, measured rather than assumed: 4,331 of
+    // the 4,337 excluded transfers are exactly FOUR BYTES, and on WWF No Mercy
+    // all 4,084 are. They are single-word ROM reads issued through PI DMA into a
+    // scratch address -- a table lookup or header field, not a load image. (An
+    // earlier revision of this comment guessed "audio/FMV streaming". That was
+    // never measured and is wrong; the largest excluded transfer on either ROM
+    // is 726 bytes.)
+    //
+    // The rule below keys on destination reuse rather than transfer size, which
+    // is the property that actually matters -- a destination without a single
+    // backing cannot have a mapping regardless of how large its writes are.
     //
     // The rule is deliberately threshold-free -- one source or more than one --
     // because "how many reloads before it stops being a load image" has no
