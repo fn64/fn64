@@ -554,7 +554,8 @@ pub enum DiscoveryStrategy {
     /// ROM (AKI-class).
     RecoveredOverlays,
     /// Load addresses inferred from `jal` statistics with NO table of any kind
-    /// ([`delta_vote::sweep_untabled_regions`]). Weakest evidence class here and
+    /// ([`delta_vote::prove_region`] over the ledger's unclaimed runs). Weakest
+    /// evidence class here and
     /// the only one that concludes `Supported` rather than `Proven`; selected
     /// only when nothing with an independent table corroborated.
     UntabledDeltaVote,
@@ -712,10 +713,70 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
     // guarantee that an inferred mapping never displaces a corroborated one.
     if best.is_none() {
         let (_, mut untabled_db) = run_discovery(rom_bytes, None)?;
-        let regions = delta_vote::sweep_untabled_regions(
+        // Extents come from the ledger's UNCLAIMED runs, not fixed windows.
+        // That choice is the whole mechanism: WCW World Tour's 352 KiB image
+        // scores 328 votes to 25 over its natural extent, and 2-3 votes per
+        // fixed 32 KiB window with every window returning Open. Fragmenting a
+        // region destroys the evidence the vote needs.
+        //
+        // The ledger is built from the baseline (boot-copy) facts, so "unclaimed"
+        // means "not the boot copy" -- exactly the territory a table strategy
+        // would have covered had one applied.
+        let baseline_ledger = ledger::build_ledger(&rom.bytes, &untabled_db);
+        let vote = delta_vote::DeltaVoteConfig::default();
+
+        // Candidates come from TWO sources, because neither alone is sufficient
+        // and the proof makes combining them safe.
+        //
+        // 1. The ledger's `code_like` runs. These are natural extents, which is
+        //    what makes the proof work: WCW's 352 KiB image scores 328 votes to
+        //    25 over its extent and 2-3 per fixed window. The heuristic's false
+        //    positives cost nothing here -- the proof rejects all eight known
+        //    OoT ones.
+        // 2. The fixed-window sweep. An unclaimed run is "everything not yet
+        //    claimed", so a small image inside megabytes of assets has no
+        //    `code_like` extent of its own and would be lost. Measured: proving
+        //    whole unclaimed runs alone regressed Perfect Dark and WCW Revenge
+        //    from three regions each to zero.
+        //
+        // Union, de-duplicated by ROM start; a region proved from its natural
+        // extent supersedes a windowed one covering the same start.
+        let mut proved: std::collections::BTreeMap<u32, delta_vote::UntabledRegion> =
+            std::collections::BTreeMap::new();
+        for region in delta_vote::sweep_untabled_regions(
             &rom.bytes,
             &delta_vote::UntabledSweepConfig::default(),
-        );
+        ) {
+            proved.insert(region.rom_start, region);
+        }
+        for span in baseline_ledger
+            .spans
+            .iter()
+            .filter(|span| span.class == ledger::SpanClass::CodeLike)
+        {
+            if let Some(region) =
+                delta_vote::prove_region(&rom.bytes, span.rom_start, span.rom_end, &vote)
+            {
+                proved.insert(region.rom_start, region);
+            }
+        }
+        // A whole-extent proof SUPERSEDES any windowed region inside it. Keeping
+        // both would emit two mappings claiming the same ROM bytes at different
+        // addresses -- a contradiction, and one `surface_mapping_conflicts`
+        // would rightly flag. Observed: WCW's windowed region at
+        // 0xab0000-0xac0000 lies inside the extent-proved 0xa69000-0xac1000.
+        let candidates: Vec<delta_vote::UntabledRegion> = proved.into_values().collect();
+        let regions: Vec<delta_vote::UntabledRegion> = candidates
+            .iter()
+            .filter(|region| {
+                !candidates.iter().any(|other| {
+                    other.rom_start <= region.rom_start
+                        && region.rom_end <= other.rom_end
+                        && (other.rom_start, other.rom_end) != (region.rom_start, region.rom_end)
+                })
+            })
+            .cloned()
+            .collect();
         for (index, region) in regions.iter().enumerate() {
             let bank = format!("untabled_region_{index}");
             let mapping = untabled_db.insert(Fact::RomMapping {
