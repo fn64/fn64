@@ -539,9 +539,44 @@ int main(int argc, char **argv) {
                  * DMA-start notification is explicitly NOT sufficient
                  * evidence, because a started transfer need not complete
                  * with the geometry it started with. */
-                if (pi_prev.len)
+                if (pi_prev.len) {
                     emit_hl_pi_dma(out, ordinal++, "pi_dma_loads", pi_prev.cart_addr,
                                    pi_prev.dram_addr, pi_prev.len);
+                } else {
+                    /* LOUD TRAP, and it fires on every real ROM.
+                     *
+                     * read_pi_regs() in mupen64plus-core returns 0x7F
+                     * UNCONDITIONALLY for PI_WR_LEN_REG and PI_RD_LEN_REG
+                     * (pi_controller.c) -- faithful N64 behaviour, those
+                     * registers genuinely read back 0x7F on hardware. So the
+                     * transfer length is not recoverable through the public
+                     * debugger memory-read path AT ANY TIME. Cart and DRAM
+                     * addresses are readable; length is not.
+                     *
+                     * Measured on NW4E: 6,735 PI DMA edges in 20M steps, every
+                     * one with an unreadable length and a real cart address
+                     * (0x10101000, 0x116f6f10, ...).
+                     *
+                     * Emitting nothing here would produce a valid, empty,
+                     * entirely misleading observation stream -- the exact
+                     * silent shrug AGENTS.md forbids. Abort by name instead.
+                     * The fix is a core-side patch emitting from
+                     * dma_pi_read/dma_pi_write, where all three operands are
+                     * in hand; see the PR discussion. */
+                    fprintf(stderr,
+                            "FATAL: PI DMA at cart 0x%08x -> dram 0x%08x has an unreadable "
+                            "length (read_pi_regs returns 0x7F unconditionally). The debugger "
+                            "path cannot produce a complete PiDmaCompleted record; a core-side "
+                            "emitter is required. Refusing to write a misleadingly empty "
+                            "trace.\n",
+                            pi_prev.cart_addr, pi_prev.dram_addr);
+                    emit_hl_end(out, ordinal,
+                                "{\"reason\":\"producer_abort\",\"detail\":"
+                                "\"pi dma length unreadable via debugger path\"}",
+                                recorded, 0);
+                    fclose(out);
+                    _exit(3);
+                }
             } else {
                 emit_event(out, ordinal++, "dma_complete", "pi", cycle, pi_prev.cart_addr,
                            pi_prev.len);
@@ -555,9 +590,11 @@ int main(int argc, char **argv) {
         int si_busy = (si_status & SI_STATUS_DMA_BUSY) != 0;
         if (si_busy && !si_prev.busy) {
             si_prev.dram_addr = DebugMemRead32(SI_DRAM_ADDR);
-            emit_event(out, ordinal++, "dma_start", "si", cycle, si_prev.dram_addr, 0);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_start", "si", cycle, si_prev.dram_addr, 0);
         } else if (!si_busy && si_prev.busy) {
-            emit_event(out, ordinal++, "dma_complete", "si", cycle, si_prev.dram_addr, 0);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_complete", "si", cycle, si_prev.dram_addr, 0);
         }
         si_prev.busy = si_busy;
 
@@ -567,9 +604,11 @@ int main(int argc, char **argv) {
         if (ai_busy && !ai_prev.busy) {
             ai_prev.dram_addr = DebugMemRead32(AI_DRAM_ADDR);
             ai_prev.len = DebugMemRead32(AI_LEN);
-            emit_event(out, ordinal++, "dma_start", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_start", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
         } else if (!ai_busy && ai_prev.busy) {
-            emit_event(out, ordinal++, "dma_complete", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "dma_complete", "ai", cycle, ai_prev.dram_addr, ai_prev.len);
         }
         ai_prev.busy = ai_busy;
 
@@ -579,9 +618,11 @@ int main(int argc, char **argv) {
         uint32_t acked = mi_prev & ~mi_now;
         for (uint32_t bit = 0x01; bit <= 0x20; bit <<= 1) {
             if (raised & bit)
-                emit_event(out, ordinal++, "mi_raise", "mi", cycle, bit, 0);
+                if (!bundle_sha256)
+                    emit_event(out, ordinal++, "mi_raise", "mi", cycle, bit, 0);
             if (acked & bit)
-                emit_event(out, ordinal++, "mi_ack", "mi", cycle, bit, 0);
+                if (!bundle_sha256)
+                    emit_event(out, ordinal++, "mi_ack", "mi", cycle, bit, 0);
         }
         mi_prev = mi_now;
 
@@ -590,7 +631,8 @@ int main(int argc, char **argv) {
          * moves on VI's own clock, not per R4300 step. ---- */
         uint32_t vi_now = DebugMemRead32(VI_CURRENT);
         if (vi_now < vi_prev)
-            emit_event(out, ordinal++, "vi_retrace", "vi", cycle, 0, 0);
+            if (!bundle_sha256)
+                emit_event(out, ordinal++, "vi_retrace", "vi", cycle, 0, 0);
         vi_prev = vi_now;
 
         recorded++;
