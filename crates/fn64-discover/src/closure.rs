@@ -86,8 +86,18 @@ pub enum DestinationReason {
     /// exists but was not admitted to CFG closure.
     BoundedIndirectSite,
     /// A concrete destination VA that is mapped in some bank but whose word is
-    /// not proven code (mapped-but-not-proven-executable).
+    /// not proven code (mapped-but-not-proven-executable). The word was never
+    /// proven either way -- unknown, or only a candidate.
     MappedNotProvenCode,
+    /// A concrete destination VA the CFG PROVED is code, which block proof
+    /// nonetheless declined to admit as a block.
+    ///
+    /// Same class as [`Self::MappedNotProvenCode`] -- the interpreter covers
+    /// both -- but a very different finding: this one is a block-admission
+    /// refusal to audit, not a word that failed to decode. Folding the two
+    /// together read as "discovery could not tell what this is" when discovery
+    /// had in fact already proven it was code.
+    ProvenCodeNoOwner,
     /// A concrete destination VA that lands on proven data.
     IntoProvenData,
     /// A concrete destination VA outside every known bank mapping.
@@ -101,7 +111,8 @@ impl DestinationReason {
             DestinationReason::InProvenBlock => DestinationClass::BlockAot,
             DestinationReason::OpenIndirectSite
             | DestinationReason::BoundedIndirectSite
-            | DestinationReason::MappedNotProvenCode => DestinationClass::DynamicMips,
+            | DestinationReason::MappedNotProvenCode
+            | DestinationReason::ProvenCodeNoOwner => DestinationClass::DynamicMips,
             DestinationReason::IntoProvenData | DestinationReason::OutsideAllMappings => {
                 DestinationClass::Unsupported
             }
@@ -279,6 +290,7 @@ impl ProgramGeometry {
             Some(WordClass::ProvenData) | Some(WordClass::Conflict) => {
                 DestinationReason::IntoProvenData
             }
+            Some(WordClass::ProvenCode) => DestinationReason::ProvenCodeNoOwner,
             _ => DestinationReason::MappedNotProvenCode,
         }
     }
@@ -447,6 +459,7 @@ fn reason_label(reason: DestinationReason) -> &'static str {
         DestinationReason::OpenIndirectSite => "open_indirect_site",
         DestinationReason::BoundedIndirectSite => "bounded_indirect_site",
         DestinationReason::MappedNotProvenCode => "mapped_not_proven_code",
+        DestinationReason::ProvenCodeNoOwner => "proven_code_no_owner",
         DestinationReason::IntoProvenData => "into_proven_data",
         DestinationReason::OutsideAllMappings => "outside_all_mappings",
     }
@@ -629,6 +642,64 @@ mod tests {
         assert!(
             board.tally(DestinationClass::BlockAot).destinations >= 1,
             "the branch target is a proven reachable block: {board:?}"
+        );
+    }
+
+    #[test]
+    fn proven_code_outside_every_admitted_block_gets_its_own_label() {
+        // A word the CFG PROVED is code, which block proof nonetheless did not
+        // admit. It used to fall into the catch-all arm and be reported as
+        // `mapped_not_proven_code` -- indistinguishable from a word that never
+        // decoded -- so a block-admission refusal read as a decoding failure.
+        let geometry = ProgramGeometry {
+            owners: Vec::new(),
+            blocks: Vec::new(),
+            mapped: vec![MappedVaRange {
+                start: BASE,
+                end: BASE + 0x100,
+            }],
+            word_class: BTreeMap::from([
+                (BASE, WordClass::ProvenCode),
+                (BASE + 4, WordClass::CandidateCode),
+                (BASE + 8, WordClass::Unknown),
+                (BASE + 12, WordClass::ProvenData),
+                (BASE + 16, WordClass::Conflict),
+            ]),
+        };
+
+        assert_eq!(
+            geometry.classify_concrete(BASE),
+            DestinationReason::ProvenCodeNoOwner
+        );
+        for va in [BASE + 4, BASE + 8] {
+            assert_eq!(
+                geometry.classify_concrete(va),
+                DestinationReason::MappedNotProvenCode,
+                "unproven words keep the original label: {va:#010x}"
+            );
+        }
+        for va in [BASE + 12, BASE + 16] {
+            assert_eq!(
+                geometry.classify_concrete(va),
+                DestinationReason::IntoProvenData,
+                "proven data and conflicts are unchanged: {va:#010x}"
+            );
+        }
+        // A word never visited at all is absent from the map entirely.
+        assert_eq!(
+            geometry.classify_concrete(BASE + 0x20),
+            DestinationReason::MappedNotProvenCode
+        );
+
+        // Labelling split only: the class -- and therefore every headline
+        // count -- is unchanged.
+        assert_eq!(
+            DestinationReason::ProvenCodeNoOwner.class(),
+            DestinationReason::MappedNotProvenCode.class()
+        );
+        assert_eq!(
+            DestinationReason::ProvenCodeNoOwner.class(),
+            DestinationClass::DynamicMips
         );
     }
 

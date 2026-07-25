@@ -86,7 +86,7 @@ That promotion has several pieces, being landed incrementally:
   (`crates/fn64-recomp-rs/src/interp.rs`) now raises `break`/`syscall` and the
   twelve conditional traps as architectural exceptions, matching the AOT lane
   word-for-word. This stopped being deferrable once a whole-ROM compose showed
-  ~12k destinations (`dynamic_mips` / `mapped_not_proven_code`) reaching the
+  ~12k destinations (`dynamic_mips`, 96% of it `proven_code_no_owner`) reaching the
   interpreter fallback. COP2 words remain a deliberate loud fault: COP2 is the
   RSP vector unit, not CPU-accessible on N64, and the AOT lane traps it too.
 - **Whole-ROM `BlockProgram` emitter (open).** `emit_block_program_source`

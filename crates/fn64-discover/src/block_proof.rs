@@ -28,6 +28,51 @@ pub enum BlockProofBlocker {
     MultipleRomBackings,
 }
 
+impl BlockProofBlocker {
+    /// The blocker's kind, without its per-site payload, for histogramming
+    /// why block proof refused across a whole program.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AnalysisBankMismatch => "analysis_bank_mismatch",
+            Self::Unowned => "unowned",
+            Self::AmbiguousOwners { .. } => "ambiguous_owners",
+            Self::EntryNotAuthoritative { .. } => "entry_not_authoritative",
+            Self::InvalidGeometry => "invalid_geometry",
+            Self::WordNotProvenCode { .. } => "word_not_proven_code",
+            Self::InvalidInstruction { .. } => "invalid_instruction",
+            Self::MissingDelaySlot { .. } => "missing_delay_slot",
+            Self::RanOffEnd => "ran_off_end",
+            Self::MissingRomBacking => "missing_rom_backing",
+            Self::MultipleRomBackings => "multiple_rom_backings",
+        }
+    }
+}
+
+/// Count block-proof refusals by blocker kind across every bank of every
+/// composed snapshot.
+///
+/// One candidate block can carry several blockers; each is counted, so the
+/// total exceeds the refused-block count. That is the useful shape: the
+/// question this answers is "which refusal reasons dominate", not "how many
+/// blocks were refused" (which `proven_blocks` already bounds).
+pub fn blocker_histogram(
+    snapshots: &[crate::snapshot::ProgramSnapshotV1],
+) -> BTreeMap<&'static str, u64> {
+    let mut histogram = BTreeMap::new();
+    for snapshot in snapshots {
+        for bank in &snapshot.banks {
+            for assessment in &bank.block_proof.assessments {
+                if let BlockAssessment::Candidate { blockers, .. } = assessment {
+                    for blocker in blockers {
+                        *histogram.entry(blocker.kind()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    histogram
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReachableCodeBlock {
     pub bank: String,
