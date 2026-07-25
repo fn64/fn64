@@ -552,6 +552,11 @@ pub enum DiscoveryStrategy {
     /// Mechanically recovered overlay descriptor table addressing physical
     /// ROM (AKI-class).
     RecoveredOverlays,
+    /// Load addresses inferred from `jal` statistics with NO table of any kind
+    /// ([`delta_vote::sweep_untabled_regions`]). Weakest evidence class here and
+    /// the only one that concludes `Supported` rather than `Proven`; selected
+    /// only when nothing with an independent table corroborated.
+    UntabledDeltaVote,
 }
 
 impl DiscoveryStrategy {
@@ -560,6 +565,7 @@ impl DiscoveryStrategy {
             Self::BootBankOnly => "boot_bank_only",
             Self::RecoveredVrom => "recovered_vrom",
             Self::RecoveredOverlays => "recovered_overlays",
+            Self::UntabledDeltaVote => "untabled_delta_vote",
         }
     }
 }
@@ -576,6 +582,10 @@ pub struct StrategyOutcome {
     /// Proven `RomMapping` facts the strategy's database ended with, including
     /// the boot bank every strategy establishes.
     pub proven_mappings: usize,
+    /// Mappings concluded at `Supported` rather than `Proven`. Only the
+    /// untabled delta-vote strategy produces these; kept in a separate field so
+    /// an inferred mapping can never be counted as a corroborated one.
+    pub supported_mappings: usize,
 }
 
 /// The result of trying every mechanical composition strategy against one ROM.
@@ -619,6 +629,7 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
         admitted_tables: 0,
         admitted_intervals: 0,
         proven_mappings: baseline_mappings,
+        supported_mappings: 0,
     }];
     let mut best: Option<(DiscoveryStrategy, FactDb, usize)> = None;
 
@@ -645,6 +656,7 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
             .count(),
         admitted_intervals: vrom_recovery.admitted_intervals().len(),
         proven_mappings: vrom_mappings,
+        supported_mappings: 0,
     });
     if vrom_mappings > baseline_mappings {
         best = Some((DiscoveryStrategy::RecoveredVrom, vrom_db, vrom_mappings));
@@ -671,6 +683,7 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
             .count(),
         admitted_intervals: overlay_recovery.admitted_intervals().len(),
         proven_mappings: overlay_mappings,
+        supported_mappings: 0,
     });
     if overlay_mappings > baseline_mappings
         && best
@@ -682,6 +695,76 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
             overlay_db,
             overlay_mappings,
         ));
+    }
+
+    // Last resort: infer load addresses from the instruction encoding itself.
+    //
+    // Every strategy above recognises a STRUCTURE and is bound to the engine
+    // families whose structure it knows; measured, six of twelve corpus ROMs
+    // find zero candidate tables of either family. A `jal` carries an ABSOLUTE
+    // target, so a blob of code states in its own bytes where it expects to run,
+    // which is a property of MIPS encoding rather than of any engine.
+    //
+    // Concluded `Supported`, never `Proven`: delta_vote's own outcome type calls
+    // an admitted delta a candidate mapping, and instruction bytes do not prove
+    // a region is reachable, resident, or ever loaded. Ordering it last is the
+    // guarantee that an inferred mapping never displaces a corroborated one.
+    if best.is_none() {
+        let (_, mut untabled_db) = run_discovery(rom_bytes, None)?;
+        let regions = delta_vote::sweep_untabled_regions(
+            &rom.bytes,
+            &delta_vote::UntabledSweepConfig::default(),
+        );
+        for (index, region) in regions.iter().enumerate() {
+            let bank = format!("untabled_region_{index}");
+            let mapping = untabled_db.insert(Fact::RomMapping {
+                bank: bank.clone(),
+                rom_space: RomAddressSpace::Physical,
+                rom_start: region.rom_start,
+                rom_end: region.rom_end,
+                va_start: region.va_start,
+                va_end: region
+                    .va_start
+                    .wrapping_add(region.rom_end - region.rom_start),
+            });
+            let evidence = untabled_db.insert(Fact::Evidence {
+                subject: facts::BankAddr::new(&bank, region.va_start),
+                note: format!(
+                    "load address inferred from jal statistics with no table: ROM \
+                     0x{:x}..0x{:x} -> VA 0x{:x} (delta 0x{:x}), agreed by {} independent \
+                     window(s). Supported, not Proven -- instruction bytes do not prove the \
+                     region is reachable, resident, or ever loaded.",
+                    region.rom_start,
+                    region.rom_end,
+                    region.va_start,
+                    region.delta,
+                    region.windows,
+                ),
+            });
+            untabled_db
+                .conclude(
+                    format!("bank:{bank}"),
+                    facts::ProofState::Supported,
+                    vec![mapping, evidence],
+                    "untabled_delta_vote",
+                )
+                .expect("untabled region bank names are freshly generated");
+        }
+        outcomes.push(StrategyOutcome {
+            strategy: DiscoveryStrategy::UntabledDeltaVote,
+            candidate_tables: 0,
+            admitted_tables: 0,
+            admitted_intervals: regions.len(),
+            proven_mappings: untabled_db.proven_rom_mappings().len(),
+            supported_mappings: regions.len(),
+        });
+        if !regions.is_empty() {
+            best = Some((
+                DiscoveryStrategy::UntabledDeltaVote,
+                untabled_db,
+                baseline_mappings,
+            ));
+        }
     }
 
     let (selected, facts) = match best {
@@ -761,6 +844,7 @@ mod tests {
                 DiscoveryStrategy::BootBankOnly,
                 DiscoveryStrategy::RecoveredVrom,
                 DiscoveryStrategy::RecoveredOverlays,
+                DiscoveryStrategy::UntabledDeltaVote,
             ],
             "every strategy attempted must report an outcome, in evaluation order"
         );

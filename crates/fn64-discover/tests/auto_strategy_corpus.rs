@@ -11,6 +11,34 @@
 
 use fn64_discover::{run_discovery_auto, DiscoveryStrategy, StrategyOutcome};
 
+/// A ROM with no table of either family still yields geometry, inferred from
+/// `jal` statistics -- and it is admitted at Supported, never Proven.
+#[test]
+fn a_rom_with_no_table_falls_back_to_inferred_geometry() {
+    let Some(bytes) = rom_bytes("FN64_DISCOVER_GE_ROM") else {
+        eprintln!("skip: FN64_DISCOVER_GE_ROM unset");
+        return;
+    };
+    let auto = run_discovery_auto(&bytes).expect("GoldenEye normalizes");
+
+    // Neither table family finds anything here; that is the precondition.
+    for strategy in [
+        DiscoveryStrategy::RecoveredVrom,
+        DiscoveryStrategy::RecoveredOverlays,
+    ] {
+        assert_eq!(outcome(&auto.outcomes, strategy).admitted_tables, 0);
+    }
+    assert_eq!(auto.selected, DiscoveryStrategy::UntabledDeltaVote);
+
+    let inferred = outcome(&auto.outcomes, DiscoveryStrategy::UntabledDeltaVote);
+    assert!(inferred.supported_mappings > 0, "no region was inferred");
+    // The whole point of the evidence class: inferred geometry is never proven.
+    assert_eq!(
+        inferred.proven_mappings, 1,
+        "only the boot bank may be proven; inferred regions must stay Supported"
+    );
+}
+
 fn rom_bytes(var: &str) -> Option<Vec<u8>> {
     let path = std::env::var_os(var)?;
     Some(std::fs::read(&path).unwrap_or_else(|error| {
