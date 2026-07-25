@@ -14,7 +14,10 @@
 //! Honest scope: this is a STATIC reachability scoreboard from proven roots. It
 //! measures what discovery has CLOSED, not a live run. Destinations reachable
 //! only at runtime surface as `dynamic_mips` (open indirects) or are simply
-//! never reached; nothing here claims runtime closure. See CLOSURE_EVIDENCE.md.
+//! never reached; nothing here claims runtime closure. The honest-scope
+//! argument for that distinction lives in `crate::closure`'s module doc.
+//! (This line previously cited docs/CLOSURE_EVIDENCE.md, which does not
+//! exist and never has.)
 //!
 //! Grading (held-out): where a ROM dump is supplied it is opened ONLY AFTER
 //! classification, and used solely to reject a bug — an `exact_aot`/`block_aot`

@@ -184,6 +184,7 @@ pub mod overlay_regions;
 pub mod overlay_reloc;
 pub mod owner_proof;
 pub mod partition;
+pub mod ledger;
 pub mod pi_dma;
 pub mod probe;
 pub mod regions;
