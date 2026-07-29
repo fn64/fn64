@@ -274,6 +274,11 @@ lie in `__osException`; the former includes a six-target switch at
 `0x8000390c`. This is evidence that Ghidra can expose code outside fn64's
 current reachable closure, not authority to seed those functions.
 
+For first-contact review, `join-review-computed-flows.py` joins a review
+inventory to a schema-v3 computed-flow stream by function body ranges. Its
+output remains candidate-only and reports disconnected sites and targets
+without mutating native CFG or ownership facts.
+
 ## Snapshot-bound production ingestion
 
 Build `ingest_tool_claims`, then run it under the memory guard with an absolute,
