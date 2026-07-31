@@ -54,7 +54,9 @@ the related discovery tests; `scripts/{wm2000-static-frontier.zsh,current-static
 and the corresponding discovery, scorecard, and fast-loop documentation.
 
 **STATE:** Half-done. The fixed point emits, compiles, and probes five banks.
-**Exact next step:** run the frozen-pair 100,000-instruction exact-entry A/B.
+The exact-entry A/B reached the same 100,001-instruction horizon but failed its
+continuation comparison. **Exact next step:** expose and diff the pending exit
+and prepared continuation at publication.
 
 **VERIFICATION:** The 30-test delay suite and generated-runner direct-entry
 regression each passed 10/10
@@ -365,8 +367,9 @@ plus the corresponding design, fast-loop, and WM boot notes.
 **STATE:** Half-done. One canonical static `(bank, PC)` can be withheld for one
 attempt, dynamic work is charged per attempt, and telemetry v2 binds the
 program and resolver-install identities. Publication digest v2 ignores only
-valid slice partitioning. **Exact next step:** complete the real-ROM
-100,000-instruction exact-entry pair and compare its publication diagnostics.
+valid slice partitioning. One real-ROM diagnostic entered the exact withheld
+key dynamically, but the continuation digest differed. **Exact next step:**
+expose and diff the pending exit and prepared continuation at publication.
 
 **VERIFICATION:** Four focused ABI tests passed 10/10, and the publication-v2
 focused gate passed 10/10. The current pair-builder and comparator wrapper
@@ -375,11 +378,12 @@ self-tests passed 10/10 together after the schema migration. The current
 `fn64-boot-harness` suite passed 281 tests once. The dynamic mapped-source
 receipt inventory test passed 10/10. The earlier whole-shard wrapper form
 passed 10/10 but does not certify exact-entry selection
-([FAST-LOOP.md:458](FAST-LOOP.md#L458)). The real-ROM exact-entry comparison did
-not run. Pair attempt 14 completed its source check and AOT build, with peaks
-of 1,462 MiB and 1,451 MiB respectively; its dynamic build was interrupted on
-request before it produced a dynamic binary or receipt
-(`/private/tmp/fn64-wm-exact-entry-pair-20260731-14`).
+([FAST-LOOP.md:458](FAST-LOOP.md#L458)). The real-ROM exact-entry comparison ran
+once; this does not meet the deterministic bar. Pair attempt 17 produced a v4
+receipt after seeding from the completed attempt-16 Cargo cache. AOT built in
+33 seconds at 755 MiB peak tree RSS and dynamic-withheld in 32 seconds at 751
+MiB. The pair receipt is
+`/private/tmp/fn64-wm-exact-entry-pair-20260731-17/receipt.json`.
 
 **FRONTIER:** Prior whole-shard runs at
 `/private/tmp/fn64-wm-withheld-diff-catalog-fp-20260731-4.10uqUL` and
@@ -388,6 +392,15 @@ request before it produced a dynamic binary or receipt
 digests, but neither withheld shard was entered. CPU and continuation digests
 differed, so those runs are not dynamic-execution parity evidence
 ([BOOT-NOTES-WM2000.md:1476](BOOT-NOTES-WM2000.md#L1476)).
+The attempt-17 exact-entry diagnostic at
+`/private/tmp/fn64-wm-exact-entry-diff-20260731-17` reached 100,001 charged
+instructions in both lanes. The exact withheld key
+`81bf2e27273b27db:80000400` executed dynamically once for one instruction with
+zero unsupported exits. Logical RDRAM, CPU, device, executor, ABI-host, and
+simulation time matched. Continuation did not; scheduler steps were 33,333 AOT
+versus 25 dynamic, and the comparison failed. The evidence trail is
+`comparison.json`, `dynamic-telemetry.json`, `aot.log`, and `dynamic.log` in
+that directory. This single diagnostic is not a fixed or parity claim.
 
 **COMMIT SAFETY:** Not safe alone in the present diff. ABI redirect semantics,
 boot-harness wire v2, WM telemetry, build receipt, and comparator schema must

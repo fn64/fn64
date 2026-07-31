@@ -1513,9 +1513,24 @@ line and comparator additionally bind `resolver_install_sha256`. Publication
 digest v2 removes dispatch-slice partition noise without dropping hardware
 authority: it omits the context's stale Count/Compare and host-driven Cause
 mirrors only because the separately required executor/device/ABI digests own
-those values, and it rejects any pending Count/Compare write. The real-ROM
-100,000-instruction A/B rerun under this exact-entry mechanism remains pending,
-as does any all-component parity claim.
+those values, and it rejects any pending Count/Compare write.
+
+The attempt-17 v4 pair was seeded from the completed attempt-16 Cargo cache.
+Its AOT build completed in 33 seconds at 755 MiB peak tree RSS, and its dynamic
+build completed in 32 seconds at 751 MiB. The receipt is retained privately at
+`/private/tmp/fn64-wm-exact-entry-pair-20260731-17/receipt.json`.
+
+One real-ROM 100,000-instruction diagnostic then reached 100,001 charged
+instructions in both lanes. The exact withheld key
+`81bf2e27273b27db:80000400` ran dynamically once, charged one instruction, and
+reported zero unsupported exits. Full logical RDRAM, CPU, device, executor,
+ABI-host, and simulation time matched. Continuation digests differed, and the
+AOT lane took 33,333 scheduler steps while the dynamic lane took 25, so the v2
+comparison failed. Its private evidence is
+`/private/tmp/fn64-wm-exact-entry-diff-20260731-17/comparison.json`,
+`dynamic-telemetry.json`, `aot.log`, and `dynamic.log`. This is one diagnostic,
+not a fixed or parity claim. The exact next step is to expose and diff the
+pending exit and prepared continuation at publication.
 
 Profiling gained `FN64_PROFILE_STOP_AT_PC` self-enablement (it no longer needs a
 second AOT profiling flag), FCSR in watched-PC snapshots, and
