@@ -8771,6 +8771,7 @@ unsafe fn boot_thread0_catalog_live_v1(
                 let mut ctx = RsContext::new();
                 ctx.restore_boot_context(&boot_context)
                     .unwrap_or_else(|error| panic!("restoring catalog BootContext: {error}"));
+                validate_restored_catalog_boot_context(entry, &boot_context, &ctx);
                 ctx.set_thread_return_pc(Some(boot_return_pc));
                 run_catalog_block_program(live.as_ref(), entry, &mut ctx, &mut mem);
             });
@@ -8803,6 +8804,25 @@ fn validate_block_boot_context(entry: GuestPc, boot_context: &BootContext) {
             "block-lane BootContext TV standard does not match the configured device fabric"
         );
     });
+}
+
+fn validate_restored_catalog_boot_context(
+    entry: ExecutionKey,
+    boot_context: &BootContext,
+    ctx: &RsContext,
+) {
+    assert_eq!(
+        entry.pc.get(),
+        boot_context.entry_pc,
+        "catalog dispatch entry differs from the validated BootContext entry"
+    );
+    let mismatches = ctx
+        .boot_context_state_mismatches(boot_context)
+        .expect("validating restored catalog BootContext");
+    assert!(
+        mismatches.is_empty(),
+        "catalog context differs from BootContext before first unified dispatch: {mismatches:?}"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14455,6 +14475,42 @@ mod tests {
             lo,
             cp0: BootCop0Context { registers: cp0 },
         }
+    }
+
+    #[test]
+    fn catalog_boot_context_is_checked_before_unified_dispatch() {
+        let entry = ExecutionKey::new(INSTALL_BANK, INSTALL_PC);
+        let boot_context = test_boot_context(INSTALL_PC);
+        let mut ctx = RsContext::new();
+        ctx.restore_boot_context(&boot_context).unwrap();
+        validate_restored_catalog_boot_context(entry, &boot_context, &ctx);
+
+        ctx.set_r32(20, 1);
+        let state_failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_restored_catalog_boot_context(entry, &boot_context, &ctx);
+        }))
+        .expect_err("a mismatched restored boot register reached unified dispatch");
+        let state_failure = state_failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| state_failure.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(state_failure.contains("before first unified dispatch"));
+
+        let entry_failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_restored_catalog_boot_context(
+                ExecutionKey::new(INSTALL_BANK, GuestPc::new(INSTALL_PC.get() + 4)),
+                &boot_context,
+                &RsContext::new(),
+            );
+        }))
+        .expect_err("a non-BootContext entry reached first unified dispatch");
+        let entry_failure = entry_failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| entry_failure.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(entry_failure.contains("dispatch entry differs"));
     }
 
     const LIVE_BANK: BankId = BankId::new(0xA11CE);

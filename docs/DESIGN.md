@@ -1119,6 +1119,12 @@ interrupt boundary. The v2 telemetry proof belongs to that individual attempt:
 it names the entry, requires positive `charged_instructions`, and requires zero
 `unsupported_exits`. Aggregate identity totals cannot prove the selected
 attempt.
+Immediately before the first unified dispatch, the catalog boot seam also
+requires the dispatch PC to equal the validated `BootContext` entry and the
+restored CPU projection to match that context. The ordinary AOT lane repeats
+that check at its first generated-bank call. Exact-entry withholding does not:
+its first static call is the post-instruction resume, so the per-attempt dynamic
+telemetry is the applicable first-entry evidence.
 `FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY=1` enables this mode;
 `fn64.wm2000.dynamic-withheld-telemetry.v2` records the selected bank/PC,
 selection basis, per-attempt result, dynamic identities, and the unchanged
@@ -1126,7 +1132,14 @@ program and resolver-install identities. The identity line and comparator bind
 `resolver_install_sha256` alongside the program digest. This replaces
 whole-shard withholding, which
 could miss an unvisited shard and therefore fail to exercise the mechanism.
-The real-ROM 100,000-instruction exact-entry comparison remains pending.
+One 100,000-instruction real-ROM diagnostic reached 100,001 charged
+instructions in both lanes. The exact withheld key
+`(0x81bf2e27273b27db, 0x80000400)` executed dynamically once for one instruction
+with zero unsupported exits. Logical RDRAM, CPU, device, executor, ABI-host,
+and simulation time matched, but continuation digests did not; scheduler steps
+were 33,333 AOT versus 25 dynamic. The comparison therefore failed. This
+single diagnostic is not a parity or fixed claim. The exact next step is to
+expose and diff the pending exit and prepared continuation at publication.
 
 Provenance of the removal: `crates/fn64-diff` once carried a subprocess client
 for the *faki-tools* `oracle` CLI plus a mupen64plus `.m64p` savestate parser,

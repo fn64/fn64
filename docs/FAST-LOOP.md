@@ -401,6 +401,12 @@ The comparator accepts retained v3 receipts under their exact legacy field set
 and v4 receipts under the smaller exact field set; fields cannot be mixed
 between versions.
 
+The retained attempt-17 v4 pair, seeded from the completed attempt-16 Cargo
+cache, built AOT in 33 seconds at 755 MiB peak tree RSS and dynamic-withheld in
+32 seconds at 751 MiB. Its receipt is
+`/private/tmp/fn64-wm-exact-entry-pair-20260731-17/receipt.json`; this is one
+private build measurement, not a repeat-count performance result.
+
 After an interrupted or failed attempt, seed a new immutable attempt from its
 retained private Cargo target:
 
@@ -460,13 +466,21 @@ continuation. A one-instruction final slice may retire a straight instruction,
 while an indivisible branch/delay pair fails loudly and produces no comparison
 receipt. Exercise both wrappers without private inputs using
 `scripts/test-build-wm2000-withheld-pair.zsh` and
-`scripts/test-wm2000-withheld-rdram-diff.zsh`. Their earlier whole-shard forms
-passed 10/10 consecutive runs on 2026-07-31; the exact-entry wrapper contract
-must be rerun after this environment/schema migration. The canonical ABI
+`scripts/test-wm2000-withheld-rdram-diff.zsh`. The current exact-entry builder
+and comparator wrapper contracts passed 10/10 consecutive runs after the
+schema migration on 2026-07-31. The canonical ABI
 publication and boot-harness digest suites independently passed the
 deterministic bar.
-The exact-entry real-ROM comparison at 100,000 charged instructions has not yet
-run, so these contracts are mechanism evidence rather than a WM parity result.
+One real-ROM diagnostic reached 100,001 charged instructions in both lanes.
+The exact withheld key `(0x81bf2e27273b27db, 0x80000400)` executed dynamically
+once for one instruction with zero unsupported exits. RDRAM, CPU, device,
+executor, ABI-host, and simulation time matched; continuation did not, and the
+AOT/dynamic scheduler step counts were 33,333/25. The v2 comparison therefore
+failed. Evidence is retained at
+`/private/tmp/fn64-wm-exact-entry-diff-20260731-17/{comparison.json,dynamic-telemetry.json,aot.log,dynamic.log}`.
+This is one diagnostic only, not a fixed or parity claim. The exact next step
+is to expose and diff the pending exit and prepared continuation at
+publication.
 
 For a ROM-bearing static-recompilation checkpoint, aggregate the gate-owned
 receipts without rerunning discovery or Cargo:
