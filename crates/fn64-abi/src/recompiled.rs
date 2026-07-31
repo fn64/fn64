@@ -9610,29 +9610,19 @@ fn dispatch_unified_catalog_slice(
                 }
                 UnifiedCatalogCallV1::Guest(next) => target = next,
             },
-            BlockExit::ExecutableWrite {
-                source_bank,
-                resume,
-            } => {
-                target = resolve_unified_catalog_target(live, source_bank, resume.pc, mem)?;
+            exit @ (BlockExit::ExecutableWrite { .. }
+            | BlockExit::ExecutableWriteResolveCall { .. }) => {
+                // Interleaving closed: the writer mutates executable bytes,
+                // publishes and suspends, another runnable guest thread may
+                // run, then the writer resumes and resolves the new image.
+                // Resolving here would collapse both sides of that scheduler
+                // boundary into one unified slice.
+                return Ok(fn64_recomp_rs::DispatchRun {
+                    exit,
+                    instructions,
+                    blocks,
+                });
             }
-            BlockExit::ExecutableWriteResolveCall {
-                source_bank,
-                target_pc,
-                resume,
-            } => match resolve_unified_catalog_call(live, source_bank, target_pc, mem)? {
-                UnifiedCatalogCallV1::Host => {
-                    return Ok(fn64_recomp_rs::DispatchRun {
-                        exit: BlockExit::HostCall {
-                            vram: target_pc,
-                            resume,
-                        },
-                        instructions,
-                        blocks,
-                    });
-                }
-                UnifiedCatalogCallV1::Guest(next) => target = next,
-            },
             BlockExit::ImageChanged { at, .. }
             | BlockExit::Fault(CpuFault {
                 at,
@@ -10785,6 +10775,30 @@ mod tests {
         assert_eq!(entry.pc, static_resume);
         ctx.set_r32(3, ctx.r_u32(3).wrapping_add(1) as i32);
         BlockRun::new(BlockExit::Yield(entry), 1)
+    }
+
+    #[cfg(feature = "dynamic-mapped-runtime")]
+    fn unified_executable_write_boundary_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        ctx: &mut RsContext,
+        _mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        let resume = GuestPc::new(INSTALL_PC.get() + 4);
+        match entry.pc {
+            INSTALL_PC => BlockRun::new(
+                BlockExit::ExecutableWrite {
+                    source_bank: entry.bank,
+                    resume: ExecutionKey::new(entry.bank, resume),
+                },
+                1,
+            ),
+            pc if pc == resume => {
+                ctx.set_r32(2, ctx.r_u32(2).wrapping_add(1) as i32);
+                BlockRun::new(BlockExit::ThreadReturn, 1)
+            }
+            pc => panic!("unexpected unified executable-write test PC {pc}"),
+        }
     }
 
     #[cfg(feature = "dynamic-mapped-runtime")]
@@ -14063,6 +14077,76 @@ mod tests {
             mem.load_w(0xffff_ffff_0000_0000 | u64::from(target_pc.get())) as u32,
             replacement_jump
         );
+    }
+
+    #[cfg(feature = "dynamic-mapped-runtime")]
+    #[test]
+    fn canonical_unified_executable_write_publishes_before_continuation() {
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = super::super::HostState::default());
+        let bank = BankId::new(0xca82);
+        let entry = ExecutionKey::new(bank, INSTALL_PC);
+        let resume = ExecutionKey::new(bank, GuestPc::new(INSTALL_PC.get() + 4));
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(bank, INSTALL_PC, vec![0, 0]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    bank,
+                    unified_executable_write_boundary_runner,
+                    ProgramArtifactIdentity::new([0x82; 32]),
+                ),
+            )
+            .unwrap();
+        let install = CatalogResolverInstallV1::new(
+            CatalogBlockProgramV1::new(program, entry, InstructionBudget::new(8).unwrap()).unwrap(),
+            HostFunctionCatalogV1::new(Vec::new()).unwrap(),
+            ProgramArtifactIdentity::new([0xe2; 32]),
+        );
+        let mut storage = vec![0; 0x8000];
+        let thread_id = 0xca82;
+
+        // SAFETY: `storage` remains live until the installed thread returns.
+        unsafe {
+            boot_thread0_catalog_program_with_dynamic_mapped_v1(
+                storage.as_mut_ptr(),
+                storage.len(),
+                install,
+                test_boot_context(INSTALL_PC),
+                thread_id,
+                10,
+            );
+        }
+
+        assert!(crate::run_one_step());
+        let publications = copy_canonical_thread_publications_v1();
+        let [CanonicalThreadPublicationV1::Exact(write)] = publications.as_slice() else {
+            panic!("expected executable-write publication: {publications:?}");
+        };
+        assert_eq!(
+            write.pending_exit,
+            BlockExit::ExecutableWrite {
+                source_bank: bank,
+                resume,
+            }
+        );
+        assert_eq!(write.charged_instructions, 1);
+        assert_eq!(
+            write.cpu.gprs[2], 0,
+            "continuation crossed the write boundary"
+        );
+        assert!(!crate::is_thread_dead(thread_id));
+
+        assert!(crate::run_one_step());
+        let publications = copy_canonical_thread_publications_v1();
+        let [CanonicalThreadPublicationV1::Exact(continuation)] = publications.as_slice() else {
+            panic!("expected resumed continuation publication: {publications:?}");
+        };
+        assert_eq!(continuation.pending_exit, BlockExit::ThreadReturn);
+        assert_eq!(continuation.charged_instructions, 1);
+        assert_eq!(continuation.cpu.gprs[2], 1);
+        crate::run_to_idle();
+        assert!(crate::is_thread_dead(thread_id));
     }
 
     #[cfg(feature = "dynamic-mapped-runtime")]

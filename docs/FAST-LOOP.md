@@ -376,7 +376,7 @@ repository.
 ### Build and compare one exactly withheld WM entry
 
 Build the pure-AOT and `dynamic-withheld` hosts from one private input set with
-one guarded, reusable Cargo target:
+two guarded, lane-isolated Cargo targets under one reusable private root:
 
 ```sh
 ROM=/absolute/private/NWXE.z64 \
@@ -394,6 +394,9 @@ one-hour-per-lane default guard. It retains distinct executables, sanitized
 logs, per-lane guard JSONL, and a path-free build-local receipt. The receipt
 binds private-input, capture-group, manifest, lock, guard, checker, and binary
 digests, but deliberately carries no release or static-discovery authority.
+The targets live at `cargo-target/aot` and
+`cargo-target/dynamic-withheld`. Keeping their Cargo fingerprints separate
+prevents either feature graph from evicting the other's freshness state.
 Receipt v4 omits the former standalone dynamic `cargo check`: the retained
 dynamic build compiles the same source and feature graph and additionally links
 the executable, while avoiding a dynamic-to-AOT-to-dynamic Cargo feature flip.
@@ -407,8 +410,16 @@ cache, built AOT in 33 seconds at 755 MiB peak tree RSS and dynamic-withheld in
 `/private/tmp/fn64-wm-exact-entry-pair-20260731-17/receipt.json`; this is one
 private build measurement, not a repeat-count performance result.
 
+Persistent-cache attempt 22 populated both lane caches in 1,354 seconds AOT
+and 1,335 seconds dynamic-withheld, peaking at 1,480 and 1,482 MiB. With no
+source or input change, attempt 25 then completed the same builds in one and
+two seconds, emitted zero shard `Compiling` lines, and produced byte-identical
+binaries. Its receipt is
+`/private/tmp/fn64-wm-exact-entry-pair-20260731-25/receipt.json`. These are one
+cold pair and one warm pair, not repeat-count performance evidence.
+
 After an interrupted or failed attempt, seed a new immutable attempt from its
-retained private Cargo target:
+retained private Cargo target root:
 
 ```sh
 FN64_WM_PAIR_CARGO_CACHE_SEED=/absolute/private/prior-attempt/cargo-target \
@@ -420,9 +431,35 @@ scripts/build-wm2000-withheld-pair.zsh \
   /absolute/private/new-wm-withheld-build
 ```
 
-The builder APFS-clones the seed into the new output and still executes both
-feature gates and both builds. The seed is recorded only as caller-provided,
-untrusted acceleration; its path and contents carry no receipt authority.
+The builder APFS-clones each lane into the matching new lane and still executes
+both feature gates and both builds. A legacy flat target is cloned into both
+lanes so older attempts remain usable. The seed is recorded only as
+caller-provided, untrusted acceleration; its path and contents carry no receipt
+authority.
+
+For repeated local iteration, keep the lane targets at stable absolute paths
+instead of relocating a copied target on every attempt:
+
+```sh
+mkdir -m 700 /absolute/private/wm-pair-cache
+FN64_WM_PAIR_CARGO_CACHE_ROOT=/absolute/private/wm-pair-cache \
+ROM=/absolute/private/NWXE.z64 \
+FN64_BOOT_CONTEXT=/absolute/private/boot-context.json \
+FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGES \
+FN64_EXECUTABLE_IMAGES=/absolute/private/image-1.json:/absolute/private/image-2.json:/absolute/private/image-3.json \
+scripts/build-wm2000-withheld-pair.zsh \
+  /absolute/private/new-wm-withheld-build
+```
+
+The cache root must be an existing non-symlink directory outside the
+repository. The builder takes an atomic cache-root lock, builds directly in
+its `aot` and `dynamic-withheld` lanes, then APFS-clones both into the fresh
+result's `cargo-target` snapshot. An interrupted run retains progress at the
+same cache paths. The persistent cache is untrusted acceleration: both Cargo
+commands still execute, only newly retained binaries enter the comparison, and
+the cache path is redacted from logs and receipts. Do not set the persistent
+root and `FN64_WM_PAIR_CARGO_CACHE_SEED` together. The lock is released before
+failure-log sanitization so an early guard failure cannot strand it.
 
 Run the operational comparison with a deterministic controller schedule:
 
@@ -471,16 +508,15 @@ and comparator wrapper contracts passed 10/10 consecutive runs after the
 schema migration on 2026-07-31. The canonical ABI
 publication and boot-harness digest suites independently passed the
 deterministic bar.
-One real-ROM diagnostic reached 100,001 charged instructions in both lanes.
+One real-ROM v3 diagnostic reached 100,001 charged instructions in both lanes.
 The exact withheld key `(0x81bf2e27273b27db, 0x80000400)` executed dynamically
 once for one instruction with zero unsupported exits. RDRAM, CPU, device,
-executor, ABI-host, and simulation time matched; continuation did not, and the
-AOT/dynamic scheduler step counts were 33,333/25. The v2 comparison therefore
-failed. Evidence is retained at
-`/private/tmp/fn64-wm-exact-entry-diff-20260731-17/{comparison.json,dynamic-telemetry.json,aot.log,dynamic.log}`.
-This is one diagnostic only, not a fixed or parity claim. The exact next step
-is to expose and diff the pending exit and prepared continuation at
-publication.
+executor, ABI-host, continuation, scheduler steps, and simulation time matched.
+Both publication diagnostics reported the same pending `ExecutableWrite`,
+five-instruction last charge, cumulative charge 100,001, and no prepared
+continuation. Evidence is retained at
+`/private/tmp/fn64-wm-exact-entry-diff-20260731-25/{comparison.json,dynamic-telemetry.json,aot.log,dynamic.log}`.
+This is one operational diagnostic only, not a ten-run parity claim.
 
 For a ROM-bearing static-recompilation checkpoint, aggregate the gate-owned
 receipts without rerunning discovery or Cargo:

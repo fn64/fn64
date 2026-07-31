@@ -290,6 +290,7 @@ unset FN64_BLOCK_EXPECT_GUEST_INSTRUCTIONS
 unset FN64_DYNAMIC_WITHHOLD_BOOT_SHARD
 unset FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY
 unset FN64_DYNAMIC_TELEMETRY
+unset FN64_WM_PUBLICATION_DIAGNOSTIC
 export FN64_GUARD_MAX_RSS_MIB=$diff_guard_max_rss_mib
 
 diff_common_environment=(
@@ -300,6 +301,7 @@ diff_common_environment=(
     "FN64_BLOCK_MAX_STEPS=$diff_max_steps"
     FN64_BLOCK_CONTINUE_AFTER_OVERLAY=1
     FN64_BLOCK_PROGRESS_ONLY=1
+    FN64_WM_PUBLICATION_DIAGNOSTIC=1
 )
 
 print -u2 -- "wm2000 withheld diff: AOT baseline"
@@ -492,6 +494,8 @@ import sys
     schedule_sha,
     aot_binary_sha,
     dynamic_binary_sha,
+    aot_log_path,
+    dynamic_log_path,
 ) = sys.argv[1:]
 with open(telemetry_path, "r", encoding="utf-8") as source:
     telemetry = json.load(source)
@@ -509,6 +513,200 @@ def is_uint(value):
 def parse_pc(value, label):
     require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{8}", value) is not None, label)
     return int(value, 16)
+
+def exact_fields(value, fields, label):
+    require(isinstance(value, dict) and set(value) == set(fields), f"{label} fields")
+    return value
+
+def is_hex(value, digits):
+    return isinstance(value, str) and re.fullmatch(rf"0x[0-9a-f]{{{digits}}}", value) is not None
+
+def execution_key(value, label):
+    value = exact_fields(value, {"bank", "pc"}, label)
+    require(is_hex(value["bank"], 16), f"{label} bank")
+    require(is_hex(value["pc"], 8), f"{label} PC")
+
+def fault(value, label):
+    value = exact_fields(value, {"at", "kind"}, label)
+    execution_key(value["at"], f"{label} at")
+    require(isinstance(value["kind"], str) and value["kind"], f"{label} kind")
+
+def pending_exit(value, label):
+    require(isinstance(value, dict), f"{label} object")
+    variant = value.get("variant")
+    fields = {
+        "transfer": {"variant", "entry"},
+        "resolve_transfer": {"variant", "source_bank", "target_pc"},
+        "resolve_call": {"variant", "source_bank", "target_pc", "resume"},
+        "host_call": {"variant", "target_pc", "resume"},
+        "executable_write": {"variant", "source_bank", "resume"},
+        "executable_write_resolve_call": {
+            "variant", "source_bank", "target_pc", "resume",
+        },
+        "executable_write_fault": {"variant", "fault"},
+        "image_changed": {
+            "variant", "at", "expected_bank", "va_start", "byte_len",
+            "expected_sha256", "actual_sha256",
+        },
+        "checkpoint": {"variant", "entry"},
+        "yield": {"variant", "entry"},
+        "thread_return": {"variant"},
+        "fault": {"variant", "fault"},
+    }
+    require(variant in fields, f"{label} variant")
+    exact_fields(value, fields[variant], label)
+    if "entry" in value:
+        execution_key(value["entry"], f"{label} entry")
+    if "resume" in value:
+        execution_key(value["resume"], f"{label} resume")
+    if "at" in value:
+        execution_key(value["at"], f"{label} at")
+    if "fault" in value:
+        fault(value["fault"], f"{label} fault")
+    if "source_bank" in value:
+        require(is_hex(value["source_bank"], 16), f"{label} source bank")
+    for key in ("target_pc", "va_start"):
+        if key in value:
+            require(is_hex(value[key], 8), f"{label} {key}")
+    if "expected_bank" in value:
+        require(is_hex(value["expected_bank"], 16), f"{label} expected bank")
+    if "byte_len" in value:
+        require(is_uint(value["byte_len"]), f"{label} byte length")
+    for key in ("expected_sha256", "actual_sha256"):
+        if key in value:
+            require(is_sha256(value[key]), f"{label} {key}")
+
+def prepared_continuation(value, label):
+    if value is None:
+        return
+    value = exact_fields(value, {"variant", "entry"}, label)
+    require(value["variant"] in ("image_changed", "inactive_generation"), f"{label} variant")
+    execution_key(value["entry"], f"{label} entry")
+
+def exact_continuation_coherent(exit_value, prepared, label):
+    if prepared is None:
+        requires_prepared = exit_value["variant"] == "image_changed" or (
+            exit_value["variant"] == "fault"
+            and exit_value["fault"]["kind"] == "NoActiveGeneration"
+        )
+        require(not requires_prepared, f"{label} missing prepared continuation")
+    elif prepared["variant"] == "image_changed":
+        require(exit_value["variant"] == "image_changed", f"{label} image-changed relation")
+        require(prepared["entry"]["pc"] == exit_value["at"]["pc"], f"{label} image-changed PC")
+    else:
+        require(
+            exit_value["variant"] == "fault"
+            and exit_value["fault"]["kind"] == "NoActiveGeneration",
+            f"{label} inactive-generation relation",
+        )
+        require(
+            prepared["entry"]["pc"] == exit_value["fault"]["at"]["pc"],
+            f"{label} inactive-generation PC",
+        )
+
+def diagnostic_cpu(value, label):
+    value = exact_fields(value, {
+        "cop0_count", "cop0_compare", "cop0_count_write", "cop0_compare_write",
+        "count_independent_schema", "count_independent_sha256",
+    }, label)
+    require(is_hex(value["cop0_count"], 8), f"{label} Count")
+    require(is_hex(value["cop0_compare"], 8), f"{label} Compare")
+    for key in ("cop0_count_write", "cop0_compare_write"):
+        require(value[key] is None or is_hex(value[key], 8), f"{label} {key}")
+    require(
+        value["count_independent_schema"]
+        == "fn64.wm2000.operational-cpu-count-independent.v1",
+        f"{label} count-independent schema",
+    )
+    require(is_sha256(value["count_independent_sha256"]), f"{label} count-independent identity")
+
+def publication_diagnostics(path, lane, expected_profile):
+    prefix = "[wm2000-publication-diagnostic] "
+    records = []
+    try:
+        with open(path, "r", encoding="utf-8") as source:
+            for line in source:
+                if line.startswith(prefix):
+                    try:
+                        def reject_duplicate_fields(pairs):
+                            result = {}
+                            for key, value in pairs:
+                                if key in result:
+                                    raise ValueError(f"duplicate field {key!r}")
+                                result[key] = value
+                            return result
+                        records.append(json.loads(
+                            line[len(prefix):],
+                            object_pairs_hook=reject_duplicate_fields,
+                        ))
+                    except (json.JSONDecodeError, ValueError) as error:
+                        require(False, f"{lane} publication diagnostic JSON: {error}")
+    except (OSError, UnicodeError) as error:
+        require(False, f"{lane} publication diagnostic log: {error}")
+    prior_thread = None
+    variant_counts = {
+        "exact": 0,
+        "opaque_host_in_flight": 0,
+        "parked_fault_opaque": 0,
+        "returned": 0,
+    }
+    exact_records = []
+    for index, record in enumerate(records):
+        label = f"{lane} publication diagnostic {index}"
+        require(isinstance(record, dict), f"{label} object")
+        variant = record.get("publication_variant")
+        field_sets = {
+            "exact": {
+                "schema", "thread", "publication_variant", "last_charge",
+                "cumulative_charge", "pending_exit", "prepared_continuation", "cpu",
+            },
+            "opaque_host_in_flight": {
+                "schema", "thread", "publication_variant", "target_pc", "resume",
+            },
+            "parked_fault_opaque": {
+                "schema", "thread", "publication_variant", "cumulative_charge", "fault", "cpu",
+            },
+            "returned": {"schema", "thread", "publication_variant", "cpu"},
+        }
+        require(variant in field_sets, f"{label} variant")
+        exact_fields(record, field_sets[variant], label)
+        require(record["schema"] == "fn64.wm2000.publication-diagnostic.v1", f"{label} schema")
+        require(is_uint(record["thread"]), f"{label} thread")
+        require(prior_thread is None or record["thread"] > prior_thread, f"{lane} publication diagnostic thread ordering")
+        prior_thread = record["thread"]
+        variant_counts[variant] += 1
+        if variant == "exact":
+            require(is_uint(record["last_charge"]) and record["last_charge"] > 0, f"{label} last charge")
+            require(is_uint(record["cumulative_charge"]), f"{label} cumulative charge")
+            require(record["last_charge"] <= record["cumulative_charge"], f"{label} charge relation")
+            pending_exit(record["pending_exit"], f"{label} pending exit")
+            prepared_continuation(record["prepared_continuation"], f"{label} prepared continuation")
+            exact_continuation_coherent(
+                record["pending_exit"], record["prepared_continuation"], label,
+            )
+            diagnostic_cpu(record["cpu"], f"{label} CPU")
+            exact_records.append(record)
+        elif variant == "opaque_host_in_flight":
+            require(is_hex(record["target_pc"], 8), f"{label} target PC")
+            execution_key(record["resume"], f"{label} resume")
+        elif variant == "parked_fault_opaque":
+            require(is_uint(record["cumulative_charge"]), f"{label} cumulative charge")
+            fault(record["fault"], f"{label} fault")
+            diagnostic_cpu(record["cpu"], f"{label} CPU")
+        else:
+            diagnostic_cpu(record["cpu"], f"{label} CPU")
+    require(len(records) == expected_profile[1], f"{lane} publication diagnostic count")
+    require(variant_counts["exact"] == expected_profile[2], f"{lane} exact diagnostic count")
+    require(
+        variant_counts["opaque_host_in_flight"] == expected_profile[4],
+        f"{lane} opaque-host diagnostic count",
+    )
+    require(
+        variant_counts["parked_fault_opaque"] == expected_profile[5],
+        f"{lane} parked-fault diagnostic count",
+    )
+    require(variant_counts["returned"] == expected_profile[6], f"{lane} returned diagnostic count")
+    return exact_records
 
 require(telemetry.get("schema") == "fn64.wm2000.dynamic-withheld-telemetry.v2", "schema")
 require(telemetry.get("authority") == "operational_only_dynamic_installed", "authority")
@@ -667,6 +865,46 @@ dynamic_publication_profile = (
     publications["missing_count"],
     publications["unexpected_count"],
 )
+aot_exact_diagnostics = publication_diagnostics(
+    aot_log_path, "AOT", aot_publication_profile,
+)
+dynamic_exact_diagnostics = publication_diagnostics(
+    dynamic_log_path, "dynamic", dynamic_publication_profile,
+)
+
+aot_exact_by_thread = {record["thread"]: record for record in aot_exact_diagnostics}
+dynamic_exact_by_thread = {record["thread"]: record for record in dynamic_exact_diagnostics}
+exact_thread_field_matches = []
+diagnostic_fields = (
+    "last_charge",
+    "cumulative_charge",
+    "pending_exit",
+    "prepared_continuation",
+    "cpu",
+)
+for thread in sorted(set(aot_exact_by_thread) | set(dynamic_exact_by_thread)):
+    aot_record = aot_exact_by_thread.get(thread)
+    dynamic_record = dynamic_exact_by_thread.get(thread)
+    if aot_record is None:
+        classification = "dynamic_only"
+    elif dynamic_record is None:
+        classification = "aot_only"
+    elif all(aot_record[field] == dynamic_record[field] for field in diagnostic_fields):
+        classification = "match"
+    else:
+        classification = "field_mismatch"
+    exact_thread_field_matches.append({
+        "thread": thread,
+        "classification": classification,
+        "field_matches": {
+            field: (
+                aot_record[field] == dynamic_record[field]
+                if aot_record is not None and dynamic_record is not None
+                else None
+            )
+            for field in diagnostic_fields
+        },
+    })
 aot_cpu_comparable = aot_cpu_comparable == "true"
 cpu_comparable = (
     aot_cpu_comparable
@@ -686,7 +924,7 @@ published_cpu_gate_pass = (
 )
 
 comparison = {
-    "schema": "fn64.wm2000.withheld-operational-comparison.v2",
+    "schema": "fn64.wm2000.withheld-operational-comparison.v3",
     "authority": "operational_rdram_and_owner_components_with_published_cpu_diagnostics",
     "expected_guest_instructions": int(expected_instructions),
     "actual_guest_instructions": actual_instructions,
@@ -711,6 +949,14 @@ comparison = {
     "abi_host_match": components["abi_host_sha256"] == aot_abi_host_sha,
     "aot_publication_profile": aot_publication_profile,
     "dynamic_publication_profile": dynamic_publication_profile,
+    "publication_diagnostic": {
+        "schema": "fn64.wm2000.publication-diagnostic-comparison.v1",
+        "authority": "diagnostic_only_canonical_publication_digests_remain_the_gate",
+        "last_charge_relation": "diagnostic_only_slice_partitioning_may_differ",
+        "aot_exact_thread_projections": aot_exact_diagnostics,
+        "dynamic_exact_thread_projections": dynamic_exact_diagnostics,
+        "exact_thread_field_matches": exact_thread_field_matches,
+    },
     "cpu_comparable": cpu_comparable,
     "expected_cpu_sha256": aot_cpu_sha,
     "actual_cpu_sha256": publications["cpu_sha256"],
@@ -755,7 +1001,7 @@ if comparison["operational_match"] is None:
     raise SystemExit("operational comparison unproven: CPU publications are not comparable")
 if not comparison["operational_match"]:
     raise SystemExit("operational comparison mismatch")
-' "$diff_dynamic_telemetry" "$diff_comparison" "$diff_aot_achieved" "$diff_aot_rdram_sha" "$diff_normalized_rom_pre_sha" "$diff_aot_program_sha" "$diff_aot_program_source" "$diff_aot_resolver_sha" "$diff_aot_entry_bank" "$diff_aot_entry_pc" "$diff_aot_steps" "$diff_aot_sim_time" "$diff_aot_device_sha" "$diff_aot_executor_sha" "$diff_aot_abi_host_sha" "$diff_aot_cpu_sha" "$diff_aot_continuation_sha" "$diff_aot_executor_threads" "$diff_aot_publications" "$diff_aot_exact" "$diff_aot_opaque" "$diff_aot_opaque_host" "$diff_aot_parked_fault" "$diff_aot_returned" "$diff_aot_missing" "$diff_aot_unexpected" "$diff_aot_cpu_comparable" "$diff_receipt_pre_sha" "$diff_receipt_schema" "$diff_rom_pre_sha" "$diff_boot_context_pre_sha" "$diff_schedule_pre_sha" "$diff_aot_binary_pre_sha" "$diff_dynamic_binary_pre_sha" || {
+' "$diff_dynamic_telemetry" "$diff_comparison" "$diff_aot_achieved" "$diff_aot_rdram_sha" "$diff_normalized_rom_pre_sha" "$diff_aot_program_sha" "$diff_aot_program_source" "$diff_aot_resolver_sha" "$diff_aot_entry_bank" "$diff_aot_entry_pc" "$diff_aot_steps" "$diff_aot_sim_time" "$diff_aot_device_sha" "$diff_aot_executor_sha" "$diff_aot_abi_host_sha" "$diff_aot_cpu_sha" "$diff_aot_continuation_sha" "$diff_aot_executor_threads" "$diff_aot_publications" "$diff_aot_exact" "$diff_aot_opaque" "$diff_aot_opaque_host" "$diff_aot_parked_fault" "$diff_aot_returned" "$diff_aot_missing" "$diff_aot_unexpected" "$diff_aot_cpu_comparable" "$diff_receipt_pre_sha" "$diff_receipt_schema" "$diff_rom_pre_sha" "$diff_boot_context_pre_sha" "$diff_schedule_pre_sha" "$diff_aot_binary_pre_sha" "$diff_dynamic_binary_pre_sha" "$diff_aot_log" "$diff_dynamic_log" || {
     print -u2 -- "wm2000 withheld diff: operational comparison failed; retained artifacts in $diff_output_canonical"
     exit 1
 }
