@@ -77,7 +77,6 @@ cleanup() {
         sanitize_log "$pair_output/aot-feature-check.log"
         sanitize_log "$pair_output/pure-aot-checker.log"
         sanitize_log "$pair_output/dynamic-feature-check.log"
-        sanitize_log "$pair_output/dynamic-source-check.log"
         sanitize_log "$pair_output/aot-build.log"
         sanitize_log "$pair_output/dynamic-withheld-build.log"
     fi
@@ -181,10 +180,8 @@ typeset -r pair_dynamic_log=$pair_output/dynamic-withheld-build.log
 typeset -r pair_aot_check_log=$pair_output/aot-feature-check.log
 typeset -r pair_checker_log=$pair_output/pure-aot-checker.log
 typeset -r pair_dynamic_check_log=$pair_output/dynamic-feature-check.log
-typeset -r pair_dynamic_source_check_log=$pair_output/dynamic-source-check.log
 typeset -r pair_aot_check_guard_jsonl=$pair_output/aot-feature-check-memory-guard.jsonl
 typeset -r pair_dynamic_check_guard_jsonl=$pair_output/dynamic-feature-check-memory-guard.jsonl
-typeset -r pair_dynamic_source_check_guard_jsonl=$pair_output/dynamic-source-check-memory-guard.jsonl
 typeset -r pair_aot_guard_jsonl=$pair_output/aot-memory-guard.jsonl
 typeset -r pair_dynamic_guard_jsonl=$pair_output/dynamic-withheld-memory-guard.jsonl
 typeset -r pair_aot_binary=$pair_output/wm2000-block-boot.aot
@@ -286,20 +283,6 @@ if ! rg -Fq 'fn64-recomp-rs feature "dynamic-mapped-runtime"' "$pair_dynamic_che
     fail "dynamic-withheld feature graph lacks dynamic-mapped-runtime"
 fi
 
-print -u2 -- "wm2000 withheld pair build: checking dynamic-withheld source"
-if ! FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib \
-    FN64_GUARD_MIN_FREE_PERCENT=$pair_min_free_percent \
-    FN64_GUARD_MAX_SECONDS=$pair_max_seconds \
-    FN64_GUARD_POLL_SECONDS=$pair_poll_seconds \
-    FN64_GUARD_JSONL=$pair_dynamic_source_check_guard_jsonl \
-    "$pair_guard" /usr/bin/env "${pair_build_env[@]}" \
-    "$pair_cargo" check -j1 --locked --manifest-path "$pair_manifest" -p "$pair_package" \
-        --bin "$pair_package" --features dynamic-withheld >"$pair_dynamic_source_check_log" 2>&1
-then
-    sanitize_log "$pair_dynamic_source_check_log"
-    fail "dynamic-withheld source check failed; retained $pair_dynamic_source_check_log"
-fi
-
 print -u2 -- "wm2000 withheld pair build: building AOT artifact"
 if ! FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib \
     FN64_GUARD_MIN_FREE_PERCENT=$pair_min_free_percent \
@@ -331,7 +314,6 @@ copy_retained_binary "$pair_target/$pair_binary_relative" "$pair_dynamic_binary"
 sanitize_log "$pair_aot_check_log"
 sanitize_log "$pair_checker_log"
 sanitize_log "$pair_dynamic_check_log"
-sanitize_log "$pair_dynamic_source_check_log"
 sanitize_log "$pair_aot_log"
 sanitize_log "$pair_dynamic_log"
 
@@ -362,14 +344,13 @@ typeset -r pair_dynamic_sha=$(hash_file "$pair_dynamic_binary")
 typeset -r pair_aot_feature_tree_sha=$(hash_file "$pair_aot_check_log")
 typeset -r pair_checker_log_sha=$(hash_file "$pair_checker_log")
 typeset -r pair_dynamic_feature_tree_sha=$(hash_file "$pair_dynamic_check_log")
-typeset -r pair_dynamic_source_check_sha=$(hash_file "$pair_dynamic_source_check_log")
 [[ "$pair_aot_sha" != "$pair_dynamic_sha" ]] || fail "feature-separated retained binaries unexpectedly have identical hashes"
 
 python3 - "$pair_receipt" "$pair_rom_pre_sha" "$pair_boot_context_pre_sha" "$pair_aot_sha" "$pair_dynamic_sha" "$pair_manifest_pre_sha" "$pair_lock_pre_sha" "$pair_guard_pre_sha" "$pair_checker_pre_sha" "$pair_cargo_pre_sha" \
     "$pair_max_rss_mib" "$pair_min_free_percent" "$pair_max_seconds" "$pair_poll_seconds" \
     "$pair_target_subdir" "$pair_cache_seed_mode" "${(j:,:)pair_group_names}" "${(j:,:)pair_group_capture_counts}" "${(j:,:)pair_capture_digests}" \
-    "$pair_aot_check_guard_jsonl" "$pair_dynamic_check_guard_jsonl" "$pair_dynamic_source_check_guard_jsonl" "$pair_aot_guard_jsonl" "$pair_dynamic_guard_jsonl" \
-    "$pair_aot_feature_tree_sha" "$pair_checker_log_sha" "$pair_dynamic_feature_tree_sha" "$pair_dynamic_source_check_sha" <<'PY'
+    "$pair_aot_check_guard_jsonl" "$pair_dynamic_check_guard_jsonl" "$pair_aot_guard_jsonl" "$pair_dynamic_guard_jsonl" \
+    "$pair_aot_feature_tree_sha" "$pair_checker_log_sha" "$pair_dynamic_feature_tree_sha" <<'PY'
 import json
 import sys
 
@@ -377,8 +358,8 @@ import sys
     receipt_path, rom_sha, boot_context_sha, aot_sha, dynamic_sha, manifest_sha, lock_sha, guard_sha, checker_sha, cargo_sha,
     max_rss_mib, min_free_percent, max_seconds, poll_seconds, target_subdir, cache_seed_mode,
     group_names, group_capture_counts, capture_digests,
-    aot_check_jsonl_path, dynamic_check_jsonl_path, dynamic_source_check_jsonl_path, aot_jsonl_path, dynamic_jsonl_path,
-    aot_feature_tree_sha, checker_log_sha, dynamic_feature_tree_sha, dynamic_source_check_sha,
+    aot_check_jsonl_path, dynamic_check_jsonl_path, aot_jsonl_path, dynamic_jsonl_path,
+    aot_feature_tree_sha, checker_log_sha, dynamic_feature_tree_sha,
 ) = sys.argv[1:]
 groups = [name for name in group_names.split(",") if name]
 counts = [int(count) for count in group_capture_counts.split(",") if count]
@@ -413,7 +394,7 @@ def guard_summary(path):
     }
 
 receipt = {
-    "schema": "fn64.wm2000.withheld-pair-build-receipt.v3",
+    "schema": "fn64.wm2000.withheld-pair-build-receipt.v4",
     "authority": "build_local_non_authoritative",
     "evidence_scope": "operational_build_local_artifact_identity_only",
     "privacy": "path-free-private-input-identities-only",
@@ -431,7 +412,6 @@ receipt = {
         "aot_feature_tree_log_sha256": aot_feature_tree_sha,
         "pure_aot_checker_log_sha256": checker_log_sha,
         "dynamic_feature_tree_log_sha256": dynamic_feature_tree_sha,
-        "dynamic_source_check_log_sha256": dynamic_source_check_sha,
         "target_subdir": target_subdir,
         "cargo_cache_seed": cache_seed_mode,
     },
@@ -446,12 +426,10 @@ receipt = {
         "cargo_sha256": cargo_sha,
         "aot_feature_check_jsonl": "aot-feature-check-memory-guard.jsonl",
         "dynamic_feature_check_jsonl": "dynamic-feature-check-memory-guard.jsonl",
-        "dynamic_source_check_jsonl": "dynamic-source-check-memory-guard.jsonl",
         "aot_jsonl": "aot-memory-guard.jsonl",
         "dynamic_withheld_jsonl": "dynamic-withheld-memory-guard.jsonl",
         "aot_feature_check_measurement": guard_summary(aot_check_jsonl_path),
         "dynamic_feature_check_measurement": guard_summary(dynamic_check_jsonl_path),
-        "dynamic_source_check_measurement": guard_summary(dynamic_source_check_jsonl_path),
         "aot_measurement": guard_summary(aot_jsonl_path),
         "dynamic_withheld_measurement": guard_summary(dynamic_jsonl_path),
     },
@@ -472,15 +450,6 @@ receipt = {
             "tree", "--locked", "--manifest-path",
             "examples/wm2000-block-boot/Cargo.toml", "-e", "features", "-p",
             "wm2000-block-boot", "-i", "fn64-recomp-rs", "--features", "dynamic-withheld",
-        ],
-        "dynamic_source_check": [
-            "<MEMORY_GUARD_BY_RECORDED_SHA256>", "env", "CARGO_BUILD_JOBS=1",
-            "CARGO_TARGET_DIR=<PRIVATE_OUTPUT>/cargo-target", "ROM=<PRIVATE_ROM>",
-            "FN64_BOOT_CONTEXT=<PRIVATE_CAPTURE>",
-            "FN64_EXECUTABLE_IMAGE_GROUPS=<CAPTURE_GROUP_NAMES_ONLY>",
-            "<CARGO_BY_RECORDED_SHA256>", "check", "-j1", "--locked", "--manifest-path",
-            "examples/wm2000-block-boot/Cargo.toml", "-p", "wm2000-block-boot",
-            "--bin", "wm2000-block-boot", "--features", "dynamic-withheld",
         ],
         "aot": [
             "<MEMORY_GUARD_BY_RECORDED_SHA256>", "env", "CARGO_BUILD_JOBS=1",

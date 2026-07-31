@@ -62,11 +62,9 @@ fi
 [[ -n "${CARGO_TARGET_DIR:-}" ]]
 print -r -- "cargo $* ROM=$ROM BOOT=$FN64_BOOT_CONTEXT GROUP=$FN64_EXECUTABLE_IMAGE_FIXTURE" >> "$FN64_PAIR_TEST_ORDER"
 print -r -- "building ROM=$ROM BOOT=$FN64_BOOT_CONTEXT GROUP=$FN64_EXECUTABLE_IMAGE_FIXTURE"
-if [[ "${1:-}" == check ]]; then
-    [[ " $* " == *" --bin wm2000-block-boot "* ]]
-    [[ " $* " == *" --features dynamic-withheld "* ]]
-    [[ "${FN64_PAIR_TEST_SOURCE_CHECK_FAIL:-}" != 1 ]] || exit 96
-    exit 0
+if [[ " $* " == *" --features dynamic-withheld "* \
+    && "${FN64_PAIR_TEST_DYNAMIC_BUILD_FAIL:-}" == 1 ]]; then
+    exit 96
 fi
 mkdir -p "$CARGO_TARGET_DIR/debug"
 if [[ " $* " == *" --features dynamic-withheld "* ]]; then
@@ -123,7 +121,6 @@ then
 fi
 [[ -x "$output/wm2000-block-boot.aot" && -x "$output/wm2000-block-boot.dynamic-withheld" ]]
 [[ -s "$output/aot-feature-check-memory-guard.jsonl" && -s "$output/dynamic-feature-check-memory-guard.jsonl" ]]
-[[ -s "$output/dynamic-source-check-memory-guard.jsonl" ]]
 [[ -s "$output/aot-memory-guard.jsonl" && -s "$output/dynamic-withheld-memory-guard.jsonl" ]]
 [[ "$(shasum -a 256 "$output/wm2000-block-boot.aot" | awk '{print $1}')" != "$(shasum -a 256 "$output/wm2000-block-boot.dynamic-withheld" | awk '{print $1}')" ]]
 [[ "$(sed -n '1p' "$order")" == 'guard aot-feature-gate' ]]
@@ -136,17 +133,19 @@ fi
 [[ "$(sed -n '5p' "$order")" == cargo-tree*dynamic-withheld* ]]
 [[ "$(sed -n '5p' "$order")" == *' -e features '* ]]
 [[ "$(sed -n '5p' "$order")" == *' -i fn64-recomp-rs'* ]]
-[[ "$(sed -n '6p' "$order")" == *'guard /usr/bin/env '*check*dynamic-withheld* ]]
-[[ "$(sed -n '7p' "$order")" == cargo\ check*dynamic-withheld* ]]
-[[ "$(sed -n '8p' "$order")" == *'guard /usr/bin/env '* ]]
-[[ "$(sed -n '8p' "$order")" != *dynamic-withheld* ]]
-[[ "$(sed -n '10p' "$order")" == *dynamic-withheld* ]]
-typeset -r aot_target=$(sed -n '8p' "$order" | sed -n 's/.*CARGO_TARGET_DIR=\([^ ]*\).*/\1/p')
-typeset -r dynamic_target=$(sed -n '10p' "$order" | sed -n 's/.*CARGO_TARGET_DIR=\([^ ]*\).*/\1/p')
+[[ "$(sed -n '6p' "$order")" == *'guard /usr/bin/env '* ]]
+[[ "$(sed -n '6p' "$order")" != *dynamic-withheld* ]]
+[[ "$(sed -n '7p' "$order")" == cargo\ build* ]]
+[[ "$(sed -n '7p' "$order")" != *dynamic-withheld* ]]
+[[ "$(sed -n '8p' "$order")" == *'guard /usr/bin/env '*dynamic-withheld* ]]
+[[ "$(sed -n '9p' "$order")" == cargo\ build*dynamic-withheld* ]]
+! rg -q 'cargo check' "$order"
+typeset -r aot_target=$(sed -n '6p' "$order" | sed -n 's/.*CARGO_TARGET_DIR=\([^ ]*\).*/\1/p')
+typeset -r dynamic_target=$(sed -n '8p' "$order" | sed -n 's/.*CARGO_TARGET_DIR=\([^ ]*\).*/\1/p')
 [[ -n "$aot_target" && "$aot_target" == "$dynamic_target" && "$aot_target" == "$output/cargo-target" ]]
 rg -q '<PRIVATE_INPUT>' "$output/aot-build.log"
 rg -q '<PRIVATE_INPUT>' "$output/dynamic-withheld-build.log"
-for retained in "$output/dynamic-source-check.log" "$output/aot-build.log" "$output/dynamic-withheld-build.log" "$output/receipt.json"; do
+for retained in "$output/aot-build.log" "$output/dynamic-withheld-build.log" "$output/receipt.json"; do
     if rg -Fq "$private_inputs" "$retained"; then
         print -u2 -- "test-build-wm2000-withheld-pair: private input path leaked into ${retained:t}"
         exit 1
@@ -159,7 +158,7 @@ import pathlib
 import sys
 receipt = json.load(open(sys.argv[1], encoding="utf-8"))
 output = pathlib.Path(sys.argv[1]).parent
-assert receipt["schema"] == "fn64.wm2000.withheld-pair-build-receipt.v3"
+assert receipt["schema"] == "fn64.wm2000.withheld-pair-build-receipt.v4"
 assert receipt["authority"] == "build_local_non_authoritative"
 assert receipt["identity_relation"] == "pre_use_hashes_verified_unchanged_after_both_builds"
 assert receipt["guard"]["cargo_build_jobs"] == 1
@@ -169,7 +168,6 @@ assert receipt["guard"]["aot_measurement"]["peak_tree_rss_mib"] == 1
 assert receipt["guard"]["dynamic_withheld_measurement"]["last_reason"] == "complete"
 assert receipt["guard"]["aot_feature_check_measurement"]["last_reason"] == "complete"
 assert receipt["guard"]["dynamic_feature_check_measurement"]["last_reason"] == "complete"
-assert receipt["guard"]["dynamic_source_check_measurement"]["last_reason"] == "complete"
 assert receipt["artifacts"]["aot_feature_tree_log_sha256"] == hashlib.sha256(
     (output / "aot-feature-check.log").read_bytes()
 ).hexdigest()
@@ -178,9 +176,6 @@ assert receipt["artifacts"]["pure_aot_checker_log_sha256"] == hashlib.sha256(
 ).hexdigest()
 assert receipt["artifacts"]["dynamic_feature_tree_log_sha256"] == hashlib.sha256(
     (output / "dynamic-feature-check.log").read_bytes()
-).hexdigest()
-assert receipt["artifacts"]["dynamic_source_check_log_sha256"] == hashlib.sha256(
-    (output / "dynamic-source-check.log").read_bytes()
 ).hexdigest()
 assert receipt["artifacts"]["cargo_cache_seed"] == "none"
 groups = receipt["inputs"]["executable_image_capture_groups"]
@@ -195,32 +190,33 @@ assert receipt["commands"]["pure_aot_feature_gate"][-3:] == [
 assert receipt["commands"]["dynamic_feature_gate"][-2:] == ["--features", "dynamic-withheld"]
 assert "normal,features" not in receipt["commands"]["pure_aot_feature_gate"]
 assert "normal,features" not in receipt["commands"]["dynamic_feature_gate"]
-assert receipt["commands"]["dynamic_source_check"][-4:] == [
-    "--bin", "wm2000-block-boot", "--features", "dynamic-withheld"
-]
-assert "check" in receipt["commands"]["dynamic_source_check"]
+assert "dynamic_source_check" not in receipt["commands"]
+assert "dynamic_source_check_log_sha256" not in receipt["artifacts"]
+assert "dynamic_source_check_jsonl" not in receipt["guard"]
+assert "dynamic_source_check_measurement" not in receipt["guard"]
 assert receipt["commands"]["pure_aot_feature_gate"][0] == "<MEMORY_GUARD_BY_RECORDED_SHA256>"
 assert "<PURE_AOT_CHECKER_BY_RECORDED_SHA256>" in receipt["commands"]["pure_aot_checker_gate"]
 assert "<CARGO_BY_RECORDED_SHA256>" in receipt["commands"]["aot"]
 assert all("<PRIVATE" in item or not item.startswith("/") for item in receipt["commands"]["aot"])
 PY
 
-typeset -r source_check_output=$test_dir/source-check-failure
+typeset -r dynamic_build_output=$test_dir/dynamic-build-failure
 if PATH=$fake_bin:$PATH \
     ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \
     FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGE_FIXTURE \
     FN64_EXECUTABLE_IMAGE_FIXTURE=$test_capture_a:$test_capture_b:$test_capture_c \
-    FN64_PAIR_TEST_ORDER=$test_dir/source-check-order.log FN64_PAIR_TEST_SOURCE_CHECK_FAIL=1 \
+    FN64_PAIR_TEST_ORDER=$test_dir/dynamic-build-order.log FN64_PAIR_TEST_DYNAMIC_BUILD_FAIL=1 \
     FN64_WM_PAIR_MEMORY_GUARD=$test_dir/fake-guard \
     FN64_WM_PAIR_AOT_CHECKER=$test_dir/fake-checker \
-    "$test_root/scripts/build-wm2000-withheld-pair.zsh" "$source_check_output" >"$test_dir/source-check.log" 2>&1
+    "$test_root/scripts/build-wm2000-withheld-pair.zsh" "$dynamic_build_output" >"$test_dir/dynamic-build.log" 2>&1
 then
-    print -u2 -- "test-build-wm2000-withheld-pair: failing dynamic source check was accepted"
+    print -u2 -- "test-build-wm2000-withheld-pair: failing dynamic build was accepted"
     exit 1
 fi
-rg -q 'dynamic-withheld source check failed' "$test_dir/source-check.log"
-[[ ! -e "$source_check_output/wm2000-block-boot.aot" ]]
-[[ ! -e "$source_check_output/wm2000-block-boot.dynamic-withheld" ]]
+rg -q 'dynamic-withheld build failed' "$test_dir/dynamic-build.log"
+[[ -x "$dynamic_build_output/wm2000-block-boot.aot" ]]
+[[ ! -e "$dynamic_build_output/wm2000-block-boot.dynamic-withheld" ]]
+[[ ! -e "$dynamic_build_output/receipt.json" ]]
 
 typeset -r seed=$test_dir/cache-seed
 typeset -r seeded_output=$test_dir/seeded-output

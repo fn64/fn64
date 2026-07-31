@@ -140,7 +140,8 @@ typeset -r diff_boot_context_pre_sha=$(hash_file "$FN64_BOOT_CONTEXT")
 typeset -r diff_schedule_pre_sha=$(hash_file "$diff_schedule")
 typeset -r diff_aot_binary_pre_sha=$(hash_file "$FN64_WM_AOT_BINARY")
 typeset -r diff_dynamic_binary_pre_sha=$(hash_file "$FN64_WM_DYNAMIC_BINARY")
-python3 - "$diff_receipt" "$diff_rom_pre_sha" "$diff_boot_context_pre_sha" \
+typeset diff_receipt_schema
+diff_receipt_schema=$(python3 - "$diff_receipt" "$diff_rom_pre_sha" "$diff_boot_context_pre_sha" \
     "$diff_aot_binary_pre_sha" "$diff_dynamic_binary_pre_sha" <<'PY'
 import json
 import sys
@@ -168,7 +169,12 @@ exact(receipt, {
     "schema", "authority", "evidence_scope", "privacy", "identity_relation",
     "inputs", "artifacts", "guard", "commands",
 }, "root")
-require(receipt.get("schema") == "fn64.wm2000.withheld-pair-build-receipt.v3", "schema")
+schema = receipt.get("schema")
+require(schema in {
+    "fn64.wm2000.withheld-pair-build-receipt.v3",
+    "fn64.wm2000.withheld-pair-build-receipt.v4",
+}, "schema")
+is_v3 = schema.endswith(".v3")
 require(receipt.get("authority") == "build_local_non_authoritative", "authority")
 require(receipt.get("evidence_scope") == "operational_build_local_artifact_identity_only", "evidence scope")
 require(receipt.get("identity_relation") == "pre_use_hashes_verified_unchanged_after_both_builds", "identity relation")
@@ -188,24 +194,35 @@ for index, group in enumerate(groups):
     captures = group["ordered_capture_sha256"]
     require(isinstance(captures, list) and len(captures) >= 3, f"capture group {index} inventory")
     require(all(is_sha256(value) for value in captures), f"capture group {index} identities")
-artifacts = exact(receipt.get("artifacts"), {
+artifact_keys = {
+    "aot_sha256", "dynamic_withheld_sha256", "aot_feature_tree_log_sha256",
+    "pure_aot_checker_log_sha256", "dynamic_feature_tree_log_sha256", "target_subdir",
+    "cargo_cache_seed",
+}
+if is_v3:
+    artifact_keys.add("dynamic_source_check_log_sha256")
+artifacts = exact(receipt.get("artifacts"), artifact_keys, "artifacts")
+artifact_digest_keys = {
     "aot_sha256", "dynamic_withheld_sha256", "aot_feature_tree_log_sha256",
     "pure_aot_checker_log_sha256", "dynamic_feature_tree_log_sha256",
-    "dynamic_source_check_log_sha256", "target_subdir", "cargo_cache_seed",
-}, "artifacts")
-for key in ("aot_sha256", "dynamic_withheld_sha256", "aot_feature_tree_log_sha256", "pure_aot_checker_log_sha256", "dynamic_feature_tree_log_sha256", "dynamic_source_check_log_sha256"):
+}
+if is_v3:
+    artifact_digest_keys.add("dynamic_source_check_log_sha256")
+for key in artifact_digest_keys:
     require(is_sha256(artifacts.get(key)), f"artifact {key}")
 require(artifacts.get("target_subdir") == "cargo-target", "artifact target subdirectory")
 require(artifacts.get("cargo_cache_seed") in ("none", "caller_provided_untrusted_acceleration"), "artifact Cargo cache seed mode")
-guard = exact(receipt.get("guard"), {
+guard_keys = {
     "max_rss_mib", "min_free_percent", "max_seconds", "poll_seconds",
     "cargo_build_jobs", "memory_guard_sha256", "pure_aot_checker_sha256",
     "cargo_sha256", "aot_feature_check_jsonl", "dynamic_feature_check_jsonl",
-    "dynamic_source_check_jsonl", "aot_jsonl", "dynamic_withheld_jsonl",
+    "aot_jsonl", "dynamic_withheld_jsonl",
     "aot_feature_check_measurement", "dynamic_feature_check_measurement",
-    "dynamic_source_check_measurement", "aot_measurement",
-    "dynamic_withheld_measurement",
-}, "guard")
+    "aot_measurement", "dynamic_withheld_measurement",
+}
+if is_v3:
+    guard_keys.update({"dynamic_source_check_jsonl", "dynamic_source_check_measurement"})
+guard = exact(receipt.get("guard"), guard_keys, "guard")
 def is_uint(value):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 require(is_uint(guard["max_rss_mib"]) and guard["max_rss_mib"] > 0, "guard max RSS")
@@ -215,39 +232,51 @@ require(guard["poll_seconds"] in ("0.05", "0.1", "0.25", "0.5", "1", "2"), "guar
 require(guard["cargo_build_jobs"] == 1, "guard Cargo jobs")
 for key in ("memory_guard_sha256", "pure_aot_checker_sha256", "cargo_sha256"):
     require(is_sha256(guard[key]), f"guard {key}")
-for key, expected in {
+guard_jsonl = {
     "aot_feature_check_jsonl": "aot-feature-check-memory-guard.jsonl",
     "dynamic_feature_check_jsonl": "dynamic-feature-check-memory-guard.jsonl",
-    "dynamic_source_check_jsonl": "dynamic-source-check-memory-guard.jsonl",
     "aot_jsonl": "aot-memory-guard.jsonl",
     "dynamic_withheld_jsonl": "dynamic-withheld-memory-guard.jsonl",
-}.items():
+}
+if is_v3:
+    guard_jsonl["dynamic_source_check_jsonl"] = "dynamic-source-check-memory-guard.jsonl"
+for key, expected in guard_jsonl.items():
     require(guard[key] == expected, f"guard {key}")
-for key in (
-    "aot_feature_check_measurement", "dynamic_feature_check_measurement", "dynamic_source_check_measurement",
+measurement_keys = {
+    "aot_feature_check_measurement", "dynamic_feature_check_measurement",
     "aot_measurement", "dynamic_withheld_measurement",
-):
+}
+if is_v3:
+    measurement_keys.add("dynamic_source_check_measurement")
+for key in measurement_keys:
     measurement = exact(guard[key], {"samples", "elapsed_seconds", "peak_tree_rss_mib", "last_reason"}, key)
     require(is_uint(measurement["samples"]) and measurement["samples"] > 0, f"{key} samples")
     require(is_uint(measurement["elapsed_seconds"]), f"{key} elapsed time")
     require(is_uint(measurement["peak_tree_rss_mib"]), f"{key} peak RSS")
     require(measurement["last_reason"] == "complete", f"{key} completion")
-commands = exact(receipt.get("commands"), {
+command_keys = {
     "pure_aot_feature_gate", "pure_aot_checker_gate", "dynamic_feature_gate",
-    "dynamic_source_check", "aot", "dynamic_withheld",
-}, "commands")
+    "aot", "dynamic_withheld",
+}
+if is_v3:
+    command_keys.add("dynamic_source_check")
+commands = exact(receipt.get("commands"), command_keys, "commands")
 require(all(isinstance(command, list) and command and all(isinstance(word, str) and word for word in command)
             for command in commands.values()), "command vectors")
 require(commands["aot"][-2:] == ["-p", "wm2000-block-boot"], "AOT command suffix")
 require(commands["dynamic_withheld"][-4:] == ["-p", "wm2000-block-boot", "--features", "dynamic-withheld"], "dynamic command suffix")
 require(commands["dynamic_feature_gate"][-2:] == ["--features", "dynamic-withheld"], "dynamic feature-gate suffix")
-require(commands["dynamic_source_check"][-4:] == ["--bin", "wm2000-block-boot", "--features", "dynamic-withheld"], "dynamic source-check suffix")
+if is_v3:
+    require(commands["dynamic_source_check"][-4:] == ["--bin", "wm2000-block-boot", "--features", "dynamic-withheld"], "dynamic source-check suffix")
 require(inputs["raw_rom_sha256"] == rom_sha, "raw ROM identity")
 require(inputs["boot_context_sha256"] == boot_sha, "BootContext identity")
 require(artifacts["aot_sha256"] == aot_sha, "AOT executable identity")
 require(artifacts["dynamic_withheld_sha256"] == dynamic_sha, "dynamic-withheld executable identity")
 require(aot_sha != dynamic_sha, "feature-separated executable identities")
+print(schema)
 PY
+) || exit 1
+typeset -r diff_receipt_schema
 
 # Prevent caller-shell diagnostics from creating unbounded histories or
 # changing the two lane inputs. The controller schedule remains explicit.
@@ -457,6 +486,7 @@ import sys
     aot_unexpected,
     aot_cpu_comparable,
     pair_receipt_sha,
+    pair_receipt_schema,
     raw_rom_sha,
     boot_context_sha,
     schedule_sha,
@@ -690,7 +720,7 @@ comparison = {
     "continuation_match": continuation_match,
     "published_cpu_gate_pass": published_cpu_gate_pass,
     "pair_provenance": {
-        "receipt_schema": "fn64.wm2000.withheld-pair-build-receipt.v3",
+        "receipt_schema": pair_receipt_schema,
         "receipt_authority": "build_local_non_authoritative",
         "receipt_sha256": pair_receipt_sha,
         "identity_relation": "receipt_artifacts_and_inputs_prevalidated_then_runtime_inputs_pre_post_verified",
@@ -725,7 +755,7 @@ if comparison["operational_match"] is None:
     raise SystemExit("operational comparison unproven: CPU publications are not comparable")
 if not comparison["operational_match"]:
     raise SystemExit("operational comparison mismatch")
-' "$diff_dynamic_telemetry" "$diff_comparison" "$diff_aot_achieved" "$diff_aot_rdram_sha" "$diff_normalized_rom_pre_sha" "$diff_aot_program_sha" "$diff_aot_program_source" "$diff_aot_resolver_sha" "$diff_aot_entry_bank" "$diff_aot_entry_pc" "$diff_aot_steps" "$diff_aot_sim_time" "$diff_aot_device_sha" "$diff_aot_executor_sha" "$diff_aot_abi_host_sha" "$diff_aot_cpu_sha" "$diff_aot_continuation_sha" "$diff_aot_executor_threads" "$diff_aot_publications" "$diff_aot_exact" "$diff_aot_opaque" "$diff_aot_opaque_host" "$diff_aot_parked_fault" "$diff_aot_returned" "$diff_aot_missing" "$diff_aot_unexpected" "$diff_aot_cpu_comparable" "$diff_receipt_pre_sha" "$diff_rom_pre_sha" "$diff_boot_context_pre_sha" "$diff_schedule_pre_sha" "$diff_aot_binary_pre_sha" "$diff_dynamic_binary_pre_sha" || {
+' "$diff_dynamic_telemetry" "$diff_comparison" "$diff_aot_achieved" "$diff_aot_rdram_sha" "$diff_normalized_rom_pre_sha" "$diff_aot_program_sha" "$diff_aot_program_source" "$diff_aot_resolver_sha" "$diff_aot_entry_bank" "$diff_aot_entry_pc" "$diff_aot_steps" "$diff_aot_sim_time" "$diff_aot_device_sha" "$diff_aot_executor_sha" "$diff_aot_abi_host_sha" "$diff_aot_cpu_sha" "$diff_aot_continuation_sha" "$diff_aot_executor_threads" "$diff_aot_publications" "$diff_aot_exact" "$diff_aot_opaque" "$diff_aot_opaque_host" "$diff_aot_parked_fault" "$diff_aot_returned" "$diff_aot_missing" "$diff_aot_unexpected" "$diff_aot_cpu_comparable" "$diff_receipt_pre_sha" "$diff_receipt_schema" "$diff_rom_pre_sha" "$diff_boot_context_pre_sha" "$diff_schedule_pre_sha" "$diff_aot_binary_pre_sha" "$diff_dynamic_binary_pre_sha" || {
     print -u2 -- "wm2000 withheld diff: operational comparison failed; retained artifacts in $diff_output_canonical"
     exit 1
 }

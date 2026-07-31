@@ -12,9 +12,13 @@ typeset -r test_schedule=$test_dir/schedule.json
 typeset -r test_aot=$test_dir/aot
 typeset -r test_dynamic=$test_dir/dynamic
 typeset -r test_receipt=$test_dir/receipt.json
+typeset -r test_v3_receipt=$test_dir/receipt-v3.json
+typeset -r test_mixed_v4_receipt=$test_dir/receipt-mixed-v4.json
 typeset -r test_stale_receipt=$test_dir/stale-receipt.json
 typeset -r test_unpaired_receipt=$test_dir/unpaired-receipt.json
 typeset -r test_output=$test_dir/output
+typeset -r test_v3_output=$test_dir/v3-output
+typeset -r test_mixed_v4_output=$test_dir/mixed-v4-output
 typeset -r test_stale_output=$test_dir/stale-output
 typeset -r test_component_output=$test_dir/component-output
 typeset -r test_noncomparable_output=$test_dir/noncomparable-output
@@ -30,6 +34,8 @@ typeset -r test_zero_dynamic_work_output=$test_dir/zero-dynamic-work-output
 typeset -r test_v1_telemetry_output=$test_dir/v1-telemetry-output
 typeset -r test_resolver_drift_output=$test_dir/resolver-drift-output
 mkdir "$test_output"
+mkdir "$test_v3_output"
+mkdir "$test_mixed_v4_output"
 mkdir "$test_stale_output"
 mkdir "$test_component_output"
 mkdir "$test_noncomparable_output"
@@ -252,7 +258,7 @@ typeset -r test_aot_sha=${test_aot_digest_line%% *}
 typeset -r test_dynamic_sha=${test_dynamic_digest_line%% *}
 cat >"$test_receipt" <<EOF
 {
-  "schema": "fn64.wm2000.withheld-pair-build-receipt.v3",
+  "schema": "fn64.wm2000.withheld-pair-build-receipt.v4",
   "authority": "build_local_non_authoritative",
   "evidence_scope": "operational_build_local_artifact_identity_only",
   "privacy": "path-free-private-input-identities-only",
@@ -277,7 +283,6 @@ cat >"$test_receipt" <<EOF
     "aot_feature_tree_log_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
     "pure_aot_checker_log_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "dynamic_feature_tree_log_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
-    "dynamic_source_check_log_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "target_subdir": "cargo-target",
     "cargo_cache_seed": "none"
   },
@@ -292,12 +297,10 @@ cat >"$test_receipt" <<EOF
     "cargo_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "aot_feature_check_jsonl": "aot-feature-check-memory-guard.jsonl",
     "dynamic_feature_check_jsonl": "dynamic-feature-check-memory-guard.jsonl",
-    "dynamic_source_check_jsonl": "dynamic-source-check-memory-guard.jsonl",
     "aot_jsonl": "aot-memory-guard.jsonl",
     "dynamic_withheld_jsonl": "dynamic-withheld-memory-guard.jsonl",
     "aot_feature_check_measurement": {"samples": 1, "elapsed_seconds": 1, "peak_tree_rss_mib": 1, "last_reason": "complete"},
     "dynamic_feature_check_measurement": {"samples": 1, "elapsed_seconds": 1, "peak_tree_rss_mib": 1, "last_reason": "complete"},
-    "dynamic_source_check_measurement": {"samples": 1, "elapsed_seconds": 1, "peak_tree_rss_mib": 1, "last_reason": "complete"},
     "aot_measurement": {"samples": 1, "elapsed_seconds": 1, "peak_tree_rss_mib": 1, "last_reason": "complete"},
     "dynamic_withheld_measurement": {"samples": 1, "elapsed_seconds": 1, "peak_tree_rss_mib": 1, "last_reason": "complete"}
   },
@@ -305,12 +308,35 @@ cat >"$test_receipt" <<EOF
     "pure_aot_feature_gate": ["cargo", "tree", "-e", "normal,features"],
     "pure_aot_checker_gate": ["scripts/check-wm2000-pure-aot.zsh"],
     "dynamic_feature_gate": ["cargo", "tree", "--features", "dynamic-withheld"],
-    "dynamic_source_check": ["cargo", "check", "--bin", "wm2000-block-boot", "--features", "dynamic-withheld"],
     "aot": ["cargo", "build", "-p", "wm2000-block-boot"],
     "dynamic_withheld": ["cargo", "build", "-p", "wm2000-block-boot", "--features", "dynamic-withheld"]
   }
 }
 EOF
+python3 - "$test_receipt" "$test_v3_receipt" <<'PY'
+import json
+import sys
+
+source, destination = sys.argv[1:]
+receipt = json.load(open(source, encoding="utf-8"))
+receipt["schema"] = "fn64.wm2000.withheld-pair-build-receipt.v3"
+receipt["artifacts"]["dynamic_source_check_log_sha256"] = "c" * 64
+receipt["guard"]["dynamic_source_check_jsonl"] = "dynamic-source-check-memory-guard.jsonl"
+receipt["guard"]["dynamic_source_check_measurement"] = {
+    "samples": 1,
+    "elapsed_seconds": 1,
+    "peak_tree_rss_mib": 1,
+    "last_reason": "complete",
+}
+receipt["commands"]["dynamic_source_check"] = [
+    "cargo", "check", "--bin", "wm2000-block-boot", "--features", "dynamic-withheld",
+]
+with open(destination, "x", encoding="utf-8") as output:
+    json.dump(receipt, output, sort_keys=True, indent=2)
+    output.write("\n")
+PY
+cp "$test_v3_receipt" "$test_mixed_v4_receipt"
+sed -i '' 's/withheld-pair-build-receipt\.v3/withheld-pair-build-receipt.v4/' "$test_mixed_v4_receipt"
 cp "$test_receipt" "$test_stale_receipt"
 sed -i '' "s/$test_rom_sha/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/" "$test_stale_receipt"
 cp "$test_receipt" "$test_unpaired_receipt"
@@ -335,7 +361,37 @@ then
     exit 1
 fi
 
+if ! ROM=$test_rom \
+    FN64_BOOT_CONTEXT=$test_boot \
+    FN64_WM_PAIR_RECEIPT=$test_v3_receipt \
+    FN64_WM_AOT_BINARY=$test_aot \
+    FN64_WM_DYNAMIC_BINARY=$test_dynamic \
+    FN64_WM_DIFF_OUTPUT_DIR=$test_v3_output \
+    "$test_root/scripts/wm2000-withheld-rdram-diff.zsh" "$test_schedule" 1000000 2000000 \
+        >"$test_dir/v3-wrapper.log" 2>&1
+then
+    print -u2 -- "test-wm2000-withheld-rdram-diff: retained v3 receipt was rejected"
+    command cat -- "$test_dir/v3-wrapper.log" >&2
+    exit 1
+fi
+
 rg -q '^wm2000 withheld diff: MATCH guest_instructions=1000004 ' "$test_dir/wrapper.log"
+rg -q '"receipt_schema": "fn64.wm2000.withheld-pair-build-receipt.v4"' "$test_output/comparison.json"
+rg -q '"receipt_schema": "fn64.wm2000.withheld-pair-build-receipt.v3"' "$test_v3_output/comparison.json"
+if ROM=$test_rom \
+    FN64_BOOT_CONTEXT=$test_boot \
+    FN64_WM_PAIR_RECEIPT=$test_mixed_v4_receipt \
+    FN64_WM_AOT_BINARY=$test_aot \
+    FN64_WM_DYNAMIC_BINARY=$test_dynamic \
+    FN64_WM_DIFF_OUTPUT_DIR=$test_mixed_v4_output \
+    "$test_root/scripts/wm2000-withheld-rdram-diff.zsh" "$test_schedule" 1000000 2000000 \
+        >"$test_dir/mixed-v4.log" 2>&1
+then
+    print -u2 -- "test-wm2000-withheld-rdram-diff: v4 receipt accepted v3-only fields"
+    exit 1
+fi
+rg -q 'invalid pair receipt: artifacts fields' "$test_dir/mixed-v4.log"
+[[ ! -e "$test_mixed_v4_output/aot.log" ]]
 rg -q '"match": true' "$test_output/comparison.json"
 rg -q '"authority": "operational_rdram_and_owner_components_with_published_cpu_diagnostics"' "$test_output/comparison.json"
 rg -q '"device_match": true' "$test_output/comparison.json"

@@ -388,15 +388,18 @@ scripts/build-wm2000-withheld-pair.zsh \
 ```
 
 The destination must not exist and must remain outside the repository. The
-builder checks both feature graphs and type-checks the exact
-`dynamic-withheld` binary before running the AOT and dynamic `--locked` builds
-serially under a 4,096 MiB/40%-free,
+builder checks both feature graphs, then runs the AOT and dynamic `--locked`
+builds serially under a 4,096 MiB/40%-free,
 one-hour-per-lane default guard. It retains distinct executables, sanitized
 logs, per-lane guard JSONL, and a path-free build-local receipt. The receipt
 binds private-input, capture-group, manifest, lock, guard, checker, and binary
 digests, but deliberately carries no release or static-discovery authority.
-The source check covers the real generated pack and feature-gated dependency
-APIs; linking and runtime behavior remain the two later gates.
+Receipt v4 omits the former standalone dynamic `cargo check`: the retained
+dynamic build compiles the same source and feature graph and additionally links
+the executable, while avoiding a dynamic-to-AOT-to-dynamic Cargo feature flip.
+The comparator accepts retained v3 receipts under their exact legacy field set
+and v4 receipts under the smaller exact field set; fields cannot be mixed
+between versions.
 
 After an interrupted or failed attempt, seed a new immutable attempt from its
 retained private Cargo target:
