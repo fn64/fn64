@@ -33,6 +33,12 @@ typeset -r test_identity_drift_output=$test_dir/identity-drift-output
 typeset -r test_zero_dynamic_work_output=$test_dir/zero-dynamic-work-output
 typeset -r test_v1_telemetry_output=$test_dir/v1-telemetry-output
 typeset -r test_resolver_drift_output=$test_dir/resolver-drift-output
+typeset -r test_missing_diagnostic_output=$test_dir/missing-diagnostic-output
+typeset -r test_malformed_diagnostic_output=$test_dir/malformed-diagnostic-output
+typeset -r test_duplicate_diagnostic_output=$test_dir/duplicate-diagnostic-output
+typeset -r test_count_mismatch_diagnostic_output=$test_dir/count-mismatch-diagnostic-output
+typeset -r test_pending_mismatch_diagnostic_output=$test_dir/pending-mismatch-diagnostic-output
+typeset -r test_prepared_mismatch_diagnostic_output=$test_dir/prepared-mismatch-diagnostic-output
 mkdir "$test_output"
 mkdir "$test_v3_output"
 mkdir "$test_mixed_v4_output"
@@ -50,12 +56,19 @@ mkdir "$test_identity_drift_output"
 mkdir "$test_zero_dynamic_work_output"
 mkdir "$test_v1_telemetry_output"
 mkdir "$test_resolver_drift_output"
+mkdir "$test_missing_diagnostic_output"
+mkdir "$test_malformed_diagnostic_output"
+mkdir "$test_duplicate_diagnostic_output"
+mkdir "$test_count_mismatch_diagnostic_output"
+mkdir "$test_pending_mismatch_diagnostic_output"
+mkdir "$test_prepared_mismatch_diagnostic_output"
 printf '\x80\x37\x12\x40rom' >"$test_rom"
 print -n -- boot >"$test_boot"
 print -n -- schedule >"$test_schedule"
 
 cat >"$test_aot" <<'EOF'
 #!/bin/zsh
+[[ "${FN64_WM_PUBLICATION_DIAGNOSTIC:-}" == 1 ]]
 print -- '[wm2000-program-identity] schema=fn64.wm2000.program-identity.v1 sha256=5555555555555555555555555555555555555555555555555555555555555555 source=canonical_block_program_sha256 resolver_sha256=1111111111111111111111111111111111111111111111111111111111111111 entry_bank=0000000000000001 entry_pc=80001000'
 print -- '[wm2000-block-checkpoint] minimum_guest_instructions=1000000 expected_guest_instructions=None achieved_guest_instructions=1000004 scheduler_steps=42 sim_time=9001 logical_rdram_bytes=8388608 logical_rdram_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 if [[ "${FN64_TEST_PARKED_FAULT:-}" == 1 ]]; then
@@ -65,12 +78,22 @@ elif [[ "${FN64_TEST_NONCOMPARABLE_CPU:-}" == 1 ]]; then
 else
     print -- '[wm2000-operational-boundary] schema=fn64.wm2000.operational-boundary.v1 component_schema=fn64.operational-state-component-digests.v1 publication_schema=fn64.operational-thread-publication-digests.v2 capture_relation=latest_per_thread_publication_paired_with_post_scheduler_owner_snapshots device_sha256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd executor_sha256=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee abi_host_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff cpu_sha256=8888888888888888888888888888888888888888888888888888888888888888 continuation_sha256=9999999999999999999999999999999999999999999999999999999999999999 executor_threads=1 publications=1 exact=1 opaque=0 opaque_host=0 parked_fault=0 returned=0 missing=0 unexpected=0 cpu_comparable=true mutation_sealed=true pending_writes=0 open_host_transactions=0 mutation_quiescent=true'
 fi
+if [[ "${FN64_TEST_PARKED_FAULT:-}" == 1 ]]; then
+    print -- '[wm2000-publication-diagnostic] {"schema":"fn64.wm2000.publication-diagnostic.v1","thread":0,"publication_variant":"parked_fault_opaque","cumulative_charge":1000004,"fault":{"at":{"bank":"0x0000000000000001","pc":"0x80001000"},"kind":"Synthetic"},"cpu":{"cop0_count":"0x00000010","cop0_compare":"0x00000020","cop0_count_write":null,"cop0_compare_write":null,"count_independent_schema":"fn64.wm2000.operational-cpu-count-independent.v1","count_independent_sha256":"3333333333333333333333333333333333333333333333333333333333333333"}}'
+elif [[ "${FN64_TEST_NONCOMPARABLE_CPU:-}" == 1 ]]; then
+    print -- '[wm2000-publication-diagnostic] {"schema":"fn64.wm2000.publication-diagnostic.v1","thread":0,"publication_variant":"opaque_host_in_flight","target_pc":"0x80001000","resume":{"bank":"0x0000000000000001","pc":"0x80001004"}}'
+elif [[ "${FN64_TEST_PREPARED_DIAGNOSTIC_MISMATCH:-}" == 1 ]]; then
+    print -- '[wm2000-publication-diagnostic] {"schema":"fn64.wm2000.publication-diagnostic.v1","thread":0,"publication_variant":"exact","last_charge":4,"cumulative_charge":1000004,"pending_exit":{"variant":"image_changed","at":{"bank":"0x0000000000000001","pc":"0x80001000"},"expected_bank":"0x0000000000000001","va_start":"0x80001000","byte_len":4,"expected_sha256":"1111111111111111111111111111111111111111111111111111111111111111","actual_sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"prepared_continuation":{"variant":"image_changed","entry":{"bank":"0x0000000000000001","pc":"0x80001000"}},"cpu":{"cop0_count":"0x00000010","cop0_compare":"0x00000020","cop0_count_write":null,"cop0_compare_write":null,"count_independent_schema":"fn64.wm2000.operational-cpu-count-independent.v1","count_independent_sha256":"3333333333333333333333333333333333333333333333333333333333333333"}}'
+else
+    print -- '[wm2000-publication-diagnostic] {"schema":"fn64.wm2000.publication-diagnostic.v1","thread":0,"publication_variant":"exact","last_charge":4,"cumulative_charge":1000004,"pending_exit":{"variant":"checkpoint","entry":{"bank":"0x0000000000000001","pc":"0x80001000"}},"prepared_continuation":null,"cpu":{"cop0_count":"0x00000010","cop0_compare":"0x00000020","cop0_count_write":null,"cop0_compare_write":null,"count_independent_schema":"fn64.wm2000.operational-cpu-count-independent.v1","count_independent_sha256":"3333333333333333333333333333333333333333333333333333333333333333"}}'
+fi
 if [[ "${FN64_TEST_MUTATE_INPUT:-}" == 1 ]]; then
     print -n -- x >>"$FN64_CONTROLLER_SCHEDULE"
 fi
 EOF
 cat >"$test_dynamic" <<'EOF'
 #!/bin/zsh
+[[ "${FN64_WM_PUBLICATION_DIAGNOSTIC:-}" == 1 ]]
 [[ "$FN64_BLOCK_MIN_GUEST_INSTRUCTIONS" == 1000004 ]]
 [[ "$FN64_BLOCK_EXPECT_GUEST_INSTRUCTIONS" == 1000004 ]]
 [[ "$FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY" == 1 ]]
@@ -245,6 +268,34 @@ sed -i '' "s/OPAQUE_COUNT_PLACEHOLDER/$opaque_count/" "$FN64_DYNAMIC_TELEMETRY"
 sed -i '' "s/OPAQUE_HOST_COUNT_PLACEHOLDER/$opaque_host_count/" "$FN64_DYNAMIC_TELEMETRY"
 sed -i '' "s/PARKED_FAULT_COUNT_PLACEHOLDER/$parked_fault_count/" "$FN64_DYNAMIC_TELEMETRY"
 sed -i '' "s/CPU_COMPARABLE_PLACEHOLDER/$cpu_comparable/" "$FN64_DYNAMIC_TELEMETRY"
+diagnostic_pending='{"variant":"checkpoint","entry":{"bank":"0x0000000000000001","pc":"0x80001000"}}'
+diagnostic_prepared=null
+if [[ "${FN64_TEST_PENDING_DIAGNOSTIC_MISMATCH:-}" == 1 ]]; then
+    diagnostic_pending='{"variant":"yield","entry":{"bank":"0x0000000000000001","pc":"0x80001000"}}'
+fi
+if [[ "${FN64_TEST_PREPARED_DIAGNOSTIC_MISMATCH:-}" == 1 ]]; then
+    diagnostic_pending='{"variant":"image_changed","at":{"bank":"0x0000000000000001","pc":"0x80001000"},"expected_bank":"0x0000000000000001","va_start":"0x80001000","byte_len":4,"expected_sha256":"1111111111111111111111111111111111111111111111111111111111111111","actual_sha256":"2222222222222222222222222222222222222222222222222222222222222222"}'
+    diagnostic_prepared='{"variant":"image_changed","entry":{"bank":"0x0000000000000002","pc":"0x80001000"}}'
+fi
+diagnostic_record="{\"schema\":\"fn64.wm2000.publication-diagnostic.v1\",\"thread\":0,\"publication_variant\":\"exact\",\"last_charge\":1,\"cumulative_charge\":1000004,\"pending_exit\":$diagnostic_pending,\"prepared_continuation\":$diagnostic_prepared,\"cpu\":{\"cop0_count\":\"0x00000030\",\"cop0_compare\":\"0x00000020\",\"cop0_count_write\":null,\"cop0_compare_write\":null,\"count_independent_schema\":\"fn64.wm2000.operational-cpu-count-independent.v1\",\"count_independent_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\"}}"
+if [[ "${FN64_TEST_PARKED_FAULT:-}" == 1 ]]; then
+    diagnostic_record='{"schema":"fn64.wm2000.publication-diagnostic.v1","thread":0,"publication_variant":"parked_fault_opaque","cumulative_charge":1000004,"fault":{"at":{"bank":"0x0000000000000001","pc":"0x80001000"},"kind":"Synthetic"},"cpu":{"cop0_count":"0x00000030","cop0_compare":"0x00000020","cop0_count_write":null,"cop0_compare_write":null,"count_independent_schema":"fn64.wm2000.operational-cpu-count-independent.v1","count_independent_sha256":"3333333333333333333333333333333333333333333333333333333333333333"}}'
+elif [[ "${FN64_TEST_NONCOMPARABLE_CPU:-}" == 1 ]]; then
+    diagnostic_record='{"schema":"fn64.wm2000.publication-diagnostic.v1","thread":0,"publication_variant":"opaque_host_in_flight","target_pc":"0x80001000","resume":{"bank":"0x0000000000000001","pc":"0x80001004"}}'
+fi
+case "${FN64_TEST_PUBLICATION_DIAGNOSTIC_CASE:-}" in
+    missing) ;;
+    malformed) print -- '[wm2000-publication-diagnostic] {not-json' ;;
+    duplicate)
+        print -- "[wm2000-publication-diagnostic] $diagnostic_record"
+        print -- "[wm2000-publication-diagnostic] $diagnostic_record"
+        ;;
+    count_mismatch)
+        print -- "[wm2000-publication-diagnostic] $diagnostic_record"
+        print -- "[wm2000-publication-diagnostic] ${diagnostic_record/\"thread\":0/\"thread\":1}"
+        ;;
+    *) print -- "[wm2000-publication-diagnostic] $diagnostic_record" ;;
+esac
 EOF
 chmod +x "$test_aot" "$test_dynamic"
 typeset test_rom_digest_line test_boot_digest_line test_aot_digest_line test_dynamic_digest_line
@@ -348,6 +399,7 @@ if ! ROM=$test_rom \
     FN64_WM_AOT_BINARY=$test_aot \
     FN64_WM_DYNAMIC_BINARY=$test_dynamic \
     FN64_WM_DIFF_OUTPUT_DIR=$test_output \
+    FN64_WM_PUBLICATION_DIAGNOSTIC=caller_value_must_be_replaced \
     "$test_root/scripts/wm2000-withheld-rdram-diff.zsh" "$test_schedule" 1000000 2000000 \
         >"$test_dir/wrapper.log" 2>&1
 then
@@ -378,6 +430,31 @@ fi
 rg -q '^wm2000 withheld diff: MATCH guest_instructions=1000004 ' "$test_dir/wrapper.log"
 rg -q '"receipt_schema": "fn64.wm2000.withheld-pair-build-receipt.v4"' "$test_output/comparison.json"
 rg -q '"receipt_schema": "fn64.wm2000.withheld-pair-build-receipt.v3"' "$test_v3_output/comparison.json"
+python3 - "$test_output/comparison.json" <<'PY'
+import json
+import sys
+
+comparison = json.load(open(sys.argv[1], encoding="utf-8"))
+assert comparison["schema"] == "fn64.wm2000.withheld-operational-comparison.v3"
+diagnostic = comparison["publication_diagnostic"]
+assert diagnostic["schema"] == "fn64.wm2000.publication-diagnostic-comparison.v1"
+assert diagnostic["authority"] == "diagnostic_only_canonical_publication_digests_remain_the_gate"
+assert [record["thread"] for record in diagnostic["aot_exact_thread_projections"]] == [0]
+assert [record["thread"] for record in diagnostic["dynamic_exact_thread_projections"]] == [0]
+assert diagnostic["aot_exact_thread_projections"][0]["last_charge"] == 4
+assert diagnostic["dynamic_exact_thread_projections"][0]["last_charge"] == 1
+fields = diagnostic["exact_thread_field_matches"][0]
+assert fields["classification"] == "field_mismatch"
+assert fields["field_matches"] == {
+    "last_charge": False,
+    "cumulative_charge": True,
+    "pending_exit": True,
+    "prepared_continuation": True,
+    "cpu": False,
+}
+assert comparison["continuation_match"] is True
+assert comparison["operational_match"] is True
+PY
 if ROM=$test_rom \
     FN64_BOOT_CONTEXT=$test_boot \
     FN64_WM_PAIR_RECEIPT=$test_mixed_v4_receipt \
@@ -497,6 +574,80 @@ rg -q '"continuation_match": false' "$test_continuation_mismatch_output/comparis
 rg -q '"published_cpu_gate_pass": false' "$test_continuation_mismatch_output/comparison.json"
 rg -q '"operational_match": false' "$test_continuation_mismatch_output/comparison.json"
 rg -q '"match": false' "$test_continuation_mismatch_output/comparison.json"
+for diagnostic_case output expected_error in \
+    missing "$test_missing_diagnostic_output" 'dynamic publication diagnostic count' \
+    malformed "$test_malformed_diagnostic_output" 'dynamic publication diagnostic JSON' \
+    duplicate "$test_duplicate_diagnostic_output" 'dynamic publication diagnostic thread ordering' \
+    count_mismatch "$test_count_mismatch_diagnostic_output" 'dynamic publication diagnostic count'
+do
+    if ROM=$test_rom \
+        FN64_BOOT_CONTEXT=$test_boot \
+        FN64_WM_PAIR_RECEIPT=$test_receipt \
+        FN64_WM_AOT_BINARY=$test_aot \
+        FN64_WM_DYNAMIC_BINARY=$test_dynamic \
+        FN64_WM_DIFF_OUTPUT_DIR=$output \
+        FN64_TEST_PUBLICATION_DIAGNOSTIC_CASE=$diagnostic_case \
+        "$test_root/scripts/wm2000-withheld-rdram-diff.zsh" "$test_schedule" 1000000 2000000 \
+        >"$test_dir/$diagnostic_case-diagnostic.log" 2>&1
+    then
+        print -u2 -- "test-wm2000-withheld-rdram-diff: $diagnostic_case publication diagnostic was accepted"
+        exit 1
+    fi
+    rg -q "invalid dynamic telemetry: $expected_error" "$test_dir/$diagnostic_case-diagnostic.log"
+    [[ ! -e "$output/comparison.json" ]]
+done
+
+if ! ROM=$test_rom \
+    FN64_BOOT_CONTEXT=$test_boot \
+    FN64_WM_PAIR_RECEIPT=$test_receipt \
+    FN64_WM_AOT_BINARY=$test_aot \
+    FN64_WM_DYNAMIC_BINARY=$test_dynamic \
+    FN64_WM_DIFF_OUTPUT_DIR=$test_pending_mismatch_diagnostic_output \
+    FN64_TEST_PENDING_DIAGNOSTIC_MISMATCH=1 \
+    "$test_root/scripts/wm2000-withheld-rdram-diff.zsh" "$test_schedule" 1000000 2000000 \
+    >"$test_dir/pending-mismatch-diagnostic.log" 2>&1
+then
+    print -u2 -- "test-wm2000-withheld-rdram-diff: diagnostic-only pending-exit mismatch changed the canonical gate"
+    exit 1
+fi
+python3 - "$test_pending_mismatch_diagnostic_output/comparison.json" <<'PY'
+import json
+import sys
+
+comparison = json.load(open(sys.argv[1], encoding="utf-8"))
+fields = comparison["publication_diagnostic"]["exact_thread_field_matches"][0]
+assert fields["classification"] == "field_mismatch"
+assert fields["field_matches"]["pending_exit"] is False
+assert fields["field_matches"]["prepared_continuation"] is True
+assert comparison["continuation_match"] is True
+assert comparison["match"] is True
+PY
+
+if ! ROM=$test_rom \
+    FN64_BOOT_CONTEXT=$test_boot \
+    FN64_WM_PAIR_RECEIPT=$test_receipt \
+    FN64_WM_AOT_BINARY=$test_aot \
+    FN64_WM_DYNAMIC_BINARY=$test_dynamic \
+    FN64_WM_DIFF_OUTPUT_DIR=$test_prepared_mismatch_diagnostic_output \
+    FN64_TEST_PREPARED_DIAGNOSTIC_MISMATCH=1 \
+    "$test_root/scripts/wm2000-withheld-rdram-diff.zsh" "$test_schedule" 1000000 2000000 \
+    >"$test_dir/prepared-mismatch-diagnostic.log" 2>&1
+then
+    print -u2 -- "test-wm2000-withheld-rdram-diff: diagnostic-only prepared-continuation mismatch changed the canonical gate"
+    exit 1
+fi
+python3 - "$test_prepared_mismatch_diagnostic_output/comparison.json" <<'PY'
+import json
+import sys
+
+comparison = json.load(open(sys.argv[1], encoding="utf-8"))
+fields = comparison["publication_diagnostic"]["exact_thread_field_matches"][0]
+assert fields["classification"] == "field_mismatch"
+assert fields["field_matches"]["pending_exit"] is True
+assert fields["field_matches"]["prepared_continuation"] is False
+assert comparison["continuation_match"] is True
+assert comparison["match"] is True
+PY
 if ROM=$test_rom \
     FN64_BOOT_CONTEXT=$test_boot \
     FN64_WM_PAIR_RECEIPT=$test_receipt \
@@ -655,6 +806,10 @@ for negative_log in \
     "$test_dir/noncomparable.log" \
     "$test_dir/cpu-mismatch.log" \
     "$test_dir/continuation-mismatch.log" \
+    "$test_dir/missing-diagnostic.log" \
+    "$test_dir/malformed-diagnostic.log" \
+    "$test_dir/duplicate-diagnostic.log" \
+    "$test_dir/count_mismatch-diagnostic.log" \
     "$test_dir/stale-telemetry.log" \
     "$test_dir/wrong-pc.log" \
     "$test_dir/identity-drift.log" \

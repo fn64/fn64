@@ -54,9 +54,11 @@ the related discovery tests; `scripts/{wm2000-static-frontier.zsh,current-static
 and the corresponding discovery, scorecard, and fast-loop documentation.
 
 **STATE:** Half-done. The fixed point emits, compiles, and probes five banks.
-The exact-entry A/B reached the same 100,001-instruction horizon but failed its
-continuation comparison. **Exact next step:** expose and diff the pending exit
-and prepared continuation at publication.
+The exact-entry A/B reached the same 100,001-instruction horizon and its v3
+comparison matched RDRAM, owner components, CPU, continuation, scheduler steps,
+simulation time, and the per-thread publication diagnostic. **Exact next
+step:** run nine more frozen real comparisons before calling the scheduler fix
+deterministic.
 
 **VERIFICATION:** The 30-test delay suite and generated-runner direct-entry
 regression each passed 10/10
@@ -367,9 +369,12 @@ plus the corresponding design, fast-loop, and WM boot notes.
 **STATE:** Half-done. One canonical static `(bank, PC)` can be withheld for one
 attempt, dynamic work is charged per attempt, and telemetry v2 binds the
 program and resolver-install identities. Publication digest v2 ignores only
-valid slice partitioning. One real-ROM diagnostic entered the exact withheld
-key dynamically, but the continuation digest differed. **Exact next step:**
-expose and diff the pending exit and prepared continuation at publication.
+valid slice partitioning. The unified dispatcher now publishes executable
+writes before resolving their continuation, and one real-ROM v3 diagnostic
+matched at the exact horizon. **Exact next step:** run the package-wide ABI
+suite against this tree. That step subsequently passed; the exact remaining
+step is nine more frozen real comparisons before calling the scheduler fix
+deterministic.
 
 **VERIFICATION:** Four focused ABI tests passed 10/10, and the publication-v2
 focused gate passed 10/10. The current pair-builder and comparator wrapper
@@ -384,6 +389,19 @@ receipt after seeding from the completed attempt-16 Cargo cache. AOT built in
 33 seconds at 755 MiB peak tree RSS and dynamic-withheld in 32 seconds at 751
 MiB. The pair receipt is
 `/private/tmp/fn64-wm-exact-entry-pair-20260731-17/receipt.json`.
+The focused unified-dispatch suite passed 20/20 after the executable-write
+publication fix. The lane-isolated builder and v3 comparator contracts passed
+together 10/10 after the early-failure lock cleanup reorder. Persistent-cache
+attempt 22 populated AOT/dynamic in
+1,354/1,335 seconds at 1,480/1,482 MiB peak RSS. Unchanged attempt 25 took
+1/2 seconds, emitted zero shard compile lines, and produced byte-identical
+binaries. The real v3 comparison ran once; it does not meet the deterministic
+bar. The package-wide ABI suite passed 286/286 tests with seven skipped once
+after this fix; this is not a ten-run claim.
+`scripts/lint-docs.py` was run once and failed four gates: an asserted but
+ungated content hash at `docs/DISCOVER-PLAN.md:58`, the NMR surface check's
+30-second timeout, stale `docs/BASE-RENDERER-BEHAVIOR-MATRIX.md`, and the
+unsupported-recorder bypass at `crates/fn64-recomp-rs/src/semantic.rs:241`.
 
 **FRONTIER:** Prior whole-shard runs at
 `/private/tmp/fn64-wm-withheld-diff-catalog-fp-20260731-4.10uqUL` and
@@ -392,15 +410,17 @@ MiB. The pair receipt is
 digests, but neither withheld shard was entered. CPU and continuation digests
 differed, so those runs are not dynamic-execution parity evidence
 ([BOOT-NOTES-WM2000.md:1476](BOOT-NOTES-WM2000.md#L1476)).
-The attempt-17 exact-entry diagnostic at
-`/private/tmp/fn64-wm-exact-entry-diff-20260731-17` reached 100,001 charged
+The attempt-25 exact-entry diagnostic at
+`/private/tmp/fn64-wm-exact-entry-diff-20260731-25` reached 100,001 charged
 instructions in both lanes. The exact withheld key
 `81bf2e27273b27db:80000400` executed dynamically once for one instruction with
 zero unsupported exits. Logical RDRAM, CPU, device, executor, ABI-host, and
-simulation time matched. Continuation did not; scheduler steps were 33,333 AOT
-versus 25 dynamic, and the comparison failed. The evidence trail is
+simulation time matched, as did continuation and 33,333 scheduler steps. Both
+publication diagnostics reported the same pending `ExecutableWrite`,
+five-instruction last charge, cumulative charge 100,001, and no prepared
+continuation. The evidence trail is
 `comparison.json`, `dynamic-telemetry.json`, `aot.log`, and `dynamic.log` in
-that directory. This single diagnostic is not a fixed or parity claim.
+that directory. This single diagnostic is not ten-run parity evidence.
 
 **COMMIT SAFETY:** Not safe alone in the present diff. ABI redirect semantics,
 boot-harness wire v2, WM telemetry, build receipt, and comparator schema must
