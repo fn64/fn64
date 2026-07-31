@@ -1132,14 +1132,14 @@ program and resolver-install identities. The identity line and comparator bind
 `resolver_install_sha256` alongside the program digest. This replaces
 whole-shard withholding, which
 could miss an unvisited shard and therefore fail to exercise the mechanism.
-One 100,000-instruction real-ROM diagnostic reached 100,001 charged
+One 100,000-instruction real-ROM v3 diagnostic reached 100,001 charged
 instructions in both lanes. The exact withheld key
 `(0x81bf2e27273b27db, 0x80000400)` executed dynamically once for one instruction
 with zero unsupported exits. Logical RDRAM, CPU, device, executor, ABI-host,
-and simulation time matched, but continuation digests did not; scheduler steps
-were 33,333 AOT versus 25 dynamic. The comparison therefore failed. This
-single diagnostic is not a parity or fixed claim. The exact next step is to
-expose and diff the pending exit and prepared continuation at publication.
+continuation, scheduler steps, and simulation time matched. Both publication
+diagnostics reported the same pending `ExecutableWrite`, five-instruction last
+charge, cumulative charge 100,001, and no prepared continuation. This single
+operational diagnostic is not a ten-run parity claim.
 
 Provenance of the removal: `crates/fn64-diff` once carried a subprocess client
 for the *faki-tools* `oracle` CLI plus a mupen64plus `.m64p` savestate parser,

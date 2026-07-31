@@ -8,7 +8,7 @@ set -eu
 setopt NOCLOBBER
 
 usage() {
-    print -u2 -- "usage: ROM=/absolute/rom.z64 FN64_BOOT_CONTEXT=/absolute/boot.json FN64_EXECUTABLE_IMAGE_GROUPS=GROUP[,GROUP...] GROUP=/absolute/capture1:/absolute/capture2:/absolute/capture3 [FN64_WM_PAIR_CARGO_CACHE_SEED=/absolute/prior-cargo-target] $0 NEW_ABSOLUTE_OUTPUT_DIR"
+    print -u2 -- "usage: ROM=/absolute/rom.z64 FN64_BOOT_CONTEXT=/absolute/boot.json FN64_EXECUTABLE_IMAGE_GROUPS=GROUP[,GROUP...] GROUP=/absolute/capture1:/absolute/capture2:/absolute/capture3 [FN64_WM_PAIR_CARGO_CACHE_SEED=/absolute/prior-cargo-target | FN64_WM_PAIR_CARGO_CACHE_ROOT=/absolute/stable-cache-root] $0 NEW_ABSOLUTE_OUTPUT_DIR"
 }
 
 if (( $# != 1 )); then
@@ -28,10 +28,14 @@ typeset -r pair_min_free_percent=${FN64_GUARD_MIN_FREE_PERCENT:-40}
 typeset -r pair_max_seconds=${FN64_GUARD_MAX_SECONDS:-3600}
 typeset -r pair_poll_seconds=${FN64_GUARD_POLL_SECONDS:-1}
 typeset -r pair_cache_seed_requested=${FN64_WM_PAIR_CARGO_CACHE_SEED:-}
+typeset -r pair_cache_root_requested=${FN64_WM_PAIR_CARGO_CACHE_ROOT:-}
 typeset -r pair_target_subdir=cargo-target
+typeset -r pair_aot_target_subdir=$pair_target_subdir/aot
+typeset -r pair_dynamic_target_subdir=$pair_target_subdir/dynamic-withheld
 typeset -r pair_binary_relative=debug/$pair_package
 typeset -a pair_redactions pair_group_names pair_capture_paths pair_capture_digests pair_group_capture_counts
 typeset pair_redaction_file=
+typeset pair_cache_lock=
 typeset -i pair_finished=0
 
 fail() {
@@ -73,6 +77,9 @@ PY
 cleanup() {
     local result=$?
     trap - EXIT HUP INT TERM
+    if [[ -n "$pair_cache_lock" && -d "$pair_cache_lock" ]]; then
+        rmdir -- "$pair_cache_lock" || print -u2 -- "wm2000 withheld pair build: failed to release persistent Cargo cache lock"
+    fi
     if (( ! pair_finished )) && [[ -n "$pair_redaction_file" && -d ${pair_output:-} ]]; then
         sanitize_log "$pair_output/aot-feature-check.log"
         sanitize_log "$pair_output/pure-aot-checker.log"
@@ -108,7 +115,10 @@ typeset -r pair_boot_context=${FN64_BOOT_CONTEXT:A}
 pair_redactions=("$ROM" "$pair_rom" "$FN64_BOOT_CONTEXT" "$pair_boot_context")
 
 typeset pair_cache_seed=
+typeset pair_cache_root=
 typeset pair_cache_seed_mode=none
+[[ -z "$pair_cache_seed_requested" || -z "$pair_cache_root_requested" ]] || \
+    fail "FN64_WM_PAIR_CARGO_CACHE_SEED and FN64_WM_PAIR_CARGO_CACHE_ROOT are mutually exclusive"
 if [[ -n "$pair_cache_seed_requested" ]]; then
     [[ "$pair_cache_seed_requested" == /* && -d "$pair_cache_seed_requested" \
         && -r "$pair_cache_seed_requested" && ! -L "$pair_cache_seed_requested" ]] || \
@@ -120,6 +130,24 @@ if [[ -n "$pair_cache_seed_requested" ]]; then
     [[ -z "$(find "$pair_cache_seed" -type l -print -quit)" ]] || \
         fail "FN64_WM_PAIR_CARGO_CACHE_SEED must not contain symlinks"
     pair_redactions+=("$pair_cache_seed_requested" "$pair_cache_seed")
+    pair_cache_seed_mode=caller_provided_untrusted_acceleration
+fi
+if [[ -n "$pair_cache_root_requested" ]]; then
+    [[ "$pair_cache_root_requested" == /* && -d "$pair_cache_root_requested" \
+        && -r "$pair_cache_root_requested" && -w "$pair_cache_root_requested" \
+        && ! -L "$pair_cache_root_requested" ]] || \
+        fail "FN64_WM_PAIR_CARGO_CACHE_ROOT must name an absolute readable writable non-symlink directory"
+    pair_cache_root=${pair_cache_root_requested:A}
+    [[ "$pair_cache_root" != "$pair_root_canonical" \
+        && "$pair_cache_root" != "$pair_root_canonical"/* ]] || \
+        fail "FN64_WM_PAIR_CARGO_CACHE_ROOT must remain outside the repository"
+    [[ -z "$(find "$pair_cache_root" -type l -print -quit)" ]] || \
+        fail "FN64_WM_PAIR_CARGO_CACHE_ROOT must not contain symlinks"
+    typeset -r pair_cache_lock_candidate=$pair_cache_root/.fn64-wm-pair.lock
+    mkdir -m 700 -- "$pair_cache_lock_candidate" || \
+        fail "FN64_WM_PAIR_CARGO_CACHE_ROOT is already locked by another pair build"
+    pair_cache_lock=$pair_cache_lock_candidate
+    pair_redactions+=("$pair_cache_root_requested" "$pair_cache_root")
     pair_cache_seed_mode=caller_provided_untrusted_acceleration
 fi
 
@@ -175,6 +203,14 @@ typeset -r pair_cargo_pre_sha=$(hash_file "$pair_cargo")
 
 mkdir -m 700 -- "$pair_output" || fail "cannot create private output directory"
 typeset -r pair_target=$pair_output/$pair_target_subdir
+typeset -r pair_retained_aot_target=$pair_output/$pair_aot_target_subdir
+typeset -r pair_retained_dynamic_target=$pair_output/$pair_dynamic_target_subdir
+typeset pair_build_target_root=$pair_target
+if [[ -n "$pair_cache_root" ]]; then
+    pair_build_target_root=$pair_cache_root
+fi
+typeset -r pair_aot_target=$pair_build_target_root/aot
+typeset -r pair_dynamic_target=$pair_build_target_root/dynamic-withheld
 typeset -r pair_aot_log=$pair_output/aot-build.log
 typeset -r pair_dynamic_log=$pair_output/dynamic-withheld-build.log
 typeset -r pair_aot_check_log=$pair_output/aot-feature-check.log
@@ -190,13 +226,37 @@ typeset -r pair_receipt=$pair_output/receipt.json
 pair_redaction_file=$(mktemp "${TMPDIR:-/private/tmp}/fn64-wm-pair-redactions.XXXXXX") || fail "cannot reserve private redaction list"
 printf '%s\n' "${pair_redactions[@]}" >> "$pair_redaction_file"
 
+mkdir -m 700 -- "$pair_target" "$pair_retained_aot_target" "$pair_retained_dynamic_target" || \
+    fail "cannot create retained lane-isolated private Cargo targets"
+if [[ -n "$pair_cache_root" ]]; then
+    if [[ -e "$pair_aot_target" || -e "$pair_dynamic_target" ]]; then
+        [[ -d "$pair_aot_target" && ! -L "$pair_aot_target" \
+            && -d "$pair_dynamic_target" && ! -L "$pair_dynamic_target" ]] || \
+            fail "persistent Cargo cache root must contain both aot and dynamic-withheld directories"
+    else
+        mkdir -m 700 -- "$pair_aot_target" "$pair_dynamic_target" || \
+            fail "cannot create persistent lane-isolated Cargo targets"
+    fi
+fi
 if [[ -n "$pair_cache_seed" ]]; then
-    mkdir -m 700 -- "$pair_target" || fail "cannot create private Cargo target"
-    # The seed is only a local acceleration input. Both lanes still execute
-    # their complete Cargo commands, and only their newly retained binaries
-    # enter the build-local receipt.
-    cp -cR -- "$pair_cache_seed/." "$pair_target" || \
-        fail "cannot clone the caller-provided Cargo cache seed"
+    # A lane-isolated seed preserves Cargo's per-feature freshness state. A
+    # legacy flat target is cloned into both lanes so existing private attempts
+    # remain useful without letting either feature graph evict the other.
+    if [[ -e "$pair_cache_seed/aot" || -e "$pair_cache_seed/dynamic-withheld" ]]; then
+        [[ -d "$pair_cache_seed/aot" && ! -L "$pair_cache_seed/aot" \
+            && -d "$pair_cache_seed/dynamic-withheld" \
+            && ! -L "$pair_cache_seed/dynamic-withheld" ]] || \
+            fail "lane-isolated Cargo cache seed must contain aot and dynamic-withheld directories"
+        cp -cR -- "$pair_cache_seed/aot/." "$pair_retained_aot_target" || \
+            fail "cannot clone the caller-provided AOT Cargo cache seed"
+        cp -cR -- "$pair_cache_seed/dynamic-withheld/." "$pair_retained_dynamic_target" || \
+            fail "cannot clone the caller-provided dynamic Cargo cache seed"
+    else
+        cp -cR -- "$pair_cache_seed/." "$pair_retained_aot_target" || \
+            fail "cannot clone the caller-provided legacy Cargo cache seed into the AOT lane"
+        cp -cR -- "$pair_cache_seed/." "$pair_retained_dynamic_target" || \
+            fail "cannot clone the caller-provided legacy Cargo cache seed into the dynamic lane"
+    fi
 fi
 
 copy_retained_binary() {
@@ -214,7 +274,6 @@ pair_build_env=(
     "ROM=$pair_rom"
     "FN64_BOOT_CONTEXT=$pair_boot_context"
     "FN64_EXECUTABLE_IMAGE_GROUPS=$FN64_EXECUTABLE_IMAGE_GROUPS"
-    "CARGO_TARGET_DIR=$pair_target"
     CARGO_BUILD_JOBS=1
     "FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib"
     "FN64_GUARD_MIN_FREE_PERCENT=$pair_min_free_percent"
@@ -231,7 +290,7 @@ if ! FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib \
     FN64_GUARD_MAX_SECONDS=$pair_max_seconds \
     FN64_GUARD_POLL_SECONDS=$pair_poll_seconds \
     FN64_GUARD_JSONL=$pair_aot_check_guard_jsonl \
-    CARGO_TARGET_DIR=$pair_target CARGO_BUILD_JOBS=1 \
+    CARGO_TARGET_DIR=$pair_aot_target CARGO_BUILD_JOBS=1 \
     "$pair_guard" /bin/zsh -c '
         set -eu
         "$1" tree --locked --manifest-path "$3" -e features -p "$4" -i fn64-recomp-rs
@@ -263,7 +322,7 @@ if ! FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib \
     FN64_GUARD_MAX_SECONDS=$pair_max_seconds \
     FN64_GUARD_POLL_SECONDS=$pair_poll_seconds \
     FN64_GUARD_JSONL=$pair_dynamic_check_guard_jsonl \
-    CARGO_TARGET_DIR=$pair_target CARGO_BUILD_JOBS=1 \
+    CARGO_TARGET_DIR=$pair_dynamic_target CARGO_BUILD_JOBS=1 \
     "$pair_guard" "$pair_cargo" tree --locked --manifest-path "$pair_manifest" \
         -e features -p "$pair_package" -i fn64-recomp-rs --features dynamic-withheld \
         >"$pair_dynamic_check_log" 2>&1
@@ -289,13 +348,13 @@ if ! FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib \
     FN64_GUARD_MAX_SECONDS=$pair_max_seconds \
     FN64_GUARD_POLL_SECONDS=$pair_poll_seconds \
     FN64_GUARD_JSONL=$pair_aot_guard_jsonl \
-    "$pair_guard" /usr/bin/env "${pair_build_env[@]}" \
+    "$pair_guard" /usr/bin/env "${pair_build_env[@]}" "CARGO_TARGET_DIR=$pair_aot_target" \
     "$pair_cargo" build -j1 --locked --manifest-path "$pair_manifest" -p "$pair_package" >"$pair_aot_log" 2>&1
 then
     sanitize_log "$pair_aot_log"
     fail "AOT build failed; retained $pair_aot_log"
 fi
-copy_retained_binary "$pair_target/$pair_binary_relative" "$pair_aot_binary"
+copy_retained_binary "$pair_aot_target/$pair_binary_relative" "$pair_aot_binary"
 
 print -u2 -- "wm2000 withheld pair build: building dynamic-withheld artifact"
 if ! FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib \
@@ -303,14 +362,22 @@ if ! FN64_GUARD_MAX_RSS_MIB=$pair_max_rss_mib \
     FN64_GUARD_MAX_SECONDS=$pair_max_seconds \
     FN64_GUARD_POLL_SECONDS=$pair_poll_seconds \
     FN64_GUARD_JSONL=$pair_dynamic_guard_jsonl \
-    "$pair_guard" /usr/bin/env "${pair_build_env[@]}" \
+    "$pair_guard" /usr/bin/env "${pair_build_env[@]}" "CARGO_TARGET_DIR=$pair_dynamic_target" \
     "$pair_cargo" build -j1 --locked --manifest-path "$pair_manifest" -p "$pair_package" --features dynamic-withheld >"$pair_dynamic_log" 2>&1
 then
     sanitize_log "$pair_aot_log"
     sanitize_log "$pair_dynamic_log"
     fail "dynamic-withheld build failed; retained $pair_dynamic_log"
 fi
-copy_retained_binary "$pair_target/$pair_binary_relative" "$pair_dynamic_binary"
+copy_retained_binary "$pair_dynamic_target/$pair_binary_relative" "$pair_dynamic_binary"
+if [[ -n "$pair_cache_root" ]]; then
+    [[ -z "$(find "$pair_cache_root" -type l -print -quit)" ]] || \
+        fail "persistent Cargo cache produced a symlink; refusing retained cache snapshot"
+    cp -cR -- "$pair_aot_target/." "$pair_retained_aot_target" || \
+        fail "cannot snapshot the persistent AOT Cargo cache"
+    cp -cR -- "$pair_dynamic_target/." "$pair_retained_dynamic_target" || \
+        fail "cannot snapshot the persistent dynamic Cargo cache"
+fi
 sanitize_log "$pair_aot_check_log"
 sanitize_log "$pair_checker_log"
 sanitize_log "$pair_dynamic_check_log"
@@ -345,10 +412,14 @@ typeset -r pair_aot_feature_tree_sha=$(hash_file "$pair_aot_check_log")
 typeset -r pair_checker_log_sha=$(hash_file "$pair_checker_log")
 typeset -r pair_dynamic_feature_tree_sha=$(hash_file "$pair_dynamic_check_log")
 [[ "$pair_aot_sha" != "$pair_dynamic_sha" ]] || fail "feature-separated retained binaries unexpectedly have identical hashes"
+typeset pair_command_target_root='<PRIVATE_OUTPUT>/cargo-target'
+if [[ -n "$pair_cache_root" ]]; then
+    pair_command_target_root='<PRIVATE_PERSISTENT_CACHE>'
+fi
 
 python3 - "$pair_receipt" "$pair_rom_pre_sha" "$pair_boot_context_pre_sha" "$pair_aot_sha" "$pair_dynamic_sha" "$pair_manifest_pre_sha" "$pair_lock_pre_sha" "$pair_guard_pre_sha" "$pair_checker_pre_sha" "$pair_cargo_pre_sha" \
     "$pair_max_rss_mib" "$pair_min_free_percent" "$pair_max_seconds" "$pair_poll_seconds" \
-    "$pair_target_subdir" "$pair_cache_seed_mode" "${(j:,:)pair_group_names}" "${(j:,:)pair_group_capture_counts}" "${(j:,:)pair_capture_digests}" \
+    "$pair_target_subdir" "$pair_cache_seed_mode" "$pair_command_target_root" "${(j:,:)pair_group_names}" "${(j:,:)pair_group_capture_counts}" "${(j:,:)pair_capture_digests}" \
     "$pair_aot_check_guard_jsonl" "$pair_dynamic_check_guard_jsonl" "$pair_aot_guard_jsonl" "$pair_dynamic_guard_jsonl" \
     "$pair_aot_feature_tree_sha" "$pair_checker_log_sha" "$pair_dynamic_feature_tree_sha" <<'PY'
 import json
@@ -357,6 +428,7 @@ import sys
 (
     receipt_path, rom_sha, boot_context_sha, aot_sha, dynamic_sha, manifest_sha, lock_sha, guard_sha, checker_sha, cargo_sha,
     max_rss_mib, min_free_percent, max_seconds, poll_seconds, target_subdir, cache_seed_mode,
+    command_target_root,
     group_names, group_capture_counts, capture_digests,
     aot_check_jsonl_path, dynamic_check_jsonl_path, aot_jsonl_path, dynamic_jsonl_path,
     aot_feature_tree_sha, checker_log_sha, dynamic_feature_tree_sha,
@@ -453,7 +525,7 @@ receipt = {
         ],
         "aot": [
             "<MEMORY_GUARD_BY_RECORDED_SHA256>", "env", "CARGO_BUILD_JOBS=1",
-            "CARGO_TARGET_DIR=<PRIVATE_OUTPUT>/cargo-target", "ROM=<PRIVATE_ROM>",
+            f"CARGO_TARGET_DIR={command_target_root}/aot", "ROM=<PRIVATE_ROM>",
             "FN64_BOOT_CONTEXT=<PRIVATE_CAPTURE>",
             "FN64_EXECUTABLE_IMAGE_GROUPS=<CAPTURE_GROUP_NAMES_ONLY>",
             "<CARGO_BY_RECORDED_SHA256>", "build", "-j1", "--locked", "--manifest-path",
@@ -461,7 +533,7 @@ receipt = {
         ],
         "dynamic_withheld": [
             "<MEMORY_GUARD_BY_RECORDED_SHA256>", "env", "CARGO_BUILD_JOBS=1",
-            "CARGO_TARGET_DIR=<PRIVATE_OUTPUT>/cargo-target", "ROM=<PRIVATE_ROM>",
+            f"CARGO_TARGET_DIR={command_target_root}/dynamic-withheld", "ROM=<PRIVATE_ROM>",
             "FN64_BOOT_CONTEXT=<PRIVATE_CAPTURE>",
             "FN64_EXECUTABLE_IMAGE_GROUPS=<CAPTURE_GROUP_NAMES_ONLY>",
             "<CARGO_BY_RECORDED_SHA256>", "build", "-j1", "--locked", "--manifest-path",

@@ -142,7 +142,8 @@ fi
 ! rg -q 'cargo check' "$order"
 typeset -r aot_target=$(sed -n '6p' "$order" | sed -n 's/.*CARGO_TARGET_DIR=\([^ ]*\).*/\1/p')
 typeset -r dynamic_target=$(sed -n '8p' "$order" | sed -n 's/.*CARGO_TARGET_DIR=\([^ ]*\).*/\1/p')
-[[ -n "$aot_target" && "$aot_target" == "$dynamic_target" && "$aot_target" == "$output/cargo-target" ]]
+[[ "$aot_target" == "$output/cargo-target/aot" ]]
+[[ "$dynamic_target" == "$output/cargo-target/dynamic-withheld" ]]
 rg -q '<PRIVATE_INPUT>' "$output/aot-build.log"
 rg -q '<PRIVATE_INPUT>' "$output/dynamic-withheld-build.log"
 for retained in "$output/aot-build.log" "$output/dynamic-withheld-build.log" "$output/receipt.json"; do
@@ -235,7 +236,8 @@ then
     command cat -- "$test_dir/seeded.log" >&2
     exit 1
 fi
-[[ -f "$seeded_output/cargo-target/seed-marker" ]]
+[[ -f "$seeded_output/cargo-target/aot/seed-marker" ]]
+[[ -f "$seeded_output/cargo-target/dynamic-withheld/seed-marker" ]]
 python3 - "$seeded_output/receipt.json" <<'PY'
 import json
 import sys
@@ -246,6 +248,142 @@ if rg -Fq "$seed" "$seeded_output/receipt.json" "$seeded_output/aot-build.log" "
     print -u2 -- "test-build-wm2000-withheld-pair: Cargo cache seed path leaked"
     exit 1
 fi
+
+typeset -r lane_seed=$test_dir/lane-cache-seed
+typeset -r lane_seeded_output=$test_dir/lane-seeded-output
+mkdir -p "$lane_seed/aot" "$lane_seed/dynamic-withheld"
+print -n -- aot-cache > "$lane_seed/aot/aot-marker"
+print -n -- dynamic-cache > "$lane_seed/dynamic-withheld/dynamic-marker"
+if ! PATH=$fake_bin:$PATH \
+    ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \
+    FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGE_FIXTURE \
+    FN64_EXECUTABLE_IMAGE_FIXTURE=$test_capture_a:$test_capture_b:$test_capture_c \
+    FN64_PAIR_TEST_ORDER=$test_dir/lane-seed-order.log \
+    FN64_WM_PAIR_MEMORY_GUARD=$test_dir/fake-guard \
+    FN64_WM_PAIR_AOT_CHECKER=$test_dir/fake-checker \
+    FN64_WM_PAIR_CARGO_CACHE_SEED=$lane_seed \
+    "$test_root/scripts/build-wm2000-withheld-pair.zsh" "$lane_seeded_output" \
+        >"$test_dir/lane-seeded.log" 2>&1
+then
+    command cat -- "$test_dir/lane-seeded.log" >&2
+    exit 1
+fi
+[[ -f "$lane_seeded_output/cargo-target/aot/aot-marker" ]]
+[[ ! -e "$lane_seeded_output/cargo-target/aot/dynamic-marker" ]]
+[[ -f "$lane_seeded_output/cargo-target/dynamic-withheld/dynamic-marker" ]]
+[[ ! -e "$lane_seeded_output/cargo-target/dynamic-withheld/aot-marker" ]]
+
+typeset -r partial_lane_seed=$test_dir/partial-lane-cache-seed
+mkdir -p "$partial_lane_seed/aot"
+if PATH=$fake_bin:$PATH \
+    ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \
+    FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGE_FIXTURE \
+    FN64_EXECUTABLE_IMAGE_FIXTURE=$test_capture_a:$test_capture_b:$test_capture_c \
+    FN64_PAIR_TEST_ORDER=$test_dir/partial-lane-seed-order.log \
+    FN64_WM_PAIR_MEMORY_GUARD=$test_dir/fake-guard \
+    FN64_WM_PAIR_AOT_CHECKER=$test_dir/fake-checker \
+    FN64_WM_PAIR_CARGO_CACHE_SEED=$partial_lane_seed \
+    "$test_root/scripts/build-wm2000-withheld-pair.zsh" \
+        "$test_dir/partial-lane-seeded-output" >"$test_dir/partial-lane-seeded.log" 2>&1
+then
+    print -u2 -- "test-build-wm2000-withheld-pair: partial lane cache seed was accepted"
+    exit 1
+fi
+rg -q 'must contain aot and dynamic-withheld directories' "$test_dir/partial-lane-seeded.log"
+
+typeset -r persistent_cache=$test_dir/persistent-cache
+typeset -r persistent_output=$test_dir/persistent-output
+mkdir "$persistent_cache"
+if ! PATH=$fake_bin:$PATH \
+    ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \
+    FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGE_FIXTURE \
+    FN64_EXECUTABLE_IMAGE_FIXTURE=$test_capture_a:$test_capture_b:$test_capture_c \
+    FN64_PAIR_TEST_ORDER=$test_dir/persistent-order.log \
+    FN64_WM_PAIR_MEMORY_GUARD=$test_dir/fake-guard \
+    FN64_WM_PAIR_AOT_CHECKER=$test_dir/fake-checker \
+    FN64_WM_PAIR_CARGO_CACHE_ROOT=$persistent_cache \
+    "$test_root/scripts/build-wm2000-withheld-pair.zsh" "$persistent_output" \
+        >"$test_dir/persistent.log" 2>&1
+then
+    command cat -- "$test_dir/persistent.log" >&2
+    exit 1
+fi
+[[ -x "$persistent_cache/aot/debug/wm2000-block-boot" ]]
+[[ -x "$persistent_cache/dynamic-withheld/debug/wm2000-block-boot" ]]
+[[ -x "$persistent_output/cargo-target/aot/debug/wm2000-block-boot" ]]
+[[ -x "$persistent_output/cargo-target/dynamic-withheld/debug/wm2000-block-boot" ]]
+[[ ! -e "$persistent_cache/.fn64-wm-pair.lock" ]]
+python3 - "$persistent_output/receipt.json" <<'PY'
+import json
+import sys
+
+receipt = json.load(open(sys.argv[1], encoding="utf-8"))
+assert receipt["artifacts"]["cargo_cache_seed"] == "caller_provided_untrusted_acceleration"
+assert "CARGO_TARGET_DIR=<PRIVATE_PERSISTENT_CACHE>/aot" in receipt["commands"]["aot"]
+assert "CARGO_TARGET_DIR=<PRIVATE_PERSISTENT_CACHE>/dynamic-withheld" in receipt["commands"]["dynamic_withheld"]
+PY
+
+typeset -r persistent_failure_output=$test_dir/persistent-failure-output
+if PATH=$fake_bin:$PATH \
+    ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \
+    FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGE_FIXTURE \
+    FN64_EXECUTABLE_IMAGE_FIXTURE=$test_capture_a:$test_capture_b:$test_capture_c \
+    FN64_PAIR_TEST_ORDER=$test_dir/persistent-failure-order.log \
+    FN64_PAIR_TEST_GUARD_BOOL=1 \
+    FN64_WM_PAIR_MEMORY_GUARD=$test_dir/fake-guard \
+    FN64_WM_PAIR_AOT_CHECKER=$test_dir/fake-checker \
+    FN64_WM_PAIR_CARGO_CACHE_ROOT=$persistent_cache \
+    "$test_root/scripts/build-wm2000-withheld-pair.zsh" "$persistent_failure_output" \
+        >"$test_dir/persistent-failure.log" 2>&1
+then
+    print -u2 -- "test-build-wm2000-withheld-pair: persistent early-failure fixture was accepted"
+    exit 1
+fi
+rg -q 'memory guard JSONL tree_rss_mib is invalid' "$test_dir/persistent-failure.log"
+[[ ! -e "$persistent_cache/.fn64-wm-pair.lock" ]]
+
+if rg -Fq "$persistent_cache" "$persistent_output/receipt.json" \
+    "$persistent_output/aot-build.log" "$persistent_output/dynamic-withheld-build.log"; then
+    print -u2 -- "test-build-wm2000-withheld-pair: persistent Cargo cache path leaked"
+    exit 1
+fi
+
+typeset -r locked_cache=$test_dir/locked-persistent-cache
+mkdir -p "$locked_cache/aot" "$locked_cache/dynamic-withheld" \
+    "$locked_cache/.fn64-wm-pair.lock"
+if PATH=$fake_bin:$PATH \
+    ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \
+    FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGE_FIXTURE \
+    FN64_EXECUTABLE_IMAGE_FIXTURE=$test_capture_a:$test_capture_b:$test_capture_c \
+    FN64_PAIR_TEST_ORDER=$test_dir/locked-persistent-order.log \
+    FN64_WM_PAIR_MEMORY_GUARD=$test_dir/fake-guard \
+    FN64_WM_PAIR_AOT_CHECKER=$test_dir/fake-checker \
+    FN64_WM_PAIR_CARGO_CACHE_ROOT=$locked_cache \
+    "$test_root/scripts/build-wm2000-withheld-pair.zsh" \
+        "$test_dir/locked-persistent-output" >"$test_dir/locked-persistent.log" 2>&1
+then
+    print -u2 -- "test-build-wm2000-withheld-pair: locked persistent cache was accepted"
+    exit 1
+fi
+rg -q 'already locked by another pair build' "$test_dir/locked-persistent.log"
+[[ -d "$locked_cache/.fn64-wm-pair.lock" ]]
+
+if PATH=$fake_bin:$PATH \
+    ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \
+    FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGE_FIXTURE \
+    FN64_EXECUTABLE_IMAGE_FIXTURE=$test_capture_a:$test_capture_b:$test_capture_c \
+    FN64_PAIR_TEST_ORDER=$test_dir/mutual-cache-order.log \
+    FN64_WM_PAIR_MEMORY_GUARD=$test_dir/fake-guard \
+    FN64_WM_PAIR_AOT_CHECKER=$test_dir/fake-checker \
+    FN64_WM_PAIR_CARGO_CACHE_SEED=$seed \
+    FN64_WM_PAIR_CARGO_CACHE_ROOT=$persistent_cache \
+    "$test_root/scripts/build-wm2000-withheld-pair.zsh" \
+        "$test_dir/mutual-cache-output" >"$test_dir/mutual-cache.log" 2>&1
+then
+    print -u2 -- "test-build-wm2000-withheld-pair: simultaneous seed and persistent cache were accepted"
+    exit 1
+fi
+rg -q 'are mutually exclusive' "$test_dir/mutual-cache.log"
 
 if PATH=$fake_bin:$PATH \
     ROM=$test_rom FN64_BOOT_CONTEXT=$test_boot \

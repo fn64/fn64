@@ -1520,17 +1520,17 @@ Its AOT build completed in 33 seconds at 755 MiB peak tree RSS, and its dynamic
 build completed in 32 seconds at 751 MiB. The receipt is retained privately at
 `/private/tmp/fn64-wm-exact-entry-pair-20260731-17/receipt.json`.
 
-One real-ROM 100,000-instruction diagnostic then reached 100,001 charged
+One real-ROM 100,000-instruction v3 diagnostic then reached 100,001 charged
 instructions in both lanes. The exact withheld key
 `81bf2e27273b27db:80000400` ran dynamically once, charged one instruction, and
 reported zero unsupported exits. Full logical RDRAM, CPU, device, executor,
-ABI-host, and simulation time matched. Continuation digests differed, and the
-AOT lane took 33,333 scheduler steps while the dynamic lane took 25, so the v2
-comparison failed. Its private evidence is
-`/private/tmp/fn64-wm-exact-entry-diff-20260731-17/comparison.json`,
+ABI-host, continuation, scheduler steps, and simulation time matched. Both
+lanes published the same pending `ExecutableWrite`, five-instruction last
+charge, cumulative charge 100,001, and no prepared continuation. Its private
+evidence is
+`/private/tmp/fn64-wm-exact-entry-diff-20260731-25/comparison.json`,
 `dynamic-telemetry.json`, `aot.log`, and `dynamic.log`. This is one diagnostic,
-not a fixed or parity claim. The exact next step is to expose and diff the
-pending exit and prepared continuation at publication.
+not a ten-run parity claim.
 
 Profiling gained `FN64_PROFILE_STOP_AT_PC` self-enablement (it no longer needs a
 second AOT profiling flag), FCSR in watched-PC snapshots, and
