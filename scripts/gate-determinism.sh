@@ -76,6 +76,9 @@ expected_d1_oot_overlays=c8fcb6a1fb013492cce964e71c4985ba10aa197cc0e66b9cbab57ed
 #      had already proven were code.
 #   2. `block_proof_blockers=` added: why block proof refused, which is the
 #      actionable half of dynamic_mips.
+# Retained historical schema-v1 baseline. Snapshot schema v2 intentionally
+# changes block authority, so this remains a fail-loud stale-evidence sentinel
+# until all six private inputs regenerate a replacement digest and docs/counts.
 expected_closure=1c6db90343e63b1f482c403b1b3a057d225dc4cc9baeb6ddd5adcc4b924dc317
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
@@ -127,7 +130,11 @@ check_gate() {
     expected=$2
     i=1
     while [ "$i" -le "$runs" ]; do
-        got=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" \
+        # Output-producing closure diagnostics are outside the retained stdout
+        # contract. Scrub them for every gate so an ambient opt-in cannot
+        # mutate the stale-evidence sentinel or write a private artifact.
+        got=$(env -u FN64_CLOSURE_AUDIT_DIR -u FN64_EMIT_BLOCK_PROGRAM \
+            cargo run --quiet --manifest-path "$repo/Cargo.toml" \
             -p fn64-discover --bin "$gate" | sha_stdout)
         if [ "$got" != "$expected" ]; then
             echo "$gate run $i/$runs: output sha256 $got != expected $expected" >&2

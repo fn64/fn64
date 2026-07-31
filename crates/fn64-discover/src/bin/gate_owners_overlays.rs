@@ -397,6 +397,7 @@ fn callable_roots(facts: &FactDb, mapping: &OverlayMapping) -> Vec<u32> {
                     | FunctionEntryEvidence::ResolvedJalr { .. }
                     | FunctionEntryEvidence::ExhaustiveIndirectCall { .. }
                     | FunctionEntryEvidence::TableEntry { .. }
+                    | FunctionEntryEvidence::HandlerTablePointer { .. }
             )
         {
             continue;

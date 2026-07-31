@@ -94,7 +94,10 @@ fn nwxe_selects_the_overlay_strategy_and_the_vrom_strategy_finds_nothing() {
     assert_eq!(auto.selected, DiscoveryStrategy::RecoveredOverlays);
     let overlays = outcome(&auto.outcomes, DiscoveryStrategy::RecoveredOverlays);
     assert!(overlays.admitted_tables > 0);
-    assert!(overlays.proven_mappings > 1, "only the boot bank was proven");
+    assert!(
+        overlays.proven_mappings > 1,
+        "only the boot bank was proven"
+    );
 
     let vrom = outcome(&auto.outcomes, DiscoveryStrategy::RecoveredVrom);
     assert_eq!(

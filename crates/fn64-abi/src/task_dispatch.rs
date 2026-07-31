@@ -442,18 +442,20 @@ unsafe fn dispatch_gfx_task_chunk(
         // own surface and copies the result here so the VI-presented frame
         // isn't blank. `0` (no VI framebuffer set yet) tells the backend
         // "no known color target": it renders to its own surface only.
-        with_host(|host| {
-            let status = backend.process_task_chunk(
-                rdram_slice,
-                host.device_fabric.rsp_memory_mut(),
-                &task,
-                output_addr,
-                step,
-            )?;
-            Ok(RenderChunkDispatchResult {
-                status,
-                dp_full_sync: backend.last_dp_full_sync(),
-                chunking: backend.task_chunking(),
+        track_rdp_renderer_mutation(rdram_slice, |rdram_slice| {
+            with_host(|host| {
+                let status = backend.process_task_chunk(
+                    rdram_slice,
+                    host.device_fabric.rsp_memory_mut(),
+                    &task,
+                    output_addr,
+                    step,
+                )?;
+                Ok(RenderChunkDispatchResult {
+                    status,
+                    dp_full_sync: backend.last_dp_full_sync(),
+                    chunking: backend.task_chunking(),
+                })
             })
         })
     });
@@ -466,6 +468,14 @@ unsafe fn dispatch_gfx_task_chunk(
             );
         });
         GFX_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+    if matches!(
+        status.status,
+        fn64_render::RenderTaskChunkStatus::NeedsLle { .. }
+    ) {
+        record_rdp_renderer_rejection_v1();
+    } else {
+        record_rdp_renderer_publication_v1();
     }
     status
 }
@@ -568,6 +578,161 @@ pub enum RspInterpreterOwner {
     },
 }
 
+/// The ABI-owned RSP path which committed one publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RspWriterCommitSourceV1 {
+    Interpreter { owner: RspInterpreterOwner },
+    TranslatedAudioHle { owner: RspInterpreterOwner },
+}
+
+/// One task-dispatch-owned RSP-to-RDRAM publication in commit order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RspWriterCommitObservationV1 {
+    pub source: RspWriterCommitSourceV1,
+    pub physical_start: u32,
+    pub physical_end: u32,
+}
+
+/// One successful translated-HLE callback, bound to the executable journal
+/// sequences it committed. An empty sequence set is still a successful typed
+/// publication boundary, but cannot by itself prove an executable write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RspWriterHlePublicationObservationV1 {
+    pub source: RspWriterCommitSourceV1,
+    pub journal_sequences: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RspWriterTraceSnapshotV1 {
+    pub commits: Vec<RspWriterCommitObservationV1>,
+    pub hle_publications: Vec<RspWriterHlePublicationObservationV1>,
+    pub rejected_journal_sequences: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct RspWriterTraceV1 {
+    epoch_id: u64,
+    commits: Vec<RspWriterCommitObservationV1>,
+    hle_publications: Vec<RspWriterHlePublicationObservationV1>,
+    rejected_journal_sequences: Vec<u64>,
+}
+
+thread_local! {
+    static RSP_WRITER_TRACE_V1: RefCell<Option<RspWriterTraceV1>> = const {
+        RefCell::new(None)
+    };
+}
+
+/// Arm the task-dispatch half of one fresh RSP writer audit epoch.
+///
+/// Canonical program/journal quiescence belongs to the recompiler owner. This
+/// function owns only the non-forgeable task-dispatch observation window and
+/// therefore remains crate-private.
+pub(crate) fn begin_rsp_writer_trace_v1(epoch_id: u64) {
+    assert_ne!(epoch_id, 0, "RSP writer trace epoch must be nonzero");
+    RSP_WRITER_TRACE_V1.with(|trace| {
+        *trace.borrow_mut() = Some(RspWriterTraceV1 {
+            epoch_id,
+            commits: Vec::new(),
+            hle_publications: Vec::new(),
+            rejected_journal_sequences: Vec::new(),
+        });
+    });
+}
+
+/// Copy observations only when `epoch_id` still names the live trace arm.
+pub(crate) fn rsp_writer_trace_snapshot_v1(epoch_id: u64) -> Option<RspWriterTraceSnapshotV1> {
+    RSP_WRITER_TRACE_V1.with(|trace| {
+        let trace = trace.borrow();
+        let trace = trace.as_ref()?;
+        (trace.epoch_id == epoch_id).then(|| RspWriterTraceSnapshotV1 {
+            commits: trace.commits.clone(),
+            hle_publications: trace.hle_publications.clone(),
+            rejected_journal_sequences: trace.rejected_journal_sequences.clone(),
+        })
+    })
+}
+
+/// Consume the exact task-dispatch observation window after validation.
+pub(crate) fn finish_rsp_writer_trace_v1(epoch_id: u64) -> bool {
+    RSP_WRITER_TRACE_V1.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        if trace
+            .as_ref()
+            .is_none_or(|trace| trace.epoch_id != epoch_id)
+        {
+            return false;
+        }
+        *trace = None;
+        true
+    })
+}
+
+/// Whether an optimized HLE task still owns a resumable publication phase.
+///
+/// The canonical recompiler validator combines this task-local fact with the
+/// `HostState` task/interpreter owners while it already holds that state; this
+/// split avoids a nested `with_host` borrow at the audit boundary.
+pub(crate) fn hle_rsp_writer_work_pending_v1() -> bool {
+    HLE_RENDER_CONTINUATION.with(|continuation| continuation.borrow().is_some())
+}
+
+fn record_rsp_writer_commits_v1(source: RspWriterCommitSourceV1, written: &[(usize, usize)]) {
+    RSP_WRITER_TRACE_V1.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let Some(trace) = trace.as_mut() else {
+            return;
+        };
+        for &(start, end) in written {
+            assert!(start < end, "RSP writer commit range must be nonempty");
+            assert!(
+                end <= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+                "RSP writer commit range [{start:#x}, {end:#x}) exceeds physical RDRAM"
+            );
+            trace.commits.push(RspWriterCommitObservationV1 {
+                source,
+                physical_start: u32::try_from(start).expect("RSP writer commit start exceeds u32"),
+                physical_end: u32::try_from(end).expect("RSP writer commit end exceeds u32"),
+            });
+        }
+    });
+}
+
+fn finish_translated_audio_hle_publication_v1(
+    source: RspWriterCommitSourceV1,
+    journal_sequences: Vec<u64>,
+    committed: bool,
+) {
+    assert!(
+        matches!(source, RspWriterCommitSourceV1::TranslatedAudioHle { .. }),
+        "translated-HLE lifecycle requires a translated-HLE source"
+    );
+    RSP_WRITER_TRACE_V1.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let Some(trace) = trace.as_mut() else {
+            return;
+        };
+        if committed {
+            trace
+                .hle_publications
+                .push(RspWriterHlePublicationObservationV1 {
+                    source,
+                    journal_sequences,
+                });
+        } else {
+            trace.rejected_journal_sequences.extend(journal_sequences);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_test_rsp_writer_commits_v1(
+    source: RspWriterCommitSourceV1,
+    written: &[(usize, usize)],
+) {
+    record_rsp_writer_commits_v1(source, written);
+}
+
 impl RspInterpreterOwner {
     /// An owner for an admitted task at `offset`.
     pub const fn task(offset: u32, admission_generation: RspTaskAdmissionGeneration) -> Self {
@@ -609,7 +774,10 @@ impl RspInterpreterOwner {
             Self::Task {
                 offset,
                 admission_generation,
-            } => format!("task {offset:#010x} generation {}", admission_generation.get()),
+            } => format!(
+                "task {offset:#010x} generation {}",
+                admission_generation.get()
+            ),
             Self::RawKick {
                 admission_generation,
             } => format!("raw SP kick generation {}", admission_generation.get()),
@@ -966,7 +1134,8 @@ unsafe fn begin_direct_hle_phase(
 
 fn resume_direct_hle_phase(task_addr: RdramAddr) {
     let admission_generation = running_task_admission_generation(task_addr);
-    with_host(|host| match host.rsp_interpreter_state {
+    with_host(|host| {
+        match host.rsp_interpreter_state {
         // Same task address, strictly older generation: this is the suspended
         // owner being reclaimed by its own readmission.
         RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
@@ -998,6 +1167,7 @@ fn resume_direct_hle_phase(task_addr: RdramAddr) {
             "direct-IMEM HLE task {:#010x} cannot resume without its suspended compatibility owner",
             task_addr.offset()
         ),
+    }
     });
 }
 
@@ -1142,18 +1312,25 @@ impl RenderEnvironmentEvidenceSnapshot {
 /// The bytes are already in the live allocation; only recompiler bookkeeping
 /// and executable-page invalidation remain.
 #[cfg(feature = "recomp-rs")]
-fn commit_rsp_rdram_writes(written: &[(usize, usize)]) {
+fn commit_rsp_rdram_writes(source: RspWriterCommitSourceV1, written: &[(usize, usize)]) {
     if written.is_empty() {
         return;
     }
+    record_rsp_writer_commits_v1(source, written);
     for &(start, end) in written {
-        fn64_recomp_rs::notify_guest_write(start as u32, (end - start) as u32);
+        fn64_recomp_rs::notify_rsp_execution_or_hle_writeback(start as u32, (end - start) as u32);
     }
-    crate::recompiled::process_live_executable_writes_from_host();
+    // Raw SP_STATUS and host-call task starts execute inside
+    // BlockProgram::dispatch, which still owns the program borrow. The write
+    // observer makes the generated runner leave through ExecutableWrite as
+    // soon as this MMIO/host call returns; run_block_program then installs the
+    // completed generation after releasing that borrow and before dispatching
+    // another guest instruction. Processing here would reborrow the live
+    // program from inside its own runner.
 }
 
 #[cfg(not(feature = "recomp-rs"))]
-fn commit_rsp_rdram_writes(_written: &[(usize, usize)]) {}
+fn commit_rsp_rdram_writes(_source: RspWriterCommitSourceV1, _written: &[(usize, usize)]) {}
 
 /// Same-task authority required to replace one in-flight interpreter phase.
 /// Construction is confined to the live owner check below; publication
@@ -1423,8 +1600,7 @@ fn continue_rsp_interpreter_phase(
     state: fn64_audio::rsp::runtime::RspMachineState,
 ) {
     let architectural = state.into_architectural_state();
-    with_host(|host| {
-        match &host.rsp_interpreter_state {
+    with_host(|host| match &host.rsp_interpreter_state {
         RspInterpreterStateEvidenceSnapshot::InFlight { owner } if *owner == expected_owner => {}
         RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
             "RSP {} cannot continue interpreter state owned by {}",
@@ -1438,7 +1614,6 @@ fn continue_rsp_interpreter_phase(
             "RSP {} has a same-task machine snapshot without an in-flight rspboot owner",
             expected_owner.describe()
         ),
-    }
     });
     // rspboot's instruction count contributes to task latency, but is not a
     // hardware register and must not seed the ucode phase's diagnostics.
@@ -1467,10 +1642,8 @@ fn commit_rsp_interpreter_phase(
         expected_owner.describe(),
         state.dp_submissions().len()
     );
-    with_host(|host| {
-        match host.rsp_interpreter_state {
-        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner =>
-        {
+    with_host(|host| match host.rsp_interpreter_state {
+        RspInterpreterStateEvidenceSnapshot::InFlight { owner } if owner == expected_owner => {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::Exact(state);
         }
         RspInterpreterStateEvidenceSnapshot::InFlight { owner } => panic!(
@@ -1482,7 +1655,6 @@ fn commit_rsp_interpreter_phase(
             "RSP {} cannot commit without an in-flight interpreter owner",
             expected_owner.describe()
         ),
-    }
     });
 }
 
@@ -1724,6 +1896,11 @@ unsafe fn commit_verified_audio_effects(
         panic!("verified audio publication rejected: {reason}");
     }
 
+    #[cfg(feature = "recomp-rs")]
+    let catalog_writer = crate::recompiled::begin_catalog_nested_writer(
+        live,
+        "verified audio RSP-state publication",
+    );
     with_host(|host| {
         host.device_fabric
             .preflight_complete_rsp_execution_state(&execution_state)
@@ -1775,13 +1952,56 @@ unsafe fn commit_verified_audio_effects(
             RspInterpreterStateEvidenceSnapshot::Exact(architectural_state);
         live.copy_from_slice(&shadow);
     });
-    commit_rsp_rdram_writes(&writes);
+    #[cfg(feature = "recomp-rs")]
+    catalog_writer.commit(live);
 
     fn64_render::DpFullSyncStatus::NotReached
 }
 
 fn rsp_visible_rdram_len(allocation_len: usize) -> usize {
     allocation_len.min(fn64_runtime::rdram::DEFAULT_RDRAM_SIZE)
+}
+
+#[cfg(feature = "recomp-rs")]
+fn track_rdp_renderer_mutation<R>(rdram: &mut [u8], operation: impl FnOnce(&mut [u8]) -> R) -> R {
+    super::recompiled::track_rdp_renderer_mutation(rdram, operation)
+}
+
+#[cfg(feature = "recomp-rs")]
+fn record_rdp_renderer_publication_v1() {
+    super::recompiled::record_rdp_renderer_publication_v1();
+}
+
+#[cfg(feature = "recomp-rs")]
+fn record_rdp_renderer_rejection_v1() {
+    super::recompiled::record_rdp_renderer_rejection_v1();
+}
+
+#[cfg(feature = "recomp-rs")]
+fn track_rsp_execution_or_hle_mutation<R>(
+    rdram: &mut [u8],
+    operation: impl FnOnce(&mut [u8]) -> R,
+) -> (R, Vec<u64>) {
+    super::recompiled::track_rsp_execution_or_hle_mutation(rdram, operation)
+}
+
+#[cfg(not(feature = "recomp-rs"))]
+fn track_rdp_renderer_mutation<R>(rdram: &mut [u8], operation: impl FnOnce(&mut [u8]) -> R) -> R {
+    operation(rdram)
+}
+
+#[cfg(not(feature = "recomp-rs"))]
+fn record_rdp_renderer_publication_v1() {}
+
+#[cfg(not(feature = "recomp-rs"))]
+fn record_rdp_renderer_rejection_v1() {}
+
+#[cfg(not(feature = "recomp-rs"))]
+fn track_rsp_execution_or_hle_mutation<R>(
+    rdram: &mut [u8],
+    operation: impl FnOnce(&mut [u8]) -> R,
+) -> (R, Vec<u64>) {
+    (operation(rdram), Vec::new())
 }
 
 /// Expose the renderer and RDP to physical RDRAM, never the host-only MMIO
@@ -2041,6 +2261,15 @@ unsafe fn dispatch_lle_task(
     const CHUNK_STEPS: u64 = 1 << 20;
     const MAX_TASK_STEPS: u64 = 1 << 26;
 
+    // The HLE renderer records its own preflight boundary. Graphics LLE then
+    // bypasses that boundary and forwards raw DPC work directly, so record the
+    // whole recognized LLE phase here and retain a separate breakdown from
+    // the aggregate graphics-phase total.
+    let gfx_started = (recognize_graphics_microcode && PHASE_TIMING.with(Cell::get))
+        .then(std::time::Instant::now);
+    let mut rsp_execution_ns = 0u64;
+    let mut raw_rdp_ns = 0u64;
+
     let (mut dmem, mut imem, mut pc, imem_generation, rdram_len, static_aliases) =
         with_host(|host| {
             let fabric = &host.device_fabric;
@@ -2064,6 +2293,11 @@ unsafe fn dispatch_lle_task(
     let initial_imem = imem;
     unsafe { trace_rsp_rdram_words(rdram, rdram_len) };
     let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
+    #[cfg(feature = "recomp-rs")]
+    let catalog_writer = crate::recompiled::begin_catalog_nested_writer(
+        unsafe { std::slice::from_raw_parts(rdram, rdram_len) },
+        "RSP LLE execution",
+    );
     // Execute directly against the live allocation. RSP stores are bounded by
     // the admitted DMA ranges and logged by the machine for post-run JIT
     // invalidation; no full-allocation snapshot or memcmp is needed.
@@ -2100,7 +2334,11 @@ unsafe fn dispatch_lle_task(
         } else {
             CHUNK_STEPS
         };
+        let rsp_started = gfx_started.map(|_| std::time::Instant::now());
         let result = fn64_audio::rsp::run_imem(&words, pc, &mut machine, chunk);
+        if let Some(started) = rsp_started {
+            rsp_execution_ns = rsp_execution_ns.saturating_add(started.elapsed().as_nanos() as u64);
+        }
         total_steps = total_steps
             .checked_add(result.steps)
             .expect("RSP task step counter overflow");
@@ -2162,7 +2400,12 @@ unsafe fn dispatch_lle_task(
     let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
-    commit_rsp_rdram_writes(&rdram_writes);
+    commit_rsp_rdram_writes(
+        RspWriterCommitSourceV1::Interpreter { owner },
+        &rdram_writes,
+    );
+    #[cfg(feature = "recomp-rs")]
+    catalog_writer.commit(unsafe { std::slice::from_raw_parts(rdram, rdram_len) });
     commit_rsp_memory_state(
         &dmem,
         &imem,
@@ -2246,8 +2489,12 @@ unsafe fn dispatch_lle_task(
         })
         .unwrap_or_else(|error| panic!("RSP DPC submission rejected: {error}"));
         let mut transaction = LiveDpcTransaction::new(submission);
+        let rdp_started = gfx_started.map(|_| std::time::Instant::now());
         let (full_sync, observation) =
             unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, &mut transaction) };
+        if let Some(started) = rdp_started {
+            raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
+        }
         transaction.commit();
         dpc_observations.push(observation);
         if full_sync == fn64_render::DpFullSyncStatus::Reached {
@@ -2313,6 +2560,18 @@ unsafe fn dispatch_lle_task(
     record_rsp_rdp_observations(observations);
     commit_rsp_interpreter_phase(owner, final_architectural_state);
 
+    if let Some(started) = gfx_started {
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
+        GFX_NS.with(|total| {
+            total.set(total.get().saturating_add(elapsed_ns));
+        });
+        GFX_CALLS.with(|calls| calls.set(calls.get() + 1));
+        GFX_LLE_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));
+        GFX_LLE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        GFX_LLE_RSP_NS.with(|total| total.set(total.get().saturating_add(rsp_execution_ns)));
+        GFX_LLE_RDP_NS.with(|total| total.set(total.get().saturating_add(raw_rdp_ns)));
+    }
+
     LleTaskResult {
         steps: total_steps.max(1),
         dp_full_sync,
@@ -2350,6 +2609,11 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
         "RSP HLE rspboot has no registered process RDRAM allocation"
     );
     let (dma_ranges, _) = rsp_dma_storage_layout(rdram_len, static_aliases);
+    #[cfg(feature = "recomp-rs")]
+    let catalog_writer = crate::recompiled::begin_catalog_nested_writer(
+        unsafe { std::slice::from_raw_parts(rdram, rdram_len) },
+        "RSP HLE rspboot execution",
+    );
     let rdram_slice = unsafe { std::slice::from_raw_parts_mut(rdram, rdram_len) };
     let mut machine = fn64_audio::rsp::runtime::RspMachine::new(rdram_slice);
     machine.set_dma_rdram_ranges(dma_ranges);
@@ -2447,7 +2711,14 @@ unsafe fn dispatch_hle_rspboot(rdram: *mut u8, task_addr: RdramAddr) -> HleBootR
     let rdram_writes = machine.take_rdram_writes();
     drop(machine);
 
-    commit_rsp_rdram_writes(&rdram_writes);
+    commit_rsp_rdram_writes(
+        RspWriterCommitSourceV1::Interpreter {
+            owner: task_interpreter_owner(task_addr),
+        },
+        &rdram_writes,
+    );
+    #[cfg(feature = "recomp-rs")]
+    catalog_writer.commit(unsafe { std::slice::from_raw_parts(rdram, rdram_len) });
     commit_rsp_memory_state(
         &dmem,
         &imem,
@@ -2743,6 +3014,7 @@ fn complete_committed_dpc(
 ) {
     transaction.commit();
     record_rsp_rdp_observations(vec![observation]);
+    record_rdp_renderer_publication_v1();
     if full_sync == fn64_render::DpFullSyncStatus::Reached {
         crate::pi::start_live_dp_full_sync()
             .unwrap_or_else(|error| panic!("{operation}: DP FullSync completion: {error}"));
@@ -2836,7 +3108,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 let full_sync =
                     require_matching_raw_dpc_completion(inspected, rendered, "dispatch_raw_rdp");
                 transaction.validate_atomic_completion();
-                real.copy_from_slice(&image);
+                track_rdp_renderer_mutation(real, |real| real.copy_from_slice(&image));
                 (words, full_sync)
             };
             (
@@ -3051,7 +3323,9 @@ unsafe fn dispatch_captured_raw_rdp(
             }
         }
     }
-    real.copy_from_slice(&image[..physical_len]);
+    track_rdp_renderer_mutation(real, |real| {
+        real.copy_from_slice(&image[..physical_len]);
+    });
     (
         full_sync,
         dpc_observation(xbus, source_start, source_end, words),
@@ -3120,16 +3394,44 @@ unsafe fn dispatch_audio_task(
     // Play_Init still completes.
     // Safety: translated registration atomically pairs this callback with its
     // process-lifetime evidence identity. `o` is the admitted OSTask offset.
+    let mut tracked_hle_publication = None;
+    let mut invoke = || {
+        #[cfg(feature = "recomp-rs")]
+        if with_host(|host| host.canonical_recompiled_program.is_some()) {
+            let owner = task_interpreter_owner(RdramAddr::from_offset(
+                u32::try_from(o).expect("translated audio task offset exceeds u32"),
+            ));
+            let rdram = unsafe { renderer_rdram_slice(rdram) };
+            let (reason, journal_sequences) =
+                track_rsp_execution_or_hle_mutation(rdram, |rdram| unsafe {
+                    callback(rdram.as_mut_ptr(), o as u32)
+                });
+            tracked_hle_publication = Some((owner, journal_sequences));
+            return reason;
+        }
+        unsafe { callback(rdram, o as u32) }
+    };
     let reason = if AUDIO_UCODE_TIMING.with(|c| c.get()) {
         let t = std::time::Instant::now();
-        let reason = unsafe { callback(rdram, o as u32) };
+        let reason = invoke();
         let ns = t.elapsed().as_nanos() as u64;
         AUDIO_UCODE_NS.with(|c| c.set(c.get() + ns));
         AUDIO_UCODE_CALLS.with(|c| c.set(c.get() + 1));
         reason
     } else {
-        unsafe { callback(rdram, o as u32) }
+        invoke()
     };
+    if let Some((owner, journal_sequences)) = tracked_hle_publication {
+        // The callback may have changed executable backing before returning a
+        // non-BREAK reason. Classifying the result before appending a success
+        // closes the interleaving where a caught unwind could otherwise let a
+        // later audit absorb a speculative callback's journal entry.
+        finish_translated_audio_hle_publication_v1(
+            RspWriterCommitSourceV1::TranslatedAudioHle { owner },
+            journal_sequences,
+            reason == 0,
+        );
+    }
     if reason != 0 {
         fn64_runtime::record_unsupported_event(
             fn64_runtime::UnsupportedSubsystem::Audio,
@@ -3152,6 +3454,52 @@ unsafe fn dispatch_audio_task(
         });
         AUDIO_DISPATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
+}
+
+/// Exercise the production translated-audio dispatcher with a canonical task
+/// owner. This wrapper exists only so the recompiler authority tests can drive
+/// the real callback classification boundary without manufacturing a trace
+/// observation directly.
+#[cfg(all(test, feature = "recomp-rs"))]
+pub(crate) unsafe fn test_dispatch_translated_audio_task_v1(
+    task_offset: u32,
+    callback: unsafe extern "C" fn(*mut u8, u32) -> u32,
+) {
+    let task_addr = RdramAddr::from_offset(task_offset);
+    let generation = RspTaskAdmissionGeneration::first();
+    let owner = RspInterpreterOwner::task(task_offset, generation);
+    let (rdram, rdram_len) = with_host(|host| {
+        host.rsp_task_lineages.insert(
+            task_offset,
+            RspTaskLineage {
+                admission_generation: generation,
+                original_header: OsTaskHeader::default(),
+                data_identity: None,
+                phase: RspTaskLineagePhase::Running,
+            },
+        );
+        host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight { owner };
+        (host.runtime_rdram, host.runtime_rdram_len)
+    });
+    assert!(
+        !rdram.is_null() && rdram_len >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE,
+        "translated-audio test requires canonical physical RDRAM"
+    );
+    struct TestRdramRegistration(usize);
+    impl Drop for TestRdramRegistration {
+        fn drop(&mut self) {
+            RDRAM_LEN.with(|cell| cell.set(self.0));
+        }
+    }
+    let registration = TestRdramRegistration(RDRAM_LEN.with(|cell| cell.replace(rdram_len)));
+    let header = OsTaskHeader {
+        task_type: M_AUDTASK,
+        ..OsTaskHeader::default()
+    };
+    unsafe { dispatch_audio_task(rdram, task_offset as usize, &header, callback) };
+    commit_rsp_hle_compatibility(task_addr, None);
+    retire_running_rsp_task_lineage(task_addr, "translated-audio production-path test");
+    drop(registration);
 }
 
 /// Capture one immutable audio-task input before translated or LLE execution.
@@ -3369,6 +3717,10 @@ thread_local! {
     pub(crate) static EXECUTOR_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_CALLS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static GFX_LLE_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static GFX_LLE_CALLS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static GFX_LLE_RSP_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static GFX_LLE_RDP_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
 }
@@ -3596,6 +3948,10 @@ pub struct PhaseTiming {
     pub executor_calls: u64,
     pub gfx_ns: u64,
     pub gfx_calls: u64,
+    pub gfx_lle_ns: u64,
+    pub gfx_lle_calls: u64,
+    pub gfx_lle_rsp_ns: u64,
+    pub gfx_lle_rdp_ns: u64,
     pub audio_dispatch_ns: u64,
     pub audio_dispatch_calls: u64,
 }
@@ -3606,6 +3962,10 @@ pub fn phase_timing() -> PhaseTiming {
         executor_calls: EXECUTOR_CALLS.with(Cell::get),
         gfx_ns: GFX_NS.with(Cell::get),
         gfx_calls: GFX_CALLS.with(Cell::get),
+        gfx_lle_ns: GFX_LLE_NS.with(Cell::get),
+        gfx_lle_calls: GFX_LLE_CALLS.with(Cell::get),
+        gfx_lle_rsp_ns: GFX_LLE_RSP_NS.with(Cell::get),
+        gfx_lle_rdp_ns: GFX_LLE_RDP_NS.with(Cell::get),
         audio_dispatch_ns: AUDIO_DISPATCH_NS.with(Cell::get),
         audio_dispatch_calls: AUDIO_DISPATCH_CALLS.with(Cell::get),
     }
@@ -4758,6 +5118,85 @@ mod tests {
     }
 
     #[test]
+    fn rsp_writer_trace_binds_exact_epoch_owner_and_commit_order() {
+        let first_owner = RspInterpreterOwner::task(
+            0x40,
+            RspTaskAdmissionGeneration::new(NonZeroU64::new(7).unwrap()),
+        );
+        let second_owner = RspInterpreterOwner::RawKick {
+            admission_generation: RspTaskAdmissionGeneration::new(NonZeroU64::new(8).unwrap()),
+        };
+        begin_rsp_writer_trace_v1(91);
+        record_rsp_writer_commits_v1(
+            RspWriterCommitSourceV1::Interpreter { owner: first_owner },
+            &[(0x100, 0x110), (0x300, 0x304)],
+        );
+        record_rsp_writer_commits_v1(
+            RspWriterCommitSourceV1::Interpreter {
+                owner: second_owner,
+            },
+            &[(0x200, 0x208)],
+        );
+
+        assert_eq!(rsp_writer_trace_snapshot_v1(90), None);
+        assert_eq!(
+            rsp_writer_trace_snapshot_v1(91).unwrap(),
+            RspWriterTraceSnapshotV1 {
+                commits: vec![
+                    RspWriterCommitObservationV1 {
+                        source: RspWriterCommitSourceV1::Interpreter { owner: first_owner },
+                        physical_start: 0x100,
+                        physical_end: 0x110,
+                    },
+                    RspWriterCommitObservationV1 {
+                        source: RspWriterCommitSourceV1::Interpreter { owner: first_owner },
+                        physical_start: 0x300,
+                        physical_end: 0x304,
+                    },
+                    RspWriterCommitObservationV1 {
+                        source: RspWriterCommitSourceV1::Interpreter {
+                            owner: second_owner,
+                        },
+                        physical_start: 0x200,
+                        physical_end: 0x208,
+                    }
+                ],
+                hle_publications: Vec::new(),
+                rejected_journal_sequences: Vec::new(),
+            }
+        );
+        assert!(!finish_rsp_writer_trace_v1(90));
+        assert!(finish_rsp_writer_trace_v1(91));
+        assert_eq!(rsp_writer_trace_snapshot_v1(91), None);
+    }
+
+    #[test]
+    fn rsp_writer_trace_rearm_supersedes_older_observations() {
+        let owner = RspInterpreterOwner::task(
+            0x80,
+            RspTaskAdmissionGeneration::new(NonZeroU64::new(1).unwrap()),
+        );
+        begin_rsp_writer_trace_v1(11);
+        finish_translated_audio_hle_publication_v1(
+            RspWriterCommitSourceV1::TranslatedAudioHle { owner },
+            vec![3],
+            true,
+        );
+
+        begin_rsp_writer_trace_v1(12);
+        assert_eq!(rsp_writer_trace_snapshot_v1(11), None);
+        assert_eq!(
+            rsp_writer_trace_snapshot_v1(12),
+            Some(RspWriterTraceSnapshotV1 {
+                commits: Vec::new(),
+                hle_publications: Vec::new(),
+                rejected_journal_sequences: Vec::new(),
+            })
+        );
+        assert!(finish_rsp_writer_trace_v1(12));
+    }
+
+    #[test]
     fn rsp_interpreter_owner_preserves_core_state_and_overlays_device_latches() {
         with_host(|host| *host = HostState::default());
         let mut first_rdram = vec![0u8; 0x1000];
@@ -5078,7 +5517,10 @@ mod tests {
             RspTaskAdmissionGeneration::first(),
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            begin_rsp_interpreter_phase(task_interpreter_owner(RdramAddr::from_offset(0x90)), &mut target);
+            begin_rsp_interpreter_phase(
+                task_interpreter_owner(RdramAddr::from_offset(0x90)),
+                &mut target,
+            );
         }))
         .expect_err("pending overlay continuation must not become a fresh task");
         assert!(panic_message(panic.as_ref()).contains("pending overlay resume address"));
@@ -5097,7 +5539,10 @@ mod tests {
         install_running_task_lineage(task, RspTaskAdmissionGeneration::first());
         begin_rsp_interpreter_phase(task_interpreter_owner(task), &mut machine);
         machine.ctx.r[9] = 0xfeed_beef;
-        commit_rsp_interpreter_phase(task_interpreter_owner(task), machine.snapshot_architectural_state());
+        commit_rsp_interpreter_phase(
+            task_interpreter_owner(task),
+            machine.snapshot_architectural_state(),
+        );
         assert!(matches!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::Exact(_)
@@ -5138,7 +5583,10 @@ mod tests {
             RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap()),
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            begin_rsp_interpreter_phase(task_interpreter_owner(RdramAddr::from_offset(0x90)), &mut next);
+            begin_rsp_interpreter_phase(
+                task_interpreter_owner(RdramAddr::from_offset(0x90)),
+                &mut next,
+            );
         }))
         .expect_err("unavailable direct-IMEM HLE state must not reuse a stale exact snapshot");
         assert!(panic_message(panic.as_ref()).contains("terminal scalar/VU state is unavailable"));
@@ -5171,7 +5619,10 @@ mod tests {
         let task_addr = RdramAddr::from_offset(VERIFIED_AUDIO_TASK_OFFSET);
         with_host(|host| {
             host.rsp_interpreter_state = RspInterpreterStateEvidenceSnapshot::InFlight {
-                owner: RspInterpreterOwner::task(task_addr.offset(), RspTaskAdmissionGeneration::new(VERIFIED_AUDIO_GENERATION)),
+                owner: RspInterpreterOwner::task(
+                    task_addr.offset(),
+                    RspTaskAdmissionGeneration::new(VERIFIED_AUDIO_GENERATION),
+                ),
             };
             host.rsp_task_lineages.insert(
                 task_addr.offset(),
@@ -7129,7 +7580,10 @@ mod tests {
         assert_eq!(
             crate::host_evidence_snapshot().rsp_interpreter_state,
             RspInterpreterStateEvidenceSnapshot::InFlight {
-                owner: RspInterpreterOwner::task(TASK, RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap(),)),
+                owner: RspInterpreterOwner::task(
+                    TASK,
+                    RspTaskAdmissionGeneration::new(NonZeroU64::new(2).unwrap(),)
+                ),
             }
         );
     }
@@ -8155,8 +8609,9 @@ mod tests {
         });
         install_running_task_lineage(task_addr, RspTaskAdmissionGeneration::first());
 
-        let result =
-            unsafe { dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None) };
+        let result = unsafe {
+            dispatch_lle_task(rdram.as_mut_ptr(), Some(task_addr), false, None, None, None)
+        };
 
         assert_eq!(
             result,
@@ -8263,7 +8718,10 @@ mod tests {
 
         // SP_STATUS bit 0 is clear-halt. The device is halted out of reset, so
         // this is the starting edge.
-        assert!(crate::pi::write_live_device_mmio(0xFFFF_FFFF_A404_0010, 1 << 0));
+        assert!(crate::pi::write_live_device_mmio(
+            0xFFFF_FFFF_A404_0010,
+            1 << 0
+        ));
 
         with_host(|host| {
             let fabric = &host.device_fabric;
@@ -9174,9 +9632,7 @@ mod tests {
             RspInterpreterStateEvidenceSnapshot::HleCompatibilityUnavailable {
                 owner: RspInterpreterOwner::task(
                     HEADER as u32,
-                    RspTaskAdmissionGeneration::new(
-                        NonZeroU64::new(resumed_generation).unwrap(),
-                    ),
+                    RspTaskAdmissionGeneration::new(NonZeroU64::new(resumed_generation).unwrap(),),
                 ),
             }
         );

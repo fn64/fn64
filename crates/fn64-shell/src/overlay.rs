@@ -188,9 +188,7 @@ impl Overlay {
         }
 
         let pixels_per_point = full_output.pixels_per_point;
-        let primitives = self
-            .ctx
-            .tessellate(full_output.shapes, pixels_per_point);
+        let primitives = self.ctx.tessellate(full_output.shapes, pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [width, height],
             pixels_per_point,
@@ -204,12 +202,7 @@ impl Overlay {
 
             // ...then the egui pass on top, LoadOp::Load to keep it.
             let renderer = renderer.get_or_insert_with(|| {
-                egui_wgpu::Renderer::new(
-                    &context.device,
-                    pixels.surface_texture_format(),
-                    None,
-                    1,
-                )
+                egui_wgpu::Renderer::new(&context.device, pixels.surface_texture_format(), None, 1)
             });
             for (id, delta) in &textures_delta.set {
                 renderer.update_texture(&context.device, &context.queue, *id, delta);
@@ -449,8 +442,7 @@ fn stick_scope(ui: &mut egui::Ui, config: &mut InputConfig, gamepads: &Gamepads,
     );
 
     // egui y grows downward; stick y grows upward.
-    let to_screen =
-        |x: f32, y: f32| center + Vec2::new(x, -y) * radius;
+    let to_screen = |x: f32, y: f32| center + Vec2::new(x, -y) * radius;
     let (rx, ry) = gamepads.raw_stick();
     let (fx, fy) = apply_deadzone_f(rx, ry, config.deadzone);
     painter.circle_filled(to_screen(rx, ry), 3.0, MUTED);

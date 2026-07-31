@@ -617,6 +617,26 @@ pub(crate) fn execute_controller_pif<R: fn64_runtime::RomStorage>(
     observations
 }
 
+/// `__osSiDeviceBusy(void) -> s32` reads `SI_STATUS_REG` and reports whether
+/// either public SI busy bit (`DMA_BUSY = 1`, `IO_BUSY = 2`) is set.
+///
+/// The exact six-instruction NWXE body captured in the materialized boot bank
+/// is `lui/ori/lw/andi/jr/sltu`: it reads `0xA4800018`, masks with `3`, and
+/// canonicalizes the result to zero or one. The shim uses the same live device
+/// fabric as arbitrary-PC MMIO, so a host binding cannot disagree with the
+/// guest-AOT implementation about an in-flight SI transfer.
+///
+/// # Safety
+/// `ctx` must point to a live recompiler context. The function does not access
+/// `rdram`, matching the no-argument guest ABI.
+#[no_mangle]
+pub unsafe extern "C" fn __osSiDeviceBusy_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+    let ctx = unsafe { &mut *ctx };
+    let status = crate::pi::read_raw_mmio_word(0xffff_ffff_a480_0018)
+        .expect("__osSiDeviceBusy_recomp: SI_STATUS_REG is not mapped");
+    ctx.r2 = u64::from(status & 3 != 0);
+}
+
 /// `__osSiRawStartDma(s32 direction, u8* dramAddr)` -- `a0`=direction
 /// (`ctx->r4`; `OS_READ=0` transfers PIF RAM to RDRAM and `OS_WRITE=1`
 /// transfers RDRAM to PIF RAM), `a1`=dramAddr
@@ -1496,6 +1516,29 @@ mod tests {
     fn reset_controller_manager() {
         with_executor(|exec| *exec = fn64_runtime::Executor::new());
         with_host(|host| *host = HostState::default());
+    }
+
+    #[test]
+    fn os_si_device_busy_tracks_the_live_timed_si_channel() {
+        reset_controller_manager();
+        let mut rdram = vec![0u8; 64];
+        let mut busy = ctx_zeroed();
+
+        unsafe { __osSiDeviceBusy_recomp(std::ptr::null_mut(), &mut busy) };
+        assert_eq!(busy.r2, 0);
+
+        let mut dma = ctx_zeroed();
+        dma.r4 = 0;
+        dma.r5 = 0x8000_0000;
+        unsafe { __osSiRawStartDma_recomp(rdram.as_mut_ptr(), &mut dma) };
+        assert_eq!(dma.r2, 0);
+
+        unsafe { __osSiDeviceBusy_recomp(std::ptr::null_mut(), &mut busy) };
+        assert_eq!(busy.r2, 1);
+
+        crate::advance_virtual_time(1);
+        unsafe { __osSiDeviceBusy_recomp(std::ptr::null_mut(), &mut busy) };
+        assert_eq!(busy.r2, 0);
     }
 
     fn initialize_controller_manager_for_test(channels: u8) {

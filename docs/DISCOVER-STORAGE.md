@@ -206,22 +206,125 @@ Analysis passes append claims to mutable, pass-local builders. A deterministic
 merge freezes them into a `ProgramSnapshot` with sorted, column-oriented
 tables:
 
-The working-tree `ProgramSnapshotV1` is deliberately a smaller compatibility
-artifact while S1-S4 remain open: one byte-verified physical bank, the cloned
-fact log, CFG/value-set closure, partition, complete owner report, blocker
-histogram, and separated coverage metrics. It proves the pass-composition and
-serialization boundary without pretending the planned columnar indexes/CSR
-graph already exist. Its JSON is an inspection/interchange form, not the hot
-cache format described below.
+### Sealed cold-training workspace
 
-The companion `BlockPackV1` is a smaller execution handoff derived only from
-function-independent proven blocks. It stores sorted disjoint geometry and
-digests, never instruction words. Materialization checks ROM and block
-identity, and the sparse emitter consumes those spans without widening them
-across holes. This is intentionally not the final indexed program database:
+The schema-v3 snapshot workspace is the current disk boundary for training a
+general discovery mechanism against known ROMs. It is produced from ROM bytes
+without a label file and declares
+`intended_use = sealed_cold_function_training_input` and
+`answer_key_present = false`. The fixed namespace contains a manifest, one
+`cold-candidates.json` receipt, and indexed bank-byte/snapshot artifacts; the
+manifest is published last. It lives in a caller-owned mode-0700 workspace
+outside Git, with regular mode-0600 artifacts, and contains no path-derived
+bank names.
+
+Candidate receipt v3 retains the addressed identity
+`(RomAddressSpace, ROM address, VA)` within its bank-qualified receipt. The
+address-space component is semantic: equal numeric physical-ROM and VROM
+coordinates are distinct identities. V3 additionally fixes a seven-detector
+denominator containing typed semantic-callable arguments derived by composed
+authority closure. A v1 or v2 digest cannot authorize v3 grading.
+
+`validate_snapshot_workspace_streaming` is the only training intake boundary.
+It visits the bounded candidate receipt and each potentially large bank
+artifact once, retaining only the compact caller-selected index, and returns a
+workspace identity only after validating the complete namespace. Validation
+binds schema and fixed limits, canonical path and permissions, artifact sizes
+and hashes, semantic snapshot digests, bank geometry and bytes, normalized ROM
+identity, candidate identity, ordering, and absence of symlinks or
+unmanifested files. Open workspaces with `no_proven_banks` remain explicit and
+may still carry the cold candidate receipt; they do not manufacture bank
+authority.
+
+The label adapter must receive the returned identity before it opens an answer
+key. It then constructs a compact address-space/bank/VA lookup while streaming,
+opens a bounded digest-pinned label file, and emits exhaustive attribution
+statuses and miss clusters. Its candidate denominator is the unique union of
+combined, per-detector-only, translated, and ungradable identities; exact
+matches remain explicitly candidate-level and do not claim proven ownership
+or extent. The cold artifacts are immutable inputs to that operation: labels
+cannot change mappings, scan bounds, candidates, or detectors. This separation
+makes cached validation cheap and permits leave-one-ROM-out training without
+loading all snapshot JSON into memory.
+
+The working-tree `ProgramSnapshotV1` Rust type (serialized as schema v5) is
+deliberately a smaller compatibility artifact while S1-S4 remain open: one or
+more byte-verified physical or proven-file-table-resolved VROM banks, the cloned
+fact log, broad exploratory CFG/value-set closure, separately retained
+authority-rooted closure, partition, complete owner report, blocker histogram,
+and separated coverage metrics. Candidate traversal roots can therefore widen
+discovery without entering execution-closure evidence. It proves the
+pass-composition and serialization boundary without pretending the planned
+columnar indexes/CSR graph already exist. Its JSON is an
+inspection/interchange form, not the hot cache format described below.
+Historical schema v4 added typed, candidate-only handler-table pointer provenance (table
+base, exact source slot, ordinal, stride, and admitted run length). It does not
+change the authority closure: a structural pointer run is not an identified
+descriptor table and cannot become a proven callable entry by serialization.
+Schema v5 adds typed semantic-callable entry evidence carrying the target,
+call site, callee, pointer register, and validated contract. Those exact Proven
+claims are re-applied whenever prepared traversal facts are rebuilt; the V3
+candidate receipt exposes the same authority without discarding its provenance.
+
+The compatibility multi-bank composer is intentionally bounded. Before
+composition it indexes facts by every bank they reference, including both ends
+of cross-bank edges and nested function-entry evidence. Owned conclusion
+subjects (`bank`, function, executable range, table entry, and observed trace
+claims) explicitly identify their semantic bank; projection validates that
+at least one expected typed justification regenerates the identical complete
+canonical subject (including address/range/index/edge), rejects every same-kind
+mismatch, and fails closed on malformed or unknown caller-authored subjects.
+Thus a foreign call site retains its raw
+function-entry claim while the merged function conclusion stays with the target
+bank. Table-level aggregate conclusions remain program diagnostics rather than
+being copied into every bank. Bankless VROM-to-physical file records are
+assigned only to **proven** VROM bank mappings whose source interval they
+contain; unrelated or merely candidate mappings cannot affect that bank's
+materialization or proof. Other truly unscoped facts remain global. Each
+snapshot receives only this bank projection and the complete justification set
+for every retained conclusion; conclusion indices are remapped without dangling
+references.
+Zero-justification conclusions remain global rather than being assigned a
+guessed scope. Its default fail-closed envelope is 4,000,000
+aggregate projected fact rows, 256 MiB of aggregate projected compact fact JSON,
+256 MiB of aggregate materialized bank bytes, and 1,048,576 unique cross-bank
+authority records. `MultiBankCompositionLimits` and the `*_with_limits` entry
+points make a different envelope explicit; raising one count does not bypass
+the independent byte limits. Cross-bank target lookup is a deterministic
+interval point query which returns every overlapping bank, so mutually
+exclusive banks at the same VA retain the earlier all-match authority semantics
+without scanning the complete catalog for each call.
+
+These limits are a safety layer, not the final storage design. The remaining
+structural step is a streaming two-pass composer: first byte-verify and close
+one bank at a time while retaining only a bounded, digest-bound cross-bank
+authority run; then point-query that complete run and finish/serialize one bank
+at a time with one temporary projected `FactDb`. A future bundle wire can store
+global facts once and bank-local deltas separately; today's compatibility wire
+still repeats global facts in each projection and returns every snapshot in one
+`Vec`.
+
+The companion Rust type `BlockPackV1` currently emits wire schema v2, whose
+per-block address-space tag distinguishes physical ROM from VROM. Authoritative
+v2 emission accepts only the move-only `ValidatedComposedSnapshotsV2` minted by
+byte-verifying composition; deserialized `ProgramSnapshotV1` remains diagnostic
+and can emit only the physical-only legacy v1 wire. A v1 pack carrying a Virtual
+tag is rejected. The pack stores sorted disjoint geometry and digests, never
+instruction words. Materialization checks ROM and block identity, and the sparse
+emitter consumes those spans without widening them across holes. This is
+intentionally not the final indexed program database:
 the runtime's small `CodeCatalog` now provides a binary-search sparse address
 index, but live generated-runner registration and generation-aware cache
 invalidation remain separate open mechanisms.
+
+The opaque composition wrapper closes post-composition snapshot forgery; it is
+not a provenance signature over an arbitrary input `FactDb`. Composition still
+trusts `Proven` mapping and entry conclusions already present in `base_facts`.
+Current project gates satisfy that boundary by passing the in-process output of
+the configured discovery/evidence pipeline. A file or API intake boundary must
+not deserialize or caller-author `FactDb` proof conclusions and then treat the
+resulting wrapper as independent validation; closing that broader intake case
+would require a separately opaque validated-evidence capability.
 
 ```text
 ProgramSnapshot
@@ -535,6 +638,15 @@ prevents duplicate writers; duplicate computation is otherwise harmless
 because objects are immutable. Named run refs point to root artifact digests.
 Garbage collection walks refs through dependency edges.
 
+For game-derived discovery and external-tool data, the cache root is further
+partitioned as `roms/<full RomId>/`; its content-addressed objects, banks, tool
+runs, refs, and reports remain inside that namespace. There is no cross-ROM
+hard-linking or deduplication of game-derived objects. This deliberately trades
+some disk reuse for auditable containment and makes deletion of one ROM's
+derived data a namespace-local operation. `DISCOVER-TOOLCHAIN.md` defines the
+directory layout, permissions, symlink policy, and immutable tool-run identity.
+A shared cache is permitted only for non-game tool binaries/environments.
+
 ROM bytes, materialized game data, traces, emitted code, and derived snapshots
 remain out of git per `AGENTS.md`. Repo tests use only synthetic fixtures.
 
@@ -688,12 +800,12 @@ The function adapter consumes root claims and owner propagation:
 - interior callable entries become aliases into the same owner when proven;
 - ambiguous blocks and open ends are rejected from authoritative packs and
   emitted in the frontier report;
-- candidate partitions may be exported separately for Splat/spimdisasm/m2c
+- candidate partitions may be exported separately for Splat/spimdisasm/Ghidra
   experiments, labeled with their proof state and never mixed into the proven
   pack.
 
 The same graph can therefore feed current N64Recomp-style function metadata,
-Splat section/symbol configuration, m2c inputs after partitioning, and a future
+Splat section/symbol configuration, Ghidra review inputs, and a future
 region emitter. None of those adapters owns the underlying truth.
 
 ## Staged migration from `FactDb`

@@ -1,66 +1,24 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-struct LiveRdramDma {
-    storage: fn64_runtime::RdramPtr,
-    len: usize,
-}
+const VI_MMIO_BASE: u32 = 0xA440_0000;
+const VI_MMIO_END: u32 = VI_MMIO_BASE + fn64_render::ViScanoutRegisters::WORD_COUNT as u32 * 4;
 
-impl LiveRdramDma {
-    /// # Safety
-    /// `rdram` must remain valid for `len` bytes while this adapter is used,
-    /// and guest execution must be suspended for every access.
-    unsafe fn new(rdram: *mut u8, len: usize) -> Self {
-        assert!(
-            len.is_multiple_of(4),
-            "PI DMA RDRAM storage extent {len:#x} must cover complete native words"
-        );
-        Self {
-            storage: unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) },
-            len,
-        }
-    }
-
-    fn checked_addr(&self, offset: usize) -> RdramAddr {
-        let offset = u32::try_from(offset).expect("PI DMA RDRAM offset exceeds u32");
-        assert!(
-            (offset as usize) < self.len,
-            "PI DMA logical byte {offset:#x} is outside RDRAM allocation {:#x}",
-            self.len
-        );
-        RdramAddr::from_offset(offset)
-    }
-}
-
-impl fn64_runtime::DmaMemory for LiveRdramDma {
-    fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
-        for (index, byte) in data.iter().copied().enumerate() {
-            let addr = self.checked_addr(
-                offset
-                    .checked_add(index)
-                    .expect("PI DMA RDRAM write range overflow"),
-            );
-            unsafe { self.storage.write_u8(addr, byte) };
-        }
-        #[cfg(feature = "recomp-rs")]
-        fn64_recomp_rs::notify_guest_write(
+fn notify_committed_dma_write(channel: fn64_runtime::DmaWriterChannel, offset: usize, len: usize) {
+    #[cfg(feature = "recomp-rs")]
+    {
+        let notify = match channel {
+            fn64_runtime::DmaWriterChannel::Pi => fn64_recomp_rs::notify_pi_dma_write,
+            fn64_runtime::DmaWriterChannel::Si => fn64_recomp_rs::notify_si_dma_write,
+            fn64_runtime::DmaWriterChannel::Sp => fn64_recomp_rs::notify_sp_dma_write,
+        };
+        notify(
             u32::try_from(offset).expect("DMA write offset exceeds u32"),
-            u32::try_from(data.len()).expect("DMA write length exceeds u32"),
+            u32::try_from(len).expect("DMA write length exceeds u32"),
         );
     }
-
-    fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|index| {
-                let addr = self.checked_addr(
-                    offset
-                        .checked_add(index)
-                        .expect("PI DMA RDRAM read range overflow"),
-                );
-                unsafe { self.storage.read_u8(addr) }
-            })
-            .collect()
-    }
+    #[cfg(not(feature = "recomp-rs"))]
+    let _ = (channel, offset, len);
 }
 
 /// Install the real ROM bytes the PI/EPI DMA shims read from. Must be
@@ -669,7 +627,7 @@ fn live_device_mmio_addr(vaddr: u64, write: bool) -> Option<MmioAddr> {
                 | 0xA410_001C
         );
     let is_dpc_write = write && matches!(addr, 0xA410_0000 | 0xA410_0004 | 0xA410_000C);
-    let is_vi = (0xA440_0000..=0xA440_0034).contains(&addr);
+    let is_vi = (VI_MMIO_BASE..VI_MMIO_END).contains(&addr);
     let is_ai = matches!(
         addr,
         0xA450_0000 | 0xA450_0004 | 0xA450_0008 | 0xA450_000C | 0xA450_0010 | 0xA450_0014
@@ -712,6 +670,13 @@ pub(crate) fn set_mi_interrupt_mask(mask: u32) {
             fn64_runtime::InterruptSource::Dp,
         ] {
             fabric.set_interrupt_mask(source, mask & source.bit() != 0);
+        }
+        if crate::boot_probe_enabled() {
+            let snapshot = fabric.snapshot();
+            eprintln!(
+                "[boot-probe] MI mask set requested={mask:#04x} latched={:#04x} pending={:#04x}",
+                snapshot.mi_mask, snapshot.mi_pending
+            );
         }
     });
 }
@@ -930,7 +895,10 @@ pub(crate) unsafe fn admit_live_sp_task(
         .checked_add(boot_size as usize)
         .expect("osSpTaskLoad rspboot range overflow");
     let required_len = task_end.max(boot_end);
-    let view = unsafe { LiveRdramDma::new(rdram, required_len) };
+    let mut committed = notify_committed_dma_write;
+    let view = unsafe {
+        fn64_runtime::ProcessDmaMemory::from_raw_parts(rdram, required_len, &mut committed)
+    };
     with_host(|host| {
         host.device_fabric
             .admit_sp_task_with_boot_image(&view, task_addr, header, boot)
@@ -942,6 +910,9 @@ pub(crate) fn arm_live_vi(interval: u64) -> Result<(), DeviceFault> {
 }
 
 pub(crate) fn queue_live_vi_mode(registers: [u32; 14], fields: [[u32; 5]; 2]) {
+    if crate::boot_probe_enabled() {
+        eprintln!("[boot-probe] queued VI mode common={registers:08x?} fields={fields:08x?}");
+    }
     with_host(|host| {
         host.pending_vi_mode = Some(PendingViMode { registers, fields });
         // The public VI manager resets prior scale/special-feature overrides
@@ -1005,7 +976,7 @@ pub(crate) fn queue_live_vi_special_features(commands: u32) {
         } else {
             let control = host.pending_vi_control.unwrap_or_else(|| {
                 host.device_fabric
-                    .read_mmio(MmioAddr::new(0xA440_0000))
+                    .read_mmio(MmioAddr::new(VI_MMIO_BASE))
                     .expect("VI_STATUS register is not mapped")
             });
             host.pending_vi_control = Some(apply(control, commands));
@@ -1234,6 +1205,20 @@ fn pif_ram_window_offset(vaddr: u64) -> Option<usize> {
     .then(|| (physical - 0x1FC0_07C0) as usize)
 }
 
+/// Direct cached/uncached CPU views of PI domain 1 address 2, whose physical
+/// base `0x1000_0000` is byte zero of the installed Game Pak ROM. The public
+/// libultra PI/Cartridge Domain contract uses the same KSEG translation for
+/// programmed CPU reads and PI DMA device addresses.
+fn cartridge_rom_window_offset(vaddr: u64) -> Option<u32> {
+    let upper = vaddr >> 32;
+    let low = vaddr as u32;
+    let physical = low & 0x1FFF_FFFF;
+    ((upper == 0 || upper == u32::MAX as u64)
+        && (0x8000_0000..0xC000_0000).contains(&low)
+        && PI_DOM1_ADDR2.contains(&physical))
+    .then(|| physical - 0x1000_0000)
+}
+
 pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
     if crate::boot_probe_enabled() {
         let low = vaddr as u32;
@@ -1245,6 +1230,19 @@ pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
     if let Some(offset) = pif_ram_window_offset(vaddr) {
         return Some(with_host(|host| {
             host.device_fabric.pif_ram_cpu_read_w(offset)
+        }));
+    }
+    if let Some(offset) = cartridge_rom_window_offset(vaddr) {
+        return Some(with_host(|host| {
+            assert!(
+                host.rom_installed,
+                "direct cartridge ROM read at {vaddr:#018x} requires load_rom first"
+            );
+            let mut bytes = [0u8; 4];
+            host.device_fabric
+                .pi_dma()
+                .read_rom_bytes(offset, &mut bytes);
+            u32::from_be_bytes(bytes)
         }));
     }
     if let Some(value) = read_live_device_mmio(vaddr) {
@@ -1265,7 +1263,11 @@ pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
 pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
     if crate::boot_probe_enabled() {
         let low = vaddr as u32;
-        if (0xA480_0000..0xA480_0020).contains(&low) || (0xA404_0000..0xA404_0020).contains(&low) {
+        if (VI_MMIO_BASE..VI_MMIO_END).contains(&low) {
+            eprintln!("[boot-probe] raw VI write {low:#010x} = {value:#010x}");
+        } else if (0xA480_0000..0xA480_0020).contains(&low)
+            || (0xA404_0000..0xA404_0020).contains(&low)
+        {
             eprintln!("[boot-probe] raw SI/SP write {low:#010x} = {value:#010x}");
         }
     }
@@ -1379,7 +1381,10 @@ fn advance_device_time_step(now: u64) -> u32 {
             // boot_thread0. This raw-pointer adapter deliberately does not
             // manufacture a second `&mut [u8]` while typed recompiled code's
             // dormant RDRAM view exists across a coroutine suspension.
-            let mut view = unsafe { LiveRdramDma::new(rdram, rdram_len) };
+            let mut committed = notify_committed_dma_write;
+            let mut view = unsafe {
+                fn64_runtime::ProcessDmaMemory::from_raw_parts(rdram, rdram_len, &mut committed)
+            };
             fabric
                 .advance_to_with_pif(
                     Cycles::new(now),
@@ -1463,7 +1468,7 @@ fn advance_device_time_step(now: u64) -> u32 {
                                 }
                             }
                             #[cfg(feature = "recomp-rs")]
-                            fn64_recomp_rs::notify_guest_write(mirror.offset(), completion.len);
+                            fn64_recomp_rs::notify_pi_dma_write(mirror.offset(), completion.len);
                         }
                         overlays.push((
                             completion.dev_addr,
@@ -1533,6 +1538,7 @@ fn advance_device_time_step(now: u64) -> u32 {
                         at,
                         "VI retrace notification escaped its device deadline"
                     );
+                    let had_pending_mode = host.pending_vi_mode.is_some();
                     if let Some(mode) = host.pending_vi_mode.take() {
                         const FIELD_REGISTER_INDICES: [usize; 5] = [1, 13, 10, 11, 3];
                         for (index, value) in mode.registers.into_iter().enumerate() {
@@ -1540,7 +1546,7 @@ fn advance_device_time_step(now: u64) -> u32 {
                                 continue;
                             }
                             let addr = MmioAddr::new(
-                                0xA440_0000
+                                VI_MMIO_BASE
                                     + u32::try_from(index).expect("VI register index exceeds u32")
                                         * 4,
                             );
@@ -1556,7 +1562,7 @@ fn advance_device_time_step(now: u64) -> u32 {
                     if let Some(control) = host.pending_vi_control.take() {
                         require_no_mmio_write_effect(
                             host.device_fabric
-                                .write_mmio(MmioAddr::new(0xA440_0000), control),
+                                .write_mmio(MmioAddr::new(VI_MMIO_BASE), control),
                             "VI special-feature latch failed",
                         );
                     }
@@ -1597,7 +1603,7 @@ fn advance_device_time_step(now: u64) -> u32 {
                                 value = scaled_vi_register(value, host.active_vi_y_scale);
                             }
                             let addr = MmioAddr::new(
-                                0xA440_0000
+                                VI_MMIO_BASE
                                     + u32::try_from(index).expect("VI register index exceeds u32")
                                         * 4,
                             );
@@ -1615,12 +1621,23 @@ fn advance_device_time_step(now: u64) -> u32 {
                     }
                     let mut words = [0u32; fn64_render::ViScanoutRegisters::WORD_COUNT];
                     for (index, word) in words.iter_mut().enumerate() {
-                        let address = 0xA440_0000
+                        let address = VI_MMIO_BASE
                             + u32::try_from(index).expect("VI register index exceeds u32") * 4;
                         *word = host
                             .device_fabric
                             .read_mmio(MmioAddr::new(address))
                             .expect("complete VI register image is not mapped");
+                    }
+                    if crate::boot_probe_enabled() {
+                        let device = host.device_fabric.snapshot();
+                        eprintln!(
+                            "[boot-probe] VI retrace at={} pending_mode={} active_mode={} pending_framebuffer={pending_vi_framebuffer:?} mi_pending={:#04x} mi_mask={:#04x} words={words:08x?}",
+                            at.get(),
+                            had_pending_mode,
+                            host.active_vi_mode.is_some(),
+                            device.mi_pending,
+                            device.mi_mask,
+                        );
                     }
                     let scanout = fn64_render::ViScanoutState::Registers(
                         fn64_render::ViScanoutRegisters::from_words(words),
@@ -2416,6 +2433,16 @@ mod tests {
         assert_eq!(live_device_mmio_addr(0x0000_0001_A440_0000, false), None);
     }
 
+    #[test]
+    fn raw_cartridge_window_reads_installed_rom_through_both_direct_segments() {
+        load_rom(vec![0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(read_raw_mmio_word(0xFFFF_FFFF_B000_0000), Some(0x1020_3040));
+        assert_eq!(read_raw_mmio_word(0x0000_0000_9000_0004), Some(0xAABB_CCDD));
+        assert_eq!(cartridge_rom_window_offset(0xFFFF_FFFF_AFFF_FFFC), None);
+        assert_eq!(cartridge_rom_window_offset(0xFFFF_FFFF_C000_0000), None);
+        assert_eq!(cartridge_rom_window_offset(0x0000_0001_B000_0000), None);
+    }
+
     fn complete_pi_dma() {
         let deadline = with_host(|host| {
             host.device_fabric
@@ -2429,16 +2456,33 @@ mod tests {
     #[test]
     fn live_rdram_dma_bounds_logical_bytes_by_complete_native_words() {
         let mut storage = [0u8; 4];
-        let mut dma = unsafe { LiveRdramDma::new(storage.as_mut_ptr(), storage.len()) };
+        let mut committed = notify_committed_dma_write;
+        let mut dma = unsafe {
+            fn64_runtime::ProcessDmaMemory::from_raw_parts(
+                storage.as_mut_ptr(),
+                storage.len(),
+                &mut committed,
+            )
+        };
 
-        fn64_runtime::DmaMemory::dma_write_bytes(&mut dma, 3, &[0xA5]);
+        fn64_runtime::DmaMemory::dma_write_bytes(
+            &mut dma,
+            fn64_runtime::DmaWriterChannel::Pi,
+            3,
+            &[0xA5],
+        );
         assert_eq!(
             fn64_runtime::RdramView::from_storage(&storage).read_u8(RdramAddr::from_offset(3)),
             0xA5
         );
 
         let outside = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fn64_runtime::DmaMemory::dma_write_bytes(&mut dma, 4, &[0x5A]);
+            fn64_runtime::DmaMemory::dma_write_bytes(
+                &mut dma,
+                fn64_runtime::DmaWriterChannel::Pi,
+                4,
+                &[0x5A],
+            );
         }));
         assert!(outside.is_err(), "one-past-end PI DMA byte must trap");
     }

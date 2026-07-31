@@ -77,7 +77,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let (mut rom, mut trace_id, mut out, mut observations, mut emulator) =
         (None, None, None, None, None);
     while let Some(argument) = args.next() {
-        let mut take = |what: &str| args.next().ok_or_else(|| format!("{what} requires a value"));
+        let mut take = |what: &str| {
+            args.next()
+                .ok_or_else(|| format!("{what} requires a value"))
+        };
         match argument.as_str() {
             "--rom" => rom = Some(PathBuf::from(take("--rom")?)),
             "--trace-id" => trace_id = Some(take("--trace-id")?),
@@ -124,43 +127,44 @@ fn build_plan(rom_sha256: &str) -> Result<ValidatedProbePlan, String> {
         // image, an RDRAM->cart transfer is a save, and only the first is
         // composition evidence.
         probes: vec![
-        Probe {
-            probe_id: "pi_dma_loads".to_string(),
-            target: ProbeTarget::PiDma {
-                direction: Some(PiDmaDirection::CartToRdram),
-                cart_range: None,
-                dram_range: None,
-            },
-            expected_information_gain: ExpectedInformationGain {
-                priority: 100,
-                unresolved_question: "which ROM ranges are loaded to which RDRAM addresses, for \
+            Probe {
+                probe_id: "pi_dma_loads".to_string(),
+                target: ProbeTarget::PiDma {
+                    direction: Some(PiDmaDirection::CartToRdram),
+                    cart_range: None,
+                    dram_range: None,
+                },
+                expected_information_gain: ExpectedInformationGain {
+                    priority: 100,
+                    unresolved_question:
+                        "which ROM ranges are loaded to which RDRAM addresses, for \
                                       a ROM whose table shape no static strategy recognizes"
-                    .to_string(),
-            },
-        },
-        // The PC that issued each transfer. Bank-agnostic and covering the whole
-        // address space: the point is to learn WHERE the loader lives, so
-        // constraining it to a range already believed would defeat it.
-        Probe {
-            probe_id: "dma_caller_pc".to_string(),
-            target: ProbeTarget::ExecutedPcRange {
-                bank: BankScope::Any,
-                // Four-byte aligned: probe validation requires it, and an
-                // instruction address cannot be unaligned anyway. u32::MAX is
-                // not a multiple of four and makes the plan unbuildable.
-                range: AddressRange {
-                    start: 0,
-                    end: 0xFFFF_FFFC,
+                            .to_string(),
                 },
             },
-            expected_information_gain: ExpectedInformationGain {
-                priority: 90,
-                unresolved_question: "which routine issues a ROM load, for a ROM whose DMA \
+            // The PC that issued each transfer. Bank-agnostic and covering the whole
+            // address space: the point is to learn WHERE the loader lives, so
+            // constraining it to a range already believed would defeat it.
+            Probe {
+                probe_id: "dma_caller_pc".to_string(),
+                target: ProbeTarget::ExecutedPcRange {
+                    bank: BankScope::Any,
+                    // Four-byte aligned: probe validation requires it, and an
+                    // instruction address cannot be unaligned anyway. u32::MAX is
+                    // not a multiple of four and makes the plan unbuildable.
+                    range: AddressRange {
+                        start: 0,
+                        end: 0xFFFF_FFFC,
+                    },
+                },
+                expected_information_gain: ExpectedInformationGain {
+                    priority: 90,
+                    unresolved_question: "which routine issues a ROM load, for a ROM whose DMA \
                                       wrapper static operand slicing cannot recover because the \
                                       operands come from the table being sought"
-                    .to_string(),
+                        .to_string(),
+                },
             },
-        },
         ],
     };
     plan.validate().map_err(|error| error.message)
@@ -228,7 +232,10 @@ fn terminate(args: &Args) -> Result<(), String> {
         .last()
         .is_some_and(|line| line.contains("\"event\":\"end\""))
     {
-        eprintln!("already terminated: {} records", lines.len().saturating_sub(1));
+        eprintln!(
+            "already terminated: {} records",
+            lines.len().saturating_sub(1)
+        );
         return Ok(());
     }
     // Sequence zero is the header and every record increments by one, so the
@@ -276,9 +283,7 @@ fn run() -> Result<(), String> {
         "plan" => {
             let file = std::fs::File::create(&out)
                 .map_err(|error| format!("creating {}: {error}", out.display()))?;
-            prepared
-                .write_json(file)
-                .map_err(|error| error.message)?;
+            prepared.write_json(file).map_err(|error| error.message)?;
             eprintln!(
                 "wrote run bundle {} (bundle_sha256={})",
                 out.display(),
@@ -299,7 +304,9 @@ fn run() -> Result<(), String> {
             let file = std::fs::File::create(&out)
                 .map_err(|error| format!("creating {}: {error}", out.display()))?;
             let count = normalized.records.len();
-            normalized.write_jsonl(file).map_err(|error| error.message)?;
+            normalized
+                .write_jsonl(file)
+                .map_err(|error| error.message)?;
             eprintln!("wrote {count} canonical trace records to {}", out.display());
             eprintln!("  feed with: fn64-discover <rom> --trace {}", out.display());
             Ok(())

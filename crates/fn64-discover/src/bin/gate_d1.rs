@@ -4,8 +4,8 @@
 //! their local ROM/key files are present.
 
 use fn64_discover::banks::{
-    BankNamePattern, DescriptorTableShape, DestinationEnd, DestinationRangeFields, DestinationSpace,
-    LoadImageTableInput, LoadImageTableShape, SourceRangeFields, TableLocation,
+    BankNamePattern, DescriptorTableShape, DestinationEnd, DestinationRangeFields,
+    DestinationSpace, LoadImageTableInput, LoadImageTableShape, SourceRangeFields, TableLocation,
 };
 use fn64_discover::evidence::EvidenceManifest;
 use fn64_discover::facts::load_image_table_record_subject;

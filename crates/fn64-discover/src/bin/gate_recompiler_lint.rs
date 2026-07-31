@@ -115,7 +115,8 @@ fn lint(program: &fn64_discover::boundaries::RecoveredProgram) -> Vec<Finding> {
         while last > root_off && words.get(last) == Some(&0) {
             last -= 1;
         }
-        let ends_clean = is_terminator(words[last]) || (last > root_off && is_terminator(words[last - 1]));
+        let ends_clean =
+            is_terminator(words[last]) || (last > root_off && is_terminator(words[last - 1]));
         if ends_clean {
             continue;
         }

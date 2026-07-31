@@ -933,7 +933,7 @@ fn command_output_with_watchdog(
     })
 }
 
-fn verified_build_cargo() -> Result<PathBuf, PlatformCertificationError> {
+pub(crate) fn verified_build_cargo() -> Result<PathBuf, PlatformCertificationError> {
     let invocation = PathBuf::from(env!("FN64_BUILD_CARGO_PATH"));
     let expected_canonical = Path::new(env!("FN64_BUILD_CARGO_CANONICAL_PATH"));
     let canonical = invocation.canonicalize().map_err(|source| {

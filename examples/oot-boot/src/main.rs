@@ -674,6 +674,10 @@ fn main() {
         // destination must resolve through the selected bank-qualified pack.
         fn64_recomp_rs::set_host_lookup(Some(host_only_lookup));
         let loaded = block_program_pack::load();
+        let boot_context_path = env_path("FN64_BOOT_CONTEXT");
+        let boot_context =
+            fn64_boot_harness::load_boot_context(&boot_context_path, &rom_bytes, tv_type)
+                .unwrap_or_else(|error| panic!("oot-boot: {error}"));
         let program_sha256: String = loaded
             .program
             .evidence_snapshot()
@@ -696,6 +700,7 @@ fn main() {
                 rdram.len(),
                 loaded.program,
                 loaded.entry,
+                boot_context,
                 block_program_pack::entry_lookup,
                 block_program_pack::transfer_lookup,
                 loaded.budget,

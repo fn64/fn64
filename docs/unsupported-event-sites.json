@@ -170,6 +170,13 @@
       "trigger": "instead of fabricating output"
     },
     {
+      "operation": "recompiler.cpu.fault-context-resume",
+      "subsystem": "recompiler",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/recompiled.rs",
+      "trigger": "recompiler.cpu.fault-context-resume"
+    },
+    {
       "operation": "recompiler.cpu.unsupported-instruction",
       "subsystem": "recompiler",
       "disposition": "loud_trap",

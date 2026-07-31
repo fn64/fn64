@@ -392,6 +392,9 @@ fn union_len(mut ranges: Vec<(u32, u32)>) -> u64 {
 /// so two byte-identical packs produce the same digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackCoverage {
+    /// Hash-wire schema. V2 adds each block's ROM address-space tag.
+    pub digest_schema_version: u32,
+    /// The independently versioned BlockPack wire schema summarized here.
     pub schema_version: u32,
     pub banks: u64,
     pub blocks: u64,
@@ -402,14 +405,16 @@ pub struct PackCoverage {
     pub digest: String,
 }
 
+pub const PACK_COVERAGE_DIGEST_SCHEMA_V2: u32 = 2;
+
 /// Fold a pack into a deterministic coverage summary. The digest commits to the
 /// schema version, the normalized ROM identity, and every packed block's
-/// `(bank, bank_id, start_va, end_va, rom_start, rom_end, bytes_sha256,
-/// terminator)`. Banks and blocks are already emitted in stable order by
-/// [`crate::block_pack::emit_block_pack_v1`]; this reads them in that order.
+/// `(bank, bank_id, start_va, end_va, rom_space, rom_start, rom_end, bytes_sha256,
+/// terminator)`. Banks and blocks are already emitted in stable order by the
+/// BlockPack emitters; this reads them in that order.
 pub fn pack_coverage(pack: &BlockPackV1) -> PackCoverage {
     let mut hasher = Sha256::new();
-    hasher.update(b"fn64:pack-coverage:v1\n");
+    hasher.update(b"fn64:pack-coverage:v2\n");
     hasher.update(pack.schema_version.to_be_bytes());
     hasher.update(pack.normalized_rom_sha256.as_bytes());
     hasher.update(b"\n");
@@ -425,6 +430,10 @@ pub fn pack_coverage(pack: &BlockPackV1) -> PackCoverage {
             words += u64::from(block.rom_end.saturating_sub(block.rom_start)) / 4;
             hasher.update(block.start_va.to_be_bytes());
             hasher.update(block.end_va.to_be_bytes());
+            hasher.update([match block.rom_space {
+                crate::facts::RomAddressSpace::Physical => 0,
+                crate::facts::RomAddressSpace::Virtual => 1,
+            }]);
             hasher.update(block.rom_start.to_be_bytes());
             hasher.update(block.rom_end.to_be_bytes());
             hasher.update(block.bytes_sha256.as_bytes());
@@ -434,6 +443,7 @@ pub fn pack_coverage(pack: &BlockPackV1) -> PackCoverage {
         }
     }
     PackCoverage {
+        digest_schema_version: PACK_COVERAGE_DIGEST_SCHEMA_V2,
         schema_version: pack.schema_version,
         banks: pack.banks.len() as u64,
         blocks,
@@ -529,8 +539,13 @@ pub fn render_report(
     match pack {
         None => lines.push("pack none".to_string()),
         Some(pack) => lines.push(format!(
-            "pack schema={} banks={} blocks={} words={} digest={}",
-            pack.schema_version, pack.banks, pack.blocks, pack.words, pack.digest
+            "pack schema={} digest_schema={} banks={} blocks={} words={} digest={}",
+            pack.schema_version,
+            pack.digest_schema_version,
+            pack.banks,
+            pack.blocks,
+            pack.words,
+            pack.digest
         )),
     }
 
@@ -740,7 +755,7 @@ mod tests {
                         start_va: 0x8000_0000,
                         end_va: 0x8000_0010,
                         rom_space: crate::facts::RomAddressSpace::Physical,
-            rom_start: 0x1000,
+                        rom_start: 0x1000,
                         rom_end: 0x1010,
                         bytes_sha256: "b".repeat(64),
                         terminator: BlockTerminator::Return,
@@ -749,7 +764,7 @@ mod tests {
                         start_va: 0x8000_0010,
                         end_va: 0x8000_0020,
                         rom_space: crate::facts::RomAddressSpace::Physical,
-            rom_start: 0x1010,
+                        rom_start: 0x1010,
                         rom_end: 0x1020,
                         bytes_sha256: "c".repeat(64),
                         terminator: BlockTerminator::Fallthrough { next: 0x8000_0020 },
@@ -824,7 +839,7 @@ mod tests {
         assert_eq!(
             lines[10],
             format!(
-                "pack schema=1 banks=1 blocks=2 words=8 digest={}",
+                "pack schema=1 digest_schema=2 banks=1 blocks=2 words=8 digest={}",
                 pack.digest
             )
         );
@@ -845,5 +860,10 @@ mod tests {
         let mut mutated = pack;
         mutated.banks[0].blocks[0].bytes_sha256 = "e".repeat(64);
         assert_ne!(pack_coverage(&mutated).digest, a.digest);
+
+        let mut address_space_changed = synthetic_pack();
+        address_space_changed.banks[0].blocks[0].rom_space = crate::facts::RomAddressSpace::Virtual;
+        assert_ne!(pack_coverage(&address_space_changed).digest, a.digest);
+        assert_eq!(a.digest_schema_version, PACK_COVERAGE_DIGEST_SCHEMA_V2);
     }
 }

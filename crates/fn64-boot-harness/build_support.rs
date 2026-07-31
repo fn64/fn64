@@ -334,8 +334,7 @@ fn inject_loop_backedges(source: &str) -> (String, usize) {
                 if seen_labels.contains(target) {
                     // Backward goto: preserve the goto's indentation for the
                     // injected call so the emitted C stays readable.
-                    let indent_len =
-                        segment.len() - segment.trim_start_matches([' ', '\t']).len();
+                    let indent_len = segment.len() - segment.trim_start_matches([' ', '\t']).len();
                     output.push_str(&segment[..indent_len]);
                     output.push_str("FN64_BACKEDGE();\n");
                     output.push_str(segment);

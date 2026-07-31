@@ -13,10 +13,10 @@ fit around `fn64-discover`. It complements
 > final packs. External tools propose typed claims, consume derived views, or
 > reject bad hypotheses. No external tool owns truth.
 
-The first adapters should be spimdisasm, Splat, and m2c because they match the
-N64 workflow directly and have short feedback loops. Ghidra is valuable as a
-second, structurally different analyzer and interactive UI, but it should
-receive fn64's bank model rather than invent one from a flat ROM. Dynamic
+The first adapters should be spimdisasm, Splat, and Ghidra because they match
+the N64 workflow directly and have short feedback loops. Ghidra is a
+structurally different analyzer and interactive UI, but its reproducible path
+should receive fn64's bank model rather than invent one from a flat ROM. Dynamic
 tracing should begin with a documented, scriptable debugger interface such as
 MAME's and add other emulators as independent black boxes. Expensive general
 binary-analysis tools such as angr belong at the unresolved frontier, not in
@@ -37,13 +37,36 @@ Tool execution and source incorporation are different decisions:
 - spimdisasm, Splat, Rabbitizer, and n64sym are MIT-licensed. They may be
   pinned external dependencies, but Rust remains the canonical engine.
 - angr is BSD-2-Clause and is suitable for bounded experiments.
-- m2c is GPL-3.0. It may be an optional user-installed subprocess and produce
-  a user's out-of-tree decompilation artifact. It must not be linked into,
-  vendored into, or copied into fn64.
 - N64LoaderWV's repository describes its Ghidra loader but does not present a
-  license in the repository metadata reviewed for this design. Do not vendor
-  or copy it without a separate license check. It is not required: fn64 can
-  materialize each bank and import it through Ghidra's public raw-binary API.
+  license. By project-owner decision 2026-07-28 it may be executed, reviewed,
+  and maintained at the approved fork
+  [`fn64/N64LoaderWV`](https://github.com/fn64/N64LoaderWV), based on the
+  `jeremyw` fork and currently
+  pinned to commit `e484f187f2aab869e5e808e1cfcec23e2d4779c7`, for interactive
+  or headless workflows. Newly built artifacts are candidates; downstream
+  automation accepts only the receipt and extension digests selected by the
+  checked-in artifact policy. Its implementation is eligible
+  only for loader/tool engineering, not as a source of N64 behavioral claims;
+  its mappings and exports remain candidate evidence. Its code does not enter
+  fn64's MIT/Apache distribution. It is not required by the reproducible
+  adapter: fn64 can materialize each bank and import it through Ghidra's public
+  raw-binary API.
+- m2c is excluded by project-owner decision 2026-07-28. Do not install,
+  invoke, vendor, read, or build an adapter for it.
+- The
+  [`awesome-n64-development`](https://github.com/command-tab/awesome-n64-development)
+  repository had no declared license when reviewed on 2026-07-27. It is a
+  link index only: do not copy its tables or prose. Every linked project needs
+  its own primary-license check.
+- [armips](https://github.com/Kingcom/armips) is MIT-licensed and is eligible
+  as an independent assembler/linker-script validator. It may reject emitted
+  MIPS or proposed geometry; assembly success does not establish code
+  ownership.
+- The [`f3dex2`](https://github.com/Mr-Wiseguy/f3dex2) repository declares CC0,
+  but its matching disassemblies derive from Nintendo microcode. Do not read
+  them for implementation claims until a separate upstream-rights and clean-
+  room review succeeds. Hash identity and black-box comparison against the
+  user's own ROM remain eligible.
 - MAME, ares, CEN64, and any other emulator run out of process. Their exact
   binary, version, settings, and output digest are provenance. fn64 does not
   link an emulator core.
@@ -52,10 +75,136 @@ Tool execution and source incorporation are different decisions:
   command, debugger, GDB, or trace interface. If no such boundary exists, the
   tool is not eligible.
 
-ROMs, materialized banks, traces, Ghidra projects, matching assembly, m2c
-output, caches, and tool logs are game-derived and stay in a user-selected
+ROMs, materialized banks, traces, Ghidra projects, matching assembly, caches,
+and tool logs are game-derived and stay in a user-selected
 out-of-tree workspace. A tool adapter must refuse an output path inside the
 fn64 repository unless the output is a synthetic test fixture.
+
+### Per-ROM workspace containment
+
+The layout and filesystem rules below are the production-admission contract.
+The current N64LoaderWV first-contact runner implements a private digest-keyed
+attempt subtree, copied inputs, isolated Ghidra state, and create-new attempts,
+but not completed-object publication, descriptor-relative traversal, disk/file
+quotas, or garbage collection. Its outputs therefore remain review artifacts.
+
+Every real-ROM adapter run is confined beneath one full normalized-ROM digest.
+Aliases, game titles, region codes, and filenames are display metadata and
+never select a directory. The required layout is:
+
+```text
+WORKSPACE/v1/
+  roms/<64-hex RomId>/
+    identity.json
+    objects/sha256/<first-two-hex>/<64-hex object digest>
+    snapshots/<64-hex snapshot digest>/
+    banks/<64-hex BankId>/
+      input.json
+      input.bin
+    runs/<adapter-id>/
+      requests/<64-hex RequestId>/
+        request.json
+        attempts/<random create-new AttemptId>/
+          inputs/
+          raw/
+          diagnostics/
+          project/
+          home/
+          tmp/
+      completed/<64-hex SourceId>/
+        canonical/
+        receipt.json
+    scratch/<random create-new identity>/
+    refs/
+    reports/
+```
+
+`RomId`, `BankId`, object digests, `RequestId`, and `SourceId` are complete
+digests, not truncated prefixes. `RequestId` binds the adapter algorithm, tool/extension
+identity, exact bank inputs, snapshot and parent lineage, configuration, and
+resource policy, but not provider output. Each retry gets a random create-new
+attempt beneath that request. After successful validation, the output-bound
+`SourceId` selects an immutable completed directory; an existing completed
+directory is never reused or overwritten without exact byte agreement. A
+changed input creates a different request. A run becomes a cache hit only
+after its canonical output and self-hashed completed `receipt.json` have been
+revalidated against an exact object manifest; a request, attempt, directory,
+or raw output alone is never completion.
+
+The selected workspace root must be absolute, pre-existing, outside the
+repository, and resolved without accepting symlink or `..` traversal. The
+same rule applies against every Git worktree rooted beneath the canonical
+repository object, not only the primary checkout. Every component from root
+to leaf must be a same-owner mode-0700 directory rather than a symlink or
+special file. Adapter IDs and ref/report names are digest-derived or validated
+as single portable path components. The runner creates ROM/run directories
+mode 0700 and files mode 0600 with descriptor-relative, no-follow, create-new
+semantics. It gives a subprocess only its run subtree, places
+Ghidra's project, user home, and temporary/cache directories there, and
+publishes validated outputs atomically. A failed or killed run remains
+quarantined and cannot be ingested as complete. Scratch is removed on success
+and interruption; failed diagnostics survive only under an explicit
+`--keep-failed` policy, under its nonce-qualified attempt directory. Cleanup
+and garbage collection operate on one `RomId` namespace at a time, enforce the
+declared file-count/byte budget, validate full-digest names and root identity,
+and refuse symlinks, unexpected hard links, special files, or objects outside
+the validated root.
+
+Game-derived objects are not hard-linked or deduplicated across ROM
+namespaces. Tool binaries and other non-game dependencies may use a separate
+global cache, but no per-ROM input, output, project, trace, or diagnostic may
+enter it. Canonical receipts contain digests and logical roles only; absolute
+paths and raw tool text stay in private diagnostics. Before launch and ingestion, the runner
+checks that every selected bank's `normalized_rom_sha256` equals its containing
+`RomId` and that its full `BankId`, byte digest, mapping digest, and snapshot
+lineage match `input.json`.
+
+`produce_snapshot_workspace ROM WORKSPACE` is the generic bounded producer for
+this candidate-tool intake. `WORKSPACE` is a canonical pre-existing mode-0700
+directory outside Git. The producer never copies the ROM: it publishes only
+fixed-index `bank-NNNNNN.bin` and `bank-NNNNNN.snapshot.json` artifacts with
+mode 0600, then publishes `snapshot-workspace.json` last. Create-new file links
+and a parent-directory sync make that final manifest the durable Unix
+completion marker; a failed attempt without it is incomplete. The namespace
+must contain no pre-existing reserved bank artifact, including when discovery
+finds zero proven banks.
+
+On Unix the ROM descriptor is opened read-only with `O_NOFOLLOW` after the
+initial regular-file check, then its device/inode identity is compared with
+the inspected path. Descriptor metadata supplies the allocation hint, while a
+`limit + 1` reader bounds bytes even if the same file grows during intake. A
+path swapped to a symlink between inspection and open is rejected by the open
+itself; a swap to another regular inode is rejected by the identity check.
+
+The manifest is path-free and binds normalized-ROM identity, auto-discovery
+strategy/outcomes, every resource limit, bank name and geometry, proven VROM
+backing-fact indices, artifact names/lengths/digests, and Ghidra seed roles.
+`composed` means only that this bounded workspace publication completed;
+`rom_recompilation_complete` is always false. A base seed requires a Proven
+owner. A paired second seed may be any distinct assessed owner and is labeled
+with its Proven/Candidate/Ambiguous assessment; pairing alone grants no tool
+authority. A Proven, byte-verified bank with no Proven owner is labeled
+`discovery_only` with role `candidate_only`: it remains eligible for stock
+BinaryLoader analysis, but the manifest supplies no function-entry authority.
+The current schema-v5 diagnostic snapshot projects a bank-scoped fact database
+per artifact and is bounded by both per-artifact and aggregate wire caps. Its
+remaining large-ROM frontier is the two-pass `streaming_v5` composer.
+
+## Fast mechanical feedback
+
+`fn64-discover --summary` is the bounded observation path for comparing
+mechanical-strategy outcomes without retaining a full discovery artifact. It
+performs normal discovery and optional trace folding, but omits the
+byte-granular ledger and full fact log. Its JSON receipt is path-free and binds
+the normalized-ROM digest, strategy outcomes, coverage, and a self-hash; it is
+not an evidence manifest, Decomp Pack, or admission authority.
+
+`scripts/profile-discovery-loop.zsh` repeats that path with an explicit local
+binary and ROM, checks receipt equality, applies a per-run wall-clock bound,
+and reports min/median/max milliseconds. Its temporary summaries and
+diagnostics remain mode-0700 and are removed on exit. A stable timing receipt
+means only that the compact observation was deterministic; it does not prove
+that a discovery result is complete or correct.
 
 ## Adapter roles
 
@@ -74,7 +223,7 @@ This distinction prevents circular evidence. For example:
 
 1. fn64 proposes a function extent.
 2. Splat emits assembly using that extent.
-3. m2c consumes the assembly successfully.
+3. an assembler or relink validator accepts the emitted object successfully.
 
 That is one hypothesis surviving two consumers. It is not three independent
 boundary claims. Likewise, a Ghidra analysis seeded with an fn64 function
@@ -108,7 +257,11 @@ recorded only in a non-canonical diagnostic log. They never enter `SourceId`.
 Python tools additionally record the lockfile or installed-wheel digest, not
 only `python --version`. Ghidra runs record the Ghidra release, Java runtime,
 script digest, processor-language identifier, analysis-option digest, and any
-extension digest.
+extension digest. The snapshot-bank runner records one canonical inventory of
+every regular non-symlink file in the Ghidra installation and cryptographically
+scans that complete set before and after analysis. Strict ingest verifies the
+inventory artifact itself; the runner is responsible for verifying the files
+listed inside it.
 
 `parent SourceIds` are mandatory. They identify common lineage and prevent
 double voting:
@@ -117,7 +270,6 @@ double voting:
 Rabbitizer decode
   -> spimdisasm analysis
      -> Splat split/assembly
-        -> m2c pseudocode
 ```
 
 Claims from this chain share one decode lineage unless a later stage adds an
@@ -160,6 +312,7 @@ then one summary. Representative claim kinds are:
 ```text
 FunctionEntryCandidate(bank, VA, basis)
 FunctionExtentCandidate(bank, start, end, basis)
+FunctionBodyRangeCandidate(bank, entry, start, end, basis)
 BlockCandidate(bank, start, end, terminator)
 ControlEdgeCandidate(bank, site, target, kind)
 DataObjectCandidate(bank, start, end, kind)
@@ -173,6 +326,16 @@ ObservedTransfer(trace, sequence, active_bank, site, target, kind)
 ObservedPiDma(trace, sequence, source, destination, length, phase)
 ObservedWrite(trace, sequence, active_bank, address, size, value_digest)
 ```
+
+`fn64.tool-adapter` schema v1 remains accepted byte-for-byte. Schema v2 adds
+`function_body_range { entry, range }` for one exact contiguous component of a
+provider's discontiguous function body. Every such record must have a matching
+bank-local `function_entry` in the same run. It is candidate evidence only: it
+does not claim that the range is a complete function extent, and bytes in gaps
+between ranges are not claimed as function body. V2 uses a distinct
+`fn64.tool-adapter.source.v2` digest domain that includes the schema version;
+the claim-record digest retains its v1 domain because the new kind has its own
+unambiguous tag. Existing v1 source and claim digests are unchanged.
 
 Every claim carries its `SourceId`, parent claim IDs when applicable, the
 tool's typed basis, and any raw score as a diagnostic. Addresses and spans use
@@ -194,7 +357,8 @@ Claims are sorted by canonical typed key and deduplicated before ingestion.
 Tool output order never affects a snapshot.
 
 The current v1 implementation serializes external results as a separate
-`ToolClaimSetV1`, bound to the exact `ProgramSnapshotV1` digest. Its validator
+`ToolClaimSetV1`, bound to the exact schema-v2 `ProgramSnapshotV1` digest. Its
+validator
 recomputes bank identity, source and claim digests, role/range constraints,
 canonical ordering, and provider observations. It never inserts these claims
 into `FactDb`; that physical/type boundary prevents a generic native
@@ -205,7 +369,8 @@ target schema.
 
 ### Sandboxing and resource bounds
 
-ROMs are untrusted input to large third-party parsers. Each adapter runs with:
+ROMs are untrusted input to large third-party parsers. Production-admissible
+adapters run with:
 
 - no network access by default;
 - a fresh content-addressed working directory;
@@ -214,6 +379,12 @@ ROMs are untrusted input to large third-party parsers. Each adapter runs with:
 - no inherited credentials beyond the minimum environment;
 - a process-group kill on timeout;
 - output parsing only after a successful exit.
+
+The current N64LoaderWV scripts enforce process-tree memory/free-memory/time
+limits, one Ghidra CPU, a scrubbed environment, and isolated home/settings/cache
+directories. They do not yet provide OS network/filesystem isolation or
+disk/file/output quotas. Their results stay review-only until an enclosing OS
+sandbox and the remaining quota contract are present.
 
 A resource limit produces an `open` frontier item. It never produces a
 partial accepted result unless the tool's schema has an authenticated,
@@ -230,7 +401,6 @@ states.
 | One tool's function start or extent | `candidate` | heuristic partition |
 | Agreement from independent analyzer families | `candidate` in the current sidecar | corroboration is not boundary proof; a future native rule must consume it explicitly |
 | Splat plus spimdisasm agreement | `candidate` | shared implementation lineage |
-| m2c accepts an assembly function | no promotion | consumer success does not prove the split |
 | Ghidra decompiles a region | no promotion | many incorrect partitions still decompile |
 | Matching assembly/relink equality | no promotion | validates bytes/placement, not ownership |
 | Round-trip mismatch | `rejected` or `conflict` | concrete contradiction |
@@ -359,7 +529,24 @@ retaining every decoded field; absolute, drive-qualified, URI-like, backslash,
 and traversing `file` values are rejected so disposable workspace paths cannot
 enter that digest. Configuration and output digests are explicit lineage.
 Generated names are deliberately not imported as identities. The out-of-
-process runner and block/reference/region export remain T1 work.
+process runner, canonical-graph wiring, and remaining boundary/region views
+remain T1 work.
+
+The reference interchange slice is implemented separately in
+`spimdisasm_reference`. An adapter-owned runner supplies strict JSON metadata
+and JSONL records for one bank; fn64 never launches the tool or accepts ROM
+bytes at this boundary. The metadata pins the tool version, build and source
+digests, configuration digest, provider-output digest, bank-input digest, and
+exact `BankId` plus linear VA/VROM geometry. The normalizer accepts block
+starts, direct references, HI/LO pairs, and typed data candidates, rejects
+unknown fields, stale identities, repeated or inconsistent records, reused
+HI/LO instructions, and overlapping data ranges, then returns a sorted unique
+candidate vector. Its cache key binds the normalization algorithm, all tool
+and configuration pins, the bank input, and bank geometry. The separate cache
+receipt contains only identities, geometry, counts, and digests: provider
+paths, raw records, and diagnostic content have no field through which to
+enter it. These values remain candidates and are not ingested into native
+facts.
 
 ### Splat: pack consumer and partition experiment
 
@@ -385,31 +572,6 @@ Emit two visibly separate configurations:
 Splat and its Python environment are optional toolchain dependencies. The
 core discovery artifact must remain usable without them.
 
-### m2c: downstream pseudocode and type-hint producer
-
-[m2c](https://github.com/matt-kempster/m2c) consumes GNU `as`-style assembly,
-including spimdisasm output, and can use a context file for declarations and
-cross-function type inference. This makes it useful after an owner view
-exists, not for finding that view.
-
-The adapter supplies:
-
-- one exact or explicitly experimental function/owner assembly unit;
-- bank-qualified symbol aliases rewritten to valid C identifiers;
-- known prototypes, structs, globals, and section information in a generated
-  context;
-- the target/compiler mode as an explicit parameter.
-
-Returned pseudocode, prototypes, struct fields, stack variables, and inferred
-global types are decompilation hints. They never establish code/data class,
-entry, or extent. A parse failure is a diagnostic about the current pack, not
-proof that the ROM is malformed.
-
-m2c documents an internal context cache. fn64 must still key the enclosing
-adapter result by m2c version, assembly digest, full context digest, and
-parameters. The tool's cache is acceleration, never evidence. m2c remains an
-external GPL subprocess; its source or algorithms are not copied into fn64.
-
 ### Ghidra: independent graph/type candidates and human UI
 
 [Ghidra](https://github.com/NationalSecurityAgency/ghidra) supports automated
@@ -419,12 +581,9 @@ runs pre-scripts, analysis, and post-scripts; the API also states that one
 analyzer instance is not thread-safe. Use one isolated process/project per
 bank, parallelized at the process level.
 
-Do not make a flat N64 ROM loader authoritative. The public
-[N64LoaderWV](https://github.com/zeroKilo/N64LoaderWV) description says it
-normalizes byte order and loads ROM, RAM, and boot regions, which is useful
-for interactive first contact but insufficient for arbitrary mutually
-exclusive overlays. fn64 has already normalized bytes and established bank
-identity. The production adapter should therefore:
+There are two separate Ghidra lanes. The reproducible production lane starts
+from fn64's bank model; it does not make a flat N64 ROM loader authoritative.
+It should:
 
 1. create a disposable Ghidra project;
 2. import one materialized bank as raw big-endian MIPS using a pinned,
@@ -435,18 +594,151 @@ identity. The production adapter should therefore:
 6. use an fn64-owned post-script to export canonical JSONL;
 7. delete or cache the project outside the repository.
 
+The N64LoaderWV lane is first-contact candidate work over a flat ROM or one
+RDRAM moment. Use only the approved
+[`fn64/N64LoaderWV`](https://github.com/fn64/N64LoaderWV) fork at commit
+`e484f187f2aab869e5e808e1cfcec23e2d4779c7` (approved commit), and record a locally measured
+SHA-256 of the exact extension artifact used. Install that artifact into an
+isolated Ghidra extension directory for the run; do not let an ambient user
+extension installation silently select it. Give each run its own project,
+home, and temporary/cache directories, plus explicit wall-clock and heap
+limits. ROMs, RDRAM dumps, projects, exports, and logs remain game-derived in
+the per-ROM out-of-tree workspace and never enter git.
+
+The checked-in source policy binds the fork repository, approved commit, and
+Git tree. Conformance binds the immutable source archive and built extension in
+a strict v2 candidate receipt. That receipt is an integrity record, not proof
+that its ZIP came from the named source. Downstream first-contact and loader
+A/B runs therefore require both receipt and ZIP digests to match the separate
+checked-in artifact policy, then replay the exact pair after copying. A
+caller-supplied commit or fabricated self-consistent receipt is not authority.
+Every VW runner also proves that its headless launcher belongs to the Ghidra
+distribution it inventories; an override from a second installation is
+rejected. The install verifier compares the complete extracted tree with the
+approved ZIP and scans the distribution/profile for competing loader classes.
+Headless runs additionally resolve `N64LoaderWVLoader` through Ghidra's loader
+service and bind the live code-source JAR and class digests to their receipts.
+
+Interactive review uses `tools/ghidra/run-n64loaderwv-gui.sh`, which applies
+the same source and artifact policies to a digest-named, out-of-tree Ghidra
+profile. It verifies that `ghidraRun` belongs to the selected distribution,
+revalidates every extracted file and rejects any competing loader class,
+isolates settings/cache/temporary/user-home paths, and caps the Java heap at
+1 GiB. This makes the
+fn64 fork the explicit VW implementation for GUI work without installing it
+globally or changing the independent raw-bank production authority.
+
+Ten consecutive guarded Banjo first-contact runs on 2026-07-29 produced the
+same install/runtime identities and receipt digest. Those private content
+identities are recorded by the local receipts; repository tests do not retain
+or recheck them.
+A same-bank A/B runtime-identity run also matched those values, but that A/B
+orchestration change has only one clean real run so far.
+
+An immutable-source conformance rebuild on the same date reproduced the class
+digest but changed only generated-help timestamps, changing the JAR/ZIP
+digests. The pending fork-side help normalization must be reviewed and
+committed before any rebuilt artifact is eligible to replace the approved ZIP.
+
+The first real same-bank A/B on 2026-07-29 used the approved fork over the
+Banjo-Kazooie Rev 1 one-MiB boot bank. BinaryLoader produced 61 function starts;
+VW produced the same 61 exact bodies plus four starts and 114 body words. The
+pre-analysis inventory attributes only `0x80000400` directly to the loader's
+external-entry seed; the other three are analyzer results under VW's memory
+map. All four already existed in fn64's snapshot ledger. This establishes a
+real differential and explains its seed boundary, but adds no ledger coverage
+and has not yet been graded against a Banjo answer key.
+
+Flat-ROM or RDRAM addresses from this first-contact lane are only candidates.
+They must not be frozen into a snapshot-bound `ToolClaimSetV1` unless fn64
+independently supplies the exact normalized-ROM identity, `BankId`, bank-byte
+and mapping digests, and matching discovery-snapshot lineage, and the adapter
+translates each claim through that bank input. A loader mapping, project name,
+or RDRAM-dump digest does not establish overlay identity; mutually exclusive
+images at the same VA remain separate bank runs.
+
 Export candidates for functions, blocks, flows, switches, references,
 strings, data objects, prototypes, stack frames, and decompiler-derived types.
 Ghidra function starts and decompiler output remain candidates. A Ghidra
 control-flow disagreement with fn64 is a high-priority differential because
 the decoder/lifter family is independent.
 
+The first flow slice is implemented as `fn64.tool-adapter` schema v3:
+`ComputedControlFlow { site, via_call, targets, completeness: Unknown }` under
+the separate `ControlFlowCandidates` role. The one-variant completeness type
+makes non-exhaustiveness a wire invariant. Sites and targets are aligned and
+qualified by the exact independently supplied bank; out-of-bank raw targets
+cannot acquire a guessed `BankId`. `ToolClaimSetV1` remains the sidecar
+envelope and accepts these candidates only from schema-v3 sources, so neither
+freezing nor replay can mutate native facts.
+
+The handwritten Ghidra conformance fixture covers constant `jr`/`jalr`, a
+three-target switch, an unresolved computed jump with no references, and
+ordinary-return exclusion. Ten consecutive guarded runs produced one stable
+receipt. On the OoT boot bank, `compare_computed_flows` independently decoded
+every reported MIPS site and compared it with the exact snapshot closure:
+all three native sites appeared; the one native-exhaustive constant target
+matched exactly; the two native-open sites remained targetless; and Ghidra
+reported seven additional sites outside native reachability, including a
+six-target switch at `0x8000390c`. The answer key places those extra sites in
+`__osException` and `__osDevMgrMain`, but that grading fact is not production
+entry authority. The next adoption gate is independent authority for their
+containing function entries followed by native resolver replay.
+
 Use two experiment modes:
 
-- `unseeded`: only bank mapping, permissions, and a hardware/proven entry;
-  useful for genuine independent discovery;
+- `discovery_only`: only the verified bank mapping and permissions, with no
+  function seed; useful for genuine independent boundary discovery;
+- `unseeded`: bank mapping, permissions, and one Proven owner entry;
 - `seeded`: all current entries and data ranges; useful for types, xrefs, and
   human work, but not corroboration of the seeds.
+
+The snapshot-bank runner makes those inputs distinct at its staging boundary.
+Paired mode requires a proven-owner base seed plus a distinct assessed snapshot
+seed. `--unseeded-only` invokes typed base-only staging and accepts no snapshot
+seed at all. `--discovery-only` invokes schema-version-3 staging with neither a
+base nor snapshot seed. Its evidence and receipt bind
+`{"mode":"discovery_only","role":"candidate_only"}`, its strict configuration
+binds both seed fields as JSON `null`, and its tool manifest and Ghidra command
+omit `Fn64SeedFunctions.java` entirely. Existing schema-version-2 `paired` and
+`base_only` staging remain unchanged; base-only artifacts omit the inapplicable
+snapshot-seed field, while their Ghidra configuration records it as JSON
+`null`.
+
+Each run retains and hashes the exact runner, distribution-manifest scanner,
+memory guard, stage helper, and ingest helper. Every generated mode tool
+manifest binds one compact orchestration manifest containing those identities,
+which avoids counting the retained helper binaries against strict ingest's
+artifact-byte budget. The relocatable helpers execute from those private
+copies, and a final check rejects source or retained-copy mutation before
+receipt publication. This binds the caller-supplied ingest implementation
+without promoting its output above the candidate-only ceiling. Distribution
+inventory is fail-closed: a traversal or file-read error invalidates the scan
+rather than silently omitting a subtree.
+
+The runner serializes its guarded phases explicitly. HUP, INT, or TERM is
+forwarded to the one active memory guard, and the runner waits for that guard's
+isolated process group to be empty before returning. Interrupted attempts keep
+diagnostics plus a typed interruption receipt and cannot overlap a subsequent
+runner launch through an orphaned Ghidra child.
+
+`tools/ghidra/run-snapshot-workspace.py` is the candidate-only scheduler for a
+producer workspace. It preflights the bounded immutable manifest and every
+artifact, then runs one bank runner at a time: no-seed discovery for
+`discovery_only`, or only the unseeded/base pass for `base_only` and `paired`.
+The paired second pass is deliberately outside this queue. A singleton lock,
+fixed launch/wall/attempt/failure/log/output/disk ceilings, and the bank
+runner's existing memory guard keep the expensive phase serialized and
+bounded. Numbered immutable attempt receipts support fail-closed resume; each
+resume rehashes producer inputs, child receipts, direct evidence, and the
+transitive Ghidra/JDK/orchestration cohort. The terminal manifest is published
+last. Its `candidate_queue_complete` state reports only completion of this
+candidate pass, never static proof closure or ROM recompilation completeness.
+The request binds the queue implementation itself. A successful child
+workspace admits exactly one runner attempt plus its private distribution
+cache; the cache must contain only the mode-0600 content-addressed manifest
+that matches the receipt. Scheduler validation changes therefore start a fresh
+queue workspace rather than reinterpreting immutable older attempts.
 
 The first bounded T3 conformance spike now runs stock Ghidra 12.1.2 over two
 handwritten 64-byte MIPS fixtures at the same VA. Each bank uses a separate
@@ -457,6 +749,25 @@ only its declared entry with discovery-snapshot lineage, and every result
 passed the Rust candidate-only adapter. Ten consecutive three-project runs
 produced one output digest per mode/bank. The reproducible command and full
 digests live in [`tools/ghidra/README.md`](../tools/ghidra/README.md).
+
+`candidate_cfg_probe` is the deliberately smaller experiment bridge from a
+validated `ToolClaimSetV1` back into fn64's native traversal. It rechecks the
+exact snapshot binding, bank mapping, byte length, and byte digest, extracts
+canonical bank-qualified `function_entry` candidates, then measures one union
+traversal and independent per-entry traversals. It admits at most 4,096 roots
+and 4,000,000 aggregate visited words. Because the native traversal API has no
+work-budget parameter, the bridge conservatively reserves one complete bank's
+word count before every admitted pass; skipped work is an explicit `partial`
+result. Its path-free JSON contains counts, coverage diagnostics, and the
+union's overlap/new-word delta against the snapshot's native traversal only.
+It cannot emit a `FactDb`, native CFG, partition, owner/block proof, replacement
+snapshot, or authority promotion. In particular, the native CFG's historical
+callable-root field name is not exported: external function starts remain
+candidate seeds regardless of traversal success. The CLI accepts additional
+validated claim-set paths after the primary path and merges their
+snapshot-bound sources before validation. This combines a function-boundary
+stream with a separate Ghidra `region_candidates` executable-range stream
+without weakening either role.
 
 Ghidra's GUI is an excellent review surface. Export fn64 proof state and
 provenance as bookmarks/comments/colors, and import analyst changes only as a
@@ -678,7 +989,13 @@ loudly; canonical output is identical across ten runs.
 - Add Rabbitizer as an optional test oracle.
 - [x] Add the pinned spimdisasm function-info JSON normalizer.
 - [x] Run the function-info adapter through the sidecar for entries and
-  extents; references and region candidates remain open.
+  extents; reference graph ingestion and remaining region candidates are open.
+- [x] Add the cached per-bank interchange for blocks, direct references,
+  HI/LO pairs, and data candidates. One pinned run should supply all four
+  views; function-info CSV alone leaves the highest-value reference fields
+  unused.
+- Build a source-qualified n64sym signature index and keep identity matches
+  separate from extent or ownership claims.
 - Measure marginal precision/recall, exact/coarse owner bytes, new references,
   and cost per bank.
 
@@ -686,13 +1003,11 @@ Exit gate: no external claim is authoritative by itself; disabling the
 adapter removes only its claims and descendant derivations; a holdout ROM
 shows positive marginal entry or reference value.
 
-### T2: Splat and m2c consumers
+### T2: Splat consumer
 
 - Emit proven and experimental Splat packs separately.
 - Run matching-assembly/relink validators.
-- Generate m2c assembly/context for exact owners and selected experimental
-  coarse owners.
-- Parse validation failures and m2c diagnostics into frontier categories.
+- Parse assembly and relink validation failures into frontier categories.
 
 Exit gate: proven pack round trips where expected; an experimental pack can
 never leak symbols or boundaries into the proven pack without a new native
@@ -826,7 +1141,6 @@ fn64-discover tool run spimdisasm SNAPSHOT --banks frontier --out RUN
 fn64-discover tool run ghidra SNAPSHOT --mode unseeded --banks frontier --out RUN
 fn64-discover tool ingest SNAPSHOT RUN --out SNAPSHOT
 fn64-discover pack splat SNAPSHOT --state proven --out WORKSPACE
-fn64-discover pack m2c SNAPSHOT FUNCTION --out WORKSPACE
 fn64-discover probe plan SNAPSHOT --budget 100 --out PLAN
 fn64-discover probe run mame PLAN --scenario boot --out TRACE
 fn64-discover trace ingest SNAPSHOT TRACE --out SNAPSHOT
@@ -846,14 +1160,11 @@ metric delta so a change can be evaluated without opening a large report.
    against the existing OoT/NW4E/NWXE grades. Keep Splat in the same lineage.
 3. Emit one proven and one experimental Splat bank, assemble both, and record
    byte/relocation mismatches without promoting either partition.
-4. Run m2c only on exact owners plus a small sampled set of deliberately
-   missplit synthetic functions. Catalog which diagnostics are useful frontier
-   signals and which accept wrong boundaries.
-5. Build a minimal Ghidra headless raw-bank exporter and compare direct edges,
+4. Build a minimal Ghidra headless raw-bank exporter and compare direct edges,
    switches, and starts on synthetic delay-slot/overlay fixtures before a ROM.
-6. Prototype a MAME command-file trace for PCs and public PI register writes;
+5. Prototype a MAME command-file trace for PCs and public PI register writes;
    require a completion event before emitting a completed DMA observation.
-7. Add a bounded angr experiment for the hardest remaining indirect site only
+6. Add a bounded angr experiment for the hardest remaining indirect site only
    after the native and dynamic frontier reports can name that site precisely.
 
 The adoption criterion is not the number of tools connected. It is a larger
@@ -864,11 +1175,10 @@ iteration time.
 
 - [Ghidra project and license](https://github.com/NationalSecurityAgency/ghidra)
 - [Ghidra HeadlessAnalyzer API](https://ghidra.re/ghidra_docs/api/ghidra/app/util/headless/HeadlessAnalyzer.html)
-- [N64LoaderWV project description](https://github.com/zeroKilo/N64LoaderWV)
+- [Historical upstream N64LoaderWV project description](https://github.com/zeroKilo/N64LoaderWV)
 - [Rabbitizer features and Rust bindings](https://github.com/Decompollaborate/rabbitizer)
 - [spimdisasm features and interfaces](https://github.com/Decompollaborate/spimdisasm)
 - [Splat project](https://github.com/ethteck/splat)
-- [m2c interface and context cache](https://github.com/matt-kempster/m2c)
 - [n64sym interface and ROM/RAM caveat](https://github.com/shygoo/n64sym)
 - [angr analyses](https://github.com/angr/angr)
 - [angr CFG recovery documentation](https://docs.angr.io/en/latest/analyses/cfg.html)

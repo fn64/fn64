@@ -1010,13 +1010,9 @@ Everything else is now owned here. After D-gate, only a user's own ROM remains.
   knobs are now `FN64_*`; `fn64-render-rt64`'s `debug_flag()` and `fn64-abi`'s
   `assert_no_legacy_env_vars()` panic on a retired `OOT_*` spelling so an old
   invocation cannot silently no-op. `examples/` keeps `OOT_*` by design.
-- [ ] **H3 `fn64-discover` gates cannot run off the author's machine.** Not
-  env vars with defaults — compile-time `const`s: `gate_b1.rs:18/20-22`,
-  `gate_d1.rs:18-19/24-27`, `gate_b2.rs:39/51` hold
-  `/Users/jer/Downloads/...z64` and `/Users/jer/Code/aki-recomp/...`. The
-  D1/B1 grading numbers cited in Phase D are reproducible by exactly one
-  person. Fix: env var + a loud, named skip when unset (never a silent pass —
-  that is the "silent shrug" AGENTS.md bans).
+- [x] **H3 `fn64-discover` gate inputs are explicit and portable.** B1, D1,
+  and B2 require named runtime `FN64_DISCOVER_*` inputs, compile no personal
+  paths or defaults, and fail loudly with the missing variable.
 
 - [ ] **H4 `cargo test -p fn64-abi` flakes ~60%; nextest does NOT.** Measured
   2026-07-17 across the day: `cargo test -p fn64-abi --lib` ->

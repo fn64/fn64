@@ -212,6 +212,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "fn64-abi"
 version = "0.0.0"
 dependencies = [
@@ -220,6 +230,7 @@ dependencies = [
  "fn64-recomp-rs",
  "fn64-render",
  "fn64-runtime",
+ "sha2",
 ]
 
 [[package]]
@@ -227,6 +238,10 @@ name = "fn64-audio"
 version = "0.0.0"
 dependencies = [
  "cpal",
+ "fn64-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -234,10 +249,14 @@ name = "fn64-boot-harness"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
+ "fn64-recomp-rs",
  "fn64-runtime",
+ "getrandom",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -246,6 +265,9 @@ version = "0.0.0"
 dependencies = [
  "csv",
  "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "fn64-runtime",
+ "libc",
  "md-5",
  "serde",
  "serde_json",
@@ -266,8 +288,20 @@ dependencies = [
 name = "fn64-recomp-rs"
 version = "0.0.0"
 dependencies = [
- "fn64-recomp",
+ "rustc_apfloat",
  "serde",
+ "sha2",
+ "toml",
+]
+
+[[package]]
+name = "fn64-recomp-rs-codegen"
+version = "0.0.0"
+dependencies = [
+ "fn64-recomp",
+ "fn64-recomp-rs",
+ "serde",
+ "sha2",
  "toml",
 ]
 
@@ -277,6 +311,16 @@ version = "0.0.0"
 dependencies = [
  "fn64-runtime",
  "sha2",
+ "twox-hash",
+]
+
+[[package]]
+name = "fn64-render-reference"
+version = "0.0.0"
+dependencies = [
+ "fn64-render",
+ "fn64-runtime",
+ "sha2",
 ]
 
 [[package]]
@@ -284,6 +328,7 @@ name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
  "corosensei",
+ "sha2",
 ]
 
 [[package]]
@@ -318,6 +363,18 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+ "wasip2",
 ]
 
 [[package]]
@@ -416,6 +473,12 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
@@ -652,12 +715,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-efi"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "rustc_apfloat"
+version = "0.2.3+llvm-462a31f5a5ab"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+dependencies = [
+ "bitflags",
+ "smallvec",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -788,6 +880,12 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "smallvec"
+version = "1.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "syn"
@@ -923,6 +1021,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
+name = "twox-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -948,6 +1052,15 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wasip2"
+version = "1.0.4+wasi-0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
+dependencies = [
+ "wit-bindgen",
 ]
 
 [[package]]
@@ -1225,6 +1338,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
 name = "wm2000-block-boot"
 version = "0.0.0"
 dependencies = [
@@ -1232,6 +1351,397 @@ dependencies = [
  "fn64-boot-harness",
  "fn64-discover",
  "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "fn64-render",
+ "fn64-render-reference",
+ "fn64-runtime",
+ "serde_json",
+ "sha2",
+ "wm2000-block-overlay-0-shard-00",
+ "wm2000-block-overlay-0-shard-01",
+ "wm2000-block-overlay-0-shard-02",
+ "wm2000-block-overlay-1-shard-00",
+ "wm2000-block-overlay-2-shard-00",
+ "wm2000-block-overlay-2-shard-01",
+ "wm2000-block-overlay-2-shard-02",
+ "wm2000-block-overlay-2-shard-03",
+ "wm2000-block-overlay-2-shard-04",
+ "wm2000-block-overlay-2-shard-05",
+ "wm2000-block-overlay-3-shard-00",
+ "wm2000-block-overlay-3-shard-01",
+ "wm2000-block-overlay-3-shard-02",
+ "wm2000-block-overlay-3-shard-03",
+ "wm2000-block-overlay-3-shard-04",
+ "wm2000-block-overlay-3-shard-05",
+ "wm2000-block-overlay-3-shard-06",
+ "wm2000-block-overlay-3-shard-07",
+ "wm2000-block-resident-tail-shard-00",
+ "wm2000-block-resident-tail-shard-01",
+ "wm2000-block-shard-00",
+ "wm2000-block-shard-01",
+ "wm2000-block-shard-02",
+ "wm2000-block-shard-03",
+ "wm2000-block-shard-04",
+ "wm2000-block-shard-05",
+ "wm2000-block-shard-06",
+ "wm2000-block-shard-07",
+ "wm2000-block-shard-08",
+ "wm2000-block-shard-09",
+ "wm2000-block-shard-10",
+ "wm2000-block-shard-11",
+ "wm2000-block-shard-12",
+ "wm2000-block-shard-13",
+ "wm2000-block-shard-14",
+]
+
+[[package]]
+name = "wm2000-block-overlay-0-shard-00"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-0-shard-01"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-0-shard-02"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-1-shard-00"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-2-shard-00"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-2-shard-01"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-2-shard-02"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-2-shard-03"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-2-shard-04"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-2-shard-05"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-00"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-01"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-02"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-03"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-04"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-05"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-06"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-overlay-3-shard-07"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-resident-tail-shard-00"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-resident-tail-shard-01"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-00"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-01"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-02"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-03"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-04"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-05"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-06"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-07"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-08"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-09"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-10"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-11"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-12"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-13"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
+]
+
+[[package]]
+name = "wm2000-block-shard-14"
+version = "0.0.0"
+dependencies = [
+ "fn64-discover",
+ "fn64-recomp-rs",
+ "fn64-recomp-rs-codegen",
+ "sha2",
 ]
 
 [[package]]

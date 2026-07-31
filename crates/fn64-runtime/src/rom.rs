@@ -37,7 +37,7 @@
 //! that an asynchronous public API completed at its call site.
 
 use crate::device::Cycles;
-use crate::rdram::RdramAddr;
+use crate::rdram::{RdramAddr, RdramPtr};
 use crate::save::{
     EepromError, EepromKind, EepromStatus, SaveOperationEvent, SaveOperationKind, SaveStorage,
     SaveType, EEPROM_BLOCK_SIZE, EEPROM_WRITE_CYCLES,
@@ -48,13 +48,26 @@ use crate::trace::DmaDirection;
 /// RDRAM allocation. Both the owning [`crate::rdram::Rdram`] and a checked
 /// borrowed [`crate::rdram::RdramViewMut`] implement this interface, so an
 /// ABI adapter never needs to fabricate a second RDRAM object.
-pub trait DmaMemory {
-    fn dma_write_bytes(&mut self, offset: usize, data: &[u8]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaWriterChannel {
+    Pi,
+    Si,
+    Sp,
+}
+
+mod dma_memory_sealed {
+    pub trait Sealed {}
+}
+
+pub trait DmaMemory: dma_memory_sealed::Sealed {
+    fn dma_write_bytes(&mut self, channel: DmaWriterChannel, offset: usize, data: &[u8]);
     fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8>;
 }
 
+impl dma_memory_sealed::Sealed for crate::rdram::Rdram {}
+
 impl DmaMemory for crate::rdram::Rdram {
-    fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+    fn dma_write_bytes(&mut self, _channel: DmaWriterChannel, offset: usize, data: &[u8]) {
         Self::dma_write_bytes(self, offset, data);
     }
 
@@ -63,13 +76,104 @@ impl DmaMemory for crate::rdram::Rdram {
     }
 }
 
+impl dma_memory_sealed::Sealed for crate::rdram::RdramViewMut<'_> {}
+
 impl DmaMemory for crate::rdram::RdramViewMut<'_> {
-    fn dma_write_bytes(&mut self, offset: usize, data: &[u8]) {
+    fn dma_write_bytes(&mut self, _channel: DmaWriterChannel, offset: usize, data: &[u8]) {
         Self::dma_write_bytes(self, offset, data);
     }
 
     fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
         Self::dma_read_bytes_flat(self, offset, len)
+    }
+}
+
+/// Call-scoped DMA access to the process's registered raw RDRAM allocation.
+///
+/// The callback is borrowed for the adapter's complete lifetime, so a caller
+/// cannot retain this capability after the device boundary which owns its
+/// write accounting has returned.
+pub struct ProcessDmaMemory<'call> {
+    storage: std::ptr::NonNull<u8>,
+    len: usize,
+    committed_write: &'call mut dyn FnMut(DmaWriterChannel, usize, usize),
+    _call: std::marker::PhantomData<&'call mut [u8]>,
+    _not_send_or_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl<'call> ProcessDmaMemory<'call> {
+    /// Construct a bounded adapter over the one process RDRAM allocation.
+    ///
+    /// # Safety
+    /// `storage` must remain live and exclusively accessible for all `len`
+    /// bytes until this adapter is dropped. `len` must describe complete
+    /// native words because logical DMA bytes use the N64Recomp `offset ^ 3`
+    /// lane mapping.
+    pub unsafe fn from_raw_parts(
+        storage: *mut u8,
+        len: usize,
+        committed_write: &'call mut dyn FnMut(DmaWriterChannel, usize, usize),
+    ) -> Self {
+        assert!(
+            len.is_multiple_of(4),
+            "process DMA RDRAM length {len:#x} must cover complete native words"
+        );
+        Self {
+            storage: std::ptr::NonNull::new(storage)
+                .expect("process DMA RDRAM pointer must not be null"),
+            len,
+            committed_write,
+            _call: std::marker::PhantomData,
+            _not_send_or_sync: std::marker::PhantomData,
+        }
+    }
+
+    fn checked_logical_range(&self, offset: usize, len: usize, operation: &str) {
+        let end = offset
+            .checked_add(len)
+            .unwrap_or_else(|| panic!("{operation}: process DMA RDRAM range overflow"));
+        assert!(
+            end <= self.len,
+            "{operation}: logical RDRAM range [{offset:#x}, {end:#x}) exceeds process allocation length {:#x}",
+            self.len
+        );
+    }
+}
+
+impl dma_memory_sealed::Sealed for ProcessDmaMemory<'_> {}
+
+impl DmaMemory for ProcessDmaMemory<'_> {
+    fn dma_write_bytes(&mut self, channel: DmaWriterChannel, offset: usize, data: &[u8]) {
+        self.checked_logical_range(offset, data.len(), "process DMA write");
+        // SAFETY: construction checked a live non-null allocation, and the
+        // complete logical range was preflighted above for this call.
+        let storage = unsafe { RdramPtr::from_storage_ptr(self.storage.as_ptr()) };
+        for (index, byte) in data.iter().copied().enumerate() {
+            let logical = u32::try_from(offset + index)
+                .expect("process DMA write address exceeds the RDRAM wire");
+            // SAFETY: the complete logical range was preflighted above.
+            unsafe {
+                storage.write_u8(RdramAddr::from_offset(logical), byte);
+            }
+        }
+        if !data.is_empty() {
+            (self.committed_write)(channel, offset, data.len());
+        }
+    }
+
+    fn dma_read_bytes_flat(&self, offset: usize, len: usize) -> Vec<u8> {
+        self.checked_logical_range(offset, len, "process DMA read");
+        // SAFETY: construction checked a live non-null allocation, and the
+        // complete logical range was preflighted above for this call.
+        let storage = unsafe { RdramPtr::from_storage_ptr(self.storage.as_ptr()) };
+        (0..len)
+            .map(|index| {
+                let logical = u32::try_from(offset + index)
+                    .expect("process DMA read address exceeds the RDRAM wire");
+                // SAFETY: the complete logical range was preflighted above.
+                unsafe { storage.read_u8(RdramAddr::from_offset(logical)) }
+            })
+            .collect()
     }
 }
 
@@ -553,7 +657,7 @@ impl<R: RomStorage> PiDma<R> {
             (DmaDirection::ToRdram, false) => {
                 let mut buf = vec![0u8; len as usize];
                 self.rom.read_into(dev_addr, &mut buf);
-                rdram.dma_write_bytes(base, &buf);
+                rdram.dma_write_bytes(DmaWriterChannel::Pi, base, &buf);
             }
             // Domain-2 SRAM READ (device -> RDRAM): flat save bytes swizzled
             // into rdram the SAME way as a ROM DMA, because the guest reads the
@@ -562,7 +666,7 @@ impl<R: RomStorage> PiDma<R> {
                 let sram_offset = dev_addr - SRAM_DOMAIN2_BASE;
                 let mut buf = vec![0u8; len as usize];
                 self.sram_read_into(sram_offset, &mut buf);
-                rdram.dma_write_bytes(base, &buf);
+                rdram.dma_write_bytes(DmaWriterChannel::Pi, base, &buf);
             }
             // Domain-2 SRAM WRITE (RDRAM -> device): rdram holds native-word-
             // swizzled bytes; un-swizzle back to flat save order (the inverse
@@ -592,6 +696,69 @@ impl<R: RomStorage> PiDma<R> {
 mod tests {
     use super::*;
     use crate::rdram::Rdram;
+
+    #[test]
+    fn process_dma_memory_maps_lanes_and_reports_only_after_commit() {
+        let mut storage = [0u8; 8];
+        let storage_address = storage.as_mut_ptr() as usize;
+        let mut calls = Vec::new();
+        {
+            let mut committed = |channel, offset, len| {
+                let bytes = unsafe { std::slice::from_raw_parts(storage_address as *const u8, 8) };
+                assert_eq!(bytes, [0x12, 0x11, 0x10, 0, 0, 0, 0x14, 0x13]);
+                calls.push((channel, offset, len));
+            };
+            let mut memory = unsafe {
+                ProcessDmaMemory::from_raw_parts(
+                    storage.as_mut_ptr(),
+                    storage.len(),
+                    &mut committed,
+                )
+            };
+            memory.dma_write_bytes(DmaWriterChannel::Pi, 1, &[0x10, 0x11, 0x12, 0x13, 0x14]);
+            assert_eq!(
+                memory.dma_read_bytes_flat(1, 5),
+                [0x10, 0x11, 0x12, 0x13, 0x14]
+            );
+        }
+        assert_eq!(calls, [(DmaWriterChannel::Pi, 1, 5)]);
+    }
+
+    #[test]
+    fn process_dma_memory_preflights_complete_ranges_before_access() {
+        let mut storage = [0x5au8; 8];
+        let mut calls = Vec::new();
+        {
+            let mut committed = |channel, offset, len| calls.push((channel, offset, len));
+            let mut memory = unsafe {
+                ProcessDmaMemory::from_raw_parts(
+                    storage.as_mut_ptr(),
+                    storage.len(),
+                    &mut committed,
+                )
+            };
+            let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                memory.dma_write_bytes(DmaWriterChannel::Sp, 7, &[1, 2]);
+            }));
+            assert!(write.is_err());
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                memory.dma_read_bytes_flat(usize::MAX, 2);
+            }));
+            assert!(read.is_err());
+        }
+        assert_eq!(storage, [0x5a; 8]);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "must cover complete native words")]
+    fn process_dma_memory_rejects_partial_native_word_storage() {
+        let mut storage = [0u8; 7];
+        let mut committed = |_, _, _| {};
+        let _ = unsafe {
+            ProcessDmaMemory::from_raw_parts(storage.as_mut_ptr(), storage.len(), &mut committed)
+        };
+    }
 
     #[test]
     fn dma_to_rdram_reads_back_through_mem_accessors_unswapped() {

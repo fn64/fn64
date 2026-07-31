@@ -471,6 +471,7 @@ fn describe_block(
             BlockTerminator::Branch {
                 target,
                 fallthrough,
+                ..
             } => (
                 4,
                 true,
@@ -484,6 +485,7 @@ fn describe_block(
             BlockTerminator::BranchLikely {
                 target,
                 fallthrough,
+                ..
             } => (
                 5,
                 true,
@@ -667,6 +669,8 @@ mod tests {
             direct_calls: Vec::new(),
             tail_transfers: Vec::new(),
             indirect_sites: Vec::new(),
+            plain_delay_entry_aliases: Vec::new(),
+            unsupported_delay_entries: Vec::new(),
             proven_roots: Vec::new(),
         }
     }
@@ -808,11 +812,13 @@ mod tests {
                         BlockTerminator::BranchLikely {
                             target: 0x8000_0020,
                             fallthrough: 0x8000_0008,
+                            link: false,
                         }
                     } else {
                         BlockTerminator::Branch {
                             target: 0x8000_0020,
                             fallthrough: 0x8000_0008,
+                            link: false,
                         }
                     },
                 },

@@ -3,14 +3,15 @@
 //! discovery runs, so function identity can be bank-qualified from the
 //! first instruction.
 //!
-//! This module implements the two detectors that are mechanical hardware
-//! facts rather than heuristics for every N64 ROM:
+//! This module implements two mechanical detectors rather than heuristic
+//! mapping guesses:
 //!
-//! 1. **The boot copy.** IPL3 always DMAs a fixed-size prefix of the ROM
-//!    (hardware behavior: 0x100000 bytes for a PI-based CIC boot, starting
-//!    at ROM offset 0x1000) to the RDRAM VA named by the header's entry
-//!    point field. This is `bank "boot"` and requires no scanning -- the
-//!    header supplies every field directly.
+//! 1. **The boot copy.** The admitted standard IPL3 builds DMA a fixed-size
+//!    prefix of the ROM (0x100000 bytes for a PI-based CIC boot, starting
+//!    at ROM offset 0x1000) to the RDRAM VA determined from the header entry
+//!    and the exact IPL3 relocation profile. This is `bank "boot"`, but it
+//!    becomes `Proven` only when the complete IPL3 has an exact recognized
+//!    identity that establishes its relocation behavior.
 //! 2. **Repeated-load VA ranges from an overlay descriptor table.** Many
 //!    AKI-family engines (see faki-tools' NW4E ground truth) and other N64
 //!    titles keep a fixed-shape table of `(rom_start, rom_end, vram_dest,
@@ -30,9 +31,9 @@ use serde::{Deserialize, Serialize};
 
 /// IPL3's fixed boot-copy size on real N64 hardware: the first 0x100000
 /// ROM bytes (after the 0x1000-byte header+IPL3 region) are DMA'd to RDRAM
-/// starting at the header's entry point. This is a hardware constant, not
-/// a discovered value -- see any N64 hardware boot reference (the PI
-/// register sequence IPL3 issues is fixed silicon behavior).
+/// starting at the destination selected by the exact IPL3 build. The source
+/// extent is a hardware constant, not a discovered value -- see public N64
+/// IPL3/PI boot documentation.
 pub const BOOT_COPY_ROM_START: u32 = 0x1000;
 pub const BOOT_COPY_SIZE: u32 = 0x0010_0000;
 
@@ -44,48 +45,180 @@ pub const BOOT_BANK: &str = "boot";
 /// boot copy. CIC-6102 and 6105 builds load at the header entry point;
 /// the CIC-6103 build loads at `entry point - 0x100000` (public N64 boot
 /// documentation, n64brew "CIC-NUS-610x" / "IPL3"). The digest below was
-/// measured directly from a Kirby 64 (US) cartridge dump — the one 6103
-/// title in the local corpus — and cross-checked by clustering IPL3
-/// digests across 14 local ROMs: the 6102 cluster (SM64, GoldenEye, four
-/// AKI titles) and 6105 cluster (OoT, MM, Perfect Dark) share their own
-/// distinct blobs and a zero delta, and Kirby's decomp places `main` at
+/// measured directly from a permitted Kirby 64 (US) cartridge dump and later
+/// clustered with the permitted Banjo/Kirby 6103-family inputs. The 6102
+/// cluster (SM64, GoldenEye, four AKI titles) and 6105 cluster (OoT, MM,
+/// Perfect Dark) share their own distinct blobs and a zero delta, and Kirby's
+/// decomp places `main` at
 /// exactly `entry - 0x100000` (0x80000400), confirming the delta on real
-/// data. An unrecognized IPL3 keeps the zero-delta reading — the behavior
-/// for every non-6103 blob observed so far — rather than guessing.
-const IPL3_SHA256_CIC_6103: &str =
+/// data. The 6102/7101 and 6105/7105 SHA-256 values were measured across the
+/// permitted local corpus and cross-checked against the matching IPL3 MD5
+/// clusters in Dragorn421/n64checksum (CC0-1.0,
+/// <https://github.com/Dragorn421/n64checksum>). No other digest inherits
+/// their behavior.
+const IPL3_SHA256_CIC_6102_7101: &str =
+    "61e88238552c356c23d19409fe5570ee6910419586bc6fc740f638f761adc46e";
+const IPL3_SHA256_CIC_6103_7103: &str =
     "bf3620d30817007091ebe9bddd1b88c23b8a0052170b3309cde5b6b4238e45e7";
+const IPL3_SHA256_CIC_6105_7105: &str =
+    "04b7bc6717a9f0eb724cf927e74ad3876c381cbb280d841736fc5e55580b756b";
 
 const IPL3_ROM_START: usize = 0x40;
 const IPL3_ROM_END: usize = 0x1000;
 
-fn boot_load_delta(rom_bytes: &[u8]) -> (u32, &'static str) {
+/// Exact standard IPL3 identity whose boot-copy relocation is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecognizedIpl3 {
+    Cic6102Or7101,
+    Cic6103Or7103,
+    Cic6105Or7105,
+}
+
+impl RecognizedIpl3 {
+    fn load_delta(self) -> u32 {
+        match self {
+            Self::Cic6102Or7101 | Self::Cic6105Or7105 => 0,
+            Self::Cic6103Or7103 => 0x10_0000,
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Self::Cic6102Or7101 => "CIC-6102/7101 IPL3 (loads at header entry)",
+            Self::Cic6103Or7103 => "CIC-6103/7103 IPL3 (loads at entry - 0x100000)",
+            Self::Cic6105Or7105 => "CIC-6105/7105 IPL3 (loads at header entry)",
+        }
+    }
+}
+
+/// Why boot-bank discovery could not establish a mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootBankOpenReason {
+    TruncatedIpl3 {
+        available_bytes: u32,
+        required_bytes: u32,
+    },
+    UnrecognizedIpl3 {
+        sha256: String,
+    },
+    TruncatedBootCopy {
+        ipl3: RecognizedIpl3,
+        ipl3_sha256: String,
+        available_bytes: u32,
+        required_bytes: u32,
+    },
+    InvalidEntrypoint {
+        ipl3: RecognizedIpl3,
+        ipl3_sha256: String,
+        entry_point: u32,
+        load_delta: u32,
+    },
+    InvalidLoadRange {
+        ipl3: RecognizedIpl3,
+        ipl3_sha256: String,
+        va_start: u32,
+        byte_length: u32,
+    },
+}
+
+/// Typed outcome of the IPL3-bound boot-bank proof rule.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootBankDiscovery {
+    Proven {
+        ipl3: RecognizedIpl3,
+        ipl3_sha256: String,
+        load_delta: u32,
+    },
+    Open {
+        reason: BootBankOpenReason,
+    },
+}
+
+fn classify_ipl3_sha256(digest: &str) -> Option<RecognizedIpl3> {
+    match digest {
+        IPL3_SHA256_CIC_6102_7101 => Some(RecognizedIpl3::Cic6102Or7101),
+        IPL3_SHA256_CIC_6103_7103 => Some(RecognizedIpl3::Cic6103Or7103),
+        IPL3_SHA256_CIC_6105_7105 => Some(RecognizedIpl3::Cic6105Or7105),
+        _ => None,
+    }
+}
+
+fn identify_ipl3(rom_bytes: &[u8]) -> Result<(RecognizedIpl3, String), BootBankOpenReason> {
     use sha2::Digest as _;
     if rom_bytes.len() < IPL3_ROM_END {
-        return (0, "header-only (ROM too short for IPL3)");
+        return Err(BootBankOpenReason::TruncatedIpl3 {
+            available_bytes: rom_bytes.len().saturating_sub(IPL3_ROM_START) as u32,
+            required_bytes: (IPL3_ROM_END - IPL3_ROM_START) as u32,
+        });
     }
     let mut hasher = sha2::Sha256::new();
     hasher.update(&rom_bytes[IPL3_ROM_START..IPL3_ROM_END]);
     let digest = format!("{:x}", hasher.finalize());
-    if digest == IPL3_SHA256_CIC_6103 {
-        (0x10_0000, "CIC-6103 IPL3 (loads at entry - 0x100000)")
-    } else {
-        (0, "entry-loading IPL3 (6102/6105-class or unrecognized)")
-    }
+    classify_ipl3_sha256(&digest)
+        .map(|identity| (identity, digest.clone()))
+        .ok_or(BootBankOpenReason::UnrecognizedIpl3 { sha256: digest })
 }
 
 /// Discover the boot-copy bank from the ROM header plus the IPL3 blob.
-/// This never fails for a normalized ROM (the header was already validated
-/// in Phase 1) and is `Proven` immediately: the mapping is a direct read
-/// of hardware-fixed header fields and the hardware-fixed relocation
-/// behavior of the identified IPL3 build, not an inference.
-pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
-    let (load_delta, ipl3_note) = boot_load_delta(&rom.bytes);
-    let va_start = rom.header.entry_point.wrapping_sub(load_delta);
+/// A complete, exactly recognized standard IPL3 produces a `Proven` mapping
+/// and entry. A truncated or unknown IPL3 records an explicit `Open` bank
+/// conclusion and publishes no guessed mapping or entry.
+pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) -> BootBankDiscovery {
+    let (ipl3, ipl3_sha256) = match identify_ipl3(&rom.bytes) {
+        Ok(identified) => identified,
+        Err(reason) => {
+            return record_boot_open(rom, db, reason);
+        }
+    };
+    publish_boot_bank(rom, db, ipl3, ipl3_sha256)
+}
+
+fn publish_boot_bank(
+    rom: &NormalizedRom,
+    db: &mut FactDb,
+    ipl3: RecognizedIpl3,
+    ipl3_sha256: String,
+) -> BootBankDiscovery {
+    let load_delta = ipl3.load_delta();
+    let Some(va_start) = rom.header.entry_point.checked_sub(load_delta) else {
+        return record_boot_open(
+            rom,
+            db,
+            BootBankOpenReason::InvalidEntrypoint {
+                ipl3,
+                ipl3_sha256,
+                entry_point: rom.header.entry_point,
+                load_delta,
+            },
+        );
+    };
     let rom_start = BOOT_COPY_ROM_START;
-    let rom_end = rom_start
-        .saturating_add(BOOT_COPY_SIZE)
-        .min(rom.len() as u32);
-    let va_end = va_start.saturating_add(rom_end - rom_start);
+    let rom_end = rom_start + BOOT_COPY_SIZE;
+    if rom.len() < rom_end as usize {
+        return record_boot_open(
+            rom,
+            db,
+            BootBankOpenReason::TruncatedBootCopy {
+                ipl3,
+                ipl3_sha256,
+                available_bytes: rom.len().saturating_sub(rom_start as usize) as u32,
+                required_bytes: BOOT_COPY_SIZE,
+            },
+        );
+    }
+    let Some(va_end) = va_start.checked_add(BOOT_COPY_SIZE) else {
+        return record_boot_open(
+            rom,
+            db,
+            BootBankOpenReason::InvalidLoadRange {
+                ipl3,
+                ipl3_sha256,
+                va_start,
+                byte_length: BOOT_COPY_SIZE,
+            },
+        );
+    };
 
     let mapping = db.insert(Fact::RomMapping {
         bank: BOOT_BANK.to_string(),
@@ -100,7 +233,8 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
         note: format!(
             "IPL3 boot copy: ROM [0x{rom_start:x}, 0x{rom_end:x}) -> VA [0x{va_start:x}, 0x{va_end:x}); \
              entry point read directly from normalized header, size fixed by N64 hardware boot behavior; \
-             {ipl3_note}"
+             {} (SHA-256 {ipl3_sha256})",
+            ipl3.note()
         ),
     });
 
@@ -126,6 +260,69 @@ pub fn discover_boot_bank(rom: &NormalizedRom, db: &mut FactDb) {
         "rom_header_entry_after_ipl3_boot_copy",
     )
     .expect("boot entry is the first conclusion for this subject; cannot violate monotonicity");
+
+    BootBankDiscovery::Proven {
+        ipl3,
+        ipl3_sha256,
+        load_delta,
+    }
+}
+
+fn record_boot_open(
+    rom: &NormalizedRom,
+    db: &mut FactDb,
+    reason: BootBankOpenReason,
+) -> BootBankDiscovery {
+    let note = match &reason {
+        BootBankOpenReason::TruncatedIpl3 {
+            available_bytes,
+            required_bytes,
+        } => format!(
+            "boot bank open: IPL3 is truncated ({available_bytes}/{required_bytes} bytes); no load delta inferred"
+        ),
+        BootBankOpenReason::UnrecognizedIpl3 { sha256 } => format!(
+            "boot bank open: IPL3 SHA-256 {sha256} has no admitted relocation behavior; no load delta inferred"
+        ),
+        BootBankOpenReason::TruncatedBootCopy {
+            ipl3,
+            ipl3_sha256,
+            available_bytes,
+            required_bytes,
+        } => format!(
+            "boot bank open: {} (SHA-256 {ipl3_sha256}) boot-copy source is truncated ({available_bytes}/{required_bytes} bytes); no partial mapping published",
+            ipl3.note()
+        ),
+        BootBankOpenReason::InvalidEntrypoint {
+            ipl3,
+            ipl3_sha256,
+            entry_point,
+            load_delta,
+        } => format!(
+            "boot bank open: header entry 0x{entry_point:08x} cannot apply {} (SHA-256 {ipl3_sha256}) load delta 0x{load_delta:x}; no wrapped mapping published",
+            ipl3.note()
+        ),
+        BootBankOpenReason::InvalidLoadRange {
+            ipl3,
+            ipl3_sha256,
+            va_start,
+            byte_length,
+        } => format!(
+            "boot bank open: {} (SHA-256 {ipl3_sha256}) load range at 0x{va_start:08x} with length 0x{byte_length:x} exceeds the 32-bit address space; no wrapped mapping published",
+            ipl3.note()
+        ),
+    };
+    let evidence = db.insert(Fact::Evidence {
+        subject: BankAddr::new(BOOT_BANK, rom.header.entry_point),
+        note,
+    });
+    db.conclude(
+        format!("bank:{BOOT_BANK}"),
+        ProofState::Open,
+        vec![evidence],
+        "boot_copy_requires_complete_recognized_ipl3",
+    )
+    .expect("boot bank is the first conclusion for this subject; cannot violate monotonicity");
+    BootBankDiscovery::Open { reason }
 }
 
 /// One fixed-shape descriptor-table record location, in ROM-record-field
@@ -602,6 +799,26 @@ pub fn materialize_rom_range(
     start: u32,
     end: u32,
 ) -> Result<MaterializedRomRange, String> {
+    materialize_rom_range_bounded(
+        rom,
+        db,
+        space,
+        start,
+        end,
+        crate::file_table::DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+    )
+}
+
+/// Materialize a ROM interval while bounding the complete decoded VROM file
+/// that may be allocated to serve a smaller requested slice.
+pub fn materialize_rom_range_bounded(
+    rom: &NormalizedRom,
+    db: &FactDb,
+    space: RomAddressSpace,
+    start: u32,
+    end: u32,
+    max_decoded_vrom_file_bytes: usize,
+) -> Result<MaterializedRomRange, String> {
     if end <= start {
         return Err(format!("empty or inverted range [0x{start:x},0x{end:x})"));
     }
@@ -660,7 +877,17 @@ pub fn materialize_rom_range(
                 rom.len()
             )
         })?;
-    let expected_len = (vrom_end - vrom_start) as usize;
+    let expected_len = usize::try_from(
+        vrom_end
+            .checked_sub(vrom_start)
+            .ok_or_else(|| "proven VROM file mapping is inverted".to_string())?,
+    )
+    .map_err(|_| "decoded VROM file length exceeds usize".to_string())?;
+    if expected_len > max_decoded_vrom_file_bytes {
+        return Err(format!(
+            "decoded VROM file length {expected_len} exceeds transient limit {max_decoded_vrom_file_bytes}"
+        ));
+    }
     let file = if physical.starts_with(b"Yaz0") {
         decompress_yaz0(physical, expected_len)?
     } else {
@@ -689,6 +916,22 @@ pub fn scan_load_image_tables(
     rom: &NormalizedRom,
     inputs: &[LoadImageTableInput],
     db: &mut FactDb,
+) -> Vec<String> {
+    scan_load_image_tables_bounded(
+        rom,
+        inputs,
+        db,
+        crate::file_table::DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+    )
+}
+
+/// Scan load-image tables while bounding every complete decoded VROM file
+/// used for a virtual table or load image.
+pub fn scan_load_image_tables_bounded(
+    rom: &NormalizedRom,
+    inputs: &[LoadImageTableInput],
+    db: &mut FactDb,
+    max_decoded_vrom_file_bytes: usize,
 ) -> Vec<String> {
     let mut ordered: Vec<_> = inputs.iter().collect();
     ordered.sort_by_key(|input| {
@@ -720,12 +963,13 @@ pub fn scan_load_image_tables(
             .saturating_add(max_field)
             .saturating_add(4);
         let table_end = shape.location.offset.saturating_add(table_len);
-        let table_bytes = match materialize_rom_range(
+        let table_bytes = match materialize_rom_range_bounded(
             rom,
             db,
             shape.location.space,
             shape.location.offset,
             table_end,
+            max_decoded_vrom_file_bytes,
         ) {
             Ok(materialized) => materialized,
             Err(error) => {
@@ -862,10 +1106,15 @@ pub fn scan_load_image_tables(
                     validate_file_record(rom, source_len, destination_start, destination_end)
                         .map(|()| vec![])
                 }
-                (_, DestinationSpace::Vram) => {
-                    materialize_rom_range(rom, db, shape.source.space, source_start, source_end)
-                        .map(|materialized| materialized.backing_evidence)
-                }
+                (_, DestinationSpace::Vram) => materialize_rom_range_bounded(
+                    rom,
+                    db,
+                    shape.source.space,
+                    source_start,
+                    source_end,
+                    max_decoded_vrom_file_bytes,
+                )
+                .map(|materialized| materialized.backing_evidence),
                 (RomAddressSpace::Physical, DestinationSpace::PhysicalRom) => Err(
                     "physical-ROM to physical-ROM table is not a load-image/file mapping".into(),
                 ),
@@ -1000,11 +1249,38 @@ pub struct StaticRequestDmaInput {
 pub struct StaticRequestDmaReport {
     pub proven_banks: Vec<String>,
     pub open: Vec<String>,
+    /// The deterministic loader-input prefix was scanned, but additional
+    /// inputs were withheld by [`MAX_STATIC_REQUEST_DMA_INPUTS`].
+    pub input_limit_hit: bool,
+    /// Boot-image wrapper shapes examined by the candidate-only classifier.
+    pub physical_wrapper_candidates_examined: usize,
+    /// Shape candidates withheld because CFG/path and inner-callee semantic
+    /// authority have not yet been established.
+    pub wrapper_semantic_proof_unavailable: usize,
+    /// The wrapper candidate scan itself stopped at its work bound.
+    pub physical_wrapper_candidate_limit_hit: bool,
+}
+
+impl StaticRequestDmaReport {
+    pub(crate) fn push_open_bounded(&mut self, message: String) {
+        if self.open.len() + 1 < MAX_STATIC_REQUEST_DMA_OPEN_ROWS {
+            self.open.push(message);
+        } else if self.open.len() + 1 == MAX_STATIC_REQUEST_DMA_OPEN_ROWS {
+            self.open.push(format!(
+                "request-DMA open frontier reached its {}-row reporting bound; additional rows omitted",
+                MAX_STATIC_REQUEST_DMA_OPEN_ROWS
+            ));
+        }
+    }
 }
 
 /// The largest RDRAM a retail console reaches (Expansion Pak). Used only to
 /// bound destination sanity in the slicer; VA truth is judged downstream.
 const SCAN_RDRAM_LEN: u32 = 0x0080_0000;
+const MAX_STATIC_REQUEST_DMA_BANKS: usize = 4096;
+const MAX_STATIC_REQUEST_DMA_INPUTS: usize = 64;
+const MAX_STATIC_REQUEST_DMA_OPEN_ROWS: usize = 4096;
+const MAX_STATIC_REQUEST_DMA_SCANNED_BYTES: usize = 256 * 1024 * 1024;
 
 /// Recover load-image mappings from static operands at direct calls to a
 /// cited request wrapper within the proven boot image. Each fully constant
@@ -1016,6 +1292,23 @@ pub fn scan_static_request_dma(
     rom: &NormalizedRom,
     inputs: &[StaticRequestDmaInput],
     db: &mut FactDb,
+) -> StaticRequestDmaReport {
+    scan_static_request_dma_bounded(
+        rom,
+        inputs,
+        db,
+        crate::file_table::DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+    )
+}
+
+/// [`scan_static_request_dma`] with an explicit complete-file VROM decode
+/// cap. A virtual request is not published unless its bytes materialize inside
+/// that envelope.
+pub fn scan_static_request_dma_bounded(
+    rom: &NormalizedRom,
+    inputs: &[StaticRequestDmaInput],
+    db: &mut FactDb,
+    max_decoded_vrom_file_bytes: usize,
 ) -> StaticRequestDmaReport {
     use crate::loaders::VirtualAddress;
     use std::collections::BTreeSet;
@@ -1057,9 +1350,10 @@ pub fn scan_static_request_dma(
         ) {
             Ok(slices) => slices,
             Err(error) => {
-                report
-                    .open
-                    .push(format!("{}: slicer rejected boot image: {error:?}", input.name));
+                report.open.push(format!(
+                    "{}: slicer rejected boot image: {error:?}",
+                    input.name
+                ));
                 continue;
             }
         };
@@ -1148,6 +1442,20 @@ pub fn scan_static_request_dma(
                         ));
                         continue;
                     }
+                    if let Err(error) = materialize_rom_range_bounded(
+                        rom,
+                        db,
+                        RomAddressSpace::Virtual,
+                        device,
+                        device_end,
+                        max_decoded_vrom_file_bytes,
+                    ) {
+                        report.open.push(format!(
+                            "{}: call at 0x{call_pc:x} VROM range 0x{device:x}..0x{device_end:x} is unavailable within the decode limit: {error}",
+                            input.name
+                        ));
+                        continue;
+                    }
                 }
             }
             let bank = input.bank_name.name(index);
@@ -1176,6 +1484,345 @@ pub fn scan_static_request_dma(
                 "static_request_dma_operands",
             )
             .expect("request-dma bank names are freshly generated");
+            report.proven_banks.push(bank);
+        }
+    }
+    report
+}
+
+/// Recover exact whole-file request-DMA loads to a bounded fixed point over
+/// every proven, materializable bank.
+///
+/// Unlike [`scan_static_request_dma_bounded`], this production-auto path does
+/// not treat a contained VROM slice as a new load image. Each virtual request
+/// must equal exactly one proven file-table record. Newly recovered images are
+/// scanned in later rounds, which admits loader calls made by resident code
+/// loaded from the boot image without relying on a title-specific call site.
+pub fn scan_static_request_dma_fixed_point_bounded(
+    rom: &NormalizedRom,
+    inputs: &[StaticRequestDmaInput],
+    db: &mut FactDb,
+    max_decoded_vrom_file_bytes: usize,
+) -> StaticRequestDmaReport {
+    use crate::loaders::VirtualAddress;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Debug, Clone)]
+    struct PendingLoad {
+        input_index: usize,
+        source_bank: String,
+        call_pc: u32,
+        device: u32,
+        device_end: u32,
+        va_start: u32,
+        va_end: u32,
+    }
+
+    type Geometry = (RomAddressSpace, u32, u32, u32, u32);
+
+    let mut report = StaticRequestDmaReport::default();
+    if inputs.is_empty() {
+        return report;
+    }
+    let inputs = if inputs.len() > MAX_STATIC_REQUEST_DMA_INPUTS {
+        report.input_limit_hit = true;
+        report.push_open_bounded(format!(
+            "request-DMA fixed point has {} loader inputs; scanning the deterministic first {MAX_STATIC_REQUEST_DMA_INPUTS} and withholding the remainder",
+            inputs.len()
+        ));
+        &inputs[..MAX_STATIC_REQUEST_DMA_INPUTS]
+    } else {
+        inputs
+    };
+    let mut exact_vrom_files: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    for (_, fact) in db.proven_vrom_file_mappings() {
+        if let Fact::LoadImageTableRecord {
+            source_start,
+            source_end,
+            ..
+        } = fact
+        {
+            *exact_vrom_files
+                .entry((*source_start, *source_end))
+                .or_default() += 1;
+        }
+    }
+
+    let mut known_geometries: BTreeSet<Geometry> = db
+        .proven_rom_mappings()
+        .into_iter()
+        .filter_map(|fact| match fact {
+            Fact::RomMapping {
+                rom_space,
+                rom_start,
+                rom_end,
+                va_start,
+                va_end,
+                ..
+            } => Some((*rom_space, *rom_start, *rom_end, *va_start, *va_end)),
+            _ => None,
+        })
+        .collect();
+    let mut scanned_banks: BTreeSet<(String, Geometry)> = BTreeSet::new();
+    let mut scanned_bytes = 0usize;
+    let mut next_bank_indices = vec![0u32; inputs.len()];
+
+    loop {
+        let mut sources: Vec<_> = db
+            .proven_rom_mappings()
+            .into_iter()
+            .filter_map(|fact| match fact {
+                Fact::RomMapping {
+                    bank,
+                    rom_space,
+                    rom_start,
+                    rom_end,
+                    va_start,
+                    va_end,
+                } => Some((
+                    bank.clone(),
+                    (*rom_space, *rom_start, *rom_end, *va_start, *va_end),
+                )),
+                _ => None,
+            })
+            .filter(|source| !scanned_banks.contains(source))
+            .collect();
+        sources.sort();
+        if sources.is_empty() {
+            break;
+        }
+        if scanned_banks.len().saturating_add(sources.len()) > MAX_STATIC_REQUEST_DMA_BANKS {
+            report.push_open_bounded(
+                format!(
+                    "request-DMA fixed point exceeds its {MAX_STATIC_REQUEST_DMA_BANKS}-bank scan bound"
+                ),
+            );
+            break;
+        }
+
+        let mut pending: BTreeMap<Geometry, PendingLoad> = BTreeMap::new();
+        for (source_bank, geometry) in sources {
+            scanned_banks.insert((source_bank.clone(), geometry));
+            let (source_space, source_rom_start, source_rom_end, source_va_start, _) = geometry;
+            let materialized = match materialize_rom_range_bounded(
+                rom,
+                db,
+                source_space,
+                source_rom_start,
+                source_rom_end,
+                max_decoded_vrom_file_bytes,
+            ) {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    report.push_open_bounded(
+                        format!(
+                            "{source_bank}: proven request-DMA scan source is not materializable: {error}"
+                        ),
+                    );
+                    continue;
+                }
+            };
+            scanned_bytes = match scanned_bytes.checked_add(materialized.bytes.len()) {
+                Some(total) if total <= MAX_STATIC_REQUEST_DMA_SCANNED_BYTES => total,
+                _ => {
+                    report.push_open_bounded(
+                        format!(
+                            "request-DMA fixed point exceeds its {MAX_STATIC_REQUEST_DMA_SCANNED_BYTES}-byte aggregate scan bound"
+                        ),
+                    );
+                    return report;
+                }
+            };
+            let words: Vec<u32> = materialized
+                .bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect();
+
+            for (input_index, input) in inputs.iter().enumerate() {
+                let slices = match crate::pi_dma::slice_load_request_calls(
+                    &words,
+                    VirtualAddress::new(source_va_start),
+                    VirtualAddress::new(input.callee_va),
+                    SCAN_RDRAM_LEN,
+                    input.dram_arg_register,
+                    input.device_arg_register,
+                    input.size_arg_register,
+                ) {
+                    Ok(slices) => slices,
+                    Err(error) => {
+                        report.push_open_bounded(format!(
+                            "{}: slicer rejected source bank {source_bank}: {error:?}",
+                            input.name
+                        ));
+                        continue;
+                    }
+                };
+                for slice in slices {
+                    let call_pc = slice.call_pc.get();
+                    let (Some(candidate), Some(dram_pointer)) =
+                        (slice.candidate(), slice.dram_pointer.proven().copied())
+                    else {
+                        report.push_open_bounded(format!(
+                            "{}: call at {source_bank}:0x{call_pc:x} has open operands",
+                            input.name
+                        ));
+                        continue;
+                    };
+                    let device = candidate.device_address.get();
+                    let length = if input.size_is_end_address {
+                        match candidate.byte_count.get().checked_sub(device) {
+                            Some(length) if length > 0 => length,
+                            _ => {
+                                report.push_open_bounded(
+                                    format!(
+                                        "{}: call at {source_bank}:0x{call_pc:x} has an invalid end-address operand",
+                                        input.name
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        candidate.byte_count.get()
+                    };
+                    let va_start = dram_pointer.get();
+                    let (Some(device_end), Some(va_end)) =
+                        (device.checked_add(length), va_start.checked_add(length))
+                    else {
+                        report.push_open_bounded(format!(
+                            "{}: call at {source_bank}:0x{call_pc:x} has an overflowing range",
+                            input.name
+                        ));
+                        continue;
+                    };
+                    let target_geometry =
+                        (input.device_space, device, device_end, va_start, va_end);
+                    if known_geometries.contains(&target_geometry)
+                        || pending.contains_key(&target_geometry)
+                    {
+                        continue;
+                    }
+
+                    match input.device_space {
+                        RomAddressSpace::Physical => {
+                            if device_end as usize > rom.len() {
+                                report.push_open_bounded(
+                                    format!(
+                                        "{}: call at {source_bank}:0x{call_pc:x} physical range 0x{device:x}..0x{device_end:x} exceeds the ROM",
+                                        input.name
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                        RomAddressSpace::Virtual => {
+                            let exact_records = exact_vrom_files
+                                .get(&(device, device_end))
+                                .copied()
+                                .unwrap_or(0);
+                            if exact_records != 1 {
+                                report.push_open_bounded(
+                                    format!(
+                                        "{}: call at {source_bank}:0x{call_pc:x} VROM range 0x{device:x}..0x{device_end:x} has {exact_records} exact proven file records; expected exactly one",
+                                        input.name
+                                    ),
+                                );
+                                continue;
+                            }
+                            if let Err(error) = materialize_rom_range_bounded(
+                                rom,
+                                db,
+                                RomAddressSpace::Virtual,
+                                device,
+                                device_end,
+                                max_decoded_vrom_file_bytes,
+                            ) {
+                                report.push_open_bounded(
+                                    format!(
+                                        "{}: call at {source_bank}:0x{call_pc:x} exact VROM file 0x{device:x}..0x{device_end:x} is unavailable within the decode limit: {error}",
+                                        input.name
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    pending.insert(
+                        target_geometry,
+                        PendingLoad {
+                            input_index,
+                            source_bank: source_bank.clone(),
+                            call_pc,
+                            device,
+                            device_end,
+                            va_start,
+                            va_end,
+                        },
+                    );
+                }
+            }
+        }
+
+        if pending.is_empty() {
+            continue;
+        }
+        for (geometry, load) in pending {
+            if known_geometries.len() >= MAX_STATIC_REQUEST_DMA_BANKS {
+                report.push_open_bounded(
+                    format!(
+                        "request-DMA fixed point reached its {MAX_STATIC_REQUEST_DMA_BANKS}-mapping bound"
+                    ),
+                );
+                return report;
+            }
+            let input = &inputs[load.input_index];
+            let bank = loop {
+                let index = next_bank_indices[load.input_index];
+                let Some(next) = index.checked_add(1) else {
+                    report.push_open_bounded(format!(
+                        "{}: request-DMA bank-name index overflow",
+                        input.name
+                    ));
+                    return report;
+                };
+                next_bank_indices[load.input_index] = next;
+                let candidate = input.bank_name.name(index);
+                if !db.facts().iter().any(|fact| {
+                        matches!(fact, Fact::RomMapping { bank, .. } if bank.as_str() == candidate)
+                    }) {
+                        break candidate;
+                    }
+            };
+            let mapping = db.insert(Fact::RomMapping {
+                bank: bank.clone(),
+                rom_space: input.device_space,
+                rom_start: load.device,
+                rom_end: load.device_end,
+                va_start: load.va_start,
+                va_end: load.va_end,
+            });
+            let evidence = db.insert(Fact::Evidence {
+                subject: BankAddr::new(&load.source_bank, load.call_pc),
+                note: format!(
+                    "exact whole-file request-DMA operands at {}:0x{:x} to {} (0x{:x}): device 0x{:x}+0x{:x} -> VA 0x{:x}; instruction bytes do not prove reachability or completion",
+                    load.source_bank,
+                    load.call_pc,
+                    input.name,
+                    input.callee_va,
+                    load.device,
+                    load.device_end - load.device,
+                    load.va_start
+                ),
+            });
+            db.conclude(
+                format!("bank:{bank}"),
+                ProofState::Proven,
+                vec![mapping, evidence],
+                "static_request_dma_whole_file_fixed_point",
+            )
+            .expect("fixed-point request-DMA bank names are freshly generated");
+            known_geometries.insert(geometry);
             report.proven_banks.push(bank);
         }
     }
@@ -1398,10 +2045,19 @@ mod tests {
     }
 
     #[test]
-    fn boot_bank_reads_directly_from_header_no_scanning() {
+    fn recognized_entry_loading_ipl3_publishes_header_mapping() {
         let rom = make_test_rom(0x8000_0400, BOOT_COPY_SIZE as usize + 0x1000);
         let mut db = FactDb::new();
-        discover_boot_bank(&rom, &mut db);
+        let outcome = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        assert!(matches!(
+            outcome,
+            BootBankDiscovery::Proven { load_delta: 0, .. }
+        ));
 
         let concl = db.conclusion("bank:boot").expect("boot bank concluded");
         assert_eq!(concl.state, ProofState::Proven);
@@ -1425,21 +2081,23 @@ mod tests {
     }
 
     #[test]
-    fn boot_bank_clamps_to_short_roms_without_panicking() {
-        // A tiny synthetic ROM shorter than a full 0x100000 boot copy must
-        // not panic or read out of bounds -- clamp rom_end to actual length.
+    fn recognized_ipl3_with_truncated_boot_copy_stays_open() {
         let rom = make_test_rom(0x8000_0400, 0x2000);
         let mut db = FactDb::new();
-        discover_boot_bank(&rom, &mut db);
-        let mapping = db
-            .facts()
-            .iter()
-            .find(|f| matches!(f, Fact::RomMapping { bank, .. } if bank == BOOT_BANK))
-            .unwrap();
-        match mapping {
-            Fact::RomMapping { rom_end, .. } => assert!(*rom_end as usize <= rom.len()),
-            _ => unreachable!(),
-        }
+        let outcome = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6105Or7105,
+            IPL3_SHA256_CIC_6105_7105.to_string(),
+        );
+        assert!(matches!(
+            outcome,
+            BootBankDiscovery::Open {
+                reason: BootBankOpenReason::TruncatedBootCopy { .. }
+            }
+        ));
+        assert_eq!(db.conclusion("bank:boot").unwrap().state, ProofState::Open);
+        assert!(db.proven_rom_mappings().is_empty());
     }
 
     fn write_record(buf: &mut [u8], base: usize, rom_start: u32, rom_end: u32, vram: u32) {
@@ -1888,15 +2546,110 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_ipl3_keeps_entry_loading_delta() {
-        // Any blob that is not the measured 6103 IPL3 must keep the
-        // zero-delta reading, including a ROM too short to hold IPL3 at
-        // all — never a guessed relocation.
-        let (delta, _) = super::boot_load_delta(&[0u8; IPL3_ROM_END]);
-        assert_eq!(delta, 0);
-        let (delta, note) = super::boot_load_delta(&[0u8; 0x100]);
-        assert_eq!(delta, 0);
-        assert!(note.contains("too short"));
+    fn only_exact_standard_ipl3_hashes_have_relocation_behavior() {
+        assert_eq!(
+            classify_ipl3_sha256(IPL3_SHA256_CIC_6102_7101),
+            Some(RecognizedIpl3::Cic6102Or7101)
+        );
+        assert_eq!(
+            classify_ipl3_sha256(IPL3_SHA256_CIC_6103_7103),
+            Some(RecognizedIpl3::Cic6103Or7103)
+        );
+        assert_eq!(
+            classify_ipl3_sha256(IPL3_SHA256_CIC_6105_7105),
+            Some(RecognizedIpl3::Cic6105Or7105)
+        );
+        assert_eq!(RecognizedIpl3::Cic6102Or7101.load_delta(), 0);
+        assert_eq!(RecognizedIpl3::Cic6103Or7103.load_delta(), 0x10_0000);
+        assert_eq!(RecognizedIpl3::Cic6105Or7105.load_delta(), 0);
+        assert_eq!(classify_ipl3_sha256(&"00".repeat(32)), None);
+    }
+
+    #[test]
+    fn unknown_complete_ipl3_records_open_without_mapping_or_entry() {
+        let rom = make_test_rom(0x8000_0400, BOOT_COPY_SIZE as usize + 0x1000);
+        let mut db = FactDb::new();
+        let outcome = discover_boot_bank(&rom, &mut db);
+
+        assert!(matches!(
+            outcome,
+            BootBankDiscovery::Open {
+                reason: BootBankOpenReason::UnrecognizedIpl3 { .. }
+            }
+        ));
+        assert_eq!(db.conclusion("bank:boot").unwrap().state, ProofState::Open);
+        assert!(db.proven_rom_mappings().is_empty());
+        assert!(db.proven_function_entries(BOOT_BANK).is_empty());
+    }
+
+    #[test]
+    fn truncated_ipl3_records_typed_open_frontier() {
+        let mut bytes = vec![0u8; 0x100];
+        bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        let rom = normalize(&bytes).expect("header-sized synthetic z64");
+        let mut db = FactDb::new();
+        let outcome = discover_boot_bank(&rom, &mut db);
+
+        assert_eq!(
+            outcome,
+            BootBankDiscovery::Open {
+                reason: BootBankOpenReason::TruncatedIpl3 {
+                    available_bytes: 0xc0,
+                    required_bytes: 0xfc0,
+                }
+            }
+        );
+        assert_eq!(db.conclusion("bank:boot").unwrap().state, ProofState::Open);
+        assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    #[test]
+    fn relocating_ipl3_rejects_entrypoint_subtraction_underflow() {
+        let rom = make_test_rom(0x0000_0400, BOOT_COPY_SIZE as usize + 0x1000);
+        let mut db = FactDb::new();
+        let outcome = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6103Or7103,
+            IPL3_SHA256_CIC_6103_7103.to_string(),
+        );
+
+        assert!(matches!(
+            outcome,
+            BootBankDiscovery::Open {
+                reason: BootBankOpenReason::InvalidEntrypoint {
+                    entry_point: 0x0000_0400,
+                    load_delta: 0x10_0000,
+                    ..
+                }
+            }
+        ));
+        assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    #[test]
+    fn entry_loading_ipl3_rejects_address_range_overflow() {
+        let rom = make_test_rom(0xfff0_0400, BOOT_COPY_SIZE as usize + 0x1000);
+        let mut db = FactDb::new();
+        let outcome = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+
+        assert!(matches!(
+            outcome,
+            BootBankDiscovery::Open {
+                reason: BootBankOpenReason::InvalidLoadRange {
+                    va_start: 0xfff0_0400,
+                    byte_length: BOOT_COPY_SIZE,
+                    ..
+                }
+            }
+        ));
+        assert!(db.proven_rom_mappings().is_empty());
     }
 }
 
@@ -2048,12 +2801,11 @@ pub fn recover_request_dma_callees(
         });
     }
     if recovery.admitted.is_empty() {
-        recovery
-            .open
-            .push("no callee's call-site operands corroborated against proven file records".to_string());
+        recovery.open.push(
+            "no callee's call-site operands corroborated against proven file records".to_string(),
+        );
     }
     recovery
-
 }
 
 #[cfg(test)]
@@ -2087,9 +2839,132 @@ mod request_dma_recovery_tests {
         ]
     }
 
+    fn request_call(vrom: u32, size: u32, destination: u32, loader: u32) -> Vec<u32> {
+        vec![
+            0x3c05_0000 | (vrom >> 16),
+            0x34a5_0000 | (vrom & 0xffff),
+            0x3c06_0000 | (size >> 16),
+            0x34c6_0000 | (size & 0xffff),
+            0x3c04_0000 | (destination >> 16),
+            0x3484_0000 | (destination & 0xffff),
+            0x0c00_0000 | ((loader & 0x0fff_ffff) >> 2),
+            0,
+        ]
+    }
+
+    fn fixed_point_rom(boot_words: &[u32], first_file_words: &[u32]) -> NormalizedRom {
+        const FIRST_PHYSICAL: usize = 0x102000;
+        const SECOND_PHYSICAL: usize = 0x103000;
+        let mut buf = vec![0u8; SECOND_PHYSICAL + 0x40];
+        buf[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        buf[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        buf[0x20..0x24].copy_from_slice(b"TEST");
+        buf[0x3b..0x3f].copy_from_slice(b"CTSE");
+        for (index, word) in boot_words.iter().enumerate() {
+            let offset = BOOT_COPY_ROM_START as usize + index * 4;
+            buf[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        for (index, word) in first_file_words.iter().enumerate() {
+            let offset = FIRST_PHYSICAL + index * 4;
+            buf[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        normalize(&buf).expect("valid fixed-point synthetic z64")
+    }
+
+    fn add_file_record(
+        db: &mut FactDb,
+        table: &str,
+        index: u32,
+        vrom: u32,
+        size: u32,
+        physical: u32,
+    ) {
+        let fact = db.insert(Fact::LoadImageTableRecord {
+            table: table.to_string(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0,
+            index,
+            source_space: crate::facts::MappingAddressSpace::VirtualRom,
+            source_start: vrom,
+            source_end: vrom + size,
+            destination_space: crate::facts::MappingAddressSpace::PhysicalRom,
+            destination_start: physical,
+            destination_end: physical + size,
+        });
+        db.conclude(
+            load_image_table_record_subject(table, index),
+            ProofState::Proven,
+            vec![fact],
+            "fixed-point test fixture",
+        )
+        .expect("fresh file record");
+    }
+
+    fn fixed_point_input() -> StaticRequestDmaInput {
+        StaticRequestDmaInput {
+            name: "request_sync".to_string(),
+            callee_va: FIXTURE_LOADER,
+            dram_arg_register: 4,
+            device_arg_register: 5,
+            size_arg_register: 6,
+            size_is_end_address: false,
+            device_space: RomAddressSpace::Virtual,
+            bank_name: BankNamePattern::new("request_dma_", 0, ""),
+        }
+    }
+
+    #[test]
+    fn physical_end_address_contract_publishes_the_exact_range() {
+        const PHYSICAL_START: u32 = 0x20;
+        const PHYSICAL_END: u32 = 0x60;
+        const DESTINATION: u32 = 0x8010_0000;
+        let rom = rom_with_boot_words(
+            0x8000_0400,
+            &request_call(PHYSICAL_START, PHYSICAL_END, DESTINATION, FIXTURE_LOADER),
+        );
+        let mut db = FactDb::new();
+        let _ = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        let input = StaticRequestDmaInput {
+            name: "physical_end".to_string(),
+            callee_va: FIXTURE_LOADER,
+            dram_arg_register: 4,
+            device_arg_register: 5,
+            size_arg_register: 6,
+            size_is_end_address: true,
+            device_space: RomAddressSpace::Physical,
+            bank_name: BankNamePattern::new("request_dma_", 0, ""),
+        };
+
+        let report = scan_static_request_dma_fixed_point_bounded(&rom, &[input], &mut db, 1024);
+
+        assert_eq!(report.proven_banks, ["request_dma_0"]);
+        assert!(db.proven_rom_mappings().iter().any(|fact| matches!(
+            fact,
+            Fact::RomMapping {
+                bank,
+                rom_space: RomAddressSpace::Physical,
+                rom_start: PHYSICAL_START,
+                rom_end: PHYSICAL_END,
+                va_start: DESTINATION,
+                va_end: 0x8010_0040,
+            } if bank == "request_dma_0"
+        )));
+    }
+
     fn db_with_proven_record(rom: &NormalizedRom, vrom: u32, size: u32) -> FactDb {
         let mut db = FactDb::new();
-        discover_boot_bank(rom, &mut db);
+        let _outcome = publish_boot_bank(
+            rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
         let fact = db.insert(Fact::LoadImageTableRecord {
             table: "t".to_string(),
             bank: None,
@@ -2116,6 +2991,176 @@ mod request_dma_recovery_tests {
     const FIXTURE_VROM: u32 = 0x1060;
     const FIXTURE_SIZE: u32 = 0x63d0;
     const FIXTURE_LOADER: u32 = 0x8000_0500;
+
+    #[test]
+    fn whole_file_request_dma_reaches_a_two_hop_fixed_point() {
+        const FIRST_VROM: u32 = 0x0020_0000;
+        const SECOND_VROM: u32 = 0x0021_0000;
+        const FILE_SIZE: u32 = 0x40;
+        const FIRST_VA: u32 = 0x8010_0000;
+        const SECOND_VA: u32 = 0x8020_0000;
+        let rom = fixed_point_rom(
+            &request_call(FIRST_VROM, FILE_SIZE, FIRST_VA, FIXTURE_LOADER),
+            &request_call(SECOND_VROM, FILE_SIZE, SECOND_VA, FIXTURE_LOADER),
+        );
+        let mut db = FactDb::new();
+        let _ = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        add_file_record(&mut db, "files", 0, FIRST_VROM, FILE_SIZE, 0x102000);
+        add_file_record(&mut db, "files", 1, SECOND_VROM, FILE_SIZE, 0x103000);
+
+        let report = scan_static_request_dma_fixed_point_bounded(
+            &rom,
+            &[fixed_point_input()],
+            &mut db,
+            1024,
+        );
+
+        assert_eq!(report.proven_banks, ["request_dma_0", "request_dma_1"]);
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::RomMapping {
+                bank,
+                rom_start: SECOND_VROM,
+                rom_end: 0x0021_0040,
+                va_start: SECOND_VA,
+                va_end: 0x8020_0040,
+                ..
+            } if bank == "request_dma_1"
+        )));
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::Evidence { subject, note }
+                if subject.bank == "request_dma_0"
+                    && subject.pc == FIRST_VA + 24
+                    && note.contains("request_dma_0:0x80100018")
+        )));
+    }
+
+    #[test]
+    fn fixed_point_scans_a_deterministic_prefix_when_loader_input_limit_is_hit() {
+        const VROM: u32 = 0x0020_0000;
+        const FILE_SIZE: u32 = 0x40;
+        const VA: u32 = 0x8010_0000;
+        let rom = fixed_point_rom(&request_call(VROM, FILE_SIZE, VA, FIXTURE_LOADER), &[]);
+        let mut db = FactDb::new();
+        let _ = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        add_file_record(&mut db, "files", 0, VROM, FILE_SIZE, 0x102000);
+        let inputs = vec![fixed_point_input(); MAX_STATIC_REQUEST_DMA_INPUTS + 1];
+
+        let report = scan_static_request_dma_fixed_point_bounded(&rom, &inputs, &mut db, 1024);
+
+        assert!(report.input_limit_hit);
+        assert_eq!(report.proven_banks, ["request_dma_0"]);
+        assert!(report
+            .open
+            .iter()
+            .any(|row| row.contains("scanning the deterministic first 64")));
+    }
+
+    #[test]
+    fn fixed_point_rejects_contained_and_ambiguous_vrom_requests() {
+        const VROM: u32 = 0x0020_0000;
+        const FILE_SIZE: u32 = 0x40;
+        let contained_rom = fixed_point_rom(
+            &request_call(VROM + 4, FILE_SIZE - 4, 0x8010_0000, FIXTURE_LOADER),
+            &[],
+        );
+        let mut contained_db = FactDb::new();
+        let _ = publish_boot_bank(
+            &contained_rom,
+            &mut contained_db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        add_file_record(&mut contained_db, "files", 0, VROM, FILE_SIZE, 0x102000);
+        let contained = scan_static_request_dma_fixed_point_bounded(
+            &contained_rom,
+            &[fixed_point_input()],
+            &mut contained_db,
+            1024,
+        );
+        assert!(contained.proven_banks.is_empty());
+        assert!(contained
+            .open
+            .iter()
+            .any(|row| row.contains("has 0 exact proven file records")));
+
+        let ambiguous_rom = fixed_point_rom(
+            &request_call(VROM, FILE_SIZE, 0x8010_0000, FIXTURE_LOADER),
+            &[],
+        );
+        let mut ambiguous_db = FactDb::new();
+        let _ = publish_boot_bank(
+            &ambiguous_rom,
+            &mut ambiguous_db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        add_file_record(&mut ambiguous_db, "files_a", 0, VROM, FILE_SIZE, 0x102000);
+        add_file_record(&mut ambiguous_db, "files_b", 0, VROM, FILE_SIZE, 0x103000);
+        let ambiguous = scan_static_request_dma_fixed_point_bounded(
+            &ambiguous_rom,
+            &[fixed_point_input()],
+            &mut ambiguous_db,
+            1024,
+        );
+        assert!(ambiguous.proven_banks.is_empty());
+        assert!(ambiguous
+            .open
+            .iter()
+            .any(|row| row.contains("has 2 exact proven file records")));
+    }
+
+    #[test]
+    fn fixed_point_deduplicates_repeated_exact_requests() {
+        const VROM: u32 = 0x0020_0000;
+        const FILE_SIZE: u32 = 0x40;
+        const VA: u32 = 0x8010_0000;
+        let call = request_call(VROM, FILE_SIZE, VA, FIXTURE_LOADER);
+        let boot_words: Vec<_> = call.iter().chain(&call).copied().collect();
+        let rom = fixed_point_rom(&boot_words, &[]);
+        let mut db = FactDb::new();
+        let _ = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        add_file_record(&mut db, "files", 0, VROM, FILE_SIZE, 0x102000);
+
+        let report = scan_static_request_dma_fixed_point_bounded(
+            &rom,
+            &[fixed_point_input()],
+            &mut db,
+            1024,
+        );
+
+        assert_eq!(report.proven_banks, ["request_dma_0"]);
+        assert_eq!(
+            db.proven_rom_mappings()
+                .into_iter()
+                .filter(|fact| matches!(
+                    fact,
+                    Fact::RomMapping {
+                        rom_start: VROM,
+                        rom_end: 0x0020_0040,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn request_dma_callee_is_recovered_when_operands_hit_a_proven_record() {
@@ -2154,5 +3199,67 @@ mod request_dma_recovery_tests {
             "a size that matches no record must not be admitted, got {:?}",
             recovery.admitted
         );
+    }
+
+    #[test]
+    fn bounded_request_dma_refuses_a_slice_from_an_oversized_vrom_file() {
+        const DECODED_FILE_BYTES: u32 = 0x0010_0000;
+        const PHYSICAL_START: usize = 0x2000;
+        let mut rom = rom_with_boot_words(
+            0x8000_0400,
+            &boot_calling_loader(FIXTURE_VROM, 4, FIXTURE_LOADER),
+        );
+        rom.bytes[PHYSICAL_START..PHYSICAL_START + 4].copy_from_slice(b"Yaz0");
+        rom.bytes[PHYSICAL_START + 4..PHYSICAL_START + 8]
+            .copy_from_slice(&DECODED_FILE_BYTES.to_be_bytes());
+        let mut db = FactDb::new();
+        let _outcome = publish_boot_bank(
+            &rom,
+            &mut db,
+            RecognizedIpl3::Cic6102Or7101,
+            IPL3_SHA256_CIC_6102_7101.to_string(),
+        );
+        let record = db.insert(Fact::LoadImageTableRecord {
+            table: "oversized".to_string(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0,
+            index: 0,
+            source_space: crate::facts::MappingAddressSpace::VirtualRom,
+            source_start: FIXTURE_VROM,
+            source_end: FIXTURE_VROM + DECODED_FILE_BYTES,
+            destination_space: crate::facts::MappingAddressSpace::PhysicalRom,
+            destination_start: PHYSICAL_START as u32,
+            destination_end: (PHYSICAL_START + 16) as u32,
+        });
+        db.conclude(
+            load_image_table_record_subject("oversized", 0),
+            ProofState::Proven,
+            vec![record],
+            "test fixture",
+        )
+        .expect("fresh conclusion");
+        let input = StaticRequestDmaInput {
+            name: "oversized_request".to_string(),
+            callee_va: FIXTURE_LOADER,
+            dram_arg_register: 4,
+            device_arg_register: 5,
+            size_arg_register: 6,
+            size_is_end_address: false,
+            device_space: RomAddressSpace::Virtual,
+            bank_name: BankNamePattern::new("request_dma_", 0, ""),
+        };
+
+        let report = scan_static_request_dma_bounded(&rom, &[input], &mut db, 1024);
+        assert!(report.proven_banks.is_empty());
+        assert!(report
+            .open
+            .iter()
+            .any(|reason| reason.contains("exceeds transient limit 1024")));
+        assert!(!db.proven_rom_mappings().iter().any(
+            |fact| matches!(fact, Fact::RomMapping { bank, .. } if bank.starts_with("request_dma_"))
+        ));
+        crate::harvest::harvest_discovered_candidates_bounded(&rom, &mut db, 1024)
+            .expect("the rejected request mapping cannot reach harvest");
     }
 }

@@ -266,10 +266,8 @@ mod tests {
         }
         assert!(!cmake.contains("${CMAKE_CURRENT_SOURCE_DIR}/fn64_rt64_raster_ps.hlsl"));
 
-        assert!(
-            cmake
-                .contains("Alpha compare and coverage intentionally observe the original combiner")
-        );
+        assert!(cmake
+            .contains("Alpha compare and coverage intentionally observe the original combiner"));
         assert!(cmake.contains("Only the combiner input to blending receives this bounded policy"));
         assert!(cmake.contains("Fn64RdpTakeFragmentNoiseSample(randomSeed);"));
         assert_eq!(

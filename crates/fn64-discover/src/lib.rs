@@ -98,6 +98,10 @@
 //! - [`overlay_recipe`]: complete nine-field ROM/load/text/data/BSS
 //!   materialization recipes, admitted only when one recovered table's range
 //!   equations all agree.
+//! - [`generation_topology`]: ROM-bound diagnostic immutable-prefix,
+//!   resident-tail, and overlay generation geometry plus bounded enumeration
+//!   of geometry-possible bank-qualified segments. It is a negative filter,
+//!   not runtime state reachability, catalog identity, or activation authority.
 //! - [`gp_base`]: IDO small-data `$gp` base recovery by constrained voting
 //!   (boot `lui`/`addiu` constructions, or a bounded access-offset histogram
 //!   fallback), admitted only on a unique dominating winner, then surfaces the
@@ -170,10 +174,12 @@ pub mod banks;
 pub mod block_pack;
 pub mod block_proof;
 pub mod boundaries;
+pub mod callback_flow;
 pub mod callgraph_match;
 pub mod candidate_cfg_probe;
 pub mod candidate_corroboration;
 pub mod candidate_relation_report;
+pub mod catalog_transfer_fixed_point;
 pub mod cfg;
 pub mod cfg_homology;
 pub mod closure;
@@ -187,6 +193,7 @@ pub mod evidence;
 pub mod external_aot;
 pub mod facts;
 pub mod file_table;
+pub mod generation_topology;
 pub mod gp_base;
 pub mod grade_candidates;
 pub mod grade_nw4e;
@@ -201,6 +208,7 @@ pub mod host_bindings;
 pub mod ledger;
 pub mod load_table_use;
 pub mod loaders;
+pub mod missed_function_attribution;
 pub mod oot_reference;
 pub mod overlay_recipe;
 pub mod overlay_regions;
@@ -213,9 +221,11 @@ pub mod regions;
 pub mod reloc_grade;
 pub mod resolve;
 pub mod rom;
+pub mod runtime_generation_catalog;
 pub mod sig_scan;
 pub mod snapshot;
 pub mod snapshot_inputs;
+pub mod snapshot_workspace;
 pub mod source_closure;
 pub mod spimdisasm_adapter;
 pub mod spimdisasm_reference;
@@ -559,6 +569,11 @@ fn discover_with_recovered_vrom_and_request_dma(
     }
 
     let mut recovered_bank_index = 0u32;
+    // Distinct descriptor-family runs can overlap without being aliases as
+    // whole tables. Their shared records still describe one load image and
+    // therefore one bank identity. Keep conflicting destinations distinct so
+    // the ordinary mapping-conflict path can surface them.
+    let mut recovered_geometries = std::collections::BTreeSet::new();
     for (table_index, admission) in recovery
         .admissions
         .iter()
@@ -581,6 +596,12 @@ fn discover_with_recovered_vrom_and_request_dma(
                 continue;
             };
             if record.rom_start.wrapping_add(delta) != va_start || va_start != record.vram_dest {
+                continue;
+            }
+            let Some(va_end) = va_start.checked_add(record.byte_len()) else {
+                continue;
+            };
+            if !recovered_geometries.insert((record.rom_start, record.rom_end, va_start, va_end)) {
                 continue;
             }
             let record_offset = (record_index as u32)
@@ -629,12 +650,35 @@ fn discover_with_recovered_vrom_and_request_dma(
         &mut db,
         materialization_limits.max_decoded_file_bytes,
     );
+    let mut effective: Vec<banks::StaticRequestDmaInput> = request_dma.to_vec();
+    let mut wrapper_diagnostics = PhysicalWrapperCandidateDiagnostics::default();
+    if let Some((rom_start, rom_end, va_start)) =
+        db.proven_rom_mappings().iter().find_map(|fact| match fact {
+            Fact::RomMapping {
+                bank,
+                rom_space: RomAddressSpace::Physical,
+                rom_start,
+                rom_end,
+                va_start,
+                ..
+            } if bank == banks::BOOT_BANK => Some((*rom_start, *rom_end, *va_start)),
+            _ => None,
+        })
+    {
+        if let Some(bytes) = rom.bytes.get(rom_start as usize..rom_end as usize) {
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect();
+            wrapper_diagnostics =
+                record_physical_end_dma_wrapper_candidates(&words, va_start, &mut db);
+        }
+    }
     // Mechanically recover the game's DMA-request routine rather than citing
     // its address: a candidate is admitted only when its call-site (vrom,
     // size) operands land exactly on file-table records already proven above.
     // Caller-supplied claims, if any, are unioned in and take no precedence.
     let callee_recovery = banks::recover_request_dma_callees(rom, &db, REQUEST_DMA_MIN_SITES);
-    let mut effective: Vec<banks::StaticRequestDmaInput> = request_dma.to_vec();
     for (index, callee) in callee_recovery.admitted.iter().enumerate() {
         if effective.iter().any(|c| c.callee_va == callee.callee_va) {
             continue;
@@ -650,13 +694,67 @@ fn discover_with_recovered_vrom_and_request_dma(
             bank_name: banks::BankNamePattern::new("request_dma_", 0, ""),
         });
     }
-    let request_dma_report = banks::scan_static_request_dma_bounded(
+    let mut request_dma_report = banks::scan_static_request_dma_fixed_point_bounded(
         rom,
         &effective,
         &mut db,
         materialization_limits.max_decoded_file_bytes,
     );
+    request_dma_report.physical_wrapper_candidates_examined =
+        wrapper_diagnostics.candidates_examined;
+    request_dma_report.wrapper_semantic_proof_unavailable =
+        wrapper_diagnostics.semantic_proof_unavailable;
+    request_dma_report.physical_wrapper_candidate_limit_hit = wrapper_diagnostics.limit_hit;
+    if wrapper_diagnostics.semantic_proof_unavailable != 0 {
+        request_dma_report.push_open_bounded(format!(
+            "wrapper_semantic_proof_unavailable: {} physical end-address DMA wrapper shape candidate(s) remain candidate-only",
+            wrapper_diagnostics.semantic_proof_unavailable
+        ));
+    }
+    if wrapper_diagnostics.limit_hit {
+        request_dma_report.push_open_bounded(
+            "physical end-address DMA-wrapper inference reached its candidate bound; result is incomplete"
+                .to_string(),
+        );
+    }
     (db, recovery, request_dma_report)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhysicalWrapperCandidateDiagnostics {
+    candidates_examined: usize,
+    semantic_proof_unavailable: usize,
+    limit_hit: bool,
+}
+
+/// Retain wrapper-shape evidence without creating a loader input or mapping.
+/// CFG/path and inner-callee authority are prerequisites for that later step.
+fn record_physical_end_dma_wrapper_candidates(
+    words: &[u32],
+    va_start: u32,
+    db: &mut FactDb,
+) -> PhysicalWrapperCandidateDiagnostics {
+    let inference = pi_dma::infer_physical_end_dma_wrappers(words, va_start);
+    let diagnostics = PhysicalWrapperCandidateDiagnostics {
+        candidates_examined: inference.candidates_examined,
+        semantic_proof_unavailable: inference.admitted.len(),
+        limit_hit: inference.candidate_limit_hit,
+    };
+    for wrapper in inference.admitted {
+        db.insert(Fact::Evidence {
+            subject: facts::BankAddr::new(banks::BOOT_BANK, wrapper.entry_va),
+            note: format!(
+                "candidate-only physical end-address DMA wrapper shape at 0x{:x}: {} \
+                 direct call-shaped words; inner DMA-shaped call at 0x{:x}; linear scan \
+                 observed a2-a1 length, cursor advances, length reduction, and a backward \
+                 branch; CFG/path and inner-callee authority remain open",
+                wrapper.entry_va,
+                wrapper.callers.len(),
+                wrapper.nested_dma_call_pc,
+            ),
+        });
+    }
+    diagnostics
 }
 
 /// Which mechanical composition strategy corroborated a ROM's overlay
@@ -721,6 +819,21 @@ pub struct StrategyOutcome {
     /// untabled delta-vote strategy produces these; kept in a separate field so
     /// an inferred mapping can never be counted as a corroborated one.
     pub supported_mappings: usize,
+    /// Bounded request-DMA frontier rows retained by this strategy.
+    pub request_dma_open_rows: usize,
+    /// True when request-DMA or wrapper analysis left any typed/resource
+    /// frontier open. Consumers must not interpret zero new mappings as
+    /// proven absence when this is set.
+    pub request_dma_incomplete: bool,
+    /// Loader inputs beyond the deterministic 64-input prefix were withheld.
+    pub request_dma_input_limit_hit: bool,
+    /// Wrapper-shape callees examined by the bounded candidate classifier.
+    pub physical_wrapper_candidates_examined: usize,
+    /// Wrapper shapes retained as candidates because semantic proof is not
+    /// yet available; these never feed `Proven` mappings.
+    pub wrapper_semantic_proof_unavailable: usize,
+    /// The wrapper candidate classifier exhausted its work bound.
+    pub physical_wrapper_candidate_limit_hit: bool,
 }
 
 /// The result of trying every mechanical composition strategy against one ROM.
@@ -839,6 +952,12 @@ pub fn run_discovery_auto_with_limits(
         decoded_file_limit_hits: 0,
         proven_mappings: baseline_mappings,
         supported_mappings: 0,
+        request_dma_open_rows: 0,
+        request_dma_incomplete: false,
+        request_dma_input_limit_hit: false,
+        physical_wrapper_candidates_examined: 0,
+        wrapper_semantic_proof_unavailable: 0,
+        physical_wrapper_candidate_limit_hit: false,
     }];
     let mut best: Option<(DiscoveryStrategy, FactDb, usize)> = None;
 
@@ -852,7 +971,7 @@ pub fn run_discovery_auto_with_limits(
         table_name: "recovered_vrom_overlay_descriptors".to_string(),
         bank_name: banks::BankNamePattern::new("recovered_overlay_", 0, ""),
     };
-    let (vrom_db, vrom_recovery, _) = discover_with_recovered_vrom_and_request_dma(
+    let (vrom_db, vrom_recovery, request_dma_report) = discover_with_recovered_vrom_and_request_dma(
         &rom,
         &vrom_input,
         &[],
@@ -871,6 +990,14 @@ pub fn run_discovery_auto_with_limits(
         decoded_file_limit_hits: vrom_recovery.decoded_file_limit_hits.len(),
         proven_mappings: vrom_mappings,
         supported_mappings: 0,
+        request_dma_open_rows: request_dma_report.open.len(),
+        request_dma_incomplete: !request_dma_report.open.is_empty(),
+        request_dma_input_limit_hit: request_dma_report.input_limit_hit,
+        physical_wrapper_candidates_examined: request_dma_report
+            .physical_wrapper_candidates_examined,
+        wrapper_semantic_proof_unavailable: request_dma_report.wrapper_semantic_proof_unavailable,
+        physical_wrapper_candidate_limit_hit: request_dma_report
+            .physical_wrapper_candidate_limit_hit,
     });
     if vrom_mappings > baseline_mappings {
         best = Some((DiscoveryStrategy::RecoveredVrom, vrom_db, vrom_mappings));
@@ -899,6 +1026,12 @@ pub fn run_discovery_auto_with_limits(
         decoded_file_limit_hits: 0,
         proven_mappings: overlay_mappings,
         supported_mappings: 0,
+        request_dma_open_rows: 0,
+        request_dma_incomplete: false,
+        request_dma_input_limit_hit: false,
+        physical_wrapper_candidates_examined: 0,
+        wrapper_semantic_proof_unavailable: 0,
+        physical_wrapper_candidate_limit_hit: false,
     });
     if overlay_mappings > baseline_mappings
         && best
@@ -1046,9 +1179,11 @@ pub fn run_discovery_auto_with_limits(
         let regions: Vec<delta_vote::UntabledRegion> = candidates
             .iter()
             .filter(|region| {
-                !baseline_physical_mappings.iter().any(|&(mapped_start, mapped_end)| {
-                    region.rom_start < mapped_end && mapped_start < region.rom_end
-                })
+                !baseline_physical_mappings
+                    .iter()
+                    .any(|&(mapped_start, mapped_end)| {
+                        region.rom_start < mapped_end && mapped_start < region.rom_end
+                    })
             })
             .filter(|region| {
                 !candidates.iter().any(|other| {
@@ -1098,6 +1233,12 @@ pub fn run_discovery_auto_with_limits(
             decoded_file_limit_hits: 0,
             proven_mappings: untabled_db.proven_rom_mappings().len(),
             supported_mappings: regions.len(),
+            request_dma_open_rows: 0,
+            request_dma_incomplete: false,
+            request_dma_input_limit_hit: false,
+            physical_wrapper_candidates_examined: 0,
+            wrapper_semantic_proof_unavailable: 0,
+            physical_wrapper_candidate_limit_hit: false,
         });
         let selected = if regions.is_empty() {
             baseline_strategy
@@ -1309,7 +1450,7 @@ mod tests {
         put_u32(&mut bytes, 8, 0x8000_0400);
 
         // Three-record physical file table: the identity image, one file
-        // carrying the descriptor table, and one carrying both overlays.
+        // carrying the descriptor table, and one carrying all overlays.
         for (index, fields) in [
             [0x0000, 0x3000, 0x0000, 0x0000],
             [0x3000, 0x6000, 0x8000, 0x0000],
@@ -1323,7 +1464,14 @@ mod tests {
             }
         }
 
-        let descriptors = [(0x6000, 0x6800, 0x8002_0000), (0x7000, 0x7800, 0x8003_0000)];
+        // The 0x1c run contains all three records while the configured 0x38
+        // stride also finds records zero and two. Exact record geometries
+        // shared by those distinct admitted tables must still mint one bank.
+        let descriptors = [
+            (0x6000, 0x6800, 0x8002_0000),
+            (0x7000, 0x7800, 0x8003_0000),
+            (0x8000, 0x8800, 0x8004_0000),
+        ];
         for (index, (vrom_start, vrom_end, vram)) in descriptors.into_iter().enumerate() {
             let base = 0x8000 + index * 0x1c;
             put_u32(&mut bytes, base, vrom_start);
@@ -1354,7 +1502,17 @@ mod tests {
                 .map(|table| table.table_rom_offset),
             Some(0x2000)
         );
-        assert_eq!(recovery.admitted_intervals().len(), 2);
+        assert_eq!(recovery.admitted_intervals().len(), 3);
+        assert!(
+            recovery
+                .admissions
+                .iter()
+                .filter(|admission| admission.admitted)
+                .flat_map(|admission| &admission.table.records)
+                .count()
+                > recovery.admitted_intervals().len(),
+            "fixture must contain exact records repeated across admitted tables"
+        );
         let overlay_mappings: Vec<_> = db
             .proven_rom_mappings()
             .into_iter()
@@ -1362,7 +1520,10 @@ mod tests {
                 |fact| matches!(fact, Fact::RomMapping { bank, .. } if bank != banks::BOOT_BANK),
             )
             .collect();
-        assert_eq!(overlay_mappings.len(), 2);
+        assert_eq!(overlay_mappings.len(), 3);
+        assert!(overlay_mappings.iter().enumerate().all(|(index, fact)| {
+            matches!(fact, Fact::RomMapping { bank, .. } if bank == &format!("recovered_overlay_{index}"))
+        }));
         assert!(overlay_mappings.iter().all(|fact| matches!(
             fact,
             Fact::RomMapping {

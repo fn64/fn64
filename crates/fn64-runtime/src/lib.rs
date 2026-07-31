@@ -33,19 +33,20 @@ pub mod voice;
 
 pub use device::{
     AiDmaRequest, Cycles, DeviceEvidenceSnapshot, DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
-    DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DpcSubmission,
-    DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr, PendingAiSnapshot,
-    PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot, PendingSpDmaSnapshot, PiDmaRequest,
-    PiDomain, PiDomainTiming, PiTimingModel, RcpTaskCompletion, RcpTaskCompletionPlan,
-    RspExecutionState, ScheduledDeviceEventKind, ScheduledDeviceEventSnapshot, SiDmaKind,
-    SiDmaRequest, SpDmaDirection, SpDmaRequest, DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND,
-    DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND, DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND,
-    DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND, DPC_STATUS_CMD_BUSY, DPC_STATUS_DMA_BUSY,
-    DPC_STATUS_END_VALID, DPC_STATUS_FLUSH, DPC_STATUS_FREEZE, DPC_STATUS_START_VALID,
-    DPC_STATUS_XBUS_DMEM_DMA, PI_STATUS_DMA_BUSY, PI_STATUS_ERROR, PI_STATUS_IO_BUSY, SP_CLR_YIELD,
-    SP_CLR_YIELDED, SP_SET_YIELD, SP_SET_YIELDED, SP_STATUS_BROKE, SP_STATUS_DMA_BUSY,
-    SP_STATUS_DMA_FULL, SP_STATUS_HALT, SP_STATUS_INTERRUPT_ON_BREAK, SP_STATUS_SIGNAL_0,
-    SP_STATUS_SIGNAL_1, SP_STATUS_SINGLE_STEP, SP_STATUS_YIELD, SP_STATUS_YIELDED,
+    DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
+    DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
+    PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot,
+    PendingSpDmaSnapshot, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel, RcpTaskCompletion,
+    RcpTaskCompletionPlan, RspExecutionState, ScheduledDeviceEventKind,
+    ScheduledDeviceEventSnapshot, SiDmaKind, SiDmaRequest, SpDmaDirection, SpDmaRequest,
+    DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND, DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND,
+    DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND, DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND,
+    DPC_STATUS_CMD_BUSY, DPC_STATUS_DMA_BUSY, DPC_STATUS_END_VALID, DPC_STATUS_FLUSH,
+    DPC_STATUS_FREEZE, DPC_STATUS_START_VALID, DPC_STATUS_XBUS_DMEM_DMA, PI_STATUS_DMA_BUSY,
+    PI_STATUS_ERROR, PI_STATUS_IO_BUSY, SP_CLR_YIELD, SP_CLR_YIELDED, SP_SET_YIELD, SP_SET_YIELDED,
+    SP_STATUS_BROKE, SP_STATUS_DMA_BUSY, SP_STATUS_DMA_FULL, SP_STATUS_HALT,
+    SP_STATUS_INTERRUPT_ON_BREAK, SP_STATUS_SIGNAL_0, SP_STATUS_SIGNAL_1, SP_STATUS_SINGLE_STEP,
+    SP_STATUS_YIELD, SP_STATUS_YIELDED,
 };
 pub use dpc_schedule::{
     DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus, DpcCursor,
@@ -85,8 +86,8 @@ pub use rdram::{
     RdramViewMut,
 };
 pub use rom::{
-    DmaCompletion, DmaMemory, InMemoryRom, PendingEepromWriteSnapshot, PiDma, PiDmaError,
-    RomStorage,
+    DmaCompletion, DmaMemory, DmaWriterChannel, InMemoryRom, PendingEepromWriteSnapshot, PiDma,
+    PiDmaError, ProcessDmaMemory, RomStorage,
 };
 pub use rsp::{
     OsTaskHeader, RspMemAddr, RspMemory, RspMemoryBank, RspMemoryError, TaskLog, M_AUDTASK,

@@ -1,0 +1,17 @@
+[package]
+name = "wm2000-block-overlay-2-shard-01"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "../build.rs"
+
+[lib]
+path = "../lib.rs"
+
+[dependencies]
+fn64-recomp-rs = { path = "../../../crates/fn64-recomp-rs", default-features = false, features = ["aot-runtime"] }
+
+[build-dependencies]
+fn64-discover = { path = "../../../crates/fn64-discover" }
+fn64-recomp-rs-codegen = { path = "../../../crates/fn64-recomp-rs-codegen" }
+sha2 = "0.10"

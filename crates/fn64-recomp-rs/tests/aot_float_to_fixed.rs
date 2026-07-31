@@ -4,7 +4,8 @@
 //! format. This checks emitter routing only; raw exceptional behavior is
 //! exercised through the typed runtime tests in `isa_completeness.rs`.
 
-use fn64_recomp_rs::{emit_bank_runner, BankId, BankInput};
+use fn64_recomp_rs::BankId;
+use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
 
 #[derive(Clone, Copy)]
 struct Case {

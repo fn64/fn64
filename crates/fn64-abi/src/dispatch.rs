@@ -352,10 +352,20 @@ mod tests {
         // optimizer folds them to one native pointer. Model that: two sections,
         // same pointer, both rom_size==0. This must not panic.
         let yielded = unsafe {
-            register_section(0x0020_0000, 0x8032_2D70, 0x10, &[(0x0, 0, folded_host_shim)])
+            register_section(
+                0x0020_0000,
+                0x8032_2D70,
+                0x10,
+                &[(0x0, 0, folded_host_shim)],
+            )
         };
         let eeprom = unsafe {
-            register_section(0x0020_1000, 0x8032_4080, 0x10, &[(0x0, 0, folded_host_shim)])
+            register_section(
+                0x0020_1000,
+                0x8032_4080,
+                0x10,
+                &[(0x0, 0, folded_host_shim)],
+            )
         };
         set_section_loaded(yielded);
         set_section_loaded(eeprom);
@@ -392,8 +402,18 @@ mod tests {
         let registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             // Same native pointer, two distinct real (rom_size != 0)
             // destinations -> a true miscompile the assert must catch.
-            register_section(0x0030_0000, 0x8040_0000, 0x100, &[(0x0, 4, collided_recompiled_body)]);
-            register_section(0x0031_0000, 0x8041_0000, 0x100, &[(0x0, 4, collided_recompiled_body)]);
+            register_section(
+                0x0030_0000,
+                0x8040_0000,
+                0x100,
+                &[(0x0, 4, collided_recompiled_body)],
+            );
+            register_section(
+                0x0031_0000,
+                0x8041_0000,
+                0x100,
+                &[(0x0, 4, collided_recompiled_body)],
+            );
         }));
         assert!(
             registration.is_err(),

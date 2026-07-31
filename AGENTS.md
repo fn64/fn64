@@ -40,6 +40,13 @@ fn64 is a clean-room reimplementation. Allowed sources:
   (Unlicense). Same precedent as reading MIT RT64. MAME remains excluded
   (GPL-2.0+ as a whole; its documented Lua/debugger interfaces are fine for
   black-box use). ddisasm is AGPL: cite its paper's concepts, never its code.
+- By project-owner decision 2026-07-28, N64LoaderWV may be executed, reviewed,
+  and maintained in a separate fork despite its repository having no declared
+  license. That exception is for loader/tool engineering, not N64 behavioral
+  authority: its mappings and analysis remain candidate evidence, and its code
+  does not enter fn64's MIT/Apache distribution.
+- m2c is excluded from this toolchain: do not install, invoke, vendor, read, or
+  build an adapter for it.
 
 Disallowed: reading GPL runtime implementation code (ultramodern/librecomp
 internals, or any GPL runtime). Not for "inspiration," not to "check one

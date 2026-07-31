@@ -301,7 +301,7 @@ fn legacy_discovery_invocation_remains_available_without_a_subcommand() {
     // records what every strategy found.
     assert_eq!(artifact["schema_version"], 2);
     assert_eq!(artifact["rom"]["sha256"].as_str().unwrap().len(), 64);
-    assert_eq!(artifact["selected_strategy"], "boot_bank_only");
+    assert_eq!(artifact["selected_strategy"], "boot_bank_open");
     let outcomes = artifact["strategy_outcomes"].as_array().unwrap();
     assert_eq!(
         outcomes
@@ -309,7 +309,7 @@ fn legacy_discovery_invocation_remains_available_without_a_subcommand() {
             .map(|outcome| outcome["strategy"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec![
-            "boot_bank_only",
+            "boot_bank_open",
             "recovered_vrom",
             "recovered_overlays",
             "untabled_delta_vote",

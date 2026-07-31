@@ -5,9 +5,14 @@
 //! `unsupported` execution destinations": every reachable CPU transfer
 //! destination must be classifiable as `exact_aot`, `block_aot`,
 //! `dynamic_mips`, or `unsupported`. This module counts that classification
-//! per ROM (across all composed banks). It reads only the closure, owner
-//! proof, and block proof already produced by [`crate::snapshot`]; it never
-//! runs discovery, never mutates a fact, and never promotes anything.
+//! per ROM (across all composed banks). Source edges are projected from the
+//! final broad CFG only when the authority-rooted closure retained by
+//! [`crate::snapshot`] contains the exact same source, destination, and edge
+//! kind, or when a consecutive plain fallthrough is wholly inside one
+//! authority block's ordinary prefix. The broader exploratory closure can
+//! therefore supply final block boundaries without manufacturing executable
+//! reachability. This module never runs discovery, mutates a fact, or promotes
+//! anything.
 //!
 //! # Honest scope
 //!
@@ -22,13 +27,14 @@
 //! (open/bounded indirects, mapped-but-unproven code) is fallback-covered and
 //! reported honestly, but is not a release blocker.
 
-use crate::block_proof::BlockAssessment;
-use crate::cfg::{BlockTerminator, WordClass};
+use crate::block_proof::{BlockAssessment, BlockProofBlocker};
+use crate::cfg::{BasicBlock, BlockTerminator, WordClass};
 use crate::facts::Fact;
 use crate::owner_proof::OwnerAssessment;
-use crate::snapshot::ProgramSnapshotV1;
+use crate::resolve::{IndirectProofState, IndirectResolutionKind};
+use crate::snapshot::{BankSnapshotV1, OwnerBlockerKind, ProgramSnapshotV1};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The four classes a reachable CPU transfer destination can land in, in
 /// order of decreasing recompilation strength.
@@ -166,6 +172,127 @@ impl ClassifiedDestination {
     }
 }
 
+/// The concrete control-transfer shape that introduced an unsupported target.
+///
+/// This is diagnostic provenance, not a new execution authority. In
+/// particular, a direct call still needs an exact host-catalog or guest-code
+/// owner before a consumer may treat it as executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcreteTransferKind {
+    Tail,
+    Call,
+    CallContinuation,
+    BranchTaken { link: bool },
+    BranchFallthrough { link: bool },
+    BranchLikelyTaken { link: bool },
+    BranchLikelyFallthrough { link: bool },
+    ResolvedIndirectJump,
+    ResolvedIndirectCall,
+    ResolvedIndirectCallContinuation,
+    OpenIndirectCallContinuation,
+    PlainFallthrough,
+    DelayEntryContinuation,
+    RanOffEndFallthrough,
+}
+
+/// One concrete successor emitted by a CFG terminator.
+///
+/// This is the single edge denominator shared by the scoreboard, classified
+/// destination list, and retained unsupported audit. `source_site_va` names
+/// the control word for delayed transfers and the final ordinary word for a
+/// plain or ran-off-end fallthrough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcreteSuccessor {
+    pub destination_va: u32,
+    pub source_site_va: u32,
+    pub kind: ConcreteTransferKind,
+}
+
+/// One authority-projected CFG edge contributing to a retained concrete
+/// destination classification.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IncomingTransferV1 {
+    pub bank: String,
+    pub block_start_va: u32,
+    pub block_end_va: u32,
+    /// Control word for a delayed transfer, or final ordinary word for a
+    /// plain or ran-off-end fallthrough.
+    pub source_site_va: u32,
+    pub kind: ConcreteTransferKind,
+}
+
+/// Address-level evidence for one unsupported concrete destination.
+///
+/// The historical scoreboard retained only a bounded printed VA list. This
+/// shape lets an opt-in gate artifact preserve every incoming edge so a later
+/// mapping investigation does not need the ROM merely to recover the original
+/// punch list. It intentionally carries no constructor that can promote a
+/// destination: host targets, exception-vector images, resident/overlay load
+/// mappings, and runtime TLB mappings remain separate typed authorities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsupportedDestinationAuditV1 {
+    pub destination_va: u32,
+    pub reason: DestinationReason,
+    pub incoming: Vec<IncomingTransferV1>,
+}
+
+/// Block-proof refusal relevant to one retained dynamic concrete destination.
+///
+/// Only blocker kinds are retained: blocker payloads may contain decoded ROM
+/// words, which do not belong in this path-free measurement artifact.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicBlockProofV1 {
+    pub bank: String,
+    pub block_start_va: u32,
+    pub block_end_va: u32,
+    pub blocker_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicOwnerAssessmentStateV1 {
+    Candidate,
+    Ambiguous,
+}
+
+/// Owner-proof refusal attached through the candidate block's partition
+/// claimant, again reduced to non-ROM-bearing blocker kinds.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicOwnerProofV1 {
+    pub bank: String,
+    pub entry_va: u32,
+    pub state: DynamicOwnerAssessmentStateV1,
+    pub proposed_va_end: Option<u32>,
+    pub blocker_kinds: Vec<OwnerBlockerKind>,
+}
+
+/// Exact retained evidence for one concrete `dynamic_mips` destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicConcreteDestinationAuditV1 {
+    pub destination_va: u32,
+    pub reason: DestinationReason,
+    pub incoming: Vec<IncomingTransferV1>,
+    pub block_proof: Vec<DynamicBlockProofV1>,
+    pub owner_proof: Vec<DynamicOwnerProofV1>,
+}
+
+/// Exact retained evidence for one bounded/open indirect site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicIndirectSiteAuditV1 {
+    pub bank: String,
+    pub site_pc: u32,
+    pub via_call: bool,
+    pub state: IndirectProofState,
+    pub kind: Option<IndirectResolutionKind>,
+    pub targets: Vec<u32>,
+    pub memory_sources: Vec<u32>,
+}
+
 /// A proven exact-owner extent, denormalized from the composed snapshot for
 /// fast point classification.
 #[derive(Clone, Copy)]
@@ -296,12 +423,232 @@ impl ProgramGeometry {
     }
 }
 
+/// Enumerate every concrete successor represented by one CFG terminator.
+///
+/// Open indirect targets are intentionally absent because no concrete VA is
+/// known, but an indirect call's concrete return continuation is retained.
+/// Delayed call/branch continuations are equally real successors and must not
+/// disappear merely because they are commonly the next block in address
+/// order. The composer has already validated block geometry; malformed blocks
+/// never reach closure measurement.
+pub fn concrete_successors(block: &BasicBlock) -> Vec<ConcreteSuccessor> {
+    let delayed = || {
+        block
+            .end_va
+            .checked_sub(8)
+            .expect("delayed transfer block includes control and delay words")
+    };
+    let ordinary = || {
+        block
+            .end_va
+            .checked_sub(4)
+            .expect("plain fallthrough block includes one ordinary word")
+    };
+    let successor = |destination_va, source_site_va, kind| ConcreteSuccessor {
+        destination_va,
+        source_site_va,
+        kind,
+    };
+
+    match &block.terminator {
+        BlockTerminator::Tail { target } => {
+            vec![successor(*target, delayed(), ConcreteTransferKind::Tail)]
+        }
+        BlockTerminator::Call { target, next } => vec![
+            successor(*target, delayed(), ConcreteTransferKind::Call),
+            successor(*next, delayed(), ConcreteTransferKind::CallContinuation),
+        ],
+        BlockTerminator::Branch {
+            target,
+            fallthrough,
+            link,
+        } => vec![
+            successor(
+                *target,
+                delayed(),
+                ConcreteTransferKind::BranchTaken { link: *link },
+            ),
+            successor(
+                *fallthrough,
+                delayed(),
+                ConcreteTransferKind::BranchFallthrough { link: *link },
+            ),
+        ],
+        BlockTerminator::BranchLikely {
+            target,
+            fallthrough,
+            link,
+        } => vec![
+            successor(
+                *target,
+                delayed(),
+                ConcreteTransferKind::BranchLikelyTaken { link: *link },
+            ),
+            successor(
+                *fallthrough,
+                delayed(),
+                ConcreteTransferKind::BranchLikelyFallthrough { link: *link },
+            ),
+        ],
+        BlockTerminator::ResolvedIndirect { targets, via_call } => {
+            let mut successors = targets
+                .iter()
+                .copied()
+                .map(|target| {
+                    successor(
+                        target,
+                        delayed(),
+                        if *via_call {
+                            ConcreteTransferKind::ResolvedIndirectCall
+                        } else {
+                            ConcreteTransferKind::ResolvedIndirectJump
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if *via_call {
+                successors.push(successor(
+                    block.end_va,
+                    delayed(),
+                    ConcreteTransferKind::ResolvedIndirectCallContinuation,
+                ));
+            }
+            successors
+        }
+        BlockTerminator::Indirect { via_call: true } => vec![successor(
+            block.end_va,
+            delayed(),
+            ConcreteTransferKind::OpenIndirectCallContinuation,
+        )],
+        BlockTerminator::Fallthrough { next } => vec![successor(
+            *next,
+            ordinary(),
+            ConcreteTransferKind::PlainFallthrough,
+        )],
+        BlockTerminator::RanOffEnd => vec![successor(
+            block.end_va,
+            ordinary(),
+            ConcreteTransferKind::RanOffEndFallthrough,
+        )],
+        BlockTerminator::Indirect { via_call: false }
+        | BlockTerminator::Return
+        | BlockTerminator::Trap
+        | BlockTerminator::InvalidInstruction { .. }
+        | BlockTerminator::MissingDelaySlot { .. }
+        | BlockTerminator::DataFence { .. } => Vec::new(),
+    }
+}
+
+fn ordinary_prefix_end(block: &BasicBlock) -> u32 {
+    match &block.terminator {
+        BlockTerminator::Tail { .. }
+        | BlockTerminator::Call { .. }
+        | BlockTerminator::Branch { .. }
+        | BlockTerminator::BranchLikely { .. }
+        | BlockTerminator::Return
+        | BlockTerminator::Indirect { .. }
+        | BlockTerminator::ResolvedIndirect { .. } => block.end_va.saturating_sub(8),
+        BlockTerminator::Fallthrough { .. } | BlockTerminator::Trap => {
+            block.end_va.saturating_sub(4)
+        }
+        BlockTerminator::InvalidInstruction { pc, .. }
+        | BlockTerminator::MissingDelaySlot { control_pc: pc } => *pc,
+        BlockTerminator::RanOffEnd | BlockTerminator::DataFence { .. } => block.end_va,
+    }
+}
+
+fn is_compatible_internal_plain_fallthrough(
+    authority_blocks: &[BasicBlock],
+    successor: ConcreteSuccessor,
+) -> bool {
+    successor.kind == ConcreteTransferKind::PlainFallthrough
+        && successor.source_site_va.checked_add(4) == Some(successor.destination_va)
+        && authority_blocks.iter().any(|authority| {
+            authority.start_va <= successor.source_site_va
+                && successor.source_site_va < ordinary_prefix_end(authority)
+                && successor.destination_va < authority.end_va
+        })
+}
+
+/// Project final CFG successors through authority at their exact source site.
+///
+/// Traversal hints may split or otherwise refine the broad CFG's block shape,
+/// so enumerating the separately-built authority CFG can lose a modeled edge
+/// at such a boundary. Conversely, enumerating every broad block lets a
+/// candidate root manufacture execution. Source reachability alone is not
+/// enough: a candidate split can attach a different terminator to the same
+/// word. Retain a broad edge only when the authority CFG contains the exact
+/// `(source site, destination, kind)` edge, except that an ordinary consecutive
+/// fallthrough may refine the interior prefix of one authority block. That
+/// compatibility never crosses the authority block's terminal/control boundary.
+fn authority_projected_successors(bank: &BankSnapshotV1) -> Vec<(&BasicBlock, ConcreteSuccessor)> {
+    let authority_blocks = bank.authority_closure.cfg.blocks.as_slice();
+    let authority_successors = bank
+        .authority_closure
+        .cfg
+        .blocks
+        .iter()
+        .flat_map(|block| concrete_successors(block))
+        .map(|successor| {
+            (
+                successor.source_site_va,
+                successor.destination_va,
+                successor.kind,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut projected = bank
+        .closure
+        .cfg
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            concrete_successors(block)
+                .into_iter()
+                .filter(|successor| {
+                    authority_successors.contains(&(
+                        successor.source_site_va,
+                        successor.destination_va,
+                        successor.kind,
+                    )) || is_compatible_internal_plain_fallthrough(authority_blocks, *successor)
+                })
+                .map(move |successor| (block, successor))
+        })
+        .collect::<Vec<_>>();
+    for alias in &bank.closure.cfg.plain_delay_entry_aliases {
+        if !bank
+            .authority_closure
+            .cfg
+            .plain_delay_entry_aliases
+            .iter()
+            .any(|authority| authority == alias)
+        {
+            continue;
+        }
+        let Some(predecessor) = bank.closure.cfg.blocks.iter().find(|block| {
+            block.start_va <= alias.control_pc && block.end_va == alias.continuation_va
+        }) else {
+            continue;
+        };
+        projected.push((
+            predecessor,
+            ConcreteSuccessor {
+                destination_va: alias.continuation_va,
+                source_site_va: alias.entry_va,
+                kind: ConcreteTransferKind::DelayEntryContinuation,
+            },
+        ));
+    }
+    projected
+}
+
 /// Enumerate every reachable CPU transfer destination across all composed
-/// banks of one ROM and classify each. Concrete destinations (branch/call/
-/// tail/resolved-indirect targets) are deduplicated by VA so a hot function
-/// reached a thousand times counts once. OPEN and BOUNDED indirect SITES are
-/// counted per site (each is a distinct place the CPU can leave statically
-/// closed code) and carry no single VA.
+/// banks of one ROM and classify each. Concrete successors (taken targets,
+/// direct and indirect-call continuations, branch fallthroughs, and ordinary
+/// fallthroughs) are deduplicated by VA so a hot function reached a thousand
+/// times counts once. OPEN and BOUNDED indirect SITES are counted per site
+/// (each is a distinct place the CPU can leave statically closed code) and
+/// carry no single VA.
 pub fn scoreboard(snapshots: &[ProgramSnapshotV1]) -> ClosureScoreboard {
     let geometry = ProgramGeometry::from_snapshots(snapshots);
 
@@ -318,40 +665,13 @@ pub fn scoreboard(snapshots: &[ProgramSnapshotV1]) -> ClosureScoreboard {
 
     for snapshot in snapshots {
         for bank in &snapshot.banks {
-            let cfg = &bank.closure.cfg;
-            for block in &cfg.blocks {
-                match &block.terminator {
-                    BlockTerminator::Tail { target } => record(*target, &geometry, &mut concrete),
-                    BlockTerminator::Call { target, .. } => {
-                        record(*target, &geometry, &mut concrete)
-                    }
-                    BlockTerminator::Branch { target, .. }
-                    | BlockTerminator::BranchLikely { target, .. } => {
-                        record(*target, &geometry, &mut concrete)
-                    }
-                    BlockTerminator::ResolvedIndirect { targets, .. } => {
-                        for &target in targets {
-                            record(target, &geometry, &mut concrete);
-                        }
-                    }
-                    // Open indirect: counted below from `closure.indirect`,
-                    // which is the authoritative per-site record. Fallthrough,
-                    // Return, Trap, and the malformed terminators are not
-                    // transfer destinations.
-                    BlockTerminator::Indirect { .. }
-                    | BlockTerminator::Fallthrough { .. }
-                    | BlockTerminator::Return
-                    | BlockTerminator::Trap
-                    | BlockTerminator::InvalidInstruction { .. }
-                    | BlockTerminator::MissingDelaySlot { .. }
-                    | BlockTerminator::RanOffEnd
-                    | BlockTerminator::DataFence { .. } => {}
-                }
+            for (_, successor) in authority_projected_successors(bank) {
+                record(successor.destination_va, &geometry, &mut concrete);
             }
             // Indirect SITES: one entry per site. Exhaustive resolutions are
             // already reflected as concrete `ResolvedIndirect` targets above,
             // so only Open/Bounded sites are counted here.
-            for resolution in &bank.closure.indirect {
+            for resolution in &bank.authority_closure.indirect {
                 use crate::resolve::IndirectProofState;
                 match resolution.state {
                     IndirectProofState::Exhaustive => {}
@@ -429,26 +749,241 @@ pub fn classified_destinations(snapshots: &[ProgramSnapshotV1]) -> Vec<Classifie
     let mut concrete: BTreeMap<u32, DestinationReason> = BTreeMap::new();
     for snapshot in snapshots {
         for bank in &snapshot.banks {
-            for block in &bank.closure.cfg.blocks {
-                let targets: Vec<u32> = match &block.terminator {
-                    BlockTerminator::Tail { target }
-                    | BlockTerminator::Call { target, .. }
-                    | BlockTerminator::Branch { target, .. }
-                    | BlockTerminator::BranchLikely { target, .. } => vec![*target],
-                    BlockTerminator::ResolvedIndirect { targets, .. } => targets.clone(),
-                    _ => Vec::new(),
-                };
-                for target in targets {
-                    concrete
-                        .entry(target)
-                        .or_insert_with(|| geometry.classify_concrete(target));
-                }
+            for (_, successor) in authority_projected_successors(bank) {
+                concrete
+                    .entry(successor.destination_va)
+                    .or_insert_with(|| geometry.classify_concrete(successor.destination_va));
             }
         }
     }
     concrete
         .into_iter()
         .map(|(va, reason)| ClassifiedDestination { va, reason })
+        .collect()
+}
+
+/// Retain every concrete destination currently assigned to `dynamic_mips`,
+/// including its authoritative incoming edges and the block/owner refusal
+/// kinds that cover the destination. No decoded words or ROM bytes enter the
+/// result.
+pub fn dynamic_concrete_destination_audit_v1(
+    snapshots: &[ProgramSnapshotV1],
+) -> Vec<DynamicConcreteDestinationAuditV1> {
+    let geometry = ProgramGeometry::from_snapshots(snapshots);
+    let mut incoming = BTreeMap::<u32, Vec<IncomingTransferV1>>::new();
+    for snapshot in snapshots {
+        for bank in &snapshot.banks {
+            for (block, successor) in authority_projected_successors(bank) {
+                if geometry.classify_concrete(successor.destination_va).class()
+                    != DestinationClass::DynamicMips
+                {
+                    continue;
+                }
+                incoming
+                    .entry(successor.destination_va)
+                    .or_default()
+                    .push(IncomingTransferV1 {
+                        bank: bank.input.bank.clone(),
+                        block_start_va: block.start_va,
+                        block_end_va: block.end_va,
+                        source_site_va: successor.source_site_va,
+                        kind: successor.kind,
+                    });
+            }
+        }
+    }
+
+    incoming
+        .into_iter()
+        .map(|(destination_va, mut incoming)| {
+            incoming.sort_unstable();
+            incoming.dedup();
+            let mut block_proof = Vec::new();
+            let mut owner_proof = Vec::new();
+            for snapshot in snapshots {
+                for bank in &snapshot.banks {
+                    for assessment in &bank.block_proof.assessments {
+                        let BlockAssessment::Candidate {
+                            start_va,
+                            end_va,
+                            blockers,
+                        } = assessment
+                        else {
+                            continue;
+                        };
+                        if destination_va < *start_va || destination_va >= *end_va {
+                            continue;
+                        }
+                        let mut blocker_kinds = blockers
+                            .iter()
+                            .map(BlockProofBlocker::kind)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        blocker_kinds.sort_unstable();
+                        blocker_kinds.dedup();
+                        block_proof.push(DynamicBlockProofV1 {
+                            bank: bank.input.bank.clone(),
+                            block_start_va: *start_va,
+                            block_end_va: *end_va,
+                            blocker_kinds,
+                        });
+
+                        let mut claimant_roots = bank
+                            .partition
+                            .owners
+                            .iter()
+                            .filter(|owner| owner.block_starts.contains(start_va))
+                            .map(|owner| owner.root_va)
+                            .collect::<Vec<_>>();
+                        claimant_roots.extend(
+                            bank.partition
+                                .ambiguous
+                                .iter()
+                                .filter(|block| block.block_start == *start_va)
+                                .flat_map(|block| block.claimants.iter().copied()),
+                        );
+                        claimant_roots.sort_unstable();
+                        claimant_roots.dedup();
+                        for assessment in &bank.owner_proof.assessments {
+                            if claimant_roots
+                                .binary_search(&assessment.entry().pc)
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let (state, frontier) = match assessment {
+                                OwnerAssessment::Candidate { frontier } => {
+                                    (DynamicOwnerAssessmentStateV1::Candidate, frontier)
+                                }
+                                OwnerAssessment::Ambiguous { frontier } => {
+                                    (DynamicOwnerAssessmentStateV1::Ambiguous, frontier)
+                                }
+                                OwnerAssessment::Proven { .. } => continue,
+                            };
+                            let mut blocker_kinds = frontier
+                                .blockers
+                                .iter()
+                                .map(OwnerBlockerKind::from)
+                                .collect::<Vec<_>>();
+                            blocker_kinds.sort_unstable();
+                            blocker_kinds.dedup();
+                            owner_proof.push(DynamicOwnerProofV1 {
+                                bank: bank.input.bank.clone(),
+                                entry_va: frontier.entry.pc,
+                                state,
+                                proposed_va_end: frontier.proposed_va_end,
+                                blocker_kinds,
+                            });
+                        }
+                    }
+                }
+            }
+            block_proof.sort_unstable();
+            block_proof.dedup();
+            owner_proof.sort_unstable();
+            owner_proof.dedup();
+            DynamicConcreteDestinationAuditV1 {
+                destination_va,
+                reason: geometry.classify_concrete(destination_va),
+                incoming,
+                block_proof,
+                owner_proof,
+            }
+        })
+        .collect()
+}
+
+/// Retain every authority-reachable indirect site that still requires the
+/// dynamic lane. Target and memory-source sets are canonicalized without
+/// consulting bank bytes.
+pub fn dynamic_indirect_site_audit_v1(
+    snapshots: &[ProgramSnapshotV1],
+) -> Vec<DynamicIndirectSiteAuditV1> {
+    let mut sites = snapshots
+        .iter()
+        .flat_map(|snapshot| &snapshot.banks)
+        .flat_map(|bank| {
+            bank.authority_closure
+                .indirect
+                .iter()
+                .filter(|resolution| resolution.state != IndirectProofState::Exhaustive)
+                .map(|resolution| {
+                    let mut targets = resolution.targets.clone();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    let mut memory_sources = resolution.memory_sources.clone();
+                    memory_sources.sort_unstable();
+                    memory_sources.dedup();
+                    DynamicIndirectSiteAuditV1 {
+                        bank: bank.input.bank.clone(),
+                        site_pc: resolution.site_pc,
+                        via_call: resolution.via_call,
+                        state: resolution.state,
+                        kind: resolution.kind,
+                        targets,
+                        memory_sources,
+                    }
+                })
+        })
+        .collect::<Vec<_>>();
+    // Do not deduplicate: the scoreboard counts one record per bank/site
+    // resolution, and this list preserves that exact denominator.
+    sites.sort_by(|left, right| {
+        (left.bank.as_str(), left.site_pc, left.via_call).cmp(&(
+            right.bank.as_str(),
+            right.site_pc,
+            right.via_call,
+        ))
+    });
+    sites
+}
+
+/// Retain every CFG edge that contributed to an unsupported concrete target.
+///
+/// Results are canonical: destinations sort by VA and incoming edges sort by
+/// bank/source/kind with exact duplicates removed. The classification is the
+/// same whole-program [`ProgramGeometry`] used by [`scoreboard`], so this
+/// diagnostic cannot drift into an independent definition of `unsupported`.
+pub fn unsupported_destination_audit_v1(
+    snapshots: &[ProgramSnapshotV1],
+) -> Vec<UnsupportedDestinationAuditV1> {
+    let geometry = ProgramGeometry::from_snapshots(snapshots);
+    let mut incoming = BTreeMap::<u32, Vec<IncomingTransferV1>>::new();
+
+    for snapshot in snapshots {
+        for bank in &snapshot.banks {
+            for (block, successor) in authority_projected_successors(bank) {
+                let destination_va = successor.destination_va;
+                if geometry.classify_concrete(destination_va).class()
+                    != DestinationClass::Unsupported
+                {
+                    continue;
+                }
+                incoming
+                    .entry(destination_va)
+                    .or_default()
+                    .push(IncomingTransferV1 {
+                        bank: bank.input.bank.clone(),
+                        block_start_va: block.start_va,
+                        block_end_va: block.end_va,
+                        source_site_va: successor.source_site_va,
+                        kind: successor.kind,
+                    });
+            }
+        }
+    }
+
+    incoming
+        .into_iter()
+        .map(|(destination_va, mut incoming)| {
+            incoming.sort_unstable();
+            incoming.dedup();
+            UnsupportedDestinationAuditV1 {
+                destination_va,
+                reason: geometry.classify_concrete(destination_va),
+                incoming,
+            }
+        })
         .collect()
 }
 
@@ -570,7 +1105,8 @@ mod tests {
         // Caller at BASE `jal`s a callee at BASE+0x10. The caller returns
         // before the callee (BASE+8 is `jr $ra`), so the callee has NO
         // incoming fallthrough edge and forms a proven exact owner. The call
-        // destination lands inside that owner => exact_aot.
+        // destination lands inside that owner => exact_aot. The shared
+        // successor denominator also retains the caller's BASE+8 continuation.
         let callee = BASE + 0x10;
         let jal_callee = 0x0c00_0000 | (callee >> 2) & 0x03ff_ffff;
         let bytes = asm(&[jal_callee, NOP, JR_RA, NOP, JR_RA, NOP]);
@@ -592,8 +1128,8 @@ mod tests {
         let board = scoreboard(std::slice::from_ref(&snapshot));
         assert_eq!(
             board.tally(DestinationClass::ExactAot).destinations,
-            1,
-            "exactly the jal destination is inside an exact owner: {board:?}"
+            2,
+            "the jal destination and return continuation are exact-owner successors: {board:?}"
         );
         assert_eq!(board.unsupported, 0);
     }
@@ -606,11 +1142,12 @@ mod tests {
         // taken blocks are each individually proven reachable code. The branch
         // target therefore classifies block_aot: proven block, no exact owner.
         //
-        //   BASE:   beq $zero,$zero,+2   (taken target = BASE+0x0c)
+        //   BASE:   beq $zero,$zero,+3   (taken target = BASE+0x10)
         //   BASE+4: nop                  (delay slot)
         //   BASE+8: jr   $t0             (OPEN indirect -> owner not exact)
-        //   BASE+c: jr   $ra ; nop       (the branch target block, proven)
-        let beq = 0x1000_0002;
+        //   BASE+c: nop                  (indirect delay slot)
+        //   BASE+10: jr  $ra ; nop       (the branch target block, proven)
+        let beq = 0x1000_0003;
         let jr_t0 = 0x0100_0008;
         let bytes = asm(&[beq, NOP, jr_t0, NOP, JR_RA, NOP]);
         let rom = rom_with_bank(&bytes);
@@ -746,6 +1283,329 @@ mod tests {
             1,
             "{board:?}"
         );
+
+        let audit = unsupported_destination_audit_v1(std::slice::from_ref(&snapshot));
+        assert_eq!(
+            audit,
+            vec![UnsupportedDestinationAuditV1 {
+                destination_va: far,
+                reason: DestinationReason::OutsideAllMappings,
+                incoming: vec![IncomingTransferV1 {
+                    bank: "bank".to_string(),
+                    block_start_va: BASE,
+                    block_end_va: BASE + 8,
+                    source_site_va: BASE,
+                    kind: ConcreteTransferKind::Tail,
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn candidate_traversal_root_cannot_manufacture_an_unsupported_transfer() {
+        let far = 0x8090_0000u32;
+        let jal_far = 0x0c00_0000 | (far >> 2) & 0x03ff_ffff;
+        let bytes = asm(&[JR_RA, NOP, jal_far, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+
+        // BASE+8 is useful as an exploratory traversal hint, but only BASE is
+        // an authoritative function entry. The broad CFG may inspect the
+        // jal-shaped bytes without making their target executable evidence.
+        let snapshot = compose(&rom, &facts, &bytes, &[BASE, BASE + 8]);
+        assert!(snapshot.banks[0]
+            .closure
+            .cfg
+            .blocks
+            .iter()
+            .any(|block| block.start_va == BASE + 8));
+        assert!(!snapshot.banks[0]
+            .authority_closure
+            .cfg
+            .blocks
+            .iter()
+            .any(|block| block.start_va == BASE + 8));
+
+        let board = scoreboard(std::slice::from_ref(&snapshot));
+        assert_eq!(board.unsupported, 0, "{board:?}");
+        assert!(!classified_destinations(std::slice::from_ref(&snapshot))
+            .iter()
+            .any(|destination| destination.va == far));
+        assert!(unsupported_destination_audit_v1(std::slice::from_ref(&snapshot)).is_empty());
+    }
+
+    #[test]
+    fn authoritative_non_owner_block_retains_its_concrete_transfer() {
+        let far = 0x8090_0000u32;
+        let jump_far = 0x0800_0000 | (far >> 2) & 0x03ff_ffff;
+        let branch_to_jump = 0x1000_0003;
+        let jr_t0 = 0x0100_0008;
+        let bytes = asm(&[branch_to_jump, NOP, jr_t0, NOP, jump_far, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let snapshot = compose(&rom, &facts, &bytes, &[BASE]);
+
+        assert!(!snapshot.banks[0]
+            .owner_proof
+            .assessments
+            .iter()
+            .any(|assessment| matches!(assessment, OwnerAssessment::Proven { .. })));
+        assert!(snapshot.banks[0]
+            .block_proof
+            .assessments
+            .iter()
+            .any(|assessment| matches!(assessment, BlockAssessment::Proven { block } if block.start_va == BASE + 0x10)));
+
+        let board = scoreboard(std::slice::from_ref(&snapshot));
+        assert_eq!(board.unsupported, 1, "{board:?}");
+        let audit = unsupported_destination_audit_v1(std::slice::from_ref(&snapshot));
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].destination_va, far);
+        assert_eq!(audit[0].incoming[0].source_site_va, BASE + 0x10);
+    }
+
+    #[test]
+    fn plain_fallthrough_past_mapped_bank_end_is_retained_as_unsupported() {
+        let bytes = asm(&[NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let mut snapshot = compose(&rom, &facts, &bytes, &[BASE]);
+        assert_eq!(
+            snapshot.banks[0]
+                .authority_closure
+                .cfg
+                .word_class
+                .get(&BASE),
+            Some(&WordClass::ProvenCode)
+        );
+        assert!(matches!(
+            snapshot.banks[0].authority_closure.cfg.blocks[0].terminator,
+            BlockTerminator::RanOffEnd
+        ));
+        let block = snapshot.banks[0]
+            .closure
+            .cfg
+            .blocks
+            .iter_mut()
+            .find(|block| block.start_va == BASE)
+            .expect("one-word root block");
+        assert!(matches!(block.terminator, BlockTerminator::RanOffEnd));
+        let board = scoreboard(std::slice::from_ref(&snapshot));
+        assert_eq!(board.unsupported, 1, "{board:?}");
+        assert_eq!(
+            classified_destinations(std::slice::from_ref(&snapshot)),
+            vec![ClassifiedDestination {
+                va: BASE + 4,
+                reason: DestinationReason::OutsideAllMappings,
+            }]
+        );
+        let audit = unsupported_destination_audit_v1(std::slice::from_ref(&snapshot));
+        assert_eq!(
+            audit,
+            vec![UnsupportedDestinationAuditV1 {
+                destination_va: BASE + 4,
+                reason: DestinationReason::OutsideAllMappings,
+                incoming: vec![IncomingTransferV1 {
+                    bank: "bank".to_string(),
+                    block_start_va: BASE,
+                    block_end_va: BASE + 4,
+                    source_site_va: BASE,
+                    kind: ConcreteTransferKind::RanOffEndFallthrough,
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn call_target_and_end_of_bank_continuation_are_both_retained() {
+        let far = 0x8090_0000u32;
+        let jal_far = 0x0c00_0000 | (far >> 2) & 0x03ff_ffff;
+        let bytes = asm(&[jal_far, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let snapshot = compose(&rom, &facts, &bytes, &[BASE]);
+
+        let board = scoreboard(std::slice::from_ref(&snapshot));
+        assert_eq!(board.unsupported, 2, "{board:?}");
+        let audit = unsupported_destination_audit_v1(std::slice::from_ref(&snapshot));
+        assert_eq!(
+            audit
+                .iter()
+                .map(|destination| destination.destination_va)
+                .collect::<Vec<_>>(),
+            [BASE + 8, far]
+        );
+        assert_eq!(
+            audit[0].incoming[0].kind,
+            ConcreteTransferKind::CallContinuation
+        );
+        assert_eq!(audit[1].incoming[0].kind, ConcreteTransferKind::Call);
+    }
+
+    #[test]
+    fn typed_successor_enumerator_retains_all_modeled_edge_shapes() {
+        let call = BasicBlock {
+            start_va: BASE,
+            end_va: BASE + 8,
+            terminator: BlockTerminator::Call {
+                target: BASE + 0x40,
+                next: BASE + 8,
+            },
+        };
+        assert_eq!(
+            concrete_successors(&call),
+            [
+                ConcreteSuccessor {
+                    destination_va: BASE + 0x40,
+                    source_site_va: BASE,
+                    kind: ConcreteTransferKind::Call,
+                },
+                ConcreteSuccessor {
+                    destination_va: BASE + 8,
+                    source_site_va: BASE,
+                    kind: ConcreteTransferKind::CallContinuation,
+                },
+            ]
+        );
+
+        let branch = BasicBlock {
+            start_va: BASE,
+            end_va: BASE + 8,
+            terminator: BlockTerminator::BranchLikely {
+                target: BASE + 0x40,
+                fallthrough: BASE + 8,
+                link: true,
+            },
+        };
+        assert_eq!(concrete_successors(&branch).len(), 2);
+        assert_eq!(
+            concrete_successors(&branch)[1].kind,
+            ConcreteTransferKind::BranchLikelyFallthrough { link: true }
+        );
+
+        let indirect_call = BasicBlock {
+            start_va: BASE,
+            end_va: BASE + 8,
+            terminator: BlockTerminator::ResolvedIndirect {
+                targets: vec![BASE + 0x40, BASE + 0x80],
+                via_call: true,
+            },
+        };
+        let successors = concrete_successors(&indirect_call);
+        assert_eq!(successors.len(), 3);
+        assert_eq!(
+            successors[2],
+            ConcreteSuccessor {
+                destination_va: BASE + 8,
+                source_site_va: BASE,
+                kind: ConcreteTransferKind::ResolvedIndirectCallContinuation,
+            }
+        );
+
+        let fallthrough = BasicBlock {
+            start_va: BASE,
+            end_va: BASE + 4,
+            terminator: BlockTerminator::Fallthrough { next: BASE + 4 },
+        };
+        assert_eq!(
+            concrete_successors(&fallthrough),
+            [ConcreteSuccessor {
+                destination_va: BASE + 4,
+                source_site_va: BASE,
+                kind: ConcreteTransferKind::PlainFallthrough,
+            }]
+        );
+
+        let ran_off_end = BasicBlock {
+            start_va: BASE,
+            end_va: BASE + 4,
+            terminator: BlockTerminator::RanOffEnd,
+        };
+        assert_eq!(
+            concrete_successors(&ran_off_end),
+            [ConcreteSuccessor {
+                destination_va: BASE + 4,
+                source_site_va: BASE,
+                kind: ConcreteTransferKind::RanOffEndFallthrough,
+            }]
+        );
+    }
+
+    #[test]
+    fn unsupported_audit_retains_and_deduplicates_every_incoming_edge() {
+        let far = 0x8090_0000u32;
+        let j_far = 0x0800_0000 | (far >> 2) & 0x03ff_ffff;
+        // Two independently authoritative blocks tail to the same unmapped
+        // target. Both source edges must survive while the destination remains
+        // one scoreboard item.
+        let bytes = asm(&[j_far, NOP, j_far, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE, BASE + 8]);
+        let snapshot = compose(&rom, &facts, &bytes, &[BASE, BASE + 8]);
+
+        let audit = unsupported_destination_audit_v1(std::slice::from_ref(&snapshot));
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].destination_va, far);
+        assert_eq!(audit[0].incoming.len(), 2, "{audit:?}");
+        assert_eq!(audit[0].incoming[0].source_site_va, BASE);
+        assert_eq!(audit[0].incoming[1].source_site_va, BASE + 8);
+
+        let duplicate_snapshots = [snapshot.clone(), snapshot];
+        assert_eq!(
+            unsupported_destination_audit_v1(&duplicate_snapshots),
+            audit,
+            "duplicate snapshot evidence must not duplicate identical edges"
+        );
+    }
+
+    #[test]
+    fn two_pc_fake_broad_edge_at_proven_source_is_not_projected() {
+        let bytes = asm(&[JR_RA, NOP, JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let mut snapshot = compose(&rom, &facts, &bytes, &[BASE]);
+
+        snapshot.banks[0].closure.cfg.blocks[0].terminator =
+            BlockTerminator::Tail { target: BASE + 8 };
+
+        assert!(authority_projected_successors(&snapshot.banks[0]).is_empty());
+    }
+
+    #[test]
+    fn two_pc_internal_plain_fallthrough_refines_only_ordinary_authority_prefix() {
+        let bytes = asm(&[NOP, NOP, JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let mut snapshot = compose(&rom, &facts, &bytes, &[BASE]);
+        let broad = &mut snapshot.banks[0].closure.cfg.blocks[0];
+
+        broad.end_va = BASE + 4;
+        broad.terminator = BlockTerminator::Fallthrough { next: BASE + 4 };
+        assert_eq!(
+            authority_projected_successors(&snapshot.banks[0])
+                .into_iter()
+                .map(|(_, successor)| successor)
+                .collect::<Vec<_>>(),
+            [ConcreteSuccessor {
+                destination_va: BASE + 4,
+                source_site_va: BASE,
+                kind: ConcreteTransferKind::PlainFallthrough,
+            }]
+        );
+
+        let broad = &mut snapshot.banks[0].closure.cfg.blocks[0];
+        broad.terminator = BlockTerminator::Fallthrough { next: BASE + 8 };
+        assert!(authority_projected_successors(&snapshot.banks[0]).is_empty());
+
+        let broad = &mut snapshot.banks[0].closure.cfg.blocks[0];
+        broad.end_va = BASE + 8;
+        broad.terminator = BlockTerminator::Tail { target: BASE + 4 };
+        assert!(authority_projected_successors(&snapshot.banks[0]).is_empty());
+
+        let broad = &mut snapshot.banks[0].closure.cfg.blocks[0];
+        broad.end_va = BASE + 12;
+        broad.terminator = BlockTerminator::Fallthrough { next: BASE + 12 };
+        assert!(authority_projected_successors(&snapshot.banks[0]).is_empty());
     }
 
     #[test]

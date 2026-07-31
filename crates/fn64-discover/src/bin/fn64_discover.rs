@@ -3,7 +3,7 @@ use fn64_discover::evidence::EvidenceManifest;
 use fn64_discover::trace::PiDmaFoldReport;
 use fn64_discover::{
     run_discovery_auto, run_discovery_with_manifest, AutoDiscovery, DiscoveryStrategy, FactDb,
-    NormalizedRom, StrategyOutcome,
+    NormalizedRom, ProofState, StrategyOutcome,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -35,6 +35,31 @@ struct DiscoveryArtifact<'a> {
     traces: Vec<fn64_discover::trace::IngestReport>,
 }
 
+/// Compact, content-free feedback receipt for one discovery run.
+///
+/// Unlike [`DiscoveryArtifact`], this deliberately omits the fact log, byte
+/// ledger, trace identities, and all paths.  It is for deciding which
+/// mechanical strategy to investigate next, not an interchangeable discovery
+/// artifact or a source of admission authority.
+#[derive(Serialize)]
+struct DiscoverySummary<'a> {
+    schema_version: u32,
+    normalized_rom_sha256: &'a str,
+    fact_count: usize,
+    coverage: fn64_discover::coverage::CoverageReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_strategy: Option<DiscoveryStrategy>,
+    strategy_outcomes: Vec<StrategyOutcome>,
+    trace_count: usize,
+    observed_load_image_reports: usize,
+}
+
+#[derive(Serialize)]
+struct DiscoverySummaryReceipt<'a> {
+    summary: DiscoverySummary<'a>,
+    receipt_sha256: String,
+}
+
 /// Report every strategy attempt on stderr, so a run that recovered nothing
 /// says so out loud instead of returning a quiet boot-bank-only artifact that
 /// looks the same as a successful one.
@@ -50,7 +75,21 @@ fn report_strategies(auto: &AutoDiscovery) {
             outcome.proven_mappings,
         );
     }
-    if auto.selected == DiscoveryStrategy::BootBankOnly {
+    if auto
+        .facts
+        .conclusion("bank:boot")
+        .is_some_and(|conclusion| conclusion.state == ProofState::Open)
+    {
+        let detail = auto
+            .facts
+            .conclusion("bank:boot")
+            .expect("checked above")
+            .rule
+            .as_str();
+        eprintln!(
+            "  NOTE: the boot bank remains Open ({detail}); no zero-delta fallback was used."
+        );
+    } else if auto.selected == DiscoveryStrategy::BootBankOnly {
         eprintln!(
             "  NOTE: no overlay geometry corroborated -- this ROM produced the IPL3 boot copy only."
         );
@@ -81,6 +120,7 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
     let rom_path = args.next().map(PathBuf::from).ok_or_else(usage)?;
     let mut evidence_path = None;
     let mut output_path = None;
+    let mut summary_only = false;
     let mut trace_paths = Vec::new();
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -96,6 +136,12 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
                         .ok_or_else(|| "--out requires a JSON path".to_string())?,
                 ));
             }
+            Some("--summary") => {
+                if summary_only {
+                    return Err("--summary may be supplied exactly once".to_string());
+                }
+                summary_only = true;
+            }
             Some("--trace") => {
                 trace_paths.push(PathBuf::from(
                     args.next()
@@ -106,6 +152,9 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
             None => return Err("arguments must be valid UTF-8".to_string()),
         }
     }
+    if summary_only && output_path.is_some() {
+        return Err("--summary and --out are mutually exclusive".to_string());
+    }
 
     let rom_bytes = std::fs::read(&rom_path)
         .map_err(|error| format!("reading ROM {}: {error}", rom_path.display()))?;
@@ -113,8 +162,8 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("reading evidence {}: {error}", path.display()))?;
         let manifest = EvidenceManifest::from_toml(&text).map_err(|error| error.to_string())?;
-        let (rom, facts) =
-            run_discovery_with_manifest(&rom_bytes, &manifest).map_err(|error| error.to_string())?;
+        let (rom, facts) = run_discovery_with_manifest(&rom_bytes, &manifest)
+            .map_err(|error| error.to_string())?;
         (rom, facts, None, Vec::new())
     } else {
         let auto = run_discovery_auto(&rom_bytes).map_err(|error| error.to_string())?;
@@ -156,8 +205,11 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
     let mut facts = facts;
     let mut observed_load_images = Vec::new();
     for report in &traces {
-        let fold =
-            fn64_discover::trace::fold_pi_dmas_into_fact_db(&mut facts, &report.header.trace_id, &report.facts);
+        let fold = fn64_discover::trace::fold_pi_dmas_into_fact_db(
+            &mut facts,
+            &report.header.trace_id,
+            &report.facts,
+        );
         eprintln!(
             "observed load images ({}): {} new, {} corroborating a proven mapping, {} conflicts, \
              {} chunks coalesced, {} transfers into {} reused destinations (buffers, not load \
@@ -187,8 +239,38 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         }
         observed_load_images.push(fold);
     }
+    let coverage = fn64_discover::coverage::report(rom.len(), &facts);
+    if summary_only {
+        let summary = DiscoverySummary {
+            // v1 is intentionally an observation-only, path-free fast-loop
+            // receipt; it is not the full artifact schema.
+            schema_version: 1,
+            normalized_rom_sha256: &rom.sha256,
+            fact_count: facts.facts().len(),
+            coverage,
+            selected_strategy,
+            strategy_outcomes,
+            trace_count: traces.len(),
+            observed_load_image_reports: observed_load_images.len(),
+        };
+        let encoded = serde_json::to_vec(&summary)
+            .map_err(|error| format!("serializing discovery summary: {error}"))?;
+        let receipt = DiscoverySummaryReceipt {
+            summary,
+            receipt_sha256: format!("{:x}", Sha256::digest(encoded)),
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&receipt)
+                .map_err(|error| format!("serializing discovery summary receipt: {error}"))?
+        );
+        return Ok(());
+    }
+
     // Byte accounting. Coverage as "% of ROM mapped" counts assets against the
-    // score and cannot say how much CODE is undiscovered; this can.
+    // score and cannot say how much CODE is undiscovered; this can.  Keep this
+    // deliberately out of --summary: it owns a byte-granular working map and
+    // a full ROM traversal, neither needed for strategy feedback.
     let ledger = fn64_discover::ledger::build_ledger(&rom.bytes, &facts);
     eprintln!("byte ledger ({} MiB):", ledger.total_bytes / 1_048_576);
     for (class, bytes) in &ledger.bytes_by_class {
@@ -210,7 +292,7 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         schema_version: 2,
         rom: &rom,
         facts: &facts,
-        coverage: fn64_discover::coverage::report(rom.len(), &facts),
+        coverage,
         selected_strategy,
         ledger,
         observed_load_images,
@@ -457,7 +539,7 @@ fn lowercase_hex(bytes: [u8; 32]) -> String {
 
 fn usage() -> String {
     format!(
-        "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--out facts.json]\n       {}",
+        "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--summary | --out facts.json]\n       {}",
         emit_block_program_usage()
     )
 }

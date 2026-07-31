@@ -10,17 +10,126 @@ use fn64_render::{
     ViScanoutRegisters,
 };
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct RdramHiddenSample {
     visible: u16,
     bits: u8,
 }
 
-fn read_rdram_hidden_bits(
-    hidden: &mut HashMap<u32, RdramHiddenSample>,
-    address: u32,
-    visible: u16,
-) -> u8 {
+/// Dense physical storage for RDRAM's two hidden bits and their visible-word
+/// coherence marker. Hidden state is indexed by physical halfword, so a hash
+/// table paid hashing/allocation costs for a naturally dense bounded address
+/// space. `u32::MAX` is outside the 18-bit packed sample domain and represents
+/// an untouched halfword.
+#[derive(Clone, Debug)]
+struct RdramHiddenBits {
+    samples: Vec<u32>,
+}
+
+impl RdramHiddenBits {
+    const EMPTY: u32 = u32::MAX;
+    const HALFWORDS: usize = fn64_runtime::rdram::DEFAULT_RDRAM_SIZE / 2;
+
+    fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+        }
+    }
+
+    fn slot(address: u32) -> Option<usize> {
+        if address & 1 != 0 || address >= fn64_runtime::rdram::DEFAULT_RDRAM_SIZE as u32 {
+            return None;
+        }
+        Some(address as usize >> 1)
+    }
+
+    fn decode(packed: u32) -> Option<RdramHiddenSample> {
+        (packed != Self::EMPTY).then_some(RdramHiddenSample {
+            visible: packed as u16,
+            bits: ((packed >> 16) & 3) as u8,
+        })
+    }
+
+    fn encode(sample: RdramHiddenSample) -> u32 {
+        u32::from(sample.visible) | (u32::from(sample.bits & 3) << 16)
+    }
+
+    fn ensure_storage(&mut self) {
+        if self.samples.is_empty() {
+            self.samples.resize(Self::HALFWORDS, Self::EMPTY);
+        }
+    }
+
+    fn get(&self, address: &u32) -> Option<RdramHiddenSample> {
+        let slot = Self::slot(*address)?;
+        self.samples.get(slot).copied().and_then(Self::decode)
+    }
+
+    fn insert(&mut self, address: u32, sample: RdramHiddenSample) {
+        let slot = Self::slot(address).unwrap_or_else(|| {
+            panic!("hidden-RDRAM address must be an in-range halfword: {address:#010x}")
+        });
+        self.ensure_storage();
+        self.samples[slot] = Self::encode(sample);
+    }
+
+    fn insert_pair(&mut self, address: u32, first: RdramHiddenSample, second: RdramHiddenSample) {
+        assert!(
+            address.is_multiple_of(4),
+            "hidden-RDRAM pair must begin at a word boundary: {address:#010x}"
+        );
+        let slot = Self::slot(address).unwrap_or_else(|| {
+            panic!("hidden-RDRAM address must be an in-range halfword: {address:#010x}")
+        });
+        self.ensure_storage();
+        let pair = self
+            .samples
+            .get_mut(slot..slot + 2)
+            .expect("hidden-RDRAM word extends outside dense storage");
+        pair[0] = Self::encode(first);
+        pair[1] = Self::encode(second);
+    }
+
+    fn update_visible(&mut self, address: u32, visible: u16) {
+        let Some(slot) = Self::slot(address) else {
+            return;
+        };
+        let Some(mut sample) = self.samples.get(slot).copied().and_then(Self::decode) else {
+            return;
+        };
+        sample.visible = visible;
+        self.samples[slot] = Self::encode(sample);
+    }
+
+    fn contains_key(&self, address: &u32) -> bool {
+        self.get(address).is_some()
+    }
+
+    fn extend(&mut self, updates: impl IntoIterator<Item = (u32, RdramHiddenSample)>) {
+        for (address, sample) in updates {
+            self.insert(address, sample);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.samples.fill(Self::EMPTY);
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.samples.iter().all(|sample| *sample == Self::EMPTY)
+    }
+}
+
+impl<const N: usize> From<[(u32, RdramHiddenSample); N]> for RdramHiddenBits {
+    fn from(entries: [(u32, RdramHiddenSample); N]) -> Self {
+        let mut hidden = Self::new();
+        hidden.extend(entries);
+        hidden
+    }
+}
+
+fn read_rdram_hidden_bits(hidden: &mut RdramHiddenBits, address: u32, visible: u16) -> u8 {
     if let Some(sample) = hidden.get(&address) {
         if sample.visible == visible {
             return sample.bits & 3;
@@ -132,7 +241,7 @@ fn vi_source_geometry_with_bottom_halo(
 fn load_vi_source(
     memory: &fn64_runtime::PhysicalRdramRead<'_>,
     geometry: ViSourceGeometry,
-    hidden: &HashMap<u32, RdramHiddenSample>,
+    hidden: &RdramHiddenBits,
 ) -> Result<(Framebuffer, Vec<(u32, RdramHiddenSample)>), RenderError> {
     validate_vi_source_footprint(memory, geometry)?;
     let height = geometry.rows as u32;
@@ -247,22 +356,13 @@ fn validate_vi_source_footprint(
 /// calls this from its changed-visible-word fallback. A same-value external
 /// store requires the host to provide a write event because `&mut [u8]`
 /// alone cannot distinguish that store from no mutation.
-fn record_non_rdp_16bit_write(
-    hidden: &mut HashMap<u32, RdramHiddenSample>,
-    address: u32,
-    visible: u16,
-) -> u8 {
+fn record_non_rdp_16bit_write(hidden: &mut RdramHiddenBits, address: u32, visible: u16) -> u8 {
     let bits = if visible & 1 == 0 { 0 } else { 3 };
     hidden.insert(address, RdramHiddenSample { visible, bits });
     bits
 }
 
-fn write_rdram_hidden_bits(
-    hidden: &mut HashMap<u32, RdramHiddenSample>,
-    address: u32,
-    visible: u16,
-    bits: u8,
-) {
+fn write_rdram_hidden_bits(hidden: &mut RdramHiddenBits, address: u32, visible: u16, bits: u8) {
     hidden.insert(
         address,
         RdramHiddenSample {
@@ -279,7 +379,7 @@ fn write_rdram_hidden_bits(
 /// an external non-RDP store and replace the preserved bits from the LSB.
 fn refresh_rdp_visible_halfwords_preserving_hidden(
     rdram: &[u8],
-    hidden: &mut HashMap<u32, RdramHiddenSample>,
+    hidden: &mut RdramHiddenBits,
     start: u32,
     byte_len: usize,
 ) {
@@ -295,13 +395,13 @@ fn refresh_rdp_visible_halfwords_preserving_hidden(
         if address as usize + 2 > view.len() {
             break;
         }
-        if let Some(sample) = hidden.get_mut(&address) {
-            sample.visible = view.read_u16(fn64_runtime::RdramAddr::from_offset(address));
-        }
+        hidden.update_visible(
+            address,
+            view.read_u16(fn64_runtime::RdramAddr::from_offset(address)),
+        );
     }
 }
 use sha2::Digest;
-use std::collections::HashMap;
 
 /// A headless software `RenderBackend`: decodes bounded F3DEX2/S2DEX
 /// display-list subsets to ordered geometry/image/fill/sync operations and
@@ -358,7 +458,7 @@ pub struct ReferenceBackend {
     /// RDP has touched. Color images interpret them as low coverage bits;
     /// depth images interpret them as low DeltaZ bits. One address-keyed store
     /// preserves real aliasing between overlapping image ranges.
-    rdram_hidden_bits: HashMap<u32, RdramHiddenSample>,
+    rdram_hidden_bits: RdramHiddenBits,
     clear_color: [u8; 4],
     noise_seed: u64,
     decode_mode: DecodeMode,
@@ -437,6 +537,8 @@ struct AutoDump {
     /// Stop dumping after this many non-clear frames (avoid flooding /tmp on
     /// a long boot). `u64::MAX` = unbounded.
     limit: u64,
+    /// Report the first task omitted by the bound, then remain quiet.
+    limit_reported: bool,
 }
 
 impl ReferenceBackend {
@@ -450,7 +552,7 @@ impl ReferenceBackend {
             depth_image: None,
             primitive_depth: None,
             rdp_decode_state: gbi::RdpDecodeState::default(),
-            rdram_hidden_bits: HashMap::new(),
+            rdram_hidden_bits: RdramHiddenBits::new(),
             clear_color: [0, 0, 0, 255],
             noise_seed: Framebuffer::DEFAULT_NOISE_SEED,
             decode_mode: DecodeMode::Simple,
@@ -633,6 +735,7 @@ impl ReferenceBackend {
             skip_before_task: 0,
             written: 0,
             limit,
+            limit_reported: false,
         });
         self
     }
@@ -1334,11 +1437,14 @@ impl ReferenceBackend {
                         state.tri_count
                     );
                 } else if dump.written >= dump.limit {
-                    eprintln!(
-                        "[fn64-render-reference] gfx task #{idx}: non-clear ({} tris) but \
-                         auto-dump limit ({}) reached -- not writing another PNG.",
-                        state.tri_count, dump.limit
-                    );
+                    if !dump.limit_reported {
+                        eprintln!(
+                            "[fn64-render-reference] gfx task #{idx}: non-clear ({} tris) but \
+                             auto-dump limit ({}) reached -- suppressing later dump notices.",
+                            state.tri_count, dump.limit
+                        );
+                        dump.limit_reported = true;
+                    }
                 } else {
                     let _ = std::fs::create_dir_all(&dump.dir);
                     let path = dump
@@ -1417,35 +1523,32 @@ impl RenderBackend for ReferenceBackend {
         task: &OsTask,
         output_addr: u32,
     ) -> Result<FrameStatus, RenderError> {
-        let mut status = self.process_reference_task_chunk(
-            rdram,
-            rsp_memory,
-            task,
-            output_addr,
-            fn64_render::RenderTaskStep::Start,
-        )?;
-        loop {
-            match status {
-                fn64_render::RenderTaskChunkStatus::Complete => {
-                    return Ok(FrameStatus::Complete);
-                }
-                fn64_render::RenderTaskChunkStatus::Continue(token) => {
-                    status = self.process_reference_task_chunk(
-                        rdram,
-                        rsp_memory,
-                        task,
-                        output_addr,
-                        fn64_render::RenderTaskStep::Resume(token),
-                    )?;
-                }
-                fn64_render::RenderTaskChunkStatus::Yielded => {
-                    return Ok(FrameStatus::Yielded);
-                }
-                fn64_render::RenderTaskChunkStatus::NeedsLle { ucode_sha256 } => {
-                    return Ok(FrameStatus::NeedsLle { ucode_sha256 });
-                }
+        let mut state = match self.prepare_reference_task(rdram, rsp_memory, task, output_addr)? {
+            PreparedReferenceTask::Ready(state) => state,
+            PreparedReferenceTask::NeedsLle(ucode_sha256) => {
+                return Ok(FrameStatus::NeedsLle { ucode_sha256 });
             }
+        };
+        self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
+        while state.next_operation < state.operations.len() {
+            let operation = state.operations[state.next_operation].clone();
+            state.next_operation += 1;
+            self.execute_reference_operation(rdram, &mut state, &operation)?;
+            state.reached_dp_full_sync |= matches!(operation, gbi::RenderOp::FullSync);
         }
+        let dp_full_sync = if state.reached_dp_full_sync {
+            fn64_render::DpFullSyncStatus::Reached
+        } else {
+            fn64_render::DpFullSyncStatus::NotReached
+        };
+        // This trait call is atomic with respect to guest execution: unlike
+        // `process_task_chunk`, it publishes no continuation at which SIG0 or
+        // another guest thread can observe RDRAM. Target changes and FullSync
+        // still commit inside `execute_reference_operation`; the remaining
+        // dirty image needs one commit at the task boundary.
+        self.finish_reference_task(rdram, state)?;
+        self.last_dp_full_sync = dp_full_sync;
+        Ok(FrameStatus::Complete)
     }
 
     fn process_task_chunk(
@@ -2117,7 +2220,7 @@ fn load_rgba5551_framebuffer(
     rdram: &[u8],
     target: gbi::ColorImage,
     fb: &mut Framebuffer,
-    hidden_bits: &mut HashMap<u32, RdramHiddenSample>,
+    hidden_bits: &mut RdramHiddenBits,
 ) {
     if fb.width != u32::from(target.width) {
         *fb = fb.resized(u32::from(target.width), fb.height);
@@ -2155,7 +2258,7 @@ fn load_color_image(
     rdram: &[u8],
     target: gbi::ColorImage,
     fb: &mut Framebuffer,
-    hidden_bits: &mut HashMap<u32, RdramHiddenSample>,
+    hidden_bits: &mut RdramHiddenBits,
 ) {
     let layout = target
         .layout()
@@ -2228,7 +2331,7 @@ fn write_rgba5551_framebuffer(
     rdram: &mut [u8],
     start: usize,
     fb: &Framebuffer,
-    hidden_bits: &mut HashMap<u32, RdramHiddenSample>,
+    hidden_bits: &mut RdramHiddenBits,
 ) {
     let px_count = (fb.width * fb.height) as usize;
     // The framebuffer format is a fixed 2 bytes/pixel; only write pixels the
@@ -2242,16 +2345,9 @@ fn write_rgba5551_framebuffer(
         "RGBA5551 framebuffer base must be word-aligned, got {:#x}",
         start.offset()
     );
+    let available_pixels = (rdram.len().saturating_sub(start.offset() as usize) / 2).min(px_count);
     let mut view = fn64_runtime::RdramViewMut::from_storage(rdram);
-    for i in 0..px_count {
-        let byte_offset = u32::try_from(i.checked_mul(2).expect("framebuffer size overflow"))
-            .expect("framebuffer byte offset exceeds u32");
-        let Some(dst) = start.checked_add(byte_offset) else {
-            break;
-        };
-        if dst.offset() as usize + 2 > view.len() {
-            break;
-        }
+    let pixel = |i: usize| {
         let src = i * 4;
         let r = fb.pixels[src];
         let g = fb.pixels[src + 1];
@@ -2261,8 +2357,43 @@ fn write_rgba5551_framebuffer(
             | (to_5(g) << 6)
             | (to_5(b) << 1)
             | u16::from((stored_coverage >> 2) & 1);
-        view.write_u16(dst, px);
-        write_rdram_hidden_bits(hidden_bits, dst.offset(), px, stored_coverage & 3);
+        (px, stored_coverage & 3)
+    };
+    let paired_pixels = available_pixels & !1;
+    for i in (0..paired_pixels).step_by(2) {
+        let byte_offset = u32::try_from(i * 2).expect("framebuffer byte offset exceeds u32");
+        let dst = start
+            .checked_add(byte_offset)
+            .expect("bounded framebuffer pair address overflow");
+        let (first, first_hidden) = pixel(i);
+        let (second, second_hidden) = pixel(i + 1);
+        let native_word = if cfg!(target_endian = "little") {
+            (u32::from(first) << 16) | u32::from(second)
+        } else {
+            (u32::from(second) << 16) | u32::from(first)
+        };
+        view.write_u32(dst, native_word);
+        hidden_bits.insert_pair(
+            dst.offset(),
+            RdramHiddenSample {
+                visible: first,
+                bits: first_hidden,
+            },
+            RdramHiddenSample {
+                visible: second,
+                bits: second_hidden,
+            },
+        );
+    }
+    if available_pixels != paired_pixels {
+        let i = paired_pixels;
+        let byte_offset = u32::try_from(i * 2).expect("framebuffer byte offset exceeds u32");
+        let dst = start
+            .checked_add(byte_offset)
+            .expect("bounded framebuffer tail address overflow");
+        let (visible, bits) = pixel(i);
+        view.write_u16(dst, visible);
+        write_rdram_hidden_bits(hidden_bits, dst.offset(), visible, bits);
     }
 }
 
@@ -2270,7 +2401,7 @@ fn commit_color_image(
     rdram: &mut [u8],
     target: gbi::ColorImage,
     fb: &Framebuffer,
-    hidden_bits: &mut HashMap<u32, RdramHiddenSample>,
+    hidden_bits: &mut RdramHiddenBits,
 ) {
     match target
         .layout()
@@ -2412,7 +2543,7 @@ fn load_rdp_depth_image(
     rdram: &[u8],
     target: gbi::DepthImage,
     fb: &mut Framebuffer,
-    hidden_bits: &mut HashMap<u32, RdramHiddenSample>,
+    hidden_bits: &mut RdramHiddenBits,
 ) -> Result<(), RenderError> {
     validate_rdp_depth_image(rdram, target, fb)?;
     let view = fn64_runtime::RdramView::from_storage(rdram);
@@ -2441,7 +2572,7 @@ fn commit_rdp_depth_image(
     rdram: &mut [u8],
     target: gbi::DepthImage,
     fb: &Framebuffer,
-    hidden_bits: &mut HashMap<u32, RdramHiddenSample>,
+    hidden_bits: &mut RdramHiddenBits,
 ) -> Result<(), RenderError> {
     validate_rdp_depth_image(rdram, target, fb)?;
     let start = fn64_runtime::RdramAddr::from_offset(target.address);
@@ -3633,7 +3764,7 @@ mod tests {
             );
             assert_eq!(
                 backend.rdram_hidden_bits.get(&address),
-                Some(&RdramHiddenSample {
+                Some(RdramHiddenSample {
                     visible,
                     bits: hidden,
                 }),
@@ -4432,6 +4563,7 @@ mod tests {
         assert_eq!(dump.skip_before_task, 4_180);
         assert_eq!(dump.written, 0);
         assert_eq!(dump.limit, 3);
+        assert!(!dump.limit_reported);
     }
 
     #[test]
@@ -4440,7 +4572,7 @@ mod tests {
         framebuffer.pixels[0..4].copy_from_slice(&[255, 0, 0, 255]);
         framebuffer.pixels[4..8].copy_from_slice(&[0, 0, 255, 255]);
         let mut storage = [0u8; 4];
-        let mut hidden_bits = HashMap::new();
+        let mut hidden_bits = RdramHiddenBits::new();
 
         write_rgba5551_framebuffer(&mut storage, 0, &framebuffer, &mut hidden_bits);
 
@@ -4467,7 +4599,7 @@ mod tests {
         let mut framebuffer = Framebuffer::new(1, 1);
         framebuffer.pixels.copy_from_slice(&[7, 8, 15, 255]);
         let mut storage = [0u8; 4];
-        let mut hidden_bits = HashMap::new();
+        let mut hidden_bits = RdramHiddenBits::new();
 
         write_rgba5551_framebuffer(&mut storage, 0, &framebuffer, &mut hidden_bits);
 
@@ -4487,7 +4619,7 @@ mod tests {
             *coverage = raster::Coverage::new(index as u8 + 1);
         }
         let mut storage = [0u8; 16];
-        let mut hidden_bits = HashMap::new();
+        let mut hidden_bits = RdramHiddenBits::new();
 
         write_rgba5551_framebuffer(&mut storage, 0, &framebuffer, &mut hidden_bits);
         let view = fn64_runtime::RdramView::from_storage(&storage);
@@ -4576,7 +4708,7 @@ mod tests {
 
     #[test]
     fn changed_cpu_visible_word_reconstructs_its_hidden_bits_from_the_lsb() {
-        let mut hidden_bits = HashMap::from([(
+        let mut hidden_bits = RdramHiddenBits::from([(
             0,
             RdramHiddenSample {
                 visible: 1,
@@ -4586,7 +4718,7 @@ mod tests {
         assert_eq!(read_rdram_hidden_bits(&mut hidden_bits, 0, 0), 0);
         assert_eq!(
             hidden_bits.get(&0),
-            Some(&RdramHiddenSample {
+            Some(RdramHiddenSample {
                 visible: 0,
                 bits: 0,
             })
@@ -4600,7 +4732,7 @@ mod tests {
         let mut visible = vec![0u8; 8];
         fn64_runtime::RdramViewMut::from_storage(&mut visible)
             .write_u16(fn64_runtime::RdramAddr::from_offset(2), 0x1235);
-        backend.rdram_hidden_bits = HashMap::from([
+        backend.rdram_hidden_bits = RdramHiddenBits::from([
             (
                 0,
                 RdramHiddenSample {
@@ -4625,8 +4757,8 @@ mod tests {
             backend.observe_non_rdp_write16(NonRdpWrite16::new(2, 0x1235)),
             NonRdpWrite16Disposition::AppliedHiddenSidecar
         );
-        assert_eq!(backend.rdram_hidden_bits[&0].bits, 0);
-        assert_eq!(backend.rdram_hidden_bits[&2].bits, 3);
+        assert_eq!(backend.rdram_hidden_bits.get(&0).unwrap().bits, 0);
+        assert_eq!(backend.rdram_hidden_bits.get(&2).unwrap().bits, 3);
         assert_eq!(
             fn64_runtime::RdramView::from_storage(&visible)
                 .read_u16(fn64_runtime::RdramAddr::from_offset(2)),
@@ -4660,7 +4792,7 @@ mod tests {
             visible: 0xcafe,
             bits: 3,
         };
-        let mut hidden_bits = HashMap::from([
+        let mut hidden_bits = RdramHiddenBits::from([
             (
                 0,
                 RdramHiddenSample {
@@ -4685,25 +4817,25 @@ mod tests {
         commit_color_image(&mut rdram, index8, &source, &mut hidden_bits);
 
         assert_eq!(
-            hidden_bits[&0],
+            hidden_bits.get(&0).unwrap(),
             RdramHiddenSample {
                 visible: 0x1234,
                 bits: 2
             }
         );
         assert_eq!(
-            hidden_bits[&2],
+            hidden_bits.get(&2).unwrap(),
             RdramHiddenSample {
                 visible: 0x5679,
                 bits: 1
             }
         );
-        assert_eq!(hidden_bits[&4], untouched);
+        assert_eq!(hidden_bits.get(&4), Some(untouched));
         let mut imported = Framebuffer::new(2, 1);
         load_color_image(&rdram, rgba16, &mut imported, &mut hidden_bits);
         assert_eq!(imported.coverage[0].stored(), 2);
         assert_eq!(imported.coverage[1].stored(), 5);
-        assert_eq!(hidden_bits[&4], untouched);
+        assert_eq!(hidden_bits.get(&4), Some(untouched));
     }
 
     #[test]
@@ -4724,7 +4856,7 @@ mod tests {
             visible: 0xdead,
             bits: 2,
         };
-        let mut hidden_bits = HashMap::from([
+        let mut hidden_bits = RdramHiddenBits::from([
             (
                 0,
                 RdramHiddenSample {
@@ -4765,34 +4897,34 @@ mod tests {
         commit_color_image(&mut rdram, rgba32, &source, &mut hidden_bits);
 
         assert_eq!(
-            hidden_bits[&0],
+            hidden_bits.get(&0).unwrap(),
             RdramHiddenSample {
                 visible: 0x1020,
                 bits: 2
             }
         );
         assert_eq!(
-            hidden_bits[&2],
+            hidden_bits.get(&2).unwrap(),
             RdramHiddenSample {
                 visible: 0x3001,
                 bits: 1
             }
         );
         assert_eq!(
-            hidden_bits[&4],
+            hidden_bits.get(&4).unwrap(),
             RdramHiddenSample {
                 visible: 0x4051,
                 bits: 3
             }
         );
         assert_eq!(
-            hidden_bits[&6],
+            hidden_bits.get(&6).unwrap(),
             RdramHiddenSample {
                 visible: 0x6000,
                 bits: 0
             }
         );
-        assert_eq!(hidden_bits[&8], untouched);
+        assert_eq!(hidden_bits.get(&8), Some(untouched));
         let mut imported = Framebuffer::new(4, 1);
         load_color_image(&rdram, rgba16, &mut imported, &mut hidden_bits);
         assert_eq!(
@@ -4803,7 +4935,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2, 5, 7, 0]
         );
-        assert_eq!(hidden_bits[&8], untouched);
+        assert_eq!(hidden_bits.get(&8), Some(untouched));
     }
 
     #[test]
@@ -4851,7 +4983,7 @@ mod tests {
                 assert_eq!(source.transition_to(destination).from, from);
 
                 let mut rdram = vec![0xcc; 0x400];
-                let mut hidden_bits = HashMap::new();
+                let mut hidden_bits = RdramHiddenBits::new();
                 commit_color_image(&mut rdram, destination, &original, &mut hidden_bits);
                 commit_color_image(&mut rdram, source, &original, &mut hidden_bits);
 
@@ -4945,7 +5077,7 @@ mod tests {
                 bits: 2,
             };
             let mut hidden_bits =
-                HashMap::from([(0, sentinel), (2, sentinel), (4, sentinel), (6, sentinel)]);
+                RdramHiddenBits::from([(0, sentinel), (2, sentinel), (4, sentinel), (6, sentinel)]);
             commit_color_image(&mut rdram, target(layout), &framebuffer, &mut hidden_bits);
 
             let expected: &[u8] = match layout {
@@ -4983,7 +5115,8 @@ mod tests {
                     gbi::ColorImageLayout::Index8 => sentinel,
                 };
                 assert_eq!(
-                    hidden_bits[&address], expected_hidden,
+                    hidden_bits.get(&address),
+                    Some(expected_hidden),
                     "{layout:?} at {address}"
                 );
             }
@@ -5424,7 +5557,7 @@ mod tests {
             address: 0x400,
         };
         let mut framebuffer = Framebuffer::new(4, 1);
-        let mut hidden_bits = HashMap::new();
+        let mut hidden_bits = RdramHiddenBits::new();
         load_color_image(&rdram, target, &mut framebuffer, &mut hidden_bits);
         assert_eq!(
             framebuffer.pixels,
@@ -5473,7 +5606,7 @@ mod tests {
         }
 
         let mut framebuffer = Framebuffer::new(2, 1);
-        let mut hidden_bits = HashMap::new();
+        let mut hidden_bits = RdramHiddenBits::new();
         load_color_image(&rdram, rgba16, &mut framebuffer, &mut hidden_bits);
         assert_eq!(&framebuffer.pixels[..8], &[255, 0, 0, 255, 0, 255, 0, 255]);
 

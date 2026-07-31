@@ -797,7 +797,10 @@ mod tests {
         let pi_len_reference = ingest(&pi_len_records);
         let pi_report = diff_ingests(&fn64, &pi_len_reference, &TimingTolerance::initial_loose());
         assert!(
-            matches!(pi_report.first_divergence, Some(Divergence::Ordering { .. })),
+            matches!(
+                pi_report.first_divergence,
+                Some(Divergence::Ordering { .. })
+            ),
             "a PI length mismatch is a payload/ordering divergence: {pi_report:?}"
         );
         assert_eq!(pi_report.first_divergence.as_ref().unwrap().index(), 0);

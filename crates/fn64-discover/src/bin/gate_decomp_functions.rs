@@ -27,7 +27,7 @@
 //!   FN64_DISCOVER_ROM         the game's .z64
 //!   FN64_DISCOVER_DUMP        the matching answer-key dump.toml
 //!   FN64_DISCOVER_ENTRY_ARGS  optional cited code-pointer-argument claims
-//!                             TOML (e.g. osCreateThread's entry in $a2);
+//!                             TOML for callbacks not derived automatically;
 //!                             constant operands seed additional CFG roots
 //!   FN64_DISCOVER_TABLES / FN64_DISCOVER_REQUEST_DMA
 //!                             optional geometry/claims (as in
@@ -95,13 +95,19 @@
 //!                             are read from ROM bytes, validated in-window,
 //!                             and pinned as CFG successors — never roots,
 //!                             never an exhaustiveness proof
+//!   FN64_DISCOVER_PRINT_ROOTS set to print every callable root added by
+//!                             composed snapshot authority; the default
+//!                             reports only the bank/root totals
 
-use fn64_discover::banks::{self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput};
+use fn64_discover::banks::{
+    self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput,
+};
 use fn64_discover::grade_oot_functions::{grade_functions, AnswerFunction, JalTargets};
 use fn64_discover::partition::{
     partition, partition_with_authoritative_entries, same_bank_overlaps,
 };
-use fn64_discover::resolve::build_cfg_closed_with_facts_and_claims;
+use fn64_discover::resolve::{build_cfg_closed_with_facts_and_claims, build_cfg_value_set_closed};
+use fn64_discover::snapshot::{compose_materialized_banks_v1, MaterializedBankInput};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Shortest run of consecutive boundary-plausible in-window code pointers
@@ -141,6 +147,12 @@ struct Function {
     name: String,
     vram: u32,
     size: u32,
+}
+
+struct OwnedMaterializedBank {
+    bank: String,
+    va_start: u32,
+    bytes: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -220,8 +232,11 @@ fn switch_table_base(text_words: &[u32], va_start: u32, site_pc: u32) -> Option<
     let scan_from = site.saturating_sub(8);
     let (lw_index, lo, base_reg) = (scan_from..site).rev().find_map(|index| {
         let word = text_words[index];
-        (word >> 26 == 0x23 && (word >> 16) & 0x1f == jr_reg)
-            .then_some((index, (word & 0xffff) as i16 as i32, (word >> 21) & 0x1f))
+        (word >> 26 == 0x23 && (word >> 16) & 0x1f == jr_reg).then_some((
+            index,
+            (word & 0xffff) as i16 as i32,
+            (word >> 21) & 0x1f,
+        ))
     })?;
     let hi = (scan_from..lw_index).rev().find_map(|index| {
         let word = text_words[index];
@@ -353,8 +368,7 @@ fn main() {
     }
 
     let code_len = (code_end - boot_va_start) as usize;
-    let bank_bytes =
-        &rom.bytes[boot_rom_start as usize..boot_rom_start as usize + code_len];
+    let bank_bytes = &rom.bytes[boot_rom_start as usize..boot_rom_start as usize + code_len];
     // The proven bank base IS the effective entry: IPL3 jumps to where it
     // copied the image (header entry adjusted by the identified variant's
     // relocation delta) — for 6102/6105-class IPL3s the two coincide.
@@ -365,13 +379,12 @@ fn main() {
         answer.len()
     );
 
-    // Optional cited entry-argument claims (FN64_DISCOVER_ENTRY_ARGS): a
-    // callee that receives a code pointer in a declared register (e.g.
-    // osCreateThread's entry in $a2). Constant operands recovered from the
-    // scanned image become additional CFG roots — the OS transfers control
-    // there, so a static constant is a callable-entry observation. The
-    // grade's wrong==0 posture judges the result; open operands and
-    // out-of-window pointers are reported, never guessed.
+    // Snapshot composition first derives callable entries for mechanisms it
+    // can identify semantically, currently resident osCreateThread calls.
+    // Optional cited entry-argument claims cover callbacks not yet derived
+    // automatically. Constant operands recovered from the scanned image become
+    // additional CFG roots; open operands and out-of-window pointers are
+    // reported, never guessed.
     // Two evidentiary classes of root. `excused` roots are machine-checked
     // callable entries (the entrypoint, statically proven entry-argument
     // pointers, cross-bank jal targets) and join the interior-entry excuse
@@ -381,6 +394,92 @@ fn main() {
     // be excused as a legitimate interior entry.
     let mut roots = vec![entrypoint];
     let mut excused = vec![entrypoint];
+    let full_boot_bytes = &rom.bytes[boot_rom_start as usize..boot_rom_end as usize];
+    let mut baseline_seed_roots = db.proven_function_entries(banks::BOOT_BANK);
+    baseline_seed_roots.push(entrypoint);
+    baseline_seed_roots.sort_unstable();
+    baseline_seed_roots.dedup();
+    let baseline_authority = build_cfg_value_set_closed(
+        banks::BOOT_BANK,
+        full_boot_bytes,
+        boot_va_start,
+        &baseline_seed_roots,
+    );
+    // Compose the resident bank together with only the load images proven by
+    // the cited request-DMA scan. This is the smallest catalog that can carry
+    // a semantic call chain out of the resident bank and back again; unrelated
+    // table-derived overlays do not become authority merely because their
+    // bytes are materializable.
+    let mut composition_storage = vec![OwnedMaterializedBank {
+        bank: banks::BOOT_BANK.to_owned(),
+        va_start: boot_va_start,
+        bytes: full_boot_bytes.to_vec(),
+    }];
+    for bank_name in &request_report.proven_banks {
+        let mappings: Vec<_> = db
+            .proven_rom_mappings()
+            .into_iter()
+            .filter(|fact| matches!(fact, Fact::RomMapping { bank, .. } if bank == bank_name))
+            .collect();
+        let [Fact::RomMapping {
+            rom_space,
+            rom_start,
+            rom_end,
+            va_start,
+            ..
+        }] = mappings.as_slice()
+        else {
+            panic!(
+                "request-DMA bank {bank_name} must have exactly one proven ROM mapping, got {}",
+                mappings.len()
+            );
+        };
+        let image = materialize_rom_range(&rom, &db, *rom_space, *rom_start, *rom_end)
+            .unwrap_or_else(|error| panic!("materializing request-DMA bank {bank_name}: {error}"));
+        composition_storage.push(OwnedMaterializedBank {
+            bank: bank_name.clone(),
+            va_start: *va_start,
+            bytes: image.bytes,
+        });
+    }
+    let composition_inputs: Vec<_> = composition_storage
+        .iter()
+        .map(|bank| MaterializedBankInput {
+            bank: &bank.bank,
+            va_start: bank.va_start,
+            bytes: &bank.bytes,
+            seed_roots: &[],
+        })
+        .collect();
+    let composed_authority = compose_materialized_banks_v1(&rom, &db, &composition_inputs)
+        .expect("byte-verified multi-bank authority composition");
+    let composed_boot = composed_authority
+        .iter()
+        .find(|snapshot| snapshot.banks[0].input.bank == banks::BOOT_BANK)
+        .expect("composed snapshots retain the boot input");
+    let baseline_roots: BTreeSet<u32> = baseline_authority.cfg.proven_roots.into_iter().collect();
+    let mut authority_delta: Vec<u32> = composed_boot.banks[0]
+        .closure
+        .cfg
+        .proven_roots
+        .iter()
+        .copied()
+        .filter(|root| !baseline_roots.contains(root) && *root < code_end)
+        .collect();
+    authority_delta.sort_unstable();
+    authority_delta.dedup();
+    for root in &authority_delta {
+        if std::env::var("FN64_DISCOVER_PRINT_ROOTS").is_ok() {
+            println!("inductive callable root: 0x{root:x}");
+        }
+        roots.push(*root);
+        excused.push(*root);
+    }
+    println!(
+        "multi-bank inductive callable seeding: banks={} roots added={}",
+        composition_inputs.len(),
+        authority_delta.len(),
+    );
     if let Some(file) = load_toml_env::<EntryArgsFile>("FN64_DISCOVER_ENTRY_ARGS") {
         let words: Vec<u32> = bank_bytes
             .chunks_exact(4)
@@ -400,9 +499,7 @@ fn main() {
             .expect("boot image already validated");
             for slice in slices {
                 match slice.pointer.proven() {
-                    Some(pointer)
-                        if pointer.get() >= boot_va_start && pointer.get() < code_end =>
-                    {
+                    Some(pointer) if pointer.get() >= boot_va_start && pointer.get() < code_end => {
                         let va = pointer.get();
                         if !roots.contains(&va) {
                             println!(
@@ -568,7 +665,14 @@ fn main() {
                 .collect(),
         );
         for fact in db.proven_rom_mappings() {
-            let Fact::RomMapping { bank, rom_space, rom_start, rom_end, .. } = fact else {
+            let Fact::RomMapping {
+                bank,
+                rom_space,
+                rom_start,
+                rom_end,
+                ..
+            } = fact
+            else {
                 continue;
             };
             if bank == banks::BOOT_BANK {
@@ -594,16 +698,12 @@ fn main() {
             let mut ovl_ptr_candidates: Vec<u32> = Vec::new();
             for words in images.iter().skip(1) {
                 let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
-                let Some(refs) = fn64_discover::overlay_reloc::parse_zelda_overlay(&bytes)
-                else {
+                let Some(refs) = fn64_discover::overlay_reloc::parse_zelda_overlay(&bytes) else {
                     continue;
                 };
                 ovl_files += 1;
                 for target in refs.jal_targets {
-                    if target >= boot_va_start
-                        && target < code_end
-                        && !roots.contains(&target)
-                    {
+                    if target >= boot_va_start && target < code_end && !roots.contains(&target) {
                         roots.push(target);
                         excused.push(target);
                         ovl_jal += 1;
@@ -621,10 +721,7 @@ fn main() {
                 }
                 let offset = ((target - boot_va_start) / 4) as usize;
                 if offset >= boot_words_ref.len()
-                    || !fn64_discover::sig_scan::plausible_function_boundary(
-                        boot_words_ref,
-                        offset,
-                    )
+                    || !fn64_discover::sig_scan::plausible_function_boundary(boot_words_ref, offset)
                 {
                     continue;
                 }
@@ -662,10 +759,7 @@ fn main() {
                         } else {
                             hi | low
                         };
-                        if target % 4 == 0
-                            && target > boot_va_start
-                            && target < code_end
-                        {
+                        if target % 4 == 0 && target > boot_va_start && target < code_end {
                             candidates.push(target);
                         }
                         break;
@@ -800,8 +894,7 @@ fn main() {
         // proven banks are materialized through its own proof chain (Yaz0
         // included), so bodies in compressed segments — where OoT/MM keep
         // most of libultra/libc — become readable signatures too.
-        let donor_tables_env =
-            std::env::var("FN64_DISCOVER_SIG_DONOR_TABLES").unwrap_or_default();
+        let donor_tables_env = std::env::var("FN64_DISCOVER_SIG_DONOR_TABLES").unwrap_or_default();
         let donor_request_env =
             std::env::var("FN64_DISCOVER_SIG_DONOR_REQUEST_DMA").unwrap_or_default();
         let donor_tables_paths: Vec<&str> = donor_tables_env.split(';').collect();
@@ -830,16 +923,15 @@ fn main() {
                         .load_image_tables
                 })
                 .unwrap_or_default();
-            let donor_request: Vec<StaticRequestDmaInput> =
-                load_donor_claims(&donor_request_paths)
-                    .map(|path| {
-                        let text = std::fs::read_to_string(&path)
-                            .unwrap_or_else(|error| panic!("reading {path}: {error}"));
-                        toml::from_str::<RequestDmaFile>(&text)
-                            .unwrap_or_else(|error| panic!("parsing {path}: {error}"))
-                            .request_dma
-                    })
-                    .unwrap_or_default();
+            let donor_request: Vec<StaticRequestDmaInput> = load_donor_claims(&donor_request_paths)
+                .map(|path| {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|error| panic!("reading {path}: {error}"));
+                    toml::from_str::<RequestDmaFile>(&text)
+                        .unwrap_or_else(|error| panic!("parsing {path}: {error}"))
+                        .request_dma
+                })
+                .unwrap_or_default();
             let (donor_rom, donor_db, _) = run_discovery_with_tables_and_request_dma(
                 &donor_rom_bytes,
                 None,
@@ -851,7 +943,13 @@ fn main() {
             // looked up by VA containment.
             let mut donor_banks: Vec<(u32, Vec<u8>)> = Vec::new();
             for fact in donor_db.proven_rom_mappings() {
-                let Fact::RomMapping { rom_space, rom_start, rom_end, va_start, .. } = fact
+                let Fact::RomMapping {
+                    rom_space,
+                    rom_start,
+                    rom_end,
+                    va_start,
+                    ..
+                } = fact
                 else {
                     continue;
                 };
@@ -863,8 +961,11 @@ fn main() {
             }
             let mut donor_functions: Vec<(String, u32, u32)> = Vec::new();
             let mut donor_words: Vec<u32> = Vec::new();
-            let push_body = |name: &str, size: u32, bytes: &[u8], words: &mut Vec<u32>,
-                                 functions: &mut Vec<(String, u32, u32)>| {
+            let push_body = |name: &str,
+                             size: u32,
+                             bytes: &[u8],
+                             words: &mut Vec<u32>,
+                             functions: &mut Vec<(String, u32, u32)>| {
                 // Re-home each body at a synthetic VA: its own offset in
                 // the accumulated donor word buffer.
                 let synthetic_va = (words.len() * 4) as u32;
@@ -899,8 +1000,7 @@ fn main() {
                         continue;
                     };
                     let start = (section.rom + delta) as usize;
-                    if let Some(bytes) =
-                        donor_rom.bytes.get(start..start + function.size as usize)
+                    if let Some(bytes) = donor_rom.bytes.get(start..start + function.size as usize)
                     {
                         push_body(
                             &function.name,
@@ -918,11 +1018,8 @@ fn main() {
                 0,
                 fn64_discover::sig_scan::MIN_SIGNATURE_WORDS,
             );
-            let matches = fn64_discover::sig_scan::scan_signatures(
-                &signatures,
-                &target_words,
-                boot_va_start,
-            );
+            let matches =
+                fn64_discover::sig_scan::scan_signatures(&signatures, &target_words, boot_va_start);
             let mut seeded = 0usize;
             for m in &matches {
                 if !roots.contains(&m.va) {
@@ -958,7 +1055,9 @@ fn main() {
                     .bytes
                     .get(at..at + 4)
                     .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
-                    .unwrap_or_else(|| panic!("jump-table {}: entry {index} outside ROM", claim.name));
+                    .unwrap_or_else(|| {
+                        panic!("jump-table {}: entry {index} outside ROM", claim.name)
+                    });
                 assert!(
                     word % 4 == 0 && word >= boot_va_start && word < code_end,
                     "jump-table {}: entry {index} = {word:#x} outside the scanned code window",
@@ -996,11 +1095,8 @@ fn main() {
     // Only these excused entries re-carve geometry; unexcused seeds
     // (script/donor matches) stay soft and still surface as `wrong` if they
     // split a real function — the wrong==0 firewall is unchanged.
-    let authoritative_entries: BTreeSet<u32> = cfg
-        .direct_calls
-        .iter()
-        .map(|(_, target)| *target)
-        .collect();
+    let authoritative_entries: BTreeSet<u32> =
+        cfg.direct_calls.iter().map(|(_, target)| *target).collect();
     let part = partition_with_authoritative_entries(&cfg, &authoritative_entries);
     let overlaps = same_bank_overlaps(&part, &cfg);
     println!(
@@ -1032,8 +1128,7 @@ fn main() {
     // claim for script-ptr seeds.)
     let mut jal_targets: JalTargets = cfg.direct_calls.iter().map(|(_, target)| *target).collect();
     jal_targets.extend(excused.iter().copied());
-    if let Some(file) =
-        load_toml_env::<AdjudicatedEntriesFile>("FN64_DISCOVER_ADJUDICATED_ENTRIES")
+    if let Some(file) = load_toml_env::<AdjudicatedEntriesFile>("FN64_DISCOVER_ADJUDICATED_ENTRIES")
     {
         println!(
             "adjudicated interior entries excused: {}",
@@ -1064,7 +1159,10 @@ fn main() {
             .per_function
             .iter()
             .filter(|(_, grade)| {
-                matches!(grade, fn64_discover::grade_oot_functions::FunctionGrade::Open)
+                matches!(
+                    grade,
+                    fn64_discover::grade_oot_functions::FunctionGrade::Open
+                )
             })
             .map(|(name, _)| name.as_str())
             .collect();
@@ -1102,7 +1200,14 @@ fn main() {
         let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize); // total, exact, coarse+interior, open, wrong
         let mut wrong_examples: Vec<String> = Vec::new();
         for fact in db.proven_rom_mappings() {
-            let Fact::RomMapping { bank, rom_space, rom_start, rom_end, va_start, .. } = fact
+            let Fact::RomMapping {
+                bank,
+                rom_space,
+                rom_start,
+                rom_end,
+                va_start,
+                ..
+            } = fact
             else {
                 continue;
             };
@@ -1113,8 +1218,7 @@ fn main() {
             else {
                 continue;
             };
-            let Some(refs) = fn64_discover::overlay_reloc::parse_zelda_overlay(&image.bytes)
-            else {
+            let Some(refs) = fn64_discover::overlay_reloc::parse_zelda_overlay(&image.bytes) else {
                 skipped_unparsed += 1;
                 non_overlay_banks.push((bank.clone(), *va_start, image.bytes.clone()));
                 all_images.push(image.bytes);
@@ -1128,9 +1232,11 @@ fn main() {
                 let len = image.bytes.len();
                 let section_size =
                     u32::from_be_bytes(image.bytes[len - 4..].try_into().unwrap()) as usize;
-                u32::from_be_bytes(image.bytes[len - section_size..len - section_size + 4]
-                    .try_into()
-                    .unwrap()) as usize
+                u32::from_be_bytes(
+                    image.bytes[len - section_size..len - section_size + 4]
+                        .try_into()
+                        .unwrap(),
+                ) as usize
             };
             let bank_va_start = *va_start;
             let text_end = bank_va_start + text_size as u32;
@@ -1166,8 +1272,7 @@ fn main() {
             let mut bank_roots: Vec<u32> = Vec::new();
             let mut bank_excused: Vec<u32> = Vec::new();
             for &target in &refs.jal_targets {
-                if target >= bank_va_start && target < text_end && !bank_roots.contains(&target)
-                {
+                if target >= bank_va_start && target < text_end && !bank_roots.contains(&target) {
                     bank_roots.push(target);
                     bank_excused.push(target);
                 }
@@ -1183,10 +1288,7 @@ fn main() {
                 // BgHidanHamstep_Draw's final padding on OoT.
                 if offset < text_words.len()
                     && text_words[offset] != 0
-                    && fn64_discover::sig_scan::plausible_function_boundary(
-                        &text_words,
-                        offset,
-                    )
+                    && fn64_discover::sig_scan::plausible_function_boundary(&text_words, offset)
                     && !bank_roots.contains(&pointer)
                 {
                     bank_roots.push(pointer);
@@ -1234,9 +1336,7 @@ fn main() {
                     .get(sorted_roots.partition_point(|root| *root <= site.pc))
                     .copied()
                     .unwrap_or(text_end);
-                let Some(base) =
-                    switch_table_base(&text_words, bank_va_start, site.pc)
-                else {
+                let Some(base) = switch_table_base(&text_words, bank_va_start, site.pc) else {
                     continue;
                 };
                 let Some(base_offset) = base.checked_sub(bank_va_start) else {
@@ -1245,9 +1345,7 @@ fn main() {
                 let start = refs
                     .rodata_words
                     .partition_point(|(offset, _)| *offset < base_offset);
-                if refs.rodata_words.get(start).map(|(offset, _)| *offset)
-                    != Some(base_offset)
-                {
+                if refs.rodata_words.get(start).map(|(offset, _)| *offset) != Some(base_offset) {
                     continue;
                 }
                 let mut targets: Vec<u32> = Vec::new();
@@ -1296,11 +1394,13 @@ fn main() {
                 bank_overlaps.is_empty(),
                 "bank {bank}: same-bank owner overlaps must be zero"
             );
-            let mut bank_jal: JalTargets =
-                bank_cfg.direct_calls.iter().map(|(_, target)| *target).collect();
+            let mut bank_jal: JalTargets = bank_cfg
+                .direct_calls
+                .iter()
+                .map(|(_, target)| *target)
+                .collect();
             bank_jal.extend(bank_excused.iter().copied());
-            let bank_report =
-                grade_functions(&bank_part.owners, &bank_answer, text_end, &bank_jal);
+            let bank_report = grade_functions(&bank_part.owners, &bank_answer, text_end, &bank_jal);
             graded_banks += 1;
             totals.0 += bank_report.total;
             totals.1 += bank_report.matched_exact;
@@ -1313,9 +1413,8 @@ fn main() {
                         owner_root,
                     } = grade
                     {
-                        wrong_examples.push(format!(
-                            "bank {bank}: {function} split by 0x{owner_root:x}"
-                        ));
+                        wrong_examples
+                            .push(format!("bank {bank}: {function} split by 0x{owner_root:x}"));
                     }
                 }
             }
@@ -1371,14 +1470,18 @@ fn main() {
         for (bank, bank_va, image) in &non_overlay_banks {
             let bank_va = *bank_va;
             // Affine answer selection against this bank's image extent.
-            let (bank_rom_start, bank_rom_end) = match db.proven_rom_mappings().into_iter().find_map(|fact| {
-                match fact {
-                    Fact::RomMapping { bank: b, rom_start, rom_end, .. } if b == bank => {
-                        Some((*rom_start, *rom_end))
-                    }
+            let (bank_rom_start, bank_rom_end) = match db
+                .proven_rom_mappings()
+                .into_iter()
+                .find_map(|fact| match fact {
+                    Fact::RomMapping {
+                        bank: b,
+                        rom_start,
+                        rom_end,
+                        ..
+                    } if b == bank => Some((*rom_start, *rom_end)),
                     _ => None,
-                }
-            }) {
+                }) {
                 Some(range) => range,
                 None => continue,
             };
@@ -1392,8 +1495,7 @@ fn main() {
                     continue;
                 }
                 for function in &section.functions {
-                    bank_code_end =
-                        bank_code_end.max(function.vram.saturating_add(function.size));
+                    bank_code_end = bank_code_end.max(function.vram.saturating_add(function.size));
                     bank_answer.push(AnswerFunction {
                         name: function.name.clone(),
                         va_start: function.vram,
@@ -1473,10 +1575,7 @@ fn main() {
                     continue;
                 }
                 if first_word != 0
-                    && fn64_discover::sig_scan::plausible_function_boundary(
-                        &text_words,
-                        offset,
-                    )
+                    && fn64_discover::sig_scan::plausible_function_boundary(&text_words, offset)
                     && !bank_roots.contains(&pointer)
                 {
                     bank_roots.push(pointer);
@@ -1499,8 +1598,11 @@ fn main() {
                 bank_overlaps.is_empty(),
                 "bank {bank}: same-bank owner overlaps must be zero"
             );
-            let mut bank_jal: JalTargets =
-                bank_cfg.direct_calls.iter().map(|(_, target)| *target).collect();
+            let mut bank_jal: JalTargets = bank_cfg
+                .direct_calls
+                .iter()
+                .map(|(_, target)| *target)
+                .collect();
             bank_jal.extend(bank_excused.iter().copied());
             let bank_report =
                 grade_functions(&bank_part.owners, &bank_answer, bank_code_end, &bank_jal);
@@ -1517,7 +1619,10 @@ fn main() {
                     .per_function
                     .iter()
                     .filter(|(_, grade)| {
-                        matches!(grade, fn64_discover::grade_oot_functions::FunctionGrade::Open)
+                        matches!(
+                            grade,
+                            fn64_discover::grade_oot_functions::FunctionGrade::Open
+                        )
                     })
                     .map(|(name, _)| {
                         let va = bank_answer
@@ -1528,7 +1633,11 @@ fn main() {
                         format!("{name}@0x{va:08x}")
                     })
                     .collect();
-                println!("code-seg open [{bank}] ({}): {}", open.len(), open.join(", "));
+                println!(
+                    "code-seg open [{bank}] ({}): {}",
+                    open.len(),
+                    open.join(", ")
+                );
             }
             if bank_report.wrong != 0 {
                 for (function, grade) in &bank_report.per_function {
@@ -1536,9 +1645,8 @@ fn main() {
                         owner_root,
                     } = grade
                     {
-                        code_wrong.push(format!(
-                            "bank {bank}: {function} split by 0x{owner_root:x}"
-                        ));
+                        code_wrong
+                            .push(format!("bank {bank}: {function} split by 0x{owner_root:x}"));
                     }
                 }
             }

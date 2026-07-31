@@ -1,12 +1,16 @@
 //! Compile-and-run gate for bank-qualified arbitrary-PC emission.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-use fn64_recomp_rs::{
+mod support;
+use support::dev_interpreter_rlib;
+
+use fn64_recomp_rs::{BankId, BankWordKind};
+use fn64_recomp_rs_codegen::{
     classify_bank_words, emit_bank_runner, emit_bank_runner_with_host_calls,
-    emit_sparse_bank_runner, BankBlockInput, BankId, BankInput, BankWordCatalog, BankWordKind,
-    SparseBankInput,
+    emit_dense_bank_shard_runner_function, emit_sparse_bank_runner, BankBlockInput, BankInput,
+    BankWordCatalog, DenseBankShardInput, DenseEmitError, SparseBankInput,
 };
 
 const BASE: u32 = 0x8000_1000;
@@ -80,36 +84,22 @@ fn every_naturally_aligned_memory_family_emits_an_address_fault_check() {
 
     assert_eq!(
         emitted
-            .matches("exception: CpuException::AddressErrorLoad")
+            .matches("address_error(FaultSite::straight(expected_bank,")
             .count(),
+        checked_loads.len() + checked_stores.len()
+    );
+    assert_eq!(
+        emitted.matches("DataAccessKind::Load").count(),
         checked_loads.len()
     );
     assert_eq!(
-        emitted
-            .matches("exception: CpuException::AddressErrorStore")
-            .count(),
+        emitted.matches("DataAccessKind::Store").count(),
         checked_stores.len()
     );
     assert_eq!(
         emitted.matches("let effective_address =").count(),
         checked_loads.len() + checked_stores.len()
     );
-}
-
-fn current_rlib(deps: &Path) -> PathBuf {
-    std::fs::read_dir(deps)
-        .expect("read target deps directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
-                })
-        })
-        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-        .expect("fn64_recomp_rs rlib beside integration test")
 }
 
 /// Compile one emitted runner in an isolated process and return its stdout.
@@ -149,7 +139,7 @@ fn main() {{
         .parent()
         .expect("target deps directory")
         .to_path_buf();
-    let rlib = current_rlib(&deps);
+    let rlib = dev_interpreter_rlib(&deps);
     let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--edition=2021")
         .arg(&source_path)
@@ -822,6 +812,68 @@ fn emitted_random_and_tlbwr_use_explicit_instruction_order() {
 }
 
 #[test]
+fn emitted_reserved_words_compile_and_raise_precise_ri() {
+    let words = [
+        0x4c00_0000, // reserved primary opcode 0x13
+        0x1000_0001, // beq $zero,$zero,+1
+        0x4c00_0000, // reserved delay-slot encoding
+        0x0000_0000,
+    ];
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_reserved_bank",
+        bank: BankId::new(0xA6),
+        vram: BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        r#"
+    let mut bytes = vec![];
+    let mut mem = Rdram::new(&mut bytes);
+
+    let mut straight_ctx = RecompContext::new();
+    let straight = run_reserved_bank(
+        ExecutionKey::new(BankId::new(0xA6), GuestPc::new(0x8000_1000)),
+        InstructionBudget::new(4).unwrap(),
+        &mut straight_ctx,
+        &mut mem,
+    );
+    assert_eq!(straight.instructions, 1);
+    let BlockExit::Fault(straight_fault) = straight.exit else { panic!("expected RI fault") };
+    assert!(matches!(straight_fault.kind, CpuFaultKind::Exception {
+        exception: CpuException::ReservedInstruction,
+        epc,
+        branch_delay: false,
+        ..
+    } if epc == GuestPc::new(0x8000_1000)));
+    assert_eq!(straight_fault.enter_exception(&mut straight_ctx), Some(GuestPc::new(0x8000_0180)));
+    assert_eq!((straight_ctx.cop0_cause >> 2) & 0x1f, 10);
+
+    let mut delay_ctx = RecompContext::new();
+    let delay = run_reserved_bank(
+        ExecutionKey::new(BankId::new(0xA6), GuestPc::new(0x8000_1004)),
+        InstructionBudget::new(4).unwrap(),
+        &mut delay_ctx,
+        &mut mem,
+    );
+    assert_eq!(delay.instructions, 2);
+    let BlockExit::Fault(delay_fault) = delay.exit else { panic!("expected delay RI fault") };
+    assert!(matches!(delay_fault.kind, CpuFaultKind::Exception {
+        exception: CpuException::ReservedInstruction,
+        epc,
+        branch_delay: true,
+        ..
+    } if epc == GuestPc::new(0x8000_1004)));
+    assert_eq!(delay_fault.enter_exception(&mut delay_ctx), Some(GuestPc::new(0x8000_0180)));
+    assert_eq!((delay_ctx.cop0_cause >> 2) & 0x1f, 10);
+    assert_ne!(delay_ctx.cop0_cause & (1 << 31), 0);
+    println!("reserved-instruction-ri-ok");
+"#,
+    );
+    assert_eq!(stdout.trim(), "reserved-instruction-ri-ok");
+}
+
+#[test]
 fn emitted_bank_runner_compiles_and_executes_from_arbitrary_pcs() {
     let emitted = emit_bank_runner(&BankInput {
         name: "run_test_bank",
@@ -836,11 +888,12 @@ fn emitted_bank_runner_compiles_and_executes_from_arbitrary_pcs() {
         vram: 0x8000_3000,
         words: &leaf_words,
     });
-    let emitted_leaf_function = fn64_recomp_rs::emit_function(&fn64_recomp_rs::FuncInput {
-        name: "run_leaf_function",
-        vram: 0x8000_3000,
-        words: &leaf_words,
-    });
+    let emitted_leaf_function =
+        fn64_recomp_rs_codegen::emit_function(&fn64_recomp_rs_codegen::FuncInput {
+            name: "run_leaf_function",
+            vram: 0x8000_3000,
+            words: &leaf_words,
+        });
     let host_call_words = [0x0C00_0800, 0x2404_0007, 0x2402_0009];
     let emitted_host_call_bank = emit_bank_runner_with_host_calls(
         &BankInput {
@@ -2070,7 +2123,7 @@ fn main() {{
         .parent()
         .expect("target deps directory")
         .to_path_buf();
-    let rlib = current_rlib(&deps);
+    let rlib = dev_interpreter_rlib(&deps);
     let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--edition=2021")
         .arg(&source_path)
@@ -2101,8 +2154,55 @@ fn main() {{
 }
 
 #[test]
+fn in_bank_jalr_keeps_host_first_call_resolution() {
+    let bank = BankId::new(0xBA11);
+    let words = [
+        0x0320_f809, // jalr $ra,$t9
+        0x2404_0007, // addiu $a0,$zero,7 (delay)
+        0x2405_0009, // resume sentinel
+        0x0000_0000, // admitted in-bank target
+    ];
+    let emitted = emit_bank_runner(&BankInput {
+        name: "run_in_bank_jalr",
+        bank,
+        vram: BASE,
+        words: &words,
+    });
+    let stdout = compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+let mut storage = vec![];
+let mut mem = Rdram::new(&mut storage);
+let mut ctx = RecompContext::new();
+ctx.set_r32(25, {target:#010x}u32 as i32);
+let run = run_in_bank_jalr(
+    ExecutionKey::new(BankId::new({bank_id}), GuestPc::new({BASE:#010x})),
+    InstructionBudget::new(4).unwrap(),
+    &mut ctx,
+    &mut mem,
+);
+assert_eq!(ctx.r_u32(4), 7, "JALR delay slot must execute");
+assert_eq!(ctx.r_u32(31), {resume:#010x});
+assert_eq!(run.instructions, 2);
+assert_eq!(run.exit, BlockExit::ResolveCall {{
+    source_bank: BankId::new({bank_id}),
+    target_pc: GuestPc::new({target:#010x}),
+    resume: ExecutionKey::new(BankId::new({bank_id}), GuestPc::new({resume:#010x})),
+}});
+println!("in-bank-jalr-resolve-call-ok");
+"#,
+            bank_id = bank.get(),
+            target = BASE + 12,
+            resume = BASE + 8,
+        ),
+    );
+    assert_eq!(stdout.trim(), "in-bank-jalr-resolve-call-ok");
+}
+
+#[test]
 fn legacy_function_runner_snapshots_computed_jr_before_delay_slot() {
-    let emitted = fn64_recomp_rs::emit_function(&fn64_recomp_rs::FuncInput {
+    let emitted = fn64_recomp_rs_codegen::emit_function(&fn64_recomp_rs_codegen::FuncInput {
         name: "jr_snapshot",
         vram: BASE,
         words: &[0x0100_0008, 0x2408_1234],
@@ -2136,6 +2236,436 @@ fn bank_ending_inside_a_delay_slot_is_rejected_loudly() {
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap_or("non-string panic");
     assert!(message.contains("omits its delay slot"), "{message}");
+}
+
+#[test]
+fn dense_shard_control_at_owned_end_uses_lookahead() {
+    let bank = BankId::new(0xD001);
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_boundary_control",
+        bank,
+        image_vram_start: BASE,
+        image_vram_end: BASE + 0x20,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 0x20,
+        shard_vram_start: BASE,
+        words: &[0x1000_0002],              // beq zero,zero -> BASE+0xc
+        delay_lookahead: Some(0x2404_0007), // addiu a0,zero,7
+        verify_live_words: true,
+    })
+    .unwrap();
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+let mut storage = vec![0u8; 0x2000];
+let mut mem = Rdram::new(&mut storage);
+mem.store_w(0xffff_ffff_0000_0000 | {BASE:#010x}, 0x1000_0002);
+mem.store_w(0xffff_ffff_0000_0000 | {:#010x}, 0x2404_0007);
+let mut ctx = RecompContext::new();
+let run = run_dense_boundary_control(
+    ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut ctx,
+    &mut mem,
+);
+assert_eq!(run.instructions, 2);
+assert_eq!(ctx.r(4), 7);
+assert_eq!(run.exit, BlockExit::Transfer(ExecutionKey::new(
+    BankId::new({}), GuestPc::new({:#010x}),
+)));
+"#,
+            BASE + 4,
+            bank.get(),
+            bank.get(),
+            BASE + 12,
+        ),
+    );
+}
+
+#[test]
+fn dense_straight_post_steps_use_the_shared_ordered_boundary() {
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_shared_post_step",
+        bank: BankId::new(0xD00A),
+        image_vram_start: BASE,
+        image_vram_end: BASE + 16,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 16,
+        shard_vram_start: BASE,
+        words: &[0, 0, 0, 0],
+        delay_lookahead: None,
+        verify_live_words: false,
+    })
+    .unwrap();
+
+    assert_eq!(
+        emitted
+            .matches("fn64_recomp_rs::post_straight_instruction_exit(")
+            .count(),
+        4,
+        "every ordinary arm must use the shared post-step:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("fn64_recomp_rs::take_executable_write_boundary()"),
+        "generated arms must not reconstruct executable-write priority:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("if executed >= budget.get()"),
+        "generated arms must not reconstruct checkpoint priority:\n{emitted}"
+    );
+    assert_eq!(
+        emitted.matches("BlockExit::ExecutableWrite {").count(),
+        0,
+        "the shared helper owns executable-write exit construction"
+    );
+}
+
+#[test]
+fn dense_shared_post_step_measurably_compacts_one_subrunner() {
+    let words = vec![0u32; 512];
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_compaction_metric",
+        bank: BankId::new(0xD00B),
+        image_vram_start: BASE,
+        image_vram_end: BASE + 2048,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 2048,
+        shard_vram_start: BASE,
+        words: &words,
+        delay_lookahead: None,
+        verify_live_words: false,
+    })
+    .unwrap();
+
+    let mut removed_inline_bytes = 0usize;
+    for index in 0..words.len() {
+        let next = BASE + (index as u32 + 1) * 4;
+        let may_continue_locally = index + 1 < words.len();
+        let compact = format!(
+            "            if let Some(exit) = fn64_recomp_rs::post_straight_instruction_exit(expected_bank, GuestPc::new({next:#010X}), executed, budget, {may_continue_locally}) {{ finish!(exit); }}\n"
+        );
+        let mut inline = format!(
+            "            if fn64_recomp_rs::take_executable_write_boundary() {{\n                finish!(BlockExit::ExecutableWrite {{ source_bank: expected_bank, resume: ExecutionKey::new(expected_bank, GuestPc::new({next:#010X})) }});\n            }}\n"
+        );
+        if may_continue_locally {
+            inline.push_str(&format!(
+                "            if executed >= budget.get() {{\n                finish!(BlockExit::Checkpoint(ExecutionKey::new(expected_bank, GuestPc::new({next:#010X}))));\n            }}\n"
+            ));
+        }
+        assert!(
+            emitted.contains(&compact),
+            "missing compact post-step at {next:#010X}"
+        );
+        removed_inline_bytes += inline.len() - compact.len();
+    }
+    let inline_equivalent_bytes = emitted.len() + removed_inline_bytes;
+    eprintln!(
+        "dense_source_compaction current_bytes={} inline_equivalent_bytes={} saved_bytes={} saved_percent={:.1}",
+        emitted.len(),
+        inline_equivalent_bytes,
+        removed_inline_bytes,
+        100.0 * removed_inline_bytes as f64 / inline_equivalent_bytes as f64,
+    );
+    assert!(
+        emitted.len() * 4 <= inline_equivalent_bytes * 3,
+        "shared post-step must remove at least 25% of this ordinary-instruction source"
+    );
+}
+
+#[test]
+fn dense_live_word_verification_is_table_backed_per_subrunner() {
+    let words = vec![0u32; 512];
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_table_backed_verification",
+        bank: BankId::new(0xD00C),
+        image_vram_start: BASE,
+        image_vram_end: BASE + 2048,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 2048,
+        shard_vram_start: BASE,
+        words: &words,
+        delay_lookahead: None,
+        verify_live_words: true,
+    })
+    .unwrap();
+
+    assert_eq!(
+        emitted
+            .matches("fn64_recomp_rs::verify_precompiled_instruction_word(")
+            .count(),
+        1,
+        "one shared verifier must replace per-arm verification calls"
+    );
+    assert!(emitted.contains("const EXPECTED_WORDS: &[u32]"));
+    assert!(
+        emitted.contains("let expected_word = EXPECTED_WORDS[((pc - 0x80001000) / 4) as usize];")
+    );
+    assert_eq!(
+        emitted
+            .matches("verify_live_word!(expected_bank, mem, pc, expected_word, pc);")
+            .count(),
+        1
+    );
+    assert!(
+        emitted.len() < 300_000,
+        "a 512-word ordinary subrunner must remain below the measured compact-source ceiling: {} bytes",
+        emitted.len()
+    );
+}
+
+#[test]
+fn dense_memory_fault_lowering_stays_shared_and_cold() {
+    let words = vec![0x8c82_0000u32; 512]; // lw $v0,0($a0)
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_shared_memory_faults",
+        bank: BankId::new(0xD00D),
+        image_vram_start: BASE,
+        image_vram_end: BASE + 2048,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 2048,
+        shard_vram_start: BASE,
+        words: &words,
+        delay_lookahead: None,
+        verify_live_words: true,
+    })
+    .unwrap();
+
+    assert_eq!(
+        emitted.matches("finish!(address_error(").count(),
+        words.len()
+    );
+    assert_eq!(
+        emitted.matches("finish_data_access_error(").count(),
+        words.len()
+    );
+    assert!(!emitted.contains("CpuFaultKind::Exception {"));
+    assert!(!emitted.contains("let __architectural"));
+    assert!(!emitted.contains(".is_architectural_exception()"));
+    assert!(!emitted.contains(".into_cpu_fault_kind("));
+    eprintln!("dense_shared_memory_fault_source_bytes={}", emitted.len());
+    assert!(
+        emitted.len() < 600_000,
+        "a 512-word load runner exceeded the shared-fault source ceiling: {} bytes",
+        emitted.len()
+    );
+}
+
+#[test]
+fn dense_direct_entry_on_control_shaped_delay_remains_control() {
+    let bank = BankId::new(0xD002);
+    let target = BASE + 0x18;
+    let jump = 0x0800_0000 | ((target & 0x0fff_ffff) >> 2);
+    let words = [0x1000_0002, jump, 0x2405_0009];
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_control_delay_entry",
+        bank,
+        image_vram_start: BASE,
+        image_vram_end: BASE + 0x20,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 0x20,
+        shard_vram_start: BASE,
+        words: &words,
+        delay_lookahead: None,
+        verify_live_words: true,
+    })
+    .unwrap();
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+let mut storage = vec![0u8; 0x2000];
+let mut mem = Rdram::new(&mut storage);
+mem.store_w(0xffff_ffff_0000_0000 | {BASE:#010x}, 0x1000_0002);
+mem.store_w(0xffff_ffff_0000_0000 | {:#010x}, {jump:#010x});
+mem.store_w(0xffff_ffff_0000_0000 | {:#010x}, 0x2405_0009);
+let mut ctx = RecompContext::new();
+let run = run_dense_control_delay_entry(
+    ExecutionKey::new(BankId::new({}), GuestPc::new({:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut ctx,
+    &mut mem,
+);
+assert_eq!(run.instructions, 2);
+assert_eq!(ctx.r(5), 9);
+assert_eq!(run.exit, BlockExit::Transfer(ExecutionKey::new(
+    BankId::new({}), GuestPc::new({target:#010x}),
+)));
+"#,
+            BASE + 4,
+            BASE + 8,
+            bank.get(),
+            BASE + 4,
+            bank.get(),
+        ),
+    );
+}
+
+#[test]
+fn dense_cross_artifact_fallthrough_uses_active_generation_resolver() {
+    let bank = BankId::new(0xD003);
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_fallthrough",
+        bank,
+        image_vram_start: BASE,
+        image_vram_end: BASE + 8,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 4,
+        shard_vram_start: BASE,
+        words: &[0x2402_0001],
+        delay_lookahead: None,
+        verify_live_words: true,
+    })
+    .unwrap();
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+let mut storage = vec![0u8; 0x2000];
+let mut mem = Rdram::new(&mut storage);
+mem.store_w(0xffff_ffff_0000_0000 | {BASE:#010x}, 0x2402_0001);
+let mut ctx = RecompContext::new();
+let run = run_dense_fallthrough(
+    ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x})),
+    InstructionBudget::new(8).unwrap(),
+    &mut ctx,
+    &mut mem,
+);
+assert_eq!(run.instructions, 1);
+assert_eq!(ctx.r(2), 1);
+assert_eq!(run.exit, BlockExit::ResolveTransfer {{
+    source_bank: BankId::new({}),
+    target_pc: GuestPc::new({:#010x}),
+}});
+"#,
+            bank.get(),
+            bank.get(),
+            BASE + 4,
+        ),
+    );
+}
+
+#[test]
+fn dense_fetch_identity_ignores_neighbor_data_and_rejects_changed_instruction() {
+    let bank = BankId::new(0xD004);
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_exact_fetch",
+        bank,
+        image_vram_start: BASE,
+        image_vram_end: BASE + 4,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 4,
+        shard_vram_start: BASE,
+        words: &[0x2402_0001],
+        delay_lookahead: None,
+        verify_live_words: true,
+    })
+    .unwrap();
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+let mut storage = vec![0u8; 0x2000];
+let mut mem = Rdram::new(&mut storage);
+mem.store_w(0xffff_ffff_0000_0000 | {:#010x}, 0xdead_beef);
+mem.store_w(0xffff_ffff_0000_0000 | {BASE:#010x}, 0x2402_0001);
+mem.store_w(0xffff_ffff_0000_0000 | {:#010x}, 0xcafe_babe);
+let mut ctx = RecompContext::new();
+let entry = ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x}));
+let run = run_dense_exact_fetch(entry, InstructionBudget::new(2).unwrap(), &mut ctx, &mut mem);
+assert_eq!(run.instructions, 1);
+assert_eq!(ctx.r(2), 1);
+
+mem.store_w(0xffff_ffff_0000_0000 | {BASE:#010x}, 0x2402_0002);
+let run = run_dense_exact_fetch(entry, InstructionBudget::new(2).unwrap(), &mut ctx, &mut mem);
+assert_eq!(run.instructions, 0);
+match run.exit {{
+    BlockExit::ImageChanged {{ at, miss }} => {{
+        assert_eq!(at, entry);
+        assert_eq!(miss.va_start, GuestPc::new({BASE:#010x}));
+        assert_eq!(miss.byte_len, 4);
+    }}
+    other => panic!("changed instruction did not fail closed: {{other:?}}"),
+}}
+"#,
+            BASE - 4,
+            BASE + 4,
+            bank.get(),
+        ),
+    );
+}
+
+#[test]
+fn dense_branch_likely_verifies_delay_only_when_taken() {
+    let bank = BankId::new(0xD005);
+    let emitted = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_likely_fetch",
+        bank,
+        image_vram_start: BASE,
+        image_vram_end: BASE + 12,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 12,
+        shard_vram_start: BASE,
+        // beql zero,v0,+1; addiu a0,zero,7; nop
+        words: &[0x5002_0001, 0x2404_0007, 0],
+        delay_lookahead: None,
+        verify_live_words: true,
+    })
+    .unwrap();
+    compile_and_run(
+        &emitted,
+        &format!(
+            r#"
+let mut storage = vec![0u8; 0x2000];
+let mut mem = Rdram::new(&mut storage);
+mem.store_w(0xffff_ffff_0000_0000 | {BASE:#010x}, 0x5002_0001);
+mem.store_w(0xffff_ffff_0000_0000 | {:#010x}, 0x2404_0008);
+mem.store_w(0xffff_ffff_0000_0000 | {:#010x}, 0);
+let entry = ExecutionKey::new(BankId::new({}), GuestPc::new({BASE:#010x}));
+let mut ctx = RecompContext::new();
+ctx.set_r32(2, 1);
+let run = run_dense_likely_fetch(entry, InstructionBudget::new(2).unwrap(), &mut ctx, &mut mem);
+assert_eq!(run.instructions, 2);
+assert_eq!(ctx.r(4), 0);
+assert_eq!(run.exit, BlockExit::Transfer(ExecutionKey::new(
+    BankId::new({}), GuestPc::new({:#010x}),
+)));
+
+ctx.set_r32(2, 0);
+let run = run_dense_likely_fetch(entry, InstructionBudget::new(2).unwrap(), &mut ctx, &mut mem);
+assert_eq!(run.instructions, 0);
+assert!(matches!(run.exit, BlockExit::ImageChanged {{ at, miss }}
+    if at == entry && miss.va_start == GuestPc::new({:#010x})));
+"#,
+            BASE + 4,
+            BASE + 8,
+            bank.get(),
+            bank.get(),
+            BASE + 8,
+            BASE + 4,
+        ),
+    );
+}
+
+#[test]
+fn dense_final_control_without_delay_is_typed_error() {
+    let error = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+        name: "run_dense_missing_delay",
+        bank: BankId::new(0xD006),
+        image_vram_start: BASE,
+        image_vram_end: BASE + 4,
+        artifact_vram_start: BASE,
+        artifact_vram_end: BASE + 4,
+        shard_vram_start: BASE,
+        words: &[0x03e0_0008],
+        delay_lookahead: None,
+        verify_live_words: true,
+    })
+    .unwrap_err();
+    assert_eq!(
+        error,
+        DenseEmitError::MissingArchitecturalDelayWord { pc: BASE }
+    );
 }
 
 /// A target on an earlier control transfer's delay slot executes that slot as
