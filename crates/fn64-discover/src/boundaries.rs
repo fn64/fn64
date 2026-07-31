@@ -234,6 +234,7 @@ fn roots_for(facts: &FactDb, mapping: &BankMapping, boundary_only: bool) -> Vec<
                     | FunctionEntryEvidence::ResolvedJalr { .. }
                     | FunctionEntryEvidence::ExhaustiveIndirectCall { .. }
                     | FunctionEntryEvidence::TableEntry { .. }
+                    | FunctionEntryEvidence::HandlerTablePointer { .. }
             )
         {
             continue;

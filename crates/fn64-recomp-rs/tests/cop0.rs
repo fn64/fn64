@@ -34,9 +34,12 @@
 //! Decoder and structural emitter tests keep that boundary explicit.
 
 use fn64_recomp_rs::{
-    decode, emit_bank_runner, emit_function, emit_sparse_bank_runner, run_bank, BankBlockInput,
-    BankId, BankInput, BlockExit, CodeBank, CodeCatalog, ExecutionKey, FuncInput, GuestPc,
-    Instruction, InstructionBudget, Rdram, RecompContext, SparseBankInput,
+    decode, run_bank, BankId, BlockExit, CodeBank, CodeCatalog, ExecutionKey, GuestPc, Instruction,
+    InstructionBudget, Rdram, RecompContext,
+};
+use fn64_recomp_rs_codegen::{
+    emit_bank_runner, emit_function, emit_sparse_bank_runner, BankBlockInput, BankInput, FuncInput,
+    SparseBankInput,
 };
 
 /// Real ROM bytes of `osGetCount` (big-endian words).
@@ -145,6 +148,28 @@ fn os_get_count_matches_oracle() {
              oracle {expected:#018X}"
         );
     }
+}
+
+#[test]
+fn arbitrary_pc_count_read_includes_interior_retired_delta() {
+    let emitted = emit_bank_runner(&BankInput {
+        name: "count_after_work",
+        bank: BankId::new(1),
+        vram: 0x8000_1000,
+        words: &[
+            0x2442_0001, // addiu $v0,$v0,1
+            0x2442_0001, // addiu $v0,$v0,1
+            0x4003_4800, // mfc0 $v1,Count
+        ],
+    });
+    assert!(
+        emitted.contains("ctx.set_r32(3, ctx.read_cop0_count_interior(executed) as i32);"),
+        "arbitrary-PC Count read must include instructions retired since entry:\n{emitted}"
+    );
+    assert!(
+        !emitted.contains("ctx.set_r32(3, ctx.cop0_count as i32);"),
+        "arbitrary-PC Count read must not reuse the stale entry value:\n{emitted}"
+    );
 }
 
 /// MTC0 to Compare (reg 11) round-trips through the typed context — the
@@ -325,7 +350,7 @@ fn cop0_branch_authority_follows_indivisible_pair_budget_admission() {
 
     for (lane, emitted) in [("contiguous", contiguous), ("sparse", sparse)] {
         let checkpoint = emitted
-            .find("if executed != 0 && executed + 2 > budget.get()")
+            .find("if !budget.can_fit(executed, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)")
             .expect("BC0 pair budget checkpoint");
         let authority = emitted
             .find("if !ctx.cop0_usable()")

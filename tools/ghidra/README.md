@@ -167,10 +167,9 @@ are review artifacts, not production-ingest authority.
 
 On 2026-07-29 the approved artifact completed ten consecutive guarded Banjo
 first-contact runs with identical install/runtime identities and receipt
-digests. The live loader was `ghidra.GhidraClassLoader` loading JAR
-`edf27a11820ccde490014dad6c2d26b5c4b596161717d0b1afcd713ff004da76`;
-the loader class digest was
-`ddaea232cb37d3922f009fbccdc00ada711ab9b75fe6557ae784893797221997`.
+digests. The live loader was `ghidra.GhidraClassLoader`; its private JAR and
+class identities are recorded by the local receipts, not retained or rechecked
+by repository tests.
 
 Both N64LoaderWV scripts bound the process tree to a 1 GiB JVM/build heap, a
 2 GiB RSS ceiling, at least 40 percent free memory, and 180 seconds wall time;
@@ -247,6 +246,12 @@ decoded site without pretending Ghidra proved it targetless. Ordinary
 the Rust adapter rejects unsorted, duplicate, unaligned, wrong-bank, or
 pre-v3 computed-flow claims.
 
+The exporter also has an opt-in raw-word audit mode for bytes that Ghidra left
+undefined: add `-Dfn64.rawIndirectCandidates=true` to the isolated JVM options.
+This mode can recover omitted register-indirect encodings, but it deliberately
+emits broad candidate noise and is never enabled by the production snapshot
+runner or treated as ownership evidence.
+
 Build the strict gate, then run the handwritten positive/negative fixture:
 
 ```sh
@@ -258,8 +263,8 @@ tools/ghidra/run-computed-flow-conformance.sh
 
 The fixture contains constant `jr`/`jalr`, a three-target switch, an
 unresolved `jr $a0`, and ordinary returns. Ten consecutive guarded Ghidra
-12.1.2 runs on 2026-07-29 produced the same path-free receipt SHA-256
-`0e2ab61da840bbe6609a1ab09642b323bb5cae33ec2b87b119f9857bddefb5bb`.
+12.1.2 runs on 2026-07-29 produced the same path-free receipt identity. The
+private receipt is not retained or rechecked by repository tests.
 Ghidra reports terminal constant `jr` thunks as calls, so `ghidra_via_call`
 is provider semantics rather than ISA authority.
 
@@ -342,6 +347,12 @@ discovery-snapshot lineage from the schema-v2 `ProgramSnapshotV1`, applies
 bounded intake and aggregate-candidate limits, validates the frozen sidecar,
 and publishes without overwriting an existing output. The loader first-contact
 workflow does not produce this request; use the snapshot-bank path below.
+
+If a function entry lies in the selected bank but its Ghidra body crosses the
+bank boundary, the exporter retains the entry candidate, omits the invalid
+single-bank extent, and records a `cross_bank_function_body:<pc>` warning in the
+summary. Multi-bank composition must resolve that warning before an extent can
+be promoted.
 
 ### Snapshot-bank runner
 
@@ -475,3 +486,8 @@ process-tree peaks stayed below 500 MiB in the preceding smoke run; every
 series process remained subject to the 2 GiB/free-memory/time kill policy.
 These hashes do not certify the schema-v2 discontiguous-body exporter; its
 production retry and conformance series must record new evidence.
+`Fn64ExportCandidates.java` keeps its historical function-boundary output by
+default. Setting `FN64_GHIDRA_EXECUTABLE_RANGES=1` additionally emits
+candidate-only `executable_range` claims for execute-permission memory blocks,
+clipped to the requested bank interval. These ranges are evidence for image
+discovery, not proof that every byte executes.

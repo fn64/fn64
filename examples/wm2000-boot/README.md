@@ -688,7 +688,7 @@ reads the payload as a round **0x8000 bytes from device offset 0x20**
 of a 256 Kbit chip.
 
 **The evidenced geometry is 256 Kbit (0x8000 bytes), not 768 Kbit.**
-Three independent signals agree:
+Two independent signals agree:
 
 1. **The game's own save-region table** (13 entries of
    `{u16 offset, u16 stride, u16 size, u16 pad}` at `0x8010625C`,
@@ -701,10 +701,6 @@ Three independent signals agree:
    write EVER crosses 0x8000; only the boot read's round 0x8000 does.
 2. **mupen64plus.ini**: all WM2000 regions (U/E/J) are
    `SaveType=SRAM` -- the flat 32 KiB device.
-3. **The beta-playable reference port** (jessetbh
-   WWFWrestleMania2000Recomp, `src/main/main.cpp`) configures
-   `recomp::SaveType::Sram`, a 32 KB buffer.
-
 **Fix (hardware address decode, not a bigger device):** a discrete
 256 Kbit SRAM part only decodes A0..A14, so the PI byte address
 aliases modulo the power-of-two device size -- the read's last 0x20

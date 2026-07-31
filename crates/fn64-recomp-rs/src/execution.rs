@@ -9,16 +9,118 @@
 //! [`CodeCatalog`] resolves it without consulting a function symbol table.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "dev-interpreter")]
+use crate::fetch::{admit_mapped_unit, run_admitted_mapped_unit};
 use crate::fetch::{
-    admit_mapped_unit, run_admitted_mapped_unit, MappedAotBlock, MappedAotEvidenceSnapshot,
-    PhysicalCodeBank, PhysicalCodeBankEvidenceSnapshot, PhysicalCodeCatalog, PhysicalCodeError,
+    MappedAotBlock, MappedAotEvidenceSnapshot, PhysicalCodeBank, PhysicalCodeBankEvidenceSnapshot,
+    PhysicalCodeCatalog, PhysicalCodeError,
 };
-use crate::runtime::{Rdram, RecompContext};
+use crate::generation::{BackedPrecompiledGenerationCatalogV1, GenerationCatalogError};
+use crate::runtime::{HostFunctionCatalogV1, Rdram, RecompContext};
+use crate::{static_execution_build_receipt, StaticExecutionBuildReceipt};
+
+/// Decoder-level classification for one aligned bank word.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BankWordKind {
+    Straight,
+    ControlTransfer,
+    Unknown,
+}
+
+pub const CATALOG_RESOLVER_POLICY_NAME_V1: &str = "fn64_dense_aot_catalog_resolver_v1";
+
+/// Every architectural exception destination selected by the arbitrary-PC
+/// lane. Cache-error entry is absent because this CPU model cannot produce it.
+/// The resolver policy evidence and the live exception selectors below share
+/// this one implementation-owned denominator.
+pub const CATALOG_RESOLVER_EXCEPTION_VECTORS_V1: [u32; 6] = [
+    0x8000_0000,
+    0x8000_0080,
+    0x8000_0180,
+    0xbfc0_0200,
+    0xbfc0_0280,
+    0xbfc0_0380,
+];
+
+/// Implementation-issued evidence for the callback-free catalog resolver.
+///
+/// Private fields prevent a caller from promoting booleans into resolver
+/// authority. The sole constructor below is co-located with the admission,
+/// fault, return-boundary, and exception-vector implementation it describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogResolverPolicyEvidenceV1 {
+    policy: &'static str,
+    exception_vectors: [u32; 6],
+    aligned_pc_admission: bool,
+    exact_active_owner_resolution: bool,
+    explicit_thread_return_boundary: bool,
+    misaligned_target_fault: bool,
+    unmapped_or_ambiguous_target_fault: bool,
+    traps_enter_shared_resolver: bool,
+    build_receipt: StaticExecutionBuildReceipt,
+}
+
+impl CatalogResolverPolicyEvidenceV1 {
+    pub const fn policy(&self) -> &'static str {
+        self.policy
+    }
+
+    pub const fn exception_vectors(&self) -> &[u32; 6] {
+        &self.exception_vectors
+    }
+
+    pub const fn aligned_pc_admission(&self) -> bool {
+        self.aligned_pc_admission
+    }
+
+    pub const fn exact_active_owner_resolution(&self) -> bool {
+        self.exact_active_owner_resolution
+    }
+
+    pub const fn explicit_thread_return_boundary(&self) -> bool {
+        self.explicit_thread_return_boundary
+    }
+
+    pub const fn misaligned_target_fault(&self) -> bool {
+        self.misaligned_target_fault
+    }
+
+    pub const fn unmapped_or_ambiguous_target_fault(&self) -> bool {
+        self.unmapped_or_ambiguous_target_fault
+    }
+
+    pub const fn traps_enter_shared_resolver(&self) -> bool {
+        self.traps_enter_shared_resolver
+    }
+
+    pub const fn build_receipt(&self) -> StaticExecutionBuildReceipt {
+        self.build_receipt
+    }
+}
+
+/// Issue resolver-policy evidence from the implementation that owns the
+/// canonical catalog semantics. This describes the linked recompiler artifact;
+/// it does not claim that any particular owner/host catalog is total.
+pub const fn catalog_resolver_policy_evidence_v1() -> CatalogResolverPolicyEvidenceV1 {
+    CatalogResolverPolicyEvidenceV1 {
+        policy: CATALOG_RESOLVER_POLICY_NAME_V1,
+        exception_vectors: CATALOG_RESOLVER_EXCEPTION_VECTORS_V1,
+        aligned_pc_admission: true,
+        exact_active_owner_resolution: true,
+        explicit_thread_return_boundary: true,
+        misaligned_target_fault: true,
+        unmapped_or_ambiguous_target_fault: true,
+        traps_enter_shared_resolver: true,
+        build_receipt: static_execution_build_receipt(),
+    }
+}
 
 /// Stable identity of one admitted code image.
 ///
@@ -42,6 +144,101 @@ impl fmt::Display for BankId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "bank:{:016X}", self.0)
     }
+}
+
+/// A fetched executable range did not match the precompiled generation the
+/// offline pack admitted. Production callers trap on this value; they never
+/// translate the newly observed bytes or enter the development interpreter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AotMiss {
+    pub expected_bank: BankId,
+    pub va_start: GuestPc,
+    pub byte_len: u32,
+    pub expected_sha256: [u8; 32],
+    pub actual_sha256: [u8; 32],
+}
+
+impl fmt::Display for AotMiss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "AotMiss for {} range {}..{:#010X}: expected {:x}, observed {:x}",
+            self.expected_bank,
+            self.va_start,
+            self.va_start.get().saturating_add(self.byte_len),
+            Sha256Display(self.expected_sha256),
+            Sha256Display(self.actual_sha256),
+        )
+    }
+}
+
+struct Sha256Display([u8; 32]);
+
+impl fmt::LowerHex for Sha256Display {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Hash one completed live image at its fetch boundary and admit only the
+/// exact precompiled generation. This performs no translation and has no
+/// fallback path.
+pub fn verify_precompiled_image(
+    expected_bank: BankId,
+    va_start: GuestPc,
+    byte_len: u32,
+    expected_sha256: [u8; 32],
+    mem: &Rdram<'_>,
+) -> Result<(), AotMiss> {
+    assert!(byte_len > 0 && byte_len.is_multiple_of(4));
+    va_start
+        .get()
+        .checked_add(byte_len)
+        .expect("precompiled executable image range overflow");
+    let canonical_start = 0xffff_ffff_0000_0000u64 | u64::from(va_start.get());
+    let bytes = (0..byte_len)
+        .map(|offset| mem.load_bu(canonical_start + u64::from(offset)))
+        .collect::<Vec<_>>();
+    let actual_sha256: [u8; 32] = Sha256::digest(bytes).into();
+    if actual_sha256 == expected_sha256 {
+        Ok(())
+    } else {
+        Err(AotMiss {
+            expected_bank,
+            va_start,
+            byte_len,
+            expected_sha256,
+            actual_sha256,
+        })
+    }
+}
+
+/// Verify the exact instruction word about to execute from an immutable AOT
+/// artifact. Neighboring mutable data is deliberately outside this identity:
+/// a replacement is detected at the first changed instruction fetch, before
+/// any stale instruction effect occurs.
+pub fn verify_precompiled_instruction_word(
+    expected_bank: BankId,
+    pc: GuestPc,
+    expected_word: u32,
+    mem: &Rdram<'_>,
+) -> Result<(), AotMiss> {
+    assert!(pc.is_instruction_aligned());
+    let address = 0xffff_ffff_0000_0000u64 | u64::from(pc.get());
+    let actual_word = mem.load_w(address) as u32;
+    if actual_word == expected_word {
+        return Ok(());
+    }
+    Err(AotMiss {
+        expected_bank,
+        va_start: pc,
+        byte_len: 4,
+        expected_sha256: Sha256::digest(expected_word.to_be_bytes()).into(),
+        actual_sha256: Sha256::digest(actual_word.to_be_bytes()).into(),
+    })
 }
 
 /// A guest virtual program counter.
@@ -132,6 +329,10 @@ pub enum CpuFaultKind {
         second_candidate: BankId,
         candidate_count: u32,
     },
+    /// The target belongs to the closed precompiled generation inventory, but
+    /// no digest-selected generation currently owns it. The outer canonical
+    /// owner must activate from explicit physical backing before retrying.
+    NoActiveGeneration,
     /// VA translation succeeded, but that physical word was not admitted in
     /// the selected immutable generation.
     UnmappedPhysicalInstruction {
@@ -145,6 +346,10 @@ pub enum CpuFaultKind {
         expected: InstructionWordIdentity,
         actual: InstructionWordIdentity,
     },
+    /// A physical generation was admitted without a precompiled callable for
+    /// the attempted entry. Production builds cannot interpret or translate
+    /// this destination at runtime.
+    MissingAotEntry,
     /// A guest data access whose effective address is outside the RDRAM bytes
     /// owned by the executing host. This remains distinct from architectural
     /// AdEL/AdES: the latter describes alignment, while this value names the
@@ -185,6 +390,7 @@ pub enum CpuException {
     CoprocessorUnusable,
     Syscall,
     Breakpoint,
+    ReservedInstruction,
     Trap,
     IntegerOverflow,
     /// An enabled COP1 (FPU) IEEE exception. The VR4300 raises ExcCode 15 (FPE)
@@ -259,9 +465,9 @@ pub fn enter_pending_interrupt(
     ctx.cop0_cause &= !(CAUSE_BD | CAUSE_EXCCODE_MASK);
     ctx.cop0_status |= STATUS_EXL;
     Some(GuestPc::new(if ctx.cop0_status & STATUS_BEV != 0 {
-        0xBFC0_0380
+        CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[5]
     } else {
-        0x8000_0180
+        CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[2]
     }))
 }
 
@@ -294,6 +500,11 @@ impl fmt::Display for CpuFault {
                 "ambiguous execution PC at {}; {candidate_count} admitted banks match, beginning with {first_candidate} and {second_candidate}",
                 self.at
             ),
+            CpuFaultKind::NoActiveGeneration => write!(
+                f,
+                "precompiled execution PC at {} requires digest activation",
+                self.at
+            ),
             CpuFaultKind::UnmappedPhysicalInstruction { physical_address } => write!(
                 f,
                 "physical instruction word {physical_address:#010X} is not admitted at {}",
@@ -308,6 +519,9 @@ impl fmt::Display for CpuFault {
                 actual.bank,
                 actual.physical_address
             ),
+            CpuFaultKind::MissingAotEntry => {
+                write!(f, "AotMiss: no precompiled entry exists at {}", self.at)
+            }
             CpuFaultKind::MemoryFault { addr } => write!(
                 f,
                 "guest memory access outside backed RDRAM at {}; effective address {addr:#018X}",
@@ -347,6 +561,7 @@ impl CpuException {
             Self::AddressErrorStore => 5,
             Self::Syscall => 8,
             Self::Breakpoint => 9,
+            Self::ReservedInstruction => 10,
             Self::CoprocessorUnusable => 11,
             Self::IntegerOverflow => 12,
             Self::Trap => 13,
@@ -464,18 +679,18 @@ impl CpuFault {
         let extended_refill_vector = exception.is_xtlb_refill() && !was_exl;
         Some(GuestPc::new(if ctx.cop0_status & STATUS_BEV != 0 {
             if extended_refill_vector {
-                0xBFC0_0280
+                CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[4]
             } else if refill_vector {
-                0xBFC0_0200
+                CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[3]
             } else {
-                0xBFC0_0380
+                CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[5]
             }
         } else if extended_refill_vector {
-            0x8000_0080
+            CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[1]
         } else if refill_vector {
-            0x8000_0000
+            CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[0]
         } else {
-            0x8000_0180
+            CATALOG_RESOLVER_EXCEPTION_VECTORS_V1[2]
         }))
     }
 }
@@ -523,6 +738,14 @@ pub enum BlockExit {
     /// but its handler may not execute until the replacement generation is
     /// visible.
     ExecutableWriteFault(CpuFault),
+    /// Live bytes at an attempted fetch match neither the runner's immutable
+    /// generation nor any state the runner may execute. The outer mapping
+    /// owner must select a precompiled generation by `miss.actual_sha256`,
+    /// atomically activate it, and retry `at`.
+    ImageChanged {
+        at: ExecutionKey,
+        miss: AotMiss,
+    },
     Checkpoint(ExecutionKey),
     Yield(ExecutionKey),
     /// The guest thread entry returned through its configured sentinel. This
@@ -574,14 +797,48 @@ pub fn finalize_executable_write_exit(source_bank: BankId, exit: BlockExit) -> B
     }
 }
 
+/// Select the host boundary, if any, after one ordinary instruction retires.
+///
+/// Generated arbitrary-PC runners call this shared post-step instead of
+/// rebuilding the same executable-write and budget exits in every dispatch
+/// arm. An executable write wins over a coincident budget checkpoint: the
+/// active mapping owner must publish the replacement generation before the
+/// continuation can be selected again. A runner that has reached its local
+/// artifact edge still drains an executable-write request, but leaves its
+/// already-proven cross-artifact transfer to the generated arm.
+#[inline(never)]
+pub fn post_straight_instruction_exit(
+    source_bank: BankId,
+    next_pc: GuestPc,
+    executed: u32,
+    budget: InstructionBudget,
+    may_continue_locally: bool,
+) -> Option<BlockExit> {
+    let resume = ExecutionKey::new(source_bank, next_pc);
+    if crate::runtime::take_executable_write_boundary() {
+        return Some(BlockExit::ExecutableWrite {
+            source_bank,
+            resume,
+        });
+    }
+    if may_continue_locally && executed >= budget.get() {
+        return Some(BlockExit::Checkpoint(resume));
+    }
+    None
+}
+
 /// Maximum number of ordinary instructions a runner may execute before it
-/// returns a deterministic checkpoint. Two is the minimum because a control
-/// transfer and its delay slot are one indivisible dispatch unit.
+/// returns a deterministic checkpoint.
+///
+/// A single straight instruction is a valid turn. A control transfer and its
+/// delay slot still require [`Self::CONTROL_TRANSFER_INSTRUCTIONS`] together;
+/// runners checkpoint before that indivisible unit when it does not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InstructionBudget(u32);
 
 impl InstructionBudget {
-    pub const MIN: u32 = 2;
+    pub const MIN: u32 = 1;
+    pub const CONTROL_TRANSFER_INSTRUCTIONS: u32 = 2;
 
     pub const fn new(value: u32) -> Option<Self> {
         if value >= Self::MIN {
@@ -593,6 +850,12 @@ impl InstructionBudget {
 
     pub const fn get(self) -> u32 {
         self.0
+    }
+
+    /// Whether an indivisible unit can retire after `executed` instructions
+    /// without exceeding this turn's total budget.
+    pub const fn can_fit(self, executed: u32, unit_instructions: u32) -> bool {
+        unit_instructions <= self.0.saturating_sub(executed)
     }
 }
 
@@ -737,12 +1000,22 @@ pub struct DispatchRun {
     pub blocks: u32,
 }
 
-/// Violation of the generated/dynamic runner contract.
+/// A typed reason dispatch cannot complete the requested turn.
 ///
-/// These are host translation defects, not guest CPU exceptions, so they are
-/// kept distinct from [`CpuFault`].
+/// An indivisible-unit error reports a caller budget that cannot admit the
+/// next architectural unit. The remaining variants are generated/dynamic
+/// runner contract defects. None are guest CPU exceptions, so they remain
+/// distinct from [`CpuFault`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DispatchError {
+    /// The instruction at `at` begins an indivisible unit that cannot fit in
+    /// the complete remaining dispatch budget. No instruction in the unit
+    /// retired.
+    IndivisibleUnitExceedsBudget {
+        at: ExecutionKey,
+        budget: InstructionBudget,
+        required: u32,
+    },
     ContinuingExitWithoutProgress {
         at: ExecutionKey,
         exit: BlockExit,
@@ -759,6 +1032,15 @@ pub enum DispatchError {
 impl fmt::Display for DispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Self::IndivisibleUnitExceedsBudget {
+                at,
+                budget,
+                required,
+            } => write!(
+                f,
+                "indivisible instruction unit at {at} requires {required} instructions but only {} remain",
+                budget.get()
+            ),
             Self::ContinuingExitWithoutProgress { at, exit } => {
                 write!(f, "block runner made no progress at {at}: {exit:?}")
             }
@@ -778,11 +1060,12 @@ impl std::error::Error for DispatchError {}
 /// Follow translated block exits until guest execution must return to the
 /// device/scheduler layer.
 ///
-/// A total budget is enforced across direct and computed transfers. If fewer
-/// than two instructions remain after a transfer, the dispatcher checkpoints
-/// at the destination instead of asking a runner to split a branch/delay
-/// pair. Resolver failures become ordinary typed CPU-fault exits with all work
-/// already completed preserved in the result.
+/// A total budget is enforced across direct and computed transfers. A final
+/// one-instruction slice may retire a straight instruction. If that slice
+/// reaches an indivisible branch/delay pair, the dispatcher returns
+/// [`DispatchError::IndivisibleUnitExceedsBudget`] with no work from the pair
+/// committed. Resolver failures become ordinary typed CPU-fault exits with all
+/// work already completed preserved in the result.
 pub fn dispatch_until_boundary<R, V>(
     mut entry: ExecutionKey,
     budget: InstructionBudget,
@@ -820,9 +1103,20 @@ where
             });
         }
         if run.instructions == 0
+            && run.exit == BlockExit::Checkpoint(entry)
+            && !turn_budget.can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
+        {
+            return Err(DispatchError::IndivisibleUnitExceedsBudget {
+                at: entry,
+                budget: turn_budget,
+                required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
+            });
+        }
+        if run.instructions == 0
             && matches!(
                 run.exit,
-                BlockExit::Transfer(_)
+                BlockExit::Checkpoint(_)
+                    | BlockExit::Transfer(_)
                     | BlockExit::ResolveTransfer { .. }
                     | BlockExit::ResolveCall { .. }
                     | BlockExit::ExecutableWrite { .. }
@@ -987,6 +1281,11 @@ impl CodeSpan {
         self.words.len()
     }
 
+    /// Exact big-endian instruction words owned by this immutable span.
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
     fn resolve(&self, pc: GuestPc) -> Option<u32> {
         let offset = pc.get().checked_sub(self.vram_start.get())?;
         self.words.get((offset / 4) as usize).copied()
@@ -1013,6 +1312,28 @@ pub struct CodeBank {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProgramArtifactIdentity([u8; 32]);
 
+/// Callable shape installed around one generated runner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedAdapterRole {
+    DirectGenerated,
+    EntryContextGate,
+    DenseInstrumentationGate,
+    OverlayGenerationGate,
+    ExternalDigestGate,
+}
+
+impl GeneratedAdapterRole {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::DirectGenerated => 0,
+            Self::EntryContextGate => 1,
+            Self::DenseInstrumentationGate => 2,
+            Self::OverlayGenerationGate => 3,
+            Self::ExternalDigestGate => 4,
+        }
+    }
+}
+
 impl ProgramArtifactIdentity {
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -1020,6 +1341,273 @@ impl ProgramArtifactIdentity {
 
     pub const fn bytes(self) -> [u8; 32] {
         self.0
+    }
+
+    /// Identity of an installed callable which combines a handwritten
+    /// adapter with one exact generated bank runner.
+    pub fn generated_adapter(
+        adapter_source_identity: [u8; 32],
+        generated_runner_source_identity: [u8; 32],
+        bank: BankId,
+        role: GeneratedAdapterRole,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"fn64:generated-runner-adapter:v1:");
+        hasher.update(adapter_source_identity);
+        hasher.update(generated_runner_source_identity);
+        hasher.update(bank.get().to_be_bytes());
+        hasher.update([role.tag()]);
+        Self(hasher.finalize().into())
+    }
+}
+
+pub const GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2: &str =
+    "fn64.generated-runner-source-attestation.v2";
+/// Canonical hash-domain prefix shared by the source-attestation issuer and
+/// the independent selected-build verifier.
+pub const GENERATED_RUNNER_SOURCE_BINDING_DOMAIN_V2: &[u8] =
+    b"fn64:cargo-generated-runner-source-attestation:v2:";
+pub const GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V1: &str =
+    "fn64.generated-runner-runtime-source.v1";
+pub const GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V2: &str =
+    "fn64.generated-runner-runtime-source.v2";
+
+/// Exact source receipt for the implementation linked by typed arbitrary-PC
+/// runners.
+///
+/// These files own typed RDRAM/MMIO routing, host-boundary exits, and
+/// block-program admission. `fn64-recomp-rs-codegen` issues the separate
+/// emitter-source receipt. Neither receipt says anything about a separately
+/// compiled callable; only the external build owner proves that relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneratedRunnerRuntimeSourceReceiptV1 {
+    schema: &'static str,
+    source_sha256: [u8; 32],
+    typed_rdram: bool,
+    typed_mmio: bool,
+    typed_host_boundaries: bool,
+}
+
+impl GeneratedRunnerRuntimeSourceReceiptV1 {
+    pub const fn schema(self) -> &'static str {
+        self.schema
+    }
+
+    pub const fn source_sha256(self) -> [u8; 32] {
+        self.source_sha256
+    }
+
+    pub const fn typed_rdram(self) -> bool {
+        self.typed_rdram
+    }
+
+    pub const fn typed_mmio(self) -> bool {
+        self.typed_mmio
+    }
+
+    pub const fn typed_host_boundaries(self) -> bool {
+        self.typed_host_boundaries
+    }
+}
+
+pub fn generated_runner_runtime_source_receipt_v1() -> GeneratedRunnerRuntimeSourceReceiptV1 {
+    let sources: &[(&[u8], &[u8])] = &[
+        (b"Cargo.toml", include_bytes!("../Cargo.toml")),
+        (b"src/lib.rs", include_bytes!("lib.rs")),
+        (b"src/execution.rs", include_bytes!("execution.rs")),
+        (
+            b"src/generated_support.rs",
+            include_bytes!("generated_support.rs"),
+        ),
+        (b"src/runtime.rs", include_bytes!("runtime.rs")),
+    ];
+    let mut hasher = Sha256::new();
+    hasher.update(b"fn64:generated-runner-runtime-source:v1:");
+    for (label, source) in sources {
+        hasher.update(
+            u64::try_from(label.len())
+                .expect("generated-runner source label length fits u64")
+                .to_be_bytes(),
+        );
+        hasher.update(label);
+        hasher.update(
+            u64::try_from(source.len())
+                .expect("generated-runner source length fits u64")
+                .to_be_bytes(),
+        );
+        hasher.update(source);
+    }
+    GeneratedRunnerRuntimeSourceReceiptV1 {
+        schema: GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V1,
+        source_sha256: hasher.finalize().into(),
+        typed_rdram: true,
+        typed_mmio: true,
+        typed_host_boundaries: true,
+    }
+}
+
+/// Source-complete runtime identity for typed arbitrary-PC runners.
+///
+/// V1 remains immutable for existing source-attestation V2 producers and
+/// consumers. V2 adds `fpu.rs`, whose floating-point implementation is called
+/// through `runtime.rs` and therefore changes generated-runner semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneratedRunnerRuntimeSourceReceiptV2 {
+    schema: &'static str,
+    source_sha256: [u8; 32],
+    typed_rdram: bool,
+    typed_mmio: bool,
+    typed_host_boundaries: bool,
+}
+
+impl GeneratedRunnerRuntimeSourceReceiptV2 {
+    pub const fn schema(self) -> &'static str {
+        self.schema
+    }
+
+    pub const fn source_sha256(self) -> [u8; 32] {
+        self.source_sha256
+    }
+
+    pub const fn typed_rdram(self) -> bool {
+        self.typed_rdram
+    }
+
+    pub const fn typed_mmio(self) -> bool {
+        self.typed_mmio
+    }
+
+    pub const fn typed_host_boundaries(self) -> bool {
+        self.typed_host_boundaries
+    }
+}
+
+pub fn generated_runner_runtime_source_receipt_v2() -> GeneratedRunnerRuntimeSourceReceiptV2 {
+    let sources: &[(&[u8], &[u8])] = &[
+        (b"Cargo.toml", include_bytes!("../Cargo.toml")),
+        (b"src/lib.rs", include_bytes!("lib.rs")),
+        (b"src/execution.rs", include_bytes!("execution.rs")),
+        (
+            b"src/generated_support.rs",
+            include_bytes!("generated_support.rs"),
+        ),
+        (b"src/runtime.rs", include_bytes!("runtime.rs")),
+        (b"src/fpu.rs", include_bytes!("fpu.rs")),
+    ];
+    let mut hasher = Sha256::new();
+    hasher.update(b"fn64:generated-runner-runtime-source:v2:");
+    for (label, source) in sources {
+        hasher.update(
+            u64::try_from(label.len())
+                .expect("generated-runner source label length fits u64")
+                .to_be_bytes(),
+        );
+        hasher.update(label);
+        hasher.update(
+            u64::try_from(source.len())
+                .expect("generated-runner source length fits u64")
+                .to_be_bytes(),
+        );
+        hasher.update(source);
+    }
+    GeneratedRunnerRuntimeSourceReceiptV2 {
+        schema: GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V2,
+        source_sha256: hasher.finalize().into(),
+        typed_rdram: true,
+        typed_mmio: true,
+        typed_host_boundaries: true,
+    }
+}
+
+/// One callable/source relation exported by a repository-controlled generated
+/// Cargo package and linked into the program-owning root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CargoGeneratedRunnerSourceBindingV1 {
+    pub bank: BankId,
+    pub generated_runner_source_sha256: [u8; 32],
+    pub code_words_sha256: [u8; 32],
+    pub vram_start: GuestPc,
+    pub vram_end: GuestPc,
+    pub composite_subrunner_count: u32,
+    pub adapter_role: GeneratedAdapterRole,
+}
+
+/// Build-script measurements supplied at the Cargo source boundary.
+///
+/// Safe Rust cannot derive source identity from `GeneratedBankFn`. The caller
+/// of this attestation is expected to be the checked-in root which
+/// owns Cargo dependencies, generated includes, and the exported callable
+/// table. Generic or third-party runner registration is deliberately outside
+/// this source projection.
+pub struct CargoGeneratedProgramSourceAttestationV2<'a> {
+    pub root_adapter_source_sha256: [u8; 32],
+    pub shard_cargo_source_tree_sha256: [u8; 32],
+    pub expected_emitter_source_sha256: [u8; 32],
+    /// Measured by the checked-in adapter and revalidated only by the outer
+    /// verifier. This lower catalog is explicitly not an issuer of emitter
+    /// source authority.
+    pub externally_measured_emitter_source_sha256: [u8; 32],
+    pub expected_runtime_source_sha256: [u8; 32],
+    pub runtime_source_receipt: GeneratedRunnerRuntimeSourceReceiptV1,
+    pub runners: &'a [CargoGeneratedRunnerSourceBindingV1],
+}
+
+/// Evidence projection claiming that one complete canonical block program was
+/// paired with the measured Cargo source graph above.
+///
+/// This is deliberately named an attestation, not authority: this crate can
+/// validate all pointer-free fields but cannot prove that rustc compiled a
+/// supplied function pointer from particular bytes. SI or another completion
+/// validator must not consume it. A verifier which owns an isolated Cargo
+/// build (or an external build attestation) is required to mint authority.
+#[derive(Debug)]
+pub struct GeneratedRunnerSourceAttestationV2 {
+    schema: &'static str,
+    cargo_source_fields_validated: bool,
+    program_identity: ProgramArtifactIdentity,
+    root_adapter_source_sha256: [u8; 32],
+    shard_cargo_source_tree_sha256: [u8; 32],
+    emitter_source_sha256: [u8; 32],
+    runtime_source_sha256: [u8; 32],
+    binding_sha256: [u8; 32],
+    build_receipt: StaticExecutionBuildReceipt,
+}
+
+impl GeneratedRunnerSourceAttestationV2 {
+    pub const fn schema(&self) -> &'static str {
+        self.schema
+    }
+
+    pub const fn cargo_source_fields_validated(&self) -> bool {
+        self.cargo_source_fields_validated
+    }
+
+    pub const fn program_identity(&self) -> ProgramArtifactIdentity {
+        self.program_identity
+    }
+
+    pub const fn root_adapter_source_sha256(&self) -> [u8; 32] {
+        self.root_adapter_source_sha256
+    }
+
+    pub const fn shard_cargo_source_tree_sha256(&self) -> [u8; 32] {
+        self.shard_cargo_source_tree_sha256
+    }
+
+    pub const fn emitter_source_sha256(&self) -> [u8; 32] {
+        self.emitter_source_sha256
+    }
+
+    pub const fn runtime_source_sha256(&self) -> [u8; 32] {
+        self.runtime_source_sha256
+    }
+
+    pub const fn binding_sha256(&self) -> [u8; 32] {
+        self.binding_sha256
+    }
+
+    pub const fn build_receipt(&self) -> StaticExecutionBuildReceipt {
+        self.build_receipt
     }
 }
 
@@ -1085,6 +1673,10 @@ pub struct BlockProgramEvidenceSnapshot {
 pub struct ExecutionDestinationObservation {
     pub destination: ExecutionKey,
     pub runner_artifact_identity: Option<ProgramArtifactIdentity>,
+    /// Architecturally retired instructions in this runner entry. Retaining
+    /// the count lets a minimum-budget diagnostic reconstruct the exact
+    /// straight-line PC sequence without instrumenting generated bodies.
+    pub instructions: u32,
 }
 
 impl CodeBank {
@@ -1261,6 +1853,10 @@ impl CodeCatalog {
         self.banks.get(&id)
     }
 
+    pub fn banks(&self) -> impl Iterator<Item = &CodeBank> {
+        self.banks.values()
+    }
+
     fn unregister(&mut self, id: BankId) -> Option<CodeBank> {
         self.banks.remove(&id)
     }
@@ -1285,20 +1881,155 @@ impl CodeCatalog {
         Ok(ResolvedInstruction { key, word })
     }
 
+    fn missing_virtual_mapping(&self, fault_bank: BankId, target_pc: GuestPc) -> CpuFault {
+        let at = ExecutionKey::new(fault_bank, target_pc);
+        match self.banks.get(&fault_bank) {
+            Some(bank) => CpuFault {
+                at,
+                kind: CpuFaultKind::UnmappedPc {
+                    bank_start: bank.vram_start().get(),
+                    bank_end: bank.vram_end().get(),
+                },
+            },
+            None => CpuFault {
+                at,
+                kind: CpuFaultKind::UnknownBank,
+            },
+        }
+    }
+
+    fn resolve_unique_virtual(
+        &self,
+        fault_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        self.resolve_unique_virtual_where(fault_bank, target_pc, |_| true)
+    }
+
+    fn resolve_unique_virtual_where(
+        &self,
+        fault_bank: BankId,
+        target_pc: GuestPc,
+        mut admits_bank: impl FnMut(BankId) -> bool,
+    ) -> Result<ExecutionKey, CpuFault> {
+        let mut candidates = self
+            .banks
+            .values()
+            .filter(|bank| admits_bank(bank.id()) && bank.resolve(target_pc).is_some())
+            .map(CodeBank::id);
+        let Some(first_candidate) = candidates.next() else {
+            return Err(self.missing_virtual_mapping(fault_bank, target_pc));
+        };
+        let Some(second_candidate) = candidates.next() else {
+            return Ok(ExecutionKey::new(first_candidate, target_pc));
+        };
+        let remaining = candidates.count();
+        let candidate_count = u32::try_from(remaining)
+            .ok()
+            .and_then(|remaining| remaining.checked_add(2))
+            .expect("virtual code-bank candidate count exceeds u32");
+        Err(CpuFault {
+            at: ExecutionKey::new(fault_bank, target_pc),
+            kind: CpuFaultKind::AmbiguousPc {
+                first_candidate,
+                second_candidate,
+                candidate_count,
+            },
+        })
+    }
+
+    /// Resolve a bankless static entry against every admitted virtual bank.
+    /// `fault_bank` anchors typed failure context only; it receives no
+    /// preference. Physical/mapped generations are outside this catalog.
+    pub fn resolve_entry(
+        &self,
+        fault_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        if !target_pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                fault_bank, target_pc,
+            )));
+        }
+        self.resolve_unique_virtual(fault_bank, target_pc)
+    }
+
+    fn resolve_entry_where(
+        &self,
+        fault_bank: BankId,
+        target_pc: GuestPc,
+        admits_bank: impl FnMut(BankId) -> bool,
+    ) -> Result<ExecutionKey, CpuFault> {
+        if !target_pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                fault_bank, target_pc,
+            )));
+        }
+        self.resolve_unique_virtual_where(fault_bank, target_pc, admits_bank)
+    }
+
+    /// Resolve one static guest transfer. The source bank wins when it admits
+    /// the exact sparse target; otherwise resolution requires exactly one
+    /// admitting virtual bank. Generated callbacks and physical generations
+    /// are deliberately not consulted.
+    pub fn resolve_transfer(
+        &self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        if !target_pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                source_bank,
+                target_pc,
+            )));
+        }
+        if self
+            .banks
+            .get(&source_bank)
+            .is_some_and(|bank| bank.resolve(target_pc).is_some())
+        {
+            return Ok(ExecutionKey::new(source_bank, target_pc));
+        }
+        self.resolve_unique_virtual(source_bank, target_pc)
+    }
+
+    fn resolve_transfer_where(
+        &self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+        mut admits_bank: impl FnMut(BankId) -> bool,
+    ) -> Result<ExecutionKey, CpuFault> {
+        if !target_pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                source_bank,
+                target_pc,
+            )));
+        }
+        if admits_bank(source_bank)
+            && self
+                .banks
+                .get(&source_bank)
+                .is_some_and(|bank| bank.resolve(target_pc).is_some())
+        {
+            return Ok(ExecutionKey::new(source_bank, target_pc));
+        }
+        self.resolve_unique_virtual_where(source_bank, target_pc, admits_bank)
+    }
+
     /// Classify an admitted instruction for table-backed dispatch.  Resolution
     /// goes through the same sparse bank catalog as execution, so a data hole
     /// cannot acquire a classification merely because it lies inside a
     /// bounding interval.
-    pub fn classify(&self, key: ExecutionKey) -> Result<crate::emit::BankWordKind, CpuFault> {
+    pub fn classify(&self, key: ExecutionKey) -> Result<BankWordKind, CpuFault> {
         let resolved = self.resolve(key)?;
         let instruction = crate::decode(resolved.word);
         Ok(
             if matches!(instruction, crate::decoder::Instruction::Unknown { .. }) {
-                crate::emit::BankWordKind::Unknown
+                BankWordKind::Unknown
             } else if instruction.has_delay_slot() {
-                crate::emit::BankWordKind::ControlTransfer
+                BankWordKind::ControlTransfer
             } else {
-                crate::emit::BankWordKind::Straight
+                BankWordKind::Straight
             },
         )
     }
@@ -1353,7 +2084,9 @@ pub struct BlockProgram {
     runners: BTreeMap<BankId, (GeneratedBankFn, Option<ProgramArtifactIdentity>)>,
     physical_code: PhysicalCodeCatalog,
     mapped_aot: BTreeMap<ExecutionKey, MappedAotBlock>,
-    execution_destinations: RefCell<Vec<ExecutionDestinationObservation>>,
+    execution_destinations: RefCell<VecDeque<ExecutionDestinationObservation>>,
+    execution_destination_history_limit: Option<NonZeroUsize>,
+    execution_destination_history_suppressed: bool,
 }
 
 impl BlockProgram {
@@ -1425,17 +2158,56 @@ impl BlockProgram {
         &self.physical_code
     }
 
-    /// Copy the append-only execution history in authoritative entry order.
+    /// Copy retained execution history in authoritative entry order.
     ///
     /// Resolution and classification do not append here. An observation is
     /// added only after sparse code admission and runner lookup both succeed.
     pub fn copy_execution_destinations(&self) -> Vec<ExecutionDestinationObservation> {
-        self.execution_destinations.borrow().clone()
+        self.execution_destinations
+            .borrow()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Bound diagnostic execution history without changing executable state.
+    /// `None` retains the complete history and remains the default required by
+    /// certification evidence; a limit retains only the newest observations.
+    pub fn set_execution_destination_history_limit(&mut self, limit: Option<NonZeroUsize>) {
+        self.execution_destination_history_limit = limit;
+        if let Some(limit) = limit {
+            let destinations = self.execution_destinations.get_mut();
+            while destinations.len() > limit.get() {
+                destinations.pop_front();
+            }
+        }
+    }
+
+    /// Enable or suppress diagnostic execution history. Complete history is
+    /// enabled by default; suppressing it also clears any retained entries.
+    pub fn set_execution_destination_history_enabled(&mut self, enabled: bool) {
+        self.execution_destination_history_suppressed = !enabled;
+        if !enabled {
+            self.execution_destinations.get_mut().clear();
+        }
     }
 
     /// Start a new observation lifetime without changing executable state.
     pub fn clear_execution_destinations(&mut self) {
         self.execution_destinations.get_mut().clear();
+    }
+
+    fn observe_execution_destination(&self, observation: ExecutionDestinationObservation) {
+        if self.execution_destination_history_suppressed {
+            return;
+        }
+        let mut destinations = self.execution_destinations.borrow_mut();
+        destinations.push_back(observation);
+        if let Some(limit) = self.execution_destination_history_limit {
+            while destinations.len() > limit.get() {
+                destinations.pop_front();
+            }
+        }
     }
 
     /// Capture the complete immutable guest-code image without native
@@ -1609,27 +2381,38 @@ impl BlockProgram {
                 if let Err(run) = block.preflight(&self.physical_code, ctx) {
                     return run;
                 }
-                self.execution_destinations
-                    .borrow_mut()
-                    .push(ExecutionDestinationObservation {
-                        destination: entry,
-                        runner_artifact_identity: block.runner_artifact_identity(),
-                    });
-                return block.run_preflighted(budget, ctx, mem);
+                let result = block.run_preflighted(budget, ctx, mem);
+                self.observe_execution_destination(ExecutionDestinationObservation {
+                    destination: entry,
+                    runner_artifact_identity: block.runner_artifact_identity(),
+                    instructions: result.instructions,
+                });
+                return result;
             }
-            let unit = match admit_mapped_unit(&self.physical_code, entry.bank, entry.pc, ctx) {
-                Ok(unit) => unit,
-                Err(run) => return run,
-            };
-            self.execution_destinations
-                .borrow_mut()
-                .push(ExecutionDestinationObservation {
+            #[cfg(not(feature = "dev-interpreter"))]
+            return BlockRun::new(
+                BlockExit::Fault(CpuFault {
+                    at: entry,
+                    kind: CpuFaultKind::MissingAotEntry,
+                }),
+                0,
+            );
+            #[cfg(feature = "dev-interpreter")]
+            {
+                let unit = match admit_mapped_unit(&self.physical_code, entry.bank, entry.pc, ctx) {
+                    Ok(unit) => unit,
+                    Err(run) => return run,
+                };
+                let result = run_admitted_mapped_unit(unit, budget, ctx, mem).unwrap_or_else(
+                    |unsupported| BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0),
+                );
+                self.observe_execution_destination(ExecutionDestinationObservation {
                     destination: entry,
                     runner_artifact_identity: None,
+                    instructions: result.instructions,
                 });
-            return run_admitted_mapped_unit(unit, budget, ctx, mem).unwrap_or_else(
-                |unsupported| BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0),
-            );
+                return result;
+            }
         }
         if let Err(fault) = self.code.resolve(entry) {
             let attempted_fetch = u32::from(matches!(fault.kind, CpuFaultKind::Exception { .. }));
@@ -1642,13 +2425,15 @@ impl BlockProgram {
                     entry.bank
                 )
             });
-        self.execution_destinations
-            .borrow_mut()
-            .push(ExecutionDestinationObservation {
+        let result = run(entry, budget, ctx, mem);
+        if !matches!(result.exit, BlockExit::ImageChanged { .. }) {
+            self.observe_execution_destination(ExecutionDestinationObservation {
                 destination: entry,
                 runner_artifact_identity,
+                instructions: result.instructions,
             });
-        run(entry, budget, ctx, mem)
+        }
+        result
     }
 
     /// Run the registered arbitrary-PC program through transfers and
@@ -1661,11 +2446,44 @@ impl BlockProgram {
     /// resolver's mapping fault without erasing the guest exception state.
     pub fn dispatch<V>(
         &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        resolver: &mut V,
+    ) -> Result<DispatchRun, DispatchError>
+    where
+        V: TransferResolver,
+    {
+        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, true)
+    }
+
+    /// Dispatch while returning architectural exceptions to the live owner.
+    /// Hosts whose typed scheduler replaces libultra's raw thread dispatcher
+    /// need to publish fault events and stop the current coroutine themselves;
+    /// they must not run a second scheduler through the guest vector first.
+    pub fn dispatch_exposing_exceptions<V>(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        resolver: &mut V,
+    ) -> Result<DispatchRun, DispatchError>
+    where
+        V: TransferResolver,
+    {
+        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, false)
+    }
+
+    fn dispatch_with_exception_vectoring<V>(
+        &self,
         mut entry: ExecutionKey,
         budget: InstructionBudget,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
         resolver: &mut V,
+        vector_exceptions: bool,
     ) -> Result<DispatchRun, DispatchError>
     where
         V: TransferResolver,
@@ -1696,10 +2514,21 @@ impl BlockProgram {
                     actual: run.instructions,
                 });
             }
+            if run.instructions == 0
+                && run.exit == BlockExit::Checkpoint(entry)
+                && !turn_budget.can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
+            {
+                return Err(DispatchError::IndivisibleUnitExceedsBudget {
+                    at: entry,
+                    budget: turn_budget,
+                    required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
+                });
+            }
             let continuing_without_progress = run.instructions == 0
                 && matches!(
                     run.exit,
-                    BlockExit::Transfer(_)
+                    BlockExit::Checkpoint(_)
+                        | BlockExit::Transfer(_)
                         | BlockExit::ResolveTransfer { .. }
                         | BlockExit::ResolveCall { .. }
                         | BlockExit::ExecutableWrite { .. }
@@ -1759,6 +2588,13 @@ impl BlockProgram {
                         blocks,
                     });
                 }
+                BlockExit::ImageChanged { at, miss } => {
+                    return Ok(DispatchRun {
+                        exit: BlockExit::ImageChanged { at, miss },
+                        instructions,
+                        blocks,
+                    });
+                }
                 BlockExit::Transfer(next) => {
                     entry = next;
                     continue;
@@ -1789,6 +2625,13 @@ impl BlockProgram {
                     Err(fault) => Err(fault),
                 },
                 BlockExit::Fault(fault) => {
+                    if !vector_exceptions && matches!(fault.kind, CpuFaultKind::Exception { .. }) {
+                        return Ok(DispatchRun {
+                            exit: BlockExit::Fault(fault),
+                            instructions,
+                            blocks,
+                        });
+                    }
                     let Some(vector) = fault.enter_exception(ctx) else {
                         return Ok(DispatchRun {
                             exit: run.exit,
@@ -1817,6 +2660,625 @@ impl BlockProgram {
                     });
                 }
             }
+        }
+    }
+}
+
+/// Failure to bind a [`BlockProgram`] to one canonical catalog entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogBlockProgramErrorV1 {
+    EntryNotAdmitted(CpuFault),
+    MissingRunnerArtifactIdentity { bank: BankId },
+    NonCanonicalProgramEvidence,
+    GeneratedRunnerSourceAttestation(GeneratedRunnerSourceAttestationErrorV1),
+}
+
+impl fmt::Display for CatalogBlockProgramErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EntryNotAdmitted(fault) => {
+                write!(
+                    formatter,
+                    "catalog block-program entry is not admitted: {fault}"
+                )
+            }
+            Self::MissingRunnerArtifactIdentity { bank } => write!(
+                formatter,
+                "catalog block-program runner {bank} has no stable artifact identity"
+            ),
+            Self::NonCanonicalProgramEvidence => write!(
+                formatter,
+                "catalog block-program evidence is not canonically derived"
+            ),
+            Self::GeneratedRunnerSourceAttestation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CatalogBlockProgramErrorV1 {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedRunnerSourceAttestationErrorV1 {
+    ZeroSourceDigest { field: &'static str },
+    EmitterSourceReceiptMismatch,
+    NonVirtualExecutionNotAttested,
+    RunnerBindingCount { expected: usize, actual: usize },
+    DuplicateRunnerBinding { bank: BankId },
+    MissingRunnerBinding { bank: BankId },
+    UnknownRunnerBinding { bank: BankId },
+    EmptyCompositeRunner { bank: BankId },
+    RunnerArtifactMismatch { bank: BankId },
+}
+
+impl fmt::Display for GeneratedRunnerSourceAttestationErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroSourceDigest { field } => {
+                write!(formatter, "generated-runner source digest {field} is zero")
+            }
+            Self::EmitterSourceReceiptMismatch => formatter.write_str(
+                "generated-runner external emitter or linked runtime source receipt mismatch",
+            ),
+            Self::NonVirtualExecutionNotAttested => formatter.write_str(
+                "generated-runner source attestation v2 admits only virtual CodeBank runners",
+            ),
+            Self::RunnerBindingCount { expected, actual } => write!(
+                formatter,
+                "generated-runner source binding count {actual} does not match program runner count {expected}"
+            ),
+            Self::DuplicateRunnerBinding { bank } => {
+                write!(formatter, "generated-runner source bindings repeat {bank}")
+            }
+            Self::MissingRunnerBinding { bank } => {
+                write!(formatter, "generated-runner source binding is missing for {bank}")
+            }
+            Self::UnknownRunnerBinding { bank } => {
+                write!(formatter, "generated-runner source binding names unknown {bank}")
+            }
+            Self::EmptyCompositeRunner { bank } => write!(
+                formatter,
+                "generated-runner source binding for {bank} contains zero emitted subrunners"
+            ),
+            Self::RunnerArtifactMismatch { bank } => write!(
+                formatter,
+                "generated-runner source/adapter identity does not match installed artifact for {bank}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GeneratedRunnerSourceAttestationErrorV1 {}
+
+/// One canonical, fixed-entry execution substrate for a future ABI install.
+///
+/// Construction captures the existing pointer-independent program evidence
+/// and the feature receipt compiled into this crate. The wrapper deliberately
+/// exposes neither `BlockProgram` mutation nor transfer-resolver dispatch: a
+/// replacement must arrive as a complete independently constructed program
+/// and pass the same admission/evidence checks before the old one is retired.
+pub struct CatalogBlockProgramV1 {
+    program: BlockProgram,
+    entry: ExecutionKey,
+    budget: InstructionBudget,
+    evidence: BlockProgramEvidenceSnapshot,
+    build_receipt: StaticExecutionBuildReceipt,
+    generated_runner_source_attestation: Option<GeneratedRunnerSourceAttestationV2>,
+}
+
+impl CatalogBlockProgramV1 {
+    pub fn new(
+        program: BlockProgram,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+    ) -> Result<Self, CatalogBlockProgramErrorV1> {
+        Self::new_inner(program, entry, budget, None)
+    }
+
+    /// Construct a catalog with a checked pointer-free Cargo-source
+    /// attestation. This validates source, role, and program agreement but is
+    /// intentionally not generated-runner semantics authority: any caller can
+    /// still pair an arbitrary `GeneratedBankFn` with matching public fields.
+    pub fn new_with_cargo_generated_runner_source_attestation_v2(
+        program: BlockProgram,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        sources: CargoGeneratedProgramSourceAttestationV2<'_>,
+    ) -> Result<Self, CatalogBlockProgramErrorV1> {
+        let attestation = Self::validate_generated_runner_source_attestation(&program, sources)
+            .map_err(CatalogBlockProgramErrorV1::GeneratedRunnerSourceAttestation)?;
+        Self::new_inner(program, entry, budget, Some(attestation))
+    }
+
+    fn new_inner(
+        program: BlockProgram,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        generated_runner_source_attestation: Option<GeneratedRunnerSourceAttestationV2>,
+    ) -> Result<Self, CatalogBlockProgramErrorV1> {
+        Self::validate_entry(&program, entry)?;
+        for (&bank, (_, artifact_identity)) in &program.runners {
+            if artifact_identity.is_none() {
+                return Err(CatalogBlockProgramErrorV1::MissingRunnerArtifactIdentity { bank });
+            }
+        }
+        let evidence = program.evidence_snapshot();
+        if evidence.identity.source != ProgramIdentitySource::CanonicalBlockProgramSha256 {
+            return Err(CatalogBlockProgramErrorV1::NonCanonicalProgramEvidence);
+        }
+        Ok(Self {
+            program,
+            entry,
+            budget,
+            evidence,
+            build_receipt: static_execution_build_receipt(),
+            generated_runner_source_attestation,
+        })
+    }
+
+    fn validate_generated_runner_source_attestation(
+        program: &BlockProgram,
+        sources: CargoGeneratedProgramSourceAttestationV2<'_>,
+    ) -> Result<GeneratedRunnerSourceAttestationV2, GeneratedRunnerSourceAttestationErrorV1> {
+        for (field, digest) in [
+            (
+                "root_adapter_source_sha256",
+                sources.root_adapter_source_sha256,
+            ),
+            (
+                "shard_cargo_source_tree_sha256",
+                sources.shard_cargo_source_tree_sha256,
+            ),
+        ] {
+            if digest == [0; 32] {
+                return Err(GeneratedRunnerSourceAttestationErrorV1::ZeroSourceDigest { field });
+            }
+        }
+        if sources.expected_emitter_source_sha256 == [0; 32] {
+            return Err(GeneratedRunnerSourceAttestationErrorV1::ZeroSourceDigest {
+                field: "expected_emitter_source_sha256",
+            });
+        }
+        if sources.expected_emitter_source_sha256
+            != sources.externally_measured_emitter_source_sha256
+        {
+            return Err(GeneratedRunnerSourceAttestationErrorV1::EmitterSourceReceiptMismatch);
+        }
+        let linked_runtime = generated_runner_runtime_source_receipt_v1();
+        if sources.runtime_source_receipt != linked_runtime
+            || sources.expected_runtime_source_sha256 != linked_runtime.source_sha256()
+        {
+            return Err(GeneratedRunnerSourceAttestationErrorV1::EmitterSourceReceiptMismatch);
+        }
+        if !program.physical_code.evidence_snapshot().is_empty() || !program.mapped_aot.is_empty() {
+            return Err(GeneratedRunnerSourceAttestationErrorV1::NonVirtualExecutionNotAttested);
+        }
+        if sources.runners.len() != program.runners.len() {
+            return Err(
+                GeneratedRunnerSourceAttestationErrorV1::RunnerBindingCount {
+                    expected: program.runners.len(),
+                    actual: sources.runners.len(),
+                },
+            );
+        }
+
+        let mut bindings = sources.runners.to_vec();
+        bindings.sort_unstable_by_key(|binding| binding.bank);
+        for pair in bindings.windows(2) {
+            if pair[0].bank == pair[1].bank {
+                return Err(
+                    GeneratedRunnerSourceAttestationErrorV1::DuplicateRunnerBinding {
+                        bank: pair[0].bank,
+                    },
+                );
+            }
+        }
+        for (&bank, (_, artifact_identity)) in &program.runners {
+            let binding = bindings
+                .binary_search_by_key(&bank, |binding| binding.bank)
+                .ok()
+                .map(|index| bindings[index])
+                .ok_or(GeneratedRunnerSourceAttestationErrorV1::MissingRunnerBinding { bank })?;
+            if binding.generated_runner_source_sha256 == [0; 32] {
+                return Err(GeneratedRunnerSourceAttestationErrorV1::ZeroSourceDigest {
+                    field: "generated_runner_source_sha256",
+                });
+            }
+            if binding.code_words_sha256 == [0; 32] {
+                return Err(GeneratedRunnerSourceAttestationErrorV1::ZeroSourceDigest {
+                    field: "code_words_sha256",
+                });
+            }
+            if binding.composite_subrunner_count == 0 {
+                return Err(GeneratedRunnerSourceAttestationErrorV1::EmptyCompositeRunner { bank });
+            }
+            let expected_artifact = ProgramArtifactIdentity::generated_adapter(
+                sources.root_adapter_source_sha256,
+                binding.generated_runner_source_sha256,
+                bank,
+                binding.adapter_role,
+            );
+            if *artifact_identity != Some(expected_artifact) {
+                return Err(
+                    GeneratedRunnerSourceAttestationErrorV1::RunnerArtifactMismatch { bank },
+                );
+            }
+            let code = program
+                .code
+                .bank(bank)
+                .expect("every registered runner has one atomically registered code bank");
+            let mut code_hasher = Sha256::new();
+            for span in code.spans() {
+                for word in span.words() {
+                    code_hasher.update(word.to_be_bytes());
+                }
+            }
+            let actual_code_sha256: [u8; 32] = code_hasher.finalize().into();
+            if code.vram_start() != binding.vram_start
+                || code.vram_end() != binding.vram_end
+                || actual_code_sha256 != binding.code_words_sha256
+            {
+                return Err(
+                    GeneratedRunnerSourceAttestationErrorV1::RunnerArtifactMismatch { bank },
+                );
+            }
+        }
+        for binding in &bindings {
+            if !program.runners.contains_key(&binding.bank) {
+                return Err(
+                    GeneratedRunnerSourceAttestationErrorV1::UnknownRunnerBinding {
+                        bank: binding.bank,
+                    },
+                );
+            }
+        }
+
+        let evidence = program.evidence_snapshot();
+        let mut binding_hasher = Sha256::new();
+        binding_hasher.update(GENERATED_RUNNER_SOURCE_BINDING_DOMAIN_V2);
+        binding_hasher.update(evidence.identity.identity.bytes());
+        binding_hasher.update(sources.root_adapter_source_sha256);
+        binding_hasher.update(sources.shard_cargo_source_tree_sha256);
+        binding_hasher.update(sources.externally_measured_emitter_source_sha256);
+        binding_hasher.update(linked_runtime.source_sha256());
+        for binding in bindings {
+            binding_hasher.update(binding.bank.get().to_be_bytes());
+            binding_hasher.update(binding.generated_runner_source_sha256);
+            binding_hasher.update(binding.code_words_sha256);
+            binding_hasher.update(binding.vram_start.get().to_be_bytes());
+            binding_hasher.update(binding.vram_end.get().to_be_bytes());
+            binding_hasher.update(binding.composite_subrunner_count.to_be_bytes());
+            binding_hasher.update([binding.adapter_role.tag()]);
+        }
+        let build_receipt = static_execution_build_receipt();
+        binding_hasher.update(build_receipt.schema.to_be_bytes());
+        binding_hasher.update([
+            u8::from(build_receipt.aot_runtime),
+            u8::from(build_receipt.production_aot),
+            u8::from(build_receipt.dev_interpreter),
+        ]);
+        Ok(GeneratedRunnerSourceAttestationV2 {
+            schema: GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2,
+            cargo_source_fields_validated: true,
+            program_identity: evidence.identity.identity,
+            root_adapter_source_sha256: sources.root_adapter_source_sha256,
+            shard_cargo_source_tree_sha256: sources.shard_cargo_source_tree_sha256,
+            emitter_source_sha256: sources.externally_measured_emitter_source_sha256,
+            runtime_source_sha256: linked_runtime.source_sha256(),
+            binding_sha256: binding_hasher.finalize().into(),
+            build_receipt,
+        })
+    }
+
+    fn validate_entry(
+        program: &BlockProgram,
+        entry: ExecutionKey,
+    ) -> Result<(), CatalogBlockProgramErrorV1> {
+        if !entry.pc.is_instruction_aligned() {
+            return Err(CatalogBlockProgramErrorV1::EntryNotAdmitted(
+                CpuFault::instruction_address_error(entry),
+            ));
+        }
+        if program.physical_code.contains_bank(entry.bank) {
+            return program.mapped_aot.contains_key(&entry).then_some(()).ok_or(
+                CatalogBlockProgramErrorV1::EntryNotAdmitted(CpuFault {
+                    at: entry,
+                    kind: CpuFaultKind::MissingAotEntry,
+                }),
+            );
+        }
+        program
+            .code
+            .resolve(entry)
+            .map(|_| ())
+            .map_err(CatalogBlockProgramErrorV1::EntryNotAdmitted)
+    }
+
+    pub const fn entry(&self) -> ExecutionKey {
+        self.entry
+    }
+
+    pub const fn budget(&self) -> InstructionBudget {
+        self.budget
+    }
+
+    pub const fn identity(&self) -> ProgramIdentityEvidenceSnapshot {
+        self.evidence.identity
+    }
+
+    pub fn evidence(&self) -> &BlockProgramEvidenceSnapshot {
+        &self.evidence
+    }
+
+    pub const fn build_receipt(&self) -> StaticExecutionBuildReceipt {
+        self.build_receipt
+    }
+
+    pub const fn generated_runner_source_attestation(
+        &self,
+    ) -> Option<&GeneratedRunnerSourceAttestationV2> {
+        self.generated_runner_source_attestation.as_ref()
+    }
+
+    pub fn copy_execution_destinations(&self) -> Vec<ExecutionDestinationObservation> {
+        self.program.copy_execution_destinations()
+    }
+
+    /// Whether the immutable static install owns this bank identity through
+    /// either virtual code or the physical mapped-code catalog.
+    ///
+    /// Dynamic operational catalogs use this complete query to keep their
+    /// content-derived identities disjoint from every static execution lane.
+    pub fn reserves_bank(&self, bank: BankId) -> bool {
+        self.program.code.bank(bank).is_some() || self.program.physical_code.contains_bank(bank)
+    }
+
+    /// Whether either the immutable program or any precompiled generation,
+    /// including an inactive generation, reserves this bank identity.
+    pub fn reserves_bank_with_generations(
+        &self,
+        bank: BankId,
+        generations: &BackedPrecompiledGenerationCatalogV1,
+    ) -> bool {
+        self.reserves_bank(bank) || generations.contains_reserved_bank(bank)
+    }
+
+    /// Resolve a static virtual entry without preferring the wrapper's entry
+    /// bank. The owned entry bank is used only to retain typed fault context.
+    pub fn resolve_entry(&self, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+        self.program.code.resolve_entry(self.entry.bank, target_pc)
+    }
+
+    /// Resolve a static virtual transfer with exact source-bank preference.
+    /// Active physical/dynamic generation selection remains an outer owner.
+    pub fn resolve_transfer(
+        &self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        self.program.code.resolve_transfer(source_bank, target_pc)
+    }
+
+    pub fn validate_precompiled_generations(
+        &self,
+        generations: &BackedPrecompiledGenerationCatalogV1,
+    ) -> Result<(), GenerationCatalogError> {
+        generations.validate_program(&self.program)
+    }
+
+    pub fn resolve_entry_with_generations(
+        &self,
+        target_pc: GuestPc,
+        generations: &BackedPrecompiledGenerationCatalogV1,
+    ) -> Result<ExecutionKey, CpuFault> {
+        if !target_pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                self.entry.bank,
+                target_pc,
+            )));
+        }
+        match generations.resolve_active(target_pc) {
+            Ok(entry) => Ok(entry),
+            Err(crate::generation::GenerationLookupError::NoActiveGeneration { .. }) => {
+                Err(CpuFault {
+                    at: ExecutionKey::new(self.entry.bank, target_pc),
+                    kind: CpuFaultKind::NoActiveGeneration,
+                })
+            }
+            Err(crate::generation::GenerationLookupError::UnmappedPc { .. }) => self
+                .program
+                .code
+                .resolve_entry_where(self.entry.bank, target_pc, |bank| {
+                    !generations.contains_reserved_bank(bank)
+                }),
+            Err(error) => unreachable!("resolve_active returned activation-time error: {error}"),
+        }
+    }
+
+    pub fn resolve_transfer_with_generations(
+        &self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+        generations: &BackedPrecompiledGenerationCatalogV1,
+    ) -> Result<ExecutionKey, CpuFault> {
+        if !target_pc.is_instruction_aligned() {
+            return Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                source_bank,
+                target_pc,
+            )));
+        }
+        match generations.resolve_active(target_pc) {
+            Ok(entry) => Ok(entry),
+            Err(crate::generation::GenerationLookupError::NoActiveGeneration { .. }) => {
+                Err(CpuFault {
+                    at: ExecutionKey::new(source_bank, target_pc),
+                    kind: CpuFaultKind::NoActiveGeneration,
+                })
+            }
+            Err(crate::generation::GenerationLookupError::UnmappedPc { .. }) => self
+                .program
+                .code
+                .resolve_transfer_where(source_bank, target_pc, |bank| {
+                    !generations.contains_reserved_bank(bank)
+                }),
+            Err(error) => unreachable!("resolve_active returned activation-time error: {error}"),
+        }
+    }
+
+    /// Execute exactly the entry and budget owned by this substrate. Transfer
+    /// resolution remains an outer ABI responsibility and is not accepted as
+    /// a callback here.
+    pub fn run(&self, ctx: &mut RecompContext, mem: &mut Rdram<'_>) -> BlockRun {
+        self.program.run(self.entry, self.budget, ctx, mem)
+    }
+
+    /// Dispatch an arbitrary admitted continuation using only this owned
+    /// static program and one exact host-function catalog. No resolver
+    /// callback or ambient host lookup participates in the decision.
+    pub fn dispatch_exposing_exceptions_at(
+        &self,
+        entry: ExecutionKey,
+        hosts: &HostFunctionCatalogV1,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+    ) -> Result<DispatchRun, DispatchError> {
+        self.dispatch_exposing_exceptions_at_budget(entry, hosts, self.budget, ctx, mem)
+    }
+
+    /// Dispatch with a caller-owned slice budget. This is the budget-preserving
+    /// seam used when static and dynamic execution share one architectural
+    /// checkpoint; it does not mutate the install's configured outer budget.
+    pub fn dispatch_exposing_exceptions_at_budget(
+        &self,
+        entry: ExecutionKey,
+        hosts: &HostFunctionCatalogV1,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+    ) -> Result<DispatchRun, DispatchError> {
+        let mut resolver = CatalogStaticTransferResolverV1 {
+            program: self,
+            hosts,
+        };
+        self.program
+            .dispatch_exposing_exceptions(entry, budget, ctx, mem, &mut resolver)
+    }
+
+    pub fn dispatch_exposing_exceptions_with_generations_at(
+        &self,
+        entry: ExecutionKey,
+        hosts: &HostFunctionCatalogV1,
+        generations: &BackedPrecompiledGenerationCatalogV1,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+    ) -> Result<DispatchRun, DispatchError> {
+        self.dispatch_exposing_exceptions_with_generations_at_budget(
+            entry,
+            hosts,
+            generations,
+            self.budget,
+            ctx,
+            mem,
+        )
+    }
+
+    pub fn dispatch_exposing_exceptions_with_generations_at_budget(
+        &self,
+        entry: ExecutionKey,
+        hosts: &HostFunctionCatalogV1,
+        generations: &BackedPrecompiledGenerationCatalogV1,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+    ) -> Result<DispatchRun, DispatchError> {
+        let mut resolver = CatalogGenerationTransferResolverV1 {
+            program: self,
+            hosts,
+            generations,
+        };
+        self.program
+            .dispatch_exposing_exceptions(entry, budget, ctx, mem, &mut resolver)
+    }
+
+    pub fn set_entry(&mut self, entry: ExecutionKey) -> Result<(), CatalogBlockProgramErrorV1> {
+        Self::validate_entry(&self.program, entry)?;
+        self.entry = entry;
+        Ok(())
+    }
+
+    pub fn set_budget(&mut self, budget: InstructionBudget) {
+        self.budget = budget;
+    }
+
+    /// Atomically replace the complete program and its entry. Validation and
+    /// canonical evidence capture finish before the installed substrate is
+    /// changed.
+    pub fn replace_program(
+        &mut self,
+        program: BlockProgram,
+        entry: ExecutionKey,
+    ) -> Result<(), CatalogBlockProgramErrorV1> {
+        let replacement = Self::new(program, entry, self.budget)?;
+        *self = replacement;
+        Ok(())
+    }
+}
+
+struct CatalogStaticTransferResolverV1<'a> {
+    program: &'a CatalogBlockProgramV1,
+    hosts: &'a HostFunctionCatalogV1,
+}
+
+impl TransferResolver for CatalogStaticTransferResolverV1<'_> {
+    fn resolve(
+        &mut self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        self.program.resolve_transfer(source_bank, target_pc)
+    }
+
+    fn resolve_call(
+        &mut self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+        _resume: ExecutionKey,
+    ) -> Result<CallResolution, CpuFault> {
+        if self.hosts.resolve(target_pc.get()).is_some() {
+            Ok(CallResolution::Host)
+        } else {
+            self.resolve(source_bank, target_pc)
+                .map(CallResolution::Guest)
+        }
+    }
+}
+
+struct CatalogGenerationTransferResolverV1<'a> {
+    program: &'a CatalogBlockProgramV1,
+    hosts: &'a HostFunctionCatalogV1,
+    generations: &'a BackedPrecompiledGenerationCatalogV1,
+}
+
+impl TransferResolver for CatalogGenerationTransferResolverV1<'_> {
+    fn resolve(
+        &mut self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+    ) -> Result<ExecutionKey, CpuFault> {
+        self.program
+            .resolve_transfer_with_generations(source_bank, target_pc, self.generations)
+    }
+
+    fn resolve_call(
+        &mut self,
+        source_bank: BankId,
+        target_pc: GuestPc,
+        _resume: ExecutionKey,
+    ) -> Result<CallResolution, CpuFault> {
+        if self.hosts.resolve(target_pc.get()).is_some() {
+            Ok(CallResolution::Host)
+        } else {
+            self.resolve(source_bank, target_pc)
+                .map(CallResolution::Guest)
         }
     }
 }
@@ -1943,6 +3405,77 @@ impl ExecutableRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_runner_runtime_receipts_preserve_v1_and_issue_source_complete_v2() {
+        let v1 = generated_runner_runtime_source_receipt_v1();
+        assert_eq!(v1.schema(), GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V1);
+        assert_ne!(v1.source_sha256(), [0; 32]);
+        assert_eq!(v1, generated_runner_runtime_source_receipt_v1());
+
+        let v2 = generated_runner_runtime_source_receipt_v2();
+        assert_eq!(v2.schema(), GENERATED_RUNNER_RUNTIME_SOURCE_SCHEMA_V2);
+        assert_ne!(v2.source_sha256(), [0; 32]);
+        assert_ne!(v2.source_sha256(), v1.source_sha256());
+        assert_eq!(v2, generated_runner_runtime_source_receipt_v2());
+        assert!(v2.typed_rdram());
+        assert!(v2.typed_mmio());
+        assert!(v2.typed_host_boundaries());
+    }
+
+    #[test]
+    fn precompiled_image_admission_hashes_live_architectural_bytes_and_fails_closed() {
+        let words = [0x3c1a_8003u32, 0x275a_6790, 0x0340_0008, 0];
+        let expected: [u8; 32] = Sha256::digest(
+            words
+                .iter()
+                .flat_map(|word| word.to_be_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .into();
+        let mut storage = vec![0u8; 0x200];
+        let mut mem = Rdram::new(&mut storage);
+        for (index, word) in words.into_iter().enumerate() {
+            mem.store_w(0xffff_ffff_8000_0180 + index as u64 * 4, word);
+        }
+        let bank = BankId::new(0x1234);
+        assert_eq!(
+            verify_precompiled_image(bank, GuestPc::new(0x8000_0180), 16, expected, &mem),
+            Ok(())
+        );
+
+        mem.store_w(0xffff_ffff_8000_018c, 1);
+        let miss = verify_precompiled_image(bank, GuestPc::new(0x8000_0180), 16, expected, &mem)
+            .unwrap_err();
+        assert_eq!(miss.expected_bank, bank);
+        assert_ne!(miss.actual_sha256, miss.expected_sha256);
+        assert!(miss
+            .to_string()
+            .starts_with("AotMiss for bank:0000000000001234"));
+    }
+
+    #[test]
+    fn instruction_admission_ignores_neighbors_and_fails_before_a_changed_word() {
+        let mut storage = vec![0u8; 0x200];
+        let mut mem = Rdram::new(&mut storage);
+        let pc = GuestPc::new(0x8000_0180);
+        let bank = BankId::new(0x5678);
+        mem.store_w(0xffff_ffff_8000_017c, 0xdead_beef);
+        mem.store_w(0xffff_ffff_8000_0180, 0x2402_0001);
+        mem.store_w(0xffff_ffff_8000_0184, 0xcafe_babe);
+        assert_eq!(
+            verify_precompiled_instruction_word(bank, pc, 0x2402_0001, &mem),
+            Ok(())
+        );
+
+        mem.store_w(0xffff_ffff_8000_0180, 0x2402_0002);
+        let miss = verify_precompiled_instruction_word(bank, pc, 0x2402_0001, &mem)
+            .expect_err("changed fetched word must fail closed");
+        assert_eq!(miss.expected_bank, bank);
+        assert_eq!(miss.va_start, pc);
+        assert_eq!(miss.byte_len, 4);
+        assert_ne!(miss.actual_sha256, miss.expected_sha256);
+    }
 
     #[test]
     fn synchronous_exception_entry_sets_epc_bd_exl_cause_and_vector() {
@@ -2356,6 +3889,360 @@ mod tests {
         BlockRun::new(BlockExit::Yield(entry), 1)
     }
 
+    fn catalog_dispatch_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        _ctx: &mut RecompContext,
+        _mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        if entry.pc == VA {
+            return BlockRun::new(
+                BlockExit::ResolveCall {
+                    source_bank: entry.bank,
+                    target_pc: GuestPc::new(VA.get() + 4),
+                    resume: ExecutionKey::new(entry.bank, GuestPc::new(VA.get() + 8)),
+                },
+                1,
+            );
+        }
+        BlockRun::new(BlockExit::Yield(entry), 1)
+    }
+
+    fn catalog_dispatch_host(_ctx: &mut RecompContext, _mem: &mut Rdram<'_>) {}
+
+    fn catalog_budget_runner(
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        _mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        ctx.set_r32(2, budget.get().try_into().unwrap());
+        BlockRun::new(BlockExit::Yield(entry), budget.get())
+    }
+
+    fn catalog_test_program(
+        id: BankId,
+        runner: GeneratedBankFn,
+        artifact_byte: u8,
+    ) -> BlockProgram {
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(id, VA, vec![0, 0]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    id,
+                    runner,
+                    ProgramArtifactIdentity::new([artifact_byte; 32]),
+                ),
+            )
+            .unwrap();
+        program
+    }
+
+    #[test]
+    fn catalog_block_program_captures_canonical_evidence_and_fixed_execution() {
+        let id = BankId::new(0xc001);
+        let entry = ExecutionKey::new(id, VA);
+        let budget = InstructionBudget::new(2).unwrap();
+        let program = catalog_test_program(id, first_runner, 0x11);
+        let expected_evidence = program.evidence_snapshot();
+        let catalog = CatalogBlockProgramV1::new(program, entry, budget).unwrap();
+
+        assert_eq!(catalog.entry(), entry);
+        assert_eq!(catalog.budget(), budget);
+        assert_eq!(catalog.evidence(), &expected_evidence);
+        assert_eq!(catalog.identity(), expected_evidence.identity);
+        assert_eq!(catalog.build_receipt(), static_execution_build_receipt());
+        assert!(catalog.reserves_bank(id));
+        assert!(!catalog.reserves_bank(BankId::new(0xc0ff)));
+        assert_eq!(catalog.resolve_entry(VA).unwrap(), entry);
+        assert_eq!(catalog.resolve_transfer(id, VA).unwrap(), entry);
+
+        let mut storage = [];
+        let mut memory = Rdram::new(&mut storage);
+        let mut context = RecompContext::new();
+        assert_eq!(catalog.run(&mut context, &mut memory).instructions, 1);
+        assert_eq!(context.r_u32(2), 1);
+        assert_eq!(catalog.copy_execution_destinations()[0].destination, entry);
+    }
+
+    #[test]
+    fn catalog_block_program_rejects_unadmitted_entry_and_unidentified_runner() {
+        let id = BankId::new(0xc002);
+        let hole = ExecutionKey::new(id, GuestPc::new(VA.get() + 8));
+        assert!(matches!(
+            CatalogBlockProgramV1::new(
+                catalog_test_program(id, first_runner, 0x22),
+                hole,
+                InstructionBudget::new(2).unwrap(),
+            ),
+            Err(CatalogBlockProgramErrorV1::EntryNotAdmitted(CpuFault {
+                kind: CpuFaultKind::UnmappedPc { .. },
+                ..
+            }))
+        ));
+
+        let mut unidentified = BlockProgram::new();
+        unidentified
+            .register(
+                CodeBank::new(id, VA, vec![0]).unwrap(),
+                GeneratedBankRunner::new(id, first_runner),
+            )
+            .unwrap();
+        assert!(matches!(
+            CatalogBlockProgramV1::new(
+                unidentified,
+                ExecutionKey::new(id, VA),
+                InstructionBudget::new(2).unwrap(),
+            ),
+            Err(CatalogBlockProgramErrorV1::MissingRunnerArtifactIdentity { bank })
+                if bank == id
+        ));
+    }
+
+    #[test]
+    fn catalog_block_program_replacement_is_validated_before_installation() {
+        let first = BankId::new(0xc003);
+        let second = BankId::new(0xc004);
+        let budget = InstructionBudget::new(2).unwrap();
+        let mut catalog = CatalogBlockProgramV1::new(
+            catalog_test_program(first, first_runner, 0x33),
+            ExecutionKey::new(first, VA),
+            budget,
+        )
+        .unwrap();
+        let first_identity = catalog.identity();
+
+        assert!(catalog
+            .replace_program(
+                catalog_test_program(second, second_runner, 0x44),
+                ExecutionKey::new(second, GuestPc::new(VA.get() + 8)),
+            )
+            .is_err());
+        assert_eq!(catalog.identity(), first_identity);
+        assert_eq!(catalog.entry(), ExecutionKey::new(first, VA));
+
+        catalog
+            .replace_program(
+                catalog_test_program(second, second_runner, 0x44),
+                ExecutionKey::new(second, VA),
+            )
+            .unwrap();
+        assert_ne!(catalog.identity(), first_identity);
+        let mut storage = [];
+        let mut memory = Rdram::new(&mut storage);
+        let mut context = RecompContext::new();
+        catalog.run(&mut context, &mut memory);
+        assert_eq!(context.r_u32(2), 2);
+    }
+
+    #[test]
+    fn catalog_block_dispatch_prefers_host_call_over_overlapping_guest_code() {
+        let bank = BankId::new(0xc005);
+        let entry = ExecutionKey::new(bank, VA);
+        let mut block_program = BlockProgram::new();
+        block_program
+            .register(
+                CodeBank::new(bank, VA, vec![0, 0, 0]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    bank,
+                    catalog_dispatch_runner,
+                    ProgramArtifactIdentity::new([0x55; 32]),
+                ),
+            )
+            .unwrap();
+        let program =
+            CatalogBlockProgramV1::new(block_program, entry, InstructionBudget::new(4).unwrap())
+                .unwrap();
+        let target = GuestPc::new(VA.get() + 4);
+        let resume = ExecutionKey::new(bank, GuestPc::new(VA.get() + 8));
+        let hosts =
+            HostFunctionCatalogV1::new(vec![(target.get(), catalog_dispatch_host)]).unwrap();
+        let mut storage = [];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+
+        assert_eq!(
+            program.resolve_transfer(bank, target),
+            Ok(ExecutionKey::new(bank, target)),
+            "the host target must also be admitted guest code for this precedence regression"
+        );
+
+        assert_eq!(
+            program
+                .dispatch_exposing_exceptions_at(entry, &hosts, &mut ctx, &mut mem)
+                .unwrap()
+                .exit,
+            BlockExit::HostCall {
+                vram: target,
+                resume,
+            }
+        );
+
+        let no_hosts = HostFunctionCatalogV1::new(Vec::new()).unwrap();
+        assert_eq!(
+            program
+                .dispatch_exposing_exceptions_at(entry, &no_hosts, &mut ctx, &mut mem)
+                .unwrap()
+                .exit,
+            BlockExit::Yield(ExecutionKey::new(bank, target))
+        );
+    }
+
+    #[test]
+    fn catalog_block_dispatch_accepts_an_explicit_slice_budget() {
+        let bank = BankId::new(0xc006);
+        let entry = ExecutionKey::new(bank, VA);
+        let program = CatalogBlockProgramV1::new(
+            catalog_test_program(bank, catalog_budget_runner, 0x56),
+            entry,
+            InstructionBudget::new(4).unwrap(),
+        )
+        .unwrap();
+        let hosts = HostFunctionCatalogV1::new(Vec::new()).unwrap();
+        let mut storage = [];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+
+        let one = program
+            .dispatch_exposing_exceptions_at_budget(
+                entry,
+                &hosts,
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+            )
+            .unwrap();
+        assert_eq!(one.instructions, 2);
+        assert_eq!(ctx.r_u32(2), 2);
+        assert_eq!(program.budget().get(), 4);
+
+        let installed = program
+            .dispatch_exposing_exceptions_at(entry, &hosts, &mut ctx, &mut mem)
+            .unwrap();
+        assert_eq!(installed.instructions, 4);
+        assert_eq!(ctx.r_u32(2), 4);
+    }
+
+    #[test]
+    fn catalog_reservation_includes_physical_code_banks() {
+        let static_bank = BankId::new(0xc007);
+        let physical_bank = BankId::new(0xc008);
+        let mut block_program = catalog_test_program(static_bank, first_runner, 0x57);
+        block_program
+            .register_physical_code(mapped_observation_bank(physical_bank))
+            .unwrap();
+        let program = CatalogBlockProgramV1::new(
+            block_program,
+            ExecutionKey::new(static_bank, VA),
+            InstructionBudget::new(2).unwrap(),
+        )
+        .unwrap();
+
+        assert!(program.reserves_bank(static_bank));
+        assert!(program.reserves_bank(physical_bank));
+        assert!(!program.reserves_bank(BankId::new(0xc009)));
+    }
+
+    #[test]
+    fn catalog_resolution_reserves_inactive_generation_banks_until_digest_activation() {
+        let first = BankId::new(0xc101);
+        let second = BankId::new(0xc102);
+        let static_bank = BankId::new(0xc103);
+        let static_pc = GuestPc::new(VA.get() + 0x100);
+        let image_a = 0x2402_0001u32.to_be_bytes();
+        let image_b = 0x2402_0002u32.to_be_bytes();
+        let mut block_program = BlockProgram::new();
+        for (bank, pc, word, identity) in [
+            (first, VA, 0x2402_0001, 0x81),
+            (second, VA, 0x2402_0002, 0x82),
+            (static_bank, static_pc, 0, 0x83),
+        ] {
+            block_program
+                .register(
+                    CodeBank::new(bank, pc, vec![word]).unwrap(),
+                    GeneratedBankRunner::new_with_artifact_identity(
+                        bank,
+                        first_runner,
+                        ProgramArtifactIdentity::new([identity; 32]),
+                    ),
+                )
+                .unwrap();
+        }
+        let program = CatalogBlockProgramV1::new(
+            block_program,
+            ExecutionKey::new(static_bank, static_pc),
+            InstructionBudget::new(4).unwrap(),
+        )
+        .unwrap();
+        let mut catalog = crate::generation::PrecompiledGenerationCatalog::new();
+        for (id, bank, bytes) in [(1, first, image_a), (2, second, image_b)] {
+            catalog
+                .register(
+                    crate::generation::PrecompiledGeneration::new(
+                        crate::generation::GenerationId::new(id),
+                        VA,
+                        GuestPc::new(VA.get() + 4),
+                        VA,
+                        GuestPc::new(VA.get() + 4),
+                        Sha256::digest(bytes).into(),
+                        vec![crate::generation::PrecompiledShard::new(
+                            bank,
+                            VA,
+                            GuestPc::new(VA.get() + 4),
+                        )
+                        .unwrap()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let backing = |id| {
+            crate::generation::PrecompiledGenerationBackingV1::new(
+                crate::generation::GenerationId::new(id),
+                vec![crate::generation::BackedExecutableSpanV1::new(VA, 0x100, 4).unwrap()],
+            )
+            .unwrap()
+        };
+        let mut generations = crate::generation::BackedPrecompiledGenerationCatalogV1::new(
+            catalog,
+            vec![backing(2), backing(1)],
+        )
+        .unwrap();
+        program
+            .validate_precompiled_generations(&generations)
+            .unwrap();
+        assert!(program.reserves_bank_with_generations(first, &generations));
+        assert!(program.reserves_bank_with_generations(second, &generations));
+        assert!(program.reserves_bank_with_generations(static_bank, &generations));
+        assert!(!program.reserves_bank_with_generations(BankId::new(0xc104), &generations));
+
+        assert!(matches!(
+            program.resolve_entry_with_generations(VA, &generations),
+            Err(CpuFault {
+                kind: CpuFaultKind::NoActiveGeneration,
+                ..
+            })
+        ));
+        generations
+            .activate_for_fetch_with_physical(VA, |physical| {
+                image_a[usize::try_from(physical - 0x100).unwrap()]
+            })
+            .unwrap();
+        assert_eq!(
+            program
+                .resolve_entry_with_generations(VA, &generations)
+                .unwrap(),
+            ExecutionKey::new(first, VA)
+        );
+        assert_eq!(
+            program
+                .resolve_transfer_with_generations(second, static_pc, &generations)
+                .unwrap(),
+            ExecutionKey::new(static_bank, static_pc)
+        );
+    }
+
     fn zero_progress_executable_write_runner(
         entry: ExecutionKey,
         _budget: InstructionBudget,
@@ -2401,6 +4288,7 @@ mod tests {
                     1,
                 )
             }
+
             key if key == ExecutionKey::new(second_bank, VA) => {
                 BlockRun::new(BlockExit::Yield(key), 1)
             }
@@ -2428,6 +4316,28 @@ mod tests {
         }
     }
 
+    fn observation_image_changed_runner(
+        entry: ExecutionKey,
+        _budget: InstructionBudget,
+        _ctx: &mut RecompContext,
+        _mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        if entry.pc == VA {
+            return BlockRun::new(
+                BlockExit::Transfer(ExecutionKey::new(entry.bank, GuestPc::new(VA.get() + 4))),
+                3,
+            );
+        }
+        let miss = AotMiss {
+            expected_bank: entry.bank,
+            va_start: VA,
+            byte_len: 8,
+            expected_sha256: [0x11; 32],
+            actual_sha256: [0x22; 32],
+        };
+        BlockRun::new(BlockExit::ImageChanged { at: entry, miss }, 0)
+    }
+
     #[test]
     fn resolves_an_interior_instruction_without_a_function_entry() {
         let mut catalog = CodeCatalog::new();
@@ -2437,6 +4347,138 @@ mod tests {
 
         let key = ExecutionKey::new(BankId::new(1), GuestPc::new(VA.get() + 4));
         assert_eq!(catalog.resolve(key).unwrap().word, 0x2222);
+    }
+
+    #[test]
+    fn static_transfer_resolution_prefers_an_admitting_source_bank() {
+        let first = BankId::new(0xd001);
+        let second = BankId::new(0xd002);
+        let mut catalog = CodeCatalog::new();
+        catalog.register(bank(first.get(), &[1, 2])).unwrap();
+        catalog.register(bank(second.get(), &[3, 4])).unwrap();
+        let target = GuestPc::new(VA.get() + 4);
+
+        assert_eq!(
+            catalog.resolve_transfer(second, target).unwrap(),
+            ExecutionKey::new(second, target)
+        );
+        assert!(matches!(
+            catalog.resolve_entry(first, target),
+            Err(CpuFault {
+                at,
+                kind: CpuFaultKind::AmbiguousPc {
+                    first_candidate,
+                    second_candidate,
+                    candidate_count: 2,
+                },
+            }) if at == ExecutionKey::new(first, target)
+                && first_candidate == first
+                && second_candidate == second
+        ));
+    }
+
+    #[test]
+    fn catalog_resolver_policy_evidence_is_implementation_issued_and_build_bound() {
+        let evidence = catalog_resolver_policy_evidence_v1();
+        assert_eq!(evidence.policy(), CATALOG_RESOLVER_POLICY_NAME_V1);
+        assert_eq!(
+            evidence.exception_vectors(),
+            &CATALOG_RESOLVER_EXCEPTION_VECTORS_V1
+        );
+        assert!(evidence.aligned_pc_admission());
+        assert!(evidence.exact_active_owner_resolution());
+        assert!(evidence.explicit_thread_return_boundary());
+        assert!(evidence.misaligned_target_fault());
+        assert!(evidence.unmapped_or_ambiguous_target_fault());
+        assert!(evidence.traps_enter_shared_resolver());
+        assert_eq!(evidence.build_receipt(), static_execution_build_receipt());
+    }
+
+    #[test]
+    fn static_transfer_resolution_admits_one_cross_bank_target() {
+        let source = BankId::new(0xd010);
+        let destination = BankId::new(0xd011);
+        let target = GuestPc::new(0x8000_2000);
+        let mut catalog = CodeCatalog::new();
+        catalog.register(bank(source.get(), &[1])).unwrap();
+        catalog
+            .register(CodeBank::new(destination, target, vec![2]).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            catalog.resolve_transfer(source, target).unwrap(),
+            ExecutionKey::new(destination, target)
+        );
+        assert_eq!(
+            catalog.resolve_entry(source, target).unwrap(),
+            ExecutionKey::new(destination, target)
+        );
+    }
+
+    #[test]
+    fn static_resolution_reports_ordered_complete_ambiguity() {
+        let first = BankId::new(0xd020);
+        let second = BankId::new(0xd021);
+        let third = BankId::new(0xd022);
+        let fault_bank = BankId::new(0xd0ff);
+        let mut catalog = CodeCatalog::new();
+        for id in [third, first, second] {
+            catalog.register(bank(id.get(), &[1])).unwrap();
+        }
+
+        assert!(matches!(
+            catalog.resolve_entry(fault_bank, VA),
+            Err(CpuFault {
+                at,
+                kind: CpuFaultKind::AmbiguousPc {
+                    first_candidate,
+                    second_candidate,
+                    candidate_count: 3,
+                },
+            }) if at == ExecutionKey::new(fault_bank, VA)
+                && first_candidate == first
+                && second_candidate == second
+        ));
+    }
+
+    #[test]
+    fn static_resolution_fails_typed_for_unmapped_unknown_and_misaligned_targets() {
+        let known = BankId::new(0xd030);
+        let unknown = BankId::new(0xd031);
+        let mut catalog = CodeCatalog::new();
+        catalog.register(bank(known.get(), &[1])).unwrap();
+        let unmapped = GuestPc::new(0x8000_3000);
+
+        assert!(matches!(
+            catalog.resolve_transfer(known, unmapped),
+            Err(CpuFault {
+                at,
+                kind: CpuFaultKind::UnmappedPc { bank_start, bank_end },
+            }) if at == ExecutionKey::new(known, unmapped)
+                && bank_start == VA.get()
+                && bank_end == VA.get() + 4
+        ));
+        assert!(matches!(
+            catalog.resolve_entry(unknown, unmapped),
+            Err(CpuFault {
+                at,
+                kind: CpuFaultKind::UnknownBank,
+            }) if at == ExecutionKey::new(unknown, unmapped)
+        ));
+
+        let misaligned = GuestPc::new(VA.get() + 2);
+        assert_eq!(
+            catalog.resolve_transfer(known, misaligned),
+            Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                known, misaligned,
+            )))
+        );
+        assert_eq!(
+            catalog.resolve_entry(unknown, misaligned),
+            Err(CpuFault::instruction_address_error(ExecutionKey::new(
+                unknown, misaligned,
+            )))
+        );
     }
 
     #[test]
@@ -2599,13 +4641,13 @@ mod tests {
         catalog.register(bank).unwrap();
         assert_eq!(
             catalog.classify(ExecutionKey::new(id, VA)).unwrap(),
-            crate::emit::BankWordKind::Straight
+            BankWordKind::Straight
         );
         assert_eq!(
             catalog
                 .classify(ExecutionKey::new(id, GuestPc::new(VA.get() + 0x20)))
                 .unwrap(),
-            crate::emit::BankWordKind::ControlTransfer
+            BankWordKind::ControlTransfer
         );
         assert!(matches!(
             catalog.classify(ExecutionKey::new(id, GuestPc::new(VA.get() + 0x10))),
@@ -2738,14 +4780,17 @@ mod tests {
                 ExecutionDestinationObservation {
                     destination: ExecutionKey::new(first_bank, VA),
                     runner_artifact_identity: Some(first_artifact),
+                    instructions: 1,
                 },
                 ExecutionDestinationObservation {
                     destination: ExecutionKey::new(first_bank, GuestPc::new(VA.get() + 4),),
                     runner_artifact_identity: Some(first_artifact),
+                    instructions: 1,
                 },
                 ExecutionDestinationObservation {
                     destination: ExecutionKey::new(second_bank, VA),
                     runner_artifact_identity: Some(second_artifact),
+                    instructions: 1,
                 },
             ]
         );
@@ -2809,12 +4854,62 @@ mod tests {
                 ExecutionDestinationObservation {
                     destination: ExecutionKey::new(bank, VA),
                     runner_artifact_identity: Some(artifact),
+                    instructions: 1,
                 },
                 ExecutionDestinationObservation {
                     destination: resume,
                     runner_artifact_identity: Some(artifact),
+                    instructions: 1,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn image_change_preserves_prior_progress_without_recording_stale_entry() {
+        let bank = BankId::new(0x504);
+        let artifact = ProgramArtifactIdentity::new([0x54; 32]);
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(bank, VA, vec![0, 0]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    bank,
+                    observation_image_changed_runner,
+                    artifact,
+                ),
+            )
+            .unwrap();
+        let mut storage = [];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        let mut resolver = |_source_bank: BankId, _target_pc: GuestPc| {
+            unreachable!("the image-change fixture uses only direct transfers")
+        };
+        let run = program
+            .dispatch(
+                ExecutionKey::new(bank, VA),
+                InstructionBudget::new(6).unwrap(),
+                &mut ctx,
+                &mut mem,
+                &mut resolver,
+            )
+            .unwrap();
+        assert_eq!(run.instructions, 3);
+        assert!(matches!(
+            run.exit,
+            BlockExit::ImageChanged {
+                at: ExecutionKey { pc, .. },
+                ..
+            } if pc == GuestPc::new(VA.get() + 4)
+        ));
+        assert_eq!(
+            program.copy_execution_destinations(),
+            vec![ExecutionDestinationObservation {
+                destination: ExecutionKey::new(bank, VA),
+                runner_artifact_identity: Some(artifact),
+                instructions: 3,
+            }]
         );
     }
 
@@ -2842,12 +4937,40 @@ mod tests {
             vec![ExecutionDestinationObservation {
                 destination: ExecutionKey::new(bank, VA),
                 runner_artifact_identity: None,
+                instructions: 1,
             }]
         );
         assert!(BlockProgram::new().copy_execution_destinations().is_empty());
         program.clear_execution_destinations();
         assert!(program.copy_execution_destinations().is_empty());
         assert!(program.code().bank(bank).is_some());
+
+        program.set_execution_destination_history_limit(NonZeroUsize::new(2));
+        for _ in 0..3 {
+            program.run(
+                ExecutionKey::new(bank, VA),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+            );
+        }
+        assert_eq!(program.copy_execution_destinations().len(), 2);
+        program.set_execution_destination_history_enabled(false);
+        program.run(
+            ExecutionKey::new(bank, VA),
+            InstructionBudget::new(2).unwrap(),
+            &mut ctx,
+            &mut mem,
+        );
+        assert!(program.copy_execution_destinations().is_empty());
+        program.set_execution_destination_history_enabled(true);
+        program.run(
+            ExecutionKey::new(bank, VA),
+            InstructionBudget::new(2).unwrap(),
+            &mut ctx,
+            &mut mem,
+        );
+        assert_eq!(program.copy_execution_destinations().len(), 1);
     }
 
     fn mapped_observation_bank(bank: BankId) -> PhysicalCodeBank {
@@ -2999,10 +5122,12 @@ mod tests {
                 ExecutionDestinationObservation {
                     destination: ExecutionKey::new(bank, interpreted_entry),
                     runner_artifact_identity: None,
+                    instructions: interpreted.instructions,
                 },
                 ExecutionDestinationObservation {
                     destination: ExecutionKey::new(bank, direct_aot_entry),
                     runner_artifact_identity: Some(aot_artifact),
+                    instructions: 1,
                 },
             ]
         );
@@ -3136,6 +5261,7 @@ mod tests {
             vec![ExecutionDestinationObservation {
                 destination: ExecutionKey::new(bank, entry),
                 runner_artifact_identity: None,
+                instructions: 2,
             }]
         );
     }
@@ -3236,6 +5362,61 @@ mod tests {
         assert_ne!(
             baseline.identity.identity,
             changed_runner_artifact.identity.identity
+        );
+    }
+
+    #[test]
+    fn generated_adapter_identity_binds_adapter_runner_and_bank() {
+        let baseline = ProgramArtifactIdentity::generated_adapter(
+            [0x11; 32],
+            [0x22; 32],
+            BankId::new(0x33),
+            GeneratedAdapterRole::DirectGenerated,
+        );
+        assert_ne!(
+            baseline,
+            ProgramArtifactIdentity::generated_adapter(
+                [0x10; 32],
+                [0x22; 32],
+                BankId::new(0x33),
+                GeneratedAdapterRole::DirectGenerated,
+            )
+        );
+        assert_ne!(
+            baseline,
+            ProgramArtifactIdentity::generated_adapter(
+                [0x11; 32],
+                [0x23; 32],
+                BankId::new(0x33),
+                GeneratedAdapterRole::DirectGenerated,
+            )
+        );
+        assert_ne!(
+            baseline,
+            ProgramArtifactIdentity::generated_adapter(
+                [0x11; 32],
+                [0x22; 32],
+                BankId::new(0x34),
+                GeneratedAdapterRole::DirectGenerated,
+            )
+        );
+        assert_ne!(
+            baseline,
+            ProgramArtifactIdentity::generated_adapter(
+                [0x22; 32],
+                [0x11; 32],
+                BankId::new(0x33),
+                GeneratedAdapterRole::DirectGenerated,
+            )
+        );
+        assert_ne!(
+            baseline,
+            ProgramArtifactIdentity::generated_adapter(
+                [0x11; 32],
+                [0x22; 32],
+                BankId::new(0x33),
+                GeneratedAdapterRole::EntryContextGate,
+            )
         );
     }
 
@@ -3551,8 +5732,16 @@ mod tests {
     #[test]
     fn instruction_budget_cannot_split_a_branch_delay_pair() {
         assert_eq!(InstructionBudget::new(0), None);
-        assert_eq!(InstructionBudget::new(1), None);
-        assert_eq!(InstructionBudget::new(2).unwrap().get(), 2);
+        let one = InstructionBudget::new(1).unwrap();
+        assert_eq!(one.get(), 1);
+        assert!(!one.can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS));
+        let two = InstructionBudget::new(2).unwrap();
+        assert_eq!(two.get(), 2);
+        assert!(two.can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS));
+        assert!(!two.can_fit(1, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS));
+        assert!(!InstructionBudget::new(u32::MAX)
+            .unwrap()
+            .can_fit(u32::MAX, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS));
     }
 
     #[test]
@@ -3631,32 +5820,35 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_checkpoints_before_an_indivisible_next_unit() {
+    fn dispatcher_reports_an_indivisible_unit_in_the_final_one_instruction_slice() {
         let first = ExecutionKey::new(BankId::new(1), GuestPc::new(0x8000_1000));
         let next = ExecutionKey::new(BankId::new(1), GuestPc::new(0x8000_1004));
         let mut calls = 0;
-        let mut runner = |_entry, _budget| {
+        let mut runner = |entry, budget: InstructionBudget| {
             calls += 1;
-            BlockRun::new(BlockExit::Transfer(next), 1)
+            if entry == next && budget.get() == 1 {
+                BlockRun::new(BlockExit::Checkpoint(next), 0)
+            } else {
+                BlockRun::new(BlockExit::Transfer(next), 1)
+            }
         };
         let mut resolver = |_source_bank, _target_pc| unreachable!();
 
-        let run = dispatch_until_boundary(
-            first,
-            InstructionBudget::new(2).unwrap(),
-            &mut runner,
-            &mut resolver,
-        )
-        .unwrap();
-        assert_eq!(calls, 1);
+        let final_budget = InstructionBudget::new(1).unwrap();
         assert_eq!(
-            run,
-            DispatchRun {
-                exit: BlockExit::Checkpoint(next),
-                instructions: 1,
-                blocks: 1,
-            }
+            dispatch_until_boundary(
+                first,
+                InstructionBudget::new(2).unwrap(),
+                &mut runner,
+                &mut resolver,
+            ),
+            Err(DispatchError::IndivisibleUnitExceedsBudget {
+                at: next,
+                budget: final_budget,
+                required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
+            })
         );
+        assert_eq!(calls, 2);
     }
 
     #[test]
@@ -3670,6 +5862,16 @@ mod tests {
             Err(DispatchError::ContinuingExitWithoutProgress {
                 at: entry,
                 exit: BlockExit::Transfer(entry),
+            })
+        );
+
+        let checkpoint = BlockExit::Checkpoint(entry);
+        let mut stalled_checkpoint = |_entry, _budget| BlockRun::new(checkpoint, 0);
+        assert_eq!(
+            dispatch_until_boundary(entry, budget, &mut stalled_checkpoint, &mut resolver),
+            Err(DispatchError::ContinuingExitWithoutProgress {
+                at: entry,
+                exit: checkpoint,
             })
         );
 
@@ -3747,7 +5949,7 @@ mod tests {
         let source = BankId::new(0xA);
         let target = ExecutionKey::new(BankId::new(0xC), GuestPc::new(0x8000_4000));
         crate::runtime::set_guest_write_boundary_observer(Some(changed));
-        crate::runtime::notify_guest_write(0x20, 4);
+        crate::runtime::notify_cpu_instruction_store(0x20, 4);
         assert_eq!(
             finalize_executable_write_exit(source, BlockExit::Transfer(target)),
             BlockExit::ExecutableWrite {
@@ -3808,5 +6010,125 @@ mod tests {
                 blocks: 1,
             }
         );
+    }
+
+    fn source_attestation_fixture(
+        binding: CargoGeneratedRunnerSourceBindingV1,
+    ) -> Result<CatalogBlockProgramV1, CatalogBlockProgramErrorV1> {
+        let artifact = ProgramArtifactIdentity::generated_adapter(
+            [0x11; 32],
+            [0x33; 32],
+            binding.bank,
+            GeneratedAdapterRole::DirectGenerated,
+        );
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(binding.bank, VA, vec![0]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    binding.bank,
+                    first_runner,
+                    artifact,
+                ),
+            )
+            .unwrap();
+        CatalogBlockProgramV1::new_with_cargo_generated_runner_source_attestation_v2(
+            program,
+            ExecutionKey::new(binding.bank, VA),
+            InstructionBudget::new(2).unwrap(),
+            CargoGeneratedProgramSourceAttestationV2 {
+                root_adapter_source_sha256: [0x11; 32],
+                shard_cargo_source_tree_sha256: [0x22; 32],
+                expected_emitter_source_sha256: [0x44; 32],
+                externally_measured_emitter_source_sha256: [0x44; 32],
+                expected_runtime_source_sha256: generated_runner_runtime_source_receipt_v1()
+                    .source_sha256(),
+                runtime_source_receipt: generated_runner_runtime_source_receipt_v1(),
+                runners: &[binding],
+            },
+        )
+    }
+
+    fn valid_source_binding() -> CargoGeneratedRunnerSourceBindingV1 {
+        CargoGeneratedRunnerSourceBindingV1 {
+            bank: BankId::new(0xA701),
+            generated_runner_source_sha256: [0x33; 32],
+            code_words_sha256: Sha256::digest(0u32.to_be_bytes()).into(),
+            vram_start: VA,
+            vram_end: GuestPc::new(VA.get() + 4),
+            composite_subrunner_count: 32,
+            adapter_role: GeneratedAdapterRole::DirectGenerated,
+        }
+    }
+
+    #[test]
+    fn generated_runner_source_attestation_binds_composite_source_program_and_role() {
+        let catalog = source_attestation_fixture(valid_source_binding()).unwrap();
+        let attestation = catalog
+            .generated_runner_source_attestation()
+            .expect("source-attested constructor retains its projection");
+        assert_eq!(
+            attestation.schema(),
+            GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2
+        );
+        assert!(attestation.cargo_source_fields_validated());
+        assert_eq!(
+            attestation.build_receipt(),
+            static_execution_build_receipt()
+        );
+
+        for malformed in [
+            CargoGeneratedRunnerSourceBindingV1 {
+                generated_runner_source_sha256: [0x44; 32],
+                ..valid_source_binding()
+            },
+            CargoGeneratedRunnerSourceBindingV1 {
+                adapter_role: GeneratedAdapterRole::EntryContextGate,
+                ..valid_source_binding()
+            },
+            CargoGeneratedRunnerSourceBindingV1 {
+                vram_end: GuestPc::new(VA.get() + 8),
+                ..valid_source_binding()
+            },
+            CargoGeneratedRunnerSourceBindingV1 {
+                code_words_sha256: [0x55; 32],
+                ..valid_source_binding()
+            },
+            CargoGeneratedRunnerSourceBindingV1 {
+                composite_subrunner_count: 0,
+                ..valid_source_binding()
+            },
+        ] {
+            assert!(source_attestation_fixture(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn generic_generated_runner_identity_never_claims_source_attestation() {
+        let binding = valid_source_binding();
+        let artifact = ProgramArtifactIdentity::generated_adapter(
+            [0x11; 32],
+            binding.generated_runner_source_sha256,
+            binding.bank,
+            binding.adapter_role,
+        );
+        let mut program = BlockProgram::new();
+        program
+            .register(
+                CodeBank::new(binding.bank, VA, vec![0]).unwrap(),
+                GeneratedBankRunner::new_with_artifact_identity(
+                    binding.bank,
+                    first_runner,
+                    artifact,
+                ),
+            )
+            .unwrap();
+        let catalog = CatalogBlockProgramV1::new(
+            program,
+            ExecutionKey::new(binding.bank, VA),
+            InstructionBudget::new(2).unwrap(),
+        )
+        .unwrap();
+        assert!(catalog.generated_runner_source_attestation().is_none());
     }
 }

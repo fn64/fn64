@@ -180,7 +180,7 @@ mod tests {
         word(&mut bytes, 0x03e00008);
         word(&mut bytes, 0);
         word(&mut bytes, 0x80086588); // .data pointer
-        // reloc section: 5 header words, 2 relocs, pad, size word
+                                      // reloc section: 5 header words, 2 relocs, pad, size word
         let header_start = bytes.len();
         word(&mut bytes, 16); // text
         word(&mut bytes, 4); // data

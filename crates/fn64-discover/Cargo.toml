@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Mechanical, zero-LLM N64 ROM function-metadata discovery frontend, per docs/DISCOVER-DESIGN.md. Proven facts + rejected candidates + an explicit unresolved frontier -- never a guessed symbol file."
+autobins = false
+
+[features]
+default = []
+writer-runtime-authority = ["dep:fn64-boot-harness"]
 
 [dependencies]
-fn64-recomp-rs = { path = "../fn64-recomp-rs" }
+fn64-boot-harness = { path = "../fn64-boot-harness", optional = true, default-features = false, features = ["recomp-rs"] }
+fn64-recomp-rs = { path = "../fn64-recomp-rs", default-features = false, features = ["aot-runtime"] }
+fn64-recomp-rs-codegen = { path = "../fn64-recomp-rs-codegen" }
 fn64-runtime = { path = "../fn64-runtime" }
 csv = "1"
 serde = { version = "1", features = ["derive"] }
@@ -15,98 +22,237 @@ serde_json = "1"
 sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
+libc = "0.2"
 toml = "0.8"
 
 [dev-dependencies]
 
 [[bin]]
-name = "gate_b1"
-path = "src/bin/gate_b1.rs"
-
-[[bin]]
-name = "gate_b2"
-path = "src/bin/gate_b2.rs"
-
-[[bin]]
-name = "gate_d1"
-path = "src/bin/gate_d1.rs"
-
-[[bin]]
-name = "gate_d1_overlays"
-path = "src/bin/gate_d1_overlays.rs"
-
-[[bin]]
-name = "gate_d1_oot_overlays"
-path = "src/bin/gate_d1_oot_overlays.rs"
-
-[[bin]]
-name = "gate_owners_overlays"
-path = "src/bin/gate_owners_overlays.rs"
-
-[[bin]]
 name = "fn64-discover"
 path = "src/bin/fn64_discover.rs"
+test = false
 
 [[bin]]
-name = "headless-bridge"
-path = "src/bin/headless_bridge.rs"
+name = "candidate_cfg_probe"
+path = "src/bin/candidate_cfg_probe.rs"
+test = false
 
 [[bin]]
-name = "gate_regions"
-path = "src/bin/gate_regions.rs"
+name = "compare_computed_flows"
+path = "src/bin/compare_computed_flows.rs"
+test = true
 
 [[bin]]
-name = "gate_homology"
-path = "src/bin/gate_homology.rs"
-
-[[bin]]
-name = "gate_callgraph_match"
-path = "src/bin/gate_callgraph_match.rs"
-
-[[bin]]
-name = "gate_corpus_homology"
-path = "src/bin/gate_corpus_homology.rs"
-
-[[bin]]
-name = "gate_loaders"
-path = "src/bin/gate_loaders.rs"
-
-[[bin]]
-name = "gate_static_closure"
-path = "src/bin/gate_static_closure.rs"
-
-[[bin]]
-name = "gate_oot_reference"
-path = "src/bin/gate_oot_reference.rs"
-
-[[bin]]
-name = "gate_coverage"
-path = "src/bin/gate_coverage.rs"
-
-[[bin]]
-name = "gate_overlay_generalize"
-path = "src/bin/gate_overlay_generalize.rs"
-
-[[bin]]
-name = "gate_closure"
-path = "src/bin/gate_closure.rs"
-
-[[bin]]
-name = "gate_reloc_accuracy"
-path = "src/bin/gate_reloc_accuracy.rs"
-
-[[bin]]
-name = "gate_content_consumer"
-path = "src/bin/gate_content_consumer.rs"
+name = "validate_candidate_receipts"
+path = "src/bin/validate_candidate_receipts.rs"
+test = false
 
 [[bin]]
 name = "gate_asm_roundtrip"
 path = "src/bin/gate_asm_roundtrip.rs"
+test = false
 
 [[bin]]
-name = "gate_wm2000_recompile"
-path = "src/bin/gate_wm2000_recompile.rs"
+name = "gate_b1"
+path = "src/bin/gate_b1.rs"
+test = false
+
+[[bin]]
+name = "gate_b2"
+path = "src/bin/gate_b2.rs"
+test = false
+
+[[bin]]
+name = "gate_callgraph_match"
+path = "src/bin/gate_callgraph_match.rs"
+test = false
+
+[[bin]]
+name = "gate_closure"
+path = "src/bin/gate_closure.rs"
+test = false
+
+[[bin]]
+name = "gate_content_consumer"
+path = "src/bin/gate_content_consumer.rs"
+test = false
+
+[[bin]]
+name = "gate_corpus_homology"
+path = "src/bin/gate_corpus_homology.rs"
+test = false
+
+[[bin]]
+name = "gate_coverage"
+path = "src/bin/gate_coverage.rs"
+test = false
+
+[[bin]]
+name = "gate_d1"
+path = "src/bin/gate_d1.rs"
+test = false
+
+[[bin]]
+name = "gate_d1_oot_overlays"
+path = "src/bin/gate_d1_oot_overlays.rs"
+test = false
+
+[[bin]]
+name = "gate_d1_overlays"
+path = "src/bin/gate_d1_overlays.rs"
+test = false
+
+[[bin]]
+name = "gate_decomp_functions"
+path = "src/bin/gate_decomp_functions.rs"
+test = false
+
+[[bin]]
+name = "gate_decomp_reference"
+path = "src/bin/gate_decomp_reference.rs"
+test = false
+
+[[bin]]
+name = "gate_delta_vote"
+path = "src/bin/gate_delta_vote.rs"
+test = false
+
+[[bin]]
+name = "gate_gp_base"
+path = "src/bin/gate_gp_base.rs"
+test = false
+
+[[bin]]
+name = "gate_homology"
+path = "src/bin/gate_homology.rs"
+test = false
+
+[[bin]]
+name = "gate_keys"
+path = "src/bin/gate_keys.rs"
+test = false
+
+[[bin]]
+name = "gate_loaders"
+path = "src/bin/gate_loaders.rs"
+test = false
+
+[[bin]]
+name = "gate_oot_reference"
+path = "src/bin/gate_oot_reference.rs"
+test = false
+
+[[bin]]
+name = "gate_overlay_generalize"
+path = "src/bin/gate_overlay_generalize.rs"
+test = false
+
+[[bin]]
+name = "gate_overlay_regions"
+path = "src/bin/gate_overlay_regions.rs"
+test = false
+
+[[bin]]
+name = "gate_owners_overlays"
+path = "src/bin/gate_owners_overlays.rs"
+test = true
+
+[[bin]]
+name = "gate_recompiler_lint"
+path = "src/bin/gate_recompiler_lint.rs"
+test = true
+
+[[bin]]
+name = "gate_recover_boundaries"
+path = "src/bin/gate_recover_boundaries.rs"
+test = false
+
+[[bin]]
+name = "gate_regions"
+path = "src/bin/gate_regions.rs"
+test = false
+
+[[bin]]
+name = "gate_reloc_accuracy"
+path = "src/bin/gate_reloc_accuracy.rs"
+test = false
+
+[[bin]]
+name = "gate_selector"
+path = "src/bin/gate_selector.rs"
+test = false
+
+[[bin]]
+name = "gate_static_closure"
+path = "src/bin/gate_static_closure.rs"
+test = false
 
 [[bin]]
 name = "gate_timing_diff"
 path = "src/bin/gate_timing_diff.rs"
+test = false
+
+[[bin]]
+name = "gate_tool_jsonl"
+path = "src/bin/gate_tool_jsonl.rs"
+test = false
+
+[[bin]]
+name = "gate_trace"
+path = "src/bin/gate_trace.rs"
+test = false
+
+[[bin]]
+name = "gate_wm2000_recompile"
+path = "src/bin/gate_wm2000_recompile.rs"
+test = true
+
+[[bin]]
+name = "headless-bridge"
+path = "src/bin/headless_bridge.rs"
+test = false
+
+[[bin]]
+name = "ingest_tool_claims"
+path = "src/bin/ingest_tool_claims.rs"
+test = true
+
+[[bin]]
+name = "profile_overlay_regions"
+path = "src/bin/profile_overlay_regions.rs"
+test = false
+
+[[bin]]
+name = "produce_snapshot_workspace"
+path = "src/bin/produce_snapshot_workspace.rs"
+test = true
+
+[[bin]]
+name = "rom_identity"
+path = "src/bin/rom_identity.rs"
+test = true
+
+[[bin]]
+name = "run_wm_writer_audit"
+path = "src/bin/run_wm_writer_audit.rs"
+test = true
+
+[[bin]]
+name = "stage_snapshot_bank"
+path = "src/bin/stage_snapshot_bank.rs"
+test = false
+
+[[bin]]
+name = "validate_executable_image_group"
+path = "src/bin/validate_executable_image_group.rs"
+test = true
+
+[[bin]]
+name = "validate_training_workspace"
+path = "src/bin/validate_training_workspace.rs"
+test = false
+
+[[bin]]
+name = "attribute_known_functions"
+path = "src/bin/attribute_known_functions.rs"
+test = true

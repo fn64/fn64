@@ -236,12 +236,15 @@ impl LoadRequestCallSlice {
 pub struct PointerArgCallSlice {
     pub call_pc: VirtualAddress,
     pub callee: VirtualAddress,
+    pub pointer_register: u8,
     pub pointer: StaticOperand<VirtualAddress>,
 }
 
 /// Find direct calls to `callee` and recover the pointer argument in the
 /// declared register. Which register — and what the pointer means — is the
 /// caller's cited claim; this slicer only recovers straight-line constants.
+/// The single-contract entry point delegates to the batch implementation so
+/// both paths have identical operand semantics.
 pub fn slice_pointer_arg_calls(
     image_words: &[u32],
     image_start: VirtualAddress,
@@ -249,21 +252,61 @@ pub fn slice_pointer_arg_calls(
     rdram_len: u32,
     pointer_register: u8,
 ) -> Result<Vec<PointerArgCallSlice>, PiDmaSliceError> {
+    slice_pointer_arg_call_contracts(
+        image_words,
+        image_start,
+        rdram_len,
+        &[(callee, pointer_register)],
+    )
+}
+
+/// Recover several direct-call pointer contracts with one image scan.
+/// Duplicate contracts collapse, callees and registers are matched exactly,
+/// and output order is call-PC then register order regardless of input order.
+pub fn slice_pointer_arg_call_contracts(
+    image_words: &[u32],
+    image_start: VirtualAddress,
+    rdram_len: u32,
+    contracts: &[(VirtualAddress, u8)],
+) -> Result<Vec<PointerArgCallSlice>, PiDmaSliceError> {
     validate_input(image_words, image_start, rdram_len)?;
+    let mut registers_by_callee = BTreeMap::<u32, BTreeSet<u8>>::new();
+    for &(callee, pointer_register) in contracts {
+        if pointer_register >= 32 {
+            return Err(PiDmaSliceError::InvalidPointerRegister {
+                register: pointer_register,
+            });
+        }
+        registers_by_callee
+            .entry(callee.get())
+            .or_default()
+            .insert(pointer_register);
+    }
+    if registers_by_callee.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut out = Vec::new();
     for call_index in 0..image_words.len().saturating_sub(1) {
         let call_pc = pc_at(image_start, call_index);
-        if direct_jal_target(image_words[call_index], call_pc) != Some(callee.get()) {
+        let Some(callee) = direct_jal_target(image_words[call_index], call_pc) else {
             continue;
+        };
+        let Some(registers) = registers_by_callee.get(&callee) else {
+            continue;
+        };
+        let requested: Vec<u8> = registers.iter().copied().collect();
+        let state = slice_state_at_call(image_words, image_start, call_index, &requested);
+        for &pointer_register in registers {
+            out.push(PointerArgCallSlice {
+                call_pc,
+                callee: VirtualAddress::new(callee),
+                pointer_register,
+                pointer: map_operand(register_operand(&state, pointer_register), |raw| {
+                    Ok(VirtualAddress::new(raw))
+                }),
+            });
         }
-        let state = slice_state_at_call(image_words, image_start, call_index, &[pointer_register]);
-        out.push(PointerArgCallSlice {
-            call_pc,
-            callee,
-            pointer: map_operand(register_operand(&state, pointer_register), |raw| {
-                Ok(VirtualAddress::new(raw))
-            }),
-        });
     }
     Ok(out)
 }
@@ -274,6 +317,7 @@ pub enum PiDmaSliceError {
     ImageAddressUnaligned { start: VirtualAddress },
     ImageAddressOverflow,
     RdramLengthOutsidePhysicalDomain { rdram_len: u32 },
+    InvalidPointerRegister { register: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -544,7 +588,10 @@ fn slice_state_at_call(
     let budget_start = call_index.saturating_sub(MAX_BACKWARD_WORDS);
     let mut slice_start = budget_start;
     for (index, &word) in words.iter().enumerate().take(call_index).skip(budget_start) {
-        if is_control_transfer(word) && index + 1 < call_index {
+        if is_control_transfer(word)
+            && index + 1 < call_index
+            && !ordinary_branch_skips_call(word, index, call_index)
+        {
             slice_start = index + 2;
         }
     }
@@ -605,8 +652,7 @@ fn slice_state_at_call(
         state.registers[29] = history.registers[29].clone();
         for register in [16u8, 17, 18, 19, 20, 21, 22, 23, 28, 30] {
             if !matches!(history.registers[register as usize], Value::Open(_)) {
-                state.registers[register as usize] =
-                    history.registers[register as usize].clone();
+                state.registers[register as usize] = history.registers[register as usize].clone();
             }
         }
     }
@@ -628,6 +674,30 @@ fn slice_state_at_call(
     }
 
     state
+}
+
+/// An ordinary conditional branch whose taken edge skips the call is not a
+/// merge on the call path: reaching the call selects its not-taken edge, and
+/// the ordinary delay slot executes on that edge. Branch-likely and REGIMM
+/// forms stay hard boundaries because their delay/link semantics differ.
+fn ordinary_branch_skips_call(word: u32, branch_index: usize, call_index: usize) -> bool {
+    let op = word >> 26;
+    if !matches!(op, 0x04..=0x07) {
+        return false;
+    }
+    let rs = (word >> 21) & 0x1f;
+    let rt = (word >> 16) & 0x1f;
+    let always_taken = match op {
+        0x04 => rs == rt,
+        0x06 => rs == 0,
+        _ => false,
+    };
+    if always_taken {
+        return false;
+    }
+    let displacement = i64::from(word as i16);
+    let target = branch_index as i64 + 1 + displacement;
+    target > call_index.saturating_add(1) as i64
 }
 
 fn map_direction(operand: StaticOperand<u32>) -> StaticOperand<PiDmaDirection> {
@@ -829,21 +899,17 @@ fn execute(state: &mut SliceState, pc: VirtualAddress, word: u32) {
             // e.g. a segment's byte count as `subu end, start` of two
             // link-time constants). Anything else stays unsupported.
             0x21 | 0x23 | 0x25 if rd != 0 => {
-                let value = match (
-                    &state.registers[rs as usize],
-                    &state.registers[rt as usize],
-                ) {
-                    (
-                        Value::Constant { value: lhs, .. },
-                        Value::Constant { value: rhs, .. },
-                    ) => Value::Constant {
-                        value: match word & 0x3f {
-                            0x21 => lhs.wrapping_add(*rhs),
-                            0x23 => lhs.wrapping_sub(*rhs),
-                            _ => lhs | rhs,
-                        },
-                        source: OperandSource::RegisterDefinition { register: rd, pc },
-                    },
+                let value = match (&state.registers[rs as usize], &state.registers[rt as usize]) {
+                    (Value::Constant { value: lhs, .. }, Value::Constant { value: rhs, .. }) => {
+                        Value::Constant {
+                            value: match word & 0x3f {
+                                0x21 => lhs.wrapping_add(*rhs),
+                                0x23 => lhs.wrapping_sub(*rhs),
+                                _ => lhs | rhs,
+                            },
+                            source: OperandSource::RegisterDefinition { register: rd, pc },
+                        }
+                    }
                     _ => Value::open(SliceBlocker::UnsupportedRegisterWrite { pc, register: rd }),
                 };
                 state.set_register(rd, value);
@@ -1034,6 +1100,468 @@ fn direct_jal_target(word: u32, pc: VirtualAddress) -> Option<u32> {
 
 fn pc_at(start: VirtualAddress, index: usize) -> VirtualAddress {
     VirtualAddress::new(start.get().wrapping_add((index as u32).wrapping_mul(4)))
+}
+
+/// A game-local wrapper whose body establishes the o32 contract
+/// `(destination, physical_start, physical_end_exclusive)` and issues the
+/// transfer through a chunked `osPiStartDma`-shaped call.
+///
+/// This is a semantic body classification, not a symbol or byte signature.
+/// The retained sites make the classification independently auditable against
+/// the admitted image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalEndDmaWrapper {
+    pub entry_va: u32,
+    pub callers: Vec<u32>,
+    pub nested_dma_call_pc: u32,
+}
+
+/// Bounded result of [`infer_physical_end_dma_wrappers`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PhysicalEndDmaWrapperInference {
+    pub admitted: Vec<PhysicalEndDmaWrapper>,
+    pub candidates_examined: usize,
+    pub candidate_limit_hit: bool,
+}
+
+const MAX_PHYSICAL_END_WRAPPER_CANDIDATES: usize = 4096;
+const MAX_PHYSICAL_END_WRAPPER_WORDS: usize = 128;
+const MIN_PHYSICAL_END_WRAPPER_CALLERS: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrapperValue {
+    Unknown,
+    Constant(u32),
+    Stack(i32),
+    Destination,
+    PhysicalStart,
+    PhysicalEnd,
+    Length,
+    DestinationCursor,
+    PhysicalCursor,
+}
+
+#[derive(Clone)]
+struct WrapperState {
+    registers: [WrapperValue; 32],
+    stack_words: BTreeMap<i32, WrapperValue>,
+}
+
+impl WrapperState {
+    fn new() -> Self {
+        let mut registers = [WrapperValue::Unknown; 32];
+        registers[0] = WrapperValue::Constant(0);
+        registers[4] = WrapperValue::Destination;
+        registers[5] = WrapperValue::PhysicalStart;
+        registers[6] = WrapperValue::PhysicalEnd;
+        registers[29] = WrapperValue::Stack(0);
+        Self {
+            registers,
+            stack_words: BTreeMap::new(),
+        }
+    }
+
+    fn stack_word(&self, offset: i32) -> WrapperValue {
+        let WrapperValue::Stack(sp) = self.registers[29] else {
+            return WrapperValue::Unknown;
+        };
+        sp.checked_add(offset)
+            .and_then(|address| self.stack_words.get(&address).copied())
+            .unwrap_or(WrapperValue::Unknown)
+    }
+
+    fn clobber_caller_saved(&mut self) {
+        for register in 1..=15 {
+            self.registers[register] = WrapperValue::Unknown;
+        }
+        for register in 24..=27 {
+            self.registers[register] = WrapperValue::Unknown;
+        }
+        self.registers[31] = WrapperValue::Unknown;
+        self.registers[0] = WrapperValue::Constant(0);
+    }
+}
+
+fn wrapper_move_or_arithmetic(lhs: WrapperValue, rhs: WrapperValue, funct: u32) -> WrapperValue {
+    if matches!(funct, 0x21 | 0x25 | 0x2d) {
+        if rhs == WrapperValue::Constant(0) {
+            return lhs;
+        }
+        if lhs == WrapperValue::Constant(0) {
+            return rhs;
+        }
+    }
+    if funct == 0x23 && lhs == WrapperValue::PhysicalEnd && rhs == WrapperValue::PhysicalStart {
+        return WrapperValue::Length;
+    }
+    if funct == 0x24
+        && ((lhs == WrapperValue::Length && matches!(rhs, WrapperValue::Constant(_)))
+            || (rhs == WrapperValue::Length && matches!(lhs, WrapperValue::Constant(_))))
+    {
+        return WrapperValue::Length;
+    }
+    if funct == 0x21 {
+        return match (lhs, rhs) {
+            (WrapperValue::Destination | WrapperValue::DestinationCursor, WrapperValue::Length)
+            | (WrapperValue::Length, WrapperValue::Destination | WrapperValue::DestinationCursor) => {
+                WrapperValue::DestinationCursor
+            }
+            (WrapperValue::PhysicalStart | WrapperValue::PhysicalCursor, WrapperValue::Length)
+            | (WrapperValue::Length, WrapperValue::PhysicalStart | WrapperValue::PhysicalCursor) => {
+                WrapperValue::PhysicalCursor
+            }
+            _ => WrapperValue::Unknown,
+        };
+    }
+    if funct == 0x23 && lhs == WrapperValue::Length && rhs == WrapperValue::Length {
+        return WrapperValue::Length;
+    }
+    WrapperValue::Unknown
+}
+
+fn execute_wrapper_word(state: &mut WrapperState, word: u32) -> (bool, bool, bool) {
+    let op = word >> 26;
+    let rs = ((word >> 21) & 0x1f) as usize;
+    let rt = ((word >> 16) & 0x1f) as usize;
+    let rd = ((word >> 11) & 0x1f) as usize;
+    let immediate = (word as i16) as i32;
+    let mut destination_advanced = false;
+    let mut physical_advanced = false;
+    let mut remaining_reduced = false;
+    match op {
+        0 => {
+            let funct = word & 0x3f;
+            if rd != 0 {
+                let value =
+                    wrapper_move_or_arithmetic(state.registers[rs], state.registers[rt], funct);
+                destination_advanced = value == WrapperValue::DestinationCursor
+                    && matches!(
+                        state.registers[rs],
+                        WrapperValue::Destination | WrapperValue::DestinationCursor
+                    )
+                    || value == WrapperValue::DestinationCursor
+                        && matches!(
+                            state.registers[rt],
+                            WrapperValue::Destination | WrapperValue::DestinationCursor
+                        );
+                physical_advanced = value == WrapperValue::PhysicalCursor
+                    && matches!(
+                        state.registers[rs],
+                        WrapperValue::PhysicalStart | WrapperValue::PhysicalCursor
+                    )
+                    || value == WrapperValue::PhysicalCursor
+                        && matches!(
+                            state.registers[rt],
+                            WrapperValue::PhysicalStart | WrapperValue::PhysicalCursor
+                        );
+                remaining_reduced = funct == 0x23
+                    && state.registers[rs] == WrapperValue::Length
+                    && state.registers[rt] == WrapperValue::Length;
+                state.registers[rd] = value;
+            }
+        }
+        0x0f => state.registers[rt] = WrapperValue::Constant((word & 0xffff) << 16),
+        0x0d => {
+            state.registers[rt] = match state.registers[rs] {
+                WrapperValue::Constant(value) => WrapperValue::Constant(value | (word & 0xffff)),
+                value if (word & 0xffff) == 0 => value,
+                _ => WrapperValue::Unknown,
+            };
+        }
+        0x08 | 0x09 | 0x18 | 0x19 => {
+            state.registers[rt] = match state.registers[rs] {
+                WrapperValue::Stack(offset) => offset
+                    .checked_add(immediate)
+                    .map(WrapperValue::Stack)
+                    .unwrap_or(WrapperValue::Unknown),
+                WrapperValue::Constant(value) => {
+                    WrapperValue::Constant(value.wrapping_add(immediate as u32))
+                }
+                WrapperValue::Length => WrapperValue::Length,
+                _ => WrapperValue::Unknown,
+            };
+        }
+        0x0c => {
+            state.registers[rt] = match state.registers[rs] {
+                WrapperValue::Length => WrapperValue::Length,
+                WrapperValue::Constant(value) => WrapperValue::Constant(value & (word & 0xffff)),
+                _ => WrapperValue::Unknown,
+            };
+        }
+        0x23 => {
+            state.registers[rt] = match state.registers[rs] {
+                WrapperValue::Stack(offset) => offset
+                    .checked_add(immediate)
+                    .and_then(|address| state.stack_words.get(&address).copied())
+                    .unwrap_or(WrapperValue::Unknown),
+                _ => WrapperValue::Unknown,
+            };
+        }
+        0x2b => {
+            if let WrapperValue::Stack(offset) = state.registers[rs] {
+                if let Some(address) = offset.checked_add(immediate) {
+                    state.stack_words.insert(address, state.registers[rt]);
+                }
+            }
+        }
+        _ => {
+            if let Some(register) = written_gpr(word) {
+                state.registers[register as usize] = WrapperValue::Unknown;
+            }
+        }
+    }
+    (destination_advanced, physical_advanced, remaining_reduced)
+}
+
+fn branch_target(pc: u32, word: u32) -> Option<u32> {
+    matches!(word >> 26, 0x01..=0x07 | 0x14..=0x17).then(|| {
+        pc.wrapping_add(4)
+            .wrapping_add(((word as i16 as i32) << 2) as u32)
+    })
+}
+
+fn classify_physical_end_wrapper(
+    words: &[u32],
+    image_start: u32,
+    entry_index: usize,
+) -> Option<u32> {
+    let end = words
+        .len()
+        .min(entry_index.saturating_add(MAX_PHYSICAL_END_WRAPPER_WORDS));
+    let mut state = WrapperState::new();
+    let mut saw_end_minus_start = false;
+    let mut nested_dma_call = None;
+    let mut destination_advanced = false;
+    let mut physical_advanced = false;
+    let mut remaining_reduced = false;
+    let mut backward_loop = false;
+    let mut saw_return = false;
+    let mut index = entry_index;
+    while index < end {
+        let word = words[index];
+        let pc = image_start.wrapping_add((index as u32).wrapping_mul(4));
+        if word == 0x03e0_0008 {
+            saw_return = true;
+            break;
+        }
+        if word >> 26 == 0x03 && index + 1 < end {
+            let mut call_state = state.clone();
+            execute_wrapper_word(&mut call_state, words[index + 1]);
+            if call_state.registers[6] == WrapperValue::Constant(0)
+                && matches!(
+                    call_state.registers[7],
+                    WrapperValue::PhysicalStart | WrapperValue::PhysicalCursor
+                )
+                && matches!(
+                    call_state.stack_word(0x10),
+                    WrapperValue::Destination | WrapperValue::DestinationCursor
+                )
+                && call_state.stack_word(0x14) == WrapperValue::Length
+            {
+                nested_dma_call = Some(pc);
+            }
+            state = call_state;
+            state.clobber_caller_saved();
+            index += 2;
+            continue;
+        }
+        let rs = ((word >> 21) & 0x1f) as usize;
+        let rt = ((word >> 16) & 0x1f) as usize;
+        if word >> 26 == 0
+            && word & 0x3f == 0x23
+            && state.registers[rs] == WrapperValue::PhysicalEnd
+            && state.registers[rt] == WrapperValue::PhysicalStart
+        {
+            saw_end_minus_start = true;
+        }
+        let (advanced_destination, advanced_physical, reduced_remaining) =
+            execute_wrapper_word(&mut state, word);
+        if nested_dma_call.is_some() {
+            destination_advanced |= advanced_destination;
+            physical_advanced |= advanced_physical;
+            remaining_reduced |= reduced_remaining;
+            if branch_target(pc, word)
+                .is_some_and(|target| target <= nested_dma_call.expect("checked above"))
+            {
+                backward_loop = true;
+            }
+        }
+        index += 1;
+    }
+    if saw_end_minus_start
+        && nested_dma_call.is_some()
+        && destination_advanced
+        && physical_advanced
+        && remaining_reduced
+        && backward_loop
+        && saw_return
+    {
+        nested_dma_call
+    } else {
+        None
+    }
+}
+
+/// Infer chunked physical-ROM loaders without a symbol, title-specific
+/// address, or exact instruction signature.
+///
+/// A candidate must have at least two direct callers and its bounded body must
+/// establish all of these dataflow facts: length is `a2 - a1`; an inner
+/// `osPiStartDma`-shaped call passes direction zero, the physical cursor in
+/// `$a3`, the destination cursor at `$sp+0x10`, and a length-derived chunk at
+/// `$sp+0x14`; after that call both cursors advance by a length-derived chunk,
+/// remaining length decreases, and control loops backward before returning.
+pub fn infer_physical_end_dma_wrappers(
+    words: &[u32],
+    image_va_start: u32,
+) -> PhysicalEndDmaWrapperInference {
+    let mut callers = BTreeMap::<u32, Vec<u32>>::new();
+    for (index, word) in words.iter().enumerate() {
+        let pc = image_va_start.wrapping_add((index as u32).wrapping_mul(4));
+        if let Some(target) = direct_jal_target(*word, VirtualAddress::new(pc)) {
+            let offset = target.wrapping_sub(image_va_start);
+            if offset & 3 == 0 && (offset as usize) / 4 < words.len() {
+                callers.entry(target).or_default().push(pc);
+            }
+        }
+    }
+    let mut inference = PhysicalEndDmaWrapperInference::default();
+    for (entry_va, caller_sites) in callers {
+        if caller_sites.len() < MIN_PHYSICAL_END_WRAPPER_CALLERS {
+            continue;
+        }
+        if inference.candidates_examined == MAX_PHYSICAL_END_WRAPPER_CANDIDATES {
+            inference.candidate_limit_hit = true;
+            break;
+        }
+        inference.candidates_examined += 1;
+        let entry_index = (entry_va.wrapping_sub(image_va_start) / 4) as usize;
+        if let Some(nested_dma_call_pc) =
+            classify_physical_end_wrapper(words, image_va_start, entry_index)
+        {
+            inference.admitted.push(PhysicalEndDmaWrapper {
+                entry_va,
+                callers: caller_sites,
+                nested_dma_call_pc,
+            });
+        }
+    }
+    inference
+}
+
+#[cfg(test)]
+mod physical_end_wrapper_tests {
+    use super::*;
+
+    const START: u32 = 0x8000_1000;
+    const WRAPPER: u32 = START + 0x20;
+    const INNER_DMA: u32 = 0x8000_1800;
+
+    fn i(op: u32, rs: u8, rt: u8, immediate: i16) -> u32 {
+        (op << 26) | ((rs as u32) << 21) | ((rt as u32) << 16) | immediate as u16 as u32
+    }
+
+    fn r(rs: u8, rt: u8, rd: u8, funct: u32) -> u32 {
+        ((rs as u32) << 21) | ((rt as u32) << 16) | ((rd as u32) << 11) | funct
+    }
+
+    fn jal(target: u32) -> u32 {
+        (0x03 << 26) | ((target >> 2) & 0x03ff_ffff)
+    }
+
+    fn wrapper_image() -> Vec<u32> {
+        vec![
+            jal(WRAPPER),
+            0,
+            jal(WRAPPER),
+            0,
+            0x03e0_0008,
+            0,
+            0,
+            0,
+            i(0x09, 29, 29, -0x20),
+            i(0x2b, 29, 4, 0x20),
+            i(0x2b, 29, 5, 0x24),
+            i(0x2b, 29, 6, 0x28),
+            i(0x23, 29, 8, 0x28),
+            i(0x23, 29, 9, 0x24),
+            r(8, 9, 10, 0x23),
+            i(0x09, 0, 11, -16),
+            r(10, 11, 10, 0x24),
+            i(0x2b, 29, 10, 0x1c),
+            i(0x23, 29, 7, 0x24),
+            i(0x23, 29, 11, 0x20),
+            i(0x2b, 29, 11, 0x10),
+            i(0x23, 29, 12, 0x1c),
+            i(0x09, 0, 6, 0),
+            jal(INNER_DMA),
+            i(0x2b, 29, 12, 0x14),
+            i(0x23, 29, 13, 0x20),
+            i(0x23, 29, 14, 0x1c),
+            r(13, 14, 13, 0x21),
+            i(0x2b, 29, 13, 0x20),
+            i(0x23, 29, 15, 0x24),
+            r(15, 14, 15, 0x21),
+            i(0x2b, 29, 15, 0x24),
+            i(0x23, 29, 24, 0x1c),
+            r(24, 14, 24, 0x23),
+            i(0x2b, 29, 24, 0x1c),
+            i(0x05, 24, 0, -18),
+            0,
+            0x03e0_0008,
+            i(0x09, 29, 29, 0x20),
+        ]
+    }
+
+    #[test]
+    fn infers_end_address_chunk_wrapper_from_semantics() {
+        let image = wrapper_image();
+        let report = infer_physical_end_dma_wrappers(&image, START);
+        assert!(!report.candidate_limit_hit);
+        assert_eq!(report.candidates_examined, 1);
+        assert_eq!(
+            report.admitted,
+            [PhysicalEndDmaWrapper {
+                entry_va: WRAPPER,
+                callers: vec![START, START + 8],
+                nested_dma_call_pc: START + 23 * 4,
+            }]
+        );
+
+        let mut db = crate::facts::FactDb::new();
+        let diagnostics = crate::record_physical_end_dma_wrapper_candidates(&image, START, &mut db);
+        assert_eq!(diagnostics.semantic_proof_unavailable, 1);
+        assert!(db.proven_rom_mappings().is_empty());
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            crate::facts::Fact::Evidence { note, .. }
+                if note.contains("CFG/path and inner-callee authority remain open")
+        )));
+    }
+
+    #[test]
+    fn rejects_count_semantics_and_non_looping_copy_shapes() {
+        let mut count_semantics = wrapper_image();
+        count_semantics[14] = r(8, 0, 10, 0x21);
+        assert!(infer_physical_end_dma_wrappers(&count_semantics, START)
+            .admitted
+            .is_empty());
+
+        let mut no_loop = wrapper_image();
+        no_loop[35] = 0;
+        assert!(infer_physical_end_dma_wrappers(&no_loop, START)
+            .admitted
+            .is_empty());
+    }
+
+    #[test]
+    fn rejects_a_single_caller_even_when_the_body_matches() {
+        let mut image = wrapper_image();
+        image[2] = 0;
+        let report = infer_physical_end_dma_wrappers(&image, START);
+        assert_eq!(report.candidates_examined, 0);
+        assert!(report.admitted.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1454,6 +1982,86 @@ mod tests {
     }
 
     #[test]
+    fn batched_pointer_contracts_equal_independent_slices_and_deduplicate() {
+        const OTHER_CALLEE: u32 = 0x8000_5000;
+        let words = vec![
+            i(0x0f, 0, 4, 0x8001u16 as i16),
+            i(0x0d, 4, 4, 0x1110),
+            i(0x0f, 0, 5, 0x8002u16 as i16),
+            i(0x0d, 5, 5, 0x2220),
+            jal(CALLEE),
+            0,
+            i(0x0f, 0, 4, 0x8003u16 as i16),
+            i(0x0d, 4, 4, 0x3330),
+            jal(OTHER_CALLEE),
+            0,
+        ];
+        let start = VirtualAddress::new(START);
+        let contracts = [
+            (VirtualAddress::new(OTHER_CALLEE), 4),
+            (VirtualAddress::new(CALLEE), 5),
+            (VirtualAddress::new(CALLEE), 4),
+            (VirtualAddress::new(CALLEE), 4),
+        ];
+        let batch =
+            slice_pointer_arg_call_contracts(&words, start, 0x0080_0000, &contracts).unwrap();
+
+        let mut independent = Vec::new();
+        for &(callee, register) in &contracts[..3] {
+            independent.extend(
+                slice_pointer_arg_calls(&words, start, callee, 0x0080_0000, register).unwrap(),
+            );
+        }
+        independent.sort_by_key(|slice| (slice.call_pc, slice.pointer_register));
+
+        assert_eq!(batch, independent);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch
+                .iter()
+                .map(|slice| (
+                    slice.call_pc.get(),
+                    slice.pointer_register,
+                    slice.pointer.proven().map(|pointer| pointer.get()),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (START + 0x10, 4, Some(0x8001_1110)),
+                (START + 0x10, 5, Some(0x8002_2220)),
+                (START + 0x20, 4, Some(0x8003_3330)),
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_contract_register_domain_is_checked_before_slicing() {
+        assert_eq!(
+            slice_pointer_arg_call_contracts(&[0], VirtualAddress::new(START), 0x0080_0000, &[],),
+            Ok(Vec::new())
+        );
+        let error = slice_pointer_arg_call_contracts(
+            &[0],
+            VirtualAddress::new(START),
+            0x0080_0000,
+            &[(VirtualAddress::new(CALLEE), 32)],
+        );
+        assert_eq!(
+            error,
+            Err(PiDmaSliceError::InvalidPointerRegister { register: 32 })
+        );
+        assert_eq!(
+            slice_pointer_arg_calls(
+                &[0],
+                VirtualAddress::new(START),
+                VirtualAddress::new(CALLEE),
+                0x0080_0000,
+                32,
+            ),
+            error
+        );
+    }
+
+    #[test]
     fn load_request_slice_folds_subu_of_link_constants() {
         // IDO computes a request's byte count as `subu end, start` of two
         // link-time constants (MM boot's Main_Init code load). The slicer
@@ -1508,6 +2116,70 @@ mod tests {
         .unwrap();
         assert!(slices[0].candidate().is_none());
     }
+
+    fn branch_guarded_load_request(branch_op: u32, branch_target: usize) -> Vec<u32> {
+        let branch_index = 2usize;
+        let displacement = i16::try_from(branch_target - (branch_index + 1)).unwrap();
+        vec![
+            0x3c05_00b9,                      // lui   a1, 0x00b9
+            0x24a5_ad30,                      // addiu a1, a1, -0x52d0
+            i(branch_op, 8, 0, displacement), // branch to a point after/at call
+            0x3c04_801c,                      // delay: lui a0, 0x801c
+            0x3c0f_00ba,                      // lui   t7, 0x00ba
+            0x25ef_da40,                      // addiu t7, t7, -0x25c0
+            0x01e5_3023,                      // subu  a2, t7, a1
+            jal(CALLEE),                      // call_index
+            0x2484_6e80,                      // delay: addiu a0, a0, 0x6e80
+            0,
+            0,
+            0,
+        ]
+    }
+
+    #[test]
+    fn load_request_slice_crosses_ordinary_branch_that_skips_the_call() {
+        let words = branch_guarded_load_request(0x05, 10);
+        let slices = slice_load_request_calls(
+            &words,
+            VirtualAddress::new(START),
+            VirtualAddress::new(CALLEE),
+            0x0080_0000,
+            4,
+            5,
+            6,
+        )
+        .unwrap();
+        let candidate = slices[0]
+            .candidate()
+            .expect("not-taken call path has exact operands");
+        assert_eq!(slices[0].dram_pointer.proven().unwrap().get(), 0x801c_6e80);
+        assert_eq!(candidate.device_address.get(), 0x00b8_ad30);
+        assert_eq!(candidate.byte_count.get(), 0x0001_2d10);
+    }
+
+    #[test]
+    fn load_request_slice_keeps_annulled_and_merging_branches_hard() {
+        let mut always_taken = branch_guarded_load_request(0x04, 10);
+        always_taken[2] = i(0x04, 8, 8, 7); // beq t0, t0, after_call
+        for words in [
+            branch_guarded_load_request(0x15, 10),
+            branch_guarded_load_request(0x05, 7),
+            branch_guarded_load_request(0x05, 8),
+            always_taken,
+        ] {
+            let slices = slice_load_request_calls(
+                &words,
+                VirtualAddress::new(START),
+                VirtualAddress::new(CALLEE),
+                0x0080_0000,
+                4,
+                5,
+                6,
+            )
+            .unwrap();
+            assert!(slices[0].candidate().is_none());
+        }
+    }
 }
 
 /// A routine that accesses the PI registers directly -- the primitive every
@@ -1519,6 +2191,10 @@ pub struct PiPrimitive {
     /// register block several times (address, address, length); a routine with
     /// one incidental reference is a weaker candidate and the count says so.
     pub register_sites: u32,
+    /// Exact sorted PCs behind `register_sites`, retained so a receipt can be
+    /// independently checked against the admitted image rather than trusting
+    /// an aggregate count.
+    pub register_site_pcs: Vec<u32>,
     /// Direct `jal` sites targeting this routine, anywhere in the scanned image.
     pub callers: Vec<u32>,
 }
@@ -1571,30 +2247,41 @@ fn is_jr_ra(word: u32) -> bool {
 /// Everything here is a CANDIDATE. Instruction bytes do not prove a routine is
 /// reached, and a `jal` in the image does not prove the call executes.
 pub fn recover_pi_primitives(image_bytes: &[u8], image_va_start: u32) -> Vec<PiPrimitive> {
-    use std::collections::BTreeMap;
-
     let words: Vec<u32> = image_bytes
         .chunks_exact(4)
         .map(|chunk| u32::from_be_bytes(chunk.try_into().expect("four bytes")))
         .collect();
+    recover_pi_primitives_words(&words, image_va_start)
+}
+
+/// Word-oriented form for callers which already decoded an admitted image.
+/// This avoids rematerializing the same complete word vector in inventory
+/// pipelines that also perform cache and direct-call scans.
+pub fn recover_pi_primitives_words(words: &[u32], image_va_start: u32) -> Vec<PiPrimitive> {
+    use std::collections::BTreeMap;
+
     let va_at = |index: usize| image_va_start.wrapping_add((index as u32).wrapping_mul(4));
 
     // Attribute every PI register access to its enclosing routine.
-    let mut sites_per_entry: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut sites_per_entry: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut last_return = None;
     for (index, word) in words.iter().enumerate() {
+        if is_jr_ra(*word) {
+            last_return = Some(index);
+        }
         if !is_lui_pi_register(*word) {
             continue;
         }
-        let mut entry_index = 0usize;
-        for back in (0..index).rev() {
-            if is_jr_ra(words[back]) {
-                // `jr $ra` plus its delay slot ends the routine; the next word
-                // begins the following one.
-                entry_index = (back + 2).min(words.len().saturating_sub(1));
-                break;
-            }
-        }
-        *sites_per_entry.entry(va_at(entry_index)).or_default() += 1;
+        // `jr $ra` plus its delay slot ends the routine; retaining the most
+        // recent return is exactly the prior reverse search, but makes the
+        // complete fixed-address inventory linear in image size.
+        let entry_index = last_return
+            .map(|return_index| (return_index + 2).min(words.len().saturating_sub(1)))
+            .unwrap_or(0);
+        sites_per_entry
+            .entry(va_at(entry_index))
+            .or_default()
+            .push(va_at(index));
     }
     if sites_per_entry.is_empty() {
         return Vec::new();
@@ -1613,9 +2300,11 @@ pub fn recover_pi_primitives(image_bytes: &[u8], image_va_start: u32) -> Vec<PiP
 
     let mut primitives: Vec<PiPrimitive> = sites_per_entry
         .into_iter()
-        .map(|(entry_va, register_sites)| PiPrimitive {
+        .map(|(entry_va, register_site_pcs)| PiPrimitive {
             entry_va,
-            register_sites,
+            register_sites: u32::try_from(register_site_pcs.len())
+                .expect("PI register-site count exceeds u32"),
+            register_site_pcs,
             callers: callers_per_entry.remove(&entry_va).unwrap_or_default(),
         })
         .collect();
@@ -1628,4 +2317,39 @@ pub fn recover_pi_primitives(image_bytes: &[u8], image_va_start: u32) -> Vec<PiP
             .then(a.entry_va.cmp(&b.entry_va))
     });
     primitives
+}
+
+#[cfg(test)]
+mod pi_primitive_tests {
+    use super::*;
+
+    #[test]
+    fn word_and_byte_entry_points_match_across_return_boundaries() {
+        let words: [u32; 7] = [
+            0x3c08_a460,
+            0,
+            0x03e0_0008,
+            0x3c09_a460,
+            0x3c0a_a460,
+            0x03e0_0008,
+            0,
+        ];
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect::<Vec<_>>();
+
+        let from_words = recover_pi_primitives_words(&words, 0x8000_1000);
+        assert_eq!(from_words, recover_pi_primitives(&bytes, 0x8000_1000));
+        assert_eq!(
+            from_words
+                .iter()
+                .map(|primitive| (primitive.entry_va, primitive.register_site_pcs.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x8000_1010, vec![0x8000_100c, 0x8000_1010]),
+                (0x8000_1000, vec![0x8000_1000]),
+            ]
+        );
+    }
 }

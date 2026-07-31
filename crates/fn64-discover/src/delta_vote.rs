@@ -886,7 +886,10 @@ pub fn prove_region(
     rom_end: u32,
     config: &DeltaVoteConfig,
 ) -> Option<UntabledRegion> {
-    let (start, end) = (rom_start as usize, rom_end.min(rom_bytes.len() as u32) as usize);
+    let (start, end) = (
+        rom_start as usize,
+        rom_end.min(rom_bytes.len() as u32) as usize,
+    );
     if end.saturating_sub(start) < 0x400 {
         return None;
     }
@@ -991,7 +994,10 @@ pub fn sweep_untabled_regions(
     rom_bytes: &[u8],
     config: &UntabledSweepConfig,
 ) -> Vec<UntabledRegion> {
-    assert!(config.window_len >= 0x100, "a window must hold enough calls to vote");
+    assert!(
+        config.window_len >= 0x100,
+        "a window must hold enough calls to vote"
+    );
     assert!(config.stride > 0, "stride must advance");
 
     let mut merged: Vec<UntabledRegion> = Vec::new();
@@ -1021,9 +1027,7 @@ pub fn sweep_untabled_regions(
         // one library at the same relative offset in different files would join
         // regions that were never one image.
         match merged.last_mut() {
-            Some(previous)
-                if previous.delta == delta && previous.rom_end == result.rom_start =>
-            {
+            Some(previous) if previous.delta == delta && previous.rom_end == result.rom_start => {
                 previous.rom_end = result.rom_end;
                 previous.windows += 1;
             }

@@ -83,6 +83,7 @@ use crate::cfg::{build_cfg, BlockTerminator, WordClass};
 use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, DeltaVoteOutcome};
 use crate::file_table::{
     recover_file_table, CandidateFileTable, FileTableRecovery, FileTableSearchConfig,
+    VromMaterializationError, VromMaterializationLimits,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -238,6 +239,32 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
     let rom_len = rom_bytes.len() as u32;
     let mut raw: Vec<CandidateTable> = Vec::new();
 
+    // A candidate record's three adjacent words do not depend on the table
+    // stride or field phase. Index the sparse set of valid triples once. The
+    // exhaustive search below still visits every stride/phase combination,
+    // but it no longer rereads and revalidates the whole ROM for each one.
+    let last_record_start = rom_bytes.len().saturating_sub(12);
+    let valid_record_offsets = (config.min_rom_offset as usize..=last_record_start)
+        .step_by(4)
+        .filter_map(|offset| {
+            let record = CandidateRecord {
+                rom_start: read_u32_be(rom_bytes, offset)?,
+                rom_end: read_u32_be(rom_bytes, offset + 4)?,
+                vram_dest: read_u32_be(rom_bytes, offset + 8)?,
+            };
+            record_valid(&record, rom_len, config).then_some(offset as u32)
+        })
+        .collect::<Vec<_>>();
+    let read_valid_record = |offset: u32| -> Option<CandidateRecord> {
+        let offset = offset as usize;
+        let record = CandidateRecord {
+            rom_start: read_u32_be(rom_bytes, offset)?,
+            rom_end: read_u32_be(rom_bytes, offset + 4)?,
+            vram_dest: read_u32_be(rom_bytes, offset + 8)?,
+        };
+        record_valid(&record, rom_len, config).then_some(record)
+    };
+
     for &stride in &config.strides {
         if stride < 12 || !stride.is_multiple_of(4) {
             continue;
@@ -252,30 +279,22 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
             let field_rom_end = field_rom_start + 4;
             let field_vram_dest = field_rom_start + 8;
 
-            let mut offset = config.min_rom_offset;
             let last_table_start =
                 rom_len.saturating_sub(stride.saturating_mul(config.min_records));
-            while offset <= last_table_start {
-                let read_rec = |base: u32| -> Option<CandidateRecord> {
-                    Some(CandidateRecord {
-                        rom_start: read_u32_be(rom_bytes, (base + field_rom_start) as usize)?,
-                        rom_end: read_u32_be(rom_bytes, (base + field_rom_end) as usize)?,
-                        vram_dest: read_u32_be(rom_bytes, (base + field_vram_dest) as usize)?,
-                    })
+            let mut next_offset = config.min_rom_offset;
+            for &record_offset in &valid_record_offsets {
+                let Some(offset) = record_offset.checked_sub(field_rom_start) else {
+                    continue;
                 };
-
-                // Quick reject before growing a run.
-                let first = read_rec(offset);
-                if !first.is_some_and(|r| record_valid(&r, rom_len, config)) {
-                    offset += 4;
+                if offset < next_offset || offset > last_table_start {
                     continue;
                 }
 
                 let mut records = Vec::new();
                 let mut base = offset;
                 while base <= rom_len.saturating_sub(stride) {
-                    match read_rec(base) {
-                        Some(rec) if record_valid(&rec, rom_len, config) => {
+                    match read_valid_record(base + field_rom_start) {
+                        Some(rec) => {
                             records.push(rec);
                             base += stride;
                         }
@@ -295,9 +314,9 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
                     });
                     // Skip past the consumed run: overlapping sub-runs of the
                     // same table are not independent discoveries.
-                    offset = base;
+                    next_offset = base;
                 } else {
-                    offset += 4;
+                    next_offset = offset + 4;
                 }
             }
             field_rom_start += 4;
@@ -481,10 +500,12 @@ fn descriptor_mapping_corroborated(
             BlockTerminator::Branch {
                 target,
                 fallthrough,
+                ..
             }
             | BlockTerminator::BranchLikely {
                 target,
                 fallthrough,
+                ..
             } => {
                 if !in_range(*target) {
                     Some(DescriptorCfgFailure::OutOfRangeTarget {
@@ -623,6 +644,27 @@ pub fn recover_overlay_regions(
 ) -> OverlayRecovery {
     let candidate_tables = enumerate_family_tables(rom_bytes, config);
 
+    admit_overlay_region_tables(
+        rom_bytes,
+        config,
+        delta_config,
+        min_mapped_regions,
+        candidate_tables,
+    )
+}
+
+/// Apply delta-vote admission to an already enumerated physical descriptor
+/// family. Keeping enumeration and admission separately callable lets build
+/// tooling reuse or profile the exhaustive ROM scan without weakening the
+/// proof rule: the candidates remain explicit inputs and the returned report
+/// retains the complete searched configuration.
+pub fn admit_overlay_region_tables(
+    rom_bytes: &[u8],
+    config: &SearchConfig,
+    delta_config: &DeltaVoteConfig,
+    min_mapped_regions: u32,
+    candidate_tables: Vec<CandidateTable>,
+) -> OverlayRecovery {
     let mut admissions: Vec<TableAdmission> = candidate_tables
         .iter()
         .map(|table| {
@@ -754,10 +796,52 @@ pub struct VromOverlayRecovery {
     pub file_table: FileTableRecovery,
     pub config: SearchConfig,
     pub delta_config: DeltaVoteConfig,
+    /// Complete-file decode cap applied to every recovered VROM source.
+    pub materialization_limits: VromMaterializationLimits,
+    /// Distinct recovered files withheld because their complete Yaz0 output
+    /// exceeded the configured transient decode cap.
+    pub decoded_file_limit_hits: Vec<DecodedFileLimitHit>,
     pub vrom_min_records: u32,
     pub min_mapped_regions: u32,
     pub candidate_tables: Vec<VromCandidateTable>,
     pub admissions: Vec<VromTableAdmission>,
+}
+
+/// One visible resource frontier from VROM overlay recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DecodedFileLimitHit {
+    pub vrom_start: u32,
+    pub vrom_end: u32,
+    pub decoded_file_bytes: usize,
+    pub max_decoded_file_bytes: usize,
+}
+
+fn materialize_vrom_for_recovery(
+    file_table: &CandidateFileTable,
+    rom_bytes: &[u8],
+    start: u32,
+    end: u32,
+    limits: VromMaterializationLimits,
+    limit_hits: &mut BTreeSet<DecodedFileLimitHit>,
+) -> Option<Vec<u8>> {
+    match file_table.materialize_vrom_range_diagnostic_with_limits(rom_bytes, start, end, limits) {
+        Ok(bytes) => Some(bytes),
+        Err(VromMaterializationError::DecodedFileLimitExceeded {
+            vrom_start,
+            vrom_end,
+            decoded_file_bytes,
+            max_decoded_file_bytes,
+        }) => {
+            limit_hits.insert(DecodedFileLimitHit {
+                vrom_start,
+                vrom_end,
+                decoded_file_bytes,
+                max_decoded_file_bytes,
+            });
+            None
+        }
+        Err(VromMaterializationError::Unavailable { .. }) => None,
+    }
 }
 
 impl VromOverlayRecovery {
@@ -796,14 +880,19 @@ fn enumerate_vrom_family_tables(
     file_table: &CandidateFileTable,
     config: &SearchConfig,
     vrom_min_records: u32,
+    materialization_limits: VromMaterializationLimits,
+    limit_hits: &mut BTreeSet<DecodedFileLimitHit>,
 ) -> Vec<VromCandidateTable> {
     let mut raw = Vec::new();
 
     for file_record in &file_table.records {
-        let Ok(file_bytes) = file_table.materialize_vrom_range(
+        let Some(file_bytes) = materialize_vrom_for_recovery(
+            file_table,
             rom_bytes,
             file_record.vrom_start,
             file_record.vrom_end,
+            materialization_limits,
+            limit_hits,
         ) else {
             continue;
         };
@@ -927,13 +1016,44 @@ pub fn recover_vrom_overlay_regions(
     vrom_min_records: u32,
     min_mapped_regions: u32,
 ) -> VromOverlayRecovery {
+    recover_vrom_overlay_regions_with_limits(
+        rom_bytes,
+        config,
+        delta_config,
+        file_table_config,
+        vrom_min_records,
+        min_mapped_regions,
+        VromMaterializationLimits::default(),
+    )
+}
+
+/// [`recover_vrom_overlay_regions`] with an explicit complete-file decode
+/// cap. A file beyond the cap contributes no descriptor candidates or mapping
+/// evidence; recovery remains open rather than allocating its declared size.
+pub fn recover_vrom_overlay_regions_with_limits(
+    rom_bytes: &[u8],
+    config: &SearchConfig,
+    delta_config: &DeltaVoteConfig,
+    file_table_config: &FileTableSearchConfig,
+    vrom_min_records: u32,
+    min_mapped_regions: u32,
+    materialization_limits: VromMaterializationLimits,
+) -> VromOverlayRecovery {
     assert!(vrom_min_records >= 2, "a one-record run is not a table");
     let file_table = recover_file_table(rom_bytes, file_table_config);
+    let mut decoded_file_limit_hits = BTreeSet::new();
     let candidate_tables = file_table
         .admitted_table
         .as_ref()
         .map_or_else(Vec::new, |table| {
-            enumerate_vrom_family_tables(rom_bytes, table, config, vrom_min_records)
+            enumerate_vrom_family_tables(
+                rom_bytes,
+                table,
+                config,
+                vrom_min_records,
+                materialization_limits,
+                &mut decoded_file_limit_hits,
+            )
         });
     let mut admissions: Vec<VromTableAdmission> = candidate_tables
         .iter()
@@ -948,12 +1068,17 @@ pub fn recover_vrom_overlay_regions(
                 .records
                 .iter()
                 .map(|record| {
-                    let outcome = admitted_file_table
-                        .materialize_vrom_range(rom_bytes, record.rom_start, record.rom_end)
-                        .ok()
-                        .map(|bytes| {
-                            infer_region_delta(&bytes, record.rom_start, &[], delta_config).outcome
-                        });
+                    let outcome = materialize_vrom_for_recovery(
+                        admitted_file_table,
+                        rom_bytes,
+                        record.rom_start,
+                        record.rom_end,
+                        materialization_limits,
+                        &mut decoded_file_limit_hits,
+                    )
+                    .map(|bytes| {
+                        infer_region_delta(&bytes, record.rom_start, &[], delta_config).outcome
+                    });
                     match outcome {
                         Some(DeltaVoteOutcome::Admitted { delta, va_start }) => {
                             mapped_regions += 1;
@@ -1002,13 +1127,16 @@ pub fn recover_vrom_overlay_regions(
                     continue;
                 }
                 let record = admissions[admission_index].table.records[record_index];
-                let region_bytes = match admitted_file_table.materialize_vrom_range(
+                let region_bytes = match materialize_vrom_for_recovery(
+                    admitted_file_table,
                     rom_bytes,
                     record.rom_start,
                     record.rom_end,
+                    materialization_limits,
+                    &mut decoded_file_limit_hits,
                 ) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
+                    Some(bytes) => bytes,
+                    None => {
                         admissions[admission_index].region_diagnostics[record_index] =
                             VromRecordMappingDiagnostic::Open(
                                 DescriptorMappingFailure::Rule1SourceMaterialization,
@@ -1138,6 +1266,8 @@ pub fn recover_vrom_overlay_regions(
         file_table,
         config: config.clone(),
         delta_config: *delta_config,
+        materialization_limits,
+        decoded_file_limit_hits: decoded_file_limit_hits.into_iter().collect(),
         vrom_min_records,
         min_mapped_regions,
         candidate_tables,
@@ -1148,6 +1278,117 @@ pub fn recover_vrom_overlay_regions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_yaz0_file_cannot_supply_vrom_descriptor_candidates() {
+        const HUGE_OUTPUT: u32 = 0xffff_fff0;
+        let mut rom = Vec::from(&b"Yaz0"[..]);
+        rom.extend_from_slice(&HUGE_OUTPUT.to_be_bytes());
+        rom.extend_from_slice(&[0; 8]);
+        let file_table = CandidateFileTable {
+            table_rom_offset: 0,
+            record_stride: 0x10,
+            vrom_alignment: 4,
+            field_vrom_start: 0,
+            field_vrom_end: 4,
+            field_rom_start: 8,
+            field_rom_end: 12,
+            records: vec![crate::file_table::FileTableRecord {
+                vrom_start: 0,
+                vrom_end: HUGE_OUTPUT,
+                rom_start: 0,
+                rom_end: rom.len() as u32,
+            }],
+        };
+
+        let mut limit_hits = BTreeSet::new();
+        let candidates = enumerate_vrom_family_tables(
+            &rom,
+            &file_table,
+            &SearchConfig::vrom_family(),
+            2,
+            VromMaterializationLimits {
+                max_decoded_file_bytes: 1024,
+            },
+            &mut limit_hits,
+        );
+        assert!(candidates.is_empty());
+        assert_eq!(
+            limit_hits.into_iter().collect::<Vec<_>>(),
+            vec![DecodedFileLimitHit {
+                vrom_start: 0,
+                vrom_end: HUGE_OUTPUT,
+                decoded_file_bytes: HUGE_OUTPUT as usize,
+                max_decoded_file_bytes: 1024,
+            }]
+        );
+    }
+
+    /// Straight exhaustive reference retained in tests so the sparse-index
+    /// fast path is proved against the original stride/phase/offset walk.
+    fn enumerate_family_tables_reference(
+        rom_bytes: &[u8],
+        config: &SearchConfig,
+    ) -> Vec<CandidateTable> {
+        let rom_len = rom_bytes.len() as u32;
+        let mut raw = Vec::new();
+        for &stride in &config.strides {
+            if stride < 12 || !stride.is_multiple_of(4) {
+                continue;
+            }
+            let max_field_start = stride - 12;
+            let mut field_rom_start = 0u32;
+            while field_rom_start <= max_field_start {
+                let field_rom_end = field_rom_start + 4;
+                let field_vram_dest = field_rom_start + 8;
+                let mut offset = config.min_rom_offset;
+                let last_table_start =
+                    rom_len.saturating_sub(stride.saturating_mul(config.min_records));
+                while offset <= last_table_start {
+                    let read_rec = |base: u32| -> Option<CandidateRecord> {
+                        Some(CandidateRecord {
+                            rom_start: read_u32_be(rom_bytes, (base + field_rom_start) as usize)?,
+                            rom_end: read_u32_be(rom_bytes, (base + field_rom_end) as usize)?,
+                            vram_dest: read_u32_be(rom_bytes, (base + field_vram_dest) as usize)?,
+                        })
+                    };
+                    let first = read_rec(offset);
+                    if !first.is_some_and(|record| record_valid(&record, rom_len, config)) {
+                        offset += 4;
+                        continue;
+                    }
+                    let mut records = Vec::new();
+                    let mut base = offset;
+                    while base <= rom_len.saturating_sub(stride) {
+                        match read_rec(base) {
+                            Some(record) if record_valid(&record, rom_len, config) => {
+                                records.push(record);
+                                base += stride;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if records.len() as u32 >= config.min_records
+                        && intervals_non_overlapping(&records)
+                    {
+                        raw.push(CandidateTable {
+                            table_rom_offset: offset,
+                            record_stride: stride,
+                            field_rom_start,
+                            field_rom_end,
+                            field_vram_dest,
+                            records,
+                        });
+                        offset = base;
+                    } else {
+                        offset += 4;
+                    }
+                }
+                field_rom_start += 4;
+            }
+        }
+        canonicalize(raw)
+    }
 
     /// Build a big-endian ROM with a planted descriptor table of a chosen
     /// shape. Region bodies are filled with a delta_vote-admissible code
@@ -1264,6 +1505,10 @@ mod tests {
         }
 
         let config = SearchConfig::aki_family();
+        assert_eq!(
+            enumerate_family_tables(&rom.bytes, &config),
+            enumerate_family_tables_reference(&rom.bytes, &config),
+        );
         let recovery = recover_overlay_regions(&rom.bytes, &config, &DeltaVoteConfig::default(), 2);
 
         // The planted table is present as a distinct candidate.

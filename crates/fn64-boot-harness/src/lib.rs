@@ -7,9 +7,16 @@
 //! Game policy remains with each harness: which sections are resident,
 //! controller input, save type, rendering, audio, and executor driving.
 
+#[cfg(feature = "recomp-rs")]
+mod boot_context;
 mod certification_profile;
+mod controller_input_schedule;
+#[cfg(feature = "recomp-rs")]
+mod generated_runner_build;
 mod observation_evidence;
 mod platform_certification;
+#[cfg(feature = "recomp-rs")]
+mod precompiled_admission;
 mod private_fs;
 mod private_input_admission;
 mod private_release_series;
@@ -21,10 +28,93 @@ mod render_evidence;
 mod report_series;
 mod unsupported_journal;
 
+#[cfg(feature = "recomp-rs")]
+pub use boot_context::{load_boot_context, parse_boot_context, BootContextLoadError};
 pub use certification_profile::{
     CertificationProfileError, CertificationProfileIdentity, CertificationRequirement,
     CertificationRequirementClass, CertificationRequirementRef, FullParityV1,
     FULL_PARITY_V1_DEFINITION_SHA256, FULL_PARITY_V1_SCHEMA,
+};
+pub use controller_input_schedule::{
+    parse_controller_input_schedule, ControllerInputPhase, ControllerInputSchedule,
+    ControllerInputScheduleError, CONTROLLER_INPUT_SCHEDULE_SCHEMA,
+};
+#[cfg(feature = "recomp-rs")]
+pub use generated_runner_build::{
+    build_wm2000_generated_runner_v1, parse_generated_runner_bootstrap_runtime_report_v1,
+    parse_generated_runner_cpu_runtime_report_v1,
+    parse_generated_runner_host_abi_runtime_report_v1, parse_generated_runner_pi_runtime_report_v1,
+    parse_generated_runner_rdp_renderer_runtime_report_v1,
+    parse_generated_runner_rsp_runtime_report_v1, parse_generated_runner_si_runtime_report_v1,
+    parse_generated_runner_sp_runtime_report_v1,
+    run_wm2000_generated_runner_bootstrap_runtime_series_v1,
+    run_wm2000_generated_runner_cpu_runtime_series_v1,
+    run_wm2000_generated_runner_host_abi_runtime_series_v1,
+    run_wm2000_generated_runner_pi_runtime_series_v1,
+    run_wm2000_generated_runner_rdp_renderer_runtime_series_v1,
+    run_wm2000_generated_runner_rsp_runtime_series_v1,
+    run_wm2000_generated_runner_si_runtime_series_v1,
+    run_wm2000_generated_runner_sp_runtime_series_v1, BootstrapAttributedWriteV1,
+    BootstrapMutationBatchV1, BootstrapWriterChannelV1, BootstrapWriterRuntimePrerequisiteV1,
+    BootstrapWriterWatchedRangeV1, CpuWriterRuntimePrerequisiteV1, CpuWriterWatchedRangeV1,
+    GeneratedRunnerAdapterRoleV1, GeneratedRunnerBootstrapRuntimeReportV1,
+    GeneratedRunnerBootstrapRuntimeSeriesEvidenceV1, GeneratedRunnerBuildError,
+    GeneratedRunnerBuildEvidenceV1, GeneratedRunnerBuildIdentityV1,
+    GeneratedRunnerCpuRuntimeReportV1, GeneratedRunnerCpuRuntimeSeriesEvidenceV1,
+    GeneratedRunnerHostAbiRuntimeReportV1, GeneratedRunnerHostAbiRuntimeSeriesEvidenceV1,
+    GeneratedRunnerLinkedIdentityV1, GeneratedRunnerPiRuntimeReportV1,
+    GeneratedRunnerPiRuntimeSeriesEvidenceV1, GeneratedRunnerRdpRendererRuntimeReportV1,
+    GeneratedRunnerRdpRendererRuntimeSeriesEvidenceV1, GeneratedRunnerRspRuntimeReportV1,
+    GeneratedRunnerRspRuntimeSeriesEvidenceV1, GeneratedRunnerSiRuntimeReportV1,
+    GeneratedRunnerSiRuntimeSeriesEvidenceV1, GeneratedRunnerSpRuntimeReportV1,
+    GeneratedRunnerSpRuntimeSeriesEvidenceV1, GeneratedRunnerWriterAuditBundleEvidenceV1,
+    GeneratedRunnerWriterAuditSessionV1, HostAbiWriterRuntimePrerequisiteV1,
+    HostAbiWriterWatchedRangeV1, PiWriterRuntimePrerequisiteV1, PiWriterWatchedRangeV1,
+    RdpRendererWriterRuntimePrerequisiteV1, RdpRendererWriterWatchedRangeV1,
+    RspWriterRuntimePrerequisiteV1, RspWriterWatchedRangeV1, SiWriterRuntimePrerequisiteV1,
+    SiWriterWatchedRangeV1, SpWriterRuntimePrerequisiteV1, SpWriterWatchedRangeV1,
+    VerifiedGeneratedRunnerBootstrapRuntimeSeriesV1, VerifiedGeneratedRunnerBuildV1,
+    VerifiedGeneratedRunnerCpuRuntimeSeriesV1, VerifiedGeneratedRunnerHostAbiRuntimeSeriesV1,
+    VerifiedGeneratedRunnerPiRuntimeSeriesV1, VerifiedGeneratedRunnerRdpRendererRuntimeSeriesV1,
+    VerifiedGeneratedRunnerRspRuntimeSeriesV1, VerifiedGeneratedRunnerSiRuntimeSeriesV1,
+    VerifiedGeneratedRunnerSpRuntimeSeriesV1, VerifiedGeneratedRunnerWriterAuditBundleV1,
+    Wm2000ExecutableImageGroupV1, Wm2000GeneratedRunnerBuildInputsV1,
+    GENERATED_RUNNER_BOOTSTRAP_RUNTIME_ARGUMENT_V1,
+    GENERATED_RUNNER_BOOTSTRAP_RUNTIME_NONCE_ENV_V1,
+    GENERATED_RUNNER_BOOTSTRAP_RUNTIME_REPORT_PREFIX_V1,
+    GENERATED_RUNNER_BOOTSTRAP_RUNTIME_REPORT_SCHEMA_V1,
+    GENERATED_RUNNER_BUILD_IDENTITY_ARGUMENT_V1, GENERATED_RUNNER_BUILD_IDENTITY_PREFIX_V1,
+    GENERATED_RUNNER_BUILD_IDENTITY_SCHEMA_V2, GENERATED_RUNNER_BUILD_IDENTITY_SCHEMA_V3,
+    GENERATED_RUNNER_CPU_RUNTIME_ARGUMENT_V1, GENERATED_RUNNER_CPU_RUNTIME_NONCE_ENV_V1,
+    GENERATED_RUNNER_CPU_RUNTIME_REPORT_PREFIX_V1, GENERATED_RUNNER_CPU_RUNTIME_REPORT_SCHEMA_V1,
+    GENERATED_RUNNER_HOST_ABI_RUNTIME_ARGUMENT_V1, GENERATED_RUNNER_HOST_ABI_RUNTIME_NONCE_ENV_V1,
+    GENERATED_RUNNER_HOST_ABI_RUNTIME_REPORT_PREFIX_V1,
+    GENERATED_RUNNER_HOST_ABI_RUNTIME_REPORT_SCHEMA_V1, GENERATED_RUNNER_PI_RUNTIME_ARGUMENT_V1,
+    GENERATED_RUNNER_PI_RUNTIME_NONCE_ENV_V1, GENERATED_RUNNER_PI_RUNTIME_REPORT_PREFIX_V1,
+    GENERATED_RUNNER_PI_RUNTIME_REPORT_SCHEMA_V1,
+    GENERATED_RUNNER_RDP_RENDERER_RUNTIME_ARGUMENT_V1,
+    GENERATED_RUNNER_RDP_RENDERER_RUNTIME_NONCE_ENV_V1,
+    GENERATED_RUNNER_RDP_RENDERER_RUNTIME_REPORT_PREFIX_V1,
+    GENERATED_RUNNER_RDP_RENDERER_RUNTIME_REPORT_SCHEMA_V1,
+    GENERATED_RUNNER_RSP_RUNTIME_ARGUMENT_V1, GENERATED_RUNNER_RSP_RUNTIME_NONCE_ENV_V1,
+    GENERATED_RUNNER_RSP_RUNTIME_REPORT_PREFIX_V1, GENERATED_RUNNER_RSP_RUNTIME_REPORT_SCHEMA_V1,
+    GENERATED_RUNNER_SI_RUNTIME_ARGUMENT_V1, GENERATED_RUNNER_SI_RUNTIME_NONCE_ENV_V1,
+    GENERATED_RUNNER_SI_RUNTIME_REPORT_PREFIX_V1, GENERATED_RUNNER_SI_RUNTIME_REPORT_SCHEMA_V1,
+    GENERATED_RUNNER_SP_RUNTIME_ARGUMENT_V1, GENERATED_RUNNER_SP_RUNTIME_NONCE_ENV_V1,
+    GENERATED_RUNNER_SP_RUNTIME_REPORT_PREFIX_V1, GENERATED_RUNNER_SP_RUNTIME_REPORT_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_BOOTSTRAP_SERIES_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_BUILD_SCHEMA_V2, VERIFIED_GENERATED_RUNNER_BUILD_SCHEMA_V3,
+    VERIFIED_GENERATED_RUNNER_BUILD_SCHEMA_V4, VERIFIED_GENERATED_RUNNER_BUILD_SCHEMA_V5,
+    VERIFIED_GENERATED_RUNNER_CPU_SERIES_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_HOST_ABI_SERIES_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_PI_SERIES_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_RDP_RENDERER_SERIES_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_RSP_SERIES_SCHEMA_V1, VERIFIED_GENERATED_RUNNER_SI_SERIES_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_SP_SERIES_SCHEMA_V1,
+    VERIFIED_GENERATED_RUNNER_WRITER_AUDIT_BUNDLE_SCHEMA_V1, WRITER_AUDIT_BOOTSTRAP_COMPLETED_V1,
+    WRITER_AUDIT_CPU_COMPLETED_V1, WRITER_AUDIT_HOST_ABI_COMPLETED_V1,
+    WRITER_AUDIT_PI_COMPLETED_V1, WRITER_AUDIT_RDP_RENDERER_COMPLETED_V1,
+    WRITER_AUDIT_RSP_COMPLETED_V1, WRITER_AUDIT_SI_COMPLETED_V1, WRITER_AUDIT_SP_COMPLETED_V1,
 };
 pub use observation_evidence::{
     FramebufferObservationFormat, FramebufferObservationGeometry, FramebufferObservationSource,
@@ -37,6 +127,8 @@ pub use platform_certification::{
     VerifiedRt64PlatformCaseAuthority, VerifiedRt64PlatformCaseSeries,
     RT64_PLATFORM_CHILD_IDENTITY_SCHEMA, VERIFIED_RT64_PLATFORM_CASE_AUTHORITY_SCHEMA,
 };
+#[cfg(feature = "recomp-rs")]
+pub use precompiled_admission::verify_precompiled_words;
 pub use private_input_admission::{
     load_private_f3dzex2_characterization_input, PrivateF3dzex2CharacterizationError,
     VerifiedPrivateF3dzex2CharacterizationInput,
@@ -57,15 +149,23 @@ pub use private_release_series::{
     REPOSITORY_SYNTHETIC_RELEASE_SCENARIO,
 };
 pub use release_gate::{
-    ArtifactDigest, ArtifactKind, ClosureGate, ClosurePath, ClosurePathStatus, DeterministicDigest,
-    ExecutionDestinationCountEvidence, ExecutionDestinationEventEvidence,
-    ExecutionDestinationEvidence, ExecutionDestinationSource, FixedCycleDigestGate, GateError,
-    LiveReleaseGate, ReleaseExecutionDestination, ReleaseGateReport, ReleaseMicrocodeFamily,
-    ReleaseRomByteOrder, ReleaseRomClass, ReleaseRomEvidence, ReleaseRomInput, ReleaseTvRegion,
-    ReleaseTvStandard, RspRdpEvidence, RspRdpObservationEventEvidence,
-    RspRdpObservationKindEvidence, UnsupportedEvent, UnsupportedInstrumentationEvidence,
-    LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS, LIVE_MINIMUM_CLOSURE_PATHS,
-    LIVE_SAVE_OPERATION_CLOSURE_PATHS,
+    operational_state_component_digests_v1, ArtifactDigest, ArtifactKind, ClosureGate, ClosurePath,
+    ClosurePathStatus, DeterministicDigest, ExecutionDestinationCountEvidence,
+    ExecutionDestinationEventEvidence, ExecutionDestinationEvidence, ExecutionDestinationSource,
+    FixedCycleDigestGate, GateError, LiveReleaseGate, OperationalStateComponentDigestsV1,
+    ReleaseExecutionDestination, ReleaseGateReport, ReleaseMicrocodeFamily, ReleaseRomByteOrder,
+    ReleaseRomClass, ReleaseRomEvidence, ReleaseRomInput, ReleaseTvRegion, ReleaseTvStandard,
+    RspRdpEvidence, RspRdpObservationEventEvidence, RspRdpObservationKindEvidence,
+    UnsupportedEvent, UnsupportedInstrumentationEvidence, LIVE_CONTROLLER_OPERATION_CLOSURE_PATHS,
+    LIVE_MINIMUM_CLOSURE_PATHS, LIVE_SAVE_OPERATION_CLOSURE_PATHS,
+    OPERATIONAL_STATE_COMPONENT_DIGEST_SCHEMA_V1,
+};
+#[cfg(feature = "recomp-rs")]
+pub use release_gate::{
+    operational_thread_publication_digests_v1, operational_thread_publication_digests_v2,
+    OperationalThreadPublicationDigestErrorV1, OperationalThreadPublicationDigestsV1,
+    OperationalThreadPublicationDigestsV2, OPERATIONAL_THREAD_PUBLICATION_DIGEST_SCHEMA_V1,
+    OPERATIONAL_THREAD_PUBLICATION_DIGEST_SCHEMA_V2,
 };
 pub use release_matrix::{
     verify_release_matrix, verify_release_matrix_with_platform_series,

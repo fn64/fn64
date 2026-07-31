@@ -164,6 +164,11 @@ pub fn partition_with_authorized_splits(
 ) -> Partition {
     let blocks_by_start: BTreeMap<u32, &BasicBlock> =
         cfg.blocks.iter().map(|b| (b.start_va, b)).collect();
+    let delay_aliases: BTreeMap<u32, u32> = cfg
+        .plain_delay_entry_aliases
+        .iter()
+        .map(|alias| (alias.entry_va, alias.continuation_va))
+        .collect();
 
     // claims[block_start] = set of root VAs whose intra-function closure
     // reaches this block.
@@ -171,7 +176,13 @@ pub fn partition_with_authorized_splits(
 
     let legacy_tail_boundaries: BTreeSet<u32> = cfg.proven_roots.iter().copied().collect();
     for &root in &cfg.proven_roots {
-        for start in reachable_blocks(&blocks_by_start, root, None, &legacy_tail_boundaries) {
+        for start in reachable_blocks(
+            &blocks_by_start,
+            &delay_aliases,
+            root,
+            None,
+            &legacy_tail_boundaries,
+        ) {
             claims.entry(start).or_default().insert(root);
         }
     }
@@ -180,7 +191,7 @@ pub fn partition_with_authorized_splits(
     let usable_authoritative: Vec<u32> = split_entries
         .iter()
         .copied()
-        .filter(|entry| blocks_by_start.contains_key(entry))
+        .filter(|entry| blocks_by_start.contains_key(entry) || delay_aliases.contains_key(entry))
         .collect();
     for &entry in &usable_authoritative {
         let Some(enclosing_claimants) = original_claims.get(&entry) else {
@@ -216,6 +227,7 @@ pub fn partition_with_authorized_splits(
         }
         let reachable = reachable_blocks(
             &blocks_by_start,
+            &delay_aliases,
             entry,
             Some(region_end),
             callable_boundaries,
@@ -303,6 +315,7 @@ pub fn partition_with_authorized_splits(
 
 fn reachable_blocks(
     blocks_by_start: &BTreeMap<u32, &BasicBlock>,
+    delay_aliases: &BTreeMap<u32, u32>,
     root: u32,
     exclusive_end: Option<u32>,
     callable_boundaries: &BTreeSet<u32>,
@@ -311,6 +324,10 @@ fn reachable_blocks(
     let mut stack = vec![root];
     while let Some(start) = stack.pop() {
         if exclusive_end.is_some_and(|end| start < root || start >= end) || !visited.insert(start) {
+            continue;
+        }
+        if let Some(&continuation) = delay_aliases.get(&start) {
+            stack.push(continuation);
             continue;
         }
         let Some(block) = blocks_by_start.get(&start) else {
@@ -327,10 +344,12 @@ fn reachable_blocks(
             BlockTerminator::Branch {
                 target,
                 fallthrough,
+                ..
             }
             | BlockTerminator::BranchLikely {
                 target,
                 fallthrough,
+                ..
             } => {
                 stack.push(*target);
                 stack.push(*fallthrough);
@@ -429,6 +448,40 @@ mod tests {
     }
 
     #[test]
+    fn plain_delay_alias_routes_its_root_to_the_continuation_block() {
+        let entry = 0x8000_0004;
+        let continuation = entry + 4;
+        let cfg = Cfg {
+            bank: "boot".into(),
+            word_class: BTreeMap::from([
+                (entry, crate::cfg::WordClass::ProvenCode),
+                (continuation, crate::cfg::WordClass::ProvenCode),
+                (continuation + 4, crate::cfg::WordClass::ProvenCode),
+            ]),
+            blocks: vec![BasicBlock {
+                start_va: continuation,
+                end_va: continuation + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            direct_calls: Vec::new(),
+            tail_transfers: Vec::new(),
+            indirect_sites: Vec::new(),
+            plain_delay_entry_aliases: vec![crate::cfg::PlainDelayEntryAlias {
+                entry_va: entry,
+                control_pc: entry - 4,
+                continuation_va: continuation,
+            }],
+            unsupported_delay_entries: Vec::new(),
+            proven_roots: vec![entry],
+        };
+
+        let partition = partition(&cfg);
+        assert_eq!(partition.owners.len(), 1);
+        assert_eq!(partition.owners[0].root_va, entry);
+        assert_eq!(partition.owners[0].block_starts, vec![continuation]);
+    }
+
+    #[test]
     fn jal_target_becomes_its_own_separate_owner_not_absorbed_by_caller() {
         // caller: jal target ; nop (delay) ; jr $ra ; nop
         // target: jr $ra ; nop
@@ -484,6 +537,8 @@ mod tests {
             direct_calls: vec![],
             tail_transfers: vec![],
             indirect_sites: vec![],
+            plain_delay_entry_aliases: vec![],
+            unsupported_delay_entries: vec![],
             proven_roots: vec![0x8000_0000, 0x8000_0020],
         };
 
@@ -698,6 +753,8 @@ mod tests {
             direct_calls: vec![],
             tail_transfers: vec![],
             indirect_sites: vec![],
+            plain_delay_entry_aliases: vec![],
+            unsupported_delay_entries: vec![],
             proven_roots: vec![0x8000_0000, 0x8000_0008],
         };
         let part = Partition {

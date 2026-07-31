@@ -8,7 +8,8 @@
 use crate::cfg::{BasicBlock, BlockTerminator, Cfg, WordClass};
 use crate::facts::{executable_range_subject, BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
 use crate::owner_proof::{OwnerAssessment, OwnerBlocker, OwnerProofReport};
-use crate::partition::Partition;
+use crate::partition::{partition, Partition};
+use crate::resolve::ClosureResult;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum BlockProofBlocker {
     AnalysisBankMismatch,
     Unowned,
-    AmbiguousOwners { roots: Vec<u32> },
+    NoAuthoritativeReachability { roots: Vec<u32> },
     EntryNotAuthoritative { root: u32 },
     InvalidGeometry,
     WordNotProvenCode { pc: u32, class: Option<WordClass> },
@@ -35,7 +36,7 @@ impl BlockProofBlocker {
         match self {
             Self::AnalysisBankMismatch => "analysis_bank_mismatch",
             Self::Unowned => "unowned",
-            Self::AmbiguousOwners { .. } => "ambiguous_owners",
+            Self::NoAuthoritativeReachability { .. } => "no_authoritative_reachability",
             Self::EntryNotAuthoritative { .. } => "entry_not_authoritative",
             Self::InvalidGeometry => "invalid_geometry",
             Self::WordNotProvenCode { .. } => "word_not_proven_code",
@@ -73,12 +74,49 @@ pub fn blocker_histogram(
     histogram
 }
 
+/// Canonical nonempty roots whose independently authoritative CFG closures
+/// reach one block.
+///
+/// Function ownership is deliberately absent: two callable roots may share a
+/// block without weakening the proof that those exact bytes are executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct AuthoritativeReachabilityRoots(Vec<u32>);
+
+impl AuthoritativeReachabilityRoots {
+    pub(crate) fn new(roots: impl IntoIterator<Item = u32>) -> Option<Self> {
+        let mut roots = roots.into_iter().collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots.dedup();
+        (!roots.is_empty()).then_some(Self(roots))
+    }
+
+    pub fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthoritativeReachabilityRoots {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let roots = Vec::<u32>::deserialize(deserializer)?;
+        if roots.is_empty() || roots.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(serde::de::Error::custom(
+                "authoritative reachability roots must be nonempty, sorted, and unique",
+            ));
+        }
+        Ok(Self(roots))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReachableCodeBlock {
     pub bank: String,
     pub start_va: u32,
     pub end_va: u32,
-    pub owner_root: u32,
+    pub authoritative_roots: AuthoritativeReachabilityRoots,
     pub rom_space: RomAddressSpace,
     pub rom_start: u32,
     pub rom_end: u32,
@@ -106,6 +144,99 @@ pub struct BlockProofReport {
     pub proven_bytes: u64,
 }
 
+#[derive(Clone)]
+struct AuthorityBlockReachability {
+    start_va: u32,
+    end_va: u32,
+    delay_slot_va: Option<u32>,
+    roots: AuthoritativeReachabilityRoots,
+}
+
+fn authority_delay_slot_va(block: &BasicBlock) -> Option<u32> {
+    match block.terminator {
+        BlockTerminator::Tail { .. }
+        | BlockTerminator::Call { .. }
+        | BlockTerminator::Branch { .. }
+        | BlockTerminator::BranchLikely { .. }
+        | BlockTerminator::Return
+        | BlockTerminator::Indirect { .. }
+        | BlockTerminator::ResolvedIndirect { .. } => block.end_va.checked_sub(4),
+        BlockTerminator::Fallthrough { .. }
+        | BlockTerminator::Trap
+        | BlockTerminator::InvalidInstruction { .. }
+        | BlockTerminator::MissingDelaySlot { .. }
+        | BlockTerminator::RanOffEnd
+        | BlockTerminator::DataFence { .. } => None,
+    }
+}
+
+/// Crate-private projection of per-block roots from the authority-only CFG.
+///
+/// The only constructor partitions the supplied authority closure itself.
+/// Broad traversal roots never enter this type. A broad block may consume a
+/// record only when one authority block fully contains its exact extent.
+pub(crate) struct AuthorityReachabilityProjection {
+    bank: String,
+    blocks: Vec<AuthorityBlockReachability>,
+}
+
+impl AuthorityReachabilityProjection {
+    pub(crate) fn from_authority_closure(authority_closure: &ClosureResult) -> Self {
+        let cfg = &authority_closure.cfg;
+        let authority_partition = partition(cfg);
+        let owner_of: BTreeMap<u32, u32> = authority_partition
+            .owners
+            .iter()
+            .flat_map(|owner| {
+                owner
+                    .block_starts
+                    .iter()
+                    .map(move |&start| (start, owner.root_va))
+            })
+            .collect();
+        let ambiguous: BTreeMap<u32, Vec<u32>> = authority_partition
+            .ambiguous
+            .iter()
+            .map(|block| (block.block_start, block.claimants.clone()))
+            .collect();
+        let mut blocks = cfg
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                let roots = ambiguous.get(&block.start_va).cloned().or_else(|| {
+                    owner_of
+                        .get(&block.start_va)
+                        .copied()
+                        .map(|root| vec![root])
+                })?;
+                Some(AuthorityBlockReachability {
+                    start_va: block.start_va,
+                    end_va: block.end_va,
+                    delay_slot_va: authority_delay_slot_va(block),
+                    roots: AuthoritativeReachabilityRoots::new(roots)
+                        .expect("authority partition claimants are nonempty"),
+                })
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| (block.start_va, block.end_va));
+        Self {
+            bank: cfg.bank.clone(),
+            blocks,
+        }
+    }
+
+    fn roots_for(&self, block: &BasicBlock) -> Option<&AuthoritativeReachabilityRoots> {
+        let mut containing = self.blocks.iter().filter(|authority| {
+            authority.start_va <= block.start_va
+                && block.end_va <= authority.end_va
+                && authority.delay_slot_va != Some(block.start_va)
+                && authority.delay_slot_va != Some(block.end_va)
+        });
+        let only = containing.next()?;
+        containing.next().is_none().then_some(&only.roots)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Backing {
     space: RomAddressSpace,
@@ -118,6 +249,26 @@ pub fn prove_reachable_blocks(
     partition: &Partition,
     owners: &OwnerProofReport,
     facts: &FactDb,
+) -> BlockProofReport {
+    prove_reachable_blocks_inner(cfg, partition, owners, facts, None)
+}
+
+pub(crate) fn prove_reachable_blocks_with_authority_projection(
+    cfg: &Cfg,
+    partition: &Partition,
+    owners: &OwnerProofReport,
+    facts: &FactDb,
+    authority: &AuthorityReachabilityProjection,
+) -> BlockProofReport {
+    prove_reachable_blocks_inner(cfg, partition, owners, facts, Some(authority))
+}
+
+fn prove_reachable_blocks_inner(
+    cfg: &Cfg,
+    partition: &Partition,
+    owners: &OwnerProofReport,
+    facts: &FactDb,
+    authority: Option<&AuthorityReachabilityProjection>,
 ) -> BlockProofReport {
     let owner_of: BTreeMap<u32, u32> = partition
         .owners
@@ -155,20 +306,46 @@ pub fn prove_reachable_blocks(
     let mut proven_bytes = 0;
     for block in &cfg.blocks {
         let mut blockers = BTreeSet::new();
-        if partition.bank != cfg.bank || owners.bank != cfg.bank {
+        if partition.bank != cfg.bank
+            || owners.bank != cfg.bank
+            || authority.is_some_and(|projection| projection.bank != cfg.bank)
+        {
             blockers.insert(BlockProofBlocker::AnalysisBankMismatch);
         }
-        let owner_root = owner_of.get(&block.start_va).copied();
-        if let Some(roots) = ambiguous.get(&block.start_va) {
-            blockers.insert(BlockProofBlocker::AmbiguousOwners {
-                roots: roots.clone(),
-            });
-        } else if owner_root.is_none() {
+        let mut claimant_roots = ambiguous
+            .get(&block.start_va)
+            .cloned()
+            .or_else(|| {
+                owner_of
+                    .get(&block.start_va)
+                    .copied()
+                    .map(|root| vec![root])
+            })
+            .unwrap_or_default();
+        claimant_roots.sort_unstable();
+        claimant_roots.dedup();
+        let reached_roots = match authority {
+            Some(projection) => projection
+                .roots_for(block)
+                .map(|roots| roots.as_slice().to_vec())
+                .unwrap_or_default(),
+            None => claimant_roots
+                .iter()
+                .copied()
+                .filter(|root| authoritative.get(root).copied().unwrap_or(false))
+                .collect(),
+        };
+        let authoritative_roots = AuthoritativeReachabilityRoots::new(reached_roots);
+        if claimant_roots.is_empty() && authoritative_roots.is_none() {
             blockers.insert(BlockProofBlocker::Unowned);
         }
-        if let Some(root) = owner_root {
-            if !authoritative.get(&root).copied().unwrap_or(false) {
-                blockers.insert(BlockProofBlocker::EntryNotAuthoritative { root });
+        if authoritative_roots.is_none() && !claimant_roots.is_empty() {
+            if let [root] = claimant_roots.as_slice() {
+                blockers.insert(BlockProofBlocker::EntryNotAuthoritative { root: *root });
+            } else {
+                blockers.insert(BlockProofBlocker::NoAuthoritativeReachability {
+                    roots: claimant_roots,
+                });
             }
         }
         validate_block(block, cfg, &mut blockers);
@@ -186,7 +363,8 @@ pub fn prove_reachable_blocks(
         };
         if blockers.is_empty() {
             let backing = backing.expect("one backing when no blocker remains");
-            let root = owner_root.expect("one owner when no blocker remains");
+            let authoritative_roots = authoritative_roots
+                .expect("nonempty authoritative reachability when no blocker remains");
             proven_blocks += 1;
             proven_bytes += u64::from(block.end_va - block.start_va);
             assessments.push(BlockAssessment::Proven {
@@ -194,7 +372,7 @@ pub fn prove_reachable_blocks(
                     bank: cfg.bank.clone(),
                     start_va: block.start_va,
                     end_va: block.end_va,
-                    owner_root: root,
+                    authoritative_roots,
                     rom_space: backing.space,
                     rom_start: backing.start,
                     rom_end: backing.end,
@@ -382,6 +560,8 @@ fn fact_rom_len(fact: &Fact) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owner_proof::OwnerFrontier;
+    use crate::partition::{AmbiguousBlock, Owner, Partition};
 
     const BASE: u32 = 0x8000_0000;
 
@@ -391,7 +571,7 @@ mod tests {
                 bank: "bank".into(),
                 start_va,
                 end_va,
-                owner_root: BASE,
+                authoritative_roots: AuthoritativeReachabilityRoots::new([BASE]).unwrap(),
                 rom_space: RomAddressSpace::Physical,
                 rom_start: 0x1000 + (start_va - BASE),
                 rom_end: 0x1000 + (end_va - BASE),
@@ -411,6 +591,718 @@ mod tests {
             proven_blocks,
             proven_bytes: 0,
         }
+    }
+
+    fn one_block_cfg() -> Cfg {
+        Cfg {
+            bank: "bank".into(),
+            word_class: [
+                (BASE, WordClass::ProvenCode),
+                (BASE + 4, WordClass::ProvenCode),
+            ]
+            .into_iter()
+            .collect(),
+            blocks: vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            direct_calls: Vec::new(),
+            tail_transfers: Vec::new(),
+            indirect_sites: Vec::new(),
+            plain_delay_entry_aliases: Vec::new(),
+            unsupported_delay_entries: Vec::new(),
+            proven_roots: Vec::new(),
+        }
+    }
+
+    fn mapped_facts() -> FactDb {
+        mapped_facts_len(8)
+    }
+
+    fn mapped_facts_len(byte_len: u32) -> FactDb {
+        let mut facts = FactDb::new();
+        let mapping = facts.insert(Fact::RomMapping {
+            bank: "bank".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x1000,
+            rom_end: 0x1000 + byte_len,
+            va_start: BASE,
+            va_end: BASE + byte_len,
+        });
+        facts
+            .conclude(
+                "bank:bank",
+                ProofState::Proven,
+                vec![mapping],
+                "test_mapping",
+            )
+            .unwrap();
+        facts
+    }
+
+    fn cfg_from_blocks(blocks: Vec<BasicBlock>, roots: Vec<u32>) -> Cfg {
+        let word_class = blocks
+            .iter()
+            .flat_map(|block| (block.start_va..block.end_va).step_by(4))
+            .map(|pc| (pc, WordClass::ProvenCode))
+            .collect();
+        Cfg {
+            bank: "bank".into(),
+            word_class,
+            blocks,
+            direct_calls: Vec::new(),
+            tail_transfers: Vec::new(),
+            indirect_sites: Vec::new(),
+            plain_delay_entry_aliases: Vec::new(),
+            unsupported_delay_entries: Vec::new(),
+            proven_roots: roots,
+        }
+    }
+
+    fn closure_of(cfg: Cfg) -> ClosureResult {
+        ClosureResult {
+            cfg,
+            indirect: Vec::new(),
+        }
+    }
+
+    fn owner_partition(block_start: u32, block_end: u32, root: u32) -> Partition {
+        Partition {
+            bank: "bank".into(),
+            owners: vec![Owner {
+                bank: "bank".into(),
+                root_va: root,
+                block_starts: vec![block_start],
+                extent_end: block_end,
+            }],
+            ambiguous: Vec::new(),
+            unowned: Vec::new(),
+        }
+    }
+
+    fn projected_report(
+        broad: &Cfg,
+        broad_partition: &Partition,
+        owners: &OwnerProofReport,
+        authority: &ClosureResult,
+        mapped_len: u32,
+    ) -> BlockProofReport {
+        let projection = AuthorityReachabilityProjection::from_authority_closure(authority);
+        prove_reachable_blocks_with_authority_projection(
+            broad,
+            broad_partition,
+            owners,
+            &mapped_facts_len(mapped_len),
+            &projection,
+        )
+    }
+
+    fn owner_report(roots: &[(u32, bool)]) -> OwnerProofReport {
+        OwnerProofReport {
+            bank: "bank".into(),
+            assessments: roots
+                .iter()
+                .map(|&(root, is_authoritative)| OwnerAssessment::Candidate {
+                    frontier: OwnerFrontier {
+                        entry: BankAddr::new("bank", root),
+                        proposed_va_end: None,
+                        blockers: (!is_authoritative)
+                            .then_some(OwnerBlocker::EntryNotAuthoritative)
+                            .into_iter()
+                            .collect(),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn ambiguous_partition(roots: &[u32]) -> Partition {
+        Partition {
+            bank: "bank".into(),
+            owners: Vec::new(),
+            ambiguous: vec![AmbiguousBlock {
+                block_start: BASE,
+                claimants: roots.to_vec(),
+            }],
+            unowned: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shared_block_with_multiple_authoritative_roots_is_proven() {
+        let report = prove_reachable_blocks(
+            &one_block_cfg(),
+            &ambiguous_partition(&[BASE + 0x40, BASE]),
+            &owner_report(&[(BASE, true), (BASE + 0x40, true)]),
+            &mapped_facts(),
+        );
+        let BlockAssessment::Proven { block } = &report.assessments[0] else {
+            panic!("shared authoritative reachability was not admitted");
+        };
+        assert_eq!(block.authoritative_roots.as_slice(), &[BASE, BASE + 0x40]);
+    }
+
+    #[test]
+    fn one_authoritative_claimant_is_sufficient_and_heuristic_claimant_is_excluded() {
+        let report = prove_reachable_blocks(
+            &one_block_cfg(),
+            &ambiguous_partition(&[BASE, BASE + 0x40]),
+            &owner_report(&[(BASE, true), (BASE + 0x40, false)]),
+            &mapped_facts(),
+        );
+        let BlockAssessment::Proven { block } = &report.assessments[0] else {
+            panic!("authoritative reachability was hidden by function-owner ambiguity");
+        };
+        assert_eq!(block.authoritative_roots.as_slice(), &[BASE]);
+    }
+
+    #[test]
+    fn shared_block_without_an_authoritative_claimant_stays_open() {
+        let report = prove_reachable_blocks(
+            &one_block_cfg(),
+            &ambiguous_partition(&[BASE, BASE + 0x40]),
+            &owner_report(&[(BASE, false), (BASE + 0x40, false)]),
+            &mapped_facts(),
+        );
+        assert!(matches!(
+            &report.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::NoAuthoritativeReachability {
+                    roots: vec![BASE, BASE + 0x40],
+                })
+        ));
+    }
+
+    #[test]
+    fn shared_authority_does_not_bypass_backing_or_decoder_proof() {
+        let partition = ambiguous_partition(&[BASE, BASE + 0x40]);
+        let owners = owner_report(&[(BASE, true), (BASE + 0x40, true)]);
+        let no_backing =
+            prove_reachable_blocks(&one_block_cfg(), &partition, &owners, &FactDb::new());
+        assert!(matches!(
+            &no_backing.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::MissingRomBacking)
+        ));
+
+        let mut invalid_word = one_block_cfg();
+        invalid_word
+            .word_class
+            .insert(BASE + 4, WordClass::CandidateCode);
+        let invalid = prove_reachable_blocks(&invalid_word, &partition, &owners, &mapped_facts());
+        assert!(matches!(
+            &invalid.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::WordNotProvenCode {
+                    pc: BASE + 4,
+                    class: Some(WordClass::CandidateCode),
+                })
+        ));
+    }
+
+    #[test]
+    fn authority_projection_proves_fully_contained_candidate_split_without_promoting_owner() {
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 0x10,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        let broad = cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE + 4,
+                end_va: BASE + 0x10,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE + 4],
+        );
+        let owners = owner_report(&[(BASE + 4, false)]);
+        let report = projected_report(
+            &broad,
+            &owner_partition(BASE + 4, BASE + 0x10, BASE + 4),
+            &owners,
+            &authority,
+            0x10,
+        );
+
+        let BlockAssessment::Proven { block } = &report.assessments[0] else {
+            panic!("fully-contained authority reachability was not projected");
+        };
+        assert_eq!(block.authoritative_roots.as_slice(), &[BASE]);
+        assert!(matches!(
+            &owners.assessments[0],
+            OwnerAssessment::Candidate { frontier }
+                if frontier.blockers.contains(&OwnerBlocker::EntryNotAuthoritative)
+        ));
+    }
+
+    #[test]
+    fn authority_projection_proves_candidate_tail_root_reached_by_authority() {
+        let tail = BASE + 0x10;
+        let blocks = vec![
+            BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Tail { target: tail },
+            },
+            BasicBlock {
+                start_va: tail,
+                end_va: tail + 8,
+                terminator: BlockTerminator::Return,
+            },
+        ];
+        let authority = closure_of(cfg_from_blocks(blocks.clone(), vec![BASE]));
+        let broad = cfg_from_blocks(blocks, vec![BASE, tail]);
+        let owners = owner_report(&[(BASE, true), (tail, false)]);
+        let report = projected_report(&broad, &partition(&broad), &owners, &authority, 0x18);
+
+        let BlockAssessment::Proven { block } = report
+            .assessments
+            .iter()
+            .find(|assessment| {
+                matches!(assessment, BlockAssessment::Proven { block } if block.start_va == tail)
+            })
+            .expect("tail block assessment")
+        else {
+            unreachable!()
+        };
+        assert_eq!(block.authoritative_roots.as_slice(), &[BASE]);
+    }
+
+    #[test]
+    fn authority_projection_preserves_all_shared_authoritative_claimants() {
+        let second_root = BASE + 8;
+        let shared = BASE + 0x10;
+        let blocks = vec![
+            BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Tail { target: shared },
+            },
+            BasicBlock {
+                start_va: second_root,
+                end_va: second_root + 8,
+                terminator: BlockTerminator::Tail { target: shared },
+            },
+            BasicBlock {
+                start_va: shared,
+                end_va: shared + 8,
+                terminator: BlockTerminator::Return,
+            },
+        ];
+        let authority = closure_of(cfg_from_blocks(blocks.clone(), vec![second_root, BASE]));
+        let broad = cfg_from_blocks(blocks, vec![BASE, second_root, shared]);
+        let owners = owner_report(&[(BASE, true), (second_root, true), (shared, false)]);
+        let report = projected_report(&broad, &partition(&broad), &owners, &authority, 0x18);
+
+        let BlockAssessment::Proven { block } = report
+            .assessments
+            .iter()
+            .find(|assessment| {
+                matches!(assessment, BlockAssessment::Proven { block } if block.start_va == shared)
+            })
+            .expect("shared block assessment")
+        else {
+            unreachable!()
+        };
+        assert_eq!(block.authoritative_roots.as_slice(), &[BASE, second_root]);
+    }
+
+    #[test]
+    fn authority_projection_rejects_disconnected_candidate_root() {
+        let candidate = BASE + 0x10;
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        let broad = cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: candidate,
+                end_va: candidate + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![candidate],
+        );
+        let report = projected_report(
+            &broad,
+            &owner_partition(candidate, candidate + 8, candidate),
+            &owner_report(&[(candidate, false)]),
+            &authority,
+            0x18,
+        );
+
+        assert!(matches!(
+            &report.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::EntryNotAuthoritative {
+                    root: candidate,
+                })
+        ));
+    }
+
+    #[test]
+    fn authority_projection_rejects_partial_overlap() {
+        let candidate = BASE + 4;
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        let broad = cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: candidate,
+                end_va: BASE + 0x0c,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![candidate],
+        );
+        let report = projected_report(
+            &broad,
+            &owner_partition(candidate, BASE + 0x0c, candidate),
+            &owner_report(&[(candidate, false)]),
+            &authority,
+            0x0c,
+        );
+
+        assert!(matches!(
+            &report.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::EntryNotAuthoritative {
+                    root: candidate,
+                })
+        ));
+    }
+
+    #[test]
+    fn authority_projection_rejects_candidate_shaped_call_bytes() {
+        let candidate = BASE + 0x10;
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        let broad = cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: candidate,
+                end_va: candidate + 8,
+                terminator: BlockTerminator::Call {
+                    target: 0x8090_0000,
+                    next: candidate + 8,
+                },
+            }],
+            vec![candidate],
+        );
+        let report = projected_report(
+            &broad,
+            &owner_partition(candidate, candidate + 8, candidate),
+            &owner_report(&[(candidate, false)]),
+            &authority,
+            0x18,
+        );
+
+        assert!(matches!(
+            &report.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::EntryNotAuthoritative {
+                    root: candidate,
+                })
+        ));
+    }
+
+    #[test]
+    fn authority_projection_does_not_import_candidate_call_target_authority() {
+        let target = BASE + 8;
+        let candidate_caller = BASE + 0x18;
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 0x10,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        let broad = cfg_from_blocks(
+            vec![
+                BasicBlock {
+                    start_va: target,
+                    end_va: BASE + 0x10,
+                    terminator: BlockTerminator::Return,
+                },
+                BasicBlock {
+                    start_va: candidate_caller,
+                    end_va: candidate_caller + 8,
+                    terminator: BlockTerminator::Call {
+                        target,
+                        next: candidate_caller + 8,
+                    },
+                },
+            ],
+            vec![target, candidate_caller],
+        );
+        let broad_partition = Partition {
+            bank: "bank".into(),
+            owners: vec![
+                Owner {
+                    bank: "bank".into(),
+                    root_va: target,
+                    block_starts: vec![target],
+                    extent_end: BASE + 0x10,
+                },
+                Owner {
+                    bank: "bank".into(),
+                    root_va: candidate_caller,
+                    block_starts: vec![candidate_caller],
+                    extent_end: candidate_caller + 8,
+                },
+            ],
+            ambiguous: Vec::new(),
+            unowned: Vec::new(),
+        };
+        let owners = owner_report(&[(target, false), (candidate_caller, false)]);
+        let report = projected_report(&broad, &broad_partition, &owners, &authority, 0x20);
+
+        let BlockAssessment::Proven { block } = &report.assessments[0] else {
+            panic!("authority-reached target block should remain executable");
+        };
+        assert_eq!(block.authoritative_roots.as_slice(), &[BASE]);
+        assert!(matches!(
+            &owners.assessments[0],
+            OwnerAssessment::Candidate { frontier }
+                if frontier.entry.pc == target
+                    && frontier.blockers.contains(&OwnerBlocker::EntryNotAuthoritative)
+        ));
+        assert!(matches!(
+            &report.assessments[1],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::EntryNotAuthoritative {
+                    root: candidate_caller,
+                })
+        ));
+    }
+
+    #[test]
+    fn authority_projection_rejects_boundaries_that_sever_a_delay_slot() {
+        let delay_slot = BASE + 4;
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        let broad = cfg_from_blocks(
+            vec![
+                BasicBlock {
+                    start_va: BASE,
+                    end_va: delay_slot,
+                    terminator: BlockTerminator::Fallthrough { next: delay_slot },
+                },
+                BasicBlock {
+                    start_va: delay_slot,
+                    end_va: BASE + 8,
+                    terminator: BlockTerminator::Trap,
+                },
+            ],
+            vec![BASE, delay_slot],
+        );
+        let broad_partition = Partition {
+            bank: "bank".into(),
+            owners: vec![
+                Owner {
+                    bank: "bank".into(),
+                    root_va: BASE,
+                    block_starts: vec![BASE],
+                    extent_end: delay_slot,
+                },
+                Owner {
+                    bank: "bank".into(),
+                    root_va: delay_slot,
+                    block_starts: vec![delay_slot],
+                    extent_end: BASE + 8,
+                },
+            ],
+            ambiguous: Vec::new(),
+            unowned: Vec::new(),
+        };
+        let report = projected_report(
+            &broad,
+            &broad_partition,
+            &owner_report(&[(BASE, true), (delay_slot, false)]),
+            &authority,
+            8,
+        );
+
+        assert!(report
+            .assessments
+            .iter()
+            .all(|assessment| matches!(assessment, BlockAssessment::Candidate { .. })));
+    }
+
+    #[test]
+    fn authority_projection_rejects_block_spanning_two_authority_blocks() {
+        let authority = closure_of(cfg_from_blocks(
+            vec![
+                BasicBlock {
+                    start_va: BASE,
+                    end_va: BASE + 8,
+                    terminator: BlockTerminator::Return,
+                },
+                BasicBlock {
+                    start_va: BASE + 8,
+                    end_va: BASE + 0x10,
+                    terminator: BlockTerminator::Return,
+                },
+            ],
+            vec![BASE, BASE + 8],
+        ));
+        let broad = cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 0x10,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        );
+        let report = projected_report(
+            &broad,
+            &owner_partition(BASE, BASE + 0x10, BASE),
+            &owner_report(&[(BASE, true)]),
+            &authority,
+            0x10,
+        );
+
+        assert!(matches!(
+            &report.assessments[0],
+            BlockAssessment::Candidate { .. }
+        ));
+    }
+
+    #[test]
+    fn authority_projection_preserves_malformed_and_data_fence_blockers() {
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        for (terminator, expected) in [
+            (
+                BlockTerminator::InvalidInstruction {
+                    pc: BASE + 4,
+                    word: 0xffff_ffff,
+                },
+                BlockProofBlocker::InvalidInstruction {
+                    pc: BASE + 4,
+                    word: 0xffff_ffff,
+                },
+            ),
+            (
+                BlockTerminator::DataFence { at: BASE + 8 },
+                BlockProofBlocker::RanOffEnd,
+            ),
+        ] {
+            let broad = cfg_from_blocks(
+                vec![BasicBlock {
+                    start_va: BASE,
+                    end_va: BASE + 8,
+                    terminator,
+                }],
+                vec![BASE],
+            );
+            let report = projected_report(
+                &broad,
+                &owner_partition(BASE, BASE + 8, BASE),
+                &owner_report(&[(BASE, true)]),
+                &authority,
+                8,
+            );
+            assert!(matches!(
+                &report.assessments[0],
+                BlockAssessment::Candidate { blockers, .. } if blockers.contains(&expected)
+            ));
+        }
+    }
+
+    #[test]
+    fn authority_projection_does_not_import_broad_resolved_indirect_targets() {
+        let target = BASE + 0x10;
+        let authority = closure_of(cfg_from_blocks(
+            vec![BasicBlock {
+                start_va: BASE,
+                end_va: BASE + 8,
+                terminator: BlockTerminator::Return,
+            }],
+            vec![BASE],
+        ));
+        let broad = cfg_from_blocks(
+            vec![
+                BasicBlock {
+                    start_va: BASE,
+                    end_va: BASE + 8,
+                    terminator: BlockTerminator::ResolvedIndirect {
+                        targets: vec![target],
+                        via_call: false,
+                    },
+                },
+                BasicBlock {
+                    start_va: target,
+                    end_va: target + 8,
+                    terminator: BlockTerminator::Return,
+                },
+            ],
+            vec![BASE, target],
+        );
+        let report = projected_report(
+            &broad,
+            &partition(&broad),
+            &owner_report(&[(BASE, true), (target, false)]),
+            &authority,
+            0x18,
+        );
+
+        assert!(matches!(
+            report.assessments.iter().find(|assessment| matches!(
+                assessment,
+                BlockAssessment::Candidate { start_va, .. } if *start_va == target
+            )),
+            Some(BlockAssessment::Candidate { blockers, .. })
+                if blockers.contains(&BlockProofBlocker::NoAuthoritativeReachability {
+                    roots: vec![BASE, target],
+                })
+        ));
+    }
+
+    #[test]
+    fn authoritative_roots_wire_rejects_empty_or_noncanonical_authority() {
+        assert!(serde_json::from_str::<AuthoritativeReachabilityRoots>("[]").is_err());
+        assert!(
+            serde_json::from_str::<AuthoritativeReachabilityRoots>(&format!(
+                "[{},{}]",
+                BASE + 4,
+                BASE
+            ))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<AuthoritativeReachabilityRoots>(&format!("[{0},{0}]", BASE))
+                .is_err()
+        );
     }
 
     #[test]

@@ -10,6 +10,51 @@ core.
 - **`mupen_trace.c`** -- trace producer v1. Single-steps a bounded window
   from the ROM entrypoint, emitting fn64-discover's `executed_pc` /
   `watched_table_write` trace schema (`crates/fn64-discover/src/trace.rs`).
+  The public debugger steps a MIPS control transfer and its delay slot as one
+  unit, so the emitted pause-PC stream intentionally makes no executed-PC
+  exhaustiveness claim. Pack admission adds the architecturally required
+  delay-slot word for every observed control instruction.
+  At the pause immediately before the normalized ROM header entry executes,
+  it also creates a separate `fn64.boot-context.v1` file containing the exact
+  ROM and IPL3 identities, header-derived TV standard, entry PC, all GPRs,
+  HI/LO, and the public debugger's complete CP0 register image. The output is
+  create-new: an existing context file is never replaced.
+  The step handshake permits exactly one outstanding `DebugStep`; a missing
+  callback traps after a bounded wait instead of queuing another step and
+  silently changing the captured CPU state.
+  Setting `FN64_CPU_SNAPSHOT_PC=<aligned-pc>` together with
+  `FN64_CPU_SNAPSHOT=<create-new-json-path>` additionally captures GPRs,
+  HI/LO, and all public-debugger CP0 slots at the first pause before that PC
+  executes. The snapshot records the exact retired-instruction position in
+  the bounded window and normalized-ROM identity; it does not interpret the
+  debugger's opaque TLB pointer.
+  Executable-image capture normally treats its capture PC as the first fetch.
+  For a completed image observed at an earlier publication checkpoint, set
+  `FN64_EXECUTABLE_IMAGE_FIRST_PC` to the independently observed first entry
+  inside the captured range; the producer validates that it lies in-range.
+  A capture may contain up to 262,144 words (one MiB), allowing one completed
+  overlay or resident image to be hashed as a unit instead of stitching
+  independently timed page captures.
+  `FN64_CAPTURE_ONLY=1` suppresses per-PC JSONL records during long capture
+  searches, and `FN64_STOP_AFTER_IMAGE=1` stops immediately after the target
+  pause. These are capture-throughput controls; their abbreviated JSONL is
+  not execution-coverage evidence.
+  Repeated full traces are reproducible for static-pack admission when their
+  parsed authority, completion shape, event counts, and exact bank-generation
+  root sets match. Their raw PC order need not be byte-identical: public-core
+  asynchronous interrupt delivery can move an exception entry by adjacent
+  guest instructions without changing the observed scenario root set.
+  Setting `FN64_WATCH_VI=1` additionally emits value transitions for the
+  fourteen standard VI MMIO words. This is a diagnostic value observation,
+  not an instruction-exact timing oracle: an MMIO transition can be observed
+  on either side of an adjacent debugger pause even when the ordered values
+  are stable.
+  `FN64_WATCH_WORD=<aligned-address>` polls one additional word after every
+  retired step and prints value transitions to stderr with the preceding
+  pause PC and retired count. This is a diagnostic publication-boundary
+  locator: the PC is not claimed as the writer because asynchronous device
+  work can become visible between pauses. The diagnostic deliberately stays
+  outside trace-schema JSONL and carries no static-discovery proof by itself.
 - **`mupen_devtrace.c`** -- device-event producer for the timing oracle
   (`docs/superpowers/specs/2026-07-23-timing-oracle-design.md`). Drives the
   same debugger seam, but emits `crates/fn64-discover/src/timing_trace.rs`'s
@@ -117,3 +162,105 @@ the built dylib's path. On macOS the pinned patch defaults
 `DEBUGGER_NO_DISASM=1`, so no libbfd/libopcodes dependency is needed. The
 scratch directory must be outside fn64's git tree (e.g. under `/tmp`) --
 never commit the clone or the build output.
+
+`FN64_BUILD_JOBS=<positive-integer>` bounds the core build's make parallelism.
+Use `FN64_BUILD_JOBS=1` on a memory-constrained host; when unset, the helper
+uses the host CPU count.
+
+## Bounded producer-to-ingest pipeline
+
+`scripts/run-black-box-trace.zsh` connects the supported public-debugger
+producer to `fn64-discover --trace --summary` without putting a ROM, trace,
+boot context, or diagnostic in the worktree or on stdout. Every path is
+explicit and absolute. The output directory must not exist and must be outside
+the fn64 worktree. Both subprocesses have a caller-selected wall-clock timeout,
+the instruction window is capped at 100,000,000, and a failed or timed-out run
+removes its newly created output directory. The script rehashes the producer,
+core, RSP plugin, ROM, canonical trace, and discover executable across the
+boundaries where each is consumed. `fn64-discover` itself rejects a trace whose
+header does not name the normalized digest of the supplied ROM.
+
+```sh
+scripts/run-black-box-trace.zsh \
+  --producer /absolute/path/to/mupen_trace \
+  --discover /absolute/path/to/fn64-discover \
+  --core /absolute/path/to/libmupen64plus.dylib \
+  --rsp /absolute/path/to/mupen64plus-rsp-hle.dylib \
+  --rom /absolute/private/path/game.z64 \
+  --trace-id boot-window-1 \
+  --steps 5000000 \
+  --timeout-seconds 600 \
+  --out-dir /absolute/private/path/new-capture-directory
+```
+
+This path produces executed-PC and watched-write observations only. It does
+**not** claim PI-DMA coverage. The public debugger reports PI length registers
+as their hardware readback values, not the completed transfer length, so
+`mupen_devtrace`'s headless-bridge mode aborts rather than fabricate DMA
+geometry. Its separate core-side emitter is not part of this public-interface
+pipeline. The resulting `trace.jsonl` is already the canonical trace schema;
+the discover ingestion pass is its strict normalization/ROM-binding gate, not
+a lossy format adapter. The summary proves ingestion and fact folding ran but
+is not a full discovery artifact or pack-admission authority.
+
+Some ROMs remain in an IPL3 MMIO polling loop when driven exclusively through
+the public single-step seam. For example, GoldenEye's `0x80000450` sequence
+loads the PI/MI status word and branches until the asynchronous transfer clears;
+the headless stepper can observe that loop without advancing the device event.
+Such a trace is valid boot evidence but is explicitly not post-boot gameplay
+coverage. A producer run that has only a small repeating PC set must therefore
+be classified as a device-progress frontier and paired with a continuous-run
+or breakpoint-based capture before its PCs can admit runtime overlays.
+For that experiment, set `FN64_CONTINUOUS_PRELUDE_MS` (bounded to two minutes):
+the producer runs normally, issues the public `M64CMD_PAUSE`, and only then
+starts the deterministic single-step window. This is opt-in because the
+continuous prelude is timing-sensitive and its resulting trace is diagnostic,
+not an instruction-exact replay authority.
+
+The producer is compiled separately against the public mupen64plus headers as
+shown in `mupen_trace.c`'s header. The pipeline deliberately does not build or
+inspect the GPL core. Run the synthetic command-contract gate without a ROM or
+emulator:
+
+```sh
+scripts/test-run-black-box-trace.zsh
+```
+
+Before admitting a capture as runtime evidence, classify its pause-PC shape:
+
+```sh
+python3 tools/mupen-trace/classify-trace.py /absolute/path/trace.jsonl
+```
+
+The command exits `2` for a small repeating PC frontier (usually an
+asynchronous device-progress wait), `0` for a diverse execution observation,
+and `0` with `insufficient-observation` when too few executed records exist.
+
+### Deterministic controller input
+
+Build `fn64_input_plugin.c` as a separate input-plugin dylib and set
+`FN64_INPUT_PLUGIN` to its absolute path. Set `FN64_INPUT_SCHEDULE` to a file
+whose first non-comment line is `fn64.controller-input-schedule.v1`, followed
+by rows of `port first_read end_read buttons_hex stick_x stick_y`. `GetKeys`
+advances each port's read ordinal independently; a row applies only to its
+declared port and uncovered reads are neutral. A macOS build using the public
+Mupen headers is:
+
+```sh
+cc -fPIC -shared -O2 -Wall -Wextra -Werror \
+  -I<path-to-mupen64plus-core>/src/api \
+  -o <scratch>/fn64_input_plugin.dylib fn64_input_plugin.c
+```
+
+The plugin is original fn64 tooling and may be extracted into a separate
+permissively licensed repository. Keep the GPL Mupen core, ROMs, schedules,
+traces, and compiled dylibs outside that repository; this tree contains no
+link-time dependency on the core.
+The plugin is loaded only when `FN64_INPUT_PLUGIN` is set, preserving the
+dummy-input default. Its source and build output remain outside the fn64 tree.
+
+For a bounded startup bypass, `FN64_FAST_FORWARD_PC=0x800xxxxx` changes the
+capture start from the default ROM entrypoint to an aligned resident address.
+The producer still single-steps until that pause is observed, emits the same
+boot-context contract, and keeps the pre-window step count diagnostic; invalid
+or non-resident values fail closed.

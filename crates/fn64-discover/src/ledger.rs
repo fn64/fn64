@@ -110,7 +110,9 @@ const IPL3_END: u32 = 0x1000;
 const CONTAINER_MAGICS: [&[u8]; 3] = [b"Yaz0", b"MIO0", &[0x1f, 0x8b]];
 
 fn is_padding(bytes: &[u8]) -> bool {
-    bytes.first().is_some_and(|first| bytes.iter().all(|b| b == first))
+    bytes
+        .first()
+        .is_some_and(|first| bytes.iter().all(|b| b == first))
 }
 
 fn has_container_magic(bytes: &[u8]) -> bool {

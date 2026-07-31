@@ -45,6 +45,24 @@ pub struct TlbEntryRaw {
     pub entry_lo1: u32,
 }
 
+/// One issued register-targeted control transfer retained for divergence
+/// diagnosis. `target_pc` is captured before the delay slot; the architectural
+/// snapshot is taken after that slot retires and immediately before dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndirectTransferObservation {
+    pub source_bank: u64,
+    pub source_pc: u32,
+    pub source_register: u8,
+    pub target_pc: u32,
+    pub link_pc: Option<u32>,
+    pub gprs: [u64; 32],
+    pub hi: u64,
+    pub lo: u64,
+    pub cop0_status: u32,
+    pub cop0_cause: u32,
+    pub cop0_epc: u32,
+}
+
 /// Direction of one guest data-memory translation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataAccessKind {
@@ -405,6 +423,48 @@ impl SingleFpuCause {
     }
 }
 
+/// Pointer-free projection of every future-affecting field owned by one
+/// [`RecompContext`].
+///
+/// The current execution destination and suspended host/coroutine
+/// continuation are deliberately absent: neither is owned by
+/// `RecompContext`. The bounded indirect-transfer history is also absent
+/// because it is diagnostic-only and cannot affect later guest execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecompContextEvidenceSnapshotV1 {
+    pub gprs: [u64; 32],
+    pub hi: u64,
+    pub lo: u64,
+    pub physical_fgrs: [u64; 32],
+    pub fpu_cond: bool,
+    pub fcsr: u32,
+    pub ll_reservation: Option<(u64, u8)>,
+    pub cop0_count: u32,
+    pub cop0_compare: u32,
+    pub cop0_count_write: Option<u32>,
+    pub cop0_compare_write: Option<u32>,
+    pub cop0_cond: bool,
+    pub cop0_status: u32,
+    pub cop0_cause: u32,
+    pub cop0_epc: u32,
+    pub cop0_error_epc: u32,
+    pub cop0_badvaddr: u64,
+    pub cop0_context: u32,
+    pub cop0_xcontext: u64,
+    pub cop0_index: u32,
+    pub tlb_entries: [TlbEntryRaw; 32],
+    pub cop0_entry_lo0: u32,
+    pub cop0_entry_lo1: u32,
+    pub cop0_page_mask: u32,
+    pub cop0_wired: u32,
+    pub cop0_entry_hi: u64,
+    pub cop0_random_phase: u32,
+    pub cop0_watch_lo: u32,
+    pub cop0_watch_hi: u32,
+    pub os_interrupt_mask: u32,
+    pub thread_return_pc: Option<u32>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RecompContext {
     /// r[0] is `$zero`; kept in the array for uniform indexing but never
@@ -509,12 +569,159 @@ pub struct RecompContext {
     /// target equals this value; address zero or an unmapped PC remains a
     /// loud guest fault.
     thread_return_pc: Option<u32>,
+    /// Bounded diagnostic history. It never participates in guest execution,
+    /// pack identity, or generation selection.
+    indirect_transfers: Vec<IndirectTransferObservation>,
 }
 
 impl RecompContext {
+    const INDIRECT_TRANSFER_HISTORY_LIMIT: usize = 64;
+
     /// A fresh context with all registers zeroed.
     pub fn new() -> Self {
         RecompContext::default()
+    }
+
+    /// Capture every future-affecting CPU field owned by this context.
+    ///
+    /// This does not claim to capture the execution destination or a native
+    /// coroutine/host continuation; those live above `RecompContext` and must
+    /// be paired with this projection by their respective owners.
+    pub fn evidence_snapshot_v1(&self) -> RecompContextEvidenceSnapshotV1 {
+        RecompContextEvidenceSnapshotV1 {
+            gprs: self.r,
+            hi: self.hi,
+            lo: self.lo,
+            physical_fgrs: self.fpr.physical_state().into_words(),
+            fpu_cond: self.fpu_cond,
+            fcsr: self.fcsr,
+            ll_reservation: self.ll_reservation,
+            cop0_count: self.cop0_count,
+            cop0_compare: self.cop0_compare,
+            cop0_count_write: self.cop0_count_write,
+            cop0_compare_write: self.cop0_compare_write,
+            cop0_cond: self.cop0_cond,
+            cop0_status: self.cop0_status,
+            cop0_cause: self.cop0_cause,
+            cop0_epc: self.cop0_epc,
+            cop0_error_epc: self.cop0_error_epc,
+            cop0_badvaddr: self.cop0_badvaddr,
+            cop0_context: self.cop0_context,
+            cop0_xcontext: self.cop0_xcontext,
+            cop0_index: self.cop0_index,
+            tlb_entries: self.tlb_entries,
+            cop0_entry_lo0: self.cop0_entry_lo0,
+            cop0_entry_lo1: self.cop0_entry_lo1,
+            cop0_page_mask: self.cop0_page_mask,
+            cop0_wired: self.cop0_wired,
+            cop0_entry_hi: self.cop0_entry_hi,
+            cop0_random_phase: self.cop0_random_phase,
+            cop0_watch_lo: self.cop0_watch_lo,
+            cop0_watch_hi: self.cop0_watch_hi,
+            os_interrupt_mask: self.os_interrupt_mask,
+            thread_return_pc: self.thread_return_pc,
+        }
+    }
+
+    /// Reconstruct the architectural CPU state observed at the
+    /// IPL3-to-header-entry handoff.
+    ///
+    /// This intentionally does not touch host-only OSThread state, the return
+    /// sentinel, or an LL reservation. IPL3 precedes libultra thread
+    /// ownership, and the debugger wire has no authority to manufacture those
+    /// runtime concepts.
+    pub fn restore_boot_context(
+        &mut self,
+        boot: &crate::boot::BootContext,
+    ) -> Result<(), crate::boot::BootContextError> {
+        boot.validate()?;
+
+        self.set_gprs(boot.gprs);
+        self.hi = boot.hi;
+        self.lo = boot.lo;
+
+        let cp0 = &boot.cp0.registers;
+        self.cop0_index = cp0[0] as u32;
+        self.cop0_entry_lo0 = cp0[2] as u32;
+        self.cop0_entry_lo1 = cp0[3] as u32;
+        self.cop0_context = cp0[4] as u32;
+        self.cop0_page_mask = cp0[5] as u32;
+        self.cop0_wired = cp0[6] as u32;
+        self.cop0_random_phase = 31 - cp0[1] as u32;
+        self.cop0_badvaddr = cp0[8];
+        self.cop0_count = cp0[9] as u32;
+        self.cop0_entry_hi = cp0[10];
+        self.cop0_compare = cp0[11] as u32;
+        self.cop0_status = cp0[12] as u32;
+        self.cop0_cause = cp0[13] as u32;
+        self.cop0_epc = cp0[14] as u32;
+        self.cop0_cond = self.cop0_status & (1 << 18) != 0;
+        self.cop0_watch_lo = cp0[18] as u32;
+        self.cop0_watch_hi = cp0[19] as u32;
+        self.cop0_xcontext = cp0[20];
+        self.cop0_error_epc = cp0[30] as u32;
+        self.cop0_count_write = None;
+        self.cop0_compare_write = None;
+        self.ll_reservation = None;
+        Ok(())
+    }
+
+    /// Compare the live architectural state with a captured boot handoff.
+    ///
+    /// Callers use this at the generated runner's first-entry boundary. The
+    /// complete mismatch set is returned so a failed black-box comparison
+    /// identifies every divergent field without rerunning private input.
+    pub fn boot_context_state_mismatches(
+        &self,
+        boot: &crate::boot::BootContext,
+    ) -> Result<Vec<crate::boot::BootContextStateMismatch>, crate::boot::BootContextError> {
+        use crate::boot::{BootContextStateField as Field, BootContextStateMismatch as Mismatch};
+
+        boot.validate()?;
+        let mut mismatches = Vec::new();
+        let mut compare = |field, expected, actual| {
+            if expected != actual {
+                mismatches.push(Mismatch {
+                    field,
+                    expected,
+                    actual,
+                });
+            }
+        };
+        for register in 0..32u8 {
+            compare(
+                Field::Gpr(register),
+                boot.gprs[register as usize],
+                self.r(register),
+            );
+        }
+        compare(Field::Hi, boot.hi, self.hi);
+        compare(Field::Lo, boot.lo, self.lo);
+
+        let cp0 = &boot.cp0.registers;
+        for (register, actual) in [
+            (0, u64::from(self.cop0_index)),
+            (1, u64::from(self.cop0_random())),
+            (2, u64::from(self.cop0_entry_lo0)),
+            (3, u64::from(self.cop0_entry_lo1)),
+            (4, u64::from(self.cop0_context)),
+            (5, u64::from(self.cop0_page_mask)),
+            (6, u64::from(self.cop0_wired)),
+            (8, self.cop0_badvaddr),
+            (9, u64::from(self.cop0_count)),
+            (10, self.cop0_entry_hi),
+            (11, u64::from(self.cop0_compare)),
+            (12, u64::from(self.cop0_status)),
+            (13, u64::from(self.cop0_cause)),
+            (14, u64::from(self.cop0_epc)),
+            (18, u64::from(self.cop0_watch_lo)),
+            (19, u64::from(self.cop0_watch_hi)),
+            (20, self.cop0_xcontext),
+            (30, u64::from(self.cop0_error_epc)),
+        ] {
+            compare(Field::Cop0(register), cp0[register as usize], actual);
+        }
+        Ok(mismatches)
     }
 
     pub fn set_thread_return_pc(&mut self, pc: Option<u32>) {
@@ -598,6 +805,39 @@ impl RecompContext {
     pub fn set_gprs(&mut self, mut regs: [u64; 32]) {
         regs[0] = 0;
         self.r = regs;
+    }
+
+    /// Retain an issued `jr`/`jalr` at the last point before its destination
+    /// enters the active-generation resolver.
+    pub fn record_indirect_transfer(
+        &mut self,
+        source_bank: u64,
+        source_pc: u32,
+        source_register: u8,
+        target_pc: u32,
+        link_pc: Option<u32>,
+    ) {
+        if self.indirect_transfers.len() == Self::INDIRECT_TRANSFER_HISTORY_LIMIT {
+            self.indirect_transfers.remove(0);
+        }
+        self.indirect_transfers.push(IndirectTransferObservation {
+            source_bank,
+            source_pc,
+            source_register,
+            target_pc,
+            link_pc,
+            gprs: self.gprs(),
+            hi: self.hi,
+            lo: self.lo,
+            cop0_status: self.cop0_status,
+            cop0_cause: self.cop0_cause,
+            cop0_epc: self.cop0_epc,
+        });
+    }
+
+    /// Exact retained order, oldest to newest.
+    pub fn indirect_transfer_observations(&self) -> &[IndirectTransferObservation] {
+        &self.indirect_transfers
     }
 
     /// Write a 32-bit result into GPR `idx`, sign-extending into the 64-bit
@@ -695,6 +935,24 @@ impl RecompContext {
             entry_lo0: self.cop0_entry_lo0,
             entry_lo1: self.cop0_entry_lo1,
         };
+    }
+
+    /// Install the unique invalid 4 KiB entry layout established before
+    /// libultra starts application OSThreads.
+    ///
+    /// Zeroing all raw entries is not an invalid TLB: it creates 32 matching
+    /// VPN2/ASID entries for address zero, an architecturally undefined
+    /// multiple-match condition. Distinct VPN2 values with V clear preserve
+    /// the intended invalid/refill behavior without inventing a translation.
+    pub fn initialize_invalid_tlb_entries(&mut self) {
+        for (index, entry) in self.tlb_entries.iter_mut().enumerate() {
+            *entry = TlbEntryRaw {
+                page_mask: 0,
+                entry_hi: (index as u64) << 13,
+                entry_lo0: 0,
+                entry_lo1: 0,
+            };
+        }
     }
 
     /// Current COP0 Random value. VR4300 User's Manual section 5.3.1 defines
@@ -1387,7 +1645,7 @@ impl RecompContext {
             };
         }
 
-        let double_exponent = u64::from(exponent - 127 + 1023) << 52;
+        let double_exponent = u64::from(exponent + (1023 - 127)) << 52;
         Ok(sign | double_exponent | (u64::from(fraction) << 29))
     }
 
@@ -2219,6 +2477,62 @@ pub struct Rdram<'a> {
 pub type RecompFunc =
     for<'ctx, 'view, 'rdram> fn(&'ctx mut RecompContext, &'view mut Rdram<'rdram>);
 
+/// Invalid input to [`HostFunctionCatalogV1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostFunctionCatalogErrorV1 {
+    MisalignedTarget { target: u32 },
+    DuplicateTarget { target: u32 },
+}
+
+/// Exact, enumerable host-function targets installed beside generated code.
+///
+/// This catalog deliberately carries no resolver-policy authority: it proves
+/// only its own sorted target/function association. In particular, creating a
+/// catalog neither installs nor supersedes the legacy [`HostLookup`] hook.
+/// An empty catalog is valid and represents a program with no host targets.
+#[derive(Clone, Debug)]
+pub struct HostFunctionCatalogV1 {
+    target_pcs: Vec<u32>,
+    functions: Vec<RecompFunc>,
+}
+
+impl HostFunctionCatalogV1 {
+    pub fn new(mut entries: Vec<(u32, RecompFunc)>) -> Result<Self, HostFunctionCatalogErrorV1> {
+        if let Some(&(target, _)) = entries.iter().find(|(target, _)| !target.is_multiple_of(4)) {
+            return Err(HostFunctionCatalogErrorV1::MisalignedTarget { target });
+        }
+        entries.sort_unstable_by_key(|(target, _)| *target);
+        if let Some(pair) = entries.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(HostFunctionCatalogErrorV1::DuplicateTarget { target: pair[0].0 });
+        }
+        let (target_pcs, functions) = entries.into_iter().unzip();
+        Ok(Self {
+            target_pcs,
+            functions,
+        })
+    }
+
+    /// Canonical ascending target inventory, independent of input order.
+    pub fn target_pcs(&self) -> &[u32] {
+        &self.target_pcs
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.target_pcs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.target_pcs.len()
+    }
+
+    pub fn resolve(&self, target: u32) -> Option<RecompFunc> {
+        self.target_pcs
+            .binary_search(&target)
+            .ok()
+            .map(|index| self.functions[index])
+    }
+}
+
 /// Host lookup hook used for functions that must be supplied by the runtime
 /// instead of executing a recompiled body (libultra shims, exception/TLB
 /// handling, and other host-owned boundaries).
@@ -2229,21 +2543,56 @@ pub type HostPause = fn();
 pub type MmioRead = fn(u64) -> Option<u32>;
 /// Optional raw word-MMIO write. `true` means the device consumed the write.
 pub type MmioWrite = fn(u64, u32) -> bool;
-/// One post-commit guest write. Only aligned CPU halfword stores carry a
-/// value because public RDRAM hidden-bit behavior assigns semantics to that
-/// exact operation; byte/word/DMA effects remain unclaimed ranges.
+/// The exact byte-producing mechanism responsible for one committed guest
+/// RDRAM mutation.
+///
+/// This is a fixed architectural denominator, not an open-ended diagnostic
+/// label. Every public external-write gateway below selects exactly one
+/// variant; callers cannot submit an unattributed write event.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum WriterChannel {
+    CpuInstructionStore,
+    PiDma,
+    SiDma,
+    SpDma,
+    RspExecutionOrHleWriteback,
+    RdpRenderer,
+    HostAbi,
+    BootstrapOrImport,
+}
+
+/// One attributed post-commit guest write. Only aligned CPU halfword stores
+/// carry a value because public RDRAM hidden-bit behavior assigns semantics
+/// to that exact operation; other effects remain exact attributed ranges.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GuestWriteEvent {
-    Range { physical_offset: u32, len: u32 },
-    NonRdpWrite16 { logical_offset: u32, value: u16 },
+    Range {
+        channel: WriterChannel,
+        physical_offset: u32,
+        len: u32,
+    },
+    NonRdpWrite16 {
+        channel: WriterChannel,
+        logical_offset: u32,
+        value: u16,
+    },
 }
 
 impl GuestWriteEvent {
+    pub const fn channel(self) -> WriterChannel {
+        match self {
+            Self::Range { channel, .. } | Self::NonRdpWrite16 { channel, .. } => channel,
+        }
+    }
+
     pub const fn range(self) -> (u32, u32) {
         match self {
             Self::Range {
                 physical_offset,
                 len,
+                ..
             } => (physical_offset, len),
             Self::NonRdpWrite16 { logical_offset, .. } => (logical_offset, 2),
         }
@@ -2335,6 +2684,10 @@ thread_local! {
     static FUNCTION_ENTRY_OBSERVER: std::cell::Cell<Option<FunctionEntryObserver>> = const {
         std::cell::Cell::new(None)
     };
+    static GUEST_WRITE_SESSION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static GUEST_WRITE_EPOCH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static GUEST_WRITE_PAGE_EPOCHS: std::cell::RefCell<Vec<u32>> =
+        std::cell::RefCell::new(vec![0; RDRAM_LEN / 4096]);
 }
 
 /// Install (or clear) the current thread's host-function resolver, returning
@@ -2376,7 +2729,60 @@ pub fn set_guest_write_boundary_observer(
     observer: Option<GuestWriteBoundaryObserver>,
 ) -> Option<GuestWriteBoundaryObserver> {
     EXECUTABLE_WRITE_BOUNDARY.with(|pending| pending.set(false));
+    GUEST_WRITE_SESSION.with(|session| {
+        let next = session
+            .get()
+            .checked_add(1)
+            .expect("guest-write session overflow");
+        session.set(next);
+    });
+    GUEST_WRITE_EPOCH.with(|epoch| epoch.set(0));
+    GUEST_WRITE_PAGE_EPOCHS.with(|epochs| epochs.borrow_mut().fill(0));
     GUEST_WRITE_BOUNDARY_OBSERVER.with(|slot| slot.replace(observer))
+}
+
+fn mark_guest_write_pages(offset: u32, len: u32) {
+    if len == 0 {
+        return;
+    }
+    let start = offset as usize / 4096;
+    let end = (offset as usize)
+        .saturating_add(len as usize)
+        .saturating_sub(1)
+        / 4096;
+    let epoch = GUEST_WRITE_EPOCH.with(|epoch| {
+        let next = epoch
+            .get()
+            .checked_add(1)
+            .expect("guest-write epoch overflow");
+        epoch.set(next);
+        next
+    });
+    GUEST_WRITE_PAGE_EPOCHS.with(|epochs| {
+        let mut epochs = epochs.borrow_mut();
+        for page in start..=end.min(epochs.len().saturating_sub(1)) {
+            epochs[page] = epoch;
+        }
+    });
+}
+
+/// Session-qualified last-write token for a physical RDRAM range. A caller
+/// may cache successful byte-image verification until this token changes.
+pub fn guest_write_token(offset: u32, len: u32) -> u64 {
+    assert!(len > 0, "guest-write token range must be nonempty");
+    let start = offset as usize / 4096;
+    let end = (offset as usize)
+        .checked_add(len as usize)
+        .and_then(|end| end.checked_sub(1))
+        .expect("guest-write token range overflow")
+        / 4096;
+    let page_epoch = GUEST_WRITE_PAGE_EPOCHS.with(|epochs| {
+        let epochs = epochs.borrow();
+        assert!(end < epochs.len(), "guest-write token range exceeds RDRAM");
+        epochs[start..=end].iter().copied().max().unwrap_or(0)
+    });
+    let session = GUEST_WRITE_SESSION.with(std::cell::Cell::get);
+    (u64::from(session) << 32) | u64::from(page_epoch)
 }
 
 /// Consume one post-store executable invalidation request.
@@ -2444,11 +2850,13 @@ pub fn trap_unsupported(context: impl Into<String>) -> ! {
     panic!("{context}")
 }
 
-/// Notify the installed observer after bytes at a physical RDRAM range have
-/// committed. DMA and generated-C adapters use this same seam as typed stores.
-pub fn notify_guest_write(offset: u32, len: u32) {
+/// Common post-commit implementation. It stays private so external producers
+/// must choose one of the exact channel-specific gateways below.
+fn notify_attributed_guest_write(channel: WriterChannel, offset: u32, len: u32) {
     if len != 0 {
+        mark_guest_write_pages(offset, len);
         let event = GuestWriteEvent::Range {
+            channel,
             physical_offset: offset,
             len,
         };
@@ -2461,9 +2869,44 @@ pub fn notify_guest_write(offset: u32, len: u32) {
     }
 }
 
+/// Report a generated-C or other externally adapted CPU instruction store.
+pub fn notify_cpu_instruction_store(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::CpuInstructionStore, offset, len);
+}
+
+pub fn notify_pi_dma_write(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::PiDma, offset, len);
+}
+
+pub fn notify_si_dma_write(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::SiDma, offset, len);
+}
+
+pub fn notify_sp_dma_write(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::SpDma, offset, len);
+}
+
+pub fn notify_rsp_execution_or_hle_writeback(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::RspExecutionOrHleWriteback, offset, len);
+}
+
+pub fn notify_rdp_renderer_write(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::RdpRenderer, offset, len);
+}
+
+pub fn notify_host_abi_write(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::HostAbi, offset, len);
+}
+
+pub fn notify_bootstrap_or_import_write(offset: u32, len: u32) {
+    notify_attributed_guest_write(WriterChannel::BootstrapOrImport, offset, len);
+}
+
 /// Notify one aligned CPU halfword store after the visible bytes commit.
-pub fn notify_non_rdp_write16(logical_offset: u32, value: u16) {
+fn notify_cpu_instruction_store16(logical_offset: u32, value: u16) {
+    mark_guest_write_pages(logical_offset, 2);
     let event = GuestWriteEvent::NonRdpWrite16 {
+        channel: WriterChannel::CpuInstructionStore,
         logical_offset,
         value,
     };
@@ -2537,6 +2980,24 @@ impl<'a> Rdram<'a> {
         self.mem
     }
 
+    /// Snapshot one physical RDRAM interval in guest byte order.
+    ///
+    /// Canonical executable-image reconciliation uses this read-only API so
+    /// the ABI owner never needs another mutable slice or raw pointer merely
+    /// to prove that no unjournaled writer changed a precompiled backing.
+    pub fn copy_physical_bytes(&self, physical_start: u32, byte_len: u32) -> Vec<u8> {
+        let physical_end = physical_start
+            .checked_add(byte_len)
+            .unwrap_or_else(|| panic!("physical RDRAM snapshot range overflow"));
+        assert!(
+            physical_end <= RDRAM_LEN as u32,
+            "physical RDRAM snapshot [{physical_start:#010x}, {physical_end:#010x}) exceeds {RDRAM_LEN:#x} bytes"
+        );
+        (physical_start..physical_end)
+            .map(|physical| self.load_physical_bu(physical))
+            .collect()
+    }
+
     /// Translate a canonical KSEG0/KSEG1 address to its generated-code backing
     /// offset. Physical RDRAM aliases share the low 29-bit device prefix;
     /// non-RDRAM direct windows retain N64Recomp's sparse `address - KSEG0`
@@ -2578,6 +3039,31 @@ impl<'a> Rdram<'a> {
         trap_unsupported(format!(
             "Rdram: unsupported mapped address {vaddr:#018x} resolves to physical {physical:#x}; {reason}"
         ))
+    }
+
+    #[inline]
+    fn read_mmio_word(vaddr: u64) -> Option<u32> {
+        MMIO_READ.with(|slot| slot.get().and_then(|read| read(vaddr)))
+    }
+
+    #[inline]
+    fn write_mmio_word(vaddr: u64, value: u32) -> bool {
+        MMIO_WRITE.with(|slot| slot.get().is_some_and(|write| write(vaddr, value)))
+    }
+
+    #[inline]
+    fn load_backed_word(&self, vaddr: u64) -> i32 {
+        let p = Self::backing_offset(vaddr);
+        i32::from_ne_bytes(self.mem[p..p + 4].try_into().unwrap())
+    }
+
+    #[inline]
+    fn store_backed_word(&mut self, vaddr: u64, value: u32) {
+        let p = Self::backing_offset(vaddr);
+        self.mem[p..p + 4].copy_from_slice(&value.to_ne_bytes());
+        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            notify_cpu_instruction_store(offset, 4);
+        }
     }
 
     /// Canonical physical RDRAM offset for cached or uncached CPU aliases.
@@ -2642,11 +3128,10 @@ impl<'a> Rdram<'a> {
     #[inline]
     pub fn load_w(&self, vaddr: u64) -> i32 {
         assert_eq!(vaddr & 3, 0, "unaligned LW at {vaddr:#018x}");
-        if let Some(value) = MMIO_READ.with(|slot| slot.get().and_then(|read| read(vaddr))) {
+        if let Some(value) = Self::read_mmio_word(vaddr) {
             return value as i32;
         }
-        let p = Self::backing_offset(vaddr);
-        i32::from_ne_bytes(self.mem[p..p + 4].try_into().unwrap())
+        self.load_backed_word(vaddr)
     }
 
     /// Load a sign-extended halfword (byte offset XOR 2).
@@ -2680,20 +3165,48 @@ impl<'a> Rdram<'a> {
         self.mem[p]
     }
 
+    /// Read one explicitly admitted physical RDRAM byte without reconstructing
+    /// a virtual alias. Generation-digest selection uses this after validating
+    /// its complete VA-to-physical backing map.
+    #[inline]
+    pub(crate) fn load_physical_bu(&self, physical: u32) -> u8 {
+        assert!(
+            physical < RDRAM_LEN as u32,
+            "physical RDRAM byte {physical:#010x} exceeds the 8 MiB device"
+        );
+        let p = usize::try_from(physical).expect("physical RDRAM offset exceeds usize") ^ 3;
+        *self.mem.get(p).unwrap_or_else(|| {
+            panic!(
+                "physical RDRAM byte {physical:#010x} exceeds the installed {}-byte backing",
+                self.mem.len()
+            )
+        })
+    }
+
+    /// Read one physical byte only when it is present in the installed RDRAM
+    /// allocation. Live mapped instruction admission uses this checked form so
+    /// a translated fetch beyond backing becomes a typed CPU fault rather than
+    /// an indexing panic.
+    #[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+    #[inline]
+    pub(crate) fn try_load_physical_bu(&self, physical: u32) -> Option<u8> {
+        if physical >= RDRAM_LEN as u32 {
+            return None;
+        }
+        let p = usize::try_from(physical).ok()? ^ 3;
+        self.mem.get(p).copied()
+    }
+
     // --- Aligned stores ---
 
     /// Store the low word of `val`.
     #[inline]
     pub fn store_w(&mut self, vaddr: u64, val: u32) {
         assert_eq!(vaddr & 3, 0, "unaligned SW at {vaddr:#018x}");
-        if MMIO_WRITE.with(|slot| slot.get().is_some_and(|write| write(vaddr, val))) {
+        if Self::write_mmio_word(vaddr, val) {
             return;
         }
-        let p = Self::backing_offset(vaddr);
-        self.mem[p..p + 4].copy_from_slice(&val.to_ne_bytes());
-        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
-            notify_guest_write(offset, 4);
-        }
+        self.store_backed_word(vaddr, val);
     }
 
     /// Store the low halfword of `val` (byte offset XOR 2).
@@ -2704,7 +3217,7 @@ impl<'a> Rdram<'a> {
         let p = Self::backing_offset(vaddr) ^ 2;
         self.mem[p..p + 2].copy_from_slice(&val.to_ne_bytes());
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
-            notify_non_rdp_write16(offset, val);
+            notify_cpu_instruction_store16(offset, val);
         }
     }
 
@@ -2715,7 +3228,7 @@ impl<'a> Rdram<'a> {
         let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p] = val;
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
-            notify_guest_write(offset, 1);
+            notify_cpu_instruction_store(offset, 1);
         }
     }
 
@@ -2818,7 +3331,7 @@ impl<'a> Rdram<'a> {
             // observer runs only after both halves are coherent.
             self.mem[low..low + 4].copy_from_slice(&(val as u32).to_ne_bytes());
             self.mem[high..high + 4].copy_from_slice(&((val >> 32) as u32).to_ne_bytes());
-            notify_guest_write(offset, 8);
+            notify_cpu_instruction_store(offset, 8);
         } else {
             self.store_w(vaddr.wrapping_add(4), val as u32);
             self.store_w(vaddr, (val >> 32) as u32);
@@ -2965,8 +3478,12 @@ impl<'a> Rdram<'a> {
     /// Checked LW/LWU (aligned word). See the module note on the block lane.
     #[inline]
     pub fn try_load_w(&self, vaddr: u64) -> Result<i32, u64> {
+        assert_eq!(vaddr & 3, 0, "unaligned LW at {vaddr:#018x}");
+        if let Some(value) = Self::read_mmio_word(vaddr) {
+            return Ok(value as i32);
+        }
         if self.word_backed(vaddr) {
-            Ok(self.load_w(vaddr))
+            Ok(self.load_backed_word(vaddr))
         } else {
             Err(vaddr)
         }
@@ -3163,8 +3680,12 @@ impl<'a> Rdram<'a> {
     /// Checked SW.
     #[inline]
     pub fn try_store_w(&mut self, vaddr: u64, val: u32) -> Result<(), u64> {
+        assert_eq!(vaddr & 3, 0, "unaligned SW at {vaddr:#018x}");
+        if Self::write_mmio_word(vaddr, val) {
+            return Ok(());
+        }
         if self.word_backed(vaddr) {
-            self.store_w(vaddr, val);
+            self.store_backed_word(vaddr, val);
             Ok(())
         } else {
             Err(vaddr)
@@ -3339,10 +3860,17 @@ impl<'a> Rdram<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::boot::{
+        BootCicIdentity, BootContext, BootCop0Context, BootRegion, BootTvStandard, Sha256Digest,
+        BOOT_CONTEXT_SCHEMA_V1,
+    };
+
     use super::{
-        set_unsupported_observer, trap_unsupported, DataAccessError, DataAccessKind,
-        GuestWriteEvent, Rdram, RecompContext, TlbEntryRaw, TlbFault, TlbFaultKind,
-        TranslatedDataAddress, TranslatedInstructionAddress, RDRAM_LEN,
+        resolve_host_function, set_host_lookup, set_unsupported_observer, trap_unsupported,
+        DataAccessError, DataAccessKind, GuestWriteEvent, HostFunctionCatalogErrorV1,
+        HostFunctionCatalogV1, Rdram, RecompContext, RecompFunc, TlbEntryRaw, TlbFault,
+        TlbFaultKind, TranslatedDataAddress, TranslatedInstructionAddress, WriterChannel,
+        RDRAM_LEN,
     };
 
     type RdramOperation = for<'a> fn(&mut Rdram<'a>);
@@ -3373,6 +3901,272 @@ mod tests {
 
     fn observe_unsupported(context: &str) {
         UNSUPPORTED_CONTEXTS.with(|contexts| contexts.borrow_mut().push(context.to_owned()));
+    }
+
+    fn first_host(_ctx: &mut RecompContext, _mem: &mut Rdram<'_>) {}
+
+    fn second_host(_ctx: &mut RecompContext, _mem: &mut Rdram<'_>) {}
+
+    fn legacy_host_lookup(target: u32) -> Option<RecompFunc> {
+        (target == 0x8000_3000).then_some(second_host)
+    }
+
+    fn context_from_evidence_for_test(
+        snapshot: &super::RecompContextEvidenceSnapshotV1,
+    ) -> RecompContext {
+        RecompContext {
+            r: snapshot.gprs,
+            hi: snapshot.hi,
+            lo: snapshot.lo,
+            fpr: super::FprFile {
+                fgr: snapshot.physical_fgrs,
+            },
+            fpu_cond: snapshot.fpu_cond,
+            fcsr: snapshot.fcsr,
+            ll_reservation: snapshot.ll_reservation,
+            cop0_count: snapshot.cop0_count,
+            cop0_compare: snapshot.cop0_compare,
+            cop0_count_write: snapshot.cop0_count_write,
+            cop0_compare_write: snapshot.cop0_compare_write,
+            cop0_cond: snapshot.cop0_cond,
+            cop0_status: snapshot.cop0_status,
+            cop0_cause: snapshot.cop0_cause,
+            cop0_epc: snapshot.cop0_epc,
+            cop0_error_epc: snapshot.cop0_error_epc,
+            cop0_badvaddr: snapshot.cop0_badvaddr,
+            cop0_context: snapshot.cop0_context,
+            cop0_xcontext: snapshot.cop0_xcontext,
+            cop0_index: snapshot.cop0_index,
+            tlb_entries: snapshot.tlb_entries,
+            cop0_entry_lo0: snapshot.cop0_entry_lo0,
+            cop0_entry_lo1: snapshot.cop0_entry_lo1,
+            cop0_page_mask: snapshot.cop0_page_mask,
+            cop0_wired: snapshot.cop0_wired,
+            cop0_entry_hi: snapshot.cop0_entry_hi,
+            cop0_random_phase: snapshot.cop0_random_phase,
+            cop0_watch_lo: snapshot.cop0_watch_lo,
+            cop0_watch_hi: snapshot.cop0_watch_hi,
+            os_interrupt_mask: snapshot.os_interrupt_mask,
+            thread_return_pc: snapshot.thread_return_pc,
+            indirect_transfers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recomp_context_evidence_v1_round_trips_and_detects_each_owned_field() {
+        let mut context = RecompContext::new();
+        context.r = std::array::from_fn(|index| index as u64 * 0x101 + 7);
+        context.r[0] = 0;
+        context.hi = 0x0102_0304_0506_0708;
+        context.lo = 0x1112_1314_1516_1718;
+        context.fpr.fgr =
+            std::array::from_fn(|index| 0x8000_0000_0000_0000u64 | (index as u64 * 0x0101_0101));
+        context.fpu_cond = true;
+        context.fcsr = 0x0102_0304;
+        context.ll_reservation = Some((0xffff_ffff_8123_4560, 8));
+        context.cop0_count = 0x1111_1111;
+        context.cop0_compare = 0x2222_2222;
+        context.cop0_count_write = Some(0x3333_3333);
+        context.cop0_compare_write = Some(0x4444_4444);
+        context.cop0_cond = true;
+        context.cop0_status = 0x5555_5555;
+        context.cop0_cause = 0x6666_6666;
+        context.cop0_epc = 0x7777_7777;
+        context.cop0_error_epc = 0x8888_8888;
+        context.cop0_badvaddr = 0x9999_9999_aaaa_aaaa;
+        context.cop0_context = 0xbbbb_bbbb;
+        context.cop0_xcontext = 0xcccc_cccc_dddd_dddd;
+        context.cop0_index = 17;
+        context.tlb_entries = std::array::from_fn(|index| TlbEntryRaw {
+            page_mask: index as u32 * 0x2000,
+            entry_hi: 0x1000_0000_0000_0000 | index as u64,
+            entry_lo0: 0x2000_0000 | index as u32,
+            entry_lo1: 0x3000_0000 | index as u32,
+        });
+        context.cop0_entry_lo0 = 0xdddd_dddd;
+        context.cop0_entry_lo1 = 0xeeee_eeee;
+        context.cop0_page_mask = 0x01ff_e000;
+        context.cop0_wired = 11;
+        context.cop0_entry_hi = 0xffff_ffff_0123_4567;
+        context.cop0_random_phase = 9;
+        context.cop0_watch_lo = 0x1234_5678;
+        context.cop0_watch_hi = 0x9abc_def0;
+        context.os_interrupt_mask = 0x1357_9bdf;
+        context.thread_return_pc = Some(0xffff_fffc);
+
+        let baseline = context.evidence_snapshot_v1();
+        let restored = context_from_evidence_for_test(&baseline);
+        assert_eq!(restored.evidence_snapshot_v1(), baseline);
+
+        macro_rules! changed {
+            ($change:expr) => {{
+                let mut candidate = baseline.clone();
+                $change(&mut candidate);
+                assert_ne!(candidate, baseline);
+            }};
+        }
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.gprs[1] ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.hi ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.lo ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.physical_fgrs[31] ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.fpu_cond = !s.fpu_cond);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.fcsr ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.ll_reservation = None);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_count ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_compare ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_count_write = None);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_compare_write = None);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_cond = !s.cop0_cond);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_status ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_cause ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_epc ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_error_epc ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_badvaddr ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_context ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_xcontext ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_index ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.tlb_entries[31].page_mask ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.tlb_entries[31].entry_hi ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.tlb_entries[31].entry_lo0 ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.tlb_entries[31].entry_lo1 ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_entry_lo0 ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_entry_lo1 ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_page_mask ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_wired ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_entry_hi ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_random_phase ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_watch_lo ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.cop0_watch_hi ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.os_interrupt_mask ^= 1);
+        changed!(|s: &mut super::RecompContextEvidenceSnapshotV1| s.thread_return_pc = None);
+
+        context.record_indirect_transfer(1, 2, 3, 4, Some(5));
+        assert_eq!(context.evidence_snapshot_v1(), baseline);
+    }
+
+    #[test]
+    fn host_function_catalog_canonicalizes_and_resolves_exact_targets() {
+        let catalog =
+            HostFunctionCatalogV1::new(vec![(0x8000_2000, second_host), (0x8000_1000, first_host)])
+                .unwrap();
+
+        assert_eq!(catalog.target_pcs(), &[0x8000_1000, 0x8000_2000]);
+        assert_eq!(catalog.len(), 2);
+        assert!(!catalog.is_empty());
+        assert!(std::ptr::fn_addr_eq(
+            catalog.resolve(0x8000_1000).unwrap(),
+            first_host as RecompFunc
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            catalog.resolve(0x8000_2000).unwrap(),
+            second_host as RecompFunc
+        ));
+        assert!(catalog.resolve(0x8000_1004).is_none());
+    }
+
+    #[test]
+    fn host_function_catalog_rejects_misaligned_and_duplicate_targets() {
+        assert!(matches!(
+            HostFunctionCatalogV1::new(vec![(0x8000_1002, first_host)]),
+            Err(HostFunctionCatalogErrorV1::MisalignedTarget {
+                target: 0x8000_1002
+            })
+        ));
+        assert!(matches!(
+            HostFunctionCatalogV1::new(
+                vec![(0x8000_1000, first_host), (0x8000_1000, second_host),]
+            ),
+            Err(HostFunctionCatalogErrorV1::DuplicateTarget {
+                target: 0x8000_1000
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_host_function_catalog_is_an_exact_empty_inventory() {
+        let catalog = HostFunctionCatalogV1::new(Vec::new()).unwrap();
+        assert!(catalog.is_empty());
+        assert_eq!(catalog.len(), 0);
+        assert!(catalog.target_pcs().is_empty());
+        assert!(catalog.resolve(0x8000_1000).is_none());
+    }
+
+    #[test]
+    fn host_function_catalog_does_not_install_or_replace_legacy_lookup() {
+        let previous = set_host_lookup(Some(legacy_host_lookup));
+        let catalog = HostFunctionCatalogV1::new(vec![(0x8000_1000, first_host)]).unwrap();
+
+        assert!(catalog.resolve(0x8000_3000).is_none());
+        assert!(std::ptr::fn_addr_eq(
+            resolve_host_function(0x8000_3000).unwrap(),
+            second_host as RecompFunc
+        ));
+        set_host_lookup(previous);
+    }
+
+    #[test]
+    fn boot_context_restores_gpr_hilo_and_modeled_cp0_state() {
+        let mut gprs = [0u64; 32];
+        gprs[20] = 0xffff_ffff_cafe_babe;
+        gprs[29] = 0xffff_ffff_a400_1ff0;
+        let mut cp0 = [0u64; 32];
+        cp0[0] = 7;
+        cp0[1] = 19;
+        cp0[4] = 0x1234_5678;
+        cp0[6] = 4;
+        cp0[8] = 0xaaaa_bbbb_cccc_dddd;
+        cp0[9] = 0x0102_0304;
+        cp0[10] = 0xeeee_ffff_0102_0304;
+        cp0[11] = 0x0506_0708;
+        cp0[12] = 0x3404_0000;
+        cp0[13] = 0x0000_0300;
+        cp0[20] = 0x1111_2222_3333_4444;
+        let boot = BootContext {
+            schema: BOOT_CONTEXT_SCHEMA_V1.to_string(),
+            producer: "synthetic debugger".to_string(),
+            normalized_rom_sha256: Sha256Digest::from_bytes([0x11; 32]),
+            cic: BootCicIdentity {
+                ipl3_sha256: Sha256Digest::from_bytes([0x22; 32]),
+            },
+            region: BootRegion {
+                destination_code: b'E',
+                tv_standard: BootTvStandard::Ntsc,
+            },
+            entry_pc: 0x8000_0400,
+            gprs,
+            hi: 0x1234,
+            lo: 0x5678,
+            cp0: BootCop0Context { registers: cp0 },
+        };
+
+        let mut ctx = RecompContext::new();
+        ctx.restore_boot_context(&boot).unwrap();
+
+        assert_eq!(ctx.gprs(), gprs);
+        assert_eq!(ctx.hi, 0x1234);
+        assert_eq!(ctx.lo, 0x5678);
+        assert_eq!(ctx.cop0_random(), 19);
+        assert_eq!(ctx.cop0_index, 7);
+        assert_eq!(ctx.cop0_context, 0x1234_5678);
+        assert_eq!(ctx.cop0_badvaddr, 0xaaaa_bbbb_cccc_dddd);
+        assert_eq!(ctx.cop0_count, 0x0102_0304);
+        assert_eq!(ctx.cop0_entry_hi, 0xeeee_ffff_0102_0304);
+        assert_eq!(ctx.cop0_compare, 0x0506_0708);
+        assert_eq!(ctx.cop0_status, 0x3404_0000);
+        assert_eq!(ctx.cop0_cause, 0x0000_0300);
+        assert_eq!(ctx.cop0_xcontext, 0x1111_2222_3333_4444);
+        assert!(ctx.cop0_cond);
+        assert!(ctx.boot_context_state_mismatches(&boot).unwrap().is_empty());
+
+        ctx.set_r(20, 0);
+        assert_eq!(
+            ctx.boot_context_state_mismatches(&boot).unwrap(),
+            vec![crate::boot::BootContextStateMismatch {
+                field: crate::boot::BootContextStateField::Gpr(20),
+                expected: 0xffff_ffff_cafe_babe,
+                actual: 0,
+            }]
+        );
     }
 
     #[test]
@@ -3453,27 +4247,72 @@ mod tests {
             OBSERVED_WRITES.with(|writes| writes.borrow().clone()),
             vec![
                 GuestWriteEvent::Range {
+                    channel: WriterChannel::CpuInstructionStore,
                     physical_offset: 0,
                     len: 4,
                 },
                 GuestWriteEvent::NonRdpWrite16 {
+                    channel: WriterChannel::CpuInstructionStore,
                     logical_offset: 4,
                     value: 0x5566,
                 },
                 GuestWriteEvent::NonRdpWrite16 {
+                    channel: WriterChannel::CpuInstructionStore,
                     logical_offset: 4,
                     value: 0x5566,
                 },
                 GuestWriteEvent::Range {
+                    channel: WriterChannel::CpuInstructionStore,
                     physical_offset: 6,
                     len: 1,
                 },
                 GuestWriteEvent::Range {
+                    channel: WriterChannel::CpuInstructionStore,
                     physical_offset: 8,
                     len: 8,
                 },
             ]
         );
+        super::set_write_observer(previous);
+    }
+
+    #[test]
+    fn external_write_gateways_attribute_the_exact_fixed_denominator() {
+        let gateways: [(WriterChannel, fn(u32, u32)); 8] = [
+            (
+                WriterChannel::CpuInstructionStore,
+                super::notify_cpu_instruction_store,
+            ),
+            (WriterChannel::PiDma, super::notify_pi_dma_write),
+            (WriterChannel::SiDma, super::notify_si_dma_write),
+            (WriterChannel::SpDma, super::notify_sp_dma_write),
+            (
+                WriterChannel::RspExecutionOrHleWriteback,
+                super::notify_rsp_execution_or_hle_writeback,
+            ),
+            (WriterChannel::RdpRenderer, super::notify_rdp_renderer_write),
+            (WriterChannel::HostAbi, super::notify_host_abi_write),
+            (
+                WriterChannel::BootstrapOrImport,
+                super::notify_bootstrap_or_import_write,
+            ),
+        ];
+        OBSERVED_WRITES.with(|writes| writes.borrow_mut().clear());
+        let previous = super::set_write_observer(Some(observe_write));
+
+        for (index, (_, gateway)) in gateways.iter().enumerate() {
+            gateway(0x1000 + index as u32 * 4, 4);
+        }
+        // Preserve the existing zero-length notification behavior: it is not
+        // a byte-producing event and therefore enters neither observer.
+        super::notify_host_abi_write(0x2000, 0);
+
+        let observed = OBSERVED_WRITES.with(|writes| writes.borrow().clone());
+        assert_eq!(observed.len(), gateways.len());
+        for (index, (event, (expected_channel, _))) in observed.iter().zip(gateways).enumerate() {
+            assert_eq!(event.channel(), expected_channel);
+            assert_eq!(event.range(), (0x1000 + index as u32 * 4, 4));
+        }
         super::set_write_observer(previous);
     }
 
@@ -3581,6 +4420,21 @@ mod tests {
                 vaddr: 0x0040_1234,
                 access: DataAccessKind::Load,
                 kind: TlbFaultKind::Refill,
+                extended: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn libultra_invalid_tlb_layout_does_not_create_a_zero_address_multi_match() {
+        let mut ctx = RecompContext::new();
+        ctx.initialize_invalid_tlb_entries();
+        assert_eq!(
+            ctx.translate_data_address(4, DataAccessKind::Load),
+            Err(DataAccessError::Tlb(TlbFault {
+                vaddr: 4,
+                access: DataAccessKind::Load,
+                kind: TlbFaultKind::Invalid,
                 extended: false,
             }))
         );
@@ -3901,6 +4755,24 @@ mod tests {
     }
 
     #[test]
+    fn checked_word_accessors_route_translated_mmio_before_backing_rejection() {
+        const SI_STATUS: u64 = 0xffff_ffff_a480_0018;
+
+        MMIO_CALLS.with(|calls| calls.set(0));
+        let previous_mmio = super::set_mmio_hooks(Some(read_mmio), Some(consume_mmio));
+        let mut bytes = [0u8; 16];
+        let mut mem = Rdram::new(&mut bytes);
+        let ctx = RecompContext::new();
+
+        assert_eq!(mem.try_load_w_translated(&ctx, SI_STATUS), Ok(0));
+        assert_eq!(mem.try_store_w_translated(&ctx, SI_STATUS, 3), Ok(()));
+        assert_eq!(MMIO_CALLS.with(std::cell::Cell::get), 2);
+        assert_eq!(mem.as_mut_slice(), [0; 16]);
+
+        super::set_mmio_hooks(previous_mmio.0, previous_mmio.1);
+    }
+
+    #[test]
     fn nonword_rcp_and_pif_accesses_trap_before_any_side_effect() {
         OBSERVED_WRITES.with(|writes| writes.borrow_mut().clear());
         MMIO_CALLS.with(|calls| calls.set(0));
@@ -3994,5 +4866,20 @@ mod tests {
         assert_eq!(bytes, [0; 4]);
         super::set_mmio_hooks(previous_mmio.0, previous_mmio.1);
         super::set_write_observer(previous_observer);
+    }
+
+    #[test]
+    fn guest_write_tokens_change_only_for_intersecting_pages_and_new_sessions() {
+        let previous = super::set_guest_write_boundary_observer(None);
+        let first = super::guest_write_token(0x2000, 0x1000);
+        super::notify_host_abi_write(0x5000, 4);
+        assert_eq!(super::guest_write_token(0x2000, 0x1000), first);
+        super::notify_host_abi_write(0x2fff, 2);
+        let written = super::guest_write_token(0x2000, 0x1000);
+        assert_ne!(written, first);
+
+        super::set_guest_write_boundary_observer(None);
+        assert_ne!(super::guest_write_token(0x2000, 0x1000), written);
+        super::set_guest_write_boundary_observer(previous);
     }
 }

@@ -48,11 +48,13 @@
 //! the bounded case needs; anything else clears the touched register rather
 //! than pretend to know it.
 
-use crate::cfg::{build_cfg_fenced, BasicBlock, BlockTerminator, Cfg};
+use crate::cfg::{build_cfg_fenced, BasicBlock, BlockTerminator, Cfg, WordClass};
+use fn64_recomp_rs::decoder::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_VALUE_SET: usize = 256;
+const COP0_STATUS_BEV: u32 = 1 << 22;
 // A loop may otherwise grow a finite set one element per trip. Widening every
 // non-zero register and tracked store to Unknown after this bound can only
 // turn a site into `open`; it cannot fabricate an exhaustive target.
@@ -200,6 +202,176 @@ pub struct ClosureResult {
     pub indirect: Vec<IndirectResolution>,
 }
 
+/// One load-image word whose initial value has been admitted by the caller.
+///
+/// Admission binds the expected bytes; it does **not** prove that the runtime
+/// word remains unchanged until a recovered load executes.  Consequently
+/// [`ConditionalFixedWordStore`] states that source-stability condition
+/// explicitly instead of promoting an initial load-image value into an
+/// unconditional runtime claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AdmittedWordSource {
+    pub address: u32,
+    pub value: u32,
+}
+
+/// A word store whose address and unchanged loaded value agree on every
+/// bounded abstract visit to the store site.
+///
+/// The conclusion is conditional: if `source` still contains `value` when the
+/// cited load executes and control reaches `site_pc`, that MIPS instruction
+/// stores the exact word at `destination`. A separate writer-closure receipt
+/// must discharge source stability, and separate control-flow evidence must
+/// establish that the store runs, before a consumer calls this an
+/// unconditional image proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ConditionalFixedWordStore {
+    pub site_pc: u32,
+    pub destination: u32,
+    pub value: u32,
+    pub source: AdmittedWordSource,
+}
+
+/// Why a reachable word store that may touch a watched destination could not
+/// be reduced to one conditional exact-copy result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FixedWordStoreBlocker {
+    AddressOpen,
+    AddressSetAmbiguous {
+        addresses: Vec<u32>,
+    },
+    ValueOpen,
+    ValueSetAmbiguous {
+        values: Vec<u32>,
+    },
+    ValueNotUnchangedStaticLoad,
+    SourceNotAdmitted {
+        address: u32,
+    },
+    SourceValueMismatch {
+        address: u32,
+        admitted: u32,
+        recovered: u32,
+    },
+    PathDisagreement,
+    RevisitWidened,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenFixedWordStore {
+    pub site_pc: u32,
+    pub blockers: Vec<FixedWordStoreBlocker>,
+}
+
+/// Deterministic bounded result for stores that may touch the watched word
+/// addresses.  `conditional` and `open` are each ordered by ascending site PC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixedWordStoreReport {
+    pub conditional: Vec<ConditionalFixedWordStore>,
+    pub open: Vec<OpenFixedWordStore>,
+}
+
+/// Encoding class of one aligned word that writes COP0 Status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Cop0StatusWriteKind {
+    Mtc0,
+    Dmtc0,
+}
+
+/// One aligned word whose typed decode writes COP0 register 12 (Status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Cop0StatusWriteSite {
+    pub site_pc: u32,
+    pub instruction_word: u32,
+    pub source_register: u8,
+    pub kind: Cop0StatusWriteKind,
+    pub word_class: Option<WordClass>,
+}
+
+/// Exhaustive aligned-word inventory of direct guest writes to COP0 Status in
+/// one supplied image, plus the bounded CFG frontier that qualifies which of
+/// those words are proven executable.
+///
+/// This is deliberately not a BEV invariant proof. `unclassified_writes` and
+/// `open_indirect_sites` prevent a consumer from mistaking a closed reachable
+/// subset for whole-image execution closure. `proven_data_words` remain in the
+/// receipt so the raw decode denominator is independently auditable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cop0StatusWriteInventory {
+    pub proven_code_writes: Vec<Cop0StatusWriteSite>,
+    pub proven_data_words: Vec<Cop0StatusWriteSite>,
+    pub unclassified_writes: Vec<Cop0StatusWriteSite>,
+    pub open_indirect_sites: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Cop0StatusValueBlocker {
+    NoReachableObservation,
+    ValueOpen,
+    RevisitWidened,
+    ValueSetOverflow { observed: u32 },
+    MutableStaticMemorySource { addresses: Vec<u32> },
+    Dmtc0Unsupported,
+}
+
+/// Bounded source-register proof at one proven-code Status write. `values`
+/// retains a small exact set when available; `known_zero`/`known_one` retain
+/// path-invariant bits when the full value remains open. Consumers apply their
+/// own bit invariant and must retain the typed blockers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Cop0StatusValueProof {
+    pub site_pc: u32,
+    pub values: Vec<u32>,
+    pub known_zero: u32,
+    pub known_one: u32,
+    pub blockers: Vec<Cop0StatusValueBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cop0StatusWriteAnalysis {
+    pub inventory: Cop0StatusWriteInventory,
+    pub proven_code_value_proofs: Vec<Cop0StatusValueProof>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cop0StatusWriteInventoryError {
+    UnalignedImage,
+    AddressOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixedWordStoreInputError {
+    UnalignedWatchedDestination {
+        address: u32,
+    },
+    UnalignedSource {
+        address: u32,
+    },
+    ConflictingSourceValues {
+        address: u32,
+        first: u32,
+        second: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawWordStoreObservation {
+    addresses: Option<Vec<u32>>,
+    values: Option<Vec<u32>>,
+    unchanged_static_word_source: Option<u32>,
+    widened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawCop0StatusObservation {
+    values: Option<Vec<u32>>,
+    known_zero: u32,
+    known_one: u32,
+    memory_sources: Vec<u32>,
+    from_static_memory: bool,
+    widened: bool,
+}
+
 /// Track register constants forward across a single straight-line block and,
 /// if that block ends in a `jr`/`jalr` whose register holds a known constant,
 /// return the resolved target. `None` when the terminating register's value
@@ -331,7 +503,14 @@ enum AbstractValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrackedValue {
     value: AbstractValue,
+    known_zero: u32,
+    known_one: u32,
     memory_sources: BTreeSet<u32>,
+    /// A singleton load-image word copied without arithmetic transformation.
+    /// This is deliberately distinct from `memory_sources`: the latter is
+    /// data-flow provenance and survives arithmetic for indirect-resolution
+    /// diagnostics, while this identity proof must be cleared by arithmetic.
+    unchanged_static_word_source: Option<u32>,
     bounded_index: bool,
     through_memory: bool,
     from_static_memory: bool,
@@ -348,7 +527,10 @@ impl TrackedValue {
     fn unknown() -> Self {
         Self {
             value: AbstractValue::Unknown,
+            known_zero: 0,
+            known_one: 0,
             memory_sources: BTreeSet::new(),
+            unchanged_static_word_source: None,
             bounded_index: false,
             through_memory: false,
             from_static_memory: false,
@@ -362,7 +544,10 @@ impl TrackedValue {
     fn sltiu_flag(index_reg: u8, upper: u32) -> Self {
         Self {
             value: AbstractValue::Unknown,
+            known_zero: 0xffff_fffc,
+            known_one: 0,
             memory_sources: BTreeSet::new(),
+            unchanged_static_word_source: None,
             bounded_index: false,
             through_memory: false,
             from_static_memory: false,
@@ -379,9 +564,23 @@ impl TrackedValue {
         if values.is_empty() || values.len() > MAX_VALUE_SET {
             return Self::unknown();
         }
+        let known_one = values
+            .iter()
+            .copied()
+            .reduce(|left, right| left & right)
+            .unwrap();
+        let known_zero = values
+            .iter()
+            .copied()
+            .map(|value| !value)
+            .reduce(|left, right| left & right)
+            .unwrap();
         Self {
             value: AbstractValue::Concrete(values),
+            known_zero,
+            known_one,
             memory_sources: BTreeSet::new(),
+            unchanged_static_word_source: None,
             bounded_index: false,
             through_memory: false,
             from_static_memory: false,
@@ -395,7 +594,10 @@ impl TrackedValue {
                 root,
                 offsets: BTreeSet::from([offset]),
             },
+            known_zero: 0,
+            known_one: 0,
             memory_sources: BTreeSet::new(),
+            unchanged_static_word_source: None,
             bounded_index: false,
             through_memory: false,
             from_static_memory: false,
@@ -435,16 +637,22 @@ impl TrackedValue {
             }
             _ => AbstractValue::Unknown,
         };
-        if matches!(value, AbstractValue::Unknown) {
-            return Self::unknown();
-        }
-        Self {
+        let mut joined = Self {
             value,
+            known_zero: self.known_zero & other.known_zero,
+            known_one: self.known_one & other.known_one,
             memory_sources: self
                 .memory_sources
                 .union(&other.memory_sources)
                 .copied()
                 .collect(),
+            unchanged_static_word_source: if self.unchanged_static_word_source
+                == other.unchanged_static_word_source
+            {
+                self.unchanged_static_word_source
+            } else {
+                None
+            },
             bounded_index: self.bounded_index && other.bounded_index,
             through_memory: self.through_memory || other.through_memory,
             from_static_memory: self.from_static_memory || other.from_static_memory,
@@ -455,7 +663,16 @@ impl TrackedValue {
             } else {
                 None
             },
+        };
+        if matches!(joined.value, AbstractValue::Unknown) {
+            joined.memory_sources.clear();
+            joined.unchanged_static_word_source = None;
+            joined.bounded_index = false;
+            joined.through_memory = false;
+            joined.from_static_memory = false;
+            joined.sltiu_bound = None;
         }
+        joined
     }
 
     fn concrete_values(&self) -> Option<&BTreeSet<u32>> {
@@ -471,13 +688,71 @@ impl TrackedValue {
         };
         let mut result = Self::concrete(values.iter().copied().map(op));
         result.memory_sources = self.memory_sources.clone();
+        result.unchanged_static_word_source = None;
         result.bounded_index = self.bounded_index;
         result.through_memory = self.through_memory;
         result.from_static_memory = self.from_static_memory;
         result
     }
 
+    fn known_zero(mask: u32) -> Self {
+        let mut value = Self::unknown();
+        value.known_zero = mask;
+        value
+    }
+
+    fn bitwise(
+        &self,
+        other: &Self,
+        op: impl Fn(u32, u32) -> u32,
+        known_zero: u32,
+        known_one: u32,
+    ) -> Self {
+        let mut result = self.binary(other, op);
+        result.known_zero = known_zero;
+        result.known_one = known_one;
+        result.memory_sources = self
+            .memory_sources
+            .union(&other.memory_sources)
+            .copied()
+            .collect();
+        result.unchanged_static_word_source = None;
+        result.through_memory = self.through_memory || other.through_memory;
+        result.from_static_memory = self.from_static_memory || other.from_static_memory;
+        result
+    }
+
+    fn bitand(&self, other: &Self) -> Self {
+        self.bitwise(
+            other,
+            |left, right| left & right,
+            self.known_zero | other.known_zero,
+            self.known_one & other.known_one,
+        )
+    }
+
+    fn bitor(&self, other: &Self) -> Self {
+        self.bitwise(
+            other,
+            |left, right| left | right,
+            self.known_zero & other.known_zero,
+            self.known_one | other.known_one,
+        )
+    }
+
+    fn bitxor(&self, other: &Self) -> Self {
+        self.bitwise(
+            other,
+            |left, right| left ^ right,
+            (self.known_zero & other.known_zero) | (self.known_one & other.known_one),
+            (self.known_zero & other.known_one) | (self.known_one & other.known_zero),
+        )
+    }
+
     fn add_immediate(&self, immediate: i32) -> Self {
+        if immediate == 0 {
+            return self.clone();
+        }
         match &self.value {
             AbstractValue::Concrete(values) => {
                 let mut result = Self::concrete(
@@ -486,6 +761,7 @@ impl TrackedValue {
                         .map(|value| value.wrapping_add(immediate as u32)),
                 );
                 result.memory_sources = self.memory_sources.clone();
+                result.unchanged_static_word_source = None;
                 result.bounded_index = self.bounded_index;
                 result.through_memory = self.through_memory;
                 result.from_static_memory = self.from_static_memory;
@@ -504,7 +780,10 @@ impl TrackedValue {
                             root: *root,
                             offsets,
                         },
+                        known_zero: 0,
+                        known_one: 0,
                         memory_sources: self.memory_sources.clone(),
+                        unchanged_static_word_source: None,
                         bounded_index: self.bounded_index,
                         through_memory: self.through_memory,
                         from_static_memory: self.from_static_memory,
@@ -532,9 +811,30 @@ impl TrackedValue {
             .union(&other.memory_sources)
             .copied()
             .collect();
+        result.unchanged_static_word_source = None;
         result.bounded_index = self.bounded_index || other.bounded_index;
         result.through_memory = self.through_memory || other.through_memory;
         result.from_static_memory = self.from_static_memory || other.from_static_memory;
+        result
+    }
+
+    fn shift_left(&self, shift: u32) -> Self {
+        let mut result = self.map_concrete(|value| value << shift);
+        result.known_zero = (self.known_zero << shift) | ((1u32 << shift) - 1);
+        result.known_one = self.known_one << shift;
+        result.memory_sources = self.memory_sources.clone();
+        result.through_memory = self.through_memory;
+        result.from_static_memory = self.from_static_memory;
+        result
+    }
+
+    fn shift_right(&self, shift: u32) -> Self {
+        let mut result = self.map_concrete(|value| value >> shift);
+        result.known_zero = (self.known_zero >> shift) | (!0u32 << (32 - shift));
+        result.known_one = self.known_one >> shift;
+        result.memory_sources = self.memory_sources.clone();
+        result.through_memory = self.through_memory;
+        result.from_static_memory = self.from_static_memory;
         result
     }
 }
@@ -700,7 +1000,17 @@ fn load_word(
                     Some(value)
                 } else {
                     read_static = true;
-                    read_static_word(bank_bytes, va_start, *address).map(TrackedValue::constant)
+                    read_static_word(bank_bytes, va_start, *address).map(|word| {
+                        let mut value = TrackedValue::constant(word);
+                        // Load-image bytes are candidate initial values, not
+                        // immutable runtime bits. Keep the concrete value for
+                        // diagnostics but require subsequent operations to
+                        // establish any known-zero/known-one invariant.
+                        value.known_zero = 0;
+                        value.known_one = 0;
+                        value.unchanged_static_word_source = Some(*address);
+                        value
+                    })
                 }
             }
             MemoryLocation::Stack { .. } => state.memory.get(&location).cloned(),
@@ -755,27 +1065,61 @@ fn execute_instruction(
 
     match opcode {
         0x00 => match word & 0x3f {
+            0x00 if shift == 0 => {
+                state.set_register(rd, state.registers[rt as usize].clone());
+            }
             0x00 => {
-                let value = state.registers[rt as usize].map_concrete(|value| value << shift);
+                let value = state.registers[rt as usize].shift_left(shift);
                 state.set_register(rd, value);
             }
+            0x02 if shift == 0 => {
+                state.set_register(rd, state.registers[rt as usize].clone());
+            }
             0x02 => {
-                let value = state.registers[rt as usize].map_concrete(|value| value >> shift);
+                let value = state.registers[rt as usize].shift_right(shift);
                 state.set_register(rd, value);
+            }
+            0x20 | 0x21 | 0x2c | 0x2d if rt == 0 => {
+                state.set_register(rd, state.registers[rs as usize].clone());
+            }
+            0x20 | 0x21 | 0x2c | 0x2d if rs == 0 => {
+                state.set_register(rd, state.registers[rt as usize].clone());
             }
             0x20 | 0x21 | 0x2c | 0x2d => {
                 let value = state.registers[rs as usize]
                     .binary(&state.registers[rt as usize], u32::wrapping_add);
                 state.set_register(rd, value);
             }
+            0x22 | 0x23 | 0x2e | 0x2f if rt == 0 => {
+                state.set_register(rd, state.registers[rs as usize].clone());
+            }
             0x22 | 0x23 | 0x2e | 0x2f => {
                 let value = state.registers[rs as usize]
                     .binary(&state.registers[rt as usize], u32::wrapping_sub);
                 state.set_register(rd, value);
             }
+            0x24 if rt == 0 => {
+                state.set_register(rd, TrackedValue::constant(0));
+            }
+            0x24 if rs == 0 => {
+                state.set_register(rd, TrackedValue::constant(0));
+            }
+            0x24 => {
+                let value = state.registers[rs as usize].bitand(&state.registers[rt as usize]);
+                state.set_register(rd, value);
+            }
+            0x25 if rt == 0 => {
+                state.set_register(rd, state.registers[rs as usize].clone());
+            }
+            0x25 if rs == 0 => {
+                state.set_register(rd, state.registers[rt as usize].clone());
+            }
             0x25 => {
-                let value = state.registers[rs as usize]
-                    .binary(&state.registers[rt as usize], |left, right| left | right);
+                let value = state.registers[rs as usize].bitor(&state.registers[rt as usize]);
+                state.set_register(rd, value);
+            }
+            0x26 => {
+                let value = state.registers[rs as usize].bitxor(&state.registers[rt as usize]);
                 state.set_register(rd, value);
             }
             0x09 => state.set_register(rd, TrackedValue::constant(pc.wrapping_add(8))),
@@ -790,17 +1134,21 @@ fn execute_instruction(
         }
         0x0c => {
             let mask = word & 0xffff;
-            let value = state.registers[rs as usize].map_concrete(|value| value & mask);
+            let value = state.registers[rs as usize].bitand(&TrackedValue::constant(mask));
             state.set_register(rt, value);
         }
         0x0d => {
             let immediate = word & 0xffff;
-            let value = state.registers[rs as usize].map_concrete(|value| value | immediate);
+            let value = if immediate == 0 {
+                state.registers[rs as usize].clone()
+            } else {
+                state.registers[rs as usize].bitor(&TrackedValue::constant(immediate))
+            };
             state.set_register(rt, value);
         }
         0x0e => {
             let immediate = word & 0xffff;
-            let value = state.registers[rs as usize].map_concrete(|value| value ^ immediate);
+            let value = state.registers[rs as usize].bitxor(&TrackedValue::constant(immediate));
             state.set_register(rt, value);
         }
         0x23 | 0x27 => {
@@ -827,6 +1175,9 @@ fn execute_instruction(
         0x0a | 0x20..=0x22 | 0x24..=0x26 | 0x30 | 0x34 | 0x37 | 0x38 | 0x3c => {
             state.set_register(rt, TrackedValue::unknown());
         }
+        0x10 if rs == 0 && rd == 12 => {
+            state.set_register(rt, TrackedValue::known_zero(COP0_STATUS_BEV));
+        }
         0x10..=0x13 if matches!(rs, 0x00..=0x02) => {
             state.set_register(rt, TrackedValue::unknown());
         }
@@ -850,7 +1201,7 @@ fn read_block_words(block: &BasicBlock, bank_bytes: &[u8], va_start: u32) -> Vec
     words
 }
 
-fn written_gpr(word: u32) -> Option<u8> {
+pub(crate) fn written_gpr(word: u32) -> Option<u8> {
     let opcode = word >> 26;
     let rs = ((word >> 21) & 0x1f) as u8;
     let rt = ((word >> 16) & 0x1f) as u8;
@@ -859,7 +1210,7 @@ fn written_gpr(word: u32) -> Option<u8> {
         0x00 => (rd != 0).then_some(rd),
         0x01 if matches!(rt, 0x10..=0x13) => Some(31),
         0x03 => Some(31),
-        0x08..=0x0f | 0x18..=0x1b | 0x20..=0x27 | 0x30..=0x37 => (rt != 0).then_some(rt),
+        0x08..=0x0f | 0x18..=0x1b | 0x20..=0x27 | 0x30..=0x38 | 0x3c => (rt != 0).then_some(rt),
         0x10..=0x13 if matches!(rs, 0x00..=0x02) => (rt != 0).then_some(rt),
         _ => None,
     }
@@ -883,10 +1234,12 @@ fn threaded_branch_bound(
         BlockTerminator::Branch {
             target,
             fallthrough,
+            ..
         }
         | BlockTerminator::BranchLikely {
             target,
             fallthrough,
+            ..
         } => (*target, *fallthrough),
         _ => return None,
     };
@@ -916,10 +1269,12 @@ fn branch_bound(words: &[(u32, u32)], terminator: &BlockTerminator) -> Option<(u
         BlockTerminator::Branch {
             target,
             fallthrough,
+            ..
         }
         | BlockTerminator::BranchLikely {
             target,
             fallthrough,
+            ..
         } => (*target, *fallthrough),
         _ => return None,
     };
@@ -966,10 +1321,12 @@ fn block_successors(block: &BasicBlock) -> Vec<u32> {
         BlockTerminator::Branch {
             target,
             fallthrough,
+            ..
         }
         | BlockTerminator::BranchLikely {
             target,
             fallthrough,
+            ..
         } => vec![*target, *fallthrough],
         BlockTerminator::ResolvedIndirect {
             targets,
@@ -1043,6 +1400,17 @@ fn resolve_value_sets_from_roots(
     bank_bytes: &[u8],
     va_start: u32,
     analysis_roots: &[u32],
+) -> Vec<IndirectResolution> {
+    resolve_value_sets_from_roots_observing(cfg, bank_bytes, va_start, analysis_roots, None, None)
+}
+
+fn resolve_value_sets_from_roots_observing(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+    analysis_roots: &[u32],
+    mut stores: Option<&mut BTreeMap<u32, BTreeSet<RawWordStoreObservation>>>,
+    mut status_writes: Option<&mut BTreeMap<u32, BTreeSet<RawCop0StatusObservation>>>,
 ) -> Vec<IndirectResolution> {
     let blocks: BTreeMap<u32, &BasicBlock> = cfg
         .blocks
@@ -1120,6 +1488,44 @@ fn resolve_value_sets_from_roots(
                             }
                         })
                         .or_insert(candidate);
+                }
+            }
+            if word >> 26 == 0x2b {
+                if let Some(stores) = stores.as_deref_mut() {
+                    let base = ((word >> 21) & 0x1f) as usize;
+                    let value_register = ((word >> 16) & 0x1f) as usize;
+                    let immediate = (word & 0xffff) as i16 as i32;
+                    let address = state.registers[base].add_immediate(immediate);
+                    stores
+                        .entry(pc)
+                        .or_default()
+                        .insert(RawWordStoreObservation {
+                            addresses: concrete_values(&address),
+                            values: concrete_values(&state.registers[value_register]),
+                            unchanged_static_word_source: state.registers[value_register]
+                                .unchanged_static_word_source,
+                            widened: widened_visit,
+                        });
+                }
+            }
+            if matches!(
+                decode(word),
+                Instruction::Mtc0 { cop0d: 12, .. } | Instruction::Dmtc0 { cop0d: 12, .. }
+            ) {
+                if let Some(status_writes) = status_writes.as_deref_mut() {
+                    let source_register = ((word >> 16) & 0x1f) as usize;
+                    let value = &state.registers[source_register];
+                    status_writes
+                        .entry(pc)
+                        .or_default()
+                        .insert(RawCop0StatusObservation {
+                            values: concrete_values(value),
+                            known_zero: value.known_zero,
+                            known_one: value.known_one,
+                            memory_sources: value.memory_sources.iter().copied().collect(),
+                            from_static_memory: value.from_static_memory,
+                            widened: widened_visit,
+                        });
                 }
             }
             execute_instruction(&mut state, pc, word, bank_bytes, va_start);
@@ -1200,6 +1606,331 @@ fn resolve_value_sets_from_roots(
         });
     }
     resolutions.into_values().collect()
+}
+
+fn concrete_values(value: &TrackedValue) -> Option<Vec<u32>> {
+    value
+        .concrete_values()
+        .map(|values| values.iter().copied().collect())
+}
+
+/// Inventory every aligned `MTC0`/`DMTC0` write to COP0 Status in `bank_bytes`.
+///
+/// The raw image scan is exhaustive for the supplied bytes. The accompanying
+/// [`Cfg`] contributes only the word classification and open-indirect
+/// frontier; this function never promotes candidate or unknown words to code.
+pub fn inventory_cop0_status_writes(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+) -> Result<Cop0StatusWriteInventory, Cop0StatusWriteInventoryError> {
+    if !bank_bytes.len().is_multiple_of(4) {
+        return Err(Cop0StatusWriteInventoryError::UnalignedImage);
+    }
+    let byte_len = u32::try_from(bank_bytes.len())
+        .map_err(|_| Cop0StatusWriteInventoryError::AddressOverflow)?;
+    va_start
+        .checked_add(byte_len)
+        .ok_or(Cop0StatusWriteInventoryError::AddressOverflow)?;
+    let mut proven_code_writes = Vec::new();
+    let mut proven_data_words = Vec::new();
+    let mut unclassified_writes = Vec::new();
+
+    for (index, bytes) in bank_bytes.chunks_exact(4).enumerate() {
+        let site_pc = va_start + index as u32 * 4;
+        let instruction_word = u32::from_be_bytes(bytes.try_into().unwrap());
+        let (source_register, kind) = match decode(instruction_word) {
+            Instruction::Mtc0 { rt, cop0d: 12 } => (rt, Cop0StatusWriteKind::Mtc0),
+            Instruction::Dmtc0 { rt, cop0d: 12 } => (rt, Cop0StatusWriteKind::Dmtc0),
+            _ => continue,
+        };
+        let word_class = cfg.word_class.get(&site_pc).copied();
+        let site = Cop0StatusWriteSite {
+            site_pc,
+            instruction_word,
+            source_register,
+            kind,
+            word_class,
+        };
+        match word_class {
+            Some(WordClass::ProvenCode) => proven_code_writes.push(site),
+            Some(WordClass::ProvenData) => proven_data_words.push(site),
+            Some(WordClass::Unknown)
+            | Some(WordClass::CandidateData)
+            | Some(WordClass::CandidateCode)
+            | Some(WordClass::Conflict)
+            | None => unclassified_writes.push(site),
+        }
+    }
+
+    let mut open_indirect_sites = cfg
+        .indirect_sites
+        .iter()
+        .map(|site| site.pc)
+        .collect::<Vec<_>>();
+    open_indirect_sites.sort_unstable();
+    open_indirect_sites.dedup();
+    Ok(Cop0StatusWriteInventory {
+        proven_code_writes,
+        proven_data_words,
+        unclassified_writes,
+        open_indirect_sites,
+    })
+}
+
+/// Prove the bounded source-GPR value set at every proven-code Status write.
+///
+/// This reuses the same whole-CFG abstract state as indirect-target and fixed
+/// store resolution. It samples values before the write executes, rejects
+/// mutable load-image provenance, and never treats the 32-bit domain as proof
+/// for `DMTC0`'s 64-bit operand.
+pub fn analyze_cop0_status_writes(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+) -> Result<Cop0StatusWriteAnalysis, Cop0StatusWriteInventoryError> {
+    let inventory = inventory_cop0_status_writes(cfg, bank_bytes, va_start)?;
+    let mut observations = BTreeMap::new();
+    let _ = resolve_value_sets_from_roots_observing(
+        cfg,
+        bank_bytes,
+        va_start,
+        &cfg.proven_roots,
+        None,
+        Some(&mut observations),
+    );
+    let mut proofs = Vec::with_capacity(inventory.proven_code_writes.len());
+    for site in &inventory.proven_code_writes {
+        let site_observations = observations.remove(&site.site_pc).unwrap_or_default();
+        let mut blockers = BTreeSet::new();
+        if site_observations.is_empty() {
+            blockers.insert(Cop0StatusValueBlocker::NoReachableObservation);
+        }
+        if site.kind == Cop0StatusWriteKind::Dmtc0 {
+            blockers.insert(Cop0StatusValueBlocker::Dmtc0Unsupported);
+        }
+        if site_observations
+            .iter()
+            .any(|observation| observation.values.is_none())
+        {
+            blockers.insert(Cop0StatusValueBlocker::ValueOpen);
+        }
+        if site_observations
+            .iter()
+            .any(|observation| observation.widened)
+        {
+            blockers.insert(Cop0StatusValueBlocker::RevisitWidened);
+        }
+        let mutable_sources = site_observations
+            .iter()
+            .filter(|observation| observation.from_static_memory)
+            .flat_map(|observation| observation.memory_sources.iter().copied())
+            .collect::<BTreeSet<_>>();
+        if site_observations
+            .iter()
+            .any(|observation| observation.from_static_memory)
+        {
+            blockers.insert(Cop0StatusValueBlocker::MutableStaticMemorySource {
+                addresses: mutable_sources.into_iter().collect(),
+            });
+        }
+        let observed_values = site_observations
+            .iter()
+            .filter_map(|observation| observation.values.as_ref())
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let values = if observed_values.len() > MAX_VALUE_SET {
+            blockers.insert(Cop0StatusValueBlocker::ValueSetOverflow {
+                observed: u32::try_from(observed_values.len()).unwrap_or(u32::MAX),
+            });
+            Vec::new()
+        } else {
+            observed_values.into_iter().collect::<Vec<_>>()
+        };
+        let known_zero = site_observations
+            .iter()
+            .map(|observation| observation.known_zero)
+            .reduce(|left, right| left & right)
+            .unwrap_or(0);
+        let known_one = site_observations
+            .iter()
+            .map(|observation| observation.known_one)
+            .reduce(|left, right| left & right)
+            .unwrap_or(0);
+        proofs.push(Cop0StatusValueProof {
+            site_pc: site.site_pc,
+            values,
+            known_zero,
+            known_one,
+            blockers: blockers.into_iter().collect(),
+        });
+    }
+    Ok(Cop0StatusWriteAnalysis {
+        inventory,
+        proven_code_value_proofs: proofs,
+    })
+}
+
+/// Derive exact fixed-address word stores whose value is an unchanged load of
+/// an admitted load-image word.
+///
+/// Results are conditional on source stability; this pass proves the bounded
+/// instruction data flow, not that no earlier CPU/device writer changed an
+/// admitted source word.  Every reachable `sw` with an unknown address remains
+/// in `open`, because it may alias a watched destination.  Concrete stores
+/// wholly outside `watched_destinations` are omitted.
+pub fn derive_fixed_word_stores(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+    watched_destinations: &[u32],
+    admitted_sources: &[AdmittedWordSource],
+) -> Result<FixedWordStoreReport, FixedWordStoreInputError> {
+    let mut watched = BTreeSet::new();
+    for &address in watched_destinations {
+        if !address.is_multiple_of(4) {
+            return Err(FixedWordStoreInputError::UnalignedWatchedDestination { address });
+        }
+        watched.insert(address);
+    }
+
+    let mut admitted = BTreeMap::new();
+    for source in admitted_sources {
+        if !source.address.is_multiple_of(4) {
+            return Err(FixedWordStoreInputError::UnalignedSource {
+                address: source.address,
+            });
+        }
+        if let Some(first) = admitted.insert(source.address, source.value) {
+            if first != source.value {
+                return Err(FixedWordStoreInputError::ConflictingSourceValues {
+                    address: source.address,
+                    first,
+                    second: source.value,
+                });
+            }
+        }
+    }
+
+    let mut observations = BTreeMap::new();
+    let _ = resolve_value_sets_from_roots_observing(
+        cfg,
+        bank_bytes,
+        va_start,
+        &cfg.proven_roots,
+        Some(&mut observations),
+        None,
+    );
+
+    let mut conditional = Vec::new();
+    let mut open = Vec::new();
+    for (site_pc, site_observations) in observations {
+        let address_is_open = site_observations
+            .iter()
+            .any(|observation| observation.addresses.is_none());
+        let addresses: BTreeSet<u32> = site_observations
+            .iter()
+            .filter_map(|observation| observation.addresses.as_ref())
+            .flatten()
+            .copied()
+            .collect();
+        if !address_is_open && addresses.is_disjoint(&watched) {
+            continue;
+        }
+
+        let mut blockers = BTreeSet::new();
+        if site_observations.len() > 1 {
+            blockers.insert(FixedWordStoreBlocker::PathDisagreement);
+        }
+        if site_observations
+            .iter()
+            .any(|observation| observation.widened)
+        {
+            blockers.insert(FixedWordStoreBlocker::RevisitWidened);
+        }
+
+        let destination = if address_is_open {
+            blockers.insert(FixedWordStoreBlocker::AddressOpen);
+            None
+        } else if addresses.len() == 1 && !addresses.is_disjoint(&watched) {
+            addresses.iter().next().copied()
+        } else {
+            blockers.insert(FixedWordStoreBlocker::AddressSetAmbiguous {
+                addresses: addresses.iter().copied().collect(),
+            });
+            None
+        };
+
+        let value_is_open = site_observations
+            .iter()
+            .any(|observation| observation.values.is_none());
+        let values: BTreeSet<u32> = site_observations
+            .iter()
+            .filter_map(|observation| observation.values.as_ref())
+            .flatten()
+            .copied()
+            .collect();
+        let value = if value_is_open {
+            blockers.insert(FixedWordStoreBlocker::ValueOpen);
+            None
+        } else if values.len() == 1 {
+            values.iter().next().copied()
+        } else {
+            blockers.insert(FixedWordStoreBlocker::ValueSetAmbiguous {
+                values: values.iter().copied().collect(),
+            });
+            None
+        };
+
+        let sources: BTreeSet<u32> = site_observations
+            .iter()
+            .filter_map(|observation| observation.unchanged_static_word_source)
+            .collect();
+        let every_observation_has_source = site_observations
+            .iter()
+            .all(|observation| observation.unchanged_static_word_source.is_some());
+        let source_address = if every_observation_has_source && sources.len() == 1 {
+            sources.iter().next().copied()
+        } else {
+            blockers.insert(FixedWordStoreBlocker::ValueNotUnchangedStaticLoad);
+            None
+        };
+
+        let source = source_address.and_then(|address| match admitted.get(&address).copied() {
+            None => {
+                blockers.insert(FixedWordStoreBlocker::SourceNotAdmitted { address });
+                None
+            }
+            Some(admitted_value) if Some(admitted_value) != value => {
+                if let Some(recovered) = value {
+                    blockers.insert(FixedWordStoreBlocker::SourceValueMismatch {
+                        address,
+                        admitted: admitted_value,
+                        recovered,
+                    });
+                }
+                None
+            }
+            Some(value) => Some(AdmittedWordSource { address, value }),
+        });
+
+        if blockers.is_empty() {
+            conditional.push(ConditionalFixedWordStore {
+                site_pc,
+                destination: destination.expect("empty blockers require one destination"),
+                value: value.expect("empty blockers require one value"),
+                source: source.expect("empty blockers require one admitted source"),
+            });
+        } else {
+            open.push(OpenFixedWordStore {
+                site_pc,
+                blockers: blockers.into_iter().collect(),
+            });
+        }
+    }
+
+    Ok(FixedWordStoreReport { conditional, open })
 }
 
 /// How many dominating predecessor blocks a backward slice may prepend before
@@ -1564,12 +2295,13 @@ fn reject_unusable_targets(resolutions: &mut [IndirectResolution], va_start: u32
         // regardless of `via_call`. Dropping the resolution to `Bounded` is
         // sound (the interpreter covers the site via dynamic_mips); admitting an
         // unprovable target is not.
-        let allow_cross_bank = resolution.via_call
-            && resolution.kind != Some(IndirectResolutionKind::JumpTable);
+        let allow_cross_bank =
+            resolution.via_call && resolution.kind != Some(IndirectResolutionKind::JumpTable);
         let targets_are_usable = !resolution.targets.is_empty()
-            && resolution.targets.iter().all(|target| {
-                target.is_multiple_of(4) && (allow_cross_bank || in_bank(*target))
-            });
+            && resolution
+                .targets
+                .iter()
+                .all(|target| target.is_multiple_of(4) && (allow_cross_bank || in_bank(*target)));
         if !targets_are_usable {
             resolution.state = IndirectProofState::Bounded;
         }
@@ -1602,7 +2334,12 @@ pub fn build_cfg_value_set_closed_with_claims(
     claimed: &BTreeMap<u32, Vec<u32>>,
 ) -> ClosureResult {
     build_cfg_value_set_closed_with_claims_fenced(
-        bank, bank_bytes, va_start, seed_roots, claimed, &BTreeSet::new(),
+        bank,
+        bank_bytes,
+        va_start,
+        seed_roots,
+        claimed,
+        &BTreeSet::new(),
     )
 }
 
@@ -1625,7 +2362,14 @@ pub fn build_cfg_value_set_closed_with_claims_fenced(
 
     loop {
         let root_vec: Vec<u32> = roots.iter().copied().collect();
-        let cfg = build_cfg_fenced(bank, bank_bytes, va_start, &root_vec, &exhaustive, data_fence);
+        let cfg = build_cfg_fenced(
+            bank,
+            bank_bytes,
+            va_start,
+            &root_vec,
+            &exhaustive,
+            data_fence,
+        );
         let mut resolutions = resolve_value_sets_from_roots(&cfg, bank_bytes, va_start, &root_vec);
         backslice_open_sites(&cfg, bank_bytes, va_start, &mut resolutions);
         reject_unusable_targets(&mut resolutions, va_start, va_end);
@@ -1655,8 +2399,14 @@ pub fn build_cfg_value_set_closed_with_claims_fenced(
             // Open in the returned evidence.
             let mut conservative = retain_cycle_stable_entries(&history[cycle_start..]);
             loop {
-                let cfg =
-                    build_cfg_fenced(bank, bank_bytes, va_start, &root_vec, &conservative, data_fence);
+                let cfg = build_cfg_fenced(
+                    bank,
+                    bank_bytes,
+                    va_start,
+                    &root_vec,
+                    &conservative,
+                    data_fence,
+                );
                 let mut resolutions =
                     resolve_value_sets_from_roots(&cfg, bank_bytes, va_start, &root_vec);
                 backslice_open_sites(&cfg, bank_bytes, va_start, &mut resolutions);
@@ -1708,7 +2458,65 @@ pub fn build_cfg_closed_with_facts(
     va_start: u32,
     seed_roots: &[u32],
 ) -> (Cfg, Vec<ResolvedTarget>) {
-    build_cfg_closed_with_facts_and_claims(db, bank, bank_bytes, va_start, seed_roots, &BTreeMap::new())
+    let closure = build_cfg_value_set_closed_with_facts(db, bank, bank_bytes, va_start, seed_roots);
+    closure_into_legacy(closure)
+}
+
+/// Build the same fact-seeded fixed point as [`build_cfg_closed_with_facts`]
+/// while retaining every indirect site's exhaustive/bounded/open state.
+/// Consumers building closure evidence must use this form instead of
+/// reconstructing an indirect inventory from the legacy resolved-target list.
+pub fn build_cfg_value_set_closed_with_facts(
+    db: &crate::facts::FactDb,
+    bank: &str,
+    bank_bytes: &[u8],
+    va_start: u32,
+    seed_roots: &[u32],
+) -> ClosureResult {
+    let mut roots: BTreeSet<u32> = seed_roots.iter().copied().collect();
+    roots.extend(db.proven_function_entries(bank));
+    build_cfg_value_set_closed(
+        bank,
+        bank_bytes,
+        va_start,
+        &roots.into_iter().collect::<Vec<_>>(),
+    )
+}
+
+fn closure_into_legacy(closure: ClosureResult) -> (Cfg, Vec<ResolvedTarget>) {
+    let block_starts: BTreeMap<u32, u32> = closure
+        .cfg
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            closure
+                .indirect
+                .iter()
+                .filter(move |resolution| {
+                    resolution.site_pc >= block.start_va && resolution.site_pc < block.end_va
+                })
+                .map(move |resolution| (resolution.site_pc, block.start_va))
+        })
+        .collect();
+    let mut legacy = Vec::new();
+    for resolution in &closure.indirect {
+        if resolution.state != IndirectProofState::Exhaustive {
+            continue;
+        }
+        for &target in &resolution.targets {
+            legacy.push(ResolvedTarget {
+                site_pc: resolution.site_pc,
+                target,
+                via_call: resolution.via_call,
+                construction_start: block_starts
+                    .get(&resolution.site_pc)
+                    .copied()
+                    .unwrap_or(resolution.site_pc),
+            });
+        }
+    }
+    legacy.sort_by_key(|resolution| (resolution.site_pc, resolution.target));
+    (closure.cfg, legacy)
 }
 
 /// [`build_cfg_closed_with_facts`] plus cited jump-table claims (see
@@ -1722,7 +2530,13 @@ pub fn build_cfg_closed_with_facts_and_claims(
     claimed: &BTreeMap<u32, Vec<u32>>,
 ) -> (Cfg, Vec<ResolvedTarget>) {
     build_cfg_closed_with_facts_claims_fenced(
-        db, bank, bank_bytes, va_start, seed_roots, claimed, &BTreeSet::new(),
+        db,
+        bank,
+        bank_bytes,
+        va_start,
+        seed_roots,
+        claimed,
+        &BTreeSet::new(),
     )
 }
 
@@ -2755,6 +3569,8 @@ mod tests {
                 pc: site_va,
                 via_call: false,
             }],
+            plain_delay_entry_aliases: Vec::new(),
+            unsupported_delay_entries: Vec::new(),
             proven_roots: vec![0x8000_0100, 0x8000_0200],
         };
 
@@ -2911,6 +3727,491 @@ mod tests {
             .blocks
             .iter()
             .any(|block| block.start_va == 0x8fff_0100));
+    }
+}
+
+#[cfg(test)]
+mod cop0_status_write_inventory_tests {
+    use super::*;
+    use crate::cfg::build_cfg;
+
+    const START: u32 = 0x8000_1000;
+
+    fn cop0_move(rs: u8, rt: u8, cop0d: u8) -> u32 {
+        (0x10 << 26) | ((rs as u32) << 21) | ((rt as u32) << 16) | ((cop0d as u32) << 11)
+    }
+
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn inventories_typed_status_writes_without_promoting_unknown_words() {
+        let image = bytes(&[
+            0x3c08_0040,          // lui t0,0x0040
+            cop0_move(4, 8, 12),  // mtc0 t0,Status
+            0x03e0_0008,          // jr ra
+            0,                    // delay
+            cop0_move(5, 9, 12),  // dmtc0 t1,Status (data-shaped)
+            cop0_move(4, 10, 12), // unclassified raw word
+            cop0_move(4, 11, 13), // mtc0 t3,Cause (not Status)
+        ]);
+        let mut cfg = build_cfg("status", &image, START, &[START]);
+        cfg.word_class.insert(START + 16, WordClass::ProvenData);
+
+        let report = inventory_cop0_status_writes(&cfg, &image, START).unwrap();
+        assert_eq!(report.proven_code_writes.len(), 1);
+        assert_eq!(report.proven_code_writes[0].site_pc, START + 4);
+        assert_eq!(report.proven_code_writes[0].source_register, 8);
+        assert_eq!(report.proven_code_writes[0].kind, Cop0StatusWriteKind::Mtc0);
+        assert_eq!(report.proven_data_words.len(), 1);
+        assert_eq!(report.proven_data_words[0].site_pc, START + 16);
+        assert_eq!(report.proven_data_words[0].kind, Cop0StatusWriteKind::Dmtc0);
+        assert_eq!(report.unclassified_writes.len(), 1);
+        assert_eq!(report.unclassified_writes[0].site_pc, START + 20);
+        assert!(report.open_indirect_sites.is_empty());
+    }
+
+    #[test]
+    fn status_value_analysis_reuses_cfg_state_and_retains_sound_blockers() {
+        let constant = bytes(&[
+            0x3c08_1234,         // lui t0,0x1234
+            cop0_move(4, 8, 12), // mtc0 t0,Status
+            0x03e0_0008,
+            0,
+        ]);
+        let cfg = build_cfg("constant-status", &constant, START, &[START]);
+        let analysis = analyze_cop0_status_writes(&cfg, &constant, START).unwrap();
+        assert_eq!(analysis.inventory.proven_code_writes.len(), 1);
+        assert_eq!(
+            analysis.proven_code_value_proofs,
+            vec![Cop0StatusValueProof {
+                site_pc: START + 4,
+                values: vec![0x1234_0000],
+                known_zero: !0x1234_0000,
+                known_one: 0x1234_0000,
+                blockers: Vec::new(),
+            }]
+        );
+
+        let mut mutable_load = bytes(&[
+            0x3c08_8000,         // lui t0,0x8000
+            0x8d09_1020,         // lw t1,0x1020(t0)
+            cop0_move(4, 9, 12), // mtc0 t1,Status
+            0x03e0_0008,
+            0,
+        ]);
+        mutable_load.resize(0x24, 0);
+        mutable_load[0x20..0x24].copy_from_slice(&0x3400_0000u32.to_be_bytes());
+        let cfg = build_cfg("mutable-status", &mutable_load, START, &[START]);
+        let analysis = analyze_cop0_status_writes(&cfg, &mutable_load, START).unwrap();
+        assert_eq!(
+            analysis.proven_code_value_proofs[0].values,
+            vec![0x3400_0000]
+        );
+        assert!(analysis.proven_code_value_proofs[0]
+            .blockers
+            .iter()
+            .any(|blocker| matches!(
+                blocker,
+                Cop0StatusValueBlocker::MutableStaticMemorySource { addresses }
+                    if addresses == &[START + 0x20]
+            )));
+        assert_eq!(analysis.proven_code_value_proofs[0].known_zero, 0);
+        assert_eq!(analysis.proven_code_value_proofs[0].known_one, 0);
+
+        let unsupported = bytes(&[cop0_move(5, 4, 12), 0x03e0_0008, 0]);
+        let cfg = build_cfg("dmtc0-status", &unsupported, START, &[START]);
+        let analysis = analyze_cop0_status_writes(&cfg, &unsupported, START).unwrap();
+        assert!(analysis.proven_code_value_proofs[0]
+            .blockers
+            .contains(&Cop0StatusValueBlocker::Dmtc0Unsupported));
+        assert!(analysis.proven_code_value_proofs[0]
+            .blockers
+            .contains(&Cop0StatusValueBlocker::ValueOpen));
+    }
+
+    #[test]
+    fn status_read_modify_write_retains_bev_known_zero() {
+        let image = bytes(&[
+            cop0_move(0, 8, 12), // mfc0 t0,Status
+            0x2401_fffe,         // addiu at,zero,-2
+            0x0101_4824,         // and t1,t0,at
+            cop0_move(4, 9, 12), // mtc0 t1,Status
+            0x03e0_0008,
+            0,
+        ]);
+        let cfg = build_cfg("status-rmw", &image, START, &[START]);
+        let analysis = analyze_cop0_status_writes(&cfg, &image, START).unwrap();
+        let [proof] = analysis.proven_code_value_proofs.as_slice() else {
+            panic!("expected one Status proof")
+        };
+        assert!(proof.values.is_empty());
+        assert_eq!(proof.known_zero & COP0_STATUS_BEV, COP0_STATUS_BEV);
+        assert_eq!(proof.known_zero & 1, 1);
+        assert_eq!(proof.known_one, 0);
+        assert_eq!(proof.blockers, vec![Cop0StatusValueBlocker::ValueOpen]);
+    }
+
+    #[test]
+    fn retains_open_indirect_frontier_even_without_status_words() {
+        let image = bytes(&[0x0100_0008, 0]); // jr t0; nop
+        let cfg = build_cfg("indirect", &image, START, &[START]);
+        let first = inventory_cop0_status_writes(&cfg, &image, START).unwrap();
+        let second = inventory_cop0_status_writes(&cfg, &image, START).unwrap();
+        assert_eq!(first, second);
+        assert!(first.proven_code_writes.is_empty());
+        assert!(first.proven_data_words.is_empty());
+        assert!(first.unclassified_writes.is_empty());
+        assert_eq!(first.open_indirect_sites, vec![START]);
+    }
+
+    #[test]
+    fn rejects_unaligned_or_wrapping_image_geometry() {
+        let cfg = build_cfg("empty", &[], START, &[]);
+        assert_eq!(
+            inventory_cop0_status_writes(&cfg, &[0; 3], START),
+            Err(Cop0StatusWriteInventoryError::UnalignedImage)
+        );
+        assert_eq!(
+            inventory_cop0_status_writes(&cfg, &[0; 4], u32::MAX - 3),
+            Err(Cop0StatusWriteInventoryError::AddressOverflow)
+        );
+    }
+}
+
+#[cfg(test)]
+mod fixed_word_store_tests {
+    use super::*;
+    use crate::cfg::build_cfg;
+
+    const START: u32 = 0x8000_1000;
+    const SOURCE: u32 = 0x8000_1100;
+    const DESTINATION: u32 = 0x8000_0180;
+    const WORD: u32 = 0x27bd_ffe0;
+    const NOP: u32 = 0;
+    const JR_RA: u32 = 0x03e0_0008;
+
+    fn i(op: u32, rs: u8, rt: u8, immediate: i16) -> u32 {
+        (op << 26) | ((rs as u32) << 21) | ((rt as u32) << 16) | immediate as u16 as u32
+    }
+
+    fn r(rs: u8, rt: u8, rd: u8, funct: u32) -> u32 {
+        ((rs as u32) << 21) | ((rt as u32) << 16) | ((rd as u32) << 11) | funct
+    }
+
+    fn j(op: u32, target: u32) -> u32 {
+        (op << 26) | ((target >> 2) & 0x03ff_ffff)
+    }
+
+    fn image(words: &[u32], sources: &[(u32, u32)]) -> Vec<u8> {
+        let mut bytes = vec![0; 0x300];
+        for (index, word) in words.iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        for &(address, word) in sources {
+            let offset = (address - START) as usize;
+            bytes[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn analyze(
+        bytes: &[u8],
+        watched: &[u32],
+        sources: &[AdmittedWordSource],
+    ) -> FixedWordStoreReport {
+        let cfg = build_cfg("stores", bytes, START, &[START]);
+        derive_fixed_word_stores(&cfg, bytes, START, watched, sources).unwrap()
+    }
+
+    fn canonical_copy() -> Vec<u32> {
+        vec![
+            i(0x0f, 0, 8, 0x8000u16 as i16),
+            i(0x09, 8, 8, 0x1100),
+            i(0x23, 8, 9, 0),
+            i(0x0f, 0, 10, 0x8000u16 as i16),
+            i(0x2b, 10, 9, 0x0180),
+            JR_RA,
+            NOP,
+        ]
+    }
+
+    #[test]
+    fn derives_conditional_unchanged_rom_word_copy() {
+        let bytes = image(&canonical_copy(), &[(SOURCE, WORD)]);
+        let report = analyze(
+            &bytes,
+            &[DESTINATION],
+            &[AdmittedWordSource {
+                address: SOURCE,
+                value: WORD,
+            }],
+        );
+        assert_eq!(report.open, Vec::new());
+        assert_eq!(
+            report.conditional,
+            vec![ConditionalFixedWordStore {
+                site_pc: START + 16,
+                destination: DESTINATION,
+                value: WORD,
+                source: AdmittedWordSource {
+                    address: SOURCE,
+                    value: WORD,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn arithmetic_clears_identity_copy_provenance() {
+        let mut words = canonical_copy();
+        words.insert(3, i(0x09, 9, 9, 1));
+        let bytes = image(&words, &[(SOURCE, WORD)]);
+        let report = analyze(
+            &bytes,
+            &[DESTINATION],
+            &[AdmittedWordSource {
+                address: SOURCE,
+                value: WORD,
+            }],
+        );
+        assert!(report.conditional.is_empty());
+        assert_eq!(report.open.len(), 1);
+        assert!(report.open[0]
+            .blockers
+            .contains(&FixedWordStoreBlocker::ValueNotUnchangedStaticLoad));
+    }
+
+    #[test]
+    fn unknown_destination_remains_open_as_a_possible_alias() {
+        let words = vec![
+            i(0x0f, 0, 8, 0x8000u16 as i16),
+            i(0x09, 8, 8, 0x1100),
+            i(0x23, 8, 9, 0),
+            i(0x2b, 4, 9, 0),
+            JR_RA,
+            NOP,
+        ];
+        let bytes = image(&words, &[(SOURCE, WORD)]);
+        let report = analyze(
+            &bytes,
+            &[DESTINATION],
+            &[AdmittedWordSource {
+                address: SOURCE,
+                value: WORD,
+            }],
+        );
+        assert!(report.conditional.is_empty());
+        assert!(report.open[0]
+            .blockers
+            .contains(&FixedWordStoreBlocker::AddressOpen));
+    }
+
+    #[test]
+    fn call_clobber_between_load_and_store_remains_open() {
+        let callee = START + 0x30;
+        let mut words = vec![
+            i(0x0f, 0, 8, 0x8000u16 as i16),
+            i(0x09, 8, 8, 0x1100),
+            i(0x23, 8, 9, 0),
+            i(0x0f, 0, 10, 0x8000u16 as i16),
+            j(0x03, callee),
+            NOP,
+            i(0x2b, 10, 9, 0x0180),
+            JR_RA,
+            NOP,
+        ];
+        words.resize(0x30 / 4, NOP);
+        words.extend([JR_RA, NOP]);
+        let bytes = image(&words, &[(SOURCE, WORD)]);
+        let report = analyze(
+            &bytes,
+            &[DESTINATION],
+            &[AdmittedWordSource {
+                address: SOURCE,
+                value: WORD,
+            }],
+        );
+        assert!(report.conditional.is_empty());
+        assert!(report.open[0]
+            .blockers
+            .contains(&FixedWordStoreBlocker::ValueOpen));
+    }
+
+    #[test]
+    fn identical_join_observations_close_but_conflicting_provenance_does_not() {
+        // Both branch arms preserve the same loaded source word before the
+        // shared store.  The observer's BTreeSet meet deduplicates identical
+        // normalized observations rather than calling convergence disagreement.
+        let words = vec![
+            i(0x0f, 0, 8, 0x8000u16 as i16),
+            i(0x09, 8, 8, 0x1100),
+            i(0x23, 8, 9, 0),
+            i(0x0f, 0, 10, 0x8000u16 as i16),
+            i(0x04, 4, 0, 3),
+            NOP,
+            j(0x02, START + 0x28),
+            NOP,
+            NOP,
+            NOP,
+            i(0x2b, 10, 9, 0x0180),
+            JR_RA,
+            NOP,
+        ];
+        let bytes = image(&words, &[(SOURCE, WORD)]);
+        let admitted = [AdmittedWordSource {
+            address: SOURCE,
+            value: WORD,
+        }];
+        let report = analyze(&bytes, &[DESTINATION], &admitted);
+        assert_eq!(report.conditional.len(), 1);
+        assert!(report.open.is_empty());
+
+        // Replace one arm's nop with a load of a different admitted word.  The
+        // join must retain both numerical values and cannot choose one source.
+        let mut changed = words;
+        changed[8] = i(0x23, 8, 9, 4);
+        let other_word = WORD ^ 1;
+        let bytes = image(&changed, &[(SOURCE, WORD), (SOURCE + 4, other_word)]);
+        let report = analyze(
+            &bytes,
+            &[DESTINATION],
+            &[
+                admitted[0],
+                AdmittedWordSource {
+                    address: SOURCE + 4,
+                    value: other_word,
+                },
+            ],
+        );
+        assert!(report.conditional.is_empty());
+        assert!(matches!(
+            report.open[0].blockers.as_slice(),
+            [
+                FixedWordStoreBlocker::ValueSetAmbiguous { .. },
+                FixedWordStoreBlocker::ValueNotUnchangedStaticLoad,
+            ]
+        ));
+    }
+
+    #[test]
+    fn four_words_to_four_vector_bases_are_deterministic() {
+        let source_words = [0x3c1a_8000, 0x275a_0000, 0x0340_0008, 0x0000_0000];
+        let vector_bases = [0x8000_0000, 0x8000_0080, 0x8000_0100, 0x8000_0180];
+        let mut words = vec![
+            i(0x0f, 0, 16, 0x8000u16 as i16),
+            i(0x09, 16, 16, 0x1100),
+            i(0x0f, 0, 17, 0x8000u16 as i16),
+        ];
+        for (index, _) in source_words.iter().enumerate() {
+            words.push(i(0x23, 16, 8, (index * 4) as i16));
+            for base in vector_bases {
+                words.push(i(0x2b, 17, 8, (base & 0xffff) as i16));
+            }
+        }
+        words.extend([JR_RA, NOP]);
+        let sources: Vec<_> = source_words
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| AdmittedWordSource {
+                address: SOURCE + (index as u32) * 4,
+                value,
+            })
+            .collect();
+        let source_pairs: Vec<_> = sources
+            .iter()
+            .map(|source| (source.address, source.value))
+            .collect();
+        let watched: Vec<_> = vector_bases
+            .iter()
+            .flat_map(|base| (0..4).map(move |index| base + index * 4))
+            .collect();
+        let bytes = image(&words, &source_pairs);
+        let first = analyze(&bytes, &watched, &sources);
+        let second = analyze(&bytes, &watched, &sources);
+        assert_eq!(first, second);
+        assert!(first.open.is_empty());
+        assert_eq!(first.conditional.len(), 16);
+    }
+
+    #[test]
+    fn widened_loop_visit_cannot_leave_an_exact_result() {
+        let words = vec![
+            i(0x0f, 0, 8, 0x8000u16 as i16),
+            i(0x09, 8, 8, 0x1100),
+            i(0x23, 8, 9, 0),
+            i(0x0f, 0, 10, 0x8000u16 as i16),
+            i(0x09, 0, 11, 0),
+            i(0x09, 11, 11, 1),
+            i(0x04, 0, 0, -2),
+            i(0x2b, 10, 9, 0x0180),
+            JR_RA,
+            NOP,
+        ];
+        let bytes = image(&words, &[(SOURCE, WORD)]);
+        let report = analyze(
+            &bytes,
+            &[DESTINATION],
+            &[AdmittedWordSource {
+                address: SOURCE,
+                value: WORD,
+            }],
+        );
+        assert!(report.conditional.is_empty());
+        assert!(report.open[0]
+            .blockers
+            .contains(&FixedWordStoreBlocker::RevisitWidened));
+    }
+
+    #[test]
+    fn validates_word_aligned_and_unambiguous_inputs() {
+        let bytes = image(&canonical_copy(), &[(SOURCE, WORD)]);
+        let cfg = build_cfg("stores", &bytes, START, &[START]);
+        assert_eq!(
+            derive_fixed_word_stores(&cfg, &bytes, START, &[DESTINATION + 1], &[]),
+            Err(FixedWordStoreInputError::UnalignedWatchedDestination {
+                address: DESTINATION + 1,
+            })
+        );
+        assert!(matches!(
+            derive_fixed_word_stores(
+                &cfg,
+                &bytes,
+                START,
+                &[DESTINATION],
+                &[
+                    AdmittedWordSource {
+                        address: SOURCE,
+                        value: WORD,
+                    },
+                    AdmittedWordSource {
+                        address: SOURCE,
+                        value: WORD ^ 1,
+                    },
+                ],
+            ),
+            Err(FixedWordStoreInputError::ConflictingSourceValues { .. })
+        ));
+    }
+
+    #[test]
+    fn register_move_preserves_identity_but_arithmetic_does_not() {
+        let mut words = canonical_copy();
+        words.insert(3, r(9, 0, 9, 0x21)); // addu t1,t1,zero
+        let bytes = image(&words, &[(SOURCE, WORD)]);
+        let report = analyze(
+            &bytes,
+            &[DESTINATION],
+            &[AdmittedWordSource {
+                address: SOURCE,
+                value: WORD,
+            }],
+        );
+        assert_eq!(report.open, Vec::new());
+        assert_eq!(report.conditional.len(), 1);
+        assert_eq!(report.conditional[0].source.address, SOURCE);
+        assert_eq!(report.conditional[0].value, WORD);
     }
 }
 

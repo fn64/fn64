@@ -36,9 +36,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use fn64_recomp::{load_config, Function, RecompConfig, Section};
-use fn64_recomp_rs::{
-    decode, emit_function_resolved, emit_lookup_dispatcher, module::SymbolTable, FuncInput,
-    Instruction,
+use fn64_recomp_rs::{decode, Instruction};
+use fn64_recomp_rs_codegen::{
+    emit_function_resolved, emit_lookup_dispatcher, module::SymbolTable, FuncInput,
 };
 
 fn main() -> std::process::ExitCode {

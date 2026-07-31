@@ -6,7 +6,9 @@
 
 use crate::block_proof::{BlockAssessment, ReachableCodeBlock};
 use crate::cfg::WordClass;
-use crate::snapshot::ProgramSnapshotV1;
+use crate::snapshot::{
+    ProgramSnapshotV1, ValidatedComposedSnapshotsV2, PROGRAM_SNAPSHOT_SCHEMA_V5,
+};
 use crate::NormalizedRom;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,11 +70,51 @@ pub struct MaterializedPackedBank {
     pub blocks: Vec<MaterializedPackedBlock>,
 }
 
+/// Measured effect of adding one exact trace generation's executed words to a
+/// materialized sparse bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedExecutionAugmentReport {
+    pub observed_words: usize,
+    pub required_delay_slot_words: usize,
+    pub newly_admitted_words: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservedExecutionAugmentError {
+    RomIdentityMismatch,
+    TraceNotCompleted,
+    BankNameMismatch { packed: String, observed: String },
+    MappingAddressOverflow,
+    ObservedPcOutsideMapping { pc: u32, va_start: u32, va_end: u32 },
+    RomWordOutsideImage { pc: u32, rom_offset: u32 },
+    ExistingWordMismatch { pc: u32, packed: u32, observed: u32 },
+}
+
+impl std::fmt::Display for ObservedExecutionAugmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for ObservedExecutionAugmentError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockPackError {
     UnsupportedSchema {
         expected: u32,
         actual: u32,
+    },
+    UnsupportedSnapshotSchema {
+        expected: u32,
+        actual: u32,
+    },
+    ValidatedSnapshotIndexOutsideComposition {
+        index: usize,
+        count: usize,
+    },
+    LegacySchemaVirtualBacking {
+        bank: String,
+        start_va: u32,
     },
     RomIdentityMismatch,
     NoProvenBlocks {
@@ -174,10 +216,46 @@ impl std::fmt::Display for BlockPackError {
 
 impl std::error::Error for BlockPackError {}
 
+/// Emit a diagnostic/interchange pack from an inspectable snapshot.
+///
+/// This compatibility API does not carry execution authority: callers can
+/// construct or deserialize `ProgramSnapshotV1`. Current execution gates must
+/// use [`emit_validated_block_pack_v2`], whose opaque composition wrapper can
+/// only come from the byte-verifying snapshot pipeline.
 pub fn emit_block_pack_v1(
     snapshot: &ProgramSnapshotV1,
     rom: &NormalizedRom,
 ) -> Result<BlockPackV1, BlockPackError> {
+    emit_block_pack_from_snapshot(snapshot, rom, BLOCK_PACK_SCHEMA_V1)
+}
+
+/// Emit one authoritative V2 pack from an exact member of a move-only,
+/// byte-verified composition.
+pub fn emit_validated_block_pack_v2(
+    composition: &ValidatedComposedSnapshotsV2,
+    snapshot_index: usize,
+    rom: &NormalizedRom,
+) -> Result<BlockPackV1, BlockPackError> {
+    let snapshot = composition.snapshot(snapshot_index).ok_or(
+        BlockPackError::ValidatedSnapshotIndexOutsideComposition {
+            index: snapshot_index,
+            count: composition.snapshots().len(),
+        },
+    )?;
+    emit_block_pack_from_snapshot(snapshot, rom, BLOCK_PACK_SCHEMA_V2)
+}
+
+fn emit_block_pack_from_snapshot(
+    snapshot: &ProgramSnapshotV1,
+    rom: &NormalizedRom,
+    output_schema: u32,
+) -> Result<BlockPackV1, BlockPackError> {
+    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V5 {
+        return Err(BlockPackError::UnsupportedSnapshotSchema {
+            expected: PROGRAM_SNAPSHOT_SCHEMA_V5,
+            actual: snapshot.schema_version,
+        });
+    }
     if snapshot.normalized_rom_sha256 != rom.sha256 {
         return Err(BlockPackError::RomIdentityMismatch);
     }
@@ -198,8 +276,26 @@ pub fn emit_block_pack_v1(
         if proven.is_empty() {
             return Err(BlockPackError::NoProvenBlocks { bank: bank.clone() });
         }
-        let geometry =
-            complete_severed_delay_slots(&proven, &bank_snapshot.closure.cfg.word_class, rom);
+        if output_schema == BLOCK_PACK_SCHEMA_V1
+            && proven
+                .iter()
+                .any(|block| block.rom_space != crate::facts::RomAddressSpace::Physical)
+        {
+            return Err(BlockPackError::LegacySchemaVirtualBacking {
+                bank: bank.clone(),
+                start_va: proven
+                    .iter()
+                    .find(|block| block.rom_space != crate::facts::RomAddressSpace::Physical)
+                    .expect("nonphysical block exists")
+                    .start_va,
+            });
+        }
+        let geometry = complete_severed_delay_slots(
+            &proven,
+            &bank_snapshot.closure.cfg.word_class,
+            rom,
+            &snapshot.facts,
+        );
         validate_completed_geometry(bank, &geometry)?;
         let bank_id = stable_bank_id(&snapshot.normalized_rom_sha256, bank);
         if !bank_ids.insert(bank_id) {
@@ -246,7 +342,7 @@ pub fn emit_block_pack_v1(
     }
     banks.sort_by(|left, right| left.bank.cmp(&right.bank));
     Ok(BlockPackV1 {
-        schema_version: BLOCK_PACK_SCHEMA_V2,
+        schema_version: output_schema,
         normalized_rom_sha256: snapshot.normalized_rom_sha256.clone(),
         banks,
     })
@@ -270,9 +366,7 @@ pub fn materialize_block_pack_with_facts(
     rom: &NormalizedRom,
     facts: Option<&crate::facts::FactDb>,
 ) -> Result<Vec<MaterializedPackedBank>, BlockPackError> {
-    if pack.schema_version != BLOCK_PACK_SCHEMA_V1
-        && pack.schema_version != BLOCK_PACK_SCHEMA_V2
-    {
+    if pack.schema_version != BLOCK_PACK_SCHEMA_V1 && pack.schema_version != BLOCK_PACK_SCHEMA_V2 {
         return Err(BlockPackError::UnsupportedSchema {
             expected: BLOCK_PACK_SCHEMA_V2,
             actual: pack.schema_version,
@@ -298,6 +392,14 @@ pub fn materialize_block_pack_with_facts(
         }
         let mut blocks = Vec::with_capacity(bank.blocks.len());
         for block in &bank.blocks {
+            if pack.schema_version == BLOCK_PACK_SCHEMA_V1
+                && block.rom_space != crate::facts::RomAddressSpace::Physical
+            {
+                return Err(BlockPackError::LegacySchemaVirtualBacking {
+                    bank: bank.bank.clone(),
+                    start_va: block.start_va,
+                });
+            }
             let resolved;
             let bytes = match (block.rom_space, facts) {
                 (crate::facts::RomAddressSpace::Physical, _) => rom
@@ -325,11 +427,11 @@ pub fn materialize_block_pack_with_facts(
                     });
                 }
             }
-                .ok_or(BlockPackError::RomRangeOutsideImage {
-                    bank: bank.bank.clone(),
-                    rom_start: block.rom_start,
-                    rom_end: block.rom_end,
-                })?;
+            .ok_or(BlockPackError::RomRangeOutsideImage {
+                bank: bank.bank.clone(),
+                rom_start: block.rom_start,
+                rom_end: block.rom_end,
+            })?;
             if sha256_hex(bytes) != block.bytes_sha256 {
                 return Err(BlockPackError::BlockDigestMismatch {
                     bank: bank.bank.clone(),
@@ -351,6 +453,136 @@ pub fn materialize_block_pack_with_facts(
         });
     }
     Ok(output)
+}
+
+/// Union the exact instruction words observed in one trace bank generation
+/// into an already materialized sparse bank.
+///
+/// This is scenario AOT coverage, not function-boundary discovery. Every
+/// added word is re-read from the normalized ROM through the supplied affine
+/// mapping; an observation outside that mapping traps instead of borrowing a
+/// numeric VA from another image generation. Existing proven blocks and
+/// observed words are canonicalized into disjoint contiguous spans.
+pub fn augment_with_observed_execution(
+    bank: &mut MaterializedPackedBank,
+    report: &crate::trace::IngestReport,
+    rom: &NormalizedRom,
+    observed_bank: &str,
+    activation: u64,
+    rom_start: u32,
+    va_start: u32,
+    byte_len: u32,
+) -> Result<ObservedExecutionAugmentReport, ObservedExecutionAugmentError> {
+    if report.header.normalized_rom_sha256.as_str() != rom.sha256 {
+        return Err(ObservedExecutionAugmentError::RomIdentityMismatch);
+    }
+    if report.completion != crate::trace::TraceCompletion::Completed {
+        return Err(ObservedExecutionAugmentError::TraceNotCompleted);
+    }
+    if bank.bank != observed_bank {
+        return Err(ObservedExecutionAugmentError::BankNameMismatch {
+            packed: bank.bank.clone(),
+            observed: observed_bank.to_string(),
+        });
+    }
+    let va_end = va_start
+        .checked_add(byte_len)
+        .ok_or(ObservedExecutionAugmentError::MappingAddressOverflow)?;
+    let mut words = BTreeMap::<u32, u32>::new();
+    for block in &bank.blocks {
+        for (index, word) in block.words.iter().copied().enumerate() {
+            words.insert(
+                block.start_va
+                    + u32::try_from(index).expect("materialized block index fits u32") * 4,
+                word,
+            );
+        }
+    }
+
+    let observed = crate::trace::observed_execution_roots(report, observed_bank, activation);
+    let mut required = observed.clone();
+    let mut required_delay_slot_words = 0usize;
+    for pc in observed.iter().copied() {
+        if pc < va_start || pc >= va_end {
+            return Err(ObservedExecutionAugmentError::ObservedPcOutsideMapping {
+                pc,
+                va_start,
+                va_end,
+            });
+        }
+        let rom_offset = rom_start
+            .checked_add(pc - va_start)
+            .ok_or(ObservedExecutionAugmentError::MappingAddressOverflow)?;
+        let start = usize::try_from(rom_offset).expect("u32 ROM offset fits usize");
+        let bytes = rom
+            .bytes
+            .get(start..start + 4)
+            .ok_or(ObservedExecutionAugmentError::RomWordOutsideImage { pc, rom_offset })?;
+        let word = u32::from_be_bytes(bytes.try_into().expect("four-byte ROM word"));
+        if fn64_recomp_rs::decode(word).has_delay_slot() {
+            let delay_pc = pc
+                .checked_add(4)
+                .ok_or(ObservedExecutionAugmentError::MappingAddressOverflow)?;
+            if required.insert(delay_pc) {
+                required_delay_slot_words += 1;
+            }
+        }
+    }
+    let mut newly_admitted_words = 0usize;
+    for pc in required.iter().copied() {
+        if pc < va_start || pc >= va_end {
+            return Err(ObservedExecutionAugmentError::ObservedPcOutsideMapping {
+                pc,
+                va_start,
+                va_end,
+            });
+        }
+        let rom_offset = rom_start
+            .checked_add(pc - va_start)
+            .ok_or(ObservedExecutionAugmentError::MappingAddressOverflow)?;
+        let start = usize::try_from(rom_offset).expect("u32 ROM offset fits usize");
+        let bytes = rom
+            .bytes
+            .get(start..start + 4)
+            .ok_or(ObservedExecutionAugmentError::RomWordOutsideImage { pc, rom_offset })?;
+        let observed_word = u32::from_be_bytes(bytes.try_into().expect("four-byte ROM word"));
+        match words.insert(pc, observed_word) {
+            Some(packed) if packed != observed_word => {
+                return Err(ObservedExecutionAugmentError::ExistingWordMismatch {
+                    pc,
+                    packed,
+                    observed: observed_word,
+                });
+            }
+            Some(_) => {}
+            None => newly_admitted_words += 1,
+        }
+    }
+
+    let mut blocks = Vec::new();
+    for (pc, word) in words {
+        match blocks.last_mut() {
+            Some(MaterializedPackedBlock {
+                start_va,
+                words: block_words,
+            }) if start_va.checked_add(
+                u32::try_from(block_words.len()).expect("block word count fits u32") * 4,
+            ) == Some(pc) =>
+            {
+                block_words.push(word)
+            }
+            _ => blocks.push(MaterializedPackedBlock {
+                start_va: pc,
+                words: vec![word],
+            }),
+        }
+    }
+    bank.blocks = blocks;
+    Ok(ObservedExecutionAugmentReport {
+        observed_words: observed.len(),
+        required_delay_slot_words,
+        newly_admitted_words,
+    })
 }
 
 /// Emit one deterministic, standalone Rust source module implementing the
@@ -436,13 +668,13 @@ pub fn emit_block_program_source_with_facts(
         let blocks = bank
             .blocks
             .iter()
-            .map(|block| fn64_recomp_rs::BankBlockInput {
+            .map(|block| fn64_recomp_rs_codegen::BankBlockInput {
                 vram: block.start_va,
                 words: &block.words,
             })
             .collect::<Vec<_>>();
-        source.push_str(&fn64_recomp_rs::emit_sparse_bank_runner_function(
-            &fn64_recomp_rs::SparseBankInput {
+        source.push_str(&fn64_recomp_rs_codegen::emit_sparse_bank_runner_function(
+            &fn64_recomp_rs_codegen::SparseBankInput {
                 name: &name,
                 bank: fn64_recomp_rs::BankId::new(bank.bank_id),
                 blocks: &blocks,
@@ -462,19 +694,35 @@ pub fn emit_block_program_source_with_facts(
 /// widens them to one bounding interval, so bytes in code/data gaps cannot be
 /// decoded or acquire same-bank transfer authority.
 pub fn emit_materialized_bank_runner(bank: &MaterializedPackedBank, name: &str) -> String {
-    let blocks: Vec<fn64_recomp_rs::BankBlockInput<'_>> = bank
+    emit_materialized_bank_runner_with_host_calls(bank, name, &[])
+}
+
+/// Feed a re-verified materialized bank into the sparse emitter with an exact
+/// inventory of statically bound host-call destinations.
+///
+/// The caller owns semantic proof for every address in `host_calls`; this
+/// adapter only preserves that typed boundary in generated control flow.
+pub fn emit_materialized_bank_runner_with_host_calls(
+    bank: &MaterializedPackedBank,
+    name: &str,
+    host_calls: &[u32],
+) -> String {
+    let blocks: Vec<fn64_recomp_rs_codegen::BankBlockInput<'_>> = bank
         .blocks
         .iter()
-        .map(|block| fn64_recomp_rs::BankBlockInput {
+        .map(|block| fn64_recomp_rs_codegen::BankBlockInput {
             vram: block.start_va,
             words: &block.words,
         })
         .collect();
-    fn64_recomp_rs::emit_sparse_bank_runner(&fn64_recomp_rs::SparseBankInput {
-        name,
-        bank: fn64_recomp_rs::BankId::new(bank.bank_id),
-        blocks: &blocks,
-    })
+    fn64_recomp_rs_codegen::emit_sparse_bank_runner_with_host_calls(
+        &fn64_recomp_rs_codegen::SparseBankInput {
+            name,
+            bank: fn64_recomp_rs::BankId::new(bank.bank_id),
+            blocks: &blocks,
+        },
+        host_calls,
+    )
 }
 
 /// Convert a re-verified pack bank into the runtime's owned sparse catalog
@@ -741,6 +989,7 @@ fn complete_severed_delay_slots(
     blocks: &[&ReachableCodeBlock],
     word_class: &BTreeMap<u32, WordClass>,
     rom: &NormalizedRom,
+    facts: &crate::facts::FactDb,
 ) -> Vec<CompletedGeometry> {
     let admitted: BTreeSet<u32> = blocks
         .iter()
@@ -759,10 +1008,21 @@ fn complete_severed_delay_slots(
             let last_word_control = block
                 .rom_end
                 .checked_sub(4)
-                .and_then(|off| rom.bytes.get(off as usize..off as usize + 4))
+                .and_then(|start| {
+                    crate::banks::materialize_rom_range(
+                        rom,
+                        facts,
+                        block.rom_space,
+                        start,
+                        block.rom_end,
+                    )
+                    .ok()
+                })
                 .map(|bytes| {
-                    fn64_recomp_rs::decode(u32::from_be_bytes(bytes.try_into().unwrap()))
-                        .has_delay_slot()
+                    fn64_recomp_rs::decode(u32::from_be_bytes(
+                        bytes.bytes.as_slice().try_into().unwrap(),
+                    ))
+                    .has_delay_slot()
                 })
                 .unwrap_or(false);
             if last_word_control
@@ -864,12 +1124,72 @@ mod tests {
             bank: "boot".into(),
             start_va,
             end_va,
-            owner_root: ENTRY_PC,
+            authoritative_roots: crate::block_proof::AuthoritativeReachabilityRoots::new([
+                ENTRY_PC,
+            ])
+            .unwrap(),
             rom_space: RomAddressSpace::Physical,
             rom_start: ROM_BASE + (start_va - ENTRY_PC),
             rom_end: ROM_BASE + (end_va - ENTRY_PC),
             terminator,
         }
+    }
+
+    #[test]
+    fn observed_execution_augments_exact_words_and_required_delay_slot() {
+        let jal = 0x0c00_0800;
+        let rom = rom_with(&[NOP, jal, NOP, NOP]);
+        let digest = crate::trace::NormalizedRomDigest::try_from(rom.sha256.clone()).unwrap();
+        let report = crate::trace::IngestReport {
+            header: crate::trace::TraceHeader {
+                schema_version: crate::trace::TRACE_SCHEMA_VERSION,
+                normalized_rom_sha256: digest,
+                trace_id: "observed-aot-test".into(),
+                producer: "synthetic-test".into(),
+            },
+            completion: crate::trace::TraceCompletion::Completed,
+            final_sequence: 2,
+            counts: crate::trace::TraceEventCounts {
+                executed_pc: 1,
+                ..Default::default()
+            },
+            observations_with_unknown_bank: 0,
+            facts: vec![crate::trace::ObservedTraceFact::ExecutedPc {
+                sequence: 1,
+                pc: crate::trace::ObservedAddress {
+                    address: ENTRY_PC + 4,
+                    bank: crate::trace::BankContext::Known {
+                        bank: "boot".into(),
+                        activation: 0,
+                    },
+                },
+            }],
+            exhaustiveness: Vec::new(),
+        };
+        let mut bank = MaterializedPackedBank {
+            bank: "boot".into(),
+            bank_id: BANK_A,
+            blocks: vec![MaterializedPackedBlock {
+                start_va: ENTRY_PC,
+                words: vec![NOP],
+            }],
+        };
+
+        let augmented = augment_with_observed_execution(
+            &mut bank, &report, &rom, "boot", 0, ROM_BASE, ENTRY_PC, 16,
+        )
+        .unwrap();
+        assert_eq!(
+            augmented,
+            ObservedExecutionAugmentReport {
+                observed_words: 1,
+                required_delay_slot_words: 1,
+                newly_admitted_words: 2,
+            }
+        );
+        assert_eq!(bank.blocks.len(), 1);
+        assert_eq!(bank.blocks[0].start_va, ENTRY_PC);
+        assert_eq!(bank.blocks[0].words, vec![NOP, jal, NOP]);
     }
 
     #[test]
@@ -885,7 +1205,12 @@ mod tests {
             (ENTRY_PC + 4, WordClass::ProvenCode),
             (ENTRY_PC + 8, WordClass::ProvenCode),
         ]);
-        let geometry = complete_severed_delay_slots(&[&control], &word_class, &rom);
+        let geometry = complete_severed_delay_slots(
+            &[&control],
+            &word_class,
+            &rom,
+            &crate::facts::FactDb::new(),
+        );
         assert_eq!(geometry[0].end_va, ENTRY_PC + 0x0c);
         assert_eq!(geometry[0].rom_end, ROM_BASE + 0x0c);
     }
@@ -902,7 +1227,12 @@ mod tests {
         let word_class = (0..5)
             .map(|index| (ENTRY_PC + index * 4, WordClass::ProvenCode))
             .collect();
-        let geometry = complete_severed_delay_slots(&[&control, &next], &word_class, &rom);
+        let geometry = complete_severed_delay_slots(
+            &[&control, &next],
+            &word_class,
+            &rom,
+            &crate::facts::FactDb::new(),
+        );
         assert_eq!(geometry[0].end_va, ENTRY_PC + 8);
         assert_eq!(geometry[1].start_va, ENTRY_PC + 8);
     }
@@ -916,7 +1246,12 @@ mod tests {
             (ENTRY_PC + 4, WordClass::ProvenCode),
             (ENTRY_PC + 8, WordClass::ProvenCode),
         ]);
-        let geometry = complete_severed_delay_slots(&[&control], &word_class, &rom);
+        let geometry = complete_severed_delay_slots(
+            &[&control],
+            &word_class,
+            &rom,
+            &crate::facts::FactDb::new(),
+        );
         assert_eq!(geometry[0].end_va, ENTRY_PC + 0x0c);
     }
 
@@ -1021,6 +1356,20 @@ mod tests {
         assert!(matches!(
             materialize_block_pack(&wrong_schema, &rom),
             Err(BlockPackError::UnsupportedSchema { .. })
+        ));
+
+        let mut false_legacy_virtual = pack.clone();
+        false_legacy_virtual.banks[0].blocks[0].rom_space = RomAddressSpace::Virtual;
+        assert!(matches!(
+            materialize_block_pack_with_facts(
+                &false_legacy_virtual,
+                &rom,
+                Some(&crate::facts::FactDb::new()),
+            ),
+            Err(BlockPackError::LegacySchemaVirtualBacking {
+                bank,
+                start_va: ENTRY_PC,
+            }) if bank == "resident"
         ));
 
         let mut malformed = pack;

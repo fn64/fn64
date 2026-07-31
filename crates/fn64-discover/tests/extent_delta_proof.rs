@@ -21,7 +21,14 @@ fn the_proof_rejects_known_false_positives() {
     };
     let config = DeltaVoteConfig::default();
     let false_positives = [
-        0x0a65000u32, 0x0bf60d0, 0x10709a0, 0x12009a0, 0x12089a0, 0x12da9a0, 0x19dc9a0, 0x1b749a0,
+        0x0a65000u32,
+        0x0bf60d0,
+        0x10709a0,
+        0x12009a0,
+        0x12089a0,
+        0x12da9a0,
+        0x19dc9a0,
+        0x1b749a0,
     ];
     for start in false_positives {
         let proved = prove_region(&bytes, start, start + 0x2000, &config);
@@ -60,7 +67,10 @@ fn whole_extents_admit_where_fixed_windows_cannot() {
     let span2 = prove_region(&bytes, 0xa69000, 0xac1000, &config)
         .expect("WCW's 352 KiB image must admit over its whole extent");
     assert_eq!(span2.va_start, 0x8008_f750);
-    assert!(!span2.full_sweep_required, "span2 admits without escalation");
+    assert!(
+        !span2.full_sweep_required,
+        "span2 admits without escalation"
+    );
 
     let span1 = prove_region(&bytes, 0xa21000, 0xa57000, &config)
         .expect("WCW's 216 KiB image must admit once the candidate set is widened");

@@ -644,6 +644,121 @@ pub struct DeterministicDigest {
     pub root_sha256: String,
 }
 
+/// Operational-only component identities for localizing deterministic A/B
+/// divergence. These digests reuse the release gate's canonical device,
+/// executor, and ABI-host wires, but carry no release-gate authority and omit
+/// program evidence deliberately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationalStateComponentDigestsV1 {
+    pub device_sha256: [u8; 32],
+    pub executor_sha256: [u8; 32],
+    pub abi_host_sha256: [u8; 32],
+}
+
+pub const OPERATIONAL_STATE_COMPONENT_DIGEST_SCHEMA_V1: &str =
+    "fn64.operational-state-component-digests.v1";
+
+/// Operational identities for the latest canonical guest-thread
+/// publications. CPU and continuation bytes are domain-separated so a
+/// divergence can be localized without granting either digest release-gate
+/// authority.
+#[cfg(feature = "recomp-rs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationalThreadPublicationDigestsV1 {
+    pub cpu_sha256: [u8; 32],
+    pub continuation_sha256: [u8; 32],
+    pub publication_count: u64,
+    pub exact_count: u64,
+    /// Total non-comparable publication count across every opaque variant.
+    pub opaque_count: u64,
+    pub opaque_host_count: u64,
+    pub parked_fault_count: u64,
+    pub returned_count: u64,
+}
+
+#[cfg(feature = "recomp-rs")]
+pub const OPERATIONAL_THREAD_PUBLICATION_DIGEST_SCHEMA_V1: &str =
+    "fn64.operational-thread-publication-digests.v1";
+
+/// Partition-invariant operational identities for canonical guest-thread
+/// publications. Unlike v1, the continuation digest does not bind the most
+/// recent dispatch slice's charge. It still binds cumulative canonical
+/// charge and every resumable continuation field.
+#[cfg(feature = "recomp-rs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationalThreadPublicationDigestsV2 {
+    pub cpu_sha256: [u8; 32],
+    pub continuation_sha256: [u8; 32],
+    pub publication_count: u64,
+    pub exact_count: u64,
+    /// Total non-comparable publication count across every opaque variant.
+    pub opaque_count: u64,
+    pub opaque_host_count: u64,
+    pub parked_fault_count: u64,
+    pub returned_count: u64,
+}
+
+#[cfg(feature = "recomp-rs")]
+pub const OPERATIONAL_THREAD_PUBLICATION_DIGEST_SCHEMA_V2: &str =
+    "fn64.operational-thread-publication-digests.v2";
+
+#[cfg(feature = "recomp-rs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationalThreadPublicationDigestErrorV1 {
+    NonStrictThreadOrder {
+        index: usize,
+        previous: fn64_runtime::ThreadId,
+        current: fn64_runtime::ThreadId,
+    },
+    IncoherentPreparedContinuation {
+        thread: fn64_runtime::ThreadId,
+    },
+    InvalidExactCheckpointCharge {
+        thread: fn64_runtime::ThreadId,
+    },
+    PendingCop0TimingWrite {
+        thread: fn64_runtime::ThreadId,
+    },
+    ParkedFaultIsNotArchitecturalException {
+        thread: fn64_runtime::ThreadId,
+    },
+}
+
+#[cfg(feature = "recomp-rs")]
+impl fmt::Display for OperationalThreadPublicationDigestErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonStrictThreadOrder {
+                index,
+                previous,
+                current,
+            } => write!(
+                formatter,
+                "canonical thread publications are not in strict ThreadId order at index {index}: {previous} then {current}"
+            ),
+            Self::IncoherentPreparedContinuation { thread } => write!(
+                formatter,
+                "canonical thread {thread} prepared continuation does not match its pending exit"
+            ),
+            Self::InvalidExactCheckpointCharge { thread } => write!(
+                formatter,
+                "canonical thread {thread} exact checkpoint has an impossible instruction charge"
+            ),
+            Self::PendingCop0TimingWrite { thread } => write!(
+                formatter,
+                "canonical thread {thread} publication retains a pending COP0 Count/Compare write"
+            ),
+            Self::ParkedFaultIsNotArchitecturalException { thread } => write!(
+                formatter,
+                "canonical thread {thread} parked-fault publication is not an architectural exception"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "recomp-rs")]
+impl std::error::Error for OperationalThreadPublicationDigestErrorV1 {}
+
 /// Builder that rejects samples from any cycle other than its declared gate.
 pub struct FixedCycleDigestGate {
     guest_cycle: u64,
@@ -4041,6 +4156,10 @@ fn encode_program(out: &mut Vec<u8>, snapshot: crate::ProgramEvidenceSnapshot) {
                     push_u64(out, region.active_generation);
                     push_u64(out, region.next_generation);
                     out.extend_from_slice(&region.builder_artifact_identity.bytes());
+                    out.push(match region.activation {
+                        fn64_abi::recompiled::ExecutableActivationEvidence::EagerPublication => 0,
+                        fn64_abi::recompiled::ExecutableActivationEvidence::FetchBoundary => 1,
+                    });
                 }
                 push_u64(out, pending_executable_writes.len() as u64);
                 for write in pending_executable_writes {
@@ -4052,12 +4171,7 @@ fn encode_program(out: &mut Vec<u8>, snapshot: crate::ProgramEvidenceSnapshot) {
     }
 }
 
-fn try_encode_device_snapshot(
-    snapshot: DeviceEvidenceSnapshot,
-    executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
-    host: fn64_abi::AbiHostEvidenceSnapshot,
-    program: crate::ProgramEvidenceSnapshot,
-) -> Result<Vec<u8>, GateError> {
+fn try_encode_device_component_v15(snapshot: DeviceEvidenceSnapshot) -> Result<Vec<u8>, GateError> {
     const DPC_COUNTER_MASK: u32 = 0x00ff_ffff;
     for (register, value) in [
         ("DPC_CLOCK", snapshot.guest.dpc_clock),
@@ -4199,8 +4313,573 @@ fn try_encode_device_snapshot(
         }
         None => out.push(0),
     }
-    encode_executor_control(&mut out, executor);
-    encode_abi_host(&mut out, host);
+    Ok(out)
+}
+
+fn encode_executor_control_component(
+    snapshot: fn64_runtime::ExecutorControlEvidenceSnapshot,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_executor_control(&mut out, snapshot);
+    out
+}
+
+fn encode_abi_host_component(snapshot: fn64_abi::AbiHostEvidenceSnapshot) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_abi_host(&mut out, snapshot);
+    out
+}
+
+fn operational_component_sha256(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(OPERATIONAL_STATE_COMPONENT_DIGEST_SCHEMA_V1.as_bytes());
+    digest.update([0]);
+    digest.update(domain);
+    digest.update([0]);
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
+/// Hash canonical release-gate state components independently for an
+/// operational A/B comparison. This API cannot import program evidence or
+/// construct any release report, digest artifact, or closure authority.
+pub fn operational_state_component_digests_v1(
+    snapshot: DeviceEvidenceSnapshot,
+    executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
+    host: fn64_abi::AbiHostEvidenceSnapshot,
+) -> Result<OperationalStateComponentDigestsV1, GateError> {
+    let device = try_encode_device_component_v15(snapshot)?;
+    let executor = encode_executor_control_component(executor);
+    let abi_host = encode_abi_host_component(host);
+    Ok(OperationalStateComponentDigestsV1 {
+        device_sha256: operational_component_sha256(b"device", &device),
+        executor_sha256: operational_component_sha256(b"executor", &executor),
+        abi_host_sha256: operational_component_sha256(b"abi-host", &abi_host),
+    })
+}
+
+#[cfg(feature = "recomp-rs")]
+fn encode_publication_cpu_snapshot(
+    out: &mut Vec<u8>,
+    snapshot: &fn64_recomp_rs::RecompContextEvidenceSnapshotV1,
+    thread: fn64_runtime::ThreadId,
+    include_executor_mirrors: bool,
+) -> Result<(), OperationalThreadPublicationDigestErrorV1> {
+    for value in snapshot.gprs {
+        push_u64(out, value);
+    }
+    push_u64(out, snapshot.hi);
+    push_u64(out, snapshot.lo);
+    for value in snapshot.physical_fgrs {
+        push_u64(out, value);
+    }
+    out.push(u8::from(snapshot.fpu_cond));
+    push_u32(out, snapshot.fcsr);
+    match snapshot.ll_reservation {
+        Some((address, width)) => {
+            out.push(1);
+            push_u64(out, address);
+            out.push(width);
+        }
+        None => out.push(0),
+    }
+    if include_executor_mirrors {
+        push_u32(out, snapshot.cop0_count);
+        push_u32(out, snapshot.cop0_compare);
+        push_option_u32(out, snapshot.cop0_count_write);
+        push_option_u32(out, snapshot.cop0_compare_write);
+    } else if snapshot.cop0_count_write.is_some() || snapshot.cop0_compare_write.is_some() {
+        return Err(OperationalThreadPublicationDigestErrorV1::PendingCop0TimingWrite { thread });
+    }
+    out.push(u8::from(snapshot.cop0_cond));
+    push_u32(out, snapshot.cop0_status);
+    let cop0_cause = if include_executor_mirrors {
+        snapshot.cop0_cause
+    } else {
+        snapshot.cop0_cause
+            & !(fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
+                | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit())
+    };
+    push_u32(out, cop0_cause);
+    push_u32(out, snapshot.cop0_epc);
+    push_u32(out, snapshot.cop0_error_epc);
+    push_u64(out, snapshot.cop0_badvaddr);
+    push_u32(out, snapshot.cop0_context);
+    push_u64(out, snapshot.cop0_xcontext);
+    push_u32(out, snapshot.cop0_index);
+    for entry in snapshot.tlb_entries {
+        push_u32(out, entry.page_mask);
+        push_u64(out, entry.entry_hi);
+        push_u32(out, entry.entry_lo0);
+        push_u32(out, entry.entry_lo1);
+    }
+    push_u32(out, snapshot.cop0_entry_lo0);
+    push_u32(out, snapshot.cop0_entry_lo1);
+    push_u32(out, snapshot.cop0_page_mask);
+    push_u32(out, snapshot.cop0_wired);
+    push_u64(out, snapshot.cop0_entry_hi);
+    push_u32(out, snapshot.cop0_random_phase);
+    push_u32(out, snapshot.cop0_watch_lo);
+    push_u32(out, snapshot.cop0_watch_hi);
+    push_u32(out, snapshot.os_interrupt_mask);
+    push_option_u32(out, snapshot.thread_return_pc);
+    Ok(())
+}
+
+#[cfg(feature = "recomp-rs")]
+fn publication_thread_v1(
+    publication: &fn64_abi::recompiled::CanonicalThreadPublicationV1,
+) -> fn64_runtime::ThreadId {
+    match publication {
+        fn64_abi::recompiled::CanonicalThreadPublicationV1::Exact(checkpoint) => checkpoint.thread,
+        fn64_abi::recompiled::CanonicalThreadPublicationV1::OpaqueHostInFlight {
+            thread, ..
+        }
+        | fn64_abi::recompiled::CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            thread, ..
+        }
+        | fn64_abi::recompiled::CanonicalThreadPublicationV1::Returned { thread, .. } => *thread,
+    }
+}
+
+#[cfg(feature = "recomp-rs")]
+fn encode_execution_key_v1(out: &mut Vec<u8>, key: fn64_recomp_rs::ExecutionKey) {
+    push_u64(out, key.bank.get());
+    push_u32(out, key.pc.get());
+}
+
+#[cfg(feature = "recomp-rs")]
+fn encode_instruction_identity_v1(
+    out: &mut Vec<u8>,
+    identity: fn64_recomp_rs::InstructionWordIdentity,
+) {
+    push_u64(out, identity.bank.get());
+    push_u32(out, identity.physical_address);
+}
+
+#[cfg(feature = "recomp-rs")]
+fn cpu_exception_tag_v1(exception: fn64_recomp_rs::CpuException) -> u8 {
+    use fn64_recomp_rs::CpuException;
+    match exception {
+        CpuException::TlbModified => 0,
+        CpuException::TlbRefillLoad => 1,
+        CpuException::TlbRefillStore => 2,
+        CpuException::XTlbRefillLoad => 3,
+        CpuException::XTlbRefillStore => 4,
+        CpuException::TlbInvalidLoad => 5,
+        CpuException::TlbInvalidStore => 6,
+        CpuException::AddressErrorLoad => 7,
+        CpuException::AddressErrorStore => 8,
+        CpuException::CoprocessorUnusable => 9,
+        CpuException::Syscall => 10,
+        CpuException::Breakpoint => 11,
+        CpuException::ReservedInstruction => 12,
+        CpuException::Trap => 13,
+        CpuException::IntegerOverflow => 14,
+        CpuException::FloatingPoint => 15,
+    }
+}
+
+#[cfg(feature = "recomp-rs")]
+fn encode_cpu_fault_v1(out: &mut Vec<u8>, fault: fn64_recomp_rs::CpuFault) {
+    use fn64_recomp_rs::CpuFaultKind;
+    encode_execution_key_v1(out, fault.at);
+    match fault.kind {
+        CpuFaultKind::UnalignedPc => out.push(0),
+        CpuFaultKind::UnknownBank => out.push(1),
+        CpuFaultKind::UnmappedPc {
+            bank_start,
+            bank_end,
+        } => {
+            out.push(2);
+            push_u32(out, bank_start);
+            push_u32(out, bank_end);
+        }
+        CpuFaultKind::AmbiguousPc {
+            first_candidate,
+            second_candidate,
+            candidate_count,
+        } => {
+            out.push(3);
+            push_u64(out, first_candidate.get());
+            push_u64(out, second_candidate.get());
+            push_u32(out, candidate_count);
+        }
+        CpuFaultKind::NoActiveGeneration => out.push(4),
+        CpuFaultKind::UnmappedPhysicalInstruction { physical_address } => {
+            out.push(5);
+            push_u32(out, physical_address);
+        }
+        CpuFaultKind::StaleInstructionIdentity { expected, actual } => {
+            out.push(6);
+            encode_instruction_identity_v1(out, expected);
+            encode_instruction_identity_v1(out, actual);
+        }
+        CpuFaultKind::MissingAotEntry => out.push(7),
+        CpuFaultKind::MemoryFault { addr } => {
+            out.push(8);
+            push_u64(out, addr);
+        }
+        CpuFaultKind::UnsupportedInstruction { word } => {
+            out.push(9);
+            push_u32(out, word);
+        }
+        CpuFaultKind::Exception {
+            exception,
+            epc,
+            branch_delay,
+            instruction_code,
+            bad_vaddr,
+            coprocessor,
+        } => {
+            out.push(10);
+            out.push(cpu_exception_tag_v1(exception));
+            push_u32(out, epc.get());
+            out.push(u8::from(branch_delay));
+            push_u32(out, instruction_code);
+            match bad_vaddr {
+                Some(value) => {
+                    out.push(1);
+                    push_u64(out, value);
+                }
+                None => out.push(0),
+            }
+            match coprocessor {
+                Some(value) => {
+                    out.push(1);
+                    out.push(value);
+                }
+                None => out.push(0),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "recomp-rs")]
+fn encode_block_exit_v1(out: &mut Vec<u8>, exit: fn64_recomp_rs::BlockExit) {
+    use fn64_recomp_rs::BlockExit;
+    match exit {
+        BlockExit::Transfer(key) => {
+            out.push(0);
+            encode_execution_key_v1(out, key);
+        }
+        BlockExit::ResolveTransfer {
+            source_bank,
+            target_pc,
+        } => {
+            out.push(1);
+            push_u64(out, source_bank.get());
+            push_u32(out, target_pc.get());
+        }
+        BlockExit::ResolveCall {
+            source_bank,
+            target_pc,
+            resume,
+        } => {
+            out.push(2);
+            push_u64(out, source_bank.get());
+            push_u32(out, target_pc.get());
+            encode_execution_key_v1(out, resume);
+        }
+        BlockExit::HostCall { vram, resume } => {
+            out.push(3);
+            push_u32(out, vram.get());
+            encode_execution_key_v1(out, resume);
+        }
+        BlockExit::ExecutableWrite {
+            source_bank,
+            resume,
+        } => {
+            out.push(4);
+            push_u64(out, source_bank.get());
+            encode_execution_key_v1(out, resume);
+        }
+        BlockExit::ExecutableWriteResolveCall {
+            source_bank,
+            target_pc,
+            resume,
+        } => {
+            out.push(5);
+            push_u64(out, source_bank.get());
+            push_u32(out, target_pc.get());
+            encode_execution_key_v1(out, resume);
+        }
+        BlockExit::ExecutableWriteFault(fault) => {
+            out.push(6);
+            encode_cpu_fault_v1(out, fault);
+        }
+        BlockExit::ImageChanged { at, miss } => {
+            out.push(7);
+            encode_execution_key_v1(out, at);
+            push_u64(out, miss.expected_bank.get());
+            push_u32(out, miss.va_start.get());
+            push_u32(out, miss.byte_len);
+            out.extend_from_slice(&miss.expected_sha256);
+            out.extend_from_slice(&miss.actual_sha256);
+        }
+        BlockExit::Checkpoint(key) => {
+            out.push(8);
+            encode_execution_key_v1(out, key);
+        }
+        BlockExit::Yield(key) => {
+            out.push(9);
+            encode_execution_key_v1(out, key);
+        }
+        BlockExit::ThreadReturn => out.push(10),
+        BlockExit::Fault(fault) => {
+            out.push(11);
+            encode_cpu_fault_v1(out, fault);
+        }
+    }
+}
+
+#[cfg(feature = "recomp-rs")]
+fn operational_thread_publication_sha256(schema: &str, domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(schema.as_bytes());
+    digest.update([0]);
+    digest.update(domain);
+    digest.update([0]);
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
+/// Hash pointer-free canonical guest-thread publications for operational A/B
+/// diagnosis. Input must retain the producer's strict `ThreadId` order;
+/// sorting here would hide duplicated or reordered publications. The result
+/// cannot construct a release report or program/writer authority.
+#[cfg(feature = "recomp-rs")]
+pub fn operational_thread_publication_digests_v1(
+    publications: &[fn64_abi::recompiled::CanonicalThreadPublicationV1],
+) -> Result<OperationalThreadPublicationDigestsV1, OperationalThreadPublicationDigestErrorV1> {
+    operational_thread_publication_digests(
+        publications,
+        OPERATIONAL_THREAD_PUBLICATION_DIGEST_SCHEMA_V1,
+        true,
+    )
+}
+
+/// Hash pointer-free canonical guest-thread publications for operational A/B
+/// diagnosis without making execution partition size or dispatch-entry
+/// hardware mirrors part of equality. The authoritative executor digest owns
+/// Count, Count phase, Compare, and timer state; device/ABI digests own the RCP
+/// line. This digest retains every context-owned CPU field and rejects pending
+/// Count/Compare writes. It is meaningful only alongside equal executor,
+/// device, and ABI component digests. The per-slice charge is still validated
+/// because an impossible checkpoint must not become comparable merely by
+/// omitting that scheduling detail.
+#[cfg(feature = "recomp-rs")]
+pub fn operational_thread_publication_digests_v2(
+    publications: &[fn64_abi::recompiled::CanonicalThreadPublicationV1],
+) -> Result<OperationalThreadPublicationDigestsV2, OperationalThreadPublicationDigestErrorV1> {
+    let digest = operational_thread_publication_digests(
+        publications,
+        OPERATIONAL_THREAD_PUBLICATION_DIGEST_SCHEMA_V2,
+        false,
+    )?;
+    Ok(OperationalThreadPublicationDigestsV2 {
+        cpu_sha256: digest.cpu_sha256,
+        continuation_sha256: digest.continuation_sha256,
+        publication_count: digest.publication_count,
+        exact_count: digest.exact_count,
+        opaque_count: digest.opaque_count,
+        opaque_host_count: digest.opaque_host_count,
+        parked_fault_count: digest.parked_fault_count,
+        returned_count: digest.returned_count,
+    })
+}
+
+#[cfg(feature = "recomp-rs")]
+fn operational_thread_publication_digests(
+    publications: &[fn64_abi::recompiled::CanonicalThreadPublicationV1],
+    schema: &str,
+    include_slice_charge: bool,
+) -> Result<OperationalThreadPublicationDigestsV1, OperationalThreadPublicationDigestErrorV1> {
+    use fn64_abi::recompiled::CanonicalThreadPublicationV1;
+
+    let mut cpu = Vec::new();
+    let mut continuation = Vec::new();
+    push_u64(&mut cpu, publications.len() as u64);
+    push_u64(&mut continuation, publications.len() as u64);
+
+    let mut previous = None;
+    let mut exact_count = 0_u64;
+    let mut opaque_count = 0_u64;
+    let mut opaque_host_count = 0_u64;
+    let mut parked_fault_count = 0_u64;
+    let mut returned_count = 0_u64;
+    for (index, publication) in publications.iter().enumerate() {
+        let thread = publication_thread_v1(publication);
+        if let Some(previous) = previous {
+            if thread <= previous {
+                return Err(
+                    OperationalThreadPublicationDigestErrorV1::NonStrictThreadOrder {
+                        index,
+                        previous,
+                        current: thread,
+                    },
+                );
+            }
+        }
+        previous = Some(thread);
+        push_u32(&mut cpu, thread);
+        push_u32(&mut continuation, thread);
+
+        match publication {
+            CanonicalThreadPublicationV1::Exact(checkpoint) => {
+                if checkpoint.charged_instructions == 0
+                    || checkpoint.canonical_charged_instructions_at_publication
+                        < u64::from(checkpoint.charged_instructions)
+                {
+                    return Err(
+                        OperationalThreadPublicationDigestErrorV1::InvalidExactCheckpointCharge {
+                            thread,
+                        },
+                    );
+                }
+                let prepared_is_coherent = match checkpoint.prepared_continuation {
+                    None => !matches!(
+                        checkpoint.pending_exit,
+                        fn64_recomp_rs::BlockExit::ImageChanged { .. }
+                            | fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+                                kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                                ..
+                            })
+                    ),
+                    Some(fn64_abi::recompiled::CanonicalPreparedContinuationV1::ImageChanged {
+                        entry,
+                    }) => matches!(
+                        checkpoint.pending_exit,
+                        fn64_recomp_rs::BlockExit::ImageChanged { at, .. } if entry.pc == at.pc
+                    ),
+                    Some(
+                        fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
+                            entry,
+                        },
+                    ) => matches!(
+                        checkpoint.pending_exit,
+                        fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+                            at,
+                            kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                            ..
+                        }) if entry.pc == at.pc
+                    ),
+                };
+                if !prepared_is_coherent {
+                    return Err(
+                        OperationalThreadPublicationDigestErrorV1::IncoherentPreparedContinuation {
+                            thread,
+                        },
+                    );
+                }
+                exact_count += 1;
+                cpu.push(1);
+                encode_publication_cpu_snapshot(
+                    &mut cpu,
+                    &checkpoint.cpu,
+                    thread,
+                    include_slice_charge,
+                )?;
+                continuation.push(0);
+                if include_slice_charge {
+                    push_u32(&mut continuation, checkpoint.charged_instructions);
+                }
+                push_u64(
+                    &mut continuation,
+                    checkpoint.canonical_charged_instructions_at_publication,
+                );
+                encode_block_exit_v1(&mut continuation, checkpoint.pending_exit);
+                match checkpoint.prepared_continuation {
+                    None => continuation.push(0),
+                    Some(fn64_abi::recompiled::CanonicalPreparedContinuationV1::ImageChanged {
+                        entry,
+                    }) => {
+                        continuation.push(1);
+                        encode_execution_key_v1(&mut continuation, entry);
+                    }
+                    Some(
+                        fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
+                            entry,
+                        },
+                    ) => {
+                        continuation.push(2);
+                        encode_execution_key_v1(&mut continuation, entry);
+                    }
+                }
+            }
+            CanonicalThreadPublicationV1::OpaqueHostInFlight { target, resume, .. } => {
+                opaque_count += 1;
+                opaque_host_count += 1;
+                cpu.push(0);
+                continuation.push(1);
+                push_u32(&mut continuation, target.get());
+                encode_execution_key_v1(&mut continuation, *resume);
+            }
+            CanonicalThreadPublicationV1::ParkedFaultOpaque {
+                post_exception_cpu,
+                fault,
+                canonical_charged_instructions_at_publication,
+                ..
+            } => {
+                if !matches!(fault.kind, fn64_recomp_rs::CpuFaultKind::Exception { .. }) {
+                    return Err(
+                        OperationalThreadPublicationDigestErrorV1::ParkedFaultIsNotArchitecturalException {
+                            thread,
+                        },
+                    );
+                }
+                opaque_count += 1;
+                parked_fault_count += 1;
+                cpu.push(2);
+                encode_publication_cpu_snapshot(
+                    &mut cpu,
+                    post_exception_cpu,
+                    thread,
+                    include_slice_charge,
+                )?;
+                continuation.push(3);
+                push_u64(
+                    &mut continuation,
+                    *canonical_charged_instructions_at_publication,
+                );
+                encode_cpu_fault_v1(&mut continuation, *fault);
+            }
+            CanonicalThreadPublicationV1::Returned { cpu: snapshot, .. } => {
+                returned_count += 1;
+                cpu.push(1);
+                encode_publication_cpu_snapshot(&mut cpu, snapshot, thread, include_slice_charge)?;
+                continuation.push(2);
+            }
+        }
+    }
+
+    Ok(OperationalThreadPublicationDigestsV1 {
+        cpu_sha256: operational_thread_publication_sha256(schema, b"cpu", &cpu),
+        continuation_sha256: operational_thread_publication_sha256(
+            schema,
+            b"continuation",
+            &continuation,
+        ),
+        publication_count: publications.len() as u64,
+        exact_count,
+        opaque_count,
+        opaque_host_count,
+        parked_fault_count,
+        returned_count,
+    })
+}
+
+fn try_encode_device_snapshot(
+    snapshot: DeviceEvidenceSnapshot,
+    executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
+    host: fn64_abi::AbiHostEvidenceSnapshot,
+    program: crate::ProgramEvidenceSnapshot,
+) -> Result<Vec<u8>, GateError> {
+    let mut out = try_encode_device_component_v15(snapshot)?;
+    out.extend_from_slice(&encode_executor_control_component(executor));
+    out.extend_from_slice(&encode_abi_host_component(host));
     encode_program(&mut out, program);
     Ok(out)
 }
@@ -4981,6 +5660,950 @@ mod tests {
             .expect("test device evidence must be canonical")
     }
 
+    #[test]
+    fn device_state_v15_component_refactor_preserves_golden_wire() {
+        let bytes = encode_device_snapshot(
+            snapshot(42),
+            executor_snapshot(),
+            host_snapshot(),
+            crate::ProgramEvidenceSnapshot::NoProgram,
+        );
+        assert_eq!(bytes.len(), 8_860);
+        assert_eq!(
+            sha256_hex(&bytes),
+            "af9bc08ec9c59caaedd7be646708557d280156af61d5d065520a6c85371a9206"
+        );
+    }
+
+    #[test]
+    fn operational_component_digests_isolate_device_executor_and_abi_host() {
+        let device = snapshot(42);
+        let executor = executor_snapshot();
+        let host = host_snapshot();
+        let baseline =
+            operational_state_component_digests_v1(device.clone(), executor.clone(), host.clone())
+                .unwrap();
+
+        let mut changed_device = device.clone();
+        changed_device.guest.pi_status ^= 1;
+        let changed =
+            operational_state_component_digests_v1(changed_device, executor.clone(), host.clone())
+                .unwrap();
+        assert_ne!(changed.device_sha256, baseline.device_sha256);
+        assert_eq!(changed.executor_sha256, baseline.executor_sha256);
+        assert_eq!(changed.abi_host_sha256, baseline.abi_host_sha256);
+
+        let mut changed_executor = executor.clone();
+        changed_executor.sim_time += 1;
+        let changed =
+            operational_state_component_digests_v1(device.clone(), changed_executor, host.clone())
+                .unwrap();
+        assert_eq!(changed.device_sha256, baseline.device_sha256);
+        assert_ne!(changed.executor_sha256, baseline.executor_sha256);
+        assert_eq!(changed.abi_host_sha256, baseline.abi_host_sha256);
+
+        let mut changed_host = host.clone();
+        changed_host.debug_hardware = fn64_abi::DebugHardware::Msp;
+        let changed =
+            operational_state_component_digests_v1(device, executor, changed_host).unwrap();
+        assert_eq!(changed.device_sha256, baseline.device_sha256);
+        assert_eq!(changed.executor_sha256, baseline.executor_sha256);
+        assert_ne!(changed.abi_host_sha256, baseline.abi_host_sha256);
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    fn publication_cpu_snapshot(seed: u64) -> fn64_recomp_rs::RecompContextEvidenceSnapshotV1 {
+        let mut gprs = [0_u64; 32];
+        let mut physical_fgrs = [0_u64; 32];
+        for (index, value) in gprs.iter_mut().enumerate() {
+            *value = seed.wrapping_add(index as u64);
+        }
+        for (index, value) in physical_fgrs.iter_mut().enumerate() {
+            *value = seed.wrapping_mul(3).wrapping_add(index as u64);
+        }
+        let mut tlb_entries = [fn64_recomp_rs::TlbEntryRaw::default(); 32];
+        tlb_entries[0] = fn64_recomp_rs::TlbEntryRaw {
+            page_mask: seed as u32 ^ 0x0000_6000,
+            entry_hi: seed ^ 0x1234_5678_9abc_def0,
+            entry_lo0: seed as u32 ^ 0x1357_2468,
+            entry_lo1: seed as u32 ^ 0x2468_1357,
+        };
+        tlb_entries[31] = fn64_recomp_rs::TlbEntryRaw {
+            page_mask: 0x01ff_e000,
+            entry_hi: seed.rotate_left(17),
+            entry_lo0: 0x1234,
+            entry_lo1: 0x5678,
+        };
+        fn64_recomp_rs::RecompContextEvidenceSnapshotV1 {
+            gprs,
+            hi: seed ^ 0x1111,
+            lo: seed ^ 0x2222,
+            physical_fgrs,
+            fpu_cond: seed & 1 != 0,
+            fcsr: seed as u32 ^ 0x0102_0304,
+            ll_reservation: Some((seed ^ 0x8000_0000, 8)),
+            cop0_count: seed as u32 + 1,
+            cop0_compare: seed as u32 + 2,
+            cop0_count_write: Some(seed as u32 + 3),
+            cop0_compare_write: None,
+            cop0_cond: seed & 2 != 0,
+            cop0_status: seed as u32 ^ 0x0405_0607,
+            cop0_cause: seed as u32 ^ 0x0809_0a0b,
+            cop0_epc: seed as u32 ^ 0x8000_0100,
+            cop0_error_epc: seed as u32 ^ 0x8000_0200,
+            cop0_badvaddr: seed ^ 0xffff_ffff_8000_0300,
+            cop0_context: seed as u32 ^ 0x0c0d_0e0f,
+            cop0_xcontext: seed ^ 0x1011_1213_1415_1617,
+            cop0_index: seed as u32 & 31,
+            tlb_entries,
+            cop0_entry_lo0: seed as u32 ^ 0x1819_1a1b,
+            cop0_entry_lo1: seed as u32 ^ 0x1c1d_1e1f,
+            cop0_page_mask: seed as u32 ^ 0x0020_2000,
+            cop0_wired: seed as u32 & 31,
+            cop0_entry_hi: seed ^ 0x2021_2223_2425_2627,
+            cop0_random_phase: seed as u32 & 31,
+            cop0_watch_lo: seed as u32 ^ 0x2829_2a2b,
+            cop0_watch_hi: seed as u32 ^ 0x2c2d_2e2f,
+            os_interrupt_mask: seed as u32 ^ 0x3031_3233,
+            thread_return_pc: Some(seed as u32 ^ 0xffff_fffc),
+        }
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    fn publication_cpu_snapshot_without_pending_timing(
+        seed: u64,
+    ) -> fn64_recomp_rs::RecompContextEvidenceSnapshotV1 {
+        let mut snapshot = publication_cpu_snapshot(seed);
+        snapshot.cop0_count_write = None;
+        snapshot.cop0_compare_write = None;
+        snapshot
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    fn publication_key(bank: u64, pc: u32) -> fn64_recomp_rs::ExecutionKey {
+        fn64_recomp_rs::ExecutionKey::new(
+            fn64_recomp_rs::BankId::new(bank),
+            fn64_recomp_rs::GuestPc::new(pc),
+        )
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    fn publication_digest_hex(digest: [u8; 32]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    #[test]
+    fn operational_thread_publication_digests_have_stable_golden_wire() {
+        use fn64_abi::recompiled::{
+            CanonicalThreadCheckpointEvidenceV1, CanonicalThreadPublicationV1,
+        };
+
+        let publications = vec![
+            CanonicalThreadPublicationV1::Exact(CanonicalThreadCheckpointEvidenceV1 {
+                thread: 1,
+                cpu: publication_cpu_snapshot(0x1020_3040_5060_7080),
+                charged_instructions: 7,
+                canonical_charged_instructions_at_publication: 0x0102_0304_0506_0708,
+                pending_exit: fn64_recomp_rs::BlockExit::ResolveCall {
+                    source_bank: fn64_recomp_rs::BankId::new(0x1122_3344_5566_7788),
+                    target_pc: fn64_recomp_rs::GuestPc::new(0x8000_1000),
+                    resume: publication_key(9, 0x8000_1008),
+                },
+                prepared_continuation: None,
+            }),
+            CanonicalThreadPublicationV1::Exact(CanonicalThreadCheckpointEvidenceV1 {
+                thread: 2,
+                cpu: publication_cpu_snapshot(0x2030_4050_6070_8090),
+                charged_instructions: 3,
+                canonical_charged_instructions_at_publication: 0x1112_1314_1516_1718,
+                pending_exit: fn64_recomp_rs::BlockExit::ImageChanged {
+                    at: publication_key(11, 0x8000_1800),
+                    miss: fn64_recomp_rs::AotMiss {
+                        expected_bank: fn64_recomp_rs::BankId::new(11),
+                        va_start: fn64_recomp_rs::GuestPc::new(0x8000_1800),
+                        byte_len: 4,
+                        expected_sha256: [0x21; 32],
+                        actual_sha256: [0x22; 32],
+                    },
+                },
+                prepared_continuation: Some(
+                    fn64_abi::recompiled::CanonicalPreparedContinuationV1::ImageChanged {
+                        entry: publication_key(12, 0x8000_1800),
+                    },
+                ),
+            }),
+            CanonicalThreadPublicationV1::Exact(CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot(0x3040_5060_7080_90a0),
+                charged_instructions: 5,
+                canonical_charged_instructions_at_publication: 0x2122_2324_2526_2728,
+                pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+                    at: publication_key(13, 0x8000_1a00),
+                    kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                }),
+                prepared_continuation: Some(
+                    fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
+                        entry: publication_key(14, 0x8000_1a00),
+                    },
+                ),
+            }),
+            CanonicalThreadPublicationV1::OpaqueHostInFlight {
+                thread: 4,
+                target: fn64_recomp_rs::GuestPc::new(0x8000_2000),
+                resume: publication_key(10, 0x8000_2008),
+            },
+            CanonicalThreadPublicationV1::ParkedFaultOpaque {
+                thread: 7,
+                post_exception_cpu: publication_cpu_snapshot(0x7080_90a0_b0c0_d0e0),
+                fault: fn64_recomp_rs::CpuFault {
+                    at: publication_key(15, 0x8000_2800),
+                    kind: fn64_recomp_rs::CpuFaultKind::Exception {
+                        exception: fn64_recomp_rs::CpuException::Breakpoint,
+                        epc: fn64_recomp_rs::GuestPc::new(0x8000_2800),
+                        branch_delay: false,
+                        instruction_code: 0x1020_3040,
+                        bad_vaddr: None,
+                        coprocessor: None,
+                    },
+                },
+                canonical_charged_instructions_at_publication: 0x3132_3334_3536_3738,
+            },
+            CanonicalThreadPublicationV1::Returned {
+                thread: 9,
+                cpu: publication_cpu_snapshot(0x8877_6655_4433_2211),
+            },
+        ];
+
+        let digests = operational_thread_publication_digests_v1(&publications).unwrap();
+        assert_eq!(digests.publication_count, 6);
+        assert_eq!(digests.exact_count, 3);
+        assert_eq!(digests.opaque_count, 2);
+        assert_eq!(digests.opaque_host_count, 1);
+        assert_eq!(digests.parked_fault_count, 1);
+        assert_eq!(digests.returned_count, 1);
+        assert_eq!(
+            publication_digest_hex(digests.cpu_sha256),
+            "c73038499cc70ece7de7c98ff89f6f10fbc966045eb120a6a3f557d42735f5ae"
+        );
+        assert_eq!(
+            publication_digest_hex(digests.continuation_sha256),
+            "859d218a586ae04426c0f4ec18cab9a8f3ffedbc9a587670a44f224c8c415f08"
+        );
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    #[test]
+    fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
+        use fn64_abi::recompiled::{
+            CanonicalThreadCheckpointEvidenceV1, CanonicalThreadPublicationV1,
+        };
+
+        let baseline_publications = vec![CanonicalThreadPublicationV1::Exact(
+            CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot(11),
+                charged_instructions: 2,
+                canonical_charged_instructions_at_publication: 101,
+                pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+                    5,
+                    0x8000_3000,
+                )),
+                prepared_continuation: None,
+            },
+        )];
+        let baseline = operational_thread_publication_digests_v1(&baseline_publications).unwrap();
+
+        let mut changed_cpu = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_cpu[0] else {
+            unreachable!();
+        };
+        checkpoint.cpu.tlb_entries[31].entry_lo1 ^= 1;
+        let changed_cpu = operational_thread_publication_digests_v1(&changed_cpu).unwrap();
+        assert_ne!(changed_cpu.cpu_sha256, baseline.cpu_sha256);
+        assert_eq!(
+            changed_cpu.continuation_sha256,
+            baseline.continuation_sha256
+        );
+
+        let mut changed_continuation = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_continuation[0] else {
+            unreachable!();
+        };
+        checkpoint.charged_instructions += 1;
+        checkpoint.canonical_charged_instructions_at_publication += 1;
+        checkpoint.pending_exit = fn64_recomp_rs::BlockExit::Yield(publication_key(5, 0x8000_3004));
+        let changed_continuation =
+            operational_thread_publication_digests_v1(&changed_continuation).unwrap();
+        assert_eq!(changed_continuation.cpu_sha256, baseline.cpu_sha256);
+        assert_ne!(
+            changed_continuation.continuation_sha256,
+            baseline.continuation_sha256
+        );
+
+        let mut changed_cumulative = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_cumulative[0] else {
+            unreachable!();
+        };
+        checkpoint.canonical_charged_instructions_at_publication += 1;
+        let changed_cumulative =
+            operational_thread_publication_digests_v1(&changed_cumulative).unwrap();
+        assert_eq!(changed_cumulative.cpu_sha256, baseline.cpu_sha256);
+        assert_ne!(
+            changed_cumulative.continuation_sha256,
+            baseline.continuation_sha256
+        );
+
+        let mut image_base_publications = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut image_base_publications[0]
+        else {
+            unreachable!();
+        };
+        checkpoint.pending_exit = fn64_recomp_rs::BlockExit::ImageChanged {
+            at: publication_key(7, 0x8000_3800),
+            miss: fn64_recomp_rs::AotMiss {
+                expected_bank: fn64_recomp_rs::BankId::new(7),
+                va_start: fn64_recomp_rs::GuestPc::new(0x8000_3800),
+                byte_len: 4,
+                expected_sha256: [0x31; 32],
+                actual_sha256: [0x32; 32],
+            },
+        };
+        checkpoint.prepared_continuation = Some(
+            fn64_abi::recompiled::CanonicalPreparedContinuationV1::ImageChanged {
+                entry: publication_key(7, 0x8000_3800),
+            },
+        );
+        let image_base =
+            operational_thread_publication_digests_v1(&image_base_publications).unwrap();
+        let mut changed_prepared = image_base_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_prepared[0] else {
+            unreachable!();
+        };
+        checkpoint.prepared_continuation = Some(
+            fn64_abi::recompiled::CanonicalPreparedContinuationV1::ImageChanged {
+                entry: publication_key(8, 0x8000_3800),
+            },
+        );
+        let changed_prepared =
+            operational_thread_publication_digests_v1(&changed_prepared).unwrap();
+        assert_eq!(changed_prepared.cpu_sha256, image_base.cpu_sha256);
+        assert_ne!(
+            changed_prepared.continuation_sha256,
+            image_base.continuation_sha256
+        );
+
+        let mut inactive_base_publications = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut inactive_base_publications[0]
+        else {
+            unreachable!();
+        };
+        checkpoint.pending_exit = fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+            at: publication_key(7, 0x8000_3800),
+            kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+        });
+        checkpoint.prepared_continuation = Some(
+            fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
+                entry: publication_key(7, 0x8000_3800),
+            },
+        );
+        let inactive_base =
+            operational_thread_publication_digests_v1(&inactive_base_publications).unwrap();
+        let mut changed_inactive_prepared = inactive_base_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_inactive_prepared[0]
+        else {
+            unreachable!();
+        };
+        checkpoint.prepared_continuation = Some(
+            fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
+                entry: publication_key(8, 0x8000_3800),
+            },
+        );
+        let changed_inactive_prepared =
+            operational_thread_publication_digests_v1(&changed_inactive_prepared).unwrap();
+        assert_eq!(
+            changed_inactive_prepared.cpu_sha256,
+            inactive_base.cpu_sha256
+        );
+        assert_ne!(
+            changed_inactive_prepared.continuation_sha256,
+            inactive_base.continuation_sha256
+        );
+
+        let opaque_a = [CanonicalThreadPublicationV1::OpaqueHostInFlight {
+            thread: 3,
+            target: fn64_recomp_rs::GuestPc::new(0x8000_4000),
+            resume: publication_key(6, 0x8000_4008),
+        }];
+        let opaque_b = [CanonicalThreadPublicationV1::OpaqueHostInFlight {
+            thread: 3,
+            target: fn64_recomp_rs::GuestPc::new(0x8000_5000),
+            resume: publication_key(6, 0x8000_5008),
+        }];
+        let opaque_a = operational_thread_publication_digests_v1(&opaque_a).unwrap();
+        let opaque_b = operational_thread_publication_digests_v1(&opaque_b).unwrap();
+        assert_eq!(opaque_a.cpu_sha256, opaque_b.cpu_sha256);
+        assert_ne!(opaque_a.continuation_sha256, opaque_b.continuation_sha256);
+
+        let parked = [CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            thread: 3,
+            post_exception_cpu: publication_cpu_snapshot(41),
+            fault: fn64_recomp_rs::CpuFault {
+                at: publication_key(8, 0x8000_6000),
+                kind: fn64_recomp_rs::CpuFaultKind::Exception {
+                    exception: fn64_recomp_rs::CpuException::Breakpoint,
+                    epc: fn64_recomp_rs::GuestPc::new(0x8000_6000),
+                    branch_delay: false,
+                    instruction_code: 0x1234,
+                    bad_vaddr: None,
+                    coprocessor: None,
+                },
+            },
+            canonical_charged_instructions_at_publication: 44,
+        }];
+        let parked_digest = operational_thread_publication_digests_v1(&parked).unwrap();
+        assert_eq!(parked_digest.exact_count, 0);
+        assert_eq!(parked_digest.opaque_count, 1);
+        assert_eq!(parked_digest.opaque_host_count, 0);
+        assert_eq!(parked_digest.parked_fault_count, 1);
+
+        let mut changed_parked_cpu = parked.clone();
+        let CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            post_exception_cpu, ..
+        } = &mut changed_parked_cpu[0]
+        else {
+            unreachable!();
+        };
+        *post_exception_cpu = publication_cpu_snapshot(42);
+        let changed_parked_cpu =
+            operational_thread_publication_digests_v1(&changed_parked_cpu).unwrap();
+        assert_ne!(changed_parked_cpu.cpu_sha256, parked_digest.cpu_sha256);
+        assert_eq!(
+            changed_parked_cpu.continuation_sha256,
+            parked_digest.continuation_sha256
+        );
+
+        let mut changed_parked_fault = parked.clone();
+        let CanonicalThreadPublicationV1::ParkedFaultOpaque { fault, .. } =
+            &mut changed_parked_fault[0]
+        else {
+            unreachable!();
+        };
+        let fn64_recomp_rs::CpuFaultKind::Exception {
+            instruction_code, ..
+        } = &mut fault.kind
+        else {
+            unreachable!();
+        };
+        *instruction_code = 0x5678;
+        let changed_parked_fault =
+            operational_thread_publication_digests_v1(&changed_parked_fault).unwrap();
+        assert_eq!(changed_parked_fault.cpu_sha256, parked_digest.cpu_sha256);
+        assert_ne!(
+            changed_parked_fault.continuation_sha256,
+            parked_digest.continuation_sha256
+        );
+
+        let mut changed_parked_cumulative = parked.clone();
+        let CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            canonical_charged_instructions_at_publication,
+            ..
+        } = &mut changed_parked_cumulative[0]
+        else {
+            unreachable!();
+        };
+        *canonical_charged_instructions_at_publication += 1;
+        let changed_parked_cumulative =
+            operational_thread_publication_digests_v1(&changed_parked_cumulative).unwrap();
+        assert_eq!(
+            changed_parked_cumulative.cpu_sha256,
+            parked_digest.cpu_sha256
+        );
+        assert_ne!(
+            changed_parked_cumulative.continuation_sha256,
+            parked_digest.continuation_sha256
+        );
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    #[test]
+    fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitioning() {
+        use fn64_abi::recompiled::{
+            CanonicalPreparedContinuationV1, CanonicalThreadCheckpointEvidenceV1,
+            CanonicalThreadPublicationV1,
+        };
+
+        let baseline_publications = vec![CanonicalThreadPublicationV1::Exact(
+            CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot_without_pending_timing(11),
+                charged_instructions: 2,
+                canonical_charged_instructions_at_publication: 101,
+                pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+                    5,
+                    0x8000_3000,
+                )),
+                prepared_continuation: None,
+            },
+        )];
+        let baseline = operational_thread_publication_digests_v2(&baseline_publications).unwrap();
+
+        let mut changed_slice = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_slice[0] else {
+            unreachable!();
+        };
+        checkpoint.charged_instructions = 3;
+        checkpoint.cpu.cop0_count ^= 0x0102_0304;
+        checkpoint.cpu.cop0_compare ^= 0x1020_3040;
+        checkpoint.cpu.cop0_cause ^= fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
+            | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit();
+        assert_eq!(
+            operational_thread_publication_digests_v2(&changed_slice).unwrap(),
+            baseline
+        );
+        assert_ne!(
+            operational_thread_publication_digests_v1(&changed_slice)
+                .unwrap()
+                .cpu_sha256,
+            operational_thread_publication_digests_v1(&baseline_publications)
+                .unwrap()
+                .cpu_sha256
+        );
+        assert_ne!(
+            operational_thread_publication_digests_v1(&changed_slice)
+                .unwrap()
+                .continuation_sha256,
+            operational_thread_publication_digests_v1(&baseline_publications)
+                .unwrap()
+                .continuation_sha256
+        );
+
+        let mut changed_cumulative = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_cumulative[0] else {
+            unreachable!();
+        };
+        checkpoint.canonical_charged_instructions_at_publication += 1;
+        let changed_cumulative =
+            operational_thread_publication_digests_v2(&changed_cumulative).unwrap();
+        assert_eq!(changed_cumulative.cpu_sha256, baseline.cpu_sha256);
+        assert_ne!(
+            changed_cumulative.continuation_sha256,
+            baseline.continuation_sha256
+        );
+
+        let mut changed_cpu = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_cpu[0] else {
+            unreachable!();
+        };
+        checkpoint.cpu.gprs[1] ^= 1;
+        let changed_cpu = operational_thread_publication_digests_v2(&changed_cpu).unwrap();
+        assert_ne!(changed_cpu.cpu_sha256, baseline.cpu_sha256);
+        assert_eq!(
+            changed_cpu.continuation_sha256,
+            baseline.continuation_sha256
+        );
+
+        let owned_cpu_changes: [fn(&mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1); 3] = [
+            |cpu: &mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1| cpu.cop0_status ^= 1,
+            |cpu: &mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1| cpu.cop0_random_phase ^= 1,
+            |cpu: &mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1| cpu.cop0_cause ^= 1 << 8,
+        ];
+        for change in owned_cpu_changes {
+            let mut changed_owned_cpu = baseline_publications.clone();
+            let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_owned_cpu[0] else {
+                unreachable!();
+            };
+            change(&mut checkpoint.cpu);
+            let changed_owned_cpu =
+                operational_thread_publication_digests_v2(&changed_owned_cpu).unwrap();
+            assert_ne!(changed_owned_cpu.cpu_sha256, baseline.cpu_sha256);
+            assert_eq!(
+                changed_owned_cpu.continuation_sha256,
+                baseline.continuation_sha256
+            );
+        }
+
+        for count_write in [true, false] {
+            let mut pending_timing_write = baseline_publications.clone();
+            let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut pending_timing_write[0]
+            else {
+                unreachable!();
+            };
+            if count_write {
+                checkpoint.cpu.cop0_count_write = Some(1);
+            } else {
+                checkpoint.cpu.cop0_compare_write = Some(1);
+            }
+            assert!(matches!(
+                operational_thread_publication_digests_v2(&pending_timing_write),
+                Err(
+                    OperationalThreadPublicationDigestErrorV1::PendingCop0TimingWrite { thread: 3 }
+                )
+            ));
+        }
+
+        let mut changed_pending_pc = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_pending_pc[0] else {
+            unreachable!();
+        };
+        checkpoint.pending_exit =
+            fn64_recomp_rs::BlockExit::Checkpoint(publication_key(5, 0x8000_3004));
+        let changed_pending_pc =
+            operational_thread_publication_digests_v2(&changed_pending_pc).unwrap();
+        assert_eq!(changed_pending_pc.cpu_sha256, baseline.cpu_sha256);
+        assert_ne!(
+            changed_pending_pc.continuation_sha256,
+            baseline.continuation_sha256
+        );
+
+        let mut image_publications = baseline_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut image_publications[0] else {
+            unreachable!();
+        };
+        checkpoint.pending_exit = fn64_recomp_rs::BlockExit::ImageChanged {
+            at: publication_key(7, 0x8000_3800),
+            miss: fn64_recomp_rs::AotMiss {
+                expected_bank: fn64_recomp_rs::BankId::new(7),
+                va_start: fn64_recomp_rs::GuestPc::new(0x8000_3800),
+                byte_len: 4,
+                expected_sha256: [0x31; 32],
+                actual_sha256: [0x32; 32],
+            },
+        };
+        checkpoint.prepared_continuation = Some(CanonicalPreparedContinuationV1::ImageChanged {
+            entry: publication_key(7, 0x8000_3800),
+        });
+        let image = operational_thread_publication_digests_v2(&image_publications).unwrap();
+        let mut changed_prepared = image_publications.clone();
+        let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut changed_prepared[0] else {
+            unreachable!();
+        };
+        checkpoint.prepared_continuation = Some(CanonicalPreparedContinuationV1::ImageChanged {
+            entry: publication_key(8, 0x8000_3800),
+        });
+        let changed_prepared =
+            operational_thread_publication_digests_v2(&changed_prepared).unwrap();
+        assert_eq!(changed_prepared.cpu_sha256, image.cpu_sha256);
+        assert_ne!(
+            changed_prepared.continuation_sha256,
+            image.continuation_sha256
+        );
+
+        for charged_instructions in [0, 102] {
+            let mut invalid = baseline_publications.clone();
+            let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut invalid[0] else {
+                unreachable!();
+            };
+            checkpoint.charged_instructions = charged_instructions;
+            assert!(matches!(
+                operational_thread_publication_digests_v2(&invalid),
+                Err(
+                    OperationalThreadPublicationDigestErrorV1::InvalidExactCheckpointCharge {
+                        thread: 3
+                    }
+                )
+            ));
+        }
+
+        let returned = [CanonicalThreadPublicationV1::Returned {
+            thread: 3,
+            cpu: publication_cpu_snapshot_without_pending_timing(17),
+        }];
+        let returned_baseline = operational_thread_publication_digests_v2(&returned).unwrap();
+        let mut returned_mirrors = returned.clone();
+        if let CanonicalThreadPublicationV1::Returned { cpu, .. } = &mut returned_mirrors[0] {
+            cpu.cop0_count ^= 1;
+            cpu.cop0_compare ^= 1;
+            cpu.cop0_cause ^= fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
+                | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit();
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            operational_thread_publication_digests_v2(&returned_mirrors).unwrap(),
+            returned_baseline
+        );
+        let CanonicalThreadPublicationV1::Returned { cpu, .. } = &mut returned_mirrors[0] else {
+            unreachable!();
+        };
+        cpu.cop0_count_write = Some(1);
+        assert!(matches!(
+            operational_thread_publication_digests_v2(&returned_mirrors),
+            Err(OperationalThreadPublicationDigestErrorV1::PendingCop0TimingWrite { thread: 3 })
+        ));
+
+        let parked = [CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            thread: 3,
+            post_exception_cpu: publication_cpu_snapshot_without_pending_timing(19),
+            fault: fn64_recomp_rs::CpuFault {
+                at: publication_key(8, 0x8000_6000),
+                kind: fn64_recomp_rs::CpuFaultKind::Exception {
+                    exception: fn64_recomp_rs::CpuException::Breakpoint,
+                    epc: fn64_recomp_rs::GuestPc::new(0x8000_6000),
+                    branch_delay: false,
+                    instruction_code: 0x1234,
+                    bad_vaddr: None,
+                    coprocessor: None,
+                },
+            },
+            canonical_charged_instructions_at_publication: 44,
+        }];
+        let parked_baseline = operational_thread_publication_digests_v2(&parked).unwrap();
+        let mut parked_mirrors = parked.clone();
+        if let CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            post_exception_cpu, ..
+        } = &mut parked_mirrors[0]
+        {
+            post_exception_cpu.cop0_count ^= 1;
+            post_exception_cpu.cop0_compare ^= 1;
+            post_exception_cpu.cop0_cause ^= fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
+                | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit();
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            operational_thread_publication_digests_v2(&parked_mirrors).unwrap(),
+            parked_baseline
+        );
+        let CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            post_exception_cpu, ..
+        } = &mut parked_mirrors[0]
+        else {
+            unreachable!();
+        };
+        post_exception_cpu.cop0_compare_write = Some(1);
+        assert!(matches!(
+            operational_thread_publication_digests_v2(&parked_mirrors),
+            Err(OperationalThreadPublicationDigestErrorV1::PendingCop0TimingWrite { thread: 3 })
+        ));
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    #[test]
+    fn operational_thread_publication_digests_reject_incoherent_native_continuations() {
+        use fn64_abi::recompiled::{
+            CanonicalPreparedContinuationV1, CanonicalThreadCheckpointEvidenceV1,
+            CanonicalThreadPublicationV1,
+        };
+
+        let incoherent_prepared = [CanonicalThreadPublicationV1::Exact(
+            CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot(3),
+                charged_instructions: 1,
+                canonical_charged_instructions_at_publication: 1,
+                pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+                    3,
+                    0x8000_3000,
+                )),
+                prepared_continuation: Some(CanonicalPreparedContinuationV1::ImageChanged {
+                    entry: publication_key(4, 0x8000_4000),
+                }),
+            },
+        )];
+        assert!(matches!(
+            operational_thread_publication_digests_v1(&incoherent_prepared),
+            Err(
+                OperationalThreadPublicationDigestErrorV1::IncoherentPreparedContinuation {
+                    thread: 3
+                }
+            )
+        ));
+
+        let missing_image_continuation = [CanonicalThreadPublicationV1::Exact(
+            CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot(3),
+                charged_instructions: 1,
+                canonical_charged_instructions_at_publication: 1,
+                pending_exit: fn64_recomp_rs::BlockExit::ImageChanged {
+                    at: publication_key(3, 0x8000_3000),
+                    miss: fn64_recomp_rs::AotMiss {
+                        expected_bank: fn64_recomp_rs::BankId::new(3),
+                        va_start: fn64_recomp_rs::GuestPc::new(0x8000_3000),
+                        byte_len: 4,
+                        expected_sha256: [0x31; 32],
+                        actual_sha256: [0x32; 32],
+                    },
+                },
+                prepared_continuation: None,
+            },
+        )];
+        assert!(matches!(
+            operational_thread_publication_digests_v1(&missing_image_continuation),
+            Err(
+                OperationalThreadPublicationDigestErrorV1::IncoherentPreparedContinuation {
+                    thread: 3
+                }
+            )
+        ));
+
+        let missing_inactive_continuation = [CanonicalThreadPublicationV1::Exact(
+            CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot(3),
+                charged_instructions: 1,
+                canonical_charged_instructions_at_publication: 1,
+                pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+                    at: publication_key(3, 0x8000_3000),
+                    kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                }),
+                prepared_continuation: None,
+            },
+        )];
+        assert!(matches!(
+            operational_thread_publication_digests_v1(&missing_inactive_continuation),
+            Err(
+                OperationalThreadPublicationDigestErrorV1::IncoherentPreparedContinuation {
+                    thread: 3
+                }
+            )
+        ));
+
+        let mismatched_pc = [CanonicalThreadPublicationV1::Exact(
+            CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot(3),
+                charged_instructions: 1,
+                canonical_charged_instructions_at_publication: 1,
+                pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+                    at: publication_key(3, 0x8000_3000),
+                    kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                }),
+                prepared_continuation: Some(CanonicalPreparedContinuationV1::InactiveGeneration {
+                    entry: publication_key(4, 0x8000_3004),
+                }),
+            },
+        )];
+        assert!(matches!(
+            operational_thread_publication_digests_v1(&mismatched_pc),
+            Err(
+                OperationalThreadPublicationDigestErrorV1::IncoherentPreparedContinuation {
+                    thread: 3
+                }
+            )
+        ));
+
+        let cross_variant = [CanonicalThreadPublicationV1::Exact(
+            CanonicalThreadCheckpointEvidenceV1 {
+                thread: 3,
+                cpu: publication_cpu_snapshot(3),
+                charged_instructions: 1,
+                canonical_charged_instructions_at_publication: 1,
+                pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+                    at: publication_key(3, 0x8000_3000),
+                    kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                }),
+                prepared_continuation: Some(CanonicalPreparedContinuationV1::ImageChanged {
+                    entry: publication_key(4, 0x8000_3000),
+                }),
+            },
+        )];
+        assert!(matches!(
+            operational_thread_publication_digests_v1(&cross_variant),
+            Err(
+                OperationalThreadPublicationDigestErrorV1::IncoherentPreparedContinuation {
+                    thread: 3
+                }
+            )
+        ));
+
+        for (charged_instructions, cumulative) in [(0, 0), (2, 1)] {
+            let invalid_charge = [CanonicalThreadPublicationV1::Exact(
+                CanonicalThreadCheckpointEvidenceV1 {
+                    thread: 3,
+                    cpu: publication_cpu_snapshot(3),
+                    charged_instructions,
+                    canonical_charged_instructions_at_publication: cumulative,
+                    pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+                        3,
+                        0x8000_3000,
+                    )),
+                    prepared_continuation: None,
+                },
+            )];
+            assert!(matches!(
+                operational_thread_publication_digests_v1(&invalid_charge),
+                Err(
+                    OperationalThreadPublicationDigestErrorV1::InvalidExactCheckpointCharge {
+                        thread: 3
+                    }
+                )
+            ));
+        }
+
+        let non_exception_parked = [CanonicalThreadPublicationV1::ParkedFaultOpaque {
+            thread: 4,
+            post_exception_cpu: publication_cpu_snapshot(4),
+            fault: fn64_recomp_rs::CpuFault {
+                at: publication_key(4, 0x8000_4000),
+                kind: fn64_recomp_rs::CpuFaultKind::UnsupportedInstruction { word: 0 },
+            },
+            canonical_charged_instructions_at_publication: 2,
+        }];
+        assert!(matches!(
+            operational_thread_publication_digests_v1(&non_exception_parked),
+            Err(
+                OperationalThreadPublicationDigestErrorV1::ParkedFaultIsNotArchitecturalException {
+                    thread: 4
+                }
+            )
+        ));
+    }
+
+    #[cfg(feature = "recomp-rs")]
+    #[test]
+    fn operational_thread_publication_digests_reject_non_strict_order() {
+        use fn64_abi::recompiled::CanonicalThreadPublicationV1;
+
+        for publications in [
+            vec![
+                CanonicalThreadPublicationV1::Returned {
+                    thread: 2,
+                    cpu: publication_cpu_snapshot(2),
+                },
+                CanonicalThreadPublicationV1::Returned {
+                    thread: 1,
+                    cpu: publication_cpu_snapshot(1),
+                },
+            ],
+            vec![
+                CanonicalThreadPublicationV1::Returned {
+                    thread: 2,
+                    cpu: publication_cpu_snapshot(2),
+                },
+                CanonicalThreadPublicationV1::Returned {
+                    thread: 2,
+                    cpu: publication_cpu_snapshot(3),
+                },
+            ],
+        ] {
+            assert!(matches!(
+                operational_thread_publication_digests_v1(&publications),
+                Err(
+                    OperationalThreadPublicationDigestErrorV1::NonStrictThreadOrder {
+                        index: 1,
+                        previous: 2,
+                        ..
+                    }
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn operational_component_digests_reject_noncanonical_device_state() {
+        let mut device = snapshot(42);
+        device.guest.dpc_clock = 0x0100_0000;
+        assert!(matches!(
+            operational_state_component_digests_v1(device, executor_snapshot(), host_snapshot(),),
+            Err(GateError::NonCanonicalDpcCounter {
+                register: "DPC_CLOCK",
+                value: 0x0100_0000,
+            })
+        ));
+    }
+
     fn admission_generation(value: u64) -> fn64_abi::RspTaskAdmissionGeneration {
         fn64_abi::RspTaskAdmissionGeneration::new(
             std::num::NonZeroU64::new(value).expect("test admission generation must be nonzero"),
@@ -5476,6 +7099,7 @@ mod tests {
                     block: vec![ExecutionDestinationObservation {
                         destination,
                         runner_artifact_identity: None,
+                        instructions: 0,
                     }],
                 },
                 0,
@@ -5491,6 +7115,7 @@ mod tests {
                     block: vec![ExecutionDestinationObservation {
                         destination,
                         runner_artifact_identity: Some(ProgramArtifactIdentity::new([0x33; 32])),
+                        instructions: 0,
                     }],
                 },
                 0,
@@ -5506,6 +7131,7 @@ mod tests {
                 block: vec![ExecutionDestinationObservation {
                     destination,
                     runner_artifact_identity: Some(ProgramArtifactIdentity::new([0x33; 32])),
+                    instructions: 0,
                 }],
             },
             0,
@@ -7000,11 +8626,21 @@ mod tests {
         // raw-kick tags must not perturb them.
         assert_eq!(
             variants[3],
-            [&[3u8][..], &0x80u32.to_be_bytes()[..], &7u64.to_be_bytes()[..]].concat()
+            [
+                &[3u8][..],
+                &0x80u32.to_be_bytes()[..],
+                &7u64.to_be_bytes()[..]
+            ]
+            .concat()
         );
         assert_eq!(
             variants[4],
-            [&[4u8][..], &0x80u32.to_be_bytes()[..], &7u64.to_be_bytes()[..]].concat()
+            [
+                &[4u8][..],
+                &0x80u32.to_be_bytes()[..],
+                &7u64.to_be_bytes()[..]
+            ]
+            .concat()
         );
         assert_eq!(
             variants
@@ -7284,6 +8920,8 @@ mod tests {
                     active_generation: 6,
                     next_generation: 7,
                     builder_artifact_identity: identity(8),
+                    activation:
+                        fn64_abi::recompiled::ExecutableActivationEvidence::EagerPublication,
                 }],
                 pending_executable_writes: vec![PendingExecutableWriteEvidenceSnapshot {
                     physical_start: 0x1100,

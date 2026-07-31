@@ -4,7 +4,7 @@
 //! shape) and that stub/ignore lists and the ABI-version handshake are honored.
 
 use fn64_recomp::{AbiVersion, Function, Patches, RecompConfig, Recompiler, Section};
-use fn64_recomp_rs::RsRecompiler;
+use fn64_recomp_rs_codegen::RsRecompiler;
 
 /// Assemble a tiny two-function ROM image and recompile it through the trait.
 #[test]

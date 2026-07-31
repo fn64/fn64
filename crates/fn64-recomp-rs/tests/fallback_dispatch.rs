@@ -20,10 +20,14 @@
 //! binary that links this crate (reusing the `tests/bank_runner.rs`
 //! infrastructure) and asserts in-process.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-use fn64_recomp_rs::{emit_bank_runner, BankId, BankInput};
+mod support;
+use support::dev_interpreter_rlib;
+
+use fn64_recomp_rs::BankId;
+use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
 
 const A_VA: u32 = 0x8000_1000;
 const B_VA: u32 = 0x8000_2000;
@@ -46,22 +50,6 @@ const B_WORDS: [u32; 3] = [
     0x03E0_0008, // jr    $ra
     0x0000_0000, // nop
 ];
-
-fn current_rlib(deps: &Path) -> PathBuf {
-    std::fs::read_dir(deps)
-        .expect("read target deps directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
-                })
-        })
-        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-        .expect("fn64_recomp_rs rlib beside integration test")
-}
 
 fn compile_and_run(emitted: &str, main_body: &str) -> String {
     let source = format!(
@@ -99,7 +87,7 @@ fn main() {{
         .parent()
         .expect("target deps directory")
         .to_path_buf();
-    let rlib = current_rlib(&deps);
+    let rlib = dev_interpreter_rlib(&deps);
     let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--edition=2021")
         .arg(&source_path)

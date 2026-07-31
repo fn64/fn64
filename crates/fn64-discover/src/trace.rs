@@ -11,12 +11,14 @@
 //! preserved through ingestion; this module never assigns a bank from a VA.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::BufRead;
 
 pub const TRACE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_JSONL_RECORD_BYTES: usize = 1024 * 1024;
+pub const EXECUTABLE_IMAGE_SCHEMA: &str = "fn64.executable-image.v1";
 const PI_DRAM_ADDRESS_SPACE_BYTES: u32 = 0x0100_0000;
 const PI_MAX_TRANSFER_BYTES: u32 = 0x0100_0000;
 
@@ -51,6 +53,203 @@ impl From<NormalizedRomDigest> for String {
     fn from(value: NormalizedRomDigest) -> Self {
         value.0
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutableImageLineage {
+    InitialIplDma,
+    DirectRomDma,
+    TableDrivenOverlay,
+    CpuProduced,
+    SelfModifiedGeneration,
+}
+
+/// One completed executable generation captured at its first attempted
+/// fetch. Words are retained in architectural big-endian value order so an
+/// offline pack can emit the exact observed image without runtime codegen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableImageCapture {
+    pub schema: String,
+    pub producer: String,
+    pub normalized_rom_sha256: NormalizedRomDigest,
+    pub image_id: String,
+    pub lineage: ExecutableImageLineage,
+    pub generation: u64,
+    pub capture_pc: u32,
+    pub first_executed_pc: u32,
+    pub retired_instructions: u64,
+    pub va_start: u32,
+    pub byte_len: u32,
+    pub sha256: String,
+    pub words: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutableImageCaptureError {
+    Json(String),
+    UnsupportedSchema(String),
+    RomIdentityMismatch,
+    EmptyField(&'static str),
+    UnalignedAddress { field: &'static str, value: u32 },
+    InvalidByteLength(u32),
+    RangeOverflow,
+    FirstPcOutsideImage,
+    WordCountMismatch { byte_len: u32, words: usize },
+    InvalidSha256,
+    ContentDigestMismatch { declared: String, actual: String },
+}
+
+#[derive(Debug)]
+pub enum ReproducibleExecutableImageError {
+    TooFewCaptures {
+        minimum: usize,
+        actual: usize,
+    },
+    InvalidCapture {
+        index: usize,
+        error: ExecutableImageCaptureError,
+    },
+    ObservationMismatch {
+        index: usize,
+    },
+}
+
+impl fmt::Display for ReproducibleExecutableImageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ReproducibleExecutableImageError {}
+
+fn same_reproducible_executable_image(
+    reference: &ExecutableImageCapture,
+    candidate: &ExecutableImageCapture,
+) -> bool {
+    reference.schema == candidate.schema
+        && reference.producer == candidate.producer
+        && reference.normalized_rom_sha256 == candidate.normalized_rom_sha256
+        && reference.image_id == candidate.image_id
+        && reference.lineage == candidate.lineage
+        && reference.generation == candidate.generation
+        && reference.capture_pc == candidate.capture_pc
+        && reference.first_executed_pc == candidate.first_executed_pc
+        && reference.va_start == candidate.va_start
+        && reference.byte_len == candidate.byte_len
+        && reference.sha256 == candidate.sha256
+        && reference.words == candidate.words
+}
+
+/// Validate one independently repeated executable-image observation group.
+///
+/// Route-length metadata is intentionally not an image-identity field; the
+/// producer, capture/fetch PCs, lineage, geometry, digest, and exact words must
+/// all agree. The first validated capture is returned as the canonical group
+/// representative.
+pub fn parse_reproducible_executable_image_group(
+    documents: &[Vec<u8>],
+    expected_rom: &NormalizedRomDigest,
+    minimum_captures: usize,
+) -> Result<ExecutableImageCapture, ReproducibleExecutableImageError> {
+    if documents.len() < minimum_captures {
+        return Err(ReproducibleExecutableImageError::TooFewCaptures {
+            minimum: minimum_captures,
+            actual: documents.len(),
+        });
+    }
+    let mut reference = None;
+    for (index, document) in documents.iter().enumerate() {
+        let candidate = parse_executable_image_capture(document, expected_rom)
+            .map_err(|error| ReproducibleExecutableImageError::InvalidCapture { index, error })?;
+        if let Some(known) = reference.as_ref() {
+            if !same_reproducible_executable_image(known, &candidate) {
+                return Err(ReproducibleExecutableImageError::ObservationMismatch { index });
+            }
+        } else {
+            reference = Some(candidate);
+        }
+    }
+    reference.ok_or(ReproducibleExecutableImageError::TooFewCaptures {
+        minimum: minimum_captures,
+        actual: 0,
+    })
+}
+
+impl fmt::Display for ExecutableImageCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ExecutableImageCaptureError {}
+
+pub fn parse_executable_image_capture(
+    bytes: &[u8],
+    expected_rom: &NormalizedRomDigest,
+) -> Result<ExecutableImageCapture, ExecutableImageCaptureError> {
+    let capture: ExecutableImageCapture = serde_json::from_slice(bytes)
+        .map_err(|error| ExecutableImageCaptureError::Json(error.to_string()))?;
+    if capture.schema != EXECUTABLE_IMAGE_SCHEMA {
+        return Err(ExecutableImageCaptureError::UnsupportedSchema(
+            capture.schema,
+        ));
+    }
+    if &capture.normalized_rom_sha256 != expected_rom {
+        return Err(ExecutableImageCaptureError::RomIdentityMismatch);
+    }
+    for (field, value) in [
+        ("producer", capture.producer.as_str()),
+        ("image_id", capture.image_id.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ExecutableImageCaptureError::EmptyField(field));
+        }
+    }
+    for (field, value) in [
+        ("capture_pc", capture.capture_pc),
+        ("first_executed_pc", capture.first_executed_pc),
+        ("va_start", capture.va_start),
+    ] {
+        if value & 3 != 0 {
+            return Err(ExecutableImageCaptureError::UnalignedAddress { field, value });
+        }
+    }
+    if capture.byte_len == 0 || capture.byte_len & 3 != 0 {
+        return Err(ExecutableImageCaptureError::InvalidByteLength(
+            capture.byte_len,
+        ));
+    }
+    let va_end = capture
+        .va_start
+        .checked_add(capture.byte_len)
+        .ok_or(ExecutableImageCaptureError::RangeOverflow)?;
+    if !(capture.va_start..va_end).contains(&capture.first_executed_pc) {
+        return Err(ExecutableImageCaptureError::FirstPcOutsideImage);
+    }
+    if capture.words.len() != capture.byte_len as usize / 4 {
+        return Err(ExecutableImageCaptureError::WordCountMismatch {
+            byte_len: capture.byte_len,
+            words: capture.words.len(),
+        });
+    }
+    if NormalizedRomDigest::try_from(capture.sha256.clone()).is_err() {
+        return Err(ExecutableImageCaptureError::InvalidSha256);
+    }
+    let content = capture
+        .words
+        .iter()
+        .flat_map(|word| word.to_be_bytes())
+        .collect::<Vec<_>>();
+    let actual = format!("{:x}", Sha256::digest(content));
+    if capture.sha256 != actual {
+        return Err(ExecutableImageCaptureError::ContentDigestMismatch {
+            declared: capture.sha256,
+            actual,
+        });
+    }
+    Ok(capture)
 }
 
 impl Serialize for NormalizedRomDigest {
@@ -275,6 +474,39 @@ pub struct IngestReport {
     pub observations_with_unknown_bank: u64,
     pub facts: Vec<ObservedTraceFact>,
     pub exhaustiveness: Vec<ExhaustivenessClaim>,
+}
+
+/// Return the distinct PCs a trace actually observed in one exact bank
+/// generation.
+///
+/// These are scenario observations, not a claim that the returned set is
+/// exhaustive. The bank name and activation are both required so overlapping
+/// VA generations cannot be merged merely because their numeric PCs match.
+/// Unknown-bank observations and events from every other generation remain
+/// outside the result.
+pub fn observed_execution_roots(
+    report: &IngestReport,
+    bank: &str,
+    activation: u64,
+) -> BTreeSet<u32> {
+    report
+        .facts
+        .iter()
+        .filter_map(|fact| {
+            let ObservedTraceFact::ExecutedPc { pc, .. } = fact else {
+                return None;
+            };
+            match &pc.bank {
+                BankContext::Known {
+                    bank: observed_bank,
+                    activation: observed_activation,
+                } if observed_bank == bank && *observed_activation == activation => {
+                    Some(pc.address)
+                }
+                BankContext::Unknown | BankContext::Known { .. } => None,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -802,8 +1034,14 @@ pub fn fold_indirect_targets_into_fact_db(
         else {
             continue;
         };
-        let (BankContext::Known { bank: site_bank, .. }, BankContext::Known { bank: target_bank, .. }) =
-            (&site.bank, &target.bank)
+        let (
+            BankContext::Known {
+                bank: site_bank, ..
+            },
+            BankContext::Known {
+                bank: target_bank, ..
+            },
+        ) = (&site.bank, &target.bank)
         else {
             report.unknown_bank_skipped += 1;
             continue;
@@ -879,6 +1117,62 @@ mod tests {
 
     fn header() -> &'static str {
         r#"{"event":"header","sequence":0,"schema_version":1,"normalized_rom_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","trace_id":"test-1","producer":"synthetic-test"}"#
+    }
+
+    fn executable_image_json(sha256: &str, words: &str) -> String {
+        format!(
+            r#"{{"schema":"fn64.executable-image.v1","producer":"public-debugger-test","normalized_rom_sha256":"{DIGEST}","image_id":"general-exception-preamble","lineage":"cpu_produced","generation":0,"capture_pc":2147484032,"first_executed_pc":2147484032,"retired_instructions":7,"va_start":2147484032,"byte_len":16,"sha256":"{sha256}","words":[{words}]}}"#
+        )
+    }
+
+    #[test]
+    fn executable_image_capture_validates_identity_geometry_and_content() {
+        let json = executable_image_json(
+            "92d005d9f1c311068500142b0129d6160dd193f92baa1e0f84061a169b48b982",
+            "1008369667,660236176,54525960,0",
+        );
+        let capture = parse_executable_image_capture(json.as_bytes(), &digest()).unwrap();
+        assert_eq!(capture.lineage, ExecutableImageLineage::CpuProduced);
+        assert_eq!(capture.va_start, 0x8000_0180);
+        assert_eq!(capture.words, [0x3c1a_8003, 0x275a_6790, 0x0340_0008, 0]);
+    }
+
+    #[test]
+    fn executable_image_capture_rejects_content_not_bound_by_its_digest() {
+        let json = executable_image_json(
+            "92d005d9f1c311068500142b0129d6160dd193f92baa1e0f84061a169b48b982",
+            "1008369667,660236176,54525960,1",
+        );
+        assert!(matches!(
+            parse_executable_image_capture(json.as_bytes(), &digest()),
+            Err(ExecutableImageCaptureError::ContentDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn reproducible_image_group_binds_identity_and_bytes_not_route_length() {
+        let json = executable_image_json(
+            "92d005d9f1c311068500142b0129d6160dd193f92baa1e0f84061a169b48b982",
+            "1008369667,660236176,54525960,0",
+        );
+        let later_route = json.replace("\"retired_instructions\":7", "\"retired_instructions\":8");
+        let documents = vec![
+            json.as_bytes().to_vec(),
+            later_route.into_bytes(),
+            json.into_bytes(),
+        ];
+        let capture = parse_reproducible_executable_image_group(&documents, &digest(), 3).unwrap();
+        assert_eq!(capture.va_start, 0x8000_0180);
+
+        let mut mismatched = documents;
+        mismatched[2] = String::from_utf8(mismatched[2].clone())
+            .unwrap()
+            .replace("public-debugger-test", "different-producer")
+            .into_bytes();
+        assert!(matches!(
+            parse_reproducible_executable_image_group(&mismatched, &digest(), 3),
+            Err(ReproducibleExecutableImageError::ObservationMismatch { index: 2 })
+        ));
     }
 
     #[test]
@@ -1007,6 +1301,29 @@ mod tests {
         let first = serde_json::to_string(&ingest(&input).unwrap()).unwrap();
         let second = serde_json::to_string(&ingest(&input).unwrap()).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn execution_roots_preserve_exact_bank_generation() {
+        let report = ingest(&[
+            header(),
+            r#"{"event":"executed_pc","sequence":1,"pc":{"address":2147484672,"bank":{"status":"known","bank":"boot","activation":0}}}"#,
+            r#"{"event":"executed_pc","sequence":2,"pc":{"address":2147484672,"bank":{"status":"known","bank":"boot","activation":0}}}"#,
+            r#"{"event":"executed_pc","sequence":3,"pc":{"address":2147484676,"bank":{"status":"known","bank":"boot","activation":1}}}"#,
+            r#"{"event":"executed_pc","sequence":4,"pc":{"address":2147484680,"bank":{"status":"known","bank":"overlay","activation":0}}}"#,
+            r#"{"event":"executed_pc","sequence":5,"pc":{"address":2147484684,"bank":{"status":"unknown"}}}"#,
+            r#"{"event":"end","sequence":6,"completion":"completed","exhaustiveness":[]}"#,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            observed_execution_roots(&report, "boot", 0),
+            BTreeSet::from([0x8000_0400])
+        );
+        assert_eq!(
+            observed_execution_roots(&report, "boot", 1),
+            BTreeSet::from([0x8000_0404])
+        );
     }
 
     #[test]
@@ -1216,14 +1533,20 @@ mod tests {
                 va_start,
                 va_end: va_start + len,
             });
-            db.conclude(format!("bank:{bank}"), ProofState::Proven, vec![mapping], "test")
-                .unwrap();
+            db.conclude(
+                format!("bank:{bank}"),
+                ProofState::Proven,
+                vec![mapping],
+                "test",
+            )
+            .unwrap();
         }
 
         #[test]
         fn a_cart_to_rdram_transfer_becomes_a_supported_mapping() {
             let mut db = FactDb::new();
-            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(1, 0x10_0000, 0x40_0000, 0x2000)]);
+            let report =
+                fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(1, 0x10_0000, 0x40_0000, 0x2000)]);
 
             assert_eq!(report.facts_added, 1);
             assert_eq!(report.new_mappings.len(), 1);
@@ -1239,7 +1562,11 @@ mod tests {
                 .facts()
                 .iter()
                 .find_map(|fact| match fact {
-                    Fact::RomMapping { va_start, rom_start, .. } => Some((*rom_start, *va_start)),
+                    Fact::RomMapping {
+                        va_start,
+                        rom_start,
+                        ..
+                    } => Some((*rom_start, *va_start)),
                     _ => None,
                 })
                 .unwrap();
@@ -1271,7 +1598,8 @@ mod tests {
             let mut db = FactDb::new();
             prove_mapping(&mut db, "code", 0x10_0000, 0x8040_0000, 0x2000);
 
-            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(1, 0x10_0000, 0x40_0000, 0x2000)]);
+            let report =
+                fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(1, 0x10_0000, 0x40_0000, 0x2000)]);
 
             assert_eq!(report.facts_added, 0, "no duplicate mapping was added");
             assert!(report.new_mappings.is_empty());
@@ -1288,7 +1616,8 @@ mod tests {
             prove_mapping(&mut db, "code", 0x10_0000, 0x8040_0000, 0x2000);
 
             // Same VA, different ROM source: one of the two is wrong.
-            let report = fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(4, 0x99_0000, 0x40_0000, 0x2000)]);
+            let report =
+                fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(4, 0x99_0000, 0x40_0000, 0x2000)]);
 
             assert_eq!(report.conflicts.len(), 1);
             let conflict = &report.conflicts[0];
@@ -1296,7 +1625,10 @@ mod tests {
             assert_eq!(conflict.observed_rom_start, 0x99_0000);
             assert_eq!(conflict.proven_rom_start, 0x10_0000);
             assert_eq!(conflict.proven_bank, "code");
-            assert_eq!(report.facts_added, 0, "a conflict must not be silently admitted");
+            assert_eq!(
+                report.facts_added, 0,
+                "a conflict must not be silently admitted"
+            );
         }
 
         #[test]
@@ -1306,7 +1638,14 @@ mod tests {
             // describe the transport, not the program.
             let mut db = FactDb::new();
             let facts: Vec<_> = (0..4)
-                .map(|i| dma(i + 1, 0xf5580 + i as u32 * 0x1000, 0x378800 + i as u32 * 0x1000, 0x1000))
+                .map(|i| {
+                    dma(
+                        i + 1,
+                        0xf5580 + i as u32 * 0x1000,
+                        0x378800 + i as u32 * 0x1000,
+                        0x1000,
+                    )
+                })
                 .collect();
             let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
 
@@ -1316,9 +1655,13 @@ mod tests {
                 .facts()
                 .iter()
                 .find_map(|fact| match fact {
-                    Fact::RomMapping { rom_start, rom_end, va_start, va_end, .. } => {
-                        Some((*rom_start, *rom_end, *va_start, *va_end))
-                    }
+                    Fact::RomMapping {
+                        rom_start,
+                        rom_end,
+                        va_start,
+                        va_end,
+                        ..
+                    } => Some((*rom_start, *rom_end, *va_start, *va_end)),
                     _ => None,
                 })
                 .unwrap();
@@ -1344,7 +1687,11 @@ mod tests {
             assert_eq!(report.facts_added, 1, "only the single-source image");
             assert_eq!(report.reused_destination_skipped, 8);
             assert_eq!(
-                report.reused_destinations.iter().copied().collect::<Vec<_>>(),
+                report
+                    .reused_destinations
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
                 vec![0x8050_0000]
             );
         }
@@ -1374,7 +1721,14 @@ mod tests {
             // Chunks need not be observed in address order; the result must not
             // depend on the order the emulator happened to emit them.
             let ordered: Vec<_> = (0..4)
-                .map(|i| dma(i + 1, 0x2000 + i as u32 * 0x800, 0x1_0000 + i as u32 * 0x800, 0x800))
+                .map(|i| {
+                    dma(
+                        i + 1,
+                        0x2000 + i as u32 * 0x800,
+                        0x1_0000 + i as u32 * 0x800,
+                        0x800,
+                    )
+                })
                 .collect();
             let mut shuffled = ordered.clone();
             shuffled.swap(0, 3);
@@ -1429,11 +1783,8 @@ mod tests {
             let mut db = FactDb::new();
             prove_mapping(&mut db, "boot", 0x1000, 0x8000_0400, 0x10_0000);
 
-            let report = fold_pi_dmas_into_fact_db(
-                &mut db,
-                "t",
-                &[dma(1, 0x1000, 0x400, 0x10_0000)],
-            );
+            let report =
+                fold_pi_dmas_into_fact_db(&mut db, "t", &[dma(1, 0x1000, 0x400, 0x10_0000)]);
 
             assert!(
                 report.conflicts.is_empty(),
@@ -1471,7 +1822,10 @@ mod tests {
             ];
             let report = fold_pi_dmas_into_fact_db(&mut db, "t", &facts);
 
-            assert_eq!(report.non_load_skipped, 1, "a write-back is not a load image");
+            assert_eq!(
+                report.non_load_skipped, 1,
+                "a write-back is not a load image"
+            );
             assert_eq!(report.degenerate_skipped, 2);
             assert_eq!(report.facts_added, 0);
         }
@@ -1480,9 +1834,7 @@ mod tests {
     mod indirect_fold {
         use super::*;
         use crate::cfg::WordClass;
-        use crate::facts::{
-            observed_indirect_target_subject, BankAddr, Fact, FactDb, ProofState,
-        };
+        use crate::facts::{observed_indirect_target_subject, BankAddr, Fact, FactDb, ProofState};
 
         fn known(bank: &str, address: u32) -> ObservedAddress {
             ObservedAddress {
@@ -1517,10 +1869,7 @@ mod tests {
         #[test]
         fn known_edge_becomes_a_supported_observed_indirect_target() {
             let mut db = FactDb::new();
-            let facts = vec![edge(
-                known("code", 0x8019_3efc),
-                known("code", 0x8019_4000),
-            )];
+            let facts = vec![edge(known("code", 0x8019_3efc), known("code", 0x8019_4000))];
             let report = fold_indirect_targets_into_fact_db(&mut db, "trace-a", &facts, no_class);
 
             assert_eq!(report.facts_added, 1);
@@ -1535,8 +1884,12 @@ mod tests {
                 Fact::ObservedIndirectTarget { site: s, target: t, trace }
                     if *s == site && *t == target && trace == "trace-a"
             ));
-            let subject = observed_indirect_target_subject("code", 0x8019_3efc, "code", 0x8019_4000);
-            assert_eq!(db.conclusion(&subject).unwrap().state, ProofState::Supported);
+            let subject =
+                observed_indirect_target_subject("code", 0x8019_3efc, "code", 0x8019_4000);
+            assert_eq!(
+                db.conclusion(&subject).unwrap().state,
+                ProofState::Supported
+            );
         }
 
         #[test]
@@ -1599,7 +1952,10 @@ mod tests {
             // conflict is surfaced, never silently resolved.
             assert_eq!(report.facts_added, 1);
             assert_eq!(report.target_conflicts.len(), 1);
-            assert_eq!(report.target_conflicts[0].site, BankAddr::new("code", 0x200));
+            assert_eq!(
+                report.target_conflicts[0].site,
+                BankAddr::new("code", 0x200)
+            );
         }
     }
 }
@@ -1860,9 +2216,7 @@ pub fn fold_pi_dmas_into_fact_db(
             .is_some_and(|sources| sources.len() > 1)
         {
             report.reused_destination_skipped += 1;
-            report
-                .reused_destinations
-                .insert(transfer.va_start);
+            report.reused_destinations.insert(transfer.va_start);
             continue;
         }
         let ObservedTransfer {

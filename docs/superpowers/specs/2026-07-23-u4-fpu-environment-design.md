@@ -11,7 +11,7 @@ fn64's FPU today is a **round-to-nearest fast path**. Arithmetic is emitted as
 raw host float ops with no IEEE machinery:
 
 ```rust
-// crates/fn64-recomp-rs/src/emit.rs:2139
+// crates/fn64-recomp-rs-codegen/src/emit.rs:2139
 SqrtS { fd, fs } => line(out, format!("ctx.set_f_s({}, ctx.f_s({}).sqrt());", fd, fs)),
 ```
 

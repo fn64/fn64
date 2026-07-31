@@ -2,9 +2,14 @@
 // @category fn64
 
 import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressRange;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 
 import java.io.BufferedWriter;
 import java.io.FileOutputStream;
@@ -19,15 +24,19 @@ import java.util.HexFormat;
 import java.util.List;
 
 public class Fn64ExportCandidates extends GhidraScript {
-    private record Candidate(int tag, long start, long end, String providerId) {}
+    private record Candidate(int tag, long entry, long start, long end, String providerId) {}
+    private record SkippedRange(long start, long end) {}
+    private List<SkippedRange> skippedRanges;
+    private List<Long> skippedBodyEntries;
 
     @Override
     protected void run() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length != 13 && args.length != 15) {
+        if (args.length != 15) {
             throw new IllegalArgumentException(
                 "usage: OUT MODE BANK VA_START VA_END ROM_SHA BANK_SHA MAPPING_SHA " +
-                "GHIDRA_VERSION BUILD_SHA CONFIG_SHA EVIDENCE_SHA [SNAPSHOT_ROLE SNAPSHOT_SHA]"
+                "GHIDRA_VERSION BUILD_SHA CONFIG_SHA EVIDENCE_SHA PROGRAM_NAME " +
+                "SNAPSHOT_ROLE SNAPSHOT_SHA"
             );
         }
 
@@ -53,41 +62,40 @@ public class Fn64ExportCandidates extends GhidraScript {
         if (!mode.equals("unseeded") && !mode.equals("seeded")) {
             throw new IllegalArgumentException("mode must be unseeded or seeded");
         }
-        if (mode.equals("seeded") != (args.length == 15)) {
-            throw new IllegalArgumentException("only seeded runs carry discovery snapshot lineage");
+        String snapshotRole = args[13];
+        if (!snapshotRole.equals("discovery_snapshot")) {
+            throw new IllegalArgumentException("lineage role must be discovery_snapshot");
         }
+        String snapshotSha = requireSha(args[14]);
 
-        String snapshotRole = null;
-        String snapshotSha = null;
-        if (args.length == 15) {
-            snapshotRole = args[13];
-            if (!snapshotRole.equals("discovery_snapshot")) {
-                throw new IllegalArgumentException("seeded lineage role must be discovery_snapshot");
-            }
-            snapshotSha = requireSha(args[14]);
-        }
-
+        AddressSpace defaultAddressSpace =
+            currentProgram.getAddressFactory().getDefaultAddressSpace();
+        verifyMappedBank(defaultAddressSpace, vaStart, vaEnd, bankSha);
+        skippedRanges = new ArrayList<>();
+        skippedBodyEntries = new ArrayList<>();
         List<Candidate> candidates = collectCandidates(bank, vaStart, vaEnd);
+        if ("1".equals(System.getenv("FN64_GHIDRA_EXECUTABLE_RANGES"))) {
+            candidates = collectExecutableRanges(bank, vaStart, vaEnd);
+        }
         String claimsSha = claimsDigest(bank, candidates);
         String toolName = "ghidra-headless-" + mode;
 
         try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
                 new FileOutputStream(output), StandardCharsets.UTF_8))) {
-            writer.write("{\"record\":\"header\",\"schema\":\"fn64.tool-adapter\",\"schema_version\":1");
+            writer.write("{\"record\":\"header\",\"schema\":\"fn64.tool-adapter\",\"schema_version\":2");
             writer.write(",\"tool\":{\"name\":\"" + toolName + "\",\"version\":\"" +
                 json(ghidraVersion) + "\",\"build_sha256\":\"" + buildSha + "\"}");
-            writer.write(",\"role\":\"function_boundary_candidates\"");
+            writer.write(",\"role\":\"" +
+                ("1".equals(System.getenv("FN64_GHIDRA_EXECUTABLE_RANGES"))
+                    ? "region_candidates" : "function_boundary_candidates") + "\"");
             writer.write(",\"input\":{\"normalized_rom_sha256\":\"" + romSha +
                 "\",\"bank\":\"" + json(bank) + "\",\"bank_bytes_sha256\":\"" + bankSha +
                 "\",\"mapping_sha256\":\"" + mappingSha + "\",\"va_start\":" + vaStart +
                 ",\"va_end\":" + vaEnd + "}");
             writer.write(",\"lineage\":[{\"role\":\"tool_configuration\",\"source_sha256\":\"" +
                 configSha + "\"},{\"role\":\"evidence_manifest\",\"source_sha256\":\"" +
-                evidenceSha + "\"}");
-            if (snapshotSha != null) {
-                writer.write(", {\"role\":\"" + snapshotRole + "\",\"source_sha256\":\"" +
-                    snapshotSha + "\"}");
-            }
+                evidenceSha + "\"},{\"role\":\"" + snapshotRole +
+                "\",\"source_sha256\":\"" + snapshotSha + "\"}");
             writer.write("]}\n");
 
             for (int sequence = 0; sequence < candidates.size(); sequence++) {
@@ -97,20 +105,84 @@ public class Fn64ExportCandidates extends GhidraScript {
                 if (candidate.tag() == 1) {
                     writer.write("{\"type\":\"function_entry\",\"address\":{\"bank\":\"" +
                         json(bank) + "\",\"pc\":" + candidate.start() + "}}");
-                } else {
+                } else if (candidate.tag() == 2) {
                     writer.write("{\"type\":\"function_extent\",\"range\":{\"bank\":\"" +
                         json(bank) + "\",\"va_start\":" + candidate.start() +
                         ",\"va_end\":" + candidate.end() + "}}");
+                } else if (candidate.tag() == 3) {
+                    writer.write("{\"type\":\"executable_range\",\"range\":{\"bank\":\"" +
+                        json(bank) + "\",\"va_start\":" + candidate.start() +
+                        ",\"va_end\":" + candidate.end() + "}}");
+                } else {
+                    writer.write("{\"type\":\"function_body_range\",\"entry\":{\"bank\":\"" +
+                        json(bank) + "\",\"pc\":" + candidate.entry() +
+                        "},\"range\":{\"bank\":\"" + json(bank) + "\",\"va_start\":" +
+                        candidate.start() + ",\"va_end\":" + candidate.end() + "}}");
                 }
                 writer.write("}\n");
             }
 
             writer.write("{\"record\":\"summary\",\"complete\":true,\"analyzed_range\":{\"bank\":\"" +
                 json(bank) + "\",\"va_start\":" + vaStart + ",\"va_end\":" + vaEnd +
-                "},\"skipped_ranges\":[],\"claim_records\":" + candidates.size() +
+                "},\"skipped_ranges\":" + serializeSkippedRanges(bank) +
+                ",\"claim_records\":" + candidates.size() +
                 ",\"claims_sha256\":\"" + claimsSha + "\",\"resources\":{\"input_bytes\":" +
                 (vaEnd - vaStart) + ",\"elapsed_millis\":0,\"peak_memory_bytes\":null," +
-                "\"limit_hit\":false,\"warnings\":[]}}\n");
+                "\"limit_hit\":false,\"warnings\":" + serializeSkippedBodyWarnings() + "}}\n");
+        }
+    }
+
+    private void verifyMappedBank(
+            AddressSpace defaultAddressSpace, long vaStart, long vaEnd, String expectedSha)
+            throws Exception {
+        long length = Math.subtractExact(vaEnd, vaStart);
+        if (length <= 0 || length > Integer.MAX_VALUE) {
+            throw new IllegalStateException("bank interval length is unsupported or overflowed");
+        }
+
+        Address start = defaultAddressSpace.getAddress(vaStart);
+        Address end = defaultAddressSpace.getAddress(vaEnd - 1);
+        if (!start.getAddressSpace().equals(defaultAddressSpace) ||
+                !end.getAddressSpace().equals(defaultAddressSpace) ||
+                start.getUnsignedOffset() != vaStart || end.getUnsignedOffset() != vaEnd - 1) {
+            throw new IllegalStateException("bank interval is not in the default address space");
+        }
+
+        Memory memory = currentProgram.getMemory();
+        MemoryBlock block = memory.getBlock(start);
+        if (block == null) {
+            throw new IllegalStateException("bank interval has no mapped memory block");
+        }
+        if (!block.getStart().getAddressSpace().equals(defaultAddressSpace) || block.isOverlay()) {
+            throw new IllegalStateException("bank interval resolves through a non-default address space");
+        }
+        if (!block.contains(end)) {
+            throw new IllegalStateException("bank interval crosses memory blocks");
+        }
+        if (!block.isRead()) {
+            throw new IllegalStateException("bank interval is not readable");
+        }
+
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] buffer = new byte[64 * 1024];
+        long consumed = 0;
+        while (consumed < length) {
+            int chunkLength = (int) Math.min(buffer.length, length - consumed);
+            Address chunkStart = start.addNoWrap(consumed);
+            int bytesRead = memory.getBytes(chunkStart, buffer, 0, chunkLength);
+            if (bytesRead != chunkLength) {
+                throw new IllegalStateException(
+                    "bank interval became unreadable at " + chunkStart
+                );
+            }
+            digest.update(buffer, 0, chunkLength);
+            consumed = Math.addExact(consumed, chunkLength);
+        }
+        String actualSha = HexFormat.of().formatHex(digest.digest());
+        if (!actualSha.equals(expectedSha)) {
+            throw new IllegalStateException(
+                "mapped bank digest mismatch: expected " + expectedSha + ", got " + actualSha
+            );
         }
     }
 
@@ -126,28 +198,115 @@ public class Fn64ExportCandidates extends GhidraScript {
             if (entry < vaStart || entry >= vaEnd) {
                 throw new IllegalStateException("Ghidra produced an out-of-bank function entry");
             }
-            if (body.getNumAddressRanges() != 1) {
-                throw new IllegalStateException(
-                    "schema v1 cannot represent a discontiguous function body at " +
-                    function.getEntryPoint()
-                );
-            }
-            long bodyStart = body.getMinAddress().getUnsignedOffset();
-            long bodyEnd = body.getMaxAddress().getUnsignedOffset() + 1;
-            if (bodyStart != entry || bodyEnd <= bodyStart || bodyEnd > vaEnd ||
-                    (bodyStart & 3) != 0 || (bodyEnd & 3) != 0) {
-                throw new IllegalStateException(
-                    "function body violates the supplied bank mapping at " + function.getEntryPoint()
-                );
-            }
             String suffix = String.format("%08x", entry);
-            result.add(new Candidate(1, entry, entry, "ghidra:function-entry:" + bank + ":" + suffix));
-            result.add(new Candidate(2, bodyStart, bodyEnd, "ghidra:function-extent:" + bank + ":" + suffix));
+            result.add(new Candidate(
+                1, entry, entry, entry, "ghidra:function-entry:" + bank + ":" + suffix
+            ));
+            int rangeCount = (int) body.getNumAddressRanges();
+            int rangeIndex = 0;
+            for (AddressRange range : body.getAddressRanges(true)) {
+                Address rangeMin = range.getMinAddress();
+                Address rangeMax = range.getMaxAddress();
+                if (!rangeMin.getAddressSpace().equals(function.getEntryPoint().getAddressSpace()) ||
+                        !rangeMax.getAddressSpace().equals(function.getEntryPoint().getAddressSpace())) {
+                    throw new IllegalStateException(
+                        "function body crosses address spaces at " + function.getEntryPoint()
+                    );
+                }
+                long bodyStart = rangeMin.getUnsignedOffset();
+                long bodyMax = rangeMax.getUnsignedOffset();
+                if (bodyMax >= 0xffff_ffffL) {
+                    throw new IllegalStateException(
+                        "function body range end overflows u32 at " + function.getEntryPoint()
+                    );
+                }
+                long bodyEnd = bodyMax + 1;
+                if (bodyStart < vaStart || bodyEnd <= bodyStart || bodyEnd > vaEnd ||
+                        (bodyStart & 3) != 0 || (bodyEnd & 3) != 0) {
+                    long clippedStart = Math.max(bodyStart, vaStart);
+                    long clippedEnd = Math.min(bodyEnd, vaEnd);
+                    if (clippedStart < clippedEnd && (clippedStart & 3) == 0 &&
+                            (clippedEnd & 3) == 0) {
+                        skippedRanges.add(new SkippedRange(clippedStart, clippedEnd));
+                    }
+                    skippedBodyEntries.add(entry);
+                    rangeIndex++;
+                    continue;
+                }
+                if (rangeCount == 1) {
+                    if (bodyStart != entry) {
+                        throw new IllegalStateException(
+                            "contiguous function body does not begin at its entry at " +
+                            function.getEntryPoint()
+                        );
+                    }
+                    result.add(new Candidate(
+                        2, entry, bodyStart, bodyEnd,
+                        "ghidra:function-extent:" + bank + ":" + suffix
+                    ));
+                } else {
+                    result.add(new Candidate(
+                        6, entry, bodyStart, bodyEnd,
+                        "ghidra:function-body-range:" + bank + ":" + suffix + ":" +
+                        String.format("%04x", rangeIndex)
+                    ));
+                }
+                rangeIndex++;
+            }
+            if (rangeIndex != rangeCount || rangeCount == 0) {
+                throw new IllegalStateException(
+                    "function body range count changed at " + function.getEntryPoint()
+                );
+            }
         }
         result.sort(Comparator.comparingLong(Candidate::start)
             .thenComparingInt(Candidate::tag)
             .thenComparing(Candidate::providerId));
         return result;
+    }
+
+    private List<Candidate> collectExecutableRanges(String bank, long vaStart, long vaEnd) {
+        List<Candidate> result = new ArrayList<>();
+        for (MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+            if (!block.isExecute()) continue;
+            long start = Math.max(vaStart, block.getStart().getOffset());
+            long end = Math.min(vaEnd, block.getEnd().getOffset() + 1);
+            start = (start + 3) & ~3L;
+            end &= ~3L;
+            if (start < end) {
+                result.add(new Candidate(3, 0, start, end,
+                    "ghidra:executable-range:" + bank + ":" +
+                    String.format("%08x-%08x", start, end)));
+            }
+        }
+        return result;
+    }
+
+    private String serializeSkippedRanges(String bank) {
+        StringBuilder result = new StringBuilder("[");
+        for (int index = 0; index < skippedRanges.size(); index++) {
+            if (index != 0) {
+                result.append(',');
+            }
+            SkippedRange skipped = skippedRanges.get(index);
+            result.append("{\"bank\":\"").append(json(bank))
+                .append("\",\"va_start\":").append(skipped.start())
+                .append(",\"va_end\":").append(skipped.end()).append('}');
+        }
+        return result.append(']').toString();
+    }
+
+    private String serializeSkippedBodyWarnings() {
+        StringBuilder result = new StringBuilder("[");
+        for (int index = 0; index < skippedBodyEntries.size(); index++) {
+            if (index != 0) {
+                result.append(',');
+            }
+            result.append("\"cross_bank_function_body:")
+                .append(String.format("%08x", skippedBodyEntries.get(index)))
+                .append('"');
+        }
+        return result.append(']').toString();
     }
 
     private static String claimsDigest(String bank, List<Candidate> candidates) throws Exception {
@@ -159,9 +318,13 @@ public class Fn64ExportCandidates extends GhidraScript {
             putU64(digest, sequence);
             putString(digest, candidate.providerId());
             digest.update((byte) candidate.tag());
+            if (candidate.tag() == 6) {
+                putString(digest, bank);
+                putU32(digest, candidate.entry());
+            }
             putString(digest, bank);
             putU32(digest, candidate.start());
-            if (candidate.tag() == 2) {
+            if (candidate.tag() == 2 || candidate.tag() == 3 || candidate.tag() == 6) {
                 putU32(digest, candidate.end());
             }
         }

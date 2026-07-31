@@ -300,7 +300,9 @@ pub struct RspExecutionState {
 #[must_use = "MMIO write effects must be handled before guest execution resumes"]
 pub enum DeviceMmioWriteEffect {
     None,
-    AiFrequencyChanged { sample_rate_hz: u32 },
+    AiFrequencyChanged {
+        sample_rate_hz: u32,
+    },
     AiDmaStarted(AiDmaRequest),
     DpcSubmissionRequested(DpcSubmission),
     /// A raw `SP_STATUS` write cleared HALT while the RSP was halted, which on
@@ -310,7 +312,9 @@ pub enum DeviceMmioWriteEffect {
     /// Only the raw MMIO path produces this. `write_sp_status` is also called
     /// directly by the libultra `__osSpSetStatus` shim, which does not route
     /// through `write_mmio` because the HLE task lane kicks the RSP itself.
-    RspStartRequested { pc: u32 },
+    RspStartRequested {
+        pc: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,6 +462,45 @@ pub struct DeviceTraceEvent {
     pub at: Cycles,
     pub sequence: u64,
     pub kind: DeviceTraceKind,
+}
+
+/// Constant-space counts of accepted device transitions. These remain active
+/// when diagnostic event retention is disabled, so long exploratory runs can
+/// report progress without growing an unbounded trace vector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceTraceSummary {
+    pub events: u64,
+    pub pi_dma_started: u64,
+    pub si_dma_started: u64,
+    pub ai_dma_started: u64,
+    pub sp_dma_started: u64,
+    pub sp_tasks_admitted: u64,
+    pub rcp_tasks_started: u64,
+    pub rcp_tasks_completed: u64,
+    pub vi_interrupts: u64,
+}
+
+impl DeviceTraceSummary {
+    fn record(&mut self, kind: DeviceTraceKind) {
+        self.events = self
+            .events
+            .checked_add(1)
+            .expect("device event count overflow");
+        let counter = match kind {
+            DeviceTraceKind::PiDmaStarted(_) => Some(&mut self.pi_dma_started),
+            DeviceTraceKind::SiDmaStarted(_) => Some(&mut self.si_dma_started),
+            DeviceTraceKind::AiDmaStarted(_) => Some(&mut self.ai_dma_started),
+            DeviceTraceKind::SpDmaStarted(_) => Some(&mut self.sp_dma_started),
+            DeviceTraceKind::SpTaskAdmitted { .. } => Some(&mut self.sp_tasks_admitted),
+            DeviceTraceKind::RcpTaskStarted { .. } => Some(&mut self.rcp_tasks_started),
+            DeviceTraceKind::RcpTaskComplete(_) => Some(&mut self.rcp_tasks_completed),
+            DeviceTraceKind::ViInterrupt => Some(&mut self.vi_interrupts),
+            _ => None,
+        };
+        if let Some(counter) = counter {
+            *counter = counter.checked_add(1).expect("device event count overflow");
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -927,6 +970,8 @@ pub struct DeviceFabric<R: RomStorage, T: PiTimingModel> {
     events: BTreeMap<(Cycles, u64), DeviceEvent>,
     next_event_sequence: u64,
     trace: Vec<DeviceTraceEvent>,
+    trace_enabled: bool,
+    trace_summary: DeviceTraceSummary,
     next_trace_sequence: u64,
 }
 
@@ -987,6 +1032,8 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             events: BTreeMap::new(),
             next_event_sequence: 0,
             trace: Vec::new(),
+            trace_enabled: true,
+            trace_summary: DeviceTraceSummary::default(),
             next_trace_sequence: 0,
         }
     }
@@ -1528,6 +1575,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// programmed mode-derived duration.
     pub fn configure_tv_type(&mut self, tv_type: TvType) -> Result<Cycles, DeviceFault> {
         self.tv_type = Some(tv_type);
+        self.vi_epoch = self.now;
         self.refresh_vi_interval_from_standard()?;
         Ok(self
             .vi_field_interval
@@ -1542,7 +1590,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             .programmed_field_cycles(self.vi_registers[7], self.vi_registers[6])
             .unwrap_or_else(|| tv_type.nominal_field_cycles());
         self.vi_field_interval = Some(Cycles::new(interval));
-        self.vi_epoch = self.now;
+        // Timing-register writes alter the running VI cadence; they do not
+        // restart the beam at scanline zero. Keeping the IPL/configuration
+        // epoch prevents a VI manager that rewrites its mode every retrace
+        // from scheduling VI_INTR again a few scanlines after acknowledgement.
         self.reschedule_vi_interrupt()
     }
 
@@ -1626,6 +1677,20 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     pub fn trace(&self) -> &[DeviceTraceEvent] {
         &self.trace
+    }
+
+    pub const fn trace_summary(&self) -> DeviceTraceSummary {
+        self.trace_summary
+    }
+
+    /// Control diagnostic event retention without changing device behavior or
+    /// the constant-space transition summary. Disabling also releases events
+    /// already retained by the current exploratory run.
+    pub fn set_trace_enabled(&mut self, enabled: bool) {
+        self.trace_enabled = enabled;
+        if !enabled {
+            self.trace.clear();
+        }
     }
 
     /// Shim entry path. Raw MMIO converges here after latching its registers.
@@ -2722,8 +2787,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                                     );
                                 }
                             }
-                            rdram
-                                .dma_write_bytes(request.dram_addr.offset() as usize, &self.pif_ram)
+                            rdram.dma_write_bytes(
+                                crate::rom::DmaWriterChannel::Si,
+                                request.dram_addr.offset() as usize,
+                                &self.pif_ram,
+                            )
                         }
                         SiDmaKind::ControllerQuery | SiDmaKind::ControllerRead => {
                             execute_pif(self.now, &mut self.pif_ram, &mut self.pi_dma);
@@ -2765,7 +2833,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                                 .map_err(DeviceFault::SpDmaMemory)?;
                             for (row, line) in bytes.chunks_exact(line_len).enumerate() {
                                 let offset = request.dram_addr.offset() as usize + row * row_stride;
-                                rdram.dma_write_bytes(offset, line);
+                                rdram.dma_write_bytes(
+                                    crate::rom::DmaWriterChannel::Sp,
+                                    offset,
+                                    line,
+                                );
                             }
                         }
                     }
@@ -2834,16 +2906,19 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     }
 
     fn record(&mut self, kind: DeviceTraceKind) {
+        self.trace_summary.record(kind);
         let sequence = self.next_trace_sequence;
         self.next_trace_sequence = self
             .next_trace_sequence
             .checked_add(1)
             .expect("device trace sequence overflow");
-        self.trace.push(DeviceTraceEvent {
-            at: self.now,
-            sequence,
-            kind,
-        });
+        if self.trace_enabled {
+            self.trace.push(DeviceTraceEvent {
+                at: self.now,
+                sequence,
+                kind,
+            });
+        }
     }
 }
 
@@ -2852,7 +2927,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 mod tests {
     use super::*;
     use crate::rdram::Rdram;
-    use crate::rom::InMemoryRom;
+    use crate::rom::{DmaWriterChannel, InMemoryRom, ProcessDmaMemory};
 
     #[derive(Clone, Copy)]
     struct TestTiming(Cycles);
@@ -2876,6 +2951,96 @@ mod tests {
             PiDma::new(InMemoryRom::new(rom)),
             TestTiming(Cycles::new(12)),
         )
+    }
+
+    #[test]
+    fn device_writes_name_the_exact_dma_producer() {
+        let mut pi = fabric();
+        let mut pi_storage = [0u8; 0x200];
+        let mut pi_writers = Vec::new();
+        let mut pi_committed = |channel, _, _| pi_writers.push(channel);
+        let mut pi_memory = unsafe {
+            ProcessDmaMemory::from_raw_parts(
+                pi_storage.as_mut_ptr(),
+                pi_storage.len(),
+                &mut pi_committed,
+            )
+        };
+        pi.start_pi_dma(PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0x20),
+            cart_addr: 0x10,
+            len: 4,
+        })
+        .unwrap();
+        pi.advance_to(Cycles::new(12), &mut pi_memory).unwrap();
+        drop(pi_memory);
+        drop(pi_committed);
+        assert_eq!(pi_writers, [DmaWriterChannel::Pi]);
+
+        let mut si = fabric();
+        si.set_si_latency(Cycles::new(1));
+        si.pif_ram_cpu_write_w(0, 0x1122_3344);
+        let mut si_storage = [0u8; 0x200];
+        let mut si_writers = Vec::new();
+        let mut si_committed = |channel, _, _| si_writers.push(channel);
+        let mut si_memory = unsafe {
+            ProcessDmaMemory::from_raw_parts(
+                si_storage.as_mut_ptr(),
+                si_storage.len(),
+                &mut si_committed,
+            )
+        };
+        si.start_si_dma(SiDmaRequest {
+            kind: SiDmaKind::PifToDram,
+            dram_addr: RdramAddr::from_offset(0x40),
+        })
+        .unwrap();
+        si.advance_to_with_pif(Cycles::new(1), &mut si_memory, |_, _, _| {})
+            .unwrap();
+        drop(si_memory);
+        drop(si_committed);
+        assert_eq!(si_writers, [DmaWriterChannel::Si]);
+
+        let mut sp = fabric();
+        sp.rsp_memory_mut()
+            .write_bytes(RspMemAddr::from_register(0), &[0x5a; 8])
+            .unwrap();
+        let mut sp_storage = [0u8; 0x200];
+        let mut sp_writers = Vec::new();
+        let mut sp_committed = |channel, _, _| sp_writers.push(channel);
+        let mut sp_memory = unsafe {
+            ProcessDmaMemory::from_raw_parts(
+                sp_storage.as_mut_ptr(),
+                sp_storage.len(),
+                &mut sp_committed,
+            )
+        };
+        sp.write_mmio(SP_MEM_ADDR_REG, 0).unwrap();
+        sp.write_mmio(SP_DRAM_ADDR_REG, 0x80).unwrap();
+        sp.write_mmio(SP_WR_LEN_REG, 7).unwrap();
+        sp.advance_to(Cycles::new(9), &mut sp_memory).unwrap();
+        drop(sp_memory);
+        drop(sp_committed);
+        assert_eq!(sp_writers, [DmaWriterChannel::Sp]);
+    }
+
+    #[test]
+    fn disabled_device_trace_retention_keeps_constant_space_summary() {
+        let mut fabric = fabric();
+        fabric.set_trace_enabled(false);
+        let request = PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0),
+            cart_addr: 0x1000_0010,
+            len: 4,
+        };
+
+        fabric.start_pi_dma(request).unwrap();
+
+        assert!(fabric.trace().is_empty());
+        assert_eq!(fabric.trace_summary().events, 1);
+        assert_eq!(fabric.trace_summary().pi_dma_started, 1);
     }
 
     fn complete_rsp_state() -> RspExecutionState {
@@ -4496,6 +4661,28 @@ mod tests {
     }
 
     #[test]
+    fn repeated_vi_mode_writes_preserve_the_running_field_epoch() {
+        let mut fabric = fabric();
+        let mut rdram = Rdram::new(0);
+        fabric.configure_tv_type(TvType::Ntsc).unwrap();
+        fabric.write_mmio(VI_V_SYNC_REG, 525).unwrap();
+        fabric.write_mmio(VI_H_SYNC_REG, 3_093).unwrap();
+        fabric.write_mmio(VI_INTR_REG, 2).unwrap();
+        let interval = fabric.vi_field_interval().unwrap();
+        let first = fabric.next_vi_deadline().unwrap();
+        fabric.advance_to(first, &mut rdram).unwrap();
+        fabric.write_mmio(VI_CURRENT_REG, 0).unwrap();
+
+        fabric.write_mmio(VI_V_SYNC_REG, 525).unwrap();
+        fabric.write_mmio(VI_H_SYNC_REG, 3_093).unwrap();
+
+        assert_eq!(
+            fabric.next_vi_deadline(),
+            Some(Cycles::new(first.get() + interval.get()))
+        );
+    }
+
+    #[test]
     fn vi_current_and_field_follow_progressive_and_interlaced_half_line_sequences() {
         let mut progressive = fabric();
         let mut rdram = Rdram::new(0);
@@ -4643,7 +4830,12 @@ mod tests {
     fn dpc_status_mode_commands_during_renderer_admission_survive_cancellation() {
         // (initial command, interleaved command, control mask, expected control after)
         let cases = [
-            (0x01, 0x02, DPC_STATUS_XBUS_DMEM_DMA, DPC_STATUS_XBUS_DMEM_DMA),
+            (
+                0x01,
+                0x02,
+                DPC_STATUS_XBUS_DMEM_DMA,
+                DPC_STATUS_XBUS_DMEM_DMA,
+            ),
             (0x02, 0x01, DPC_STATUS_XBUS_DMEM_DMA, 0),
             (0x04, 0x08, DPC_STATUS_FREEZE, DPC_STATUS_FREEZE),
             (0x08, 0x04, DPC_STATUS_FREEZE, 0),
@@ -4724,5 +4916,4 @@ mod tests {
             );
         }
     }
-
 }

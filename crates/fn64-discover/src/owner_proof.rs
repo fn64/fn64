@@ -21,6 +21,7 @@ use crate::facts::{
     RomAddressSpace,
 };
 use crate::partition::{same_bank_overlaps, Owner, Partition};
+use crate::resolve::{ClosureResult, IndirectProofState};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -226,6 +227,145 @@ struct Backing {
     rom_end: u32,
 }
 
+/// Bank-bound callable-entry authority for snapshot composition.
+///
+/// The only constructor consumes the authority-only closure. Candidate calls
+/// found solely through broad traversal therefore cannot enter this set and
+/// cannot promote an owner during snapshot's executable-evidence pass.
+pub(crate) struct AuthoritativeCallableEntries {
+    bank: String,
+    entries: BTreeSet<u32>,
+}
+
+pub(crate) fn exact_authority_direct_call(cfg: &Cfg, block: &BasicBlock) -> Option<(u32, u32)> {
+    let BlockTerminator::Call { target, .. } = &block.terminator else {
+        return None;
+    };
+    if block.end_va < block.start_va.saturating_add(8) {
+        return None;
+    }
+    let source_pc = block.end_va - 8;
+    (cfg.word_class.get(&source_pc) == Some(&WordClass::ProvenCode)
+        && cfg.word_class.get(&(source_pc + 4)) == Some(&WordClass::ProvenCode)
+        && cfg.direct_calls.contains(&(source_pc, *target)))
+    .then_some((source_pc, *target))
+}
+
+pub(crate) fn exhaustive_authority_call_site(
+    authority_closure: &ClosureResult,
+    block: &BasicBlock,
+) -> Option<u32> {
+    let BlockTerminator::ResolvedIndirect {
+        targets,
+        via_call: true,
+    } = &block.terminator
+    else {
+        return None;
+    };
+    if block.end_va < block.start_va.saturating_add(8) {
+        return None;
+    }
+    let site_pc = block.end_va - 8;
+    let cfg = &authority_closure.cfg;
+    if cfg.bank.is_empty()
+        || cfg.word_class.get(&site_pc) != Some(&WordClass::ProvenCode)
+        || cfg.word_class.get(&(site_pc + 4)) != Some(&WordClass::ProvenCode)
+    {
+        return None;
+    }
+    let mut records = authority_closure
+        .indirect
+        .iter()
+        .filter(|record| record.site_pc == site_pc && record.via_call);
+    let record = records.next()?;
+    if records.next().is_some()
+        || record.state != IndirectProofState::Exhaustive
+        || record.kind.is_none()
+        || record.targets.is_empty()
+    {
+        return None;
+    }
+    let mut cfg_targets = targets.clone();
+    cfg_targets.sort_unstable();
+    cfg_targets.dedup();
+    let mut evidence_targets = record.targets.clone();
+    evidence_targets.sort_unstable();
+    evidence_targets.dedup();
+    (cfg_targets == evidence_targets).then_some(site_pc)
+}
+
+impl AuthoritativeCallableEntries {
+    pub(crate) fn from_authority_closure(
+        authority_closure: &ClosureResult,
+        facts: &FactDb,
+        external_authorized_roots: &BTreeSet<u32>,
+    ) -> Self {
+        let cfg = &authority_closure.cfg;
+        let mut entries = BTreeSet::new();
+        for root in facts.proven_function_entries(&cfg.bank) {
+            if facts
+                .conclusion(&function_entry_subject(&BankAddr::new(&cfg.bank, root)))
+                .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
+            {
+                entries.insert(root);
+            }
+        }
+        for block in &cfg.blocks {
+            if let Some((_, target)) = exact_authority_direct_call(cfg, block) {
+                if cfg.blocks.iter().any(|block| block.start_va == target)
+                    || cfg
+                        .plain_delay_entry_aliases
+                        .iter()
+                        .any(|alias| alias.entry_va == target)
+                {
+                    entries.insert(target);
+                }
+            }
+        }
+        for block in &cfg.blocks {
+            if exhaustive_authority_call_site(authority_closure, block).is_none() {
+                continue;
+            }
+            if let BlockTerminator::ResolvedIndirect {
+                targets,
+                via_call: true,
+            } = &block.terminator
+            {
+                entries.extend(targets.iter().copied().filter(|target| {
+                    cfg.blocks.iter().any(|block| block.start_va == *target)
+                        || cfg
+                            .plain_delay_entry_aliases
+                            .iter()
+                            .any(|alias| alias.entry_va == *target)
+                }));
+            }
+        }
+        let proven_mappings = facts.proven_rom_mappings();
+        entries.extend(external_authorized_roots.iter().copied().filter(|&root| {
+            root.is_multiple_of(4)
+                && proven_mappings.iter().any(|fact| {
+                    matches!(
+                        fact,
+                        Fact::RomMapping {
+                            bank,
+                            va_start,
+                            va_end,
+                            ..
+                        } if bank == &cfg.bank && *va_start <= root && root < *va_end
+                    )
+                })
+        }));
+        Self {
+            bank: cfg.bank.clone(),
+            entries,
+        }
+    }
+
+    fn contains(&self, bank: &str, root: u32) -> bool {
+        self.bank == bank && self.entries.contains(&root)
+    }
+}
+
 /// Prove exact extents for every root represented by `cfg` or `partition`.
 ///
 /// `cfg` and `partition` must describe the same bank, and `image_bytes` at
@@ -273,6 +413,46 @@ pub fn prove_exact_owners_with_external_authority(
     image_va_start: u32,
     external_authorized_roots: &BTreeSet<u32>,
 ) -> OwnerProofReport {
+    prove_exact_owners_inner(
+        cfg,
+        partition,
+        facts,
+        image_bytes,
+        image_va_start,
+        external_authorized_roots,
+        None,
+    )
+}
+
+pub(crate) fn prove_exact_owners_with_callable_authority(
+    cfg: &Cfg,
+    partition: &Partition,
+    facts: &FactDb,
+    image_bytes: &[u8],
+    image_va_start: u32,
+    authority: &AuthoritativeCallableEntries,
+) -> OwnerProofReport {
+    prove_exact_owners_inner(
+        cfg,
+        partition,
+        facts,
+        image_bytes,
+        image_va_start,
+        &BTreeSet::new(),
+        Some(authority),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_exact_owners_inner(
+    cfg: &Cfg,
+    partition: &Partition,
+    facts: &FactDb,
+    image_bytes: &[u8],
+    image_va_start: u32,
+    external_authorized_roots: &BTreeSet<u32>,
+    callable_authority: Option<&AuthoritativeCallableEntries>,
+) -> OwnerProofReport {
     let mut roots: BTreeSet<u32> = cfg.proven_roots.iter().copied().collect();
     roots.extend(partition.owners.iter().map(|owner| owner.root_va));
     roots.extend(
@@ -282,7 +462,6 @@ pub fn prove_exact_owners_with_external_authority(
             .flat_map(|block| block.claimants.iter().copied()),
     );
     roots.extend(external_authorized_roots.iter().copied());
-
     let mut blocks_by_start: BTreeMap<u32, &BasicBlock> = BTreeMap::new();
     let mut duplicate_blocks = BTreeSet::new();
     for block in &cfg.blocks {
@@ -335,6 +514,7 @@ pub fn prove_exact_owners_with_external_authority(
                 image_bytes,
                 image_va_start,
                 external_authorized_roots,
+                callable_authority,
             )
         })
         .collect();
@@ -361,6 +541,7 @@ fn assess_root(
     image_bytes: &[u8],
     image_va_start: u32,
     external_authorized_roots: &BTreeSet<u32>,
+    callable_authority: Option<&AuthoritativeCallableEntries>,
 ) -> OwnerAssessment {
     let entry = BankAddr::new(&cfg.bank, root);
     let mut blockers = BTreeSet::new();
@@ -373,9 +554,14 @@ fn assess_root(
             partition_bank: partition.bank.clone(),
         });
     }
-    if !external_authorized_roots.contains(&root)
-        && !entry_is_authoritative(root, cfg, facts, blocks_by_start, proven_entries)
-    {
+    let entry_authoritative = callable_authority.map_or_else(
+        || {
+            external_authorized_roots.contains(&root)
+                || entry_is_authoritative(root, cfg, facts, blocks_by_start, proven_entries)
+        },
+        |authority| authority.contains(&cfg.bank, root),
+    );
+    if !entry_authoritative {
         blockers.insert(OwnerBlocker::EntryNotAuthoritative);
     }
 
@@ -705,10 +891,12 @@ fn validate_block(
         BlockTerminator::Branch {
             target,
             fallthrough,
+            ..
         }
         | BlockTerminator::BranchLikely {
             target,
             fallthrough,
+            ..
         } => {
             *fallthrough == block.end_va
                 && internal_target_is_block(*target)
@@ -806,6 +994,20 @@ fn validate_incoming(
                     });
                 }
             }
+            Fact::ResolvedCall { source, target } => {
+                let foreign_source = source.bank != owner.bank || !contains(source.pc);
+                if target.bank == owner.bank
+                    && contains(target.pc)
+                    && target.pc != owner.root_va
+                    && foreign_source
+                {
+                    blockers.insert(OwnerBlocker::IncomingEdge {
+                        source: source.pc,
+                        target: target.pc,
+                        edge: IncomingEdgeKind::ResolvedCall,
+                    });
+                }
+            }
             Fact::ObservedIndirectTarget { site, target, .. }
                 if target.bank == owner.bank
                     && contains(target.pc)
@@ -837,6 +1039,7 @@ fn validate_incoming(
             BlockTerminator::Branch {
                 target,
                 fallthrough,
+                ..
             } => {
                 edges.push((*target, IncomingEdgeKind::Branch));
                 edges.push((*fallthrough, IncomingEdgeKind::Fallthrough));
@@ -844,6 +1047,7 @@ fn validate_incoming(
             BlockTerminator::BranchLikely {
                 target,
                 fallthrough,
+                ..
             } => {
                 edges.push((*target, IncomingEdgeKind::BranchLikely));
                 edges.push((*fallthrough, IncomingEdgeKind::Fallthrough));
@@ -1040,6 +1244,86 @@ mod tests {
             }
             OwnerAssessment::Proven { .. } => panic!("expected unresolved frontier"),
         }
+    }
+
+    #[test]
+    fn callable_authority_is_bank_bound_and_fails_closed_on_mismatch() {
+        let bytes = asm(&[JR_RA, NOP]);
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let facts = facts_for(bytes.len() as u32, &[]);
+        let authority_closure = ClosureResult {
+            cfg: Cfg {
+                bank: "other".into(),
+                word_class: BTreeMap::new(),
+                blocks: Vec::new(),
+                direct_calls: Vec::new(),
+                tail_transfers: Vec::new(),
+                indirect_sites: Vec::new(),
+                plain_delay_entry_aliases: Vec::new(),
+                unsupported_delay_entries: Vec::new(),
+                proven_roots: Vec::new(),
+            },
+            indirect: Vec::new(),
+        };
+        let authority = AuthoritativeCallableEntries::from_authority_closure(
+            &authority_closure,
+            &facts,
+            &BTreeSet::from([BASE]),
+        );
+        let report = prove_exact_owners_with_callable_authority(
+            &cfg, &partition, &facts, &bytes, BASE, &authority,
+        );
+
+        assert!(frontier(&report.assessments[0])
+            .blockers
+            .contains(&OwnerBlocker::EntryNotAuthoritative));
+    }
+
+    #[test]
+    fn exact_direct_call_authority_rejects_malformed_or_unproven_delay_geometry() {
+        let target = BASE + 0x20;
+        let block = BasicBlock {
+            start_va: BASE,
+            end_va: BASE + 8,
+            terminator: BlockTerminator::Call {
+                target,
+                next: BASE + 8,
+            },
+        };
+        let mut cfg = Cfg {
+            bank: "bank".into(),
+            word_class: [
+                (BASE, WordClass::ProvenCode),
+                (BASE + 4, WordClass::ProvenCode),
+            ]
+            .into_iter()
+            .collect(),
+            blocks: vec![block.clone()],
+            direct_calls: vec![(BASE, target)],
+            tail_transfers: Vec::new(),
+            indirect_sites: Vec::new(),
+            plain_delay_entry_aliases: Vec::new(),
+            unsupported_delay_entries: Vec::new(),
+            proven_roots: vec![BASE],
+        };
+        assert_eq!(
+            exact_authority_direct_call(&cfg, &block),
+            Some((BASE, target))
+        );
+
+        let malformed = BasicBlock {
+            end_va: BASE + 4,
+            ..block.clone()
+        };
+        assert_eq!(exact_authority_direct_call(&cfg, &malformed), None);
+
+        cfg.word_class.insert(BASE + 4, WordClass::Unknown);
+        assert_eq!(exact_authority_direct_call(&cfg, &block), None);
+
+        cfg.word_class.insert(BASE + 4, WordClass::ProvenCode);
+        cfg.direct_calls.clear();
+        assert_eq!(exact_authority_direct_call(&cfg, &block), None);
     }
 
     #[test]

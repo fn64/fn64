@@ -5,25 +5,13 @@
 //! state differ from physical word identity, including a branch whose adjacent
 //! delay-slot VA is backed by a nonadjacent physical page.
 
-use fn64_recomp_rs::{emit_bank_runner, BankId, BankInput};
-use std::path::{Path, PathBuf};
+use fn64_recomp_rs::BankId;
+use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
+use std::path::PathBuf;
 use std::process::Command;
 
-fn current_rlib(deps: &Path) -> PathBuf {
-    std::fs::read_dir(deps)
-        .expect("read target deps")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
-                })
-        })
-        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-        .expect("fn64_recomp_rs rlib beside integration test")
-}
+mod support;
+use support::dev_interpreter_rlib;
 
 #[test]
 fn mapped_fetch_keeps_virtual_architecture_and_physical_generation_separate_across_lanes() {
@@ -316,7 +304,7 @@ fn main() {{
         .parent()
         .expect("target deps directory")
         .to_path_buf();
-    let rlib = current_rlib(&deps);
+    let rlib = dev_interpreter_rlib(&deps);
     let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--edition=2021")
         .arg(&source_path)

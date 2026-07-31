@@ -30,10 +30,10 @@
 //!    `resolve_jal` Match-vs-Ambiguous decision.
 
 use fn64_recomp_rs::{
-    call_host_or_recompiled, emit_module, resolve_host_function, set_function_entry_observer,
-    set_host_lookup, ModuleFunc, Rdram, RecompContext, RecompFunc, SymbolTable,
-    TranslatedFunctionIdentity,
+    call_host_or_recompiled, resolve_host_function, set_function_entry_observer, set_host_lookup,
+    Rdram, RecompContext, RecompFunc, TranslatedFunctionIdentity,
 };
+use fn64_recomp_rs_codegen::{emit_module, ModuleFunc, SymbolTable};
 
 thread_local! {
     static FUNCTION_ENTRIES: std::cell::RefCell<Vec<TranslatedFunctionIdentity>> = const {

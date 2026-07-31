@@ -229,6 +229,7 @@ fn callable_roots(facts: &FactDb, bank: &PhysicalBank) -> Vec<u32> {
                     | FunctionEntryEvidence::ResolvedJalr { .. }
                     | FunctionEntryEvidence::ExhaustiveIndirectCall { .. }
                     | FunctionEntryEvidence::TableEntry { .. }
+                    | FunctionEntryEvidence::HandlerTablePointer { .. }
             )
         {
             roots.insert(target.pc);

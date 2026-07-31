@@ -214,18 +214,18 @@ impl fmt::Display for DeviceTraceIngestError {
         if self.line == 0 {
             write!(formatter, "device trace: {}", self.message)
         } else {
-            write!(formatter, "device trace line {}: {}", self.line, self.message)
+            write!(
+                formatter,
+                "device trace line {}: {}",
+                self.line, self.message
+            )
         }
     }
 }
 
 impl std::error::Error for DeviceTraceIngestError {}
 
-fn validate_nonempty(
-    line: usize,
-    label: &str,
-    value: &str,
-) -> Result<(), DeviceTraceIngestError> {
+fn validate_nonempty(line: usize, label: &str, value: &str) -> Result<(), DeviceTraceIngestError> {
     if value.trim().is_empty() {
         Err(DeviceTraceIngestError::at(
             line,
@@ -285,7 +285,10 @@ pub fn ingest_jsonl<R: BufRead>(
         if record.ordinal() != next_ordinal {
             return Err(DeviceTraceIngestError::at(
                 line_number,
-                format!("expected ordinal {next_ordinal}, found {}", record.ordinal()),
+                format!(
+                    "expected ordinal {next_ordinal}, found {}",
+                    record.ordinal()
+                ),
             ));
         }
         next_ordinal = next_ordinal.checked_add(1).ok_or_else(|| {
@@ -655,7 +658,11 @@ mod tests {
         }])
         .unwrap();
         let err = ingest_jsonl(Cursor::new(no_header)).unwrap_err();
-        assert!(err.message.contains("first record must be a header"), "{}", err);
+        assert!(
+            err.message.contains("first record must be a header"),
+            "{}",
+            err
+        );
 
         let no_end = to_jsonl(&[header()]).unwrap();
         let err = ingest_jsonl(Cursor::new(no_end)).unwrap_err();

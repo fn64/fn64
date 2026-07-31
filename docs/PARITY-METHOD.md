@@ -39,6 +39,10 @@ the command below; no game-derived input or generated output is committed.
 ## Commands and claims
 
 ```sh
+# No-ROM contract checks and path-free phase plan. Neither invokes Cargo.
+scripts/lane-parity.sh --selftest
+scripts/lane-parity.sh --dry-run --observe 60
+
 # Authoritative mode (default): currently exits 2 before boot because the
 # generated callable-body sets are not aligned.
 FN64_GAME_DIR=/path/to/private/game-workspace scripts/lane-parity.sh 60
@@ -53,6 +57,15 @@ and can report only `OBSERVED MATCH` or `OBSERVED DIVERGENCE`. A matching
 observation is a useful end-to-end regression signal for the exercised output;
 it is not evidence that an empty C body was unreachable or semantically
 irrelevant.
+
+The native emitter build, emitter execution, callable-body test, C build, C
+run, Rust build, and Rust run are sequential phases. Each phase owns a fresh
+exact process group under the common 2048 MiB/40%-free memory guard; every Cargo
+compiler command is `-j1`, and the authority test also fixes one libtest thread.
+The C and Rust target paths remain distinct and unchanged. Compiler/linker
+children spawned by either Cargo build inherit that phase's process group, so a
+threshold crossing terminates the complete phase without crossing into the
+other lane. A native-emitter failure is an authority error, not a content skip.
 
 The current measured observation matches through swap 60 under shared
 guest-quiescence timing. A historical deeper observation first differed at

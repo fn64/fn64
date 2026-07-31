@@ -12,6 +12,62 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::fmt;
+
+/// Largest complete VROM file the default discovery path will decode.
+///
+/// This is deliberately larger than the ordinary N64 RDRAM image while still
+/// preventing a tiny Yaz0 input from turning an untrusted 32-bit declared
+/// length into a multi-gigabyte allocation. Callers with a tighter workspace
+/// budget should use the explicit limits variants.
+pub const DEFAULT_MAX_DECODED_VROM_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Transient allocation limits for materializing recovered VROM files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VromMaterializationLimits {
+    /// Maximum complete decoded file size. The limit is checked against both
+    /// the recovered VROM extent and the Yaz0 header before output allocation.
+    pub max_decoded_file_bytes: usize,
+}
+
+impl Default for VromMaterializationLimits {
+    fn default() -> Self {
+        Self {
+            max_decoded_file_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        }
+    }
+}
+
+/// Typed resource frontier from bounded VROM materialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VromMaterializationError {
+    DecodedFileLimitExceeded {
+        vrom_start: u32,
+        vrom_end: u32,
+        decoded_file_bytes: usize,
+        max_decoded_file_bytes: usize,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl fmt::Display for VromMaterializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DecodedFileLimitExceeded {
+                vrom_start,
+                vrom_end,
+                decoded_file_bytes,
+                max_decoded_file_bytes,
+            } => write!(
+                formatter,
+                "VROM file [0x{vrom_start:x},0x{vrom_end:x}) decoded length 0x{decoded_file_bytes:x} exceeds decoded-file limit 0x{max_decoded_file_bytes:x}"
+            ),
+            Self::Unavailable { reason } => formatter.write_str(reason),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileTableSearchConfig {
@@ -121,6 +177,23 @@ impl CandidateFileTable {
         start: u32,
         end: u32,
     ) -> Result<Vec<u8>, String> {
+        self.materialize_vrom_range_with_limits(
+            rom_bytes,
+            start,
+            end,
+            VromMaterializationLimits::default(),
+        )
+    }
+
+    /// [`Self::materialize_vrom_range`] with an explicit complete-file decode
+    /// cap. Oversized Yaz0 declarations fail before reserving output storage.
+    pub fn materialize_vrom_range_with_limits(
+        &self,
+        rom_bytes: &[u8],
+        start: u32,
+        end: u32,
+        limits: VromMaterializationLimits,
+    ) -> Result<Vec<u8>, String> {
         let matches: Vec<_> = self
             .records
             .iter()
@@ -140,8 +213,14 @@ impl CandidateFileTable {
             .get(record.rom_start as usize..physical_end as usize)
             .ok_or_else(|| "file backing exceeds normalized ROM".to_string())?;
         let expected_len = record.vrom_len() as usize;
+        if expected_len > limits.max_decoded_file_bytes {
+            return Err(format!(
+                "VROM file length 0x{expected_len:x} exceeds decoded-file limit 0x{:x}",
+                limits.max_decoded_file_bytes
+            ));
+        }
         let file = if physical.starts_with(b"Yaz0") {
-            decompress_yaz0(physical, expected_len)?
+            decompress_yaz0(physical, expected_len, limits.max_decoded_file_bytes)?
         } else {
             if physical.len() != expected_len {
                 return Err(format!(
@@ -154,6 +233,54 @@ impl CandidateFileTable {
         let relative_start = (start - record.vrom_start) as usize;
         let relative_end = (end - record.vrom_start) as usize;
         Ok(file[relative_start..relative_end].to_vec())
+    }
+
+    /// Diagnostic form of [`Self::materialize_vrom_range_with_limits`]. The
+    /// resource-cap case is typed so recovery can report it separately from
+    /// malformed or absent backing.
+    pub fn materialize_vrom_range_diagnostic_with_limits(
+        &self,
+        rom_bytes: &[u8],
+        start: u32,
+        end: u32,
+        limits: VromMaterializationLimits,
+    ) -> Result<Vec<u8>, VromMaterializationError> {
+        let matches: Vec<_> = self
+            .records
+            .iter()
+            .copied()
+            .filter(|record| record.contains_vrom(start, end))
+            .collect();
+        let [record] = matches.as_slice() else {
+            return Err(VromMaterializationError::Unavailable {
+                reason: format!(
+                    "VROM range [0x{start:x},0x{end:x}) has {} recovered file mappings; expected exactly one",
+                    matches.len()
+                ),
+            });
+        };
+        let physical_end =
+            record
+                .physical_end()
+                .ok_or_else(|| VromMaterializationError::Unavailable {
+                    reason: "file backing end overflowed u32".to_string(),
+                })?;
+        let _physical = rom_bytes
+            .get(record.rom_start as usize..physical_end as usize)
+            .ok_or_else(|| VromMaterializationError::Unavailable {
+                reason: "file backing exceeds normalized ROM".to_string(),
+            })?;
+        let decoded_file_bytes = record.vrom_len() as usize;
+        if decoded_file_bytes > limits.max_decoded_file_bytes {
+            return Err(VromMaterializationError::DecodedFileLimitExceeded {
+                vrom_start: record.vrom_start,
+                vrom_end: record.vrom_end,
+                decoded_file_bytes,
+                max_decoded_file_bytes: limits.max_decoded_file_bytes,
+            });
+        }
+        self.materialize_vrom_range_with_limits(rom_bytes, start, end, limits)
+            .map_err(|reason| VromMaterializationError::Unavailable { reason })
     }
 }
 
@@ -217,10 +344,7 @@ fn record_valid(
         return vrom_well_formed;
     }
 
-    if !vrom_well_formed
-        || !record.rom_start.is_multiple_of(4)
-        || record.rom_start >= rom_len
-    {
+    if !vrom_well_formed || !record.rom_start.is_multiple_of(4) || record.rom_start >= rom_len {
         return false;
     }
     let Some(physical_end) = record.physical_end() else {
@@ -351,7 +475,11 @@ pub fn recover_file_table(rom_bytes: &[u8], config: &FileTableSearchConfig) -> F
 /// Bounded Yaz0 decoder matching the public stream format used by N64 load
 /// images. Malformed streams stay unavailable rather than yielding partial
 /// bytes.
-fn decompress_yaz0(input: &[u8], expected_len: usize) -> Result<Vec<u8>, String> {
+fn decompress_yaz0(
+    input: &[u8],
+    expected_len: usize,
+    max_decoded_file_bytes: usize,
+) -> Result<Vec<u8>, String> {
     if input.len() < 16 || &input[..4] != b"Yaz0" {
         return Err("missing or truncated Yaz0 header".into());
     }
@@ -359,6 +487,11 @@ fn decompress_yaz0(input: &[u8], expected_len: usize) -> Result<Vec<u8>, String>
     if declared != expected_len {
         return Err(format!(
             "Yaz0 output length 0x{declared:x} differs from expected VROM length 0x{expected_len:x}"
+        ));
+    }
+    if declared > max_decoded_file_bytes {
+        return Err(format!(
+            "Yaz0 output length 0x{declared:x} exceeds decoded-file limit 0x{max_decoded_file_bytes:x}"
         ));
     }
     let mut source = 16usize;
@@ -515,13 +648,14 @@ mod tests {
         let recovery = recover_file_table(&rom, &FileTableSearchConfig::n64_family());
         let table = recovery.admitted_table.expect("one file table");
 
-        assert_eq!(table.records, records, "the run must span the unbacked file");
+        assert_eq!(
+            table.records, records,
+            "the run must span the unbacked file"
+        );
         assert!(has_no_physical_backing(table.records[2]));
         // The unbacked file yields no bytes, so nothing downstream can mistake
         // it for backed content.
-        assert!(table
-            .materialize_vrom_range(&rom, 0x3000, 0x5000)
-            .is_err());
+        assert!(table.materialize_vrom_range(&rom, 0x3000, 0x5000).is_err());
         // And the record after it is reachable, which is the whole point.
         assert_eq!(table.translate_uncompressed(0x5100), Some(0x8100));
     }
@@ -555,5 +689,40 @@ mod tests {
         let recovery = recover_file_table(&rom, &FileTableSearchConfig::n64_family());
         assert!(recovery.candidate_tables.is_empty());
         assert!(recovery.admitted_table.is_none());
+    }
+
+    #[test]
+    fn tiny_yaz0_with_huge_declared_output_fails_before_decode() {
+        const HUGE_OUTPUT: u32 = 0xffff_fff0;
+        let mut rom = Vec::from(&b"Yaz0"[..]);
+        rom.extend_from_slice(&HUGE_OUTPUT.to_be_bytes());
+        rom.extend_from_slice(&[0; 8]);
+        let table = CandidateFileTable {
+            table_rom_offset: 0,
+            record_stride: 0x10,
+            vrom_alignment: 4,
+            field_vrom_start: 0,
+            field_vrom_end: 4,
+            field_rom_start: 8,
+            field_rom_end: 12,
+            records: vec![FileTableRecord {
+                vrom_start: 0,
+                vrom_end: HUGE_OUTPUT,
+                rom_start: 0,
+                rom_end: rom.len() as u32,
+            }],
+        };
+
+        let error = table
+            .materialize_vrom_range_with_limits(
+                &rom,
+                0,
+                4,
+                VromMaterializationLimits {
+                    max_decoded_file_bytes: 1024,
+                },
+            )
+            .expect_err("oversized declaration must not allocate");
+        assert!(error.contains("exceeds decoded-file limit"), "{error}");
     }
 }

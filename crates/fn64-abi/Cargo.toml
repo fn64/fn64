@@ -15,6 +15,7 @@ crate-type = ["lib", "staticlib"]
 [features]
 default = []
 recomp-rs = ["dep:fn64-recomp-rs"]
+dynamic-mapped-runtime = ["recomp-rs", "fn64-recomp-rs/dynamic-mapped-runtime"]
 
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
@@ -36,7 +37,7 @@ fn64-audio = { path = "../fn64-audio" }
 # fn64-runtime uses, per docs/DESIGN.md section 2's single stackful-
 # coroutine model; not a second, competing coroutine implementation.
 corosensei = "0.3"
-fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true }
+fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true, default-features = false, features = ["aot-runtime"] }
 sha2 = "0.10"
 
 [dev-dependencies]
@@ -45,3 +46,4 @@ sha2 = "0.10"
 # dependency, keeping fn64-abi's real dependency graph backend-agnostic per
 # docs/DECOUPLING.md.
 fn64-render-reference = { path = "../fn64-render-reference" }
+fn64-recomp-rs = { path = "../fn64-recomp-rs", features = ["dev-interpreter"] }

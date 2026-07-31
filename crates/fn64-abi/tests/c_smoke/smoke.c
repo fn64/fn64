@@ -61,6 +61,7 @@ extern void osInitialize_recomp(uint8_t *rdram, RecompContext *ctx);
 extern void osContInit_recomp(uint8_t *rdram, RecompContext *ctx);
 extern void osContSetCh_recomp(uint8_t *rdram, RecompContext *ctx);
 extern void osPfsIsPlug_recomp(uint8_t *rdram, RecompContext *ctx);
+extern void __osSiDeviceBusy_recomp(uint8_t *rdram, RecompContext *ctx);
 
 int main(void) {
     uint8_t rdram[64] = {0};
@@ -98,6 +99,14 @@ int main(void) {
     // all beyond the pointer itself being valid.
     RecompContext init_ctx = {0};
     osInitialize_recomp(rdram, &init_ctx);
+
+    RecompContext si_busy_ctx = {0};
+    __osSiDeviceBusy_recomp(rdram, &si_busy_ctx);
+    if (si_busy_ctx.r2 != 0) {
+        fprintf(stderr, "__osSiDeviceBusy_recomp: expected idle, got %#llx\n",
+                (unsigned long long)si_busy_ctx.r2);
+        return 1;
+    }
 
     // Controller Manager signatures: initialization and osPfsIsPlug are
     // synchronous and therefore require a live guest coroutine. Retaining

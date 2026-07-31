@@ -10,7 +10,10 @@ mechanically established:
 
 - the bank has a proven load-image identity;
 - the entry is authoritative: a proven function-entry fact, direct call from
-  proven code, or exhaustive computed call;
+  proven code, or exhaustive computed call. Multi-bank composition carries
+  both call forms across bank boundaries only when the source instruction and
+  delay slot are proven code; a computed call additionally requires one
+  unambiguous exhaustive analysis whose target set exactly matches the CFG;
 - the owner's blocks form one aligned, gap-free span;
 - each instruction and every transfer delay slot is proven code;
 - the span has one unambiguous ROM backing and complete proven-executable
@@ -73,18 +76,65 @@ implementation source is a behavior input.
 
 `fn64-discover::block_proof` exposes a deliberately smaller
 `ReachableCodeBlock` type for the `block_aot` path. A block is admitted only
-when its partition owner has an authoritative entry, every word is
-`ProvenCode`, the terminator is neither invalid, missing-delay, nor
-ran-off-end, and exactly one proven ROM mapping backs its bytes. Ambiguous or
-unowned blocks and unauthoritative traversal seeds remain typed candidates.
+when at least one independently authoritative partition-claimant root reaches
+it, every word is `ProvenCode`, the terminator is neither invalid,
+missing-delay, nor ran-off-end, and exactly one proven ROM mapping backs its
+bytes. The block carries the sorted nonempty set of authoritative reachability
+roots, not a fabricated singular function owner. Competing function roots do
+not weaken executable-byte proof; an unowned block or a block reached only
+from unauthoritative traversal seeds remains a typed candidate.
+
+Snapshot composition also projects reachability from the separately built
+authority-only CFG onto broad exploratory blocks. The projection is
+crate-private, derives its roots only from the authority closure's own
+partition, and retains a broad successor only when authority contains the
+exact same source site, destination, and transfer kind. The sole compatible
+refinement is a consecutive plain fallthrough wholly inside the ordinary prefix
+of one authority block; it cannot cross a control/terminal boundary. A bank-end
+fallthrough is instead an exact typed `ran_off_end_fallthrough` authority edge.
+Before broad traversal, a non-authoritative root that lands on an authority
+delay slot is omitted from the traversal set while its candidate fact remains
+recorded. An exact transfer to an ordinary instruction at that address is a
+typed delay-entry alias: direct entry executes that word and continues at the
+next word, while the predecessor CFG block retains its inseparable control and
+delay pair. Call-derived aliases carry callable authority; branch and tail
+aliases carry reachability only. A control-shaped delay entry remains rejected.
+In this mode only
+projected roots count: broad candidate-owner roots cannot feed back into
+executable authority. Proving the block does not promote its candidate
+function owner.
+
+Snapshot's two owner passes share a bank-bound callable-entry capability built
+from that same authority closure, proven entry facts, and already-vetted
+cross-bank roots. Consequently a direct or exhaustive computed call found only
+by broad candidate traversal cannot become same-bank or cross-bank callable
+authority after reached executable ranges are derived.
+
+Cross-bank direct and exhaustive-resolved calls advance one monotone authority
+fixed point only when an exact target VA identifies one target bank. A VA in
+several overlapping generations confers neither reachability nor semantic
+callback-argument authority: choosing any of those bytes requires a future
+typed activation-compatibility capability. Unique late-wave roots can still
+expose another exact direct or exhaustive-resolved call in the next wave.
+Authority records remain uniquely counted under the composition cap and
+ordered canonically.
+Bank names are the fixed-point identity key, so multi-bank composition rejects
+duplicate input names before preparing or cloning bank state.
+
+A target also contained by the source bank is not projected onto overlapping
+sibling banks: runtime generation segments can replace only part of an image,
+so VA containment alone proves neither that execution stays in the source
+generation nor that a sibling is active at the target. This is a deliberate
+completeness loss until composition has typed activation-compatibility
+evidence; choosing a sibling by address alone would be unsound.
 
 This does not manufacture an executable section boundary and does not produce
-an `ExactFunctionOwner`. It proves only the bank-qualified block bytes and
-their control exit. Thus local data, padding, split assembly, and uncertain
-historical function boundaries can block function AOT without blocking an
-already-reached code block. Unresolved indirect exits remain visible for the
-bank-qualified dispatcher; block proof does not claim their target set is
-closed.
+an `ExactFunctionOwner`. It proves only the bank-qualified block bytes, their
+authoritative reachability, and their control exit. Thus local data, padding,
+split assembly, and uncertain historical function boundaries can block
+function AOT without blocking an already-reached code block. Unresolved
+indirect exits remain visible for the bank-qualified dispatcher; block proof
+does not claim their target set is closed.
 
 ## Reached-code executable derivation
 
@@ -103,8 +153,11 @@ derivation between an authority-only owner pass and the final owner pass, so
 the former `not_proven_executable` blocker is discharged exactly where an
 assessment's full extent lies inside reached proven code.
 
-`BlockPackV1` is the serialization boundary for admitted blocks. It carries
-only bank identity, geometry, terminators, and content digests. Re-
+The Rust `BlockPackV1` type's schema-v2 wire is the serialization boundary for
+admitted blocks. Its authoritative emitter requires the opaque move-only
+validated composition produced by byte-verifying snapshot construction; a
+deserialized snapshot cannot mint that capability. The pack carries only bank
+identity, geometry, ROM address space, terminators, and content digests. Re-
 materialization verifies the normalized ROM identity and every block digest,
 then supplies each disjoint span separately to the sparse arbitrary-PC
 emitter. No bounding-range conversion is permitted: holes have no instruction

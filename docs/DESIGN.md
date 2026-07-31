@@ -19,7 +19,9 @@ fn64-render    backend-neutral render seam, exact microcode admission, and diagn
 fn64-render-reference deterministic pure-Rust ReferenceBackend
 fn64-render-rt64 FFI bridge to RT64 (C++)
 fn64-certification executable behavioral evidence gates over the public renderer seams
-fn64-recomp / fn64-recomp-rs  the Rust-emitting recompiler and its whole-ROM driver (§1.1's `rs` lane)
+fn64-recomp-rs  linked typed execution runtime for generated VR4300 Rust runners
+fn64-recomp-rs-codegen  build-side Rust emitter and whole-ROM driver (§1.1's `rs` lane)
+fn64-recomp  N64Recomp adapter for the comparison lane
 fn64-audio     RSP audio ucode execution
 fn64-diff      the first-divergence comparator, pure/no-I/O (§4's comparator lane)
 fn64-discover  ROM discovery: symbol/section metadata without a decomp (Phase D)
@@ -170,9 +172,11 @@ already cites RT64's MIT `shared/rt64_color_combiner.h` as its algorithm
 source; reading MIT RT64 is an allowed source under AGENTS.md, GPL runtime
 internals are not.
 
-No longer planned-only: `fn64-recomp`/`fn64-recomp-rs`, the Rust-emitting
-recompiler `README.md` deferred until the runtime earned it, are built and
-boot OoT. They add the second lane below.
+No longer planned-only: `fn64-recomp-rs-codegen` emits typed Rust against the
+linked `fn64-recomp-rs` execution runtime. Generated shard crates depend only
+on that runtime package, so an emitter-only edit cannot invalidate their
+normal Cargo dependency edge. `fn64-recomp` remains the N64Recomp comparison
+adapter. Together they provide the second lane below.
 
 ### 1.0 The outer boundary: fn64 owns its toolchain
 
@@ -364,6 +368,173 @@ executor now has an explicit `boot_thread0_block_program` lane that owns the
 registered program for thread 0 and spawned OSThreads. Generated instruction
 checkpoints suspend to the executor, which charges their instruction count to
 virtual time and services device deadlines before another block can run. The
+reset context may arrive with Status.FR set, but a libultra-created OSThread
+enters the FR=0 paired-register view; the typed creation seam clears FR instead
+of inheriting that reset-only view while retaining its other modeled Status
+fields. This matches the fixed saved-SR shape in N64Recomp-generated
+`osCreateThread` and keeps paired-double construction architectural. The
+thread-0 boundary requires a canonical `fn64.boot-context.v1` value instead of
+inventing a zeroed IPL3 handoff. That value binds the normalized ROM, complete
+IPL3 digest, header-derived TV standard, and entry PC; restores all GPRs,
+HI/LO, and modeled CP0 state; and seeds the executor's Count, Compare, and
+captured IP7 latch before the coroutine exists. ROM, TV, and entry mismatches
+fail loudly. `tools/mupen-trace/mupen_trace.c` creates the out-of-tree value
+through the public black-box debugger boundary at the pause immediately before
+the ROM-header entry executes. Its wire retains every raw CP0 slot, including
+slots the runtime cannot yet execute. The producer is implemented and
+syntax-checked. A timeout recovery race initially queued a second debugger step
+between retirement and callback publication, losing a pre-window pause and
+moving captured Count by 66 ticks. The producer now owns exactly one
+outstanding step and traps on callback stall. Twenty consecutive NWXE
+black-box captures reached the same 5,079,153-instruction pre-window horizon
+and were byte-identical. The private capture report retains both content
+digests out of tree; this document does not freeze ungated digest literals. A
+real fn64 first-entry comparison is
+now wired at the generated-runner boundary: the captured NWXE context matched
+all GPRs, HI/LO, and every modeled CP0 field before instruction one. The sparse
+resident pack's checked word access now routes aligned translated MMIO through
+the same live device hook as the whole-function lane before testing RDRAM
+backing, closing the SI-status fault at `0x80038268` / `0xffffffffa4800018`.
+The NWXE pack also proves `__osSiDeviceBusy` by its exact six-word semantic
+body, records the unique matched address in the generated artifact, and gives
+that address static host-call precedence through the typed adapter. An unknown
+or ambiguous signature fails the build instead of becoming an address-only
+override. A first differential target snapshot disproved the apparent TLB
+frontier: three independent black-box runs reached `0x80036f10` after exactly
+261,748 retired window instructions with `$t8 = 0xffffffff80048860`, while
+fn64 had loaded `0x60880480`, its exact byte reversal. The block example had
+copied flat big-endian ROM bytes directly into native-word RDRAM storage; it now
+uses the same logical IPL3 DMA materialization as every other boot harness.
+After that correction, ten consecutive fn64 runs first stopped identically at
+the honest sparse-pack miss for newly created thread entry `0x800004d0`.
+Scenario AOT admission now consumes at least three byte-identical,
+normalized-ROM-bound black-box traces and unions their exact bank-generation
+PCs with the statically proven sparse bank. This does not promote those PCs to
+function-owner roots and does not claim scenario exhaustiveness. The public
+debugger exposes a branch and its delay slot as one step, so the producer no
+longer emits its former executed-PC exhaustiveness claim; pack admission reads
+and adds each observed control word's architecturally inseparable delay slot
+from the same normalized ROM mapping. Three regenerated traces were
+byte-identical. For the bounded NWXE trace, 1,929 distinct pause PCs plus 289
+required delay-slot words produce a 90-span, 2,517-word bank, including
+`0x800004d0`. The first ten consecutive fn64 runs passed that entry and stopped
+at a separate runtime-behavior fault: a guest load at `0x8002a8d8` addressed
+the cartridge window `0xffffffffb0000000`. The typed raw-word seam now maps
+canonical KSEG0/KSEG1 PI-domain-1 address-2 reads to the same installed,
+read-only ROM source used by PI DMA; noncanonical aliases remain rejected.
+Ten consecutive corrected runs pass that access and stop identically at the
+next runtime frontier, where VI scanout construction sees a partially
+programmed register image (`H_START` decodes to `0..0`) at retrace. An
+env-gated fn64 register trace proves these are raw guest writes rather than a
+queued host `OSViMode`: the guest fills V timing and scales, leaves H_START
+zero, then enables VI status. An independent public-debugger MMIO observation
+records the same values and no H_START transition. Its status transition can
+fall on either side of one adjacent debugger pause, so that diagnostic is not
+an instruction-exact timing oracle. A zero H or V interval now remains an
+inactive retained VI image; nonzero malformed intervals still trap. Ten
+consecutive corrected runs pass the former VI assertion and stop identically
+at the separate `present_render_backend: no render backend registered`
+frontier, with no earlier `AotMiss`. The live dispatcher includes current
+Status, Cause, EPC, and BadVAddr in a loud non-architectural gap; those fields
+are diagnostic context, not a claim that the gap committed an exception.
+The block example now registers the reference renderer and recompiles the
+complete one-MiB IPL3-resident image: all 262,144 aligned words are present,
+including words which decode to architectural RI behavior. A monolithic unit
+produced roughly 267 MiB of Rust and exceeded the two-minute compile gate. The
+pack therefore owns sixteen content-addressed 64 KiB bank crates. Each bank is
+still one immutable generation, but its callable is statically partitioned
+into sixteen 4 KiB subrunners; cross-subrunner control leaves through the
+ordinary typed resolver and never decodes at runtime. This changed the full
+`cargo check -j4` measurement to 62.67 seconds and the native debug build to
+107.56 seconds; an unchanged rebuild took 0.06 seconds. The debug binary was
+295 MiB. Three 400,000-step black-box traces, boot contexts, and completed
+general-exception-vector captures were byte-identical. The CPU-produced
+`0x80000180` preamble is a separate digest-checked generation rather than
+being folded into the resident bank. Its four admitted words are compared
+directly on each matching entry; only a mismatch hashes the live bytes to
+produce the same expected/actual `AotMiss` digest evidence. This keeps image
+identity fail-closed without paying SHA-256 setup on every exception.
+The production pack no longer assumes that this is the only capturable vector
+image. Each reproducible capture group is validated into a deterministic
+external-AOT catalog: it must cover at least one of the six modeled exception
+entries, its first observed fetch must be one of those entries, its range must
+not overlap another capture or any immutable ROM-backed shard, and its
+content-derived 64-bit bank ID must be collision-free. Generated lookup,
+digest gates, runners, and `CodeBank` registration iterate that catalog. The
+current evidence still owns only `0x80000180`; multi-image support is capacity
+for future allowed captures, not a claim that the other five vectors closed.
+
+Dense execution passed the former sparse-PC and renderer frontiers without an
+`AotMiss`. It exposed two runtime-only harness defects: missing typed SRAM
+registration, then eager RSP executable-write publication reborrowing the
+live `BlockProgram` from inside its own AOT MMIO instruction. NWXE now receives
+an in-memory `SramBanked` device. RSP writes only mark the generated runner's
+typed executable-write boundary; the outer live owner publishes after the
+runner returns and releases its program borrow, before another guest
+instruction executes. The apparent next destination at `0x800e1b90` was not
+indirect: typed `jr`/`jalr` provenance identified the direct `jal` at
+`0x80000884`. The active resident page made that target a preceding return's
+delay-slot NOP under the first page-wide identity scheme. That scheme was the
+bug: the capture's first `0x790` bytes are mutable data while the fetched
+suffix beginning at `0x800e1b90` is byte-identical to resident ROM
+`0xe2790..0xe3000`. Its `first_executed_pc` was caller-supplied, not observed.
+The trace-derived page generation has been removed, and ordinary build
+coverage now comes only from the complete resident image plus four
+mechanically recovered overlay recipes. Dense generated runners verify the
+exact instruction word immediately before execution. A non-likely control
+transfer also verifies its delay word before any branch effect; a likely
+branch verifies that word only on the taken path. Thus a neighboring data
+write cannot retire valid code, while a changed fetched instruction returns
+typed `ImageChanged` with zero retired instructions. The closed catalog then
+matches complete ROM-recovered overlay candidates and retries the same PC
+under the selected immutable bank. Unknown content remains a loud `AotMiss`,
+with no runtime translation or interpreter fallback. Focused compile-and-run
+gates cover mutable neighbors, changed instructions, annulled and taken likely
+delays, shard-end lookahead, and cross-shard fallthrough. Corrected two-million-
+and ten-million-step idle-boot runs execute resident AOT without an earlier
+`AotMiss` or false image change, but neither requests a recovered gameplay
+overlay. A deterministic controller scenario with an independent black-box
+trace, followed by ten-run validation, remains outstanding. The block
+harness's opt-in
+`FN64_BLOCK_PC_TRACE` diagnostic requires that minimum budget and writes the
+bank-qualified retired-PC stream reconstructed from typed runner-entry counts;
+it does not instrument or alter generated instruction semantics. The companion
+`FN64_BLOCK_HOST_TRACE` stream records typed host-call enter/exit anchors with
+thread, target, resume, GPR, HI/LO, and modeled CP0 state so differential
+normalization never guesses a substituted guest-function extent.
+Both histories remain complete by default. The long-running exploratory
+harness suppresses a history only when its corresponding trace environment
+variable is absent, preventing tens of millions of diagnostic entries from
+turning a bounded probe into unbounded memory growth. A digest-bound
+controller schedule advances by successful per-port controller-read ordinal,
+not instruction count. The current resident scenario reaches zero such reads,
+so controller replay is implemented but cannot yet steer this timeline.
+
+Later typed host discovery and timing work supersedes that resident-only
+frontier. Public-manual structural recognizers now bind `osSetTimer` and the
+four SP-task operations, controller initialization completes one operation,
+and repeated VI H/V timing writes no longer reset the running beam epoch.
+Ten consecutive current non-exploratory runs enter mechanically recovered
+overlay generation `0x5DEA0D1723E94993` at step 19,523 and
+`sim_time=13990253`, with a guarded peak of 134 MiB. The retained schedule is
+still unused because no standard-controller read occurs. A 100,000-step
+continuation completes overlay0 and services 130 audio tasks but submits no
+graphics task and enters no later overlay generation; that post-overlay
+application/graphics progression was the next runtime frontier at that point.
+Created OSThreads now enter with the generated `osCreateThread` FR=0 contract,
+which lets the current 65,000-step scenario submit fourteen graphics tasks.
+Recognized graphics LLE is included in phase timing separately from its HLE
+preflight. Native profiling showed its raw-DPC framebuffer commit dominated the
+old run: the reference renderer therefore stores the fixed 8 MiB RDRAM hidden
+coverage domain as a lazy 16 MiB packed dense sidecar rather than a hash map.
+The standalone diagnostic harness applies `opt-level=2` only to that handwritten
+renderer; generated shards retain their bounded low-memory profiles. The
+measured executor window fell from 49.584 s to 16.592 s without changing the
+step, simulation-time, device/task, or render-error observations.
+
+Reserved words in a dense bank now emit the architectural RI
+exception (ExcCode 10), including
+precise EPC/BD in a delay slot, rather than failing Rust code generation. The
 OoT Rust host can now explicitly select an out-of-tree generated pack source,
 hash-bind and preflight its entry/runner identities, and install it without a
 whole-function guest fallback. Missing pack input fails the build. The current
@@ -372,7 +543,509 @@ real OoT pack artifact exists to exercise that host path yet. Arbitrary-PC
 codegen emits direct boundaries for a supplied static host-JAL inventory and a
 distinct `ResolveCall` for dynamic JAL/JALR targets. The live resolver types
 those as either an installed host function or a bank-qualified guest target;
-generated `jr`/`jalr` recognizes only an explicit OSThread return sentinel.
+ordinary dense and sparse arms share one typed post-step boundary decision.
+The emitted arm still owns the architectural operation, CP0 Random advance,
+retirement count, and transfer. The shared helper only preserves the ordered
+choice of a committed executable write before a local budget checkpoint; at
+an artifact edge it drains a write but leaves transfer classification to the
+generated arm. This removes repeated exit construction from generated HIR
+without moving instruction semantics into the runtime. The helper is
+deliberately non-inlined so LLVM cannot recreate that body at every generated
+site. Its per-ordinary-instruction host call is an explicit runtime tradeoff:
+source shrink alone is not a performance result, and retention requires both a
+worst-shard compile/RSS comparison and an unchanged execution oracle with an
+acceptable runtime measurement.
+generated `jr`/`jalr` recognizes only an explicit thread-return target. A
+spawned OSThread uses the synthetic sentinel installed with its entry context;
+thread 0 instead uses the exact `$ra` in the validated header-handoff
+`BootContext`, because a normal ROM-bootstrap return targets IPL3/SP memory
+outside the game AOT pack.
+`fn64-recomp-rs` keeps the interpreter and `dynamic_mips` fallback behind the
+`dev-interpreter` feature. The final WM host selects `production-aot`, which
+implies `aot-runtime` and is compile-time incompatible with `dev-interpreter`;
+its standalone workspace explicitly uses Cargo resolver 2 so build-tool
+features remain separate from the linked target graph. Dense-pack manifests
+disable default features and select `aot-runtime`. An admitted mapped
+generation without a callable returns a named `MissingAotEntry`/`AotMiss`
+fault. Before a precompiled generation catalog becomes live, every shard must
+name an installed generated bank with exactly one matching contiguous range.
+This prevents activation of a catalog-only bank from retrying an `UnknownBank`
+without progress. The interpreter API is absent from the production build,
+while development/oracle tests keep the default feature for differential
+coverage.
+
+The `static-micro-op.v1` format separates immutable instruction data from a
+shared executor using one
+canonical eight-byte record: expected raw word, an exhaustive stable opcode,
+decoder-derived flags, and a zero reserved byte. The raw word remains the
+live-image verification and operand authority; the opcode cannot silently
+drift because its match covers every decoded `Instruction` variant without a
+wildcard, including an explicit reserved-instruction tag. The codegen-side
+artifact retains bank-qualified ordered span geometry and validates alignment,
+overlap, counts, digest, records, truncation, and trailing bytes. Separate
+source receipts bind the packer and the record mapping plus shared decoder;
+the runtime owns the sole artifact parser and codegen validation delegates to
+it.
+Exporting that API still changes the codegen
+crate's `lib.rs`, which the existing generated-emitter receipt hashes, so
+prepared typed-Rust artifacts correctly invalidate once.
+
+The experimental static-micro-op executor still cannot grant `production-aot`
+authority. Every admitted non-control word now enters the lane-neutral
+`execute_straight_word` kernel using the exact raw word; the kernel decodes
+that word internally, so a caller cannot pair one verified word with another
+decoded operation. BEQ/BEQL control pairs and their narrow delay slice remain
+local to this executor; other control-shaped words fail loudly.
+
+The dense-runner differential compares the exact `BlockRun`, complete
+`RecompContextEvidenceSnapshotV1`, full RDRAM, and ordered MMIO events. Its
+fixtures cover straight integer, memory, executable-write, direct-MMIO,
+mapped/TLB data-alias, COP0 Random/Count, ERET, COP1, prior-retirement fault,
+live-word mismatch, branch-likely annulment, and V2 lookahead behavior. This
+proves integration equivalence between the two runners, not an independent ISA
+oracle: both intentionally share semantic/runtime helpers. Instruction
+live-word verification still uses the direct-RDRAM dense helper, so mapped/TLB
+instruction-fetch identity, the remaining control/delay families, and
+host-call transfer boundaries remain promotion gates.
+
+V1/V2 executor receipts remain frozen. V3 additionally binds `fpu.rs` and the
+complete manifest/lib/decoder/execution/runtime/pack/executor/semantic source
+set. Generated-runner runtime receipt V2 likewise adds `fpu.rs`; static
+execution receipt V2 distinguishes `dynamic-mapped-runtime` from the broader
+development interpreter.
+
+A control-shaped record is not rejected merely because the preceding record
+also has a delay slot. The second record remains a valid arbitrary direct entry;
+only executing the first pair reaches the architecturally unpredictable nested
+control, where the experimental executor returns its loud typed unsupported
+boundary. Artifact admission still requires every control to have a delay
+record. V2 closes the distinct package-boundary shape while preserving every
+V1 API: a span header explicitly tags zero or one appended delay-only record.
+The executor can reach it only from the final owned control, live-verifies it
+at `end`, and excludes it from direct entry, owned instruction counts, and the
+bank identity derived from owned words. This represents
+`wm2000-block-overlay-3-shard-03`'s final branch at `0x80121b8c` and affine
+lookahead at `0x80121b90` without turning the latter into owned code. The
+content-silent V2 WM profile admits all 35 packages: 516,688 owned instructions
+in 4,135,951 bytes; the 67-byte V1 delta is 35 one-byte span tags plus four
+eight-byte lookahead records. Ten consecutive real-ROM profiles returned the
+same package count, owned-instruction count, byte count, and inventory digest.
+
+The authority-capable catalog lane is now separate from that legacy live
+builder. `CatalogResolverInstallV1` consumes the canonical block program and
+exact host-function inventory; its boot API accepts no resolver callback or
+ambient host lookup. `CatalogGenerationInstallV1` additionally consumes a
+closed generation inventory whose complete invalidation VA ranges are tiled by
+explicit physical-RDRAM spans. The spans support noncontiguous page mappings,
+are bounded by the 8 MiB device, and drive both physical-byte digest selection
+and the executable-write denominator. Active generation ownership is resolved
+before static code. An inactive owned target becomes a typed activation
+boundary; generation shard banks are excluded from ordinary static fallback,
+and an unclaimed static span may not intersect generation ownership. CPU and
+host/DMA writes retire every active segment of each affected image before the
+next resolution. The live evidence includes the complete immutable inventory,
+backing map, current active segments, pending physical writes, and the
+canonical executable-mutation journal. The recompiler boundary assigns every
+write event one of the fixed eight writer channels; producer-less notification
+is not an API. Device commits retain PI/SI/SP identity through `DmaMemory`.
+
+The physically backed catalog also exposes a thread-local diagnostic observer
+after a complete live physical-image digest has matched one admitted generation
+and that generation has been published active. Its event records the requested
+PC, selected generation and entry, matched image digest, whether publication
+was new, and retired generations. Failed and compatibility/unbacked activation
+paths emit nothing. The callback runs after publication and must not panic or
+recursively activate through ambient host state. This is trace-local runtime
+observability, not a durable receipt: it neither binds a catalog definition nor
+proves static reachability, catalog completeness, unobserved paths, or writer
+closure. Any retained diagnostic must join it to the installed catalog's
+canonical-definition identity. Runner entry remains a separate later event.
+
+The compatibility resolver constructor still accepts an arbitrary
+`HostFunctionCatalogV1`, but its evidence is explicitly non-authoritative.
+The authority-capable constructor instead consumes an opaque ABI-issued host
+catalog: callers provide only aligned guest target PCs plus stable named shim
+IDs, while fn64-abi privately selects the safe-Rust callable and a conservative
+writer-effect declaration. Its receipt hash is bound into both resolver and
+writer-program model identity. This semantic addition advances those evidence
+domains to `fn64.catalog-resolver-install.v2` and
+`fn64.canonical-writer-program-model.v2`; retained V1 names describe the old
+target-only model. A caller-supplied function pointer or effect
+label cannot manufacture that authority. This is a prerequisite for, not a
+claim of, SI or any other non-bootstrap writer-channel completion.
+
+Generated-runner source identity has a deliberately weaker boundary. The WM
+Cargo build now hashes the exact checked-in root manifest/lock/build/adapter
+sources, the shared shard build/lib sources and all 35 shard manifests. Each
+linked bank binds its complete code words/geometry, generated composite-source
+digest, subrunner count, and adapter role. `fn64-recomp-rs-codegen` issues the
+exact emitter-source receipt, while `fn64-recomp-rs` separately issues the
+linked execution/runtime receipt plus its feature receipt. That runtime
+receipt includes `generated_support.rs`, the documented typed cold boundary
+used by emitted runners for shared synchronous-fault construction and
+retirement. The lower
+`GeneratedRunnerSourceAttestationV2` binds that pointer-free projection while
+explicitly treating the emitter identity as externally measured.
+It is not callable semantics authority: safe Rust cannot prove that an opaque
+function pointer from a separately compiled crate came from those source
+bytes, and the public fields can be paired with another callable. Therefore
+the generic and source-attested catalog constructors expose no receipt that SI
+completion may consume. `fn64-boot-harness` now owns the separate frozen Cargo
+build and exact compiler-artifact selection. Its selected WM child has one
+fixed identity argument which constructs the canonical block program without
+installing devices or starting guest execution, emits one deny-unknown
+protocol envelope sorted by bank, and exits. The envelope binds the exact
+manifest/lock, measured source domains, source-attestation fields, production
+feature receipt, and every runner's source/code/geometry/composition/role.
+Only the parent verifier combines that child report with its selected binary
+and source measurements to mint the move-only build capability; invoking the
+child mode directly remains non-authoritative. The selected WM child now also
+has a fixed Bootstrap/Import audit argument which branches immediately after
+canonical boot has produced the ABI's move-only bootstrap completion receipt,
+before controller, history, watchdog, or guest scheduling setup. It consumes
+that receipt once and emits one nonce-bound, deny-unknown line containing a
+pointer-free projection of sequence-zero bootstrap publication. The parent
+uses the same bounded, environment-cleared launcher as the device audits,
+revalidates the retained binary and private inputs around every launch, and
+requires exactly ten distinct nonces with identical nonce-excluded semantics.
+The resulting move-only outer series binds the selected build to the ABI
+bootstrap receipt, ROM, resolver, generation catalog, journal root, and final
+watched bytes. A direct ABI receipt has no denominator completion API; only a
+verifier-owned writer-audit bundle can project this selected-build series.
+Neither the child report nor copied series evidence is
+authority, and no private exact-ten Bootstrap series has yet been run.
+
+Captured CPU-produced executable images are immutable precompiled generations,
+not initially resident static banks. The WM catalog registers every such image
+and its direct-RDRAM physical backing before bootstrap validation. Zero bytes in
+that reserved range therefore mean the future image has not yet been produced;
+an ordinary unreserved static bank must still match its admitted words at
+bootstrap. This keeps bootstrap validation, executable-write invalidation, and
+later digest-selected activation on one generation mechanism.
+
+To avoid rebuilding the very large generated runner once per channel, the
+boot harness also exposes a move-only writer-audit session. It retains one
+`VerifiedGeneratedRunnerBuildV1`, can independently run Bootstrap, SI, and SP
+exact-ten series at most once each, preserves already-established evidence if
+a later channel fails, and seals any nonempty subset into a non-cloneable
+bundle. The bundle bitmap, common build/binary/private-input identities, each
+nested series authority, cross-channel build/program identity, and canonical
+writer-program model are hash-bound and revalidated. It exposes evidence but
+never the selected path or staged private inputs. This is a runtime-audit and
+profiling optimization; the bundle itself grants no denominator credit until
+an explicit denominator API consumes the relevant move-only authority.
+Existing consume-one-build SI/SP entry points remain compatibility wrappers
+over the same borrowed-build implementations.
+
+The private writer-audit CLI may publish fixed path-free progress at the
+verified-build and channel-series boundaries. These wall-clock observations
+are flushed for operator feedback and may be retained beside private
+diagnostics, but they are neither serialized into nor hashed by any build,
+series, bundle, denominator, or scorecard receipt. Losing the diagnostic
+consumer cannot create, suppress, or alter authority; the exact-ten session
+and its move-only bundle remain the only completion path.
+
+Writer children may emit ordinary runtime diagnostics before their authority
+envelope. Transport is source-bound by the v5 selected build, capped at 16 MiB
+per stdout/stderr stream, and accepts exactly one expected protocol-prefixed
+report of at most 1 MiB. Other report prefixes, zero reports, and duplicate
+reports fail closed. Only the extracted line enters the unchanged strict
+nonce/build-bound semantic parser; diagnostic bytes never enter authority.
+Watchdog failures remain fixed at 600 seconds and retain only bounded private
+tails plus exact byte counts and full-output digests.
+
+The first complete v5 selected build finished in 854,608 ms. Its all-channel
+session retained one exact-ten CPU series and a one-of-eight partial bundle.
+Bootstrap run zero produced 8,214,477 diagnostic bytes before its report and
+hit the former 1 MiB transport cap; Host ABI, PI, RDP renderer, RSP, SI, and SP
+each hit the unchanged 600-second watchdog. No complete writer-audit or
+scorecard receipt resulted, and those seven transport/liveness failures do not
+establish seven semantic channel gaps.
+
+The runtime issuer and selected-build verifier consume the same exported
+`GENERATED_RUNNER_SOURCE_BINDING_DOMAIN_V2` constant. The verifier still
+reconstructs every ordered field independently, but the protocol version is
+not duplicated as a string literal: an earlier cold full build exposed that
+the issuer had advanced to V2 while the verifier still hashed the V1 domain.
+That drift now fails at compile-time name resolution or at the ordinary
+field-level recomputation tests instead of after a private cold build.
+
+SI completion additionally
+requires the SI-specific channel constructor described below. The boot harness
+now consumes the selected-build capability in a fixed SI child mode and
+verifier-owned exact-ten series. Each launch receives a fresh nonce and only
+the retained staged ROM, BootContext, and capture paths; the parent revalidates
+those inputs and the binary around each watchdog-bounded launch, accepts one
+content-silent report line, and requires all ten reports to be semantically
+identical except for distinct nonces. The resulting move-only capability binds
+the build authority, private-input and binary identities, program
+model/resolver/catalog, sealed journal, watched state, and SI transition
+receipt. No private series has yet been run, so no production denominator has
+received SI credit. The writer denominator still accepts this move-only
+capability through `complete_si`: it revalidates the series authority hash,
+requires an exact canonical writer-program-model digest match and an open SI
+row, and stores a private SI receipt bound to the series authority. The
+selected-build writer-audit bundle is the atomic path when it represents SI
+alongside Bootstrap and/or SP. Copied public reports or series evidence remain
+inadmissible. The ABI supplies the
+inner runtime-state prerequisite for that owner: a private validator
+requires an ABI-issued host catalog, the production-AOT feature lane, retained
+and balanced SI start/byte-commit/busy-clear/interrupt/notification
+transitions including at least one PIF-to-RDRAM commit, no pending device or
+ABI SI owner, and a sealed quiescent mutation journal whose expected bytes
+still equal owned RDRAM. One successful take yields a move-only, non-serde
+receipt bound to the exact writer-program model, resolver, host-catalog
+receipt, terminal journal root, watched digest, and SI transition digest. It
+deliberately carries no generated-build authority and no writer-denominator
+API accepts it directly. The fixed verifier-owned child mode disables and
+re-enables device-trace retention immediately before its bounded SI audit
+window; otherwise an earlier unrelated PIF-to-RDRAM transaction could satisfy
+the prerequisite's minimum exercised-path condition. The validator rejects a
+non-monotonic `(cycle, sequence)` stream. It also retains the count of journal
+declarations attributed to `SiDma`; that count may be zero because declarations
+are clipped to executable backing and ordinary PIF controller buffers are not
+code. Structural path totality must come from the typed gateway plus the
+future selected-build series, never from observing an executable intersection.
+That trait is sealed to runtime-owned implementations; the canonical ABI raw
+allocation crosses it only through a call-scoped `ProcessDmaMemory` which
+bounds the allocation, performs the canonical lane mapping, and invokes its
+borrowed attribution callback after commit.
+The SP-DMA channel now has the same ABI-local prerequisite boundary without
+claiming channel completion. Its begin API first requires the canonical owned
+bootstrap, ABI-issued host catalog, production-AOT lane, sealed/unpoisoned
+journal, and no pending physical, attributed, host, child, device-SP, or
+ABI-RSP work. It then clears and re-enables device-trace retention and returns
+a move-only epoch token bound to the exact writer-program model. The take API
+accepts only that live epoch, checks exact watched bytes, and validates the
+public RSP guide's double-buffered lifecycle: `SpDmaStarted`, optional
+`SpDmaQueued`, matching `SpDmaBytesCommitted`, immediate start of the exact
+queued request before busy can clear, and terminal `SpDmaBusyCleared`, with at
+least one `RspToRdram` commit. Raw SP DMA has no MI interrupt or OS
+notification to invent; busy-clear is its terminal publication. The receipt
+binds transition counts/digest, journal root, watched digest, resolver, build,
+and host-catalog authority, is one-successful-take, and remains inadmissible to
+the writer denominator. The selected WM runner now exposes a fixed SP child
+mode which arms this typed epoch immediately before the same bounded canonical
+guest/device scheduling loop used for the SI audit. Only SP DMA initiated by
+the admitted guest can populate that fresh trace; the child retries transient
+pending/no-transition/no-RSP-to-RDRAM states, but traps malformed transition
+order or any other invariant failure. After the real writeback lifecycle and
+all SP device/task/ABI owners drain, it consumes the ABI receipt once and emits
+one nonce-bound deny-unknown report. The boot-harness parent consumes the
+selected-build capability and reuses SI's environment-cleared, staged-input,
+bounded-output, watchdog, and pre/post-validation process mechanism. Ten
+distinct OS-random nonces with identical nonce-excluded semantics mint a
+move-only SP-series prerequisite. No private SP series has been run, and no
+production denominator has received SP credit. The writer denominator still
+accepts this move-only capability through `complete_sp`: it revalidates the SP
+series authority hash, requires an exact canonical writer-program-model digest
+match and an open SP row, and stores a private SP receipt bound to the series
+authority. The selected-build writer-audit bundle is the atomic path when it
+represents SP alongside Bootstrap and/or SI. Copied reports, copied series
+evidence, and the ABI-local SP prerequisite remain inadmissible. This
+ABI-owned epoch improves on the SI prerequisite's
+current outer-verifier freshness obligation; SI is not silently reinterpreted
+and still requires its selected child to clear/re-enable retention immediately
+before its bounded audit. Provenance: public *RSP Programmer's Guide*, SP DMA
+register and double-buffering descriptions, plus fn64's typed device trace.
+The PI-DMA channel now has the same bounded ABI-local prerequisite, without an
+outer selected-build series or denominator completion claim. Its begin API
+requires the validated owned bootstrap, ABI-issued host catalog,
+production-AOT lane, sealed quiescent journal, no active device request or
+queued ABI completion owner, and a clear PI interrupt line. It then clears and
+re-enables retained device history and returns a move-only, process-unique
+epoch bound to the exact writer-program model. The take API accepts only that
+live epoch, rejects either pending PI owner, rechecks the journal and watched
+bytes, and validates each typed lifecycle in order: matching `PiDmaStarted`,
+`PiBytesCommitted`, `PiBusyCleared`, PI interrupt publication when the line was
+not already asserted, and matching `NotificationReady(PiDmaComplete)`. The
+validator also tracks interrupt acknowledgements, so a serialized request may
+correctly complete without a second raise event while the first interrupt
+remains asserted; no missing transition is invented. At least one
+device-to-RDRAM commit is mandatory. The one-successful-take, non-serializable
+receipt binds the transition counts/digest, terminal journal root, watched
+digest, resolver, production feature receipt, ABI host catalog, and writer
+program model. A data-only DMA can exercise the typed producer while its
+executable-clipped journal declaration count remains zero. Copied evidence is
+not authority, and no selected-child PI exact-ten series or production PI
+credit exists yet. Provenance: public libultra PI manager/DMA documentation,
+public PI register behavior, and fn64's typed device trace.
+The RSP-execution/HLE-writeback channel has a path-total ABI-local prerequisite
+over the installed production policies. Interpreter publications append exact
+physical half-open ranges and their `RspInterpreterOwner` (task address plus
+admission generation, or a generation-bearing raw kick). The translated-audio
+HLE callback runs inside the canonical nested writer and classifies its BREAK
+result before publishing trace success. A successful callback binds its exact
+owner and every resulting executable-journal sequence; a non-BREAK callback
+records its sequences as rejected and permanently invalidates that epoch, so a
+caught unwind cannot let a later audit absorb speculative executable changes.
+Empty successful callbacks remain visible as typed lifecycle boundaries but do
+not satisfy the receipt's writeback requirement. Duplicate, missing, wrong-
+channel, or rejected sequences fail closed. A process-unique move-only epoch
+supersedes all earlier observations. Successful take requires a production-AOT
+canonical owner, validated bootstrap and ABI host catalog, sealed journal and
+matching watched bytes, no device task, loaded/yielded lineage, interpreter
+owner, HLE continuation, host transaction, child writer, or pending executable
+write. The one-take receipt binds those authorities, the RSP journal-declaration
+count, exact interpreter ranges, and exact translated-HLE publication sequence.
+Graphics optimized HLE writes belong to the separately audited RDP-renderer
+channel. The verified-audio transactional adapter remains test-only and is not
+an installed production policy or a trace source; no receipt claims otherwise.
+The selected runner now chooses graphics `LleAccuracy` for its RSP audit,
+arms a fresh epoch immediately before guest/device scheduling, and retries
+only live device/ABI ownership or the absence of a typed writeback. Its strict
+nonce-bound report projects the ABI receipt and recomputes the production
+build, program model, catalog, journal, watched image, and trace identities.
+Ten distinct nonces with identical nonce-excluded semantics mint a move-only
+series and an RSP bit in the one-build audit bundle. A data-only interpreter
+writeback may exercise the typed producer while the executable-clipped journal
+count remains zero; copied report bytes are not authority. This remains
+structural: no private ten-run RSP series has executed, and the selected WM
+scenario exercises the interpreter policy rather than independently exercising
+the translated-audio callback.
+Provenance: public *RSP Programmer's Guide* task/DRAM-DMA protocol and fn64's
+typed interpreter-owner and mutation-journal machinery.
+The CPU-instruction-store channel now has a corresponding ABI-local fresh
+window, but not an outer selected-build series. Its begin API requires the
+validated owned bootstrap, ABI-issued host catalog, production-AOT lane, and a
+sealed, unpoisoned, quiescent mutation owner. The move-only epoch is
+process-unique and bound to the exact writer-program model; arming a new epoch
+supersedes the old one. While armed, the existing post-commit typed RDRAM store
+observer retains each CPU physical range in order. Successful take requires at
+least one valid in-RDRAM store, a second quiescent boundary, unchanged watched
+bytes, and a self-consistent canonical journal, then consumes the sole live
+epoch and returns a non-serializable receipt binding the trace digest, journal,
+resolver, feature receipt, ABI host catalog, and writer-program model. A CPU
+store outside executable backing legitimately exercises the typed path while
+adding no clipped journal declaration. The exported notification gateway also
+serves generated-C adapters, so this inner receipt deliberately does not prove
+which separately compiled body caused the store. No selected WM child,
+exact-ten build-owned series, writer-audit bundle projection, private run, or
+denominator completion exists for this channel yet. Provenance: MIPS III store
+semantics, fn64's typed `Rdram` store gateways, and the canonical mutation
+journal described above.
+The Host-ABI channel now carries its ABI-local fresh transaction prerequisite
+through a selected-build series, but has no production completion claim. Its
+begin API requires the
+validated owned bootstrap, production-AOT lane, ABI-issued stable-shim
+catalog, and a sealed, unpoisoned, quiescent mutation owner. A process-unique,
+move-only epoch arms tracing inside that exact owner. Each subsequent
+catalog-owned host call retains its target, resume key, thread, per-thread
+LIFO begin/finish lifecycle, ordering boundaries, and the exact HostAbi
+journal sequences committed at those boundaries. Successful take requires a
+balanced lifecycle, a second quiescent watched-byte check, and at least one
+actual executable-journal commit attributed to `HostAbi`; merely invoking a
+shim whose conservative effect set says it *may* write cannot satisfy the
+writer prerequisite. The non-serializable receipt binds the fresh lifecycle
+digest, initial and terminal journal positions, journal root, watched digest,
+resolver, feature receipt, ABI host catalog, and writer program model. A
+replacement epoch supersedes the prior token, and one successful take consumes
+the sole authority. Compatibility catalogs remain executable but are
+deliberately inadmissible because caller-supplied raw function pointers do not
+prove stable-shim identity or total writer effects. The selected runner arms
+this epoch immediately before guest scheduling and must exercise a real
+HostAbi executable write through the enumerated ABI catalog. Its strict
+nonce-bound report is recomputed by the parent, and ten distinct, semantically
+identical launches become one move-only series that can join the one-build
+audit bundle. This remains structural evidence: no private ten-run series has
+been executed, and model-total coverage of all mutable host surfaces remains
+required for production denominator credit. Provenance: fn64's
+canonical host transaction and executable mutation journal described below;
+no reference-runtime implementation was consulted.
+Canonical renderer task calls and validated raw-DPC shadow publications are
+similarly bracketed by an executable-only preimage. Changed logical physical
+bytes are coalesced and reported as `RdpRenderer` before the guest can resume;
+ordinary framebuffer changes outside the executable union are not retained.
+The channel now also has an ABI-local fresh publication prerequisite. A
+process-unique move-only epoch is armed only while the canonical production-
+AOT owner has no live RSP task, fabric DPC transaction, pending DP completion,
+HLE continuation, loaded task, task lineage, interpreter owner, host frame, or
+child writer. Successful HLE `Complete`/`Yielded`/`Continue` chunks and
+fabric-committed raw-DPC transactions are the only lifecycle marks. A
+`NeedsLle` preflight still traverses the mutation bracket, but it cannot count
+as a renderer publication and any executable write invalidates the epoch. Take
+requires a second
+quiescent boundary, at least one marked publication, exact agreement between
+the publication windows and every `RdpRenderer` journal sequence since arm,
+and unchanged watched bytes. Its non-serializable receipt binds that trace,
+the journal root and positions, final watched digest, resolver, ABI-issued host
+catalog, feature receipt, and canonical writer model. The selected runner now
+arms that epoch immediately before guest/device scheduling. Its child retries
+only live task/device/renderer quiescence and `NoRendererPublications`; an
+invalid trace remains a loud failure, so a `NeedsLle` preflight cannot be
+relabelled as a publication. The strict nonce-bound report additionally
+requires at least one actual `RdpRenderer` executable-journal entry and
+declaration; a committed framebuffer-only publication is insufficient. The
+parent recomputes the ABI receipt, selected build and program identities, then
+requires ten distinct nonces with byte-identical nonce-excluded semantics
+before minting a move-only series. That series can join the same one-build
+audit bundle as the other represented channels. This remains structural
+evidence: no private ten-run RDP series has been executed and model-total
+renderer coverage remains open.
+Catalog-owned host calls form per-guest-thread LIFO parent transactions. The
+owner commits the current `HostAbi` prefix before coroutine suspension and
+before every synchronous RSP/RDP child enters, commits each child batch
+immediately, retains the parent frame across a yield, and commits the residual
+`HostAbi` suffix when the host call returns. The hash-chained batches therefore
+preserve `HostAbi -> child/device -> HostAbi` execution order even when every
+writer changes the same executable byte. Open frames and pending writes are
+transient quiescence diagnostics, not part of the committed journal root.
+This closes that attribution interleaving only for the enumerated canonical
+gateways. Compatibility raw-pointer APIs, other noncanonical callers,
+model-total coverage, and the selected-build completion authority remain
+structural channel-closure blockers. Provenance is fn64's canonical mutation
+journal, fabric-owned DPC transaction, and public `RenderBackend` commit
+contract; no reference-runtime implementation was consulted.
+Bootstrap/Import's ABI receipt is only an inner prerequisite. A move-only
+verifier-owned selected-build bundle may retain Bootstrap, CPU, HostAbi, PI,
+RDP-renderer, RSP-execution-writeback, SI, and SP series from one exact build.
+All eight fixed writer channels now have a bundle projection. The current
+denominator accepts the other seven; RSP denominator admission remains a
+separate integration step. Those are structural authorities only: without the
+private exact-ten runs, every corresponding production row remains open.
+
+Stage B's ROM-independent build boundary is specified in
+[`WM-PREPARED-SHARDS.md`](WM-PREPARED-SHARDS.md). Its std-only per-shard
+materializer and strict v2 synthetic format exist, but remain inactive: all 35
+manifests still use the current shared ROM-driven build script. A future
+activation uses the new one-shot producer, which shares the exact source
+generator with that legacy build and atomically renames a complete synced tree
+from outside the repository. Its explicit source identities remain claims.
+The root manifest cross-binds all package sidecars and artifacts, while each
+materializer watches only its package's stable sidecar and two sources; a
+root-claim-only retry with byte-identical package files atomically replaces
+only the authority manifest at the same root. This preserves every watched
+path, but no zero-shard invalidation claim is made until Cargo compiler-artifact
+evidence exists. Stable-root artifact reconciliation is likewise serialized:
+an update marker makes materializers fail closed, changed sources commit before
+their package sidecar, root authority commits last, and a same-target rerun
+recovers an interrupted prefix. Concurrent producer/Cargo execution carries no
+authority.
+Generated-build v3 now implements that inactive cold authority: it owns the
+frozen producer graph and staged binary, independently validates the exact
+private projection, remeasures it across Cargo and the identity child, and
+retains it in the move-only build capability. Its explicit
+`legacy_with_prepared_candidate` mode keeps the selected binary's legacy Cargo
+source attestation authoritative and does not claim that prepared sources were
+compiled. The future `prepared_consumed` mode is derived only from an exact
+all-35 manifest inventory and switches the source domain to
+`prepared_build.rs` plus `materializer.rs`. Manifest claims and warm
+materialization are not authority, and there is no fallback from the prepared
+path to discovery/codegen because that would recreate the invalidation edge.
+Real-ROM byte parity and guarded cold/warm activation benchmarks remain gates.
+
+At first dispatch the owner snapshots the union of every generation's physical
+backing, not only active code. After an attributed write it verifies that every
+changed byte lies within a declared range, invalidates intersecting active
+generations, and hash-chains the exact channel/ranges, before/after digest, and
+retired identities. It byte-reconciles the expected backing again before every
+dispatch, so a remaining raw-pointer escape traps before stale static code can
+execute. This runtime reconciliation does not itself close the writer
+denominator: raw mutation visibility must still be sealed structurally before
+the seven remaining completion receipts can be minted. The older
+callback/builder APIs remain executable for compatibility but cannot populate
+this canonical evidence.
+
 `ExecutableRegion` now owns one active immutable generation and atomically
 retires the previous `CodeBank` plus runner on same-range replacement. The ABI
 registers equal-length physical/virtual executable spans and observes typed CPU
@@ -396,6 +1069,64 @@ claim. Cache tags, silicon self-modifying-code rules, page-granular ownership,
 automatic executable detection, and a real translator/pack plus boot
 registration remain open, so this does not make real-ROM transplant/resume
 available by itself.
+
+`BlockProgram::dispatch` therefore has two explicit exception ownership modes.
+The ordinary API vectors architectural faults inside the guest program. The
+live host-scheduled lane asks dispatch to expose faults to its owner instead.
+For an `OSThread` registered through the typed host scheduler, that owner
+commits precise CP0 exception state, optionally posts libultra's registered
+BREAK/FAULT event, and parks the current coroutine. It must not execute the raw
+guest exception dispatcher, because host-bound thread creation and queues make
+the typed executor the sole scheduler authority. The build discovers the
+guest current-thread global independently from the agreeing null-thread paths
+of `osGetThreadPri` and `osSetThreadPri`; the per-resume seam mirrors the
+selected `OSThread*` there for guest-visible state without admitting a second
+scheduler. In the canonical catalog lane this scheduler-owned publication is
+reconciled, attributed to the HostAbi writer channel, invalidated, and committed
+before the coroutine resumes. It is not represented as a catalog host-call
+frame because no guest target/resume pair exists; the current host-call-only
+completion receipt therefore remains open until a later schema admits this
+distinct typed scheduler boundary.
+
+Operational A/B capture may also install one process-wide exact
+charged-instruction limit. The canonical owner clamps each subsequent dispatch
+slice to the remaining work. A final straight instruction may execute with a
+one-instruction budget; a branch and its delay slot still require two together,
+and return a typed indivisible-unit error before either instruction mutates
+state when only one remains. The operational publication v2 comparison digest
+validates but excludes the most recent slice charge, because AOT and dynamic
+execution may partition identical cumulative work differently. It also omits
+the per-context dispatch-entry mirrors of Count, Compare, and the host-driven
+RCP/timer Cause lines: the required executor digest owns Count, odd phase,
+Compare, and timer state, while the required device/ABI digests own RCP state.
+Pending Count/Compare writes are rejected rather than omitted. The v2 CPU
+digest still binds context-owned CPU state, including Random and every other
+Cause bit; its equality is meaningful only beside equal executor, device, and
+ABI component digests. The continuation digest still binds cumulative charge,
+pending exit, and prepared continuation. These controls change checkpoint
+scheduling and comparison only; they are not guest state, program identity, or
+static execution authority.
+
+The WM operational A/B lane withholds the installed canonical-entry
+`ExecutionKey` once, not a generated shard or an arbitrary catalog member.
+Both binaries install the same complete static catalog and retain the same
+canonical program and resolver-install identities. The dynamic-enabled owner
+validates that the selected key equals the installed entry, then applies one
+operational-only redirect at the unified dispatch seam. The guard clears only
+after that dynamic attempt charges positive work; ordinary static budgets and
+executable-mutation reconciliation then resume without changing the outer
+interrupt boundary. The v2 telemetry proof belongs to that individual attempt:
+it names the entry, requires positive `charged_instructions`, and requires zero
+`unsupported_exits`. Aggregate identity totals cannot prove the selected
+attempt.
+`FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY=1` enables this mode;
+`fn64.wm2000.dynamic-withheld-telemetry.v2` records the selected bank/PC,
+selection basis, per-attempt result, dynamic identities, and the unchanged
+program and resolver-install identities. The identity line and comparator bind
+`resolver_install_sha256` alongside the program digest. This replaces
+whole-shard withholding, which
+could miss an unvisited shard and therefore fail to exercise the mechanism.
+The real-ROM 100,000-instruction exact-entry comparison remains pending.
 
 Provenance of the removal: `crates/fn64-diff` once carried a subprocess client
 for the *faki-tools* `oracle` CLI plus a mupen64plus `.m64p` savestate parser,
@@ -651,9 +1382,14 @@ a safe `fn(&mut fn64_recomp_rs::RecompContext, &mut Rdram)` ABI, while
 `fn64-abi::recompiled` is the single adapter at the already-unsafe C host-shim
 boundary. It marshals GPR/HI/LO/COP0 status into the legacy host context,
 calls the existing queue/DMA/VI/thread shim, then copies architectural state
-back. `osCreateThread` constructs a recompiled context inside the same
+back. The adapter snapshots Status.BEV and rejects any shim transition before
+copy-back, so an admitted legacy-C call cannot silently select the bootstrap
+exception-vector family. `osCreateThread` constructs a recompiled context inside the same
 `GameThread` coroutine; it does not create another executor, RDRAM image, or
-host thread. The generated module also exports section `(ROM, static VRAM,
+host thread. Its child Status inherits the caller while clearing FR, so BEV
+closure for a spawned thread depends on proving the caller's Status sources;
+once those sources are closed, this is an inductive preservation edge rather
+than a new blocker. The generated module also exports section `(ROM, static VRAM,
 size)` geometry. The existing DMA load registry records relocated heap bases,
 and host-first lookup maps a relocated callback back to its static typed
 function entry. Thus rs and C lanes share scheduling, peripherals, and
@@ -970,8 +1706,12 @@ task calls out:
   evidence in a typed checkpoint. It commits one `RenderOp` to RDRAM per call,
   returns a fresh opaque token while operations remain, removes that token
   before executing the next operation, and rejects stale, mismatched, or
-  overlapping task ownership by name. Its historical atomic `process_task`
-  entry drives those same chunks internally to completion. RT64 remains
+  overlapping task ownership by name. Its atomic `process_task` entry exposes
+  no continuation or guest interleaving point, so it executes the same ordered
+  operations in one call and commits at color/depth target changes, FullSync,
+  and task completion rather than rewriting a dirty full image after every
+  operation. Atomic-vs-chunked tests require identical final RDRAM,
+  framebuffer, and FullSync evidence. RT64 remains
   `Atomic` because its public native task call exposes no resumable
   continuation. Completion no longer wakes
   the scheduler from inside `osSpTaskStartGo`: the fabric schedules SP at the
@@ -1474,6 +2214,11 @@ out, recorded here honestly per `AGENTS.md`'s "mark revisions honestly":
   queue-owned waiter removal clears both sender and receiver roles for thread
   stop/destruction. These types preserve the operation across every scheduler
   interleaving rather than asking the eventual wake site to reconstruct it.
+  The host shim also yields after making the target runnable. This closes the
+  caller-starts-higher-priority-target interleaving: the executor's ordered run
+  queue chooses the target before the caller can retire its next guest
+  instruction; a non-outranking target simply causes the caller to be chosen
+  again.
 - **A real reentrancy bug, caught by this crate's own tests, in exactly the
   shape the pre-check above created.** `fn64-abi`'s coroutine bodies run
   physically nested inside `Executor::run_one_step`'s call to
@@ -1637,15 +2382,51 @@ available under this architecture.
 
 ### rdram buffer ownership
 
-The 8 MB (or however large the target console's RDRAM is configured; N64 =
-4/8 MB) `rdram` buffer is one stable allocation created by
-`fn64-boot-harness::new_rdram(TvType)` and owned by the process harness for the whole
-guest lifetime. `fn64-runtime::Rdram` owns the same layout in isolated core
-tests and runtime-only configurations. Every consumer — `fn64-abi` shims, the
-executor, and render task marshalling — borrows that one allocation; no
-consumer makes a translated framebuffer/DMA copy and later treats it as
-RDRAM. This matches the ABI contract directly: every `RECOMP_FUNC`/`_recomp`
-shim receives the same `uint8_t* rdram` argument.
+Physical RDRAM is one stable 8 MiB allocation for the canonical typed-Rust
+lane. A validated bootstrap/import transaction owns it before boot, admits
+only typed ROM publications, binds the executable baseline to the exact ROM,
+resolver, generation catalog, and watched-byte digest, then moves the sealed
+allocation into `fn64-abi`'s `HostState` for the complete guest lifetime. The
+initial publications become sequence zero of the executable-mutation journal;
+there is no mutable slice or raw-pointer escape between validation and
+installation. Bootstrap commit validates every initially resident,
+unreserved direct-RDRAM static bank and every unreserved physical-code bank,
+not only the entry bank. Generation shard banks are excluded from that
+word-for-word pass because they are mutually exclusive alternatives; their
+initial physical images instead pass a whole-catalog validator. Zero bytes are
+an unloaded image; every nonzero image byte must be covered by at least one
+complete exact catalog digest. The receipt binds the canonically ordered
+matching generation IDs, and install revalidates them before taking ownership.
+The ABI has a validator-owned move-only completion constructor for this exact
+bootstrap evidence, and the boot harness now adds the selected-build exact-ten
+outer prerequisite described above. The production row remains open until a
+private series is actually run and the denominator consumes the intended
+move-only outer authority; copied report data is never a substitute.
+
+The generated-C compatibility lane still uses
+`fn64-boot-harness::new_rdram(TvType)`, whose same stable allocation extends to
+the legacy `0x2900_0000` sparse MMIO mirror because generated pointer macros
+cannot be intercepted. That roughly 656 MiB compatibility extent is not N64
+RDRAM and is not carried into the canonical block lane: typed-Rust loads and
+stores route RCP MMIO through the registered hooks. `fn64-runtime::Rdram` owns
+the corresponding layout in isolated core tests and runtime-only
+configurations. Every consumer — `fn64-abi` shims, the executor, and render
+task marshalling — borrows the one installed allocation; no consumer makes a
+translated framebuffer/DMA copy and later treats it as RDRAM. Raw compatibility
+boot rejects a canonical executable backing whose physical end exceeds the
+supplied allocation before installing any live owner.
+
+Local test runs use `scripts/guarded-cargo-test.zsh`; nextest runs use
+`scripts/guarded-nextest.zsh`. Both combine single-job Cargo compilation with
+serialized test execution, a sampled 4 GiB process-group ceiling, and a
+sampled 40% system-free floor. `nextest -j1` serializes test processes but does
+not serialize Cargo compilation, so the wrapper also fixes
+`CARGO_BUILD_JOBS=1`. The guard owns one dedicated
+macOS session until its exact PGID is empty, including surviving reparented
+descendants, and signals only that group. These one-second observations are a
+safety guard rather than an OS hard memory limit; transient overshoot remains
+possible between samples. `cargo test -j1` alone does not serialize tests and
+therefore is not the safe feedback loop for tests that own process RDRAM.
 
 ### The `MEM_*` accessor contract
 
@@ -1847,6 +2628,15 @@ the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
 artifacts are historical only; they cannot satisfy current v28 verification.
+
+Device transition retention remains enabled by default and is required for
+that release evidence. Long exploratory runs may explicitly disable retention;
+`DeviceFabric` then releases the retained vector but continues updating a
+constant-space typed summary of total transitions and PI/SI/AI/SP/task/VI
+counts. The summary is progress telemetry only: it cannot replace the ordered
+trace in a release digest. The WM2000 block harness uses this mode only under
+`FN64_BLOCK_PROGRESS_ONLY`, with `FN64_BLOCK_DEVICE_TRACE=1` as the explicit
+opt-in when full diagnostic history is needed.
 DeviceState v11 binds the audio-task execution policy and translated artifact
 identity. DeviceState v12 additionally binds DPC CLOCK, BUFBUSY, PIPEBUSY, and
 TMEM. DeviceState v13 binds the ABI-owned RSP interpreter continuation:

@@ -141,7 +141,20 @@ Mechanically:
 2. Convert to canonical big-endian bytes.
 3. Record SHA-256, SHA-1, and MD5 identities.
 4. Parse the ROM header, entrypoint, and boot region.
-5. Identify the CIC where possible.
+5. Identify the complete IPL3 by exact digest where possible. The current
+   admitted public-standard clusters are CIC-6102/7101, 6103/7103, and
+   6105/7105. An unknown or truncated IPL3 remains an explicit frontier; it
+   never inherits a zero relocation delta. The local-corpus SHA-256 clusters
+   are cross-checked against the public IPL3 MD5 identities in
+   [Dragorn421/n64checksum](https://github.com/Dragorn421/n64checksum), whose
+   CC0-1.0 `LICENSE` was verified for this intake.
+
+   - CIC-6102/7101: SHA-256
+     `61e88238552c356c23d19409fe5570ee6910419586bc6fc740f638f761adc46e`
+   - CIC-6103/7103: SHA-256
+     `bf3620d30817007091ebe9bddd1b88c23b8a0052170b3309cde5b6b4238e45e7`
+   - CIC-6105/7105: SHA-256
+     `04b7bc6717a9f0eb724cf927e74ad3876c381cbb280d841736fc5e55580b756b`
 6. Reject malformed or unexpected inputs before analysis.
 
 All downstream artifacts and cache keys must bind to the normalized ROM
@@ -181,7 +194,53 @@ digest.
 > validated against normalized-ROM bounds; compressed VROM files are
 > deterministically materialized with a bounded decoder derived from the
 > allowed N64Recomp-generated `Yaz0_DecompressImpl` C, and the stream's
-> declared size must match the VROM interval. Malformed/blank records are `rejected`,
+> declared size must match the VROM interval. Automatic discovery also caps a
+> complete decoded VROM file at 64 MiB, checking the recovered interval and
+> Yaz0 declaration before reserving output storage. Explicit-limits variants
+> let constrained callers lower that cap; an oversized file contributes no
+> descriptor or mapping evidence. Each distinct withheld file is serialized
+> in `VromOverlayRecovery::decoded_file_limit_hits`, and its count is carried
+> into `StrategyOutcome`, so a workspace manifest cannot present a
+> resource-limited search as proven absence. The same cap gates publication
+> of virtual request-DMA mappings and Phase 3 image harvesting, so neither
+> path can rematerialize a file that recovery withheld as oversized.
+> Automatic request-DMA recovery is a bounded monotone fixed point over newly
+> proven, materializable banks, not a resident-bank-only pass. Each round scans
+> every newly admitted bank once and publishes only requests whose source
+> interval exactly names one complete proven VROM file. Recovery stops at 64
+> loader inputs, 4,096 banks/mappings, or 256 MiB of aggregate scanned image
+> bytes; reaching a limit is an explicit incomplete result rather than absence.
+> The operand slicer may cross an ordinary, non-likely forward conditional
+> branch only when its taken target is strictly after the request call's delay
+> slot: reaching that call proves the not-taken edge, whose ordinary delay word
+> executes. Backward branches, branch-likely and REGIMM/link forms, jumps, and
+> branches into the call or delay slot remain hard boundaries.
+> Physical end-address wrapper inference is currently diagnostic candidate
+> evidence only. Its bounded linear scan examines at most 4,096 call-shaped
+> targets and 128 words per target and records shapes resembling `$a2 - $a1`,
+> a nested DMA call, cursor updates, a length reduction, and a backward branch.
+> It does not yet establish one feasible CFG path, authenticate the nested PI
+> primitive, or prove that the updates share one chunk value; whole-image JAL
+> words are not callable-entry authority. Consequently these candidates cannot
+> supply `StaticRequestDmaInput` or publish a mapping. A temporary SM64 training
+> experiment showed the potential payoff—one 78,992-byte engine range would
+> move 200 bodies out of `NoMapping`—but that promotion was removed after
+> review. CFG-aware relational proof, independently authenticated PI semantics,
+> and closed analysis bounds are required before enabling it. The request-DMA
+> report and serialized strategy outcome retain the examined/open wrapper
+> counts, wrapper and loader-input limit flags, and aggregate incomplete state.
+> The retained SM64 candidate also has only `Supported` function-entry evidence
+> and lies outside every proven executable range, so candidate CFG structure is
+> not an authority substitute. The dependency order is: prove the wrapper entry
+> and executable bytes; authenticate the complete public libultra call contract
+> and cart handle/base; prove call-site message/queue writes cannot alias loop
+> carriers; then prove the same chunk advances both cursors and reduces the
+> remaining length on every loop step. Bytes, CFG, facts, and capabilities must
+> come from one digest-bound prepared-bank view. Until all of those exist, this
+> cluster remains a measured training opportunity rather than a mapping input.
+> More than 64 loader inputs scans the deterministic first 64 and reports the
+> withheld suffix instead of discarding all progress.
+> Malformed/blank records are `rejected`,
 > missing backing is `open`, and records whose source and destination ranges
 > conflict are moved to `conflict` (including every member of a multi-record
 > conflict), so none can feed Phase 3 as proven input.
@@ -247,14 +306,28 @@ invalid edges, and address collisions.
 
 ## Phase 3: harvest candidates
 
-> Implementation status (D1, 2026-07-16): `fn64-discover::harvest` now runs
-> three zero-LLM providers concurrently over immutable, Phase-2-proven load
+> Implementation status (updated 2026-07-30): `fn64-discover::harvest` runs
+> zero-LLM providers over immutable, Phase-2-proven load
 > images: (1) a linear `jal` scan plus bounded HI/LO-resolved `jalr` targets,
 > with the call site retained as evidence; (2) classic
 > `addiu`/`daddiu $sp,$sp,-N` + in-frame `sw $ra` prologues and the stricter
-> leaf variant requiring a matching stack restore at `jr $ra`; and (3)
+> leaf variant requiring a matching stack restore at `jr $ra`; a recognized
+> prologue may move its candidate entry back by at most three nonzero,
+> non-control, non-`$sp`-writing words when the earlier address is independently
+> a terminator/padding boundary and no direct transfer enters the intervening
+> words; (3)
 > `TableEntry` facts exposed by an already-identified descriptor table or
-> vector. The third provider does not scan blindly for table locations.
+> vector; (4) candidate-only dense/fixed-stride handler-pointer runs; and (5)
+> bounded argument-home-spill leaf shapes after an independently structural
+> boundary.
+> The third provider does not scan blindly for table locations. The fourth
+> scans the complete materialized bank before executable-range slicing and
+> retains typed table-base, exact-slot, ordinal, stride, and run-length
+> provenance. It never emits `Fact::TableEntry`, never feeds the same harvest
+> wave, and never proposes more than `Candidate`: a pointer-shaped run does not
+> prove a reachable consumer or an exhaustive index domain.
+> Prefix rewind relocates only the candidate target; its evidence retains the
+> exact stack-adjust site. It does not strengthen proof state.
 > Providers return immutable claims; the merge sorts and deduplicates before
 > touching `FactDb`, so host thread scheduling cannot affect serialized
 > output. Independent positive providers produce `supported`; any positive
@@ -382,6 +455,19 @@ evidence.
 
 ### Composed proof snapshot
 
+`fn64_discover::snapshot_inputs::prepare_snapshot_banks` is the reusable
+in-process preparation boundary. It enumerates only `Proven` mappings, rejects
+distinct proven geometries for one bank, materializes Physical or proven
+VROM/Yaz0 backing, and trims load-time `.bss` from the VA prefix. Its sorted
+call-derived roots (including callable entries exposed by an admitted table)
+are traversal seeds only; callable authority remains in the fact database and
+is decided by snapshot composition. Conclusion-absent strong claims remain
+hints, but a current Open or Conflict conclusion cannot seed traversal. Exact
+duplicate mapping facts collapse, while invalid geometry and unaligned seeds
+fail loudly. Conservative bank-count, retained-byte, and complete decoded-VROM
+file limits are checked before materialization; callers may supply a smaller
+explicit `PrepareSnapshotBanksLimits` envelope.
+
 `fn64-discover::snapshot::compose_materialized_bank_v1` is the first thin
 composition boundary over the existing passes. V1 accepts one resident,
 physical-ROM-backed bank, verifies its bytes against the normalized ROM and
@@ -452,9 +538,13 @@ non-Yaz0 file whose length disagrees with the VROM interval is still
 rejected loudly rather than silently materializing unverified bytes — that
 part of the original rationale still holds.
 
-The boot bank's normalized ROM-header entry is a typed, authoritative
-`HardwareEntrypoint` / `RomHeaderEntrypoint` claim justified by the same IPL3
-copy evidence as its mapping. In contrast, an exhaustive link-free `jr`
+The boot bank's effective entry is a typed, authoritative
+`HardwareEntrypoint` / `RomHeaderEntrypoint` claim only when an exact admitted
+IPL3 identity establishes the relocation delta and the complete one-megabyte
+copy source exists. CIC-6102/7101 and 6105/7105 use zero delta;
+CIC-6103/7103 uses `0x100000`. Unknown/truncated IPL3, a truncated copy source,
+or invalid header arithmetic records `bank:boot` as `Open` and emits neither a
+mapping nor an entry claim. In contrast, an exhaustive link-free `jr`
 target is traversed as an intra-owner successor and is not inserted into the
 callable-root set. On the real NWXE bank this distinction removes the false
 owner ambiguity at the mechanically recovered `0x80000460` transfer without
@@ -469,6 +559,10 @@ Hard constraints:
 - Every accepted block has exactly one owner within its bank.
 - Owners do not overlap within a bank.
 - Every direct call target is a callable entry.
+- Every exhaustive computed-call target is a callable entry when its typed
+  target-set evidence exactly matches the CFG. Multi-bank composition applies
+  the same rule across bank boundaries; bounded/open calls and computed jumps
+  remain non-authoritative.
 - Ordinary fallthrough stays within its owner.
 - Returns terminate paths.
 - Tail transfers may cross owners.
@@ -482,6 +576,109 @@ Initial roots include:
 - Thread and callback entrypoints.
 - Proven function-pointer targets.
 - Dynamically observed external entries.
+
+> Implementation status (2026-07-29): byte-verified snapshot composition now
+> derives resident `osCreateThread` entry arguments without a caller-supplied
+> callee address. A bounded semantic recognizer identifies exactly one
+> implementation from the public libultra `osCreateThread` contract: linkage,
+> identity, saved context, state, and priority fields written into `OSThread`.
+> Zero matches adds no authority; multiple matches fail composition closed.
+> Starting only from the typed proven ROM-header entry (never traversal hints
+> or tool candidates), an authority-only CFG admits a constant aligned
+> same-bank `$a2` target only when both the direct call and its delay slot are
+> proven code. Each admitted thread entry is fed back into that closure until
+> no new entry appears. Operand slicing is performed once per bank and reused
+> across rounds. Cross-bank targets remain open until bank-generation identity
+> can select exactly one loaded image; overlapping overlay ranges are never
+> guessed. All newly discovered `(callee, argument-register)` contracts are
+> sliced in one image scan per fixed-point round rather than rescanning the
+> bank once per contract. N64LoaderWV/Ghidra output remains candidate evidence and is not an
+> input to this authority chain.
+>
+> The focused OoT NTSC 1.0 characterization supplies no entry-argument
+> manifest: semantic discovery uniquely identifies `osCreateThread`, and the
+> private composition chain admits the device-manager thread entry that the
+> retained pre-change snapshot omitted. The full corpus grade likewise removes
+> the `osCreateThread` address from its manifest while retaining two unrelated
+> callback anchors; exact recall rises from 116/137 to 119/137 with `wrong=0`.
+> Its output was byte-identical across 10 consecutive guarded runs on
+> 2026-07-29, followed by all 703 `fn64-discover` nextest cases. The 1 MiB real-bank
+> characterization itself completes in about 0.2 seconds once compiled; peak
+> memory in the full validation was compiler memory, not discovery execution.
+> MM US independently passed 10 consecutive guarded, semantically identical
+> corpus runs after removing its `osCreateThread` anchor, raising exact recall
+> from 399/486 to 401/486 with `wrong=0`. SM64 currently derives no thread roots
+> from boot-entry authority, and Kirby's `0x80022e04` interior entry is visible
+> only from a call inside the same otherwise-unreachable entry; neither circular
+> case is promoted, and both manifests retain their explicit anchor.
+>
+> The same private fixed point now infers callback-argument contracts without
+> API names: within an uncontested callable owner, an o32 argument must reach a
+> reachable `jalr` target through exact register moves or stack spills/reloads.
+> Arithmetic, non-stack loads, caller clobbers, and disagreeing CFG joins erase
+> identity; branch-likely fallthrough annuls only its delay word. A constant
+> caller operand is admitted only when that direct call and its delay word are
+> proven code in the hardware-rooted closure. On MM this removes the resident
+> `_Printf` `$a0` anchor with 10/10 semantically identical guarded corpus runs,
+> retaining 401/486 exact and `wrong=0`.
+>
+> Cross-function callback field proof is now implemented as a stricter second
+> contract: a reachable registrar must store one o32 argument into an object
+> field, link that same object to the old head, and publish it through an exact
+> field of a globally loaded context pointer. A reachable uncontested
+> dispatcher must load that identical head, load the identical callback field
+> into `jalr`, and traverse the registrar's exact link field after the call;
+> site reachability must preserve those event orders. Events are emitted only
+> from stabilized dataflow states, so incompatible branch-local facts cannot
+> combine into a contract. Synthetic positives, mismatched-link and
+> unreachable-dispatch negatives, and an adversarial disagreeing-join case
+> pass; the exact registry-focused set passed 10 consecutive guarded runs on
+> 2026-07-29. On real MM, boot-only
+> hardware authority correctly produces no contract because
+> `Fault_ProcessClients` is not reachable. A private characterization that
+> supplies the known `Fault_ThreadEntry` as test-only authority then derives
+> `Fault_AddClient` `$a1`, object callback offset `+4`, link offset `+0`, the
+> context-pointer/list-head expression, and `jalr` at `0x80083634` without
+> names. Multi-bank composition now feeds a cross-bank call into semantic
+> recovery only when the call and delay slot are reachable from fact-proven or
+> already-derived callable roots and its target belongs to exactly one
+> byte-verified bank generation. Physical and proven VROM-backed banks use the
+> same rule; overlapping generations remain open. Newly authorized banks are
+> rescanned to a monotone fixed point, with strict source-call results cached
+> until that source gains another authoritative root. Caller-supplied traversal
+> hints cannot bootstrap the chain. The original positive resident-target path
+> and traversal-hint rejection each passed 10/10 guarded runs; the
+> overlapping-generation negative also passes. The complete focused semantic
+> set, including the VROM/multi-hop fixed point, passed 10 consecutive runs on
+> 2026-07-29.
+>
+> Real-MM characterization exposed a two-hop cross-bank chain rather than a
+> missing-function-identification problem. Proven boot `Main_ThreadEntry`
+> directly calls `request_dma_0:0x80174bf0`; that loaded function's call at
+> `0x80174c28` targets resident `Fault_Init`. Fixed-point composition now reaches
+> both calls, derives `Fault_ThreadEntry`, and recovers the registry contract on
+> the user-owned MM image without an answer-key root or literal stored pointer.
+> The exact real-ROM test passed 10 consecutive clean runs on 2026-07-29. A
+> stack sample placed the dominant cost in whole-bank value-set CFG building;
+> deferring traversal-hint CFGs until strict authority stabilizes reduced the
+> measured exact test from about 65.0 seconds to 57.6–59.9 seconds across the
+> final run series. The function-boundary grader now composes the resident bank
+> with only the load images proven by its cited request-DMA scan, so it consumes
+> the same fixed-point authority without admitting unrelated materializable
+> overlays. On 2026-07-29, an A/B run with the former `Fault_AddClient` manifest
+> present versus absent was identical: the manifest added zero roots, both runs
+> produced 386/486 exact and 98 open without the cross-game donor, and both had
+> `wrong=0`. The obsolete MM entry-argument manifest was therefore removed.
+> Grader integration then raises canonical MM from 401/486 to 402/486 exact,
+> `wrong=0`; 10 consecutive canonical composed runs were identical and peaked
+> between 495 and 523 MiB on 2026-07-29.
+> The same name-free mechanism raises WM2000 from 688/847 to 698/847 and No
+> Mercy from 826/985 to 835/985 exact, both `wrong=0`; each game passed 10/10
+> paired, semantically identical guarded corpus runs. OoT, SM64, and Kirby
+> retain their prior exact grades and `wrong=0` under the expanded authority
+> pass. After the fixed-point extension, 703/703 package tests passed in the
+> sandbox and the one process-table-dependent Ghidra runner test passed
+> separately with its memory guard enabled: 704/704 total.
 
 Compute each root's reachable block closure. Competing closures create local
 ambiguity regions. Normal cases should resolve through graph and interval
@@ -790,6 +987,10 @@ the ROM, revalidates schema, digests, geometry, and entry, then stages and
 syncs the source beside the destination. Publication is an atomic no-clobber
 hard link; an existing output is never replaced. Success prints the exact byte
 count and SHA-256 receipt without printing the generated source.
+This file-intake command proves pack/ROM integrity, not discovery derivation:
+project gates obtain schema-v2 packs only from the in-process move-only
+validated snapshot composition rather than treating caller-authored snapshot
+JSON as root authority.
 
 An audit report should expose exact counts:
 
@@ -816,7 +1017,7 @@ Decomp Pack
   sections, data symbols, relocations, compiler profiles, and match proofs
 
 Generated adapters
-  Splat, linker scripts, assembly objects, m2c contexts, asm-differ and
+  Splat, linker scripts, assembly objects, Ghidra review projects, asm-differ and
   decomp-permuter jobs
 ```
 

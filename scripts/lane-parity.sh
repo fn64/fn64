@@ -14,6 +14,8 @@
 # script.
 #
 # Usage:  scripts/lane-parity.sh [--observe] [SWAPS]     (default 60)
+#         scripts/lane-parity.sh --dry-run [--observe] [SWAPS]
+#         scripts/lane-parity.sh --selftest
 #
 # Default mode first compares the generated callable-body inventories and
 # refuses to run a semantic framebuffer gate if a callable C empty body has a
@@ -42,18 +44,60 @@
 set -uo pipefail
 
 OBSERVE=0
-if [ "${1:-}" = "--observe" ]; then
-  OBSERVE=1
+MODE=run
+SWAPS=60
+SWAPS_SET=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --observe)
+      [ "$OBSERVE" -eq 0 ] || { echo "lane-parity: duplicate --observe" >&2; exit 2; }
+      OBSERVE=1
+      ;;
+    --dry-run)
+      [ "$MODE" = run ] || { echo "lane-parity: duplicate or conflicting mode" >&2; exit 2; }
+      MODE=dry-run
+      ;;
+    --selftest)
+      [ "$MODE" = run ] || { echo "lane-parity: duplicate or conflicting mode" >&2; exit 2; }
+      MODE=selftest
+      ;;
+    *)
+      if [[ "$1" =~ ^[1-9][0-9]*$ ]] && [ "$SWAPS_SET" -eq 0 ]; then
+        SWAPS="$1"
+        SWAPS_SET=1
+      else
+        echo "usage: scripts/lane-parity.sh [--observe] [SWAPS] | --dry-run [--observe] [SWAPS] | --selftest" >&2
+        exit 2
+      fi
+      ;;
+  esac
   shift
-fi
-if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && ! [[ "$1" =~ ^[1-9][0-9]*$ ]]; }; then
-  echo "usage: scripts/lane-parity.sh [--observe] [SWAPS]" >&2
-  exit 2
-fi
-SWAPS="${1:-60}"
+done
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 FN64="${FN64:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 BOOT="$FN64/examples/oot-boot"
+guard="$SCRIPT_DIR/memory-guard.zsh"
+export FN64_GUARD_MAX_RSS_MIB="${FN64_GUARD_MAX_RSS_MIB:-2048}"
+export FN64_GUARD_MIN_FREE_PERCENT="${FN64_GUARD_MIN_FREE_PERCENT:-40}"
+export CARGO_BUILD_JOBS=1
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
+
+if [ "$MODE" = selftest ]; then
+  [ "$OBSERVE" -eq 0 ] && [ "$SWAPS_SET" -eq 0 ] || {
+    echo "lane-parity self-test: --selftest accepts no lane options" >&2
+    exit 2
+  }
+  [ -x "$guard" ] || { echo "lane-parity self-test: memory guard is unavailable" >&2; exit 1; }
+  "$SCRIPT_DIR/native-emit.sh" --selftest >/dev/null || exit 1
+  echo "lane-parity self-test: PASS"
+  exit 0
+fi
+if [ "$MODE" = dry-run ]; then
+  printf '{"schema":"fn64.lane-parity-plan.v1","status":"dry-run","observe":%s,"swaps":%s,"cargo_jobs":1,"test_threads":1,"max_rss_mib":%s,"min_free_percent":%s,"guarded_phases":["native_emit","authority_test","c_build","c_run","rs_build","rs_run"]}\n' \
+    "$([ "$OBSERVE" -eq 1 ] && printf true || printf false)" "$SWAPS" \
+    "$FN64_GUARD_MAX_RSS_MIB" "$FN64_GUARD_MIN_FREE_PERCENT"
+  exit 0
+fi
 
 # Both lanes emit a binary called `oot-boot`, so they MUST NOT share a target
 # dir: the second build overwrites the first and the comparison silently
@@ -90,7 +134,12 @@ FB_GLOB="/tmp/fn64-fb"
 # the exact same unique instruction-PC set, giving an independent whole-corpus
 # code-coverage differential before either boot binary runs.
 echo "lane-parity: emitting/locating rs crate for authority audit..."
-RECOMP_RS_DIR="${RECOMP_RS_DIR:-$("$SCRIPT_DIR/native-emit.sh" 2>/dev/null | tail -1)}"
+if [ -z "${RECOMP_RS_DIR:-}" ]; then
+  if ! RECOMP_RS_DIR=$("$SCRIPT_DIR/native-emit.sh" | tail -1); then
+    echo "lane-parity: FAIL -- guarded native emit failed" >&2
+    exit 2
+  fi
+fi
 if [ -z "${RECOMP_RS_DIR:-}" ] || [ ! -f "$RECOMP_RS_DIR/src/lib.rs" ]; then
   echo "lane-parity: SKIP -- no emitted rs crate (scripts/native-emit.sh produced nothing usable)." >&2
   exit 0
@@ -103,8 +152,8 @@ if [ "$OBSERVE" -eq 1 ]; then
 fi
 echo "lane-parity: auditing generated callable bodies (mode=$AUTHORITY_MODE)..."
 if ! FN64_LANE_AUTHORITY_MODE="$AUTHORITY_MODE" \
-  cargo test -q -p fn64-recomp-rs --test lane_authority generated_lane_authority \
-    -- --ignored --nocapture; then
+  "$guard" cargo test -j1 -q -p fn64-recomp-rs --test lane_authority \
+    generated_lane_authority -- --ignored --nocapture --test-threads=1; then
   echo "lane-parity: AUTHORITY REJECTED -- the legacy C callable-body set is not aligned with the rs lane." >&2
   echo "lane-parity: use --observe only for a labeled framebuffer observation; it is not semantic parity." >&2
   exit 2
@@ -120,7 +169,8 @@ run_lane() {
   local lane="$1" out="$2" bin="$3"
   [ -x "$bin" ] || { echo "lane-parity: $lane lane binary missing at $bin" >&2; exit 2; }
   rm -f "$FB_GLOB"-*.png
-  ( cd "$BOOT" && OOT_MAX_SWAPS="$SWAPS" "$bin" ) >"/tmp/lane-parity-$lane.log" 2>&1
+  ( cd "$BOOT" && OOT_MAX_SWAPS="$SWAPS" "$guard" "$bin" ) \
+    >"/tmp/lane-parity-$lane.log" 2>&1
   local observed
   observed=$(grep -oE "VI swaps observed: [0-9]+" "/tmp/lane-parity-$lane.log" | tail -1 | grep -oE "[0-9]+$")
   if [ -z "${observed:-}" ] || [ "$observed" -lt "$SWAPS" ]; then
@@ -141,7 +191,8 @@ echo "lane-parity: bounding both lanes at $SWAPS swaps"
 
 # --- C lane ------------------------------------------------------------------
 echo "lane-parity: building C lane..."
-( cd "$BOOT" && CARGO_TARGET_DIR="$C_TARGET" FN64_RECOMP=c cargo build --release -q ) \
+( cd "$BOOT" && CARGO_TARGET_DIR="$C_TARGET" FN64_RECOMP=c \
+  "$guard" cargo build -j1 --release -q ) \
   || { echo "lane-parity: C lane build failed" >&2; exit 2; }
 run_lane c /tmp/lane-parity-c.sha "$C_BIN"
 
@@ -155,7 +206,7 @@ fi
 ln -sfn "$RECOMP_RS_DIR" "$link" || exit 2
 echo "lane-parity: building rs lane (large emitted crate; first build is slow)..."
 CARGO_TARGET_DIR="$RS_TARGET" FN64_RECOMP=rs \
-  cargo build --manifest-path "$BOOT/rs/Cargo.toml" --release -q \
+  "$guard" cargo build -j1 --manifest-path "$BOOT/rs/Cargo.toml" --release -q \
   || { echo "lane-parity: rs lane build failed" >&2; exit 2; }
 
 # Self-check: the whole experiment is void if both "lanes" are the same binary.

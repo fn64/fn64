@@ -585,6 +585,16 @@ impl Executor {
         self.cp0_count_phase = 0;
     }
 
+    /// Restore the CPU clock state captured at an external architectural
+    /// handoff. Unlike [`Self::write_cp0_compare`], this is not an emulated
+    /// MTC0 and therefore retains the captured IP7 latch.
+    pub fn restore_cp0_clock(&mut self, count: u32, compare: u32, timer_pending: bool) {
+        self.cp0_count = count;
+        self.cp0_count_phase = 0;
+        self.cp0_compare = compare;
+        self.cp0_timer_pending = timer_pending;
+    }
+
     pub fn cp0_compare(&self) -> u32 {
         self.cp0_compare
     }
@@ -911,6 +921,19 @@ impl Executor {
             ExternalEvent::DirectPost { queue_addr, msg } => (queue_addr, msg),
         };
         self.deliver_or_enqueue(queue_addr, msg, None);
+    }
+
+    /// Post a synchronous CPU exception event when the guest registered one.
+    /// Libultra permits fault/break events to be unregistered; in that case
+    /// the faulted thread still stops, but there is no queue notification.
+    /// Peripheral completion paths keep using [`Self::inject_event`] so a
+    /// missing required registration remains loud there.
+    pub fn inject_optional_os_event(&mut self, code: u32) -> bool {
+        let Some(&(addr, msg)) = self.event_table.get(&code) else {
+            return false;
+        };
+        self.deliver_or_enqueue(RdramAddr::from_offset(addr), msg, None);
+        true
     }
 
     /// Advance the virtual clock the host drives (VI-tick equivalent).
@@ -1935,6 +1958,15 @@ mod tests {
         exec.write_cp0_compare(0x1234_5678);
         assert_eq!(exec.cp0_compare(), 0x1234_5678);
         assert!(!exec.cp0_timer_pending());
+    }
+
+    #[test]
+    fn boot_clock_restore_retains_captured_compare_latch() {
+        let mut exec = Executor::new();
+        exec.restore_cp0_clock(0x1234_5678, 0x9abc_def0, true);
+        assert_eq!(exec.cp0_count(), 0x1234_5678);
+        assert_eq!(exec.cp0_compare(), 0x9abc_def0);
+        assert!(exec.cp0_timer_pending());
     }
 
     #[test]

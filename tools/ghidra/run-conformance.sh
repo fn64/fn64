@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
+umask 077
 
-repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+guard="$repo/scripts/memory-guard.zsh"
 headless=${GHIDRA_HEADLESS:-/opt/homebrew/Cellar/ghidra/12.1.2/libexec/support/analyzeHeadless}
 jdk=${GHIDRA_JAVA_HOME:-/opt/homebrew/Cellar/openjdk@21/21.0.11/libexec/openjdk.jdk/Contents/Home}
 work=${FN64_GHIDRA_WORK:-/private/tmp/fn64-ghidra-conformance}
@@ -14,6 +16,10 @@ if [ ! -x "$jdk/bin/java" ]; then
     echo "GHIDRA_JAVA_HOME does not contain bin/java: $jdk" >&2
     exit 2
 fi
+if [ ! -x "$guard" ]; then
+    echo "repository memory guard is not executable: $guard" >&2
+    exit 2
+fi
 case "$work" in
     "$repo"|"$repo"/*)
         echo "FN64_GHIDRA_WORK must be outside the repository" >&2
@@ -21,7 +27,8 @@ case "$work" in
         ;;
 esac
 
-mkdir -p "$work/inputs" "$work/out" "$work/projects" "$work/home" "$work/cache"
+mkdir -p "$work/inputs" "$work/out" "$work/projects" "$work/home" "$work/settings" \
+    "$work/cache" "$work/tmp"
 xxd -r -p "$repo/tools/ghidra/fixtures/bank-a.hex" "$work/inputs/bank-a.bin"
 xxd -r -p "$repo/tools/ghidra/fixtures/bank-b.hex" "$work/inputs/bank-b.bin"
 
@@ -37,6 +44,7 @@ export_script_sha=$(sha "$repo/tools/ghidra/Fn64ExportCandidates.java")
 rom_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 evidence_sha=3333333333333333333333333333333333333333333333333333333333333333
 snapshot_sha=4444444444444444444444444444444444444444444444444444444444444444
+path_value=${PATH:-/usr/bin:/bin}
 
 run_bank() {
     output=$1
@@ -50,10 +58,18 @@ run_bank() {
         'MIPS:BE:64:64-32addr:o32' "$mode" "$seed_script_sha" "$export_script_sha" "$mapping_sha" |
         shasum -a 256 | awk '{print $1}')
 
+    run_log="$work/out/$output.log"
+    run_guard="$work/out/$output-memory.jsonl"
     if [ "$mode" = seeded ]; then
-        JAVA_HOME="$jdk" \
-        _JAVA_OPTIONS="-Duser.home=$work/home -Djava.io.tmpdir=$work/cache" \
-        "$headless" "$work/projects" "$output" \
+        FN64_GUARD_MAX_RSS_MIB=2048 \
+        FN64_GUARD_MIN_FREE_PERCENT=40 \
+        FN64_GUARD_MAX_SECONDS=180 \
+        FN64_GUARD_JSONL="$run_guard" \
+        "$guard" env -i \
+            "PATH=$path_value" "HOME=$work/home" "TMPDIR=$work/tmp" \
+            "JAVA_HOME=$jdk" "GHIDRA_HEADLESS_MAXMEM=1G" \
+            "_JAVA_OPTIONS=-Dapplication.settingsdir=$work/settings -Dapplication.cachedir=$work/cache -Dapplication.tempdir=$work/tmp -Djava.io.tmpdir=$work/tmp -Duser.home=$work/home" \
+            "$headless" "$work/projects" "$output" \
             -import "$input" -overwrite \
             -processor MIPS:BE:64:64-32addr -cspec o32 \
             -loader BinaryLoader -loader-baseAddr 80001000 \
@@ -64,11 +80,17 @@ run_bank() {
                 0x80001000 0x80001040 "$rom_sha" "$bank_sha" "$mapping_sha" 12.1.2 \
                 "$build_sha" "$config_sha" "$evidence_sha" "$(basename -- "$input")" \
                 discovery_snapshot "$snapshot_sha" \
-            -deleteProject >"$work/out/$output.log" 2>&1
+            -deleteProject >"$run_log" 2>&1
     else
-        JAVA_HOME="$jdk" \
-        _JAVA_OPTIONS="-Duser.home=$work/home -Djava.io.tmpdir=$work/cache" \
-        "$headless" "$work/projects" "$output" \
+        FN64_GUARD_MAX_RSS_MIB=2048 \
+        FN64_GUARD_MIN_FREE_PERCENT=40 \
+        FN64_GUARD_MAX_SECONDS=180 \
+        FN64_GUARD_JSONL="$run_guard" \
+        "$guard" env -i \
+            "PATH=$path_value" "HOME=$work/home" "TMPDIR=$work/tmp" \
+            "JAVA_HOME=$jdk" "GHIDRA_HEADLESS_MAXMEM=1G" \
+            "_JAVA_OPTIONS=-Dapplication.settingsdir=$work/settings -Dapplication.cachedir=$work/cache -Dapplication.tempdir=$work/tmp -Djava.io.tmpdir=$work/tmp -Duser.home=$work/home" \
+            "$headless" "$work/projects" "$output" \
             -import "$input" -overwrite \
             -processor MIPS:BE:64:64-32addr -cspec o32 \
             -loader BinaryLoader -loader-baseAddr 80001000 \
@@ -78,7 +100,8 @@ run_bank() {
             -postScript Fn64ExportCandidates.java "$work/out/$output.jsonl" unseeded "$bank" \
                 0x80001000 0x80001040 "$rom_sha" "$bank_sha" "$mapping_sha" 12.1.2 \
                 "$build_sha" "$config_sha" "$evidence_sha" "$(basename -- "$input")" \
-            -deleteProject >"$work/out/$output.log" 2>&1
+                discovery_snapshot "$snapshot_sha" \
+            -deleteProject >"$run_log" 2>&1
     fi
 }
 
@@ -100,29 +123,70 @@ for run_log in "$work"/out/*.log; do
     fi
 done
 
-cargo run --quiet --manifest-path "$repo/Cargo.toml" -p fn64-discover --bin gate_tool_jsonl -- \
-    "$work/out/bank-a-unseeded.jsonl" \
-    "$work/out/bank-a-seeded.jsonl" \
-    "$work/out/bank-b-unseeded.jsonl"
-
-# Stream digests recorded in tools/ghidra/README.md ("Measured conformance").
-# They are stable for the pinned Ghidra 12.1.2 build (the JSONL embeds the
-# build digest); a different Ghidra build fails here by design.
-expected_a_seeded=193ce1641402c9f4c436a7abca70030970859dcb12895535661f863a7fa45e0f
-expected_a_unseeded=953c0a01d81dbdd4fb05c9c02d6664c09610254da22970b4246ee9a55892b807
-expected_b_unseeded=8d3fdcc8e222d598ea815703296d403a693f192e98639d1ee4657dfa5c5e8e31
-for pair in \
-    "bank-a-seeded $expected_a_seeded" \
-    "bank-a-unseeded $expected_a_unseeded" \
-    "bank-b-unseeded $expected_b_unseeded"; do
-    stream=${pair% *}
-    expected=${pair#* }
-    got=$(sha "$work/out/$stream.jsonl")
-    if [ "$got" != "$expected" ]; then
-        echo "$stream.jsonl sha256 $got != recorded $expected (pinned Ghidra 12.1.2)" >&2
-        exit 1
+gate_log="$work/out/gate-tool-jsonl.log"
+gate_guard="$work/out/gate-tool-jsonl-memory.jsonl"
+if [ -n "${FN64_GATE_TOOL_JSONL:-}" ]; then
+    case "$FN64_GATE_TOOL_JSONL" in
+        /*) ;;
+        *) echo "FN64_GATE_TOOL_JSONL must be absolute" >&2; exit 2 ;;
+    esac
+    if [ ! -x "$FN64_GATE_TOOL_JSONL" ]; then
+        echo "FN64_GATE_TOOL_JSONL is not executable: $FN64_GATE_TOOL_JSONL" >&2
+        exit 2
     fi
-done
+    FN64_GUARD_MAX_RSS_MIB=2048 \
+    FN64_GUARD_MIN_FREE_PERCENT=40 \
+    FN64_GUARD_MAX_SECONDS=180 \
+    FN64_GUARD_JSONL="$gate_guard" \
+    "$guard" "$FN64_GATE_TOOL_JSONL" \
+        "$work/out/bank-a-unseeded.jsonl" \
+        "$work/out/bank-a-seeded.jsonl" \
+        "$work/out/bank-b-unseeded.jsonl" >"$gate_log" 2>&1
+else
+    caller_home=${HOME:-}
+    if [ -z "$caller_home" ]; then
+        echo "HOME or FN64_GATE_TOOL_JSONL is required for the Rust gate" >&2
+        exit 2
+    fi
+    cargo_home=${CARGO_HOME:-$caller_home/.cargo}
+    rustup_home=${RUSTUP_HOME:-$caller_home/.rustup}
+    cargo_target=${CARGO_TARGET_DIR:-$repo/target}
+    FN64_GUARD_MAX_RSS_MIB=2048 \
+    FN64_GUARD_MIN_FREE_PERCENT=40 \
+    FN64_GUARD_MAX_SECONDS=180 \
+    FN64_GUARD_JSONL="$gate_guard" \
+    "$guard" env -i \
+        "PATH=$path_value" "HOME=$work/home" "TMPDIR=$work/tmp" \
+        "CARGO_HOME=$cargo_home" "RUSTUP_HOME=$rustup_home" \
+        "CARGO_TARGET_DIR=$cargo_target" "CARGO_BUILD_JOBS=1" \
+        cargo run --quiet --manifest-path "$repo/Cargo.toml" -j 1 -p fn64-discover \
+            --bin gate_tool_jsonl -- \
+            "$work/out/bank-a-unseeded.jsonl" \
+            "$work/out/bank-a-seeded.jsonl" \
+            "$work/out/bank-b-unseeded.jsonl" >"$gate_log" 2>&1
+fi
+
+# Snapshot lineage changes every stream. Record one-run digests here, but do
+# not promote them to the README's ten-run deterministic claim until ten
+# consecutive clean guarded runs agree.
+a_seeded_sha=$(sha "$work/out/bank-a-seeded.jsonl")
+a_unseeded_sha=$(sha "$work/out/bank-a-unseeded.jsonl")
+b_unseeded_sha=$(sha "$work/out/bank-b-unseeded.jsonl")
+expected_a_seeded=062377050bbabfd7ad34e8f968608cee83e859342a8af22c5ff3fe88d9b6bc08
+expected_a_unseeded=9beaec498da4c35af821ea662dec1e46a8b532f3084ca248e0a7330eba51e4e6
+expected_b_unseeded=748246baa3b4bd9fadc3466a6926f3156894c7eb636666e3bcc9661f47099461
+[ "$a_seeded_sha" = "$expected_a_seeded" ] || {
+    echo "bank A seeded digest drifted: $a_seeded_sha" >&2
+    exit 1
+}
+[ "$a_unseeded_sha" = "$expected_a_unseeded" ] || {
+    echo "bank A unseeded digest drifted: $a_unseeded_sha" >&2
+    exit 1
+}
+[ "$b_unseeded_sha" = "$expected_b_unseeded" ] || {
+    echo "bank B unseeded digest drifted: $b_unseeded_sha" >&2
+    exit 1
+}
 
 if ! grep -q 'ghidra:function-entry:bank-a:80001020' "$work/out/bank-a-unseeded.jsonl"; then
     echo "bank A did not discover its direct-call target" >&2
@@ -145,4 +209,5 @@ if grep -q 'ghidra:function-entry:bank-a:' "$work/out/bank-b-unseeded.jsonl"; th
     exit 1
 fi
 
-echo "ghidra conformance: raw BE MIPS import, bank isolation, and seed lineage passed"
+echo "ghidra conformance: raw BE MIPS import, bank isolation, and snapshot-bound seed modes passed"
+echo "one-run digests (ten-run refresh pending): bank-a-seeded=$a_seeded_sha bank-a-unseeded=$a_unseeded_sha bank-b-unseeded=$b_unseeded_sha"

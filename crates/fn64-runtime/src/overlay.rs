@@ -798,24 +798,9 @@ mod tests {
         // s_a: rom 0x1000..0x2400 (spans >1 chunk), ram 0x9000..0xA400.
         // s_b: rom 0x2400..0x2600 (0x200 bytes, fits inside one chunk), ram 0xA400.
         // s_c: rom 0x2600..0x3800, ram 0xA600.
-        let s_a = reg.register_section(section_at_rom(
-            0x1000,
-            0x9000,
-            0x1400,
-            vec![(0x0, 0xaaaa)],
-        ));
-        let s_b = reg.register_section(section_at_rom(
-            0x2400,
-            0xA400,
-            0x200,
-            vec![(0x0, 0xbbbb)],
-        ));
-        let s_c = reg.register_section(section_at_rom(
-            0x2600,
-            0xA600,
-            0x1200,
-            vec![(0x0, 0xcccc)],
-        ));
+        let s_a = reg.register_section(section_at_rom(0x1000, 0x9000, 0x1400, vec![(0x0, 0xaaaa)]));
+        let s_b = reg.register_section(section_at_rom(0x2400, 0xA400, 0x200, vec![(0x0, 0xbbbb)]));
+        let s_c = reg.register_section(section_at_rom(0x2600, 0xA600, 0x1200, vec![(0x0, 0xcccc)]));
 
         // The game DMAs the segment in 0x1000-byte chunks, all at static VRAM
         // (dest - rom == 0x8000 for every chunk).
@@ -844,12 +829,7 @@ mod tests {
     fn coverage_dma_ignores_non_static_and_mismatched_delta() {
         let mut reg = SectionRegistry::new();
         // Static delta is 0x8000 (rom 0x1000 -> ram 0x9000).
-        let idx = reg.register_section(section_at_rom(
-            0x1000,
-            0x9000,
-            0x400,
-            vec![(0x0, 0xdead)],
-        ));
+        let idx = reg.register_section(section_at_rom(0x1000, 0x9000, 0x400, vec![(0x0, 0xdead)]));
         // Heap relocation: same rom, but dest is an arena base (delta != 0x8000).
         assert!(reg
             .load_sections_covered_by_dma(0x1000, 0x803b_4640, 0x400)

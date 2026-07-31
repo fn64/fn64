@@ -495,7 +495,7 @@ pub extern "C" fn fn64_c_rdram_write(vaddr: u64, width: u32, value: u64) {
         "generated-C RDRAM write at {vaddr:#018x} has invalid aligned physical range {physical_offset:#x}..{end:#x} for width {width}"
     );
     #[cfg(feature = "recomp-rs")]
-    fn64_recomp_rs::notify_guest_write(physical_offset, width);
+    fn64_recomp_rs::notify_cpu_instruction_store(physical_offset, width);
     if width == 2 {
         task_dispatch::observe_non_rdp_write16(physical_offset, value as u16);
     }
@@ -818,6 +818,7 @@ pub struct AbiHostEvidenceSnapshot {
     pub leo_disk: Option<pi::LeoDiskConfig>,
     pub thread_handles: Vec<ThreadHandleEvidenceSnapshot>,
     pub thread_guest_ids: Vec<ThreadGuestIdEvidenceSnapshot>,
+    pub guest_running_thread_global: Option<u32>,
     pub timer_handles: Vec<TimerHandleEvidenceSnapshot>,
     pub next_synthetic_thread_id: ThreadId,
     pub registered_rdram: RegisteredRdramEvidenceSnapshot,
@@ -878,6 +879,10 @@ struct HostState {
     /// starts record their call-local pointer/required extent directly.
     runtime_rdram: *mut u8,
     runtime_rdram_len: usize,
+    /// Canonical bootstrap owns its process allocation here so no caller can
+    /// retain a mutable `Vec` or raw-pointer lifetime after validation.
+    #[cfg(feature = "recomp-rs")]
+    owned_runtime_rdram: Option<Box<[u8]>>,
     /// CPU-side images of immutable `OSTask::ucode_boot` ranges. The public
     /// task contract points these fields at rspboot text, and the real CPU's
     /// non-coherent data cache can retain that text while a CIC/custom RSP
@@ -953,6 +958,11 @@ struct HostState {
     /// the real disassembly evidence that disproved a prior wave's opposite
     /// assumption.
     thread_handles: std::collections::HashMap<u32, ThreadId>,
+    /// Executor `ThreadId` -> original guest `OSThread*` virtual address.
+    /// This is the O(1) reverse of `thread_handles`, retained so the one
+    /// scheduler resume seam can publish libultra's current-thread global
+    /// without scanning the handle inventory on every scheduling step.
+    thread_handle_vrams: std::collections::HashMap<ThreadId, u32>,
     /// Executor `ThreadId` -> the OSId the guest's `osCreateThread` actually
     /// supplied. Libultra's OSId is an informational tag with NO uniqueness
     /// contract -- thread identity on real hardware is the OSThread struct
@@ -964,6 +974,10 @@ struct HostState {
     /// id instead, and this map preserves the guest-visible OSId for
     /// `osGetThreadId_recomp`.
     thread_guest_ids: std::collections::HashMap<ThreadId, u32>,
+    /// Structurally discovered guest global containing `__osRunningThread`.
+    /// Hosts install it as artifact metadata; the scheduler mirrors the
+    /// selected `OSThread*` immediately before resuming that coroutine.
+    guest_running_thread_global: Option<RdramAddr>,
     /// Next synthetic executor id handed out on an OSId collision. Starts
     /// far above any plausible guest OSId so remapped threads are obvious
     /// in trace output.
@@ -987,6 +1001,11 @@ struct HostState {
     /// the same owned program/generation identities as thread 0.
     #[cfg(feature = "recomp-rs")]
     recompiled_program: Option<recompiled::LiveBlockProgram>,
+    /// Callback-free canonical catalog owner. This is separate from the
+    /// compatibility block lane so evidence can distinguish the only install
+    /// shape eligible for future catalog-total authority.
+    #[cfg(feature = "recomp-rs")]
+    canonical_recompiled_program: Option<recompiled::CanonicalLiveBlockProgramV1>,
     /// Length of the process-wide RDRAM/MMIO allocation behind `ACTIVE_RDRAM`.
     /// Required to rebuild the checked rs-lane `Rdram` view at a spawned
     /// thread's entry without creating a second memory model or allocation.
@@ -1018,6 +1037,8 @@ impl Default for HostState {
             active_vi_y_scale: 1.0,
             runtime_rdram: std::ptr::null_mut(),
             runtime_rdram_len: 0,
+            #[cfg(feature = "recomp-rs")]
+            owned_runtime_rdram: None,
             rsp_boot_images: std::collections::HashMap::new(),
             loaded_rsp_task: None,
             next_rsp_task_admission_generation: task_dispatch::RspTaskAdmissionGeneration::first(),
@@ -1038,13 +1059,17 @@ impl Default for HostState {
             native_execution_destinations: Vec::new(),
             native_destination_by_pointer: std::collections::HashMap::new(),
             thread_handles: std::collections::HashMap::new(),
+            thread_handle_vrams: std::collections::HashMap::new(),
             thread_guest_ids: std::collections::HashMap::new(),
+            guest_running_thread_global: None,
             next_synthetic_thread_id: 0xF000_0000,
             timer_handles: std::collections::HashMap::new(),
             #[cfg(feature = "recomp-rs")]
             recompiled_lookup: None,
             #[cfg(feature = "recomp-rs")]
             recompiled_program: None,
+            #[cfg(feature = "recomp-rs")]
+            canonical_recompiled_program: None,
             #[cfg(feature = "recomp-rs")]
             recompiled_rdram_len: 0,
         }
@@ -1230,6 +1255,8 @@ fn classify_host_evidence_fields(host: &HostState) {
         active_vi_y_scale: _,
         runtime_rdram: _,
         runtime_rdram_len: _,
+        #[cfg(feature = "recomp-rs")]
+            owned_runtime_rdram: _,
         rsp_boot_images: _,
         loaded_rsp_task: _,
         next_rsp_task_admission_generation: _,
@@ -1254,7 +1281,11 @@ fn classify_host_evidence_fields(host: &HostState) {
         native_execution_destinations: _,
         native_destination_by_pointer: _,
         thread_handles: _,
+        // Exact reverse index of `thread_handles`; it adds no independent
+        // future-affecting state to the evidence snapshot.
+        thread_handle_vrams: _,
         thread_guest_ids: _,
+        guest_running_thread_global: _,
         next_synthetic_thread_id: _,
         timer_handles: _,
         // These have a separately owned, feature-gated evidence seam in
@@ -1263,6 +1294,8 @@ fn classify_host_evidence_fields(host: &HostState) {
             recompiled_lookup: _,
         #[cfg(feature = "recomp-rs")]
             recompiled_program: _,
+        #[cfg(feature = "recomp-rs")]
+            canonical_recompiled_program: _,
         #[cfg(feature = "recomp-rs")]
             recompiled_rdram_len: _,
     } = host;
@@ -1385,6 +1418,7 @@ pub fn host_evidence_snapshot() -> AbiHostEvidenceSnapshot {
             leo_disk: host.leo_disk,
             thread_handles,
             thread_guest_ids,
+            guest_running_thread_global: host.guest_running_thread_global.map(RdramAddr::offset),
             timer_handles,
             next_synthetic_thread_id: host.next_synthetic_thread_id,
             registered_rdram: RegisteredRdramEvidenceSnapshot {
@@ -1407,6 +1441,18 @@ pub fn copy_device_trace() -> Vec<fn64_runtime::DeviceTraceEvent> {
     with_host(|host| host.device_fabric.trace().to_vec())
 }
 
+/// Read constant-space device progress counts without cloning the retained
+/// authoritative trace.
+pub fn device_trace_summary() -> fn64_runtime::DeviceTraceSummary {
+    with_host(|host| host.device_fabric.trace_summary())
+}
+
+/// Control device event retention for bounded exploratory runs. Counts remain
+/// active; release evidence leaves retention enabled, which is the default.
+pub fn set_device_trace_enabled(enabled: bool) {
+    with_host(|host| host.device_fabric.set_trace_enabled(enabled));
+}
+
 /// Copy successful typed save operations observed through authoritative ABI
 /// storage boundaries. This is separate from device DMA trace because PFS and
 /// synchronous Flash APIs do not traverse `DeviceFabric`.
@@ -1425,6 +1471,22 @@ pub fn copy_save_operations() -> Vec<fn64_runtime::SaveOperationEvent> {
 /// device was actually exercised by the guest.
 pub fn copy_controller_operations() -> Vec<fn64_runtime::ControllerOperationEvent> {
     with_host(|host| host.controller_operations.clone())
+}
+
+/// Copy controller-operation evidence appended at or after `start`.
+/// Scripted-input harnesses use this cursor form to advance by successful
+/// controller-read ordinal without repeatedly cloning the complete history.
+pub fn copy_controller_operations_since(
+    start: usize,
+) -> Vec<fn64_runtime::ControllerOperationEvent> {
+    with_host(|host| {
+        assert!(
+            start <= host.controller_operations.len(),
+            "controller-operation cursor {start} exceeds history length {}",
+            host.controller_operations.len()
+        );
+        host.controller_operations[start..].to_vec()
+    })
 }
 
 /// Copy exact committed RSP/RDP observations in ABI execution order.
@@ -1804,10 +1866,14 @@ fn suspend_active_coroutine(yield_value: Yield) -> Resume {
     // faithful-rate work if a title ever needs it.
     const C_LANE_OS_CALL_CYCLES: u32 = 250;
     if !matches!(yield_value, Yield::InstructionCheckpoint { .. }) {
+        #[cfg(feature = "recomp-rs")]
+        recompiled::checkpoint_catalog_host_transaction_before_suspend();
         let _ = yielder.suspend(Yield::InstructionCheckpoint {
             instructions: C_LANE_OS_CALL_CYCLES,
         });
     }
+    #[cfg(feature = "recomp-rs")]
+    recompiled::checkpoint_catalog_host_transaction_before_suspend();
     yielder.suspend(yield_value)
 }
 

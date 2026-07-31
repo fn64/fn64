@@ -4,13 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "From-scratch Rust MIPS III (VR4300) -> typed-Rust static recompiler. The type-safe Rust sibling of the N64Recomp shell-out adapter (docs/DECOUPLING.md step 5)."
+description = "Linked typed execution runtime for fn64's generated VR4300 Rust runners."
+
+[features]
+default = ["dev-interpreter"]
+aot-runtime = []
+production-aot = ["aot-runtime"]
+dynamic-mapped-runtime = ["aot-runtime"]
+dev-interpreter = ["dynamic-mapped-runtime"]
 
 [dependencies]
-fn64-recomp = { path = "../fn64-recomp" }
 rustc_apfloat = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
 
 [dev-dependencies]
+fn64-recomp = { path = "../fn64-recomp" }
+fn64-recomp-rs-codegen = { path = "../fn64-recomp-rs-codegen" }
+serde_json = "1"

@@ -62,7 +62,7 @@ pub enum EvidenceClass {
     /// but named here so the taxonomy is complete and honest.
     ExactAot,
     /// A generated bank/basic-block runner emitted by
-    /// [`emit_bank_runner`](crate::emit::emit_bank_runner).
+    /// the build-side bank emitter.
     BlockAot,
     /// The interpreter fallback: admitted code with no generated runner, run by
     /// the [`crate::interp`] MIPS-III interpreter behind the same contract.

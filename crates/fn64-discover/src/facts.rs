@@ -48,7 +48,9 @@ pub enum CandidateDetector {
     HardwareEntrypoint,
     JalTarget,
     IndirectCallTarget,
+    SemanticCallableArgument,
     ProloguePattern,
+    ArgumentHomeSpillLeaf,
     TableDerived,
 }
 
@@ -83,12 +85,30 @@ pub enum ProloguePattern {
     LeafWithMatchedRestore,
 }
 
+/// Closed semantic contract that makes one constant o32 argument callable.
+/// Each variant retains the exact reachable consumer evidence used by the
+/// byte-verified fixed point; a generic pointer argument is never authority.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SemanticCallableContract {
+    OsCreateThread,
+    ArgumentToJalr {
+        jalr_sites: Vec<BankAddr>,
+    },
+    CallbackRegistry {
+        dispatcher: BankAddr,
+        callback_store_site: BankAddr,
+        list_insert_site: BankAddr,
+        jalr_site: BankAddr,
+    },
+}
+
 /// Machine-readable evidence carried by every Phase 3 function-entry claim.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum FunctionEntryEvidence {
-    /// The normalized ROM header entry executed after IPL3's hardware-fixed
-    /// boot copy. This is authoritative reachability, not a heuristic
-    /// prologue or tool claim.
+    /// The effective program entry reached after an exactly identified IPL3's
+    /// boot copy. It is derived from the normalized header entry plus that
+    /// IPL3 profile's admitted relocation delta. This is authoritative
+    /// reachability, not a heuristic prologue or tool claim.
     RomHeaderEntrypoint,
     DirectJal {
         call_site: BankAddr,
@@ -102,15 +122,45 @@ pub enum FunctionEntryEvidence {
         kind: IndirectCallEvidenceKind,
         memory_sources: Vec<BankAddr>,
     },
+    /// A reachable direct call supplies a statically proven code pointer to a
+    /// mechanically closed callback/thread-entry contract. This is Proven
+    /// only when composition rederives the call, delay word, constant operand,
+    /// and contract from the byte-verified authority closure.
+    SemanticCallableArgument {
+        call_site: BankAddr,
+        callee: BankAddr,
+        pointer_register: u8,
+        contract: SemanticCallableContract,
+    },
     Prologue {
         stack_adjust: BankAddr,
         frame_size: u32,
         pattern: ProloguePattern,
         corroborating_site: BankAddr,
     },
+    /// A frameless o32 leaf begins by spilling one incoming argument to its
+    /// canonical caller-allocated home slot, follows a complete preceding
+    /// `jr $ra` plus delay slot, and reaches its own bounded `jr $ra` without
+    /// any intervening control ambiguity. This is candidate evidence only.
+    ArgumentHomeSpillLeaf {
+        predecessor_return: BankAddr,
+        spill_site: BankAddr,
+        argument_index: u8,
+        return_site: BankAddr,
+    },
     TableEntry {
         table: BankAddr,
         index: u32,
+    },
+    /// Candidate-only pointer slot in a mechanically recognized dense or
+    /// fixed-stride table-shaped run. This is not an identified descriptor
+    /// table and does not establish that any reachable consumer invokes it.
+    HandlerTablePointer {
+        table_base: BankAddr,
+        source_slot: BankAddr,
+        slot_ordinal: u32,
+        stride_words: u8,
+        run_length: u32,
     },
 }
 
@@ -131,6 +181,15 @@ impl BankAddr {
 pub enum Fact {
     /// `source` performs a direct `jal`/`j` to `target`, both bank-qualified.
     DirectCall { source: BankAddr, target: BankAddr },
+    /// `source` performs a computed call whose complete statically-proven
+    /// target set includes `target`, both bank-qualified.
+    ///
+    /// Unlike an observed `jalr`, this fact is emitted only when the source
+    /// bank's typed indirect-transfer analysis is `Exhaustive` and its target
+    /// set exactly matches the CFG terminator. It therefore carries the same
+    /// callable-entry authority as an in-bank exhaustive resolved call without
+    /// pretending the instruction was a direct `jal`.
+    ResolvedCall { source: BankAddr, target: BankAddr },
     /// `bank` has a basic-block boundary starting at `pc`.
     BlockStart { bank: String, pc: u32 },
     /// The instruction at `site` loads from computed address `address`
@@ -232,7 +291,9 @@ impl Fact {
     /// facts, like cross-bank `DirectCall`, don't have a single owner).
     pub fn primary_bank(&self) -> Option<&str> {
         match self {
-            Fact::DirectCall { source, .. } => Some(&source.bank),
+            Fact::DirectCall { source, .. } | Fact::ResolvedCall { source, .. } => {
+                Some(&source.bank)
+            }
             Fact::BlockStart { bank, .. } => Some(bank),
             Fact::LoadsFrom { site, .. } => Some(&site.bank),
             Fact::ObservedIndirectTarget { site, .. } => Some(&site.bank),
@@ -245,6 +306,131 @@ impl Fact {
             Fact::FunctionEntryClaim { target, .. } => Some(&target.bank),
             Fact::Evidence { subject, .. } => Some(&subject.bank),
         }
+    }
+
+    /// Every bank named by this fact, including both ends of an edge and all
+    /// nested function-entry evidence. This is the authoritative scope used
+    /// when projecting the append-only database for one bank; `primary_bank`
+    /// is deliberately insufficient for cross-bank authority.
+    pub fn referenced_banks(&self) -> BTreeSet<&str> {
+        fn insert_addr<'a>(banks: &mut BTreeSet<&'a str>, address: &'a BankAddr) {
+            banks.insert(address.bank.as_str());
+        }
+        let mut banks = BTreeSet::new();
+        match self {
+            Fact::DirectCall { source, target } | Fact::ResolvedCall { source, target } => {
+                insert_addr(&mut banks, source);
+                insert_addr(&mut banks, target);
+            }
+            Fact::BlockStart { bank, .. }
+            | Fact::RomMapping { bank, .. }
+            | Fact::ExecutableRange { bank, .. } => {
+                banks.insert(bank);
+            }
+            Fact::LoadsFrom { site, .. }
+            | Fact::ObservedExecutedCode { site, .. }
+            | Fact::IndirectTransferAnalysis { site, .. } => insert_addr(&mut banks, site),
+            Fact::ObservedIndirectTarget { site, target, .. } => {
+                insert_addr(&mut banks, site);
+                insert_addr(&mut banks, target);
+            }
+            Fact::LoadImageTableRecord { bank, .. } => {
+                if let Some(bank) = bank {
+                    banks.insert(bank);
+                }
+            }
+            Fact::TableEntry { table, target, .. } => {
+                insert_addr(&mut banks, table);
+                insert_addr(&mut banks, target);
+            }
+            Fact::FunctionEntryClaim {
+                target, evidence, ..
+            } => {
+                insert_addr(&mut banks, target);
+                match evidence {
+                    FunctionEntryEvidence::RomHeaderEntrypoint => {}
+                    FunctionEntryEvidence::DirectJal { call_site } => {
+                        insert_addr(&mut banks, call_site)
+                    }
+                    FunctionEntryEvidence::ResolvedJalr {
+                        call_site,
+                        construction_start,
+                    } => {
+                        insert_addr(&mut banks, call_site);
+                        insert_addr(&mut banks, construction_start);
+                    }
+                    FunctionEntryEvidence::ExhaustiveIndirectCall {
+                        call_site,
+                        memory_sources,
+                        ..
+                    } => {
+                        insert_addr(&mut banks, call_site);
+                        for source in memory_sources {
+                            insert_addr(&mut banks, source);
+                        }
+                    }
+                    FunctionEntryEvidence::SemanticCallableArgument {
+                        call_site,
+                        callee,
+                        contract,
+                        ..
+                    } => {
+                        insert_addr(&mut banks, call_site);
+                        insert_addr(&mut banks, callee);
+                        match contract {
+                            SemanticCallableContract::OsCreateThread => {}
+                            SemanticCallableContract::ArgumentToJalr { jalr_sites } => {
+                                for site in jalr_sites {
+                                    insert_addr(&mut banks, site);
+                                }
+                            }
+                            SemanticCallableContract::CallbackRegistry {
+                                dispatcher,
+                                callback_store_site,
+                                list_insert_site,
+                                jalr_site,
+                            } => {
+                                insert_addr(&mut banks, dispatcher);
+                                insert_addr(&mut banks, callback_store_site);
+                                insert_addr(&mut banks, list_insert_site);
+                                insert_addr(&mut banks, jalr_site);
+                            }
+                        }
+                    }
+                    FunctionEntryEvidence::Prologue {
+                        stack_adjust,
+                        corroborating_site,
+                        ..
+                    } => {
+                        insert_addr(&mut banks, stack_adjust);
+                        insert_addr(&mut banks, corroborating_site);
+                    }
+                    FunctionEntryEvidence::ArgumentHomeSpillLeaf {
+                        predecessor_return,
+                        spill_site,
+                        return_site,
+                        ..
+                    } => {
+                        insert_addr(&mut banks, predecessor_return);
+                        insert_addr(&mut banks, spill_site);
+                        insert_addr(&mut banks, return_site);
+                    }
+                    FunctionEntryEvidence::TableEntry { table, .. } => {
+                        insert_addr(&mut banks, table)
+                    }
+                    FunctionEntryEvidence::HandlerTablePointer {
+                        table_base,
+                        source_slot,
+                        ..
+                    } => {
+                        insert_addr(&mut banks, table_base);
+                        insert_addr(&mut banks, source_slot);
+                    }
+                }
+            }
+            Fact::Evidence { subject, .. } => insert_addr(&mut banks, subject),
+        }
+        banks
     }
 }
 
@@ -353,6 +539,434 @@ pub struct Conclusion {
 pub struct FactDb {
     facts: Vec<Fact>,
     conclusions: BTreeMap<String, Conclusion>,
+}
+
+/// A malformed conclusion cannot be projected without either dangling or
+/// silently changing its evidence indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FactProjectionError {
+    DanglingJustification {
+        subject: String,
+        fact_index: usize,
+        fact_count: usize,
+    },
+    UnknownConclusionOwner {
+        subject: String,
+    },
+    ConclusionOwnerMismatch {
+        subject: String,
+        expected_bank: String,
+        fact_index: usize,
+        actual_bank: String,
+    },
+    CanonicalConclusionMismatch {
+        subject: String,
+        fact_index: usize,
+        expected_subject: String,
+    },
+    MissingCanonicalConclusionClaim {
+        subject: String,
+    },
+}
+
+impl std::fmt::Display for FactProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DanglingJustification {
+                subject,
+                fact_index,
+                fact_count,
+            } => write!(
+                f,
+                "conclusion '{subject}' references missing fact {fact_index} (fact count {fact_count})"
+            ),
+            Self::UnknownConclusionOwner { subject } => write!(
+                f,
+                "conclusion '{subject}' has evidence but no typed semantic owner"
+            ),
+            Self::ConclusionOwnerMismatch {
+                subject,
+                expected_bank,
+                fact_index,
+                actual_bank,
+            } => write!(
+                f,
+                "conclusion '{subject}' owns bank '{expected_bank}' but justification fact {fact_index} owns '{actual_bank}'"
+            ),
+            Self::CanonicalConclusionMismatch {
+                subject,
+                fact_index,
+                expected_subject,
+            } => write!(
+                f,
+                "conclusion '{subject}' does not match canonical subject '{expected_subject}' from justification fact {fact_index}"
+            ),
+            Self::MissingCanonicalConclusionClaim { subject } => write!(
+                f,
+                "conclusion '{subject}' has no typed justification of its expected kind"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FactProjectionError {}
+
+#[derive(Debug, Clone, Copy)]
+enum OwnedConclusionKind {
+    Bank,
+    Function,
+    ExecutableRange,
+    TableEntry,
+    ObservedExecuted,
+    ObservedIndirect,
+}
+
+fn explicit_conclusion_owner(subject: &str) -> Option<(OwnedConclusionKind, &str)> {
+    if let Some(bank) = subject.strip_prefix("bank:") {
+        return Some((OwnedConclusionKind::Bank, bank));
+    }
+    let forms = [
+        ("fn:", OwnedConclusionKind::Function),
+        ("executable-range:", OwnedConclusionKind::ExecutableRange),
+        ("table-entry:", OwnedConclusionKind::TableEntry),
+        ("observed-executed:", OwnedConclusionKind::ObservedExecuted),
+        ("observed-indirect:", OwnedConclusionKind::ObservedIndirect),
+    ];
+    forms.into_iter().find_map(|(prefix, kind)| {
+        subject
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.split_once(":0x"))
+            .map(|(bank, _)| (kind, bank))
+    })
+}
+
+fn canonical_claim_for_kind(fact: &Fact, kind: OwnedConclusionKind) -> Option<(&str, String)> {
+    match (kind, fact) {
+        (OwnedConclusionKind::Bank, Fact::RomMapping { bank, .. }) => {
+            Some((bank, format!("bank:{bank}")))
+        }
+        (
+            OwnedConclusionKind::Bank,
+            Fact::LoadImageTableRecord {
+                bank: Some(bank), ..
+            },
+        ) => Some((bank, format!("bank:{bank}"))),
+        (OwnedConclusionKind::Function, Fact::FunctionEntryClaim { target, .. }) => {
+            Some((&target.bank, function_entry_subject(target)))
+        }
+        (
+            OwnedConclusionKind::ExecutableRange,
+            Fact::ExecutableRange {
+                bank,
+                va_start,
+                va_end,
+            },
+        ) => Some((bank, executable_range_subject(bank, *va_start, *va_end))),
+        (OwnedConclusionKind::TableEntry, Fact::TableEntry { table, index, .. }) => {
+            Some((&table.bank, table_entry_subject(table, *index)))
+        }
+        (OwnedConclusionKind::ObservedExecuted, Fact::ObservedExecutedCode { site, .. }) => Some((
+            &site.bank,
+            observed_executed_code_subject(&site.bank, site.pc),
+        )),
+        (
+            OwnedConclusionKind::ObservedIndirect,
+            Fact::ObservedIndirectTarget { site, target, .. },
+        ) => Some((
+            &site.bank,
+            observed_indirect_target_subject(&site.bank, site.pc, &target.bank, target.pc),
+        )),
+        _ => None,
+    }
+}
+
+/// Immutable index for constructing exact bank-local views of a [`FactDb`].
+/// Facts with no named bank are global. A cross-bank fact is indexed under
+/// every endpoint, while each selected conclusion pulls in its complete
+/// justification set and receives densely remapped indices. An owned
+/// `Proven` conclusion must exactly equal the canonical subject regenerated
+/// from at least one typed justification of its expected kind; bank-only or
+/// prefix-only matches are rejected. Non-authoritative states retain their
+/// explicit diagnostic scope even when the failed/open rule has no positive
+/// typed claim. A call-site bank retains its raw claim, but does not clone the
+/// merged conclusion owned by the claim's target bank.
+#[derive(Debug)]
+pub struct FactProjectionIndex<'a> {
+    source: &'a FactDb,
+    facts_by_bank: BTreeMap<String, BTreeSet<usize>>,
+    global_facts: BTreeSet<usize>,
+    conclusions_by_bank: BTreeMap<String, BTreeSet<String>>,
+    global_conclusions: BTreeSet<String>,
+}
+
+impl<'a> FactProjectionIndex<'a> {
+    pub fn new(source: &'a FactDb) -> Result<Self, FactProjectionError> {
+        let vrom_banks = source
+            .facts
+            .iter()
+            .filter_map(|fact| {
+                let Fact::RomMapping {
+                    bank,
+                    rom_space: RomAddressSpace::Virtual,
+                    rom_start,
+                    rom_end,
+                    ..
+                } = fact
+                else {
+                    return None;
+                };
+                source
+                    .conclusion(&format!("bank:{bank}"))
+                    .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
+                    .then_some((bank.as_str(), *rom_start, *rom_end))
+            })
+            .collect::<Vec<_>>();
+        let mut projectable_global_banks = BTreeMap::<usize, BTreeSet<String>>::new();
+        for (index, fact) in source.facts.iter().enumerate() {
+            let Fact::LoadImageTableRecord {
+                bank: None,
+                source_space: MappingAddressSpace::VirtualRom,
+                source_start,
+                source_end,
+                destination_space: MappingAddressSpace::PhysicalRom,
+                ..
+            } = fact
+            else {
+                continue;
+            };
+            let banks = vrom_banks
+                .iter()
+                .filter(|(_, rom_start, rom_end)| {
+                    source_start <= rom_start && rom_end <= source_end
+                })
+                .map(|(bank, _, _)| (*bank).to_owned())
+                .collect();
+            projectable_global_banks.insert(index, banks);
+        }
+
+        let mut facts_by_bank = BTreeMap::<String, BTreeSet<usize>>::new();
+        let mut global_facts = BTreeSet::new();
+        for (index, fact) in source.facts.iter().enumerate() {
+            if let Some(banks) = projectable_global_banks.get(&index) {
+                for bank in banks {
+                    facts_by_bank.entry(bank.clone()).or_default().insert(index);
+                }
+                continue;
+            }
+            let banks = fact.referenced_banks();
+            if banks.is_empty() {
+                global_facts.insert(index);
+            } else {
+                for bank in banks {
+                    facts_by_bank
+                        .entry(bank.to_owned())
+                        .or_default()
+                        .insert(index);
+                }
+            }
+        }
+
+        let mut conclusions_by_bank = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut global_conclusions = BTreeSet::new();
+        for conclusion in source.conclusions.values() {
+            let explicit_owner = explicit_conclusion_owner(&conclusion.subject);
+            if conclusion.justified_by.is_empty() {
+                if conclusion.state == ProofState::Proven && explicit_owner.is_some() {
+                    return Err(FactProjectionError::MissingCanonicalConclusionClaim {
+                        subject: conclusion.subject.clone(),
+                    });
+                }
+                if let Some((_, owner)) = explicit_owner {
+                    conclusions_by_bank
+                        .entry(owner.to_owned())
+                        .or_default()
+                        .insert(conclusion.subject.clone());
+                } else {
+                    global_conclusions.insert(conclusion.subject.clone());
+                }
+                continue;
+            }
+            for &fact_index in &conclusion.justified_by {
+                if source.facts.get(fact_index).is_none() {
+                    return Err(FactProjectionError::DanglingJustification {
+                        subject: conclusion.subject.clone(),
+                        fact_index,
+                        fact_count: source.facts.len(),
+                    });
+                }
+            }
+
+            if let Some((kind, owner)) = explicit_owner {
+                if conclusion.state != ProofState::Proven {
+                    conclusions_by_bank
+                        .entry(owner.to_owned())
+                        .or_default()
+                        .insert(conclusion.subject.clone());
+                    continue;
+                }
+                let mut canonical_claims = 0usize;
+                for &fact_index in &conclusion.justified_by {
+                    if let Some((actual, expected_subject)) =
+                        canonical_claim_for_kind(&source.facts[fact_index], kind)
+                    {
+                        canonical_claims += 1;
+                        if actual != owner {
+                            return Err(FactProjectionError::ConclusionOwnerMismatch {
+                                subject: conclusion.subject.clone(),
+                                expected_bank: owner.to_owned(),
+                                fact_index,
+                                actual_bank: actual.to_owned(),
+                            });
+                        }
+                        if expected_subject != conclusion.subject {
+                            return Err(FactProjectionError::CanonicalConclusionMismatch {
+                                subject: conclusion.subject.clone(),
+                                fact_index,
+                                expected_subject,
+                            });
+                        }
+                    }
+                }
+                if canonical_claims == 0 {
+                    return Err(FactProjectionError::MissingCanonicalConclusionClaim {
+                        subject: conclusion.subject.clone(),
+                    });
+                }
+                conclusions_by_bank
+                    .entry(owner.to_owned())
+                    .or_default()
+                    .insert(conclusion.subject.clone());
+                continue;
+            }
+
+            if conclusion.subject.starts_with("load-image-table:") {
+                let matching_records = conclusion
+                    .justified_by
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        matches!(
+                            &source.facts[index],
+                            Fact::LoadImageTableRecord { table, index, .. }
+                                if load_image_table_record_subject(table, *index)
+                                    == conclusion.subject
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                // A table-level aggregate (or an open record with no typed
+                // row) is diagnostic program evidence, not bank authority.
+                // Keeping it out of every bank prevents its aggregate
+                // justification vector from cloning sibling banks.
+                if matching_records.is_empty() {
+                    continue;
+                }
+                let mut banks = BTreeSet::new();
+                for fact_index in matching_records {
+                    match &source.facts[fact_index] {
+                        Fact::LoadImageTableRecord {
+                            bank: Some(bank), ..
+                        } => {
+                            banks.insert(bank.clone());
+                        }
+                        Fact::LoadImageTableRecord { bank: None, .. } => {
+                            if let Some(projected) = projectable_global_banks.get(&fact_index) {
+                                banks.extend(projected.iter().cloned());
+                            } else {
+                                global_conclusions.insert(conclusion.subject.clone());
+                            }
+                        }
+                        _ => unreachable!("matching record predicate admits only records"),
+                    }
+                }
+                for bank in banks {
+                    conclusions_by_bank
+                        .entry(bank)
+                        .or_default()
+                        .insert(conclusion.subject.clone());
+                }
+                continue;
+            }
+
+            return Err(FactProjectionError::UnknownConclusionOwner {
+                subject: conclusion.subject.clone(),
+            });
+        }
+
+        Ok(Self {
+            source,
+            facts_by_bank,
+            global_facts,
+            conclusions_by_bank,
+            global_conclusions,
+        })
+    }
+
+    pub fn project(&self, bank: &str) -> FactDb {
+        let mut fact_indices = self.global_facts.clone();
+        if let Some(indices) = self.facts_by_bank.get(bank) {
+            fact_indices.extend(indices);
+        }
+        let mut conclusion_subjects = self.global_conclusions.clone();
+        if let Some(subjects) = self.conclusions_by_bank.get(bank) {
+            conclusion_subjects.extend(subjects.iter().cloned());
+        }
+        for subject in &conclusion_subjects {
+            fact_indices.extend(&self.source.conclusions[subject].justified_by);
+        }
+
+        let mut remap = BTreeMap::new();
+        let mut facts = Vec::with_capacity(fact_indices.len());
+        for old_index in fact_indices {
+            remap.insert(old_index, facts.len());
+            facts.push(self.source.facts[old_index].clone());
+        }
+        let conclusions = conclusion_subjects
+            .into_iter()
+            .map(|subject| {
+                let mut conclusion = self.source.conclusions[&subject].clone();
+                conclusion.justified_by = conclusion
+                    .justified_by
+                    .iter()
+                    .map(|index| remap[index])
+                    .collect();
+                (subject, conclusion)
+            })
+            .collect();
+        FactDb { facts, conclusions }
+    }
+
+    pub fn global_fact_count(&self) -> usize {
+        self.global_facts.len()
+    }
+
+    pub fn scoped_fact_count(&self, bank: &str) -> usize {
+        self.facts_by_bank.get(bank).map_or(0, BTreeSet::len)
+    }
+
+    pub fn selected_conclusion_count(&self, bank: &str) -> usize {
+        self.global_conclusions.len() + self.conclusions_by_bank.get(bank).map_or(0, BTreeSet::len)
+    }
+
+    pub fn largest_selected_justifications(
+        &self,
+        bank: &str,
+        limit: usize,
+    ) -> Vec<(String, usize)> {
+        let mut subjects = self.global_conclusions.clone();
+        if let Some(scoped) = self.conclusions_by_bank.get(bank) {
+            subjects.extend(scoped.iter().cloned());
+        }
+        let mut sizes = subjects
+            .into_iter()
+            .map(|subject| {
+                let size = self.source.conclusions[&subject].justified_by.len();
+                (subject, size)
+            })
+            .collect::<Vec<_>>();
+        sizes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        sizes.truncate(limit);
+        sizes
+    }
 }
 
 /// Error returned when a proof-rule update would silently overwrite a
@@ -545,6 +1159,35 @@ impl FactDb {
         entries.into_iter().collect()
     }
 
+    /// Hardware entrypoints whose own typed claim is already proven.
+    ///
+    /// This is intentionally narrower than [`Self::proven_function_entries`]:
+    /// consumers that inductively derive new callable authority must not let a
+    /// traversal seed, table claim, or independently merged heuristic become
+    /// the root of that proof chain.
+    pub fn proven_hardware_function_entries(&self, bank: &str) -> Vec<u32> {
+        let mut entries = BTreeSet::new();
+        for fact in &self.facts {
+            let Fact::FunctionEntryClaim {
+                target,
+                detector: CandidateDetector::HardwareEntrypoint,
+                evidence: FunctionEntryEvidence::RomHeaderEntrypoint,
+                proposed_state: ProofState::Proven,
+            } = fact
+            else {
+                continue;
+            };
+            if target.bank == bank
+                && self
+                    .conclusion(&function_entry_subject(target))
+                    .is_some_and(|conclusion| conclusion.state == ProofState::Proven)
+            {
+                entries.insert(target.pc);
+            }
+        }
+        entries.into_iter().collect()
+    }
+
     /// Function-entry candidates suitable only for exploratory CFG coverage.
     /// This deliberately includes non-authoritative claims but never changes
     /// their proof state; callers must keep resulting owners/candidates out of
@@ -575,6 +1218,699 @@ impl FactDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn banks(fact: &Fact) -> Vec<String> {
+        fact.referenced_banks()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn referenced_banks_covers_edges_globals_and_nested_entry_evidence() {
+        let a = BankAddr::new("a", 0x8000_0000);
+        let b = BankAddr::new("b", 0x8010_0000);
+        let c = BankAddr::new("c", 0x8020_0000);
+        assert_eq!(
+            banks(&Fact::DirectCall {
+                source: a.clone(),
+                target: b.clone()
+            }),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            banks(&Fact::ResolvedCall {
+                source: a.clone(),
+                target: b.clone()
+            }),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            banks(&Fact::ObservedIndirectTarget {
+                site: a.clone(),
+                target: b.clone(),
+                trace: "t".into()
+            }),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            banks(&Fact::TableEntry {
+                table: a.clone(),
+                index: 0,
+                target: b.clone()
+            }),
+            vec!["a", "b"]
+        );
+        assert!(banks(&Fact::LoadImageTableRecord {
+            table: "dma".into(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0,
+            index: 0,
+            source_space: MappingAddressSpace::PhysicalRom,
+            source_start: 0,
+            source_end: 4,
+            destination_space: MappingAddressSpace::PhysicalRom,
+            destination_start: 4,
+            destination_end: 8,
+        })
+        .is_empty());
+
+        let nested = [
+            FunctionEntryEvidence::DirectJal {
+                call_site: a.clone(),
+            },
+            FunctionEntryEvidence::ResolvedJalr {
+                call_site: a.clone(),
+                construction_start: c.clone(),
+            },
+            FunctionEntryEvidence::ExhaustiveIndirectCall {
+                call_site: a.clone(),
+                kind: IndirectCallEvidenceKind::MemoryValueSet,
+                memory_sources: vec![c.clone()],
+            },
+            FunctionEntryEvidence::SemanticCallableArgument {
+                call_site: a.clone(),
+                callee: c.clone(),
+                pointer_register: 5,
+                contract: SemanticCallableContract::CallbackRegistry {
+                    dispatcher: c.clone(),
+                    callback_store_site: a.clone(),
+                    list_insert_site: c.clone(),
+                    jalr_site: c.clone(),
+                },
+            },
+            FunctionEntryEvidence::Prologue {
+                stack_adjust: a.clone(),
+                frame_size: 16,
+                pattern: ProloguePattern::SavesReturnAddress,
+                corroborating_site: c.clone(),
+            },
+            FunctionEntryEvidence::ArgumentHomeSpillLeaf {
+                predecessor_return: a.clone(),
+                spill_site: b.clone(),
+                argument_index: 0,
+                return_site: c.clone(),
+            },
+            FunctionEntryEvidence::TableEntry {
+                table: c.clone(),
+                index: 1,
+            },
+        ];
+        for evidence in nested {
+            let referenced = banks(&Fact::FunctionEntryClaim {
+                target: b.clone(),
+                detector: CandidateDetector::TableDerived,
+                evidence,
+                proposed_state: ProofState::Supported,
+            });
+            assert!(referenced.iter().any(|bank| bank == "b"));
+            assert!(referenced.len() >= 2);
+        }
+
+        // Single-bank variants exercise every remaining top-level arm.
+        let single_bank = [
+            Fact::BlockStart {
+                bank: "a".into(),
+                pc: a.pc,
+            },
+            Fact::LoadsFrom {
+                site: a.clone(),
+                address: 0,
+            },
+            Fact::ObservedExecutedCode {
+                site: a.clone(),
+                trace: "t".into(),
+                sequence: 0,
+            },
+            Fact::IndirectTransferAnalysis {
+                site: a.clone(),
+                via_call: false,
+                state: IndirectTransferState::Open,
+                kind: None,
+                targets: vec![],
+                memory_sources: vec![],
+            },
+            Fact::RomMapping {
+                bank: "a".into(),
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0,
+                rom_end: 4,
+                va_start: a.pc,
+                va_end: a.pc + 4,
+            },
+            Fact::ExecutableRange {
+                bank: "a".into(),
+                va_start: a.pc,
+                va_end: a.pc + 4,
+            },
+            Fact::Evidence {
+                subject: a.clone(),
+                note: "e".into(),
+            },
+        ];
+        for fact in &single_bank {
+            assert_eq!(banks(fact), vec!["a"]);
+        }
+        assert_eq!(
+            banks(&Fact::LoadImageTableRecord {
+                table: "dma".into(),
+                bank: Some("a".into()),
+                table_space: RomAddressSpace::Physical,
+                table_offset: 0,
+                index: 0,
+                source_space: MappingAddressSpace::PhysicalRom,
+                source_start: 0,
+                source_end: 4,
+                destination_space: MappingAddressSpace::Vram,
+                destination_start: a.pc,
+                destination_end: a.pc + 4,
+            }),
+            vec!["a"]
+        );
+        assert_eq!(
+            banks(&Fact::FunctionEntryClaim {
+                target: b,
+                detector: CandidateDetector::HardwareEntrypoint,
+                evidence: FunctionEntryEvidence::RomHeaderEntrypoint,
+                proposed_state: ProofState::Proven,
+            }),
+            vec!["b"]
+        );
+    }
+
+    #[test]
+    fn projection_preserves_cross_bank_edges_globals_and_conclusion_indices() {
+        let mut db = FactDb::new();
+        let edge = db.insert(Fact::DirectCall {
+            source: BankAddr::new("source", 0x8000_0000),
+            target: BankAddr::new("target", 0x8010_0000),
+        });
+        let target_detail = db.insert(Fact::BlockStart {
+            bank: "target".into(),
+            pc: 0x8010_0000,
+        });
+        db.insert(Fact::BlockStart {
+            bank: "irrelevant".into(),
+            pc: 0x8020_0000,
+        });
+        let global = db.insert(Fact::LoadImageTableRecord {
+            table: "dma".into(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0,
+            index: 0,
+            source_space: MappingAddressSpace::PhysicalRom,
+            source_start: 0,
+            source_end: 4,
+            destination_space: MappingAddressSpace::PhysicalRom,
+            destination_start: 4,
+            destination_end: 8,
+        });
+        let _ = (edge, target_detail);
+        db.conclude("global", ProofState::Open, vec![], "unscoped")
+            .unwrap();
+        db.conclude(
+            load_image_table_record_subject("dma", 0),
+            ProofState::Proven,
+            vec![global, global],
+            "dma",
+        )
+        .unwrap();
+
+        let index = FactProjectionIndex::new(&db).unwrap();
+        for bank in ["source", "target"] {
+            let projected = index.project(bank);
+            assert!(projected
+                .facts()
+                .iter()
+                .any(|fact| matches!(fact, Fact::DirectCall { .. })));
+            assert!(projected
+                .facts()
+                .iter()
+                .any(|fact| matches!(fact, Fact::LoadImageTableRecord { bank: None, .. })));
+            assert!(!projected
+                .facts()
+                .iter()
+                .any(|fact| matches!(fact, Fact::BlockStart { bank, .. } if bank == "irrelevant")));
+            for conclusion in projected.conclusions() {
+                assert!(conclusion
+                    .justified_by
+                    .iter()
+                    .all(|fact| *fact < projected.facts().len()));
+            }
+            assert!(projected.conclusion("global").is_some());
+            let duplicate = &projected
+                .conclusion(&load_image_table_record_subject("dma", 0))
+                .unwrap()
+                .justified_by;
+            assert_eq!(duplicate.len(), 2);
+            assert_eq!(duplicate[0], duplicate[1]);
+        }
+    }
+
+    #[test]
+    fn projection_keeps_foreign_claim_but_scopes_merged_conclusion_to_target() {
+        let source = BankAddr::new("source", 0x8000_0000);
+        let target = BankAddr::new("target", 0x8010_0000);
+        let mut db = FactDb::new();
+        let claim = db.insert(Fact::FunctionEntryClaim {
+            target: target.clone(),
+            detector: CandidateDetector::JalTarget,
+            evidence: FunctionEntryEvidence::DirectJal { call_site: source },
+            proposed_state: ProofState::Proven,
+        });
+        let subject = function_entry_subject(&target);
+        db.conclude(&subject, ProofState::Proven, vec![claim], "direct_jal")
+            .unwrap();
+
+        let index = FactProjectionIndex::new(&db).unwrap();
+        let source_projection = index.project("source");
+        assert_eq!(source_projection.facts().len(), 1);
+        assert!(source_projection.conclusion(&subject).is_none());
+
+        let target_projection = index.project("target");
+        assert_eq!(target_projection.facts().len(), 1);
+        assert_eq!(
+            target_projection.conclusion(&subject).unwrap().justified_by,
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn projection_assigns_bankless_file_records_only_to_backed_vrom_banks() {
+        let mut db = FactDb::new();
+        let mapping = db.insert(Fact::RomMapping {
+            bank: "overlay".into(),
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x1100,
+            rom_end: 0x1200,
+            va_start: 0x8010_0000,
+            va_end: 0x8010_0100,
+        });
+        db.conclude("bank:overlay", ProofState::Proven, vec![mapping], "mapping")
+            .unwrap();
+        let shared_mapping = db.insert(Fact::RomMapping {
+            bank: "shared_overlay".into(),
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x1180,
+            rom_end: 0x11c0,
+            va_start: 0x8020_0000,
+            va_end: 0x8020_0040,
+        });
+        db.conclude(
+            "bank:shared_overlay",
+            ProofState::Proven,
+            vec![shared_mapping],
+            "mapping",
+        )
+        .unwrap();
+        let candidate_mapping = db.insert(Fact::RomMapping {
+            bank: "candidate_overlay".into(),
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x1100,
+            rom_end: 0x1200,
+            va_start: 0x8030_0000,
+            va_end: 0x8030_0100,
+        });
+        db.conclude(
+            "bank:candidate_overlay",
+            ProofState::Candidate,
+            vec![candidate_mapping],
+            "candidate",
+        )
+        .unwrap();
+        let covering = db.insert(Fact::LoadImageTableRecord {
+            table: "files".into(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0x100,
+            index: 0,
+            source_space: MappingAddressSpace::VirtualRom,
+            source_start: 0x1000,
+            source_end: 0x1300,
+            destination_space: MappingAddressSpace::PhysicalRom,
+            destination_start: 0x2000,
+            destination_end: 0x2300,
+        });
+        let covering_subject = load_image_table_record_subject("files", 0);
+        db.conclude(
+            &covering_subject,
+            ProofState::Proven,
+            vec![covering],
+            "file",
+        )
+        .unwrap();
+        let unrelated = db.insert(Fact::LoadImageTableRecord {
+            table: "files".into(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0x100,
+            index: 1,
+            source_space: MappingAddressSpace::VirtualRom,
+            source_start: 0x3000,
+            source_end: 0x3100,
+            destination_space: MappingAddressSpace::PhysicalRom,
+            destination_start: 0x4000,
+            destination_end: 0x4100,
+        });
+        let unrelated_subject = load_image_table_record_subject("files", 1);
+        db.conclude(
+            &unrelated_subject,
+            ProofState::Proven,
+            vec![unrelated],
+            "file",
+        )
+        .unwrap();
+        let truly_global = db.insert(Fact::LoadImageTableRecord {
+            table: "global".into(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0x200,
+            index: 0,
+            source_space: MappingAddressSpace::PhysicalRom,
+            source_start: 0x5000,
+            source_end: 0x5100,
+            destination_space: MappingAddressSpace::PhysicalRom,
+            destination_start: 0x6000,
+            destination_end: 0x6100,
+        });
+        let global_subject = load_image_table_record_subject("global", 0);
+        db.conclude(
+            &global_subject,
+            ProofState::Open,
+            vec![truly_global],
+            "global",
+        )
+        .unwrap();
+
+        let index = FactProjectionIndex::new(&db).unwrap();
+        let overlay = index.project("overlay");
+        assert!(overlay.conclusion(&covering_subject).is_some());
+        assert!(overlay.conclusion(&unrelated_subject).is_none());
+        assert!(overlay.conclusion(&global_subject).is_some());
+        assert!(overlay.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::LoadImageTableRecord { table, index: 0, .. } if table == "files"
+        )));
+        assert!(!overlay.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::LoadImageTableRecord { table, index: 1, .. } if table == "files"
+        )));
+
+        let physical = index.project("physical");
+        assert!(physical.conclusion(&covering_subject).is_none());
+        assert!(physical.conclusion(&unrelated_subject).is_none());
+        assert!(physical.conclusion(&global_subject).is_some());
+        assert!(index
+            .project("shared_overlay")
+            .conclusion(&covering_subject)
+            .is_some());
+        assert!(index
+            .project("candidate_overlay")
+            .conclusion(&covering_subject)
+            .is_none());
+    }
+
+    #[test]
+    fn projection_rejects_mismatched_and_unknown_owned_conclusions() {
+        let target = BankAddr::new("actual", 0x8010_0000);
+        let mut mismatched = FactDb::new();
+        let claim = mismatched.insert(Fact::FunctionEntryClaim {
+            target,
+            detector: CandidateDetector::JalTarget,
+            evidence: FunctionEntryEvidence::DirectJal {
+                call_site: BankAddr::new("source", 0x8000_0000),
+            },
+            proposed_state: ProofState::Proven,
+        });
+        mismatched
+            .conclude(
+                function_entry_subject(&BankAddr::new("claimed", 0x8010_0000)),
+                ProofState::Proven,
+                vec![claim],
+                "corrupt",
+            )
+            .unwrap();
+        assert!(matches!(
+            FactProjectionIndex::new(&mismatched),
+            Err(FactProjectionError::ConclusionOwnerMismatch { .. })
+        ));
+
+        let mut wrong_address = FactDb::new();
+        let target = BankAddr::new("bank", 0x8010_0000);
+        let claim = wrong_address.insert(Fact::FunctionEntryClaim {
+            target: target.clone(),
+            detector: CandidateDetector::JalTarget,
+            evidence: FunctionEntryEvidence::DirectJal {
+                call_site: BankAddr::new("source", 0x8000_0000),
+            },
+            proposed_state: ProofState::Proven,
+        });
+        wrong_address
+            .conclude(
+                function_entry_subject(&BankAddr::new("bank", target.pc + 4)),
+                ProofState::Proven,
+                vec![claim],
+                "wrong address",
+            )
+            .unwrap();
+        assert!(matches!(
+            FactProjectionIndex::new(&wrong_address),
+            Err(FactProjectionError::CanonicalConclusionMismatch { .. })
+        ));
+
+        let mut malformed = FactDb::new();
+        let claim = malformed.insert(Fact::FunctionEntryClaim {
+            target,
+            detector: CandidateDetector::JalTarget,
+            evidence: FunctionEntryEvidence::DirectJal {
+                call_site: BankAddr::new("source", 0x8000_0000),
+            },
+            proposed_state: ProofState::Proven,
+        });
+        malformed
+            .conclude(
+                "fn:bank:0xnot-an-address",
+                ProofState::Proven,
+                vec![claim],
+                "malformed",
+            )
+            .unwrap();
+        assert!(matches!(
+            FactProjectionIndex::new(&malformed),
+            Err(FactProjectionError::CanonicalConclusionMismatch { .. })
+        ));
+
+        let mut unrelated_only = FactDb::new();
+        let unrelated = unrelated_only.insert(Fact::BlockStart {
+            bank: "bank".into(),
+            pc: 0x8010_0000,
+        });
+        unrelated_only
+            .conclude(
+                "fn:bank:0x80100000",
+                ProofState::Proven,
+                vec![unrelated],
+                "unrelated",
+            )
+            .unwrap();
+        assert!(matches!(
+            FactProjectionIndex::new(&unrelated_only),
+            Err(FactProjectionError::MissingCanonicalConclusionClaim { .. })
+        ));
+
+        let mut unknown = FactDb::new();
+        let fact = unknown.insert(Fact::BlockStart {
+            bank: "bank".into(),
+            pc: 0x8000_0000,
+        });
+        unknown
+            .conclude("caller-authored", ProofState::Proven, vec![fact], "unknown")
+            .unwrap();
+        assert!(matches!(
+            FactProjectionIndex::new(&unknown),
+            Err(FactProjectionError::UnknownConclusionOwner { .. })
+        ));
+    }
+
+    #[test]
+    fn projection_rejects_proven_owned_empty_and_scopes_open_diagnostics() {
+        let mut owned = FactDb::new();
+        owned
+            .conclude(
+                "fn:bank:0x80100000",
+                ProofState::Proven,
+                vec![],
+                "missing claim",
+            )
+            .unwrap();
+        assert!(matches!(
+            FactProjectionIndex::new(&owned),
+            Err(FactProjectionError::MissingCanonicalConclusionClaim { .. })
+        ));
+
+        let mut open_owned = FactDb::new();
+        open_owned
+            .conclude("bank:a", ProofState::Open, vec![], "no record")
+            .unwrap();
+        let index = FactProjectionIndex::new(&open_owned).unwrap();
+        assert!(index.project("a").conclusion("bank:a").is_some());
+        assert!(index.project("b").conclusion("bank:a").is_none());
+
+        let mut unscoped = FactDb::new();
+        unscoped
+            .conclude("analysis-frontier", ProofState::Open, vec![], "open")
+            .unwrap();
+        let index = FactProjectionIndex::new(&unscoped).unwrap();
+        for bank in ["a", "b"] {
+            assert!(index
+                .project(bank)
+                .conclusion("analysis-frontier")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn projection_semantics_match_unprojected_bank_without_aggregate_siblings() {
+        let mut db = FactDb::new();
+        let mapping_a = db.insert(Fact::RomMapping {
+            bank: "a".into(),
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x1000,
+            rom_end: 0x1100,
+            va_start: 0x8010_0000,
+            va_end: 0x8010_0100,
+        });
+        db.conclude("bank:a", ProofState::Proven, vec![mapping_a], "mapping")
+            .unwrap();
+        let mapping_b = db.insert(Fact::RomMapping {
+            bank: "b".into(),
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x1080,
+            rom_end: 0x1100,
+            va_start: 0x8020_0000,
+            va_end: 0x8020_0080,
+        });
+        db.conclude("bank:b", ProofState::Proven, vec![mapping_b], "mapping")
+            .unwrap();
+        let executable = db.insert(Fact::ExecutableRange {
+            bank: "a".into(),
+            va_start: 0x8010_0000,
+            va_end: 0x8010_0100,
+        });
+        db.conclude(
+            executable_range_subject("a", 0x8010_0000, 0x8010_0100),
+            ProofState::Proven,
+            vec![executable],
+            "executable",
+        )
+        .unwrap();
+        let entry = BankAddr::new("a", 0x8010_0000);
+        let claim = db.insert(Fact::FunctionEntryClaim {
+            target: entry.clone(),
+            detector: CandidateDetector::HardwareEntrypoint,
+            evidence: FunctionEntryEvidence::RomHeaderEntrypoint,
+            proposed_state: ProofState::Proven,
+        });
+        db.conclude(
+            function_entry_subject(&entry),
+            ProofState::Proven,
+            vec![claim, claim],
+            "entry",
+        )
+        .unwrap();
+        let shared_file = db.insert(Fact::LoadImageTableRecord {
+            table: "files".into(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0,
+            index: 0,
+            source_space: MappingAddressSpace::VirtualRom,
+            source_start: 0x1000,
+            source_end: 0x1100,
+            destination_space: MappingAddressSpace::PhysicalRom,
+            destination_start: 0x2000,
+            destination_end: 0x2100,
+        });
+        let shared_subject = load_image_table_record_subject("files", 0);
+        db.conclude(
+            &shared_subject,
+            ProofState::Proven,
+            vec![shared_file],
+            "file",
+        )
+        .unwrap();
+        db.conclude(
+            "load-image-table:files",
+            ProofState::Proven,
+            vec![mapping_a, mapping_b, shared_file],
+            "aggregate",
+        )
+        .unwrap();
+        db.conclude("zero", ProofState::Open, vec![], "unscoped")
+            .unwrap();
+
+        let projected = FactProjectionIndex::new(&db).unwrap().project("a");
+        let unprojected_mappings = db
+            .proven_rom_mappings()
+            .into_iter()
+            .filter_map(|fact| match fact {
+                Fact::RomMapping { bank, .. } if bank == "a" => Some(bank.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let projected_mappings = projected
+            .proven_rom_mappings()
+            .into_iter()
+            .filter_map(|fact| match fact {
+                Fact::RomMapping { bank, .. } => Some(bank.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected_mappings, unprojected_mappings);
+        assert_eq!(
+            projected.proven_executable_ranges("a"),
+            db.proven_executable_ranges("a")
+        );
+        assert_eq!(
+            projected.proven_function_entries("a"),
+            db.proven_function_entries("a")
+        );
+        assert_eq!(
+            projected.proven_hardware_function_entries("a"),
+            db.proven_hardware_function_entries("a")
+        );
+        assert!(projected.conclusion(&shared_subject).is_some());
+        assert!(projected.conclusion("load-image-table:files").is_none());
+        assert!(projected.conclusion("zero").is_some());
+        assert_eq!(
+            projected
+                .conclusion(&function_entry_subject(&entry))
+                .unwrap()
+                .justified_by,
+            vec![2, 2]
+        );
+        assert!(!projected
+            .facts()
+            .iter()
+            .any(|fact| matches!(fact, Fact::RomMapping { bank, .. } if bank == "b")));
+    }
+
+    #[test]
+    fn projection_rejects_dangling_justification() {
+        let mut db = FactDb::new();
+        db.conclude("bad", ProofState::Open, vec![9], "bad")
+            .unwrap();
+        assert_eq!(
+            FactProjectionIndex::new(&db).unwrap_err(),
+            FactProjectionError::DanglingJustification {
+                subject: "bad".into(),
+                fact_index: 9,
+                fact_count: 0,
+            }
+        );
+    }
 
     #[test]
     fn insert_is_append_only_and_indices_are_stable() {
@@ -699,6 +2035,53 @@ mod tests {
         .unwrap();
         assert_eq!(db.proven_function_entries("overlay"), vec![0x8010_0040]);
         assert!(db.proven_function_entries("boot").is_empty());
+    }
+
+    #[test]
+    fn inductive_authority_roots_include_only_proven_hardware_claims() {
+        let mut db = FactDb::new();
+        let hardware = BankAddr::new("boot", 0x8000_0400);
+        let hardware_claim = db.insert(Fact::FunctionEntryClaim {
+            target: hardware.clone(),
+            detector: CandidateDetector::HardwareEntrypoint,
+            evidence: FunctionEntryEvidence::RomHeaderEntrypoint,
+            proposed_state: ProofState::Proven,
+        });
+        db.conclude(
+            function_entry_subject(&hardware),
+            ProofState::Proven,
+            vec![hardware_claim],
+            "hardware entry",
+        )
+        .unwrap();
+
+        let table_target = BankAddr::new("boot", 0x8000_0800);
+        let table_claim = db.insert(Fact::FunctionEntryClaim {
+            target: table_target.clone(),
+            detector: CandidateDetector::TableDerived,
+            evidence: FunctionEntryEvidence::TableEntry {
+                table: BankAddr::new("boot", 0x8000_1000),
+                index: 0,
+            },
+            proposed_state: ProofState::Proven,
+        });
+        db.conclude(
+            function_entry_subject(&table_target),
+            ProofState::Proven,
+            vec![table_claim],
+            "table entry",
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.proven_function_entries("boot"),
+            vec![0x8000_0400, 0x8000_0800]
+        );
+        assert_eq!(
+            db.proven_hardware_function_entries("boot"),
+            vec![0x8000_0400]
+        );
+        assert!(db.proven_hardware_function_entries("overlay").is_empty());
     }
 
     #[test]

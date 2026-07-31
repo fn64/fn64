@@ -228,7 +228,10 @@ fn run() -> Result<(), String> {
     let graded_flags: Vec<bool> = loaded.iter().map(|r| r.graded).collect();
     let aliases = load_name_aliases()?;
     if !aliases.is_empty() {
-        println!("  name_aliases loaded={} (oracle canonicalization only)", aliases.len());
+        println!(
+            "  name_aliases loaded={} (oracle canonicalization only)",
+            aliases.len()
+        );
     }
 
     let mut graded_identities = 0usize;
@@ -355,7 +358,10 @@ fn grade_identity(
         return IdentityGrade::Ungraded;
     }
     let canonical = |name: &str| -> String {
-        aliases.get(name).cloned().unwrap_or_else(|| name.to_string())
+        aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     };
     let first = canonical(names[0].1);
     if names.iter().all(|(_, name)| canonical(name) == first) {
@@ -403,8 +409,10 @@ fn load_name_aliases() -> Result<BTreeMap<String, String>, String> {
     let Ok(path) = std::env::var("FN64_DISCOVER_NAME_ALIASES") else {
         return Ok(BTreeMap::new());
     };
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("reading {path}: {error}"))?;
-    let doc: AliasDoc = toml::from_str(&text).map_err(|error| format!("parsing {path}: {error}"))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("reading {path}: {error}"))?;
+    let doc: AliasDoc =
+        toml::from_str(&text).map_err(|error| format!("parsing {path}: {error}"))?;
     let mut map = BTreeMap::new();
     for group in &doc.alias {
         let [canonical, rest @ ..] = group.names.as_slice() else {

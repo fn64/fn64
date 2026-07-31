@@ -27,8 +27,7 @@ impl Gamepads {
     pub fn new() -> Self {
         let gilrs = match Gilrs::new() {
             Ok(g) => {
-                let names: Vec<String> =
-                    g.gamepads().map(|(_, p)| p.name().to_string()).collect();
+                let names: Vec<String> = g.gamepads().map(|(_, p)| p.name().to_string()).collect();
                 if names.is_empty() {
                     println!("[fn64-shell] gamepads: none connected (hotplug supported)");
                 } else {
@@ -88,10 +87,7 @@ impl Gamepads {
         let Some(pad) = self.active_pad() else {
             return (0.0, 0.0);
         };
-        (
-            pad.value(Axis::LeftStickX),
-            pad.value(Axis::LeftStickY),
-        )
+        (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY))
     }
 
     /// Resolve the active gamepad against `config`:

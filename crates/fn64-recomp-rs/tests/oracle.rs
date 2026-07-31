@@ -25,7 +25,8 @@
 //! spanning the sign boundary and the `< 0x32` threshold. Divergence fails the
 //! test — this is the strong check, not a bbox/fuzzy one.
 
-use fn64_recomp_rs::{decode, emit_function, FuncInput, Instruction, Rdram, RecompContext};
+use fn64_recomp_rs::{decode, Instruction, Rdram, RecompContext};
+use fn64_recomp_rs_codegen::{emit_function, FuncInput};
 
 /// Real ROM bytes of `DynaPoly_IsBgIdBgActor` (big-endian words).
 const DYNAPOLY_WORDS: [u32; 8] = [
