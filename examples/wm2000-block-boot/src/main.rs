@@ -2754,7 +2754,15 @@ fn main() {
             fn64_boot_harness::TvType::Ntsc,
         )
         .unwrap_or_else(|error| panic!("loading NWXE BootContext: {error}"));
-        FIRST_ENTRY_BOOT_CONTEXT.with(|slot| *slot.borrow_mut() = Some(boot_context.clone()));
+        // The catalog boot seam validates the exact entry and restored CPU
+        // state immediately before unified dispatch. Ordinary AOT repeats that
+        // check at its first generated-bank call. Withholding executes that
+        // entry dynamically, so its first static call is a post-instruction
+        // resume; the bounded telemetry gate separately requires supported,
+        // positive work at the exact withheld key.
+        FIRST_ENTRY_BOOT_CONTEXT.with(|slot| {
+            *slot.borrow_mut() = (!dynamic_exact_entry_withheld).then(|| boot_context.clone())
+        });
 
         fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
         fn64_abi::load_rom(rom.clone());
