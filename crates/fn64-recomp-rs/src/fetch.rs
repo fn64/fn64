@@ -23,10 +23,12 @@ use crate::execution::{
     ProgramArtifactIdentity,
 };
 #[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
-use crate::interp::run_instruction_unit;
+use crate::interp::run_instruction_unit_with_memory_port;
 #[cfg(feature = "dev-interpreter")]
 use crate::interp::UnsupportedOp;
 use crate::runtime::{DataAccessError, Rdram, RecompContext, TlbFaultKind};
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+use crate::semantic::{MemoryPort, NoMmio};
 
 /// One immutable contiguous physical code span.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,6 +468,29 @@ impl DynamicMappedUnitCatalogV1 {
         budget: InstructionBudget,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
+        reserved_by_static_program: impl FnMut(BankId) -> bool,
+    ) -> Result<DynamicMappedRunV1, DynamicMappedErrorV1> {
+        let mut no_mmio = NoMmio;
+        let mut port = MemoryPort::mmio_only(&mut no_mmio);
+        self.activate_and_run_with_memory_port(
+            attempted_entry,
+            budget,
+            ctx,
+            mem,
+            &mut port,
+            reserved_by_static_program,
+        )
+    }
+
+    /// [`Self::activate_and_run`] with distinct MMIO and cartridge-memory
+    /// authorities installed for the exact interpreted instruction unit.
+    pub fn activate_and_run_with_memory_port(
+        &mut self,
+        attempted_entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        port: &mut MemoryPort<'_>,
         mut reserved_by_static_program: impl FnMut(BankId) -> bool,
     ) -> Result<DynamicMappedRunV1, DynamicMappedErrorV1> {
         let primary = snapshot_live_instruction(
@@ -498,10 +523,18 @@ impl DynamicMappedUnitCatalogV1 {
             .map(|instruction| InstructionWordIdentity::new(bank, instruction.physical_address))
             .collect();
         let entry = ExecutionKey::new(bank, attempted_entry.pc);
-        let run = run_instruction_unit(bank, attempted_entry.pc, &words, budget, ctx, mem)
-            .unwrap_or_else(|unsupported| {
-                BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0)
-            });
+        let run = run_instruction_unit_with_memory_port(
+            bank,
+            attempted_entry.pc,
+            &words,
+            budget,
+            ctx,
+            mem,
+            port,
+        )
+        .unwrap_or_else(|unsupported| {
+            BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0)
+        });
         Ok(DynamicMappedRunV1 {
             entry,
             identity,
@@ -741,7 +774,33 @@ pub(crate) fn run_admitted_mapped_unit(
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
 ) -> Result<BlockRun, UnsupportedOp> {
-    run_instruction_unit(unit.bank, unit.entry, &unit.words, budget, ctx, mem)
+    let mut no_mmio = NoMmio;
+    run_admitted_mapped_unit_with_memory_port(
+        unit,
+        budget,
+        ctx,
+        mem,
+        &mut MemoryPort::mmio_only(&mut no_mmio),
+    )
+}
+
+#[cfg(feature = "dev-interpreter")]
+pub(crate) fn run_admitted_mapped_unit_with_memory_port(
+    unit: AdmittedMappedUnit,
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+    port: &mut MemoryPort<'_>,
+) -> Result<BlockRun, UnsupportedOp> {
+    run_instruction_unit_with_memory_port(
+        unit.bank,
+        unit.entry,
+        &unit.words,
+        budget,
+        ctx,
+        mem,
+        port,
+    )
 }
 
 /// Execute one dynamically fetched unit in the interpreter lane.
@@ -759,11 +818,34 @@ pub fn run_mapped_bank(
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
 ) -> Result<BlockRun, UnsupportedOp> {
+    let mut no_mmio = NoMmio;
+    run_mapped_bank_with_memory_port(
+        catalog,
+        bank,
+        entry,
+        budget,
+        ctx,
+        mem,
+        &mut MemoryPort::mmio_only(&mut no_mmio),
+    )
+}
+
+/// [`run_mapped_bank`] with distinct MMIO and cartridge-memory authorities.
+#[cfg(feature = "dev-interpreter")]
+pub fn run_mapped_bank_with_memory_port(
+    catalog: &PhysicalCodeCatalog,
+    bank: BankId,
+    entry: GuestPc,
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+    port: &mut MemoryPort<'_>,
+) -> Result<BlockRun, UnsupportedOp> {
     let unit = match admit_mapped_unit(catalog, bank, entry, ctx) {
         Ok(unit) => unit,
         Err(run) => return Ok(run),
     };
-    run_admitted_mapped_unit(unit, budget, ctx, mem)
+    run_admitted_mapped_unit_with_memory_port(unit, budget, ctx, mem, port)
 }
 
 /// One AOT unit bound to exact VA-to-physical identities at translation time.
@@ -929,7 +1011,10 @@ impl MappedAotBlock {
 ))]
 mod dynamic_mapped_tests {
     use super::*;
-    use crate::TlbEntryRaw;
+    use crate::{
+        AlignedDirectWordAddress, CartridgeReadOutcome, CartridgeStoreOutcome, CartridgeWordPort,
+        MemoryPort, NoMmio, TlbEntryRaw,
+    };
 
     const ATTEMPT_BANK: BankId = BankId::new(0x1234);
     const SEMANTICS: [u8; 32] = [0x5a; 32];
@@ -1540,5 +1625,110 @@ mod dynamic_mapped_tests {
         crate::runtime::set_mmio_hooks(previous.0, previous.1);
         assert_eq!(run.run.instructions, 1);
         assert_eq!(ctx.r_u32(2), 0x1122_3344);
+    }
+
+    struct DynamicCartridgePort {
+        reads: u32,
+    }
+
+    impl CartridgeWordPort for DynamicCartridgePort {
+        fn read_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeReadOutcome {
+            if address.get() != 0xffff_ffff_b000_0000 {
+                return CartridgeReadOutcome::NotCartridge;
+            }
+            self.reads += 1;
+            CartridgeReadOutcome::Handled(0x89ab_cdef)
+        }
+
+        fn classify_store_w(
+            &mut self,
+            _address: AlignedDirectWordAddress,
+        ) -> CartridgeStoreOutcome {
+            CartridgeStoreOutcome::NotCartridge
+        }
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    fn physical_lw_catalog() -> PhysicalCodeCatalog {
+        let mut catalog = PhysicalCodeCatalog::new();
+        catalog
+            .register(PhysicalCodeBank::new(ATTEMPT_BANK, 0x40, vec![0x8c82_0000]).unwrap())
+            .unwrap();
+        catalog
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    #[test]
+    fn admitted_mapped_unit_uses_injected_cartridge_memory_port() {
+        let catalog = physical_lw_catalog();
+        let mut bytes = vec![0; 0x100];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        let unit =
+            admit_mapped_unit(&catalog, ATTEMPT_BANK, GuestPc::new(0x8000_0040), &ctx).unwrap();
+        let mut cartridge = DynamicCartridgePort { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let run = run_admitted_mapped_unit_with_memory_port(
+            unit,
+            InstructionBudget::new(1).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert_eq!(run.instructions, 1);
+        assert_eq!(ctx.r(2), 0xffff_ffff_89ab_cdef);
+        assert_eq!(cartridge.reads, 1);
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    #[test]
+    fn public_mapped_bank_uses_injected_cartridge_memory_port() {
+        let catalog = physical_lw_catalog();
+        let mut bytes = vec![0; 0x100];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        let mut cartridge = DynamicCartridgePort { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let run = run_mapped_bank_with_memory_port(
+            &catalog,
+            ATTEMPT_BANK,
+            GuestPc::new(0x8000_0040),
+            InstructionBudget::new(1).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert_eq!(run.instructions, 1);
+        assert_eq!(ctx.r(2), 0xffff_ffff_89ab_cdef);
+        assert_eq!(cartridge.reads, 1);
+    }
+
+    #[test]
+    fn exact_dynamic_unit_uses_injected_cartridge_memory_port() {
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x8c82_0000); // lw v0,0(a0)
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let mut cartridge = DynamicCartridgePort { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let run = catalog
+            .activate_and_run_with_memory_port(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(1).unwrap(),
+                &mut ctx,
+                &mut mem,
+                &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(run.run.instructions, 1);
+        assert_eq!(ctx.r(2), 0xffff_ffff_89ab_cdef);
+        assert_eq!(cartridge.reads, 1);
     }
 }
