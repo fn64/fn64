@@ -281,7 +281,21 @@ digest.
 > table as typed `LoadImageTableRecord` plus proven bank-qualified
 > `RomMapping` facts. A delta vote alone is not sufficient. The proof rule is
 > unique table admission plus exact per-record agreement between the inferred
-> VA and the descriptor destination. `gate_d1_overlays` keeps NWXE's dump
+> VA and the descriptor destination. Physical descriptor-family recovery
+> enumerates the third field as either a destination start or exclusive end,
+> normalizes both to a start, and requires exact delta agreement to select a
+> field interpretation before ordinary fragment admission. The distinction is
+> retained in the candidate table and its evidence; it is not guessed after
+> admission. This recovers the measured
+> exclusive-end families in Ogre Battle 64, Gex 64, and Air Boarder 64 while
+> leaving the unrelated Bottom of the 9th and Batman candidates at one proven
+> boot mapping; their admitted candidate tables still fail per-record
+> destination agreement and grant no load-image authority. On the local corpus
+> images, mapped-bank counts move Ogre Battle 64 `1 -> 15`, Gex 64 `1 -> 8`,
+> and Air Boarder 64 `1 -> 9`: 29 additional proven mappings. Existing controls
+> remain Mega Man 64 28, WWF No Mercy 6, Paper Mario 165, Majora's Mask 604,
+> and Mario Party 94.
+> `gate_d1_overlays` keeps NWXE's dump
 > held out until both discovery runs finish. Boot-only combined precision /
 > recall is 36.396867% / 28.542179%; recovered overlays produce 49.976448% /
 > 86.895987%. The four added mappings raise recalled functions by 1,425 while

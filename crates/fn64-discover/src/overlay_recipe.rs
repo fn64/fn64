@@ -191,6 +191,7 @@ mod tests {
             field_rom_start: 0x18,
             field_rom_end: 0x1c,
             field_vram_dest: 0x20,
+            destination_field: crate::overlay_regions::DestinationFieldSemantics::Start,
             records: vec![CandidateRecord {
                 rom_start: 0x2000,
                 rom_end: 0x2040,
@@ -228,6 +229,7 @@ mod tests {
             field_rom_start: 0,
             field_rom_end: 4,
             field_vram_dest: 8,
+            destination_field: crate::overlay_regions::DestinationFieldSemantics::Start,
             records: vec![CandidateRecord {
                 rom_start: 0x2000,
                 rom_end: 0x2040,

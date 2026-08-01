@@ -18,8 +18,10 @@
 //! record-relative `+0x00` rom_start, `+0x04` rom_end, `+0x08` vram_dest) is a
 //! *shape*, not a location. The family is any `(stride, field_rom_start,
 //! field_rom_end, field_vram_dest)` whose consecutive records carry a
-//! plausible ROM interval and a plausible RDRAM destination VA. This module
-//! enumerates that family across the whole ROM.
+//! plausible ROM interval and a plausible RDRAM destination field. The field
+//! may hold either the destination start or its exclusive end; both typed
+//! interpretations are enumerated and delta agreement admits at most the
+//! matching geometry. This module enumerates that family across the whole ROM.
 //!
 //! # Discipline: ENUMERATE, VALIDATE, ADMIT only on uniqueness
 //!
@@ -156,6 +158,9 @@ impl SearchConfig {
 pub struct CandidateRecord {
     pub rom_start: u32,
     pub rom_end: u32,
+    /// Normalized destination start. [`CandidateTable::destination_field`]
+    /// records whether the source field held this value directly or held the
+    /// corresponding exclusive end.
     pub vram_dest: u32,
 }
 
@@ -167,11 +172,34 @@ impl CandidateRecord {
     }
 }
 
+/// Meaning of the third address field in a physical overlay descriptor.
+///
+/// Both layouts occur in ROMs. Keeping the interpretation on the candidate
+/// table prevents an end address from being silently treated as a start while
+/// downstream records continue to consume one normalized destination start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestinationFieldSemantics {
+    #[default]
+    Start,
+    ExclusiveEnd,
+}
+
+impl DestinationFieldSemantics {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::ExclusiveEnd => "exclusive_end",
+        }
+    }
+}
+
 /// A candidate table: where it sits, its shape, and the records it yields.
-/// Identity for canonicalization is the ordered ROM-interval set, not the
-/// `(offset, field)` phase -- a table read at `+0` with `field_rom_start = 0`
-/// and the same table read one word earlier with `field_rom_start = 4`
-/// describe the identical overlays and must not both count.
+/// Identity for canonicalization is the destination-field semantics plus the
+/// normalized record geometry, not the `(offset, field)` phase -- a table read
+/// at `+0` with `field_rom_start = 0` and the same table read one word earlier
+/// with `field_rom_start = 4` describe the identical overlays and must not both
+/// count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateTable {
     pub table_rom_offset: u32,
@@ -179,6 +207,8 @@ pub struct CandidateTable {
     pub field_rom_start: u32,
     pub field_rom_end: u32,
     pub field_vram_dest: u32,
+    #[serde(default)]
+    pub destination_field: DestinationFieldSemantics,
     pub records: Vec<CandidateRecord>,
 }
 
@@ -210,6 +240,18 @@ fn record_valid(rec: &CandidateRecord, rom_len: u32, config: &SearchConfig) -> b
         && rec.vram_dest >= config.vram_lo
         && rec.vram_dest < config.vram_hi
         && rec.vram_dest.is_multiple_of(4)
+}
+
+fn normalize_record_destination(
+    mut record: CandidateRecord,
+    semantics: DestinationFieldSemantics,
+) -> Option<CandidateRecord> {
+    let byte_len = record.rom_end.checked_sub(record.rom_start)?;
+    record.vram_dest = match semantics {
+        DestinationFieldSemantics::Start => record.vram_dest,
+        DestinationFieldSemantics::ExclusiveEnd => record.vram_dest.checked_sub(byte_len)?,
+    };
+    Some(record)
 }
 
 /// Records are non-overlapping when, sorted by start, no interval reaches into
@@ -247,23 +289,32 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
     let valid_record_offsets = (config.min_rom_offset as usize..=last_record_start)
         .step_by(4)
         .filter_map(|offset| {
-            let record = CandidateRecord {
+            let raw = CandidateRecord {
                 rom_start: read_u32_be(rom_bytes, offset)?,
                 rom_end: read_u32_be(rom_bytes, offset + 4)?,
                 vram_dest: read_u32_be(rom_bytes, offset + 8)?,
             };
-            record_valid(&record, rom_len, config).then_some(offset as u32)
+            [
+                DestinationFieldSemantics::Start,
+                DestinationFieldSemantics::ExclusiveEnd,
+            ]
+            .into_iter()
+            .filter_map(|semantics| normalize_record_destination(raw, semantics))
+            .any(|record| record_valid(&record, rom_len, config))
+            .then_some(offset as u32)
         })
         .collect::<Vec<_>>();
-    let read_valid_record = |offset: u32| -> Option<CandidateRecord> {
-        let offset = offset as usize;
-        let record = CandidateRecord {
-            rom_start: read_u32_be(rom_bytes, offset)?,
-            rom_end: read_u32_be(rom_bytes, offset + 4)?,
-            vram_dest: read_u32_be(rom_bytes, offset + 8)?,
+    let read_valid_record =
+        |offset: u32, semantics: DestinationFieldSemantics| -> Option<CandidateRecord> {
+            let offset = offset as usize;
+            let raw = CandidateRecord {
+                rom_start: read_u32_be(rom_bytes, offset)?,
+                rom_end: read_u32_be(rom_bytes, offset + 4)?,
+                vram_dest: read_u32_be(rom_bytes, offset + 8)?,
+            };
+            let record = normalize_record_destination(raw, semantics)?;
+            record_valid(&record, rom_len, config).then_some(record)
         };
-        record_valid(&record, rom_len, config).then_some(record)
-    };
 
     for &stride in &config.strides {
         if stride < 12 || !stride.is_multiple_of(4) {
@@ -279,44 +330,51 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
             let field_rom_end = field_rom_start + 4;
             let field_vram_dest = field_rom_start + 8;
 
-            let last_table_start =
-                rom_len.saturating_sub(stride.saturating_mul(config.min_records));
-            let mut next_offset = config.min_rom_offset;
-            for &record_offset in &valid_record_offsets {
-                let Some(offset) = record_offset.checked_sub(field_rom_start) else {
-                    continue;
-                };
-                if offset < next_offset || offset > last_table_start {
-                    continue;
-                }
-
-                let mut records = Vec::new();
-                let mut base = offset;
-                while base <= rom_len.saturating_sub(stride) {
-                    match read_valid_record(base + field_rom_start) {
-                        Some(rec) => {
-                            records.push(rec);
-                            base += stride;
-                        }
-                        _ => break,
+            for destination_field in [
+                DestinationFieldSemantics::Start,
+                DestinationFieldSemantics::ExclusiveEnd,
+            ] {
+                let last_table_start =
+                    rom_len.saturating_sub(stride.saturating_mul(config.min_records));
+                let mut next_offset = config.min_rom_offset;
+                for &record_offset in &valid_record_offsets {
+                    let Some(offset) = record_offset.checked_sub(field_rom_start) else {
+                        continue;
+                    };
+                    if offset < next_offset || offset > last_table_start {
+                        continue;
                     }
-                }
 
-                if records.len() as u32 >= config.min_records && intervals_non_overlapping(&records)
-                {
-                    raw.push(CandidateTable {
-                        table_rom_offset: offset,
-                        record_stride: stride,
-                        field_rom_start,
-                        field_rom_end,
-                        field_vram_dest,
-                        records,
-                    });
-                    // Skip past the consumed run: overlapping sub-runs of the
-                    // same table are not independent discoveries.
-                    next_offset = base;
-                } else {
-                    next_offset = offset + 4;
+                    let mut records = Vec::new();
+                    let mut base = offset;
+                    while base <= rom_len.saturating_sub(stride) {
+                        match read_valid_record(base + field_rom_start, destination_field) {
+                            Some(rec) => {
+                                records.push(rec);
+                                base += stride;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    if records.len() as u32 >= config.min_records
+                        && intervals_non_overlapping(&records)
+                    {
+                        raw.push(CandidateTable {
+                            table_rom_offset: offset,
+                            record_stride: stride,
+                            field_rom_start,
+                            field_rom_end,
+                            field_vram_dest,
+                            destination_field,
+                            records,
+                        });
+                        // Skip past the consumed run: overlapping sub-runs of
+                        // the same table are not independent discoveries.
+                        next_offset = base;
+                    } else {
+                        next_offset = offset + 4;
+                    }
                 }
             }
             field_rom_start += 4;
@@ -326,9 +384,9 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
     canonicalize(raw)
 }
 
-/// Collapse phase aliases: keep one table per distinct interval set, choosing
-/// the lowest `table_rom_offset` (then the smallest field layout) as the
-/// canonical representative. Deterministic.
+/// Collapse phase aliases: keep one table per distinct normalized geometry and
+/// destination-field semantics, choosing the lowest `table_rom_offset` (then
+/// the smallest field layout) as the canonical representative. Deterministic.
 fn canonicalize(mut raw: Vec<CandidateTable>) -> Vec<CandidateTable> {
     raw.sort_by(|a, b| {
         a.table_rom_offset
@@ -336,10 +394,15 @@ fn canonicalize(mut raw: Vec<CandidateTable>) -> Vec<CandidateTable> {
             .then(a.record_stride.cmp(&b.record_stride))
             .then(a.field_rom_start.cmp(&b.field_rom_start))
     });
-    let mut seen: BTreeSet<Vec<(u32, u32)>> = BTreeSet::new();
+    let mut seen: BTreeSet<(DestinationFieldSemantics, Vec<(u32, u32, u32)>)> = BTreeSet::new();
     let mut out = Vec::new();
     for table in raw {
-        if seen.insert(table.interval_set()) {
+        let geometry = table
+            .records
+            .iter()
+            .map(|record| (record.rom_start, record.rom_end, record.vram_dest))
+            .collect();
+        if seen.insert((table.destination_field, geometry)) {
             out.push(table);
         }
     }
@@ -360,8 +423,12 @@ pub struct TableAdmission {
     pub region_deltas: Vec<Option<(u32, u32)>>,
     /// Regions mapped by delta_vote or the descriptor-corroborated fallback.
     pub mapped_regions: u32,
-    /// Admitted iff `mapped_regions >= min_mapped_regions` (see
-    /// [`recover_overlay_regions`]).
+    /// Admitted iff `mapped_regions >= min_mapped_regions` under the selected
+    /// destination-field semantics (see [`recover_overlay_regions`]). Exact
+    /// delta agreement selects between competing interpretations; a family
+    /// with no agreement retains the established start-address candidate path,
+    /// which still cannot produce a proven mapping without per-record
+    /// agreement downstream.
     pub admitted: bool,
 }
 
@@ -767,6 +834,37 @@ pub fn admit_overlay_region_tables(
         })
         .collect();
 
+    // Select the raw field interpretation before descriptor-CFG fallback.
+    // Otherwise the start and end hypotheses for the same source interval
+    // overlap by construction and reject each other as non-unique. Exact
+    // delta agreement is independent of the descriptor field and therefore
+    // breaks that ambiguity. A nonzero tie has no unique interpretation and
+    // admits neither. With no delta agreement at all, retain the established
+    // start-address interpretation so descriptor-only corroboration keeps its
+    // prior proof boundary; an end-address layout requires positive evidence.
+    let agreements = |semantics| {
+        admissions
+            .iter()
+            .filter(|admission| admission.table.destination_field == semantics)
+            .flat_map(|admission| admission.table.records.iter().zip(&admission.region_deltas))
+            .filter_map(|(record, outcome)| {
+                outcome
+                    .is_some_and(|(_, va_start)| va_start == record.vram_dest)
+                    .then_some((record.rom_start, record.rom_end, record.vram_dest))
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let start_agreements = agreements(DestinationFieldSemantics::Start);
+    let end_agreements = agreements(DestinationFieldSemantics::ExclusiveEnd);
+    let selected_destination_field = match start_agreements.len().cmp(&end_agreements.len()) {
+        std::cmp::Ordering::Greater => Some(DestinationFieldSemantics::Start),
+        std::cmp::Ordering::Less => Some(DestinationFieldSemantics::ExclusiveEnd),
+        std::cmp::Ordering::Equal if start_agreements.is_empty() => {
+            Some(DestinationFieldSemantics::Start)
+        }
+        std::cmp::Ordering::Equal => None,
+    };
+
     // Descriptor corroboration is offered to EVERY candidate table, not only
     // to tables delta_vote already admitted. Gating it on `admitted` was a
     // deadlock: `admitted` is computed from delta-vote outcomes alone, so a
@@ -781,6 +879,9 @@ pub fn admit_overlay_region_tables(
     let mut raw_mappings = BTreeSet::new();
     let mut fallbacks = Vec::new();
     for (admission_index, admission) in admissions.iter().enumerate() {
+        if Some(admission.table.destination_field) != selected_destination_field {
+            continue;
+        }
         for (record_index, (record, outcome)) in admission
             .table
             .records
@@ -823,10 +924,12 @@ pub fn admit_overlay_region_tables(
     );
 
     // Admission was decided before the fallbacks ran, so re-derive it against
-    // the regions now corroborated. The bar is unchanged; only the evidence
-    // available to meet it has grown.
+    // the regions now corroborated. Fragment and stride aliases can each hold
+    // only a subset of the matching records; preserve the ordinary per-
+    // fragment mapped-region floor within the selected interpretation.
     for admission in &mut admissions {
-        admission.admitted = admission.mapped_regions >= min_mapped_regions;
+        admission.admitted = admission.mapped_regions >= min_mapped_regions
+            && Some(admission.table.destination_field) == selected_destination_field;
     }
 
     OverlayRecovery {
@@ -1412,6 +1515,7 @@ mod tests {
             field_rom_start: 0,
             field_rom_end: 4,
             field_vram_dest: 8,
+            destination_field: DestinationFieldSemantics::Start,
             records,
         };
         let recovery = admit_overlay_region_tables(
@@ -1557,47 +1661,60 @@ mod tests {
             while field_rom_start <= max_field_start {
                 let field_rom_end = field_rom_start + 4;
                 let field_vram_dest = field_rom_start + 8;
-                let mut offset = config.min_rom_offset;
-                let last_table_start =
-                    rom_len.saturating_sub(stride.saturating_mul(config.min_records));
-                while offset <= last_table_start {
-                    let read_rec = |base: u32| -> Option<CandidateRecord> {
-                        Some(CandidateRecord {
-                            rom_start: read_u32_be(rom_bytes, (base + field_rom_start) as usize)?,
-                            rom_end: read_u32_be(rom_bytes, (base + field_rom_end) as usize)?,
-                            vram_dest: read_u32_be(rom_bytes, (base + field_vram_dest) as usize)?,
-                        })
-                    };
-                    let first = read_rec(offset);
-                    if !first.is_some_and(|record| record_valid(&record, rom_len, config)) {
-                        offset += 4;
-                        continue;
-                    }
-                    let mut records = Vec::new();
-                    let mut base = offset;
-                    while base <= rom_len.saturating_sub(stride) {
-                        match read_rec(base) {
-                            Some(record) if record_valid(&record, rom_len, config) => {
-                                records.push(record);
-                                base += stride;
-                            }
-                            _ => break,
+                for destination_field in [
+                    DestinationFieldSemantics::Start,
+                    DestinationFieldSemantics::ExclusiveEnd,
+                ] {
+                    let mut offset = config.min_rom_offset;
+                    let last_table_start =
+                        rom_len.saturating_sub(stride.saturating_mul(config.min_records));
+                    while offset <= last_table_start {
+                        let read_rec = |base: u32| -> Option<CandidateRecord> {
+                            let raw = CandidateRecord {
+                                rom_start: read_u32_be(
+                                    rom_bytes,
+                                    (base + field_rom_start) as usize,
+                                )?,
+                                rom_end: read_u32_be(rom_bytes, (base + field_rom_end) as usize)?,
+                                vram_dest: read_u32_be(
+                                    rom_bytes,
+                                    (base + field_vram_dest) as usize,
+                                )?,
+                            };
+                            normalize_record_destination(raw, destination_field)
+                        };
+                        let first = read_rec(offset);
+                        if !first.is_some_and(|record| record_valid(&record, rom_len, config)) {
+                            offset += 4;
+                            continue;
                         }
-                    }
-                    if records.len() as u32 >= config.min_records
-                        && intervals_non_overlapping(&records)
-                    {
-                        raw.push(CandidateTable {
-                            table_rom_offset: offset,
-                            record_stride: stride,
-                            field_rom_start,
-                            field_rom_end,
-                            field_vram_dest,
-                            records,
-                        });
-                        offset = base;
-                    } else {
-                        offset += 4;
+                        let mut records = Vec::new();
+                        let mut base = offset;
+                        while base <= rom_len.saturating_sub(stride) {
+                            match read_rec(base) {
+                                Some(record) if record_valid(&record, rom_len, config) => {
+                                    records.push(record);
+                                    base += stride;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if records.len() as u32 >= config.min_records
+                            && intervals_non_overlapping(&records)
+                        {
+                            raw.push(CandidateTable {
+                                table_rom_offset: offset,
+                                record_stride: stride,
+                                field_rom_start,
+                                field_rom_end,
+                                field_vram_dest,
+                                destination_field,
+                                records,
+                            });
+                            offset = base;
+                        } else {
+                            offset += 4;
+                        }
                     }
                 }
                 field_rom_start += 4;
@@ -1750,6 +1867,102 @@ mod tests {
             admission.region_deltas[0],
             Some((0x8010_0000u32.wrapping_sub(0x8000), 0x8010_0000))
         );
+    }
+
+    #[test]
+    fn exclusive_end_destination_fields_are_normalized_before_admission() {
+        let mut rom = RomBuilder::new(0x40_000);
+        let table_off = 0x2000u32;
+        let stride = 0x10u32;
+        let regions = [
+            (0x8000u32, 0x8000u32, 0x8010_0000u32),
+            (0x10000, 0x6000, 0x8020_0000),
+            (0x16000, 0x9000, 0x8030_0000),
+        ];
+        for (index, &(rom_start, len, va_start)) in regions.iter().enumerate() {
+            let base = table_off + index as u32 * stride;
+            rom.put_u32(base, rom_start);
+            rom.put_u32(base + 4, rom_start + len);
+            rom.put_u32(base + 8, va_start + len);
+            rom.plant_admissible_region(rom_start, len, va_start);
+        }
+
+        let config = SearchConfig::aki_family();
+        let recovery = recover_overlay_regions(&rom.bytes, &config, &DeltaVoteConfig::default(), 2);
+        let intervals = vec![(0x8000, 0x10000), (0x10000, 0x16000), (0x16000, 0x1f000)];
+        let end = recovery
+            .admissions
+            .iter()
+            .find(|admission| {
+                admission.table.interval_set() == intervals
+                    && admission.table.destination_field == DestinationFieldSemantics::ExclusiveEnd
+            })
+            .expect("exclusive-end table variant recovered");
+
+        assert!(end.admitted);
+        assert_eq!(
+            end.table
+                .records
+                .iter()
+                .map(|record| record.vram_dest)
+                .collect::<Vec<_>>(),
+            vec![0x8010_0000, 0x8020_0000, 0x8030_0000]
+        );
+        let start = recovery
+            .admissions
+            .iter()
+            .find(|admission| {
+                admission.table.interval_set() == intervals
+                    && admission.table.destination_field == DestinationFieldSemantics::Start
+            })
+            .expect("start-address interpretation remains an explicit candidate");
+        assert!(!start.admitted, "delta disagreement cannot admit a layout");
+    }
+
+    #[test]
+    fn equally_supported_destination_field_semantics_admit_neither() {
+        let mut rom = RomBuilder::new(0x30_000);
+        let records = [
+            (DestinationFieldSemantics::Start, 0x8000, 0x8010_0000),
+            (
+                DestinationFieldSemantics::ExclusiveEnd,
+                0x18000,
+                0x8020_0000,
+            ),
+        ];
+        let tables = records
+            .into_iter()
+            .enumerate()
+            .map(|(index, (destination_field, rom_start, va_start))| {
+                rom.plant_admissible_region(rom_start, 0x8000, va_start);
+                CandidateTable {
+                    table_rom_offset: 0x2000 + index as u32 * 0x10,
+                    record_stride: 0x10,
+                    field_rom_start: 0,
+                    field_rom_end: 4,
+                    field_vram_dest: 8,
+                    destination_field,
+                    records: vec![CandidateRecord {
+                        rom_start,
+                        rom_end: rom_start + 0x8000,
+                        vram_dest: va_start,
+                    }],
+                }
+            })
+            .collect();
+
+        let recovery = admit_overlay_region_tables(
+            &rom.bytes,
+            &SearchConfig::aki_family(),
+            &DeltaVoteConfig::default(),
+            1,
+            tables,
+        );
+
+        assert!(recovery
+            .admissions
+            .iter()
+            .all(|admission| !admission.admitted));
     }
 
     /// A table whose last record is out of bounds is not extended into it:

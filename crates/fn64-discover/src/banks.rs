@@ -857,11 +857,12 @@ pub fn scan_recovered_overlay_regions(
         let provenance = db.insert(Fact::Evidence {
             subject: BankAddr::new(&bank, record.vram_dest),
             note: format!(
-                "uniquely admitted ROM-only descriptor table at 0x{:x}, record {index}: ROM [0x{:x},0x{:x}) -> descriptor VA 0x{:08x}; {delta_note}",
+                "uniquely admitted ROM-only descriptor table at 0x{:x}, record {index}: ROM [0x{:x},0x{:x}) -> normalized descriptor VA 0x{:08x} (field={}); {delta_note}",
                 table.table_rom_offset,
                 record.rom_start,
                 record.rom_end,
                 record.vram_dest,
+                table.destination_field.label(),
             ),
         });
         let mut evidence = vec![selection, record_fact, provenance];
@@ -2587,6 +2588,7 @@ mod tests {
             field_rom_start: 0x18,
             field_rom_end: 0x1c,
             field_vram_dest: 0x20,
+            destination_field: crate::overlay_regions::DestinationFieldSemantics::Start,
             records: vec![crate::overlay_regions::CandidateRecord {
                 rom_start,
                 rom_end: rom_start + 0x1000,
