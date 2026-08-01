@@ -56,12 +56,36 @@ pub const BOOT_BANK: &str = "boot";
 /// clusters in Dragorn421/n64checksum (CC0-1.0,
 /// <https://github.com/Dragorn421/n64checksum>). No other digest inherits
 /// their behavior.
+///
+/// The 6106/7106 and 7102 digests were added later from the same permitted
+/// local corpus, which contains five distinct IPL3 blobs rather than three.
+/// Both were identified by re-deriving their IPL3 MD5 *and* CRC32 from local
+/// ROM bytes and matching the published clusters in Dragorn421/n64checksum
+/// (6106/7106 MD5 `6460387749AC0BD925AA5430BC7864FE`, CRC32 `0xACC8580A`;
+/// 7102 MD5 `955894C2E40A698BF98A67B78A4E28FA`, CRC32 `0x009E9EA3`); the same
+/// procedure reproduced all three digests above, confirming the method.
+///
+/// Their deltas are proven two independent ways. Documentary: en64
+/// <https://en64.shoutwiki.com/wiki/ROM> records that 6101/6102/6105 do not
+/// relocate, 6103 subtracts 0x100000, and 6106 subtracts 0x200000, and states
+/// 7102 is the PAL counterpart of the non-relocating 6101 type. Empirical:
+/// counting boot-copy `jal` targets that land inside
+/// `[entry - delta, entry - delta + 0x100000)` selects exactly one delta per
+/// ROM -- 0x200000 for the three permitted 6106 cartridges (68.5%, 76.5%, and
+/// 77.0% of targets in-bank, against ~0% at the other candidates) and 0 for
+/// the permitted 7102 cartridge (88.4%). Running the same procedure on SM64,
+/// whose zero delta is already proven above, returns 0 at 86.8%, so the
+/// method reproduces a known-good answer before being trusted on new data.
 const IPL3_SHA256_CIC_6102_7101: &str =
     "61e88238552c356c23d19409fe5570ee6910419586bc6fc740f638f761adc46e";
 const IPL3_SHA256_CIC_6103_7103: &str =
     "bf3620d30817007091ebe9bddd1b88c23b8a0052170b3309cde5b6b4238e45e7";
 const IPL3_SHA256_CIC_6105_7105: &str =
     "04b7bc6717a9f0eb724cf927e74ad3876c381cbb280d841736fc5e55580b756b";
+const IPL3_SHA256_CIC_6106_7106: &str =
+    "36adc40148af56f0d78cd505eb6a90117d1fd6f11c6309e52ed36bc4c6ba340e";
+const IPL3_SHA256_CIC_7102: &str =
+    "16e062ba8f190c7a712a6bdb34620207299d9be676174cd81d764403df661ad0";
 
 const IPL3_ROM_START: usize = 0x40;
 const IPL3_ROM_END: usize = 0x1000;
@@ -72,13 +96,16 @@ pub enum RecognizedIpl3 {
     Cic6102Or7101,
     Cic6103Or7103,
     Cic6105Or7105,
+    Cic6106Or7106,
+    Cic7102,
 }
 
 impl RecognizedIpl3 {
     fn load_delta(self) -> u32 {
         match self {
-            Self::Cic6102Or7101 | Self::Cic6105Or7105 => 0,
+            Self::Cic6102Or7101 | Self::Cic6105Or7105 | Self::Cic7102 => 0,
             Self::Cic6103Or7103 => 0x10_0000,
+            Self::Cic6106Or7106 => 0x20_0000,
         }
     }
 
@@ -87,6 +114,8 @@ impl RecognizedIpl3 {
             Self::Cic6102Or7101 => "CIC-6102/7101 IPL3 (loads at header entry)",
             Self::Cic6103Or7103 => "CIC-6103/7103 IPL3 (loads at entry - 0x100000)",
             Self::Cic6105Or7105 => "CIC-6105/7105 IPL3 (loads at header entry)",
+            Self::Cic6106Or7106 => "CIC-6106/7106 IPL3 (loads at entry - 0x200000)",
+            Self::Cic7102 => "CIC-7102 IPL3 (loads at header entry)",
         }
     }
 }
@@ -140,6 +169,8 @@ fn classify_ipl3_sha256(digest: &str) -> Option<RecognizedIpl3> {
         IPL3_SHA256_CIC_6102_7101 => Some(RecognizedIpl3::Cic6102Or7101),
         IPL3_SHA256_CIC_6103_7103 => Some(RecognizedIpl3::Cic6103Or7103),
         IPL3_SHA256_CIC_6105_7105 => Some(RecognizedIpl3::Cic6105Or7105),
+        IPL3_SHA256_CIC_6106_7106 => Some(RecognizedIpl3::Cic6106Or7106),
+        IPL3_SHA256_CIC_7102 => Some(RecognizedIpl3::Cic7102),
         _ => None,
     }
 }
@@ -2559,9 +2590,19 @@ mod tests {
             classify_ipl3_sha256(IPL3_SHA256_CIC_6105_7105),
             Some(RecognizedIpl3::Cic6105Or7105)
         );
+        assert_eq!(
+            classify_ipl3_sha256(IPL3_SHA256_CIC_6106_7106),
+            Some(RecognizedIpl3::Cic6106Or7106)
+        );
+        assert_eq!(
+            classify_ipl3_sha256(IPL3_SHA256_CIC_7102),
+            Some(RecognizedIpl3::Cic7102)
+        );
         assert_eq!(RecognizedIpl3::Cic6102Or7101.load_delta(), 0);
         assert_eq!(RecognizedIpl3::Cic6103Or7103.load_delta(), 0x10_0000);
         assert_eq!(RecognizedIpl3::Cic6105Or7105.load_delta(), 0);
+        assert_eq!(RecognizedIpl3::Cic6106Or7106.load_delta(), 0x20_0000);
+        assert_eq!(RecognizedIpl3::Cic7102.load_delta(), 0);
         assert_eq!(classify_ipl3_sha256(&"00".repeat(32)), None);
     }
 

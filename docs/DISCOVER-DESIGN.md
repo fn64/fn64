@@ -142,10 +142,10 @@ Mechanically:
 3. Record SHA-256, SHA-1, and MD5 identities.
 4. Parse the ROM header, entrypoint, and boot region.
 5. Identify the complete IPL3 by exact digest where possible. The current
-   admitted public-standard clusters are CIC-6102/7101, 6103/7103, and
-   6105/7105. An unknown or truncated IPL3 remains an explicit frontier; it
-   never inherits a zero relocation delta. The local-corpus SHA-256 clusters
-   are cross-checked against the public IPL3 MD5 identities in
+   admitted public-standard clusters are CIC-6102/7101, 6103/7103, 6105/7105,
+   6106/7106, and 7102. An unknown or truncated IPL3 remains an explicit
+   frontier; it never inherits a zero relocation delta. The local-corpus
+   SHA-256 clusters are cross-checked against the public IPL3 MD5 identities in
    [Dragorn421/n64checksum](https://github.com/Dragorn421/n64checksum), whose
    CC0-1.0 `LICENSE` was verified for this intake.
 
@@ -155,6 +155,26 @@ Mechanically:
      `bf3620d30817007091ebe9bddd1b88c23b8a0052170b3309cde5b6b4238e45e7`
    - CIC-6105/7105: SHA-256
      `04b7bc6717a9f0eb724cf927e74ad3876c381cbb280d841736fc5e55580b756b`
+   - CIC-6106/7106: SHA-256
+     `36adc40148af56f0d78cd505eb6a90117d1fd6f11c6309e52ed36bc4c6ba340e`
+   - CIC-7102: SHA-256
+     `16e062ba8f190c7a712a6bdb34620207299d9be676174cd81d764403df661ad0`
+
+   The 6106/7106 and 7102 clusters were admitted after a local 287-ROM corpus
+   showed five distinct IPL3 blobs rather than three. Both were identified by
+   re-deriving their IPL3 MD5 *and* CRC32 and matching the published clusters;
+   the same procedure reproduced the three digests above before being trusted
+   on new data. Their relocation deltas are proven independently of that
+   identity: [en64](https://en64.shoutwiki.com/wiki/ROM) records that 6106
+   subtracts `0x200000` and that 7102 is the PAL counterpart of the
+   non-relocating 6101 type, and counting boot-copy `jal` targets that land
+   inside `[entry - delta, entry - delta + 0x100000)` selects exactly one
+   delta per ROM — `0x200000` for the three permitted 6106 cartridges (68.5%,
+   76.5%, 77.0% in-bank against ~0% elsewhere) and `0` for the permitted 7102
+   cartridge (88.4%). The same measurement returns `0` at 86.8% for a ROM whose
+   zero delta is already proven, so the method reproduces a known-good answer
+   before being relied on. `crates/fn64-discover/src/banks.rs` asserts every
+   digest and delta above.
 6. Reject malformed or unexpected inputs before analysis.
 
 All downstream artifacts and cache keys must bind to the normalized ROM

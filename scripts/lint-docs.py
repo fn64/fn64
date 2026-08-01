@@ -142,6 +142,10 @@ def check_env_vars() -> None:
             "*.h",
             "--glob",
             "*.hpp",
+            "--glob",
+            # Python tooling reads env vars too; without this a doc could never
+            # cite a variable that only a script in scripts/ consumes.
+            "*.py",
             r"(FN64|OOT|RECOMP)_[A-Z0-9_]+",
             ".",
         ],

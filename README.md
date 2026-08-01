@@ -131,6 +131,40 @@ path-free, digest-verified receipt per image plus content-free wall-time and
 peak-RSS distributions only after the complete panel succeeds. See
 `docs/DISCOVER-PLAN.md` for the measured nine-ROM baseline.
 
+To characterize a whole local ROM corpus rather than a curated panel,
+`scripts/rom-catalog.py` measures every ROM in a directory and
+`scripts/rom-frontier.py` joins those measurements to live discovery outcomes:
+
+```sh
+python3 scripts/rom-catalog.py \
+  --rom-dir "$FN64_ROM_CORPUS_DIR" \
+  --output /path/to/private-catalog.jsonl
+
+python3 scripts/rom-frontier.py \
+  --catalog /path/to/private-catalog.jsonl \
+  --binary "$PWD/target/release/fn64-discover" \
+  --output /path/to/private-frontier.jsonl
+```
+
+`FN64_ROM_CORPUS_DIR` has no default; both tools exit rather than guess a ROM
+location, and both refuse to write inside the repository. The catalog records
+cartridge identity, IPL3 cluster, and per-ROM structural measures — boot-copy
+entropy, the share of bytes inside long code runs, and a
+`loader_stub_ratio` (distinct `jal` targets over resident `jr $ra` returns)
+that separates ROMs whose code is resident in the boot bank from those whose
+boot bank is only a loader stub. Recompiler-hazard counts (unaligned
+`lwl`/`lwr`, `cache`, branch-likely, COP0) are taken only inside long code
+runs, never over the raw bank: decoding data as instructions reports hazards
+no title executes. The frontier tool prints aggregate tables plus a ranked
+"easiest next target" list — resident-code ROMs discovery has not yet proven,
+which need neither decompression nor streaming to attempt.
+
+`crates/fn64-recomp-rs/tests/corpus_decode_sweep.rs` uses the same corpus as a
+decoder completeness guard, gated by `FN64_RECOMP_SWEEP_DIR` and skipped when
+unset. Measured across 287 ROMs: 23,808,397 decoded words, 289 `Unknown`
+(0.0012%), the residual being embedded data on reserved encodings rather than
+instructions the decoder lacks.
+
 `wrong == 0` holds across every game. The open remainder is an honest,
 characterized gap — genuinely unreferenced library/dead code (Kirby 64),
 struct-callback dispatch whose producer and loaded-image authority are not yet
