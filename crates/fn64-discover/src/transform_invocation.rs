@@ -1,10 +1,11 @@
-//! Candidate-only evidence for one exact transform-wrapper invocation.
+//! Candidate-only evidence for exact transform-wrapper invocations.
 //!
 //! The evaluator constructs a fresh CPU/RDRAM machine, admits only a narrow
 //! dependency-audited integer subset, and requires the completed destination
 //! bytes to equal a re-derived [`EvaluatedImageReceiptV1`] output exactly. The
-//! resulting certificate proves only this invocation from its committed
-//! inputs. It does not promote a fact, prove general transform semantics, or
+//! resulting certificates prove only one invocation, or one declared ordered
+//! one-call-per-stream sequence with shared mutable memory, from committed
+//! inputs. They do not promote a fact, prove general transform semantics, or
 //! establish runtime placement, reachability, or release authority.
 
 use crate::banks::materialize_rom_range_bounded;
@@ -24,6 +25,8 @@ use std::collections::BTreeSet;
 
 pub const TRANSFORM_INVOCATION_CERTIFICATE_SCHEMA_V1: &str =
     "fn64.transform-invocation-certificate.v1";
+pub const TRANSFORM_INVOCATION_SEQUENCE_CERTIFICATE_SCHEMA_V1: &str =
+    "fn64.transform-invocation-sequence-certificate.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhysicalRangeV1 {
@@ -48,6 +51,46 @@ impl PhysicalRangeV1 {
             (Some(a_end), Some(b_end)) => self.start < b_end && other.start < a_end,
             _ => true,
         }
+    }
+}
+
+struct ReadAuthorityV1 {
+    bytes: Vec<bool>,
+}
+
+impl ReadAuthorityV1 {
+    fn from_ranges(ranges: &[PhysicalRangeV1]) -> Self {
+        let mut authority = Self {
+            bytes: vec![false; RDRAM_LEN],
+        };
+        for range in ranges {
+            authority.mark(*range);
+        }
+        authority
+    }
+
+    fn allows(&self, start: u32, len: u32) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if len == 0 || end as usize > self.bytes.len() {
+            return false;
+        }
+        (start as usize..end as usize).all(|offset| self.bytes[offset])
+    }
+
+    fn mark(&mut self, range: PhysicalRangeV1) {
+        let end = range
+            .end()
+            .expect("validated read-authority range end must fit in u32");
+        self.bytes[range.start as usize..end as usize].fill(true);
+    }
+
+    fn clear(&mut self, range: PhysicalRangeV1) {
+        let end = range
+            .end()
+            .expect("validated read-authority range end must fit in u32");
+        self.bytes[range.start as usize..end as usize].fill(false);
     }
 }
 
@@ -100,6 +143,42 @@ pub struct TransformInvocationRequestV1<'a> {
     pub source_physical_start: u32,
     pub output_physical_start: u32,
     pub committed_memory: &'a [CommittedMemoryRangeV1<'a>],
+    pub additional_allowed_writes: &'a [PhysicalRangeV1],
+}
+
+/// One call boundary in an ordered transform sequence. Each step must select
+/// the receipt stream with the same ordinal as its position in the sequence;
+/// the evaluator rejects subsets and reorderings rather than silently
+/// certifying something weaker than the aggregate.
+#[derive(Clone, Debug)]
+pub struct TransformInvocationStepRequestV1<'a> {
+    pub entry_pc: u32,
+    pub return_pc: u32,
+    pub a0: u32,
+    pub a1: u32,
+    pub additional_gpr_seeds: &'a [GprSeedV1],
+    pub expected_output: ExpectedEvaluatedOutputV1,
+    pub expected_mutable_memory_after: &'a [CommittedMemoryRangeV1<'a>],
+}
+
+/// Initial bytes which remain shared and writable across every declared
+/// invocation. Their pre/post commitments make pointer-cell evolution part of
+/// the sequence identity instead of an inferred property of adjacent calls.
+#[derive(Clone, Debug)]
+pub struct SharedMutableMemoryRangeV1<'a> {
+    pub role: &'a str,
+    pub physical_start: u32,
+    pub initial_bytes: &'a [u8],
+}
+
+#[derive(Clone, Debug)]
+pub struct TransformInvocationSequenceRequestV1<'a> {
+    pub steps: &'a [TransformInvocationStepRequestV1<'a>],
+    pub code: KnownTransformCodeImageV1<'a>,
+    pub source_physical_start: u32,
+    pub output_physical_start: u32,
+    pub committed_memory: &'a [CommittedMemoryRangeV1<'a>],
+    pub shared_mutable_memory: &'a [SharedMutableMemoryRangeV1<'a>],
     pub additional_allowed_writes: &'a [PhysicalRangeV1],
 }
 
@@ -165,6 +244,61 @@ pub struct TransformInvocationCertificateV1 {
     pub output: ContentCommitmentV1,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransformInvocationSequenceStepCertificateV1 {
+    pub ordinal: u32,
+    pub entry_pc: u32,
+    pub initial_a0: u32,
+    pub initial_a1: u32,
+    pub additional_gpr_seeds: Vec<GprSeedV1>,
+    pub return_pc: u32,
+    pub expected_output: ExpectedEvaluatedOutputV1,
+    pub expected_output_start: u32,
+    pub expected_output_end: u32,
+    pub mutable_memory_before: Vec<ContentCommitmentV1>,
+    pub mutable_memory_after: Vec<ContentCommitmentV1>,
+    pub allowed_writes: Vec<PhysicalRangeV1>,
+    pub units: Vec<TransformUnitTranscriptV1>,
+    pub memory_events: Vec<TransformMemoryEventV1>,
+    pub retired_instructions: u32,
+    pub output: ContentCommitmentV1,
+}
+
+/// Replay evidence for a complete ordered stream sequence in one shared fresh
+/// RDRAM machine. Like the single-invocation certificate, this is not an
+/// authority capability and does not prove that boot selects the calls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransformInvocationSequenceCertificateV1 {
+    pub schema: String,
+    pub evaluated_image_receipt_sha256: String,
+    pub dynamic_semantics_schema: String,
+    pub dynamic_semantics_sha256: String,
+    pub dynamic_semantics_available: bool,
+    pub dynamic_semantics_general_dev_interpreter: bool,
+    pub code_virtual_start: u32,
+    pub code: ContentCommitmentV1,
+    pub committed_memory: Vec<ContentCommitmentV1>,
+    pub initial_mutable_memory: Vec<ContentCommitmentV1>,
+    pub max_units: u32,
+    pub max_instructions: u32,
+    pub steps: Vec<TransformInvocationSequenceStepCertificateV1>,
+    pub executed_units: u32,
+    pub retired_instructions: u32,
+    pub output: ContentCommitmentV1,
+}
+
+pub fn transform_invocation_sequence_certificate_sha256_v1(
+    certificate: &TransformInvocationSequenceCertificateV1,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fn64.transform-invocation-sequence-certificate.identity.v1\0");
+    hasher.update(
+        serde_json::to_vec(certificate)
+            .expect("transform invocation sequence certificate serializes"),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
 pub fn transform_invocation_certificate_sha256_v1(
     certificate: &TransformInvocationCertificateV1,
 ) -> String {
@@ -184,6 +318,22 @@ pub struct TransformInvocationEvaluationV1 {
 
 impl TransformInvocationEvaluationV1 {
     pub fn certificate(&self) -> &TransformInvocationCertificateV1 {
+        &self.certificate
+    }
+
+    pub fn output(&self) -> &[u8] {
+        &self.output
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransformInvocationSequenceEvaluationV1 {
+    certificate: TransformInvocationSequenceCertificateV1,
+    output: Vec<u8>,
+}
+
+impl TransformInvocationSequenceEvaluationV1 {
+    pub fn certificate(&self) -> &TransformInvocationSequenceCertificateV1 {
         &self.certificate
     }
 
@@ -231,6 +381,10 @@ pub enum TransformInvocationErrorV1 {
     RejectedExit(String),
     OutputNotFullyWritten {
         first_unwritten_physical_offset: u32,
+    },
+    MutableMemoryMismatch {
+        ordinal: u32,
+        role: String,
     },
     OutputMismatch,
 }
@@ -295,6 +449,117 @@ fn take_observed_events() -> Vec<ObservedEvent> {
                 .as_mut()
                 .expect("active transform journal exists"),
         )
+    })
+}
+
+struct InvocationSeedV1<'a> {
+    entry_pc: u32,
+    return_pc: u32,
+    a0: u32,
+    a1: u32,
+    additional_gpr_seeds: &'a [GprSeedV1],
+}
+
+struct InvocationRunV1 {
+    units: Vec<TransformUnitTranscriptV1>,
+    memory_events: Vec<TransformMemoryEventV1>,
+    retired_instructions: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_declared_invocation_v1(
+    seed: InvocationSeedV1<'_>,
+    code: &KnownTransformCodeImageV1<'_>,
+    code_range: PhysicalRangeV1,
+    catalog: &mut DynamicMappedUnitCatalogV1,
+    mem: &mut Rdram<'_>,
+    authority: &mut ReadAuthorityV1,
+    allowed_writes: &[PhysicalRangeV1],
+    max_units: u32,
+    max_instructions: u32,
+) -> Result<InvocationRunV1, TransformInvocationErrorV1> {
+    let mut context = RecompContext::new();
+    context.set_r32(4, seed.a0 as i32);
+    context.set_r32(5, seed.a1 as i32);
+    context.set_r32(31, seed.return_pc as i32);
+    context.set_thread_return_pc(Some(seed.return_pc));
+    let mut defined = BTreeSet::from([0u8, 4, 5, 31]);
+    for register_seed in seed.additional_gpr_seeds {
+        context.set_r(register_seed.register, register_seed.value);
+        defined.insert(register_seed.register);
+    }
+
+    let mut pc = seed.entry_pc;
+    let mut units = Vec::new();
+    let mut transcript_events = Vec::new();
+    let mut retired_total = 0u32;
+    loop {
+        if units.len() >= max_units as usize {
+            return Err(TransformInvocationErrorV1::UnitLimitExceeded);
+        }
+        validate_code_pc(code, pc)?;
+        let primary = decode(word_at_pc(code, pc)?);
+        let likely_delay_executes = match primary {
+            Instruction::Beql { rs, rt, .. } => context.r(rs) == context.r(rt),
+            Instruction::Bnel { rs, rt, .. } => context.r(rs) != context.r(rt),
+            Instruction::Blezl { rs, .. } => context.r_s64(rs) <= 0,
+            Instruction::Bgtzl { rs, .. } => context.r_s64(rs) > 0,
+            _ => true,
+        };
+        let run = catalog
+            .activate_and_run(
+                ExecutionKey::new(BankId::new(0), GuestPc::new(pc)),
+                InstructionBudget::new(2).unwrap(),
+                &mut context,
+                mem,
+                |_| false,
+            )
+            .map_err(|error| TransformInvocationErrorV1::DynamicExecution(error.to_string()))?;
+        retired_total = retired_total
+            .checked_add(run.run.instructions)
+            .ok_or(TransformInvocationErrorV1::InstructionLimitExceeded)?;
+        if retired_total > max_instructions {
+            return Err(TransformInvocationErrorV1::InstructionLimitExceeded);
+        }
+        let observed = take_observed_events();
+        let words = words_for_run(code, &run.instructions)?;
+        audit_unit(
+            pc,
+            &words,
+            run.run.instructions,
+            &observed,
+            &mut defined,
+            authority,
+            allowed_writes,
+            code_range,
+            &mut transcript_events,
+            likely_delay_executes,
+        )?;
+        let (exit_name, next) = classify_exit(run.run.exit)?;
+        units.push(TransformUnitTranscriptV1 {
+            entry_pc: pc,
+            identity_sha256: hex(&run.identity.bytes()),
+            instruction_physical_addresses: run
+                .instructions
+                .iter()
+                .map(|instruction| instruction.physical_address)
+                .collect(),
+            words,
+            retired_instructions: run.run.instructions,
+            exit: exit_name,
+        });
+        match next {
+            Some(next_pc) => {
+                validate_code_pc(code, next_pc)?;
+                pc = next_pc;
+            }
+            None => break,
+        }
+    }
+    Ok(InvocationRunV1 {
+        units,
+        memory_events: transcript_events,
+        retired_instructions: retired_total,
     })
 }
 
@@ -410,16 +675,6 @@ fn certify_transform_wrapper_invocation_isolated_v1(
         ));
     }
     let mut catalog = DynamicMappedUnitCatalogV1::new_linked();
-    let mut context = RecompContext::new();
-    context.set_r32(4, request.a0 as i32);
-    context.set_r32(5, request.a1 as i32);
-    context.set_r32(31, request.return_pc as i32);
-    context.set_thread_return_pc(Some(request.return_pc));
-    let mut defined = BTreeSet::from([0u8, 4, 5, 31]);
-    for seed in request.additional_gpr_seeds {
-        context.set_r(seed.register, seed.value);
-        defined.insert(seed.register);
-    }
     let mut committed = vec![code_range, source_range];
     committed.extend(
         request
@@ -428,72 +683,31 @@ fn certify_transform_wrapper_invocation_isolated_v1(
             .map(|range| range_of(range.physical_start, range.bytes))
             .collect::<Result<Vec<_>, _>>()?,
     );
-    let mut pc = request.entry_pc;
-    let mut units = Vec::new();
-    let mut transcript_events = Vec::new();
-    let mut retired_total = 0u32;
-
-    loop {
-        if units.len() >= limits.max_units as usize {
-            return Err(TransformInvocationErrorV1::UnitLimitExceeded);
-        }
-        validate_code_pc(request, pc)?;
-        let run = catalog
-            .activate_and_run(
-                ExecutionKey::new(BankId::new(0), GuestPc::new(pc)),
-                InstructionBudget::new(2).unwrap(),
-                &mut context,
-                &mut mem,
-                |_| false,
-            )
-            .map_err(|error| TransformInvocationErrorV1::DynamicExecution(error.to_string()))?;
-        retired_total = retired_total
-            .checked_add(run.run.instructions)
-            .ok_or(TransformInvocationErrorV1::InstructionLimitExceeded)?;
-        if retired_total > limits.max_instructions {
-            return Err(TransformInvocationErrorV1::InstructionLimitExceeded);
-        }
-        let observed = take_observed_events();
-        let words = words_for_run(request, &run.instructions)?;
-        audit_unit(
-            pc,
-            &words,
-            run.run.instructions,
-            &observed,
-            &mut defined,
-            &mut committed,
-            &allowed_writes,
-            code_range,
-            &mut transcript_events,
-        )?;
-        let (exit_name, next) = classify_exit(run.run.exit)?;
-        units.push(TransformUnitTranscriptV1 {
-            entry_pc: pc,
-            identity_sha256: hex(&run.identity.bytes()),
-            instruction_physical_addresses: run
-                .instructions
-                .iter()
-                .map(|instruction| instruction.physical_address)
-                .collect(),
-            words,
-            retired_instructions: run.run.instructions,
-            exit: exit_name,
-        });
-        match next {
-            Some(next_pc) => {
-                validate_code_pc(request, next_pc)?;
-                pc = next_pc;
-            }
-            None => break,
-        }
-    }
+    let mut authority = ReadAuthorityV1::from_ranges(&committed);
+    let run = run_declared_invocation_v1(
+        InvocationSeedV1 {
+            entry_pc: request.entry_pc,
+            return_pc: request.return_pc,
+            a0: request.a0,
+            a1: request.a1,
+            additional_gpr_seeds: request.additional_gpr_seeds,
+        },
+        &request.code,
+        code_range,
+        &mut catalog,
+        &mut mem,
+        &mut authority,
+        &allowed_writes,
+        limits.max_units,
+        limits.max_instructions,
+    )?;
 
     let output = mem.copy_physical_bytes(
         request.output_physical_start,
         u32::try_from(output_initial.len())
             .map_err(|_| TransformInvocationErrorV1::InvalidInput("output length exceeds u32"))?,
     );
-    require_full_output_write_coverage(output_range, &transcript_events)?;
+    require_full_output_write_coverage(output_range, &run.memory_events)?;
     if output != expected_output {
         return Err(TransformInvocationErrorV1::OutputMismatch);
     }
@@ -552,15 +766,412 @@ fn certify_transform_wrapper_invocation_isolated_v1(
         allowed_writes,
         max_units: limits.max_units,
         max_instructions: limits.max_instructions,
-        units,
-        memory_events: transcript_events,
-        retired_instructions: retired_total,
+        units: run.units,
+        memory_events: run.memory_events,
+        retired_instructions: run.retired_instructions,
         output: commitment("output_final", request.output_physical_start, &output)?,
     };
     Ok(TransformInvocationEvaluationV1 {
         certificate,
         output,
     })
+}
+
+pub fn certify_transform_invocation_sequence_v1(
+    rom: &NormalizedRom,
+    facts: &FactDb,
+    expected: &EvaluatedImageReceiptV1,
+    request: &TransformInvocationSequenceRequestV1<'_>,
+    limits: TransformInvocationLimitsV1,
+) -> Result<TransformInvocationSequenceEvaluationV1, TransformInvocationErrorV1> {
+    std::thread::scope(|scope| {
+        match scope
+            .spawn(|| {
+                certify_transform_invocation_sequence_isolated_v1(
+                    rom, facts, expected, request, limits,
+                )
+            })
+            .join()
+        {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+fn certify_transform_invocation_sequence_isolated_v1(
+    rom: &NormalizedRom,
+    facts: &FactDb,
+    expected: &EvaluatedImageReceiptV1,
+    request: &TransformInvocationSequenceRequestV1<'_>,
+    limits: TransformInvocationLimitsV1,
+) -> Result<TransformInvocationSequenceEvaluationV1, TransformInvocationErrorV1> {
+    validate_sequence_request(request, expected, limits)?;
+    let evaluation =
+        rederive_materialized_image_v1(rom, facts, expected, limits.materialized_image)
+            .map_err(|error| TransformInvocationErrorV1::Materialization(error.to_string()))?;
+    let expected_receipt_sha256 = evaluated_image_receipt_sha256_v1(expected);
+    let output_initial = output_poison(
+        &expected_receipt_sha256,
+        0,
+        expected.output_len,
+        request.output_physical_start,
+        evaluation.bytes().len(),
+    );
+    let source = materialize_rom_range_bounded(
+        rom,
+        facts,
+        expected.source.rom_space,
+        expected.source.rom_start,
+        expected.source.rom_end,
+        limits.materialized_image.max_decoded_vrom_file_bytes,
+    )
+    .map_err(TransformInvocationErrorV1::Materialization)?;
+    if sha256(&source.bytes) != expected.source_sha256 {
+        return Err(TransformInvocationErrorV1::Materialization(
+            "materialized source digest disagrees with evaluated receipt".to_owned(),
+        ));
+    }
+
+    let code_range = range_of(request.code.physical_start, request.code.bytes)?;
+    let source_range = range_of(request.source_physical_start, &source.bytes)?;
+    let output_range = range_of(request.output_physical_start, &output_initial)?;
+    let immutable_ranges = request
+        .committed_memory
+        .iter()
+        .map(|range| range_of(range.physical_start, range.bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mutable_ranges = request
+        .shared_mutable_memory
+        .iter()
+        .map(|range| range_of(range.physical_start, range.initial_bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut initial_ranges = vec![code_range, source_range, output_range];
+    initial_ranges.extend(immutable_ranges.iter().copied());
+    initial_ranges.extend(mutable_ranges.iter().copied());
+    reject_overlaps(&initial_ranges)?;
+
+    reject_overlaps(request.additional_allowed_writes)?;
+    for range in request.additional_allowed_writes {
+        if initial_ranges
+            .iter()
+            .any(|initial| range.intersects(*initial))
+        {
+            return Err(TransformInvocationErrorV1::InvalidInput(
+                "additional allowed write range intersects committed, mutable, code, source, or output memory",
+            ));
+        }
+    }
+
+    let mut backing = vec![0u8; RDRAM_LEN];
+    let mut mem = Rdram::new(&mut backing);
+    install_bytes(&mut mem, request.code.physical_start, request.code.bytes);
+    install_bytes(&mut mem, request.source_physical_start, &source.bytes);
+    install_bytes(&mut mem, request.output_physical_start, &output_initial);
+    for range in request.committed_memory {
+        install_bytes(&mut mem, range.physical_start, range.bytes);
+    }
+    for range in request.shared_mutable_memory {
+        install_bytes(&mut mem, range.physical_start, range.initial_bytes);
+    }
+
+    let _observers = ObserverGuard::install();
+    let semantics = dynamic_mapped_execution_build_receipt_v1();
+    if !semantics.available() {
+        return Err(TransformInvocationErrorV1::InvalidInput(
+            "dynamic mapped execution capability is unavailable",
+        ));
+    }
+    let mut catalog = DynamicMappedUnitCatalogV1::new_linked();
+    let mut committed = vec![code_range, source_range];
+    committed.extend(immutable_ranges);
+    committed.extend(mutable_ranges.iter().copied());
+    let mut authority = ReadAuthorityV1::from_ranges(&committed);
+
+    let mut initial_commitments = vec![
+        commitment(
+            "evaluated_source",
+            request.source_physical_start,
+            &source.bytes,
+        )?,
+        commitment(
+            "output_initial_poison",
+            request.output_physical_start,
+            &output_initial,
+        )?,
+    ];
+    initial_commitments.extend(
+        request
+            .committed_memory
+            .iter()
+            .map(|range| commitment(range.role, range.physical_start, range.bytes))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    sort_commitments(&mut initial_commitments);
+    let initial_mutable_memory = mutable_commitments(&mem, request.shared_mutable_memory)?;
+
+    let mut total_units = 0u32;
+    let mut total_instructions = 0u32;
+    let mut step_certificates = Vec::with_capacity(request.steps.len());
+    for (index, step) in request.steps.iter().enumerate() {
+        let ordinal = u32::try_from(index)
+            .map_err(|_| TransformInvocationErrorV1::InvalidInput("too many sequence steps"))?;
+        let stream = &expected.streams[index];
+        let selected_start = request
+            .output_physical_start
+            .checked_add(stream.output_range.start)
+            .ok_or(TransformInvocationErrorV1::InvalidInput(
+                "selected output range overflows RDRAM",
+            ))?;
+        let selected_len = stream
+            .output_range
+            .end
+            .checked_sub(stream.output_range.start)
+            .ok_or(TransformInvocationErrorV1::InvalidInput(
+                "selected output range is reversed",
+            ))?;
+        let selected_range = PhysicalRangeV1 {
+            start: selected_start,
+            len: selected_len,
+        };
+        validate_range(selected_range)?;
+
+        let mut allowed_writes = vec![selected_range];
+        allowed_writes.extend(mutable_ranges.iter().copied());
+        allowed_writes.extend_from_slice(request.additional_allowed_writes);
+        allowed_writes.sort_unstable_by_key(|range| (range.start, range.len));
+        allowed_writes.dedup();
+
+        let mutable_memory_before = mutable_commitments(&mem, request.shared_mutable_memory)?;
+        let remaining_units = limits
+            .max_units
+            .checked_sub(total_units)
+            .filter(|remaining| *remaining != 0)
+            .ok_or(TransformInvocationErrorV1::UnitLimitExceeded)?;
+        let remaining_instructions = limits
+            .max_instructions
+            .checked_sub(total_instructions)
+            .filter(|remaining| *remaining != 0)
+            .ok_or(TransformInvocationErrorV1::InstructionLimitExceeded)?;
+        let run = run_declared_invocation_v1(
+            InvocationSeedV1 {
+                entry_pc: step.entry_pc,
+                return_pc: step.return_pc,
+                a0: step.a0,
+                a1: step.a1,
+                additional_gpr_seeds: step.additional_gpr_seeds,
+            },
+            &request.code,
+            code_range,
+            &mut catalog,
+            &mut mem,
+            &mut authority,
+            &allowed_writes,
+            remaining_units,
+            remaining_instructions,
+        )?;
+        total_units = total_units
+            .checked_add(
+                u32::try_from(run.units.len())
+                    .map_err(|_| TransformInvocationErrorV1::UnitLimitExceeded)?,
+            )
+            .ok_or(TransformInvocationErrorV1::UnitLimitExceeded)?;
+        total_instructions = total_instructions
+            .checked_add(run.retired_instructions)
+            .ok_or(TransformInvocationErrorV1::InstructionLimitExceeded)?;
+        require_full_output_write_coverage(selected_range, &run.memory_events)?;
+        let step_output = mem.copy_physical_bytes(selected_start, selected_len);
+        let expected_step = evaluation
+            .bytes()
+            .get(stream.output_range.start as usize..stream.output_range.end as usize)
+            .ok_or(TransformInvocationErrorV1::InvalidInput(
+                "selected output range is outside the evaluated image",
+            ))?;
+        if step_output != expected_step {
+            return Err(TransformInvocationErrorV1::OutputMismatch);
+        }
+        for expected_mutable in step.expected_mutable_memory_after {
+            let len = u32::try_from(expected_mutable.bytes.len()).map_err(|_| {
+                TransformInvocationErrorV1::InvalidInput("range length exceeds u32")
+            })?;
+            if mem.copy_physical_bytes(expected_mutable.physical_start, len)
+                != expected_mutable.bytes
+            {
+                return Err(TransformInvocationErrorV1::MutableMemoryMismatch {
+                    ordinal,
+                    role: expected_mutable.role.to_owned(),
+                });
+            }
+        }
+        let mutable_memory_after = mutable_commitments(&mem, request.shared_mutable_memory)?;
+        step_certificates.push(TransformInvocationSequenceStepCertificateV1 {
+            ordinal,
+            entry_pc: step.entry_pc,
+            initial_a0: step.a0,
+            initial_a1: step.a1,
+            additional_gpr_seeds: step.additional_gpr_seeds.to_vec(),
+            return_pc: step.return_pc,
+            expected_output: step.expected_output,
+            expected_output_start: stream.output_range.start,
+            expected_output_end: stream.output_range.end,
+            mutable_memory_before,
+            mutable_memory_after,
+            allowed_writes,
+            units: run.units,
+            memory_events: run.memory_events,
+            retired_instructions: run.retired_instructions,
+            output: commitment("step_output_final", selected_start, &step_output)?,
+        });
+        // Additional scratch is step-local dependency state. Bytes may remain
+        // in the fresh machine, but no later invocation may read them until it
+        // has overwritten them itself; cross-call state must use the explicit
+        // shared-mutable seam and its before/after commitments.
+        for scratch in request.additional_allowed_writes {
+            authority.clear(*scratch);
+        }
+    }
+
+    let output = mem.copy_physical_bytes(request.output_physical_start, expected.output_len);
+    if output != evaluation.bytes() {
+        return Err(TransformInvocationErrorV1::OutputMismatch);
+    }
+    let certificate = TransformInvocationSequenceCertificateV1 {
+        schema: TRANSFORM_INVOCATION_SEQUENCE_CERTIFICATE_SCHEMA_V1.to_owned(),
+        evaluated_image_receipt_sha256: expected_receipt_sha256,
+        dynamic_semantics_schema: semantics.schema().to_owned(),
+        dynamic_semantics_sha256: hex(&semantics.source_sha256()),
+        dynamic_semantics_available: semantics.available(),
+        dynamic_semantics_general_dev_interpreter: semantics.general_dev_interpreter(),
+        code_virtual_start: request.code.virtual_start,
+        code: commitment("code", request.code.physical_start, request.code.bytes)?,
+        committed_memory: initial_commitments,
+        initial_mutable_memory,
+        max_units: limits.max_units,
+        max_instructions: limits.max_instructions,
+        steps: step_certificates,
+        executed_units: total_units,
+        retired_instructions: total_instructions,
+        output: commitment("output_final", request.output_physical_start, &output)?,
+    };
+    Ok(TransformInvocationSequenceEvaluationV1 {
+        certificate,
+        output,
+    })
+}
+
+fn validate_sequence_request(
+    request: &TransformInvocationSequenceRequestV1<'_>,
+    expected: &EvaluatedImageReceiptV1,
+    limits: TransformInvocationLimitsV1,
+) -> Result<(), TransformInvocationErrorV1> {
+    if limits.max_units == 0 || limits.max_instructions == 0 {
+        return Err(TransformInvocationErrorV1::InvalidInput(
+            "execution limits must be nonzero",
+        ));
+    }
+    if request.steps.is_empty() || request.steps.len() != expected.streams.len() {
+        return Err(TransformInvocationErrorV1::InvalidInput(
+            "sequence must contain exactly one step per evaluated stream",
+        ));
+    }
+    if request.code.bytes.is_empty() || !request.code.bytes.len().is_multiple_of(4) {
+        return Err(TransformInvocationErrorV1::InvalidInput(
+            "code image must be nonempty and word aligned",
+        ));
+    }
+    if request.code.virtual_start & 3 != 0 {
+        return Err(TransformInvocationErrorV1::InvalidInput(
+            "code address must be word aligned",
+        ));
+    }
+    let physical = direct_physical(request.code.virtual_start).ok_or(
+        TransformInvocationErrorV1::InvalidInput("code must use a direct KSEG address"),
+    )?;
+    if physical != request.code.physical_start {
+        return Err(TransformInvocationErrorV1::InvalidInput(
+            "code virtual and physical starts disagree",
+        ));
+    }
+    validate_range(range_of(request.code.physical_start, request.code.bytes)?)?;
+
+    for (index, step) in request.steps.iter().enumerate() {
+        if step.entry_pc & 3 != 0 {
+            return Err(TransformInvocationErrorV1::InvalidInput(
+                "sequence entry address must be word aligned",
+            ));
+        }
+        validate_additional_gpr_seeds(step.additional_gpr_seeds)?;
+        let ordinal = u32::try_from(index)
+            .map_err(|_| TransformInvocationErrorV1::InvalidInput("too many sequence steps"))?;
+        if step.expected_output != (ExpectedEvaluatedOutputV1::Stream { ordinal }) {
+            return Err(TransformInvocationErrorV1::InvalidInput(
+                "sequence steps must select every stream in ordinal order",
+            ));
+        }
+        if step.expected_mutable_memory_after.len() != request.shared_mutable_memory.len() {
+            return Err(TransformInvocationErrorV1::InvalidInput(
+                "each sequence step must declare every shared mutable post-state",
+            ));
+        }
+        for (declared, shared) in step
+            .expected_mutable_memory_after
+            .iter()
+            .zip(request.shared_mutable_memory)
+        {
+            if declared.role != shared.role
+                || declared.physical_start != shared.physical_start
+                || declared.bytes.len() != shared.initial_bytes.len()
+            {
+                return Err(TransformInvocationErrorV1::InvalidInput(
+                    "shared mutable post-state geometry must match the initial declaration",
+                ));
+            }
+        }
+    }
+    let mut mutable_roles = BTreeSet::new();
+    for range in request.shared_mutable_memory {
+        if range.role.trim().is_empty() || !mutable_roles.insert(range.role) {
+            return Err(TransformInvocationErrorV1::InvalidInput(
+                "shared mutable memory roles must be nonempty and unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mutable_commitments(
+    mem: &Rdram<'_>,
+    ranges: &[SharedMutableMemoryRangeV1<'_>],
+) -> Result<Vec<ContentCommitmentV1>, TransformInvocationErrorV1> {
+    let mut commitments = ranges
+        .iter()
+        .map(|range| {
+            let len = u32::try_from(range.initial_bytes.len()).map_err(|_| {
+                TransformInvocationErrorV1::InvalidInput("range length exceeds u32")
+            })?;
+            let bytes = mem.copy_physical_bytes(range.physical_start, len);
+            commitment(range.role, range.physical_start, &bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sort_commitments(&mut commitments);
+    Ok(commitments)
+}
+
+fn sort_commitments(commitments: &mut [ContentCommitmentV1]) {
+    commitments.sort_unstable_by(|left, right| {
+        (
+            left.physical_start,
+            left.len,
+            left.role.as_str(),
+            left.sha256.as_str(),
+        )
+            .cmp(&(
+                right.physical_start,
+                right.len,
+                right.role.as_str(),
+                right.sha256.as_str(),
+            ))
+    });
 }
 
 fn require_full_output_write_coverage(
@@ -623,9 +1234,23 @@ fn validate_limits_and_layout(
             "code and entry addresses must be word aligned",
         ));
     }
+    validate_additional_gpr_seeds(request.additional_gpr_seeds)?;
+    let physical = direct_physical(request.code.virtual_start).ok_or(
+        TransformInvocationErrorV1::InvalidInput("code must use a direct KSEG address"),
+    )?;
+    if physical != request.code.physical_start {
+        return Err(TransformInvocationErrorV1::InvalidInput(
+            "code virtual and physical starts disagree",
+        ));
+    }
+    validate_range(range_of(request.code.physical_start, request.code.bytes)?)?;
+    Ok(())
+}
+
+fn validate_additional_gpr_seeds(seeds: &[GprSeedV1]) -> Result<(), TransformInvocationErrorV1> {
     let mut seeded = BTreeSet::new();
     let mut previous_seed = None;
-    for seed in request.additional_gpr_seeds {
+    for seed in seeds {
         if seed.register >= 32 || matches!(seed.register, 0 | 4 | 5 | 31) {
             return Err(TransformInvocationErrorV1::InvalidInput(
                 "additional GPR seed uses an invalid or dedicated register",
@@ -643,15 +1268,6 @@ fn validate_limits_and_layout(
         }
         previous_seed = Some(seed.register);
     }
-    let physical = direct_physical(request.code.virtual_start).ok_or(
-        TransformInvocationErrorV1::InvalidInput("code must use a direct KSEG address"),
-    )?;
-    if physical != request.code.physical_start {
-        return Err(TransformInvocationErrorV1::InvalidInput(
-            "code virtual and physical starts disagree",
-        ));
-    }
-    validate_range(range_of(request.code.physical_start, request.code.bytes)?)?;
     Ok(())
 }
 
@@ -697,19 +1313,18 @@ fn install_bytes(mem: &mut Rdram<'_>, start: u32, bytes: &[u8]) {
 }
 
 fn validate_code_pc(
-    request: &TransformInvocationRequestV1<'_>,
+    code: &KnownTransformCodeImageV1<'_>,
     pc: u32,
 ) -> Result<(), TransformInvocationErrorV1> {
-    let virtual_end = request
-        .code
+    let virtual_end = code
         .virtual_start
-        .checked_add(request.code.bytes.len() as u32)
+        .checked_add(code.bytes.len() as u32)
         .ok_or(TransformInvocationErrorV1::CodeEscape { pc })?;
-    if pc < request.code.virtual_start || pc >= virtual_end || pc & 3 != 0 {
+    if pc < code.virtual_start || pc >= virtual_end || pc & 3 != 0 {
         return Err(TransformInvocationErrorV1::CodeEscape { pc });
     }
     let physical = direct_physical(pc).ok_or(TransformInvocationErrorV1::CodeEscape { pc })?;
-    let expected = request.code.physical_start + (pc - request.code.virtual_start);
+    let expected = code.physical_start + (pc - code.virtual_start);
     if physical != expected {
         return Err(TransformInvocationErrorV1::CodeEscape { pc });
     }
@@ -717,7 +1332,7 @@ fn validate_code_pc(
 }
 
 fn words_for_run(
-    request: &TransformInvocationRequestV1<'_>,
+    code: &KnownTransformCodeImageV1<'_>,
     instructions: &[fn64_recomp_rs::InstructionWordIdentity],
 ) -> Result<Vec<u32>, TransformInvocationErrorV1> {
     instructions
@@ -725,11 +1340,11 @@ fn words_for_run(
         .map(|instruction| {
             let relative = instruction
                 .physical_address
-                .checked_sub(request.code.physical_start)
+                .checked_sub(code.physical_start)
                 .ok_or(TransformInvocationErrorV1::CodeEscape {
                     pc: instruction.physical_address,
                 })? as usize;
-            let bytes = request.code.bytes.get(relative..relative + 4).ok_or(
+            let bytes = code.bytes.get(relative..relative + 4).ok_or(
                 TransformInvocationErrorV1::CodeEscape {
                     pc: instruction.physical_address,
                 },
@@ -739,6 +1354,20 @@ fn words_for_run(
         .collect()
 }
 
+fn word_at_pc(
+    code: &KnownTransformCodeImageV1<'_>,
+    pc: u32,
+) -> Result<u32, TransformInvocationErrorV1> {
+    let relative = pc
+        .checked_sub(code.virtual_start)
+        .ok_or(TransformInvocationErrorV1::CodeEscape { pc })? as usize;
+    let bytes = code
+        .bytes
+        .get(relative..relative + 4)
+        .ok_or(TransformInvocationErrorV1::CodeEscape { pc })?;
+    Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn audit_unit(
     pc: u32,
@@ -746,13 +1375,17 @@ fn audit_unit(
     retired: u32,
     observed: &[ObservedEvent],
     defined: &mut BTreeSet<u8>,
-    committed: &mut Vec<PhysicalRangeV1>,
+    authority: &mut ReadAuthorityV1,
     allowed_writes: &[PhysicalRangeV1],
     code: PhysicalRangeV1,
     transcript: &mut Vec<TransformMemoryEventV1>,
+    likely_delay_executes: bool,
 ) -> Result<(), TransformInvocationErrorV1> {
-    let executed_words = usize::try_from(retired)
+    let mut executed_words = usize::try_from(retired)
         .map_err(|_| TransformInvocationErrorV1::InstructionLimitExceeded)?;
+    if words.len() == 2 && decode(words[0]).is_branch_likely() && !likely_delay_executes {
+        executed_words = 1;
+    }
     if executed_words == 0 || executed_words > words.len() {
         return Err(TransformInvocationErrorV1::MemoryEventMismatch { pc });
     }
@@ -763,7 +1396,7 @@ fn audit_unit(
             decode(word),
             &mut events,
             defined,
-            committed,
+            authority,
             allowed_writes,
             code,
             transcript,
@@ -781,7 +1414,7 @@ fn audit_instruction<'a>(
     instruction: Instruction,
     events: &mut impl Iterator<Item = &'a ObservedEvent>,
     defined: &mut BTreeSet<u8>,
-    committed: &mut Vec<PhysicalRangeV1>,
+    authority: &mut ReadAuthorityV1,
     allowed_writes: &[PhysicalRangeV1],
     code: PhysicalRangeV1,
     transcript: &mut Vec<TransformMemoryEventV1>,
@@ -809,7 +1442,7 @@ fn audit_instruction<'a>(
         | Lwu { rt, base, .. }
         | Ld { rt, base, .. } => {
             require(base)?;
-            consume_read(pc, events, committed, transcript)?;
+            consume_read(pc, events, authority, transcript)?;
             define(rt, defined);
         }
         Lwl { rt, base, .. }
@@ -818,13 +1451,13 @@ fn audit_instruction<'a>(
         | Ldr { rt, base, .. } => {
             require(base)?;
             require(rt)?;
-            consume_read(pc, events, committed, transcript)?;
+            consume_read(pc, events, authority, transcript)?;
             define(rt, defined);
         }
         Sb { rt, base, .. } | Sh { rt, base, .. } | Sw { rt, base, .. } | Sd { rt, base, .. } => {
             require(base)?;
             require(rt)?;
-            consume_write(pc, events, committed, allowed_writes, code, transcript)?;
+            consume_write(pc, events, authority, allowed_writes, code, transcript)?;
         }
         Swl { .. } | Swr { .. } | Sdl { .. } | Sdr { .. } => {
             return Err(TransformInvocationErrorV1::UnsupportedInstruction {
@@ -879,11 +1512,11 @@ fn audit_instruction<'a>(
             require(rt)?;
             define(rd, defined);
         }
-        Beq { rs, rt, .. } | Bne { rs, rt, .. } => {
+        Beq { rs, rt, .. } | Bne { rs, rt, .. } | Beql { rs, rt, .. } | Bnel { rs, rt, .. } => {
             require(rs)?;
             require(rt)?;
         }
-        Blez { rs, .. } | Bgtz { rs, .. } => require(rs)?,
+        Blez { rs, .. } | Bgtz { rs, .. } | Blezl { rs, .. } | Bgtzl { rs, .. } => require(rs)?,
         J { .. } => {}
         Jal { .. } => define(31, defined),
         Jr { rs } => require(rs)?,
@@ -904,16 +1537,13 @@ fn audit_instruction<'a>(
 fn consume_read<'a>(
     pc: u32,
     events: &mut impl Iterator<Item = &'a ObservedEvent>,
-    committed: &[PhysicalRangeV1],
+    authority: &ReadAuthorityV1,
     transcript: &mut Vec<TransformMemoryEventV1>,
 ) -> Result<(), TransformInvocationErrorV1> {
     let Some(ObservedEvent::Read(event)) = events.next() else {
         return Err(TransformInvocationErrorV1::MemoryEventMismatch { pc });
     };
-    if !committed
-        .iter()
-        .any(|range| range.contains(event.physical_offset, event.len))
-    {
+    if !authority.allows(event.physical_offset, event.len) {
         return Err(TransformInvocationErrorV1::ReadOutsideCommitted {
             physical_offset: event.physical_offset,
             len: event.len,
@@ -929,7 +1559,7 @@ fn consume_read<'a>(
 fn consume_write<'a>(
     pc: u32,
     events: &mut impl Iterator<Item = &'a ObservedEvent>,
-    committed: &mut Vec<PhysicalRangeV1>,
+    authority: &mut ReadAuthorityV1,
     allowed_writes: &[PhysicalRangeV1],
     code: PhysicalRangeV1,
     transcript: &mut Vec<TransformMemoryEventV1>,
@@ -962,7 +1592,7 @@ fn consume_write<'a>(
             len,
         });
     }
-    committed.push(written);
+    authority.mark(written);
     transcript.push(TransformMemoryEventV1::Write {
         physical_offset,
         len,
@@ -1072,6 +1702,37 @@ mod tests {
         .collect()
     }
 
+    fn pointer_cell_copy_wrapper() -> Vec<u8> {
+        [
+            i(0x23, 4, 8, 0),  // lw t0,0(a0): encoded-source cursor
+            i(0x23, 5, 9, 0),  // lw t1,0(a1): output cursor
+            r(8, 7, 8, 0x21),  // addu t0,t0,a3: skip stream header
+            i(0x24, 8, 10, 0), // lbu t2,0(t0)
+            i(0x28, 9, 10, 0), // sb t2,0(t1)
+            i(0x09, 8, 8, 1),  // addiu t0,t0,1
+            i(0x09, 9, 9, 1),  // addiu t1,t1,1
+            i(0x09, 6, 6, -1), // addiu a2,a2,-1
+            i(0x05, 6, 0, -6), // bne a2,zero,copy
+            0,                 // nop
+            i(0x2b, 4, 8, 0),  // sw t0,0(a0)
+            i(0x2b, 5, 9, 0),  // sw t1,0(a1)
+            r(31, 0, 0, 0x08), // jr ra
+            0,                 // nop
+        ]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect()
+    }
+
+    fn prefixed_copy_wrapper(prefix: &[u32], payload_len: usize) -> Vec<u8> {
+        prefix
+            .iter()
+            .copied()
+            .flat_map(u32::to_be_bytes)
+            .chain(copy_wrapper(payload_len))
+            .collect()
+    }
+
     fn stored_stream(payload: &[u8]) -> Vec<u8> {
         let len = payload.len() as u16;
         let mut bytes = vec![0x11, 0x72];
@@ -1162,8 +1823,8 @@ mod tests {
             .iter()
             .any(|event| matches!(event, TransformMemoryEventV1::Write { .. })));
         assert_eq!(
-            transform_invocation_certificate_sha256_v1(result.certificate()).len(),
-            64
+            transform_invocation_certificate_sha256_v1(result.certificate()),
+            "826e55db18f6a3f8f9f6bdaee8aa4b275efea75429e58009521c379485847cad"
         );
         let repeated = certify_transform_wrapper_invocation_v1(
             &rom,
@@ -1236,6 +1897,608 @@ mod tests {
     }
 
     #[test]
+    fn ordered_sequence_binds_shared_pointer_evolution_and_aggregate_output() {
+        const SOURCE_CELL_PA: u32 = 0x4000;
+        const OUTPUT_CELL_PA: u32 = 0x4004;
+        const SOURCE_CELL_VA: u32 = 0x8000_4000;
+        const OUTPUT_CELL_VA: u32 = 0x8000_4004;
+
+        let first_payload = b"first ordered stream".to_vec();
+        let second_payload = b"second ordered stream with a different length".to_vec();
+        let first_source = stored_stream(&first_payload);
+        let second_source = stored_stream(&second_payload);
+        let source = [first_source.as_slice(), second_source.as_slice()].concat();
+        let expected_output = [first_payload.as_slice(), second_payload.as_slice()].concat();
+        let rom_offset = 0x80usize;
+        let mut rom_bytes = vec![0; (rom_offset + source.len() + 3) & !3];
+        rom_bytes[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        rom_bytes[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        rom_bytes[rom_offset..rom_offset + source.len()].copy_from_slice(&source);
+        let rom = normalize(&rom_bytes).unwrap();
+        let evaluation = evaluate_materialized_image_v1(
+            &rom,
+            &FactDb::new(),
+            &MaterializedImageSourceV1 {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: rom_offset as u32,
+                rom_end: rom_offset as u32 + source.len() as u32,
+                cursor: 0,
+            },
+            &MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 2 },
+            MaterializedImageLimitsV1::default(),
+        )
+        .unwrap();
+        let code = pointer_cell_copy_wrapper();
+        let first_seeds = [
+            GprSeedV1 {
+                register: 6,
+                value: first_payload.len() as u64,
+            },
+            GprSeedV1 {
+                register: 7,
+                value: 11,
+            },
+        ];
+        let second_seeds = [
+            GprSeedV1 {
+                register: 6,
+                value: second_payload.len() as u64,
+            },
+            GprSeedV1 {
+                register: 7,
+                value: 11,
+            },
+        ];
+        let first_source_after = (SOURCE_VA + first_source.len() as u32).to_be_bytes();
+        let first_output_after = (OUTPUT_VA + first_payload.len() as u32).to_be_bytes();
+        let final_source_after = (SOURCE_VA + source.len() as u32).to_be_bytes();
+        let final_output_after = (OUTPUT_VA + expected_output.len() as u32).to_be_bytes();
+        let first_expected_mutable = [
+            CommittedMemoryRangeV1 {
+                role: "source_cursor",
+                physical_start: SOURCE_CELL_PA,
+                bytes: &first_source_after,
+            },
+            CommittedMemoryRangeV1 {
+                role: "output_cursor",
+                physical_start: OUTPUT_CELL_PA,
+                bytes: &first_output_after,
+            },
+        ];
+        let second_expected_mutable = [
+            CommittedMemoryRangeV1 {
+                role: "source_cursor",
+                physical_start: SOURCE_CELL_PA,
+                bytes: &final_source_after,
+            },
+            CommittedMemoryRangeV1 {
+                role: "output_cursor",
+                physical_start: OUTPUT_CELL_PA,
+                bytes: &final_output_after,
+            },
+        ];
+        let steps = [
+            TransformInvocationStepRequestV1 {
+                entry_pc: CODE_VA,
+                return_pc: RETURN_PC,
+                a0: SOURCE_CELL_VA,
+                a1: OUTPUT_CELL_VA,
+                additional_gpr_seeds: &first_seeds,
+                expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 0 },
+                expected_mutable_memory_after: &first_expected_mutable,
+            },
+            TransformInvocationStepRequestV1 {
+                entry_pc: CODE_VA,
+                return_pc: RETURN_PC,
+                a0: SOURCE_CELL_VA,
+                a1: OUTPUT_CELL_VA,
+                additional_gpr_seeds: &second_seeds,
+                expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 1 },
+                expected_mutable_memory_after: &second_expected_mutable,
+            },
+        ];
+        let source_cell_initial = SOURCE_VA.to_be_bytes();
+        let output_cell_initial = OUTPUT_VA.to_be_bytes();
+        let mutable = [
+            SharedMutableMemoryRangeV1 {
+                role: "source_cursor",
+                physical_start: SOURCE_CELL_PA,
+                initial_bytes: &source_cell_initial,
+            },
+            SharedMutableMemoryRangeV1 {
+                role: "output_cursor",
+                physical_start: OUTPUT_CELL_PA,
+                initial_bytes: &output_cell_initial,
+            },
+        ];
+        let request = TransformInvocationSequenceRequestV1 {
+            steps: &steps,
+            code: KnownTransformCodeImageV1 {
+                virtual_start: CODE_VA,
+                physical_start: CODE_PA,
+                bytes: &code,
+            },
+            source_physical_start: SOURCE_PA,
+            output_physical_start: OUTPUT_PA,
+            committed_memory: &[],
+            shared_mutable_memory: &mutable,
+            additional_allowed_writes: &[],
+        };
+
+        let result = certify_transform_invocation_sequence_v1(
+            &rom,
+            &FactDb::new(),
+            evaluation.receipt(),
+            &request,
+            TransformInvocationLimitsV1::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.output(), expected_output);
+        assert_eq!(result.certificate().steps.len(), 2);
+        assert_eq!(
+            result.certificate().executed_units,
+            result
+                .certificate()
+                .steps
+                .iter()
+                .map(|step| step.units.len() as u32)
+                .sum::<u32>()
+        );
+        assert_eq!(
+            result.certificate().retired_instructions,
+            result
+                .certificate()
+                .steps
+                .iter()
+                .map(|step| step.retired_instructions)
+                .sum::<u32>()
+        );
+        let first_source_end = SOURCE_VA + first_source.len() as u32;
+        let final_source_end = SOURCE_VA + source.len() as u32;
+        let first_output_end = OUTPUT_VA + first_payload.len() as u32;
+        let final_output_end = OUTPUT_VA + expected_output.len() as u32;
+        let source_commitment = |value: u32| sha256(&value.to_be_bytes());
+        let commitment_for = |commitments: &[ContentCommitmentV1], role: &str| {
+            commitments
+                .iter()
+                .find(|commitment| commitment.role == role)
+                .unwrap()
+                .sha256
+                .clone()
+        };
+        let first = &result.certificate().steps[0];
+        let second = &result.certificate().steps[1];
+        assert_eq!(
+            commitment_for(&first.mutable_memory_before, "source_cursor"),
+            source_commitment(SOURCE_VA)
+        );
+        assert_eq!(
+            commitment_for(&first.mutable_memory_after, "source_cursor"),
+            source_commitment(first_source_end)
+        );
+        assert_eq!(
+            first.mutable_memory_after, second.mutable_memory_before,
+            "the second call must consume the first call's exact mutable state"
+        );
+        assert_eq!(
+            commitment_for(&second.mutable_memory_after, "source_cursor"),
+            source_commitment(final_source_end)
+        );
+        assert_eq!(
+            commitment_for(&first.mutable_memory_after, "output_cursor"),
+            source_commitment(first_output_end)
+        );
+        assert_eq!(
+            commitment_for(&second.mutable_memory_after, "output_cursor"),
+            source_commitment(final_output_end)
+        );
+        assert_eq!(
+            transform_invocation_sequence_certificate_sha256_v1(result.certificate()),
+            "3171969d740169ce789ec740b75d6dddb60eb47ace6fc6a1fbfc711f5e6679a1"
+        );
+        let repeated = certify_transform_invocation_sequence_v1(
+            &rom,
+            &FactDb::new(),
+            evaluation.receipt(),
+            &request,
+            TransformInvocationLimitsV1::default(),
+        )
+        .unwrap();
+        assert_eq!(repeated.certificate(), result.certificate());
+
+        let mut exact_unit_bound = TransformInvocationLimitsV1::default();
+        exact_unit_bound.max_units = result.certificate().executed_units;
+        assert!(certify_transform_invocation_sequence_v1(
+            &rom,
+            &FactDb::new(),
+            evaluation.receipt(),
+            &request,
+            exact_unit_bound,
+        )
+        .is_ok());
+        exact_unit_bound.max_units -= 1;
+        assert_eq!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &request,
+                exact_unit_bound,
+            ),
+            Err(TransformInvocationErrorV1::UnitLimitExceeded)
+        );
+
+        let mut bounded = TransformInvocationLimitsV1::default();
+        bounded.max_instructions = result.certificate().retired_instructions - 1;
+        assert_eq!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &request,
+                bounded,
+            ),
+            Err(TransformInvocationErrorV1::InstructionLimitExceeded)
+        );
+
+        let wrong_final_output_after = (final_output_end + 1).to_be_bytes();
+        let wrong_second_expected = [
+            CommittedMemoryRangeV1 {
+                role: "source_cursor",
+                physical_start: SOURCE_CELL_PA,
+                bytes: &final_source_after,
+            },
+            CommittedMemoryRangeV1 {
+                role: "output_cursor",
+                physical_start: OUTPUT_CELL_PA,
+                bytes: &wrong_final_output_after,
+            },
+        ];
+        let wrong_steps = [
+            steps[0].clone(),
+            TransformInvocationStepRequestV1 {
+                expected_mutable_memory_after: &wrong_second_expected,
+                ..steps[1].clone()
+            },
+        ];
+        let wrong_mutable = TransformInvocationSequenceRequestV1 {
+            steps: &wrong_steps,
+            ..request.clone()
+        };
+        assert_eq!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &wrong_mutable,
+                TransformInvocationLimitsV1::default(),
+            ),
+            Err(TransformInvocationErrorV1::MutableMemoryMismatch {
+                ordinal: 1,
+                role: "output_cursor".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn sequence_rejects_missing_reordered_and_cross_stream_writes() {
+        let first_payload = b"first stream".to_vec();
+        let second_payload = b"second stream".to_vec();
+        let first_source = stored_stream(&first_payload);
+        let second_source = stored_stream(&second_payload);
+        let source = [first_source.as_slice(), second_source.as_slice()].concat();
+        let rom_offset = 0x80usize;
+        let mut rom_bytes = vec![0; (rom_offset + source.len() + 3) & !3];
+        rom_bytes[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        rom_bytes[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        rom_bytes[rom_offset..rom_offset + source.len()].copy_from_slice(&source);
+        let rom = normalize(&rom_bytes).unwrap();
+        let evaluation = evaluate_materialized_image_v1(
+            &rom,
+            &FactDb::new(),
+            &MaterializedImageSourceV1 {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: rom_offset as u32,
+                rom_end: rom_offset as u32 + source.len() as u32,
+                cursor: 0,
+            },
+            &MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 2 },
+            MaterializedImageLimitsV1::default(),
+        )
+        .unwrap();
+        let code = pointer_cell_copy_wrapper();
+        let seeds = [
+            GprSeedV1 {
+                register: 6,
+                value: first_payload.len() as u64,
+            },
+            GprSeedV1 {
+                register: 7,
+                value: 11,
+            },
+        ];
+        let first_source_after = (SOURCE_VA + first_source.len() as u32).to_be_bytes();
+        let first_output_after = (OUTPUT_VA + first_payload.len() as u32).to_be_bytes();
+        let first_expected_mutable = [
+            CommittedMemoryRangeV1 {
+                role: "source_cursor",
+                physical_start: 0x4000,
+                bytes: &first_source_after,
+            },
+            CommittedMemoryRangeV1 {
+                role: "output_cursor",
+                physical_start: 0x4004,
+                bytes: &first_output_after,
+            },
+        ];
+        let first = TransformInvocationStepRequestV1 {
+            entry_pc: CODE_VA,
+            return_pc: RETURN_PC,
+            a0: 0x8000_4000,
+            a1: 0x8000_4004,
+            additional_gpr_seeds: &seeds,
+            expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 0 },
+            expected_mutable_memory_after: &first_expected_mutable,
+        };
+        let source_cell = SOURCE_VA.to_be_bytes();
+        let output_cell = OUTPUT_VA.to_be_bytes();
+        let mutable = [
+            SharedMutableMemoryRangeV1 {
+                role: "source_cursor",
+                physical_start: 0x4000,
+                initial_bytes: &source_cell,
+            },
+            SharedMutableMemoryRangeV1 {
+                role: "output_cursor",
+                physical_start: 0x4004,
+                initial_bytes: &output_cell,
+            },
+        ];
+        let one_step = [first.clone()];
+        let missing = TransformInvocationSequenceRequestV1 {
+            steps: &one_step,
+            code: KnownTransformCodeImageV1 {
+                virtual_start: CODE_VA,
+                physical_start: CODE_PA,
+                bytes: &code,
+            },
+            source_physical_start: SOURCE_PA,
+            output_physical_start: OUTPUT_PA,
+            committed_memory: &[],
+            shared_mutable_memory: &mutable,
+            additional_allowed_writes: &[],
+        };
+        assert!(matches!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &missing,
+                TransformInvocationLimitsV1::default(),
+            ),
+            Err(TransformInvocationErrorV1::InvalidInput(_))
+        ));
+
+        let valid_ordinals = [
+            first.clone(),
+            TransformInvocationStepRequestV1 {
+                expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 1 },
+                ..first.clone()
+            },
+        ];
+        let output_alias = [PhysicalRangeV1 {
+            start: OUTPUT_PA,
+            len: (first_payload.len() + second_payload.len()) as u32,
+        }];
+        let aliased_output = TransformInvocationSequenceRequestV1 {
+            steps: &valid_ordinals,
+            additional_allowed_writes: &output_alias,
+            ..missing.clone()
+        };
+        assert!(matches!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &aliased_output,
+                TransformInvocationLimitsV1::default(),
+            ),
+            Err(TransformInvocationErrorV1::InvalidInput(_))
+        ));
+
+        let reordered_steps = [
+            TransformInvocationStepRequestV1 {
+                expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 1 },
+                ..first.clone()
+            },
+            TransformInvocationStepRequestV1 {
+                expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 0 },
+                ..first.clone()
+            },
+        ];
+        let reordered = TransformInvocationSequenceRequestV1 {
+            steps: &reordered_steps,
+            ..missing.clone()
+        };
+        assert!(matches!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &reordered,
+                TransformInvocationLimitsV1::default(),
+            ),
+            Err(TransformInvocationErrorV1::InvalidInput(_))
+        ));
+
+        let oversized_seeds = [
+            GprSeedV1 {
+                register: 6,
+                value: (first_payload.len() + 1) as u64,
+            },
+            GprSeedV1 {
+                register: 7,
+                value: 11,
+            },
+        ];
+        let crossing_steps = [
+            TransformInvocationStepRequestV1 {
+                additional_gpr_seeds: &oversized_seeds,
+                ..first.clone()
+            },
+            TransformInvocationStepRequestV1 {
+                additional_gpr_seeds: &seeds,
+                expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 1 },
+                ..first
+            },
+        ];
+        let crossing = TransformInvocationSequenceRequestV1 {
+            steps: &crossing_steps,
+            ..missing
+        };
+        assert!(matches!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &crossing,
+                TransformInvocationLimitsV1::default(),
+            ),
+            Err(TransformInvocationErrorV1::WriteOutsideAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn sequence_scratch_must_be_rewritten_before_a_later_step_reads_it() {
+        const SCRATCH_PA: u32 = 0x5000;
+        const SCRATCH_VA: u64 = 0x8000_5000;
+
+        let first_payload = b"first scratch stream".to_vec();
+        let second_payload = b"second scratch stream".to_vec();
+        let first_source = stored_stream(&first_payload);
+        let second_source = stored_stream(&second_payload);
+        let source = [first_source.as_slice(), second_source.as_slice()].concat();
+        let rom_offset = 0x80usize;
+        let mut rom_bytes = vec![0; (rom_offset + source.len() + 3) & !3];
+        rom_bytes[..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        rom_bytes[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        rom_bytes[rom_offset..rom_offset + source.len()].copy_from_slice(&source);
+        let rom = normalize(&rom_bytes).unwrap();
+        let evaluation = evaluate_materialized_image_v1(
+            &rom,
+            &FactDb::new(),
+            &MaterializedImageSourceV1 {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: rom_offset as u32,
+                rom_end: rom_offset as u32 + source.len() as u32,
+                cursor: 0,
+            },
+            &MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 2 },
+            MaterializedImageLimitsV1::default(),
+        )
+        .unwrap();
+
+        let first_code = prefixed_copy_wrapper(
+            &[i(0x28, 12, 11, 0)], // sb t3,0(t4)
+            first_payload.len(),
+        );
+        let second_read_code = prefixed_copy_wrapper(
+            &[i(0x24, 12, 11, 0)], // lbu t3,0(t4)
+            second_payload.len(),
+        );
+        let second_rewrite_code = prefixed_copy_wrapper(
+            &[
+                i(0x28, 12, 11, 0), // sb t3,0(t4)
+                i(0x24, 12, 11, 0), // lbu t3,0(t4)
+            ],
+            second_payload.len(),
+        );
+        let second_read_entry = CODE_VA + first_code.len() as u32;
+        let second_rewrite_entry = second_read_entry + second_read_code.len() as u32;
+        let code = [
+            first_code.as_slice(),
+            second_read_code.as_slice(),
+            second_rewrite_code.as_slice(),
+        ]
+        .concat();
+        let scratch_seeds = [
+            GprSeedV1 {
+                register: 11,
+                value: 0xa5,
+            },
+            GprSeedV1 {
+                register: 12,
+                value: SCRATCH_VA,
+            },
+        ];
+        let steps_for = |second_entry| {
+            [
+                TransformInvocationStepRequestV1 {
+                    entry_pc: CODE_VA,
+                    return_pc: RETURN_PC,
+                    a0: SOURCE_VA + 11,
+                    a1: OUTPUT_VA,
+                    additional_gpr_seeds: &scratch_seeds,
+                    expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 0 },
+                    expected_mutable_memory_after: &[],
+                },
+                TransformInvocationStepRequestV1 {
+                    entry_pc: second_entry,
+                    return_pc: RETURN_PC,
+                    a0: SOURCE_VA + first_source.len() as u32 + 11,
+                    a1: OUTPUT_VA + first_payload.len() as u32,
+                    additional_gpr_seeds: &scratch_seeds,
+                    expected_output: ExpectedEvaluatedOutputV1::Stream { ordinal: 1 },
+                    expected_mutable_memory_after: &[],
+                },
+            ]
+        };
+        let scratch = [PhysicalRangeV1 {
+            start: SCRATCH_PA,
+            len: 1,
+        }];
+        let make_request = |steps| TransformInvocationSequenceRequestV1 {
+            steps,
+            code: KnownTransformCodeImageV1 {
+                virtual_start: CODE_VA,
+                physical_start: CODE_PA,
+                bytes: &code,
+            },
+            source_physical_start: SOURCE_PA,
+            output_physical_start: OUTPUT_PA,
+            committed_memory: &[],
+            shared_mutable_memory: &[],
+            additional_allowed_writes: &scratch,
+        };
+
+        let read_before_rewrite = steps_for(second_read_entry);
+        assert_eq!(
+            certify_transform_invocation_sequence_v1(
+                &rom,
+                &FactDb::new(),
+                evaluation.receipt(),
+                &make_request(&read_before_rewrite),
+                TransformInvocationLimitsV1::default(),
+            ),
+            Err(TransformInvocationErrorV1::ReadOutsideCommitted {
+                physical_offset: SCRATCH_PA,
+                len: 1,
+            })
+        );
+
+        let rewrite_before_read = steps_for(second_rewrite_entry);
+        assert!(certify_transform_invocation_sequence_v1(
+            &rom,
+            &FactDb::new(),
+            evaluation.receipt(),
+            &make_request(&rewrite_before_read),
+            TransformInvocationLimitsV1::default(),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn unseeded_register_dependency_is_rejected() {
         let (rom, receipt, _source, payload) = fixture();
         let mut code = copy_wrapper(payload.len());
@@ -1288,6 +2551,44 @@ mod tests {
             ),
             Err(TransformInvocationErrorV1::ReadOutsideCommitted { .. })
         ));
+    }
+
+    #[test]
+    fn adjacent_commitments_cover_one_boundary_spanning_read() {
+        let (rom, receipt, _source, payload) = fixture();
+        let mut code = i(0x23, 10, 8, 0).to_be_bytes().to_vec(); // lw t0,0(t2)
+        code.extend(copy_wrapper(payload.len()));
+        let left = [1u8, 2];
+        let right = [3u8, 4];
+        let committed = [
+            CommittedMemoryRangeV1 {
+                role: "left_half",
+                physical_start: 0x7000,
+                bytes: &left,
+            },
+            CommittedMemoryRangeV1 {
+                role: "right_half",
+                physical_start: 0x7002,
+                bytes: &right,
+            },
+        ];
+        let seeds = [GprSeedV1 {
+            register: 10,
+            value: 0x8000_7000,
+        }];
+        let zeros = vec![0; payload.len()];
+        let mut request = request(&code, &zeros);
+        request.committed_memory = &committed;
+        request.additional_gpr_seeds = &seeds;
+
+        assert!(certify_transform_wrapper_invocation_v1(
+            &rom,
+            &FactDb::new(),
+            &receipt,
+            &request,
+            TransformInvocationLimitsV1::default(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1391,6 +2692,51 @@ mod tests {
             ),
             Err(TransformInvocationErrorV1::UnsupportedInstruction { .. })
         ));
+    }
+
+    #[test]
+    fn branch_likely_register_dependencies_are_audited() {
+        let (rom, receipt, _source, payload) = fixture();
+        let mut code = copy_wrapper(payload.len());
+        code[6 * 4..7 * 4].copy_from_slice(&i(0x15, 9, 0, -6).to_be_bytes()); // bnel
+        let zeros = vec![0; payload.len()];
+        assert!(certify_transform_wrapper_invocation_v1(
+            &rom,
+            &FactDb::new(),
+            &receipt,
+            &request(&code, &zeros),
+            TransformInvocationLimitsV1::default(),
+        )
+        .is_ok());
+
+        code[6 * 4..7 * 4].copy_from_slice(&i(0x15, 10, 0, -6).to_be_bytes());
+        assert!(matches!(
+            certify_transform_wrapper_invocation_v1(
+                &rom,
+                &FactDb::new(),
+                &receipt,
+                &request(&code, &zeros),
+                TransformInvocationLimitsV1::default(),
+            ),
+            Err(TransformInvocationErrorV1::UnseededRegisterRead { register: 10, .. })
+        ));
+
+        let mut annulled = [
+            i(0x15, 0, 0, 1),  // bnel zero,zero,+1: not taken
+            i(0x23, 10, 8, 0), // lw t0,0(t2): annulled, t2 is unseeded
+        ]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect::<Vec<_>>();
+        annulled.extend(copy_wrapper(payload.len()));
+        assert!(certify_transform_wrapper_invocation_v1(
+            &rom,
+            &FactDb::new(),
+            &receipt,
+            &request(&annulled, &zeros),
+            TransformInvocationLimitsV1::default(),
+        )
+        .is_ok());
     }
 
     #[test]

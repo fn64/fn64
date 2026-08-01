@@ -634,9 +634,22 @@ and output. It does not conclude a fact or prove general transform semantics,
 boot reachability, runtime placement, or release authority; unsupported CPU
 state, unseeded-register dependencies, uncommitted reads, writes outside the
 declared destination/scratch ranges, and partial unaligned stores all reject
-the invocation. Multiple per-stream certificates do not by themselves prove
-their runtime ordering or shared pointer-cell evolution; that requires a later
-composition certificate over an ordered sequence in one shared machine.
+the invocation. The sequence form requires exactly one declared call per
+receipt stream in ordinal order and executes every call in one shared fresh
+RDRAM machine. Each call gets a new explicitly seeded CPU context, may write
+only its selected stream plus declared shared mutable/scratch ranges, and must
+fully replace that stream's poison with the exact re-derived bytes. Per-step
+pre/post commitments bind shared pointer-cell evolution, and each post-state
+must equal the caller-declared bytes. Cumulative unit and instruction limits
+cover the complete sequence rather than resetting at call boundaries. Scratch
+cannot overlap committed, shared, code, source, or aggregate-output memory and
+loses read authority at each call boundary, so only explicitly committed
+mutable ranges and already-certified earlier output streams can carry
+cross-call dependencies. Only RDRAM and the linked unit catalog persist:
+registers, HI/LO, and COP0 state do not, and intervening caller instructions
+are not executed. This proves the declared ordering and shared state for that
+exact content-bound sequence; it does not prove call sites, their intervening
+corridor, or that boot selects the calls.
 The serialized certificate is replay evidence, not an authority capability;
 authority consumers must retain the opaque evaluation or re-run the exact
 content-bound request. Caller-declared scratch ranges and code bytes remain
