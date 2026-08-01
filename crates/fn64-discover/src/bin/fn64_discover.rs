@@ -365,6 +365,69 @@ fn diagnose_boot_tlb_alias(mut args: impl Iterator<Item = OsString>) -> Result<S
     .map_err(|error| format!("serializing boot-TLB receipt: {error}"))
 }
 
+/// Compose the prepared banks and report coverage including Phase 5 owner
+/// proof, plus the aggregated blocker histogram.
+///
+/// `coverage::report` hardcodes `not_run` because owner proof is a
+/// snapshot-composition product; only `report_with_owner_proofs` reports a
+/// measured assessment. Composition is the same path `study-layout` uses, so
+/// this reports what that path would, without needing an answer key.
+fn compose_owner_proofs(
+    rom: &fn64_discover::rom::NormalizedRom,
+    facts: &fn64_discover::facts::FactDb,
+) -> Result<
+    (
+        fn64_discover::coverage::CoverageReport,
+        Vec<fn64_discover::snapshot::OwnerBlockerSummary>,
+    ),
+    String,
+> {
+    // Default bounds throughout: this is a measurement path, and the limits
+    // types already carry the production envelopes.
+    let prepared = fn64_discover::snapshot_inputs::prepare_snapshot_banks_with_limits(
+        rom,
+        facts,
+        fn64_discover::snapshot_inputs::PrepareSnapshotBanksLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let inputs = prepared.materialized_inputs();
+    let composed = fn64_discover::snapshot::compose_materialized_banks_validated_v2_with_limits(
+        rom,
+        facts,
+        &inputs,
+        fn64_discover::snapshot::MultiBankCompositionLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut reports = Vec::new();
+    let mut blockers: Vec<fn64_discover::snapshot::OwnerBlockerSummary> = Vec::new();
+    let mut composed_facts = None;
+    for snapshot in composed.snapshots() {
+        composed_facts = Some(snapshot.facts.clone());
+        for bank in &snapshot.banks {
+            reports.push(bank.owner_proof.clone());
+            for summary in &bank.blocker_histogram {
+                match blockers.iter_mut().find(|held| held.kind == summary.kind) {
+                    Some(held) => {
+                        held.affected_assessments += summary.affected_assessments;
+                        held.occurrences += summary.occurrences;
+                    }
+                    None => blockers.push(summary.clone()),
+                }
+            }
+        }
+    }
+    let facts_for_coverage = composed_facts.as_ref().unwrap_or(facts);
+    let coverage = fn64_discover::coverage::report_with_owner_proofs(
+        rom.len(),
+        facts_for_coverage,
+        &reports,
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    blockers.sort_by(|a, b| b.occurrences.cmp(&a.occurrences).then(a.kind.cmp(&b.kind)));
+    Ok((coverage, blockers))
+}
+
 fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
     let rom_path = PathBuf::from(
         args.next()
@@ -688,6 +751,7 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
     let mut evidence_path = None;
     let mut output_path = None;
     let mut summary_only = false;
+    let mut prove_owners = false;
     let mut trace_paths = Vec::new();
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -708,6 +772,12 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
                     return Err("--summary may be supplied exactly once".to_string());
                 }
                 summary_only = true;
+            }
+            Some("--prove-owners") => {
+                if prove_owners {
+                    return Err("--prove-owners may be supplied exactly once".to_string());
+                }
+                prove_owners = true;
             }
             Some("--trace") => {
                 trace_paths.push(PathBuf::from(
@@ -806,7 +876,40 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         }
         observed_load_images.push(fold);
     }
-    let coverage = fn64_discover::coverage::report(rom.len(), &facts);
+    // Phase 5 owner proof runs only under snapshot composition, so the plain
+    // discovery path reports `not_run` rather than a measured owner count.
+    // `--prove-owners` composes the prepared banks and reports the real
+    // assessment plus the blocker histogram, which is the per-ROM accounting
+    // of *why* extents stay unproven. Composition is materially more
+    // expensive than discovery, so it stays opt-in.
+    let (coverage, owner_blockers) = if prove_owners {
+        match compose_owner_proofs(&rom, &facts) {
+            Ok((composed_coverage, blockers)) => (composed_coverage, Some(blockers)),
+            Err(error) => {
+                // A composition failure is a measurement outcome, not a
+                // discovery failure: report it and keep the unproven coverage
+                // rather than discarding the whole run.
+                eprintln!("owner proof unavailable: {error}");
+                (fn64_discover::coverage::report(rom.len(), &facts), None)
+            }
+        }
+    } else {
+        (fn64_discover::coverage::report(rom.len(), &facts), None)
+    };
+    if let Some(blockers) = &owner_blockers {
+        // The per-ROM accounting of why extents stay unproven. Printed to
+        // stderr so the summary receipt on stdout keeps its exact shape.
+        if blockers.is_empty() {
+            eprintln!("owner_blockers: none");
+        } else {
+            for summary in blockers {
+                eprintln!(
+                    "owner_blocker {:?} assessments={} occurrences={}",
+                    summary.kind, summary.affected_assessments, summary.occurrences
+                );
+            }
+        }
+    }
     if summary_only {
         let summary = DiscoverySummary {
             // v1 is intentionally an observation-only, path-free fast-loop
@@ -1106,7 +1209,7 @@ fn lowercase_hex(bytes: [u8; 32]) -> String {
 
 fn usage() -> String {
     format!(
-        "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--summary | --out facts.json]\n       fn64-discover study-layout <rom> <dump.toml>\n       {}",
+        "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--prove-owners] [--summary | --out facts.json]\n       fn64-discover study-layout <rom> <dump.toml>\n       {}",
         emit_block_program_usage()
     )
 }

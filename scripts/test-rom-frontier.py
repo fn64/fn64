@@ -178,6 +178,24 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(rows[0]["proven_target_share"], 0.0)
 
 
+class ParallelismTests(unittest.TestCase):
+    def test_summaries_key_on_digest_so_completion_order_cannot_reorder_output(self) -> None:
+        # Discovery fans out across cores, so results arrive in completion
+        # order rather than ROM order. Rows are keyed by normalized digest and
+        # the join walks the catalog, so output order follows the catalog and
+        # is unaffected by which subprocess finishes first.
+        catalog = [
+            catalog_record(normalized_rom_sha256="a" * 64, internal_name="FIRST"),
+            catalog_record(normalized_rom_sha256="b" * 64, internal_name="SECOND"),
+        ]
+        forward = {"a" * 64: summary("a" * 64), "b" * 64: summary("b" * 64)}
+        reversed_completion = {"b" * 64: summary("b" * 64), "a" * 64: summary("a" * 64)}
+        self.assertEqual(
+            [row["internal_name"] for row in FRONTIER.join(catalog, forward)],
+            [row["internal_name"] for row in FRONTIER.join(catalog, reversed_completion)],
+        )
+
+
 class CatalogLoadTests(unittest.TestCase):
     def test_wrong_schema_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
