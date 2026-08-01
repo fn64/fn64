@@ -121,6 +121,9 @@
 //!   fallback), admitted only on a unique dominating winner, then surfaces the
 //!   gp-relative data accesses `xref.rs` cannot see. Emitted xref sites are
 //!   candidate evidence; the admitted base is a typed program-level fact.
+//! - [`headered_raw_deflate`]: bounded candidate-only materialization of an
+//!   explicitly addressed sequence of `0x1172`, big-endian-length, raw-DEFLATE
+//!   streams. Successful decoding proves bytes, not runtime placement or use.
 //! - [`homology`]: bounded relocation-masked cross-ROM n-gram lookup with
 //!   collision-safe full-body validation and explicit ambiguous/unmatched
 //!   results. Homology emits candidates only.
@@ -218,6 +221,7 @@ pub mod grade_nwxe_functions;
 pub mod grade_oot;
 pub mod grade_oot_functions;
 pub mod harvest;
+pub mod headered_raw_deflate;
 pub mod headless;
 pub mod homology;
 pub mod host_bindings;
