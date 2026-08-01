@@ -75,6 +75,13 @@
 //! - [`stage1_effects`]: conservative syntactic COP0/cache/trap and constant-
 //!   address memory-effect inventory over authority-reached code. It is an
 //!   explicit negative classifier, not a general purity theorem.
+//! - [`boot_tlb_alias`]: fail-closed boot TLB diagnostics that reuse the
+//!   execution runtime's translator and intersect only proven physical bytes;
+//!   diagnostics do not mint mappings or mutate discovery authority.
+//! - [`program_transfer_index`]: deterministic forward/reverse intra-bank CFG
+//!   and exact cross-bank call edges plus exact-owner caller/callee projections
+//!   over validated composed snapshots; open and candidate evidence cannot
+//!   enter the index.
 //! - [`partition`]: Phase 5, recursive-descent owner partitioning of a
 //!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
 //!   bank, ambiguous claims and unowned blocks reported explicitly rather
@@ -180,6 +187,7 @@ pub mod asm_emit;
 pub mod banks;
 pub mod block_pack;
 pub mod block_proof;
+pub mod boot_tlb_alias;
 pub mod boundaries;
 pub mod callback_flow;
 pub mod callgraph_match;
