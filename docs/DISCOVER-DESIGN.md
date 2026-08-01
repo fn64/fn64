@@ -470,31 +470,43 @@ conclusion cannot seed traversal. Conservative bank-count, decoded retained-
 byte, source, evaluator-output, stream-count, and complete decoded-VROM-file
 limits are checked before or during their bounded materialization.
 
-The preparation boundary is ahead of the current snapshot wire: the existing
-composer and snapshot-workspace schema still require affine ROM coordinates
-and reject evaluated-image backing. No materialized bank is assigned a fake
-ROM offset while that schema migration remains open.
+Snapshot wire V6 carries the selected bank image as a tagged
+`BankBackingSpanV1`: either affine Physical/VROM coordinates or an evaluated-
+image receipt digest plus output-relative offsets. Composition re-resolves
+that span from the projected facts and re-verifies the supplied bytes before
+analysis. V5 is an affine-only historical wire and is not upgraded into V6
+authority; its inputs must be composed again to produce a current snapshot.
+The core snapshot-workspace receipt type can validate either V6 backing, but
+`produce_snapshot_workspace` remains a ROM-only publisher and rejects a
+prepared evaluated image. `stage_snapshot_bank` is likewise an explicitly
+affine-only external-tool bridge because its output contract requires ROM
+coordinates. Neither tool assigns evaluated output a fake ROM offset.
 
-`fn64-discover::snapshot::compose_materialized_bank_v1` is the first thin
-composition boundary over the existing passes. V1 accepts one resident,
-physical-ROM-backed bank, verifies its bytes against the normalized ROM and
-the unique proven mapping, then runs value-set closure, integrates direct and
-indirect transfer facts, partitions blocks, proves owners, and reports
-coverage from that same fact snapshot. It serializes geometry and a byte
-digest, never ROM content.
+`fn64-discover::snapshot::compose_materialized_bank_v1` retains its historical
+Rust name but emits snapshot wire V6. It accepts one byte-verified bank backed
+by either an affine Physical/VROM span or an exactly re-derived evaluated-
+image span, then runs value-set closure, integrates direct and indirect
+transfer facts, partitions blocks, proves owners, and reports coverage from
+that same fact snapshot. It serializes tagged geometry and a byte digest,
+never ROM content.
 
 The snapshot also carries the separate `block_proof` view. This admits
-ROM-backed blocks reached from authoritative entries without claiming a
-contiguous historical function or a global executable section. It is the
-typed input for `BlockPackV1`, not a shortcut around exact owner proof. The
-portable pack contains bank/content identities, block geometry, terminators,
-and digests but no ROM words. Materialization re-verifies the normalized ROM
-and each block digest before exposing words in memory. Its adapter preserves
-the disjoint spans when invoking the typed sparse arbitrary-PC emitter: a data
-gap never becomes executable from the bank's bounding interval, and a static
-or computed transfer into that gap returns to mapping resolution. The real
-NWXE gate emits 197 blocks / 1,039 words and requires the generated Rust to
-compile.
+image-backed blocks reached from authoritative entries without claiming a
+contiguous historical function or a global executable section. Both
+`ReachableCodeBlock` and `ExactFunctionOwner` retain the exact tagged backing
+subspan; evaluated output offsets are not represented as cartridge addresses.
+Block proof is the typed input for `BlockPackV1`, not a shortcut around exact
+owner proof. Pack wire V3 contains bank/content identities, block geometry,
+tagged backing, terminators, and digests but no ROM words. Materialization
+re-verifies the normalized ROM, re-derives each distinct evaluated-image
+receipt under fixed resource bounds, and verifies each block digest before
+exposing words in memory. Legacy V1 physical and V2 affine Physical/VROM packs
+remain readable and are validated under their original restrictions; they do
+not carry evaluated-image backing. The adapter preserves disjoint spans when
+invoking the typed sparse arbitrary-PC emitter: a data gap never becomes
+executable from the bank's bounding interval, and a static or computed
+transfer into that gap returns to mapping resolution. The real NWXE gate
+emits 197 blocks / 1,039 words and requires the generated Rust to compile.
 
 `block_pack::emit_block_program_source` is the reusable pack-to-execution
 boundary. It re-materializes the pack against the normalized ROM and requires
@@ -529,21 +541,14 @@ also reports how many assessments have no other blocker, so a pass can be
 prioritized by its immediate exact-owner payoff.
 
 **Correction:** this section previously claimed virtual/compressed backing
-was rejected in V1 pending a proof-carrying materialization transform. That
-claim is retracted — the transform exists and is wired in. Virtual (VROM)
-and Yaz0-compressed backing are accepted, not rejected, provided they carry
-that proof: `snapshot::compose_materialized_bank_v1` resolves a bank's bytes
-through `banks::materialize_rom_range`
-(`crates/fn64-discover/src/snapshot.rs:472`), which for a VROM range
-requires exactly one proven `LoadImageTableRecord` file-table mapping
-(`crates/fn64-discover/src/banks.rs:625-652`) and, when the mapped file
-starts with a `Yaz0` header, decodes it with a bounded decoder that verifies
-the stream's declared output length against the VROM interval before
-trusting any byte (`banks.rs:664-674`, decoder at `banks.rs:1319-1370`). An
-unproven VROM range (zero or more than one candidate mapping) or a
-non-Yaz0 file whose length disagrees with the VROM interval is still
-rejected loudly rather than silently materializing unverified bytes — that
-part of the original rationale still holds.
+was rejected pending a proof-carrying materialization transform. That claim
+is retracted. Affine VROM/Yaz0 backing is resolved through the bounded ROM
+range materializer and requires exactly one proven `LoadImageTableRecord`.
+Evaluator-produced backing is independently re-derived from its typed receipt
+through `materialized_image::rederive_materialized_image_v1`; its source may
+itself use the same proven VROM resolver. Missing or competing file records,
+receipt disagreement, decoded-length disagreement, and resource-limit failures
+all reject the bank rather than materializing unverified bytes.
 
 The boot bank's effective entry is a typed, authoritative
 `HardwareEntrypoint` / `RomHeaderEntrypoint` claim only when an exact admitted
@@ -995,7 +1000,7 @@ syncs the source beside the destination. Publication is an atomic no-clobber
 hard link; an existing output is never replaced. Success prints the exact byte
 count and SHA-256 receipt without printing the generated source.
 This file-intake command proves pack/ROM integrity, not discovery derivation:
-project gates obtain schema-v2 packs only from the in-process move-only
+project gates obtain schema-v3 packs only from the in-process move-only
 validated snapshot composition rather than treating caller-authored snapshot
 JSON as root authority.
 

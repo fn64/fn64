@@ -13,7 +13,7 @@ use crate::resolve::build_cfg_value_set_closed;
 use crate::snapshot::ProgramSnapshotV1;
 use crate::tool_adapter::{Sha256Digest, ToolCandidateKind};
 use crate::tool_claims::{
-    bank_input_identity_v1, program_snapshot_sha256_v2, validate_tool_claim_set_v1, ToolClaimSetV1,
+    bank_input_identity_v1, program_snapshot_sha256_v3, validate_tool_claim_set_v1, ToolClaimSetV1,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -318,7 +318,7 @@ pub fn run_candidate_cfg_probe_v1_with_limits(
         schema: CANDIDATE_CFG_PROBE_SCHEMA.into(),
         schema_version: CANDIDATE_CFG_PROBE_SCHEMA_VERSION_V1,
         state,
-        program_snapshot_sha256: program_snapshot_sha256_v2(snapshot)
+        program_snapshot_sha256: program_snapshot_sha256_v3(snapshot)
             .map_err(|error| CandidateCfgProbeError::InvalidClaimSet(error.to_string()))?,
         tool_claim_set_sha256: Sha256Digest::of(&encoded_claims),
         bank: bank.into(),
@@ -359,7 +359,7 @@ mod tests {
         ToolRunRole,
     };
     use crate::tool_claims::{
-        bank_input_identity_v1, discovery_snapshot_lineage_v2, freeze_tool_claims_v1,
+        bank_input_identity_v1, discovery_snapshot_lineage_v3, freeze_tool_claims_v1,
     };
 
     const BANK: &str = crate::banks::BOOT_BANK;
@@ -444,7 +444,7 @@ mod tests {
         )
         .unwrap();
         let input = bank_input_identity_v1(&snapshot, BANK).unwrap();
-        let lineage = vec![discovery_snapshot_lineage_v2(&snapshot).unwrap()];
+        let lineage = vec![discovery_snapshot_lineage_v3(&snapshot).unwrap()];
         let role = ToolRunRole::FunctionBoundaryCandidates;
         let jsonl = export_complete_tool_jsonl(CompleteToolRun {
             tool: ToolIdentity {

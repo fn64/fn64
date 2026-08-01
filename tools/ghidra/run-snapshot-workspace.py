@@ -164,7 +164,7 @@ def hash_regular(
     except OSError as error:
         fail(f"cannot open {label}: {error}")
     artifact = hashlib.sha256()
-    semantic = hashlib.sha256(b"fn64.program-snapshot.v2\0") if program_wire else None
+    semantic = hashlib.sha256(b"fn64.program-snapshot.v3\0") if program_wire else None
     chunks = []
     measured = 0
     tail = b""
@@ -222,7 +222,7 @@ def validate_manifest(workspace: Path) -> tuple[bytes, str, dict, list[Bank]]:
         },
         "snapshot manifest",
     )
-    if top["schema"] != "fn64.snapshot-workspace" or type(top["schema_version"]) is not int or top["schema_version"] != 1:
+    if top["schema"] != "fn64.snapshot-workspace" or type(top["schema_version"]) is not int or top["schema_version"] != 4:
         fail("unsupported snapshot-workspace schema")
     rom_sha = digest(top["normalized_rom_sha256"], "normalized ROM digest")
     if top["intended_use"] != "candidate_ghidra_only":
@@ -236,11 +236,28 @@ def validate_manifest(workspace: Path) -> tuple[bytes, str, dict, list[Bank]]:
         fail("invalid discovery receipt")
     seen_strategies = set()
     for outcome in discovery["outcomes"]:
-        outcome = exact_fields(outcome, {"strategy", "candidate_tables", "admitted_tables", "admitted_intervals", "proven_mappings", "supported_mappings", "decoded_file_limit_hits"}, "strategy outcome")
+        outcome = exact_fields(
+            outcome,
+            {
+                "strategy", "candidate_tables", "admitted_tables", "admitted_intervals",
+                "proven_mappings", "supported_mappings", "decoded_file_limit_hits",
+                "request_dma_open_rows", "request_dma_incomplete",
+                "request_dma_input_limit_hit", "physical_wrapper_candidates_examined",
+                "wrapper_semantic_proof_unavailable",
+                "physical_wrapper_candidate_limit_hit",
+            },
+            "strategy outcome",
+        )
         if outcome["strategy"] not in strategies or outcome["strategy"] in seen_strategies:
             fail("invalid or duplicate discovery strategy")
         seen_strategies.add(outcome["strategy"])
-        for field in set(outcome) - {"strategy"}:
+        boolean_fields = {
+            "request_dma_incomplete", "request_dma_input_limit_hit",
+            "physical_wrapper_candidate_limit_hit",
+        }
+        if any(type(outcome[field]) is not bool for field in boolean_fields):
+            fail("strategy outcome has invalid boolean frontier")
+        for field in set(outcome) - {"strategy"} - boolean_fields:
             integer(outcome[field], f"strategy outcome {field}")
     if discovery["selected"] not in seen_strategies:
         fail("selected discovery strategy has no outcome")
@@ -259,10 +276,10 @@ def validate_manifest(workspace: Path) -> tuple[bytes, str, dict, list[Bank]]:
     }
     limits = exact_fields(top["limits"], set(expected_limits), "producer limits")
     if limits != expected_limits:
-        fail("snapshot workspace producer limits do not match v1")
+        fail("snapshot workspace producer limits do not match v4")
     wire = exact_fields(top["snapshot_wire"], {"schema_version", "authority", "duplicates_fact_db_per_bank", "remaining_large_rom_frontier"}, "snapshot wire")
-    if type(wire["schema_version"]) is not int or wire != {"schema_version": 3, "authority": "diagnostic_only", "duplicates_fact_db_per_bank": False, "remaining_large_rom_frontier": "streaming_v3"}:
-        fail("snapshot wire is not admitted projected diagnostic v3")
+    if type(wire["schema_version"]) is not int or wire != {"schema_version": 6, "authority": "diagnostic_only", "duplicates_fact_db_per_bank": False, "remaining_large_rom_frontier": "streaming_v6"}:
+        fail("snapshot wire is not admitted projected diagnostic v6")
 
     raw_banks = top["banks"]
     if not isinstance(raw_banks, list) or len(raw_banks) > MAX_BANKS:
@@ -284,7 +301,7 @@ def validate_manifest(workspace: Path) -> tuple[bytes, str, dict, list[Bank]]:
     previous_name = None
     expected_reserved = {"snapshot-workspace.json"}
     for index, raw in enumerate(raw_banks):
-        bank = exact_fields(raw, {"index", "bank", "rom_space", "rom_start", "rom_end", "va_start", "va_end", "byte_length", "backing_evidence_fact_indices", "bank_sha256", "bank_artifact", "snapshot_artifact", "snapshot_artifact_byte_length", "snapshot_artifact_sha256", "program_snapshot_sha256", "ghidra_seeds"}, f"bank {index}")
+        bank = exact_fields(raw, {"index", "bank", "backing", "va_start", "va_end", "byte_length", "backing_evidence_fact_indices", "bank_sha256", "bank_artifact", "snapshot_artifact", "snapshot_artifact_byte_length", "snapshot_artifact_sha256", "program_snapshot_sha256", "ghidra_seeds"}, f"bank {index}")
         if integer(bank["index"], f"bank {index} index") != index:
             fail("bank indices must be contiguous")
         name = bank["bank"]
@@ -293,10 +310,26 @@ def validate_manifest(workspace: Path) -> tuple[bytes, str, dict, list[Bank]]:
         if previous_name is not None and previous_name >= name:
             fail("bank names must be strictly sorted and unique")
         previous_name = name
-        if bank["rom_space"] not in {"Physical", "Virtual"}:
-            fail(f"bank {index} has invalid ROM space")
-        rom_start = integer(bank["rom_start"], f"bank {index} rom_start", 0xFFFF_FFFF)
-        rom_end = integer(bank["rom_end"], f"bank {index} rom_end", 0xFFFF_FFFF)
+        if not isinstance(bank["backing"], dict):
+            fail(f"bank {index} has invalid backing")
+        backing_kind = bank["backing"].get("kind")
+        if backing_kind == "materialized":
+            exact_fields(
+                bank["backing"],
+                {"kind", "receipt_sha256", "output_start", "output_end"},
+                f"bank {index} materialized backing",
+            )
+            fail(f"bank {index} materialized backing is unsupported by the affine-only Ghidra workspace runner")
+        backing = exact_fields(
+            bank["backing"],
+            {"kind", "rom_space", "rom_start", "rom_end"},
+            f"bank {index} affine backing",
+        )
+        if backing["kind"] != "rom_affine" or backing["rom_space"] not in {"Physical", "Virtual"}:
+            fail(f"bank {index} has invalid affine ROM backing")
+        rom_space = backing["rom_space"]
+        rom_start = integer(backing["rom_start"], f"bank {index} rom_start", 0xFFFF_FFFF)
+        rom_end = integer(backing["rom_end"], f"bank {index} rom_end", 0xFFFF_FFFF)
         va_start = integer(bank["va_start"], f"bank {index} va_start", 0xFFFF_FFFF)
         va_end = integer(bank["va_end"], f"bank {index} va_end", 0xFFFF_FFFF)
         length = integer(bank["byte_length"], f"bank {index} byte_length", MAX_BANK_BYTES)
@@ -305,7 +338,7 @@ def validate_manifest(workspace: Path) -> tuple[bytes, str, dict, list[Bank]]:
         evidence = bank["backing_evidence_fact_indices"]
         if not isinstance(evidence, list) or any(type(item) is not int or item < 0 for item in evidence) or evidence != sorted(set(evidence)):
             fail(f"bank {index} has invalid backing evidence")
-        if (bank["rom_space"] == "Physical" and evidence) or (bank["rom_space"] == "Virtual" and len(evidence) != 1):
+        if (rom_space == "Physical" and evidence) or (rom_space == "Virtual" and len(evidence) != 1):
             fail(f"bank {index} backing evidence does not match ROM space")
         bank_artifact = f"bank-{index:06}.bin"
         snapshot_artifact = f"bank-{index:06}.snapshot.json"
@@ -356,7 +389,7 @@ def validate_manifest(workspace: Path) -> tuple[bytes, str, dict, list[Bank]]:
         aggregate_bank += length
         aggregate_snapshot += snapshot_length
         expected_reserved.update({bank_artifact, snapshot_artifact})
-        banks.append(Bank(index, name, bank_artifact, length, bank_sha, snapshot_artifact, snapshot_length, snapshot_sha, program_sha, mode, base_seed, bank["rom_space"], rom_start, rom_end, va_start, va_end, rom_sha))
+        banks.append(Bank(index, name, bank_artifact, length, bank_sha, snapshot_artifact, snapshot_length, snapshot_sha, program_sha, mode, base_seed, rom_space, rom_start, rom_end, va_start, va_end, rom_sha))
     if aggregate_bank > MAX_AGGREGATE_BANK_BYTES or aggregate_snapshot != aggregate_declared:
         fail("snapshot workspace aggregate byte count is invalid")
     for entry in workspace.iterdir():

@@ -15,7 +15,7 @@ use crate::cfg::{BlockTerminator, Cfg, WordClass};
 use crate::facts::{function_entry_subject, BankAddr, Fact, IndirectTransferState, ProofState};
 use crate::resolve::build_cfg_value_set_closed;
 use crate::tool_adapter::{Sha256Digest, ToolCandidateKind};
-use crate::tool_claims::{bank_input_identity_v1, program_snapshot_sha256_v2};
+use crate::tool_claims::{bank_input_identity_v1, program_snapshot_sha256_v3};
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -185,7 +185,7 @@ pub fn report_candidate_native_relations_v1(
     Ok(CandidateNativeRelationReportV1 {
         schema: CANDIDATE_RELATION_REPORT_SCHEMA.into(),
         schema_version: 1,
-        program_snapshot_sha256: program_snapshot_sha256_v2(snapshot)
+        program_snapshot_sha256: program_snapshot_sha256_v3(snapshot)
             .map_err(|_| CandidateNativeRelationError::SnapshotDigest)?,
         tool_claim_set_sha256: validated.tool_claim_set_sha256(),
         bank: bank_name.clone(),
@@ -326,7 +326,7 @@ pub fn probe_baseline_unreached_candidates_v1(
     Ok(CandidateUnreachedCfgProbeV1 {
         schema: CANDIDATE_UNREACHED_PROBE_SCHEMA.into(),
         schema_version: 1,
-        program_snapshot_sha256: program_snapshot_sha256_v2(snapshot)
+        program_snapshot_sha256: program_snapshot_sha256_v3(snapshot)
             .map_err(|_| CandidateNativeRelationError::SnapshotDigest)?,
         tool_claim_set_sha256: validated.tool_claim_set_sha256(),
         bank: bank_name.clone(),

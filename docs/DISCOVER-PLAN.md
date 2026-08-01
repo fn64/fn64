@@ -149,9 +149,9 @@ any cold-panel coverage number above.
 Known recompilation/decompilation corpora are training data, not inputs to the
 production discovery engine. A valid training run has two ordered phases:
 
-1. Run discovery from the ROM alone and publish a schema-v3 snapshot workspace
+1. Run discovery from the ROM alone and publish a schema-v4 snapshot workspace
    with `intended_use = sealed_cold_function_training_input` and
-   `answer_key_present = false`. Its snapshot wire is v5 and its candidate
+   `answer_key_present = false`. Its snapshot wire is v6 and its candidate
    receipt is v3. The addressed identity includes `RomAddressSpace`, so the
    same numeric ROM/VA pair in physical ROM and VROM is not collapsed; V3 also
    includes typed semantic-callable authority in the fixed detector denominator.
@@ -1346,7 +1346,7 @@ they rank causes, they do not count blocks. For OoT the single largest lever on
 AOT coverage is entry authority; for the two AKI titles it is owner ambiguity.
 
 Those histogram values describe the retained schema-v1 block proof. Since
-schema v3, including the current schema-v5 snapshot, competing function owners
+schema v3, including the current schema-v6 snapshot, competing function owners
 are no longer treated as an
 executable-byte blocker: a shared block is admitted when at least one claimant
 root is independently authoritative and the existing code, terminator, and

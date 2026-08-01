@@ -2,7 +2,7 @@
 //!
 //! [`crate::partition`] assigns reachable blocks to roots, but a partition is
 //! not by itself an exact function boundary. A root may have been seeded by a
-//! detector, a contiguous span may lack proven executable/ROM backing, an
+//! detector, a contiguous span may lack proven executable/image backing, an
 //! incoming edge may expose an interior callable entry, or an unresolved
 //! indirect transfer may still enter the span. This module is the type-level
 //! boundary between that useful candidate geometry and metadata an emitter is
@@ -17,23 +17,21 @@
 
 use crate::cfg::{BasicBlock, BlockTerminator, Cfg, WordClass};
 use crate::facts::{
-    function_entry_subject, BankAddr, Fact, FactDb, IndirectTransferState, ProofState,
-    RomAddressSpace,
+    function_entry_subject, BankAddr, BankBackingSpanResolutionV1, BankBackingSpanV1, Fact, FactDb,
+    IndirectTransferState, ProofState,
 };
 use crate::partition::{same_bank_overlaps, Owner, Partition};
 use crate::resolve::{ClosureResult, IndirectProofState};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A ROM-backed extent that passed every exact-owner proof rule. Candidate
+/// An image-backed extent that passed every exact-owner proof rule. Candidate
 /// geometry cannot be converted into this type by this module's public API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExactFunctionOwner {
     pub entry: BankAddr,
     pub va_end: u32,
-    pub rom_space: RomAddressSpace,
-    pub rom_start: u32,
-    pub rom_end: u32,
+    pub backing: BankBackingSpanV1,
     pub block_starts: Vec<u32>,
 }
 
@@ -113,8 +111,9 @@ pub enum OwnerBlocker {
         pc: u32,
         class: Option<WordClass>,
     },
-    MissingRomBacking,
-    MultipleRomBackings,
+    MissingBankBacking,
+    AmbiguousBankBacking,
+    InvalidBankBackingGeometry,
     NotProvenExecutable,
     InteriorCallableEntry {
         pc: u32,
@@ -177,7 +176,8 @@ impl OwnerBlocker {
                 | Self::MissingCfgBlock { .. }
                 | Self::MalformedBlock { .. }
                 | Self::InconsistentTerminator { .. }
-                | Self::MultipleRomBackings
+                | Self::AmbiguousBankBacking
+                | Self::InvalidBankBackingGeometry
                 | Self::InteriorCallableEntry { .. }
                 | Self::IncomingEdge { .. }
                 | Self::ObservedInteriorEntry { .. }
@@ -218,13 +218,6 @@ impl OwnerAssessment {
 pub struct OwnerProofReport {
     pub bank: String,
     pub assessments: Vec<OwnerAssessment>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Backing {
-    rom_space: RomAddressSpace,
-    rom_start: u32,
-    rom_end: u32,
 }
 
 /// Bank-bound callable-entry authority for snapshot composition.
@@ -340,19 +333,11 @@ impl AuthoritativeCallableEntries {
                 }));
             }
         }
-        let proven_mappings = facts.proven_rom_mappings();
+        let proven_images = facts.proven_bank_images();
         entries.extend(external_authorized_roots.iter().copied().filter(|&root| {
             root.is_multiple_of(4)
-                && proven_mappings.iter().any(|fact| {
-                    matches!(
-                        fact,
-                        Fact::RomMapping {
-                            bank,
-                            va_start,
-                            va_end,
-                            ..
-                        } if bank == &cfg.bank && *va_start <= root && root < *va_end
-                    )
+                && proven_images.iter().any(|image| {
+                    image.bank == cfg.bank && image.va_start <= root && root < image.va_end
                 })
         }));
         Self {
@@ -621,14 +606,16 @@ fn assess_root(
             }
         }
 
-        let backings = owner_backings(facts, &cfg.bank, root, owner.extent_end);
-        match backings.as_slice() {
-            [] => {
-                blockers.insert(OwnerBlocker::MissingRomBacking);
+        match facts.resolve_proven_bank_backing_span(&cfg.bank, root, owner.extent_end) {
+            BankBackingSpanResolutionV1::Missing => {
+                blockers.insert(OwnerBlocker::MissingBankBacking);
             }
-            [backing] => exact_backing = Some(*backing),
-            _ => {
-                blockers.insert(OwnerBlocker::MultipleRomBackings);
+            BankBackingSpanResolutionV1::Unique(backing) => exact_backing = Some(backing),
+            BankBackingSpanResolutionV1::Ambiguous => {
+                blockers.insert(OwnerBlocker::AmbiguousBankBacking);
+            }
+            BankBackingSpanResolutionV1::InvalidGeometry => {
+                blockers.insert(OwnerBlocker::InvalidBankBackingGeometry);
             }
         }
         if !interval_is_covered(
@@ -667,14 +654,12 @@ fn assess_root(
 
     if blockers.is_empty() {
         let owner = owner.expect("an exact assessment must have one partition owner");
-        let backing = exact_backing.expect("an exact assessment must have one ROM backing");
+        let backing = exact_backing.expect("an exact assessment must have one bank backing");
         return OwnerAssessment::Proven {
             owner: ExactFunctionOwner {
                 entry,
                 va_end: owner.extent_end,
-                rom_space: backing.rom_space,
-                rom_start: backing.rom_start,
-                rom_end: backing.rom_end,
+                backing,
                 block_starts: owner.block_starts.clone(),
             },
         };
@@ -762,46 +747,6 @@ fn entry_is_authoritative(
                 } if targets.contains(&root)
             )
     })
-}
-
-fn owner_backings(facts: &FactDb, bank: &str, start: u32, end: u32) -> Vec<Backing> {
-    let mut out = BTreeSet::new();
-    for fact in facts.proven_rom_mappings() {
-        let Fact::RomMapping {
-            bank: fact_bank,
-            rom_space,
-            rom_start,
-            rom_end,
-            va_start,
-            va_end,
-        } = fact
-        else {
-            unreachable!("proven_rom_mappings returned a non-mapping fact")
-        };
-        if fact_bank != bank || end <= start || start < *va_start || end > *va_end {
-            continue;
-        }
-        let Some(backed_va_end) = va_start.checked_add(rom_end.saturating_sub(*rom_start)) else {
-            continue;
-        };
-        if end > backed_va_end {
-            continue;
-        }
-        let start_delta = start - va_start;
-        let end_delta = end - va_start;
-        let (Some(mapped_start), Some(mapped_end)) = (
-            rom_start.checked_add(start_delta),
-            rom_start.checked_add(end_delta),
-        ) else {
-            continue;
-        };
-        out.insert(Backing {
-            rom_space: *rom_space,
-            rom_start: mapped_start,
-            rom_end: mapped_end,
-        });
-    }
-    out.into_iter().collect()
 }
 
 fn interval_is_covered(start: u32, end: u32, ranges: &[(u32, u32)]) -> bool {
@@ -1169,7 +1114,9 @@ mod tests {
     use super::*;
     use crate::cfg::{build_cfg, build_cfg_with_indirect};
     use crate::facts::{
-        CandidateDetector, FunctionEntryEvidence, IndirectTransferKind, ProloguePattern,
+        evaluated_image_receipt_sha256_v1, CandidateDetector, EvaluatedImageReceiptV1,
+        FunctionEntryEvidence, IndirectTransferKind, MaterializationEvaluatorV1,
+        MaterializedImageSourceV1, MaterializedImageSuffixV1, ProloguePattern, RomAddressSpace,
     };
     use crate::partition::partition;
 
@@ -1199,6 +1146,52 @@ mod tests {
                 "test_mapping",
             )
             .unwrap();
+        add_executable_and_entries(&mut facts, bytes_len, entries);
+        facts
+    }
+
+    fn evaluated_receipt(output_len: u32) -> EvaluatedImageReceiptV1 {
+        EvaluatedImageReceiptV1 {
+            evaluator: MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 1 },
+            source: MaterializedImageSourceV1 {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0x2000,
+                rom_end: 0x2040,
+                cursor: 4,
+            },
+            source_sha256: "11".repeat(32),
+            output_len,
+            output_sha256: "22".repeat(32),
+            streams: Vec::new(),
+            trailing_suffix: MaterializedImageSuffixV1 {
+                offset: 0,
+                len: 0,
+                sha256: "33".repeat(32),
+            },
+        }
+    }
+
+    fn materialized_facts_for(image_len: u32, receipt_output_len: u32, entries: &[u32]) -> FactDb {
+        let mut facts = FactDb::new();
+        let image = facts.insert(Fact::EvaluatedImage {
+            bank: "bank".into(),
+            va_start: BASE,
+            va_end: BASE + image_len,
+            receipt: evaluated_receipt(receipt_output_len),
+        });
+        facts
+            .conclude(
+                "bank:bank",
+                ProofState::Proven,
+                vec![image],
+                "test_materialized_image",
+            )
+            .unwrap();
+        add_executable_and_entries(&mut facts, image_len, entries);
+        facts
+    }
+
+    fn add_executable_and_entries(facts: &mut FactDb, bytes_len: u32, entries: &[u32]) {
         let executable = facts.insert(Fact::ExecutableRange {
             bank: "bank".into(),
             va_start: BASE,
@@ -1234,7 +1227,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        facts
     }
 
     fn frontier(assessment: &OwnerAssessment) -> &OwnerFrontier {
@@ -1327,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_owner_requires_and_carries_rom_backed_extent() {
+    fn exact_owner_requires_and_carries_typed_affine_backing() {
         let bytes = asm(&[NOP, JR_RA, NOP]);
         let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
         let partition = partition(&cfg);
@@ -1339,9 +1331,40 @@ mod tests {
         };
         assert_eq!(owner.entry, BankAddr::new("bank", BASE));
         assert_eq!(owner.va_end, BASE + 12);
-        assert_eq!(owner.rom_start, 0x1000);
-        assert_eq!(owner.rom_end, 0x100c);
+        assert_eq!(
+            owner.backing,
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0x1000,
+                rom_end: 0x100c,
+            }
+        );
         assert_eq!(owner.byte_len(), 12);
+    }
+
+    #[test]
+    fn exact_owner_carries_materialized_output_offsets_without_rom_coordinates() {
+        let bytes = asm(&[NOP, JR_RA, NOP]);
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let facts = materialized_facts_for(bytes.len() as u32, bytes.len() as u32, &[BASE]);
+        let expected_receipt = evaluated_receipt(bytes.len() as u32);
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        let OwnerAssessment::Proven { owner } = &report.assessments[0] else {
+            panic!(
+                "expected exact materialized owner: {:?}",
+                report.assessments[0]
+            );
+        };
+        assert_eq!(
+            owner.backing,
+            BankBackingSpanV1::Materialized {
+                receipt_sha256: evaluated_image_receipt_sha256_v1(&expected_receipt),
+                output_start: 0,
+                output_end: 12,
+            }
+        );
     }
 
     #[test]
@@ -1443,12 +1466,13 @@ mod tests {
     }
 
     #[test]
-    fn distinct_rom_backings_are_ambiguous() {
+    fn distinct_bank_backings_are_ambiguous() {
         let bytes = asm(&[JR_RA, NOP]);
         let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
         let partition = partition(&cfg);
         let mut facts = facts_for(bytes.len() as u32, &[BASE]);
-        facts.insert(Fact::RomMapping {
+        let first = facts.conclusion("bank:bank").unwrap().justified_by[0];
+        let second = facts.insert(Fact::RomMapping {
             bank: "bank".into(),
             rom_space: RomAddressSpace::Physical,
             rom_start: 0x2000,
@@ -1456,6 +1480,14 @@ mod tests {
             va_start: BASE,
             va_end: BASE + 8,
         });
+        facts
+            .conclude(
+                "bank:bank",
+                ProofState::Proven,
+                vec![first, second],
+                "test competing proven backing",
+            )
+            .unwrap();
 
         let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
         assert!(matches!(
@@ -1464,7 +1496,24 @@ mod tests {
         ));
         assert!(frontier(&report.assessments[0])
             .blockers
-            .contains(&OwnerBlocker::MultipleRomBackings));
+            .contains(&OwnerBlocker::AmbiguousBankBacking));
+    }
+
+    #[test]
+    fn invalid_bank_backing_geometry_is_ambiguous() {
+        let bytes = asm(&[JR_RA, NOP]);
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let facts = materialized_facts_for(bytes.len() as u32, 12, &[BASE]);
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        assert!(matches!(
+            report.assessments[0],
+            OwnerAssessment::Ambiguous { .. }
+        ));
+        assert!(frontier(&report.assessments[0])
+            .blockers
+            .contains(&OwnerBlocker::InvalidBankBackingGeometry));
     }
 
     #[test]
