@@ -1719,6 +1719,15 @@ mod tests {
     use super::*;
     use crate::execution::{CodeBank, CodeSpan};
 
+    thread_local! {
+        static OBSERVED_READS: std::cell::RefCell<Vec<crate::runtime::GuestReadEvent>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn observe_read(event: crate::runtime::GuestReadEvent) {
+        OBSERVED_READS.with(|reads| reads.borrow_mut().push(event));
+    }
+
     const BANK: BankId = BankId::new(0x42);
     const VA: u32 = 0x8000_1000;
 
@@ -2239,6 +2248,63 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_pc_execution_reports_ordered_rdram_read_dependencies() {
+        let catalog = catalog_of(&[
+            0x3c08_8000, // lui $t0,0x8000
+            0x8d02_0000, // lw $v0,0($t0)
+            0x8903_0005, // lwl $v1,5($t0)
+            0xc104_0008, // ll $a0,8($t0)
+            0xc500_000c, // lwc1 $f0,12($t0)
+            0xd502_0010, // ldc1 $f2,16($t0)
+            0x03e0_0008, // jr $ra
+            0x0000_0000, // nop
+        ]);
+        let mut storage = vec![0u8; 32];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.cop0_status = 1 << 29;
+        OBSERVED_READS.with(|reads| reads.borrow_mut().clear());
+        let previous = crate::runtime::set_read_observer(Some(observe_read));
+        let run = run_bank(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(16).unwrap(),
+            &mut ctx,
+            &mut mem,
+        )
+        .unwrap();
+        crate::runtime::set_read_observer(previous);
+
+        assert!(matches!(run.exit, BlockExit::ResolveTransfer { .. }));
+        assert_eq!(
+            OBSERVED_READS.with(|reads| reads.borrow().clone()),
+            vec![
+                crate::runtime::GuestReadEvent {
+                    physical_offset: 0,
+                    len: 4,
+                },
+                crate::runtime::GuestReadEvent {
+                    physical_offset: 4,
+                    len: 4,
+                },
+                crate::runtime::GuestReadEvent {
+                    physical_offset: 8,
+                    len: 4,
+                },
+                crate::runtime::GuestReadEvent {
+                    physical_offset: 12,
+                    len: 4,
+                },
+                crate::runtime::GuestReadEvent {
+                    physical_offset: 16,
+                    len: 8,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_data_hole_between_spans_is_never_executed() {
         // Two disjoint spans with a hole at VA+4; entering the hole faults typed.
         let bank = CodeBank::from_spans(
@@ -2346,6 +2412,8 @@ mod tests {
         let mut storage = vec![0u8; 64];
         let mut mem = Rdram::new(&mut storage);
         let mut ctx = RecompContext::new();
+        OBSERVED_READS.with(|reads| reads.borrow_mut().clear());
+        let previous = crate::runtime::set_read_observer(Some(observe_read));
         let run = run_bank_with_mmio(
             &catalog,
             BANK,
@@ -2356,10 +2424,12 @@ mod tests {
             &mut port,
         )
         .unwrap();
+        crate::runtime::set_read_observer(previous);
         assert_eq!(port.reads, 1, "the modeled register was read once");
         // Word register value sign-extends into the GPR exactly as a real LW.
         assert_eq!(ctx.r(2), 0xFFFF_FFFF_DEAD_BEEF);
         assert!(matches!(run.exit, BlockExit::ResolveTransfer { .. }));
+        assert!(OBSERVED_READS.with(|reads| reads.borrow().is_empty()));
     }
 
     #[test]

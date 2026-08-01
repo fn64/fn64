@@ -2683,6 +2683,18 @@ impl GuestWriteEvent {
 /// renderer notification are multiplexed by the host callback.
 pub type WriteObserver = fn(GuestWriteEvent);
 
+/// One successful checked arbitrary-PC guest data load from physical RDRAM.
+/// The length conservatively covers the bytes touched by the backing read.
+/// Whole-function generated runners and host-side snapshots do not publish
+/// these events.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GuestReadEvent {
+    pub physical_offset: u32,
+    pub len: u32,
+}
+
+pub type ReadObserver = fn(GuestReadEvent);
+
 /// Whether one committed guest write changed bytes owned by the active
 /// executable image.
 ///
@@ -2751,6 +2763,9 @@ thread_local! {
     static WRITE_OBSERVER: std::cell::Cell<Option<WriteObserver>> = const {
         std::cell::Cell::new(None)
     };
+    static READ_OBSERVER: std::cell::Cell<Option<ReadObserver>> = const {
+        std::cell::Cell::new(None)
+    };
     static GUEST_WRITE_BOUNDARY_OBSERVER:
         std::cell::Cell<Option<GuestWriteBoundaryObserver>> = const {
             std::cell::Cell::new(None)
@@ -2801,6 +2816,14 @@ pub fn set_mmio_hooks(
 
 pub fn set_write_observer(observer: Option<WriteObserver>) -> Option<WriteObserver> {
     WRITE_OBSERVER.with(|slot| slot.replace(observer))
+}
+
+/// Install (or clear) the current thread's checked arbitrary-PC data-load
+/// observer, returning the previous observer. The copied callback may replace
+/// or clear itself; recursive checked loads recursively invoke it. A callback
+/// panic propagates after the backing read and leaves the callback installed.
+pub fn set_read_observer(observer: Option<ReadObserver>) -> Option<ReadObserver> {
+    READ_OBSERVER.with(|slot| slot.replace(observer))
 }
 
 /// Install the live executable-owner callback and clear any request belonging
@@ -3158,6 +3181,20 @@ impl<'a> Rdram<'a> {
         let direct_segment = (0x8000_0000..0xc000_0000).contains(&low);
         let physical = low & 0x1fff_ffff;
         (canonical_32 && direct_segment && physical < RDRAM_LEN as u32).then_some(physical)
+    }
+
+    #[inline]
+    fn notify_translated_rdram_read(vaddr: u64, len: u32) {
+        if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            READ_OBSERVER.with(|slot| {
+                if let Some(observer) = slot.get() {
+                    observer(GuestReadEvent {
+                        physical_offset: offset,
+                        len,
+                    });
+                }
+            });
+        }
     }
 
     /// Generated-C's proxy exposes RCP registers and PIF RAM only as modeled
@@ -3575,8 +3612,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<i32, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_w(translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_w(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated, 4);
+        Ok(value)
     }
 
     /// Checked LH (aligned, sign-extended halfword).
@@ -3595,8 +3635,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<i16, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_h(translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_h(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated, 2);
+        Ok(value)
     }
 
     /// Checked LHU (aligned, zero-extended halfword).
@@ -3610,7 +3653,12 @@ impl<'a> Rdram<'a> {
         ctx: &RecompContext,
         vaddr: u64,
     ) -> Result<u16, DataAccessError> {
-        self.try_load_h_translated(ctx, vaddr).map(|v| v as u16)
+        let translated = Self::translated_load_address(ctx, vaddr)?;
+        let value = self
+            .try_load_hu(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated, 2);
+        Ok(value)
     }
 
     /// Checked LB (sign-extended byte).
@@ -3629,8 +3677,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<i8, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_b(translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_b(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated, 1);
+        Ok(value)
     }
 
     /// Checked LBU (zero-extended byte).
@@ -3649,8 +3700,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<u8, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_bu(translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_bu(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated, 1);
+        Ok(value)
     }
 
     /// Checked LWL (the aligned word it merges from must be backed).
@@ -3670,8 +3724,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<i32, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_wl(initial, translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_wl(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated & !0x3, 4);
+        Ok(value)
     }
 
     /// Checked LWR.
@@ -3691,8 +3748,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<i32, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_wr(initial, translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_wr(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated & !0x3, 4);
+        Ok(value)
     }
 
     /// Checked LD/LLD (aligned doubleword).
@@ -3711,8 +3771,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<u64, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_d(translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_d(translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated, 8);
+        Ok(value)
     }
 
     /// Checked LDL.
@@ -3732,8 +3795,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<u64, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_dl(initial, translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_dl(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated & !0x7, 8);
+        Ok(value)
     }
 
     /// Checked LDR.
@@ -3753,8 +3819,11 @@ impl<'a> Rdram<'a> {
         vaddr: u64,
     ) -> Result<u64, DataAccessError> {
         let translated = Self::translated_load_address(ctx, vaddr)?;
-        self.try_load_dr(initial, translated)
-            .map_err(|_| DataAccessError::Unbacked { vaddr })
+        let value = self
+            .try_load_dr(initial, translated)
+            .map_err(|_| DataAccessError::Unbacked { vaddr })?;
+        Self::notify_translated_rdram_read(translated & !0x7, 8);
+        Ok(value)
     }
 
     /// Checked SW.
@@ -3947,16 +4016,19 @@ mod tests {
 
     use super::{
         resolve_host_function, set_host_lookup, set_unsupported_observer, trap_unsupported,
-        DataAccessError, DataAccessKind, GuestWriteEvent, HostFunctionCatalogErrorV1,
-        HostFunctionCatalogV1, InstructionTranslationDiagnosticErrorV1, Rdram, RecompContext,
-        RecompFunc, TlbEntryRaw, TlbFault, TlbFaultKind, TranslatedDataAddress,
-        TranslatedInstructionAddress, WriterChannel, RDRAM_LEN,
+        DataAccessError, DataAccessKind, GuestReadEvent, GuestWriteEvent,
+        HostFunctionCatalogErrorV1, HostFunctionCatalogV1, InstructionTranslationDiagnosticErrorV1,
+        Rdram, RecompContext, RecompFunc, TlbEntryRaw, TlbFault, TlbFaultKind,
+        TranslatedDataAddress, TranslatedInstructionAddress, WriterChannel, RDRAM_LEN,
     };
 
     type RdramOperation = for<'a> fn(&mut Rdram<'a>);
 
     thread_local! {
         static OBSERVED_WRITES: std::cell::RefCell<Vec<GuestWriteEvent>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+        static OBSERVED_READS: std::cell::RefCell<Vec<GuestReadEvent>> = const {
             std::cell::RefCell::new(Vec::new())
         };
         static MMIO_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -3967,6 +4039,10 @@ mod tests {
 
     fn observe_write(event: GuestWriteEvent) {
         OBSERVED_WRITES.with(|writes| writes.borrow_mut().push(event));
+    }
+
+    fn observe_read(event: GuestReadEvent) {
+        OBSERVED_READS.with(|reads| reads.borrow_mut().push(event));
     }
 
     fn consume_mmio(_vaddr: u64, _value: u32) -> bool {
@@ -4354,6 +4430,136 @@ mod tests {
             ]
         );
         super::set_write_observer(previous);
+    }
+
+    #[test]
+    fn translated_rdram_read_observer_covers_every_ordinary_load() {
+        OBSERVED_READS.with(|reads| reads.borrow_mut().clear());
+        let previous = super::set_read_observer(Some(observe_read));
+        let mut bytes = [0u8; 64];
+        let mem = Rdram::new(&mut bytes);
+        let ctx = RecompContext::new();
+        let base = 0xffff_ffff_8000_0000;
+
+        assert!(mem.try_load_w_translated(&ctx, base).is_ok());
+        assert!(mem.try_load_h_translated(&ctx, base + 4).is_ok());
+        assert!(mem.try_load_hu_translated(&ctx, base + 6).is_ok());
+        assert!(mem.try_load_b_translated(&ctx, base + 8).is_ok());
+        assert!(mem.try_load_bu_translated(&ctx, base + 9).is_ok());
+        assert!(mem.try_load_d_translated(&ctx, base + 16).is_ok());
+        super::set_read_observer(previous);
+
+        assert_eq!(
+            OBSERVED_READS.with(|reads| reads.borrow().clone()),
+            vec![
+                GuestReadEvent {
+                    physical_offset: 0,
+                    len: 4,
+                },
+                GuestReadEvent {
+                    physical_offset: 4,
+                    len: 2,
+                },
+                GuestReadEvent {
+                    physical_offset: 6,
+                    len: 2,
+                },
+                GuestReadEvent {
+                    physical_offset: 8,
+                    len: 1,
+                },
+                GuestReadEvent {
+                    physical_offset: 9,
+                    len: 1,
+                },
+                GuestReadEvent {
+                    physical_offset: 16,
+                    len: 8,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn translated_rdram_read_observer_reports_tlb_mapped_physical_offset() {
+        OBSERVED_READS.with(|reads| reads.borrow_mut().clear());
+        let previous = super::set_read_observer(Some(observe_read));
+        let mut bytes = [0u8; 0x2000];
+        let mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.tlb_entries[0] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0x0040_0000,
+            entry_lo0: (1 << 6) | 0b111,
+            entry_lo1: 0b111,
+        };
+
+        assert!(mem.try_load_w_translated(&ctx, 0x0040_0020).is_ok());
+        super::set_read_observer(previous);
+
+        assert_eq!(
+            OBSERVED_READS.with(|reads| reads.borrow().clone()),
+            vec![GuestReadEvent {
+                physical_offset: 0x1020,
+                len: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn translated_rdram_read_observer_unaligned_loads_cover_aligned_backing_ranges() {
+        OBSERVED_READS.with(|reads| reads.borrow_mut().clear());
+        let previous = super::set_read_observer(Some(observe_read));
+        let mut bytes = [0u8; 32];
+        let mem = Rdram::new(&mut bytes);
+        let ctx = RecompContext::new();
+        let base = 0xffff_ffff_a000_0000;
+
+        assert!(mem.try_load_wl_translated(&ctx, 0, base + 1).is_ok());
+        assert!(mem.try_load_wr_translated(&ctx, 0, base + 2).is_ok());
+        assert!(mem.try_load_dl_translated(&ctx, 0, base + 11).is_ok());
+        assert!(mem.try_load_dr_translated(&ctx, 0, base + 14).is_ok());
+        super::set_read_observer(previous);
+
+        assert_eq!(
+            OBSERVED_READS.with(|reads| reads.borrow().clone()),
+            vec![
+                GuestReadEvent {
+                    physical_offset: 0,
+                    len: 4,
+                },
+                GuestReadEvent {
+                    physical_offset: 0,
+                    len: 4,
+                },
+                GuestReadEvent {
+                    physical_offset: 8,
+                    len: 8,
+                },
+                GuestReadEvent {
+                    physical_offset: 8,
+                    len: 8,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn translated_rdram_read_observer_ignores_failed_loads_and_host_snapshots() {
+        OBSERVED_READS.with(|reads| reads.borrow_mut().clear());
+        let previous = super::set_read_observer(Some(observe_read));
+        let mut bytes = [0u8; 16];
+        let mem = Rdram::new(&mut bytes);
+        let ctx = RecompContext::new();
+
+        assert!(mem.try_load_w_translated(&ctx, 0x0040_0000).is_err());
+        assert!(mem
+            .try_load_w_translated(&ctx, 0xffff_ffff_8000_0040)
+            .is_err());
+        assert_eq!(mem.copy_physical_bytes(0, 4), vec![0; 4]);
+        super::set_read_observer(previous);
+
+        assert!(OBSERVED_READS.with(|reads| reads.borrow().is_empty()));
     }
 
     #[test]

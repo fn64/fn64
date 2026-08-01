@@ -2594,6 +2594,12 @@ multiplexes Rust executable-region invalidation and renderer notification
 without entering the executor. That `WriteObserver` remains notification-only;
 the block lane installs a distinct `GuestWriteBoundaryObserver` whose typed
 result marks a proven post-commit overlap with the live executable-region map.
+The checked arbitrary-PC lane also exposes a thread-local `ReadObserver` for
+exact-invocation dependency certificates. It reports successful physical-RDRAM
+backing reads after translation, conservatively widening merge loads to their
+aligned four- or eight-byte backing range. It excludes MMIO, failed accesses,
+instruction fetches, host snapshots, and whole-function generated runners; it
+is evidence for a bounded arbitrary-PC execution, not a lane-wide read trace.
 Runners consume the mark only after the current straight instruction or full
 branch/delay pair, so renderer observation neither chooses nor delays the
 execution boundary. Programming Manual 15.5.6 is the behavioral source for
