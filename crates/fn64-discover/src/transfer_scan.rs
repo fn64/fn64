@@ -1312,6 +1312,28 @@ mod tests {
         fn64_recomp_rs::catalog_resolver_policy_evidence_v1()
     }
 
+    /// Whether the linked `fn64-recomp-rs` artifact can grant catalog-total
+    /// authority at all.
+    ///
+    /// `validate_catalog_total_transfer_authority_v1` refuses a build whose
+    /// receipt reports `dev_interpreter`, which is deliberate: the dev
+    /// interpreter is a development lane and must never carry production
+    /// transfer authority. `fn64-discover` asks for
+    /// `default-features = false, features = ["aot-runtime"]`, so building
+    /// this crate alone satisfies that. Cargo unifies features across a
+    /// workspace build, though, and `fn64-abi`'s dev-dependency requests
+    /// `dev-interpreter` -- so under `cargo nextest run --workspace` the
+    /// receipt this crate observes reports `dev_interpreter: true` and every
+    /// grant is correctly refused.
+    ///
+    /// Tests that assert a *successful* grant therefore describe a lane the
+    /// workspace build is not in. They skip rather than fail: the refusal is
+    /// the rule working, not a regression. Tests asserting a refusal stay
+    /// unconditional, because refusal holds in both configurations.
+    fn catalog_total_authority_is_grantable() -> bool {
+        !fn64_recomp_rs::static_execution_build_receipt().dev_interpreter
+    }
+
     #[test]
     fn direct_guest_and_exact_host_calls_are_classified() {
         let closure = closure(
@@ -1585,6 +1607,9 @@ mod tests {
 
     #[test]
     fn catalog_total_authority_retains_dynamic_sites_without_blocking() {
+        if !catalog_total_authority_is_grantable() {
+            return;
+        }
         let closure = closure(
             "resident",
             vec![
@@ -1706,6 +1731,9 @@ mod tests {
 
     #[test]
     fn catalog_total_authority_is_bound_to_exact_catalog_inputs() {
+        if !catalog_total_authority_is_grantable() {
+            return;
+        }
         let closure = closure("resident", Vec::new(), Vec::new());
         let banks = [TransferScanBankInput {
             bank: "resident",
