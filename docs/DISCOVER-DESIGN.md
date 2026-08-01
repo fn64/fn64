@@ -588,20 +588,22 @@ content-bound request. Caller-declared scratch ranges and code bytes remain
 candidate inputs until a validator binds them to an admitted bank and corridor.
 
 The same opt-in feature exposes `polling_stutter` for one narrower corridor
-claim. Given a complete committed RDRAM/context state, disjoint direct-mapped
-code spans, one exact non-RDRAM KSEG1 status word, and declared loop-head/join
-PCs, it executes the exact unit catalog against a port that services only that
-status read and faults every other memory access. An opcode whitelist is checked
-before each unit executes; stores, other loads, COP0/TLB/FPU operations, traps,
-host calls, and code escape are rejected. The validator requires one status read
-and no RDRAM change on every path. It proves that the first busy observation
-reaches a loop-head state for which two further busy executions have identical
-complete CPU state after erasing only Count and Random phase, and identical
-fetched-unit transcripts. The whitelist cannot explicitly observe Count or
-Random and cannot execute TLBWR; ordinary instruction retirement still advances
-the interpreter's Random phase. It also requires ready execution from two
-consecutive recurrent heads to produce the same delayed join state and
-transcript under that normalization.
+claim. Given complete committed pre-device and post-device RDRAM backings, one
+complete context state, disjoint direct-mapped code spans, one exact non-RDRAM
+KSEG1 status word, and declared loop-head/join PCs, it executes the exact unit
+catalog against a port that services only that status read and faults every
+other memory access. Busy paths use the pre-device backing; ready paths use the
+post-device backing. Both must contain the same committed polling code. An
+opcode whitelist is checked before each unit executes; stores, other loads,
+COP0/TLB/FPU operations, traps, host calls, and code escape are rejected. The
+validator requires one status read and no RDRAM change on every path. It proves
+that the first busy observation reaches a loop-head state for which two further
+busy executions have identical complete CPU state after erasing only Count and
+Random phase, and identical fetched-unit transcripts. The whitelist cannot
+explicitly observe Count or Random and cannot execute TLBWR; ordinary
+instruction retirement still advances the interpreter's Random phase. It also
+requires ready execution from two consecutive recurrent heads to produce the
+same delayed join state and transcript under that normalization.
 
 Immediate-ready and delayed-ready join states are retained as two distinct
 outputs. They are deliberately not required to be equal: a caller can leave
@@ -615,9 +617,11 @@ obligation that downstream validation prove every Count/Random phase in the
 quotient unobservable through the final claim; the production Count clock and
 pending-interrupt entry are not modeled here, and the exposed join contexts are
 only representatives. Its serialized certificate contains full initial and
-normalized final CPU-state commitments plus code/RDRAM/transcript commitments,
-but no instruction or memory bytes, and deserialization
-cannot recreate the opaque validation.
+normalized final CPU-state commitments plus distinct pre-device/post-device
+RDRAM commitments and code/transcript commitments, but no instruction or memory
+bytes, and deserialization cannot recreate the opaque validation. It does not
+authenticate the change between the two backings; the continuous device
+corridor must bind that transition to one typed commit.
 
 The boot bank's effective entry is a typed, authoritative
 `HardwareEntrypoint` / `RomHeaderEntrypoint` claim only when an exact admitted
