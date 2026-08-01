@@ -403,7 +403,7 @@ fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, 
         || auto.selected != cold.receipt.measurement.selected_strategy
         || auto.outcomes != cold.receipt.measurement.strategy_outcomes
         || auto.facts.facts().len() != cold.receipt.measurement.fact_count
-        || auto.facts.proven_rom_mappings().len() != cold.receipt.measurement.proven_bank_count
+        || auto.facts.proven_bank_images().len() != cold.receipt.measurement.proven_bank_count
     {
         return Err("layout-study discovery rerun differs from its sealed cold receipt".to_owned());
     }
@@ -412,8 +412,14 @@ fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, 
         &auto.facts,
         fn64_discover::snapshot_inputs::PrepareSnapshotBanksLimits {
             max_banks: limits.max_banks as usize,
-            max_aggregate_rom_bytes: limits.max_aggregate_materialized_bytes,
-            max_decoded_vrom_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+            max_aggregate_materialized_bytes: limits.max_aggregate_materialized_bytes,
+            materialized_image: fn64_discover::materialized_image::MaterializedImageLimitsV1 {
+                max_source_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_decoded_vrom_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_stream_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_aggregate_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_streams: 4096,
+            },
         },
     )
     .map_err(|error| error.to_string())?;
