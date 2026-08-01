@@ -6,7 +6,9 @@
 //! [`crate::run_discovery_auto`]; a composition frontier stays explicit and
 //! never masquerades as a zero-unsupported scoreboard.
 
-use crate::closure::{ClosureScoreboard, DestinationClass, DestinationReason};
+use crate::closure::{
+    ClosureScoreboard, DestinationClass, DestinationReason, UnsupportedDestinationAuditV1,
+};
 use crate::ledger::build_ledger;
 use crate::materialized_image::MaterializedImageLimitsV1;
 use crate::snapshot::{
@@ -144,6 +146,9 @@ pub struct ColdRomReceiptV2 {
 pub struct ColdRomRunV2 {
     pub receipt: ColdRomReceiptV2,
     pub composition_diagnostic: Option<String>,
+    /// Content-free address/edge provenance kept outside the sealed V2
+    /// receipt so adding diagnostics cannot change its historical identity.
+    pub unsupported_destinations: Vec<UnsupportedDestinationAuditV1>,
 }
 
 pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError> {
@@ -159,6 +164,7 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
     )?;
 
     let proven_bank_count = auto.facts.proven_bank_images().len();
+    let mut unsupported_destinations = Vec::new();
     let (closure, stage1_effects, composition_diagnostic) = match prepare_snapshot_banks_with_limits(
         &auto.rom,
         &auto.facts,
@@ -246,6 +252,8 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
                             )
                         },
                     );
+                    unsupported_destinations =
+                        crate::closure::unsupported_destination_audit_v1(composed.snapshots());
                     (
                         ColdClosureMeasurementV2::Measured {
                             scoreboard: crate::closure::scoreboard(composed.snapshots()),
@@ -315,6 +323,7 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
             receipt_sha256,
         },
         composition_diagnostic,
+        unsupported_destinations,
     })
 }
 
@@ -510,6 +519,7 @@ mod tests {
             }
         ));
         assert_eq!(run.receipt.measurement.proven_bank_count, 0);
+        assert!(run.unsupported_destinations.is_empty());
         assert_eq!(
             run.receipt.measurement.ledger_code_like_floor_bytes,
             run.receipt

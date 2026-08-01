@@ -96,6 +96,10 @@
 //!   Computed-jump table entries remain intra-owner code successors; only
 //!   exhaustive computed calls become callable roots. Every unresolved site
 //!   is retained as bounded/open evidence in the fact database.
+//! - [`indirect_frontier`]: content-free opportunity ranking for final open
+//!   indirects. Local instruction shapes remain diagnostic, while owner-payoff
+//!   counterfactuals count only assessments whose complete blocker set the
+//!   named mechanism family would discharge.
 //! - [`delta_vote`]: mapping inference for a code region with an unknown VA
 //!   base -- lui-histogram-narrowed delta hypotheses scored by distinct
 //!   `jal`-target-to-prologue coincidences, admitted only on a unique

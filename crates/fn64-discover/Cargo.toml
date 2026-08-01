@@ -50,6 +50,11 @@ path = "src/bin/diagnose_open_indirects.rs"
 test = false
 
 [[bin]]
+name = "diagnose_cold_unsupported"
+path = "src/bin/diagnose_cold_unsupported.rs"
+test = false
+
+[[bin]]
 name = "validate_candidate_receipts"
 path = "src/bin/validate_candidate_receipts.rs"
 test = false

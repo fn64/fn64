@@ -1,4 +1,6 @@
-use fn64_discover::indirect_frontier::{classify_open_indirects_v1, OpenIndirectFrontierV1};
+use fn64_discover::indirect_frontier::{
+    classify_open_indirects_with_owners_v1, OpenIndirectFrontierV1,
+};
 use fn64_discover::snapshot::{
     compose_materialized_banks_validated_v2_with_limits, MultiBankCompositionLimits,
 };
@@ -36,12 +38,21 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<(), String> {
     if paths.is_empty() {
         return Err("usage: diagnose_open_indirects ROM [ROM ...]".into());
     }
+    let mut failures = 0u64;
     for path in paths {
-        let report = diagnose(&path)?;
-        println!(
-            "{}",
-            serde_json::to_string(&report).map_err(|error| error.to_string())?
-        );
+        match diagnose(&path) {
+            Ok(report) => println!(
+                "{}",
+                serde_json::to_string(&report).map_err(|error| error.to_string())?
+            ),
+            Err(error) => {
+                failures += 1;
+                eprintln!("diagnose-open-indirects: {}: {error}", path.display());
+            }
+        }
+    }
+    if failures != 0 {
+        return Err(format!("{failures} ROM input(s) failed"));
     }
     Ok(())
 }
@@ -78,7 +89,9 @@ fn diagnose(path: &Path) -> Result<OpenIndirectDiagnosticV1, String> {
 
     let mut frontier = OpenIndirectFrontierV1 {
         open_sites: 0,
+        semantic_shapes: vec![],
         shapes: vec![],
+        mechanism_counterfactuals: vec![],
     };
     for snapshot in composed.snapshots() {
         let [bank_snapshot] = snapshot.banks.as_slice() else {
@@ -96,9 +109,13 @@ fn diagnose(path: &Path) -> Result<OpenIndirectDiagnosticV1, String> {
         let [bank] = matching.as_slice() else {
             return Err("a composed snapshot did not match exactly one prepared bank".into());
         };
-        let bank_frontier =
-            classify_open_indirects_v1(&bank_snapshot.closure, &bank.bytes, bank.va_start)
-                .map_err(|error| format!("classifying an open-indirect frontier: {error}"))?;
+        let bank_frontier = classify_open_indirects_with_owners_v1(
+            &bank_snapshot.closure,
+            &bank_snapshot.owner_proof,
+            &bank.bytes,
+            bank.va_start,
+        )
+        .map_err(|error| format!("classifying an open-indirect frontier: {error}"))?;
         frontier.merge(&bank_frontier);
     }
 
