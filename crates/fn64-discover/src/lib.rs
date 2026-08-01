@@ -68,6 +68,13 @@
 //!   branch/call edge target is code, and anything else stays ambiguous.
 //!   Never reads or mutates [`facts::FactDb`] or a [`cfg::Cfg`]; strictly
 //!   corroborating evidence that cannot override a proven conclusion.
+//! - [`cold_sweep`]: path-free cold discovery measurement from ROM bytes only,
+//!   including automatic snapshot composition, closure tiers, and the complete
+//!   byte ledger. A composition frontier remains typed `open`; it never becomes
+//!   a misleading zero-unsupported result.
+//! - [`stage1_effects`]: conservative syntactic COP0/cache/trap and constant-
+//!   address memory-effect inventory over authority-reached code. It is an
+//!   explicit negative classifier, not a general purity theorem.
 //! - [`partition`]: Phase 5, recursive-descent owner partitioning of a
 //!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
 //!   bank, ambiguous claims and unowned blocks reported explicitly rather
@@ -184,6 +191,7 @@ pub mod cfg;
 pub mod cfg_homology;
 pub mod closure;
 pub mod closure_audit;
+pub mod cold_sweep;
 pub mod content_consumer;
 pub mod corpus_homology;
 pub mod coverage;
@@ -229,6 +237,7 @@ pub mod snapshot_workspace;
 pub mod source_closure;
 pub mod spimdisasm_adapter;
 pub mod spimdisasm_reference;
+pub mod stage1_effects;
 pub mod timing_diff;
 pub mod timing_trace;
 pub mod tool_adapter;
@@ -763,7 +772,9 @@ fn record_physical_end_dma_wrapper_candidates(
 /// Recovery-strategy declaration order is the deterministic tie-break order.
 /// The two boot-only variants describe the baseline outcome and do not compete
 /// with one another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryStrategy {
     /// No boot mapping was proven because the IPL3 or its complete DMA source
@@ -803,7 +814,8 @@ impl DiscoveryStrategy {
 /// What one strategy found on this ROM, recorded whether or not it was
 /// selected. Every strategy attempted reports an outcome: a strategy that
 /// recovered nothing is stated, never omitted.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StrategyOutcome {
     pub strategy: DiscoveryStrategy,
     pub candidate_tables: usize,

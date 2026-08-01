@@ -173,7 +173,11 @@ pub fn harvest_discovered_candidates_bounded(
     db: &mut FactDb,
     max_decoded_vrom_file_bytes: usize,
 ) -> Result<HarvestReport, HarvestError> {
-    let (images, handler_table_claims) = load_images(rom, db, max_decoded_vrom_file_bytes)?;
+    let (images, handler_table_claims, overlay_relocation_facts) =
+        load_images(rom, db, max_decoded_vrom_file_bytes)?;
+    for fact in overlay_relocation_facts {
+        db.insert(fact);
+    }
     let image_index = LoadImageIndex::new(&images);
     let table_entries: Vec<(BankAddr, u32, BankAddr, ProofState)> = db
         .facts()
@@ -225,9 +229,10 @@ fn load_images(
     rom: &NormalizedRom,
     db: &FactDb,
     max_decoded_vrom_file_bytes: usize,
-) -> Result<(Vec<LoadImage>, Vec<ProviderClaim>), HarvestError> {
+) -> Result<(Vec<LoadImage>, Vec<ProviderClaim>, Vec<Fact>), HarvestError> {
     let mut images = Vec::new();
     let mut handler_table_claims = Vec::new();
+    let mut overlay_relocation_facts = Vec::new();
     for mapping in db.proven_rom_mappings() {
         let Fact::RomMapping {
             bank,
@@ -262,6 +267,20 @@ fn load_images(
             detail,
         })?
         .bytes;
+        if let Some(relocations) = crate::overlay_reloc::parse_zelda_overlay(&bytes) {
+            overlay_relocation_facts.extend(relocations.relocations.into_iter().map(
+                |relocation| Fact::OverlayRelocation {
+                    site: BankAddr::new(
+                        bank.clone(),
+                        va_start.saturating_add(relocation.file_offset),
+                    ),
+                    section: relocation.section,
+                    kind: relocation.kind,
+                    value_evidence: relocation.value_evidence,
+                    unrelocated_value: relocation.unrelocated_value,
+                },
+            ));
+        }
         handler_table_claims.extend(detect_handler_table_entries(
             bank, *va_start, *va_end, &bytes,
         ));
@@ -299,7 +318,7 @@ fn load_images(
     images.sort_by(|a, b| {
         (&a.bank, a.rom_start, a.va_start).cmp(&(&b.bank, b.rom_start, b.va_start))
     });
-    Ok((images, handler_table_claims))
+    Ok((images, handler_table_claims, overlay_relocation_facts))
 }
 
 fn detect_reachable_call_targets(
@@ -1103,7 +1122,9 @@ fn merge_existing_state(existing: ProofState, incoming: ProofState) -> ProofStat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::Fact;
+    use crate::facts::{
+        Fact, OverlayRelocationKind, OverlayRelocationSection, OverlayRelocationValueEvidence,
+    };
     use crate::rom::normalize;
 
     const NOP: u32 = 0;
@@ -1135,6 +1156,34 @@ mod tests {
         db.conclude("bank:boot", ProofState::Proven, vec![mapping], "test")
             .unwrap();
         db
+    }
+
+    fn rom_with_overlay_data_relocation(target: u32) -> NormalizedRom {
+        fn push_word(bytes: &mut Vec<u8>, word: u32) {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+
+        let mut bytes = vec![0u8; 0x1000];
+        bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        bytes[0x20..0x24].copy_from_slice(b"TEST");
+        bytes[0x3b..0x3f].copy_from_slice(b"CTSE");
+        push_word(&mut bytes, NOP);
+        push_word(&mut bytes, NOP);
+        push_word(&mut bytes, JR_RA);
+        push_word(&mut bytes, NOP);
+        push_word(&mut bytes, target);
+        let relocation_start = bytes.len();
+        push_word(&mut bytes, 16);
+        push_word(&mut bytes, 4);
+        push_word(&mut bytes, 0);
+        push_word(&mut bytes, 0);
+        push_word(&mut bytes, 1);
+        push_word(&mut bytes, (2 << 30) | (2 << 24));
+        push_word(&mut bytes, 0);
+        let relocation_size = bytes.len() - relocation_start + 4;
+        push_word(&mut bytes, relocation_size as u32);
+        normalize(&bytes).unwrap()
     }
 
     fn synthetic_image(words: &[u32], va_start: u32) -> LoadImage {
@@ -1199,6 +1248,29 @@ mod tests {
                 via_call: true,
                 ..
             } if site.pc == 0x8000_0410
+        )));
+    }
+
+    #[test]
+    fn overlay_data_relocation_enters_fact_db_without_becoming_a_function_root() {
+        let target = 0x8123_4560;
+        let rom = rom_with_overlay_data_relocation(target);
+        let mut db = mapped_db(&rom);
+        harvest_discovered_candidates(&rom, &mut db).unwrap();
+
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::OverlayRelocation {
+                site,
+                section: OverlayRelocationSection::Data,
+                kind: OverlayRelocationKind::Mips32,
+                value_evidence: OverlayRelocationValueEvidence::StoredWord,
+                unrelocated_value: recorded,
+            } if site == &BankAddr::new("boot", 0x8000_0410) && *recorded == target
+        )));
+        assert!(!db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::FunctionEntryClaim { target: entry, .. } if entry.pc == target
         )));
     }
 

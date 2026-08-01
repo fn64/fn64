@@ -40,6 +40,41 @@ pub enum MappingAddressSpace {
     Vram,
 }
 
+/// Linker-declared section containing an overlay relocation site. This is the
+/// section encoded in the Zelda overlay relocation word, not a section guessed
+/// from the relocated value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayRelocationSection {
+    Text,
+    Data,
+    Rodata,
+}
+
+/// Machine-readable relocation operation retained by the canonical fact log.
+/// A relocated address is not automatically a callable function entry: the
+/// consumer and target role remain separate proof obligations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayRelocationKind {
+    Mips32,
+    Mips26Call,
+    Mips26Jump,
+    Hi16Lo16Address,
+}
+
+/// How the value associated with an overlay relocation was obtained. This is
+/// deliberately separate from relocation kind: a HI16/LO16 value depends on
+/// the parser's register-pairing model and is candidate evidence, while an
+/// R_MIPS_32 word is retained directly from the unrelocated image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayRelocationValueEvidence {
+    StoredWord,
+    JumpInstructionEncoding,
+    RegisterPairedHi16Lo16,
+}
+
 /// The deterministic Phase 3 provider that produced a function-entry claim.
 /// These values are part of serialized provenance, so adding a provider must
 /// add a new variant rather than reusing a free-form string.
@@ -263,6 +298,20 @@ pub enum Fact {
         destination_start: u32,
         destination_end: u32,
     },
+    /// One linker-declared Zelda overlay relocation. `site` is the loaded
+    /// address of the relocated word (the LO16 instruction for a paired
+    /// HI16/LO16 address), while `unrelocated_value` is the stored or decoded
+    /// value from the image. `value_evidence` records whether that value was
+    /// direct or depended on the parser's register-pairing model. This proves
+    /// a relocation fact only; it does not prove the run-time relocated value,
+    /// reachability, or a callable boundary.
+    OverlayRelocation {
+        site: BankAddr,
+        section: OverlayRelocationSection,
+        kind: OverlayRelocationKind,
+        value_evidence: OverlayRelocationValueEvidence,
+        unrelocated_value: u32,
+    },
     /// A code-pointer entry exposed by a descriptor table or vector that an
     /// earlier phase has already identified. Phase 3 consumes this fact; it
     /// never guesses table locations or semantics from raw bytes.
@@ -302,6 +351,7 @@ impl Fact {
             Fact::RomMapping { bank, .. } => Some(bank),
             Fact::ExecutableRange { bank, .. } => Some(bank),
             Fact::LoadImageTableRecord { bank, .. } => bank.as_deref(),
+            Fact::OverlayRelocation { site, .. } => Some(&site.bank),
             Fact::TableEntry { table, .. } => Some(&table.bank),
             Fact::FunctionEntryClaim { target, .. } => Some(&target.bank),
             Fact::Evidence { subject, .. } => Some(&subject.bank),
@@ -339,6 +389,7 @@ impl Fact {
                     banks.insert(bank);
                 }
             }
+            Fact::OverlayRelocation { site, .. } => insert_addr(&mut banks, site),
             Fact::TableEntry { table, target, .. } => {
                 insert_addr(&mut banks, table);
                 insert_addr(&mut banks, target);
