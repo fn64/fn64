@@ -16,18 +16,22 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
+import hashlib
 import json
 import os
 import secrets
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
 
-FRONTIER_SCHEMA = "fn64.rom-frontier.v1"
+FRONTIER_SCHEMA = "fn64.rom-frontier.v2"
+FAILURE_SCHEMA = "fn64.rom-frontier-failure.v1"
 CATALOG_SCHEMA = "fn64.rom-catalog.v1"
+RSS_SAMPLE_INTERVAL_SECONDS = 1.0
 
 # A boot bank whose call targets vastly outnumber its resident returns is a
 # loader stub: its code is streamed in, so no boot-bank-only strategy can
@@ -118,22 +122,128 @@ def load_catalog(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def run_discovery(binary: Path, rom_path: Path, timeout_seconds: int) -> dict[str, Any]:
-    """Run `fn64-discover <rom> --summary` and return its parsed summary."""
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sample_rss_bytes(pid: int) -> int | None:
+    """Return the child's currently observed RSS, or None when unavailable.
+
+    POSIX `ps` reports RSS in KiB on both macOS and Linux. Sampling is used
+    instead of process-global `getrusage(RUSAGE_CHILDREN)`, whose totals cannot
+    be attributed correctly while corpus children run concurrently.
+    """
     try:
-        completed = subprocess.run(
-            [str(binary), str(rom_path), "--summary"],
+        sampled = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
-            timeout=timeout_seconds,
+            timeout=1,
             check=False,
         )
-    except subprocess.TimeoutExpired as error:
-        raise FrontierError(f"{rom_path.name} exceeded {timeout_seconds}s") from error
-    if completed.returncode != 0:
-        raise FrontierError(f"{rom_path.name} discovery exited {completed.returncode}")
-    for line in completed.stdout.decode("utf-8", "replace").splitlines():
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if sampled.returncode != 0:
+        return None
+    try:
+        kibibytes = int(sampled.stdout.strip())
+    except ValueError:
+        return None
+    return kibibytes * 1024
+
+
+def encoded_summary_from_receipt(line: str) -> bytes:
+    """Recover the exact nested summary encoding covered by Rust's hash."""
+    marker = '"summary":'
+    marker_start = line.find(marker)
+    if marker_start < 0:
+        raise FrontierError("summary receipt has no summary member")
+    start = marker_start + len(marker)
+    if start >= len(line) or line[start] != "{":
+        raise FrontierError("summary receipt summary is not an object")
+    depth = 0
+    quoted = False
+    escaped = False
+    for index in range(start, len(line)):
+        character = line[index]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return line[start : index + 1].encode("utf-8")
+    raise FrontierError("summary receipt summary is truncated")
+
+
+def run_discovery(binary: Path, rom_path: Path, timeout_seconds: int) -> dict[str, Any]:
+    """Run owner proof and return its summary plus attributable cost."""
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            [str(binary), str(rom_path), "--summary", "--prove-owners"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise FrontierError(f"{rom_path.name} discovery could not start") from error
+
+    peak_rss_bytes = sample_rss_bytes(process.pid)
+    while True:
+        remaining = timeout_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            process.kill()
+            process.communicate()
+            raise FrontierError(f"{rom_path.name} exceeded {timeout_seconds}s")
+        try:
+            stdout, _stderr = process.communicate(
+                timeout=min(RSS_SAMPLE_INTERVAL_SECONDS, remaining)
+            )
+            break
+        except subprocess.TimeoutExpired:
+            rss_bytes = sample_rss_bytes(process.pid)
+            if rss_bytes is not None:
+                peak_rss_bytes = max(peak_rss_bytes or 0, rss_bytes)
+
+    wall_seconds = round(time.monotonic() - started, 6)
+    if process.returncode != 0:
+        raise FrontierError(f"{rom_path.name} discovery exited {process.returncode}")
+    for line in stdout.decode("utf-8", "replace").splitlines():
         if line.startswith("{"):
-            return json.loads(line)["summary"]
+            try:
+                receipt = json.loads(line)
+                summary = receipt["summary"]
+                claimed_hash = receipt["receipt_sha256"]
+                encoded_summary = encoded_summary_from_receipt(line)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError, FrontierError) as error:
+                raise FrontierError(f"{rom_path.name} produced an invalid summary record") from error
+            if not isinstance(summary, dict) or summary.get("schema_version") != 2:
+                raise FrontierError(f"{rom_path.name} owner-proof summary is not schema v2")
+            if not isinstance(claimed_hash, str) or claimed_hash != hashlib.sha256(
+                encoded_summary
+            ).hexdigest():
+                raise FrontierError(f"{rom_path.name} summary receipt hash does not match")
+            if "owner_proof" not in summary:
+                raise FrontierError(f"{rom_path.name} produced no owner-proof diagnostics")
+            return {
+                "summary": summary,
+                "wall_seconds": wall_seconds,
+                "peak_rss_bytes": peak_rss_bytes,
+            }
     raise FrontierError(f"{rom_path.name} produced no summary record")
 
 
@@ -204,7 +314,156 @@ def classify(record: dict[str, Any]) -> str:
     return "resident_code"
 
 
-def join(catalog: list[dict[str, Any]], summaries: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def validate_owner_proof(value: Any, digest: str) -> dict[str, Any]:
+    """Validate the structured Rust receipt without changing its vocabulary."""
+    if not isinstance(value, dict):
+        raise FrontierError(f"{digest} owner_proof is not an object")
+    if value.get("coverage_blocker_payloads_omitted") is not True:
+        raise FrontierError(
+            f"{digest} owner_proof must declare omitted coverage blocker payloads"
+        )
+
+    def require_object(item: Any, label: str) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            raise FrontierError(f"{digest} owner_proof {label} is not an object")
+        return item
+
+    def require_list(item: dict[str, Any], field: str, label: str) -> list[Any]:
+        held = item.get(field)
+        if not isinstance(held, list):
+            raise FrontierError(f"{digest} owner_proof {label}.{field} is not an array")
+        return held
+
+    def require_count(item: dict[str, Any], field: str, label: str) -> None:
+        held = item.get(field)
+        if not isinstance(held, int) or isinstance(held, bool) or held < 0:
+            raise FrontierError(
+                f"{digest} owner_proof {label}.{field} is not a nonnegative integer"
+            )
+
+    def validate_marginals(items: list[Any], label: str) -> None:
+        for index, raw in enumerate(items):
+            item_label = f"{label}[{index}]"
+            item = require_object(raw, item_label)
+            if not isinstance(item.get("kind"), str) or not item["kind"]:
+                raise FrontierError(f"{digest} owner_proof {item_label}.kind is invalid")
+            for field in (
+                "affected_assessments",
+                "occurrences",
+                "sole_blocker_assessments",
+            ):
+                require_count(item, field, item_label)
+
+    def validate_combinations(items: list[Any], label: str) -> None:
+        for index, raw in enumerate(items):
+            item_label = f"{label}[{index}]"
+            item = require_object(raw, item_label)
+            if item.get("assessment_state") not in ("candidate", "ambiguous"):
+                raise FrontierError(
+                    f"{digest} owner_proof {item_label}.assessment_state is invalid"
+                )
+            kinds = require_list(item, "kinds", item_label)
+            if (
+                not all(isinstance(kind, str) and kind for kind in kinds)
+                or kinds != sorted(set(kinds))
+            ):
+                raise FrontierError(
+                    f"{digest} owner_proof {item_label}.kinds is not sorted and unique"
+                )
+            require_count(item, "assessments", item_label)
+
+    def validate_ranges(raw: Any, label: str) -> None:
+        item = require_object(raw, label)
+        require_count(item, "proven_range_count", label)
+        require_count(item, "proven_bytes", label)
+        for index, raw_provenance in enumerate(require_list(item, "provenance", label)):
+            provenance_label = f"{label}.provenance[{index}]"
+            provenance = require_object(raw_provenance, provenance_label)
+            if not isinstance(provenance.get("rule"), str) or not provenance["rule"]:
+                raise FrontierError(
+                    f"{digest} owner_proof {provenance_label}.rule is invalid"
+                )
+            require_count(provenance, "range_count", provenance_label)
+            require_count(provenance, "bytes", provenance_label)
+
+    def validate_indirect(raw: Any, label: str) -> None:
+        item = require_object(raw, label)
+        for field in (
+            "total_sites",
+            "exhaustive_sites",
+            "bounded_sites",
+            "open_sites",
+            "via_call_sites",
+            "via_jump_sites",
+        ):
+            require_count(item, field, label)
+        for index, raw_kind in enumerate(require_list(item, "resolution_kinds", label)):
+            kind_label = f"{label}.resolution_kinds[{index}]"
+            kind = require_object(raw_kind, kind_label)
+            if kind.get("kind") not in (
+                "constant",
+                "memory_value_set",
+                "jump_table",
+                "unresolved",
+            ):
+                raise FrontierError(f"{digest} owner_proof {kind_label}.kind is invalid")
+            require_count(kind, "sites", kind_label)
+        for index, raw_count in enumerate(
+            require_list(item, "target_count_distribution", label)
+        ):
+            count_label = f"{label}.target_count_distribution[{index}]"
+            count = require_object(raw_count, count_label)
+            require_count(count, "target_count", count_label)
+            require_count(count, "sites", count_label)
+
+    validate_marginals(require_list(value, "blocker_marginals", "root"), "blocker_marginals")
+    root_combinations = require_list(value, "blocker_combinations", "root")
+    validate_combinations(root_combinations, "blocker_combinations")
+    validate_ranges(value.get("executable_ranges"), "executable_ranges")
+    validate_indirect(value.get("indirect_transfers"), "indirect_transfers")
+    unresolved_assessments = 0
+    for index, raw_bank in enumerate(require_list(value, "banks", "root")):
+        label = f"banks[{index}]"
+        bank = require_object(raw_bank, label)
+        if not isinstance(bank.get("bank"), str) or not bank["bank"]:
+            raise FrontierError(f"{digest} owner_proof {label}.bank is invalid")
+        for field in (
+            "assessed_entries",
+            "exact_owners",
+            "candidate_owners",
+            "ambiguous_owners",
+            "exact_owner_bytes",
+        ):
+            require_count(bank, field, label)
+        validate_marginals(
+            require_list(bank, "blocker_marginals", label), f"{label}.blocker_marginals"
+        )
+        if bank["assessed_entries"] != (
+            bank["exact_owners"] + bank["candidate_owners"] + bank["ambiguous_owners"]
+        ):
+            raise FrontierError(f"{digest} owner_proof {label} owner totals do not balance")
+        bank_combinations = require_list(bank, "blocker_combinations", label)
+        validate_combinations(bank_combinations, f"{label}.blocker_combinations")
+        bank_unresolved = bank["candidate_owners"] + bank["ambiguous_owners"]
+        if sum(item["assessments"] for item in bank_combinations) != bank_unresolved:
+            raise FrontierError(
+                f"{digest} owner_proof {label} blocker combinations do not cover unresolved owners"
+            )
+        unresolved_assessments += bank_unresolved
+        validate_ranges(bank.get("executable_ranges"), f"{label}.executable_ranges")
+        validate_indirect(bank.get("indirect_transfers"), f"{label}.indirect_transfers")
+    if sum(item["assessments"] for item in root_combinations) != unresolved_assessments:
+        raise FrontierError(
+            f"{digest} owner_proof aggregate blocker combinations do not match bank rows"
+        )
+    return value
+
+
+def join(
+    catalog: list[dict[str, Any]],
+    summaries: dict[str, dict[str, Any]],
+    measurements: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     rows = []
     for record in catalog:
         digest = record["normalized_rom_sha256"]
@@ -221,8 +480,7 @@ def join(catalog: list[dict[str, Any]], summaries: dict[str, dict[str, Any]]) ->
             for outcome in outcomes
             if outcome["strategy"] in GEOMETRY_STRATEGIES
         }
-        rows.append(
-            {
+        row = {
                 "schema": FRONTIER_SCHEMA,
                 "normalized_rom_sha256": digest,
                 "stable_id": record.get("stable_id", ""),
@@ -268,7 +526,18 @@ def join(catalog: list[dict[str, Any]], summaries: dict[str, dict[str, Any]]) ->
                 "cache_ops": record["cache_ops"],
                 "branch_likely": record["branch_likely"],
             }
-        )
+        # Optional additions leave old summary fixtures and v1 receipts
+        # readable while retaining the structured proof data when requested.
+        if "owner_proof" in summary:
+            row["owner_proof"] = validate_owner_proof(summary["owner_proof"], digest)
+        if measurements is not None and digest in measurements:
+            measurement = measurements[digest]
+            row["wall_seconds"] = measurement["wall_seconds"]
+            row["sampled_peak_rss_bytes"] = measurement["sampled_peak_rss_bytes"]
+            row["rss_scope"] = "direct_process"
+            row["rss_sample_interval_seconds"] = RSS_SAMPLE_INTERVAL_SECONDS
+            row["discovery_binary_sha256"] = measurement["discovery_binary_sha256"]
+        rows.append(row)
     if not rows:
         raise FrontierError("no catalog record joined a discovery summary")
     return rows
@@ -356,6 +625,56 @@ def report(rows: list[dict[str, Any]]) -> None:
             f"{row['geometry_failure']}"
         )
 
+    owner_rows = [row for row in rows if "owner_proof" in row]
+    if owner_rows:
+        assessed = exact = candidate = ambiguous = exact_bytes = 0
+        marginals: dict[str, list[int]] = {}
+        combinations: collections.Counter[tuple[str, tuple[str, ...]]] = collections.Counter()
+        indirect = collections.Counter()
+        for row in owner_rows:
+            proof = row["owner_proof"]
+            for bank in proof["banks"]:
+                assessed += bank["assessed_entries"]
+                exact += bank["exact_owners"]
+                candidate += bank["candidate_owners"]
+                ambiguous += bank["ambiguous_owners"]
+                exact_bytes += bank["exact_owner_bytes"]
+            for marginal in proof["blocker_marginals"]:
+                counts = marginals.setdefault(marginal["kind"], [0, 0, 0])
+                counts[0] += marginal["affected_assessments"]
+                counts[1] += marginal["sole_blocker_assessments"]
+                counts[2] += marginal["occurrences"]
+            for combination in proof["blocker_combinations"]:
+                key = (combination["assessment_state"], tuple(combination["kinds"]))
+                combinations[key] += combination["assessments"]
+            for field in (
+                "total_sites",
+                "exhaustive_sites",
+                "bounded_sites",
+                "open_sites",
+                "via_call_sites",
+                "via_jump_sites",
+            ):
+                indirect[field] += proof["indirect_transfers"][field]
+
+        print(f"\nowner proof ({len(owner_rows)} ROMs):")
+        print(
+            f"  assessed={assessed} exact={exact} exact_bytes={exact_bytes} "
+            f"candidate={candidate} ambiguous={ambiguous}"
+        )
+        print("  blocker kinds (affected assessments, sole immediate payoff, site occurrences):")
+        for kind, counts in sorted(marginals.items(), key=lambda item: (-item[1][0], item[0])):
+            print(f"    {kind:<38}{counts[0]:>10}{counts[1]:>10}{counts[2]:>14}")
+        print("  dominant exact blocker combinations:")
+        for (state, kinds), count in combinations.most_common(12):
+            print(f"    {state:<10}{count:>10}  {' + '.join(kinds)}")
+        print(
+            "  indirect sites: "
+            f"total={indirect['total_sites']} exhaustive={indirect['exhaustive_sites']} "
+            f"bounded={indirect['bounded_sites']} open={indirect['open_sites']} "
+            f"calls={indirect['via_call_sites']} jumps={indirect['via_jump_sites']}"
+        )
+
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
@@ -366,12 +685,16 @@ def parser() -> argparse.ArgumentParser:
         help="ROM directory; defaults to $FN64_ROM_CORPUS_DIR. No relative fallback.",
     )
     result.add_argument("--output", help="absolute JSONL path for per-ROM detail")
+    result.add_argument(
+        "--failures-output",
+        help="absolute JSONL path for path-free failed-ROM diagnostics",
+    )
     result.add_argument("--timeout-seconds", type=int, default=600)
     result.add_argument(
         "--jobs",
         type=int,
-        default=min(32, (os.cpu_count() or 1)),
-        help="concurrent discovery subprocesses (default: one per core)",
+        default=min(2, (os.cpu_count() or 1)),
+        help="concurrent owner-proof subprocesses (default: 2; raise explicitly after measuring RSS)",
     )
     result.add_argument("--limit", type=int, help="stop after N ROMs (smoke runs)")
     return result
@@ -389,11 +712,20 @@ def main() -> int:
         binary = Path(args.binary)
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise FrontierError(f"{binary} is not an executable file")
+        if args.jobs <= 0:
+            raise FrontierError("jobs must be positive")
+        binary_sha256 = sha256_file(binary)
         output_path = validate_output_destination(args.output) if args.output else None
+        failures_path = (
+            validate_output_destination(args.failures_output) if args.failures_output else None
+        )
+        if output_path is not None and failures_path == output_path:
+            raise FrontierError("output and failures-output must be different files")
 
         catalog = load_catalog(Path(args.catalog))
         if args.limit is not None:
             catalog = catalog[: args.limit]
+        catalog_digests = {record["normalized_rom_sha256"] for record in catalog}
 
         rom_paths = [
             path
@@ -403,32 +735,69 @@ def main() -> int:
         if args.limit is not None:
             rom_paths = rom_paths[: args.limit]
 
-        # Each ROM is an independent read-only subprocess with no shared state,
-        # so discovery fans out across cores. Measured 1.7-6.0 s per ROM, which
-        # is 40+ minutes sequentially over a 287-ROM corpus.
+        # Each ROM is independent, but snapshot composition retains materially
+        # more memory than plain discovery. Keep the default bounded; an
+        # operator can raise it after the sampled RSS field demonstrates room.
         summaries: dict[str, dict[str, Any]] = {}
-        failures: list[str] = []
+        measurements: dict[str, dict[str, Any]] = {}
+        failures: list[dict[str, Any]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             pending = {
-                pool.submit(run_discovery, binary, path, args.timeout_seconds): path
-                for path in rom_paths
+                pool.submit(run_discovery, binary, path, args.timeout_seconds): (index, path)
+                for index, path in enumerate(rom_paths)
             }
             for future in concurrent.futures.as_completed(pending):
                 try:
-                    summary = future.result()
+                    result = future.result()
                 except FrontierError as error:
                     # One unreadable ROM must not discard the whole sweep, but
                     # it is still reported rather than silently dropped.
-                    failures.append(str(error))
+                    failures.append(
+                        {
+                            "schema": FAILURE_SCHEMA,
+                            "input_index": pending[future][0],
+                            "input_name": pending[future][1].name,
+                            "identity_scope": "path_free_basename_not_verified_digest",
+                            "error": str(error),
+                        }
+                    )
                     continue
-                summaries[summary["normalized_rom_sha256"]] = summary
+                summary = result["summary"]
+                digest = summary.get("normalized_rom_sha256")
+                if digest not in catalog_digests or digest in summaries:
+                    failures.append(
+                        {
+                            "schema": FAILURE_SCHEMA,
+                            "input_index": pending[future][0],
+                            "input_name": pending[future][1].name,
+                            "identity_scope": "path_free_basename_not_verified_digest",
+                            "error": (
+                                f"{pending[future][1].name} summary digest is not a unique "
+                                "catalog member"
+                            ),
+                        }
+                    )
+                    continue
+                summaries[digest] = summary
+                measurements[digest] = {
+                    "wall_seconds": result["wall_seconds"],
+                    "sampled_peak_rss_bytes": result["peak_rss_bytes"],
+                    "discovery_binary_sha256": binary_sha256,
+                }
+        failures.sort(key=lambda failure: failure["input_name"])
         for failure in failures:
-            print(f"rom-frontier: {failure}", file=sys.stderr)
+            print(f"rom-frontier: {failure['error']}", file=sys.stderr)
+        if not summaries:
+            if failures_path is not None:
+                publish_records(failures_path, failures)
+            raise FrontierError("no ROM completed discovery")
 
-        rows = join(catalog, summaries)
+        rows = join(catalog, summaries, measurements)
         report(rows)
         if output_path is not None:
             publish_records(output_path, rows)
+        if failures_path is not None:
+            publish_records(failures_path, failures)
         return 0
     except FrontierError as error:
         print(f"rom-frontier: {error}", file=sys.stderr)

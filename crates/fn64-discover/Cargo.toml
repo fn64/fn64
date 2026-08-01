@@ -45,6 +45,11 @@ path = "src/bin/compare_computed_flows.rs"
 test = true
 
 [[bin]]
+name = "diagnose_open_indirects"
+path = "src/bin/diagnose_open_indirects.rs"
+test = false
+
+[[bin]]
 name = "validate_candidate_receipts"
 path = "src/bin/validate_candidate_receipts.rs"
 test = false

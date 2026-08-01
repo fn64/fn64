@@ -47,10 +47,13 @@ decoded.
 
 The last rule is deliberately stronger than ordinary CFG reachability. An
 open computed transfer elsewhere in the active bank could enter the proposed
-span. The current fact model cannot express an exhaustively excluded target
-domain, so the pass retains every such owner as `candidate`. A future bounded
-target-domain fact may discharge that blocker for unrelated owners without
-requiring global indirect closure.
+span. A typed exclusion-only target-domain view now admits one narrower case:
+a guard-bounded jump table whose complete enumerated target set was rejected
+from CFG admission may discharge a bank-scoped blocker when every retained
+target is outside the proposed owner extent. The domain never contributes CFG
+successors or callable-entry authority. Owner-scoped sites, empty or
+unconstrained domains, and initial values read from mutable memory continue to
+block; those initial values are not an exhaustive runtime target domain.
 
 Results are a tagged enum. Only `proven` carries an `ExactFunctionOwner` with
 a bank-qualified VA extent and `BankBackingSpanV1`. The backing is either an
@@ -70,6 +73,16 @@ remain in the coverage artifact with assessment counts. The strict
 `require_all_owners_exact` gate rejects an empty run, any unresolved owner,
 duplicate `(bank, entry)` assessments, cross-bank report entries, and malformed
 deserialized extents before metadata can reach an emitter.
+
+The content-free corpus diagnostic projects each unresolved assessment to its
+sorted, unique set of `OwnerBlockerKind` values and counts exact combinations
+separately for candidate and ambiguous assessments in each bank. Full blocker
+payloads are excluded because some carry decoded instruction words. The
+combination histogram is the dependency measurement: a singleton is the
+immediate payoff if one blocker class is discharged, while a multi-kind row
+must not be reported as independent wins for its members. Per-kind
+`affected_assessments`, site `occurrences`, and `sole_blocker_assessments`
+remain separate units, and ROM totals are derived by summing the bank rows.
 
 This proof depends only on fn64's own discovery model and public MIPS-III
 control-flow/delay-slot behavior already documented in

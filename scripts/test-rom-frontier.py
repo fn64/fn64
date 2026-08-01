@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().with_name("rom-frontier.py")
@@ -46,6 +49,7 @@ def summary(digest: str = "a" * 64, **overrides: object) -> dict:
         "function_entries_by_state": states,
     }
     record = {
+        "schema_version": 1,
         "normalized_rom_sha256": digest,
         "selected_strategy": "boot_bank_only",
         "coverage": coverage,
@@ -56,6 +60,62 @@ def summary(digest: str = "a" * 64, **overrides: object) -> dict:
     }
     record.update(overrides)
     return record
+
+
+def owner_proof() -> dict:
+    marginal = {
+        "kind": "unresolved_indirect",
+        "affected_assessments": 7,
+        "occurrences": 12,
+        "sole_blocker_assessments": 3,
+    }
+    combination = {
+        "assessment_state": "candidate",
+        "kinds": ["entry_not_authoritative", "unresolved_indirect"],
+        "assessments": 9,
+    }
+    ranges = {
+        "proven_range_count": 1,
+        "proven_bytes": 64,
+        "provenance": [{"rule": "block_closure", "range_count": 1, "bytes": 64}],
+    }
+    indirect = {
+        "total_sites": 8,
+        "exhaustive_sites": 2,
+        "bounded_sites": 1,
+        "open_sites": 5,
+        "via_call_sites": 3,
+        "via_jump_sites": 5,
+        "resolution_kinds": [
+            {"kind": "constant", "sites": 2},
+            {"kind": "unresolved", "sites": 6},
+        ],
+        "target_count_distribution": [
+            {"target_count": 0, "sites": 5},
+            {"target_count": 1, "sites": 3},
+        ],
+    }
+    return {
+        "coverage_blocker_payloads_omitted": True,
+        "banks": [
+            {
+                "bank": "boot",
+                "assessed_entries": 10,
+                "exact_owners": 1,
+                "candidate_owners": 9,
+                "ambiguous_owners": 0,
+                "exact_owner_bytes": 64,
+                "blocker_marginals": [marginal],
+                "blocker_combinations": [combination],
+                "executable_ranges": ranges,
+                "indirect_transfers": indirect,
+            }
+        ],
+        "blocker_marginals": [marginal],
+        "blocker_combinations": [combination],
+        "executable_ranges": ranges,
+        "indirect_transfers": indirect,
+    }
 
 
 class ClassifyTests(unittest.TestCase):
@@ -177,6 +237,126 @@ class JoinTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["proven_target_share"], 0.0)
 
+    def test_owner_diagnostics_and_measurement_are_retained_without_renaming(self) -> None:
+        proof = owner_proof()
+        rows = FRONTIER.join(
+            [catalog_record()],
+            {"a" * 64: summary(owner_proof=proof)},
+            {
+                "a" * 64: {
+                    "wall_seconds": 1.25,
+                    "sampled_peak_rss_bytes": 4096,
+                    "discovery_binary_sha256": "b" * 64,
+                }
+            },
+        )
+        self.assertEqual(rows[0]["owner_proof"], proof)
+        self.assertEqual(rows[0]["wall_seconds"], 1.25)
+        self.assertEqual(rows[0]["sampled_peak_rss_bytes"], 4096)
+        self.assertEqual(rows[0]["discovery_binary_sha256"], "b" * 64)
+        self.assertEqual(rows[0]["rss_scope"], "direct_process")
+        self.assertEqual(rows[0]["rss_sample_interval_seconds"], 1.0)
+        self.assertEqual(
+            rows[0]["owner_proof"]["blocker_marginals"][0]["sole_blocker_assessments"],
+            3,
+        )
+
+    def test_v1_summary_without_owner_diagnostics_remains_supported(self) -> None:
+        row = FRONTIER.join([catalog_record()], {"a" * 64: summary()})[0]
+        self.assertNotIn("owner_proof", row)
+        self.assertNotIn("wall_seconds", row)
+
+    def test_malformed_owner_diagnostics_are_loud(self) -> None:
+        with self.assertRaises(FRONTIER.FrontierError):
+            FRONTIER.join(
+                [catalog_record()],
+                {"a" * 64: summary(owner_proof=[])},
+            )
+        malformed = owner_proof()
+        malformed["blocker_combinations"][0]["kinds"] = [
+            "unresolved_indirect",
+            "entry_not_authoritative",
+        ]
+        with self.assertRaises(FRONTIER.FrontierError):
+            FRONTIER.join(
+                [catalog_record()],
+                {"a" * 64: summary(owner_proof=malformed)},
+            )
+
+    def test_report_exposes_sole_payoff_and_exact_combinations(self) -> None:
+        row = FRONTIER.join(
+            [catalog_record()],
+            {"a" * 64: summary(owner_proof=owner_proof())},
+        )[0]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            FRONTIER.report([row])
+        rendered = output.getvalue()
+        self.assertIn("sole immediate payoff", rendered)
+        self.assertIn("unresolved_indirect", rendered)
+        self.assertIn("entry_not_authoritative + unresolved_indirect", rendered)
+        self.assertIn("indirect sites:", rendered)
+
+
+class DiscoveryRunTests(unittest.TestCase):
+    def test_owner_proof_parallelism_default_is_memory_bounded(self) -> None:
+        args = FRONTIER.parser().parse_args(["--catalog", "catalog", "--binary", "binary"])
+        self.assertEqual(args.jobs, min(2, FRONTIER.os.cpu_count() or 1))
+
+    def test_owner_proof_is_requested_and_cost_is_measured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arguments = root / "arguments"
+            executable = root / "discover"
+            emitted_summary = {
+                "schema_version": 2,
+                "normalized_rom_sha256": "a" * 64,
+                "owner_proof": owner_proof(),
+            }
+            encoded_summary = json.dumps(
+                emitted_summary, separators=(",", ":"), ensure_ascii=False
+            )
+            receipt = json.dumps(
+                {
+                    "summary": emitted_summary,
+                    "receipt_sha256": __import__("hashlib")
+                    .sha256(encoded_summary.encode())
+                    .hexdigest(),
+                },
+                separators=(",", ":"),
+            )
+            executable.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" > '{arguments}'\n"
+                f"printf '%s\\n' '{receipt}'\n"
+            )
+            executable.chmod(0o755)
+            result = FRONTIER.run_discovery(executable, root / "sample.z64", 5)
+            self.assertEqual(
+                arguments.read_text().splitlines(),
+                [str(root / "sample.z64"), "--summary", "--prove-owners"],
+            )
+            self.assertGreaterEqual(result["wall_seconds"], 0)
+            self.assertIn("peak_rss_bytes", result)
+
+    def test_tampered_summary_receipt_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "discover"
+            emitted_summary = {
+                "schema_version": 2,
+                "normalized_rom_sha256": "a" * 64,
+                "owner_proof": owner_proof(),
+            }
+            receipt = json.dumps(
+                {"summary": emitted_summary, "receipt_sha256": "0" * 64},
+                separators=(",", ":"),
+            )
+            executable.write_text(f"#!/bin/sh\nprintf '%s\\n' '{receipt}'\n")
+            executable.chmod(0o755)
+            with self.assertRaisesRegex(FRONTIER.FrontierError, "hash does not match"):
+                FRONTIER.run_discovery(executable, root / "sample.z64", 5)
+
 
 class ParallelismTests(unittest.TestCase):
     def test_summaries_key_on_digest_so_completion_order_cannot_reorder_output(self) -> None:
@@ -197,6 +377,15 @@ class ParallelismTests(unittest.TestCase):
 
 
 class CatalogLoadTests(unittest.TestCase):
+    def test_binary_digest_is_streamed_from_exact_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "discover"
+            path.write_bytes(b"exact executable bytes")
+            self.assertEqual(
+                FRONTIER.sha256_file(path),
+                "135a9af43260004bfc617b97f806fcc6600e211fe0219d6c4311ef8cc6d59b48",
+            )
+
     def test_wrong_schema_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "catalog.jsonl"
@@ -228,6 +417,50 @@ class OutputTests(unittest.TestCase):
             path = Path(directory).resolve() / "frontier.jsonl"
             FRONTIER.publish_records(path, [{"b": 2, "a": 1}])
             self.assertEqual(path.read_bytes(), b'{"a":1,"b":2}\n')
+
+    def test_empty_failure_output_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "failures.jsonl"
+            FRONTIER.publish_records(path, [])
+            self.assertEqual(path.read_bytes(), b"")
+
+    def test_all_failed_roms_are_published_only_to_explicit_failure_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            catalog = root / "catalog.jsonl"
+            catalog.write_text(json.dumps(catalog_record()) + "\n")
+            rom_dir = root / "roms"
+            rom_dir.mkdir()
+            (rom_dir / "failed.z64").write_bytes(b"")
+            executable = root / "discover"
+            executable.write_text("#!/bin/sh\nexit 3\n")
+            executable.chmod(0o755)
+            failures = root / "failures.jsonl"
+            output = root / "frontier.jsonl"
+            argv = [
+                str(SCRIPT),
+                "--catalog",
+                str(catalog),
+                "--binary",
+                str(executable),
+                "--rom-dir",
+                str(rom_dir),
+                "--output",
+                str(output),
+                "--failures-output",
+                str(failures),
+                "--jobs",
+                "1",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                self.assertEqual(FRONTIER.main(), 1)
+            self.assertFalse(output.exists())
+            record = json.loads(failures.read_text())
+            self.assertEqual(record["schema"], FRONTIER.FAILURE_SCHEMA)
+            self.assertEqual(record["input_name"], "failed.z64")
+            self.assertEqual(
+                record["identity_scope"], "path_free_basename_not_verified_digest"
+            )
 
 
 if __name__ == "__main__":

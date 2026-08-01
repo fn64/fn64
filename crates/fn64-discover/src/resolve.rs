@@ -4005,10 +4005,12 @@ mod tests {
         assert!(call.via_call);
         // The whole resolution must be refused: not Exhaustive, no fabricated
         // targets, and the garbage word never seeded as a root or block.
-        assert_ne!(
-            call.state,
-            IndirectProofState::Exhaustive,
-            "an over-walked out-of-bank jump-table slot must not be admitted",
+        assert_eq!(call.state, IndirectProofState::Bounded);
+        assert_eq!(call.kind, Some(IndirectResolutionKind::JumpTable));
+        assert_eq!(
+            call.targets,
+            vec![0x8000_0080, 0x8000_0090, over_walked],
+            "the full guard-enumerated domain must survive CFG rejection",
         );
         assert!(!closure.cfg.proven_roots.contains(&over_walked));
         assert!(!closure

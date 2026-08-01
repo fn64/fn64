@@ -24,6 +24,13 @@ underlying `fn64-discover --summary` output is observation-only: it contains a
 normalized-ROM digest, strategy outcomes, coverage, and a self-hash, but no
 paths, ROM bytes, fact log, ledger, or admission authority. Use the normal
 `--out facts.json` route whenever downstream work needs the complete artifact.
+`--summary --prove-owners` is the heavier schema-v2 corpus path: it composes
+bank snapshots and retains only content-free owner/blocker, executable-range,
+and indirect-resolution aggregates. `rom-frontier.py` records per-ROM wall
+time and samples direct-process RSS once per second; that peak is a lower
+bound between samples, not an enforced limit. Its default of two concurrent
+owner-proof children is intentionally independent of CPU count, and should be
+raised only after measuring memory headroom.
 The automatic strategy pass normalizes the ROM once, evaluates each mechanical
 Phase-2 recovery once, then runs Phase-3 candidate harvest only on the selected
 database. Strategy outcomes and the selected fact log remain deterministic;

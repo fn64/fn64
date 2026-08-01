@@ -236,6 +236,45 @@ impl From<&OwnerBlocker> for OwnerBlockerKind {
     }
 }
 
+impl OwnerBlockerKind {
+    /// Stable content-free label for summary and aggregate diagnostics. The
+    /// explicit spelling keeps those consumers independent of Debug/stderr.
+    pub const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::BankNotProven => "bank_not_proven",
+            Self::PartitionBankMismatch => "partition_bank_mismatch",
+            Self::EntryNotAuthoritative => "entry_not_authoritative",
+            Self::OwnerMissing => "owner_missing",
+            Self::DuplicateOwner => "duplicate_owner",
+            Self::OwnerBankMismatch => "owner_bank_mismatch",
+            Self::OwnerNotContiguous => "owner_not_contiguous",
+            Self::PartitionAmbiguity => "partition_ambiguity",
+            Self::PartitionOverlap => "partition_overlap",
+            Self::DuplicateCfgBlockStart => "duplicate_cfg_block_start",
+            Self::MissingCfgBlock => "missing_cfg_block",
+            Self::MalformedBlock => "malformed_block",
+            Self::InconsistentTerminator => "inconsistent_terminator",
+            Self::RanOffEnd => "ran_off_end",
+            Self::InvalidInstruction => "invalid_instruction",
+            Self::MissingDelaySlot => "missing_delay_slot",
+            Self::WordNotProvenCode => "word_not_proven_code",
+            Self::MissingBankBacking => "missing_bank_backing",
+            Self::AmbiguousBankBacking => "ambiguous_bank_backing",
+            Self::InvalidBankBackingGeometry => "invalid_bank_backing_geometry",
+            Self::NotProvenExecutable => "not_proven_executable",
+            Self::InteriorCallableEntry => "interior_callable_entry",
+            Self::InteriorCandidateEntry => "interior_candidate_entry",
+            Self::TrailingUnattributedCode => "trailing_unattributed_code",
+            Self::IncomingEdge => "incoming_edge",
+            Self::ObservedInteriorEntry => "observed_interior_entry",
+            Self::ResolvedJumpLeavesOwner => "resolved_jump_leaves_owner",
+            Self::ResolvedIndirectNotExhaustive => "resolved_indirect_not_exhaustive",
+            Self::ResolvedIndirectEvidenceMismatch => "resolved_indirect_evidence_mismatch",
+            Self::UnresolvedIndirect => "unresolved_indirect",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerBlockerSummary {
     pub kind: OwnerBlockerKind,

@@ -199,6 +199,17 @@ byte-granular ledger and full fact log. Its JSON receipt is path-free and binds
 the normalized-ROM digest, strategy outcomes, coverage, and a self-hash; it is
 not an evidence manifest, Decomp Pack, or admission authority.
 
+Adding `--prove-owners` emits summary schema v2 after snapshot composition.
+That receipt keeps ROM-wide discovery facts while merging the proven
+executable ranges derived inside each bank snapshot, and separately reports
+bank-local owner totals, blocker-kind combinations, executable conclusion
+rules, and indirect-resolution distributions. Full blocker payloads and
+indirect addresses stay out of this content-free diagnostic; the receipt marks
+that omission explicitly rather than letting an empty legacy payload list
+imply that no blocker exists. Corpus wall time
+is measured per child; sampled RSS is explicitly a lower bound and concurrent
+ROM durations are a distribution, not additive corpus wall time.
+
 `scripts/profile-discovery-loop.zsh` repeats that path with an explicit local
 binary and ROM, checks receipt equality, applies a per-run wall-clock bound,
 and reports min/median/max milliseconds. Its temporary summaries and

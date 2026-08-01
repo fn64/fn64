@@ -280,6 +280,31 @@ pub enum IndirectTransferKind {
     JumpTable,
 }
 
+/// Why a finite indirect-target domain is safe to use as an exclusion proof.
+///
+/// This is deliberately narrower than [`IndirectTransferState::Bounded`].
+/// Today only a guard-bounded jump table demoted by the resolver's target
+/// usability check carries a finite over-approximation of its destinations.
+/// Initial values read from mutable memory are not an exhaustive runtime
+/// domain and therefore have no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IndirectTargetDomainBasisV1 {
+    GuardBoundedFinite,
+}
+
+/// Typed exclusion-only view of an indirect transfer's finite target domain.
+///
+/// A domain never contributes CFG successors or callable-entry authority. It
+/// may only prove that a bank-scoped unresolved transfer cannot enter a
+/// disjoint function-owner extent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectTargetDomainV1 {
+    pub site: BankAddr,
+    pub via_call: bool,
+    pub basis: IndirectTargetDomainBasisV1,
+    pub targets: Vec<u32>,
+}
+
 /// The prologue shape that justified a [`CandidateDetector::ProloguePattern`]
 /// claim. A leaf claim requires a matched stack restore and `jr $ra`; a stack
 /// adjustment by itself is deliberately insufficient.
@@ -515,6 +540,41 @@ pub enum Fact {
 }
 
 impl Fact {
+    /// Project the one bounded analysis shape whose retained targets form a
+    /// finite over-approximation suitable for owner-exclusion proofs.
+    ///
+    /// `Bounded` is not sufficient by itself: constant and memory-value-set
+    /// records can describe only initial mutable state. The resolver emits a
+    /// bounded jump-table record when a guard-enumerated table was rejected
+    /// from CFG admission because at least one enumerated destination was not
+    /// usable. Keeping the complete enumerated set here is conservative for
+    /// disjointness and confers no positive reachability authority.
+    pub fn indirect_target_domain_v1(&self) -> Option<IndirectTargetDomainV1> {
+        let Fact::IndirectTransferAnalysis {
+            site,
+            via_call,
+            state: IndirectTransferState::Bounded,
+            kind: Some(IndirectTransferKind::JumpTable),
+            targets,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if targets.is_empty() {
+            return None;
+        }
+        let mut targets = targets.clone();
+        targets.sort_unstable();
+        targets.dedup();
+        Some(IndirectTargetDomainV1 {
+            site: site.clone(),
+            via_call: *via_call,
+            basis: IndirectTargetDomainBasisV1::GuardBoundedFinite,
+            targets,
+        })
+    }
+
     /// The bank this fact is scoped to, if it names one directly (some
     /// facts, like cross-bank `DirectCall`, don't have a single owner).
     pub fn primary_bank(&self) -> Option<&str> {
@@ -1658,6 +1718,56 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn indirect_target_domain_projection_is_guard_bounded_and_fail_closed() {
+        let analysis = |state, kind, targets| Fact::IndirectTransferAnalysis {
+            site: BankAddr::new("bank", 0x8000_0040),
+            via_call: false,
+            state,
+            kind,
+            targets,
+            memory_sources: vec![0x8000_1000],
+        };
+
+        let domain = analysis(
+            IndirectTransferState::Bounded,
+            Some(IndirectTransferKind::JumpTable),
+            vec![0x8000_0090, 0x8000_0080, 0x8000_0090],
+        )
+        .indirect_target_domain_v1()
+        .expect("guard-bounded jump table has an exclusion-only domain");
+        assert_eq!(
+            domain.basis,
+            IndirectTargetDomainBasisV1::GuardBoundedFinite
+        );
+        assert_eq!(domain.targets, vec![0x8000_0080, 0x8000_0090]);
+
+        for fact in [
+            analysis(
+                IndirectTransferState::Exhaustive,
+                Some(IndirectTransferKind::JumpTable),
+                vec![0x8000_0080],
+            ),
+            analysis(
+                IndirectTransferState::Open,
+                Some(IndirectTransferKind::JumpTable),
+                vec![0x8000_0080],
+            ),
+            analysis(
+                IndirectTransferState::Bounded,
+                Some(IndirectTransferKind::MemoryValueSet),
+                vec![0x8000_0080],
+            ),
+            analysis(
+                IndirectTransferState::Bounded,
+                Some(IndirectTransferKind::JumpTable),
+                vec![],
+            ),
+        ] {
+            assert!(fact.indirect_target_domain_v1().is_none());
+        }
     }
 
     #[test]

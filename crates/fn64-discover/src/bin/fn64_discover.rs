@@ -7,7 +7,7 @@ use fn64_discover::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{BufReader, Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -110,6 +110,89 @@ struct DiscoverySummary<'a> {
     strategy_outcomes: Vec<StrategyOutcome>,
     trace_count: usize,
     observed_load_image_reports: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_proof: Option<OwnerProofDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OwnerProofDiagnostics {
+    coverage_blocker_payloads_omitted: bool,
+    banks: Vec<OwnerProofBankDiagnostics>,
+    blocker_marginals: Vec<OwnerBlockerMarginal>,
+    blocker_combinations: Vec<OwnerBlockerCombination>,
+    executable_ranges: ExecutableRangeDiagnostics,
+    indirect_transfers: IndirectTransferDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OwnerProofBankDiagnostics {
+    bank: String,
+    assessed_entries: u64,
+    exact_owners: u64,
+    candidate_owners: u64,
+    ambiguous_owners: u64,
+    exact_owner_bytes: u64,
+    blocker_marginals: Vec<OwnerBlockerMarginal>,
+    blocker_combinations: Vec<OwnerBlockerCombination>,
+    executable_ranges: ExecutableRangeDiagnostics,
+    indirect_transfers: IndirectTransferDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct OwnerBlockerMarginal {
+    kind: &'static str,
+    affected_assessments: u64,
+    occurrences: u64,
+    sole_blocker_assessments: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct OwnerBlockerCombination {
+    assessment_state: &'static str,
+    kinds: Vec<&'static str>,
+    assessments: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ExecutableRangeDiagnostics {
+    proven_range_count: u64,
+    /// Union size within each bank. ROM-wide diagnostics sum those bank-local
+    /// unions because identical VAs in distinct banks are distinct bytes.
+    proven_bytes: u64,
+    provenance: Vec<ExecutableRangeProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct ExecutableRangeProvenance {
+    rule: String,
+    range_count: u64,
+    /// Sum of intervals concluded by this rule. Rules may overlap, so these
+    /// attribution bytes are not percentages of `proven_bytes`.
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndirectTransferDiagnostics {
+    total_sites: u64,
+    exhaustive_sites: u64,
+    bounded_sites: u64,
+    open_sites: u64,
+    via_call_sites: u64,
+    via_jump_sites: u64,
+    resolution_kinds: Vec<IndirectResolutionKindCount>,
+    target_count_distribution: Vec<IndirectTargetCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IndirectResolutionKindCount {
+    kind: &'static str,
+    sites: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IndirectTargetCount {
+    target_count: u64,
+    sites: u64,
 }
 
 #[derive(Serialize)]
@@ -372,6 +455,360 @@ fn diagnose_boot_tlb_alias(mut args: impl Iterator<Item = OsString>) -> Result<S
 /// snapshot-composition product; only `report_with_owner_proofs` reports a
 /// measured assessment. Composition is the same path `study-layout` uses, so
 /// this reports what that path would, without needing an answer key.
+fn executable_range_diagnostics(
+    snapshot: &fn64_discover::snapshot::ProgramSnapshotV1,
+    bank: &str,
+) -> ExecutableRangeDiagnostics {
+    let mut ranges = BTreeMap::<(u32, u32), String>::new();
+    for fact in snapshot.facts.facts() {
+        let fn64_discover::facts::Fact::ExecutableRange {
+            bank: fact_bank,
+            va_start,
+            va_end,
+        } = fact
+        else {
+            continue;
+        };
+        if fact_bank != bank {
+            continue;
+        }
+        let subject = fn64_discover::facts::executable_range_subject(fact_bank, *va_start, *va_end);
+        let Some(conclusion) = snapshot.facts.conclusion(&subject) else {
+            continue;
+        };
+        if conclusion.state == ProofState::Proven {
+            ranges.insert((*va_start, *va_end), conclusion.rule.clone());
+        }
+    }
+
+    let mut provenance = BTreeMap::<String, (u64, u64)>::new();
+    for ((start, end), rule) in &ranges {
+        let entry = provenance.entry(rule.clone()).or_default();
+        entry.0 += 1;
+        entry.1 += u64::from(end - start);
+    }
+
+    let mut merged = Vec::<(u32, u32)>::new();
+    for &(start, end) in ranges.keys() {
+        match merged.last_mut() {
+            Some((_, merged_end)) if start <= *merged_end => {
+                *merged_end = (*merged_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    ExecutableRangeDiagnostics {
+        proven_range_count: ranges.len() as u64,
+        proven_bytes: merged
+            .iter()
+            .map(|(start, end)| u64::from(end - start))
+            .sum(),
+        provenance: provenance
+            .into_iter()
+            .map(|(rule, (range_count, bytes))| ExecutableRangeProvenance {
+                rule,
+                range_count,
+                bytes,
+            })
+            .collect(),
+    }
+}
+
+fn indirect_transfer_diagnostics(
+    closure: &fn64_discover::resolve::ClosureResult,
+) -> IndirectTransferDiagnostics {
+    use fn64_discover::resolve::{IndirectProofState, IndirectResolutionKind};
+
+    let mut result = IndirectTransferDiagnostics::default();
+    let mut kinds = BTreeMap::<&'static str, u64>::new();
+    let mut target_counts = BTreeMap::<u64, u64>::new();
+    for resolution in &closure.indirect {
+        result.total_sites += 1;
+        match resolution.state {
+            IndirectProofState::Exhaustive => result.exhaustive_sites += 1,
+            IndirectProofState::Bounded => result.bounded_sites += 1,
+            IndirectProofState::Open => result.open_sites += 1,
+        }
+        if resolution.via_call {
+            result.via_call_sites += 1;
+        } else {
+            result.via_jump_sites += 1;
+        }
+        let kind = match resolution.kind {
+            Some(IndirectResolutionKind::Constant) => "constant",
+            Some(IndirectResolutionKind::MemoryValueSet) => "memory_value_set",
+            Some(IndirectResolutionKind::JumpTable) => "jump_table",
+            None => "unresolved",
+        };
+        *kinds.entry(kind).or_default() += 1;
+        *target_counts
+            .entry(resolution.targets.len() as u64)
+            .or_default() += 1;
+    }
+    result.resolution_kinds = kinds
+        .into_iter()
+        .map(|(kind, sites)| IndirectResolutionKindCount { kind, sites })
+        .collect();
+    result.target_count_distribution = target_counts
+        .into_iter()
+        .map(|(target_count, sites)| IndirectTargetCount {
+            target_count,
+            sites,
+        })
+        .collect();
+    result
+}
+
+fn owner_proof_bank_diagnostics(
+    snapshot: &fn64_discover::snapshot::ProgramSnapshotV1,
+    bank: &fn64_discover::snapshot::BankSnapshotV1,
+) -> OwnerProofBankDiagnostics {
+    use fn64_discover::owner_proof::OwnerAssessment;
+
+    let mut exact_owners = 0u64;
+    let mut candidate_owners = 0u64;
+    let mut ambiguous_owners = 0u64;
+    let mut exact_owner_bytes = 0u64;
+    let mut combinations = BTreeMap::<(&'static str, Vec<&'static str>), u64>::new();
+    for assessment in &bank.owner_proof.assessments {
+        let (state, frontier) = match assessment {
+            OwnerAssessment::Proven { owner } => {
+                exact_owners += 1;
+                exact_owner_bytes += u64::from(owner.byte_len());
+                continue;
+            }
+            OwnerAssessment::Candidate { frontier } => {
+                candidate_owners += 1;
+                ("candidate", frontier)
+            }
+            OwnerAssessment::Ambiguous { frontier } => {
+                ambiguous_owners += 1;
+                ("ambiguous", frontier)
+            }
+        };
+        let kinds: BTreeSet<_> = frontier
+            .blockers
+            .iter()
+            .map(fn64_discover::snapshot::OwnerBlockerKind::from)
+            .map(fn64_discover::snapshot::OwnerBlockerKind::diagnostic_label)
+            .collect();
+        *combinations
+            .entry((state, kinds.into_iter().collect()))
+            .or_default() += 1;
+    }
+
+    OwnerProofBankDiagnostics {
+        bank: bank.input.bank.clone(),
+        assessed_entries: bank.owner_proof.assessments.len() as u64,
+        exact_owners,
+        candidate_owners,
+        ambiguous_owners,
+        exact_owner_bytes,
+        blocker_marginals: bank
+            .blocker_histogram
+            .iter()
+            .map(|summary| OwnerBlockerMarginal {
+                kind: summary.kind.diagnostic_label(),
+                affected_assessments: summary.affected_assessments,
+                occurrences: summary.occurrences,
+                sole_blocker_assessments: summary.sole_blocker_assessments,
+            })
+            .collect(),
+        blocker_combinations: combinations
+            .into_iter()
+            .map(
+                |((assessment_state, kinds), assessments)| OwnerBlockerCombination {
+                    assessment_state,
+                    kinds,
+                    assessments,
+                },
+            )
+            .collect(),
+        executable_ranges: executable_range_diagnostics(snapshot, &bank.input.bank),
+        indirect_transfers: indirect_transfer_diagnostics(&bank.closure),
+    }
+}
+
+fn aggregate_owner_proof_diagnostics(
+    banks: Vec<OwnerProofBankDiagnostics>,
+) -> OwnerProofDiagnostics {
+    let mut marginals = BTreeMap::<&'static str, (u64, u64, u64)>::new();
+    let mut combinations = BTreeMap::<(&'static str, Vec<&'static str>), u64>::new();
+    let mut provenance = BTreeMap::<String, (u64, u64)>::new();
+    let mut executable_ranges = ExecutableRangeDiagnostics::default();
+    let mut indirect_transfers = IndirectTransferDiagnostics::default();
+    let mut indirect_kinds = BTreeMap::<&'static str, u64>::new();
+    let mut indirect_target_counts = BTreeMap::<u64, u64>::new();
+    for bank in &banks {
+        for marginal in &bank.blocker_marginals {
+            let entry = marginals.entry(marginal.kind).or_default();
+            entry.0 += marginal.affected_assessments;
+            entry.1 += marginal.occurrences;
+            entry.2 += marginal.sole_blocker_assessments;
+        }
+        for combination in &bank.blocker_combinations {
+            *combinations
+                .entry((combination.assessment_state, combination.kinds.clone()))
+                .or_default() += combination.assessments;
+        }
+        executable_ranges.proven_range_count += bank.executable_ranges.proven_range_count;
+        executable_ranges.proven_bytes += bank.executable_ranges.proven_bytes;
+        for source in &bank.executable_ranges.provenance {
+            let entry = provenance.entry(source.rule.clone()).or_default();
+            entry.0 += source.range_count;
+            entry.1 += source.bytes;
+        }
+        indirect_transfers.total_sites += bank.indirect_transfers.total_sites;
+        indirect_transfers.exhaustive_sites += bank.indirect_transfers.exhaustive_sites;
+        indirect_transfers.bounded_sites += bank.indirect_transfers.bounded_sites;
+        indirect_transfers.open_sites += bank.indirect_transfers.open_sites;
+        indirect_transfers.via_call_sites += bank.indirect_transfers.via_call_sites;
+        indirect_transfers.via_jump_sites += bank.indirect_transfers.via_jump_sites;
+        for kind in &bank.indirect_transfers.resolution_kinds {
+            *indirect_kinds.entry(kind.kind).or_default() += kind.sites;
+        }
+        for bucket in &bank.indirect_transfers.target_count_distribution {
+            *indirect_target_counts
+                .entry(bucket.target_count)
+                .or_default() += bucket.sites;
+        }
+    }
+    executable_ranges.provenance = provenance
+        .into_iter()
+        .map(|(rule, (range_count, bytes))| ExecutableRangeProvenance {
+            rule,
+            range_count,
+            bytes,
+        })
+        .collect();
+    indirect_transfers.resolution_kinds = indirect_kinds
+        .into_iter()
+        .map(|(kind, sites)| IndirectResolutionKindCount { kind, sites })
+        .collect();
+    indirect_transfers.target_count_distribution = indirect_target_counts
+        .into_iter()
+        .map(|(target_count, sites)| IndirectTargetCount {
+            target_count,
+            sites,
+        })
+        .collect();
+    OwnerProofDiagnostics {
+        coverage_blocker_payloads_omitted: true,
+        banks,
+        blocker_marginals: marginals
+            .into_iter()
+            .map(
+                |(kind, (affected_assessments, occurrences, sole_blocker_assessments))| {
+                    OwnerBlockerMarginal {
+                        kind,
+                        affected_assessments,
+                        occurrences,
+                        sole_blocker_assessments,
+                    }
+                },
+            )
+            .collect(),
+        blocker_combinations: combinations
+            .into_iter()
+            .map(
+                |((assessment_state, kinds), assessments)| OwnerBlockerCombination {
+                    assessment_state,
+                    kinds,
+                    assessments,
+                },
+            )
+            .collect(),
+        executable_ranges,
+        indirect_transfers,
+    }
+}
+
+fn merge_proven_executable_ranges<'a>(
+    target: &mut fn64_discover::facts::FactDb,
+    sources: impl IntoIterator<Item = &'a fn64_discover::facts::FactDb>,
+) -> Result<(), String> {
+    let mut copied_subjects = BTreeSet::new();
+    for source in sources {
+        for fact in source.facts() {
+            let fn64_discover::facts::Fact::ExecutableRange {
+                bank,
+                va_start,
+                va_end,
+            } = fact
+            else {
+                continue;
+            };
+            let subject = fn64_discover::facts::executable_range_subject(bank, *va_start, *va_end);
+            let Some(conclusion) = source.conclusion(&subject) else {
+                continue;
+            };
+            if conclusion.state != ProofState::Proven || !copied_subjects.insert(subject.clone()) {
+                continue;
+            }
+            let range = target.insert(fact.clone());
+            target
+                .conclude(
+                    subject,
+                    ProofState::Proven,
+                    vec![range],
+                    conclusion.rule.clone(),
+                )
+                .map_err(|error| format!("merging composed executable range: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod owner_summary_tests {
+    use super::*;
+    use fn64_discover::facts::{executable_range_subject, Fact};
+
+    fn source(bank: &str, start: u32, end: u32, rule: &str) -> FactDb {
+        let mut facts = FactDb::new();
+        let range = facts.insert(Fact::ExecutableRange {
+            bank: bank.to_owned(),
+            va_start: start,
+            va_end: end,
+        });
+        facts
+            .conclude(
+                executable_range_subject(bank, start, end),
+                ProofState::Proven,
+                vec![range],
+                rule,
+            )
+            .unwrap();
+        facts
+    }
+
+    #[test]
+    fn composed_executable_ranges_merge_across_banks_with_provenance() {
+        let first = source("a", 0x8000_0000, 0x8000_0008, "first_rule");
+        let second = source("b", 0x8000_0000, 0x8000_0010, "second_rule");
+        let mut merged = FactDb::new();
+        merge_proven_executable_ranges(&mut merged, [&first, &second]).unwrap();
+
+        let report = fn64_discover::coverage::report(0x1000, &merged);
+        assert_eq!(report.executable_banks, 2);
+        assert_eq!(report.executable_bytes, 24);
+        assert_eq!(
+            merged
+                .conclusion(&executable_range_subject("a", 0x8000_0000, 0x8000_0008))
+                .unwrap()
+                .rule,
+            "first_rule"
+        );
+        assert_eq!(
+            merged
+                .conclusion(&executable_range_subject("b", 0x8000_0000, 0x8000_0010))
+                .unwrap()
+                .rule,
+            "second_rule"
+        );
+    }
+}
+
 fn compose_owner_proofs(
     rom: &fn64_discover::rom::NormalizedRom,
     facts: &fn64_discover::facts::FactDb,
@@ -379,6 +816,7 @@ fn compose_owner_proofs(
     (
         fn64_discover::coverage::CoverageReport,
         Vec<fn64_discover::snapshot::OwnerBlockerSummary>,
+        OwnerProofDiagnostics,
     ),
     String,
 > {
@@ -401,28 +839,43 @@ fn compose_owner_proofs(
 
     let mut reports = Vec::new();
     let mut blockers: Vec<fn64_discover::snapshot::OwnerBlockerSummary> = Vec::new();
+    let mut coverage_facts = facts.clone();
+    let mut bank_diagnostics = Vec::new();
     for snapshot in composed.snapshots() {
         for bank in &snapshot.banks {
             reports.push(bank.owner_proof.clone());
+            bank_diagnostics.push(owner_proof_bank_diagnostics(snapshot, bank));
             for summary in &bank.blocker_histogram {
                 match blockers.iter_mut().find(|held| held.kind == summary.kind) {
                     Some(held) => {
                         held.affected_assessments += summary.affected_assessments;
                         held.occurrences += summary.occurrences;
+                        held.sole_blocker_assessments += summary.sole_blocker_assessments;
                     }
                     None => blockers.push(summary.clone()),
                 }
             }
         }
     }
+    merge_proven_executable_ranges(
+        &mut coverage_facts,
+        composed.snapshots().iter().map(|snapshot| &snapshot.facts),
+    )?;
     // ROM-wide discovery facts, never a composed snapshot's: each snapshot
     // carries only its own bank's projected facts, so using them would report
     // one bank's mapping and entry counts as if they were the whole ROM.
     // Owner proof is layered onto the same coverage the default path reports.
-    let coverage = fn64_discover::coverage::report_with_owner_proofs(rom.len(), facts, &reports)
-    .map_err(|error| format!("{error:?}"))?;
-    blockers.sort_by(|a, b| b.occurrences.cmp(&a.occurrences).then(a.kind.cmp(&b.kind)));
-    Ok((coverage, blockers))
+    let coverage =
+        fn64_discover::coverage::report_with_owner_proofs(rom.len(), &coverage_facts, &reports)
+            .map_err(|error| format!("{error:?}"))?;
+    blockers.sort_by(|a, b| {
+        b.affected_assessments
+            .cmp(&a.affected_assessments)
+            .then(a.kind.cmp(&b.kind))
+    });
+    bank_diagnostics.sort_by(|a, b| a.bank.cmp(&b.bank));
+    let diagnostics = aggregate_owner_proof_diagnostics(bank_diagnostics);
+    Ok((coverage, blockers, diagnostics))
 }
 
 fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
@@ -879,19 +1332,29 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
     // assessment plus the blocker histogram, which is the per-ROM accounting
     // of *why* extents stay unproven. Composition is materially more
     // expensive than discovery, so it stays opt-in.
-    let (coverage, owner_blockers) = if prove_owners {
+    let (coverage, owner_blockers, owner_proof) = if prove_owners {
         match compose_owner_proofs(&rom, &facts) {
-            Ok((composed_coverage, blockers)) => (composed_coverage, Some(blockers)),
+            Ok((composed_coverage, blockers, diagnostics)) => {
+                (composed_coverage, Some(blockers), Some(diagnostics))
+            }
             Err(error) => {
                 // A composition failure is a measurement outcome, not a
                 // discovery failure: report it and keep the unproven coverage
                 // rather than discarding the whole run.
                 eprintln!("owner proof unavailable: {error}");
-                (fn64_discover::coverage::report(rom.len(), &facts), None)
+                (
+                    fn64_discover::coverage::report(rom.len(), &facts),
+                    None,
+                    None,
+                )
             }
         }
     } else {
-        (fn64_discover::coverage::report(rom.len(), &facts), None)
+        (
+            fn64_discover::coverage::report(rom.len(), &facts),
+            None,
+            None,
+        )
     };
     if let Some(blockers) = &owner_blockers {
         // The per-ROM accounting of why extents stay unproven. Printed to
@@ -901,24 +1364,34 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         } else {
             for summary in blockers {
                 eprintln!(
-                    "owner_blocker {:?} assessments={} occurrences={}",
-                    summary.kind, summary.affected_assessments, summary.occurrences
+                    "owner_blocker {:?} assessments={} occurrences={} sole={}",
+                    summary.kind,
+                    summary.affected_assessments,
+                    summary.occurrences,
+                    summary.sole_blocker_assessments
                 );
             }
         }
     }
     if summary_only {
+        // The compact owner diagnostic carries blocker kinds and exact kind
+        // combinations above. Full CoverageReport blocker payloads can retain
+        // decoded words and per-site addresses; they belong only in the full
+        // artifact, and made one ordinary ROM's "compact" receipt about 5 MiB.
+        let mut summary_coverage = coverage;
+        summary_coverage.function_owners.blockers.clear();
         let summary = DiscoverySummary {
-            // v1 is intentionally an observation-only, path-free fast-loop
-            // receipt; it is not the full artifact schema.
-            schema_version: 1,
+            // V2 adds the opt-in structured owner-proof diagnostics. Ordinary
+            // fast-loop summaries retain their exact V1 shape.
+            schema_version: if owner_proof.is_some() { 2 } else { 1 },
             normalized_rom_sha256: &rom.sha256,
             fact_count: facts.facts().len(),
-            coverage,
+            coverage: summary_coverage,
             selected_strategy,
             strategy_outcomes,
             trace_count: traces.len(),
             observed_load_image_reports: observed_load_images.len(),
+            owner_proof,
         };
         let encoded = serde_json::to_vec(&summary)
             .map_err(|error| format!("serializing discovery summary: {error}"))?;

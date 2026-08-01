@@ -480,6 +480,7 @@ fn prove_exact_owners_inner(
         .conclusion(&format!("bank:{}", cfg.bank))
         .is_some_and(|conclusion| conclusion.state == ProofState::Proven);
     let overlaps = same_bank_overlaps(partition, cfg);
+    let indirect_target_domains = collect_indirect_target_domains(facts, &cfg.bank);
 
     let assessments = roots
         .into_iter()
@@ -500,6 +501,7 @@ fn prove_exact_owners_inner(
                 image_va_start,
                 external_authorized_roots,
                 callable_authority,
+                &indirect_target_domains,
             )
         })
         .collect();
@@ -527,6 +529,7 @@ fn assess_root(
     image_va_start: u32,
     external_authorized_roots: &BTreeSet<u32>,
     callable_authority: Option<&AuthoritativeCallableEntries>,
+    indirect_target_domains: &BTreeMap<(u32, bool), BTreeSet<u32>>,
 ) -> OwnerAssessment {
     let entry = BankAddr::new(&cfg.bank, root);
     let mut blockers = BTreeSet::new();
@@ -649,7 +652,7 @@ fn assess_root(
             proven_entries,
             &mut blockers,
         );
-        validate_indirects(owner, cfg, facts, &mut blockers);
+        validate_indirects(owner, cfg, facts, indirect_target_domains, &mut blockers);
     }
 
     if blockers.is_empty() {
@@ -1042,6 +1045,7 @@ fn validate_indirects(
     owner: &Owner,
     cfg: &Cfg,
     facts: &FactDb,
+    target_domains: &BTreeMap<(u32, bool), BTreeSet<u32>>,
     blockers: &mut BTreeSet<OwnerBlocker>,
 ) {
     let scope = |site: u32| {
@@ -1052,9 +1056,23 @@ fn validate_indirects(
         }
     };
     for site in &cfg.indirect_sites {
+        let site_scope = scope(site.pc);
+        if site_scope == IndirectScope::Bank {
+            if target_domains
+                .get(&(site.pc, site.via_call))
+                .is_some_and(|targets| {
+                    !targets.is_empty()
+                        && targets
+                            .iter()
+                            .all(|target| *target < owner.root_va || *target >= owner.extent_end)
+                })
+            {
+                continue;
+            }
+        }
         blockers.insert(OwnerBlocker::UnresolvedIndirect {
             site: site.pc,
-            scope: scope(site.pc),
+            scope: site_scope,
         });
     }
 
@@ -1107,6 +1125,45 @@ fn validate_indirects(
             blockers.insert(OwnerBlocker::ResolvedIndirectEvidenceMismatch { site: site_pc });
         }
     }
+}
+
+/// Index exclusion-only target domains once per bank. The fact database is
+/// append-only and can retain analyses from more than one closure pass, so a
+/// site is admitted only when every retained analysis projects to the same
+/// guard-bounded domain. An open, exhaustive, differently-kinded, or differing
+/// target-set record invalidates the site rather than letting stale evidence
+/// discharge a blocker.
+fn collect_indirect_target_domains(
+    facts: &FactDb,
+    bank: &str,
+) -> BTreeMap<(u32, bool), BTreeSet<u32>> {
+    let mut domains = BTreeMap::<(u32, bool), Option<BTreeSet<u32>>>::new();
+    for fact in facts.facts() {
+        let Fact::IndirectTransferAnalysis { site, via_call, .. } = fact else {
+            continue;
+        };
+        if site.bank != bank {
+            continue;
+        }
+        let key = (site.pc, *via_call);
+        let projected = fact
+            .indirect_target_domain_v1()
+            .map(|domain| domain.targets.into_iter().collect::<BTreeSet<_>>());
+        match domains.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(projected);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != projected.as_ref() {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    domains
+        .into_iter()
+        .filter_map(|(site, targets)| targets.map(|targets| (site, targets)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1566,6 +1623,128 @@ mod tests {
                 site: target,
                 scope: IndirectScope::Bank,
             }));
+    }
+
+    #[test]
+    fn guard_bounded_domain_disjoint_from_owner_discharges_bank_scoped_site() {
+        let site = BASE + 0x20;
+        let jal = 0x0c00_0000 | ((site >> 2) & 0x03ff_ffff);
+        let jalr_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut bytes = asm(&[jal, NOP, JR_RA, NOP]);
+        bytes.resize(0x28, 0);
+        bytes[0x20..0x24].copy_from_slice(&jalr_t9.to_be_bytes());
+        bytes[0x24..0x28].copy_from_slice(&NOP.to_be_bytes());
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let mut facts = facts_for(bytes.len() as u32, &[BASE]);
+        facts.insert(Fact::IndirectTransferAnalysis {
+            site: BankAddr::new("bank", site),
+            via_call: true,
+            state: IndirectTransferState::Bounded,
+            kind: Some(IndirectTransferKind::JumpTable),
+            targets: vec![site],
+            memory_sources: vec![BASE + 0x18],
+        });
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        let caller = report
+            .assessments
+            .iter()
+            .find(|assessment| assessment.entry().pc == BASE)
+            .unwrap();
+        let still_blocked = match caller {
+            OwnerAssessment::Proven { .. } => false,
+            OwnerAssessment::Candidate { frontier } | OwnerAssessment::Ambiguous { frontier } => {
+                frontier
+                    .blockers
+                    .contains(&OwnerBlocker::UnresolvedIndirect {
+                        site,
+                        scope: IndirectScope::Bank,
+                    })
+            }
+        };
+        assert!(!still_blocked);
+
+        facts.insert(Fact::IndirectTransferAnalysis {
+            site: BankAddr::new("bank", site),
+            via_call: true,
+            state: IndirectTransferState::Open,
+            kind: None,
+            targets: vec![],
+            memory_sources: vec![],
+        });
+        let conflicted = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        let caller = conflicted
+            .assessments
+            .iter()
+            .find(|assessment| assessment.entry().pc == BASE)
+            .unwrap();
+        assert!(frontier(caller)
+            .blockers
+            .contains(&OwnerBlocker::UnresolvedIndirect {
+                site,
+                scope: IndirectScope::Bank,
+            }));
+    }
+
+    #[test]
+    fn bounded_domain_that_can_enter_owner_keeps_bank_scoped_blocker() {
+        let site = BASE + 0x20;
+        let jal = 0x0c00_0000 | ((site >> 2) & 0x03ff_ffff);
+        let jalr_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut bytes = asm(&[jal, NOP, JR_RA, NOP]);
+        bytes.resize(0x28, 0);
+        bytes[0x20..0x24].copy_from_slice(&jalr_t9.to_be_bytes());
+        bytes[0x24..0x28].copy_from_slice(&NOP.to_be_bytes());
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let mut facts = facts_for(bytes.len() as u32, &[BASE]);
+        facts.insert(Fact::IndirectTransferAnalysis {
+            site: BankAddr::new("bank", site),
+            via_call: true,
+            state: IndirectTransferState::Bounded,
+            kind: Some(IndirectTransferKind::JumpTable),
+            targets: vec![BASE + 4],
+            memory_sources: vec![BASE + 0x18],
+        });
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        let caller = report
+            .assessments
+            .iter()
+            .find(|assessment| assessment.entry().pc == BASE)
+            .unwrap();
+        assert!(frontier(caller)
+            .blockers
+            .contains(&OwnerBlocker::UnresolvedIndirect {
+                site,
+                scope: IndirectScope::Bank,
+            }));
+    }
+
+    #[test]
+    fn bounded_domain_never_discharges_owner_scoped_site() {
+        let jalr_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let bytes = asm(&[jalr_t9, NOP]);
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+        let partition = partition(&cfg);
+        let mut facts = facts_for(bytes.len() as u32, &[BASE]);
+        facts.insert(Fact::IndirectTransferAnalysis {
+            site: BankAddr::new("bank", BASE),
+            via_call: true,
+            state: IndirectTransferState::Bounded,
+            kind: Some(IndirectTransferKind::JumpTable),
+            targets: vec![BASE + 0x100],
+            memory_sources: vec![BASE + 0x80],
+        });
+
+        let report = prove_exact_owners(&cfg, &partition, &facts, &bytes, BASE);
+        assert!(frontier(&report.assessments[0]).blockers.contains(
+            &OwnerBlocker::UnresolvedIndirect {
+                site: BASE,
+                scope: IndirectScope::Owner,
+            }
+        ));
     }
 
     #[test]

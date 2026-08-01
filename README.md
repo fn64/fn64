@@ -143,11 +143,25 @@ python3 scripts/rom-catalog.py \
 python3 scripts/rom-frontier.py \
   --catalog /path/to/private-catalog.jsonl \
   --binary "$PWD/target/release/fn64-discover" \
-  --output /path/to/private-frontier.jsonl
+  --output /path/to/private-frontier.jsonl \
+  --failures-output /path/to/private-failures.jsonl
 ```
 
 `FN64_ROM_CORPUS_DIR` has no default; both tools exit rather than guess a ROM
 location, and both refuse to write inside the repository.
+
+The frontier runner requests snapshot-composed owner proof and emits
+`fn64.rom-frontier.v2`. Each ROM row retains bank-local owner totals, exact
+blocker-kind combinations, per-kind affected/occurrence/sole counts,
+executable-range conclusion rules, indirect-resolution distributions, wall
+time, the exact discovery-binary digest, and one-second sampled direct-process
+RSS. The RSS value is a sampled lower bound, not a hard memory limit. Owner
+composition is materially heavier
+than plain discovery, so the default is two concurrent ROMs; raise `--jobs`
+only after measuring available headroom. Failed inputs are retained separately
+rather than disappearing from the denominator. A corpus pass is opportunity-
+ranking evidence; it is not the ten-run determinism evidence required by
+`AGENTS.md`.
 
 `rom-catalog.py --dat-dir` optionally attaches developer, publisher, release
 year, and genre from `libretro/libretro-database` clrmamepro DAT files
@@ -187,10 +201,12 @@ r=+0.14 and `loader_stub_ratio` at r=-0.10, so ordering by them selects
 candidates no better than chance.
 
 `crates/fn64-recomp-rs/tests/corpus_decode_sweep.rs` uses the same corpus as a
-decoder completeness guard, gated by `FN64_RECOMP_SWEEP_DIR` and skipped when
-unset. Measured across 287 ROMs: 23,808,397 decoded words, 289 `Unknown`
-(0.0012%), the residual being embedded data on reserved encodings rather than
-instructions the decoder lacks.
+decoder coverage guard, gated by `FN64_RECOMP_SWEEP_DIR` and skipped when
+unset. It selects prologue-delimited functions from each ROM's fixed boot-copy
+window; it does not scan leaf/prologueless functions or recovered overlays.
+That selected slice measured 23,808,397 decoded words and 289 `Unknown`
+(0.0012%), strongly deprioritizing decoder widening without claiming whole-ROM
+or ISA completeness.
 
 `wrong == 0` holds across every game. The open remainder is an honest,
 characterized gap — genuinely unreferenced library/dead code (Kirby 64),

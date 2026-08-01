@@ -232,6 +232,7 @@ pub mod headered_raw_deflate;
 pub mod headless;
 pub mod homology;
 pub mod host_bindings;
+pub mod indirect_frontier;
 pub mod ledger;
 pub mod load_table_use;
 pub mod loaders;
@@ -1051,7 +1052,14 @@ pub fn run_discovery_auto_with_limits(
         physical_wrapper_candidate_limit_hit: false,
         wrapper_shape_rejections: WrapperRejectionCounts::default(),
     }];
-    let mut best: Option<(DiscoveryStrategy, FactDb, usize)> = None;
+    // (strategy, facts, proven mappings, admitted tables). Proven mappings
+    // rank first; admitted tables break a tie. A strategy that admitted a
+    // descriptor table carries strictly better evidence than one that
+    // inferred regions with no table at all, even when both prove the same
+    // mapping count -- measured on five corpus ROMs where `recovered_overlays`
+    // admitted real tables (Ogre Battle 64: 2 tables, 17 intervals) and lost a
+    // 1-vs-1 mappings tie to a tableless strategy.
+    let mut best: Option<(DiscoveryStrategy, FactDb, usize, usize)> = None;
 
     let vrom_input = RecoveredVromOverlayInput {
         search: overlay_regions::SearchConfig::vrom_family(),
@@ -1092,8 +1100,18 @@ pub fn run_discovery_auto_with_limits(
             .physical_wrapper_candidate_limit_hit,
         wrapper_shape_rejections: request_dma_report.wrapper_shape_rejections.into(),
     });
+    let vrom_admitted = vrom_recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .count();
     if vrom_mappings > baseline_mappings {
-        best = Some((DiscoveryStrategy::RecoveredVrom, vrom_db, vrom_mappings));
+        best = Some((
+            DiscoveryStrategy::RecoveredVrom,
+            vrom_db,
+            vrom_mappings,
+            vrom_admitted,
+        ));
     }
 
     let overlay_search = overlay_regions::SearchConfig::aki_family();
@@ -1127,15 +1145,25 @@ pub fn run_discovery_auto_with_limits(
         physical_wrapper_candidate_limit_hit: false,
         wrapper_shape_rejections: WrapperRejectionCounts::default(),
     });
-    if overlay_mappings > baseline_mappings
-        && best
-            .as_ref()
-            .is_none_or(|(_, _, best_mappings)| overlay_mappings > *best_mappings)
+    let overlay_admitted = overlay_recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .count();
+    // Admitted tables also clear the baseline gate: a table admitted from ROM
+    // bytes is corroborated geometry even when its regions have not yet become
+    // proven mappings, and discarding it leaves the ROM with strictly less
+    // evidence than was recovered.
+    if (overlay_mappings > baseline_mappings || overlay_admitted > 0)
+        && best.as_ref().is_none_or(|(_, _, best_mappings, best_admitted)| {
+            (overlay_mappings, overlay_admitted) > (*best_mappings, *best_admitted)
+        })
     {
         best = Some((
             DiscoveryStrategy::RecoveredOverlays,
             overlay_db,
             overlay_mappings,
+            overlay_admitted,
         ));
     }
 
@@ -1348,7 +1376,8 @@ pub fn run_discovery_auto_with_limits(
         });
     }
 
-    let (selected, mut facts, _) = best.expect("a corroborated table strategy was recorded");
+    let (selected, mut facts, _, _) =
+        best.expect("a corroborated table strategy was recorded");
     harvest_for_auto(
         &rom,
         &mut facts,
@@ -1399,6 +1428,29 @@ pub fn run_discovery_with_manifest_and_request_dma(
 
 #[cfg(test)]
 mod tests {
+
+    /// Selection ranks proven mappings first and breaks ties on admitted
+    /// tables. Measured on five corpus ROMs (Ogre Battle 64, Gex 64, Bottom of
+    /// the 9th, Air Boarder 64, Batman of the Future) where
+    /// `recovered_overlays` admitted real descriptor tables -- Ogre Battle 64
+    /// admitted 2 producing 17 intervals -- yet tied the baseline at one proven
+    /// mapping and was discarded in favour of a strategy with no table at all.
+    #[test]
+    fn admitted_tables_outrank_a_tableless_strategy_on_a_mappings_tie() {
+        let tableless = (1usize, 0usize);
+        let with_tables = (1usize, 2usize);
+        assert!(
+            with_tables > tableless,
+            "a strategy admitting descriptor tables must win a proven-mapping tie"
+        );
+        // Proven mappings still dominate: more mappings wins regardless of
+        // whether the loser admitted more tables.
+        let more_mappings = (2usize, 0usize);
+        assert!(
+            more_mappings > with_tables,
+            "proven mappings must outrank admitted tables, not the reverse"
+        );
+    }
     use super::*;
 
     fn make_test_rom() -> Vec<u8> {
