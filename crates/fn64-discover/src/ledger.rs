@@ -16,7 +16,7 @@
 //! Nothing here promotes anything. The ledger reads facts a composition already
 //! produced and classifies the residue; it never concludes a mapping.
 
-use crate::delta_vote::{infer_region_delta, DeltaVoteConfig};
+use crate::delta_vote::{infer_region_delta, DeltaVoteConfig, RegionScanStats};
 use crate::facts::{Fact, FactDb};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -102,7 +102,7 @@ impl RomLedger {
 /// Resolution of the residue scan. Small enough that a single overlay is not
 /// averaged into megabytes of surrounding assets, large enough to hold the
 /// prologues and calls a code test needs.
-const RESIDUE_SPAN: u32 = 0x2000;
+pub(crate) const RESIDUE_SPAN: u32 = 0x2000;
 
 /// Hardware-fixed: the header plus the IPL3 blob, before the boot copy.
 const IPL3_END: u32 = 0x1000;
@@ -158,7 +158,7 @@ fn classify_residue(bytes: &[u8], rom_start: u32, vote: &DeltaVoteConfig) -> Spa
     // Reuse delta_vote's scan rather than inventing a second decoder: a span
     // holding function prologues AND calls is code, and those are exactly the
     // signals delta_vote already extracts and is tested on.
-    let scan = infer_region_delta(bytes, rom_start, &[], vote).scan;
+    let (is_code_like, _) = code_like_residue_scan(bytes, rom_start, vote);
     // Every function returns; data does not. Requiring RETURNS, not merely a
     // prologue, is what stops one coincidental `addiu $sp,$sp,-N` admitting a
     // whole span of asset bytes.
@@ -171,11 +171,7 @@ fn classify_residue(bytes: &[u8], rom_start: u32, vote: &DeltaVoteConfig) -> Spa
     //
     // The ratio guard is the point: a lone return is as coincidental as a lone
     // prologue. Real code pairs them, because every function has both.
-    let has_functions = scan.return_sites > 0
-        && scan.prologue_sites > 0
-        && scan.return_sites * 4 >= scan.prologue_sites
-        && scan.prologue_sites * 4 >= scan.return_sites;
-    if has_functions && scan.jal_sites > 0 {
+    if is_code_like {
         return SpanClass::CodeLike;
     }
     if entropy_bits(bytes) >= HIGH_ENTROPY_BITS {
@@ -185,6 +181,22 @@ fn classify_residue(bytes: &[u8], rom_start: u32, vote: &DeltaVoteConfig) -> Spa
     // 92-100% of genuine code at this resolution (tests/ledger_code_sensitivity),
     // so a span reaching here is content that is not code.
     SpanClass::StructuredData
+}
+
+/// Run the ledger's measured code predicate without assigning a mapping or
+/// proof state. Evaluated-image diagnostics use this exact predicate rather
+/// than growing a second notion of "looks like code."
+pub(crate) fn code_like_residue_scan(
+    bytes: &[u8],
+    address_start: u32,
+    vote: &DeltaVoteConfig,
+) -> (bool, RegionScanStats) {
+    let scan = infer_region_delta(bytes, address_start, &[], vote).scan;
+    let has_functions = scan.return_sites > 0
+        && scan.prologue_sites > 0
+        && scan.return_sites * 4 >= scan.prologue_sites
+        && scan.prologue_sites * 4 >= scan.return_sites;
+    (has_functions && scan.jal_sites > 0, scan)
 }
 
 /// Account for every byte of a ROM.

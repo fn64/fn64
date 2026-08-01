@@ -130,6 +130,10 @@
 //!   six-byte header and four-byte big-endian length; `0x1173` uses a five-byte
 //!   header and three-byte big-endian length. Successful decoding proves
 //!   bytes, not runtime placement or use.
+//! - [`rzip_verify`]: bounded composition of candidate header scanning with
+//!   exact stream decoding and the ledger's measured code predicate. Results
+//!   retain offsets, sizes, hashes, and counts, never decoded bytes or runtime
+//!   authority.
 //! - [`materialized_image`]: conclusion-blind re-derivation of typed evaluated-
 //!   image receipts from normalized ROM bytes and proven VROM backing. Its
 //!   in-memory result carries bytes but no mapping or proof authority.
@@ -257,8 +261,9 @@ pub mod regions;
 pub mod reloc_grade;
 pub mod resolve;
 pub mod rom;
-pub mod rzip_scan;
 pub mod runtime_generation_catalog;
+pub mod rzip_scan;
+pub mod rzip_verify;
 pub mod sig_scan;
 pub mod snapshot;
 pub mod snapshot_inputs;

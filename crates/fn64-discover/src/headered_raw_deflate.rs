@@ -114,6 +114,26 @@ pub struct HeaderedRawDeflateSequence {
     pub trailing_suffix: HeaderedRawDeflateSuffix,
 }
 
+/// Exact result for one explicitly addressed stream, without any work over
+/// source bytes following that stream.
+///
+/// This is the bounded validation primitive for a locator. It shares the same
+/// inflate, `StreamEnd`, declared-length, resource-limit, range, and digest
+/// checks as sequence materialization, but deliberately does not hash a
+/// trailing suffix that is outside the candidate stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderedRawDeflateDecodedStream {
+    pub stream: HeaderedRawDeflateStream,
+    pub bytes: Vec<u8>,
+}
+
+struct InternalSequence {
+    streams: Vec<HeaderedRawDeflateStream>,
+    bytes: Vec<u8>,
+    suffix_offset: usize,
+    suffix_len: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderedRawDeflateError {
     InputLimitExceeded {
@@ -219,6 +239,36 @@ pub fn materialize_headered_raw_deflate_1173_sequence(
     )
 }
 
+/// Materialize one explicitly addressed `0x1172` stream without hashing bytes
+/// following its exact compressed extent.
+pub fn materialize_headered_raw_deflate_stream(
+    source: &[u8],
+    source_cursor: usize,
+    limits: HeaderedRawDeflateLimits,
+) -> Result<HeaderedRawDeflateDecodedStream, HeaderedRawDeflateError> {
+    materialize_headered_raw_deflate_stream_with_layout(
+        source,
+        source_cursor,
+        limits,
+        HeaderLayout::Rzip1172,
+    )
+}
+
+/// Materialize one explicitly addressed `0x1173` stream without hashing bytes
+/// following its exact compressed extent.
+pub fn materialize_headered_raw_deflate_1173_stream(
+    source: &[u8],
+    source_cursor: usize,
+    limits: HeaderedRawDeflateLimits,
+) -> Result<HeaderedRawDeflateDecodedStream, HeaderedRawDeflateError> {
+    materialize_headered_raw_deflate_stream_with_layout(
+        source,
+        source_cursor,
+        limits,
+        HeaderLayout::Rzip1173,
+    )
+}
+
 fn materialize_headered_raw_deflate_sequence_with_layout(
     source: &[u8],
     source_cursor: usize,
@@ -226,6 +276,55 @@ fn materialize_headered_raw_deflate_sequence_with_layout(
     limits: HeaderedRawDeflateLimits,
     layout: HeaderLayout,
 ) -> Result<HeaderedRawDeflateSequence, HeaderedRawDeflateError> {
+    let internal = materialize_headered_raw_deflate_sequence_internal(
+        source,
+        source_cursor,
+        stream_count,
+        limits,
+        layout,
+    )?;
+    Ok(HeaderedRawDeflateSequence {
+        streams: internal.streams,
+        bytes: internal.bytes,
+        trailing_suffix: HeaderedRawDeflateSuffix {
+            offset: internal.suffix_offset,
+            len: internal.suffix_len,
+            sha256: sha256(&source[internal.suffix_offset..]),
+        },
+    })
+}
+
+fn materialize_headered_raw_deflate_stream_with_layout(
+    source: &[u8],
+    source_cursor: usize,
+    limits: HeaderedRawDeflateLimits,
+    layout: HeaderLayout,
+) -> Result<HeaderedRawDeflateDecodedStream, HeaderedRawDeflateError> {
+    let internal = materialize_headered_raw_deflate_sequence_internal(
+        source,
+        source_cursor,
+        1,
+        limits,
+        layout,
+    )?;
+    let mut streams = internal.streams.into_iter();
+    let stream = streams
+        .next()
+        .expect("one requested stream produces one stream result");
+    debug_assert!(streams.next().is_none());
+    Ok(HeaderedRawDeflateDecodedStream {
+        stream,
+        bytes: internal.bytes,
+    })
+}
+
+fn materialize_headered_raw_deflate_sequence_internal(
+    source: &[u8],
+    source_cursor: usize,
+    stream_count: usize,
+    limits: HeaderedRawDeflateLimits,
+    layout: HeaderLayout,
+) -> Result<InternalSequence, HeaderedRawDeflateError> {
     if source.len() > limits.max_input_bytes {
         return Err(HeaderedRawDeflateError::InputLimitExceeded {
             bytes: source.len(),
@@ -389,15 +488,12 @@ fn materialize_headered_raw_deflate_sequence_with_layout(
         cursor = source_end;
     }
 
-    let suffix = &source[cursor..];
-    Ok(HeaderedRawDeflateSequence {
+    let suffix_len = source.len() - cursor;
+    Ok(InternalSequence {
         streams,
         bytes,
-        trailing_suffix: HeaderedRawDeflateSuffix {
-            offset: cursor,
-            len: suffix.len(),
-            sha256: sha256(suffix),
-        },
+        suffix_offset: cursor,
+        suffix_len,
     })
 }
 
@@ -490,6 +586,22 @@ mod tests {
     }
 
     #[test]
+    fn single_stream_materialization_matches_sequence_without_suffix_evidence() {
+        let output = b"one exact stream";
+        let encoded = stream_1172(output);
+        let mut source = encoded.clone();
+        source.extend_from_slice(&vec![0xa5; 2048]);
+
+        let single = materialize_headered_raw_deflate_stream(&source, 0, limits()).unwrap();
+        let sequence = materialize_headered_raw_deflate_sequence(&source, 0, 1, limits()).unwrap();
+
+        assert_eq!(single.stream, sequence.streams[0]);
+        assert_eq!(single.bytes, sequence.bytes);
+        assert_eq!(single.stream.source_range.end, encoded.len());
+        assert_eq!(sequence.trailing_suffix.len, 2048);
+    }
+
+    #[test]
     fn materializes_1173_with_three_byte_big_endian_length() {
         let first = vec![0x5a; 0x010203];
         let second = b"second 1173 payload";
@@ -519,6 +631,23 @@ mod tests {
         );
         assert_eq!(result.trailing_suffix.offset, source.len() - suffix.len());
         assert_eq!(result.trailing_suffix.sha256, sha256(&suffix));
+    }
+
+    #[test]
+    fn single_1173_stream_matches_sequence_evidence() {
+        let output = b"one exact 1173 stream";
+        let encoded = stream_1173(output);
+        let mut source = encoded.clone();
+        source.extend_from_slice(&vec![0x5a; 2048]);
+
+        let single = materialize_headered_raw_deflate_1173_stream(&source, 0, limits()).unwrap();
+        let sequence =
+            materialize_headered_raw_deflate_1173_sequence(&source, 0, 1, limits()).unwrap();
+
+        assert_eq!(single.stream, sequence.streams[0]);
+        assert_eq!(single.bytes, sequence.bytes);
+        assert_eq!(single.stream.source_range.end, encoded.len());
+        assert_eq!(sequence.trailing_suffix.len, 2048);
     }
 
     #[test]

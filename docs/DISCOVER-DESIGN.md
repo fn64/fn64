@@ -579,6 +579,31 @@ layout was derived from local ROM-byte experiments and checked against
 `perfect-dark-pc-port/perfect_dark/src/lib/rzip_c.c` (MIT, Copyright 2022 Ryan
 Dwyer). Neither evaluator scans for a stream or establishes runtime placement.
 
+`rzip_scan` locates candidate `0x1172`/`0x1173` headers; `rzip_verify` feeds
+each bounded candidate through the matching single-stream materializer and keeps
+only exact `StreamEnd` plus declared-length matches. Single-stream evaluation
+does not hash the unrelated ROM suffix, avoiding work proportional to
+`candidate count × remaining ROM bytes`; sequence receipts retain their
+existing suffix digest unchanged. The verification result is content-free and
+reports offsets, lengths, digests, exact rejection/frontier counts, and the
+ledger's mapping-independent 8 KiB code signals. It grants no placement,
+execution, bank, or proof authority.
+
+On the local Perfect Dark Europe image (SHA-256 `8e432b1a...0394ff`), the
+default bounded pass examined 9,571 candidates, skipped two over its aggregate
+output frontier, rejected 1,082 as invalid DEFLATE plus 13 for output-length
+mismatch, and retained 8,474 exact streams producing 31,515,214 bytes in
+3.4--3.7 seconds. An independent raw-zlib pass also retained 8,474; the
+previously reported 8,475 is not reproduced, and 13 candidates fail declared-
+length agreement after inflation.
+The ledger predicate marked 452 streams code-like, while the earlier 377 count
+is exactly the separate threshold `jr_ra_words > 4`. On Banjo-Kazooie USA
+(SHA-256 `59875835...e6eff`), the default pass examined 3,584 candidates,
+skipped two, rejected 318, and retained 3,264 exact streams producing
+31,495,582 bytes in 3.1--3.4 seconds; 15 satisfy both the ledger predicate and
+`jr_ra_words > 4`. These distributions are build-qualified measurements, not
+container-format constants.
+
 The opt-in `transform-invocation-certificate` feature adds a narrower,
 candidate-only bridge between those host-rederived bytes and one exact guest
 wrapper execution. It runs content-bound code and committed memory on a scoped
