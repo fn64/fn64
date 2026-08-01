@@ -49,6 +49,10 @@ def summary(digest: str = "a" * 64, **overrides: object) -> dict:
         "normalized_rom_sha256": digest,
         "selected_strategy": "boot_bank_only",
         "coverage": coverage,
+        "strategy_outcomes": [
+            outcome(),
+            outcome(strategy="recovered_vrom"),
+        ],
     }
     record.update(overrides)
     return record
@@ -74,6 +78,84 @@ class ClassifyTests(unittest.TestCase):
         # alone would misfile as healthy.
         record = catalog_record(code_run_share=0.064, boot_entropy=5.72)
         self.assertEqual(FRONTIER.classify(record), "sparse_boot")
+
+
+def outcome(strategy: str = "recovered_overlays", **overrides: object) -> dict:
+    record = {
+        "strategy": strategy,
+        "candidate_tables": 0,
+        "admitted_tables": 0,
+        "admitted_intervals": 0,
+        "decoded_file_limit_hits": 0,
+        "proven_mappings": 1,
+        "supported_mappings": 0,
+        "request_dma_open_rows": 0,
+        "request_dma_incomplete": False,
+        "request_dma_input_limit_hit": False,
+        "physical_wrapper_candidates_examined": 0,
+        "wrapper_semantic_proof_unavailable": 0,
+        "physical_wrapper_candidate_limit_hit": False,
+    }
+    record.update(overrides)
+    return record
+
+
+class GeometryFailureTests(unittest.TestCase):
+    def test_multi_bank_mapping_is_recovered(self) -> None:
+        # Mega Man 64's shape: one table, 29 intervals, 28 proven mappings.
+        outcomes = [
+            outcome(candidate_tables=1, admitted_tables=1, admitted_intervals=29, proven_mappings=28)
+        ]
+        self.assertEqual(FRONTIER.geometry_failure(outcomes), "recovered")
+
+    def test_no_candidate_table_is_distinguished_from_rejection(self) -> None:
+        self.assertEqual(
+            FRONTIER.geometry_failure([outcome()]), "no_candidate_table_found"
+        )
+        self.assertEqual(
+            FRONTIER.geometry_failure([outcome(candidate_tables=3)]),
+            "candidate_table_under_mapped",
+        )
+
+    def test_examined_wrappers_separate_detection_from_proof_gaps(self) -> None:
+        # NBA Live 99's shape: 1009 wrapper candidates examined, none proven,
+        # and no descriptor table found. A proof-rule gap, not a blind spot.
+        outcomes = [outcome(strategy="recovered_vrom", physical_wrapper_candidates_examined=1009)]
+        self.assertEqual(
+            FRONTIER.geometry_failure(outcomes), "wrappers_examined_none_proven"
+        )
+        self.assertEqual(
+            FRONTIER.geometry_failure(
+                [outcome(strategy="recovered_vrom", wrapper_semantic_proof_unavailable=4)]
+            ),
+            "wrapper_semantics_unprovable",
+        )
+
+    def test_resource_ceilings_outrank_emptier_verdicts(self) -> None:
+        # A truncated search is a frontier, not proven absence, so it must not
+        # be reported as "no candidate table found".
+        self.assertEqual(
+            FRONTIER.geometry_failure([outcome(decoded_file_limit_hits=2)]),
+            "decode_limit_hit",
+        )
+        self.assertEqual(
+            FRONTIER.geometry_failure([outcome(physical_wrapper_candidate_limit_hit=True)]),
+            "wrapper_limit_hit",
+        )
+
+    def test_missing_geometry_strategies_are_loud_not_silent(self) -> None:
+        self.assertEqual(
+            FRONTIER.geometry_failure([outcome(strategy="boot_bank_only")]),
+            "no_geometry_strategy_ran",
+        )
+        self.assertEqual(FRONTIER.geometry_failure([]), "no_geometry_strategy_ran")
+
+    def test_recovered_wins_over_a_concurrent_resource_ceiling(self) -> None:
+        outcomes = [
+            outcome(proven_mappings=28, admitted_intervals=29, admitted_tables=1),
+            outcome(strategy="recovered_vrom", decoded_file_limit_hits=5),
+        ]
+        self.assertEqual(FRONTIER.geometry_failure(outcomes), "recovered")
 
 
 class JoinTests(unittest.TestCase):

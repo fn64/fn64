@@ -155,9 +155,24 @@ that separates ROMs whose code is resident in the boot bank from those whose
 boot bank is only a loader stub. Recompiler-hazard counts (unaligned
 `lwl`/`lwr`, `cache`, branch-likely, COP0) are taken only inside long code
 runs, never over the raw bank: decoding data as instructions reports hazards
-no title executes. The frontier tool prints aggregate tables plus a ranked
-"easiest next target" list — resident-code ROMs discovery has not yet proven,
-which need neither decompression nor streaming to attempt.
+no title executes.
+
+The frontier tool reports why load-image recovery did not produce a multi-bank
+mapping, which is the measure that matters: ROMs that recover load geometry
+harvest roughly ten times what boot-bank-only ROMs do (median entries by
+selected strategy: `recovered_vrom` 13,158, `recovered_overlays` 4,476,
+`untabled_delta_vote` 2,074, `boot_bank_only` 1,313). Each ROM gets a named
+unmet condition — `no_candidate_table_found`, `candidate_table_under_mapped`,
+`admitted_without_mapping`, `wrappers_examined_none_proven`, or a resource
+ceiling such as `decode_limit_hit` — so a corpus of failures becomes a
+histogram of specific proof-rule gaps rather than a uniform "did not work".
+Resource ceilings outrank the emptier verdicts: a truncated search is a
+frontier, not proven absence.
+
+The boot-bank measures classify but deliberately do not rank. Measured across
+178 resident-code ROMs, `code_run_share` correlates with actual harvest at only
+r=+0.14 and `loader_stub_ratio` at r=-0.10, so ordering by them selects
+candidates no better than chance.
 
 `crates/fn64-recomp-rs/tests/corpus_decode_sweep.rs` uses the same corpus as a
 decoder completeness guard, gated by `FN64_RECOMP_SWEEP_DIR` and skipped when

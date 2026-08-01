@@ -136,6 +136,61 @@ def run_discovery(binary: Path, rom_path: Path, timeout_seconds: int) -> dict[st
     raise FrontierError(f"{rom_path.name} produced no summary record")
 
 
+"""Geometry-stage strategies. Everything else maps the boot copy only, so a
+failure there is not a geometry failure -- it never reached the stage."""
+GEOMETRY_STRATEGIES = ("recovered_overlays", "recovered_vrom")
+
+
+def geometry_failure(outcomes: list[dict[str, Any]]) -> str:
+    """Why load-image recovery did not produce a multi-bank mapping.
+
+    Load geometry is the bottleneck: ROMs that recover it harvest roughly ten
+    times what boot-bank-only ROMs do. Naming the specific unmet condition is
+    what makes 276 failures actionable rather than uniform.
+    """
+    by_strategy = {outcome["strategy"]: outcome for outcome in outcomes}
+    geometry = [by_strategy[name] for name in GEOMETRY_STRATEGIES if name in by_strategy]
+    if not geometry:
+        return "no_geometry_strategy_ran"
+
+    if any(outcome["proven_mappings"] > 1 for outcome in geometry):
+        return "recovered"
+
+    # A resource ceiling is a frontier, not proven absence, so it outranks the
+    # emptier verdicts below: the search was truncated, not exhausted.
+    if any(outcome["decoded_file_limit_hits"] for outcome in geometry):
+        return "decode_limit_hit"
+    if any(outcome["physical_wrapper_candidate_limit_hit"] for outcome in geometry):
+        return "wrapper_limit_hit"
+    if any(outcome["request_dma_input_limit_hit"] for outcome in geometry):
+        return "request_dma_limit_hit"
+
+    if any(outcome["request_dma_incomplete"] for outcome in geometry):
+        return "request_dma_incomplete"
+    if any(outcome["request_dma_open_rows"] for outcome in geometry):
+        return "request_dma_open_rows"
+
+    admitted = sum(outcome["admitted_tables"] for outcome in geometry)
+    candidates = sum(outcome["candidate_tables"] for outcome in geometry)
+    if admitted and not any(outcome["admitted_intervals"] for outcome in geometry):
+        return "table_admitted_no_intervals"
+    if candidates and not admitted:
+        return "candidate_table_under_mapped"
+    if candidates:
+        return "admitted_without_mapping"
+
+    # No candidate table at all. Distinguish a search that examined wrapper
+    # candidates and proved none from one that found nothing to examine --
+    # the first is a proof-rule gap, the second a detection gap.
+    examined = sum(outcome["physical_wrapper_candidates_examined"] for outcome in geometry)
+    unprovable = sum(outcome["wrapper_semantic_proof_unavailable"] for outcome in geometry)
+    if unprovable:
+        return "wrapper_semantics_unprovable"
+    if examined:
+        return "wrappers_examined_none_proven"
+    return "no_candidate_table_found"
+
+
 def classify(record: dict[str, Any]) -> str:
     """Why a ROM is where it is -- the bucket that decides what to fix."""
     if record["boot_entropy"] >= COMPRESSED_ENTROPY_FLOOR:
@@ -158,6 +213,12 @@ def join(catalog: list[dict[str, Any]], summaries: dict[str, dict[str, Any]]) ->
         states = coverage["function_entries_by_state"]
         proven = states.get("Proven", 0)
         targets = record["distinct_jal_targets"]
+        outcomes = summary.get("strategy_outcomes", [])
+        geometry = {
+            outcome["strategy"]: outcome
+            for outcome in outcomes
+            if outcome["strategy"] in GEOMETRY_STRATEGIES
+        }
         rows.append(
             {
                 "schema": FRONTIER_SCHEMA,
@@ -167,6 +228,13 @@ def join(catalog: list[dict[str, Any]], summaries: dict[str, dict[str, Any]]) ->
                 "ipl3_group": record["ipl3_group"],
                 "developer": record.get("developer", ""),
                 "class": classify(record),
+                "geometry_failure": geometry_failure(outcomes),
+                "candidate_tables": sum(o["candidate_tables"] for o in geometry.values()),
+                "admitted_tables": sum(o["admitted_tables"] for o in geometry.values()),
+                "admitted_intervals": sum(o["admitted_intervals"] for o in geometry.values()),
+                "wrapper_candidates_examined": sum(
+                    o["physical_wrapper_candidates_examined"] for o in geometry.values()
+                ),
                 "selected_strategy": summary["selected_strategy"],
                 "mapped_banks": coverage["mapped_banks"],
                 "executable_bytes": coverage["executable_bytes"],
@@ -221,23 +289,39 @@ def report(rows: list[dict[str, Any]]) -> None:
             f"   max {busiest[field]} ({busiest['internal_name']})"
         )
 
-    # The practical output: resident-code ROMs discovery still fails on need no
-    # decompression and no streaming, so they are the closest to success.
-    ranked = [
-        row
-        for row in rows
-        if row["class"] == "resident_code" and row["proven_entries"] <= 1
-    ]
-    ranked.sort(key=lambda row: (-row["code_run_share"], row["loader_stub_ratio"]))
-    print(f"\neasiest next targets ({len(ranked)} resident-code ROMs still unproven):")
-    print(f"  {'internal name':<24}{'code%':>7}{'stub':>7}{'targets':>9}  developer")
-    for row in ranked[:15]:
+    # Load geometry is the bottleneck -- ROMs that recover it harvest roughly
+    # ten times the rest -- so the actionable output is which proof condition
+    # went unmet, not a difficulty score. Boot-bank measures do not predict
+    # harvest (code_run_share correlates at r=+0.14), so they are reported as
+    # classifiers only and never used to rank.
+    print("\ngeometry failure reason:")
+    for value, count in histogram(rows, "geometry_failure"):
+        print(f"  {value:<32}{count:>5}")
+
+    recovered = [row for row in rows if row["geometry_failure"] == "recovered"]
+    print(f"\nrecovered load geometry ({len(recovered)} ROMs):")
+    print(f"  {'internal name':<28}{'banks':>6}{'tables':>7}{'intervals':>10}  developer")
+    for row in sorted(recovered, key=lambda row: -row["mapped_banks"]):
         print(
-            f"  {row['internal_name'][:23]:<24}"
-            f"{row['code_run_share'] * 100:>6.1f}%"
-            f"{row['loader_stub_ratio']:>7.2f}"
-            f"{row['distinct_jal_targets']:>9}"
+            f"  {row['internal_name'][:27]:<28}"
+            f"{row['mapped_banks']:>6}"
+            f"{row['admitted_tables']:>7}"
+            f"{row['admitted_intervals']:>10}"
             f"  {row['developer']}"
+        )
+
+    # A candidate found and then rejected is a proof-rule gap: the detector
+    # works and the admission bar is what stands in the way. That is a far
+    # smaller, more specific problem than finding no candidate at all.
+    near = [row for row in rows if row["candidate_tables"] and row["mapped_banks"] <= 1]
+    near.sort(key=lambda row: -row["candidate_tables"])
+    print(f"\ncandidate tables found but not mapped ({len(near)} ROMs):")
+    for row in near[:15]:
+        print(
+            f"  {row['internal_name'][:27]:<28}"
+            f"cand={row['candidate_tables']:<5}"
+            f"admitted={row['admitted_tables']:<5}"
+            f"{row['geometry_failure']}"
         )
 
 
