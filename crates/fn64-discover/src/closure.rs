@@ -29,7 +29,6 @@
 
 use crate::block_proof::{BlockAssessment, BlockProofBlocker};
 use crate::cfg::{BasicBlock, BlockTerminator, WordClass};
-use crate::facts::Fact;
 use crate::owner_proof::OwnerAssessment;
 use crate::resolve::{IndirectProofState, IndirectResolutionKind};
 use crate::snapshot::{BankSnapshotV1, OwnerBlockerKind, ProgramSnapshotV1};
@@ -341,8 +340,9 @@ struct BlockExtent {
     end: u32,
 }
 
-/// One proven ROM->VA mapping's VA interval, for "is this address mapped at
-/// all" tests independent of proof-of-code.
+/// One proven bank image's VA interval, for "is this address mapped at all"
+/// tests independent of its affine or evaluator-produced backing and of
+/// proof-of-code.
 #[derive(Clone, Copy)]
 struct MappedVaRange {
     start: u32,
@@ -369,16 +369,11 @@ impl ProgramGeometry {
         let mut word_class: BTreeMap<u32, WordClass> = BTreeMap::new();
 
         for snapshot in snapshots {
-            for fact in snapshot.facts.proven_rom_mappings() {
-                if let Fact::RomMapping {
-                    va_start, va_end, ..
-                } = fact
-                {
-                    mapped.push(MappedVaRange {
-                        start: *va_start,
-                        end: *va_end,
-                    });
-                }
+            for image in snapshot.facts.proven_bank_images() {
+                mapped.push(MappedVaRange {
+                    start: image.va_start,
+                    end: image.va_end,
+                });
             }
             for bank in &snapshot.banks {
                 for assessment in &bank.owner_proof.assessments {
@@ -1031,7 +1026,9 @@ mod tests {
     use super::*;
     use crate::facts::{
         executable_range_subject, function_entry_subject, BankAddr, CandidateDetector,
-        FunctionEntryEvidence, ProloguePattern, ProofState, RomAddressSpace,
+        EvaluatedImageReceiptV1, Fact, FunctionEntryEvidence, MaterializationEvaluatorV1,
+        MaterializedImageSourceV1, MaterializedImageSuffixV1, ProloguePattern, ProofState,
+        RomAddressSpace,
     };
     use crate::normalize;
     use crate::snapshot::{compose_materialized_bank_v1, MaterializedBankInput};
@@ -1052,6 +1049,27 @@ mod tests {
         bytes[8..12].copy_from_slice(&BASE.to_be_bytes());
         bytes[ROM_START as usize..].copy_from_slice(bank);
         normalize(&bytes).unwrap()
+    }
+
+    fn evaluated_receipt(output_len: u32) -> EvaluatedImageReceiptV1 {
+        EvaluatedImageReceiptV1 {
+            evaluator: MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 1 },
+            source: MaterializedImageSourceV1 {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0x2000,
+                rom_end: 0x2040,
+                cursor: 4,
+            },
+            source_sha256: "11".repeat(32),
+            output_len,
+            output_sha256: "22".repeat(32),
+            streams: Vec::new(),
+            trailing_suffix: MaterializedImageSuffixV1 {
+                offset: 0,
+                len: 0,
+                sha256: "33".repeat(32),
+            },
+        }
     }
 
     /// Facts with a proven physical mapping + executable range covering the
@@ -1332,6 +1350,93 @@ mod tests {
                     kind: ConcreteTransferKind::Tail,
                 }],
             }]
+        );
+    }
+
+    #[test]
+    fn only_proven_evaluated_images_contribute_mapped_geometry() {
+        let bytes = asm(&[JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let mut snapshot = compose(&rom, &facts, &bytes, &[BASE]);
+        let evaluated_start = BASE + 0x1000;
+        let evaluated_end = evaluated_start + 8;
+        let evaluated = snapshot.facts.insert(Fact::EvaluatedImage {
+            bank: "evaluated".into(),
+            va_start: evaluated_start,
+            va_end: evaluated_end,
+            receipt: evaluated_receipt(evaluated_end - evaluated_start),
+        });
+        snapshot
+            .facts
+            .conclude(
+                "bank:evaluated",
+                ProofState::Supported,
+                vec![evaluated],
+                "candidate evaluation only",
+            )
+            .unwrap();
+
+        assert_eq!(
+            ProgramGeometry::from_snapshots(std::slice::from_ref(&snapshot))
+                .classify_concrete(evaluated_start),
+            DestinationReason::OutsideAllMappings,
+            "Supported evaluated bytes are not admitted bank geometry"
+        );
+
+        snapshot
+            .facts
+            .conclude(
+                "bank:evaluated",
+                ProofState::Proven,
+                vec![evaluated],
+                "test full proof",
+            )
+            .unwrap();
+        let geometry = ProgramGeometry::from_snapshots(std::slice::from_ref(&snapshot));
+        assert_eq!(
+            geometry.classify_concrete(evaluated_start),
+            DestinationReason::MappedNotProvenCode,
+            "Proven evaluated bytes contribute mapping, not code or owner authority"
+        );
+        assert!(geometry.is_mapped(BASE), "affine mapping remains present");
+    }
+
+    #[test]
+    fn same_bank_backing_ambiguity_unions_mapping_without_granting_code() {
+        let bytes = asm(&[JR_RA, NOP]);
+        let rom = rom_with_bank(&bytes);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+        let mut snapshot = compose(&rom, &facts, &bytes, &[BASE]);
+        let evaluated_start = BASE + 0x2000;
+        let evaluated_end = evaluated_start + 8;
+        let evaluated = snapshot.facts.insert(Fact::EvaluatedImage {
+            bank: "bank".into(),
+            va_start: evaluated_start,
+            va_end: evaluated_end,
+            receipt: evaluated_receipt(evaluated_end - evaluated_start),
+        });
+        snapshot
+            .facts
+            .conclude(
+                "bank:bank",
+                ProofState::Proven,
+                vec![evaluated],
+                "test competing proven backing",
+            )
+            .unwrap();
+
+        let geometry = ProgramGeometry::from_snapshots(std::slice::from_ref(&snapshot));
+        assert!(geometry.is_mapped(BASE), "affine interval remains mapped");
+        assert!(
+            geometry.is_mapped(evaluated_start),
+            "materialized interval joins the same bank's union geometry"
+        );
+        assert!(!geometry.in_owner(evaluated_start));
+        assert!(!geometry.in_block(evaluated_start));
+        assert_eq!(
+            geometry.classify_concrete(evaluated_start),
+            DestinationReason::MappedNotProvenCode
         );
     }
 
