@@ -208,7 +208,7 @@ tables:
 
 ### Sealed cold-training workspace
 
-The schema-v3 snapshot workspace is the current disk boundary for training a
+The schema-v4 snapshot workspace is the current disk boundary for training a
 general discovery mechanism against known ROMs. It is produced from ROM bytes
 without a label file and declares
 `intended_use = sealed_cold_function_training_input` and
@@ -304,14 +304,19 @@ global facts once and bank-local deltas separately; today's compatibility wire
 still repeats global facts in each projection and returns every snapshot in one
 `Vec`.
 
-The companion Rust type `BlockPackV1` currently emits wire schema v2, whose
-per-block address-space tag distinguishes physical ROM from VROM. Authoritative
-v2 emission accepts only the move-only `ValidatedComposedSnapshotsV2` minted by
-byte-verifying composition; deserialized `ProgramSnapshotV1` remains diagnostic
-and can emit only the physical-only legacy v1 wire. A v1 pack carrying a Virtual
-tag is rejected. The pack stores sorted disjoint geometry and digests, never
-instruction words. Materialization checks ROM and block identity, and the sparse
-emitter consumes those spans without widening them across holes. This is
+The companion Rust type `BlockPackV1` emits wire schema V3. Each block stores a
+tagged `BankBackingSpanV1`: affine Physical/VROM coordinates or an evaluated-
+image receipt identity with output-relative offsets. Authoritative emission
+accepts only the move-only `ValidatedComposedSnapshotsV2` minted by V6 byte-
+verifying composition; deserialized `ProgramSnapshotV1` remains diagnostic.
+V5 snapshots are not promoted and must be regenerated. Legacy V1 physical and
+V2 affine pack wires remain readable and retain their old restrictions; V1
+rejects Virtual backing and both reject evaluated-image backing. The pack
+stores sorted disjoint geometry and digests, never instruction words.
+Materialization checks ROM identity, re-derives evaluated output under fixed
+bounds when present, checks each block digest, and feeds the sparse emitter
+without widening spans across holes. The ROM-only workspace publisher and the
+external-tool staging command remain explicitly affine-only. This is
 intentionally not the final indexed program database:
 the runtime's small `CodeCatalog` now provides a binary-search sparse address
 index, but live generated-runner registration and generation-aware cache

@@ -4,6 +4,9 @@
 //! This module does not discover boundaries, classify words, or decode the
 //! ISA. Its only authoritative geometry is [`ExactFunctionOwner`], and every
 //! typed input is checked against [`fn64_recomp_rs::decode`] before emission.
+//! Emission consumes caller-supplied words and is therefore independent of
+//! whether the exact owner's bytes came from an affine ROM span or a
+//! materialized output span.
 //! A caller can explicitly retain an embedded or unresolved word as
 //! [`AsmWord::Raw`]; it is then emitted numerically without inferring code or
 //! a symbol.
@@ -635,15 +638,17 @@ fn fp_condition(cond: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::RomAddressSpace;
+    use crate::facts::{BankBackingSpanV1, RomAddressSpace};
 
     fn owner(start: u32, word_count: u32) -> ExactFunctionOwner {
         ExactFunctionOwner {
             entry: BankAddr::new("test", start),
             va_end: start + word_count * 4,
-            rom_space: RomAddressSpace::Physical,
-            rom_start: 0,
-            rom_end: word_count * 4,
+            backing: BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0,
+                rom_end: word_count * 4,
+            },
             block_starts: vec![start],
         }
     }
@@ -652,7 +657,14 @@ mod tests {
     fn integer_load_branch_and_symbolic_call_emit_as_instructions() {
         // Deliberately not 16-byte aligned: owner VAs are only word-aligned,
         // and the round trip must not inherit GNU ld's default text padding.
-        let function = owner(0x8000_1004, 6);
+        let mut function = owner(0x8000_1004, 6);
+        // Words cross this API explicitly, so their storage coordinates must
+        // not limit otherwise identical assembly emission.
+        function.backing = BankBackingSpanV1::Materialized {
+            receipt_sha256: "11".repeat(32),
+            output_start: 0,
+            output_end: 24,
+        };
         let callee = owner(0x8000_2000, 1);
         let words = [
             AsmWord::decode(0x012a_4020), // add $8,$9,$10

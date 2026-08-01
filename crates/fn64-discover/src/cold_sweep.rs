@@ -185,6 +185,7 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
                     max_projected_fact_bytes: limits.max_projected_fact_bytes,
                     max_aggregate_materialized_bytes: limits.max_aggregate_materialized_bytes,
                     max_cross_bank_authority_records: limits.max_cross_bank_authority_records,
+                    materialized_image: MaterializedImageLimitsV1::default(),
                 },
             ) {
                 Ok(composed) => {

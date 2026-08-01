@@ -2,10 +2,10 @@
 //! proof-carrying program artifact.
 //!
 //! The Rust envelope retains its historical `ProgramSnapshotV1` name, while
-//! its serialized schema is V5 after preserving typed semantic callable-entry
-//! provenance alongside the authority-rooted and broad traversal closures.
-//! It materializes one proven physical ROM-backed bank and verifies
-//! the supplied bytes against [`NormalizedRom`] before analysis, runs Phase
+//! its serialized schema is V6 after preserving the selected bank image as a
+//! typed affine-ROM or evaluator-produced backing span. It re-derives that
+//! backing from [`NormalizedRom`] and the projected [`FactDb`], verifies the
+//! supplied bytes before analysis, runs Phase
 //! 4-6 closure, writes closure-derived facts into a cloned [`FactDb`], then
 //! partitions and proves owners from that same fact snapshot. Reached
 //! proven-code blocks additionally become typed `ExecutableRange` facts
@@ -25,9 +25,10 @@ use crate::callback_flow::{
 use crate::coverage::{report_with_owner_proofs, CoverageReport, OwnerProofCoverageError};
 use crate::dense_aot_pack::DenseAotPackV1;
 use crate::facts::{
-    function_entry_subject, BankAddr, CandidateDetector, Fact, FactDb, FactProjectionError,
-    FactProjectionIndex, FunctionEntryEvidence, IndirectTransferKind, IndirectTransferState,
-    ProofState, RomAddressSpace, SemanticCallableContract,
+    function_entry_subject, BankAddr, BankBackingSpanResolutionV1, BankBackingSpanV1,
+    CandidateDetector, Fact, FactDb, FactProjectionError, FactProjectionIndex,
+    FunctionEntryEvidence, IndirectTransferKind, IndirectTransferState, ProofState,
+    SemanticCallableContract,
 };
 use crate::generation_topology::{
     dense_aot_pack_sha256_v1, CatalogBoundExactTransferV1, ExactTransferKindV1,
@@ -37,6 +38,10 @@ use crate::host_bindings::{
     discover_os_create_thread_host_binding, HostBindingDiscoveryError, HostBindingSymbol,
 };
 use crate::loaders::VirtualAddress;
+use crate::materialized_image::{
+    materialize_backing_span_v1, MaterializedBackingSpanCacheV1, MaterializedBackingSpanErrorV1,
+    MaterializedImageErrorV1, MaterializedImageLimitsV1,
+};
 use crate::owner_proof::{
     exact_authority_direct_call, exhaustive_authority_call_site,
     prove_exact_owners_with_callable_authority, AuthoritativeCallableEntries, OwnerAssessment,
@@ -53,11 +58,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
-/// V5 retains typed semantic callable-entry provenance in addition to the
-/// authority-rooted CFG and broad exploratory traversal CFG. Execution-closure
-/// consumers must never promote a caller-supplied traversal hint into evidence
-/// that a transfer can execute.
+/// Legacy affine-only snapshot wire, retained only so readers can reject it by
+/// its exact historical value. New composition never emits V5.
 pub const PROGRAM_SNAPSHOT_SCHEMA_V5: u32 = 5;
+/// V6 retains a tagged affine-ROM or evaluator-produced backing on every bank
+/// input, owner, and proven block.
+pub const PROGRAM_SNAPSHOT_SCHEMA_V6: u32 = 6;
 const REPORT_PROJECTION_STATS_ENV: &str = "FN64_DISCOVER_REPORT_PROJECTION_STATS";
 
 /// Runtime image supplied to the one-bank V1 composer. The bank may be the
@@ -76,9 +82,7 @@ pub struct BankInputDigestV1 {
     pub bank: String,
     pub va_start: u32,
     pub va_end: u32,
-    pub rom_space: RomAddressSpace,
-    pub rom_start: u32,
-    pub rom_end: u32,
+    pub backing: BankBackingSpanV1,
     pub bytes_sha256: String,
 }
 
@@ -176,8 +180,9 @@ pub enum OwnerBlockerKind {
     InvalidInstruction,
     MissingDelaySlot,
     WordNotProvenCode,
-    MissingRomBacking,
-    MultipleRomBackings,
+    MissingBankBacking,
+    AmbiguousBankBacking,
+    InvalidBankBackingGeometry,
     NotProvenExecutable,
     InteriorCallableEntry,
     InteriorCandidateEntry,
@@ -210,8 +215,9 @@ impl From<&OwnerBlocker> for OwnerBlockerKind {
             OwnerBlocker::InvalidInstruction { .. } => Self::InvalidInstruction,
             OwnerBlocker::MissingDelaySlot { .. } => Self::MissingDelaySlot,
             OwnerBlocker::WordNotProvenCode { .. } => Self::WordNotProvenCode,
-            OwnerBlocker::MissingRomBacking => Self::MissingRomBacking,
-            OwnerBlocker::MultipleRomBackings => Self::MultipleRomBackings,
+            OwnerBlocker::MissingBankBacking => Self::MissingBankBacking,
+            OwnerBlocker::AmbiguousBankBacking => Self::AmbiguousBankBacking,
+            OwnerBlocker::InvalidBankBackingGeometry => Self::InvalidBankBackingGeometry,
             OwnerBlocker::NotProvenExecutable => Self::NotProvenExecutable,
             OwnerBlocker::InteriorCallableEntry { .. } => Self::InteriorCallableEntry,
             OwnerBlocker::InteriorCandidateEntry { .. } => Self::InteriorCandidateEntry,
@@ -295,6 +301,7 @@ pub struct MultiBankCompositionLimits {
     pub max_projected_fact_bytes: u64,
     pub max_aggregate_materialized_bytes: u64,
     pub max_cross_bank_authority_records: u64,
+    pub materialized_image: MaterializedImageLimitsV1,
 }
 
 impl Default for MultiBankCompositionLimits {
@@ -310,6 +317,7 @@ impl Default for MultiBankCompositionLimits {
             max_projected_fact_bytes: 256 * 1024 * 1024,
             max_aggregate_materialized_bytes: 256 * 1024 * 1024,
             max_cross_bank_authority_records: 1_048_576,
+            materialized_image: MaterializedImageLimitsV1::default(),
         }
     }
 }
@@ -394,28 +402,43 @@ pub enum SnapshotError {
         entry: u32,
         control_pc: u32,
     },
-    MissingProvenMapping {
+    MissingProvenBacking {
         bank: String,
         va_start: u32,
         va_end: u32,
     },
-    AmbiguousProvenMapping {
+    AmbiguousProvenBacking {
         bank: String,
         va_start: u32,
         va_end: u32,
+    },
+    InvalidProvenBackingGeometry {
+        bank: String,
+        va_start: u32,
+        va_end: u32,
+    },
+    MissingEvaluatedImageReceipt {
+        bank: String,
+        receipt_sha256: String,
+    },
+    AmbiguousEvaluatedImageReceipt {
+        bank: String,
+        receipt_sha256: String,
         count: usize,
     },
-    MalformedPhysicalMapping {
+    BackingMaterialization {
         bank: String,
+        backing: BankBackingSpanV1,
+        reason: String,
     },
-    RomBackingOutsideImage {
-        rom_start: u32,
-        rom_end: u32,
+    EvaluatedImageRederivation {
+        bank: String,
+        receipt_sha256: String,
+        error: MaterializedImageErrorV1,
     },
     MaterializedBytesMismatch {
         bank: String,
-        rom_start: u32,
-        rom_end: u32,
+        backing: BankBackingSpanV1,
     },
     ExecutableRangeOutsideBank {
         bank: String,
@@ -521,24 +544,53 @@ impl std::fmt::Display for SnapshotError {
                 f,
                 "exact entry {bank}:0x{entry:08x} is control-shaped while also serving as the delay word of 0x{control_pc:08x}"
             ),
-            Self::MissingProvenMapping { bank, va_start, va_end } => write!(
+            Self::MissingProvenBacking { bank, va_start, va_end } => write!(
                 f,
-                "no proven mapping for {bank} covers [0x{va_start:08x},0x{va_end:08x})"
+                "no proven bank image for {bank} covers [0x{va_start:08x},0x{va_end:08x})"
             ),
-            Self::AmbiguousProvenMapping { bank, va_start, va_end, count } => write!(
+            Self::AmbiguousProvenBacking { bank, va_start, va_end } => write!(
                 f,
-                "{count} proven mappings for {bank} cover [0x{va_start:08x},0x{va_end:08x})"
+                "several distinct proven bank images for {bank} prevent selecting [0x{va_start:08x},0x{va_end:08x})"
             ),
-            Self::MalformedPhysicalMapping { bank } => {
-                write!(f, "proven physical mapping for {bank} has unequal ROM and VA extents")
-            }
-            Self::RomBackingOutsideImage { rom_start, rom_end } => write!(
+            Self::InvalidProvenBackingGeometry {
+                bank,
+                va_start,
+                va_end,
+            } => write!(
                 f,
-                "physical backing [0x{rom_start:x},0x{rom_end:x}) is outside the normalized ROM"
+                "proven bank image for {bank} cannot represent [0x{va_start:08x},0x{va_end:08x})"
             ),
-            Self::MaterializedBytesMismatch { bank, rom_start, rom_end } => write!(
+            Self::MissingEvaluatedImageReceipt {
+                bank,
+                receipt_sha256,
+            } => write!(
                 f,
-                "materialized bytes for {bank} differ from normalized ROM [0x{rom_start:x},0x{rom_end:x})"
+                "materialized backing for {bank} has no exact evaluated-image receipt {receipt_sha256}"
+            ),
+            Self::AmbiguousEvaluatedImageReceipt {
+                bank,
+                receipt_sha256,
+                count,
+            } => write!(
+                f,
+                "materialized backing for {bank} has {count} distinct evaluated-image receipts with identity {receipt_sha256}"
+            ),
+            Self::BackingMaterialization {
+                bank,
+                backing,
+                reason,
+            } => write!(f, "materializing {bank} backing {backing:?}: {reason}"),
+            Self::EvaluatedImageRederivation {
+                bank,
+                receipt_sha256,
+                error,
+            } => write!(
+                f,
+                "re-deriving {bank} evaluated image {receipt_sha256}: {error}"
+            ),
+            Self::MaterializedBytesMismatch { bank, backing } => write!(
+                f,
+                "supplied bytes for {bank} differ from re-derived backing {backing:?}"
             ),
             Self::ExecutableRangeOutsideBank { bank, va_start, va_end } => write!(
                 f,
@@ -557,16 +609,7 @@ impl From<OwnerProofCoverageError> for SnapshotError {
     }
 }
 
-#[derive(Clone, Copy)]
-struct CoveringMapping {
-    rom_space: RomAddressSpace,
-    rom_start: u32,
-    rom_end: u32,
-    va_start: u32,
-    va_end: u32,
-}
-
-/// Compose one byte-verified, proven physical ROM-backed bank through
+/// Compose one byte-verified, proven bank image through
 /// exact-owner proof, using only in-bank authority. Behavior and signature are
 /// preserved for existing callers; the multi-bank path is a separate entry
 /// point that adds cross-bank authority without touching this one.
@@ -592,7 +635,12 @@ pub fn compose_materialized_bank_validated_v2(
     let projection_index =
         FactProjectionIndex::new(base_facts).map_err(SnapshotError::FactProjection)?;
     let projected_facts = projection_index.project(input.bank);
-    let mut prepared = prepare_materialized_bank(rom, &projected_facts, input)?;
+    let mut prepared = prepare_materialized_bank(
+        rom,
+        &projected_facts,
+        input,
+        MaterializedImageLimitsV1::default(),
+    )?;
     refresh_prepared_traversal_closure(&mut prepared, &projected_facts)?;
     let authorized_roots = prepared.authorized_callable_roots.clone();
     Ok(ValidatedComposedSnapshotsV2 {
@@ -608,6 +656,7 @@ fn prepare_materialized_bank(
     rom: &NormalizedRom,
     base_facts: &FactDb,
     input: MaterializedBankInput<'_>,
+    materialized_image_limits: MaterializedImageLimitsV1,
 ) -> Result<PreparedBank, SnapshotError> {
     if input.bank.is_empty() || input.bank.trim() != input.bank {
         return Err(SnapshotError::InvalidBankName);
@@ -654,100 +703,44 @@ fn prepare_materialized_bank(
         roots.insert(root);
     }
 
-    let mappings: Vec<_> = base_facts
-        .proven_rom_mappings()
-        .into_iter()
-        .filter_map(|fact| {
-            let Fact::RomMapping {
-                bank,
-                rom_space,
-                rom_start,
-                rom_end,
-                va_start,
-                va_end: map_va_end,
-            } = fact
-            else {
-                return None;
-            };
-            (bank == input.bank && *va_start <= input.va_start && *map_va_end >= va_end).then_some(
-                CoveringMapping {
-                    rom_space: *rom_space,
-                    rom_start: *rom_start,
-                    rom_end: *rom_end,
-                    va_start: *va_start,
-                    va_end: *map_va_end,
-                },
-            )
-        })
-        .collect();
-    let mapping = match mappings.as_slice() {
-        [] => {
-            return Err(SnapshotError::MissingProvenMapping {
-                bank: input.bank.into(),
-                va_start: input.va_start,
-                va_end,
-            });
-        }
-        [mapping] => *mapping,
-        mappings => {
-            return Err(SnapshotError::AmbiguousProvenMapping {
-                bank: input.bank.into(),
-                va_start: input.va_start,
-                va_end,
-                count: mappings.len(),
-            });
-        }
-    };
-    // A DMA-loaded overlay's VA extent may exceed its ROM extent: the trailing
-    // `.bss` is allocated at load time and has no backing bytes. Accept that
-    // shape, but never let a materialized window reach past the ROM-backed
-    // prefix (checked once `rom_end` is known below).
-    match (
-        mapping.rom_end.checked_sub(mapping.rom_start),
-        mapping.va_end.checked_sub(mapping.va_start),
-    ) {
-        (Some(rom_extent), Some(va_extent)) if rom_extent <= va_extent => {}
-        _ => {
-            return Err(SnapshotError::MalformedPhysicalMapping {
-                bank: input.bank.into(),
-            });
-        }
-    }
-    let offset = input.va_start - mapping.va_start;
-    let rom_start =
-        mapping
-            .rom_start
-            .checked_add(offset)
-            .ok_or(SnapshotError::MalformedPhysicalMapping {
-                bank: input.bank.into(),
-            })?;
-    let rom_end =
-        rom_start
-            .checked_add(byte_len)
-            .ok_or(SnapshotError::MalformedPhysicalMapping {
-                bank: input.bank.into(),
-            })?;
-    // The requested window must stay inside the mapping's ROM-backed bytes; a
-    // bank that tried to include its `.bss` tail is rejected loudly rather than
-    // silently materializing bytes that the ROM does not carry.
-    if rom_end > mapping.rom_end {
-        return Err(SnapshotError::MalformedPhysicalMapping {
-            bank: input.bank.into(),
-        });
-    }
-    // Materialize through the shared ROM-range resolver: a physical bank is
-    // sliced from the image, while a VROM (DMA-loaded) overlay is resolved and
-    // byte-verified through its one proven file-table record. Both therefore
-    // reach the same materialized-bytes check below.
     let backing =
-        crate::banks::materialize_rom_range(rom, base_facts, mapping.rom_space, rom_start, rom_end)
-            .map_err(|_| SnapshotError::RomBackingOutsideImage { rom_start, rom_end })?;
-    let backing = backing.bytes.as_slice();
-    if backing != input.bytes {
+        match base_facts.resolve_proven_bank_backing_span(input.bank, input.va_start, va_end) {
+            BankBackingSpanResolutionV1::Missing => {
+                return Err(SnapshotError::MissingProvenBacking {
+                    bank: input.bank.into(),
+                    va_start: input.va_start,
+                    va_end,
+                });
+            }
+            BankBackingSpanResolutionV1::Ambiguous => {
+                return Err(SnapshotError::AmbiguousProvenBacking {
+                    bank: input.bank.into(),
+                    va_start: input.va_start,
+                    va_end,
+                });
+            }
+            BankBackingSpanResolutionV1::InvalidGeometry => {
+                return Err(SnapshotError::InvalidProvenBackingGeometry {
+                    bank: input.bank.into(),
+                    va_start: input.va_start,
+                    va_end,
+                });
+            }
+            BankBackingSpanResolutionV1::Unique(backing) => backing,
+        };
+    let rederived = materialize_selected_backing(
+        rom,
+        base_facts,
+        input.bank,
+        input.va_start,
+        va_end,
+        &backing,
+        materialized_image_limits,
+    )?;
+    if rederived != input.bytes {
         return Err(SnapshotError::MaterializedBytesMismatch {
             bank: input.bank.into(),
-            rom_start,
-            rom_end,
+            backing,
         });
     }
     for (exec_start, exec_end) in base_facts.proven_executable_ranges(input.bank) {
@@ -793,9 +786,7 @@ fn prepare_materialized_bank(
             bank: input.bank.into(),
             va_start: input.va_start,
             va_end,
-            rom_space: mapping.rom_space,
-            rom_start,
-            rom_end,
+            backing,
             bytes_sha256: sha256_hex(input.bytes),
         },
         facts,
@@ -806,6 +797,63 @@ fn prepare_materialized_bank(
         cross_bank_reachability_roots: BTreeSet::new(),
         semantic_cross_bank_roots: BTreeSet::new(),
         authority_closure,
+    })
+}
+
+fn materialize_selected_backing(
+    rom: &NormalizedRom,
+    facts: &FactDb,
+    bank: &str,
+    va_start: u32,
+    va_end: u32,
+    backing: &BankBackingSpanV1,
+    limits: MaterializedImageLimitsV1,
+) -> Result<Vec<u8>, SnapshotError> {
+    materialize_backing_span_v1(
+        rom,
+        Some(facts),
+        bank,
+        va_start,
+        va_end,
+        backing,
+        limits,
+        &mut MaterializedBackingSpanCacheV1::default(),
+    )
+    .map_err(|error| match error {
+        MaterializedBackingSpanErrorV1::MissingEvaluatedImageReceipt { receipt_sha256 } => {
+            SnapshotError::MissingEvaluatedImageReceipt {
+                bank: bank.to_owned(),
+                receipt_sha256,
+            }
+        }
+        MaterializedBackingSpanErrorV1::AmbiguousEvaluatedImageReceipt {
+            receipt_sha256,
+            count,
+        } => SnapshotError::AmbiguousEvaluatedImageReceipt {
+            bank: bank.to_owned(),
+            receipt_sha256,
+            count,
+        },
+        MaterializedBackingSpanErrorV1::EvaluatedImageRederivation {
+            receipt_sha256,
+            error,
+        } => SnapshotError::EvaluatedImageRederivation {
+            bank: bank.to_owned(),
+            receipt_sha256,
+            error,
+        },
+        MaterializedBackingSpanErrorV1::InvalidGeometry => {
+            SnapshotError::InvalidProvenBackingGeometry {
+                bank: bank.to_owned(),
+                va_start,
+                va_end,
+            }
+        }
+        error => SnapshotError::BackingMaterialization {
+            bank: bank.to_owned(),
+            backing: backing.clone(),
+            reason: format!("{error:?}"),
+        },
     })
 }
 
@@ -1288,7 +1336,7 @@ fn finish_materialized_bank(
     };
     debug_assert_eq!(bank.input.bank, bank.owner_proof.bank);
     Ok(ProgramSnapshotV1 {
-        schema_version: PROGRAM_SNAPSHOT_SCHEMA_V5,
+        schema_version: PROGRAM_SNAPSHOT_SCHEMA_V6,
         normalized_rom_sha256: rom.sha256.clone(),
         facts,
         banks: vec![bank],
@@ -1974,6 +2022,7 @@ fn compose_materialized_banks_catalog_bound_with_limits(
                     bytes: input.bytes,
                     seed_roots: input.seed_roots,
                 },
+                limits.materialized_image,
             )
         })
         .collect::<Result<_, _>>()?;
@@ -2211,9 +2260,11 @@ mod tests {
     use super::*;
     use crate::facts::{
         executable_range_subject, function_entry_subject, load_image_table_record_subject,
-        CandidateDetector, FunctionEntryEvidence, MappingAddressSpace, ProloguePattern, ProofState,
+        CandidateDetector, FunctionEntryEvidence, MappingAddressSpace, MaterializationEvaluatorV1,
+        MaterializedImageSourceV1, ProloguePattern, ProofState, RomAddressSpace,
     };
     use crate::normalize;
+    use flate2::{write::DeflateEncoder, Compression};
 
     const BASE: u32 = 0x8000_0000;
     const ROM_START: u32 = 0x1000;
@@ -2518,6 +2569,26 @@ mod tests {
         normalize(&bytes).unwrap()
     }
 
+    fn headered_raw_deflate(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut encoded = Vec::with_capacity(6 + compressed.len());
+        encoded.extend_from_slice(&[0x11, 0x72]);
+        encoded.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&compressed);
+        encoded
+    }
+
+    fn rom_with_encoded_image(encoded: &[u8]) -> NormalizedRom {
+        let len = (ROM_START as usize + encoded.len() + 3) & !3;
+        let mut bytes = vec![0u8; len];
+        bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&BASE.to_be_bytes());
+        bytes[ROM_START as usize..ROM_START as usize + encoded.len()].copy_from_slice(encoded);
+        normalize(&bytes).unwrap()
+    }
+
     fn facts_for(byte_len: u32, authoritative_entries: &[u32]) -> FactDb {
         let mut facts = facts_without_executable(byte_len, authoritative_entries);
         let executable = facts.insert(Fact::ExecutableRange {
@@ -2604,11 +2675,18 @@ mod tests {
         let facts = facts_for(bytes.len() as u32, &[BASE]);
         let snapshot = compose(&rom, &facts, &bytes, &[BASE]).unwrap();
 
-        assert_eq!(snapshot.schema_version, PROGRAM_SNAPSHOT_SCHEMA_V5);
+        assert_eq!(snapshot.schema_version, PROGRAM_SNAPSHOT_SCHEMA_V6);
         assert_eq!(snapshot.coverage.function_owners.exact_owners, 1);
         assert_eq!(snapshot.banks[0].block_proof.proven_blocks, 1);
         assert!(snapshot.banks[0].blocker_histogram.is_empty());
-        assert_eq!(snapshot.banks[0].input.rom_start, ROM_START);
+        assert_eq!(
+            snapshot.banks[0].input.backing,
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: ROM_START,
+                rom_end: ROM_START + bytes.len() as u32,
+            }
+        );
     }
 
     #[test]
@@ -2787,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_vrom_composition_emits_v2_but_not_legacy_v1() {
+    fn validated_vrom_composition_emits_v3_and_requires_facts_to_materialize() {
         const VROM_START: u32 = 0x0020_0000;
 
         let bytes = asm(&[JR_RA, NOP]);
@@ -2862,16 +2940,21 @@ mod tests {
             },
         )
         .unwrap();
-        let pack = crate::block_pack::emit_validated_block_pack_v2(&validated, 0, &rom).unwrap();
-        assert_eq!(pack.schema_version, crate::block_pack::BLOCK_PACK_SCHEMA_V2);
-        assert_eq!(pack.banks[0].blocks[0].rom_space, RomAddressSpace::Virtual);
+        let pack = crate::block_pack::emit_validated_block_pack_v3(&validated, 0, &rom).unwrap();
+        assert_eq!(pack.schema_version, crate::block_pack::BLOCK_PACK_SCHEMA_V3);
         assert!(matches!(
-            crate::block_pack::emit_block_pack_v1(&validated.snapshots()[0], &rom),
-            Err(crate::block_pack::BlockPackError::LegacySchemaVirtualBacking {
-                bank,
-                start_va: BASE,
-            }) if bank == "overlay"
+            pack.banks[0].blocks[0].backing,
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Virtual,
+                ..
+            }
         ));
+        let diagnostic =
+            crate::block_pack::emit_block_pack_v1(&validated.snapshots()[0], &rom).unwrap();
+        assert_eq!(
+            diagnostic.schema_version,
+            crate::block_pack::BLOCK_PACK_SCHEMA_V3
+        );
         assert!(matches!(
             crate::block_pack::materialize_block_pack(&pack, &rom),
             Err(crate::block_pack::BlockPackError::VromRequiresFacts {
@@ -3027,12 +3110,12 @@ mod tests {
         )
         .unwrap();
         let pack = crate::block_pack::emit_validated_block_pack_v2(&validated, 0, &rom).unwrap();
-        assert_eq!(pack.schema_version, crate::block_pack::BLOCK_PACK_SCHEMA_V2);
+        assert_eq!(pack.schema_version, crate::block_pack::BLOCK_PACK_SCHEMA_V3);
         let diagnostic =
             crate::block_pack::emit_block_pack_v1(&validated.snapshots()[0], &rom).unwrap();
         assert_eq!(
             diagnostic.schema_version,
-            crate::block_pack::BLOCK_PACK_SCHEMA_V1
+            crate::block_pack::BLOCK_PACK_SCHEMA_V3
         );
         assert!(matches!(
             crate::block_pack::emit_validated_block_pack_v2(&validated, 1, &rom),
@@ -3049,7 +3132,7 @@ mod tests {
             crate::block_pack::emit_block_pack_v1(&caller_authored, &rom),
             Err(
                 crate::block_pack::BlockPackError::UnsupportedSnapshotSchema {
-                    expected: PROGRAM_SNAPSHOT_SCHEMA_V5,
+                    expected: PROGRAM_SNAPSHOT_SCHEMA_V6,
                     actual: 1,
                 }
             )
@@ -3098,6 +3181,73 @@ mod tests {
             compose(&rom, &facts, &different, &[BASE]),
             Err(SnapshotError::MaterializedBytesMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn evaluated_image_subrange_is_rederived_with_typed_output_offsets() {
+        let full_output = asm(&[NOP, NOP, JR_RA, NOP]);
+        let selected = &full_output[8..];
+        let encoded = headered_raw_deflate(&full_output);
+        let rom = rom_with_encoded_image(&encoded);
+        let source = MaterializedImageSourceV1 {
+            rom_space: RomAddressSpace::Physical,
+            rom_start: ROM_START,
+            rom_end: ROM_START + encoded.len() as u32,
+            cursor: 0,
+        };
+        let evaluator =
+            MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 1 };
+        let receipt = crate::materialized_image::evaluate_materialized_image_v1(
+            &rom,
+            &FactDb::new(),
+            &source,
+            &evaluator,
+            MaterializedImageLimitsV1::default(),
+        )
+        .unwrap()
+        .receipt()
+        .clone();
+        let receipt_sha256 = crate::facts::evaluated_image_receipt_sha256_v1(&receipt);
+        let mut facts = FactDb::new();
+        let image = facts.insert(Fact::EvaluatedImage {
+            bank: "materialized".into(),
+            va_start: BASE,
+            va_end: BASE + full_output.len() as u32,
+            receipt,
+        });
+        facts
+            .conclude(
+                "bank:materialized",
+                ProofState::Proven,
+                vec![image],
+                "test evaluated image",
+            )
+            .unwrap();
+
+        let snapshot = compose_materialized_bank_v1(
+            &rom,
+            &facts,
+            MaterializedBankInput {
+                bank: "materialized",
+                va_start: BASE + 8,
+                bytes: selected,
+                seed_roots: &[BASE + 8],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.schema_version, PROGRAM_SNAPSHOT_SCHEMA_V6);
+        assert_eq!(
+            snapshot.banks[0].input.backing,
+            BankBackingSpanV1::Materialized {
+                receipt_sha256,
+                output_start: 8,
+                output_end: 16,
+            }
+        );
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(wire.contains("\"kind\":\"materialized\""));
+        assert!(!wire.contains("\"bytes\":"));
     }
 
     #[test]
@@ -3413,7 +3563,7 @@ mod tests {
 
         let wire = serde_json::to_vec(&snapshots[1]).unwrap();
         let round_trip: ProgramSnapshotV1 = serde_json::from_slice(&wire).unwrap();
-        assert_eq!(round_trip.schema_version, PROGRAM_SNAPSHOT_SCHEMA_V5);
+        assert_eq!(round_trip.schema_version, PROGRAM_SNAPSHOT_SCHEMA_V6);
         assert_eq!(
             serde_json::to_vec(&round_trip.facts).unwrap(),
             serde_json::to_vec(&snapshots[1].facts).unwrap()
@@ -4711,7 +4861,7 @@ mod tests {
             callee_owner_is_proven(&snapshots),
             "an exhaustive cross-bank computed call should authorize the callee entry"
         );
-        assert_eq!(snapshots[1].schema_version, PROGRAM_SNAPSHOT_SCHEMA_V5);
+        assert_eq!(snapshots[1].schema_version, PROGRAM_SNAPSHOT_SCHEMA_V6);
         assert!(snapshots[1].facts.facts().iter().any(|fact| matches!(
             fact,
             Fact::ResolvedCall { source, target }
@@ -4721,7 +4871,7 @@ mod tests {
                     && target.pc == Y_BASE
         )));
         let wire = serde_json::to_value(&snapshots[1]).unwrap();
-        assert_eq!(wire["schema_version"], PROGRAM_SNAPSHOT_SCHEMA_V5);
+        assert_eq!(wire["schema_version"], PROGRAM_SNAPSHOT_SCHEMA_V6);
         assert!(wire["facts"]["facts"]
             .as_array()
             .unwrap()
@@ -4845,9 +4995,11 @@ mod tests {
                     bank: "caller".into(),
                     va_start: X_BASE,
                     va_end: X_BASE + 8,
-                    rom_space: RomAddressSpace::Physical,
-                    rom_start: X_ROM,
-                    rom_end: X_ROM + 8,
+                    backing: BankBackingSpanV1::RomAffine {
+                        rom_space: RomAddressSpace::Physical,
+                        rom_start: X_ROM,
+                        rom_end: X_ROM + 8,
+                    },
                     bytes_sha256: sha256_hex(&[0; 8]),
                 },
                 facts,

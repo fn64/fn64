@@ -7,17 +7,19 @@
 //! a capability.  Snapshot and bank bytes are then revalidated and borrowed to
 //! a visitor one bank at a time, keeping full-ROM workspaces out of memory.
 
-use crate::facts::{BankAddr, CandidateDetector, RomAddressSpace};
+use crate::facts::{BankAddr, BankBackingSpanV1, CandidateDetector, RomAddressSpace};
 use crate::grade_candidates::{
     AddressedPhysicalEntryV2, CandidatePhysicalProvenanceV2, DetectorCandidateIdentitiesV2,
     ScopedCandidateIdentitiesV3, SCOPED_CANDIDATE_IDENTITY_SCHEMA_V3,
 };
-use crate::snapshot::{ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V5};
+use crate::snapshot::{ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V6};
 use crate::tool_adapter::Sha256Digest;
-use crate::tool_claims::program_snapshot_sha256_v2;
+use crate::tool_claims::program_snapshot_sha256_v3;
 use crate::workspace_artifacts::validate_workspace;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+const SNAPSHOT_WORKSPACE_SCHEMA_V4: u32 = 4;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
 #[cfg(unix)]
@@ -405,9 +407,7 @@ struct SnapshotWireReceipt {
 struct BankReceipt {
     index: usize,
     bank: String,
-    rom_space: RomAddressSpace,
-    rom_start: u32,
-    rom_end: u32,
+    backing: BankBackingSpanV1,
     va_start: u32,
     va_end: u32,
     byte_length: u64,
@@ -442,11 +442,11 @@ enum GhidraSeedsWire {
 
 fn validate_manifest(manifest: &WorkspaceManifest) -> Result<(), SnapshotWorkspaceError> {
     if manifest.schema != "fn64.snapshot-workspace"
-        || manifest.schema_version != 3
+        || manifest.schema_version != SNAPSHOT_WORKSPACE_SCHEMA_V4
         || manifest.intended_use != "sealed_cold_function_training_input"
     {
         return Err(SnapshotWorkspaceError(
-            "workspace is not the current sealed cold-function-training schema".into(),
+            "workspace is not the current sealed cold-function-training schema v4".into(),
         ));
     }
     parse_digest(&manifest.normalized_rom_sha256, "normalized ROM digest")?;
@@ -491,13 +491,13 @@ fn validate_manifest(manifest: &WorkspaceManifest) -> Result<(), SnapshotWorkspa
         "scoped candidate identity digest",
     )?;
     validate_limits(&manifest.limits)?;
-    if manifest.snapshot_wire.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V5
+    if manifest.snapshot_wire.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V6
         || manifest.snapshot_wire.authority != "diagnostic_only"
         || manifest.snapshot_wire.duplicates_fact_db_per_bank
-        || manifest.snapshot_wire.remaining_large_rom_frontier != "streaming_v5"
+        || manifest.snapshot_wire.remaining_large_rom_frontier != "streaming_v6"
     {
         return Err(SnapshotWorkspaceError(
-            "snapshot wire receipt does not describe current projected schema v5".into(),
+            "snapshot wire receipt does not describe current projected schema v6".into(),
         ));
     }
     validate_discovery(&manifest.discovery)?;
@@ -525,25 +525,47 @@ fn validate_manifest(manifest: &WorkspaceManifest) -> Result<(), SnapshotWorkspa
             ));
         }
         prior_name = Some(&bank.bank);
-        let rom_span = bank.rom_end.checked_sub(bank.rom_start).map(u64::from);
+        let backing_span = match &bank.backing {
+            BankBackingSpanV1::RomAffine {
+                rom_start, rom_end, ..
+            } => rom_end.checked_sub(*rom_start).map(u64::from),
+            BankBackingSpanV1::Materialized {
+                output_start,
+                output_end,
+                ..
+            } => output_end.checked_sub(*output_start).map(u64::from),
+        };
         let va_span = bank.va_end.checked_sub(bank.va_start).map(u64::from);
         if bank.byte_length == 0
-            || rom_span != Some(bank.byte_length)
+            || backing_span != Some(bank.byte_length)
             || va_span != Some(bank.byte_length)
         {
             return Err(SnapshotWorkspaceError(format!(
                 "bank {index} has inconsistent geometry"
             )));
         }
-        match bank.rom_space {
-            RomAddressSpace::Physical if !bank.backing_evidence_fact_indices.is_empty() => {
+        match &bank.backing {
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                ..
+            } if !bank.backing_evidence_fact_indices.is_empty() => {
                 return Err(SnapshotWorkspaceError(format!(
                     "physical bank {index} carries VROM backing evidence"
                 )))
             }
-            RomAddressSpace::Virtual if bank.backing_evidence_fact_indices.len() != 1 => {
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Virtual,
+                ..
+            } if bank.backing_evidence_fact_indices.len() != 1 => {
                 return Err(SnapshotWorkspaceError(format!(
                     "virtual bank {index} lacks one backing evidence index"
+                )))
+            }
+            BankBackingSpanV1::Materialized { .. }
+                if bank.backing_evidence_fact_indices.len() > 1 =>
+            {
+                return Err(SnapshotWorkspaceError(format!(
+                    "materialized bank {index} carries more than one source backing evidence index"
                 )))
             }
             _ => {}
@@ -691,7 +713,7 @@ fn parse_and_verify_snapshot(
             receipt.index
         )));
     }
-    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V5
+    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V6
         || snapshot.normalized_rom_sha256 != manifest.normalized_rom_sha256
         || snapshot.banks.len() != 1
     {
@@ -704,9 +726,7 @@ fn parse_and_verify_snapshot(
     if input.bank != receipt.bank
         || input.va_start != receipt.va_start
         || input.va_end != receipt.va_end
-        || input.rom_space != receipt.rom_space
-        || input.rom_start != receipt.rom_start
-        || input.rom_end != receipt.rom_end
+        || input.backing != receipt.backing
         || input.bytes_sha256 != receipt.bank_sha256.to_hex()
         || Sha256Digest::of(bank_bytes) != receipt.bank_sha256
     {
@@ -715,7 +735,7 @@ fn parse_and_verify_snapshot(
             receipt.index
         )));
     }
-    let semantic = program_snapshot_sha256_v2(&snapshot).map_err(|error| {
+    let semantic = program_snapshot_sha256_v3(&snapshot).map_err(|error| {
         SnapshotWorkspaceError(format!(
             "hashing semantic snapshot {}: {error}",
             receipt.index
@@ -1333,7 +1353,7 @@ mod tests {
         let input = &snapshot.banks[0].input;
         let manifest = serde_json::json!({
             "schema": "fn64.snapshot-workspace",
-            "schema_version": 3,
+            "schema_version": 4,
             "state": "composed",
             "open_reason": null,
             "normalized_rom_sha256": snapshot.normalized_rom_sha256,
@@ -1357,7 +1377,7 @@ mod tests {
                 "max_aggregate_materialized_bytes":MAX_AGGREGATE_BANK_BYTES,
                 "max_cross_bank_authority_records":1_048_576
             },
-            "snapshot_wire":{"schema_version":5,"authority":"diagnostic_only","duplicates_fact_db_per_bank":false,"remaining_large_rom_frontier":"streaming_v5"},
+            "snapshot_wire":{"schema_version":6,"authority":"diagnostic_only","duplicates_fact_db_per_bank":false,"remaining_large_rom_frontier":"streaming_v6"},
             "aggregate_snapshot_artifact_bytes":snapshot_bytes.len(),
             "rom_recompilation_complete":false,
             "remaining_recompilation_frontier":"proven_bank_and_callable_owner_closure",
@@ -1370,15 +1390,14 @@ mod tests {
                 "scoped_candidate_identities_v3_sha256":candidates.digest_sha256()
             },
             "banks":[{
-                "index":0,"bank":"bank_a","rom_space":"Physical",
-                "rom_start":input.rom_start,"rom_end":input.rom_end,
+                "index":0,"bank":"bank_a","backing":input.backing.clone(),
                 "va_start":input.va_start,"va_end":input.va_end,
                 "byte_length":bank_bytes.len(),"backing_evidence_fact_indices":[],
                 "bank_sha256":Sha256Digest::of(&bank_bytes),
                 "bank_artifact":"bank-000000.bin","snapshot_artifact":"bank-000000.snapshot.json",
                 "snapshot_artifact_byte_length":snapshot_bytes.len(),
                 "snapshot_artifact_sha256":Sha256Digest::of(&snapshot_bytes),
-                "program_snapshot_sha256":program_snapshot_sha256_v2(&snapshot).unwrap(),
+                "program_snapshot_sha256":program_snapshot_sha256_v3(&snapshot).unwrap(),
                 "ghidra_seeds":{"mode":"discovery_only","role":"candidate_only"}
             }]
         });
@@ -1476,12 +1495,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_requires_equal_checked_rom_and_va_spans() {
+    fn manifest_requires_equal_checked_backing_and_va_spans() {
         for (rom_start, rom_end) in [(0x1000, 0x101c), (0x1020, 0x1000)] {
             let fixture = valid_fixture();
             rewrite_manifest(&fixture, |manifest| {
-                manifest["banks"][0]["rom_start"] = serde_json::json!(rom_start);
-                manifest["banks"][0]["rom_end"] = serde_json::json!(rom_end);
+                manifest["banks"][0]["backing"]["rom_start"] = serde_json::json!(rom_start);
+                manifest["banks"][0]["backing"]["rom_end"] = serde_json::json!(rom_end);
             });
             let error = validate_snapshot_workspace(&fixture.workspace)
                 .err()

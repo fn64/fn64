@@ -1301,17 +1301,19 @@ impl FactDb {
         self.conclusions.values()
     }
 
-    /// All `RomMapping` facts with `Proven` conclusions, i.e. accepted
-    /// banks. This is the primary input to Phase 3+ (candidate harvesting
-    /// operates within bank-qualified identity).
+    /// All `RomMapping` facts cited by their bank's `Proven` conclusion. A
+    /// same-bank candidate fact that is absent from `justified_by` does not
+    /// inherit the bank subject's authority.
     pub fn proven_rom_mappings(&self) -> Vec<&Fact> {
         self.facts
             .iter()
-            .filter(|f| {
-                matches!(f, Fact::RomMapping { bank, .. }
-                if self.conclusion(&format!("bank:{bank}"))
-                    .map(|c| c.state == ProofState::Proven)
-                    .unwrap_or(false))
+            .enumerate()
+            .filter_map(|(index, fact)| {
+                let Fact::RomMapping { bank, .. } = fact else {
+                    return None;
+                };
+                self.proven_bank_conclusion_cites(bank, index)
+                    .then_some(fact)
             })
             .collect()
     }
@@ -1322,7 +1324,8 @@ impl FactDb {
     pub fn proven_bank_images(&self) -> Vec<ProvenBankImageV1> {
         self.facts
             .iter()
-            .filter_map(|fact| match fact {
+            .enumerate()
+            .filter_map(|(index, fact)| match fact {
                 Fact::RomMapping {
                     bank,
                     rom_space,
@@ -1330,43 +1333,41 @@ impl FactDb {
                     rom_end,
                     va_start,
                     va_end,
-                } if self
-                    .conclusion(&format!("bank:{bank}"))
-                    .is_some_and(|conclusion| conclusion.state == ProofState::Proven) =>
-                {
-                    Some(ProvenBankImageV1 {
-                        bank: bank.clone(),
-                        va_start: *va_start,
-                        va_end: *va_end,
-                        backing: BankBackingV1::RomAffine {
-                            rom_space: *rom_space,
-                            rom_start: *rom_start,
-                            rom_end: *rom_end,
-                        },
-                    })
-                }
+                } if self.proven_bank_conclusion_cites(bank, index) => Some(ProvenBankImageV1 {
+                    bank: bank.clone(),
+                    va_start: *va_start,
+                    va_end: *va_end,
+                    backing: BankBackingV1::RomAffine {
+                        rom_space: *rom_space,
+                        rom_start: *rom_start,
+                        rom_end: *rom_end,
+                    },
+                }),
                 Fact::EvaluatedImage {
                     bank,
                     va_start,
                     va_end,
                     receipt,
-                } if self
-                    .conclusion(&format!("bank:{bank}"))
-                    .is_some_and(|conclusion| conclusion.state == ProofState::Proven) =>
-                {
-                    Some(ProvenBankImageV1 {
-                        bank: bank.clone(),
-                        va_start: *va_start,
-                        va_end: *va_end,
-                        backing: BankBackingV1::Materialized {
-                            receipt_sha256: evaluated_image_receipt_sha256_v1(receipt),
-                            output_len: receipt.output_len,
-                        },
-                    })
-                }
+                } if self.proven_bank_conclusion_cites(bank, index) => Some(ProvenBankImageV1 {
+                    bank: bank.clone(),
+                    va_start: *va_start,
+                    va_end: *va_end,
+                    backing: BankBackingV1::Materialized {
+                        receipt_sha256: evaluated_image_receipt_sha256_v1(receipt),
+                        output_len: receipt.output_len,
+                    },
+                }),
                 _ => None,
             })
             .collect()
+    }
+
+    fn proven_bank_conclusion_cites(&self, bank: &str, fact_index: usize) -> bool {
+        self.conclusion(&format!("bank:{bank}"))
+            .is_some_and(|conclusion| {
+                conclusion.state == ProofState::Proven
+                    && conclusion.justified_by.contains(&fact_index)
+            })
     }
 
     /// Resolve `[va_start, va_end)` to a typed subspan of the bank's complete
@@ -2798,6 +2799,38 @@ mod tests {
         assert!(matches!(
             images[1].backing,
             BankBackingV1::Materialized { .. }
+        ));
+    }
+
+    #[test]
+    fn uncited_same_bank_candidate_does_not_inherit_bank_authority() {
+        let mut db = FactDb::new();
+        let affine = db.insert(Fact::RomMapping {
+            bank: "bank".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x1000,
+            rom_end: 0x1008,
+            va_start: 0x8040_0000,
+            va_end: 0x8040_0008,
+        });
+        db.insert(Fact::EvaluatedImage {
+            bank: "bank".into(),
+            va_start: 0x8040_0000,
+            va_end: 0x8040_0008,
+            receipt: evaluated_receipt(),
+        });
+        db.conclude(
+            "bank:bank",
+            ProofState::Proven,
+            vec![affine],
+            "only the affine image is proven",
+        )
+        .unwrap();
+
+        assert_eq!(db.proven_bank_images().len(), 1);
+        assert!(matches!(
+            db.resolve_proven_bank_backing_span("bank", 0x8040_0000, 0x8040_0008),
+            BankBackingSpanResolutionV1::Unique(BankBackingSpanV1::RomAffine { .. })
         ));
     }
 

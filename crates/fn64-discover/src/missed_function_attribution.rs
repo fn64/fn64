@@ -1796,7 +1796,7 @@ mod tests {
     use super::*;
     use crate::facts::{FactDb, FunctionEntryEvidence};
     use crate::grade_candidates::DetectorCandidateIdentitiesV2;
-    use crate::snapshot::PROGRAM_SNAPSHOT_SCHEMA_V5;
+    use crate::snapshot::PROGRAM_SNAPSHOT_SCHEMA_V6;
 
     fn validation_envelope() -> AttributionEnvelopeV2 {
         let section = AnswerSectionV1 {
@@ -2085,7 +2085,7 @@ mod tests {
             target: BankAddr::new("code", VA + 4),
         });
         let snapshot = ProgramSnapshotV1 {
-            schema_version: PROGRAM_SNAPSHOT_SCHEMA_V5,
+            schema_version: PROGRAM_SNAPSHOT_SCHEMA_V6,
             normalized_rom_sha256: "00".repeat(32),
             coverage: crate::coverage::report(0, &facts),
             facts,

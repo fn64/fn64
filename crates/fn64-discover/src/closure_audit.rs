@@ -104,16 +104,14 @@ fn retained_closure_audit_v3(
             left.bank.as_str(),
             left.va_start,
             left.va_end,
-            left.rom_start,
-            left.rom_end,
+            &left.backing,
             left.bytes_sha256.as_str(),
         )
             .cmp(&(
                 right.bank.as_str(),
                 right.va_start,
                 right.va_end,
-                right.rom_start,
-                right.rom_end,
+                &right.backing,
                 right.bytes_sha256.as_str(),
             ))
     });
@@ -446,6 +444,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema"], CLOSURE_AUDIT_SCHEMA_V3);
         assert_eq!(value["normalized_rom_sha256"], rom.sha256);
+        assert_eq!(
+            value["composed_bank_inputs"][0]["backing"]["kind"],
+            "rom_affine"
+        );
 
         let text = std::str::from_utf8(&bytes).unwrap();
         let fields = [

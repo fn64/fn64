@@ -52,7 +52,7 @@ cargo run -p fn64-discover --bin attribute_known_functions -- \
 ```
 
 The output directory must be a new private workspace outside Git. The producer
-publishes the schema-v3 workspace envelope with snapshot wire v5, a v3
+publishes the schema-v4 workspace envelope with snapshot wire v6, a v3
 address-space-aware candidate receipt, cold provider-set algorithm v3, and no
 answer key. Candidate receipt v3 adds the typed
 `SemanticCallableArgument` detector derived during composed authority closure;

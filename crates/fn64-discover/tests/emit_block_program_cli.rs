@@ -1,5 +1,5 @@
 use fn64_discover::block_pack::{
-    BlockPackV1, PackedBankV1, PackedBlockV1, BLOCK_PACK_SCHEMA_V1, BLOCK_PACK_SCHEMA_V2,
+    BlockPackV1, PackedBankV1, PackedBlockV1, BLOCK_PACK_SCHEMA_V1, BLOCK_PACK_SCHEMA_V3,
 };
 use fn64_discover::cfg::BlockTerminator;
 use sha2::{Digest, Sha256};
@@ -108,7 +108,7 @@ fn cli_rejects_wrong_rom_schema_entry_and_unknown_pack_fields() {
 
     let mut schema: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&fixture.pack).unwrap()).unwrap();
-    schema["schema_version"] = serde_json::json!(BLOCK_PACK_SCHEMA_V2 + 1);
+    schema["schema_version"] = serde_json::json!(BLOCK_PACK_SCHEMA_V3 + 1);
     let schema_path = fixture.output("wrong-schema.json");
     std::fs::write(&schema_path, serde_json::to_vec(&schema).unwrap()).unwrap();
     let schema_output = run_emit(
@@ -370,9 +370,11 @@ fn synthetic_pack() -> (Vec<u8>, BlockPackV1) {
         PackedBlockV1 {
             start_va,
             end_va: start_va + 4,
-            rom_space: fn64_discover::facts::RomAddressSpace::Physical,
-            rom_start,
-            rom_end: rom_start + 4,
+            backing: fn64_discover::facts::BankBackingSpanV1::RomAffine {
+                rom_space: fn64_discover::facts::RomAddressSpace::Physical,
+                rom_start,
+                rom_end: rom_start + 4,
+            },
             bytes_sha256: hex(Sha256::digest(
                 &rom.bytes[rom_start as usize..rom_start as usize + 4],
             )

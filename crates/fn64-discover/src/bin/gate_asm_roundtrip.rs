@@ -103,7 +103,12 @@ fn run() -> Result<(), String> {
     let mut digest = Sha256::new();
 
     for (index, owner) in owners.iter().enumerate() {
-        if owner.rom_space != RomAddressSpace::Physical {
+        let fn64_discover::facts::BankBackingSpanV1::RomAffine {
+            rom_space: RomAddressSpace::Physical,
+            rom_start,
+            rom_end,
+        } = &owner.backing
+        else {
             differences.push((
                 owner.entry.pc,
                 Difference::Tool {
@@ -112,10 +117,10 @@ fn run() -> Result<(), String> {
                 },
             ));
             continue;
-        }
+        };
         let original = rom
             .bytes
-            .get(owner.rom_start as usize..owner.rom_end as usize)
+            .get(*rom_start as usize..*rom_end as usize)
             .ok_or_else(|| {
                 format!(
                     "owner {:#010x} ROM interval is out of bounds",

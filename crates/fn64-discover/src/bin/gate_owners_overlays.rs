@@ -7,7 +7,7 @@
 
 use fn64_discover::banks::{self, BankNamePattern};
 use fn64_discover::delta_vote::DeltaVoteConfig;
-use fn64_discover::facts::{FunctionEntryEvidence, ProofState, RomAddressSpace};
+use fn64_discover::facts::{BankBackingSpanV1, FunctionEntryEvidence, ProofState, RomAddressSpace};
 use fn64_discover::overlay_regions::SearchConfig;
 use fn64_discover::owner_proof::OwnerAssessment;
 use fn64_discover::snapshot::{
@@ -77,6 +77,7 @@ struct ExtentGrade {
     admitted: usize,
     exact: usize,
     interior_direct_calls: usize,
+    unsupported_backings: Vec<String>,
     wrong: Vec<String>,
 }
 
@@ -196,6 +197,7 @@ fn run() -> Result<(), String> {
 
     let mut total_exact = 0usize;
     let mut total_wrong = 0usize;
+    let mut total_unsupported_backings = 0usize;
     let mut total_histogram = BTreeMap::<OwnerBlockerKind, (u64, u64, u64)>::new();
     for overlay in &completed {
         let bank_snapshot = overlay
@@ -234,6 +236,7 @@ fn run() -> Result<(), String> {
         let grade = grade_extents(overlay, &bank_key);
         total_exact += exact;
         total_wrong += grade.wrong.len();
+        total_unsupported_backings += grade.unsupported_backings.len();
         merge_histogram(&mut total_histogram, &bank_snapshot.blocker_histogram);
 
         println!(
@@ -256,12 +259,16 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("serializing blocker histogram: {error}"))?
         );
         println!(
-            "  extent_grade: admitted={} exact={} interior_direct_calls={} wrong={}",
+            "  extent_grade: admitted={} exact={} interior_direct_calls={} unsupported_backings={} wrong={}",
             grade.admitted,
             grade.exact,
             grade.interior_direct_calls,
+            grade.unsupported_backings.len(),
             grade.wrong.len()
         );
+        if !grade.unsupported_backings.is_empty() {
+            println!("  unsupported_backings={:?}", grade.unsupported_backings);
+        }
         if !grade.wrong.is_empty() {
             println!("  wrong_extents={:?}", grade.wrong);
         }
@@ -281,12 +288,18 @@ fn run() -> Result<(), String> {
         )
         .collect();
     println!(
-        "total: exact_owners={} wrong_extents={} owner_blockers={}",
+        "total: exact_owners={} unsupported_backings={} wrong_extents={} owner_blockers={}",
         total_exact,
+        total_unsupported_backings,
         total_wrong,
         serde_json::to_string(&total_histogram)
             .map_err(|error| format!("serializing total blocker histogram: {error}"))?
     );
+    if total_unsupported_backings != 0 {
+        return Err(format!(
+            "hard extent gate requires affine owner backing, got {total_unsupported_backings} unsupported backings"
+        ));
+    }
     if total_wrong != 0 {
         return Err(format!(
             "hard extent gate requires wrong_extents=0, got {total_wrong}"
@@ -479,9 +492,30 @@ fn grade_extents(overlay: &CompletedOverlay, key: &[KeyExtent]) -> ExtentGrade {
             continue;
         };
         grade.admitted += 1;
+        let (owner_rom_start, owner_rom_end) = match &owner.backing {
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start,
+                rom_end,
+            } => (*rom_start, *rom_end),
+            BankBackingSpanV1::RomAffine { rom_space, .. } => {
+                grade.unsupported_backings.push(format!(
+                    "{}:0x{:08x} unsupported_{rom_space:?}_affine_backing",
+                    owner.entry.bank, owner.entry.pc
+                ));
+                continue;
+            }
+            BankBackingSpanV1::Materialized { .. } => {
+                grade.unsupported_backings.push(format!(
+                    "{}:0x{:08x} unsupported_materialized_backing",
+                    owner.entry.bank, owner.entry.pc
+                ));
+                continue;
+            }
+        };
         if key.iter().any(|extent| {
-            extent.rom_start == owner.rom_start
-                && extent.rom_end == owner.rom_end
+            extent.rom_start == owner_rom_start
+                && extent.rom_end == owner_rom_end
                 && extent.va_start == owner.entry.pc
                 && extent.va_end == owner.va_end
         }) {
@@ -492,8 +526,8 @@ fn grade_extents(overlay: &CompletedOverlay, key: &[KeyExtent]) -> ExtentGrade {
             is_direct_call_subspan(
                 owner.entry.pc,
                 owner.va_end,
-                owner.rom_start,
-                owner.rom_end,
+                owner_rom_start,
+                owner_rom_end,
                 extent,
                 &direct_targets,
             )
@@ -503,7 +537,7 @@ fn grade_extents(overlay: &CompletedOverlay, key: &[KeyExtent]) -> ExtentGrade {
         }
         grade.wrong.push(format!(
             "{}:0x{:08x}..0x{:08x} / ROM 0x{:08x}..0x{:08x}",
-            owner.entry.bank, owner.entry.pc, owner.va_end, owner.rom_start, owner.rom_end
+            owner.entry.bank, owner.entry.pc, owner.va_end, owner_rom_start, owner_rom_end
         ));
     }
     grade

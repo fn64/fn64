@@ -5,7 +5,9 @@
 //! entries, or turn bounded/observed indirect targets into execution edges.
 //! Cross-bank jumps remain outside this view until composition retains a typed
 //! jump-authority record. Both directions are built from one canonical edge
-//! set so forward and reverse queries cannot disagree.
+//! set so forward and reverse queries cannot disagree. Call indexing consumes
+//! only bank-qualified owner and block geometry; byte backing is deliberately
+//! irrelevant to this derived graph.
 
 use crate::cfg::{BasicBlock, BlockTerminator};
 use crate::facts::{BankAddr, Fact};
@@ -738,7 +740,7 @@ fn index_call_authority(
 mod tests {
     use super::*;
     use crate::cfg::{Cfg, IndirectSite, WordClass};
-    use crate::facts::{FactDb, RomAddressSpace};
+    use crate::facts::{BankBackingSpanV1, FactDb, RomAddressSpace};
     use crate::owner_proof::OwnerFrontier;
     use crate::resolve::{IndirectResolution, IndirectResolutionKind};
 
@@ -770,9 +772,11 @@ mod tests {
         ExactFunctionOwner {
             entry: BankAddr::new(bank, entry),
             va_end: entry + 0x20,
-            rom_space: RomAddressSpace::Physical,
-            rom_start: 0,
-            rom_end: 0x20,
+            backing: BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0,
+                rom_end: 0x20,
+            },
             block_starts,
         }
     }
@@ -880,11 +884,18 @@ mod tests {
                 target: BankAddr::new("b", B + 8),
             },
         ];
-        let owners = [
+        let mut owners = [
             owner("a", A, vec![A, A + 8]),
             owner("b", B, vec![B]),
             owner("b", B + 8, vec![B + 8]),
         ];
+        // Caller/callee ownership is bank-qualified control-flow geometry;
+        // materialized byte provenance cannot change this graph.
+        owners[0].backing = BankBackingSpanV1::Materialized {
+            receipt_sha256: "11".repeat(32),
+            output_start: 0,
+            output_end: 0x20,
+        };
         let index = derive(&banks, facts.iter(), owners.iter()).unwrap();
         assert_eq!(
             index.call_sites_targeting(&BankAddr::new("b", B)).count(),

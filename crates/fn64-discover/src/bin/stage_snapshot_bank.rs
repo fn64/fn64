@@ -1,9 +1,9 @@
 //! Verify and stage one caller-materialized snapshot bank for an external tool.
 
 use fn64_discover::owner_proof::OwnerAssessment;
-use fn64_discover::snapshot::{ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V5};
+use fn64_discover::snapshot::{ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V6};
 use fn64_discover::tool_adapter::{BankInputIdentity, Sha256Digest};
-use fn64_discover::tool_claims::{bank_input_identity_v1, program_snapshot_sha256_v2};
+use fn64_discover::tool_claims::{bank_input_identity_v1, program_snapshot_sha256_v3};
 use fn64_discover::workspace_artifacts::{publish_new, validate_output_path, validate_workspace};
 use serde::Serialize;
 use std::ffi::OsString;
@@ -122,7 +122,7 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
             snapshot_path.display()
         )
     })?;
-    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V5 {
+    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V6 {
         return Err(format!(
             "unsupported program snapshot schema {}",
             snapshot.schema_version
@@ -137,6 +137,18 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         [] => return Err(format!("snapshot has no bank {bank:?}")),
         [bank_snapshot] => *bank_snapshot,
         _ => return Err(format!("snapshot has duplicate bank {bank:?}")),
+    };
+    let (rom_space, rom_start, rom_end) = match &bank_snapshot.input.backing {
+        fn64_discover::facts::BankBackingSpanV1::RomAffine {
+            rom_space,
+            rom_start,
+            rom_end,
+        } => (*rom_space, *rom_start, *rom_end),
+        fn64_discover::facts::BankBackingSpanV1::Materialized { .. } => {
+            return Err(format!(
+                "snapshot bank {bank:?} has evaluator-produced backing; affine-only external-tool staging cannot assign it ROM offsets"
+            ));
+        }
     };
     let input = bank_input_identity_v1(&snapshot, &bank)
         .map_err(|error| format!("deriving bank identity: {error}"))?;
@@ -190,7 +202,7 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         }
     }
 
-    let snapshot_sha = program_snapshot_sha256_v2(&snapshot)
+    let snapshot_sha = program_snapshot_sha256_v3(&snapshot)
         .map_err(|error| format!("deriving program-snapshot digest: {error}"))?;
     let manifest = EvidenceManifest {
         schema: "fn64.snapshot-bank-evidence",
@@ -201,9 +213,9 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         program_snapshot_sha256: snapshot_sha,
         input: &input,
         backing: Backing {
-            rom_space: bank_snapshot.input.rom_space,
-            rom_start: bank_snapshot.input.rom_start,
-            rom_end: bank_snapshot.input.rom_end,
+            rom_space,
+            rom_start,
+            rom_end,
         },
         artifact: Artifact {
             byte_length: bank_bytes.len() as u64,

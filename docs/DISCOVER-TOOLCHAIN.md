@@ -186,9 +186,9 @@ with its Proven/Candidate/Ambiguous assessment; pairing alone grants no tool
 authority. A Proven, byte-verified bank with no Proven owner is labeled
 `discovery_only` with role `candidate_only`: it remains eligible for stock
 BinaryLoader analysis, but the manifest supplies no function-entry authority.
-The current schema-v5 diagnostic snapshot projects a bank-scoped fact database
+The current schema-v6 diagnostic snapshot projects a bank-scoped fact database
 per artifact and is bounded by both per-artifact and aggregate wire caps. Its
-remaining large-ROM frontier is the two-pass `streaming_v5` composer.
+remaining large-ROM frontier is the two-pass `streaming_v6` composer.
 
 ## Fast mechanical feedback
 
@@ -357,7 +357,8 @@ Claims are sorted by canonical typed key and deduplicated before ingestion.
 Tool output order never affects a snapshot.
 
 The current v1 implementation serializes external results as a separate
-`ToolClaimSetV1`, bound to the exact schema-v2 `ProgramSnapshotV1` digest. Its
+`ToolClaimSetV1`, bound to the exact v3 domain-separated `ProgramSnapshotV1`
+digest. Its
 validator
 recomputes bank identity, source and claim digests, role/range constraints,
 canonical ordering, and provider observations. It never inserts these claims

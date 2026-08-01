@@ -1,7 +1,7 @@
 use fn64_discover::grade_candidates::ScopedCandidateIdentitiesV3;
 use fn64_discover::snapshot::ProgramSnapshotV1;
 use fn64_discover::tool_adapter::Sha256Digest;
-use fn64_discover::tool_claims::program_snapshot_sha256_v2;
+use fn64_discover::tool_claims::program_snapshot_sha256_v3;
 use std::collections::BTreeSet;
 use std::fs;
 #[cfg(unix)]
@@ -170,7 +170,7 @@ fn zero_proven_banks_publish_only_an_honest_path_free_open_manifest() {
         .unwrap()
         .iter()
         .all(|outcome| outcome.get("decoded_file_limit_hits").is_some()));
-    assert_eq!(manifest["snapshot_wire"]["schema_version"], 5);
+    assert_eq!(manifest["snapshot_wire"]["schema_version"], 6);
     assert_eq!(manifest["snapshot_wire"]["authority"], "diagnostic_only");
     assert_eq!(
         manifest["snapshot_wire"]["duplicates_fact_db_per_bank"],
@@ -178,7 +178,7 @@ fn zero_proven_banks_publish_only_an_honest_path_free_open_manifest() {
     );
     assert_eq!(
         manifest["snapshot_wire"]["remaining_large_rom_frontier"],
-        "streaming_v5"
+        "streaming_v6"
     );
     assert_eq!(manifest["aggregate_snapshot_artifact_bytes"], 0);
     assert_eq!(manifest["rom_recompilation_complete"], false);
@@ -220,7 +220,7 @@ fn training_mode_seals_key_free_candidate_receipt_even_when_no_bank_is_proven() 
     );
     let manifest_bytes = fs::read(fixture.workspace.join("snapshot-workspace.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
-    assert_eq!(manifest["schema_version"], 3);
+    assert_eq!(manifest["schema_version"], 4);
     assert_eq!(manifest["state"], "open");
     assert_eq!(
         manifest["intended_use"],
@@ -323,7 +323,7 @@ fn recovered_banks_use_fixed_index_names_and_manifest_bound_digests() {
         );
         assert_eq!(
             bank["program_snapshot_sha256"],
-            program_snapshot_sha256_v2(&snapshot_value)
+            program_snapshot_sha256_v3(&snapshot_value)
                 .unwrap()
                 .to_hex()
         );
@@ -337,6 +337,8 @@ fn recovered_banks_use_fixed_index_names_and_manifest_bound_digests() {
         }
         prior_bank_name = Some(bank_name);
         assert!(unique_bank_names.insert(bank_name));
+        assert_eq!(bank["backing"]["kind"], "rom_affine");
+        assert_eq!(bank["backing"]["rom_space"], "Virtual");
         assert_eq!(
             bank["backing_evidence_fact_indices"]
                 .as_array()
@@ -439,7 +441,7 @@ fn selected_bank_mode_is_explicit_single_bank_without_cross_bank_authority() {
         &fs::read(selected.workspace.join("snapshot-workspace.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["schema_version"], 4);
     assert_eq!(manifest["state"], "composed");
     assert_eq!(manifest["rom_recompilation_complete"], false);
     assert_eq!(

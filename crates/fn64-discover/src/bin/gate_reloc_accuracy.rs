@@ -264,9 +264,20 @@ fn recover_references(
                 for pc in (block.start_va..block.end_va).step_by(4) {
                     sites.insert(pc);
                 }
+                let fn64_discover::facts::BankBackingSpanV1::RomAffine {
+                    rom_space: fn64_discover::facts::RomAddressSpace::Physical,
+                    rom_start,
+                    rom_end,
+                } = &block.backing
+                else {
+                    return Err(format!(
+                        "relocation-accuracy gate requires physical affine backing for proven block {bank_name}:0x{:08x}",
+                        block.start_va
+                    ));
+                };
                 let bytes = rom
                     .bytes
-                    .get(block.rom_start as usize..block.rom_end as usize)
+                    .get(*rom_start as usize..*rom_end as usize)
                     .ok_or_else(|| {
                         format!(
                             "proven block [0x{:08x},0x{:08x}) has backing outside ROM",

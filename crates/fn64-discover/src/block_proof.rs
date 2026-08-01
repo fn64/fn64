@@ -3,10 +3,14 @@
 //! This does not weaken [`crate::owner_proof::ExactFunctionOwner`]. It
 //! exposes the smaller fact needed by `block_aot`: bytes reached from an
 //! authoritative entry through the closed CFG, accepted by the shared
-//! decoder, and bound to exactly one proven ROM mapping.
+//! decoder, and bound to exactly one proven bank-image span. That span stays
+//! typed: evaluated output offsets are never represented as ROM coordinates.
 
 use crate::cfg::{BasicBlock, BlockTerminator, Cfg, WordClass};
-use crate::facts::{executable_range_subject, BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
+use crate::facts::{
+    executable_range_subject, BankAddr, BankBackingSpanResolutionV1, BankBackingSpanV1, Fact,
+    FactDb, ProofState,
+};
 use crate::owner_proof::{OwnerAssessment, OwnerBlocker, OwnerProofReport};
 use crate::partition::{partition, Partition};
 use crate::resolve::ClosureResult;
@@ -25,8 +29,9 @@ pub enum BlockProofBlocker {
     InvalidInstruction { pc: u32, word: u32 },
     MissingDelaySlot { control_pc: u32 },
     RanOffEnd,
-    MissingRomBacking,
-    MultipleRomBackings,
+    MissingBankBacking,
+    AmbiguousBankBacking,
+    InvalidBankBackingGeometry,
 }
 
 impl BlockProofBlocker {
@@ -43,8 +48,9 @@ impl BlockProofBlocker {
             Self::InvalidInstruction { .. } => "invalid_instruction",
             Self::MissingDelaySlot { .. } => "missing_delay_slot",
             Self::RanOffEnd => "ran_off_end",
-            Self::MissingRomBacking => "missing_rom_backing",
-            Self::MultipleRomBackings => "multiple_rom_backings",
+            Self::MissingBankBacking => "missing_bank_backing",
+            Self::AmbiguousBankBacking => "ambiguous_bank_backing",
+            Self::InvalidBankBackingGeometry => "invalid_bank_backing_geometry",
         }
     }
 }
@@ -117,9 +123,7 @@ pub struct ReachableCodeBlock {
     pub start_va: u32,
     pub end_va: u32,
     pub authoritative_roots: AuthoritativeReachabilityRoots,
-    pub rom_space: RomAddressSpace,
-    pub rom_start: u32,
-    pub rom_end: u32,
+    pub backing: BankBackingSpanV1,
     pub terminator: BlockTerminator,
 }
 
@@ -237,13 +241,6 @@ impl AuthorityReachabilityProjection {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Backing {
-    space: RomAddressSpace,
-    start: u32,
-    end: u32,
-}
-
 pub fn prove_reachable_blocks(
     cfg: &Cfg,
     partition: &Partition,
@@ -349,18 +346,22 @@ fn prove_reachable_blocks_inner(
             }
         }
         validate_block(block, cfg, &mut blockers);
-        let backings = block_backings(facts, &cfg.bank, block.start_va, block.end_va);
-        let backing = match backings.as_slice() {
-            [] => {
-                blockers.insert(BlockProofBlocker::MissingRomBacking);
-                None
-            }
-            [backing] => Some(*backing),
-            _ => {
-                blockers.insert(BlockProofBlocker::MultipleRomBackings);
-                None
-            }
-        };
+        let backing =
+            match facts.resolve_proven_bank_backing_span(&cfg.bank, block.start_va, block.end_va) {
+                BankBackingSpanResolutionV1::Missing => {
+                    blockers.insert(BlockProofBlocker::MissingBankBacking);
+                    None
+                }
+                BankBackingSpanResolutionV1::Unique(backing) => Some(backing),
+                BankBackingSpanResolutionV1::Ambiguous => {
+                    blockers.insert(BlockProofBlocker::AmbiguousBankBacking);
+                    None
+                }
+                BankBackingSpanResolutionV1::InvalidGeometry => {
+                    blockers.insert(BlockProofBlocker::InvalidBankBackingGeometry);
+                    None
+                }
+            };
         if blockers.is_empty() {
             let backing = backing.expect("one backing when no blocker remains");
             let authoritative_roots = authoritative_roots
@@ -373,9 +374,7 @@ fn prove_reachable_blocks_inner(
                     start_va: block.start_va,
                     end_va: block.end_va,
                     authoritative_roots,
-                    rom_space: backing.space,
-                    rom_start: backing.start,
-                    rom_end: backing.end,
+                    backing,
                     terminator: block.terminator.clone(),
                 },
             });
@@ -511,55 +510,14 @@ fn validate_block(block: &BasicBlock, cfg: &Cfg, blockers: &mut BTreeSet<BlockPr
     }
 }
 
-fn block_backings(facts: &FactDb, bank: &str, start: u32, end: u32) -> Vec<Backing> {
-    let mut out = BTreeSet::new();
-    for fact in facts.proven_rom_mappings() {
-        let Fact::RomMapping {
-            bank: mapped_bank,
-            rom_space,
-            rom_start,
-            va_start,
-            va_end,
-            ..
-        } = fact
-        else {
-            continue;
-        };
-        if mapped_bank == bank
-            && start >= *va_start
-            && end <= *va_end
-            && va_end.checked_sub(*va_start) == fact_rom_len(fact)
-        {
-            let offset = start - *va_start;
-            let Some(backing_start) = rom_start.checked_add(offset) else {
-                continue;
-            };
-            let Some(backing_end) = backing_start.checked_add(end - start) else {
-                continue;
-            };
-            out.insert(Backing {
-                space: *rom_space,
-                start: backing_start,
-                end: backing_end,
-            });
-        }
-    }
-    out.into_iter().collect()
-}
-
-fn fact_rom_len(fact: &Fact) -> Option<u32> {
-    let Fact::RomMapping {
-        rom_start, rom_end, ..
-    } = fact
-    else {
-        return None;
-    };
-    rom_end.checked_sub(*rom_start)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::facts::{
+        evaluated_image_receipt_sha256_v1, EvaluatedImageReceiptV1, MaterializationEvaluatorV1,
+        MaterializedByteRangeV1, MaterializedImageSourceV1, MaterializedImageStreamV1,
+        MaterializedImageSuffixV1, RomAddressSpace,
+    };
     use crate::owner_proof::OwnerFrontier;
     use crate::partition::{AmbiguousBlock, Owner, Partition};
 
@@ -572,9 +530,11 @@ mod tests {
                 start_va,
                 end_va,
                 authoritative_roots: AuthoritativeReachabilityRoots::new([BASE]).unwrap(),
-                rom_space: RomAddressSpace::Physical,
-                rom_start: 0x1000 + (start_va - BASE),
-                rom_end: 0x1000 + (end_va - BASE),
+                backing: BankBackingSpanV1::RomAffine {
+                    rom_space: RomAddressSpace::Physical,
+                    rom_start: 0x1000 + (start_va - BASE),
+                    rom_end: 0x1000 + (end_va - BASE),
+                },
                 terminator: BlockTerminator::Return,
             },
         }
@@ -639,6 +599,58 @@ mod tests {
             )
             .unwrap();
         facts
+    }
+
+    fn evaluated_receipt(output_len: u32) -> EvaluatedImageReceiptV1 {
+        EvaluatedImageReceiptV1 {
+            evaluator: MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 1 },
+            source: MaterializedImageSourceV1 {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0x2000,
+                rom_end: 0x2040,
+                cursor: 4,
+            },
+            source_sha256: "11".repeat(32),
+            output_len,
+            output_sha256: "22".repeat(32),
+            streams: vec![MaterializedImageStreamV1 {
+                source_range: MaterializedByteRangeV1 { start: 4, end: 32 },
+                encoded_range: MaterializedByteRangeV1 { start: 10, end: 32 },
+                output_range: MaterializedByteRangeV1 {
+                    start: 0,
+                    end: output_len,
+                },
+                declared_output_len: output_len,
+                source_sha256: "33".repeat(32),
+                output_sha256: "22".repeat(32),
+            }],
+            trailing_suffix: MaterializedImageSuffixV1 {
+                offset: 32,
+                len: 32,
+                sha256: "44".repeat(32),
+            },
+        }
+    }
+
+    fn materialized_facts(output_len: u32, va_len: u32) -> (FactDb, String) {
+        let mut facts = FactDb::new();
+        let receipt = evaluated_receipt(output_len);
+        let digest = evaluated_image_receipt_sha256_v1(&receipt);
+        let image = facts.insert(Fact::EvaluatedImage {
+            bank: "bank".into(),
+            va_start: BASE,
+            va_end: BASE + va_len,
+            receipt,
+        });
+        facts
+            .conclude(
+                "bank:bank",
+                ProofState::Proven,
+                vec![image],
+                "test_materialized_image",
+            )
+            .unwrap();
+        (facts, digest)
     }
 
     fn cfg_from_blocks(blocks: Vec<BasicBlock>, roots: Vec<u32>) -> Cfg {
@@ -783,7 +795,7 @@ mod tests {
         assert!(matches!(
             &no_backing.assessments[0],
             BlockAssessment::Candidate { blockers, .. }
-                if blockers.contains(&BlockProofBlocker::MissingRomBacking)
+                if blockers.contains(&BlockProofBlocker::MissingBankBacking)
         ));
 
         let mut invalid_word = one_block_cfg();
@@ -798,6 +810,82 @@ mod tests {
                     pc: BASE + 4,
                     class: Some(WordClass::CandidateCode),
                 })
+        ));
+    }
+
+    #[test]
+    fn materialized_block_retains_output_offsets_without_rom_coordinates() {
+        let (facts, receipt_sha256) = materialized_facts(8, 8);
+        let report = prove_reachable_blocks(
+            &one_block_cfg(),
+            &owner_partition(BASE, BASE + 8, BASE),
+            &owner_report(&[(BASE, true)]),
+            &facts,
+        );
+
+        let BlockAssessment::Proven { block } = &report.assessments[0] else {
+            panic!("materialized block was not admitted");
+        };
+        assert_eq!(
+            block.backing,
+            BankBackingSpanV1::Materialized {
+                receipt_sha256,
+                output_start: 0,
+                output_end: 8,
+            }
+        );
+        let wire = serde_json::to_value(block).unwrap();
+        assert!(wire.get("rom_start").is_none());
+        assert!(wire.get("rom_end").is_none());
+    }
+
+    #[test]
+    fn competing_proven_bank_images_block_proof_before_interval_selection() {
+        let (mut facts, _) = materialized_facts(8, 8);
+        let materialized = facts.conclusion("bank:bank").unwrap().justified_by[0];
+        let affine = facts.insert(Fact::RomMapping {
+            bank: "bank".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x1000,
+            rom_end: 0x1008,
+            va_start: BASE,
+            va_end: BASE + 8,
+        });
+        facts
+            .conclude(
+                "bank:bank",
+                ProofState::Proven,
+                vec![materialized, affine],
+                "test_competing_image",
+            )
+            .unwrap();
+
+        let report = prove_reachable_blocks(
+            &one_block_cfg(),
+            &owner_partition(BASE, BASE + 8, BASE),
+            &owner_report(&[(BASE, true)]),
+            &facts,
+        );
+        assert!(matches!(
+            &report.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::AmbiguousBankBacking)
+        ));
+    }
+
+    #[test]
+    fn invalid_materialized_geometry_is_a_distinct_blocker() {
+        let (facts, _) = materialized_facts(4, 8);
+        let report = prove_reachable_blocks(
+            &one_block_cfg(),
+            &owner_partition(BASE, BASE + 8, BASE),
+            &owner_report(&[(BASE, true)]),
+            &facts,
+        );
+        assert!(matches!(
+            &report.assessments[0],
+            BlockAssessment::Candidate { blockers, .. }
+                if blockers.contains(&BlockProofBlocker::InvalidBankBackingGeometry)
         ));
     }
 
