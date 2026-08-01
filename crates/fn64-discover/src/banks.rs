@@ -609,6 +609,110 @@ pub struct LoadImageTableInput {
 /// independently parsed from the descriptor record. A delta vote by itself
 /// remains candidate evidence; the agreement of two separately derived
 /// fields under a unique table admission is the proof rule.
+/// Two admitted tables assigning one ROM source to different destinations.
+struct DestinationDisagreement {
+    source_start: u32,
+    source_end: u32,
+    first_va: u32,
+    second_va: u32,
+}
+
+/// The first source interval that two admitted tables place at different VAs,
+/// scanned in deterministic order. `None` means every table agrees wherever
+/// they overlap, so their records describe one geometry.
+///
+/// Identical sources must declare identical destinations. Sources that
+/// *partially* overlap are a contradiction outright: one ROM byte cannot
+/// belong to two differently-based images, and no fragmentation or stride
+/// alias produces that shape -- aliases repeat whole records.
+fn contradicting_destination(
+    admitted: &[&crate::overlay_regions::TableAdmission],
+) -> Option<DestinationDisagreement> {
+    let mut declared: std::collections::BTreeMap<(u32, u32), u32> =
+        std::collections::BTreeMap::new();
+    for admission in admitted {
+        for record in &admission.table.records {
+            match declared.entry((record.rom_start, record.rom_end)) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(record.vram_dest);
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if *slot.get() != record.vram_dest {
+                        return Some(DestinationDisagreement {
+                            source_start: record.rom_start,
+                            source_end: record.rom_end,
+                            first_va: *slot.get(),
+                            second_va: record.vram_dest,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut intervals: Vec<_> = declared
+        .iter()
+        .map(|((start, end), va)| (*start, *end, *va))
+        .collect();
+    intervals.sort_unstable();
+    for pair in intervals.windows(2) {
+        let (start, end, va) = pair[0];
+        let (next_start, next_end, next_va) = pair[1];
+        if next_start < end {
+            return Some(DestinationDisagreement {
+                source_start: start.max(next_start),
+                source_end: end.min(next_end),
+                first_va: va,
+                second_va: next_va,
+            });
+        }
+    }
+    None
+}
+
+/// One deduplicated overlay record plus the table it was recovered from.
+struct MergedOverlayRecord<'a> {
+    record: crate::overlay_regions::CandidateRecord,
+    delta_outcome: Option<(u32, u32)>,
+    table: &'a crate::overlay_regions::CandidateTable,
+}
+
+/// Union the admitted tables' records, one entry per distinct source interval,
+/// ordered by source so bank indices are deterministic.
+///
+/// A record resolved by one fragment and left open by another is kept
+/// resolved: the outcomes are not in tension once destinations agree, and
+/// discarding the resolved one would lose proof that was already earned.
+fn merge_admitted_overlay_records<'a>(
+    admitted: &[&'a crate::overlay_regions::TableAdmission],
+) -> Vec<MergedOverlayRecord<'a>> {
+    let mut by_source: std::collections::BTreeMap<(u32, u32), MergedOverlayRecord<'a>> = std::collections::BTreeMap::new();
+    for admission in admitted {
+        for (record, delta_outcome) in admission.table.records.iter().zip(&admission.region_deltas) {
+            let key = (record.rom_start, record.rom_end);
+            match by_source.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(MergedOverlayRecord {
+                        record: *record,
+                        delta_outcome: *delta_outcome,
+                        table: &admission.table,
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    if slot.get().delta_outcome.is_none() && delta_outcome.is_some() {
+                        slot.insert(MergedOverlayRecord {
+                            record: *record,
+                            delta_outcome: *delta_outcome,
+                            table: &admission.table,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    by_source.into_values().collect()
+}
+
 pub fn scan_recovered_overlay_regions(
     rom: &NormalizedRom,
     recovery: &crate::overlay_regions::OverlayRecovery,
@@ -641,47 +745,73 @@ pub fn scan_recovered_overlay_regions(
         ),
     });
 
-    let [admission] = admitted.as_slice() else {
-        let (state, rule) = if admitted.is_empty() {
-            (
-                ProofState::Open,
-                "recovered_overlay_table_has_no_unique_admission",
-            )
-        } else {
-            (
-                ProofState::Conflict,
-                "recovered_overlay_table_has_multiple_admissions",
-            )
-        };
-        db.conclude(table_subject, state, vec![selection], rule)
-            .expect("first conclusion for recovered overlay table");
+    if admitted.is_empty() {
+        db.conclude(
+            table_subject,
+            ProofState::Open,
+            vec![selection],
+            "recovered_overlay_table_has_no_unique_admission",
+        )
+        .expect("first conclusion for recovered overlay table");
         return Vec::new();
-    };
+    }
 
-    assert_eq!(
-        admission.table.records.len(),
-        admission.region_deltas.len(),
-        "overlay recovery must report one delta outcome per record"
-    );
-    assert_eq!(
-        admission.mapped_regions as usize,
-        admission
-            .region_deltas
-            .iter()
-            .filter(|delta| delta.is_some())
-            .count(),
-        "overlay recovery mapped_regions must match its delta outcomes"
-    );
+    // Several admitted tables are not automatically a contradiction. A
+    // descriptor array split across ROM, or read at a stride alias (a 0x40
+    // stride sees every other 0x20 record), yields fragments of ONE geometry.
+    // The contradiction that matters is a source interval assigned two
+    // different destinations, because only then do the tables disagree about
+    // where bytes land. Measured across the corpus: Paper Mario's 18 admitted
+    // tables cover 232 distinct sources with zero contradicting destinations,
+    // as do Mario Party's 8 over 94 -- they fragment, they do not disagree.
+    if let Some(conflict) = contradicting_destination(&admitted) {
+        let note = db.insert(Fact::Evidence {
+            subject: BankAddr::new(table_name, conflict.source_start),
+            note: format!(
+                "recovered overlay tables disagree: ROM [0x{:x},0x{:x}) is declared at both VA 0x{:08x} and 0x{:08x}",
+                conflict.source_start, conflict.source_end, conflict.first_va, conflict.second_va,
+            ),
+        });
+        db.conclude(
+            table_subject,
+            ProofState::Conflict,
+            vec![selection, note],
+            "recovered_overlay_tables_disagree_on_destination",
+        )
+        .expect("first conclusion for recovered overlay table");
+        return Vec::new();
+    }
 
-    let table = &admission.table;
+    for admission in &admitted {
+        assert_eq!(
+            admission.table.records.len(),
+            admission.region_deltas.len(),
+            "overlay recovery must report one delta outcome per record"
+        );
+        assert_eq!(
+            admission.mapped_regions as usize,
+            admission
+                .region_deltas
+                .iter()
+                .filter(|delta| delta.is_some())
+                .count(),
+            "overlay recovery mapped_regions must match its delta outcomes"
+        );
+    }
+
+    // One record per distinct source interval, in deterministic source order.
+    // Fragments and stride aliases repeat records; the destination-agreement
+    // check above already proved every repeat declares the same VA, so the
+    // first occurrence is the whole claim. Keeping the resolved delta means a
+    // fragment that mapped a record is not lost to one that left it open.
+    let merged = merge_admitted_overlay_records(&admitted);
+
     let mut accepted_banks = Vec::new();
     let mut table_evidence = vec![selection];
-    for (index, (record, delta_outcome)) in table
-        .records
-        .iter()
-        .zip(&admission.region_deltas)
-        .enumerate()
+    for (index, MergedOverlayRecord { record, delta_outcome, table, .. }) in
+        merged.iter().enumerate()
     {
+        let (record, delta_outcome) = (record, delta_outcome);
         let index = index as u32;
         let bank = bank_name.name(index);
         let record_subject = load_image_table_record_subject(table_name, index);
@@ -2555,11 +2685,36 @@ mod tests {
     }
 
     #[test]
-    fn multiple_recovered_table_admissions_map_nothing() {
+    fn multiple_admissions_over_disjoint_sources_merge_into_one_geometry() {
+        // Several admitted tables are fragments or stride aliases of one
+        // descriptor array unless they actually disagree. These two claim
+        // disjoint ROM sources at disjoint destinations, so both map.
         let rom = make_test_rom(0x8000_0400, 0x5000);
         let recovery = recovery_with(vec![
             recovered_table(0x1800, 0x2000, 0x8010_0000, 0x8010_0000),
             recovered_table(0x1900, 0x3000, 0x8020_0000, 0x8020_0000),
+        ]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert_eq!(banks.len(), 2, "both non-contradicting records must map");
+        assert_eq!(db.proven_rom_mappings().len(), 2);
+    }
+
+    #[test]
+    fn admissions_disagreeing_on_a_destination_still_map_nothing() {
+        // The contradiction that matters: one source interval declared at two
+        // different VAs. Nothing may be admitted from either table.
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![
+            recovered_table(0x1800, 0x2000, 0x8010_0000, 0x8010_0000),
+            recovered_table(0x1900, 0x2000, 0x8020_0000, 0x8020_0000),
         ]);
         let mut db = FactDb::new();
         let banks = scan_recovered_overlay_regions(
@@ -2578,6 +2733,34 @@ mod tests {
             ProofState::Conflict
         );
         assert!(db.proven_rom_mappings().is_empty());
+    }
+
+    #[test]
+    fn partially_overlapping_sources_are_a_conflict_not_a_merge() {
+        // One ROM byte cannot belong to two differently-based images, and no
+        // stride alias produces a partial overlap -- aliases repeat whole
+        // records.
+        let rom = make_test_rom(0x8000_0400, 0x5000);
+        let recovery = recovery_with(vec![
+            recovered_table(0x1800, 0x2000, 0x8010_0000, 0x8010_0000),
+            recovered_table(0x1900, 0x2800, 0x8020_0000, 0x8020_0000),
+        ]);
+        let mut db = FactDb::new();
+        let banks = scan_recovered_overlay_regions(
+            &rom,
+            &recovery,
+            "recovered_overlays",
+            &BankNamePattern::new("overlay_", 0, ""),
+            &mut db,
+        );
+
+        assert!(banks.is_empty());
+        assert_eq!(
+            db.conclusion("load-image-table:recovered_overlays")
+                .unwrap()
+                .state,
+            ProofState::Conflict
+        );
     }
 
     #[test]
