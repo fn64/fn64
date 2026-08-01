@@ -9,6 +9,7 @@
 //! Design provenance for every non-obvious semantic choice below is cited
 //! inline; see `docs/DESIGN.md` section 6 for the full provenance table.
 
+pub mod boot_globals;
 pub mod device;
 pub mod dpc_schedule;
 pub mod executor;
@@ -31,6 +32,10 @@ pub mod unsupported;
 pub mod vi;
 pub mod voice;
 
+pub use boot_globals::{
+    IplBootGlobals, IplResetType, CART_ROM_KSEG1_BASE, OS_RESET_TYPE_ADDR, OS_ROM_BASE_ADDR,
+    OS_TV_TYPE_ADDR,
+};
 pub use device::{
     AiDmaRequest, Cycles, DeviceEvidenceSnapshot, DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
     DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
