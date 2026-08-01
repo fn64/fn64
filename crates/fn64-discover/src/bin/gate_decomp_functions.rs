@@ -98,6 +98,10 @@
 //!   FN64_DISCOVER_PRINT_ROOTS set to print every callable root added by
 //!                             composed snapshot authority; the default
 //!                             reports only the bank/root totals
+//!   FN64_DISCOVER_PRINT_GRADES
+//!                             emit one tab-separated answer-key row with its
+//!                             exact grade for corpus-only adjacency studies;
+//!                             never consumed by discovery
 
 use fn64_discover::banks::{
     self, materialize_rom_range, LoadImageTableInput, StaticRequestDmaInput,
@@ -1167,6 +1171,15 @@ fn main() {
             .map(|(name, _)| name.as_str())
             .collect();
         println!("open functions ({}): {}", open.len(), open.join(", "));
+    }
+    if std::env::var("FN64_DISCOVER_PRINT_GRADES").is_ok() {
+        for (answer_function, (graded_name, grade)) in answer.iter().zip(&report.per_function) {
+            assert_eq!(answer_function.name, *graded_name);
+            println!(
+                "adjacency-grade\t0x{:08x}\t{}\t{grade:?}",
+                answer_function.va_start, graded_name
+            );
+        }
     }
     if report.wrong != 0 {
         for (function, grade) in &report.per_function {

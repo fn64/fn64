@@ -111,6 +111,30 @@ pub enum DestinationReason {
 }
 
 impl DestinationReason {
+    pub const ALL: [Self; 8] = [
+        Self::InExactOwner,
+        Self::InProvenBlock,
+        Self::OpenIndirectSite,
+        Self::BoundedIndirectSite,
+        Self::MappedNotProvenCode,
+        Self::ProvenCodeNoOwner,
+        Self::IntoProvenData,
+        Self::OutsideAllMappings,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InExactOwner => "in_exact_owner",
+            Self::InProvenBlock => "in_proven_block",
+            Self::OpenIndirectSite => "open_indirect_site",
+            Self::BoundedIndirectSite => "bounded_indirect_site",
+            Self::MappedNotProvenCode => "mapped_not_proven_code",
+            Self::ProvenCodeNoOwner => "proven_code_no_owner",
+            Self::IntoProvenData => "into_proven_data",
+            Self::OutsideAllMappings => "outside_all_mappings",
+        }
+    }
+
     fn class(self) -> DestinationClass {
         match self {
             DestinationReason::InExactOwner => DestinationClass::ExactAot,
@@ -131,6 +155,7 @@ impl DestinationReason {
 /// word slot uniquely counted) and are zero for indirect SITES, which have no
 /// single destination address.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassTally {
     pub destinations: u64,
     pub bytes: u64,
@@ -140,6 +165,7 @@ pub struct ClassTally {
 /// and the two headline numbers (`unsupported` — the release blocker — and
 /// `dynamic_mips` — fallback-covered, reported honestly).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClosureScoreboard {
     pub total_destinations: u64,
     pub per_class: BTreeMap<String, ClassTally>,
@@ -152,6 +178,13 @@ impl ClosureScoreboard {
     pub fn tally(&self, class: DestinationClass) -> ClassTally {
         self.per_class
             .get(class.label())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn reason_count(&self, reason: DestinationReason) -> u64 {
+        self.per_reason
+            .get(reason.label())
             .copied()
             .unwrap_or_default()
     }
@@ -661,7 +694,10 @@ pub fn scoreboard(snapshots: &[ProgramSnapshotV1]) -> ClosureScoreboard {
     };
 
     // Per-class tallies; indirect sites are appended after concrete VAs.
-    let mut per_reason: BTreeMap<DestinationReason, u64> = BTreeMap::new();
+    let mut per_reason: BTreeMap<DestinationReason, u64> = DestinationReason::ALL
+        .into_iter()
+        .map(|reason| (reason, 0))
+        .collect();
 
     for snapshot in snapshots {
         for bank in &snapshot.banks {
@@ -697,7 +733,10 @@ pub fn scoreboard(snapshots: &[ProgramSnapshotV1]) -> ClosureScoreboard {
 
     // Build the class tallies. Concrete destinations contribute 4 bytes each
     // (one aligned instruction word slot); indirect sites contribute no bytes.
-    let mut per_class: BTreeMap<DestinationClass, ClassTally> = BTreeMap::new();
+    let mut per_class: BTreeMap<DestinationClass, ClassTally> = DestinationClass::ALL
+        .into_iter()
+        .map(|class| (class, ClassTally::default()))
+        .collect();
     for (va, reason) in &concrete {
         let _ = va;
         let entry = per_class.entry(reason.class()).or_default();
@@ -734,7 +773,7 @@ pub fn scoreboard(snapshots: &[ProgramSnapshotV1]) -> ClosureScoreboard {
             .collect(),
         per_reason: per_reason
             .into_iter()
-            .map(|(reason, count)| (reason_label(reason).to_string(), count))
+            .map(|(reason, count)| (reason.label().to_string(), count))
             .collect(),
         unsupported,
         dynamic_mips,
@@ -987,19 +1026,6 @@ pub fn unsupported_destination_audit_v1(
         .collect()
 }
 
-fn reason_label(reason: DestinationReason) -> &'static str {
-    match reason {
-        DestinationReason::InExactOwner => "in_exact_owner",
-        DestinationReason::InProvenBlock => "in_proven_block",
-        DestinationReason::OpenIndirectSite => "open_indirect_site",
-        DestinationReason::BoundedIndirectSite => "bounded_indirect_site",
-        DestinationReason::MappedNotProvenCode => "mapped_not_proven_code",
-        DestinationReason::ProvenCodeNoOwner => "proven_code_no_owner",
-        DestinationReason::IntoProvenData => "into_proven_data",
-        DestinationReason::OutsideAllMappings => "outside_all_mappings",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,6 +1158,14 @@ mod tests {
             "the jal destination and return continuation are exact-owner successors: {board:?}"
         );
         assert_eq!(board.unsupported, 0);
+        assert_eq!(board.per_class.len(), DestinationClass::ALL.len());
+        assert!(DestinationClass::ALL
+            .into_iter()
+            .all(|class| board.per_class.contains_key(class.label())));
+        assert_eq!(board.per_reason.len(), DestinationReason::ALL.len());
+        assert!(DestinationReason::ALL
+            .into_iter()
+            .all(|reason| board.per_reason.contains_key(reason.label())));
     }
 
     #[test]

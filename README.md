@@ -110,6 +110,27 @@ OoT's; WM2000 and No Mercy donate to each other). See
 per-game inputs. None of this weakens the `wrong == 0` grading bar, but the
 recall numbers are not cold-start discovery on an unstudied ROM.
 
+For the ROM-only breadth baseline, declare private ROM paths and expected
+normalized digests in an external `fn64.cold-coverage-panel-input.v1` manifest,
+then run the bounded panel tool:
+
+```sh
+python3 scripts/cold-coverage-panel.py \
+  --manifest /path/to/private-panel.json \
+  --binary "$PWD/target/release/fn64-discover" \
+  --output /path/to/private-results.jsonl
+```
+
+The manifest must list canonical regular files explicitly; directory contents
+are never inferred. Each ROM runs in an environment-cleared process group with
+a timeout, a sampled aggregate-RSS watchdog, a system-free-memory floor, and
+kernel-limited output files. Linux additionally receives a per-process address-
+space backstop; macOS reports that no reliable hard memory limit is available.
+The default ten repetitions bind the exact executable digest and emit one
+path-free, digest-verified receipt per image plus content-free wall-time and
+peak-RSS distributions only after the complete panel succeeds. See
+`docs/DISCOVER-PLAN.md` for the measured nine-ROM baseline.
+
 `wrong == 0` holds across every game. The open remainder is an honest,
 characterized gap — genuinely unreferenced library/dead code (Kirby 64),
 struct-callback dispatch whose producer and loaded-image authority are not yet

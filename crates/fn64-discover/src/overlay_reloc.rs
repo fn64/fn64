@@ -35,9 +35,29 @@
 //! remaining open boot functions. Typed references may still add recall
 //! on games whose overlays are not also covered by proven-bank scans.
 
+use crate::facts::{
+    OverlayRelocationKind, OverlayRelocationSection, OverlayRelocationValueEvidence,
+};
+
+/// One relocation with its exact file location retained for canonical
+/// provenance. The legacy grouped vectors below remain convenient views for
+/// the answer-key gate, while this row is what the ROM-only fact pipeline
+/// consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocatedOverlayRelocation {
+    pub file_offset: u32,
+    pub section: OverlayRelocationSection,
+    pub kind: OverlayRelocationKind,
+    pub value_evidence: OverlayRelocationValueEvidence,
+    pub unrelocated_value: u32,
+}
+
 /// References harvested from one overlay's relocation section.
 #[derive(Debug, Default, Clone)]
 pub struct OverlayRelocRefs {
+    /// Complete located evidence retained for the canonical FactDb. A row is
+    /// relocation typing, not automatic callable-entry authority.
+    pub relocations: Vec<LocatedOverlayRelocation>,
     /// Absolute targets of `jal` words typed `R_MIPS_26` in `.text` —
     /// machine-checked callable entries.
     pub jal_targets: Vec<u32>,
@@ -113,6 +133,12 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
             3 => (text + data, rodata),
             _ => return None,
         };
+        let typed_section = match section {
+            1 => OverlayRelocationSection::Text,
+            2 => OverlayRelocationSection::Data,
+            3 => OverlayRelocationSection::Rodata,
+            _ => unreachable!("validated overlay section"),
+        };
         if !offset.is_multiple_of(4) || offset + 4 > size {
             return None;
         }
@@ -135,23 +161,55 @@ pub fn parse_zelda_overlay(bytes: &[u8]) -> Option<OverlayRelocRefs> {
                     ((hi << 16) as i64 + (lo as i16 as i64)) as u32
                 };
                 refs.hi_lo_pointers.push(target);
+                refs.relocations.push(LocatedOverlayRelocation {
+                    file_offset: (base + offset) as u32,
+                    section: typed_section,
+                    kind: OverlayRelocationKind::Hi16Lo16Address,
+                    value_evidence: OverlayRelocationValueEvidence::RegisterPairedHi16Lo16,
+                    unrelocated_value: target,
+                });
             }
             4 => {
                 // R_MIPS_26 must sit on a j/jal instruction.
                 match value >> 26 {
-                    0x03 => refs
-                        .jal_targets
-                        .push(0x8000_0000 | ((value & 0x03ff_ffff) << 2)),
-                    0x02 => {}
+                    opcode @ (0x02 | 0x03) => {
+                        let target = 0x8000_0000 | ((value & 0x03ff_ffff) << 2);
+                        let kind = if opcode == 0x03 {
+                            refs.jal_targets.push(target);
+                            OverlayRelocationKind::Mips26Call
+                        } else {
+                            OverlayRelocationKind::Mips26Jump
+                        };
+                        refs.relocations.push(LocatedOverlayRelocation {
+                            file_offset: (base + offset) as u32,
+                            section: typed_section,
+                            kind,
+                            value_evidence: OverlayRelocationValueEvidence::JumpInstructionEncoding,
+                            unrelocated_value: target,
+                        });
+                    }
                     _ => return None,
                 }
             }
-            2 if section == 2 => refs.data_pointers.push(value),
-            2 if section == 3 => refs.rodata_words.push(((base + offset) as u32, value)),
-            2 => {}
+            2 => {
+                refs.relocations.push(LocatedOverlayRelocation {
+                    file_offset: (base + offset) as u32,
+                    section: typed_section,
+                    kind: OverlayRelocationKind::Mips32,
+                    value_evidence: OverlayRelocationValueEvidence::StoredWord,
+                    unrelocated_value: value,
+                });
+                if section == 2 {
+                    refs.data_pointers.push(value);
+                } else if section == 3 {
+                    refs.rodata_words.push(((base + offset) as u32, value));
+                }
+            }
             _ => return None,
         }
     }
+    refs.relocations.sort_unstable();
+    refs.relocations.dedup();
     refs.jal_targets.sort_unstable();
     refs.jal_targets.dedup();
     refs.data_pointers.sort_unstable();
@@ -200,6 +258,25 @@ mod tests {
         let refs = parse_zelda_overlay(&overlay()).expect("valid overlay");
         assert_eq!(refs.jal_targets, vec![0x80081730]);
         assert_eq!(refs.data_pointers, vec![0x80086588]);
+        assert_eq!(
+            refs.relocations,
+            vec![
+                LocatedOverlayRelocation {
+                    file_offset: 0,
+                    section: OverlayRelocationSection::Text,
+                    kind: OverlayRelocationKind::Mips26Call,
+                    value_evidence: OverlayRelocationValueEvidence::JumpInstructionEncoding,
+                    unrelocated_value: 0x80081730,
+                },
+                LocatedOverlayRelocation {
+                    file_offset: 16,
+                    section: OverlayRelocationSection::Data,
+                    kind: OverlayRelocationKind::Mips32,
+                    value_evidence: OverlayRelocationValueEvidence::StoredWord,
+                    unrelocated_value: 0x80086588,
+                },
+            ]
+        );
     }
 
     #[test]

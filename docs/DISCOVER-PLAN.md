@@ -39,6 +39,111 @@ that stronger condition being mechanically provable for every program.
 
 ## Current measured baseline
 
+### ROM-only cold coverage panel (2026-07-31)
+
+`scripts/cold-coverage-panel.py` is the path-free breadth gate. A strict
+external manifest names canonical regular ROM files and their expected
+normalized digests. Every image runs in an environment-cleared process group
+with a 600-second timeout, a sampled 2 GiB aggregate-RSS watchdog, a 40%
+system-free-memory floor, and kernel-enforced 1 MiB stdout/stderr limits. Linux
+also receives a per-process address-space backstop; macOS records that no
+reliable hard memory limit is available. The parent verifies the complete
+`fn64.cold-rom-measurement.v2` shape, internal totals, and normalized identity,
+verifies the receipt digest, and binds and revalidates the exact
+executable digest; it publishes no partial output.
+Wall time, peak RSS, manifest IDs, and paths do not enter the deterministic
+receipt.
+
+The v2 gate covered nine private ROMs from five engine families. Ten complete
+sweeps emitted byte-identical per-ROM receipts. The sealed panel and artifact
+digests remain with the private result rather than becoming an ungated
+repository assertion. Complete-panel wall times were 118.225–119.010 seconds
+and the observed process-group peak sample was 577,765,376 bytes.
+
+| ROM | selected strategy | banks | facts | exact AOT destinations | block AOT destinations | dynamic destinations | unsupported destinations | code-like floor bytes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| No Mercy (NW4E) | recovered overlays | 6 | 31,457 | 0 | 1,820 | 11 | 0 | 0 |
+| WrestleMania 2000 (NWXE) | recovered overlays | 5 | 21,528 | 0 | 1,810 | 13 | 0 | 0 |
+| Ocarina of Time | recovered VROM | 471 | 104,826 | 0 | 819 | 10 | 0 | 8,192 |
+| Majora's Mask | recovered VROM | 605 | 81,839 | 0 | 1,527 | 15 | 0 | 81,920 |
+| Kirby 64 | recovered overlays | 10 | 23,898 | 0 | 2,865 | 32 | 0 | 704,512 |
+| GoldenEye 007 | boot bank only | 1 | 5,925 | 0 | 3 | 1 | 0 | 32,768 |
+| Perfect Dark | boot bank only | 1 | 339 | 0 | 3 | 1 | 0 | 0 |
+| Super Mario 64 | untabled delta vote | 1 | 14,241 | 0 | 163 | 0 | 0 | 245,760 |
+| Banjo-Kazooie | boot bank only | 1 | 223 | 0 | 363 | 0 | **1** | 0 |
+
+The sole static release blocker is Banjo-Kazooie's one
+`outside_all_mappings` destination. Kirby 64 has the largest measured residue
+and dynamic tier. `ledger_code_like_floor_bytes` is exactly
+`undiscovered_code_bytes()`: the measured CodeLike heuristic floor, not a
+complete undiscovered-code total. A zero floor on a boot-only model is not a
+whole-game closure claim.
+
+An earlier v1 panel is historical only. Its zero runtime-event count was
+vacuous because the static measurement executed no guest code, its raw receipt
+artifact was not retained, and its `7a98bc2d…68a6` transcript hash cannot be
+recomputed. V2 removes that field and reports static `unsupported` only over
+the exact `total_destinations` denominator. It also retains all four class
+tallies and all eight reason buckets, including zero-valued buckets.
+
+The retained v2 baseline contains 35,646 `OverlayRelocation` facts for OoT and
+46,993 for MM; the other seven ROMs contain none. Session output recorded
+pre-ingestion totals of 69,180 and 34,846 facts and unchanged closure/ledger
+scores, but no raw pre-ingestion receipt survived. Those deltas therefore
+cannot be independently recomputed and are not admitted as a verified panel
+delta. The canonical facts remain inert evidence rather than callable roots.
+Any later consumer must prove both the parser-derived value and its role;
+`R_MIPS_32` plus a text-range value is not enough after the measured
+25-function split failure in the answer-key gate.
+
+Stage-1 effect classification now exists independently of the WM-specific
+source-frontier gate. `stage1_effects::scan_stage1_effects` inventories raw
+COP0/cache/sync/trap encodings, qualifies code versus data-shaped words with
+the authority CFG, and performs a sound but deliberately local constant-
+address pass that resets at every basic-block entry. Direct KSEG0/KSEG1 aliases
+are converted to physical addresses before RDRAM/RCP/PIF classification;
+KSEG1 by itself is not an MMIO signal. Every cross-block, TLB-dependent, or
+path-ambiguous memory address remains open, so an empty positive list would
+still not be a purity theorem.
+
+The nine-ROM scan measured reachable obvious external-effect sites (intrinsic
+COP0/cache/sync/trap plus exact RCP/PIF accesses) as NW4E 136, NWXE 136, OoT
+100, MM 107, Kirby 146, GoldenEye 6, Perfect Dark 6, SM64 37, and Banjo 34.
+Exact RCP accesses were respectively 68, 68, 46, 40, 79, 0, 0, 5, and 10;
+no exact PIF access appeared. More importantly, unresolved reachable memory
+addresses remained 2,617 / 2,585 / 1,427 / 2,380 / 4,688 / 2 / 2 / 273 / 493.
+This validates the sequencing decision: stage 1 cheaply rejects many blocks,
+but cannot yet mint the effect/closure certificate required to admit block
+harvest. Typed-memory separation and complete call/effect propagation remain
+later proof obligations.
+
+`fn64-discover study-layout <rom> <dump.toml>` is a held-out research
+diagnostic, not a cold input. It seals the ROM-only receipt before opening a
+bounded answer key, reruns discovery/composition under the receipt's exact
+limits, requires the scoreboards to agree, and binds the answer-key digest into
+its own receipt. `FN64_DISCOVER_PRINT_GRADES=1 gate_decomp_functions` emits the
+corpus-only adjacency rows used by that line of research. One real OoT run
+completed, but cold discovery had zero exact owners, so it produced zero
+candidate gaps. The command has not passed a 10-run characterization and the
+layout hypothesis remains untested by the baseline.
+
+Accordingly, no sealed block-harvest evaluation was run and no evaluated image
+was admitted as writer-class authority. The reserved
+`ValidatedWriterClassReceiptV2::CpuCopyStoreOrDecompression` shape is now
+structurally split into three independently retained receipts: an
+effect/closure certificate, an exact evaluated-image block-harvest receipt,
+and class-completeness aggregation. The production constructor remains absent.
+This prevents a future successful execution sample from substituting for
+either all-executions closure or completeness of the writer-class inventory.
+
+The depth-side anchor is the separate 100k exact-entry AOT/dynamic diagnostic,
+attempt 25, landed in `f527f08`. Both lanes completed 100,001 guest
+instructions and matched RDRAM, CPU, device, executor, ABI-host, continuation,
+scheduler-step (33,333), and simulated-time state. Both publication diagnostics
+retained the same pending executable write, last charge 5, and cumulative
+instruction count. It bounds one exact fallback transition; it does not improve
+any cold-panel coverage number above.
+
 ### Cold training, then label-free application
 
 Known recompilation/decompilation corpora are training data, not inputs to the
@@ -2057,6 +2162,8 @@ table consolidates, it does not re-measure.
 
 | Experiment | OoT | NW4E | NWXE | Disposition |
 |---|---|---|---|---|
+| Canonical Zelda overlay-relocation facts | 35,646 facts retained; causal delta not retained | 0 facts retained | 0 facts retained | adopted as inert provenance; MM retains 46,993 facts; pre-ingestion receipts are missing, so current coverage delta is **not verified** and no pointer-to-root promotion follows |
+| Stage-1 syntactic effect inventory | 100 obvious external-effect sites; 1,427 memory addresses open | 136; 2,617 open | 136; 2,585 open | adopted as standalone negative classifier; 9-ROM panel measured, absence is not a purity/closure certificate |
 | D1.5 load-image/file tables | combined 62.29%/0.82% → 90.57%/72.32% | n/m (uses descriptor path) | n/m | adopted |
 | D2 value-set closure + identity audit | precision 90.57% → 98.69%, recall flat 72.32% (JalTarget 82.12% → 97.76%) | 44.69% → 48.44% prec, 89.04% → 89.71% recall | no change (36.36%/28.50%) | adopted |
 | Descriptor-table mapping | n/m | 48.44%/89.74% (baseline of its rows) | 49.95%/86.86% vs 36.40%/28.54% boot-only | adopted (shape is data input) |
