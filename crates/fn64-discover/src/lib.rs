@@ -129,7 +129,9 @@
 //!   in-memory result carries bytes but no mapping or proof authority.
 //! - `transform_invocation`: opt-in, candidate-only certification that one
 //!   exact content-bound guest wrapper invocation produces one re-derived
-//!   evaluated image. It does not promote facts or claim general transform
+//!   evaluated image, plus an ordered one-call-per-stream sequence form that
+//!   binds shared mutable-memory evolution and cumulative limits in one fresh
+//!   machine. Neither form promotes facts or claims general transform
 //!   semantics, runtime placement, or boot reachability.
 //! - [`homology`]: bounded relocation-masked cross-ROM n-gram lookup with
 //!   collision-safe full-body validation and explicit ambiguous/unmatched
