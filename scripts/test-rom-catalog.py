@@ -148,6 +148,57 @@ class StableIdTests(unittest.TestCase):
         self.assertEqual(CATALOG.stable_id(Path("/roms/!!!.z64")), "rom")
 
 
+DAT_SAMPLE = """clrmamepro (
+\tname "Nintendo - Nintendo 64"
+)
+
+game (
+\tcomment "Test Game (USA)"
+\tdeveloper "Iguana Entertainment"
+\trom ( crc DEADBEEF )
+)
+
+game (
+\tcomment "Other Game (USA)"
+\tdeveloper "Rareware"
+\trom ( crc 12345678 )
+)
+"""
+
+
+class DatJoinTests(unittest.TestCase):
+    def test_records_parse_and_key_on_lowercase_crc(self) -> None:
+        table = CATALOG.parse_dat(DAT_SAMPLE, "developer")
+        self.assertEqual(table["deadbeef"], ("Iguana Entertainment", "Test Game (USA)"))
+        self.assertEqual(table["12345678"][0], "Rareware")
+
+    def test_a_matched_rom_gains_metadata(self) -> None:
+        tables = {field: CATALOG.parse_dat(DAT_SAMPLE, "developer") for field in CATALOG.DAT_FIELDS}
+        record = {"file_crc32": "deadbeef"}
+        CATALOG.join_dat(record, tables)
+        self.assertTrue(record["dat_match"])
+        self.assertEqual(record["developer"], "Iguana Entertainment")
+        self.assertEqual(record["dat_name"], "Test Game (USA)")
+        # `releaseyear` is renamed to the catalog's field name.
+        self.assertIn("release_year", record)
+        self.assertNotIn("releaseyear", record)
+
+    def test_an_unmatched_rom_is_an_explicit_miss_not_a_guess(self) -> None:
+        # No-Intro does not catalog hacks, translations or prototypes. An
+        # absent row must stay empty rather than borrow a neighbour's values.
+        tables = {field: CATALOG.parse_dat(DAT_SAMPLE, "developer") for field in CATALOG.DAT_FIELDS}
+        record = {"file_crc32": "ffffffff"}
+        CATALOG.join_dat(record, tables)
+        self.assertFalse(record["dat_match"])
+        self.assertEqual(record["developer"], "")
+        self.assertEqual(record["dat_name"], "")
+
+    def test_a_missing_dat_file_is_loud(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(CATALOG.CatalogError):
+                CATALOG.load_dat_directory(Path(directory))
+
+
 class OutputTests(unittest.TestCase):
     def test_relative_and_dotdot_destinations_are_refused(self) -> None:
         for candidate in ("relative.jsonl", "/tmp/../etc/out.jsonl"):

@@ -147,7 +147,19 @@ python3 scripts/rom-frontier.py \
 ```
 
 `FN64_ROM_CORPUS_DIR` has no default; both tools exit rather than guess a ROM
-location, and both refuse to write inside the repository. The catalog records
+location, and both refuse to write inside the repository.
+
+`rom-catalog.py --dat-dir` optionally attaches developer, publisher, release
+year, and genre from `libretro/libretro-database` clrmamepro DAT files
+(CC BY-SA 4.0; place `developer.dat`, `publisher.dat`, `releaseyear.dat`, and
+`genre.dat` in one directory). The join key is CRC32 of the whole ROM file,
+computed locally, so it is verifiable rather than matched by filename.
+Measured coverage on a 287-ROM corpus is 276 rows (96.2%); the misses are ROM
+hacks, translations, and prototypes that No-Intro does not catalog, and they
+are recorded as `dat_match: false` with empty fields rather than guessed. The
+developer field gives the frontier report an engine axis: studios reused
+in-house engines, so a fixture proven on one title plausibly transfers to that
+studio's others. The catalog records
 cartridge identity, IPL3 cluster, and per-ROM structural measures — boot-copy
 entropy, the share of bytes inside long code runs, and a
 `loader_stub_ratio` (distinct `jal` targets over resident `jr $ra` returns)
