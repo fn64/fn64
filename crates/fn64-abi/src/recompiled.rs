@@ -1910,8 +1910,7 @@ impl<'a> BootstrapImportTransactionV1<'a> {
             });
         }
         let mut storage = vec![0; rdram_len].into_boxed_slice();
-        fn64_runtime::RdramViewMut::from_storage(&mut storage)
-            .write_u32(fn64_runtime::RdramAddr::from_offset(0x300), tv_type as u32);
+        fn64_runtime::IplBootGlobals::cold(tv_type).install(&mut storage);
         Ok(Self {
             install,
             rom,
@@ -11059,6 +11058,27 @@ mod tests {
 
     fn bootstrap_test_rdram_len() -> usize {
         fn64_recomp_rs::RDRAM_LEN
+    }
+
+    #[test]
+    fn bootstrap_import_installs_complete_cold_ipl_globals() {
+        let install = bootstrap_test_install(0x2402_0001);
+        for (tv_type, expected_tv) in [
+            (fn64_runtime::TvType::Pal, 0),
+            (fn64_runtime::TvType::Ntsc, 1),
+            (fn64_runtime::TvType::Mpal, 2),
+        ] {
+            let transaction = install
+                .begin_bootstrap_import_v1(&[], bootstrap_test_rdram_len(), tv_type)
+                .unwrap();
+            let view = fn64_runtime::RdramView::from_storage(&transaction.storage);
+            assert_eq!(view.read_u32(fn64_runtime::OS_TV_TYPE_ADDR), expected_tv);
+            assert_eq!(
+                view.read_u32(fn64_runtime::OS_ROM_BASE_ADDR),
+                fn64_runtime::CART_ROM_KSEG1_BASE
+            );
+            assert_eq!(view.read_u32(fn64_runtime::OS_RESET_TYPE_ADDR), 0);
+        }
     }
 
     #[test]
