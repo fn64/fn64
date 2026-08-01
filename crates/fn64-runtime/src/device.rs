@@ -26,7 +26,7 @@ use std::fmt;
 
 use crate::mmio::{AI_STATUS_BUSY, AI_STATUS_ENABLED, AI_STATUS_FULL};
 use crate::rdram::RdramAddr;
-use crate::rom::{DmaCompletion, DmaMemory, PiDma, PiDmaError, RomStorage};
+use crate::rom::{DmaCompletion, DmaMemory, PiDeviceAddress, PiDma, PiDmaError, RomStorage};
 use crate::rsp::{RspMemAddr, RspMemory, RspMemoryBank, RspMemoryError, RSP_MEMORY_BANK_SIZE};
 use crate::trace::DmaDirection;
 use crate::tv::{TvType, CPU_CLOCK_HZ};
@@ -99,6 +99,10 @@ const PI_DOM2_LAT_REG: MmioAddr = MmioAddr::new(0xA460_0024);
 const PI_DOM2_PWD_REG: MmioAddr = MmioAddr::new(0xA460_0028);
 const PI_DOM2_PGS_REG: MmioAddr = MmioAddr::new(0xA460_002C);
 const PI_DOM2_RLS_REG: MmioAddr = MmioAddr::new(0xA460_0030);
+const PI_DOM1_ADDR2_START: u32 = 0x1000_0000;
+const PI_DOM1_ADDR2_END: u32 = 0x1FC0_0000;
+const PI_DOM2_ADDR2_START: u32 = 0x0800_0000;
+const PI_DOM2_ADDR2_END: u32 = 0x1000_0000;
 const SP_DMEM_START: u32 = 0xA400_0000;
 const SP_IMEM_END: u32 = 0xA400_2000;
 const SP_MEM_ADDR_REG: MmioAddr = MmioAddr::new(0xA404_0000);
@@ -231,7 +235,7 @@ impl InterruptSource {
 pub struct PiDmaRequest {
     pub direction: DmaDirection,
     pub dram_addr: RdramAddr,
-    pub cart_addr: u32,
+    pub device: PiDeviceAddress,
     pub len: u32,
 }
 
@@ -393,14 +397,51 @@ pub enum PiDomain {
 
 impl PiDmaRequest {
     pub const fn domain(self) -> PiDomain {
-        if (self.cart_addr >= 0x0500_0000 && self.cart_addr <= 0x05FF_FFFF)
-            || (self.cart_addr >= 0x0800_0000 && self.cart_addr <= 0x0FFF_FFFF)
-        {
-            PiDomain::Domain2
-        } else {
-            PiDomain::Domain1
+        match self.device {
+            PiDeviceAddress::RomOffset(_) => PiDomain::Domain1,
+            PiDeviceAddress::SramOffset(_) => PiDomain::Domain2,
         }
     }
+}
+
+/// Decode the physical PI CART latch only when a raw length-register write
+/// starts a transfer. The public libultra `osPiRawStartDma` manual defines
+/// `OS_READ` as device-to-RDRAM and `OS_WRITE` as RDRAM-to-device; its PI
+/// domain documentation keeps the physical bus window separate from the
+/// device-relative address. The Unlicense libdragon PI behavior independently
+/// programs WR_LEN for cartridge-to-RDRAM transfers and removes the Domain-1
+/// Address-2 base before indexing ROM. Those constraints determine this
+/// boundary; shim callers already supply a typed device-relative address.
+fn decode_raw_pi_device_address(physical: u32) -> Result<PiDeviceAddress, DeviceFault> {
+    if (PI_DOM1_ADDR2_START..PI_DOM1_ADDR2_END).contains(&physical) {
+        Ok(PiDeviceAddress::RomOffset(physical - PI_DOM1_ADDR2_START))
+    } else if (PI_DOM2_ADDR2_START..PI_DOM2_ADDR2_END).contains(&physical) {
+        Ok(PiDeviceAddress::SramOffset(physical - PI_DOM2_ADDR2_START))
+    } else {
+        Err(DeviceFault::InvalidPiCartAddress { physical })
+    }
+}
+
+fn physical_pi_device_range(device: PiDeviceAddress, len: u32) -> Result<u32, DeviceFault> {
+    let (base, span, offset) = match device {
+        PiDeviceAddress::RomOffset(offset) => (
+            PI_DOM1_ADDR2_START,
+            PI_DOM1_ADDR2_END - PI_DOM1_ADDR2_START,
+            offset,
+        ),
+        PiDeviceAddress::SramOffset(offset) => (
+            PI_DOM2_ADDR2_START,
+            PI_DOM2_ADDR2_END - PI_DOM2_ADDR2_START,
+            offset,
+        ),
+    };
+    let end = offset
+        .checked_add(len)
+        .ok_or(DeviceFault::InvalidPiDeviceRange { device, len })?;
+    if offset >= span || end > span {
+        return Err(DeviceFault::InvalidPiDeviceRange { device, len });
+    }
+    Ok(base + offset)
 }
 
 /// PI bus parameters exposed by the four domain timing registers.
@@ -609,6 +650,13 @@ pub enum DeviceFault {
     PiLengthOverflow {
         encoded: u32,
     },
+    InvalidPiDeviceRange {
+        device: PiDeviceAddress,
+        len: u32,
+    },
+    InvalidPiCartAddress {
+        physical: u32,
+    },
     PiTransfer(PiDmaError),
     DeadlineOverflow,
     TimeWentBack {
@@ -703,6 +751,16 @@ impl fmt::Display for DeviceFault {
             Self::PiLengthOverflow { encoded } => {
                 write!(f, "PI encoded DMA length {encoded:#010X} overflows")
             }
+            Self::InvalidPiDeviceRange { device, len } => {
+                write!(
+                    f,
+                    "PI device-relative range {device:?} + {len:#x} bytes escapes its physical domain"
+                )
+            }
+            Self::InvalidPiCartAddress { physical } => write!(
+                f,
+                "PI CART address {physical:#010X} is outside supported Domain-1/2 Address-2 windows"
+            ),
             Self::PiTransfer(error) => write!(f, "PI transfer rejected: {error}"),
             Self::DeadlineOverflow => write!(f, "device-event deadline overflow"),
             Self::TimeWentBack { now, requested } => write!(
@@ -1695,30 +1753,49 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
 
     /// Shim entry path. Raw MMIO converges here after latching its registers.
     pub fn start_pi_dma(&mut self, request: PiDmaRequest) -> Result<(), DeviceFault> {
+        let (physical, deadline) = self.preflight_pi_dma(request)?;
+        self.pi_cart_addr = physical;
+        self.admit_pi_dma(request, deadline);
+        Ok(())
+    }
+
+    fn start_latched_pi_dma(&mut self, request: PiDmaRequest) -> Result<(), DeviceFault> {
+        let (_, deadline) = self.preflight_pi_dma(request)?;
+        self.admit_pi_dma(request, deadline);
+        Ok(())
+    }
+
+    fn preflight_pi_dma(&self, request: PiDmaRequest) -> Result<(u32, Cycles), DeviceFault> {
         if self.pending_pi.is_some() {
             return Err(DeviceFault::PiBusy);
         }
         if request.len == 0 {
             return Err(DeviceFault::ZeroLengthPiDma);
         }
+        let physical = physical_pi_device_range(request.device, request.len)?;
         let timing = self.pi_domain_timing(request.domain());
         let deadline = self
             .now
             .checked_add(self.pi_timing.completion_latency(request, timing))
             .ok_or(DeviceFault::DeadlineOverflow)?;
+        self.next_event_sequence
+            .checked_add(1)
+            .ok_or(DeviceFault::DeadlineOverflow)?;
+        Ok((physical, deadline))
+    }
+
+    fn admit_pi_dma(&mut self, request: PiDmaRequest, deadline: Cycles) {
         let token = self.next_event_sequence;
         self.next_event_sequence = self
             .next_event_sequence
             .checked_add(1)
-            .ok_or(DeviceFault::DeadlineOverflow)?;
+            .expect("preflight PI event sequence overflow");
         self.pi_dram_addr = request.dram_addr;
-        self.pi_cart_addr = request.cart_addr;
         self.pi_status = PI_STATUS_DMA_BUSY;
         self.pending_pi = Some(PendingPi { token, request });
         self.events
             .insert((deadline, token), DeviceEvent::Pi { token });
         self.record(DeviceTraceKind::PiDmaStarted(request));
-        Ok(())
     }
 
     /// Enqueue one AI buffer in the hardware's current/next two-slot FIFO.
@@ -2576,10 +2653,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 let len = value
                     .checked_add(1)
                     .ok_or(DeviceFault::PiLengthOverflow { encoded: value })?;
-                self.start_pi_dma(PiDmaRequest {
-                    direction: DmaDirection::ToRdram,
+                let device = decode_raw_pi_device_address(self.pi_cart_addr)?;
+                self.start_latched_pi_dma(PiDmaRequest {
+                    direction: DmaDirection::FromRdram,
                     dram_addr: self.pi_dram_addr,
-                    cart_addr: self.pi_cart_addr,
+                    device,
                     len,
                 })
             }
@@ -2587,10 +2665,11 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 let len = value
                     .checked_add(1)
                     .ok_or(DeviceFault::PiLengthOverflow { encoded: value })?;
-                self.start_pi_dma(PiDmaRequest {
-                    direction: DmaDirection::FromRdram,
+                let device = decode_raw_pi_device_address(self.pi_cart_addr)?;
+                self.start_latched_pi_dma(PiDmaRequest {
+                    direction: DmaDirection::ToRdram,
                     dram_addr: self.pi_dram_addr,
-                    cart_addr: self.pi_cart_addr,
+                    device,
                     len,
                 })
             }
@@ -2720,7 +2799,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                             rdram,
                             request.direction,
                             request.dram_addr,
-                            request.cart_addr,
+                            request.device,
                             request.len,
                         )
                         .map_err(DeviceFault::PiTransfer)?;
@@ -2969,7 +3048,7 @@ mod tests {
         pi.start_pi_dma(PiDmaRequest {
             direction: DmaDirection::ToRdram,
             dram_addr: RdramAddr::from_offset(0x20),
-            cart_addr: 0x10,
+            device: PiDeviceAddress::RomOffset(0x10),
             len: 4,
         })
         .unwrap();
@@ -3032,7 +3111,7 @@ mod tests {
         let request = PiDmaRequest {
             direction: DmaDirection::ToRdram,
             dram_addr: RdramAddr::from_offset(0),
-            cart_addr: 0x1000_0010,
+            device: PiDeviceAddress::RomOffset(0x10),
             len: 4,
         };
 
@@ -3741,7 +3820,7 @@ mod tests {
         let request = PiDmaRequest {
             direction: DmaDirection::ToRdram,
             dram_addr: RdramAddr::from_offset(0x20),
-            cart_addr: 0x10,
+            device: PiDeviceAddress::RomOffset(0x10),
             len: 4,
         };
         let mut shim = fabric();
@@ -3751,8 +3830,8 @@ mod tests {
 
         shim.start_pi_dma(request).unwrap();
         raw.write_mmio(PI_DRAM_ADDR_REG, 0x20).unwrap();
-        raw.write_mmio(PI_CART_ADDR_REG, 0x10).unwrap();
-        raw.write_mmio(PI_RD_LEN_REG, 3).unwrap();
+        raw.write_mmio(PI_CART_ADDR_REG, 0x1000_0010).unwrap();
+        raw.write_mmio(PI_WR_LEN_REG, 3).unwrap();
         assert_eq!(raw.snapshot(), shim.snapshot());
         assert_eq!(raw.read_mmio(PI_STATUS_REG).unwrap(), PI_STATUS_DMA_BUSY);
 
@@ -3819,6 +3898,284 @@ mod tests {
         raw.write_mmio(PI_STATUS_REG, 0b10).unwrap();
         assert!(!raw.interrupt_pending(InterruptSource::Pi));
         assert!(!raw.cpu_interrupt_pending());
+    }
+
+    #[test]
+    fn raw_pi_length_registers_decode_direction_and_device_at_trigger() {
+        let mut read = fabric();
+        read.write_mmio(PI_DRAM_ADDR_REG, 0x20).unwrap();
+        read.write_mmio(PI_CART_ADDR_REG, 0x0800_0010).unwrap();
+        assert_eq!(read.read_mmio(PI_CART_ADDR_REG).unwrap(), 0x0800_0010);
+        read.write_mmio(PI_RD_LEN_REG, 3).unwrap();
+        assert_eq!(
+            read.pending_pi_request(),
+            Some(PiDmaRequest {
+                direction: DmaDirection::FromRdram,
+                dram_addr: RdramAddr::from_offset(0x20),
+                device: PiDeviceAddress::SramOffset(0x10),
+                len: 4,
+            })
+        );
+        assert_eq!(read.read_mmio(PI_CART_ADDR_REG).unwrap(), 0x0800_0010);
+
+        let mut write = fabric();
+        write.write_mmio(PI_DRAM_ADDR_REG, 0x24).unwrap();
+        write.write_mmio(PI_CART_ADDR_REG, 0x1000_0010).unwrap();
+        write.write_mmio(PI_WR_LEN_REG, 3).unwrap();
+        assert_eq!(
+            write.pending_pi_request(),
+            Some(PiDmaRequest {
+                direction: DmaDirection::ToRdram,
+                dram_addr: RdramAddr::from_offset(0x24),
+                device: PiDeviceAddress::RomOffset(0x10),
+                len: 4,
+            })
+        );
+        assert_eq!(write.read_mmio(PI_CART_ADDR_REG).unwrap(), 0x1000_0010);
+    }
+
+    #[test]
+    fn raw_pi_rd_len_rejects_a_write_to_cartridge_rom_loudly() {
+        let mut fabric = fabric();
+        let mut rdram = Rdram::new(0x100);
+        fabric.write_mmio(PI_DRAM_ADDR_REG, 0x20).unwrap();
+        fabric.write_mmio(PI_CART_ADDR_REG, 0x1000_0010).unwrap();
+        fabric.write_mmio(PI_RD_LEN_REG, 3).unwrap();
+
+        assert_eq!(
+            fabric.advance_to(Cycles::new(12), &mut rdram),
+            Err(DeviceFault::PiTransfer(PiDmaError::ReadOnlyDevice {
+                device: PiDeviceAddress::RomOffset(0x10),
+            }))
+        );
+    }
+
+    #[test]
+    fn raw_pi_sram_round_trips_in_both_register_directions() {
+        let mut fabric = fabric();
+        fabric
+            .pi_dma_mut()
+            .set_save(Box::new(crate::save::InMemorySaveStorage::for_device(
+                crate::save::SaveType::SramBanked,
+            )));
+        let mut rdram = Rdram::new(0x100);
+        rdram.write_w(RdramAddr::from_offset(0x20), 0x1122_3344);
+
+        fabric.write_mmio(PI_DRAM_ADDR_REG, 0x20).unwrap();
+        fabric.write_mmio(PI_CART_ADDR_REG, 0x0800_0010).unwrap();
+        fabric.write_mmio(PI_RD_LEN_REG, 3).unwrap();
+        fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+
+        fabric.write_mmio(PI_DRAM_ADDR_REG, 0x40).unwrap();
+        fabric.write_mmio(PI_CART_ADDR_REG, 0x0800_0010).unwrap();
+        fabric.write_mmio(PI_WR_LEN_REG, 3).unwrap();
+        fabric.advance_to(Cycles::new(24), &mut rdram).unwrap();
+
+        assert_eq!(rdram.read_w(RdramAddr::from_offset(0x40)), 0x1122_3344);
+    }
+
+    #[test]
+    fn typed_and_raw_sram_reads_share_state_trace_and_bytes() {
+        let request = PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0x20),
+            device: PiDeviceAddress::SramOffset(0x10),
+            len: 4,
+        };
+        let mut typed = fabric();
+        let mut raw = fabric();
+        for fabric in [&mut typed, &mut raw] {
+            fabric
+                .pi_dma_mut()
+                .set_save(Box::new(crate::save::InMemorySaveStorage::for_device(
+                    crate::save::SaveType::SramBanked,
+                )));
+            fabric
+                .pi_dma_mut()
+                .save_write_from(0x10, &[0x55, 0x66, 0x77, 0x88]);
+        }
+        let mut typed_rdram = Rdram::new(0x100);
+        let mut raw_rdram = Rdram::new(0x100);
+
+        typed.start_pi_dma(request).unwrap();
+        raw.write_mmio(PI_DRAM_ADDR_REG, 0x20).unwrap();
+        raw.write_mmio(PI_CART_ADDR_REG, 0x0800_0010).unwrap();
+        raw.write_mmio(PI_WR_LEN_REG, 3).unwrap();
+        assert_eq!(raw.snapshot(), typed.snapshot());
+
+        let typed_notifications = typed.advance_to(Cycles::new(12), &mut typed_rdram).unwrap();
+        let raw_notifications = raw.advance_to(Cycles::new(12), &mut raw_rdram).unwrap();
+        assert_eq!(raw_notifications, typed_notifications);
+        assert_eq!(raw.snapshot(), typed.snapshot());
+        assert_eq!(raw.trace(), typed.trace());
+        assert_eq!(
+            raw_rdram.read_w(RdramAddr::from_offset(0x20)),
+            typed_rdram.read_w(RdramAddr::from_offset(0x20))
+        );
+    }
+
+    #[test]
+    fn raw_pi_device_windows_decode_boundaries_and_reject_gaps() {
+        for (physical, device) in [
+            (0x0800_0000, PiDeviceAddress::SramOffset(0)),
+            (0x0fff_ffff, PiDeviceAddress::SramOffset(0x07ff_ffff)),
+            (0x1000_0000, PiDeviceAddress::RomOffset(0)),
+            (0x1fbf_ffff, PiDeviceAddress::RomOffset(0x0fbf_ffff)),
+        ] {
+            let mut fabric = fabric();
+            fabric.write_mmio(PI_CART_ADDR_REG, physical).unwrap();
+            fabric.write_mmio(PI_WR_LEN_REG, 0).unwrap();
+            assert_eq!(fabric.pending_pi_request().unwrap().device, device);
+            assert_eq!(fabric.read_mmio(PI_CART_ADDR_REG).unwrap(), physical);
+        }
+
+        for physical in [0x07ff_ffff, 0x1fc0_0000] {
+            let mut fabric = fabric();
+            fabric.write_mmio(PI_CART_ADDR_REG, physical).unwrap();
+            assert_eq!(
+                fabric.write_mmio(PI_WR_LEN_REG, 0),
+                Err(DeviceFault::InvalidPiCartAddress { physical })
+            );
+            assert_eq!(fabric.pending_pi_request(), None);
+            assert_eq!(fabric.read_mmio(PI_CART_ADDR_REG).unwrap(), physical);
+        }
+
+        for (physical, device) in [
+            (0x0fff_ffff, PiDeviceAddress::SramOffset(0x07ff_ffff)),
+            (0x1fbf_ffff, PiDeviceAddress::RomOffset(0x0fbf_ffff)),
+        ] {
+            let mut fabric = fabric();
+            fabric.write_mmio(PI_CART_ADDR_REG, physical).unwrap();
+            assert_eq!(
+                fabric.write_mmio(PI_WR_LEN_REG, 1),
+                Err(DeviceFault::InvalidPiDeviceRange { device, len: 2 })
+            );
+            assert_eq!(fabric.pending_pi_request(), None);
+            assert_eq!(fabric.read_mmio(PI_CART_ADDR_REG).unwrap(), physical);
+        }
+    }
+
+    #[test]
+    fn rom_offset_above_eight_mib_is_not_inferred_as_sram() {
+        const ROM_OFFSET: u32 = 0x0080_0010;
+        let mut rom = vec![0u8; ROM_OFFSET as usize + 4];
+        rom[ROM_OFFSET as usize..ROM_OFFSET as usize + 4]
+            .copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        let mut fabric = DeviceFabric::new(
+            PiDma::new(InMemoryRom::new(rom)),
+            TestTiming(Cycles::new(12)),
+        );
+        let mut rdram = Rdram::new(0x100);
+
+        fabric.write_mmio(PI_DRAM_ADDR_REG, 0x20).unwrap();
+        fabric
+            .write_mmio(PI_CART_ADDR_REG, 0x1000_0000 + ROM_OFFSET)
+            .unwrap();
+        fabric.write_mmio(PI_WR_LEN_REG, 3).unwrap();
+        assert_eq!(
+            fabric.pending_pi_request().unwrap().device,
+            PiDeviceAddress::RomOffset(ROM_OFFSET)
+        );
+        fabric.advance_to(Cycles::new(12), &mut rdram).unwrap();
+        assert_eq!(
+            rdram.read_w(RdramAddr::from_offset(0x20)) as u32,
+            0x1234_5678
+        );
+    }
+
+    #[test]
+    fn synthetic_banjo_pi_tuple_normalizes_without_game_content() {
+        let mut fabric = fabric();
+        fabric.write_mmio(PI_DRAM_ADDR_REG, 0x0002_d500).unwrap();
+        fabric.write_mmio(PI_CART_ADDR_REG, 0x10f1_9250).unwrap();
+        fabric.write_mmio(PI_WR_LEN_REG, 0x0001_ed3f).unwrap();
+
+        assert_eq!(
+            fabric.pending_pi_request(),
+            Some(PiDmaRequest {
+                direction: DmaDirection::ToRdram,
+                dram_addr: RdramAddr::from_offset(0x0002_d500),
+                device: PiDeviceAddress::RomOffset(0x00f1_9250),
+                len: 0x0001_ed40,
+            })
+        );
+        assert_eq!(
+            0x0002_d500u32 + fabric.pending_pi_request().unwrap().len,
+            0x0004_c240
+        );
+        assert_eq!(
+            0x00f1_9250u32 + fabric.pending_pi_request().unwrap().len,
+            0x00f3_7f90
+        );
+        assert_eq!(fabric.read_mmio(PI_CART_ADDR_REG).unwrap(), 0x10f1_9250);
+    }
+
+    #[test]
+    fn typed_pi_offsets_must_fit_their_physical_windows() {
+        for (device, len) in [
+            (PiDeviceAddress::RomOffset(0x0fc0_0000), 1),
+            (PiDeviceAddress::SramOffset(0x0800_0000), 1),
+            (PiDeviceAddress::RomOffset(0x0fbf_ffff), 2),
+            (PiDeviceAddress::SramOffset(0x07ff_ffff), 2),
+            (PiDeviceAddress::RomOffset(0x0fbf_ffff), u32::MAX),
+        ] {
+            let mut fabric = fabric();
+            assert_eq!(
+                fabric.start_pi_dma(PiDmaRequest {
+                    direction: DmaDirection::ToRdram,
+                    dram_addr: RdramAddr::from_offset(0),
+                    device,
+                    len,
+                }),
+                Err(DeviceFault::InvalidPiDeviceRange { device, len })
+            );
+            assert_eq!(fabric.pending_pi_request(), None);
+        }
+    }
+
+    #[test]
+    fn typed_pi_start_failures_do_not_mutate_readable_latches_or_trace() {
+        let request = |device, len| PiDmaRequest {
+            direction: DmaDirection::ToRdram,
+            dram_addr: RdramAddr::from_offset(0x20),
+            device,
+            len,
+        };
+
+        let mut zero = fabric();
+        zero.write_mmio(PI_CART_ADDR_REG, 0x0800_0040).unwrap();
+        let before = zero.snapshot();
+        assert_eq!(
+            zero.start_pi_dma(request(PiDeviceAddress::RomOffset(0x10), 0)),
+            Err(DeviceFault::ZeroLengthPiDma)
+        );
+        assert_eq!(zero.snapshot(), before);
+        assert!(zero.trace().is_empty());
+
+        let mut busy = fabric();
+        busy.start_pi_dma(request(PiDeviceAddress::RomOffset(0x10), 4))
+            .unwrap();
+        let before = busy.snapshot();
+        let trace = busy.trace().to_vec();
+        assert_eq!(
+            busy.start_pi_dma(request(PiDeviceAddress::SramOffset(0x20), 4)),
+            Err(DeviceFault::PiBusy)
+        );
+        assert_eq!(busy.snapshot(), before);
+        assert_eq!(busy.trace(), trace);
+
+        let mut deadline = fabric();
+        deadline.write_mmio(PI_CART_ADDR_REG, 0x0800_0040).unwrap();
+        deadline
+            .advance_to(Cycles::new(u64::MAX), &mut Rdram::new(0x100))
+            .unwrap();
+        let before = deadline.snapshot();
+        assert_eq!(
+            deadline.start_pi_dma(request(PiDeviceAddress::RomOffset(0x10), 4)),
+            Err(DeviceFault::DeadlineOverflow)
+        );
+        assert_eq!(deadline.snapshot(), before);
+        assert!(deadline.trace().is_empty());
     }
 
     #[test]
@@ -3951,7 +4308,7 @@ mod tests {
         let request = PiDmaRequest {
             direction: DmaDirection::ToRdram,
             dram_addr: RdramAddr::from_offset(0x20),
-            cart_addr: 0x10,
+            device: PiDeviceAddress::RomOffset(0x10),
             len: 4,
         };
         fabric.start_pi_dma(request).unwrap();
@@ -4499,7 +4856,7 @@ mod tests {
         let request = PiDmaRequest {
             direction: DmaDirection::ToRdram,
             dram_addr: RdramAddr::from_offset(0x20),
-            cart_addr: 0x10,
+            device: PiDeviceAddress::RomOffset(0x10),
             len: 4,
         };
         fabric.start_pi_dma(request).unwrap();
@@ -4560,7 +4917,7 @@ mod tests {
             PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0),
-                cart_addr: 0x0800_0000,
+                device: PiDeviceAddress::SramOffset(0),
                 len: 2,
             }
             .domain(),
@@ -4576,7 +4933,7 @@ mod tests {
             .start_pi_dma(PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0x20),
-                cart_addr: 0x10,
+                device: PiDeviceAddress::RomOffset(0x10),
                 len: 4,
             })
             .unwrap();

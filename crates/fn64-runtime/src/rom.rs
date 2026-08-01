@@ -177,25 +177,24 @@ impl DmaMemory for ProcessDmaMemory<'_> {
     }
 }
 
-/// Base of the PI **domain-2 address space** (the SRAM/save cartridge
-/// domain). A PI DMA whose `devAddr` is `>= this` is a SAVE access, not a
-/// cartridge-ROM read, and must route to `SaveStorage` (offset = `devAddr -
-/// SRAM_DOMAIN2_BASE`), NOT the ROM image.
+/// Unambiguous device-relative address carried by every PI transfer.
 ///
-/// Byte-cited: OoT decomp `include/ultra64/rcp.h:714`
-/// `#define PI_DOM2_ADDR2 0x08000000 /* to 0x0FFFFFFF */` -- the domain-2
-/// address space (SRAM cartridge base). OoT's `SsSram_ReadWrite` passes
-/// `OS_K1_TO_PHYSICAL(0xA8000000)` = `0xA8000000 - 0xA0000000` = `0x08000000`
-/// as the DMA `devAddr` (decomp `z_sram.c:672`, recomp
-/// `games/OOTU/RecompiledFuncs/funcs_34.c:10632` `a0 = 0x800 << 16`). This is
-/// distinct from the domain-2 *register* base `0x05000000`
-/// (`PI_BSD_DOM2_LAT_REG`); the SRAM *data* transfer targets `0x08000000`.
-pub const SRAM_DOMAIN2_BASE: u32 = 0x0800_0000;
+/// ROM offsets can exceed the numeric base of the raw SRAM physical window, so
+/// a scalar threshold cannot distinguish a large ROM from a save transfer.
+/// The public libultra PI manuals keep the cartridge handle/domain separate
+/// from `devAddr`; this type preserves that distinction after address decoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PiDeviceAddress {
+    RomOffset(u32),
+    SramOffset(u32),
+}
 
-/// Is this PI-DMA `devAddr` a domain-2 (SRAM/save) access rather than a
-/// cartridge-ROM read? See `SRAM_DOMAIN2_BASE`.
-pub fn is_sram_dev_addr(dev_addr: u32) -> bool {
-    dev_addr >= SRAM_DOMAIN2_BASE
+impl PiDeviceAddress {
+    pub const fn offset(self) -> u32 {
+        match self {
+            Self::RomOffset(offset) | Self::SramOffset(offset) => offset,
+        }
+    }
 }
 
 /// A read-only byte source for cartridge-domain PI reads. `fn64-shell` (or a
@@ -279,22 +278,21 @@ impl RomStorage for InMemoryRom {
 pub struct DmaCompletion {
     pub direction: DmaDirection,
     pub dram_addr: RdramAddr,
-    pub dev_addr: u32,
+    pub device: PiDeviceAddress,
     pub len: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PiDmaError {
-    ReadOnlyDevice { dev_addr: u32 },
+    ReadOnlyDevice { device: PiDeviceAddress },
 }
 
 impl std::fmt::Display for PiDmaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::ReadOnlyDevice { dev_addr } => write!(
-                f,
-                "PI write targets read-only cartridge ROM at device address {dev_addr:#010x}"
-            ),
+            Self::ReadOnlyDevice { device } => {
+                write!(f, "PI write targets read-only cartridge ROM at {device:?}")
+            }
         }
     }
 }
@@ -350,7 +348,7 @@ impl<R: RomStorage> PiDma<R> {
     }
 
     /// Register the domain-2 (SRAM/EEPROM/Flash) save-backing store this PI
-    /// engine routes `devAddr >= SRAM_DOMAIN2_BASE` DMAs to. Mirrors how the
+    /// engine routes [`PiDeviceAddress::SramOffset`] DMAs to. Mirrors how the
     /// ROM is installed at construction -- the harness/`fn64-shell` supplies
     /// an `InMemorySaveStorage`/`FileSaveStorage` of the game's save size.
     pub fn set_save(&mut self, save: Box<dyn SaveStorage>) {
@@ -386,9 +384,10 @@ impl<R: RomStorage> PiDma<R> {
     }
 
     pub(crate) fn record_sram_dma_commit(&mut self, at: Cycles, completion: DmaCompletion) {
-        if !is_sram_dev_addr(completion.dev_addr)
-            || self.save_len() != Some(SaveType::SramBanked.byte_len())
-        {
+        let PiDeviceAddress::SramOffset(offset) = completion.device else {
+            return;
+        };
+        if self.save_len() != Some(SaveType::SramBanked.byte_len()) {
             return;
         }
         self.save_operations.push(SaveOperationEvent {
@@ -398,7 +397,7 @@ impl<R: RomStorage> PiDma<R> {
                 DmaDirection::ToRdram => SaveOperationKind::Read,
                 DmaDirection::FromRdram => SaveOperationKind::Write,
             },
-            offset: completion.dev_addr - SRAM_DOMAIN2_BASE,
+            offset,
             len: completion.len,
         });
     }
@@ -521,7 +520,7 @@ impl<R: RomStorage> PiDma<R> {
     fn save_mut(&mut self, dir: &str) -> &mut dyn SaveStorage {
         self.save.as_deref_mut().unwrap_or_else(|| {
             panic!(
-                "PiDma: a domain-2 (SRAM, devAddr >= {SRAM_DOMAIN2_BASE:#x}) {dir} DMA arrived \
+                "PiDma: a domain-2 SRAM {dir} DMA arrived \
                  but no save store is registered -- call PiDma::set_save(..) with the game's \
                  save-backing store before any save-domain DMA (see set_save's doc comment). \
                  This is a harness wiring bug, not something to silently route to the ROM image."
@@ -546,8 +545,8 @@ impl<R: RomStorage> PiDma<R> {
         (start, device_len)
     }
 
-    /// Read `buf.len()` SRAM bytes at `sram_offset` (already `devAddr -
-    /// SRAM_DOMAIN2_BASE`) into `buf` as FLAT bytes -- the save chip is a
+    /// Read `buf.len()` SRAM bytes at the device-relative `sram_offset`
+    /// carried by [`PiDeviceAddress::SramOffset`] into `buf` as FLAT bytes -- the save chip is a
     /// plain byte buffer. The caller word-swizzles into rdram (see
     /// `osEPiStartDma_recomp`), exactly like a ROM DMA-in, because the guest
     /// reads the destination back via `MEM_BU` (`^3` byte-lane XOR, recomp.h)
@@ -562,8 +561,8 @@ impl<R: RomStorage> PiDma<R> {
         }
     }
 
-    /// Write FLAT `data` bytes to the save chip at `sram_offset` (already
-    /// `devAddr - SRAM_DOMAIN2_BASE`). The caller un-swizzles rdram's
+    /// Write FLAT `data` bytes to the save chip at the device-relative
+    /// `sram_offset` carried by [`PiDeviceAddress::SramOffset`]. The caller un-swizzles rdram's
     /// native-word bytes back to flat save order first (see
     /// `osEPiStartDma_recomp`'s FromRdram arm).
     pub fn sram_write_from(&mut self, sram_offset: u32, data: &[u8]) {
@@ -610,20 +609,20 @@ impl<R: RomStorage> PiDma<R> {
     /// cannot call `start_dma` (which takes `&mut Rdram`). Same underlying
     /// `RomStorage::read_into` contract (loud panic on an out-of-range
     /// read, never a silent short-read).
-    pub fn read_rom_bytes(&self, dev_addr: u32, buf: &mut [u8]) {
-        self.rom.read_into(dev_addr, buf);
+    pub fn read_rom_bytes(&self, rom_offset: u32, buf: &mut [u8]) {
+        self.rom.read_into(rom_offset, buf);
     }
 
     /// `osEPiStartDma(handle, mb, direction)`'s core transfer, once the
     /// caller (`fn64-abi`'s shim) has decoded the `OSIoMesg`, formed the
-    /// public `handle->baseAddress | devAddr`, normalized the supported
-    /// Game Pak/SRAM physical spaces into this engine's address convention,
+    /// public `handle->baseAddress | devAddr`, and classified the supported
+    /// Game Pak/SRAM physical spaces into an explicit device-relative address,
     /// and applied the handle timing to `DeviceFabric`'s raw PI registers.
     /// Keeping handle parsing above this storage primitive lets managed/raw
     /// EPI and programmed I/O share one authority without teaching the
     /// runtime core about guest C-struct layout.
     ///
-    /// Copies `len` ROM bytes starting at `dev_addr` into `rdram` at
+    /// Copies `len` device bytes starting at `device` into `rdram` at
     /// `dram_addr`, matching real cartridge-domain PI DMA's actual effect --
     /// This primitive runs synchronously only after `DeviceFabric` reaches
     /// the scheduled deadline; callers must not use it as the public start
@@ -633,10 +632,10 @@ impl<R: RomStorage> PiDma<R> {
         rdram: &mut M,
         direction: DmaDirection,
         dram_addr: RdramAddr,
-        dev_addr: u32,
+        device: PiDeviceAddress,
         len: u32,
     ) -> DmaCompletion {
-        self.try_start_dma(rdram, direction, dram_addr, dev_addr, len)
+        self.try_start_dma(rdram, direction, dram_addr, device, len)
             .unwrap_or_else(|error| panic!("PiDma::start_dma: {error}"))
     }
 
@@ -647,23 +646,22 @@ impl<R: RomStorage> PiDma<R> {
         rdram: &mut M,
         direction: DmaDirection,
         dram_addr: RdramAddr,
-        dev_addr: u32,
+        device: PiDeviceAddress,
         len: u32,
     ) -> Result<DmaCompletion, PiDmaError> {
         let base = dram_addr.offset() as usize;
-        match (direction, is_sram_dev_addr(dev_addr)) {
+        match (direction, device) {
             // Cartridge-ROM read: big-endian ROM bytes swizzled into rdram's
             // native-word storage (dma_write_bytes does the swizzle).
-            (DmaDirection::ToRdram, false) => {
+            (DmaDirection::ToRdram, PiDeviceAddress::RomOffset(rom_offset)) => {
                 let mut buf = vec![0u8; len as usize];
-                self.rom.read_into(dev_addr, &mut buf);
+                self.rom.read_into(rom_offset, &mut buf);
                 rdram.dma_write_bytes(DmaWriterChannel::Pi, base, &buf);
             }
             // Domain-2 SRAM READ (device -> RDRAM): flat save bytes swizzled
             // into rdram the SAME way as a ROM DMA, because the guest reads the
             // destination via MEM_BU (`^3` XOR) -- see sram_read_into's doc.
-            (DmaDirection::ToRdram, true) => {
-                let sram_offset = dev_addr - SRAM_DOMAIN2_BASE;
+            (DmaDirection::ToRdram, PiDeviceAddress::SramOffset(sram_offset)) => {
                 let mut buf = vec![0u8; len as usize];
                 self.sram_read_into(sram_offset, &mut buf);
                 rdram.dma_write_bytes(DmaWriterChannel::Pi, base, &buf);
@@ -671,22 +669,21 @@ impl<R: RomStorage> PiDma<R> {
             // Domain-2 SRAM WRITE (RDRAM -> device): rdram holds native-word-
             // swizzled bytes; un-swizzle back to flat save order (the inverse
             // of dma_write_bytes) before writing the save chip.
-            (DmaDirection::FromRdram, true) => {
+            (DmaDirection::FromRdram, PiDeviceAddress::SramOffset(sram_offset)) => {
                 // Un-swizzle native-word rdram back to flat save order via the
                 // per-byte inverse (`flat[k] = rdram[(base+k)^3]`), correct for
                 // any offset/length -- no word-alignment requirement.
                 let flat = rdram.dma_read_bytes_flat(base, len as usize);
-                let sram_offset = dev_addr - SRAM_DOMAIN2_BASE;
                 self.sram_write_from(sram_offset, &flat);
             }
-            (DmaDirection::FromRdram, false) => {
-                return Err(PiDmaError::ReadOnlyDevice { dev_addr });
+            (DmaDirection::FromRdram, PiDeviceAddress::RomOffset(_)) => {
+                return Err(PiDmaError::ReadOnlyDevice { device });
             }
         }
         Ok(DmaCompletion {
             direction,
             dram_addr,
-            dev_addr,
+            device,
             len,
         })
     }
@@ -778,7 +775,7 @@ mod tests {
             &mut rdram,
             DmaDirection::ToRdram,
             RdramAddr::from_offset(0x20),
-            0x10,
+            PiDeviceAddress::RomOffset(0x10),
             4,
         );
 
@@ -810,7 +807,7 @@ mod tests {
             &mut rdram,
             DmaDirection::ToRdram,
             RdramAddr::from_offset(0x20),
-            0x10,
+            PiDeviceAddress::RomOffset(0x10),
             6, // NON-word-aligned length
         );
 
@@ -999,7 +996,7 @@ mod tests {
             &mut rdram,
             DmaDirection::FromRdram,
             RdramAddr::from_offset(0x40),
-            SRAM_DOMAIN2_BASE + 0x10,
+            PiDeviceAddress::SramOffset(0x10),
             8,
         );
 
@@ -1009,7 +1006,7 @@ mod tests {
             &mut rdram,
             DmaDirection::ToRdram,
             RdramAddr::from_offset(0x80),
-            SRAM_DOMAIN2_BASE + 0x10,
+            PiDeviceAddress::SramOffset(0x10),
             8,
         );
         for (k, &b) in src.iter().enumerate() {
@@ -1028,8 +1025,8 @@ mod tests {
 
     #[test]
     fn sram_dma_reads_save_store_not_rom() {
-        // A domain-2 devAddr must NOT read the ROM image. Fill ROM and SRAM
-        // with distinguishable patterns; a ToRdram at SRAM_DOMAIN2_BASE must
+        // A typed SRAM transfer must NOT read the ROM image. Fill ROM and SRAM
+        // with distinguishable patterns; a typed SRAM transfer at offset zero must
         // deliver the SRAM byte, never the ROM byte at offset 0.
         let mut rom_bytes = vec![0u8; 0x100];
         rom_bytes[0] = 0xAA; // ROM byte at offset 0
@@ -1043,7 +1040,7 @@ mod tests {
             &mut rdram,
             DmaDirection::ToRdram,
             RdramAddr::from_offset(0x40),
-            SRAM_DOMAIN2_BASE, // offset 0 in the SRAM domain
+            PiDeviceAddress::SramOffset(0),
             4,
         );
         // MEM_BU(0x40) is the FIRST SRAM byte (0xC1), not the ROM byte (0xAA).
@@ -1108,10 +1105,12 @@ mod tests {
                 &mut rdram,
                 DmaDirection::FromRdram,
                 RdramAddr::from_offset(0x20),
-                0x10,
+                PiDeviceAddress::RomOffset(0x10),
                 4,
             ),
-            Err(PiDmaError::ReadOnlyDevice { dev_addr: 0x10 })
+            Err(PiDmaError::ReadOnlyDevice {
+                device: PiDeviceAddress::RomOffset(0x10)
+            })
         );
     }
 
@@ -1124,7 +1123,7 @@ mod tests {
             &mut rdram,
             DmaDirection::ToRdram,
             RdramAddr::from_offset(0x40),
-            SRAM_DOMAIN2_BASE,
+            PiDeviceAddress::SramOffset(0),
             4,
         );
     }

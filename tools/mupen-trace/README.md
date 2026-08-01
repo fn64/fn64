@@ -65,6 +65,27 @@ core.
   cycle-stamped device-event schema (PI/AI/SI DMA start/complete, MI
   interrupt raise/ack, VI retrace), read against mupen's own RCP register
   headers.
+  Timing schema v2 records all three PI-only fields explicitly. A PI start
+  carries `dma_direction` (`PI_WR_LEN` is `to_rdram`; `PI_RD_LEN` is
+  `from_rdram`), `pi_device` (`rom` for physical Domain1 Address2; `sram` for
+  physical Domain2 Address2), and `pi_offset` relative to that window. Its
+  completion reuses that complete start observation, but BUSY falling alone is
+  not accepted as completion because PI_STATUS reset also clears BUSY without
+  committing bytes. The same poll must observe a newly raised PI MI bit; an
+  already-pending PI bit or no new edge aborts the producer. A proven completion
+  is emitted before the matching `mi_raise`, preserving the fn64 event order.
+  Every non-PI event emits those three fields as JSON `null`; this is a
+  producer-output requirement pinned by the compiled C fixture. Rust ingestion
+  also rejects the producer's old schema-v1 header before interpreting any
+  optional payload fields.
+  The public debugger can expose only register readback, not the store that
+  triggered DMA. On the pinned core both PI length registers commonly read as
+  `0x7f` after the triggering store. If exactly one length register does not
+  claim the start, both claim it, the encoded length cannot become a nonzero
+  byte count, or the complete physical device range is outside one Address2
+  window, the producer emits an aborted timing terminator and exits loudly
+  before any PI start. A core-side emitter is required for runs where public
+  readback cannot establish that identity.
   - `FN64_CAPTURE_SECONDS=<n>` switches this producer to a full-speed mode:
     it drops `EnableDebugger` and runs `R4300Emulator=2` (dynarec) instead of
     the interpreter, driven by a wall-clock budget rather than a step count.
@@ -210,10 +231,11 @@ scripts/run-black-box-trace.zsh \
 
 This path produces executed-PC and watched-write observations only. It does
 **not** claim PI-DMA coverage. The public debugger reports PI length registers
-as their hardware readback values, not the completed transfer length, so
-`mupen_devtrace`'s headless-bridge mode aborts rather than fabricate DMA
-geometry. Its separate core-side emitter is not part of this public-interface
-pipeline. The resulting `trace.jsonl` is already the canonical trace schema;
+as their hardware readback values, not the completed transfer length, so both
+`mupen_devtrace` timing v2 and its separate headless-bridge mode abort rather
+than fabricate DMA geometry when the readback is ambiguous. Its separate
+core-side emitter is not part of this public-interface pipeline. The resulting
+`trace.jsonl` is already the canonical trace schema;
 the discover ingestion pass is its strict normalization/ROM-binding gate, not
 a lossy format adapter. The summary proves ingestion and fact folding ran but
 is not a full discovery artifact or pack-admission authority.

@@ -513,7 +513,7 @@ mod tests {
             let pi_request = PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0x20),
-                cart_addr: 0x1000_0000,
+                device: fn64_runtime::PiDeviceAddress::RomOffset(0),
                 len: 0x20,
             };
             host.pending_pi_completions.push_back(PendingPiCompletion {

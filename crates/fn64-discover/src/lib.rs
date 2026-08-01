@@ -194,9 +194,10 @@
 //! - [`timing_diff`]: the differential timing comparator -- diffs fn64's
 //!   device-event stream against a reference emulator's under a two-tier
 //!   tolerance (zero-tolerance event ORDERING; a per-device cycle-count BAND),
-//!   reporting the first divergence. Never runs an emulator; consumes two
-//!   ingested [`timing_trace`] streams. The acceptance gate for every timing
-//!   refinement item.
+//!   reporting the first divergence. Agreement additionally requires both
+//!   ingested [`timing_trace`] streams to carry successful completion; aborted
+//!   captures cannot agree. Never runs an emulator. The acceptance gate for
+//!   every timing refinement item.
 //!
 //! Dynamic indirect observations/callback-field semantics (Phase 6/7) and
 //! assembly verification (Phase 8) are not yet implemented.

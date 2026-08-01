@@ -15,8 +15,9 @@
 //! an INDEPENDENT reference emulator's (a C program reading a different core's
 //! registers — see the design spec's `mupen_devtrace.c` component). So this
 //! schema is deliberately decoupled from every fn64 internal type: a record is
-//! six plain scalars — a string `event_kind`, a string `device`, a `u64`
-//! cycle, two `u32` payload fields, and a `u64` ordinal. There is no
+//! plain wire enums and integers. PI DMA records include direction plus an
+//! explicit ROM/SRAM variant and device-relative offset; other records leave
+//! those PI-only fields null. There is no
 //! `RdramAddr`, no `Cycles`, no `DeviceTraceKind` on the wire. A C producer
 //! emits the exact same JSONL; the [`crate::timing_trace::capture`] tap
 //! (Rust) emits it from fn64's fabric. Neither is privileged.
@@ -39,10 +40,10 @@ use std::io::BufRead;
 
 /// Independent of [`crate::trace::TRACE_SCHEMA_VERSION`]: the device-timing
 /// schema evolves on its own cadence.
-pub const DEVICE_TRACE_SCHEMA_VERSION: u32 = 1;
+pub const DEVICE_TRACE_SCHEMA_VERSION: u32 = 2;
 
 /// Shared with [`crate::trace::MAX_JSONL_RECORD_BYTES`] in spirit: a single
-/// JSONL device record is tiny (six scalars), so a generous cap still fails
+/// JSONL device record is tiny, so a generous cap still fails
 /// loudly on a corrupt or concatenated stream.
 pub const MAX_JSONL_RECORD_BYTES: usize = 1024 * 1024;
 
@@ -59,6 +60,20 @@ pub enum TimingDevice {
     Dp,
     Vi,
     Mi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingDmaDirection {
+    ToRdram,
+    FromRdram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimingPiDevice {
+    Rom,
+    Sram,
 }
 
 /// The class of cycle-stamped device event. Serialized as a lowercase string,
@@ -141,6 +156,12 @@ pub enum DeviceTraceRecord {
         addr_or_source: u32,
         /// Per-kind: a byte length, or 0.
         value_or_len: u32,
+        /// Required only for PI DMA events.
+        dma_direction: Option<TimingDmaDirection>,
+        /// Required only for PI DMA events; distinguishes equal ROM/SRAM offsets.
+        pi_device: Option<TimingPiDevice>,
+        /// Required only for PI DMA events; relative to the selected device.
+        pi_offset: Option<u32>,
     },
     End {
         ordinal: u64,
@@ -183,6 +204,9 @@ pub struct DeviceEvent {
     pub cycle: u64,
     pub addr_or_source: u32,
     pub value_or_len: u32,
+    pub dma_direction: Option<TimingDmaDirection>,
+    pub pi_device: Option<TimingPiDevice>,
+    pub pi_offset: Option<u32>,
 }
 
 /// The result of ingesting one complete device-timing trace.
@@ -233,6 +257,31 @@ fn validate_nonempty(line: usize, label: &str, value: &str) -> Result<(), Device
         ))
     } else {
         Ok(())
+    }
+}
+
+fn validate_pi_payload(
+    line: usize,
+    event_kind: TimingEventKind,
+    device: TimingDevice,
+    dma_direction: Option<TimingDmaDirection>,
+    pi_device: Option<TimingPiDevice>,
+    pi_offset: Option<u32>,
+) -> Result<(), DeviceTraceIngestError> {
+    let is_pi_dma = device == TimingDevice::Pi
+        && matches!(
+            event_kind,
+            TimingEventKind::DmaStart | TimingEventKind::DmaComplete
+        );
+    let complete = dma_direction.is_some() && pi_device.is_some() && pi_offset.is_some();
+    let absent = dma_direction.is_none() && pi_device.is_none() && pi_offset.is_none();
+    if (is_pi_dma && complete) || (!is_pi_dma && absent) {
+        Ok(())
+    } else {
+        Err(DeviceTraceIngestError::at(
+            line,
+            "PI DMA direction/device/offset must be present together only on PI DMA events",
+        ))
     }
 }
 
@@ -338,7 +387,18 @@ pub fn ingest_jsonl<R: BufRead>(
                 cycle,
                 addr_or_source,
                 value_or_len,
+                dma_direction,
+                pi_device,
+                pi_offset,
             } => {
+                validate_pi_payload(
+                    line_number,
+                    event_kind,
+                    device,
+                    dma_direction,
+                    pi_device,
+                    pi_offset,
+                )?;
                 events.push(DeviceEvent {
                     ordinal,
                     event_kind,
@@ -346,6 +406,9 @@ pub fn ingest_jsonl<R: BufRead>(
                     cycle,
                     addr_or_source,
                     value_or_len,
+                    dma_direction,
+                    pi_device,
+                    pi_offset,
                 });
             }
             DeviceTraceRecord::End {
@@ -378,6 +441,37 @@ pub fn to_jsonl(records: &[DeviceTraceRecord]) -> Result<String, serde_json::Err
         out.push('\n');
     }
     Ok(out)
+}
+
+fn pi_timing_payload(
+    event_kind: TimingEventKind,
+    request: fn64_runtime::PiDmaRequest,
+) -> (
+    TimingEventKind,
+    TimingDevice,
+    u32,
+    u32,
+    Option<TimingDmaDirection>,
+    Option<TimingPiDevice>,
+    Option<u32>,
+) {
+    let direction = match request.direction {
+        fn64_runtime::DmaDirection::ToRdram => TimingDmaDirection::ToRdram,
+        fn64_runtime::DmaDirection::FromRdram => TimingDmaDirection::FromRdram,
+    };
+    let (device, offset) = match request.device {
+        fn64_runtime::PiDeviceAddress::RomOffset(offset) => (TimingPiDevice::Rom, offset),
+        fn64_runtime::PiDeviceAddress::SramOffset(offset) => (TimingPiDevice::Sram, offset),
+    };
+    (
+        event_kind,
+        TimingDevice::Pi,
+        request.dram_addr.offset(),
+        request.len,
+        Some(direction),
+        Some(device),
+        Some(offset),
+    )
 }
 
 /// The fn64-side capture tap: turn one run of a
@@ -440,35 +534,43 @@ pub fn capture(
 
     for event in fabric_trace {
         let cycle = event.at.get();
-        // (event_kind, device, addr_or_source, value_or_len)
-        let mapped: Option<(TimingEventKind, TimingDevice, u32, u32)> = match event.kind {
-            DeviceTraceKind::PiDmaStarted(request) => Some((
-                TimingEventKind::DmaStart,
-                TimingDevice::Pi,
-                request.dram_addr.offset(),
-                request.len,
-            )),
+        // (event kind, device, address, length, PI direction/device/offset)
+        let mapped: Option<(
+            TimingEventKind,
+            TimingDevice,
+            u32,
+            u32,
+            Option<TimingDmaDirection>,
+            Option<TimingPiDevice>,
+            Option<u32>,
+        )> = match event.kind {
+            DeviceTraceKind::PiDmaStarted(request) => {
+                Some(pi_timing_payload(TimingEventKind::DmaStart, request))
+            }
             // Bytes-committed carries the request payload and is stamped at the
             // completion cycle; the following PiBusyCleared shares that cycle
             // and is dropped as redundant.
-            DeviceTraceKind::PiBytesCommitted(request) => Some((
-                TimingEventKind::DmaComplete,
-                TimingDevice::Pi,
-                request.dram_addr.offset(),
-                request.len,
-            )),
+            DeviceTraceKind::PiBytesCommitted(request) => {
+                Some(pi_timing_payload(TimingEventKind::DmaComplete, request))
+            }
             DeviceTraceKind::PiBusyCleared => None,
             DeviceTraceKind::AiDmaStarted(request) => Some((
                 TimingEventKind::DmaStart,
                 TimingDevice::Ai,
                 request.dram_addr.offset(),
                 request.len,
+                None,
+                None,
+                None,
             )),
             DeviceTraceKind::AiDmaComplete(request) => Some((
                 TimingEventKind::DmaComplete,
                 TimingDevice::Ai,
                 request.dram_addr.offset(),
                 request.len,
+                None,
+                None,
+                None,
             )),
             DeviceTraceKind::SiDmaStarted(request) => Some((
                 TimingEventKind::DmaStart,
@@ -477,12 +579,18 @@ pub fn capture(
                 // SI transfers are the fixed 64-byte PIF window; length is not
                 // carried per-request, so 0 marks "SI's fixed window".
                 0,
+                None,
+                None,
+                None,
             )),
             DeviceTraceKind::SiBytesCommitted(request) => Some((
                 TimingEventKind::DmaComplete,
                 TimingDevice::Si,
                 request.dram_addr.offset(),
                 0,
+                None,
+                None,
+                None,
             )),
             DeviceTraceKind::SiBusyCleared => None,
             DeviceTraceKind::SpDmaStarted(request) => Some((
@@ -490,12 +598,18 @@ pub fn capture(
                 TimingDevice::Sp,
                 request.dram_addr.offset(),
                 request.total_bytes() as u32,
+                None,
+                None,
+                None,
             )),
             DeviceTraceKind::SpDmaBytesCommitted(request) => Some((
                 TimingEventKind::DmaComplete,
                 TimingDevice::Sp,
                 request.dram_addr.offset(),
                 request.total_bytes() as u32,
+                None,
+                None,
+                None,
             )),
             // SP DMA queue admission and busy-clear are scheduling bookkeeping,
             // not a distinct timed transfer edge.
@@ -505,16 +619,28 @@ pub fn capture(
                 TimingDevice::Mi,
                 source_bit(source),
                 0,
+                None,
+                None,
+                None,
             )),
             DeviceTraceKind::MiInterruptCleared(source) => Some((
                 TimingEventKind::MiAck,
                 TimingDevice::Mi,
                 source_bit(source),
                 0,
+                None,
+                None,
+                None,
             )),
-            DeviceTraceKind::ViInterrupt => {
-                Some((TimingEventKind::ViRetrace, TimingDevice::Vi, 0, 0))
-            }
+            DeviceTraceKind::ViInterrupt => Some((
+                TimingEventKind::ViRetrace,
+                TimingDevice::Vi,
+                0,
+                0,
+                None,
+                None,
+                None,
+            )),
             // Out-of-scope-for-this-increment fabric bookkeeping.
             DeviceTraceKind::SpTaskAdmitted { .. }
             | DeviceTraceKind::RcpTaskStarted { .. }
@@ -522,7 +648,16 @@ pub fn capture(
             | DeviceTraceKind::NotificationReady(_) => None,
         };
 
-        if let Some((event_kind, device, addr_or_source, value_or_len)) = mapped {
+        if let Some((
+            event_kind,
+            device,
+            addr_or_source,
+            value_or_len,
+            dma_direction,
+            pi_device,
+            pi_offset,
+        )) = mapped
+        {
             records.push(DeviceTraceRecord::DeviceEvent {
                 ordinal,
                 event_kind,
@@ -530,6 +665,9 @@ pub fn capture(
                 cycle,
                 addr_or_source,
                 value_or_len,
+                dma_direction,
+                pi_device,
+                pi_offset,
             });
             ordinal += 1;
         }
@@ -567,6 +705,9 @@ mod tests {
                 cycle: 100,
                 addr_or_source: 0x20,
                 value_or_len: 64,
+                dma_direction: Some(TimingDmaDirection::ToRdram),
+                pi_device: Some(TimingPiDevice::Rom),
+                pi_offset: Some(0x10),
             },
             DeviceTraceRecord::DeviceEvent {
                 ordinal: 2,
@@ -575,6 +716,9 @@ mod tests {
                 cycle: 112,
                 addr_or_source: 0x20,
                 value_or_len: 64,
+                dma_direction: Some(TimingDmaDirection::ToRdram),
+                pi_device: Some(TimingPiDevice::Rom),
+                pi_offset: Some(0x10),
             },
             DeviceTraceRecord::DeviceEvent {
                 ordinal: 3,
@@ -583,6 +727,9 @@ mod tests {
                 cycle: 112,
                 addr_or_source: 1 << 4, // MI_INTR PI source bit
                 value_or_len: 0,
+                dma_direction: None,
+                pi_device: None,
+                pi_offset: None,
             },
             DeviceTraceRecord::End {
                 ordinal: 4,
@@ -610,6 +757,41 @@ mod tests {
     }
 
     #[test]
+    fn schema_v2_distinguishes_equal_pi_offsets_and_rejects_partial_payloads() {
+        let records = |pi_device| {
+            vec![
+                header(),
+                DeviceTraceRecord::DeviceEvent {
+                    ordinal: 1,
+                    event_kind: TimingEventKind::DmaStart,
+                    device: TimingDevice::Pi,
+                    cycle: 7,
+                    addr_or_source: 0x20,
+                    value_or_len: 4,
+                    dma_direction: Some(TimingDmaDirection::ToRdram),
+                    pi_device,
+                    pi_offset: Some(0x10),
+                },
+                DeviceTraceRecord::End {
+                    ordinal: 2,
+                    completion: DeviceTraceCompletion::Completed,
+                },
+            ]
+        };
+        let rom = to_jsonl(&records(Some(TimingPiDevice::Rom))).unwrap();
+        let sram = to_jsonl(&records(Some(TimingPiDevice::Sram))).unwrap();
+        assert_ne!(rom, sram);
+        assert_ne!(
+            ingest_jsonl(Cursor::new(rom)).unwrap().events,
+            ingest_jsonl(Cursor::new(sram)).unwrap().events
+        );
+
+        let partial = to_jsonl(&records(None)).unwrap();
+        let error = ingest_jsonl(Cursor::new(partial)).unwrap_err();
+        assert!(error.message.contains("must be present together"));
+    }
+
+    #[test]
     fn rejects_ordinal_gaps_and_records_after_end() {
         let gap = to_jsonl(&[
             header(),
@@ -620,6 +802,9 @@ mod tests {
                 cycle: 5,
                 addr_or_source: 0,
                 value_or_len: 0,
+                dma_direction: None,
+                pi_device: None,
+                pi_offset: None,
             },
         ])
         .unwrap();
@@ -639,6 +824,9 @@ mod tests {
                 cycle: 5,
                 addr_or_source: 0,
                 value_or_len: 0,
+                dma_direction: None,
+                pi_device: None,
+                pi_offset: None,
             },
         ])
         .unwrap();
@@ -655,6 +843,9 @@ mod tests {
             cycle: 1,
             addr_or_source: 0,
             value_or_len: 0,
+            dma_direction: None,
+            pi_device: None,
+            pi_offset: None,
         }])
         .unwrap();
         let err = ingest_jsonl(Cursor::new(no_header)).unwrap_err();
@@ -703,7 +894,7 @@ mod tests {
             let request = PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0x20),
-                cart_addr: 0x10,
+                device: fn64_runtime::PiDeviceAddress::RomOffset(0x10),
                 len: 4,
             };
             fabric.start_pi_dma(request).unwrap();
@@ -731,11 +922,39 @@ mod tests {
             // The exact expected cycle-stamped device-event stream. This is
             // the whole point: the tap must reproduce the fabric's real
             // ordering and cycles, never fabricate.
-            let expected: Vec<(TimingEventKind, TimingDevice, u64, u32, u32)> = vec![
+            type EventTuple = (
+                TimingEventKind,
+                TimingDevice,
+                u64,
+                u32,
+                u32,
+                Option<TimingDmaDirection>,
+                Option<TimingPiDevice>,
+                Option<u32>,
+            );
+            let expected: Vec<EventTuple> = vec![
                 // PI DMA started at cycle 0, DRAM 0x20, 4 bytes.
-                (TimingEventKind::DmaStart, TimingDevice::Pi, 0, 0x20, 4),
+                (
+                    TimingEventKind::DmaStart,
+                    TimingDevice::Pi,
+                    0,
+                    0x20,
+                    4,
+                    Some(TimingDmaDirection::ToRdram),
+                    Some(TimingPiDevice::Rom),
+                    Some(0x10),
+                ),
                 // PI DMA completed at cycle 12 (start + fixed 12-cycle latency).
-                (TimingEventKind::DmaComplete, TimingDevice::Pi, 12, 0x20, 4),
+                (
+                    TimingEventKind::DmaComplete,
+                    TimingDevice::Pi,
+                    12,
+                    0x20,
+                    4,
+                    Some(TimingDmaDirection::ToRdram),
+                    Some(TimingPiDevice::Rom),
+                    Some(0x10),
+                ),
                 // The PI completion raised the PI MI line, at the same cycle 12.
                 (
                     TimingEventKind::MiRaise,
@@ -743,6 +962,9 @@ mod tests {
                     12,
                     InterruptSource::Pi.bit(),
                     0,
+                    None,
+                    None,
+                    None,
                 ),
                 // The independent VI raise/ack, both at cycle 12.
                 (
@@ -751,6 +973,9 @@ mod tests {
                     12,
                     InterruptSource::Vi.bit(),
                     0,
+                    None,
+                    None,
+                    None,
                 ),
                 (
                     TimingEventKind::MiAck,
@@ -758,10 +983,13 @@ mod tests {
                     12,
                     InterruptSource::Vi.bit(),
                     0,
+                    None,
+                    None,
+                    None,
                 ),
             ];
 
-            let actual: Vec<(TimingEventKind, TimingDevice, u64, u32, u32)> = ingest
+            let actual: Vec<EventTuple> = ingest
                 .events
                 .iter()
                 .map(|e| {
@@ -771,6 +999,9 @@ mod tests {
                         e.cycle,
                         e.addr_or_source,
                         e.value_or_len,
+                        e.dma_direction,
+                        e.pi_device,
+                        e.pi_offset,
                     )
                 })
                 .collect();
@@ -794,7 +1025,7 @@ mod tests {
                 let request = PiDmaRequest {
                     direction: DmaDirection::ToRdram,
                     dram_addr: RdramAddr::from_offset(0x20),
-                    cart_addr: 0x10,
+                    device: fn64_runtime::PiDeviceAddress::RomOffset(0x10),
                     len: 4,
                 };
                 fabric.start_pi_dma(request).unwrap();
