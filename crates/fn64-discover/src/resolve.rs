@@ -202,6 +202,89 @@ pub struct ClosureResult {
     pub indirect: Vec<IndirectResolution>,
 }
 
+/// The statically established callee set at one reachable call boundary.
+///
+/// Direct calls always carry one target. Resolved indirect calls retain their
+/// complete finite target set instead of selecting one target by registration
+/// or address order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CallBoundaryCalleeV1 {
+    Direct { target: u32 },
+    ResolvedIndirect { targets: Vec<u32> },
+}
+
+/// Public projection of one GPR's bounded abstract value at a call boundary.
+///
+/// Stack locations are symbolic: `root` identifies the analysis root/frame,
+/// not a runtime stack address. Consumers may compare two locations for exact
+/// identity but must not reinterpret either field as an RDRAM pointer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CallBoundaryValueV1 {
+    Concrete { values: Vec<u32> },
+    StackLocations { root: u32, offsets: Vec<i32> },
+    Open,
+}
+
+/// Reasons a diagnostic value projection is not an exact call operand proof.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallBoundaryValueBlockerV1 {
+    NoReachableObservation,
+    ValueOpen,
+    PathDisagreement,
+    RevisitWidened,
+    /// A load-image word is only an initial value. It may have changed before
+    /// the call, so even a singleton diagnostic value is not exact authority.
+    MutableStaticMemorySource {
+        addresses: Vec<u32>,
+    },
+}
+
+/// One requested register projected without exposing the resolver's mutable
+/// internal state. Empty `blockers` is the only exact proof state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallBoundaryRegisterProofV1 {
+    pub register: u8,
+    pub value: CallBoundaryValueV1,
+    pub memory_sources: Vec<u32>,
+    pub through_memory: bool,
+    pub blockers: Vec<CallBoundaryValueBlockerV1>,
+}
+
+impl CallBoundaryRegisterProofV1 {
+    pub fn exact_concrete_values(&self) -> Option<&[u32]> {
+        if !self.blockers.is_empty() {
+            return None;
+        }
+        match &self.value {
+            CallBoundaryValueV1::Concrete { values } => Some(values),
+            CallBoundaryValueV1::StackLocations { .. } | CallBoundaryValueV1::Open => None,
+        }
+    }
+}
+
+/// Exact bounded register state after a call's delay slot and before applying
+/// the unknown callee's effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallBoundaryProofV1 {
+    pub site_pc: u32,
+    pub callee: CallBoundaryCalleeV1,
+    pub registers: Vec<CallBoundaryRegisterProofV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallBoundaryAnalysisV1 {
+    pub requested_registers: Vec<u8>,
+    pub calls: Vec<CallBoundaryProofV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallBoundaryAnalysisErrorV1 {
+    InvalidRegister { register: u8 },
+}
+
 /// One load-image word whose initial value has been admitted by the caller.
 ///
 /// Admission binds the expected bytes; it does **not** prove that the runtime
@@ -432,6 +515,21 @@ struct RawTlbTransferObservation {
     widened: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawCallRegisterObservation {
+    register: u8,
+    value: AbstractValue,
+    memory_sources: Vec<u32>,
+    through_memory: bool,
+    from_static_memory: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawCallBoundaryObservation {
+    registers: Vec<RawCallRegisterObservation>,
+    widened: bool,
+}
+
 /// Track register constants forward across a single straight-line block and,
 /// if that block ends in a `jr`/`jalr` whose register holds a known constant,
 /// return the resolved target. `None` when the terminating register's value
@@ -553,7 +651,7 @@ fn set(reg: &mut [Option<u32>; 32], i: u8, v: Option<u32>) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum AbstractValue {
     Unknown,
     Concrete(BTreeSet<u32>),
@@ -1612,6 +1710,7 @@ fn resolve_value_sets_from_roots(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1623,6 +1722,10 @@ fn resolve_value_sets_from_roots_observing(
     mut stores: Option<&mut BTreeMap<u32, BTreeSet<RawWordStoreObservation>>>,
     mut status_writes: Option<&mut BTreeMap<u32, BTreeSet<RawCop0StatusObservation>>>,
     mut tlb_transfers: Option<&mut BTreeMap<u32, Vec<RawTlbTransferObservation>>>,
+    mut call_boundaries: Option<(
+        &[u8],
+        &mut BTreeMap<u32, BTreeSet<RawCallBoundaryObservation>>,
+    )>,
 ) -> Vec<IndirectResolution> {
     let blocks: BTreeMap<u32, &BasicBlock> = cfg
         .blocks
@@ -1809,6 +1912,29 @@ fn resolve_value_sets_from_roots_observing(
                 | BlockTerminator::ResolvedIndirect { via_call: true, .. }
         );
         if is_call {
+            if let Some((requested_registers, observations)) = call_boundaries.as_mut() {
+                let registers = requested_registers
+                    .iter()
+                    .copied()
+                    .map(|register| {
+                        let value = &state.registers[register as usize];
+                        RawCallRegisterObservation {
+                            register,
+                            value: value.value.clone(),
+                            memory_sources: value.memory_sources.iter().copied().collect(),
+                            through_memory: value.through_memory,
+                            from_static_memory: value.from_static_memory,
+                        }
+                    })
+                    .collect();
+                observations
+                    .entry(transfer_pc.expect("call block includes control and delay words"))
+                    .or_default()
+                    .insert(RawCallBoundaryObservation {
+                        registers,
+                        widened: widened_visit,
+                    });
+            }
             state.clobber_callers();
         }
         for successor in block_successors(block) {
@@ -1875,6 +2001,206 @@ fn concrete_values(value: &TrackedValue) -> Option<Vec<u32>> {
     value
         .concrete_values()
         .map(|values| values.iter().copied().collect())
+}
+
+/// Project `$a0..$a3` at every proven-root-reachable direct or exhaustively
+/// resolved indirect call. Values are sampled after the architectural delay
+/// slot and before the unknown callee clobbers caller-owned state.
+pub fn analyze_call_boundaries(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+) -> CallBoundaryAnalysisV1 {
+    analyze_call_boundaries_from_roots(cfg, bank_bytes, va_start, &cfg.proven_roots)
+}
+
+/// `$a0..$a3` call-boundary projection rooted only at the supplied authority
+/// entries. This prevents an unrelated callable root from joining away the
+/// entry stub's symbolic stack identity.
+pub fn analyze_call_boundaries_from_roots(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+    analysis_roots: &[u32],
+) -> CallBoundaryAnalysisV1 {
+    analyze_call_boundary_registers_from_roots(
+        cfg,
+        bank_bytes,
+        va_start,
+        analysis_roots,
+        &[4, 5, 6, 7],
+    )
+    .expect("the o32 argument-register set is valid")
+}
+
+/// Call-boundary projection for a caller-selected bounded register set.
+/// Duplicate registers collapse and output is always register-sorted.
+pub fn analyze_call_boundary_registers(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+    requested_registers: &[u8],
+) -> Result<CallBoundaryAnalysisV1, CallBoundaryAnalysisErrorV1> {
+    analyze_call_boundary_registers_from_roots(
+        cfg,
+        bank_bytes,
+        va_start,
+        &cfg.proven_roots,
+        requested_registers,
+    )
+}
+
+/// Requested-register form rooted only at the supplied authority entries.
+pub fn analyze_call_boundary_registers_from_roots(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+    analysis_roots: &[u32],
+    requested_registers: &[u8],
+) -> Result<CallBoundaryAnalysisV1, CallBoundaryAnalysisErrorV1> {
+    let requested_registers = requested_registers.iter().copied().collect::<BTreeSet<_>>();
+    if let Some(register) = requested_registers
+        .iter()
+        .copied()
+        .find(|register| *register >= 32)
+    {
+        return Err(CallBoundaryAnalysisErrorV1::InvalidRegister { register });
+    }
+    let requested_registers = requested_registers.into_iter().collect::<Vec<_>>();
+
+    let mut callees = BTreeMap::new();
+    for block in &cfg.blocks {
+        let Some(site_pc) = block.end_va.checked_sub(8) else {
+            continue;
+        };
+        let callee = match &block.terminator {
+            BlockTerminator::Call { target, .. } => {
+                Some(CallBoundaryCalleeV1::Direct { target: *target })
+            }
+            BlockTerminator::ResolvedIndirect {
+                targets,
+                via_call: true,
+            } => {
+                let targets = targets.iter().copied().collect::<BTreeSet<_>>();
+                Some(CallBoundaryCalleeV1::ResolvedIndirect {
+                    targets: targets.into_iter().collect(),
+                })
+            }
+            _ => None,
+        };
+        if let Some(callee) = callee {
+            callees.insert(site_pc, callee);
+        }
+    }
+
+    let mut observations = BTreeMap::new();
+    let _ = resolve_value_sets_from_roots_observing(
+        cfg,
+        bank_bytes,
+        va_start,
+        analysis_roots,
+        None,
+        None,
+        None,
+        Some((&requested_registers, &mut observations)),
+    );
+
+    let mut calls = Vec::new();
+    for (site_pc, site_observations) in observations {
+        let Some(callee) = callees.get(&site_pc).cloned() else {
+            // Open indirect calls are observed by the shared engine but are
+            // intentionally outside this exact-callee API.
+            continue;
+        };
+        let registers = requested_registers
+            .iter()
+            .copied()
+            .map(|register| reduce_call_register_observations(register, &site_observations))
+            .collect();
+        calls.push(CallBoundaryProofV1 {
+            site_pc,
+            callee,
+            registers,
+        });
+    }
+    Ok(CallBoundaryAnalysisV1 {
+        requested_registers,
+        calls,
+    })
+}
+
+fn reduce_call_register_observations(
+    register: u8,
+    observations: &BTreeSet<RawCallBoundaryObservation>,
+) -> CallBoundaryRegisterProofV1 {
+    let register_observations = observations
+        .iter()
+        .filter_map(|observation| {
+            observation
+                .registers
+                .iter()
+                .find(|candidate| candidate.register == register)
+        })
+        .collect::<Vec<_>>();
+    let distinct = register_observations
+        .iter()
+        .map(|observation| (*observation).clone())
+        .collect::<BTreeSet<_>>();
+    let mut blockers = BTreeSet::new();
+    if register_observations.is_empty() {
+        blockers.insert(CallBoundaryValueBlockerV1::NoReachableObservation);
+    }
+    if observations.iter().any(|observation| observation.widened) {
+        blockers.insert(CallBoundaryValueBlockerV1::RevisitWidened);
+    }
+    if distinct.len() > 1 {
+        blockers.insert(CallBoundaryValueBlockerV1::PathDisagreement);
+    }
+    let mutable_sources = register_observations
+        .iter()
+        .filter(|observation| observation.from_static_memory)
+        .flat_map(|observation| observation.memory_sources.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if !mutable_sources.is_empty() {
+        blockers.insert(CallBoundaryValueBlockerV1::MutableStaticMemorySource {
+            addresses: mutable_sources.into_iter().collect(),
+        });
+    }
+
+    let value = if distinct.len() == 1 {
+        match &distinct.iter().next().unwrap().value {
+            AbstractValue::Concrete(values) => CallBoundaryValueV1::Concrete {
+                values: values.iter().copied().collect(),
+            },
+            AbstractValue::Stack { root, offsets } => CallBoundaryValueV1::StackLocations {
+                root: *root,
+                offsets: offsets.iter().copied().collect(),
+            },
+            AbstractValue::Unknown => {
+                blockers.insert(CallBoundaryValueBlockerV1::ValueOpen);
+                CallBoundaryValueV1::Open
+            }
+        }
+    } else {
+        blockers.insert(CallBoundaryValueBlockerV1::ValueOpen);
+        CallBoundaryValueV1::Open
+    };
+    let memory_sources = register_observations
+        .iter()
+        .flat_map(|observation| observation.memory_sources.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let through_memory = register_observations
+        .iter()
+        .any(|observation| observation.through_memory);
+    CallBoundaryRegisterProofV1 {
+        register,
+        value,
+        memory_sources,
+        through_memory,
+        blockers: blockers.into_iter().collect(),
+    }
 }
 
 /// Inventory every aligned `MTC0`/`DMTC0` write to COP0 Status in `bank_bytes`.
@@ -1961,6 +2287,7 @@ pub fn analyze_cop0_status_writes(
         &cfg.proven_roots,
         None,
         Some(&mut observations),
+        None,
         None,
     );
     let mut proofs = Vec::with_capacity(inventory.proven_code_writes.len());
@@ -2056,6 +2383,7 @@ pub fn analyze_constant_tlb_transfers(
         None,
         None,
         Some(&mut observations),
+        None,
     );
 
     let mut sites = cfg
@@ -2200,6 +2528,7 @@ pub fn derive_fixed_word_stores(
         va_start,
         &cfg.proven_roots,
         Some(&mut observations),
+        None,
         None,
         None,
     );
@@ -3008,6 +3337,219 @@ mod tests {
     }
 
     const NOP: u32 = 0x0000_0000;
+
+    fn call_register(call: &CallBoundaryProofV1, register: u8) -> &CallBoundaryRegisterProofV1 {
+        call.registers
+            .iter()
+            .find(|proof| proof.register == register)
+            .unwrap()
+    }
+
+    #[test]
+    fn call_boundary_samples_delay_slot_arguments() {
+        let start = 0x8000_0000;
+        let target = start + 0x40;
+        let jal = 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut bytes = asm(&[
+            0x3c04_1234, // lui a0,0x1234
+            0x2405_0022, // addiu a1,zero,0x22
+            0x3c06_ffff, // stale a2 value
+            jal,
+            0x2406_0055, // delay: addiu a2,zero,0x55
+            0x03e0_0008,
+            NOP,
+        ]);
+        bytes.resize(0x48, 0);
+        bytes[0x40..0x44].copy_from_slice(&0x03e0_0008u32.to_be_bytes());
+        let cfg = build_cfg("calls", &bytes, start, &[start]);
+        let analysis = analyze_call_boundaries_from_roots(&cfg, &bytes, start, &[start]);
+        let call = analysis
+            .calls
+            .iter()
+            .find(|call| call.site_pc == start + 0x0c)
+            .unwrap();
+        assert_eq!(
+            call_register(call, 4).exact_concrete_values(),
+            Some([0x1234_0000].as_slice())
+        );
+        assert_eq!(
+            call_register(call, 5).exact_concrete_values(),
+            Some([0x22].as_slice())
+        );
+        assert_eq!(
+            call_register(call, 6).exact_concrete_values(),
+            Some([0x55].as_slice())
+        );
+        assert_eq!(call_register(call, 7).value, CallBoundaryValueV1::Open);
+    }
+
+    #[test]
+    fn call_boundary_keeps_symbolic_stack_cells_across_calls() {
+        let start = 0x8000_0000;
+        let target = start + 0x60;
+        let jal = 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut bytes = asm(&[
+            0x27bd_ffe0, // addiu sp,sp,-0x20
+            0x27a4_001c, // addiu a0,sp,0x1c
+            jal,
+            0x27a5_0018, // delay: addiu a1,sp,0x18
+            0x27a4_001c,
+            jal,
+            0x27a5_0018,
+            0x03e0_0008,
+            NOP,
+        ]);
+        bytes.resize(0x68, 0);
+        bytes[0x60..0x64].copy_from_slice(&0x03e0_0008u32.to_be_bytes());
+        let cfg = build_cfg("calls", &bytes, start, &[start]);
+        let analysis = analyze_call_boundaries_from_roots(&cfg, &bytes, start, &[start]);
+        let calls = analysis
+            .calls
+            .iter()
+            .filter(|call| matches!(call.callee, CallBoundaryCalleeV1::Direct { target: t } if t == target))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert_eq!(
+                call_register(call, 4).value,
+                CallBoundaryValueV1::StackLocations {
+                    root: start,
+                    offsets: vec![-4],
+                }
+            );
+            assert_eq!(
+                call_register(call, 5).value,
+                CallBoundaryValueV1::StackLocations {
+                    root: start,
+                    offsets: vec![-8],
+                }
+            );
+            assert!(call_register(call, 4).blockers.is_empty());
+            assert!(call_register(call, 5).blockers.is_empty());
+        }
+    }
+
+    #[test]
+    fn call_boundary_leaves_a_divergent_open_argument_open() {
+        let start = 0x8000_0000;
+        let target = start + 0x40;
+        let beq_to_open_path = (0x04u32 << 26) | (4 << 21) | 5;
+        let jump_to_call = (0x02u32 << 26) | (((start + 0x20) >> 2) & 0x03ff_ffff);
+        let jal = 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut bytes = asm(&[
+            beq_to_open_path,
+            NOP,
+            0x3c05_1111, // one path has a concrete a1
+            jump_to_call,
+            NOP,
+            NOP,
+            0x8c85_0000, // other path loads a1 through unknown a0
+            NOP,
+            jal,
+            NOP,
+            0x03e0_0008,
+            NOP,
+        ]);
+        bytes.resize(0x48, 0);
+        bytes[0x40..0x44].copy_from_slice(&0x03e0_0008u32.to_be_bytes());
+        let cfg = build_cfg("calls", &bytes, start, &[start]);
+        let analysis = analyze_call_boundaries_from_roots(&cfg, &bytes, start, &[start]);
+        let call = analysis
+            .calls
+            .iter()
+            .find(|call| call.site_pc == start + 0x20)
+            .unwrap();
+        assert_eq!(call_register(call, 5).value, CallBoundaryValueV1::Open);
+        assert!(call_register(call, 5)
+            .blockers
+            .contains(&CallBoundaryValueBlockerV1::ValueOpen));
+    }
+
+    #[test]
+    fn call_boundary_rejects_mutable_static_singleton_as_exact() {
+        let start = 0x8000_0000;
+        let target = start + 0x60;
+        let jal = 0x0c00_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut bytes = asm(&[
+            0x3c08_8000, // lui t0,0x8000
+            0x8d04_0040, // lw a0,0x40(t0)
+            jal,
+            NOP,
+            0x03e0_0008,
+            NOP,
+        ]);
+        bytes.resize(0x68, 0);
+        bytes[0x40..0x44].copy_from_slice(&0x8023_da20u32.to_be_bytes());
+        bytes[0x60..0x64].copy_from_slice(&0x03e0_0008u32.to_be_bytes());
+        let cfg = build_cfg("calls", &bytes, start, &[start]);
+        let analysis = analyze_call_boundaries_from_roots(&cfg, &bytes, start, &[start]);
+        let argument = call_register(&analysis.calls[0], 4);
+        assert_eq!(
+            argument.value,
+            CallBoundaryValueV1::Concrete {
+                values: vec![0x8023_da20],
+            }
+        );
+        assert_eq!(argument.exact_concrete_values(), None);
+        assert!(argument.blockers.contains(
+            &CallBoundaryValueBlockerV1::MutableStaticMemorySource {
+                addresses: vec![start + 0x40],
+            }
+        ));
+    }
+
+    #[test]
+    fn call_boundary_enumerates_resolved_indirect_calls_canonically() {
+        let start = 0x8000_0000;
+        let target = start + 0x40;
+        let jalr_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut bytes = asm(&[
+            0x3c19_8000, // lui t9,0x8000
+            0x2739_0040, // addiu t9,t9,0x40
+            0x2404_0011, // addiu a0,zero,0x11
+            jalr_t9,
+            0x2405_0022, // delay: addiu a1,zero,0x22
+            0x03e0_0008,
+            NOP,
+        ]);
+        bytes.resize(0x48, 0);
+        bytes[0x40..0x44].copy_from_slice(&0x03e0_0008u32.to_be_bytes());
+        let closure = build_cfg_value_set_closed("calls", &bytes, start, &[start]);
+        let analysis = analyze_call_boundary_registers_from_roots(
+            &closure.cfg,
+            &bytes,
+            start,
+            &[start],
+            &[5, 4, 5],
+        )
+        .unwrap();
+        assert_eq!(analysis.requested_registers, vec![4, 5]);
+        assert_eq!(analysis.calls.len(), 1);
+        assert_eq!(
+            analysis.calls[0].callee,
+            CallBoundaryCalleeV1::ResolvedIndirect {
+                targets: vec![target],
+            }
+        );
+        assert_eq!(
+            call_register(&analysis.calls[0], 4).exact_concrete_values(),
+            Some([0x11].as_slice())
+        );
+        assert_eq!(
+            call_register(&analysis.calls[0], 5).exact_concrete_values(),
+            Some([0x22].as_slice())
+        );
+        assert_eq!(
+            analyze_call_boundary_registers_from_roots(
+                &closure.cfg,
+                &bytes,
+                start,
+                &[start],
+                &[32],
+            ),
+            Err(CallBoundaryAnalysisErrorV1::InvalidRegister { register: 32 })
+        );
+    }
 
     #[test]
     fn resolves_lui_addiu_jr_boot_stub_target() {

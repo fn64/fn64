@@ -728,6 +728,15 @@ an `open` result.
 > bytes. No reference-runtime implementation source was consulted. Runtime
 > observations (step 7) and mutable callback fields whose values arrive only
 > through unknown arguments remain unimplemented and stay open.
+>
+> The same fixed point now exposes an opt-in call-boundary projection sampled
+> after each call's delay slot and before unknown callee effects are applied.
+> Callers may restrict analysis to an explicit authority-root set and request
+> a bounded GPR set. Results distinguish finite constants, symbolic stack
+> locations, and open values; path disagreement, revisit widening, and values
+> loaded from mutable initial-image words remain typed blockers. This is
+> operand evidence for a separately authenticated callee mechanism, not proof
+> that an arbitrary call target implements that mechanism.
 
 The third-ROM NWXE answer-key run (2026-07-16) confirmed that the bounded
 HI/LO resolver itself generalizes unchanged: from the header entrypoint
