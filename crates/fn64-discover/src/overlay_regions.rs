@@ -767,12 +767,20 @@ pub fn admit_overlay_region_tables(
         })
         .collect();
 
+    // Descriptor corroboration is offered to EVERY candidate table, not only
+    // to tables delta_vote already admitted. Gating it on `admitted` was a
+    // deadlock: `admitted` is computed from delta-vote outcomes alone, so a
+    // table whose regions all stay open can never reach the fallback that
+    // would resolve them. Measured on Hot Wheels - Turbo Racing, where 0 of
+    // 136 records vote but 53 decode as code at their declared destination:
+    // all 21 tables scored `mapped_regions = 0` and the 53 were discarded.
+    //
+    // This widens what counts as corroboration, not the admission bar itself
+    // -- a region still only counts once it decodes as code at the declared
+    // VA, and `min_mapped_regions` is re-checked below against the total.
     let mut raw_mappings = BTreeSet::new();
     let mut fallbacks = Vec::new();
     for (admission_index, admission) in admissions.iter().enumerate() {
-        if !admission.admitted {
-            continue;
-        }
         for (record_index, (record, outcome)) in admission
             .table
             .records
@@ -813,6 +821,13 @@ pub fn admit_overlay_region_tables(
         |admission| &mut admission.region_deltas,
         |admission| &mut admission.mapped_regions,
     );
+
+    // Admission was decided before the fallbacks ran, so re-derive it against
+    // the regions now corroborated. The bar is unchanged; only the evidence
+    // available to meet it has grown.
+    for admission in &mut admissions {
+        admission.admitted = admission.mapped_regions >= min_mapped_regions;
+    }
 
     OverlayRecovery {
         config: config.clone(),
@@ -1366,6 +1381,58 @@ mod tests {
                 va_end: va_start + len,
             },
         }
+    }
+
+    #[test]
+    fn descriptor_corroboration_is_not_gated_on_a_prior_delta_vote_admission() {
+        // The deadlock this guards: `admitted` was computed from delta-vote
+        // outcomes alone, and only admitted tables were offered descriptor
+        // corroboration. A table whose regions all stayed open could never
+        // reach the fallback that would resolve them, so it scored zero
+        // forever. Here no region votes, yet each decodes as code at its
+        // declared VA, so the table must still be admitted.
+        let mut rom = vec![0u8; 0x4000];
+        // Three disjoint regions of a trivial `jr $ra` + `nop` leaf function.
+        for base in [0x1000usize, 0x2000, 0x3000] {
+            rom[base..base + 4].copy_from_slice(&0x03e0_0008u32.to_be_bytes());
+            rom[base + 4..base + 8].copy_from_slice(&0u32.to_be_bytes());
+        }
+        let records: Vec<_> = [0x1000u32, 0x2000, 0x3000]
+            .iter()
+            .enumerate()
+            .map(|(index, start)| CandidateRecord {
+                rom_start: *start,
+                rom_end: start + 8,
+                vram_dest: 0x8010_0000 + (index as u32) * 0x1000,
+            })
+            .collect();
+        let table = CandidateTable {
+            table_rom_offset: 0x100,
+            record_stride: 0x0c,
+            field_rom_start: 0,
+            field_rom_end: 4,
+            field_vram_dest: 8,
+            records,
+        };
+        let recovery = admit_overlay_region_tables(
+            &rom,
+            &SearchConfig {
+                min_region_len: 8,
+                ..SearchConfig::aki_family()
+            },
+            &DeltaVoteConfig::default(),
+            3,
+            vec![table],
+        );
+        let admission = &recovery.admissions[0];
+        assert_eq!(
+            admission.mapped_regions, 3,
+            "every corroborated region must count toward admission"
+        );
+        assert!(
+            admission.admitted,
+            "admission must be re-derived after descriptor fallbacks apply"
+        );
     }
 
     #[test]
