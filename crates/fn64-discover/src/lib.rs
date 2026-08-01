@@ -127,6 +127,10 @@
 //! - [`materialized_image`]: conclusion-blind re-derivation of typed evaluated-
 //!   image receipts from normalized ROM bytes and proven VROM backing. Its
 //!   in-memory result carries bytes but no mapping or proof authority.
+//! - `transform_invocation`: opt-in, candidate-only certification that one
+//!   exact content-bound guest wrapper invocation produces one re-derived
+//!   evaluated image. It does not promote facts or claim general transform
+//!   semantics, runtime placement, or boot reachability.
 //! - [`homology`]: bounded relocation-masked cross-ROM n-gram lookup with
 //!   collision-safe full-body validation and explicit ambiguous/unmatched
 //!   results. Homology emits candidates only.
@@ -261,6 +265,8 @@ pub mod tool_adapter;
 pub mod tool_claims;
 pub mod trace;
 pub mod transfer_scan;
+#[cfg(feature = "transform-invocation-certificate")]
+pub mod transform_invocation;
 pub mod workspace_artifacts;
 pub mod writer_denominator;
 pub mod xref;

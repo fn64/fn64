@@ -550,6 +550,30 @@ itself use the same proven VROM resolver. Missing or competing file records,
 receipt disagreement, decoded-length disagreement, and resource-limit failures
 all reject the bank rather than materializing unverified bytes.
 
+The opt-in `transform-invocation-certificate` feature adds a narrower,
+candidate-only bridge between those host-rederived bytes and one exact guest
+wrapper execution. It runs content-bound code and committed memory on a scoped
+execution thread with fresh thread-local hooks and writer epochs, using a fresh
+typed-Rust RDRAM/context. It initializes the destination with verifier-derived
+poison that is not readable until guest stores replace it, admits only a
+conservative dependency-audited integer subset, journals successful physical
+data reads and CPU stores, and requires a bounded `ThreadReturn` where CPU
+stores cover every destination byte and the result equals the re-derived
+evaluator aggregate or one explicitly selected receipt stream exactly. Its certificate
+binds that output-relative selection, the evaluator receipt, linked dynamic
+semantics, code image, fetched units, committed inputs, ordered memory effects,
+and output. It does not conclude a fact or prove general transform semantics,
+boot reachability, runtime placement, or release authority; unsupported CPU
+state, unseeded-register dependencies, uncommitted reads, writes outside the
+declared destination/scratch ranges, and partial unaligned stores all reject
+the invocation. Multiple per-stream certificates do not by themselves prove
+their runtime ordering or shared pointer-cell evolution; that requires a later
+composition certificate over an ordered sequence in one shared machine.
+The serialized certificate is replay evidence, not an authority capability;
+authority consumers must retain the opaque evaluation or re-run the exact
+content-bound request. Caller-declared scratch ranges and code bytes remain
+candidate inputs until a validator binds them to an admitted bank and corridor.
+
 The boot bank's effective entry is a typed, authoritative
 `HardwareEntrypoint` / `RomHeaderEntrypoint` claim only when an exact admitted
 IPL3 identity establishes the relocation delta and the complete one-megabyte
