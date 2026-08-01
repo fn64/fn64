@@ -331,13 +331,13 @@ pub use execution::{
 };
 #[cfg(feature = "dev-interpreter")]
 pub use fallback::{EvidenceClass, FallbackProgram, FallbackRunner};
-#[cfg(feature = "dev-interpreter")]
-pub use fetch::run_mapped_bank;
 pub use fetch::{
     fetch_instruction, FetchedInstruction, InstructionFetchSite, MappedAotBlock, MappedAotError,
     MappedAotEvidenceSnapshot, PhysicalCodeBank, PhysicalCodeBankEvidenceSnapshot,
     PhysicalCodeCatalog, PhysicalCodeError, PhysicalCodeSpan, PhysicalCodeSpanEvidenceSnapshot,
 };
+#[cfg(feature = "dev-interpreter")]
+pub use fetch::{run_mapped_bank, run_mapped_bank_with_memory_port};
 #[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
 pub use fetch::{
     DynamicMappedErrorV1, DynamicMappedRunV1, DynamicMappedUnitCatalogV1,
@@ -354,7 +354,11 @@ pub use generation::{
     PrecompiledShard, BACKED_GENERATION_CATALOG_EVIDENCE_SCHEMA_V1,
 };
 #[cfg(feature = "dev-interpreter")]
-pub use interp::{run_bank, run_bank_with_mmio, MmioOutcome, MmioPort, NoMmio, UnsupportedOp};
+pub use interp::{
+    run_bank, run_bank_with_memory_port, run_bank_with_mmio, AlignedDirectWordAddress,
+    CartridgeReadOutcome, CartridgeStoreOutcome, CartridgeWordPort, MemoryPort, MmioOutcome,
+    MmioPort, NoMmio, UnsupportedOp,
+};
 pub use runtime::{
     call_host_or_recompiled, discard_executable_write_boundary, guest_write_token,
     notify_bootstrap_or_import_write, notify_cpu_instruction_store, notify_function_entry,
@@ -372,6 +376,11 @@ pub use runtime::{
     TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity,
     TranslatedInstructionAddress, UnsupportedObserver, WriteObserver, WriterChannel,
     FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
+};
+#[cfg(all(not(feature = "dev-interpreter"), feature = "dynamic-mapped-runtime"))]
+pub use semantic::{
+    AlignedDirectWordAddress, CartridgeReadOutcome, CartridgeStoreOutcome, CartridgeWordPort,
+    MemoryPort, MmioOutcome, MmioPort, NoMmio,
 };
 pub use static_micro_op::{
     static_micro_op_format_source_receipt_v1, static_micro_op_format_source_receipt_v2,
