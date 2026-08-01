@@ -281,7 +281,7 @@ yield-buffer pointer to admitted microcode data. One typed lifecycle permits
 retires `Running`, and each authorization is load-consumed exactly once. Every production report in
 the exact-ten series must contain at least one individual recognized event whose text SHA,
 data length, and data SHA equal the admitted pair. Current report schema
-`fn64.release-gate.v28` also freezes the install-once audio-task execution
+`fn64.release-gate.v29` also freezes the install-once audio-task execution
 policy and admits only execution of the live RSP image through `LleAccuracy`;
 the
 `fn64.rsp-rdp-observations.v2` wire bind those fields.
@@ -290,10 +290,12 @@ This mechanism makes a correctly formed production contract launchable; it is
 not representative-ROM evidence by itself. Representative private NTSC
 full-ROM exact-ten series for reference and RT64 LLE/post-VI completed under
 schema v22 and were independently reverified locally on 2026-07-22. Both
-series are historical under schema v28 and require regeneration. They bind
+series are historical under schema v29 and require regeneration. They bind
 their then-current boundary-owned observations and the compiled unsupported-
 instrumentation identity. A retained public synthetic identified-native XBUS
-series binds the same denominator without acquiring private-ROM authority. Its
+series binds the same denominator without acquiring private-ROM authority.
+That series and its target-named fingerprint are schema-v28 historical
+evidence and require v29 regeneration. Its
 specialized runner operation exposes only a self-hashed receipt; repository
 acceptance is instead anchored solely by the exact target-named macOS arm64
 semantic fingerprint, including both build-produced archive hashes. Compiler,
@@ -308,7 +310,7 @@ Report-only matrix v5 verification never awards a ROM-class requirement from
 the report's host-supplied label. Its private-series path accepts only an
 opaque capability produced by jointly revalidating the policy-admitted v3
 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image,
-and bound inputs. It exact-matches the v28 semantic report and ordered run-event
+and bound inputs. It exact-matches the v29 semantic report and ordered run-event
 identities, and retains a canonical `fn64.verified-rom-class-authority.v1`
 inside verified-matrix v18. The retained
 self-hash proves canonical integrity, not signer identity or transferable
@@ -1216,7 +1218,7 @@ regular generated file under `src/`. Only the validated machine-local runtime
 path is normalized; extra targets, features, dependencies, build scripts, and
 symlinks are rejected. A stale or handwritten callable table therefore cannot
 silently claim a complete stream. The committed-VI release boundary freezes
-the exact `(cycle, artifact, link VRAM, symbol)` order and schema v28 binds its
+the exact `(cycle, artifact, link VRAM, symbol)` order and schema v29 binds its
 ordered and canonical unique/count digests as `typed_observed_function`.
 
 The same boundary freezes a separate ABI-owned RSP/RDP observation stream.
@@ -1228,7 +1230,7 @@ a contradictory backend label traps. Neither source can choose the digest or
 execution policy. Successful IMEM
 replacement and DRAM/XBUS DPC commits enter the same ordered history. This is
 release observation, not future-affecting DeviceState, so ROM installation
-clears it and report schema `fn64.release-gate.v28` binds it independently.
+clears it and report schema `fn64.release-gate.v29` binds it independently.
 Each microcode recognition entry also binds the original task data address,
 exact logical byte length, and SHA-256 in the
 `fn64.rsp-rdp-observations.v2` wire.
@@ -1503,6 +1505,22 @@ task calls out:
   timing through that fabric's raw PI registers, and applies the documented
   KSEG1 `baseAddress | devAddr` rule for managed DMA, raw DMA, and programmed
   I/O before converting the result at the physical PI boundary.
+  The public runtime request carries a typed device-relative
+  `PiDeviceAddress::{RomOffset,SramOffset}`; storage never infers a device from
+  an offset threshold. Raw MMIO alone retains the physical `PI_CART_ADDR`
+  latch for register readback and snapshots, then decodes Domain 1 Address 2
+  or Domain 2 Address 2 when a length write triggers the transfer. Admission
+  checks the complete half-open device range without wrapping at either PI
+  window boundary; typed-start failures leave every readable latch and trace
+  unchanged, while an explicitly programmed raw CART latch remains readable
+  after a rejected length trigger. SRAM chip addressing inside an admitted
+  Domain 2 range still masks the installed power-of-two part's real address
+  lines and may wrap once; a transfer longer than the whole part traps. In the
+  public PI register convention, `PI_WR_LEN` starts device-to-RDRAM and
+  `PI_RD_LEN` starts RDRAM-to-device; a ROM write is a loud typed rejection.
+  The managed API reports that read-only rejection at submission, whereas the
+  raw ABI traps at its length-register boundary; that public API distinction is
+  retained rather than relabeled as timed transfer parity.
   The supported Game Pak ROM and SRAM physical spaces normalize into the
   fabric's one storage authority. A malformed handle or a documented bulk/64DD space without
   attached storage records `abi.pi.epi-handle` before trapping; it cannot be
@@ -2036,7 +2054,7 @@ task calls out:
   native pointers and registration order. Mapped-interpreter destination
   observations honestly retain no
   generated artifact and are operational/differential-only, not fixed-cycle
-  release evidence under schema v28; artifact-identified mapped AOT retains its
+  release evidence under schema v29; artifact-identified mapped AOT retains its
   real artifact and is eligible, while compatibility AOT without one is not.
   Refill and invalid fetch faults retain exact EPC/BD, BadVAddr, Context/EntryHi,
   and refill/common vector selection. The legacy whole-function boundary,
@@ -2658,7 +2676,7 @@ semantic metadata, mapper/RTC/timing state; high-level VI/retrace state; and
 the ABI manager's pending PI/SI delivery and VI-latch metadata. DeviceState v9
 added the owner-local executor control and complete modeled ABI HostState
 projections described below. Retained report schema v22 and DeviceState v9
-artifacts are historical only; they cannot satisfy current v28 verification.
+artifacts are historical only; they cannot satisfy current v29 verification.
 
 Device transition retention remains enabled by default and is required for
 that release evidence. Long exploratory runs may explicitly disable retention;
@@ -2680,6 +2698,9 @@ DeviceState v15 narrows DPC CLOCK, BUFBUSY, PIPEBUSY, and TMEM to their public
 24-bit domains at the runtime import boundary and rejects a noncanonical value
 at release encoding. It does not claim modeled counter increments or close the
 still-open STATUS counter-clear/transaction interleavings.
+DeviceState v16 distinguishes pending PI ROM and SRAM requests with a typed
+device-relative address. Live timing v2 applies the same identity to PI DMA
+rows, so equal offsets in different devices cannot alias in either channel.
 Fixed-cycle report construction admits only
 `AudioTaskExecutionPolicy::LleAccuracy`; translated callbacks cannot prove a
 match to live IMEM, and diagnostic skip is explicitly non-release.
@@ -2761,7 +2782,7 @@ pub struct TraceEvent {
 pub enum TraceKind {
     ThreadSwitch { from: ThreadId, to: ThreadId, reason: SwitchReason },
     QueueOp { queue: RdramAddr, op: QueueOpKind, thread: ThreadId }, // send/recv/block/wake
-    Dma { direction: DmaDirection, dram: RdramAddr, dev_addr: u32, len: u32 },
+    Dma { direction: DmaDirection, dram: RdramAddr, device: PiDeviceAddress, len: u32 },
     TaskSubmit { task_kind: TaskKind, ucode: u32 }, // RSP gfx/audio StartGo handoff
 }
 ```

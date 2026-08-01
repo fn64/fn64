@@ -4887,7 +4887,7 @@ fn validate_pi_runtime_prerequisite(
     prerequisite: &PiWriterRuntimePrerequisiteV1,
     build_identity: &GeneratedRunnerBuildIdentityV1,
 ) -> Result<(), GeneratedRunnerBuildError> {
-    if prerequisite.schema != fn64_abi::recompiled::PI_WRITER_RUNTIME_STATE_SCHEMA_V1
+    if prerequisite.schema != fn64_abi::recompiled::PI_WRITER_RUNTIME_STATE_SCHEMA_V2
         || prerequisite.build_receipt_schema != build_identity.build_receipt_schema
         || prerequisite.aot_runtime != build_identity.aot_runtime
         || prerequisite.production_aot != build_identity.production_aot
@@ -4952,7 +4952,7 @@ fn recompute_pi_runtime_prerequisite_receipt(
     prerequisite: &PiWriterRuntimePrerequisiteV1,
 ) -> Result<String, GeneratedRunnerBuildError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"fn64:pi-writer-runtime-state-receipt:v1");
+    hasher.update(b"fn64:pi-writer-runtime-state-receipt:v2");
     hasher.update((prerequisite.schema.len() as u64).to_be_bytes());
     hasher.update(prerequisite.schema.as_bytes());
     for digest in [
@@ -7733,7 +7733,7 @@ mod tests {
 
     fn pi_prerequisite(identity: &GeneratedRunnerBuildIdentityV1) -> PiWriterRuntimePrerequisiteV1 {
         let mut prerequisite = PiWriterRuntimePrerequisiteV1 {
-            schema: fn64_abi::recompiled::PI_WRITER_RUNTIME_STATE_SCHEMA_V1.to_owned(),
+            schema: fn64_abi::recompiled::PI_WRITER_RUNTIME_STATE_SCHEMA_V2.to_owned(),
             program_model_sha256: "a1".repeat(32),
             resolver_install_sha256: "e2".repeat(32),
             abi_host_catalog_receipt_sha256: "e3".repeat(32),
