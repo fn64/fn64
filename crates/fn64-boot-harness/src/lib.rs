@@ -1369,8 +1369,6 @@ impl GuestDrain {
     }
 }
 
-const OS_TV_TYPE: fn64_runtime::RdramAddr = fn64_runtime::RdramAddr::from_offset(0x300);
-
 /// Length required by generated `MEM_*` accesses during boot.
 pub const fn rdram_len() -> usize {
     let mmio_end = fn64_runtime::RDRAM_MMIO_WINDOW_END as usize;
@@ -1387,7 +1385,7 @@ pub const fn rdram_len() -> usize {
 pub fn new_rdram(tv_type: TvType) -> Vec<u8> {
     fn64_abi::configure_tv_type(tv_type);
     let mut rdram = vec![0; rdram_len()];
-    fn64_runtime::RdramViewMut::from_storage(&mut rdram).write_u32(OS_TV_TYPE, tv_type as u32);
+    fn64_runtime::IplBootGlobals::cold(tv_type).install(&mut rdram);
     rdram
 }
 
@@ -1689,10 +1687,13 @@ mod tests {
     fn television_standard_is_explicit_boot_state_not_zero_fill_accident() {
         for (tv_type, expected) in [(TvType::Pal, 0), (TvType::Ntsc, 1), (TvType::Mpal, 2)] {
             let rdram = new_rdram(tv_type);
+            let view = fn64_runtime::RdramView::from_storage(&rdram);
+            assert_eq!(view.read_u32(fn64_runtime::OS_TV_TYPE_ADDR), expected);
             assert_eq!(
-                fn64_runtime::RdramView::from_storage(&rdram).read_u32(OS_TV_TYPE),
-                expected
+                view.read_u32(fn64_runtime::OS_ROM_BASE_ADDR),
+                fn64_runtime::CART_ROM_KSEG1_BASE
             );
+            assert_eq!(view.read_u32(fn64_runtime::OS_RESET_TYPE_ADDR), 0);
             assert_eq!(fn64_abi::configured_tv_type(), tv_type);
             assert_eq!(
                 fn64_abi::vi_field_interval(),

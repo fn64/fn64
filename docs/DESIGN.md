@@ -68,10 +68,12 @@ adapter, generated `recomp_entrypoint` declaration, and the one RDRAM
 allocation sized for physical RDRAM plus the raw MMIO/non-RDRAM window. Which
 sections begin resident and all input/save/render/audio policy remain local
 to each harness because those choices differ by game and host.
-The allocation API requires a typed `TvType` (`Pal`/`Ntsc`/`Mpal`) and writes
-the IPL-owned `osTvType` boot global before thread 0 runs. A zero-filled buffer
-is not valid console boot state: generated initialization reads this global to
-choose region-dependent VI/audio parameters before any ABI shim can repair it.
+The allocation API requires a typed `TvType` (`Pal`/`Ntsc`/`Mpal`) and installs
+the IPL-owned `osTvType`, `osRomBase`, and `osResetType` globals before thread 0
+runs. New process allocations explicitly select the public cold-reset value;
+`osRomBase` receives the cartridge's canonical KSEG1 base. A zero-filled buffer
+is not valid console boot state: generated initialization reads these globals
+before any ABI shim can repair them.
 The same seam reproduces IPL3's initial DMA—one MiB from cartridge ROM
 `0x1000` to RDRAM `0x400`—so translated CPU execution and hardware DMA
 consumers such as rspboot observe one resident boot image. Once game policy
