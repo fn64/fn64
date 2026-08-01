@@ -456,17 +456,24 @@ evidence.
 ### Composed proof snapshot
 
 `fn64_discover::snapshot_inputs::prepare_snapshot_banks` is the reusable
-in-process preparation boundary. It enumerates only `Proven` mappings, rejects
-distinct proven geometries for one bank, materializes Physical or proven
-VROM/Yaz0 backing, and trims load-time `.bss` from the VA prefix. Its sorted
-call-derived roots (including callable entries exposed by an admitted table)
-are traversal seeds only; callable authority remains in the fact database and
-is decided by snapshot composition. Conclusion-absent strong claims remain
-hints, but a current Open or Conflict conclusion cannot seed traversal. Exact
-duplicate mapping facts collapse, while invalid geometry and unaligned seeds
-fail loudly. Conservative bank-count, retained-byte, and complete decoded-VROM
-file limits are checked before materialization; callers may supply a smaller
-explicit `PrepareSnapshotBanksLimits` envelope.
+in-process preparation boundary. It enumerates only `Proven` bank images and
+keeps affine ROM backing structurally distinct from evaluated output. Affine
+images materialize Physical or proven VROM/Yaz0 bytes and trim load-time
+`.bss`; evaluated images are re-derived from their typed, content-free receipt
+and must exactly fill their claimed VA interval. Exact duplicate facts
+collapse, while any distinct affine/evaluated geometries for one bank are
+ambiguous and rejected. Its sorted call-derived roots (including callable
+entries exposed by an admitted table) are traversal seeds only; callable
+authority remains in the fact database and is decided by snapshot composition.
+Conclusion-absent strong claims remain hints, but a current Open or Conflict
+conclusion cannot seed traversal. Conservative bank-count, decoded retained-
+byte, source, evaluator-output, stream-count, and complete decoded-VROM-file
+limits are checked before or during their bounded materialization.
+
+The preparation boundary is ahead of the current snapshot wire: the existing
+composer and snapshot-workspace schema still require affine ROM coordinates
+and reject evaluated-image backing. No materialized bank is assigned a fake
+ROM offset while that schema migration remains open.
 
 `fn64-discover::snapshot::compose_materialized_bank_v1` is the first thin
 composition boundary over the existing passes. V1 accepts one resident,

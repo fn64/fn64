@@ -8,6 +8,7 @@
 
 use crate::closure::{ClosureScoreboard, DestinationClass, DestinationReason};
 use crate::ledger::build_ledger;
+use crate::materialized_image::MaterializedImageLimitsV1;
 use crate::snapshot::{
     compose_materialized_banks_validated_v2_with_limits, MultiBankCompositionLimits,
 };
@@ -157,14 +158,20 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
         },
     )?;
 
-    let proven_bank_count = auto.facts.proven_rom_mappings().len();
+    let proven_bank_count = auto.facts.proven_bank_images().len();
     let (closure, stage1_effects, composition_diagnostic) = match prepare_snapshot_banks_with_limits(
         &auto.rom,
         &auto.facts,
         PrepareSnapshotBanksLimits {
             max_banks: limits.max_banks as usize,
-            max_aggregate_rom_bytes: limits.max_aggregate_materialized_bytes,
-            max_decoded_vrom_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+            max_aggregate_materialized_bytes: limits.max_aggregate_materialized_bytes,
+            materialized_image: MaterializedImageLimitsV1 {
+                max_source_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_decoded_vrom_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_stream_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_aggregate_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_streams: 4096,
+            },
         },
     ) {
         Ok(prepared) => {
@@ -257,14 +264,14 @@ pub fn measure_cold_rom(rom_bytes: &[u8]) -> Result<ColdRomRunV2, ColdSweepError
                 ),
             }
         }
-        Err(PrepareSnapshotBanksError::NoProvenMappings) => (
+        Err(PrepareSnapshotBanksError::NoProvenImages) => (
             ColdClosureMeasurementV2::Open {
                 blocker: ColdCompositionBlockerV2::NoProvenMappings,
             },
             ColdStage1EffectMeasurementV2::Open {
                 blocker: ColdStage1EffectBlockerV2::CompositionUnavailable,
             },
-            Some(PrepareSnapshotBanksError::NoProvenMappings.to_string()),
+            Some(PrepareSnapshotBanksError::NoProvenImages.to_string()),
         ),
         Err(error) => (
             ColdClosureMeasurementV2::Open {

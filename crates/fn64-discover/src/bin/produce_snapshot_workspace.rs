@@ -5,13 +5,14 @@
 //! paths, and the manifest is published last as the completion marker.
 
 use fn64_discover::facts::{
-    function_entry_subject, load_image_table_record_subject, CandidateDetector,
+    function_entry_subject, load_image_table_record_subject, BankBackingV1, CandidateDetector,
     MappingAddressSpace, ProofState,
 };
 use fn64_discover::file_table::{VromMaterializationLimits, DEFAULT_MAX_DECODED_VROM_FILE_BYTES};
 use fn64_discover::grade_candidates::{
     scoped_candidate_identities_v3, ScopedCandidateIdentitiesV3,
 };
+use fn64_discover::materialized_image::MaterializedImageLimitsV1;
 use fn64_discover::owner_proof::OwnerAssessment;
 use fn64_discover::snapshot::{
     compose_materialized_bank_validated_v2, compose_materialized_banks_validated_v2_with_limits,
@@ -51,8 +52,14 @@ const COMPOSITION_LIMITS: MultiBankCompositionLimits = MultiBankCompositionLimit
 };
 const PREPARATION_LIMITS: PrepareSnapshotBanksLimits = PrepareSnapshotBanksLimits {
     max_banks: MAX_BANKS,
-    max_aggregate_rom_bytes: 256 * MIB,
-    max_decoded_vrom_file_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+    max_aggregate_materialized_bytes: 256 * MIB,
+    materialized_image: MaterializedImageLimitsV1 {
+        max_source_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_decoded_vrom_file_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_stream_output_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_aggregate_output_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_streams: 4096,
+    },
 };
 const DISCOVERY_LIMITS: AutoDiscoveryLimits = AutoDiscoveryLimits {
     vrom_materialization: VromMaterializationLimits {
@@ -271,6 +278,16 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         ));
     }
     let available_proven_bank_count = prepared.banks().len();
+    if let Some(bank) = prepared
+        .banks()
+        .iter()
+        .find(|bank| matches!(bank.backing, BankBackingV1::Materialized { .. }))
+    {
+        return Err(format!(
+            "prepared bank {:?} has evaluated-image backing, which the current ROM-only snapshot-workspace schema cannot publish",
+            bank.bank
+        ));
+    }
     let inputs = prepared.materialized_inputs();
     let (published_indices, composed) = if let Some(requested) = selected_bank {
         let matches: Vec<usize> = prepared
@@ -338,11 +355,19 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     let backing_evidence: Vec<Vec<usize>> = published_banks
         .iter()
         .map(|bank| {
+            let BankBackingV1::RomAffine {
+                rom_space,
+                rom_start,
+                rom_end,
+            } = &bank.backing
+            else {
+                return Err("ROM-only publisher admitted materialized backing".into());
+            };
             validate_backing_evidence(
                 &discovery.facts,
-                bank.rom_space,
-                bank.rom_start,
-                bank.rom_end,
+                *rom_space,
+                *rom_start,
+                *rom_end,
                 &bank.backing_evidence,
             )
         })
@@ -379,15 +404,23 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         snapshot_bytes.push(b'\n');
         let snapshot_artifact_sha256 = Sha256Digest::of(&snapshot_bytes);
         let bank_sha256 = Sha256Digest::of(&bank.bytes);
+        let BankBackingV1::RomAffine {
+            rom_space,
+            rom_start,
+            rom_end,
+        } = &bank.backing
+        else {
+            return Err("ROM-only publisher admitted materialized backing".into());
+        };
 
         publish_new(bank_path, &bank.bytes)?;
         publish_new(snapshot_path, &snapshot_bytes)?;
         bank_receipts.push(BankReceipt {
             index,
             bank: bank.bank.clone(),
-            rom_space: bank.rom_space,
-            rom_start: bank.rom_start,
-            rom_end: bank.rom_end,
+            rom_space: *rom_space,
+            rom_start: *rom_start,
+            rom_end: *rom_end,
             va_start: bank.va_start,
             va_end: bank.va_end,
             byte_length: bank.bytes.len(),
@@ -631,7 +664,9 @@ fn limits_receipt() -> LimitsReceipt {
         max_discovery_decoded_vrom_file_bytes: DISCOVERY_LIMITS
             .vrom_materialization
             .max_decoded_file_bytes,
-        max_preparation_decoded_vrom_file_bytes: PREPARATION_LIMITS.max_decoded_vrom_file_bytes,
+        max_preparation_decoded_vrom_file_bytes: PREPARATION_LIMITS
+            .materialized_image
+            .max_decoded_vrom_file_bytes,
         max_projected_fact_rows: COMPOSITION_LIMITS.max_projected_fact_rows,
         max_projected_fact_bytes: COMPOSITION_LIMITS.max_projected_fact_bytes,
         max_aggregate_materialized_bytes: COMPOSITION_LIMITS.max_aggregate_materialized_bytes,
