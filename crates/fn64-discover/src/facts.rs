@@ -179,6 +179,18 @@ pub enum BankBackingSpanV1 {
     },
 }
 
+/// Result of resolving one nonempty runtime interval against a bank's single
+/// accepted complete image. Ambiguity is decided before interval coverage:
+/// choosing whichever of two competing images happens to cover a request
+/// would silently turn the request into backing authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BankBackingSpanResolutionV1 {
+    Missing,
+    Unique(BankBackingSpanV1),
+    Ambiguous,
+    InvalidGeometry,
+}
+
 /// Generalized proven bank geometry. The accessor that returns this type is
 /// conclusion-gated; merely inserting an evaluated-image fact is insufficient.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1357,6 +1369,103 @@ impl FactDb {
             .collect()
     }
 
+    /// Resolve `[va_start, va_end)` to a typed subspan of the bank's complete
+    /// proven image. Exact duplicate image facts collapse, but distinct
+    /// complete images remain an ambiguity even when only one covers the
+    /// requested interval. Affine mappings expose only their ROM-backed
+    /// prefix; a larger VA interval may include BSS and does not manufacture
+    /// cartridge coordinates for it.
+    pub fn resolve_proven_bank_backing_span(
+        &self,
+        bank: &str,
+        va_start: u32,
+        va_end: u32,
+    ) -> BankBackingSpanResolutionV1 {
+        if va_start >= va_end {
+            return BankBackingSpanResolutionV1::InvalidGeometry;
+        }
+
+        let images = self
+            .proven_bank_images()
+            .into_iter()
+            .filter(|image| image.bank == bank)
+            .collect::<BTreeSet<_>>();
+        let mut images = images.into_iter();
+        let Some(image) = images.next() else {
+            return BankBackingSpanResolutionV1::Missing;
+        };
+        if images.next().is_some() {
+            return BankBackingSpanResolutionV1::Ambiguous;
+        }
+
+        let Some(va_len) = image.va_end.checked_sub(image.va_start) else {
+            return BankBackingSpanResolutionV1::InvalidGeometry;
+        };
+        if va_len == 0 {
+            return BankBackingSpanResolutionV1::InvalidGeometry;
+        }
+
+        match image.backing {
+            BankBackingV1::RomAffine {
+                rom_space,
+                rom_start,
+                rom_end,
+            } => {
+                let Some(rom_len) = rom_end.checked_sub(rom_start) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                if rom_len == 0 || rom_len > va_len {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                }
+                let Some(backed_va_end) = image.va_start.checked_add(rom_len) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                if va_start < image.va_start || va_end > backed_va_end {
+                    return BankBackingSpanResolutionV1::Missing;
+                }
+                let Some(start_delta) = va_start.checked_sub(image.va_start) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                let Some(end_delta) = va_end.checked_sub(image.va_start) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                let Some(span_rom_start) = rom_start.checked_add(start_delta) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                let Some(span_rom_end) = rom_start.checked_add(end_delta) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                BankBackingSpanResolutionV1::Unique(BankBackingSpanV1::RomAffine {
+                    rom_space,
+                    rom_start: span_rom_start,
+                    rom_end: span_rom_end,
+                })
+            }
+            BankBackingV1::Materialized {
+                receipt_sha256,
+                output_len,
+            } => {
+                if output_len == 0 || output_len != va_len {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                }
+                if va_start < image.va_start || va_end > image.va_end {
+                    return BankBackingSpanResolutionV1::Missing;
+                }
+                let Some(output_start) = va_start.checked_sub(image.va_start) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                let Some(output_end) = va_end.checked_sub(image.va_start) else {
+                    return BankBackingSpanResolutionV1::InvalidGeometry;
+                };
+                BankBackingSpanResolutionV1::Unique(BankBackingSpanV1::Materialized {
+                    receipt_sha256,
+                    output_start,
+                    output_end,
+                })
+            }
+        }
+    }
+
     /// Proven executable intervals for `bank`, sorted by address. An empty
     /// result means no provider has separated text from the load image yet;
     /// callers may retain their legacy whole-image behavior but must not
@@ -1536,6 +1645,11 @@ mod tests {
                 sha256: "44".repeat(32),
             },
         }
+    }
+
+    fn prove_bank(db: &mut FactDb, bank: &str, facts: Vec<usize>) {
+        db.conclude(format!("bank:{bank}"), ProofState::Proven, facts, "test")
+            .unwrap();
     }
 
     fn banks(fact: &Fact) -> Vec<String> {
@@ -2700,5 +2814,237 @@ mod tests {
         assert!(wire.get("rom_end").is_none());
         assert_eq!(wire["output_start"], 4);
         assert_eq!(wire["output_end"], 12);
+    }
+
+    #[test]
+    fn backing_span_resolves_physical_and_virtual_affine_offsets() {
+        for (bank, rom_space) in [
+            ("physical", RomAddressSpace::Physical),
+            ("virtual", RomAddressSpace::Virtual),
+        ] {
+            let mut db = FactDb::new();
+            let fact = db.insert(Fact::RomMapping {
+                bank: bank.into(),
+                rom_space,
+                rom_start: 0x1200,
+                rom_end: 0x1240,
+                va_start: 0x8000_1000,
+                va_end: 0x8000_1040,
+            });
+            prove_bank(&mut db, bank, vec![fact]);
+
+            assert_eq!(
+                db.resolve_proven_bank_backing_span(bank, 0x8000_100c, 0x8000_1024),
+                BankBackingSpanResolutionV1::Unique(BankBackingSpanV1::RomAffine {
+                    rom_space,
+                    rom_start: 0x120c,
+                    rom_end: 0x1224,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn backing_span_excludes_affine_bss() {
+        let mut db = FactDb::new();
+        let fact = db.insert(Fact::RomMapping {
+            bank: "bss".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x2000,
+            rom_end: 0x2020,
+            va_start: 0x8010_0000,
+            va_end: 0x8010_0040,
+        });
+        prove_bank(&mut db, "bss", vec![fact]);
+
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("bss", 0x8010_001c, 0x8010_0024),
+            BankBackingSpanResolutionV1::Missing
+        );
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("bss", 0x8010_0020, 0x8010_0024),
+            BankBackingSpanResolutionV1::Missing
+        );
+    }
+
+    #[test]
+    fn backing_span_resolves_materialized_offsets() {
+        let mut db = FactDb::new();
+        let receipt = evaluated_receipt();
+        let digest = evaluated_image_receipt_sha256_v1(&receipt);
+        let fact = db.insert(Fact::EvaluatedImage {
+            bank: "materialized".into(),
+            va_start: 0x8020_0000,
+            va_end: 0x8020_0008,
+            receipt,
+        });
+        prove_bank(&mut db, "materialized", vec![fact]);
+
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("materialized", 0x8020_0002, 0x8020_0007),
+            BankBackingSpanResolutionV1::Unique(BankBackingSpanV1::Materialized {
+                receipt_sha256: digest,
+                output_start: 2,
+                output_end: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn backing_span_excludes_supported_images() {
+        let mut db = FactDb::new();
+        let fact = db.insert(Fact::EvaluatedImage {
+            bank: "supported".into(),
+            va_start: 0x8030_0000,
+            va_end: 0x8030_0008,
+            receipt: evaluated_receipt(),
+        });
+        db.conclude(
+            "bank:supported",
+            ProofState::Supported,
+            vec![fact],
+            "test candidate",
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("supported", 0x8030_0000, 0x8030_0004),
+            BankBackingSpanResolutionV1::Missing
+        );
+    }
+
+    #[test]
+    fn backing_span_collapses_exact_duplicate_images() {
+        let mut db = FactDb::new();
+        let mapping = Fact::RomMapping {
+            bank: "duplicate".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x3000,
+            rom_end: 0x3010,
+            va_start: 0x8040_0000,
+            va_end: 0x8040_0010,
+        };
+        let first = db.insert(mapping.clone());
+        let second = db.insert(mapping);
+        prove_bank(&mut db, "duplicate", vec![first, second]);
+
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("duplicate", 0x8040_0004, 0x8040_0008),
+            BankBackingSpanResolutionV1::Unique(BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0x3004,
+                rom_end: 0x3008,
+            })
+        );
+    }
+
+    #[test]
+    fn backing_span_rejects_distinct_receipt_ambiguity_before_coverage() {
+        let mut db = FactDb::new();
+        let first = db.insert(Fact::EvaluatedImage {
+            bank: "ambiguous".into(),
+            va_start: 0x8050_0000,
+            va_end: 0x8050_0008,
+            receipt: evaluated_receipt(),
+        });
+        let mut other_receipt = evaluated_receipt();
+        other_receipt.source_sha256 = "99".repeat(32);
+        let second = db.insert(Fact::EvaluatedImage {
+            bank: "ambiguous".into(),
+            va_start: 0x8060_0000,
+            va_end: 0x8060_0008,
+            receipt: other_receipt,
+        });
+        prove_bank(&mut db, "ambiguous", vec![first, second]);
+
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("ambiguous", 0x8050_0000, 0x8050_0004),
+            BankBackingSpanResolutionV1::Ambiguous
+        );
+    }
+
+    #[test]
+    fn backing_span_rejects_affine_materialized_ambiguity() {
+        let mut db = FactDb::new();
+        let affine = db.insert(Fact::RomMapping {
+            bank: "mixed".into(),
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x4000,
+            rom_end: 0x4008,
+            va_start: 0x8070_0000,
+            va_end: 0x8070_0008,
+        });
+        let materialized = db.insert(Fact::EvaluatedImage {
+            bank: "mixed".into(),
+            va_start: 0x8070_0000,
+            va_end: 0x8070_0008,
+            receipt: evaluated_receipt(),
+        });
+        prove_bank(&mut db, "mixed", vec![affine, materialized]);
+
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("mixed", 0x8070_0000, 0x8070_0004),
+            BankBackingSpanResolutionV1::Ambiguous
+        );
+    }
+
+    #[test]
+    fn backing_span_reports_invalid_request_and_inverted_affine_geometry() {
+        let db = FactDb::new();
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("missing", 4, 4),
+            BankBackingSpanResolutionV1::InvalidGeometry
+        );
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("missing", 8, 4),
+            BankBackingSpanResolutionV1::InvalidGeometry
+        );
+
+        let mut inverted_va = FactDb::new();
+        let fact = inverted_va.insert(Fact::RomMapping {
+            bank: "inverted-va".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x1000,
+            rom_end: 0x1008,
+            va_start: 0x8080_0008,
+            va_end: 0x8080_0000,
+        });
+        prove_bank(&mut inverted_va, "inverted-va", vec![fact]);
+        assert_eq!(
+            inverted_va.resolve_proven_bank_backing_span("inverted-va", 0x8080_0000, 0x8080_0004),
+            BankBackingSpanResolutionV1::InvalidGeometry
+        );
+
+        let mut inverted_rom = FactDb::new();
+        let fact = inverted_rom.insert(Fact::RomMapping {
+            bank: "inverted-rom".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x1010,
+            rom_end: 0x1000,
+            va_start: 0x8090_0000,
+            va_end: 0x8090_0010,
+        });
+        prove_bank(&mut inverted_rom, "inverted-rom", vec![fact]);
+        assert_eq!(
+            inverted_rom.resolve_proven_bank_backing_span("inverted-rom", 0x8090_0000, 0x8090_0004),
+            BankBackingSpanResolutionV1::InvalidGeometry
+        );
+    }
+
+    #[test]
+    fn backing_span_reports_materialized_output_mismatch() {
+        let mut db = FactDb::new();
+        let fact = db.insert(Fact::EvaluatedImage {
+            bank: "mismatch".into(),
+            va_start: 0x80a0_0000,
+            va_end: 0x80a0_0010,
+            receipt: evaluated_receipt(),
+        });
+        prove_bank(&mut db, "mismatch", vec![fact]);
+
+        assert_eq!(
+            db.resolve_proven_bank_backing_span("mismatch", 0x80a0_0000, 0x80a0_0004),
+            BankBackingSpanResolutionV1::InvalidGeometry
+        );
     }
 }
