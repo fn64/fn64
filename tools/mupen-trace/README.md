@@ -95,6 +95,17 @@ That's why `build-core.sh` verifies the three load-bearing symbols
 (`DebugSetCallbacks`, `DebugStep`, `DebugMemRead32`) immediately after
 building, rather than letting a bad build surface as a downstream mystery.
 
+`FN64_FAST_FORWARD_PC` may equal `FN64_CPU_SNAPSHOT_PC` or
+`FN64_EXECUTABLE_IMAGE_PC`. The pause that starts the recorded window is also
+the target-capture boundary, so CPU and memory state are sampled before that
+instruction executes; the fast-forward transition does not consume the only
+matching pause.
+
+`FN64_CONTINUOUS_PRELUDE_MS` is rejected when a CPU or executable-image
+target capture is armed. RUNNING mode does not publish every traversed PC, so
+a wall-clock pause cannot prove that a transient target was not passed; use
+bounded single-step fast-forward for target-state capture.
+
 One real cost of the debugger API: `EnableDebugger` requires
 `R4300Emulator=0` (the pure interpreter) on every host architecture, dynarec
 or not. Single-stepped captures are therefore always interpreter-speed, which
@@ -217,6 +228,7 @@ be classified as a device-progress frontier and paired with a continuous-run
 or breakpoint-based capture before its PCs can admit runtime overlays.
 For that experiment, set `FN64_CONTINUOUS_PRELUDE_MS` (bounded to two minutes):
 the producer runs normally, issues the public `M64CMD_PAUSE`, and only then
+consumes that exact pause report before it can issue a debugger step, then
 starts the deterministic single-step window. This is opt-in because the
 continuous prelude is timing-sensitive and its resulting trace is diagnostic,
 not an instruction-exact replay authority.

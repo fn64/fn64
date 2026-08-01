@@ -401,6 +401,35 @@ static void emit_executable_image(const char *path, const char *rom_sha256,
     free(bytes);
 }
 
+static void complete_trace(FILE *out, const char *out_path, uint64_t seq,
+                           unsigned long long recorded) {
+    fprintf(out,
+            "{\"event\":\"end\",\"sequence\":%llu,\"completion\":\"completed\","
+            "\"exhaustiveness\":[]}\n",
+            (unsigned long long)seq);
+    if (fclose(out) != 0) {
+        fprintf(stderr, "closing %s failed\n", out_path);
+        _exit(1);
+    }
+    fprintf(stderr, "trace complete: %llu executed-pc records, final sequence %llu\n",
+            recorded, (unsigned long long)seq);
+    /* The core is paused inside its own stepping wait on the EXECUTE thread.
+     * The documented shutdown (RUNNING + STOP) is attempted; if the exec
+     * thread does not return promptly, the process exits after the already-
+     * closed trace and capture artifacts are durable. */
+    pthread_mutex_lock(&g_lock);
+    g_done = 1;
+    pthread_cond_broadcast(&g_consumed);
+    pthread_cond_broadcast(&g_cond);
+    pthread_mutex_unlock(&g_lock);
+    DebugSetRunState(M64P_DBG_RUNSTATE_RUNNING);
+    DebugStep();
+    g_do_command(M64CMD_STOP, 0, NULL);
+    struct timespec grace = {0, 200 * 1000 * 1000};
+    nanosleep(&grace, NULL);
+    _exit(0);
+}
+
 int main(int argc, char **argv) {
     if (argc != 8) {
         fprintf(stderr,
@@ -679,7 +708,14 @@ int main(int argc, char **argv) {
     }
     const char *prelude_env = getenv("FN64_CONTINUOUS_PRELUDE_MS");
     unsigned long prelude_ms = prelude_env ? strtoul(prelude_env, NULL, 10) : 0;
+    uint32_t pending_pause_pc = 0;
+    int have_pending_pause = 0;
     if (prelude_ms > 0) {
+        if (snapshot_pending || image_pending) {
+            fprintf(stderr,
+                    "FN64_CONTINUOUS_PRELUDE_MS cannot preserve target-PC capture boundaries\n");
+            _exit(2);
+        }
         if (prelude_ms > 120000) {
             fprintf(stderr, "FN64_CONTINUOUS_PRELUDE_MS exceeds 120000 ms\n");
             _exit(1);
@@ -695,6 +731,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "CoreDoCommand(PAUSE) -> %d; aborting\n", rc);
             _exit(1);
         }
+        wait_for_pause(&pending_pause_pc);
+        have_pending_pause = 1;
         fprintf(stderr, "continuous prelude paused after %lu ms\n", prelude_ms);
     }
     rc = DebugSetRunState(M64P_DBG_RUNSTATE_STEPPING);
@@ -702,7 +740,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "DebugSetRunState(STEPPING) -> %d; aborting\n", rc);
         _exit(1);
     }
-    DebugStep();
+    if (!have_pending_pause)
+        DebugStep();
 
     const char *schedule_path = getenv("FN64_INPUT_SCHEDULE");
     char schedule_sha256[CC_SHA256_DIGEST_LENGTH * 2 + 1];
@@ -749,11 +788,18 @@ int main(int argc, char **argv) {
 
     for (;;) {
         uint32_t pc;
-        wait_for_pause(&pc);
+        if (have_pending_pause) {
+            pc = pending_pause_pc;
+            have_pending_pause = 0;
+        } else {
+            wait_for_pause(&pc);
+        }
 
+        int entered_recording = 0;
         if (!recording) {
             if (pc == capture_start_pc) {
                 recording = 1;
+                entered_recording = 1;
                 emit_boot_context(boot_context_path, digest_hex, ipl3_digest_hex,
                                   destination_code, tv_standard, capture_start_pc);
                 /* Baseline observed values at the entrypoint pause. */
@@ -786,22 +832,28 @@ int main(int argc, char **argv) {
                 have_prev = 1;
                 fprintf(stderr, "entrypoint pause at 0x%08x after %llu pre-window steps\n", pc,
                         (unsigned long long)skip_steps);
-            } else if (++skip_steps > MAX_SKIP_STEPS) {
-                fprintf(stderr,
-                        "entrypoint 0x%08x never reached within %llu steps; aborting\n",
-                        capture_start_pc, (unsigned long long)MAX_SKIP_STEPS);
-                fprintf(out,
-                        "{\"event\":\"end\",\"sequence\":%llu,\"completion\":\"aborted\","
-                        "\"exhaustiveness\":[]}\n",
-                        (unsigned long long)seq);
-                fclose(out);
-                g_done = 1;
-                _exit(1);
+            } else {
+                if (++skip_steps > MAX_SKIP_STEPS) {
+                    fprintf(stderr,
+                            "entrypoint 0x%08x never reached within %llu steps; aborting\n",
+                            capture_start_pc, (unsigned long long)MAX_SKIP_STEPS);
+                    fprintf(out,
+                            "{\"event\":\"end\",\"sequence\":%llu,\"completion\":\"aborted\","
+                            "\"exhaustiveness\":[]}\n",
+                            (unsigned long long)seq);
+                    fclose(out);
+                    g_done = 1;
+                    _exit(1);
+                }
+                DebugStep();
+                continue;
             }
-            DebugStep();
-            continue;
         }
 
+        /* Target captures observe a pause before its instruction executes.
+         * The recording-start pause is itself eligible: fast-forwarding to
+         * the same PC as a requested image/CPU snapshot must not consume that
+         * one-shot boundary before the capture checks run. */
         if (snapshot_pending && pc == snapshot_pc) {
             emit_cpu_snapshot(snapshot_path, digest_hex, pc, recorded);
             snapshot_pending = 0;
@@ -816,8 +868,15 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "executable image %s captured before 0x%08x after %llu retired window instructions\n",
                     image_id, pc, recorded);
-            if (stop_after_image)
+            if (stop_after_image) {
+                if (entered_recording)
+                    complete_trace(out, out_path, seq, recorded);
                 steps = recorded;
+            }
+        }
+        if (entered_recording) {
+            DebugStep();
+            continue;
         }
 
         /* This pause proves the instruction at prev_pc retired. */
@@ -872,32 +931,7 @@ int main(int argc, char **argv) {
         prev_pc = pc;
 
         if (recorded >= steps) {
-            fprintf(out,
-                    "{\"event\":\"end\",\"sequence\":%llu,\"completion\":\"completed\","
-                    "\"exhaustiveness\":[]}\n",
-                    (unsigned long long)seq);
-            if (fclose(out) != 0) {
-                fprintf(stderr, "closing %s failed\n", out_path);
-                _exit(1);
-            }
-            fprintf(stderr, "trace complete: %llu executed-pc records, final sequence %llu\n",
-                    recorded, (unsigned long long)seq);
-            /* Teardown: the core is paused inside its own stepping wait on
-             * the EXECUTE thread. The documented shutdown (RUNNING + STOP)
-             * is attempted; if the exec thread does not come back promptly
-             * the process exits anyway -- the trace file is already closed
-             * and complete, and this exit path touches no output. */
-            pthread_mutex_lock(&g_lock);
-            g_done = 1;
-            pthread_cond_broadcast(&g_consumed);
-            pthread_cond_broadcast(&g_cond);
-            pthread_mutex_unlock(&g_lock);
-            DebugSetRunState(M64P_DBG_RUNSTATE_RUNNING);
-            DebugStep();
-            CoreDoCommand(M64CMD_STOP, 0, NULL);
-            struct timespec grace = {0, 200 * 1000 * 1000};
-            nanosleep(&grace, NULL);
-            _exit(0);
+            complete_trace(out, out_path, seq, recorded);
         }
         DebugStep();
     }
