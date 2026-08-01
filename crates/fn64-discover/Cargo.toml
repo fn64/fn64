@@ -10,6 +10,7 @@ autobins = false
 [features]
 default = []
 writer-runtime-authority = ["dep:fn64-boot-harness"]
+transform-invocation-certificate = ["fn64-recomp-rs/dynamic-mapped-runtime"]
 
 [dependencies]
 fn64-boot-harness = { path = "../fn64-boot-harness", optional = true, default-features = false, features = ["recomp-rs"] }
