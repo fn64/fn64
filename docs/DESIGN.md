@@ -560,6 +560,18 @@ spawned OSThread uses the synthetic sentinel installed with its entry context;
 thread 0 instead uses the exact `$ra` in the validated header-handoff
 `BootContext`, because a normal ROM-bootstrap return targets IPL3/SP memory
 outside the game AOT pack.
+`BootContext v1` deliberately does not contain the 32-entry TLB, and restoring
+it does not invent that state. Boot-TLB analysis therefore retains
+`InitialTlbStateUnproven`: it correlates path-invariant indexed writes and
+transfer-time EntryHi/ASID, uses the runtime's typed non-panicking diagnostic
+translator, and intersects only independently proven physical backing. This
+view remains diagnostic; it does not mint a `RomMapping` or alter cold ROM-only
+authority. A disposable ares `b80f67d3` candidate capture reached the exact
+header entry for the cold-panel GoldenEye and Perfect Dark inputs, but each
+successful-TLBWI/TLBWR-since-power mask was `0x00000000`. All 32
+captured values therefore came from ares's zero-reset policy and cannot supply
+hardware authority. Production translation still traps loudly on invalid
+PageMask encodings and undefined multiple matches.
 `fn64-recomp-rs` keeps the interpreter and `dynamic_mips` fallback behind the
 `dev-interpreter` feature. The final WM host selects `production-aot`, which
 implies `aot-runtime` and is compile-time incompatible with `dev-interpreter`;

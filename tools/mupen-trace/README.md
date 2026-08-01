@@ -28,6 +28,10 @@ core.
   executes. The snapshot records the exact retired-instruction position in
   the bounded window and normalized-ROM identity; it does not interpret the
   debugger's opaque TLB pointer.
+  The public debugger enum does name `M64P_CPU_TLB`, but
+  `DebugGetCPUDataPtr` exposes it only as `void *`; the public API specifies no
+  entry type, count, size, offsets, or versioned pointee layout. This producer
+  therefore must not cast it or manufacture initial-TLB authority.
   Executable-image capture normally treats its capture PC as the first fetch.
   For a completed image observed at an earlier publication checkpoint, set
   `FN64_EXECUTABLE_IMAGE_FIRST_PC` to the independently observed first entry

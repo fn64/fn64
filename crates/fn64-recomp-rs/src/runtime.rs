@@ -119,6 +119,27 @@ impl TranslatedInstructionAddress {
     }
 }
 
+/// Fail-closed result for tooling which must inspect TLB geometry without
+/// selecting behavior the VR4300 leaves undefined.
+///
+/// The execution-facing translation methods retain their loud traps for the
+/// undefined cases. Discovery diagnostics use this currency so an unsupported
+/// raw PageMask or competing tag match remains evidence instead of unwinding
+/// the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstructionTranslationDiagnosticErrorV1 {
+    Access(DataAccessError),
+    InvalidPageMaskEncoding {
+        index: usize,
+        page_mask_raw: u32,
+    },
+    MultipleTlbMatches {
+        vaddr: u64,
+        first_index: usize,
+        second_index: usize,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AddressRoute {
     DirectVirtual(u64),
@@ -1193,6 +1214,29 @@ impl RecompContext {
         vaddr: u64,
         access: DataAccessKind,
     ) -> Result<TranslatedDataAddress, DataAccessError> {
+        match self.translate_data_address_diagnostic(vaddr, access) {
+            Ok(translated) => Ok(translated),
+            Err(InstructionTranslationDiagnosticErrorV1::Access(error)) => Err(error),
+            Err(InstructionTranslationDiagnosticErrorV1::InvalidPageMaskEncoding {
+                index,
+                page_mask_raw,
+            }) => trap_unsupported(format!(
+                "TLB entry {index} has unsupported VR4300 PageMask {page_mask_raw:#010x}"
+            )),
+            Err(InstructionTranslationDiagnosticErrorV1::MultipleTlbMatches {
+                vaddr,
+                ..
+            }) => trap_unsupported(format!(
+                "data translation for {vaddr:#018x} matched multiple TLB entries; VR4300 behavior is undefined"
+            )),
+        }
+    }
+
+    fn translate_data_address_diagnostic(
+        &self,
+        vaddr: u64,
+        access: DataAccessKind,
+    ) -> Result<TranslatedDataAddress, InstructionTranslationDiagnosticErrorV1> {
         const PAGE_MASK_BITS: u32 = 0x01ff_e000;
         const VPN2_32_BITS: u64 = 0x0000_0000_ffff_e000;
         const VPN2_64_BITS: u64 = 0x0000_00ff_ffff_e000;
@@ -1202,9 +1246,12 @@ impl RecompContext {
         const VALID: u32 = 1 << 1;
         const DIRTY: u32 = 1 << 2;
 
-        let route = self
-            .classify_data_address(vaddr)
-            .map_err(|()| DataAccessError::AddressError { vaddr, access })?;
+        let route = self.classify_data_address(vaddr).map_err(|()| {
+            InstructionTranslationDiagnosticErrorV1::Access(DataAccessError::AddressError {
+                vaddr,
+                access,
+            })
+        })?;
         match route {
             AddressRoute::DirectVirtual(address) => {
                 return Ok(TranslatedDataAddress::Direct(address));
@@ -1231,10 +1278,12 @@ impl RecompContext {
                     | 0x007f_e000
                     | 0x01ff_e000
             ) {
-                trap_unsupported(format!(
-                    "TLB entry {index} has unsupported VR4300 PageMask {:#010x}",
-                    entry.page_mask
-                ));
+                return Err(
+                    InstructionTranslationDiagnosticErrorV1::InvalidPageMaskEncoding {
+                        index,
+                        page_mask_raw: entry.page_mask,
+                    },
+                );
             }
             let compared_vpn = if extended {
                 (VPN2_64_BITS & !(u64::from(page_mask))) | REGION_BITS
@@ -1244,21 +1293,29 @@ impl RecompContext {
             let vpn_matches = (vaddr ^ entry.entry_hi) & compared_vpn == 0;
             let global = entry.entry_lo0 & GLOBAL != 0 && entry.entry_lo1 & GLOBAL != 0;
             let asid_matches = (self.cop0_entry_hi ^ entry.entry_hi) & ASID_BITS == 0;
-            if vpn_matches && (global || asid_matches) && matched.replace((index, entry)).is_some()
-            {
-                trap_unsupported(format!(
-                    "data translation for {vaddr:#018x} matched multiple TLB entries; VR4300 behavior is undefined"
-                ));
+            if vpn_matches && (global || asid_matches) {
+                if let Some((first_index, _)) = matched {
+                    return Err(
+                        InstructionTranslationDiagnosticErrorV1::MultipleTlbMatches {
+                            vaddr,
+                            first_index,
+                            second_index: index,
+                        },
+                    );
+                }
+                matched = Some((index, entry));
             }
         }
 
         let Some((_index, entry)) = matched else {
-            return Err(DataAccessError::Tlb(TlbFault {
-                vaddr,
-                access,
-                kind: TlbFaultKind::Refill,
-                extended,
-            }));
+            return Err(InstructionTranslationDiagnosticErrorV1::Access(
+                DataAccessError::Tlb(TlbFault {
+                    vaddr,
+                    access,
+                    kind: TlbFaultKind::Refill,
+                    extended,
+                }),
+            ));
         };
         let page_mask = entry.page_mask & PAGE_MASK_BITS;
         let page_size = (page_mask + 0x2000) >> 1;
@@ -1268,20 +1325,24 @@ impl RecompContext {
             entry.entry_lo1
         };
         if entry_lo & VALID == 0 {
-            return Err(DataAccessError::Tlb(TlbFault {
-                vaddr,
-                access,
-                kind: TlbFaultKind::Invalid,
-                extended,
-            }));
+            return Err(InstructionTranslationDiagnosticErrorV1::Access(
+                DataAccessError::Tlb(TlbFault {
+                    vaddr,
+                    access,
+                    kind: TlbFaultKind::Invalid,
+                    extended,
+                }),
+            ));
         }
         if access == DataAccessKind::Store && entry_lo & DIRTY == 0 {
-            return Err(DataAccessError::Tlb(TlbFault {
-                vaddr,
-                access,
-                kind: TlbFaultKind::Modified,
-                extended,
-            }));
+            return Err(InstructionTranslationDiagnosticErrorV1::Access(
+                DataAccessError::Tlb(TlbFault {
+                    vaddr,
+                    access,
+                    kind: TlbFaultKind::Modified,
+                    extended,
+                }),
+            ));
         }
 
         // User's Manual figure 3-10 defines the VR4300 EntryLo PFN as the 20
@@ -1325,6 +1386,25 @@ impl RecompContext {
                 Ok(TranslatedInstructionAddress::new(physical))
             }
             TranslatedDataAddress::Mapped(physical) => {
+                Ok(TranslatedInstructionAddress::new(physical))
+            }
+        }
+    }
+
+    /// Translate one 32-bit instruction address for diagnostic tooling.
+    /// Unlike [`Self::translate_instruction_address`], architecturally
+    /// undefined TLB inputs are returned as typed blockers rather than loud
+    /// execution traps.
+    pub fn translate_instruction_address_diagnostic_v1(
+        &self,
+        vaddr: u32,
+    ) -> Result<TranslatedInstructionAddress, InstructionTranslationDiagnosticErrorV1> {
+        match self.translate_data_address_diagnostic(u64::from(vaddr), DataAccessKind::Load)? {
+            TranslatedDataAddress::Direct(_) => {
+                Ok(TranslatedInstructionAddress::new(vaddr & 0x1fff_ffff))
+            }
+            TranslatedDataAddress::DirectPhysical(physical)
+            | TranslatedDataAddress::Mapped(physical) => {
                 Ok(TranslatedInstructionAddress::new(physical))
             }
         }
@@ -3868,9 +3948,9 @@ mod tests {
     use super::{
         resolve_host_function, set_host_lookup, set_unsupported_observer, trap_unsupported,
         DataAccessError, DataAccessKind, GuestWriteEvent, HostFunctionCatalogErrorV1,
-        HostFunctionCatalogV1, Rdram, RecompContext, RecompFunc, TlbEntryRaw, TlbFault,
-        TlbFaultKind, TranslatedDataAddress, TranslatedInstructionAddress, WriterChannel,
-        RDRAM_LEN,
+        HostFunctionCatalogV1, InstructionTranslationDiagnosticErrorV1, Rdram, RecompContext,
+        RecompFunc, TlbEntryRaw, TlbFault, TlbFaultKind, TranslatedDataAddress,
+        TranslatedInstructionAddress, WriterChannel, RDRAM_LEN,
     };
 
     type RdramOperation = for<'a> fn(&mut Rdram<'a>);
@@ -4668,6 +4748,43 @@ mod tests {
         assert_eq!(
             ctx.translate_instruction_address(0x0040_1000),
             Ok(TranslatedInstructionAddress::new(0x0030_0000))
+        );
+    }
+
+    #[test]
+    fn diagnostic_instruction_translation_types_undefined_tlb_inputs() {
+        let mut unsupported = RecompContext::new();
+        unsupported.initialize_invalid_tlb_entries();
+        unsupported.tlb_entries[4].page_mask = 0x0000_2000;
+        assert_eq!(
+            unsupported.translate_instruction_address_diagnostic_v1(0x0040_0000),
+            Err(
+                InstructionTranslationDiagnosticErrorV1::InvalidPageMaskEncoding {
+                    index: 4,
+                    page_mask_raw: 0x0000_2000,
+                }
+            )
+        );
+
+        let mut competing = RecompContext::new();
+        competing.initialize_invalid_tlb_entries();
+        let entry = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0x0040_0000,
+            entry_lo0: ((0x0010_0000 >> 6) & 0x03ff_ffc0) | 0b111,
+            entry_lo1: ((0x0030_0000 >> 6) & 0x03ff_ffc0) | 0b111,
+        };
+        competing.tlb_entries[1] = entry;
+        competing.tlb_entries[2] = entry;
+        assert_eq!(
+            competing.translate_instruction_address_diagnostic_v1(0x0040_0040),
+            Err(
+                InstructionTranslationDiagnosticErrorV1::MultipleTlbMatches {
+                    vaddr: 0x0040_0040,
+                    first_index: 1,
+                    second_index: 2,
+                }
+            )
         );
     }
 

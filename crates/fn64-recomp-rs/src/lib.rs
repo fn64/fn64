@@ -366,11 +366,11 @@ pub use runtime::{
     DataAccessError, DataAccessKind, FpuException, FunctionEntryObservationSchema,
     FunctionEntryObserver, GuestWriteBoundary, GuestWriteBoundaryObserver, GuestWriteEvent,
     HostFunctionCatalogErrorV1, HostFunctionCatalogV1, HostLookup, HostPause,
-    IndirectTransferObservation, MmioRead, MmioWrite, PhysicalFgrState, Rdram, RecompContext,
-    RecompContextEvidenceSnapshotV1, RecompFunc, TlbEntryRaw, TlbFault, TlbFaultKind,
-    TranslatedDataAddress, TranslatedFunctionIdentity, TranslatedInstructionAddress,
-    UnsupportedObserver, WriteObserver, WriterChannel, FUNCTION_ENTRY_OBSERVATION_SCHEMA,
-    RDRAM_LEN, RDRAM_VBASE,
+    IndirectTransferObservation, InstructionTranslationDiagnosticErrorV1, MmioRead, MmioWrite,
+    PhysicalFgrState, Rdram, RecompContext, RecompContextEvidenceSnapshotV1, RecompFunc,
+    TlbEntryRaw, TlbFault, TlbFaultKind, TranslatedDataAddress, TranslatedFunctionIdentity,
+    TranslatedInstructionAddress, UnsupportedObserver, WriteObserver, WriterChannel,
+    FUNCTION_ENTRY_OBSERVATION_SCHEMA, RDRAM_LEN, RDRAM_VBASE,
 };
 pub use static_micro_op::{
     static_micro_op_format_source_receipt_v1, static_micro_op_format_source_receipt_v2,
