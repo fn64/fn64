@@ -11,6 +11,7 @@
 //! which preserves rather than overwrites the disagreement.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A bank-qualified address: identity is `(bank, pc)`, never `pc` alone,
@@ -30,6 +31,162 @@ pub struct BankAddr {
 pub enum RomAddressSpace {
     Physical,
     Virtual,
+}
+
+/// Closed evaluator identity for an image produced from immutable ROM input.
+/// A new implementation or container interpretation requires a new variant;
+/// free-form names cannot silently change the receipt's meaning.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MaterializationEvaluatorV1 {
+    HeaderedRawDeflateSequenceV1 { stream_count: u32 },
+}
+
+/// Immutable encoded input selected from the normalized ROM. `cursor` is
+/// relative to `[rom_start, rom_end)`, not a host pointer or runtime VA.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MaterializedImageSourceV1 {
+    pub rom_space: RomAddressSpace,
+    pub rom_start: u32,
+    pub rom_end: u32,
+    pub cursor: u32,
+}
+
+/// Half-open offset interval within an encoded source or evaluated output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MaterializedByteRangeV1 {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Content-only receipt for one stream. All ranges are relative offsets; none
+/// can be mistaken for a ROM coordinate or runtime address.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MaterializedImageStreamV1 {
+    pub source_range: MaterializedByteRangeV1,
+    pub encoded_range: MaterializedByteRangeV1,
+    pub output_range: MaterializedByteRangeV1,
+    pub declared_output_len: u32,
+    pub source_sha256: String,
+    pub output_sha256: String,
+}
+
+/// Identity of bytes left after the explicitly requested stream sequence.
+/// The bytes themselves are deliberately absent from the fact wire.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MaterializedImageSuffixV1 {
+    pub offset: u32,
+    pub len: u32,
+    pub sha256: String,
+}
+
+/// Reproducible, content-free record of one candidate evaluated image. This
+/// proves the evaluator result only; it does not prove that guest code invokes
+/// the evaluator, writes the destination, or transfers control to the output.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EvaluatedImageReceiptV1 {
+    pub evaluator: MaterializationEvaluatorV1,
+    pub source: MaterializedImageSourceV1,
+    pub source_sha256: String,
+    pub output_len: u32,
+    pub output_sha256: String,
+    pub streams: Vec<MaterializedImageStreamV1>,
+    pub trailing_suffix: MaterializedImageSuffixV1,
+}
+
+/// Stable identity for a serialized evaluated-image receipt. The hash wire is
+/// manual and domain-separated so serde representation changes cannot alter
+/// an existing receipt identity.
+pub fn evaluated_image_receipt_sha256_v1(receipt: &EvaluatedImageReceiptV1) -> String {
+    fn hash_u32(hasher: &mut Sha256, value: u32) {
+        hasher.update(value.to_be_bytes());
+    }
+    fn hash_u64(hasher: &mut Sha256, value: u64) {
+        hasher.update(value.to_be_bytes());
+    }
+    fn hash_str(hasher: &mut Sha256, value: &str) {
+        hash_u64(hasher, value.len() as u64);
+        hasher.update(value.as_bytes());
+    }
+    fn hash_range(hasher: &mut Sha256, range: MaterializedByteRangeV1) {
+        hash_u32(hasher, range.start);
+        hash_u32(hasher, range.end);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"fn64.evaluated-image-receipt.v1\0");
+    match receipt.evaluator {
+        MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count } => {
+            hasher.update([1]);
+            hash_u32(&mut hasher, stream_count);
+        }
+    }
+    hasher.update([match receipt.source.rom_space {
+        RomAddressSpace::Physical => 1,
+        RomAddressSpace::Virtual => 2,
+    }]);
+    hash_u32(&mut hasher, receipt.source.rom_start);
+    hash_u32(&mut hasher, receipt.source.rom_end);
+    hash_u32(&mut hasher, receipt.source.cursor);
+    hash_str(&mut hasher, &receipt.source_sha256);
+    hash_u32(&mut hasher, receipt.output_len);
+    hash_str(&mut hasher, &receipt.output_sha256);
+    hash_u64(&mut hasher, receipt.streams.len() as u64);
+    for stream in &receipt.streams {
+        hash_range(&mut hasher, stream.source_range);
+        hash_range(&mut hasher, stream.encoded_range);
+        hash_range(&mut hasher, stream.output_range);
+        hash_u32(&mut hasher, stream.declared_output_len);
+        hash_str(&mut hasher, &stream.source_sha256);
+        hash_str(&mut hasher, &stream.output_sha256);
+    }
+    hash_u32(&mut hasher, receipt.trailing_suffix.offset);
+    hash_u32(&mut hasher, receipt.trailing_suffix.len);
+    hash_str(&mut hasher, &receipt.trailing_suffix.sha256);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Backing for one complete proven bank image. Materialized output has no ROM
+/// coordinates: it is identified by the evaluator receipt and output length.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BankBackingV1 {
+    RomAffine {
+        rom_space: RomAddressSpace,
+        rom_start: u32,
+        rom_end: u32,
+    },
+    Materialized {
+        receipt_sha256: String,
+        output_len: u32,
+    },
+}
+
+/// Backing for a subrange of a proven bank. Materialized offsets are relative
+/// to the evaluated output and cannot be consumed as cartridge addresses.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BankBackingSpanV1 {
+    RomAffine {
+        rom_space: RomAddressSpace,
+        rom_start: u32,
+        rom_end: u32,
+    },
+    Materialized {
+        receipt_sha256: String,
+        output_start: u32,
+        output_end: u32,
+    },
+}
+
+/// Generalized proven bank geometry. The accessor that returns this type is
+/// conclusion-gated; merely inserting an evaluated-image fact is insufficient.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProvenBankImageV1 {
+    pub bank: String,
+    pub va_start: u32,
+    pub va_end: u32,
+    pub backing: BankBackingV1,
 }
 
 /// Address spaces connected by a configurable Phase-2 range table.
@@ -273,6 +430,16 @@ pub enum Fact {
         va_start: u32,
         va_end: u32,
     },
+    /// Candidate evaluated bytes at one runtime interval. The receipt is
+    /// content-addressed and carries no output bytes. This fact alone is not a
+    /// mapping proof: only a separate `bank:<bank>` Proven conclusion may
+    /// expose it through [`FactDb::proven_bank_images`].
+    EvaluatedImage {
+        bank: String,
+        va_start: u32,
+        va_end: u32,
+        receipt: EvaluatedImageReceiptV1,
+    },
     /// A bank-qualified interval whose bytes are permitted to enter code
     /// discovery. Load-image mappings describe where bytes can be loaded;
     /// they do not imply that text, rodata, and data are all executable.
@@ -349,6 +516,7 @@ impl Fact {
             Fact::ObservedExecutedCode { site, .. } => Some(&site.bank),
             Fact::IndirectTransferAnalysis { site, .. } => Some(&site.bank),
             Fact::RomMapping { bank, .. } => Some(bank),
+            Fact::EvaluatedImage { bank, .. } => Some(bank),
             Fact::ExecutableRange { bank, .. } => Some(bank),
             Fact::LoadImageTableRecord { bank, .. } => bank.as_deref(),
             Fact::OverlayRelocation { site, .. } => Some(&site.bank),
@@ -374,6 +542,7 @@ impl Fact {
             }
             Fact::BlockStart { bank, .. }
             | Fact::RomMapping { bank, .. }
+            | Fact::EvaluatedImage { bank, .. }
             | Fact::ExecutableRange { bank, .. } => {
                 banks.insert(bank);
             }
@@ -696,6 +865,9 @@ fn canonical_claim_for_kind(fact: &Fact, kind: OwnedConclusionKind) -> Option<(&
         (OwnedConclusionKind::Bank, Fact::RomMapping { bank, .. }) => {
             Some((bank, format!("bank:{bank}")))
         }
+        (OwnedConclusionKind::Bank, Fact::EvaluatedImage { bank, .. }) => {
+            Some((bank, format!("bank:{bank}")))
+        }
         (
             OwnedConclusionKind::Bank,
             Fact::LoadImageTableRecord {
@@ -756,15 +928,30 @@ impl<'a> FactProjectionIndex<'a> {
             .facts
             .iter()
             .filter_map(|fact| {
-                let Fact::RomMapping {
-                    bank,
-                    rom_space: RomAddressSpace::Virtual,
-                    rom_start,
-                    rom_end,
-                    ..
-                } = fact
-                else {
-                    return None;
+                let (bank, rom_start, rom_end) = match fact {
+                    Fact::RomMapping {
+                        bank,
+                        rom_space: RomAddressSpace::Virtual,
+                        rom_start,
+                        rom_end,
+                        ..
+                    } => (bank, rom_start, rom_end),
+                    Fact::EvaluatedImage {
+                        bank,
+                        receipt:
+                            EvaluatedImageReceiptV1 {
+                                source:
+                                    MaterializedImageSourceV1 {
+                                        rom_space: RomAddressSpace::Virtual,
+                                        rom_start,
+                                        rom_end,
+                                        ..
+                                    },
+                                ..
+                            },
+                        ..
+                    } => (bank, rom_start, rom_end),
+                    _ => return None,
                 };
                 source
                     .conclusion(&format!("bank:{bank}"))
@@ -1117,6 +1304,59 @@ impl FactDb {
             .collect()
     }
 
+    /// Every accepted bank image, preserving the structural distinction
+    /// between affine ROM bytes and evaluator-produced output. Candidate and
+    /// Supported conclusions never enter this result.
+    pub fn proven_bank_images(&self) -> Vec<ProvenBankImageV1> {
+        self.facts
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::RomMapping {
+                    bank,
+                    rom_space,
+                    rom_start,
+                    rom_end,
+                    va_start,
+                    va_end,
+                } if self
+                    .conclusion(&format!("bank:{bank}"))
+                    .is_some_and(|conclusion| conclusion.state == ProofState::Proven) =>
+                {
+                    Some(ProvenBankImageV1 {
+                        bank: bank.clone(),
+                        va_start: *va_start,
+                        va_end: *va_end,
+                        backing: BankBackingV1::RomAffine {
+                            rom_space: *rom_space,
+                            rom_start: *rom_start,
+                            rom_end: *rom_end,
+                        },
+                    })
+                }
+                Fact::EvaluatedImage {
+                    bank,
+                    va_start,
+                    va_end,
+                    receipt,
+                } if self
+                    .conclusion(&format!("bank:{bank}"))
+                    .is_some_and(|conclusion| conclusion.state == ProofState::Proven) =>
+                {
+                    Some(ProvenBankImageV1 {
+                        bank: bank.clone(),
+                        va_start: *va_start,
+                        va_end: *va_end,
+                        backing: BankBackingV1::Materialized {
+                            receipt_sha256: evaluated_image_receipt_sha256_v1(receipt),
+                            output_len: receipt.output_len,
+                        },
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Proven executable intervals for `bank`, sorted by address. An empty
     /// result means no provider has separated text from the load image yet;
     /// callers may retain their legacy whole-image behavior but must not
@@ -1270,6 +1510,34 @@ impl FactDb {
 mod tests {
     use super::*;
 
+    fn evaluated_receipt() -> EvaluatedImageReceiptV1 {
+        EvaluatedImageReceiptV1 {
+            evaluator: MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 1 },
+            source: MaterializedImageSourceV1 {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: 0x2000,
+                rom_end: 0x2040,
+                cursor: 4,
+            },
+            source_sha256: "11".repeat(32),
+            output_len: 8,
+            output_sha256: "22".repeat(32),
+            streams: vec![MaterializedImageStreamV1 {
+                source_range: MaterializedByteRangeV1 { start: 4, end: 32 },
+                encoded_range: MaterializedByteRangeV1 { start: 10, end: 32 },
+                output_range: MaterializedByteRangeV1 { start: 0, end: 8 },
+                declared_output_len: 8,
+                source_sha256: "33".repeat(32),
+                output_sha256: "22".repeat(32),
+            }],
+            trailing_suffix: MaterializedImageSuffixV1 {
+                offset: 32,
+                len: 32,
+                sha256: "44".repeat(32),
+            },
+        }
+    }
+
     fn banks(fact: &Fact) -> Vec<String> {
         fact.referenced_banks()
             .into_iter()
@@ -1326,6 +1594,14 @@ mod tests {
             destination_end: 8,
         })
         .is_empty());
+        let evaluated = Fact::EvaluatedImage {
+            bank: "image".into(),
+            va_start: 0x8020_0000,
+            va_end: 0x8020_0008,
+            receipt: evaluated_receipt(),
+        };
+        assert_eq!(evaluated.primary_bank(), Some("image"));
+        assert_eq!(banks(&evaluated), vec!["image"]);
 
         let nested = [
             FunctionEntryEvidence::DirectJal {
@@ -1680,6 +1956,69 @@ mod tests {
         assert!(index
             .project("candidate_overlay")
             .conclusion(&covering_subject)
+            .is_none());
+    }
+
+    #[test]
+    fn projection_routes_virtual_source_backing_to_proven_evaluated_image() {
+        let mut db = FactDb::new();
+        let mut receipt = evaluated_receipt();
+        receipt.source.rom_space = RomAddressSpace::Virtual;
+        receipt.source.rom_start = 0x7100;
+        receipt.source.rom_end = 0x7180;
+        let evaluated = db.insert(Fact::EvaluatedImage {
+            bank: "materialized".into(),
+            va_start: 0x8040_0000,
+            va_end: 0x8040_0008,
+            receipt: receipt.clone(),
+        });
+        db.conclude(
+            "bank:materialized",
+            ProofState::Proven,
+            vec![evaluated],
+            "test full proof",
+        )
+        .unwrap();
+        let candidate = db.insert(Fact::EvaluatedImage {
+            bank: "candidate_materialized".into(),
+            va_start: 0x8050_0000,
+            va_end: 0x8050_0008,
+            receipt,
+        });
+        db.conclude(
+            "bank:candidate_materialized",
+            ProofState::Supported,
+            vec![candidate],
+            "candidate evaluation only",
+        )
+        .unwrap();
+        let backing = db.insert(Fact::LoadImageTableRecord {
+            table: "files".into(),
+            bank: None,
+            table_space: RomAddressSpace::Physical,
+            table_offset: 0x100,
+            index: 7,
+            source_space: MappingAddressSpace::VirtualRom,
+            source_start: 0x7000,
+            source_end: 0x7200,
+            destination_space: MappingAddressSpace::PhysicalRom,
+            destination_start: 0x9000,
+            destination_end: 0x9200,
+        });
+        let backing_subject = load_image_table_record_subject("files", 7);
+        db.conclude(&backing_subject, ProofState::Proven, vec![backing], "file")
+            .unwrap();
+
+        let index = FactProjectionIndex::new(&db).unwrap();
+        let projected = index.project("materialized");
+        assert!(projected.conclusion(&backing_subject).is_some());
+        assert!(projected.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::LoadImageTableRecord { table, index: 7, .. } if table == "files"
+        )));
+        assert!(index
+            .project("candidate_materialized")
+            .conclusion(&backing_subject)
             .is_none());
     }
 
@@ -2200,5 +2539,166 @@ mod tests {
         let proven = db.proven_rom_mappings();
         assert_eq!(proven.len(), 1);
         assert!(matches!(proven[0], Fact::RomMapping { bank, .. } if bank == "boot"));
+    }
+
+    #[test]
+    fn evaluated_image_receipt_identity_is_stable_content_only() {
+        let receipt = evaluated_receipt();
+        let digest = evaluated_image_receipt_sha256_v1(&receipt);
+        assert_eq!(digest.len(), 64);
+        assert_eq!(digest, evaluated_image_receipt_sha256_v1(&receipt));
+
+        let wire = serde_json::to_value(&receipt).unwrap();
+        assert!(wire.get("bytes").is_none());
+        assert!(wire["streams"][0].get("bytes").is_none());
+        assert!(wire["trailing_suffix"].get("bytes").is_none());
+
+        let mut changed = receipt;
+        changed.trailing_suffix.len += 1;
+        assert_ne!(digest, evaluated_image_receipt_sha256_v1(&changed));
+    }
+
+    #[test]
+    fn proven_bank_images_preserve_typed_backing_and_proof_gate() {
+        let mut db = FactDb::new();
+        let affine = db.insert(Fact::RomMapping {
+            bank: "affine".into(),
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x1000,
+            rom_end: 0x1010,
+            va_start: 0x8010_0000,
+            va_end: 0x8010_0010,
+        });
+        let supported = db.insert(Fact::EvaluatedImage {
+            bank: "supported".into(),
+            va_start: 0x8020_0000,
+            va_end: 0x8020_0008,
+            receipt: evaluated_receipt(),
+        });
+        let receipt = evaluated_receipt();
+        let materialized_digest = evaluated_image_receipt_sha256_v1(&receipt);
+        let materialized = db.insert(Fact::EvaluatedImage {
+            bank: "materialized".into(),
+            va_start: 0x8030_0000,
+            va_end: 0x8030_0008,
+            receipt,
+        });
+        db.conclude("bank:affine", ProofState::Proven, vec![affine], "test")
+            .unwrap();
+        db.conclude(
+            "bank:supported",
+            ProofState::Supported,
+            vec![supported],
+            "candidate evaluation only",
+        )
+        .unwrap();
+        db.conclude(
+            "bank:materialized",
+            ProofState::Proven,
+            vec![materialized],
+            "test full proof",
+        )
+        .unwrap();
+
+        assert_eq!(db.proven_rom_mappings().len(), 1);
+        assert_eq!(
+            db.proven_bank_images(),
+            vec![
+                ProvenBankImageV1 {
+                    bank: "affine".into(),
+                    va_start: 0x8010_0000,
+                    va_end: 0x8010_0010,
+                    backing: BankBackingV1::RomAffine {
+                        rom_space: RomAddressSpace::Virtual,
+                        rom_start: 0x1000,
+                        rom_end: 0x1010,
+                    },
+                },
+                ProvenBankImageV1 {
+                    bank: "materialized".into(),
+                    va_start: 0x8030_0000,
+                    va_end: 0x8030_0008,
+                    backing: BankBackingV1::Materialized {
+                        receipt_sha256: materialized_digest,
+                        output_len: 8,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_retains_evaluated_image_canonical_bank_authority() {
+        let mut db = FactDb::new();
+        let fact = db.insert(Fact::EvaluatedImage {
+            bank: "materialized".into(),
+            va_start: 0x8030_0000,
+            va_end: 0x8030_0008,
+            receipt: evaluated_receipt(),
+        });
+        db.conclude(
+            "bank:materialized",
+            ProofState::Proven,
+            vec![fact],
+            "test full proof",
+        )
+        .unwrap();
+
+        let projection = FactProjectionIndex::new(&db).unwrap();
+        let projected = projection.project("materialized");
+        assert!(matches!(
+            projected.facts(),
+            [Fact::EvaluatedImage { bank, .. }] if bank == "materialized"
+        ));
+        assert_eq!(projected.proven_bank_images(), db.proven_bank_images());
+    }
+
+    #[test]
+    fn proven_bank_images_retain_same_bank_backing_ambiguity() {
+        let mut db = FactDb::new();
+        let affine = db.insert(Fact::RomMapping {
+            bank: "ambiguous".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x1000,
+            rom_end: 0x1008,
+            va_start: 0x8040_0000,
+            va_end: 0x8040_0008,
+        });
+        let evaluated = db.insert(Fact::EvaluatedImage {
+            bank: "ambiguous".into(),
+            va_start: 0x8040_0000,
+            va_end: 0x8040_0008,
+            receipt: evaluated_receipt(),
+        });
+        db.conclude(
+            "bank:ambiguous",
+            ProofState::Proven,
+            vec![affine, evaluated],
+            "test competing proven evidence",
+        )
+        .unwrap();
+
+        let images = db.proven_bank_images();
+        assert_eq!(images.len(), 2);
+        assert!(matches!(images[0].backing, BankBackingV1::RomAffine { .. }));
+        assert!(matches!(
+            images[1].backing,
+            BankBackingV1::Materialized { .. }
+        ));
+    }
+
+    #[test]
+    fn materialized_backing_span_wire_has_no_rom_coordinates() {
+        let span = BankBackingSpanV1::Materialized {
+            receipt_sha256: "55".repeat(32),
+            output_start: 4,
+            output_end: 12,
+        };
+        let wire = serde_json::to_value(span).unwrap();
+        assert_eq!(wire["kind"], "materialized");
+        assert!(wire.get("rom_start").is_none());
+        assert!(wire.get("rom_end").is_none());
+        assert_eq!(wire["output_start"], 4);
+        assert_eq!(wire["output_end"], 12);
     }
 }
