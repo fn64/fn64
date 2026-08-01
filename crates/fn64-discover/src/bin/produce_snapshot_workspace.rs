@@ -5,8 +5,8 @@
 //! paths, and the manifest is published last as the completion marker.
 
 use fn64_discover::facts::{
-    function_entry_subject, load_image_table_record_subject, BankBackingV1, CandidateDetector,
-    MappingAddressSpace, ProofState,
+    function_entry_subject, load_image_table_record_subject, BankBackingSpanV1, BankBackingV1,
+    CandidateDetector, MappingAddressSpace, ProofState,
 };
 use fn64_discover::file_table::{VromMaterializationLimits, DEFAULT_MAX_DECODED_VROM_FILE_BYTES};
 use fn64_discover::grade_candidates::{
@@ -16,7 +16,7 @@ use fn64_discover::materialized_image::MaterializedImageLimitsV1;
 use fn64_discover::owner_proof::OwnerAssessment;
 use fn64_discover::snapshot::{
     compose_materialized_bank_validated_v2, compose_materialized_banks_validated_v2_with_limits,
-    MultiBankCompositionLimits, ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V5,
+    MultiBankCompositionLimits, ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V6,
 };
 use fn64_discover::snapshot_inputs::{
     prepare_snapshot_banks_with_limits, PrepareSnapshotBanksLimits,
@@ -49,6 +49,13 @@ const COMPOSITION_LIMITS: MultiBankCompositionLimits = MultiBankCompositionLimit
     max_projected_fact_bytes: 256 * MIB,
     max_aggregate_materialized_bytes: 256 * MIB,
     max_cross_bank_authority_records: 1_048_576,
+    materialized_image: MaterializedImageLimitsV1 {
+        max_source_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_decoded_vrom_file_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_stream_output_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_aggregate_output_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+        max_streams: 4096,
+    },
 };
 const PREPARATION_LIMITS: PrepareSnapshotBanksLimits = PrepareSnapshotBanksLimits {
     max_banks: MAX_BANKS,
@@ -66,6 +73,7 @@ const DISCOVERY_LIMITS: AutoDiscoveryLimits = AutoDiscoveryLimits {
         max_decoded_file_bytes: DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
     },
 };
+const SNAPSHOT_WORKSPACE_SCHEMA_V4: u32 = 4;
 
 #[derive(Serialize)]
 struct WorkspaceManifest<'a> {
@@ -152,9 +160,7 @@ struct SnapshotWireReceipt {
 struct BankReceipt {
     index: usize,
     bank: String,
-    rom_space: RomAddressSpace,
-    rom_start: u32,
-    rom_end: u32,
+    backing: BankBackingSpanV1,
     va_start: u32,
     va_end: u32,
     byte_length: usize,
@@ -238,7 +244,7 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
             .transpose()?;
         let manifest = WorkspaceManifest {
             schema: "fn64.snapshot-workspace",
-            schema_version: if cold_training.is_some() { 3 } else { 1 },
+            schema_version: SNAPSHOT_WORKSPACE_SCHEMA_V4,
             state: WorkspaceState::Open,
             open_reason: Some("no_proven_banks"),
             normalized_rom_sha256: &discovery.rom.sha256,
@@ -418,9 +424,11 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         bank_receipts.push(BankReceipt {
             index,
             bank: bank.bank.clone(),
-            rom_space: *rom_space,
-            rom_start: *rom_start,
-            rom_end: *rom_end,
+            backing: BankBackingSpanV1::RomAffine {
+                rom_space: *rom_space,
+                rom_start: *rom_start,
+                rom_end: *rom_end,
+            },
             va_start: bank.va_start,
             va_end: bank.va_end,
             byte_length: bank.bytes.len(),
@@ -437,11 +445,7 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
 
     let manifest = WorkspaceManifest {
         schema: "fn64.snapshot-workspace",
-        schema_version: match &mode {
-            OutputMode::GhidraFull => 1,
-            OutputMode::GhidraSelected(_) => 2,
-            OutputMode::ColdTraining => 3,
-        },
+        schema_version: SNAPSHOT_WORKSPACE_SCHEMA_V4,
         state: WorkspaceState::Composed,
         open_reason: None,
         normalized_rom_sha256: &discovery.rom.sha256,
@@ -676,10 +680,10 @@ fn limits_receipt() -> LimitsReceipt {
 
 fn snapshot_wire_receipt() -> SnapshotWireReceipt {
     SnapshotWireReceipt {
-        schema_version: PROGRAM_SNAPSHOT_SCHEMA_V5,
+        schema_version: PROGRAM_SNAPSHOT_SCHEMA_V6,
         authority: "diagnostic_only",
         duplicates_fact_db_per_bank: false,
-        remaining_large_rom_frontier: "streaming_v5",
+        remaining_large_rom_frontier: "streaming_v6",
     }
 }
 
@@ -692,7 +696,7 @@ fn publish_manifest(path: &Path, manifest: &WorkspaceManifest<'_>) -> Result<(),
 
 fn program_snapshot_digest(serialized: &[u8]) -> Sha256Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"fn64.program-snapshot.v2\0");
+    hasher.update(b"fn64.program-snapshot.v3\0");
     hasher.update(serialized);
     Sha256Digest(hasher.finalize().into())
 }

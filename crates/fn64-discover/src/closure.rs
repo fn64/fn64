@@ -1416,12 +1416,18 @@ mod tests {
             va_end: evaluated_end,
             receipt: evaluated_receipt(evaluated_end - evaluated_start),
         });
+        let affine = snapshot
+            .facts
+            .facts()
+            .iter()
+            .position(|fact| matches!(fact, Fact::RomMapping { bank, .. } if bank == "bank"))
+            .unwrap();
         snapshot
             .facts
             .conclude(
                 "bank:bank",
                 ProofState::Proven,
-                vec![evaluated],
+                vec![affine, evaluated],
                 "test competing proven backing",
             )
             .unwrap();

@@ -1,13 +1,20 @@
 //! Versioned, content-bound Recompiler Pack for function-independent blocks.
 //!
 //! The portable pack contains identities, geometry, terminators, and hashes,
-//! never ROM words. Materialization re-verifies the normalized ROM and each
-//! block digest before exposing instruction words to a code generator.
+//! never ROM words. Materialization re-verifies the normalized ROM, any
+//! evaluator receipt, and each block digest before exposing instruction words
+//! to a code generator.
 
 use crate::block_proof::{BlockAssessment, ReachableCodeBlock};
 use crate::cfg::WordClass;
+use crate::facts::{BankBackingSpanV1, FactDb, RomAddressSpace};
+use crate::materialized_image::{
+    materialize_backing_span_v1, MaterializedBackingFactsRequirementV1,
+    MaterializedBackingSpanCacheV1, MaterializedBackingSpanErrorV1, MaterializedImageErrorV1,
+    MaterializedImageLimitsV1,
+};
 use crate::snapshot::{
-    ProgramSnapshotV1, ValidatedComposedSnapshotsV2, PROGRAM_SNAPSHOT_SCHEMA_V5,
+    ProgramSnapshotV1, ValidatedComposedSnapshotsV2, PROGRAM_SNAPSHOT_SCHEMA_V6,
 };
 use crate::NormalizedRom;
 use serde::{Deserialize, Serialize};
@@ -21,24 +28,80 @@ pub const BLOCK_PACK_SCHEMA_V1: u32 = 1;
 /// deserializes with `rom_space = Physical`, which is exactly what it meant,
 /// so existing packs stay readable and keep their meaning.
 pub const BLOCK_PACK_SCHEMA_V2: u32 = 2;
+/// V3 replaces flat ROM coordinates with a tagged affine-ROM or evaluated
+/// output span. No decoded bytes enter the portable wire.
+pub const BLOCK_PACK_SCHEMA_V3: u32 = 3;
 
 fn default_rom_space() -> crate::facts::RomAddressSpace {
     crate::facts::RomAddressSpace::Physical
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackedBlockV1 {
     pub start_va: u32,
     pub end_va: u32,
-    /// Address space `rom_start`/`rom_end` are expressed in. Absent in V1
-    /// packs, which were physical-only.
-    #[serde(default = "default_rom_space")]
-    pub rom_space: crate::facts::RomAddressSpace,
-    pub rom_start: u32,
-    pub rom_end: u32,
+    pub backing: BankBackingSpanV1,
     pub bytes_sha256: String,
     pub terminator: crate::cfg::BlockTerminator,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackedBlockV3Wire {
+    start_va: u32,
+    end_va: u32,
+    backing: BankBackingSpanV1,
+    bytes_sha256: String,
+    terminator: crate::cfg::BlockTerminator,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackedBlockLegacyWire {
+    start_va: u32,
+    end_va: u32,
+    #[serde(default = "default_rom_space")]
+    rom_space: RomAddressSpace,
+    rom_start: u32,
+    rom_end: u32,
+    bytes_sha256: String,
+    terminator: crate::cfg::BlockTerminator,
+}
+
+impl<'de> Deserialize<'de> for PackedBlockV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            V3(PackedBlockV3Wire),
+            Legacy(PackedBlockLegacyWire),
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::V3(wire) => Self {
+                start_va: wire.start_va,
+                end_va: wire.end_va,
+                backing: wire.backing,
+                bytes_sha256: wire.bytes_sha256,
+                terminator: wire.terminator,
+            },
+            Wire::Legacy(wire) => Self {
+                start_va: wire.start_va,
+                end_va: wire.end_va,
+                backing: BankBackingSpanV1::RomAffine {
+                    rom_space: wire.rom_space,
+                    rom_start: wire.rom_start,
+                    rom_end: wire.rom_end,
+                },
+                bytes_sha256: wire.bytes_sha256,
+                terminator: wire.terminator,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +179,11 @@ pub enum BlockPackError {
         bank: String,
         start_va: u32,
     },
+    LegacySchemaMaterializedBacking {
+        schema_version: u32,
+        bank: String,
+        start_va: u32,
+    },
     RomIdentityMismatch,
     NoProvenBlocks {
         bank: String,
@@ -142,6 +210,12 @@ pub enum BlockPackError {
         rom_start: u32,
         rom_end: u32,
     },
+    BackingSpanLimitExceeded {
+        bank: String,
+        start_va: u32,
+        bytes: usize,
+        limit: usize,
+    },
     BlockDigestMismatch {
         bank: String,
         start_va: u32,
@@ -152,6 +226,27 @@ pub enum BlockPackError {
     VromRequiresFacts {
         bank: String,
         start_va: u32,
+    },
+    MaterializedRequiresFacts {
+        bank: String,
+        start_va: u32,
+    },
+    MissingEvaluatedImageReceipt {
+        bank: String,
+        start_va: u32,
+        receipt_sha256: String,
+    },
+    AmbiguousEvaluatedImageReceipt {
+        bank: String,
+        start_va: u32,
+        receipt_sha256: String,
+        count: usize,
+    },
+    EvaluatedImageRederivation {
+        bank: String,
+        start_va: u32,
+        receipt_sha256: String,
+        error: MaterializedImageErrorV1,
     },
 }
 
@@ -220,18 +315,29 @@ impl std::error::Error for BlockPackError {}
 ///
 /// This compatibility API does not carry execution authority: callers can
 /// construct or deserialize `ProgramSnapshotV1`. Current execution gates must
-/// use [`emit_validated_block_pack_v2`], whose opaque composition wrapper can
-/// only come from the byte-verifying snapshot pipeline.
+/// use [`emit_validated_block_pack_v3`], whose opaque composition wrapper can
+/// only come from the byte-verifying snapshot pipeline. The historical Rust
+/// function name is retained, but a V6 snapshot always emits a V3 pack.
 pub fn emit_block_pack_v1(
     snapshot: &ProgramSnapshotV1,
     rom: &NormalizedRom,
 ) -> Result<BlockPackV1, BlockPackError> {
-    emit_block_pack_from_snapshot(snapshot, rom, BLOCK_PACK_SCHEMA_V1)
+    emit_block_pack_from_snapshot(snapshot, rom)
 }
 
-/// Emit one authoritative V2 pack from an exact member of a move-only,
-/// byte-verified composition.
+/// Historical name retained for callers while the pack wire advances to V3.
+/// A V6 composition always emits a V3 pack.
 pub fn emit_validated_block_pack_v2(
+    composition: &ValidatedComposedSnapshotsV2,
+    snapshot_index: usize,
+    rom: &NormalizedRom,
+) -> Result<BlockPackV1, BlockPackError> {
+    emit_validated_block_pack_v3(composition, snapshot_index, rom)
+}
+
+/// Emit one authoritative V3 pack from an exact member of a move-only,
+/// byte-verified composition.
+pub fn emit_validated_block_pack_v3(
     composition: &ValidatedComposedSnapshotsV2,
     snapshot_index: usize,
     rom: &NormalizedRom,
@@ -242,17 +348,16 @@ pub fn emit_validated_block_pack_v2(
             count: composition.snapshots().len(),
         },
     )?;
-    emit_block_pack_from_snapshot(snapshot, rom, BLOCK_PACK_SCHEMA_V2)
+    emit_block_pack_from_snapshot(snapshot, rom)
 }
 
 fn emit_block_pack_from_snapshot(
     snapshot: &ProgramSnapshotV1,
     rom: &NormalizedRom,
-    output_schema: u32,
 ) -> Result<BlockPackV1, BlockPackError> {
-    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V5 {
+    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V6 {
         return Err(BlockPackError::UnsupportedSnapshotSchema {
-            expected: PROGRAM_SNAPSHOT_SCHEMA_V5,
+            expected: PROGRAM_SNAPSHOT_SCHEMA_V6,
             actual: snapshot.schema_version,
         });
     }
@@ -261,6 +366,7 @@ fn emit_block_pack_from_snapshot(
     }
     let mut banks = Vec::with_capacity(snapshot.banks.len());
     let mut bank_ids = BTreeSet::new();
+    let mut materialized_cache = MaterializedBackingSpanCacheV1::default();
     for bank_snapshot in &snapshot.banks {
         let bank = &bank_snapshot.input.bank;
         let mut proven: Vec<&ReachableCodeBlock> = bank_snapshot
@@ -276,26 +382,14 @@ fn emit_block_pack_from_snapshot(
         if proven.is_empty() {
             return Err(BlockPackError::NoProvenBlocks { bank: bank.clone() });
         }
-        if output_schema == BLOCK_PACK_SCHEMA_V1
-            && proven
-                .iter()
-                .any(|block| block.rom_space != crate::facts::RomAddressSpace::Physical)
-        {
-            return Err(BlockPackError::LegacySchemaVirtualBacking {
-                bank: bank.clone(),
-                start_va: proven
-                    .iter()
-                    .find(|block| block.rom_space != crate::facts::RomAddressSpace::Physical)
-                    .expect("nonphysical block exists")
-                    .start_va,
-            });
-        }
         let geometry = complete_severed_delay_slots(
             &proven,
             &bank_snapshot.closure.cfg.word_class,
             rom,
             &snapshot.facts,
-        );
+            MaterializedImageLimitsV1::default(),
+            &mut materialized_cache,
+        )?;
         validate_completed_geometry(bank, &geometry)?;
         let bank_id = stable_bank_id(&snapshot.normalized_rom_sha256, bank);
         if !bank_ids.insert(bank_id) {
@@ -306,31 +400,21 @@ fn emit_block_pack_from_snapshot(
         }
         let mut blocks = Vec::with_capacity(geometry.len());
         for (block, geom) in proven.iter().zip(&geometry) {
-            // Resolve the block's backing bytes in its own address space: a
-            // physically-resident block slices the image, a VROM (DMA-loaded)
-            // block resolves through its one proven file-table record. The
-            // digest below is over the resolved bytes either way, so a pack
-            // stays byte-bound regardless of how the bank reaches RDRAM.
-            let resolved = crate::banks::materialize_rom_range(
+            let bytes = materialize_pack_backing_span(
                 rom,
-                &snapshot.facts,
-                block.rom_space,
-                geom.rom_start,
-                geom.rom_end,
-            )
-            .map_err(|_| BlockPackError::RomRangeOutsideImage {
-                bank: bank.clone(),
-                rom_start: geom.rom_start,
-                rom_end: geom.rom_end,
-            })?;
-            let bytes = resolved.bytes.as_slice();
+                Some(&snapshot.facts),
+                bank,
+                geom.start_va,
+                geom.end_va,
+                &geom.backing,
+                MaterializedImageLimitsV1::default(),
+                &mut materialized_cache,
+            )?;
             blocks.push(PackedBlockV1 {
                 start_va: geom.start_va,
                 end_va: geom.end_va,
-                rom_space: block.rom_space,
-                rom_start: geom.rom_start,
-                rom_end: geom.rom_end,
-                bytes_sha256: sha256_hex(bytes),
+                backing: geom.backing.clone(),
+                bytes_sha256: sha256_hex(&bytes),
                 terminator: block.terminator.clone(),
             });
         }
@@ -342,15 +426,14 @@ fn emit_block_pack_from_snapshot(
     }
     banks.sort_by(|left, right| left.bank.cmp(&right.bank));
     Ok(BlockPackV1 {
-        schema_version: output_schema,
+        schema_version: BLOCK_PACK_SCHEMA_V3,
         normalized_rom_sha256: snapshot.normalized_rom_sha256.clone(),
         banks,
     })
 }
 
-/// Materialize a pack whose blocks are all physically resident. A VROM-backed
-/// block returns [`BlockPackError::VromRequiresFacts`]; use
-/// [`materialize_block_pack_with_facts`] for packs that carry one.
+/// Materialize a pack whose blocks are all physically resident. VROM and
+/// evaluated-image spans require the fact database accepted by discovery.
 pub fn materialize_block_pack(
     pack: &BlockPackV1,
     rom: &NormalizedRom,
@@ -358,17 +441,20 @@ pub fn materialize_block_pack(
     materialize_block_pack_with_facts(pack, rom, None)
 }
 
-/// Materialize a pack, resolving each block in its own address space. `facts`
-/// supplies the proven file-table records a VROM (DMA-loaded, possibly
-/// compressed) block needs; physical blocks never consult it.
+/// Materialize a pack, resolving each block through its tagged backing.
+/// `facts` supplies proven file-table records for VROM and the exact evaluated
+/// image receipt for materialized output; physical blocks never consult it.
 pub fn materialize_block_pack_with_facts(
     pack: &BlockPackV1,
     rom: &NormalizedRom,
     facts: Option<&crate::facts::FactDb>,
 ) -> Result<Vec<MaterializedPackedBank>, BlockPackError> {
-    if pack.schema_version != BLOCK_PACK_SCHEMA_V1 && pack.schema_version != BLOCK_PACK_SCHEMA_V2 {
+    if !matches!(
+        pack.schema_version,
+        BLOCK_PACK_SCHEMA_V1 | BLOCK_PACK_SCHEMA_V2 | BLOCK_PACK_SCHEMA_V3
+    ) {
         return Err(BlockPackError::UnsupportedSchema {
-            expected: BLOCK_PACK_SCHEMA_V2,
+            expected: BLOCK_PACK_SCHEMA_V3,
             actual: pack.schema_version,
         });
     }
@@ -377,6 +463,7 @@ pub fn materialize_block_pack_with_facts(
     }
     let mut output = Vec::with_capacity(pack.banks.len());
     let mut bank_ids = BTreeSet::new();
+    let mut materialized_cache = MaterializedBackingSpanCacheV1::default();
     for bank in &pack.banks {
         if bank.blocks.is_empty() {
             return Err(BlockPackError::NoProvenBlocks {
@@ -392,47 +479,18 @@ pub fn materialize_block_pack_with_facts(
         }
         let mut blocks = Vec::with_capacity(bank.blocks.len());
         for block in &bank.blocks {
-            if pack.schema_version == BLOCK_PACK_SCHEMA_V1
-                && block.rom_space != crate::facts::RomAddressSpace::Physical
-            {
-                return Err(BlockPackError::LegacySchemaVirtualBacking {
-                    bank: bank.bank.clone(),
-                    start_va: block.start_va,
-                });
-            }
-            let resolved;
-            let bytes = match (block.rom_space, facts) {
-                (crate::facts::RomAddressSpace::Physical, _) => rom
-                    .bytes
-                    .get(block.rom_start as usize..block.rom_end as usize),
-                (crate::facts::RomAddressSpace::Virtual, Some(facts)) => {
-                    resolved = crate::banks::materialize_rom_range(
-                        rom,
-                        facts,
-                        crate::facts::RomAddressSpace::Virtual,
-                        block.rom_start,
-                        block.rom_end,
-                    )
-                    .map_err(|_| BlockPackError::RomRangeOutsideImage {
-                        bank: bank.bank.clone(),
-                        rom_start: block.rom_start,
-                        rom_end: block.rom_end,
-                    })?;
-                    Some(resolved.bytes.as_slice())
-                }
-                (crate::facts::RomAddressSpace::Virtual, None) => {
-                    return Err(BlockPackError::VromRequiresFacts {
-                        bank: bank.bank.clone(),
-                        start_va: block.start_va,
-                    });
-                }
-            }
-            .ok_or(BlockPackError::RomRangeOutsideImage {
-                bank: bank.bank.clone(),
-                rom_start: block.rom_start,
-                rom_end: block.rom_end,
-            })?;
-            if sha256_hex(bytes) != block.bytes_sha256 {
+            validate_schema_backing(pack.schema_version, &bank.bank, block)?;
+            let bytes = materialize_pack_backing_span(
+                rom,
+                facts,
+                &bank.bank,
+                block.start_va,
+                block.end_va,
+                &block.backing,
+                MaterializedImageLimitsV1::default(),
+                &mut materialized_cache,
+            )?;
+            if sha256_hex(&bytes) != block.bytes_sha256 {
                 return Err(BlockPackError::BlockDigestMismatch {
                     bank: bank.bank.clone(),
                     start_va: block.start_va,
@@ -453,6 +511,114 @@ pub fn materialize_block_pack_with_facts(
         });
     }
     Ok(output)
+}
+
+fn validate_schema_backing(
+    schema_version: u32,
+    bank: &str,
+    block: &PackedBlockV1,
+) -> Result<(), BlockPackError> {
+    match (schema_version, &block.backing) {
+        (
+            BLOCK_PACK_SCHEMA_V1,
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Virtual,
+                ..
+            },
+        ) => Err(BlockPackError::LegacySchemaVirtualBacking {
+            bank: bank.to_owned(),
+            start_va: block.start_va,
+        }),
+        (BLOCK_PACK_SCHEMA_V1 | BLOCK_PACK_SCHEMA_V2, BankBackingSpanV1::Materialized { .. }) => {
+            Err(BlockPackError::LegacySchemaMaterializedBacking {
+                schema_version,
+                bank: bank.to_owned(),
+                start_va: block.start_va,
+            })
+        }
+        (BLOCK_PACK_SCHEMA_V1 | BLOCK_PACK_SCHEMA_V2 | BLOCK_PACK_SCHEMA_V3, _) => Ok(()),
+        _ => unreachable!("pack schema was validated before block backing"),
+    }
+}
+
+fn materialize_pack_backing_span(
+    rom: &NormalizedRom,
+    facts: Option<&FactDb>,
+    bank: &str,
+    start_va: u32,
+    end_va: u32,
+    backing: &BankBackingSpanV1,
+    limits: MaterializedImageLimitsV1,
+    materialized_cache: &mut MaterializedBackingSpanCacheV1,
+) -> Result<Vec<u8>, BlockPackError> {
+    materialize_backing_span_v1(
+        rom,
+        facts,
+        bank,
+        start_va,
+        end_va,
+        backing,
+        limits,
+        materialized_cache,
+    )
+    .map_err(|error| match error {
+        MaterializedBackingSpanErrorV1::InvalidGeometry => BlockPackError::InvalidGeometry {
+            bank: bank.to_owned(),
+            start_va,
+        },
+        MaterializedBackingSpanErrorV1::SpanLimitExceeded { bytes, limit } => {
+            BlockPackError::BackingSpanLimitExceeded {
+                bank: bank.to_owned(),
+                start_va,
+                bytes,
+                limit,
+            }
+        }
+        MaterializedBackingSpanErrorV1::FactsRequired {
+            requirement: MaterializedBackingFactsRequirementV1::VirtualRom,
+        } => BlockPackError::VromRequiresFacts {
+            bank: bank.to_owned(),
+            start_va,
+        },
+        MaterializedBackingSpanErrorV1::FactsRequired {
+            requirement: MaterializedBackingFactsRequirementV1::EvaluatedImage,
+        } => BlockPackError::MaterializedRequiresFacts {
+            bank: bank.to_owned(),
+            start_va,
+        },
+        MaterializedBackingSpanErrorV1::RomMaterialization {
+            rom_start, rom_end, ..
+        } => BlockPackError::RomRangeOutsideImage {
+            bank: bank.to_owned(),
+            rom_start,
+            rom_end,
+        },
+        MaterializedBackingSpanErrorV1::MissingEvaluatedImageReceipt { receipt_sha256 } => {
+            BlockPackError::MissingEvaluatedImageReceipt {
+                bank: bank.to_owned(),
+                start_va,
+                receipt_sha256,
+            }
+        }
+        MaterializedBackingSpanErrorV1::AmbiguousEvaluatedImageReceipt {
+            receipt_sha256,
+            count,
+        } => BlockPackError::AmbiguousEvaluatedImageReceipt {
+            bank: bank.to_owned(),
+            start_va,
+            receipt_sha256,
+            count,
+        },
+        MaterializedBackingSpanErrorV1::EvaluatedImageRederivation {
+            receipt_sha256,
+            error,
+        } => BlockPackError::EvaluatedImageRederivation {
+            bank: bank.to_owned(),
+            start_va,
+            receipt_sha256,
+            error,
+        },
+    })
 }
 
 /// Union the exact instruction words observed in one trace bank generation
@@ -940,11 +1106,9 @@ fn validate_packed_geometry(bank: &str, blocks: &[PackedBlockV1]) -> Result<(), 
     for block in sorted {
         if !block.start_va.is_multiple_of(4)
             || !block.end_va.is_multiple_of(4)
-            || !block.rom_start.is_multiple_of(4)
-            || !block.rom_end.is_multiple_of(4)
             || block.end_va <= block.start_va
-            || block.rom_end.checked_sub(block.rom_start)
-                != block.end_va.checked_sub(block.start_va)
+            || !backing_is_word_aligned(&block.backing)
+            || backing_len(&block.backing) != block.end_va.checked_sub(block.start_va)
         {
             return Err(BlockPackError::InvalidGeometry {
                 bank: bank.into(),
@@ -965,14 +1129,13 @@ fn validate_packed_geometry(bank: &str, blocks: &[PackedBlockV1]) -> Result<(), 
     Ok(())
 }
 
-/// A proven block's emitted VA/ROM extents after delay-slot completion. Byte
-/// length is preserved between the VA and ROM views.
-#[derive(Clone, Copy)]
+/// A proven block's emitted VA/backing extents after delay-slot completion.
+/// Byte length is preserved between runtime and typed backing views.
+#[derive(Clone)]
 struct CompletedGeometry {
     start_va: u32,
     end_va: u32,
-    rom_start: u32,
-    rom_end: u32,
+    backing: BankBackingSpanV1,
 }
 
 /// Realize the "control transfer and its delay slot are one architecturally
@@ -989,54 +1152,75 @@ fn complete_severed_delay_slots(
     blocks: &[&ReachableCodeBlock],
     word_class: &BTreeMap<u32, WordClass>,
     rom: &NormalizedRom,
-    facts: &crate::facts::FactDb,
-) -> Vec<CompletedGeometry> {
+    facts: &FactDb,
+    limits: MaterializedImageLimitsV1,
+    materialized_cache: &mut MaterializedBackingSpanCacheV1,
+) -> Result<Vec<CompletedGeometry>, BlockPackError> {
     let admitted: BTreeSet<u32> = blocks
         .iter()
         .flat_map(|block| (block.start_va..block.end_va).step_by(4))
         .collect();
     blocks
         .iter()
-        .map(|block| {
+        .map(|block| -> Result<CompletedGeometry, BlockPackError> {
             let mut geom = CompletedGeometry {
                 start_va: block.start_va,
                 end_va: block.end_va,
-                rom_start: block.rom_start,
-                rom_end: block.rom_end,
+                backing: block.backing.clone(),
             };
             let delay_slot_va = block.end_va;
-            let last_word_control = block
-                .rom_end
-                .checked_sub(4)
-                .and_then(|start| {
-                    crate::banks::materialize_rom_range(
-                        rom,
-                        facts,
-                        block.rom_space,
-                        start,
-                        block.rom_end,
-                    )
-                    .ok()
-                })
-                .map(|bytes| {
-                    fn64_recomp_rs::decode(u32::from_be_bytes(
-                        bytes.bytes.as_slice().try_into().unwrap(),
-                    ))
-                    .has_delay_slot()
-                })
-                .unwrap_or(false);
+            let last_start_va =
+                block
+                    .end_va
+                    .checked_sub(4)
+                    .ok_or_else(|| BlockPackError::InvalidGeometry {
+                        bank: block.bank.clone(),
+                        start_va: block.start_va,
+                    })?;
+            let last_backing = backing_last_word(&block.backing).ok_or_else(|| {
+                BlockPackError::InvalidGeometry {
+                    bank: block.bank.clone(),
+                    start_va: block.start_va,
+                }
+            })?;
+            let last_bytes = materialize_pack_backing_span(
+                rom,
+                Some(facts),
+                &block.bank,
+                last_start_va,
+                block.end_va,
+                &last_backing,
+                limits,
+                materialized_cache,
+            )?;
+            let last_word: [u8; 4] =
+                last_bytes
+                    .try_into()
+                    .map_err(|_| BlockPackError::InvalidGeometry {
+                        bank: block.bank.clone(),
+                        start_va: block.start_va,
+                    })?;
+            let last_word_control =
+                fn64_recomp_rs::decode(u32::from_be_bytes(last_word)).has_delay_slot();
             if last_word_control
                 && word_class.get(&delay_slot_va) == Some(&WordClass::ProvenCode)
                 && !admitted.contains(&delay_slot_va)
             {
-                if let (Some(end_va), Some(rom_end)) =
-                    (geom.end_va.checked_add(4), geom.rom_end.checked_add(4))
-                {
-                    geom.end_va = end_va;
-                    geom.rom_end = rom_end;
-                }
+                geom.end_va =
+                    geom.end_va
+                        .checked_add(4)
+                        .ok_or_else(|| BlockPackError::InvalidGeometry {
+                            bank: block.bank.clone(),
+                            start_va: block.start_va,
+                        })?;
+                extend_backing_end(&mut geom.backing, 4).ok_or_else(|| {
+                    BlockPackError::InvalidGeometry {
+                        bank: block.bank.clone(),
+                        start_va: block.start_va,
+                    }
+                })?;
             }
-            geom
+            Ok(geom)
         })
         .collect()
 }
@@ -1050,8 +1234,8 @@ fn validate_completed_geometry(
         if !block.start_va.is_multiple_of(4)
             || !block.end_va.is_multiple_of(4)
             || block.end_va <= block.start_va
-            || block.rom_end.checked_sub(block.rom_start)
-                != block.end_va.checked_sub(block.start_va)
+            || !backing_is_word_aligned(&block.backing)
+            || backing_len(&block.backing) != block.end_va.checked_sub(block.start_va)
         {
             return Err(BlockPackError::InvalidGeometry {
                 bank: bank.into(),
@@ -1070,6 +1254,67 @@ fn validate_completed_geometry(
         previous_end = Some(block.end_va);
     }
     Ok(())
+}
+
+fn backing_len(backing: &BankBackingSpanV1) -> Option<u32> {
+    match backing {
+        BankBackingSpanV1::RomAffine {
+            rom_start, rom_end, ..
+        } => rom_end.checked_sub(*rom_start),
+        BankBackingSpanV1::Materialized {
+            output_start,
+            output_end,
+            ..
+        } => output_end.checked_sub(*output_start),
+    }
+}
+
+fn backing_is_word_aligned(backing: &BankBackingSpanV1) -> bool {
+    match backing {
+        BankBackingSpanV1::RomAffine {
+            rom_start, rom_end, ..
+        } => rom_start.is_multiple_of(4) && rom_end.is_multiple_of(4),
+        BankBackingSpanV1::Materialized {
+            output_start,
+            output_end,
+            ..
+        } => output_start.is_multiple_of(4) && output_end.is_multiple_of(4),
+    }
+}
+
+fn backing_last_word(backing: &BankBackingSpanV1) -> Option<BankBackingSpanV1> {
+    match backing {
+        BankBackingSpanV1::RomAffine {
+            rom_space,
+            rom_start,
+            rom_end,
+        } => Some(BankBackingSpanV1::RomAffine {
+            rom_space: *rom_space,
+            rom_start: rom_end.checked_sub(4).filter(|start| start >= rom_start)?,
+            rom_end: *rom_end,
+        }),
+        BankBackingSpanV1::Materialized {
+            receipt_sha256,
+            output_start,
+            output_end,
+        } => Some(BankBackingSpanV1::Materialized {
+            receipt_sha256: receipt_sha256.clone(),
+            output_start: output_end
+                .checked_sub(4)
+                .filter(|start| start >= output_start)?,
+            output_end: *output_end,
+        }),
+    }
+}
+
+fn extend_backing_end(backing: &mut BankBackingSpanV1, bytes: u32) -> Option<()> {
+    match backing {
+        BankBackingSpanV1::RomAffine { rom_end, .. } => *rom_end = rom_end.checked_add(bytes)?,
+        BankBackingSpanV1::Materialized { output_end, .. } => {
+            *output_end = output_end.checked_add(bytes)?
+        }
+    }
+    Some(())
 }
 
 fn stable_bank_id(rom_sha256: &str, bank: &str) -> u64 {
@@ -1088,8 +1333,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::cfg::BlockTerminator;
-    use crate::facts::RomAddressSpace;
+    use crate::facts::{
+        evaluated_image_receipt_sha256_v1, EvaluatedImageReceiptV1, Fact,
+        MaterializationEvaluatorV1, MaterializedImageSourceV1, ProofState, RomAddressSpace,
+    };
+    use crate::materialized_image::evaluate_materialized_image_v1;
+    use flate2::{write::DeflateEncoder, Compression};
     use fn64_recomp_rs::{BankId, CpuFaultKind, ExecutionKey, GuestPc, InstructionBudget};
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1115,6 +1366,61 @@ mod tests {
         crate::normalize(&bytes).unwrap()
     }
 
+    fn raw_deflate_stream(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut stream = Vec::with_capacity(6 + compressed.len());
+        stream.extend_from_slice(&[0x11, 0x72]);
+        stream.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        stream.extend_from_slice(&compressed);
+        stream
+    }
+
+    fn materialized_fixture() -> (NormalizedRom, FactDb, EvaluatedImageReceiptV1, Vec<u8>) {
+        let output = [NOP, JR_RA, NOP]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let encoded = raw_deflate_stream(&output);
+        let mut rom_bytes = vec![0; (ROM_BASE as usize + encoded.len() + 3) & !3];
+        rom_bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        rom_bytes[8..12].copy_from_slice(&ENTRY_PC.to_be_bytes());
+        rom_bytes[ROM_BASE as usize..ROM_BASE as usize + encoded.len()].copy_from_slice(&encoded);
+        let rom = crate::normalize(&rom_bytes).unwrap();
+        let source = MaterializedImageSourceV1 {
+            rom_space: RomAddressSpace::Physical,
+            rom_start: ROM_BASE,
+            rom_end: ROM_BASE + encoded.len() as u32,
+            cursor: 0,
+        };
+        let mut facts = FactDb::new();
+        let evaluation = evaluate_materialized_image_v1(
+            &rom,
+            &facts,
+            &source,
+            &MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 1 },
+            MaterializedImageLimitsV1::default(),
+        )
+        .unwrap();
+        let receipt = evaluation.receipt().clone();
+        let image = facts.insert(Fact::EvaluatedImage {
+            bank: "boot".into(),
+            va_start: ENTRY_PC,
+            va_end: ENTRY_PC + output.len() as u32,
+            receipt: receipt.clone(),
+        });
+        facts
+            .conclude(
+                "bank:boot",
+                ProofState::Proven,
+                vec![image],
+                "test evaluated image",
+            )
+            .unwrap();
+        (rom, facts, receipt, output)
+    }
+
     fn reachable_block(
         start_va: u32,
         end_va: u32,
@@ -1128,9 +1434,11 @@ mod tests {
                 ENTRY_PC,
             ])
             .unwrap(),
-            rom_space: RomAddressSpace::Physical,
-            rom_start: ROM_BASE + (start_va - ENTRY_PC),
-            rom_end: ROM_BASE + (end_va - ENTRY_PC),
+            backing: BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: ROM_BASE + (start_va - ENTRY_PC),
+                rom_end: ROM_BASE + (end_va - ENTRY_PC),
+            },
             terminator,
         }
     }
@@ -1210,9 +1518,19 @@ mod tests {
             &word_class,
             &rom,
             &crate::facts::FactDb::new(),
-        );
+            MaterializedImageLimitsV1::default(),
+            &mut MaterializedBackingSpanCacheV1::default(),
+        )
+        .unwrap();
         assert_eq!(geometry[0].end_va, ENTRY_PC + 0x0c);
-        assert_eq!(geometry[0].rom_end, ROM_BASE + 0x0c);
+        assert_eq!(
+            geometry[0].backing,
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: ROM_BASE,
+                rom_end: ROM_BASE + 0x0c,
+            }
+        );
     }
 
     #[test]
@@ -1232,7 +1550,10 @@ mod tests {
             &word_class,
             &rom,
             &crate::facts::FactDb::new(),
-        );
+            MaterializedImageLimitsV1::default(),
+            &mut MaterializedBackingSpanCacheV1::default(),
+        )
+        .unwrap();
         assert_eq!(geometry[0].end_va, ENTRY_PC + 8);
         assert_eq!(geometry[1].start_va, ENTRY_PC + 8);
     }
@@ -1251,8 +1572,154 @@ mod tests {
             &word_class,
             &rom,
             &crate::facts::FactDb::new(),
-        );
+            MaterializedImageLimitsV1::default(),
+            &mut MaterializedBackingSpanCacheV1::default(),
+        )
+        .unwrap();
         assert_eq!(geometry[0].end_va, ENTRY_PC + 0x0c);
+    }
+
+    #[test]
+    fn materialized_pack_rederives_receipt_and_extends_tagged_delay_slot() {
+        let (rom, facts, receipt, output) = materialized_fixture();
+        let receipt_sha256 = evaluated_image_receipt_sha256_v1(&receipt);
+        let block = ReachableCodeBlock {
+            bank: "boot".into(),
+            start_va: ENTRY_PC,
+            end_va: ENTRY_PC + 8,
+            authoritative_roots: crate::block_proof::AuthoritativeReachabilityRoots::new([
+                ENTRY_PC,
+            ])
+            .unwrap(),
+            backing: BankBackingSpanV1::Materialized {
+                receipt_sha256: receipt_sha256.clone(),
+                output_start: 0,
+                output_end: 8,
+            },
+            terminator: BlockTerminator::Fallthrough { next: ENTRY_PC + 8 },
+        };
+        let word_class = BTreeMap::from([
+            (ENTRY_PC, WordClass::ProvenCode),
+            (ENTRY_PC + 4, WordClass::ProvenCode),
+            (ENTRY_PC + 8, WordClass::ProvenCode),
+        ]);
+        let geometry = complete_severed_delay_slots(
+            &[&block],
+            &word_class,
+            &rom,
+            &facts,
+            MaterializedImageLimitsV1::default(),
+            &mut MaterializedBackingSpanCacheV1::default(),
+        )
+        .unwrap();
+        assert_eq!(geometry[0].end_va, ENTRY_PC + 12);
+        assert_eq!(
+            geometry[0].backing,
+            BankBackingSpanV1::Materialized {
+                receipt_sha256: receipt_sha256.clone(),
+                output_start: 0,
+                output_end: 12,
+            }
+        );
+
+        let pack = BlockPackV1 {
+            schema_version: BLOCK_PACK_SCHEMA_V3,
+            normalized_rom_sha256: rom.sha256.clone(),
+            banks: vec![PackedBankV1 {
+                bank: "boot".into(),
+                bank_id: BANK_A,
+                blocks: vec![PackedBlockV1 {
+                    start_va: ENTRY_PC,
+                    end_va: ENTRY_PC + 12,
+                    backing: geometry[0].backing.clone(),
+                    bytes_sha256: sha256_hex(&output),
+                    terminator: block.terminator.clone(),
+                }],
+            }],
+        };
+        let materialized = materialize_block_pack_with_facts(&pack, &rom, Some(&facts)).unwrap();
+        assert_eq!(materialized[0].blocks[0].words, vec![NOP, JR_RA, NOP]);
+        let wire = serde_json::to_string(&pack).unwrap();
+        assert!(wire.contains("\"kind\":\"materialized\""));
+        assert!(!wire.contains("\"words\""));
+
+        let mut tampered_receipt = receipt;
+        tampered_receipt.streams[0].output_sha256 = "00".repeat(32);
+        let tampered_digest = evaluated_image_receipt_sha256_v1(&tampered_receipt);
+        let mut tampered_facts = FactDb::new();
+        let tampered_image = tampered_facts.insert(Fact::EvaluatedImage {
+            bank: "boot".into(),
+            va_start: ENTRY_PC,
+            va_end: ENTRY_PC + 12,
+            receipt: tampered_receipt,
+        });
+        tampered_facts
+            .conclude(
+                "bank:boot",
+                ProofState::Proven,
+                vec![tampered_image],
+                "test tampered evaluated image",
+            )
+            .unwrap();
+        let mut tampered_pack = pack;
+        let BankBackingSpanV1::Materialized { receipt_sha256, .. } =
+            &mut tampered_pack.banks[0].blocks[0].backing
+        else {
+            panic!("test pack is materialized")
+        };
+        *receipt_sha256 = tampered_digest;
+        assert!(matches!(
+            materialize_block_pack_with_facts(&tampered_pack, &rom, Some(&tampered_facts),),
+            Err(BlockPackError::EvaluatedImageRederivation {
+                error: MaterializedImageErrorV1::ReceiptMismatch { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_v1_v2_block_wires_deserialize_to_affine_backing() {
+        let terminator = serde_json::to_value(BlockTerminator::Return).unwrap();
+        let v1 = serde_json::json!({
+            "start_va": ENTRY_PC,
+            "end_va": ENTRY_PC + 4,
+            "rom_start": ROM_BASE,
+            "rom_end": ROM_BASE + 4,
+            "bytes_sha256": "11".repeat(32),
+            "terminator": terminator,
+        });
+        let v1: PackedBlockV1 = serde_json::from_value(v1).unwrap();
+        assert_eq!(
+            v1.backing,
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start: ROM_BASE,
+                rom_end: ROM_BASE + 4,
+            }
+        );
+        validate_schema_backing(BLOCK_PACK_SCHEMA_V1, "boot", &v1).unwrap();
+        validate_packed_geometry("boot", std::slice::from_ref(&v1)).unwrap();
+
+        let v2 = serde_json::json!({
+            "start_va": ENTRY_PC,
+            "end_va": ENTRY_PC + 4,
+            "rom_space": "Virtual",
+            "rom_start": 0x2000,
+            "rom_end": 0x2004,
+            "bytes_sha256": "22".repeat(32),
+            "terminator": BlockTerminator::Return,
+        });
+        let v2: PackedBlockV1 = serde_json::from_value(v2).unwrap();
+        assert_eq!(
+            v2.backing,
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Virtual,
+                rom_start: 0x2000,
+                rom_end: 0x2004,
+            }
+        );
+        validate_schema_backing(BLOCK_PACK_SCHEMA_V2, "boot", &v2).unwrap();
+        validate_packed_geometry("boot", std::slice::from_ref(&v2)).unwrap();
     }
 
     fn synthetic_pack() -> (BlockPackV1, NormalizedRom) {
@@ -1270,9 +1737,11 @@ mod tests {
             PackedBlockV1 {
                 start_va,
                 end_va: start_va + 4,
-                rom_space: crate::facts::RomAddressSpace::Physical,
-                rom_start,
-                rom_end: rom_start + 4,
+                backing: BankBackingSpanV1::RomAffine {
+                    rom_space: crate::facts::RomAddressSpace::Physical,
+                    rom_start,
+                    rom_end: rom_start + 4,
+                },
                 bytes_sha256: sha256_hex(&rom.bytes[rom_start as usize..rom_start as usize + 4]),
                 terminator: crate::cfg::BlockTerminator::Fallthrough { next: start_va + 4 },
             }
@@ -1352,14 +1821,19 @@ mod tests {
         let mut wrong_schema = pack.clone();
         // A version newer than any this build supports, so the check stays
         // meaningful as supported versions are added.
-        wrong_schema.schema_version = BLOCK_PACK_SCHEMA_V2 + 1;
+        wrong_schema.schema_version = BLOCK_PACK_SCHEMA_V3 + 1;
         assert!(matches!(
             materialize_block_pack(&wrong_schema, &rom),
             Err(BlockPackError::UnsupportedSchema { .. })
         ));
 
         let mut false_legacy_virtual = pack.clone();
-        false_legacy_virtual.banks[0].blocks[0].rom_space = RomAddressSpace::Virtual;
+        let BankBackingSpanV1::RomAffine { rom_space, .. } =
+            &mut false_legacy_virtual.banks[0].blocks[0].backing
+        else {
+            panic!("synthetic V1 block is affine")
+        };
+        *rom_space = RomAddressSpace::Virtual;
         assert!(matches!(
             materialize_block_pack_with_facts(
                 &false_legacy_virtual,
@@ -1380,7 +1854,12 @@ mod tests {
         ));
 
         let (mut trailing_bytes, rom) = synthetic_pack();
-        trailing_bytes.banks[0].blocks[0].rom_end += 1;
+        let BankBackingSpanV1::RomAffine { rom_end, .. } =
+            &mut trailing_bytes.banks[0].blocks[0].backing
+        else {
+            panic!("synthetic V1 block is affine")
+        };
+        *rom_end += 1;
         assert!(matches!(
             materialize_block_pack(&trailing_bytes, &rom),
             Err(BlockPackError::InvalidGeometry { .. })

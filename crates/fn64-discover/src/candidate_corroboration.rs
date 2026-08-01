@@ -7,13 +7,14 @@
 //! In particular, the returned capability is not native evidence and cannot
 //! add a fact, a partition boundary, an owner, or a traversal root.
 
-use crate::snapshot::ProgramSnapshotV1;
+use crate::facts::{BankBackingSpanV1, RomAddressSpace};
+use crate::snapshot::{BankInputDigestV1, ProgramSnapshotV1};
 use crate::tool_adapter::{
     ingest_tool_jsonl, AdapterLimits, Sha256Digest, ToolAdapterExpectation, ToolIdentity,
     ToolLineageRef, ToolLineageRole, ToolRunRole,
 };
 use crate::tool_claims::{
-    bank_input_identity_v1, freeze_tool_claims_v1, program_snapshot_sha256_v2,
+    bank_input_identity_v1, freeze_tool_claims_v1, program_snapshot_sha256_v3,
     validate_tool_claim_set_v1, ToolClaimSetV1,
 };
 use serde::Deserialize;
@@ -106,6 +107,7 @@ pub enum CandidateCorroborationError {
     UnsupportedSnapshotSchema,
     BankIndexOutOfRange,
     InvalidBankGeometry,
+    UnsupportedBankBacking,
     QueueRequest,
     QueueReceipt,
     Attempt,
@@ -300,7 +302,7 @@ struct EvidenceV3 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceBackingV1 {
-    rom_space: crate::facts::RomAddressSpace,
+    rom_space: RomAddressSpace,
     rom_start: u32,
     rom_end: u32,
 }
@@ -395,13 +397,14 @@ pub fn validate_discovery_only_tool_claims_v1(
     {
         return Err(CandidateCorroborationError::InvalidSnapshotWire);
     }
-    let snapshot_sha = program_snapshot_sha256_v2(&snapshot)
+    let snapshot_sha = program_snapshot_sha256_v3(&snapshot)
         .map_err(|_| CandidateCorroborationError::UnsupportedSnapshotSchema)?;
     let bank = snapshot
         .banks
         .get(bundle.bank_index)
         .ok_or(CandidateCorroborationError::BankIndexOutOfRange)?;
     let bank_byte_length = validate_bank_geometry(bank.input.va_start, bank.input.va_end)?;
+    let (rom_space, rom_start, rom_end) = affine_bank_backing(&bank.input)?;
     let bank_name = bank.input.bank.clone();
     let bank_identity = bank_input_identity_v1(&snapshot, &bank_name)
         .map_err(|_| CandidateCorroborationError::Evidence)?;
@@ -526,9 +529,9 @@ pub fn validate_discovery_only_tool_claims_v1(
         || evidence.schema_version != 3
         || evidence.program_snapshot_sha256 != snapshot_sha
         || evidence.input != bank_identity
-        || evidence.backing.rom_space != bank.input.rom_space
-        || evidence.backing.rom_start != bank.input.rom_start
-        || evidence.backing.rom_end != bank.input.rom_end
+        || evidence.backing.rom_space != rom_space
+        || evidence.backing.rom_start != rom_start
+        || evidence.backing.rom_end != rom_end
         || evidence.artifact.byte_length != bank_byte_length
         || evidence.artifact.sha256 != bank_identity.bank_bytes_sha256
         || !is_discovery_only(&evidence.seeds)
@@ -699,6 +702,21 @@ fn validate_bank_geometry(va_start: u32, va_end: u32) -> Result<u64, CandidateCo
     Ok(u64::from(byte_length))
 }
 
+fn affine_bank_backing(
+    input: &BankInputDigestV1,
+) -> Result<(RomAddressSpace, u32, u32), CandidateCorroborationError> {
+    match &input.backing {
+        BankBackingSpanV1::RomAffine {
+            rom_space,
+            rom_start,
+            rom_end,
+        } => Ok((*rom_space, *rom_start, *rom_end)),
+        BankBackingSpanV1::Materialized { .. } => {
+            Err(CandidateCorroborationError::UnsupportedBankBacking)
+        }
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(
     artifact: &'static str,
     bytes: &[u8],
@@ -811,5 +829,37 @@ mod tests {
                 Err(CandidateCorroborationError::InvalidBankGeometry)
             );
         }
+    }
+
+    #[test]
+    fn external_evidence_requires_affine_bank_backing() {
+        let affine = BankInputDigestV1 {
+            bank: "bank".into(),
+            va_start: 0x8000_0000,
+            va_end: 0x8000_0040,
+            backing: BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Virtual,
+                rom_start: 0x1000,
+                rom_end: 0x1040,
+            },
+            bytes_sha256: "a".repeat(64),
+        };
+        assert_eq!(
+            affine_bank_backing(&affine),
+            Ok((RomAddressSpace::Virtual, 0x1000, 0x1040))
+        );
+
+        let materialized = BankInputDigestV1 {
+            backing: BankBackingSpanV1::Materialized {
+                receipt_sha256: "b".repeat(64),
+                output_start: 0,
+                output_end: 0x40,
+            },
+            ..affine
+        };
+        assert_eq!(
+            affine_bank_backing(&materialized),
+            Err(CandidateCorroborationError::UnsupportedBankBacking)
+        );
     }
 }

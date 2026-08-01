@@ -433,6 +433,13 @@ fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, 
             max_projected_fact_bytes: limits.max_projected_fact_bytes,
             max_aggregate_materialized_bytes: limits.max_aggregate_materialized_bytes,
             max_cross_bank_authority_records: limits.max_cross_bank_authority_records,
+            materialized_image: fn64_discover::materialized_image::MaterializedImageLimitsV1 {
+                max_source_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_decoded_vrom_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_stream_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_aggregate_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_streams: 4096,
+            },
         },
     )
     .map_err(|error| error.to_string())?;
@@ -481,17 +488,25 @@ fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, 
 
     for snapshot in composed.snapshots() {
         for bank in &snapshot.banks {
+            let fn64_discover::facts::BankBackingSpanV1::RomAffine {
+                rom_space: fn64_discover::facts::RomAddressSpace::Physical,
+                rom_start,
+                rom_end,
+            } = &bank.input.backing
+            else {
+                return Err(format!(
+                    "layout study requires physical affine backing for bank {}",
+                    bank.input.bank
+                ));
+            };
             let mut answer_functions = dump
                 .sections
                 .iter()
                 .filter(|section| {
-                    section.rom >= bank.input.rom_start
-                        && section.rom < bank.input.rom_end
+                    section.rom >= *rom_start
+                        && section.rom < *rom_end
                         && section.vram
-                            == bank
-                                .input
-                                .va_start
-                                .saturating_add(section.rom - bank.input.rom_start)
+                            == bank.input.va_start.saturating_add(section.rom - *rom_start)
                 })
                 .flat_map(|section| &section.functions)
                 .filter(|function| {

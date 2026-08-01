@@ -8,14 +8,16 @@
 
 use crate::banks::materialize_rom_range_bounded;
 use crate::facts::{
-    EvaluatedImageReceiptV1, FactDb, MaterializationEvaluatorV1, MaterializedByteRangeV1,
-    MaterializedImageSourceV1, MaterializedImageStreamV1, MaterializedImageSuffixV1,
+    evaluated_image_receipt_sha256_v1, BankBackingSpanV1, EvaluatedImageReceiptV1, Fact, FactDb,
+    MaterializationEvaluatorV1, MaterializedByteRangeV1, MaterializedImageSourceV1,
+    MaterializedImageStreamV1, MaterializedImageSuffixV1, ProofState, RomAddressSpace,
 };
 use crate::headered_raw_deflate::{
     materialize_headered_raw_deflate_sequence, HeaderedRawDeflateError, HeaderedRawDeflateLimits,
 };
 use crate::NormalizedRom;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 const HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
 const HARD_MAX_STREAMS: usize = 4096;
@@ -151,6 +153,52 @@ impl std::fmt::Display for MaterializedImageErrorV1 {
 }
 
 impl std::error::Error for MaterializedImageErrorV1 {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterializedBackingFactsRequirementV1 {
+    VirtualRom,
+    EvaluatedImage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MaterializedBackingSpanErrorV1 {
+    InvalidGeometry,
+    SpanLimitExceeded {
+        bytes: usize,
+        limit: usize,
+    },
+    FactsRequired {
+        requirement: MaterializedBackingFactsRequirementV1,
+    },
+    RomMaterialization {
+        rom_space: RomAddressSpace,
+        rom_start: u32,
+        rom_end: u32,
+        reason: String,
+    },
+    MissingEvaluatedImageReceipt {
+        receipt_sha256: String,
+    },
+    AmbiguousEvaluatedImageReceipt {
+        receipt_sha256: String,
+        count: usize,
+    },
+    EvaluatedImageRederivation {
+        receipt_sha256: String,
+        error: MaterializedImageErrorV1,
+    },
+}
+
+/// Operation-local cache of fully re-derived evaluated-image outputs.
+///
+/// The cache is deliberately neither serializable nor authoritative. Every
+/// span lookup still proves the exact bank/VA/receipt association from the
+/// supplied [`FactDb`]; caching only avoids repeating the deterministic
+/// evaluator for another span of the same receipt during one operation.
+#[derive(Debug, Default)]
+pub struct MaterializedBackingSpanCacheV1 {
+    evaluated_outputs: BTreeMap<String, Vec<u8>>,
+}
 
 /// Re-derived candidate bytes and their content-only receipt.
 ///
@@ -313,6 +361,175 @@ pub fn rederive_materialized_image_v1(
         });
     }
     Ok(actual)
+}
+
+/// Reconstruct one typed bank subspan without changing proof state.
+///
+/// Physical spans slice the normalized ROM directly. Virtual spans resolve
+/// through proven VROM file records. Evaluated spans require one exact receipt
+/// under a proven bank conclusion, re-derive its complete output, cache that
+/// output by receipt identity, and only then return the checked subspan.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_backing_span_v1(
+    rom: &NormalizedRom,
+    facts: Option<&FactDb>,
+    bank: &str,
+    va_start: u32,
+    va_end: u32,
+    backing: &BankBackingSpanV1,
+    limits: MaterializedImageLimitsV1,
+    cache: &mut MaterializedBackingSpanCacheV1,
+) -> Result<Vec<u8>, MaterializedBackingSpanErrorV1> {
+    let va_len = va_end
+        .checked_sub(va_start)
+        .filter(|length| *length != 0)
+        .ok_or(MaterializedBackingSpanErrorV1::InvalidGeometry)?;
+    let backing_len = match backing {
+        BankBackingSpanV1::RomAffine {
+            rom_start, rom_end, ..
+        } => rom_end.checked_sub(*rom_start),
+        BankBackingSpanV1::Materialized {
+            output_start,
+            output_end,
+            ..
+        } => output_end.checked_sub(*output_start),
+    }
+    .filter(|length| *length == va_len)
+    .ok_or(MaterializedBackingSpanErrorV1::InvalidGeometry)?;
+    let span_bytes = usize::try_from(backing_len)
+        .map_err(|_| MaterializedBackingSpanErrorV1::InvalidGeometry)?;
+    if span_bytes > limits.max_aggregate_output_bytes {
+        return Err(MaterializedBackingSpanErrorV1::SpanLimitExceeded {
+            bytes: span_bytes,
+            limit: limits.max_aggregate_output_bytes,
+        });
+    }
+
+    match backing {
+        BankBackingSpanV1::RomAffine {
+            rom_space: RomAddressSpace::Physical,
+            rom_start,
+            rom_end,
+        } => {
+            let start = usize::try_from(*rom_start)
+                .map_err(|_| MaterializedBackingSpanErrorV1::InvalidGeometry)?;
+            let end = usize::try_from(*rom_end)
+                .map_err(|_| MaterializedBackingSpanErrorV1::InvalidGeometry)?;
+            rom.bytes
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| MaterializedBackingSpanErrorV1::RomMaterialization {
+                    rom_space: RomAddressSpace::Physical,
+                    rom_start: *rom_start,
+                    rom_end: *rom_end,
+                    reason: "physical ROM span is outside the normalized image".to_owned(),
+                })
+        }
+        BankBackingSpanV1::RomAffine {
+            rom_space: RomAddressSpace::Virtual,
+            rom_start,
+            rom_end,
+        } => {
+            let facts = facts.ok_or(MaterializedBackingSpanErrorV1::FactsRequired {
+                requirement: MaterializedBackingFactsRequirementV1::VirtualRom,
+            })?;
+            materialize_rom_range_bounded(
+                rom,
+                facts,
+                RomAddressSpace::Virtual,
+                *rom_start,
+                *rom_end,
+                limits.max_decoded_vrom_file_bytes,
+            )
+            .map(|materialized| materialized.bytes)
+            .map_err(
+                |reason| MaterializedBackingSpanErrorV1::RomMaterialization {
+                    rom_space: RomAddressSpace::Virtual,
+                    rom_start: *rom_start,
+                    rom_end: *rom_end,
+                    reason,
+                },
+            )
+        }
+        BankBackingSpanV1::Materialized {
+            receipt_sha256,
+            output_start,
+            output_end,
+        } => {
+            let facts = facts.ok_or(MaterializedBackingSpanErrorV1::FactsRequired {
+                requirement: MaterializedBackingFactsRequirementV1::EvaluatedImage,
+            })?;
+            let proven_conclusion = facts
+                .conclusion(&format!("bank:{bank}"))
+                .filter(|conclusion| conclusion.state == ProofState::Proven);
+            let receipts = facts
+                .facts()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, fact)| {
+                    let Fact::EvaluatedImage {
+                        bank: fact_bank,
+                        va_start: image_va_start,
+                        va_end: image_va_end,
+                        receipt,
+                    } = fact
+                    else {
+                        return None;
+                    };
+                    let image_len = image_va_end.checked_sub(*image_va_start)?;
+                    (proven_conclusion
+                        .is_some_and(|conclusion| conclusion.justified_by.contains(&index))
+                        && fact_bank == bank
+                        && receipt.output_len == image_len
+                        && evaluated_image_receipt_sha256_v1(receipt) == *receipt_sha256
+                        && image_va_start.checked_add(*output_start) == Some(va_start)
+                        && image_va_start.checked_add(*output_end) == Some(va_end))
+                    .then_some(receipt.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            let receipt = match receipts.len() {
+                0 => {
+                    return Err(
+                        MaterializedBackingSpanErrorV1::MissingEvaluatedImageReceipt {
+                            receipt_sha256: receipt_sha256.clone(),
+                        },
+                    );
+                }
+                1 => receipts.into_iter().next().expect("one receipt exists"),
+                count => {
+                    return Err(
+                        MaterializedBackingSpanErrorV1::AmbiguousEvaluatedImageReceipt {
+                            receipt_sha256: receipt_sha256.clone(),
+                            count,
+                        },
+                    );
+                }
+            };
+            if !cache.evaluated_outputs.contains_key(receipt_sha256) {
+                let evaluation = rederive_materialized_image_v1(rom, facts, &receipt, limits)
+                    .map_err(|error| {
+                        MaterializedBackingSpanErrorV1::EvaluatedImageRederivation {
+                            receipt_sha256: receipt_sha256.clone(),
+                            error,
+                        }
+                    })?;
+                cache
+                    .evaluated_outputs
+                    .insert(receipt_sha256.clone(), evaluation.bytes().to_vec());
+            }
+            let start = usize::try_from(*output_start)
+                .map_err(|_| MaterializedBackingSpanErrorV1::InvalidGeometry)?;
+            let end = usize::try_from(*output_end)
+                .map_err(|_| MaterializedBackingSpanErrorV1::InvalidGeometry)?;
+            cache
+                .evaluated_outputs
+                .get(receipt_sha256)
+                .expect("receipt output was cached after exact re-derivation")
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or(MaterializedBackingSpanErrorV1::InvalidGeometry)
+        }
+    }
 }
 
 fn validate_limits(limits: MaterializedImageLimitsV1) -> Result<(), MaterializedImageErrorV1> {
@@ -528,6 +745,69 @@ mod tests {
             Err(MaterializedImageErrorV1::SourceMaterialization { .. })
         ));
         assert!(missing.facts().is_empty());
+    }
+
+    #[test]
+    fn backing_span_rejects_an_uncited_same_bank_evaluated_image() {
+        let output = b"uncited output";
+        let encoded = stream(output);
+        let rom = synthetic_rom(&encoded, 0x80);
+        let source = MaterializedImageSourceV1 {
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x80,
+            rom_end: 0x80 + encoded.len() as u32,
+            cursor: 0,
+        };
+        let evaluation = evaluate_materialized_image_v1(
+            &rom,
+            &FactDb::new(),
+            &source,
+            &MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count: 1 },
+            limits(),
+        )
+        .unwrap();
+        let mut facts = FactDb::new();
+        let affine = facts.insert(Fact::RomMapping {
+            bank: "bank".into(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x80,
+            rom_end: 0x80 + output.len() as u32,
+            va_start: 0x8000_0000,
+            va_end: 0x8000_0000 + output.len() as u32,
+        });
+        facts.insert(Fact::EvaluatedImage {
+            bank: "bank".into(),
+            va_start: 0x8000_0000,
+            va_end: 0x8000_0000 + output.len() as u32,
+            receipt: evaluation.receipt().clone(),
+        });
+        facts
+            .conclude(
+                "bank:bank",
+                ProofState::Proven,
+                vec![affine],
+                "only affine evidence is proven",
+            )
+            .unwrap();
+        let backing = BankBackingSpanV1::Materialized {
+            receipt_sha256: evaluated_image_receipt_sha256_v1(evaluation.receipt()),
+            output_start: 0,
+            output_end: output.len() as u32,
+        };
+
+        assert!(matches!(
+            materialize_backing_span_v1(
+                &rom,
+                Some(&facts),
+                "bank",
+                0x8000_0000,
+                0x8000_0000 + output.len() as u32,
+                &backing,
+                limits(),
+                &mut MaterializedBackingSpanCacheV1::default(),
+            ),
+            Err(MaterializedBackingSpanErrorV1::MissingEvaluatedImageReceipt { .. })
+        ));
     }
 
     #[test]

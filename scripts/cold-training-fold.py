@@ -510,8 +510,8 @@ def rom_identity(binary: Path, rom: Path, timeout: int, scratch: Path, limits: d
 def cold_identity(cold: Path, expected_rom: str) -> dict[str, str]:
     manifest, data = read_json(cold / "snapshot-workspace.json", "cold workspace manifest")
     exact_keys(manifest, {"schema", "schema_version", "state", "open_reason", "normalized_rom_sha256", "discovery", "limits", "snapshot_wire", "aggregate_snapshot_artifact_bytes", "rom_recompilation_complete", "remaining_recompilation_frontier", "intended_use", "cold_training", "banks"}, {"selection"}, "cold workspace manifest")
-    if manifest["schema"] != "fn64.snapshot-workspace" or manifest["schema_version"] != 3 or manifest["intended_use"] != "sealed_cold_function_training_input":
-        raise FoldError("producer did not emit schema3 cold-training workspace")
+    if manifest["schema"] != "fn64.snapshot-workspace" or manifest["schema_version"] != 4 or manifest["intended_use"] != "sealed_cold_function_training_input":
+        raise FoldError("producer did not emit schema4 cold-training workspace")
     if manifest["normalized_rom_sha256"] != expected_rom:
         raise FoldError("cold workspace ROM digest mismatch")
     training = require_object(manifest["cold_training"], "cold_training receipt")
@@ -527,10 +527,10 @@ def cold_identity(cold: Path, expected_rom: str) -> dict[str, str]:
     require_digest(training["candidate_artifact_sha256"], "candidate artifact digest")
     snapshot_wire = require_object(manifest["snapshot_wire"], "snapshot wire receipt")
     exact_keys(snapshot_wire, {"schema_version", "authority", "duplicates_fact_db_per_bank", "remaining_large_rom_frontier"}, set(), "snapshot wire receipt")
-    if (snapshot_wire["schema_version"] != 5
+    if (snapshot_wire["schema_version"] != 6
             or snapshot_wire["authority"] != "diagnostic_only"
             or snapshot_wire["duplicates_fact_db_per_bank"] is not False
-            or snapshot_wire["remaining_large_rom_frontier"] != "streaming_v5"):
+            or snapshot_wire["remaining_large_rom_frontier"] != "streaming_v6"):
         raise FoldError("cold workspace does not bind the current snapshot wire")
     return {"normalized_rom_sha256": expected_rom, "cold_manifest_sha256": sha256_bytes(data),
             "candidate_identity_v3_sha256": require_digest(training.get("scoped_candidate_identities_v3_sha256"), "candidate identity v3 digest")}

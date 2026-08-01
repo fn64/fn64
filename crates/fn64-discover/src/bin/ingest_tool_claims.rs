@@ -10,7 +10,7 @@ use fn64_discover::tool_adapter::{
     ToolLineageRef, ToolLineageRole, ToolRunRole,
 };
 use fn64_discover::tool_claims::{
-    bank_input_identity_v1, discovery_snapshot_lineage_v2, freeze_tool_claims_v1,
+    bank_input_identity_v1, discovery_snapshot_lineage_v3, freeze_tool_claims_v1,
     validate_tool_claim_set_v1,
 };
 use fn64_discover::workspace_artifacts::{publish_new, validate_output_path, validate_workspace};
@@ -103,7 +103,7 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
         read_json(&request_path, "tool-ingest request", MAX_REQUEST_BYTES)?;
     validate_request(&request)?;
     let request_dir = request_path.parent().unwrap_or_else(|| Path::new("."));
-    let snapshot_lineage = discovery_snapshot_lineage_v2(&snapshot)
+    let snapshot_lineage = discovery_snapshot_lineage_v3(&snapshot)
         .map_err(|error| format!("deriving discovery-snapshot lineage: {error}"))?;
 
     let mut outputs = Vec::with_capacity(request.runs.len());

@@ -6,7 +6,7 @@ use fn64_discover::snapshot::{
     compose_materialized_bank_v1, MaterializedBankInput, ProgramSnapshotV1,
 };
 use fn64_discover::tool_adapter::Sha256Digest;
-use fn64_discover::tool_claims::program_snapshot_sha256_v2;
+use fn64_discover::tool_claims::program_snapshot_sha256_v3;
 use fn64_discover::{normalize, BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
 use std::fs;
 #[cfg(unix)]
@@ -480,7 +480,7 @@ echo 'Using Language/Compiler: MIPS:BE:64:64-32addr:o32'
     make_executable(&jdk.join("bin/java"), "#!/bin/sh\nexit 0\n");
 
     let (snapshot, _) = snapshot();
-    let snapshot_sha = program_snapshot_sha256_v2(&snapshot).unwrap().to_hex();
+    let snapshot_sha = program_snapshot_sha256_v3(&snapshot).unwrap().to_hex();
     let ingest = fixture.root.join("fake-ingest");
     let ingest_script = r#"#!/bin/sh
 set -eu

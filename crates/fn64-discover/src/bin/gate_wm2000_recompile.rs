@@ -23,7 +23,7 @@ use fn64_discover::delta_vote::DeltaVoteConfig;
 use fn64_discover::dense_aot_pack::{
     build_dense_aot_pack_v1, DenseAotGenerationInput, DenseAotPackV1, DENSE_AOT_SHARD_BYTES,
 };
-use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
+use fn64_discover::facts::{BankBackingSpanV1, FunctionEntryEvidence, ProofState};
 use fn64_discover::generation_topology::build_generation_topology_v1;
 #[cfg(test)]
 use fn64_discover::generation_topology::CatalogGenerationRoleV1;
@@ -753,10 +753,29 @@ fn dense_transfer_banks<'a>(
                 generation.name
             ));
         };
+        let (rom_start, rom_end) = match &bank.input.backing {
+            BankBackingSpanV1::RomAffine {
+                rom_space: RomAddressSpace::Physical,
+                rom_start,
+                rom_end,
+            } => (*rom_start, *rom_end),
+            BankBackingSpanV1::RomAffine { rom_space, .. } => {
+                return Err(format!(
+                    "dense transfer snapshot {index} uses unsupported {rom_space:?} affine backing for {}",
+                    generation.name
+                ));
+            }
+            BankBackingSpanV1::Materialized { .. } => {
+                return Err(format!(
+                    "dense transfer snapshot {index} uses unsupported materialized backing for {}",
+                    generation.name
+                ));
+            }
+        };
         let observed = (
             bank.input.bank.as_str(),
-            bank.input.rom_start,
-            bank.input.rom_end,
+            rom_start,
+            rom_end,
             bank.input.va_start,
             bank.input.va_end,
         );

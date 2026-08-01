@@ -78,7 +78,7 @@ def make_snapshot_workspace(
         private_file(workspace / bank_artifact, bank_bytes)
         private_file(workspace / snapshot_artifact, snapshot_bytes)
         program_sha = hashlib.sha256(
-            b"fn64.program-snapshot.v2\0" + snapshot_bytes[:-1]
+            b"fn64.program-snapshot.v3\0" + snapshot_bytes[:-1]
         ).hexdigest()
         if seed_mode == "discovery_only":
             ghidra_seeds = {"mode": "discovery_only", "role": "candidate_only"}
@@ -103,9 +103,12 @@ def make_snapshot_workspace(
             {
                 "index": index,
                 "bank": f"bank-{index}",
-                "rom_space": "Physical",
-                "rom_start": rom_cursor,
-                "rom_end": rom_cursor + bank_length,
+                "backing": {
+                    "kind": "rom_affine",
+                    "rom_space": "Physical",
+                    "rom_start": rom_cursor,
+                    "rom_end": rom_cursor + bank_length,
+                },
                 "va_start": va_start,
                 "va_end": va_start + bank_length,
                 "byte_length": bank_length,
@@ -130,7 +133,7 @@ def make_snapshot_workspace(
     ]
     manifest = {
         "schema": "fn64.snapshot-workspace",
-        "schema_version": 1,
+        "schema_version": 4,
         "state": "composed",
         "open_reason": None,
         "normalized_rom_sha256": "11" * 32,
@@ -145,6 +148,12 @@ def make_snapshot_workspace(
                     "proven_mappings": 1 if strategy == "boot_bank_only" else 0,
                     "supported_mappings": 0,
                     "decoded_file_limit_hits": 0,
+                    "request_dma_open_rows": 0,
+                    "request_dma_incomplete": False,
+                    "request_dma_input_limit_hit": False,
+                    "physical_wrapper_candidates_examined": 0,
+                    "wrapper_semantic_proof_unavailable": 0,
+                    "physical_wrapper_candidate_limit_hit": False,
                 }
                 for strategy in strategies
             ],
@@ -162,10 +171,10 @@ def make_snapshot_workspace(
             "max_cross_bank_authority_records": 1_048_576,
         },
         "snapshot_wire": {
-            "schema_version": 3,
+            "schema_version": 6,
             "authority": "diagnostic_only",
             "duplicates_fact_db_per_bank": False,
-            "remaining_large_rom_frontier": "streaming_v3",
+            "remaining_large_rom_frontier": "streaming_v6",
         },
         "aggregate_snapshot_artifact_bytes": aggregate_snapshots,
         "rom_recompilation_complete": False,
@@ -304,7 +313,7 @@ def emit_success(workspace, bank_name, snapshot_path):
 
     snapshot_bytes = snapshot_path.read_bytes()
     snapshot = json.loads(snapshot_bytes)
-    program_sha = hashlib.sha256(b"fn64.program-snapshot.v2\0" + snapshot_bytes[:-1]).hexdigest()
+    program_sha = hashlib.sha256(b"fn64.program-snapshot.v3\0" + snapshot_bytes[:-1]).hexdigest()
     bank_bytes = bank_path.read_bytes()
     put(retained / "inputs/bank.bin", bank_bytes)
     put(retained / "inputs/program-snapshot.json", snapshot_bytes)
@@ -667,11 +676,42 @@ class SnapshotWorkspaceQueueTests(unittest.TestCase):
         manifest["snapshot_wire"]["duplicates_fact_db_per_bank"] = True
         private_file(manifest_path, encoded_json(manifest))
         with self.assertRaisesRegex(
-            QUEUE.QueueError, "snapshot wire is not admitted projected diagnostic v3"
+            QUEUE.QueueError, "snapshot wire is not admitted projected diagnostic v6"
         ):
             self.run_queue()
         self.assertFalse(self.launches.exists())
         self.assertFalse((self.output / "queue-request.json").exists())
+
+    def test_virtual_affine_backing_requires_exactly_one_evidence_index(self) -> None:
+        manifest_path = self.source / "snapshot-workspace.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["banks"][0]["backing"]["rom_space"] = "Virtual"
+        manifest["banks"][0]["backing_evidence_fact_indices"] = [7]
+        private_file(manifest_path, encoded_json(manifest))
+
+        _, _, _, banks = QUEUE.validate_manifest(self.source)
+        self.assertEqual(banks[0].rom_space, "Virtual")
+        self.assertEqual(banks[0].rom_start, 0)
+        self.assertEqual(banks[0].rom_end, 4)
+
+        manifest["banks"][0]["backing_evidence_fact_indices"] = []
+        private_file(manifest_path, encoded_json(manifest))
+        with self.assertRaisesRegex(QUEUE.QueueError, "backing evidence does not match"):
+            QUEUE.validate_manifest(self.source)
+
+    def test_materialized_backing_is_rejected_without_fabricating_rom_coordinates(self) -> None:
+        manifest_path = self.source / "snapshot-workspace.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["banks"][0]["backing"] = {
+            "kind": "materialized",
+            "receipt_sha256": "22" * 32,
+            "output_start": 0,
+            "output_end": manifest["banks"][0]["byte_length"],
+        }
+        private_file(manifest_path, encoded_json(manifest))
+
+        with self.assertRaisesRegex(QUEUE.QueueError, "materialized backing is unsupported"):
+            QUEUE.validate_manifest(self.source)
 
     def test_legacy_ineligible_seed_mode_is_not_admitted_by_current_producer(self) -> None:
         manifest_path = self.source / "snapshot-workspace.json"

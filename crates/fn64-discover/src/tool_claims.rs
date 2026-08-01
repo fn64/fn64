@@ -5,7 +5,8 @@
 //! artifact, never into it: this avoids both a self-referential snapshot
 //! digest and accidental promotion through generic native conclusion keys.
 
-use crate::snapshot::{BankInputDigestV1, ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V5};
+use crate::facts::BankBackingSpanV1;
+use crate::snapshot::{BankInputDigestV1, ProgramSnapshotV1, PROGRAM_SNAPSHOT_SCHEMA_V6};
 use crate::tool_adapter::{
     recompute_tool_run_source_sha256, BankInputIdentity, CandidateProofCeiling, Sha256Digest,
     ToolAdapterOutput, ToolCandidateKind, ToolLineageRef, ToolLineageRole, ToolRunRole,
@@ -151,10 +152,10 @@ impl std::fmt::Display for ToolClaimIngestError {
 
 impl std::error::Error for ToolClaimIngestError {}
 
-pub fn program_snapshot_sha256_v2(
+pub fn program_snapshot_sha256_v3(
     snapshot: &ProgramSnapshotV1,
 ) -> Result<Sha256Digest, ToolClaimIngestError> {
-    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V5 {
+    if snapshot.schema_version != PROGRAM_SNAPSHOT_SCHEMA_V6 {
         return Err(ToolClaimIngestError::UnsupportedSnapshotSchema(
             snapshot.schema_version,
         ));
@@ -162,7 +163,7 @@ pub fn program_snapshot_sha256_v2(
     let bytes = serde_json::to_vec(snapshot)
         .map_err(|error| ToolClaimIngestError::SnapshotSerialization(error.to_string()))?;
     let mut hasher = Sha256::new();
-    hasher.update(b"fn64.program-snapshot.v2\0");
+    hasher.update(b"fn64.program-snapshot.v3\0");
     hasher.update(bytes);
     Ok(Sha256Digest(hasher.finalize().into()))
 }
@@ -189,18 +190,18 @@ pub fn bank_input_identity_v1(
         normalized_rom_sha256,
         bank: bank.into(),
         bank_bytes_sha256,
-        mapping_sha256: snapshot_bank_mapping_sha256_v1(input),
+        mapping_sha256: snapshot_bank_mapping_sha256_v2(input),
         va_start: input.va_start,
         va_end: input.va_end,
     })
 }
 
-pub fn discovery_snapshot_lineage_v2(
+pub fn discovery_snapshot_lineage_v3(
     snapshot: &ProgramSnapshotV1,
 ) -> Result<ToolLineageRef, ToolClaimIngestError> {
     Ok(ToolLineageRef {
         role: ToolLineageRole::DiscoverySnapshot,
-        source_sha256: program_snapshot_sha256_v2(snapshot)?,
+        source_sha256: program_snapshot_sha256_v3(snapshot)?,
     })
 }
 
@@ -208,7 +209,7 @@ pub fn freeze_tool_claims_v1<'a>(
     snapshot: &ProgramSnapshotV1,
     runs: impl IntoIterator<Item = &'a ToolAdapterOutput>,
 ) -> Result<ToolClaimSetV1, ToolClaimIngestError> {
-    let snapshot_digest = program_snapshot_sha256_v2(snapshot)?;
+    let snapshot_digest = program_snapshot_sha256_v3(snapshot)?;
     let mut sources = BTreeMap::<Sha256Digest, ToolRunSource>::new();
     let mut claims = BTreeMap::<Sha256Digest, CanonicalToolClaimV1>::new();
 
@@ -291,7 +292,7 @@ pub fn validate_tool_claim_set_v1(
             version: set.schema_version,
         });
     }
-    let snapshot_digest = program_snapshot_sha256_v2(snapshot)?;
+    let snapshot_digest = program_snapshot_sha256_v3(snapshot)?;
     if set.program_snapshot_sha256 != snapshot_digest {
         return Err(ToolClaimIngestError::SnapshotBindingMismatch);
     }
@@ -437,16 +438,35 @@ fn validate_source_binding(
     }
 }
 
-fn snapshot_bank_mapping_sha256_v1(input: &BankInputDigestV1) -> Sha256Digest {
+fn snapshot_bank_mapping_sha256_v2(input: &BankInputDigestV1) -> Sha256Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"fn64.snapshot-bank-mapping.v1\0");
+    hasher.update(b"fn64.snapshot-bank-mapping.v2\0");
     hash_str(&mut hasher, &input.bank);
-    hasher.update([match input.rom_space {
-        crate::facts::RomAddressSpace::Physical => 1,
-        crate::facts::RomAddressSpace::Virtual => 2,
-    }]);
-    hasher.update(input.rom_start.to_le_bytes());
-    hasher.update(input.rom_end.to_le_bytes());
+    match &input.backing {
+        BankBackingSpanV1::RomAffine {
+            rom_space,
+            rom_start,
+            rom_end,
+        } => {
+            hasher.update([1]);
+            hasher.update([match rom_space {
+                crate::facts::RomAddressSpace::Physical => 1,
+                crate::facts::RomAddressSpace::Virtual => 2,
+            }]);
+            hasher.update(rom_start.to_le_bytes());
+            hasher.update(rom_end.to_le_bytes());
+        }
+        BankBackingSpanV1::Materialized {
+            receipt_sha256,
+            output_start,
+            output_end,
+        } => {
+            hasher.update([2]);
+            hash_str(&mut hasher, receipt_sha256);
+            hasher.update(output_start.to_le_bytes());
+            hasher.update(output_end.to_le_bytes());
+        }
+    }
     hasher.update(input.va_start.to_le_bytes());
     hasher.update(input.va_end.to_le_bytes());
     Sha256Digest(hasher.finalize().into())
@@ -656,7 +676,7 @@ mod tests {
         claims: Vec<ToolClaimRecord>,
     ) -> ToolAdapterOutput {
         let input = bank_input_identity_v1(snapshot, crate::banks::BOOT_BANK).unwrap();
-        let lineage = vec![discovery_snapshot_lineage_v2(snapshot).unwrap()];
+        let lineage = vec![discovery_snapshot_lineage_v3(snapshot).unwrap()];
         let jsonl = export_complete_tool_jsonl(CompleteToolRun {
             tool: tool(),
             role: role.clone(),
@@ -690,7 +710,7 @@ mod tests {
         claims: Vec<ToolClaimRecord>,
     ) -> ToolAdapterOutput {
         let input = bank_input_identity_v1(snapshot, crate::banks::BOOT_BANK).unwrap();
-        let lineage = vec![discovery_snapshot_lineage_v2(snapshot).unwrap()];
+        let lineage = vec![discovery_snapshot_lineage_v3(snapshot).unwrap()];
         let jsonl = export_complete_tool_jsonl_v2(CompleteToolRun {
             tool: tool(),
             role: role.clone(),
@@ -724,7 +744,7 @@ mod tests {
         claims: Vec<ToolClaimRecord>,
     ) -> ToolAdapterOutput {
         let input = bank_input_identity_v1(snapshot, crate::banks::BOOT_BANK).unwrap();
-        let lineage = vec![discovery_snapshot_lineage_v2(snapshot).unwrap()];
+        let lineage = vec![discovery_snapshot_lineage_v3(snapshot).unwrap()];
         let jsonl = crate::tool_adapter::export_complete_tool_jsonl_v3(CompleteToolRun {
             tool: tool(),
             role: role.clone(),
@@ -1048,12 +1068,31 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_snapshot_cannot_reuse_schema_v2_tool_lineage() {
+    fn legacy_snapshot_cannot_reuse_schema_v3_tool_lineage() {
         let mut snapshot = snapshot();
-        snapshot.schema_version = 1;
+        snapshot.schema_version = crate::snapshot::PROGRAM_SNAPSHOT_SCHEMA_V5;
         assert_eq!(
-            program_snapshot_sha256_v2(&snapshot),
-            Err(ToolClaimIngestError::UnsupportedSnapshotSchema(1))
+            program_snapshot_sha256_v3(&snapshot),
+            Err(ToolClaimIngestError::UnsupportedSnapshotSchema(
+                crate::snapshot::PROGRAM_SNAPSHOT_SCHEMA_V5
+            ))
+        );
+    }
+
+    #[test]
+    fn bank_mapping_identity_hashes_the_typed_backing_variant() {
+        let snapshot = snapshot();
+        let affine = snapshot.banks[0].input.clone();
+        let mut materialized = affine.clone();
+        materialized.backing = BankBackingSpanV1::Materialized {
+            receipt_sha256: "11".repeat(32),
+            output_start: 0,
+            output_end: materialized.va_end - materialized.va_start,
+        };
+
+        assert_ne!(
+            snapshot_bank_mapping_sha256_v2(&affine),
+            snapshot_bank_mapping_sha256_v2(&materialized)
         );
     }
 
@@ -1133,7 +1172,7 @@ mod tests {
                     build_sha256: Sha256Digest([9; 32]),
                 },
                 input,
-                parent_lineage: vec![discovery_snapshot_lineage_v2(&snapshot).unwrap()],
+                parent_lineage: vec![discovery_snapshot_lineage_v3(&snapshot).unwrap()],
                 vrom_start: 0x1000,
                 diagnostics: SpimdisasmRunDiagnostics {
                     elapsed_millis: 1,

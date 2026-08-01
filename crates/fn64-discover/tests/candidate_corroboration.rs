@@ -22,8 +22,8 @@ use fn64_discover::tool_adapter::{
     ToolRunRole,
 };
 use fn64_discover::tool_claims::{
-    bank_input_identity_v1, discovery_snapshot_lineage_v2, freeze_tool_claims_v1,
-    program_snapshot_sha256_v2,
+    bank_input_identity_v1, discovery_snapshot_lineage_v3, freeze_tool_claims_v1,
+    program_snapshot_sha256_v3,
 };
 use serde_json::{json, Value};
 
@@ -156,7 +156,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap();
-    let snapshot_sha = program_snapshot_sha256_v2(&snapshot).unwrap().to_hex();
+    let snapshot_sha = program_snapshot_sha256_v3(&snapshot).unwrap().to_hex();
     let input = bank_input_identity_v1(&snapshot, BOOT_BANK).unwrap();
 
     let source_manifest = b"synthetic-source-manifest";
@@ -228,7 +228,7 @@ fn fixture() -> Fixture {
         "seeds": {"mode": "discovery_only", "role": "candidate_only"},
     }));
     let lineage = vec![
-        discovery_snapshot_lineage_v2(&snapshot).unwrap(),
+        discovery_snapshot_lineage_v3(&snapshot).unwrap(),
         ToolLineageRef {
             role: ToolLineageRole::EvidenceManifest,
             source_sha256: Sha256Digest::of(&evidence),
