@@ -447,6 +447,24 @@ pub enum VromRecordMappingDiagnostic {
 /// Validate the descriptor-derived mapping without using delta_vote or a
 /// grading key. The descriptor supplies only the root VA; the region's own
 /// reachable instructions must establish a complete, blocker-free CFG.
+#[doc(hidden)]
+pub fn descriptor_mapping_corroborated_probe(
+    region_bytes: &[u8],
+    rom_start: u32,
+    rom_end: u32,
+    vram_dest: u32,
+) -> Result<(), DescriptorCfgFailure> {
+    descriptor_mapping_corroborated(
+        region_bytes,
+        MappingHypothesis {
+            source_start: rom_start,
+            source_end: rom_end,
+            va_start: vram_dest,
+            va_end: vram_dest.wrapping_add(rom_end - rom_start),
+        },
+    )
+}
+
 fn descriptor_mapping_corroborated(
     region_bytes: &[u8],
     hypothesis: MappingHypothesis,
@@ -547,10 +565,63 @@ struct DescriptorFallback {
     mapping: MappingHypothesis,
 }
 
+/// Distinct ROM sources that must converge on one destination before the
+/// overlap is read as a reused RAM slot rather than a contradiction. Two
+/// regions sharing a VA is ordinary ambiguity; many independent ROM images
+/// declaring one destination is a loader design.
+const MIN_SWAPPED_SOURCES_PER_DESTINATION: usize = 8;
+
+/// Destinations-to-sources ratio below which the shape is a reused slot.
+/// A swapping engine concentrates many sources onto few destinations; a table
+/// of coincidental pointer pairs scatters instead.
+const MAX_SWAPPED_DESTINATION_SHARE: usize = 4;
+
+/// Whether these hypotheses describe an overlay-swapping engine: many distinct
+/// ROM images declaring few destinations, at least one of which is claimed by
+/// many sources.
+///
+/// Deliberately strict. Coincidental descriptor tables produce scattered
+/// destinations, so requiring heavy concentration keeps VA uniqueness as the
+/// rule everywhere it is the right rule. Every candidate here has already
+/// passed [`descriptor_mapping_corroborated`], so each region decodes as code
+/// at its declared VA -- this only decides whether their *overlap* is fatal.
+fn overlapping_destination_is_engine_shape(fallbacks: &[DescriptorFallback]) -> bool {
+    let mut sources_by_destination: BTreeMap<u32, BTreeSet<(u32, u32)>> = BTreeMap::new();
+    for fallback in fallbacks {
+        sources_by_destination
+            .entry(fallback.mapping.va_start)
+            .or_default()
+            .insert((fallback.mapping.source_start, fallback.mapping.source_end));
+    }
+    let distinct_sources: usize = sources_by_destination
+        .values()
+        .map(|sources| sources.len())
+        .sum();
+    let busiest = sources_by_destination
+        .values()
+        .map(|sources| sources.len())
+        .max()
+        .unwrap_or(0);
+    busiest >= MIN_SWAPPED_SOURCES_PER_DESTINATION
+        && distinct_sources >= sources_by_destination.len() * MAX_SWAPPED_DESTINATION_SHARE
+}
+
 /// Admit only hypotheses whose VA interval is unique across distinct region
 /// identities. Exact duplicate records from phase/stride aliases are one
 /// hypothesis, not conflicts; different source regions sharing any VA byte
 /// reject each other symmetrically, independent of iteration order.
+///
+/// VA uniqueness is the wrong test for an overlay-*swapping* engine, which
+/// loads many ROM images into one reused RAM slot at different times. There
+/// the descriptor's own `vram_dest` is the authority and overlap is the
+/// design, not a contradiction: measured on Paper Mario (PAL), 319 of 322
+/// records in admitted tables declare the same `0x80240000` destination, so
+/// symmetric rejection discards every one of them.
+///
+/// [`overlapping_destination_is_engine_shape`] recognizes that case. The
+/// safety property is unchanged for every other engine: a hypothesis is still
+/// admitted only when its region decodes as code at the declared VA, and a
+/// *raw* delta-vote mapping still wins over any conflicting fallback.
 fn apply_unique_descriptor_fallbacks<A>(
     admissions: &mut [A],
     raw_mappings: &BTreeSet<MappingHypothesis>,
@@ -558,15 +629,20 @@ fn apply_unique_descriptor_fallbacks<A>(
     mut region_deltas: impl FnMut(&mut A) -> &mut Vec<Option<(u32, u32)>>,
     mut mapped_regions: impl FnMut(&mut A) -> &mut u32,
 ) -> BTreeSet<(usize, usize)> {
+    let swapping_engine = overlapping_destination_is_engine_shape(&fallbacks);
     let admitted: Vec<_> = fallbacks
         .iter()
         .filter(|candidate| {
+            // A delta-vote mapping is independently derived evidence, so it
+            // outranks a declared destination even in a swapping engine.
             let conflicts_with_raw = raw_mappings.iter().any(|mapping| {
                 *mapping != candidate.mapping && mapping.overlaps_va(candidate.mapping)
             });
-            let conflicts_with_fallback = fallbacks.iter().any(|other| {
-                other.mapping != candidate.mapping && other.mapping.overlaps_va(candidate.mapping)
-            });
+            let conflicts_with_fallback = !swapping_engine
+                && fallbacks.iter().any(|other| {
+                    other.mapping != candidate.mapping
+                        && other.mapping.overlaps_va(candidate.mapping)
+                });
             !conflicts_with_raw && !conflicts_with_fallback
         })
         .collect();
@@ -1278,6 +1354,79 @@ pub fn recover_vrom_overlay_regions_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fallback(source_start: u32, va_start: u32, len: u32) -> DescriptorFallback {
+        DescriptorFallback {
+            admission_index: 0,
+            record_index: 0,
+            mapping: MappingHypothesis {
+                source_start,
+                source_end: source_start + len,
+                va_start,
+                va_end: va_start + len,
+            },
+        }
+    }
+
+    #[test]
+    fn two_regions_sharing_a_destination_stay_a_conflict() {
+        // Ordinary ambiguity: VA uniqueness must remain the rule. Only heavy
+        // concentration reads as a reused slot.
+        let shared = vec![
+            fallback(0x1000, 0x8020_0000, 0x100),
+            fallback(0x2000, 0x8020_0000, 0x100),
+        ];
+        assert!(!overlapping_destination_is_engine_shape(&shared));
+    }
+
+    #[test]
+    fn scattered_destinations_are_not_a_swapping_engine() {
+        // One source per destination is the resident-overlay shape, whatever
+        // the record count.
+        let scattered: Vec<_> = (0..32)
+            .map(|i| fallback(0x1000 + i * 0x100, 0x8020_0000 + i * 0x1000, 0x80))
+            .collect();
+        assert!(!overlapping_destination_is_engine_shape(&scattered));
+    }
+
+    #[test]
+    fn many_sources_on_one_destination_read_as_a_reused_slot() {
+        // Paper Mario (PAL) measured shape: 319 of 322 records in admitted
+        // tables declare 0x80240000. Symmetric VA rejection discards them all,
+        // so the swapping engine must be recognized instead.
+        let swapped: Vec<_> = (0..24)
+            .map(|i| fallback(0x1000 + i * 0x1000, 0x8024_0000, 0x400))
+            .collect();
+        assert!(overlapping_destination_is_engine_shape(&swapped));
+    }
+
+    #[test]
+    fn a_swapping_engine_still_yields_to_an_independent_delta_vote() {
+        // The safety property: a delta-vote mapping is independently derived,
+        // so it outranks a merely declared destination even here.
+        let swapped: Vec<_> = (0..24)
+            .map(|i| fallback(0x1000 + i * 0x1000, 0x8024_0000, 0x400))
+            .collect();
+        let mut admissions = vec![(vec![None; 1], 0u32)];
+        let mut raw = BTreeSet::new();
+        raw.insert(MappingHypothesis {
+            source_start: 0xdead_0000,
+            source_end: 0xdead_0400,
+            va_start: 0x8024_0000,
+            va_end: 0x8024_0400,
+        });
+        let admitted = apply_unique_descriptor_fallbacks(
+            &mut admissions,
+            &raw,
+            swapped,
+            |entry| &mut entry.0,
+            |entry| &mut entry.1,
+        );
+        assert!(
+            admitted.is_empty(),
+            "a conflicting raw delta-vote mapping must still reject declared destinations"
+        );
+    }
 
     #[test]
     fn oversized_yaz0_file_cannot_supply_vrom_descriptor_candidates() {
