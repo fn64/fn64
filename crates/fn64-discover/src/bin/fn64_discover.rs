@@ -401,9 +401,7 @@ fn compose_owner_proofs(
 
     let mut reports = Vec::new();
     let mut blockers: Vec<fn64_discover::snapshot::OwnerBlockerSummary> = Vec::new();
-    let mut composed_facts = None;
     for snapshot in composed.snapshots() {
-        composed_facts = Some(snapshot.facts.clone());
         for bank in &snapshot.banks {
             reports.push(bank.owner_proof.clone());
             for summary in &bank.blocker_histogram {
@@ -417,12 +415,11 @@ fn compose_owner_proofs(
             }
         }
     }
-    let facts_for_coverage = composed_facts.as_ref().unwrap_or(facts);
-    let coverage = fn64_discover::coverage::report_with_owner_proofs(
-        rom.len(),
-        facts_for_coverage,
-        &reports,
-    )
+    // ROM-wide discovery facts, never a composed snapshot's: each snapshot
+    // carries only its own bank's projected facts, so using them would report
+    // one bank's mapping and entry counts as if they were the whole ROM.
+    // Owner proof is layered onto the same coverage the default path reports.
+    let coverage = fn64_discover::coverage::report_with_owner_proofs(rom.len(), facts, &reports)
     .map_err(|error| format!("{error:?}"))?;
     blockers.sort_by(|a, b| b.occurrences.cmp(&a.occurrences).then(a.kind.cmp(&b.kind)));
     Ok((coverage, blockers))
