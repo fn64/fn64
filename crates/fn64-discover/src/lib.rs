@@ -737,35 +737,11 @@ fn discover_with_recovered_vrom_and_request_dma(
     request_dma_report.wrapper_semantic_proof_unavailable =
         wrapper_diagnostics.semantic_proof_unavailable;
     request_dma_report.physical_wrapper_candidate_limit_hit = wrapper_diagnostics.limit_hit;
+    request_dma_report.wrapper_shape_rejections = wrapper_diagnostics.rejections;
     if wrapper_diagnostics.semantic_proof_unavailable != 0 {
         request_dma_report.push_open_bounded(format!(
             "wrapper_semantic_proof_unavailable: {} physical end-address DMA wrapper shape candidate(s) remain candidate-only",
             wrapper_diagnostics.semantic_proof_unavailable
-        ));
-    }
-    // Naming the unestablished fact is what makes a corpus of wrapper
-    // rejections actionable: the counts rank which dataflow fact the detector
-    // most often cannot recover. Facts cascade, so one candidate may appear
-    // under several names.
-    let rejections = &wrapper_diagnostics.rejections;
-    let rejection_census = [
-        ("no_end_minus_start", rejections.no_end_minus_start),
-        ("no_nested_dma_call", rejections.no_nested_dma_call),
-        ("destination_not_advanced", rejections.destination_not_advanced),
-        ("physical_not_advanced", rejections.physical_not_advanced),
-        ("remaining_not_reduced", rejections.remaining_not_reduced),
-        ("no_backward_loop", rejections.no_backward_loop),
-        ("no_return", rejections.no_return),
-    ];
-    if rejection_census.iter().any(|(_, count)| *count != 0) {
-        let detail = rejection_census
-            .iter()
-            .filter(|(_, count)| *count != 0)
-            .map(|(name, count)| format!("{name}={count}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        request_dma_report.push_open_bounded(format!(
-            "wrapper_shape_rejections: {detail}"
         ));
     }
     if wrapper_diagnostics.limit_hit {
@@ -899,6 +875,56 @@ pub struct StrategyOutcome {
     pub wrapper_semantic_proof_unavailable: usize,
     /// The wrapper candidate classifier exhausted its work bound.
     pub physical_wrapper_candidate_limit_hit: bool,
+    /// Which required dataflow fact each rejected wrapper candidate failed to
+    /// establish. Omitted from serialized output when empty, so a strategy
+    /// that rejected nothing keeps its historical shape.
+    #[serde(default, skip_serializing_if = "WrapperRejectionCounts::is_empty")]
+    pub wrapper_shape_rejections: WrapperRejectionCounts,
+}
+
+/// Serializable form of [`pi_dma::WrapperRejectionCensus`].
+///
+/// The wrapper proof rule is the dominant geometry frontier across a large
+/// corpus, so naming the unmet fact is what makes those rejections
+/// actionable. Facts cascade -- the loop and cursor facts are only evaluated
+/// once the inner DMA call is recognized -- so one candidate may be counted
+/// under several names and these need not sum to the rejection count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WrapperRejectionCounts {
+    #[serde(default)]
+    pub no_end_minus_start: usize,
+    #[serde(default)]
+    pub no_nested_dma_call: usize,
+    #[serde(default)]
+    pub destination_not_advanced: usize,
+    #[serde(default)]
+    pub physical_not_advanced: usize,
+    #[serde(default)]
+    pub remaining_not_reduced: usize,
+    #[serde(default)]
+    pub no_backward_loop: usize,
+    #[serde(default)]
+    pub no_return: usize,
+}
+
+impl WrapperRejectionCounts {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl From<pi_dma::WrapperRejectionCensus> for WrapperRejectionCounts {
+    fn from(census: pi_dma::WrapperRejectionCensus) -> Self {
+        Self {
+            no_end_minus_start: census.no_end_minus_start,
+            no_nested_dma_call: census.no_nested_dma_call,
+            destination_not_advanced: census.destination_not_advanced,
+            physical_not_advanced: census.physical_not_advanced,
+            remaining_not_reduced: census.remaining_not_reduced,
+            no_backward_loop: census.no_backward_loop,
+            no_return: census.no_return,
+        }
+    }
 }
 
 /// The result of trying every mechanical composition strategy against one ROM.
@@ -1023,6 +1049,7 @@ pub fn run_discovery_auto_with_limits(
         physical_wrapper_candidates_examined: 0,
         wrapper_semantic_proof_unavailable: 0,
         physical_wrapper_candidate_limit_hit: false,
+        wrapper_shape_rejections: WrapperRejectionCounts::default(),
     }];
     let mut best: Option<(DiscoveryStrategy, FactDb, usize)> = None;
 
@@ -1063,6 +1090,7 @@ pub fn run_discovery_auto_with_limits(
         wrapper_semantic_proof_unavailable: request_dma_report.wrapper_semantic_proof_unavailable,
         physical_wrapper_candidate_limit_hit: request_dma_report
             .physical_wrapper_candidate_limit_hit,
+        wrapper_shape_rejections: request_dma_report.wrapper_shape_rejections.into(),
     });
     if vrom_mappings > baseline_mappings {
         best = Some((DiscoveryStrategy::RecoveredVrom, vrom_db, vrom_mappings));
@@ -1097,6 +1125,7 @@ pub fn run_discovery_auto_with_limits(
         physical_wrapper_candidates_examined: 0,
         wrapper_semantic_proof_unavailable: 0,
         physical_wrapper_candidate_limit_hit: false,
+        wrapper_shape_rejections: WrapperRejectionCounts::default(),
     });
     if overlay_mappings > baseline_mappings
         && best
@@ -1304,6 +1333,7 @@ pub fn run_discovery_auto_with_limits(
             physical_wrapper_candidates_examined: 0,
             wrapper_semantic_proof_unavailable: 0,
             physical_wrapper_candidate_limit_hit: false,
+            wrapper_shape_rejections: WrapperRejectionCounts::default(),
         });
         let selected = if regions.is_empty() {
             baseline_strategy

@@ -117,18 +117,19 @@ class GeometryFailureTests(unittest.TestCase):
             "candidate_table_under_mapped",
         )
 
-    def test_examined_wrappers_separate_detection_from_proof_gaps(self) -> None:
-        # NBA Live 99's shape: 1009 wrapper candidates examined, none proven,
-        # and no descriptor table found. A proof-rule gap, not a blind spot.
+    def test_wrapper_rejection_is_not_reported_as_a_failure_reason(self) -> None:
+        # Measured: Mega Man 64 rejects 631 of 632 wrapper candidates and still
+        # recovers 28 banks via descriptor tables. Rejection is the normal
+        # state, so it must not mask the real frontier -- no candidate table.
         outcomes = [outcome(strategy="recovered_vrom", physical_wrapper_candidates_examined=1009)]
-        self.assertEqual(
-            FRONTIER.geometry_failure(outcomes), "wrappers_examined_none_proven"
-        )
+        self.assertEqual(FRONTIER.geometry_failure(outcomes), "no_candidate_table_found")
+
+    def test_wrapper_shapes_awaiting_proof_are_named(self) -> None:
         self.assertEqual(
             FRONTIER.geometry_failure(
                 [outcome(strategy="recovered_vrom", wrapper_semantic_proof_unavailable=4)]
             ),
-            "wrapper_semantics_unprovable",
+            "wrapper_shape_awaiting_proof",
         )
 
     def test_resource_ceilings_outrank_emptier_verdicts(self) -> None:

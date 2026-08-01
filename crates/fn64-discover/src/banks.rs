@@ -1290,6 +1290,10 @@ pub struct StaticRequestDmaReport {
     pub wrapper_semantic_proof_unavailable: usize,
     /// The wrapper candidate scan itself stopped at its work bound.
     pub physical_wrapper_candidate_limit_hit: bool,
+    /// Which required dataflow fact each rejected wrapper candidate failed to
+    /// establish; the wrapper rule is the dominant geometry frontier, so the
+    /// unmet fact is the actionable part of a rejection.
+    pub wrapper_shape_rejections: crate::pi_dma::WrapperRejectionCensus,
 }
 
 impl StaticRequestDmaReport {

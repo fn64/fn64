@@ -179,15 +179,16 @@ def geometry_failure(outcomes: list[dict[str, Any]]) -> str:
     if candidates:
         return "admitted_without_mapping"
 
-    # No candidate table at all. Distinguish a search that examined wrapper
-    # candidates and proved none from one that found nothing to examine --
-    # the first is a proof-rule gap, the second a detection gap.
-    examined = sum(outcome["physical_wrapper_candidates_examined"] for outcome in geometry)
+    # No candidate descriptor table at all -- the real frontier for these ROMs.
+    #
+    # Wrapper-candidate rejection is deliberately NOT reported here. Measured
+    # across the corpus it is the normal state even for ROMs that fully
+    # succeed: Mega Man 64 rejects 631 of 632 wrapper candidates and still
+    # recovers 28 banks through the descriptor-table path. Treating it as a
+    # failure reason made a routine non-event look like the dominant frontier.
     unprovable = sum(outcome["wrapper_semantic_proof_unavailable"] for outcome in geometry)
     if unprovable:
-        return "wrapper_semantics_unprovable"
-    if examined:
-        return "wrappers_examined_none_proven"
+        return "wrapper_shape_awaiting_proof"
     return "no_candidate_table_found"
 
 
@@ -235,6 +236,21 @@ def join(catalog: list[dict[str, Any]], summaries: dict[str, dict[str, Any]]) ->
                 "wrapper_candidates_examined": sum(
                     o["physical_wrapper_candidates_examined"] for o in geometry.values()
                 ),
+                "wrapper_shape_rejections": {
+                    name: sum(
+                        o.get("wrapper_shape_rejections", {}).get(name, 0)
+                        for o in geometry.values()
+                    )
+                    for name in (
+                        "no_end_minus_start",
+                        "no_nested_dma_call",
+                        "destination_not_advanced",
+                        "physical_not_advanced",
+                        "remaining_not_reduced",
+                        "no_backward_loop",
+                        "no_return",
+                    )
+                },
                 "selected_strategy": summary["selected_strategy"],
                 "mapped_banks": coverage["mapped_banks"],
                 "executable_bytes": coverage["executable_bytes"],
@@ -313,6 +329,21 @@ def report(rows: list[dict[str, Any]]) -> None:
     # A candidate found and then rejected is a proof-rule gap: the detector
     # works and the admission bar is what stands in the way. That is a far
     # smaller, more specific problem than finding no candidate at all.
+    # Reported separately from the failure histogram: wrapper rejection is not
+    # a failure reason (ROMs that recover geometry reject them too), but which
+    # fact fails first still says where the detector's reach ends.
+    facts = collections.Counter()
+    examined = 0
+    for row in rows:
+        examined += row["wrapper_candidates_examined"]
+        for name, count in row["wrapper_shape_rejections"].items():
+            facts[name] += count
+    if examined:
+        print(f"\nwrapper candidates examined corpus-wide: {examined}")
+        print("  rejected for (facts cascade, so one candidate counts under several):")
+        for name, count in facts.most_common():
+            print(f"    {name:<28}{count:>9}")
+
     near = [row for row in rows if row["candidate_tables"] and row["mapped_banks"] <= 1]
     near.sort(key=lambda row: -row["candidate_tables"])
     print(f"\ncandidate tables found but not mapped ({len(near)} ROMs):")
