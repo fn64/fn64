@@ -31,8 +31,13 @@ pub struct PollingCodeSpanV1<'a> {
 pub struct MmioPollingStutterRequestV1<'a> {
     pub code: Vec<PollingCodeSpanV1<'a>>,
     pub initial_context: &'a RecompContext,
-    /// Raw host backing in the exact layout accepted by [`Rdram::new`].
+    /// Raw host backing before the device commit, in the exact layout
+    /// accepted by [`Rdram::new`].
     pub initial_rdram: &'a [u8],
+    /// Raw host backing after the device commit. The ready paths execute
+    /// against this backing; a later corridor validator must authenticate
+    /// the transition from `initial_rdram` to this state.
+    pub ready_rdram: &'a [u8],
     pub cycle_head_pc: u32,
     pub join_pc: u32,
     pub status_vaddr: u64,
@@ -107,6 +112,9 @@ pub struct MmioPollingStutterCertificateV1 {
     /// SHA-256 of all physical RDRAM bytes in guest address order, independent
     /// of the host backing's native-endian byte swizzle.
     pub initial_rdram_sha256: String,
+    /// Canonical guest-order commitment to the post-device-commit backing used
+    /// by every ready path.
+    pub ready_rdram_sha256: String,
     pub initial_state_sha256: String,
     pub cycle_head_pc: u32,
     pub join_pc: u32,
@@ -168,6 +176,7 @@ pub enum MmioPollingStutterErrorV1 {
     InvalidStatusAddress,
     EqualStatusWords,
     InvalidRdramLength {
+        field: &'static str,
         actual: usize,
     },
     CodeBackingMismatch,
@@ -278,6 +287,7 @@ pub fn validate_mmio_polling_stutter_v1(
         "first_busy",
         request,
         request.initial_context,
+        request.initial_rdram,
         StatusMode::Busy,
         request.cycle_head_pc,
         limits,
@@ -286,6 +296,7 @@ pub fn validate_mmio_polling_stutter_v1(
         "steady_busy",
         request,
         &first_busy.context,
+        request.initial_rdram,
         StatusMode::Busy,
         request.cycle_head_pc,
         limits,
@@ -294,6 +305,7 @@ pub fn validate_mmio_polling_stutter_v1(
         "repeated_steady_busy",
         request,
         &steady_busy.context,
+        request.initial_rdram,
         StatusMode::Busy,
         request.cycle_head_pc,
         limits,
@@ -313,6 +325,7 @@ pub fn validate_mmio_polling_stutter_v1(
         "immediate_ready",
         request,
         request.initial_context,
+        request.ready_rdram,
         StatusMode::Ready,
         request.join_pc,
         limits,
@@ -321,6 +334,7 @@ pub fn validate_mmio_polling_stutter_v1(
         "delayed_ready",
         request,
         &first_busy.context,
+        request.ready_rdram,
         StatusMode::Ready,
         request.join_pc,
         limits,
@@ -329,6 +343,7 @@ pub fn validate_mmio_polling_stutter_v1(
         "repeated_delayed_ready",
         request,
         &steady_busy.context,
+        request.ready_rdram,
         StatusMode::Ready,
         request.join_pc,
         limits,
@@ -363,6 +378,7 @@ pub fn validate_mmio_polling_stutter_v1(
         dynamic_semantics_sha256: hex(semantics.source_sha256()),
         code,
         initial_rdram_sha256: canonical_rdram_sha256(request.initial_rdram),
+        ready_rdram_sha256: canonical_rdram_sha256(request.ready_rdram),
         initial_state_sha256: hash_full_state(request.initial_context, request.cycle_head_pc),
         cycle_head_pc: request.cycle_head_pc,
         join_pc: request.join_pc,
@@ -460,20 +476,28 @@ fn validate_request(
     if request.busy_status_word == request.ready_status_word {
         return Err(MmioPollingStutterErrorV1::EqualStatusWords);
     }
-    if request.initial_rdram.len() != RDRAM_LEN {
-        return Err(MmioPollingStutterErrorV1::InvalidRdramLength {
-            actual: request.initial_rdram.len(),
-        });
+    for (field, backing) in [
+        ("initial_rdram", request.initial_rdram),
+        ("ready_rdram", request.ready_rdram),
+    ] {
+        if backing.len() != RDRAM_LEN {
+            return Err(MmioPollingStutterErrorV1::InvalidRdramLength {
+                field,
+                actual: backing.len(),
+            });
+        }
     }
     if limits.max_units_per_path == 0 || limits.max_instructions_per_path == 0 {
         return Err(MmioPollingStutterErrorV1::PathLimitZero);
     }
-    let mut backing = request.initial_rdram.to_vec();
-    let mem = Rdram::new(&mut backing);
-    for span in &request.code {
-        let len = u32::try_from(span.bytes.len()).expect("validated code span length fits u32");
-        if mem.copy_physical_bytes(span.physical_start, len) != span.bytes {
-            return Err(MmioPollingStutterErrorV1::CodeBackingMismatch);
+    for source in [request.initial_rdram, request.ready_rdram] {
+        let mut backing = source.to_vec();
+        let mem = Rdram::new(&mut backing);
+        for span in &request.code {
+            let len = u32::try_from(span.bytes.len()).expect("validated code span length fits u32");
+            if mem.copy_physical_bytes(span.physical_start, len) != span.bytes {
+                return Err(MmioPollingStutterErrorV1::CodeBackingMismatch);
+            }
         }
     }
     Ok(())
@@ -483,12 +507,13 @@ fn run_path(
     path: &'static str,
     request: &MmioPollingStutterRequestV1<'_>,
     initial_context: &RecompContext,
+    path_rdram: &[u8],
     mode: StatusMode,
     stop_pc: u32,
     limits: MmioPollingStutterLimitsV1,
 ) -> Result<PathResult, MmioPollingStutterErrorV1> {
     let mut context = initial_context.clone();
-    let mut backing = request.initial_rdram.to_vec();
+    let mut backing = path_rdram.to_vec();
     let mut mem = Rdram::new(&mut backing);
     let mut port = ExactStatusPort {
         address: request.status_vaddr,
@@ -571,7 +596,7 @@ fn run_path(
         });
     }
     drop(mem);
-    if backing != request.initial_rdram {
+    if backing != path_rdram {
         return Err(MmioPollingStutterErrorV1::RdramChanged { path });
     }
     let certificate = PollingPathCertificateV1 {
@@ -908,6 +933,7 @@ mod tests {
                 ],
                 initial_context: &self.context,
                 initial_rdram: &self.backing,
+                ready_rdram: &self.backing,
                 cycle_head_pc: HEAD,
                 join_pc: JOIN,
                 status_vaddr: STATUS,
@@ -1014,6 +1040,33 @@ mod tests {
         assert!(matches!(
             validate_mmio_polling_stutter_v1(&request, Default::default()),
             Err(MmioPollingStutterErrorV1::InvalidStatusAddress)
+        ));
+    }
+
+    #[test]
+    fn ready_paths_use_and_commit_the_post_device_backing() {
+        let fixture = Fixture::new();
+        let mut ready = fixture.backing.clone();
+        ready[0x0010_0000usize ^ 3] = 0x5a;
+        let mut request = fixture.request();
+        request.ready_rdram = &ready;
+        let validation = validate_mmio_polling_stutter_v1(&request, Default::default()).unwrap();
+        assert_ne!(
+            validation.certificate().initial_rdram_sha256,
+            validation.certificate().ready_rdram_sha256
+        );
+    }
+
+    #[test]
+    fn ready_backing_cannot_change_committed_polling_code() {
+        let fixture = Fixture::new();
+        let mut ready = fixture.backing.clone();
+        ready[((CODE_PA + (HEAD - CODE_VA)) as usize) ^ 3] ^= 1;
+        let mut request = fixture.request();
+        request.ready_rdram = &ready;
+        assert!(matches!(
+            validate_mmio_polling_stutter_v1(&request, Default::default()),
+            Err(MmioPollingStutterErrorV1::CodeBackingMismatch)
         ));
     }
 
