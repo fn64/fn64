@@ -2228,10 +2228,35 @@ Banjo-Kazooie (CC0, 100% complete, `symbol_addrs.*.txt`) and Perfect Dark
 (MIT, ~97.5%, `symbol_addrs.*.txt`) are clean direct-hit keys; Super Mario
 64 (CC0, 100%) needs linker-map parsing; Diddy Kong Racing (CC0, ~97.75%)
 is a strong alternate. Paper Mario and Majora's Mask have the best splat
-tooling but **no license** — symbol-metadata extraction from them is held
-until a rights check; GoldenEye is ranked last (89.1%, no license, active
-rights disputes around the title). Keys require the user's own ROMs to
+tooling but **no license**; GoldenEye is ranked last (89.1%, no license,
+active rights disputes around the title). Keys require the user's own ROMs to
 grade against; ingestion tooling ships with loud env-declared skips.
+
+The rights check those three were held for was resolved by project-owner
+decision 2026-08-01 (AGENTS.md "Clean-room protocol"): measured observations
+about a ROM — addresses, segment maps, overlay geometry, symbol-to-address
+bindings — may be read from a decompilation project whatever its declared
+license, because they are facts about the cartridge that any disassembly
+reproduces, not the project's expression. Copying or adapting such a
+project's *code* remains disallowed.
+
+### Observation intake
+
+| Source | License | Date | What was taken |
+|---|---|---|---|
+| pmret/papermario | none declared | 2026-08-01 | `ver/pal/splat.yaml` segment map for the PAL ROM (sha1 `2111d392…`, matching its `checksum.sha1`): 687 kseg0 ROM→VRAM segment mappings, read as measurements to explain an overlay-recovery failure. No source read into fn64. |
+
+That measurement disproved a standing hypothesis and identified the real
+cause: Paper Mario maps 687 segments onto only 35 distinct VRAM destinations
+(420 segments share `0x80240000`) with 683 distinct
+`vram - rom_offset` deltas, and every VRAM lands below `0x8080_0000`. So
+`SearchConfig::aki_family`'s `vram_hi` bound was never the blocker, and
+`delta_vote`'s search for a dominant shared delta is structurally
+inapplicable to an overlay-swapping engine: the descriptor's own `vram_dest`
+is the authority there, and corroboration has to come from the loaded image
+decoding as MIPS at that VA rather than from agreement between sibling
+regions. 195 of 687 regions also fall below `aki_family`'s `min_region_len`
+of `0x1000` (`vrom_family` already relaxes this to `0x80`).
 
 Corrections measured during intake (2026-07-18, same day): Perfect Dark has
 NO splat `symbol_addrs` table at its repo root — the survey's claim was
