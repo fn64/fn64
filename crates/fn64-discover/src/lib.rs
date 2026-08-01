@@ -743,6 +743,31 @@ fn discover_with_recovered_vrom_and_request_dma(
             wrapper_diagnostics.semantic_proof_unavailable
         ));
     }
+    // Naming the unestablished fact is what makes a corpus of wrapper
+    // rejections actionable: the counts rank which dataflow fact the detector
+    // most often cannot recover. Facts cascade, so one candidate may appear
+    // under several names.
+    let rejections = &wrapper_diagnostics.rejections;
+    let rejection_census = [
+        ("no_end_minus_start", rejections.no_end_minus_start),
+        ("no_nested_dma_call", rejections.no_nested_dma_call),
+        ("destination_not_advanced", rejections.destination_not_advanced),
+        ("physical_not_advanced", rejections.physical_not_advanced),
+        ("remaining_not_reduced", rejections.remaining_not_reduced),
+        ("no_backward_loop", rejections.no_backward_loop),
+        ("no_return", rejections.no_return),
+    ];
+    if rejection_census.iter().any(|(_, count)| *count != 0) {
+        let detail = rejection_census
+            .iter()
+            .filter(|(_, count)| *count != 0)
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        request_dma_report.push_open_bounded(format!(
+            "wrapper_shape_rejections: {detail}"
+        ));
+    }
     if wrapper_diagnostics.limit_hit {
         request_dma_report.push_open_bounded(
             "physical end-address DMA-wrapper inference reached its candidate bound; result is incomplete"
@@ -757,6 +782,10 @@ struct PhysicalWrapperCandidateDiagnostics {
     candidates_examined: usize,
     semantic_proof_unavailable: usize,
     limit_hit: bool,
+    /// Which required dataflow fact each rejected candidate failed to
+    /// establish. Examined-minus-admitted is otherwise an undifferentiated
+    /// number, and on most ROMs it is the whole of the geometry frontier.
+    rejections: pi_dma::WrapperRejectionCensus,
 }
 
 /// Retain wrapper-shape evidence without creating a loader input or mapping.
@@ -771,6 +800,7 @@ fn record_physical_end_dma_wrapper_candidates(
         candidates_examined: inference.candidates_examined,
         semantic_proof_unavailable: inference.admitted.len(),
         limit_hit: inference.candidate_limit_hit,
+        rejections: inference.rejections,
     };
     for wrapper in inference.admitted {
         db.insert(Fact::Evidence {

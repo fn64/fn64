@@ -1116,12 +1116,89 @@ pub struct PhysicalEndDmaWrapper {
     pub nested_dma_call_pc: u32,
 }
 
+/// Which of the wrapper shape's required dataflow facts a candidate failed to
+/// establish. A candidate must satisfy every one, so a rejection census over a
+/// corpus names the specific fact the detector cannot recover rather than
+/// reporting an undifferentiated "examined, not admitted".
+///
+/// Counts are per rejected candidate and one candidate may miss several facts,
+/// so these sum to at least the rejection count, not exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WrapperRejectionCensus {
+    /// Length was never computed as `a2 - a1`.
+    pub no_end_minus_start: usize,
+    /// No inner `osPiStartDma`-shaped call with the required argument shape.
+    pub no_nested_dma_call: usize,
+    pub destination_not_advanced: usize,
+    pub physical_not_advanced: usize,
+    pub remaining_not_reduced: usize,
+    /// Body never loops backward, so it copies at most one chunk.
+    pub no_backward_loop: usize,
+    /// Bounded body ended without a return: the window is too small or this is
+    /// not a self-contained function.
+    pub no_return: usize,
+}
+
+impl WrapperRejectionCensus {
+    fn record(&mut self, facts: &WrapperFacts) {
+        if !facts.saw_end_minus_start {
+            self.no_end_minus_start += 1;
+        }
+        if facts.nested_dma_call.is_none() {
+            self.no_nested_dma_call += 1;
+        }
+        if !facts.destination_advanced {
+            self.destination_not_advanced += 1;
+        }
+        if !facts.physical_advanced {
+            self.physical_not_advanced += 1;
+        }
+        if !facts.remaining_reduced {
+            self.remaining_not_reduced += 1;
+        }
+        if !facts.backward_loop {
+            self.no_backward_loop += 1;
+        }
+        if !facts.saw_return {
+            self.no_return += 1;
+        }
+    }
+}
+
+/// The dataflow facts [`classify_physical_end_wrapper`] establishes while
+/// walking a candidate body. Admission requires all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct WrapperFacts {
+    saw_end_minus_start: bool,
+    nested_dma_call: Option<u32>,
+    destination_advanced: bool,
+    physical_advanced: bool,
+    remaining_reduced: bool,
+    backward_loop: bool,
+    saw_return: bool,
+}
+
+impl WrapperFacts {
+    fn admits(&self) -> Option<u32> {
+        (self.saw_end_minus_start
+            && self.destination_advanced
+            && self.physical_advanced
+            && self.remaining_reduced
+            && self.backward_loop
+            && self.saw_return)
+            .then_some(self.nested_dma_call)
+            .flatten()
+    }
+}
+
 /// Bounded result of [`infer_physical_end_dma_wrappers`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PhysicalEndDmaWrapperInference {
     pub admitted: Vec<PhysicalEndDmaWrapper>,
     pub candidates_examined: usize,
     pub candidate_limit_hit: bool,
+    /// Why examined candidates were not admitted.
+    pub rejections: WrapperRejectionCensus,
 }
 
 const MAX_PHYSICAL_END_WRAPPER_CANDIDATES: usize = 4096;
@@ -1324,7 +1401,7 @@ fn classify_physical_end_wrapper(
     words: &[u32],
     image_start: u32,
     entry_index: usize,
-) -> Option<u32> {
+) -> WrapperFacts {
     let end = words
         .len()
         .min(entry_index.saturating_add(MAX_PHYSICAL_END_WRAPPER_WORDS));
@@ -1388,17 +1465,14 @@ fn classify_physical_end_wrapper(
         }
         index += 1;
     }
-    if saw_end_minus_start
-        && nested_dma_call.is_some()
-        && destination_advanced
-        && physical_advanced
-        && remaining_reduced
-        && backward_loop
-        && saw_return
-    {
-        nested_dma_call
-    } else {
-        None
+    WrapperFacts {
+        saw_end_minus_start,
+        nested_dma_call,
+        destination_advanced,
+        physical_advanced,
+        remaining_reduced,
+        backward_loop,
+        saw_return,
     }
 }
 
@@ -1436,14 +1510,15 @@ pub fn infer_physical_end_dma_wrappers(
         }
         inference.candidates_examined += 1;
         let entry_index = (entry_va.wrapping_sub(image_va_start) / 4) as usize;
-        if let Some(nested_dma_call_pc) =
-            classify_physical_end_wrapper(words, image_va_start, entry_index)
-        {
+        let facts = classify_physical_end_wrapper(words, image_va_start, entry_index);
+        if let Some(nested_dma_call_pc) = facts.admits() {
             inference.admitted.push(PhysicalEndDmaWrapper {
                 entry_va,
                 callers: caller_sites,
                 nested_dma_call_pc,
             });
+        } else {
+            inference.rejections.record(&facts);
         }
     }
     inference
@@ -1552,6 +1627,39 @@ mod physical_end_wrapper_tests {
         assert!(infer_physical_end_dma_wrappers(&no_loop, START)
             .admitted
             .is_empty());
+    }
+
+    #[test]
+    fn rejection_census_names_the_fact_the_candidate_failed() {
+        // The facts are not independent: the loop, cursor, and remaining-length
+        // facts are only evaluated once the inner DMA call is recognized, which
+        // itself needs the length dataflow. So breaking the length computation
+        // cascades, and the census reports every fact left unestablished rather
+        // than a single root cause. What must hold is that the broken fact is
+        // always named, and that a fact broken in isolation is named alone.
+        let mut count_semantics = wrapper_image();
+        count_semantics[14] = r(8, 0, 10, 0x21);
+        let report = infer_physical_end_dma_wrappers(&count_semantics, START);
+        assert_eq!(report.candidates_examined, 1);
+        assert_eq!(report.rejections.no_end_minus_start, 1);
+
+        // Breaking only the backward branch leaves every earlier fact intact,
+        // so exactly one counter moves.
+        let mut no_loop = wrapper_image();
+        no_loop[35] = 0;
+        let report = infer_physical_end_dma_wrappers(&no_loop, START);
+        assert_eq!(
+            report.rejections,
+            WrapperRejectionCensus {
+                no_backward_loop: 1,
+                ..WrapperRejectionCensus::default()
+            }
+        );
+
+        // An admitted candidate contributes nothing to the census.
+        let report = infer_physical_end_dma_wrappers(&wrapper_image(), START);
+        assert_eq!(report.admitted.len(), 1);
+        assert_eq!(report.rejections, WrapperRejectionCensus::default());
     }
 
     #[test]
@@ -2353,3 +2461,4 @@ mod pi_primitive_tests {
         );
     }
 }
+
