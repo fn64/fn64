@@ -124,6 +124,9 @@
 //! - [`headered_raw_deflate`]: bounded candidate-only materialization of an
 //!   explicitly addressed sequence of `0x1172`, big-endian-length, raw-DEFLATE
 //!   streams. Successful decoding proves bytes, not runtime placement or use.
+//! - [`materialized_image`]: conclusion-blind re-derivation of typed evaluated-
+//!   image receipts from normalized ROM bytes and proven VROM backing. Its
+//!   in-memory result carries bytes but no mapping or proof authority.
 //! - [`homology`]: bounded relocation-masked cross-ROM n-gram lookup with
 //!   collision-safe full-body validation and explicit ambiguous/unmatched
 //!   results. Homology emits candidates only.
@@ -228,6 +231,7 @@ pub mod host_bindings;
 pub mod ledger;
 pub mod load_table_use;
 pub mod loaders;
+pub mod materialized_image;
 pub mod missed_function_attribution;
 pub mod oot_reference;
 pub mod overlay_recipe;
