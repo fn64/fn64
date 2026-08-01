@@ -2245,6 +2245,7 @@ project's *code* remains disallowed.
 | Source | License | Date | What was taken |
 |---|---|---|---|
 | pmret/papermario | none declared | 2026-08-01 | `ver/pal/splat.yaml` segment map for the PAL ROM (sha1 `2111d392…`, matching its `checksum.sha1`): 687 kseg0 ROM→VRAM segment mappings, read as measurements to explain an overlay-recovery failure. No source read into fn64. |
+| bomberhackers/bm64 | none declared | 2026-08-01 | `splat.yaml` segment map only. **Targets a different revision** — sha1 `8f9e1706…`, a 16 MB build whose overlays begin at ROM `0x800000`, while the local ROM is 8 MB (sha1 `8a7648d8…`), so its addresses do not transfer and were not used as such. Read for engine *structure*, which is revision-stable. No source read into fn64. |
 
 That measurement disproved a standing hypothesis and identified the real
 cause: Paper Mario maps 687 segments onto only 35 distinct VRAM destinations
@@ -2257,6 +2258,16 @@ is the authority there, and corroboration has to come from the loaded image
 decoding as MIPS at that VA rather than from agreement between sibling
 regions. 195 of 687 regions also fall below `aki_family`'s `min_region_len`
 of `0x1000` (`vrom_family` already relaxes this to `0x80`).
+
+Bomberman 64 sharpens why the remaining zero-candidate ROMs stay open. Its
+decomp shows the same swapping shape — 111 overlay segments onto only four
+VRAM destinations, 95 sub-overlays sharing `0x80043000` — with every region
+inside `aki_family`'s size bounds. What differs is where the metadata lives:
+each overlay carries its **own** `ovl_N_header`, so there is no central
+`(rom_start, rom_end, vram_dest)` array for `enumerate_family_tables` to walk.
+These ROMs are not missing overlays, they are missing a *table*. Recovering
+per-overlay headers is a distinct detector from family-table enumeration, and
+is not attempted here.
 
 Corrections measured during intake (2026-07-18, same day): Perfect Dark has
 NO splat `symbol_addrs` table at its repo root — the survey's claim was
