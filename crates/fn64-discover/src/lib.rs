@@ -225,6 +225,7 @@ pub mod owner_proof;
 pub mod partition;
 pub mod pi_dma;
 pub mod probe;
+pub mod program_transfer_index;
 pub mod regions;
 pub mod reloc_grade;
 pub mod resolve;

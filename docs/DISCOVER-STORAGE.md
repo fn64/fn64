@@ -456,6 +456,18 @@ edge retains its source block and instruction site. Direct control-flow edges
 inside a caller remain in the block graph; the call graph is an index, not a
 replacement.
 
+The current migration seam is `program_transfer_index::ProgramTransferIndex`.
+It derives one deterministic edge set only from validated composed snapshots:
+intra-bank CFG edges plus exact direct and exhaustive-resolved calls whose
+typed facts identify another composed bank. It exposes raw forward/reverse
+queries plus exact-owner `callees_of`/`callers_of` queries that retain source
+blocks and edge-origin instruction sites. Cross-bank jumps remain omitted
+until composition retains typed jump authority at this boundary. Open,
+bounded, observed, candidate-owner, and ambiguous-owner evidence stays out of
+the function projection. This interim view still uses vectors and `BTreeMap`
+postings and is rebuilt per composed snapshot set; it is neither the frozen
+CSR artifact nor the persistent corpus database specified here.
+
 The program graph adds data nodes and typed reference edges:
 
 - `Reads`, `Writes`, and `TakesAddressOf` from instruction site to data object;
