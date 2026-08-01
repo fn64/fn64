@@ -126,8 +126,10 @@
 //!   gp-relative data accesses `xref.rs` cannot see. Emitted xref sites are
 //!   candidate evidence; the admitted base is a typed program-level fact.
 //! - [`headered_raw_deflate`]: bounded candidate-only materialization of an
-//!   explicitly addressed sequence of `0x1172`, big-endian-length, raw-DEFLATE
-//!   streams. Successful decoding proves bytes, not runtime placement or use.
+//!   explicitly addressed sequence of raw-DEFLATE streams. `0x1172` uses a
+//!   six-byte header and four-byte big-endian length; `0x1173` uses a five-byte
+//!   header and three-byte big-endian length. Successful decoding proves
+//!   bytes, not runtime placement or use.
 //! - [`materialized_image`]: conclusion-blind re-derivation of typed evaluated-
 //!   image receipts from normalized ROM bytes and proven VROM backing. Its
 //!   in-memory result carries bytes but no mapping or proof authority.
@@ -255,6 +257,7 @@ pub mod regions;
 pub mod reloc_grade;
 pub mod resolve;
 pub mod rom;
+pub mod rzip_scan;
 pub mod runtime_generation_catalog;
 pub mod sig_scan;
 pub mod snapshot;
