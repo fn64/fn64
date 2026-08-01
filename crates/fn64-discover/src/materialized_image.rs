@@ -13,7 +13,8 @@ use crate::facts::{
     MaterializedImageStreamV1, MaterializedImageSuffixV1, ProofState, RomAddressSpace,
 };
 use crate::headered_raw_deflate::{
-    materialize_headered_raw_deflate_sequence, HeaderedRawDeflateError, HeaderedRawDeflateLimits,
+    materialize_headered_raw_deflate_1173_sequence, materialize_headered_raw_deflate_sequence,
+    HeaderedRawDeflateError, HeaderedRawDeflateLimits,
 };
 use crate::NormalizedRom;
 use sha2::{Digest, Sha256};
@@ -295,6 +296,24 @@ pub fn evaluate_materialized_image_v1(
                 }
             })?;
             materialize_headered_raw_deflate_sequence(
+                &materialized.bytes,
+                source_cursor,
+                stream_count,
+                HeaderedRawDeflateLimits {
+                    max_input_bytes: limits.max_source_bytes,
+                    max_stream_output_bytes: limits.max_stream_output_bytes,
+                    max_aggregate_output_bytes: limits.max_aggregate_output_bytes,
+                    max_streams: limits.max_streams,
+                },
+            )?
+        }
+        MaterializationEvaluatorV1::HeaderedRawDeflate1173SequenceV1 { stream_count } => {
+            let stream_count = usize::try_from(*stream_count).map_err(|_| {
+                MaterializedImageErrorV1::StreamCountConversion {
+                    stream_count: *stream_count,
+                }
+            })?;
+            materialize_headered_raw_deflate_1173_sequence(
                 &materialized.bytes,
                 source_cursor,
                 stream_count,
@@ -613,6 +632,19 @@ mod tests {
         result
     }
 
+    fn stream_1173(bytes: &[u8]) -> Vec<u8> {
+        assert!(bytes.len() <= 0x00ff_ffff);
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let length = (bytes.len() as u32).to_be_bytes();
+        let mut result = Vec::with_capacity(5 + compressed.len());
+        result.extend_from_slice(&[0x11, 0x73]);
+        result.extend_from_slice(&length[1..]);
+        result.extend_from_slice(&compressed);
+        result
+    }
+
     fn synthetic_rom(payload: &[u8], offset: usize) -> NormalizedRom {
         let mut bytes = vec![0; (offset + payload.len() + 3) & !3];
         bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
@@ -686,6 +718,38 @@ mod tests {
             rederive_materialized_image_v1(&rom, &FactDb::new(), first.receipt(), limits())
                 .unwrap(),
             first
+        );
+    }
+
+    #[test]
+    fn physical_1173_source_uses_distinct_typed_evaluator() {
+        let output = b"typed 1173 output";
+        let encoded = stream_1173(output);
+        let rom = synthetic_rom(&encoded, 0x80);
+        let source = MaterializedImageSourceV1 {
+            rom_space: RomAddressSpace::Physical,
+            rom_start: 0x80,
+            rom_end: 0x80 + encoded.len() as u32,
+            cursor: 0,
+        };
+        let evaluator =
+            MaterializationEvaluatorV1::HeaderedRawDeflate1173SequenceV1 { stream_count: 1 };
+
+        let result =
+            evaluate_materialized_image_v1(&rom, &FactDb::new(), &source, &evaluator, limits())
+                .unwrap();
+
+        assert_eq!(result.bytes(), output);
+        assert_eq!(result.receipt().evaluator, evaluator);
+        assert_eq!(result.receipt().streams[0].encoded_range.start, 5);
+        assert_eq!(
+            result.receipt().streams[0].declared_output_len,
+            output.len() as u32
+        );
+        assert_eq!(
+            rederive_materialized_image_v1(&rom, &FactDb::new(), result.receipt(), limits())
+                .unwrap(),
+            result
         );
     }
 

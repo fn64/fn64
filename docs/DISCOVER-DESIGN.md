@@ -570,6 +570,15 @@ itself use the same proven VROM resolver. Missing or competing file records,
 receipt disagreement, decoded-length disagreement, and resource-limit failures
 all reject the bank rather than materializing unverified bytes.
 
+Headered raw-DEFLATE evaluator identity includes the container layout. The
+existing `0x1172` evaluator retains its six-byte header and four-byte
+big-endian output length. The distinct `0x1173` evaluator uses a five-byte
+header and a three-byte big-endian output length; both require decoder
+`StreamEnd` and exact agreement with the declared output length. The `0x1173`
+layout was derived from local ROM-byte experiments and checked against
+`perfect-dark-pc-port/perfect_dark/src/lib/rzip_c.c` (MIT, Copyright 2022 Ryan
+Dwyer). Neither evaluator scans for a stream or establishes runtime placement.
+
 The opt-in `transform-invocation-certificate` feature adds a narrower,
 candidate-only bridge between those host-rederived bytes and one exact guest
 wrapper execution. It runs content-bound code and committed memory on a scoped

@@ -39,7 +39,11 @@ pub enum RomAddressSpace {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MaterializationEvaluatorV1 {
+    /// `0x1172`, six-byte header, four-byte big-endian output length.
     HeaderedRawDeflateSequenceV1 { stream_count: u32 },
+    /// `0x1173`, five-byte header, three-byte big-endian output length.
+    #[serde(rename = "headered_raw_deflate_1173_sequence_v1")]
+    HeaderedRawDeflate1173SequenceV1 { stream_count: u32 },
 }
 
 /// Immutable encoded input selected from the normalized ROM. `cursor` is
@@ -118,6 +122,10 @@ pub fn evaluated_image_receipt_sha256_v1(receipt: &EvaluatedImageReceiptV1) -> S
     match receipt.evaluator {
         MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 { stream_count } => {
             hasher.update([1]);
+            hash_u32(&mut hasher, stream_count);
+        }
+        MaterializationEvaluatorV1::HeaderedRawDeflate1173SequenceV1 { stream_count } => {
+            hasher.update([2]);
             hash_u32(&mut hasher, stream_count);
         }
     }
@@ -2770,7 +2778,10 @@ mod tests {
     fn evaluated_image_receipt_identity_is_stable_content_only() {
         let receipt = evaluated_receipt();
         let digest = evaluated_image_receipt_sha256_v1(&receipt);
-        assert_eq!(digest.len(), 64);
+        assert_eq!(
+            digest,
+            "b8d111b46163af2978271f8f66513133a7b3bd3e78eef308c601dbf2b25111d5"
+        );
         assert_eq!(digest, evaluated_image_receipt_sha256_v1(&receipt));
 
         let wire = serde_json::to_value(&receipt).unwrap();
@@ -2781,6 +2792,22 @@ mod tests {
         let mut changed = receipt;
         changed.trailing_suffix.len += 1;
         assert_ne!(digest, evaluated_image_receipt_sha256_v1(&changed));
+    }
+
+    #[test]
+    fn evaluated_image_1173_receipt_has_distinct_stable_identity() {
+        let mut receipt = evaluated_receipt();
+        receipt.evaluator =
+            MaterializationEvaluatorV1::HeaderedRawDeflate1173SequenceV1 { stream_count: 1 };
+
+        assert_eq!(
+            evaluated_image_receipt_sha256_v1(&receipt),
+            "3bda2c534cdefe150c9c5406a6d983891708597d4e736c95de580c5bd9300f77"
+        );
+        assert_eq!(
+            serde_json::to_value(&receipt).unwrap()["evaluator"]["kind"],
+            "headered_raw_deflate_1173_sequence_v1"
+        );
     }
 
     #[test]

@@ -9,8 +9,43 @@
 use flate2::{Decompress, FlushDecompress, Status};
 use sha2::{Digest, Sha256};
 
-const HEADER_LEN: usize = 6;
-const MAGIC: [u8; 2] = [0x11, 0x72];
+const MAGIC_1172: [u8; 2] = [0x11, 0x72];
+const MAGIC_1173: [u8; 2] = [0x11, 0x73];
+
+#[derive(Clone, Copy)]
+enum HeaderLayout {
+    /// Six-byte header: magic followed by a four-byte big-endian length.
+    Rzip1172,
+    /// Five-byte header: magic followed by a three-byte big-endian length.
+    Rzip1173,
+}
+
+impl HeaderLayout {
+    fn magic(self) -> [u8; 2] {
+        match self {
+            Self::Rzip1172 => MAGIC_1172,
+            Self::Rzip1173 => MAGIC_1173,
+        }
+    }
+
+    fn header_len(self) -> usize {
+        match self {
+            Self::Rzip1172 => 6,
+            Self::Rzip1173 => 5,
+        }
+    }
+
+    fn declared_output_len(self, header: &[u8]) -> usize {
+        match self {
+            Self::Rzip1172 => u32::from_be_bytes(header[2..6].try_into().unwrap()) as usize,
+            Self::Rzip1173 => {
+                (usize::from(header[2]) << 16)
+                    | (usize::from(header[3]) << 8)
+                    | usize::from(header[4])
+            }
+        }
+    }
+}
 
 /// Half-open byte range relative to the caller-supplied source or output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +89,7 @@ impl Default for HeaderedRawDeflateLimits {
 pub struct HeaderedRawDeflateStream {
     /// Header and compressed payload consumed by this stream.
     pub source_range: RelativeByteRange,
-    /// Raw-DEFLATE payload only, excluding the six-byte header.
+    /// Raw-DEFLATE payload only, excluding the container header.
     pub deflate_range: RelativeByteRange,
     /// This stream's bytes within the returned aggregate output.
     pub output_range: RelativeByteRange,
@@ -154,6 +189,43 @@ pub fn materialize_headered_raw_deflate_sequence(
     stream_count: usize,
     limits: HeaderedRawDeflateLimits,
 ) -> Result<HeaderedRawDeflateSequence, HeaderedRawDeflateError> {
+    materialize_headered_raw_deflate_sequence_with_layout(
+        source,
+        source_cursor,
+        stream_count,
+        limits,
+        HeaderLayout::Rzip1172,
+    )
+}
+
+/// Decode exactly `stream_count` `0x1173` streams beginning at
+/// `source_cursor`.
+///
+/// Each stream has a five-byte header whose final three bytes are its
+/// big-endian declared output length. All proof and resource properties are
+/// otherwise identical to [`materialize_headered_raw_deflate_sequence`].
+pub fn materialize_headered_raw_deflate_1173_sequence(
+    source: &[u8],
+    source_cursor: usize,
+    stream_count: usize,
+    limits: HeaderedRawDeflateLimits,
+) -> Result<HeaderedRawDeflateSequence, HeaderedRawDeflateError> {
+    materialize_headered_raw_deflate_sequence_with_layout(
+        source,
+        source_cursor,
+        stream_count,
+        limits,
+        HeaderLayout::Rzip1173,
+    )
+}
+
+fn materialize_headered_raw_deflate_sequence_with_layout(
+    source: &[u8],
+    source_cursor: usize,
+    stream_count: usize,
+    limits: HeaderedRawDeflateLimits,
+    layout: HeaderLayout,
+) -> Result<HeaderedRawDeflateSequence, HeaderedRawDeflateError> {
     if source.len() > limits.max_input_bytes {
         return Err(HeaderedRawDeflateError::InputLimitExceeded {
             bytes: source.len(),
@@ -181,20 +253,20 @@ pub fn materialize_headered_raw_deflate_sequence(
     let mut streams = Vec::with_capacity(stream_count);
     for stream in 0..stream_count {
         let header_end = cursor
-            .checked_add(HEADER_LEN)
+            .checked_add(layout.header_len())
             .ok_or(HeaderedRawDeflateError::SourceRangeOverflow { stream })?;
         let header = source
             .get(cursor..header_end)
             .ok_or(HeaderedRawDeflateError::TruncatedHeader { stream, cursor })?;
         let found = [header[0], header[1]];
-        if found != MAGIC {
+        if found != layout.magic() {
             return Err(HeaderedRawDeflateError::InvalidMagic {
                 stream,
                 cursor,
                 found,
             });
         }
-        let declared_output_len = u32::from_be_bytes(header[2..6].try_into().unwrap()) as usize;
+        let declared_output_len = layout.declared_output_len(header);
         if declared_output_len == 0 {
             return Err(HeaderedRawDeflateError::ZeroDeclaredOutput { stream });
         }
@@ -339,13 +411,26 @@ mod tests {
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
 
-    fn stream(bytes: &[u8]) -> Vec<u8> {
+    fn stream_1172(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         let compressed = encoder.finish().unwrap();
-        let mut result = Vec::with_capacity(HEADER_LEN + compressed.len());
-        result.extend_from_slice(&MAGIC);
+        let mut result = Vec::with_capacity(6 + compressed.len());
+        result.extend_from_slice(&MAGIC_1172);
         result.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        result.extend_from_slice(&compressed);
+        result
+    }
+
+    fn stream_1173(bytes: &[u8]) -> Vec<u8> {
+        assert!(bytes.len() <= 0x00ff_ffff);
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let length = (bytes.len() as u32).to_be_bytes();
+        let mut result = Vec::with_capacity(5 + compressed.len());
+        result.extend_from_slice(&MAGIC_1173);
+        result.extend_from_slice(&length[1..]);
         result.extend_from_slice(&compressed);
         result
     }
@@ -365,8 +450,8 @@ mod tests {
         let second = b"second payload with a distinct length";
         let prefix = [0xaa, 0xbb, 0xcc];
         let suffix = [0xde, 0xad, 0xbe, 0xef];
-        let first_stream = stream(first);
-        let second_stream = stream(second);
+        let first_stream = stream_1172(first);
+        let second_stream = stream_1172(second);
         let mut source = prefix.to_vec();
         source.extend_from_slice(&first_stream);
         source.extend_from_slice(&second_stream);
@@ -405,6 +490,71 @@ mod tests {
     }
 
     #[test]
+    fn materializes_1173_with_three_byte_big_endian_length() {
+        let first = vec![0x5a; 0x010203];
+        let second = b"second 1173 payload";
+        let prefix = [0xaa, 0xbb, 0xcc];
+        let suffix = [0xde, 0xad];
+        let first_stream = stream_1173(&first);
+        let second_stream = stream_1173(second);
+        let mut source = prefix.to_vec();
+        source.extend_from_slice(&first_stream);
+        source.extend_from_slice(&second_stream);
+        source.extend_from_slice(&suffix);
+        let mut generous = limits();
+        generous.max_input_bytes = source.len();
+        generous.max_stream_output_bytes = first.len();
+        generous.max_aggregate_output_bytes = first.len() + second.len();
+
+        let result =
+            materialize_headered_raw_deflate_1173_sequence(&source, prefix.len(), 2, generous)
+                .unwrap();
+
+        assert_eq!(result.bytes, [first.as_slice(), second.as_slice()].concat());
+        assert_eq!(result.streams[0].declared_output_len, 0x010203);
+        assert_eq!(result.streams[0].deflate_range.start, prefix.len() + 5);
+        assert_eq!(
+            result.streams[1].source_range.start,
+            prefix.len() + first_stream.len()
+        );
+        assert_eq!(result.trailing_suffix.offset, source.len() - suffix.len());
+        assert_eq!(result.trailing_suffix.sha256, sha256(&suffix));
+    }
+
+    #[test]
+    fn header_layouts_are_not_interchangeable() {
+        let output = b"layout-specific output";
+        let encoded_1172 = stream_1172(output);
+        let encoded_1173 = stream_1173(output);
+
+        assert!(matches!(
+            materialize_headered_raw_deflate_1173_sequence(&encoded_1172, 0, 1, limits()),
+            Err(HeaderedRawDeflateError::InvalidMagic {
+                found: MAGIC_1172,
+                ..
+            })
+        ));
+        assert!(matches!(
+            materialize_headered_raw_deflate_sequence(&encoded_1173, 0, 1, limits()),
+            Err(HeaderedRawDeflateError::InvalidMagic {
+                found: MAGIC_1173,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_1173_header() {
+        assert_eq!(
+            materialize_headered_raw_deflate_1173_sequence(&[0x11, 0x73, 0, 1], 0, 1, limits(),),
+            Err(HeaderedRawDeflateError::TruncatedHeader {
+                stream: 0,
+                cursor: 0,
+            })
+        );
+    }
+
+    #[test]
     fn rejects_malformed_deflate() {
         let mut source = vec![0x11, 0x72, 0, 0, 0, 8];
         source.extend_from_slice(&[0xff; 16]);
@@ -424,8 +574,8 @@ mod tests {
             })
         );
 
-        let mut truncated = stream(b"a payload long enough to require compressed bytes");
-        truncated.truncate(HEADER_LEN + 1);
+        let mut truncated = stream_1172(b"a payload long enough to require compressed bytes");
+        truncated.truncate(7);
         assert!(matches!(
             materialize_headered_raw_deflate_sequence(&truncated, 0, 1, limits()),
             Err(HeaderedRawDeflateError::MissingStreamEnd { stream: 0 })
@@ -435,7 +585,7 @@ mod tests {
 
     #[test]
     fn rejects_declared_output_over_resource_limits() {
-        let mut source = stream(b"small");
+        let mut source = stream_1172(b"small");
         source[2..6].copy_from_slice(&1025u32.to_be_bytes());
         assert_eq!(
             materialize_headered_raw_deflate_sequence(&source, 0, 1, limits()),
@@ -446,8 +596,8 @@ mod tests {
             })
         );
 
-        let one = stream(&vec![1; 700]);
-        let two = stream(&vec![2; 700]);
+        let one = stream_1172(&vec![1; 700]);
+        let two = stream_1172(&vec![2; 700]);
         let source = [one, two].concat();
         let mut aggregate_limited = limits();
         aggregate_limited.max_aggregate_output_bytes = 1000;
@@ -462,7 +612,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_end_marker() {
-        let mut source = stream(&vec![0x5a; 512]);
+        let mut source = stream_1172(&vec![0x5a; 512]);
         source.pop();
         assert!(matches!(
             materialize_headered_raw_deflate_sequence(&source, 0, 1, limits()),
@@ -473,7 +623,7 @@ mod tests {
 
     #[test]
     fn rejects_declared_output_mismatch() {
-        let mut source = stream(b"known output");
+        let mut source = stream_1172(b"known output");
         source[2..6].copy_from_slice(&11u32.to_be_bytes());
         assert_eq!(
             materialize_headered_raw_deflate_sequence(&source, 0, 1, limits()),
