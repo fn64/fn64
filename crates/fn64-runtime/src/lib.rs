@@ -86,8 +86,8 @@ pub use rdram::{
     RdramViewMut,
 };
 pub use rom::{
-    DmaCompletion, DmaMemory, DmaWriterChannel, InMemoryRom, PendingEepromWriteSnapshot, PiDma,
-    PiDmaError, ProcessDmaMemory, RomStorage,
+    DmaCompletion, DmaMemory, DmaWriterChannel, InMemoryRom, PendingEepromWriteSnapshot,
+    PiDeviceAddress, PiDma, PiDmaError, ProcessDmaMemory, RomStorage,
 };
 pub use rsp::{
     OsTaskHeader, RspMemAddr, RspMemory, RspMemoryBank, RspMemoryError, TaskLog, M_AUDTASK,

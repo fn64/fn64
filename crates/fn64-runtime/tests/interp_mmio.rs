@@ -137,7 +137,7 @@ fn interpreted_lw_of_pi_status_observes_the_modeled_device_transition() {
         .start_pi_dma(PiDmaRequest {
             direction: DmaDirection::ToRdram,
             dram_addr: RdramAddr::from_offset(0x40),
-            cart_addr: 0x10,
+            device: fn64_runtime::PiDeviceAddress::RomOffset(0x10),
             len: 4,
         })
         .unwrap();
@@ -193,7 +193,7 @@ fn interpreted_sw_to_pi_status_updates_modeled_device_state() {
         .start_pi_dma(PiDmaRequest {
             direction: DmaDirection::ToRdram,
             dram_addr: RdramAddr::from_offset(0x40),
-            cart_addr: 0x10,
+            device: fn64_runtime::PiDeviceAddress::RomOffset(0x10),
             len: 4,
         })
         .unwrap();

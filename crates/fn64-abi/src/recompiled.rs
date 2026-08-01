@@ -1060,7 +1060,7 @@ pub const BOOTSTRAP_IMPORT_VALIDATION_SCHEMA_V1: &str = "fn64.bootstrap-or-impor
 pub const BOOTSTRAP_WRITER_CHANNEL_COMPLETION_SCHEMA_V1: &str =
     "fn64.bootstrap-writer-channel-completion.v1";
 pub const CPU_WRITER_RUNTIME_STATE_SCHEMA_V1: &str = "fn64.cpu-instruction-store-runtime-state.v1";
-pub const PI_WRITER_RUNTIME_STATE_SCHEMA_V1: &str = "fn64.pi-writer-runtime-state.v1";
+pub const PI_WRITER_RUNTIME_STATE_SCHEMA_V2: &str = "fn64.pi-writer-runtime-state.v2";
 pub const SI_WRITER_RUNTIME_STATE_SCHEMA_V1: &str = "fn64.si-writer-runtime-state.v1";
 pub const SP_WRITER_RUNTIME_STATE_SCHEMA_V1: &str = "fn64.sp-writer-runtime-state.v1";
 pub const HOST_ABI_WRITER_RUNTIME_STATE_SCHEMA_V1: &str = "fn64.host-abi-writer-runtime-state.v1";
@@ -2528,7 +2528,7 @@ fn cpu_writer_runtime_state_receipt_sha256(evidence: &CpuWriterRuntimeStateEvide
 
 fn pi_writer_runtime_state_receipt_sha256(evidence: &PiWriterRuntimeStateEvidenceV1) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"fn64:pi-writer-runtime-state-receipt:v1");
+    hasher.update(b"fn64:pi-writer-runtime-state-receipt:v2");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
     hasher.update(evidence.schema.as_bytes());
     hasher.update(evidence.program_model_sha256);
@@ -2707,7 +2707,16 @@ fn hash_pi_request(hasher: &mut sha2::Sha256, request: fn64_runtime::PiDmaReques
         fn64_runtime::DmaDirection::FromRdram => 1,
     }]);
     hasher.update(request.dram_addr.offset().to_be_bytes());
-    hasher.update(request.cart_addr.to_be_bytes());
+    match request.device {
+        fn64_runtime::PiDeviceAddress::RomOffset(offset) => {
+            hasher.update([0]);
+            hasher.update(offset.to_be_bytes());
+        }
+        fn64_runtime::PiDeviceAddress::SramOffset(offset) => {
+            hasher.update([1]);
+            hasher.update(offset.to_be_bytes());
+        }
+    }
     hasher.update(request.len.to_be_bytes());
 }
 
@@ -2734,7 +2743,7 @@ fn validate_pi_transition_trace(
     let mut transitions = 0u64;
     let mut previous_order = None;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"fn64:pi-writer-runtime-transitions:v1");
+    hasher.update(b"fn64:pi-writer-runtime-transitions:v2");
 
     for event in trace {
         let order = (event.at.get(), event.sequence);
@@ -2822,7 +2831,7 @@ fn validate_pi_transition_trace(
                 let completed_request = fn64_runtime::PiDmaRequest {
                     direction: completion.direction,
                     dram_addr: completion.dram_addr,
-                    cart_addr: completion.dev_addr,
+                    device: completion.device,
                     len: completion.len,
                 };
                 if current.request != completed_request
@@ -3567,7 +3576,7 @@ fn validate_pi_writer_runtime_state_v1(
         })
         .collect::<Vec<_>>();
     let mut evidence = PiWriterRuntimeStateEvidenceV1 {
-        schema: PI_WRITER_RUNTIME_STATE_SCHEMA_V1.to_string(),
+        schema: PI_WRITER_RUNTIME_STATE_SCHEMA_V2.to_string(),
         program_model_sha256,
         resolver_install_sha256,
         abi_host_catalog_receipt_sha256,
@@ -4181,7 +4190,7 @@ fn validate_rsp_writer_runtime_state_v1(
                 owner
             }
             crate::task_dispatch::RspWriterCommitSourceV1::TranslatedAudioHle { .. } => {
-                return Err(RspWriterRuntimeStateErrorV1::InvalidRspWritebackRange)
+                return Err(RspWriterRuntimeStateErrorV1::InvalidRspWritebackRange);
             }
         };
         match owner.task_offset() {
@@ -4201,7 +4210,7 @@ fn validate_rsp_writer_runtime_state_v1(
         let owner = match publication.source {
             crate::task_dispatch::RspWriterCommitSourceV1::TranslatedAudioHle { owner } => owner,
             crate::task_dispatch::RspWriterCommitSourceV1::Interpreter { .. } => {
-                return Err(RspWriterRuntimeStateErrorV1::InvalidRspHlePublication)
+                return Err(RspWriterRuntimeStateErrorV1::InvalidRspHlePublication);
             }
         };
         translated_audio_hle_publication_count = translated_audio_hle_publication_count
@@ -9353,10 +9362,12 @@ fn resolve_unified_catalog_entry(
 ) -> Result<UnifiedCatalogTargetV1, String> {
     match live.resolve_entry(target_pc) {
         Ok(entry) => Ok(UnifiedCatalogTargetV1::Static(entry)),
-        Err(fault @ CpuFault {
-            kind: CpuFaultKind::NoActiveGeneration,
-            ..
-        }) => match live.activate_for_fetch(target_pc, mem) {
+        Err(
+            fault @ CpuFault {
+                kind: CpuFaultKind::NoActiveGeneration,
+                ..
+            },
+        ) => match live.activate_for_fetch(target_pc, mem) {
             Ok(entry) => Ok(UnifiedCatalogTargetV1::Static(entry)),
             Err(GenerationLookupError::AotMiss(_) | GenerationLookupError::UnmappedPc { .. }) => {
                 Ok(UnifiedCatalogTargetV1::Dynamic {
@@ -9371,12 +9382,10 @@ fn resolve_unified_catalog_entry(
                 "entry generation activation at {target_pc} did not produce an executable owner: {error}"
             )),
         },
-        Err(fault) if dynamic_fallback_eligible(fault) => {
-            Ok(UnifiedCatalogTargetV1::Dynamic {
-                source_bank: fault.at.bank,
-                target_pc,
-            })
-        }
+        Err(fault) if dynamic_fallback_eligible(fault) => Ok(UnifiedCatalogTargetV1::Dynamic {
+            source_bank: fault.at.bank,
+            target_pc,
+        }),
         Err(fault) => Err(format!("entry {target_pc} does not resolve: {fault}")),
     }
 }
@@ -11246,16 +11255,23 @@ mod tests {
     }
 
     fn pi_test_trace(direction: fn64_runtime::DmaDirection) -> Vec<fn64_runtime::DeviceTraceEvent> {
+        pi_test_trace_for_device(direction, fn64_runtime::PiDeviceAddress::RomOffset(0x20))
+    }
+
+    fn pi_test_trace_for_device(
+        direction: fn64_runtime::DmaDirection,
+        device: fn64_runtime::PiDeviceAddress,
+    ) -> Vec<fn64_runtime::DeviceTraceEvent> {
         let request = fn64_runtime::PiDmaRequest {
             direction,
             dram_addr: fn64_runtime::RdramAddr::from_offset(0x6000),
-            cart_addr: 0x20,
+            device,
             len: 4,
         };
         let completion = fn64_runtime::DmaCompletion {
             direction,
             dram_addr: request.dram_addr,
-            dev_addr: request.cart_addr,
+            device: request.device,
             len: request.len,
         };
         [
@@ -11702,8 +11718,8 @@ mod tests {
             .expect("canonical owner must mint one fresh PI epoch");
         assert!(crate::copy_device_trace().is_empty());
         assert!(write_raw_mmio(0xFFFF_FFFF_A460_0000, 0x6000));
-        assert!(write_raw_mmio(0xFFFF_FFFF_A460_0004, 0x20));
-        assert!(write_raw_mmio(0xFFFF_FFFF_A460_0008, 3));
+        assert!(write_raw_mmio(0xFFFF_FFFF_A460_0004, 0x1000_0020));
+        assert!(write_raw_mmio(0xFFFF_FFFF_A460_000C, 3));
         assert_eq!(
             take_validated_pi_writer_runtime_state_receipt_v1(&epoch).unwrap_err(),
             PiWriterRuntimeStateErrorV1::PendingDevicePi
@@ -11908,18 +11924,33 @@ mod tests {
     }
 
     #[test]
+    fn pi_writer_v2_distinguishes_equal_rom_and_sram_offsets() {
+        let rom = pi_test_trace_for_device(
+            fn64_runtime::DmaDirection::ToRdram,
+            fn64_runtime::PiDeviceAddress::RomOffset(0x20),
+        );
+        let sram = pi_test_trace_for_device(
+            fn64_runtime::DmaDirection::ToRdram,
+            fn64_runtime::PiDeviceAddress::SramOffset(0x20),
+        );
+        let rom_digest = validate_pi_transition_trace(&rom).unwrap().7;
+        let sram_digest = validate_pi_transition_trace(&sram).unwrap().7;
+        assert_ne!(rom_digest, sram_digest);
+    }
+
+    #[test]
     fn pi_writer_runtime_state_accepts_serialized_requests_while_interrupt_remains_asserted() {
         let mut trace = pi_test_trace(fn64_runtime::DmaDirection::ToRdram);
         let second = fn64_runtime::PiDmaRequest {
             direction: fn64_runtime::DmaDirection::ToRdram,
             dram_addr: fn64_runtime::RdramAddr::from_offset(0x6010),
-            cart_addr: 0x24,
+            device: fn64_runtime::PiDeviceAddress::RomOffset(0x24),
             len: 4,
         };
         let completion = fn64_runtime::DmaCompletion {
             direction: second.direction,
             dram_addr: second.dram_addr,
-            dev_addr: second.cart_addr,
+            device: second.device,
             len: second.len,
         };
         for kind in [
@@ -15261,8 +15292,8 @@ mod tests {
         match (entry.bank, entry.pc) {
             (DMA_OLD_BANK, DMA_ENTRY) => {
                 mem.store_w(0xFFFF_FFFF_A460_0000, DMA_PHYSICAL);
-                mem.store_w(0xFFFF_FFFF_A460_0004, 0x20);
-                mem.store_w(0xFFFF_FFFF_A460_0008, 7);
+                mem.store_w(0xFFFF_FFFF_A460_0004, 0x1000_0020);
+                mem.store_w(0xFFFF_FFFF_A460_000C, 7);
                 BlockRun::new(BlockExit::Checkpoint(entry), 5)
             }
             (DMA_NEW_BANK, DMA_ENTRY) => {
@@ -15484,8 +15515,8 @@ mod tests {
                 ctx.set_r(4, 0x0010_0401); // OS_IM_PI
                 os_set_int_mask(ctx, mem);
                 mem.store_w(0xFFFF_FFFF_A460_0000, 0x400);
-                mem.store_w(0xFFFF_FFFF_A460_0004, 0x20);
-                mem.store_w(0xFFFF_FFFF_A460_0008, 3);
+                mem.store_w(0xFFFF_FFFF_A460_0004, 0x1000_0020);
+                mem.store_w(0xFFFF_FFFF_A460_000C, 3);
                 BlockRun::new(
                     BlockExit::Checkpoint(ExecutionKey::new(IRQ_BANK, IRQ_RESUME)),
                     5,
@@ -17680,8 +17711,8 @@ mod tests {
         {
             let mut mem = Rdram::new(&mut bytes);
             mem.store_w(0xFFFF_FFFF_A460_0000, 0x400);
-            mem.store_w(0xFFFF_FFFF_A460_0004, 0x20);
-            mem.store_w(0xFFFF_FFFF_A460_0008, 3);
+            mem.store_w(0xFFFF_FFFF_A460_0004, 0x1000_0020);
+            mem.store_w(0xFFFF_FFFF_A460_000C, 3);
             assert_eq!(
                 mem.load_w(0xFFFF_FFFF_A460_0010) as u32,
                 fn64_runtime::PI_STATUS_DMA_BUSY

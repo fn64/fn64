@@ -10,6 +10,10 @@
 //! already-ingested [`DeviceTraceIngest`](crate::timing_trace::DeviceTraceIngest)
 //! streams (via [`ingest_jsonl`](crate::timing_trace::ingest_jsonl)) and reports
 //! where they diverge.
+//! Agreement additionally requires both envelopes to end with
+//! [`DeviceTraceCompletion::Completed`](crate::timing_trace::DeviceTraceCompletion::Completed).
+//! Matching aborted streams are failed evidence, including two empty aborted
+//! streams; a matching event prefix cannot promote an unsuccessful capture.
 //!
 //! ## The approved tolerance philosophy (two-tier)
 //!
@@ -53,7 +57,10 @@
 //! treated as a fixed window and excluded from the ordering/payload key. Every
 //! other device compares its full payload.
 
-use crate::timing_trace::{DeviceEvent, DeviceTraceIngest, TimingDevice, TimingEventKind};
+use crate::timing_trace::{
+    DeviceEvent, DeviceTraceCompletion, DeviceTraceIngest, TimingDevice, TimingDmaDirection,
+    TimingEventKind, TimingPiDevice,
+};
 
 /// Per-device cycle tolerance band, in guest cycles. Two aligned events of the
 /// same `(kind, device, payload)` whose cycle stamps differ by MORE than the
@@ -145,9 +152,10 @@ impl Default for TimingTolerance {
 }
 
 /// The identity of an aligned position that must match zero-tolerance: the
-/// event kind, the device, the payload address/source, and — except for SI —
-/// the length. Two events with the same key are order-compatible; the only
-/// remaining comparison is their cycle stamps against the band.
+/// event kind, the device, the payload address/source, PI direction and typed
+/// device-relative target, and — except for SI — the length. Two events with
+/// the same key are order-compatible; the only remaining comparison is their
+/// cycle stamps against the band.
 ///
 /// SI's `value_or_len` is deliberately absent (the fixed-window caveat): fn64's
 /// fabric emits 0 for it while a reference may emit the true 64, and that is not
@@ -159,6 +167,9 @@ struct AlignmentKey {
     addr_or_source: u32,
     /// `Some(len)` for every device except SI; `None` for SI (fixed window).
     value_or_len: Option<u32>,
+    dma_direction: Option<TimingDmaDirection>,
+    pi_device: Option<TimingPiDevice>,
+    pi_offset: Option<u32>,
 }
 
 impl AlignmentKey {
@@ -173,6 +184,9 @@ impl AlignmentKey {
             device: event.device,
             addr_or_source: event.addr_or_source,
             value_or_len,
+            dma_direction: event.dma_direction,
+            pi_device: event.pi_device,
+            pi_offset: event.pi_offset,
         }
     }
 }
@@ -186,6 +200,9 @@ pub struct EventSummary {
     pub cycle: u64,
     pub addr_or_source: u32,
     pub value_or_len: u32,
+    pub dma_direction: Option<TimingDmaDirection>,
+    pub pi_device: Option<TimingPiDevice>,
+    pub pi_offset: Option<u32>,
 }
 
 impl EventSummary {
@@ -197,6 +214,9 @@ impl EventSummary {
             cycle: event.cycle,
             addr_or_source: event.addr_or_source,
             value_or_len: event.value_or_len,
+            dma_direction: event.dma_direction,
+            pi_device: event.pi_device,
+            pi_offset: event.pi_offset,
         }
     }
 }
@@ -205,13 +225,16 @@ impl std::fmt::Display for EventSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ordinal={} {:?}/{:?} cycle={} addr_or_source=0x{:x} value_or_len={}",
+            "ordinal={} {:?}/{:?} cycle={} addr_or_source=0x{:x} value_or_len={} dma_direction={:?} pi_device={:?} pi_offset={:?}",
             self.ordinal,
             self.event_kind,
             self.device,
             self.cycle,
             self.addr_or_source,
             self.value_or_len,
+            self.dma_direction,
+            self.pi_device,
+            self.pi_offset,
         )
     }
 }
@@ -222,6 +245,15 @@ impl std::fmt::Display for EventSummary {
 /// actionable one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Divergence {
+    /// Event bodies agreed within tolerance, but one or both trace envelopes
+    /// did not report successful completion. Agreement requires both sides to
+    /// be `Completed`; two matching `Aborted` streams are still failed evidence.
+    Completion {
+        /// Position immediately after the compared event prefix.
+        index: usize,
+        fn64: DeviceTraceCompletion,
+        reference: DeviceTraceCompletion,
+    },
     /// Zero-tolerance ordering mismatch: the aligned position `index` (0-based
     /// over the compared event sequence) does not agree on
     /// `(event_kind, device, payload)`. One side may be absent (a missing or
@@ -252,7 +284,9 @@ impl Divergence {
     /// The aligned index this divergence occurred at.
     pub fn index(&self) -> usize {
         match self {
-            Self::Ordering { index, .. } | Self::CycleOutOfBand { index, .. } => *index,
+            Self::Completion { index, .. }
+            | Self::Ordering { index, .. }
+            | Self::CycleOutOfBand { index, .. } => *index,
         }
     }
 }
@@ -266,6 +300,14 @@ impl std::fmt::Display for Divergence {
             }
         }
         match self {
+            Self::Completion {
+                index,
+                fn64,
+                reference,
+            } => write!(
+                f,
+                "trace-completion-invalid after {index} aligned events: both traces must be Completed (fn64={fn64:?}, reference={reference:?})",
+            ),
             Self::Ordering {
                 index,
                 fn64,
@@ -316,14 +358,16 @@ pub struct DiffCounts {
 /// and the tolerance used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffReport {
-    /// `None` means the two streams agree end-to-end within tolerance.
+    /// `None` means both streams completed and their events agree end-to-end
+    /// within tolerance.
     pub first_divergence: Option<Divergence>,
     pub counts: DiffCounts,
     pub tolerance: TimingTolerance,
 }
 
 impl DiffReport {
-    /// True when the streams agree: same ordering AND every cycle in band.
+    /// True only when both traces completed, ordering matches, and every cycle
+    /// is in band.
     pub fn agrees(&self) -> bool {
         self.first_divergence.is_none()
     }
@@ -369,11 +413,9 @@ impl DiffReport {
     }
 }
 
-/// Diff two device-event streams. `fn64` is the stream under test; `reference`
-/// is the oracle. Both are already-ingested traces (their JSONL envelope,
-/// ordinals, header, and end record validated by
-/// [`ingest_jsonl`](crate::timing_trace::ingest_jsonl)); this compares their
-/// event bodies.
+/// Diff two device-event bodies. This internal helper has no trace-envelope
+/// completion information; only [`diff_ingests`] can produce an acceptance
+/// report.
 ///
 /// The two streams are aligned position-for-position (index 0 to index 0, and
 /// so on). At each position:
@@ -387,7 +429,7 @@ impl DiffReport {
 /// The comparator halts at the FIRST divergence (spec's first-divergent
 /// principle) and never resynchronizes past a structural mismatch, because any
 /// pairing past an unmatched event would be a guess (`wrong == 0`).
-pub fn diff_events(
+fn diff_events(
     fn64: &[DeviceEvent],
     reference: &[DeviceEvent],
     tolerance: &TimingTolerance,
@@ -462,21 +504,35 @@ pub fn diff_events(
     }
 }
 
-/// [`diff_events`] over two fully-ingested traces. Convenience for callers that
-/// hold [`DeviceTraceIngest`](crate::timing_trace::DeviceTraceIngest)s.
+/// Diff two fully-ingested traces. Event diagnostics take precedence: the first
+/// ordering or cycle divergence is preserved even when a trace also aborted.
+/// If the event bodies agree, both envelopes must be `Completed`; any aborted
+/// side becomes a [`Divergence::Completion`].
 pub fn diff_ingests(
     fn64: &DeviceTraceIngest,
     reference: &DeviceTraceIngest,
     tolerance: &TimingTolerance,
 ) -> DiffReport {
-    diff_events(&fn64.events, &reference.events, tolerance)
+    let mut report = diff_events(&fn64.events, &reference.events, tolerance);
+    if report.first_divergence.is_none()
+        && (fn64.completion != DeviceTraceCompletion::Completed
+            || reference.completion != DeviceTraceCompletion::Completed)
+    {
+        report.first_divergence = Some(Divergence::Completion {
+            index: report.counts.events_compared,
+            fn64: fn64.completion,
+            reference: reference.completion,
+        });
+    }
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::timing_trace::{
-        DeviceTraceCompletion, DeviceTraceRecord, DEVICE_TRACE_SCHEMA_VERSION,
+        DeviceTraceCompletion, DeviceTraceRecord, TimingDmaDirection, TimingPiDevice,
+        DEVICE_TRACE_SCHEMA_VERSION,
     };
 
     /// Build a small but representative device-event stream: a PI DMA
@@ -498,6 +554,9 @@ mod tests {
                 cycle: 461_036,
                 addr_or_source: 0x0020,
                 value_or_len: 0x1000,
+                dma_direction: Some(TimingDmaDirection::ToRdram),
+                pi_device: Some(TimingPiDevice::Rom),
+                pi_offset: Some(0x10),
             },
             DeviceTraceRecord::DeviceEvent {
                 ordinal: 2,
@@ -506,6 +565,9 @@ mod tests {
                 cycle: 592_178,
                 addr_or_source: 0x0020,
                 value_or_len: 0x1000,
+                dma_direction: Some(TimingDmaDirection::ToRdram),
+                pi_device: Some(TimingPiDevice::Rom),
+                pi_offset: Some(0x10),
             },
             DeviceTraceRecord::DeviceEvent {
                 ordinal: 3,
@@ -514,6 +576,9 @@ mod tests {
                 cycle: 592_178,
                 addr_or_source: 1 << 4, // PI source bit
                 value_or_len: 0,
+                dma_direction: None,
+                pi_device: None,
+                pi_offset: None,
             },
             DeviceTraceRecord::DeviceEvent {
                 ordinal: 4,
@@ -522,6 +587,9 @@ mod tests {
                 cycle: 600_000,
                 addr_or_source: 0x0040,
                 value_or_len: 0, // fixed 64-byte PIF window: fn64 emits 0
+                dma_direction: None,
+                pi_device: None,
+                pi_offset: None,
             },
             DeviceTraceRecord::DeviceEvent {
                 ordinal: 5,
@@ -530,6 +598,9 @@ mod tests {
                 cycle: 700_000,
                 addr_or_source: 0,
                 value_or_len: 0,
+                dma_direction: None,
+                pi_device: None,
+                pi_offset: None,
             },
             DeviceTraceRecord::End {
                 ordinal: 6,
@@ -577,6 +648,113 @@ mod tests {
         assert_eq!(report.counts.cycle_out_of_band, 0);
         assert_eq!(report.counts.fn64_events, 5);
         assert_eq!(report.counts.reference_events, 5);
+    }
+
+    #[test]
+    fn equal_empty_aborted_traces_cannot_report_agreement() {
+        let records = vec![
+            DeviceTraceRecord::Header {
+                ordinal: 0,
+                schema_version: DEVICE_TRACE_SCHEMA_VERSION,
+                producer: "synthetic".to_string(),
+                trace_id: "empty-abort".to_string(),
+            },
+            DeviceTraceRecord::End {
+                ordinal: 1,
+                completion: DeviceTraceCompletion::Aborted,
+            },
+        ];
+        let fn64 = ingest(&records);
+        let reference = ingest(&records);
+        let report = diff_ingests(&fn64, &reference, &TimingTolerance::initial_loose());
+
+        assert!(!report.agrees());
+        assert_eq!(report.counts.events_compared, 0);
+        assert!(matches!(
+            report.first_divergence,
+            Some(Divergence::Completion {
+                index: 0,
+                fn64: DeviceTraceCompletion::Aborted,
+                reference: DeviceTraceCompletion::Aborted,
+            })
+        ));
+        let diagnostic = report.to_human();
+        assert!(diagnostic.contains("RESULT: DIVERGE"));
+        assert!(diagnostic.contains("fn64=Aborted, reference=Aborted"));
+    }
+
+    #[test]
+    fn completion_mismatch_fails_after_preserving_matched_event_counts() {
+        let completed = ingest(&sample_records());
+        let mut aborted_records = sample_records();
+        let Some(DeviceTraceRecord::End { completion, .. }) = aborted_records.last_mut() else {
+            panic!("sample ends with completion");
+        };
+        *completion = DeviceTraceCompletion::Aborted;
+        let aborted = ingest(&aborted_records);
+
+        let report = diff_ingests(&completed, &aborted, &TimingTolerance::initial_loose());
+        assert!(!report.agrees());
+        assert_eq!(report.counts.events_compared, 5);
+        assert_eq!(report.counts.ordering_matches, 5);
+        assert_eq!(report.counts.cycle_in_band, 5);
+        assert!(matches!(
+            report.first_divergence,
+            Some(Divergence::Completion {
+                index: 5,
+                fn64: DeviceTraceCompletion::Completed,
+                reference: DeviceTraceCompletion::Aborted,
+            })
+        ));
+    }
+
+    #[test]
+    fn event_divergence_remains_the_first_diagnostic_when_a_trace_aborted() {
+        let reference = ingest(&sample_records());
+        let mut aborted_records = sample_records();
+        for record in &mut aborted_records {
+            match record {
+                DeviceTraceRecord::DeviceEvent {
+                    event_kind: TimingEventKind::DmaStart,
+                    device: TimingDevice::Pi,
+                    value_or_len,
+                    ..
+                } => *value_or_len += 1,
+                DeviceTraceRecord::End { completion, .. } => {
+                    *completion = DeviceTraceCompletion::Aborted;
+                }
+                _ => {}
+            }
+        }
+        let aborted = ingest(&aborted_records);
+        let report = diff_ingests(&aborted, &reference, &TimingTolerance::initial_loose());
+
+        assert!(matches!(
+            report.first_divergence,
+            Some(Divergence::Ordering { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn equal_pi_offsets_on_different_devices_are_an_ordering_divergence() {
+        let rom = ingest(&sample_records());
+        let mut sram_records = sample_records();
+        for record in &mut sram_records {
+            if let DeviceTraceRecord::DeviceEvent {
+                device: TimingDevice::Pi,
+                pi_device,
+                ..
+            } = record
+            {
+                *pi_device = Some(TimingPiDevice::Sram);
+            }
+        }
+        let sram = ingest(&sram_records);
+        let report = diff_ingests(&rom, &sram, &TimingTolerance::initial_loose());
+        assert!(matches!(
+            report.first_divergence,
+            Some(Divergence::Ordering { index: 0, .. })
+        ));
     }
 
     // --- Self-test B: inject a wrong PI completion cycle beyond the band; the

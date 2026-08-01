@@ -14,9 +14,9 @@ use std::path::Path;
 use fn64_runtime::{
     ControllerOperationDevice, ControllerOperationEvent, DeviceEvidenceSnapshot, DeviceSnapshot,
     DeviceTraceEvent, DeviceTraceKind, DmaDirection, GameBoyMapperEvidenceSnapshot, PendingViFade,
-    PortState, QueueOpKind, RdramAddr, SaveOperationEvent, SaveType, ScheduledDeviceEventKind,
-    SiDmaKind, SpDmaDirection, SwitchReason, TaskKind, TraceEvent, TraceKind,
-    UnsupportedEvent as RuntimeUnsupportedEvent,
+    PiDeviceAddress, PortState, QueueOpKind, RdramAddr, SaveOperationEvent, SaveType,
+    ScheduledDeviceEventKind, SiDmaKind, SpDmaDirection, SwitchReason, TaskKind, TraceEvent,
+    TraceKind, UnsupportedEvent as RuntimeUnsupportedEvent,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,7 +29,7 @@ use crate::{
     ReleaseWindowsVersionEvidence,
 };
 
-pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v28";
+pub(crate) const REPORT_SCHEMA: &str = "fn64.release-gate.v29";
 
 /// Provenance class declared for a ROM input. The N64 header does not encode
 /// whether otherwise-valid bytes came from a retail cartridge or a public
@@ -1630,7 +1630,7 @@ impl FixedCycleDigestGate {
             });
         }
         let mut bytes = Vec::new();
-        push_bytes(&mut bytes, b"fn64.live-timing.v1");
+        push_bytes(&mut bytes, b"fn64.live-timing.v2");
         push_bytes(&mut bytes, &encode_timing_trace(events));
         push_bytes(&mut bytes, &encode_device_dma_trace(device_events));
         self.capture(observed_cycle, ArtifactKind::TimingTrace, &bytes)
@@ -2400,7 +2400,7 @@ impl ReleaseGateReport {
         )
     }
 
-    /// Recompute the schema-v28 evidence digest after loading a retained JSON
+    /// Recompute the schema-v29 evidence digest after loading a retained JSON
     /// report. Acceptance always performs this check before inspecting the
     /// closure ledger.
     pub fn verify_integrity(&self) -> Result<(), GateError> {
@@ -2951,7 +2951,10 @@ impl fmt::Display for GateError {
                 write!(f, "invalid Windows release identity: {detail}")
             }
             Self::RendererObservationMismatch(detail) => {
-                write!(f, "frozen renderer evidence disagrees with framebuffer observation: {detail}")
+                write!(
+                    f,
+                    "frozen renderer evidence disagrees with framebuffer observation: {detail}"
+                )
             }
             Self::InvalidViBoundary(error) => {
                 write!(f, "invalid committed VI release boundary: {error}")
@@ -3265,8 +3268,21 @@ fn encode_pi_request(out: &mut Vec<u8>, request: fn64_runtime::PiDmaRequest) {
         DmaDirection::FromRdram => 1,
     });
     push_u32(out, request.dram_addr.offset());
-    push_u32(out, request.cart_addr);
+    encode_pi_device_address(out, request.device);
     push_u32(out, request.len);
+}
+
+fn encode_pi_device_address(out: &mut Vec<u8>, device: PiDeviceAddress) {
+    match device {
+        PiDeviceAddress::RomOffset(offset) => {
+            out.push(0);
+            push_u32(out, offset);
+        }
+        PiDeviceAddress::SramOffset(offset) => {
+            out.push(1);
+            push_u32(out, offset);
+        }
+    }
 }
 
 fn encode_ai_request(out: &mut Vec<u8>, request: fn64_runtime::AiDmaRequest) {
@@ -4171,7 +4187,7 @@ fn encode_program(out: &mut Vec<u8>, snapshot: crate::ProgramEvidenceSnapshot) {
     }
 }
 
-fn try_encode_device_component_v15(snapshot: DeviceEvidenceSnapshot) -> Result<Vec<u8>, GateError> {
+fn try_encode_device_component_v16(snapshot: DeviceEvidenceSnapshot) -> Result<Vec<u8>, GateError> {
     const DPC_COUNTER_MASK: u32 = 0x00ff_ffff;
     for (register, value) in [
         ("DPC_CLOCK", snapshot.guest.dpc_clock),
@@ -4184,7 +4200,7 @@ fn try_encode_device_component_v15(snapshot: DeviceEvidenceSnapshot) -> Result<V
         }
     }
     let mut out = Vec::with_capacity(8 * 1024 + snapshot.save_bytes.as_ref().map_or(0, Vec::len));
-    out.extend_from_slice(b"fn64.device-evidence.v15\0");
+    out.extend_from_slice(b"fn64.device-evidence.v16\0");
     encode_guest_device_snapshot(&mut out, snapshot.guest);
     push_bytes(&mut out, &snapshot.pi_timing_policy);
 
@@ -4349,7 +4365,7 @@ pub fn operational_state_component_digests_v1(
     executor: fn64_runtime::ExecutorControlEvidenceSnapshot,
     host: fn64_abi::AbiHostEvidenceSnapshot,
 ) -> Result<OperationalStateComponentDigestsV1, GateError> {
-    let device = try_encode_device_component_v15(snapshot)?;
+    let device = try_encode_device_component_v16(snapshot)?;
     let executor = encode_executor_control_component(executor);
     let abi_host = encode_abi_host_component(host);
     Ok(OperationalStateComponentDigestsV1 {
@@ -4877,7 +4893,7 @@ fn try_encode_device_snapshot(
     host: fn64_abi::AbiHostEvidenceSnapshot,
     program: crate::ProgramEvidenceSnapshot,
 ) -> Result<Vec<u8>, GateError> {
-    let mut out = try_encode_device_component_v15(snapshot)?;
+    let mut out = try_encode_device_component_v16(snapshot)?;
     out.extend_from_slice(&encode_executor_control_component(executor));
     out.extend_from_slice(&encode_abi_host_component(host));
     encode_program(&mut out, program);
@@ -4918,7 +4934,7 @@ fn encode_timing_trace(events: &[TraceEvent]) -> Vec<u8> {
             TraceKind::Dma {
                 direction,
                 dram,
-                dev_addr,
+                device,
                 len,
             } => {
                 out.push(2);
@@ -4927,7 +4943,7 @@ fn encode_timing_trace(events: &[TraceEvent]) -> Vec<u8> {
                     DmaDirection::FromRdram => 1,
                 });
                 push_u32(&mut out, dram.offset());
-                push_u32(&mut out, dev_addr);
+                encode_pi_device_address(&mut out, device);
                 push_u32(&mut out, len);
             }
             TraceKind::TaskSubmit { task_kind, ucode } => {
@@ -4997,7 +5013,7 @@ fn encode_device_dma_trace(events: &[DeviceTraceEvent]) -> Vec<u8> {
                     DmaDirection::FromRdram => 1,
                 });
                 push_u32(&mut out, request.dram_addr.offset());
-                push_u32(&mut out, request.cart_addr);
+                encode_pi_device_address(&mut out, request.device);
                 push_u32(&mut out, request.len);
             }
             DeviceTraceKind::AiDmaStarted(request) | DeviceTraceKind::AiDmaComplete(request) => {
@@ -5661,7 +5677,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_component_refactor_preserves_golden_wire() {
+    fn device_state_v16_component_refactor_preserves_golden_wire() {
         let bytes = encode_device_snapshot(
             snapshot(42),
             executor_snapshot(),
@@ -5671,8 +5687,29 @@ mod tests {
         assert_eq!(bytes.len(), 8_860);
         assert_eq!(
             sha256_hex(&bytes),
-            "af9bc08ec9c59caaedd7be646708557d280156af61d5d065520a6c85371a9206"
+            "8fad6de2c8ffb517e0e7bd3abd41a2c20015797c6353b385af635be7ae784f89"
         );
+    }
+
+    #[test]
+    fn device_state_v16_distinguishes_equal_rom_and_sram_offsets() {
+        let encoded = |device| {
+            let mut state = snapshot(42);
+            state.pending_pi = Some(fn64_runtime::PendingPiSnapshot {
+                token: 7,
+                request: PiDmaRequest {
+                    direction: DmaDirection::ToRdram,
+                    dram_addr: RdramAddr::from_offset(0x20),
+                    device,
+                    len: 4,
+                },
+            });
+            try_encode_device_component_v16(state).unwrap()
+        };
+        let rom = encoded(PiDeviceAddress::RomOffset(0x10));
+        let sram = encoded(PiDeviceAddress::SramOffset(0x10));
+        assert_ne!(rom, sram);
+        assert_ne!(sha256_hex(&rom), sha256_hex(&sram));
     }
 
     #[test]
@@ -7349,17 +7386,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_v28_fixed_cycle_digest_is_stable_and_complete() {
+    fn schema_v29_fixed_cycle_digest_is_stable_and_complete() {
         assert_eq!(complete_digest(), complete_digest());
         assert_eq!(complete_digest().artifacts.len(), 5);
         assert_eq!(
             complete_digest().root_sha256,
-            "56e31e60b0b75ebef56d87b98859ae7a3a28223446257383b345fa2bba452224"
+            "3de3abd5723bf4b6dd63b970f3f881a08c7dfec4f6d36df16e12bf6e6505f8a6"
         );
     }
 
     #[test]
-    fn schema_v28_report_wire_binds_rom_identity_class_and_tv_authorities() {
+    fn schema_v29_report_wire_binds_rom_identity_class_and_tv_authorities() {
         let input = test_rom(b'E');
         let geometry = observations();
         let rom =
@@ -7615,7 +7652,7 @@ mod tests {
                 request: PiDmaRequest {
                     direction: DmaDirection::ToRdram,
                     dram_addr: RdramAddr::from_offset(4),
-                    cart_addr: 8,
+                    device: PiDeviceAddress::RomOffset(8),
                     len: 12,
                 },
             })
@@ -7917,7 +7954,7 @@ mod tests {
                         request: PiDmaRequest {
                             direction: DmaDirection::ToRdram,
                             dram_addr: RdramAddr::from_offset(4),
-                            cart_addr: 8,
+                            device: PiDeviceAddress::RomOffset(8),
                             len: 12,
                         },
                         rdram_len: 8 * 1024 * 1024,
@@ -8051,7 +8088,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_rejects_noncanonical_dpc_clock() {
+    fn device_state_v16_rejects_noncanonical_dpc_clock() {
         const VALUE: u32 = 0x0100_0041;
         assert_noncanonical_dpc_counter_rejected("DPC_CLOCK", VALUE, |snapshot| {
             snapshot.guest.dpc_clock = VALUE;
@@ -8059,7 +8096,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_rejects_noncanonical_dpc_bufbusy() {
+    fn device_state_v16_rejects_noncanonical_dpc_bufbusy() {
         const VALUE: u32 = 0x0200_0042;
         assert_noncanonical_dpc_counter_rejected("DPC_BUFBUSY", VALUE, |snapshot| {
             snapshot.guest.dpc_busy = VALUE;
@@ -8067,7 +8104,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_rejects_noncanonical_dpc_pipebusy() {
+    fn device_state_v16_rejects_noncanonical_dpc_pipebusy() {
         const VALUE: u32 = 0x0400_0043;
         assert_noncanonical_dpc_counter_rejected("DPC_PIPEBUSY", VALUE, |snapshot| {
             snapshot.guest.dpc_pipe_busy = VALUE;
@@ -8075,7 +8112,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_rejects_noncanonical_dpc_tmem() {
+    fn device_state_v16_rejects_noncanonical_dpc_tmem() {
         const VALUE: u32 = 0x0800_0044;
         assert_noncanonical_dpc_counter_rejected("DPC_TMEM", VALUE, |snapshot| {
             snapshot.guest.dpc_tmem_busy = VALUE;
@@ -8083,7 +8120,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_accepts_maximum_canonical_dpc_counters() {
+    fn device_state_v16_accepts_maximum_canonical_dpc_counters() {
         let mut device = snapshot(42);
         device.guest.dpc_clock = 0x00ff_ffff;
         device.guest.dpc_busy = 0x00ff_ffff;
@@ -8099,7 +8136,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_wire_binds_executor_and_abi_host_families() {
+    fn device_state_v16_wire_binds_executor_and_abi_host_families() {
         use fn64_runtime::{
             EventRegistrationEvidenceSnapshot, ExecutorQueueEvidenceSnapshot,
             ExecutorRunningEvidenceSnapshot, MesgQueueEvidenceSnapshot,
@@ -8117,7 +8154,7 @@ mod tests {
             host.clone(),
             crate::ProgramEvidenceSnapshot::NoProgram,
         );
-        assert!(encoded.starts_with(b"fn64.device-evidence.v15\0"));
+        assert!(encoded.starts_with(b"fn64.device-evidence.v16\0"));
         assert!(!encoded.starts_with(b"fn64.device-evidence.v12\0"));
         let baseline = sha256_hex(&encode_device_snapshot(
             device.clone(),
@@ -8439,7 +8476,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_wire_binds_complete_rsp_interpreter_state() {
+    fn device_state_v16_wire_binds_complete_rsp_interpreter_state() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let baseline_state = rsp_architectural_state(|_| {});
@@ -8583,7 +8620,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_wire_distinguishes_rsp_interpreter_variants() {
+    fn device_state_v16_wire_distinguishes_rsp_interpreter_variants() {
         let state = rsp_architectural_state(|_| {});
         let encoded = |value| {
             let mut out = Vec::new();
@@ -8694,7 +8731,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_wire_distinguishes_rsp_task_admission_generations() {
+    fn device_state_v16_wire_distinguishes_rsp_task_admission_generations() {
         let encoded = |host| {
             let mut out = Vec::new();
             encode_abi_host(&mut out, host);
@@ -8751,7 +8788,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_wire_distinguishes_rsp_task_lineage_phases() {
+    fn device_state_v16_wire_distinguishes_rsp_task_lineage_phases() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let digest = |phase| {
@@ -8791,7 +8828,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_wire_distinguishes_every_audio_execution_policy() {
+    fn device_state_v16_wire_distinguishes_every_audio_execution_policy() {
         let digest = |policy| {
             let mut host = host_snapshot();
             host.audio_task_execution = policy;
@@ -8822,7 +8859,7 @@ mod tests {
     }
 
     #[test]
-    fn device_state_v15_wire_distinguishes_native_program_classes_and_identity() {
+    fn device_state_v16_wire_distinguishes_native_program_classes_and_identity() {
         let device = snapshot(42);
         let executor = executor_snapshot();
         let host = host_snapshot();
@@ -8852,7 +8889,7 @@ mod tests {
 
     #[cfg(feature = "recomp-rs")]
     #[test]
-    fn device_state_v15_wire_binds_typed_program_identity_and_dynamic_state() {
+    fn device_state_v16_wire_binds_typed_program_identity_and_dynamic_state() {
         use fn64_abi::recompiled::{
             LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
             RecompiledProgramEvidenceSnapshot,
@@ -9266,11 +9303,11 @@ mod tests {
         ));
 
         let mut stale_schema = report.clone();
-        stale_schema.schema = "fn64.release-gate.v27".to_owned();
+        stale_schema.schema = "fn64.release-gate.v28".to_owned();
         assert!(matches!(
             stale_schema.verify_integrity(),
             Err(GateError::UnsupportedReportSchema(schema))
-                if schema == "fn64.release-gate.v27"
+                if schema == "fn64.release-gate.v28"
         ));
 
         let duplicate = vec![report.closure[0].clone(), report.closure[0].clone()];
@@ -9287,7 +9324,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v28_report_wire_binds_every_release_environment_field() {
+    fn schema_v29_report_wire_binds_every_release_environment_field() {
         let report = ReleaseGateReport::new(
             "environment-wire",
             b"input",
@@ -9730,7 +9767,7 @@ mod tests {
             kind: DeviceTraceKind::PiBytesCommitted(PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0x200),
-                cart_addr: 0x1000,
+                device: PiDeviceAddress::RomOffset(0x1000),
                 len: 64,
             }),
         };
@@ -9935,7 +9972,7 @@ mod tests {
                 kind: TraceKind::Dma {
                     direction: DmaDirection::ToRdram,
                     dram: RdramAddr::from_offset(0x200),
-                    dev_addr: 0x1000,
+                    device: PiDeviceAddress::RomOffset(0x1000),
                     len: 64,
                 },
             },
@@ -9963,7 +10000,7 @@ mod tests {
                 kind: DeviceTraceKind::PiBytesCommitted(PiDmaRequest {
                     direction: DmaDirection::ToRdram,
                     dram_addr: RdramAddr::from_offset(0x200),
-                    cart_addr: 0x1000,
+                    device: PiDeviceAddress::RomOffset(0x1000),
                     len: 64,
                 }),
             },
@@ -10148,7 +10185,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v28_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
+    fn schema_v29_rsp_rdp_wire_rejects_tamper_future_cycles_and_false_graphics_closure() {
         let geometry = observations();
         let graphics_closure = vec![ClosurePath {
             name: "rsp.graphics-task".to_owned(),
@@ -10442,7 +10479,7 @@ mod tests {
             kind: TraceKind::Dma {
                 direction: DmaDirection::ToRdram,
                 dram: RdramAddr::from_offset(0x200),
-                dev_addr: 0x1000,
+                device: PiDeviceAddress::RomOffset(0x1000),
                 len: 64,
             },
         }];
@@ -10471,7 +10508,7 @@ mod tests {
             kind: DeviceTraceKind::PiDmaStarted(PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0x200),
-                cart_addr: 0x1000,
+                device: PiDeviceAddress::RomOffset(0x1000),
                 len: 64,
             }),
         }];

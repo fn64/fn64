@@ -177,7 +177,7 @@ unsafe fn resolve_epi_device_address(
     handle_gpr: u64,
     dev_addr: u32,
     shim: &str,
-) -> u32 {
+) -> fn64_runtime::PiDeviceAddress {
     let upper = handle_gpr >> 32;
     let handle_vram = handle_gpr as u32;
     if (upper != 0 && upper != u32::MAX as u64)
@@ -273,7 +273,7 @@ unsafe fn resolve_epi_device_address(
                 ),
             );
         }
-        physical - 0x1000_0000
+        fn64_runtime::PiDeviceAddress::RomOffset(physical - 0x1000_0000)
     } else if PI_DOM2_ADDR2.contains(&physical) {
         if handle.device_type != DEVICE_TYPE_SRAM {
             trap_epi_handle(
@@ -284,7 +284,7 @@ unsafe fn resolve_epi_device_address(
                 ),
             );
         }
-        physical
+        fn64_runtime::PiDeviceAddress::SramOffset(physical - 0x0800_0000)
     } else {
         trap_epi_handle(
             shim,
@@ -472,20 +472,24 @@ fn start_timed_pi_dma(
     if *TRACE_PI_DMA.get_or_init(|| std::env::var_os("FN64_TRACE_PI_DMA").is_some()) {
         let thread = crate::current_thread_id("FN64_TRACE_PI_DMA");
         eprintln!(
-            "[fn64-abi/pi] thread={thread} {shim} {:?} cart={:#010x} dram={:#010x} len={:#x} \
+            "[fn64-abi/pi] thread={thread} {shim} {:?} device={:?} dram={:#010x} len={:#x} \
              ret_queue={ret_queue:?}",
             request.direction,
-            request.cart_addr,
+            request.device,
             request.dram_addr.offset(),
             request.len
         );
     }
     let result = with_host(|host| {
-        if matches!(request.direction, DmaDirection::FromRdram)
-            && !fn64_runtime::rom::is_sram_dev_addr(request.cart_addr)
-        {
+        if matches!(
+            (request.direction, request.device),
+            (
+                DmaDirection::FromRdram,
+                fn64_runtime::PiDeviceAddress::RomOffset(_)
+            )
+        ) {
             return Err(DeviceFault::PiTransfer(PiDmaError::ReadOnlyDevice {
-                dev_addr: request.cart_addr,
+                device: request.device,
             }));
         }
         if !host.rom_installed {
@@ -530,13 +534,13 @@ fn start_raw_pi_dma(
     rdram: *mut u8,
     direction: DmaDirection,
     dram_addr: RdramAddr,
-    dev_addr: u32,
+    device: fn64_runtime::PiDeviceAddress,
     len: u32,
     shim: &str,
 ) -> bool {
     assert!(
-        dev_addr.is_multiple_of(2),
-        "{shim}: PI device address {dev_addr:#010x} is not 2-byte aligned"
+        device.offset().is_multiple_of(2),
+        "{shim}: PI device address {device:?} is not 2-byte aligned"
     );
     assert!(
         dram_addr.offset().is_multiple_of(8),
@@ -565,7 +569,7 @@ fn start_raw_pi_dma(
         PiDmaRequest {
             direction,
             dram_addr,
-            cart_addr: dev_addr,
+            device,
             len,
         },
         None,
@@ -1101,8 +1105,8 @@ pub(crate) fn write_live_device_mmio(vaddr: u64, value: u32) -> bool {
             );
         }
         let fabric = &mut host.device_fabric;
-        if addr.get() == 0xA460_000C
-            && !fn64_runtime::rom::is_sram_dev_addr(fabric.snapshot().pi_cart_addr)
+        if addr.get() == 0xA460_0008
+            && (0x1000_0000..0x1FC0_0000).contains(&fabric.snapshot().pi_cart_addr)
         {
             panic!(
                 "raw MMIO PI write targets read-only cartridge ROM at device address {:#010x}",
@@ -1434,23 +1438,24 @@ fn advance_device_time_step(now: u64) -> u32 {
                         PiDmaRequest {
                             direction: completion.direction,
                             dram_addr: completion.dram_addr,
-                            cart_addr: completion.dev_addr,
+                            device: completion.device,
                             len: completion.len,
                         },
                         "PI completion does not match the sole in-flight request"
                     );
 
-                    if matches!(completion.direction, DmaDirection::ToRdram)
-                        && !fn64_runtime::rom::is_sram_dev_addr(completion.dev_addr)
+                    if let (
+                        DmaDirection::ToRdram,
+                        fn64_runtime::PiDeviceAddress::RomOffset(rom_offset),
+                    ) = (completion.direction, completion.device)
                     {
-                        if let Some(static_off) = host
-                            .sections
-                            .plan_static_mirror(completion.dev_addr, completion.len)
+                        if let Some(static_off) =
+                            host.sections.plan_static_mirror(rom_offset, completion.len)
                         {
                             let mut bytes = vec![0u8; completion.len as usize];
                             host.device_fabric
                                 .pi_dma_mut()
-                                .read_rom_bytes(completion.dev_addr, &mut bytes);
+                                .read_rom_bytes(rom_offset, &mut bytes);
                             let storage =
                                 unsafe { fn64_runtime::RdramPtr::from_storage_ptr(pending.rdram) };
                             let mirror = RdramAddr::from_offset(static_off);
@@ -1471,7 +1476,7 @@ fn advance_device_time_step(now: u64) -> u32 {
                             fn64_recomp_rs::notify_pi_dma_write(mirror.offset(), completion.len);
                         }
                         overlays.push((
-                            completion.dev_addr,
+                            rom_offset,
                             completion.dram_addr.offset() | 0x8000_0000,
                             completion.len,
                         ));
@@ -1869,12 +1874,13 @@ unsafe fn epi_start_dma_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle
     // wave's own regression test after the sibling double-translation bug
     // (see the correction note above `read_offset_word`'s introduction).
     let dram_addr = RdramAddr::from_gpr(read_offset_word(rdram, mb_addr.offset(), 0x8) as u64);
-    let mut dev_addr = read_offset_word(rdram, mb_addr.offset(), 0xC);
+    let dev_addr = read_offset_word(rdram, mb_addr.offset(), 0xC);
     let len = read_offset_word(rdram, mb_addr.offset(), 0x10);
-    if use_handle {
-        dev_addr =
-            unsafe { resolve_epi_device_address(rdram, ctx.r4, dev_addr, "osEPiStartDma_recomp") };
-    }
+    let device = if use_handle {
+        unsafe { resolve_epi_device_address(rdram, ctx.r4, dev_addr, "osEPiStartDma_recomp") }
+    } else {
+        fn64_runtime::PiDeviceAddress::RomOffset(dev_addr)
+    };
     if crate::boot_probe_enabled() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CALLS: AtomicU32 = AtomicU32::new(0);
@@ -1910,7 +1916,7 @@ unsafe fn epi_start_dma_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle
         PiDmaRequest {
             direction,
             dram_addr,
-            cart_addr: dev_addr,
+            device,
             len,
         },
         ret_queue,
@@ -1939,14 +1945,14 @@ pub unsafe extern "C" fn osEPiRawStartDma_recomp(rdram: *mut u8, ctx: *mut Recom
     };
     let dram_addr = RdramAddr::from_gpr(ctx.r7);
     let len = unsafe { read_stack_word(rdram, ctx.r29, 0x10) };
-    let dev_addr = unsafe {
+    let device = unsafe {
         resolve_epi_device_address(rdram, ctx.r4, ctx.r6 as u32, "osEPiRawStartDma_recomp")
     };
     ctx.r2 = if start_raw_pi_dma(
         rdram,
         direction,
         dram_addr,
-        dev_addr,
+        device,
         len,
         "osEPiRawStartDma_recomp",
     ) {
@@ -2048,20 +2054,23 @@ pub unsafe extern "C" fn osEPiReadIo_recomp(rdram: *mut u8, ctx: *mut RecompCont
 
 unsafe fn epi_read_io_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle: bool) {
     let ctx = unsafe { &mut *ctx };
-    let dev_addr = if use_handle {
+    let device = if use_handle {
         unsafe { resolve_epi_device_address(rdram, ctx.r4, ctx.r5 as u32, "osEPiReadIo_recomp") }
     } else {
-        ctx.r5 as u32
+        fn64_runtime::PiDeviceAddress::RomOffset(ctx.r5 as u32)
     };
     let dram_addr = RdramAddr::from_gpr(ctx.r6).offset() as usize;
     let record_sram = with_pi_dma("osEPiReadIo_recomp", |dma| {
         let mut buf = [0u8; 4];
-        let record_sram = if fn64_runtime::rom::is_sram_dev_addr(dev_addr) {
-            dma.sram_read_into(dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE, &mut buf);
-            dma.save_len() == Some(fn64_runtime::SaveType::SramBanked.byte_len())
-        } else {
-            dma.read_rom_bytes(dev_addr, &mut buf);
-            false
+        let record_sram = match device {
+            fn64_runtime::PiDeviceAddress::SramOffset(offset) => {
+                dma.sram_read_into(offset, &mut buf);
+                dma.save_len() == Some(fn64_runtime::SaveType::SramBanked.byte_len())
+            }
+            fn64_runtime::PiDeviceAddress::RomOffset(offset) => {
+                dma.read_rom_bytes(offset, &mut buf);
+                false
+            }
         };
         // Same word-swizzle as PiDma::start_dma / Rdram::write_bytes: rdram is
         // native-endian-WORD storage, so a big-endian cartridge word must be
@@ -2073,11 +2082,11 @@ unsafe fn epi_read_io_impl(rdram: *mut u8, ctx: *mut RecompContext, use_handle: 
         }
         record_sram
     });
-    if record_sram {
+    if let (true, fn64_runtime::PiDeviceAddress::SramOffset(offset)) = (record_sram, device) {
         crate::record_save_operation(
             fn64_runtime::SaveType::SramBanked,
             fn64_runtime::SaveOperationKind::Read,
-            (dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE) as usize,
+            offset as usize,
             4,
         );
     }
@@ -2175,21 +2184,18 @@ pub unsafe extern "C" fn osPiGetStatus_recomp(_rdram: *mut u8, ctx: *mut RecompC
 #[no_mangle]
 pub unsafe extern "C" fn osEPiWriteIo_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     let ctx = unsafe { &mut *ctx };
-    let dev_addr =
+    let device =
         unsafe { resolve_epi_device_address(rdram, ctx.r4, ctx.r5 as u32, "osEPiWriteIo_recomp") };
-    if fn64_runtime::rom::is_sram_dev_addr(dev_addr) {
+    if let fn64_runtime::PiDeviceAddress::SramOffset(offset) = device {
         let record_sram = with_pi_dma("osEPiWriteIo_recomp", |dma| {
-            dma.sram_write_from(
-                dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE,
-                &(ctx.r6 as u32).to_be_bytes(),
-            );
+            dma.sram_write_from(offset, &(ctx.r6 as u32).to_be_bytes());
             dma.save_len() == Some(fn64_runtime::SaveType::SramBanked.byte_len())
         });
         if record_sram {
             crate::record_save_operation(
                 fn64_runtime::SaveType::SramBanked,
                 fn64_runtime::SaveOperationKind::Write,
-                (dev_addr - fn64_runtime::rom::SRAM_DOMAIN2_BASE) as usize,
+                offset as usize,
                 4,
             );
         }
@@ -2337,7 +2343,7 @@ mod tests {
             PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0),
-                cart_addr: fn64_runtime::rom::SRAM_DOMAIN2_BASE,
+                device: fn64_runtime::PiDeviceAddress::SramOffset(0),
                 len: 4,
             },
             None,
@@ -3143,8 +3149,8 @@ mod tests {
         unsafe { osEPiRawStartDma_recomp(rdram.as_mut_ptr(), &mut raw) };
         assert_eq!(raw.r2, 0);
         assert_eq!(
-            with_host(|host| host.device_fabric.pending_pi_request().unwrap().cart_addr),
-            0x20
+            with_host(|host| host.device_fabric.pending_pi_request().unwrap().device),
+            fn64_runtime::PiDeviceAddress::RomOffset(0x20)
         );
         assert_eq!(
             read_raw_mmio_word(0xA460_0014),
@@ -3184,8 +3190,8 @@ mod tests {
         unsafe { osEPiStartDma_recomp(rdram.as_mut_ptr(), &mut managed) };
         assert_eq!(managed.r2, 0);
         assert_eq!(
-            with_host(|host| host.device_fabric.pending_pi_request().unwrap().cart_addr),
-            fn64_runtime::rom::SRAM_DOMAIN2_BASE + 0x10
+            with_host(|host| host.device_fabric.pending_pi_request().unwrap().device),
+            fn64_runtime::PiDeviceAddress::SramOffset(0x10)
         );
         assert_eq!(
             read_raw_mmio_word(0xA460_0024),

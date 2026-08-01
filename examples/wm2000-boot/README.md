@@ -94,7 +94,7 @@ proves which native pixels were produced and whether a bounded run repeats;
 it does not by itself prove hardware pixel correctness or zero unsupported
 behavior.
 
-## Voice-map-intervention-free schema-v28 release path
+## Voice-map-intervention-free schema-v29 release path
 
 The generic runner-owned release tuple enables the fail-closed RT64/LLE path:
 
@@ -116,7 +116,7 @@ staged microcode pair, report path, and ROM-class authority. The target cycle
 must be an exact scheduled VI edge with a completed RT64 post-VI presentation.
 The host arms `LiveReleaseGate` and its crash-flushed unsupported-event journal
 before thread 0 runs, freezes the native archive identity and all fixed-cycle
-channels at that edge, writes the schema-v28 report, completes the unsupported
+channels at that edge, writes the schema-v29 report, completes the unsupported
 journal, and then requires closed-gate state. A failed closure may retain an
 incomplete report for diagnosis, but the private-series runner rejects it.
 Stopping early or skipping the requested cycle is a loud failure.

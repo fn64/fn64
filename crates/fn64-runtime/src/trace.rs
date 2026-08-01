@@ -111,7 +111,7 @@ pub enum TraceKind {
     Dma {
         direction: DmaDirection,
         dram: crate::RdramAddr,
-        dev_addr: u32,
+        device: crate::PiDeviceAddress,
         len: u32,
     },
     TaskSubmit {
