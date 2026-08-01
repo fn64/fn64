@@ -258,6 +258,8 @@ pub mod overlay_reloc;
 pub mod owner_proof;
 pub mod partition;
 pub mod pi_dma;
+#[cfg(feature = "transform-invocation-certificate")]
+pub mod polling_stutter;
 pub mod probe;
 pub mod program_transfer_index;
 pub mod regions;
