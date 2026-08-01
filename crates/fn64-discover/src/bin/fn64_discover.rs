@@ -118,6 +118,44 @@ struct DiscoverySummaryReceipt<'a> {
     receipt_sha256: String,
 }
 
+#[derive(Serialize)]
+struct BootTlbAliasCfgMeasurementV1 {
+    transfer_pc: u32,
+    target_va: u32,
+    alias_va_start: u32,
+    alias_va_end: u32,
+    physical_start: u32,
+    physical_end: u32,
+    byte_count: u32,
+    admissible: bool,
+    target_reached: bool,
+    block_count: usize,
+    proven_code_words: usize,
+    exhaustive_indirect_sites: usize,
+    bounded_indirect_sites: usize,
+    open_indirect_sites: usize,
+    invalid_or_incomplete_blocks: usize,
+}
+
+#[derive(Serialize)]
+struct BootTlbAliasMeasurementV1 {
+    schema: &'static str,
+    normalized_rom_sha256: String,
+    selected_strategy: DiscoveryStrategy,
+    proven_rom_mapping_count: usize,
+    boot_va_start: u32,
+    boot_va_end: u32,
+    boot_physical_start: u32,
+    diagnostic: fn64_discover::boot_tlb_alias::BootTlbAliasDiagnosticV1,
+    alias_cfg: Vec<BootTlbAliasCfgMeasurementV1>,
+}
+
+#[derive(Serialize)]
+struct BootTlbAliasReceiptV1 {
+    measurement: BootTlbAliasMeasurementV1,
+    receipt_sha256: String,
+}
+
 /// Report every strategy attempt on stderr, so a run that recovered nothing
 /// says so out loud instead of returning a quiet boot-bank-only artifact that
 /// looks the same as a successful one.
@@ -176,8 +214,155 @@ fn run() -> Result<Option<String>, String> {
     if args.first().and_then(|argument| argument.to_str()) == Some("emit-block-program") {
         return emit_block_program_command(args.into_iter().skip(1)).map(Some);
     }
+    if args.first().and_then(|argument| argument.to_str()) == Some("diagnose-boot-tlb-alias") {
+        return diagnose_boot_tlb_alias(args.into_iter().skip(1)).map(Some);
+    }
     run_discovery_command(args.into_iter())?;
     Ok(None)
+}
+
+fn diagnose_boot_tlb_alias(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
+    let rom_path = PathBuf::from(
+        args.next()
+            .ok_or_else(|| "diagnose-boot-tlb-alias requires one ROM path".to_owned())?,
+    );
+    if args.next().is_some() {
+        return Err("usage: fn64-discover diagnose-boot-tlb-alias <rom>".to_owned());
+    }
+    let rom_bytes = read_stable_regular_bounded(
+        &rom_path,
+        fn64_discover::cold_sweep::COLD_ROM_MAX_INPUT_BYTES as u64,
+        "boot-TLB diagnostic ROM",
+    )?;
+    let auto = run_discovery_auto(&rom_bytes).map_err(|error| error.to_string())?;
+    let prepared = fn64_discover::snapshot_inputs::prepare_snapshot_banks(&auto.rom, &auto.facts)
+        .map_err(|error| format!("preparing boot bank: {error:?}"))?;
+    let boot = prepared
+        .banks()
+        .iter()
+        .find(|bank| bank.bank == fn64_discover::banks::BOOT_BANK)
+        .ok_or_else(|| "discovery produced no proven boot bank".to_owned())?;
+    let closure = fn64_discover::resolve::build_cfg_value_set_closed(
+        &boot.bank,
+        &boot.bytes,
+        boot.va_start,
+        &boot.traversal_seeds,
+    );
+    let tlb = fn64_discover::resolve::analyze_constant_tlb_transfers(
+        &closure.cfg,
+        &boot.bytes,
+        boot.va_start,
+    );
+    let boot_physical_start = boot.va_start & 0x1fff_ffff;
+    let boot_bytes = boot
+        .va_end
+        .checked_sub(boot.va_start)
+        .ok_or_else(|| "boot bank VA interval is inverted".to_owned())?;
+    let diagnostic = fn64_discover::boot_tlb_alias::derive_boot_tlb_alias_diagnostic(
+        &tlb,
+        boot_physical_start,
+        boot_bytes,
+    );
+    let mut alias_cfg = Vec::new();
+    for transfer in &diagnostic.transfers {
+        let Some(alias) = &transfer.conditional_alias else {
+            continue;
+        };
+        let byte_start = alias
+            .physical_start
+            .checked_sub(boot_physical_start)
+            .ok_or_else(|| "alias begins before boot backing".to_owned())?
+            as usize;
+        let byte_end = alias
+            .physical_end
+            .checked_sub(boot_physical_start)
+            .ok_or_else(|| "alias ends before boot backing".to_owned())?
+            as usize;
+        let alias_bytes = boot
+            .bytes
+            .get(byte_start..byte_end)
+            .ok_or_else(|| "alias physical interval exceeds boot bytes".to_owned())?;
+        let alias_closure = fn64_discover::resolve::build_cfg_value_set_closed(
+            "boot_tlb_alias_diagnostic",
+            alias_bytes,
+            alias.alias_va_start,
+            &[alias.target_va],
+        );
+        let mut exhaustive_indirect_sites = 0;
+        let mut bounded_indirect_sites = 0;
+        let mut open_indirect_sites = 0;
+        for indirect in &alias_closure.indirect {
+            match indirect.state {
+                fn64_discover::resolve::IndirectProofState::Exhaustive => {
+                    exhaustive_indirect_sites += 1
+                }
+                fn64_discover::resolve::IndirectProofState::Bounded => bounded_indirect_sites += 1,
+                fn64_discover::resolve::IndirectProofState::Open => open_indirect_sites += 1,
+            }
+        }
+        let invalid_or_incomplete_blocks = alias_closure
+            .cfg
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.terminator,
+                    fn64_discover::cfg::BlockTerminator::InvalidInstruction { .. }
+                        | fn64_discover::cfg::BlockTerminator::MissingDelaySlot { .. }
+                        | fn64_discover::cfg::BlockTerminator::RanOffEnd
+                )
+            })
+            .count();
+        alias_cfg.push(BootTlbAliasCfgMeasurementV1 {
+            transfer_pc: alias.transfer_pc,
+            target_va: alias.target_va,
+            alias_va_start: alias.alias_va_start,
+            alias_va_end: alias.alias_va_end,
+            physical_start: alias.physical_start,
+            physical_end: alias.physical_end,
+            byte_count: alias.physical_end - alias.physical_start,
+            admissible: transfer.blockers.is_empty(),
+            target_reached: alias_closure
+                .cfg
+                .blocks
+                .iter()
+                .any(|block| block.start_va == alias.target_va),
+            block_count: alias_closure.cfg.blocks.len(),
+            proven_code_words: alias_closure
+                .cfg
+                .word_class
+                .values()
+                .filter(|class| **class == fn64_discover::cfg::WordClass::ProvenCode)
+                .count(),
+            exhaustive_indirect_sites,
+            bounded_indirect_sites,
+            open_indirect_sites,
+            invalid_or_incomplete_blocks,
+        });
+    }
+    let measurement = BootTlbAliasMeasurementV1 {
+        schema: "fn64.boot-tlb-alias-diagnostic.v1",
+        normalized_rom_sha256: auto.rom.sha256,
+        selected_strategy: auto.selected,
+        proven_rom_mapping_count: auto.facts.proven_rom_mappings().len(),
+        boot_va_start: boot.va_start,
+        boot_va_end: boot.va_end,
+        boot_physical_start,
+        diagnostic,
+        alias_cfg,
+    };
+    let receipt_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&measurement)
+                .map_err(|error| format!("serializing boot-TLB measurement: {error}"))?
+        )
+    );
+    serde_json::to_string(&BootTlbAliasReceiptV1 {
+        measurement,
+        receipt_sha256,
+    })
+    .map_err(|error| format!("serializing boot-TLB receipt: {error}"))
 }
 
 fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {

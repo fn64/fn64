@@ -333,6 +333,57 @@ pub struct Cop0StatusWriteAnalysis {
     pub proven_code_value_proofs: Vec<Cop0StatusValueProof>,
 }
 
+/// One exact indexed TLB write retained by the whole-CFG abstract state.
+///
+/// These are raw COP0 values. Address translation remains the execution
+/// runtime's responsibility so discovery cannot grow a second TLB model.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TlbWriteProofV1 {
+    pub tlbwi_pc: u32,
+    pub index_raw: u32,
+    pub page_mask_raw: u32,
+    pub entry_hi_raw: u32,
+    pub entry_lo0_raw: u32,
+    pub entry_lo1_raw: u32,
+}
+
+/// Why a reachable computed transfer lacks one path-invariant TLB setup.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TlbTransferBlockerV1 {
+    NoReachableObservation,
+    ViaCall,
+    TargetOpen,
+    TargetPathDisagreement,
+    NoProvenTlbWrite,
+    TlbPathDisagreement,
+    EntryHiPathDisagreement,
+    TlbSetupOpen { cop0d: u8 },
+    MutableStaticMemorySource { cop0d: u8, addresses: Vec<u32> },
+    Dmtc0Unsupported { cop0d: u8 },
+    RandomIndexedWrite,
+    UnknownCallEffects,
+    RevisitWidened,
+}
+
+/// A computed transfer paired with the exact indexed writes active after its
+/// delay slot. Empty `blockers` is the only admissible proof state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlbTransferProofV1 {
+    pub transfer_pc: u32,
+    pub target: Option<u32>,
+    /// Exact COP0 EntryHi value active after the transfer's delay slot. This
+    /// supplies the ASID/Region used by the runtime translator independently
+    /// of the indexed entries' stored EntryHi values.
+    pub entry_hi_at_transfer: Option<u64>,
+    pub active_writes: Vec<TlbWriteProofV1>,
+    pub blockers: Vec<TlbTransferBlockerV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstantTlbTransferAnalysisV1 {
+    pub transfers: Vec<TlbTransferProofV1>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cop0StatusWriteInventoryError {
     UnalignedImage,
@@ -369,6 +420,15 @@ struct RawCop0StatusObservation {
     known_one: u32,
     memory_sources: Vec<u32>,
     from_static_memory: bool,
+    widened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawTlbTransferObservation {
+    target: IndirectResolution,
+    entry_hi_at_transfer: Option<u64>,
+    active_writes: Vec<TlbWriteProofV1>,
+    blockers: Vec<TlbTransferBlockerV1>,
     widened: bool,
 }
 
@@ -849,6 +909,9 @@ enum MemoryLocation {
 struct AnalysisState {
     registers: [TrackedValue; 32],
     memory: BTreeMap<MemoryLocation, TrackedValue>,
+    staged_tlb: [TrackedValue; 5],
+    proven_tlb_entries: BTreeMap<u32, TlbWriteProofV1>,
+    tlb_blockers: BTreeSet<TlbTransferBlockerV1>,
 }
 
 impl AnalysisState {
@@ -859,6 +922,9 @@ impl AnalysisState {
         Self {
             registers,
             memory: BTreeMap::new(),
+            staged_tlb: std::array::from_fn(|_| TrackedValue::unknown()),
+            proven_tlb_entries: BTreeMap::new(),
+            tlb_blockers: BTreeSet::new(),
         }
     }
 
@@ -885,6 +951,21 @@ impl AnalysisState {
         Self {
             registers,
             memory: BTreeMap::new(),
+            staged_tlb: std::array::from_fn(|_| TrackedValue::unknown()),
+            proven_tlb_entries: BTreeMap::new(),
+            tlb_blockers: BTreeSet::from([TlbTransferBlockerV1::RevisitWidened]),
+        }
+    }
+
+    fn widened_preserving_tlb(&self) -> Self {
+        let mut registers = std::array::from_fn(|_| TrackedValue::unknown());
+        registers[0] = TrackedValue::constant(0);
+        Self {
+            registers,
+            memory: BTreeMap::new(),
+            staged_tlb: self.staged_tlb.clone(),
+            proven_tlb_entries: self.proven_tlb_entries.clone(),
+            tlb_blockers: self.tlb_blockers.clone(),
         }
     }
 
@@ -901,7 +982,31 @@ impl AnalysisState {
                     .map(|right| (location.clone(), left.join(right)))
             })
             .collect();
-        Self { registers, memory }
+        let staged_tlb =
+            std::array::from_fn(|index| self.staged_tlb[index].join(&other.staged_tlb[index]));
+        let proven_tlb_entries = self
+            .proven_tlb_entries
+            .iter()
+            .filter_map(|(index, left)| {
+                (other.proven_tlb_entries.get(index) == Some(left))
+                    .then_some((*index, left.clone()))
+            })
+            .collect();
+        let mut tlb_blockers = self
+            .tlb_blockers
+            .union(&other.tlb_blockers)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if self.proven_tlb_entries != other.proven_tlb_entries {
+            tlb_blockers.insert(TlbTransferBlockerV1::TlbPathDisagreement);
+        }
+        Self {
+            registers,
+            memory,
+            staged_tlb,
+            proven_tlb_entries,
+            tlb_blockers,
+        }
     }
 
     fn refine_unsigned_upper_bound(&mut self, register: u8, upper: u32) {
@@ -944,6 +1049,77 @@ impl AnalysisState {
         // or pointer arguments. Keeping pre-call stores would turn a stale
         // value into a fabricated exhaustive target set.
         self.memory.clear();
+        self.staged_tlb = std::array::from_fn(|_| TrackedValue::unknown());
+        self.proven_tlb_entries.clear();
+        self.tlb_blockers
+            .insert(TlbTransferBlockerV1::UnknownCallEffects);
+    }
+
+    fn staged_tlb_slot(cop0d: u8) -> Option<usize> {
+        match cop0d {
+            0 => Some(0),
+            2 => Some(1),
+            3 => Some(2),
+            5 => Some(3),
+            10 => Some(4),
+            _ => None,
+        }
+    }
+
+    fn stage_tlb_register(&mut self, cop0d: u8, value: TrackedValue) {
+        if let Some(slot) = Self::staged_tlb_slot(cop0d) {
+            self.staged_tlb[slot] = value;
+        }
+    }
+
+    fn open_staged_tlb_register(&mut self, cop0d: u8) {
+        if let Some(slot) = Self::staged_tlb_slot(cop0d) {
+            self.staged_tlb[slot] = TrackedValue::unknown();
+        }
+    }
+
+    fn record_tlbwi(&mut self, pc: u32) {
+        let exact = self
+            .staged_tlb
+            .iter()
+            .map(|value| {
+                let values = value.concrete_values()?;
+                (values.len() == 1 && !value.from_static_memory)
+                    .then_some(*values.iter().next().unwrap())
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(values) = exact else {
+            for (slot, value) in self.staged_tlb.iter().enumerate() {
+                let cop0d = [0, 2, 3, 5, 10][slot];
+                if value.from_static_memory {
+                    self.tlb_blockers
+                        .insert(TlbTransferBlockerV1::MutableStaticMemorySource {
+                            cop0d,
+                            addresses: value.memory_sources.iter().copied().collect(),
+                        });
+                } else if value.concrete_values().is_none_or(|set| set.len() != 1) {
+                    self.tlb_blockers
+                        .insert(TlbTransferBlockerV1::TlbSetupOpen { cop0d });
+                }
+            }
+            if let Some(index_values) = self.staged_tlb[0].concrete_values() {
+                for index in index_values {
+                    self.proven_tlb_entries.remove(&(index & 31));
+                }
+            } else {
+                self.proven_tlb_entries.clear();
+            }
+            return;
+        };
+        let proof = TlbWriteProofV1 {
+            tlbwi_pc: pc,
+            index_raw: values[0],
+            entry_lo0_raw: values[1],
+            entry_lo1_raw: values[2],
+            page_mask_raw: values[3],
+            entry_hi_raw: values[4],
+        };
+        self.proven_tlb_entries.insert(values[0] & 31, proof);
     }
 }
 
@@ -1056,6 +1232,33 @@ fn execute_instruction(
     bank_bytes: &[u8],
     va_start: u32,
 ) {
+    match decode(word) {
+        Instruction::Mtc0 { rt, cop0d } => {
+            state.stage_tlb_register(cop0d, state.registers[rt as usize].clone());
+        }
+        Instruction::Dmtc0 { cop0d, .. } => {
+            if AnalysisState::staged_tlb_slot(cop0d).is_some() {
+                state.open_staged_tlb_register(cop0d);
+                state
+                    .tlb_blockers
+                    .insert(TlbTransferBlockerV1::Dmtc0Unsupported { cop0d });
+            }
+        }
+        Instruction::Tlbwi => state.record_tlbwi(pc),
+        Instruction::Tlbwr => {
+            state.proven_tlb_entries.clear();
+            state
+                .tlb_blockers
+                .insert(TlbTransferBlockerV1::RandomIndexedWrite);
+        }
+        Instruction::Tlbp => state.open_staged_tlb_register(0),
+        Instruction::Tlbr => {
+            for cop0d in [2, 3, 5, 10] {
+                state.open_staged_tlb_register(cop0d);
+            }
+        }
+        _ => {}
+    }
     let opcode = (word >> 26) & 0x3f;
     let rs = ((word >> 21) & 0x1f) as u8;
     let rt = ((word >> 16) & 0x1f) as u8;
@@ -1401,7 +1604,15 @@ fn resolve_value_sets_from_roots(
     va_start: u32,
     analysis_roots: &[u32],
 ) -> Vec<IndirectResolution> {
-    resolve_value_sets_from_roots_observing(cfg, bank_bytes, va_start, analysis_roots, None, None)
+    resolve_value_sets_from_roots_observing(
+        cfg,
+        bank_bytes,
+        va_start,
+        analysis_roots,
+        None,
+        None,
+        None,
+    )
 }
 
 fn resolve_value_sets_from_roots_observing(
@@ -1411,6 +1622,7 @@ fn resolve_value_sets_from_roots_observing(
     analysis_roots: &[u32],
     mut stores: Option<&mut BTreeMap<u32, BTreeSet<RawWordStoreObservation>>>,
     mut status_writes: Option<&mut BTreeMap<u32, BTreeSet<RawCop0StatusObservation>>>,
+    mut tlb_transfers: Option<&mut BTreeMap<u32, Vec<RawTlbTransferObservation>>>,
 ) -> Vec<IndirectResolution> {
     let blocks: BTreeMap<u32, &BasicBlock> = cfg
         .blocks
@@ -1442,11 +1654,33 @@ fn resolve_value_sets_from_roots_observing(
         let Some(mut state) = incoming.get(&start).cloned() else {
             continue;
         };
+        let words = read_block_words(block, bank_bytes, va_start);
         let visit = visits.entry(start).or_default();
         *visit += 1;
         let mut widened_visit = false;
         if *visit > MAX_BLOCK_REVISITS {
-            let widened = AnalysisState::widened();
+            let mut widened = state.widened_preserving_tlb();
+            if words.iter().any(|(_, word)| {
+                matches!(
+                    decode(*word),
+                    Instruction::Mtc0 {
+                        cop0d: 0 | 2 | 3 | 5 | 10,
+                        ..
+                    } | Instruction::Dmtc0 {
+                        cop0d: 0 | 2 | 3 | 5 | 10,
+                        ..
+                    } | Instruction::Tlbwi
+                        | Instruction::Tlbwr
+                        | Instruction::Tlbp
+                        | Instruction::Tlbr
+                )
+            }) {
+                widened.staged_tlb = std::array::from_fn(|_| TrackedValue::unknown());
+                widened.proven_tlb_entries.clear();
+                widened
+                    .tlb_blockers
+                    .insert(TlbTransferBlockerV1::RevisitWidened);
+            }
             if state == widened {
                 continue;
             }
@@ -1454,40 +1688,38 @@ fn resolve_value_sets_from_roots_observing(
             state = widened;
             widened_visit = true;
         }
-        let words = read_block_words(block, bank_bytes, va_start);
         let transfer_pc = block.end_va.checked_sub(8);
         let delay_pc = block.end_va.checked_sub(4);
         let mut before_delay = None;
+        let mut pending_tlb_transfer = None;
         for &(pc, word) in &words {
             if Some(pc) == delay_pc {
                 before_delay = Some(state.clone());
             }
-            if Some(pc) == transfer_pc && !widened_visit {
-                // Record the site verdict from every *real* (non-widened) visit
-                // and meet them: disagreeing observations fall to `Open`. A
-                // widened visit is skipped because its all-`unknown` state is a
-                // termination over-approximation, never new runtime evidence --
-                // it can only introduce a spurious `Open`. Crucially, widening
-                // only ever *loses* boundedness it previously had; it never
-                // exposes a target a real visit missed, so skipping it cannot
-                // hide a reachable edge (soundness) while preventing a real
-                // exhaustive proof from being erased (precision).
+            if Some(pc) == transfer_pc {
+                // The ordinary target verdict meets only real (non-widened)
+                // visits; widening can only lose target precision. The TLB
+                // observer below retains widened visits as explicit blockers,
+                // because an active mapping must agree after every delay slot.
                 if let BlockTerminator::Indirect { via_call }
                 | BlockTerminator::ResolvedIndirect { via_call, .. } = &block.terminator
                 {
                     let register = ((word >> 21) & 0x1f) as usize;
                     let candidate =
                         resolution_from_value(pc, *via_call, &state.registers[register]);
-                    resolutions
-                        .entry(pc)
-                        .and_modify(|existing| {
-                            if *existing != candidate {
-                                existing.state = IndirectProofState::Open;
-                                existing.kind = None;
-                                existing.targets.clear();
-                            }
-                        })
-                        .or_insert(candidate);
+                    pending_tlb_transfer = Some(candidate.clone());
+                    if !widened_visit {
+                        resolutions
+                            .entry(pc)
+                            .and_modify(|existing| {
+                                if *existing != candidate {
+                                    existing.state = IndirectProofState::Open;
+                                    existing.kind = None;
+                                    existing.targets.clear();
+                                }
+                            })
+                            .or_insert(candidate);
+                    }
                 }
             }
             if word >> 26 == 0x2b {
@@ -1529,6 +1761,37 @@ fn resolve_value_sets_from_roots_observing(
                 }
             }
             execute_instruction(&mut state, pc, word, bank_bytes, va_start);
+        }
+
+        if let (Some(candidate), Some(tlb_transfers)) =
+            (pending_tlb_transfer, tlb_transfers.as_deref_mut())
+        {
+            let entry_hi = &state.staged_tlb[4];
+            let mut blockers = state.tlb_blockers.clone();
+            let entry_hi_at_transfer = entry_hi.concrete_values().and_then(|values| {
+                (values.len() == 1 && !entry_hi.from_static_memory)
+                    .then(|| u64::from(*values.iter().next().unwrap()))
+            });
+            if entry_hi_at_transfer.is_none() {
+                if entry_hi.from_static_memory {
+                    blockers.insert(TlbTransferBlockerV1::MutableStaticMemorySource {
+                        cop0d: 10,
+                        addresses: entry_hi.memory_sources.iter().copied().collect(),
+                    });
+                } else {
+                    blockers.insert(TlbTransferBlockerV1::TlbSetupOpen { cop0d: 10 });
+                }
+            }
+            tlb_transfers
+                .entry(candidate.site_pc)
+                .or_default()
+                .push(RawTlbTransferObservation {
+                    target: candidate,
+                    entry_hi_at_transfer,
+                    active_writes: state.proven_tlb_entries.values().cloned().collect(),
+                    blockers: blockers.into_iter().collect(),
+                    widened: widened_visit,
+                });
         }
 
         // The branch tests `$pred` before its delay slot runs, so the bound is
@@ -1698,6 +1961,7 @@ pub fn analyze_cop0_status_writes(
         &cfg.proven_roots,
         None,
         Some(&mut observations),
+        None,
     );
     let mut proofs = Vec::with_capacity(inventory.proven_code_writes.len());
     for site in &inventory.proven_code_writes {
@@ -1772,6 +2036,122 @@ pub fn analyze_cop0_status_writes(
     })
 }
 
+/// Correlate each reachable computed transfer with the exact indexed TLB
+/// writes active after its delay slot.
+///
+/// This proves only path-invariant raw setup and target values. Consumers must
+/// ask the execution runtime to translate the target and must independently
+/// establish backing bytes before admitting an executable address view.
+pub fn analyze_constant_tlb_transfers(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+) -> ConstantTlbTransferAnalysisV1 {
+    let mut observations = BTreeMap::new();
+    let _ = resolve_value_sets_from_roots_observing(
+        cfg,
+        bank_bytes,
+        va_start,
+        &cfg.proven_roots,
+        None,
+        None,
+        Some(&mut observations),
+    );
+
+    let mut sites = cfg
+        .indirect_sites
+        .iter()
+        .map(|site| site.pc)
+        .collect::<BTreeSet<_>>();
+    sites.extend(observations.keys().copied());
+    let transfers = sites
+        .into_iter()
+        .map(|transfer_pc| {
+            let site_observations = observations.remove(&transfer_pc).unwrap_or_default();
+            let mut blockers = BTreeSet::new();
+            if site_observations.is_empty() {
+                blockers.insert(TlbTransferBlockerV1::NoReachableObservation);
+            }
+            if site_observations
+                .iter()
+                .any(|observation| observation.target.via_call)
+            {
+                blockers.insert(TlbTransferBlockerV1::ViaCall);
+            }
+            if site_observations.iter().any(|observation| {
+                observation.target.state != IndirectProofState::Exhaustive
+                    || observation.target.kind != Some(IndirectResolutionKind::Constant)
+                    || observation.target.targets.len() != 1
+            }) {
+                blockers.insert(TlbTransferBlockerV1::TargetOpen);
+            }
+            if site_observations
+                .iter()
+                .any(|observation| observation.widened)
+            {
+                blockers.insert(TlbTransferBlockerV1::RevisitWidened);
+            }
+            for blocker in site_observations
+                .iter()
+                .flat_map(|observation| observation.blockers.iter().cloned())
+            {
+                blockers.insert(blocker);
+            }
+
+            let targets = site_observations
+                .iter()
+                .filter_map(|observation| {
+                    (observation.target.state == IndirectProofState::Exhaustive
+                        && observation.target.kind == Some(IndirectResolutionKind::Constant)
+                        && observation.target.targets.len() == 1)
+                        .then(|| observation.target.targets[0])
+                })
+                .collect::<BTreeSet<_>>();
+            let target = (targets.len() == 1).then(|| *targets.iter().next().unwrap());
+            if targets.len() > 1 {
+                blockers.insert(TlbTransferBlockerV1::TargetPathDisagreement);
+            }
+
+            let active_write_sets = site_observations
+                .iter()
+                .map(|observation| observation.active_writes.clone())
+                .collect::<BTreeSet<_>>();
+            let active_writes = if active_write_sets.len() == 1 {
+                active_write_sets.iter().next().cloned().unwrap_or_default()
+            } else {
+                blockers.insert(TlbTransferBlockerV1::TlbPathDisagreement);
+                Vec::new()
+            };
+            if active_writes.is_empty() {
+                blockers.insert(TlbTransferBlockerV1::NoProvenTlbWrite);
+            }
+
+            let entry_hi_values = site_observations
+                .iter()
+                .filter_map(|observation| observation.entry_hi_at_transfer)
+                .collect::<BTreeSet<_>>();
+            let entry_hi_at_transfer =
+                (entry_hi_values.len() == 1).then(|| *entry_hi_values.iter().next().unwrap());
+            if site_observations
+                .iter()
+                .any(|observation| observation.entry_hi_at_transfer.is_none())
+                || entry_hi_values.len() > 1
+            {
+                blockers.insert(TlbTransferBlockerV1::EntryHiPathDisagreement);
+            }
+
+            TlbTransferProofV1 {
+                transfer_pc,
+                target,
+                entry_hi_at_transfer,
+                active_writes,
+                blockers: blockers.into_iter().collect(),
+            }
+        })
+        .collect();
+    ConstantTlbTransferAnalysisV1 { transfers }
+}
+
 /// Derive exact fixed-address word stores whose value is an unchanged load of
 /// an admitted load-image word.
 ///
@@ -1820,6 +2200,7 @@ pub fn derive_fixed_word_stores(
         va_start,
         &cfg.proven_roots,
         Some(&mut observations),
+        None,
         None,
     );
 
@@ -3877,6 +4258,169 @@ mod cop0_status_write_inventory_tests {
             inventory_cop0_status_writes(&cfg, &[0; 4], u32::MAX - 3),
             Err(Cop0StatusWriteInventoryError::AddressOverflow)
         );
+    }
+}
+
+#[cfg(test)]
+mod tlb_transfer_tests {
+    use super::*;
+    use crate::cfg::build_cfg;
+
+    const START: u32 = 0x8000_1000;
+    const NOP: u32 = 0;
+
+    fn mtc0(rt: u8, cop0d: u8) -> u32 {
+        (0x10 << 26) | (4 << 21) | ((rt as u32) << 16) | ((cop0d as u32) << 11)
+    }
+
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_be_bytes()).collect()
+    }
+
+    fn setup_words() -> Vec<u32> {
+        vec![
+            0x2408_0001, // addiu t0,zero,1: Index
+            0x2409_001f, // addiu t1,zero,0x1f: EntryLo0
+            0x240a_0001, // addiu t2,zero,1: EntryLo1
+            0x3c0b_007f, // lui t3,0x007f
+            0x356b_e000, // ori t3,t3,0xe000: PageMask
+            0x3c0c_7000, // lui t4,0x7000: EntryHi
+            mtc0(8, 0),
+            mtc0(9, 2),
+            mtc0(10, 3),
+            mtc0(11, 5),
+            mtc0(12, 10),
+        ]
+    }
+
+    #[test]
+    fn constant_tlbwi_is_correlated_with_post_delay_transfer() {
+        let mut words = setup_words();
+        words.extend([
+            0x4200_0002, // tlbwi
+            0x3c0d_7000, // lui t5,0x7000
+            0x35ad_0510, // ori t5,t5,0x0510
+            0x01a0_0008, // jr t5
+            NOP,
+        ]);
+        let image = bytes(&words);
+        let cfg = build_cfg("tlb-constant", &image, START, &[START]);
+        let analysis = analyze_constant_tlb_transfers(&cfg, &image, START);
+        let [transfer] = analysis.transfers.as_slice() else {
+            panic!("expected one computed transfer")
+        };
+        assert_eq!(transfer.transfer_pc, START + 14 * 4);
+        assert_eq!(transfer.target, Some(0x7000_0510));
+        assert_eq!(transfer.entry_hi_at_transfer, Some(0x7000_0000));
+        assert!(transfer.blockers.is_empty());
+        assert_eq!(
+            transfer.active_writes,
+            vec![TlbWriteProofV1 {
+                tlbwi_pc: START + 11 * 4,
+                index_raw: 1,
+                page_mask_raw: 0x007f_e000,
+                entry_hi_raw: 0x7000_0000,
+                entry_lo0_raw: 0x1f,
+                entry_lo1_raw: 0x1,
+            }]
+        );
+    }
+
+    #[test]
+    fn bypass_path_cannot_inherit_tlb_write() {
+        let mut words = setup_words();
+        words.extend([
+            0x1080_0004, // beq a0,zero,join
+            NOP,
+            0x4200_0002, // tlbwi
+            0x0800_0410, // j START+0x40 (join)
+            NOP,
+            0x3c0d_7000, // join: lui t5,0x7000
+            0x35ad_0510,
+            0x01a0_0008,
+            NOP,
+        ]);
+        let image = bytes(&words);
+        let cfg = build_cfg("tlb-bypass", &image, START, &[START]);
+        let analysis = analyze_constant_tlb_transfers(&cfg, &image, START);
+        let transfer = analysis
+            .transfers
+            .iter()
+            .find(|transfer| transfer.target == Some(0x7000_0510))
+            .expect("joined transfer");
+        assert!(transfer.active_writes.is_empty());
+        assert!(transfer
+            .blockers
+            .contains(&TlbTransferBlockerV1::TlbPathDisagreement));
+        assert!(transfer
+            .blockers
+            .contains(&TlbTransferBlockerV1::NoProvenTlbWrite));
+    }
+
+    #[test]
+    fn delay_slot_tlb_mutation_blocks_transfer() {
+        let mut words = setup_words();
+        words.extend([
+            0x4200_0002, // tlbwi
+            0x3c0d_7000,
+            0x35ad_0510,
+            0x01a0_0008, // jr t5
+            0x4200_0006, // tlbwr in the architectural delay slot
+        ]);
+        let image = bytes(&words);
+        let cfg = build_cfg("tlb-delay", &image, START, &[START]);
+        let analysis = analyze_constant_tlb_transfers(&cfg, &image, START);
+        let [transfer] = analysis.transfers.as_slice() else {
+            panic!("expected one computed transfer")
+        };
+        assert_eq!(transfer.target, Some(0x7000_0510));
+        assert!(transfer.active_writes.is_empty());
+        assert!(transfer
+            .blockers
+            .contains(&TlbTransferBlockerV1::RandomIndexedWrite));
+        assert!(transfer
+            .blockers
+            .contains(&TlbTransferBlockerV1::NoProvenTlbWrite));
+    }
+
+    #[test]
+    fn transfer_entry_hi_is_sampled_after_the_delay_slot() {
+        let mut words = setup_words();
+        words.extend([
+            0x4200_0002, // tlbwi
+            0x3c0d_7000,
+            0x35ad_0510,
+            0x3c0e_7000,
+            0x35ce_0001,  // t6 = transfer-time EntryHi with ASID 1
+            0x01a0_0008,  // jr t5
+            mtc0(14, 10), // architectural delay slot
+        ]);
+        let image = bytes(&words);
+        let cfg = build_cfg("tlb-entry-hi-delay", &image, START, &[START]);
+        let analysis = analyze_constant_tlb_transfers(&cfg, &image, START);
+        let [transfer] = analysis.transfers.as_slice() else {
+            panic!("expected one computed transfer")
+        };
+        assert_eq!(transfer.target, Some(0x7000_0510));
+        assert_eq!(transfer.entry_hi_at_transfer, Some(0x7000_0001));
+        assert!(transfer.blockers.is_empty());
+    }
+
+    #[test]
+    fn open_target_is_retained_without_indexing_an_empty_set() {
+        let image = bytes(&[0x0080_0008, NOP]); // jr a0; nop
+        let cfg = build_cfg("tlb-open-target", &image, START, &[START]);
+        let analysis = analyze_constant_tlb_transfers(&cfg, &image, START);
+        let [transfer] = analysis.transfers.as_slice() else {
+            panic!("expected one computed transfer")
+        };
+        assert_eq!(transfer.target, None);
+        assert!(transfer
+            .blockers
+            .contains(&TlbTransferBlockerV1::TargetOpen));
+        assert!(transfer
+            .blockers
+            .contains(&TlbTransferBlockerV1::NoProvenTlbWrite));
     }
 }
 
