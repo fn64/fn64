@@ -85,7 +85,7 @@ enum WriterClassStateV2 {
 enum ValidatedWriterClassReceiptV2 {
     IndirectPiEpiCall(OpaqueValidatorReceiptV2),
     UnrecognizedRawPiAddressConstruction(OpaqueValidatorReceiptV2),
-    CpuCopyStoreOrDecompression(OpaqueValidatorReceiptV2),
+    CpuCopyStoreOrDecompression(CpuCopyStoreOrDecompressionReceiptV2),
     SpDmaToCpuExecutable(OpaqueValidatorReceiptV2),
     SiDmaToCpuExecutable(OpaqueValidatorReceiptV2),
     RdpWriteToCpuExecutable(OpaqueValidatorReceiptV2),
@@ -103,6 +103,19 @@ enum ValidatedWriterClassReceiptV2 {
 struct OpaqueValidatorReceiptV2 {
     validator_schema: String,
     evidence_sha256: String,
+}
+
+/// Reserved completion shape for CPU copies/stores/decompression. No one
+/// evaluation can complete this class: effect/closure authority establishes
+/// that evaluation is admissible, block harvest binds the exact evaluated
+/// image and outputs, and class aggregation proves that the evaluated set is
+/// complete for the program model. Production constructors remain absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CpuCopyStoreOrDecompressionReceiptV2 {
+    effect_closure_certificate: OpaqueValidatorReceiptV2,
+    evaluated_image_block_harvest: OpaqueValidatorReceiptV2,
+    class_completeness_aggregation: OpaqueValidatorReceiptV2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -273,7 +286,13 @@ fn validated_receipt_for_test(
             ValidatedWriterClassReceiptV2::UnrecognizedRawPiAddressConstruction(receipt())
         }
         OpenWriterClass::CpuCopyStoreOrDecompression => {
-            ValidatedWriterClassReceiptV2::CpuCopyStoreOrDecompression(receipt())
+            ValidatedWriterClassReceiptV2::CpuCopyStoreOrDecompression(
+                CpuCopyStoreOrDecompressionReceiptV2 {
+                    effect_closure_certificate: receipt(),
+                    evaluated_image_block_harvest: receipt(),
+                    class_completeness_aggregation: receipt(),
+                },
+            )
         }
         OpenWriterClass::SpDmaToCpuExecutable => {
             ValidatedWriterClassReceiptV2::SpDmaToCpuExecutable(receipt())
@@ -1177,6 +1196,16 @@ mod tests {
             .unwrap()
             .iter()
             .all(|row| row["state"] == "complete"));
+        let cpu_copy = json["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["class"] == "cpu_copy_store_or_decompression")
+            .unwrap();
+        let split = &cpu_copy["receipt"]["receipt"];
+        assert!(split.get("effect_closure_certificate").is_some());
+        assert!(split.get("evaluated_image_block_harvest").is_some());
+        assert!(split.get("class_completeness_aggregation").is_some());
     }
 
     #[test]
