@@ -112,6 +112,92 @@ pub trait MmioPort {
     fn write_w(&mut self, vaddr: u64, value: u32) -> MmioOutcome<()>;
 }
 
+/// One architecturally aligned word address reached through a canonical direct
+/// KSEG0/KSEG1 data translation.
+///
+/// The interpreter constructs this token only after its ordinary alignment and
+/// address-translation checks succeed. A cartridge adapter can therefore
+/// classify direct CPU cartridge accesses without accepting mapped/TLB or
+/// noncanonical aliases. The adapter remains the sole authority for the actual
+/// cartridge window; this crate deliberately contains no PI-domain constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlignedDirectWordAddress(u64);
+
+impl AlignedDirectWordAddress {
+    /// The canonical zero- or sign-extended effective address selected by
+    /// translation.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn from_translated(address: u64) -> Option<Self> {
+        let upper = address >> 32;
+        let low = address as u32;
+        ((address & 3 == 0)
+            && (upper == 0 || upper == u32::MAX as u64)
+            && (0x8000_0000..0xc000_0000).contains(&low))
+        .then_some(Self(address))
+    }
+}
+
+/// Result of offering a proven direct word load to cartridge storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CartridgeReadOutcome {
+    /// The address is outside this cartridge adapter's window.
+    NotCartridge,
+    /// The immutable cartridge supplied the architectural big-endian word.
+    Handled(u32),
+    /// The address is cartridge-domain but cannot be read (for example, no ROM
+    /// is installed or the complete word lies outside its bounded image).
+    Fault,
+}
+
+/// Result of classifying a proven direct word store against cartridge storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CartridgeStoreOutcome {
+    /// The address is outside this cartridge adapter's window.
+    NotCartridge,
+    /// The address names immutable cartridge storage; the interpreter must
+    /// fault without changing ordinary backing or exposing a write capability.
+    ReadOnlyFault,
+}
+
+/// Read-only direct CPU access to installed cartridge storage.
+///
+/// There is intentionally no write method. [`Self::classify_store_w`] only
+/// identifies a store that must fault, keeping immutable ROM mutation
+/// unrepresentable at this seam.
+pub trait CartridgeWordPort {
+    fn read_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeReadOutcome;
+    fn classify_store_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeStoreOutcome;
+}
+
+/// Distinct CPU memory authorities composed for one interpreted execution.
+///
+/// MMIO remains a register-only port. Cartridge storage is optional so the
+/// existing no-cartridge and MMIO-only entrypoints retain their exact ordinary
+/// RDRAM/fault fallback behavior.
+pub struct MemoryPort<'a> {
+    mmio: &'a mut dyn MmioPort,
+    cartridge: Option<&'a mut dyn CartridgeWordPort>,
+}
+
+impl<'a> MemoryPort<'a> {
+    pub fn new(mmio: &'a mut dyn MmioPort, cartridge: &'a mut dyn CartridgeWordPort) -> Self {
+        Self {
+            mmio,
+            cartridge: Some(cartridge),
+        }
+    }
+
+    pub fn mmio_only(mmio: &'a mut dyn MmioPort) -> Self {
+        Self {
+            mmio,
+            cartridge: None,
+        }
+    }
+}
+
 /// The result of offering a word access to an [`MmioPort`].
 ///
 /// Deliberately three-valued so the "in the window but the device rejected it"
@@ -257,7 +343,7 @@ pub(crate) fn execute_straight_word(
         instruction,
         ctx,
         mem,
-        &mut NoMmio,
+        &mut MemoryPort::mmio_only(&mut NoMmio),
         retired_before,
     )
 }
@@ -304,6 +390,28 @@ pub fn run_bank_with_mmio(
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
     port: &mut dyn MmioPort,
+) -> Result<BlockRun, UnsupportedOp> {
+    run_bank_with_memory_port(
+        catalog,
+        bank,
+        entry,
+        budget,
+        ctx,
+        mem,
+        &mut MemoryPort::mmio_only(port),
+    )
+}
+
+/// [`run_bank`] with distinct register and cartridge-memory authorities.
+#[cfg(feature = "dev-interpreter")]
+pub fn run_bank_with_memory_port(
+    catalog: &CodeCatalog,
+    bank: BankId,
+    entry: ExecutionKey,
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+    port: &mut MemoryPort<'_>,
 ) -> Result<BlockRun, UnsupportedOp> {
     let interp = Interp {
         instructions: catalog,
@@ -361,13 +469,14 @@ impl InstructionSource for InstructionUnit<'_> {
 
 /// Run one already-admitted mapped instruction unit without imposing a
 /// non-wrapping virtual-span geometry on the architectural 32-bit PC.
-pub(crate) fn run_instruction_unit(
+pub(crate) fn run_instruction_unit_with_memory_port(
     bank: BankId,
     entry: GuestPc,
     words: &[u32],
     budget: InstructionBudget,
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
+    port: &mut MemoryPort<'_>,
 ) -> Result<BlockRun, UnsupportedOp> {
     assert!(
         matches!(words.len(), 1 | 2),
@@ -378,13 +487,7 @@ pub(crate) fn run_instruction_unit(
         instructions: &instructions,
         bank,
     };
-    interp.run(
-        ExecutionKey::new(bank, entry),
-        budget,
-        ctx,
-        mem,
-        &mut NoMmio,
-    )
+    interp.run(ExecutionKey::new(bank, entry), budget, ctx, mem, port)
 }
 
 /// The interpreter bound to one immutable instruction source.
@@ -400,7 +503,7 @@ impl Interp<'_> {
         budget: InstructionBudget,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
-        port: &mut dyn MmioPort,
+        port: &mut MemoryPort<'_>,
     ) -> Result<BlockRun, UnsupportedOp> {
         // Bank/alignment admission mirrors the AOT runner prologue exactly: an
         // unknown bank or unaligned entry PC faults with zero instructions.
@@ -650,7 +753,7 @@ impl Interp<'_> {
         attempt_runtime_fetch: bool,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
-        port: &mut dyn MmioPort,
+        port: &mut MemoryPort<'_>,
         retired_before: u32,
     ) -> Result<Step, StepFault> {
         use Instruction::*;
@@ -687,7 +790,7 @@ impl Interp<'_> {
         // load/store: it is routed through the same `port`.
         let run_delay = |ctx: &mut RecompContext,
                          mem: &mut Rdram<'_>,
-                         port: &mut dyn MmioPort|
+                         port: &mut MemoryPort<'_>|
          -> Result<(), StepFault> {
             match self.straight(
                 FaultSite {
@@ -828,7 +931,7 @@ impl Interp<'_> {
         instr: Instruction,
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
-        port: &mut dyn MmioPort,
+        port: &mut MemoryPort<'_>,
         retired_before: u32,
     ) -> Result<Step, StepFault> {
         let next = site.pc.wrapping_add(4);
@@ -969,17 +1072,13 @@ impl Interp<'_> {
             };
         }
 
-        // The MMIO seam: after architectural alignment/TLB checks, a word
-        // load/store is offered to the device `port`. The port is the sole authority on which effective addresses are
-        // modeled registers (`MmioOutcome::NotMmio` for everything else), so this
-        // diverts ONLY register accesses to the modeled device and leaves every
-        // other address — backed RDRAM or an out-of-RDRAM hole — to
-        // `exec_straight`'s `try_*` accessor, unchanged. That is why the seam
-        // cannot turn an arbitrary out-of-RDRAM address into a success: the port
-        // says `NotMmio` and the address still faults typed. Only `Lw`/`Sw` are
-        // routed here (the one proven device-word interaction); every other
-        // width/op stays on the plain RDRAM path — a deliberately narrow first
-        // slice (`docs/UNIVERSAL-RUNTIME-PLAN.md` U2).
+        // After architectural alignment/TLB checks, precedence is structural:
+        // modeled MMIO, then ordinary checked backing (including the legacy raw
+        // hook), then immutable cartridge storage for a still-unbacked canonical
+        // direct KSEG0/KSEG1 word. A broad cartridge classifier therefore cannot
+        // shadow either RDRAM or a register. Cartridge stores expose only a
+        // read-only classification outcome, so a claimed external store faults
+        // without mutation. Only `Lw`/`Sw` use this deliberately narrow seam.
         if let Some((base, off, alignment, exception)) = aligned_memory_access(instr) {
             let addr = Rdram::eff_addr(ctx.r(base), off);
             if addr & (alignment - 1) != 0 {
@@ -993,10 +1092,18 @@ impl Interp<'_> {
             }
             Instruction::Lw { rt, base, off } => {
                 let addr = Rdram::eff_addr(ctx.r(base), off);
-                let port_addr = match ctx
+                let translated = ctx
                     .translate_data_address(addr, DataAccessKind::Load)
-                    .map_err(mem_fault)?
-                {
+                    .map_err(mem_fault)?;
+                let direct_word = match translated {
+                    TranslatedDataAddress::Direct(address) => {
+                        AlignedDirectWordAddress::from_translated(address)
+                    }
+                    TranslatedDataAddress::DirectPhysical(_) | TranslatedDataAddress::Mapped(_) => {
+                        None
+                    }
+                };
+                let mmio_addr = match translated {
                     TranslatedDataAddress::Direct(address) => Some(address),
                     TranslatedDataAddress::DirectPhysical(physical)
                     | TranslatedDataAddress::Mapped(physical)
@@ -1008,7 +1115,7 @@ impl Interp<'_> {
                         None
                     }
                 };
-                match port_addr.map_or(MmioOutcome::NotMmio, |address| port.read_w(address)) {
+                match mmio_addr.map_or(MmioOutcome::NotMmio, |address| port.mmio.read_w(address)) {
                     MmioOutcome::Handled(v) => {
                         ctx.set_r32(rt, v as i32);
                         ctx.advance_cop0_random(1);
@@ -1019,13 +1126,46 @@ impl Interp<'_> {
                     }
                     MmioOutcome::NotMmio => {}
                 }
+                match mem.try_load_w_translated(ctx, addr) {
+                    Ok(value) => {
+                        ctx.set_r32(rt, value);
+                        ctx.advance_cop0_random(1);
+                        return ok;
+                    }
+                    Err(DataAccessError::Unbacked { .. }) => {}
+                    Err(error) => return Err(mem_fault(error)),
+                }
+                if let (Some(address), Some(cartridge)) =
+                    (direct_word, port.cartridge.as_deref_mut())
+                {
+                    match cartridge.read_w(address) {
+                        CartridgeReadOutcome::Handled(value) => {
+                            ctx.set_r32(rt, value as i32);
+                            ctx.advance_cop0_random(1);
+                            return ok;
+                        }
+                        CartridgeReadOutcome::Fault => {
+                            return Err(mem_fault(DataAccessError::Unbacked { vaddr: addr }));
+                        }
+                        CartridgeReadOutcome::NotCartridge => {}
+                    }
+                }
+                return Err(mem_fault(DataAccessError::Unbacked { vaddr: addr }));
             }
             Instruction::Sw { rt, base, off } => {
                 let addr = Rdram::eff_addr(ctx.r(base), off);
-                let port_addr = match ctx
+                let translated = ctx
                     .translate_data_address(addr, DataAccessKind::Store)
-                    .map_err(mem_fault)?
-                {
+                    .map_err(mem_fault)?;
+                let direct_word = match translated {
+                    TranslatedDataAddress::Direct(address) => {
+                        AlignedDirectWordAddress::from_translated(address)
+                    }
+                    TranslatedDataAddress::DirectPhysical(_) | TranslatedDataAddress::Mapped(_) => {
+                        None
+                    }
+                };
+                let mmio_addr = match translated {
                     TranslatedDataAddress::Direct(address) => Some(address),
                     TranslatedDataAddress::DirectPhysical(physical)
                     | TranslatedDataAddress::Mapped(physical)
@@ -1037,8 +1177,8 @@ impl Interp<'_> {
                         None
                     }
                 };
-                match port_addr.map_or(MmioOutcome::NotMmio, |address| {
-                    port.write_w(address, ctx.r_u32(rt))
+                match mmio_addr.map_or(MmioOutcome::NotMmio, |address| {
+                    port.mmio.write_w(address, ctx.r_u32(rt))
                 }) {
                     MmioOutcome::Handled(()) => {
                         ctx.advance_cop0_random(1);
@@ -1049,6 +1189,25 @@ impl Interp<'_> {
                     }
                     MmioOutcome::NotMmio => {}
                 }
+                match mem.try_store_w_translated(ctx, addr, ctx.r_u32(rt)) {
+                    Ok(()) => {
+                        ctx.advance_cop0_random(1);
+                        return ok;
+                    }
+                    Err(DataAccessError::Unbacked { .. }) => {}
+                    Err(error) => return Err(mem_fault(error)),
+                }
+                if let (Some(address), Some(cartridge)) =
+                    (direct_word, port.cartridge.as_deref_mut())
+                {
+                    match cartridge.classify_store_w(address) {
+                        CartridgeStoreOutcome::ReadOnlyFault => {
+                            return Err(mem_fault(DataAccessError::Unbacked { vaddr: addr }));
+                        }
+                        CartridgeStoreOutcome::NotCartridge => {}
+                    }
+                }
+                return Err(mem_fault(DataAccessError::Unbacked { vaddr: addr }));
             }
             _ => {}
         }
@@ -1718,6 +1877,7 @@ fn exec_straight(
 mod tests {
     use super::*;
     use crate::execution::{CodeBank, CodeSpan};
+    use crate::runtime::TlbEntryRaw;
 
     thread_local! {
         static OBSERVED_READS: std::cell::RefCell<Vec<crate::runtime::GuestReadEvent>> =
@@ -2396,6 +2556,337 @@ mod tests {
                 MmioOutcome::Fault { addr: vaddr }
             }
         }
+    }
+
+    struct MockCartridgePort {
+        physical_base: u32,
+        words: [u32; 2],
+        readable_len: Option<usize>,
+        offered_reads: u32,
+        offered_stores: u32,
+    }
+
+    impl MockCartridgePort {
+        fn offset(&self, address: AlignedDirectWordAddress) -> Option<usize> {
+            let physical = address.get() as u32 & 0x1fff_ffff;
+            let offset = physical.checked_sub(self.physical_base)?;
+            (offset < 8).then_some(offset as usize)
+        }
+    }
+
+    impl CartridgeWordPort for MockCartridgePort {
+        fn read_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeReadOutcome {
+            self.offered_reads += 1;
+            let Some(offset) = self.offset(address) else {
+                return CartridgeReadOutcome::NotCartridge;
+            };
+            match self.readable_len {
+                Some(len) if offset.checked_add(4).is_some_and(|end| end <= len) => {
+                    CartridgeReadOutcome::Handled(self.words[offset / 4])
+                }
+                Some(_) | None => CartridgeReadOutcome::Fault,
+            }
+        }
+
+        fn classify_store_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeStoreOutcome {
+            self.offered_stores += 1;
+            if self.offset(address).is_some() {
+                CartridgeStoreOutcome::ReadOnlyFault
+            } else {
+                CartridgeStoreOutcome::NotCartridge
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct BroadCartridgePort {
+        offered_reads: u32,
+        offered_stores: u32,
+    }
+
+    impl CartridgeWordPort for BroadCartridgePort {
+        fn read_w(&mut self, _address: AlignedDirectWordAddress) -> CartridgeReadOutcome {
+            self.offered_reads += 1;
+            CartridgeReadOutcome::Handled(0xdead_beef)
+        }
+
+        fn classify_store_w(
+            &mut self,
+            _address: AlignedDirectWordAddress,
+        ) -> CartridgeStoreOutcome {
+            self.offered_stores += 1;
+            CartridgeStoreOutcome::ReadOnlyFault
+        }
+    }
+
+    fn no_mmio_port() -> MockPiPort {
+        MockPiPort {
+            reg: 0,
+            reads: 0,
+            writes: 0,
+        }
+    }
+
+    #[test]
+    fn interpreted_cartridge_loads_accept_canonical_kseg0_and_kseg1() {
+        let catalog = catalog_of(&[
+            0x3c08_9000, // lui $t0,0x9000 (cached cartridge alias)
+            0x8d02_0000, // lw $v0,0($t0)
+            0x3c08_b000, // lui $t0,0xb000 (uncached cartridge alias)
+            0x8d03_0004, // lw $v1,4($t0)
+            0x03e0_0008,
+            0,
+        ]);
+        let mut cartridge = MockCartridgePort {
+            physical_base: 0x1000_0000,
+            words: [0x1020_3040, 0xaabb_ccdd],
+            readable_len: Some(8),
+            offered_reads: 0,
+            offered_stores: 0,
+        };
+        let mut mmio = no_mmio_port();
+        let mut storage = [0u8; 16];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        let run = run_bank_with_memory_port(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert!(matches!(run.exit, BlockExit::ResolveTransfer { .. }));
+        assert_eq!(ctx.r(2), 0x1020_3040);
+        assert_eq!(ctx.r(3), 0xffff_ffff_aabb_ccdd);
+        assert_eq!(cartridge.offered_reads, 2);
+        assert_eq!(mmio.reads, 0);
+    }
+
+    #[test]
+    fn direct_word_token_rejects_noncanonical_and_delegates_window_boundaries() {
+        assert_eq!(
+            AlignedDirectWordAddress::from_translated(0x0000_0001_b000_0000),
+            None
+        );
+        assert_eq!(
+            AlignedDirectWordAddress::from_translated(0xffff_ffff_b000_0001),
+            None
+        );
+        let mut cartridge = MockCartridgePort {
+            physical_base: 0x1000_0000,
+            words: [0; 2],
+            readable_len: Some(8),
+            offered_reads: 0,
+            offered_stores: 0,
+        };
+        let before = AlignedDirectWordAddress::from_translated(0xffff_ffff_afff_fffc).unwrap();
+        let after = AlignedDirectWordAddress::from_translated(0xffff_ffff_b000_0008).unwrap();
+        assert_eq!(cartridge.read_w(before), CartridgeReadOutcome::NotCartridge);
+        assert_eq!(cartridge.read_w(after), CartridgeReadOutcome::NotCartridge);
+    }
+
+    #[test]
+    fn noncanonical_and_unaligned_loads_fault_before_cartridge_classification() {
+        let catalog = catalog_of(&[0x8d02_0000, 0x03e0_0008, 0]);
+        for address in [0x0000_0001_b000_0000, 0xffff_ffff_b000_0001] {
+            let mut cartridge = MockCartridgePort {
+                physical_base: 0x1000_0000,
+                words: [0; 2],
+                readable_len: Some(8),
+                offered_reads: 0,
+                offered_stores: 0,
+            };
+            let mut mmio = no_mmio_port();
+            let mut storage = [0u8; 16];
+            let mut mem = Rdram::new(&mut storage);
+            let mut ctx = RecompContext::new();
+            ctx.set_r(8, address);
+            let run = run_bank_with_memory_port(
+                &catalog,
+                BANK,
+                ExecutionKey::new(BANK, GuestPc::new(VA)),
+                InstructionBudget::new(4).unwrap(),
+                &mut ctx,
+                &mut mem,
+                &mut MemoryPort::new(&mut mmio, &mut cartridge),
+            )
+            .unwrap();
+            assert!(matches!(run.exit, BlockExit::Fault(_)));
+            assert_eq!(cartridge.offered_reads, 0);
+        }
+    }
+
+    #[test]
+    fn mapped_cartridge_physical_address_is_not_direct_cartridge_access() {
+        let catalog = catalog_of(&[0x8d02_0000, 0x03e0_0008, 0]);
+        let mut cartridge = MockCartridgePort {
+            physical_base: 0x1000_0000,
+            words: [0xfeed_face, 0],
+            readable_len: Some(8),
+            offered_reads: 0,
+            offered_stores: 0,
+        };
+        let mut mmio = no_mmio_port();
+        let mut storage = [0u8; 16];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(8, 0x0040_0000);
+        ctx.tlb_entries[0] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: 0x0040_0000,
+            entry_lo0: (0x10000 << 6) | 0b111,
+            entry_lo1: 0b111,
+        };
+        let run = run_bank_with_memory_port(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(4).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert!(matches!(run.exit, BlockExit::Fault(_)));
+        assert_eq!(cartridge.offered_reads, 0);
+    }
+
+    #[test]
+    fn absent_and_out_of_bounds_cartridge_reads_fault_typed() {
+        let catalog = catalog_of(&[0x3c08_b000, 0x8d02_0004, 0x03e0_0008, 0]);
+        for readable_len in [None, Some(4)] {
+            let mut cartridge = MockCartridgePort {
+                physical_base: 0x1000_0000,
+                words: [0; 2],
+                readable_len,
+                offered_reads: 0,
+                offered_stores: 0,
+            };
+            let mut mmio = no_mmio_port();
+            let mut storage = [0u8; 16];
+            let mut mem = Rdram::new(&mut storage);
+            let mut ctx = RecompContext::new();
+            let run = run_bank_with_memory_port(
+                &catalog,
+                BANK,
+                ExecutionKey::new(BANK, GuestPc::new(VA)),
+                InstructionBudget::new(8).unwrap(),
+                &mut ctx,
+                &mut mem,
+                &mut MemoryPort::new(&mut mmio, &mut cartridge),
+            )
+            .unwrap();
+            assert!(matches!(
+                run.exit,
+                BlockExit::Fault(CpuFault {
+                    kind: CpuFaultKind::MemoryFault { .. },
+                    ..
+                })
+            ));
+            assert_eq!(ctx.r(2), 0);
+            assert_eq!(mmio.reads, 0);
+        }
+    }
+
+    #[test]
+    fn read_only_cartridge_store_faults_before_backing_changes() {
+        let mut cartridge = MockCartridgePort {
+            physical_base: 0x1000_0000,
+            words: [0; 2],
+            readable_len: Some(8),
+            offered_reads: 0,
+            offered_stores: 0,
+        };
+        let mut mmio = no_mmio_port();
+        let mut storage = [0x5au8; 8];
+        let before = storage;
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(2, 0x1122_3344);
+        ctx.set_r32(8, 0xb000_0000u32 as i32);
+        let catalog = catalog_of(&[0xad02_0000, 0x03e0_0008, 0]);
+        let run = run_bank_with_memory_port(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(4).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert!(matches!(run.exit, BlockExit::Fault(_)));
+        assert_eq!(cartridge.offered_stores, 1);
+        assert_eq!(storage, before);
+    }
+
+    #[test]
+    fn broad_cartridge_cannot_shadow_backed_rdram() {
+        let catalog = catalog_of(&[0x8d02_0000, 0x03e0_0008, 0]);
+        let mut cartridge = BroadCartridgePort::default();
+        let mut mmio = no_mmio_port();
+        let mut storage = [0u8; 8];
+        let mut mem = Rdram::new(&mut storage);
+        mem.store_w(0xffff_ffff_8000_0000, 0x1234_5678);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(8, 0x8000_0000u32 as i32);
+        run_bank_with_memory_port(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(4).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert_eq!(ctx.r(2), 0x1234_5678);
+        assert_eq!(cartridge.offered_reads, 0);
+    }
+
+    #[test]
+    fn default_entrypoint_does_not_install_cartridge_authority() {
+        let catalog = catalog_of(&[0x3c08_b000, 0x8d02_0000, 0x03e0_0008, 0]);
+        let mut ctx = RecompContext::new();
+        let run = run(&catalog, VA, 8, &mut ctx).unwrap();
+        assert!(matches!(
+            run.exit,
+            BlockExit::Fault(CpuFault {
+                kind: CpuFaultKind::MemoryFault { .. },
+                ..
+            })
+        ));
+        assert_eq!(ctx.r(2), 0);
+    }
+
+    #[test]
+    fn broad_cartridge_cannot_shadow_handled_mmio() {
+        let catalog = catalog_of(&[0x3c08_a460, 0x8d02_0010, 0x03e0_0008, 0]);
+        let mut cartridge = BroadCartridgePort::default();
+        let mut mmio = MockPiPort {
+            reg: 0x1234_5678,
+            reads: 0,
+            writes: 0,
+        };
+        let mut storage = [0u8; 16];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        run_bank_with_memory_port(
+            &catalog,
+            BANK,
+            ExecutionKey::new(BANK, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert_eq!(cartridge.offered_reads, 0);
+        assert_eq!(mmio.reads, 1);
+        assert_eq!(ctx.r(2), 0x1234_5678);
     }
 
     #[test]

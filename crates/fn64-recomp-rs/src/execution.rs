@@ -16,13 +16,17 @@ use std::num::NonZeroUsize;
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "dev-interpreter")]
-use crate::fetch::{admit_mapped_unit, run_admitted_mapped_unit};
+use crate::fetch::{
+    admit_mapped_unit, run_admitted_mapped_unit, run_admitted_mapped_unit_with_memory_port,
+};
 use crate::fetch::{
     MappedAotBlock, MappedAotEvidenceSnapshot, PhysicalCodeBank, PhysicalCodeBankEvidenceSnapshot,
     PhysicalCodeCatalog, PhysicalCodeError,
 };
 use crate::generation::{BackedPrecompiledGenerationCatalogV1, GenerationCatalogError};
 use crate::runtime::{HostFunctionCatalogV1, Rdram, RecompContext};
+#[cfg(feature = "dev-interpreter")]
+use crate::semantic::{MemoryPort, NoMmio};
 use crate::{static_execution_build_receipt, StaticExecutionBuildReceipt};
 
 /// Decoder-level classification for one aligned bank word.
@@ -2376,6 +2380,55 @@ impl BlockProgram {
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
     ) -> BlockRun {
+        #[cfg(feature = "dev-interpreter")]
+        {
+            let mut no_mmio = NoMmio;
+            return self.run_with_memory_port(
+                entry,
+                budget,
+                ctx,
+                mem,
+                &mut MemoryPort::mmio_only(&mut no_mmio),
+            );
+        }
+        #[cfg(not(feature = "dev-interpreter"))]
+        self.run_without_dynamic_memory_port(entry, budget, ctx, mem)
+    }
+
+    #[cfg(not(feature = "dev-interpreter"))]
+    fn run_without_dynamic_memory_port(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+    ) -> BlockRun {
+        self.run_inner(entry, budget, ctx, mem, None)
+    }
+
+    /// [`Self::run`] with a composed memory port for mapped interpreter
+    /// fallback units. Static and mapped-AOT runners remain unchanged.
+    #[cfg(feature = "dev-interpreter")]
+    pub fn run_with_memory_port(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        port: &mut MemoryPort<'_>,
+    ) -> BlockRun {
+        self.run_inner(entry, budget, ctx, mem, Some(port))
+    }
+
+    fn run_inner(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        #[cfg(feature = "dev-interpreter")] mut port: Option<&mut MemoryPort<'_>>,
+        #[cfg(not(feature = "dev-interpreter"))] _port: Option<()>,
+    ) -> BlockRun {
         if self.physical_code.contains_bank(entry.bank) {
             if let Some(block) = self.mapped_aot.get(&entry) {
                 if let Err(run) = block.preflight(&self.physical_code, ctx) {
@@ -2403,9 +2456,15 @@ impl BlockProgram {
                     Ok(unit) => unit,
                     Err(run) => return run,
                 };
-                let result = run_admitted_mapped_unit(unit, budget, ctx, mem).unwrap_or_else(
-                    |unsupported| BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0),
-                );
+                let result = match port.as_deref_mut() {
+                    Some(port) => {
+                        run_admitted_mapped_unit_with_memory_port(unit, budget, ctx, mem, port)
+                    }
+                    None => run_admitted_mapped_unit(unit, budget, ctx, mem),
+                }
+                .unwrap_or_else(|unsupported| {
+                    BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0)
+                });
                 self.observe_execution_destination(ExecutionDestinationObservation {
                     destination: entry,
                     runner_artifact_identity: None,
@@ -2455,7 +2514,25 @@ impl BlockProgram {
     where
         V: TransferResolver,
     {
-        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, true)
+        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, None, true)
+    }
+
+    /// [`Self::dispatch`] with a composed memory port for mapped interpreter
+    /// fallback units encountered during the dispatch.
+    #[cfg(feature = "dev-interpreter")]
+    pub fn dispatch_with_memory_port<V>(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        resolver: &mut V,
+        port: &mut MemoryPort<'_>,
+    ) -> Result<DispatchRun, DispatchError>
+    where
+        V: TransferResolver,
+    {
+        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, Some(port), true)
     }
 
     /// Dispatch while returning architectural exceptions to the live owner.
@@ -2473,7 +2550,25 @@ impl BlockProgram {
     where
         V: TransferResolver,
     {
-        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, false)
+        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, None, false)
+    }
+
+    /// [`Self::dispatch_exposing_exceptions`] with a composed memory port for
+    /// mapped interpreter fallback units.
+    #[cfg(feature = "dev-interpreter")]
+    pub fn dispatch_exposing_exceptions_with_memory_port<V>(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        resolver: &mut V,
+        port: &mut MemoryPort<'_>,
+    ) -> Result<DispatchRun, DispatchError>
+    where
+        V: TransferResolver,
+    {
+        self.dispatch_with_exception_vectoring(entry, budget, ctx, mem, resolver, Some(port), false)
     }
 
     fn dispatch_with_exception_vectoring<V>(
@@ -2483,6 +2578,8 @@ impl BlockProgram {
         ctx: &mut RecompContext,
         mem: &mut Rdram<'_>,
         resolver: &mut V,
+        #[cfg(feature = "dev-interpreter")] mut port: Option<&mut MemoryPort<'_>>,
+        #[cfg(not(feature = "dev-interpreter"))] _port: Option<()>,
         vector_exceptions: bool,
     ) -> Result<DispatchRun, DispatchError>
     where
@@ -2502,6 +2599,12 @@ impl BlockProgram {
             }
             let turn_budget = InstructionBudget::new(remaining)
                 .expect("remaining budget was checked against InstructionBudget::MIN");
+            #[cfg(feature = "dev-interpreter")]
+            let run = match port.as_deref_mut() {
+                Some(port) => self.run_with_memory_port(entry, turn_budget, ctx, mem, port),
+                None => self.run(entry, turn_budget, ctx, mem),
+            };
+            #[cfg(not(feature = "dev-interpreter"))]
             let run = self.run(entry, turn_budget, ctx, mem);
             let run = BlockRun::new(
                 finalize_executable_write_exit(entry.bank, run.exit),
@@ -3405,6 +3508,10 @@ impl ExecutableRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dev-interpreter")]
+    use crate::semantic::{
+        AlignedDirectWordAddress, CartridgeReadOutcome, CartridgeStoreOutcome, CartridgeWordPort,
+    };
 
     #[test]
     fn generated_runner_runtime_receipts_preserve_v1_and_issue_source_complete_v2() {
@@ -4985,6 +5092,121 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    struct MappedProgramCartridge {
+        reads: u32,
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    impl CartridgeWordPort for MappedProgramCartridge {
+        fn read_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeReadOutcome {
+            if address.get() != 0xffff_ffff_b000_0000 {
+                return CartridgeReadOutcome::NotCartridge;
+            }
+            self.reads += 1;
+            CartridgeReadOutcome::Handled(0x1357_9bdf)
+        }
+
+        fn classify_store_w(
+            &mut self,
+            _address: AlignedDirectWordAddress,
+        ) -> CartridgeStoreOutcome {
+            CartridgeStoreOutcome::NotCartridge
+        }
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    #[test]
+    fn block_program_mapped_fallback_uses_injected_cartridge_memory_port() {
+        let bank = BankId::new(0x50a);
+        let mut program = BlockProgram::new();
+        program
+            .register_physical_code(PhysicalCodeBank::new(bank, 0x40, vec![0x8c82_0000]).unwrap())
+            .unwrap();
+        let entry = ExecutionKey::new(bank, GuestPc::new(0x8000_0040));
+        let mut storage = [0u8; 0x100];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        let mut cartridge = MappedProgramCartridge { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let run = program.run_with_memory_port(
+            entry,
+            InstructionBudget::new(1).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+        );
+        assert_eq!(run.instructions, 1);
+        assert_eq!(ctx.r(2), 0x1357_9bdf);
+        assert_eq!(cartridge.reads, 1);
+        assert_eq!(
+            program.copy_execution_destinations(),
+            vec![ExecutionDestinationObservation {
+                destination: entry,
+                runner_artifact_identity: None,
+                instructions: 1,
+            }]
+        );
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    struct UnusedResolver;
+
+    #[cfg(feature = "dev-interpreter")]
+    impl TransferResolver for UnusedResolver {
+        fn resolve(
+            &mut self,
+            _source_bank: BankId,
+            _target_pc: GuestPc,
+        ) -> Result<ExecutionKey, CpuFault> {
+            panic!("thread-return test must not resolve a guest transfer")
+        }
+
+        fn resolve_call(
+            &mut self,
+            _source_bank: BankId,
+            _target_pc: GuestPc,
+            _resume: ExecutionKey,
+        ) -> Result<CallResolution, CpuFault> {
+            panic!("thread-return test must not resolve a guest call")
+        }
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    #[test]
+    fn block_program_dispatch_threads_cartridge_port_through_mapped_delay_slot() {
+        let bank = BankId::new(0x50b);
+        let mut program = BlockProgram::new();
+        program
+            .register_physical_code(
+                PhysicalCodeBank::new(bank, 0x40, vec![0x03e0_0008, 0x8c82_0000]).unwrap(),
+            )
+            .unwrap();
+        let mut storage = [0u8; 0x100];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        ctx.set_r32(31, 0xffff_fffcu32 as i32);
+        ctx.set_thread_return_pc(Some(0xffff_fffc));
+        let mut cartridge = MappedProgramCartridge { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let dispatched = program
+            .dispatch_with_memory_port(
+                ExecutionKey::new(bank, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                &mut UnusedResolver,
+                &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+            )
+            .unwrap();
+        assert_eq!(dispatched.exit, BlockExit::ThreadReturn);
+        assert_eq!(dispatched.instructions, 2);
+        assert_eq!(ctx.r(2), 0x1357_9bdf);
+        assert_eq!(cartridge.reads, 1);
     }
 
     #[test]
