@@ -100,7 +100,23 @@ const DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1: &[(&str, &[u8])] = &[
         include_bytes!("dev_interpreter_artifact.rs"),
     ),
     ("src/drive.rs", include_bytes!("drive.rs")),
-    ("src/execution.rs", include_bytes!("execution.rs")),
+    (
+        "src/execution/catalog_v1.rs",
+        include_bytes!("execution/catalog_v1.rs"),
+    ),
+    ("src/execution/mod.rs", include_bytes!("execution/mod.rs")),
+    (
+        "src/execution/program.rs",
+        include_bytes!("execution/program.rs"),
+    ),
+    (
+        "src/execution/tests/mod.rs",
+        include_bytes!("execution/tests/mod.rs"),
+    ),
+    (
+        "src/execution/tests/programs.rs",
+        include_bytes!("execution/tests/programs.rs"),
+    ),
     ("src/fallback.rs", include_bytes!("fallback.rs")),
     ("src/fetch.rs", include_bytes!("fetch.rs")),
     ("src/fpu.rs", include_bytes!("fpu.rs")),

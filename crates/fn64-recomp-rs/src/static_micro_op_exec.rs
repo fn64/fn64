@@ -67,7 +67,26 @@ pub fn static_micro_op_executor_source_receipt_v1() -> StaticMicroOpExecutorSour
             b"src/decoder/mod.rs",
             include_bytes!("decoder/mod.rs"),
         ),
-        (b"src/execution.rs", include_bytes!("execution.rs")),
+        (
+            b"src/execution/catalog_v1.rs",
+            include_bytes!("execution/catalog_v1.rs"),
+        ),
+        (
+            b"src/execution/mod.rs",
+            include_bytes!("execution/mod.rs"),
+        ),
+        (
+            b"src/execution/program.rs",
+            include_bytes!("execution/program.rs"),
+        ),
+        (
+            b"src/execution/tests/mod.rs",
+            include_bytes!("execution/tests/mod.rs"),
+        ),
+        (
+            b"src/execution/tests/programs.rs",
+            include_bytes!("execution/tests/programs.rs"),
+        ),
         (
             b"src/runtime/fpu_ops.rs",
             include_bytes!("runtime/fpu_ops.rs"),
@@ -141,7 +160,26 @@ pub fn static_micro_op_executor_source_receipt_v2() -> StaticMicroOpExecutorSour
             b"src/decoder/mod.rs",
             include_bytes!("decoder/mod.rs"),
         ),
-        (b"src/execution.rs", include_bytes!("execution.rs")),
+        (
+            b"src/execution/catalog_v1.rs",
+            include_bytes!("execution/catalog_v1.rs"),
+        ),
+        (
+            b"src/execution/mod.rs",
+            include_bytes!("execution/mod.rs"),
+        ),
+        (
+            b"src/execution/program.rs",
+            include_bytes!("execution/program.rs"),
+        ),
+        (
+            b"src/execution/tests/mod.rs",
+            include_bytes!("execution/tests/mod.rs"),
+        ),
+        (
+            b"src/execution/tests/programs.rs",
+            include_bytes!("execution/tests/programs.rs"),
+        ),
         (
             b"src/runtime/fpu_ops.rs",
             include_bytes!("runtime/fpu_ops.rs"),
@@ -220,7 +258,26 @@ pub fn static_micro_op_executor_source_receipt_v3() -> StaticMicroOpExecutorSour
             b"src/decoder/mod.rs",
             include_bytes!("decoder/mod.rs"),
         ),
-        (b"src/execution.rs", include_bytes!("execution.rs")),
+        (
+            b"src/execution/catalog_v1.rs",
+            include_bytes!("execution/catalog_v1.rs"),
+        ),
+        (
+            b"src/execution/mod.rs",
+            include_bytes!("execution/mod.rs"),
+        ),
+        (
+            b"src/execution/program.rs",
+            include_bytes!("execution/program.rs"),
+        ),
+        (
+            b"src/execution/tests/mod.rs",
+            include_bytes!("execution/tests/mod.rs"),
+        ),
+        (
+            b"src/execution/tests/programs.rs",
+            include_bytes!("execution/tests/programs.rs"),
+        ),
         (
             b"src/runtime/fpu_ops.rs",
             include_bytes!("runtime/fpu_ops.rs"),
