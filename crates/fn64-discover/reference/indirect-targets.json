@@ -1,12 +1,5 @@
 [
  {
-  "rom": "Donkey Kong 64 (Europe) (En,Fr,De,Es).z64",
-  "banks": 1,
-  "sites": 1,
-  "owners": 68,
-  "yield": 68.0
- },
- {
   "rom": "Tetrisphere (USA).z64",
   "banks": 1,
   "sites": 36,
@@ -21,18 +14,18 @@
   "yield": 19.83
  },
  {
-  "rom": "Banjo-Kazooie (Europe) (En,Fr,De).z64",
-  "banks": 1,
-  "sites": 1,
-  "owners": 19,
-  "yield": 19.0
- },
- {
   "rom": "Rampage - World Tour (USA).z64",
   "banks": 1,
   "sites": 46,
   "owners": 816,
   "yield": 17.74
+ },
+ {
+  "rom": "Nightmare Creatures (USA).z64",
+  "banks": 1,
+  "sites": 45,
+  "owners": 760,
+  "yield": 16.89
  },
  {
   "rom": "Bottom of the 9th (USA).z64",
@@ -91,6 +84,13 @@
   "yield": 13.18
  },
  {
+  "rom": "In-Fisherman - Bass Hunter 64 (USA).z64",
+  "banks": 1,
+  "sites": 45,
+  "owners": 586,
+  "yield": 13.02
+ },
+ {
   "rom": "Glover (USA).z64",
   "banks": 1,
   "sites": 42,
@@ -103,6 +103,20 @@
   "sites": 92,
   "owners": 1109,
   "yield": 12.05
+ },
+ {
+  "rom": "Asteroids Hyper 64 (USA).z64",
+  "banks": 1,
+  "sites": 34,
+  "owners": 398,
+  "yield": 11.71
+ },
+ {
+  "rom": "Wayne Gretzky's 3D Hockey (USA) (Rev A).z64",
+  "banks": 1,
+  "sites": 68,
+  "owners": 790,
+  "yield": 11.62
  },
  {
   "rom": "Duke Nukem - Zero Hour (France).z64",
@@ -131,13 +145,6 @@
   "sites": 32,
   "owners": 355,
   "yield": 11.09
- },
- {
-  "rom": "Gauntlet Legends (Europe).z64",
-  "banks": 1,
-  "sites": 1,
-  "owners": 11,
-  "yield": 11.0
  },
  {
   "rom": "Earthworm Jim 3D (Europe) (En,Fr,De,Es,It).z64",
@@ -182,6 +189,13 @@
   "yield": 9.5
  },
  {
+  "rom": "SD Hiryuu no Ken Densetsu (Japan).z64",
+  "banks": 1,
+  "sites": 67,
+  "owners": 633,
+  "yield": 9.45
+ },
+ {
   "rom": "Ready 2 Rumble Boxing (USA).z64",
   "banks": 1,
   "sites": 61,
@@ -194,20 +208,6 @@
   "sites": 61,
   "owners": 553,
   "yield": 9.07
- },
- {
-  "rom": "Jeremy McGrath Supercross 2000 (USA).z64",
-  "banks": 1,
-  "sites": 1,
-  "owners": 9,
-  "yield": 9.0
- },
- {
-  "rom": "South Park - Chef's Luv Shack (USA).z64",
-  "banks": 1,
-  "sites": 1,
-  "owners": 9,
-  "yield": 9.0
  },
  {
   "rom": "International Superstar Soccer '98 (USA).z64",
@@ -224,6 +224,13 @@
   "yield": 8.69
  },
  {
+  "rom": "Star Wars Episode I - Racer (Europe) (En,Fr,De).z64",
+  "banks": 1,
+  "sites": 54,
+  "owners": 457,
+  "yield": 8.46
+ },
+ {
   "rom": "Fighters Destiny (USA).z64",
   "banks": 1,
   "sites": 45,
@@ -233,9 +240,9 @@
  {
   "rom": "Army Men - Air Combat (USA).z64",
   "banks": 1,
-  "sites": 56,
+  "sites": 55,
   "owners": 462,
-  "yield": 8.25
+  "yield": 8.4
  },
  {
   "rom": "Bakuretsu Muteki Bangaioh (Japan).z64",
@@ -243,6 +250,13 @@
   "sites": 27,
   "owners": 222,
   "yield": 8.22
+ },
+ {
+  "rom": "F-Zero X (USA).z64",
+  "banks": 1,
+  "sites": 44,
+  "owners": 354,
+  "yield": 8.05
  },
  {
   "rom": "WinBack - Covert Operations (USA).z64",
@@ -343,6 +357,13 @@
   "yield": 6.9
  },
  {
+  "rom": "Virtual Pool 64 (USA).z64",
+  "banks": 1,
+  "sites": 122,
+  "owners": 823,
+  "yield": 6.75
+ },
+ {
   "rom": "Densha de Go! 64 (Japan).z64",
   "banks": 1,
   "sites": 45,
@@ -434,11 +455,25 @@
   "yield": 6.0
  },
  {
+  "rom": "SpaceStation Silicon Valley (USA).z64",
+  "banks": 1,
+  "sites": 41,
+  "owners": 241,
+  "yield": 5.88
+ },
+ {
   "rom": "Dual Heroes (USA).z64",
   "banks": 3,
   "sites": 39,
   "owners": 229,
   "yield": 5.87
+ },
+ {
+  "rom": "Namco Museum 64 (USA).z64",
+  "banks": 1,
+  "sites": 42,
+  "owners": 245,
+  "yield": 5.83
  },
  {
   "rom": "Super Bowling (USA).z64",
@@ -453,6 +488,13 @@
   "sites": 36,
   "owners": 208,
   "yield": 5.78
+ },
+ {
+  "rom": "Chopper Attack (USA).z64",
+  "banks": 1,
+  "sites": 38,
+  "owners": 217,
+  "yield": 5.71
  },
  {
   "rom": "FIFA - Road to World Cup 98 (USA) (En,Fr,De,Es,It,Nl,Sv).z64",
@@ -476,11 +518,25 @@
   "yield": 5.62
  },
  {
+  "rom": "Dezaemon 3D (Japan).z64",
+  "banks": 1,
+  "sites": 37,
+  "owners": 205,
+  "yield": 5.54
+ },
+ {
   "rom": "Excitebike 64 (USA) (Rev A).z64",
   "banks": 1,
   "sites": 16,
   "owners": 88,
   "yield": 5.5
+ },
+ {
+  "rom": "Army Men - Sarge's Heroes 2 (USA).z64",
+  "banks": 1,
+  "sites": 108,
+  "owners": 576,
+  "yield": 5.33
  },
  {
   "rom": "F1 Pole Position 64 (USA) (En,Fr,De).z64",
@@ -497,11 +553,46 @@
   "yield": 5.27
  },
  {
+  "rom": "New Tetris, The (USA).z64",
+  "banks": 1,
+  "sites": 53,
+  "owners": 278,
+  "yield": 5.25
+ },
+ {
+  "rom": "WCW vs. nWo - World Tour (USA) (Rev A).z64",
+  "banks": 1,
+  "sites": 33,
+  "owners": 173,
+  "yield": 5.24
+ },
+ {
   "rom": "Cruis'n World (USA).z64",
   "banks": 1,
   "sites": 53,
   "owners": 275,
   "yield": 5.19
+ },
+ {
+  "rom": "Army Men - Sarge's Heroes (USA).z64",
+  "banks": 1,
+  "sites": 106,
+  "owners": 543,
+  "yield": 5.12
+ },
+ {
+  "rom": "Rally Challenge 2000 (USA).z64",
+  "banks": 6,
+  "sites": 50,
+  "owners": 256,
+  "yield": 5.12
+ },
+ {
+  "rom": "Nagano Winter Olympics '98 (USA).z64",
+  "banks": 1,
+  "sites": 46,
+  "owners": 234,
+  "yield": 5.09
  },
  {
   "rom": "Tigger's Honey Hunt (USA).z64",
@@ -560,6 +651,13 @@
   "yield": 4.9
  },
  {
+  "rom": "Wetrix (USA) (En,Fr,De,Es,It,Nl).z64",
+  "banks": 1,
+  "sites": 43,
+  "owners": 209,
+  "yield": 4.86
+ },
+ {
   "rom": "Road Rash 64 (USA).z64",
   "banks": 1,
   "sites": 50,
@@ -581,6 +679,27 @@
   "yield": 4.72
  },
  {
+  "rom": "Monaco Grand Prix (USA).z64",
+  "banks": 1,
+  "sites": 72,
+  "owners": 340,
+  "yield": 4.72
+ },
+ {
+  "rom": "International Superstar Soccer 2000 (Europe) (Fr,It).z64",
+  "banks": 1,
+  "sites": 84,
+  "owners": 393,
+  "yield": 4.68
+ },
+ {
+  "rom": "WCW-nWo Revenge (USA).z64",
+  "banks": 1,
+  "sites": 34,
+  "owners": 159,
+  "yield": 4.68
+ },
+ {
   "rom": "Bomberman 64 - The Second Attack! (USA).z64",
   "banks": 1,
   "sites": 69,
@@ -593,6 +712,13 @@
   "sites": 70,
   "owners": 323,
   "yield": 4.61
+ },
+ {
+  "rom": "F1 Racing Championship (Europe) (En,Fr,De,Es,It).z64",
+  "banks": 1,
+  "sites": 73,
+  "owners": 334,
+  "yield": 4.58
  },
  {
   "rom": "MRC - Multi Racing Championship (USA).z64",
@@ -616,6 +742,20 @@
   "yield": 4.49
  },
  {
+  "rom": "Sin and Punishment - Successor of the Earth (Japan) [Trad-En].z64",
+  "banks": 1,
+  "sites": 60,
+  "owners": 265,
+  "yield": 4.42
+ },
+ {
+  "rom": "RR64 - Ridge Racer 64 (USA).z64",
+  "banks": 1,
+  "sites": 46,
+  "owners": 203,
+  "yield": 4.41
+ },
+ {
   "rom": "NBA in the Zone '99 (USA).z64",
   "banks": 1,
   "sites": 33,
@@ -637,11 +777,81 @@
   "yield": 4.26
  },
  {
+  "rom": "Star Soldier - Vanishing Earth (USA).z64",
+  "banks": 1,
+  "sites": 66,
+  "owners": 280,
+  "yield": 4.24
+ },
+ {
+  "rom": "Body Harvest (Europe) (En,Fr,De).z64",
+  "banks": 1,
+  "sites": 57,
+  "owners": 241,
+  "yield": 4.23
+ },
+ {
+  "rom": "John Romero's Daikatana (Europe) (En,Fr,De).z64",
+  "banks": 7,
+  "sites": 70,
+  "owners": 296,
+  "yield": 4.23
+ },
+ {
+  "rom": "Air Boarder 64 (Europe).z64",
+  "banks": 9,
+  "sites": 47,
+  "owners": 196,
+  "yield": 4.17
+ },
+ {
+  "rom": "Carmageddon 64 (Europe) (En,Fr,De,Es).z64",
+  "banks": 1,
+  "sites": 48,
+  "owners": 200,
+  "yield": 4.17
+ },
+ {
+  "rom": "Top Gear Rally 2 (USA).z64",
+  "banks": 1,
+  "sites": 55,
+  "owners": 229,
+  "yield": 4.16
+ },
+ {
   "rom": "Rat Attack! (USA) (En,Fr,De,Es,It,Nl).z64",
   "banks": 1,
   "sites": 62,
   "owners": 256,
   "yield": 4.13
+ },
+ {
+  "rom": "Pokemon Stadium (France).z64",
+  "banks": 1,
+  "sites": 137,
+  "owners": 562,
+  "yield": 4.1
+ },
+ {
+  "rom": "Bomberman Hero (Europe).z64",
+  "banks": 1,
+  "sites": 82,
+  "owners": 335,
+  "yield": 4.09
+ },
+ {
+  "rom": "Viewpoint 2064 (USA) (Unreleased).z64",
+  "banks": 1,
+  "sites": 37,
+  "owners": 151,
+  "yield": 4.08
+ },
+ {
+  "rom": "Forsaken 64 (USA).z64",
+  "banks": 1,
+  "sites": 46,
+  "owners": 185,
+  "yield": 4.02
  },
  {
   "rom": "FIFA Soccer 64 (USA) (En,Fr,De).z64",
@@ -651,11 +861,39 @@
   "yield": 4.0
  },
  {
+  "rom": "Mike Piazza's StrikeZone (USA).z64",
+  "banks": 1,
+  "sites": 91,
+  "owners": 363,
+  "yield": 3.99
+ },
+ {
   "rom": "Tom Clancy's Rainbow Six (France).z64",
   "banks": 1,
   "sites": 67,
   "owners": 261,
   "yield": 3.9
+ },
+ {
+  "rom": "Penny Racers (USA).z64",
+  "banks": 1,
+  "sites": 28,
+  "owners": 109,
+  "yield": 3.89
+ },
+ {
+  "rom": "Hybrid Heaven (USA).z64",
+  "banks": 1,
+  "sites": 47,
+  "owners": 182,
+  "yield": 3.87
+ },
+ {
+  "rom": "Razor Freestyle Scooter (USA).z64",
+  "banks": 1,
+  "sites": 63,
+  "owners": 244,
+  "yield": 3.87
  },
  {
   "rom": "Tarzan (France).z64",
@@ -672,6 +910,20 @@
   "yield": 3.74
  },
  {
+  "rom": "Snowboard Kids 2 (USA).z64",
+  "banks": 1,
+  "sites": 42,
+  "owners": 154,
+  "yield": 3.67
+ },
+ {
+  "rom": "Robotron 64 (USA).z64",
+  "banks": 1,
+  "sites": 112,
+  "owners": 409,
+  "yield": 3.65
+ },
+ {
   "rom": "Snowboard Kids (USA).z64",
   "banks": 1,
   "sites": 63,
@@ -686,10 +938,24 @@
   "yield": 3.61
  },
  {
+  "rom": "Dark Rift (USA).z64",
+  "banks": 1,
+  "sites": 42,
+  "owners": 151,
+  "yield": 3.6
+ },
+ {
   "rom": "Hercules - The Legendary Journeys (Europe) (En,Fr,De,Es,It,Nl).z64",
   "banks": 1,
   "sites": 97,
   "owners": 349,
+  "yield": 3.6
+ },
+ {
+  "rom": "NBA Showtime - NBA on NBC (USA).z64",
+  "banks": 1,
+  "sites": 65,
+  "owners": 234,
   "yield": 3.6
  },
  {
@@ -698,6 +964,13 @@
   "sites": 81,
   "owners": 290,
   "yield": 3.58
+ },
+ {
+  "rom": "NBA Hangtime (USA).z64",
+  "banks": 1,
+  "sites": 101,
+  "owners": 361,
+  "yield": 3.57
  },
  {
   "rom": "Top Gear Rally (USA).z64",
@@ -714,13 +987,6 @@
   "yield": 3.53
  },
  {
-  "rom": "NBA Jam 99 (USA).z64",
-  "banks": 1,
-  "sites": 2,
-  "owners": 7,
-  "yield": 3.5
- },
- {
   "rom": "Battlezone - Rise of the Black Dogs (USA).z64",
   "banks": 1,
   "sites": 51,
@@ -732,6 +998,13 @@
   "banks": 1,
   "sites": 81,
   "owners": 277,
+  "yield": 3.42
+ },
+ {
+  "rom": "NHL Breakaway 99 (USA).z64",
+  "banks": 1,
+  "sites": 66,
+  "owners": 226,
   "yield": 3.42
  },
  {
@@ -747,6 +1020,20 @@
   "sites": 88,
   "owners": 295,
   "yield": 3.35
+ },
+ {
+  "rom": "Off Road Challenge (USA).z64",
+  "banks": 1,
+  "sites": 66,
+  "owners": 219,
+  "yield": 3.32
+ },
+ {
+  "rom": "Charlie Blast's Territory (USA).z64",
+  "banks": 1,
+  "sites": 68,
+  "owners": 225,
+  "yield": 3.31
  },
  {
   "rom": "Indy Racing 2000 (USA).z64",
@@ -777,6 +1064,13 @@
   "yield": 2.97
  },
  {
+  "rom": "Batman of the Future - Return of the Joker (Europe) (En,Fr,De).z64",
+  "banks": 1,
+  "sites": 75,
+  "owners": 220,
+  "yield": 2.93
+ },
+ {
   "rom": "Brunswick Circuit Pro Bowling (USA).z64",
   "banks": 1,
   "sites": 142,
@@ -791,11 +1085,18 @@
   "yield": 2.91
  },
  {
-  "rom": "Ogre Battle 64 - Person of Lordly Caliber (USA) (Rev A).z64",
+  "rom": "Top Gear Overdrive (USA).z64",
   "banks": 1,
-  "sites": 56,
-  "owners": 163,
-  "yield": 2.91
+  "sites": 72,
+  "owners": 208,
+  "yield": 2.89
+ },
+ {
+  "rom": "International Superstar Soccer 64 (USA).z64",
+  "banks": 1,
+  "sites": 95,
+  "owners": 274,
+  "yield": 2.88
  },
  {
   "rom": "Chameleon Twist (USA) (Rev A).z64",
@@ -812,11 +1113,32 @@
   "yield": 2.74
  },
  {
+  "rom": "Virtual Pro Wrestling 2 - Oudou Keishou (Japan).z64",
+  "banks": 5,
+  "sites": 65,
+  "owners": 173,
+  "yield": 2.66
+ },
+ {
   "rom": "Dinomod_Enhanced_2022-09-08.z64",
   "banks": 1,
   "sites": 219,
   "owners": 548,
   "yield": 2.5
+ },
+ {
+  "rom": "WWF WrestleMania 2000 (USA).z64",
+  "banks": 5,
+  "sites": 68,
+  "owners": 164,
+  "yield": 2.41
+ },
+ {
+  "rom": "Rugrats in Paris - The Movie (Europe).z64",
+  "banks": 1,
+  "sites": 120,
+  "owners": 286,
+  "yield": 2.38
  },
  {
   "rom": "Yoshi's Story (Europe) (En,Fr,De).z64",
@@ -840,13 +1162,6 @@
   "yield": 2.35
  },
  {
-  "rom": "NBA Jam 2000 (USA).z64",
-  "banks": 1,
-  "sites": 3,
-  "owners": 7,
-  "yield": 2.33
- },
- {
   "rom": "Blues Brothers 2000 (Europe) (En,Fr,De,Es,It,Nl).z64",
   "banks": 1,
   "sites": 137,
@@ -868,18 +1183,18 @@
   "yield": 2.15
  },
  {
+  "rom": "WWF No Mercy (USA) (Rev A).z64",
+  "banks": 6,
+  "sites": 81,
+  "owners": 169,
+  "yield": 2.09
+ },
+ {
   "rom": "Goemon's Great Adventure (USA).z64",
   "banks": 1,
   "sites": 85,
   "owners": 175,
   "yield": 2.06
- },
- {
-  "rom": "Ms. Pac-Man - Maze Madness (USA).z64",
-  "banks": 1,
-  "sites": 1,
-  "owners": 2,
-  "yield": 2.0
  },
  {
   "rom": "San Francisco Rush 2049 (USA).z64",
@@ -889,11 +1204,25 @@
   "yield": 1.96
  },
  {
+  "rom": "California Speed (USA).z64",
+  "banks": 1,
+  "sites": 39,
+  "owners": 74,
+  "yield": 1.9
+ },
+ {
   "rom": "NHL Blades of Steel '99 (USA).z64",
   "banks": 4,
   "sites": 77,
   "owners": 146,
   "yield": 1.9
+ },
+ {
+  "rom": "Puyo Puyo 4 - Puyo Puyon Party (Japan).z64",
+  "banks": 1,
+  "sites": 109,
+  "owners": 201,
+  "yield": 1.84
  },
  {
   "rom": "Mortal Kombat Trilogy (USA) (Rev A).z64",
@@ -903,18 +1232,32 @@
   "yield": 1.77
  },
  {
-  "rom": "Ken Griffey Jr.'s Slugfest (USA).z64",
+  "rom": "Pokemon Snap (France).z64",
+  "banks": 13,
+  "sites": 124,
+  "owners": 220,
+  "yield": 1.77
+ },
+ {
+  "rom": "Pilotwings 64 (Europe) (En,Fr,De).z64",
   "banks": 1,
-  "sites": 10,
-  "owners": 17,
-  "yield": 1.7
+  "sites": 51,
+  "owners": 90,
+  "yield": 1.76
+ },
+ {
+  "rom": "Magical Tetris Challenge (USA).z64",
+  "banks": 1,
+  "sites": 98,
+  "owners": 165,
+  "yield": 1.68
  },
  {
   "rom": "Deadly Arts (USA).z64",
   "banks": 12,
-  "sites": 86,
+  "sites": 84,
   "owners": 133,
-  "yield": 1.55
+  "yield": 1.58
  },
  {
   "rom": "Knockout Kings 2000 (USA).z64",
@@ -924,6 +1267,13 @@
   "yield": 1.53
  },
  {
+  "rom": "Kirby 64 - The Crystal Shards (Europe).z64",
+  "banks": 10,
+  "sites": 132,
+  "owners": 194,
+  "yield": 1.47
+ },
+ {
   "rom": "PGA European Tour (USA).z64",
   "banks": 1,
   "sites": 227,
@@ -931,17 +1281,24 @@
   "yield": 1.42
  },
  {
-  "rom": "Mario Kart 64 (Europe) (Rev A).z64",
+  "rom": "Twisted Edge - Extreme Snowboarding (USA).z64",
   "banks": 1,
-  "sites": 17,
-  "owners": 22,
-  "yield": 1.29
+  "sites": 69,
+  "owners": 93,
+  "yield": 1.35
  },
  {
-  "rom": "Tony Hawk's Pro Skater (USA) (Rev A).z64",
+  "rom": "StarCraft 64 (USA).z64",
   "banks": 1,
-  "sites": 19,
-  "owners": 24,
+  "sites": 124,
+  "owners": 163,
+  "yield": 1.31
+ },
+ {
+  "rom": "Ogre Battle 64 - Person of Lordly Caliber (USA) (Rev A).z64",
+  "banks": 15,
+  "sites": 148,
+  "owners": 187,
   "yield": 1.26
  },
  {
@@ -987,13 +1344,6 @@
   "yield": 1.12
  },
  {
-  "rom": "Tony Hawk's Pro Skater 2 (USA).z64",
-  "banks": 1,
-  "sites": 21,
-  "owners": 23,
-  "yield": 1.1
- },
- {
   "rom": "Star Wars - Rogue Squadron (Europe) (En,Fr,De) (Rev A).z64",
   "banks": 1,
   "sites": 124,
@@ -1015,6 +1365,13 @@
   "yield": 1.06
  },
  {
+  "rom": "Polaris SnoCross (USA).z64",
+  "banks": 1,
+  "sites": 127,
+  "owners": 129,
+  "yield": 1.02
+ },
+ {
   "rom": "Paper Mario (Europe) (En,Fr,De,Es).z64",
   "banks": 165,
   "sites": 114,
@@ -1029,10 +1386,24 @@
   "yield": 0.98
  },
  {
-  "rom": "Spider-Man (USA).z64",
+  "rom": "1080 TenEighty Snowboarding (Japan, USA) (En,Ja).z64",
   "banks": 1,
-  "sites": 30,
-  "owners": 26,
+  "sites": 18,
+  "owners": 17,
+  "yield": 0.94
+ },
+ {
+  "rom": "Nuclear Strike 64 (USA).z64",
+  "banks": 1,
+  "sites": 276,
+  "owners": 250,
+  "yield": 0.91
+ },
+ {
+  "rom": "Command & Conquer (Europe) (En,Fr).z64",
+  "banks": 1,
+  "sites": 768,
+  "owners": 665,
   "yield": 0.87
  },
  {
@@ -1050,25 +1421,11 @@
   "yield": 0.77
  },
  {
-  "rom": "Jet Force Gemini (Europe) (En,Fr,De,Es).z64",
-  "banks": 1,
-  "sites": 30,
-  "owners": 23,
-  "yield": 0.77
- },
- {
   "rom": "Rocket - Robot on Wheels (USA).z64",
   "banks": 1,
   "sites": 493,
   "owners": 376,
   "yield": 0.76
- },
- {
-  "rom": "Mickey's Speedway USA (Europe) (En,Fr,De,Es,It).z64",
-  "banks": 1,
-  "sites": 30,
-  "owners": 22,
-  "yield": 0.73
  },
  {
   "rom": "Beetle Adventure Racing! (USA) (En,Fr,De).z64",
@@ -1099,24 +1456,45 @@
   "yield": 0.66
  },
  {
-  "rom": "World Cup 98 (USA) (En,Fr,De,Es,It,Nl,Sv,Da).z64",
-  "banks": 1,
-  "sites": 20,
-  "owners": 12,
-  "yield": 0.6
+  "rom": "Mario Party 3 (Europe) (En,Fr,De,Es).z64",
+  "banks": 119,
+  "sites": 243,
+  "owners": 152,
+  "yield": 0.63
  },
  {
-  "rom": "FIFA 99 (USA) (En,Fr,De,Es,It,Nl,Pt,Sv).z64",
+  "rom": "NHL 99 (USA).z64",
   "banks": 1,
-  "sites": 20,
-  "owners": 11,
-  "yield": 0.55
+  "sites": 16,
+  "owners": 10,
+  "yield": 0.62
  },
  {
-  "rom": "Monster Truck Madness 64 (USA).z64",
+  "rom": "F-1 World Grand Prix (France).z64",
   "banks": 1,
-  "sites": 39,
-  "owners": 19,
+  "sites": 196,
+  "owners": 109,
+  "yield": 0.56
+ },
+ {
+  "rom": "Supercross 2000 (USA).z64",
+  "banks": 1,
+  "sites": 16,
+  "owners": 9,
+  "yield": 0.56
+ },
+ {
+  "rom": "Bust-A-Move 2 - Arcade Edition (USA).z64",
+  "banks": 1,
+  "sites": 682,
+  "owners": 361,
+  "yield": 0.53
+ },
+ {
+  "rom": "International Track & Field 2000 (USA).z64",
+  "banks": 1,
+  "sites": 80,
+  "owners": 39,
   "yield": 0.49
  },
  {
@@ -1124,6 +1502,13 @@
   "banks": 1,
   "sites": 78,
   "owners": 35,
+  "yield": 0.45
+ },
+ {
+  "rom": "Super Smash Bros. (Europe) (En,Fr,De).z64",
+  "banks": 85,
+  "sites": 424,
+  "owners": 191,
   "yield": 0.45
  },
  {
@@ -1141,32 +1526,11 @@
   "yield": 0.4
  },
  {
-  "rom": "South Park (Europe) (En,Fr,Es).z64",
-  "banks": 1,
-  "sites": 5,
-  "owners": 2,
-  "yield": 0.4
- },
- {
-  "rom": "Turok - Rage Wars (Europe) (En,Fr,It).z64",
-  "banks": 1,
-  "sites": 5,
-  "owners": 2,
-  "yield": 0.4
- },
- {
   "rom": "Transformers - Beast Wars Transmetals (USA).z64",
   "banks": 1,
   "sites": 457,
   "owners": 180,
   "yield": 0.39
- },
- {
-  "rom": "Armorines - Project S.W.A.R.M. (USA).z64",
-  "banks": 1,
-  "sites": 3,
-  "owners": 1,
-  "yield": 0.33
  },
  {
   "rom": "Castlevania - Legacy of Darkness (Europe) (En,Fr,De).z64",
@@ -1176,18 +1540,25 @@
   "yield": 0.33
  },
  {
-  "rom": "Super Mario 64 (USA).z64",
+  "rom": "Triple Play 2000 (USA).z64",
   "banks": 1,
-  "sites": 76,
-  "owners": 24,
-  "yield": 0.32
+  "sites": 95,
+  "owners": 25,
+  "yield": 0.26
  },
  {
-  "rom": "Super Mario 64 (Europe) (En,Fr,De).z64",
+  "rom": "Castlevania (Europe) (En,Fr,De).z64",
+  "banks": 4,
+  "sites": 723,
+  "owners": 181,
+  "yield": 0.25
+ },
+ {
+  "rom": "Mischief Makers (USA) (Rev A).z64",
   "banks": 1,
-  "sites": 78,
-  "owners": 21,
-  "yield": 0.27
+  "sites": 156,
+  "owners": 37,
+  "yield": 0.24
  },
  {
   "rom": "Legend of Zelda, The - Majora's Mask (Europe) (En,Fr,De,Es) (Rev A).z64",
@@ -1211,25 +1582,18 @@
   "yield": 0.2
  },
  {
-  "rom": "WCW Backstage Assault (USA).z64",
-  "banks": 1,
-  "sites": 175,
-  "owners": 33,
+  "rom": "Mega Man 64 (USA).z64",
+  "banks": 28,
+  "sites": 882,
+  "owners": 168,
   "yield": 0.19
  },
  {
-  "rom": "NBA Live 99 (USA) (En,Fr,De,Es,It).z64",
+  "rom": "Paperboy (USA).z64",
   "banks": 1,
-  "sites": 154,
-  "owners": 24,
-  "yield": 0.16
- },
- {
-  "rom": "WCW Mayhem (USA).z64",
-  "banks": 1,
-  "sites": 175,
-  "owners": 25,
-  "yield": 0.14
+  "sites": 1047,
+  "owners": 177,
+  "yield": 0.17
  },
  {
   "rom": "Legend of Zelda, The - Ocarina of Time (Europe) (En,Fr,De) (Rev A).z64",
@@ -1244,19 +1608,5 @@
   "sites": 832,
   "owners": 60,
   "yield": 0.07
- },
- {
-  "rom": "Virtual Pro Wrestling 2 - Oudou Keishou (Japan).z64",
-  "banks": 5,
-  "sites": 65,
-  "owners": 4,
-  "yield": 0.06
- },
- {
-  "rom": "Kirby 64 - The Crystal Shards (Europe).z64",
-  "banks": 10,
-  "sites": 132,
-  "owners": 3,
-  "yield": 0.02
  }
 ]
