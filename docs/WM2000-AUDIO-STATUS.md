@@ -61,13 +61,63 @@ match against Revenge's `revenge_audio.toml`).
 The harness now executes admitted live IMEM through fn64's clean-room RSP
 interpreter. Remaining work is evidence and performance:
 
+One guarded private-input diagnostic on 2026-08-02 ran 100,000 scheduler
+steps through live-image LLE and completed 985 audio tasks. Its AI boundary
+received 984 buffers / 1,031,872 samples, including 459,481 nonzero samples
+in the range -13,904..=13,463. All 984 buffers reached the live cpal backend;
+the device rejected 28,800 Hz, opened at 48,000 Hz with band-limited
+resampling, and its callback ran. Peak guarded RSS was 788 MiB.
+
+That is one diagnostic run, not repeat evidence. The unpaced headless producer
+overflowed cpal's bounded 250 ms ring, so it proves live custom-ucode → AI →
+backend transport and nonzero signal but not uninterrupted audible output.
+One follow-up at the same 100,000-step horizon used
+`FN64_AUDIO_PACE=1`, held the host-only queue to at most 6,000 frames, emitted
+no overflow diagnostic, and drained the queue before process exit. It retained
+the same task/buffer/sample/nonzero/range totals and peaked at 782 MiB guarded
+RSS. A health-instrumented repetition showed that the reference software
+renderer, not audio synthesis or CoreAudio callback scheduling, still starved
+the integrated loop: 28.086 of 30.087 executor seconds were graphics work,
+with 1,855,348 underrun samples and zero late callbacks.
+
+An explicit audio-isolation run selected `GraphicsTaskExecutionPolicy::DiagnosticSkip`
+while retaining live-IMEM LLE audio. It reproduced all 985 audio tasks and the
+same AI sample totals, reported zero active-window underruns and zero late
+callbacks, and reduced executor work to 1.355 seconds. Its 884 additional
+silence samples occurred only after the measured window while draining the
+partial terminal callback. This is a subsystem diagnostic, not graphics or
+release evidence.
+
+A native sample attributed 5,046 of 6,615 main-thread samples to raw-RDP
+processing; triangle rasterization and texture sampling dominated. The
+reference sampler was reading and filtering the adjacent tile even when LOD
+was disabled and the combiner did not select `TEXEL1`. Reusing `TEXEL0` in
+that no-consumer case reduced the same audio-disabled 100,000-step workload's
+graphics time from 20.921 to 14.815 seconds (29.2%) and executor time from
+22.012 to 15.767 seconds (28.4%), with identical step, task, and AI totals.
+The focused no-unused-tile-read regression passed 10/10 guarded runs. The
+optimized reference lane still burst-starved integrated playback: one paced
+run reported 453,492 active-window underrun samples.
+
+The intended interactive RT64/LLE lane completed the same paced horizon with
+zero active-window underruns, zero late callbacks, 2.920 seconds of graphics
+work, and the same AI totals. Its only 884 silence samples were again the
+labeled terminal partial-buffer drain. This is one guarded diagnostic run,
+not repeated release evidence.
+The native-C game lane also retains callable empty bodies, and this run used
+the harness's documented diagnostic voice-map virgin-memory intervention;
+neither condition is release authority. A standalone replay of the first
+captured task hit its 2,000,000-step cap; `rsp_trace` labels that cap
+`UnhandledResumeTarget`, so the dump did not independently close the task.
+
 1. Run repeated content-bound WM2000 tasks through live-IMEM LLE and retain
    fixed-cycle framebuffer/audio/device/memory evidence.
 2. Verify every exercised AKI RSP operation and loud unsupported frontier.
 3. Compare any optional translated artifact against the live-IMEM baseline;
    it remains diagnostic evidence, not release authority.
-4. Confirm WM2000 menu music / SFX is audible through the already-live cpal
-   path; add decode/resample/envmix unit vectors.
+4. Repeat the integrated paced RT64/LLE horizon to the ten-run deterministic
+   bar with zero active-window underruns; the current listener evidence is one
+   run. Add decode/resample/envmix unit vectors.
 
 ## Clean-room boundary (unchanged, still binding)
 

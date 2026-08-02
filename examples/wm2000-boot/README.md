@@ -78,6 +78,20 @@ the transactional LLE fallback, not a claim that WM2000 executed in HLE.
    an invalid foreign-frame unwind; renderer/audio owners and ordinary Rust
    values then receive normal process teardown.
 
+The harness registers its complete RDRAM allocation at the AI output boundary
+and reports buffer/sample/nonzero/range counts at exit. It opens the default
+cpal device when available; set `FN64_NO_AUDIO=1` for a headless run. Set
+`FN64_DUMP_AUDIO_STREAM_PCM=/private/path/stream.pcm` to retain private
+pre-resample stereo `s16le` for a bounded audio validation.
+The boot loop normally runs faster than wall time and may deliberately skip
+old samples at cpal's bounded latency cap. Set `FN64_AUDIO_PACE=1` for an
+audible diagnostic: the harness holds the host-only queue near 125 ms and
+drains it before exit without changing guest virtual time. Release evidence
+rejects this wall-clock mode. For audio-only diagnosis, additionally set
+`FN64_AUDIO_VALIDATION_SKIP_GRAPHICS=1`; this selects the ABI's explicit
+`DiagnosticSkip` graphics policy while retaining live-IMEM LLE audio. It is
+mutually exclusive with `WM2000_GRAPHICS_POLICY` and rejected in release mode.
+
 `WM2000_NO_DUMP=1` disables PNG output and normally skips RT64 readback setup.
 `WM2000_NO_TRACE=1` also disables PNGs for throughput measurements. Add
 `WM2000_RT64_CAPTURE=1` to either configuration to retain the fenced post-VI

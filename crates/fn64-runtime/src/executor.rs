@@ -580,6 +580,13 @@ impl Executor {
         self.cp0_count
     }
 
+    /// Half-rate phase paired with [`Self::cp0_count`]. Zero means the next
+    /// CPU cycle does not advance Count; one means it completes the pending
+    /// two-cycle Count interval.
+    pub fn cp0_count_phase(&self) -> u8 {
+        self.cp0_count_phase
+    }
+
     pub fn set_cp0_count(&mut self, count: u32) {
         self.cp0_count = count;
         self.cp0_count_phase = 0;
@@ -1947,12 +1954,15 @@ mod tests {
 
         exec.advance_time(1);
         assert_eq!(exec.cp0_count(), 0xFFFF_FFFE);
+        assert_eq!(exec.cp0_count_phase(), 1);
         assert!(!exec.cp0_timer_pending());
         exec.advance_time(2);
         assert_eq!(exec.cp0_count(), 0xFFFF_FFFF);
+        assert_eq!(exec.cp0_count_phase(), 0);
         assert!(!exec.cp0_timer_pending());
         exec.advance_time(4);
         assert_eq!(exec.cp0_count(), 0);
+        assert_eq!(exec.cp0_count_phase(), 0);
         assert!(exec.cp0_timer_pending());
 
         exec.write_cp0_compare(0x1234_5678);

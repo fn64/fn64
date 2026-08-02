@@ -8987,14 +8987,15 @@ fn run_block_program(
         // Count and latches Compare/IP7 -> coroutine resume -> this sample ->
         // exception entry before the resumed guest block. Sampling after
         // dispatch would allow that block to run once with an overdue timer.
-        let (count, compare, timer_pending) = with_executor(|executor| {
+        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
             (
                 executor.cp0_count(),
+                executor.cp0_count_phase(),
                 executor.cp0_compare(),
                 executor.cp0_timer_pending(),
             )
         });
-        ctx.synchronize_cop0_timing(count, compare);
+        ctx.synchronize_cop0_timing(count, count_phase, compare);
         CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
         CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
         if let Some(vector) = enter_pending_interrupt(ctx, entry.pc) {
@@ -9689,14 +9690,15 @@ fn run_catalog_block_program_dynamic(
     loop {
         live.reconcile_before_dispatch(mem);
         let current = target.key();
-        let (count, compare, timer_pending) = with_executor(|executor| {
+        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
             (
                 executor.cp0_count(),
+                executor.cp0_count_phase(),
                 executor.cp0_compare(),
                 executor.cp0_timer_pending(),
             )
         });
-        ctx.synchronize_cop0_timing(count, compare);
+        ctx.synchronize_cop0_timing(count, count_phase, compare);
         CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
         CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
         if let Some(vector) = enter_pending_interrupt(ctx, current.pc) {
@@ -9850,14 +9852,15 @@ fn run_catalog_block_program(
         .unwrap_or_else(|error| recompiled_gap_panic(error));
     loop {
         live.reconcile_before_dispatch(mem);
-        let (count, compare, timer_pending) = with_executor(|executor| {
+        let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
             (
                 executor.cp0_count(),
+                executor.cp0_count_phase(),
                 executor.cp0_compare(),
                 executor.cp0_timer_pending(),
             )
         });
-        ctx.synchronize_cop0_timing(count, compare);
+        ctx.synchronize_cop0_timing(count, count_phase, compare);
         CpuInterruptLine::TIMER.set_level(ctx, timer_pending);
         CpuInterruptLine::RCP.set_level(ctx, crate::pi::cpu_interrupt_pending());
         if let Some(vector) = enter_pending_interrupt(ctx, entry.pc) {

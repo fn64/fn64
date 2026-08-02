@@ -2114,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn mid_block_mfc0_count_sees_interior_retired_delta_without_double_counting_at_the_boundary() {
+    fn mid_block_mfc0_count_sees_live_phase_and_interior_delta_without_double_counting() {
         // Three MFC0 $9 reads inside ONE block, at retired-instruction
         // offsets 0, 5, and 10 (four NOPs between each), then `jr $ra`. Gap 2:
         // Count is normally synchronized only at block/checkpoint boundaries
@@ -2144,7 +2144,7 @@ mod tests {
         // Simulate the block-entry boundary sync: the live executor's
         // authoritative Count at the moment this block was dispatched.
         const ENTRY_COUNT: u32 = 1_000;
-        ctx.synchronize_cop0_timing(ENTRY_COUNT, 0);
+        ctx.synchronize_cop0_timing(ENTRY_COUNT, 0, 0);
 
         let result = run(&catalog, VA, words.len() as u32, &mut ctx).unwrap();
         assert_eq!(result.instructions, words.len() as u32);
@@ -2201,6 +2201,19 @@ mod tests {
             "the boundary must not re-sum the three interior deltas on top \
              of its own advance"
         );
+
+        // An odd phase at entry completes a Count interval after the first
+        // retired instruction. This state was previously lost at the live
+        // executor -> block-context boundary.
+        let mut odd_phase_ctx = RecompContext::new();
+        odd_phase_ctx.set_r(31, 0x8000_9000);
+        odd_phase_ctx.synchronize_cop0_timing(ENTRY_COUNT, 1, 0);
+        let odd_phase_result = run(&catalog, VA, words.len() as u32, &mut odd_phase_ctx).unwrap();
+        assert_eq!(odd_phase_result.instructions, words.len() as u32);
+        assert_eq!(odd_phase_ctx.r_u32(8), ENTRY_COUNT);
+        assert_eq!(odd_phase_ctx.r_u32(9), ENTRY_COUNT + (1 + 5) / 2);
+        assert_eq!(odd_phase_ctx.r_u32(10), ENTRY_COUNT + (1 + 10) / 2);
+        assert_eq!(odd_phase_ctx.cop0_count, ENTRY_COUNT);
     }
 
     /// ERET (COP0 function 0x18): `eret`.

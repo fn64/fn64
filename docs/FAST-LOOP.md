@@ -795,6 +795,17 @@ ffmpeg -f s16le -ar 32006 -ac 2 -i /tmp/fn64-guest.pcm \
 If the WAV is clean while live output buzzes, the host resampler is the fault;
 if both buzz, continue upstream at AI decoding/RSP synthesis.
 
+The OoT boot harness normally keeps both graphics and audio on `LleAccuracy`
+because it is also a release/parity runner. If an unrelated graphics-LLE
+frontier prevents a bounded audio-only validation from reaching later AI
+buffers, set `FN64_AUDIO_VALIDATION_SKIP_GRAPHICS=1`. This explicitly skips
+the graphics microcode phase, synthesizes the DP FullSync completion required
+to advance the game scheduler, and leaves audio on live-image LLE. The harness
+rejects that setting in every release or discovery mode, labels it in stdout,
+and does not permit the result to claim graphics or whole-run parity.
+The `examples/oot-boot/oot run` wrapper propagates the boot process's failure
+status even though its output is filtered.
+
 For task-level RSP replay, set `FN64_DUMP_AUDIO_TASK=/tmp/fn64-task.rdram`.
 By default this captures the first submitted audio task; use one-based
 `FN64_DUMP_AUDIO_TASK_INDEX=N` to capture the task aligned with a later audible

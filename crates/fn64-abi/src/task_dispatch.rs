@@ -1272,6 +1272,11 @@ pub enum GraphicsTaskExecutionPolicy {
     HleOptimized,
     /// Execute every loaded graphics microcode instruction through LLE.
     LleAccuracy,
+    /// Execute rspboot, then skip the graphics microcode phase explicitly and
+    /// synthesize its DP FullSync completion so the game scheduler can advance.
+    /// This exists only to isolate non-graphics subsystem diagnostics; release
+    /// evidence rejects it.
+    DiagnosticSkip,
 }
 
 /// Installed-ROM executor for admitted `M_AUDTASK` microcode.
@@ -4738,10 +4743,13 @@ pub unsafe extern "C" fn osSpTaskStartGo_recomp(rdram: *mut u8, ctx: *mut Recomp
     let hle_compatibility_state = hle_entry
         .as_ref()
         .and_then(AdmittedHleEntry::hle_compatibility_state);
-    let dp_full_sync = if is_gfx
-        && GRAPHICS_TASK_EXECUTION_POLICY.with(Cell::get)
-            == GraphicsTaskExecutionPolicy::LleAccuracy
-    {
+    let graphics_policy = GRAPHICS_TASK_EXECUTION_POLICY.with(Cell::get);
+    let diagnostic_full_sync = is_gfx
+        .then(|| diagnostic_graphics_dp_full_sync(graphics_policy))
+        .flatten();
+    let dp_full_sync = if let Some(full_sync) = diagnostic_full_sync {
+        full_sync
+    } else if is_gfx && graphics_policy == GraphicsTaskExecutionPolicy::LleAccuracy {
         let entry = hle_entry
             .take()
             .expect("gfx accuracy LLE requires an admitted HLE entry");
@@ -4981,6 +4989,13 @@ fn rcp_completion_plan(
     }
 }
 
+fn diagnostic_graphics_dp_full_sync(
+    policy: GraphicsTaskExecutionPolicy,
+) -> Option<fn64_render::DpFullSyncStatus> {
+    (policy == GraphicsTaskExecutionPolicy::DiagnosticSkip)
+        .then_some(fn64_render::DpFullSyncStatus::Reached)
+}
+
 /// `osSpTaskYield(void)` -- signals the RSP to yield its current task back
 /// to the CPU, returning immediately (asynchronous request, not a
 /// blocking wait -- `osSpTaskYielded` is the separate poll/wait-for-
@@ -5033,6 +5048,26 @@ mod tests {
     use fn64_render::{FrameStatus, RenderConfig, RenderError, UcodeId};
     use fn64_runtime::RecvMesgOutcome;
     use std::rc::Rc;
+
+    #[test]
+    fn diagnostic_graphics_skip_advances_the_sp_then_dp_scheduler() {
+        let full_sync =
+            diagnostic_graphics_dp_full_sync(GraphicsTaskExecutionPolicy::DiagnosticSkip)
+                .expect("diagnostic skip must publish its synthetic completion");
+        assert_eq!(full_sync, fn64_render::DpFullSyncStatus::Reached);
+        assert_eq!(
+            rcp_completion_plan(full_sync, "diagnostic graphics skip"),
+            fn64_runtime::RcpTaskCompletionPlan::SpThenDpFullSync
+        );
+        assert_eq!(
+            diagnostic_graphics_dp_full_sync(GraphicsTaskExecutionPolicy::LleAccuracy),
+            None
+        );
+        assert_eq!(
+            diagnostic_graphics_dp_full_sync(GraphicsTaskExecutionPolicy::HleOptimized),
+            None
+        );
+    }
 
     fn install_running_task_lineage(
         task_addr: RdramAddr,
