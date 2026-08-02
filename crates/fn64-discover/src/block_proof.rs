@@ -127,11 +127,46 @@ pub struct ReachableCodeBlock {
     pub terminator: BlockTerminator,
 }
 
+/// A proven-code block in a proven-installed bank image, carrying no
+/// authoritative reachability claim.
+///
+/// Structurally [`ReachableCodeBlock`] minus `authoritative_roots` -- the
+/// field is absent rather than empty so the weaker claim cannot be mistaken
+/// for the stronger one by a consumer that forgets to check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledCodeBlock {
+    pub bank: String,
+    pub start_va: u32,
+    pub end_va: u32,
+    pub backing: BankBackingSpanV1,
+    pub terminator: BlockTerminator,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum BlockAssessment {
     Proven {
         block: ReachableCodeBlock,
+    },
+    /// Every requirement of [`Self::Proven`] except authoritative
+    /// reachability: the words are `ProvenCode`, the terminator is sound, and
+    /// exactly one proven bank-image subspan backs the bytes -- but no
+    /// independently authoritative root reaches the block.
+    ///
+    /// This is a strictly weaker claim than `block_aot` and is deliberately a
+    /// separate variant rather than a relaxation of it. It exists for banks
+    /// whose image is installed by a proven activation (an overlay DMA with
+    /// exact recovered geometry) and whose entry point is therefore never
+    /// named by any proven fact: the hardware installs the image, so the bytes
+    /// are genuinely resident code, but nothing proves where execution enters
+    /// them. Admitting these under `Proven` would silently redefine every
+    /// historical `block_aot` figure; keeping them separate preserves that
+    /// meaning while still allowing emission.
+    Installed {
+        block: InstalledCodeBlock,
+        /// Retained so the missing evidence stays visible in reports rather
+        /// than being erased by admission.
+        blockers: Vec<BlockProofBlocker>,
     },
     Candidate {
         start_va: u32,
@@ -146,6 +181,14 @@ pub struct BlockProofReport {
     pub assessments: Vec<BlockAssessment>,
     pub proven_blocks: u64,
     pub proven_bytes: u64,
+    /// Blocks admitted as [`BlockAssessment::Installed`]: proven-installed and
+    /// decoding as code, but with no authoritative reachability. Counted
+    /// separately so a consumer can never fold the weaker claim into
+    /// `proven_blocks`.
+    #[serde(default)]
+    pub installed_blocks: u64,
+    #[serde(default)]
+    pub installed_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -301,6 +344,16 @@ fn prove_reachable_blocks_inner(
     let mut assessments = Vec::with_capacity(cfg.blocks.len());
     let mut proven_blocks = 0;
     let mut proven_bytes = 0;
+    let mut installed_blocks = 0;
+    let mut installed_bytes = 0;
+    // A bank whose image a proven activation installs. Entry authority for
+    // such a bank is never established by any proven fact -- an overlay
+    // descriptor names where the image is placed, not where it is entered
+    // (measured: VPW2 overlay entry offsets are 0, 7, and 12 words past the
+    // load address, so no structural rule recovers them).
+    let bank_is_installed = !facts
+        .proven_activation_load_addresses(&cfg.bank)
+        .is_empty();
     for block in &cfg.blocks {
         let mut blockers = BTreeSet::new();
         if partition.bank != cfg.bank
@@ -378,6 +431,26 @@ fn prove_reachable_blocks_inner(
                     terminator: block.terminator.clone(),
                 },
             });
+        } else if bank_is_installed && only_reachability_blockers(&blockers) {
+            // Reachability is the ONLY thing missing, and the bank's image is
+            // installed by a proven activation. Every byte-level requirement
+            // -- ProvenCode words, sound terminator, unique proven backing --
+            // already held above, so the block is genuinely resident code
+            // whose entry point no proven fact names. Admitting it here keeps
+            // that distinction explicit instead of promoting it to Proven.
+            let backing = backing.expect("one backing when only reachability blocks");
+            installed_blocks += 1;
+            installed_bytes += u64::from(block.end_va - block.start_va);
+            assessments.push(BlockAssessment::Installed {
+                block: InstalledCodeBlock {
+                    bank: cfg.bank.clone(),
+                    start_va: block.start_va,
+                    end_va: block.end_va,
+                    backing,
+                    terminator: block.terminator.clone(),
+                },
+                blockers: blockers.into_iter().collect(),
+            });
         } else {
             assessments.push(BlockAssessment::Candidate {
                 start_va: block.start_va,
@@ -391,7 +464,28 @@ fn prove_reachable_blocks_inner(
         assessments,
         proven_blocks,
         proven_bytes,
+        installed_blocks,
+        installed_bytes,
     }
+}
+
+/// Whether every blocker is a missing-reachability finding.
+///
+/// These three are the only blockers a proven installation may waive: they all
+/// say "no authoritative root reaches this block", never "these bytes are not
+/// code". Any byte-level blocker -- `WordNotProvenCode`, `InvalidInstruction`,
+/// `MissingDelaySlot`, `RanOffEnd`, or any backing failure -- keeps the block a
+/// candidate, because installation says nothing about whether the words decode.
+fn only_reachability_blockers(blockers: &BTreeSet<BlockProofBlocker>) -> bool {
+    !blockers.is_empty()
+        && blockers.iter().all(|blocker| {
+            matches!(
+                blocker,
+                BlockProofBlocker::Unowned
+                    | BlockProofBlocker::EntryNotAuthoritative { .. }
+                    | BlockProofBlocker::NoAuthoritativeReachability { .. }
+            )
+        })
 }
 
 /// One executable interval derived from the union of reached proven-code
@@ -427,7 +521,12 @@ pub fn conclude_reached_executable_ranges(
         .iter()
         .filter_map(|assessment| match assessment {
             BlockAssessment::Proven { block } => Some((block.start_va, block.end_va)),
-            BlockAssessment::Candidate { .. } => None,
+            // Installed blocks are deliberately excluded. This function
+            // concludes `ExecutableRange` FACTS, which downstream passes read
+            // as authoritative reachability; admitting a block that carries no
+            // reachability claim would launder the weaker claim into the fact
+            // database and let it seed further proofs.
+            BlockAssessment::Installed { .. } | BlockAssessment::Candidate { .. } => None,
         })
         .collect();
     intervals.sort_unstable();
@@ -550,6 +649,8 @@ mod tests {
             assessments,
             proven_blocks,
             proven_bytes: 0,
+            installed_blocks: 0,
+            installed_bytes: 0,
         }
     }
 

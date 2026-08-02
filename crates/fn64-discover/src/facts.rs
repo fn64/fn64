@@ -1430,6 +1430,43 @@ impl FactDb {
             .collect()
     }
 
+    /// Load addresses this bank's own proven activation records name.
+    ///
+    /// An overlay bank's image is installed by a DMA the descriptor table
+    /// proves. That establishes the bytes as resident code, but NOT where
+    /// execution enters them: a descriptor names a destination extent, where
+    /// the ROM header names an entry point. Consumers must not treat a
+    /// nonempty result as entry authority.
+    ///
+    /// Only records cited by the bank's own `Proven` conclusion qualify, so a
+    /// candidate table can never make a bank look installed.
+    pub fn proven_activation_load_addresses(&self, bank: &str) -> Vec<u32> {
+        let mut addresses = BTreeSet::new();
+        for (index, fact) in self.facts.iter().enumerate() {
+            let Fact::LoadImageTableRecord {
+                bank: record_bank,
+                destination_space,
+                destination_start,
+                destination_end,
+                ..
+            } = fact
+            else {
+                continue;
+            };
+            if record_bank.as_deref() != Some(bank)
+                || *destination_space != MappingAddressSpace::Vram
+                || destination_end <= destination_start
+                || !destination_start.is_multiple_of(4)
+            {
+                continue;
+            }
+            if self.proven_bank_conclusion_cites(bank, index) {
+                addresses.insert(*destination_start);
+            }
+        }
+        addresses.into_iter().collect()
+    }
+
     fn proven_bank_conclusion_cites(&self, bank: &str, fact_index: usize) -> bool {
         self.conclusion(&format!("bank:{bank}"))
             .is_some_and(|conclusion| {

@@ -5,7 +5,8 @@
 //! evaluator receipt, and each block digest before exposing instruction words
 //! to a code generator.
 
-use crate::block_proof::{BlockAssessment, ReachableCodeBlock};
+use crate::block_proof::{BlockAssessment, InstalledCodeBlock, ReachableCodeBlock};
+use crate::cfg::BlockTerminator;
 use crate::cfg::WordClass;
 use crate::facts::{BankBackingSpanV1, FactDb, RomAddressSpace};
 use crate::materialized_image::{
@@ -369,19 +370,33 @@ fn emit_block_pack_from_snapshot(
     let mut materialized_cache = MaterializedBackingSpanCacheV1::default();
     for bank_snapshot in &snapshot.banks {
         let bank = &bank_snapshot.input.bank;
-        let mut proven: Vec<&ReachableCodeBlock> = bank_snapshot
-            .block_proof
-            .assessments
+        // Emission admits both claims. A `Proven` block is reachable from an
+        // authoritative root; an `Installed` block is proven-installed code
+        // whose entry no proven fact names (an overlay image the descriptor
+        // table proves is DMA'd in). Both are byte-identical proven code with
+        // a sound terminator and unique proven backing, which is everything
+        // emission itself requires -- the distinction is what the metadata
+        // claims about reachability, and it is preserved in `block_proof`'s
+        // own assessments and counters rather than erased here.
+        let mut proven: Vec<&ReachableCodeBlock> = Vec::new();
+        let mut installed: Vec<&InstalledCodeBlock> = Vec::new();
+        for assessment in &bank_snapshot.block_proof.assessments {
+            match assessment {
+                BlockAssessment::Proven { block } => proven.push(block),
+                BlockAssessment::Installed { block, .. } => installed.push(block),
+                BlockAssessment::Candidate { .. } => {}
+            }
+        }
+        let mut admitted: Vec<PackBlockView<'_>> = proven
             .iter()
-            .filter_map(|assessment| match assessment {
-                BlockAssessment::Proven { block } => Some(block),
-                BlockAssessment::Candidate { .. } => None,
-            })
+            .map(|block| PackBlockView::from(*block))
+            .chain(installed.iter().map(|block| PackBlockView::from(*block)))
             .collect();
-        proven.sort_by_key(|block| block.start_va);
-        if proven.is_empty() {
+        admitted.sort_by_key(|block| block.start_va);
+        if admitted.is_empty() {
             return Err(BlockPackError::NoProvenBlocks { bank: bank.clone() });
         }
+        let proven = admitted;
         let geometry = complete_severed_delay_slots(
             &proven,
             &bank_snapshot.closure.cfg.word_class,
@@ -1148,8 +1163,49 @@ struct CompletedGeometry {
 /// dropped. Re-attach exactly that one proven, unadmitted delay-slot word. The
 /// proof state and owner geometry remain unchanged; this only regroups already
 /// proven code for emission.
+/// The block geometry emission consumes, borrowed from either assessment
+/// kind.
+///
+/// `ReachableCodeBlock` additionally carries `authoritative_roots`, which no
+/// code on this path reads. Projecting to the shared fields lets an
+/// `InstalledCodeBlock` travel the same route without being converted into a
+/// `ReachableCodeBlock` -- a conversion that would require inventing
+/// reachability roots it does not have.
+#[derive(Clone, Copy)]
+struct PackBlockView<'a> {
+    bank: &'a str,
+    start_va: u32,
+    end_va: u32,
+    backing: &'a BankBackingSpanV1,
+    terminator: &'a BlockTerminator,
+}
+
+impl<'a> From<&'a ReachableCodeBlock> for PackBlockView<'a> {
+    fn from(block: &'a ReachableCodeBlock) -> Self {
+        Self {
+            bank: &block.bank,
+            start_va: block.start_va,
+            end_va: block.end_va,
+            backing: &block.backing,
+            terminator: &block.terminator,
+        }
+    }
+}
+
+impl<'a> From<&'a InstalledCodeBlock> for PackBlockView<'a> {
+    fn from(block: &'a InstalledCodeBlock) -> Self {
+        Self {
+            bank: &block.bank,
+            start_va: block.start_va,
+            end_va: block.end_va,
+            backing: &block.backing,
+            terminator: &block.terminator,
+        }
+    }
+}
+
 fn complete_severed_delay_slots(
-    blocks: &[&ReachableCodeBlock],
+    blocks: &[PackBlockView<'_>],
     word_class: &BTreeMap<u32, WordClass>,
     rom: &NormalizedRom,
     facts: &FactDb,
@@ -1174,12 +1230,12 @@ fn complete_severed_delay_slots(
                     .end_va
                     .checked_sub(4)
                     .ok_or_else(|| BlockPackError::InvalidGeometry {
-                        bank: block.bank.clone(),
+                        bank: block.bank.to_string(),
                         start_va: block.start_va,
                     })?;
             let last_backing = backing_last_word(&block.backing).ok_or_else(|| {
                 BlockPackError::InvalidGeometry {
-                    bank: block.bank.clone(),
+                    bank: block.bank.to_string(),
                     start_va: block.start_va,
                 }
             })?;
@@ -1197,7 +1253,7 @@ fn complete_severed_delay_slots(
                 last_bytes
                     .try_into()
                     .map_err(|_| BlockPackError::InvalidGeometry {
-                        bank: block.bank.clone(),
+                        bank: block.bank.to_string(),
                         start_va: block.start_va,
                     })?;
             let last_word_control =
@@ -1210,12 +1266,12 @@ fn complete_severed_delay_slots(
                     geom.end_va
                         .checked_add(4)
                         .ok_or_else(|| BlockPackError::InvalidGeometry {
-                            bank: block.bank.clone(),
+                            bank: block.bank.to_string(),
                             start_va: block.start_va,
                         })?;
                 extend_backing_end(&mut geom.backing, 4).ok_or_else(|| {
                     BlockPackError::InvalidGeometry {
-                        bank: block.bank.clone(),
+                        bank: block.bank.to_string(),
                         start_va: block.start_va,
                     }
                 })?;
@@ -1514,7 +1570,7 @@ mod tests {
             (ENTRY_PC + 8, WordClass::ProvenCode),
         ]);
         let geometry = complete_severed_delay_slots(
-            &[&control],
+            &[PackBlockView::from(&control)],
             &word_class,
             &rom,
             &crate::facts::FactDb::new(),
@@ -1546,7 +1602,7 @@ mod tests {
             .map(|index| (ENTRY_PC + index * 4, WordClass::ProvenCode))
             .collect();
         let geometry = complete_severed_delay_slots(
-            &[&control, &next],
+            &[PackBlockView::from(&control), PackBlockView::from(&next)],
             &word_class,
             &rom,
             &crate::facts::FactDb::new(),
@@ -1568,7 +1624,7 @@ mod tests {
             (ENTRY_PC + 8, WordClass::ProvenCode),
         ]);
         let geometry = complete_severed_delay_slots(
-            &[&control],
+            &[PackBlockView::from(&control)],
             &word_class,
             &rom,
             &crate::facts::FactDb::new(),
@@ -1604,7 +1660,7 @@ mod tests {
             (ENTRY_PC + 8, WordClass::ProvenCode),
         ]);
         let geometry = complete_severed_delay_slots(
-            &[&block],
+            &[PackBlockView::from(&block)],
             &word_class,
             &rom,
             &facts,
