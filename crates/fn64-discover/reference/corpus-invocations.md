@@ -133,6 +133,14 @@ FN64_DISCOVER_ROM=<roms>/mm-usa.z64 gate_rom_rebuild
 FN64_DISCOVER_ROM=<roms>/"Clay Fighter 63 1-3 (USA).z64" gate_rom_rebuild
 ```
 
+For corpus selection, set `FN64_REBUILD_REPORT` to retain each shortlisted
+ROM's content-free `fn64.rom-rebuild-report.v1` receipt, then pass every
+receipt back to `scripts/pick-novel-rom.py` with repeated `--rebuild-report`
+arguments and `--selection-output`. The selector refuses incomplete, failed,
+duplicate, or out-of-shortlist reports and ranks the complete set by absolute
+`roundtripped_code_bytes`; this is why Clay Fighter's 811,944 bytes win even
+though a smaller ROM can have a larger percentage.
+
 The gate exits nonzero unless every attempted region round-trips byte-exact
 AND the rebuilt image's sha256 equals the original's. Run it twice: the
 reports must be byte-identical (assembly_text_sha256 included).

@@ -12,10 +12,13 @@ Inputs (all produced by this repo's corpus tooling):
   frontier.jsonl  -- scripts/rom-frontier.py output (discovery outcomes)
   resweep.json    -- diagnose_open_indirects sweep (banks, open sites)
 
-Output: a ranked shortlist. The final pick is made by RUNNING
-gate_rom_rebuild on the shortlist and taking the highest measured
-roundtripped-code share -- the gate is the selector of record; this script
-only orders the queue.
+Output: a ranked shortlist. Pass one `--rebuild-report` per shortlisted ROM
+after running `gate_rom_rebuild` with `FN64_REBUILD_REPORT`; the final pick is
+then the successful report with the greatest absolute number of
+roundtripped-code bytes. Absolute coverage is the plan's leverage metric:
+it maximizes how much novel code the first proof actually exercises. The
+script refuses a partial report set so the selected target cannot be chosen
+post hoc.
 """
 
 import argparse
@@ -79,12 +82,94 @@ def known_project(name):
     return any(re.search(pattern, lowered) for pattern in KNOWN_PROJECT_PATTERNS)
 
 
+def select_from_rebuild_reports(shortlist, report_paths):
+    reports = {}
+    for path in report_paths:
+        with open(path) as report_file:
+            report = json.load(report_file)
+        if report.get("schema") != "fn64.rom-rebuild-report.v1":
+            raise ValueError(f"{path}: unsupported rebuild-report schema")
+        sha = report.get("normalized_rom_sha256", "")
+        if len(sha) != 64 or any(char not in "0123456789abcdef" for char in sha):
+            raise ValueError(f"{path}: invalid normalized_rom_sha256")
+        if sha in reports:
+            raise ValueError(f"{path}: duplicate rebuild report for {sha[:12]}")
+        classes = (
+            report.get("header_ipl3_bytes", -1)
+            + report.get("roundtripped_code_bytes", -1)
+            + report.get("opaque_bytes", -1)
+        )
+        if classes != report.get("rom_bytes"):
+            raise ValueError(f"{path}: physical byte classes do not cover the ROM")
+        if (
+            not report.get("digest_match")
+            or report.get("differences") != 0
+            or report.get("regions_exact") != report.get("regions_attempted")
+        ):
+            raise ValueError(f"{path}: rebuild gate did not pass exactly")
+        reports[sha] = report
+
+    matched = []
+    missing = []
+    for candidate in shortlist:
+        matches = [
+            report for sha, report in reports.items() if sha.startswith(candidate["sha"])
+        ]
+        if len(matches) != 1:
+            missing.append(candidate["sha"])
+            continue
+        matched.append((candidate, matches[0]))
+    if missing:
+        raise ValueError(
+            "rebuild reports must cover the complete shortlist; missing/ambiguous: "
+            + ", ".join(missing)
+        )
+    unused = set(reports) - {
+        report["normalized_rom_sha256"] for _, report in matched
+    }
+    if unused:
+        raise ValueError(
+            "rebuild reports include ROMs outside the shortlist: "
+            + ", ".join(sorted(sha[:12] for sha in unused))
+        )
+
+    candidate, report = min(
+        matched,
+        key=lambda item: (
+            -item[1]["roundtripped_code_bytes"],
+            item[1]["normalized_rom_sha256"],
+        ),
+    )
+    return {
+        "schema": "fn64.novel-rebuild-selection.v1",
+        "name": candidate["name"],
+        "normalized_rom_sha256": report["normalized_rom_sha256"],
+        "roundtripped_code_bytes": report["roundtripped_code_bytes"],
+        "rom_bytes": report["rom_bytes"],
+        "roundtripped_code_share": (
+            report["roundtripped_code_bytes"] / report["rom_bytes"]
+        ),
+        "shortlist_size": len(shortlist),
+        "metric": "max_absolute_roundtripped_code_bytes",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--roms", required=True, help="roms.jsonl from rom-catalog.py")
     parser.add_argument("--frontier", required=True, help="frontier.jsonl from rom-frontier.py")
     parser.add_argument("--resweep", required=True, help="resweep.json open-indirect sweep")
     parser.add_argument("--top", type=int, default=10)
+    parser.add_argument(
+        "--rebuild-report",
+        action="append",
+        default=[],
+        help="content-free gate_rom_rebuild JSON receipt; repeat for every shortlisted ROM",
+    )
+    parser.add_argument(
+        "--selection-output",
+        help="write the mechanically selected target as content-free JSON",
+    )
     args = parser.parse_args()
 
     roms = {}
@@ -178,8 +263,30 @@ def main():
             f"{code * 100 if code is not None else -1:>6.2f} "
             f"{c['size_bytes'] / 1048576:>5.1f}"
         )
-    json.dump(candidates[: args.top], open("novel-shortlist.json", "w"), indent=1)
+    shortlist = candidates[: args.top]
+    json.dump(shortlist, open("novel-shortlist.json", "w"), indent=1)
     print("wrote novel-shortlist.json", file=sys.stderr)
 
+    if args.rebuild_report:
+        if not args.selection_output:
+            parser.error("--selection-output is required with --rebuild-report")
+        try:
+            selection = select_from_rebuild_reports(shortlist, args.rebuild_report)
+        except ValueError as error:
+            parser.error(str(error))
+        with open(args.selection_output, "w") as output:
+            json.dump(selection, output, indent=1)
+            output.write("\n")
+        print(
+            "selected "
+            f"{selection['name']} sha={selection['normalized_rom_sha256'][:12]} "
+            f"roundtripped={selection['roundtripped_code_bytes']}/"
+            f"{selection['rom_bytes']} "
+            f"({selection['roundtripped_code_share'] * 100:.2f}%)",
+            file=sys.stderr,
+        )
+        print(f"wrote {args.selection_output}", file=sys.stderr)
 
-main()
+
+if __name__ == "__main__":
+    main()

@@ -28,6 +28,9 @@
 //! * `FN64_REBUILD_DUMP_ASM_DIR` — optional directory retaining every
 //!   emitted `.s` so the mnemonic-vs-`.word` composition of a "pass" can be
 //!   audited independently of this gate's own claims.
+//! * `FN64_REBUILD_REPORT` — optional path for a content-free JSON receipt
+//!   suitable for mechanical corpus selection; no ROM bytes or local paths
+//!   enter the receipt.
 //!
 //! Requires `mips-linux-gnu-{as,ld,objcopy}` (macOS: `brew install
 //! mips-linux-gnu-binutils` or a cross-binutils build providing these
@@ -44,6 +47,7 @@ use fn64_discover::snapshot_inputs::{
     prepare_snapshot_banks_with_limits, PrepareSnapshotBanksLimits,
 };
 use fn64_discover::{required_env_path, RomAddressSpace};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -478,6 +482,16 @@ fn run() -> Result<(), String> {
     let classes = classify_rom_bytes(rom_len, &mut physical_code)?;
     let bank_bytes = physical_bank_bytes.total();
     let total_differences: usize = tallies.values().map(|tally| tally.differences.len()).sum();
+    let regions_attempted: usize = tallies
+        .values()
+        .map(|tally| tally.functions_attempted + tally.runs_attempted)
+        .sum();
+    let regions_exact: usize = tallies
+        .values()
+        .map(|tally| tally.functions_exact + tally.runs_exact)
+        .sum();
+    let raw_words: u64 = tallies.values().map(|tally| tally.raw_words).sum();
+    let assembly_text_sha256 = format!("{:x}", assembly_digest.finalize());
 
     println!("gate_rom_rebuild: Phase-8 whole-ROM byte-exact rebuild");
     println!("  rom_sha256={}", discovery.rom.sha256);
@@ -539,9 +553,35 @@ fn run() -> Result<(), String> {
         percent(classes.opaque, rom_len)
     );
     println!("  differences={total_differences}");
-    println!("  assembly_text_sha256={:x}", assembly_digest.finalize());
+    println!("  assembly_text_sha256={assembly_text_sha256}");
     println!("  rebuilt_sha256={rebuilt_sha256}");
     println!("  digest_match={digest_match}");
+
+    if let Ok(report_path) = std::env::var("FN64_REBUILD_REPORT") {
+        let report = RebuildReportV1 {
+            schema: "fn64.rom-rebuild-report.v1",
+            normalized_rom_sha256: &discovery.rom.sha256,
+            internal_name: &discovery.rom.header.name,
+            banks: tallies.len(),
+            regions_attempted,
+            regions_exact,
+            raw_words,
+            rom_bytes: rom_len,
+            header_ipl3_bytes: classes.header_ipl3,
+            roundtripped_code_bytes: classes.roundtripped_code,
+            materialized_roundtripped_bytes: materialized_code_bytes,
+            opaque_bytes: classes.opaque,
+            differences: total_differences,
+            assembly_text_sha256: &assembly_text_sha256,
+            rebuilt_sha256: &rebuilt_sha256,
+            digest_match,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("serializing rebuild report: {error}"))?;
+        bytes.push(b'\n');
+        std::fs::write(&report_path, bytes)
+            .map_err(|error| format!("writing rebuild report to {report_path}: {error}"))?;
+    }
 
     if !digest_match {
         return Err("rebuilt ROM digest does not match the original".to_owned());
@@ -559,6 +599,26 @@ struct RomByteClasses {
     header_ipl3: u64,
     roundtripped_code: u64,
     opaque: u64,
+}
+
+#[derive(Serialize)]
+struct RebuildReportV1<'a> {
+    schema: &'static str,
+    normalized_rom_sha256: &'a str,
+    internal_name: &'a str,
+    banks: usize,
+    regions_attempted: usize,
+    regions_exact: usize,
+    raw_words: u64,
+    rom_bytes: u64,
+    header_ipl3_bytes: u64,
+    roundtripped_code_bytes: u64,
+    materialized_roundtripped_bytes: u64,
+    opaque_bytes: u64,
+    differences: usize,
+    assembly_text_sha256: &'a str,
+    rebuilt_sha256: &'a str,
+    digest_match: bool,
 }
 
 /// Partition the normalized ROM into the three Phase-8 physical-byte

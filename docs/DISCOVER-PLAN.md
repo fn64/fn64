@@ -21,19 +21,24 @@ byte-identical, digest match everywhere:
 - **Majora's Mask (USA)** — the known-recomp target (zeldaret / Zelda64Recomp
   ground truth grades the decompile side separately): **605 banks, every
   region exact, 101 raw words total**, 66,312 physical + 2,173,380
-  materialized bytes round-tripped.
+  materialized bytes round-tripped. The all-bank answer-key grade on this
+  tree is **16,443 / 17,108 exact, 2 coarse/interior, 663 open, 0 wrong**
+  (boot 402/486; overlays 13,001/13,016; code segment 3,040/3,606).
 - **Clay Fighter 63⅓ (USA)** — the novel target, picked mechanically by
-  `scripts/pick-novel-rom.py` (no known decomp/recomp project): **220/220
-  regions, zero raw words, 811,944 bytes** of cold-proven code round-tripped
-  in one bank.
+  `scripts/pick-novel-rom.py` from complete `gate_rom_rebuild` receipts using
+  the declared maximum-absolute-roundtripped-code metric (no known
+  decomp/recomp project): **220/220 regions, zero raw words, 811,944 bytes**
+  of cold-proven code round-tripped in one bank.
 - OoT (USA), Buck Bumble, Penny Racers, Automobili Lamborghini, Ridge Racer
   64 also pass; invocations and the full table live in
   `crates/fn64-discover/reference/corpus-invocations.md`.
 
-Honest limits: exact owners are zero on the cold path (functions=0/0
+Honest limits: exact owners are zero in the cold rebuild snapshots
+(functions=0/0
 everywhere), so the decompile-grade claim still rides on
 `gate_decomp_functions`' wrong==0 catalog; opaque bytes remain the explicit
-frontier (93.55% on Clay Fighter — assets, data, and unproven code); and
+frontier (93.51% on Clay Fighter after separately classifying its 4,096-byte
+header/IPL3 — assets, data, and unproven code); and
 materialized (compressed) bank sources stay original bytes in the rebuild,
 with their round-trip proven on output bytes.
 
