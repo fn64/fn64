@@ -119,7 +119,11 @@ const DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1: &[(&str, &[u8])] = &[
     ("src/interp.rs", include_bytes!("interp.rs")),
     ("src/lib.rs", include_bytes!("lib.rs")),
     ("src/runtime.rs", include_bytes!("runtime.rs")),
-    ("src/semantic.rs", include_bytes!("semantic.rs")),
+    ("src/semantic/mod.rs", include_bytes!("semantic/mod.rs")),
+    (
+        "src/semantic/tests.rs",
+        include_bytes!("semantic/tests.rs"),
+    ),
     (
         "src/static_micro_op.rs",
         include_bytes!("static_micro_op.rs"),

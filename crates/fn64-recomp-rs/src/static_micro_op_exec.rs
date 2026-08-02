@@ -77,7 +77,14 @@ pub fn static_micro_op_executor_source_receipt_v1() -> StaticMicroOpExecutorSour
             b"src/static_micro_op_exec.rs",
             include_bytes!("static_micro_op_exec.rs"),
         ),
-        (b"src/semantic.rs", include_bytes!("semantic.rs")),
+        (
+            b"src/semantic/mod.rs",
+            include_bytes!("semantic/mod.rs"),
+        ),
+        (
+            b"src/semantic/tests.rs",
+            include_bytes!("semantic/tests.rs"),
+        ),
     ];
     let mut hasher = Sha256::new();
     hasher.update(b"fn64:static-micro-op-executor-source:v1:");
@@ -129,7 +136,14 @@ pub fn static_micro_op_executor_source_receipt_v2() -> StaticMicroOpExecutorSour
             b"src/static_micro_op_exec.rs",
             include_bytes!("static_micro_op_exec.rs"),
         ),
-        (b"src/semantic.rs", include_bytes!("semantic.rs")),
+        (
+            b"src/semantic/mod.rs",
+            include_bytes!("semantic/mod.rs"),
+        ),
+        (
+            b"src/semantic/tests.rs",
+            include_bytes!("semantic/tests.rs"),
+        ),
     ];
     let mut hasher = Sha256::new();
     hasher.update(b"fn64:static-micro-op-executor-source:v2:");
@@ -187,7 +201,14 @@ pub fn static_micro_op_executor_source_receipt_v3() -> StaticMicroOpExecutorSour
             b"src/static_micro_op_exec.rs",
             include_bytes!("static_micro_op_exec.rs"),
         ),
-        (b"src/semantic.rs", include_bytes!("semantic.rs")),
+        (
+            b"src/semantic/mod.rs",
+            include_bytes!("semantic/mod.rs"),
+        ),
+        (
+            b"src/semantic/tests.rs",
+            include_bytes!("semantic/tests.rs"),
+        ),
     ];
     let mut hasher = Sha256::new();
     hasher.update(b"fn64:static-micro-op-executor-source:v3:");
