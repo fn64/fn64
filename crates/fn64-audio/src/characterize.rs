@@ -15,9 +15,12 @@ use fn64_runtime::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::compact_abi::execute_compact_audio_lane;
+use crate::hle::{AudioHleCatalog, AudioHleCatalogEntry};
 use crate::hle_lle::{run_speculative_audio_lle, SpeculativeAudioLleError};
 use crate::hle_outcome::{
-    AudioTaskTerminalReason, DeferredDpcSubmission, DpcSubmissionSource, Sha256Digest,
+    AudioHleFamily, AudioTaskTerminalReason, DeferredDpcSubmission, DpcSubmissionSource,
+    Sha256Digest,
 };
 use crate::hle_rspboot::{execute_audio_rspboot_to_entry, AudioRspbootError, AudioRspbootInput};
 use crate::hle_snapshot::AudioHleSnapshotError;
@@ -25,6 +28,7 @@ use crate::rsp::runtime::{RspDmaDirection, RspDmaJournalEntry, RspMachine, RspMa
 
 pub const REQUEST_SCHEMA: &str = "fn64.audio-abi-characterization-request.v2";
 pub const REPORT_SCHEMA: &str = "fn64.audio-abi-characterization-report.v2";
+pub const COMPACT_VERIFICATION_REPORT_SCHEMA: &str = "fn64.audio-compact-verification-report.v1";
 pub const FIXTURE_REVISION: u32 = 2;
 const TASK_DMEM_OFFSET: u16 = 0x0fc0;
 
@@ -342,7 +346,12 @@ pub fn characterize_request(
     request: CharacterizationRequest,
 ) -> Result<CharacterizationReport, String> {
     validate_request_header(&request)?;
-    let loaded = LoadedInputs {
+    let loaded = load_inputs(&request)?;
+    characterize_loaded(request, loaded)
+}
+
+fn load_inputs(request: &CharacterizationRequest) -> Result<LoadedInputs, String> {
+    Ok(LoadedInputs {
         rspboot: read_exact_input(
             "rspboot",
             &request.microcode.rspboot_path,
@@ -358,12 +367,163 @@ pub fn characterize_request(
             &request.microcode.data_path,
             &request.microcode.data_sha256,
         )?,
-    };
-    characterize_loaded(request, loaded)
+    })
 }
 
 pub fn canonical_report_json(report: &CharacterizationReport) -> Result<String, String> {
     serde_json::to_string(report).map_err(|error| format!("serialize report: {error}"))
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompactVerificationReport {
+    pub schema: &'static str,
+    pub fixture_revision: u32,
+    pub request_sha256: String,
+    pub verified_inputs: VerifiedInputIdentities,
+    pub phases: Vec<CompactPhaseVerification>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompactPhaseVerification {
+    pub case_sha256: String,
+    pub trial: usize,
+    pub command_count: usize,
+    pub decoded_commands: usize,
+    pub dmem_equivalent: bool,
+    pub first_dmem_difference: Option<u16>,
+    pub dmem_differences: Vec<DifferenceRange>,
+    pub rdram_patches_equivalent: bool,
+}
+
+pub fn verify_compact_request(
+    request: CharacterizationRequest,
+) -> Result<CompactVerificationReport, String> {
+    validate_request_header(&request)?;
+    if request
+        .cases
+        .iter()
+        .flat_map(|case| &case.trials)
+        .any(|trial| trial.phases.len() != 1)
+    {
+        return Err("compact verification currently requires independent one-phase trials".into());
+    }
+    let loaded = load_inputs(&request)?;
+    verify_compact_loaded(request, loaded)
+}
+
+fn verify_compact_loaded(
+    request: CharacterizationRequest,
+    loaded: LoadedInputs,
+) -> Result<CompactVerificationReport, String> {
+    validate_loaded_geometry(request.layout, &loaded, &request.cases)?;
+    let verified_inputs = VerifiedInputIdentities {
+        rspboot_bytes: loaded.rspboot.len(),
+        rspboot_sha256: hex_digest(Sha256Digest::hash(&loaded.rspboot)),
+        text_bytes: loaded.text.len(),
+        text_sha256: hex_digest(Sha256Digest::hash(&loaded.text)),
+        data_bytes: loaded.data.len(),
+        data_sha256: hex_digest(Sha256Digest::hash(&loaded.data)),
+    };
+    let request_sha256 = hex_digest(request_digest(&request, &loaded));
+    let mut phases = Vec::new();
+    for case in &request.cases {
+        let _content_safe_diagnostics = crate::rsp::recomp::ContentSafeDiagnosticsGuard::enter();
+        let baseline = build_baseline_rdram(request.layout, &loaded, &case.sentinels);
+        for (trial_index, trial) in case.trials.iter().enumerate() {
+            phases.push(verify_compact_phase(
+                request.layout,
+                &loaded,
+                &baseline,
+                &case_digest(case),
+                trial_index,
+                &trial.phases[0],
+            )?);
+        }
+    }
+    Ok(CompactVerificationReport {
+        schema: COMPACT_VERIFICATION_REPORT_SCHEMA,
+        fixture_revision: FIXTURE_REVISION,
+        request_sha256,
+        verified_inputs,
+        phases,
+    })
+}
+
+fn verify_compact_phase(
+    layout: CharacterizationLayout,
+    loaded: &LoadedInputs,
+    baseline: &[u8],
+    case_sha256: &Sha256Digest,
+    trial: usize,
+    phase: &CharacterizationPhase,
+) -> Result<CompactPhaseVerification, String> {
+    let command_bytes = encode_packets(&phase.packets);
+    let mut rdram = baseline.to_vec();
+    install_logical(&mut rdram, layout.command_address, &command_bytes);
+    let header = task_header(layout, loaded, command_bytes.len())?;
+    install_logical(&mut rdram, layout.task_address, &encode_header(header));
+    let mut memory = RspMemory::new();
+    memory
+        .write_bytes(
+            RspMemAddr::from_parts(RspMemoryBank::Imem, 0),
+            &loaded.rspboot,
+        )
+        .map_err(|error| content_safe_rsp_memory_error("install rspboot IMEM", error))?;
+    memory
+        .write_bytes(
+            RspMemAddr::from_parts(RspMemoryBank::Dmem, TASK_DMEM_OFFSET),
+            &encode_header(header),
+        )
+        .map_err(|error| content_safe_rsp_memory_error("install task DMEM", error))?;
+    let mut machine_backing = [0; 8];
+    let machine_state = RspMachine::new(&mut machine_backing).snapshot_state();
+    let input = AudioRspbootInput::new(
+        RdramAddr::from_offset(layout.task_address),
+        header,
+        rdram,
+        memory.snapshot(),
+        0,
+        machine_state,
+    )
+    .map_err(|error| content_safe_rspboot_error("rspboot input", error))?;
+    let entry = execute_audio_rspboot_to_entry(input)
+        .map_err(|error| content_safe_rspboot_error("rspboot execution", error))?
+        .into_entry();
+    let catalog_entries = [AudioHleCatalogEntry {
+        identity: entry.identity(),
+        family: AudioHleFamily::CompactAbi,
+        implementation_revision: 1,
+    }];
+    let admission = AudioHleCatalog::new(&catalog_entries)
+        .expect("one-entry compact verification catalog is unique")
+        .admit(entry.identity())
+        .expect("one-entry compact verification catalog contains the entry identity");
+    let admitted = entry
+        .admit_hle(admission)
+        .map_err(|error| content_safe_snapshot_error(error).to_owned())?;
+    let hle = execute_compact_audio_lane(admitted.fork_hle_lane())
+        .map_err(|error| format!("compact HLE execution failed: {error}"))?;
+    let lle = run_speculative_audio_lle(admitted.fork_lle_lane().into_lle_parts())
+        .map_err(content_safe_speculative_lle_error)?;
+    let lle_dmem = lle.rsp_memory().bank(RspMemoryBank::Dmem);
+    let first_dmem_difference = hle
+        .dmem()
+        .image()
+        .iter()
+        .zip(lle_dmem)
+        .position(|(hle, lle)| hle != lle)
+        .map(|offset| u16::try_from(offset).expect("DMEM offset fits u16"));
+    let dmem_differences = difference_ranges(0, hle.dmem().image(), lle_dmem);
+    Ok(CompactPhaseVerification {
+        case_sha256: hex_digest(*case_sha256),
+        trial,
+        command_count: phase.packets.len(),
+        decoded_commands: hle.decoded_commands(),
+        dmem_equivalent: first_dmem_difference.is_none(),
+        first_dmem_difference,
+        dmem_differences,
+        rdram_patches_equivalent: hle.rdram_patches() == lle.rdram_patches(),
+    })
 }
 
 fn validate_request_header(request: &CharacterizationRequest) -> Result<(), String> {
@@ -1713,6 +1873,18 @@ mod tests {
         (0x09 << 26) | (rs << 21) | (rt << 16) | u32::from(immediate)
     }
 
+    fn lui(rt: u32, immediate: u16) -> u32 {
+        (0x0f << 26) | (rt << 16) | u32::from(immediate)
+    }
+
+    fn sw(rt: u32, base: u32, immediate: u16) -> u32 {
+        (0x2b << 26) | (base << 21) | (rt << 16) | u32::from(immediate)
+    }
+
+    fn sh(rt: u32, base: u32, immediate: u16) -> u32 {
+        (0x29 << 26) | (base << 21) | (rt << 16) | u32::from(immediate)
+    }
+
     fn public_fixture() -> (CharacterizationRequest, LoadedInputs) {
         public_fixture_with_text(&[0x2405_5678, BREAK])
     }
@@ -1793,6 +1965,49 @@ mod tests {
             }],
         };
         (request, loaded)
+    }
+
+    fn public_compact_verification_fixture() -> (CharacterizationRequest, LoadedInputs) {
+        let program = [
+            lui(2, 0x0e00),
+            sw(2, 0, 0x02b0),
+            addiu(3, 0, 0x1234),
+            sw(3, 0, 0x02b4),
+            sh(3, 0, 0x0fea),
+            BREAK,
+            0,
+            0,
+        ];
+        let (mut request, loaded) = public_fixture_with_text(&program);
+        for trial in &mut request.cases[0].trials {
+            trial.phases[0].packets = vec![PublicCommandPacket {
+                word0: 0x0e00_0000,
+                word1: 0x0000_1234,
+            }];
+        }
+        (request, loaded)
+    }
+
+    #[test]
+    fn compact_verifier_matches_public_synthetic_hle_and_lle() {
+        let (request, loaded) = public_compact_verification_fixture();
+        let first = verify_compact_loaded(request.clone(), loaded.clone()).unwrap();
+        let second = verify_compact_loaded(request, loaded).unwrap();
+        let first_json = serde_json::to_string(&first).unwrap();
+        assert_eq!(first_json, serde_json::to_string(&second).unwrap());
+        assert!(first_json.starts_with("{\"schema\":\"fn64.audio-compact-verification-report.v1\""));
+        assert!(!first_json.contains("public-smoke"));
+        assert!(!first_json.contains("234881024"));
+        assert!(!first_json.contains("4660"));
+        assert_eq!(first.phases.len(), 2);
+        for phase in &first.phases {
+            assert_eq!(phase.command_count, 1);
+            assert_eq!(phase.decoded_commands, 1);
+            assert!(phase.dmem_equivalent);
+            assert!(phase.first_dmem_difference.is_none());
+            assert!(phase.dmem_differences.is_empty());
+            assert!(phase.rdram_patches_equivalent);
+        }
     }
 
     #[test]

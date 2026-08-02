@@ -128,6 +128,13 @@
       "trigger": "unimplemented RSP instruction word"
     },
     {
+      "operation": "audio.hle.compact-memory-unsupported-opcode",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/compact_memory_abi.rs",
+      "trigger": "compact audio DMA reached uncharacterized selector {opcode:#04x}"
+    },
+    {
       "operation": "audio.rsp.unimplemented-vu-op",
       "subsystem": "audio",
       "disposition": "returned_error",

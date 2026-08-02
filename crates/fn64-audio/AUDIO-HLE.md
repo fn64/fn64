@@ -57,7 +57,8 @@ The HLE foundation has ten independent pieces:
   a whole-task reference with no deferred DPC submission. It composes exact boot-plus-ucode write
   intent using final LLE bytes, so later ucode writes win overlaps while
   same-valued DMA writes remain visible to publication preflight. The value is
-  deliberately not a commit token: no complete family HLE executor exists yet.
+  deliberately not a commit token: the compact-family executor currently
+  returns command memory effects, not a complete architectural task outcome.
 - `hle_commit.rs` is quarantined as test-only characterization. Its reduced
   `RspVisibleState` projection does not bind complete architectural state, and
   its comparison does not consume the exact paired HLE lane. No production
@@ -83,6 +84,84 @@ both boot and ucode patches from both lanes.
 
 The standard ABI decoder is a separate layer. Possessing a valid standard
 packet does not prove that the loaded microcode implements that packet family.
+
+`compact_memory_abi.rs` records a second, narrower exact-image result without
+promoting it to a family catalog entry. A private same-snapshot WM2000 control
+replay terminated through BREAK and duplicate trials matched complete RDRAM,
+DMEM, IMEM, architectural state, DPC state, and work. An 84-case address
+redirection sweep then covered every 32 load-shaped and 52 save-shaped packet
+in that captured task. Each transfer used an eight-byte-masked 24-bit RDRAM
+address, a 16-byte length quantum from the high payload byte, and DMEM
+`0x04f0 + low16`; all six distinct observed field/DMEM combinations fit that
+rule. Ten consecutive fresh 84-case sweeps produced byte-identical
+content-free reports. A compact LOAD then seeded controlled nonzero DMEM
+immediately before a truncated opcode-2 task tail. Counts `0..=16` cleared one
+16-byte block, `17..=32` cleared two, and the `33`, `367`, `368`, and `369`
+boundaries followed a minimum-one-block, round-up-to-16 rule; each additional
+block cost four RSP instructions. Ten consecutive fresh runs of that
+14-boundary matrix produced byte-identical content-free reports. The module
+then applied the same seeded boundaries to opcode `0x0a`: it used the same
+minimum/round-up rule, with seven RSP instructions per additional block. A
+four-case direct-versus-scratch-copy matrix matched non-overlap, backward
+overlap, and exact alias, while forward overlap differed in exactly the bytes
+predicted by ascending 16-byte block copies. Both matrices produced
+byte-identical content-free reports in 10/10 fresh runs. The module implements
+those four speculative transactional memory commands. The four opcode-`0x0b`
+occurrences in the same task each issued one 32-byte RDRAM read to fixed DMEM
+`0x03f0`. Redirecting each occurrence independently preserved BREAK and work;
+ten consecutive fresh four-case sweeps produced byte-identical content-free
+reports. A separate positive-count matrix at `1`, `2`, `7`, `8`, `9`, `15`,
+`16`, `17`, `31`, `32`, `33`, `47`, `48`, `49`, `255`, `256`, and `257`
+issued raw DMA length `count - 1` to the same fixed destination, which gives
+the public hardware's round-up-to-eight transfer size. It too produced
+byte-identical content-free reports in 10/10 fresh runs. The module implements
+that LOADADPCM table load transactionally; zero count remains uncharacterized
+after it left the bounded valid-task path. A 177-block opcode-`0x0d` dependency
+sweep then perturbed every 16-byte block in the compact audio region. Only two
+368-byte inputs participated: compact offsets `1248..1616` and `1616..1984`.
+Their halfwords mapped without byte or arithmetic transformation to the even
+and odd halfwords, respectively, of the 736-byte output at compact offset
+zero. A four-case first/last-block matrix for both channels checked the exact
+two-byte output digests against the seeded input slices; every pair was
+identical, and 10/10 fresh matrix runs produced byte-identical content-free
+reports. `compact_dsp_abi.rs` implements that fixed zero-operand INTERLEAVE
+transactionally. The remaining 52 opcode-`0x0c` packets formed ten distinct
+field shapes. A same-snapshot sweep checked 43 independently hashed changed
+ranges and established two fixed 368-byte buffers at compact offsets from
+DMEM `0x04f0`, a signed low-16 gain, and this saturating sample operation:
+`(prior * 32767 * 2 + 0x8000 + input * gain * 2) >> 16`. The implementation
+uses a wide accumulator before the final signed-16 clamp. Opcode `0x0e` is not
+the standard ABI pole filter for this identity: a 12-case field sweep showed
+that it ignores both `word0` payload and the high half of `word1`, and stores
+only the low half of `word1` as a big-endian scalar at DMEM `0x0fea`. Ten
+fresh runs of that matrix were byte-identical.
+
+`compact_abi.rs` now dispatches all eight selectors present in the captured
+164-command list: `2`, `4`, `6`, `10`, `11`, `12`, `13`, and `14`. It stages
+each 320-byte command batch at DMEM `0x02b0`, matching the observed command
+processor rather than comparing only command effects. The content-safe
+`audio_compact_verify` tool ran admitted compact HLE and LLE from the same
+post-rspboot snapshot; all 164 commands decoded, terminal DMEM was identical,
+and canonical RDRAM write coverage and bytes were identical. Ten consecutive
+fresh whole-list runs produced byte-identical reports. This closes the command
+semantics represented by that captured list. Zero transfer quanta for
+LOAD/SAVE, a distributable exact identity catalog, complete terminal
+scalar/vector/SP state and work equivalence, and live policy selection remain
+loud frontiers. Private task inputs and reports remain outside the repository.
+
+The 2026-08-01 private OoT fixture attempt did not establish a valid synthetic
+task entry. Bounded VROM materialization recovered the named rspboot, text, and
+data images, and the standalone interpreter executed the complete text image
+to BREAK. The characterization path instead exceeded its ucode step bound
+after rspboot placed the supplied task text at IMEM `0x1080`; that placement
+does not preserve the image's observed absolute-control-flow layout. An
+8-byte-aligned source-offset sweep was not an answer: several offsets reached
+BREAK without performing any command DMA, and the sole longer terminating
+candidate performed one DMA but no output write. This rules out adopting a
+terminating offset as task geometry. The exact next step is to capture one
+real audio `OSTask` at the existing common pre-policy dump boundary and use
+its header geometry and referenced images as the private characterization
+input.
 
 ## Clean-room evidence
 
@@ -168,7 +247,9 @@ begins after rspboot, so it cannot claim whole-task atomicity or publish
 rspboot's earlier effects. The pure whole-task reference now retains the
 pre-boot baseline, boot and ucode write intent, ordered replacement history,
 complete final LLE state, and an inseparable no-submission seal, but exposes no
-publication authority until a concrete HLE lane produces an exact comparison.
+publication authority until a concrete HLE lane produces and exactly compares
+a complete task outcome. The compact verifier's DMEM/RDRAM comparison is
+deliberately narrower than that boundary.
 `LleAccuracy` replaces the cross-task owner with the
 exact terminal image after draining DPC submissions. Optimized boot-overlay HLE
 exposes no post-ucode scalar/VU image, so successful completion is explicitly

@@ -9,12 +9,13 @@
 
 use core::fmt;
 
+use crate::hle::AdmittedStandardAbiDecodeError;
 use crate::hle_memory::{
     execute_standard_memory_command, StandardAbiMemoryError, StandardAbiMemoryState,
 };
 use crate::hle_outcome::AudioHleSelection;
 use crate::hle_transaction::OwnedDmem;
-use crate::standard_abi::{DecodedStandardAbiPacket, StandardAbiOpcode, UnknownStandardAbiOpcode};
+use crate::standard_abi::{DecodedStandardAbiPacket, StandardAbiOpcode};
 use crate::whole_task::{
     NoDpcSubmissionWholeAudioTaskReference, PreparedWholeAudioTaskDifferential,
     WholeAudioTaskHleLane,
@@ -25,7 +26,7 @@ use fn64_runtime::RspMemoryBank;
 pub enum StandardAudioHleFrontier {
     UnknownOpcode {
         command_index: usize,
-        source: UnknownStandardAbiOpcode,
+        source: AdmittedStandardAbiDecodeError,
     },
     UnsupportedMemorySemantics {
         command_index: usize,

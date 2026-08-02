@@ -291,7 +291,7 @@ The source inventory is checked by
 `tools/check_unsupported_event_sites.py` against
 `fn64.unsupported-event-sites.v2`. It scans the production Rust paths in the
 runtime, ABI, audio/RSP, Rust CPU recompiler, shared renderer, and RT64 adapter.
-Twenty-five exact record sites, the reference renderer's 46 literal
+Twenty-six exact record sites, the reference renderer's 46 literal
 helper-routed operation identities, and the ABI's two command-indexed SI
 operation families must remain registered. Balanced multiline macro scanning
 and inline `cfg(test)` removal ensure test-oracle panics neither create false

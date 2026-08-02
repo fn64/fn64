@@ -519,6 +519,10 @@ pub struct RecompContext {
     /// performs (`MFC0 rt, $9`); the host advances it. Modeled as real state
     /// rather than trapped, unlike the libultra-managed Status/Cause/EPC.
     pub cop0_count: u32,
+    /// Half-rate phase imported from the live CPU clock at each execution
+    /// boundary. This makes an interior MFC0 Count observe a preceding odd
+    /// number of retired CPU cycles without transferring clock ownership.
+    cop0_count_phase: u8,
     /// COP0 register 11, `Compare`: the timer-interrupt threshold written via
     /// `MTC0 rt, $11` on the `osSetTimer` path. Stored so the write round-trips;
     /// the interrupt it would schedule is the host's concern.
@@ -763,8 +767,13 @@ impl RecompContext {
 
     /// Refresh the block-local view from the live CPU clock without
     /// fabricating an architectural MTC0 write.
-    pub fn synchronize_cop0_timing(&mut self, count: u32, compare: u32) {
+    pub fn synchronize_cop0_timing(&mut self, count: u32, count_phase: u8, compare: u32) {
+        assert!(
+            count_phase <= 1,
+            "CP0 Count half-rate phase must be zero or one"
+        );
         self.cop0_count = count;
+        self.cop0_count_phase = count_phase;
         self.cop0_compare = compare;
     }
 
@@ -1447,7 +1456,7 @@ impl RecompContext {
     /// strictly AFTER the block returns, driven by its retired-instruction
     /// count (`Yield::InstructionCheckpoint` -> `Executor::advance_time`,
     /// which adds `retired_total / 2` — respecting an odd-cycle carry
-    /// (`cp0_count_phase`) private to the executor). So a plain
+    /// (the executor-owned `cp0_count_phase`). So a plain
     /// `self.cop0_count` read mid-block sees the value from block ENTRY,
     /// stale by however many instructions have already retired THIS turn.
     ///
@@ -1460,27 +1469,14 @@ impl RecompContext {
     /// method returned meanwhile. No cycle is double-counted because this
     /// method counts nothing into persistent state; it only offsets a read.
     ///
-    /// # The one approximation: entry phase
-    ///
-    /// The executor's `cp0_count_phase` (an odd-cycle carry across
-    /// `advance_time` calls) is private executor state never threaded
-    /// through `synchronize_cop0_timing`, so this context has no way to know
-    /// whether the block's true starting phase was 0 or 1. This method
-    /// assumes phase 0 at block entry — the same convention
-    /// `Executor::set_cp0_count` already uses for an explicit COP0 Count
-    /// write — so an in-block read can be up to one Count tick behind the
-    /// (unobservable) silicon-exact value when the real entry phase was 1.
-    /// The BOUNDARY value stays exact either way: the executor computes the
-    /// authoritative post-block Count itself, from its own retained phase,
-    /// independent of this approximation. Threading the true phase through
-    /// would require new cross-crate API surface
-    /// (`Executor::cp0_count_phase()` plus a `synchronize_cop0_timing`
-    /// parameter); `docs/UNIVERSAL-RUNTIME-PLAN.md`'s U4 row already lists
-    /// "instruction-interior timer visibility" as a separately tracked open
-    /// boundary, which this conservative half-fix narrows without closing.
+    /// The live executor supplies its retained half-rate phase at every
+    /// boundary. This view therefore agrees with the authoritative clock for
+    /// every interior instruction count while remaining a read-only offset;
+    /// the executor still performs the sole persistent post-block advance.
     #[inline]
     pub fn read_cop0_count_interior(&self, retired_since_entry: u32) -> u32 {
-        self.cop0_count.wrapping_add(retired_since_entry / 2)
+        self.cop0_count
+            .wrapping_add((u32::from(self.cop0_count_phase) + retired_since_entry) / 2)
     }
 
     /// Read one architecturally 64-bit COP0 address register for DMFC0.
@@ -4081,6 +4077,9 @@ mod tests {
             fcsr: snapshot.fcsr,
             ll_reservation: snapshot.ll_reservation,
             cop0_count: snapshot.cop0_count,
+            // Boundary-owned clock phase is synchronized by the executor and
+            // deliberately absent from RecompContext-owned evidence.
+            cop0_count_phase: 0,
             cop0_compare: snapshot.cop0_compare,
             cop0_count_write: snapshot.cop0_count_write,
             cop0_compare_write: snapshot.cop0_compare_write,
@@ -4372,7 +4371,7 @@ mod tests {
     #[test]
     fn cop0_timing_writes_retain_same_value_compare_acknowledgements() {
         let mut ctx = RecompContext::new();
-        ctx.synchronize_cop0_timing(7, 9);
+        ctx.synchronize_cop0_timing(7, 0, 9);
         ctx.cop0_cause = 1 << 15;
         ctx.write_cop0(9, 7);
         ctx.write_cop0(11, 9);
@@ -4380,6 +4379,28 @@ mod tests {
         assert_eq!(ctx.cop0_cause & (1 << 15), 0);
         assert_eq!(ctx.take_cop0_timing_writes(), (Some(7), Some(9)));
         assert_eq!(ctx.take_cop0_timing_writes(), (None, None));
+    }
+
+    #[test]
+    fn interior_count_reads_include_the_live_half_rate_phase() {
+        let mut ctx = RecompContext::new();
+
+        ctx.synchronize_cop0_timing(7, 0, 9);
+        assert_eq!(ctx.read_cop0_count_interior(0), 7);
+        assert_eq!(ctx.read_cop0_count_interior(1), 7);
+        assert_eq!(ctx.read_cop0_count_interior(2), 8);
+
+        ctx.synchronize_cop0_timing(7, 1, 9);
+        assert_eq!(ctx.read_cop0_count_interior(0), 7);
+        assert_eq!(ctx.read_cop0_count_interior(1), 8);
+        assert_eq!(ctx.read_cop0_count_interior(2), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "CP0 Count half-rate phase must be zero or one")]
+    fn cop0_timing_sync_rejects_an_invalid_half_rate_phase() {
+        let mut ctx = RecompContext::new();
+        ctx.synchronize_cop0_timing(0, 2, 0);
     }
 
     #[test]

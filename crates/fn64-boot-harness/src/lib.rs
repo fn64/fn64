@@ -7,6 +7,7 @@
 //! Game policy remains with each harness: which sections are resident,
 //! controller input, save type, rendering, audio, and executor driving.
 
+mod audio_output;
 #[cfg(feature = "recomp-rs")]
 mod boot_context;
 mod certification_profile;
@@ -28,6 +29,9 @@ mod render_evidence;
 mod report_series;
 mod unsupported_journal;
 
+pub use audio_output::{
+    pace_live_audio_output, wire_live_audio_output, LiveAudioOutput, LiveAudioPaceError,
+};
 #[cfg(feature = "recomp-rs")]
 pub use boot_context::{load_boot_context, parse_boot_context, BootContextLoadError};
 pub use certification_profile::{

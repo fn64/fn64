@@ -819,7 +819,9 @@ mod tests {
             attempted.frontier(),
             StandardAudioHleFrontier::UnknownOpcode {
                 command_index: 0,
-                source: crate::standard_abi::UnknownStandardAbiOpcode { opcode: 0x10 },
+                source: crate::hle::AdmittedStandardAbiDecodeError::UnknownOpcode(
+                    crate::standard_abi::UnknownStandardAbiOpcode { opcode: 0x10 }
+                ),
             }
         ));
     }
