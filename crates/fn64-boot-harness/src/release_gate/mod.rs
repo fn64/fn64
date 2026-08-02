@@ -44,7 +44,13 @@ pub use evidence::*;
 pub use live_gate::*;
 pub use report::*;
 pub use encode::*;
+// publication's pub items all sit behind the recomp-rs feature; without it
+// the glob would re-export nothing public and rustc warns. The siblings and
+// tests still need its pub(super) items either way.
+#[cfg(feature = "recomp-rs")]
 pub use publication::*;
+#[cfg(not(feature = "recomp-rs"))]
+pub(crate) use publication::*;
 
 #[cfg(test)]
 fn test_release_environment(
