@@ -946,7 +946,7 @@ fn render_driver_source(
     }
 
     source.push_str(
-        "fn probe(program: &BlockProgram, bank: BankId, pc: u32) -> BlockRun {\n    let mut storage = vec![0u8; 8 * 1024 * 1024];\n    let mut mem = Rdram::new(&mut storage);\n    let mut ctx = RecompContext::new();\n    ctx.set_r(29, 0x8070_0000);\n    program.run(ExecutionKey::new(bank, GuestPc::new(pc)), InstructionBudget::new(4096).unwrap(), &mut ctx, &mut mem)\n}\n\nfn main() {\n    let mut program = BlockProgram::new();\n",
+        "fn probe(program: &BlockProgram, bank: BankId, pc: u32) -> BlockRun {\n    let mut storage = vec![0u8; 8 * 1024 * 1024];\n    let mut mem = Rdram::new(&mut storage);\n    let mut ctx = RecompContext::new();\n    // A fresh context zeroes every TLB entry, which makes all 32 share\n    // entry_hi = 0 and therefore match any address -- the VR4300 calls that\n    // undefined, and the runtime correctly traps it. Give each entry a\n    // distinct VPN so an arbitrary-PC probe faults on the guest code's own\n    // behavior instead of on unconfigured probe state.\n    ctx.initialize_invalid_tlb_entries();\n    ctx.set_r(29, 0x8070_0000);\n    program.run(ExecutionKey::new(bank, GuestPc::new(pc)), InstructionBudget::new(4096).unwrap(), &mut ctx, &mut mem)\n}\n\nfn main() {\n    let mut program = BlockProgram::new();\n",
     );
     for bank_index in 0..banks.len() {
         writeln!(
