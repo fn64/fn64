@@ -4,6 +4,22 @@
     use fn64_runtime::RecvMesgOutcome;
     use std::rc::Rc;
 
+    /// Emits the `RenderBackend::observe_non_rdp_write16` method reporting no
+    /// Rust hidden sidecar. Shared by the helpers here and all three test
+    /// buckets; `macro_rules!` is in scope for the rest of this module and for
+    /// the child modules declared textually after it.
+    macro_rules! no_rust_hidden_sidecar {
+        () => {
+            fn observe_non_rdp_write16(
+                &mut self,
+                _write: fn64_render::NonRdpWrite16,
+            ) -> fn64_render::NonRdpWrite16Disposition {
+                fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
+            }
+        };
+    }
+    pub(crate) use no_rust_hidden_sidecar;
+
     fn install_running_task_lineage(
         task_addr: RdramAddr,
         admission_generation: RspTaskAdmissionGeneration,

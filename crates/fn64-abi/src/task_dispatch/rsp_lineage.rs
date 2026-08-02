@@ -337,7 +337,7 @@ impl RspTaskLineage {
 
 /// Process-monotonic identity of one successfully admitted `osSpTaskLoad`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RspTaskAdmissionGeneration(NonZeroU64);
+pub struct RspTaskAdmissionGeneration(pub(crate) NonZeroU64);
 
 impl RspTaskAdmissionGeneration {
     /// Constructs an evidence value from a nonzero admission generation.

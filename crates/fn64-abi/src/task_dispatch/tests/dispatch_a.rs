@@ -514,18 +514,6 @@ use super::*;
         assert!(panic_message(panic.as_ref()).contains("terminal scalar/VU state is unavailable"));
     }
 
-    macro_rules! no_rust_hidden_sidecar {
-        () => {
-            fn observe_non_rdp_write16(
-                &mut self,
-                _write: fn64_render::NonRdpWrite16,
-            ) -> fn64_render::NonRdpWrite16Disposition {
-                fn64_render::NonRdpWrite16Disposition::NoRustHiddenSidecar
-            }
-        };
-    }
-
-
     #[test]
     fn verified_audio_patches_use_logical_guest_byte_order() {
         let patches = fn64_audio::hle_outcome::CanonicalRdramPatches::new(vec![

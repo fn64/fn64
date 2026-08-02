@@ -154,7 +154,12 @@ def function_body(source: str, signature_end: int) -> str:
 
 def live_exports(source_dir: Path = SOURCE_DIR) -> dict[str, ExportedShim]:
     exports: dict[str, ExportedShim] = {}
-    for path in sorted(source_dir.glob("*.rs")):
+    # rglob, not glob: shims live in subdirectory modules too (e.g. pi/mmio.rs,
+    # task_dispatch/lifecycle.rs) since the large files were split. Skip test
+    # modules -- exports are #[no_mangle] production definitions, never in tests.
+    for path in sorted(source_dir.rglob("*.rs")):
+        if path.name == "tests.rs" or "tests" in path.parts:
+            continue
         source = path.read_text()
         for match in EXPORT.finditer(source):
             symbol = match.group("name")
