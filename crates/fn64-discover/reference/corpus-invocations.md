@@ -145,6 +145,11 @@ Expected results (2026-08-01, cold discovery, zero reference TOMLs):
 | Ocarina of Time (USA) | 102 | all exact | ~3.7k | 18,904 physical + 2,559,588 materialized | match |
 | Clay Fighter 63⅓ (USA) | 1 | 220/220 | 0 | 811,944 physical | match |
 | Buck Bumble / Penny Racers / Lamborghini / RR64 | 1 each | all exact | — | 307,560 / 93,768 / 519,380 / 206,428 | match |
+| Tom and Jerry (Europe) | 1 | all exact | — | 475,448 physical | match |
+| Powerpuff Girls (USA) | 1 | all exact | — | 480,580 physical | match |
+| Fighting Force 64 / Bass Hunter 64 | 1 each | all exact | — | 409,288 / 347,232 | match |
+| Dual Heroes (USA) | 3 | all exact | — | 183,188 physical | match |
+| MRC Multi Racing Championship (USA) | 10 | all exact | — | 748,088 physical | match |
 
 `raw_words` counts words retained as numeric literals (out-of-region
 branches, non-canonical encodings, embedded table data inside proven blocks)
