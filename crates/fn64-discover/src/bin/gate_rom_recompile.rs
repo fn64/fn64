@@ -52,7 +52,7 @@ use fn64_recomp_rs::execution::BankId;
 use fn64_recomp_rs_codegen::{emit_dense_bank_shard_runner_function, DenseBankShardInput};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -707,6 +707,24 @@ fn plan_bank_shards_with_bound(
         })
         .expect("bank blocks non-empty, checked above");
 
+    // A block whose final word is a control transfer has its architectural
+    // delay slot in the NEXT block when the two are adjacent. `block_pack`
+    // normally folds that word into the block, but only when no other block
+    // already owns it; where one does, the severed pair survives into here
+    // and the emitter refuses with MissingArchitecturalDelayWord. Indexing
+    // adjacency lets the last shard of such a block borrow the successor's
+    // first word as its lookahead, which is exactly what that field is for.
+    let next_block_first_word: BTreeMap<u32, u32> = bank
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let end_va = block.start_va.checked_add(
+                u32::try_from(block.words.len()).ok()?.checked_mul(4)?,
+            )?;
+            Some((end_va, *block.words.first()?))
+        })
+        .collect();
+
     let mut shards = Vec::new();
     for block in &bank.blocks {
         let mut offset = 0usize;
@@ -717,11 +735,20 @@ fn plan_bank_shards_with_bound(
                 .start_va
                 .checked_add(u32::try_from(offset).unwrap() * 4)
                 .expect("shard start exceeds u32");
-            // The lookahead word, if any, is the next word in this same
-            // block -- never a word from a different block, since blocks
-            // are independently proven spans and a gap between them is not
-            // an architectural successor.
-            let delay_lookahead = block.words.get(offset + shard_len).copied();
+            // Within a block the lookahead is simply the next word. At a
+            // block end it is the adjacent block's first word, and only when
+            // the two are contiguous -- a gap between blocks is not an
+            // architectural successor, so a non-adjacent block never lends
+            // its word.
+            let delay_lookahead = block
+                .words
+                .get(offset + shard_len)
+                .copied()
+                .or_else(|| {
+                    let shard_end = shard_start
+                        .checked_add(u32::try_from(shard_len).ok()?.checked_mul(4)?)?;
+                    next_block_first_word.get(&shard_end).copied()
+                });
             let shard_index = shards.len();
             let name = format!("run_rom_bank_{bank_index}_shard_{shard_index}");
             let source = emit_dense_bank_shard_runner_function(&DenseBankShardInput {

@@ -392,9 +392,29 @@ fn emit_block_pack_from_snapshot(
             .map(|block| PackBlockView::from(*block))
             .chain(installed.iter().map(|block| PackBlockView::from(*block)))
             .collect();
-        admitted.sort_by_key(|block| block.start_va);
+        // Ascending start; at a shared start prefer the proven claim, then
+        // the longest extent. Overlap resolution walks this order and keeps
+        // the first block of any overlapping run, so a proven block can never
+        // be displaced by a merely-installed one.
+        admitted.sort_by_key(|block| {
+            (
+                block.start_va,
+                !block.reachability_proven,
+                std::cmp::Reverse(block.end_va),
+            )
+        });
+        let dropped_overlapping = retain_disjoint_blocks(&mut admitted);
         if admitted.is_empty() {
             return Err(BlockPackError::NoProvenBlocks { bank: bank.clone() });
+        }
+        if dropped_overlapping != 0 {
+            // Reported rather than silent: a dropped block is emitted-code
+            // coverage this pack does not carry, and a large count would mean
+            // the CFG is producing overlapping geometry systematically rather
+            // than at a few branch-into-block sites.
+            eprintln!(
+                "block_pack: {bank}: dropped {dropped_overlapping} overlapping installed block(s)"
+            );
         }
         let proven = admitted;
         let geometry = complete_severed_delay_slots(
@@ -1173,6 +1193,10 @@ struct CompletedGeometry {
 /// reachability roots it does not have.
 #[derive(Clone, Copy)]
 struct PackBlockView<'a> {
+    /// True when the source assessment was `Proven` (authoritative
+    /// reachability), false when it was `Installed`. Overlap resolution must
+    /// never discard a proven block in favour of a weaker one.
+    reachability_proven: bool,
     bank: &'a str,
     start_va: u32,
     end_va: u32,
@@ -1183,6 +1207,7 @@ struct PackBlockView<'a> {
 impl<'a> From<&'a ReachableCodeBlock> for PackBlockView<'a> {
     fn from(block: &'a ReachableCodeBlock) -> Self {
         Self {
+            reachability_proven: true,
             bank: &block.bank,
             start_va: block.start_va,
             end_va: block.end_va,
@@ -1195,6 +1220,7 @@ impl<'a> From<&'a ReachableCodeBlock> for PackBlockView<'a> {
 impl<'a> From<&'a InstalledCodeBlock> for PackBlockView<'a> {
     fn from(block: &'a InstalledCodeBlock) -> Self {
         Self {
+            reachability_proven: false,
             bank: &block.bank,
             start_va: block.start_va,
             end_va: block.end_va,
@@ -1202,6 +1228,47 @@ impl<'a> From<&'a InstalledCodeBlock> for PackBlockView<'a> {
             terminator: &block.terminator,
         }
     }
+}
+
+/// Drop blocks that overlap an already-retained block, returning how many
+/// were dropped. `blocks` must be sorted by `(start_va, Reverse(end_va))`.
+///
+/// A pack requires disjoint ascending geometry: two blocks covering the same
+/// word would emit that word twice and make the dispatcher's routing
+/// ambiguous. The broad CFG can produce overlapping blocks where a branch
+/// lands one word inside another block, so admitting non-reachability-proven
+/// blocks exposes geometry the authoritative-only set never contained
+/// (measured: WM2000 `recovered_overlay_0`, 4 overlapping pairs in 5,251
+/// admitted spans, e.g. 0x80107554..5c, 0x80107558..60, 0x8010755c..64 --
+/// each starting one word into the previous).
+///
+/// Dropping is the conservative resolution: the retained block's bytes are
+/// still byte-identical proven code, and the dropped block's coverage is lost
+/// rather than misrepresented. Since the sort puts the longest block first at
+/// any shared start, the retained one covers the most bytes.
+fn retain_disjoint_blocks(blocks: &mut Vec<PackBlockView<'_>>) -> usize {
+    let mut retained: Vec<PackBlockView<'_>> = Vec::with_capacity(blocks.len());
+    let mut dropped = 0usize;
+    for block in blocks.iter() {
+        match retained.last() {
+            Some(previous) if block.start_va < previous.end_va => {
+                // A proven block outranks an installed one even when the
+                // installed block started earlier: reachability evidence is
+                // never discarded to keep a weaker claim. Replacing is safe
+                // because the sort is ascending by start, so the block two
+                // back (if any) already ends at or before this one's start.
+                if block.reachability_proven && !previous.reachability_proven {
+                    retained.pop();
+                    retained.push(*block);
+                } else {
+                    dropped += 1;
+                }
+            }
+            _ => retained.push(*block),
+        }
+    }
+    *blocks = retained;
+    dropped
 }
 
 fn complete_severed_delay_slots(
