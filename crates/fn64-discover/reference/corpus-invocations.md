@@ -137,6 +137,29 @@ The gate exits nonzero unless every attempted region round-trips byte-exact
 AND the rebuilt image's sha256 equals the original's. Run it twice: the
 reports must be byte-identical (assembly_text_sha256 included).
 
+The physical-byte report is a checked, disjoint partition of
+`header_ipl3_bytes`, `roundtripped_code_bytes`, and `opaque_bytes`; their sum
+must equal `rom_bytes`, and accepted code overlapping header/IPL3 fails loud.
+For the known target, the separate all-bank decompile grade is:
+
+```sh
+FN64_DISCOVER_ROM=<roms>/mm-usa.z64 \
+FN64_DISCOVER_DUMP=<corpus>/games/MMU/syms/dump.toml \
+FN64_DISCOVER_TABLES=$REF/mm-n64-us-load-tables.toml \
+FN64_DISCOVER_REQUEST_DMA=$REF/mm-n64-us-request-dma.toml \
+FN64_DISCOVER_SIG_DONOR_ROM=<roms>/oot-ntsc-1.0.z64 \
+FN64_DISCOVER_SIG_DONOR_DUMP=<corpus>/games/OOTU/syms/dump.toml \
+FN64_DISCOVER_SIG_DONOR_TABLES=$REF/oot-ntsc-1.0-load-tables.toml \
+FN64_DISCOVER_SIG_DONOR_REQUEST_DMA=$REF/oot-ntsc-1.0-request-dma.toml \
+FN64_DISCOVER_OVL_RELOCS=1 \
+FN64_DISCOVER_GRADE_OVERLAYS=1 \
+FN64_DISCOVER_JUMP_TABLES=$REF/mm-n64-us-jump-tables.toml \
+gate_decomp_functions
+```
+
+Current result: 16,443 / 17,108 exact, 2 coarse/interior, 663 open,
+and 0 wrong across the boot bank, 612 parsed overlays, and the code segment.
+
 Expected results (2026-08-01, cold discovery, zero reference TOMLs):
 
 | ROM | banks | regions | raw_words | roundtripped bytes | digest |
@@ -154,3 +177,11 @@ Expected results (2026-08-01, cold discovery, zero reference TOMLs):
 `raw_words` counts words retained as numeric literals (out-of-region
 branches, non-canonical encodings, embedded table data inside proven blocks)
 — byte-exact either way, reported never hidden.
+
+Full-corpus sweep (2026-08-01, 287 ROMs, cold): **284 pass byte-exact**,
+111,014,792+ physical bytes regenerated through GNU `as`. The 3 failures are
+snapshot-composition refusals (Banjo-Tooie, Donald Duck Goin' Quackers,
+Rayman 2) — a discovery frontier, not an emission defect. Encodings gas
+cannot express at `-mips3` are retained numerically by the gate's pre-pass:
+`jalr rd==rs`, MIPS IV FPU conditional moves (`movz/movn/movt/movf .s/.d`),
+and `bltzal`-family branches sourcing `$31`.

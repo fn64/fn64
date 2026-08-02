@@ -50,6 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const MAX_ROM_BYTES: u64 = 128 * 1024 * 1024;
+const HEADER_IPL3_END: u64 = 0x1000;
 
 /// One emitted-and-assembled proven region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,7 +222,13 @@ fn run() -> Result<(), String> {
             };
             assembly_digest.update(owner.entry.pc.to_be_bytes());
             assembly_digest.update(assembly.as_bytes());
-            match assemble(&temp.path, region_index, owner.entry.pc, original.len(), &assembly) {
+            match assemble(
+                &temp.path,
+                region_index,
+                owner.entry.pc,
+                original.len(),
+                &assembly,
+            ) {
                 Ok(assembled) if assembled == original => {
                     tally.functions_exact += 1;
                     record_verified(
@@ -290,6 +297,32 @@ fn run() -> Result<(), String> {
                             return AsmWord::raw(word);
                         }
                     }
+                    // FPU conditional moves are MIPS IV; `as -mips3` (the
+                    // VR4300's ISA) cannot express them, so their words are
+                    // retained numerically wherever they appear.
+                    if matches!(
+                        instruction,
+                        fn64_recomp_rs::Instruction::MovzS { .. }
+                            | fn64_recomp_rs::Instruction::MovnS { .. }
+                            | fn64_recomp_rs::Instruction::MovzD { .. }
+                            | fn64_recomp_rs::Instruction::MovnD { .. }
+                            | fn64_recomp_rs::Instruction::MovcfS { .. }
+                            | fn64_recomp_rs::Instruction::MovcfD { .. }
+                    ) {
+                        return AsmWord::raw(word);
+                    }
+                    // A branch-and-link whose source is the link register
+                    // itself clobbers its own comparison operand; gas
+                    // refuses the mnemonic outright.
+                    if matches!(
+                        instruction,
+                        fn64_recomp_rs::Instruction::Bltzal { rs: 31, .. }
+                            | fn64_recomp_rs::Instruction::Bgezal { rs: 31, .. }
+                            | fn64_recomp_rs::Instruction::Bltzall { rs: 31, .. }
+                            | fn64_recomp_rs::Instruction::Bgezall { rs: 31, .. }
+                    ) {
+                        return AsmWord::raw(word);
+                    }
                     match branch_target(pc, instruction) {
                         Some(target) if target < run_start || target >= run_end => {
                             AsmWord::raw(word)
@@ -317,15 +350,20 @@ fn run() -> Result<(), String> {
                         break;
                     }
                 };
-                match assemble(&temp.path, region_index, run_start, original.len(), &assembly) {
+                match assemble(
+                    &temp.path,
+                    region_index,
+                    run_start,
+                    original.len(),
+                    &assembly,
+                ) {
                     Ok(assembled) if assembled == original => {
                         assembly_digest.update(run_start.to_be_bytes());
                         assembly_digest.update(assembly.as_bytes());
                         if let Ok(dir) = std::env::var("FN64_REBUILD_DUMP_ASM_DIR") {
                             let _ = std::fs::create_dir_all(&dir);
                             let _ = std::fs::write(
-                                Path::new(&dir)
-                                    .join(format!("{}_{run_start:08x}.s", bank.bank)),
+                                Path::new(&dir).join(format!("{}_{run_start:08x}.s", bank.bank)),
                                 &assembly,
                             );
                         }
@@ -395,7 +433,9 @@ fn run() -> Result<(), String> {
                     );
                 }
                 Some(Err(difference)) => {
-                    tally.differences.push((RegionKind::Run, run_start, difference));
+                    tally
+                        .differences
+                        .push((RegionKind::Run, run_start, difference));
                 }
                 None => {
                     tally.differences.push((
@@ -403,8 +443,7 @@ fn run() -> Result<(), String> {
                         run_start,
                         Difference::Tool {
                             stage: "repair",
-                            detail: "region did not converge within the demotion budget"
-                                .to_owned(),
+                            detail: "region did not converge within the demotion budget".to_owned(),
                         },
                     ));
                 }
@@ -436,7 +475,7 @@ fn run() -> Result<(), String> {
     }
 
     let rom_len = discovery.rom.bytes.len() as u64;
-    let code_bytes = physical_code.total();
+    let classes = classify_rom_bytes(rom_len, &mut physical_code)?;
     let bank_bytes = physical_bank_bytes.total();
     let total_differences: usize = tallies.values().map(|tally| tally.differences.len()).sum();
 
@@ -480,18 +519,24 @@ fn run() -> Result<(), String> {
     }
     println!("  rom_bytes={rom_len}");
     println!(
+        "  header_ipl3_bytes={} ({:.2}%)",
+        classes.header_ipl3,
+        percent(classes.header_ipl3, rom_len)
+    );
+    println!(
         "  physical_bank_bytes={bank_bytes} ({:.2}%)",
         percent(bank_bytes, rom_len)
     );
     println!(
-        "  roundtripped_code_bytes={code_bytes} ({:.2}%)",
-        percent(code_bytes, rom_len)
+        "  roundtripped_code_bytes={} ({:.2}%)",
+        classes.roundtripped_code,
+        percent(classes.roundtripped_code, rom_len)
     );
     println!("  materialized_roundtripped_bytes={materialized_code_bytes}");
     println!(
         "  opaque_bytes={} ({:.2}%)",
-        rom_len - code_bytes,
-        percent(rom_len - code_bytes, rom_len)
+        classes.opaque,
+        percent(classes.opaque, rom_len)
     );
     println!("  differences={total_differences}");
     println!("  assembly_text_sha256={:x}", assembly_digest.finalize());
@@ -507,6 +552,53 @@ fn run() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RomByteClasses {
+    header_ipl3: u64,
+    roundtripped_code: u64,
+    opaque: u64,
+}
+
+/// Partition the normalized ROM into the three Phase-8 physical-byte
+/// classes. Header/IPL3 is a distinct non-code class, and the opaque class is
+/// the checked complement of it and the accepted-code union. This makes it
+/// impossible for an accepted code interval to be hidden by the opaque
+/// remainder while still reporting a complete ROM-sized partition.
+fn classify_rom_bytes(
+    rom_len: u64,
+    physical_code: &mut IntervalUnion,
+) -> Result<RomByteClasses, String> {
+    if physical_code
+        .intervals
+        .iter()
+        .any(|&(start, end)| start >= end || end > rom_len)
+    {
+        return Err("a round-tripped code interval leaves the normalized ROM".to_owned());
+    }
+
+    let header_ipl3 = rom_len.min(HEADER_IPL3_END);
+    if physical_code.overlaps(0, header_ipl3) {
+        return Err("round-tripped code overlaps the header/IPL3 class".to_owned());
+    }
+
+    let roundtripped_code = physical_code.total();
+    let classified = header_ipl3
+        .checked_add(roundtripped_code)
+        .ok_or_else(|| "physical-byte classification overflowed".to_owned())?;
+    let opaque = rom_len
+        .checked_sub(classified)
+        .ok_or_else(|| "header/IPL3 and round-tripped code exceed the normalized ROM".to_owned())?;
+    if header_ipl3 + roundtripped_code + opaque != rom_len {
+        return Err("physical-byte classification does not cover the normalized ROM".to_owned());
+    }
+
+    Ok(RomByteClasses {
+        header_ipl3,
+        roundtripped_code,
+        opaque,
+    })
 }
 
 /// The bank's retained bytes for `[va_start, va_end)`, or `None` when the
@@ -609,6 +701,12 @@ impl IntervalUnion {
             }
         }
         total
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.intervals
+            .iter()
+            .any(|&(other_start, other_end)| other_start < end && start < other_end)
     }
 }
 
@@ -771,5 +869,49 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_byte_classes_are_disjoint_and_complete() {
+        let mut code = IntervalUnion::default();
+        code.insert(0x1000, 0x1100);
+        code.insert(0x1080, 0x1200);
+
+        let classes = classify_rom_bytes(0x4000, &mut code).unwrap();
+
+        assert_eq!(classes.header_ipl3, 0x1000);
+        assert_eq!(classes.roundtripped_code, 0x200);
+        assert_eq!(classes.opaque, 0x2e00);
+        assert_eq!(
+            classes.header_ipl3 + classes.roundtripped_code + classes.opaque,
+            0x4000
+        );
+    }
+
+    #[test]
+    fn physical_byte_classes_reject_code_hidden_under_header_ipl3() {
+        let mut code = IntervalUnion::default();
+        code.insert(0x0ffc, 0x1004);
+
+        assert_eq!(
+            classify_rom_bytes(0x4000, &mut code).unwrap_err(),
+            "round-tripped code overlaps the header/IPL3 class"
+        );
+    }
+
+    #[test]
+    fn physical_byte_classes_reject_code_outside_the_rom() {
+        let mut code = IntervalUnion::default();
+        code.insert(0x3ffc, 0x4004);
+
+        assert_eq!(
+            classify_rom_bytes(0x4000, &mut code).unwrap_err(),
+            "a round-tripped code interval leaves the normalized ROM"
+        );
     }
 }
