@@ -478,6 +478,21 @@ fn plan_bank_shards(
     bank: &MaterializedPackedBank,
     bank_index: usize,
 ) -> Result<Vec<BankShard>, String> {
+    plan_bank_shards_with_bound(bank, bank_index, MAX_SHARD_WORDS)
+}
+
+/// [`plan_bank_shards`] with an explicit word bound.
+///
+/// The bound is a parameter so the within-block split path can be exercised
+/// without a ROM whose blocks exceed [`MAX_SHARD_WORDS`]. Every corpus ROM
+/// measured so far has blocks far smaller than the production bound, so the
+/// split loop's second iteration would otherwise never run under test.
+fn plan_bank_shards_with_bound(
+    bank: &MaterializedPackedBank,
+    bank_index: usize,
+    max_shard_words: usize,
+) -> Result<Vec<BankShard>, String> {
+    assert!(max_shard_words > 0, "shard bound must admit at least one word");
     let bank_id = BankId::new(bank.bank_id);
     let artifact_start = bank
         .blocks
@@ -504,7 +519,7 @@ fn plan_bank_shards(
     for block in &bank.blocks {
         let mut offset = 0usize;
         while offset < block.words.len() {
-            let shard_len = MAX_SHARD_WORDS.min(block.words.len() - offset);
+            let shard_len = max_shard_words.min(block.words.len() - offset);
             let shard_words = &block.words[offset..offset + shard_len];
             let shard_start = block
                 .start_va
@@ -929,4 +944,77 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fn64_discover::block_pack::MaterializedPackedBlock;
+
+    /// One block of `words` MIPS words at `start_va`. The final word is a
+    /// `jr $ra`, so a split whose boundary lands just before it must supply
+    /// the following word as `delay_lookahead`.
+    fn bank(start_va: u32, words: usize) -> MaterializedPackedBank {
+        let mut body: Vec<u32> = (0..words).map(|index| 0x2408_0000 | index as u32).collect();
+        if words >= 2 {
+            body[words - 2] = 0x03e0_0008; // jr $ra
+            body[words - 1] = 0x0000_0000; // its delay slot
+        }
+        MaterializedPackedBank {
+            bank: "boot".to_string(),
+            bank_id: 0x1234_5678_9abc_def0,
+            blocks: vec![MaterializedPackedBlock {
+                start_va,
+                words: body,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_block_within_the_bound_emits_exactly_one_shard() {
+        let shards = plan_bank_shards_with_bound(&bank(0x8000_0400, 16), 0, 64).unwrap();
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].start_va, 0x8000_0400);
+        assert_eq!(shards[0].end_va, 0x8000_0400 + 16 * 4);
+    }
+
+    /// The path the production bound never reaches: every corpus ROM's blocks
+    /// are far smaller than 16,384 words, so without an explicit bound the
+    /// split loop's second iteration is dead code under test.
+    #[test]
+    fn an_oversized_block_splits_into_contiguous_non_overlapping_shards() {
+        let shards = plan_bank_shards_with_bound(&bank(0x8000_0400, 20), 0, 8).unwrap();
+        assert_eq!(shards.len(), 3, "20 words at a bound of 8 is 8 + 8 + 4");
+
+        // Contiguous, ascending, half-open, gapless: a PC in the block must
+        // route to exactly one shard.
+        assert_eq!(shards[0].start_va, 0x8000_0400);
+        for pair in shards.windows(2) {
+            assert_eq!(
+                pair[0].end_va, pair[1].start_va,
+                "a gap or overlap would make dispatcher routing ambiguous"
+            );
+        }
+        assert_eq!(shards[2].end_va, 0x8000_0400 + 20 * 4);
+    }
+
+    #[test]
+    fn every_shard_names_a_distinct_runner_function() {
+        let shards = plan_bank_shards_with_bound(&bank(0x8000_0400, 20), 3, 8).unwrap();
+        let names: std::collections::BTreeSet<String> =
+            shards.iter().map(BankShard::fn_name).collect();
+        assert_eq!(names.len(), shards.len());
+        assert!(names.iter().all(|name| name.starts_with("run_rom_bank_3_shard_")));
+    }
+
+    /// A bank with no blocks is a caller error, not a silent empty plan.
+    #[test]
+    fn an_empty_bank_is_rejected() {
+        let empty = MaterializedPackedBank {
+            bank: "boot".to_string(),
+            bank_id: 1,
+            blocks: Vec::new(),
+        };
+        assert!(plan_bank_shards_with_bound(&empty, 0, 64).is_err());
+    }
 }

@@ -67,7 +67,7 @@ test = false
 [[bin]]
 name = "gate_rom_recompile"
 path = "src/bin/gate_rom_recompile.rs"
-test = false
+test = true
 
 [[bin]]
 name = "gate_rom_rebuild"
