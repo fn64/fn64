@@ -1683,9 +1683,20 @@ mod tests {
         assert!(bounded_json.get("catalog_guarded").is_none());
         assert!(bounded_json.get("catalog_total_authority").is_none());
 
-        let authority =
-            validate_catalog_total_transfer_authority_v1(&banks, &owners, &[], &complete_policy())
-                .unwrap();
+        let policy = complete_policy();
+        let authority = validate_catalog_total_transfer_authority_v1(&banks, &owners, &[], &policy);
+        // Workspace feature unification deliberately links the development
+        // interpreter into this artifact. Such an artifact cannot issue
+        // catalog-total authority; package-scoped AOT tests exercise the
+        // successful arm without weakening the production admission rule.
+        if policy.build_receipt().dev_interpreter {
+            assert_eq!(
+                authority,
+                Err(TransferScanError::CatalogAuthorityPolicyIncomplete)
+            );
+            return;
+        }
+        let authority = authority.unwrap();
         let scan = scan_transfers_with_catalog_total_authority_v1(&banks, &owners, &[], &authority)
             .unwrap();
 
@@ -1743,6 +1754,18 @@ mod tests {
             &MODELED_EXCEPTION_VECTOR_DESTINATIONS_V1
         );
         assert_eq!(policy.build_receipt(), static_execution_build_receipt());
+
+        let exact_owners = [owner("resident", 1, 0x8000_1000, 0x8000_1100)];
+        let linked_result =
+            validate_catalog_total_transfer_authority_v1(&banks, &exact_owners, &[], &policy);
+        if policy.build_receipt().dev_interpreter {
+            assert_eq!(
+                linked_result,
+                Err(TransferScanError::CatalogAuthorityPolicyIncomplete)
+            );
+        } else {
+            assert!(linked_result.is_ok());
+        }
     }
 
     #[test]
@@ -1760,9 +1783,20 @@ mod tests {
             root_coverage: TransferRootCoverageV1::ProvenFactRoots,
         }];
         let owners = [owner("resident", 1, 0x8000_1000, 0x8000_1100)];
-        let authority =
-            validate_catalog_total_transfer_authority_v1(&banks, &owners, &[], &complete_policy())
-                .unwrap();
+        let policy = complete_policy();
+        let authority = validate_catalog_total_transfer_authority_v1(&banks, &owners, &[], &policy);
+        // Workspace feature unification deliberately links the development
+        // interpreter into this artifact. Such an artifact cannot issue
+        // catalog-total authority; package-scoped AOT tests exercise the
+        // successful arm without weakening the production admission rule.
+        if policy.build_receipt().dev_interpreter {
+            assert_eq!(
+                authority,
+                Err(TransferScanError::CatalogAuthorityPolicyIncomplete)
+            );
+            return;
+        }
+        let authority = authority.unwrap();
         let different_hosts = [HostTransferTargetInput {
             bank: "resident",
             guest_pc: 0x8000_3000,

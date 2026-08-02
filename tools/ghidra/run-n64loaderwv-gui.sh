@@ -64,8 +64,8 @@ profile_root=$(CDPATH='' cd -- "$profile_root" && pwd -P) ||
 case "$profile_root" in
     "$repo"|"$repo"/*) fail "PROFILE_ROOT must be outside the repository" ;;
 esac
-if profile_mode=$(stat -f '%Lp' "$profile_root" 2>/dev/null); then :
-elif profile_mode=$(stat -c '%a' "$profile_root" 2>/dev/null); then :
+if profile_mode=$(stat -c '%a' "$profile_root" 2>/dev/null); then :
+elif profile_mode=$(stat -f '%Lp' "$profile_root" 2>/dev/null); then :
 else fail "could not inspect PROFILE_ROOT permissions"
 fi
 [ "$profile_mode" = 700 ] || fail "PROFILE_ROOT must have mode 0700"
