@@ -75,6 +75,51 @@ FN64_DISCOVER_SIG_DONOR_DUMP=<corpus>/games/OOTU/syms/dump.toml \
 gate_decomp_functions
 ```
 
+## WCW/nWo Revenge — the guard witness, graded WITHOUT a donor
+
+Revenge is graded because it is the only ROM in this set that exercises
+`sig_scan::admissible_entry_word`. That guard is inert on all six other
+graded games -- identical output with it disabled -- but disabling it moves
+Revenge from wrong=0 to wrong=4. A guard whose only witness sits outside the
+gate set is how a wrong==0 violation stays invisible, so the witness is now
+inside it.
+
+It is graded with NO signature donor, and that is a measured decision rather
+than an omission. 8-word boot-bank shingle Jaccard against the corpus
+random-pair baseline (median 0.0025, p99 0.0176):
+
+| pair | similarity |
+|---|---|
+| No Mercy <-> WM2000 (both late engine) | **0.0629** |
+| Revenge <-> WM2000 | 0.0387 |
+| Revenge <-> No Mercy | 0.0320 |
+
+Revenge is a generation older than the late trio, so an AKI donor is
+same-franchise but cross-generation, at roughly half the engine similarity
+the late pair share. With the NW4E donor it grades **551/689 wrong=2**: the
+lane adds 52 exact matches and two false splits, at `func_80028860` (split 8
+words in) and `func_8002D524` (split 234 words in). Both split roots are
+genuinely boundary-plausible -- one follows alignment padding, one follows a
+real `jr $ra` -- so the boundary rule is behaving correctly and the donor
+body simply matched an interior region of a larger target function.
+
+Raising `MIN_SIGNATURE_WORDS` does not separate them: at 6 and at 8 the ROM
+still grades wrong=2 while recall falls 551 -> 546 -> 543. These are long
+matches at real internal boundaries, not short-body collisions, so the
+existing degeneracy knobs are the wrong lever. Until a cross-generation
+donor rule exists that admits the 52 without the 2, this ROM is graded
+donor-free.
+
+```sh
+FN64_DISCOVER_ROM="<WCW-nWo Revenge (USA).z64>" \
+FN64_DISCOVER_DUMP=<jessetbh-WCWnWoRevengeRecomp>/syms/dump.toml \
+gate_decomp_functions
+```
+
+The answer key is jessetbh's WCWnWoRevengeRecomp `dump.toml` -- function
+geometry only (name, vram, size), the measured-observation class AGENTS.md
+permits. That project is GPL-3.0; none of its code or runtime is used.
+
 ## AKI wrestling engine — WM2000 (NWXE) and No Mercy (NW4E)
 
 The AKI titles are one engine a year apart, so they donate signatures to
@@ -115,6 +160,7 @@ apart from the donor.
 | K64  | 402 / 531  | 0 |
 | NWXE | 698 / 847  | 0 |
 | NW4E | 835 / 985  | 0 |
+| Revenge (no donor) | 499 / 689  | 0 |
 
 ## gate_rom_rebuild — Phase-8 whole-ROM byte-exact rebuild
 
