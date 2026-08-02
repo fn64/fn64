@@ -211,7 +211,48 @@ pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
     // enough — it is routinely a branch delay slot mid-function
     // (observed: `b; nop` inside MM's __osException). A tail-`j` is not
     // accepted either: handwritten SDK assembly uses `j` for loops.
-    prev1 == 0 && prev2 == 0
+    //
+    // The padding rule alone is necessary but not sufficient: a read-only
+    // data region also begins after zero padding. Requiring the candidate
+    // word itself to be admissible as code closes that hole (observed:
+    // WCW/nWo Revenge, where `func_8002EC80` was split at 0x8002eeb0 — a
+    // KSEG0 pointer run — and `func_8002FF00` at 0x80030860 — packed float
+    // data; both sit immediately after zero padding).
+    prev1 == 0 && prev2 == 0 && admissible_entry_word(raw_words[offset])
+}
+
+/// Whether a word can open a real function.
+///
+/// This rejects the data shapes that follow alignment padding and would
+/// otherwise satisfy [`plausible_function_boundary`]'s padding rule. It is
+/// deliberately a *word-local* test with no window scan: a boundary rule that
+/// consults neighbours would reject real functions whose second word happens
+/// to look like data.
+///
+/// Rejected:
+/// * KSEG0/KSEG1 addresses (`0x8*`/`0xa*` with a plausible RDRAM offset) —
+///   these are pointer-table slots, and a pointer run following padding is
+///   the exact shape that split Revenge's `func_8002EC80`.
+/// * Words whose primary opcode is architecturally reserved on the VR4300.
+///   A real entry decodes; reserved-encoding data does not.
+///
+/// A leading `nop` is deliberately NOT rejected. It looks like padding, but
+/// real functions do open with one (Kirby 64's answer key contains eleven,
+/// including `game_tick` and `play_music`), and rejecting it cost seven
+/// exact matches with no wrong-split prevented.
+fn admissible_entry_word(word: u32) -> bool {
+    // A code pointer stored in data, not an instruction. Restricted to the
+    // cached/uncached RDRAM windows so genuine instructions that merely
+    // begin with those nibbles (they do not, at these opcode positions) can
+    // never be caught: opcodes 0x20 and 0x28 are `lb`/`sb`, whose encodings
+    // occupy the same high nibble, so the low-word check keeps this tight.
+    let opcode = word >> 26;
+    if matches!(word >> 28, 0x8 | 0xa) && (word & 0x0fff_ffff) < 0x0080_0000 {
+        return false;
+    }
+    // Reserved primary opcodes on MIPS III/VR4300. Data frequently lands
+    // here; compiled code never does.
+    !matches!(opcode, 0x13 | 0x1c | 0x1d | 0x1e | 0x1f | 0x3c | 0x3d | 0x3e)
 }
 
 /// One handler-table target together with the exact bank-word geometry that
@@ -362,6 +403,40 @@ pub fn detect_handler_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padding_alone_does_not_admit_a_data_boundary() {
+        // Both shapes below sit immediately after alignment padding, which
+        // satisfied the boundary rule on its own and split two real
+        // functions in WCW/nWo Revenge.
+        let pointer_run = [0, 0, 0x801b_7800, 0x8017_f400, 0x8014_7000];
+        assert!(!plausible_function_boundary(&pointer_run, 2));
+        let packed_data = [0, 0, 0xf801_07c1, 0x003f_0000, 0x0b06_0100];
+        assert!(!plausible_function_boundary(&packed_data, 2));
+
+        // A real prologue after the same padding is still admitted.
+        let real_entry = [0, 0, 0x27bd_ffd8, 0xafbf_001c, 0x0000_0000];
+        assert!(plausible_function_boundary(&real_entry, 2));
+    }
+
+    #[test]
+    fn a_leading_nop_still_opens_a_function() {
+        // Kirby 64's answer key contains eleven functions whose first word
+        // is a nop (game_tick, play_music, ...). Rejecting that shape costs
+        // real matches and prevents no wrong split.
+        let padded_entry = [0, 0, 0x0000_0000, 0x27bd_ffd8];
+        assert!(plausible_function_boundary(&padded_entry, 2));
+    }
+
+    #[test]
+    fn load_and_store_words_are_not_mistaken_for_pointers() {
+        // `lw`/`sw` encodings share the 0x8*/0xa* high nibble with KSEG0
+        // addresses; the low-word bound is what separates them.
+        assert!(admissible_entry_word(0x8fa4_0028)); // lw a0,0x28(sp)
+        assert!(admissible_entry_word(0xafbf_001c)); // sw ra,0x1c(sp)
+        assert!(admissible_entry_word(0x8c8e_0000)); // lw t6,0(a0)
+        assert!(!admissible_entry_word(0x801b_7800)); // KSEG0 pointer
+    }
 
     // A 8-word body: prologue, a lui/addiu pair (address material that
     // differs between donor and target), work, epilogue.
