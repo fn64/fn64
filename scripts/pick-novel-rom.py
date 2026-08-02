@@ -221,8 +221,13 @@ def main():
         sweep = resweep.get(sha[:12], {})
         banks = sweep.get("banks", front.get("mapped_banks", 0))
         open_sites = sweep.get("open", None)
+        # `proven_target_share` was dropped as a score term: with
+        # proven_entries pinned at 1 for every corpus ROM it equalled
+        # 1/distinct_jal_targets, so ranking on it ranked ROMs by having the
+        # FEWEST call targets -- the opposite of the intended "most proven".
+        # code_run_share leads instead: it measures how much of the image is
+        # code the gate can actually exercise.
         score = (
-            front.get("proven_target_share", 0.0),
             rom.get("code_run_share", 0.0),
             -banks,  # fewer banks = simpler whole-ROM story
             -(open_sites if open_sites is not None else 10_000),
@@ -234,7 +239,6 @@ def main():
                 "score": score,
                 "banks": banks,
                 "open_sites": open_sites,
-                "proven_target_share": front.get("proven_target_share"),
                 "code_run_share": rom.get("code_run_share"),
                 "executable_bytes": front.get("executable_bytes"),
                 "size_bytes": rom.get("size_bytes"),
@@ -251,15 +255,13 @@ def main():
     )
     print(
         f"{'rank':>4} {'name':44.44} {'banks':>5} {'open':>5} "
-        f"{'proven%':>8} {'code%':>6} {'MiB':>5}"
+        f"{'code%':>6} {'MiB':>5}"
     )
     for rank, c in enumerate(candidates[: args.top], 1):
-        proven = c["proven_target_share"]
         code = c["code_run_share"]
         print(
             f"{rank:>4} {c['name']:44.44} {c['banks']:>5} "
             f"{c['open_sites'] if c['open_sites'] is not None else '?':>5} "
-            f"{proven * 100 if proven is not None else -1:>8.2f} "
             f"{code * 100 if code is not None else -1:>6.2f} "
             f"{c['size_bytes'] / 1048576:>5.1f}"
         )

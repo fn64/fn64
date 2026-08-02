@@ -202,7 +202,12 @@ def read_header_fields(rom: bytes) -> dict[str, Any]:
         "cartridge_code": cartridge_id[1:3].decode("ascii", "replace"),
         "region": chr(cartridge_id[3]) if 0x20 <= cartridge_id[3] < 0x7F else "",
         "version": rom[0x3F],
-        "pi_bsd_dom1_config": struct.unpack_from(">I", rom, 0x00)[0],
+        # Header word 0 is deliberately absent: it is the z64 byte-order
+        # magic (0x80371240 in every normalized image), already reported as
+        # `byte_order`. It was previously emitted as `pi_bsd_dom1_config`,
+        # which it is not -- the PI timing fields are the individual bytes of
+        # that word, not the word itself, and the whole-word value carried no
+        # information across all 287 corpus ROMs.
         "clock_rate": struct.unpack_from(">I", rom, 0x04)[0],
         "entry_point": struct.unpack_from(">I", rom, 0x08)[0],
         "libultra_version": struct.unpack_from(">I", rom, 0x0C)[0],
@@ -237,26 +242,21 @@ def measure_boot_bank(rom: bytes) -> dict[str, Any]:
         raise CatalogError("ROM is too small to contain a boot copy")
     words = list(struct.unpack(f">{len(boot) // 4}I", boot[: len(boot) // 4 * 4]))
 
+    code_words = 0
+    for word in words:
+        if word >> 26 in CODE_PRIMARY_OPCODES:
+            code_words += 1
+
+    # `jal` targets, returns, and prologues are counted over code runs only,
+    # for the same reason the hazard census is: decoding data as instructions
+    # invents thousands of them. Measured before this restriction, Mario
+    # Tennis reported 10,199 distinct call targets of which 49 lay in code --
+    # 99.5% were data -- and the resulting ratio's corpus maximum was 2549.75.
+    # Restricting both terms is not a rescale: it reorders the corpus
+    # (Spearman 0.58 against the unrestricted version).
     jal_targets: set[int] = set()
     jr_ra_count = 0
     stack_prologue_count = 0
-    code_words = 0
-    for word in words:
-        opcode = word >> 26
-        if opcode == OPCODE_JAL:
-            jal_targets.add((word & 0x03FF_FFFF) << 2)
-        elif word == WORD_JR_RA:
-            jr_ra_count += 1
-        elif (
-            opcode == OPCODE_ADDIU
-            and (word >> 21) & 0x1F == REGISTER_SP
-            and (word >> 16) & 0x1F == REGISTER_SP
-            and word & 0x8000
-        ):
-            stack_prologue_count += 1
-        if opcode in CODE_PRIMARY_OPCODES:
-            code_words += 1
-
     hazards = collections.Counter()
     code_run_words = 0
     for start, end in code_run_spans(words):
@@ -264,6 +264,19 @@ def measure_boot_bank(rom: bytes) -> dict[str, Any]:
         for index in range(start, end):
             word = words[index]
             opcode = word >> 26
+            if opcode == OPCODE_JAL:
+                jal_targets.add((word & 0x03FF_FFFF) << 2)
+            elif word == WORD_JR_RA:
+                jr_ra_count += 1
+            elif (
+                opcode == OPCODE_ADDIU
+                and (word >> 21) & 0x1F == REGISTER_SP
+                and (word >> 16) & 0x1F == REGISTER_SP
+                and word & 0x8000
+            ):
+                stack_prologue_count += 1
+            # Hazards share this pass; their opcode classes are disjoint from
+            # the call/return/prologue shapes above.
             if opcode == 0x2F:
                 hazards["cache_ops"] += 1
             elif opcode in (0x35, 0x3D):
@@ -285,9 +298,11 @@ def measure_boot_bank(rom: bytes) -> dict[str, Any]:
         "jr_ra_count": jr_ra_count,
         "stack_prologue_count": stack_prologue_count,
         # A boot bank that is purely a loader stub has many outbound call
-        # targets and almost no resident function bodies. Guard the divisor:
-        # zero returns means every target is outbound, which is the extreme of
-        # the stub case, not an error.
+        # targets and almost no resident function bodies. Both terms are
+        # code-run-restricted (see above), so this is a ratio of call sites to
+        # function bodies rather than of decoded data to decoded data. Guard
+        # the divisor: zero returns means every target is outbound, which is
+        # the extreme of the stub case, not an error.
         "loader_stub_ratio": (
             round(distinct_jal_targets / jr_ra_count, 4)
             if jr_ra_count

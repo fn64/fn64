@@ -512,13 +512,20 @@ def join(
                 },
                 "selected_strategy": summary["selected_strategy"],
                 "mapped_banks": coverage["mapped_banks"],
+                # Zero for every corpus ROM measured to date. Retained because
+                # it is an upstream discovery signal, not a derived one: a
+                # nonzero value here would mean cold discovery began admitting
+                # executable extent, which is exactly the change worth seeing.
                 "executable_bytes": coverage["executable_bytes"],
+                # `proven_entries` is 1 for every corpus ROM (the entry point
+                # alone) and `proven_target_share` was therefore exactly
+                # 1/distinct_jal_targets in all 287 rows -- it restated the
+                # denominator and was dropped. Candidate/supported counts do
+                # vary and stay.
                 "proven_entries": proven,
                 "candidate_entries": states.get("Candidate", 0),
                 "supported_entries": states.get("Supported", 0),
                 "distinct_jal_targets": targets,
-                # The magnitude of the gap, not merely that one exists.
-                "proven_target_share": round(proven / targets, 6) if targets else 0.0,
                 "loader_stub_ratio": record["loader_stub_ratio"],
                 "code_run_share": record["code_run_share"],
                 "boot_entropy": record["boot_entropy"],

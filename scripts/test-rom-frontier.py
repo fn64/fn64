@@ -225,17 +225,21 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["proven_entries"], 1)
         self.assertEqual(rows[0]["distinct_jal_targets"], 1000)
-        self.assertEqual(rows[0]["proven_target_share"], 0.001)
+        # The gap is reported as its two terms. A derived share is not:
+        # proven_entries is 1 for every measured ROM, so a share would be
+        # exactly 1/distinct_jal_targets and restate the denominator.
+        self.assertNotIn("proven_target_share", rows[0])
 
     def test_unmatched_catalog_rows_are_dropped_not_guessed(self) -> None:
         with self.assertRaises(FRONTIER.FrontierError):
             FRONTIER.join([catalog_record()], {"b" * 64: summary("b" * 64)})
 
-    def test_zero_targets_does_not_divide_by_zero(self) -> None:
+    def test_zero_targets_is_reported_without_a_derived_ratio(self) -> None:
         rows = FRONTIER.join(
             [catalog_record(distinct_jal_targets=0)], {"a" * 64: summary()}
         )
-        self.assertEqual(rows[0]["proven_target_share"], 0.0)
+        self.assertEqual(rows[0]["distinct_jal_targets"], 0)
+        self.assertNotIn("proven_target_share", rows[0])
 
     def test_owner_diagnostics_and_measurement_are_retained_without_renaming(self) -> None:
         proof = owner_proof()
