@@ -219,6 +219,10 @@ pub enum TransferBlockerV1 {
         bank: String,
         site_pc: u32,
     },
+    SelfReferentialBranchReached {
+        bank: String,
+        site_pc: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -655,6 +659,12 @@ fn scan_transfers_inner_v1(
                         site_pc: *at,
                     });
                 }
+                BlockTerminator::SelfReferentialBranch { at } => {
+                    blockers.push(TransferBlockerV1::SelfReferentialBranchReached {
+                        bank: bank.bank.to_string(),
+                        site_pc: *at,
+                    });
+                }
             }
         }
 
@@ -933,11 +943,16 @@ fn validate_inputs(
         let mut expected_tail_transfers = BTreeSet::new();
         let mut block_ranges = Vec::new();
         for block in &bank.closure.cfg.blocks {
-            let zero_length_data_fence = block.start_va == block.end_va
-                && matches!(
-                    block.terminator,
-                    BlockTerminator::DataFence { at } if at == block.start_va
-                );
+            // `DataFence` and `SelfReferentialBranch` are the two terminators
+            // descent can produce with zero decoded words; `start_va ==
+            // end_va` is valid geometry for them alone.
+            let fenced_at_start = match block.terminator {
+                BlockTerminator::DataFence { at } | BlockTerminator::SelfReferentialBranch { at } => {
+                    at == block.start_va
+                }
+                _ => false,
+            };
+            let zero_length_data_fence = block.start_va == block.end_va && fenced_at_start;
             if block.start_va < bank.va_start
                 || block.end_va > bank.va_end
                 || (block.start_va >= block.end_va && !zero_length_data_fence)
@@ -1292,6 +1307,7 @@ mod tests {
                 indirect_sites,
                 plain_delay_entry_aliases: Vec::new(),
                 unsupported_delay_entries: Vec::new(),
+                rejected_transfer_targets: Vec::new(),
                 proven_roots: vec![0x8000_1000],
             },
             indirect,

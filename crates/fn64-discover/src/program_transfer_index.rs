@@ -482,8 +482,17 @@ fn add_cfg_edges(
     let cfg = &bank.closure.cfg;
     let mut block_starts = BTreeSet::new();
     for block in &cfg.blocks {
-        let valid_zero_length_fence = block.start_va == block.end_va
-            && matches!(block.terminator, BlockTerminator::DataFence { at } if at == block.start_va);
+        // `DataFence` and `SelfReferentialBranch` are the two terminators
+        // descent can produce with zero decoded words: both refuse to read
+        // anything before ending the block, so `start_va == end_va` is valid
+        // geometry for them alone.
+        let fenced_at_start = match block.terminator {
+            BlockTerminator::DataFence { at } | BlockTerminator::SelfReferentialBranch { at } => {
+                at == block.start_va
+            }
+            _ => false,
+        };
+        let valid_zero_length_fence = block.start_va == block.end_va && fenced_at_start;
         if block.start_va < bank.va_start
             || block.end_va > bank.va_end
             || (block.start_va >= block.end_va && !valid_zero_length_fence)
@@ -602,7 +611,8 @@ fn add_cfg_edges(
             | BlockTerminator::InvalidInstruction { .. }
             | BlockTerminator::MissingDelaySlot { .. }
             | BlockTerminator::RanOffEnd
-            | BlockTerminator::DataFence { .. } => {}
+            | BlockTerminator::DataFence { .. }
+            | BlockTerminator::SelfReferentialBranch { .. } => {}
         }
     }
     Ok(())
@@ -757,6 +767,7 @@ mod tests {
             indirect_sites: Vec::<IndirectSite>::new(),
             plain_delay_entry_aliases: Vec::new(),
             unsupported_delay_entries: Vec::new(),
+            rejected_transfer_targets: Vec::new(),
             proven_roots: Vec::new(),
         }
     }

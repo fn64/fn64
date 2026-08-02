@@ -912,7 +912,9 @@ fn validate_block(
             });
             true
         }
-        BlockTerminator::RanOffEnd | BlockTerminator::DataFence { .. } => {
+        BlockTerminator::RanOffEnd
+        | BlockTerminator::DataFence { .. }
+        | BlockTerminator::SelfReferentialBranch { .. } => {
             blockers.insert(OwnerBlocker::RanOffEnd {
                 block_start: block.start_va,
             });
@@ -1045,7 +1047,8 @@ fn validate_incoming(
             | BlockTerminator::InvalidInstruction { .. }
             | BlockTerminator::MissingDelaySlot { .. }
             | BlockTerminator::RanOffEnd
-            | BlockTerminator::DataFence { .. } => {}
+            | BlockTerminator::DataFence { .. }
+            | BlockTerminator::SelfReferentialBranch { .. } => {}
         }
         for (target, edge) in edges {
             if !contains(target) {
@@ -1355,6 +1358,7 @@ mod tests {
                 indirect_sites: Vec::new(),
                 plain_delay_entry_aliases: Vec::new(),
                 unsupported_delay_entries: Vec::new(),
+                rejected_transfer_targets: Vec::new(),
                 proven_roots: Vec::new(),
             },
             indirect: Vec::new(),
@@ -1400,6 +1404,7 @@ mod tests {
             indirect_sites: Vec::new(),
             plain_delay_entry_aliases: Vec::new(),
             unsupported_delay_entries: Vec::new(),
+            rejected_transfer_targets: Vec::new(),
             proven_roots: vec![BASE],
         };
         assert_eq!(

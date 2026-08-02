@@ -678,9 +678,12 @@ fn bank_slice(
 
 /// Maximal contiguous spans of CFG blocks whose terminators prove every word
 /// in the extent decoded as code. Blocks ending in `InvalidInstruction`,
-/// `MissingDelaySlot`, `RanOffEnd`, or `DataFence` carry words that are not
-/// proven code, so their extents are excluded wholesale — conservatively:
-/// their decodable prefixes become opaque frontier, never a silent claim.
+/// `MissingDelaySlot`, `RanOffEnd`, `DataFence`, or `SelfReferentialBranch`
+/// carry words that are not proven code, so their extents are excluded
+/// wholesale — conservatively: their decodable prefixes become opaque
+/// frontier, never a silent claim. `SelfReferentialBranch` in particular is a
+/// zero-instruction block (descent refused before decoding anything), so
+/// admitting it here would hand `emit_code_region` an empty word slice.
 /// Adjacent and delay-slot-overlapping blocks merge into one span.
 fn proven_code_runs(bank_snapshot: &fn64_discover::snapshot::BankSnapshotV1) -> Vec<(u32, u32)> {
     let mut spans: Vec<(u32, u32)> = bank_snapshot
@@ -695,6 +698,7 @@ fn proven_code_runs(bank_snapshot: &fn64_discover::snapshot::BankSnapshotV1) -> 
                     | BlockTerminator::MissingDelaySlot { .. }
                     | BlockTerminator::RanOffEnd
                     | BlockTerminator::DataFence { .. }
+                    | BlockTerminator::SelfReferentialBranch { .. }
             )
         })
         .map(|block| (block.start_va, block.end_va))

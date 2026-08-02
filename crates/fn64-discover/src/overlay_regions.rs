@@ -577,7 +577,9 @@ fn descriptor_mapping_corroborated(
                     control_pc: *control_pc,
                 })
             }
-            BlockTerminator::RanOffEnd | BlockTerminator::DataFence { .. } => {
+            BlockTerminator::RanOffEnd
+            | BlockTerminator::DataFence { .. }
+            | BlockTerminator::SelfReferentialBranch { .. } => {
                 Some(DescriptorCfgFailure::RanOffEnd {
                     block_start: block.start_va,
                 })

@@ -366,7 +366,8 @@ fn reachable_blocks(
             | BlockTerminator::InvalidInstruction { .. }
             | BlockTerminator::MissingDelaySlot { .. }
             | BlockTerminator::RanOffEnd
-            | BlockTerminator::DataFence { .. } => {}
+            | BlockTerminator::DataFence { .. }
+            | BlockTerminator::SelfReferentialBranch { .. } => {}
         }
     }
     visited
@@ -472,6 +473,7 @@ mod tests {
                 continuation_va: continuation,
             }],
             unsupported_delay_entries: Vec::new(),
+            rejected_transfer_targets: Vec::new(),
             proven_roots: vec![entry],
         };
 
@@ -539,6 +541,7 @@ mod tests {
             indirect_sites: vec![],
             plain_delay_entry_aliases: vec![],
             unsupported_delay_entries: vec![],
+            rejected_transfer_targets: Vec::new(),
             proven_roots: vec![0x8000_0000, 0x8000_0020],
         };
 
@@ -755,6 +758,7 @@ mod tests {
             indirect_sites: vec![],
             plain_delay_entry_aliases: vec![],
             unsupported_delay_entries: vec![],
+            rejected_transfer_targets: Vec::new(),
             proven_roots: vec![0x8000_0000, 0x8000_0008],
         };
         let part = Partition {

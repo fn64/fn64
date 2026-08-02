@@ -213,7 +213,8 @@ fn authority_delay_slot_va(block: &BasicBlock) -> Option<u32> {
         | BlockTerminator::InvalidInstruction { .. }
         | BlockTerminator::MissingDelaySlot { .. }
         | BlockTerminator::RanOffEnd
-        | BlockTerminator::DataFence { .. } => None,
+        | BlockTerminator::DataFence { .. }
+        | BlockTerminator::SelfReferentialBranch { .. } => None,
     }
 }
 
@@ -673,6 +674,7 @@ mod tests {
             indirect_sites: Vec::new(),
             plain_delay_entry_aliases: Vec::new(),
             unsupported_delay_entries: Vec::new(),
+            rejected_transfer_targets: Vec::new(),
             proven_roots: Vec::new(),
         }
     }
@@ -769,6 +771,7 @@ mod tests {
             indirect_sites: Vec::new(),
             plain_delay_entry_aliases: Vec::new(),
             unsupported_delay_entries: Vec::new(),
+            rejected_transfer_targets: Vec::new(),
             proven_roots: roots,
         }
     }

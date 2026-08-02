@@ -431,7 +431,8 @@ fn declared_edge_count(terminator: &BlockTerminator) -> Option<usize> {
         | BlockTerminator::InvalidInstruction { .. }
         | BlockTerminator::MissingDelaySlot { .. }
         | BlockTerminator::RanOffEnd
-        | BlockTerminator::DataFence { .. } => Some(0),
+        | BlockTerminator::DataFence { .. }
+        | BlockTerminator::SelfReferentialBranch { .. } => Some(0),
     }
 }
 
@@ -540,6 +541,7 @@ fn describe_block(
             BlockTerminator::DataFence { .. } => (13, false, false, 0, Vec::new()),
             BlockTerminator::InvalidInstruction { .. } => (13, false, false, 0, Vec::new()),
             BlockTerminator::MissingDelaySlot { .. } => (14, false, false, 0, Vec::new()),
+            BlockTerminator::SelfReferentialBranch { .. } => (15, false, false, 0, Vec::new()),
         };
     edges.sort_unstable();
     edges.dedup();
@@ -671,6 +673,7 @@ mod tests {
             indirect_sites: Vec::new(),
             plain_delay_entry_aliases: Vec::new(),
             unsupported_delay_entries: Vec::new(),
+            rejected_transfer_targets: Vec::new(),
             proven_roots: Vec::new(),
         }
     }

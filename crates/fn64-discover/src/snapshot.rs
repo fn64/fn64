@@ -5008,6 +5008,7 @@ mod tests {
                 indirect_sites: Vec::new(),
                 plain_delay_entry_aliases: Vec::new(),
                 unsupported_delay_entries: Vec::new(),
+                rejected_transfer_targets: Vec::new(),
                 proven_roots: vec![site_pc],
             },
             indirect: evidence_sets

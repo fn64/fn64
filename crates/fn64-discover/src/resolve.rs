@@ -1641,7 +1641,8 @@ fn block_successors(block: &BasicBlock) -> Vec<u32> {
         | BlockTerminator::InvalidInstruction { .. }
         | BlockTerminator::MissingDelaySlot { .. }
         | BlockTerminator::RanOffEnd
-        | BlockTerminator::DataFence { .. } => Vec::new(),
+        | BlockTerminator::DataFence { .. }
+        | BlockTerminator::SelfReferentialBranch { .. } => Vec::new(),
     }
 }
 
@@ -4496,6 +4497,7 @@ mod tests {
             }],
             plain_delay_entry_aliases: Vec::new(),
             unsupported_delay_entries: Vec::new(),
+            rejected_transfer_targets: Vec::new(),
             proven_roots: vec![0x8000_0100, 0x8000_0200],
         };
 

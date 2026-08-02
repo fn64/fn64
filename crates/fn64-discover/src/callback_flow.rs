@@ -316,7 +316,8 @@ fn successors(block: &BasicBlock) -> Vec<(u32, bool)> {
         | BlockTerminator::InvalidInstruction { .. }
         | BlockTerminator::MissingDelaySlot { .. }
         | BlockTerminator::RanOffEnd
-        | BlockTerminator::DataFence { .. } => Vec::new(),
+        | BlockTerminator::DataFence { .. }
+        | BlockTerminator::SelfReferentialBranch { .. } => Vec::new(),
     }
 }
 

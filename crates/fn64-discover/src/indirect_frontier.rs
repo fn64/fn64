@@ -700,6 +700,7 @@ mod tests {
             }],
             plain_delay_entry_aliases: vec![],
             unsupported_delay_entries: vec![],
+            rejected_transfer_targets: Vec::new(),
             proven_roots: vec![],
         };
         let indirect = vec![IndirectResolution {

@@ -1772,6 +1772,7 @@ mod tests {
                 indirect_sites: vec![],
                 plain_delay_entry_aliases: vec![],
                 unsupported_delay_entries: vec![],
+                rejected_transfer_targets: Vec::new(),
                 proven_roots: vec![PI, EPI],
             };
             for pc in (PI..PI + (pi.len() as u32) * 4).step_by(4) {

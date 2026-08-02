@@ -563,7 +563,8 @@ pub fn concrete_successors(block: &BasicBlock) -> Vec<ConcreteSuccessor> {
         | BlockTerminator::Trap
         | BlockTerminator::InvalidInstruction { .. }
         | BlockTerminator::MissingDelaySlot { .. }
-        | BlockTerminator::DataFence { .. } => Vec::new(),
+        | BlockTerminator::DataFence { .. }
+        | BlockTerminator::SelfReferentialBranch { .. } => Vec::new(),
     }
 }
 
@@ -581,7 +582,9 @@ fn ordinary_prefix_end(block: &BasicBlock) -> u32 {
         }
         BlockTerminator::InvalidInstruction { pc, .. }
         | BlockTerminator::MissingDelaySlot { control_pc: pc } => *pc,
-        BlockTerminator::RanOffEnd | BlockTerminator::DataFence { .. } => block.end_va,
+        BlockTerminator::RanOffEnd
+        | BlockTerminator::DataFence { .. }
+        | BlockTerminator::SelfReferentialBranch { .. } => block.end_va,
     }
 }
 

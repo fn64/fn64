@@ -240,7 +240,12 @@ pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
 /// real functions do open with one (Kirby 64's answer key contains eleven,
 /// including `game_tick` and `play_music`), and rejecting it cost seven
 /// exact matches with no wrong-split prevented.
-fn admissible_entry_word(word: u32) -> bool {
+///
+/// `pub(crate)`: also consulted by `cfg`'s recursive descent, which needs the
+/// same word-local rule to keep `j`/branch targets out of data islands
+/// (Donald Duck, Rayman 2). Kept here rather than duplicated so the rule has
+/// exactly one definition.
+pub(crate) fn admissible_entry_word(word: u32) -> bool {
     // A code pointer stored in data, not an instruction. Restricted to the
     // cached/uncached RDRAM windows so genuine instructions that merely
     // begin with those nibbles (they do not, at these opcode positions) can
