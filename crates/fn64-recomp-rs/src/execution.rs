@@ -1423,7 +1423,22 @@ pub fn generated_runner_runtime_source_receipt_v1() -> GeneratedRunnerRuntimeSou
             b"src/generated_support.rs",
             include_bytes!("generated_support.rs"),
         ),
-        (b"src/runtime.rs", include_bytes!("runtime.rs")),
+        (
+            b"src/runtime/fpu_ops.rs",
+            include_bytes!("runtime/fpu_ops.rs"),
+        ),
+        (
+            b"src/runtime/host.rs",
+            include_bytes!("runtime/host.rs"),
+        ),
+        (
+            b"src/runtime/mod.rs",
+            include_bytes!("runtime/mod.rs"),
+        ),
+        (
+            b"src/runtime/tests.rs",
+            include_bytes!("runtime/tests.rs"),
+        ),
     ];
     let mut hasher = Sha256::new();
     hasher.update(b"fn64:generated-runner-runtime-source:v1:");
@@ -1495,7 +1510,22 @@ pub fn generated_runner_runtime_source_receipt_v2() -> GeneratedRunnerRuntimeSou
             b"src/generated_support.rs",
             include_bytes!("generated_support.rs"),
         ),
-        (b"src/runtime.rs", include_bytes!("runtime.rs")),
+        (
+            b"src/runtime/fpu_ops.rs",
+            include_bytes!("runtime/fpu_ops.rs"),
+        ),
+        (
+            b"src/runtime/host.rs",
+            include_bytes!("runtime/host.rs"),
+        ),
+        (
+            b"src/runtime/mod.rs",
+            include_bytes!("runtime/mod.rs"),
+        ),
+        (
+            b"src/runtime/tests.rs",
+            include_bytes!("runtime/tests.rs"),
+        ),
         (b"src/fpu.rs", include_bytes!("fpu.rs")),
     ];
     let mut hasher = Sha256::new();

@@ -68,7 +68,22 @@ pub fn static_micro_op_executor_source_receipt_v1() -> StaticMicroOpExecutorSour
             include_bytes!("decoder/mod.rs"),
         ),
         (b"src/execution.rs", include_bytes!("execution.rs")),
-        (b"src/runtime.rs", include_bytes!("runtime.rs")),
+        (
+            b"src/runtime/fpu_ops.rs",
+            include_bytes!("runtime/fpu_ops.rs"),
+        ),
+        (
+            b"src/runtime/host.rs",
+            include_bytes!("runtime/host.rs"),
+        ),
+        (
+            b"src/runtime/mod.rs",
+            include_bytes!("runtime/mod.rs"),
+        ),
+        (
+            b"src/runtime/tests.rs",
+            include_bytes!("runtime/tests.rs"),
+        ),
         (
             b"src/static_micro_op.rs",
             include_bytes!("static_micro_op.rs"),
@@ -127,7 +142,22 @@ pub fn static_micro_op_executor_source_receipt_v2() -> StaticMicroOpExecutorSour
             include_bytes!("decoder/mod.rs"),
         ),
         (b"src/execution.rs", include_bytes!("execution.rs")),
-        (b"src/runtime.rs", include_bytes!("runtime.rs")),
+        (
+            b"src/runtime/fpu_ops.rs",
+            include_bytes!("runtime/fpu_ops.rs"),
+        ),
+        (
+            b"src/runtime/host.rs",
+            include_bytes!("runtime/host.rs"),
+        ),
+        (
+            b"src/runtime/mod.rs",
+            include_bytes!("runtime/mod.rs"),
+        ),
+        (
+            b"src/runtime/tests.rs",
+            include_bytes!("runtime/tests.rs"),
+        ),
         (
             b"src/static_micro_op.rs",
             include_bytes!("static_micro_op.rs"),
@@ -191,7 +221,22 @@ pub fn static_micro_op_executor_source_receipt_v3() -> StaticMicroOpExecutorSour
             include_bytes!("decoder/mod.rs"),
         ),
         (b"src/execution.rs", include_bytes!("execution.rs")),
-        (b"src/runtime.rs", include_bytes!("runtime.rs")),
+        (
+            b"src/runtime/fpu_ops.rs",
+            include_bytes!("runtime/fpu_ops.rs"),
+        ),
+        (
+            b"src/runtime/host.rs",
+            include_bytes!("runtime/host.rs"),
+        ),
+        (
+            b"src/runtime/mod.rs",
+            include_bytes!("runtime/mod.rs"),
+        ),
+        (
+            b"src/runtime/tests.rs",
+            include_bytes!("runtime/tests.rs"),
+        ),
         (b"src/fpu.rs", include_bytes!("fpu.rs")),
         (
             b"src/static_micro_op.rs",
