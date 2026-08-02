@@ -22,8 +22,7 @@
 //! * `FN64_RECOMPILE_REPORT` — optional content-free JSON receipt path.
 
 use fn64_discover::block_pack::{
-    emit_materialized_bank_runner, emit_validated_block_pack_v2, materialize_block_pack,
-    BlockPackV1, MaterializedPackedBank,
+    emit_validated_block_pack_v2, materialize_block_pack, BlockPackV1, MaterializedPackedBank,
 };
 use fn64_discover::closure::{
     classified_destinations, scoreboard, ClosureScoreboard, DestinationClass,
@@ -35,6 +34,8 @@ use fn64_discover::snapshot::{
     MultiBankCompositionLimits,
 };
 use fn64_discover::{required_env_path, Fact, FactDb, RomAddressSpace};
+use fn64_recomp_rs::execution::BankId;
+use fn64_recomp_rs_codegen::{emit_dense_bank_shard_runner_function, DenseBankShardInput};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -53,6 +54,24 @@ const MAX_ROM_BYTES: u64 = 128 * 1024 * 1024;
 /// keeps every rustc invocation small enough to finish in practice, without
 /// changing which words are emitted or what the harness proves.
 const MAX_COMPILE_UNIT_WORDS: usize = (DENSE_AOT_SHARD_BYTES / 4) as usize;
+
+/// Maximum words a single emitted *function* may cover, using the same 64
+/// KiB dense-AOT shard convention as [`MAX_COMPILE_UNIT_WORDS`] (the two
+/// constants happen to share a value, but bound different things: this one
+/// bounds one `fn`'s own `match pc {}` arm count, that one bounds how many
+/// already-small functions one rustc invocation compiles together).
+///
+/// `MAX_COMPILE_UNIT_WORDS` alone cannot fix compile time when a whole bank
+/// is a single giant emitted function -- grouping compile units cannot
+/// subdivide a function that was never split. Penny Racers is exactly this
+/// case: one physical bank, 5,837 words, one `emit_materialized_bank_runner`
+/// call previously produced one `match` with over a thousand arms, which hit
+/// an LLVM `-O` `ConstraintEliminationPass` complexity cliff independent of
+/// how many rustc invocations saw it. Splitting *emission* itself -- before
+/// any function is generated, using the same shard-before-emission idiom
+/// `gate_wm2000_recompile`'s dense-AOT path already relies on -- keeps every
+/// emitted function small regardless of how large the source bank is.
+const MAX_SHARD_WORDS: usize = (DENSE_AOT_SHARD_BYTES / 4) as usize;
 
 struct PhysicalBank {
     bank: String,
@@ -238,18 +257,26 @@ fn run() -> Result<(), String> {
         .collect();
     println!("unsupported_punch_list=[{}]", unsupported.join(", "));
 
-    let mut runners = Vec::with_capacity(materialized.len());
+    let mut bank_shards = Vec::with_capacity(materialized.len());
     for (index, bank) in materialized.iter().enumerate() {
-        runners.push(emit_materialized_bank_runner(
-            bank,
-            &format!("run_rom_bank_{index}"),
-        ));
+        bank_shards.push(
+            plan_bank_shards(bank, index)
+                .map_err(|error| format!("sharding bank {}: {error}", bank.bank))?,
+        );
     }
-    let runner_sha256 = sha256_hex(runners.join("\n").as_bytes());
-    let harness_report = compile_and_run_harness(&runners, &materialized)?;
+    let runner_sha256 = sha256_hex(
+        bank_shards
+            .iter()
+            .flatten()
+            .map(|shard| shard.source.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .as_bytes(),
+    );
+    let harness_report = compile_and_run_harness(&bank_shards, &materialized)?;
     println!(
         "generated runners: banks={} sha256={runner_sha256} rustc_compiles=true harness_runs=true",
-        runners.len(),
+        materialized.len(),
     );
     for line in harness_report.lines() {
         println!("runner: {line}");
@@ -383,39 +410,178 @@ fn callable_roots(facts: &FactDb, bank: &PhysicalBank) -> Vec<u32> {
     roots.into_iter().collect()
 }
 
-/// One bounded compile unit: a contiguous run of whole banks (in `banks`
-/// order) whose combined emitted-code word count does not exceed
-/// [`MAX_COMPILE_UNIT_WORDS`]. A bank is never split across units -- its
-/// runner function is one opaque string from the sparse emitter -- so a
-/// single bank larger than the bound still gets its own (oversized) unit
-/// rather than breaking the bound guarantee for every other unit.
-struct CompileUnit {
-    /// Indices into `banks`/`runners`, in ascending order.
-    bank_indices: Vec<usize>,
+/// One 64 KiB-bounded slice of one bank's materialized words, already
+/// rendered to Rust source by the dense shard emitter.
+///
+/// This is the actual fix for the compile-time cliff: emission itself is
+/// split before any function is generated, so no single emitted `fn` -- and
+/// therefore no single rustc `-O` pass -- ever sees more than
+/// [`MAX_SHARD_WORDS`] words, regardless of how large the source bank is.
+#[derive(Clone)]
+struct BankShard {
+    /// Index into `materialized`/`bank_shards` identifying the owning bank.
+    bank_index: usize,
+    /// This shard's ordinal within its bank, used to name its function.
+    shard_index: usize,
+    /// `[start_va, end_va)`: the guest PC range this shard's own generated
+    /// `match pc {}` arms cover. Used by the bank's dispatcher wrapper to
+    /// route a PC to the shard that owns it.
+    start_va: u32,
+    end_va: u32,
+    /// The rendered `fn run_rom_bank_{bank_index}_shard_{shard_index}(...)`.
+    source: String,
 }
 
-/// Partition banks into compile units by accumulated word count, in
-/// deterministic `banks`-order. Grouping is geometry-derived (word counts
-/// from the materialized pack, iterated in the caller's already-sorted bank
-/// order) so two runs on the same ROM produce identical unit boundaries.
-fn plan_compile_units(banks: &[MaterializedPackedBank]) -> Vec<CompileUnit> {
+impl BankShard {
+    fn fn_name(&self) -> String {
+        format!(
+            "run_rom_bank_{}_shard_{}",
+            self.bank_index, self.shard_index
+        )
+    }
+}
+
+/// Split one materialized bank into dense shard runners, each covering at
+/// most [`MAX_SHARD_WORDS`] words of one block.
+///
+/// A block is split at shard boundaries, never across blocks -- blocks may
+/// have gaps between them (proven code spans are not required to be
+/// contiguous), and a gap PC must remain unmapped, not silently absorbed
+/// into an adjacent block's shard. Splitting *inside* a block reuses the
+/// exact idiom `dense_aot_pack.rs` already uses for contiguous ROM/RDRAM
+/// shards: `delay_lookahead` is the word immediately following this slice
+/// within the same block, so a control transfer that is a shard's last
+/// owned word still gets its correct architectural delay-slot word; the
+/// true last word of a block that dangles mid control-transfer pair (no
+/// admitted successor in the block at all) is a malformed proven span the
+/// dense emitter is right to reject loudly, since executing it would fault
+/// identically under the sparse emitter too.
+///
+/// `artifact_vram_start/end` is set to the *whole bank's* extent (its first
+/// block's start through its last block's end), not this shard's own
+/// narrower range. That is what keeps every in-bank control transfer --
+/// including ones that land in a different shard of the same bank -- typed
+/// as `BlockExit::Transfer(same BankId, target)` rather than
+/// `ResolveTransfer` (see `emit.rs` `ExecutionDomain::contains`): the
+/// generated dispatcher wrapper below is what actually owns routing that
+/// `Transfer` to the shard function whose range contains `target`, so no
+/// resolver or per-shard `BankId` is needed to stitch shards of one bank
+/// back together.
+///
+/// `verify_live_words: false`: this gate is a compile-and-probe
+/// certification run against a freshly allocated, mostly-zeroed probe
+/// `Rdram`, not a live-RDRAM boot (see `emit.rs:79-82` -- "compile-only
+/// generic emitter probes may leave code out of guest memory"). The probe
+/// harness never loads bank words into its `Rdram`, so live-word
+/// verification would spuriously fault on every probed instruction.
+fn plan_bank_shards(
+    bank: &MaterializedPackedBank,
+    bank_index: usize,
+) -> Result<Vec<BankShard>, String> {
+    let bank_id = BankId::new(bank.bank_id);
+    let artifact_start = bank
+        .blocks
+        .first()
+        .map(|block| block.start_va)
+        .ok_or_else(|| "bank has no blocks to shard".to_string())?;
+    let artifact_end = bank
+        .blocks
+        .last()
+        .map(|block| {
+            block
+                .start_va
+                .checked_add(
+                    u32::try_from(block.words.len())
+                        .expect("block word count exceeds u32")
+                        .checked_mul(4)
+                        .expect("block byte length exceeds u32"),
+                )
+                .expect("block virtual extent exceeds u32")
+        })
+        .expect("bank blocks non-empty, checked above");
+
+    let mut shards = Vec::new();
+    for block in &bank.blocks {
+        let mut offset = 0usize;
+        while offset < block.words.len() {
+            let shard_len = MAX_SHARD_WORDS.min(block.words.len() - offset);
+            let shard_words = &block.words[offset..offset + shard_len];
+            let shard_start = block
+                .start_va
+                .checked_add(u32::try_from(offset).unwrap() * 4)
+                .expect("shard start exceeds u32");
+            // The lookahead word, if any, is the next word in this same
+            // block -- never a word from a different block, since blocks
+            // are independently proven spans and a gap between them is not
+            // an architectural successor.
+            let delay_lookahead = block.words.get(offset + shard_len).copied();
+            let shard_index = shards.len();
+            let name = format!("run_rom_bank_{bank_index}_shard_{shard_index}");
+            let source = emit_dense_bank_shard_runner_function(&DenseBankShardInput {
+                name: &name,
+                bank: bank_id,
+                image_vram_start: artifact_start,
+                image_vram_end: artifact_end,
+                artifact_vram_start: artifact_start,
+                artifact_vram_end: artifact_end,
+                shard_vram_start: shard_start,
+                words: shard_words,
+                delay_lookahead,
+                verify_live_words: false,
+            })
+            .map_err(|error| {
+                format!(
+                    "bank {} shard {shard_index} at {shard_start:#010X}: {error:?}",
+                    bank.bank
+                )
+            })?;
+            shards.push(BankShard {
+                bank_index,
+                shard_index,
+                start_va: shard_start,
+                end_va: shard_start + shard_len as u32 * 4,
+                source,
+            });
+            offset += shard_len;
+        }
+    }
+    Ok(shards)
+}
+
+/// One bounded compile unit: a contiguous run of shards (in `bank_shards`
+/// flattened order) whose combined emitted-code word count does not exceed
+/// [`MAX_COMPILE_UNIT_WORDS`]. Since every shard is already bounded by
+/// [`MAX_SHARD_WORDS`] (which equals [`MAX_COMPILE_UNIT_WORDS`]), a unit
+/// holds either exactly one shard or several small ones -- never a fraction
+/// of a shard, and no single shard is ever itself oversized relative to the
+/// bound the way a whole unsharded bank used to be.
+struct CompileUnit {
+    /// Indices into the flattened shard list, in ascending order.
+    shard_indices: Vec<usize>,
+}
+
+/// Partition shards into compile units by accumulated word count, in
+/// deterministic flattened order. Grouping is geometry-derived (word counts
+/// from the already-planned shards, iterated in the caller's fixed order) so
+/// two runs on the same ROM produce identical unit boundaries.
+fn plan_compile_units(shards: &[BankShard]) -> Vec<CompileUnit> {
     let mut units = Vec::new();
     let mut current = Vec::new();
     let mut current_words = 0usize;
-    for (index, bank) in banks.iter().enumerate() {
-        let bank_words: usize = bank.blocks.iter().map(|block| block.words.len()).sum();
-        if !current.is_empty() && current_words + bank_words > MAX_COMPILE_UNIT_WORDS {
+    for (index, shard) in shards.iter().enumerate() {
+        let shard_words = ((shard.end_va - shard.start_va) / 4) as usize;
+        if !current.is_empty() && current_words + shard_words > MAX_COMPILE_UNIT_WORDS {
             units.push(CompileUnit {
-                bank_indices: std::mem::take(&mut current),
+                shard_indices: std::mem::take(&mut current),
             });
             current_words = 0;
         }
         current.push(index);
-        current_words += bank_words;
+        current_words += shard_words;
     }
     if !current.is_empty() {
         units.push(CompileUnit {
-            bank_indices: current,
+            shard_indices: current,
         });
     }
     units
@@ -430,23 +596,61 @@ fn plan_compile_units(banks: &[MaterializedPackedBank]) -> Vec<CompileUnit> {
 // import.
 const GENERATED_PRELUDE: &str = "#![allow(clippy::all, unused)]\nuse fn64_recomp_rs::{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext};\n\n";
 
-/// Render one compile unit's source: the bank runner functions the sparse
-/// emitter already produced for this unit's banks, plus a `pub` span table
-/// and `CodeBank` constructor per bank so the driver crate (compiled and
-/// linked separately) can call into them.
-fn render_shard_source(
-    unit: &CompileUnit,
-    runners: &[String],
+/// Render one compile unit's source: this unit's shard runner functions,
+/// `pub` so the driver crate (compiled and linked separately) can call them
+/// directly by their `--extern` path.
+fn render_shard_source(unit: &CompileUnit, shards: &[BankShard]) -> String {
+    let mut source = String::from(GENERATED_PRELUDE);
+    for &index in &unit.shard_indices {
+        // The emitter's own output is `pub fn <name>(...)`; nothing to add.
+        source.push_str(&shards[index].source);
+        source.push('\n');
+    }
+    source
+}
+
+/// Render the driver binary's source: per-bank span tables and `CodeBank`
+/// constructors, a per-bank dispatcher wrapper that routes a `pc` to the
+/// shard function owning it (calling into whichever shard crate emitted
+/// that shard, by its `--extern` name), the arbitrary-PC probe harness, and
+/// `main`, which registers every bank's wrapper and asserts the same probes
+/// and typed unaligned-PC architectural fault the unsharded gate always has.
+///
+/// The wrapper is what makes shard splitting transparent to `BlockProgram`:
+/// `BlockProgram::register` allows exactly one runner function per `BankId`
+/// (a second `register` on the same id is `ProgramError::DuplicateBank`), so
+/// a bank's several shard functions cannot each be registered directly.
+/// Every in-bank control transfer the shard emitter produces targets the
+/// same real `BankId` (because `plan_bank_shards` sets each shard's
+/// `artifact_vram_start/end` to the whole bank's extent), so it always
+/// re-enters through `BlockProgram::run`, which looks the wrapper up by
+/// that one `BankId` and re-dispatches by range -- no `ResolveTransfer` or
+/// per-shard synthetic `BankId` is needed for shards of the *same* bank.
+fn render_driver_source(
+    units: &[CompileUnit],
+    shards: &[BankShard],
     banks: &[MaterializedPackedBank],
 ) -> String {
     let mut source = String::from(GENERATED_PRELUDE);
-    for &index in &unit.bank_indices {
-        source.push_str(&runners[index]);
-        source.push('\n');
+
+    // Map each flattened shard index to the compile unit (crate) that holds
+    // it, so the wrapper can call `shard_{unit}::run_rom_bank_{b}_shard_{s}`.
+    let mut unit_of_shard = vec![0usize; shards.len()];
+    for (unit_index, unit) in units.iter().enumerate() {
+        for &index in &unit.shard_indices {
+            unit_of_shard[index] = unit_index;
+        }
     }
-    for &index in &unit.bank_indices {
-        let bank = &banks[index];
-        writeln!(source, "const SPANS_{index}: &[(u32, &[u32])] = &[")
+
+    for (bank_index, bank) in banks.iter().enumerate() {
+        let mut bank_shards: Vec<(usize, &BankShard)> = shards
+            .iter()
+            .enumerate()
+            .filter(|(_, shard)| shard.bank_index == bank_index)
+            .collect();
+        bank_shards.sort_by_key(|(_, shard)| shard.start_va);
+
+        writeln!(source, "const SPANS_{bank_index}: &[(u32, &[u32])] = &[")
             .expect("writing generated span table");
         for block in &bank.blocks {
             let words = block
@@ -460,31 +664,62 @@ fn render_shard_source(
         }
         writeln!(
             source,
-            "];\n\npub fn code_bank_{index}() -> CodeBank {{\n    let id = BankId::new({:#018X});\n    let spans = SPANS_{index}.iter().map(|(va, words)| CodeSpan::new(id, GuestPc::new(*va), words.to_vec()).unwrap()).collect();\n    CodeBank::from_spans(id, spans).unwrap()\n}}\n",
+            "];\n\npub fn code_bank_{bank_index}() -> CodeBank {{\n    let id = BankId::new({:#018X});\n    let spans = SPANS_{bank_index}.iter().map(|(va, words)| CodeSpan::new(id, GuestPc::new(*va), words.to_vec()).unwrap()).collect();\n    CodeBank::from_spans(id, spans).unwrap()\n}}\n",
             bank.bank_id
         )
         .expect("writing generated CodeBank constructor");
-    }
-    source
-}
 
-/// Render the driver binary's source: the arbitrary-PC probe harness plus
-/// `main`, which registers every bank (calling into the shard crates by
-/// their `--extern` names) and asserts the same probes and typed
-/// `UnalignedPc` fault the unsharded gate always has.
-fn render_driver_source(units: &[CompileUnit], banks: &[MaterializedPackedBank]) -> String {
-    let mut source = String::from(GENERATED_PRELUDE);
+        // Dispatcher wrapper: routes `entry.pc` to the shard whose owned
+        // range contains it. A PC in a gap between blocks (or otherwise
+        // outside every shard's range) is not architecturally reachable
+        // code, matching the single-function emitter's own `_ =>` arm.
+        writeln!(
+            source,
+            "#[inline(never)]\n#[allow(unused_variables, unused_mut)]\npub fn run_rom_bank_{bank_index}(entry: ExecutionKey, budget: InstructionBudget, ctx: &mut RecompContext, mem: &mut Rdram) -> BlockRun {{"
+        )
+        .expect("writing generated dispatcher wrapper header");
+        writeln!(source, "    let pc = entry.pc.get();")
+            .expect("writing generated dispatcher wrapper body");
+        for &(flat_index, shard) in &bank_shards {
+            let unit_index = unit_of_shard[flat_index];
+            writeln!(
+                source,
+                "    if pc >= {:#010X} && pc < {:#010X} {{ return shard_{unit_index}::{}(entry, budget, ctx, mem); }}",
+                shard.start_va,
+                shard.end_va,
+                shard.fn_name(),
+            )
+            .expect("writing generated dispatcher wrapper range check");
+        }
+        writeln!(
+            source,
+            "    BlockRun::new(BlockExit::Fault(CpuFault {{ at: entry, kind: CpuFaultKind::UnmappedPc {{ bank_start: {:#010X}, bank_end: {:#010X} }} }}), 0)",
+            bank.blocks.first().map(|block| block.start_va).unwrap_or(0),
+            bank.blocks
+                .last()
+                .map(|block| block.start_va + block.words.len() as u32 * 4)
+                .unwrap_or(0),
+        )
+        .expect("writing generated dispatcher wrapper fallback");
+        writeln!(source, "}}\n").expect("writing generated dispatcher wrapper footer");
+
+        writeln!(
+            source,
+            "pub fn register_run_rom_bank_{bank_index}(program: &mut BlockProgram, code: CodeBank) -> Result<(), ProgramError> {{\n    program.register(code, GeneratedBankRunner::new(BankId::new({:#018X}), run_rom_bank_{bank_index}))\n}}\n",
+            bank.bank_id
+        )
+        .expect("writing generated registration helper");
+    }
+
     source.push_str(
         "fn probe(program: &BlockProgram, bank: BankId, pc: u32) -> BlockRun {\n    let mut storage = vec![0u8; 8 * 1024 * 1024];\n    let mut mem = Rdram::new(&mut storage);\n    let mut ctx = RecompContext::new();\n    ctx.set_r(29, 0x8070_0000);\n    program.run(ExecutionKey::new(bank, GuestPc::new(pc)), InstructionBudget::new(4096).unwrap(), &mut ctx, &mut mem)\n}\n\nfn main() {\n    let mut program = BlockProgram::new();\n",
     );
-    for (unit_index, unit) in units.iter().enumerate() {
-        for &index in &unit.bank_indices {
-            writeln!(
-                source,
-                "    shard_{unit_index}::register_run_rom_bank_{index}(&mut program, shard_{unit_index}::code_bank_{index}()).unwrap();"
-            )
-            .expect("writing generated registration");
-        }
+    for bank_index in 0..banks.len() {
+        writeln!(
+            source,
+            "    register_run_rom_bank_{bank_index}(&mut program, code_bank_{bank_index}()).unwrap();"
+        )
+        .expect("writing generated registration");
     }
     for bank in banks {
         let Some(first) = bank.blocks.first() else {
@@ -502,10 +737,23 @@ fn render_driver_source(units: &[CompileUnit], banks: &[MaterializedPackedBank])
             .expect("writing generated arbitrary-PC probe");
         }
         // An unaligned PC must produce the typed architectural fault, never a
-        // silent miss: the emitter's own soundness check.
+        // silent miss: the emitter's own soundness check. `BlockProgram::run`
+        // rejects an unaligned entry through `CodeCatalog::resolve` before any
+        // generated runner (wrapper or not) is ever called, and that path
+        // produces the architecturally precise `CpuFaultKind::Exception {
+        // exception: AddressErrorLoad, .. }` (see
+        // `CpuFault::instruction_address_error`'s doc comment: `UnalignedPc`
+        // is reserved for the separate interpreter-fallback compatibility
+        // path, which this gate never exercises). `BlockProgram::run` reports
+        // this as one attempted-fetch instruction, not zero (see
+        // `attempted_fetch = u32::from(matches!(fault.kind,
+        // CpuFaultKind::Exception { .. }))` in `execution.rs`). Sharding did
+        // not change this path or its output; the previous assertion had
+        // simply never been exercised end-to-end before (see
+        // task-1-report.md for two other bugs of this exact kind).
         writeln!(
             source,
-            "    let unaligned = probe(&program, BankId::new({:#018X}), {:#010X});\n    assert!(matches!(unaligned.exit, BlockExit::Fault(CpuFault {{ kind: CpuFaultKind::UnalignedPc, .. }})));\n    assert_eq!(unaligned.instructions, 0);\n    println!(\"bank={} unaligned_pc={:#010x} typed_fault=UnalignedPc\");",
+            "    let unaligned = probe(&program, BankId::new({:#018X}), {:#010X});\n    assert!(matches!(unaligned.exit, BlockExit::Fault(CpuFault {{ kind: CpuFaultKind::Exception {{ exception: CpuException::AddressErrorLoad, .. }}, .. }})));\n    assert_eq!(unaligned.instructions, 1);\n    println!(\"bank={} unaligned_pc={:#010x} typed_fault=AddressErrorLoad\");",
             bank.bank_id,
             first.start_va | 1,
             bank.bank,
@@ -518,7 +766,7 @@ fn render_driver_source(units: &[CompileUnit], banks: &[MaterializedPackedBank])
 }
 
 fn compile_and_run_harness(
-    runners: &[String],
+    bank_shards: &[Vec<BankShard>],
     banks: &[MaterializedPackedBank],
 ) -> Result<String, String> {
     let executable_dir = std::env::current_exe()
@@ -536,15 +784,24 @@ fn compile_and_run_harness(
     std::fs::create_dir_all(&temp)
         .map_err(|error| format!("creating generated-runner temp directory: {error}"))?;
 
+    // Flatten in fixed (bank, shard) order -- deterministic across runs
+    // since `bank_shards` was built by iterating `materialized` in its own
+    // already-deterministic order.
+    let shards: Vec<BankShard> = bank_shards.iter().flatten().cloned().collect();
+
     // Split the generated code into bounded compile units (see
     // MAX_COMPILE_UNIT_WORDS) rather than one translation unit: rustc's
     // compile time on the whole-ROM dispatch match does not scale linearly,
-    // and one unbounded unit does not finish on real ROMs.
-    let units = plan_compile_units(banks);
+    // and one unbounded unit does not finish on real ROMs. Splitting
+    // *emission* itself (see MAX_SHARD_WORDS / plan_bank_shards) is what
+    // keeps any one shard from being the giant single function that used to
+    // hit rustc's LLVM `-O` cliff regardless of unit grouping; this pass is
+    // the compile-parallelism/incrementality layer on top of that.
+    let units = plan_compile_units(&shards);
 
     let mut shard_rlibs = Vec::with_capacity(units.len());
     for (unit_index, unit) in units.iter().enumerate() {
-        let shard_source = render_shard_source(unit, runners, banks);
+        let shard_source = render_shard_source(unit, &shards);
         let shard_source_path = temp.join(format!("shard_{unit_index}.rs"));
         std::fs::write(&shard_source_path, &shard_source)
             .map_err(|error| format!("writing shard {unit_index} source: {error}"))?;
@@ -583,7 +840,7 @@ fn compile_and_run_harness(
         shard_rlibs.push(shard_rlib_path);
     }
 
-    let driver_source = render_driver_source(&units, banks);
+    let driver_source = render_driver_source(&units, &shards, banks);
     let driver_source_path = temp.join("generated_runner.rs");
     std::fs::write(&driver_source_path, &driver_source)
         .map_err(|error| format!("writing generated runner source: {error}"))?;
