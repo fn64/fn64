@@ -102,52 +102,81 @@ static NEXT_HOST_ABI_WRITER_TRACE_EPOCH_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RSP_WRITER_TRACE_EPOCH_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RDP_RENDERER_WRITER_TRACE_EPOCH_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_sp_writer_trace_epoch_id() -> u64 {
-    NEXT_SP_WRITER_TRACE_EPOCH_ID
+/// Which executable-write queue is non-empty, if either.
+///
+/// Nine call sites guard on writer quiescence before sealing a receipt, and
+/// each raises its own channel-specific error enum, so only the predicate is
+/// shared -- the caller keeps its own `Err(...)`. Five of the nine had a named
+/// `validate_*_writer_quiescence` wrapper and four (SI, SP, the bootstrap
+/// receipt, and the SP begin-path) open-coded the same two `.with(|pending|
+/// !pending.borrow().is_empty())` reads.
+///
+/// The value here is coupling rather than line count: it reduces the number of
+/// places that reach into `PENDING_EXECUTABLE_WRITES` and
+/// `PENDING_ATTRIBUTED_EXECUTABLE_WRITES` from nine to one, which is what makes
+/// those thread-locals movable later.
+///
+/// Physical writes are reported before attributed ones, matching the order
+/// every existing site checked them in.
+fn pending_executable_write_violation() -> Option<PendingWriteViolation> {
+    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
+        return Some(PendingWriteViolation::Physical);
+    }
+    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
+        return Some(PendingWriteViolation::Attributed);
+    }
+    None
+}
+
+/// The queue [`pending_executable_write_violation`] found non-empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingWriteViolation {
+    Physical,
+    Attributed,
+}
+
+/// Mint the next epoch identity for one writer channel.
+///
+/// The six counters above stay six distinct statics -- see the interleaving
+/// note there -- because each channel needs its own identity space. Only the
+/// minting code is shared: it was six byte-identical bodies differing solely
+/// in which static they read and which channel they named on overflow.
+///
+/// `channel` appears only in the overflow panic, so a caller that passes the
+/// wrong name degrades a diagnostic rather than the identity itself.
+fn next_writer_trace_epoch_id(counter: &'static AtomicU64, channel: &'static str) -> u64 {
+    counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch_id| {
             epoch_id.checked_add(1)
         })
-        .unwrap_or_else(|_| panic!("SP writer trace epoch identity overflow"))
+        .unwrap_or_else(|_| panic!("{channel} writer trace epoch identity overflow"))
+}
+
+fn next_sp_writer_trace_epoch_id() -> u64 {
+    next_writer_trace_epoch_id(&NEXT_SP_WRITER_TRACE_EPOCH_ID, "SP")
 }
 
 fn next_cpu_writer_trace_epoch_id() -> u64 {
-    NEXT_CPU_WRITER_TRACE_EPOCH_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch_id| {
-            epoch_id.checked_add(1)
-        })
-        .unwrap_or_else(|_| panic!("CPU instruction-store trace epoch identity overflow"))
+    next_writer_trace_epoch_id(
+        &NEXT_CPU_WRITER_TRACE_EPOCH_ID,
+        "CPU instruction-store",
+    )
 }
 
 fn next_pi_writer_trace_epoch_id() -> u64 {
-    NEXT_PI_WRITER_TRACE_EPOCH_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch_id| {
-            epoch_id.checked_add(1)
-        })
-        .unwrap_or_else(|_| panic!("PI writer trace epoch identity overflow"))
+    next_writer_trace_epoch_id(&NEXT_PI_WRITER_TRACE_EPOCH_ID, "PI")
 }
 
 fn next_host_abi_writer_trace_epoch_id() -> u64 {
-    NEXT_HOST_ABI_WRITER_TRACE_EPOCH_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch_id| {
-            epoch_id.checked_add(1)
-        })
-        .unwrap_or_else(|_| panic!("Host ABI writer trace epoch identity overflow"))
+    next_writer_trace_epoch_id(&NEXT_HOST_ABI_WRITER_TRACE_EPOCH_ID, "Host ABI")
 }
 
 fn next_rsp_writer_trace_epoch_id() -> u64 {
-    NEXT_RSP_WRITER_TRACE_EPOCH_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch_id| {
-            epoch_id.checked_add(1)
-        })
-        .unwrap_or_else(|_| panic!("RSP writer trace epoch identity overflow"))
+    next_writer_trace_epoch_id(&NEXT_RSP_WRITER_TRACE_EPOCH_ID, "RSP")
 }
 
 fn next_rdp_renderer_writer_trace_epoch_id() -> u64 {
-    NEXT_RDP_RENDERER_WRITER_TRACE_EPOCH_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch_id| {
-            epoch_id.checked_add(1)
-        })
-        .unwrap_or_else(|_| panic!("RDP renderer writer trace epoch identity overflow"))
+    next_writer_trace_epoch_id(&NEXT_RDP_RENDERER_WRITER_TRACE_EPOCH_ID, "RDP renderer")
 }
 
 #[derive(Debug)]
@@ -3225,11 +3254,14 @@ fn validate_bootstrap_writer_completion_state(
     if state.poison.is_some() {
         return Err(BootstrapWriterChannelCompletionErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(BootstrapWriterChannelCompletionErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(BootstrapWriterChannelCompletionErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => {
+            return Err(BootstrapWriterChannelCompletionErrorV1::PendingPhysicalWrites)
+        }
+        Some(PendingWriteViolation::Attributed) => {
+            return Err(BootstrapWriterChannelCompletionErrorV1::PendingAttributedWrites)
+        }
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(BootstrapWriterChannelCompletionErrorV1::OpenHostTransactions);
@@ -3357,11 +3389,10 @@ fn validate_cpu_writer_quiescence(
     if state.poison.is_some() {
         return Err(CpuWriterRuntimeStateErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(CpuWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(CpuWriterRuntimeStateErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => return Err(CpuWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+        Some(PendingWriteViolation::Attributed) => return Err(CpuWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(CpuWriterRuntimeStateErrorV1::OpenHostTransactions);
@@ -3483,11 +3514,10 @@ fn validate_pi_writer_quiescence(
     if state.poison.is_some() {
         return Err(PiWriterRuntimeStateErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(PiWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(PiWriterRuntimeStateErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => return Err(PiWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+        Some(PendingWriteViolation::Attributed) => return Err(PiWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(PiWriterRuntimeStateErrorV1::OpenHostTransactions);
@@ -3633,11 +3663,10 @@ fn validate_si_writer_runtime_state_v1(
     if state.poison.is_some() {
         return Err(SiWriterRuntimeStateErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(SiWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(SiWriterRuntimeStateErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => return Err(SiWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+        Some(PendingWriteViolation::Attributed) => return Err(SiWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(SiWriterRuntimeStateErrorV1::OpenHostTransactions);
@@ -3744,11 +3773,10 @@ fn validate_sp_writer_runtime_state_v1(
     if state.poison.is_some() {
         return Err(SpWriterRuntimeStateErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+        Some(PendingWriteViolation::Attributed) => return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(SpWriterRuntimeStateErrorV1::OpenHostTransactions);
@@ -3843,11 +3871,10 @@ fn validate_host_abi_writer_quiescence(
     if state.poison.is_some() {
         return Err(HostAbiWriterRuntimeStateErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(HostAbiWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(HostAbiWriterRuntimeStateErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => return Err(HostAbiWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+        Some(PendingWriteViolation::Attributed) => return Err(HostAbiWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(HostAbiWriterRuntimeStateErrorV1::OpenHostTransactions);
@@ -4084,11 +4111,10 @@ fn validate_rsp_writer_quiescence(
     if state.poison.is_some() {
         return Err(RspWriterRuntimeStateErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(RspWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(RspWriterRuntimeStateErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => return Err(RspWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+        Some(PendingWriteViolation::Attributed) => return Err(RspWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(RspWriterRuntimeStateErrorV1::OpenHostTransactions);
@@ -4294,11 +4320,10 @@ fn validate_rdp_renderer_writer_quiescence(
     if state.poison.is_some() {
         return Err(RdpRendererWriterRuntimeStateErrorV1::Poisoned);
     }
-    if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(RdpRendererWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-    }
-    if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-        return Err(RdpRendererWriterRuntimeStateErrorV1::PendingAttributedWrites);
+    match pending_executable_write_violation() {
+        Some(PendingWriteViolation::Physical) => return Err(RdpRendererWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+        Some(PendingWriteViolation::Attributed) => return Err(RdpRendererWriterRuntimeStateErrorV1::PendingAttributedWrites),
+        None => {}
     }
     if !state.host_transactions.is_empty() {
         return Err(RdpRendererWriterRuntimeStateErrorV1::OpenHostTransactions);
@@ -5815,11 +5840,10 @@ impl CanonicalLiveBlockProgramV1 {
         if state.poison.is_some() {
             return Err(SpWriterRuntimeStateErrorV1::Poisoned);
         }
-        if PENDING_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-            return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites);
-        }
-        if PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| !pending.borrow().is_empty()) {
-            return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites);
+        match pending_executable_write_violation() {
+            Some(PendingWriteViolation::Physical) => return Err(SpWriterRuntimeStateErrorV1::PendingPhysicalWrites),
+            Some(PendingWriteViolation::Attributed) => return Err(SpWriterRuntimeStateErrorV1::PendingAttributedWrites),
+            None => {}
         }
         if !state.host_transactions.is_empty() {
             return Err(SpWriterRuntimeStateErrorV1::OpenHostTransactions);
