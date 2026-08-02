@@ -28,6 +28,7 @@ use fn64_discover::block_pack::{
 use fn64_discover::closure::{
     classified_destinations, scoreboard, ClosureScoreboard, DestinationClass,
 };
+use fn64_discover::dense_aot_pack::DENSE_AOT_SHARD_BYTES;
 use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
 use fn64_discover::snapshot::{
     compose_materialized_banks_validated_v2_with_limits, MaterializedBankInput,
@@ -42,6 +43,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MAX_ROM_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum emitted-code words a single generated-runner compile unit may
+/// hold, derived from the existing 64 KiB dense-AOT shard convention
+/// (`DENSE_AOT_SHARD_BYTES / 4` = 16,384 words). rustc's compile time on the
+/// generated dispatch match is superlinear in single-unit size: one 111 MB /
+/// 1,886,522-line translation unit (Clay Fighter, unsharded) had not
+/// finished `rustc -O` after 32 minutes. Splitting emission at this bound
+/// keeps every rustc invocation small enough to finish in practice, without
+/// changing which words are emitted or what the harness proves.
+const MAX_COMPILE_UNIT_WORDS: usize = (DENSE_AOT_SHARD_BYTES / 4) as usize;
 
 struct PhysicalBank {
     bank: String,
@@ -158,13 +169,12 @@ fn run() -> Result<(), String> {
         banks: Vec::with_capacity(snapshots.len()),
     };
     for (index, snapshot) in snapshots.iter().enumerate() {
-        let pack = emit_validated_block_pack_v2(&composed, index, &rom)
-            .map_err(|error| {
-                format!(
-                    "emitting block pack for {}: {error:?}",
-                    snapshot.banks[0].input.bank
-                )
-            })?;
+        let pack = emit_validated_block_pack_v2(&composed, index, &rom).map_err(|error| {
+            format!(
+                "emitting block pack for {}: {error:?}",
+                snapshot.banks[0].input.bank
+            )
+        })?;
         if pack.banks.len() != 1 {
             return Err(format!(
                 "one-bank snapshot for {} emitted {} pack banks",
@@ -373,33 +383,69 @@ fn callable_roots(facts: &FactDb, bank: &PhysicalBank) -> Vec<u32> {
     roots.into_iter().collect()
 }
 
-fn compile_and_run_harness(
+/// One bounded compile unit: a contiguous run of whole banks (in `banks`
+/// order) whose combined emitted-code word count does not exceed
+/// [`MAX_COMPILE_UNIT_WORDS`]. A bank is never split across units -- its
+/// runner function is one opaque string from the sparse emitter -- so a
+/// single bank larger than the bound still gets its own (oversized) unit
+/// rather than breaking the bound guarantee for every other unit.
+struct CompileUnit {
+    /// Indices into `banks`/`runners`, in ascending order.
+    bank_indices: Vec<usize>,
+}
+
+/// Partition banks into compile units by accumulated word count, in
+/// deterministic `banks`-order. Grouping is geometry-derived (word counts
+/// from the materialized pack, iterated in the caller's already-sorted bank
+/// order) so two runs on the same ROM produce identical unit boundaries.
+fn plan_compile_units(banks: &[MaterializedPackedBank]) -> Vec<CompileUnit> {
+    let mut units = Vec::new();
+    let mut current = Vec::new();
+    let mut current_words = 0usize;
+    for (index, bank) in banks.iter().enumerate() {
+        let bank_words: usize = bank.blocks.iter().map(|block| block.words.len()).sum();
+        if !current.is_empty() && current_words + bank_words > MAX_COMPILE_UNIT_WORDS {
+            units.push(CompileUnit {
+                bank_indices: std::mem::take(&mut current),
+            });
+            current_words = 0;
+        }
+        current.push(index);
+        current_words += bank_words;
+    }
+    if !current.is_empty() {
+        units.push(CompileUnit {
+            bank_indices: current,
+        });
+    }
+    units
+}
+
+/// Shared prelude every generated `.rs` file (shard or driver) opens with.
+// `CpuException` is required here even though the unsharded gate's identical
+// prelude omitted it: that omission was a latent bug masked by never being
+// exercised end-to-end before (see task-1-report.md). The sparse emitter
+// writes bare `CpuException::Variant` paths for trap/break/cop-unusable
+// exception exits, so any compile unit containing such a block needs the
+// import.
+const GENERATED_PRELUDE: &str = "#![allow(clippy::all, unused)]\nuse fn64_recomp_rs::{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext};\n\n";
+
+/// Render one compile unit's source: the bank runner functions the sparse
+/// emitter already produced for this unit's banks, plus a `pub` span table
+/// and `CodeBank` constructor per bank so the driver crate (compiled and
+/// linked separately) can call into them.
+fn render_shard_source(
+    unit: &CompileUnit,
     runners: &[String],
     banks: &[MaterializedPackedBank],
-) -> Result<String, String> {
-    let executable_dir = std::env::current_exe()
-        .map_err(|error| format!("finding gate executable: {error}"))?
-        .parent()
-        .ok_or("gate executable has no parent directory")?
-        .to_path_buf();
-    let deps = if executable_dir.ends_with("deps") {
-        executable_dir
-    } else {
-        executable_dir.join("deps")
-    };
-    let rlib = current_recomp_rlib(&deps)?;
-    let temp = std::env::temp_dir().join(format!("fn64-rom-recompile-{}", std::process::id()));
-    std::fs::create_dir_all(&temp)
-        .map_err(|error| format!("creating generated-runner temp directory: {error}"))?;
-
-    let mut source = String::from(
-        "#![allow(clippy::all, unused)]\nuse fn64_recomp_rs::{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext};\n\n",
-    );
-    for runner in runners {
-        source.push_str(runner);
+) -> String {
+    let mut source = String::from(GENERATED_PRELUDE);
+    for &index in &unit.bank_indices {
+        source.push_str(&runners[index]);
         source.push('\n');
     }
-    for (index, bank) in banks.iter().enumerate() {
+    for &index in &unit.bank_indices {
+        let bank = &banks[index];
         writeln!(source, "const SPANS_{index}: &[(u32, &[u32])] = &[")
             .expect("writing generated span table");
         for block in &bank.blocks {
@@ -414,20 +460,31 @@ fn compile_and_run_harness(
         }
         writeln!(
             source,
-            "];\n\nfn code_bank_{index}() -> CodeBank {{\n    let id = BankId::new({:#018X});\n    let spans = SPANS_{index}.iter().map(|(va, words)| CodeSpan::new(id, GuestPc::new(*va), words.to_vec()).unwrap()).collect();\n    CodeBank::from_spans(id, spans).unwrap()\n}}\n",
+            "];\n\npub fn code_bank_{index}() -> CodeBank {{\n    let id = BankId::new({:#018X});\n    let spans = SPANS_{index}.iter().map(|(va, words)| CodeSpan::new(id, GuestPc::new(*va), words.to_vec()).unwrap()).collect();\n    CodeBank::from_spans(id, spans).unwrap()\n}}\n",
             bank.bank_id
         )
         .expect("writing generated CodeBank constructor");
     }
+    source
+}
+
+/// Render the driver binary's source: the arbitrary-PC probe harness plus
+/// `main`, which registers every bank (calling into the shard crates by
+/// their `--extern` names) and asserts the same probes and typed
+/// `UnalignedPc` fault the unsharded gate always has.
+fn render_driver_source(units: &[CompileUnit], banks: &[MaterializedPackedBank]) -> String {
+    let mut source = String::from(GENERATED_PRELUDE);
     source.push_str(
         "fn probe(program: &BlockProgram, bank: BankId, pc: u32) -> BlockRun {\n    let mut storage = vec![0u8; 8 * 1024 * 1024];\n    let mut mem = Rdram::new(&mut storage);\n    let mut ctx = RecompContext::new();\n    ctx.set_r(29, 0x8070_0000);\n    program.run(ExecutionKey::new(bank, GuestPc::new(pc)), InstructionBudget::new(4096).unwrap(), &mut ctx, &mut mem)\n}\n\nfn main() {\n    let mut program = BlockProgram::new();\n",
     );
-    for (index, _bank) in banks.iter().enumerate() {
-        writeln!(
-            source,
-            "    register_run_rom_bank_{index}(&mut program, code_bank_{index}()).unwrap();"
-        )
-        .expect("writing generated registration");
+    for (unit_index, unit) in units.iter().enumerate() {
+        for &index in &unit.bank_indices {
+            writeln!(
+                source,
+                "    shard_{unit_index}::register_run_rom_bank_{index}(&mut program, shard_{unit_index}::code_bank_{index}()).unwrap();"
+            )
+            .expect("writing generated registration");
+        }
     }
     for bank in banks {
         let Some(first) = bank.blocks.first() else {
@@ -457,21 +514,98 @@ fn compile_and_run_harness(
         .expect("writing generated unaligned probe");
     }
     source.push_str("}\n");
+    source
+}
 
-    let source_path = temp.join("generated_runner.rs");
-    std::fs::write(&source_path, &source)
+fn compile_and_run_harness(
+    runners: &[String],
+    banks: &[MaterializedPackedBank],
+) -> Result<String, String> {
+    let executable_dir = std::env::current_exe()
+        .map_err(|error| format!("finding gate executable: {error}"))?
+        .parent()
+        .ok_or("gate executable has no parent directory")?
+        .to_path_buf();
+    let deps = if executable_dir.ends_with("deps") {
+        executable_dir
+    } else {
+        executable_dir.join("deps")
+    };
+    let rlib = current_recomp_rlib(&deps)?;
+    let temp = std::env::temp_dir().join(format!("fn64-rom-recompile-{}", std::process::id()));
+    std::fs::create_dir_all(&temp)
+        .map_err(|error| format!("creating generated-runner temp directory: {error}"))?;
+
+    // Split the generated code into bounded compile units (see
+    // MAX_COMPILE_UNIT_WORDS) rather than one translation unit: rustc's
+    // compile time on the whole-ROM dispatch match does not scale linearly,
+    // and one unbounded unit does not finish on real ROMs.
+    let units = plan_compile_units(banks);
+
+    let mut shard_rlibs = Vec::with_capacity(units.len());
+    for (unit_index, unit) in units.iter().enumerate() {
+        let shard_source = render_shard_source(unit, runners, banks);
+        let shard_source_path = temp.join(format!("shard_{unit_index}.rs"));
+        std::fs::write(&shard_source_path, &shard_source)
+            .map_err(|error| format!("writing shard {unit_index} source: {error}"))?;
+        // Each shard only references `fn64_recomp_rs` (the emitted bank
+        // runners and CodeBank constructors are self-contained); shards
+        // never call into one another, so only the driver links them all.
+        let shard_rlib_path = temp.join(format!("libshard_{unit_index}.rlib"));
+        let mut command = Command::new("rustc");
+        command
+            .arg("--edition=2021")
+            .arg("-O")
+            .arg("--crate-type=rlib")
+            .arg("--crate-name")
+            .arg(format!("shard_{unit_index}"))
+            .arg("--extern")
+            .arg(format!("fn64_recomp_rs={}", rlib.display()))
+            .arg("-L")
+            .arg(&deps)
+            .arg("-o")
+            .arg(&shard_rlib_path)
+            .arg(&shard_source_path);
+        let output = command
+            .output()
+            .map_err(|error| format!("invoking rustc on shard {unit_index}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "generated shard {unit_index} failed to compile: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .trim()
+                    .replace('\n', " | ")
+                    .chars()
+                    .take(2000)
+                    .collect::<String>()
+            ));
+        }
+        shard_rlibs.push(shard_rlib_path);
+    }
+
+    let driver_source = render_driver_source(&units, banks);
+    let driver_source_path = temp.join("generated_runner.rs");
+    std::fs::write(&driver_source_path, &driver_source)
         .map_err(|error| format!("writing generated runner source: {error}"))?;
     let binary = temp.join("generated_runner");
-    let output = Command::new("rustc")
+    let mut command = Command::new("rustc");
+    command
         .arg("--edition=2021")
         .arg("-O")
         .arg("--extern")
-        .arg(format!("fn64_recomp_rs={}", rlib.display()))
+        .arg(format!("fn64_recomp_rs={}", rlib.display()));
+    for (unit_index, shard_rlib_path) in shard_rlibs.iter().enumerate() {
+        command
+            .arg("--extern")
+            .arg(format!("shard_{unit_index}={}", shard_rlib_path.display()));
+    }
+    command
         .arg("-L")
         .arg(&deps)
         .arg("-o")
         .arg(&binary)
-        .arg(&source_path)
+        .arg(&driver_source_path);
+    let output = command
         .output()
         .map_err(|error| format!("invoking rustc on the generated runner: {error}"))?;
     if !output.status.success() {
@@ -492,7 +626,9 @@ fn compile_and_run_harness(
         return Err(format!(
             "generated runner exited {}: {}",
             run.status,
-            String::from_utf8_lossy(&run.stderr).trim().replace('\n', " | ")
+            String::from_utf8_lossy(&run.stderr)
+                .trim()
+                .replace('\n', " | ")
         ));
     }
     let _ = std::fs::remove_dir_all(&temp);
@@ -501,14 +637,21 @@ fn compile_and_run_harness(
 
 fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    let entries = std::fs::read_dir(deps)
-        .map_err(|error| format!("reading {}: {error}", deps.display()))?;
+    let entries =
+        std::fs::read_dir(deps).map_err(|error| format!("reading {}: {error}", deps.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !name.starts_with("libfn64_recomp_rs") || !name.ends_with(".rlib") {
+        // "libfn64_recomp_rs" alone also matches
+        // "libfn64_recomp_rs_codegen-*.rlib" (a sibling crate in the same
+        // deps directory); require the hyphen that starts the hash suffix
+        // so the codegen crate's rlib is never mistaken for the runtime
+        // crate's, which -- because both can share a build-batch mtime --
+        // was a nondeterministic wrong-crate pick depending on directory
+        // iteration order.
+        if !name.starts_with("libfn64_recomp_rs-") || !name.ends_with(".rlib") {
             continue;
         }
         let modified = entry
