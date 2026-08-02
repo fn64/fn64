@@ -64,7 +64,9 @@ FN64_RT64_DIR=/path/to/rt64 cargo build -p fn64-render-rt64 --features rt64
 ```
 
 `build.rs` verifies the RT64 source identity and MIT license, configures the
-crate-local CMake project, and links the static renderer. The GPL mupen64plus
+crate-local CMake project, and links the static renderer. Its native build
+uses Cargo's `-j` job count; use `cargo build -j1` for the lowest-memory loop.
+The GPL mupen64plus
 subtree is neither compiled nor linked. On macOS the adapter owns the hidden
 SDL/Metal surface currently required by RT64 initialization.
 

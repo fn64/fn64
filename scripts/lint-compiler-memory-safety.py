@@ -27,6 +27,7 @@ LOCAL_TEST_ENTRYPOINTS = (
     "scripts/guarded-nextest.zsh",
 )
 GENERATED_BUILD = "crates/fn64-boot-harness/src/generated_runner_build.rs"
+RT64_BUILD = "crates/fn64-render-rt64/build.rs"
 COMPILER_COMMAND = re.compile(r"\bcargo\s+(?:build|test|check|metadata|nextest|run)\b")
 
 
@@ -140,11 +141,17 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         errors.append(f"{GENERATED_BUILD}: not every owned build phase binds the RSS guard")
     if generated.count("FN64_GUARD_MIN_FREE_PERCENT") < 3:
         errors.append(f"{GENERATED_BUILD}: not every owned build phase binds the free-memory guard")
+
+    rt64_build = sources[RT64_BUILD]
+    if 'env::var("NUM_JOBS")' not in rt64_build:
+        errors.append(f"{RT64_BUILD}: native build does not consume Cargo's job bound")
+    if '.arg("--parallel")\n        .arg(cargo_jobs)' not in rt64_build:
+        errors.append(f"{RT64_BUILD}: CMake parallelism is not bound to Cargo's job count")
     return errors
 
 
 def repository_sources() -> dict[str, str]:
-    paths = (*DEFAULT_ENTRYPOINTS, GENERATED_BUILD)
+    paths = (*DEFAULT_ENTRYPOINTS, GENERATED_BUILD, RT64_BUILD)
     return {path: (ROOT / path).read_text(encoding="utf-8") for path in paths}
 
 
@@ -228,6 +235,18 @@ def selftest(sources: dict[str, str]) -> None:
         for error in check_sources(stale_outer_cap)
     ):
         raise AssertionError("stale selected-build outer-cap fixture was accepted")
+
+    unbound_rt64 = dict(sources)
+    unbound_rt64[RT64_BUILD] = unbound_rt64[RT64_BUILD].replace(
+        '.arg("--parallel")\n        .arg(cargo_jobs)',
+        '.arg("--parallel")',
+        1,
+    )
+    if not any(
+        "CMake parallelism is not bound" in error
+        for error in check_sources(unbound_rt64)
+    ):
+        raise AssertionError("unbound RT64 native-build fixture was accepted")
 
 
 def main() -> int:

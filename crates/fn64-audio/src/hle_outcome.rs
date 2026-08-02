@@ -66,6 +66,7 @@ impl AudioMicrocodeIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AudioHleFamily {
     StandardAbi,
+    CompactAbi,
 }
 
 /// Exact microcode and HLE implementation selected by catalog admission.

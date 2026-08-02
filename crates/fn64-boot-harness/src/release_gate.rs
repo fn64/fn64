@@ -1943,7 +1943,8 @@ fn environment_from_frozen(
         },
     };
     let execution_policy = match render.execution_policy {
-        fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized => {
+        fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized
+        | fn64_abi::GraphicsTaskExecutionPolicy::DiagnosticSkip => {
             return Err(GateError::NonAccuracyRenderPolicy);
         }
         fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy => {
@@ -9564,6 +9565,20 @@ mod tests {
                         tv_type: TvType::Ntsc,
                     },
                     execution_policy: fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
+                },
+            ),
+            Err(GateError::NonAccuracyRenderPolicy)
+        ));
+        assert!(matches!(
+            environment_from_frozen(
+                platform,
+                None,
+                &host,
+                fn64_abi::RenderEnvironmentEvidenceSnapshot {
+                    backend: fn64_abi::RenderBackendEvidence::Reference {
+                        tv_type: TvType::Ntsc,
+                    },
+                    execution_policy: fn64_abi::GraphicsTaskExecutionPolicy::DiagnosticSkip,
                 },
             ),
             Err(GateError::NonAccuracyRenderPolicy)

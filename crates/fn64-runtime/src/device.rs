@@ -2435,6 +2435,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             AI_DACRATE_REG => {
                 let dacrate = value & AI_DACRATE_MASK;
                 if self.current_ai.is_some() || self.queued_ai.is_some() {
+                    if dacrate == self.ai_dacrate {
+                        return Ok(DeviceMmioWriteEffect::None);
+                    }
                     return Err(DeviceFault::AiDacrateWhileBusy {
                         current: self.ai_dacrate,
                         requested: dacrate,
@@ -2449,6 +2452,9 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             AI_BITRATE_REG => {
                 let bitrate = value & AI_BITRATE_MASK;
                 if self.current_ai.is_some() || self.queued_ai.is_some() {
+                    if bitrate == self.ai_bitrate {
+                        return Ok(DeviceMmioWriteEffect::None);
+                    }
                     return Err(DeviceFault::AiBitrateWhileBusy {
                         current: self.ai_bitrate,
                         requested: bitrate,
@@ -3512,6 +3518,17 @@ mod tests {
             })
             .unwrap();
         let before = fabric.evidence_snapshot();
+        assert_eq!(
+            fabric.write_mmio(AI_DACRATE_REG, 1_520).unwrap(),
+            DeviceMmioWriteEffect::None,
+            "an idempotent DACRATE rewrite is not a live-FIFO transition"
+        );
+        assert_eq!(
+            fabric.write_mmio(AI_BITRATE_REG, 15).unwrap(),
+            DeviceMmioWriteEffect::None,
+            "an idempotent BITRATE rewrite is not a live-FIFO transition"
+        );
+        assert_eq!(fabric.evidence_snapshot(), before);
         assert_eq!(
             fabric.write_mmio(AI_DACRATE_REG, 1_551),
             Err(DeviceFault::AiDacrateWhileBusy {

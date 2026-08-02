@@ -280,6 +280,12 @@ fn main() {
         .arg("-DCMAKE_BUILD_TYPE=Release");
     run(&mut configure, "RT64 CMake configure");
 
+    let cargo_jobs =
+        env::var("NUM_JOBS").expect("Cargo must publish NUM_JOBS to bound the RT64 native build");
+    assert!(
+        cargo_jobs.parse::<usize>().is_ok_and(|jobs| jobs > 0),
+        "Cargo NUM_JOBS must be a positive integer, got {cargo_jobs:?}"
+    );
     let mut build = Command::new("cmake");
     build
         .arg("--build")
@@ -288,7 +294,8 @@ fn main() {
         .arg("Release")
         .arg("--target")
         .arg("fn64_rt64_shim")
-        .arg("--parallel");
+        .arg("--parallel")
+        .arg(cargo_jobs);
     run(&mut build, "RT64 static core/HLE build");
 
     // CMake owns the transitive build graph, while Cargo owns the final link.

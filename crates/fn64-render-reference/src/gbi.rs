@@ -2233,14 +2233,15 @@ impl Texture {
                 !other_mode.texture_lod() && other_mode.texture_detail() == 0,
                 "texture LOD/detail reached sampler without an immutable tile snapshot"
             );
-            return (
-                self.sample_rdp(s, t, other_mode, convert),
+            let texel0 = self.sample_rdp(s, t, other_mode, convert);
+            let texel1 = if require_texel1 {
                 fallback_texel1
-                    .or_else(|| (!require_texel1).then_some(self))
                     .expect("RDP combiner selected TEXEL1 without a decoded tile+1 image")
-                    .sample_rdp(s, t, other_mode, convert),
-                0.0,
-            );
+                    .sample_rdp(s, t, other_mode, convert)
+            } else {
+                texel0
+            };
+            return (texel0, texel1, 0.0);
         };
         let selection = Self::lod_selection(snapshot, derivatives, other_mode, min_level);
         let tile0 = snapshot.tiles[usize::from(selection.tile0)]
@@ -2251,9 +2252,16 @@ impl Texture {
                     selection.tile0
                 )
             });
+        let texel0 = tile0.sample_rdp(s, t, other_mode, convert);
+        // With LOD disabled and no TEXEL1 combiner input, the second tile has
+        // no observable consumer. Avoiding that complete filter/address/TMEM
+        // read is especially material for the reference software rasterizer;
+        // LOD mode retains both selected-tile validations below.
+        if !other_mode.texture_lod() && !require_texel1 {
+            return (texel0, texel0, selection.fraction);
+        }
         let tile1 = snapshot.tiles[usize::from(selection.tile1)]
             .as_ref()
-            .or_else(|| (!other_mode.texture_lod() && !require_texel1).then_some(tile0))
             .unwrap_or_else(|| {
                 panic!(
                     "RDP LOD selected tile {} without a decoded G_LOADBLOCK/G_LOADTILE image",
@@ -2261,7 +2269,7 @@ impl Texture {
                 )
             });
         (
-            tile0.sample_rdp(s, t, other_mode, convert),
+            texel0,
             tile1.sample_rdp(s, t, other_mode, convert),
             selection.fraction,
         )
@@ -13098,6 +13106,32 @@ mod tests {
                 require_texel1: true,
             },
         );
+    }
+
+    #[test]
+    fn unused_texel1_does_not_sample_the_adjacent_tile() {
+        let tile0 = checker_2x2(true);
+        let mut invalid_tile1 = checker_2x2(true);
+        invalid_tile1.texels = std::rc::Rc::new(Vec::new());
+        let mut tiles = std::array::from_fn(|_| None);
+        tiles[0] = Some(tile0.clone());
+        tiles[1] = Some(invalid_tile1);
+        let texture = tile0.with_lod_snapshot(tiles, 0, 0);
+
+        let (texel0, texel1, fraction) = texture.sample_rdp_pair(
+            None,
+            TextureSampleRequest {
+                s: 0.0,
+                t: 0.0,
+                derivatives: TextureDerivatives::default(),
+                other_mode: OtherMode::default(),
+                convert: ConvertState::default(),
+                min_level: 0,
+                require_texel1: false,
+            },
+        );
+        assert_eq!(texel1, texel0);
+        assert_eq!(fraction, 0.0);
     }
 
     #[test]
