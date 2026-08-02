@@ -47,8 +47,8 @@ if [ ! -e "$work" ]; then
     mkdir -m 700 "$work"
 fi
 [ -d "$work" ] && [ ! -L "$work" ] || fail "FN64_GHIDRA_WORK must be a directory"
-if work_mode=$(stat -f '%Lp' "$work" 2>/dev/null); then :
-elif work_mode=$(stat -c '%a' "$work" 2>/dev/null); then :
+if work_mode=$(stat -c '%a' "$work" 2>/dev/null); then :
+elif work_mode=$(stat -f '%Lp' "$work" 2>/dev/null); then :
 else fail "could not inspect FN64_GHIDRA_WORK permissions"
 fi
 [ "$work_mode" = 700 ] || fail "FN64_GHIDRA_WORK must have mode 0700"
