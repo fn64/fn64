@@ -237,13 +237,10 @@ pub(crate) fn execute_straight_word(
     mem: &mut Rdram<'_>,
 ) -> Result<Step, StepFault> {
     let instruction = decode(word);
-    if instruction.has_delay_slot() {
-        return Err(StepFault::Unsupported(UnsupportedOp {
-            at: ExecutionKey::new(bank, GuestPc::new(pc)),
-            instruction,
-            word,
-        }));
-    }
+    assert!(
+        !instruction.has_delay_slot(),
+        "execute_straight_word requires an ordinary instruction: bank={bank:?} pc={pc:#010x} word={word:#010x} decoded={instruction:?}"
+    );
     let words = [word];
     let source = InstructionUnit {
         bank,
@@ -1748,6 +1745,23 @@ mod tests {
             ctx,
             &mut mem,
         )
+    }
+
+    #[test]
+    #[should_panic(expected = "execute_straight_word requires an ordinary instruction")]
+    fn straight_word_rejects_control_transfer_as_a_caller_invariant() {
+        let mut storage = vec![0u8; 64];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+
+        let _ = execute_straight_word(
+            BANK,
+            VA,
+            0x03e0_0008, // jr $ra
+            0,
+            &mut ctx,
+            &mut mem,
+        );
     }
 
     #[test]
