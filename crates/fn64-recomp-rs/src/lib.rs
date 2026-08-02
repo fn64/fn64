@@ -104,7 +104,14 @@ const DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1: &[(&str, &[u8])] = &[
         "src/generated_support.rs",
         include_bytes!("generated_support.rs"),
     ),
-    ("src/generation.rs", include_bytes!("generation.rs")),
+    (
+        "src/generation/mod.rs",
+        include_bytes!("generation/mod.rs"),
+    ),
+    (
+        "src/generation/tests.rs",
+        include_bytes!("generation/tests.rs"),
+    ),
     ("src/interp.rs", include_bytes!("interp.rs")),
     ("src/lib.rs", include_bytes!("lib.rs")),
     ("src/runtime.rs", include_bytes!("runtime.rs")),
