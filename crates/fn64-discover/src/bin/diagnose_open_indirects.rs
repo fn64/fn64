@@ -1,6 +1,8 @@
 use fn64_discover::indirect_frontier::{
     classify_open_indirects_with_owners_v1, OpenIndirectFrontierV1,
 };
+use fn64_discover::owner_proof::OwnerAssessment;
+use fn64_discover::resolve::IndirectProofState;
 use fn64_discover::snapshot::{
     compose_materialized_banks_validated_v2_with_limits, MultiBankCompositionLimits,
 };
@@ -8,6 +10,7 @@ use fn64_discover::snapshot_inputs::{
     prepare_snapshot_banks_with_limits, PrepareSnapshotBanksLimits,
 };
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,13 +19,16 @@ use std::time::Instant;
 const MAX_ROM_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
-struct OpenIndirectDiagnosticV1 {
+struct OpenIndirectDiagnosticV2 {
     schema: &'static str,
     schema_version: u32,
     normalized_rom_sha256: String,
     internal_name: String,
     banks: u64,
+    assessed_entries: u64,
+    exact_owners: u64,
     elapsed_ms: u128,
+    owner_proof_frontier: OpenIndirectFrontierV1,
     frontier: OpenIndirectFrontierV1,
 }
 
@@ -57,7 +63,7 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<(), String> {
     Ok(())
 }
 
-fn diagnose(path: &Path) -> Result<OpenIndirectDiagnosticV1, String> {
+fn diagnose(path: &Path) -> Result<OpenIndirectDiagnosticV2, String> {
     let started = Instant::now();
     let metadata = fs::metadata(path).map_err(|error| format!("reading ROM metadata: {error}"))?;
     if !metadata.is_file() {
@@ -93,10 +99,31 @@ fn diagnose(path: &Path) -> Result<OpenIndirectDiagnosticV1, String> {
         shapes: vec![],
         mechanism_counterfactuals: vec![],
     };
+    let mut owner_proof_frontier = OpenIndirectFrontierV1 {
+        open_sites: 0,
+        semantic_shapes: vec![],
+        shapes: vec![],
+        mechanism_counterfactuals: vec![],
+    };
+    let mut assessed_entries = 0u64;
+    let mut exact_owners = 0u64;
     for snapshot in composed.snapshots() {
         let [bank_snapshot] = snapshot.banks.as_slice() else {
             return Err("a composed snapshot did not contain exactly one bank".into());
         };
+        assessed_entries += bank_snapshot.owner_proof.assessments.len() as u64;
+        exact_owners += bank_snapshot
+            .owner_proof
+            .assessments
+            .iter()
+            .filter(|assessment| matches!(assessment, OwnerAssessment::Proven { .. }))
+            .count() as u64;
+        let authority_sites: BTreeSet<_> = bank_snapshot
+            .authority_closure
+            .indirect
+            .iter()
+            .map(|site| (site.site_pc, site.via_call))
+            .collect();
         let matching: Vec<_> = prepared
             .banks()
             .iter()
@@ -109,6 +136,19 @@ fn diagnose(path: &Path) -> Result<OpenIndirectDiagnosticV1, String> {
         let [bank] = matching.as_slice() else {
             return Err("a composed snapshot did not match exactly one prepared bank".into());
         };
+        let mut owner_proof_closure = bank_snapshot.closure.clone();
+        owner_proof_closure.indirect.retain(|site| {
+            site.state == IndirectProofState::Open
+                && authority_sites.contains(&(site.site_pc, site.via_call))
+        });
+        let bank_owner_proof_frontier = classify_open_indirects_with_owners_v1(
+            &owner_proof_closure,
+            &bank_snapshot.owner_proof,
+            &bank.bytes,
+            bank.va_start,
+        )
+        .map_err(|error| format!("classifying an owner-proof indirect frontier: {error}"))?;
+        owner_proof_frontier.merge(&bank_owner_proof_frontier);
         let bank_frontier = classify_open_indirects_with_owners_v1(
             &bank_snapshot.closure,
             &bank_snapshot.owner_proof,
@@ -119,13 +159,16 @@ fn diagnose(path: &Path) -> Result<OpenIndirectDiagnosticV1, String> {
         frontier.merge(&bank_frontier);
     }
 
-    Ok(OpenIndirectDiagnosticV1 {
-        schema: "fn64.open-indirect-frontier.v1",
-        schema_version: 1,
+    Ok(OpenIndirectDiagnosticV2 {
+        schema: "fn64.open-indirect-frontier.v2",
+        schema_version: 2,
         normalized_rom_sha256: discovery.rom.sha256,
         internal_name: discovery.rom.header.name,
         banks: composed.snapshots().len() as u64,
+        assessed_entries,
+        exact_owners,
         elapsed_ms: started.elapsed().as_millis(),
+        owner_proof_frontier,
         frontier,
     })
 }

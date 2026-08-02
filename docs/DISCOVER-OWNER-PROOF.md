@@ -35,8 +35,11 @@ mechanically established:
   function at `0x80036770`), so no content rule can decide the boundary and
   exactness is withheld;
 - no path runs off the decoded image; and
-- every indirect transfer in the bank is exhaustive, with the CFG target set
-  matching one unambiguous exhaustive fact.
+- every authority-reachable indirect transfer in the bank is exhaustive, with
+  the CFG target set matching one unambiguous exhaustive fact. The public
+  owner-proof API has no authority-only closure and therefore conservatively
+  checks every indirect in its CFG; snapshot composition supplies its
+  separately built authority closure.
 
 The two boundary-attribution rules consume heuristic claims only in the
 withholding direction: a candidate claim can prevent an exact claim or
@@ -45,9 +48,15 @@ rejected claim stops blocking. `prove_exact_owners` therefore takes the
 materialized image bytes: the trailing walk inspects words the CFG never
 decoded.
 
-The last rule is deliberately stronger than ordinary CFG reachability. An
-open computed transfer elsewhere in the active bank could enter the proposed
-span. A typed exclusion-only target-domain view now admits one narrower case:
+The last rule is deliberately stronger than owner-local CFG reachability. An
+open computed transfer elsewhere in the authority-reachable bank closure
+could enter the proposed span. A site reached only through broad candidate
+traversal cannot execute from a proven root and therefore cannot block an
+exact owner during snapshot composition; it remains present in the broad CFG
+and open-indirect diagnostic. The bank-bound owner-proof capability is built
+only from the authority closure, and a missing or wrong-bank capability falls
+back to checking the whole broad CFG. A typed exclusion-only target-domain
+view admits one narrower case for an authority-reachable site:
 a guard-bounded jump table whose complete enumerated target set was rejected
 from CFG admission may discharge a bank-scoped blocker when every retained
 target is outside the proposed owner extent. The domain never contributes CFG
@@ -123,11 +132,13 @@ projected roots count: broad candidate-owner roots cannot feed back into
 executable authority. Proving the block does not promote its candidate
 function owner.
 
-Snapshot's two owner passes share a bank-bound callable-entry capability built
+Snapshot's two owner passes share a bank-bound owner-proof capability built
 from that same authority closure, proven entry facts, and already-vetted
-cross-bank roots. Consequently a direct or exhaustive computed call found only
+cross-bank roots. It carries both callable entries and authority-reachable
+indirect sites. Consequently a direct or exhaustive computed call found only
 by broad candidate traversal cannot become same-bank or cross-bank callable
-authority after reached executable ranges are derived.
+authority after reached executable ranges are derived, and a candidate-only
+open indirect cannot withhold exactness from authority-reachable owners.
 
 Cross-bank direct and exhaustive-resolved calls advance one monotone authority
 fixed point only when an exact target VA identifies one target bank. A VA in

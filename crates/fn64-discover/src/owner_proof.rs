@@ -8,12 +8,11 @@
 //! boundary between that useful candidate geometry and metadata an emitter is
 //! allowed to consume as exact.
 //!
-//! The proof is intentionally strict. In particular, every unresolved
-//! indirect site in the bank blocks exact ownership until value-set analysis
-//! either closes it or proves its target domain cannot enter the owner. The
-//! current fact model has no exclusion-domain fact, so accepting an owner in
-//! the presence of such a site would be an audit assumption rather than a
-//! mechanical proof. See `docs/DISCOVER-OWNER-PROOF.md`.
+//! The proof is intentionally strict. In snapshot composition, every
+//! authority-reachable unresolved indirect site blocks exact ownership until
+//! value-set analysis either closes it or proves its target domain cannot enter
+//! the owner. The public API has no authority-only closure and therefore checks
+//! every unresolved site in its CFG. See `docs/DISCOVER-OWNER-PROOF.md`.
 
 use crate::cfg::{BasicBlock, BlockTerminator, Cfg, WordClass};
 use crate::facts::{
@@ -220,14 +219,31 @@ pub struct OwnerProofReport {
     pub assessments: Vec<OwnerAssessment>,
 }
 
-/// Bank-bound callable-entry authority for snapshot composition.
+/// Bank-bound owner-proof authority for snapshot composition.
 ///
 /// The only constructor consumes the authority-only closure. Candidate calls
-/// found solely through broad traversal therefore cannot enter this set and
-/// cannot promote an owner during snapshot's executable-evidence pass.
-pub(crate) struct AuthoritativeCallableEntries {
+/// and indirect sites found solely through broad traversal therefore cannot
+/// confer entry authority or add unresolved-indirect blockers during
+/// snapshot's executable-evidence pass.
+pub(crate) struct OwnerProofAuthority {
     bank: String,
     entries: BTreeSet<u32>,
+    /// Syntactic indirect sites present in the authority-only closure. A site
+    /// found solely through broad candidate traversal cannot execute from any
+    /// proven root and therefore cannot block unrelated exact owners.
+    indirect_sites: BTreeSet<AuthorityIndirectSite>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AuthorityIndirectSite {
+    pc: u32,
+    via_call: bool,
+}
+
+impl AuthorityIndirectSite {
+    const fn new(pc: u32, via_call: bool) -> Self {
+        Self { pc, via_call }
+    }
 }
 
 pub(crate) fn exact_authority_direct_call(cfg: &Cfg, block: &BasicBlock) -> Option<(u32, u32)> {
@@ -287,7 +303,7 @@ pub(crate) fn exhaustive_authority_call_site(
     (cfg_targets == evidence_targets).then_some(site_pc)
 }
 
-impl AuthoritativeCallableEntries {
+impl OwnerProofAuthority {
     pub(crate) fn from_authority_closure(
         authority_closure: &ClosureResult,
         facts: &FactDb,
@@ -343,6 +359,11 @@ impl AuthoritativeCallableEntries {
         Self {
             bank: cfg.bank.clone(),
             entries,
+            indirect_sites: authority_closure
+                .indirect
+                .iter()
+                .map(|site| AuthorityIndirectSite::new(site.site_pc, site.via_call))
+                .collect(),
         }
     }
 
@@ -409,13 +430,13 @@ pub fn prove_exact_owners_with_external_authority(
     )
 }
 
-pub(crate) fn prove_exact_owners_with_callable_authority(
+pub(crate) fn prove_exact_owners_with_authority(
     cfg: &Cfg,
     partition: &Partition,
     facts: &FactDb,
     image_bytes: &[u8],
     image_va_start: u32,
-    authority: &AuthoritativeCallableEntries,
+    authority: &OwnerProofAuthority,
 ) -> OwnerProofReport {
     prove_exact_owners_inner(
         cfg,
@@ -436,7 +457,7 @@ fn prove_exact_owners_inner(
     image_bytes: &[u8],
     image_va_start: u32,
     external_authorized_roots: &BTreeSet<u32>,
-    callable_authority: Option<&AuthoritativeCallableEntries>,
+    owner_proof_authority: Option<&OwnerProofAuthority>,
 ) -> OwnerProofReport {
     let mut roots: BTreeSet<u32> = cfg.proven_roots.iter().copied().collect();
     roots.extend(partition.owners.iter().map(|owner| owner.root_va));
@@ -500,7 +521,7 @@ fn prove_exact_owners_inner(
                 image_bytes,
                 image_va_start,
                 external_authorized_roots,
-                callable_authority,
+                owner_proof_authority,
                 &indirect_target_domains,
             )
         })
@@ -528,7 +549,7 @@ fn assess_root(
     image_bytes: &[u8],
     image_va_start: u32,
     external_authorized_roots: &BTreeSet<u32>,
-    callable_authority: Option<&AuthoritativeCallableEntries>,
+    owner_proof_authority: Option<&OwnerProofAuthority>,
     indirect_target_domains: &BTreeMap<(u32, bool), BTreeSet<u32>>,
 ) -> OwnerAssessment {
     let entry = BankAddr::new(&cfg.bank, root);
@@ -542,7 +563,7 @@ fn assess_root(
             partition_bank: partition.bank.clone(),
         });
     }
-    let entry_authoritative = callable_authority.map_or_else(
+    let entry_authoritative = owner_proof_authority.map_or_else(
         || {
             external_authorized_roots.contains(&root)
                 || entry_is_authoritative(root, cfg, facts, blocks_by_start, proven_entries)
@@ -652,7 +673,14 @@ fn assess_root(
             proven_entries,
             &mut blockers,
         );
-        validate_indirects(owner, cfg, facts, indirect_target_domains, &mut blockers);
+        validate_indirects(
+            owner,
+            cfg,
+            facts,
+            owner_proof_authority,
+            indirect_target_domains,
+            &mut blockers,
+        );
     }
 
     if blockers.is_empty() {
@@ -1045,6 +1073,7 @@ fn validate_indirects(
     owner: &Owner,
     cfg: &Cfg,
     facts: &FactDb,
+    owner_proof_authority: Option<&OwnerProofAuthority>,
     target_domains: &BTreeMap<(u32, bool), BTreeSet<u32>>,
     blockers: &mut BTreeSet<OwnerBlocker>,
 ) {
@@ -1056,6 +1085,16 @@ fn validate_indirects(
         }
     };
     for site in &cfg.indirect_sites {
+        if let Some(authority) =
+            owner_proof_authority.filter(|authority| authority.bank == cfg.bank)
+        {
+            if !authority
+                .indirect_sites
+                .contains(&AuthorityIndirectSite::new(site.pc, site.via_call))
+            {
+                continue;
+            }
+        }
         let site_scope = scope(site.pc);
         if site_scope == IndirectScope::Bank {
             if target_domains
@@ -1296,9 +1335,14 @@ mod tests {
     }
 
     #[test]
-    fn callable_authority_is_bank_bound_and_fails_closed_on_mismatch() {
-        let bytes = asm(&[JR_RA, NOP]);
-        let cfg = build_cfg("bank", &bytes, BASE, &[BASE]);
+    fn owner_proof_authority_is_bank_bound_and_fails_closed_on_mismatch() {
+        let site = BASE + 0x20;
+        let jalr_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut bytes = asm(&[JR_RA, NOP]);
+        bytes.resize(0x28, 0);
+        bytes[0x20..0x24].copy_from_slice(&jalr_t9.to_be_bytes());
+        bytes[0x24..0x28].copy_from_slice(&NOP.to_be_bytes());
+        let cfg = build_cfg("bank", &bytes, BASE, &[BASE, site]);
         let partition = partition(&cfg);
         let facts = facts_for(bytes.len() as u32, &[]);
         let authority_closure = ClosureResult {
@@ -1315,18 +1359,20 @@ mod tests {
             },
             indirect: Vec::new(),
         };
-        let authority = AuthoritativeCallableEntries::from_authority_closure(
+        let authority = OwnerProofAuthority::from_authority_closure(
             &authority_closure,
             &facts,
             &BTreeSet::from([BASE]),
         );
-        let report = prove_exact_owners_with_callable_authority(
-            &cfg, &partition, &facts, &bytes, BASE, &authority,
-        );
+        let report =
+            prove_exact_owners_with_authority(&cfg, &partition, &facts, &bytes, BASE, &authority);
 
-        assert!(frontier(&report.assessments[0])
-            .blockers
-            .contains(&OwnerBlocker::EntryNotAuthoritative));
+        let blockers = &frontier(&report.assessments[0]).blockers;
+        assert!(blockers.contains(&OwnerBlocker::EntryNotAuthoritative));
+        assert!(blockers.contains(&OwnerBlocker::UnresolvedIndirect {
+            site,
+            scope: IndirectScope::Bank,
+        }));
     }
 
     #[test]
@@ -1621,6 +1667,69 @@ mod tests {
             .blockers
             .contains(&OwnerBlocker::UnresolvedIndirect {
                 site: target,
+                scope: IndirectScope::Bank,
+            }));
+    }
+
+    #[test]
+    fn candidate_only_indirect_does_not_enter_authority_owner_proof() {
+        let site = BASE + 0x20;
+        let jalr_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let mut bytes = asm(&[JR_RA, NOP]);
+        bytes.resize(0x28, 0);
+        bytes[0x20..0x24].copy_from_slice(&jalr_t9.to_be_bytes());
+        bytes[0x24..0x28].copy_from_slice(&NOP.to_be_bytes());
+        let broad_cfg = build_cfg("bank", &bytes, BASE, &[BASE, site]);
+        let partition = partition(&broad_cfg);
+        let facts = facts_for(bytes.len() as u32, &[BASE]);
+
+        let authority_closure = ClosureResult {
+            cfg: build_cfg("bank", &bytes, BASE, &[BASE]),
+            indirect: Vec::new(),
+        };
+        let authority = OwnerProofAuthority::from_authority_closure(
+            &authority_closure,
+            &facts,
+            &BTreeSet::new(),
+        );
+        let report = prove_exact_owners_with_authority(
+            &broad_cfg, &partition, &facts, &bytes, BASE, &authority,
+        );
+        let caller = report
+            .assessments
+            .iter()
+            .find(|assessment| assessment.entry().pc == BASE)
+            .unwrap();
+        assert!(matches!(caller, OwnerAssessment::Proven { .. }));
+
+        let authoritative_site = ClosureResult {
+            cfg: broad_cfg.clone(),
+            indirect: vec![crate::resolve::IndirectResolution {
+                site_pc: site,
+                via_call: true,
+                state: IndirectProofState::Open,
+                kind: None,
+                targets: Vec::new(),
+                memory_sources: Vec::new(),
+            }],
+        };
+        let authority = OwnerProofAuthority::from_authority_closure(
+            &authoritative_site,
+            &facts,
+            &BTreeSet::new(),
+        );
+        let blocked = prove_exact_owners_with_authority(
+            &broad_cfg, &partition, &facts, &bytes, BASE, &authority,
+        );
+        let caller = blocked
+            .assessments
+            .iter()
+            .find(|assessment| assessment.entry().pc == BASE)
+            .unwrap();
+        assert!(frontier(caller)
+            .blockers
+            .contains(&OwnerBlocker::UnresolvedIndirect {
+                site,
                 scope: IndirectScope::Bank,
             }));
     }

@@ -43,9 +43,8 @@ use crate::materialized_image::{
     MaterializedImageErrorV1, MaterializedImageLimitsV1,
 };
 use crate::owner_proof::{
-    exact_authority_direct_call, exhaustive_authority_call_site,
-    prove_exact_owners_with_callable_authority, AuthoritativeCallableEntries, OwnerAssessment,
-    OwnerBlocker, OwnerProofReport,
+    exact_authority_direct_call, exhaustive_authority_call_site, prove_exact_owners_with_authority,
+    OwnerAssessment, OwnerBlocker, OwnerProofAuthority, OwnerProofReport,
 };
 use crate::partition::{partition, partition_with_authorized_splits, Partition};
 use crate::pi_dma::{slice_pointer_arg_call_contracts, PiDmaSliceError};
@@ -1316,8 +1315,10 @@ fn finish_materialized_bank(
     // External roots were derived from authority-reached sibling calls.
     // `ensure_authoritative_block_leaders` above makes each one representable
     // in this broad CFG; the capability constructor independently requires
-    // alignment and a proven mapping in this bank.
-    let callable_authority = AuthoritativeCallableEntries::from_authority_closure(
+    // alignment and a proven mapping in this bank. The same capability also
+    // records which indirect sites are authority-reachable, so candidate-only
+    // broad sites cannot withhold exactness from unrelated owners.
+    let owner_proof_authority = OwnerProofAuthority::from_authority_closure(
         &authority_closure,
         &facts,
         external_authorized_roots,
@@ -1325,13 +1326,13 @@ fn finish_materialized_bank(
     // First owner pass supplies entry authority to block proof; executable
     // evidence may not exist yet, so its `NotProvenExecutable` blockers are
     // provisional and it is never serialized.
-    let authority_proof = prove_exact_owners_with_callable_authority(
+    let authority_proof = prove_exact_owners_with_authority(
         &closure.cfg,
         &partition,
         &facts,
         &bytes,
         va_start,
-        &callable_authority,
+        &owner_proof_authority,
     );
     // Candidate traversal roots may split broad partition geometry, but they
     // cannot confer execution authority. Project only exact claimant roots
@@ -1350,17 +1351,18 @@ fn finish_materialized_bank(
     // executable — exactly those bytes, never the gaps between them. Record
     // them as typed facts, then re-prove owners against the enriched
     // evidence. Both owner passes consume the same authority-closure-derived
-    // callable capability, so broad candidate calls cannot become authority
-    // through this executable-range feedback. Block proof itself does not
-    // consume executable ranges, so no further fixpoint iteration exists.
+    // owner-proof capability, so broad candidate calls cannot become authority
+    // and broad candidate-only indirect sites cannot become blockers through
+    // this executable-range feedback. Block proof itself does not consume
+    // executable ranges, so no further fixpoint iteration exists.
     conclude_reached_executable_ranges(&block_proof, &mut facts);
-    let owner_proof = prove_exact_owners_with_callable_authority(
+    let owner_proof = prove_exact_owners_with_authority(
         &closure.cfg,
         &partition,
         &facts,
         &bytes,
         va_start,
-        &callable_authority,
+        &owner_proof_authority,
     );
     let blocker_histogram = owner_blocker_histogram(&owner_proof);
     let coverage = report_with_owner_proofs(rom.len(), &facts, std::slice::from_ref(&owner_proof))?;
