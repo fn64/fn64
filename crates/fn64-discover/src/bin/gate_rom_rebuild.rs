@@ -25,6 +25,9 @@
 //! Environment:
 //! * `FN64_DISCOVER_ROM` — the ROM to prove (required).
 //! * `FN64_REBUILD_OUT` — optional path for the rebuilt image.
+//! * `FN64_REBUILD_DUMP_ASM_DIR` — optional directory retaining every
+//!   emitted `.s` so the mnemonic-vs-`.word` composition of a "pass" can be
+//!   audited independently of this gate's own claims.
 //!
 //! Requires `mips-linux-gnu-{as,ld,objcopy}` (macOS: `brew install
 //! mips-linux-gnu-binutils` or a cross-binutils build providing these
@@ -318,6 +321,14 @@ fn run() -> Result<(), String> {
                     Ok(assembled) if assembled == original => {
                         assembly_digest.update(run_start.to_be_bytes());
                         assembly_digest.update(assembly.as_bytes());
+                        if let Ok(dir) = std::env::var("FN64_REBUILD_DUMP_ASM_DIR") {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(
+                                Path::new(&dir)
+                                    .join(format!("{}_{run_start:08x}.s", bank.bank)),
+                                &assembly,
+                            );
+                        }
                         outcome = Some(Ok(assembled));
                         break;
                     }
