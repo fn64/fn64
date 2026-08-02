@@ -226,7 +226,7 @@ test = false
 
 [[bin]]
 name = "gate_wm2000_recompile"
-path = "src/bin/gate_wm2000_recompile.rs"
+path = "src/bin/gate_wm2000_recompile/main.rs"
 test = true
 
 [[bin]]
