@@ -90,7 +90,11 @@ pub const DYNAMIC_MAPPED_EXECUTION_SOURCE_SCHEMA_V1: &str =
 
 const DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1: &[(&str, &[u8])] = &[
     ("src/boot.rs", include_bytes!("boot.rs")),
-    ("src/decoder.rs", include_bytes!("decoder.rs")),
+    (
+        "src/decoder/dispatch.rs",
+        include_bytes!("decoder/dispatch.rs"),
+    ),
+    ("src/decoder/mod.rs", include_bytes!("decoder/mod.rs")),
     (
         "src/dev_interpreter_artifact.rs",
         include_bytes!("dev_interpreter_artifact.rs"),

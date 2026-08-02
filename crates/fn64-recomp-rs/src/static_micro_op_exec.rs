@@ -59,7 +59,14 @@ pub fn static_micro_op_executor_source_receipt_v1() -> StaticMicroOpExecutorSour
     let sources: &[(&[u8], &[u8])] = &[
         (b"Cargo.toml", include_bytes!("../Cargo.toml")),
         (b"src/lib.rs", include_bytes!("lib.rs")),
-        (b"src/decoder.rs", include_bytes!("decoder.rs")),
+        (
+            b"src/decoder/dispatch.rs",
+            include_bytes!("decoder/dispatch.rs"),
+        ),
+        (
+            b"src/decoder/mod.rs",
+            include_bytes!("decoder/mod.rs"),
+        ),
         (b"src/execution.rs", include_bytes!("execution.rs")),
         (b"src/runtime.rs", include_bytes!("runtime.rs")),
         (
@@ -104,7 +111,14 @@ pub fn static_micro_op_executor_source_receipt_v2() -> StaticMicroOpExecutorSour
     let sources: &[(&[u8], &[u8])] = &[
         (b"Cargo.toml", include_bytes!("../Cargo.toml")),
         (b"src/lib.rs", include_bytes!("lib.rs")),
-        (b"src/decoder.rs", include_bytes!("decoder.rs")),
+        (
+            b"src/decoder/dispatch.rs",
+            include_bytes!("decoder/dispatch.rs"),
+        ),
+        (
+            b"src/decoder/mod.rs",
+            include_bytes!("decoder/mod.rs"),
+        ),
         (b"src/execution.rs", include_bytes!("execution.rs")),
         (b"src/runtime.rs", include_bytes!("runtime.rs")),
         (
@@ -154,7 +168,14 @@ pub fn static_micro_op_executor_source_receipt_v3() -> StaticMicroOpExecutorSour
     let sources: &[(&[u8], &[u8])] = &[
         (b"Cargo.toml", include_bytes!("../Cargo.toml")),
         (b"src/lib.rs", include_bytes!("lib.rs")),
-        (b"src/decoder.rs", include_bytes!("decoder.rs")),
+        (
+            b"src/decoder/dispatch.rs",
+            include_bytes!("decoder/dispatch.rs"),
+        ),
+        (
+            b"src/decoder/mod.rs",
+            include_bytes!("decoder/mod.rs"),
+        ),
         (b"src/execution.rs", include_bytes!("execution.rs")),
         (b"src/runtime.rs", include_bytes!("runtime.rs")),
         (b"src/fpu.rs", include_bytes!("fpu.rs")),

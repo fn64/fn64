@@ -48,7 +48,14 @@ impl StaticMicroOpFormatSourceReceiptV1 {
 
 pub fn static_micro_op_format_source_receipt_v1() -> StaticMicroOpFormatSourceReceiptV1 {
     let sources: &[(&[u8], &[u8])] = &[
-        (b"src/decoder.rs", include_bytes!("decoder.rs")),
+        (
+            b"src/decoder/dispatch.rs",
+            include_bytes!("decoder/dispatch.rs"),
+        ),
+        (
+            b"src/decoder/mod.rs",
+            include_bytes!("decoder/mod.rs"),
+        ),
         (
             b"src/static_micro_op.rs",
             include_bytes!("static_micro_op.rs"),
@@ -84,7 +91,14 @@ impl StaticMicroOpFormatSourceReceiptV2 {
 
 pub fn static_micro_op_format_source_receipt_v2() -> StaticMicroOpFormatSourceReceiptV2 {
     let sources: &[(&[u8], &[u8])] = &[
-        (b"src/decoder.rs", include_bytes!("decoder.rs")),
+        (
+            b"src/decoder/dispatch.rs",
+            include_bytes!("decoder/dispatch.rs"),
+        ),
+        (
+            b"src/decoder/mod.rs",
+            include_bytes!("decoder/mod.rs"),
+        ),
         (
             b"src/static_micro_op.rs",
             include_bytes!("static_micro_op.rs"),
