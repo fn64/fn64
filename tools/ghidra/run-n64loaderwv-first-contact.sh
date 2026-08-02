@@ -101,9 +101,9 @@ workspace=$(CDPATH='' cd -- "$workspace" && pwd -P) || fail "cannot resolve WORK
 case "$workspace" in
     "$repo"|"$repo"/*) fail "WORKSPACE must be outside the repository" ;;
 esac
-if workspace_mode=$(stat -f '%Lp' "$workspace" 2>/dev/null); then
+if workspace_mode=$(stat -c '%a' "$workspace" 2>/dev/null); then
     :
-elif workspace_mode=$(stat -c '%a' "$workspace" 2>/dev/null); then
+elif workspace_mode=$(stat -f '%Lp' "$workspace" 2>/dev/null); then
     :
 else
     fail "could not inspect WORKSPACE permissions"

@@ -116,9 +116,9 @@ work=$(CDPATH='' cd -- "$work" && pwd)
 case "$work" in
     "$repo"|"$repo"/*) fail "FN64_GHIDRA_WORK must be outside the repository" ;;
 esac
-if workspace_mode=$(stat -f '%Lp' "$work" 2>/dev/null); then
+if workspace_mode=$(stat -c '%a' "$work" 2>/dev/null); then
     :
-elif workspace_mode=$(stat -c '%a' "$work" 2>/dev/null); then
+elif workspace_mode=$(stat -f '%Lp' "$work" 2>/dev/null); then
     :
 else
     fail "could not inspect FN64_GHIDRA_WORK permissions"

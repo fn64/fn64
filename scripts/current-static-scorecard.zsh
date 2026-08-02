@@ -177,9 +177,9 @@ chmod 700 "$output_dir" 2>/dev/null || {
 
 private_mode() {
     local value
-    if value=$(stat -f '%Lp' -- "$output_dir" 2>/dev/null); then
+    if value=$(stat -c '%a' -- "$output_dir" 2>/dev/null); then
         [[ $value == 700 ]]
-    elif value=$(stat -c '%a' -- "$output_dir" 2>/dev/null); then
+    elif value=$(stat -f '%Lp' -- "$output_dir" 2>/dev/null); then
         [[ $value == 700 ]]
     else
         return 1

@@ -30,9 +30,9 @@ series_work=$(CDPATH='' cd -- "$series_work" && pwd -P) ||
 case "$series_work" in
     "$repo"|"$repo"/*) fail "FN64_GHIDRA_SERIES_WORK must be outside the repository" ;;
 esac
-if series_mode=$(stat -f '%Lp' "$series_work" 2>/dev/null); then
+if series_mode=$(stat -c '%a' "$series_work" 2>/dev/null); then
     :
-elif series_mode=$(stat -c '%a' "$series_work" 2>/dev/null); then
+elif series_mode=$(stat -f '%Lp' "$series_work" 2>/dev/null); then
     :
 else
     fail "could not inspect FN64_GHIDRA_SERIES_WORK permissions"

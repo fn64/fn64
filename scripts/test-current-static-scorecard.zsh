@@ -162,10 +162,10 @@ run_output=$("$test_root/scripts/current-static-scorecard.zsh" --output $invento
     && $(<$inventory_output/producer.calls) == 1 \
     && ! -e $inventory_output/writer.calls ]]
 typeset output_mode
-if output_mode=$(stat -f '%Lp' -- $inventory_output 2>/dev/null); then
+if output_mode=$(stat -c '%a' -- $inventory_output 2>/dev/null); then
     [[ $output_mode == 700 ]]
 else
-    [[ $(stat -c '%a' -- $inventory_output) == 700 ]]
+    [[ $(stat -f '%Lp' -- $inventory_output) == 700 ]]
 fi
 
 if "$test_root/scripts/current-static-scorecard.zsh" --output $inventory_output >/dev/null 2>&1; then
