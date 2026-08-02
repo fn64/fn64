@@ -192,6 +192,30 @@ pub fn emit_function(
     Ok(out)
 }
 
+/// Emit one contiguous proven-code region as GNU `as` text at its VA.
+///
+/// Unlike [`emit_function`], this makes **no ownership claim**: the extent is
+/// CFG-proven code (one basic block, or a maximal run of contiguous blocks),
+/// not a function boundary. Branches inside the region become local labels;
+/// every transfer leaving it stays numeric, and no `jal` resolves to a
+/// symbol. Used by whole-ROM round-trip verification where code is proven
+/// but no exact owner exists.
+pub fn emit_code_region(bank: &str, pc: u32, words: &[AsmWord]) -> Result<String, AsmEmitError> {
+    let region = ExactFunctionOwner {
+        entry: BankAddr::new(bank.to_owned(), pc),
+        va_end: pc.wrapping_add((words.len() as u32).wrapping_mul(4)),
+        // Emission never reads the backing span; this placeholder cannot
+        // reach any consumer because the synthetic owner never leaves here.
+        backing: crate::facts::BankBackingSpanV1::RomAffine {
+            rom_space: crate::RomAddressSpace::Physical,
+            rom_start: 0,
+            rom_end: 0,
+        },
+        block_starts: vec![pc],
+    };
+    emit_function(&region, words, &[])
+}
+
 /// Stable assembler identifier for one bank-qualified exact owner.
 pub fn function_symbol(address: &BankAddr) -> String {
     let mut bank = String::with_capacity(address.bank.len() * 2);
@@ -216,6 +240,17 @@ fn branch_labels(owner: &ExactFunctionOwner, words: &[AsmWord]) -> BTreeSet<u32>
                 .then_some(target)
         })
         .collect()
+}
+
+/// The absolute target of a PC-relative branch at `pc`, or `None` for
+/// non-branch instructions. Callers use this to decide whether a branch can
+/// be emitted symbolically (target inside the emitted extent) or must be
+/// retained numerically — GNU `as` resolves absolute branch operands against
+/// section-relative addresses, so a branch out of the emitted extent cannot
+/// assemble as a mnemonic.
+pub fn branch_target(pc: u32, instruction: Instruction) -> Option<u32> {
+    branch_offset(instruction)
+        .map(|off| pc.wrapping_add(4).wrapping_add((off as i32 as u32) << 2))
 }
 
 fn branch_offset(instruction: Instruction) -> Option<i16> {
@@ -651,6 +686,37 @@ mod tests {
             },
             block_starts: vec![start],
         }
+    }
+
+    #[test]
+    fn code_region_emits_without_ownership_claims() {
+        let words = [
+            AsmWord::decode(0x1100_0001), // beq $8,$0,+2   (in-region -> label)
+            AsmWord::decode(0x0000_0000),
+            AsmWord::raw(0x0001_7cd0),    // embedded table word, retained numerically
+            AsmWord::decode(0x1100_2000), // beq $8,$0,+0x2001 (leaves region -> numeric)
+            AsmWord::decode(0x0000_0000),
+        ];
+        let text = emit_code_region("test", 0x8000_1000, &words).unwrap();
+        assert!(text.contains("    beq $8,$0,.L_80001008\n"));
+        assert!(text.contains(".L_80001008:\n"));
+        assert!(text.contains("    .word 0x00017cd0\n"));
+        // The out-of-region branch keeps a numeric operand: callers must
+        // retain such words raw before assembling, and this emission shape
+        // is what makes that requirement visible.
+        assert!(text.contains("    beq $8,$0,0x80009010\n"));
+    }
+
+    #[test]
+    fn branch_target_reports_the_absolute_destination() {
+        let AsmWord::Instruction { decoded, .. } = AsmWord::decode(0x1100_0001) else {
+            panic!("beq decodes as an instruction");
+        };
+        assert_eq!(branch_target(0x8000_1000, decoded), Some(0x8000_1008));
+        let AsmWord::Instruction { decoded, .. } = AsmWord::decode(0x012a_4020) else {
+            panic!("add decodes as an instruction");
+        };
+        assert_eq!(branch_target(0x8000_1000, decoded), None);
     }
 
     #[test]

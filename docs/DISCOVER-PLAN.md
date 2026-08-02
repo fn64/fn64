@@ -1,7 +1,41 @@
 # Deterministic ROM Discovery Plan
 
 Status: active implementation plan
-Last updated: 2026-07-30
+Last updated: 2026-08-01
+
+## Composing milestone: byte-exact rebuild proven, known + novel (2026-08-01)
+
+`gate_rom_rebuild` composes automatic discovery into the Phase-8 end
+artifact: every proven bank materialized, every proven code region emitted as
+GNU `as` text, assembled/linked at its VA, byte-compared, and the verified
+bytes written back into a ROM image whose sha256 must equal the original's.
+Two granularities carry two claims — exact owners round-trip as functions
+(the decompile claim), maximal contiguous proven-block runs round-trip with
+no ownership claim (the code-classification claim). Unfaithful words
+(out-of-region branches, non-canonical encodings, embedded table data) are
+retained as numeric literals, counted, and reported.
+
+First results, cold discovery, zero reference TOMLs, run-twice
+byte-identical, digest match everywhere:
+
+- **Majora's Mask (USA)** — the known-recomp target (zeldaret / Zelda64Recomp
+  ground truth grades the decompile side separately): **605 banks, every
+  region exact, 101 raw words total**, 66,312 physical + 2,173,380
+  materialized bytes round-tripped.
+- **Clay Fighter 63⅓ (USA)** — the novel target, picked mechanically by
+  `scripts/pick-novel-rom.py` (no known decomp/recomp project): **220/220
+  regions, zero raw words, 811,944 bytes** of cold-proven code round-tripped
+  in one bank.
+- OoT (USA), Buck Bumble, Penny Racers, Automobili Lamborghini, Ridge Racer
+  64 also pass; invocations and the full table live in
+  `crates/fn64-discover/reference/corpus-invocations.md`.
+
+Honest limits: exact owners are zero on the cold path (functions=0/0
+everywhere), so the decompile-grade claim still rides on
+`gate_decomp_functions`' wrong==0 catalog; opaque bytes remain the explicit
+frontier (93.55% on Clay Fighter — assets, data, and unproven code); and
+materialized (compressed) bank sources stay original bytes in the rebuild,
+with their round-trip proven on output bytes.
 
 ## Objective
 

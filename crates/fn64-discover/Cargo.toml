@@ -65,6 +65,11 @@ path = "src/bin/gate_asm_roundtrip.rs"
 test = false
 
 [[bin]]
+name = "gate_rom_rebuild"
+path = "src/bin/gate_rom_rebuild.rs"
+test = false
+
+[[bin]]
 name = "gate_b1"
 path = "src/bin/gate_b1.rs"
 test = false

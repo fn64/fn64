@@ -115,3 +115,37 @@ apart from the donor.
 | K64  | 402 / 531  | 0 |
 | NWXE | 698 / 847  | 0 |
 | NW4E | 835 / 985  | 0 |
+
+## gate_rom_rebuild — Phase-8 whole-ROM byte-exact rebuild
+
+No answer key, dump, donor, or claims file: the ROM byte is the oracle and
+automatic discovery supplies every bank. Requires `mips-linux-gnu-{as,ld,objcopy}`
+on PATH (macOS: a cross-binutils build; Homebrew formulae exist).
+
+```sh
+# Known-recomp proof target (Majora's Mask; zeldaret + Zelda64Recomp are the
+# external ground truth for the DECOMPILE grade via gate_decomp_functions —
+# this gate is the RECOMPILE proof and reads none of that).
+FN64_DISCOVER_ROM=<roms>/mm-usa.z64 gate_rom_rebuild
+
+# Novel proof target (corpus-picked by scripts/pick-novel-rom.py; no known
+# decomp or recomp project exists for it).
+FN64_DISCOVER_ROM=<roms>/"Clay Fighter 63 1-3 (USA).z64" gate_rom_rebuild
+```
+
+The gate exits nonzero unless every attempted region round-trips byte-exact
+AND the rebuilt image's sha256 equals the original's. Run it twice: the
+reports must be byte-identical (assembly_text_sha256 included).
+
+Expected results (2026-08-01, cold discovery, zero reference TOMLs):
+
+| ROM | banks | regions | raw_words | roundtripped bytes | digest |
+|---|---:|---:|---:|---:|---|
+| Majora's Mask (USA) | 605 | all exact | 101 | 66,312 physical + 2,173,380 materialized | match |
+| Ocarina of Time (USA) | 102 | all exact | ~3.7k | 18,904 physical + 2,559,588 materialized | match |
+| Clay Fighter 63⅓ (USA) | 1 | 220/220 | 0 | 811,944 physical | match |
+| Buck Bumble / Penny Racers / Lamborghini / RR64 | 1 each | all exact | — | 307,560 / 93,768 / 519,380 / 206,428 | match |
+
+`raw_words` counts words retained as numeric literals (out-of-region
+branches, non-canonical encodings, embedded table data inside proven blocks)
+— byte-exact either way, reported never hidden.
