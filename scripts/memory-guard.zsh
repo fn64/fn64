@@ -1,7 +1,7 @@
 #!/bin/zsh
 
-# Sample one isolated process group by aggregate resident memory and macOS's
-# system-wide free-memory signal. The group remains the ownership boundary
+# Sample one isolated process group by aggregate resident memory and the host's
+# system-wide available-memory signal. The group remains the ownership boundary
 # after its original leader exits or descendants are reparented.
 
 set -u
@@ -81,7 +81,7 @@ record_json_sample() {
     }
 }
 
-read_free_percent() {
+read_macos_free_percent() {
     local pressure_output
     local line
     local candidate
@@ -98,6 +98,44 @@ read_free_percent() {
     done
     [[ -n "$free_percent" ]] || return 1
     (( free_percent >= 0 && free_percent <= 100 ))
+}
+
+read_linux_free_percent() {
+    local meminfo_key
+    local meminfo_value
+    local meminfo_unit
+    local ignored
+    local total_kib=
+    local available_kib=
+    local total_unit=
+    local available_unit=
+
+    while read -r meminfo_key meminfo_value meminfo_unit ignored; do
+        case ${meminfo_key%:} in
+            MemTotal)
+                total_kib=$meminfo_value
+                total_unit=$meminfo_unit
+                ;;
+            MemAvailable)
+                available_kib=$meminfo_value
+                available_unit=$meminfo_unit
+                ;;
+        esac
+    done < /proc/meminfo || return 1
+    [[ "$total_kib" == <-> && "$available_kib" == <-> ]] || return 1
+    [[ "$total_unit" == kB && "$available_unit" == kB ]] || return 1
+    (( total_kib > 0 && available_kib >= 0 && available_kib <= total_kib )) || return 1
+    free_percent=$((available_kib * 100 / total_kib))
+}
+
+read_free_percent() {
+    if (( $+commands[memory_pressure] )); then
+        read_macos_free_percent
+    elif [[ -r /proc/meminfo ]]; then
+        read_linux_free_percent
+    else
+        return 1
+    fi
 }
 
 # Take one coherent process-table snapshot. Any ps failure or malformed row is
