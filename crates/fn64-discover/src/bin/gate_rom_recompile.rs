@@ -21,19 +21,33 @@
 //! * `FN64_DISCOVER_ROM` — the ROM to certify (required).
 //! * `FN64_RECOMPILE_REPORT` — optional content-free JSON receipt path.
 
+use fn64_discover::banks::{BankNamePattern, BOOT_BANK};
 use fn64_discover::block_pack::{
     emit_validated_block_pack_v2, materialize_block_pack, BlockPackV1, MaterializedPackedBank,
+};
+use fn64_discover::catalog_transfer_fixed_point::{
+    compose_catalog_bound_direct_transfer_fixed_point_v1, CatalogTransferFixedPointLimitsV1,
 };
 use fn64_discover::closure::{
     classified_destinations, scoreboard, ClosureScoreboard, DestinationClass,
 };
-use fn64_discover::dense_aot_pack::DENSE_AOT_SHARD_BYTES;
+use fn64_discover::delta_vote::DeltaVoteConfig;
+use fn64_discover::dense_aot_pack::{
+    build_dense_aot_pack_v1, DenseAotGenerationInput, DENSE_AOT_SHARD_BYTES,
+};
 use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
+use fn64_discover::generation_topology::build_generation_topology_v1;
+use fn64_discover::overlay_recipe::admitted_overlay_load_recipes_v1;
+use fn64_discover::overlay_regions::SearchConfig;
+use fn64_discover::runtime_generation_catalog::build_backed_dense_generation_catalog_v1;
 use fn64_discover::snapshot::{
     compose_materialized_banks_validated_v2_with_limits, MaterializedBankInput,
-    MultiBankCompositionLimits,
+    MultiBankCompositionLimits, ValidatedComposedSnapshotsV2,
 };
-use fn64_discover::{required_env_path, Fact, FactDb, RomAddressSpace};
+use fn64_discover::{
+    required_env_path, run_discovery_with_recovered_overlay_regions, DiscoveryStrategy, Fact,
+    FactDb, RecoveredOverlayInput, RomAddressSpace,
+};
 use fn64_recomp_rs::execution::BankId;
 use fn64_recomp_rs_codegen::{emit_dense_bank_shard_runner_function, DenseBankShardInput};
 use serde::Serialize;
@@ -72,6 +86,14 @@ const MAX_COMPILE_UNIT_WORDS: usize = (DENSE_AOT_SHARD_BYTES / 4) as usize;
 /// `gate_wm2000_recompile`'s dense-AOT path already relies on -- keeps every
 /// emitted function small regardless of how large the source bank is.
 const MAX_SHARD_WORDS: usize = (DENSE_AOT_SHARD_BYTES / 4) as usize;
+
+/// Content-hashing salt for this gate's own resident-tail generation identity
+/// (see `build_generation_topology_v1`'s doc comment on
+/// `resident_tail_identity_domain`: any fixed, gate-distinguishing byte
+/// string is correct). Distinct from `gate_wm2000_recompile`'s own constant
+/// so the two gates' identity hashes can never collide.
+const ROM_RECOMPILE_RESIDENT_TAIL_IDENTITY_DOMAIN_V1: &[u8] =
+    b"fn64:rom-recompile-resident-tail-generation:v1:";
 
 struct PhysicalBank {
     bank: String,
@@ -165,18 +187,49 @@ fn run() -> Result<(), String> {
         })
         .collect();
 
-    // Generic composition, not the catalog-bound generation fixed point: the
-    // latter requires at least one overlay generation, which a single-bank
-    // ROM does not have. This is the same validated multi-bank composition
-    // `gate_rom_rebuild` proves across the corpus, and it yields the same
-    // `ValidatedComposedSnapshotsV2` the block-pack emitter consumes.
-    let composed = compose_materialized_banks_validated_v2_with_limits(
-        &rom,
-        &facts,
-        &inputs,
-        MultiBankCompositionLimits::default(),
-    )
-    .map_err(|error| format!("composing snapshot banks: {error}"))?;
+    // Two composition paths, chosen by what discovery actually proved:
+    //
+    // The single-pass composer (`compose_materialized_banks_validated_v2_with_limits`)
+    // trusts only `proven_function_entries`/`proven_hardware_function_entries`
+    // as CFG-closure authority (see `build_cross_bank_authority_closure` in
+    // `snapshot.rs`), and a hardware entrypoint exists only for the boot bank
+    // (`Fact::FunctionEntryClaim` with `RomHeaderEntrypoint` evidence, proven
+    // from the ROM's own header). An overlay bank has no such entry -- nothing
+    // ever calls it from inside its own byte range -- so every one of its
+    // `FunctionEntryClaim` roots (however many `callable_roots` collects) is
+    // rejected as `EntryNotAuthoritative` and the bank composes with zero
+    // proven blocks, regardless of how many roots were seeded. This is a
+    // proof-propagation gap, not a geometry gap: passing the overlay's whole
+    // bank extent as if it were one flat text region (as this gate did before)
+    // changes nothing here, because the single-pass composer never looks at a
+    // text/data split at all -- `MaterializedBankInput` has none.
+    //
+    // What actually supplies authority into an overlay bank is a PROVEN CALL
+    // FROM the boot bank's own closure landing at the overlay's load address --
+    // exactly what `compose_catalog_bound_direct_transfer_fixed_point_v1`
+    // establishes by iterating composition to a fixed point over dense-AOT
+    // generations wired through a generation topology and capability catalog.
+    // That is the same mechanism `gate_wm2000_recompile` (this gate's
+    // hand-configured, single-game predecessor) already relies on for the
+    // identical AKI-family overlay shape; the only thing that gate hardcodes
+    // and this one must not is the recipe geometry and bank count.
+    let composed = if discovery.selected == DiscoveryStrategy::RecoveredOverlays {
+        compose_catalog_bound_overlay_snapshots(&rom_bytes, &rom, &facts, &physical, &inputs)?
+    } else {
+        // Generic composition, not the catalog-bound generation fixed point:
+        // the latter requires at least one overlay generation, which a
+        // single-bank (or boot-bank-only) ROM does not have. This is the same
+        // validated multi-bank composition `gate_rom_rebuild` proves across
+        // the corpus, and it yields the same `ValidatedComposedSnapshotsV2`
+        // the block-pack emitter consumes.
+        compose_materialized_banks_validated_v2_with_limits(
+            &rom,
+            &facts,
+            &inputs,
+            MultiBankCompositionLimits::default(),
+        )
+        .map_err(|error| format!("composing snapshot banks: {error}"))?
+    };
     let snapshots = composed.snapshots();
     let board = scoreboard(snapshots);
 
@@ -336,6 +389,145 @@ fn print_scoreboard(label: &str, board: &ClosureScoreboard) {
         );
     }
     println!("  total_destinations={}", board.total_destinations);
+}
+
+/// Compose an AKI-family overlay ROM (`DiscoveryStrategy::RecoveredOverlays`)
+/// through the catalog-bound direct-transfer fixed point, so cross-bank
+/// authority (a proven call from the boot bank landing at an overlay's load
+/// address) can reach each overlay's blocks. See the call site in `run()` for
+/// why the single-pass composer cannot do this at all.
+///
+/// This re-runs `run_discovery_with_recovered_overlay_regions` to obtain the
+/// `OverlayRecovery` object `run_discovery_auto` selected internally but does
+/// not return (`AutoDiscovery` carries only the winning `FactDb`). The search
+/// config mirrors exactly what `run_discovery_auto` tries for this strategy
+/// (`lib.rs`, `overlay_input` in `run_discovery_auto_with_limits`): AKI-family
+/// geometry, the same table/bank naming. Re-deriving is cheap (one more ROM
+/// scan) and deterministic -- it is the same mechanical recovery over the
+/// same bytes, so it reproduces the identical recovery `run_discovery_auto`
+/// already selected, not a second guess. A generic gate must not hardcode
+/// `aki_family()` for its OWN sake (the ROM might have selected the sibling
+/// `RecoveredVrom`/`vrom_family()` strategy instead, which this function is
+/// never called for); it is hardcoded here only because this function is
+/// reached exclusively when `discovery.selected == RecoveredOverlays`, which
+/// `run_discovery_auto` only ever concludes from the `aki_family()` attempt.
+fn compose_catalog_bound_overlay_snapshots(
+    rom_bytes: &[u8],
+    rom: &fn64_discover::NormalizedRom,
+    facts: &FactDb,
+    physical: &[PhysicalBank],
+    inputs: &[MaterializedBankInput<'_>],
+) -> Result<ValidatedComposedSnapshotsV2, String> {
+    let search = SearchConfig::aki_family();
+    let overlay_input = RecoveredOverlayInput {
+        min_mapped_regions: search.min_records,
+        search,
+        delta_vote: DeltaVoteConfig::default(),
+        table_name: "recovered_overlay_descriptors".to_string(),
+        bank_name: BankNamePattern::new("recovered_overlay_", 0, ""),
+    };
+    let (_, _, recovery) = run_discovery_with_recovered_overlay_regions(rom_bytes, &overlay_input)
+        .map_err(|error| format!("re-deriving overlay recovery: {error:?}"))?;
+    let recipes = admitted_overlay_load_recipes_v1(rom_bytes, &recovery)
+        .map_err(|error| format!("recovering complete overlay load recipes: {error:?}"))?;
+
+    let resident = physical
+        .iter()
+        .find(|bank| bank.bank == BOOT_BANK)
+        .ok_or_else(|| {
+            "recovered-overlay composition requires a resident boot bank".to_string()
+        })?;
+    // The boot bank's whole physical extent is trusted as one flat text
+    // region (no data/bss split), matching what this gate's single-bank path
+    // already assumed for every non-overlay ROM -- the IPL3 boot copy is a
+    // fixed-size, fixed-offset physical span (`BOOT_COPY_ROM_START`/`SIZE` in
+    // `banks.rs`), never a table-described load image with its own text/data
+    // boundary the way an overlay recipe is.
+    let mut dense_inputs = vec![DenseAotGenerationInput {
+        name: BOOT_BANK,
+        source_rom_start: resident.rom_start,
+        source_rom_end: resident.rom_end,
+        load_start: resident.va_start,
+        text_start: resident.va_start,
+        text_end: resident.va_end,
+        data_start: resident.va_end,
+        data_end: resident.va_end,
+        bss_start: resident.va_end,
+        bss_end: resident.va_end,
+    }];
+
+    // Match each overlay `PhysicalBank` to its recipe by ROM source interval,
+    // not by list position: `physical_banks` derives its order from
+    // `proven_rom_mappings()` (bank-name sorted), while `admitted_overlay_
+    // load_recipes_v1` preserves the admitted table's own raw record order,
+    // which `scan_recovered_overlay_regions` deduplicates/renames through a
+    // `BTreeMap` keyed by `(rom_start, rom_end)` -- a different sort key than
+    // bank name. The two orders coincide whenever bank names sort the same
+    // way their source intervals do, but nothing proves they always must;
+    // matching by the ROM interval both sides actually share is exact
+    // regardless, and a bank with no matching recipe fails loudly instead of
+    // silently pairing with the wrong overlay's text/data/bss split.
+    let overlay_banks: Vec<&PhysicalBank> = physical
+        .iter()
+        .filter(|bank| bank.bank != BOOT_BANK)
+        .collect();
+    if overlay_banks.len() != recipes.len() {
+        return Err(format!(
+            "recovered {} overlay bank(s) but {} admitted load recipe(s)",
+            overlay_banks.len(),
+            recipes.len()
+        ));
+    }
+    // `build_generation_topology_v1` below zips its own `dense_pack.generations`
+    // (built from `dense_inputs`, in `overlay_banks` order) against whatever
+    // recipe slice it is given, POSITIONALLY (`overlays.iter().zip(recipes)` in
+    // `generation_topology.rs`) -- so the recipe list passed to it must already
+    // be reordered into that same order, not the admitted table's raw record
+    // order `recipes` started in. `matched_recipes` carries that reordering
+    // alongside `dense_inputs` so the two stay in lockstep by construction.
+    let mut matched_recipes = Vec::with_capacity(overlay_banks.len());
+    for bank in &overlay_banks {
+        let recipe = recipes
+            .iter()
+            .find(|recipe| recipe.rom_start == bank.rom_start && recipe.rom_end == bank.rom_end)
+            .ok_or_else(|| {
+                format!(
+                    "{} ROM interval [{:#x},{:#x}) has no matching admitted overlay recipe",
+                    bank.bank, bank.rom_start, bank.rom_end
+                )
+            })?;
+        dense_inputs.push(DenseAotGenerationInput::from((bank.bank.as_str(), recipe)));
+        matched_recipes.push(recipe.clone());
+    }
+
+    let dense_pack = build_dense_aot_pack_v1(rom, &dense_inputs)
+        .map_err(|error| format!("building dense AOT pack: {error:?}"))?;
+    // The identity domain is a content-hashing salt, not game-specific logic
+    // (see `build_generation_topology_v1`'s own doc comment); it only needs
+    // to be a fixed distinguishing tag for this gate's own resident-tail
+    // generation identity, the same role `gate_wm2000_recompile`'s WM-specific
+    // constant plays for its one hardcoded game.
+    let topology = build_generation_topology_v1(
+        rom,
+        &dense_pack,
+        BOOT_BANK,
+        ROM_RECOMPILE_RESIDENT_TAIL_IDENTITY_DOMAIN_V1,
+        &matched_recipes,
+    )
+    .map_err(|error| format!("building generation topology: {error}"))?;
+    let generation_catalog = build_backed_dense_generation_catalog_v1(rom, &dense_pack, &topology)
+        .map_err(|error| format!("building runtime generation catalog: {error}"))?;
+    let catalog_fixed_point = compose_catalog_bound_direct_transfer_fixed_point_v1(
+        rom,
+        facts,
+        inputs,
+        &dense_pack,
+        &topology,
+        &generation_catalog,
+        CatalogTransferFixedPointLimitsV1::default(),
+    )
+    .map_err(|error| format!("composing catalog-bound overlay transfer closure: {error:?}"))?;
+    Ok(catalog_fixed_point.into_validated())
 }
 
 fn physical_banks(facts: &FactDb) -> Result<Vec<PhysicalBank>, String> {
