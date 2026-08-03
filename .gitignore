@@ -32,3 +32,6 @@ __pycache__/
 !.claude/
 .claude/*
 !.claude/skills/
+
+# Raw corpus sweep output: regenerate with scripts/, not source of truth.
+crates/fn64-discover/reference/corpus-certification-sample.tsv
