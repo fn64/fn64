@@ -1240,6 +1240,57 @@ fn main() {
         }
     }
 
+    // Dynamic entry roots: an executed PC proves a word runs as code, and the
+    // structural entry test proves a function begins there. Neither half
+    // suffices alone -- a trace observes mostly mid-function words (5,279
+    // distinct on a bank of ~850 functions), and boundary shape alone is what
+    // the static lanes already apply. Together both halves are
+    // machine-checked, so a qualifying PC is an excused callable entry of the
+    // same class as a jal target.
+    //
+    // This runs against the BOOT bank specifically: the resident trace
+    // observes almost everything here, and `non_overlay_banks` (used by the
+    // per-overlay grade) deliberately excludes it.
+    let mut dynamic_entry_roots = 0usize;
+    {
+        let boot_words: Vec<u32> = bank_bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        let mut observed: Vec<u32> = db
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::ObservedExecutedCode { site, .. } if site.bank == banks::BOOT_BANK => {
+                    Some(site.pc)
+                }
+                _ => None,
+            })
+            .collect();
+        observed.sort_unstable();
+        observed.dedup();
+        for pc in observed {
+            let Some(offset) = pc.checked_sub(boot_va_start).map(|d| (d / 4) as usize) else {
+                continue;
+            };
+            if offset >= boot_words.len() {
+                continue;
+            }
+            if !fn64_discover::sig_scan::plausible_function_boundary(&boot_words, offset) {
+                continue;
+            }
+            if roots.contains(&pc) {
+                continue;
+            }
+            roots.push(pc);
+            excused.push(pc);
+            dynamic_entry_roots += 1;
+        }
+        if dynamic_entry_roots != 0 {
+            println!("observed-execution entry roots added={dynamic_entry_roots}");
+        }
+    }
+
     let (cfg, resolved) = build_cfg_closed_with_facts_and_claims(
         &db,
         banks::BOOT_BANK,
