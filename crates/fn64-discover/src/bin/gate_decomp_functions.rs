@@ -1866,7 +1866,7 @@ fn main() {
         // machine-checked callable entry (it ran from an observed site),
         // so it joins the excused root set — same evidentiary class as a
         // jal target, never a guess.
-        let observed_targets: Vec<fn64_discover::facts::BankAddr> = db
+        let mut observed_targets: Vec<fn64_discover::facts::BankAddr> = db
             .facts()
             .iter()
             .filter_map(|fact| match fact {
@@ -1874,6 +1874,73 @@ fn main() {
                 _ => None,
             })
             .collect();
+        // Executed PCs are the other dynamic evidence class, and most of them
+        // are mid-function words rather than entries: a 40,000,000-record
+        // WM2000 capture folds 5,279 distinct executed words, while the bank
+        // holds only ~850 functions. Admitting each as a root would seed
+        // interior entries wholesale and manufacture `wrong` splits.
+        //
+        // An executed PC is promoted only when it independently satisfies the
+        // SAME structural entry test static discovery uses
+        // (`plausible_function_boundary`: it follows a terminator or padding,
+        // and its own word is admissible as an entry). Execution then supplies
+        // what the static lanes lacked -- proof the word really runs as code --
+        // while the boundary shape supplies what execution cannot: evidence
+        // that this particular word is where a function BEGINS.
+        //
+        // Both halves are machine-checked, so a promoted PC joins the excused
+        // set. A word that runs but has no entry shape stays existence-only
+        // evidence and roots nothing.
+        let mut observed_entry_promotions = 0usize;
+        let executed_entry_roots: Vec<fn64_discover::facts::BankAddr> = db
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::ObservedExecutedCode { site, .. } => Some(site.clone()),
+                _ => None,
+            })
+            .filter(|site| {
+                // The boot bank is deliberately absent from `non_overlay_banks`
+                // (that list exists for the per-overlay grade), yet it is where
+                // the resident trace observes almost everything -- so resolve
+                // the image for either.
+                let boot_image = (site.bank == banks::BOOT_BANK)
+                    .then(|| (boot_va_start, full_boot_bytes as &[u8]));
+                let Some((bank_va, image)) = boot_image.or_else(|| {
+                    non_overlay_banks
+                        .iter()
+                        .find(|(bank, _, _)| *bank == site.bank)
+                        .map(|(_, va, bytes)| (*va, bytes.as_slice()))
+                }) else {
+                    return false;
+                };
+                let Some(offset) = site.pc.checked_sub(bank_va).map(|d| (d / 4) as usize) else {
+                    return false;
+                };
+                let words: Vec<u32> = image
+                    .chunks_exact(4)
+                    .map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect();
+                if offset >= words.len() {
+                    return false;
+                }
+                let promoted = fn64_discover::sig_scan::plausible_function_boundary(&words, offset);
+                if promoted {
+                    observed_entry_promotions += 1;
+                }
+                promoted
+            })
+            .collect();
+        observed_targets.extend(executed_entry_roots);
+        observed_targets.sort_by(|left, right| {
+            (left.bank.as_str(), left.pc).cmp(&(right.bank.as_str(), right.pc))
+        });
+        observed_targets.dedup();
+        if observed_entry_promotions > 0 {
+            println!(
+                "observed executed PCs promoted to excused entry roots: {observed_entry_promotions}"
+            );
+        }
         let mut code_totals = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut code_wrong: Vec<String> = Vec::new();
         for (bank, bank_va, image) in &non_overlay_banks {

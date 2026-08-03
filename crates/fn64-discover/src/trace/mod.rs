@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::BufRead;
 
@@ -904,6 +904,23 @@ pub fn fold_executed_pcs_into_fact_db(
     use crate::facts::{observed_executed_code_subject, BankAddr, Fact, ProofState};
 
     let mut report = FactDbFoldReport::default();
+    // Provenance per site is CAPPED, not deduplicated. Code existence is a set
+    // property -- the thousandth execution of a PC says what the first did --
+    // but the second sighting is still meaningful as corroboration, and the
+    // retained sequences say when the word was seen. Collapsing to one record
+    // per site destroys both (measured: `corroborated` fell from 2,988 to 0).
+    //
+    // Recording EVERY observation is equally wrong: it makes the database
+    // scale with trace LENGTH rather than with distinct executed code. A
+    // 3,000,000-record capture produced 3,019,106 rows and 342 MB of
+    // justifications -- past the composition limit -- with one hot PC alone
+    // contributing 203,776 identical rows.
+    //
+    // Keeping the first two sightings per site preserves exactly what the
+    // consumers read (first-seen sequence, and the new-vs-corroborated
+    // distinction) while bounding the database at twice the bank's word count.
+    const MAX_PROVENANCE_PER_SITE: usize = 2;
+    let mut site_records: BTreeMap<BankAddr, usize> = BTreeMap::new();
     for observed in facts {
         let ObservedTraceFact::ExecutedPc { sequence, pc } = observed else {
             continue;
@@ -913,6 +930,11 @@ pub fn fold_executed_pcs_into_fact_db(
             continue;
         };
         let site = BankAddr::new(bank.clone(), pc.address);
+        let seen = site_records.entry(site.clone()).or_insert(0);
+        if *seen >= MAX_PROVENANCE_PER_SITE {
+            continue;
+        }
+        *seen += 1;
         let subject = observed_executed_code_subject(&site.bank, site.pc);
         let already_concluded = db.conclusion(&subject).is_some();
 
