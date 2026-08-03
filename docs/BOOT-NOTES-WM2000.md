@@ -1,5 +1,32 @@
 # WM2000 boot session notes (2026-07-14)
 
+> **STATUS AS OF 2026-08-03 — READ THIS BEFORE QUOTING ANY SECTION BELOW.**
+>
+> **WM2000 renders.** `scripts/wm2000-scenario-gate.zsh` passes 10/10 runs
+> with byte-identical evidence: 119 graphics submissions, 262 audio
+> submissions, 500 RCP tasks, 357 recognized microcodes, `render_error=None`.
+> Routes have been driven to Exhibition / Single Match setup. Frame dumps
+> land in `/tmp/fn64-wm2000-render-*.png` (240 frames, boot splash onward).
+>
+> This document is a CHRONOLOGICAL LOG, not a status page. Every "current
+> frontier" paragraph below states the frontier *as of its own session* and
+> is superseded by later ones. Two separate investigations have now been
+> misled by quoting a mid-document frontier as if it were current:
+>
+> * the passage near line 905-935 ("no VI mode/origin programming, no SP task
+>   submission") is the state on **2026-07-19**, closed by the fixes in
+>   sessions 4-9 below -- device-delivery ordering, `osEPiStartDma` `$a0`
+>   routing, the auto-stubbed `osGetCount`, semantic host-boundary binding,
+>   and finally the FR-bit inheritance bug that was blocking graphics;
+> * that passage itself opens by correcting an *earlier* wrong reading, which
+>   is exactly why quoting any single frontier out of sequence is unsafe.
+>
+> The honest open item is **catalog exhaustiveness** for a 100% static
+> recompilation claim: three `0xbfc0...` bootstrap exception vectors lacking
+> an exact image owner or a validated unreachability receipt, and four
+> unproven `MTC0 Status` value proofs. That is a static evidence audit, not
+> an input-route sweep -- driving more routes cannot close it.
+
 2026-07-25 arbitrary-PC update: checked AOT `lw`/`sw` now reaches the installed
 word-MMIO hook before RDRAM backing rejection. The private NWXE pack passes the
 former `__osSiDeviceBusy` SI-status fault at `0x80038268`. Its host override is
