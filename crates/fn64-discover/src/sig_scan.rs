@@ -218,25 +218,7 @@ pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
     // WCW/nWo Revenge, where `func_8002EC80` was split at 0x8002eeb0 — a
     // KSEG0 pointer run — and `func_8002FF00` at 0x80030860 — packed float
     // data; both sit immediately after zero padding).
-    if prev1 == 0 && prev2 == 0 && admissible_entry_word(raw_words[offset]) {
-        return true;
-    }
-    // One pad after a terminator: `jr $ra`/`eret` at prev3, its delay slot
-    // at prev2 (any instruction), exactly one zero pad at prev1. The
-    // two-pad rule above misses this shape whenever the delay slot is a
-    // real instruction; the graded keys contain hi/lo-constructed
-    // callbacks that open this way (WCW/nWo Revenge's
-    // __osExceptionPreamble among them). The single pad alone would be
-    // unsound -- a lone zero word is routinely a branch delay slot
-    // mid-function -- so this arm additionally demands the terminator,
-    // and the candidate word must still be admissible as code.
-    offset >= 3
-        && prev1 == 0
-        && {
-            let prev3 = raw_words[offset - 3];
-            prev3 == 0x03e0_0008 /* jr $ra */ || prev3 == 0x4200_0018 /* eret */
-        }
-        && admissible_entry_word(raw_words[offset])
+    prev1 == 0 && prev2 == 0 && admissible_entry_word(raw_words[offset])
 }
 
 /// Whether a word can open a real function.
@@ -440,21 +422,6 @@ mod tests {
         // A real prologue after the same padding is still admitted.
         let real_entry = [0, 0, 0x27bd_ffd8, 0xafbf_001c, 0x0000_0000];
         assert!(plausible_function_boundary(&real_entry, 2));
-    }
-
-    #[test]
-    fn one_pad_after_a_terminator_opens_a_function() {
-        // [jr $ra][real delay slot][one zero pad][prologue]: the two-pad
-        // rule misses this because the delay slot is a real instruction.
-        let one_pad = [0x03e0_0008, 0x27bd_0020, 0, 0x27bd_ffd8, 0xafbf_001c];
-        assert!(plausible_function_boundary(&one_pad, 3));
-        // Same shape but the candidate is a KSEG0 pointer: still data.
-        let one_pad_data = [0x03e0_0008, 0x27bd_0020, 0, 0x801b_7800, 0x8017_f400];
-        assert!(!plausible_function_boundary(&one_pad_data, 3));
-        // One pad WITHOUT a terminator before it stays inadmissible: a lone
-        // zero word is routinely a branch delay slot mid-function.
-        let lone_pad = [0x2402_0001, 0x1440_fff8, 0, 0x27bd_ffd8, 0xafbf_001c];
-        assert!(!plausible_function_boundary(&lone_pad, 3));
     }
 
     #[test]
