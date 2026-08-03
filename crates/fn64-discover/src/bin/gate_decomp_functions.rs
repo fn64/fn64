@@ -1344,6 +1344,66 @@ fn main() {
     // cross-bank authority into an aliased slot is M2's problem and is
     // deliberately absent here.
     if !slot_catalog.is_empty() {
+        // M2: inductive entry authority across composed banks.
+        //
+        // The in-bank sweep below roots each image from its own text, so an
+        // overlay function called only from a SIBLING image stays unrooted --
+        // overlay->overlay authority is circular with nothing to break in.
+        // The boot bank breaks it: every boot-window root this gate already
+        // proved is swept for jals into overlay windows, and those entries
+        // seed a fixpoint that carries authority image to image.
+        //
+        // Bank-keyed throughout (see `inductive_bank_roots`), so two images
+        // sharing a VA slot never merge root sets, and a target whose aliases
+        // disagree stays unconverted rather than guessing which is resident.
+        let mut boot_seeded: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+        let mut boot_to_overlay = 0usize;
+        for (index, chunk) in full_boot_bytes.chunks_exact(4).enumerate() {
+            let word = u32::from_be_bytes(chunk.try_into().unwrap());
+            if word >> 26 != 0x03 {
+                continue;
+            }
+            let pc = boot_va_start.wrapping_add((index as u32) * 4);
+            let target = (pc & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
+            if target >= boot_va_start && target < code_end {
+                continue;
+            }
+            match slot_catalog.resolve(target) {
+                fn64_discover::overlay_slots::SlotResolution::Unique { bank } => {
+                    if boot_seeded.entry(bank).or_default().insert(target) {
+                        boot_to_overlay += 1;
+                    }
+                }
+                fn64_discover::overlay_slots::SlotResolution::AgreedAcrossAliases { banks } => {
+                    let mut any = false;
+                    for bank in banks {
+                        if boot_seeded.entry(bank).or_default().insert(target) {
+                            any = true;
+                        }
+                    }
+                    if any {
+                        boot_to_overlay += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A budget the AKI corpus clears in a handful of rounds; exhausting it
+        // means the induction did not settle, and the gate keeps M1's
+        // in-bank-only roots rather than shipping a half-converged set.
+        const INDUCTIVE_MAX_ROUNDS: usize = 16;
+        let inductive = slot_catalog.inductive_bank_roots(&boot_seeded, INDUCTIVE_MAX_ROUNDS);
+        match &inductive {
+            Some(fixpoint) => println!(
+                "inductive overlay authority: boot->overlay seeds={boot_to_overlay} \
+                 rounds={} targets rejected by slot aliasing={}",
+                fixpoint.rounds, fixpoint.rejected_ambiguous,
+            ),
+            None => println!(
+                "inductive overlay authority: DID NOT CONVERGE in \
+                 {INDUCTIVE_MAX_ROUNDS} rounds -- falling back to in-bank roots"
+            ),
+        }
         let mut graded = 0usize;
         let mut skipped_no_answer = 0usize;
         let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -1406,6 +1466,24 @@ fn main() {
                 if target >= bank_va && target < bank_code_end && !bank_roots.contains(&target) {
                     bank_roots.push(target);
                     bank_excused.push(target);
+                }
+            }
+            // M2 roots for THIS bank: entries the induction proved callable
+            // from the boot bank or a sibling image. Same evidentiary class as
+            // the in-bank sweep above -- a direct call encoded in proven bytes,
+            // resolved to this image by the slot catalog -- so they join the
+            // excuse set alongside it.
+            if let Some(fixpoint) = &inductive {
+                if let Some(proven) = fixpoint.roots.get(&image.bank) {
+                    for target in proven {
+                        if *target >= bank_va
+                            && *target < bank_code_end
+                            && !bank_roots.contains(target)
+                        {
+                            bank_roots.push(*target);
+                            bank_excused.push(*target);
+                        }
+                    }
                 }
             }
             if bank_roots.is_empty() {
