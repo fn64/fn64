@@ -1,0 +1,67 @@
+# Key-Free Discovery: Mechanism Roadmap (NWXE / NW4E / Revenge)
+
+**Baselines (all wrong==0):** NWXE 698/2442 exact (grade line total=847), NW4E 835/3440 (total=985), Revenge 499/1709 (total=689). Combined: 2,032/7,591 exact (26.8%); 5,559 missed.
+
+---
+
+## 1. Merged buckets, ranked by total missed functions
+
+| # | Merged bucket (same root cause) | NWXE | NW4E | Revenge | Total |
+|---|---|---|---|---|---|
+| B1 | **Overlay banks never composed into the gate's fact db** — overlay functions never graded; entry authority circular or absent | 1,595 | 1,976 (1,739 intra-bank + 226 sibling + 11 boot-jal'd) | 1,020 | **4,591** |
+| B2 | **Boot functions whose only jal evidence sits in uncomposed overlay text** — cross-bank jal lane exists but sees banks=1 | 81 | 93 | 98 | **272** |
+| B3 | **Mutable-dispatch-table pointees** — VA appears only as a literal word in statically-initialized *mutable* .data (AKI GObj/process tables) | 0 | 358 | 0¹ | **358** |
+| B4 | **Statically unreferenced anywhere in the ROM** — runtime-computed dispatch or dead code (nop stubs, splat linear-sweep artifacts, epilogue fragments, exception-vector class) | 60 | 171 (50 boot + 121 overlay) | 81 (80 + 1 j-only) | **312** |
+| B5 | **`plausible_function_boundary` padding-shape rejects** — real hi/lo-constructed callbacks after `jr; delay; ONE pad` (rule demands jr-at-prev2 or two pads) | 5 | ~6 (the hi/lo-rejected boundary-opens) | 6 | **~17** |
+| B6 | **Stored-pointer present but no lane admits it** — run below HANDLER_TABLE_MIN_RUN=4, or pointer in asset region outside any proven bank | 0 | 0 | 3 | **3** |
+| B7 | **Contested/artifact residue** — ambiguous-block contests (0x80000450-class), InteriorEntry where discovery out-structures the key | 3 | 1 | 2 | **6** |
+
+¹ Revenge's mutable-table class blocks the *owner-proof certification* layer (1 of 8 blocker sites), not the grading layer.
+
+**Headline confirmed across all three games: B1+B2 = 4,863 of 5,559 misses (87.5%) share ONE cause — the gate composes the boot bank alone.** Boundary analysis is not the bottleneck; bank composition is.
+
+Note also the two-universes finding, consistent on NWXE and Revenge: the strict composed-bank owner-proof lane proves **zero** exact owners (all Candidate/Ambiguous, UnresolvedIndirect bank-scope poisoning from ~8–40 open jr/jalr sites), while partition grading reaches 499–835 exact. The roadmap below targets *grading recall*; the certification lane is a parallel track that PR #125's call-boundary seeding (`a72e8cd`) already advances.
+
+---
+
+## 2. Mechanisms, in execution order (functions closed ÷ implementation risk)
+
+### M1 — Wire recovered overlay banks into `gate_decomp_functions`'s fact db
+**Closes:** B2 entirely + the directly boot-jal'd slice of B1 (Revenge 747, NW4E 11) ≈ **1,030 functions**, plus it makes the other ~3,833 overlay functions *gradeable at all*.
+**Mechanism:** `gate_decomp_functions.rs` calls `run_discovery_with_tables_and_request_dma` and composes banks=1. `run_discovery_auto`'s RecoveredOverlays strategy (`run_discovery_with_recovered_overlay_regions`, aki_family) already key-freely proves every overlay bank on all three ROMs — the identical machinery `crates/fn64-discover/src/bin/gate_d1_overlays.rs` runs today. Feed those proven RomMapping facts into the gate's existing cross-bank jal lane (which iterates `proven_rom_mappings` and is currently a no-op) and into `compose_materialized_banks_v1` (`crates/fn64-discover/src/snapshot/multi_bank.rs`).
+**Risk: low.** Measured on NWXE: 219/220 cross-bank jal targets land exactly at key starts; the lone interior target is already an excused jal target — no wrong-split observed. The one real hazard is VA-slot aliasing (see M2); for M1 restrict conversions to targets unambiguous across the composed images.
+**Expected recall after M1:** NWXE 779/2442 (32%), NW4E 939/3440 (27%), Revenge ~1,246–1,344/1709 (73–79%, depending on how many of the 747 survive the two-images-one-slot 0x80090000 disambiguation).
+
+### M2 — Bank-scoped inductive entry authority inside composed overlays
+**Closes:** the intra-bank and sibling-jal remainder of B1 ≈ **3,300–3,600 functions** (NW4E 1,739+226; NWXE ~1,300 of 1,595 extrapolating NW4E's jal-reachable ratio; Revenge's residual ~273).
+**Mechanism:** overlay→overlay authority is circular *until* one entry is boot-rooted; M1 provides those roots. Extend the existing "multi-bank inductive callable seeding" (the lane that today prints `banks=1`) to iterate to fixpoint across composed banks, and grade each overlay bank as its own universe — the answer key already names functions per-section (`func_X_R1_text`), so intra-bank jal resolves without slot ambiguity. Cross-bank targets into aliased slots (NWXE bank1/4@0x800E1B90, bank2/3@0x8011C900; NW4E R1/R4 and R2/R3/R5; Revenge ovl_a/ovl_b@0x80090000) accept authority only when every aliased image agrees the target is a plausible entry, else stay Open. Builds on `compose_materialized_banks_v1` + the admitted-descriptor-table facts (which record which ROM range fills the slot).
+**Risk: moderate.** The aliasing rule must be conservative or wrong>0 appears; the per-section grading change touches the grader in `gate_decomp_functions.rs`.
+**Expected recall after M1+M2:** NWXE ~2,080/2442 (85%), NW4E ~2,904/3440 (84%), Revenge ~1,617/1709 (95%).
+
+### M3 — One-pad boundary arm in `sig_scan::plausible_function_boundary`
+**Closes:** B5 ≈ **17 functions** (including `__osExceptionPreamble` on Revenge). Tiny absolute, but the best ratio on the board.
+**Mechanism:** add a third arm to `plausible_function_boundary` (`crates/fn64-discover/src/sig_scan.rs:194`): accept `[jr/eret at prev3][delay-slot][exactly one zero pad]` when the candidate word passes `admissible_entry_word`. All 17 are already in the stored-code-pointer lane's own candidate lists with real prologues; only the padding shape kills them.
+**Risk: trivial.** Guarded by admissible_entry_word; measured candidates all open with `addiu $sp,-N`/`lui`.
+**Recall delta:** +5 NWXE, +~6 NW4E, +6 Revenge.
+
+### M4 — Certified runtime-observation lane for mutable-table and dark-live dispatch
+**Closes:** B3 (358) + the *live* subset of B4 (unknown fraction of 312) + Revenge's 7 jalr-callback certification blockers. Realistically **~400–550 functions**.
+**Mechanism:** this is the designed discharge, not a workaround. `a72e8cd`/PR #125 *proved* the static ceiling: the tables are enumerable but sit in statically-initialized mutable memory, and 45,117 unbounded-address stores defeat any store-closure immutability certificate — so no sound static lane can ever admit them. `fold_indirect_targets_into_fact_db` (`crates/fn64-discover/src/trace/mod.rs`) already folds trace-certified indirect targets into the fact db. Run the emitted runner (gate_trace machinery) far enough to observe the GObj/process dispatches, fold, re-grade. Critically: the trace lane proves *coverage, not universes* — observed targets are sound as callable roots (each observation is machine-checked), which is exactly what grading recall needs; it just cannot certify a jr site's target set exhaustive, so the owner-proof lane stays Candidate. That asymmetry is fine for this goal.
+**Risk: moderate** — depends on trace reach (menu/gameplay coverage), not on analysis soundness.
+**Expected recall after M1–M4:** NWXE ~2,120–2,160/2442 (87–88%), NW4E ~3,290–3,330/3440 (96%), Revenge ~1,630–1,650/1709 (95–96%).
+
+### M5 (parallel track, certification not recall) — Entry-argument/callback dataflow on jalr sites
+7 of Revenge's 8 bank-poisoning blockers are jalr register-callback dispatches, not table loads; the lever is propagating callee-pointer arguments across certified call boundaries — a direct extension of PR #125's seeding (`crates/fn64-discover/src/boundaries.rs`, `harvest.rs`). This unblocks OwnerProven certification (currently 0 proven on every measured boot bank) but adds few graded-exact functions by itself. Do it for the certification story, not the recall number.
+
+---
+
+## 3. The honest ceiling: buckets with NO sound key-free mechanism
+
+**B4-dead (the majority of B4) + B6 + B7 residue — roughly 200–280 functions (~3–4% of the combined key) — cannot be closed soundly, and most should not be.**
+
+- **Splat linear-sweep artifacts in the answer keys themselves:** NW4E's 50 boot "functions" include a single-`nop` stub (0x80000450), post-noreturn epilogue fragments (0x80000580 opens `lw $ra; jr $ra`), and dead getters — zero references of any kind in 28 MB; 23/49 are below the 5-word donor-signature minimum so even the signature lane is structurally impossible. NWXE's 60 (24 are ≤16-byte stubs, 3,868 bytes total) and Revenge's 80 (13.1 KiB, incl. handwritten exception/cache-vector asm) are the same class. A key-free discoverer that "found" these would be guessing. **The correct fix is key adjudication** (mark rows as artifacts), exactly as NW4E's 57 KB key hole (0x800433D0–0x800515BC, where discovery proves real structure the key lacks) already shows the keys are imperfect in both directions.
+- The runtime lane can rescue whichever of these are actually live (reached in traces); anything never observed and never referenced is indistinguishable from dead bytes by any sound method.
+- **B6 (3 fns):** relaxing HANDLER_TABLE_MIN_RUN or scanning asset regions for pointers is possible but is exactly the kind of lane that manufactures wrong>0; not worth 3 functions.
+- **B7 InteriorEntry cases** are discovery being *right* where the key is coarse — withholding exactness there is by design.
+
+**Achievable key-free recall ceiling with wrong==0, keys as-is: ~93–96% per game (NWXE ~88–90% is the laggard until its overlay-internal dark set is trace-measured). With key adjudication of the artifact rows: ~97–99%.** 100% against the current unadjudicated keys is not attainable by any sound mechanism, because the keys contain rows no evidence — static or dynamic — can ever support.
