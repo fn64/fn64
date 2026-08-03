@@ -1046,6 +1046,156 @@ pub(super) fn resolution_from_value(site_pc: u32, via_call: bool, value: &Tracke
     }
 }
 
+/// Interprocedural `$a0..$a3` seeds, keyed by function-entry VA.
+///
+/// A missing entry or a `None` slot means the register starts Unknown, which
+/// is byte-identical to the unseeded analysis for that entry.
+pub(super) type EntryArgumentSeeds = BTreeMap<u32, [Option<TrackedValue>; 4]>;
+
+/// Derive sound `$a0..$a3` entry seeds from certified call-boundary proofs.
+///
+/// A seed asserts "every runtime activation of this entry receives exactly
+/// these argument values", so admission must rule out callers the analysis
+/// cannot see. Three conditions, all fail-closed:
+///
+/// 1. The entry has at least one certified caller: a call-boundary proof
+///    whose callee is `Direct` to it or whose `ResolvedIndirect` target set
+///    contains it. Resolved-indirect callers are exhaustive by construction,
+///    so they are known callers, not a hole.
+/// 2. The entry's address is never materialized as a value: its VA does not
+///    occur as an aligned word anywhere in the bank image (pointer tables),
+///    and no address-ordered `lui`+`addiu`/`ori` pair in the image constructs
+///    it. Without a materialized address, a still-open indirect site cannot
+///    reach this entry, so the certified callers are all the callers.
+///    The scan is deliberately over-broad -- a code word that merely encodes
+///    the same bits also rejects -- because over-rejection only loses a seed.
+///    Residual risk: a construction scheduled across a backward branch feeds
+///    a still-open site; the six-game wrong==0 grading is the measured
+///    firewall for that gap.
+/// 3. Per register, every certified caller proves the same `Concrete` value
+///    set with no blockers. Disagreement or opacity degrades that register
+///    to Unknown rather than rejecting the whole entry.
+pub(super) fn compute_entry_argument_seeds(
+    cfg: &Cfg,
+    bank_bytes: &[u8],
+    va_start: u32,
+    analysis_roots: &[u32],
+) -> EntryArgumentSeeds {
+    let boundaries =
+        super::analyses::analyze_call_boundaries_from_roots(cfg, bank_bytes, va_start, analysis_roots);
+
+    let mut callers: BTreeMap<u32, Vec<&CallBoundaryProofV1>> = BTreeMap::new();
+    for call in &boundaries.calls {
+        match &call.callee {
+            CallBoundaryCalleeV1::Direct { target } => {
+                callers.entry(*target).or_default().push(call);
+            }
+            CallBoundaryCalleeV1::ResolvedIndirect { targets } => {
+                for target in targets {
+                    callers.entry(*target).or_default().push(call);
+                }
+            }
+        }
+    }
+
+    // Condition 2: collect every VA that is materialized in the image, either
+    // as an aligned data word or by an address-ordered lui/addiu|ori pair.
+    let mut materialized: BTreeSet<u32> = BTreeSet::new();
+    let mut lui_imm: [Option<u16>; 32] = [None; 32];
+    for chunk_start in (0..bank_bytes.len().saturating_sub(3)).step_by(4) {
+        let word = u32::from_be_bytes([
+            bank_bytes[chunk_start],
+            bank_bytes[chunk_start + 1],
+            bank_bytes[chunk_start + 2],
+            bank_bytes[chunk_start + 3],
+        ]);
+        materialized.insert(word);
+        let op = word >> 26;
+        let rs = ((word >> 21) & 0x1f) as usize;
+        let rt = ((word >> 16) & 0x1f) as usize;
+        let imm = (word & 0xffff) as u16;
+        match op {
+            0x0f => lui_imm[rt] = Some(imm), // lui
+            0x09 => {
+                // addiu: sign-extended low half
+                if let Some(hi) = lui_imm[rs] {
+                    materialized
+                        .insert(((hi as u32) << 16).wrapping_add(imm as i16 as i32 as u32));
+                }
+                if rt != rs {
+                    lui_imm[rt] = None;
+                }
+            }
+            0x0d => {
+                // ori: zero-extended low half
+                if let Some(hi) = lui_imm[rs] {
+                    materialized.insert(((hi as u32) << 16) | imm as u32);
+                }
+                if rt != rs {
+                    lui_imm[rt] = None;
+                }
+            }
+            _ => {
+                // Any other write to rt invalidates a pending lui in it. The
+                // written-register decoder covers the forms that matter here.
+                if let Some(written) = written_gpr(word) {
+                    lui_imm[written as usize] = None;
+                }
+            }
+        }
+    }
+
+    let root_set: BTreeSet<u32> = analysis_roots.iter().copied().collect();
+    let mut seeds = EntryArgumentSeeds::new();
+    for (entry, proofs) in callers {
+        if !root_set.contains(&entry) || materialized.contains(&entry) {
+            continue;
+        }
+        let mut slots: [Option<TrackedValue>; 4] = [None, None, None, None];
+        for slot in 0..4u8 {
+            let register = 4 + slot;
+            let mut merged: Option<BTreeSet<u32>> = None;
+            let mut sound = true;
+            for proof in &proofs {
+                let Some(reg_proof) = proof.registers.iter().find(|p| p.register == register)
+                else {
+                    sound = false;
+                    break;
+                };
+                if !reg_proof.blockers.is_empty() {
+                    sound = false;
+                    break;
+                }
+                let CallBoundaryValueV1::Concrete { values } = &reg_proof.value else {
+                    sound = false;
+                    break;
+                };
+                let values: BTreeSet<u32> = values.iter().copied().collect();
+                match &merged {
+                    None => merged = Some(values),
+                    Some(existing) if *existing == values => {}
+                    Some(_) => {
+                        // Condition 3: cross-caller disagreement degrades the
+                        // register, never joins the sets -- a join would claim
+                        // a per-activation value no single caller proves.
+                        sound = false;
+                        break;
+                    }
+                }
+            }
+            if sound {
+                if let Some(values) = merged {
+                    slots[slot as usize] = Some(TrackedValue::concrete(values));
+                }
+            }
+        }
+        if slots.iter().any(Option::is_some) {
+            seeds.insert(entry, slots);
+        }
+    }
+    seeds
+}
+
 /// Run bounded forward value-set analysis over the currently reachable CFG.
 /// Joins that exceed [`MAX_VALUE_SET`] become `open`; no widening guesses a
 /// target. Bounds from `sltiu` + dominating `beq`/`bne` edges refine only the
@@ -1060,6 +1210,13 @@ pub(super) fn resolve_value_sets_from_roots(
     va_start: u32,
     analysis_roots: &[u32],
 ) -> Vec<IndirectResolution> {
+    // Interprocedural argument seeds are derived here, once, and then applied
+    // to the same forward pass every other consumer already runs. Deriving
+    // them inside this entry point means every caller of the resolver benefits
+    // without threading a new argument through its own signature; an entry
+    // that fails admission simply gets no seed, so the pass is identical to
+    // the unseeded one for it.
+    let seeds = compute_entry_argument_seeds(cfg, bank_bytes, va_start, analysis_roots);
     resolve_value_sets_from_roots_observing(
         cfg,
         bank_bytes,
@@ -1069,6 +1226,7 @@ pub(super) fn resolve_value_sets_from_roots(
         None,
         None,
         None,
+        &seeds,
     )
 }
 
@@ -1084,6 +1242,7 @@ pub(super) fn resolve_value_sets_from_roots_observing(
         &[u8],
         &mut BTreeMap<u32, BTreeSet<RawCallBoundaryObservation>>,
     )>,
+    entry_seeds: &EntryArgumentSeeds,
 ) -> Vec<IndirectResolution> {
     let blocks: BTreeMap<u32, &BasicBlock> = cfg
         .blocks
@@ -1096,7 +1255,17 @@ pub(super) fn resolve_value_sets_from_roots_observing(
         if !blocks.contains_key(&root) {
             continue;
         }
-        let root_state = AnalysisState::at_root(root);
+        let mut root_state = AnalysisState::at_root(root);
+        // Interprocedural admission happened in compute_entry_argument_seeds;
+        // an absent entry leaves every argument register Unknown, identical
+        // to the historical unseeded analysis.
+        if let Some(slots) = entry_seeds.get(&root) {
+            for (index, slot) in slots.iter().enumerate() {
+                if let Some(value) = slot {
+                    root_state.set_register(4 + index as u8, value.clone());
+                }
+            }
+        }
         let next = incoming
             .get(&root)
             .map_or_else(|| root_state.clone(), |state| state.join(&root_state));
