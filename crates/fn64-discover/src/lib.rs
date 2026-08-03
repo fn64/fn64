@@ -228,6 +228,7 @@ pub mod corpus_homology;
 pub mod coverage;
 pub mod delta_vote;
 pub mod dense_aot_pack;
+pub mod dump_toml;
 pub mod evidence;
 pub mod external_aot;
 pub mod facts;
@@ -255,6 +256,7 @@ pub mod oot_reference;
 pub mod overlay_recipe;
 pub mod overlay_regions;
 pub mod overlay_reloc;
+pub mod overlay_slots;
 pub mod owner_proof;
 pub mod partition;
 pub mod pi_dma;
@@ -439,6 +441,54 @@ pub fn run_discovery_with_recovered_overlay_regions(
     harvest::harvest_discovered_candidates(&rom, &mut db)
         .expect("Phase 2 produced a malformed recovered-overlay mapping");
     Ok((rom, db, recovery))
+}
+
+/// Recover overlay load images from `rom`'s own bytes and add the proven
+/// mappings to an EXISTING fact database.
+///
+/// [`run_discovery_with_recovered_overlay_regions`] owns its database, which
+/// makes it an all-or-nothing choice: a consumer that already ran a
+/// tables/request-DMA discovery had to throw that database away to gain
+/// overlay mappings. The recovery itself is independent of how the database
+/// was built — it reads only `rom.bytes` and concludes only its own
+/// `load-image-table:` and `bank:` subjects — so it composes with any prior
+/// discovery instead of replacing it. Phase 3 harvest is re-run so candidates
+/// in the newly proven banks enter the database on the same footing as the
+/// caller's original banks.
+///
+/// No answer-key value, ROM identity, table offset, or destination address
+/// enters through this seam: every one is a recovery output, exactly as in
+/// [`run_discovery_with_recovered_overlay_regions`].
+pub fn add_recovered_overlay_regions(
+    rom: &NormalizedRom,
+    db: &mut FactDb,
+    input: &RecoveredOverlayInput,
+) -> overlay_regions::OverlayRecovery {
+    let recovery = overlay_regions::recover_overlay_regions(
+        &rom.bytes,
+        &input.search,
+        &input.delta_vote,
+        input.min_mapped_regions,
+    );
+    let proven = banks::scan_recovered_overlay_regions(
+        rom,
+        &recovery,
+        &input.table_name,
+        &input.bank_name,
+        db,
+    );
+    // Harvest only when this recovery actually proved a bank. Phase 3 is a
+    // whole-database pass, not an incremental one, so on a ROM where the
+    // recovery admits nothing there is by construction nothing new for it to
+    // see, and running it again would be pure work with no facts to show for
+    // it. Skipping it is what makes this seam exactly inert on such a ROM,
+    // which in turn is what lets callers invoke it unconditionally instead of
+    // gating it on a game they had to name.
+    if !proven.is_empty() {
+        harvest::harvest_discovered_candidates(rom, db)
+            .expect("Phase 2 produced a malformed recovered-overlay mapping");
+    }
+    recovery
 }
 
 fn discover_with_recovered_overlay_regions(

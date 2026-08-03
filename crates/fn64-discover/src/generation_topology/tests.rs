@@ -390,16 +390,197 @@
         );
     }
 
-    #[test]
-    fn invalidation_union_must_cover_resident_tail() {
-        let (rom, pack, mut recipes) = fixture();
-        for recipe in &mut recipes {
-            recipe.bss_end = BOOT + 0x1800;
+    /// Build a consistent pack+recipe pair from arbitrary overlay dense inputs,
+    /// so a fixture may vary overlay geometry without desynchronizing the two
+    /// sides `overlay_matches` compares.
+    fn fixture_with_overlays(
+        overlays: &[DenseAotGenerationInput<'static>],
+    ) -> (NormalizedRom, DenseAotPackV1, Vec<OverlayLoadRecipeV1>) {
+        let mut raw = vec![0u8; 0x5000];
+        raw[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        raw[8..12].copy_from_slice(&BOOT.to_be_bytes());
+        for (index, byte) in raw[0x1000..0x3040].iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(17);
         }
+        let rom = crate::normalize(&raw).unwrap();
+        let mut inputs = vec![DenseAotGenerationInput {
+            name: "boot",
+            source_rom_start: 0x1000,
+            source_rom_end: 0x3000,
+            load_start: BOOT,
+            text_start: BOOT,
+            text_end: BOOT + 0x2000,
+            data_start: BOOT + 0x2000,
+            data_end: BOOT + 0x2000,
+            bss_start: BOOT + 0x2000,
+            bss_end: BOOT + 0x2000,
+        }];
+        inputs.extend(overlays.iter().cloned());
+        let pack = build_dense_aot_pack_v1(&rom, &inputs).unwrap();
+        let recipes = pack
+            .generations
+            .iter()
+            .skip(1)
+            .enumerate()
+            .map(|(index, generation)| OverlayLoadRecipeV1 {
+                schema: OVERLAY_RECIPE_SCHEMA_V1.to_owned(),
+                descriptor_rom_offset: 0x200 + index as u32 * 0x24,
+                rom_start: generation.source_rom_start,
+                rom_end: generation.source_rom_end,
+                load_start: generation.load_start,
+                text_start: generation.text_start,
+                text_end: generation.text_end,
+                data_start: generation.data_start,
+                data_end: generation.data_end,
+                bss_start: generation.bss_start,
+                bss_end: generation.bss_end,
+                loaded_sha256: generation.loaded_sha256.clone(),
+            })
+            .collect();
+        (rom, pack, recipes)
+    }
+
+    /// The measured WCW/nWo Revenge and WCW vs nWo World Tour geometry (M1b
+    /// two-overlay swap pair): both overlay images load at ONE VA inside the
+    /// resident bank, and their invalidation union stops SHORT of
+    /// `resident.load_end`, because that end is the fixed 1 MiB IPL3 boot copy
+    /// -- a hardware constant no game's overlays are obliged to reach.
+    ///
+    /// This used to be rejected as `InvalidResidentSplit`. The resident tail's
+    /// image is now clamped to where overlays actually stop writing, leaving
+    /// the trailing resident span immutable rather than folding it into a
+    /// generation whose invalidation could not cover it.
+    #[test]
+    fn swap_pair_union_short_of_resident_end_clamps_the_tail_image() {
+        // Both overlays at OVERLAY, union bss_end at BOOT + 0x1800, which is
+        // strictly between the split (BOOT + 0x1400) and the resident end
+        // (BOOT + 0x2000): Revenge's shape in miniature.
+        let (rom, pack, recipes) = fixture_with_overlays(&[
+            DenseAotGenerationInput {
+                name: "overlay_a",
+                source_rom_start: 0x3000,
+                source_rom_end: 0x3020,
+                load_start: OVERLAY,
+                text_start: OVERLAY,
+                text_end: OVERLAY + 0x10,
+                data_start: OVERLAY + 0x10,
+                data_end: OVERLAY + 0x20,
+                bss_start: OVERLAY + 0x20,
+                bss_end: BOOT + 0x1780,
+            },
+            DenseAotGenerationInput {
+                name: "overlay_b",
+                source_rom_start: 0x3020,
+                source_rom_end: 0x3040,
+                load_start: OVERLAY,
+                text_start: OVERLAY,
+                text_end: OVERLAY + 0x10,
+                data_start: OVERLAY + 0x10,
+                data_end: OVERLAY + 0x20,
+                bss_start: OVERLAY + 0x20,
+                bss_end: BOOT + 0x1800,
+            },
+        ]);
+        let topology =
+            build_generation_topology_v1(&rom, &pack, "boot", RESIDENT_ID_DOMAIN, &recipes).unwrap();
+
+        // The swap pair shares one VA, so the immutable prefix still ends at
+        // the single split.
         assert_eq!(
-            build_generation_topology_v1(&rom, &pack, "boot", RESIDENT_ID_DOMAIN, &recipes,),
-            Err(GenerationTopologyError::InvalidResidentSplit)
+            (
+                topology.immutable_prefix.va_start,
+                topology.immutable_prefix.va_end
+            ),
+            (BOOT, OVERLAY)
         );
+        let resident = topology
+            .generations
+            .iter()
+            .find(|generation| generation.role == CatalogGenerationRoleV1::ResidentTail)
+            .unwrap();
+        // Clamped to the union end, NOT to resident.load_end (BOOT + 0x2000).
+        assert_eq!(
+            (resident.image_start, resident.image_end),
+            (OVERLAY, BOOT + 0x1800)
+        );
+        // The runtime invariant this clamp exists to preserve:
+        // `PrecompiledGeneration::new` rejects invalidation that does not
+        // contain the image.
+        assert!(resident.invalidation_start <= resident.image_start);
+        assert!(resident.invalidation_end >= resident.image_end);
+        assert_eq!(resident.invalidation_end, BOOT + 0x1800);
+
+        // The trailing resident span is owned by no generation: it is
+        // immutable, exactly like the pre-split prefix.
+        assert!(!topology.generations.iter().any(|generation| {
+            generation.image_start <= BOOT + 0x1900 && BOOT + 0x1900 < generation.image_end
+        }));
+
+        // And the whole topology still builds a real runtime catalog, which is
+        // what the old guard was indirectly protecting.
+        crate::runtime_generation_catalog::build_backed_dense_generation_catalog_v1(
+            &rom, &pack, &topology,
+        )
+        .unwrap();
+    }
+
+    /// Fail-closed: when overlays stop writing at or before the split there is
+    /// no contended resident byte at all, so there is no resident-tail
+    /// generation to compose. `EmptyResidentTail` rejects that precisely,
+    /// instead of emitting a zero-length generation the runtime would refuse
+    /// as `InvalidRange`.
+    ///
+    /// A well-formed recipe cannot reach it -- `build_dense_aot_pack_v1`
+    /// already enforces `bss_end >= bss_start >= data_end > load_start`, so the
+    /// union always exceeds the minimum `load_start` that becomes the split.
+    /// That is precisely why the guard is asserted here rather than through a
+    /// fixture: it is the defensive floor that keeps the clamp from ever
+    /// silently producing an empty image if those upstream relations are later
+    /// loosened. This test pins that a recipe set which WOULD trip it is
+    /// unconstructible, so the guard's unreachability is a checked property
+    /// rather than an assumption.
+    #[test]
+    fn an_empty_resident_tail_is_unconstructible_from_well_formed_recipes() {
+        let (rom, _, _) = fixture();
+        // bss_end below load_start is exactly the shape that would clamp the
+        // tail to nothing, and the dense pack refuses to build it at all.
+        assert!(build_dense_aot_pack_v1(
+            &rom,
+            &[DenseAotGenerationInput {
+                name: "overlay_a",
+                source_rom_start: 0x3000,
+                source_rom_end: 0x3020,
+                load_start: OVERLAY,
+                text_start: OVERLAY,
+                text_end: OVERLAY + 0x10,
+                data_start: OVERLAY + 0x10,
+                data_end: OVERLAY + 0x20,
+                bss_start: OVERLAY + 0x20,
+                bss_end: OVERLAY,
+            }],
+        )
+        .is_err());
+    }
+
+    /// The clauses that survive: a split outside the resident bank is still a
+    /// blanket rejection, because it describes no split of that bank at all.
+    #[test]
+    fn a_split_outside_the_resident_bank_is_still_rejected() {
+        let (rom, pack, recipes) = fixture();
+        for (load_start, label) in [
+            (BOOT, "at the resident start"),
+            (BOOT + 0x2000, "at the resident end"),
+        ] {
+            let mut moved = recipes.clone();
+            for recipe in &mut moved {
+                recipe.load_start = load_start;
+            }
+            assert_eq!(
+                build_generation_topology_v1(&rom, &pack, "boot", RESIDENT_ID_DOMAIN, &moved),
+                Err(GenerationTopologyError::InvalidResidentSplit),
+                "a split {label} must not compose"
+            );
+        }
     }
 
     #[test]

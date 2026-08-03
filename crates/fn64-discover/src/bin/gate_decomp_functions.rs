@@ -119,6 +119,20 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `sig_scan::detect_handler_tables`). Short runs collide with incidental
 /// pointer pairs in data; a real action/camera/cutscene table is longer.
 const HANDLER_TABLE_MIN_RUN: usize = 4;
+
+/// Distinct site addresses that must name a boot-window target before the
+/// cross-bank jal lane converts it into an excused callable root.
+///
+/// One, deliberately, and the corroboration ladder was measured rather than
+/// assumed. Requiring 2/3/4 sites costs recall monotonically and buys no
+/// soundness: WM2000 786 -> 766 -> 737 -> 731 and No Mercy 931 -> 911 -> 884
+/// -> 870 (donor configurations), with `wrong=0` at every rung including this
+/// one. Whatever the sole-sited targets are, none of them splits a real answer
+/// function, so charging 20-50 correct boundaries to exclude them is a bad
+/// trade. `FN64_DISCOVER_CROSS_BANK_MIN_SITES` re-runs that ladder without a
+/// rebuild; it exists to keep the measurement reproducible, not as a knob to
+/// tune per game.
+const CROSS_BANK_MIN_SITES: usize = 1;
 use fn64_discover::{required_env_path, run_discovery_with_tables_and_request_dma, Fact};
 use serde::Deserialize;
 
@@ -290,6 +304,40 @@ fn main() {
         );
     }
 
+    // Key-free overlay recovery (unconditional; no per-game switch). The
+    // descriptor-family search reads only the normalized ROM's own bytes and
+    // proves an overlay mapping when delta_vote derives one destination for
+    // the whole admitted table — the identical machinery gate_d1_overlays
+    // grades held-out. A ROM with no recoverable table (measured: WCW/nWo
+    // Revenge, zero candidate tables of any family) simply gains no mappings
+    // and every lane below sees exactly the banks it saw before, so this is
+    // safe to run everywhere rather than gated on a game the caller names.
+    //
+    // Its purpose here is the cross-bank jal lane, which iterates
+    // `proven_rom_mappings` and was a no-op on every AKI title because the
+    // gate composed the boot bank alone.
+    let overlay_search = fn64_discover::overlay_regions::SearchConfig::aki_family();
+    let overlay_recovery = fn64_discover::add_recovered_overlay_regions(
+        &rom,
+        &mut db,
+        &fn64_discover::RecoveredOverlayInput {
+            min_mapped_regions: overlay_search.min_records,
+            search: overlay_search,
+            delta_vote: fn64_discover::delta_vote::DeltaVoteConfig::default(),
+            table_name: "recovered_overlay_descriptors".to_string(),
+            bank_name: banks::BankNamePattern::new("recovered_overlay_", 0, ""),
+        },
+    );
+    println!(
+        "recovered overlays: candidate tables={} admitted={}",
+        overlay_recovery.candidate_tables.len(),
+        overlay_recovery
+            .admissions
+            .iter()
+            .filter(|admission| admission.admitted)
+            .count(),
+    );
+
     // Optional dynamic trace (FN64_DISCOVER_TRACE): fold observed
     // indirect transfers into the fact database as ObservedIndirectTarget
     // existence evidence. An observed jr/jalr target is a machine-checked
@@ -317,6 +365,34 @@ fn main() {
             report.facts_added,
             report.new_edges.len(),
             report.unknown_bank_skipped,
+        );
+        // Executed PCs are a second, independent evidence class in the same
+        // capture, and until now the gate ignored them. A producer that emits
+        // only `executed_pc` records (tools/mupen-trace/mupen_trace.c does)
+        // therefore folded nothing at all, even when the capture demonstrably
+        // executed functions the static lanes had left open -- measured on a
+        // 3,000,000-record WM2000 boot trace: 0 edges folded, recall
+        // unchanged, while the same trace proves func_80028BA0 ran 12 times.
+        //
+        // An executed PC is existence evidence of the same class as an
+        // observed indirect target: the word demonstrably ran as code in that
+        // bank. It is NOT a reachability or exhaustiveness proof, and it does
+        // not by itself make the PC a function entry -- only the code-segment
+        // grade decides ownership, exactly as it does for a jal target.
+        let executed = fn64_discover::trace::fold_executed_pcs_into_fact_db(
+            &mut db,
+            &ingest.header.trace_id,
+            &ingest.facts,
+            |_bank: &str, _va: u32| None,
+        );
+        println!(
+            "trace {:?}: {} executed-PC observations folded \
+             ({} new code-existence, {} corroborated, {} conflicts)",
+            ingest.header.trace_id,
+            executed.facts_added,
+            executed.new_code_existence.len(),
+            executed.corroborated.len(),
+            executed.conflicts.len(),
         );
     }
 
@@ -608,8 +684,12 @@ fn main() {
     // record, Yaz0 included) is scanned for direct jals landing in the
     // boot window; each such target is a machine-checked callable entry,
     // the same evidentiary class as an in-bank jal target.
+    //
+    // Every recovered overlay image is materialized once here and kept, both
+    // to sweep for jals and to answer the slot question below.
     let mut cross_bank = 0usize;
     let mut cross_bank_unreadable = 0usize;
+    let mut slot_images: Vec<fn64_discover::overlay_slots::SlotImage> = Vec::new();
     for fact in db.proven_rom_mappings() {
         let Fact::RomMapping {
             bank,
@@ -632,23 +712,102 @@ fn main() {
                 continue;
             }
         };
+        slot_images.push(fn64_discover::overlay_slots::SlotImage {
+            bank: bank.clone(),
+            va_start: *va_start,
+            bytes: image.bytes,
+        });
+    }
+    let slot_catalog = fn64_discover::overlay_slots::SlotCatalog::new(slot_images);
+    if !slot_catalog.is_empty() {
+        println!(
+            "recovered overlay images={} VA slots={} aliased slots={}",
+            slot_catalog.images().len(),
+            slot_catalog.slots().len(),
+            slot_catalog.aliased_slot_count(),
+        );
+    }
+    // A cross-bank jal edge is an ordered pair: the word that encodes the
+    // call, and the boot-window address it names.
+    //
+    // The TARGET half carries no slot-aliasing hazard here and the catalog
+    // says so: every target is required to lie in the boot code window, and
+    // measured on all three AKI titles no recovered overlay slot overlaps it
+    // (WM2000 boot code ends 0x8004_8FC0, slots at 0x800E_1B90/0x8011_C900;
+    // No Mercy 0x8005_1708, slots at 0x800D_9960/0x8010_6760). The boot bank
+    // is a single image, so a boot-window VA names one function. The
+    // `Uncovered` check below is what enforces that rather than assuming it:
+    // a target that any recovered overlay DOES cover is a VA two images
+    // disagree about, and is left unconverted.
+    //
+    // The SITE half is where the measured hazard bites. A recovered image is
+    // `.text` followed by `.data`/`.rodata`, and a data word aliases as `jal`
+    // roughly one time in 64. The site's own bytes are never ambiguous — they
+    // come from the materialized image, identified by bank and offset, not by
+    // a VA — but whether they are an INSTRUCTION is exactly the open
+    // question, and this gate has no key-free text extent for an AKI overlay
+    // (unlike a Zelda overlay, whose footer states `text_size`).
+    //
+    // The discriminator that needs neither an answer key nor a text-size
+    // guess is CORROBORATION: require the same target to be named from at
+    // least `CROSS_BANK_MIN_SITES` distinct site addresses. A real engine
+    // entry point is called from many places; a data word that happens to
+    // encode `jal X` names an X nothing else names. Measured on No Mercy, the
+    // 12-strong cluster of bogus "targets" 4 bytes apart inside one data
+    // array is single-sited to a word, while genuine boot API entries carry
+    // many callers. Targets short of the bar stay unconverted — the honest
+    // outcome, and M2's problem rather than M1's.
+    let mut target_sites: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    let mut aliased_targets = 0usize;
+    for image in slot_catalog.images() {
         for (index, chunk) in image.bytes.chunks_exact(4).enumerate() {
             let word = u32::from_be_bytes(chunk.try_into().unwrap());
             if word >> 26 != 0x03 {
                 continue;
             }
-            let pc = va_start.wrapping_add((index as u32) * 4);
+            let pc = image.va_start.wrapping_add((index as u32) * 4);
             let target = (pc & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
-            if target >= boot_va_start && target < code_end && !roots.contains(&target) {
-                roots.push(target);
-                excused.push(target);
-                cross_bank += 1;
+            if target < boot_va_start || target >= code_end {
+                continue;
             }
+            // A boot-window target that a recovered overlay also covers is a
+            // VA whose meaning depends on what is resident. Convert it only
+            // when the aliases agree byte-identically there.
+            let resolution = slot_catalog.resolve(target);
+            if !matches!(
+                resolution,
+                fn64_discover::overlay_slots::SlotResolution::Uncovered
+            ) && !resolution.admissible()
+            {
+                aliased_targets += 1;
+                continue;
+            }
+            target_sites.entry(target).or_default().insert(pc);
         }
     }
-    if cross_bank != 0 || cross_bank_unreadable != 0 {
+    let min_sites = std::env::var("FN64_DISCOVER_CROSS_BANK_MIN_SITES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(CROSS_BANK_MIN_SITES);
+    let mut uncorroborated = 0usize;
+    for (target, sites) in &target_sites {
+        if roots.contains(target) {
+            continue;
+        }
+        if sites.len() < min_sites {
+            uncorroborated += 1;
+            continue;
+        }
+        roots.push(*target);
+        excused.push(*target);
+        cross_bank += 1;
+    }
+    if cross_bank != 0 || cross_bank_unreadable != 0 || !target_sites.is_empty() {
         println!(
-            "cross-bank jal roots added={cross_bank} unreadable banks={cross_bank_unreadable}"
+            "cross-bank jal roots added={cross_bank} left ambiguous={uncorroborated} \
+             (distinct targets seen={}, targets rejected by slot aliasing={aliased_targets}, \
+             min sites={min_sites}) unreadable banks={cross_bank_unreadable}",
+            target_sites.len(),
         );
     }
 
@@ -1081,6 +1240,57 @@ fn main() {
         }
     }
 
+    // Dynamic entry roots: an executed PC proves a word runs as code, and the
+    // structural entry test proves a function begins there. Neither half
+    // suffices alone -- a trace observes mostly mid-function words (5,279
+    // distinct on a bank of ~850 functions), and boundary shape alone is what
+    // the static lanes already apply. Together both halves are
+    // machine-checked, so a qualifying PC is an excused callable entry of the
+    // same class as a jal target.
+    //
+    // This runs against the BOOT bank specifically: the resident trace
+    // observes almost everything here, and `non_overlay_banks` (used by the
+    // per-overlay grade) deliberately excludes it.
+    let mut dynamic_entry_roots = 0usize;
+    {
+        let boot_words: Vec<u32> = bank_bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        let mut observed: Vec<u32> = db
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::ObservedExecutedCode { site, .. } if site.bank == banks::BOOT_BANK => {
+                    Some(site.pc)
+                }
+                _ => None,
+            })
+            .collect();
+        observed.sort_unstable();
+        observed.dedup();
+        for pc in observed {
+            let Some(offset) = pc.checked_sub(boot_va_start).map(|d| (d / 4) as usize) else {
+                continue;
+            };
+            if offset >= boot_words.len() {
+                continue;
+            }
+            if !fn64_discover::sig_scan::plausible_function_boundary(&boot_words, offset) {
+                continue;
+            }
+            if roots.contains(&pc) {
+                continue;
+            }
+            roots.push(pc);
+            excused.push(pc);
+            dynamic_entry_roots += 1;
+        }
+        if dynamic_entry_roots != 0 {
+            println!("observed-execution entry roots added={dynamic_entry_roots}");
+        }
+    }
+
     let (cfg, resolved) = build_cfg_closed_with_facts_and_claims(
         &db,
         banks::BOOT_BANK,
@@ -1193,6 +1403,290 @@ fn main() {
         std::process::exit(1);
     }
     println!("decomp function grade PASSED (wrong=0)");
+
+    // Recovered-overlay grading: the boot rule, applied per recovered bank.
+    //
+    // Until now an overlay function could not be graded at all — the gate
+    // composed the boot bank alone, so every one of them was invisible rather
+    // than open. Grading them is what makes the roadmap's remaining
+    // mechanisms measurable.
+    //
+    // Each bank is its OWN universe, and that is what defuses slot aliasing
+    // rather than working around it. A bank's answer functions are selected by
+    // its ROM range plus affine agreement — the same two-part rule the boot
+    // grade uses, and the same reason it needs both halves: ROM containment
+    // alone would sweep in a neighbouring image's sections, VA agreement alone
+    // would sweep in every image that shares the slot. Because selection is
+    // keyed on ROM, two images at one VA never see each other's answers and no
+    // function is graded twice. Roots come from the bank's own text (an
+    // in-bank flat jal sweep, whose targets are same-image by construction);
+    // cross-bank authority into an aliased slot is M2's problem and is
+    // deliberately absent here.
+    let mut overlay_dynamic_roots = 0usize;
+    if !slot_catalog.is_empty() {
+        // M2: inductive entry authority across composed banks.
+        //
+        // The in-bank sweep below roots each image from its own text, so an
+        // overlay function called only from a SIBLING image stays unrooted --
+        // overlay->overlay authority is circular with nothing to break in.
+        // The boot bank breaks it: every boot-window root this gate already
+        // proved is swept for jals into overlay windows, and those entries
+        // seed a fixpoint that carries authority image to image.
+        //
+        // Bank-keyed throughout (see `inductive_bank_roots`), so two images
+        // sharing a VA slot never merge root sets, and a target whose aliases
+        // disagree stays unconverted rather than guessing which is resident.
+        let mut boot_seeded: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+        let mut boot_to_overlay = 0usize;
+        for (index, chunk) in full_boot_bytes.chunks_exact(4).enumerate() {
+            let word = u32::from_be_bytes(chunk.try_into().unwrap());
+            if word >> 26 != 0x03 {
+                continue;
+            }
+            let pc = boot_va_start.wrapping_add((index as u32) * 4);
+            let target = (pc & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
+            if target >= boot_va_start && target < code_end {
+                continue;
+            }
+            match slot_catalog.resolve(target) {
+                fn64_discover::overlay_slots::SlotResolution::Unique { bank } => {
+                    if boot_seeded.entry(bank).or_default().insert(target) {
+                        boot_to_overlay += 1;
+                    }
+                }
+                fn64_discover::overlay_slots::SlotResolution::AgreedAcrossAliases { banks } => {
+                    let mut any = false;
+                    for bank in banks {
+                        if boot_seeded.entry(bank).or_default().insert(target) {
+                            any = true;
+                        }
+                    }
+                    if any {
+                        boot_to_overlay += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A budget the AKI corpus clears in a handful of rounds; exhausting it
+        // means the induction did not settle, and the gate keeps M1's
+        // in-bank-only roots rather than shipping a half-converged set.
+        const INDUCTIVE_MAX_ROUNDS: usize = 16;
+        let inductive = slot_catalog.inductive_bank_roots(&boot_seeded, INDUCTIVE_MAX_ROUNDS);
+        match &inductive {
+            Some(fixpoint) => println!(
+                "inductive overlay authority: boot->overlay seeds={boot_to_overlay} \
+                 rounds={} targets rejected by slot aliasing={}",
+                fixpoint.rounds, fixpoint.rejected_ambiguous,
+            ),
+            None => println!(
+                "inductive overlay authority: DID NOT CONVERGE in \
+                 {INDUCTIVE_MAX_ROUNDS} rounds -- falling back to in-bank roots"
+            ),
+        }
+        let mut graded = 0usize;
+        let mut skipped_no_answer = 0usize;
+        let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut overlay_wrong: Vec<String> = Vec::new();
+        for image in slot_catalog.images() {
+            let Some((bank_rom_start, bank_rom_end)) = db
+                .proven_rom_mappings()
+                .into_iter()
+                .find_map(|fact| match fact {
+                    Fact::RomMapping {
+                        bank,
+                        rom_start,
+                        rom_end,
+                        ..
+                    } if *bank == image.bank => Some((*rom_start, *rom_end)),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            let bank_va = image.va_start;
+            let mut bank_answer: Vec<AnswerFunction> = Vec::new();
+            let mut bank_code_end = bank_va;
+            for section in &dump.sections {
+                if section.rom < bank_rom_start || section.rom >= bank_rom_end {
+                    continue;
+                }
+                if section.vram != bank_va + (section.rom - bank_rom_start) {
+                    continue;
+                }
+                for function in &section.functions {
+                    bank_code_end = bank_code_end.max(function.vram.saturating_add(function.size));
+                    bank_answer.push(AnswerFunction {
+                        name: function.name.clone(),
+                        va_start: function.vram,
+                    });
+                }
+            }
+            if bank_answer.is_empty() {
+                skipped_no_answer += 1;
+                continue;
+            }
+            bank_answer.sort_by_key(|function| function.va_start);
+            bank_code_end = bank_code_end.min(bank_va + image.bytes.len() as u32);
+            let text_len = (bank_code_end - bank_va) as usize;
+            let text_bytes = &image.bytes[..text_len.min(image.bytes.len())];
+
+            // In-bank flat jal sweep over this image's own text. Same
+            // evidentiary class as the boot bank's: a direct call encoded in
+            // proven bytes, landing in this image's own window.
+            let mut bank_roots: Vec<u32> = Vec::new();
+            let mut bank_excused: Vec<u32> = Vec::new();
+            for (index, chunk) in text_bytes.chunks_exact(4).enumerate() {
+                let word = u32::from_be_bytes(chunk.try_into().unwrap());
+                if word >> 26 != 0x03 {
+                    continue;
+                }
+                let pc = bank_va.wrapping_add((index as u32) * 4);
+                let target = (pc & 0xf000_0000) | ((word & 0x03ff_ffff) << 2);
+                if target >= bank_va && target < bank_code_end && !bank_roots.contains(&target) {
+                    bank_roots.push(target);
+                    bank_excused.push(target);
+                }
+            }
+            // M2 roots for THIS bank: entries the induction proved callable
+            // from the boot bank or a sibling image. Same evidentiary class as
+            // the in-bank sweep above -- a direct call encoded in proven bytes,
+            // resolved to this image by the slot catalog -- so they join the
+            // excuse set alongside it.
+            if let Some(fixpoint) = &inductive {
+                if let Some(proven) = fixpoint.roots.get(&image.bank) {
+                    for target in proven {
+                        if *target >= bank_va
+                            && *target < bank_code_end
+                            && !bank_roots.contains(target)
+                        {
+                            bank_roots.push(*target);
+                            bank_excused.push(*target);
+                        }
+                    }
+                }
+            }
+            // Dynamic entry roots for THIS bank, on the same two-part rule the
+            // boot grade applies: execution proves the word runs as code, the
+            // structural entry test proves a function begins there. Bank-keyed
+            // like everything else here, so an observation attributed to one
+            // image never roots its slot-sharing sibling -- which is exactly
+            // why aliasing does not need a special case in this lane.
+            {
+                let bank_words: Vec<u32> = image
+                    .bytes
+                    .chunks_exact(4)
+                    .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect();
+                let mut observed: Vec<u32> = db
+                    .facts()
+                    .iter()
+                    .filter_map(|fact| match fact {
+                        Fact::ObservedExecutedCode { site, .. } if site.bank == image.bank => {
+                            Some(site.pc)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                observed.sort_unstable();
+                observed.dedup();
+                for pc in observed {
+                    if pc < bank_va || pc >= bank_code_end || bank_roots.contains(&pc) {
+                        continue;
+                    }
+                    let Some(offset) = pc.checked_sub(bank_va).map(|d| (d / 4) as usize) else {
+                        continue;
+                    };
+                    if offset >= bank_words.len() {
+                        continue;
+                    }
+                    if !fn64_discover::sig_scan::plausible_function_boundary(&bank_words, offset) {
+                        continue;
+                    }
+                    bank_roots.push(pc);
+                    bank_excused.push(pc);
+                    overlay_dynamic_roots += 1;
+                }
+            }
+            if bank_roots.is_empty() {
+                skipped_no_answer += 1;
+                continue;
+            }
+            let (bank_cfg, _) = build_cfg_closed_with_facts_and_claims(
+                &db,
+                &image.bank,
+                text_bytes,
+                bank_va,
+                &bank_roots,
+                &BTreeMap::new(),
+            );
+            let authoritative: BTreeSet<u32> = bank_cfg
+                .direct_calls
+                .iter()
+                .map(|(_, target)| *target)
+                .collect();
+            let bank_part = partition_with_authoritative_entries(&bank_cfg, &authoritative);
+            let bank_overlaps = same_bank_overlaps(&bank_part, &bank_cfg);
+            assert!(
+                bank_overlaps.is_empty(),
+                "bank {}: same-bank owner overlaps must be zero, got {bank_overlaps:?}",
+                image.bank
+            );
+            let mut bank_jal: JalTargets = authoritative.iter().copied().collect();
+            bank_jal.extend(bank_excused.iter().copied());
+            let bank_report =
+                grade_functions(&bank_part.owners, &bank_answer, bank_code_end, &bank_jal);
+            graded += 1;
+            totals.0 += bank_report.total;
+            totals.1 += bank_report.matched_exact;
+            totals.2 += bank_report.matched_coarse + bank_report.interior_entries;
+            totals.3 += bank_report.open;
+            totals.4 += bank_report.wrong;
+            println!(
+                "  recovered bank {} @0x{bank_va:x} (rom 0x{bank_rom_start:x}..0x{bank_rom_end:x}): \
+                 total={} matched_exact={} coarse+interior={} open={} wrong={}",
+                image.bank,
+                bank_report.total,
+                bank_report.matched_exact,
+                bank_report.matched_coarse + bank_report.interior_entries,
+                bank_report.open,
+                bank_report.wrong,
+            );
+            for (function, grade) in &bank_report.per_function {
+                if let fn64_discover::grade_oot_functions::FunctionGrade::WrongSplit {
+                    owner_root,
+                } = grade
+                {
+                    overlay_wrong.push(format!(
+                        "bank {}: {function} split by 0x{owner_root:x}",
+                        image.bank
+                    ));
+                }
+            }
+        }
+if overlay_dynamic_roots != 0 {
+            println!("overlay observed-execution entry roots added={overlay_dynamic_roots}");
+        }
+        
+        println!(
+            "recovered-overlay grade: banks={graded} (skipped without answers={skipped_no_answer}) \
+             total={} matched_exact={} coarse+interior={} open={} wrong={}",
+            totals.0, totals.1, totals.2, totals.3, totals.4
+        );
+        if totals.4 != 0 {
+            for example in overlay_wrong.iter().take(10) {
+                println!("wrong: {example}");
+            }
+            eprintln!(
+                "gate_decomp_functions FAILED: recovered-overlay wrong={}",
+                totals.4
+            );
+            std::process::exit(1);
+        }
+        if graded != 0 {
+            println!("recovered-overlay function grade PASSED (wrong=0)");
+        }
+    }
 
     // Overlay grading (FN64_DISCOVER_GRADE_OVERLAYS=1): the boot rule,
     // generalized per proven bank. Only banks that parse as Zelda
@@ -1470,7 +1964,7 @@ fn main() {
         // machine-checked callable entry (it ran from an observed site),
         // so it joins the excused root set — same evidentiary class as a
         // jal target, never a guess.
-        let observed_targets: Vec<fn64_discover::facts::BankAddr> = db
+        let mut observed_targets: Vec<fn64_discover::facts::BankAddr> = db
             .facts()
             .iter()
             .filter_map(|fact| match fact {
@@ -1478,6 +1972,73 @@ fn main() {
                 _ => None,
             })
             .collect();
+        // Executed PCs are the other dynamic evidence class, and most of them
+        // are mid-function words rather than entries: a 40,000,000-record
+        // WM2000 capture folds 5,279 distinct executed words, while the bank
+        // holds only ~850 functions. Admitting each as a root would seed
+        // interior entries wholesale and manufacture `wrong` splits.
+        //
+        // An executed PC is promoted only when it independently satisfies the
+        // SAME structural entry test static discovery uses
+        // (`plausible_function_boundary`: it follows a terminator or padding,
+        // and its own word is admissible as an entry). Execution then supplies
+        // what the static lanes lacked -- proof the word really runs as code --
+        // while the boundary shape supplies what execution cannot: evidence
+        // that this particular word is where a function BEGINS.
+        //
+        // Both halves are machine-checked, so a promoted PC joins the excused
+        // set. A word that runs but has no entry shape stays existence-only
+        // evidence and roots nothing.
+        let mut observed_entry_promotions = 0usize;
+        let executed_entry_roots: Vec<fn64_discover::facts::BankAddr> = db
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::ObservedExecutedCode { site, .. } => Some(site.clone()),
+                _ => None,
+            })
+            .filter(|site| {
+                // The boot bank is deliberately absent from `non_overlay_banks`
+                // (that list exists for the per-overlay grade), yet it is where
+                // the resident trace observes almost everything -- so resolve
+                // the image for either.
+                let boot_image = (site.bank == banks::BOOT_BANK)
+                    .then(|| (boot_va_start, full_boot_bytes as &[u8]));
+                let Some((bank_va, image)) = boot_image.or_else(|| {
+                    non_overlay_banks
+                        .iter()
+                        .find(|(bank, _, _)| *bank == site.bank)
+                        .map(|(_, va, bytes)| (*va, bytes.as_slice()))
+                }) else {
+                    return false;
+                };
+                let Some(offset) = site.pc.checked_sub(bank_va).map(|d| (d / 4) as usize) else {
+                    return false;
+                };
+                let words: Vec<u32> = image
+                    .chunks_exact(4)
+                    .map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect();
+                if offset >= words.len() {
+                    return false;
+                }
+                let promoted = fn64_discover::sig_scan::plausible_function_boundary(&words, offset);
+                if promoted {
+                    observed_entry_promotions += 1;
+                }
+                promoted
+            })
+            .collect();
+        observed_targets.extend(executed_entry_roots);
+        observed_targets.sort_by(|left, right| {
+            (left.bank.as_str(), left.pc).cmp(&(right.bank.as_str(), right.pc))
+        });
+        observed_targets.dedup();
+        if observed_entry_promotions > 0 {
+            println!(
+                "observed executed PCs promoted to excused entry roots: {observed_entry_promotions}"
+            );
+        }
         let mut code_totals = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut code_wrong: Vec<String> = Vec::new();
         for (bank, bank_va, image) in &non_overlay_banks {
