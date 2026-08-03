@@ -228,6 +228,7 @@ pub mod corpus_homology;
 pub mod coverage;
 pub mod delta_vote;
 pub mod dense_aot_pack;
+pub mod dump_toml;
 pub mod evidence;
 pub mod external_aot;
 pub mod facts;
