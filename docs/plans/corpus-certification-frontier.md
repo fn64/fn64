@@ -48,6 +48,44 @@ well-shaped research direction rather than a long tail, and the M1b result
 (a 2-record floor plus contiguity recognition took corpus overlay recovery
 from 32 to 41 ROMs) shows what closing one costs.
 
+## Banjo-Kazooie: measured, and it is NOT a descriptor-table gap
+
+Traced the one unmapped destination to its origin. The mechanism is
+different in kind from AKI's overlays, which changes what closing this
+class requires.
+
+`0x8023e620` has **no pointer and no `jal` anywhere in the 16 MB ROM**. It
+is constructed twice, both inside the 2,124-word boot stub, and called
+directly:
+
+```
+0x80000524  lui   $25,0x8024
+0x80000528  addiu $25,$25,-6624      # = 0x8023e620
+0x8000052c  jalr  $25                # call into it
+```
+
+Earlier, at `0x80000450`, the stub stacks that same address alongside
+`0x8003d500` and calls `0x80001d70`. That routine is a **PI DMA loader** --
+its body loads `lui $4,0x100` (cart domain `0x10000000`) and
+`lui $4,0x1fc0` (PIF `0x1fc00000`) and drives the PI registers.
+
+So Banjo-Kazooie's real code is **DMA'd from cart into RDRAM by the boot
+stub itself and then jumped into**. There is no descriptor table to find:
+`SearchConfig`'s family search correctly reports nothing, because nothing
+of that shape exists.
+
+**What this means for the class.** The five `OutsideAllMappings` ROMs may
+not share one mechanism after all -- they share a *symptom*. Banjo needs
+**PI-DMA-derived bank recovery** (fn64 has `pi_dma.rs`, which slices
+`osPiStartDma`/`osEPiStartDma` for constant triples; the open question is
+whether this stub's hand-rolled PI writes are reachable by it), not
+descriptor-family extension. The remaining four should each be traced to
+their construction site before assuming a common fix; the AKI precedent of
+"one fix, several titles" may not hold here.
+
+That is a correction to this document's own earlier conclusion, made after
+tracing rather than after counting error strings.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
