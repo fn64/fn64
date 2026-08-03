@@ -2047,8 +2047,12 @@ FN64_SOURCE_FRONTIER_RECEIPT=/tmp/fn64-wm-frontier-baseline.json \
   target/debug/gate_wm2000_recompile
 ```
 
-Receipt `sha256=4cd5e0feb679c39a9e76d4a3f4b7ee529adb92a4655194c7a566272c7ce759f0`,
-`open_frontier=true`. Against the five conjunctive conditions in
+The receipt reported `open_frontier=true`, reproducibly (byte-identical
+across two runs). Its content hash is deliberately NOT quoted here: the
+receipt depends on private BootContext and image captures that are not in
+this repo, so no test can pin the value, and an unverifiable digest in a doc
+is a claim rather than evidence. Re-derive it by running the command above.
+Against the five conjunctive conditions in
 `ExecutableSourceFrontierV1::validates_bev_clear_invariant`:
 
 1. **Initial BootContext Status clear — FAILS, input-absent.** The receipt
