@@ -93,3 +93,35 @@ one did not. The callbacks are therefore NOT installed-but-uninvoked -- the
 whole `0x8002bb04..0x8002ca70` neighbourhood is gated upstream and never
 entered. That is one question ("what enables this subsystem?"), not four,
 and it is the right thing to answer before capturing again.
+
+## M5 classifier: first measured assessment (2026-08-03)
+
+`classify_callerless` (bin, commit `1de2c1f`) emits a typed hypothesis plus a
+machine-checkable verification plan per callerless function. On NWXE's 66:
+
+| hypothesis | count |
+|---|---|
+| `unclassified` | 42 |
+| `libc_like` | 12 |
+| `global_accessor` | 8 |
+| `struct_field_writer` | 2 |
+| `device_register_access` | 1 |
+| `float_math` | 1 |
+
+**Independently verified.** `func_80000648` classifies as `GlobalAccessor` for
+`0x8004c29c`; decoding its three words from raw ROM bytes confirms exactly
+that address (`lui 0x8005` + `lw -15716`).
+
+**The verification plan holds at scale, contrary to a first impression.**
+`func_80000648`'s own global is touched by no external code, which briefly
+looked like the plan failing on its best case. Measured across all 18
+getter-shaped functions in the resident image, **16 of 18 have their global
+touched by external code** -- so "whoever else touches this global is the
+caller neighbourhood" does produce leads; `func_80000648` is the outlier.
+
+**Honest limits.** 42 of 66 are `unclassified`, which is the correct default
+when nothing fires but leaves most of the worklist without a directed lead.
+`LibcLike` (12) is the weakest class -- small byte-copy loops are genuinely
+ambiguous and "find a byte-identical twin" is a fallback, not a lead. Of the
+six split-constructed functions, only two classify at all, and both as
+`LibcLike`.
