@@ -276,3 +276,36 @@ since, and the generic path is not weaker than the hand-configured one.
 Boot bank alone reports `unsupported=3` and `recovered_overlay_2` reports 8;
 both compose away. Reading a per-bank line as the verdict is a mistake the
 HEADLINE exists to prevent.
+
+### The other AKI titles — 2026-08-03
+
+Same command, one env var each. ROM paths: NW4E/NWXE from the gate-determinism
+set, Revenge and World Tour from `aki-recomp/donors/`, VPW2 from the corpus
+directory.
+
+| title | banks | blocks | result |
+|---|---|---|---|
+| Virtual Pro Wrestling 2 (Japan) | 5 | 49,329 | exit 0, `unsupported=0` |
+| WCW/nWo Revenge | 3 | 25,057 | exit 0, `unsupported=0` |
+| WCW vs nWo World Tour | 3 | 25,375 | exit 0, `unsupported=0` |
+| WWF No Mercy (NW4E) | 6 | — | does not finish; see below |
+
+VPW2 is the notable one: a Japanese-language title with no decomp project, no
+answer key, and no prior attempt, certified cold on its first run.
+
+Revenge and World Tour required `e5e7d39` (the resident-tail clamp). Before
+it they failed identically with `InvalidResidentSplit`, because the guard
+required overlay invalidation to reach `resident.load_end` -- a fixed 1 MiB
+IPL3 boot-copy constant, not a discovered extent. Any two-overlay swap-pair
+title would have hit this.
+
+**No Mercy does not complete.** Killed at 71 minutes; a `sample(1)` of the
+live process put 1689/1689 stacks in one path:
+`compose_catalog_bound_overlay_snapshots` ->
+`compose_catalog_bound_direct_transfer_fixed_point_v1` ->
+`compose_materialized_banks_catalog_bound_with_limits` ->
+`finish_materialized_bank` -> `owner_proof::prove_exact_owners_inner`. It is
+stuck in OWNER PROOF -- the boundary/recall lane -- before emission starts.
+The other four titles complete in ~10 minutes each, and No Mercy is only one
+bank larger than the two 5-bank titles, so this is superlinear rather than
+size. Under investigation.
