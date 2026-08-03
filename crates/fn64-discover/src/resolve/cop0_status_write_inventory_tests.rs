@@ -132,6 +132,77 @@
         assert_eq!(first.open_indirect_sites, vec![START]);
     }
 
+    /// Pin the four WM2000 resident `MTC0 Status` shapes that remain open, and
+    /// the one preserve-mask shape that closes, using the exact instruction
+    /// words read from the NWXE ROM on 2026-08-03. These are the concrete
+    /// reason the `0xbfc0...` bootstrap frontier stays open: three of the four
+    /// derive BEV from runtime-mutable state and the fourth ORs in an
+    /// unconstrained argument. Widening any of them to "clear" would lower the
+    /// admission bar rather than prove the invariant.
+    #[test]
+    fn wm2000_resident_status_write_shapes_keep_bev_open() {
+        // `mfc0 k1,Status; addiu at,zero,-4; and k1,k1,at; mtc0 k1,Status`
+        // is the WM shape at 0x800367ac: mask 0xfffffffc preserves bit 22, so
+        // the `mfc0` BEV known-zero seed survives and the site proves clear.
+        let preserving = bytes(&[
+            cop0_move(0, 27, 12), // mfc0 k1,Status
+            0x2401_fffc,          // addiu at,zero,-4
+            0x0361_d824,          // and k1,k1,at
+            cop0_move(4, 27, 12), // mtc0 k1,Status
+            0x03e0_0008,          // jr ra
+            0,
+        ]);
+        let cfg = build_cfg("preserving", &preserving, START, &[START]);
+        let analysis = analyze_cop0_status_writes(&cfg, &preserving, START).unwrap();
+        let proof = analysis
+            .proven_code_value_proofs
+            .iter()
+            .find(|proof| proof.site_pc == START + 12)
+            .expect("the masked write is proven code");
+        assert_eq!(proof.known_zero & COP0_STATUS_BEV, COP0_STATUS_BEV);
+
+        // `mfc0 t0,Status; or t0,t0,a0; mtc0 t0,Status` is the WM shape at
+        // 0x8002a2c8. The caller's `$a0` is unconstrained, so BEV known-zero
+        // must be dropped by the `or` rule.
+        let or_with_argument = bytes(&[
+            cop0_move(0, 8, 12), // mfc0 t0,Status
+            0x0104_4025,         // or t0,t0,a0
+            cop0_move(4, 8, 12), // mtc0 t0,Status
+            0x03e0_0008,         // jr ra
+            0,
+            0,
+        ]);
+        let cfg = build_cfg("or_argument", &or_with_argument, START, &[START]);
+        let analysis = analyze_cop0_status_writes(&cfg, &or_with_argument, START).unwrap();
+        let proof = analysis
+            .proven_code_value_proofs
+            .iter()
+            .find(|proof| proof.site_pc == START + 8)
+            .expect("the or-with-argument write is proven code");
+        assert_eq!(
+            proof.known_zero & COP0_STATUS_BEV,
+            0,
+            "OR with an unconstrained argument must not retain BEV known-zero"
+        );
+
+        // A bare `mtc0 a0,Status` is the WM shape at 0x800376d0: a whole-Status
+        // write from an unconstrained argument retains no BEV fact at all.
+        let bare = bytes(&[
+            cop0_move(4, 4, 12), // mtc0 a0,Status
+            0x03e0_0008,         // jr ra
+            0,
+            0,
+        ]);
+        let cfg = build_cfg("bare", &bare, START, &[START]);
+        let analysis = analyze_cop0_status_writes(&cfg, &bare, START).unwrap();
+        let proof = analysis
+            .proven_code_value_proofs
+            .iter()
+            .find(|proof| proof.site_pc == START)
+            .expect("the bare write is proven code");
+        assert_eq!(proof.known_zero & COP0_STATUS_BEV, 0);
+    }
+
     #[test]
     fn rejects_unaligned_or_wrapping_image_geometry() {
         let cfg = build_cfg("empty", &[], START, &[]);
