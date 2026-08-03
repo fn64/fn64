@@ -30,7 +30,29 @@ installed into a struct or table.
 those are not code addresses and read as DMA lengths or DMEM offsets, which
 would place it in a hardware or microcode lane.
 
-**Status: hypothesis, not evidence.** Address construction proves the value
-can exist at runtime; it does not prove any particular call happens. These
-are the highest-confidence targets for the trace lane (M4) precisely because
-the static side has taken them as far as it can.
+## Trace verdict (3,000,000 executed-PC records, WM2000 boot, 2026-08-03)
+
+A real mupen64plus DEBUGGER=1 capture of the boot path settles two of the
+six. 5,282 distinct PCs executed, spanning 0x80000180..0x800385f8.
+
+| callback | entry hits | body hits | verdict |
+|---|---|---|---|
+| `0x80000460` | 1 | 19 | **CONFIRMED CALLED** -- exactly as the entry-point construction predicted |
+| `0x80028ba0` | 12 | 4,896 | **CONFIRMED CALLED** -- hot code, not dead |
+| `0x8002c290` | 0 | 0 | not reached in boot |
+| `0x8002ceb0` | 0 | 0 | not reached in boot |
+| `0x8002db80` | 0 | 0 | not reached in boot |
+| `0x8002dfa0` | 0 | 0 | not reached in boot |
+
+So the hypothesis lane works: a hunch directed a mechanical check, the check
+named construction sites, and execution confirmed two of them. Neither
+confirmation is a proof that the site's target set is closed -- an observed
+edge is existence, never exhaustiveness -- but both are sound callable roots.
+
+**TABLED for later (4 of 6).** The unreached four are not disproved; boot
+coverage simply does not reach them. All four are constructed inside
+functions in the 0x8002bb04..0x8002ca70 neighbourhood, which suggests one
+subsystem entered by gameplay rather than boot. Revisit together: either a
+longer/menu-driven capture reaches them as a group, or their shared
+construction neighbourhood indicates a common gate worth understanding
+before capturing again.
