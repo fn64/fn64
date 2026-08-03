@@ -14,7 +14,7 @@ geometry that makes this possible — `DENSE_AOT_SHARD_BYTES = 64 KiB`
 (`crates/fn64-discover/src/dense_aot_pack.rs:14`) — and the emitter already
 has a per-shard entry point,
 `emit_dense_bank_shard_runner_function_with_host_calls`
-(`crates/fn64-recomp-rs-codegen/src/emit.rs:468`).
+(`crates/fn64-recomp-rs-codegen/src/emit/mod.rs:468`).
 
 So this is not new capability: it is routing the generic gate through the
 sharding that already exists, so the certification terminates in practical
@@ -110,7 +110,7 @@ not exceed N emitted words."
 
 Requirements:
 
-- Add one small public helper to `crates/fn64-discover/src/block_pack.rs`
+- Add one small public helper to `crates/fn64-discover/src/block_pack/mod.rs`
   (the module that already owns `MaterializedPackedBank` and the runner
   emission both consumers use) that partitions materialized banks into
   compile units under the word bound. Suggested shape — adjust if the

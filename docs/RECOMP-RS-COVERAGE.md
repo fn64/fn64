@@ -62,8 +62,8 @@ heavily), the whole-function lane omits real code.
 
 The arbitrary-PC block/interpreter lane is where these cases belong: its AOT
 emitter renders `break`/`syscall`/traps as architectural exceptions and `eret`
-as a typed control transfer (see `crates/fn64-recomp-rs/src/execution.rs`,
-`crates/fn64-recomp-rs-codegen/src/emit.rs`, and the `ISA-COVERAGE.md` C/P/T/R audit).
+as a typed control transfer (see `crates/fn64-recomp-rs/src/execution/mod.rs`,
+`crates/fn64-recomp-rs-codegen/src/emit/mod.rs`, and the `ISA-COVERAGE.md` C/P/T/R audit).
 Promoting that lane to the default whole-ROM execution path — not retrofitting
 an exception-return ABI into the whole-function lane — is the work that turns
 "recompiles OoT" into "runs arbitrary N64 ROMs."
@@ -71,7 +71,7 @@ an exception-return ABI into the whole-function lane — is the work that turns
 That promotion has several pieces, being landed incrementally:
 
 - **Driver exception vectoring (done).** The block-lane driver
-  `run_block_program` (`crates/fn64-abi/src/recompiled.rs`) now vectors a
+  `run_block_program` (`crates/fn64-abi/src/recompiled/mod.rs`) now vectors a
   `BlockExit::Fault` carrying an architectural exception through the installed
   handler, exactly like the executable-write boundary; previously only
   executable-write faults were vectored and a mid-function `break` panicked the

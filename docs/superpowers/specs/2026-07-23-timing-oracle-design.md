@@ -32,7 +32,7 @@ Hence 0a is first.
   removes the Rosetta blocker the docs cited; a fast native reference core exists.
 - **fn64-recomp-rs oracle test scaffolding** — the differential-comparison
   pattern (`cop0.rs`, `interp_differential.rs`, `fpu_oracle.rs`) to mirror.
-- **`crates/fn64-discover/src/trace.rs`** — the existing trace schema to extend.
+- **`crates/fn64-discover/src/trace/mod.rs`** — the existing trace schema to extend.
 
 ## The build
 

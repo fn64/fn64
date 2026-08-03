@@ -9,7 +9,7 @@ core.
 
 - **`mupen_trace.c`** -- trace producer v1. Single-steps a bounded window
   from the ROM entrypoint, emitting fn64-discover's `executed_pc` /
-  `watched_table_write` trace schema (`crates/fn64-discover/src/trace.rs`).
+  `watched_table_write` trace schema (`crates/fn64-discover/src/trace/mod.rs`).
   The public debugger steps a MIPS control transfer and its delay slot as one
   unit, so the emitted pause-PC stream intentionally makes no executed-PC
   exhaustiveness claim. Pack admission adds the architecturally required

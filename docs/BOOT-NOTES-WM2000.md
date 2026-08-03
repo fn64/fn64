@@ -598,7 +598,7 @@ framing:
    contract documented at `lib.rs:485`).
 3. **`fn64-runtime` scheduler reordering** -- rejected, re-confirmed this
    session by reading `Executor::run_one_step`/`pick_next`
-   (`crates/fn64-runtime/src/executor.rs:565-626`): the executor is
+   (`crates/fn64-runtime/src/executor/mod.rs:565-626`): the executor is
    strict-priority-preemptive at every scheduling point (`pick_next` always
    returns the highest-pri runnable thread), which IS the libultra-correct
    behavior real hardware also exhibits at its own scheduling points (a

@@ -173,7 +173,7 @@ Mechanically:
    76.5%, 77.0% in-bank against ~0% elsewhere) and `0` for the permitted 7102
    cartridge (88.4%). The same measurement returns `0` at 86.8% for a ROM whose
    zero delta is already proven, so the method reproduces a known-good answer
-   before being relied on. `crates/fn64-discover/src/banks.rs` asserts every
+   before being relied on. `crates/fn64-discover/src/banks/mod.rs` asserts every
    digest and delta above.
 6. Reject malformed or unexpected inputs before analysis.
 
