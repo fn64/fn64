@@ -111,6 +111,24 @@ never collides:
 that is bottlenecked on trace bank attribution (see
 docs/plans/overlay-trace-attribution.md), not on a static mechanism.
 
+**M3 postmortem: the exact soundness hole, measured (2026-08-03).** The
+one-pad arm split Revenge's `func_8002BBCC` at `0x8002bc40`. The bytes there
+are `jr $ra` / delay slot / one zero pad / `0x09000419` -- textbook boundary
+shape. But `0x09000419` is not code: it decodes as `j 0x84001064`, an address
+no N64 executes, and the words after it (`0x20010fc0`, `0x8c220010`) are a
+data run. `admissible_entry_word` is deliberately word-local and does not
+check jump-target plausibility, which is the hole.
+
+A word-local guard rejecting `j`/`jal` whose target falls outside
+`0x8000_0000..0x8100_0000` DOES catch this case (the 26-bit field reaches
+past the RDRAM window, so the constructed target really is out of range).
+Measured, it also costs one legitimate function on four of the five graded
+configurations (925->924, 873->872, 779->778, 725->724, Revenge unchanged) --
+so it is a net negative as written and was not landed. A future attempt needs
+either a target check that knows the bank extent (currently impossible:
+`plausible_function_boundary` has 15 call sites and no VA parameter) or a
+different discriminator for this shape.
+
 **Mechanism status:** M1 LANDED (`5fe2c36`, overlay banks compose into the
 grade). M1b LANDED (`785130b`, two-overlay swap pairs -- Revenge's descriptor
 table at ROM 0x37a30 was hidden by a 3-record floor and an 8-source swap
