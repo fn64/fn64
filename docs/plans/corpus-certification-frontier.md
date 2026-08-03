@@ -86,6 +86,31 @@ their construction site before assuming a common fix; the AKI precedent of
 That is a correction to this document's own earlier conclusion, made after
 tracing rather than after counting error strings.
 
+## The render/runtime lane is closed to software work
+
+Measured from `docs/base-renderer-behavior-matrix.json` (22 behavior rows,
+each carrying typed blockers):
+
+| exactness | rows |
+|---|---|
+| `bounded_reference` | 18 |
+| `exact_public` | 4 |
+| `missing` | 2 |
+
+Blocker kinds across all rows: **`hardware_trace` 19, `full_rom` 8**,
+`implementation` 2, `allowed_spec` 1. Filtering for rows whose blockers are
+neither hardware nor full-ROM leaves **zero**.
+
+The two `missing` rows are `vi-aa-resampling-analog` (VI analog output --
+DAC and composite encoding, needing physical-console capture) and
+`full-rom-zero-unsupported` (needing private ROM series evidence). The 18
+bounded rows are implemented and tested; they are bounded because certifying
+them further means measuring real silicon, not because code is absent.
+
+So there is no renderer or runtime work an agent can pick up. WM2000 renders
+(240 captured frames, scenario gate 10/10). Effort belongs in discovery,
+where blockers are still software-shaped.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
