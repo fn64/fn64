@@ -278,3 +278,8 @@ test = false
 name = "attribute_known_functions"
 path = "src/bin/attribute_known_functions.rs"
 test = true
+
+[[bin]]
+name = "classify_callerless"
+path = "src/bin/classify_callerless.rs"
+test = true
