@@ -290,6 +290,12 @@ pub enum GenerationTopologyError {
     DuplicateGenerationId { generation_id: u64 },
     InvalidDigest { field: &'static str },
     InvalidResidentSplit,
+    /// The split and the overlay invalidation union leave no contended
+    /// resident bytes, so there is no resident-tail generation to compose.
+    EmptyResidentTail {
+        split: u32,
+        tail_image_end: u32,
+    },
     ResidentTailOutsideRom,
     OverlayRecipeMismatch { index: usize },
     StateLimitExceeded { states: usize, limit: usize },
@@ -426,22 +432,64 @@ pub fn build_generation_topology_v1(
         .min()
         .unwrap();
     let invalidation_end = recipes.iter().map(|recipe| recipe.bss_end).max().unwrap();
-    if !split.is_multiple_of(4)
-        || split <= resident.load_start
-        || split >= resident.load_end
-        || invalidation_end < resident.load_end
-    {
+    if !split.is_multiple_of(4) || split <= resident.load_start || split >= resident.load_end {
         return Err(GenerationTopologyError::InvalidResidentSplit);
+    }
+    // The resident tail is the part of the resident bank overlay activations
+    // actually contend for, so its image ends where the overlay invalidation
+    // union ends -- NOT unconditionally at `resident.load_end`.
+    //
+    // `resident.load_end` is not a discovered code extent: for every ROM this
+    // path admits it is `entry - ipl3_delta + BOOT_COPY_SIZE`, the fixed 1 MiB
+    // IPL3 boot copy (`banks/mod.rs`). Nothing makes a game's overlays reach
+    // that hardware constant. WM2000's do (union `0x80171a60` past a resident
+    // end of `0x80100400`), which is why requiring
+    // `invalidation_end >= resident.load_end` went unnoticed; the two-overlay
+    // swap-pair titles measured on 2026-08-03 do not:
+    //
+    //   WCW/nWo Revenge      resident [0x80000400,0x80100400)
+    //                        split 0x80090000, union end 0x800fafa0
+    //   WCW vs nWo World Tour resident [0x80000400,0x80100400)
+    //                        split 0x80090000, union end 0x800f8af0
+    //
+    // Both left a trailing resident span (21,600 and 30,992 bytes) that no
+    // overlay ever writes. That span is immutable executable territory, the
+    // same status as the pre-split prefix -- so folding it into the tail image
+    // was the actual error. Clamping is what keeps the runtime's own
+    // `invalidation >= image` invariant true by construction
+    // (`PrecompiledGeneration::new`, which rejects
+    // `InvalidationDoesNotContainImage`) instead of by luck of geometry.
+    //
+    // Widening is fail-closed: the clamp only ever SHRINKS the tail image, so
+    // no byte becomes owned by the resident tail that the old rule did not
+    // already give it, and a geometry with no contended tail at all is still
+    // rejected below.
+    let tail_image_end = resident.load_end.min(invalidation_end);
+    // A split at or past where overlays stop writing leaves an empty tail: the
+    // resident bank and the overlays never contend for a single byte, so there
+    // is no generation to compose. Reject it precisely rather than emitting a
+    // zero-length generation the runtime would refuse as `InvalidRange`.
+    if tail_image_end <= split {
+        return Err(GenerationTopologyError::EmptyResidentTail {
+            split,
+            tail_image_end,
+        });
     }
     let tail_rom_start = resident
         .source_rom_start
         .checked_add(split - resident.load_start)
         .ok_or(GenerationTopologyError::ResidentTailOutsideRom)?;
+    let tail_rom_end = tail_rom_start
+        .checked_add(tail_image_end - split)
+        .ok_or(GenerationTopologyError::ResidentTailOutsideRom)?;
+    if tail_rom_end > resident.source_rom_end {
+        return Err(GenerationTopologyError::ResidentTailOutsideRom);
+    }
     let tail_bytes = rom
         .bytes
-        .get(tail_rom_start as usize..resident.source_rom_end as usize)
+        .get(tail_rom_start as usize..tail_rom_end as usize)
         .ok_or(GenerationTopologyError::ResidentTailOutsideRom)?;
-    if tail_bytes.len() != (resident.load_end - split) as usize {
+    if tail_bytes.len() != (tail_image_end - split) as usize {
         return Err(GenerationTopologyError::ResidentTailOutsideRom);
     }
     let tail_digest: [u8; 32] = Sha256::digest(tail_bytes).into();
@@ -457,13 +505,13 @@ pub fn build_generation_topology_v1(
             resident_tail_identity_domain,
             &rom.sha256,
             split,
-            resident.load_end,
+            tail_image_end,
             split,
             invalidation_end,
             tail_digest,
         ),
         image_start: split,
-        image_end: resident.load_end,
+        image_end: tail_image_end,
         invalidation_start: split,
         invalidation_end,
         image_sha256: tail_sha256,

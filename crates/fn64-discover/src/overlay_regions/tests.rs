@@ -88,6 +88,45 @@
     }
 
     #[test]
+    fn two_abutting_sources_on_one_destination_are_a_swap_pair() {
+        // WCW/nWo Revenge: ROM 0x3c770..0x834a0 and 0x834a0..0xdac50 both
+        // declare 0x80090000. Two sources is an order of magnitude under the
+        // concentration floor, so contiguity carries the evidence instead.
+        // One sibling wins a raw delta vote while the other falls back, so
+        // the shape is only visible across both evidence sets.
+        let fallbacks = vec![fallback(0x834a0, 0x8009_0000, 0x577b0)];
+        let mut raw = BTreeSet::new();
+        raw.insert(MappingHypothesis {
+            source_start: 0x3c770,
+            source_end: 0x834a0,
+            va_start: 0x8009_0000,
+            va_end: 0x8009_0000 + 0x46d30,
+        });
+        assert!(overlapping_destination_is_engine_shape_across(
+            &fallbacks, &raw
+        ));
+        // The strict (VROM) view sees only the fallback and must not.
+        assert!(!overlapping_destination_is_engine_shape(&fallbacks));
+    }
+
+    #[test]
+    fn non_abutting_sources_on_one_destination_stay_a_conflict() {
+        // A gap between the sources means they do not tile a span, so the
+        // shared destination is ordinary ambiguity, not a swap pair.
+        let fallbacks = vec![fallback(0x90000, 0x8009_0000, 0x1000)];
+        let mut raw = BTreeSet::new();
+        raw.insert(MappingHypothesis {
+            source_start: 0x3c770,
+            source_end: 0x834a0,
+            va_start: 0x8009_0000,
+            va_end: 0x8009_0000 + 0x46d30,
+        });
+        assert!(!overlapping_destination_is_engine_shape_across(
+            &fallbacks, &raw
+        ));
+    }
+
+    #[test]
     fn many_sources_on_one_destination_read_as_a_reused_slot() {
         // Paper Mario (PAL) measured shape: 319 of 322 records in admitted
         // tables declare 0x80240000. Symmetric VA rejection discards them all,

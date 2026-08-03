@@ -239,3 +239,95 @@ Rayman 2) — a discovery frontier, not an emission defect. Encodings gas
 cannot express at `-mips3` are retained numerically by the gate's pre-pass:
 `jalr rd==rs`, MIPS IV FPU conditional moves (`movz/movn/movt/movf .s/.d`),
 and `bltzal`-family branches sourcing `$31`.
+
+## gate_rom_recompile — generic whole-ROM CPU recompilation
+
+The generic gate needs exactly one input and no per-game configuration:
+
+```sh
+FN64_DISCOVER_ROM=<rom.z64> \
+FN64_RECOMPILE_REPORT=<scratch>/<label>.json \
+  cargo run --release -p fn64-discover --bin gate_rom_recompile
+```
+
+It discovers banks, packs digest-bound block geometry, emits Rust, compiles
+it with a real `rustc`, runs the result, and probes arbitrary guest PCs. The
+pass criterion is the composed `HEADLINE unsupported=0`; per-bank
+`unsupported` lines can be nonzero and still compose to zero, because a
+destination unmapped in one bank may be resident in another.
+
+### WWF WrestleMania 2000 (NWXE) — 2026-08-03, exit 0
+
+First run of the GENERIC gate against any AKI title. Previously only
+`gate_wm2000_recompile` (hardcoded to this game) had certified it.
+
+```
+composed_banks=5
+HEADLINE unsupported=0 total_recompiled_exact_plus_block_aot_bytes=8188
+exact_aot=110  block_aot=1937  dynamic_mips=19  unsupported=0
+whole-ROM BlockPack v2: blocks=43032 words=223429
+unsupported_punch_list=[]
+```
+
+Note `exact_aot=110` where the recorded `gate_wm2000_recompile` scoreboard
+(2026-07-31, `docs/DISCOVER-PLAN.md`) reported 0 — discovery has improved
+since, and the generic path is not weaker than the hand-configured one.
+
+Boot bank alone reports `unsupported=3` and `recovered_overlay_2` reports 8;
+both compose away. Reading a per-bank line as the verdict is a mistake the
+HEADLINE exists to prevent.
+
+### The other AKI titles — 2026-08-03
+
+Same command, one env var each. ROM paths: NW4E/NWXE from the gate-determinism
+set, Revenge and World Tour from `aki-recomp/donors/`, VPW2 from the corpus
+directory.
+
+| title | banks | blocks | result |
+|---|---|---|---|
+| Virtual Pro Wrestling 2 (Japan) | 5 | 49,329 | exit 0, `unsupported=0` |
+| WCW/nWo Revenge | 3 | 25,057 | exit 0, `unsupported=0` |
+| WCW vs nWo World Tour | 3 | 25,375 | exit 0, `unsupported=0` |
+| WWF No Mercy (NW4E) | 6 | 57,284 | exit 0, `unsupported=0`; see below |
+
+VPW2 is the notable one: a Japanese-language title with no decomp project, no
+answer key, and no prior attempt, certified cold on its first run.
+
+Revenge and World Tour required `e5e7d39` (the resident-tail clamp). Before
+it they failed identically with `InvalidResidentSplit`, because the guard
+required overlay invalidation to reach `resident.load_end` -- a fixed 1 MiB
+IPL3 boot-copy constant, not a discovered extent. Any two-overlay swap-pair
+title would have hit this.
+
+**No Mercy now completes.** It previously did not, and the first diagnosis
+was wrong in an instructive way, so both are recorded.
+
+The original evidence: killed at 71 minutes, `sample(1)` putting 1689/1689
+stacks in `compose_catalog_bound_overlay_snapshots` ->
+`compose_catalog_bound_direct_transfer_fixed_point_v1` ->
+`compose_materialized_banks_catalog_bound_with_limits` ->
+`finish_materialized_bank` -> `owner_proof::prove_exact_owners_inner`. Read
+as "stuck in owner proof, the boundary/recall lane, doing work certification
+does not need," and as superlinear-in-bank-count because No Mercy is only one
+bank larger than the 5-bank titles that finish.
+
+**Both readings were wrong.** A deeper `sample` (6807/6807 stacks) resolved
+one frame further, to the leaf `partition::same_bank_overlaps` -- called from
+`prove_exact_owners_inner` *before* its per-root loop. It was not superlinear
+and it was not slow: `same_bank_overlaps` walks a block chain with
+`pc = b.end_va`, which does not advance when a block has `end_va <= start_va`.
+Zero-length blocks are a legitimate `Cfg` shape (a root landing in fenced data
+becomes a zero-instruction `DataFence` block; `RanOffEnd` at an image edge can
+be too), and No Mercy has one inside an owner extent. The loop spun at 100%
+CPU forever. No round budget or limit bounds it, because it never returns to
+code that has one.
+
+Lesson worth keeping: a profile that names a *function* can be one frame short
+of naming the *bug*, and "7x slower than a comparable input" is as consistent
+with non-termination as with a bad exponent. Resolve to the leaf before
+theorizing about complexity.
+
+After the fix, No Mercy certifies with 6 banks and 57,284 blocks. Note it does
+so at `exact_aot=0` -- all 1,820 destinations are `BlockAot`. That is a valid
+`unsupported=0` (the emitter does not consult function boundaries), but it is
+not evidence that exact-owner proof succeeds on this ROM.
