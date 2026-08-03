@@ -225,3 +225,61 @@ addressable set is much larger than the overlay count suggests.
 
 The one failure is a specific, nameable blocker in overlay-recipe recovery
 (`SourceFieldsChanged`), not a general limitation. A wider batch is running.
+
+### Wider corpus batch — the failure class is singular
+
+A second batch (ROMs 7-40 in corpus order) is still running, but the first
+completed results already name one shared blocker rather than many:
+
+| ROM | result |
+|---|---|
+| Armorines - Project S.W.A.R.M. | `unsupported=1` — `0x00292e00:OutsideAllMappings` |
+| Army Men - Sarge's Heroes | `unsupported=1` — `0x801f9930:OutsideAllMappings` |
+| Army Men - Sarge's Heroes 2 | `unsupported=1` — `0x80214690:OutsideAllMappings` |
+
+Each reaches the scoreboard and emits successfully; each has **exactly one**
+destination landing at an address no discovered bank covers. Two are the same
+engine, so this is likely a family-shaped geometry gap (a bank the descriptor
+search does not recover) rather than three unrelated defects.
+
+That is a far better failure mode than a structural one: the addressable work
+is "recover one more mapping", and a single fix plausibly certifies several
+titles at once -- the same shape as the `InvalidResidentSplit` fix that
+certified Revenge and World Tour together.
+
+## The `0xbfc0...` frontier: measured, still open, and correctly so
+
+Ran the canonical receipt (`gate_wm2000_recompile` with
+`FN64_DENSE_MANIFEST_ONLY=1`, receipt `sha256=4cd5e0fe...`,
+byte-identical across two runs). Of the five admission conditions:
+
+| # | condition | status |
+|---|---|---|
+| 1 | initial BootContext Status clear | FAILS — no private capture on this machine |
+| 2 | dense/external Status scans + value proofs close | FAILS — boot `value_open=4 unclassified=2` |
+| 3 | exact 15 host symbols and effects | **PASSES** — all `unique_structural_semantic_match` |
+| 4 | normal-vector handlers have scanned owners | FAILS — all six vectors open, `external_images=0` |
+| 5 | writer/DMA/transfer closure | FAILS — 14 open writer classes, 52 open stores |
+
+**The four open Status value proofs are genuine limits, not defects.** Decoded
+from ROM bytes (BEV is bit 22): `0x8002a2ac` and `0x80036fb0` mask with
+`0xffff00ff`, so BEV sits in the *preserved* half and is carried from
+runtime-mutable memory; `0x8002a2c8` is `or $t0,$a0` against an unconstrained
+argument, where known-zero correctly collapses; `0x800376d0` is a bare
+`mtc0 $a0,$12`. Closing them needs interprocedural argument closure -- proving
+the callable-entry set and every caller's `$a0`. The abstract interpreter is
+not leaking soundness: `read_static_word` zeroes both known-bit masks on every
+load-image read, so ROM bytes can never masquerade as runtime invariants.
+
+**The instructive one:** `0x800367ac` decodes as `mfc0 $k1,$12; and $k1,~3;
+mtc0` -- a textbook BEV-preserving RMW that would close trivially if
+classified. It is unclassified only because the CFG never reaches it: the boot
+bank seeds the ROM header entry point alone, giving **27 proven roots / 197
+reachable blocks against 262,144 aligned words**. Promoting a candidate word
+to proven code to pass this condition is precisely the bar-lowering the
+frontier exists to prevent, so it stays open.
+
+Conditions 1 and 4 fail on *absent private inputs* rather than evidence
+limits; supplying a validated BootContext and external image captures would
+likely close them. Conditions 2 and 5 would still block on the 27-root CFG,
+so the frontier stays open regardless.
