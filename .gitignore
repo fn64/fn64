@@ -27,3 +27,8 @@ tools/mupen-trace/mupen_devtrace
 # up as spurious worktree dirt otherwise.
 __pycache__/
 *.pyc
+
+# Project skills are shared procedure knowledge; the rest of .claude stays local.
+!.claude/
+.claude/*
+!.claude/skills/
