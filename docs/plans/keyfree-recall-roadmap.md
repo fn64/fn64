@@ -95,6 +95,22 @@ these were "live-but-indirect" were measured wrong (the first probe scanned
 raw compressed asset bytes and produced impossible targets like 0x84000778);
 this supersedes them.
 
+**Full AKI scoreboard at HEAD (2026-08-03), all wrong==0.** Revenge grades
+its two swap-pair overlays too -- both images sit at VA 0x80090000 and are
+graded separately because selection is keyed on ROM range, so the shared slot
+never collides:
+
+| game | boot | overlays | total | recall |
+|---|---|---|---|---|
+| NWXE | 725/847 | 1,131/1,595 | 1,856/2,442 | 76.0% |
+| NW4E | 873/985 | 1,842/2,455 | 2,715/3,440 | 78.9% |
+| Revenge | 597/689 | 745/1,020 | 1,342/1,709 | 78.5% |
+
+**5,913 of 7,591 key-free with zero wrong splits (77.9%)**, against 2,032 /
+26.8% when this roadmap was written. 79% of what remains is in overlays, and
+that is bottlenecked on trace bank attribution (see
+docs/plans/overlay-trace-attribution.md), not on a static mechanism.
+
 **Mechanism status:** M1 LANDED (`5fe2c36`, overlay banks compose into the
 grade). M1b LANDED (`785130b`, two-overlay swap pairs -- Revenge's descriptor
 table at ROM 0x37a30 was hidden by a 3-record floor and an 8-source swap
