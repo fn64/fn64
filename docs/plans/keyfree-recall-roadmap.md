@@ -18,6 +18,25 @@ configurations) rather than trusting this table:
 Plus ~2,965 overlay-bank functions now graded exact that previously had no
 verdict (NWXE 1,125/1,595; NW4E 1,840/2,455).
 
+**M2 RETIRED -- its premise was disproved by measurement (2026-08-03).**
+M2 assumed overlay functions go unrooted because authority cannot cross
+image boundaries, projecting ~3,300-3,600 recoverable functions. Built and
+landed (`a3bf70b`, sound, wrong=0 in all five configurations, fixpoint in 2
+rounds), it gained **+10 functions total**: NWXE 1125->1131, NW4E
+1840->1842, Revenge 743->745.
+
+The existing in-bank flat jal sweep already roots nearly everything
+statically callable inside each image, so induction adds 1-4 roots per bank
+on top of 171-604 existing ones. Revenge is decisive: zero aliasing
+rejections, so the slot rule blocks nothing there, and it still gained only
+2. Independently verified on NWXE's best-graded slot (`_2` @0x8011c900):
+374 distinct jal targets land in it against 355 already graded exact and
+393 answer functions -- static call evidence is exhausted.
+
+The remaining ~1,300 overlay open functions are therefore the same class as
+the boot bank's 66: never statically called. They belong to M4's trace lane
+or to key adjudication, not to any static authority mechanism.
+
 **Measured key-free ceiling (NWXE, 2026-08-03).** All 66 functions still
 open in the donor configuration have ZERO static references anywhere in the
 code image -- no `jal`, no pointer word -- scanned across the resident image
