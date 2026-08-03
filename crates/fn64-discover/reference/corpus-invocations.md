@@ -288,7 +288,7 @@ directory.
 | Virtual Pro Wrestling 2 (Japan) | 5 | 49,329 | exit 0, `unsupported=0` |
 | WCW/nWo Revenge | 3 | 25,057 | exit 0, `unsupported=0` |
 | WCW vs nWo World Tour | 3 | 25,375 | exit 0, `unsupported=0` |
-| WWF No Mercy (NW4E) | 6 | — | does not finish; see below |
+| WWF No Mercy (NW4E) | 6 | 57,284 | exit 0, `unsupported=0`; see below |
 
 VPW2 is the notable one: a Japanese-language title with no decomp project, no
 answer key, and no prior attempt, certified cold on its first run.
@@ -299,13 +299,35 @@ required overlay invalidation to reach `resident.load_end` -- a fixed 1 MiB
 IPL3 boot-copy constant, not a discovered extent. Any two-overlay swap-pair
 title would have hit this.
 
-**No Mercy does not complete.** Killed at 71 minutes; a `sample(1)` of the
-live process put 1689/1689 stacks in one path:
-`compose_catalog_bound_overlay_snapshots` ->
+**No Mercy now completes.** It previously did not, and the first diagnosis
+was wrong in an instructive way, so both are recorded.
+
+The original evidence: killed at 71 minutes, `sample(1)` putting 1689/1689
+stacks in `compose_catalog_bound_overlay_snapshots` ->
 `compose_catalog_bound_direct_transfer_fixed_point_v1` ->
 `compose_materialized_banks_catalog_bound_with_limits` ->
-`finish_materialized_bank` -> `owner_proof::prove_exact_owners_inner`. It is
-stuck in OWNER PROOF -- the boundary/recall lane -- before emission starts.
-The other four titles complete in ~10 minutes each, and No Mercy is only one
-bank larger than the two 5-bank titles, so this is superlinear rather than
-size. Under investigation.
+`finish_materialized_bank` -> `owner_proof::prove_exact_owners_inner`. Read
+as "stuck in owner proof, the boundary/recall lane, doing work certification
+does not need," and as superlinear-in-bank-count because No Mercy is only one
+bank larger than the 5-bank titles that finish.
+
+**Both readings were wrong.** A deeper `sample` (6807/6807 stacks) resolved
+one frame further, to the leaf `partition::same_bank_overlaps` -- called from
+`prove_exact_owners_inner` *before* its per-root loop. It was not superlinear
+and it was not slow: `same_bank_overlaps` walks a block chain with
+`pc = b.end_va`, which does not advance when a block has `end_va <= start_va`.
+Zero-length blocks are a legitimate `Cfg` shape (a root landing in fenced data
+becomes a zero-instruction `DataFence` block; `RanOffEnd` at an image edge can
+be too), and No Mercy has one inside an owner extent. The loop spun at 100%
+CPU forever. No round budget or limit bounds it, because it never returns to
+code that has one.
+
+Lesson worth keeping: a profile that names a *function* can be one frame short
+of naming the *bug*, and "7x slower than a comparable input" is as consistent
+with non-termination as with a bad exponent. Resolve to the leaf before
+theorizing about complexity.
+
+After the fix, No Mercy certifies with 6 banks and 57,284 blocks. Note it does
+so at `exact_aot=0` -- all 1,820 destinations are `BlockAot`. That is a valid
+`unsupported=0` (the emitter does not consult function boundaries), but it is
+not evidence that exact-owner proof succeeds on this ROM.

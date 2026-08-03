@@ -416,6 +416,19 @@ pub fn same_bank_overlaps(partition: &Partition, cfg: &Cfg) -> Vec<(u32, u32)> {
             let Some(b) = blocks_by_start.get(&pc) else {
                 break;
             };
+            // A block that does not extend past its own start covers no
+            // bytes, so it cannot chain the walk forward. `DataFence` blocks
+            // are exactly this shape by construction (`cfg.rs`: a root that
+            // lands in fenced data becomes a zero-instruction block with
+            // `end_va == start_va`), and a `RanOffEnd` block at the image
+            // edge can be too. Advancing to `end_va` would leave `pc`
+            // unchanged and spin forever; the extent past such a block is
+            // not walkable coverage, which is the same situation the
+            // no-block-starts-here arm above already treats as the end of
+            // the walk. Stop there rather than looping.
+            if b.end_va <= pc {
+                break;
+            }
             pc = b.end_va;
         }
     }
@@ -786,6 +799,51 @@ mod tests {
 
         let overlaps = same_bank_overlaps(&part, &cfg);
         assert_eq!(overlaps, vec![(0x8000_0000, 0x8000_0008)]);
+    }
+
+    #[test]
+    fn same_bank_overlaps_terminates_on_a_zero_length_block() {
+        // Regression for a real hang found against NW4E: the walk advanced
+        // `pc` to the block's `end_va`, so a block covering no bytes
+        // (`end_va <= start_va`) never moved the cursor and the loop spun
+        // forever. `build_cfg` produces exactly this shape for a root that
+        // lands in fenced data -- a zero-instruction `DataFence` block --
+        // and NW4E has one inside an owner extent. Whole-ROM certification
+        // wedged here -- 6807 of 6807 `sample(1)` hits on this one leaf --
+        // burning >70 minutes at 100% CPU without ever reaching emission.
+        let blocks = vec![BasicBlock {
+            start_va: 0x8000_0000,
+            end_va: 0x8000_0000,
+            terminator: BlockTerminator::DataFence { at: 0x8000_0000 },
+        }];
+        let cfg = Cfg {
+            bank: "boot".to_string(),
+            word_class: BTreeMap::new(),
+            blocks,
+            direct_calls: vec![],
+            tail_transfers: vec![],
+            indirect_sites: vec![],
+            plain_delay_entry_aliases: vec![],
+            unsupported_delay_entries: vec![],
+            rejected_transfer_targets: Vec::new(),
+            proven_roots: vec![0x8000_0000],
+        };
+        let part = Partition {
+            bank: "boot".to_string(),
+            owners: vec![Owner {
+                bank: "boot".to_string(),
+                root_va: 0x8000_0000,
+                block_starts: vec![0x8000_0000],
+                // An extent that outruns the zero-length block is what makes
+                // the `while pc < extent_end` guard fail to stop the walk.
+                extent_end: 0x8000_0010,
+            }],
+            ambiguous: vec![],
+            unowned: vec![],
+        };
+
+        // The assertion that matters is that this returns at all.
+        assert!(same_bank_overlaps(&part, &cfg).is_empty());
     }
 
     #[test]
