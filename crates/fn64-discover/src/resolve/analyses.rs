@@ -100,6 +100,8 @@ pub fn analyze_call_boundary_registers_from_roots(
         None,
         None,
         Some((&requested_registers, &mut observations)),
+    
+        &EntryArgumentSeeds::new(),
     );
 
     let mut calls = Vec::new();
@@ -286,6 +288,8 @@ pub fn analyze_cop0_status_writes(
         Some(&mut observations),
         None,
         None,
+    
+        &EntryArgumentSeeds::new(),
     );
     let mut proofs = Vec::with_capacity(inventory.proven_code_writes.len());
     for site in &inventory.proven_code_writes {
@@ -381,6 +385,8 @@ pub fn analyze_constant_tlb_transfers(
         None,
         Some(&mut observations),
         None,
+    
+        &EntryArgumentSeeds::new(),
     );
 
     let mut sites = cfg
@@ -528,6 +534,8 @@ pub fn derive_fixed_word_stores(
         None,
         None,
         None,
+    
+        &EntryArgumentSeeds::new(),
     );
 
     let mut conditional = Vec::new();
