@@ -100,6 +100,11 @@ path = "src/bin/gate_content_consumer.rs"
 test = false
 
 [[bin]]
+name = "corpus_index"
+path = "src/bin/corpus_index.rs"
+test = true
+
+[[bin]]
 name = "gate_corpus_homology"
 path = "src/bin/gate_corpus_homology.rs"
 test = false
