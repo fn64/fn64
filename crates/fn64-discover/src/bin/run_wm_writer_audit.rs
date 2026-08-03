@@ -6,6 +6,10 @@
 //! still require all eight series; a failed run retains a distinct diagnostic
 //! receipt for successful series without making it scorecard authority.
 
+// Everything below main() is live only under the writer-runtime-authority
+// feature; the default build compiles it dead and would warn on every item.
+#![cfg_attr(not(feature = "writer-runtime-authority"), allow(dead_code))]
+
 use std::path::{Component, Path, PathBuf};
 
 const OUTPUT_WRITER_DENOMINATOR: &str = "writers.json";

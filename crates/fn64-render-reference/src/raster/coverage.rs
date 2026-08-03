@@ -178,7 +178,7 @@ impl PartialAttributeSamplePolicy {
 /// covered. Every triangle/line evaluator returns this type and derives the
 /// count only at the fragment boundary, preventing an early identity collapse.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct CoverageMask(pub(super) u8);
+pub(crate) struct CoverageMask(pub(super) u8);
 
 impl CoverageMask {
     pub(super) fn from_samples(mut covered: impl FnMut(i32, i32) -> bool) -> Self {

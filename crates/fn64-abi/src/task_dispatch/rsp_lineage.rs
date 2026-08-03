@@ -1,3 +1,9 @@
+
+// The writer-trace observation seam below is exercised today only from the
+// task_dispatch test tree, so the non-test build sees it dead. It stays: it
+// is the non-forgeable dispatch observation window, and deleting it would
+// force tests back into this file.
+#![cfg_attr(not(test), allow(dead_code))]
 use super::*;
 
 /// Canonical ABI owner for the RSP interpreter registers that are not stored

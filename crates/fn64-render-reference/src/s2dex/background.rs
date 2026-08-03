@@ -412,7 +412,7 @@ impl Default for ObjectMatrix {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum ObjectTexture {
+pub(crate) enum ObjectTexture {
     Block {
         common: ObjectTextureCommon,
         tmem: u16,
