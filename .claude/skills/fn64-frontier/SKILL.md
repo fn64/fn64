@@ -18,7 +18,8 @@ Corpus sweep (checkpoints every batch; canonical output lives with the
 analysis, e.g. the session tmp dir or crates/fn64-discover/reference/):
 
 ```sh
-python3 scripts/resweep.py out.json --workers 4 --timeout 900
+source .claude/local.env
+python3 scripts/resweep.py out.json --rom-dir "$FN64_ROM_CORPUS_DIR" --workers 4 --timeout 900
 ```
 
 `--timeout` exists because WWF No Mercy exceeded 900s under a loaded sweep.

@@ -11,16 +11,19 @@ configuration; recall (`matched_exact`) may only rise. A mechanism that
 grades `wrong>0` anywhere is unsound as admitted — tighten or revert, never
 tune per-game.
 
-## Environment (exact paths; the keys live outside the repo)
+## Environment
+
+Machine-local paths live in the gitignored `.claude/local.env` (answer-key
+ROMs and dump.tomls are external to the repo and per-machine):
 
 ```sh
-export FN64_DISCOVER_NW4E_ROM=/Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64
-export FN64_DISCOVER_NWXE_ROM=/Users/jer/Code/aki-recomp/games/NWXE/wm2000.z64
-export FN64_DISCOVER_OOT_ROM=/Users/jer/Code/aki-recomp/refs/oot-decomp/baseroms/ntsc-1.0/baserom.z64
-export FN64_DISCOVER_NW4E_DUMP=/Users/jer/Code/aki-recomp/games/NW4E/syms/dump.toml
-export FN64_DISCOVER_NWXE_DUMP=/Users/jer/Code/aki-recomp/games/NWXE/syms/dump.toml
-export FN64_DISCOVER_OOT_DUMP=/Users/jer/Code/aki-recomp/games/OOTU/syms/dump.toml
+source .claude/local.env
 ```
+
+If that file is missing, create it defining: `FN64_DISCOVER_{NWXE,NW4E,OOT}_ROM`,
+`FN64_DISCOVER_{NWXE,NW4E,OOT}_DUMP`, and `FN64_ROM_CORPUS_DIR` — the
+answer-key checkouts (jessetbh-derived dump.tomls beside their exact ROMs)
+and the corpus ROM directory.
 
 Traps:
 - `~/Downloads/WWF No Mercy (E) (V1.1)` is PAL and is NOT the key's ROM.
