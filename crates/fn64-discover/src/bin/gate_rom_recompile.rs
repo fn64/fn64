@@ -37,7 +37,12 @@ use fn64_discover::dense_aot_pack::{
 };
 use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
 use fn64_discover::generation_topology::build_generation_topology_v1;
-use fn64_discover::overlay_recipe::admitted_overlay_load_recipes_v1;
+use fn64_discover::overlay_load_mapping::{
+    admitted_overlay_load_mappings_v1, shared_slot_invalidation_range, OverlayLoadMappingV1,
+};
+use fn64_discover::overlay_recipe::{
+    admitted_overlay_load_recipes_v1, OverlayLoadRecipeV1, OVERLAY_RECIPE_SCHEMA_V1,
+};
 use fn64_discover::overlay_regions::SearchConfig;
 use fn64_discover::runtime_generation_catalog::build_backed_dense_generation_catalog_v1;
 use fn64_discover::snapshot::{
@@ -428,8 +433,29 @@ fn compose_catalog_bound_overlay_snapshots(
     };
     let (_, _, recovery) = run_discovery_with_recovered_overlay_regions(rom_bytes, &overlay_input)
         .map_err(|error| format!("re-deriving overlay recovery: {error:?}"))?;
-    let recipes = admitted_overlay_load_recipes_v1(rom_bytes, &recovery)
-        .map_err(|error| format!("recovering complete overlay load recipes: {error:?}"))?;
+    // Recipes are the proven product and always preferred. When a ROM's
+    // descriptors carry no section extents at all, fall back to load-only
+    // mappings rather than refusing the ROM outright -- see
+    // `synthesize_flat_text_recipes` for what that costs and why it is sound.
+    let recipes = match admitted_overlay_load_recipes_v1(rom_bytes, &recovery) {
+        Ok(recipes) => recipes,
+        Err(recipe_error) => {
+            let mappings = admitted_overlay_load_mappings_v1(rom_bytes, &recovery).map_err(
+                |mapping_error| {
+                    format!(
+                        "recovering complete overlay load recipes: {recipe_error:?}; \
+                         load-only fallback also failed: {mapping_error:?}"
+                    )
+                },
+            )?;
+            synthesize_flat_text_recipes(&mappings).ok_or_else(|| {
+                format!(
+                    "recovering complete overlay load recipes: {recipe_error:?}; \
+                     load-only fallback proved no shared destination slot"
+                )
+            })?
+        }
+    };
 
     let resident = physical
         .iter()
@@ -528,6 +554,58 @@ fn compose_catalog_bound_overlay_snapshots(
     )
     .map_err(|error| format!("composing catalog-bound overlay transfer closure: {error:?}"))?;
     Ok(catalog_fixed_point.into_validated())
+}
+
+/// Turn load-only mappings into recipes the composition path can consume,
+/// treating each overlay as flat text with no data/bss split.
+///
+/// This is the same shape the resident boot bank already uses on every ROM
+/// this gate admits: `text = [load_start, load_end)`, with data and bss empty
+/// at the end. The boot copy is a fixed physical span with no table-described
+/// section boundary, and a load-only overlay is in exactly that position --
+/// its descriptor proves an image and a destination and says nothing about
+/// sections.
+///
+/// The one thing flat text cannot supply honestly is `bss_end`, which
+/// `generation_topology` uses as the invalidation high-water mark. A
+/// per-overlay image end is only a lower bound on what that overlay touches,
+/// so using it would risk leaving stale bytes after a swap. Every recipe here
+/// therefore carries the SHARED-SLOT UNION as its `bss_end`: these overlays all
+/// load to one address, so the union is the region any activation can occupy,
+/// and invalidating it is conservative for each overlay individually. That is
+/// why this returns `None` unless `shared_slot_invalidation_range` proves a
+/// single slot -- without one, no sound union exists and refusing is correct.
+///
+/// What this still cannot rule out is bss beyond the union, which a load-only
+/// descriptor by definition does not record. The union covers every byte any
+/// overlay's own descriptor accounts for; an overlay that zeroes memory past
+/// its declared allocation would escape it. Recipes are preferred wherever a
+/// ROM supplies them precisely because their nine-role layout closes that gap.
+fn synthesize_flat_text_recipes(
+    mappings: &[OverlayLoadMappingV1],
+) -> Option<Vec<OverlayLoadRecipeV1>> {
+    let invalidation = shared_slot_invalidation_range(mappings)?;
+    mappings
+        .iter()
+        .map(|mapping| {
+            let image = mapping.loaded_range()?;
+            Some(OverlayLoadRecipeV1 {
+                schema: OVERLAY_RECIPE_SCHEMA_V1.to_string(),
+                descriptor_rom_offset: mapping.descriptor_rom_offset,
+                rom_start: mapping.rom_start,
+                rom_end: mapping.rom_end,
+                load_start: image.start,
+                text_start: image.start,
+                text_end: image.end,
+                data_start: image.end,
+                data_end: image.end,
+                bss_start: image.end,
+                // The union, not this overlay's own end: see above.
+                bss_end: invalidation.end,
+                loaded_sha256: mapping.loaded_sha256.clone(),
+            })
+        })
+        .collect()
 }
 
 fn physical_banks(facts: &FactDb) -> Result<Vec<PhysicalBank>, String> {
