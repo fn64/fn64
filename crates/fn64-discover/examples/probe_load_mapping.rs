@@ -8,7 +8,7 @@
 //!
 //! Usage: `cargo run --release -p fn64-discover --example probe_load_mapping
 //! -- <rom.z64> [min_records]`
-use fn64_discover::overlay_load_mapping::admitted_overlay_load_mappings_v1;
+use fn64_discover::overlay_load_mapping::{admitted_overlay_load_mappings_v1, shared_slot_invalidation_range};
 use fn64_discover::overlay_recipe::admitted_overlay_load_recipes_v1;
 use fn64_discover::overlay_regions::{recover_overlay_regions, SearchConfig};
 
@@ -31,6 +31,15 @@ fn main() {
     match admitted_overlay_load_mappings_v1(&bytes, &recovery) {
         Ok(mappings) => {
             println!("mappings={}", mappings.len());
+            match shared_slot_invalidation_range(&mappings) {
+                Some(range) => println!(
+                    "  shared-slot invalidation [{:#x},{:#x}) size={:#x}",
+                    range.start,
+                    range.end,
+                    range.end - range.start
+                ),
+                None => println!("  shared-slot invalidation: none (not one slot)"),
+            }
             for mapping in mappings.iter().take(6) {
                 println!(
                     "  rom {:#08x}..{:#08x} len={:#x} load={:#x?}",
