@@ -366,6 +366,34 @@ fn main() {
             report.new_edges.len(),
             report.unknown_bank_skipped,
         );
+        // Executed PCs are a second, independent evidence class in the same
+        // capture, and until now the gate ignored them. A producer that emits
+        // only `executed_pc` records (tools/mupen-trace/mupen_trace.c does)
+        // therefore folded nothing at all, even when the capture demonstrably
+        // executed functions the static lanes had left open -- measured on a
+        // 3,000,000-record WM2000 boot trace: 0 edges folded, recall
+        // unchanged, while the same trace proves func_80028BA0 ran 12 times.
+        //
+        // An executed PC is existence evidence of the same class as an
+        // observed indirect target: the word demonstrably ran as code in that
+        // bank. It is NOT a reachability or exhaustiveness proof, and it does
+        // not by itself make the PC a function entry -- only the code-segment
+        // grade decides ownership, exactly as it does for a jal target.
+        let executed = fn64_discover::trace::fold_executed_pcs_into_fact_db(
+            &mut db,
+            &ingest.header.trace_id,
+            &ingest.facts,
+            |_bank: &str, _va: u32| None,
+        );
+        println!(
+            "trace {:?}: {} executed-PC observations folded \
+             ({} new code-existence, {} corroborated, {} conflicts)",
+            ingest.header.trace_id,
+            executed.facts_added,
+            executed.new_code_existence.len(),
+            executed.corroborated.len(),
+            executed.conflicts.len(),
+        );
     }
 
     let boot = db
