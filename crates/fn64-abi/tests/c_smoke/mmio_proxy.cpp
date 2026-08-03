@@ -206,6 +206,19 @@ int main(int argc, char** argv) {
         return 7;
     }
 
+    // MI_INTR_MASK is a paired clear/set command register. Generated-C must
+    // observe the same six-source mask authority used by osSetIntMask.
+    MEM_W(0, UINT64_C(0xFFFFFFFFA430000C)) = UINT32_C(0x222);
+    if (static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA430000C))) !=
+            UINT32_C(0x15)) {
+        return 32;
+    }
+    MEM_W(0, UINT64_C(0xFFFFFFFFA430000C)) = UINT32_C(0x10);
+    if (static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA430000C))) !=
+            UINT32_C(0x11)) {
+        return 33;
+    }
+
     // SP memory and the real PC address use the same proxy and persistent
     // DeviceFabric state. SP_WR_LEN at A404000C is deliberately not confused
     // with PC (A4080000).
