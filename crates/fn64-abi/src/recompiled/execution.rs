@@ -815,7 +815,7 @@ fn record_recompiled_unsupported(context: &str) {
     );
 }
 
-fn recompiled_gap_panic(context: impl Into<String>) -> ! {
+pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
     let context = context.into();
     record_recompiled_unsupported(&context);
     panic!("{context}")

@@ -776,13 +776,13 @@ impl fmt::Display for DeviceFault {
 impl std::error::Error for DeviceFault {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingPi {
+pub(crate) struct PendingPi {
     token: u64,
     request: PiDmaRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingAi {
+pub(crate) struct PendingAi {
     token: u64,
     request: AiDmaRequest,
     started_at: Cycles,
@@ -808,7 +808,7 @@ impl DpcCounter24 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DpcRegisters {
+pub(crate) struct DpcRegisters {
     start: u32,
     end: u32,
     current: u32,
@@ -820,25 +820,25 @@ struct DpcRegisters {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingDpc {
+pub(crate) struct PendingDpc {
     submission: DpcSubmission,
     rollback: DpcRegisters,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingSi {
+pub(crate) struct PendingSi {
     token: u64,
     request: SiDmaRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingSpDma {
+pub(crate) struct PendingSpDma {
     token: u64,
     request: SpDmaRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeviceEvent {
+pub(crate) enum DeviceEvent {
     Pi { token: u64 },
     Ai { token: u64 },
     Si { token: u64 },
