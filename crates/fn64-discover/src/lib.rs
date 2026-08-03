@@ -253,6 +253,7 @@ pub mod loaders;
 pub mod materialized_image;
 pub mod missed_function_attribution;
 pub mod oot_reference;
+pub mod overlay_load_mapping;
 pub mod overlay_recipe;
 pub mod overlay_regions;
 pub mod overlay_reloc;
