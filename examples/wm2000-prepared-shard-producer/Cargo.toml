@@ -1,0 +1,22 @@
+[package]
+name = "fn64-wm-prepared-shard-producer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "fn64-wm-prepared-shard-producer"
+path = "../wm2000-block-shards/producer.rs"
+
+[[bin]]
+name = "fn64-wm-static-micro-op-profile"
+path = "../wm2000-block-shards/profile_static_micro_ops.rs"
+
+[dependencies]
+fn64-discover = { path = "../../crates/fn64-discover" }
+fn64-recomp-rs = { path = "../../crates/fn64-recomp-rs", default-features = false, features = ["aot-runtime"] }
+fn64-recomp-rs-codegen = { path = "../../crates/fn64-recomp-rs-codegen" }
+sha2 = "0.10"
+
+[workspace]
+resolver = "2"

@@ -77,13 +77,6 @@ fn linked_native_program_identity() -> fn64_boot_harness::NativeProgramArtifactI
 /// RDRAM bounds are registered even when no device exists so live PCM stats
 /// and `FN64_DUMP_AUDIO_PCM` remain available in headless runs.
 fn wire_audio_output(rdram_len: usize) {
-    fn64_abi::set_audio_rdram_len(rdram_len);
-    if std::env::var_os("FN64_NO_AUDIO").is_some() {
-        println!("[oot-boot] FN64_NO_AUDIO set -- cpal output disabled");
-        return;
-    }
-
-    use fn64_audio::{AudioBackend as _, AudioConfig, CpalBackend};
     // OoT's boot-time AI rate; osAiSetFrequency forwards the true DAC rate
     // to the backend later, so this is a starting ratio, not a commitment.
     // The backend negotiates the host stream rate with the device itself
@@ -91,17 +84,24 @@ fn wire_audio_output(rdram_len: usize) {
     // multi-rate retry ladder here is gone -- playing 32 kHz samples on a
     // 48 kHz stream without conversion was the "background static" bug.
     const OOT_BOOT_AI_RATE_HZ: u32 = 32_000;
-    let mut backend = CpalBackend::new();
-    match backend.create(&AudioConfig::new(OOT_BOOT_AI_RATE_HZ, 2)) {
-        Ok(()) => {
-            let stream_rate = backend.stream_rate_hz().unwrap_or(OOT_BOOT_AI_RATE_HZ);
-            fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
+    match fn64_boot_harness::wire_live_audio_output(
+        rdram_len,
+        OOT_BOOT_AI_RATE_HZ,
+        std::env::var_os("FN64_NO_AUDIO").is_some(),
+    ) {
+        fn64_boot_harness::LiveAudioOutput::Disabled => {
+            println!("[oot-boot] FN64_NO_AUDIO set -- cpal output disabled");
+        }
+        fn64_boot_harness::LiveAudioOutput::Active {
+            guest_rate_hz,
+            stream_rate_hz,
+        } => {
             println!(
-                "[oot-boot] audio output wired (cpal, guest {OOT_BOOT_AI_RATE_HZ} Hz -> \
-                 stream {stream_rate} Hz stereo)"
+                "[oot-boot] audio output wired (cpal, guest {guest_rate_hz} Hz -> \
+                 stream {stream_rate_hz} Hz stereo)"
             );
         }
-        Err(error) => eprintln!(
+        fn64_boot_harness::LiveAudioOutput::Unavailable(error) => eprintln!(
             "[oot-boot] audio output unavailable ({error}); live PCM stats/dump remain enabled"
         ),
     }
@@ -562,9 +562,26 @@ fn main() {
             .to_ascii_lowercase();
     let release_mode_active =
         release_gate.is_some() || quiescent_discovery.is_some() || presentation_discovery.is_some();
+    let audio_validation_skip_graphics = fn64_boot_harness::parse_release_env_value(
+        "FN64_AUDIO_VALIDATION_SKIP_GRAPHICS",
+        std::env::var_os("FN64_AUDIO_VALIDATION_SKIP_GRAPHICS"),
+    )
+    .unwrap_or_else(|error| panic!("oot-boot: {error}"))
+    .map(|value| {
+        assert_eq!(
+            value, "1",
+            "oot-boot: FN64_AUDIO_VALIDATION_SKIP_GRAPHICS must be exactly 1 when present"
+        );
+        true
+    })
+    .unwrap_or(false);
     assert!(
         !release_mode_active || matches!(requested_renderer.as_str(), "reference" | "rt64"),
         "oot-boot: release modes require FN64_RENDER=reference or FN64_RENDER=rt64, got {requested_renderer:?}"
+    );
+    assert!(
+        !release_mode_active || !audio_validation_skip_graphics,
+        "oot-boot: release/discovery modes cannot skip graphics during an audio validation"
     );
     assert!(
         presentation_discovery.is_none() || requested_renderer == "rt64",
@@ -621,14 +638,19 @@ fn main() {
     // loaded graphics microcode through the clean-room RSP interpreter and
     // give the selected backend only the resulting raw DPC stream; the
     // interactive shell retains the explicitly documented HLE optimization.
-    fn64_abi::set_render_backend_with_policy(
-        render_backend,
-        rdram.len(),
-        fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
-    );
+    let graphics_policy = if audio_validation_skip_graphics {
+        fn64_abi::GraphicsTaskExecutionPolicy::DiagnosticSkip
+    } else {
+        fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy
+    };
+    fn64_abi::set_render_backend_with_policy(render_backend, rdram.len(), graphics_policy);
+    let graphics_policy_label = if audio_validation_skip_graphics {
+        "diagnostic skip for audio isolation"
+    } else {
+        "LLE accuracy"
+    };
     println!(
-        "[oot-boot] registered {active_renderer} renderer (320x240), graphics ucode=LLE \
-         accuracy; reference/fallback auto-dumps honor \
+        "[oot-boot] registered {active_renderer} renderer (320x240), graphics ucode={graphics_policy_label}; reference/fallback auto-dumps honor \
          OOT_RENDER_DUMP_START={render_dump_start}"
     );
 
@@ -674,6 +696,10 @@ fn main() {
         // destination must resolve through the selected bank-qualified pack.
         fn64_recomp_rs::set_host_lookup(Some(host_only_lookup));
         let loaded = block_program_pack::load();
+        let boot_context_path = env_path("FN64_BOOT_CONTEXT");
+        let boot_context =
+            fn64_boot_harness::load_boot_context(&boot_context_path, &rom_bytes, tv_type)
+                .unwrap_or_else(|error| panic!("oot-boot: {error}"));
         let program_sha256: String = loaded
             .program
             .evidence_snapshot()
@@ -696,6 +722,7 @@ fn main() {
                 rdram.len(),
                 loaded.program,
                 loaded.entry,
+                boot_context,
                 block_program_pack::entry_lookup,
                 block_program_pack::transfer_lookup,
                 loaded.budget,

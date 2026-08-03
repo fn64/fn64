@@ -173,7 +173,7 @@ impl WordClass {
 
 /// A basic block: a maximal straight-line run ending at a control transfer
 /// (inclusive of its delay slot, when the instruction has one).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BasicBlock {
     pub start_va: u32,
     /// Exclusive end, i.e. one past the last word (delay slot included).
@@ -181,7 +181,7 @@ pub struct BasicBlock {
     pub terminator: BlockTerminator,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockTerminator {
     /// Falls through to the next instruction (word wasn't a control
     /// transfer at all -- only produced at bank end or before a
@@ -194,11 +194,19 @@ pub enum BlockTerminator {
     /// returns, and separately proves `target` as a callable root.
     Call { target: u32, next: u32 },
     /// Conditional branch: two successors, taken and fallthrough.
-    Branch { target: u32, fallthrough: u32 },
+    Branch {
+        target: u32,
+        fallthrough: u32,
+        link: bool,
+    },
     /// Branch-likely: same two successors, but the fallthrough edge does
     /// NOT execute the delay slot (annulment) -- recorded so callers don't
     /// treat the delay-slot word as unconditionally reached.
-    BranchLikely { target: u32, fallthrough: u32 },
+    BranchLikely {
+        target: u32,
+        fallthrough: u32,
+        link: bool,
+    },
     /// `jr $ra`: an ordinary return, terminates this path with no known
     /// successor.
     Return,
@@ -226,6 +234,14 @@ pub enum BlockTerminator {
     /// (machine-checked embedded read-only data). The block ends here
     /// with no successor; the fenced words are never decoded.
     DataFence { at: u32 },
+    /// A branch/branch-likely decoded mid-descent whose own computed target
+    /// is its own architectural delay slot. No compiler emits this -- a
+    /// branch into its own delay slot is UNPREDICTABLE on real MIPS
+    /// hardware -- so it is conclusive proof this word is data, not code
+    /// (observed: Rayman 2's `bltzal $fp, +0` inside a KSEG0-pointer/float
+    /// island). The block ends here undecoded rather than manufacturing the
+    /// self-referential edge.
+    SelfReferentialBranch { at: u32 },
 }
 
 /// One indirect control-transfer site the CFG could not resolve -- carried
@@ -234,6 +250,41 @@ pub enum BlockTerminator {
 pub struct IndirectSite {
     pub pc: u32,
     pub via_call: bool,
+}
+
+/// An independently reached ordinary instruction which is also the delay word
+/// of another control transfer. The predecessor block keeps the architectural
+/// control+delay pair; direct entry executes `entry_va` and then continues at
+/// `continuation_va`. Callability is separate authority established by exact
+/// call facts, not by this structural alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlainDelayEntryAlias {
+    pub entry_va: u32,
+    pub control_pc: u32,
+    pub continuation_va: u32,
+}
+
+/// An exact entry whose word is itself control-shaped. Executing it as the
+/// predecessor's delay word is architecturally unsupported. Authority
+/// consumers reject this metadata instead of deleting either overlapping
+/// interpretation; a broad candidate-only CFG may retain it diagnostically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsupportedDelayEntry {
+    pub entry_va: u32,
+    pub control_pc: u32,
+}
+
+/// A `j`/branch/branch-likely target descent refused to enqueue because the
+/// target's own word is not plausibly code (its architectural delay slot
+/// would immediately be control-shaped, e.g. Donald Duck's `j` into a run of
+/// `bgtzl`-decoding data). Recorded rather than silently dropped -- the same
+/// frontier discipline as [`IndirectSite`] and [`BlockTerminator::DataFence`]:
+/// a transfer into data is a real finding, not a no-op. `source_pc` is the
+/// control instruction that computed the rejected target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedTransferTarget {
+    pub source_pc: u32,
+    pub target: u32,
 }
 
 /// The full CFG for one bank: word classifications, basic blocks, and the
@@ -250,6 +301,14 @@ pub struct Cfg {
     pub direct_calls: Vec<(u32, u32)>,   // (source pc, target)
     pub tail_transfers: Vec<(u32, u32)>, // (source pc, target)
     pub indirect_sites: Vec<IndirectSite>,
+    #[serde(default)]
+    pub plain_delay_entry_aliases: Vec<PlainDelayEntryAlias>,
+    #[serde(default)]
+    pub unsupported_delay_entries: Vec<UnsupportedDelayEntry>,
+    /// `j`/branch/branch-likely targets descent refused to enter because the
+    /// target word is not plausibly code. See [`RejectedTransferTarget`].
+    #[serde(default)]
+    pub rejected_transfer_targets: Vec<RejectedTransferTarget>,
     /// Addresses that are proven callable roots because something reached
     /// them via `jal` or supplied them as an explicit seed root, in
     /// first-seen order. A plain `j` proves its target is code, but not that
@@ -262,6 +321,72 @@ pub struct Cfg {
 fn read_word(bank_bytes: &[u8], off: usize) -> Option<u32> {
     let b = bank_bytes.get(off..off + 4)?;
     Some(u32::from_be_bytes(b.try_into().unwrap()))
+}
+
+/// Whether a `j`/branch/branch-likely target is plausibly the start of real
+/// code, checked BEFORE descent enqueues it.
+///
+/// Two independent, machine-checkable signals of "this is data, not code":
+///
+/// 1. [`admissible_entry_word`](crate::sig_scan) rejects the same shapes it
+///    rejects for a signature-scan boundary -- stored KSEG0/KSEG1 pointers
+///    and VR4300-reserved primary opcodes. Shared with `sig_scan` rather
+///    than duplicated.
+/// 2. The target word decodes as a control transfer AND its own
+///    architecturally required delay slot (target + 4) ALSO decodes as a
+///    control transfer. Real compiled code never places a branch/jump in
+///    another instruction's delay slot -- it is UNPREDICTABLE on real MIPS
+///    hardware, so no toolchain emits it. High-density data (Donald Duck's
+///    `bgtzl`-decoding clamp table) decodes exactly this way: every word is
+///    branch-shaped, so each one's "delay slot" is next door's branch too.
+///    This is the same shape [`extract_plain_delay_entry_aliases`] catches
+///    reactively after a block is built; checking it here stops descent
+///    from ever manufacturing the block in the first place.
+///
+/// Deliberately conservative: an unreadable word (out of range) or a `Plain`
+/// target word admits by default. A false rejection silently drops reachable
+/// code, which is worse than the current loud composer failure this guard
+/// exists to prevent.
+fn transfer_target_is_plausible_code(bank_bytes: &[u8], va_start: u32, target: u32) -> bool {
+    let Some(off) = target.checked_sub(va_start).map(|off| off as usize) else {
+        return true;
+    };
+    let Some(word) = read_word(bank_bytes, off) else {
+        return true;
+    };
+    if !crate::sig_scan::admissible_entry_word(word) {
+        return false;
+    }
+    let is_transfer = !matches!(
+        classify_control(word),
+        ControlOp::Plain | ControlOp::Trap | ControlOp::Invalid { .. }
+    );
+    if !is_transfer {
+        return true;
+    }
+    let Some(delay_word) = read_word(bank_bytes, off + 4) else {
+        return true;
+    };
+    matches!(classify_control(delay_word), ControlOp::Plain)
+}
+
+/// Whether the architectural delay slot of the control instruction at `pc`
+/// decodes as an ordinary (non-control) instruction.
+///
+/// Used only to qualify the self-referential-branch check: a branch
+/// targeting its own delay slot is a real MIPS idiom (a spin loop, or a
+/// linking branch used as a get-PC-into-`$ra` trick) exactly when that delay
+/// word is ordinary code. An unreadable word admits by default, matching
+/// this module's general conservative-admission rule.
+fn delay_word_is_plain(bank_bytes: &[u8], va_start: u32, pc: u32) -> bool {
+    let delay_pc = pc.wrapping_add(4);
+    let Some(off) = delay_pc.checked_sub(va_start).map(|off| off as usize) else {
+        return true;
+    };
+    let Some(word) = read_word(bank_bytes, off) else {
+        return true;
+    };
+    matches!(classify_control(word), ControlOp::Plain)
 }
 
 /// Validate the architecturally required word after a control transfer.
@@ -340,8 +465,7 @@ pub fn detect_embedded_data(
         .chunks_exact(4)
         .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
         .collect();
-    let is_internal_ptr =
-        |word: u32| word.is_multiple_of(4) && word > va_start && word < code_end;
+    let is_internal_ptr = |word: u32| word.is_multiple_of(4) && word > va_start && word < code_end;
     let mut fences = BTreeSet::new();
     let mut run_start: Option<usize> = None;
     for index in 0..=words.len() {
@@ -370,7 +494,14 @@ pub fn build_cfg_with_indirect(
     roots: &[u32],
     exhaustive_indirect: &BTreeMap<u32, Vec<u32>>,
 ) -> Cfg {
-    build_cfg_fenced(bank, bank_bytes, va_start, roots, exhaustive_indirect, &BTreeSet::new())
+    build_cfg_fenced(
+        bank,
+        bank_bytes,
+        va_start,
+        roots,
+        exhaustive_indirect,
+        &BTreeSet::new(),
+    )
 }
 
 /// [`build_cfg_with_indirect`] plus a caller-supplied set of DATA FENCE
@@ -397,6 +528,7 @@ pub fn build_cfg_fenced(
     let mut direct_calls = Vec::new();
     let mut tail_transfers = Vec::new();
     let mut indirect_sites = Vec::new();
+    let mut rejected_transfer_targets: Vec<RejectedTransferTarget> = Vec::new();
     let mut proven_roots: Vec<u32> = Vec::new();
     let mut proven_roots_seen: BTreeSet<u32> = BTreeSet::new();
     let mut block_starts_visited: BTreeSet<u32> = BTreeSet::new();
@@ -537,8 +669,23 @@ pub fn build_cfg_fenced(
                     // the target now; partitioning will keep it with the
                     // caller unless independent evidence (`jal` or an
                     // explicit seed) proves the target is a real root.
+                    //
+                    // Unless the target word itself is not plausibly code --
+                    // a `j` landing in an embedded data island (Donald
+                    // Duck's clamp table) decodes as dense branch-shaped
+                    // garbage that manufactures an `UnsupportedDelayEntry`
+                    // downstream. The terminator still records `target` (the
+                    // transfer is a real, visible fact); only descent into
+                    // it is refused.
                     if in_range(target) {
-                        worklist.push_back(target);
+                        if transfer_target_is_plausible_code(bank_bytes, va_start, target) {
+                            worklist.push_back(target);
+                        } else {
+                            rejected_transfer_targets.push(RejectedTransferTarget {
+                                source_pc: pc,
+                                target,
+                            });
+                        }
                     }
                     blocks.push(BasicBlock {
                         start_va: block_start,
@@ -584,7 +731,7 @@ pub fn build_cfg_fenced(
                         .filter(|targets| !targets.is_empty())
                     {
                         for &target in targets {
-                            if in_range(target) && !is_delay_slot_va(bank_bytes, va_start, target) {
+                            if in_range(target) {
                                 worklist.push_back(target);
                             }
                         }
@@ -619,7 +766,7 @@ pub fn build_cfg_fenced(
                         .filter(|targets| !targets.is_empty())
                     {
                         for &target in targets {
-                            if in_range(target) && !is_delay_slot_va(bank_bytes, va_start, target) {
+                            if in_range(target) {
                                 worklist.push_back(target);
                                 if via_call && proven_roots_seen.insert(target) {
                                     proven_roots.push(target);
@@ -646,6 +793,31 @@ pub fn build_cfg_fenced(
                 }
                 ControlOp::Branch { target, link } => {
                     let target = branch_target(pc, target);
+                    // A branch whose own computed target is its own
+                    // architectural delay slot is a real, if unusual, MIPS
+                    // idiom -- `beq $zero, $zero, +0` is a documented spin
+                    // loop, and a linking self-target (`bltzal $x, +0`) is a
+                    // classic get-PC-into-$ra trick. Both are fine PROVIDED
+                    // the delay word is an ordinary instruction: descent
+                    // resolves that shape as a `PlainDelayEntryAlias`. What
+                    // is never legitimate is the delay word ALSO being
+                    // control-shaped -- no compiler emits a branch or jump
+                    // in another instruction's delay slot, so that shape is
+                    // conclusive proof this is data (Rayman 2's `bltzal
+                    // $fp, +0` inside a KSEG0-pointer/float island, whose
+                    // "delay slot" decodes as `jr $t9`). Peek at the delay
+                    // word before deciding, so the island can never reach
+                    // `extract_plain_delay_entry_aliases`'s `UnsupportedDelayEntry`
+                    // by manufacturing that same edge.
+                    if target == pc.wrapping_add(4) && !delay_word_is_plain(bank_bytes, va_start, pc)
+                    {
+                        blocks.push(BasicBlock {
+                            start_va: block_start,
+                            end_va: pc,
+                            terminator: BlockTerminator::SelfReferentialBranch { at: pc },
+                        });
+                        break;
+                    }
                     mark(&mut word_class, pc, WordClass::ProvenCode);
                     let delay_pc = valid_delay!();
                     // Ordinary branch: delay slot always executes (both
@@ -653,12 +825,24 @@ pub fn build_cfg_fenced(
                     // unconditionally proven code.
                     let fallthrough = delay_pc.wrapping_add(4);
                     if in_range(target) {
-                        worklist.push_back(target);
-                        if link && proven_roots_seen.insert(target) {
-                            proven_roots.push(target);
+                        if transfer_target_is_plausible_code(bank_bytes, va_start, target) {
+                            worklist.push_back(target);
+                            if link {
+                                direct_calls.push((pc, target));
+                                if proven_roots_seen.insert(target) {
+                                    proven_roots.push(target);
+                                }
+                            }
+                        } else {
+                            rejected_transfer_targets.push(RejectedTransferTarget {
+                                source_pc: pc,
+                                target,
+                            });
                         }
-                    }
-                    if link {
+                    } else if link {
+                        // Out-of-range link target: not this guard's
+                        // concern, keep the historical behavior of
+                        // recording the call fact regardless of range.
                         direct_calls.push((pc, target));
                     }
                     if in_range(fallthrough) {
@@ -670,12 +854,26 @@ pub fn build_cfg_fenced(
                         terminator: BlockTerminator::Branch {
                             target,
                             fallthrough,
+                            link,
                         },
                     });
                     break;
                 }
                 ControlOp::BranchLikely { target, link } => {
                     let target = branch_target(pc, target);
+                    // Same self-referential-target guard as `Branch`: a
+                    // self-targeting branch is fine when its delay word is
+                    // ordinary code, and only conclusive proof of data when
+                    // that word is ALSO control-shaped.
+                    if target == pc.wrapping_add(4) && !delay_word_is_plain(bank_bytes, va_start, pc)
+                    {
+                        blocks.push(BasicBlock {
+                            start_va: block_start,
+                            end_va: pc,
+                            terminator: BlockTerminator::SelfReferentialBranch { at: pc },
+                        });
+                        break;
+                    }
                     mark(&mut word_class, pc, WordClass::ProvenCode);
                     let delay_pc = valid_delay!();
                     // Branch-likely annulment: the delay slot only executes
@@ -687,12 +885,21 @@ pub fn build_cfg_fenced(
                     // implies "always executes".
                     let fallthrough = delay_pc.wrapping_add(4);
                     if in_range(target) {
-                        worklist.push_back(target);
-                        if link && proven_roots_seen.insert(target) {
-                            proven_roots.push(target);
+                        if transfer_target_is_plausible_code(bank_bytes, va_start, target) {
+                            worklist.push_back(target);
+                            if link {
+                                direct_calls.push((pc, target));
+                                if proven_roots_seen.insert(target) {
+                                    proven_roots.push(target);
+                                }
+                            }
+                        } else {
+                            rejected_transfer_targets.push(RejectedTransferTarget {
+                                source_pc: pc,
+                                target,
+                            });
                         }
-                    }
-                    if link {
+                    } else if link {
                         direct_calls.push((pc, target));
                     }
                     if in_range(fallthrough) {
@@ -704,6 +911,7 @@ pub fn build_cfg_fenced(
                         terminator: BlockTerminator::BranchLikely {
                             target,
                             fallthrough,
+                            link,
                         },
                     });
                     break;
@@ -712,7 +920,55 @@ pub fn build_cfg_fenced(
         }
     }
 
-    canonicalize_blocks(&mut blocks);
+    let (plain_delay_entry_aliases, unsupported_delay_entries) =
+        extract_plain_delay_entry_aliases(&mut blocks, bank_bytes, va_start);
+    canonicalize_blocks(
+        &mut blocks,
+        &unsupported_delay_entries
+            .iter()
+            .map(|entry| entry.entry_va)
+            .collect(),
+    );
+    direct_calls.clear();
+    tail_transfers.clear();
+    indirect_sites.clear();
+    for block in &blocks {
+        let control_pc = block.end_va.checked_sub(8);
+        match &block.terminator {
+            BlockTerminator::Call { target, .. } => {
+                direct_calls.push((control_pc.expect("call block contains delay pair"), *target));
+            }
+            BlockTerminator::Tail { target } => {
+                tail_transfers.push((control_pc.expect("tail block contains delay pair"), *target));
+            }
+            BlockTerminator::Branch {
+                target, link: true, ..
+            }
+            | BlockTerminator::BranchLikely {
+                target, link: true, ..
+            } => {
+                direct_calls.push((
+                    control_pc.expect("link-branch block contains delay pair"),
+                    *target,
+                ));
+            }
+            BlockTerminator::Indirect { via_call } => {
+                indirect_sites.push(IndirectSite {
+                    pc: control_pc.expect("indirect block contains delay pair"),
+                    via_call: *via_call,
+                });
+            }
+            _ => {}
+        }
+    }
+    direct_calls.sort_unstable();
+    direct_calls.dedup();
+    tail_transfers.sort_unstable();
+    tail_transfers.dedup();
+    indirect_sites.sort_by_key(|site| (site.pc, site.via_call));
+    indirect_sites.dedup_by_key(|site| (site.pc, site.via_call));
+    rejected_transfer_targets.sort_by_key(|rejection| (rejection.source_pc, rejection.target));
+    rejected_transfer_targets.dedup();
 
     Cfg {
         bank: bank.to_string(),
@@ -721,24 +977,86 @@ pub fn build_cfg_fenced(
         direct_calls,
         tail_transfers,
         indirect_sites,
+        plain_delay_entry_aliases,
+        unsupported_delay_entries,
+        rejected_transfer_targets,
         proven_roots,
     }
 }
 
-/// A VA is a *delay slot* iff the word immediately before it is a control
-/// instruction that carries one. A control transfer and its delay slot are one
-/// architecturally inseparable unit — hardware cannot branch INTO a delay slot
-/// — so any discovered "target"/leader landing on a delay-slot VA is a CFG
-/// over-approximation (e.g. a computed-jump target set that swept up a
-/// delay-slot address). Admitting it as a block start severs the branch from
-/// its delay slot into two blocks, which the sparse runner emitter (correctly)
-/// rejects — the `boot:0x800f8e90` whole-ROM-recompile blocker. Callers filter
-/// such targets at enqueue time so the pair always stays in one block.
-fn is_delay_slot_va(bank_bytes: &[u8], va_start: u32, va: u32) -> bool {
-    va.checked_sub(4)
-        .and_then(|prev_va| prev_va.checked_sub(va_start))
-        .and_then(|off| read_word(bank_bytes, off as usize))
-        .is_some_and(|word| decode(word).has_delay_slot())
+fn extract_plain_delay_entry_aliases(
+    blocks: &mut Vec<BasicBlock>,
+    bank_bytes: &[u8],
+    va_start: u32,
+) -> (Vec<PlainDelayEntryAlias>, Vec<UnsupportedDelayEntry>) {
+    let mut aliases = Vec::new();
+    let mut unsupported = Vec::new();
+    let entry_candidates = blocks
+        .iter()
+        .map(|block| block.start_va)
+        .collect::<BTreeSet<_>>();
+    for entry_va in entry_candidates {
+        let Some(control_pc) = entry_va.checked_sub(4) else {
+            continue;
+        };
+        let Some(continuation_va) = entry_va.checked_add(4) else {
+            continue;
+        };
+        let plain = entry_va
+            .checked_sub(va_start)
+            .and_then(|off| read_word(bank_bytes, off as usize))
+            .is_some_and(|word| matches!(classify_control(word), ControlOp::Plain));
+        let predecessor_reached = blocks.iter().any(|block| {
+            block.end_va == continuation_va
+                && block.start_va <= control_pc
+                && matches!(
+                    block.terminator,
+                    BlockTerminator::Tail { .. }
+                        | BlockTerminator::Call { .. }
+                        | BlockTerminator::Return
+                        | BlockTerminator::Indirect { .. }
+                        | BlockTerminator::ResolvedIndirect { .. }
+                        | BlockTerminator::Branch { .. }
+                        | BlockTerminator::BranchLikely { .. }
+                )
+        });
+        let Some(alias_index) = blocks.iter().position(|block| block.start_va == entry_va) else {
+            continue;
+        };
+        if !predecessor_reached {
+            continue;
+        }
+
+        if !plain {
+            unsupported.push(UnsupportedDelayEntry {
+                entry_va,
+                control_pc,
+            });
+            continue;
+        }
+        if blocks
+            .iter()
+            .enumerate()
+            .any(|(index, block)| index != alias_index && block.start_va == continuation_va)
+        {
+            blocks.remove(alias_index);
+        } else if blocks[alias_index].end_va > continuation_va {
+            blocks[alias_index].start_va = continuation_va;
+        } else {
+            blocks.remove(alias_index);
+        }
+        aliases.push(PlainDelayEntryAlias {
+            entry_va,
+            control_pc,
+            continuation_va,
+        });
+    }
+    blocks.sort_by_key(|block| block.start_va);
+    aliases.sort_by_key(|alias| alias.entry_va);
+    aliases.dedup_by_key(|alias| alias.entry_va);
+    unsupported.sort_by_key(|entry| entry.entry_va);
+    unsupported.dedup_by_key(|entry| entry.entry_va);
+    (aliases, unsupported)
 }
 
 /// Recursive descent can discover a branch target after an earlier scan has
@@ -746,14 +1064,13 @@ fn is_delay_slot_va(bank_bytes: &[u8], va_start: u32, va: u32) -> bool {
 /// a mandatory leader: truncate any earlier overlapping span into an ordinary
 /// fallthrough prefix. The later block retains the real terminator, producing
 /// a disjoint canonical graph without re-decoding or inventing an edge.
-fn canonicalize_blocks(blocks: &mut [BasicBlock]) {
+fn canonicalize_blocks(blocks: &mut [BasicBlock], retained_overlaps: &BTreeSet<u32>) {
     blocks.sort_by_key(|block| block.start_va);
     let starts: Vec<u32> = blocks.iter().map(|block| block.start_va).collect();
     for block in blocks.iter_mut() {
-        if let Some(&leader) = starts
-            .iter()
-            .find(|&&start| start > block.start_va && start < block.end_va)
-        {
+        if let Some(&leader) = starts.iter().find(|&&start| {
+            start > block.start_va && start < block.end_va && !retained_overlaps.contains(&start)
+        }) {
             block.end_va = leader;
             block.terminator = BlockTerminator::Fallthrough { next: leader };
         }
@@ -769,6 +1086,146 @@ mod tests {
     }
 
     const NOP: u32 = 0x0000_0000; // sll $zero, $zero, 0
+
+    fn jal(target: u32) -> u32 {
+        0x0c00_0000 | (target >> 2 & 0x03ff_ffff)
+    }
+
+    #[test]
+    fn exact_call_to_plain_delay_word_preserves_predecessor_pair() {
+        let base = 0x8000_0000;
+        let predecessor = base + 16;
+        let delay_entry = predecessor + 4;
+        let bytes = asm(&[
+            jal(delay_entry),
+            NOP,
+            0x03e0_0008,
+            NOP,
+            0x1000_0001,
+            NOP,
+            0x03e0_0008,
+            NOP,
+        ]);
+
+        let cfg = build_cfg("bank", &bytes, base, &[base, predecessor]);
+
+        assert_eq!(
+            cfg.plain_delay_entry_aliases,
+            vec![PlainDelayEntryAlias {
+                entry_va: delay_entry,
+                control_pc: predecessor,
+                continuation_va: delay_entry + 4,
+            }]
+        );
+        assert!(cfg.proven_roots.contains(&delay_entry));
+        assert!(!cfg.blocks.iter().any(|block| block.start_va == delay_entry));
+        assert!(cfg.blocks.iter().any(|block| {
+            block.start_va == predecessor
+                && block.end_va == delay_entry + 4
+                && matches!(block.terminator, BlockTerminator::Branch { .. })
+        }));
+    }
+
+    #[test]
+    fn exhaustive_jalr_to_plain_delay_word_uses_same_alias() {
+        let base = 0x8000_0000;
+        let predecessor = base + 16;
+        let delay_entry = predecessor + 4;
+        let jalr_ra_t9 = (25u32 << 21) | (31u32 << 11) | 0x09;
+        let bytes = asm(&[
+            jalr_ra_t9,
+            NOP,
+            0x03e0_0008,
+            NOP,
+            0x1000_0001,
+            NOP,
+            0x03e0_0008,
+            NOP,
+        ]);
+        let exhaustive = BTreeMap::from([(base, vec![delay_entry])]);
+
+        let cfg = build_cfg_with_indirect("bank", &bytes, base, &[base, predecessor], &exhaustive);
+
+        assert!(cfg.proven_roots.contains(&delay_entry));
+        assert_eq!(cfg.plain_delay_entry_aliases[0].entry_va, delay_entry);
+        assert!(!cfg.blocks.iter().any(|block| block.start_va == delay_entry));
+    }
+
+    #[test]
+    fn exact_noncall_transfers_to_plain_delay_word_are_transfer_only_aliases() {
+        let base = 0x8000_0000;
+        let predecessor = base + 16;
+        let delay_entry = predecessor + 4;
+        let jump = 0x0800_0000 | (delay_entry >> 2 & 0x03ff_ffff);
+        let jr_t9 = (25u32 << 21) | 0x08;
+        for (transfer, exhaustive) in [
+            (jump, BTreeMap::new()),
+            (jr_t9, BTreeMap::from([(base, vec![delay_entry])])),
+        ] {
+            let bytes = asm(&[
+                transfer,
+                NOP,
+                0x03e0_0008,
+                NOP,
+                0x1000_0001,
+                NOP,
+                0x03e0_0008,
+                NOP,
+            ]);
+            let cfg =
+                build_cfg_with_indirect("bank", &bytes, base, &[base, predecessor], &exhaustive);
+            assert!(cfg
+                .plain_delay_entry_aliases
+                .iter()
+                .any(|alias| { alias.entry_va == delay_entry && alias.control_pc == predecessor }));
+            assert!(!cfg.proven_roots.contains(&delay_entry));
+            assert!(!cfg.blocks.iter().any(|block| block.start_va == delay_entry));
+            assert!(cfg
+                .blocks
+                .iter()
+                .any(|block| { block.start_va == predecessor && block.end_va == delay_entry + 4 }));
+        }
+    }
+
+    #[test]
+    fn control_shaped_delay_entry_is_retained_as_an_explicit_blocker() {
+        let base = 0x8000_0000;
+        let bytes = asm(&[0x03e0_0008, 0x03e0_0008, NOP]);
+        let cfg = build_cfg("bank", &bytes, base, &[base, base + 4]);
+
+        assert!(cfg.plain_delay_entry_aliases.is_empty());
+        assert_eq!(
+            cfg.unsupported_delay_entries,
+            vec![UnsupportedDelayEntry {
+                entry_va: base + 4,
+                control_pc: base,
+            }]
+        );
+        assert!(cfg.blocks.iter().any(|block| {
+            block.start_va == base
+                && block.end_va == base + 8
+                && matches!(block.terminator, BlockTerminator::Return)
+        }));
+        assert!(cfg.blocks.iter().any(|block| block.start_va == base + 4));
+    }
+
+    #[test]
+    fn cfg_old_json_defaults_delay_entry_metadata() {
+        let cfg = build_cfg(
+            "bank",
+            &asm(&[0x03e0_0008, NOP]),
+            0x8000_0000,
+            &[0x8000_0000],
+        );
+        let mut value = serde_json::to_value(cfg).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("plain_delay_entry_aliases");
+        object.remove("unsupported_delay_entries");
+
+        let decoded: Cfg = serde_json::from_value(value).unwrap();
+        assert!(decoded.plain_delay_entry_aliases.is_empty());
+        assert!(decoded.unsupported_delay_entries.is_empty());
+    }
 
     #[test]
     fn detect_embedded_data_finds_pointer_table_not_code() {
@@ -825,6 +1282,133 @@ mod tests {
             unfenced.word_class.get(&0x8000_000c),
             Some(&WordClass::ProvenCode)
         );
+    }
+
+    #[test]
+    fn j_into_repeated_data_word_is_not_descended_into() {
+        // Donald Duck (Goin' Quackers): real code at 0x800b03cc is `j
+        // 0x800b9f74`, landing in a clamp/ramp table of repeated
+        // 0x5c5c5c5c words. That word decodes as `bgtzl` (opcode 0x17), and
+        // so does the next word -- a control instruction whose delay slot
+        // is itself control-shaped, the exact shape that manufactures an
+        // `UnsupportedDelayEntry` if descended into. The target word is not
+        // plausibly code, so the `j` must not enqueue it.
+        const DATA_WORD: u32 = 0x5c5c_5c5c;
+        let base = 0x8000_0000u32;
+        let target = base + 0x20;
+        let j_word = 0x0800_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut words = vec![j_word, NOP]; // j target ; delay slot
+        words.resize(8, NOP);
+        words.extend(std::iter::repeat_n(DATA_WORD, 8));
+        let bytes = asm(&words);
+
+        let cfg = build_cfg("boot", &bytes, base, &[base]);
+
+        assert_eq!(cfg.tail_transfers, vec![(base, target)]);
+        assert_eq!(
+            cfg.rejected_transfer_targets,
+            vec![RejectedTransferTarget {
+                source_pc: base,
+                target,
+            }]
+        );
+        // Descent never entered the data island: none of its words were
+        // classified as code, and no block starts there.
+        assert!(!cfg.word_class.contains_key(&target));
+        assert!(!cfg.blocks.iter().any(|block| block.start_va == target));
+    }
+
+    #[test]
+    fn j_into_genuine_code_is_still_descended_into() {
+        // Same shape as `j_into_repeated_data_word_is_not_descended_into`,
+        // but the target is an ordinary leaf function (addiu sp; jr ra;
+        // nop). Descent must still enter it: the guard is conservative and
+        // must not cost real reachable code.
+        let base = 0x8000_0000u32;
+        let target = base + 0x20;
+        let j_word = 0x0800_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut words = vec![j_word, NOP];
+        words.resize(8, NOP);
+        words.extend([0x27bd_ffe8, 0x03e0_0008, NOP]); // addiu sp; jr ra; nop
+
+        let bytes = asm(&words);
+        let cfg = build_cfg("boot", &bytes, base, &[base]);
+
+        assert_eq!(cfg.tail_transfers, vec![(base, target)]);
+        assert!(cfg.rejected_transfer_targets.is_empty());
+        assert_eq!(cfg.word_class[&target], WordClass::ProvenCode);
+        assert!(cfg.blocks.iter().any(|block| {
+            block.start_va == target && matches!(block.terminator, BlockTerminator::Return)
+        }));
+    }
+
+    #[test]
+    fn branch_targeting_its_own_delay_slot_is_rejected_as_data() {
+        // Rayman 2: a `j` lands on a `nop` inside a KSEG0-pointer/float
+        // data island -- ambiguous on its own (a leading nop also opens
+        // real functions) -- but straight-line descent from that nop hits
+        // `bltzal $fp, +0`, whose computed branch target is its own
+        // architectural delay slot, which in turn decodes as `jr $t9`
+        // (control-shaped, not an ordinary instruction). No compiler places
+        // a branch in another instruction's delay slot; that combination is
+        // conclusive proof of data. Descent must stop there rather than
+        // manufacturing the self-referential edge (the exact geometry that
+        // crashed the composer before this fix: 0x800be420/0x800be424).
+        let jr_t9 = (25u32 << 21) | 0x08; // jr $t9
+        let base = 0x8000_0000u32;
+        let target = base + 0x20;
+        let j_word = 0x0800_0000 | ((target >> 2) & 0x03ff_ffff);
+        let mut words = vec![j_word, NOP];
+        words.resize(8, NOP);
+        words.push(NOP); // the `j` target: a nop, ambiguous on its own
+        words.push(0x07d0_0000); // bltzal $fp, +0 -- targets its own delay slot
+        words.push(jr_t9); // that delay slot: control-shaped, not ordinary
+
+        let bytes = asm(&words);
+        let cfg = build_cfg("boot", &bytes, base, &[base]);
+
+        // Straight-line descent from the `j` target (the leading nop) walks
+        // into the branch within the SAME block -- it ends that block right
+        // before the bogus branch, one word long (just the nop), the same
+        // shape as a `DataFence` reached mid-run.
+        let branch_pc = target + 4;
+        let block = cfg
+            .blocks
+            .iter()
+            .find(|block| block.start_va == target)
+            .expect("descent enters the nop-opened block");
+        assert_eq!(block.end_va, branch_pc);
+        assert_eq!(
+            block.terminator,
+            BlockTerminator::SelfReferentialBranch { at: branch_pc }
+        );
+        // Neither the branch word nor its would-be delay slot is ever
+        // classified as code.
+        assert!(!cfg.word_class.contains_key(&branch_pc));
+        assert!(!cfg.word_class.contains_key(&(branch_pc + 4)));
+    }
+
+    #[test]
+    fn branch_targeting_its_own_plain_delay_slot_is_a_legitimate_idiom() {
+        // `beq $zero, $zero, +0` is a documented MIPS spin-loop idiom: its
+        // computed target IS its own delay slot, same as the data shape
+        // above, but the delay word is ordinary code (a nop here). This
+        // must NOT be rejected -- the self-reference alone is not proof of
+        // data, only a self-reference onto a control-shaped word is. The
+        // existing `plain_delay_entry_aliases` machinery is what actually
+        // resolves this shape.
+        let beq_self = 0x1000_0000u32; // beq $zero, $zero, +0
+        let base = 0x8000_0000u32;
+        let bytes = asm(&[beq_self, NOP, NOP]);
+
+        let cfg = build_cfg("boot", &bytes, base, &[base]);
+
+        assert!(!cfg
+            .blocks
+            .iter()
+            .any(|block| matches!(block.terminator, BlockTerminator::SelfReferentialBranch { .. })));
+        assert_eq!(cfg.plain_delay_entry_aliases.len(), 1);
+        assert_eq!(cfg.plain_delay_entry_aliases[0].entry_va, base + 4);
     }
 
     #[test]
@@ -923,7 +1507,27 @@ mod tests {
             cfg.blocks[0].terminator,
             BlockTerminator::Branch {
                 target: 0x8000_0010,
-                fallthrough: 0x8000_0008
+                fallthrough: 0x8000_0008,
+                link: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn canonical_leader_rebuilds_transfer_denominators_from_final_blocks() {
+        let jal = 0x0c00_0005u32; // jal 0x80000014
+        let bytes = asm(&[NOP, NOP, jal, NOP, NOP, 0x03e0_0008, NOP]);
+        let cfg = build_cfg("boot", &bytes, 0x8000_0000, &[0x8000_0000, 0x8000_0008]);
+        assert_eq!(cfg.direct_calls, vec![(0x8000_0008, 0x8000_0014)]);
+        assert!(matches!(
+            cfg.blocks[0].terminator,
+            BlockTerminator::Fallthrough { next: 0x8000_0008 }
+        ));
+        assert!(matches!(
+            cfg.blocks[1].terminator,
+            BlockTerminator::Call {
+                target: 0x8000_0014,
+                next: 0x8000_0010
             }
         ));
     }
@@ -987,9 +1591,11 @@ mod tests {
             BlockTerminator::Branch {
                 target,
                 fallthrough,
+                link,
             } => {
                 assert_eq!(*fallthrough, 0x8000_0008);
                 assert_eq!(*target, 0x8000_000c); // pc+4 + (2<<2) = 0+4+8 = 0xc
+                assert!(!link);
             }
             other => panic!("expected Branch, got {other:?}"),
         }
@@ -1041,15 +1647,13 @@ mod tests {
     #[test]
     fn indirect_target_on_a_delay_slot_does_not_sever_the_branch_delay_pair() {
         // Regression for the boot:0x800f8e90 whole-ROM-recompile blocker. A
-        // computed-jump (jr) resolver over-approximated its target set to
-        // include a delay-slot VA. Admitting that as a block start severs the
-        // branch from its delay slot into two blocks, which the sparse runner
-        // emitter (correctly) rejects. A real target can never be a delay slot
-        // (hardware can't branch into one), so the resolver's delay-slot target
-        // is filtered at enqueue and the pair stays in one block.
+        // computed-jump (jr) target set includes a delay-slot VA. Making that
+        // VA an ordinary leader severs the branch from its delay slot, which
+        // the sparse emitter correctly rejects. The target instead becomes a
+        // transfer-only alias while the predecessor pair stays in one block.
         //
         // Layout: 0x08 is a branch whose delay slot is 0x0C. A jr at 0x14 has an
-        // exhaustive-indirect target set that (over-approximately) includes 0x0C.
+        // exhaustive-indirect target set that includes 0x0C.
         let beq_fwd = 0x1000_0001u32; // beq $0,$0,+1
         let jr_t9 = 0x0320_0008u32; // jr $t9 (computed jump, not $ra)
         let bytes = asm(&[
@@ -1062,16 +1666,19 @@ mod tests {
             NOP,     // 0x18 (ds of 0x14)
             NOP,     // 0x1C
         ]);
-        // The jr at 0x14 resolves (over-approximately) to {0x10, 0x0C}. 0x0C is
-        // the delay slot of the branch at 0x08 and must NOT become a block start.
-        let indirect =
-            BTreeMap::from([(0x8000_0014u32, vec![0x8000_0010u32, 0x8000_000Cu32])]);
+        // The jr at 0x14 resolves to {0x10, 0x0C}. 0x0C is the delay slot of
+        // the branch at 0x08 and must NOT become a block start.
+        let indirect = BTreeMap::from([(0x8000_0014u32, vec![0x8000_0010u32, 0x8000_000Cu32])]);
         let cfg = build_cfg_with_indirect("boot", &bytes, 0x8000_0000, &[0x8000_0000], &indirect);
         assert!(
             cfg.blocks.iter().all(|b| b.start_va != 0x8000_000C),
             "an indirect target landing on a delay slot (0x0C) was admitted as a block start, \
              severing the branch/delay pair at 0x08"
         );
+        assert!(cfg
+            .plain_delay_entry_aliases
+            .iter()
+            .any(|alias| { alias.entry_va == 0x8000_000C && alias.control_pc == 0x8000_0008 }));
         for block in &cfg.blocks {
             assert_ne!(
                 block.end_va, 0x8000_000C,

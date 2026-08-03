@@ -446,7 +446,10 @@ mod tests {
             // Raw MMIO path (write DPC_STATUS directly).
             crate::load_rom_with_fixed_pi_latency(vec![0; 0x100], 1);
             seed_live_dpc_counters();
-            assert!(crate::pi::write_raw_mmio_word(0xFFFF_FFFF_A410_000C, command));
+            assert!(crate::pi::write_raw_mmio_word(
+                0xFFFF_FFFF_A410_000C,
+                command
+            ));
             let via_raw = live_dpc_counters();
             assert_eq!(
                 via_raw, via_shim,

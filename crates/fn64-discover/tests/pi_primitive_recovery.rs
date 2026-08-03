@@ -50,6 +50,11 @@ fn the_pi_primitive_is_located_without_any_table() {
             "{name}: strongest candidate has only {} PI access(es)",
             best.register_sites
         );
+        assert_eq!(best.register_sites as usize, best.register_site_pcs.len());
+        assert!(best
+            .register_site_pcs
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
         assert!(
             best.entry_va >= va_start,
             "{name}: entry 0x{:08x} precedes the image base 0x{va_start:08x}",

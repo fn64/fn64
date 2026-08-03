@@ -4,8 +4,9 @@
 //! The full-game gate (DISCOVER-PLAN, UNIVERSAL-RUNTIME-PLAN) is "zero
 //! `unsupported` execution destinations." This gate is the SCOREBOARD that
 //! measures that number. For each supplied ROM it runs the real discovery
-//! pipeline, composes every proven physically-resident bank through Phase 4-6
-//! closure + owner/block proof (reusing [`snapshot::compose_materialized_banks_v1`],
+//! pipeline, composes every proven bank through Phase 4-6
+//! closure + owner/block proof (reusing the opaque-authority
+//! `snapshot::compose_materialized_banks_validated_v2`,
 //! not reimplementing anything), then classifies every reachable CPU transfer
 //! destination as `exact_aot` / `block_aot` / `dynamic_mips` / `unsupported`
 //! and reports the counts. The headline `unsupported` count is the number that
@@ -28,26 +29,38 @@
 //!   FN64_DISCOVER_NW4E_ROM  [FN64_DISCOVER_NW4E_DUMP]
 //!   FN64_DISCOVER_NWXE_ROM  [FN64_DISCOVER_NWXE_DUMP]
 //!   FN64_DISCOVER_OOT_ROM   [FN64_DISCOVER_OOT_DUMP]
+//!   FN64_CLOSURE_AUDIT_DIR   optional address/edge artifact output directory
+//!
+//! This historical classifier intentionally consults only proven ROM mapping
+//! geometry. Its current edge denominator comes from `closure`'s one typed
+//! successor enumerator, including continuations and fallthroughs. The
+//! canonical WM source-frontier path uses `transfer_scan` with opaque
+//! catalog-total resolver evidence instead; that path recognizes exact host
+//! boundaries and catalog-guarded vectors before declaring an edge open.
 
 use fn64_discover::banks::{self, BankNamePattern};
+use fn64_discover::block_pack::{
+    emit_block_program_source_with_facts, emit_validated_block_pack_v2,
+    materialize_block_pack_with_facts, BlockPackV1, BlockProgramSourceConfig,
+};
 use fn64_discover::closure::{
     classified_destinations, scoreboard, ClosureScoreboard, DestinationClass,
 };
+use fn64_discover::closure_audit::{write_closure_audit_v3, CLOSURE_AUDIT_SCHEMA_V3};
 use fn64_discover::delta_vote::DeltaVoteConfig;
-use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
 use fn64_discover::overlay_regions::SearchConfig;
-use fn64_discover::block_pack::{
-    emit_block_pack_v1, emit_block_program_source_with_facts, materialize_block_pack_with_facts,
-    BlockPackV1, BlockProgramSourceConfig,
+use fn64_discover::snapshot::{
+    compose_materialized_banks_validated_v2, ValidatedComposedSnapshotsV2,
 };
-use fn64_discover::snapshot::{compose_materialized_banks_v1, MaterializedBankInput};
+use fn64_discover::snapshot_inputs::{prepare_snapshot_banks, PreparedSnapshotBank};
 use fn64_discover::{
-    aki_reference, run_discovery, run_discovery_with_recovered_vrom_and_request_dma,
-    run_discovery_with_recovered_overlay_regions, DescriptorTableInput, Fact, FactDb,
-    NormalizedRom, RecoveredOverlayInput, RecoveredVromOverlayInput, RomAddressSpace,
+    aki_reference, run_discovery, run_discovery_with_recovered_overlay_regions,
+    run_discovery_with_recovered_vrom_and_request_dma, DescriptorTableInput, FactDb, NormalizedRom,
+    RecoveredOverlayInput, RecoveredVromOverlayInput,
 };
 use serde::Deserialize;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 const NW4E_ROM_VAR: &str = "FN64_DISCOVER_NW4E_ROM";
 const NW4E_DUMP_VAR: &str = "FN64_DISCOVER_NW4E_DUMP";
@@ -56,6 +69,7 @@ const NWXE_DUMP_VAR: &str = "FN64_DISCOVER_NWXE_DUMP";
 const OOT_ROM_VAR: &str = "FN64_DISCOVER_OOT_ROM";
 const OOT_DUMP_VAR: &str = "FN64_DISCOVER_OOT_DUMP";
 const EMIT_BLOCK_PROGRAM_VAR: &str = "FN64_EMIT_BLOCK_PROGRAM";
+const CLOSURE_AUDIT_DIR_VAR: &str = "FN64_CLOSURE_AUDIT_DIR";
 
 /// Which discovery composition a ROM uses. All three reuse the crate's own
 /// `run_discovery*` entry points; none reimplements discovery.
@@ -79,16 +93,6 @@ struct RomSpec {
     rom_var: &'static str,
     dump_var: &'static str,
     discovery: fn() -> Discovery,
-}
-
-/// One proven physically-resident bank the composer can materialize.
-struct PhysicalBank {
-    bank: String,
-    rom_space: RomAddressSpace,
-    rom_start: u32,
-    rom_end: u32,
-    va_start: u32,
-    va_end: u32,
 }
 
 fn main() {
@@ -154,59 +158,37 @@ fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
     let rom_bytes = std::fs::read(path).map_err(|error| format!("reading {path}: {error}"))?;
     let (rom, facts) = discover(&rom_bytes, (spec.discovery)())?;
 
-    let physical = physical_banks(&facts)?;
-    if physical.is_empty() {
-        return Err("no proven physically-resident bank to compose".to_string());
-    }
+    let prepared = prepare_snapshot_banks(&rom, &facts)
+        .map_err(|error| format!("preparing banks: {error}"))?;
+    let inputs = prepared.materialized_inputs();
 
-    // Materialize every physical bank's bytes and roots; `MaterializedBankInput`
-    // borrows both, so they must outlive the composition call. Banks are
-    // composed together so cross-bank direct-call authority is available.
-    let mut bank_bytes: Vec<Vec<u8>> = Vec::with_capacity(physical.len());
-    let mut bank_roots: Vec<Vec<u32>> = Vec::with_capacity(physical.len());
-    for bank in &physical {
-        // Resolve through the shared range materializer: a physically-resident
-        // bank slices the image, while a VROM (DMA-loaded, possibly compressed)
-        // overlay resolves through its one proven file-table record.
-        let materialized = banks::materialize_rom_range(
-            &rom,
-            &facts,
-            bank.rom_space,
-            bank.rom_start,
-            bank.rom_end,
-        )
-        .map_err(|error| {
-            format!(
-                "{} ROM interval [0x{:x},0x{:x}): {error}",
-                bank.bank, bank.rom_start, bank.rom_end
-            )
-        })?;
-        bank_bytes.push(materialized.bytes);
-        bank_roots.push(callable_roots(&facts, bank));
-    }
-
-    let inputs: Vec<MaterializedBankInput> = physical
-        .iter()
-        .enumerate()
-        .map(|(index, bank)| MaterializedBankInput {
-            bank: &bank.bank,
-            va_start: bank.va_start,
-            bytes: &bank_bytes[index],
-            seed_roots: &bank_roots[index],
-        })
-        .collect();
-
-    let snapshots = compose_materialized_banks_v1(&rom, &facts, &inputs)
+    let validated_snapshots = compose_materialized_banks_validated_v2(&rom, &facts, &inputs)
         .map_err(|error| format!("composing banks: {error}"))?;
+    let snapshots = validated_snapshots.snapshots();
 
     // Opt-in: emit the composed program as a compilable BlockProgram source
     // module. This is measurement, not part of the scoreboard, so it never
     // changes the classification below.
     if let Some(out) = std::env::var_os(EMIT_BLOCK_PROGRAM_VAR) {
-        emit_block_program(spec.label, &rom, &facts, &snapshots, &out.to_string_lossy())?;
+        emit_block_program(
+            spec.label,
+            &rom,
+            &facts,
+            &validated_snapshots,
+            &out.to_string_lossy(),
+        )?;
     }
 
-    let board = scoreboard(&snapshots);
+    let board = scoreboard(snapshots);
+
+    if let Some(audit_dir) = std::env::var_os(CLOSURE_AUDIT_DIR_VAR) {
+        let (filename, sha256) =
+            write_closure_audit_v3(spec.label, &rom, snapshots, Path::new(&audit_dir))?;
+        println!(
+            "  closure_audit schema={} unsupported={} sha256={} file={}",
+            CLOSURE_AUDIT_SCHEMA_V3, board.unsupported, sha256, filename
+        );
+    }
 
     // Held-out grading boundary: every discovery, composition, proof, and
     // classification pass above is COMPLETE. Nothing parsed from the dump below
@@ -219,11 +201,18 @@ fn score_rom(spec: &RomSpec, path: &str) -> Result<(), String> {
             let dump_path = dump_path.to_string_lossy().into_owned();
             let dump_text = std::fs::read_to_string(&dump_path)
                 .map_err(|error| format!("reading {dump_path}: {error}"))?;
-            Some(grade_against_dump(&snapshots, &dump_text)?)
+            Some(grade_against_dump(snapshots, &dump_text)?)
         }
     };
 
-    print_scoreboard(spec.label, &rom, &physical, &snapshots, &board, &dump_check);
+    print_scoreboard(
+        spec.label,
+        &rom,
+        prepared.banks(),
+        snapshots,
+        &board,
+        &dump_check,
+    );
 
     if let Some(check) = &dump_check {
         if check.misclassified != 0 {
@@ -261,20 +250,20 @@ fn emit_block_program(
     label: &str,
     rom: &NormalizedRom,
     facts: &FactDb,
-    snapshots: &[fn64_discover::snapshot::ProgramSnapshotV1],
+    validated: &ValidatedComposedSnapshotsV2,
     out_path: &str,
 ) -> Result<(), String> {
     let mut pack = BlockPackV1 {
-        schema_version: fn64_discover::block_pack::BLOCK_PACK_SCHEMA_V1,
+        schema_version: fn64_discover::block_pack::BLOCK_PACK_SCHEMA_V2,
         normalized_rom_sha256: rom.sha256.clone(),
-        banks: Vec::with_capacity(snapshots.len()),
+        banks: Vec::with_capacity(validated.snapshots().len()),
     };
     // A composed bank with no proven blocks is an overlay that static closure
     // never reached. It carries no executable code to emit, so it is counted
     // and skipped rather than failing the whole program.
     let mut empty_banks = 0usize;
-    for snapshot in snapshots {
-        match emit_block_pack_v1(snapshot, rom) {
+    for (index, snapshot) in validated.snapshots().iter().enumerate() {
+        match emit_validated_block_pack_v2(validated, index, rom) {
             Ok(emitted) => pack.banks.extend(emitted.banks),
             Err(fn64_discover::block_pack::BlockPackError::NoProvenBlocks { .. }) => {
                 empty_banks += 1;
@@ -327,8 +316,7 @@ fn emit_block_program(
     )
     .map_err(|error| format!("emitting block program source: {error:?}"))?;
 
-    std::fs::write(out_path, &source)
-        .map_err(|error| format!("writing {out_path}: {error}"))?;
+    std::fs::write(out_path, &source).map_err(|error| format!("writing {out_path}: {error}"))?;
     println!(
         "  emitted {label} BlockProgram: banks={} (+{empty_banks} unreached) blocks={} source_bytes={} entry={}@{:#010x} -> {out_path}",
         pack.banks.len(),
@@ -338,91 +326,6 @@ fn emit_block_program(
         entry_pc,
     );
     Ok(())
-}
-
-/// Every proven ROM mapping, in deterministic bank order. Physically-resident
-/// banks slice the image; VROM (DMA-loaded) overlays resolve through their
-/// proven file-table record, so OoT's overlays compose here too.
-fn physical_banks(facts: &FactDb) -> Result<Vec<PhysicalBank>, String> {
-    let mut banks = Vec::new();
-    for fact in facts.proven_rom_mappings() {
-        let Fact::RomMapping {
-            bank,
-            rom_space,
-            rom_start,
-            rom_end,
-            va_start,
-            va_end,
-        } = fact
-        else {
-            unreachable!("proven_rom_mappings returned a non-mapping fact")
-        };
-        // A DMA-loaded overlay's VA extent may exceed its ROM extent by a
-        // load-time `.bss` tail. Compose only the ROM-backed prefix: bss holds
-        // no instructions, so excluding it loses no executable code.
-        let (Some(rom_extent), Some(va_extent)) = (
-            rom_end.checked_sub(*rom_start),
-            va_end.checked_sub(*va_start),
-        ) else {
-            return Err(format!("bank {bank} has an inverted ROM or VA interval"));
-        };
-        if rom_extent > va_extent {
-            return Err(format!(
-                "bank {bank} carries more ROM bytes ({rom_extent}) than VA extent ({va_extent})"
-            ));
-        }
-        banks.push(PhysicalBank {
-            bank: bank.clone(),
-            rom_space: *rom_space,
-            rom_start: *rom_start,
-            rom_end: *rom_end,
-            va_start: *va_start,
-            va_end: va_start.saturating_add(rom_extent),
-        });
-    }
-    banks.sort_by(|left, right| left.bank.cmp(&right.bank));
-    Ok(banks)
-}
-
-/// Traversal roots come only from ROM-derived discovery claims: proven
-/// entries plus direct/exhaustive-indirect/table callable-entry claims. This
-/// mirrors [`gate_owners_overlays`]'s rule; the composer itself decides
-/// authority. Candidate prologues are deliberately not bulk-seeded.
-fn callable_roots(facts: &FactDb, bank: &PhysicalBank) -> Vec<u32> {
-    let mut roots: BTreeSet<u32> = facts
-        .proven_function_entries(&bank.bank)
-        .into_iter()
-        .collect();
-    for fact in facts.facts() {
-        let Fact::FunctionEntryClaim {
-            target,
-            evidence,
-            proposed_state,
-            ..
-        } = fact
-        else {
-            continue;
-        };
-        if target.bank != bank.bank
-            || target.pc < bank.va_start
-            || target.pc >= bank.va_end
-            || !matches!(
-                proposed_state,
-                ProofState::Candidate | ProofState::Supported | ProofState::Proven
-            )
-            || !matches!(
-                evidence,
-                FunctionEntryEvidence::DirectJal { .. }
-                    | FunctionEntryEvidence::ResolvedJalr { .. }
-                    | FunctionEntryEvidence::ExhaustiveIndirectCall { .. }
-                    | FunctionEntryEvidence::TableEntry { .. }
-            )
-        {
-            continue;
-        }
-        roots.insert(target.pc);
-    }
-    roots.into_iter().collect()
 }
 
 // ---- Held-out dump grading ---------------------------------------------------
@@ -522,7 +425,7 @@ fn grade_against_dump(
 fn print_scoreboard(
     label: &str,
     rom: &NormalizedRom,
-    physical: &[PhysicalBank],
+    physical: &[PreparedSnapshotBank],
     snapshots: &[fn64_discover::snapshot::ProgramSnapshotV1],
     board: &ClosureScoreboard,
     dump_check: &Option<DumpCheck>,
@@ -553,7 +456,7 @@ fn print_scoreboard(
         board.unsupported
     );
     println!(
-        "  dynamic_mips={}  (classified interpreter-coverable, not a release blocker; the\n                    fallback lane itself is still unimplemented -- see DISCOVER-PLAN)",
+        "  dynamic_mips={}  (covered by the implemented dev-interpreter lane; production-aot\n                    deliberately excludes that lane and requires static catalog admission)",
         board.dynamic_mips
     );
     println!(

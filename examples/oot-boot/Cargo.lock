@@ -244,6 +244,7 @@ name = "fn64-boot-harness"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
+ "fn64-audio",
  "fn64-recomp-rs",
  "fn64-runtime",
  "getrandom",
@@ -255,18 +256,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "fn64-recomp"
-version = "0.0.0"
-dependencies = [
- "serde",
- "toml",
-]
-
-[[package]]
 name = "fn64-recomp-rs"
 version = "0.0.0"
 dependencies = [
- "fn64-recomp",
  "rustc_apfloat",
  "serde",
  "sha2",

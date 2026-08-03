@@ -18,6 +18,50 @@ use fn64_runtime::{RdramAddr, RdramView};
 use crate::hle_outcome::{AudioHleFamily, AudioHleSelection, AudioMicrocodeIdentity};
 use crate::standard_abi::{DecodedStandardAbiPacket, StandardAbiPacket, UnknownStandardAbiOpcode};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmittedStandardAbiDecodeError {
+    WrongFamily { actual: AudioHleFamily },
+    UnknownOpcode(UnknownStandardAbiOpcode),
+}
+
+impl fmt::Display for AdmittedStandardAbiDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongFamily { actual } => {
+                write!(
+                    f,
+                    "standard audio decoder received admitted family {actual:?}"
+                )
+            }
+            Self::UnknownOpcode(source) => source.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AdmittedStandardAbiDecodeError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmittedCompactAbiDecodeError {
+    WrongFamily { actual: AudioHleFamily },
+    Decode(crate::compact_abi::CompactAbiDecodeError),
+}
+
+impl fmt::Display for AdmittedCompactAbiDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongFamily { actual } => {
+                write!(
+                    f,
+                    "compact audio decoder received admitted family {actual:?}"
+                )
+            }
+            Self::Decode(source) => source.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AdmittedCompactAbiDecodeError {}
+
 /// Every public audio ABI command occupies two 32-bit words.
 pub const ABI_COMMAND_BYTES: u32 = 8;
 
@@ -189,10 +233,28 @@ impl AdmittedAudioMicrocode {
     pub fn decode_standard_abi(
         self,
         command: AbiCommand,
-    ) -> Result<DecodedStandardAbiPacket, UnknownStandardAbiOpcode> {
-        match self.selection.family {
-            AudioHleFamily::StandardAbi => StandardAbiPacket::from(command).decode(),
+    ) -> Result<DecodedStandardAbiPacket, AdmittedStandardAbiDecodeError> {
+        if self.selection.family != AudioHleFamily::StandardAbi {
+            return Err(AdmittedStandardAbiDecodeError::WrongFamily {
+                actual: self.selection.family,
+            });
         }
+        StandardAbiPacket::from(command)
+            .decode()
+            .map_err(AdmittedStandardAbiDecodeError::UnknownOpcode)
+    }
+
+    pub fn decode_compact_abi(
+        self,
+        command: AbiCommand,
+    ) -> Result<crate::compact_abi::CompactAbiCommand, AdmittedCompactAbiDecodeError> {
+        if self.selection.family != AudioHleFamily::CompactAbi {
+            return Err(AdmittedCompactAbiDecodeError::WrongFamily {
+                actual: self.selection.family,
+            });
+        }
+        crate::compact_abi::decode_compact_abi(command)
+            .map_err(AdmittedCompactAbiDecodeError::Decode)
     }
 }
 

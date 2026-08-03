@@ -47,15 +47,76 @@ are not an implementation source.
 
 | Area | Present mechanism | Closure gap | Mechanical gate |
 |---|---|---|---|
-| CPU decode | Documented MIPS III encodings decode in `fn64-recomp-rs`; ordinary integer, control, memory, delay-slot, and much COP1 behavior exists. The arbitrary-PC generated and interpreted lanes share modeled 32-bit COP0 moves plus indexed/random TLB write/read/probe state. The public manual supplies Random's inclusive 31-through-Wired range and Wired-write reset to 31; fn64's bounded, non-silicon clock policy advances once per charged block-runner instruction unit, including its existing second unit for an annulled likely slot, and TLBWR samples before its own unit advances. Canonical 32-bit KUSEG/KSSEG/KSEG3 data accesses use the recorded entries: legal PageMask sizes select EntryLo0/1, PFN plus page offset produces the physical address, and ASID/global/V/store-D checks return typed refill, invalid, or modified faults before memory changes. KSEG0/KSEG1 remain direct and multiple matches trap. Status.KSU plus UX/SX/KX now classify the documented 64-bit XUSEG/XKSSEG/XKUSEG, XSSEG, XKPHYS, and XKSEG data ranges. Mapped spaces compare EntryHi.Region plus VA[39:13], XKPHYS validates VA[58:32] before direct PA[31:0], and width/privilege violations return typed AdEL/AdES. Canonical 32-bit instruction fetch retains virtual `ExecutionKey.pc` for branch/link/EPC/BD while admitting the selected physical word as `InstructionWordIdentity { BankId, PA }`; AOT and interpreter execute the same one-word or independently fetched branch/delay unit, including nonadjacent cross-page PFNs. Fault entry retains exact bank/fault-PC/EPC/BD/BadVAddr, updates Context, XContext, and EntryHi while preserving their software-owned bases and ASID, and selects the first-level 32-bit refill, XTLB refill, or common/nested vector. The legacy whole-function lane keeps Random/TLBWR and mapped-memory/fetch exception return loud because its callable ABI has no instruction clock or typed transfer. The arbitrary-PC lane also returns typed SYSCALL/BREAK/conditional-trap, signed-integer-overflow, instruction-fetch AdEL, aligned-memory AdEL/AdES, and COP1-unusable faults; COP1 arithmetic, comparison, conversion, and CTC1 faults return precise FloatingPoint/ExcCode 15 before destination commit. `BlockProgram::dispatch` applies CP0 state, enters a registered handler bank, and follows ERET through ErrorEPC/ERL or EPC/EXL while clearing LLbit. The live owner samples MI on CPU IP2 and Count/Compare on IP7 at block boundaries; Count advances once per two guest CPU cycles and a Compare write acknowledges the timer latch. | Silicon-exact Random and FPU pipeline timing, undocumented FPU payload/exception-priority quirks, 64-bit instruction-PC/catalog identity, generated-lane translated physical device routing, remaining COP0/COP2 faults, instruction-interior timer visibility, and the whole-function lane's exception-return/instruction-clock boundary remain incomplete; several remaining faulting operations still panic as host failures. | Per-instruction AOT/interpreter differential plus architectural exception-state and live-checkpoint tests. |
-| CPU dispatch | The function lane remains function-entry based. Official native-C builds inject a first-in-body observer into every generated `RECOMP_FUNC`; it maps the entered callable through generated section metadata and retains pointer-free `(section, offset, link VRAM, cycle)` history in exact order. The typed whole-function emitter likewise injects the first statement through its single `emit_function_resolved` body template and retains artifact-bound `(link VRAM, symbol, cycle)` entries; root, direct sibling/tail, and lookup-resolved guest calls enter that template, while host overrides and lookup probes/misses do not. Its ABI install fails closed unless given the observation-schema marker exported by the regenerated artifact, so identity-only or handwritten `RecompFunc` tables cannot claim a complete stream. The committed-VI boundary now freezes and mutation-checks that stream, and report schema v28 rejects empty, future-cycle, artifact-mismatched, or cross-lane entries before serializing exact ordered and canonical unique/count evidence as `typed_observed_function`. The working-tree bank lane emits every admitted aligned entry, preserves sparse code/data holes, and returns typed transfer/fault outcomes; a typed outer dispatcher follows direct/resolved transfers under one total instruction budget. `BlockProgram` atomically pairs disjoint bank-bound spans with the generated callable and checks sparse admission before invocation. That authoritative entry boundary retains an append-only, bank-qualified destination history with the immutable runner-artifact identity when supplied; resolution probes and failed sparse destinations are excluded, and the history is not future-affecting program state. `boot_thread0_block_program` owns it across thread 0/spawned OSThreads and charges checkpoint instructions through executor virtual time after coroutine suspension. Static known-host JALs emit typed HostCall/resume boundaries; dynamic JAL/JALR uses `ResolveCall` to distinguish the installed host table from guest banks, and generated returns require the thread sentinel. The OoT Rust host has an explicit, source-hash-bound pack-selection seam which rejects missing input and prevents whole-function guest fallback. It now hashes the generated source tree with a path-independent canonical wire and boots through `boot_thread0_with_execution_observation`; a stale cached generated crate without the marker fails compilation. | The private generated crate must be regenerated before that host can build and produce a v28 function-lane report. The existing OoT generator also does not emit the required block-pack source, so the alternate host path has no real OoT artifact to install. A third-party native archive that bypasses fn64's generated-source preparation has no universal observable function-entry boundary. | Regenerate the private module, then retain ten v28 `typed_observed_function` runs, or generate the complete OoT block-pack contract. Enter prepared functions through root, resolved, direct, tail, host-override, and failed-lookup paths without recording resolution attempts; retain exact entered-destination order across transfer and host resume. |
-| Dynamic code | PI DMA activates pre-registered overlays. `ExecutableRegion` owns one active bank generation. Equal-length physical/virtual registrations in the arbitrary-PC block lane observe typed CPU stores and device DMA writes after commit. The ordinary notification observer remains unchanged; a second typed `GuestWriteBoundaryObserver` returns `ExecutableChanged` only for a proven overlap with an active executable region. Generated AOT and interpreted runners then stop after one straight instruction or one complete branch/delay pair. Typed executable-write exits preserve the source bank and defer call/fault continuation resolution until the host has snapshotted architectural byte order and atomically published the replacement code+runner generation. Non-overlapping stores continue normally, while a live stale-sentinel gate prevents generation A from executing after its overlapping store. | Regions are not page-granular, no real pack supplies a translation builder, automatic executable PI/decompression detection is absent, and dynamic targets are not promoted. Function-lane and timer/device instruction-interior timing remain separate open boundaries. | Execute generation A, rewrite through both CPU and PI DMA paths, prove A is unreachable before boundary resume/completion visibility, then execute generation B at the identical PC. |
-| Clock/checkpoints | The coroutine executor owns ordered virtual time and explicit yield points. The block lane suspends on instruction budgets, commits due PI/MI state before any later resume, and samples interrupts before the next block. | The legacy function lane and host-atomic shims do not preempt internally; exact per-instruction device timing is not claimed. | Cycle-budgeted blocks stop at deterministic deadlines and service a higher-priority wakeup. |
+| CPU decode | Documented MIPS III encodings decode in `fn64-recomp-rs`; ordinary integer, control, memory, delay-slot, and much COP1 behavior exists. The arbitrary-PC generated and interpreted lanes share modeled 32-bit COP0 moves plus indexed/random TLB write/read/probe state. The public manual supplies Random's inclusive 31-through-Wired range and Wired-write reset to 31; fn64's bounded, non-silicon clock policy advances once per charged block-runner instruction unit, including its existing second unit for an annulled likely slot, and TLBWR samples before its own unit advances. Canonical 32-bit KUSEG/KSSEG/KSEG3 data accesses use the recorded entries: legal PageMask sizes select EntryLo0/1, PFN plus page offset produces the physical address, and ASID/global/V/store-D checks return typed refill, invalid, or modified faults before memory changes. KSEG0/KSEG1 remain direct and multiple matches trap. Status.KSU plus UX/SX/KX now classify the documented 64-bit XUSEG/XKSSEG/XKUSEG, XSSEG, XKPHYS, and XKSEG data ranges. Mapped spaces compare EntryHi.Region plus VA[39:13], XKPHYS validates VA[58:32] before direct PA[31:0], and width/privilege violations return typed AdEL/AdES. Canonical 32-bit instruction fetch retains virtual `ExecutionKey.pc` for branch/link/EPC/BD while admitting the selected physical word as `InstructionWordIdentity { BankId, PA }`; AOT and interpreter execute the same one-word or independently fetched branch/delay unit, including nonadjacent cross-page PFNs. Fault entry retains exact bank/fault-PC/EPC/BD/BadVAddr, updates Context, XContext, and EntryHi while preserving their software-owned bases and ASID, and selects the first-level 32-bit refill, XTLB refill, or common/nested vector. The legacy whole-function lane keeps Random/TLBWR and mapped-memory/fetch exception return loud because its callable ABI has no instruction clock or typed transfer. The arbitrary-PC lane also returns typed SYSCALL/BREAK/conditional-trap, signed-integer-overflow, instruction-fetch AdEL, aligned-memory AdEL/AdES, and COP1-unusable faults; COP1 arithmetic, comparison, conversion, and CTC1 faults return precise FloatingPoint/ExcCode 15 before destination commit. `BlockProgram::dispatch` applies CP0 state, enters a registered handler bank, and follows ERET through ErrorEPC/ERL or EPC/EXL while clearing LLbit. The live owner samples MI on CPU IP2 and Count/Compare on IP7 at block boundaries; Count advances once per two guest CPU cycles, its retained phase makes interior MFC0 reads exact at charged-instruction granularity, and a Compare write acknowledges the timer latch. | Silicon-exact Random and FPU pipeline timing, undocumented FPU payload/exception-priority quirks, 64-bit instruction-PC/catalog identity, generated-lane translated physical device routing, remaining COP0/COP2 faults, instruction-interior interrupt/Compare sampling, and the whole-function lane's exception-return/instruction-clock boundary remain incomplete; several remaining faulting operations still panic as host failures. | Per-instruction AOT/interpreter differential plus architectural exception-state and live-checkpoint tests. |
+| CPU dispatch | The function lane remains function-entry based. Official native-C builds inject a first-in-body observer into every generated `RECOMP_FUNC`; it maps the entered callable through generated section metadata and retains pointer-free `(section, offset, link VRAM, cycle)` history in exact order. The typed whole-function emitter likewise injects the first statement through its single `emit_function_resolved` body template and retains artifact-bound `(link VRAM, symbol, cycle)` entries; root, direct sibling/tail, and lookup-resolved guest calls enter that template, while host overrides and lookup probes/misses do not. Its ABI install fails closed unless given the observation-schema marker exported by the regenerated artifact, so identity-only or handwritten `RecompFunc` tables cannot claim a complete stream. The committed-VI boundary now freezes and mutation-checks that stream, and report schema v29 rejects empty, future-cycle, artifact-mismatched, or cross-lane entries before serializing exact ordered and canonical unique/count evidence as `typed_observed_function`. The working-tree bank lane emits every admitted aligned entry, preserves sparse code/data holes, and returns typed transfer/fault outcomes; a typed outer dispatcher follows direct/resolved transfers under one total instruction budget. `BlockProgram` atomically pairs disjoint bank-bound spans with the generated callable and checks sparse admission before invocation. That authoritative entry boundary retains an append-only, bank-qualified destination history with the immutable runner-artifact identity when supplied; resolution probes and failed sparse destinations are excluded, and the history is not future-affecting program state. `boot_thread0_block_program` owns it across thread 0/spawned OSThreads and charges checkpoint instructions through executor virtual time after coroutine suspension. Static known-host JALs emit typed HostCall/resume boundaries; dynamic JAL/JALR uses `ResolveCall` to distinguish the installed host table from guest banks, and generated returns require the thread sentinel. The OoT Rust host has an explicit, source-hash-bound pack-selection seam which rejects missing input and prevents whole-function guest fallback. It now hashes the generated source tree with a path-independent canonical wire and boots through `boot_thread0_with_execution_observation`; a stale cached generated crate without the marker fails compilation. | The private generated crate must be regenerated before that host can build and produce a v29 function-lane report. The existing OoT generator also does not emit the required block-pack source, so the alternate host path has no real OoT artifact to install. A third-party native archive that bypasses fn64's generated-source preparation has no universal observable function-entry boundary. | Regenerate the private module, then retain ten v29 `typed_observed_function` runs, or generate the complete OoT block-pack contract. Enter prepared functions through root, resolved, direct, tail, host-override, and failed-lookup paths without recording resolution attempts; retain exact entered-destination order across transfer and host resume. |
+| Dynamic code | PI DMA activates pre-registered overlays. `ExecutableRegion` owns one active bank generation. Equal-length physical/virtual registrations in the arbitrary-PC block lane observe typed CPU stores and device DMA writes after commit. The ordinary notification observer remains unchanged; a second typed `GuestWriteBoundaryObserver` returns `ExecutableChanged` only for a proven overlap with an active executable region. Generated AOT and interpreted runners then stop after one straight instruction or one complete branch/delay pair. Typed executable-write exits preserve the source bank and defer call/fault continuation resolution until the host has snapshotted architectural byte order and atomically published the replacement code+runner generation. Non-overlapping stores continue normally, while a live stale-sentinel gate prevents generation A from executing after its overlapping store. The opt-in `dynamic-mapped-runtime` lane now installs an execution-local `DynamicMappedUnitCatalogV1` beside `CanonicalLiveBlockProgramV1`. One unified inner slice preserves a single total instruction budget across static misses, exact-unit execution, executable writes, and later static continuations; it samples interrupts only at the outer architectural checkpoint. Host bindings win first, digest-selected precompiled generations next, immutable static code next, and dynamic live fetch last. Every dynamic unit re-snapshots one straight word or a complete independently translated branch/delay pair, uses an implementation-issued source receipt in its full content identity, rejects static/precompiled bank collisions, and routes canonical MMIO through the installed `Rdram` hooks. JAL/JALR always crosses `ResolveCall`, including an in-bank target, so the unified owner applies host-first precedence; JR/JALR retains complete indirect-transfer observations and the thread-return sentinel. Bounded telemetry binds the resolver/program, dynamic source, optional ROM/bootstrap receipt, mutation journal, exact fetched identities, charged work, failures, and explicit saturation counters; the identity catalog also fails loudly at a configurable capacity rather than growing host memory without limit. The validated-owned dynamic boot retains exact ROM/bootstrap/mutation provenance while refusing every static writer/release authority. Focused and public-boot gates cover aliases, cross-page slots, A→B→A reuse, static→dynamic→static without replay, one-instruction remainder checkpointing before admission, host/precompiled precedence, prior-work fetch-fault accounting, delay-slot refetch, ambiguity, static-authority rejection, and static miss→dynamic call→suspended host→externally committed byte visibility→static resume without replay. A separate generation-backed gate drives a real raw-MMIO DeviceFabric PI DMA during that suspended dynamic host and proves exact `HostAbi → PiDma → HostAbi` mutation-journal ordering and digest chaining. Corrected in-bank call/observation regressions passed 10/10 guarded runs; the two public dynamic-boot/provenance tests passed 10/10; and the real-PI dynamic ordering gate passed 10/10 on 2026-07-31. The WM `dynamic-withheld` harness and paired runner bind independently-featured binaries to one unchanged ROM/BootContext/capture set while retaining the same complete static catalog plus canonical program and resolver-install identities. `FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY=1` selects only the installed entry `ExecutionKey`; the operational dispatcher redirects it once, clears the guard only after positive dynamic work, then restores normal static budgets and executable-mutation reconciliation. V2 telemetry proves that individual attempt with positive `charged_instructions` and zero `unsupported_exits`; aggregate totals cannot prove the entry. Both lanes stop at the same global charged-instruction horizon and compare full logical RDRAM plus canonical device/executor/ABI-host and per-thread CPU/continuation digests. The exact-entry pair/comparator contracts passed 10/10 on 2026-07-31. | One exact-entry real-ROM v3 diagnostic reached 100,001 instructions in both lanes and dynamically executed the selected entry once for one instruction with zero unsupported exits. RDRAM, CPU, device, executor, ABI-host, continuation, scheduler steps, simulation time, and the per-thread publication diagnostic matched. This one run is not ten-run parity evidence. The operational digest is deterministic comparison evidence, not an atomic savestate: opaque host/parked native continuations remain non-comparable, and canonical full-machine serialization, interpreter totality, and a held-out ROM remain open. Regions are not page-granular, automatic executable PI/decompression classification is absent, and function-lane/timer instruction-interior timing remain separate boundaries. | Repeat the frozen exact-entry comparison before promoting the one-run operational result to deterministic parity evidence. |
+| Clock/checkpoints | The coroutine executor owns ordered virtual time and explicit yield points. The block lane suspends on instruction budgets, commits due PI/MI state before any later resume, and samples interrupts before the next block. `RecompContextEvidenceSnapshotV1` projects every future-affecting CPU field owned by one context: integer/FPU/LL state, pending Count/Compare writes, modeled COP0/TLB state, interrupt mask, and return sentinel. The canonical owner counts charged work globally across OSThreads and publishes each thread's latest exact pre-yield checkpoint, opaque host-in-flight marker, post-exception parked-fault marker, or returned CPU state. Exact publications bind their nonzero last-slice charge, cumulative global charge, pending exit, and any generation key prepared before suspension. The digest rejects impossible charge relations, missing/cross-variant prepared continuations, and a prepared target PC different from its transition PC while allowing generation activation to change the bank identity. Parked faults replace the earlier exact publication after exception entry and remain deliberately non-comparable because their native stopped continuation is not independently resumable. Operational-only canonical digests separate CPU bytes from continuation bytes and reject reordered or duplicate thread publications; device, executor, and ABI-host state use separate canonical component digests. The ABI publication and digest suites each passed 10/10 guarded runs on 2026-07-31. | A native host shim's stack and locals and a parked fault's native stop continuation remain deliberately opaque. Created-but-never-entered thread start contexts can be absent from the publication set. The latest per-thread publications are paired with owner snapshots taken after scheduler handling; this is deterministic comparison evidence rather than one atomic savestate. The legacy function lane and host-atomic shims do not preempt internally; exact per-instruction device timing is not claimed. | Require equal full RDRAM and owner-component digests at the exact global horizon, report CPU/continuation equality only when no executor thread is missing and no publication is opaque, then replace common native continuations with typed resumable continuations before claiming complete machine-state equality. |
 | Devices/MMIO | One deterministic `DeviceFabric` owns typed PI, SI, AI, VI, MI, save, SP, and DP state. Managed calls, raw MMIO, generated-C proxies, and libultra shims converge on it. PI orders bytes/busy/MI/queue delivery; AI owns a timed two-slot FIFO; SI owns persistent PIF RAM and timed two-direction DMA. Raw and high-level EEPROM, Controller Pak, Rumble Pak, and Transfer Pak operations share their authoritative stores and latches. Runtime-configurable 1–62-bank Controller Paks use one physical image and retained bank latch as their sole authority: high-level operations decode and encode per-bank checksum-protected FAT/backup pages plus the sixteen-entry note directory seen by raw Joybus, global 16-bit chains cross bank boundaries, and ambiguous checksum/cycle/share/orphan/directory corruption returns `PFS_ERR_INCONSISTENT`. EEPROM writes defer backing-store mutation to one typed guest-cycle deadline, expose public `0x80` busy state through raw Info/Write, reject overlap, and make high-level polling plus LongWrite's per-block 15 ms timer use that same state. Transfer Pak support includes CRC-checked raw register windows, ROM/RAM persistence, ROM-only and MBC1/2/3/5 cartridge buses, sticky removal/reset state, all six public `osGbpak*` adapters, registration-header and connector validation, and documented deterministic initialization/power waits. Timer-bearing MBC3 cartridges advance on exact guest-second boundaries independently of Pak power, retain immutable latches, honor halt, and implement 9-bit day/sticky-carry rollover through both raw and high-level paths. Their live RTC/phase and exact ROM/type identity persist in a checksummed versioned sidecar; explicitly injected host timestamps materialize powered-off elapsed time once without entering runtime evidence. Voice has a typed initialized/READY/START/CANCEL/BUSY/END lifecycle shared by its nine shims, raw Info, captured result/status, five-write raw initialization, and initialization/clear/start/stop controls. VI owns its live register file, region timing, field/current/intr derivation, vblank-latched mode/scale/features/presentation, current mode/status queries, square-root gamma, coverage AA, coverage-gated median divot, RGBA16 neighborhood dither restoration, and retrace-seeded stochastic seven-bit gamma dither. Persistent RSP DMEM/IMEM, status/PC/semaphore, double-buffered DMA, raw DPC streams, and all six MI sources use the same event ordering. | PI/SI/SP-DMA and HLE SP/DP deadlines remain deterministic policies rather than measured hardware timing. EEPROM uses the public library's conservative 15 ms interval rather than a measured per-chip-revision timing model. Raw Voice still traps with typed evidence for `0x09` without an injected result, region-dependent `0x0A` staging, `0x0D` power/gain writes, and the unestablished `0x0C` dictionary-transfer mode. VI register timing lacks hardware-trace validation and exact random-stream identity remains unproven. A twenty-phase pinned-Metal gate supplies exact native post-VI gamma, bounded seeded gamma-dither, scale, divot, and RGBA16 restoration evidence. A separate adapter-capture test plus eleven-phase gate distinguish compatibility Unspecified from explicit mode 0 across the wire and native callback. For deliberately generated managed codes 1-6, modes 0/1 match an independent per-code Figure-11 CPU oracle, modes 2/3 restore exactly, and AA, source-before-projection divot, and AA-before-divot each change the six target pixels. This evidence is limited to pinned Metal, nearest/progressive synthetic RGBA16, opaque code-7 controls, and the original-aspect (4:3) presentation policy; pinned RT64's code-7 alias, code-0/save, natural/imported hidden coverage, insufficient neighborhoods, other filtering/scaling modes, MSAA/downsample, other graphics APIs, recognized-HLE/full-profile ROM breadth, silicon identity, and analog output remain uncertified. Function-lane generated code remains atomic between host boundaries. | Hardware-derived timing plus raw/shim/C-proxy byte-identical traces through the integrated executor. |
 | RSP | The clean-room scalar/vector interpreter executes the persistent IMEM image from the fabric's PC, imports/commits architectural DMEM and SP status, resolves rectangular IMEM DMA generations, resumes after each overlay, and stops only at BREAK or a loud bounded failure. Unknown/custom task types take this LLE path. Known graphics/audio tasks execute admitted rspboot until control first reaches DMA-loaded ucode, committing RDRAM/DMEM/IMEM/status/entry-PC effects before the HLE backend; transactional LLE fallback also receives a typed snapshot of the complete non-memory machine state. Graphics tasks expose an explicit `HleOptimized`/`LleAccuracy` host policy; the release/parity harness selects accuracy and continues the loaded ucode through that same snapshot and interpreter. Synthetic normal, wrapped-overlay, invalid-boot, yielded, reload/resume, boot-register-continuity, and accuracy-policy raw-DPC gates prove the connection. The OS yield handshake uses the same live SP status: SIG0 requests yield, SIG1 prepares the task's yield buffer for restart, normal completion is read-only, and load clears stale handshake bits. | The selected HLE backend executes atomically, so SIG0 cannot yet preempt/resume an HLE task in flight, and instruction timing is a deterministic count rather than a pipeline model. | Run the synthetic admission/execution/overlay and yield-protocol gates 10 times, then exercise non-GBI full tasks with stable DMEM/RDRAM/DPC traces. |
 | RDP/VI | RT64 is the faithful HLE lane; the pure-Rust F3DEX2 decoder emits ordered operations for 8-bit index/RGBA16/RGBA32 targets, fills, syncs, triangles, texture rectangles, and the independent depth-image register. One typed layout classifier is shared by validation, import, fill, copy, and commit. The reference backend imports, switches, commits, and same-address reinterprets all three public color-image layouts; the 8-bit layout stores one byte and ignores hidden coverage, while RGBA32 retains five-bit memory alpha and the three coverage bits in its alpha byte. It executes format-correct fill-cycle rectangles, normal/flipped RGBA16 copy-cycle rectangles, direct I8, packed IA8, and undereferenced CI8 copies into 8-bit targets, and one/two-cycle TEXRECT/TEXRECTFLIP through shared texture filtering, color combining, alpha compare, and framebuffer blending. Eight-bit copy preserves the original TMEM byte while alpha compare uses source-format intensity/alpha. YUV16 Y0/U/Y1/V tile loads, all six signed `G_SETCONVERT` fields, public `CONV`/`FILTCONV`/`FILT` selection, and K4/K5 combiner inputs run through the same triangle/rectangle sampler. `G_SETKEYR`/`G_SETKEYGB`, CENTER/SCALE combiner inputs, and `G_CK_KEY` alpha fixup implement the public soft-edge chroma equation and feed alpha compare. Programming Manual Chapter 13.7 mip/detail/sharpen selection uses immutable eight-tile primitive snapshots, adjacent perspective-corrected coordinate derivatives, modulo-eight tile selection, minimum/maximum LOD, and RGB/alpha LOD_FRACTION inputs across rectangles, high-level triangles, and raw coefficient triangles. A fill directed at the persistent depth image writes its raw halfwords and clears the covered software depth samples across later color-image switches. Bounded `osDpSetNextBuffer`, raw DPC START/END, and LLE RSP DPC submissions execute the proven subset. `CMD_END` captures the submitted words into an immutable command image staged outside guest RDRAM before backend dispatch. Both DRAM command DMA and XBUS DMEM command DMA reach the renderer. All eight raw RDP triangle layouts retain typed edge/shade/texture/Z planes through a coefficient-driven span walker with the public eight-sample checkerboard coverage mask; high-level F3DEX2 triangles now evaluate those same sample positions and use winding-independent top-left ownership for exact shared edges. Full masks retain pixel-center attributes while partial raw/high-level masks use one typed covered sample for shade, texture, and Z under a bounded nearest-to-center/stable-order policy. Set Scissor retains its public field-enable and odd/even selector, and every color/depth/rectangle/raw/high-level raster path rejects the opposite-parity scanlines. RGBA16 coverage and depth DeltaZ share a physical-address hidden-bit sidecar; all four coverage destinations, coverage/alpha selection, clear-on-wrap color writes, memory-coverage blending, and opaque coverage-wrap strict Z execute. `Z_CMP`/`Z_UPD` are independent; primitive depth works for triangles and rectangles; Chapter 15 relations drive opaque/interpenetrating/translucent/decal admission; and ordered RGB MagicSquare/Bayer plus alpha Pattern/InversePattern dither execute before target-format storage. One typed seedable deterministic per-fragment byte feeds combiner NOISE, RGB/alpha Noise, and `G_AC_DITHER`; the unpublished silicon stream remains unclaimed. Unsupported state still fails by name. | Exact LOD derivative norm/fixed-point boundaries, exact fixed-width/subpixel coefficient, conversion, key, and covered-sample selector arithmetic, interpenetration coverage adjustment, exact alpha-coverage rounding, same-visible-value CPU hidden-bit rewrites, filter arithmetic, exact hardware noise-generator identity/advancement, other unmodeled state, and precise timing behavior remain incomplete. | Raw fill/texture/depth-clear/triangle command streams produce deterministic image and coverage bytes through shim, MMIO, and LLE DPC entry paths; SP/DP/MI ordering and VI mode/field are captured separately. The bounded real C-lane path reached its first swap at step 445 after 28 graphics tasks in 20/20 clean runs. |
 | Exploration | Discovery has typed trace/probe inputs and a bounded probe-plan foundation. | No real headless emulator producer, state mutation loop, coverage frontier, or forced-path admission rule is connected. | Digest-bound save state, forced branch, reproducible trace, and explicit natural-versus-forced reachability labels. |
-| Validation | Unit/oracle tests, C ABI smoke, generated-body inventory/PC-set comparison, trace comparison, audio dumps, and live screenshots exist. Both boot harnesses use guest-quiescence timing. C/rs framebuffer observation matches through 60 swaps but is non-authoritative because the legacy C inventory has 116 callable empty bodies. Prepared native, schema-enabled typed-function, and typed-block lanes retain authoritative reached-destination order. Schema v28 binds those destinations, all five fixed-cycle channels, complete observation geometry, environment, closure, RT64's resolved graphics API and TV standard, nonzero completed workload/present identity, normalized ROM identity/class, decoded TV region, exact native Windows workstation build/UBR evidence, the ordered ABI-owned `fn64.rsp-rdp-observations.v2` stream, and DeviceState v15's canonical 24-bit DPC counter projection while retaining DeviceState v14's complete RSP interpreter continuation and admission generations, DeviceState v11's audio-task execution policy and translated artifact identity, DeviceState v10's AI/DPC latches and pending-transaction state, and v9's controller-manager, mapped-fetch/AOT expected-word, and typed pending/completed PFS transaction state. DPC counter increments and STATUS counter-clear/transaction interleavings remain open. Release admits only `AudioTaskExecutionPolicy::LleAccuracy`; translated identity cannot establish a live-IMEM match and diagnostic skip remains non-release. The trusted private-series runner accepts only a policy-revalidated opaque v3 contract, owns exact-ten sequential fresh child launches, and independently recomputes each admitted ROM's normalized header evidence before accepting a report. Admission v7 binds retail/public-homebrew class-specific provenance, a typed build receipt, the exact child/source/recompiled input, and the runner-owned class environment; retained v6 is read-only. Matrix v6 derives report-visible coverage; retained v19 matrices credit fixed NTSC/PAL/MPAL only from header/device/renderer agreement, while report-only verification cannot credit ROM class. The private-series path jointly revalidates an opaque capability's v3 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image, and bound inputs; it exact-matches semantic report and ordered run-event identities before retaining a separately hashed v1 class authority. RT64 target-case credit requires a distinct opaque capability bound to the exact report and ordered matrix events. Its production constructor owns the repository-selected child, revalidated Cargo and fn64/adapter source identities, an isolated fresh build target, clean pinned RT64 source, 10/20-run watchdog-bounded process series, identical semantic output, and child-observed adapter/API identity. All 13 macOS/Metal examples emit the identity envelope; other target/API rows remain fail-closed. Missing evidence returns an explicit v7 incomplete assessment rather than a smaller denominator. | Historical private NTSC reference and RT64 LLE/post-VI lanes each supplied ten semantically identical schema-v22 reports with ten distinct terminal v3 journals and were independently reverified locally on 2026-07-22 at fixed cycle `722368695`, with zero unsupported events. A retained public synthetic identified-native XBUS series supplied ten more reports under the same unsupported-instrumentation denominator without receiving private-ROM authority. Its current v28 acceptance is bounded to the exact target-named macOS arm64 fingerprint, including both build-produced archive hashes; compiler/SDK/target drift fails closed. The previous v6 incomplete assessment accepted all three scenarios and all 30 reports, satisfied 12 of 162 requirements, and retained 150 explicit gaps; the v7 assessment has not yet been regenerated. No schema-v28 representative series or assessment has yet been retained. No positive Windows report or production RT64 platform-case capability has yet been retained through the new constructor; blocker closure and allowed-source public-microcode identities also remain absent. A class-specific local provenance string is an admitted attestation, not independent public-homebrew provenance. A self-hashed receipt is not transferable process attestation without an external trusted CI/code-signing root; same-UID transient source mutation is outside the local runner's integrity threat model; native-archive identity does not repair the legacy C oracle's missing bodies; reached destinations do not prove unreachable code; native coroutine continuations remain excluded; focused oracles are not exhaustive; and measured parity only reaches swap 60 with a non-authoritative deeper C oracle. | Run and retain the macOS platform-case capabilities, populate a successor allowed-source public-microcode catalog, produce native Windows v28 evidence and production blocker authorities, retain external process attestation where required, and retain ten trusted v28 report/journal pairs for each remaining profile scenario. See `RELEASE-GATE.md`. |
+| Validation | Unit/oracle tests, C ABI smoke, generated-body inventory/PC-set comparison, trace comparison, audio dumps, and live screenshots exist. Both boot harnesses use guest-quiescence timing. C/rs framebuffer observation matches through 60 swaps but is non-authoritative because the legacy C inventory has 116 callable empty bodies. Prepared native, schema-enabled typed-function, and typed-block lanes retain authoritative reached-destination order. Schema v29 binds those destinations, all five fixed-cycle channels, complete observation geometry, environment, closure, RT64's resolved graphics API and TV standard, nonzero completed workload/present identity, normalized ROM identity/class, decoded TV region, exact native Windows workstation build/UBR evidence, the ordered ABI-owned `fn64.rsp-rdp-observations.v2` stream, DeviceState v16's typed pending PI addresses, and live timing v2's matching PI DMA identity while retaining DeviceState v15's canonical 24-bit DPC counter projection, DeviceState v14's complete RSP interpreter continuation and admission generations, DeviceState v11's audio-task execution policy and translated artifact identity, DeviceState v10's AI/DPC latches and pending-transaction state, and v9's controller-manager, mapped-fetch/AOT expected-word, and typed pending/completed PFS transaction state. DPC counter increments and STATUS counter-clear/transaction interleavings remain open. Release admits only `AudioTaskExecutionPolicy::LleAccuracy`; translated identity cannot establish a live-IMEM match and diagnostic skip remains non-release. The trusted private-series runner accepts only a policy-revalidated opaque v3 contract, owns exact-ten sequential fresh child launches, and independently recomputes each admitted ROM's normalized header evidence before accepting a report. Admission v7 binds retail/public-homebrew class-specific provenance, a typed build receipt, the exact child/source/recompiled input, and the runner-owned class environment; retained v6 is read-only. Matrix v6 derives report-visible coverage; retained v19 matrices credit fixed NTSC/PAL/MPAL only from header/device/renderer agreement, while report-only verification cannot credit ROM class. The private-series path jointly revalidates an opaque capability's v3 contract, exact-ten receipt, retained reports/journals, raw ROM, runner image, and bound inputs; it exact-matches semantic report and ordered run-event identities before retaining a separately hashed v1 class authority. RT64 target-case credit requires a distinct opaque capability bound to the exact report and ordered matrix events. Its production constructor owns the repository-selected child, revalidated Cargo and fn64/adapter source identities, an isolated fresh build target, clean pinned RT64 source, 10/20-run watchdog-bounded process series, identical semantic output, and child-observed adapter/API identity. All 13 macOS/Metal examples emit the identity envelope; other target/API rows remain fail-closed. Missing evidence returns an explicit v7 incomplete assessment rather than a smaller denominator. | Historical private NTSC reference and RT64 LLE/post-VI lanes each supplied ten semantically identical schema-v22 reports with ten distinct terminal v3 journals and were independently reverified locally on 2026-07-22 at fixed cycle `722368695`, with zero unsupported events. A retained public synthetic identified-native XBUS series supplied ten more schema-v28 reports under the same unsupported-instrumentation denominator without receiving private-ROM authority; it too requires schema-v29 regeneration. The previous v6 incomplete assessment accepted all three scenarios and all 30 reports, satisfied 12 of 162 requirements, and retained 150 explicit gaps; the v7 assessment has not yet been regenerated. No schema-v29 representative series or assessment has yet been retained. No positive Windows report or production RT64 platform-case capability has yet been retained through the new constructor; blocker closure and allowed-source public-microcode identities also remain absent. A class-specific local provenance string is an admitted attestation, not independent public-homebrew provenance. A self-hashed receipt is not transferable process attestation without an external trusted CI/code-signing root; same-UID transient source mutation is outside the local runner's integrity threat model; native-archive identity does not repair the legacy C oracle's missing bodies; reached destinations do not prove unreachable code; native coroutine continuations remain excluded; focused oracles are not exhaustive; and measured parity only reaches swap 60 with a non-authoritative deeper C oracle. | Run and retain the macOS platform-case capabilities, populate a successor allowed-source public-microcode catalog, produce native Windows v29 evidence and production blocker authorities, retain external process attestation where required, and retain ten trusted v29 report/journal pairs for each remaining profile scenario. See `RELEASE-GATE.md`. |
+
+Checkpoint update after the matrix snapshot: the canonical catalog owner now
+counts exact charged `BlockProgram` work across all of its OSThreads while
+excluding synthetic host and legacy-C charges. The WM bounded loop can stop at
+the first scheduler checkpoint at or beyond a requested minimum and can
+require the exact achieved baseline count on a comparison run. The receipt
+records minimum, expected, and achieved counts; a minimum may overshoot by one
+outer dispatch slice, while an exact expectation fails instead of rounding or
+splitting a branch/delay pair. Static-through-dynamic boot accounting and the
+generation-backed real-PI dynamic path each passed 10/10 guarded counter
+assertions on 2026-07-31. This closes measurement of a shared guest-work
+horizon, not complete state equality: typed native-host continuation and
+canonical atomic full-machine serialization remain open.
+
+`scripts/wm2000-withheld-rdram-diff.zsh` is the first executable A/B wrapper.
+It runs separately retained AOT and `dynamic-withheld` binaries sequentially
+under the memory guard, derives the baseline's achieved checkpoint at or above
+the requested guest-instruction minimum, requires the dynamic lane to hit that
+exact count, and compares a transient hash of all logical RDRAM bytes plus canonical
+device, executor, and ABI-host component digests. Canonical thread CPU and
+continuation digests are retained independently; they are comparable only
+when both lanes publish the same complete non-opaque thread set. An exact CPU
+publication is sampled before checkpoint suspension, a parked-fault marker is
+sampled after exception entry, and returned state is terminal; owner components
+are sampled after scheduler handling. The bundle therefore identifies its
+relation as latest per-thread publications paired with post-scheduler owner
+snapshots and is not labeled an atomic savestate. The wrapper writes only to a fresh private
+out-of-tree directory and labels the strict result
+`operational_rdram_and_owner_components_with_published_cpu_diagnostics`.
+Its mock-binary contract test exercises baseline extraction, exact horizon
+propagation, stale-ROM rejection, owner-component mismatch rejection, and the
+positive match receipt.
+
+The two lanes install the same complete static catalog and retain the same
+canonical program and resolver-install identities. Only the dynamic lane
+receives
+`FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY=1`. Its owner validates that the
+selected `ExecutionKey` equals the installed entry, then redirects that entry
+from static to dynamic execution once at the operational unified-dispatch seam.
+The guard clears only after positive dynamic work; normal static budgets and
+executable-mutation reconciliation then resume. Telemetry schema
+`fn64.wm2000.dynamic-withheld-telemetry.v2` binds a per-attempt entry bank/PC,
+positive `charged_instructions`, and zero `unsupported_exits`. Aggregate dynamic
+totals do not prove that attempt. The identity line and comparator also bind
+`resolver_install_sha256`. Whole-shard removal is obsolete because a bounded
+route can avoid the selected shard entirely.
+
+This checkpoint supersedes the dynamic-code matrix cell's earlier request to
+add a horizon and operational digest: both mechanisms now exist in source. The
+exact-entry pair and comparator contracts passed the deterministic bar after
+the schema migration. Earlier real runs reached
+100,001 instructions with whole shards 1 and 2 withheld and matched full RDRAM,
+device, executor, and ABI-host digests, but neither withheld shard was entered;
+those runs are partial owner-state evidence, not dynamic-execution evidence.
+One exact-entry real-ROM v3 diagnostic reached 100,001 instructions in both lanes.
+The withheld `(bank, PC)` `81bf2e27273b27db:80000400` ran dynamically once for
+one instruction with zero unsupported exits. RDRAM, CPU, device, executor,
+ABI-host, continuation, scheduler steps, and simulation time matched. The two
+publication diagnostics also matched on pending `ExecutableWrite`, last charge
+five, cumulative charge 100,001, and absent prepared continuation. This is one
+operational diagnostic only; no ten-run parity result is claimed.
 
 In the validation row, “binds” means exact identity co-binding. The typed
 receipt does not prove that the child was compiled or linked from its lane
@@ -119,13 +180,32 @@ and generated artifact identity without retaining native pointers.
 Mapped-interpreter destination
 observations have no generated-runner artifact and therefore remain
 operational/differential-only, not fixed-cycle release evidence under schema
-v28; artifact-identified mapped AOT observations retain their real artifact
+v29; artifact-identified mapped AOT observations retain their real artifact
 and are eligible, while compatibility AOT without one is not. The 64-bit
 instruction-PC/catalog identity and the legacy whole-function boundary remain
 loud rather than borrowing this 32-bit block-lane contract. Data addresses do
 use the wider VR4300 contract: Status.KSU plus UX/SX/KX classify the extended
 mapped ranges and XKPHYS, and extended refill entry updates full BadVAddr,
 Context, XContext, and EntryHi before selecting the XTLB vector.
+
+The opt-in live miss path uses the same exact-unit shape without first
+mutating `BlockProgram`: `DynamicMappedUnitCatalogV1` translates and
+snapshots the primary physical word, snapshots an independently translated
+delay word when required, then executes that immutable local unit through the
+shared interpreter. Its full SHA-256 identity binds the implementation-issued
+dynamic source receipt and ordered physical address/word pairs. That receipt
+conservatively binds the crate manifest and every library `src/**/*.rs` file;
+an inventory test rejects an added Rust source until it is included. The
+architectural VA remains only in `ExecutionKey`. A projected `BankId` is never
+accepted without retaining and comparing the full digest, and any collision
+with immutable static, mapped-AOT, or inactive precompiled-generation banks is
+loud. Re-snapshotting every subsequent unit makes A→B→A content reuse exact
+and prevents a committed code write from leaving a later unit cached. The ABI
+owner places it after host, active/activatable precompiled, and static
+resolution, reconciles attributed executable writes between units, and charges
+the combined slice once. This proves the mechanism and ordering only; focused
+tests are not a whole-ROM closure claim, and enabling the lane cannot mint
+static writer or release authority.
 
 ```rust
 enum BlockExit {
@@ -206,7 +286,8 @@ unavailable, and in-flight task owners plus the next admission generation.
 DeviceState v15 canonicalizes the four public DPC performance counters to 24
 bits at import and fails closed if release encoding sees a noncanonical value;
 counter increments and STATUS counter-clear/transaction interleavings remain
-open. The
+open. DeviceState v16 types pending PI requests as ROM or SRAM offsets, and
+live timing v2 carries the same typed identity for PI DMA rows. The
 release environment admits only live-image `LleAccuracy`. The public
 [N64brew Audio Interface register map](https://n64brew.dev/wiki/Audio_Interface?oldid=5924)
 defines `AI_CONTROL.DMA_ENABLE` and the reflected `AI_STATUS.ENABLED` bit.
@@ -215,7 +296,8 @@ is enabled; `osInitialize` establishes the initial enable used by raw libultra
 DRAM/LEN callers, and the managed submission repeats that idempotent write.
 The public source does not define a mid-transfer disable/pause transition, so
 changing CONTROL while either FIFO slot is active remains a named unsupported fault.
-DACRATE and BITRATE changes are rejected under the same live-FIFO rule; typed
+DACRATE and BITRATE changes are rejected under the same live-FIFO rule;
+idempotent rewrites are accepted without mutating the active transfer. Typed
 requests must match the public integer rate derived from the admitted divisor.
 Exact silicon AI/DPC timing and counters, the precise AI-interrupt phase, the
 hardware semantics of mid-transfer AI control/rate writes, FREEZE/FLUSH,
@@ -433,8 +515,218 @@ Each nonzero instruction checkpoint suspends the coroutine first, then advances
 executor virtual time and services due devices before rescheduling; a live gate
 proves exact 3+2-cycle charging and RDRAM mutation. Static known-host JAL,
 dynamic JAL/JALR host-or-guest resolution, and explicit thread-return
-boundaries are compiled/live gates. Real-pack boot wiring and runtime code
-real-pack translation policy remain open. The block lane's live region
+boundaries are compiled/live gates. Real-pack boot wiring now requires a
+canonical ROM/IPL3/TV/entry-bound `BootContext`, restores the captured
+GPR/HI/LO/modeled-CP0 image, and seeds Count/Compare/IP7 before thread 0 is
+created. The public-debugger black-box producer emits the complete raw CP0 slot
+image at the header-entry pause. The first private capture series exposed a
+queued-step race in the producer: a timeout re-kick could be consumed after the
+next pause but before callback publication, losing a pre-window observation
+and changing CP0 Count. The fix permits one outstanding step and traps on
+callback stall. Twenty consecutive NWXE captures then reached the same
+5,079,153-instruction pre-window horizon and produced one boot-context digest
+and one bounded-trace digest. A real fn64 first-entry comparison and runtime
+code real-pack translation policy were the next boundary. The generated-runner
+gate now compares the live state before instruction one; NWXE matched all GPRs,
+HI/LO, and modeled CP0 fields exactly. Checked aligned word accesses now offer
+the translated address to the live MMIO hook before rejecting absent RDRAM
+backing, so the SI-status read at `0x80038268` / `0xffffffffa4800018` executes
+in arbitrary-PC AOT. The generated NWXE pack additionally recognizes the
+unique exact six-word `__osSiDeviceBusy` body, emits its address as a pack fact,
+and gives only that fact typed host-call precedence; absence or ambiguity is a
+build failure. Three independent public-debugger target snapshots then
+classified the apparent TLB frontier as a harness materialization bug: the
+reference reached `0x80036f10` after 261,748 retired window instructions with
+`$t8 = 0xffffffff80048860`; fn64's `0x60880480` was the exact byte reversal
+caused by copying flat big-endian ROM bytes into native-word RDRAM storage.
+The block example now uses the canonical logical IPL3 DMA materializer. Ten
+corrected runs first stopped identically at the honest sparse-pack miss for
+spawned thread entry `0x800004d0`. The fixed-point pack builder now requires at
+least three ROM-bound black-box traces with identical parsed authority,
+completion shape, event counts, and exact activation-0 boot-root sets, and
+augments the static bank with those observed bank-generation words. Raw PC
+order is not an authority: regenerated two-million-step captures first
+diverged when asynchronous interrupt delivery moved a general-exception entry
+by adjacent guest instructions, while all three retained the same 5,183-PC
+total set and exact activation-0 boot-root digest. Observations stay scenario
+coverage rather than function-owner proof or an exhaustive support claim. The
+public debugger does not expose a separate pause for architectural delay slots,
+so the producer removed its former executed-PC exhaustiveness claim and the
+pack adds required delay-slot words from the verified ROM mapping. Three
+regenerated traces reproduced the exact admitted root set. The resulting bounded
+NWXE pack contains 1,929 observed PCs plus 289 required delay slots in 90
+spans / 2,517 total words and admits `0x800004d0`. Ten consecutive runs reach
+the next frontier with no earlier `AotMiss`: a runtime memory-model fault at
+`0x8002a8d8` for guest address `0xffffffffb0000000`. The checked raw-word seam
+now maps canonical cached/uncached PI-domain-1 cartridge reads to the installed
+read-only ROM source shared with PI DMA. Ten consecutive corrected runs pass
+that access and expose a raw guest VI initialization image with V timing and
+scales programmed, H_START zero, and status enabled. The independent public
+debugger observes the same values and no H_START transition; one adjacent-pause
+variation in the status observation prevents treating that diagnostic as an
+instruction-exact timing oracle. A zero H or V interval now remains an
+inactive retained image, while nonzero malformed intervals still trap. Ten
+consecutive corrected runs pass the old VI assertion and stop identically at
+the separate missing-render-backend frontier, with no earlier `AotMiss`.
+Static closure and runtime behavior therefore remain separate reports. The loud gap retains current CP0
+context without claiming a non-architectural miss committed an exception.
+The next full-image gate emits all 262,144 aligned words of the one-MiB NWXE
+resident image. A single generated control-flow body exceeded the two-minute
+budget and approached the 4 GiB per-process ceiling. Sixteen fixed,
+content-addressed 64 KiB crate artifacts now retain the planned bank boundary;
+each uses static 4 KiB subrunners internally so rustc never analyzes 16,384
+entries as one function. No runtime decoder was introduced. Measured on the
+same input, full `cargo check -j4` completed in 62.67 seconds, native debug
+build in 107.56 seconds, and unchanged rebuild in 0.06 seconds; the debug
+binary is 295 MiB. Three independent 400,000-step traces, BootContexts, and
+completed `0x80000180` image captures are byte-identical. The four-word
+CPU-produced general-exception preamble remains a separate digest-gated bank.
+Its four admitted words are compared directly on the matching hot path, while
+a mismatch still hashes the complete live image and reports the admitted
+expected digest in `AotMiss`; hashing is evidence construction, not routine
+exception-entry work.
+The standalone artifact represents captured exception images as a validated
+catalog rather than one scalar bank. Multiple independently reproducible
+groups can therefore install disjoint, digest-gated static runners without
+changing runtime translation policy. Catalog construction rejects unmodeled
+first-fetch entries, overlapping ranges, immutable-shard overlap, duplicate
+capture identities, and truncated bank-ID collisions. Only the existing
+`0x80000180` capture is presently owned; the other modeled vector entries stay
+open until equivalent evidence or a machine-checked unreachability proof
+exists.
+With an explicit reference renderer and typed in-memory SRAM device, dense AOT
+passes every former sparse-pack miss. RSP-produced RDRAM writes now defer
+generation publication until the enclosing generated instruction returns,
+closing a nested live-program borrow while preserving publication before the
+next guest instruction. A typed indirect-transfer trace proved that the
+apparent `0x800e1b90` indirect frontier is instead the target of a direct
+`jal`. The first fetch-time implementation hashed the containing 4 KiB page
+and incorrectly classified it as a replacement generation. The capture's
+`first_executed_pc` was caller-supplied rather than observed, its first
+`0x790` bytes are mutable non-code state, and its executable suffix
+`0x800e1b90..0x800e2400` is byte-identical to the ordinary resident mapping
+from ROM `0xe2790..0xe3000`. A public-debugger word probe found the entry word
+present at the header handoff and unchanged over two million steps; a
+byte-for-byte comparison establishes the complete suffix identity. The
+trace-derived duplicate generation is therefore rejected. Dense AOT runners
+now verify the exact instruction word immediately before executing it and
+verify a delay word only on a path that executes the delay slot. Neighboring
+data writes no longer retire valid code; a changed fetched word returns typed
+`ImageChanged` with zero retired instructions, and the closed catalog hashes
+only complete mechanically recovered overlay candidates before retrying the
+same instruction. Unknown content traps with `AotMiss`; there is no runtime
+translator or interpreter fallback in the `aot-runtime` production feature.
+Focused gates cover changed instructions, mutable neighbors, annulled/taken
+branch-likely delays, shard-end delay lookahead, and cross-shard fallthrough.
+The corrected debug executable completes both two-million- and ten-million-step
+idle-boot runs without an earlier `AotMiss` or false `ImageChanged`; the longer
+run executes 9,305,999 AOT entries and peaks below 1 GiB. Neither run enters a
+ROM-recovered overlay generation. Extending the horizon fivefold therefore
+does not supply overlay evidence: the preserved public-debugger traces contain
+no controller-input authority, and this idle scenario does not request the
+gameplay overlays. Closure now needs a deterministic controller scenario (and
+independent black-box trace of that same scenario), not another passive boot
+horizon. A serial release build is not safe on this 24 GiB host: one
+`wm2000-block-overlay-2-shard-04` rustc
+process crossed the explicit 10 GiB guard and was terminated while system free
+memory remained above 80%. The guarded serial debug build completed in 25
+minutes 33 seconds and stayed near 1.1 GiB during code generation after the
+CPU-only per-shard discovery phase. Its exact minimum-budget PC history matches
+the public-debugger guest prefix after accounting for architectural delay
+slots, annulled branch-likely charged units, and the typed
+`__osSiDeviceBusy` substitution. Flat lockstep ceases at the expected
+`osCreateThread` host boundary. Public-debugger target snapshots are not a
+state arbiter there: the reported 24-byte stack difference contradicts the
+reference trace's own intervening stack-adjusting instructions, and three
+common-resume attempts expose a non-boolean `$v0` after the independently
+decoded boolean-return body. No runtime behavior change is justified by those
+snapshots. ROM-recovered overlay entry and ten-run deterministic validation
+remain open runtime-timeline gates.
+Build-phase profiling subsequently showed that the standalone shard workspace
+compiled mechanical discovery at `opt-level = 0`: one representative overlay
+shard spent 69.185 of 70.731 build-script seconds in overlay recovery. A
+scoped build-profile override plus a sparse valid-record index reduced the
+same complete build script to 249 ms (86 ms recovery) without optimizing the
+generated guest crate. The recovery receipt and `2 / 1 / 4`
+candidate/admission/recipe counts are unchanged across 10/10 real-ROM runs;
+the full guarded debug build now completes in 17 minutes 17 seconds, down from
+25 minutes 33 seconds, while paying the one-time optimized host-dependency
+rebuild. It peaks at 3.27 GiB during final linking with 88% system memory free;
+serial generated-crate compilation, not discovery, is now the dominant cost.
+The next invalidation reduction is implemented as an inactive foundation: the
+legacy build and one-shot ROM-wide producer share one generator, the producer
+atomically publishes a digest-indexed private prepared tree outside the repo,
+and each shard's std-only materializer can copy only its verified pair of
+generated sources. The v2 root cross-binds stable package sidecars: global
+source-claim changes leave them byte-identical, and one changed artifact
+changes only its owning sidecar at the byte-contract layer. The
+producer retains the same root for claim-only retries by atomically replacing
+only the authority manifest. Actual zero/one-shard Cargo invalidation remains
+an activation benchmark, not a current result. The canonical format and
+cold-authority activation gates are in
+[`WM-PREPARED-SHARDS.md`](WM-PREPARED-SHARDS.md). The 35 manifests deliberately
+remain on the current build script. Generated-build v3 now owns and repeatedly
+measures the producer and private prepared candidate, but records the exact
+mode as `legacy_with_prepared_candidate`; the selected binary's legacy source
+attestation therefore remains the compilation authority. Real-ROM byte parity,
+the all-manifest `prepared_consumed` switch, and guarded cold/warm invalidation
+measurements remain open, so this is not yet a speedup result.
+The shared shard build script now treats `FN64_PROFILE_BUILD` as observational
+rather than a Cargo invalidator and writes generated outputs only when content
+changes. A full hot graph with the flag toggled completes in 0.12 seconds. The
+checked-in macOS guard launches a dedicated session/process group, samples
+that exact group until it is empty even when descendants are reparented, and
+terminates only that group. RSS and system-free thresholds are sampled safety
+signals, not kernel hard limits, so short overshoot between samples remains
+possible. The
+current local build wrapper fixes Cargo at one job and defaults to a 4 GiB
+aggregate ceiling plus a 40%-free system floor; historical debug `-j3`
+measurements reached 5.28 GiB, and broad release parallelism remains outside
+the safe envelope. Opt-in wall-time and path-free JSONL sampling make a profile
+bounded without making the profiling flag a Cargo input. A per-bank AOT
+counter attributes a 200,000-step resident probe to shard 00 (56.5%), shard 03
+(34.1%), and shard 02 (9.4%). A historical experiment optimizing the first two
+hot crates reduced that exact probe from 24.75 to 18.41 seconds; its guarded
+`-j2` rebuild took 1 minute 41 seconds and peaked at 5.45 GiB. The current
+standalone full-graph profile instead applies opt-level 1 / 16 codegen units to
+all dependency packages so the final link can load the shard catalog within
+the measured envelope, with opt-level 2 restricted to the handwritten
+reference-renderer, runtime, and ABI hot paths. Those first measurements also
+exposed zsh's automatic `nice(5)` for monitored background jobs. Disabling
+that priority change in the guard reduced the same final probe again to 9.07
+seconds, for a compound 63% reduction from the original guarded configuration.
+Unrequested
+block-destination and host-boundary
+histories are suppressed only by this exploratory harness; the library default
+remains complete history, and setting either trace-output environment variable
+retains the complete corresponding stream.
+
+The controller schedule is now a digest-bound, per-port read-ordinal format,
+so translated host substitutions cannot skew its replay clock. Its first
+resident probe reports final ordinals `[0, 0, 0, 0]` after 200,000 steps: the
+current timeline performs no standard-controller read at all. Input search
+therefore cannot request an overlay yet, and building the independent Mupen
+input plugin would not close the present frontier. Device/task progression to
+the first controller poll or natural overlay request must be diagnosed first.
+
+Subsequent semantic host discovery bound the public `osSetTimer` behavior into
+the typed timer wheel, allowing controller initialization to complete one SI
+operation without an input schedule. The same work added uniqueness-gated
+bindings for the public `osSpTaskLoad`, `osSpTaskStartGo`, `osSpTaskYield`, and
+`osSpTaskYielded` operations and retained `LleAccuracy` for audio tasks. A
+separate VI cadence correction stopped repeated H/V timing writes from
+restarting the beam epoch. With those corrections, 10/10 current
+non-exploratory runs enter mechanically recovered overlay generation
+`0x5DEA0D1723E94993` at step 19,523 and `sim_time=13990253`; guarded peak RSS is
+134 MiB. ROM-recovered overlay entry is therefore closed for this scenario,
+superseding the passive-horizon status above. Full static execution is still
+open: a bounded 100,000-step continuation completes overlay0 but reports zero
+graphics submits and enters no later overlay generation.
+
+Reserved
+encodings in the dense AOT emitter and development interpreter produce precise architectural RI exceptions
+(ExcCode 10) instead of code-generation or unsupported-lane failures. The
+block lane's live region
 mechanism observes registered typed CPU and device DMA writes, snapshots their
 final architectural
 bytes at a host boundary, atomically retires generation A, publishes B at the
@@ -445,8 +737,8 @@ instruction or one complete branch/delay pair. Deferred exits retain the
 source bank and prevent call/fault target resolution until B is published;
 non-overlap continues, and the live gate keeps A's post-store sentinel
 unreachable. Page-granular ownership, automatic executable detection, a real
-translator/pack, dynamic-target recording, and real-pack boot wiring remain
-open.
+translator/pack, dynamic-target recording, and real private-pack execution
+evidence remain open.
 
 ### U2 — deterministic PI/device vertical slice
 
@@ -520,6 +812,26 @@ sources as well as runtime/ABI/audio/render paths. These mechanics make a
 reached gap impossible to certify as zero, but they do not close the
 architectural behaviors listed below.
 
+The executable-source receipt now treats initial Status as a distinct U4
+authority. An absent `FN64_BOOT_CONTEXT` is recorded as an open `missing`
+state; a supplied context is accepted only after its canonical ROM, IPL3,
+region, TV, and entry identities match the normalized discovery image, and
+then retains the exact CP0 Status value. This proves neither subsequent
+`MTC0` values nor child-thread inheritance, which remain separate frontiers.
+The same receipt now requires a digest/range/generation-bound Status scan for
+every reproducible external executable image, so dynamically captured vector
+or generated code cannot sit outside the U4 instruction denominator.
+Proven-code Status writes are paired one-to-one with the existing CFG
+value-set analysis. Only exhaustive finite `MTC0` values that all clear BEV
+close that write; mutable image loads, widening, unknowns, and every `DMTC0
+Status` remain typed U4 blockers.
+Only after those facts, the exact typed installed-host denominator, normal
+handler ownership, executable-writer closure, and transfer closure all agree
+may the receipt's in-process BEV-clear induction mark the three bootstrap
+vectors unreachable. Exception/interrupt entry, ERET, scheduler restore, and
+`osCreateThread` preserve the invariant; no caller-supplied opaque proof digest
+is accepted.
+
 Working-tree frontier: explicit `SYSCALL`, `BREAK`, all integer
 conditional-trap instructions, and trapping `ADD`/`ADDI`/`SUB` plus their
 64-bit `DADD`/`DADDI`/`DSUB` counterparts in emitted bank runners now return
@@ -541,9 +853,12 @@ ErrorEPC, so the compile/run gate now
 executes a real read/advance/write EPC handler before ERET. The combined library
 and compile/run gate passed 10 consecutive runs. The coroutine runtime now owns
 this block program and samples precise MI/IP2 interrupts at instruction-budget
-boundaries. The executor now owns Count's half-rate phase, wrap-safe Compare
-matching, and the latched IP7 line; live MTC0 Count/Compare writes cross back
-to that authority, including same-value Compare acknowledgement before ERET.
+boundaries. The executor now owns Count's half-rate phase, passes that exact
+phase into both arbitrary-PC lanes for interior MFC0 Count reads, and retains
+wrap-safe Compare matching plus the latched IP7 line; live MTC0 Count/Compare
+writes cross back to that authority, including same-value Compare
+acknowledgement before ERET. Interior reads do not mutate the boundary-owned
+clock, so its post-block advance remains single-counted.
 The exact checkpoint-match/handler/acknowledge/ERET interleaving passed 20
 consecutive clean runs.
 Status.FR is now a lossless view switch over all 32 physical FGRs:
@@ -570,10 +885,15 @@ and admits only the exact registry of FR-stable host shims before exposing the
 raw context pointer. This rejects even a transition which accesses the other
 view and restores the entry mode before return; the exit check remains a
 second invariant before decoding entry-view bytes
-under the wrong layout.
+under the wrong layout. The same common boundary snapshots Status.BEV and
+rejects any exit transition before copying `status_reg` back. Whole-register
+Status replacement remains available only through typed guest/COP0 authority,
+never as an incidental side effect of an admitted legacy-C adapter.
 Every naturally aligned integer, LL/SC, and COP1 memory operation in the bank
 lane now checks its effective address before any register, memory, or
-reservation mutation. Misaligned loads return AdEL/ExcCode 4; stores return
+reservation mutation. Generated arms construct these failures through the
+typed, shared cold boundary in `fn64_recomp_rs::generated_support`; the normal
+memory path remains inline. Misaligned loads return AdEL/ExcCode 4; stores return
 AdES/ExcCode 5; both carry BadVAddr, and delay-slot faults preserve branch EPC
 plus Cause.BD. The compile-and-run gate covers a normal load fault, a store
 fault in a taken delay slot, side-effect suppression, installed-handler entry,
@@ -588,8 +908,8 @@ memory access, branch delay instruction, or address-alignment check can occur.
 The compile/run gate covers straight execution, a COP1 branch, COP1 in an
 integer delay slot, CU1-enabled execution, CU1-versus-AdEL priority, installed
 handler entry, and ERET. Remaining COP0/COP2, 64-bit instruction admission,
-instruction-interior timing, whole-function-lane, and floating-point
-exceptions remain open.
+instruction-interior interrupt/Compare sampling, whole-function-lane, and
+floating-point exceptions remain open.
 
 ### U5 — device closure
 

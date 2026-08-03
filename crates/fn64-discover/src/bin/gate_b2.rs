@@ -26,7 +26,7 @@
 
 use fn64_discover::banks::{self, DescriptorTableShape};
 use fn64_discover::block_pack::{
-    emit_block_pack_v1, emit_materialized_bank_runner, materialize_block_pack,
+    emit_materialized_bank_runner, emit_validated_block_pack_v2, materialize_block_pack,
     materialized_code_bank,
 };
 use fn64_discover::grade_nw4e_symbols::{grade_grind_collapse, parse_symbol_addrs};
@@ -38,7 +38,8 @@ use fn64_discover::owner_proof::{OwnerAssessment, OwnerProofReport};
 use fn64_discover::partition::{partition, same_bank_overlaps, Owner};
 use fn64_discover::resolve::{build_cfg_closed_with_facts, build_cfg_exploratory_with_candidates};
 use fn64_discover::snapshot::{
-    compose_materialized_bank_v1, BankSnapshotV1, MaterializedBankInput, ProgramSnapshotV1,
+    compose_materialized_bank_v1, compose_materialized_bank_validated_v2, BankSnapshotV1,
+    MaterializedBankInput, ProgramSnapshotV1,
 };
 use fn64_discover::{run_discovery, DescriptorTableInput};
 use fn64_recomp_rs::{decode, Instruction};
@@ -624,8 +625,9 @@ fn run_nwxe_function_gate() -> Result<(), String> {
         bytes: bank_bytes,
         seed_roots: std::slice::from_ref(&entrypoint),
     };
-    let snapshot = compose_materialized_bank_v1(&rom, &db, input())
+    let validated_snapshot = compose_materialized_bank_validated_v2(&rom, &db, input())
         .map_err(|error| format!("composing NWXE program snapshot: {error}"))?;
+    let snapshot = &validated_snapshot.snapshots()[0];
     let canonical = serde_json::to_vec(&snapshot)
         .map_err(|error| format!("serializing NWXE program snapshot: {error}"))?;
     let snapshot_sha256 = format!("{:x}", Sha256::digest(&canonical));
@@ -642,7 +644,7 @@ fn run_nwxe_function_gate() -> Result<(), String> {
         }
     }
     let bank_snapshot = &snapshot.banks[0];
-    let block_pack = emit_block_pack_v1(&snapshot, &rom)
+    let block_pack = emit_validated_block_pack_v2(&validated_snapshot, 0, &rom)
         .map_err(|error| format!("emitting NWXE Block Pack: {error}"))?;
     let block_pack_json = serde_json::to_vec(&block_pack)
         .map_err(|error| format!("serializing NWXE Block Pack: {error}"))?;

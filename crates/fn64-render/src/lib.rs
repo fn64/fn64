@@ -346,12 +346,14 @@ pub struct ViActiveWindow {
 impl ViActiveWindow {
     const FIELD_MASK: u32 = 0x03ff;
 
-    /// Decode a programmed active window, or report that no H/V window has
-    /// been programmed yet. A partially programmed or malformed image still
-    /// traps through [`Self::from_registers`].
+    /// Decode a programmed active window, or report that either the H or V
+    /// interval has not been programmed yet. Register initialization is not
+    /// atomic: software may enable VI after filling V_START while H_START is
+    /// still zero, which remains an inactive image until both intervals exist.
+    /// Nonzero malformed intervals still trap through [`Self::from_registers`].
     pub fn try_from_registers(horizontal: u32, vertical: u32) -> Option<Self> {
         let used = Self::FIELD_MASK | (Self::FIELD_MASK << 16);
-        if horizontal & used == 0 && vertical & used == 0 {
+        if horizontal & used == 0 || vertical & used == 0 {
             None
         } else {
             Some(Self::from_registers(horizontal, vertical))
@@ -1704,6 +1706,8 @@ mod tests {
         let masked = ViActiveWindow::from_registers(0xfc6c_f2ec, 0xfc25_f1ff);
         assert_eq!(masked, window);
         assert_eq!(ViActiveWindow::try_from_registers(0, 0), None);
+        assert_eq!(ViActiveWindow::try_from_registers(0, 0x0025_01ff), None);
+        assert_eq!(ViActiveWindow::try_from_registers(0x006c_02ec, 0), None);
         assert_eq!(
             ViActiveWindow::try_from_registers(0x006c_02ec, 0x0025_01ff),
             Some(window)
@@ -1785,6 +1789,21 @@ mod tests {
         words[0] = 3;
         words[1] = 0x0010_0000;
         words[2] = 320;
+        let registers = ViScanoutRegisters::from_words(words);
+        assert_eq!(registers.words(), words);
+        assert_eq!(registers.active_window(), None);
+    }
+
+    #[test]
+    fn vi_scanout_registers_retain_a_partially_programmed_inactive_image() {
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 0x311e;
+        words[1] = 0x280;
+        words[2] = 320;
+        words[9] = 0;
+        words[10] = 0x0025_01ff;
+        words[12] = 0x200;
+        words[13] = 0x400;
         let registers = ViScanoutRegisters::from_words(words);
         assert_eq!(registers.words(), words);
         assert_eq!(registers.active_window(), None);

@@ -12,6 +12,23 @@ The tool reads one JSON request:
 cargo run -p fn64-audio --bin audio_abi_characterize -- request.json
 ```
 
+For an already characterized compact identity, the companion verifier runs
+the compact HLE executor and the clean-room LLE authority from the same
+post-rspboot snapshot:
+
+```sh
+cargo run -p fn64-audio --bin audio_compact_verify -- request.json
+```
+
+It accepts request v2 but requires every trial to contain exactly one phase;
+cross-task persistence is rejected. Its content-free v1 report gives the
+command and decoded-command counts, exact terminal-DMEM equivalence and hashed
+difference ranges, and canonical RDRAM-patch equivalence for every trial. It
+does not serialize packets, memory bytes, paths, or caller-controlled case
+labels. This verifier establishes command-list memory effects only. It does
+not compare terminal scalar/vector/SP state, completion work, live scheduling,
+or commit policy and therefore cannot authorize live HLE selection by itself.
+
 Every private file has a required exact SHA-256. The harness refuses a
 mismatch before execution. Paths and bytes never enter the report. Standard
 output is one canonical compact JSON value containing only fixture revision,

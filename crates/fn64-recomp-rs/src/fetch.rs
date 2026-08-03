@@ -10,6 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+use std::num::NonZeroUsize;
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+use sha2::{Digest, Sha256};
 
 use crate::decode;
 use crate::execution::{
@@ -17,8 +22,13 @@ use crate::execution::{
     GeneratedBankRunner, GuestPc, InstructionBudget, InstructionWordIdentity,
     ProgramArtifactIdentity,
 };
-use crate::interp::{run_instruction_unit, UnsupportedOp};
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+use crate::interp::run_instruction_unit_with_memory_port;
+#[cfg(feature = "dev-interpreter")]
+use crate::interp::UnsupportedOp;
 use crate::runtime::{DataAccessError, Rdram, RecompContext, TlbFaultKind};
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+use crate::semantic::{MemoryPort, NoMmio};
 
 /// One immutable contiguous physical code span.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,13 +323,278 @@ pub struct FetchedInstruction {
     pub word: u32,
 }
 
-/// Translate and fetch through one immutable physical-code catalog.
-pub fn fetch_instruction(
-    catalog: &PhysicalCodeCatalog,
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+const DYNAMIC_MAPPED_UNIT_IDENTITY_DOMAIN_V1: &[u8] = b"fn64.dynamic-mapped-unit.identity.v1\0";
+
+/// Full identity of one execution-local unit snapshotted from live RDRAM.
+/// The digest, rather than its [`BankId`] projection, remains collision
+/// authority.
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DynamicMappedUnitIdentityV1([u8; 32]);
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+impl DynamicMappedUnitIdentityV1 {
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Result of snapshotting and executing one straight instruction or one
+/// indivisible branch/delay pair from live physical RDRAM.
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicMappedRunV1 {
+    pub entry: ExecutionKey,
+    pub identity: DynamicMappedUnitIdentityV1,
+    pub instructions: Vec<InstructionWordIdentity>,
+    pub newly_admitted: bool,
+    pub run: BlockRun,
+}
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicMappedErrorV1 {
+    ZeroSemanticsIdentity,
+    CatalogCapacityExceeded {
+        capacity: usize,
+    },
+    Fetch {
+        fault: CpuFault,
+        attempted_instructions: u32,
+    },
+    BankCollision {
+        bank: BankId,
+        identity: DynamicMappedUnitIdentityV1,
+        registered_identity: Option<DynamicMappedUnitIdentityV1>,
+        reserved_by_static_program: bool,
+    },
+}
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+impl fmt::Display for DynamicMappedErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::ZeroSemanticsIdentity => {
+                write!(formatter, "dynamic mapped execution has zero semantic identity")
+            }
+            Self::CatalogCapacityExceeded { capacity } => write!(
+                formatter,
+                "dynamic mapped identity catalog reached its bounded capacity of {capacity} units"
+            ),
+            Self::Fetch {
+                fault,
+                attempted_instructions,
+            } => write!(
+                formatter,
+                "{fault} after {attempted_instructions} attempted instruction fetch(es)"
+            ),
+            Self::BankCollision {
+                bank,
+                reserved_by_static_program,
+                ..
+            } => write!(
+                formatter,
+                "dynamic mapped identity collides at {bank} (reserved_static={reserved_by_static_program})"
+            ),
+        }
+    }
+}
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+impl std::error::Error for DynamicMappedErrorV1 {}
+
+/// Execution-local catalog for exact live instruction units.
+///
+/// Every activation snapshots the next complete unit again. Consequently a
+/// committed write cannot leave a stale later instruction resident: straight
+/// instructions end the unit, while a control instruction and its already-
+/// fetched delay slot are architecturally indivisible. The catalog retains
+/// only full identity-to-bank bindings for A→B→A reuse; it does not mutate the
+/// immutable static program or claim an executable virtual range.
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+pub struct DynamicMappedUnitCatalogV1 {
+    semantics_identity: [u8; 32],
+    identities_by_bank: BTreeMap<BankId, DynamicMappedUnitIdentityV1>,
+    capacity: NonZeroUsize,
+}
+
+/// Prevent a self-modifying workload from growing host memory without bound.
+/// Saturation is loud so a caller cannot mistake a partial run for closure.
+const DYNAMIC_MAPPED_UNIT_CATALOG_CAPACITY: usize = 131_072;
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+impl DynamicMappedUnitCatalogV1 {
+    /// Construct a catalog bound to the exact mapped-execution implementation
+    /// linked into this process.
+    pub fn new_linked() -> Self {
+        let receipt = crate::dynamic_mapped_execution_build_receipt_v1();
+        assert!(
+            receipt.available(),
+            "dynamic mapped execution capability is not linked"
+        );
+        Self::new(receipt.source_sha256())
+            .expect("implementation-issued dynamic semantics identity is nonzero")
+    }
+
+    pub fn new(semantics_identity: [u8; 32]) -> Result<Self, DynamicMappedErrorV1> {
+        Self::new_with_capacity(
+            semantics_identity,
+            NonZeroUsize::new(DYNAMIC_MAPPED_UNIT_CATALOG_CAPACITY)
+                .expect("dynamic catalog capacity is nonzero"),
+        )
+    }
+
+    pub fn new_with_capacity(
+        semantics_identity: [u8; 32],
+        capacity: NonZeroUsize,
+    ) -> Result<Self, DynamicMappedErrorV1> {
+        if semantics_identity == [0; 32] {
+            return Err(DynamicMappedErrorV1::ZeroSemanticsIdentity);
+        }
+        Ok(Self {
+            semantics_identity,
+            identities_by_bank: BTreeMap::new(),
+            capacity,
+        })
+    }
+
+    /// Snapshot and execute one exact live unit after the caller has reached a
+    /// quiescent outer dispatch boundary. `reserved_by_static_program` must
+    /// report every bank owned by the immutable static/precompiled install.
+    pub fn activate_and_run(
+        &mut self,
+        attempted_entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        reserved_by_static_program: impl FnMut(BankId) -> bool,
+    ) -> Result<DynamicMappedRunV1, DynamicMappedErrorV1> {
+        let mut no_mmio = NoMmio;
+        let mut port = MemoryPort::mmio_only(&mut no_mmio);
+        self.activate_and_run_with_memory_port(
+            attempted_entry,
+            budget,
+            ctx,
+            mem,
+            &mut port,
+            reserved_by_static_program,
+        )
+    }
+
+    /// [`Self::activate_and_run`] with distinct MMIO and cartridge-memory
+    /// authorities installed for the exact interpreted instruction unit.
+    pub fn activate_and_run_with_memory_port(
+        &mut self,
+        attempted_entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        port: &mut MemoryPort<'_>,
+        mut reserved_by_static_program: impl FnMut(BankId) -> bool,
+    ) -> Result<DynamicMappedRunV1, DynamicMappedErrorV1> {
+        let primary = snapshot_live_instruction(
+            ctx,
+            mem,
+            attempted_entry.bank,
+            InstructionFetchSite::primary(attempted_entry.pc),
+        )?;
+        let mut fetched = vec![primary];
+        if decode(primary.word).has_delay_slot() {
+            // Fetch the complete pair before either instruction has an effect.
+            fetched.push(snapshot_live_instruction(
+                ctx,
+                mem,
+                attempted_entry.bank,
+                InstructionFetchSite::delay_slot(attempted_entry.pc),
+            )?);
+        }
+
+        let identity = dynamic_mapped_unit_identity(self.semantics_identity, &fetched);
+        let (bank, newly_admitted) =
+            self.admit_identity(identity, &mut reserved_by_static_program)?;
+
+        let words = fetched
+            .iter()
+            .map(|instruction| instruction.word)
+            .collect::<Vec<_>>();
+        let instructions = fetched
+            .iter()
+            .map(|instruction| InstructionWordIdentity::new(bank, instruction.physical_address))
+            .collect();
+        let entry = ExecutionKey::new(bank, attempted_entry.pc);
+        let run = run_instruction_unit_with_memory_port(
+            bank,
+            attempted_entry.pc,
+            &words,
+            budget,
+            ctx,
+            mem,
+            port,
+        )
+        .unwrap_or_else(|unsupported| {
+            BlockRun::new(BlockExit::Fault(unsupported.into_cpu_fault()), 0)
+        });
+        Ok(DynamicMappedRunV1 {
+            entry,
+            identity,
+            instructions,
+            newly_admitted,
+            run,
+        })
+    }
+
+    fn admit_identity(
+        &mut self,
+        identity: DynamicMappedUnitIdentityV1,
+        reserved_by_static_program: &mut impl FnMut(BankId) -> bool,
+    ) -> Result<(BankId, bool), DynamicMappedErrorV1> {
+        let bank = BankId::new(u64::from_be_bytes(identity.0[..8].try_into().unwrap()));
+        let registered_identity = self.identities_by_bank.get(&bank).copied();
+        let reserved = reserved_by_static_program(bank);
+        if reserved || registered_identity.is_some_and(|known| known != identity) {
+            return Err(DynamicMappedErrorV1::BankCollision {
+                bank,
+                identity,
+                registered_identity,
+                reserved_by_static_program: reserved,
+            });
+        }
+        if registered_identity.is_none() && self.identities_by_bank.len() >= self.capacity.get() {
+            return Err(DynamicMappedErrorV1::CatalogCapacityExceeded {
+                capacity: self.capacity.get(),
+            });
+        }
+        let newly_admitted = registered_identity.is_none();
+        self.identities_by_bank.insert(bank, identity);
+        Ok((bank, newly_admitted))
+    }
+
+    pub fn identity_for_bank(&self, bank: BankId) -> Option<DynamicMappedUnitIdentityV1> {
+        self.identities_by_bank.get(&bank).copied()
+    }
+
+    pub fn admitted_len(&self) -> usize {
+        self.identities_by_bank.len()
+    }
+
+    pub const fn capacity(&self) -> usize {
+        self.capacity.get()
+    }
+}
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+#[derive(Clone, Copy)]
+struct LiveFetchedInstruction {
+    physical_address: u32,
+    word: u32,
+}
+
+fn translate_instruction_site(
     ctx: &RecompContext,
     bank: BankId,
     site: InstructionFetchSite,
-) -> Result<FetchedInstruction, CpuFault> {
+) -> Result<(GuestPc, u32), CpuFault> {
     let pc = site.pc();
     let at = ExecutionKey::new(bank, pc);
     if !pc.is_instruction_aligned() {
@@ -368,12 +643,78 @@ pub fn fetch_instruction(
                 }
             },
         })?;
-    let identity = InstructionWordIdentity::new(bank, translated.get());
+    Ok((pc, translated.get()))
+}
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+fn snapshot_live_instruction(
+    ctx: &RecompContext,
+    mem: &Rdram<'_>,
+    fault_bank: BankId,
+    site: InstructionFetchSite,
+) -> Result<LiveFetchedInstruction, DynamicMappedErrorV1> {
+    let (virtual_pc, physical_address) = translate_instruction_site(ctx, fault_bank, site)
+        .map_err(|fault| DynamicMappedErrorV1::Fetch {
+            fault,
+            attempted_instructions: attempted_fetches(fault, site.branch_delay()),
+        })?;
+    let mut bytes = [0u8; 4];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        let physical =
+            physical_address
+                .checked_add(offset as u32)
+                .ok_or(DynamicMappedErrorV1::Fetch {
+                    fault: CpuFault {
+                        at: ExecutionKey::new(fault_bank, virtual_pc),
+                        kind: CpuFaultKind::UnmappedPhysicalInstruction { physical_address },
+                    },
+                    attempted_instructions: 0,
+                })?;
+        *byte = mem
+            .try_load_physical_bu(physical)
+            .ok_or(DynamicMappedErrorV1::Fetch {
+                fault: CpuFault {
+                    at: ExecutionKey::new(fault_bank, virtual_pc),
+                    kind: CpuFaultKind::UnmappedPhysicalInstruction { physical_address },
+                },
+                attempted_instructions: 0,
+            })?;
+    }
+    Ok(LiveFetchedInstruction {
+        physical_address,
+        word: u32::from_be_bytes(bytes),
+    })
+}
+
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
+fn dynamic_mapped_unit_identity(
+    semantics_identity: [u8; 32],
+    fetched: &[LiveFetchedInstruction],
+) -> DynamicMappedUnitIdentityV1 {
+    let mut hasher = Sha256::new();
+    hasher.update(DYNAMIC_MAPPED_UNIT_IDENTITY_DOMAIN_V1);
+    hasher.update(semantics_identity);
+    hasher.update((fetched.len() as u64).to_be_bytes());
+    for instruction in fetched {
+        hasher.update(instruction.physical_address.to_be_bytes());
+        hasher.update(instruction.word.to_be_bytes());
+    }
+    DynamicMappedUnitIdentityV1(hasher.finalize().into())
+}
+
+/// Translate and fetch through one immutable physical-code catalog.
+pub fn fetch_instruction(
+    catalog: &PhysicalCodeCatalog,
+    ctx: &RecompContext,
+    bank: BankId,
+    site: InstructionFetchSite,
+) -> Result<FetchedInstruction, CpuFault> {
+    let (pc, physical_address) = translate_instruction_site(ctx, bank, site)?;
+    let at = ExecutionKey::new(bank, pc);
+    let identity = InstructionWordIdentity::new(bank, physical_address);
     let word = catalog.word(identity).ok_or(CpuFault {
         at,
-        kind: CpuFaultKind::UnmappedPhysicalInstruction {
-            physical_address: translated.get(),
-        },
+        kind: CpuFaultKind::UnmappedPhysicalInstruction { physical_address },
     })?;
     Ok(FetchedInstruction {
         virtual_pc: pc,
@@ -399,12 +740,14 @@ fn attempted_fetches(fault: CpuFault, delay_slot: bool) -> u32 {
 /// Construction is private to [`admit_mapped_unit`], so owning dispatchers may
 /// treat possession of this value as proof that every instruction the unit can
 /// execute was fetched successfully before recording an entered destination.
+#[cfg(feature = "dev-interpreter")]
 pub(crate) struct AdmittedMappedUnit {
     bank: BankId,
     entry: GuestPc,
     words: Vec<u32>,
 }
 
+#[cfg(feature = "dev-interpreter")]
 pub(crate) fn admit_mapped_unit(
     catalog: &PhysicalCodeCatalog,
     bank: BankId,
@@ -424,13 +767,40 @@ pub(crate) fn admit_mapped_unit(
     Ok(AdmittedMappedUnit { bank, entry, words })
 }
 
+#[cfg(feature = "dev-interpreter")]
 pub(crate) fn run_admitted_mapped_unit(
     unit: AdmittedMappedUnit,
     budget: InstructionBudget,
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
 ) -> Result<BlockRun, UnsupportedOp> {
-    run_instruction_unit(unit.bank, unit.entry, &unit.words, budget, ctx, mem)
+    let mut no_mmio = NoMmio;
+    run_admitted_mapped_unit_with_memory_port(
+        unit,
+        budget,
+        ctx,
+        mem,
+        &mut MemoryPort::mmio_only(&mut no_mmio),
+    )
+}
+
+#[cfg(feature = "dev-interpreter")]
+pub(crate) fn run_admitted_mapped_unit_with_memory_port(
+    unit: AdmittedMappedUnit,
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+    port: &mut MemoryPort<'_>,
+) -> Result<BlockRun, UnsupportedOp> {
+    run_instruction_unit_with_memory_port(
+        unit.bank,
+        unit.entry,
+        &unit.words,
+        budget,
+        ctx,
+        mem,
+        port,
+    )
 }
 
 /// Execute one dynamically fetched unit in the interpreter lane.
@@ -439,6 +809,7 @@ pub(crate) fn run_admitted_mapped_unit(
 /// slot VA is translated independently before execution, so adjacent virtual
 /// words may come from unrelated physical pages. The temporary virtual view is
 /// execution-local; admitted identity remains the physical catalog above.
+#[cfg(feature = "dev-interpreter")]
 pub fn run_mapped_bank(
     catalog: &PhysicalCodeCatalog,
     bank: BankId,
@@ -447,11 +818,34 @@ pub fn run_mapped_bank(
     ctx: &mut RecompContext,
     mem: &mut Rdram<'_>,
 ) -> Result<BlockRun, UnsupportedOp> {
+    let mut no_mmio = NoMmio;
+    run_mapped_bank_with_memory_port(
+        catalog,
+        bank,
+        entry,
+        budget,
+        ctx,
+        mem,
+        &mut MemoryPort::mmio_only(&mut no_mmio),
+    )
+}
+
+/// [`run_mapped_bank`] with distinct MMIO and cartridge-memory authorities.
+#[cfg(feature = "dev-interpreter")]
+pub fn run_mapped_bank_with_memory_port(
+    catalog: &PhysicalCodeCatalog,
+    bank: BankId,
+    entry: GuestPc,
+    budget: InstructionBudget,
+    ctx: &mut RecompContext,
+    mem: &mut Rdram<'_>,
+    port: &mut MemoryPort<'_>,
+) -> Result<BlockRun, UnsupportedOp> {
     let unit = match admit_mapped_unit(catalog, bank, entry, ctx) {
         Ok(unit) => unit,
         Err(run) => return Ok(run),
     };
-    run_admitted_mapped_unit(unit, budget, ctx, mem)
+    run_admitted_mapped_unit_with_memory_port(unit, budget, ctx, mem, port)
 }
 
 /// One AOT unit bound to exact VA-to-physical identities at translation time.
@@ -608,5 +1002,733 @@ impl MappedAotBlock {
         mem: &mut Rdram<'_>,
     ) -> BlockRun {
         (self.runner.callable())(ExecutionKey::new(self.bank, self.entry), budget, ctx, mem)
+    }
+}
+
+#[cfg(all(
+    test,
+    any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime")
+))]
+mod dynamic_mapped_tests {
+    use super::*;
+    use crate::{
+        AlignedDirectWordAddress, CartridgeReadOutcome, CartridgeStoreOutcome, CartridgeWordPort,
+        MemoryPort, NoMmio, TlbEntryRaw,
+    };
+
+    const ATTEMPT_BANK: BankId = BankId::new(0x1234);
+    const SEMANTICS: [u8; 32] = [0x5a; 32];
+
+    fn put_word(bytes: &mut [u8], physical: u32, word: u32) {
+        for (offset, byte) in word.to_be_bytes().into_iter().enumerate() {
+            bytes[(physical as usize + offset) ^ 3] = byte;
+        }
+    }
+
+    fn entry_lo(physical_page: u32, valid: bool) -> u32 {
+        ((physical_page >> 6) & 0x03ff_ffc0) | 1 | ((valid as u32) << 1) | (1 << 2)
+    }
+
+    fn map_pair(
+        ctx: &mut RecompContext,
+        index: usize,
+        virtual_pair: u32,
+        even_pa: u32,
+        odd_pa: u32,
+    ) {
+        ctx.tlb_entries[index] = TlbEntryRaw {
+            page_mask: 0,
+            entry_hi: u64::from(virtual_pair & 0xffff_e000),
+            entry_lo0: entry_lo(even_pa, true),
+            entry_lo1: entry_lo(odd_pa, true),
+        };
+    }
+
+    #[test]
+    fn live_fetch_reuses_exact_a_after_a_b_a() {
+        const PC: GuestPc = GuestPc::new(0x8000_0040);
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x2442_0001); // addiu $v0,$v0,1
+        let mut mem = Rdram::new(&mut bytes);
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let budget = InstructionBudget::new(2).unwrap();
+
+        let mut ctx = RecompContext::new();
+        let a = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, PC),
+                budget,
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert!(a.newly_admitted);
+        assert_eq!(ctx.r(2), 1);
+
+        ctx.set_r(2, 0);
+        let same_a = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, PC),
+                budget,
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(same_a.identity, a.identity);
+        assert_eq!(same_a.entry.bank, a.entry.bank);
+        assert!(!same_a.newly_admitted);
+
+        mem.store_w(0xffff_ffff_8000_0040, 0x2442_0007);
+        ctx.set_r(2, 0);
+        let b = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, PC),
+                budget,
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_ne!(b.identity, a.identity);
+        assert_ne!(b.entry.bank, a.entry.bank);
+        assert_eq!(ctx.r(2), 7);
+
+        mem.store_w(0xffff_ffff_8000_0040, 0x2442_0001);
+        ctx.set_r(2, 0);
+        let restored = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, PC),
+                budget,
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(restored.identity, a.identity);
+        assert_eq!(restored.entry.bank, a.entry.bank);
+        assert!(!restored.newly_admitted);
+        assert_eq!(ctx.r(2), 1);
+    }
+
+    #[test]
+    fn aliases_share_physical_identity_but_keep_virtual_entries() {
+        let mut bytes = vec![0; 0x101000];
+        put_word(&mut bytes, 0x0010_0000, 0x2442_0001);
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        map_pair(&mut ctx, 0, 0x0040_0000, 0x0010_0000, 0x0010_1000);
+        map_pair(&mut ctx, 1, 0x0080_0000, 0x0010_0000, 0x0010_1000);
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let budget = InstructionBudget::new(2).unwrap();
+
+        let first = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x0040_0000)),
+                budget,
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        let second = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x0080_0000)),
+                budget,
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(first.identity, second.identity);
+        assert_eq!(first.entry.bank, second.entry.bank);
+        assert_ne!(first.entry.pc, second.entry.pc);
+        assert_eq!(first.instructions, second.instructions);
+    }
+
+    #[test]
+    fn cross_page_delay_slot_is_snapshotted_before_execution() {
+        const BRANCH_PC: GuestPc = GuestPc::new(0x0040_0ffc);
+        let mut bytes = vec![0; 0x301000];
+        put_word(&mut bytes, 0x0010_0ffc, 0x1000_0001); // beq zero,zero,+1
+        put_word(&mut bytes, 0x0030_0000, 0x2442_0005); // addiu v0,v0,5
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        map_pair(&mut ctx, 0, 0x0040_0000, 0x0010_0000, 0x0030_0000);
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let run = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, BRANCH_PC),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(run.instructions[0].physical_address, 0x0010_0ffc);
+        assert_eq!(run.instructions[1].physical_address, 0x0030_0000);
+        assert_eq!(ctx.r(2), 5);
+
+        let mut invalid_ctx = RecompContext::new();
+        map_pair(&mut invalid_ctx, 0, 0x0040_0000, 0x0010_0000, 0x0030_0000);
+        invalid_ctx.tlb_entries[0].entry_lo1 &= !(1 << 1);
+        let mut invalid_catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let error = invalid_catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, BRANCH_PC),
+                InstructionBudget::new(2).unwrap(),
+                &mut invalid_ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap_err();
+        let DynamicMappedErrorV1::Fetch {
+            fault,
+            attempted_instructions,
+        } = error
+        else {
+            panic!("expected delay-slot fetch fault")
+        };
+        assert_eq!(attempted_instructions, 2);
+        let CpuFaultKind::Exception {
+            epc,
+            branch_delay,
+            bad_vaddr,
+            ..
+        } = fault.kind
+        else {
+            panic!("expected architectural delay-slot fault")
+        };
+        assert_eq!(epc, BRANCH_PC);
+        assert!(branch_delay);
+        assert_eq!(bad_vaddr, Some(0x0040_1000));
+        assert_eq!(invalid_ctx.r(2), 0);
+        assert_eq!(invalid_catalog.admitted_len(), 0);
+    }
+
+    fn target_code_boundary(
+        event: crate::runtime::GuestWriteEvent,
+    ) -> crate::runtime::GuestWriteBoundary {
+        let (start, len) = event.range();
+        if start < 0x50 && start.saturating_add(len) > 0x4c {
+            crate::runtime::GuestWriteBoundary::ExecutableChanged
+        } else {
+            crate::runtime::GuestWriteBoundary::Continue
+        }
+    }
+
+    #[test]
+    fn delay_store_returns_before_target_and_next_activation_reads_new_word() {
+        const BRANCH_PC: GuestPc = GuestPc::new(0x8000_0040);
+        const TARGET_PC: GuestPc = GuestPc::new(0x8000_004c);
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x1000_0002); // beq zero,zero,+2
+        put_word(&mut bytes, 0x44, 0xac88_0000); // sw t0,0(a0)
+        put_word(&mut bytes, 0x4c, 0x2442_0001); // stale addiu v0,v0,1
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(4, 0xffff_ffff_8000_004c);
+        ctx.set_r(8, 0x2442_0007); // replacement addiu v0,v0,7
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let previous =
+            crate::runtime::set_guest_write_boundary_observer(Some(target_code_boundary));
+
+        let writer = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, BRANCH_PC),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(writer.run.instructions, 2);
+        assert_eq!(
+            writer.run.exit,
+            BlockExit::ExecutableWrite {
+                source_bank: writer.entry.bank,
+                resume: ExecutionKey::new(writer.entry.bank, TARGET_PC),
+            }
+        );
+        assert_eq!(
+            ctx.r(2),
+            0,
+            "stale target did not execute in the writer unit"
+        );
+
+        let target = catalog
+            .activate_and_run(
+                ExecutionKey::new(writer.entry.bank, TARGET_PC),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_ne!(target.identity, writer.identity);
+        assert_eq!(ctx.r(2), 7);
+        crate::runtime::set_guest_write_boundary_observer(previous);
+    }
+
+    #[test]
+    fn preadmission_faults_and_static_bank_collisions_are_loud() {
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x2442_0001);
+        let mut mem = Rdram::new(&mut bytes);
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let mut ctx = RecompContext::new();
+        let misaligned = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0042)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            misaligned,
+            DynamicMappedErrorV1::Fetch {
+                fault: CpuFault {
+                    kind: CpuFaultKind::Exception {
+                        exception: CpuException::AddressErrorLoad,
+                        ..
+                    },
+                    ..
+                },
+                attempted_instructions: 1,
+            }
+        ));
+        assert_eq!(catalog.admitted_len(), 0);
+
+        let unbacked = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0100)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            unbacked,
+            DynamicMappedErrorV1::Fetch {
+                fault: CpuFault {
+                    kind: CpuFaultKind::UnmappedPhysicalInstruction {
+                        physical_address: 0x100
+                    },
+                    ..
+                },
+                attempted_instructions: 0,
+            }
+        ));
+        assert_eq!(catalog.admitted_len(), 0);
+
+        let first = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        let mut colliding_catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let collision = colliding_catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |bank| bank == first.entry.bank,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            collision,
+            DynamicMappedErrorV1::BankCollision {
+                bank,
+                reserved_by_static_program: true,
+                ..
+            } if bank == first.entry.bank
+        ));
+        assert_eq!(colliding_catalog.admitted_len(), 0);
+    }
+
+    #[test]
+    fn dynamic_identity_catalog_capacity_is_loud_and_does_not_grow() {
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x2442_0001);
+        put_word(&mut bytes, 0x44, 0x2463_0001);
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        let mut catalog =
+            DynamicMappedUnitCatalogV1::new_with_capacity(SEMANTICS, NonZeroUsize::new(1).unwrap())
+                .unwrap();
+
+        catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        let error = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0044)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            DynamicMappedErrorV1::CatalogCapacityExceeded { capacity: 1 }
+        );
+        assert_eq!(catalog.admitted_len(), 1);
+        assert_eq!(catalog.capacity(), 1);
+    }
+
+    #[test]
+    fn exact_dynamic_jal_retains_call_and_resume_semantics() {
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x0c00_0020); // jal 0x80000080
+        put_word(&mut bytes, 0x44, 0); // delay nop
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+
+        let run = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+
+        assert_eq!(ctx.r_u32(31), 0x8000_0048);
+        assert_eq!(run.run.instructions, 2);
+        assert_eq!(
+            run.run.exit,
+            BlockExit::ResolveCall {
+                source_bank: run.entry.bank,
+                target_pc: GuestPc::new(0x8000_0080),
+                resume: ExecutionKey::new(run.entry.bank, GuestPc::new(0x8000_0048)),
+            }
+        );
+    }
+
+    #[test]
+    fn exact_dynamic_in_unit_jal_and_jalr_still_require_call_resolution() {
+        const PC: GuestPc = GuestPc::new(0x8000_0040);
+        const RESUME: GuestPc = GuestPc::new(0x8000_0048);
+        for (word, source_register) in [
+            (0x0c00_0010, None),      // jal 0x80000040
+            (0x0100_f809, Some(8u8)), // jalr ra,t0
+        ] {
+            let mut bytes = vec![0; 0x100];
+            put_word(&mut bytes, 0x40, word);
+            put_word(&mut bytes, 0x44, 0); // delay nop
+            let mut mem = Rdram::new(&mut bytes);
+            let mut ctx = RecompContext::new();
+            if source_register.is_some() {
+                ctx.set_r32(8, PC.get() as i32);
+            }
+            let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+
+            let run = catalog
+                .activate_and_run(
+                    ExecutionKey::new(ATTEMPT_BANK, PC),
+                    InstructionBudget::new(2).unwrap(),
+                    &mut ctx,
+                    &mut mem,
+                    |_| false,
+                )
+                .unwrap();
+
+            assert_eq!(ctx.r_u32(31), RESUME.get());
+            assert_eq!(run.run.instructions, 2);
+            assert_eq!(
+                run.run.exit,
+                BlockExit::ResolveCall {
+                    source_bank: run.entry.bank,
+                    target_pc: PC,
+                    resume: ExecutionKey::new(run.entry.bank, RESUME),
+                }
+            );
+            assert_eq!(
+                ctx.indirect_transfer_observations().len(),
+                usize::from(source_register.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn exact_dynamic_jalr_retains_call_and_jr_retains_thread_return() {
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x0100_f809); // jalr ra,t0
+        put_word(&mut bytes, 0x44, 0); // delay nop
+        put_word(&mut bytes, 0x50, 0x03e0_0008); // jr ra
+        put_word(&mut bytes, 0x54, 0); // delay nop
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(8, 0x8000_0080u32 as i32);
+        ctx.hi = 0x0123_4567_89ab_cdef;
+        ctx.lo = 0xfedc_ba98_7654_3210;
+        ctx.cop0_status = 0x1000_0001;
+        ctx.cop0_cause = 0x2000_00b2;
+        ctx.cop0_epc = 0x3000_00c4;
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+
+        let call = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(ctx.r_u32(31), 0x8000_0048);
+        assert_eq!(
+            call.run.exit,
+            BlockExit::ResolveCall {
+                source_bank: call.entry.bank,
+                target_pc: GuestPc::new(0x8000_0080),
+                resume: ExecutionKey::new(call.entry.bank, GuestPc::new(0x8000_0048)),
+            }
+        );
+        let mut call_gprs = [0; 32];
+        call_gprs[8] = 0xffff_ffff_8000_0080;
+        call_gprs[31] = 0xffff_ffff_8000_0048;
+        assert_eq!(
+            ctx.indirect_transfer_observations(),
+            &[crate::runtime::IndirectTransferObservation {
+                source_bank: call.entry.bank.get(),
+                source_pc: 0x8000_0040,
+                source_register: 8,
+                target_pc: 0x8000_0080,
+                link_pc: Some(0x8000_0048),
+                gprs: call_gprs,
+                hi: 0x0123_4567_89ab_cdef,
+                lo: 0xfedc_ba98_7654_3210,
+                cop0_status: 0x1000_0001,
+                cop0_cause: 0x2000_00b2,
+                cop0_epc: 0x3000_00c4,
+            }]
+        );
+
+        const SENTINEL: u32 = 0xffff_fffc;
+        ctx.set_r32(31, SENTINEL as i32);
+        ctx.set_thread_return_pc(Some(SENTINEL));
+        let returned = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0050)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(returned.run.exit, BlockExit::ThreadReturn);
+        assert_eq!(returned.run.instructions, 2);
+        let mut return_gprs = call_gprs;
+        return_gprs[31] = 0xffff_ffff_ffff_fffc;
+        assert_eq!(
+            ctx.indirect_transfer_observations(),
+            &[
+                crate::runtime::IndirectTransferObservation {
+                    source_bank: call.entry.bank.get(),
+                    source_pc: 0x8000_0040,
+                    source_register: 8,
+                    target_pc: 0x8000_0080,
+                    link_pc: Some(0x8000_0048),
+                    gprs: call_gprs,
+                    hi: 0x0123_4567_89ab_cdef,
+                    lo: 0xfedc_ba98_7654_3210,
+                    cop0_status: 0x1000_0001,
+                    cop0_cause: 0x2000_00b2,
+                    cop0_epc: 0x3000_00c4,
+                },
+                crate::runtime::IndirectTransferObservation {
+                    source_bank: returned.entry.bank.get(),
+                    source_pc: 0x8000_0050,
+                    source_register: 31,
+                    target_pc: SENTINEL,
+                    link_pc: None,
+                    gprs: return_gprs,
+                    hi: 0x0123_4567_89ab_cdef,
+                    lo: 0xfedc_ba98_7654_3210,
+                    cop0_status: 0x1000_0001,
+                    cop0_cause: 0x2000_00b2,
+                    cop0_epc: 0x3000_00c4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_bank_projection_with_different_full_digest_is_rejected() {
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let mut first_bytes = [0x11; 32];
+        let mut second_bytes = first_bytes;
+        first_bytes[31] = 0x22;
+        second_bytes[31] = 0x33;
+        let first = DynamicMappedUnitIdentityV1(first_bytes);
+        let second = DynamicMappedUnitIdentityV1(second_bytes);
+        let (bank, newly_admitted) = catalog.admit_identity(first, &mut |_| false).unwrap();
+        assert!(newly_admitted);
+        let error = catalog.admit_identity(second, &mut |_| false).unwrap_err();
+        assert!(matches!(
+            error,
+            DynamicMappedErrorV1::BankCollision {
+                bank: collided,
+                identity,
+                registered_identity: Some(registered),
+                reserved_by_static_program: false,
+            } if collided == bank && identity == second && registered == first
+        ));
+        assert_eq!(catalog.admitted_len(), 1);
+        assert_eq!(catalog.identity_for_bank(bank), Some(first));
+    }
+
+    #[test]
+    fn exact_dynamic_unit_uses_the_canonical_rdram_mmio_hooks() {
+        fn read_mmio(vaddr: u64) -> Option<u32> {
+            (vaddr == 0xffff_ffff_a460_0010).then_some(0x1122_3344)
+        }
+
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x8c82_0000); // lw v0,0(a0)
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r(4, 0xffff_ffff_a460_0010);
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let previous = crate::runtime::set_mmio_hooks(Some(read_mmio), None);
+
+        let run = catalog
+            .activate_and_run(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(2).unwrap(),
+                &mut ctx,
+                &mut mem,
+                |_| false,
+            )
+            .unwrap();
+
+        crate::runtime::set_mmio_hooks(previous.0, previous.1);
+        assert_eq!(run.run.instructions, 1);
+        assert_eq!(ctx.r_u32(2), 0x1122_3344);
+    }
+
+    struct DynamicCartridgePort {
+        reads: u32,
+    }
+
+    impl CartridgeWordPort for DynamicCartridgePort {
+        fn read_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeReadOutcome {
+            if address.get() != 0xffff_ffff_b000_0000 {
+                return CartridgeReadOutcome::NotCartridge;
+            }
+            self.reads += 1;
+            CartridgeReadOutcome::Handled(0x89ab_cdef)
+        }
+
+        fn classify_store_w(
+            &mut self,
+            _address: AlignedDirectWordAddress,
+        ) -> CartridgeStoreOutcome {
+            CartridgeStoreOutcome::NotCartridge
+        }
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    fn physical_lw_catalog() -> PhysicalCodeCatalog {
+        let mut catalog = PhysicalCodeCatalog::new();
+        catalog
+            .register(PhysicalCodeBank::new(ATTEMPT_BANK, 0x40, vec![0x8c82_0000]).unwrap())
+            .unwrap();
+        catalog
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    #[test]
+    fn admitted_mapped_unit_uses_injected_cartridge_memory_port() {
+        let catalog = physical_lw_catalog();
+        let mut bytes = vec![0; 0x100];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        let unit =
+            admit_mapped_unit(&catalog, ATTEMPT_BANK, GuestPc::new(0x8000_0040), &ctx).unwrap();
+        let mut cartridge = DynamicCartridgePort { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let run = run_admitted_mapped_unit_with_memory_port(
+            unit,
+            InstructionBudget::new(1).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert_eq!(run.instructions, 1);
+        assert_eq!(ctx.r(2), 0xffff_ffff_89ab_cdef);
+        assert_eq!(cartridge.reads, 1);
+    }
+
+    #[cfg(feature = "dev-interpreter")]
+    #[test]
+    fn public_mapped_bank_uses_injected_cartridge_memory_port() {
+        let catalog = physical_lw_catalog();
+        let mut bytes = vec![0; 0x100];
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        let mut cartridge = DynamicCartridgePort { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let run = run_mapped_bank_with_memory_port(
+            &catalog,
+            ATTEMPT_BANK,
+            GuestPc::new(0x8000_0040),
+            InstructionBudget::new(1).unwrap(),
+            &mut ctx,
+            &mut mem,
+            &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+        )
+        .unwrap();
+        assert_eq!(run.instructions, 1);
+        assert_eq!(ctx.r(2), 0xffff_ffff_89ab_cdef);
+        assert_eq!(cartridge.reads, 1);
+    }
+
+    #[test]
+    fn exact_dynamic_unit_uses_injected_cartridge_memory_port() {
+        let mut bytes = vec![0; 0x100];
+        put_word(&mut bytes, 0x40, 0x8c82_0000); // lw v0,0(a0)
+        let mut mem = Rdram::new(&mut bytes);
+        let mut ctx = RecompContext::new();
+        ctx.set_r32(4, 0xb000_0000u32 as i32);
+        let mut catalog = DynamicMappedUnitCatalogV1::new(SEMANTICS).unwrap();
+        let mut cartridge = DynamicCartridgePort { reads: 0 };
+        let mut no_mmio = NoMmio;
+        let run = catalog
+            .activate_and_run_with_memory_port(
+                ExecutionKey::new(ATTEMPT_BANK, GuestPc::new(0x8000_0040)),
+                InstructionBudget::new(1).unwrap(),
+                &mut ctx,
+                &mut mem,
+                &mut MemoryPort::new(&mut no_mmio, &mut cartridge),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(run.run.instructions, 1);
+        assert_eq!(ctx.r(2), 0xffff_ffff_89ab_cdef);
+        assert_eq!(cartridge.reads, 1);
     }
 }

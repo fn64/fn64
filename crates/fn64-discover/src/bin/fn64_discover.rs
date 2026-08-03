@@ -3,13 +3,13 @@ use fn64_discover::evidence::EvidenceManifest;
 use fn64_discover::trace::PiDmaFoldReport;
 use fn64_discover::{
     run_discovery_auto, run_discovery_with_manifest, AutoDiscovery, DiscoveryStrategy, FactDb,
-    NormalizedRom, StrategyOutcome,
+    NormalizedRom, ProofState, StrategyOutcome,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::io::{BufReader, Write as IoWrite};
+use std::io::{BufReader, Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
@@ -35,6 +35,210 @@ struct DiscoveryArtifact<'a> {
     traces: Vec<fn64_discover::trace::IngestReport>,
 }
 
+const LAYOUT_STUDY_MAX_ANSWER_KEY_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayoutStudyDump {
+    #[serde(rename = "section")]
+    sections: Vec<LayoutStudySection>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayoutStudySection {
+    #[serde(rename = "name")]
+    _name: String,
+    rom: u32,
+    vram: u32,
+    #[serde(rename = "size")]
+    _size: u32,
+    #[serde(default)]
+    functions: Vec<LayoutStudyFunction>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayoutStudyFunction {
+    #[serde(rename = "name")]
+    _name: String,
+    vram: u32,
+    size: u32,
+}
+
+#[derive(Serialize)]
+struct LayoutStudyMeasurementV1 {
+    schema: &'static str,
+    normalized_rom_sha256: String,
+    cold_receipt_sha256: String,
+    answer_key_sha256: String,
+    banks_with_answer_functions: usize,
+    banks_with_two_exact_owners: usize,
+    answer_function_count: usize,
+    exact_owner_count: usize,
+    candidate_gap_count: usize,
+    answer_positive_gap_count: usize,
+    answer_empty_gap_count: usize,
+    singleton_function_gap_count: usize,
+    multi_function_gap_count: usize,
+    answer_functions_in_positive_gaps: usize,
+    candidate_gap_bytes: u64,
+    answer_positive_gap_bytes: u64,
+    answer_empty_gap_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct LayoutStudyReceiptV1 {
+    measurement: LayoutStudyMeasurementV1,
+    receipt_sha256: String,
+}
+
+/// Compact, content-free feedback receipt for one discovery run.
+///
+/// Unlike [`DiscoveryArtifact`], this deliberately omits the fact log, byte
+/// ledger, trace identities, and all paths.  It is for deciding which
+/// mechanical strategy to investigate next, not an interchangeable discovery
+/// artifact or a source of admission authority.
+#[derive(Serialize)]
+struct DiscoverySummary<'a> {
+    schema_version: u32,
+    normalized_rom_sha256: &'a str,
+    fact_count: usize,
+    coverage: fn64_discover::coverage::CoverageReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_strategy: Option<DiscoveryStrategy>,
+    strategy_outcomes: Vec<StrategyOutcome>,
+    trace_count: usize,
+    observed_load_image_reports: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_proof: Option<OwnerProofDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OwnerProofDiagnostics {
+    coverage_blocker_payloads_omitted: bool,
+    banks: Vec<OwnerProofBankDiagnostics>,
+    blocker_marginals: Vec<OwnerBlockerMarginal>,
+    blocker_combinations: Vec<OwnerBlockerCombination>,
+    executable_ranges: ExecutableRangeDiagnostics,
+    indirect_transfers: IndirectTransferDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OwnerProofBankDiagnostics {
+    bank: String,
+    assessed_entries: u64,
+    exact_owners: u64,
+    candidate_owners: u64,
+    ambiguous_owners: u64,
+    exact_owner_bytes: u64,
+    blocker_marginals: Vec<OwnerBlockerMarginal>,
+    blocker_combinations: Vec<OwnerBlockerCombination>,
+    executable_ranges: ExecutableRangeDiagnostics,
+    indirect_transfers: IndirectTransferDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct OwnerBlockerMarginal {
+    kind: &'static str,
+    affected_assessments: u64,
+    occurrences: u64,
+    sole_blocker_assessments: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct OwnerBlockerCombination {
+    assessment_state: &'static str,
+    kinds: Vec<&'static str>,
+    assessments: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ExecutableRangeDiagnostics {
+    proven_range_count: u64,
+    /// Union size within each bank. ROM-wide diagnostics sum those bank-local
+    /// unions because identical VAs in distinct banks are distinct bytes.
+    proven_bytes: u64,
+    provenance: Vec<ExecutableRangeProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct ExecutableRangeProvenance {
+    rule: String,
+    range_count: u64,
+    /// Sum of intervals concluded by this rule. Rules may overlap, so these
+    /// attribution bytes are not percentages of `proven_bytes`.
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndirectTransferDiagnostics {
+    total_sites: u64,
+    exhaustive_sites: u64,
+    bounded_sites: u64,
+    open_sites: u64,
+    via_call_sites: u64,
+    via_jump_sites: u64,
+    resolution_kinds: Vec<IndirectResolutionKindCount>,
+    target_count_distribution: Vec<IndirectTargetCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IndirectResolutionKindCount {
+    kind: &'static str,
+    sites: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IndirectTargetCount {
+    target_count: u64,
+    sites: u64,
+}
+
+#[derive(Serialize)]
+struct DiscoverySummaryReceipt<'a> {
+    summary: DiscoverySummary<'a>,
+    receipt_sha256: String,
+}
+
+#[derive(Serialize)]
+struct BootTlbAliasCfgMeasurementV1 {
+    transfer_pc: u32,
+    target_va: u32,
+    alias_va_start: u32,
+    alias_va_end: u32,
+    physical_start: u32,
+    physical_end: u32,
+    byte_count: u32,
+    admissible: bool,
+    target_reached: bool,
+    block_count: usize,
+    proven_code_words: usize,
+    exhaustive_indirect_sites: usize,
+    bounded_indirect_sites: usize,
+    open_indirect_sites: usize,
+    invalid_or_incomplete_blocks: usize,
+}
+
+#[derive(Serialize)]
+struct BootTlbAliasMeasurementV1 {
+    schema: &'static str,
+    normalized_rom_sha256: String,
+    selected_strategy: DiscoveryStrategy,
+    proven_rom_mapping_count: usize,
+    boot_va_start: u32,
+    boot_va_end: u32,
+    boot_physical_start: u32,
+    diagnostic: fn64_discover::boot_tlb_alias::BootTlbAliasDiagnosticV1,
+    alias_cfg: Vec<BootTlbAliasCfgMeasurementV1>,
+}
+
+#[derive(Serialize)]
+struct BootTlbAliasReceiptV1 {
+    measurement: BootTlbAliasMeasurementV1,
+    receipt_sha256: String,
+}
+
 /// Report every strategy attempt on stderr, so a run that recovered nothing
 /// says so out loud instead of returning a quiet boot-bank-only artifact that
 /// looks the same as a successful one.
@@ -50,7 +254,21 @@ fn report_strategies(auto: &AutoDiscovery) {
             outcome.proven_mappings,
         );
     }
-    if auto.selected == DiscoveryStrategy::BootBankOnly {
+    if auto
+        .facts
+        .conclusion("bank:boot")
+        .is_some_and(|conclusion| conclusion.state == ProofState::Open)
+    {
+        let detail = auto
+            .facts
+            .conclusion("bank:boot")
+            .expect("checked above")
+            .rule
+            .as_str();
+        eprintln!(
+            "  NOTE: the boot bank remains Open ({detail}); no zero-delta fallback was used."
+        );
+    } else if auto.selected == DiscoveryStrategy::BootBankOnly {
         eprintln!(
             "  NOTE: no overlay geometry corroborated -- this ROM produced the IPL3 boot copy only."
         );
@@ -70,17 +288,920 @@ fn main() {
 
 fn run() -> Result<Option<String>, String> {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.first().and_then(|argument| argument.to_str()) == Some("study-layout") {
+        return run_layout_study(args.into_iter().skip(1)).map(Some);
+    }
+    if args.first().and_then(|argument| argument.to_str()) == Some("__cold-rom-child") {
+        return run_cold_rom_child(args.into_iter().skip(1)).map(Some);
+    }
     if args.first().and_then(|argument| argument.to_str()) == Some("emit-block-program") {
         return emit_block_program_command(args.into_iter().skip(1)).map(Some);
     }
+    if args.first().and_then(|argument| argument.to_str()) == Some("diagnose-boot-tlb-alias") {
+        return diagnose_boot_tlb_alias(args.into_iter().skip(1)).map(Some);
+    }
     run_discovery_command(args.into_iter())?;
     Ok(None)
+}
+
+fn diagnose_boot_tlb_alias(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
+    let rom_path = PathBuf::from(
+        args.next()
+            .ok_or_else(|| "diagnose-boot-tlb-alias requires one ROM path".to_owned())?,
+    );
+    if args.next().is_some() {
+        return Err("usage: fn64-discover diagnose-boot-tlb-alias <rom>".to_owned());
+    }
+    let rom_bytes = read_stable_regular_bounded(
+        &rom_path,
+        fn64_discover::cold_sweep::COLD_ROM_MAX_INPUT_BYTES as u64,
+        "boot-TLB diagnostic ROM",
+    )?;
+    let auto = run_discovery_auto(&rom_bytes).map_err(|error| error.to_string())?;
+    let prepared = fn64_discover::snapshot_inputs::prepare_snapshot_banks(&auto.rom, &auto.facts)
+        .map_err(|error| format!("preparing boot bank: {error:?}"))?;
+    let boot = prepared
+        .banks()
+        .iter()
+        .find(|bank| bank.bank == fn64_discover::banks::BOOT_BANK)
+        .ok_or_else(|| "discovery produced no proven boot bank".to_owned())?;
+    let closure = fn64_discover::resolve::build_cfg_value_set_closed(
+        &boot.bank,
+        &boot.bytes,
+        boot.va_start,
+        &boot.traversal_seeds,
+    );
+    let tlb = fn64_discover::resolve::analyze_constant_tlb_transfers(
+        &closure.cfg,
+        &boot.bytes,
+        boot.va_start,
+    );
+    let boot_physical_start = boot.va_start & 0x1fff_ffff;
+    let boot_bytes = boot
+        .va_end
+        .checked_sub(boot.va_start)
+        .ok_or_else(|| "boot bank VA interval is inverted".to_owned())?;
+    let diagnostic = fn64_discover::boot_tlb_alias::derive_boot_tlb_alias_diagnostic(
+        &tlb,
+        boot_physical_start,
+        boot_bytes,
+    );
+    let mut alias_cfg = Vec::new();
+    for transfer in &diagnostic.transfers {
+        let Some(alias) = &transfer.conditional_alias else {
+            continue;
+        };
+        let byte_start = alias
+            .physical_start
+            .checked_sub(boot_physical_start)
+            .ok_or_else(|| "alias begins before boot backing".to_owned())?
+            as usize;
+        let byte_end = alias
+            .physical_end
+            .checked_sub(boot_physical_start)
+            .ok_or_else(|| "alias ends before boot backing".to_owned())?
+            as usize;
+        let alias_bytes = boot
+            .bytes
+            .get(byte_start..byte_end)
+            .ok_or_else(|| "alias physical interval exceeds boot bytes".to_owned())?;
+        let alias_closure = fn64_discover::resolve::build_cfg_value_set_closed(
+            "boot_tlb_alias_diagnostic",
+            alias_bytes,
+            alias.alias_va_start,
+            &[alias.target_va],
+        );
+        let mut exhaustive_indirect_sites = 0;
+        let mut bounded_indirect_sites = 0;
+        let mut open_indirect_sites = 0;
+        for indirect in &alias_closure.indirect {
+            match indirect.state {
+                fn64_discover::resolve::IndirectProofState::Exhaustive => {
+                    exhaustive_indirect_sites += 1
+                }
+                fn64_discover::resolve::IndirectProofState::Bounded => bounded_indirect_sites += 1,
+                fn64_discover::resolve::IndirectProofState::Open => open_indirect_sites += 1,
+            }
+        }
+        let invalid_or_incomplete_blocks = alias_closure
+            .cfg
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.terminator,
+                    fn64_discover::cfg::BlockTerminator::InvalidInstruction { .. }
+                        | fn64_discover::cfg::BlockTerminator::MissingDelaySlot { .. }
+                        | fn64_discover::cfg::BlockTerminator::RanOffEnd
+                )
+            })
+            .count();
+        alias_cfg.push(BootTlbAliasCfgMeasurementV1 {
+            transfer_pc: alias.transfer_pc,
+            target_va: alias.target_va,
+            alias_va_start: alias.alias_va_start,
+            alias_va_end: alias.alias_va_end,
+            physical_start: alias.physical_start,
+            physical_end: alias.physical_end,
+            byte_count: alias.physical_end - alias.physical_start,
+            admissible: transfer.blockers.is_empty(),
+            target_reached: alias_closure
+                .cfg
+                .blocks
+                .iter()
+                .any(|block| block.start_va == alias.target_va),
+            block_count: alias_closure.cfg.blocks.len(),
+            proven_code_words: alias_closure
+                .cfg
+                .word_class
+                .values()
+                .filter(|class| **class == fn64_discover::cfg::WordClass::ProvenCode)
+                .count(),
+            exhaustive_indirect_sites,
+            bounded_indirect_sites,
+            open_indirect_sites,
+            invalid_or_incomplete_blocks,
+        });
+    }
+    let measurement = BootTlbAliasMeasurementV1 {
+        schema: "fn64.boot-tlb-alias-diagnostic.v1",
+        normalized_rom_sha256: auto.rom.sha256,
+        selected_strategy: auto.selected,
+        proven_rom_mapping_count: auto.facts.proven_rom_mappings().len(),
+        boot_va_start: boot.va_start,
+        boot_va_end: boot.va_end,
+        boot_physical_start,
+        diagnostic,
+        alias_cfg,
+    };
+    let receipt_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&measurement)
+                .map_err(|error| format!("serializing boot-TLB measurement: {error}"))?
+        )
+    );
+    serde_json::to_string(&BootTlbAliasReceiptV1 {
+        measurement,
+        receipt_sha256,
+    })
+    .map_err(|error| format!("serializing boot-TLB receipt: {error}"))
+}
+
+/// Compose the prepared banks and report coverage including Phase 5 owner
+/// proof, plus the aggregated blocker histogram.
+///
+/// `coverage::report` hardcodes `not_run` because owner proof is a
+/// snapshot-composition product; only `report_with_owner_proofs` reports a
+/// measured assessment. Composition is the same path `study-layout` uses, so
+/// this reports what that path would, without needing an answer key.
+fn executable_range_diagnostics(
+    snapshot: &fn64_discover::snapshot::ProgramSnapshotV1,
+    bank: &str,
+) -> ExecutableRangeDiagnostics {
+    let mut ranges = BTreeMap::<(u32, u32), String>::new();
+    for fact in snapshot.facts.facts() {
+        let fn64_discover::facts::Fact::ExecutableRange {
+            bank: fact_bank,
+            va_start,
+            va_end,
+        } = fact
+        else {
+            continue;
+        };
+        if fact_bank != bank {
+            continue;
+        }
+        let subject = fn64_discover::facts::executable_range_subject(fact_bank, *va_start, *va_end);
+        let Some(conclusion) = snapshot.facts.conclusion(&subject) else {
+            continue;
+        };
+        if conclusion.state == ProofState::Proven {
+            ranges.insert((*va_start, *va_end), conclusion.rule.clone());
+        }
+    }
+
+    let mut provenance = BTreeMap::<String, (u64, u64)>::new();
+    for ((start, end), rule) in &ranges {
+        let entry = provenance.entry(rule.clone()).or_default();
+        entry.0 += 1;
+        entry.1 += u64::from(end - start);
+    }
+
+    let mut merged = Vec::<(u32, u32)>::new();
+    for &(start, end) in ranges.keys() {
+        match merged.last_mut() {
+            Some((_, merged_end)) if start <= *merged_end => {
+                *merged_end = (*merged_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    ExecutableRangeDiagnostics {
+        proven_range_count: ranges.len() as u64,
+        proven_bytes: merged
+            .iter()
+            .map(|(start, end)| u64::from(end - start))
+            .sum(),
+        provenance: provenance
+            .into_iter()
+            .map(|(rule, (range_count, bytes))| ExecutableRangeProvenance {
+                rule,
+                range_count,
+                bytes,
+            })
+            .collect(),
+    }
+}
+
+fn indirect_transfer_diagnostics(
+    closure: &fn64_discover::resolve::ClosureResult,
+) -> IndirectTransferDiagnostics {
+    use fn64_discover::resolve::{IndirectProofState, IndirectResolutionKind};
+
+    let mut result = IndirectTransferDiagnostics::default();
+    let mut kinds = BTreeMap::<&'static str, u64>::new();
+    let mut target_counts = BTreeMap::<u64, u64>::new();
+    for resolution in &closure.indirect {
+        result.total_sites += 1;
+        match resolution.state {
+            IndirectProofState::Exhaustive => result.exhaustive_sites += 1,
+            IndirectProofState::Bounded => result.bounded_sites += 1,
+            IndirectProofState::Open => result.open_sites += 1,
+        }
+        if resolution.via_call {
+            result.via_call_sites += 1;
+        } else {
+            result.via_jump_sites += 1;
+        }
+        let kind = match resolution.kind {
+            Some(IndirectResolutionKind::Constant) => "constant",
+            Some(IndirectResolutionKind::MemoryValueSet) => "memory_value_set",
+            Some(IndirectResolutionKind::JumpTable) => "jump_table",
+            None => "unresolved",
+        };
+        *kinds.entry(kind).or_default() += 1;
+        *target_counts
+            .entry(resolution.targets.len() as u64)
+            .or_default() += 1;
+    }
+    result.resolution_kinds = kinds
+        .into_iter()
+        .map(|(kind, sites)| IndirectResolutionKindCount { kind, sites })
+        .collect();
+    result.target_count_distribution = target_counts
+        .into_iter()
+        .map(|(target_count, sites)| IndirectTargetCount {
+            target_count,
+            sites,
+        })
+        .collect();
+    result
+}
+
+fn owner_proof_bank_diagnostics(
+    snapshot: &fn64_discover::snapshot::ProgramSnapshotV1,
+    bank: &fn64_discover::snapshot::BankSnapshotV1,
+) -> OwnerProofBankDiagnostics {
+    use fn64_discover::owner_proof::OwnerAssessment;
+
+    let mut exact_owners = 0u64;
+    let mut candidate_owners = 0u64;
+    let mut ambiguous_owners = 0u64;
+    let mut exact_owner_bytes = 0u64;
+    let mut combinations = BTreeMap::<(&'static str, Vec<&'static str>), u64>::new();
+    for assessment in &bank.owner_proof.assessments {
+        let (state, frontier) = match assessment {
+            OwnerAssessment::Proven { owner } => {
+                exact_owners += 1;
+                exact_owner_bytes += u64::from(owner.byte_len());
+                continue;
+            }
+            OwnerAssessment::Candidate { frontier } => {
+                candidate_owners += 1;
+                ("candidate", frontier)
+            }
+            OwnerAssessment::Ambiguous { frontier } => {
+                ambiguous_owners += 1;
+                ("ambiguous", frontier)
+            }
+        };
+        let kinds: BTreeSet<_> = frontier
+            .blockers
+            .iter()
+            .map(fn64_discover::snapshot::OwnerBlockerKind::from)
+            .map(fn64_discover::snapshot::OwnerBlockerKind::diagnostic_label)
+            .collect();
+        *combinations
+            .entry((state, kinds.into_iter().collect()))
+            .or_default() += 1;
+    }
+
+    OwnerProofBankDiagnostics {
+        bank: bank.input.bank.clone(),
+        assessed_entries: bank.owner_proof.assessments.len() as u64,
+        exact_owners,
+        candidate_owners,
+        ambiguous_owners,
+        exact_owner_bytes,
+        blocker_marginals: bank
+            .blocker_histogram
+            .iter()
+            .map(|summary| OwnerBlockerMarginal {
+                kind: summary.kind.diagnostic_label(),
+                affected_assessments: summary.affected_assessments,
+                occurrences: summary.occurrences,
+                sole_blocker_assessments: summary.sole_blocker_assessments,
+            })
+            .collect(),
+        blocker_combinations: combinations
+            .into_iter()
+            .map(
+                |((assessment_state, kinds), assessments)| OwnerBlockerCombination {
+                    assessment_state,
+                    kinds,
+                    assessments,
+                },
+            )
+            .collect(),
+        executable_ranges: executable_range_diagnostics(snapshot, &bank.input.bank),
+        indirect_transfers: indirect_transfer_diagnostics(&bank.closure),
+    }
+}
+
+fn aggregate_owner_proof_diagnostics(
+    banks: Vec<OwnerProofBankDiagnostics>,
+) -> OwnerProofDiagnostics {
+    let mut marginals = BTreeMap::<&'static str, (u64, u64, u64)>::new();
+    let mut combinations = BTreeMap::<(&'static str, Vec<&'static str>), u64>::new();
+    let mut provenance = BTreeMap::<String, (u64, u64)>::new();
+    let mut executable_ranges = ExecutableRangeDiagnostics::default();
+    let mut indirect_transfers = IndirectTransferDiagnostics::default();
+    let mut indirect_kinds = BTreeMap::<&'static str, u64>::new();
+    let mut indirect_target_counts = BTreeMap::<u64, u64>::new();
+    for bank in &banks {
+        for marginal in &bank.blocker_marginals {
+            let entry = marginals.entry(marginal.kind).or_default();
+            entry.0 += marginal.affected_assessments;
+            entry.1 += marginal.occurrences;
+            entry.2 += marginal.sole_blocker_assessments;
+        }
+        for combination in &bank.blocker_combinations {
+            *combinations
+                .entry((combination.assessment_state, combination.kinds.clone()))
+                .or_default() += combination.assessments;
+        }
+        executable_ranges.proven_range_count += bank.executable_ranges.proven_range_count;
+        executable_ranges.proven_bytes += bank.executable_ranges.proven_bytes;
+        for source in &bank.executable_ranges.provenance {
+            let entry = provenance.entry(source.rule.clone()).or_default();
+            entry.0 += source.range_count;
+            entry.1 += source.bytes;
+        }
+        indirect_transfers.total_sites += bank.indirect_transfers.total_sites;
+        indirect_transfers.exhaustive_sites += bank.indirect_transfers.exhaustive_sites;
+        indirect_transfers.bounded_sites += bank.indirect_transfers.bounded_sites;
+        indirect_transfers.open_sites += bank.indirect_transfers.open_sites;
+        indirect_transfers.via_call_sites += bank.indirect_transfers.via_call_sites;
+        indirect_transfers.via_jump_sites += bank.indirect_transfers.via_jump_sites;
+        for kind in &bank.indirect_transfers.resolution_kinds {
+            *indirect_kinds.entry(kind.kind).or_default() += kind.sites;
+        }
+        for bucket in &bank.indirect_transfers.target_count_distribution {
+            *indirect_target_counts
+                .entry(bucket.target_count)
+                .or_default() += bucket.sites;
+        }
+    }
+    executable_ranges.provenance = provenance
+        .into_iter()
+        .map(|(rule, (range_count, bytes))| ExecutableRangeProvenance {
+            rule,
+            range_count,
+            bytes,
+        })
+        .collect();
+    indirect_transfers.resolution_kinds = indirect_kinds
+        .into_iter()
+        .map(|(kind, sites)| IndirectResolutionKindCount { kind, sites })
+        .collect();
+    indirect_transfers.target_count_distribution = indirect_target_counts
+        .into_iter()
+        .map(|(target_count, sites)| IndirectTargetCount {
+            target_count,
+            sites,
+        })
+        .collect();
+    OwnerProofDiagnostics {
+        coverage_blocker_payloads_omitted: true,
+        banks,
+        blocker_marginals: marginals
+            .into_iter()
+            .map(
+                |(kind, (affected_assessments, occurrences, sole_blocker_assessments))| {
+                    OwnerBlockerMarginal {
+                        kind,
+                        affected_assessments,
+                        occurrences,
+                        sole_blocker_assessments,
+                    }
+                },
+            )
+            .collect(),
+        blocker_combinations: combinations
+            .into_iter()
+            .map(
+                |((assessment_state, kinds), assessments)| OwnerBlockerCombination {
+                    assessment_state,
+                    kinds,
+                    assessments,
+                },
+            )
+            .collect(),
+        executable_ranges,
+        indirect_transfers,
+    }
+}
+
+fn merge_proven_executable_ranges<'a>(
+    target: &mut fn64_discover::facts::FactDb,
+    sources: impl IntoIterator<Item = &'a fn64_discover::facts::FactDb>,
+) -> Result<(), String> {
+    let mut copied_subjects = BTreeSet::new();
+    for source in sources {
+        for fact in source.facts() {
+            let fn64_discover::facts::Fact::ExecutableRange {
+                bank,
+                va_start,
+                va_end,
+            } = fact
+            else {
+                continue;
+            };
+            let subject = fn64_discover::facts::executable_range_subject(bank, *va_start, *va_end);
+            let Some(conclusion) = source.conclusion(&subject) else {
+                continue;
+            };
+            if conclusion.state != ProofState::Proven || !copied_subjects.insert(subject.clone()) {
+                continue;
+            }
+            let range = target.insert(fact.clone());
+            target
+                .conclude(
+                    subject,
+                    ProofState::Proven,
+                    vec![range],
+                    conclusion.rule.clone(),
+                )
+                .map_err(|error| format!("merging composed executable range: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod owner_summary_tests {
+    use super::*;
+    use fn64_discover::facts::{executable_range_subject, Fact};
+
+    fn source(bank: &str, start: u32, end: u32, rule: &str) -> FactDb {
+        let mut facts = FactDb::new();
+        let range = facts.insert(Fact::ExecutableRange {
+            bank: bank.to_owned(),
+            va_start: start,
+            va_end: end,
+        });
+        facts
+            .conclude(
+                executable_range_subject(bank, start, end),
+                ProofState::Proven,
+                vec![range],
+                rule,
+            )
+            .unwrap();
+        facts
+    }
+
+    #[test]
+    fn composed_executable_ranges_merge_across_banks_with_provenance() {
+        let first = source("a", 0x8000_0000, 0x8000_0008, "first_rule");
+        let second = source("b", 0x8000_0000, 0x8000_0010, "second_rule");
+        let mut merged = FactDb::new();
+        merge_proven_executable_ranges(&mut merged, [&first, &second]).unwrap();
+
+        let report = fn64_discover::coverage::report(0x1000, &merged);
+        assert_eq!(report.executable_banks, 2);
+        assert_eq!(report.executable_bytes, 24);
+        assert_eq!(
+            merged
+                .conclusion(&executable_range_subject("a", 0x8000_0000, 0x8000_0008))
+                .unwrap()
+                .rule,
+            "first_rule"
+        );
+        assert_eq!(
+            merged
+                .conclusion(&executable_range_subject("b", 0x8000_0000, 0x8000_0010))
+                .unwrap()
+                .rule,
+            "second_rule"
+        );
+    }
+}
+
+fn compose_owner_proofs(
+    rom: &fn64_discover::rom::NormalizedRom,
+    facts: &fn64_discover::facts::FactDb,
+) -> Result<
+    (
+        fn64_discover::coverage::CoverageReport,
+        Vec<fn64_discover::snapshot::OwnerBlockerSummary>,
+        OwnerProofDiagnostics,
+    ),
+    String,
+> {
+    // Default bounds throughout: this is a measurement path, and the limits
+    // types already carry the production envelopes.
+    let prepared = fn64_discover::snapshot_inputs::prepare_snapshot_banks_with_limits(
+        rom,
+        facts,
+        fn64_discover::snapshot_inputs::PrepareSnapshotBanksLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let inputs = prepared.materialized_inputs();
+    let composed = fn64_discover::snapshot::compose_materialized_banks_validated_v2_with_limits(
+        rom,
+        facts,
+        &inputs,
+        fn64_discover::snapshot::MultiBankCompositionLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut reports = Vec::new();
+    let mut blockers: Vec<fn64_discover::snapshot::OwnerBlockerSummary> = Vec::new();
+    let mut coverage_facts = facts.clone();
+    let mut bank_diagnostics = Vec::new();
+    for snapshot in composed.snapshots() {
+        for bank in &snapshot.banks {
+            reports.push(bank.owner_proof.clone());
+            bank_diagnostics.push(owner_proof_bank_diagnostics(snapshot, bank));
+            for summary in &bank.blocker_histogram {
+                match blockers.iter_mut().find(|held| held.kind == summary.kind) {
+                    Some(held) => {
+                        held.affected_assessments += summary.affected_assessments;
+                        held.occurrences += summary.occurrences;
+                        held.sole_blocker_assessments += summary.sole_blocker_assessments;
+                    }
+                    None => blockers.push(summary.clone()),
+                }
+            }
+        }
+    }
+    merge_proven_executable_ranges(
+        &mut coverage_facts,
+        composed.snapshots().iter().map(|snapshot| &snapshot.facts),
+    )?;
+    // ROM-wide discovery facts, never a composed snapshot's: each snapshot
+    // carries only its own bank's projected facts, so using them would report
+    // one bank's mapping and entry counts as if they were the whole ROM.
+    // Owner proof is layered onto the same coverage the default path reports.
+    let coverage =
+        fn64_discover::coverage::report_with_owner_proofs(rom.len(), &coverage_facts, &reports)
+            .map_err(|error| format!("{error:?}"))?;
+    blockers.sort_by(|a, b| {
+        b.affected_assessments
+            .cmp(&a.affected_assessments)
+            .then(a.kind.cmp(&b.kind))
+    });
+    bank_diagnostics.sort_by(|a, b| a.bank.cmp(&b.bank));
+    let diagnostics = aggregate_owner_proof_diagnostics(bank_diagnostics);
+    Ok((coverage, blockers, diagnostics))
+}
+
+fn run_layout_study(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
+    let rom_path = PathBuf::from(
+        args.next()
+            .ok_or_else(|| "study-layout requires ROM and dump paths".to_owned())?,
+    );
+    let dump_path = PathBuf::from(
+        args.next()
+            .ok_or_else(|| "study-layout requires an answer-key dump path".to_owned())?,
+    );
+    if args.next().is_some() {
+        return Err("usage: fn64-discover study-layout <rom> <dump.toml>".to_owned());
+    }
+    let rom_bytes = read_stable_regular_bounded(
+        &rom_path,
+        fn64_discover::cold_sweep::COLD_ROM_MAX_INPUT_BYTES as u64,
+        "layout-study ROM",
+    )?;
+
+    // Seal a complete ROM-only receipt before opening the answer key. The
+    // subsequent rerun uses the same ROM-only API; the dump can only grade the
+    // already-produced exact-owner geometry.
+    let cold = fn64_discover::cold_sweep::measure_cold_rom(&rom_bytes)
+        .map_err(|error| error.to_string())?;
+    cold.receipt.verify()?;
+    let limits = cold.receipt.measurement.limits;
+    let auto = fn64_discover::run_discovery_auto_with_limits(
+        &rom_bytes,
+        fn64_discover::AutoDiscoveryLimits {
+            vrom_materialization: fn64_discover::file_table::VromMaterializationLimits {
+                max_decoded_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+            },
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if auto.rom.sha256 != cold.receipt.measurement.normalized_rom_sha256
+        || auto.selected != cold.receipt.measurement.selected_strategy
+        || auto.outcomes != cold.receipt.measurement.strategy_outcomes
+        || auto.facts.facts().len() != cold.receipt.measurement.fact_count
+        || auto.facts.proven_bank_images().len() != cold.receipt.measurement.proven_bank_count
+    {
+        return Err("layout-study discovery rerun differs from its sealed cold receipt".to_owned());
+    }
+    let prepared = fn64_discover::snapshot_inputs::prepare_snapshot_banks_with_limits(
+        &auto.rom,
+        &auto.facts,
+        fn64_discover::snapshot_inputs::PrepareSnapshotBanksLimits {
+            max_banks: limits.max_banks as usize,
+            max_aggregate_materialized_bytes: limits.max_aggregate_materialized_bytes,
+            materialized_image: fn64_discover::materialized_image::MaterializedImageLimitsV1 {
+                max_source_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_decoded_vrom_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_stream_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_aggregate_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_streams: 4096,
+            },
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let inputs = prepared.materialized_inputs();
+    let composed = fn64_discover::snapshot::compose_materialized_banks_validated_v2_with_limits(
+        &auto.rom,
+        &auto.facts,
+        &inputs,
+        fn64_discover::snapshot::MultiBankCompositionLimits {
+            max_projected_fact_rows: limits.max_projected_fact_rows,
+            max_projected_fact_bytes: limits.max_projected_fact_bytes,
+            max_aggregate_materialized_bytes: limits.max_aggregate_materialized_bytes,
+            max_cross_bank_authority_records: limits.max_cross_bank_authority_records,
+            materialized_image: fn64_discover::materialized_image::MaterializedImageLimitsV1 {
+                max_source_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_decoded_vrom_file_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_stream_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_aggregate_output_bytes: limits.max_decoded_vrom_file_bytes as usize,
+                max_streams: 4096,
+            },
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let sealed_scoreboard = match &cold.receipt.measurement.closure {
+        fn64_discover::cold_sweep::ColdClosureMeasurementV2::Measured { scoreboard } => scoreboard,
+        fn64_discover::cold_sweep::ColdClosureMeasurementV2::Open { .. } => {
+            return Err("layout study requires a measured cold closure".to_owned());
+        }
+    };
+    if &fn64_discover::closure::scoreboard(composed.snapshots()) != sealed_scoreboard {
+        return Err(
+            "layout-study composition rerun differs from its sealed cold receipt".to_owned(),
+        );
+    }
+
+    let dump_bytes = read_stable_regular_bounded(
+        &dump_path,
+        LAYOUT_STUDY_MAX_ANSWER_KEY_BYTES,
+        "layout-study answer key",
+    )?;
+    let answer_key_sha256 = format!("{:x}", Sha256::digest(&dump_bytes));
+    let dump_text = std::str::from_utf8(&dump_bytes)
+        .map_err(|_| "layout-study answer key is not UTF-8".to_owned())?;
+    let dump: LayoutStudyDump =
+        toml::from_str(dump_text).map_err(|error| format!("parsing layout-study key: {error}"))?;
+
+    let mut measurement = LayoutStudyMeasurementV1 {
+        schema: "fn64.linker-layout-study.v1",
+        normalized_rom_sha256: auto.rom.sha256,
+        cold_receipt_sha256: cold.receipt.receipt_sha256,
+        answer_key_sha256,
+        banks_with_answer_functions: 0,
+        banks_with_two_exact_owners: 0,
+        answer_function_count: 0,
+        exact_owner_count: 0,
+        candidate_gap_count: 0,
+        answer_positive_gap_count: 0,
+        answer_empty_gap_count: 0,
+        singleton_function_gap_count: 0,
+        multi_function_gap_count: 0,
+        answer_functions_in_positive_gaps: 0,
+        candidate_gap_bytes: 0,
+        answer_positive_gap_bytes: 0,
+        answer_empty_gap_bytes: 0,
+    };
+
+    for snapshot in composed.snapshots() {
+        for bank in &snapshot.banks {
+            let fn64_discover::facts::BankBackingSpanV1::RomAffine {
+                rom_space: fn64_discover::facts::RomAddressSpace::Physical,
+                rom_start,
+                rom_end,
+            } = &bank.input.backing
+            else {
+                return Err(format!(
+                    "layout study requires physical affine backing for bank {}",
+                    bank.input.bank
+                ));
+            };
+            let mut answer_functions = dump
+                .sections
+                .iter()
+                .filter(|section| {
+                    section.rom >= *rom_start
+                        && section.rom < *rom_end
+                        && section.vram
+                            == bank.input.va_start.saturating_add(section.rom - *rom_start)
+                })
+                .flat_map(|section| &section.functions)
+                .filter(|function| {
+                    function.vram >= bank.input.va_start
+                        && function.vram < bank.input.va_end
+                        && function
+                            .vram
+                            .saturating_add(function.size)
+                            .min(bank.input.va_end)
+                            > function.vram
+                })
+                .collect::<Vec<_>>();
+            answer_functions.sort_by_key(|function| function.vram);
+            answer_functions.dedup_by_key(|function| function.vram);
+            if answer_functions.is_empty() {
+                continue;
+            }
+            measurement.banks_with_answer_functions += 1;
+            measurement.answer_function_count += answer_functions.len();
+
+            let mut exact_owners = bank
+                .owner_proof
+                .assessments
+                .iter()
+                .filter_map(|assessment| match assessment {
+                    fn64_discover::owner_proof::OwnerAssessment::Proven { owner } => Some(owner),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            exact_owners.sort_by_key(|owner| owner.entry.pc);
+            exact_owners.dedup_by_key(|owner| owner.entry.pc);
+            measurement.exact_owner_count += exact_owners.len();
+            if exact_owners.len() < 2 {
+                continue;
+            }
+            measurement.banks_with_two_exact_owners += 1;
+
+            for pair in exact_owners.windows(2) {
+                let gap_start = pair[0].va_end;
+                let gap_end = pair[1].entry.pc;
+                if gap_start >= gap_end {
+                    continue;
+                }
+                let gap_bytes = u64::from(gap_end - gap_start);
+                let functions_in_gap = answer_functions
+                    .iter()
+                    .filter(|function| function.vram >= gap_start && function.vram < gap_end)
+                    .count();
+                measurement.candidate_gap_count += 1;
+                measurement.candidate_gap_bytes += gap_bytes;
+                if functions_in_gap == 0 {
+                    measurement.answer_empty_gap_count += 1;
+                    measurement.answer_empty_gap_bytes += gap_bytes;
+                } else {
+                    measurement.answer_positive_gap_count += 1;
+                    measurement.answer_positive_gap_bytes += gap_bytes;
+                    measurement.answer_functions_in_positive_gaps += functions_in_gap;
+                    if functions_in_gap == 1 {
+                        measurement.singleton_function_gap_count += 1;
+                    } else {
+                        measurement.multi_function_gap_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let receipt_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&measurement)
+                .map_err(|error| format!("serializing layout study: {error}"))?
+        )
+    );
+    serde_json::to_string(&LayoutStudyReceiptV1 {
+        measurement,
+        receipt_sha256,
+    })
+    .map_err(|error| format!("serializing layout-study receipt: {error}"))
+}
+
+fn run_cold_rom_child(mut args: impl Iterator<Item = OsString>) -> Result<String, String> {
+    let rom_path = PathBuf::from(
+        args.next()
+            .ok_or_else(|| "internal cold-ROM child requires one ROM path".to_owned())?,
+    );
+    let expected_sha256 = args
+        .next()
+        .and_then(|argument| argument.into_string().ok())
+        .ok_or_else(|| {
+            "internal cold-ROM child requires the expected normalized SHA-256".to_owned()
+        })?;
+    if args.next().is_some() {
+        return Err(
+            "internal cold-ROM child accepts one ROM path and one expected digest".to_owned(),
+        );
+    }
+    let rom_bytes = read_stable_regular_bounded(
+        &rom_path,
+        fn64_discover::cold_sweep::COLD_ROM_MAX_INPUT_BYTES as u64,
+        "isolated ROM input",
+    )?;
+    let run = fn64_discover::cold_sweep::measure_cold_rom(&rom_bytes)
+        .map_err(|error| error.to_string())?;
+    run.receipt.verify()?;
+    if run.receipt.measurement.normalized_rom_sha256 != expected_sha256 {
+        return Err(format!(
+            "normalized ROM digest mismatch: expected {expected_sha256}, got {}",
+            run.receipt.measurement.normalized_rom_sha256
+        ));
+    }
+    if let Some(diagnostic) = run.composition_diagnostic {
+        eprintln!("cold ROM analysis remains open: {diagnostic}");
+    }
+    let encoded = serde_json::to_string(&run.receipt)
+        .map_err(|error| format!("serializing cold ROM receipt: {error}"))?;
+    if encoded.len() > 1024 * 1024 {
+        return Err("cold ROM receipt exceeds its 1 MiB output bound".to_owned());
+    }
+    Ok(encoded)
+}
+
+fn read_stable_regular_bounded(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+    let before =
+        std::fs::symlink_metadata(path).map_err(|error| format!("inspecting {label}: {error}"))?;
+    if !before.file_type().is_file() {
+        return Err(format!("{label} must be a regular file, not a symlink"));
+    }
+    if before.len() > limit {
+        return Err(format!("{label} exceeds its {limit}-byte bound"));
+    }
+    let file = std::fs::File::open(path).map_err(|error| format!("opening {label}: {error}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("inspecting opened {label}: {error}"))?;
+    if !opened.is_file() || !same_file_snapshot(&before, &opened) {
+        return Err(format!("{label} changed between inspection and open"));
+    }
+    let mut bytes = Vec::with_capacity(opened.len().min(limit) as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("reading {label}: {error}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("{label} exceeds its {limit}-byte bound"));
+    }
+    let after =
+        std::fs::symlink_metadata(path).map_err(|error| format!("rechecking {label}: {error}"))?;
+    if !after.file_type().is_file()
+        || !same_file_snapshot(&before, &after)
+        || !same_file_snapshot(&opened, &after)
+        || bytes.len() as u64 != opened.len()
+    {
+        return Err(format!("{label} changed while it was read"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
 }
 
 fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     let rom_path = args.next().map(PathBuf::from).ok_or_else(usage)?;
     let mut evidence_path = None;
     let mut output_path = None;
+    let mut summary_only = false;
+    let mut prove_owners = false;
     let mut trace_paths = Vec::new();
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -96,6 +1217,18 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
                         .ok_or_else(|| "--out requires a JSON path".to_string())?,
                 ));
             }
+            Some("--summary") => {
+                if summary_only {
+                    return Err("--summary may be supplied exactly once".to_string());
+                }
+                summary_only = true;
+            }
+            Some("--prove-owners") => {
+                if prove_owners {
+                    return Err("--prove-owners may be supplied exactly once".to_string());
+                }
+                prove_owners = true;
+            }
             Some("--trace") => {
                 trace_paths.push(PathBuf::from(
                     args.next()
@@ -106,6 +1239,9 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
             None => return Err("arguments must be valid UTF-8".to_string()),
         }
     }
+    if summary_only && output_path.is_some() {
+        return Err("--summary and --out are mutually exclusive".to_string());
+    }
 
     let rom_bytes = std::fs::read(&rom_path)
         .map_err(|error| format!("reading ROM {}: {error}", rom_path.display()))?;
@@ -113,8 +1249,8 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("reading evidence {}: {error}", path.display()))?;
         let manifest = EvidenceManifest::from_toml(&text).map_err(|error| error.to_string())?;
-        let (rom, facts) =
-            run_discovery_with_manifest(&rom_bytes, &manifest).map_err(|error| error.to_string())?;
+        let (rom, facts) = run_discovery_with_manifest(&rom_bytes, &manifest)
+            .map_err(|error| error.to_string())?;
         (rom, facts, None, Vec::new())
     } else {
         let auto = run_discovery_auto(&rom_bytes).map_err(|error| error.to_string())?;
@@ -156,8 +1292,11 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
     let mut facts = facts;
     let mut observed_load_images = Vec::new();
     for report in &traces {
-        let fold =
-            fn64_discover::trace::fold_pi_dmas_into_fact_db(&mut facts, &report.header.trace_id, &report.facts);
+        let fold = fn64_discover::trace::fold_pi_dmas_into_fact_db(
+            &mut facts,
+            &report.header.trace_id,
+            &report.facts,
+        );
         eprintln!(
             "observed load images ({}): {} new, {} corroborating a proven mapping, {} conflicts, \
              {} chunks coalesced, {} transfers into {} reused destinations (buffers, not load \
@@ -187,8 +1326,91 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         }
         observed_load_images.push(fold);
     }
+    // Phase 5 owner proof runs only under snapshot composition, so the plain
+    // discovery path reports `not_run` rather than a measured owner count.
+    // `--prove-owners` composes the prepared banks and reports the real
+    // assessment plus the blocker histogram, which is the per-ROM accounting
+    // of *why* extents stay unproven. Composition is materially more
+    // expensive than discovery, so it stays opt-in.
+    let (coverage, owner_blockers, owner_proof) = if prove_owners {
+        match compose_owner_proofs(&rom, &facts) {
+            Ok((composed_coverage, blockers, diagnostics)) => {
+                (composed_coverage, Some(blockers), Some(diagnostics))
+            }
+            Err(error) => {
+                // A composition failure is a measurement outcome, not a
+                // discovery failure: report it and keep the unproven coverage
+                // rather than discarding the whole run.
+                eprintln!("owner proof unavailable: {error}");
+                (
+                    fn64_discover::coverage::report(rom.len(), &facts),
+                    None,
+                    None,
+                )
+            }
+        }
+    } else {
+        (
+            fn64_discover::coverage::report(rom.len(), &facts),
+            None,
+            None,
+        )
+    };
+    if let Some(blockers) = &owner_blockers {
+        // The per-ROM accounting of why extents stay unproven. Printed to
+        // stderr so the summary receipt on stdout keeps its exact shape.
+        if blockers.is_empty() {
+            eprintln!("owner_blockers: none");
+        } else {
+            for summary in blockers {
+                eprintln!(
+                    "owner_blocker {:?} assessments={} occurrences={} sole={}",
+                    summary.kind,
+                    summary.affected_assessments,
+                    summary.occurrences,
+                    summary.sole_blocker_assessments
+                );
+            }
+        }
+    }
+    if summary_only {
+        // The compact owner diagnostic carries blocker kinds and exact kind
+        // combinations above. Full CoverageReport blocker payloads can retain
+        // decoded words and per-site addresses; they belong only in the full
+        // artifact, and made one ordinary ROM's "compact" receipt about 5 MiB.
+        let mut summary_coverage = coverage;
+        summary_coverage.function_owners.blockers.clear();
+        let summary = DiscoverySummary {
+            // V2 adds the opt-in structured owner-proof diagnostics. Ordinary
+            // fast-loop summaries retain their exact V1 shape.
+            schema_version: if owner_proof.is_some() { 2 } else { 1 },
+            normalized_rom_sha256: &rom.sha256,
+            fact_count: facts.facts().len(),
+            coverage: summary_coverage,
+            selected_strategy,
+            strategy_outcomes,
+            trace_count: traces.len(),
+            observed_load_image_reports: observed_load_images.len(),
+            owner_proof,
+        };
+        let encoded = serde_json::to_vec(&summary)
+            .map_err(|error| format!("serializing discovery summary: {error}"))?;
+        let receipt = DiscoverySummaryReceipt {
+            summary,
+            receipt_sha256: format!("{:x}", Sha256::digest(encoded)),
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&receipt)
+                .map_err(|error| format!("serializing discovery summary receipt: {error}"))?
+        );
+        return Ok(());
+    }
+
     // Byte accounting. Coverage as "% of ROM mapped" counts assets against the
-    // score and cannot say how much CODE is undiscovered; this can.
+    // score and cannot say how much CODE is undiscovered; this can.  Keep this
+    // deliberately out of --summary: it owns a byte-granular working map and
+    // a full ROM traversal, neither needed for strategy feedback.
     let ledger = fn64_discover::ledger::build_ledger(&rom.bytes, &facts);
     eprintln!("byte ledger ({} MiB):", ledger.total_bytes / 1_048_576);
     for (class, bytes) in &ledger.bytes_by_class {
@@ -210,7 +1432,7 @@ fn run_discovery_command(mut args: impl Iterator<Item = OsString>) -> Result<(),
         schema_version: 2,
         rom: &rom,
         facts: &facts,
-        coverage: fn64_discover::coverage::report(rom.len(), &facts),
+        coverage,
         selected_strategy,
         ledger,
         observed_load_images,
@@ -457,7 +1679,7 @@ fn lowercase_hex(bytes: [u8; 32]) -> String {
 
 fn usage() -> String {
     format!(
-        "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--out facts.json]\n       {}",
+        "usage: fn64-discover <rom> [--evidence manifest.toml] [--trace events.jsonl]... [--prove-owners] [--summary | --out facts.json]\n       fn64-discover study-layout <rom> <dump.toml>\n       {}",
         emit_block_program_usage()
     )
 }

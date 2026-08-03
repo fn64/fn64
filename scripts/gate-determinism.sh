@@ -76,6 +76,9 @@ expected_d1_oot_overlays=c8fcb6a1fb013492cce964e71c4985ba10aa197cc0e66b9cbab57ed
 #      had already proven were code.
 #   2. `block_proof_blockers=` added: why block proof refused, which is the
 #      actionable half of dynamic_mips.
+# Retained historical schema-v1 baseline. Snapshot schema v2 intentionally
+# changes block authority, so this remains a fail-loud stale-evidence sentinel
+# until all six private inputs regenerate a replacement digest and docs/counts.
 expected_closure=1c6db90343e63b1f482c403b1b3a057d225dc4cc9baeb6ddd5adcc4b924dc317
 # gate_owners_overlays: exact-owner proof on the recovered NWXE overlay banks
 # (6 owners, 0 wrong extents). Dump is grading-only, opened after proof. The
@@ -127,7 +130,11 @@ check_gate() {
     expected=$2
     i=1
     while [ "$i" -le "$runs" ]; do
-        got=$(cargo run --quiet --manifest-path "$repo/Cargo.toml" \
+        # Output-producing closure diagnostics are outside the retained stdout
+        # contract. Scrub them for every gate so an ambient opt-in cannot
+        # mutate the stale-evidence sentinel or write a private artifact.
+        got=$(env -u FN64_CLOSURE_AUDIT_DIR -u FN64_EMIT_BLOCK_PROGRAM \
+            cargo run --quiet --manifest-path "$repo/Cargo.toml" \
             -p fn64-discover --bin "$gate" | sha_stdout)
         if [ "$got" != "$expected" ]; then
             echo "$gate run $i/$runs: output sha256 $got != expected $expected" >&2
@@ -216,6 +223,79 @@ if [ "${FN64_DISCOVER_OOT_ROM:-}" != "" ]; then
 else
     echo "gate_coverage: skipped (FN64_DISCOVER_OOT_ROM unset; digest not checkable)"
     echo "gate_b2: skipped (FN64_DISCOVER_OOT_ROM unset; digest not checkable)"
+fi
+
+# --- Boundary grades: wrong == 0, the firewall -------------------------------
+#
+# gate_decomp_functions is checked differently from every gate above, and the
+# difference is deliberate. Those gates pin a stdout digest, which is the right
+# contract when any output change means a behavior change. This one grades
+# recall, and recall is EXPECTED to improve: pinning its digest would turn every
+# genuine recovery into a false failure and train the reader to re-baseline
+# without looking.
+#
+# What must never move is `wrong`. A nonzero `wrong` means a discovered boundary
+# split a real answer function -- the one error class this project treats as a
+# regression rather than a trade (see the header of
+# reference/corpus-invocations.md). So this asserts the invariant and reports
+# the recall it happened to measure, rather than freezing both.
+#
+# Each game needs its own ROM/DUMP/donor triple, so these cannot use
+# check_gate's no-env form. A game whose inputs are unset is a loud skip, never
+# a silent pass.
+check_boundary_grade() {
+    label=$1
+    shift
+    # The gate itself exits nonzero on wrong>0, so its status is captured
+    # rather than short-circuited: the grade line below is what says WHY, and a
+    # bare "failed to run" would hide a wrong>0 behind a generic error.
+    out=$(env "$@" cargo run --quiet --manifest-path "$repo/Cargo.toml" \
+        -p fn64-discover --bin gate_decomp_functions 2>&1) || true
+    grade=$(echo "$out" | grep -o 'matched_exact=[0-9]*.*wrong=[0-9]*' | head -1)
+    case "$grade" in
+        *"wrong=0")
+            echo "$label: $grade" ;;
+        "")
+            echo "$label: gate_decomp_functions printed no grade line" >&2
+            exit 1 ;;
+        *)
+            echo "$label: WRONG>0 -- a discovered boundary split a real answer function" >&2
+            echo "  $grade" >&2
+            echo "$out" | grep '^wrong:' | head -5 >&2
+            exit 1 ;;
+    esac
+}
+
+if [ -n "${FN64_DISCOVER_NWXE_DUMP:-}" ] && [ -n "${FN64_DISCOVER_NW4E_DUMP:-}" ]; then
+    # The AKI pair donate signatures to each other: same engine, one year apart.
+    check_boundary_grade "grade_nwxe" \
+        "FN64_DISCOVER_ROM=$FN64_DISCOVER_NWXE_ROM" \
+        "FN64_DISCOVER_DUMP=$FN64_DISCOVER_NWXE_DUMP" \
+        "FN64_DISCOVER_SIG_DONOR_ROM=$FN64_DISCOVER_NW4E_ROM" \
+        "FN64_DISCOVER_SIG_DONOR_DUMP=$FN64_DISCOVER_NW4E_DUMP"
+    check_boundary_grade "grade_nw4e" \
+        "FN64_DISCOVER_ROM=$FN64_DISCOVER_NW4E_ROM" \
+        "FN64_DISCOVER_DUMP=$FN64_DISCOVER_NW4E_DUMP" \
+        "FN64_DISCOVER_SIG_DONOR_ROM=$FN64_DISCOVER_NWXE_ROM" \
+        "FN64_DISCOVER_SIG_DONOR_DUMP=$FN64_DISCOVER_NWXE_DUMP"
+else
+    echo "grade_nwxe: skipped (FN64_DISCOVER_NWXE_DUMP/NW4E_DUMP unset)"
+    echo "grade_nw4e: skipped (FN64_DISCOVER_NWXE_DUMP/NW4E_DUMP unset)"
+fi
+
+# Revenge is graded WITHOUT a donor, and donor-free is the point: it is a
+# generation older than the AKI late trio (8-word shingle Jaccard 0.032 against
+# No Mercy, versus 0.063 between No Mercy and WM2000), and a cross-generation
+# donor produces two false splits at real internal boundaries. It is graded at
+# all because it is the only ROM that witnesses sig_scan::admissible_entry_word
+# -- inert on every other graded game, but disabling it takes Revenge to
+# wrong=4. See reference/corpus-invocations.md.
+if [ -n "${FN64_DISCOVER_REVENGE_ROM:-}" ] && [ -n "${FN64_DISCOVER_REVENGE_DUMP:-}" ]; then
+    check_boundary_grade "grade_revenge" \
+        "FN64_DISCOVER_ROM=$FN64_DISCOVER_REVENGE_ROM" \
+        "FN64_DISCOVER_DUMP=$FN64_DISCOVER_REVENGE_DUMP"
+else
+    echo "grade_revenge: skipped (FN64_DISCOVER_REVENGE_ROM/_DUMP unset)"
 fi
 
 echo "gate-determinism: all gates stable over $runs runs"

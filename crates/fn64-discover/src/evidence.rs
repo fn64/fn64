@@ -244,6 +244,9 @@ mod tests {
         bytes[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
         bytes[0x20..0x2c].copy_from_slice(b"EVIDENCE ROM");
         bytes[0x3b..0x3f].copy_from_slice(b"CTSE");
+        bytes[0x100..0x104].copy_from_slice(&0x1000u32.to_be_bytes());
+        bytes[0x104..0x108].copy_from_slice(&0x3000u32.to_be_bytes());
+        bytes[0x108..0x10c].copy_from_slice(&0x8000_0400u32.to_be_bytes());
         for offset in [0x1000usize, 0x1100] {
             for (index, word) in [0x27bd_ffe0u32, 0xafbf_001c, 0x03e0_0008, 0x27bd_0020]
                 .into_iter()
@@ -260,10 +263,22 @@ mod tests {
         EvidenceManifest {
             schema_version: EVIDENCE_SCHEMA_VERSION,
             rom_sha256: rom.sha256.clone(),
-            descriptor_tables: vec![],
+            descriptor_tables: vec![DescriptorTableEvidence {
+                name: "synthetic_boot_table".to_string(),
+                source: "synthetic test mapping table".to_string(),
+                shape: DescriptorTableShape {
+                    table_rom_offset: 0x100,
+                    record_count: 1,
+                    record_stride: 12,
+                    field_rom_start: 0,
+                    field_rom_end: 4,
+                    field_vram_dest: 8,
+                },
+                bank_name: BankNamePattern::new("boot", 0, ""),
+            }],
             load_image_tables: vec![],
             executable_ranges: vec![ExecutableRangeEvidence {
-                bank: banks::BOOT_BANK.to_string(),
+                bank: "boot0".to_string(),
                 va_start: 0x8000_0400,
                 va_end: 0x8000_0410,
                 source: "synthetic test text interval".to_string(),
@@ -298,7 +313,10 @@ mod tests {
     fn executable_range_prevents_mapped_data_from_becoming_code_candidates() {
         let bytes = test_rom();
         let rom = crate::rom::normalize(&bytes).unwrap();
-        let (_, unrestricted) = crate::run_discovery(&bytes, None).unwrap();
+        let mut unrestricted_manifest = manifest_for(&rom);
+        unrestricted_manifest.executable_ranges.clear();
+        let (_, unrestricted) =
+            crate::run_discovery_with_manifest(&bytes, &unrestricted_manifest).unwrap();
         let (_, restricted) =
             crate::run_discovery_with_manifest(&bytes, &manifest_for(&rom)).unwrap();
 
@@ -325,7 +343,7 @@ mod tests {
         let rom = crate::rom::normalize(&bytes).unwrap();
         let mut manifest = manifest_for(&rom);
         manifest.executable_ranges.push(ExecutableRangeEvidence {
-            bank: banks::BOOT_BANK.to_string(),
+            bank: "boot0".to_string(),
             va_start: 0x8000_0408,
             va_end: 0x8000_0420,
             source: "overlapping synthetic interval".to_string(),

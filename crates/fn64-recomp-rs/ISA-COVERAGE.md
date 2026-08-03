@@ -229,9 +229,12 @@ above; no runtime implementation is an authority for them.
 
 The live block owner synchronizes Count/Compare with the executor at every
 checkpoint. Count retains its once-per-two-cycle phase across split advances;
-wrap-safe Compare equality latches IP7, and every MTC0 Compare write (including
+the exact retained phase is imported into both arbitrary-PC lanes, so an
+interior MFC0 Count includes every preceding charged instruction without
+mutating or double-counting the executor-owned clock. Compare/interrupt
+sampling inside an indivisible emitted unit remains checkpoint-granular.
+Wrap-safe Compare equality latches IP7, and every MTC0 Compare write (including
 a same-value write) clears both the block-local Cause bit and executor latch.
-Visibility inside an indivisible emitted block remains checkpoint-granular.
 
 ## COP1 fmt and funct
 

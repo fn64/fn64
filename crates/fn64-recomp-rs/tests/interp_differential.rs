@@ -6,19 +6,24 @@
 //! synthetic bank of ordinary instructions it runs BOTH lanes over an identical
 //! initial `RecompContext` + `Rdram`, then asserts the final architectural state
 //! (all GPRs, HI/LO, COP0 Count/Compare, the FPU condition flag), the full RDRAM
-//! image, and the returned `BlockExit` + retired instruction count are
-//! byte-identical. Equivalence over the whole program set IS the correctness
-//! proof.
+//! image, and retired instruction count are byte-identical. Typed exits also
+//! match except for a statically-known in-bank JAL: an AOT runner with an
+//! explicit empty host-call inventory may transfer directly, while the dynamic
+//! lane must retain `ResolveCall` so the owner can apply host-first precedence.
 //!
 //! The AOT runner is emitted Rust; it is compiled into a host binary that links
 //! this crate, so the same binary can call the emitted function AND the library
 //! `run_bank` interpreter and compare them in-process. This reuses the
 //! compile-and-run infrastructure proven in `tests/bank_runner.rs`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-use fn64_recomp_rs::{emit_bank_runner, BankId, BankInput};
+mod support;
+use support::dev_interpreter_rlib;
+
+use fn64_recomp_rs::BankId;
+use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
 
 /// One synthetic bank plus the initial machine state to run it from. Every
 /// program's words decode to ordinary integer/control/memory ops (no FPU/COP0),
@@ -1052,22 +1057,6 @@ fn programs() -> Vec<Program> {
     ]
 }
 
-fn current_rlib(deps: &Path) -> PathBuf {
-    std::fs::read_dir(deps)
-        .expect("read target deps directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
-                })
-        })
-        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-        .expect("fn64_recomp_rs rlib beside integration test")
-}
-
 /// Render the `Program` struct literal (arrays of tuples) as Rust source so the
 /// harness can reconstruct the identical initial state for both lanes.
 fn render_program_setup(p: &Program) -> String {
@@ -1136,7 +1125,8 @@ fn interpreter_matches_aot_bank_runner_on_ordinary_programs() {
     let program_count = programs.len();
 
     // The harness builds identical initial state, runs both lanes, and asserts
-    // byte-equal architectural state + Rdram + BlockExit + instruction count.
+    // byte-equal architectural state, RDRAM, and instruction count. Exit policy
+    // is exact too, including the one intentional static-JAL distinction.
     let source = format!(
         r#"#![allow(unused_imports)]
 use fn64_recomp_rs::{{
@@ -1567,7 +1557,7 @@ fn check(
     aot: AotRunner,
 ) {{
     let key = ExecutionKey::new(bank, GuestPc::new(entry));
-    let budget = InstructionBudget::new(budget).expect("budget >= 2");
+    let budget = InstructionBudget::new(budget).expect("fixture budget is nonzero");
 
     // Interpreter lane.
     let mut interp_ctx = make_ctx(name, init_regs);
@@ -1605,6 +1595,28 @@ fn check(
     assert_cop0_authority_case(name, bank, vram, &interp_run, &interp_state);
     assert_cop0_authority_case(name, bank, vram, &aot_run, &aot_state);
 
+    if name == "p_jal" {{
+        assert_eq!(interp_run.instructions, aot_run.instructions);
+        assert_eq!(interp_run.instructions, 2);
+        assert_eq!(
+            interp_run.exit,
+            BlockExit::ResolveCall {{
+                source_bank: bank,
+                target_pc: GuestPc::new(vram + 12),
+                resume: ExecutionKey::new(bank, GuestPc::new(vram + 8)),
+            }}
+        );
+        assert_eq!(
+            aot_run.exit,
+            BlockExit::Transfer(ExecutionKey::new(bank, GuestPc::new(vram + 12)))
+        );
+        assert_eq!(
+            interp_state, aot_state,
+            "[{{name}}] architectural state diverged across intentional call-boundary policy"
+        );
+        return;
+    }}
+
     assert_eq!(
         interp_run, aot_run,
         "[{{name}}] BlockRun (exit + instruction count) diverged: interp={{interp_run:?}} aot={{aot_run:?}}",
@@ -1617,7 +1629,7 @@ fn check(
 
 fn main() {{
 {checks}
-    println!("differential ok: {program_count} programs cross-checked byte-identical");
+    println!("differential ok: {program_count} programs cross-checked with explicit call-boundary policy");
 }}
 "#
     );
@@ -1632,7 +1644,7 @@ fn main() {{
         .parent()
         .expect("target deps directory")
         .to_path_buf();
-    let rlib = current_rlib(&deps);
+    let rlib = dev_interpreter_rlib(&deps);
     let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--edition=2021")
         .arg(&source_path)
@@ -1663,7 +1675,7 @@ fn main() {{
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
         stdout.contains(&format!(
-            "differential ok: {program_count} programs cross-checked byte-identical"
+            "differential ok: {program_count} programs cross-checked with explicit call-boundary policy"
         )),
         "harness did not confirm all programs cross-checked: {stdout}"
     );

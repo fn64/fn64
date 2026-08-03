@@ -187,7 +187,10 @@ mod tests {
             "adapter_source_identity.rs",
             "build.rs",
             "src/lib.rs",
-            "src/ffi.rs",
+            "src/ffi/mod.rs",
+            "src/ffi/config_wire.rs",
+            "src/ffi/context.rs",
+            "src/ffi/tests.rs",
             "ffi/CMakeLists.txt",
             "ffi/fn64_rt64_shim.cpp",
             "ffi/fn64_rt64_shim.h",
@@ -266,10 +269,8 @@ mod tests {
         }
         assert!(!cmake.contains("${CMAKE_CURRENT_SOURCE_DIR}/fn64_rt64_raster_ps.hlsl"));
 
-        assert!(
-            cmake
-                .contains("Alpha compare and coverage intentionally observe the original combiner")
-        );
+        assert!(cmake
+            .contains("Alpha compare and coverage intentionally observe the original combiner"));
         assert!(cmake.contains("Only the combiner input to blending receives this bounded policy"));
         assert!(cmake.contains("Fn64RdpTakeFragmentNoiseSample(randomSeed);"));
         assert_eq!(

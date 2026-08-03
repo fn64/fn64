@@ -41,9 +41,7 @@ pub const STICK_FULL: i8 = 80;
 
 /// Every N64 controller button, in the overlay's display order. `Ord` so the
 /// serialized TOML maps are stable (BTreeMap).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum N64Button {
     A,
     B,
@@ -120,9 +118,7 @@ impl N64Button {
 }
 
 /// The four keyboard keys that drive the analog stick.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StickDir {
     Up,
     Down,
@@ -266,7 +262,9 @@ impl InputConfig {
     /// config stays live for this session either way.
     pub fn save(&self) {
         let Some(path) = Self::path() else {
-            eprintln!("[fn64-shell] no config directory on this platform -- input config not saved");
+            eprintln!(
+                "[fn64-shell] no config directory on this platform -- input config not saved"
+            );
             return;
         };
         let text = toml::to_string_pretty(self).expect("InputConfig serializes to TOML");

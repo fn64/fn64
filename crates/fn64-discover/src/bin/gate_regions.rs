@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("reading {}: {error}", rom_path.display()))?;
     let rom = normalize(&rom_bytes).map_err(|error| error.to_string())?;
     let mut db = FactDb::new();
-    banks::discover_boot_bank(&rom, &mut db);
+    let _boot = banks::discover_boot_bank(&rom, &mut db);
     let manifest = if let Some(evidence_path) = evidence_path {
         let evidence_text = std::fs::read_to_string(&evidence_path)
             .map_err(|error| format!("reading {}: {error}", evidence_path.display()))?;

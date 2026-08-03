@@ -2,9 +2,8 @@
 //! encoding tables A-39/B-25 and the NEC VR4300 User's Manual sections
 //! 6.3.2 (FCR0/FCR31), 10.8 (LL/SC), and appendix D.2 (division by zero).
 
-use fn64_recomp_rs::{
-    decode, emit_function, FuncInput, Instruction, Rdram, RecompContext, RDRAM_VBASE,
-};
+use fn64_recomp_rs::{decode, Instruction, Rdram, RecompContext, RDRAM_VBASE};
+use fn64_recomp_rs_codegen::{emit_function, FuncInput};
 
 #[test]
 fn decode_missing_primary_slots() {
@@ -924,6 +923,25 @@ fn float_to_float_raw_vectors_cover_rounding_specials_and_fs() {
         assert!(ctx.try_cvt_s_d_bits(0).is_err());
         assert_eq!(ctx.read_fcr(31) & (0x3F << 12), E_CAUSE);
         assert_eq!(ctx.read_fcr(31) & (U_FLAG | I_FLAG), 0);
+    }
+}
+
+#[test]
+fn cvt_d_s_rebiases_low_normal_exponents_without_unsigned_underflow() {
+    let mut ctx = RecompContext::new();
+    for single in [
+        0x0080_0000u32,
+        0x0080_0001,
+        0x3F00_0000,
+        0x8080_0001,
+        0x7F7F_FFFF,
+    ] {
+        ctx.set_f_bits(0, single);
+        assert_eq!(
+            ctx.try_cvt_d_s_bits(0),
+            Ok((f32::from_bits(single) as f64).to_bits()),
+            "single={single:#010x}"
+        );
     }
 }
 

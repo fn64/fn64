@@ -237,7 +237,11 @@ pub fn bind_ranges_to_fact_db_partial(
     let mappings = db.proven_rom_mappings();
     let mut bound = Vec::with_capacity(ranges.len());
     let mut unresolved = Vec::new();
-    for RangeWithRom { evidence: range, rom_start } in ranges {
+    for RangeWithRom {
+        evidence: range,
+        rom_start,
+    } in ranges
+    {
         let matches = mappings
             .iter()
             .filter_map(|fact| match fact {

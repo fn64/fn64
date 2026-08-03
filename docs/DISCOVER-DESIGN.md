@@ -141,7 +141,40 @@ Mechanically:
 2. Convert to canonical big-endian bytes.
 3. Record SHA-256, SHA-1, and MD5 identities.
 4. Parse the ROM header, entrypoint, and boot region.
-5. Identify the CIC where possible.
+5. Identify the complete IPL3 by exact digest where possible. The current
+   admitted public-standard clusters are CIC-6102/7101, 6103/7103, 6105/7105,
+   6106/7106, and 7102. An unknown or truncated IPL3 remains an explicit
+   frontier; it never inherits a zero relocation delta. The local-corpus
+   SHA-256 clusters are cross-checked against the public IPL3 MD5 identities in
+   [Dragorn421/n64checksum](https://github.com/Dragorn421/n64checksum), whose
+   CC0-1.0 `LICENSE` was verified for this intake.
+
+   - CIC-6102/7101: SHA-256
+     `61e88238552c356c23d19409fe5570ee6910419586bc6fc740f638f761adc46e`
+   - CIC-6103/7103: SHA-256
+     `bf3620d30817007091ebe9bddd1b88c23b8a0052170b3309cde5b6b4238e45e7`
+   - CIC-6105/7105: SHA-256
+     `04b7bc6717a9f0eb724cf927e74ad3876c381cbb280d841736fc5e55580b756b`
+   - CIC-6106/7106: SHA-256
+     `36adc40148af56f0d78cd505eb6a90117d1fd6f11c6309e52ed36bc4c6ba340e`
+   - CIC-7102: SHA-256
+     `16e062ba8f190c7a712a6bdb34620207299d9be676174cd81d764403df661ad0`
+
+   The 6106/7106 and 7102 clusters were admitted after a local 287-ROM corpus
+   showed five distinct IPL3 blobs rather than three. Both were identified by
+   re-deriving their IPL3 MD5 *and* CRC32 and matching the published clusters;
+   the same procedure reproduced the three digests above before being trusted
+   on new data. Their relocation deltas are proven independently of that
+   identity: [en64](https://en64.shoutwiki.com/wiki/ROM) records that 6106
+   subtracts `0x200000` and that 7102 is the PAL counterpart of the
+   non-relocating 6101 type, and counting boot-copy `jal` targets that land
+   inside `[entry - delta, entry - delta + 0x100000)` selects exactly one
+   delta per ROM — `0x200000` for the three permitted 6106 cartridges (68.5%,
+   76.5%, 77.0% in-bank against ~0% elsewhere) and `0` for the permitted 7102
+   cartridge (88.4%). The same measurement returns `0` at 86.8% for a ROM whose
+   zero delta is already proven, so the method reproduces a known-good answer
+   before being relied on. `crates/fn64-discover/src/banks/mod.rs` asserts every
+   digest and delta above.
 6. Reject malformed or unexpected inputs before analysis.
 
 All downstream artifacts and cache keys must bind to the normalized ROM
@@ -181,7 +214,53 @@ digest.
 > validated against normalized-ROM bounds; compressed VROM files are
 > deterministically materialized with a bounded decoder derived from the
 > allowed N64Recomp-generated `Yaz0_DecompressImpl` C, and the stream's
-> declared size must match the VROM interval. Malformed/blank records are `rejected`,
+> declared size must match the VROM interval. Automatic discovery also caps a
+> complete decoded VROM file at 64 MiB, checking the recovered interval and
+> Yaz0 declaration before reserving output storage. Explicit-limits variants
+> let constrained callers lower that cap; an oversized file contributes no
+> descriptor or mapping evidence. Each distinct withheld file is serialized
+> in `VromOverlayRecovery::decoded_file_limit_hits`, and its count is carried
+> into `StrategyOutcome`, so a workspace manifest cannot present a
+> resource-limited search as proven absence. The same cap gates publication
+> of virtual request-DMA mappings and Phase 3 image harvesting, so neither
+> path can rematerialize a file that recovery withheld as oversized.
+> Automatic request-DMA recovery is a bounded monotone fixed point over newly
+> proven, materializable banks, not a resident-bank-only pass. Each round scans
+> every newly admitted bank once and publishes only requests whose source
+> interval exactly names one complete proven VROM file. Recovery stops at 64
+> loader inputs, 4,096 banks/mappings, or 256 MiB of aggregate scanned image
+> bytes; reaching a limit is an explicit incomplete result rather than absence.
+> The operand slicer may cross an ordinary, non-likely forward conditional
+> branch only when its taken target is strictly after the request call's delay
+> slot: reaching that call proves the not-taken edge, whose ordinary delay word
+> executes. Backward branches, branch-likely and REGIMM/link forms, jumps, and
+> branches into the call or delay slot remain hard boundaries.
+> Physical end-address wrapper inference is currently diagnostic candidate
+> evidence only. Its bounded linear scan examines at most 4,096 call-shaped
+> targets and 128 words per target and records shapes resembling `$a2 - $a1`,
+> a nested DMA call, cursor updates, a length reduction, and a backward branch.
+> It does not yet establish one feasible CFG path, authenticate the nested PI
+> primitive, or prove that the updates share one chunk value; whole-image JAL
+> words are not callable-entry authority. Consequently these candidates cannot
+> supply `StaticRequestDmaInput` or publish a mapping. A temporary SM64 training
+> experiment showed the potential payoff—one 78,992-byte engine range would
+> move 200 bodies out of `NoMapping`—but that promotion was removed after
+> review. CFG-aware relational proof, independently authenticated PI semantics,
+> and closed analysis bounds are required before enabling it. The request-DMA
+> report and serialized strategy outcome retain the examined/open wrapper
+> counts, wrapper and loader-input limit flags, and aggregate incomplete state.
+> The retained SM64 candidate also has only `Supported` function-entry evidence
+> and lies outside every proven executable range, so candidate CFG structure is
+> not an authority substitute. The dependency order is: prove the wrapper entry
+> and executable bytes; authenticate the complete public libultra call contract
+> and cart handle/base; prove call-site message/queue writes cannot alias loop
+> carriers; then prove the same chunk advances both cursors and reduces the
+> remaining length on every loop step. Bytes, CFG, facts, and capabilities must
+> come from one digest-bound prepared-bank view. Until all of those exist, this
+> cluster remains a measured training opportunity rather than a mapping input.
+> More than 64 loader inputs scans the deterministic first 64 and reports the
+> withheld suffix instead of discarding all progress.
+> Malformed/blank records are `rejected`,
 > missing backing is `open`, and records whose source and destination ranges
 > conflict are moved to `conflict` (including every member of a multi-record
 > conflict), so none can feed Phase 3 as proven input.
@@ -202,7 +281,21 @@ digest.
 > table as typed `LoadImageTableRecord` plus proven bank-qualified
 > `RomMapping` facts. A delta vote alone is not sufficient. The proof rule is
 > unique table admission plus exact per-record agreement between the inferred
-> VA and the descriptor destination. `gate_d1_overlays` keeps NWXE's dump
+> VA and the descriptor destination. Physical descriptor-family recovery
+> enumerates the third field as either a destination start or exclusive end,
+> normalizes both to a start, and requires exact delta agreement to select a
+> field interpretation before ordinary fragment admission. The distinction is
+> retained in the candidate table and its evidence; it is not guessed after
+> admission. This recovers the measured
+> exclusive-end families in Ogre Battle 64, Gex 64, and Air Boarder 64 while
+> leaving the unrelated Bottom of the 9th and Batman candidates at one proven
+> boot mapping; their admitted candidate tables still fail per-record
+> destination agreement and grant no load-image authority. On the local corpus
+> images, mapped-bank counts move Ogre Battle 64 `1 -> 15`, Gex 64 `1 -> 8`,
+> and Air Boarder 64 `1 -> 9`: 29 additional proven mappings. Existing controls
+> remain Mega Man 64 28, WWF No Mercy 6, Paper Mario 165, Majora's Mask 604,
+> and Mario Party 94.
+> `gate_d1_overlays` keeps NWXE's dump
 > held out until both discovery runs finish. Boot-only combined precision /
 > recall is 36.396867% / 28.542179%; recovered overlays produce 49.976448% /
 > 86.895987%. The four added mappings raise recalled functions by 1,425 while
@@ -247,14 +340,28 @@ invalid edges, and address collisions.
 
 ## Phase 3: harvest candidates
 
-> Implementation status (D1, 2026-07-16): `fn64-discover::harvest` now runs
-> three zero-LLM providers concurrently over immutable, Phase-2-proven load
+> Implementation status (updated 2026-07-30): `fn64-discover::harvest` runs
+> zero-LLM providers over immutable, Phase-2-proven load
 > images: (1) a linear `jal` scan plus bounded HI/LO-resolved `jalr` targets,
 > with the call site retained as evidence; (2) classic
 > `addiu`/`daddiu $sp,$sp,-N` + in-frame `sw $ra` prologues and the stricter
-> leaf variant requiring a matching stack restore at `jr $ra`; and (3)
+> leaf variant requiring a matching stack restore at `jr $ra`; a recognized
+> prologue may move its candidate entry back by at most three nonzero,
+> non-control, non-`$sp`-writing words when the earlier address is independently
+> a terminator/padding boundary and no direct transfer enters the intervening
+> words; (3)
 > `TableEntry` facts exposed by an already-identified descriptor table or
-> vector. The third provider does not scan blindly for table locations.
+> vector; (4) candidate-only dense/fixed-stride handler-pointer runs; and (5)
+> bounded argument-home-spill leaf shapes after an independently structural
+> boundary.
+> The third provider does not scan blindly for table locations. The fourth
+> scans the complete materialized bank before executable-range slicing and
+> retains typed table-base, exact-slot, ordinal, stride, and run-length
+> provenance. It never emits `Fact::TableEntry`, never feeds the same harvest
+> wave, and never proposes more than `Candidate`: a pointer-shaped run does not
+> prove a reachable consumer or an exhaustive index domain.
+> Prefix rewind relocates only the candidate target; its evidence retains the
+> exact stack-adjust site. It does not strengthen proof state.
 > Providers return immutable claims; the merge sorts and deduplicates before
 > touching `FactDb`, so host thread scheduling cannot affect serialized
 > output. Independent positive providers produce `supported`; any positive
@@ -382,26 +489,58 @@ evidence.
 
 ### Composed proof snapshot
 
-`fn64-discover::snapshot::compose_materialized_bank_v1` is the first thin
-composition boundary over the existing passes. V1 accepts one resident,
-physical-ROM-backed bank, verifies its bytes against the normalized ROM and
-the unique proven mapping, then runs value-set closure, integrates direct and
-indirect transfer facts, partitions blocks, proves owners, and reports
-coverage from that same fact snapshot. It serializes geometry and a byte
-digest, never ROM content.
+`fn64_discover::snapshot_inputs::prepare_snapshot_banks` is the reusable
+in-process preparation boundary. It enumerates only `Proven` bank images and
+keeps affine ROM backing structurally distinct from evaluated output. Affine
+images materialize Physical or proven VROM/Yaz0 bytes and trim load-time
+`.bss`; evaluated images are re-derived from their typed, content-free receipt
+and must exactly fill their claimed VA interval. Exact duplicate facts
+collapse, while any distinct affine/evaluated geometries for one bank are
+ambiguous and rejected. Its sorted call-derived roots (including callable
+entries exposed by an admitted table) are traversal seeds only; callable
+authority remains in the fact database and is decided by snapshot composition.
+Conclusion-absent strong claims remain hints, but a current Open or Conflict
+conclusion cannot seed traversal. Conservative bank-count, decoded retained-
+byte, source, evaluator-output, stream-count, and complete decoded-VROM-file
+limits are checked before or during their bounded materialization.
+
+Snapshot wire V6 carries the selected bank image as a tagged
+`BankBackingSpanV1`: either affine Physical/VROM coordinates or an evaluated-
+image receipt digest plus output-relative offsets. Composition re-resolves
+that span from the projected facts and re-verifies the supplied bytes before
+analysis. V5 is an affine-only historical wire and is not upgraded into V6
+authority; its inputs must be composed again to produce a current snapshot.
+The core snapshot-workspace receipt type can validate either V6 backing, but
+`produce_snapshot_workspace` remains a ROM-only publisher and rejects a
+prepared evaluated image. `stage_snapshot_bank` is likewise an explicitly
+affine-only external-tool bridge because its output contract requires ROM
+coordinates. Neither tool assigns evaluated output a fake ROM offset.
+
+`fn64-discover::snapshot::compose_materialized_bank_v1` retains its historical
+Rust name but emits snapshot wire V6. It accepts one byte-verified bank backed
+by either an affine Physical/VROM span or an exactly re-derived evaluated-
+image span, then runs value-set closure, integrates direct and indirect
+transfer facts, partitions blocks, proves owners, and reports coverage from
+that same fact snapshot. It serializes tagged geometry and a byte digest,
+never ROM content.
 
 The snapshot also carries the separate `block_proof` view. This admits
-ROM-backed blocks reached from authoritative entries without claiming a
-contiguous historical function or a global executable section. It is the
-typed input for `BlockPackV1`, not a shortcut around exact owner proof. The
-portable pack contains bank/content identities, block geometry, terminators,
-and digests but no ROM words. Materialization re-verifies the normalized ROM
-and each block digest before exposing words in memory. Its adapter preserves
-the disjoint spans when invoking the typed sparse arbitrary-PC emitter: a data
-gap never becomes executable from the bank's bounding interval, and a static
-or computed transfer into that gap returns to mapping resolution. The real
-NWXE gate emits 197 blocks / 1,039 words and requires the generated Rust to
-compile.
+image-backed blocks reached from authoritative entries without claiming a
+contiguous historical function or a global executable section. Both
+`ReachableCodeBlock` and `ExactFunctionOwner` retain the exact tagged backing
+subspan; evaluated output offsets are not represented as cartridge addresses.
+Block proof is the typed input for `BlockPackV1`, not a shortcut around exact
+owner proof. Pack wire V3 contains bank/content identities, block geometry,
+tagged backing, terminators, and digests but no ROM words. Materialization
+re-verifies the normalized ROM, re-derives each distinct evaluated-image
+receipt under fixed resource bounds, and verifies each block digest before
+exposing words in memory. Legacy V1 physical and V2 affine Physical/VROM packs
+remain readable and are validated under their original restrictions; they do
+not carry evaluated-image backing. The adapter preserves disjoint spans when
+invoking the typed sparse arbitrary-PC emitter: a data gap never becomes
+executable from the bank's bounding interval, and a static or computed
+transfer into that gap returns to mapping resolution. The real NWXE gate
+emits 197 blocks / 1,039 words and requires the generated Rust to compile.
 
 `block_pack::emit_block_program_source` is the reusable pack-to-execution
 boundary. It re-materializes the pack against the normalized ROM and requires
@@ -436,25 +575,129 @@ also reports how many assessments have no other blocker, so a pass can be
 prioritized by its immediate exact-owner payoff.
 
 **Correction:** this section previously claimed virtual/compressed backing
-was rejected in V1 pending a proof-carrying materialization transform. That
-claim is retracted — the transform exists and is wired in. Virtual (VROM)
-and Yaz0-compressed backing are accepted, not rejected, provided they carry
-that proof: `snapshot::compose_materialized_bank_v1` resolves a bank's bytes
-through `banks::materialize_rom_range`
-(`crates/fn64-discover/src/snapshot.rs:472`), which for a VROM range
-requires exactly one proven `LoadImageTableRecord` file-table mapping
-(`crates/fn64-discover/src/banks.rs:625-652`) and, when the mapped file
-starts with a `Yaz0` header, decodes it with a bounded decoder that verifies
-the stream's declared output length against the VROM interval before
-trusting any byte (`banks.rs:664-674`, decoder at `banks.rs:1319-1370`). An
-unproven VROM range (zero or more than one candidate mapping) or a
-non-Yaz0 file whose length disagrees with the VROM interval is still
-rejected loudly rather than silently materializing unverified bytes — that
-part of the original rationale still holds.
+was rejected pending a proof-carrying materialization transform. That claim
+is retracted. Affine VROM/Yaz0 backing is resolved through the bounded ROM
+range materializer and requires exactly one proven `LoadImageTableRecord`.
+Evaluator-produced backing is independently re-derived from its typed receipt
+through `materialized_image::rederive_materialized_image_v1`; its source may
+itself use the same proven VROM resolver. Missing or competing file records,
+receipt disagreement, decoded-length disagreement, and resource-limit failures
+all reject the bank rather than materializing unverified bytes.
 
-The boot bank's normalized ROM-header entry is a typed, authoritative
-`HardwareEntrypoint` / `RomHeaderEntrypoint` claim justified by the same IPL3
-copy evidence as its mapping. In contrast, an exhaustive link-free `jr`
+Headered raw-DEFLATE evaluator identity includes the container layout. The
+existing `0x1172` evaluator retains its six-byte header and four-byte
+big-endian output length. The distinct `0x1173` evaluator uses a five-byte
+header and a three-byte big-endian output length; both require decoder
+`StreamEnd` and exact agreement with the declared output length. The `0x1173`
+layout was derived from local ROM-byte experiments and checked against
+`perfect-dark-pc-port/perfect_dark/src/lib/rzip_c.c` (MIT, Copyright 2022 Ryan
+Dwyer). Neither evaluator scans for a stream or establishes runtime placement.
+
+`rzip_scan` locates candidate `0x1172`/`0x1173` headers; `rzip_verify` feeds
+each bounded candidate through the matching single-stream materializer and keeps
+only exact `StreamEnd` plus declared-length matches. Single-stream evaluation
+does not hash the unrelated ROM suffix, avoiding work proportional to
+`candidate count × remaining ROM bytes`; sequence receipts retain their
+existing suffix digest unchanged. The verification result is content-free and
+reports offsets, lengths, digests, exact rejection/frontier counts, and the
+ledger's mapping-independent 8 KiB code signals. It grants no placement,
+execution, bank, or proof authority.
+
+On the local Perfect Dark Europe image (SHA-256 `8e432b1a...0394ff`), the
+default bounded pass examined 9,571 candidates, skipped two over its aggregate
+output frontier, rejected 1,082 as invalid DEFLATE plus 13 for output-length
+mismatch, and retained 8,474 exact streams producing 31,515,214 bytes in
+3.4--3.7 seconds. An independent raw-zlib pass also retained 8,474; the
+previously reported 8,475 is not reproduced, and 13 candidates fail declared-
+length agreement after inflation.
+The ledger predicate marked 452 streams code-like, while the earlier 377 count
+is exactly the separate threshold `jr_ra_words > 4`. On Banjo-Kazooie USA
+(SHA-256 `59875835...e6eff`), the default pass examined 3,584 candidates,
+skipped two, rejected 318, and retained 3,264 exact streams producing
+31,495,582 bytes in 3.1--3.4 seconds; 15 satisfy both the ledger predicate and
+`jr_ra_words > 4`. These distributions are build-qualified measurements, not
+container-format constants.
+
+The opt-in `transform-invocation-certificate` feature adds a narrower,
+candidate-only bridge between those host-rederived bytes and one exact guest
+wrapper execution. It runs content-bound code and committed memory on a scoped
+execution thread with fresh thread-local hooks and writer epochs, using a fresh
+typed-Rust RDRAM/context. It initializes the destination with verifier-derived
+poison that is not readable until guest stores replace it, admits only a
+conservative dependency-audited integer subset, journals successful physical
+data reads and CPU stores, and requires a bounded `ThreadReturn` where CPU
+stores cover every destination byte and the result equals the re-derived
+evaluator aggregate or one explicitly selected receipt stream exactly. Its certificate
+binds that output-relative selection, the evaluator receipt, linked dynamic
+semantics, code image, fetched units, committed inputs, ordered memory effects,
+and output. It does not conclude a fact or prove general transform semantics,
+boot reachability, runtime placement, or release authority; unsupported CPU
+state, unseeded-register dependencies, uncommitted reads, writes outside the
+declared destination/scratch ranges, and partial unaligned stores all reject
+the invocation. The sequence form requires exactly one declared call per
+receipt stream in ordinal order and executes every call in one shared fresh
+RDRAM machine. Each call gets a new explicitly seeded CPU context, may write
+only its selected stream plus declared shared mutable/scratch ranges, and must
+fully replace that stream's poison with the exact re-derived bytes. Per-step
+pre/post commitments bind shared pointer-cell evolution, and each post-state
+must equal the caller-declared bytes. Cumulative unit and instruction limits
+cover the complete sequence rather than resetting at call boundaries. Scratch
+cannot overlap committed, shared, code, source, or aggregate-output memory and
+loses read authority at each call boundary, so only explicitly committed
+mutable ranges and already-certified earlier output streams can carry
+cross-call dependencies. Only RDRAM and the linked unit catalog persist:
+registers, HI/LO, and COP0 state do not, and intervening caller instructions
+are not executed. This proves the declared ordering and shared state for that
+exact content-bound sequence; it does not prove call sites, their intervening
+corridor, or that boot selects the calls.
+The serialized certificate is replay evidence, not an authority capability;
+authority consumers must retain the opaque evaluation or re-run the exact
+content-bound request. Caller-declared scratch ranges and code bytes remain
+candidate inputs until a validator binds them to an admitted bank and corridor.
+
+The same opt-in feature exposes `polling_stutter` for one narrower corridor
+claim. Given complete committed pre-device and post-device RDRAM backings, one
+complete context state, disjoint direct-mapped code spans, one exact non-RDRAM
+KSEG1 status word, and declared loop-head/join PCs, it executes the exact unit
+catalog against a port that services only that status read and faults every
+other memory access. Busy paths use the pre-device backing; ready paths use the
+post-device backing. Both must contain the same committed polling code. An
+opcode whitelist is checked before each unit executes; stores, other loads,
+COP0/TLB/FPU operations, traps, host calls, and code escape are rejected. The
+validator requires one status read and no RDRAM change on every path. It proves
+that the first busy observation reaches a loop-head state for which two further
+busy executions have identical complete CPU state after erasing only Count and
+Random phase, and identical fetched-unit transcripts. The whitelist cannot
+explicitly observe Count or Random and cannot execute TLBWR; ordinary
+instruction retirement still advances the interpreter's Random phase. It also
+requires ready execution from two consecutive recurrent heads to produce the
+same delayed join state and transcript under that normalization.
+
+Immediate-ready and delayed-ready join states are retained as two distinct
+outputs. They are deliberately not required to be equal: a caller can leave
+different dead scratch registers on the no-wait and waited branches. A later
+corridor validator must independently show that both states produce the same
+claimed image, placement, and transfer. Therefore the opaque stutter validation
+proves arbitrary finite repetition of one exact polling cycle only. It does not
+prove device timing, PI event ordering, interrupt scheduling, image production,
+or release authority. The capability and certificate retain an explicit
+obligation that downstream validation prove every Count/Random phase in the
+quotient unobservable through the final claim; the production Count clock and
+pending-interrupt entry are not modeled here, and the exposed join contexts are
+only representatives. Its serialized certificate contains full initial and
+normalized final CPU-state commitments plus distinct pre-device/post-device
+RDRAM commitments and code/transcript commitments, but no instruction or memory
+bytes, and deserialization cannot recreate the opaque validation. It does not
+authenticate the change between the two backings; the continuous device
+corridor must bind that transition to one typed commit.
+
+The boot bank's effective entry is a typed, authoritative
+`HardwareEntrypoint` / `RomHeaderEntrypoint` claim only when an exact admitted
+IPL3 identity establishes the relocation delta and the complete one-megabyte
+copy source exists. CIC-6102/7101 and 6105/7105 use zero delta;
+CIC-6103/7103 uses `0x100000`. Unknown/truncated IPL3, a truncated copy source,
+or invalid header arithmetic records `bank:boot` as `Open` and emits neither a
+mapping nor an entry claim. In contrast, an exhaustive link-free `jr`
 target is traversed as an intra-owner successor and is not inserted into the
 callable-root set. On the real NWXE bank this distinction removes the false
 owner ambiguity at the mechanically recovered `0x80000460` transfer without
@@ -469,6 +712,10 @@ Hard constraints:
 - Every accepted block has exactly one owner within its bank.
 - Owners do not overlap within a bank.
 - Every direct call target is a callable entry.
+- Every exhaustive computed-call target is a callable entry when its typed
+  target-set evidence exactly matches the CFG. Multi-bank composition applies
+  the same rule across bank boundaries; bounded/open calls and computed jumps
+  remain non-authoritative.
 - Ordinary fallthrough stays within its owner.
 - Returns terminate paths.
 - Tail transfers may cross owners.
@@ -482,6 +729,109 @@ Initial roots include:
 - Thread and callback entrypoints.
 - Proven function-pointer targets.
 - Dynamically observed external entries.
+
+> Implementation status (2026-07-29): byte-verified snapshot composition now
+> derives resident `osCreateThread` entry arguments without a caller-supplied
+> callee address. A bounded semantic recognizer identifies exactly one
+> implementation from the public libultra `osCreateThread` contract: linkage,
+> identity, saved context, state, and priority fields written into `OSThread`.
+> Zero matches adds no authority; multiple matches fail composition closed.
+> Starting only from the typed proven ROM-header entry (never traversal hints
+> or tool candidates), an authority-only CFG admits a constant aligned
+> same-bank `$a2` target only when both the direct call and its delay slot are
+> proven code. Each admitted thread entry is fed back into that closure until
+> no new entry appears. Operand slicing is performed once per bank and reused
+> across rounds. Cross-bank targets remain open until bank-generation identity
+> can select exactly one loaded image; overlapping overlay ranges are never
+> guessed. All newly discovered `(callee, argument-register)` contracts are
+> sliced in one image scan per fixed-point round rather than rescanning the
+> bank once per contract. N64LoaderWV/Ghidra output remains candidate evidence and is not an
+> input to this authority chain.
+>
+> The focused OoT NTSC 1.0 characterization supplies no entry-argument
+> manifest: semantic discovery uniquely identifies `osCreateThread`, and the
+> private composition chain admits the device-manager thread entry that the
+> retained pre-change snapshot omitted. The full corpus grade likewise removes
+> the `osCreateThread` address from its manifest while retaining two unrelated
+> callback anchors; exact recall rises from 116/137 to 119/137 with `wrong=0`.
+> Its output was byte-identical across 10 consecutive guarded runs on
+> 2026-07-29, followed by all 703 `fn64-discover` nextest cases. The 1 MiB real-bank
+> characterization itself completes in about 0.2 seconds once compiled; peak
+> memory in the full validation was compiler memory, not discovery execution.
+> MM US independently passed 10 consecutive guarded, semantically identical
+> corpus runs after removing its `osCreateThread` anchor, raising exact recall
+> from 399/486 to 401/486 with `wrong=0`. SM64 currently derives no thread roots
+> from boot-entry authority, and Kirby's `0x80022e04` interior entry is visible
+> only from a call inside the same otherwise-unreachable entry; neither circular
+> case is promoted, and both manifests retain their explicit anchor.
+>
+> The same private fixed point now infers callback-argument contracts without
+> API names: within an uncontested callable owner, an o32 argument must reach a
+> reachable `jalr` target through exact register moves or stack spills/reloads.
+> Arithmetic, non-stack loads, caller clobbers, and disagreeing CFG joins erase
+> identity; branch-likely fallthrough annuls only its delay word. A constant
+> caller operand is admitted only when that direct call and its delay word are
+> proven code in the hardware-rooted closure. On MM this removes the resident
+> `_Printf` `$a0` anchor with 10/10 semantically identical guarded corpus runs,
+> retaining 401/486 exact and `wrong=0`.
+>
+> Cross-function callback field proof is now implemented as a stricter second
+> contract: a reachable registrar must store one o32 argument into an object
+> field, link that same object to the old head, and publish it through an exact
+> field of a globally loaded context pointer. A reachable uncontested
+> dispatcher must load that identical head, load the identical callback field
+> into `jalr`, and traverse the registrar's exact link field after the call;
+> site reachability must preserve those event orders. Events are emitted only
+> from stabilized dataflow states, so incompatible branch-local facts cannot
+> combine into a contract. Synthetic positives, mismatched-link and
+> unreachable-dispatch negatives, and an adversarial disagreeing-join case
+> pass; the exact registry-focused set passed 10 consecutive guarded runs on
+> 2026-07-29. On real MM, boot-only
+> hardware authority correctly produces no contract because
+> `Fault_ProcessClients` is not reachable. A private characterization that
+> supplies the known `Fault_ThreadEntry` as test-only authority then derives
+> `Fault_AddClient` `$a1`, object callback offset `+4`, link offset `+0`, the
+> context-pointer/list-head expression, and `jalr` at `0x80083634` without
+> names. Multi-bank composition now feeds a cross-bank call into semantic
+> recovery only when the call and delay slot are reachable from fact-proven or
+> already-derived callable roots and its target belongs to exactly one
+> byte-verified bank generation. Physical and proven VROM-backed banks use the
+> same rule; overlapping generations remain open. Newly authorized banks are
+> rescanned to a monotone fixed point, with strict source-call results cached
+> until that source gains another authoritative root. Caller-supplied traversal
+> hints cannot bootstrap the chain. The original positive resident-target path
+> and traversal-hint rejection each passed 10/10 guarded runs; the
+> overlapping-generation negative also passes. The complete focused semantic
+> set, including the VROM/multi-hop fixed point, passed 10 consecutive runs on
+> 2026-07-29.
+>
+> Real-MM characterization exposed a two-hop cross-bank chain rather than a
+> missing-function-identification problem. Proven boot `Main_ThreadEntry`
+> directly calls `request_dma_0:0x80174bf0`; that loaded function's call at
+> `0x80174c28` targets resident `Fault_Init`. Fixed-point composition now reaches
+> both calls, derives `Fault_ThreadEntry`, and recovers the registry contract on
+> the user-owned MM image without an answer-key root or literal stored pointer.
+> The exact real-ROM test passed 10 consecutive clean runs on 2026-07-29. A
+> stack sample placed the dominant cost in whole-bank value-set CFG building;
+> deferring traversal-hint CFGs until strict authority stabilizes reduced the
+> measured exact test from about 65.0 seconds to 57.6–59.9 seconds across the
+> final run series. The function-boundary grader now composes the resident bank
+> with only the load images proven by its cited request-DMA scan, so it consumes
+> the same fixed-point authority without admitting unrelated materializable
+> overlays. On 2026-07-29, an A/B run with the former `Fault_AddClient` manifest
+> present versus absent was identical: the manifest added zero roots, both runs
+> produced 386/486 exact and 98 open without the cross-game donor, and both had
+> `wrong=0`. The obsolete MM entry-argument manifest was therefore removed.
+> Grader integration then raises canonical MM from 401/486 to 402/486 exact,
+> `wrong=0`; 10 consecutive canonical composed runs were identical and peaked
+> between 495 and 523 MiB on 2026-07-29.
+> The same name-free mechanism raises WM2000 from 688/847 to 698/847 and No
+> Mercy from 826/985 to 835/985 exact, both `wrong=0`; each game passed 10/10
+> paired, semantically identical guarded corpus runs. OoT, SM64, and Kirby
+> retain their prior exact grades and `wrong=0` under the expanded authority
+> pass. After the fixed-point extension, 703/703 package tests passed in the
+> sandbox and the one process-table-dependent Ghidra runner test passed
+> separately with its memory guard enabled: 704/704 total.
 
 Compute each root's reachable block closure. Competing closures create local
 ambiguity regions. Normal cases should resolve through graph and interval
@@ -519,6 +869,15 @@ an `open` result.
 > bytes. No reference-runtime implementation source was consulted. Runtime
 > observations (step 7) and mutable callback fields whose values arrive only
 > through unknown arguments remain unimplemented and stay open.
+>
+> The same fixed point now exposes an opt-in call-boundary projection sampled
+> after each call's delay slot and before unknown callee effects are applied.
+> Callers may restrict analysis to an explicit authority-root set and request
+> a bounded GPR set. Results distinguish finite constants, symbolic stack
+> locations, and open values; path disagreement, revisit widening, and values
+> loaded from mutable initial-image words remain typed blockers. This is
+> operand evidence for a separately authenticated callee mechanism, not proof
+> that an arbitrary call target implements that mechanism.
 
 The third-ROM NWXE answer-key run (2026-07-16) confirmed that the bounded
 HI/LO resolver itself generalizes unchanged: from the header entrypoint
@@ -790,6 +1149,10 @@ the ROM, revalidates schema, digests, geometry, and entry, then stages and
 syncs the source beside the destination. Publication is an atomic no-clobber
 hard link; an existing output is never replaced. Success prints the exact byte
 count and SHA-256 receipt without printing the generated source.
+This file-intake command proves pack/ROM integrity, not discovery derivation:
+project gates obtain schema-v3 packs only from the in-process move-only
+validated snapshot composition rather than treating caller-authored snapshot
+JSON as root authority.
 
 An audit report should expose exact counts:
 
@@ -816,7 +1179,7 @@ Decomp Pack
   sections, data symbols, relocations, compiler profiles, and match proofs
 
 Generated adapters
-  Splat, linker scripts, assembly objects, m2c contexts, asm-differ and
+  Splat, linker scripts, assembly objects, Ghidra review projects, asm-differ and
   decomp-permuter jobs
 ```
 

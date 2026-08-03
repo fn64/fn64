@@ -202,14 +202,78 @@ pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
     let prev2 = raw_words[offset - 2];
     // Directly after a terminator (its delay/successor slot is prev1,
     // which may be any instruction).
-    if prev2 == 0x03e0_0008 /* jr $ra */ || prev2 == 0x4200_0018 /* eret */ {
+    if prev2 == 0x03e0_0008 /* jr $ra */ || prev2 == 0x4200_0018
+    /* eret */
+    {
         return true;
     }
     // Alignment padding: two consecutive nops. A single nop is NOT
     // enough — it is routinely a branch delay slot mid-function
     // (observed: `b; nop` inside MM's __osException). A tail-`j` is not
     // accepted either: handwritten SDK assembly uses `j` for loops.
-    prev1 == 0 && prev2 == 0
+    //
+    // The padding rule alone is necessary but not sufficient: a read-only
+    // data region also begins after zero padding. Requiring the candidate
+    // word itself to be admissible as code closes that hole (observed:
+    // WCW/nWo Revenge, where `func_8002EC80` was split at 0x8002eeb0 — a
+    // KSEG0 pointer run — and `func_8002FF00` at 0x80030860 — packed float
+    // data; both sit immediately after zero padding).
+    prev1 == 0 && prev2 == 0 && admissible_entry_word(raw_words[offset])
+}
+
+/// Whether a word can open a real function.
+///
+/// This rejects the data shapes that follow alignment padding and would
+/// otherwise satisfy [`plausible_function_boundary`]'s padding rule. It is
+/// deliberately a *word-local* test with no window scan: a boundary rule that
+/// consults neighbours would reject real functions whose second word happens
+/// to look like data.
+///
+/// Rejected:
+/// * KSEG0/KSEG1 addresses (`0x8*`/`0xa*` with a plausible RDRAM offset) —
+///   these are pointer-table slots, and a pointer run following padding is
+///   the exact shape that split Revenge's `func_8002EC80`.
+/// * Words whose primary opcode is architecturally reserved on the VR4300.
+///   A real entry decodes; reserved-encoding data does not.
+///
+/// A leading `nop` is deliberately NOT rejected. It looks like padding, but
+/// real functions do open with one (Kirby 64's answer key contains eleven,
+/// including `game_tick` and `play_music`), and rejecting it cost seven
+/// exact matches with no wrong-split prevented.
+///
+/// `pub(crate)`: also consulted by `cfg`'s recursive descent, which needs the
+/// same word-local rule to keep `j`/branch targets out of data islands
+/// (Donald Duck, Rayman 2). Kept here rather than duplicated so the rule has
+/// exactly one definition.
+pub(crate) fn admissible_entry_word(word: u32) -> bool {
+    // A code pointer stored in data, not an instruction. Restricted to the
+    // cached/uncached RDRAM windows so genuine instructions that merely
+    // begin with those nibbles (they do not, at these opcode positions) can
+    // never be caught: opcodes 0x20 and 0x28 are `lb`/`sb`, whose encodings
+    // occupy the same high nibble, so the low-word check keeps this tight.
+    let opcode = word >> 26;
+    if matches!(word >> 28, 0x8 | 0xa) && (word & 0x0fff_ffff) < 0x0080_0000 {
+        return false;
+    }
+    // Reserved primary opcodes on MIPS III/VR4300. Data frequently lands
+    // here; compiled code never does.
+    !matches!(opcode, 0x13 | 0x1c | 0x1d | 0x1e | 0x1f | 0x3c | 0x3d | 0x3e)
+}
+
+/// One handler-table target together with the exact bank-word geometry that
+/// supplied it. Indices are relative to the `bank_words` slice passed to
+/// [`detect_handler_table_candidates`]; consumers can bind them to their own
+/// bank identity without this scan inventing provenance. `run_length`
+/// is the accepted run's total number of pointer slots, shared by every row
+/// from that run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HandlerTableCandidate {
+    pub target_va: u32,
+    pub table_base_word_index: usize,
+    pub source_slot_word_index: usize,
+    pub slot_ordinal: usize,
+    pub stride_words: usize,
+    pub run_length: usize,
 }
 
 /// Find embedded handler-table entries: function pointers stored in a
@@ -234,28 +298,26 @@ pub fn plausible_function_boundary(raw_words: &[u32], offset: usize) -> bool {
 /// handler}` at stride 2). The boundary requirement on every slot is the
 /// guard against float/fixed-point alias runs; requiring the interleaved
 /// words to be non-pointers keeps a stride-`S` scan from re-reading a
-/// denser table as a sparser one. Returns each pointer-slot VA
-/// (deduplicated, sorted); the caller seeds them as callable-entry roots
-/// and `wrong == 0` is the final adversarial judge.
-pub fn detect_handler_tables(
+/// denser table as a sparser one. Returns one row per accepted source slot,
+/// sorted by source word index. Duplicate targets remain distinct because
+/// their source slots are distinct evidence.
+pub fn detect_handler_table_candidates(
     bank_words: &[u32],
     text_words: &[u32],
     va_start: u32,
     code_end: u32,
     min_run: usize,
-) -> Vec<u32> {
+) -> Vec<HandlerTableCandidate> {
     let is_entry = |word: u32| -> bool {
         if !word.is_multiple_of(4) || word < va_start || word >= code_end {
             return false;
         }
         let offset = ((word - va_start) / 4) as usize;
-        text_words
-            .get(offset)
-            .is_some_and(|&first| first != 0)
+        text_words.get(offset).is_some_and(|&first| first != 0)
             && plausible_function_boundary(text_words, offset)
     };
 
-    let mut entries: Vec<u32> = Vec::new();
+    let mut candidates = Vec::new();
     // Slots already claimed by a table, so a denser stride wins and a
     // sparser stride does not re-harvest the same pointers.
     let mut claimed = vec![false; bank_words.len()];
@@ -268,11 +330,7 @@ pub fn detect_handler_tables(
             // For stride > 1, the word(s) between this slot and the next
             // must NOT be pointer-like (that would be a denser table).
             let interstitial_ok = stride == 1
-                || (1..stride).all(|k| {
-                    bank_words
-                        .get(index + k)
-                        .is_none_or(|&w| !is_entry(w))
-                });
+                || (1..stride).all(|k| bank_words.get(index + k).is_none_or(|&w| !is_entry(w)));
             if slot_ok && interstitial_ok {
                 if start.is_none() {
                     start = Some(index);
@@ -285,7 +343,14 @@ pub fn detect_handler_tables(
                         let mut i = s;
                         while i < index {
                             if !claimed[i] {
-                                entries.push(bank_words[i]);
+                                candidates.push(HandlerTableCandidate {
+                                    target_va: bank_words[i],
+                                    table_base_word_index: s,
+                                    source_slot_word_index: i,
+                                    slot_ordinal: (i - s) / stride,
+                                    stride_words: stride,
+                                    run_length: count,
+                                });
                                 claimed[i] = true;
                             }
                             i += stride;
@@ -301,7 +366,14 @@ pub fn detect_handler_tables(
                 let mut i = s;
                 while i < bank_words.len() {
                     if !claimed[i] {
-                        entries.push(bank_words[i]);
+                        candidates.push(HandlerTableCandidate {
+                            target_va: bank_words[i],
+                            table_base_word_index: s,
+                            source_slot_word_index: i,
+                            slot_ordinal: (i - s) / stride,
+                            stride_words: stride,
+                            run_length: count,
+                        });
                         claimed[i] = true;
                     }
                     i += stride;
@@ -309,6 +381,25 @@ pub fn detect_handler_tables(
             }
         }
     }
+    candidates.sort_unstable_by_key(|candidate| candidate.source_slot_word_index);
+    candidates
+}
+
+/// Backward-compatible target-only view of
+/// [`detect_handler_table_candidates`]. The sorted/deduplicated output is
+/// exactly the historical `detect_handler_tables` contract.
+pub fn detect_handler_tables(
+    bank_words: &[u32],
+    text_words: &[u32],
+    va_start: u32,
+    code_end: u32,
+    min_run: usize,
+) -> Vec<u32> {
+    let mut entries =
+        detect_handler_table_candidates(bank_words, text_words, va_start, code_end, min_run)
+            .into_iter()
+            .map(|candidate| candidate.target_va)
+            .collect::<Vec<_>>();
     entries.sort_unstable();
     entries.dedup();
     entries
@@ -317,6 +408,40 @@ pub fn detect_handler_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padding_alone_does_not_admit_a_data_boundary() {
+        // Both shapes below sit immediately after alignment padding, which
+        // satisfied the boundary rule on its own and split two real
+        // functions in WCW/nWo Revenge.
+        let pointer_run = [0, 0, 0x801b_7800, 0x8017_f400, 0x8014_7000];
+        assert!(!plausible_function_boundary(&pointer_run, 2));
+        let packed_data = [0, 0, 0xf801_07c1, 0x003f_0000, 0x0b06_0100];
+        assert!(!plausible_function_boundary(&packed_data, 2));
+
+        // A real prologue after the same padding is still admitted.
+        let real_entry = [0, 0, 0x27bd_ffd8, 0xafbf_001c, 0x0000_0000];
+        assert!(plausible_function_boundary(&real_entry, 2));
+    }
+
+    #[test]
+    fn a_leading_nop_still_opens_a_function() {
+        // Kirby 64's answer key contains eleven functions whose first word
+        // is a nop (game_tick, play_music, ...). Rejecting that shape costs
+        // real matches and prevents no wrong split.
+        let padded_entry = [0, 0, 0x0000_0000, 0x27bd_ffd8];
+        assert!(plausible_function_boundary(&padded_entry, 2));
+    }
+
+    #[test]
+    fn load_and_store_words_are_not_mistaken_for_pointers() {
+        // `lw`/`sw` encodings share the 0x8*/0xa* high nibble with KSEG0
+        // addresses; the low-word bound is what separates them.
+        assert!(admissible_entry_word(0x8fa4_0028)); // lw a0,0x28(sp)
+        assert!(admissible_entry_word(0xafbf_001c)); // sw ra,0x1c(sp)
+        assert!(admissible_entry_word(0x8c8e_0000)); // lw t6,0(a0)
+        assert!(!admissible_entry_word(0x801b_7800)); // KSEG0 pointer
+    }
 
     // A 8-word body: prologue, a lui/addiu pair (address material that
     // differs between donor and target), work, epilogue.
@@ -424,6 +549,22 @@ mod tests {
         let mut bank = text.clone();
         bank.extend_from_slice(&[0x3f800000, 0x42280000]); // floats, not ptrs
         bank.extend_from_slice(&table);
+        let candidates = detect_handler_table_candidates(&bank, &text, va, code_end, 4);
+        assert_eq!(
+            candidates,
+            table
+                .iter()
+                .enumerate()
+                .map(|(ordinal, target_va)| HandlerTableCandidate {
+                    target_va: *target_va,
+                    table_base_word_index: 10,
+                    source_slot_word_index: 10 + ordinal,
+                    slot_ordinal: ordinal,
+                    stride_words: 1,
+                    run_length: 4,
+                })
+                .collect::<Vec<_>>()
+        );
         let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
         assert_eq!(entries, vec![va, va + 0x08, va + 0x10, va + 0x18]);
 
@@ -457,13 +598,31 @@ mod tests {
         // A `{u32 flag; Func handler}` struct array: ptr at +0, non-ptr
         // flag at +1, stride 2 words. (SM64 sInteractionHandlers shape.)
         let table = [
-            va, 0x0000_0010, // {handler0, flag}
-            va + 0x08, 0x0001_0000, // {handler1, flag}
-            va + 0x10, 0x0000_1000, // {handler2, flag}
-            va + 0x18, 0x0800_0000, // {handler3, flag}
+            va,
+            0x0000_0010, // {handler0, flag}
+            va + 0x08,
+            0x0001_0000, // {handler1, flag}
+            va + 0x10,
+            0x0000_1000, // {handler2, flag}
+            va + 0x18,
+            0x0800_0000, // {handler3, flag}
         ];
         let mut bank = text.clone();
         bank.extend_from_slice(&table);
+        let candidates = detect_handler_table_candidates(&bank, &text, va, code_end, 4);
+        assert_eq!(
+            candidates,
+            (0..4usize)
+                .map(|ordinal| HandlerTableCandidate {
+                    target_va: va + ordinal as u32 * 8,
+                    table_base_word_index: 8,
+                    source_slot_word_index: 8 + ordinal * 2,
+                    slot_ordinal: ordinal,
+                    stride_words: 2,
+                    run_length: 4,
+                })
+                .collect::<Vec<_>>()
+        );
         let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
         assert_eq!(entries, vec![va, va + 0x08, va + 0x10, va + 0x18]);
 
@@ -491,10 +650,30 @@ mod tests {
         let mut table: Vec<u32> = Vec::new();
         for k in 0..6u32 {
             table.push(va + k * 8); // the Func field
-            table.extend_from_slice(&[0x0000_0001, 0x4048_0000, 0x0000_0000, 0x0000_0002, 0x3f80_0000]);
+            table.extend_from_slice(&[
+                0x0000_0001,
+                0x4048_0000,
+                0x0000_0000,
+                0x0000_0002,
+                0x3f80_0000,
+            ]);
         }
         let mut bank = text.clone();
         bank.extend_from_slice(&table);
+        let candidates = detect_handler_table_candidates(&bank, &text, va, code_end, 4);
+        assert_eq!(
+            candidates,
+            (0..6usize)
+                .map(|ordinal| HandlerTableCandidate {
+                    target_va: va + ordinal as u32 * 8,
+                    table_base_word_index: 12,
+                    source_slot_word_index: 12 + ordinal * 6,
+                    slot_ordinal: ordinal,
+                    stride_words: 6,
+                    run_length: 6,
+                })
+                .collect::<Vec<_>>()
+        );
         let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
         for k in 0..6u32 {
             assert!(entries.contains(&(va + k * 8)), "missing slot {k}");
@@ -514,12 +693,58 @@ mod tests {
         let code_end = va + (text.len() as u32) * 4;
         // Only two stride-6 slots.
         let table = [
-            va, 0x0000_0001, 0x0000_0002, 0x0000_0003, 0x0000_0004, 0x0000_0005,
-            va + 0x08, 0x0000_0006, 0x0000_0007, 0x0000_0008, 0x0000_0009, 0x0000_000a,
+            va,
+            0x0000_0001,
+            0x0000_0002,
+            0x0000_0003,
+            0x0000_0004,
+            0x0000_0005,
+            va + 0x08,
+            0x0000_0006,
+            0x0000_0007,
+            0x0000_0008,
+            0x0000_0009,
+            0x0000_000a,
         ];
         let mut bank = text.clone();
         bank.extend_from_slice(&table);
         let entries = detect_handler_tables(&bank, &text, va, code_end, 4);
-        assert!(entries.is_empty(), "short wide-stride run must not seed: {entries:x?}");
+        assert!(
+            entries.is_empty(),
+            "short wide-stride run must not seed: {entries:x?}"
+        );
+    }
+
+    #[test]
+    fn handler_table_candidates_preserve_duplicate_sources_and_dense_precedence() {
+        let va = 0x8024_6000;
+        let text = vec![
+            0x03e00008, 0x00000000, 0x03e00008, 0x00000000, 0x03e00008, 0x00000000, 0x03e00008,
+            0x00000000,
+        ];
+        let code_end = va + text.len() as u32 * 4;
+        let mut bank = text.clone();
+        bank.extend_from_slice(&[va, va + 0x08, va, va + 0x08]);
+
+        let candidates = detect_handler_table_candidates(&bank, &text, va, code_end, 4);
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.target_va)
+                .collect::<Vec<_>>(),
+            vec![va, va + 0x08, va, va + 0x08]
+        );
+        assert!(candidates.iter().enumerate().all(|(ordinal, candidate)| {
+            candidate.table_base_word_index == 8
+                && candidate.source_slot_word_index == 8 + ordinal
+                && candidate.slot_ordinal == ordinal
+                && candidate.stride_words == 1
+                && candidate.run_length == 4
+        }));
+        assert_eq!(
+            detect_handler_tables(&bank, &text, va, code_end, 4),
+            vec![va, va + 0x08]
+        );
     }
 }

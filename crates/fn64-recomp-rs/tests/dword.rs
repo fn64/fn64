@@ -500,7 +500,7 @@ fn mem_oracle(initial: &[u8]) -> (Vec<u8>, u64) {
 
 #[test]
 fn emitter_output_matches_goldens() {
-    use fn64_recomp_rs::{emit_function, FuncInput};
+    use fn64_recomp_rs_codegen::{emit_function, FuncInput};
     let norm = |s: &str| s.trim_end().replace("\r\n", "\n");
 
     let alu = emit_function(&FuncInput {

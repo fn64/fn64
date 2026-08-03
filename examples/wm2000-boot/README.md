@@ -78,6 +78,20 @@ the transactional LLE fallback, not a claim that WM2000 executed in HLE.
    an invalid foreign-frame unwind; renderer/audio owners and ordinary Rust
    values then receive normal process teardown.
 
+The harness registers its complete RDRAM allocation at the AI output boundary
+and reports buffer/sample/nonzero/range counts at exit. It opens the default
+cpal device when available; set `FN64_NO_AUDIO=1` for a headless run. Set
+`FN64_DUMP_AUDIO_STREAM_PCM=/private/path/stream.pcm` to retain private
+pre-resample stereo `s16le` for a bounded audio validation.
+The boot loop normally runs faster than wall time and may deliberately skip
+old samples at cpal's bounded latency cap. Set `FN64_AUDIO_PACE=1` for an
+audible diagnostic: the harness holds the host-only queue near 125 ms and
+drains it before exit without changing guest virtual time. Release evidence
+rejects this wall-clock mode. For audio-only diagnosis, additionally set
+`FN64_AUDIO_VALIDATION_SKIP_GRAPHICS=1`; this selects the ABI's explicit
+`DiagnosticSkip` graphics policy while retaining live-IMEM LLE audio. It is
+mutually exclusive with `WM2000_GRAPHICS_POLICY` and rejected in release mode.
+
 `WM2000_NO_DUMP=1` disables PNG output and normally skips RT64 readback setup.
 `WM2000_NO_TRACE=1` also disables PNGs for throughput measurements. Add
 `WM2000_RT64_CAPTURE=1` to either configuration to retain the fenced post-VI
@@ -94,7 +108,7 @@ proves which native pixels were produced and whether a bounded run repeats;
 it does not by itself prove hardware pixel correctness or zero unsupported
 behavior.
 
-## Voice-map-intervention-free schema-v28 release path
+## Voice-map-intervention-free schema-v29 release path
 
 The generic runner-owned release tuple enables the fail-closed RT64/LLE path:
 
@@ -116,7 +130,7 @@ staged microcode pair, report path, and ROM-class authority. The target cycle
 must be an exact scheduled VI edge with a completed RT64 post-VI presentation.
 The host arms `LiveReleaseGate` and its crash-flushed unsupported-event journal
 before thread 0 runs, freezes the native archive identity and all fixed-cycle
-channels at that edge, writes the schema-v28 report, completes the unsupported
+channels at that edge, writes the schema-v29 report, completes the unsupported
 journal, and then requires closed-gate state. A failed closure may retain an
 incomplete report for diagnosis, but the private-series runner rejects it.
 Stopping early or skipping the requested cycle is a loud failure.
@@ -688,7 +702,7 @@ reads the payload as a round **0x8000 bytes from device offset 0x20**
 of a 256 Kbit chip.
 
 **The evidenced geometry is 256 Kbit (0x8000 bytes), not 768 Kbit.**
-Three independent signals agree:
+Two independent signals agree:
 
 1. **The game's own save-region table** (13 entries of
    `{u16 offset, u16 stride, u16 size, u16 pad}` at `0x8010625C`,
@@ -701,10 +715,6 @@ Three independent signals agree:
    write EVER crosses 0x8000; only the boot read's round 0x8000 does.
 2. **mupen64plus.ini**: all WM2000 regions (U/E/J) are
    `SaveType=SRAM` -- the flat 32 KiB device.
-3. **The beta-playable reference port** (jessetbh
-   WWFWrestleMania2000Recomp, `src/main/main.cpp`) configures
-   `recomp::SaveType::Sram`, a 32 KB buffer.
-
 **Fix (hardware address decode, not a bigger device):** a discrete
 256 Kbit SRAM part only decodes A0..A14, so the PI byte address
 aliases modulo the power-of-two device size -- the read's last 0x20

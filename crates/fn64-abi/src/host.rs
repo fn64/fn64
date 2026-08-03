@@ -82,6 +82,69 @@ pub unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
     with_executor(|exec| unsafe { exec.set_rdram_base_with_len(rdram, rdram_len) });
 }
 
+#[cfg(feature = "recomp-rs")]
+pub(crate) fn install_owned_process_rdram(mut storage: Box<[u8]>) -> (*mut u8, usize) {
+    assert!(
+        !storage.is_empty(),
+        "owned process RDRAM allocation must be nonempty"
+    );
+    let pointer = storage.as_mut_ptr();
+    let length = storage.len();
+    with_host(|host| {
+        assert!(
+            host.owned_runtime_rdram.is_none() && host.runtime_rdram.is_null(),
+            "owned process RDRAM cannot replace an existing allocation"
+        );
+        host.owned_runtime_rdram = Some(storage);
+    });
+    // SAFETY: HostState now owns the boxed allocation for the runtime lifetime.
+    unsafe { register_process_rdram(pointer, length) };
+    (pointer, length)
+}
+
+/// Install the structurally discovered guest global that libultra's exception
+/// handler reads to find the current `OSThread`.
+pub fn set_guest_running_thread_global(vram: u32) {
+    let address = RdramAddr::from_gpr(u64::from(vram));
+    with_host(|host| {
+        assert!(
+            host.guest_running_thread_global.is_none()
+                || host.guest_running_thread_global == Some(address),
+            "guest running-thread global cannot change after installation"
+        );
+        host.guest_running_thread_global = Some(address);
+    });
+}
+
+fn mirror_guest_running_thread(thread_id: ThreadId) {
+    let configured = with_host(|host| {
+        let global = host.guest_running_thread_global?;
+        let handle = host.thread_handle_vrams.get(&thread_id).copied()?;
+        Some((global, handle, host.runtime_rdram, host.runtime_rdram_len))
+    });
+    let Some((global, handle, rdram, rdram_len)) = configured else {
+        // The synthetic bootstrap coroutine has no guest OSThread object.
+        return;
+    };
+    assert!(
+        !rdram.is_null(),
+        "guest running-thread mirror has no process RDRAM"
+    );
+    assert!(
+        global.offset() as usize + 4 <= rdram_len,
+        "guest running-thread global {:#010x} exceeds registered RDRAM length {rdram_len:#x}",
+        global.offset()
+    );
+    #[cfg(feature = "recomp-rs")]
+    if crate::recompiled::commit_scheduler_running_thread_mirror(
+        crate::recompiled::SchedulerRunningThreadMirrorV1::new(thread_id, global, handle),
+    ) {
+        return;
+    }
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    unsafe { storage.write_u32(global, handle) };
+}
+
 /// Copy the complete physical RDRAM device in logical guest-byte order.
 ///
 /// The registered allocation can include fn64's host-only sparse MMIO window;
@@ -185,7 +248,14 @@ pub fn run_one_step() -> bool {
         // suspend). `None` means nothing is runnable -- no resume will
         // happen, so no context needs arming.
         let stepped = match exec.peek_next_thread() {
-            Some(id) => with_rearmed_context(id, || exec.run_one_step()),
+            Some(id) => {
+                // Close scheduler selection -> exception-handler observation:
+                // the selected coroutine's guest OSThread pointer is visible
+                // before its first instruction and cannot interleave with a
+                // different resume because `run_one_step` owns RunToken.
+                mirror_guest_running_thread(id);
+                with_rearmed_context(id, || exec.run_one_step())
+            }
             None => exec.run_one_step(),
         };
         (stepped, exec.sim_time())
@@ -260,6 +330,10 @@ pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
     with_host(|host| {
         host.runtime_rdram = std::ptr::null_mut();
         host.runtime_rdram_len = 0;
+        #[cfg(feature = "recomp-rs")]
+        {
+            host.owned_runtime_rdram = None;
+        }
     });
     THREAD_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     ACTIVE_YIELDER.with(|active| active.set(None));
@@ -290,6 +364,11 @@ pub fn executor_resume_epoch() -> u64 {
 /// `TraceEvent` stream to a file.
 pub fn copy_trace() -> Vec<fn64_runtime::TraceEvent> {
     with_executor(|exec| exec.trace().to_vec())
+}
+
+/// Number of retained diagnostic executor events without cloning them.
+pub fn trace_len() -> usize {
+    with_executor(|exec| exec.trace().len())
 }
 
 /// Enable or disable differential event capture. This controls diagnostics
@@ -323,6 +402,24 @@ mod tests {
     fn reset_evidence_owners() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
         with_host(|host| *host = HostState::default());
+    }
+
+    #[test]
+    fn scheduler_mirror_publishes_registered_guest_osthread_pointer() {
+        reset_evidence_owners();
+        let mut storage = vec![0u8; 0x1000];
+        unsafe { register_process_rdram(storage.as_mut_ptr(), storage.len()) };
+        set_guest_running_thread_global(0x8000_0100);
+        with_host(|host| {
+            host.thread_handle_vrams.insert(7, 0x8000_0280);
+        });
+
+        mirror_guest_running_thread(7);
+
+        assert_eq!(
+            fn64_runtime::RdramView::from_storage(&storage).read_u32(RdramAddr::from_offset(0x100)),
+            0x8000_0280
+        );
     }
 
     #[test]
@@ -416,7 +513,7 @@ mod tests {
             let pi_request = PiDmaRequest {
                 direction: DmaDirection::ToRdram,
                 dram_addr: RdramAddr::from_offset(0x20),
-                cart_addr: 0x1000_0000,
+                device: fn64_runtime::PiDeviceAddress::RomOffset(0),
                 len: 0x20,
             };
             host.pending_pi_completions.push_back(PendingPiCompletion {

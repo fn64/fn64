@@ -8,6 +8,9 @@
 //! gate every timing-refinement item (U2 PI latency, U5 AI drain / EEPROM /
 //! Flash busy, U6 RSP) is graded against. It runs NO emulator — it ingests two
 //! already-produced JSONL traces and diffs them.
+//! A zero exit additionally requires both trace envelopes to end as
+//! `completed`; matching aborted traces are failed evidence, even when both
+//! event streams are empty.
 //!
 //! Usage:
 //!   gate_timing_diff <fn64.jsonl> <reference.jsonl> [pi si ai mi vi]
