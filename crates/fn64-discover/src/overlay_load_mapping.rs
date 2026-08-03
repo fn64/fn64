@@ -45,6 +45,20 @@ pub struct OverlayLoadMappingV1 {
     pub rom_start: u32,
     pub rom_end: u32,
     pub load_start: Option<u32>,
+    /// The high-water mark of RDRAM this overlay is known to touch, when the
+    /// descriptor proves one beyond the loaded image.
+    ///
+    /// A recipe gets this from `bss_end`. A load-only descriptor has no bss,
+    /// but it may still carry an allocation extent -- Batman of the Future's
+    /// records hold a `[w0, w0, w2]` triple, and in 3 of its 6 records `w2`
+    /// reaches past the loaded image (rec1 to `0x8028e2a0`, against an image
+    /// ending at `0x80230020`).
+    ///
+    /// `None` means the descriptor proves no reach beyond the image. It does
+    /// NOT mean the overlay touches nothing further -- see
+    /// [`Self::proven_reach_end`], which is why this is not an invalidation
+    /// bound on its own.
+    pub allocation_end: Option<u32>,
     pub loaded_sha256: String,
 }
 
@@ -58,6 +72,65 @@ impl OverlayLoadMappingV1 {
         let start = self.load_start?;
         Some(start..start.checked_add(self.loaded_byte_len())?)
     }
+
+    /// The furthest RDRAM address this descriptor proves the overlay reaches:
+    /// the loaded image, widened by any allocation extent it also declares.
+    ///
+    /// This is a *lower bound* on one overlay's true footprint. A recipe's
+    /// `bss_end` is an upper bound, because the nine-role layout enumerates
+    /// every section; a load-only descriptor enumerates nothing, so an
+    /// unrecorded bss beyond this point cannot be ruled out.
+    ///
+    /// Per-overlay, that gap makes this unusable as an invalidation bound. Use
+    /// [`shared_slot_invalidation_range`], which is sound for the swapping
+    /// shape these tables actually have.
+    pub fn proven_reach_end(&self) -> Option<u32> {
+        let image_end = self.loaded_range()?.end;
+        Some(match self.allocation_end {
+            Some(allocation_end) => image_end.max(allocation_end),
+            None => image_end,
+        })
+    }
+}
+
+/// The one invalidation range that is sound for a set of load-only overlays
+/// sharing a single destination slot.
+///
+/// Per-overlay reach is only a lower bound (see [`OverlayLoadMappingV1::
+/// proven_reach_end`]), so invalidating just one overlay's own extent could
+/// leave stale bytes behind when a larger sibling is swapped out. The union
+/// over every mapping avoids that entirely: all of them load to the same
+/// address, so the union is exactly the region any activation can occupy, and
+/// invalidating it is conservative for each one individually.
+///
+/// Measured on Batman of the Future: the four admitted overlays share the slot
+/// `0x8022f2c0` and union to `[0x8022f2c0,0x80233380)` (0x40c0 bytes). Two of
+/// those four reach past their own loaded image via the allocation extent
+/// (rec1 to `0x80231d50` against an image ending `0x802304b0`), which is
+/// precisely why a per-overlay extent is not safe to invalidate on.
+///
+/// The union is over the ADMITTED records, which is what the lane composes.
+/// Batman's raw array holds six records; discovery locks onto a phase two
+/// records in and admits four. A union over records the lane never
+/// materializes would describe memory no activation here can occupy.
+///
+/// Returns `None` unless every mapping proved a load address AND they all
+/// share one: distinct destinations mean the overlays are not contending for a
+/// single slot, so a union over them would invalidate unrelated memory and no
+/// longer describes what a swap actually replaces.
+pub fn shared_slot_invalidation_range(
+    mappings: &[OverlayLoadMappingV1],
+) -> Option<std::ops::Range<u32>> {
+    let (first, rest) = mappings.split_first()?;
+    let slot = first.load_start?;
+    let mut end = first.proven_reach_end()?;
+    for mapping in rest {
+        if mapping.load_start? != slot {
+            return None;
+        }
+        end = end.max(mapping.proven_reach_end()?);
+    }
+    Some(slot..end)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +188,53 @@ fn destinations_are_loadable(table: &CandidateTable) -> bool {
     images.windows(2).all(|pair| pair[1].0 >= pair[0].1)
 }
 
+/// The `[start, start, end]` allocation triple a record opens with, if it has
+/// one.
+///
+/// The repeated first word is the whole evidence. One address sitting above
+/// another proves nothing -- any two unrelated pointers do that -- but a value
+/// stated twice and then bounded is a start/start/end triple, which is how
+/// Batman of the Future's records open. Requiring the repetition keeps this
+/// from promoting an arbitrary descriptor word into a memory bound.
+///
+/// Only reads words the record's own stride spans, so a narrower table (Bottom
+/// of the 9th's four-word records) yields `None` instead of reading its
+/// neighbour's fields.
+fn allocation_extent<F>(
+    read: &F,
+    table: &CandidateTable,
+) -> Result<Option<u32>, OverlayLoadMappingError>
+where
+    F: Fn(u32) -> Result<u32, OverlayLoadMappingError>,
+{
+    // The triple occupies words 0..3; the record must also still contain the
+    // ROM/destination fields the table already names.
+    const TRIPLE_WORDS: u32 = 3;
+    if table.record_stride < TRIPLE_WORDS * 4 {
+        return Ok(None);
+    }
+    let occupied = [
+        table.field_rom_start,
+        table.field_rom_end,
+        table.field_vram_dest,
+    ];
+    if occupied
+        .iter()
+        .any(|offset| *offset < TRIPLE_WORDS * 4)
+    {
+        // The triple's words are the same words the table reads as ROM
+        // bounds or destination, so there is no separate allocation here.
+        return Ok(None);
+    }
+    let start = read(0)?;
+    let repeated = read(4)?;
+    let end = read(8)?;
+    if start != repeated || end <= start {
+        return Ok(None);
+    }
+    Ok(Some(end))
+}
+
 /// Recover load-only mappings from one already-recovered table.
 ///
 /// Every record is re-read from the ROM at its descriptor offset and checked
@@ -165,6 +285,19 @@ pub fn parse_overlay_load_mappings_v1(
             });
         }
 
+        // An allocation extent, when the record's own words prove one.
+        //
+        // Batman of the Future's records open with `[w0, w0, w2]`: a repeated
+        // start and a bound above it. That repetition is the evidence -- a
+        // single word above another proves nothing, but a value stated twice
+        // and then bounded is a start/start/end triple, and in 3 of its 6
+        // records `w2` reaches past the loaded image.
+        //
+        // Recovered only from words the stride actually spans, and only from a
+        // record whose first two words agree. Anything else leaves this None
+        // rather than promoting an arbitrary word to a memory bound.
+        let allocation_end = allocation_extent(&read, table)?;
+
         // `overlay_regions` has already normalized the destination to a start
         // address under the table's semantics, so the normalized value -- not a
         // re-read of the raw field -- is what a mapping would report.
@@ -195,6 +328,7 @@ pub fn parse_overlay_load_mappings_v1(
             rom_start,
             rom_end,
             load_start,
+            allocation_end,
             loaded_sha256: format!("{:x}", Sha256::digest(loaded)),
         });
     }

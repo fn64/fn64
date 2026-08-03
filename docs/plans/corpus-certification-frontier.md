@@ -312,10 +312,63 @@ Batman's constant `0x8022f2c0` is a genuine reused slot and survives; Bottom
 of the 9th's name pointers collapse to `None` while its nine ROM intervals
 stay proven.
 
-**What is still open** is whether the recompile lane may consume a load-only
-mapping for bank composition. Answering that is a separate decision about what
-`unsupported=0` is allowed to mean, and the absent `From` impl deliberately
-forces that decision to be made explicitly rather than by accident.
+### The lane now consumes them, and the invalidation bound is sound
+
+`gate_rom_recompile` falls back to load-only mappings when recipe recovery
+fails. `synthesize_flat_text_recipes` turns each mapping into the flat-text
+shape the resident boot bank already uses on every ROM this gate admits --
+`text = [load_start, load_end)`, data and bss empty -- since a load-only
+overlay is in exactly the boot copy's position: an image and a destination,
+with no table-described section boundary.
+
+The one field flat text cannot supply honestly is `bss_end`, which
+`generation_topology` uses as the invalidation high-water mark. A per-overlay
+image end is only a *lower* bound on what that overlay touches, so invalidating
+on it could leave stale bytes after a swap -- and `unsupported=0` would still
+report success. Measured on Batman: 2 of its 4 admitted overlays reach past
+their own loaded image via the allocation extent.
+
+So every synthesized recipe carries the **shared-slot union** as its `bss_end`.
+These overlays all load to one address, so the union
+(`[0x8022f2c0,0x80233380)` for Batman) is the region any activation can occupy,
+and invalidating it is conservative for each overlay individually.
+`shared_slot_invalidation_range` returns `None` unless a single slot is proven,
+and the fallback refuses the ROM rather than guessing when it does. What
+remains unprovable is bss beyond the union, which a load-only descriptor by
+definition does not record -- which is why recipes stay preferred wherever a
+ROM supplies them.
+
+### Batman still does not certify: a discovery-layer disagreement
+
+With the lane wired, Batman advances past the recipe stage and fails later:
+
+```
+recovered 0 overlay bank(s) but 4 admitted load recipe(s)
+```
+
+Discovery proves only the boot bank. Both overlay banks conclude
+`Conflict (recovered_overlay_delta_conflicts_with_descriptor_destination)`,
+from the guard in `scan_recovered_overlay_regions` requiring
+`rom_start + delta == va_start && va_start == vram_dest`.
+
+The arithmetic shows what disagrees. For all four records
+`rom_start + delta == 0x8022f280` exactly, matching `va_start` -- but the
+normalized descriptor destination is `0x8022f2c0`, 0x40 higher:
+
+| record | rom_start | delta | sum | vram_dest |
+|---|---|---|---|---|
+| 0 | `0x8ba00` | `0x801a3880` | `0x8022f280` | `0x8022f2c0` |
+| 1 | `0x8fd10` | `0x8019f570` | `0x8022f280` | `0x8022f2c0` |
+
+Delta-vote independently infers the record's **load_start** (`0x8022f280`,
+word 3 of the descriptor), while the overlay search normalized the **dest**
+field (`0x8022f2c0`, word 7). Two different words of the same record, both
+real, disagreeing by the fixed 0x40 header offset between them.
+
+That is a discovery-layer question about which word the destination field
+*is* -- not a recipe-schema gap, and not something the recompile lane can
+resolve. Relaxing the guard would weaken a proven-bank invariant every ROM
+depends on, so it is left standing and recorded here instead.
 
 ## Honest scope
 

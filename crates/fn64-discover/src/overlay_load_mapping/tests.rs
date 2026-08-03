@@ -184,6 +184,144 @@ fn a_reused_destination_slot_is_still_a_load_address() {
     );
 }
 
+/// A four-word record has no room for an allocation triple, and reading one
+/// would consume the neighbouring record's fields.
+#[test]
+fn a_narrow_record_proves_no_allocation_extent() {
+    let (rom, table) = load_only_rom();
+
+    let mappings = parse_overlay_load_mappings_v1(&rom, &table).unwrap();
+
+    assert!(mappings.iter().all(|m| m.allocation_end.is_none()));
+    assert_eq!(
+        mappings[0].proven_reach_end(),
+        Some(0x8010_0100),
+        "reach falls back to the loaded image"
+    );
+}
+
+/// Batman's shape: a wide record whose first three words are
+/// `[start, start, end]` above the loaded image. The repetition is the
+/// evidence that this is an extent rather than two unrelated pointers.
+#[test]
+fn a_repeated_start_and_bound_prove_an_allocation_extent() {
+    let mut rom = vec![0u8; 0x5000];
+    let table = CandidateTable {
+        table_rom_offset: 0x100,
+        record_stride: 0x20,
+        field_rom_start: 0x14,
+        field_rom_end: 0x18,
+        field_vram_dest: 0x1c,
+        destination_field: DestinationFieldSemantics::Start,
+        records: vec![CandidateRecord {
+            rom_start: 0x2000,
+            rom_end: 0x2100,
+            vram_dest: 0x8010_0000,
+        }],
+    };
+    let base = table.table_rom_offset as usize;
+    // The allocation triple reaches past the image end (0x80100100).
+    put(&mut rom, base, 0x8010_0400);
+    put(&mut rom, base + 4, 0x8010_0400);
+    put(&mut rom, base + 8, 0x8010_0900);
+    put(&mut rom, base + 0x14, 0x2000);
+    put(&mut rom, base + 0x18, 0x2100);
+    put(&mut rom, base + 0x1c, 0x8010_0000);
+
+    let mapping = &parse_overlay_load_mappings_v1(&rom, &table).unwrap()[0];
+
+    assert_eq!(mapping.allocation_end, Some(0x8010_0900));
+    assert_eq!(
+        mapping.proven_reach_end(),
+        Some(0x8010_0900),
+        "reach must widen past the image, or a swap leaves stale bytes"
+    );
+}
+
+/// Without the repetition, two words in ascending order are just two words.
+#[test]
+fn two_unrepeated_ascending_words_are_not_an_extent() {
+    let mut rom = vec![0u8; 0x5000];
+    let table = CandidateTable {
+        table_rom_offset: 0x100,
+        record_stride: 0x20,
+        field_rom_start: 0x14,
+        field_rom_end: 0x18,
+        field_vram_dest: 0x1c,
+        destination_field: DestinationFieldSemantics::Start,
+        records: vec![CandidateRecord {
+            rom_start: 0x2000,
+            rom_end: 0x2100,
+            vram_dest: 0x8010_0000,
+        }],
+    };
+    let base = table.table_rom_offset as usize;
+    put(&mut rom, base, 0x8010_0400);
+    put(&mut rom, base + 4, 0x8010_0500); // differs: not a start/start/end
+    put(&mut rom, base + 8, 0x8010_0900);
+    put(&mut rom, base + 0x14, 0x2000);
+    put(&mut rom, base + 0x18, 0x2100);
+    put(&mut rom, base + 0x1c, 0x8010_0000);
+
+    let mapping = &parse_overlay_load_mappings_v1(&rom, &table).unwrap()[0];
+
+    assert_eq!(mapping.allocation_end, None);
+}
+
+/// The invalidation range the lane may act on. Per-overlay reach is a lower
+/// bound, so the union over a shared slot is what makes invalidation sound:
+/// swapping any one overlay clears everything any sibling could have written.
+#[test]
+fn a_shared_slot_unions_every_overlays_reach() {
+    let (mut rom, mut table) = load_only_rom();
+    for record in table.records.iter_mut() {
+        record.vram_dest = 0x8022_f2c0;
+    }
+    for (index, record) in table.records.iter().enumerate() {
+        let base = table.table_rom_offset as usize + index * table.record_stride as usize;
+        put(&mut rom, base + 8, record.vram_dest);
+    }
+
+    let mappings = parse_overlay_load_mappings_v1(&rom, &table).unwrap();
+    let range = shared_slot_invalidation_range(&mappings).unwrap();
+
+    assert_eq!(range.start, 0x8022_f2c0);
+    assert_eq!(
+        range.end,
+        0x8022_f2c0 + 0x100,
+        "the union must cover the largest sibling, not just the first"
+    );
+}
+
+/// Distinct destinations mean the overlays are not contending for one slot, so
+/// a union over them would invalidate memory no single swap replaces.
+#[test]
+fn distinct_destinations_yield_no_shared_slot_range() {
+    let (rom, table) = load_only_rom();
+
+    let mappings = parse_overlay_load_mappings_v1(&rom, &table).unwrap();
+
+    assert!(shared_slot_invalidation_range(&mappings).is_none());
+}
+
+/// A mapping with no proven destination cannot contribute to an invalidation
+/// range at all -- Bottom of the 9th's name-pointer table must not produce one.
+#[test]
+fn mappings_without_a_destination_yield_no_range() {
+    let (mut rom, mut table) = load_only_rom();
+    for (index, record) in table.records.iter_mut().enumerate() {
+        record.vram_dest = 0x8005_9bc4 - (index as u32) * 12;
+    }
+    for (index, record) in table.records.iter().enumerate() {
+        let base = table.table_rom_offset as usize + index * table.record_stride as usize;
+        put(&mut rom, base + 8, record.vram_dest);
+    }
+
+    let mappings = parse_overlay_load_mappings_v1(&rom, &table).unwrap();
+
+    assert!(shared_slot_invalidation_range(&mappings).is_none());
+}
+
 /// The load-bearing property of this whole module. A load-only mapping proves
 /// no section extents, so it must not be convertible into codegen input --
 /// `DenseAotGenerationInput` requires all six and re-validates them, and
