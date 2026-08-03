@@ -42,49 +42,72 @@ recognized, which is the same class of work `SearchConfig::aki_family()` and
 `vrom_family()` already do for two families. `NoUniqueAdmittedTable` (3 more
 ROMs) is the same root cause seen one step earlier in the pipeline.
 
-**So roughly 8 of 9 sampled failures trace to one gap: overlay descriptor
-recovery for engine families fn64 has not yet modeled.** That is a single
-well-shaped research direction rather than a long tail, and the M1b result
-(a 2-record floor plus contiguity recognition took corpus overlay recovery
-from 32 to 41 ROMs) shows what closing one costs.
+**Superseded by the per-ROM traces below.** This section originally read the
+shared error string as a shared cause and concluded that roughly 8 of 9
+sampled failures traced to one gap. Tracing each ROM individually refutes
+that: Banjo-Kazooie is a compressed payload, Armorines is TLB-mapped, and only
+the remaining three are the overlay-descriptor class. The paragraphs above
+this one describe that class correctly; the count does not.
 
-## Banjo-Kazooie: measured, and it is NOT a descriptor-table gap
+## Banjo-Kazooie: re-traced from the bytes, and the earlier trace was wrong
 
-Traced the one unmapped destination to its origin. The mechanism is
-different in kind from AKI's overlays, which changes what closing this
-class requires.
+An earlier revision of this document asserted a PI DMA loader at
+`0x80001d70` and a 2,124-word bank. A byte-level re-trace refutes all three
+of its load-bearing claims, so they are corrected here rather than left on
+record.
 
-`0x8023e620` has **no pointer and no `jal` anywhere in the 16 MB ROM**. It
-is constructed twice, both inside the 2,124-word boot stub, and called
-directly:
+- **The addresses were off by `0x100000`.** Banjo is CIC-6103 (IPL3 CRC32
+  `0x0b050ee0`), so IPL3 loads at `entry - 0x100000`. fn64 already implements
+  this (`banks/mod.rs`, `load_delta()`) and composes the bank correctly at
+  `0x80000400`.
+- **`0x80001d70` is not a DMA loader.** It is exception-vector and PIF setup.
+  Its `lui $4,0x100` / `lui $4,0x1fc0` are PIF-boundary constants for COP0
+  helpers, not cart-domain DMA operands.
+- **The bank is not 2,124 words.** It is the full 1 MiB,
+  `va=[0x80000400,0x80100400)`. `pack_words=2124` is the CFG-*reachable*
+  subset.
 
-```
-0x80000524  lui   $25,0x8024
-0x80000528  addiu $25,$25,-6624      # = 0x8023e620
-0x8000052c  jalr  $25                # call into it
-```
+**The mechanism is implementable and recovers nothing.** Banjo's PI primitive
+at `0x80002000` is fully register-parameterized, so a "recover constants at
+the PI-register writes" pass finds nothing by construction; the constants live
+at the caller, the shape `slice_load_request_calls` already handles. That
+primitive has exactly one caller in the whole 1 MiB, and its transfer lands at
+`0x8003d500..0x8005ba40` -- *inside the already-mapped boot bank*. Recovering
+it adds zero banks and moves `unsupported` not at all.
 
-Earlier, at `0x80000450`, the stub stacks that same address alongside
-`0x8003d500` and calls `0x80001d70`. That routine is a **PI DMA loader** --
-its body loads `lui $4,0x100` (cart domain `0x10000000`) and
-`lui $4,0x1fc0` (PIF `0x1fc00000`) and drives the PI registers.
+**And the target is unrecoverable in principle.** The entire 16 MB ROM is
+compressed (7.88-7.99 bits/byte, Rare's proprietary codec -- no Yay0/Yaz0/MIO0
+magic). A whole-ROM search for `0x8023e620` finds 0 data words, 0 `jal`s, and
+only the 2 lui/addiu constructions in the stub itself. It is a decompression
+*output* address: its bytes do not exist in the ROM in any form a static
+slicer can read. Failing closed here is correct behavior, not a gap.
 
-So Banjo-Kazooie's real code is **DMA'd from cart into RDRAM by the boot
-stub itself and then jumped into**. There is no descriptor table to find:
-`SearchConfig`'s family search correctly reports nothing, because nothing
-of that shape exists.
+## The five `OutsideAllMappings` ROMs are at least four unrelated causes
 
-**What this means for the class.** The five `OutsideAllMappings` ROMs may
-not share one mechanism after all -- they share a *symptom*. Banjo needs
-**PI-DMA-derived bank recovery** (fn64 has `pi_dma.rs`, which slices
-`osPiStartDma`/`osEPiStartDma` for constant triples; the open question is
-whether this stub's hand-rolled PI writes are reachable by it), not
-descriptor-family extension. The remaining four should each be traced to
-their construction site before assuming a common fix; the AKI precedent of
-"one fix, several titles" may not hold here.
+The grouping in the section above was my error -- I inferred a shared cause
+from similar error strings. Tracing each ROM individually:
 
-That is a correction to this document's own earlier conclusion, made after
-tracing rather than after counting error strings.
+| ROM | reached by | actual cause |
+|---|---|---|
+| Banjo-Kazooie | `jalr` on a constructed address | compressed payload, unrecoverable statically |
+| Armorines | `jalr` after `jal 0x80000488` | **TLB-mapped** -- `0x80000488` is COP0/`mtc0` TLB setup, and the target is a physical address behind a mapping. The same shape that ruled Perfect Dark out of the fn64 model. |
+| Army Men SH | direct `jal` | overlay geometry -- 0 descriptor words at the target range |
+| Army Men SH2 | direct `jal` | overlay geometry -- same |
+| Bomberman Hero | direct `jal` | overlay geometry -- 0 descriptor words in `[0x80280000,0x80290000)` |
+
+Only the last three are the overlay-descriptor class. So the claim above that
+"roughly 8 of 9 sampled failures trace to one gap" is **too strong**: the
+class shares a symptom, not a mechanism, and at least four distinct causes sit
+under it.
+
+## `unsupported=0` is a weaker signal than it reads as
+
+Worth stating plainly next to every pass count in this document: GoldenEye
+certifies on 41 CFG-reachable words out of an 8 MB ROM. The metric measures
+whether the reachable walk stays inside a mapping -- **not** how much code was
+recovered. For the all-N64 goal it will keep reporting success on ROMs where
+essentially nothing was recovered, so pass counts here should be read as "no
+contradiction found", never as coverage.
 
 ## The render/runtime lane is closed to software work
 
@@ -144,6 +167,49 @@ titles from FAIL to PASS in one change.
 Caveat on the correlation: 5 ROMs is a small denominator, and it says nothing
 about the 246 corpus ROMs that recover no overlays and were never sampled.
 It is a lead, not a law.
+
+## What the recipe-stage fix reached, and where it stops
+
+Two defects were real and are fixed. One contiguous descriptor array is
+legible at every multiple of its true stride, and every such reading was
+admitted as a separate table:
+
+- **Stride aliases.** A 0x10-stride array read at 0x20/0x30/0x40 samples every
+  second/third/fourth record. Each alias proposes a strict SUBSET of the dense
+  table, which `canonicalize` could not see -- it collapses exact geometry
+  matches only.
+- **Phase-shifted readings.** Starting a coarse walk one record early reads
+  neighbouring words as fields, mixing genuine borrowed records with noise, so
+  the result is not a subset at all. Bottom of the 9th's table at 0x48008 has
+  two records lifted verbatim from the real array at 0x48038 and one 4-byte
+  "overlay" spanning ROM 0x0..0x4.
+
+Both collapses are gated on the dense table *chaining* -- each record's
+`rom_end` opening the next record's `rom_start`. Two independent arrays can
+share records without either being a misreading of the other, and the chain is
+what separates those cases.
+
+Measured effect: Batman of the Future and Bottom of the 9th both reach
+`admitted_tables=1`, and `NoUniqueAdmittedTable` no longer fires for them.
+
+**They still do not certify, and the reason is not a bug.** Both now fail one
+stage later, at `InvalidRangeRelations`. The recipe stage requires the
+nine-word AKI-family descriptor -- ROM bounds, load start, and text/data/bss
+extents, with every independent range equation agreeing. Bottom of the 9th's
+records are four words (`[0, rom_start, rom_end, dest]`, stride 0x10) and
+Batman's are eight. There is no text/data/bss to read; the next word is the
+next record.
+
+So the correlation this document opened with has a sharper explanation than
+"recipes cannot complete". These ROMs carry a **simpler descriptor format**
+than the AKI nine-word layout, and `overlay_recipe` deliberately refuses to
+degrade to a linear mapping rather than guess the missing extents. Supporting
+them means recovering a second descriptor schema and proving it to the same
+standard -- a real project, not a guard to relax.
+
+Big Mountain 2000 (2 admitted) and Bio F.R.E.A.K.S. (3) do not even reach that
+point: their surviving tables are genuinely distinct arrays, not aliases of
+one.
 
 ## Honest scope
 
