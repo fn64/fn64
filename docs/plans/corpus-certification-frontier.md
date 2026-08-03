@@ -211,6 +211,79 @@ Big Mountain 2000 (2 admitted) and Bio F.R.E.A.K.S. (3) do not even reach that
 point: their surviving tables are genuinely distinct arrays, not aliases of
 one.
 
+## The "second descriptor schema" is two different schemas, and neither yields a recipe
+
+Both ROMs were read out of the raw bytes rather than inferred from field
+counts. They are not one format, and neither carries what
+`OverlayLoadRecipeV1` proves.
+
+### Bottom of the 9th is a file table with names, not an overlay table
+
+The array at `0x48038` is `[flags, rom_start, rom_end, name_ptr]`, stride
+0x10, ten records:
+
+```
+rec0 @0x48038: 00000000 00001050 00064c90 80059bc4
+rec1 @0x48048: 00000000 00064c90 0006da50 80059bb8
+```
+
+The fourth word looks like a destination and is not one. Its values
+*decrease* monotonically (`80059bc4`, `80059bb8`, `80059bac`, ...) while the
+ROM spans grow, spaced 12/8/4 bytes apart -- and resolving them into the boot
+bank yields null-terminated strings:
+
+| record | word 3 | resolves to |
+|---|---|---|
+| 0 | `0x80059bc4` | `"bb2code"` |
+| 1 | `0x80059bb8` | `"tpitcode"` |
+| 2 | `0x80059bac` | `"tbatcode"` |
+| 3 | `0x80059ba0` | `"tfdrcode"` |
+
+The deltas are exactly the string lengths. So the record has **no load
+address in it at all**, and rec9 has `rom_start == rom_end` (an empty span).
+Nothing here can be promoted to an overlay recipe, because the destination
+that a recipe must prove is not present in the descriptor -- the loader
+resolves it by name at run time.
+
+### Batman of the Future carries a constant destination and an unrelated triple
+
+The real array is at `0x299c0`, stride 0x20, six records, ending exactly where
+the constant-destination run ends (`0x299c0..0x29a80`):
+
+```
+rec0: w0=8022f990 w1=8022f990 w2=8022fa80 load=8022f280 w4=8028e2a0
+      rom=0x02c9e0..0x08ba00 dest=8022f2c0
+```
+
+`load` (`0x8022f280`) and `dest` (`0x8022f2c0`) are **constant across every
+record** -- one reused slot, a swapping engine. `w0 == w1` with `w2` a small
+extent above it, and `w4` is the next record's `w0`, so the records also form
+a chain.
+
+The AKI recipe requires `load_start == text_start` and the monotone chain
+`text_end == data_start == bss_start`. Batman satisfies none of it. The
+`[w0, w0, w2]` triple is not a text/data/bss chain: `w0` is unordered against
+the load address (`0x80275890` sits far above its neighbours), and its extents
+(0xf0 to 0x18a10) track neither the ROM span lengths nor `dest + len` -- the
+residual `w0 - (dest + len)` swings between `-0x5e950` and `+0x45870`. It is a
+separate allocation the record points at, not the loaded image's own sections.
+
+### Why this is not a guard to relax
+
+`InvalidRangeRelations` is firing correctly on both ROMs. Neither descriptor
+contains the text/data/bss extents that `OverlayLoadRecipeV1` exists to prove,
+so there is nothing to recover -- the information is absent from the ROM data
+structure, not merely encoded differently. Admitting them would mean inventing
+extents and marking them proven, which is exactly the degradation
+`overlay_recipe` refuses by design ("a malformed or ambiguous table fails
+loudly; it never degrades to a simple linear mapping").
+
+What these ROMs would need is a *different, weaker* typed product -- a
+load-only mapping that proves ROM interval and destination and asserts nothing
+about sections -- plus a decision about whether the recompile lane may consume
+it. That is a schema design question, not a bug fix, and it is not
+answered here.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
