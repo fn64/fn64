@@ -989,3 +989,56 @@
         assert!(recovery.candidate_tables.is_empty());
         assert!(recovery.admitted_intervals().is_empty());
     }
+
+    /// One contiguous descriptor array is legible at every multiple of its
+    /// true stride, and each alias proposes a strict subset of the dense
+    /// table's records. Before this collapsed, Bottom of the 9th admitted the
+    /// single array at 0x48038 four times -- at strides 0x10, 0x20, 0x30 and
+    /// 0x40 -- and the recipe stage then refused the whole ROM for having no
+    /// unique admitted table.
+    #[test]
+    fn stride_aliases_of_one_array_collapse_to_the_dense_reading() {
+        let dense = CandidateTable {
+            table_rom_offset: 0x1000,
+            record_stride: 0x10,
+            field_rom_start: 0x4,
+            field_rom_end: 0x8,
+            field_vram_dest: 0xc,
+            destination_field: DestinationFieldSemantics::Start,
+            records: (0..4)
+                .map(|i| CandidateRecord {
+                    rom_start: 0x2000 + i * 0x100,
+                    rom_end: 0x2000 + (i + 1) * 0x100,
+                    vram_dest: 0x8010_0000 + i * 0x100,
+                })
+                .collect(),
+        };
+        // Every second record of `dense`: a real under-sampling, not a rival.
+        let alias = CandidateTable {
+            table_rom_offset: 0x1000,
+            record_stride: 0x20,
+            records: dense.records.iter().step_by(2).cloned().collect(),
+            ..dense.clone()
+        };
+        // Same subset relation, but its stride does not divide -- a distinct
+        // array that happens to nest must survive.
+        let nested = CandidateTable {
+            record_stride: 0x18,
+            ..alias.clone()
+        };
+
+        let kept = canonicalize(vec![dense.clone(), alias, nested.clone()]);
+
+        assert!(
+            kept.iter().any(|t| t.record_stride == dense.record_stride),
+            "the dense reading is the real array and must survive"
+        );
+        assert!(
+            !kept.iter().any(|t| t.record_stride == 0x20),
+            "a stride multiple proposing a subset is one array under-sampled"
+        );
+        assert!(
+            kept.iter().any(|t| t.record_stride == nested.record_stride),
+            "subset alone must not drop a table whose stride is not a multiple"
+        );
+    }
