@@ -1,6 +1,29 @@
 # Key-Free Discovery: Mechanism Roadmap (NWXE / NW4E / Revenge)
 
-**Baselines (all wrong==0):** NWXE 698/2442 exact (grade line total=847), NW4E 835/3440 (total=985), Revenge 499/1709 (total=689). Combined: 2,032/7,591 exact (26.8%); 5,559 missed.
+**Baselines when this roadmap was written (all wrong==0):** NWXE 698/847,
+NW4E 835/985, Revenge 499/689 on the boot-bank grade line; overlay banks
+were not gradeable at all.
+
+**Status at HEAD** -- re-measure with `scripts/grade-all.sh` (17s, all five
+configurations) rather than trusting this table:
+
+| config | roadmap baseline | at HEAD | mechanism |
+|---|---|---|---|
+| nwxe-solo | 608 | **725** | M1 |
+| nwxe-donor | 698 | **779** | M1 |
+| nw4e-solo | 759 | **873** | M1 |
+| nw4e-donor | 835 | **925** | M1 |
+| revenge-solo | 499 | **597** | M1b |
+
+Plus ~2,965 overlay-bank functions now graded exact that previously had no
+verdict (NWXE 1,125/1,595; NW4E 1,840/2,455).
+
+**Mechanism status:** M1 LANDED (`5fe2c36`, overlay banks compose into the
+grade). M1b LANDED (`785130b`, two-overlay swap pairs -- Revenge's descriptor
+table at ROM 0x37a30 was hidden by a 3-record floor and an 8-source swap
+threshold). M3 REVERTED (`96e32cc`: graded only 4 of 5 configurations and
+broke Revenge's wrong==0; revisit only with a tighter guard). M2 and M4
+remain open as described below.
 
 ---
 
