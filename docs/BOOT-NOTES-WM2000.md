@@ -26,6 +26,11 @@
 > an exact image owner or a validated unreachability receipt, and four
 > unproven `MTC0 Status` value proofs. That is a static evidence audit, not
 > an input-route sweep -- driving more routes cannot close it.
+>
+> A warning about *this* file specifically, learned the hard way: grepping it
+> is unsafe. A search for "frontier closed" hits a sentence reading "this
+> mechanism does not yet make the real `0xbfc0...` frontier closed" -- the
+> negation lives in the words before the match. Read whole sections.
 
 2026-07-25 arbitrary-PC update: checked AOT `lw`/`sw` now reaches the installed
 word-MMIO hook before RDRAM backing rejection. The private NWXE pack passes the
