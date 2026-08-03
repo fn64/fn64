@@ -18,24 +18,52 @@ consults host bindings.
 | WrestleMania 2000 (NWXE) | **PASS** exit 0 | 5 | 43,032 | exact_aot=110 block_aot=1937 dynamic_mips=19 |
 | Virtual Pro Wrestling 2 | **PASS** exit 0 | 5 | 49,329 | first-ever attempt, cold |
 | No Mercy (NW4E) | running | | | |
-| WCW/nWo Revenge | **FAIL** exit 1 | | | `InvalidResidentSplit` building generation topology |
-| WCW vs nWo World Tour | **FAIL** exit 1 | | | `InvalidResidentSplit` building generation topology |
+| WCW/nWo Revenge | **PASS** exit 0 | 3 | 25,057 | was `InvalidResidentSplit`; fixed by the resident-tail clamp below |
+| WCW vs nWo World Tour | **PASS** exit 0 | 3 | 25,375 | same fix, same commit |
 
 Reading trap worth keeping: per-bank `unsupported` lines can be nonzero and
 still compose to zero (WM2000's boot bank reports 3, `recovered_overlay_2`
 reports 8, HEADLINE is 0) because a destination unmapped in one bank is
 resident in another. The HEADLINE is the verdict.
 
-## The shared blocker: `InvalidResidentSplit`
+## The shared blocker: `InvalidResidentSplit` — diagnosed and fixed
 
-Revenge and World Tour fail identically, before emission, at
-`generation_topology/mod.rs:434`. Both are the two-overlay swap-pair games
-M1b recovered (both images at one VA). The failure is in composing a
-generation topology from that geometry, not in discovery — their overlays ARE
-recovered and graded (Revenge: 745/1020 exact, wrong=0).
+Revenge and World Tour failed identically, before emission, in
+`build_generation_topology_v1`. Both are the two-overlay swap-pair games M1b
+recovered (both images at one VA). The failure was in composing a generation
+topology from that geometry, not in discovery — their overlays ARE recovered
+and graded (Revenge: 745/1020 exact, wrong=0).
 
-One fix likely certifies both, which makes this the highest-value AKI
-recompile blocker.
+**Which clause, measured.** Of the four-clause guard, only
+`invalidation_end < resident.load_end` tripped. Alignment and
+split-inside-the-resident-bank were all satisfied:
+
+| | resident | split | overlay union end |
+|---|---|---|---|
+| WM2000 | `[0x80000400,0x80100400)` | `0x800e1b90` | `0x80171a60` (past end) |
+| Revenge | `[0x80000400,0x80100400)` | `0x80090000` | `0x800fafa0` (21,600 short) |
+| World Tour | `[0x80000400,0x80100400)` | `0x80090000` | `0x800f8af0` (30,992 short) |
+
+**The ASSUMPTION was wrong, not the data.** The guard required overlays to
+overwrite the resident bank all the way to `resident.load_end`. That end is
+not a discovered code extent: for every ROM this path admits it is
+`entry - ipl3_delta + BOOT_COPY_SIZE`, the fixed 1 MiB IPL3 boot copy
+(`banks/mod.rs`). Nothing obliges a game's overlays to reach a hardware
+constant. WM2000's happen to; the swap-pair titles' do not. The recipes' own
+`bss_end` values are internally consistent and were not mis-derived.
+
+**The fix** (`e5e7d39`) clamps the resident-tail image to
+`min(resident.load_end, union_end)` instead of requiring the union to cover
+it. The trailing resident span no overlay writes becomes immutable — the same
+status as the pre-split prefix — rather than being folded into a generation
+whose invalidation could not contain it. That last part is the real
+soundness content: the runtime rejects `invalidation < image`
+(`PrecompiledGeneration::new` → `InvalidationDoesNotContainImage`), so the
+old rule was not protecting an invariant, it was working around one. The
+clamp only ever shrinks the tail image, so no byte becomes tail-owned that
+the old rule did not already grant; the surviving clauses still reject a
+split outside the resident bank, and a degenerate empty tail now returns a
+precise `EmptyResidentTail` rather than the blanket error.
 
 ## What jessetbh's pipeline tells us about the answer keys
 
