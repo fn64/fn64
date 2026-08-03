@@ -415,6 +415,54 @@
     }
 
     #[test]
+    fn mi_shim_raw_and_generated_c_proxy_share_fixed_cycle_state_and_trace() {
+        const SELECTED_MASK: u32 = (1 << 0) | (1 << 2) | (1 << 4);
+        const SELECTED_MASK_COMMAND: u32 = (1 << 1) | (1 << 5) | (1 << 9);
+
+        let capture = |write_mask: &dyn Fn()| {
+            load_rom(vec![0; 0x100]);
+            write_mask();
+            for source in [
+                fn64_runtime::InterruptSource::Sp,
+                fn64_runtime::InterruptSource::Ai,
+                fn64_runtime::InterruptSource::Pi,
+            ] {
+                raise_device_interrupt(source);
+            }
+            assert!(cpu_interrupt_pending());
+            assert_eq!(
+                read_raw_mmio_word(0xFFFF_FFFF_A430_000C),
+                Some(SELECTED_MASK)
+            );
+            with_host(|host| {
+                (
+                    host.device_fabric.evidence_snapshot(),
+                    host.device_fabric.trace().to_vec(),
+                )
+            })
+        };
+
+        let shim = capture(&|| {
+            let mut ctx = ctx_zeroed();
+            ctx.r4 = u64::from(SELECTED_MASK << 16);
+            unsafe { crate::system::osSetIntMask_recomp(std::ptr::null_mut(), &mut ctx) };
+        });
+        let raw = capture(&|| {
+            assert!(write_raw_mmio_word(
+                0xFFFF_FFFF_A430_000C,
+                SELECTED_MASK_COMMAND
+            ));
+        });
+        let generated_c_proxy = capture(&|| {
+            crate::fn64_c_mmio_write_w(0xFFFF_FFFF_A430_000C, SELECTED_MASK_COMMAND);
+        });
+
+        assert_eq!(shim, raw);
+        assert_eq!(raw, generated_c_proxy);
+        assert_eq!(shim.0.guest.now, Cycles::ZERO);
+    }
+
+    #[test]
     fn os_virtual_to_physical_masks_kseg0() {
         let mut ctx = ctx_zeroed();
         ctx.r4 = 0x8000_1234;

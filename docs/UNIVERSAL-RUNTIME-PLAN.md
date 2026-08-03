@@ -822,9 +822,12 @@ The same receipt now requires a digest/range/generation-bound Status scan for
 every reproducible external executable image, so dynamically captured vector
 or generated code cannot sit outside the U4 instruction denominator.
 Proven-code Status writes are paired one-to-one with the existing CFG
-value-set analysis. Only exhaustive finite `MTC0` values that all clear BEV
-close that write; mutable image loads, widening, unknowns, and every `DMTC0
-Status` remain typed U4 blockers.
+value-set analysis. That pass now consumes the same fail-closed
+interprocedural `$a0..$a3` seeds as indirect-target resolution: a callable
+entry is seeded only when its complete certified caller set and every caller's
+argument proof are admitted. Only exhaustive finite `MTC0` values that all
+clear BEV close that write; mutable image loads, widening, unknowns, and every
+`DMTC0 Status` remain typed U4 blockers.
 Only after those facts, the exact typed installed-host denominator, normal
 handler ownership, executable-writer closure, and transfer closure all agree
 may the receipt's in-process BEV-clear induction mark the three bootstrap
@@ -902,6 +905,11 @@ same AdEL path with EPC and BadVAddr equal to the requested fetch address and
 BD clear. A computed target checkpoints before its fault when the branch/delay
 pair exactly exhausts the budget; the next dispatch counts the fetch attempt,
 enters the installed handler, and can ERET to an aligned handler-selected EPC.
+The dynamic interpreter now matches the emitted-bank trapping arithmetic
+boundary: `ADD`/`ADDI`/`SUB` and `DADD`/`DADDI`/`DSUB` return precise integer
+overflow faults without committing the destination. A delay-slot overflow
+retains the branch PC in EPC and sets Cause.BD, so this fallback lane no longer
+turns these architectural exceptions into host panics.
 Every decoded COP1 family now shares one Status.CU1 guard in the bank emitter.
 Disabled COP1 raises ExcCode 11 with Cause.CE=1 before a register, FPU state,
 memory access, branch delay instruction, or address-alignment check can occur.
@@ -963,8 +971,11 @@ clocks and now crosses `RenderConfig` into native RT64 workload-rate inference,
 so stable VI factors derive from 60/50/60 Hz without changing an Extended-GBI
 refresh override. Ten fresh Metal processes observe exact PAL/MPAL completed-
 workload sequences `[0,0,0,50]` and `[0,0,0,60]`; release evidence still must
-co-bind decoded TV authority to the renderer configuration. Raw generated-C
-writes remain open. VI now stores the complete raw register block, samples `VI_CURRENT` from
+co-bind decoded TV authority to the renderer configuration. Generated-C word
+writes for VI, AI, MI, and SP enter the same fabric as raw Rust and shim paths;
+the compiled-C proxy smoke covers those register files, and a fixed-cycle MI
+gate compares the shim, raw Rust, and generated-C proxy state and interrupt
+trace exactly. VI now stores the complete raw register block, samples `VI_CURRENT` from
 the programmed `VI_V_SYNC`, schedules MI at `VI_INTR`, decodes the public
 `OSViMode` layout, and latches pending mode/framebuffer state before either
 VI-manager message path and renderer presentation. Progressive and serrated
