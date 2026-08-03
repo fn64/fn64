@@ -1026,6 +1026,40 @@ So there is no renderer or runtime work an agent can pick up. WM2000 renders
 (240 captured frames, scenario gate 10/10). Effort belongs in discovery,
 where blockers are still software-shaped.
 
+## The strongest signal: recovering overlays correlates with FAILING
+
+Cross-referencing the certification results against
+`reference/overlay-corpus-sweep.tsv` (which records admitted overlay tables
+per ROM) inverts the natural assumption:
+
+| | pass | fail |
+|---|---|---|
+| ROMs **with** recovered overlay tables | **0** | **5** |
+| ROMs **without** any overlay table | 22 | 7 |
+
+Every ROM that recovers overlays fails. Batman of the Future (2 tables), Big
+Mountain 2000 (2), Bio F.R.E.A.K.S. (4), Bottom of the 9th (4), and
+Castlevania (2) all fail; Banjo-Tooie, Blast Corps, Body Harvest, and both
+Bomberman 64 titles recover nothing and certify.
+
+The mechanism is legible in the error strings: those five fail with
+`NoUniqueAdmittedTable`, `InvalidRangeRelations`, or `SourceFieldsChanged` --
+every one an overlay *recipe* error, not a code-emission error. Admitting a
+descriptor table commits the pipeline to completing load recipes and a
+generation topology; when that cannot be completed the whole ROM fails,
+whereas a ROM with no table certifies its single bank and passes.
+
+**This is a better-shaped blocker than "246 ROMs lack overlay geometry."**
+The failing set is small, the failures are typed, and they cluster in one
+pipeline stage between "table admitted" and "recipes complete". The
+`InvalidResidentSplit` fix earlier today was exactly this shape -- a guard in
+that same stage keyed on a wrong assumption -- and it converted two AKI
+titles from FAIL to PASS in one change.
+
+Caveat on the correlation: 5 ROMs is a small denominator, and it says nothing
+about the 246 corpus ROMs that recover no overlays and were never sampled.
+It is a lead, not a law.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
