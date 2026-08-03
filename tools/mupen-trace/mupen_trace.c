@@ -48,7 +48,25 @@
  * destination (0x800d9960 slot A / 0x80106760 slot B) lies strictly above
  * this window, so no overlay load can ever alias it. Every other address
  * (IPL3 stub, RSP vector space, data regions) stays bank-unknown --
- * unknown-preserved, never guessed.
+ * unknown-preserved, never guessed, UNLESS FN64_OVERLAY_WINDOWS names it (see
+ * below).
+ *
+ * Overlay bank identity (FN64_OVERLAY_WINDOWS): AKI-family overlays reuse a
+ * handful of load slots, so a PC's VA alone cannot say which image is
+ * resident (docs/plans/overlay-trace-attribution.md measures every NWXE/NW4E
+ * overlay sharing a slot). This producer resolves that the same way the
+ * engine does: by watching PI DMA loads. It polls the PI_STATUS DMA_BUSY bit
+ * every pause exactly like mupen_devtrace.c's device-event poller (same
+ * registers, same rising/falling busy-edge state machine -- see
+ * watch_pi_dma/observe_pi_dma_load below), and when a completed transfer's
+ * (cart_addr, dram_addr) tuple matches exactly one declared overlay window's
+ * (rom_start..rom_end, va_start) mapping, that window's bank becomes the
+ * slot's resident image and its activation counter increments. A PC in an
+ * overlay window is attributed to the slot's CURRENT resident bank and
+ * activation; a PC in a slot with no resolved load yet stays bank-unknown.
+ * This is generation tracking from observed load order, never a guessed
+ * address -- see the window-parsing comment near g_overlay_windows for the
+ * aliasing rules this enables and the aliasing that remains fail-closed.
  *
  * Reproducibility: the trace contains sequence numbers only, never host
  * timestamps. Repeated captures must reproduce the exact observed bank-root
@@ -97,6 +115,25 @@
 #define MI_INTR_REG 0xa4300008u
 #define MI_MASK_REG 0xa430000cu
 
+/* PI DMA registers, verified against mupen64plus-core source in
+ * mupen_devtrace.c (see that file's header comment for the register-map
+ * cross-check). Watched here for the same reason devtrace watches them: a PI
+ * DMA's (cart_addr, dram_addr) tuple is the only observable evidence of which
+ * overlay image is resident in a load slot, because AKI overlays reuse VA
+ * slots and address alone cannot disambiguate them (see
+ * docs/plans/overlay-trace-attribution.md). */
+#define PI_DRAM_ADDR 0xa4600000u
+#define PI_CART_ADDR 0xa4600004u
+#define PI_RD_LEN    0xa4600008u
+#define PI_WR_LEN    0xa460000cu
+#define PI_STATUS    0xa4600010u
+#define PI_STATUS_DMA_BUSY 0x01u
+
+/* dram_addr is a physical RDRAM address (KSEG-free); overlay windows are
+ * declared as KSEG0/1 VAs. Masking the top nibble makes the two comparable
+ * without asserting a cache policy either window implies. */
+#define KSEG_MASK 0x1fffffffu
+
 /* Resident-bank attribution window; see the header comment for the
  * boot-copy justification. */
 #define RESIDENT_VA_START 0x80000400u
@@ -113,6 +150,16 @@ static ptr_DebugGetState DebugGetState;
 static ptr_DebugSetRunState DebugSetRunState;
 static ptr_DebugStep DebugStep;
 static ptr_CoreDoCommand g_do_command;
+
+/* PI DMA busy-edge state, mirroring mupen_devtrace.c's struct pi_state:
+ * completion must attribute using the tuple captured at the RISING edge --
+ * by the time BUSY falls, PI_CART_ADDR/PI_DRAM_ADDR may already have been
+ * consumed or overwritten by the next queued transfer. */
+static struct {
+    int busy;
+    uint32_t cart_addr;
+    uint32_t dram_addr;
+} g_pi_prev;
 
 static int hash_optional_file(const char *path, char out[CC_SHA256_DIGEST_LENGTH * 2 + 1]) {
     out[0] = '\0';
@@ -220,8 +267,245 @@ static int pc_in_resident(uint32_t pc) {
     return pc >= RESIDENT_VA_START && pc < RESIDENT_VA_END;
 }
 
+/* Optional overlay attribution windows, supplied out-of-band by
+ * FN64_OVERLAY_WINDOWS as lines of either:
+ *   "<bank> <va_start> <va_end>"                       (3-field, VA only)
+ *   "<bank> <va_start> <va_end> <rom_start> <rom_end>"  (5-field, +ROM range)
+ * (hex or decimal). Without the file, behaviour is exactly as before: only
+ * the resident window is named and every other PC stays bank-unknown.
+ *
+ * WHY A FILE AND NOT A BUILT-IN TABLE: the windows come from fn64-discover's
+ * proven RomMapping facts for the ROM under trace. Hardcoding them here would
+ * put a per-game claim in the producer, which is the thing this boundary
+ * exists to avoid -- and the producer cannot verify them anyway.
+ *
+ * ALIASING: overlay images share load slots (WM2000 puts two images at
+ * 0x800e1b90 and two more at 0x8011c900). A PC inside a slot claimed by more
+ * than one 3-field (no ROM range) window cannot be attributed by VA alone --
+ * knowing WHICH image is resident needs the active load generation. Those
+ * windows are still rejected at load time and their PCs stay unknown, exactly
+ * as before this change.
+ *
+ * A 5-field window carries the ROM range PRECISELY so VA-sharing can be
+ * resolved instead of rejected: the producer watches PI DMA (see
+ * watch_pi_dma below) and uses the observed load ORDER, never a guessed
+ * address, to decide which of the aliasing images is resident at any given
+ * PC observation. So VA-overlap among rom-range-carrying windows is
+ * admitted. The only aliasing that remains genuinely unresolvable -- and
+ * stays fail-closed -- is two declared overlays claiming the same
+ * rom_start: a PI DMA from that cart address could never tell them apart
+ * either, so both are rejected. */
+#define MAX_OVERLAY_WINDOWS 32
+static struct {
+    char bank[64];
+    uint32_t va_start;
+    uint32_t va_end;
+    int has_rom_range;
+    uint32_t rom_start;
+    uint32_t rom_end;
+    /* Index into g_overlay_slots for this window's load slot, resolved once
+     * after parsing. -1 until then. */
+    int slot;
+} g_overlay_windows[MAX_OVERLAY_WINDOWS];
+static unsigned g_overlay_window_count;
+
+/* A "slot" is a distinct (va_start, va_end) resident-image destination.
+ * Residency (which declared image currently occupies the slot) is generation
+ * state, not a property of any one window, so it is tracked once per slot and
+ * shared by every window/bank name that targets it. */
+#define MAX_OVERLAY_SLOTS 32
+static struct {
+    uint32_t va_start;
+    uint32_t va_end;
+    /* -1 = no load observed yet for this slot: every PC here stays
+     * bank-unknown, per the design doc's step 4 -- attribution before the
+     * first load, or under any ambiguity, is never guessed. */
+    int resident_window;
+    uint64_t activation;
+} g_overlay_slots[MAX_OVERLAY_SLOTS];
+static unsigned g_overlay_slot_count;
+
+static int find_or_add_slot(uint32_t va_start, uint32_t va_end) {
+    for (unsigned i = 0; i < g_overlay_slot_count; i++) {
+        if (g_overlay_slots[i].va_start == va_start && g_overlay_slots[i].va_end == va_end)
+            return (int)i;
+    }
+    if (g_overlay_slot_count >= MAX_OVERLAY_SLOTS) {
+        fprintf(stderr, "too many distinct overlay slots (max %u)\n", MAX_OVERLAY_SLOTS);
+        exit(2);
+    }
+    unsigned i = g_overlay_slot_count++;
+    g_overlay_slots[i].va_start = va_start;
+    g_overlay_slots[i].va_end = va_end;
+    g_overlay_slots[i].resident_window = -1;
+    g_overlay_slots[i].activation = 0;
+    return (int)i;
+}
+
+static void load_overlay_windows(void) {
+    const char *path = getenv("FN64_OVERLAY_WINDOWS");
+    if (!path) return;
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "cannot open FN64_OVERLAY_WINDOWS %s\n", path);
+        exit(2);
+    }
+    char line[256];
+    unsigned parsed = 0;
+    while (fgets(line, sizeof line, file) && parsed < MAX_OVERLAY_WINDOWS) {
+        char bank[64];
+        unsigned long long start = 0, end = 0, rom_start = 0, rom_end = 0;
+        if (line[0] == '#') continue;
+        int fields = sscanf(line, "%63s %llx %llx %llx %llx", bank, &start, &end,
+                            &rom_start, &rom_end);
+        if (fields != 3 && fields != 5) continue;
+        if (start >= end || start > 0xffffffffull || end > 0xffffffffull) continue;
+        int has_rom_range = fields == 5;
+        if (has_rom_range) {
+            if (rom_start >= rom_end || rom_start > 0xffffffffull || rom_end > 0xffffffffull)
+                continue;
+        }
+        snprintf(g_overlay_windows[parsed].bank, sizeof g_overlay_windows[parsed].bank,
+                 "%s", bank);
+        g_overlay_windows[parsed].va_start = (uint32_t)start;
+        g_overlay_windows[parsed].va_end = (uint32_t)end;
+        g_overlay_windows[parsed].has_rom_range = has_rom_range;
+        g_overlay_windows[parsed].rom_start = (uint32_t)rom_start;
+        g_overlay_windows[parsed].rom_end = (uint32_t)rom_end;
+        g_overlay_windows[parsed].slot = -1;
+        parsed++;
+    }
+    fclose(file);
+    /* Reject a window when its aliasing genuinely cannot be resolved:
+     *   - it shares its VA slot with another window and EITHER lacks a ROM
+     *     range (no generation signal is possible), OR the other window
+     *     also lacks one;
+     *   - it shares its ROM start with another window (a PI DMA from that
+     *     cart address could never distinguish which is meant, so
+     *     generation tracking cannot help here either).
+     * Two rom-range-carrying windows that merely share a VA slot are
+     * exactly the case this producer now handles: keep both. */
+    unsigned kept = 0;
+    for (unsigned i = 0; i < parsed; i++) {
+        int rejected = 0;
+        const char *reason = NULL;
+        for (unsigned j = 0; j < parsed; j++) {
+            if (i == j) continue;
+            int va_overlap = g_overlay_windows[i].va_start < g_overlay_windows[j].va_end &&
+                             g_overlay_windows[j].va_start < g_overlay_windows[i].va_end;
+            if (va_overlap &&
+                (!g_overlay_windows[i].has_rom_range || !g_overlay_windows[j].has_rom_range)) {
+                rejected = 1;
+                reason = "slot shared with another image and no ROM range resolves it";
+                break;
+            }
+            if (g_overlay_windows[i].has_rom_range && g_overlay_windows[j].has_rom_range &&
+                g_overlay_windows[i].rom_start == g_overlay_windows[j].rom_start) {
+                rejected = 1;
+                reason = "rom_start shared with another declared image";
+                break;
+            }
+        }
+        if (rejected) {
+            fprintf(stderr, "overlay window %s rejected: %s\n", g_overlay_windows[i].bank,
+                    reason);
+            continue;
+        }
+        g_overlay_windows[kept] = g_overlay_windows[i];
+        kept++;
+    }
+    g_overlay_window_count = kept;
+    /* Resolve each admitted window to its slot, after filtering so a
+     * rejected window's VA range never seeds a slot no admitted window
+     * observes. */
+    for (unsigned i = 0; i < g_overlay_window_count; i++) {
+        g_overlay_windows[i].slot =
+            find_or_add_slot(g_overlay_windows[i].va_start, g_overlay_windows[i].va_end);
+    }
+    fprintf(stderr, "overlay attribution windows admitted: %u of %u (%u slot(s))\n", kept,
+            parsed, g_overlay_slot_count);
+}
+
+/* A PI DMA landing in RDRAM identifies the resident image for a slot only
+ * when its (cart, dram) tuple matches exactly one declared window: cart_addr
+ * must fall in that window's declared ROM range, and dram_addr (physical,
+ * KSEG-masked) must equal the window's VA start (also KSEG-masked) -- the
+ * slot's load destination. More than one match means the ROM ranges the
+ * caller declared do not disambiguate this transfer, so residency is left
+ * unchanged rather than guessed. */
+static void observe_pi_dma_load(uint32_t cart_addr, uint32_t dram_addr) {
+    int match = -1;
+    int matches = 0;
+    for (unsigned i = 0; i < g_overlay_window_count; i++) {
+        if (!g_overlay_windows[i].has_rom_range) continue;
+        if (cart_addr < g_overlay_windows[i].rom_start || cart_addr >= g_overlay_windows[i].rom_end)
+            continue;
+        if ((dram_addr & KSEG_MASK) != (g_overlay_windows[i].va_start & KSEG_MASK)) continue;
+        match = (int)i;
+        matches++;
+    }
+    if (matches != 1) return;
+    int slot = g_overlay_windows[match].slot;
+    g_overlay_slots[slot].resident_window = match;
+    g_overlay_slots[slot].activation++;
+    fprintf(stderr,
+            "overlay slot 0x%08x resident -> %s (activation %llu) via PI DMA cart=0x%08x "
+            "dram=0x%08x\n",
+            g_overlay_slots[slot].va_start, g_overlay_windows[match].bank,
+            (unsigned long long)g_overlay_slots[slot].activation, cart_addr, dram_addr);
+}
+
+/* PI DMA busy-edge polling, mirroring mupen_devtrace.c's per-step register
+ * poll (see that file's header comment for the verified register map and
+ * the rationale for edge detection over write interception). Called once per
+ * pause, alongside the existing watched-cell polling -- this producer has no
+ * separate poll loop of its own, and DMA start/complete boundaries are just
+ * more per-step register state to observe. */
+static void watch_pi_dma(void) {
+    if (g_overlay_window_count == 0) return; /* nothing declared to resolve */
+    uint32_t status = DebugMemRead32(PI_STATUS);
+    int busy = (status & PI_STATUS_DMA_BUSY) != 0;
+    if (busy && !g_pi_prev.busy) {
+        /* Rising edge: capture the tuple now. By the falling edge these
+         * registers may already reflect the NEXT queued transfer. */
+        g_pi_prev.cart_addr = DebugMemRead32(PI_CART_ADDR);
+        g_pi_prev.dram_addr = DebugMemRead32(PI_DRAM_ADDR);
+    } else if (!busy && g_pi_prev.busy) {
+        /* Falling edge: the rising-edge tuple is the transfer that just
+         * completed. Resolve residency from it, not from current registers. */
+        observe_pi_dma_load(g_pi_prev.cart_addr, g_pi_prev.dram_addr);
+    }
+    g_pi_prev.busy = busy;
+}
+
+/* Attributes a PC to the bank currently resident in its slot, with that
+ * residency's activation number. Returns 0 (leave bank-unknown) for any PC
+ * outside every admitted window OR inside one whose slot has not yet seen a
+ * resolving load -- attribution before the first load is exactly the
+ * situation the design doc's step 4 forbids guessing through. */
+static int overlay_bank_for_pc(uint32_t pc, const char **bank_out, uint64_t *activation_out) {
+    for (unsigned i = 0; i < g_overlay_window_count; i++) {
+        if (pc < g_overlay_windows[i].va_start || pc >= g_overlay_windows[i].va_end) continue;
+        int slot = g_overlay_windows[i].slot;
+        int resident = g_overlay_slots[slot].resident_window;
+        if (resident < 0) return 0; /* slot's resident image is unknown */
+        *bank_out = g_overlay_windows[resident].bank;
+        *activation_out = g_overlay_slots[slot].activation;
+        return 1;
+    }
+    return 0;
+}
+
 static void emit_executed_pc(FILE *out, uint64_t seq, uint32_t pc) {
-    if (pc_in_resident(pc)) {
+    const char *overlay_bank = NULL;
+    uint64_t overlay_activation = 0;
+    if (overlay_bank_for_pc(pc, &overlay_bank, &overlay_activation)) {
+        fprintf(out,
+                "{\"event\":\"executed_pc\",\"sequence\":%llu,\"pc\":{\"address\":%u,"
+                "\"bank\":{\"status\":\"known\",\"bank\":\"%s\",\"activation\":%llu}}}\n",
+                (unsigned long long)seq, pc, overlay_bank,
+                (unsigned long long)overlay_activation);
+    } else if (pc_in_resident(pc)) {
         fprintf(out,
                 "{\"event\":\"executed_pc\",\"sequence\":%llu,\"pc\":{\"address\":%u,"
                 "\"bank\":{\"status\":\"known\",\"bank\":\"boot\",\"activation\":0}}}\n",
@@ -437,6 +721,7 @@ int main(int argc, char **argv) {
                 argv[0]);
         return 2;
     }
+    load_overlay_windows();
     const char *core_path = argv[1];
     const char *rom_path = argv[2];
     const char *rsp_path = argv[3];
@@ -794,6 +1079,12 @@ int main(int argc, char **argv) {
         } else {
             wait_for_pause(&pc);
         }
+
+        /* Polled on every pause, not just while recording: an overlay load
+         * that establishes a slot's first residency can happen before the
+         * capture window opens (IPL3/boot-stub churn loads early overlays),
+         * and a PC observed after that must still resolve correctly. */
+        watch_pi_dma();
 
         int entered_recording = 0;
         if (!recording) {

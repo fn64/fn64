@@ -117,10 +117,16 @@ pub struct SearchConfig {
 impl SearchConfig {
     /// The default family search: an 8 MiB RDRAM window (`0x8000_0000 ..
     /// 0x8080_0000`), overlay lengths from 4 KiB to 2 MiB, and strides
-    /// covering the AKI `0x24` record plus neighbours. `min_records = 3` is
-    /// the smallest run a single arithmetic accident cannot fake (two records
-    /// can share one spurious spacing; three independent plausible triples in
-    /// a row do not).
+    /// covering the AKI `0x24` record plus neighbours. `min_records = 2` is
+    /// the smallest run the family search will consider: a two-record table is
+    /// a real shape (a game with exactly two mutually exclusive overlays --
+    /// measured on WCW/nWo Revenge -- has nothing longer to offer), and two
+    /// records CAN share one spurious spacing, so the floor alone is not the
+    /// evidence. What keeps a coincidental pair out is downstream: every
+    /// record must decode as code at its declared VA
+    /// ([`descriptor_mapping_corroborated`]), and a table is admitted only
+    /// when `min_mapped_regions` of its records map uniquely -- callers
+    /// derive that floor from this one, so a 2-record table must map BOTH.
     pub fn aki_family() -> Self {
         Self {
             min_rom_offset: 0x1000,
@@ -131,7 +137,7 @@ impl SearchConfig {
             strides: vec![
                 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x38, 0x40,
             ],
-            min_records: 3,
+            min_records: 2,
         }
     }
 
@@ -662,6 +668,14 @@ fn overlapping_destination_is_engine_shape(fallbacks: &[DescriptorFallback]) -> 
             .or_default()
             .insert((fallback.mapping.source_start, fallback.mapping.source_end));
     }
+    concentrated_swap_shape(&sources_by_destination)
+}
+
+/// The concentration test alone: many distinct ROM images declaring few
+/// destinations, at least one claimed by many sources.
+fn concentrated_swap_shape(
+    sources_by_destination: &BTreeMap<u32, BTreeSet<(u32, u32)>>,
+) -> bool {
     let distinct_sources: usize = sources_by_destination
         .values()
         .map(|sources| sources.len())
@@ -673,6 +687,86 @@ fn overlapping_destination_is_engine_shape(fallbacks: &[DescriptorFallback]) -> 
         .unwrap_or(0);
     busiest >= MIN_SWAPPED_SOURCES_PER_DESTINATION
         && distinct_sources >= sources_by_destination.len() * MAX_SWAPPED_DESTINATION_SHARE
+}
+
+/// Whether two mappings' ROM sources are immediate neighbours -- one ends
+/// exactly where the other begins. Swap-pair siblings tile a contiguous span;
+/// an unrelated image that merely lands on the same VA does not.
+fn sources_abut(left: MappingHypothesis, right: MappingHypothesis) -> bool {
+    left.source_end == right.source_start || right.source_end == left.source_start
+}
+
+/// [`overlapping_destination_is_engine_shape`] over both evidence sets: the
+/// descriptor fallbacks and the raw delta-vote mappings. A swap pair splits
+/// its evidence across the two (one sibling votes, the other falls back), so
+/// concentration and contiguity must be measured on the union.
+/// Concentration OR small-swap-pair contiguity, measured across both
+/// evidence sets.
+///
+/// A game with exactly two mutually exclusive overlays concentrates 2 sources
+/// on 1 destination -- an order of magnitude under
+/// [`MIN_SWAPPED_SOURCES_PER_DESTINATION`], so concentration cannot carry the
+/// evidence at that size and contiguity does instead: coincidental pointer
+/// pairs do not abut, while a partitioned ROM span whose pieces each decode as
+/// code at one shared VA is a swap pair rather than a contradiction (measured:
+/// WCW/nWo Revenge, ROM 0x3c770..0x834a0 and 0x834a0..0xdac50, both declaring
+/// 0x80090000).
+fn overlapping_destination_is_engine_shape_across(
+    fallbacks: &[DescriptorFallback],
+    raw_mappings: &BTreeSet<MappingHypothesis>,
+) -> bool {
+    let mut sources_by_destination: BTreeMap<u32, BTreeSet<(u32, u32)>> = BTreeMap::new();
+    for fallback in fallbacks {
+        sources_by_destination
+            .entry(fallback.mapping.va_start)
+            .or_default()
+            .insert((fallback.mapping.source_start, fallback.mapping.source_end));
+    }
+    for mapping in raw_mappings {
+        sources_by_destination
+            .entry(mapping.va_start)
+            .or_default()
+            .insert((mapping.source_start, mapping.source_end));
+    }
+    let distinct_sources: usize = sources_by_destination
+        .values()
+        .map(|sources| sources.len())
+        .sum();
+    let busiest = sources_by_destination
+        .values()
+        .map(|sources| sources.len())
+        .max()
+        .unwrap_or(0);
+    if busiest >= MIN_SWAPPED_SOURCES_PER_DESTINATION
+        && distinct_sources >= sources_by_destination.len() * MAX_SWAPPED_DESTINATION_SHARE
+    {
+        return true;
+    }
+    small_contiguous_swap_pair(&sources_by_destination)
+}
+
+/// Whether one destination is claimed only by ROM sources that exactly tile a
+/// contiguous span -- each source's end is the next source's start.
+///
+/// Deliberately narrow: every source for the destination must participate (a
+/// stray extra claimant means the overlap is ambiguity again), the sources
+/// must be non-degenerate, and the tiling must be exact. Each region has
+/// already passed [`descriptor_mapping_corroborated`], so it decodes as code
+/// at the declared VA; this only decides whether the shared destination is a
+/// design or a contradiction.
+fn small_contiguous_swap_pair(
+    sources_by_destination: &BTreeMap<u32, BTreeSet<(u32, u32)>>,
+) -> bool {
+    sources_by_destination.values().any(|sources| {
+        if sources.len() < 2 {
+            return false;
+        }
+        let ordered: Vec<(u32, u32)> = sources.iter().copied().collect();
+        ordered.iter().all(|(start, end)| end > start)
+            && ordered
+                .windows(2)
+                .all(|pair| pair[0].1 == pair[1].0)
+    })
 }
 
 /// Admit only hypotheses whose VA interval is unique across distinct region
@@ -695,17 +789,62 @@ fn apply_unique_descriptor_fallbacks<A>(
     admissions: &mut [A],
     raw_mappings: &BTreeSet<MappingHypothesis>,
     fallbacks: Vec<DescriptorFallback>,
+    region_deltas: impl FnMut(&mut A) -> &mut Vec<Option<(u32, u32)>>,
+    mapped_regions: impl FnMut(&mut A) -> &mut u32,
+) -> BTreeSet<(usize, usize)> {
+    apply_unique_descriptor_fallbacks_with_swap_pairs(
+        admissions,
+        raw_mappings,
+        fallbacks,
+        region_deltas,
+        mapped_regions,
+        false,
+    )
+}
+
+/// [`apply_unique_descriptor_fallbacks`], with the small-swap-pair exemption
+/// selectable.
+///
+/// The exemption is offered only on the physical descriptor path. The VROM
+/// path resolves its own file table first, so an abutting source pair there is
+/// ordinary adjacency in a file list rather than evidence of a reused slot,
+/// and its stricter VA-uniqueness rule (`Rule4VaConflict`) stands unchanged.
+fn apply_unique_descriptor_fallbacks_with_swap_pairs<A>(
+    admissions: &mut [A],
+    raw_mappings: &BTreeSet<MappingHypothesis>,
+    fallbacks: Vec<DescriptorFallback>,
     mut region_deltas: impl FnMut(&mut A) -> &mut Vec<Option<(u32, u32)>>,
     mut mapped_regions: impl FnMut(&mut A) -> &mut u32,
+    allow_small_swap_pairs: bool,
 ) -> BTreeSet<(usize, usize)> {
-    let swapping_engine = overlapping_destination_is_engine_shape(&fallbacks);
+    // Shape detection spans BOTH evidence sets. A two-overlay swap pair
+    // typically has one record win a raw delta vote while its sibling stays
+    // open, so a fallbacks-only view sees a single claimant and can never
+    // recognize the pair (measured on WCW/nWo Revenge: record 1 votes, record
+    // 2 falls back, both declare 0x80090000).
+    let swapping_engine = if allow_small_swap_pairs {
+        overlapping_destination_is_engine_shape_across(&fallbacks, raw_mappings)
+    } else {
+        overlapping_destination_is_engine_shape(&fallbacks)
+    };
     let admitted: Vec<_> = fallbacks
         .iter()
         .filter(|candidate| {
             // A delta-vote mapping is independently derived evidence, so it
-            // outranks a declared destination even in a swapping engine.
+            // outranks a declared destination -- except where the overlap IS
+            // the design. In a swap pair the raw mapping and the declared
+            // destination agree about the slot and differ only in which ROM
+            // image occupies it, so treating the raw claim as exclusive
+            // discards the sibling that shares it by construction.
             let conflicts_with_raw = raw_mappings.iter().any(|mapping| {
-                *mapping != candidate.mapping && mapping.overlaps_va(candidate.mapping)
+                *mapping != candidate.mapping
+                    && mapping.overlaps_va(candidate.mapping)
+                    // ...unless the two ROM images abut. A swap pair's members
+                    // tile one contiguous ROM span and share one slot by
+                    // design, so the raw claim does not contradict its
+                    // sibling; an unrelated source landing on the same VA is
+                    // still a contradiction and still rejects.
+                    && !(allow_small_swap_pairs && swapping_engine && sources_abut(*mapping, candidate.mapping))
             });
             let conflicts_with_fallback = !swapping_engine
                 && fallbacks.iter().any(|other| {
@@ -917,12 +1056,13 @@ pub fn admit_overlay_region_tables(
             }
         }
     }
-    let _ = apply_unique_descriptor_fallbacks(
+    let _ = apply_unique_descriptor_fallbacks_with_swap_pairs(
         &mut admissions,
         &raw_mappings,
         fallbacks,
         |admission| &mut admission.region_deltas,
         |admission| &mut admission.mapped_regions,
+        true,
     );
 
     // Admission was decided before the fallbacks ran, so re-derive it against
@@ -932,6 +1072,30 @@ pub fn admit_overlay_region_tables(
     for admission in &mut admissions {
         admission.admitted = admission.mapped_regions >= min_mapped_regions
             && Some(admission.table.destination_field) == selected_destination_field;
+    }
+
+    // A fully-mapped table outranks a partially-mapped one. Lowering the
+    // record floor to admit genuine two-overlay games also lets a short table
+    // clear the bar with records left open, and a weaker table competing with
+    // a complete one is not ambiguity to preserve -- downstream
+    // (`scan_recovered_overlay_regions`) requires exactly ONE admitted table,
+    // so a spurious partial admission silently costs the whole game its
+    // overlays (measured on WWF WrestleMania 2000: the real 4-record table
+    // maps 4/4 while a 3-record neighbour maps 2/3, and admitting both dropped
+    // NWXE recall by 122 functions).
+    //
+    // Completeness, not length, is the discriminator: a short table that maps
+    // every record it declares is exactly the two-overlay shape this floor
+    // exists to admit.
+    let any_complete = admissions
+        .iter()
+        .any(|admission| admission.admitted && admission.mapped_regions as usize == admission.table.records.len());
+    if any_complete {
+        for admission in &mut admissions {
+            if admission.mapped_regions as usize != admission.table.records.len() {
+                admission.admitted = false;
+            }
+        }
     }
 
     OverlayRecovery {

@@ -1,5 +1,37 @@
 # WM2000 boot session notes (2026-07-14)
 
+> **STATUS AS OF 2026-08-03 — READ THIS BEFORE QUOTING ANY SECTION BELOW.**
+>
+> **WM2000 renders.** `scripts/wm2000-scenario-gate.zsh` passes 10/10 runs
+> with byte-identical evidence: 119 graphics submissions, 262 audio
+> submissions, 500 RCP tasks, 357 recognized microcodes, `render_error=None`.
+> Routes have been driven to Exhibition / Single Match setup. Frame dumps
+> land in `/tmp/fn64-wm2000-render-*.png` (240 frames, boot splash onward).
+>
+> This document is a CHRONOLOGICAL LOG, not a status page. Every "current
+> frontier" paragraph below states the frontier *as of its own session* and
+> is superseded by later ones. Two separate investigations have now been
+> misled by quoting a mid-document frontier as if it were current:
+>
+> * the passage near line 905-935 ("no VI mode/origin programming, no SP task
+>   submission") is the state on **2026-07-19**, closed by the fixes in
+>   sessions 4-9 below -- device-delivery ordering, `osEPiStartDma` `$a0`
+>   routing, the auto-stubbed `osGetCount`, semantic host-boundary binding,
+>   and finally the FR-bit inheritance bug that was blocking graphics;
+> * that passage itself opens by correcting an *earlier* wrong reading, which
+>   is exactly why quoting any single frontier out of sequence is unsafe.
+>
+> The honest open item is **catalog exhaustiveness** for a 100% static
+> recompilation claim: three `0xbfc0...` bootstrap exception vectors lacking
+> an exact image owner or a validated unreachability receipt, and four
+> unproven `MTC0 Status` value proofs. That is a static evidence audit, not
+> an input-route sweep -- driving more routes cannot close it.
+>
+> A warning about *this* file specifically, learned the hard way: grepping it
+> is unsafe. A search for "frontier closed" hits a sentence reading "this
+> mechanism does not yet make the real `0xbfc0...` frontier closed" -- the
+> negation lives in the words before the match. Read whole sections.
+
 2026-07-25 arbitrary-PC update: checked AOT `lw`/`sw` now reaches the installed
 word-MMIO hook before RDRAM backing rejection. The private NWXE pack passes the
 former `__osSiDeviceBusy` SI-status fault at `0x80038268`. Its host override is
@@ -2003,6 +2035,106 @@ promote that bounded scan to exhaustive evidence. The receipt consumes the
 opaque analyzer result and retains the full scan rather than only its summary,
 so another producer cannot manufacture a complete inventory through public
 Rust fields or direct receipt deserialization.
+
+## 2026-08-03 measured audit of the five BEV admission conditions
+
+This section reports *measured* status, not a plan. Command:
+
+```sh
+FN64_DISCOVER_NWXE_ROM=.../NWXE/wm2000.z64 \
+FN64_DENSE_MANIFEST_ONLY=1 \
+FN64_SOURCE_FRONTIER_RECEIPT=/tmp/fn64-wm-frontier-baseline.json \
+  target/debug/gate_wm2000_recompile
+```
+
+The receipt reported `open_frontier=true`, reproducibly (byte-identical
+across two runs). Its content hash is deliberately NOT quoted here: the
+receipt depends on private BootContext and image captures that are not in
+this repo, so no test can pin the value, and an unverifiable digest in a doc
+is a claim rather than evidence. Re-derive it by running the command above.
+Against the five conjunctive conditions in
+`ExecutableSourceFrontierV1::validates_bev_clear_invariant`:
+
+1. **Initial BootContext Status clear — FAILS, input-absent.** The receipt
+   records `initial_cop0_status = {"authority":"missing"}` because no
+   `FN64_BOOT_CONTEXT` capture exists on this machine. This is a *missing
+   private input*, not a code defect: the validator correctly fails closed. It
+   is closable only by supplying a ROM-bound post-IPL3 capture whose normalized
+   ROM digest, header entry, NTSC selection, destination code, and IPL3 digest
+   all match. Fabricating one would forge the very authority under audit.
+2. **Every dense/external Status scan and value proof closes — FAILS, and four
+   of the five sub-failures are genuine, not mechanical.** Measured:
+   `cop0_status_scan bank=boot proven_code=5 value_proofs=5 value_open=4
+   unclassified=2`, plus `bank=recovered_overlay_3 unclassified=1`.
+3. **Exact 15 installed host symbols and effects match — PASSES.** All 15
+   bindings resolve by `unique_structural_semantic_match` and every one carries
+   `current_status_effect = c_bridge_runtime_enforced_preserves_bev`. This is
+   the one condition already fully met.
+4. **All normal-vector handlers have scanned owners — FAILS.** All six modeled
+   destinations (`0x80000000`, `0x80000080`, `0x80000180`, and the three
+   `0xbfc0...`) are `open`; `external_images=0`, so no capture can supply an
+   `ExactCodeOwner`. Note the invariant requires the *three normal* vectors to
+   have exact owners; with zero external images none do.
+5. **Writer/DMA/transfer closure complete — FAILS.** Measured:
+   14 open writer classes, `transfer_inventory=open`, `direct_open=16`,
+   `direct_dma_blockers=16`, `conditional_cpu_word_stores=3`,
+   `open_cpu_word_stores=52`, 42 of 46 cache sites `unclassified`, and 2
+   `fixed_lui_a460_candidate` raw-PI callers still `open`.
+
+### The four open Status value proofs, decoded from ROM bytes
+
+BEV is bit 22 (`0x00400000`). Decoding the resident image at each site:
+
+* `0x8002a26c` — `mfc0`/mask/`mtc0`; `known_zero=0x00400001` includes BEV.
+  **Closed** (this is the one the abstract interpreter already discharged).
+* `0x8002a2ac` — `lw $t1,0x118($t2)` from a saved thread context, then
+  `$t1 &= 0xffff00ff; $t1 |= (...); $t1 &= ~1; mtc0 $t1,$12`. Bit 22 lies
+  *inside* the preserved `0xffff0000` half, so BEV is carried through from
+  mutable memory (`0x80048870+0x118`). **Genuinely open.**
+* `0x8002a2c8` — `mfc0 $t0,$12; or $t0,$t0,$a0; mtc0 $t0,$12`. The `mfc0` seed
+  supplies BEV known-zero, but `OR` with an unconstrained argument correctly
+  drops it (`bitor` sets `known_zero = lhs.kz & rhs.kz = 0`). A caller may set
+  BEV. **Genuinely open** — closable only by proving every caller's `$a0`.
+* `0x80036fb0` — same `0xffff00ff` preserve-mask shape as `0x8002a2ac`, reading
+  the saved context through `$k0`. **Genuinely open.**
+* `0x800376d0` — a bare `mtc0 $a0,$12`: a whole-Status write from an
+  unconstrained argument. **Genuinely open.**
+
+These four are *not* interpreter weaknesses. Three write a Status value whose
+BEV bit provably originates in runtime-mutable memory or an unconstrained
+argument; the fourth ORs in an open caller value. `read_static_word` deliberately
+resets `known_zero`/`known_one` on every load from the load image, so an initial
+ROM byte can never masquerade as a runtime invariant. Closing them soundly
+requires *interprocedural argument closure* — proving the callable-entry set and
+every caller's `$a0`/saved-context contents — which the receipt itself reports
+is unavailable ("proven fact roots do not enumerate every callable entry").
+
+### The three unclassified writes are a reachability limit, not unsoundness
+
+`0x800367ac` decodes as `mfc0 $k1,$12; addiu $at,$zero,-4; and $k1,$k1,$at;
+mtc0 $k1,$12` — a textbook BEV-*preserving* read/modify/write that would close
+trivially if it were classified. It is `unclassified` because the CFG never
+reaches it: the boot bank seeds only `rom.header.entry_point` plus proven facts,
+yielding `proven_root_count=27` and `reachable_block_count=197` against
+`aligned_word_count=262144`. `inventory_cop0_status_writes` puts every
+`Unknown`/`Candidate*`/`Conflict`/`None` word class into `unclassified_writes`,
+which is the correct conservative choice — promoting a candidate word to proven
+code to make the receipt pass would be exactly the bar-lowering this frontier
+exists to prevent. The same limit explains `0x8002a36c` and the
+`recovered_overlay_3` `dmtc0` at `0x8015172c` (and `DMTC0` remains unsupported
+by design rather than truncated into the interpreter's 32-bit domain).
+
+### Verdict
+
+The `0xbfc0...` frontier is **still open**, and correctly so. Four of the five
+admission conditions fail. Only condition 3 (host bindings) passes. Two of the
+failures are *input-absent* (no BootContext capture, no external executable-image
+captures) and would close by supplying validated black-box captures. The other
+two are *evidence-limited*: the bounded 27-root CFG cannot enumerate every
+callable entry, and without that, neither the four Status value proofs nor the
+transfer/writer closure can be discharged. No code change can close them without
+weakening the bar, so none was made. The receipt's fail-closed behavior is the
+correct outcome, and the digest above pins it for regression.
 
 The 30-read neutral gaps are also deliberately conservative: retained edges
 show roughly 30 graphics submissions between adjacent inputs. A safe speed

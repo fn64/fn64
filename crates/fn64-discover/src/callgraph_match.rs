@@ -53,12 +53,13 @@
 
 use crate::cfg::{classify_control, region_target, ControlOp};
 use crate::homology::relocation_masked_word;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One prior, independently-derived function body from a ROM. `identity` is
 /// output-side identity (e.g. a name or address label); it is never consumed
 /// by matching, only reported.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionBody {
     pub identity: String,
     pub va_start: u32,

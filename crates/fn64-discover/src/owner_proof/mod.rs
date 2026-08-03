@@ -502,6 +502,11 @@ fn prove_exact_owners_inner(
         .is_some_and(|conclusion| conclusion.state == ProofState::Proven);
     let overlaps = same_bank_overlaps(partition, cfg);
     let indirect_target_domains = collect_indirect_target_domains(facts, &cfg.bank);
+    // Both were previously recomputed inside the per-root loop: a full
+    // `FactDb` scan each, plus (for executable ranges) a `conclusion` lookup
+    // per fact. Neither depends on the root.
+    let fact_index = BankFactIndex::build(facts, &cfg.bank);
+    let proven_executable_ranges = facts.proven_executable_ranges(&cfg.bank);
 
     let assessments = roots
         .into_iter()
@@ -523,6 +528,8 @@ fn prove_exact_owners_inner(
                 external_authorized_roots,
                 owner_proof_authority,
                 &indirect_target_domains,
+                &fact_index,
+                &proven_executable_ranges,
             )
         })
         .collect();
@@ -551,6 +558,8 @@ fn assess_root(
     external_authorized_roots: &BTreeSet<u32>,
     owner_proof_authority: Option<&OwnerProofAuthority>,
     indirect_target_domains: &BTreeMap<(u32, bool), BTreeSet<u32>>,
+    fact_index: &BankFactIndex,
+    proven_executable_ranges: &[(u32, u32)],
 ) -> OwnerAssessment {
     let entry = BankAddr::new(&cfg.bank, root);
     let mut blockers = BTreeSet::new();
@@ -642,11 +651,7 @@ fn assess_root(
                 blockers.insert(OwnerBlocker::InvalidBankBackingGeometry);
             }
         }
-        if !interval_is_covered(
-            root,
-            owner.extent_end,
-            &facts.proven_executable_ranges(&cfg.bank),
-        ) {
+        if !interval_is_covered(root, owner.extent_end, proven_executable_ranges) {
             blockers.insert(OwnerBlocker::NotProvenExecutable);
         }
 
@@ -668,7 +673,7 @@ fn assess_root(
         validate_incoming(
             owner,
             cfg,
-            facts,
+            fact_index,
             owner_of_block,
             proven_entries,
             &mut blockers,
@@ -676,7 +681,7 @@ fn assess_root(
         validate_indirects(
             owner,
             cfg,
-            facts,
+            fact_index,
             owner_proof_authority,
             indirect_target_domains,
             &mut blockers,
@@ -944,7 +949,7 @@ fn validate_block(
 fn validate_incoming(
     owner: &Owner,
     cfg: &Cfg,
-    facts: &FactDb,
+    fact_index: &BankFactIndex,
     owner_of_block: &BTreeMap<u32, u32>,
     proven_entries: &BTreeSet<u32>,
     blockers: &mut BTreeSet<OwnerBlocker>,
@@ -956,47 +961,34 @@ fn validate_incoming(
         }
     }
 
-    for fact in facts.facts() {
-        match fact {
-            Fact::DirectCall { source, target } => {
-                let foreign_source = source.bank != owner.bank || !contains(source.pc);
-                if target.bank == owner.bank
-                    && contains(target.pc)
-                    && target.pc != owner.root_va
-                    && foreign_source
-                {
+    // Interior targets only: `target.pc != owner.root_va` and `contains` are
+    // exactly the old per-fact filters, now applied by range-selecting the
+    // index instead of rescanning every fact. The index is keyed on
+    // `cfg.bank`; the filters these arms replace keyed on `owner.bank`. Those
+    // agree except when the owner's bank disagrees with its CFG's, which
+    // `OwnerBankMismatch` already reports above -- skip rather than report
+    // another bank's edges against this owner.
+    if owner.bank == cfg.bank {
+        let interior_start = owner.root_va.saturating_add(1);
+        let interior = interior_start..owner.extent_end.max(interior_start);
+        for (&target_pc, sources) in fact_index.incoming_calls.range(interior.clone()) {
+            for (source_bank, source_pc, edge) in sources {
+                if source_bank.as_str() != owner.bank || !contains(*source_pc) {
                     blockers.insert(OwnerBlocker::IncomingEdge {
-                        source: source.pc,
-                        target: target.pc,
-                        edge: IncomingEdgeKind::DirectCall,
+                        source: *source_pc,
+                        target: target_pc,
+                        edge: *edge,
                     });
                 }
             }
-            Fact::ResolvedCall { source, target } => {
-                let foreign_source = source.bank != owner.bank || !contains(source.pc);
-                if target.bank == owner.bank
-                    && contains(target.pc)
-                    && target.pc != owner.root_va
-                    && foreign_source
-                {
-                    blockers.insert(OwnerBlocker::IncomingEdge {
-                        source: source.pc,
-                        target: target.pc,
-                        edge: IncomingEdgeKind::ResolvedCall,
-                    });
-                }
-            }
-            Fact::ObservedIndirectTarget { site, target, .. }
-                if target.bank == owner.bank
-                    && contains(target.pc)
-                    && target.pc != owner.root_va =>
-            {
+        }
+        for (&target_pc, sites) in fact_index.observed_indirect_targets.range(interior) {
+            for &site in sites {
                 blockers.insert(OwnerBlocker::ObservedInteriorEntry {
-                    site: site.pc,
-                    target: target.pc,
+                    site,
+                    target: target_pc,
                 });
             }
-            _ => {}
         }
     }
 
@@ -1075,7 +1067,7 @@ fn validate_incoming(
 fn validate_indirects(
     owner: &Owner,
     cfg: &Cfg,
-    facts: &FactDb,
+    fact_index: &BankFactIndex,
     owner_proof_authority: Option<&OwnerProofAuthority>,
     target_domains: &BTreeMap<(u32, bool), BTreeSet<u32>>,
     blockers: &mut BTreeSet<OwnerBlocker>,
@@ -1130,32 +1122,19 @@ fn validate_indirects(
             continue;
         }
         let site_pc = block.end_va - 8;
-        let mut exhaustive_sets = BTreeSet::new();
-        for fact in facts.facts() {
-            let Fact::IndirectTransferAnalysis {
-                site,
-                via_call,
-                state,
-                kind,
-                targets,
-                ..
-            } = fact
-            else {
-                continue;
-            };
-            if site.bank == owner.bank
-                && site.pc == site_pc
-                && via_call == cfg_via_call
-                && *state == IndirectTransferState::Exhaustive
-                && kind.is_some()
-                && !targets.is_empty()
-            {
-                let mut normalized = targets.clone();
-                normalized.sort_unstable();
-                normalized.dedup();
-                exhaustive_sets.insert(normalized);
-            }
-        }
+        // `BankFactIndex` is built for `cfg.bank`; the old scan filtered on
+        // `owner.bank`. An owner whose bank differs from the CFG's already
+        // raises `OwnerBankMismatch`, but keep the check exact rather than
+        // relying on that.
+        let empty = BTreeSet::new();
+        let exhaustive_sets = if owner.bank == cfg.bank {
+            fact_index
+                .exhaustive_indirect_sets
+                .get(&(site_pc, *cfg_via_call))
+                .unwrap_or(&empty)
+        } else {
+            &empty
+        };
         if exhaustive_sets.is_empty() {
             blockers.insert(OwnerBlocker::ResolvedIndirectNotExhaustive { site: site_pc });
             continue;
@@ -1165,6 +1144,83 @@ fn validate_indirects(
         cfg_targets.dedup();
         if exhaustive_sets.len() != 1 || !exhaustive_sets.contains(&cfg_targets) {
             blockers.insert(OwnerBlocker::ResolvedIndirectEvidenceMismatch { site: site_pc });
+        }
+    }
+}
+
+/// Per-bank evidence indexed once, replacing whole-`FactDb` scans that were
+/// previously repeated for every candidate root (and, for the exhaustive
+/// indirect check, for every CFG block of every root). Every field is a
+/// reindexing of exactly the facts the per-root scans matched, so the blockers
+/// derived from it are identical; only the cost changes, from
+/// `O(roots * facts)` to `O(facts + roots * hits)`.
+struct BankFactIndex {
+    /// Sources of `DirectCall`/`ResolvedCall` facts landing in this bank,
+    /// keyed by target pc. `(source_bank, source_pc, kind)`.
+    incoming_calls: BTreeMap<u32, Vec<(String, u32, IncomingEdgeKind)>>,
+    /// `ObservedIndirectTarget` facts landing in this bank, keyed by target pc,
+    /// valued by the observing site pcs.
+    observed_indirect_targets: BTreeMap<u32, BTreeSet<u32>>,
+    /// Distinct normalized exhaustive target sets per `(site pc, via_call)`.
+    exhaustive_indirect_sets: BTreeMap<(u32, bool), BTreeSet<Vec<u32>>>,
+}
+
+impl BankFactIndex {
+    fn build(facts: &FactDb, bank: &str) -> Self {
+        let mut incoming_calls: BTreeMap<u32, Vec<(String, u32, IncomingEdgeKind)>> =
+            BTreeMap::new();
+        let mut observed_indirect_targets: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let mut exhaustive_indirect_sets: BTreeMap<(u32, bool), BTreeSet<Vec<u32>>> =
+            BTreeMap::new();
+        for fact in facts.facts() {
+            match fact {
+                Fact::DirectCall { source, target } if target.bank == bank => {
+                    incoming_calls.entry(target.pc).or_default().push((
+                        source.bank.clone(),
+                        source.pc,
+                        IncomingEdgeKind::DirectCall,
+                    ));
+                }
+                Fact::ResolvedCall { source, target } if target.bank == bank => {
+                    incoming_calls.entry(target.pc).or_default().push((
+                        source.bank.clone(),
+                        source.pc,
+                        IncomingEdgeKind::ResolvedCall,
+                    ));
+                }
+                Fact::ObservedIndirectTarget { site, target, .. } if target.bank == bank => {
+                    observed_indirect_targets
+                        .entry(target.pc)
+                        .or_default()
+                        .insert(site.pc);
+                }
+                Fact::IndirectTransferAnalysis {
+                    site,
+                    via_call,
+                    state,
+                    kind,
+                    targets,
+                    ..
+                } if site.bank == bank
+                    && *state == IndirectTransferState::Exhaustive
+                    && kind.is_some()
+                    && !targets.is_empty() =>
+                {
+                    let mut normalized = targets.clone();
+                    normalized.sort_unstable();
+                    normalized.dedup();
+                    exhaustive_indirect_sets
+                        .entry((site.pc, *via_call))
+                        .or_default()
+                        .insert(normalized);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            incoming_calls,
+            observed_indirect_targets,
+            exhaustive_indirect_sets,
         }
     }
 }
