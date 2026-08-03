@@ -73,7 +73,8 @@ pub fn generated_runner_emitter_source_receipt_v2() -> GeneratedRunnerEmitterSou
         (b"src/lib.rs", include_bytes!("lib.rs")),
         // `body_reuse.rs` emits content-silent observations only. It cannot
         // change generated runner bytes and therefore is not emitter source.
-        (b"src/emit.rs", include_bytes!("emit.rs")),
+        (b"src/emit/mod.rs", include_bytes!("emit/mod.rs")),
+        (b"src/emit/ops.rs", include_bytes!("emit/ops.rs")),
     ];
     let mut hasher = Sha256::new();
     hasher.update(b"fn64:generated-runner-emitter-source:v2:");
