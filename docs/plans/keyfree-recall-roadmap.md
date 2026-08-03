@@ -18,6 +18,33 @@ configurations) rather than trusting this table:
 Plus ~2,965 overlay-bank functions now graded exact that previously had no
 verdict (NWXE 1,125/1,595; NW4E 1,840/2,455).
 
+## Two standing decisions (owner, 2026-08-03)
+
+**1. Valid ROM code is assumed called until proven otherwise.** For the PORT
+lane, a function that decodes as valid code should be emitted even when no
+caller is proven -- exclusion is the wrong default when the goal is a
+complete artifact. fn64 already carries the distinction: emit `Installed`
+blocks (proven-resident, not authoritatively entered) as `BlockAot` rather
+than dropping them, while the GRADE continues to claim only what is proven.
+Two questions, two answers: the firewall stays honest and the port stays
+complete. Dead code can be shaken out later, once there is enough evidence
+to decide a function really is unused.
+
+**2. M5 -- hypothesis-directed discovery (proposed).** For functions with no
+obvious caller, a semantic classifier reads the body and forms a hunch about
+where it is used ("getter for the global at 0x8005c29c", "touches the SP
+task struct", "audio-buffer memset"). The hunch is a PRIOR, never evidence.
+It may: rank which unresolved indirect sites to attack first; propose which
+dispatch table a function likely belongs to, so a mechanical tool goes and
+verifies that specific hypothesis; and target a trace run ("these six
+split-constructed functions look like menu callbacks -- drive the menu").
+
+The pipeline is strictly: classifier proposes -> mechanical or dynamic tool
+verifies -> firewall grades. A hunch that cannot be mechanically confirmed
+stays a hunch and never touches `matched_exact`. This likely outranks M4
+alone, because it makes the trace lane targeted rather than hoping gameplay
+happens to cover the right dispatches.
+
 **M2 RETIRED -- its premise was disproved by measurement (2026-08-03).**
 M2 assumed overlay functions go unrooted because authority cannot cross
 image boundaries, projecting ~3,300-3,600 recoverable functions. Built and
