@@ -1042,3 +1042,86 @@
             "subset alone must not drop a table whose stride is not a multiple"
         );
     }
+
+    /// Starting a coarse walk one record early reads neighbouring words as
+    /// fields, so a phase-shifted alias mixes genuine borrowed records with
+    /// noise and is therefore NOT a subset. Bottom of the 9th's table at
+    /// 0x48008 is this shape: two of its four records appear verbatim in the
+    /// array at 0x48038, and one is a 4-byte "overlay" over ROM 0x0..0x4.
+    #[test]
+    fn phase_shifted_alias_mixing_borrowed_and_junk_records_collapses() {
+        let dense = CandidateTable {
+            table_rom_offset: 0x1000,
+            record_stride: 0x10,
+            field_rom_start: 0x4,
+            field_rom_end: 0x8,
+            field_vram_dest: 0xc,
+            destination_field: DestinationFieldSemantics::Start,
+            // Chained: each record's end opens the next record's start.
+            records: (0..6)
+                .map(|i| CandidateRecord {
+                    rom_start: 0x2000 + i * 0x100,
+                    rom_end: 0x2000 + (i + 1) * 0x100,
+                    vram_dest: 0x8010_0000 + i * 0x100,
+                })
+                .collect(),
+        };
+        let alias = CandidateTable {
+            record_stride: 0x40,
+            records: vec![
+                dense.records[1].clone(),
+                dense.records[3].clone(),
+                CandidateRecord {
+                    rom_start: 0x9000,
+                    rom_end: 0x9100,
+                    vram_dest: 0x8090_0000,
+                },
+            ],
+            ..dense.clone()
+        };
+
+        let kept = canonicalize(vec![dense.clone(), alias]);
+
+        assert_eq!(
+            kept.len(),
+            1,
+            "a majority-borrowed reading of a chained array is that array misread"
+        );
+        assert_eq!(kept[0].record_stride, dense.record_stride);
+    }
+
+    /// The gate on the majority-borrowing rule. Two independent arrays may
+    /// share records without either being a misreading of the other, so a
+    /// coarser table must not suppress a denser one that does not chain.
+    #[test]
+    fn majority_borrowing_from_an_unchained_table_is_not_an_alias() {
+        let scattered = CandidateTable {
+            table_rom_offset: 0x1000,
+            record_stride: 0x10,
+            field_rom_start: 0x4,
+            field_rom_end: 0x8,
+            field_vram_dest: 0xc,
+            destination_field: DestinationFieldSemantics::Start,
+            // Deliberate gaps: this proposes no contiguous span.
+            records: (0..6)
+                .map(|i| CandidateRecord {
+                    rom_start: 0x2000 + i * 0x400,
+                    rom_end: 0x2000 + i * 0x400 + 0x100,
+                    vram_dest: 0x8010_0000 + i * 0x100,
+                })
+                .collect(),
+        };
+        let sharing = CandidateTable {
+            record_stride: 0x20,
+            records: vec![scattered.records[0].clone(), scattered.records[2].clone()],
+            ..scattered.clone()
+        };
+
+        let kept = canonicalize(vec![scattered, sharing]);
+
+        assert_eq!(
+            kept.len(),
+            2,
+            "without the chained shape, shared records are not evidence of misreading"
+        );
+    }

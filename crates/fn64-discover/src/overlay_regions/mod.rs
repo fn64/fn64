@@ -459,11 +459,53 @@ fn collapse_stride_aliases(tables: Vec<CandidateTable>) -> Vec<CandidateTable> {
                     && other.destination_field == table.destination_field
                     && other.record_stride < table.record_stride
                     && table.record_stride.is_multiple_of(other.record_stride)
-                    && record_sets[*index].is_subset(&record_sets[other_index])
+                    && borrows_from(&record_sets[*index], &record_sets[other_index], other)
             })
         })
         .map(|(_, table)| table.clone())
         .collect()
+}
+
+/// Whether `alias` is this table's records rather than its own findings.
+///
+/// A clean under-sampling is a strict subset. A *phase-shifted* under-sampling
+/// is not: starting a coarse walk one record early reads neighbouring words as
+/// fields, so some records are genuine (lifted verbatim from the dense array)
+/// and the rest are noise that happens to satisfy `record_valid`. Bottom of
+/// the 9th's table at 0x48008 is exactly this -- two of its four records
+/// appear verbatim in the array at 0x48038, and one of the others is a 4-byte
+/// "overlay" spanning ROM 0x0..0x4.
+///
+/// Subset containment cannot see that shape, so majority borrowing stands in
+/// for it: if most of what a coarser table proposes was already proposed by a
+/// denser one, it is that array misread, not an independent discovery.
+///
+/// Both rules are gated on the dense table chaining -- each record's `rom_end`
+/// opening the next record's `rom_start`. That is the property a phase-shifted
+/// walk breaks and that two independent arrays need not have, so without the
+/// gate this would let a coarse table suppress a real one merely for sharing
+/// records.
+fn borrows_from(
+    alias: &BTreeSet<(u32, u32, u32)>,
+    dense: &BTreeSet<(u32, u32, u32)>,
+    dense_table: &CandidateTable,
+) -> bool {
+    if !records_chain(dense_table) {
+        return false;
+    }
+    if alias.is_subset(dense) {
+        return true;
+    }
+    let borrowed = alias.iter().filter(|record| dense.contains(record)).count();
+    borrowed * 2 > alias.len()
+}
+
+/// Whether every record's end opens the next record's start -- the shape of a
+/// descriptor array that partitions one contiguous ROM span.
+fn records_chain(table: &CandidateTable) -> bool {
+    let mut intervals = table.interval_set();
+    intervals.sort_unstable();
+    intervals.len() > 1 && intervals.windows(2).all(|pair| pair[0].1 == pair[1].0)
 }
 
 /// Why a candidate table was or was not admitted, with the delta_vote outcome
