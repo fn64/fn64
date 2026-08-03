@@ -17,7 +17,7 @@ pub use lifecycle::*;
 pub use rsp_commit::*;
 pub use rsp_lineage::*;
 pub use rsp_phase::*;
-pub use setup::*;
+pub(crate) use setup::*;
 
 #[cfg(test)]
 mod tests;

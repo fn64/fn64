@@ -1,21 +1,13 @@
-use crate::raster::Framebuffer;
-use crate::{
-    depth, gbi, png_dump, raster, render_unsupported_error, s2dex, vi, GeometryWireFamily,
-    S2dexWireFamily,
-};
-use fn64_render::{
-    F3dex2UcodeCatalog, FrameStatus, MicrocodeDataImageIdentity, MicrocodePairCatalog,
-    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend,
-    RenderConfig, RenderError, S2dexUcodeCatalog, UcodeId, ViPixelType, ViPresentation,
-    ViScanoutRegisters,
-};
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
+use fn64_render::RenderBackend;
 
 use super::*;
-use super::vi_source::*;
-use super::validate::*;
-use super::framebuffer_io::*;
-use super::imp::*;
-use super::render_backend::*;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct RdramHiddenSample {

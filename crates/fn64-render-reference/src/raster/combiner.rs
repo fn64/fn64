@@ -1,5 +1,4 @@
 use crate::gbi::*;
-use crate::depth::EncodedDepth;
 use super::*;
 
 /// Evaluate both programmed RDP color-combiner cycles.

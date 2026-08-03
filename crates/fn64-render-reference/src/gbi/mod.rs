@@ -46,12 +46,14 @@
 //! any unrecognized byte are malformed-command traps. Texture, lighting, RDP
 //! other-mode, alpha compare, and the color-combiner and framebuffer-blender
 //! inputs needed by OoT are decoded.
-use fn64_render::{
-    GeometryUcodeProfile, MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration,
-    TaskAdmissionSource, UcodeId,
-};
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt::Write as _};
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
+use std::fmt::Write as _;
 
 pub use fn64_render::{F3dex2UcodeCatalog, GeometryUcodeCatalog, GeometryWireFamily, UcodeDigest};
 
@@ -74,11 +76,8 @@ mod projdump;
 
 pub use wire::*;
 pub use types::*;
-pub use matrix::*;
-pub use tmem::*;
 pub use state::*;
 pub use entries::*;
-pub use stream::*;
 pub use geometry::*;
 
 #[cfg(test)]

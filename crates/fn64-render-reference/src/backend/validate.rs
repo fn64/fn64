@@ -1,21 +1,9 @@
-use crate::raster::Framebuffer;
 use crate::{
-    depth, gbi, png_dump, raster, render_unsupported_error, s2dex, vi, GeometryWireFamily,
-    S2dexWireFamily,
+    gbi, render_unsupported_error,
 };
-use fn64_render::{
-    F3dex2UcodeCatalog, FrameStatus, MicrocodeDataImageIdentity, MicrocodePairCatalog,
-    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend,
-    RenderConfig, RenderError, S2dexUcodeCatalog, UcodeId, ViPixelType, ViPresentation,
-    ViScanoutRegisters,
-};
+use fn64_render::RenderError;
 
 use super::*;
-use super::hidden_bits::*;
-use super::vi_source::*;
-use super::framebuffer_io::*;
-use super::imp::*;
-use super::render_backend::*;
 
 pub(super) fn validate_reference_color_image(
     rdram: &[u8],

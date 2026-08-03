@@ -632,7 +632,7 @@ pub(crate) unsafe fn commit_verified_audio_effects(
     let verified_writes = apply_verified_audio_rdram_patches(&mut shadow, &rdram_patches);
     let architectural_state = machine_state.into_architectural_state();
 
-    let writes = merge_canonical_rdram_write_ranges(
+    let _writes = merge_canonical_rdram_write_ranges(
         verified_writes,
         canonical_changed_rdram_ranges(live, &shadow),
     );
@@ -730,6 +730,7 @@ pub(crate) fn record_rdp_renderer_rejection_v1() {
 }
 
 #[cfg(feature = "recomp-rs")]
+#[allow(dead_code)] // seam kept for the writer-runtime lane; test tree does not drive it yet
 pub(crate) fn track_rsp_execution_or_hle_mutation<R>(
     rdram: &mut [u8],
     operation: impl FnOnce(&mut [u8]) -> R,
@@ -749,6 +750,7 @@ pub(crate) fn record_rdp_renderer_publication_v1() {}
 pub(crate) fn record_rdp_renderer_rejection_v1() {}
 
 #[cfg(not(feature = "recomp-rs"))]
+#[allow(dead_code)] // seam kept for the writer-runtime lane; test tree does not drive it yet
 pub(crate) fn track_rsp_execution_or_hle_mutation<R>(
     rdram: &mut [u8],
     operation: impl FnOnce(&mut [u8]) -> R,

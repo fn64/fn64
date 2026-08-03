@@ -1,17 +1,6 @@
-use fn64_render::{
-    GeometryUcodeProfile, MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration,
-    TaskAdmissionSource, UcodeId,
-};
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt::Write as _};
 use super::*;
 use super::types::*;
-use super::matrix::*;
-use super::tmem::*;
 use super::state::*;
-use super::entries::*;
-use super::stream::*;
-use super::geometry::*;
 
 // --- Opcode bytes: F3DEX_GBI_2 branch of the public ultra64/gbi.h ---
 pub const G_VTX: u8 = 0x01;

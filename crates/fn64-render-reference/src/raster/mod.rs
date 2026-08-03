@@ -7,11 +7,7 @@
 
 use crate::depth::EncodedDepth;
 use crate::gbi::{
-    AlphaCompare, AlphaDither, AlphaSource, BlendAlphaInput, BlendBInput, BlendColorInput,
-    BlenderState, ColorImage, ColorImageLayout, ColorSource, CombinerCycle, CombinerState,
-    CoverageDestination, CullMode, CycleType, FillRectangle, Line, OtherMode, PrimitiveDepth,
-    RawRdpTriangle, RgbDither, ScissorRect, TextureDerivatives, TextureRectangle,
-    TextureSampleRequest, Triangle, Vertex,
+    BlenderState, ColorImageLayout, CombinerState, Line, OtherMode, PrimitiveDepth, ScissorRect, Vertex,
 };
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -207,7 +203,6 @@ mod blend;
 mod draw;
 
 use coverage::*;
-use combiner::*;
 use blend::*;
 
 /// TEMP instrumentation (env `FN64_DUMP_PROJ=1`): count z-test passes vs

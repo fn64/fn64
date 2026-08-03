@@ -1,6 +1,5 @@
 use super::*;
 
-    use super::*;
 
     #[cfg(not(feature = "rt64"))]
     #[test]

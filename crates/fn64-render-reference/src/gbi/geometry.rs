@@ -1,17 +1,20 @@
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
 use fn64_render::{
-    GeometryUcodeProfile, MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration,
-    TaskAdmissionSource, UcodeId,
+    GeometryUcodeProfile, UcodeId,
 };
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt::Write as _};
+use sha2::Digest;
+use std::fmt::Write as _;
 use super::*;
 use super::wire::*;
 use super::types::*;
 use super::matrix::*;
-use super::tmem::*;
 use super::state::*;
-use super::entries::*;
-use super::stream::*;
 
 /// Derive the per-triangle [`CullMode`] from the current F3DEX2 geometry
 /// mode's `G_CULL_FRONT`/`G_CULL_BACK` bits (`F3DEX2-CONCEPTS.md` §2.4).

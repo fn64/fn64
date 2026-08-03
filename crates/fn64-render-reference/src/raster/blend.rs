@@ -1,5 +1,4 @@
 use crate::gbi::*;
-use crate::depth::EncodedDepth;
 use super::*;
 
 pub(super) fn require_supported_alpha_compare(other_mode: OtherMode, primitive: &str) {

@@ -1,5 +1,4 @@
 use crate::gbi::*;
-use crate::depth::EncodedDepth;
 use super::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

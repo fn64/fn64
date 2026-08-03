@@ -1,9 +1,8 @@
 use fn64_render::{
-    GeometryUcodeProfile, MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration,
-    TaskAdmissionSource, UcodeId,
+    MicrocodeDataImageIdentity, TaskAdmissionGeneration,
+    TaskAdmissionSource,
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt::Write as _};
 use super::*;
 use super::wire::*;
 use super::types::*;

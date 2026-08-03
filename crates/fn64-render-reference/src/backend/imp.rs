@@ -1,21 +1,23 @@
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
 use crate::raster::Framebuffer;
 use crate::{
-    depth, gbi, png_dump, raster, render_unsupported_error, s2dex, vi, GeometryWireFamily,
+    gbi, png_dump, raster, s2dex, GeometryWireFamily,
     S2dexWireFamily,
 };
 use fn64_render::{
-    F3dex2UcodeCatalog, FrameStatus, MicrocodeDataImageIdentity, MicrocodePairCatalog,
-    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend,
-    RenderConfig, RenderError, S2dexUcodeCatalog, UcodeId, ViPixelType, ViPresentation,
-    ViScanoutRegisters,
+    F3dex2UcodeCatalog, MicrocodeDataImageIdentity, MicrocodePairCatalog, OsTask, RenderBackend, RenderError, S2dexUcodeCatalog, UcodeId, ViPresentation,
 };
 
 use super::*;
 use super::hidden_bits::*;
-use super::vi_source::*;
 use super::validate::*;
 use super::framebuffer_io::*;
-use super::render_backend::*;
 use sha2::Digest;
 
 impl ReferenceBackend {

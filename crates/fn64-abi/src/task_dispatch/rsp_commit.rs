@@ -1177,7 +1177,12 @@ pub(crate) unsafe fn dispatch_audio_task(
     // Play_Init still completes.
     // Safety: translated registration atomically pairs this callback with its
     // process-lifetime evidence identity. `o` is the admitted OSTask offset.
+    // Both muts are exercised only under the recomp-rs feature (the closure
+    // assigns tracked_hle_publication there); the default build sees them
+    // immutable and would warn.
+    #[allow(unused_mut)]
     let mut tracked_hle_publication = None;
+    #[allow(unused_mut)]
     let mut invoke = || {
         #[cfg(feature = "recomp-rs")]
         if with_host(|host| host.canonical_recompiled_program.is_some()) {

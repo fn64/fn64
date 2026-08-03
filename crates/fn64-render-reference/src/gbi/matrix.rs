@@ -1,17 +1,14 @@
-use fn64_render::{
-    GeometryUcodeProfile, MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration,
-    TaskAdmissionSource, UcodeId,
-};
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt::Write as _};
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
+use std::fmt::Write as _;
 use super::*;
 use super::wire::*;
-use super::types::*;
-use super::tmem::*;
 use super::state::*;
-use super::entries::*;
-use super::stream::*;
-use super::geometry::*;
 
 /// A 4x4 column-vector transform (row-major storage: `m[row][col]`), f32.
 /// Built from an N64 fixed-point `Mtx` (see `read_mtx`) or the identity.

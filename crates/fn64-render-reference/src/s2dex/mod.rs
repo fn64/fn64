@@ -6,7 +6,14 @@
 //! use the existing raw-RDP TMEM path; draws lower through existing rectangle/
 //! triangle paths.
 
-use crate::gbi::{CullMode, CycleType, RdpDecodeState, RenderOp, TextureFilter, Triangle, Vertex};
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
+use crate::gbi::{RdpDecodeState, RenderOp};
 use fn64_render::RenderError;
 #[cfg(test)]
 use fn64_render::UcodeId;
@@ -102,10 +109,7 @@ mod background;
 mod object_draw;
 mod object_ops;
 
-use object_mode::*;
-use common::*;
 use background::*;
-use object_ops::*;
 
 // Preserve the crate-visible entry point path `s2dex::decode_ops_for_family`.
 pub(crate) use object_draw::decode_ops_for_family;

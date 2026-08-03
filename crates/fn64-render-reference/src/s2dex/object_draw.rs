@@ -1,4 +1,11 @@
-use crate::gbi::{CullMode, CycleType, RdpDecodeState, RenderOp, TextureFilter, Triangle, Vertex};
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
+use crate::gbi::{RdpDecodeState, RenderOp};
 use fn64_render::RenderError;
 #[cfg(test)]
 use fn64_render::UcodeId;

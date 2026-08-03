@@ -1,17 +1,12 @@
-use fn64_render::{
-    GeometryUcodeProfile, MicrocodeDataImageIdentity, RenderError, TaskAdmissionGeneration,
-    TaskAdmissionSource, UcodeId,
-};
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt::Write as _};
-use super::*;
-use super::wire::*;
-use super::types::*;
-use super::matrix::*;
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
+use super::types::Texture;
 use super::state::*;
-use super::entries::*;
-use super::stream::*;
-use super::geometry::*;
 
 // --- Texture format decode (F3DEX2-CONCEPTS.md §5.1) --------------------
 //

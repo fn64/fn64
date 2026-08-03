@@ -1,13 +1,14 @@
-use crate::gbi::{CullMode, CycleType, RdpDecodeState, RenderOp, TextureFilter, Triangle, Vertex};
-use fn64_render::RenderError;
+// The split module trees feed names through use-super glob chains; rustc
+// accepts these imports at check time yet its fix pass calls them unused,
+// and removing them breaks the build (pattern-bound constants, glob-fed
+// children). Suppressed until the trees are normalized to single-source
+// imports; see the file-split PR notes.
+#![allow(unused_imports)]
+
 #[cfg(test)]
 use fn64_render::UcodeId;
 
 use super::*;
-use super::object_mode::*;
-use super::background::*;
-use super::object_draw::*;
-use super::object_ops::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct PendingSelectDl {
@@ -17,7 +18,7 @@ pub(super) struct PendingSelectDl {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct ObjectTextureCommon {
+pub(crate) struct ObjectTextureCommon {
     pub(super) image: u32,
     pub(super) sid: u16,
     pub(super) flag: u32,

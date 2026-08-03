@@ -1,21 +1,10 @@
 use crate::raster::Framebuffer;
 use crate::{
-    depth, gbi, png_dump, raster, render_unsupported_error, s2dex, vi, GeometryWireFamily,
-    S2dexWireFamily,
+    depth, gbi, raster,
 };
-use fn64_render::{
-    F3dex2UcodeCatalog, FrameStatus, MicrocodeDataImageIdentity, MicrocodePairCatalog,
-    NonRdpWrite16, NonRdpWrite16Disposition, OsTask, PresentMemory, PresentRequest, RenderBackend,
-    RenderConfig, RenderError, S2dexUcodeCatalog, UcodeId, ViPixelType, ViPresentation,
-    ViScanoutRegisters,
-};
+use fn64_render::RenderError;
 
-use super::*;
 use super::hidden_bits::*;
-use super::vi_source::*;
-use super::validate::*;
-use super::imp::*;
-use super::render_backend::*;
 
 /// Load an RGBA16 color image into the software surface before ordered work
 /// continues on that target. Depth is deliberately not reset: the RDP depth

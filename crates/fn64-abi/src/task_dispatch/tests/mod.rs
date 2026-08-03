@@ -18,7 +18,6 @@
             }
         };
     }
-    pub(crate) use no_rust_hidden_sidecar;
 
     fn install_running_task_lineage(
         task_addr: RdramAddr,
