@@ -239,3 +239,40 @@ Rayman 2) — a discovery frontier, not an emission defect. Encodings gas
 cannot express at `-mips3` are retained numerically by the gate's pre-pass:
 `jalr rd==rs`, MIPS IV FPU conditional moves (`movz/movn/movt/movf .s/.d`),
 and `bltzal`-family branches sourcing `$31`.
+
+## gate_rom_recompile — generic whole-ROM CPU recompilation
+
+The generic gate needs exactly one input and no per-game configuration:
+
+```sh
+FN64_DISCOVER_ROM=<rom.z64> \
+FN64_RECOMPILE_REPORT=<scratch>/<label>.json \
+  cargo run --release -p fn64-discover --bin gate_rom_recompile
+```
+
+It discovers banks, packs digest-bound block geometry, emits Rust, compiles
+it with a real `rustc`, runs the result, and probes arbitrary guest PCs. The
+pass criterion is the composed `HEADLINE unsupported=0`; per-bank
+`unsupported` lines can be nonzero and still compose to zero, because a
+destination unmapped in one bank may be resident in another.
+
+### WWF WrestleMania 2000 (NWXE) — 2026-08-03, exit 0
+
+First run of the GENERIC gate against any AKI title. Previously only
+`gate_wm2000_recompile` (hardcoded to this game) had certified it.
+
+```
+composed_banks=5
+HEADLINE unsupported=0 total_recompiled_exact_plus_block_aot_bytes=8188
+exact_aot=110  block_aot=1937  dynamic_mips=19  unsupported=0
+whole-ROM BlockPack v2: blocks=43032 words=223429
+unsupported_punch_list=[]
+```
+
+Note `exact_aot=110` where the recorded `gate_wm2000_recompile` scoreboard
+(2026-07-31, `docs/DISCOVER-PLAN.md`) reported 0 — discovery has improved
+since, and the generic path is not weaker than the hand-configured one.
+
+Boot bank alone reports `unsupported=3` and `recovered_overlay_2` reports 8;
+both compose away. Reading a per-bank line as the verdict is a mistake the
+HEADLINE exists to prevent.
