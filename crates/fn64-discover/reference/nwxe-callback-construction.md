@@ -49,10 +49,47 @@ named construction sites, and execution confirmed two of them. Neither
 confirmation is a proof that the site's target set is closed -- an observed
 edge is existence, never exhaustiveness -- but both are sound callable roots.
 
-**TABLED for later (4 of 6).** The unreached four are not disproved; boot
-coverage simply does not reach them. All four are constructed inside
-functions in the 0x8002bb04..0x8002ca70 neighbourhood, which suggests one
-subsystem entered by gameplay rather than boot. Revisit together: either a
-longer/menu-driven capture reaches them as a group, or their shared
-construction neighbourhood indicates a common gate worth understanding
-before capturing again.
+## Second capture: 40,000,000 records with driven input (2026-08-03)
+
+A 13x longer capture with a deterministic controller schedule (Start/A
+across the intro and menu sequence) reached 17,271 distinct PCs spanning
+0x80000180..0x8011f674 -- into the overlay banks, versus 5,282 PCs ending at
+0x800385f8 in the boot capture. The control confirms the extra depth is
+real: func_80028BA0 went from 12 entries / 4,896 body instructions to **300
+entries / 122,426**.
+
+All four tabled functions still show **entry=0, body=0**.
+
+**STILL TABLED (4 of 6), now with stronger evidence.** They are not simply
+"past the boot screens" -- a capture that reaches deep into overlay code and
+executes their neighbours 300 times does not touch them at all. Candidate
+explanations, none yet tested:
+
+- a mode this input schedule never selects (a specific match type, options
+  screen, or unlockable path);
+- a two-player or peripheral-gated path (the capture ran controller 1 only,
+  with nothing plugged into ports 2-4);
+- an error/recovery path taken only on a condition the capture never
+  produced (pak removal, save corruption, disconnect);
+- genuinely unreachable in the shipped build, with the construction sites
+  being dead stores in code that itself never runs.
+
+**Discriminator run, and it settles the shape.** Do the CONSTRUCTING
+functions themselves execute in the 40M capture?
+
+| constructor | builds | entries |
+|---|---|---|
+| `func_80000400` (ROM entry) | 0x80000460 | 1 |
+| `func_80025FE8` | 0x80028ba0 | 1 |
+| `func_80029BD0` | 0x80028ba0 | **0** |
+| `func_8002BB04` | 0x8002dfa0 | **0** |
+| `func_8002BF9C` | 0x8002ceb0 | **0** |
+| `func_8002C054` | 0x8002c290 | **0** |
+| `func_8002C1EC` | 0x8002db80 | **0** |
+| `func_8002CA70` | 0x8002c290 | **0** |
+
+Every constructor of a confirmed callback ran; every constructor of a tabled
+one did not. The callbacks are therefore NOT installed-but-uninvoked -- the
+whole `0x8002bb04..0x8002ca70` neighbourhood is gated upstream and never
+entered. That is one question ("what enables this subsystem?"), not four,
+and it is the right thing to answer before capturing again.
