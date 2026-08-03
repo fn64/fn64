@@ -220,8 +220,94 @@ static int pc_in_resident(uint32_t pc) {
     return pc >= RESIDENT_VA_START && pc < RESIDENT_VA_END;
 }
 
+/* Optional overlay attribution windows, supplied out-of-band by
+ * FN64_OVERLAY_WINDOWS as lines of "<bank> <va_start> <va_end>" (hex or
+ * decimal). Without the file, behaviour is exactly as before: only the
+ * resident window is named and every other PC stays bank-unknown.
+ *
+ * WHY A FILE AND NOT A BUILT-IN TABLE: the windows come from fn64-discover's
+ * proven RomMapping facts for the ROM under trace. Hardcoding them here would
+ * put a per-game claim in the producer, which is the thing this boundary
+ * exists to avoid -- and the producer cannot verify them anyway.
+ *
+ * ALIASING IS FAIL-CLOSED: overlay images share load slots (WM2000 puts two
+ * images at 0x800e1b90 and two more at 0x8011c900). A PC inside a slot claimed
+ * by more than one window cannot be attributed by VA alone -- knowing WHICH
+ * image is resident needs the active load generation, which this producer does
+ * not observe. Such windows are rejected at load time and their PCs stay
+ * unknown, exactly as today. Only a slot claimed by exactly one image is
+ * named. */
+#define MAX_OVERLAY_WINDOWS 32
+static struct {
+    char bank[64];
+    uint32_t va_start;
+    uint32_t va_end;
+} g_overlay_windows[MAX_OVERLAY_WINDOWS];
+static unsigned g_overlay_window_count;
+
+static void load_overlay_windows(void) {
+    const char *path = getenv("FN64_OVERLAY_WINDOWS");
+    if (!path) return;
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "cannot open FN64_OVERLAY_WINDOWS %s\n", path);
+        exit(2);
+    }
+    char line[256];
+    unsigned parsed = 0;
+    while (fgets(line, sizeof line, file) && parsed < MAX_OVERLAY_WINDOWS) {
+        char bank[64];
+        unsigned long long start = 0, end = 0;
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%63s %llx %llx", bank, &start, &end) != 3) continue;
+        if (start >= end || start > 0xffffffffull || end > 0xffffffffull) continue;
+        snprintf(g_overlay_windows[parsed].bank, sizeof g_overlay_windows[parsed].bank,
+                 "%s", bank);
+        g_overlay_windows[parsed].va_start = (uint32_t)start;
+        g_overlay_windows[parsed].va_end = (uint32_t)end;
+        parsed++;
+    }
+    fclose(file);
+    /* Drop every window whose slot another window also claims. */
+    unsigned kept = 0;
+    for (unsigned i = 0; i < parsed; i++) {
+        int aliased = 0;
+        for (unsigned j = 0; j < parsed; j++) {
+            if (i == j) continue;
+            if (g_overlay_windows[i].va_start < g_overlay_windows[j].va_end &&
+                g_overlay_windows[j].va_start < g_overlay_windows[i].va_end) {
+                aliased = 1;
+                break;
+            }
+        }
+        if (aliased) {
+            fprintf(stderr, "overlay window %s rejected: slot shared with another image\n",
+                    g_overlay_windows[i].bank);
+            continue;
+        }
+        g_overlay_windows[kept++] = g_overlay_windows[i];
+    }
+    g_overlay_window_count = kept;
+    fprintf(stderr, "overlay attribution windows admitted: %u of %u\n", kept, parsed);
+}
+
+static const char *overlay_bank_for_pc(uint32_t pc) {
+    for (unsigned i = 0; i < g_overlay_window_count; i++) {
+        if (pc >= g_overlay_windows[i].va_start && pc < g_overlay_windows[i].va_end) {
+            return g_overlay_windows[i].bank;
+        }
+    }
+    return NULL;
+}
+
 static void emit_executed_pc(FILE *out, uint64_t seq, uint32_t pc) {
-    if (pc_in_resident(pc)) {
+    const char *overlay = overlay_bank_for_pc(pc);
+    if (overlay) {
+        fprintf(out,
+                "{\"event\":\"executed_pc\",\"sequence\":%llu,\"pc\":{\"address\":%u,"
+                "\"bank\":{\"status\":\"known\",\"bank\":\"%s\",\"activation\":0}}}\n",
+                (unsigned long long)seq, pc, overlay);
+    } else if (pc_in_resident(pc)) {
         fprintf(out,
                 "{\"event\":\"executed_pc\",\"sequence\":%llu,\"pc\":{\"address\":%u,"
                 "\"bank\":{\"status\":\"known\",\"bank\":\"boot\",\"activation\":0}}}\n",
@@ -437,6 +523,7 @@ int main(int argc, char **argv) {
                 argv[0]);
         return 2;
     }
+    load_overlay_windows();
     const char *core_path = argv[1];
     const char *rom_path = argv[2];
     const char *rsp_path = argv[3];
