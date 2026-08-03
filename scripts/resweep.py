@@ -55,7 +55,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output")
     parser.add_argument("--bin", default=DEFAULT_BIN)
-    parser.add_argument("--rom-dir", default="/Users/jer/Code/roms/n64")
+    # Per-machine; no personal default belongs in committed code.
+    parser.add_argument(
+        "--rom-dir", default=os.environ.get("FN64_ROM_CORPUS_DIR"),
+        help="ROM corpus directory (or set FN64_ROM_CORPUS_DIR)",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=40)
     # WWF No Mercy exceeded the original hardcoded 900s under a loaded
@@ -66,6 +70,8 @@ def main():
         parser.error("--workers must be at least 1")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if not args.rom_dir:
+        parser.error("--rom-dir required (or set FN64_ROM_CORPUS_DIR)")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if not os.path.isfile(args.bin):
