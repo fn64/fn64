@@ -412,10 +412,58 @@ fn canonicalize(mut raw: Vec<CandidateTable>) -> Vec<CandidateTable> {
             out.push(table);
         }
     }
+    let out = collapse_stride_aliases(out);
     // Final order: by first proposed interval, so the report is stable and
     // independent of which phase won the alias race.
+    let mut out = out;
     out.sort_by_key(|table| table.interval_set());
     out
+}
+
+/// Drop tables that re-read a denser table at a multiple of its stride.
+///
+/// One contiguous descriptor array is legible at every multiple of its true
+/// stride: a 0x10-stride array read at 0x20, 0x30, or 0x40 samples every
+/// second, third, or fourth record and yields a table whose records are all
+/// genuine. Those aliases are not competing hypotheses about the ROM -- they
+/// are one array under-sampled, and each proposes a strict subset of the
+/// denser table's records.
+///
+/// [`canonicalize`] cannot see them, because it collapses only exact geometry
+/// matches and a subset is not a match. Left standing they inflate the
+/// admitted-table count, and `admitted_overlay_load_recipes_v1` then refuses
+/// the ROM for having no unique table -- Bottom of the 9th admits four tables
+/// at strides 0x10/0x20/0x30/0x40 that are all the one array at 0x48038.
+///
+/// Subset alone is not enough to drop a table: two genuinely different arrays
+/// can nest when a game loads a subset of its overlays through a second,
+/// smaller table. The stride-multiple requirement is what distinguishes an
+/// under-sampling of one array from a real second array.
+fn collapse_stride_aliases(tables: Vec<CandidateTable>) -> Vec<CandidateTable> {
+    let record_sets: Vec<BTreeSet<(u32, u32, u32)>> = tables
+        .iter()
+        .map(|table| {
+            table
+                .records
+                .iter()
+                .map(|record| (record.rom_start, record.rom_end, record.vram_dest))
+                .collect()
+        })
+        .collect();
+    tables
+        .iter()
+        .enumerate()
+        .filter(|(index, table)| {
+            !tables.iter().enumerate().any(|(other_index, other)| {
+                other_index != *index
+                    && other.destination_field == table.destination_field
+                    && other.record_stride < table.record_stride
+                    && table.record_stride.is_multiple_of(other.record_stride)
+                    && record_sets[*index].is_subset(&record_sets[other_index])
+            })
+        })
+        .map(|(_, table)| table.clone())
+        .collect()
 }
 
 /// Why a candidate table was or was not admitted, with the delta_vote outcome
