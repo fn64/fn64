@@ -1422,6 +1422,7 @@ fn main() {
     // in-bank flat jal sweep, whose targets are same-image by construction);
     // cross-bank authority into an aliased slot is M2's problem and is
     // deliberately absent here.
+    let mut overlay_dynamic_roots = 0usize;
     if !slot_catalog.is_empty() {
         // M2: inductive entry authority across composed banks.
         //
@@ -1565,6 +1566,48 @@ fn main() {
                     }
                 }
             }
+            // Dynamic entry roots for THIS bank, on the same two-part rule the
+            // boot grade applies: execution proves the word runs as code, the
+            // structural entry test proves a function begins there. Bank-keyed
+            // like everything else here, so an observation attributed to one
+            // image never roots its slot-sharing sibling -- which is exactly
+            // why aliasing does not need a special case in this lane.
+            {
+                let bank_words: Vec<u32> = image
+                    .bytes
+                    .chunks_exact(4)
+                    .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect();
+                let mut observed: Vec<u32> = db
+                    .facts()
+                    .iter()
+                    .filter_map(|fact| match fact {
+                        Fact::ObservedExecutedCode { site, .. } if site.bank == image.bank => {
+                            Some(site.pc)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                observed.sort_unstable();
+                observed.dedup();
+                for pc in observed {
+                    if pc < bank_va || pc >= bank_code_end || bank_roots.contains(&pc) {
+                        continue;
+                    }
+                    let Some(offset) = pc.checked_sub(bank_va).map(|d| (d / 4) as usize) else {
+                        continue;
+                    };
+                    if offset >= bank_words.len() {
+                        continue;
+                    }
+                    if !fn64_discover::sig_scan::plausible_function_boundary(&bank_words, offset) {
+                        continue;
+                    }
+                    bank_roots.push(pc);
+                    bank_excused.push(pc);
+                    overlay_dynamic_roots += 1;
+                }
+            }
             if bank_roots.is_empty() {
                 skipped_no_answer += 1;
                 continue;
@@ -1621,6 +1664,10 @@ fn main() {
                 }
             }
         }
+if overlay_dynamic_roots != 0 {
+            println!("overlay observed-execution entry roots added={overlay_dynamic_roots}");
+        }
+        
         println!(
             "recovered-overlay grade: banks={graded} (skipped without answers={skipped_no_answer}) \
              total={} matched_exact={} coarse+interior={} open={} wrong={}",
