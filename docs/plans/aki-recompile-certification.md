@@ -197,3 +197,31 @@ From their stub lists. Categories 1, 2 and 6 are opcode-detectable; category
 5. Hand-written assembly whose boundaries the disassembler mis-segments.
 6. IDO soft-float helpers using MIPS III FPU instructions.
 7. RSP microcode — outside CPU recompilation entirely.
+
+## Secondary goal: corpus-wide certification (2026-08-03, first measurement)
+
+`gate_rom_recompile` is ROM-agnostic, so the AKI result raises an obvious
+question nobody had measured: how much of the 287-ROM corpus certifies?
+
+First sample, six ROMs in corpus order, cold, no configuration:
+
+| ROM | result |
+|---|---|
+| 007 GoldenEye (Europe) | **PASS** `unsupported=0` |
+| 007 The World Is Not Enough | **PASS** `unsupported=0` |
+| 1080 TenEighty Snowboarding | **PASS** `unsupported=0` |
+| AeroGauge (USA) | **PASS** `unsupported=0` |
+| Air Boarder 64 (Europe) | FAIL `SourceFieldsChanged { record: 0 }` |
+| All Star Tennis 99 (USA) | **PASS** `unsupported=0` |
+
+**Five of six certify cold, including GoldenEye** — a title with a well-known
+reputation for resisting static analysis. The machinery generalizes past the
+AKI family without per-game work.
+
+Context for the denominator: 41 of 287 corpus ROMs recover overlay geometry;
+the other 246 are mostly single-bank and were never expected to need it. So
+"has overlay geometry" is not a prerequisite for certification, and the
+addressable set is much larger than the overlay count suggests.
+
+The one failure is a specific, nameable blocker in overlay-recipe recovery
+(`SourceFieldsChanged`), not a general limitation. A wider batch is running.
