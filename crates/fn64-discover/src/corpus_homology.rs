@@ -194,11 +194,29 @@ fn body_hash(words: &[u32]) -> u64 {
     hash.wrapping_mul(0x0000_0100_0000_01b3)
 }
 
-/// A disjoint-set forest over corpus nodes, carrying the two component
-/// invariants (the ROMs present, the shared body hash) at each root so a merge
-/// can detect a conflict before it happens. A component that ever conflicts is
-/// *poisoned* — it and everything later merged into it become ambiguous, and it
-/// can never contribute an identity.
+/// A disjoint-set forest over corpus nodes: PURE connectivity only. Whether a
+/// final component is poisoned (violates per-ROM uniqueness or body
+/// corroboration) is decided once, after every edge is unioned in, by
+/// [`poison_components`] reading each root's FINAL member set — never
+/// incrementally during a union.
+///
+/// This matters for more than style: incremental per-union poison bookkeeping
+/// (an earlier version of this forest carried `roms`/`hash`/`poisoned` at
+/// each root and updated them on every union) is UNION-ORDER-SENSITIVE. Two
+/// applications of the exact same final edge set, unioned in different
+/// orders, could poison different components — because "does the OTHER
+/// side's current root already contain this ROM" depends on what has merged
+/// so far, not on final membership. [`build_corpus`] always resorts and
+/// reunions the FULL edge set in one canonical order, so it never observed
+/// this; [`extend_corpus`] folds a new ROM's edges in as a LATER, separate
+/// batch on top of an already-closed forest, which is a different union order
+/// and provably diverged (a component that ends up not poisoned when built
+/// in one shot could be reported ambiguous, or vice versa, when extended
+/// incrementally). Deciding poison purely from final membership — an
+/// order-independent property of connectivity, which IS order-independent —
+/// removes the dependency on union order entirely, so [`build_corpus`] and
+/// [`extend_corpus`] agree by construction, not by coincidence of a shared
+/// canonical order.
 ///
 /// Serializable so a [`CorpusIndex`] can persist the closure exactly as
 /// computed: [`extend_corpus`] appends new nodes and unions in only the new
@@ -207,28 +225,14 @@ fn body_hash(words: &[u32]) -> u64 {
 struct Forest {
     parent: Vec<usize>,
     rank: Vec<u8>,
-    /// Per root: the set of ROM indices its members come from. Used to enforce
-    /// per-ROM uniqueness (a ROM appearing twice is a conflict).
-    roms: Vec<BTreeSet<usize>>,
-    /// Per root: the masked body hash shared by its members, or `None` once the
-    /// component is poisoned (no single hash holds).
-    hash: Vec<Option<u64>>,
-    /// Per root: whether a conflict has poisoned this component.
-    poisoned: Vec<bool>,
-    /// Per root: why it was poisoned (first conflict recorded).
-    reason: Vec<Option<AmbiguityReason>>,
 }
 
 impl Forest {
-    fn new(node_rom: &[usize], node_hash: &[u64]) -> Self {
+    fn new(node_rom: &[usize], _node_hash: &[u64]) -> Self {
         let n = node_rom.len();
         Self {
             parent: (0..n).collect(),
             rank: vec![0; n],
-            roms: node_rom.iter().map(|&r| BTreeSet::from([r])).collect(),
-            hash: node_hash.iter().copied().map(Some).collect(),
-            poisoned: vec![false; n],
-            reason: vec![None; n],
         }
     }
 
@@ -236,20 +240,16 @@ impl Forest {
         self.parent.len()
     }
 
-    /// Append `n` new singleton nodes (their own root, unpoisoned, carrying
-    /// their own ROM index and body hash). Used by [`extend_corpus`] to grow
-    /// an existing forest with a new ROM's nodes before unioning its edges in.
-    fn extend(&mut self, node_rom: &[usize], node_hash: &[u64]) {
+    /// Append `n` new singleton nodes (their own root). Used by
+    /// [`extend_corpus`] to grow an existing forest with a new ROM's nodes
+    /// before unioning its edges in.
+    fn extend(&mut self, node_rom: &[usize], _node_hash: &[u64]) {
         let base = self.len();
-        for (offset, (&rom, &hash)) in node_rom.iter().zip(node_hash).enumerate() {
+        for offset in 0..node_rom.len() {
             let id = base + offset;
             debug_assert_eq!(id, self.parent.len());
             self.parent.push(id);
             self.rank.push(0);
-            self.roms.push(BTreeSet::from([rom]));
-            self.hash.push(Some(hash));
-            self.poisoned.push(false);
-            self.reason.push(None);
         }
     }
 
@@ -261,35 +261,14 @@ impl Forest {
         x
     }
 
-    /// Union the components of `a` and `b`. If the merge would violate per-ROM
-    /// uniqueness or body corroboration, the merged component is poisoned
-    /// (collapsed to ambiguous) rather than silently repaired. Poison is
-    /// contagious: merging anything into a poisoned component poisons the
-    /// result, so one bad edge cannot leave a "clean" identity behind it.
+    /// Union the components of `a` and `b` by pure connectivity (union by
+    /// rank). Carries no conflict bookkeeping — see the type doc for why that
+    /// must be decided later, from final membership, not incrementally here.
     fn union(&mut self, a: usize, b: usize) {
         let (ra, rb) = (self.find(a), self.find(b));
         if ra == rb {
             return;
         }
-
-        let already_poisoned = self.poisoned[ra] || self.poisoned[rb];
-        let first_reason = self.reason[ra].or(self.reason[rb]);
-
-        // Per-ROM uniqueness: the two components must not both contain the same
-        // ROM (that would put two distinct functions of one ROM together — the
-        // endpoints of this edge are distinct nodes, so a shared ROM is always
-        // two different functions).
-        let rom_conflict = self.roms[ra].intersection(&self.roms[rb]).next().is_some();
-
-        // Body corroboration: both live components must agree on their masked
-        // body hash. A poisoned component has no single hash, so it is treated
-        // as already inconsistent (poison propagates regardless).
-        let body_conflict = match (self.hash[ra], self.hash[rb]) {
-            (Some(ha), Some(hb)) => ha != hb,
-            _ => false,
-        };
-
-        // Choose the new root by rank (union by rank keeps find near-flat).
         let (root, other) = if self.rank[ra] < self.rank[rb] {
             (rb, ra)
         } else if self.rank[ra] > self.rank[rb] {
@@ -299,36 +278,47 @@ impl Forest {
             (ra, rb)
         };
         self.parent[other] = root;
-
-        // Merge the ROM sets and the shared hash into the surviving root.
-        let merged_roms: BTreeSet<usize> = self.roms[ra].union(&self.roms[rb]).copied().collect();
-        self.roms[root] = merged_roms;
-        self.roms[other] = BTreeSet::new();
-
-        let poisoned = already_poisoned || rom_conflict || body_conflict;
-        self.poisoned[root] = poisoned;
-        self.reason[root] = if poisoned {
-            first_reason.or(if rom_conflict {
-                Some(AmbiguityReason::DuplicateRomInComponent)
-            } else if body_conflict {
-                Some(AmbiguityReason::BodyMismatch)
-            } else {
-                // Poison inherited from an already-poisoned side that somehow
-                // lost its reason — default to the ROM-duplicate cascade, the
-                // dominant corpus failure mode.
-                Some(AmbiguityReason::DuplicateRomInComponent)
-            })
-        } else {
-            None
-        };
-        // A poisoned component has no single shared hash; a clean one keeps the
-        // hash both sides agreed on.
-        self.hash[root] = if poisoned {
-            None
-        } else {
-            self.hash[ra].or(self.hash[rb])
-        };
     }
+}
+
+/// Per final root: whether the component is poisoned (a ROM appears more
+/// than once among its members, or its members' masked body hashes disagree)
+/// and, if so, why. This is the ONLY place poison is decided — a pure
+/// function of final connectivity, so it agrees regardless of the union order
+/// that produced that connectivity (see [`Forest`]'s doc).
+fn poison_components(
+    forest: &mut Forest,
+    node_rom: &[usize],
+    node_hash: &[u64],
+) -> BTreeMap<usize, (bool, Option<AmbiguityReason>)> {
+    let mut by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for id in 0..node_rom.len() {
+        let root = forest.find(id);
+        by_root.entry(root).or_default().push(id);
+    }
+    let mut verdict = BTreeMap::new();
+    for (root, members) in by_root {
+        let mut roms = BTreeSet::new();
+        let mut rom_conflict = false;
+        for &id in &members {
+            if !roms.insert(node_rom[id]) {
+                rom_conflict = true;
+            }
+        }
+        let body_conflict = members
+            .iter()
+            .any(|&id| node_hash[id] != node_hash[members[0]]);
+        let poisoned = rom_conflict || body_conflict;
+        let reason = if rom_conflict {
+            Some(AmbiguityReason::DuplicateRomInComponent)
+        } else if body_conflict {
+            Some(AmbiguityReason::BodyMismatch)
+        } else {
+            None
+        };
+        verdict.insert(root, (poisoned, reason));
+    }
+    verdict
 }
 
 /// The node table [`build_corpus`] and [`CorpusIndex`] both need: a flat
@@ -392,6 +382,7 @@ fn reject_duplicate_labels(roms: &[CorpusRom]) -> Result<(), CorpusError> {
 fn finalize_report(
     forest: &mut Forest,
     node_rom: &[usize],
+    node_hash: &[u64],
     rom_base: &[usize],
     roms: &[CorpusRom],
     pairwise_edges: usize,
@@ -401,6 +392,7 @@ fn finalize_report(
         let root = forest.find(id);
         by_root.entry(root).or_default().push(id);
     }
+    let verdict = poison_components(forest, node_rom, node_hash);
 
     let member = |id: usize| -> IdentityMember {
         let rom = node_rom[id];
@@ -424,16 +416,18 @@ fn finalize_report(
         }
         let mut members: Vec<IdentityMember> = nodes.iter().map(|&id| member(id)).collect();
         members.sort_unstable();
-        if forest.poisoned[root] {
+        let &(poisoned, reason) = verdict
+            .get(&root)
+            .expect("every root with >1 member has a verdict");
+        if poisoned {
             ambiguous.push(AmbiguousComponent {
                 members,
-                reason: forest.reason[root].unwrap_or(AmbiguityReason::DuplicateRomInComponent),
+                reason: reason.unwrap_or(AmbiguityReason::DuplicateRomInComponent),
             });
         } else {
-            let hash = forest.hash[root].expect("a clean component keeps its shared hash");
             identities.push(CorpusIdentity {
                 members,
-                body_hash: hash,
+                body_hash: node_hash[nodes[0]],
             });
         }
     }
@@ -461,10 +455,10 @@ fn finalize_report(
 
 /// Every unordered pair among `0..rom_count`, matched by the existing
 /// pairwise engine, projected back to node ids via `table`. The resulting
-/// edges are the only cross-ROM evidence the closure consumes. Deterministic
-/// edge order (the union outcome is order-independent for the sets/hashes it
-/// tracks, but a fixed order keeps the whole run reproducible and debugging
-/// legible).
+/// edges are the only cross-ROM evidence the closure consumes. Sorted for a
+/// deterministic union order — connectivity (and, via [`poison_components`],
+/// the poison verdict) does not depend on this order, but a fixed one keeps
+/// runs reproducible and debugging legible.
 fn all_pairs_edges(table: &NodeTable, rom_count: usize, config: CorpusConfig) -> Vec<(usize, usize)> {
     let node = |rom: usize, function: usize| table.rom_base[rom] + function;
     let mut edges: Vec<(usize, usize)> = Vec::new();
@@ -516,6 +510,7 @@ pub fn build_corpus(roms: &[CorpusRom], config: CorpusConfig) -> Result<CorpusRe
     Ok(finalize_report(
         &mut forest,
         &table.node_rom,
+        &table.node_hash,
         &table.rom_base,
         roms,
         edges.len(),
@@ -653,10 +648,18 @@ impl CorpusIndex {
     pub fn report(&self) -> CorpusReport {
         let roms = self.corpus_roms();
         let node_rom = self.node_rom();
+        let node_hash = self.node_hash();
         let rom_base = self.rom_base();
         let pairwise_edges = self.pairwise_edges;
         let mut forest = self.forest.clone();
-        finalize_report(&mut forest, &node_rom, &rom_base, &roms, pairwise_edges)
+        finalize_report(
+            &mut forest,
+            &node_rom,
+            &node_hash,
+            &rom_base,
+            &roms,
+            pairwise_edges,
+        )
     }
 
     fn corpus_roms(&self) -> Vec<CorpusRom> {
@@ -675,6 +678,14 @@ impl CorpusIndex {
             node_rom.extend(std::iter::repeat_n(rom_index, rom.functions.len()));
         }
         node_rom
+    }
+
+    fn node_hash(&self) -> Vec<u64> {
+        let mut node_hash = Vec::with_capacity(self.forest.len());
+        for rom in &self.roms {
+            node_hash.extend(rom.functions.iter().map(|f| body_hash(&f.words)));
+        }
+        node_hash
     }
 
     fn rom_base(&self) -> Vec<usize> {
@@ -1015,24 +1026,21 @@ mod tests {
         // isolation. node 0 = romA, nodes 1,2 = romB (two funcs), node 3 = romC.
         // Edges: A-b0, A... no, A is one rom. Edges A<->b0, C<->b1, then b0<->b1
         // would merge A,b0,b1,C -> ROM B appears via b0 AND b1 -> conflict.
-        let mut forest = Forest::new(
-            &[0, 1, 1, 2], // roms: A, B, B, C
-            &[7, 7, 7, 7], // all same masked body hash
-        );
+        let node_rom = [0, 1, 1, 2]; // roms: A, B, B, C
+        let node_hash = [7, 7, 7, 7]; // all same masked body hash
+        let mut forest = Forest::new(&node_rom, &node_hash);
         forest.union(0, 1); // A - b0
         forest.union(3, 2); // C - b1
                             // Both components are clean so far.
         let (r0, r3) = (forest.find(0), forest.find(3));
-        assert!(!forest.poisoned[r0]);
-        assert!(!forest.poisoned[r3]);
+        assert_ne!(r0, r3, "not yet merged into one component");
         forest.union(1, 2); // b0 - b1: pulls both B funcs together -> conflict
         let root = forest.find(0);
         assert_eq!(forest.find(3), root, "all four are now one component");
-        assert!(forest.poisoned[root], "doubled ROM poisons the component");
-        assert_eq!(
-            forest.reason[root],
-            Some(AmbiguityReason::DuplicateRomInComponent)
-        );
+        let verdict = poison_components(&mut forest, &node_rom, &node_hash);
+        let &(poisoned, reason) = verdict.get(&root).unwrap();
+        assert!(poisoned, "doubled ROM poisons the component");
+        assert_eq!(reason, Some(AmbiguityReason::DuplicateRomInComponent));
     }
 
     #[test]
@@ -1041,11 +1049,15 @@ mod tests {
         // unioned into a clean identity. (A pairwise edge never produces this —
         // its endpoints agree by construction — but the guard is explicit so a
         // future edge source cannot smuggle in an incompatible merge.)
-        let mut forest = Forest::new(&[0, 1], &[7, 9]);
+        let node_rom = [0, 1];
+        let node_hash = [7, 9];
+        let mut forest = Forest::new(&node_rom, &node_hash);
         forest.union(0, 1);
         let root = forest.find(0);
-        assert!(forest.poisoned[root]);
-        assert_eq!(forest.reason[root], Some(AmbiguityReason::BodyMismatch));
+        let verdict = poison_components(&mut forest, &node_rom, &node_hash);
+        let &(poisoned, reason) = verdict.get(&root).unwrap();
+        assert!(poisoned);
+        assert_eq!(reason, Some(AmbiguityReason::BodyMismatch));
     }
 
     #[test]
@@ -1056,16 +1068,21 @@ mod tests {
         // body-mismatched union (the only way an edge can be "wrong" past the
         // pairwise body-corroboration): one poisoned component does not poison
         // an unrelated clean one.
-        let mut forest = Forest::new(&[0, 1, 2, 3], &[7, 9, 5, 5]);
+        let node_rom = [0, 1, 2, 3];
+        let node_hash = [7, 9, 5, 5];
+        let mut forest = Forest::new(&node_rom, &node_hash);
         forest.union(0, 1); // wrong edge: bodies differ -> poisoned
         forest.union(2, 3); // unrelated clean edge: bodies agree
         let (r0, r2) = (forest.find(0), forest.find(2));
-        assert!(forest.poisoned[r0]);
+        let verdict = poison_components(&mut forest, &node_rom, &node_hash);
+        let &(poisoned0, _) = verdict.get(&r0).unwrap();
+        let &(poisoned2, _) = verdict.get(&r2).unwrap();
+        assert!(poisoned0);
         assert!(
-            !forest.poisoned[r2],
+            !poisoned2,
             "an unrelated clean identity is untouched by the poisoned one"
         );
-        assert_eq!(forest.hash[r2], Some(5));
+        assert_eq!(node_hash[r2], 5);
     }
 
     #[test]
@@ -1212,6 +1229,65 @@ mod tests {
         assert_eq!(incremental_report.identities, from_scratch.identities);
         assert_eq!(incremental_report.ambiguous, from_scratch.ambiguous);
         assert_eq!(incremental_report.max_span, from_scratch.max_span);
+    }
+
+    #[test]
+    fn extend_corpus_agrees_with_build_corpus_when_a_late_rom_creates_a_conflict() {
+        // Regression for a real divergence found against actual AKI ROMs
+        // (NWXE/Revenge/WorldTour): a component that is clean when every edge
+        // is unioned in ONE canonical global order (build_corpus always does
+        // this) could come out poisoned — or vice versa — when the SAME final
+        // edge set is unioned in separate batches (extend_corpus's "existing
+        // edges already applied, then new-ROM edges applied later" shape).
+        // Poison must be decided from FINAL component membership, not from
+        // union order; this test constructs the minimal shape that exposes an
+        // order-dependent implementation: ROM C's arrival creates a genuine
+        // per-ROM-uniqueness conflict inside a component that was clean
+        // before C joined, and the incremental and from-scratch paths must
+        // agree on exactly which components end up poisoned.
+        let body = unique_leaf(0x99);
+        // A and B share ONE clean identity (unique on both sides).
+        let a = new_rom("A", "sha-A", vec![func("shared", 0x8000_1000, body.clone())]);
+        let b = new_rom(
+            "B",
+            "sha-B",
+            vec![
+                func("shared", 0x8020_1000, body.clone()),
+                // B ALSO carries a second, masked-identical twin — so once C's
+                // matching pairwise edges land, C can pull BOTH B functions
+                // into the same component as A, doubling ROM B in it.
+                func("twin", 0x8020_2000, body.clone()),
+            ],
+        );
+        let c = new_rom(
+            "C",
+            "sha-C",
+            vec![
+                func("shared", 0x8040_1000, body.clone()),
+                func("twin", 0x8040_2000, body),
+            ],
+        );
+
+        let to_corpus_rom = |r: &NewCorpusRom| CorpusRom {
+            label: r.label.clone(),
+            functions: r.functions.clone(),
+        };
+        let all: Vec<NewCorpusRom> = vec![a.clone(), b.clone(), c.clone()];
+        let all_corpus_roms: Vec<CorpusRom> = all.iter().map(to_corpus_rom).collect();
+        let from_scratch = build_corpus(&all_corpus_roms, CorpusConfig::default()).unwrap();
+
+        let index = CorpusIndex::build(&[a, b], CorpusConfig::default()).unwrap();
+        let index = extend_corpus(index, c, CorpusConfig::default()).unwrap();
+        let incremental = index.report();
+
+        assert_eq!(
+            incremental.identities, from_scratch.identities,
+            "extend_corpus must agree with build_corpus on which components are clean"
+        );
+        assert_eq!(
+            incremental.ambiguous, from_scratch.ambiguous,
+            "extend_corpus must agree with build_corpus on which components are ambiguous"
+        );
     }
 
     #[test]
