@@ -18,11 +18,11 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BIN = os.path.join(REPO, "target", "release", "diagnose_open_indirects")
 
-def one(binary, path):
+def one(binary, path, timeout):
     name = os.path.basename(path)
     try:
         r = subprocess.run(
-            [binary, path], capture_output=True, text=True, timeout=900
+            [binary, path], capture_output=True, text=True, timeout=timeout
         )
     except subprocess.TimeoutExpired:
         return {"rom": name, "error": "timeout"}
@@ -58,11 +58,16 @@ def main():
     parser.add_argument("--rom-dir", default="/Users/jer/Code/roms/n64")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=40)
+    # WWF No Mercy exceeded the original hardcoded 900s under a loaded
+    # 4-worker sweep; the cap must be raisable without editing the script.
+    parser.add_argument("--timeout", type=float, default=900)
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
     if not os.path.isfile(args.bin):
         parser.error(f"diagnostic binary not found: {args.bin}")
     out_path = args.output
@@ -74,7 +79,7 @@ def main():
     # Checkpoint every batch: the unbatched form died twice today writing nothing.
     for i in range(0, len(files), args.batch_size):
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-            for r in pool.map(lambda path: one(args.bin, path), files[i:i + args.batch_size]):
+            for r in pool.map(lambda path: one(args.bin, path, args.timeout), files[i:i + args.batch_size]):
                 res.append(r)
         temporary = f"{out_path}.tmp"
         with open(temporary, "w") as output:
