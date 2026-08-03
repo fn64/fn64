@@ -46,7 +46,7 @@ use crate::execution::{
     BlockExit, BlockProgram, BlockRun, BlockRunner, CodeBank, ExecutionKey, GeneratedBankRunner,
     InstructionBudget, ProgramError,
 };
-use crate::interp::{run_bank_with_mmio, MmioPort, NoMmio};
+use crate::interp::{run_bank_with_memory_port, MemoryPort, MmioPort, NoMmio};
 use crate::runtime::{Rdram, RecompContext};
 
 pub use crate::execution::BankId;
@@ -62,7 +62,7 @@ pub enum EvidenceClass {
     /// but named here so the taxonomy is complete and honest.
     ExactAot,
     /// A generated bank/basic-block runner emitted by
-    /// [`emit_bank_runner`](crate::emit::emit_bank_runner).
+    /// the build-side bank emitter.
     BlockAot,
     /// The interpreter fallback: admitted code with no generated runner, run by
     /// the [`crate::interp`] MIPS-III interpreter behind the same contract.
@@ -209,6 +209,19 @@ impl FallbackProgram {
         mem: &mut Rdram<'_>,
         port: &mut dyn MmioPort,
     ) -> BlockRun {
+        self.run_with_memory_port(entry, budget, ctx, mem, &mut MemoryPort::mmio_only(port))
+    }
+
+    /// [`FallbackProgram::run`] with distinct MMIO and cartridge-memory
+    /// authorities installed for the `dynamic_mips` interpreter lane.
+    pub fn run_with_memory_port(
+        &self,
+        entry: ExecutionKey,
+        budget: InstructionBudget,
+        ctx: &mut RecompContext,
+        mem: &mut Rdram<'_>,
+        port: &mut MemoryPort<'_>,
+    ) -> BlockRun {
         if let Err(fault) = self.code.resolve(entry) {
             return BlockRun::new(BlockExit::Fault(fault), 0);
         }
@@ -221,7 +234,9 @@ impl FallbackProgram {
         match lane {
             Lane::Aot(program) => program.run(entry, budget, ctx, mem),
             Lane::DynamicMips => {
-                match run_bank_with_mmio(&self.code, entry.bank, entry, budget, ctx, mem, port) {
+                match run_bank_with_memory_port(
+                    &self.code, entry.bank, entry, budget, ctx, mem, port,
+                ) {
                     Ok(run) => run,
                     // The interpreter's coverage boundary is surfaced as the typed
                     // guest fault the dispatcher already understands, so an AOT and
@@ -246,6 +261,7 @@ impl FallbackProgram {
             ctx,
             mem,
             port: None,
+            memory_port: None,
         }
     }
 
@@ -266,14 +282,33 @@ impl FallbackProgram {
             ctx,
             mem,
             port: Some(port),
+            memory_port: None,
+        }
+    }
+
+    /// A [`BlockRunner`] view with the complete composed memory port threaded
+    /// to interpreted banks. Generated AOT banks remain unchanged.
+    pub fn runner_with_memory_port<'a, 'r>(
+        &'a self,
+        ctx: &'a mut RecompContext,
+        mem: &'a mut Rdram<'r>,
+        port: &'a mut MemoryPort<'a>,
+    ) -> FallbackRunner<'a, 'r> {
+        FallbackRunner {
+            program: self,
+            ctx,
+            mem,
+            port: None,
+            memory_port: Some(port),
         }
     }
 }
 
 /// A [`BlockRunner`] adapter that runs turns of a [`FallbackProgram`] against
-/// borrowed machine state, routing the interpreter lane's word MMIO accesses to
-/// a [`MmioPort`] when one is installed. Produced by
-/// [`FallbackProgram::runner`]/[`FallbackProgram::runner_with_mmio`].
+/// borrowed machine state, routing the interpreter lane through an installed
+/// MMIO-only or composed memory port. Produced by [`FallbackProgram::runner`],
+/// [`FallbackProgram::runner_with_mmio`], or
+/// [`FallbackProgram::runner_with_memory_port`].
 pub struct FallbackRunner<'a, 'r> {
     program: &'a FallbackProgram,
     ctx: &'a mut RecompContext,
@@ -281,10 +316,18 @@ pub struct FallbackRunner<'a, 'r> {
     /// `None` recovers the plain (no-device) runner exactly: turns run with a
     /// transient [`NoMmio`] port, byte-identical to before the seam existed.
     port: Option<&'a mut dyn MmioPort>,
+    /// The composed path is mutually exclusive with `port`; constructors make
+    /// that state explicit and [`BlockRunner::run`] gives it precedence.
+    memory_port: Option<&'a mut MemoryPort<'a>>,
 }
 
 impl BlockRunner for FallbackRunner<'_, '_> {
     fn run(&mut self, entry: ExecutionKey, budget: InstructionBudget) -> BlockRun {
+        if let Some(port) = self.memory_port.as_deref_mut() {
+            return self
+                .program
+                .run_with_memory_port(entry, budget, self.ctx, self.mem, port);
+        }
         match self.port.as_deref_mut() {
             Some(port) => self
                 .program
@@ -300,6 +343,9 @@ impl BlockRunner for FallbackRunner<'_, '_> {
 mod tests {
     use super::*;
     use crate::execution::{CodeSpan, CpuFault, CpuFaultKind, GuestPc};
+    use crate::interp::{
+        AlignedDirectWordAddress, CartridgeReadOutcome, CartridgeStoreOutcome, CartridgeWordPort,
+    };
 
     const VA: u32 = 0x8000_1000;
 
@@ -338,6 +384,49 @@ mod tests {
                 target_pc: GuestPc::new(0x8000_9000),
             }
         );
+    }
+
+    struct Cartridge;
+
+    impl CartridgeWordPort for Cartridge {
+        fn read_w(&mut self, address: AlignedDirectWordAddress) -> CartridgeReadOutcome {
+            if address.get() == 0xffff_ffff_b000_0000 {
+                CartridgeReadOutcome::Handled(0x7654_3210)
+            } else {
+                CartridgeReadOutcome::NotCartridge
+            }
+        }
+
+        fn classify_store_w(
+            &mut self,
+            _address: AlignedDirectWordAddress,
+        ) -> CartridgeStoreOutcome {
+            CartridgeStoreOutcome::NotCartridge
+        }
+    }
+
+    #[test]
+    fn fallback_runner_threads_the_composed_memory_port_to_dynamic_mips() {
+        let id = BankId::new(0x74);
+        let words = [0x3c08_b000, 0x8d02_0000, 0x03e0_0008, 0];
+        let mut program = FallbackProgram::new();
+        program
+            .register_dynamic_mips(contiguous(id.get(), &words))
+            .unwrap();
+        let mut storage = [0u8; 16];
+        let mut mem = Rdram::new(&mut storage);
+        let mut ctx = RecompContext::new();
+        let mut no_mmio = NoMmio;
+        let mut cartridge = Cartridge;
+        let mut port = MemoryPort::new(&mut no_mmio, &mut cartridge);
+        let mut runner = program.runner_with_memory_port(&mut ctx, &mut mem, &mut port);
+        let run = runner.run(
+            ExecutionKey::new(id, GuestPc::new(VA)),
+            InstructionBudget::new(8).unwrap(),
+        );
+        assert!(matches!(run.exit, BlockExit::ResolveTransfer { .. }));
+        drop(runner);
+        assert_eq!(ctx.r(2), 0x7654_3210);
     }
 
     #[test]

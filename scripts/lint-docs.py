@@ -127,6 +127,8 @@ def check_env_vars() -> None:
             "--glob",
             "*.sh",
             "--glob",
+            "*.zsh",
+            "--glob",
             "*.toml",
             "--glob",
             "*.c",
@@ -140,6 +142,10 @@ def check_env_vars() -> None:
             "*.h",
             "--glob",
             "*.hpp",
+            "--glob",
+            # Python tooling reads env vars too; without this a doc could never
+            # cite a variable that only a script in scripts/ consumes.
+            "*.py",
             r"(FN64|OOT|RECOMP)_[A-Z0-9_]+",
             ".",
         ],
@@ -240,12 +246,20 @@ def check_doc_hashes_are_tested() -> None:
 # generated doc block; run it here so every ordinary doc-lint invocation is a
 # mechanical surface-drift gate.
 def check_completeness_recipe() -> None:
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/check-nmr-surface.py"), "--check-doc"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/check-nmr-surface.py"), "--check-doc"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as error:
+        fail(
+            "COMPLETENESS.md",
+            f"NMR surface checker exceeded 30s (stdout={error.stdout!r}, stderr={error.stderr!r})",
+        )
+        return
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
         fail("COMPLETENESS.md", detail)

@@ -4,34 +4,56 @@
     {
       "operation_prefix": "render.",
       "subsystem": "render",
-      "dispositions": ["loud_trap", "returned_error"],
+      "dispositions": [
+        "loud_trap",
+        "returned_error"
+      ],
       "recorder_path": "crates/fn64-render-reference/src/lib.rs",
       "recorder_trigger": "fn64_runtime::record_unsupported_event(",
       "source_paths": [
-        "crates/fn64-render-reference/src/backend.rs",
-        "crates/fn64-render-reference/src/gbi.rs",
-        "crates/fn64-render-reference/src/raster.rs",
-        "crates/fn64-render-reference/src/s2dex.rs"
+        "crates/fn64-render-reference/src/backend/framebuffer_io.rs",
+        "crates/fn64-render-reference/src/backend/hidden_bits.rs",
+        "crates/fn64-render-reference/src/backend/imp.rs",
+        "crates/fn64-render-reference/src/backend/mod.rs",
+        "crates/fn64-render-reference/src/backend/render_backend.rs",
+        "crates/fn64-render-reference/src/backend/validate.rs",
+        "crates/fn64-render-reference/src/backend/vi_source.rs",
+        "crates/fn64-render-reference/src/gbi/mod.rs",
+        "crates/fn64-render-reference/src/raster/blend.rs",
+        "crates/fn64-render-reference/src/raster/combiner.rs",
+        "crates/fn64-render-reference/src/raster/coverage.rs",
+        "crates/fn64-render-reference/src/raster/draw.rs",
+        "crates/fn64-render-reference/src/raster/mod.rs",
+        "crates/fn64-render-reference/src/s2dex/background.rs",
+        "crates/fn64-render-reference/src/s2dex/common.rs",
+        "crates/fn64-render-reference/src/s2dex/mod.rs",
+        "crates/fn64-render-reference/src/s2dex/object_draw.rs",
+        "crates/fn64-render-reference/src/s2dex/object_mode.rs",
+        "crates/fn64-render-reference/src/s2dex/object_ops.rs"
       ]
     },
     {
       "operation_prefix": "abi.si.voice-command-",
       "subsystem": "abi",
-      "dispositions": ["loud_trap"],
-      "recorder_path": "crates/fn64-abi/src/si.rs",
+      "dispositions": [
+        "loud_trap"
+      ],
+      "recorder_path": "crates/fn64-abi/src/si/mod.rs",
       "recorder_trigger": "format!(\"abi.si.voice-command-{command:02x}\")",
       "source_paths": [
-        "crates/fn64-abi/src/si.rs"
+        "crates/fn64-abi/src/si/mod.rs"
       ]
     },
     {
       "operation_prefix": "abi.si.pif-command-",
       "subsystem": "abi",
-      "dispositions": ["loud_trap"],
-      "recorder_path": "crates/fn64-abi/src/si.rs",
+      "dispositions": [
+        "loud_trap"
+      ],
+      "recorder_path": "crates/fn64-abi/src/si/mod.rs",
       "recorder_trigger": "format!(\"abi.si.pif-command-{command:02x}\")",
       "source_paths": [
-        "crates/fn64-abi/src/si.rs"
+        "crates/fn64-abi/src/si/mod.rs"
       ]
     }
   ],
@@ -103,21 +125,21 @@
       "operation": "abi.pi.epi-handle",
       "subsystem": "abi",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/pi.rs",
+      "path": "crates/fn64-abi/src/pi/mmio.rs",
       "trigger": "fn64_runtime::UnsupportedSubsystem::Abi,\n        \"abi.pi.epi-handle\""
     },
     {
       "operation": "audio.task.missing-execution-policy",
       "subsystem": "audio",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "path": "crates/fn64-abi/src/task_dispatch/lifecycle.rs",
       "trigger": "task={:#010x} type={} ucode={:#010x}/size={:#x}"
     },
     {
       "operation": "audio.translated-ucode.exit-reason",
       "subsystem": "audio",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "path": "crates/fn64-abi/src/task_dispatch/rsp_commit.rs",
       "trigger": "task_offset={o:#010x} exit_reason={reason}"
     },
     {
@@ -126,6 +148,13 @@
       "disposition": "returned_error",
       "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
       "trigger": "unimplemented RSP instruction word"
+    },
+    {
+      "operation": "audio.hle.compact-memory-unsupported-opcode",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/compact_memory_abi.rs",
+      "trigger": "compact audio DMA reached uncharacterized selector {opcode:#04x}"
     },
     {
       "operation": "audio.rsp.unimplemented-vu-op",
@@ -170,10 +199,17 @@
       "trigger": "instead of fabricating output"
     },
     {
+      "operation": "recompiler.cpu.fault-context-resume",
+      "subsystem": "recompiler",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/recompiled/execution.rs",
+      "trigger": "recompiler.cpu.fault-context-resume"
+    },
+    {
       "operation": "recompiler.cpu.unsupported-instruction",
       "subsystem": "recompiler",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/recompiled.rs",
+      "path": "crates/fn64-abi/src/recompiled/execution.rs",
       "trigger": "recompiler.cpu.unsupported-instruction"
     },
     {
@@ -187,21 +223,21 @@
       "operation": "render.geometry-task-inspection.rejected",
       "subsystem": "render",
       "disposition": "returned_error",
-      "path": "crates/fn64-render/src/geometry_task_inspection.rs",
+      "path": "crates/fn64-render/src/geometry_task_inspection/mod.rs",
       "trigger": "inspector={INSPECTOR}; reason={reason}"
     },
     {
       "operation": "render.backend.unsupported-ucode",
       "subsystem": "render",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "path": "crates/fn64-abi/src/task_dispatch/setup.rs",
       "trigger": "backend rejected unlisted microcode at RDRAM offset"
     },
     {
       "operation": "render.hle-ucode.needs-lle",
       "subsystem": "render",
       "disposition": "needs_lle",
-      "path": "crates/fn64-abi/src/task_dispatch.rs",
+      "path": "crates/fn64-abi/src/task_dispatch/lifecycle.rs",
       "trigger": "microcode_sha256={digest}"
     }
   ]

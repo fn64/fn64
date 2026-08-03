@@ -38,6 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # The dominant cost here is linking ~86 test binaries, not running them.
+      # mold swaps in as the system linker (no RUSTFLAGS change, so restored
+      # cache fingerprints stay valid) and cuts the link phase substantially.
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           # Without this, a failing run saves nothing -- and the runs that fail
@@ -49,8 +53,9 @@ jobs:
           prefix-key: v1-rust
       - uses: taiki-e/install-action@nextest
       # fn64-audio/fn64-shell link ALSA via cpal/gilrs; the runner image has no
-      # libasound headers, so alsa-sys' build.rs panics before any test runs.
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      # libasound headers. Ghidra runner tests execute memory-guard.zsh, while
+      # the stock image does not provide zsh.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev zsh
       # The ROM-gated aki-audio-ucode lives in examples/*/audio-ucode, which are
       # their own workspaces -- `--workspace` never reaches them, so no exclude
       # is needed (naming it only emitted "excluded package(s) not found").

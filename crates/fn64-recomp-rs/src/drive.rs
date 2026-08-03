@@ -90,6 +90,12 @@ pub enum ExecutorAction {
     /// An executable-changing store completed before an architectural fault
     /// selected its exception path.
     ExecutableWriteFault(CpuFault),
+    /// Fetch-time image identity changed; the active-generation owner must
+    /// install a matching precompiled artifact and retry this destination.
+    ImageChanged {
+        at: ExecutionKey,
+        miss: crate::execution::AotMiss,
+    },
     /// The guest cooperatively yielded ([`BlockExit::Yield`], e.g. a `j self`
     /// idle spin). The executor should give up the CPU for this thread and let
     /// the run queue pick the next one; the thread is immediately runnable
@@ -167,6 +173,7 @@ impl ExecutorAction {
                 resume,
             },
             BlockExit::ExecutableWriteFault(fault) => ExecutorAction::ExecutableWriteFault(fault),
+            BlockExit::ImageChanged { at, miss } => ExecutorAction::ImageChanged { at, miss },
             BlockExit::Yield(resume) => ExecutorAction::Yield { resume },
             BlockExit::HostCall { vram, resume } => ExecutorAction::HostCall { vram, resume },
             BlockExit::ResolveTransfer {

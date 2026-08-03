@@ -8,7 +8,10 @@
 use fn64_discover::banks::{self, BankNamePattern};
 use fn64_discover::delta_vote::DeltaVoteConfig;
 use fn64_discover::file_table::FileTableSearchConfig;
-use fn64_discover::grade_candidates::{grade_candidates, parse_symbol_dump, CandidateGradeReport};
+use fn64_discover::grade_candidates::{
+    grade_candidates_scoped, parse_symbol_dump, scoped_candidate_identities_v1,
+    CandidateGradeReport, PrecisionRecall,
+};
 use fn64_discover::oot_reference::oot_load_image_tables;
 use fn64_discover::overlay_regions::{SearchConfig, VromOverlayRecovery};
 use fn64_discover::{
@@ -114,6 +117,23 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    // Candidate identity equality is established before the grading key is
+    // opened. Equal precision/recall totals alone could hide offsetting
+    // candidate differences.
+    let mechanical_identities = scoped_candidate_identities_v1(&mechanical_db, |bank| {
+        bank == banks::BOOT_BANK || recovered_overlay_bank(bank)
+    });
+    let hand_identities = scoped_candidate_identities_v1(&hand_db, |bank| {
+        bank == banks::BOOT_BANK || family(bank).is_some()
+    });
+    let mechanical_identity_digest = mechanical_identities.digest_sha256();
+    let hand_identity_digest = hand_identities.digest_sha256();
+    if mechanical_identities != hand_identities {
+        return Err(format!(
+            "pre-grade scoped candidate identities differ: mechanical {mechanical_identity_digest}, hand {hand_identity_digest}"
+        ));
+    }
+
     // HELD-OUT BOUNDARY: the answer key is opened only after A, B, and C
     // discovery have all completed. Nothing below can feed either FactDb.
     let key_text = std::fs::read_to_string(&dump_path)
@@ -128,11 +148,15 @@ fn run() -> Result<(), String> {
     }
     let grading_dump: GradingDump = toml::from_str(&key_text).map_err(|error| error.to_string())?;
 
-    let boot_grade = grade_candidates(&boot_db, &key);
-    let mechanical_grade = grade_candidates(&mechanical_db, &key);
-    let hand_grade = grade_candidates(&hand_db, &key);
-    let mechanical_regions = overlay_regions(&mechanical_db);
-    let hand_regions = overlay_regions(&hand_db);
+    let boot_grade = grade_candidates_scoped(&boot_db, &key, |bank| bank == banks::BOOT_BANK);
+    let mechanical_grade = grade_candidates_scoped(&mechanical_db, &key, |bank| {
+        bank == banks::BOOT_BANK || recovered_overlay_bank(bank)
+    });
+    let hand_grade = grade_candidates_scoped(&hand_db, &key, |bank| {
+        bank == banks::BOOT_BANK || family(bank).is_some()
+    });
+    let mechanical_regions = overlay_regions(&mechanical_db, recovered_overlay_bank);
+    let hand_regions = overlay_regions(&hand_db, |bank| family(bank).is_some());
     let wrong_regions: Vec<_> = mechanical_regions
         .difference(&hand_regions)
         .copied()
@@ -146,18 +170,19 @@ fn run() -> Result<(), String> {
 
     println!("gate_d1_oot_overlays: OoT held-out mechanical VROM-overlay re-grade");
     println!("ROM SHA-256 {}", boot_rom.sha256);
+    println!("pre-grade scoped candidate identity SHA-256 {mechanical_identity_digest} (B=C)");
     report_recovery(&recovery);
-    print_grade("A boot-only", &boot_grade, &boot_db, 0);
+    print_grade("A boot-only", &boot_grade, 0, 0);
     print_grade(
         "B mechanically-recovered-overlays",
         &mechanical_grade,
-        &mechanical_db,
+        proven_overlay_banks(&mechanical_db, recovered_overlay_bank),
         recovery.admitted_intervals().len(),
     );
     print_grade(
         "C hand-supplied-table-geometry",
         &hand_grade,
-        &hand_db,
+        proven_overlay_banks(&hand_db, |bank| family(bank).is_some()),
         hand_regions.len(),
     );
 
@@ -225,8 +250,48 @@ fn run() -> Result<(), String> {
         );
     }
 
-    if !wrong_regions.is_empty() {
-        return Err("mechanical recovery promoted a region absent from the hand geometry".into());
+    if !same_grade_aggregates(&mechanical_grade, &hand_grade) {
+        return Err(
+            "overlay-scoped mechanical grade aggregates differ from the hand-geometry ceiling"
+                .into(),
+        );
+    }
+    if mechanical_regions.len() != 468 {
+        return Err(format!(
+            "expected 468 unique mechanical overlay regions, got {}",
+            mechanical_regions.len()
+        ));
+    }
+    let full_mapping_count = mechanical_db.proven_rom_mappings().len();
+    if full_mapping_count != 470 {
+        return Err(format!(
+            "expected boot + 468 overlays + resident code = 470 full mappings, got {full_mapping_count}"
+        ));
+    }
+    let resident_code_mappings = mechanical_db
+        .proven_rom_mappings()
+        .into_iter()
+        .filter(|fact| {
+            matches!(fact, Fact::RomMapping {
+                bank,
+                rom_start: 0x00a8_7000,
+                rom_end: 0x00b8_ad30,
+                va_start: 0x8001_10a0,
+                ..
+            } if bank.starts_with("request_dma_"))
+        })
+        .count();
+    if resident_code_mappings != 1 {
+        return Err(format!(
+            "expected one mechanically recovered resident code mapping, got {resident_code_mappings}"
+        ));
+    }
+    if !wrong_regions.is_empty() || !missed_regions.is_empty() {
+        return Err(format!(
+            "mechanical overlay geometry differs from hand geometry: {} wrong, {} missed",
+            wrong_regions.len(),
+            missed_regions.len()
+        ));
     }
     Ok(())
 }
@@ -269,7 +334,12 @@ fn report_recovery(recovery: &VromOverlayRecovery) {
     }
 }
 
-fn print_grade(label: &str, report: &CandidateGradeReport, db: &FactDb, regions: usize) {
+fn print_grade(
+    label: &str,
+    report: &CandidateGradeReport,
+    proven_overlay_banks: usize,
+    regions: usize,
+) {
     let metrics = &report.combined;
     println!(
         "{label}: candidates={} tp_entries={} recalled_functions={} fp={} fn={} precision={:.6}% recall={:.6}% proven_overlay_banks={} recovered_regions={} ungradable={}",
@@ -280,7 +350,7 @@ fn print_grade(label: &str, report: &CandidateGradeReport, db: &FactDb, regions:
         metrics.false_negatives,
         metrics.precision() * 100.0,
         metrics.recall() * 100.0,
-        proven_overlay_banks(db),
+        proven_overlay_banks,
         regions,
         report.combined_ungradable,
     );
@@ -294,7 +364,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
-fn overlay_regions(db: &FactDb) -> BTreeSet<RegionKey> {
+fn overlay_regions(db: &FactDb, include_bank: impl Fn(&str) -> bool) -> BTreeSet<RegionKey> {
     db.proven_rom_mappings()
         .into_iter()
         .filter_map(|fact| match fact {
@@ -304,7 +374,7 @@ fn overlay_regions(db: &FactDb) -> BTreeSet<RegionKey> {
                 rom_end,
                 va_start,
                 ..
-            } if bank != banks::BOOT_BANK => Some(RegionKey {
+            } if include_bank(bank) => Some(RegionKey {
                 rom_start: *rom_start,
                 rom_end: *rom_end,
                 vram_start: *va_start,
@@ -314,15 +384,44 @@ fn overlay_regions(db: &FactDb) -> BTreeSet<RegionKey> {
         .collect()
 }
 
-fn proven_overlay_banks(db: &FactDb) -> usize {
+fn proven_overlay_banks(db: &FactDb, include_bank: impl Fn(&str) -> bool) -> usize {
     db.proven_rom_mappings()
         .into_iter()
         .filter_map(|fact| match fact {
-            Fact::RomMapping { bank, .. } if bank != banks::BOOT_BANK => Some(bank),
+            Fact::RomMapping { bank, .. } if include_bank(bank) => Some(bank),
             _ => None,
         })
         .collect::<BTreeSet<_>>()
         .len()
+}
+
+fn recovered_overlay_bank(bank: &str) -> bool {
+    bank.strip_prefix("recovered_overlay_")
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn same_metrics(left: &PrecisionRecall, right: &PrecisionRecall) -> bool {
+    left.candidates == right.candidates
+        && left.true_positives == right.true_positives
+        && left.false_positives == right.false_positives
+        && left.recalled_functions == right.recalled_functions
+        && left.false_negatives == right.false_negatives
+}
+
+fn same_grade_aggregates(left: &CandidateGradeReport, right: &CandidateGradeReport) -> bool {
+    left.answer_key_total == right.answer_key_total
+        && same_metrics(&left.combined, &right.combined)
+        && left.combined_ungradable == right.combined_ungradable
+        && left.per_detector.len() == right.per_detector.len()
+        && left
+            .per_detector
+            .iter()
+            .zip(&right.per_detector)
+            .all(|(left, right)| {
+                left.detector == right.detector
+                    && same_metrics(&left.metrics, &right.metrics)
+                    && left.ungradable == right.ungradable
+            })
 }
 
 fn hand_mappings(db: &FactDb) -> Vec<HandMapping> {
@@ -411,4 +510,21 @@ fn account_families(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn recovered_overlay_bank_scope_excludes_resident_images() {
+        assert!(super::recovered_overlay_bank("recovered_overlay_0"));
+        assert!(super::recovered_overlay_bank("recovered_overlay_467"));
+        assert!(!super::recovered_overlay_bank("request_dma_0"));
+        assert!(!super::recovered_overlay_bank("recovered_overlay_code"));
+    }
+
+    #[test]
+    #[ignore = "requires private OoT NTSC 1.0 ROM and held-out dump environment"]
+    fn oot_private_unique_overlay_and_resident_regression() {
+        super::run().expect("OoT private overlay regression");
+    }
 }

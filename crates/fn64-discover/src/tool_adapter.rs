@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const TOOL_ADAPTER_SCHEMA: &str = "fn64.tool-adapter";
 pub const TOOL_ADAPTER_SCHEMA_VERSION: u32 = 1;
+pub const TOOL_ADAPTER_SCHEMA_VERSION_V2: u32 = 2;
+pub const TOOL_ADAPTER_SCHEMA_VERSION_V3: u32 = 3;
 
 /// A SHA-256 value serialized as exactly 64 lowercase hexadecimal digits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,6 +117,7 @@ impl BankInputIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum ToolRunRole {
     FunctionBoundaryCandidates,
+    ControlFlowCandidates,
     RegionCandidates,
     SymbolCandidates,
 }
@@ -157,14 +160,51 @@ pub struct BankRange {
     pub va_end: u32,
 }
 
+/// Ghidra and similar providers can recover concrete targets for a computed
+/// transfer, but their absence of additional references is not an
+/// exhaustiveness proof. Keeping this enum one-variant makes that ceiling a
+/// wire-level invariant instead of a convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputedFlowCompleteness {
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolCandidateKind {
-    FunctionEntry { address: BankAddr },
-    FunctionExtent { range: BankRange },
-    ExecutableRange { range: BankRange },
-    DataRange { range: BankRange },
-    SymbolAlias { address: BankAddr, alias: String },
+    FunctionEntry {
+        address: BankAddr,
+    },
+    FunctionExtent {
+        range: BankRange,
+    },
+    /// One exact contiguous component of a provider's function body. Unlike
+    /// `FunctionExtent`, this does not claim that the component is the whole
+    /// function or that gaps between components are executable body bytes.
+    FunctionBodyRange {
+        entry: BankAddr,
+        range: BankRange,
+    },
+    ExecutableRange {
+        range: BankRange,
+    },
+    DataRange {
+        range: BankRange,
+    },
+    SymbolAlias {
+        address: BankAddr,
+        alias: String,
+    },
+    /// One bank-local computed-control-flow site and the targets recovered by
+    /// the provider. An empty target vector still records the independently
+    /// observed site. Targets are candidates and never imply completeness.
+    ComputedControlFlow {
+        site: BankAddr,
+        via_call: bool,
+        targets: Vec<BankAddr>,
+        completeness: ComputedFlowCompleteness,
+    },
 }
 
 /// One provider claim record before canonical semantic deduplication.
@@ -398,6 +438,11 @@ pub enum AdapterError {
     InvalidProviderClaimId {
         sequence: u64,
     },
+    BodyRangeWithoutFunctionEntry {
+        sequence: u64,
+        bank: String,
+        entry: u32,
+    },
     WrongClaimRole {
         sequence: u64,
         role: ToolRunRole,
@@ -417,6 +462,9 @@ pub enum AdapterError {
         end: u32,
     },
     InvalidAlias {
+        sequence: u64,
+    },
+    NonCanonicalComputedTargets {
         sequence: u64,
     },
     PartialRun,
@@ -487,6 +535,14 @@ impl std::fmt::Display for AdapterError {
             Self::InvalidProviderClaimId { sequence } => {
                 write!(f, "invalid provider claim ID at sequence {sequence}")
             }
+            Self::BodyRangeWithoutFunctionEntry {
+                sequence,
+                bank,
+                entry,
+            } => write!(
+                f,
+                "function-body range at sequence {sequence} has no matching function-entry claim for {bank}:0x{entry:08x}"
+            ),
             Self::WrongClaimRole { sequence, role } => {
                 write!(f, "claim sequence {sequence} is invalid for role {role:?}")
             }
@@ -505,6 +561,10 @@ impl std::fmt::Display for AdapterError {
             Self::InvalidAlias { sequence } => {
                 write!(f, "claim sequence {sequence} has an invalid symbol alias")
             }
+            Self::NonCanonicalComputedTargets { sequence } => write!(
+                f,
+                "computed-flow claim sequence {sequence} targets are not strictly sorted and unique"
+            ),
             Self::PartialRun => write!(f, "tool reports a partial run or skipped ranges"),
             Self::IncompleteAnalyzedRange => {
                 write!(f, "tool did not analyze the exact expected bank range")
@@ -590,7 +650,11 @@ pub fn ingest_tool_jsonl(
                 if header.is_some() {
                     return Err(AdapterError::DuplicateHeader { line: line_number });
                 }
-                if schema != TOOL_ADAPTER_SCHEMA || schema_version != TOOL_ADAPTER_SCHEMA_VERSION {
+                if schema != TOOL_ADAPTER_SCHEMA
+                    || (schema_version != TOOL_ADAPTER_SCHEMA_VERSION
+                        && schema_version != TOOL_ADAPTER_SCHEMA_VERSION_V2
+                        && schema_version != TOOL_ADAPTER_SCHEMA_VERSION_V3)
+                {
                     return Err(AdapterError::UnknownSchema {
                         schema,
                         version: schema_version,
@@ -621,7 +685,7 @@ pub fn ingest_tool_jsonl(
                 }
                 header = Some(ToolRunHeader {
                     schema: TOOL_ADAPTER_SCHEMA.to_string(),
-                    schema_version: TOOL_ADAPTER_SCHEMA_VERSION,
+                    schema_version,
                     tool,
                     role: expectation.role.clone(),
                     input: expectation.input.clone(),
@@ -644,7 +708,13 @@ pub fn ingest_tool_jsonl(
                 }
                 validate_token("provider claim ID", &provider_claim_id, 256)
                     .map_err(|_| AdapterError::InvalidProviderClaimId { sequence })?;
-                validate_claim(sequence, &claim, &header.role, &header.input)?;
+                validate_claim(
+                    sequence,
+                    &claim,
+                    header.schema_version,
+                    &header.role,
+                    &header.input,
+                )?;
                 claims.push(ToolClaimRecord {
                     sequence,
                     provider_claim_id,
@@ -680,11 +750,12 @@ pub fn ingest_tool_jsonl(
     let header = header.ok_or(AdapterError::MissingHeader)?;
     let summary = summary.ok_or(AdapterError::MissingSummary)?;
     validate_record_identity(&mut claims)?;
+    validate_function_body_associations(&claims)?;
     validate_summary(&summary, &claims, &header.input, expectation.limits)?;
     let candidates = canonical_candidates(&claims);
     let source = ToolRunSource {
         source_sha256: source_digest(&header, &candidates),
-        schema_version: TOOL_ADAPTER_SCHEMA_VERSION,
+        schema_version: header.schema_version,
         tool: header.tool,
         role: header.role,
         input: header.input,
@@ -704,13 +775,33 @@ pub fn ingest_tool_jsonl(
 /// ingester can validate it against the exact identity and lineage supplied
 /// by the provider-specific adapter.
 pub fn export_complete_tool_jsonl(run: CompleteToolRun) -> Result<String, AdapterError> {
+    export_complete_tool_jsonl_version(run, TOOL_ADAPTER_SCHEMA_VERSION)
+}
+
+/// Serialize a complete provider run into schema v2. V2 adds exact,
+/// entry-associated `function_body_range` candidates for discontiguous bodies;
+/// it does not change v1's existing wire encodings or canonical digest.
+pub fn export_complete_tool_jsonl_v2(run: CompleteToolRun) -> Result<String, AdapterError> {
+    export_complete_tool_jsonl_version(run, TOOL_ADAPTER_SCHEMA_VERSION_V2)
+}
+
+/// Serialize a complete provider run into schema v3. V3 adds bank-qualified,
+/// explicitly non-exhaustive computed-control-flow candidates.
+pub fn export_complete_tool_jsonl_v3(run: CompleteToolRun) -> Result<String, AdapterError> {
+    export_complete_tool_jsonl_version(run, TOOL_ADAPTER_SCHEMA_VERSION_V3)
+}
+
+fn export_complete_tool_jsonl_version(
+    run: CompleteToolRun,
+    schema_version: u32,
+) -> Result<String, AdapterError> {
     let mut claims = run.claims;
     validate_record_identity(&mut claims)?;
 
     let lineage = canonical_lineage(&run.lineage);
     let header = WireRecord::Header {
         schema: TOOL_ADAPTER_SCHEMA.to_string(),
-        schema_version: TOOL_ADAPTER_SCHEMA_VERSION,
+        schema_version,
         tool: run.tool,
         role: run.role.clone(),
         input: run.input.clone(),
@@ -806,6 +897,7 @@ fn canonical_lineage(lineage: &[ToolLineageRef]) -> Vec<ToolLineageRef> {
 fn validate_claim(
     sequence: u64,
     claim: &ToolCandidateKind,
+    schema_version: u32,
     role: &ToolRunRole,
     input: &BankInputIdentity,
 ) -> Result<(), AdapterError> {
@@ -813,7 +905,12 @@ fn validate_claim(
         (role, claim),
         (
             ToolRunRole::FunctionBoundaryCandidates,
-            ToolCandidateKind::FunctionEntry { .. } | ToolCandidateKind::FunctionExtent { .. }
+            ToolCandidateKind::FunctionEntry { .. }
+                | ToolCandidateKind::FunctionExtent { .. }
+                | ToolCandidateKind::FunctionBodyRange { .. }
+        ) | (
+            ToolRunRole::ControlFlowCandidates,
+            ToolCandidateKind::ComputedControlFlow { .. }
         ) | (
             ToolRunRole::RegionCandidates,
             ToolCandidateKind::ExecutableRange { .. } | ToolCandidateKind::DataRange { .. }
@@ -828,6 +925,23 @@ fn validate_claim(
             role: role.clone(),
         });
     }
+    if matches!(claim, ToolCandidateKind::FunctionBodyRange { .. })
+        && schema_version != TOOL_ADAPTER_SCHEMA_VERSION_V2
+        && schema_version != TOOL_ADAPTER_SCHEMA_VERSION_V3
+    {
+        return Err(AdapterError::UnknownSchema {
+            schema: TOOL_ADAPTER_SCHEMA.to_string(),
+            version: schema_version,
+        });
+    }
+    if matches!(claim, ToolCandidateKind::ComputedControlFlow { .. })
+        && schema_version != TOOL_ADAPTER_SCHEMA_VERSION_V3
+    {
+        return Err(AdapterError::UnknownSchema {
+            schema: TOOL_ADAPTER_SCHEMA.to_string(),
+            version: schema_version,
+        });
+    }
 
     match claim {
         ToolCandidateKind::FunctionEntry { address } => {
@@ -835,6 +949,10 @@ fn validate_claim(
         }
         ToolCandidateKind::FunctionExtent { range }
         | ToolCandidateKind::ExecutableRange { range } => {
+            validate_range(sequence, range, input, true)
+        }
+        ToolCandidateKind::FunctionBodyRange { entry, range } => {
+            validate_address(sequence, entry, input, true)?;
             validate_range(sequence, range, input, true)
         }
         ToolCandidateKind::DataRange { range } => validate_range(sequence, range, input, false),
@@ -848,6 +966,21 @@ fn validate_claim(
                 || alias.chars().any(|character| character.is_control())
             {
                 return Err(AdapterError::InvalidAlias { sequence });
+            }
+            Ok(())
+        }
+        ToolCandidateKind::ComputedControlFlow {
+            site,
+            targets,
+            completeness: ComputedFlowCompleteness::Unknown,
+            ..
+        } => {
+            validate_address(sequence, site, input, true)?;
+            if !targets.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Err(AdapterError::NonCanonicalComputedTargets { sequence });
+            }
+            for target in targets {
+                validate_address(sequence, target, input, true)?;
             }
             Ok(())
         }
@@ -938,6 +1071,28 @@ fn validate_record_identity(claims: &mut [ToolClaimRecord]) -> Result<(), Adapte
     Ok(())
 }
 
+fn validate_function_body_associations(claims: &[ToolClaimRecord]) -> Result<(), AdapterError> {
+    let entries: BTreeSet<_> = claims
+        .iter()
+        .filter_map(|claim| match &claim.claim {
+            ToolCandidateKind::FunctionEntry { address } => Some(address),
+            _ => None,
+        })
+        .collect();
+    for claim in claims {
+        if let ToolCandidateKind::FunctionBodyRange { entry, .. } = &claim.claim {
+            if !entries.contains(entry) {
+                return Err(AdapterError::BodyRangeWithoutFunctionEntry {
+                    sequence: claim.sequence,
+                    bank: entry.bank.clone(),
+                    entry: entry.pc,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_summary(
     summary: &ToolRunSummary,
     claims: &[ToolClaimRecord],
@@ -1016,6 +1171,7 @@ fn canonical_candidates(records: &[ToolClaimRecord]) -> Vec<ToolCandidate> {
 
 fn source_digest(header: &ToolRunHeader, candidates: &[ToolCandidate]) -> Sha256Digest {
     source_digest_parts(
+        header.schema_version,
         &header.tool,
         &header.role,
         &header.input,
@@ -1032,6 +1188,7 @@ pub(crate) fn recompute_tool_run_source_sha256(
     candidate_kinds.sort();
     candidate_kinds.dedup();
     source_digest_parts(
+        source.schema_version,
         &source.tool,
         &source.role,
         &source.input,
@@ -1041,6 +1198,7 @@ pub(crate) fn recompute_tool_run_source_sha256(
 }
 
 fn source_digest_parts<'a>(
+    schema_version: u32,
     tool: &ToolIdentity,
     role: &ToolRunRole,
     input: &BankInputIdentity,
@@ -1048,7 +1206,16 @@ fn source_digest_parts<'a>(
     candidate_kinds: impl ExactSizeIterator<Item = &'a ToolCandidateKind>,
 ) -> Sha256Digest {
     let mut hasher = Sha256::new();
-    hasher.update(b"fn64.tool-adapter.source.v1\0");
+    if schema_version == TOOL_ADAPTER_SCHEMA_VERSION {
+        // Preserve every established v1 source identity byte-for-byte.
+        hasher.update(b"fn64.tool-adapter.source.v1\0");
+    } else if schema_version == TOOL_ADAPTER_SCHEMA_VERSION_V2 {
+        hasher.update(b"fn64.tool-adapter.source.v2\0");
+        hasher.update(schema_version.to_le_bytes());
+    } else {
+        hasher.update(b"fn64.tool-adapter.source.v3\0");
+        hasher.update(schema_version.to_le_bytes());
+    }
     hash_str(&mut hasher, &tool.name);
     hash_str(&mut hasher, &tool.version);
     hasher.update(tool.build_sha256.0);
@@ -1085,6 +1252,11 @@ fn hash_claim(hasher: &mut Sha256, claim: &ToolCandidateKind) {
             hasher.update([2]);
             hash_range(hasher, range);
         }
+        ToolCandidateKind::FunctionBodyRange { entry, range } => {
+            hasher.update([6]);
+            hash_address(hasher, entry);
+            hash_range(hasher, range);
+        }
         ToolCandidateKind::ExecutableRange { range } => {
             hasher.update([3]);
             hash_range(hasher, range);
@@ -1097,6 +1269,21 @@ fn hash_claim(hasher: &mut Sha256, claim: &ToolCandidateKind) {
             hasher.update([5]);
             hash_address(hasher, address);
             hash_str(hasher, alias);
+        }
+        ToolCandidateKind::ComputedControlFlow {
+            site,
+            via_call,
+            targets,
+            completeness: ComputedFlowCompleteness::Unknown,
+        } => {
+            hasher.update([7]);
+            hash_address(hasher, site);
+            hasher.update([u8::from(*via_call)]);
+            hash_u64(hasher, targets.len() as u64);
+            for target in targets {
+                hash_address(hasher, target);
+            }
+            hasher.update([0]);
         }
     }
 }
@@ -1126,6 +1313,7 @@ fn role_tag(role: &ToolRunRole) -> u8 {
         ToolRunRole::FunctionBoundaryCandidates => 1,
         ToolRunRole::RegionCandidates => 2,
         ToolRunRole::SymbolCandidates => 3,
+        ToolRunRole::ControlFlowCandidates => 4,
     }
 }
 
@@ -1185,6 +1373,57 @@ mod tests {
             provider_claim_id: format!("claim-{sequence}"),
             claim: ToolCandidateKind::FunctionEntry {
                 address: BankAddr::new(bank, pc),
+            },
+        }
+    }
+
+    fn function_body_range_claim(
+        bank: &str,
+        sequence: u64,
+        entry: u32,
+        start: u32,
+        end: u32,
+    ) -> ToolClaimRecord {
+        ToolClaimRecord {
+            sequence,
+            provider_claim_id: format!("body-range-{sequence}"),
+            claim: ToolCandidateKind::FunctionBodyRange {
+                entry: BankAddr::new(bank, entry),
+                range: BankRange {
+                    bank: bank.to_string(),
+                    va_start: start,
+                    va_end: end,
+                },
+            },
+        }
+    }
+
+    fn schema_v2(jsonl: String) -> String {
+        jsonl.replacen("\"schema_version\":1", "\"schema_version\":2", 1)
+    }
+
+    fn schema_v3(jsonl: String) -> String {
+        jsonl.replacen("\"schema_version\":1", "\"schema_version\":3", 1)
+    }
+
+    fn computed_claim(
+        bank: &str,
+        sequence: u64,
+        site: u32,
+        via_call: bool,
+        targets: &[u32],
+    ) -> ToolClaimRecord {
+        ToolClaimRecord {
+            sequence,
+            provider_claim_id: format!("computed-{sequence}"),
+            claim: ToolCandidateKind::ComputedControlFlow {
+                site: BankAddr::new(bank, site),
+                via_call,
+                targets: targets
+                    .iter()
+                    .map(|target| BankAddr::new(bank, *target))
+                    .collect(),
+                completeness: ComputedFlowCompleteness::Unknown,
             },
         }
     }
@@ -1300,6 +1539,201 @@ mod tests {
         .unwrap();
         assert_ne!(output_a.candidates[0].kind, output_b.candidates[0].kind);
         assert_ne!(output_a.source.source_sha256, output_b.source.source_sha256);
+    }
+
+    #[test]
+    fn schema_v2_preserves_discontiguous_body_ranges_without_claiming_the_gap() {
+        let expected = expectation("bank-a");
+        let entry = 0x8000_0040;
+        let claims = vec![
+            function_claim("bank-a", 0, entry),
+            function_body_range_claim("bank-a", 1, entry, entry, entry + 8),
+            function_body_range_claim("bank-a", 2, entry, entry + 0x20, entry + 0x28),
+        ];
+        let jsonl = schema_v2(stream(
+            &expected.input,
+            expected.role.clone(),
+            expected.lineage.clone(),
+            &claims,
+            true,
+        ));
+        let output = ingest_tool_jsonl(&jsonl, &expected).unwrap();
+        let v1_entry_only = ingest_tool_jsonl(
+            &stream(
+                &expected.input,
+                expected.role.clone(),
+                expected.lineage.clone(),
+                &[function_claim("bank-a", 0, entry)],
+                true,
+            ),
+            &expected,
+        )
+        .unwrap();
+        let v2_entry_only = ingest_tool_jsonl(
+            &schema_v2(stream(
+                &expected.input,
+                expected.role.clone(),
+                expected.lineage.clone(),
+                &[function_claim("bank-a", 0, entry)],
+                true,
+            )),
+            &expected,
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.source().schema_version,
+            TOOL_ADAPTER_SCHEMA_VERSION_V2
+        );
+        assert_ne!(
+            v1_entry_only.source().source_sha256,
+            v2_entry_only.source().source_sha256
+        );
+        assert_eq!(output.candidates().len(), 3);
+        assert!(output.candidates().iter().any(|candidate| {
+            candidate.kind
+                == ToolCandidateKind::FunctionBodyRange {
+                    entry: BankAddr::new("bank-a", entry),
+                    range: BankRange {
+                        bank: "bank-a".to_string(),
+                        va_start: entry + 0x20,
+                        va_end: entry + 0x28,
+                    },
+                }
+        }));
+        assert!(!output.candidates().iter().any(|candidate| matches!(
+            candidate.kind,
+            ToolCandidateKind::FunctionExtent { ref range }
+                if range.va_start <= entry + 8 && range.va_end >= entry + 0x20
+        )));
+        let mut reordered = claims.clone();
+        reordered.reverse();
+        assert_eq!(
+            canonical_claim_records_sha256(&claims),
+            canonical_claim_records_sha256(&reordered)
+        );
+    }
+
+    #[test]
+    fn schema_v1_rejects_body_ranges_and_v2_validates_both_addresses() {
+        let expected = expectation("bank-a");
+        let entry = 0x8000_0040;
+        let valid = [function_body_range_claim(
+            "bank-a",
+            0,
+            entry,
+            entry + 0x20,
+            entry + 0x28,
+        )];
+        assert!(matches!(
+            ingest_tool_jsonl(
+                &stream(
+                    &expected.input,
+                    expected.role.clone(),
+                    expected.lineage.clone(),
+                    &valid,
+                    true,
+                ),
+                &expected
+            ),
+            Err(AdapterError::UnknownSchema { version: 1, .. })
+        ));
+
+        let missing_entry = schema_v2(stream(
+            &expected.input,
+            expected.role.clone(),
+            expected.lineage.clone(),
+            &valid,
+            true,
+        ));
+        assert!(matches!(
+            ingest_tool_jsonl(&missing_entry, &expected),
+            Err(AdapterError::BodyRangeWithoutFunctionEntry { sequence: 0, .. })
+        ));
+
+        for invalid in [
+            function_body_range_claim("bank-b", 0, entry, entry + 0x20, entry + 0x28),
+            function_body_range_claim("bank-a", 0, entry + 2, entry + 0x20, entry + 0x28),
+            function_body_range_claim("bank-a", 0, entry, entry + 0x22, entry + 0x28),
+            function_body_range_claim("bank-a", 0, entry, entry + 0x20, 0x8000_2000),
+        ] {
+            let jsonl = schema_v2(stream(
+                &expected.input,
+                expected.role.clone(),
+                expected.lineage.clone(),
+                &[invalid],
+                true,
+            ));
+            assert!(ingest_tool_jsonl(&jsonl, &expected).is_err());
+        }
+    }
+
+    #[test]
+    fn schema_v3_computed_flow_is_bank_local_sorted_and_never_exhaustive() {
+        let mut expected = expectation("bank-a");
+        expected.role = ToolRunRole::ControlFlowCandidates;
+        let claim = computed_claim("bank-a", 0, 0x8000_0040, true, &[0x8000_0080, 0x8000_00c0]);
+        let jsonl = schema_v3(stream(
+            &expected.input,
+            expected.role.clone(),
+            expected.lineage.clone(),
+            std::slice::from_ref(&claim),
+            true,
+        ));
+        let output = ingest_tool_jsonl(&jsonl, &expected).unwrap();
+        assert_eq!(
+            output.source().schema_version,
+            TOOL_ADAPTER_SCHEMA_VERSION_V3
+        );
+        assert_eq!(output.candidates().len(), 1);
+        assert_eq!(
+            output.candidates()[0].proof_ceiling,
+            CandidateProofCeiling::Candidate
+        );
+
+        let v2 = schema_v2(stream(
+            &expected.input,
+            expected.role.clone(),
+            expected.lineage.clone(),
+            std::slice::from_ref(&claim),
+            true,
+        ));
+        assert!(matches!(
+            ingest_tool_jsonl(&v2, &expected),
+            Err(AdapterError::UnknownSchema { version: 2, .. })
+        ));
+
+        for invalid in [
+            computed_claim("bank-a", 0, 0x8000_0040, false, &[0x8000_00c0, 0x8000_0080]),
+            computed_claim("bank-a", 0, 0x8000_0040, false, &[0x8000_0080, 0x8000_0080]),
+        ] {
+            let jsonl = schema_v3(stream(
+                &expected.input,
+                expected.role.clone(),
+                expected.lineage.clone(),
+                &[invalid],
+                true,
+            ));
+            assert!(matches!(
+                ingest_tool_jsonl(&jsonl, &expected),
+                Err(AdapterError::NonCanonicalComputedTargets { sequence: 0 })
+            ));
+        }
+
+        for invalid in [
+            computed_claim("bank-b", 0, 0x8000_0040, false, &[]),
+            computed_claim("bank-a", 0, 0x8000_0042, false, &[]),
+            computed_claim("bank-a", 0, 0x8000_0040, false, &[0x8000_2000]),
+        ] {
+            let jsonl = schema_v3(stream(
+                &expected.input,
+                expected.role.clone(),
+                expected.lineage.clone(),
+                &[invalid],
+                true,
+            ));
+            assert!(ingest_tool_jsonl(&jsonl, &expected).is_err());
+        }
     }
 
     #[test]

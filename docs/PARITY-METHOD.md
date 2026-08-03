@@ -39,6 +39,10 @@ the command below; no game-derived input or generated output is committed.
 ## Commands and claims
 
 ```sh
+# No-ROM contract checks and path-free phase plan. Neither invokes Cargo.
+scripts/lane-parity.sh --selftest
+scripts/lane-parity.sh --dry-run --observe 60
+
 # Authoritative mode (default): currently exits 2 before boot because the
 # generated callable-body sets are not aligned.
 FN64_GAME_DIR=/path/to/private/game-workspace scripts/lane-parity.sh 60
@@ -53,6 +57,15 @@ and can report only `OBSERVED MATCH` or `OBSERVED DIVERGENCE`. A matching
 observation is a useful end-to-end regression signal for the exercised output;
 it is not evidence that an empty C body was unreachable or semantically
 irrelevant.
+
+The native emitter build, emitter execution, callable-body test, C build, C
+run, Rust build, and Rust run are sequential phases. Each phase owns a fresh
+exact process group under the common 2048 MiB/40%-free memory guard; every Cargo
+compiler command is `-j1`, and the authority test also fixes one libtest thread.
+The C and Rust target paths remain distinct and unchanged. Compiler/linker
+children spawned by either Cargo build inherit that phase's process group, so a
+threshold crossing terminates the complete phase without crossing into the
+other lane. A native-emitter failure is an authority error, not a content skip.
 
 The current measured observation matches through swap 60 under shared
 guest-quiescence timing. A historical deeper observation first differed at
@@ -71,18 +84,19 @@ The usable evidence stack is deliberately split:
   oracles for their named instruction families.
 - `lane-parity.sh --observe` compares end-to-end framebuffer bytes while
   labeling the legacy lane's missing-body defect.
-- Schema-v28 fixed-cycle device/framebuffer/audio/memory digests,
+- Schema-v29 fixed-cycle device/framebuffer/audio/memory digests,
   boundary-owned observations, the compiled unsupported-instrumentation
   identity, and the bound zero-unsupported journal provide the release
   authority mechanism. Representative private NTSC reference and RT64
   LLE/post-VI exact-ten schema-v22 series completed and were independently
   reverified on 2026-07-22 with zero unsupported events; these are historical
-  and require schema-v28 regeneration. The public synthetic identified-native
-  XBUS scenario has a current schema-v28 macOS arm64 exact-ten gate whose sole
-  repository acceptance anchor is a complete target-named semantic fingerprint
-  including both build-produced archive hashes. It passed 10/10 consecutive
-  parent invocations (100 fresh children) on 2026-07-24. Compiler, SDK, or
-  target drift fails closed pending a separately reviewed golden. Combined with the
+  and require schema-v29 regeneration. The public synthetic identified-native
+  XBUS scenario has a historical schema-v28 macOS arm64 exact-ten gate whose
+  sole repository acceptance anchor was a complete target-named semantic
+  fingerprint including both build-produced archive hashes. It passed 10/10
+  consecutive parent invocations (100 fresh children) on 2026-07-24, but now
+  requires schema-v29 regeneration. Compiler, SDK, or target drift also fails
+  closed pending a separately reviewed golden. Combined with the
   retained historical public synthetic exact-ten series, the
   previous three-scenario matrix credited 12 of 162 requirements and retained the
   other 150 explicitly. The public series adds mechanism coverage, not another

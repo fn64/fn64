@@ -9,6 +9,7 @@
 //! Design provenance for every non-obvious semantic choice below is cited
 //! inline; see `docs/DESIGN.md` section 6 for the full provenance table.
 
+pub mod boot_globals;
 pub mod device;
 pub mod dpc_schedule;
 pub mod executor;
@@ -31,21 +32,26 @@ pub mod unsupported;
 pub mod vi;
 pub mod voice;
 
+pub use boot_globals::{
+    IplBootGlobals, IplResetType, CART_ROM_KSEG1_BASE, OS_RESET_TYPE_ADDR, OS_ROM_BASE_ADDR,
+    OS_TV_TYPE_ADDR,
+};
 pub use device::{
     AiDmaRequest, Cycles, DeviceEvidenceSnapshot, DeviceFabric, DeviceFault, DeviceMmioWriteEffect,
-    DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DpcSubmission,
-    DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr, PendingAiSnapshot,
-    PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot, PendingSpDmaSnapshot, PiDmaRequest,
-    PiDomain, PiDomainTiming, PiTimingModel, RcpTaskCompletion, RcpTaskCompletionPlan,
-    RspExecutionState, ScheduledDeviceEventKind, ScheduledDeviceEventSnapshot, SiDmaKind,
-    SiDmaRequest, SpDmaDirection, SpDmaRequest, DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND,
-    DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND, DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND,
-    DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND, DPC_STATUS_CMD_BUSY, DPC_STATUS_DMA_BUSY,
-    DPC_STATUS_END_VALID, DPC_STATUS_FLUSH, DPC_STATUS_FREEZE, DPC_STATUS_START_VALID,
-    DPC_STATUS_XBUS_DMEM_DMA, PI_STATUS_DMA_BUSY, PI_STATUS_ERROR, PI_STATUS_IO_BUSY, SP_CLR_YIELD,
-    SP_CLR_YIELDED, SP_SET_YIELD, SP_SET_YIELDED, SP_STATUS_BROKE, SP_STATUS_DMA_BUSY,
-    SP_STATUS_DMA_FULL, SP_STATUS_HALT, SP_STATUS_INTERRUPT_ON_BREAK, SP_STATUS_SIGNAL_0,
-    SP_STATUS_SIGNAL_1, SP_STATUS_SINGLE_STEP, SP_STATUS_YIELD, SP_STATUS_YIELDED,
+    DeviceNotification, DeviceSnapshot, DeviceTraceEvent, DeviceTraceKind, DeviceTraceSummary,
+    DpcSubmission, DpcSubmissionSource, FixedPiTiming, InterruptSource, MmioAddr,
+    PendingAiSnapshot, PendingDpcSnapshot, PendingPiSnapshot, PendingSiSnapshot,
+    PendingSpDmaSnapshot, PiDmaRequest, PiDomain, PiDomainTiming, PiTimingModel, RcpTaskCompletion,
+    RcpTaskCompletionPlan, RspExecutionState, ScheduledDeviceEventKind,
+    ScheduledDeviceEventSnapshot, SiDmaKind, SiDmaRequest, SpDmaDirection, SpDmaRequest,
+    DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND, DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND,
+    DPC_STATUS_CLEAR_PIPE_COUNTER_COMMAND, DPC_STATUS_CLEAR_TMEM_COUNTER_COMMAND,
+    DPC_STATUS_CMD_BUSY, DPC_STATUS_DMA_BUSY, DPC_STATUS_END_VALID, DPC_STATUS_FLUSH,
+    DPC_STATUS_FREEZE, DPC_STATUS_START_VALID, DPC_STATUS_XBUS_DMEM_DMA, PI_STATUS_DMA_BUSY,
+    PI_STATUS_ERROR, PI_STATUS_IO_BUSY, SP_CLR_YIELD, SP_CLR_YIELDED, SP_SET_YIELD, SP_SET_YIELDED,
+    SP_STATUS_BROKE, SP_STATUS_DMA_BUSY, SP_STATUS_DMA_FULL, SP_STATUS_HALT,
+    SP_STATUS_INTERRUPT_ON_BREAK, SP_STATUS_SIGNAL_0, SP_STATUS_SIGNAL_1, SP_STATUS_SINGLE_STEP,
+    SP_STATUS_YIELD, SP_STATUS_YIELDED,
 };
 pub use dpc_schedule::{
     DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus, DpcCursor,
@@ -85,8 +91,8 @@ pub use rdram::{
     RdramViewMut,
 };
 pub use rom::{
-    DmaCompletion, DmaMemory, InMemoryRom, PendingEepromWriteSnapshot, PiDma, PiDmaError,
-    RomStorage,
+    DmaCompletion, DmaMemory, DmaWriterChannel, InMemoryRom, PendingEepromWriteSnapshot,
+    PiDeviceAddress, PiDma, PiDmaError, ProcessDmaMemory, RomStorage,
 };
 pub use rsp::{
     OsTaskHeader, RspMemAddr, RspMemory, RspMemoryBank, RspMemoryError, TaskLog, M_AUDTASK,

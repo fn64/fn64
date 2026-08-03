@@ -243,6 +243,7 @@ name = "fn64-boot-harness"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
+ "fn64-audio",
  "fn64-runtime",
  "getrandom",
  "rustix",

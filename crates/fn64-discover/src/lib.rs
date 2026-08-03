@@ -47,6 +47,12 @@
 //!   exact operands and unresolved blockers are typed separately, and static
 //!   geometry remains candidate evidence until handle mapping and completion
 //!   exist.
+//! - [`source_closure`]: canonical, ROM-bound executable-source inventory
+//!   receipts. Construction sorts and validates evidence but never promotes
+//!   bounded writer or indirect frontiers into an exhaustiveness claim.
+//! - [`external_aot`]: deterministic cross-image admission for reproducibly
+//!   captured executable generations. Ranges and truncated content identities
+//!   must be collision-free against each other and every immutable AOT bank.
 //! - [`harvest`]: Phase 3, parallel deterministic candidate providers for
 //!   direct/resolved calls, classic and leaf prologues, and code-pointer
 //!   entries exposed by already-discovered tables. Claims merge through
@@ -62,6 +68,20 @@
 //!   branch/call edge target is code, and anything else stays ambiguous.
 //!   Never reads or mutates [`facts::FactDb`] or a [`cfg::Cfg`]; strictly
 //!   corroborating evidence that cannot override a proven conclusion.
+//! - [`cold_sweep`]: path-free cold discovery measurement from ROM bytes only,
+//!   including automatic snapshot composition, closure tiers, and the complete
+//!   byte ledger. A composition frontier remains typed `open`; it never becomes
+//!   a misleading zero-unsupported result.
+//! - [`stage1_effects`]: conservative syntactic COP0/cache/trap and constant-
+//!   address memory-effect inventory over authority-reached code. It is an
+//!   explicit negative classifier, not a general purity theorem.
+//! - [`boot_tlb_alias`]: fail-closed boot TLB diagnostics that reuse the
+//!   execution runtime's translator and intersect only proven physical bytes;
+//!   diagnostics do not mint mappings or mutate discovery authority.
+//! - [`program_transfer_index`]: deterministic forward/reverse intra-bank CFG
+//!   and exact cross-bank call edges plus exact-owner caller/callee projections
+//!   over validated composed snapshots; open and candidate evidence cannot
+//!   enter the index.
 //! - [`partition`]: Phase 5, recursive-descent owner partitioning of a
 //!   [`cfg::Cfg`]'s blocks from its proven roots -- one owner per block per
 //!   bank, ambiguous claims and unowned blocks reported explicitly rather
@@ -76,6 +96,10 @@
 //!   Computed-jump table entries remain intra-owner code successors; only
 //!   exhaustive computed calls become callable roots. Every unresolved site
 //!   is retained as bounded/open evidence in the fact database.
+//! - [`indirect_frontier`]: content-free opportunity ranking for final open
+//!   indirects. Local instruction shapes remain diagnostic, while owner-payoff
+//!   counterfactuals count only assessments whose complete blocker set the
+//!   named mechanism family would discharge.
 //! - [`delta_vote`]: mapping inference for a code region with an unknown VA
 //!   base -- lui-histogram-narrowed delta hypotheses scored by distinct
 //!   `jal`-target-to-prologue coincidences, admitted only on a unique
@@ -89,11 +113,36 @@
 //!   load image only when exactly one table is admitted and that record's
 //!   unique delta-derived VA exactly matches its independently parsed
 //!   descriptor destination; a delta vote alone remains candidate evidence.
+//! - [`overlay_recipe`]: complete nine-field ROM/load/text/data/BSS
+//!   materialization recipes, admitted only when one recovered table's range
+//!   equations all agree.
+//! - [`generation_topology`]: ROM-bound diagnostic immutable-prefix,
+//!   resident-tail, and overlay generation geometry plus bounded enumeration
+//!   of geometry-possible bank-qualified segments. It is a negative filter,
+//!   not runtime state reachability, catalog identity, or activation authority.
 //! - [`gp_base`]: IDO small-data `$gp` base recovery by constrained voting
 //!   (boot `lui`/`addiu` constructions, or a bounded access-offset histogram
 //!   fallback), admitted only on a unique dominating winner, then surfaces the
 //!   gp-relative data accesses `xref.rs` cannot see. Emitted xref sites are
 //!   candidate evidence; the admitted base is a typed program-level fact.
+//! - [`headered_raw_deflate`]: bounded candidate-only materialization of an
+//!   explicitly addressed sequence of raw-DEFLATE streams. `0x1172` uses a
+//!   six-byte header and four-byte big-endian length; `0x1173` uses a five-byte
+//!   header and three-byte big-endian length. Successful decoding proves
+//!   bytes, not runtime placement or use.
+//! - [`rzip_verify`]: bounded composition of candidate header scanning with
+//!   exact stream decoding and the ledger's measured code predicate. Results
+//!   retain offsets, sizes, hashes, and counts, never decoded bytes or runtime
+//!   authority.
+//! - [`materialized_image`]: conclusion-blind re-derivation of typed evaluated-
+//!   image receipts from normalized ROM bytes and proven VROM backing. Its
+//!   in-memory result carries bytes but no mapping or proof authority.
+//! - `transform_invocation`: opt-in, candidate-only certification that one
+//!   exact content-bound guest wrapper invocation produces one re-derived
+//!   evaluated image, plus an ordered one-call-per-stream sequence form that
+//!   binds shared mutable-memory evolution and cumulative limits in one fresh
+//!   machine. Neither form promotes facts or claims general transform
+//!   semantics, runtime placement, or boot reachability.
 //! - [`homology`]: bounded relocation-masked cross-ROM n-gram lookup with
 //!   collision-safe full-body validation and explicit ambiguous/unmatched
 //!   results. Homology emits candidates only.
@@ -119,9 +168,14 @@
 //!   [`facts::FactDb`] conclusions.
 //! - [`spimdisasm_adapter`]: pure-Rust normalization of pinned spimdisasm
 //!   function-info CSV into that strict candidate-only interchange.
+//! - [`spimdisasm_reference`]: strict cached per-bank normalization of
+//!   adapter-owned block, direct-reference, HI/LO-pair, and data candidates.
 //! - [`snapshot`]: the byte-verified one-bank composition boundary that runs
 //!   closure, fact integration, partitioning, owner proof, and coverage into
 //!   one deterministic artifact. Traversal seeds never imply entry proof.
+//! - [`snapshot_inputs`]: proven-bank enumeration, ROM/VROM materialization,
+//!   `.bss`-prefix exclusion, and callable-derived traversal seeds shared by
+//!   in-process snapshot producers. Seeds remain distinct from authority.
 //! - [`grade_oot`] / [`grade_nw4e`]: grading-only cross-checks against the
 //!   OoT decomp's segment answer key and NW4E's hand-verified
 //!   `overlays.json`. Neither module is reachable from the discovery
@@ -142,9 +196,10 @@
 //! - [`timing_diff`]: the differential timing comparator -- diffs fn64's
 //!   device-event stream against a reference emulator's under a two-tier
 //!   tolerance (zero-tolerance event ORDERING; a per-device cycle-count BAND),
-//!   reporting the first divergence. Never runs an emulator; consumes two
-//!   ingested [`timing_trace`] streams. The acceptance gate for every timing
-//!   refinement item.
+//!   reporting the first divergence. Agreement additionally requires both
+//!   ingested [`timing_trace`] streams to carry successful completion; aborted
+//!   captures cannot agree. Never runs an emulator. The acceptance gate for
+//!   every timing refinement item.
 //!
 //! Dynamic indirect observations/callback-field semantics (Phase 6/7) and
 //! assembly verification (Phase 8) are not yet implemented.
@@ -155,18 +210,29 @@ pub mod asm_emit;
 pub mod banks;
 pub mod block_pack;
 pub mod block_proof;
+pub mod boot_tlb_alias;
 pub mod boundaries;
+pub mod callback_flow;
 pub mod callgraph_match;
+pub mod candidate_cfg_probe;
+pub mod candidate_corroboration;
+pub mod candidate_relation_report;
+pub mod catalog_transfer_fixed_point;
 pub mod cfg;
 pub mod cfg_homology;
 pub mod closure;
+pub mod closure_audit;
+pub mod cold_sweep;
 pub mod content_consumer;
 pub mod corpus_homology;
 pub mod coverage;
 pub mod delta_vote;
+pub mod dense_aot_pack;
 pub mod evidence;
+pub mod external_aot;
 pub mod facts;
 pub mod file_table;
+pub mod generation_topology;
 pub mod gp_base;
 pub mod grade_candidates;
 pub mod grade_nw4e;
@@ -175,31 +241,59 @@ pub mod grade_nwxe_functions;
 pub mod grade_oot;
 pub mod grade_oot_functions;
 pub mod harvest;
+pub mod headered_raw_deflate;
 pub mod headless;
 pub mod homology;
+pub mod host_bindings;
+pub mod indirect_frontier;
+pub mod ledger;
 pub mod load_table_use;
 pub mod loaders;
+pub mod materialized_image;
+pub mod missed_function_attribution;
 pub mod oot_reference;
+pub mod overlay_recipe;
 pub mod overlay_regions;
 pub mod overlay_reloc;
 pub mod owner_proof;
 pub mod partition;
-pub mod ledger;
 pub mod pi_dma;
+#[cfg(feature = "transform-invocation-certificate")]
+pub mod polling_stutter;
 pub mod probe;
+pub mod program_transfer_index;
 pub mod regions;
 pub mod reloc_grade;
 pub mod resolve;
 pub mod rom;
+pub mod runtime_generation_catalog;
+pub mod rzip_scan;
+pub mod rzip_verify;
 pub mod sig_scan;
 pub mod snapshot;
+pub mod snapshot_inputs;
+pub mod snapshot_workspace;
+pub mod source_closure;
 pub mod spimdisasm_adapter;
+pub mod spimdisasm_reference;
+pub mod stage1_effects;
 pub mod timing_diff;
 pub mod timing_trace;
 pub mod tool_adapter;
 pub mod tool_claims;
 pub mod trace;
+pub mod transfer_scan;
+#[cfg(feature = "transform-invocation-certificate")]
+pub mod transform_invocation;
+pub mod workspace_artifacts;
+pub mod writer_denominator;
 pub mod xref;
+
+#[cfg(test)]
+extern crate self as fn64_discover;
+#[cfg(test)]
+#[path = "../tests/candidate_corroboration.rs"]
+mod candidate_corroboration_receipt_tests;
 
 pub use facts::{BankAddr, Fact, FactDb, ProofState, RomAddressSpace};
 pub use rom::{normalize, NormalizedRom, RomByteOrder, RomRejectReason};
@@ -274,8 +368,9 @@ pub fn required_env_path(variable: &str, what: &str) -> Result<String, String> {
 ///
 /// `descriptor_table` is optional because not every N64 title has one
 /// (OoT does not; NW4E and other AKI-family titles do) -- passing `None`
-/// still yields a valid, if smaller, fact DB with just the boot bank
-/// proven and nothing else claimed.
+/// still yields a valid, if smaller, fact DB. The boot bank is proven only for
+/// a complete, exactly recognized standard IPL3 and complete 1 MiB source;
+/// otherwise its conclusion remains explicitly `Open`.
 pub fn run_discovery(
     rom_bytes: &[u8],
     descriptor_table: Option<DescriptorTableInput>,
@@ -292,15 +387,24 @@ pub fn run_discovery_with_load_image_tables(
     load_image_tables: &[banks::LoadImageTableInput],
 ) -> Result<(NormalizedRom, FactDb), RomRejectReason> {
     let rom = rom::normalize(rom_bytes)?;
-    let mut db = FactDb::new();
-    banks::discover_boot_bank(&rom, &mut db);
-    if let Some((shape, bank_name)) = descriptor_table {
-        banks::scan_descriptor_table(&rom, shape, bank_name, &mut db);
-    }
-    banks::scan_load_image_tables(&rom, load_image_tables, &mut db);
+    let mut db = discover_with_load_image_tables(&rom, descriptor_table, load_image_tables);
     harvest::harvest_discovered_candidates(&rom, &mut db)
         .expect("Phase 2 produced a malformed load-image mapping");
     Ok((rom, db))
+}
+
+fn discover_with_load_image_tables(
+    rom: &NormalizedRom,
+    descriptor_table: Option<DescriptorTableInput>,
+    load_image_tables: &[banks::LoadImageTableInput],
+) -> FactDb {
+    let mut db = FactDb::new();
+    let _boot = banks::discover_boot_bank(rom, &mut db);
+    if let Some((shape, bank_name)) = descriptor_table {
+        banks::scan_descriptor_table(rom, shape, bank_name, &mut db);
+    }
+    banks::scan_load_image_tables(rom, load_image_tables, &mut db);
+    db
 }
 
 /// [`run_discovery_with_load_image_tables`] plus a static request-DMA scan
@@ -315,12 +419,7 @@ pub fn run_discovery_with_tables_and_request_dma(
     request_dma: &[banks::StaticRequestDmaInput],
 ) -> Result<(NormalizedRom, FactDb, banks::StaticRequestDmaReport), RomRejectReason> {
     let rom = rom::normalize(rom_bytes)?;
-    let mut db = FactDb::new();
-    banks::discover_boot_bank(&rom, &mut db);
-    if let Some((shape, bank_name)) = descriptor_table {
-        banks::scan_descriptor_table(&rom, shape, bank_name, &mut db);
-    }
-    banks::scan_load_image_tables(&rom, load_image_tables, &mut db);
+    let mut db = discover_with_load_image_tables(&rom, descriptor_table, load_image_tables);
     let report = banks::scan_static_request_dma(&rom, request_dma, &mut db);
     harvest::harvest_discovered_candidates(&rom, &mut db)
         .expect("Phase 2 produced a malformed load-image mapping");
@@ -336,6 +435,16 @@ pub fn run_discovery_with_recovered_overlay_regions(
     input: &RecoveredOverlayInput,
 ) -> Result<(NormalizedRom, FactDb, overlay_regions::OverlayRecovery), RomRejectReason> {
     let rom = rom::normalize(rom_bytes)?;
+    let (mut db, recovery) = discover_with_recovered_overlay_regions(&rom, input);
+    harvest::harvest_discovered_candidates(&rom, &mut db)
+        .expect("Phase 2 produced a malformed recovered-overlay mapping");
+    Ok((rom, db, recovery))
+}
+
+fn discover_with_recovered_overlay_regions(
+    rom: &NormalizedRom,
+    input: &RecoveredOverlayInput,
+) -> (FactDb, overlay_regions::OverlayRecovery) {
     let recovery = overlay_regions::recover_overlay_regions(
         &rom.bytes,
         &input.search,
@@ -343,17 +452,15 @@ pub fn run_discovery_with_recovered_overlay_regions(
         input.min_mapped_regions,
     );
     let mut db = FactDb::new();
-    banks::discover_boot_bank(&rom, &mut db);
+    let _boot = banks::discover_boot_bank(rom, &mut db);
     banks::scan_recovered_overlay_regions(
-        &rom,
+        rom,
         &recovery,
         &input.table_name,
         &input.bank_name,
         &mut db,
     );
-    harvest::harvest_discovered_candidates(&rom, &mut db)
-        .expect("Phase 2 produced a malformed recovered-overlay mapping");
-    Ok((rom, db, recovery))
+    (db, recovery)
 }
 
 /// Run discovery with VROM-located overlay tables recovered mechanically
@@ -379,8 +486,27 @@ pub fn run_discovery_with_recovered_vrom_overlay_regions(
     rom_bytes: &[u8],
     input: &RecoveredVromOverlayInput,
 ) -> Result<(NormalizedRom, FactDb, overlay_regions::VromOverlayRecovery), RomRejectReason> {
-    run_discovery_with_recovered_vrom_and_request_dma(rom_bytes, input, &[])
-        .map(|(rom, db, recovery, _report)| (rom, db, recovery))
+    run_discovery_with_recovered_vrom_overlay_regions_with_limits(
+        rom_bytes,
+        input,
+        file_table::VromMaterializationLimits::default(),
+    )
+}
+
+/// [`run_discovery_with_recovered_vrom_overlay_regions`] with an explicit
+/// complete-file VROM decode cap.
+pub fn run_discovery_with_recovered_vrom_overlay_regions_with_limits(
+    rom_bytes: &[u8],
+    input: &RecoveredVromOverlayInput,
+    materialization_limits: file_table::VromMaterializationLimits,
+) -> Result<(NormalizedRom, FactDb, overlay_regions::VromOverlayRecovery), RomRejectReason> {
+    run_discovery_with_recovered_vrom_and_request_dma_with_limits(
+        rom_bytes,
+        input,
+        &[],
+        materialization_limits,
+    )
+    .map(|(rom, db, recovery, _report)| (rom, db, recovery))
 }
 
 /// [`run_discovery_with_recovered_vrom_overlay_regions`] plus a static
@@ -401,19 +527,69 @@ pub fn run_discovery_with_recovered_vrom_and_request_dma(
     ),
     RomRejectReason,
 > {
+    run_discovery_with_recovered_vrom_and_request_dma_with_limits(
+        rom_bytes,
+        input,
+        request_dma,
+        file_table::VromMaterializationLimits::default(),
+    )
+}
+
+/// [`run_discovery_with_recovered_vrom_and_request_dma`] with an explicit
+/// complete-file VROM decode cap.
+pub fn run_discovery_with_recovered_vrom_and_request_dma_with_limits(
+    rom_bytes: &[u8],
+    input: &RecoveredVromOverlayInput,
+    request_dma: &[banks::StaticRequestDmaInput],
+    materialization_limits: file_table::VromMaterializationLimits,
+) -> Result<
+    (
+        NormalizedRom,
+        FactDb,
+        overlay_regions::VromOverlayRecovery,
+        banks::StaticRequestDmaReport,
+    ),
+    RomRejectReason,
+> {
+    let rom = rom::normalize(rom_bytes)?;
+    let (mut db, recovery, request_dma_report) = discover_with_recovered_vrom_and_request_dma(
+        &rom,
+        input,
+        request_dma,
+        materialization_limits,
+    );
+    harvest::harvest_discovered_candidates_bounded(
+        &rom,
+        &mut db,
+        materialization_limits.max_decoded_file_bytes,
+    )
+    .expect("Phase 2 produced a malformed recovered VROM overlay mapping");
+    Ok((rom, db, recovery, request_dma_report))
+}
+
+fn discover_with_recovered_vrom_and_request_dma(
+    rom: &NormalizedRom,
+    input: &RecoveredVromOverlayInput,
+    request_dma: &[banks::StaticRequestDmaInput],
+    materialization_limits: file_table::VromMaterializationLimits,
+) -> (
+    FactDb,
+    overlay_regions::VromOverlayRecovery,
+    banks::StaticRequestDmaReport,
+) {
     use banks::{
         DestinationEnd, DestinationRangeFields, DestinationSpace, LoadImageTableInput,
         LoadImageTableShape, SourceRangeFields, TableLocation,
     };
 
-    let rom = rom::normalize(rom_bytes)?;
-    let recovery = overlay_regions::recover_vrom_overlay_regions(
+    let recovery = overlay_regions::recover_vrom_overlay_regions_with_limits(
         &rom.bytes,
         &input.search,
         &input.delta_vote,
         &input.file_table_search,
         input.vrom_min_records,
         input.min_mapped_regions,
+        materialization_limits,
     );
     let mut recovered_inputs = Vec::new();
 
@@ -443,6 +619,11 @@ pub fn run_discovery_with_recovered_vrom_and_request_dma(
     }
 
     let mut recovered_bank_index = 0u32;
+    // Distinct descriptor-family runs can overlap without being aliases as
+    // whole tables. Their shared records still describe one load image and
+    // therefore one bank identity. Keep conflicting destinations distinct so
+    // the ordinary mapping-conflict path can surface them.
+    let mut recovered_geometries = std::collections::BTreeSet::new();
     for (table_index, admission) in recovery
         .admissions
         .iter()
@@ -465,6 +646,12 @@ pub fn run_discovery_with_recovered_vrom_and_request_dma(
                 continue;
             };
             if record.rom_start.wrapping_add(delta) != va_start || va_start != record.vram_dest {
+                continue;
+            }
+            let Some(va_end) = va_start.checked_add(record.byte_len()) else {
+                continue;
+            };
+            if !recovered_geometries.insert((record.rom_start, record.rom_end, va_start, va_end)) {
                 continue;
             }
             let record_offset = (record_index as u32)
@@ -506,14 +693,42 @@ pub fn run_discovery_with_recovered_vrom_and_request_dma(
     }
 
     let mut db = FactDb::new();
-    banks::discover_boot_bank(&rom, &mut db);
-    banks::scan_load_image_tables(&rom, &recovered_inputs, &mut db);
+    let _boot = banks::discover_boot_bank(rom, &mut db);
+    banks::scan_load_image_tables_bounded(
+        rom,
+        &recovered_inputs,
+        &mut db,
+        materialization_limits.max_decoded_file_bytes,
+    );
+    let mut effective: Vec<banks::StaticRequestDmaInput> = request_dma.to_vec();
+    let mut wrapper_diagnostics = PhysicalWrapperCandidateDiagnostics::default();
+    if let Some((rom_start, rom_end, va_start)) =
+        db.proven_rom_mappings().iter().find_map(|fact| match fact {
+            Fact::RomMapping {
+                bank,
+                rom_space: RomAddressSpace::Physical,
+                rom_start,
+                rom_end,
+                va_start,
+                ..
+            } if bank == banks::BOOT_BANK => Some((*rom_start, *rom_end, *va_start)),
+            _ => None,
+        })
+    {
+        if let Some(bytes) = rom.bytes.get(rom_start as usize..rom_end as usize) {
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect();
+            wrapper_diagnostics =
+                record_physical_end_dma_wrapper_candidates(&words, va_start, &mut db);
+        }
+    }
     // Mechanically recover the game's DMA-request routine rather than citing
     // its address: a candidate is admitted only when its call-site (vrom,
     // size) operands land exactly on file-table records already proven above.
     // Caller-supplied claims, if any, are unioned in and take no precedence.
-    let callee_recovery = banks::recover_request_dma_callees(&rom, &db, REQUEST_DMA_MIN_SITES);
-    let mut effective: Vec<banks::StaticRequestDmaInput> = request_dma.to_vec();
+    let callee_recovery = banks::recover_request_dma_callees(rom, &db, REQUEST_DMA_MIN_SITES);
     for (index, callee) in callee_recovery.admitted.iter().enumerate() {
         if effective.iter().any(|c| c.callee_va == callee.callee_va) {
             continue;
@@ -529,20 +744,90 @@ pub fn run_discovery_with_recovered_vrom_and_request_dma(
             bank_name: banks::BankNamePattern::new("request_dma_", 0, ""),
         });
     }
-    let request_dma_report = banks::scan_static_request_dma(&rom, &effective, &mut db);
-    harvest::harvest_discovered_candidates(&rom, &mut db)
-        .expect("Phase 2 produced a malformed recovered VROM overlay mapping");
-    Ok((rom, db, recovery, request_dma_report))
+    let mut request_dma_report = banks::scan_static_request_dma_fixed_point_bounded(
+        rom,
+        &effective,
+        &mut db,
+        materialization_limits.max_decoded_file_bytes,
+    );
+    request_dma_report.physical_wrapper_candidates_examined =
+        wrapper_diagnostics.candidates_examined;
+    request_dma_report.wrapper_semantic_proof_unavailable =
+        wrapper_diagnostics.semantic_proof_unavailable;
+    request_dma_report.physical_wrapper_candidate_limit_hit = wrapper_diagnostics.limit_hit;
+    request_dma_report.wrapper_shape_rejections = wrapper_diagnostics.rejections;
+    if wrapper_diagnostics.semantic_proof_unavailable != 0 {
+        request_dma_report.push_open_bounded(format!(
+            "wrapper_semantic_proof_unavailable: {} physical end-address DMA wrapper shape candidate(s) remain candidate-only",
+            wrapper_diagnostics.semantic_proof_unavailable
+        ));
+    }
+    if wrapper_diagnostics.limit_hit {
+        request_dma_report.push_open_bounded(
+            "physical end-address DMA-wrapper inference reached its candidate bound; result is incomplete"
+                .to_string(),
+        );
+    }
+    (db, recovery, request_dma_report)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhysicalWrapperCandidateDiagnostics {
+    candidates_examined: usize,
+    semantic_proof_unavailable: usize,
+    limit_hit: bool,
+    /// Which required dataflow fact each rejected candidate failed to
+    /// establish. Examined-minus-admitted is otherwise an undifferentiated
+    /// number, and on most ROMs it is the whole of the geometry frontier.
+    rejections: pi_dma::WrapperRejectionCensus,
+}
+
+/// Retain wrapper-shape evidence without creating a loader input or mapping.
+/// CFG/path and inner-callee authority are prerequisites for that later step.
+fn record_physical_end_dma_wrapper_candidates(
+    words: &[u32],
+    va_start: u32,
+    db: &mut FactDb,
+) -> PhysicalWrapperCandidateDiagnostics {
+    let inference = pi_dma::infer_physical_end_dma_wrappers(words, va_start);
+    let diagnostics = PhysicalWrapperCandidateDiagnostics {
+        candidates_examined: inference.candidates_examined,
+        semantic_proof_unavailable: inference.admitted.len(),
+        limit_hit: inference.candidate_limit_hit,
+        rejections: inference.rejections,
+    };
+    for wrapper in inference.admitted {
+        db.insert(Fact::Evidence {
+            subject: facts::BankAddr::new(banks::BOOT_BANK, wrapper.entry_va),
+            note: format!(
+                "candidate-only physical end-address DMA wrapper shape at 0x{:x}: {} \
+                 direct call-shaped words; inner DMA-shaped call at 0x{:x}; linear scan \
+                 observed a2-a1 length, cursor advances, length reduction, and a backward \
+                 branch; CFG/path and inner-callee authority remain open",
+                wrapper.entry_va,
+                wrapper.callers.len(),
+                wrapper.nested_dma_call_pc,
+            ),
+        });
+    }
+    diagnostics
 }
 
 /// Which mechanical composition strategy corroborated a ROM's overlay
 /// geometry.
 ///
-/// Declaration order is the evaluation order and the tie-break order, so a
-/// ROM that corroborates two strategies equally always selects the same one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+/// Recovery-strategy declaration order is the deterministic tie-break order.
+/// The two boot-only variants describe the baseline outcome and do not compete
+/// with one another.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryStrategy {
+    /// No boot mapping was proven because the IPL3 or its complete DMA source
+    /// lacked an admitted identity/extent. Other strategies are still
+    /// attempted and may supersede this baseline outcome.
+    BootBankOpen,
     /// Nothing beyond the IPL3 boot copy corroborated. This is a real result,
     /// not a failure: it says the ROM carries no overlay geometry this build
     /// knows how to recover.
@@ -564,6 +849,7 @@ pub enum DiscoveryStrategy {
 impl DiscoveryStrategy {
     pub fn label(self) -> &'static str {
         match self {
+            Self::BootBankOpen => "boot_bank_open",
             Self::BootBankOnly => "boot_bank_only",
             Self::RecoveredVrom => "recovered_vrom",
             Self::RecoveredOverlays => "recovered_overlays",
@@ -575,19 +861,88 @@ impl DiscoveryStrategy {
 /// What one strategy found on this ROM, recorded whether or not it was
 /// selected. Every strategy attempted reports an outcome: a strategy that
 /// recovered nothing is stated, never omitted.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StrategyOutcome {
     pub strategy: DiscoveryStrategy,
     pub candidate_tables: usize,
     pub admitted_tables: usize,
     pub admitted_intervals: usize,
-    /// Proven `RomMapping` facts the strategy's database ended with, including
-    /// the boot bank every strategy establishes.
+    /// Distinct VROM files withheld by a configured complete-file decode cap.
+    /// Nonzero marks a resource frontier, not proven absence.
+    pub decoded_file_limit_hits: usize,
+    /// Proven `RomMapping` facts the strategy's database ended with. The boot
+    /// bank is included only when its IPL3-bound proof completed.
     pub proven_mappings: usize,
     /// Mappings concluded at `Supported` rather than `Proven`. Only the
     /// untabled delta-vote strategy produces these; kept in a separate field so
     /// an inferred mapping can never be counted as a corroborated one.
     pub supported_mappings: usize,
+    /// Bounded request-DMA frontier rows retained by this strategy.
+    pub request_dma_open_rows: usize,
+    /// True when request-DMA or wrapper analysis left any typed/resource
+    /// frontier open. Consumers must not interpret zero new mappings as
+    /// proven absence when this is set.
+    pub request_dma_incomplete: bool,
+    /// Loader inputs beyond the deterministic 64-input prefix were withheld.
+    pub request_dma_input_limit_hit: bool,
+    /// Wrapper-shape callees examined by the bounded candidate classifier.
+    pub physical_wrapper_candidates_examined: usize,
+    /// Wrapper shapes retained as candidates because semantic proof is not
+    /// yet available; these never feed `Proven` mappings.
+    pub wrapper_semantic_proof_unavailable: usize,
+    /// The wrapper candidate classifier exhausted its work bound.
+    pub physical_wrapper_candidate_limit_hit: bool,
+    /// Which required dataflow fact each rejected wrapper candidate failed to
+    /// establish. Omitted from serialized output when empty, so a strategy
+    /// that rejected nothing keeps its historical shape.
+    #[serde(default, skip_serializing_if = "WrapperRejectionCounts::is_empty")]
+    pub wrapper_shape_rejections: WrapperRejectionCounts,
+}
+
+/// Serializable form of [`pi_dma::WrapperRejectionCensus`].
+///
+/// The wrapper proof rule is the dominant geometry frontier across a large
+/// corpus, so naming the unmet fact is what makes those rejections
+/// actionable. Facts cascade -- the loop and cursor facts are only evaluated
+/// once the inner DMA call is recognized -- so one candidate may be counted
+/// under several names and these need not sum to the rejection count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WrapperRejectionCounts {
+    #[serde(default)]
+    pub no_end_minus_start: usize,
+    #[serde(default)]
+    pub no_nested_dma_call: usize,
+    #[serde(default)]
+    pub destination_not_advanced: usize,
+    #[serde(default)]
+    pub physical_not_advanced: usize,
+    #[serde(default)]
+    pub remaining_not_reduced: usize,
+    #[serde(default)]
+    pub no_backward_loop: usize,
+    #[serde(default)]
+    pub no_return: usize,
+}
+
+impl WrapperRejectionCounts {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl From<pi_dma::WrapperRejectionCensus> for WrapperRejectionCounts {
+    fn from(census: pi_dma::WrapperRejectionCensus) -> Self {
+        Self {
+            no_end_minus_start: census.no_end_minus_start,
+            no_nested_dma_call: census.no_nested_dma_call,
+            destination_not_advanced: census.destination_not_advanced,
+            physical_not_advanced: census.physical_not_advanced,
+            remaining_not_reduced: census.remaining_not_reduced,
+            no_backward_loop: census.no_backward_loop,
+            no_return: census.no_return,
+        }
+    }
 }
 
 /// The result of trying every mechanical composition strategy against one ROM.
@@ -600,40 +955,128 @@ pub struct AutoDiscovery {
     pub outcomes: Vec<StrategyOutcome>,
 }
 
+/// Transient resource limits applied by automatic discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoDiscoveryLimits {
+    /// Complete-file VROM decode cap for file-table and overlay recovery.
+    pub vrom_materialization: file_table::VromMaterializationLimits,
+}
+
+impl Default for AutoDiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            vrom_materialization: file_table::VromMaterializationLimits::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AutoDiscoveryWork {
+    normalizations: usize,
+    harvests: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AUTO_DISCOVERY_WORK: std::cell::Cell<AutoDiscoveryWork> =
+        const { std::cell::Cell::new(AutoDiscoveryWork { normalizations: 0, harvests: 0 }) };
+}
+
+fn normalize_for_auto(rom_bytes: &[u8]) -> Result<NormalizedRom, RomRejectReason> {
+    #[cfg(test)]
+    AUTO_DISCOVERY_WORK.with(|work| {
+        let mut counts = work.get();
+        counts.normalizations += 1;
+        work.set(counts);
+    });
+    rom::normalize(rom_bytes)
+}
+
+fn harvest_for_auto(
+    rom: &NormalizedRom,
+    db: &mut FactDb,
+    malformed_mapping: &str,
+    max_decoded_vrom_file_bytes: usize,
+) {
+    #[cfg(test)]
+    AUTO_DISCOVERY_WORK.with(|work| {
+        let mut counts = work.get();
+        counts.harvests += 1;
+        work.set(counts);
+    });
+    harvest::harvest_discovered_candidates_bounded(rom, db, max_decoded_vrom_file_bytes)
+        .expect(malformed_mapping);
+}
+
 /// Run discovery without being told what kind of ROM this is.
 ///
 /// The per-strategy recovery passes are already mechanical -- no table
 /// location, stride, record count, or destination is a caller-supplied game
 /// fact -- but until now the CHOICE of which to run was hardcoded per game in
-/// the gates, so the generic entry point ran none of them and every ROM came
-/// back with the boot copy alone. This tries each and keeps whichever
+/// the gates, so the generic entry point ran none of them and stopped after
+/// the IPL3-bound boot attempt. This tries each and keeps whichever
 /// corroborates, which is the difference between "recompiles ROMs we
 /// hand-wired" and "works out what a ROM is".
 ///
 /// Selection rule: a strategy is admitted only if it proves strictly more ROM
-/// mappings than the boot copy alone, and the strategy proving the most wins.
+/// mappings than the baseline attempt, and the strategy proving the most wins.
 /// Ties break by [`DiscoveryStrategy`] declaration order, so the choice is
 /// deterministic. Nothing is merged across strategies -- the winner's database
 /// is returned whole -- so no strategy can contribute a mapping that its own
 /// admission rules did not justify.
 ///
 /// A ROM that corroborates nothing returns [`DiscoveryStrategy::BootBankOnly`]
-/// with every attempt's outcome recorded. That is the honest answer, and it is
-/// reported rather than presented as success.
+/// when its boot mapping was proven, or [`DiscoveryStrategy::BootBankOpen`]
+/// when that prerequisite remained open. Every attempt's outcome is recorded.
 pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectReason> {
-    // The floor every strategy must beat. Each strategy below also establishes
-    // the boot bank, so this is a like-for-like comparison.
-    let (rom, baseline_db) = run_discovery(rom_bytes, None)?;
+    run_discovery_auto_with_limits(rom_bytes, AutoDiscoveryLimits::default())
+}
+
+/// [`run_discovery_auto`] with explicit transient VROM materialization limits.
+/// Oversized files leave the VROM strategy open and cannot contribute facts.
+pub fn run_discovery_auto_with_limits(
+    rom_bytes: &[u8],
+    limits: AutoDiscoveryLimits,
+) -> Result<AutoDiscovery, RomRejectReason> {
+    // The floor every strategy must beat. Each strategy below repeats the same
+    // IPL3-bound boot attempt, so this is a like-for-like comparison whether
+    // that attempt proves a mapping or records an Open frontier.
+    let rom = normalize_for_auto(rom_bytes)?;
+    let baseline_db = discover_with_load_image_tables(&rom, None, &[]);
     let baseline_mappings = baseline_db.proven_rom_mappings().len();
+    let baseline_strategy = if baseline_db
+        .conclusion("bank:boot")
+        .is_some_and(|conclusion| conclusion.state == facts::ProofState::Proven)
+    {
+        DiscoveryStrategy::BootBankOnly
+    } else {
+        DiscoveryStrategy::BootBankOpen
+    };
     let mut outcomes = vec![StrategyOutcome {
-        strategy: DiscoveryStrategy::BootBankOnly,
+        strategy: baseline_strategy,
         candidate_tables: 0,
         admitted_tables: 0,
         admitted_intervals: 0,
+        decoded_file_limit_hits: 0,
         proven_mappings: baseline_mappings,
         supported_mappings: 0,
+        request_dma_open_rows: 0,
+        request_dma_incomplete: false,
+        request_dma_input_limit_hit: false,
+        physical_wrapper_candidates_examined: 0,
+        wrapper_semantic_proof_unavailable: 0,
+        physical_wrapper_candidate_limit_hit: false,
+        wrapper_shape_rejections: WrapperRejectionCounts::default(),
     }];
-    let mut best: Option<(DiscoveryStrategy, FactDb, usize)> = None;
+    // (strategy, facts, proven mappings, admitted tables). Proven mappings
+    // rank first; admitted tables break a tie. A strategy that admitted a
+    // descriptor table carries strictly better evidence than one that
+    // inferred regions with no table at all, even when both prove the same
+    // mapping count -- measured on five corpus ROMs where `recovered_overlays`
+    // admitted real tables (Ogre Battle 64: 2 tables, 17 intervals) and lost a
+    // 1-vs-1 mappings tie to a tableless strategy.
+    let mut best: Option<(DiscoveryStrategy, FactDb, usize, usize)> = None;
 
     let vrom_input = RecoveredVromOverlayInput {
         search: overlay_regions::SearchConfig::vrom_family(),
@@ -645,8 +1088,12 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
         table_name: "recovered_vrom_overlay_descriptors".to_string(),
         bank_name: banks::BankNamePattern::new("recovered_overlay_", 0, ""),
     };
-    let (_, vrom_db, vrom_recovery, _) =
-        run_discovery_with_recovered_vrom_and_request_dma(rom_bytes, &vrom_input, &[])?;
+    let (vrom_db, vrom_recovery, request_dma_report) = discover_with_recovered_vrom_and_request_dma(
+        &rom,
+        &vrom_input,
+        &[],
+        limits.vrom_materialization,
+    );
     let vrom_mappings = vrom_db.proven_rom_mappings().len();
     outcomes.push(StrategyOutcome {
         strategy: DiscoveryStrategy::RecoveredVrom,
@@ -657,11 +1104,31 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
             .filter(|admission| admission.admitted)
             .count(),
         admitted_intervals: vrom_recovery.admitted_intervals().len(),
+        decoded_file_limit_hits: vrom_recovery.decoded_file_limit_hits.len(),
         proven_mappings: vrom_mappings,
         supported_mappings: 0,
+        request_dma_open_rows: request_dma_report.open.len(),
+        request_dma_incomplete: !request_dma_report.open.is_empty(),
+        request_dma_input_limit_hit: request_dma_report.input_limit_hit,
+        physical_wrapper_candidates_examined: request_dma_report
+            .physical_wrapper_candidates_examined,
+        wrapper_semantic_proof_unavailable: request_dma_report.wrapper_semantic_proof_unavailable,
+        physical_wrapper_candidate_limit_hit: request_dma_report
+            .physical_wrapper_candidate_limit_hit,
+        wrapper_shape_rejections: request_dma_report.wrapper_shape_rejections.into(),
     });
+    let vrom_admitted = vrom_recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .count();
     if vrom_mappings > baseline_mappings {
-        best = Some((DiscoveryStrategy::RecoveredVrom, vrom_db, vrom_mappings));
+        best = Some((
+            DiscoveryStrategy::RecoveredVrom,
+            vrom_db,
+            vrom_mappings,
+            vrom_admitted,
+        ));
     }
 
     let overlay_search = overlay_regions::SearchConfig::aki_family();
@@ -672,8 +1139,8 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
         table_name: "recovered_overlay_descriptors".to_string(),
         bank_name: banks::BankNamePattern::new("recovered_overlay_", 0, ""),
     };
-    let (_, overlay_db, overlay_recovery) =
-        run_discovery_with_recovered_overlay_regions(rom_bytes, &overlay_input)?;
+    let (overlay_db, overlay_recovery) =
+        discover_with_recovered_overlay_regions(&rom, &overlay_input);
     let overlay_mappings = overlay_db.proven_rom_mappings().len();
     outcomes.push(StrategyOutcome {
         strategy: DiscoveryStrategy::RecoveredOverlays,
@@ -684,18 +1151,36 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
             .filter(|admission| admission.admitted)
             .count(),
         admitted_intervals: overlay_recovery.admitted_intervals().len(),
+        decoded_file_limit_hits: 0,
         proven_mappings: overlay_mappings,
         supported_mappings: 0,
+        request_dma_open_rows: 0,
+        request_dma_incomplete: false,
+        request_dma_input_limit_hit: false,
+        physical_wrapper_candidates_examined: 0,
+        wrapper_semantic_proof_unavailable: 0,
+        physical_wrapper_candidate_limit_hit: false,
+        wrapper_shape_rejections: WrapperRejectionCounts::default(),
     });
-    if overlay_mappings > baseline_mappings
-        && best
-            .as_ref()
-            .is_none_or(|(_, _, best_mappings)| overlay_mappings > *best_mappings)
+    let overlay_admitted = overlay_recovery
+        .admissions
+        .iter()
+        .filter(|admission| admission.admitted)
+        .count();
+    // Admitted tables also clear the baseline gate: a table admitted from ROM
+    // bytes is corroborated geometry even when its regions have not yet become
+    // proven mappings, and discarding it leaves the ROM with strictly less
+    // evidence than was recovered.
+    if (overlay_mappings > baseline_mappings || overlay_admitted > 0)
+        && best.as_ref().is_none_or(|(_, _, best_mappings, best_admitted)| {
+            (overlay_mappings, overlay_admitted) > (*best_mappings, *best_admitted)
+        })
     {
         best = Some((
             DiscoveryStrategy::RecoveredOverlays,
             overlay_db,
             overlay_mappings,
+            overlay_admitted,
         ));
     }
 
@@ -712,7 +1197,13 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
     // a region is reachable, resident, or ever loaded. Ordering it last is the
     // guarantee that an inferred mapping never displaces a corroborated one.
     if best.is_none() {
-        let (_, mut untabled_db) = run_discovery(rom_bytes, None)?;
+        let mut untabled_db = baseline_db;
+        harvest_for_auto(
+            &rom,
+            &mut untabled_db,
+            "Phase 2 produced a malformed boot-bank mapping",
+            limits.vrom_materialization.max_decoded_file_bytes,
+        );
         // Extents come from the ledger's UNCLAIMED runs, not fixed windows.
         // That choice is the whole mechanism: WCW World Tour's 352 KiB image
         // scores 328 votes to 25 over its natural extent, and 2-3 votes per
@@ -806,8 +1297,33 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
         // would rightly flag. Observed: WCW's windowed region at
         // 0xab0000-0xac0000 lies inside the extent-proved 0xa69000-0xac1000.
         let candidates: Vec<delta_vote::UntabledRegion> = proved.into_values().collect();
+        // The raw sweep is intentionally ROM-wide, so it can rediscover a
+        // delta-consistent slice inside the already-proven IPL3 copy. Such a
+        // slice is not a new bank: admitting it would duplicate the boot image
+        // under a supported name and make downstream coverage look larger than
+        // the physical load evidence warrants.
+        let baseline_physical_mappings: Vec<(u32, u32)> = untabled_db
+            .proven_rom_mappings()
+            .into_iter()
+            .filter_map(|fact| match fact {
+                Fact::RomMapping {
+                    rom_space: RomAddressSpace::Physical,
+                    rom_start,
+                    rom_end,
+                    ..
+                } => Some((*rom_start, *rom_end)),
+                _ => None,
+            })
+            .collect();
         let regions: Vec<delta_vote::UntabledRegion> = candidates
             .iter()
+            .filter(|region| {
+                !baseline_physical_mappings
+                    .iter()
+                    .any(|&(mapped_start, mapped_end)| {
+                        region.rom_start < mapped_end && mapped_start < region.rom_end
+                    })
+            })
             .filter(|region| {
                 !candidates.iter().any(|other| {
                     other.rom_start <= region.rom_start
@@ -836,11 +1352,7 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
                      0x{:x}..0x{:x} -> VA 0x{:x} (delta 0x{:x}), agreed by {} independent \
                      window(s). Supported, not Proven -- instruction bytes do not prove the \
                      region is reachable, resident, or ever loaded.",
-                    region.rom_start,
-                    region.rom_end,
-                    region.va_start,
-                    region.delta,
-                    region.windows,
+                    region.rom_start, region.rom_end, region.va_start, region.delta, region.windows,
                 ),
             });
             untabled_db
@@ -857,22 +1369,38 @@ pub fn run_discovery_auto(rom_bytes: &[u8]) -> Result<AutoDiscovery, RomRejectRe
             candidate_tables: 0,
             admitted_tables: 0,
             admitted_intervals: regions.len(),
+            decoded_file_limit_hits: 0,
             proven_mappings: untabled_db.proven_rom_mappings().len(),
             supported_mappings: regions.len(),
+            request_dma_open_rows: 0,
+            request_dma_incomplete: false,
+            request_dma_input_limit_hit: false,
+            physical_wrapper_candidates_examined: 0,
+            wrapper_semantic_proof_unavailable: 0,
+            physical_wrapper_candidate_limit_hit: false,
+            wrapper_shape_rejections: WrapperRejectionCounts::default(),
         });
-        if !regions.is_empty() {
-            best = Some((
-                DiscoveryStrategy::UntabledDeltaVote,
-                untabled_db,
-                baseline_mappings,
-            ));
-        }
+        let selected = if regions.is_empty() {
+            baseline_strategy
+        } else {
+            DiscoveryStrategy::UntabledDeltaVote
+        };
+        return Ok(AutoDiscovery {
+            rom,
+            facts: untabled_db,
+            selected,
+            outcomes,
+        });
     }
 
-    let (selected, facts) = match best {
-        Some((strategy, db, _)) => (strategy, db),
-        None => (DiscoveryStrategy::BootBankOnly, baseline_db),
-    };
+    let (selected, mut facts, _, _) =
+        best.expect("a corroborated table strategy was recorded");
+    harvest_for_auto(
+        &rom,
+        &mut facts,
+        "Phase 2 produced a malformed recovered mapping",
+        limits.vrom_materialization.max_decoded_file_bytes,
+    );
     Ok(AutoDiscovery {
         rom,
         facts,
@@ -907,7 +1435,7 @@ pub fn run_discovery_with_manifest_and_request_dma(
         .validate_identity(&rom)
         .map_err(DiscoveryError::Evidence)?;
     let mut db = FactDb::new();
-    banks::discover_boot_bank(&rom, &mut db);
+    let _boot = banks::discover_boot_bank(&rom, &mut db);
     evidence::apply_mapping_evidence(&rom, manifest, &mut db).map_err(DiscoveryError::Evidence)?;
     let report = banks::scan_static_request_dma(&rom, request_dma, &mut db);
     evidence::apply_executable_evidence(manifest, &mut db).map_err(DiscoveryError::Evidence)?;
@@ -917,6 +1445,29 @@ pub fn run_discovery_with_manifest_and_request_dma(
 
 #[cfg(test)]
 mod tests {
+
+    /// Selection ranks proven mappings first and breaks ties on admitted
+    /// tables. Measured on five corpus ROMs (Ogre Battle 64, Gex 64, Bottom of
+    /// the 9th, Air Boarder 64, Batman of the Future) where
+    /// `recovered_overlays` admitted real descriptor tables -- Ogre Battle 64
+    /// admitted 2 producing 17 intervals -- yet tied the baseline at one proven
+    /// mapping and was discarded in favour of a strategy with no table at all.
+    #[test]
+    fn admitted_tables_outrank_a_tableless_strategy_on_a_mappings_tie() {
+        let tableless = (1usize, 0usize);
+        let with_tables = (1usize, 2usize);
+        assert!(
+            with_tables > tableless,
+            "a strategy admitting descriptor tables must win a proven-mapping tie"
+        );
+        // Proven mappings still dominate: more mappings wins regardless of
+        // whether the loser admitted more tables.
+        let more_mappings = (2usize, 0usize);
+        assert!(
+            more_mappings > with_tables,
+            "proven mappings must outrank admitted tables, not the reverse"
+        );
+    }
     use super::*;
 
     fn make_test_rom() -> Vec<u8> {
@@ -930,20 +1481,20 @@ mod tests {
 
     #[test]
     fn auto_discovery_reports_every_strategy_even_when_none_corroborate() {
-        // A ROM with a boot copy and no overlay geometry of any shape. The
+        // A ROM with an unknown synthetic IPL3 and no overlay geometry. The
         // point is not that it recovers nothing -- it is that recovering
         // nothing is REPORTED. A quiet boot-bank-only artifact is otherwise
         // indistinguishable from a successful composition.
         let auto = run_discovery_auto(&make_test_rom()).expect("synthetic ROM normalizes");
 
-        assert_eq!(auto.selected, DiscoveryStrategy::BootBankOnly);
+        assert_eq!(auto.selected, DiscoveryStrategy::BootBankOpen);
         assert_eq!(
             auto.outcomes
                 .iter()
                 .map(|outcome| outcome.strategy)
                 .collect::<Vec<_>>(),
             vec![
-                DiscoveryStrategy::BootBankOnly,
+                DiscoveryStrategy::BootBankOpen,
                 DiscoveryStrategy::RecoveredVrom,
                 DiscoveryStrategy::RecoveredOverlays,
                 DiscoveryStrategy::UntabledDeltaVote,
@@ -957,8 +1508,34 @@ mod tests {
                 outcome.strategy
             );
         }
-        // The boot bank is still established, and is the only proven mapping.
-        assert_eq!(auto.facts.proven_rom_mappings().len(), 1);
+        assert_eq!(auto.facts.proven_rom_mappings().len(), 0);
+        assert_eq!(
+            auto.facts.conclusion("bank:boot").unwrap().state,
+            ProofState::Open
+        );
+    }
+
+    #[test]
+    fn auto_discovery_normalizes_and_harvests_once() {
+        AUTO_DISCOVERY_WORK.with(|work| work.set(AutoDiscoveryWork::default()));
+
+        let bytes = make_test_rom();
+        let auto = run_discovery_auto(&bytes).expect("synthetic ROM normalizes");
+        let work = AUTO_DISCOVERY_WORK.with(std::cell::Cell::get);
+
+        assert_eq!(
+            work,
+            AutoDiscoveryWork {
+                normalizations: 1,
+                harvests: 1,
+            }
+        );
+        let (_, direct) = run_discovery(&bytes, None).expect("synthetic ROM normalizes");
+        assert_eq!(
+            serde_json::to_vec(&auto.facts).unwrap(),
+            serde_json::to_vec(&direct).unwrap(),
+            "single-pass auto discovery must retain the direct boot strategy byte-for-byte"
+        );
     }
 
     #[test]
@@ -968,10 +1545,12 @@ mod tests {
         // the strategy can change underneath it.
         let rom = make_test_rom();
         let first = run_discovery_auto(&rom).expect("synthetic ROM normalizes");
+        let first_facts = serde_json::to_vec(&first.facts).unwrap();
         for _ in 0..3 {
             let again = run_discovery_auto(&rom).expect("synthetic ROM normalizes");
             assert_eq!(first.selected, again.selected);
             assert_eq!(first.outcomes, again.outcomes);
+            assert_eq!(first_facts, serde_json::to_vec(&again.facts).unwrap());
         }
     }
 
@@ -1001,23 +1580,15 @@ mod tests {
     }
 
     #[test]
-    fn run_discovery_without_descriptor_table_still_proves_boot_bank() {
+    fn run_discovery_without_recognized_ipl3_keeps_boot_bank_open() {
         let bytes = make_test_rom();
         let (_rom, db) = run_discovery(&bytes, None).unwrap();
-        assert_eq!(
-            db.conclusion("bank:boot").unwrap().state,
-            ProofState::Proven
-        );
-        assert_eq!(db.proven_function_entries("boot"), vec![0x8000_0400]);
-        assert!(db.facts().iter().any(|fact| matches!(
-            fact,
-            Fact::FunctionEntryClaim {
-                detector: facts::CandidateDetector::HardwareEntrypoint,
-                evidence: facts::FunctionEntryEvidence::RomHeaderEntrypoint,
-                proposed_state: ProofState::Proven,
-                ..
-            }
-        )));
+        assert_eq!(db.conclusion("bank:boot").unwrap().state, ProofState::Open);
+        assert!(db.proven_function_entries("boot").is_empty());
+        assert!(!db
+            .facts()
+            .iter()
+            .any(|fact| matches!(fact, Fact::RomMapping { bank, .. } if bank == "boot")));
     }
 
     #[test]
@@ -1043,7 +1614,7 @@ mod tests {
         put_u32(&mut bytes, 8, 0x8000_0400);
 
         // Three-record physical file table: the identity image, one file
-        // carrying the descriptor table, and one carrying both overlays.
+        // carrying the descriptor table, and one carrying all overlays.
         for (index, fields) in [
             [0x0000, 0x3000, 0x0000, 0x0000],
             [0x3000, 0x6000, 0x8000, 0x0000],
@@ -1057,7 +1628,14 @@ mod tests {
             }
         }
 
-        let descriptors = [(0x6000, 0x6800, 0x8002_0000), (0x7000, 0x7800, 0x8003_0000)];
+        // The 0x1c run contains all three records while the configured 0x38
+        // stride also finds records zero and two. Exact record geometries
+        // shared by those distinct admitted tables must still mint one bank.
+        let descriptors = [
+            (0x6000, 0x6800, 0x8002_0000),
+            (0x7000, 0x7800, 0x8003_0000),
+            (0x8000, 0x8800, 0x8004_0000),
+        ];
         for (index, (vrom_start, vrom_end, vram)) in descriptors.into_iter().enumerate() {
             let base = 0x8000 + index * 0x1c;
             put_u32(&mut bytes, base, vrom_start);
@@ -1073,9 +1651,9 @@ mod tests {
             file_table_search: file_table::FileTableSearchConfig::n64_family(),
             vrom_min_records: 2,
             min_mapped_regions: 2,
-            file_table_name: "recovered_files".into(),
-            table_name: "recovered_overlays".into(),
-            bank_name: banks::BankNamePattern::new("recovered_", 0, ""),
+            file_table_name: "recovered_file_table".into(),
+            table_name: "recovered_vrom_overlay_descriptors".into(),
+            bank_name: banks::BankNamePattern::new("recovered_overlay_", 0, ""),
         };
         let (_, db, recovery) =
             run_discovery_with_recovered_vrom_overlay_regions(&bytes, &input).unwrap();
@@ -1088,7 +1666,17 @@ mod tests {
                 .map(|table| table.table_rom_offset),
             Some(0x2000)
         );
-        assert_eq!(recovery.admitted_intervals().len(), 2);
+        assert_eq!(recovery.admitted_intervals().len(), 3);
+        assert!(
+            recovery
+                .admissions
+                .iter()
+                .filter(|admission| admission.admitted)
+                .flat_map(|admission| &admission.table.records)
+                .count()
+                > recovery.admitted_intervals().len(),
+            "fixture must contain exact records repeated across admitted tables"
+        );
         let overlay_mappings: Vec<_> = db
             .proven_rom_mappings()
             .into_iter()
@@ -1096,7 +1684,10 @@ mod tests {
                 |fact| matches!(fact, Fact::RomMapping { bank, .. } if bank != banks::BOOT_BANK),
             )
             .collect();
-        assert_eq!(overlay_mappings.len(), 2);
+        assert_eq!(overlay_mappings.len(), 3);
+        assert!(overlay_mappings.iter().enumerate().all(|(index, fact)| {
+            matches!(fact, Fact::RomMapping { bank, .. } if bank == &format!("recovered_overlay_{index}"))
+        }));
         assert!(overlay_mappings.iter().all(|fact| matches!(
             fact,
             Fact::RomMapping {
@@ -1104,5 +1695,76 @@ mod tests {
                 ..
             }
         )));
+
+        AUTO_DISCOVERY_WORK.with(|work| work.set(AutoDiscoveryWork::default()));
+        let auto = run_discovery_auto(&bytes).expect("synthetic VROM ROM normalizes");
+        assert_eq!(auto.selected, DiscoveryStrategy::RecoveredVrom);
+        assert_eq!(
+            AUTO_DISCOVERY_WORK.with(std::cell::Cell::get),
+            AutoDiscoveryWork {
+                normalizations: 1,
+                harvests: 1,
+            }
+        );
+        assert_eq!(
+            serde_json::to_vec(&auto.facts).unwrap(),
+            serde_json::to_vec(&db).unwrap(),
+            "single-pass auto discovery must retain the selected VROM strategy byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn auto_discovery_reports_oversized_vrom_file_without_harvesting_it() {
+        const HUGE_FILE_BYTES: u32 = 0x0800_0000;
+        let mut bytes = vec![0u8; 0xf000];
+        put_u32(&mut bytes, 0, 0x8037_1240);
+        put_u32(&mut bytes, 8, 0x8000_0400);
+        for (index, fields) in [
+            [0x0000, 0x3000, 0x0000, 0x0000],
+            [0x3000, 0x6000, 0x8000, 0x0000],
+            [0x6000, 0x9000, 0xb000, 0x0000],
+            [0x9000, 0x9000 + HUGE_FILE_BYTES, 0xe000, 0xe010],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (field, value) in fields.into_iter().enumerate() {
+                put_u32(&mut bytes, 0x2000 + index * 0x10 + field * 4, value);
+            }
+        }
+        for (index, (vrom_start, vrom_end, vram)) in
+            [(0x6000, 0x6800, 0x8002_0000), (0x7000, 0x7800, 0x8003_0000)]
+                .into_iter()
+                .enumerate()
+        {
+            let base = 0x8000 + index * 0x1c;
+            put_u32(&mut bytes, base, vrom_start);
+            put_u32(&mut bytes, base + 4, vrom_end);
+            put_u32(&mut bytes, base + 8, vram);
+            let physical = 0xb000 + (vrom_start - 0x6000) as usize;
+            plant_delta_admissible_region(&mut bytes, physical, vram);
+        }
+        bytes[0xe000..0xe004].copy_from_slice(b"Yaz0");
+        put_u32(&mut bytes, 0xe004, HUGE_FILE_BYTES);
+
+        let auto = run_discovery_auto_with_limits(
+            &bytes,
+            AutoDiscoveryLimits {
+                vrom_materialization: file_table::VromMaterializationLimits {
+                    max_decoded_file_bytes: 0x4000,
+                },
+            },
+        )
+        .expect("bounded synthetic VROM ROM normalizes");
+        let vrom = auto
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.strategy == DiscoveryStrategy::RecoveredVrom)
+            .expect("VROM strategy reports an outcome");
+        assert_eq!(vrom.decoded_file_limit_hits, 1);
+        assert_eq!(auto.selected, DiscoveryStrategy::RecoveredVrom);
+        assert!(!auto.facts.proven_rom_mappings().iter().any(
+            |fact| matches!(fact, Fact::RomMapping { bank, .. } if bank.starts_with("request_dma_"))
+        ));
     }
 }

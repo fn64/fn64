@@ -143,7 +143,7 @@ and scope limits that make an open item meaningful.
   into RT64 so PAL stable-factor workloads derive from 50 Hz rather than the
   pinned upstream 60 Hz constant. Ten fresh live Metal processes prove the
   production-context PAL/MPAL workload sequences `[0,0,0,50]` and
-  `[0,0,0,60]` without an Extended refresh override. Report schema v28 now
+  `[0,0,0,60]` without an Extended refresh override. Report schema v29 now
   co-binds normalized ROM TV region, committed device TV state, and renderer
   create-time TV configuration; representative private PAL/MPAL exact-ten
   evidence remains to be retained. cpal
@@ -731,7 +731,7 @@ and deterministic output traces.
   evidence binds the physical spans/words and each mapped entry's exact
   `BankId`/PA sequence, preflight-expected words, and generated artifact
   identity. Artifact-identified mapped AOT destination observations carry that
-  real artifact and are schema-v28 fixed-cycle eligible; compatibility AOT
+  real artifact and are schema-v29 fixed-cycle eligible; compatibility AOT
   without one and mapped-interpreter observations are not. The latter remain
   operational/differential-only until a successor typed destination schema
   exists. Multiple matches remain loud. Data-side Status.KSU plus UX/SX/KX now
@@ -1010,13 +1010,9 @@ Everything else is now owned here. After D-gate, only a user's own ROM remains.
   knobs are now `FN64_*`; `fn64-render-rt64`'s `debug_flag()` and `fn64-abi`'s
   `assert_no_legacy_env_vars()` panic on a retired `OOT_*` spelling so an old
   invocation cannot silently no-op. `examples/` keeps `OOT_*` by design.
-- [ ] **H3 `fn64-discover` gates cannot run off the author's machine.** Not
-  env vars with defaults — compile-time `const`s: `gate_b1.rs:18/20-22`,
-  `gate_d1.rs:18-19/24-27`, `gate_b2.rs:39/51` hold
-  `/Users/jer/Downloads/...z64` and `/Users/jer/Code/aki-recomp/...`. The
-  D1/B1 grading numbers cited in Phase D are reproducible by exactly one
-  person. Fix: env var + a loud, named skip when unset (never a silent pass —
-  that is the "silent shrug" AGENTS.md bans).
+- [x] **H3 `fn64-discover` gate inputs are explicit and portable.** B1, D1,
+  and B2 require named runtime `FN64_DISCOVER_*` inputs, compile no personal
+  paths or defaults, and fail loudly with the missing variable.
 
 - [ ] **H4 `cargo test -p fn64-abi` flakes ~60%; nextest does NOT.** Measured
   2026-07-17 across the day: `cargo test -p fn64-abi --lib` ->

@@ -166,7 +166,7 @@ mod tests {
     fn rejects_duplicate_report_duplicate_journal_and_same_pair_path() {
         let manifest = existing("Cargo.toml");
         let library = existing("src/lib.rs");
-        let gate = existing("src/release_gate.rs");
+        let gate = existing("src/release_gate/mod.rs");
         assert!(validate_distinct_paths(&[
             (library.clone(), manifest.clone()),
             (library.clone(), gate.clone()),

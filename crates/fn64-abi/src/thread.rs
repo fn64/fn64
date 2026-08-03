@@ -53,6 +53,8 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
     let arg = ctx.r7;
     let sp = read_stack_word(rdram, ctx.r29, 0x10) as u64;
     let priority = read_stack_word(rdram, ctx.r29, 0x14) as Priority;
+    #[cfg(feature = "recomp-rs")]
+    let initial_recompiled_status = crate::recompiled::take_pending_osthread_status();
 
     // Libultra's OSId is an informational tag, not a key: thread identity on
     // real hardware is the OSThread struct pointer, and NWXE's retail boot
@@ -74,6 +76,7 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
 
     with_host(|host| {
         host.thread_handles.insert(thread_handle.offset(), id);
+        host.thread_handle_vrams.insert(id, ctx.r4 as u32);
         host.thread_guest_ids.insert(id, requested_osid);
     });
     if crate::boot_probe_enabled() {
@@ -95,7 +98,15 @@ pub unsafe extern "C" fn osCreateThread_recomp(rdram: *mut u8, ctx: *mut RecompC
             with_active_yielder(id, rdram_ptr, yielder, || {
                 let _ = first_input; // Resume::Start; nothing to hand back at thread entry
                 #[cfg(feature = "recomp-rs")]
-                if unsafe { recompiled::run_registered_entry(rdram_ptr, entry_vram, arg, sp) } {
+                if unsafe {
+                    recompiled::run_registered_entry(
+                        rdram_ptr,
+                        entry_vram,
+                        arg,
+                        sp,
+                        initial_recompiled_status,
+                    )
+                } {
                     return;
                 }
                 let func_ptr = get_function(entry_vram as i32);
@@ -139,6 +150,19 @@ pub unsafe extern "C" fn osStartThread_recomp(_rdram: *mut u8, ctx: *mut RecompC
     let ctx = unsafe { &*ctx };
     let id = resolve_thread_arg(ctx.r4, "osStartThread_recomp");
     with_executor(|exec| exec.start_thread(id));
+    if ACTIVE_YIELDER.with(|active| active.get().is_some()) {
+        // Interleaving closed here: caller starts higher-priority B -> caller
+        // returns from the host shim and reaches its next guest instruction
+        // before B runs. The libultra scheduling boundary must return control
+        // to the executor first; its priority queue then chooses B (or chooses
+        // the caller again when B does not outrank it).
+        let resumed = suspend_active_coroutine(Yield::PauseSelf);
+        assert_eq!(
+            resumed,
+            Resume::Continue,
+            "osStartThread_recomp: voluntary scheduling boundary resumed with {resumed:?}"
+        );
+    }
 }
 
 /// `osSetThreadPri(OSThread *t, OSPri pri)` -- `a0`=t (`ctx->r4`), `a1`=pri
@@ -318,6 +342,35 @@ mod tests {
         with_executor(|exec| {
             assert_eq!(exec.thread_pri(200), 50);
         });
+    }
+
+    #[test]
+    fn start_thread_yields_before_caller_continues_to_higher_priority_guest() {
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let child_order = order.clone();
+        with_executor(|exec| {
+            exec.create_thread(302, 20, move |yielder, first_input| {
+                with_active_yielder(302, std::ptr::null_mut(), yielder, || {
+                    assert_eq!(first_input, Resume::Start);
+                    child_order.borrow_mut().push("child");
+                });
+            });
+        });
+        register_test_thread_handle(0x8000_0302, 302);
+
+        let caller_order = order.clone();
+        spawn_test_thread(301, 10, move || {
+            caller_order.borrow_mut().push("caller-before");
+            let mut ctx = ctx_with(0x8000_0302, 0, 0);
+            unsafe { osStartThread_recomp(std::ptr::null_mut(), &mut ctx as *mut _) };
+            caller_order.borrow_mut().push("caller-after");
+        });
+        run_to_idle_with_yielder_plumbing();
+
+        assert_eq!(
+            *order.borrow(),
+            vec!["caller-before", "child", "caller-after"]
+        );
     }
 
     #[test]

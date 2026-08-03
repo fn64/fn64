@@ -43,6 +43,9 @@
 #![forbid(unsafe_code)]
 
 pub mod characterize;
+pub mod compact_abi;
+pub mod compact_dsp_abi;
+pub mod compact_memory_abi;
 pub mod hle;
 // The former ucode-phase commit candidate compared a reduced visible-state
 // projection and accepted an independently supplied LLE result. Keep its

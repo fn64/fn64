@@ -47,7 +47,9 @@ export ROM="${ROM:-$FN64_GAME_DIR/games/OOTU/oot-ntsc-1.0.z64}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 export FN64_RECOMP="${FN64_RECOMP:-c}"
 export RECOMP_RS_DIR="${RECOMP_RS_DIR:-/tmp/fn64-recomp-rs-oot}"
-export FN64_RS_EXECUTION="${FN64_RS_EXECUTION:-function}"
+if [[ "$FN64_RECOMP" == "rs" ]]; then
+  export FN64_RS_EXECUTION="${FN64_RS_EXECUTION:-function}"
+fi
 
 BIN="$FN64/examples/oot-boot/target/release/oot-boot"
 IDENTITY_WIRE_BIN="$FN64/examples/oot-boot/target/release/write-function-identity-wire"
@@ -112,7 +114,9 @@ case "$cmd" in
     build
     swaps="${1:-6}"
     OOT_MAX_SWAPS="$swaps" "$BIN" 2>&1 | grep -iE "swap #|VI swaps observed|gfx tasks|NON-CLEAR|dumped|exceeds|get_function|vram 0x|stopping early|panicked|EXIT" | tail -15
+    run_status=$?
     echo "PNGs: $(ls /tmp/fn64-oot-render-*.png 2>/dev/null | wc -l | tr -d ' ') in /tmp/fn64-oot-render-*.png"
+    exit "$run_status"
     ;;
   where)
     build

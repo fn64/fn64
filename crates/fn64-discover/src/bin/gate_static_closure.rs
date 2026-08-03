@@ -6,8 +6,9 @@
 //! interval to executable or claim that discovery recovered its boundaries.
 
 use fn64_discover::normalize;
-use fn64_recomp_rs::{
-    classify_bank_words, emit_bank_runner, BankId, BankInput, BankWordCatalog, BankWordKind,
+use fn64_recomp_rs::BankId;
+use fn64_recomp_rs_codegen::{
+    classify_bank_words, emit_bank_runner, BankInput, BankWordCatalog, BankWordKind,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

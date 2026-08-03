@@ -48,29 +48,16 @@
 //! a small generated-code harness — executes the caller so the emitted
 //! cross-call reaches the callee and produces the expected FPU state.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-use fn64_recomp_rs::{
-    decode, emit_function, fpu, round_ties_even_f32, round_ties_even_f64, FuncInput, Instruction,
-    Rdram, RecompContext,
-};
+mod support;
+use support::dev_interpreter_rlib;
 
-fn current_rlib(deps: &Path) -> PathBuf {
-    std::fs::read_dir(deps)
-        .expect("read target deps directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
-                })
-        })
-        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-        .expect("fn64_recomp_rs rlib beside integration test")
-}
+use fn64_recomp_rs::{
+    decode, fpu, round_ties_even_f32, round_ties_even_f64, Instruction, Rdram, RecompContext,
+};
+use fn64_recomp_rs_codegen::{emit_function, FuncInput};
 
 fn compile_and_run_whole_function(emitted: &str, main_body: &str) -> String {
     let source = format!(
@@ -96,7 +83,7 @@ fn main() {{
         .parent()
         .expect("target deps directory")
         .to_path_buf();
-    let rlib = current_rlib(&deps);
+    let rlib = dev_interpreter_rlib(&deps);
     let compile = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--edition=2021")
         .arg(&source_path)

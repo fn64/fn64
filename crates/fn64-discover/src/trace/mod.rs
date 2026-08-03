@@ -1,0 +1,1422 @@
+//! Bounded dynamic-trace interchange for discovery.
+//!
+//! A trace is a JSONL stream bound to the SHA-256 of the normalized
+//! big-endian ROM. Records are strictly sequenced so truncation, duplication,
+//! and accidental concatenation fail loudly. Dynamic events are observations:
+//! an observed target proves that one transfer happened, never that the target
+//! set is complete. A completed producer may separately state bounded
+//! instrumentation guarantees in the final record.
+//!
+//! Bank identity is deliberately explicit at every address. `Unknown` is
+//! preserved through ingestion; this module never assigns a bank from a VA.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::fmt;
+use std::io::BufRead;
+
+pub const TRACE_SCHEMA_VERSION: u32 = 1;
+pub const MAX_JSONL_RECORD_BYTES: usize = 1024 * 1024;
+pub const EXECUTABLE_IMAGE_SCHEMA: &str = "fn64.executable-image.v1";
+const PI_DRAM_ADDRESS_SPACE_BYTES: u32 = 0x0100_0000;
+const PI_MAX_TRANSFER_BYTES: u32 = 0x0100_0000;
+
+/// SHA-256 of the Phase-1 normalized, big-endian ROM bytes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NormalizedRomDigest(String);
+
+impl NormalizedRomDigest {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for NormalizedRomDigest {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() != 64 {
+            return Err("normalized ROM SHA-256 must contain exactly 64 hex digits");
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("normalized ROM SHA-256 must use lowercase hexadecimal");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<NormalizedRomDigest> for String {
+    fn from(value: NormalizedRomDigest) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutableImageLineage {
+    InitialIplDma,
+    DirectRomDma,
+    TableDrivenOverlay,
+    CpuProduced,
+    SelfModifiedGeneration,
+}
+
+/// One completed executable generation captured at its first attempted
+/// fetch. Words are retained in architectural big-endian value order so an
+/// offline pack can emit the exact observed image without runtime codegen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableImageCapture {
+    pub schema: String,
+    pub producer: String,
+    pub normalized_rom_sha256: NormalizedRomDigest,
+    pub image_id: String,
+    pub lineage: ExecutableImageLineage,
+    pub generation: u64,
+    pub capture_pc: u32,
+    pub first_executed_pc: u32,
+    pub retired_instructions: u64,
+    pub va_start: u32,
+    pub byte_len: u32,
+    pub sha256: String,
+    pub words: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutableImageCaptureError {
+    Json(String),
+    UnsupportedSchema(String),
+    RomIdentityMismatch,
+    EmptyField(&'static str),
+    UnalignedAddress { field: &'static str, value: u32 },
+    InvalidByteLength(u32),
+    RangeOverflow,
+    FirstPcOutsideImage,
+    WordCountMismatch { byte_len: u32, words: usize },
+    InvalidSha256,
+    ContentDigestMismatch { declared: String, actual: String },
+}
+
+#[derive(Debug)]
+pub enum ReproducibleExecutableImageError {
+    TooFewCaptures {
+        minimum: usize,
+        actual: usize,
+    },
+    InvalidCapture {
+        index: usize,
+        error: ExecutableImageCaptureError,
+    },
+    ObservationMismatch {
+        index: usize,
+    },
+}
+
+impl fmt::Display for ReproducibleExecutableImageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ReproducibleExecutableImageError {}
+
+fn same_reproducible_executable_image(
+    reference: &ExecutableImageCapture,
+    candidate: &ExecutableImageCapture,
+) -> bool {
+    reference.schema == candidate.schema
+        && reference.producer == candidate.producer
+        && reference.normalized_rom_sha256 == candidate.normalized_rom_sha256
+        && reference.image_id == candidate.image_id
+        && reference.lineage == candidate.lineage
+        && reference.generation == candidate.generation
+        && reference.capture_pc == candidate.capture_pc
+        && reference.first_executed_pc == candidate.first_executed_pc
+        && reference.va_start == candidate.va_start
+        && reference.byte_len == candidate.byte_len
+        && reference.sha256 == candidate.sha256
+        && reference.words == candidate.words
+}
+
+/// Validate one independently repeated executable-image observation group.
+///
+/// Route-length metadata is intentionally not an image-identity field; the
+/// producer, capture/fetch PCs, lineage, geometry, digest, and exact words must
+/// all agree. The first validated capture is returned as the canonical group
+/// representative.
+pub fn parse_reproducible_executable_image_group(
+    documents: &[Vec<u8>],
+    expected_rom: &NormalizedRomDigest,
+    minimum_captures: usize,
+) -> Result<ExecutableImageCapture, ReproducibleExecutableImageError> {
+    if documents.len() < minimum_captures {
+        return Err(ReproducibleExecutableImageError::TooFewCaptures {
+            minimum: minimum_captures,
+            actual: documents.len(),
+        });
+    }
+    let mut reference = None;
+    for (index, document) in documents.iter().enumerate() {
+        let candidate = parse_executable_image_capture(document, expected_rom)
+            .map_err(|error| ReproducibleExecutableImageError::InvalidCapture { index, error })?;
+        if let Some(known) = reference.as_ref() {
+            if !same_reproducible_executable_image(known, &candidate) {
+                return Err(ReproducibleExecutableImageError::ObservationMismatch { index });
+            }
+        } else {
+            reference = Some(candidate);
+        }
+    }
+    reference.ok_or(ReproducibleExecutableImageError::TooFewCaptures {
+        minimum: minimum_captures,
+        actual: 0,
+    })
+}
+
+impl fmt::Display for ExecutableImageCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ExecutableImageCaptureError {}
+
+pub fn parse_executable_image_capture(
+    bytes: &[u8],
+    expected_rom: &NormalizedRomDigest,
+) -> Result<ExecutableImageCapture, ExecutableImageCaptureError> {
+    let capture: ExecutableImageCapture = serde_json::from_slice(bytes)
+        .map_err(|error| ExecutableImageCaptureError::Json(error.to_string()))?;
+    if capture.schema != EXECUTABLE_IMAGE_SCHEMA {
+        return Err(ExecutableImageCaptureError::UnsupportedSchema(
+            capture.schema,
+        ));
+    }
+    if &capture.normalized_rom_sha256 != expected_rom {
+        return Err(ExecutableImageCaptureError::RomIdentityMismatch);
+    }
+    for (field, value) in [
+        ("producer", capture.producer.as_str()),
+        ("image_id", capture.image_id.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ExecutableImageCaptureError::EmptyField(field));
+        }
+    }
+    for (field, value) in [
+        ("capture_pc", capture.capture_pc),
+        ("first_executed_pc", capture.first_executed_pc),
+        ("va_start", capture.va_start),
+    ] {
+        if value & 3 != 0 {
+            return Err(ExecutableImageCaptureError::UnalignedAddress { field, value });
+        }
+    }
+    if capture.byte_len == 0 || capture.byte_len & 3 != 0 {
+        return Err(ExecutableImageCaptureError::InvalidByteLength(
+            capture.byte_len,
+        ));
+    }
+    let va_end = capture
+        .va_start
+        .checked_add(capture.byte_len)
+        .ok_or(ExecutableImageCaptureError::RangeOverflow)?;
+    if !(capture.va_start..va_end).contains(&capture.first_executed_pc) {
+        return Err(ExecutableImageCaptureError::FirstPcOutsideImage);
+    }
+    if capture.words.len() != capture.byte_len as usize / 4 {
+        return Err(ExecutableImageCaptureError::WordCountMismatch {
+            byte_len: capture.byte_len,
+            words: capture.words.len(),
+        });
+    }
+    if NormalizedRomDigest::try_from(capture.sha256.clone()).is_err() {
+        return Err(ExecutableImageCaptureError::InvalidSha256);
+    }
+    let content = capture
+        .words
+        .iter()
+        .flat_map(|word| word.to_be_bytes())
+        .collect::<Vec<_>>();
+    let actual = format!("{:x}", Sha256::digest(content));
+    if capture.sha256 != actual {
+        return Err(ExecutableImageCaptureError::ContentDigestMismatch {
+            declared: capture.sha256,
+            actual,
+        });
+    }
+    Ok(capture)
+}
+
+impl Serialize for NormalizedRomDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for NormalizedRomDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The producer's bank identity at one observation. Activation distinguishes
+/// two lifetimes of the same named overlay without inventing new bank names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BankContext {
+    Unknown,
+    Known { bank: String, activation: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ObservedAddress {
+    pub address: u32,
+    pub bank: BankContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiDmaDirection {
+    CartToRdram,
+    RdramToCart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndirectTransferKind {
+    Call,
+    Jump,
+    Return,
+    ExceptionReturn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchedValueWidth {
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl WatchedValueWidth {
+    fn bytes(self) -> u32 {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+            Self::U32 => 4,
+            Self::U64 => 8,
+        }
+    }
+
+    fn accepts(self, value: u64) -> bool {
+        match self {
+            Self::U8 => value <= u8::MAX.into(),
+            Self::U16 => value <= u16::MAX.into(),
+            Self::U32 => value <= u32::MAX.into(),
+            Self::U64 => true,
+        }
+    }
+}
+
+/// What an instrumentation guarantee covers. Such a guarantee means the
+/// producer recorded every event of this class during its sequence interval;
+/// it does not claim all possible program behavior was exercised.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "domain", rename_all = "snake_case")]
+pub enum CoverageDomain {
+    PiDma,
+    ExecutedPc,
+    IndirectTransfer,
+    WatchedTableWrite { watch_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ExhaustivenessClaim {
+    #[serde(flatten)]
+    pub domain: CoverageDomain,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceCompletion {
+    Completed,
+    Aborted,
+}
+
+/// One input line. The header must be sequence zero and the end record must be
+/// last. Every intervening sequence number must increase by exactly one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum TraceRecord {
+    Header {
+        sequence: u64,
+        schema_version: u32,
+        normalized_rom_sha256: NormalizedRomDigest,
+        trace_id: String,
+        producer: String,
+    },
+    PiDma {
+        sequence: u64,
+        direction: PiDmaDirection,
+        cart_address: u32,
+        dram_address: u32,
+        byte_len: u32,
+        active_bank: BankContext,
+    },
+    ExecutedPc {
+        sequence: u64,
+        pc: ObservedAddress,
+    },
+    IndirectTransfer {
+        sequence: u64,
+        kind: IndirectTransferKind,
+        site: ObservedAddress,
+        target: ObservedAddress,
+    },
+    WatchedTableWrite {
+        sequence: u64,
+        watch_id: String,
+        address: u32,
+        width: WatchedValueWidth,
+        value: u64,
+        active_bank: BankContext,
+    },
+    End {
+        sequence: u64,
+        completion: TraceCompletion,
+        exhaustiveness: Vec<ExhaustivenessClaim>,
+    },
+}
+
+impl TraceRecord {
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Header { sequence, .. }
+            | Self::PiDma { sequence, .. }
+            | Self::ExecutedPc { sequence, .. }
+            | Self::IndirectTransfer { sequence, .. }
+            | Self::WatchedTableWrite { sequence, .. }
+            | Self::End { sequence, .. } => *sequence,
+        }
+    }
+}
+
+/// Typed observations ready for a later adapter into `FactDb`. None of these
+/// variants asserts that an observed set is exhaustive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "fact", rename_all = "snake_case")]
+pub enum ObservedTraceFact {
+    PiDma {
+        sequence: u64,
+        direction: PiDmaDirection,
+        cart_address: u32,
+        dram_address: u32,
+        byte_len: u32,
+        active_bank: BankContext,
+    },
+    ExecutedPc {
+        sequence: u64,
+        pc: ObservedAddress,
+    },
+    IndirectTransfer {
+        sequence: u64,
+        kind: IndirectTransferKind,
+        site: ObservedAddress,
+        target: ObservedAddress,
+    },
+    WatchedTableWrite {
+        sequence: u64,
+        watch_id: String,
+        address: u32,
+        width: WatchedValueWidth,
+        value: u64,
+        active_bank: BankContext,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEventCounts {
+    pub pi_dma: u64,
+    pub executed_pc: u64,
+    pub indirect_transfer: u64,
+    pub watched_table_write: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceHeader {
+    pub schema_version: u32,
+    pub normalized_rom_sha256: NormalizedRomDigest,
+    pub trace_id: String,
+    pub producer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestReport {
+    pub header: TraceHeader,
+    pub completion: TraceCompletion,
+    pub final_sequence: u64,
+    pub counts: TraceEventCounts,
+    pub observations_with_unknown_bank: u64,
+    pub facts: Vec<ObservedTraceFact>,
+    pub exhaustiveness: Vec<ExhaustivenessClaim>,
+}
+
+/// Return the distinct PCs a trace actually observed in one exact bank
+/// generation.
+///
+/// These are scenario observations, not a claim that the returned set is
+/// exhaustive. The bank name and activation are both required so overlapping
+/// VA generations cannot be merged merely because their numeric PCs match.
+/// Unknown-bank observations and events from every other generation remain
+/// outside the result.
+pub fn observed_execution_roots(
+    report: &IngestReport,
+    bank: &str,
+    activation: u64,
+) -> BTreeSet<u32> {
+    report
+        .facts
+        .iter()
+        .filter_map(|fact| {
+            let ObservedTraceFact::ExecutedPc { pc, .. } = fact else {
+                return None;
+            };
+            match &pc.bank {
+                BankContext::Known {
+                    bank: observed_bank,
+                    activation: observed_activation,
+                } if observed_bank == bank && *observed_activation == activation => {
+                    Some(pc.address)
+                }
+                BankContext::Unknown | BankContext::Known { .. } => None,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceIngestError {
+    pub line: usize,
+    pub message: String,
+}
+
+impl TraceIngestError {
+    fn at(line: usize, message: impl Into<String>) -> Self {
+        Self {
+            line,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for TraceIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.line == 0 {
+            write!(formatter, "trace: {}", self.message)
+        } else {
+            write!(formatter, "trace line {}: {}", self.line, self.message)
+        }
+    }
+}
+
+impl std::error::Error for TraceIngestError {}
+
+fn validate_nonempty(line: usize, label: &str, value: &str) -> Result<(), TraceIngestError> {
+    if value.trim().is_empty() {
+        Err(TraceIngestError::at(
+            line,
+            format!("{label} must not be empty"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_bank(line: usize, bank: &BankContext) -> Result<bool, TraceIngestError> {
+    match bank {
+        BankContext::Unknown => Ok(true),
+        BankContext::Known { bank, .. } => {
+            validate_nonempty(line, "bank", bank)?;
+            Ok(false)
+        }
+    }
+}
+
+fn validate_instruction_address(
+    line: usize,
+    label: &str,
+    address: &ObservedAddress,
+) -> Result<u64, TraceIngestError> {
+    if address.address & 3 != 0 {
+        return Err(TraceIngestError::at(
+            line,
+            format!("{label} 0x{:08x} is not four-byte aligned", address.address),
+        ));
+    }
+    Ok(u64::from(validate_bank(line, &address.bank)?))
+}
+
+/// Ingest one complete trace, rejecting records bound to another normalized
+/// ROM. Output ordering is input sequence ordering and uses only ordered
+/// collections for validation, so repeated ingestion is byte-deterministic
+/// under `serde_json` serialization.
+pub fn ingest_jsonl<R: BufRead>(
+    mut reader: R,
+    expected_rom: &NormalizedRomDigest,
+) -> Result<IngestReport, TraceIngestError> {
+    let mut raw = String::new();
+    let mut line_number = 0usize;
+    let mut header = None;
+    let mut next_sequence = 0u64;
+    let mut facts = Vec::new();
+    let mut counts = TraceEventCounts::default();
+    let mut unknown_bank_count = 0u64;
+    let mut end = None;
+
+    loop {
+        raw.clear();
+        let bytes = reader
+            .read_line(&mut raw)
+            .map_err(|error| TraceIngestError::at(line_number + 1, error.to_string()))?;
+        if bytes == 0 {
+            break;
+        }
+        line_number += 1;
+        if bytes > MAX_JSONL_RECORD_BYTES {
+            return Err(TraceIngestError::at(
+                line_number,
+                format!("record exceeds {MAX_JSONL_RECORD_BYTES} bytes"),
+            ));
+        }
+        let trimmed = raw.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            return Err(TraceIngestError::at(
+                line_number,
+                "blank records are not permitted",
+            ));
+        }
+        if end.is_some() {
+            return Err(TraceIngestError::at(
+                line_number,
+                "record appears after end",
+            ));
+        }
+
+        let record: TraceRecord = serde_json::from_str(trimmed)
+            .map_err(|error| TraceIngestError::at(line_number, error.to_string()))?;
+        if record.sequence() != next_sequence {
+            return Err(TraceIngestError::at(
+                line_number,
+                format!(
+                    "expected sequence {next_sequence}, found {}",
+                    record.sequence()
+                ),
+            ));
+        }
+        next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or_else(|| TraceIngestError::at(line_number, "sequence overflow after u64::MAX"))?;
+
+        match record {
+            TraceRecord::Header {
+                sequence: _,
+                schema_version,
+                normalized_rom_sha256,
+                trace_id,
+                producer,
+            } => {
+                if header.is_some() || !facts.is_empty() {
+                    return Err(TraceIngestError::at(line_number, "header is not first"));
+                }
+                if schema_version != TRACE_SCHEMA_VERSION {
+                    return Err(TraceIngestError::at(
+                        line_number,
+                        format!(
+                            "unsupported schema version {schema_version}; expected {TRACE_SCHEMA_VERSION}"
+                        ),
+                    ));
+                }
+                if &normalized_rom_sha256 != expected_rom {
+                    return Err(TraceIngestError::at(
+                        line_number,
+                        "normalized ROM digest does not match the requested ROM",
+                    ));
+                }
+                validate_nonempty(line_number, "trace_id", &trace_id)?;
+                validate_nonempty(line_number, "producer", &producer)?;
+                header = Some(TraceHeader {
+                    schema_version,
+                    normalized_rom_sha256,
+                    trace_id,
+                    producer,
+                });
+            }
+            other if header.is_none() => {
+                let _ = other;
+                return Err(TraceIngestError::at(
+                    line_number,
+                    "first record must be a header",
+                ));
+            }
+            TraceRecord::PiDma {
+                sequence,
+                direction,
+                cart_address,
+                dram_address,
+                byte_len,
+                active_bank,
+            } => {
+                if byte_len == 0 || byte_len > PI_MAX_TRANSFER_BYTES {
+                    return Err(TraceIngestError::at(
+                        line_number,
+                        format!(
+                            "PI DMA byte_len {byte_len} is outside 1..={PI_MAX_TRANSFER_BYTES}"
+                        ),
+                    ));
+                }
+                let dram_end = dram_address.checked_add(byte_len).ok_or_else(|| {
+                    TraceIngestError::at(line_number, "PI DMA DRAM interval overflows u32")
+                })?;
+                if dram_address >= PI_DRAM_ADDRESS_SPACE_BYTES
+                    || dram_end > PI_DRAM_ADDRESS_SPACE_BYTES
+                {
+                    return Err(TraceIngestError::at(
+                        line_number,
+                        "PI DMA DRAM interval is outside the 24-bit PI DRAM address space",
+                    ));
+                }
+                cart_address.checked_add(byte_len).ok_or_else(|| {
+                    TraceIngestError::at(line_number, "PI DMA cartridge interval overflows u32")
+                })?;
+                unknown_bank_count += u64::from(validate_bank(line_number, &active_bank)?);
+                counts.pi_dma += 1;
+                facts.push(ObservedTraceFact::PiDma {
+                    sequence,
+                    direction,
+                    cart_address,
+                    dram_address,
+                    byte_len,
+                    active_bank,
+                });
+            }
+            TraceRecord::ExecutedPc { sequence, pc } => {
+                unknown_bank_count += validate_instruction_address(line_number, "PC", &pc)?;
+                counts.executed_pc += 1;
+                facts.push(ObservedTraceFact::ExecutedPc { sequence, pc });
+            }
+            TraceRecord::IndirectTransfer {
+                sequence,
+                kind,
+                site,
+                target,
+            } => {
+                unknown_bank_count +=
+                    validate_instruction_address(line_number, "transfer site", &site)?;
+                unknown_bank_count +=
+                    validate_instruction_address(line_number, "transfer target", &target)?;
+                counts.indirect_transfer += 1;
+                facts.push(ObservedTraceFact::IndirectTransfer {
+                    sequence,
+                    kind,
+                    site,
+                    target,
+                });
+            }
+            TraceRecord::WatchedTableWrite {
+                sequence,
+                watch_id,
+                address,
+                width,
+                value,
+                active_bank,
+            } => {
+                validate_nonempty(line_number, "watch_id", &watch_id)?;
+                let width_bytes = width.bytes();
+                if address % width_bytes != 0 {
+                    return Err(TraceIngestError::at(
+                        line_number,
+                        format!(
+                            "watched write address 0x{address:08x} is not {width_bytes}-byte aligned"
+                        ),
+                    ));
+                }
+                address.checked_add(width_bytes).ok_or_else(|| {
+                    TraceIngestError::at(line_number, "watched write interval overflows u32")
+                })?;
+                if !width.accepts(value) {
+                    return Err(TraceIngestError::at(
+                        line_number,
+                        format!("value 0x{value:x} does not fit {width:?}"),
+                    ));
+                }
+                unknown_bank_count += u64::from(validate_bank(line_number, &active_bank)?);
+                counts.watched_table_write += 1;
+                facts.push(ObservedTraceFact::WatchedTableWrite {
+                    sequence,
+                    watch_id,
+                    address,
+                    width,
+                    value,
+                    active_bank,
+                });
+            }
+            TraceRecord::End {
+                sequence,
+                completion,
+                exhaustiveness,
+            } => {
+                if completion == TraceCompletion::Aborted && !exhaustiveness.is_empty() {
+                    return Err(TraceIngestError::at(
+                        line_number,
+                        "an aborted trace cannot claim exhaustive instrumentation",
+                    ));
+                }
+                let mut unique = BTreeSet::new();
+                for claim in &exhaustiveness {
+                    if claim.first_sequence == 0
+                        || claim.first_sequence > claim.last_sequence
+                        || claim.last_sequence >= sequence
+                    {
+                        return Err(TraceIngestError::at(
+                            line_number,
+                            format!(
+                                "invalid exhaustiveness interval {}..={} for end sequence {sequence}",
+                                claim.first_sequence, claim.last_sequence
+                            ),
+                        ));
+                    }
+                    if let CoverageDomain::WatchedTableWrite { watch_id } = &claim.domain {
+                        validate_nonempty(line_number, "exhaustiveness watch_id", watch_id)?;
+                    }
+                    if !unique.insert(claim.clone()) {
+                        return Err(TraceIngestError::at(
+                            line_number,
+                            "duplicate exhaustiveness claim",
+                        ));
+                    }
+                }
+                end = Some((sequence, completion, exhaustiveness));
+            }
+        }
+    }
+
+    let header = header.ok_or_else(|| TraceIngestError::at(0, "missing header"))?;
+    let (final_sequence, completion, mut exhaustiveness) =
+        end.ok_or_else(|| TraceIngestError::at(line_number, "missing end record"))?;
+    exhaustiveness.sort();
+    Ok(IngestReport {
+        header,
+        completion,
+        final_sequence,
+        counts,
+        observations_with_unknown_bank: unknown_bank_count,
+        facts,
+        exhaustiveness,
+    })
+}
+
+/// One `ExecutedPc` observation landing on a word static analysis had
+/// already called `ProvenData`. Dynamic evidence (this word ran) and static
+/// evidence (this word is proven non-code) genuinely disagree; per
+/// `facts.rs`'s monotonic-fact invariant, neither side may silently
+/// overwrite the other, so this is a typed finding, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticDataConflict {
+    pub site: crate::facts::BankAddr,
+    pub trace_id: String,
+    pub sequence: u64,
+}
+
+/// The measured effect of folding one trace's `ExecutedPc` observations into
+/// a [`crate::facts::FactDb`] as bank-scoped dynamic code-existence evidence
+/// ([`crate::facts::Fact::ObservedExecutedCode`]). Every count here is a
+/// direct measurement of what [`fold_executed_pcs_into_fact_db`] actually did
+/// to `db` -- never an estimate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactDbFoldReport {
+    /// Total `Fact::ObservedExecutedCode` records appended to the database
+    /// (one per known-bank `ExecutedPc` observation folded).
+    pub facts_added: u64,
+    /// `(bank, pc)` words that had no prior code-existence conclusion of any
+    /// kind before this fold and now carry one from this evidence class.
+    pub new_code_existence: BTreeSet<crate::facts::BankAddr>,
+    /// `(bank, pc)` words that already carried a code-existence conclusion
+    /// (from this or an earlier fold, static or dynamic) and this
+    /// observation corroborates -- a second-or-later independent sighting of
+    /// the same word, not new evidence of existence.
+    pub corroborated: BTreeSet<crate::facts::BankAddr>,
+    /// Observations that landed on a word static analysis had already
+    /// proven `ProvenData`. Reported, never resolved by fiat.
+    pub conflicts: Vec<StaticDataConflict>,
+    /// `ExecutedPc` observations skipped because their bank was
+    /// `BankContext::Unknown`. Never promoting, per this module's mandate
+    /// that unknown-bank identity is preserved rather than guessed.
+    pub unknown_bank_skipped: u64,
+}
+
+/// Fold every known-bank `ExecutedPc` observation in `facts` into `db` as
+/// [`crate::facts::Fact::ObservedExecutedCode`] evidence, and return the
+/// exact measured delta.
+///
+/// This is deliberately the *only* class of trace fact this adapter
+/// promotes: an executed PC in a known bank proves that word is code that
+/// ran once -- weaker than a proven owner, weaker than CFG-reachability
+/// proof, but a real, distinct, auditable evidence class (`observed_executed`
+/// / dynamic code existence). `IndirectTransfer`, `PiDma`, and
+/// `WatchedTableWrite` facts are untouched here; they remain, as `trace.rs`'s
+/// module doc says, observations without an admission rule of their own yet.
+///
+/// `static_word_class` looks up whatever static classification the caller
+/// already has for `(bank, va)` (e.g. from a `cfg::Cfg::word_class` built by
+/// `resolve::build_cfg_closed_with_facts`/`build_cfg_exploratory_with_candidates`).
+/// It is a caller-supplied lookup, not a CFG this module builds itself, so
+/// `trace.rs` stays decoupled from bank-materialization and CFG
+/// construction. Returning `None` means "no static code/data claim at this
+/// word" and is never treated as a conflict.
+///
+/// Idempotent per `(bank, pc)`: observing the same PC twice inserts two
+/// `Fact::ObservedExecutedCode` records (distinct provenance, exact-duplicate
+/// facts are harmless per `FactDb::insert`'s contract) but only ever
+/// concludes the `(bank, pc)` subject once, growing its `justified_by` list
+/// -- "one fact[-conclusion] with two provenance records."
+pub fn fold_executed_pcs_into_fact_db(
+    db: &mut crate::facts::FactDb,
+    trace_id: &str,
+    facts: &[ObservedTraceFact],
+    static_word_class: impl Fn(&str, u32) -> Option<crate::cfg::WordClass>,
+) -> FactDbFoldReport {
+    use crate::cfg::WordClass;
+    use crate::facts::{observed_executed_code_subject, BankAddr, Fact, ProofState};
+
+    let mut report = FactDbFoldReport::default();
+    for observed in facts {
+        let ObservedTraceFact::ExecutedPc { sequence, pc } = observed else {
+            continue;
+        };
+        let BankContext::Known { bank, .. } = &pc.bank else {
+            report.unknown_bank_skipped += 1;
+            continue;
+        };
+        let site = BankAddr::new(bank.clone(), pc.address);
+        let subject = observed_executed_code_subject(&site.bank, site.pc);
+        let already_concluded = db.conclusion(&subject).is_some();
+
+        let fact_index = db.insert(Fact::ObservedExecutedCode {
+            site: site.clone(),
+            trace: trace_id.to_string(),
+            sequence: *sequence,
+        });
+        report.facts_added += 1;
+
+        let mut justified_by = db
+            .conclusion(&subject)
+            .map(|conclusion| conclusion.justified_by.clone())
+            .unwrap_or_default();
+        justified_by.push(fact_index);
+        db.conclude(
+            subject,
+            ProofState::Supported,
+            justified_by,
+            "trace_observed_executed_pc",
+        )
+        .expect(
+            "ObservedExecutedCode never proposes Proven, so it can never fail to supersede \
+             an existing conclusion for the same subject",
+        );
+
+        if already_concluded {
+            report.corroborated.insert(site.clone());
+        } else {
+            report.new_code_existence.insert(site.clone());
+        }
+
+        if matches!(
+            static_word_class(&site.bank, site.pc),
+            Some(WordClass::ProvenData)
+        ) {
+            report.conflicts.push(StaticDataConflict {
+                site,
+                trace_id: trace_id.to_string(),
+                sequence: *sequence,
+            });
+        }
+    }
+    report
+}
+
+/// The measured effect of folding one trace's `IndirectTransfer`
+/// observations into a [`crate::facts::FactDb`] as
+/// [`crate::facts::Fact::ObservedIndirectTarget`] existence evidence.
+/// Every count is a direct measurement of what
+/// [`fold_indirect_targets_into_fact_db`] did to `db`, never an estimate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndirectFoldReport {
+    /// `Fact::ObservedIndirectTarget` records appended (one per known-bank
+    /// site+target observation folded).
+    pub facts_added: u64,
+    /// `(site -> target)` edges observed for the first time in this fold.
+    pub new_edges: BTreeSet<(crate::facts::BankAddr, crate::facts::BankAddr)>,
+    /// Edges already concluded (this or an earlier fold) that this
+    /// observation corroborates -- a repeat sighting, not a new edge.
+    pub corroborated: BTreeSet<(crate::facts::BankAddr, crate::facts::BankAddr)>,
+    /// Observations whose target word static analysis had already proven
+    /// `ProvenData`. Reported, never resolved by fiat -- an indirect edge
+    /// into proven data means the static class or the trace bank identity
+    /// is wrong, and that must surface loudly.
+    pub target_conflicts: Vec<StaticDataConflict>,
+    /// Observations skipped because the site OR target bank was
+    /// `BankContext::Unknown`. An edge is only sound when BOTH endpoints
+    /// have a known bank; a target in an unknown bank cannot become a
+    /// bank-qualified `ObservedIndirectTarget` without inventing identity.
+    pub unknown_bank_skipped: u64,
+}
+
+/// Fold every known-bank `IndirectTransfer` observation in `facts` into
+/// `db` as [`crate::facts::Fact::ObservedIndirectTarget`] existence
+/// evidence, and return the exact measured delta.
+///
+/// This is the trace lane's admission rule for indirect edges, the
+/// counterpart of [`fold_executed_pcs_into_fact_db`] for executed PCs. An
+/// observed `jr`/`jalr` transfer proves the edge `site -> target`
+/// EXISTED at runtime -- exactly the evidence static value-set analysis
+/// cannot supply for a load-derived or input-dependent dispatch (the MM
+/// audio/camera handler tables the static lanes leave open). It is
+/// deliberately weaker than a static `IndirectTransferAnalysis` with
+/// `Exhaustive` state: an observation is existence, never exhaustiveness,
+/// so it concludes at `ProofState::Supported` and NEVER contributes an
+/// exhaustive successor set. Downstream owner admission may treat the
+/// target as a proven callable entry (it demonstrably ran), but the
+/// site's frontier stays open unless a separate exhaustive proof closes
+/// it.
+///
+/// BOTH endpoints must have a known bank: an edge whose target bank is
+/// `Unknown` is skipped (`unknown_bank_skipped`), never promoted, per
+/// this module's mandate that unknown-bank identity is preserved rather
+/// than guessed. `static_word_class` is the same caller-supplied lookup
+/// as the executed-PC fold; a target landing on `ProvenData` is recorded
+/// as a conflict, never silently resolved.
+///
+/// Idempotent per `(site -> target)` edge: the same edge observed twice
+/// inserts two facts (distinct provenance) but concludes the edge once,
+/// growing its `justified_by` list.
+pub fn fold_indirect_targets_into_fact_db(
+    db: &mut crate::facts::FactDb,
+    trace_id: &str,
+    facts: &[ObservedTraceFact],
+    static_word_class: impl Fn(&str, u32) -> Option<crate::cfg::WordClass>,
+) -> IndirectFoldReport {
+    use crate::cfg::WordClass;
+    use crate::facts::{observed_indirect_target_subject, BankAddr, Fact, ProofState};
+
+    let mut report = IndirectFoldReport::default();
+    for observed in facts {
+        let ObservedTraceFact::IndirectTransfer {
+            sequence,
+            site,
+            target,
+            ..
+        } = observed
+        else {
+            continue;
+        };
+        let (
+            BankContext::Known {
+                bank: site_bank, ..
+            },
+            BankContext::Known {
+                bank: target_bank, ..
+            },
+        ) = (&site.bank, &target.bank)
+        else {
+            report.unknown_bank_skipped += 1;
+            continue;
+        };
+        let site_addr = BankAddr::new(site_bank.clone(), site.address);
+        let target_addr = BankAddr::new(target_bank.clone(), target.address);
+        let subject = observed_indirect_target_subject(
+            &site_addr.bank,
+            site_addr.pc,
+            &target_addr.bank,
+            target_addr.pc,
+        );
+        let already_concluded = db.conclusion(&subject).is_some();
+
+        let fact_index = db.insert(Fact::ObservedIndirectTarget {
+            site: site_addr.clone(),
+            target: target_addr.clone(),
+            trace: trace_id.to_string(),
+        });
+        report.facts_added += 1;
+
+        let mut justified_by = db
+            .conclusion(&subject)
+            .map(|conclusion| conclusion.justified_by.clone())
+            .unwrap_or_default();
+        justified_by.push(fact_index);
+        db.conclude(
+            subject,
+            ProofState::Supported,
+            justified_by,
+            "trace_observed_indirect_target",
+        )
+        .expect(
+            "ObservedIndirectTarget never proposes Proven, so it can never fail to supersede \
+             an existing conclusion for the same subject",
+        );
+
+        let edge = (site_addr.clone(), target_addr.clone());
+        if already_concluded {
+            report.corroborated.insert(edge);
+        } else {
+            report.new_edges.insert(edge);
+        }
+
+        if matches!(
+            static_word_class(&target_addr.bank, target_addr.pc),
+            Some(WordClass::ProvenData)
+        ) {
+            report.target_conflicts.push(StaticDataConflict {
+                site: target_addr,
+                trace_id: trace_id.to_string(),
+                sequence: *sequence,
+            });
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests;
+
+/// A proven static mapping and an observed DMA disagree about what backs a VA.
+///
+/// Reported, never resolved by fiat: one of the two is wrong, and which one is
+/// a question this adapter has no standing to answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedMappingConflict {
+    pub trace_id: String,
+    pub sequence: u64,
+    pub va_start: u32,
+    pub observed_rom_start: u32,
+    pub proven_bank: String,
+    pub proven_rom_start: u32,
+}
+
+/// The measured effect of folding one trace's `PiDma` observations into a
+/// [`crate::facts::FactDb`] as observed load-image mappings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiDmaFoldReport {
+    /// `Fact::RomMapping` records appended (one per distinct transfer).
+    pub facts_added: u64,
+    /// Banks concluded from a transfer no proven mapping already described.
+    pub new_mappings: BTreeSet<String>,
+    /// Transfers whose geometry a proven static mapping already asserts. These
+    /// add no reach, and they are the valuable ones: an independent producer
+    /// agreeing with static composition is corroboration static analysis
+    /// cannot give itself.
+    pub corroborated: BTreeSet<String>,
+    /// Transfers that land on a VA a proven mapping backs from a DIFFERENT ROM
+    /// offset.
+    pub conflicts: Vec<ObservedMappingConflict>,
+    /// Distinct transfers seen more than once (an overlay reloaded). Counted,
+    /// not re-concluded.
+    pub repeated: u64,
+    /// `FromRdram` transfers. A write-back is not a load image.
+    pub non_load_skipped: u64,
+    /// Zero-length transfers, or ones whose end address overflows `u32`.
+    pub degenerate_skipped: u64,
+    /// Transfers whose destination was written from more than one distinct ROM
+    /// source in this trace. Such a destination is a buffer, not a load image:
+    /// it has no single backing, so no mapping is concluded for it.
+    pub reused_destination_skipped: u64,
+    /// The distinct destination VAs that behaved as buffers. Reported because a
+    /// streaming buffer is a real and useful thing to know about, even though
+    /// it is not composition evidence.
+    pub reused_destinations: BTreeSet<u32>,
+    /// Transfers merged into a preceding one because they were strictly
+    /// adjacent in both ROM and VA -- i.e. chunks of a single streamed load
+    /// image rather than distinct regions.
+    pub coalesced_transfers: u64,
+    /// Transfers whose source is not PI cartridge domain 1 -- the 64DD or PIF
+    /// ROM, which are different devices, not this cartridge. Counted so they
+    /// are visibly excluded rather than silently mistranslated.
+    pub off_cartridge_skipped: u64,
+}
+
+/// Fold every cart-to-RDRAM `PiDma` observation into `db` as an observed
+/// load-image mapping, and return the exact measured delta.
+///
+/// **Why this is the one universal composition mechanism.** Every static
+/// strategy has to recognise a structure -- a dmadata-shaped file table, an
+/// AKI descriptor table -- and is therefore bound to the engine families whose
+/// structure it knows. Static PI-DMA operand slicing does not escape that: at
+/// the interesting call sites the vrom/size operands are READ FROM the very
+/// table the scan is trying to avoid needing, so it cannot bootstrap (measured
+/// negative, see `DISCOVER-PLAN`). An observed DMA has no such circularity. It
+/// does not matter whether the address came from a table, a decompressor, a
+/// TLB-mapped pointer, or a custom IPL3 -- by the time the transfer completes,
+/// the geometry is a fact.
+///
+/// **Evidence class.** `Supported`, never `Proven`. A completed transfer shows
+/// bytes moved cart->RDRAM at one moment of one run; it does not show the
+/// destination is code, that the mapping is stable, or that the set of
+/// transfers observed is exhaustive. `headless.rs` requires a genuinely
+/// completed DMA for this record -- a register write or a DMA-start
+/// notification is explicitly not sufficient -- so the observation is sound
+/// even though the conclusion drawn from it is bounded.
+///
+/// Deduplicated by `(cart, dram, len)`: a game reloading the same overlay
+/// yields one mapping and a `repeated` count, not N conclusions.
+/// PI cartridge domain 1: the address window a game's ROM is visible at on the
+/// PI bus. An observation carries the address the hardware saw, which is a
+/// cart-bus address; a `RomMapping` wants a ROM file offset. Domain 2
+/// (0x0500_0000, 64DD) and PIF ROM (0x1FC0_0000) are different devices and are
+/// NOT this ROM, so a transfer from them is reported rather than translated.
+const PI_CART_DOMAIN1_BASE: u32 = 0x1000_0000;
+const PI_CART_DOMAIN1_END: u32 = 0x1FC0_0000;
+
+/// Translate a PI cart-bus address to a ROM file offset, or `None` when the
+/// transfer's source is not this cartridge.
+fn cart_address_to_rom_offset(cart_address: u32) -> Option<u32> {
+    (PI_CART_DOMAIN1_BASE..PI_CART_DOMAIN1_END)
+        .contains(&cart_address)
+        .then(|| cart_address - PI_CART_DOMAIN1_BASE)
+}
+
+/// One admitted cart-to-RDRAM transfer, before adjacent chunks are merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedTransfer {
+    rom_start: u32,
+    rom_end: u32,
+    va_start: u32,
+    /// The earliest observation sequence that contributed, for diagnostics.
+    first_sequence: u64,
+}
+
+pub fn fold_pi_dmas_into_fact_db(
+    db: &mut crate::facts::FactDb,
+    trace_id: &str,
+    facts: &[ObservedTraceFact],
+) -> PiDmaFoldReport {
+    use crate::facts::{BankAddr, Fact, ProofState, RomAddressSpace};
+    use std::collections::BTreeMap;
+
+    let mut report = PiDmaFoldReport::default();
+    let mut seen: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+    let mut transfers: Vec<ObservedTransfer> = Vec::new();
+
+    // Proven VA -> (bank, rom_start), so an observation can be checked against
+    // static composition instead of silently duplicating or contradicting it.
+    let proven: BTreeMap<u32, (String, u32)> = db
+        .proven_rom_mappings()
+        .iter()
+        .filter_map(|fact| match fact {
+            Fact::RomMapping {
+                bank,
+                rom_start,
+                va_start,
+                ..
+            } => Some((*va_start, (bank.clone(), *rom_start))),
+            _ => None,
+        })
+        .collect();
+
+    for observed in facts {
+        let ObservedTraceFact::PiDma {
+            sequence,
+            direction,
+            cart_address,
+            dram_address,
+            byte_len,
+            ..
+        } = observed
+        else {
+            continue;
+        };
+        if *direction != PiDmaDirection::CartToRdram {
+            report.non_load_skipped += 1;
+            continue;
+        }
+        let (Some(_), Some(dram_end)) = (
+            cart_address.checked_add(*byte_len),
+            dram_address.checked_add(*byte_len),
+        ) else {
+            report.degenerate_skipped += 1;
+            continue;
+        };
+        if *byte_len == 0 {
+            report.degenerate_skipped += 1;
+            continue;
+        }
+        // The observation records a cart-BUS address; a mapping wants a ROM
+        // file offset. Without this the boot copy reads as ROM 0x10001000
+        // instead of 0x1000 and every mapping lands outside the image --
+        // caught by a live capture conflicting with the proven boot bank.
+        let Some(rom_offset) = cart_address_to_rom_offset(*cart_address) else {
+            report.off_cartridge_skipped += 1;
+            continue;
+        };
+        if !seen.insert((rom_offset, *dram_address, *byte_len)) {
+            report.repeated += 1;
+            continue;
+        }
+
+        // KSEG0 is the address the guest executes a loaded image at; the DMA
+        // destination is the physical RDRAM offset.
+        let va_start = 0x8000_0000 | dram_address;
+        let _ = dram_end;
+        transfers.push(ObservedTransfer {
+            rom_start: rom_offset,
+            rom_end: rom_offset + byte_len,
+            va_start,
+            first_sequence: *sequence,
+        });
+    }
+
+    // Coalesce transfer CHUNKS into logical load images.
+    //
+    // A game does not DMA a file in one go; it streams it in fixed-size pieces.
+    // Measured on WCW vs. nWo World Tour: 4,410 transfers against 78 distinct
+    // destinations, and on SM64 sequential 4 KiB chunks at rising ROM offsets
+    // mapping to rising VAs. Concluding one bank per chunk would describe the
+    // transport rather than the program, and would bury a real load image under
+    // dozens of fragments that no consumer can recognise as one region.
+    //
+    // Merge only STRICTLY adjacent pairs -- contiguous in ROM *and* in VA. That
+    // is exactly the condition under which the pieces are one image at one
+    // load address; it preserves the (va - rom) delta by construction, and it
+    // never joins two files that merely happen to sit next to each other in
+    // only one of the two spaces.
+    transfers.sort_unstable_by_key(|transfer| (transfer.rom_start, transfer.va_start));
+    let mut coalesced: Vec<ObservedTransfer> = Vec::new();
+    for transfer in transfers {
+        match coalesced.last_mut() {
+            Some(previous)
+                if previous.rom_end == transfer.rom_start
+                    && previous.va_start + (previous.rom_end - previous.rom_start)
+                        == transfer.va_start =>
+            {
+                previous.rom_end = transfer.rom_end;
+                report.coalesced_transfers += 1;
+            }
+            _ => coalesced.push(transfer),
+        }
+    }
+
+    // A RomMapping claims a STABLE correspondence: these ROM bytes back this
+    // VA range. A destination that is written from more than one ROM source
+    // across the trace does not have that property -- it is a buffer, and
+    // concluding a mapping for it would assert thousands of mutually
+    // contradictory backings for one address.
+    //
+    // Measured on WCW vs. nWo World Tour: of 4,411 transfers, two destinations
+    // account for 4,331, one of them written from 2,598 DISTINCT ROM sources.
+    //
+    // What those transfers actually are, measured rather than assumed: 4,331 of
+    // the 4,337 excluded transfers are exactly FOUR BYTES, and on WWF No Mercy
+    // all 4,084 are. They are single-word ROM reads issued through PI DMA into a
+    // scratch address -- a table lookup or header field, not a load image. (An
+    // earlier revision of this comment guessed "audio/FMV streaming". That was
+    // never measured and is wrong; the largest excluded transfer on either ROM
+    // is 726 bytes.)
+    //
+    // The rule below keys on destination reuse rather than transfer size, which
+    // is the property that actually matters -- a destination without a single
+    // backing cannot have a mapping regardless of how large its writes are.
+    //
+    // The rule is deliberately threshold-free -- one source or more than one --
+    // because "how many reloads before it stops being a load image" has no
+    // principled answer. Note this correctly excludes overlay POOLS too: a slot
+    // that holds overlay A then overlay B has no single backing either, and
+    // representing those needs the per-activation bank identity the trace
+    // schema already carries, not a mapping.
+    let mut sources_per_destination: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for transfer in &coalesced {
+        sources_per_destination
+            .entry(transfer.va_start)
+            .or_default()
+            .insert(transfer.rom_start);
+    }
+
+    for transfer in coalesced {
+        if sources_per_destination
+            .get(&transfer.va_start)
+            .is_some_and(|sources| sources.len() > 1)
+        {
+            report.reused_destination_skipped += 1;
+            report.reused_destinations.insert(transfer.va_start);
+            continue;
+        }
+        let ObservedTransfer {
+            rom_start: rom_offset,
+            rom_end,
+            va_start,
+            first_sequence: sequence,
+        } = transfer;
+        let byte_len = rom_end - rom_offset;
+        let va_end = va_start + byte_len;
+        let bank = format!("observed_dma_{rom_offset:08x}_{va_start:08x}_{byte_len:x}");
+
+        match proven.get(&va_start) {
+            Some((proven_bank, proven_rom_start)) if *proven_rom_start == rom_offset => {
+                report.corroborated.insert(proven_bank.clone());
+                continue;
+            }
+            Some((proven_bank, proven_rom_start)) => {
+                report.conflicts.push(ObservedMappingConflict {
+                    trace_id: trace_id.to_string(),
+                    sequence,
+                    va_start,
+                    observed_rom_start: rom_offset,
+                    proven_bank: proven_bank.clone(),
+                    proven_rom_start: *proven_rom_start,
+                });
+                continue;
+            }
+            None => {}
+        }
+
+        let mapping = db.insert(Fact::RomMapping {
+            bank: bank.clone(),
+            rom_space: RomAddressSpace::Physical,
+            rom_start: rom_offset,
+            rom_end,
+            va_start,
+            va_end,
+        });
+        let evidence = db.insert(Fact::Evidence {
+            subject: BankAddr::new(&bank, va_start),
+            note: format!(
+                "observed PI DMA load image (trace {trace_id}, from seq {sequence}): \
+                 ROM 0x{rom_offset:x}..0x{rom_end:x} -> VA 0x{va_start:x}, coalesced from \
+                 strictly adjacent transfers. Observed in one run; Supported, not Proven \
+                 -- neither exhaustive nor evidence the image is code."
+            ),
+        });
+        report.facts_added += 1;
+        db.conclude(
+            format!("bank:{bank}"),
+            ProofState::Supported,
+            vec![mapping, evidence],
+            "trace_observed_pi_dma",
+        )
+        .expect("observed-DMA bank names encode their own geometry and never collide");
+        report.new_mappings.insert(bank);
+    }
+    report
+}

@@ -12,6 +12,7 @@ members = [
     "crates/fn64-audio",
     "crates/fn64-recomp",
     "crates/fn64-recomp-rs",
+    "crates/fn64-recomp-rs-codegen",
     "crates/fn64-diff",
     "crates/fn64-discover",
 ]
@@ -27,3 +28,16 @@ repository = "https://github.com/fn64/fn64"
 # workload; keep debug builds usable without opting every contributor into
 # release-only iteration.
 opt-level = 1
+# Line tables instead of full debug info. Backtraces keep file and line
+# numbers -- what CI failures and gate output actually need -- while variable
+# inspection under a debugger is lost. Measured cost of the default: this
+# workspace's `target/debug` reached 155 GB against 1.5 GB for `target/release`,
+# a 100x ratio, because `fn64-discover` alone declares 46 bin targets and each
+# links its own copy of the workspace rlibs with full debug info (623,440 files
+# under `target/debug/deps`). Set `debug = 2` locally when stepping through a
+# debugger.
+debug = 1
+# Keep debug info in separate .dSYM-style artifacts rather than inlined in
+# every binary. On macOS this is the difference between each of those 46
+# binaries carrying its own copy and them referencing one.
+split-debuginfo = "unpacked"

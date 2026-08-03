@@ -5,6 +5,7 @@
 //! single-threaded, sorted, and bank-qualified: scheduling cannot affect fact
 //! order, serialized output, or proof state. No provider reads an answer key.
 
+use crate::cfg::{classify_control, region_target, ControlOp};
 use crate::facts::{
     function_entry_subject, table_entry_subject, BankAddr, CandidateDetector, Fact, FactDb,
     FunctionEntryEvidence, IndirectCallEvidenceKind, IndirectTransferKind, IndirectTransferState,
@@ -15,6 +16,7 @@ use crate::resolve::{
     IndirectResolutionKind,
 };
 use crate::rom::NormalizedRom;
+use crate::sig_scan::{detect_handler_table_candidates, plausible_function_boundary};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,6 +36,8 @@ struct LoadImage {
     va_end: u32,
     bytes: Vec<u8>,
 }
+
+const HANDLER_TABLE_MIN_RUN: usize = 4;
 
 /// Deterministic coarse interval index for bank images. A target query visits
 /// only images intersecting its 4 KiB VA page, then applies exact interval and
@@ -155,7 +159,25 @@ pub fn harvest_discovered_candidates(
     rom: &NormalizedRom,
     db: &mut FactDb,
 ) -> Result<HarvestReport, HarvestError> {
-    let images = load_images(rom, db)?;
+    harvest_discovered_candidates_bounded(
+        rom,
+        db,
+        crate::file_table::DEFAULT_MAX_DECODED_VROM_FILE_BYTES,
+    )
+}
+
+/// [`harvest_discovered_candidates`] with an explicit complete-file VROM
+/// decode cap applied before any provider receives image bytes.
+pub fn harvest_discovered_candidates_bounded(
+    rom: &NormalizedRom,
+    db: &mut FactDb,
+    max_decoded_vrom_file_bytes: usize,
+) -> Result<HarvestReport, HarvestError> {
+    let (images, handler_table_claims, overlay_relocation_facts) =
+        load_images(rom, db, max_decoded_vrom_file_bytes)?;
+    for fact in overlay_relocation_facts {
+        db.insert(fact);
+    }
     let image_index = LoadImageIndex::new(&images);
     let table_entries: Vec<(BankAddr, u32, BankAddr, ProofState)> = db
         .facts()
@@ -176,7 +198,8 @@ pub fn harvest_discovered_candidates(
         })
         .collect();
 
-    let prologue_claims = detect_prologues(&images);
+    let mut prologue_claims = detect_prologues(&images);
+    prologue_claims.extend(detect_argument_home_spill_leaves(&images));
     let ((jal_claims, indirect_facts), table_claims) = std::thread::scope(|scope| {
         let jal = scope.spawn(|| {
             detect_reachable_call_targets(&images, &image_index, &prologue_claims, &table_entries)
@@ -193,6 +216,7 @@ pub fn harvest_discovered_candidates(
     let mut claims = jal_claims;
     claims.extend(prologue_claims);
     claims.extend(table_claims);
+    claims.extend(handler_table_claims);
     claims.sort();
     claims.dedup();
     for fact in indirect_facts {
@@ -201,8 +225,14 @@ pub fn harvest_discovered_candidates(
     merge_claims(db, &claims)
 }
 
-fn load_images(rom: &NormalizedRom, db: &FactDb) -> Result<Vec<LoadImage>, HarvestError> {
+fn load_images(
+    rom: &NormalizedRom,
+    db: &FactDb,
+    max_decoded_vrom_file_bytes: usize,
+) -> Result<(Vec<LoadImage>, Vec<ProviderClaim>, Vec<Fact>), HarvestError> {
     let mut images = Vec::new();
+    let mut handler_table_claims = Vec::new();
+    let mut overlay_relocation_facts = Vec::new();
     for mapping in db.proven_rom_mappings() {
         let Fact::RomMapping {
             bank,
@@ -224,12 +254,36 @@ fn load_images(rom: &NormalizedRom, db: &FactDb) -> Result<Vec<LoadImage>, Harve
                 va_len,
             });
         }
-        let bytes = crate::banks::materialize_rom_range(rom, db, *rom_space, *rom_start, *rom_end)
-            .map_err(|detail| HarvestError::MappingBytesUnavailable {
-                bank: bank.clone(),
-                detail,
-            })?
-            .bytes;
+        let bytes = crate::banks::materialize_rom_range_bounded(
+            rom,
+            db,
+            *rom_space,
+            *rom_start,
+            *rom_end,
+            max_decoded_vrom_file_bytes,
+        )
+        .map_err(|detail| HarvestError::MappingBytesUnavailable {
+            bank: bank.clone(),
+            detail,
+        })?
+        .bytes;
+        if let Some(relocations) = crate::overlay_reloc::parse_zelda_overlay(&bytes) {
+            overlay_relocation_facts.extend(relocations.relocations.into_iter().map(
+                |relocation| Fact::OverlayRelocation {
+                    site: BankAddr::new(
+                        bank.clone(),
+                        va_start.saturating_add(relocation.file_offset),
+                    ),
+                    section: relocation.section,
+                    kind: relocation.kind,
+                    value_evidence: relocation.value_evidence,
+                    unrelocated_value: relocation.unrelocated_value,
+                },
+            ));
+        }
+        handler_table_claims.extend(detect_handler_table_entries(
+            bank, *va_start, *va_end, &bytes,
+        ));
         let executable_ranges = db.proven_executable_ranges(bank);
         if executable_ranges.is_empty() {
             images.push(LoadImage {
@@ -264,7 +318,7 @@ fn load_images(rom: &NormalizedRom, db: &FactDb) -> Result<Vec<LoadImage>, Harve
     images.sort_by(|a, b| {
         (&a.bank, a.rom_start, a.va_start).cmp(&(&b.bank, b.rom_start, b.va_start))
     });
-    Ok(images)
+    Ok((images, handler_table_claims, overlay_relocation_facts))
 }
 
 fn detect_reachable_call_targets(
@@ -555,18 +609,21 @@ fn detect_prologues(images: &[LoadImage]) -> Vec<ProviderClaim> {
             .chunks_exact(4)
             .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
             .collect();
+        let incoming = direct_control_targets(&words, image.va_start);
         for (index, &word) in words.iter().enumerate() {
             let Some(frame_size) = stack_allocation(word) else {
                 continue;
             };
-            let entry_pc = image.va_start.wrapping_add((index * 4) as u32);
+            let entry_index = prologue_entry_index(&words, index, image.va_start, &incoming);
+            let entry_pc = image.va_start.wrapping_add((entry_index * 4) as u32);
+            let stack_adjust_pc = image.va_start.wrapping_add((index * 4) as u32);
 
             if let Some(save_index) = find_ra_save(&words, index, frame_size) {
                 claims.push(ProviderClaim {
                     target: BankAddr::new(&image.bank, entry_pc),
                     detector: CandidateDetector::ProloguePattern,
                     evidence: FunctionEntryEvidence::Prologue {
-                        stack_adjust: BankAddr::new(&image.bank, entry_pc),
+                        stack_adjust: BankAddr::new(&image.bank, stack_adjust_pc),
                         frame_size,
                         pattern: ProloguePattern::SavesReturnAddress,
                         corroborating_site: BankAddr::new(
@@ -584,7 +641,7 @@ fn detect_prologues(images: &[LoadImage]) -> Vec<ProviderClaim> {
                     target: BankAddr::new(&image.bank, entry_pc),
                     detector: CandidateDetector::ProloguePattern,
                     evidence: FunctionEntryEvidence::Prologue {
-                        stack_adjust: BankAddr::new(&image.bank, entry_pc),
+                        stack_adjust: BankAddr::new(&image.bank, stack_adjust_pc),
                         frame_size,
                         pattern: ProloguePattern::LeafWithMatchedRestore,
                         corroborating_site: BankAddr::new(
@@ -598,6 +655,161 @@ fn detect_prologues(images: &[LoadImage]) -> Vec<ProviderClaim> {
         }
     }
     claims
+}
+
+const MAX_PROLOGUE_PREFIX_WORDS: usize = 3;
+
+/// Recover a short non-control setup prefix before a recognized stack
+/// prologue. This only relocates candidate evidence to an independently
+/// structural boundary; it does not make the entry authoritative.
+fn prologue_entry_index(
+    words: &[u32],
+    stack_adjust_index: usize,
+    va_start: u32,
+    incoming: &BTreeSet<u32>,
+) -> usize {
+    let max_rewind = stack_adjust_index.min(MAX_PROLOGUE_PREFIX_WORDS);
+    for rewind in (1..=max_rewind).rev() {
+        let entry_index = stack_adjust_index - rewind;
+        if !plausible_function_boundary(words, entry_index) {
+            continue;
+        }
+        let prefix = &words[entry_index..stack_adjust_index];
+        if !prefix.iter().all(|&word| {
+            word != 0
+                && matches!(classify_control(word), ControlOp::Plain)
+                && !writes_stack_pointer(word)
+        }) {
+            continue;
+        }
+        let has_interior_entry = (entry_index + 1..=stack_adjust_index)
+            .any(|index| incoming.contains(&va_start.wrapping_add((index as u32).wrapping_mul(4))));
+        if !has_interior_entry {
+            return entry_index;
+        }
+    }
+    stack_adjust_index
+}
+
+fn writes_stack_pointer(word: u32) -> bool {
+    const SP: u32 = 29;
+    match word >> 26 {
+        0 => ((word >> 11) & 0x1f) == SP,
+        3 => false,
+        8..=15 | 24..=27 | 32..=39 | 48..=55 => ((word >> 16) & 0x1f) == SP,
+        // Coprocessor-to-GPR transfers use this field; treating all
+        // coprocessor opcodes alike is conservative for a three-word prefix.
+        16..=19 => ((word >> 16) & 0x1f) == SP,
+        _ => false,
+    }
+}
+
+const MAX_ARGUMENT_HOME_SPILL_LEAF_WORDS: usize = 96;
+const JR_RA: u32 = 0x03e0_0008;
+
+fn argument_home_slot(word: u32) -> Option<u8> {
+    if (word >> 26) != 0x2b || ((word >> 21) & 0x1f) != 29 {
+        return None;
+    }
+    let register = ((word >> 16) & 0x1f) as u8;
+    let argument_index = register.checked_sub(4)?;
+    if argument_index > 3 || (word & 0xffff) != u32::from(argument_index) * 4 {
+        return None;
+    }
+    Some(argument_index)
+}
+
+fn direct_control_targets(words: &[u32], va_start: u32) -> BTreeSet<u32> {
+    let mut targets = BTreeSet::new();
+    for (index, &word) in words.iter().enumerate() {
+        let pc = va_start.wrapping_add((index as u32).wrapping_mul(4));
+        let target = match classify_control(word) {
+            ControlOp::J { target } | ControlOp::Jal { target } => Some(region_target(pc, target)),
+            ControlOp::Branch { target, .. } | ControlOp::BranchLikely { target, .. } => Some(
+                pc.wrapping_add(4)
+                    .wrapping_add((target as i32).wrapping_mul(4) as u32),
+            ),
+            _ => None,
+        };
+        if let Some(target) = target {
+            targets.insert(target);
+        }
+    }
+    targets
+}
+
+fn bounded_argument_home_leaf_return(words: &[u32], entry: usize) -> Option<usize> {
+    let end = words
+        .len()
+        .min(entry.checked_add(MAX_ARGUMENT_HOME_SPILL_LEAF_WORDS)?);
+    for index in entry + 1..end {
+        let word = words[index];
+        if word == JR_RA {
+            let delay_index = index.checked_add(1)?;
+            if delay_index >= end
+                || !matches!(classify_control(words[delay_index]), ControlOp::Plain)
+            {
+                return None;
+            }
+            return Some(index);
+        }
+        if !matches!(classify_control(word), ControlOp::Plain) {
+            return None;
+        }
+    }
+    None
+}
+
+fn detect_argument_home_spill_leaves(images: &[LoadImage]) -> Vec<ProviderClaim> {
+    let mut claims = BTreeSet::new();
+    for image in images {
+        if !image.va_start.is_multiple_of(4) {
+            continue;
+        }
+        let words: Vec<u32> = image
+            .bytes
+            .chunks_exact(4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four-byte chunk")))
+            .collect();
+        let incoming = direct_control_targets(&words, image.va_start);
+        for index in 2..words.len() {
+            let entry_pc = image.va_start.wrapping_add((index as u32).wrapping_mul(4));
+            if words[index - 2] != JR_RA
+                || !matches!(classify_control(words[index - 1]), ControlOp::Plain)
+                || incoming.contains(&entry_pc)
+            {
+                continue;
+            }
+            let Some(argument_index) = argument_home_slot(words[index]) else {
+                continue;
+            };
+            let Some(return_index) = bounded_argument_home_leaf_return(&words, index) else {
+                continue;
+            };
+            claims.insert(ProviderClaim {
+                target: BankAddr::new(&image.bank, entry_pc),
+                detector: CandidateDetector::ArgumentHomeSpillLeaf,
+                evidence: FunctionEntryEvidence::ArgumentHomeSpillLeaf {
+                    predecessor_return: BankAddr::new(
+                        &image.bank,
+                        image
+                            .va_start
+                            .wrapping_add(((index - 2) as u32).wrapping_mul(4)),
+                    ),
+                    spill_site: BankAddr::new(&image.bank, entry_pc),
+                    argument_index,
+                    return_site: BankAddr::new(
+                        &image.bank,
+                        image
+                            .va_start
+                            .wrapping_add((return_index as u32).wrapping_mul(4)),
+                    ),
+                },
+                proposed_state: ProofState::Candidate,
+            });
+        }
+    }
+    claims.into_iter().collect()
 }
 
 fn detect_table_entries(
@@ -634,6 +846,59 @@ fn detect_table_entries(
             }
         })
         .collect()
+}
+
+/// Candidate-only recognition of dense or fixed-stride arrays whose selected
+/// fields all name plausible in-image function boundaries. Pattern evidence
+/// is useful for prioritizing callback analysis, but it does not prove that a
+/// reachable consumer invokes the table or that its index domain is closed.
+fn detect_handler_table_entries(
+    bank: &str,
+    va_start: u32,
+    va_end: u32,
+    bytes: &[u8],
+) -> Vec<ProviderClaim> {
+    let mut claims = Vec::new();
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
+        .collect();
+    for candidate in
+        detect_handler_table_candidates(&words, &words, va_start, va_end, HANDLER_TABLE_MIN_RUN)
+    {
+        let address_at = |word_index: usize| {
+            u32::try_from(word_index)
+                .ok()
+                .and_then(|index| index.checked_mul(4))
+                .and_then(|offset| va_start.checked_add(offset))
+        };
+        let (Some(table_base), Some(source_slot)) = (
+            address_at(candidate.table_base_word_index),
+            address_at(candidate.source_slot_word_index),
+        ) else {
+            continue;
+        };
+        let (Ok(slot_ordinal), Ok(stride_words), Ok(run_length)) = (
+            u32::try_from(candidate.slot_ordinal),
+            u8::try_from(candidate.stride_words),
+            u32::try_from(candidate.run_length),
+        ) else {
+            continue;
+        };
+        claims.push(ProviderClaim {
+            target: BankAddr::new(bank, candidate.target_va),
+            detector: CandidateDetector::TableDerived,
+            evidence: FunctionEntryEvidence::HandlerTablePointer {
+                table_base: BankAddr::new(bank, table_base),
+                source_slot: BankAddr::new(bank, source_slot),
+                slot_ordinal,
+                stride_words,
+                run_length,
+            },
+            proposed_state: ProofState::Candidate,
+        });
+    }
+    claims
 }
 
 fn stack_allocation(word: u32) -> Option<u32> {
@@ -857,7 +1122,9 @@ fn merge_existing_state(existing: ProofState, incoming: ProofState) -> ProofStat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::Fact;
+    use crate::facts::{
+        Fact, OverlayRelocationKind, OverlayRelocationSection, OverlayRelocationValueEvidence,
+    };
     use crate::rom::normalize;
 
     const NOP: u32 = 0;
@@ -889,6 +1156,51 @@ mod tests {
         db.conclude("bank:boot", ProofState::Proven, vec![mapping], "test")
             .unwrap();
         db
+    }
+
+    fn rom_with_overlay_data_relocation(target: u32) -> NormalizedRom {
+        fn push_word(bytes: &mut Vec<u8>, word: u32) {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+
+        let mut bytes = vec![0u8; 0x1000];
+        bytes[0..4].copy_from_slice(&0x8037_1240u32.to_be_bytes());
+        bytes[8..12].copy_from_slice(&0x8000_0400u32.to_be_bytes());
+        bytes[0x20..0x24].copy_from_slice(b"TEST");
+        bytes[0x3b..0x3f].copy_from_slice(b"CTSE");
+        push_word(&mut bytes, NOP);
+        push_word(&mut bytes, NOP);
+        push_word(&mut bytes, JR_RA);
+        push_word(&mut bytes, NOP);
+        push_word(&mut bytes, target);
+        let relocation_start = bytes.len();
+        push_word(&mut bytes, 16);
+        push_word(&mut bytes, 4);
+        push_word(&mut bytes, 0);
+        push_word(&mut bytes, 0);
+        push_word(&mut bytes, 1);
+        push_word(&mut bytes, (2 << 30) | (2 << 24));
+        push_word(&mut bytes, 0);
+        let relocation_size = bytes.len() - relocation_start + 4;
+        push_word(&mut bytes, relocation_size as u32);
+        normalize(&bytes).unwrap()
+    }
+
+    fn synthetic_image(words: &[u32], va_start: u32) -> LoadImage {
+        LoadImage {
+            bank: "synthetic".into(),
+            rom_start: 0,
+            va_start,
+            va_end: va_start + (words.len() as u32) * 4,
+            bytes: words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+        }
+    }
+
+    fn argument_home_spill(argument_index: u8) -> u32 {
+        0xac00_0000
+            | (29 << 21)
+            | (u32::from(argument_index + 4) << 16)
+            | (u32::from(argument_index) * 4)
     }
 
     #[test]
@@ -940,6 +1252,29 @@ mod tests {
     }
 
     #[test]
+    fn overlay_data_relocation_enters_fact_db_without_becoming_a_function_root() {
+        let target = 0x8123_4560;
+        let rom = rom_with_overlay_data_relocation(target);
+        let mut db = mapped_db(&rom);
+        harvest_discovered_candidates(&rom, &mut db).unwrap();
+
+        assert!(db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::OverlayRelocation {
+                site,
+                section: OverlayRelocationSection::Data,
+                kind: OverlayRelocationKind::Mips32,
+                value_evidence: OverlayRelocationValueEvidence::StoredWord,
+                unrelocated_value: recorded,
+            } if site == &BankAddr::new("boot", 0x8000_0410) && *recorded == target
+        )));
+        assert!(!db.facts().iter().any(|fact| matches!(
+            fact,
+            Fact::FunctionEntryClaim { target: entry, .. } if entry.pc == target
+        )));
+    }
+
+    #[test]
     fn classic_and_leaf_prologues_are_distinct_weaker_candidates() {
         let addiu_sp_m20 = 0x27bd_ffe0u32;
         let sw_ra_1c_sp = 0xafbf_001cu32;
@@ -984,6 +1319,185 @@ mod tests {
     }
 
     #[test]
+    fn prologue_prefix_rewind_accepts_one_to_three_plain_setup_words() {
+        let jr_ra = 0x03e0_0008;
+        let lui_t0 = 0x3c08_8000;
+        let ori_t0 = 0x3508_1234;
+        let lw_t1 = 0x8d09_0000;
+        let addiu_sp_m20 = 0x27bd_ffe0;
+
+        for prefix in [
+            vec![lui_t0],
+            vec![lui_t0, ori_t0],
+            vec![lui_t0, ori_t0, lw_t1],
+        ] {
+            let mut words = vec![jr_ra, NOP];
+            let expected = words.len();
+            words.extend(prefix);
+            let stack_adjust = words.len();
+            words.push(addiu_sp_m20);
+            let incoming = direct_control_targets(&words, 0x8000_0000);
+            assert_eq!(
+                prologue_entry_index(&words, stack_adjust, 0x8000_0000, &incoming),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn prologue_prefix_rewind_requires_a_safe_unambiguous_boundary() {
+        let addiu_sp_m20 = 0x27bd_ffe0;
+        let lui_t0 = 0x3c08_8000;
+        let mut incoming = BTreeSet::new();
+
+        let no_boundary = [lui_t0, 0x3508_1234, addiu_sp_m20];
+        assert_eq!(
+            prologue_entry_index(&no_boundary, 2, 0x8000_0000, &incoming),
+            0,
+            "the image base is itself a valid boundary"
+        );
+
+        let control_prefix = [JR_RA, NOP, 0x1000_0000, addiu_sp_m20];
+        assert_eq!(
+            prologue_entry_index(&control_prefix, 3, 0x8000_0000, &incoming),
+            3
+        );
+
+        let zero_prefix = [JR_RA, NOP, NOP, addiu_sp_m20];
+        assert_eq!(
+            prologue_entry_index(&zero_prefix, 3, 0x8000_0000, &incoming),
+            3
+        );
+
+        let sp_write_prefix = [JR_RA, NOP, 0x27bd_fff0, addiu_sp_m20];
+        assert_eq!(
+            prologue_entry_index(&sp_write_prefix, 3, 0x8000_0000, &incoming),
+            3
+        );
+
+        let targeted_prefix = [JR_RA, NOP, lui_t0, addiu_sp_m20];
+        incoming.insert(0x8000_000c);
+        assert_eq!(
+            prologue_entry_index(&targeted_prefix, 3, 0x8000_0000, &incoming),
+            3
+        );
+    }
+
+    #[test]
+    fn prologue_prefix_rewind_is_bounded_to_three_words() {
+        let words = [
+            JR_RA,
+            NOP,
+            0x3c08_8000,
+            0x3508_1234,
+            0x8d09_0000,
+            0x2529_0004,
+            0x27bd_ffe0,
+        ];
+        assert_eq!(
+            prologue_entry_index(
+                &words,
+                6,
+                0x8000_0000,
+                &direct_control_targets(&words, 0x8000_0000)
+            ),
+            6
+        );
+    }
+
+    #[test]
+    fn argument_home_spill_leaf_accepts_all_canonical_slots_candidate_only() {
+        let mut words = vec![JR_RA, NOP];
+        for argument in 0..4 {
+            words.extend([argument_home_spill(argument), NOP, JR_RA, NOP]);
+        }
+        let image = synthetic_image(&words, 0x8000_0000);
+        let claims = detect_argument_home_spill_leaves(&[image.clone(), image]);
+        assert_eq!(claims.len(), 4, "duplicate images must deduplicate");
+        assert!(claims.iter().all(|claim| {
+            claim.detector == CandidateDetector::ArgumentHomeSpillLeaf
+                && claim.proposed_state == ProofState::Candidate
+        }));
+        assert_eq!(
+            claims
+                .iter()
+                .filter_map(|claim| match &claim.evidence {
+                    FunctionEntryEvidence::ArgumentHomeSpillLeaf { argument_index, .. } => {
+                        Some(*argument_index)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn argument_home_spill_leaf_rejects_noncanonical_and_ambiguous_shapes() {
+        let jal = 0x0c00_0000;
+        let branch_to_entry = 0x1000_0003;
+        let invalid = 0x7801_2345;
+        let decoys = [
+            vec![JR_RA, NOP, 0xafa4_0004, NOP, JR_RA, NOP],
+            vec![JR_RA, NOP, 0xaca4_0000, NOP, JR_RA, NOP],
+            vec![JR_RA, NOP, argument_home_spill(0), jal, NOP, JR_RA, NOP],
+            vec![
+                JR_RA,
+                NOP,
+                argument_home_spill(0),
+                0x1000_0001,
+                NOP,
+                JR_RA,
+                NOP,
+            ],
+            vec![JR_RA, NOP, argument_home_spill(0), 0x0800_0000, NOP],
+            vec![JR_RA, NOP, argument_home_spill(0), invalid, JR_RA, NOP],
+            vec![JR_RA, NOP, argument_home_spill(0), JR_RA],
+            vec![
+                branch_to_entry,
+                NOP,
+                JR_RA,
+                NOP,
+                argument_home_spill(0),
+                NOP,
+                JR_RA,
+                NOP,
+            ],
+        ];
+        for words in decoys {
+            assert!(
+                detect_argument_home_spill_leaves(&[synthetic_image(&words, 0x8000_0000)])
+                    .is_empty(),
+                "decoy unexpectedly admitted: {words:08x?}"
+            );
+        }
+        let true_words = [JR_RA, NOP, argument_home_spill(0), NOP, JR_RA, NOP];
+        assert!(
+            detect_argument_home_spill_leaves(&[synthetic_image(&true_words, 0x8000_0002,)])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn argument_home_spill_leaf_bound_includes_return_delay() {
+        let mut boundary = vec![JR_RA, NOP, argument_home_spill(0)];
+        boundary.extend([NOP; 93]);
+        boundary.extend([JR_RA, NOP]);
+        assert_eq!(
+            detect_argument_home_spill_leaves(&[synthetic_image(&boundary, 0x8000_0000)]).len(),
+            1,
+            "a 96-word leaf including its return delay slot is within the bound"
+        );
+
+        let mut words = vec![JR_RA, NOP, argument_home_spill(0)];
+        words.extend([NOP; 94]);
+        words.extend([JR_RA, NOP]);
+        assert!(
+            detect_argument_home_spill_leaves(&[synthetic_image(&words, 0x8000_0000,)]).is_empty()
+        );
+    }
+
+    #[test]
     fn proven_table_vector_entry_becomes_an_authoritative_candidate_root() {
         let mut words = [NOP; 8];
         words[4] = 0x8000_041c;
@@ -1005,6 +1519,79 @@ mod tests {
             .unwrap();
         assert_eq!(entry.state, ProofState::Proven);
         assert_eq!(db.proven_function_entries("boot"), vec![0x8000_041c]);
+    }
+
+    #[test]
+    fn handler_table_pattern_retains_slot_provenance_without_granting_authority() {
+        let base = 0x8000_0400u32;
+        let words = [
+            JR_RA,
+            NOP,
+            JR_RA,
+            NOP,
+            JR_RA,
+            NOP,
+            JR_RA,
+            NOP,
+            base,
+            base + 0x08,
+            base + 0x10,
+            base + 0x18,
+        ];
+        let rom = rom_with_words(&words);
+        let mut db = mapped_db(&rom);
+        let report = harvest_discovered_candidates(&rom, &mut db).unwrap();
+
+        let table_entries: Vec<_> = report
+            .entries
+            .iter()
+            .filter(|entry| entry.detectors.contains(&CandidateDetector::TableDerived))
+            .collect();
+        assert_eq!(table_entries.len(), 4);
+        assert!(table_entries
+            .iter()
+            .all(|entry| entry.state == ProofState::Candidate));
+        assert!(db.proven_function_entries("boot").is_empty());
+        assert!(!db
+            .facts()
+            .iter()
+            .any(|fact| matches!(fact, Fact::TableEntry { .. })));
+
+        let evidence: Vec<_> = db
+            .facts()
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::FunctionEntryClaim {
+                    evidence:
+                        FunctionEntryEvidence::HandlerTablePointer {
+                            table_base,
+                            source_slot,
+                            slot_ordinal,
+                            stride_words,
+                            run_length,
+                        },
+                    detector: CandidateDetector::TableDerived,
+                    proposed_state: ProofState::Candidate,
+                    ..
+                } => Some((
+                    table_base.pc,
+                    source_slot.pc,
+                    *slot_ordinal,
+                    *stride_words,
+                    *run_length,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            evidence,
+            [
+                (base + 0x20, base + 0x20, 0, 1, 4),
+                (base + 0x20, base + 0x24, 1, 1, 4),
+                (base + 0x20, base + 0x28, 2, 1, 4),
+                (base + 0x20, base + 0x2c, 3, 1, 4),
+            ]
+        );
     }
 
     #[test]

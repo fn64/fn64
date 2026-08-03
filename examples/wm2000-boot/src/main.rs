@@ -82,6 +82,40 @@ fn main() {
     println!("[wm2000-boot] ROM size: {} bytes", rom_bytes.len());
     let release_environment = fn64_boot_harness::release_run_environment_from_process()
         .unwrap_or_else(|error| panic!("wm2000-boot: {error}"));
+    let pace_audio_output = fn64_boot_harness::parse_release_env_value(
+        "FN64_AUDIO_PACE",
+        std::env::var_os("FN64_AUDIO_PACE"),
+    )
+    .unwrap_or_else(|error| panic!("wm2000-boot: {error}"))
+    .map(|value| {
+        assert_eq!(
+            value, "1",
+            "wm2000-boot: FN64_AUDIO_PACE must be exactly 1 when present"
+        );
+        true
+    })
+    .unwrap_or(false);
+    assert!(
+        release_environment.is_none() || !pace_audio_output,
+        "wm2000-boot: release evidence cannot use host-wall-clock audio pacing"
+    );
+    let audio_validation_skip_graphics = fn64_boot_harness::parse_release_env_value(
+        "FN64_AUDIO_VALIDATION_SKIP_GRAPHICS",
+        std::env::var_os("FN64_AUDIO_VALIDATION_SKIP_GRAPHICS"),
+    )
+    .unwrap_or_else(|error| panic!("wm2000-boot: {error}"))
+    .map(|value| {
+        assert_eq!(
+            value, "1",
+            "wm2000-boot: FN64_AUDIO_VALIDATION_SKIP_GRAPHICS must be exactly 1 when present"
+        );
+        true
+    })
+    .unwrap_or(false);
+    assert!(
+        release_environment.is_none() || !audio_validation_skip_graphics,
+        "wm2000-boot: release evidence cannot skip graphics during an audio validation"
+    );
     let tv_type = fn64_boot_harness::TvType::Ntsc;
     let mut rdram = fn64_boot_harness::new_rdram(tv_type);
     fn64_boot_harness::seed_ipl3_image(&mut rdram, &rom_bytes);
@@ -127,6 +161,41 @@ fn main() {
 
     // Execute live task IMEM through fn64's clean-room RSP interpreter.
     fn64_abi::set_audio_task_lle_accuracy();
+    // The boot-time requested rate. osAiSetFrequency publishes the resulting
+    // exact DAC rate (28,805 Hz on NTSC) to the backend once guest code runs.
+    const WM2000_BOOT_AI_RATE_HZ: u32 = 28_800;
+    let audio_pace_target_frames = match fn64_boot_harness::wire_live_audio_output(
+        rdram.len(),
+        WM2000_BOOT_AI_RATE_HZ,
+        std::env::var_os("FN64_NO_AUDIO").is_some(),
+    ) {
+        fn64_boot_harness::LiveAudioOutput::Disabled => {
+            println!("[wm2000-boot] FN64_NO_AUDIO set -- cpal output disabled");
+            None
+        }
+        fn64_boot_harness::LiveAudioOutput::Active {
+            guest_rate_hz,
+            stream_rate_hz,
+        } => {
+            println!(
+                "[wm2000-boot] audio output wired (cpal, guest {guest_rate_hz} Hz -> stream {stream_rate_hz} Hz stereo)"
+            );
+            pace_audio_output.then_some((stream_rate_hz / 8).max(1))
+        }
+        fn64_boot_harness::LiveAudioOutput::Unavailable(error) => {
+            eprintln!(
+                "[wm2000-boot] audio output unavailable ({error}); live PCM stats/dump remain enabled"
+            );
+            None
+        }
+    };
+    assert!(
+        !pace_audio_output || audio_pace_target_frames.is_some(),
+        "wm2000-boot: FN64_AUDIO_PACE requires an available host audio backend"
+    );
+    if let Some(target) = audio_pace_target_frames {
+        println!("[wm2000-boot] host audio pacing enabled: queue target <= {target} frames");
+    }
 
     // NWXE's osCartRomInit (func_80022540) returns its OSPiHandle BSS at
     // D_800839A0 (`addiu $v0, $s0, %lo(D_800839A0)`, disasm/asm/1050.s
@@ -210,23 +279,34 @@ fn main() {
         !release_mode || requested_renderer == "rt64",
         "wm2000-boot: live release evidence requires FN64_RENDER=rt64, got {requested_renderer:?}"
     );
-    let graphics_policy_name = fn64_boot_harness::parse_release_env_value(
+    let requested_graphics_policy = fn64_boot_harness::parse_release_env_value(
         "WM2000_GRAPHICS_POLICY",
         std::env::var_os("WM2000_GRAPHICS_POLICY"),
     )
-    .unwrap_or_else(|error| panic!("wm2000-boot: {error}"))
-    .unwrap_or_else(|| {
-        if requested_renderer == "rt64" {
-            "lle".to_string()
-        } else {
-            "hle".to_string()
+    .unwrap_or_else(|error| panic!("wm2000-boot: {error}"));
+    assert!(
+        !audio_validation_skip_graphics || requested_graphics_policy.is_none(),
+        "wm2000-boot: FN64_AUDIO_VALIDATION_SKIP_GRAPHICS and WM2000_GRAPHICS_POLICY are mutually exclusive"
+    );
+    let graphics_policy_name = requested_graphics_policy
+        .unwrap_or_else(|| {
+            if requested_renderer == "rt64" {
+                "lle".to_string()
+            } else {
+                "hle".to_string()
+            }
+        })
+        .to_ascii_lowercase();
+    let graphics_policy = if audio_validation_skip_graphics {
+        fn64_abi::GraphicsTaskExecutionPolicy::DiagnosticSkip
+    } else {
+        match graphics_policy_name.as_str() {
+            "hle" | "hle-optimized" => fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
+            "lle" | "lle-accuracy" => fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
+            value => {
+                panic!("wm2000-boot: WM2000_GRAPHICS_POLICY must be hle or lle, got {value:?}")
+            }
         }
-    })
-    .to_ascii_lowercase();
-    let graphics_policy = match graphics_policy_name.as_str() {
-        "hle" | "hle-optimized" => fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
-        "lle" | "lle-accuracy" => fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
-        value => panic!("wm2000-boot: WM2000_GRAPHICS_POLICY must be hle or lle, got {value:?}"),
     };
     assert!(
         !release_mode || graphics_policy == fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy,
@@ -605,6 +685,10 @@ fn main() {
                 gate.guest_cycle()
             );
         }
+        if let Some(target) = audio_pace_target_frames {
+            fn64_boot_harness::pace_live_audio_output(target, std::time::Duration::from_secs(2))
+                .unwrap_or_else(|error| panic!("wm2000-boot: {error}"));
+        }
         // Virgin-allocation reproduction for the AKI voice maps -- see the
         // block comment above `last_chan_array_ptr` for the full story.
         {
@@ -803,6 +887,16 @@ fn main() {
     );
     println!("[wm2000-boot] gfx tasks submitted: {gfx_count}");
     println!("[wm2000-boot] audio tasks submitted: {audio_count}");
+    let audio_stats = fn64_abi::audio_output_stats();
+    println!(
+        "[wm2000-boot] AI audio output: {} buffers / {} samples ({} nonzero), range {:?}..={:?}; {} buffers reached AudioBackend",
+        audio_stats.ai_buffers,
+        audio_stats.samples,
+        audio_stats.nonzero_samples,
+        audio_stats.min,
+        audio_stats.max,
+        audio_stats.backend_buffers,
+    );
     println!("[wm2000-boot] renderer: {active_renderer}, graphics policy: {graphics_policy:?}");
     let last_render_error = fn64_abi::last_render_error();
     println!("[wm2000-boot] last render error: {last_render_error:?}");
@@ -821,6 +915,61 @@ fn main() {
         println!("[wm2000-boot] trace events recorded: {}", trace.len());
         write_trace_file(&trace, &trace_path);
         println!("[wm2000-boot] trace written to {trace_path}");
+    }
+
+    let audio_health_before_drain = fn64_abi::audio_stream_health();
+    if let Some(health) = audio_health_before_drain {
+        println!(
+            "[wm2000-boot] host audio health before drain: callbacks={} requested_samples={} \
+             underrun_samples={} late_callbacks={} max_callback_gap_us={}",
+            health.callbacks,
+            health.requested_samples,
+            health.underrun_samples,
+            health.late_callbacks,
+            health.max_callback_gap_us,
+        );
+    }
+    if audio_pace_target_frames.is_some() {
+        fn64_boot_harness::pace_live_audio_output(0, std::time::Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("wm2000-boot: drain host audio before exit: {error}"));
+        println!("[wm2000-boot] host audio queue drained before exit");
+    }
+    if let Some(health) = fn64_abi::audio_stream_health() {
+        let drain_underrun_samples = audio_health_before_drain
+            .map(|before| {
+                health
+                    .underrun_samples
+                    .saturating_sub(before.underrun_samples)
+            })
+            .unwrap_or(0);
+        println!(
+            "[wm2000-boot] host audio health after drain: callbacks={} requested_samples={} \
+             underrun_samples={} (+{} drain) late_callbacks={} max_callback_gap_us={}",
+            health.callbacks,
+            health.requested_samples,
+            health.underrun_samples,
+            drain_underrun_samples,
+            health.late_callbacks,
+            health.max_callback_gap_us,
+        );
+    }
+    let timing = fn64_abi::phase_timing();
+    if timing.executor_calls > 0 {
+        let residual_ns = timing
+            .executor_ns
+            .saturating_sub(timing.gfx_ns)
+            .saturating_sub(timing.audio_dispatch_ns);
+        println!(
+            "[wm2000-boot] phase timing: executor={:.3} ms/{} calls, gfx={:.3} ms/{} phases, \
+             audio_dispatch={:.3} ms/{} tasks, cpu+executor_residual={:.3} ms",
+            timing.executor_ns as f64 / 1e6,
+            timing.executor_calls,
+            timing.gfx_ns as f64 / 1e6,
+            timing.gfx_calls,
+            timing.audio_dispatch_ns as f64 / 1e6,
+            timing.audio_dispatch_calls,
+            residual_ns as f64 / 1e6,
+        );
     }
 
     let exit = fn64_abi::prepare_process_exit();

@@ -38,6 +38,7 @@ EXPORT = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)_recomp\b",
     re.MULTILINE,
 )
+RAW_STRING_START = re.compile(r'r(#+)?"')
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,10 @@ def scrub_rust(text: str) -> str:
             i += 2
             continue
 
-        raw = re.match(r'r(#+)?"', text[i:])
+        # Match against the original source at an offset. Slicing `text[i:]`
+        # here copies the remaining source on every lexer step and makes the
+        # scan quadratic on large generated ABI modules.
+        raw = RAW_STRING_START.match(text, i)
         if raw:
             hashes = raw.group(1) or ""
             start_len = len(raw.group(0))
@@ -150,7 +154,12 @@ def function_body(source: str, signature_end: int) -> str:
 
 def live_exports(source_dir: Path = SOURCE_DIR) -> dict[str, ExportedShim]:
     exports: dict[str, ExportedShim] = {}
-    for path in sorted(source_dir.glob("*.rs")):
+    # rglob, not glob: shims live in subdirectory modules too (e.g. pi/mmio.rs,
+    # task_dispatch/lifecycle.rs) since the large files were split. Skip test
+    # modules -- exports are #[no_mangle] production definitions, never in tests.
+    for path in sorted(source_dir.rglob("*.rs")):
+        if path.name == "tests.rs" or "tests" in path.parts:
+            continue
         source = path.read_text()
         for match in EXPORT.finditer(source):
             symbol = match.group("name")

@@ -3,9 +3,9 @@
 use std::{error::Error, io};
 
 use fn64_render::{
-    FrameStatus, M_GFXTASK, OsTask, RenderAspectRatio, RenderBackend, RenderConfig,
-    RenderFiltering, RenderGraphicsApi, RenderRuntimeSettings, ViFilterControl, ViPixelType,
-    ViPresentation,
+    FrameStatus, OsTask, RenderAspectRatio, RenderBackend, RenderConfig, RenderFiltering,
+    RenderGraphicsApi, RenderRuntimeSettings, ViFilterControl, ViPixelType, ViPresentation,
+    M_GFXTASK,
 };
 use fn64_render_rt64::{Rt64Backend, Rt64SourceProvenance};
 use fn64_runtime::{RdramAddr, RdramView, RdramViewMut, RspMemory};
@@ -332,8 +332,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         false,
     );
     // Public S2DEX pointers also admit KSEG0/KSEG1 low-24 physical forms.
-    RdramViewMut::from_storage(&mut rdram)
-        .write_u32(RdramAddr::from_offset(TXSP + 4), 0xa000_3000);
+    RdramViewMut::from_storage(&mut rdram).write_u32(RdramAddr::from_offset(TXSP + 4), 0xa000_3000);
     overwrite_compound_pointer(&mut rdram, S2DEX_DL, 0x8000_2000);
     insert_segment_zero_base(&mut rdram, S2DEX_DL, 0x0010_0000);
     backend.enable_deferred_workload_capture_for_evidence()?;
@@ -456,16 +455,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     write_compound(&mut rdram, 0);
-    RdramViewMut::from_storage(&mut rdram)
-        .write_u32(RdramAddr::from_offset(TXSP + 4), 0x1000_3000);
+    RdramViewMut::from_storage(&mut rdram).write_u32(RdramAddr::from_offset(TXSP + 4), 0x1000_3000);
     require_named_rejection(
         backend.process_synthetic_s2dex2(&mut rdram, REJECT_DL as u32, S2DEX_TARGET),
         "block source uses non-public segment bits",
     )?;
 
     write_compound(&mut rdram, 0);
-    RdramViewMut::from_storage(&mut rdram)
-        .write_u32(RdramAddr::from_offset(TXSP + 4), 0x007f_fff8);
+    RdramViewMut::from_storage(&mut rdram).write_u32(RdramAddr::from_offset(TXSP + 4), 0x007f_fff8);
     require_named_rejection(
         backend.process_synthetic_s2dex2(&mut rdram, REJECT_DL as u32, S2DEX_TARGET),
         "block source range escapes physical RDRAM",

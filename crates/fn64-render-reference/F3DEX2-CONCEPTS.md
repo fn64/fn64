@@ -7,7 +7,7 @@ This document is a behavioral reference for the F3DEX2 graphics microcode as
 used by *The Legend of Zelda: Ocarina of Time* (NTSC 1.0). It describes **what
 each display-list command does to N64 RSP/RDP state** and **the transform +
 rasterization math that turns loaded vertices into on-screen triangles**, so
-that `crates/fn64-render-reference/src/gbi.rs` (the DL decoder) and `raster.rs`
+that `crates/fn64-render-reference/src/gbi/mod.rs` (the DL decoder) and `raster.rs`
 (the software rasterizer) can be filled in correctly.
 
 Everything here is described from the hardware/GBI *contract* (command
@@ -1193,7 +1193,7 @@ color-combiner, framebuffer, depth, scissor, texture-rectangle, raw-triangle,
 
 ---
 
-## 7. Cross-reference: what `crates/fn64-render-reference/src/gbi.rs` already names
+## 7. Cross-reference: what `crates/fn64-render-reference/src/gbi/mod.rs` already names
 
 `gbi.rs` already declares these opcode constants and has handler scaffolding.
 This maps each to the section above and flags where the current handler logic

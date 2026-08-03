@@ -5,8 +5,8 @@
 
 use crate::block_pack::BlockPackV1;
 use crate::facts::{
-    executable_range_subject, function_entry_subject, Fact, FactDb, MappingAddressSpace,
-    ProofState, RomAddressSpace,
+    executable_range_subject, function_entry_subject, BankBackingSpanV1, BankBackingV1, Fact,
+    FactDb, MappingAddressSpace, ProofState, RomAddressSpace,
 };
 use crate::owner_proof::{OwnerAssessment, OwnerBlocker, OwnerProofReport};
 use serde::{Deserialize, Serialize};
@@ -72,8 +72,7 @@ pub enum OwnerProofCoverageError {
         bank: String,
         entry_pc: u32,
         va_end: u32,
-        rom_start: u32,
-        rom_end: u32,
+        backing: BankBackingSpanV1,
     },
     UnresolvedOwners {
         candidates: u64,
@@ -101,11 +100,10 @@ impl std::fmt::Display for OwnerProofCoverageError {
                 bank,
                 entry_pc,
                 va_end,
-                rom_start,
-                rom_end,
+                backing,
             } => write!(
                 f,
-                "exact owner {bank}:0x{entry_pc:08x} has invalid VA/ROM extents ending at 0x{va_end:08x} and [0x{rom_start:08x},0x{rom_end:08x})"
+                "exact owner {bank}:0x{entry_pc:08x} has invalid VA/backing extents ending at 0x{va_end:08x} and {backing:?}"
             ),
             Self::UnresolvedOwners {
                 candidates,
@@ -207,10 +205,10 @@ pub fn owner_proof_coverage(
                     let Some(va_len) = owner.va_end.checked_sub(owner.entry.pc) else {
                         return Err(invalid_exact(owner));
                     };
-                    let Some(rom_len) = owner.rom_end.checked_sub(owner.rom_start) else {
+                    let Some(backing_len) = backing_span_len(&owner.backing) else {
                         return Err(invalid_exact(owner));
                     };
-                    if va_len == 0 || va_len != rom_len {
+                    if va_len == 0 || va_len != backing_len {
                         return Err(invalid_exact(owner));
                     }
                     exact_owners += 1;
@@ -255,8 +253,20 @@ fn invalid_exact(owner: &crate::owner_proof::ExactFunctionOwner) -> OwnerProofCo
         bank: owner.entry.bank.clone(),
         entry_pc: owner.entry.pc,
         va_end: owner.va_end,
-        rom_start: owner.rom_start,
-        rom_end: owner.rom_end,
+        backing: owner.backing.clone(),
+    }
+}
+
+fn backing_span_len(backing: &BankBackingSpanV1) -> Option<u32> {
+    match backing {
+        BankBackingSpanV1::RomAffine {
+            rom_start, rom_end, ..
+        } => rom_end.checked_sub(*rom_start),
+        BankBackingSpanV1::Materialized {
+            output_start,
+            output_end,
+            ..
+        } => output_end.checked_sub(*output_start),
     }
 }
 
@@ -268,30 +278,17 @@ fn report_base(
     let mut direct_physical = Vec::new();
     let mut logical_mappings = BTreeSet::new();
     let mut mapped_banks = BTreeSet::new();
-    for fact in db.proven_rom_mappings() {
-        let Fact::RomMapping {
-            bank,
-            rom_space,
+    for image in db.proven_bank_images() {
+        mapped_banks.insert(image.bank.clone());
+        if let BankBackingV1::RomAffine {
+            rom_space: RomAddressSpace::Physical,
             rom_start,
             rom_end,
-            va_start,
-            va_end,
-        } = fact
-        else {
-            unreachable!()
-        };
-        mapped_banks.insert(bank.clone());
-        logical_mappings.insert((
-            bank.clone(),
-            *rom_space,
-            *rom_start,
-            *rom_end,
-            *va_start,
-            *va_end,
-        ));
-        if *rom_space == RomAddressSpace::Physical {
+        } = &image.backing
+        {
             direct_physical.push((*rom_start, *rom_end));
         }
+        logical_mappings.insert(image);
     }
 
     let file_backing = db
@@ -349,7 +346,7 @@ fn report_base(
         known_file_backing_bytes: union_len(file_backing),
         logical_load_image_bytes: logical_mappings
             .iter()
-            .map(|(_, _, start, end, _, _)| end.saturating_sub(*start) as u64)
+            .map(|image| image.va_end.saturating_sub(image.va_start) as u64)
             .sum(),
         executable_bytes: executable_by_bank
             .values()
@@ -392,24 +389,29 @@ fn union_len(mut ranges: Vec<(u32, u32)>) -> u64 {
 /// so two byte-identical packs produce the same digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackCoverage {
+    /// Hash-wire schema. V3 replaces flat ROM coordinates with typed backing.
+    pub digest_schema_version: u32,
+    /// The independently versioned BlockPack wire schema summarized here.
     pub schema_version: u32,
     pub banks: u64,
     pub blocks: u64,
     /// Aligned 32-bit instruction words across all packed blocks. Each block's
-    /// word count is `(rom_end - rom_start) / 4`; block geometry is validated
-    /// four-byte-aligned when the pack is emitted.
+    /// word count is the typed backing span length divided by four; block
+    /// geometry is validated four-byte-aligned when the pack is emitted.
     pub words: u64,
     pub digest: String,
 }
 
+pub const PACK_COVERAGE_DIGEST_SCHEMA_V3: u32 = 3;
+
 /// Fold a pack into a deterministic coverage summary. The digest commits to the
 /// schema version, the normalized ROM identity, and every packed block's
-/// `(bank, bank_id, start_va, end_va, rom_start, rom_end, bytes_sha256,
-/// terminator)`. Banks and blocks are already emitted in stable order by
-/// [`crate::block_pack::emit_block_pack_v1`]; this reads them in that order.
+/// `(bank, bank_id, start_va, end_va, backing, bytes_sha256, terminator)`.
+/// Banks and blocks are already emitted in stable order by the BlockPack
+/// emitters; this reads them in that order.
 pub fn pack_coverage(pack: &BlockPackV1) -> PackCoverage {
     let mut hasher = Sha256::new();
-    hasher.update(b"fn64:pack-coverage:v1\n");
+    hasher.update(b"fn64:pack-coverage:v3\n");
     hasher.update(pack.schema_version.to_be_bytes());
     hasher.update(pack.normalized_rom_sha256.as_bytes());
     hasher.update(b"\n");
@@ -422,11 +424,35 @@ pub fn pack_coverage(pack: &BlockPackV1) -> PackCoverage {
         hasher.update(bank.bank_id.to_be_bytes());
         for block in &bank.blocks {
             blocks += 1;
-            words += u64::from(block.rom_end.saturating_sub(block.rom_start)) / 4;
+            words += u64::from(backing_span_len(&block.backing).unwrap_or(0)) / 4;
             hasher.update(block.start_va.to_be_bytes());
             hasher.update(block.end_va.to_be_bytes());
-            hasher.update(block.rom_start.to_be_bytes());
-            hasher.update(block.rom_end.to_be_bytes());
+            match &block.backing {
+                BankBackingSpanV1::RomAffine {
+                    rom_space,
+                    rom_start,
+                    rom_end,
+                } => {
+                    hasher.update([0]);
+                    hasher.update([match rom_space {
+                        RomAddressSpace::Physical => 0,
+                        RomAddressSpace::Virtual => 1,
+                    }]);
+                    hasher.update(rom_start.to_be_bytes());
+                    hasher.update(rom_end.to_be_bytes());
+                }
+                BankBackingSpanV1::Materialized {
+                    receipt_sha256,
+                    output_start,
+                    output_end,
+                } => {
+                    hasher.update([1]);
+                    hasher.update((receipt_sha256.len() as u64).to_be_bytes());
+                    hasher.update(receipt_sha256.as_bytes());
+                    hasher.update(output_start.to_be_bytes());
+                    hasher.update(output_end.to_be_bytes());
+                }
+            }
             hasher.update(block.bytes_sha256.as_bytes());
             hasher.update(b"\n");
             hasher.update(format!("{:?}", block.terminator).as_bytes());
@@ -434,6 +460,7 @@ pub fn pack_coverage(pack: &BlockPackV1) -> PackCoverage {
         }
     }
     PackCoverage {
+        digest_schema_version: PACK_COVERAGE_DIGEST_SCHEMA_V3,
         schema_version: pack.schema_version,
         banks: pack.banks.len() as u64,
         blocks,
@@ -529,8 +556,13 @@ pub fn render_report(
     match pack {
         None => lines.push("pack none".to_string()),
         Some(pack) => lines.push(format!(
-            "pack schema={} banks={} blocks={} words={} digest={}",
-            pack.schema_version, pack.banks, pack.blocks, pack.words, pack.digest
+            "pack schema={} digest_schema={} banks={} blocks={} words={} digest={}",
+            pack.schema_version,
+            pack.digest_schema_version,
+            pack.banks,
+            pack.blocks,
+            pack.words,
+            pack.digest
         )),
     }
 
@@ -542,7 +574,10 @@ mod tests {
     use super::*;
     use crate::block_pack::{BlockPackV1, PackedBankV1, PackedBlockV1};
     use crate::cfg::BlockTerminator;
-    use crate::facts::{BankAddr, CandidateDetector, FunctionEntryEvidence};
+    use crate::facts::{
+        BankAddr, CandidateDetector, FunctionEntryEvidence, MaterializationEvaluatorV1,
+        MaterializedImageSourceV1, MaterializedImageSuffixV1,
+    };
     use crate::owner_proof::{
         ExactFunctionOwner, OwnerAssessment, OwnerFrontier, OwnerProofReport,
     };
@@ -553,7 +588,11 @@ mod tests {
         for bank in ["a", "b"] {
             let mapping = db.insert(Fact::RomMapping {
                 bank: bank.to_string(),
-                rom_space: RomAddressSpace::Physical,
+                rom_space: if bank == "a" {
+                    RomAddressSpace::Physical
+                } else {
+                    RomAddressSpace::Virtual
+                },
                 rom_start: 0x100,
                 rom_end: 0x200,
                 va_start: 0x8000_0000,
@@ -579,6 +618,38 @@ mod tests {
             )
             .unwrap();
         }
+        let evaluated = db.insert(Fact::EvaluatedImage {
+            bank: "materialized".into(),
+            va_start: 0x8010_0000,
+            va_end: 0x8010_0040,
+            receipt: crate::facts::EvaluatedImageReceiptV1 {
+                evaluator: MaterializationEvaluatorV1::HeaderedRawDeflateSequenceV1 {
+                    stream_count: 0,
+                },
+                source: MaterializedImageSourceV1 {
+                    rom_space: RomAddressSpace::Physical,
+                    rom_start: 0x400,
+                    rom_end: 0x440,
+                    cursor: 0,
+                },
+                source_sha256: "1".repeat(64),
+                output_len: 0x40,
+                output_sha256: "2".repeat(64),
+                streams: Vec::new(),
+                trailing_suffix: MaterializedImageSuffixV1 {
+                    offset: 0,
+                    len: 0x40,
+                    sha256: "3".repeat(64),
+                },
+            },
+        });
+        db.conclude(
+            "bank:materialized",
+            ProofState::Proven,
+            vec![evaluated],
+            "test",
+        )
+        .unwrap();
         let target = BankAddr::new("a", 0x8000_0000);
         let claim = db.insert(Fact::FunctionEntryClaim {
             target: target.clone(),
@@ -598,9 +669,9 @@ mod tests {
 
         let report = report(0x1000, &db);
         assert_eq!(report.direct_physical_load_bytes, 0x100);
-        assert_eq!(report.logical_load_image_bytes, 0x200);
+        assert_eq!(report.logical_load_image_bytes, 0x240);
         assert_eq!(report.executable_bytes, 0x100);
-        assert_eq!(report.mapped_banks, 2);
+        assert_eq!(report.mapped_banks, 3);
         assert_eq!(report.function_entries_by_state[&ProofState::Candidate], 1);
         assert_eq!(report.function_owners.state, OwnerProofRunState::NotRun);
         assert_eq!(
@@ -614,9 +685,26 @@ mod tests {
             owner: ExactFunctionOwner {
                 entry: BankAddr::new("bank", entry_pc),
                 va_end: entry_pc + byte_len,
-                rom_space: RomAddressSpace::Physical,
-                rom_start: 0x1000 + entry_pc - 0x8000_0000,
-                rom_end: 0x1000 + entry_pc - 0x8000_0000 + byte_len,
+                backing: BankBackingSpanV1::RomAffine {
+                    rom_space: RomAddressSpace::Physical,
+                    rom_start: 0x1000 + entry_pc - 0x8000_0000,
+                    rom_end: 0x1000 + entry_pc - 0x8000_0000 + byte_len,
+                },
+                block_starts: vec![entry_pc],
+            },
+        }
+    }
+
+    fn exact_materialized(entry_pc: u32, byte_len: u32) -> OwnerAssessment {
+        OwnerAssessment::Proven {
+            owner: ExactFunctionOwner {
+                entry: BankAddr::new("bank", entry_pc),
+                va_end: entry_pc + byte_len,
+                backing: BankBackingSpanV1::Materialized {
+                    receipt_sha256: "f".repeat(64),
+                    output_start: entry_pc - 0x8000_0000,
+                    output_end: entry_pc - 0x8000_0000 + byte_len,
+                },
                 block_starts: vec![entry_pc],
             },
         }
@@ -703,7 +791,7 @@ mod tests {
     fn exact_owner_gate_accepts_valid_proven_extents() {
         let reports = [OwnerProofReport {
             bank: "bank".into(),
-            assessments: vec![exact(0x8000_0000, 8), exact(0x8000_0008, 12)],
+            assessments: vec![exact(0x8000_0000, 8), exact_materialized(0x8000_0008, 12)],
         }];
         let coverage = require_all_owners_exact(&reports).unwrap();
         assert_eq!(coverage.exact_owners, 2);
@@ -739,18 +827,22 @@ mod tests {
                     PackedBlockV1 {
                         start_va: 0x8000_0000,
                         end_va: 0x8000_0010,
-                        rom_space: crate::facts::RomAddressSpace::Physical,
-            rom_start: 0x1000,
-                        rom_end: 0x1010,
+                        backing: BankBackingSpanV1::RomAffine {
+                            rom_space: RomAddressSpace::Physical,
+                            rom_start: 0x1000,
+                            rom_end: 0x1010,
+                        },
                         bytes_sha256: "b".repeat(64),
                         terminator: BlockTerminator::Return,
                     },
                     PackedBlockV1 {
                         start_va: 0x8000_0010,
                         end_va: 0x8000_0020,
-                        rom_space: crate::facts::RomAddressSpace::Physical,
-            rom_start: 0x1010,
-                        rom_end: 0x1020,
+                        backing: BankBackingSpanV1::Materialized {
+                            receipt_sha256: "d".repeat(64),
+                            output_start: 0x10,
+                            output_end: 0x20,
+                        },
                         bytes_sha256: "c".repeat(64),
                         terminator: BlockTerminator::Fallthrough { next: 0x8000_0020 },
                     },
@@ -824,7 +916,7 @@ mod tests {
         assert_eq!(
             lines[10],
             format!(
-                "pack schema=1 banks=1 blocks=2 words=8 digest={}",
+                "pack schema=1 digest_schema=3 banks=1 blocks=2 words=8 digest={}",
                 pack.digest
             )
         );
@@ -845,5 +937,23 @@ mod tests {
         let mut mutated = pack;
         mutated.banks[0].blocks[0].bytes_sha256 = "e".repeat(64);
         assert_ne!(pack_coverage(&mutated).digest, a.digest);
+
+        let mut backing_changed = synthetic_pack();
+        backing_changed.banks[0].blocks[0].backing = BankBackingSpanV1::RomAffine {
+            rom_space: RomAddressSpace::Virtual,
+            rom_start: 0x1000,
+            rom_end: 0x1010,
+        };
+        assert_ne!(pack_coverage(&backing_changed).digest, a.digest);
+
+        let mut receipt_changed = synthetic_pack();
+        let BankBackingSpanV1::Materialized { receipt_sha256, .. } =
+            &mut receipt_changed.banks[0].blocks[1].backing
+        else {
+            panic!("synthetic second block must be materialized")
+        };
+        *receipt_sha256 = "e".repeat(64);
+        assert_ne!(pack_coverage(&receipt_changed).digest, a.digest);
+        assert_eq!(a.digest_schema_version, PACK_COVERAGE_DIGEST_SCHEMA_V3);
     }
 }

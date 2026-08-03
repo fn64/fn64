@@ -1,5 +1,37 @@
 # WM2000 boot session notes (2026-07-14)
 
+2026-07-25 arbitrary-PC update: checked AOT `lw`/`sw` now reaches the installed
+word-MMIO hook before RDRAM backing rejection. The private NWXE pack passes the
+former `__osSiDeviceBusy` SI-status fault at `0x80038268`. Its host override is
+not address-guessed: the build requires one exact six-word implementation,
+emits the matched address into the generated pack, and binds only that fact to
+the typed adapter. Three independent public-debugger target snapshots showed
+the apparent `0x80036f10` TLB refill was a harness bug: the reference `$t8` was
+`0xffffffff80048860`, while fn64's `0x60880480` was its exact byte reversal.
+The block example now materializes the IPL3 ROM copy through logical RDRAM byte
+lanes. Ten corrected runs first stopped identically at the honest sparse-pack
+miss for spawned thread entry `0x800004d0`. The pack builder now admits exact
+bank-generation PCs from three byte-identical, ROM-bound black-box traces
+without treating scenario observations as function-owner proof or exhaustive
+support. Because the debugger advances branch+delay atomically, its producer
+no longer claims executed-PC exhaustiveness and pack admission adds each
+required delay-slot word from verified ROM bytes. The bounded pack contains
+1,929 observed PCs plus 289 required delay slots in 90 spans / 2,517 total
+words. It passes `0x800004d0`; the first ten consecutive runs then stopped on
+a separate runtime memory-model fault at `0x8002a8d8` for cartridge address
+`0xffffffffb0000000`. Canonical KSEG0/KSEG1 PI-domain-1 word reads now use the
+same installed, read-only ROM source as PI DMA. Ten corrected runs pass that
+load and expose a raw guest VI initialization image with V timing and scales
+programmed but `H_START` still zero when status is enabled. The independent
+public-debugger observation exposes the same values and no H_START transition;
+its status transition varies by one adjacent pause, so it is value evidence,
+not an instruction-exact timing trace. A zero H or V interval now remains an
+inactive retained image while nonzero malformed intervals still trap. Ten
+consecutive corrected runs pass that assertion and stop identically at the
+separate missing-render-backend frontier, with no prior `AotMiss`.
+Gap diagnostics retain current
+CP0 context; a non-architectural miss does not commit an exception.
+
 Starting state: HEAD=a7f94c33. Frontier per commit msg: func_800004D0 unbounded
 poll ~iter 400. Trace file /tmp/wm2000-boot-trace.jsonl only has 1 event (stale
 from prior run, not yet re-run this session).
@@ -566,7 +598,7 @@ framing:
    contract documented at `lib.rs:485`).
 3. **`fn64-runtime` scheduler reordering** -- rejected, re-confirmed this
    session by reading `Executor::run_one_step`/`pick_next`
-   (`crates/fn64-runtime/src/executor.rs:565-626`): the executor is
+   (`crates/fn64-runtime/src/executor/mod.rs:565-626`): the executor is
    strict-priority-preemptive at every scheduling point (`pick_next` always
    returns the highest-pri runnable thread), which IS the libultra-correct
    behavior real hardware also exhibits at its own scheduling points (a
@@ -764,7 +796,7 @@ allows ordinary Rust process teardown; changing individual shims to
 
 New standalone example `examples/wm2000-block-boot`: build.rs runs the
 REAL fn64-discover pipeline on the ROM (`run_discovery` ->
-`compose_materialized_bank_v1` -> `emit_block_pack_v1` ->
+`compose_materialized_bank_validated_v2` -> `emit_validated_block_pack_v2` ->
 `materialize_block_pack` -> `emit_materialized_bank_runner`), emits the
 197-block/1,039-word sparse runner + pack consts into OUT_DIR; main.rs
 installs them via `ExecutableRegion`/`BlockProgram` and boots through
@@ -1168,3 +1200,814 @@ under FN64_BOOT_PROBE):
 Also landed this part: permanent creation-table and sp-region probes,
 PIF control-byte clear. Trap/back-stop diagnostics from parts 7-8 all
 still in place. Gates green.
+
+## Session 2026-07-26: dense resident AOT, compile-budget sharding, and the first separated runtime divergence
+
+`FN64_BLOCK_PROGRESS_ONLY=1` makes the dense block harness stop after its
+bounded milestone counters and process-exit cleanup, before enforcing the
+overlay-entry release gate. This is an exploratory profiling mode only; its
+successful exit is not overlay evidence.
+
+`FN64_BLOCK_CONTINUE_AFTER_OVERLAY=1` keeps the bounded executor running after
+the first digest-selected overlay entry instead of stopping at that release
+milestone. It exists to locate the next post-entry execution boundary; the
+ordinary gate remains stop-on-first-entry so its result has one narrow meaning.
+`FN64_BLOCK_PROGRESS_ONLY=1` still writes an explicitly requested
+`FN64_BLOCK_PC_TRACE` or `FN64_BLOCK_HOST_TRACE` before preparing process exit.
+Progress-only runs also disable retention of the executor and device diagnostic
+event vectors by default. The device fabric continues to maintain constant-space
+typed transition counters used by the progress report. Set
+`FN64_BLOCK_EXECUTOR_TRACE=1` or `FN64_BLOCK_DEVICE_TRACE=1` to retain the
+corresponding full history when a diagnosis actually needs it. Release evidence
+keeps both histories enabled by default.
+
+`FN64_PROFILE_AOT_PCS` accepts a comma-separated list of hexadecimal guest
+PCs and reports exact dense-runner entry counts plus the first and last
+observed `v0/v1/a0/a1/a2/a3/sp/ra`, six incoming stack words, COP0
+`Status/Cause/EPC/BadVAddr`, FCSR, and selected raw FPR values for each at the
+bounded exit. The snapshot is constant-space and sampled only at named PCs.
+It is a diagnostic observation list, never an address signature or discovery
+input.
+
+`FN64_PROFILE_STOP_AT_PC` accepts one hexadecimal guest PC and ends the
+exploratory loop after the scheduler step that first enters that AOT
+destination. Pair it with the same PC in `FN64_PROFILE_AOT_PCS` to capture the
+transition's first/last GPR and COP0 state without overshooting a late
+milestone. It is profiling control only and is never release-gate evidence.
+
+`FN64_PROFILE_RDRAM_RANGES` accepts comma-separated `HEX_VRAM:BYTE_LEN`
+ranges, each capped at 256 bytes, and reports architectural bytes at the same
+bounded exit. It is observational only and never seeds generated content.
+
+`FN64_PROFILE_AOT_RECENT` accepts a positive destination count, enables the
+existing bounded destination ring at exactly that limit, and reports the 20
+most frequent bank-qualified PCs in the retained tail. It is intended for
+late-loop localization without restoring the default unbounded certification
+history to exploratory million-step runs.
+
+`FN64_PROFILE_HOST_RECENT` accepts a positive host-boundary count, bounds the
+existing host-boundary ring at exactly that limit, and reports both the 20 most
+frequent `(thread, target, phase, resume)` tuples and the final 12 boundaries.
+It is the bounded diagnostic alternative to `FN64_BLOCK_HOST_TRACE`; absent
+both variables, exploratory runs retain no host-boundary history.
+
+`FN64_PROFILE_CONTROL=1` reports the typed executor control snapshot at the
+bounded exit so a localized PC or host-boundary loop can be attributed to its
+guest thread and scheduler state. It does not enable any execution history.
+
+The block lane now emits the complete one-MiB IPL3 resident image: 262,144
+aligned entries, including data words and precise RI behavior. A monolithic
+generated unit was roughly 267 MiB and crossed the two-minute compile gate.
+Sixteen content-addressed 64 KiB crate artifacts retain the prescribed shard
+identity; each is statically divided into sixteen 4 KiB callable subrunners.
+This is still AOT at every entry—cross-subrunner transfers use the normal typed
+resolver, with no runtime decoder or interpreter fallback. Full `cargo check
+-j4` measured 62.67 seconds, native debug build 107.56 seconds, and an
+unchanged rebuild 0.06 seconds. The resulting debug binary is 295 MiB.
+
+Three 400,000-step black-box runs produced byte-identical traces, BootContexts,
+and completed-image observations for the four-word general exception preamble
+at `0x80000180` (SHA-256
+`92d005d9f1c311068500142b0129d6160dd193f92baa1e0f84061a169b48b982`).
+That CPU-produced image is a separate generation and its four live words are
+compared directly at every matching runner entry; a mismatch computes the full
+digest for evidence. Dense execution passes the prior sparse-PC, transitional
+VI, and missing-renderer frontiers with no `AotMiss`.
+
+Those private inputs now have a bounded acquisition wrapper rather than a
+manual producer recipe: `scripts/capture-wm-executable-image-group.zsh` runs
+the public-debugger producer at least three times in isolated private
+directories, requires both the image and ROM-entry BootContext even when the
+producer exits zero, and validates the group with the canonical discovery
+parser under the common 2048 MiB/40%-free guard and Cargo `-j1`. For this known
+generation its typed inputs are group
+`FN64_EXECUTABLE_IMAGE_GENERAL_EXCEPTION`, image ID
+`general-exception-preamble`, capture/first/start PC `0x80000180`, four words,
+and 400,000 steps. The wrapper prints only a path-free receipt and keeps all
+ROM-derived bytes outside the repository. Its ROM-free fake-producer contract
+gate is `scripts/capture-wm-executable-image-group.zsh --selftest`.
+
+Two newly exposed faults were runtime wiring, not AOT closure. The harness now
+registers NWXE's typed in-memory 32 KiB SRAM device. RSP RDRAM publication no
+longer tries to reborrow the live `BlockProgram` while an AOT `SP_STATUS` store
+still owns it: the RSP records the write, the generated instruction exits via
+its executable-write boundary, and the outer owner publishes before the next
+guest instruction. Ten consecutive dense end-to-end runs cleared that nested
+borrow and reached the same later guest fault at EPC `0x800e1ba4`; their panic
+text is not byte-identical because Rust includes the process/thread ID. The
+focused `fn64-abi` suite passes 318 tests.
+
+Follow-up diagnosis disproved the initial indirect-transfer interpretation. A bounded
+typed `jr`/`jalr` provenance ring showed that no register-targeted transfer
+selected `0x800e1b90`; the actual source is the direct `jal` at `0x80000884`.
+The resident bytes make `0x800e1b90` the delay-slot NOP of a preceding
+`jr $v0`, which exposed stale-generation execution. Dense subrunners now bind
+each 4 KiB page digest and validate it on first fetch and after an intersecting
+guest write. Session-qualified per-page write tokens avoid hashing unchanged
+pages at every checkpoint without allowing a fresh boot to inherit an old
+verification result.
+
+The corrected run stops before stale execution with a typed `AotMiss` for
+`0x800e1400..0x800e2400`: the resident and live digests differ.
+At the last common checkpoint before the `0x80003720` initialization call,
+the public debugger still observes the resident digest. Three byte-identical
+captures immediately after that call observe the same live digest as fn64,
+with first
+entry `0x800e1b90`; no exact copy of the 4 KiB image occurs in the normalized
+ROM, so this evidence classifies it as CPU-produced rather than direct ROM
+DMA.
+
+The pack now emits both the resident page and that completed image as distinct
+immutable banks. Writes only dirty the registered physical range. At the next
+attempted fetch, a typed `ImageChanged` boundary returns without entering the
+stale runner; the outer owner matches the completed bytes against the closed
+pack, atomically replaces code and runner, preserves the instructions retired
+before the boundary, and retries the same PC under the new bank identity. An
+unknown digest or later generation remains a loud `AotMiss`; there is no
+translator or interpreter fallback. One early end-to-end measurement passed
+the old page miss and entered `0x800e1b90` from the captured bank.
+
+The newly exposed frontier is the separate runtime-behavior path already seen
+before stale-generation diagnosis: the guest reaches the null-pointer `LHU`
+at EPC `0x800e1ba4` and requests the unadmitted `0x80000000` refill vector.
+The three one-million-step black-box traces reach neither PC, so fn64-only
+vector bytes must not be admitted as closure evidence. This fetch-activation
+mechanism is unit-tested, but it has not yet met the ten-run deterministic-fix
+bar; the next investigation is the first runtime/input-state divergence that
+causes the guest fault.
+
+### Bounded profiling and resident host-boundary closure
+
+The July 26 dense-lane investigation uses `scripts/memory-guard.zsh` for every
+substantial build and run. The guard measures only the launched process tree,
+defaults to a 10 GiB aggregate-RSS limit and a 25% free-memory floor, and now
+refuses to launch when `ps` or `pgrep` is unavailable. Cargo builds are debug
+only and limited to `-j3`; the complete host-binding rebuild peaked at 4.57 GiB.
+This replaces the unsafe parallel release-build shape that launched fourteen
+`rustc` processes before the machine exhausted memory.
+
+Mechanical overlay discovery was not the remaining runtime bottleneck. Its
+enumeration phase fell from 1569 ms to 14--15 ms and the complete receipt from
+1780 ms to 201--209 ms, with identical receipts in ten consecutive runs.
+Content-stable generated writes and removal of profiling environment variables
+from semantic build inputs also reduce unchanged rebuilds to 0.12 seconds.
+For runtime diagnosis, `FN64_BLOCK_PROGRESS_ONLY`, `FN64_PROFILE_AOT_PCS`, and
+`FN64_PROFILE_RDRAM_RANGES` provide bounded milestone, exact-entry, and small
+architectural-memory observations. They are exploratory evidence only. A
+four-entry bank-to-artifact cache made the warm 200,000-step run slightly slower
+(8.99--9.01 seconds versus 8.85--8.86 seconds) and was removed.
+
+The dense resident pack now discovers public libultra host boundaries by
+semantics rather than addresses. The RSP recognizers follow the public
+`osSpTaskLoad`, `osSpTaskStartGo`, `osSpTaskYield`, and `osSpTaskYielded` manual
+operations and require helper-target relationships as well as task/status/DMA
+field behavior. The timer recognizer follows the public `osSetTimer` manual's
+o32 argument layout, `OSTimer` fields, and list insertion behavior. Each role
+must have exactly one match; relocated synthetic fixtures, invariant mutations,
+duplicate candidates, and an environment-gated NWXE corpus test cover the
+mechanism. Discovered calls map to the existing typed ABI adapters. Audio tasks
+use `LleAccuracy`, not the diagnostic-skip policy.
+
+This changes the observed frontier. Before task binding, 200,000 steps reported
+zero admitted SP tasks. After binding, 20,000 steps reported four audio submits,
+four SP tasks, four RCP completions, and four RSP/RDP executions. The next zero
+counter was SI/controller progress: the hand-written controller initialization
+called guest `osSetTimer`, then blocked in `osRecvMesg`; the raw guest timer list
+could not arm the typed executor's `TimerWheel`. After semantic `osSetTimer`
+binding, a bounded 50,000-step run reached the post-receive continuation once,
+performed eight raw SI DMAs, and completed one controller operation. Process-tree
+RSS peaked at 126 MiB. Ten subsequent sequential clean 50,000-step runs produced
+the same `sim_time=13087281`, eight raw SI DMAs, one controller operation, eight
+SP tasks, and identical watched-PC counts/register snapshots. Their guarded peak
+aggregate RSS was 129 MiB. This meets the deterministic-fix run-count bar for
+the timer-to-controller-init stall; it is not an overlay-entry claim.
+
+The next post-entry profile exposed a VI scheduling defect rather than a need
+for a longer horizon. NWXE rewrites `VI_H_SYNC` and `VI_V_SYNC` from its VI
+manager on every interrupt; applying those timing values restarted the modeled
+beam epoch, so `VI_INTR=2` scheduled another interrupt after only a few
+scanlines. Timing writes now change the field cadence without resetting the
+running field origin. A focused epoch-preservation regression passes 10/10.
+After that correction, the ordinary non-exploratory gate reaches recovered
+generation `0x5DEA0D1723E94993` at step 19,523 and
+`sim_time=13990253`. Ten consecutive clean runs produced that exact milestone
+and process-exit summary; guarded aggregate RSS peaked at 134 MiB. This meets
+the deterministic bar for resident-to-recovered-overlay entry. It does not by
+itself prove gameplay, rendering parity, or that every recovered overlay
+generation is reachable.
+
+A bounded 100,000-step continuation reaches `sim_time=223614515` with 143 VI
+interrupts, 130 completed audio tasks, 8,781 PI starts, one controller
+operation, four save operations, and no graphics submit. It completes overlay0
+and returns to predominantly resident execution; no other recovered generation
+is entered. A proposed dense-runner local-transfer fast path reduced retired
+host instructions by only 2.8% and did not reduce the 100,000-step CPU time
+(`92.74` versus `93.25` seconds), so it and two speculative extra
+`opt-level=1` shard overrides were removed. This rules out mechanical overlay
+discovery and those codegen changes as useful next actions; the zero graphics
+submit remains the current behavior frontier.
+
+Native stack sampling then attributed 33% of all samples, and most of the
+late-run cost, to SHA-256 setup for the 16-byte general-exception preamble.
+The vector gate had re-hashed those four words on every exception entry. It
+now compares the admitted words directly on the matching hot path and retains
+the admitted expected digest plus a freshly hashed live digest on mismatch.
+This preserves the same loud `AotMiss` evidence while moving hashing off the
+ordinary exception path. The same untraced 100,000-step workload fell from
+93.25 to 67.09 user CPU seconds (28.1%) with identical `sim_time=223614515`
+and identical device/task counters. Ten consecutive clean 50,000-step runs
+then reproduced `sim_time=37453026`, the step-19,523 overlay milestone, and
+every progress counter exactly; aggregate guarded RSS peaked at 139 MiB.
+
+One adjacent generic codegen defect was corrected independently: an arbitrary-PC
+runner's interior `MFC0 Count` now includes instructions retired before the
+read, matching the interpreter; whole-function entry reads retain the entry
+value. Its focused regression passes, but NWXE's `osGetCount` begins at a runner
+boundary, so this change did not cause the controller advance and is not cited
+as such.
+
+### Typed exception ownership and bounded profiling (2026-07-27)
+
+A 200,000-step continuation was not waiting on graphics or another mechanical
+overlay scan. At step 50,568, resident `DIV.D` at `0x800303e4` raised an enabled
+invalid-operation exception (`FCSR 0x01800804 -> 0x01810804`). The four-word
+vector reached the retail handler, but its load of the guest running-thread
+global returned null and recursively faulted while saving context. That global
+was not already modeled. Discovery now derives it without an address signature:
+the independently unique public `osGetThreadPri(NULL)` and
+`osSetThreadPri(NULL, ...)` bodies must load the same global before accessing
+`OSThread.priority`. The scheduler mirrors the selected registered
+`OSThread*` at its single resume seam.
+
+The mirror exposed a deeper ownership conflict: the raw handler then attempted
+to dispatch from guest thread queues and saved contexts that the host-bound
+thread API intentionally does not own, selecting unmapped PC `0x00000400`.
+The live block lane now asks `BlockProgram` to return architectural faults to
+the live owner. Registered guest threads commit precise CP0 state, optionally
+post the public BREAK/FAULT event through the typed executor, and stop; the raw
+guest dispatcher is retained for program owners that do not replace libultra's
+scheduler. One bounded 60,000-step probe cleared the handler recursion and
+completed at `sim_time=387768784`, with 226 audio tasks and zero graphics tasks;
+peak process-tree RSS was 139 MiB. This is first-run frontier evidence, not the
+required 10-run deterministic validation.
+
+### Canonical scheduler-mirror writer boundary (2026-07-31)
+
+The first one-million-instruction withheld-shard AOT run stopped before its
+dynamic comparison at physical RDRAM `[0x00048870, 0x00048874)`. The loud
+mutation guard was correct: the dense boot pack makes every aligned resident
+word an arbitrary-PC fallback candidate, so the zero-initialized
+`__osRunningThread` data word is inside the watched union. The write itself was
+not self-modifying code. `run_one_step` mirrors the selected `OSThread *` there
+through a raw host pointer immediately before resuming the coroutine, bypassing
+the canonical writer journal.
+
+The canonical catalog lane now reconciles the watched image before that write,
+skips an unchanged pointer, and otherwise commits the exact four-byte HostAbi
+declaration through a move-only child writer transaction before dispatch. It
+does not invent a catalog host-call target/resume frame for scheduler state, so
+the existing host-call-only completion receipt remains honestly open. A
+synthetic validated-bootstrap regression places the global in a watched
+non-entry bank and proves the exact declaration, changed-byte runs, quiescent
+pending state, and successful dispatch. That deterministic regression passed
+10 consecutive clean runs. The package-wide `fn64-abi` nextest run passed 399
+tests before the generated completeness-document check detected transient
+surface-line drift; the exact document gate then passed after regeneration.
+The rebuilt 100,000-instruction whole-shard-withholding comparison cleared that
+writer escape.
+The AOT lane reached its natural architectural boundary at 100,001 charged
+instructions. The dynamic lane then stopped with exactly one instruction left:
+the old `InstructionBudget` type rejected every one-instruction slice even when
+the next unit was a straight instruction. The core budget now admits one
+straight instruction while preserving branch/delay atomicity and returns a
+typed error for a genuinely indivisible final pair. Generated AOT, semantic,
+and static-micro-op regressions passed 10 consecutive clean runs, and the full
+`fn64-recomp-rs` suite passed 370 tests with one skipped. Operational thread
+publication v2 also removes only the last-slice charge from equality while
+retaining and validating it as diagnostic evidence; cumulative charge and
+continuation state remain bound. The rebuilt real pair then reached exactly
+100,001 in both lanes. Full logical RDRAM plus device, executor, and ABI-host
+digests matched. Boot shards 1 and 2 were not entered within that horizon, so
+neither short run exercised dynamic translation and both correctly failed the
+withheld-entry requirement. Those results remain useful partial evidence for
+RDRAM and owner-state agreement, but are not dynamic-execution parity evidence.
+CPU and continuation publication digests also
+differed despite the matching owner state. `RecompContext` keeps Count at
+dispatch-entry time while the executor owns and charges elapsed time after the
+coroutine publishes its checkpoint, making slice-dependent timing fields one
+suspected observation artifact; the exact differing fields remain to be
+diagnosed.
+
+Whole-shard withholding is now replaced by one operational exact-key redirect.
+Both lanes retain the complete static catalog and identical canonical program
+and resolver-install identities. With
+`FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY=1`, the dynamic lane requires the
+selected `ExecutionKey` to equal the installed entry and redirects it once at
+the unified dispatcher; it does not remove a shard or alter static authority.
+The guard clears only after positive dynamic work, after which normal static
+budgets and executable-mutation reconciliation resume. Telemetry schema
+`fn64.wm2000.dynamic-withheld-telemetry.v2` proves the individual attempt with
+its bank/PC, positive `charged_instructions`, and zero `unsupported_exits`;
+aggregate dynamic charge is not proof of that attempt. The program-identity
+line and comparator additionally bind `resolver_install_sha256`. Publication
+digest v2 removes dispatch-slice partition noise without dropping hardware
+authority: it omits the context's stale Count/Compare and host-driven Cause
+mirrors only because the separately required executor/device/ABI digests own
+those values, and it rejects any pending Count/Compare write.
+
+The attempt-17 v4 pair was seeded from the completed attempt-16 Cargo cache.
+Its AOT build completed in 33 seconds at 755 MiB peak tree RSS, and its dynamic
+build completed in 32 seconds at 751 MiB. The receipt is retained privately at
+`/private/tmp/fn64-wm-exact-entry-pair-20260731-17/receipt.json`.
+
+One real-ROM 100,000-instruction v3 diagnostic then reached 100,001 charged
+instructions in both lanes. The exact withheld key
+`81bf2e27273b27db:80000400` ran dynamically once, charged one instruction, and
+reported zero unsupported exits. Full logical RDRAM, CPU, device, executor,
+ABI-host, continuation, scheduler steps, and simulation time matched. Both
+lanes published the same pending `ExecutableWrite`, five-instruction last
+charge, cumulative charge 100,001, and no prepared continuation. Its private
+evidence is
+`/private/tmp/fn64-wm-exact-entry-diff-20260731-25/comparison.json`,
+`dynamic-telemetry.json`, `aot.log`, and `dynamic.log`. This is one diagnostic,
+not a ten-run parity claim.
+
+Profiling gained `FN64_PROFILE_STOP_AT_PC` self-enablement (it no longer needs a
+second AOT profiling flag), FCSR in watched-PC snapshots, and
+`FN64_PROFILE_EXCEPTIONS=1` for exception type/current-thread ownership. Watched
+PC snapshots also include raw `d0`/`d18`; the faulting `DIV.D` sees both as
+zero, proving the immediate operation is `0.0 / 0.0` rather than an FPU flag
+classification error. The upstream zero-vector provenance remains open.
+`FN64_PHASE_TIMING=1` now prints executor/graphics/audio wall-time totals in
+this harness. Progress-only probes disable the unbounded executor trace unless
+`FN64_BLOCK_EXECUTOR_TRACE=1` is requested; task counts remain available from
+always-on counters, so the progress summary no longer clones that full trace.
+
+The zero-vector provenance is now closed. The only call before the fault came
+from `0x8000d6f0` with a non-degenerate look-at tuple: eye `(0,400,500)`, target
+`(0,150,0)`, and up `(0,1,0)`. Its reciprocal constant was present in RDRAM as
+the double `1.0`, but the created thread had inherited reset-thread
+`Status.FR=1`; the function's FR=0 `MTC1` even/odd construction therefore left
+the double operand in `f18` equal to zero. N64Recomp's generated NWXE
+`osCreateThread` body initializes the saved SR to `0x0000ff03` (FR clear), so
+the typed created-thread context now clears FR while retaining its other
+modeled Status fields. A focused regression passes, and one bounded 60,000-step
+probe reached the old `0x800303e4` site twice with divisor `1.0`, no exception,
+and peak RSS 149 MiB. A 65,000-step continuation then produced 14 graphics
+submits, 56 audio submits, and no render error at peak RSS 211 MiB. Its 49.584 s
+executor time initially reported only 1.865 ms of graphics dispatch because the
+phase counter covered HLE preflight but not the subsequent recognized LLE/raw-DPC
+path. Native sampling, rather than that incomplete counter, located the actual
+renderer cost described below.
+The former fault boundary then passed ten consecutive clean guarded runs. Every
+run stopped deterministically at step 50,568 / simulation time 39,272,554,
+entered `0x800303e4` twice with Status `0x30000000`, divisor `1.0`, unchanged
+FCSR `0x01800804`, and no render error; the ten-run process-tree peak was
+137 MiB. This satisfies the deterministic-fix run-count bar for the FR
+transition. The separate 65,000-step graphics continuation remains a one-run
+frontier observation at this point; the later renderer section records its
+ten-run validation.
+
+### Post-submit renderer profile and bounded optimization (2026-07-27)
+
+An eight-second native sample inside the post-overlay window attributed 5,058
+of 5,904 main-thread samples to the recognized graphics-LLE/raw-DPC path. Of
+those, 3,681 were in the full framebuffer commit and 1,170 in RGBA16 hidden-bit
+writes. The hidden coverage sidecar used a hash table keyed by physical
+halfword even though the domain is exactly the fixed 8 MiB RDRAM allocation.
+It now uses lazily allocated dense packed storage: one `u32` per physical
+halfword, with `u32::MAX` as the untouched sentinel. First use costs a bounded
+16 MiB; lookup and update are direct bit-test/shift indexing, and an untouched
+backend still allocates nothing.
+
+The same 65,000-step workload fell from 49.584 s to 29.000 s after that storage
+change, with identical step count, simulation time, device/task counters, and
+render-error state. The standalone harness now compiles only the handwritten
+`fn64-render-reference` crate at `opt-level=2`; generated AOT shards keep their
+existing low-memory profiles. That targeted build rebuilt the renderer and
+harness in 3.97 s, peaked at 387 MiB, and did not recompile any shard. The final
+workload measured 16.592 s executor time, including 3.607 s across fourteen
+graphics-LLE tasks, with the same observable counters and a 216 MiB guarded
+runtime peak. This is a 66.5% executor-time reduction from the measured
+baseline. `FN64_PHASE_TIMING=1` now reports aggregate graphics phases separately
+from recognized LLE task time, so an HLE preflight followed by LLE is no longer
+mislabelled as two graphics tasks.
+
+Mechanical discovery was rechecked independently after these runtime changes:
+ten consecutive `profile_overlay_regions` runs produced one identical stable
+receipt. Enumeration took 13--14 ms and the complete
+normalize/enumerate/admit/recipe pipeline took 199--225 ms (200 ms median).
+Mechanical ROM discovery is therefore not the remaining long-run bottleneck.
+
+Ten consecutive final guarded 65,000-step runs then reproduced the exact
+overlay milestone at step 19,523 / simulation time 13,990,253 and completed at
+`sim_time=98511883`. Every run reported 14 graphics submits, 56 audio submits,
+the same device/RSP/RDP/controller/save counters, the same two entered recovered
+generations, and `render_error=None`. Peak aggregate RSS was 219 MiB. This meets
+the deterministic run-count bar for the dense-sidecar/runtime-profile candidate;
+it does not establish framebuffer parity against an external runtime.
+
+The faster lane extends cleanly to 100,000 steps / simulation time 598,985,169:
+175 graphics tasks, 351 audio tasks, 177 controller operations, four save
+operations, the same two recovered generations, and no render error. Executor
+time was 69.474 s, of which recognized graphics LLE consumed 43.677 s; guarded
+RSS peaked at 226 MiB. A post-optimization native sample attributed 2,482 of
+3,374 renderer-bound samples to RGBA16 framebuffer commit, primarily the
+canonical checked halfword writer rather than hidden-sidecar hashing. A typed
+bulk-halfword experiment matched individual writes in a focused test and kept
+all 461 renderer tests/snapshots green, but its allocation and second pass
+regressed the identical 100,000-step workload to 77.371 s and graphics to
+51.137 s. It was removed completely. The next performance frontier is reducing
+full-frame commit work without adding a second pass or weakening the canonical
+RDRAM lane mapping; this is not a reason to reopen mechanical ROM discovery.
+
+The allocation-free continuation of that profile is now implemented. RGBA16
+commit packs two adjacent logical pixels into one canonical native-word write
+and updates the dense hidden-bit sidecar as the same pair; it creates no
+temporary buffer and performs no second framebuffer pass. On the identical
+controller-scheduled 100,000-step route, raw-RDP time fell from 11.065 s to
+6.791 s (38.6%) and total executor time from 30.385 s to 26.144 s (14.0%),
+with identical virtual time, device/task counters, render-error state, and
+entered generation list. A ten-second native sample had identified the old
+per-halfword RGBA16 commit as the largest avoidable renderer cost. The split
+phase timer now reports RSP execution and raw-RDP processing separately; on
+this route they consumed 0.148 s and 6.791 s respectively, ruling out the RSP
+interpreter as the next performance target.
+
+The next profile found that the reference backend's atomic `process_task`
+implemented atomicity by repeatedly calling its public resumable one-operation
+path. After the first draw made an image dirty, every following operation
+therefore rewrote the complete active color/depth image even though no guest
+could interleave. Atomic dispatch now executes the same ordered operations in
+one call and commits only at existing semantic barriers (target changes and
+FullSync) plus task completion; the public chunk/token path and its per-op
+commit contract are unchanged. The existing atomic-vs-chunked test proved
+identical final RDRAM, framebuffer pixels, and FullSync evidence, and the full
+renderer suite passed 455 unit plus six replay/snapshot tests.
+
+On the identical 100,000-step scheduled route, raw-RDP time fell from 6.791 s
+to 2.453 s (63.9%) and total executor time from 26.144 s to 22.027 s (15.7%).
+Step/time, all device/task counters, render-error state, and the three entered
+generations were identical. `scripts/wm2000-route-series.zsh` then completed
+10/10 guarded runs with byte-identical extracted evidence; peak process-tree
+RSS was 222--223 MiB. Full logs are retained out of tree at
+`/private/tmp/fn64-wm-route-series.dXIqO2`.
+
+The standalone profile also compiles the handwritten `fn64-abi` crate at
+`opt-level=2`. That package-scoped change reduced the same route from 37.717 s
+to 30.560 s before the packed commit landed, with unchanged guest evidence;
+generated shard codegen remains narrowly scoped as above. Progress-only runs
+now discard both executor and device diagnostic vectors by default while
+constant-space device counters remain active. The full reference-renderer
+suite passed 455 unit plus six replay/snapshot integration tests. Ten
+consecutive final guarded 65,000-step runs reproduced the exact step 19,523
+overlay milestone, completion virtual time, all counters, and two-generation
+list; peak process-tree RSS was 214--217 MiB. The scheduled 100,000-step route
+also reached the mechanically recovered third generation, whose image covers
+`0x8011c900..0x8016e650`. A scheduled 200,000-step route remained pure static
+AOT and clean but did not enter the fourth catalog generation. Runtime entry
+coverage is not a static-closure requirement: the generated pack already
+contains every aligned word of all four mechanically recovered images, and a
+generation is recorded as entered only when one of its runners executes. The
+route result therefore establishes three-generation execution coverage, not a
+missing-code frontier.
+Three bounded vertical-menu probes then moved down one, three, and six rows
+after START before confirming. Each produced distinct timing/controller/task
+counters, proving the scripted inputs reached different live paths, but all
+three remained within the first two recovered generations at 100,000 steps.
+The earlier alternating START/A route remains the only tested path that enters
+the third generation. Simple main-menu vertical coverage therefore does not
+reach the fourth; the next sweep must vary a later-stage choice (for example
+left/right or character selection) rather than extend these same routes.
+
+For that sweep, `FN64_RENDER_DUMP_DIR` enables out-of-tree reference-renderer
+PNG output, `FN64_RENDER_DUMP_FIRST_TASK` skips earlier graphics tasks, and
+`FN64_RENDER_DUMP_LIMIT` bounds the number of non-clear frames written. These
+are opt-in diagnostics only; ordinary progress and release runs perform no
+image I/O. The renderer reports the first omitted frame after that bound and
+then suppresses identical limit notices.
+
+The 200,000-step endpoint was one input edge too early to characterize the
+next screen: it stopped at controller read 469. A guarded 240,000-step run of
+the same alternating schedule crossed A presses at reads 510 and 570, reached
+638 graphics tasks and 591 controller operations, and remained pure static
+AOT in the same three generations. Peak process-tree RSS was 342 MiB with 85%
+system memory free. Bounded frames proved that the late route had entered
+Exhibition / Single Match setup; the changing triangle workload after read
+510 showed a further screen transition, but not the fourth generation.
+
+`scripts/wm2000-route-probe.zsh` is the short feedback-loop entry point. It
+requires the user's `ROM` and a `FN64_BOOT_CONTEXT`, reuses the existing
+harness binary, enables constant-space progress mode, continues after early
+overlays, and always runs under `scripts/memory-guard.zsh`. Its optional third
+argument becomes `FN64_PROFILE_STOP_AT_GENERATION`, which stops immediately
+after the requested recovered generation is first entered. The wrapper clears
+all four opt-in unbounded trace-history variables and defaults its process-tree
+RSS ceiling to 2 GiB; callers can deliberately set a different
+`FN64_GUARD_MAX_RSS_MIB`. The guard escalates from TERM to KILL after a bounded
+two-second grace period for the exact captured process tree. A configured stop
+generation that is absent at the bounded exit is a loud failure rather than a
+successful identical miss. Controller input
+edges now include scheduler step, simulation time, graphics/audio task counts,
+and the entered-generation set, so a schedule can be correlated without a
+second trace. Example (the generation ID is decimal or `0x`-prefixed):
+
+```sh
+ROM=/path/to/wm2000.z64 \
+FN64_BOOT_CONTEXT=/path/to/boot-context.json \
+scripts/wm2000-route-probe.zsh /tmp/route.schedule 240000 3068194456377681093
+```
+
+`scripts/wm2000-route-series.zsh SCHEDULE MAX_STEPS RUNS [STOP_GENERATION]`
+runs that same guarded probe strictly sequentially, retains full stdout/stderr
+logs under a fresh `/private/tmp` directory, and requires byte-identical schedule,
+input-edge, generation, completion, counter, and entered-generation evidence.
+It is the default helper for the ten-run deterministic validation bar; it does
+not compare host wall time or memory-pressure telemetry.
+
+`scripts/wm2000-scenario-gate.zsh SCHEDULE MAX_STEPS [RUNS]
+[REQUIRED_GENERATIONS]` is the authoritative bounded-scenario wrapper. It
+first rejects a feature graph containing the development interpreter, then
+runs the existing dense-AOT binary sequentially under the memory guard. Every
+run must report the linked library's production-AOT feature receipt, the same
+program and controller-schedule identities, at least one consumed standard-
+controller read, input edge, graphics submission, completed RCP task,
+recognized microcode, committed DRAM/XBUS DPC stream, executor timing
+checkpoint, no render error, and every declared overlay generation. It
+rejects typed static-dispatch and unsupported outcomes, then requires
+byte-identical semantic evidence. The policy receipt binds the actual binary,
+ROM, BootContext, schedule content, run count, step bound, required generation
+list, and milestone thresholds by digest or value, without recording private
+paths. Authoritative use requires 10--100 runs; ten is the default. Minimum
+counters can be raised with the `FN64_SCENARIO_MIN_*` variables; audio defaults
+to a recorded-but-zero-allowed checkpoint until a route declares
+`FN64_SCENARIO_MIN_AUDIO=1` or higher. This proves the declared exercised
+scenario only; it does not replace the separate build-owned executable-image
+catalog exhaustiveness receipt required for a 100% static-recompilation claim.
+`scripts/test-wm2000-scenario-gate.zsh` is its ROM-free, sub-second parser
+feedback loop.
+
+The first fresh production proof with this gate used the digest-bound NWXE
+ROM, retained BootContext and controller schedule, and the newly linked
+111 MiB binary. Its exact binary digest is retained with the out-of-tree run
+evidence rather than asserted as a live repository invariant.
+One 100,000-step smoke run entered required generations
+`6767235783115491731`, `3179581202434458265`, and
+`5416062183125883563`; completed 138 standard controller reads, 119 graphics
+submissions, 262 audio submissions, and 500 RCP tasks; recognized 357
+microcodes; and committed 119 XBUS DPC streams with no render error. The
+authoritative wrapper then passed 10/10 runs with byte-identical evidence.
+Logs are retained out of tree at `/private/tmp/fn64-wm-scenario-gate.EQslgV`.
+This closes the declared scenario proof, not the separate exhaustive source-
+catalog frontier.
+
+The hook was validated against already-known generation
+`6767235783115491731`: a nominal 100,000-step probe stopped at its exact first
+entry, step 19,523 / simulation time 13,990,253, in 2.96 s with 91 MiB peak
+RSS. After hardening the wrapper, ten consecutive probes reproduced identical
+extracted evidence and the same 91 MiB peak; logs are retained at
+`/private/tmp/fn64-wm-route-series.ZDwPcz`. A one-step probe requesting the
+unreached fourth generation exited nonzero with its target and bounded process
+exit in the panic, proving a miss cannot be reported as a successful series.
+A follow-up 320,000-step route replaced the post-read-510 START/A
+alternation with spaced A confirmations through read 782. It reached 1,161
+graphics tasks and 800 controller operations, remained pure static in the
+same three generations, and peaked at 955 MiB under a 2 GiB guard. That rules
+out simple repeated confirmation as an observed fourth-generation route. A
+different menu branch is relevant only to runtime reachability coverage, not
+to whether the already linked fourth generation is statically recompiled.
+
+The later-stage branch was then resolved visually rather than guessed. A
+downward mode choice produced `STONE COLD VS STONE COLD`, proving that the CPU
+opponent path was active. On the rules page, A opened the highlighted Time
+Limit chooser and START closed it. The observed navigation graph then gave the
+confirm path without importing an external implementation claim: D-UP moved
+from Decision to the bottom Options control, A opened the global
+settings page, START returned, D-DOWN wrapped back to Decision, and A produced
+the `Single Match / STEVE AUSTIN VS STEVE AUSTIN` presentation. This removes
+the earlier ambiguity between a two-player roster screen and match setup.
+
+It does not enter the fourth catalog generation. A 420,000-step guarded run
+pressed START twice during the versus/entrance presentation, completed 1,707
+graphics submits and 1,162 controller operations with `render_error=None`, and
+remained in the same three recovered generations. The selector gate word at
+`0x8003dd0c` remained `00000000`; peak process-tree RSS was 1,250 MiB under the
+2 GiB route cap. Therefore the catalogued generation
+`3068194456377681093` is not yet proven to be the ordinary single-match bank,
+and no retained route recipe reaches it.
+
+A follow-up run used the existing constant-space AOT-PC profiler on that exact
+420,000-step schedule under a tighter 1 GiB process-tree cap. It watched the
+fourth descriptor's selector continuation (`0x80022484`), selected path
+(`0x80022498`), loader return (`0x800224d4`), and image return (`0x80022510`).
+All four counts were zero. The bounded exit still contained gate word zero and
+the complete descriptor bytes at `0x80047eec..0x80047f10`, including ROM
+`0x000d2720..0x00144aa0`, load address `0x800e1b90`, data end
+`0x80153f10`, and invalidation/BSS end `0x8016f170`. The run peaked at 698 MiB.
+Thus the single-match route never executed this loader-loop path; gate value
+zero at the endpoint was not evidence that it selected or rejected the fourth
+image. Extending the same route cannot answer fourth-generation reachability.
+
+The closure terms are now kept separate. The fourth generation is
+**catalogued** by mechanical ROM discovery and **compiled** into eight linked
+dense-AOT shards. It was not **selected/materialized** by this observed loader
+path and was not **entered/executed** by any retained route. Lack of runtime
+entry does not subtract from the pack's byte/entry ownership, just as executing
+three generations does not prove unreachable code. The remaining 100% claim
+is a static evidence audit: prove that the recovered resident-plus-four-image
+catalog is exhaustive for required CPU code and that the production artifact
+has no interpreter or missing-AOT path. It is not an input-route sweep.
+
+That audit found one production feature leak: the standalone harness selected
+`aot-runtime` without default features, but each generated shard's normal and
+build dependency accepted `fn64-recomp-rs` defaults. Cargo feature unification
+therefore enabled `dev-interpreter` in the final graph even though every linked
+shard had a generated runner. All 34 shard manifests in that measured build selected only
+`aot-runtime`. The final host selects the stronger `production-aot` feature,
+which is compile-time incompatible with `dev-interpreter`; its explicit
+resolver-2 workspace keeps host/build-tool features out of the linked target
+graph. `scripts/check-wm2000-pure-aot.zsh` is the permanent fast gate: it
+resolves normal linked feature edges, requires both `production-aot` and
+`aot-runtime`, and fails if the development interpreter reappears.
+
+The corrected graph rebuilt successfully with `cargo build -j1` under the
+process-tree memory guard. The build receipt reports 16 resident and 18 overlay
+dense-AOT shards; peak aggregate RSS was 3,194 MiB with at least 74% system
+memory free. The resolved feature gate passes, the linked binary contains no
+`fn64-recomp-rs:dev-interpreter:artifact` marker, and the no-default-features
+`production_aot` test proves that admitted code without a generated entry fails
+closed as `MissingAotEntry`. A short guarded smoke then reached generation
+`6767235783115491731` at the unchanged step 19,523 / simulation time
+13,990,253 with 116 MiB peak RSS. This verifies pure-AOT artifact composition
+and the known entry path; it does not prove catalog exhaustiveness.
+
+The honest remaining static-closure frontier is catalog exhaustiveness. The
+pack proves complete aligned-entry ownership for the mechanically recovered
+one-MiB resident image and all four records in the uniquely admitted overlay
+descriptor table. It does not yet prove that no other mechanism can produce or
+load required CPU code outside those five images. Runtime route coverage cannot
+prove that negative, and the generic discovery scoreboard still contains
+unsupported destinations. A 100% recompilation claim therefore remains not
+verified until a build gate binds exhaustive executable-image ownership to the
+pure-AOT feature/entry receipt.
+
+The linked-catalog seam now fails earlier: installation checks every generation
+shard against the live `BlockProgram`, requiring the bank to exist and its one
+contiguous span to equal the catalog range. The WM host also exact-matches each
+flattened overlay artifact's bank and range against the generated generation
+table before registration. This closes catalog/program drift, but it is not an
+exhaustiveness proof. Exception ownership is a concrete remaining gap. The
+current CPU model has an exact six-address denominator: `0x80000000`,
+`0x80000080`, and `0x80000180` with BEV clear, plus `0xbfc00200`, `0xbfc00280`,
+and `0xbfc00380` with BEV set. `0x80000100` is not a modeled exception
+destination. Only the independently captured `0x80000180` general vector is
+admitted. An fn64-only fault route has already requested `0x80000000`; the
+reference traces did not, so its live bytes cannot be promoted from that route.
+The frontier receipt now requires every modeled address to carry either one
+exact image owner, a validated machine-checkable unreachability receipt, or an
+explicit open disposition. The unreachability form fails closed until its
+state-proof validator exists. A bounded CFG data-flow pass can recover exact
+ROM-word stores into fixed vector addresses, but labels them conditional on the
+source word remaining unchanged until its load. These gaps therefore still
+require allowed black-box captures or a mechanical writer/state proof.
+Generated disassembly is not an authority for filling them.
+
+The manifest-only frontier now applies that bounded store pass to the resident
+generation and each of the four recovered overlay generations. It requires an
+exact one-to-one match between every dense generation and its proven physical
+ROM mapping, seeds only proven function entries (plus the hardware entrypoint
+in the resident range), and bank-qualifies every result with the dense bank ID.
+Per-generation scan summaries expose root/block/finding counts. A recovered
+store remains candidate provenance only: it neither proves that its source was
+stable nor that runtime control executed the store, and it does not promote an
+exception vector to an exact code owner.
+
+Each dense generation now also records every aligned word that decodes as a
+direct COP0 Status write (`MTC0` or `DMTC0` to register 12), partitioned by CFG
+classification into proven code, proven data, and unclassified words. Open
+indirect sites remain attached to the same scan. This closes the cheap static
+instruction inventory but does not yet prove `Status.BEV == 0`: the captured
+BootContext, `__osSetSR`/legacy host bridges, and saved thread contexts can all
+replace Status outside that instruction subset. The receipt therefore keeps
+all three `0xbfc0...` destinations open until a ROM-bound runtime-state/effect
+receipt validates those authorities in process.
+
+The source-frontier receipt now carries that initial runtime-state authority.
+If `FN64_BOOT_CONTEXT` is absent it records an explicit missing authority; if
+present, the gate parses the canonical context and checks its normalized-ROM
+digest, header entry, NTSC selection, destination code, and IPL3 digest against
+the normalized discovery image before retaining the exact CP0 Status value.
+Malformed or mismatched contexts fail loudly. This makes the initial BEV bit
+auditable without treating it as proof for later `MTC0`, host, or child-thread
+effects.
+
+Captured external executable generations are no longer outside this Status
+denominator. Each reproducible capture is scanned from its retained
+architectural words with the same raw decoder and bounded CFG machinery, and
+the receipt requires a scan matching its exact image identity, generation,
+range, digest, and first fetch. Any unclassified Status-shaped word remains an
+open frontier rather than being hidden by the capture's external provenance.
+Exception-vector ownership is now entry-specific: only the capture's
+reproducible first fetch may receive `ExactCodeOwner`; other vector addresses
+that merely fall inside the same byte range remain open.
+
+Each proven-code `MTC0 Status` now also carries a one-to-one value proof from
+the existing whole-CFG abstract interpreter. Constants and finite joins can
+prove BEV clear, while known-zero/known-one propagation retains bit invariants
+even when the complete value is unknown. `MFC0 Status` seeds BEV as known zero,
+which closes the resident read/modify/write site at `0x8002a26c`: its mask
+preserves BEV clear without claiming a complete Status value. Loads from
+mutable image memory reset both masks, so their initial ROM bytes cannot become
+runtime facts; subsequent bit operations must establish any retained mask.
+Unknown/widened values and mutable-memory provenance remain explicit blockers,
+while `DMTC0 Status` stays unsupported rather than being truncated to the
+interpreter's 32-bit domain. The current canonical receipt therefore has four,
+not five, open proven-code Status value proofs.
+
+The canonical validator can now mark the three bootstrap vectors unreachable
+through an inductive BEV-clear disposition, but only in process: initial
+BootContext Status must be clear; every dense and external Status scan/value
+proof must close; the exact 15 installed host symbols and effects must match;
+all normal-vector handlers must have scanned owners; and executable writer,
+DMA, and transfer closure must be complete. Forged/incomplete host catalogs,
+open normal handlers, and opaque proof digests are rejected. The present WM
+inputs do not meet that bar, so this mechanism does not yet make the real
+`0xbfc0...` frontier closed.
+
+The WM production boot build, every generated shard build, and the manifest
+gate now obtain their host targets from the same exact 15-binding catalog.
+`__osSiDeviceBusy` is included through its public SI status-register behavior;
+its signature is no longer privately duplicated in the shard emitter or
+omitted from the source receipt. The common C adapter now compares
+Status.BEV before and after every admitted shim and traps before copy-back on a
+transition, so the receipt marks every installed adapter's current-context
+effect as runtime-enforced BEV preservation. `osCreateThread` also records its
+child-Status transition as caller inheritance with FR cleared. That remaining
+inheritance edge turns a previously implicit runtime authority into a
+canonical, typed blocker.
+
+The independently compiled dense shards export full source and emitted-
+runner SHA-256 values. The boot build independently derives each expected
+source identity from normalized-ROM identity, generation/ROM/load geometry,
+and exact bytes, then rejects any linked mismatch before registration. It also
+hashes the actual linked `CodeBank` words and compares the full digest. Runner
+identity composes the installed dispatch source, complete generated pack,
+generated runner, bank, and typed adapter role; captured external-image runners
+use the same rule. The resulting live program must produce a canonical
+`BlockProgram` evidence snapshot before thread-zero boot, so a truncated bank
+ID is no longer mistaken for native artifact proof.
+
+The canonical generation migration makes the resident/overlay ownership
+boundary explicit. The permanently resident IPL prefix is now 15 static shards
+covering `[0x80000400,0x800e1b90)`. The overlapping IPL tail is a two-shard
+precompiled generation with image `[0x800e1b90,0x80100400)`, invalidation union
+`[0x800e1b90,0x80171a60)`, an exact ROM-byte digest, and a domain-separated ID
+binding the normalized ROM plus that geometry. Together with the 18 overlay
+artifacts this makes 35 generated shard packages. Treating the tail as static
+would overlap overlay ownership; dropping it would lose executable resident
+code before the first overlay load.
+
+The WM host now consumes that catalog through `CatalogGenerationInstallV1`:
+an exact 15-target host-function catalog, direct-KSEG physical backing for the
+resident tail and every overlay generation, and no ambient entry, transfer, or
+host callback. A typed IPL3 publication seeds an owned 8 MiB allocation; commit
+binds ROM, resolver, generation definition, entry image, and watched bytes,
+then boot moves the allocation into `HostState` and records the publication as
+mutation-journal sequence zero. The generated-C 0x29000000-byte sparse MMIO
+mirror is not allocated in this typed block lane. A no-ROM guarded Cargo check
+compiled the complete 35-package build-script graph and stopped at the named
+`ROM` input requirement; real pack generation, root compilation, and route
+execution remain unverified until the private ROM, BootContext, and executable-
+image capture group are supplied.
+
+The fast feedback command for this frontier is now
+`scripts/wm2000-static-frontier.zsh`. It composes the production feature gate
+with the ROM-only dense-manifest/source-receipt path under a 2 GiB guard. The
+receipt is canonical and digest-bound, retains exact raw-PI register-site PCs
+rather than an aggregate count, and lists every presently open writer class.
+It deliberately avoids runner emission, shard compilation, linking, and route
+execution; a production rebuild is reserved for changes that survive this
+cheap structural loop.
+
+The source-receipt path now reuses its dense and external CFG closures to scan
+transfers in the same process. Direct guest/host edges and every indirect
+exhaustive/bounded/open state replace the former all-zero placeholder summary;
+the scanner also retains ambiguous/outside-owner, `$ra` return, decoder/trap,
+malformed delay-slot, run-off-end, and reached-data-fence blockers. It checks
+the CFG's direct, tail, unresolved-indirect, and resolved-indirect inventories
+against the actual block terminators, including call continuations and exact
+resolved target sets. This adds no second CFG pass. Current WM evidence remains
+explicitly open because proven fact roots do not enumerate every callable
+entry and return provenance has not been closed; a caller assertion cannot
+promote that bounded scan to exhaustive evidence. The receipt consumes the
+opaque analyzer result and retains the full scan rather than only its summary,
+so another producer cannot manufacture a complete inventory through public
+Rust fields or direct receipt deserialization.
+
+The 30-read neutral gaps are also deliberately conservative: retained edges
+show roughly 30 graphics submissions between adjacent inputs. A safe speed
+experiment preserves the proven prefix through read 510, halves only the late
+suffix to 15-read gaps while retaining two-read pulses, and checks the same UI
+states and generation prefix. No compressed schedule is authoritative until a
+bounded visual run establishes semantic equivalence and the required series
+establishes deterministic replay.

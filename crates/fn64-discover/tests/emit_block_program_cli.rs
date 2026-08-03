@@ -1,5 +1,5 @@
 use fn64_discover::block_pack::{
-    BlockPackV1, PackedBankV1, PackedBlockV1, BLOCK_PACK_SCHEMA_V1, BLOCK_PACK_SCHEMA_V2,
+    BlockPackV1, PackedBankV1, PackedBlockV1, BLOCK_PACK_SCHEMA_V1, BLOCK_PACK_SCHEMA_V3,
 };
 use fn64_discover::cfg::BlockTerminator;
 use sha2::{Digest, Sha256};
@@ -108,7 +108,7 @@ fn cli_rejects_wrong_rom_schema_entry_and_unknown_pack_fields() {
 
     let mut schema: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&fixture.pack).unwrap()).unwrap();
-    schema["schema_version"] = serde_json::json!(BLOCK_PACK_SCHEMA_V2 + 1);
+    schema["schema_version"] = serde_json::json!(BLOCK_PACK_SCHEMA_V3 + 1);
     let schema_path = fixture.output("wrong-schema.json");
     std::fs::write(&schema_path, serde_json::to_vec(&schema).unwrap()).unwrap();
     let schema_output = run_emit(
@@ -301,7 +301,7 @@ fn legacy_discovery_invocation_remains_available_without_a_subcommand() {
     // records what every strategy found.
     assert_eq!(artifact["schema_version"], 2);
     assert_eq!(artifact["rom"]["sha256"].as_str().unwrap().len(), 64);
-    assert_eq!(artifact["selected_strategy"], "boot_bank_only");
+    assert_eq!(artifact["selected_strategy"], "boot_bank_open");
     let outcomes = artifact["strategy_outcomes"].as_array().unwrap();
     assert_eq!(
         outcomes
@@ -309,7 +309,7 @@ fn legacy_discovery_invocation_remains_available_without_a_subcommand() {
             .map(|outcome| outcome["strategy"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec![
-            "boot_bank_only",
+            "boot_bank_open",
             "recovered_vrom",
             "recovered_overlays",
             "untabled_delta_vote",
@@ -370,9 +370,11 @@ fn synthetic_pack() -> (Vec<u8>, BlockPackV1) {
         PackedBlockV1 {
             start_va,
             end_va: start_va + 4,
-            rom_space: fn64_discover::facts::RomAddressSpace::Physical,
-            rom_start,
-            rom_end: rom_start + 4,
+            backing: fn64_discover::facts::BankBackingSpanV1::RomAffine {
+                rom_space: fn64_discover::facts::RomAddressSpace::Physical,
+                rom_start,
+                rom_end: rom_start + 4,
+            },
             bytes_sha256: hex(Sha256::digest(
                 &rom.bytes[rom_start as usize..rom_start as usize + 4],
             )

@@ -28,6 +28,13 @@ CORE_COMMIT="c6cf52d517e63fe4bed01554ddfbd9af5fb48d5a"
 CORE_UPSTREAM_BASE="6dca4c15370ac3e2171ce7b31426695f8f39b460"
 
 OUT_DIR="${1:?usage: build-core.sh <out-of-tree-scratch-dir>}"
+JOBS=${FN64_BUILD_JOBS:-$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu || echo 4)}
+case "$JOBS" in
+  ''|*[!0-9]*|0)
+    echo "error: FN64_BUILD_JOBS must be a positive integer (got '$JOBS')" >&2
+    exit 2
+    ;;
+esac
 mkdir -p "$OUT_DIR"
 SRC="$OUT_DIR/mupen64plus-core"
 
@@ -50,7 +57,6 @@ echo "Pinned core at $CORE_COMMIT (upstream base $CORE_UPSTREAM_BASE)" >&2
 # DEBUGGER=1 is the whole point: it exports DebugSetCallbacks / DebugStep /
 # DebugMemRead32, which the producers here drive. On macOS the second pinned
 # patch defaults DEBUGGER_NO_DISASM=1, so no libbfd/libopcodes is needed.
-JOBS=$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu || echo 4)
 echo "Building DEBUGGER=1 core with -j$JOBS ..." >&2
 make -C "$SRC/projects/unix" all DEBUGGER=1 "-j$JOBS" >"$OUT_DIR/build.log" 2>&1 || {
   echo "error: build failed; see $OUT_DIR/build.log" >&2

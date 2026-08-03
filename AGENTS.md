@@ -40,6 +40,35 @@ fn64 is a clean-room reimplementation. Allowed sources:
   (Unlicense). Same precedent as reading MIT RT64. MAME remains excluded
   (GPL-2.0+ as a whole; its documented Lua/debugger interfaces are fine for
   black-box use). ddisasm is AGPL: cite its paper's concepts, never its code.
+- By project-owner decision 2026-07-28, N64LoaderWV may be executed, reviewed,
+  and maintained in a separate fork despite its repository having no declared
+  license. That exception is for loader/tool engineering, not N64 behavioral
+  authority: its mappings and analysis remain candidate evidence, and its code
+  does not enter fn64's MIT/Apache distribution.
+- By project-owner decision 2026-08-01, **measured observations about a ROM may
+  be read from any decompilation or reverse-engineering project regardless of
+  its declared license**, including projects with none. An observation is a
+  fact about the cartridge that anyone disassembling the same bytes would
+  derive identically: function boundaries and addresses, segment ROM/VRAM
+  maps, overlay geometry, struct offsets, symbol names bound to addresses.
+  These are not the project's expression to license, and they are how the
+  discovery corpus is graded (zeldaret/oot, zeldaret/mm, SM64, Kirby 64,
+  pmret/papermario).
+
+  The distinction is what you extract, not what the repository's LICENSE says:
+
+  - **Allowed** — reading its addresses, layout tables, and splat/linker
+    configuration; citing them as answer keys, gradings, or measurements.
+  - **Not allowed** — copying, adapting, or transcribing its *code* into fn64,
+    or letting its implementation choices become fn64's design. GPL runtime
+    implementations stay excluded outright (see below); the observation
+    allowance never reopens them.
+
+  Record each project used this way in `docs/DISCOVER-PLAN.md` "Research
+  intake" with the date and what was taken. An observation still needs a
+  citation like any other design claim.
+- m2c is excluded from this toolchain: do not install, invoke, vendor, read, or
+  build an adapter for it.
 
 Disallowed: reading GPL runtime implementation code (ultramodern/librecomp
 internals, or any GPL runtime). Not for "inspiration," not to "check one
