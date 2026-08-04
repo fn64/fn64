@@ -735,6 +735,28 @@ Two consequences worth stating:
 It sits in the same subsystem as the undeclared-mutation defect, and neither
 had ever executed before 2026-08-04.
 
+## The MMIO fast path, confirmed end to end
+
+The KSEG1 pre-check (`50975c2`) was measured on short runs; the full route
+confirms it. The undeclared-mutation panic that previously landed at ~48
+minutes now lands at **~19 minutes**, same byte, same
+`events=0 declarations=0` -- the identical failure, reached 2.5x sooner.
+
+Two corrections that came out of that run:
+
+* **The panic is early in boot, not deep in the route.** It aborts before any
+  progress line is printed -- no graphics submissions, no controller
+  operations, no VI interrupts. Wall-clock had made it look like a late-route
+  fault; step-count bisection shows 30,000 steps do NOT reproduce it, so it
+  sits somewhere between 30k and 420k rather than at the end.
+* **Rendering cannot be evaluated until it is fixed.** The run dumped zero
+  frames because the fault precedes the first graphics task. That also
+  explains the windowed lane never presenting a frame: it is not a shell
+  defect, it is this panic.
+
+So the remaining gameplay work is gated on one defect rather than several,
+and the reproduction is now cheap enough to bisect.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
