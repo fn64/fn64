@@ -135,6 +135,36 @@ So there is no renderer or runtime work an agent can pick up. WM2000 renders
 (240 captured frames, scenario gate 10/10). Effort belongs in discovery,
 where blockers are still software-shaped.
 
+## All five AKI titles certify -- re-verified after every change
+
+The primary goal, re-measured against HEAD rather than assumed from earlier
+runs. Every one of these was run after the stride-alias collapse, the
+phase-shift collapse, the load-only mapping product, and the image-header
+arbiter:
+
+| title | result |
+|---|---|
+| WCW/nWo World Tour 2000 (WM2000) | `HEADLINE unsupported=0` |
+| WWF No Mercy | `HEADLINE unsupported=0` |
+| WCW/nWo Revenge | `HEADLINE unsupported=0` |
+| WCW vs. nWo World Tour | `HEADLINE unsupported=0` |
+| Virtual Pro Wrestling 2 | `HEADLINE unsupported=0` |
+
+They certify through the *proven recipe* path, not the load-only fallback --
+AKI's nine-role descriptors supply full section extents, so nothing about
+them was weakened to reach this. The load-only path exists for families that
+have no such extents, and it is gated so it cannot be reached when recipes
+succeed.
+
+## The overlay correlation, re-measured
+
+The 0-pass/5-fail correlation that opened this document has been broken.
+Batman of the Future recovers overlay tables **and** certifies, which no
+overlay-recovering ROM did before. The mechanism was never "overlays are
+poison" -- it was that overlay recovery admitted tables the downstream
+stages could not complete, and the four fixes above closed that gap for one
+family.
+
 ## The strongest signal: recovering overlays correlates with FAILING
 
 Cross-referencing the certification results against
