@@ -190,6 +190,53 @@ use super::*;
     }
 
 
+    /// The renderer tracker must watch the ranges the GUARD checks, not just
+    /// this thread's registered write ranges.
+    ///
+    /// These two sets normally agree -- the canonical fixture mirrors the
+    /// watched ranges into EXECUTABLE_WRITE_RANGES -- which is exactly why the
+    /// divergence went unnoticed. When they differ, a renderer write to
+    /// executable bytes the guard watches but the thread-local set omits was
+    /// snapshotted by nobody and notified by nobody, then surfaced at the next
+    /// commit as an undeclared mutation with events=0 declarations=0. WM2000
+    /// patching a store immediate at 0x8009b0b0 during a graphics task is that
+    /// case.
+    #[test]
+    fn renderer_tracker_watches_guard_ranges_not_just_thread_local_ranges() {
+        // The guard watches [0x40,0x48); the thread-local set deliberately
+        // does NOT cover 0x44.
+        let _state = scoped_test_executable_write_preflight_state(vec![(0x40, 0x42)], Vec::new());
+        let mut state = CanonicalExecutableMutationStateV1::new(&[(0x40, 0x48)]);
+        let mut storage = [0u8; 0x80];
+        state.seal_with(|physical| storage[((physical - 0x40) as usize) ^ 3]);
+
+        let watched = state.watched_ranges();
+
+        assert_eq!(
+            watched,
+            [(0x40, 0x48)],
+            "the guard's watched set is what commit_snapshot compares against"
+        );
+        assert_ne!(
+            watched,
+            EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone()),
+            "this test is only meaningful while the two sets differ"
+        );
+        assert!(
+            watched
+                .iter()
+                .any(|(start, end)| *start <= 0x44 && 0x44 < *end),
+            "0x44 must be inside the guard's watched set"
+        );
+        assert!(
+            !EXECUTABLE_WRITE_RANGES
+                .with(|ranges| ranges.borrow().clone())
+                .iter()
+                .any(|(start, end)| *start <= 0x44 && 0x44 < *end),
+            "0x44 must be outside the thread-local set, or the bug cannot occur"
+        );
+    }
+
     #[test]
     fn same_byte_nested_writers_commit_in_execution_order() {
         let mut image = [0u8; 8];

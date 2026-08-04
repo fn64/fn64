@@ -223,6 +223,18 @@ impl CanonicalExecutableMutationStateV1 {
             .physical_end
     }
 
+    /// The physical ranges this state watches, as plain tuples.
+    ///
+    /// Exposed so the renderer/RSP mutation tracker can snapshot exactly what
+    /// `commit_snapshot` will later compare against. Watching a different set
+    /// there is what let an undeclared executable write slip through.
+    pub(super) fn watched_ranges(&self) -> Vec<(u32, u32)> {
+        self.watched
+            .iter()
+            .map(|range| (range.physical_start, range.physical_end))
+            .collect()
+    }
+
     pub(super) fn read_snapshot(&self, mut read_physical_byte: impl FnMut(u32) -> u8) -> Vec<Vec<u8>> {
         self.watched
             .iter()

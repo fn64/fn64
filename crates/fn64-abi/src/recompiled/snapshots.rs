@@ -1011,7 +1011,28 @@ fn track_catalog_nested_mutation<R>(
         transaction.commit_changed_bytes(rdram, notify);
         return result;
     }
-    let ranges = EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone());
+    // Watch the ranges the GUARD will later check, not just this thread's
+    // registered write ranges.
+    //
+    // The canonical branch above diffs `mutation_state`'s watched set -- the
+    // same set `commit_snapshot` compares against when it decides a byte was
+    // undeclared. This branch used `EXECUTABLE_WRITE_RANGES`, a different set,
+    // so a renderer write landing on executable bytes outside it was never
+    // compared here and never notified. It then surfaced at the next commit as
+    // an undeclared mutation with `events=0 declarations=0`, because nothing
+    // had declared it -- WM2000 patching a store's immediate at 0x8009b0b0
+    // during a graphics task is exactly that case.
+    //
+    // Falling back to the thread-local set keeps behavior unchanged when no
+    // canonical program is installed, which is the only situation it was ever
+    // the right answer for.
+    let ranges = with_host(|host| host.canonical_recompiled_program.clone())
+        .and_then(|live| {
+            live.mutation_state
+                .as_ref()
+                .map(|state| state.borrow().watched_ranges())
+        })
+        .unwrap_or_else(|| EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone()));
     let before = {
         let view = fn64_runtime::RdramView::from_storage(rdram);
         ranges
