@@ -532,11 +532,33 @@ aligned word write covers `0x9b0b0..0x9b0b4` and its last byte is the
 `0x9b0b3` the guard reports. Only that byte differs because only the store's
 low immediate byte changed.
 
-So the search narrows to callers of the word-level raw write that do not
-notify. Note the asymmetry worth fixing regardless of this bug: `write_u8`
-and `write_u32` are peers on the same pointer type, and neither notifies --
-attribution is expected to happen at a higher layer, which is exactly the
-kind of split that lets one path stay silent while its sibling is audited.
+**The probes had been on the wrong type.** `RdramPtr` and `RdramViewMut` are
+distinct types, each with its OWN `write_u8`/`write_u32`/`write_logical_bytes`.
+Both instrumented runs covered only `RdramPtr`, which is why two 40-minute runs
+returned zero hits while still panicking. Reading the code found in a minute
+what the runs could not.
+
+**Prime candidate: `G_DMA_IO` / `gSPDmaWrite`** in
+`crates/fn64-render-reference/src/gbi/stream.rs:78`. It writes RSP memory back
+into DRAM through `RdramViewMut::write_logical_bytes` with **no declaration and
+no notification** -- that file contains zero notify calls. It is a graphics
+task DMAing arbitrary DRAM from inside the renderer crate, which sits outside
+the ABI layer where write attribution lives.
+
+That also retro-explains the frame-dump correlation retracted earlier: it was
+dismissed as a run-speed artifact, and the speed analysis was correct, but both
+observations are downstream of graphics-task execution, so the correlation may
+have been real for the wrong reason.
+
+Contrast with the path that does it correctly: the verified-audio commit
+(`task_dispatch/rsp_phase.rs:632`) writes to a SHADOW copy, merges the changed
+ranges, and runs `preflight_non_executable_host_writes` to reject executable
+overlap before touching live RDRAM. `G_DMA_IO` does none of that.
+
+Structural note worth fixing regardless: `write_u8` and `write_u32` are peers
+on each type and none of them notify -- attribution is expected at a higher
+layer, which is exactly the split that lets a renderer-crate caller write guest
+code with nothing watching.
 
 **A correlation that did not survive testing.** `FN64_RENDER_DUMP_DIR` looked
 implicated: the panic appeared in a run with it set and not in a 74-minute run
