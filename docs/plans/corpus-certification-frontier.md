@@ -840,6 +840,50 @@ That also retires the earlier `EXECUTABLE_WRITE_RANGES`-vs-watched-set
 hypothesis: the observer demonstrably records the event, so the filter is not
 what loses it.
 
+## Blocker A is fixed; the next stop is a different failure
+
+The undeclared-mutation panic is resolved (`1a25cb4`). Two commit paths --
+guest execution and the device-time advance -- call
+`invalidate_pending_physical_writes_with` on the same canonical state, and each
+`std::mem::take`s the shared declaration queue. The first consumes the
+declaration and refreshes `watched[..].expected`; the second arrives empty,
+re-reads RDRAM, and re-detects the byte the first already accepted.
+
+The intermediate attempt is what made the final one correct: skipping the
+empty commit removed that panic and produced a *different* one, `before
+canonical static dispatch`, because the baseline was then never refreshed at
+all. So the baseline must advance; what must not happen is journalling an empty
+batch as a mutation. `adopt_snapshot` does exactly that.
+
+Verified on the full 420k route: **zero occurrences of either mutation-guard
+message**, where every prior run failed at ~19 minutes.
+
+**The route now reaches ~28 minutes and stops elsewhere:**
+
+```
+CpuFault { pc: 0x80022620, kind: MemoryFault { addr: 0xffffffffa6000000 } }
+```
+
+Disassembling that PC shows the standard libultra uncached-alias idiom:
+
+```
+0x80022614:  lw   $t6, 0xc($s0)     ; load a pointer
+0x80022618:  lui  $at, 0xa000       ; KSEG1 base
+0x8002261c:  or   $t7, $t6, $at     ; force uncached
+0x80022620:  lw   $v0, 0($t7)       ; FAULT
+```
+
+So `$t6` held `0x06000000` and the uncached alias is `0xA6000000`. Physical
+`0x06000000` falls in the gap between `PI_DOM2_ADDR1` (ends `0x05ffffff`) and
+`PI_DOM2_ADDR2` (starts `0x08000000`) -- mapped by no PI domain and beyond the
+8 MiB RDRAM allocation.
+
+That is a *loaded pointer* being out of range, not a decode bug: the emulator
+is faulting on an address the guest computed. Whether the pointer is garbage
+(uninitialised memory the guest expected something else to fill) or the load at
+`0x8002261c+0xc` should have returned something else is the next question, and
+it is a different investigation from the mutation guard.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
