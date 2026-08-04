@@ -1,4 +1,5 @@
 use super::*;
+use fn64_recomp_rs::CodeSpan;
 
     #[test]
     fn translated_cpu_unsupported_gap_records_the_typed_release_event() {
@@ -25,7 +26,7 @@ use super::*;
 
     #[test]
     fn function_lane_evidence_requires_identity_and_excludes_callable_pointers() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         set_entry_lookup(evidence_lookup, 0x100);
         let missing = std::panic::catch_unwind(recompiled_program_evidence_snapshot)
             .expect_err("unidentified function lane must fail evidence capture");
@@ -53,7 +54,7 @@ use super::*;
 
     #[test]
     fn function_destination_history_binds_artifact_function_cycle_and_schema() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let identity = ProgramArtifactIdentity::new([0xC3; 32]);
         set_entry_lookup_with_execution_observation(
             evidence_lookup,
@@ -102,7 +103,7 @@ use super::*;
 
     #[test]
     fn block_lane_evidence_sorts_regions_and_excludes_builder_pointers() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         install_evidence_block_lane(8, false, false);
         PENDING_EXECUTABLE_WRITES
             .with(|pending| *pending.borrow_mut() = vec![(0x42, 2), (0x20, 2), (0x21, 3)]);
@@ -149,7 +150,7 @@ use super::*;
 
     #[test]
     fn block_destination_copy_api_reads_the_live_program_history() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         install_evidence_block_lane(8, false, false);
         assert!(copy_block_execution_destinations().is_empty());
         let live = with_host(|host| {
@@ -182,7 +183,7 @@ use super::*;
 
     #[test]
     fn block_lane_evidence_binds_budget_region_generation_and_pending_writes() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         install_evidence_block_lane(8, false, false);
         let baseline = recompiled_program_evidence_snapshot().unwrap();
 
@@ -233,7 +234,7 @@ use super::*;
     #[test]
     #[should_panic(expected = "pending executable write has zero length")]
     fn block_lane_evidence_never_omits_malformed_pending_write() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         install_evidence_block_lane(8, false, false);
         PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().push((0x30, 0)));
         let _ = recompiled_program_evidence_snapshot();
@@ -243,7 +244,7 @@ use super::*;
     #[test]
     #[should_panic(expected = "stable host-provided dispatch artifact identity")]
     fn block_lane_evidence_rejects_unidentified_dispatch_artifact() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         install_evidence_block_lane(8, false, false);
         with_host(|host| {
             host.recompiled_program
@@ -258,7 +259,7 @@ use super::*;
     #[test]
     #[should_panic(expected = "stable host-provided builder artifact identity")]
     fn block_lane_evidence_rejects_unidentified_builder_artifact() {
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         install_evidence_block_lane(8, false, false);
         let live = with_host(|host| host.recompiled_program.clone().unwrap());
         live.executable_regions.borrow_mut()[0].builder_artifact_identity = None;
@@ -386,7 +387,7 @@ use super::*;
     #[test]
     fn live_block_program_owns_thread_dispatch_and_charges_instruction_time() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x100];
         let mut program = BlockProgram::new();
         let mut region = ExecutableRegion::new(LIVE_ENTRY, GuestPc::new(LIVE_NEXT.get() + 4));
@@ -445,7 +446,7 @@ use super::*;
     #[test]
     fn canonical_catalog_boot_owns_dispatch_host_lookup_and_evidence() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x1008];
         let mut program = BlockProgram::new();
         program
@@ -535,7 +536,7 @@ use super::*;
     #[test]
     fn canonical_catalog_scheduler_reaches_a_one_instruction_limit() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x1008];
         let bank = BankId::new(0xca71);
         let entry = GuestPc::new(0x8000_0100);
@@ -594,7 +595,7 @@ use super::*;
     #[test]
     fn canonical_dynamic_boot_observes_external_write_across_suspended_host_without_replay() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         DYNAMIC_BOOT_SOURCE_RUNS.store(0, Ordering::SeqCst);
         DYNAMIC_BOOT_HOST_RUNS.store(0, Ordering::SeqCst);
         DYNAMIC_BOOT_RESUME_RUNS.store(0, Ordering::SeqCst);
@@ -744,7 +745,7 @@ use super::*;
     #[test]
     fn canonical_dynamic_generation_boot_orders_real_pi_dma_during_suspended_host() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         DYNAMIC_BOOT_SOURCE_RUNS.store(0, Ordering::SeqCst);
         DYNAMIC_BOOT_HOST_RUNS.store(0, Ordering::SeqCst);
         DYNAMIC_BOOT_RESUME_RUNS.store(0, Ordering::SeqCst);
@@ -941,7 +942,7 @@ use super::*;
     #[test]
     fn canonical_generation_boot_activates_explicit_physical_backing() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x1008];
         let image = [0x24, 0x02, 0x00, 0x01, 0x03, 0xe0, 0x00, 0x08];
         for (index, byte) in image.iter().copied().enumerate() {

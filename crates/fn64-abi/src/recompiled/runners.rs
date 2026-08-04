@@ -1,6 +1,6 @@
 use super::*;
 
-fn run_block_program(
+pub(super) fn run_block_program(
     live: &LiveBlockProgram,
     mut entry: ExecutionKey,
     ctx: &mut RsContext,
@@ -116,7 +116,7 @@ fn run_block_program(
             });
         }
         if dispatched.instructions > 0 {
-            super::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
+            crate::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
                 instructions: dispatched.instructions,
             });
         }
@@ -334,7 +334,7 @@ fn resolve_catalog_call_with_activation(
 
 #[cfg(feature = "dynamic-mapped-runtime")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnifiedCatalogTargetV1 {
+pub(super) enum UnifiedCatalogTargetV1 {
     Static(ExecutionKey),
     Dynamic {
         source_bank: BankId,
@@ -368,7 +368,7 @@ fn dynamic_fallback_eligible(fault: CpuFault) -> bool {
 }
 
 #[cfg(feature = "dynamic-mapped-runtime")]
-fn resolve_unified_catalog_target(
+pub(super) fn resolve_unified_catalog_target(
     live: &CanonicalLiveBlockProgramV1,
     source_bank: BankId,
     target_pc: GuestPc,
@@ -403,7 +403,7 @@ fn resolve_unified_catalog_target(
 }
 
 #[cfg(feature = "dynamic-mapped-runtime")]
-fn resolve_unified_catalog_entry(
+pub(super) fn resolve_unified_catalog_entry(
     live: &CanonicalLiveBlockProgramV1,
     target_pc: GuestPc,
     mem: &Rdram<'_>,
@@ -476,7 +476,7 @@ fn checked_add_unified_work(
 }
 
 #[cfg(feature = "dynamic-mapped-runtime")]
-fn dispatch_unified_catalog_slice(
+pub(super) fn dispatch_unified_catalog_slice(
     live: &CanonicalLiveBlockProgramV1,
     mut target: UnifiedCatalogTargetV1,
     budget: InstructionBudget,
@@ -753,7 +753,7 @@ fn run_catalog_block_program_dynamic(
         if dispatched.instructions > 0 {
             live.charge_canonical_instructions(dispatched.instructions);
             live.publish_checkpoint(dispatched.instructions, dispatched.exit, None, ctx);
-            super::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
+            crate::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
                 instructions: dispatched.instructions,
             });
         }
@@ -851,7 +851,7 @@ fn run_catalog_block_program_dynamic(
     }
 }
 
-fn run_catalog_block_program(
+pub(super) fn run_catalog_block_program(
     live: &CanonicalLiveBlockProgramV1,
     mut entry: ExecutionKey,
     ctx: &mut RsContext,
@@ -956,7 +956,7 @@ fn run_catalog_block_program(
                 prepared_continuation,
                 ctx,
             );
-            super::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
+            crate::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
                 instructions: dispatched.instructions,
             });
         }
@@ -1086,7 +1086,7 @@ fn run_catalog_block_program(
 /// # Safety
 /// `rdram` carries the same process-lifetime allocation contract as
 /// `osCreateThread_recomp` and `recompiled::boot_thread0`.
-pub(super) unsafe fn run_registered_entry(
+pub(crate) unsafe fn run_registered_entry(
     rdram: *mut u8,
     entry_vram: u32,
     arg: u64,
@@ -1213,7 +1213,7 @@ fn physical_from_c_fpr_image(packed: [u64; 32], fr: bool) -> PhysicalFgrState {
     PhysicalFgrState::from_words(physical)
 }
 
-fn c_from_recompiled(ctx: &RsContext) -> CContext {
+pub(super) fn c_from_recompiled(ctx: &RsContext) -> CContext {
     let r = ctx.gprs();
     let mut c = CContext::zeroed();
     c.r0 = r[0];
@@ -1260,7 +1260,7 @@ fn c_from_recompiled(ctx: &RsContext) -> CContext {
     c
 }
 
-fn copy_c_back(c: &CContext, ctx: &mut RsContext) {
+pub(super) fn copy_c_back(c: &CContext, ctx: &mut RsContext) {
     c.assert_float_mode_matches_status();
     ctx.set_gprs([
         c.r0, c.r1, c.r2, c.r3, c.r4, c.r5, c.r6, c.r7, c.r8, c.r9, c.r10, c.r11, c.r12, c.r13,
@@ -1291,11 +1291,11 @@ fn is_test_c_shim(shim: CShim) -> bool {
 fn is_admitted_fr_stable_c_shim(shim: CShim) -> bool {
     is_generated_adapter_c_shim(shim)
         || [
-            super::__osInitialize_common_recomp as CShim,
-            super::osInitialize_recomp as CShim,
-            super::__osInitialize_msp_recomp as CShim,
-            super::__osInitialize_kmc_recomp as CShim,
-            super::__osInitialize_isv_recomp as CShim,
+            crate::__osInitialize_common_recomp as CShim,
+            crate::osInitialize_recomp as CShim,
+            crate::__osInitialize_msp_recomp as CShim,
+            crate::__osInitialize_kmc_recomp as CShim,
+            crate::__osInitialize_isv_recomp as CShim,
         ]
         .into_iter()
         .any(|allowed| std::ptr::fn_addr_eq(allowed, shim))
@@ -1311,7 +1311,7 @@ fn is_admitted_fr_stable_c_shim(shim: CShim) -> bool {
         }
 }
 
-fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static str, shim: CShim) {
+pub(super) fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static str, shim: CShim) {
     // An exit snapshot cannot observe a shim which changes FR, accesses the
     // other FPR view, then restores FR. Admit only the closed host-shim set
     // whose implementations preserve FR for the entire call.
@@ -1352,7 +1352,7 @@ fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static str, shim: CS
 /// every new thread starts with denormal-result flushing and Invalid exceptions
 /// enabled. Keeping this in the context makes coroutine suspension itself the
 /// FCSR save/restore boundary.
-fn new_osthread_context(initial_status: Option<u32>) -> RsContext {
+pub(super) fn new_osthread_context(initial_status: Option<u32>) -> RsContext {
     let mut ctx = RsContext::new();
     ctx.initialize_invalid_tlb_entries();
     if let Some(status) = initial_status {
@@ -1383,12 +1383,12 @@ pub fn os_initialize_common(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
         ctx,
         mem,
         "__osInitialize_common_recomp",
-        super::__osInitialize_common_recomp,
+        crate::__osInitialize_common_recomp,
     );
 }
 
 pub fn os_initialize(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
-    initialize_typed_fpcsr(ctx, mem, "osInitialize_recomp", super::osInitialize_recomp);
+    initialize_typed_fpcsr(ctx, mem, "osInitialize_recomp", crate::osInitialize_recomp);
 }
 
 pub fn os_initialize_msp(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
@@ -1396,7 +1396,7 @@ pub fn os_initialize_msp(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
         ctx,
         mem,
         "__osInitialize_msp_recomp",
-        super::__osInitialize_msp_recomp,
+        crate::__osInitialize_msp_recomp,
     );
 }
 
@@ -1405,7 +1405,7 @@ pub fn os_initialize_kmc(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
         ctx,
         mem,
         "__osInitialize_kmc_recomp",
-        super::__osInitialize_kmc_recomp,
+        crate::__osInitialize_kmc_recomp,
     );
 }
 
@@ -1414,7 +1414,7 @@ pub fn os_initialize_isv(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
         ctx,
         mem,
         "__osInitialize_isv_recomp",
-        super::__osInitialize_isv_recomp,
+        crate::__osInitialize_isv_recomp,
     );
 }
 
@@ -1435,13 +1435,13 @@ pub fn os_set_fpc_csr(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
 macro_rules! c_adapters {
     ($(($recompiled:ident, $shim:ident)),+ $(,)?) => {
         fn is_generated_adapter_c_shim(shim: CShim) -> bool {
-            std::ptr::fn_addr_eq(shim, super::osCreateThread_recomp as CShim)
-                $(|| std::ptr::fn_addr_eq(shim, super::$shim as CShim))+
+            std::ptr::fn_addr_eq(shim, crate::osCreateThread_recomp as CShim)
+                $(|| std::ptr::fn_addr_eq(shim, crate::$shim as CShim))+
         }
 
         $(
             pub fn $recompiled(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
-                call_c(ctx, mem, stringify!($shim), super::$shim);
+                call_c(ctx, mem, stringify!($shim), crate::$shim);
             }
         )+
     };
@@ -1453,7 +1453,7 @@ thread_local! {
     };
 }
 
-pub(super) fn take_pending_osthread_status() -> Option<u32> {
+pub(crate) fn take_pending_osthread_status() -> Option<u32> {
     PENDING_OSTHREAD_STATUS.with(std::cell::Cell::take)
 }
 
@@ -1468,7 +1468,7 @@ pub fn os_create_thread(ctx: &mut RsContext, mem: &mut Rdram<'_>) {
         ctx,
         mem,
         "osCreateThread_recomp",
-        super::osCreateThread_recomp,
+        crate::osCreateThread_recomp,
     );
     assert!(
         take_pending_osthread_status().is_none(),
@@ -1603,7 +1603,7 @@ c_adapters!(
     (os_dp_get_status, osDpGetStatus_recomp),
 );
 
-fn abi_host_shim_callable(shim: AbiHostShimV1) -> RecompFunc {
+pub(super) fn abi_host_shim_callable(shim: AbiHostShimV1) -> RecompFunc {
     match shim {
         AbiHostShimV1::OsCreateMesgQueue => os_create_mesg_queue,
         AbiHostShimV1::OsCreateThread => os_create_thread,
@@ -1623,7 +1623,7 @@ fn abi_host_shim_callable(shim: AbiHostShimV1) -> RecompFunc {
     }
 }
 
-fn abi_host_shim_writer_effects(shim: AbiHostShimV1) -> Vec<WriterChannel> {
+pub(super) fn abi_host_shim_writer_effects(shim: AbiHostShimV1) -> Vec<WriterChannel> {
     // These are conservative synchronous/nested effects of invoking the shim,
     // not claims about all later guest execution. Every adapter may mutate
     // guest memory through its HostAbi parent transaction. Queue send/receive
@@ -1701,5 +1701,3 @@ pub fn os_get_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
     ctx.set_r(2, ctx.os_interrupt_mask() as u64);
 }
 
-#[cfg(test)]
-mod tests;

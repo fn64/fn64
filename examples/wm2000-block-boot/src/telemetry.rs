@@ -1,6 +1,6 @@
 use crate::*;
 
-fn write_pc_trace(
+pub(crate) fn write_pc_trace(
     destinations: &[fn64_recomp_rs::ExecutionDestinationObservation],
     instruction_budget: u32,
 ) {
@@ -43,7 +43,7 @@ fn write_pc_trace(
     output.flush().expect("flushing FN64_BLOCK_PC_TRACE output");
 }
 
-fn write_host_boundary_trace(boundaries: &[fn64_abi::recompiled::BlockHostBoundaryObservation]) {
+pub(crate) fn write_host_boundary_trace(boundaries: &[fn64_abi::recompiled::BlockHostBoundaryObservation]) {
     let Some(path) = std::env::var_os("FN64_BLOCK_HOST_TRACE") else {
         return;
     };
@@ -88,14 +88,14 @@ fn write_host_boundary_trace(boundaries: &[fn64_abi::recompiled::BlockHostBounda
 }
 
 #[cfg(feature = "dynamic-withheld")]
-struct DynamicTelemetryOutput {
+pub(crate) struct DynamicTelemetryOutput {
     final_path: std::path::PathBuf,
     partial_path: std::path::PathBuf,
     file: std::fs::File,
 }
 
 #[cfg(feature = "dynamic-withheld")]
-fn prepare_dynamic_telemetry_output() -> DynamicTelemetryOutput {
+pub(crate) fn prepare_dynamic_telemetry_output() -> DynamicTelemetryOutput {
     let requested_final_path = std::path::PathBuf::from(
         std::env::var_os("FN64_DYNAMIC_TELEMETRY")
             .expect("dynamic withheld execution requires FN64_DYNAMIC_TELEMETRY output path"),
@@ -153,7 +153,7 @@ fn prepare_dynamic_telemetry_output() -> DynamicTelemetryOutput {
 }
 
 #[cfg(feature = "dynamic-withheld")]
-fn build_dynamic_withheld_telemetry(
+pub(crate) fn build_dynamic_withheld_telemetry(
     withheld_static_key: ExecutionKey,
     minimum_guest_instructions: u64,
     expected_guest_instructions: Option<u64>,
@@ -282,7 +282,7 @@ fn build_dynamic_withheld_telemetry(
 }
 
 #[cfg(feature = "dynamic-withheld")]
-fn commit_dynamic_withheld_telemetry(
+pub(crate) fn commit_dynamic_withheld_telemetry(
     output: DynamicTelemetryOutput,
     mut report: serde_json::Value,
     process_exit: &fn64_runtime::ProcessExitSummary,
@@ -322,7 +322,7 @@ fn commit_dynamic_withheld_telemetry(
     });
 }
 
-fn print_runtime_progress() {
+pub(crate) fn print_runtime_progress() {
     let trace_len = fn64_abi::trace_len();
     let (graphics_submits, audio_submits) = fn64_abi::task_counts();
 
@@ -396,7 +396,7 @@ fn print_runtime_progress() {
     }
 }
 
-fn print_profiled_rdram_ranges() {
+pub(crate) fn print_profiled_rdram_ranges() {
     let Ok(specification) = std::env::var("FN64_PROFILE_RDRAM_RANGES") else {
         return;
     };

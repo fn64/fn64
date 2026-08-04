@@ -7,8 +7,6 @@
 //! publication in runtime-owned RDRAM, then drives the executor until the guest
 //! either idles, reaches an unobserved PC, or reaches a runtime-behavior fault.
 
-use fn64_recomp_rs::{
-
 mod dense_aot;
 mod diagnostics;
 mod runner_reports;
@@ -18,6 +16,7 @@ use diagnostics::*;
 use runner_reports::*;
 use telemetry::*;
 
+use fn64_recomp_rs::{
     BackedExecutableSpanV1, BackedPrecompiledGenerationCatalogV1, BankId, BlockRun, BootContext,
     CargoGeneratedProgramSourceAttestationV2, CargoGeneratedRunnerSourceBindingV1,
     CatalogBlockProgramV1, CodeBank, ExecutableRegion, ExecutionKey, GeneratedAdapterRole,

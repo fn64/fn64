@@ -1,7 +1,7 @@
 use super::*;
 
 impl CanonicalExecutableMutationStateV1 {
-    fn new(ranges: &[(u32, u32)]) -> Self {
+    pub(super) fn new(ranges: &[(u32, u32)]) -> Self {
         assert!(
             !ranges.is_empty(),
             "canonical mutation state requires executable backing"
@@ -38,7 +38,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    fn assert_not_poisoned(&self) {
+    pub(super) fn assert_not_poisoned(&self) {
         if let Some(reason) = &self.poison {
             recompiled_gap_panic(format!(
                 "canonical executable mutation owner is poisoned: {reason}"
@@ -46,13 +46,13 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    fn poison(&mut self, reason: String) {
+    pub(super) fn poison(&mut self, reason: String) {
         if self.poison.is_none() {
             self.poison = Some(reason);
         }
     }
 
-    fn begin_child_transaction(&mut self) -> u64 {
+    pub(super) fn begin_child_transaction(&mut self) -> u64 {
         self.assert_not_poisoned();
         assert!(
             self.active_child_transaction.is_none(),
@@ -67,7 +67,7 @@ impl CanonicalExecutableMutationStateV1 {
         id
     }
 
-    fn assert_active_child_transaction(&self, id: u64) {
+    pub(super) fn assert_active_child_transaction(&self, id: u64) {
         self.assert_not_poisoned();
         assert_eq!(
             self.active_child_transaction,
@@ -76,12 +76,12 @@ impl CanonicalExecutableMutationStateV1 {
         );
     }
 
-    fn finish_child_transaction(&mut self, id: u64) {
+    pub(super) fn finish_child_transaction(&mut self, id: u64) {
         self.assert_active_child_transaction(id);
         self.active_child_transaction = None;
     }
 
-    fn begin_host_transaction(
+    pub(super) fn begin_host_transaction(
         &mut self,
         thread: ThreadId,
         target: GuestPc,
@@ -112,7 +112,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    fn active_host_transaction(&self, thread: ThreadId) -> Option<HostMutationTransactionTokenV1> {
+    pub(super) fn active_host_transaction(&self, thread: ThreadId) -> Option<HostMutationTransactionTokenV1> {
         self.host_transactions
             .get(&thread)
             .and_then(|stack| stack.last())
@@ -140,7 +140,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    fn finish_host_transaction(&mut self, token: HostMutationTransactionTokenV1) {
+    pub(super) fn finish_host_transaction(&mut self, token: HostMutationTransactionTokenV1) {
         self.assert_active_host_transaction(token);
         let stack = self
             .host_transactions
@@ -159,7 +159,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    fn record_host_abi_boundary(
+    pub(super) fn record_host_abi_boundary(
         &mut self,
         token: HostMutationTransactionTokenV1,
         first_new_entry: usize,
@@ -187,7 +187,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    fn from_bootstrap(evidence: &BootstrapOrImportValidationEvidenceV1, storage: &[u8]) -> Self {
+    pub(super) fn from_bootstrap(evidence: &BootstrapOrImportValidationEvidenceV1, storage: &[u8]) -> Self {
         let ranges = evidence
             .watched_ranges
             .iter()
@@ -216,14 +216,14 @@ impl CanonicalExecutableMutationStateV1 {
         state
     }
 
-    fn required_physical_end(&self) -> u32 {
+    pub(super) fn required_physical_end(&self) -> u32 {
         self.watched
             .last()
             .expect("canonical mutation state has no watched ranges")
             .physical_end
     }
 
-    fn read_snapshot(&self, mut read_physical_byte: impl FnMut(u32) -> u8) -> Vec<Vec<u8>> {
+    pub(super) fn read_snapshot(&self, mut read_physical_byte: impl FnMut(u32) -> u8) -> Vec<Vec<u8>> {
         self.watched
             .iter()
             .map(|range| {
@@ -234,7 +234,7 @@ impl CanonicalExecutableMutationStateV1 {
             .collect()
     }
 
-    fn digest_snapshot(&self, snapshot: &[Vec<u8>]) -> [u8; 32] {
+    pub(super) fn digest_snapshot(&self, snapshot: &[Vec<u8>]) -> [u8; 32] {
         let mut digest = sha2::Sha256::new();
         for (range, bytes) in self.watched.iter().zip(snapshot) {
             digest.update(range.physical_start.to_be_bytes());
@@ -244,7 +244,7 @@ impl CanonicalExecutableMutationStateV1 {
         digest.finalize().into()
     }
 
-    fn seal_with(&mut self, read_physical_byte: impl FnMut(u32) -> u8) {
+    pub(super) fn seal_with(&mut self, read_physical_byte: impl FnMut(u32) -> u8) {
         if self.sealed {
             return;
         }
@@ -266,7 +266,7 @@ impl CanonicalExecutableMutationStateV1 {
         self.sealed = true;
     }
 
-    fn current_changed_ranges(&self, snapshot: &[Vec<u8>]) -> Vec<(u32, u32)> {
+    pub(super) fn current_changed_ranges(&self, snapshot: &[Vec<u8>]) -> Vec<(u32, u32)> {
         let mut changed = Vec::new();
         for (range, current) in self.watched.iter().zip(snapshot) {
             assert_eq!(range.expected.len(), current.len());
@@ -290,7 +290,7 @@ impl CanonicalExecutableMutationStateV1 {
         changed
     }
 
-    fn clipped_declarations(
+    pub(super) fn clipped_declarations(
         &self,
         events: &[GuestWriteEvent],
     ) -> Vec<AttributedExecutableWriteEvidenceV1> {
@@ -358,7 +358,7 @@ impl CanonicalExecutableMutationStateV1 {
         None
     }
 
-    fn reconcile_snapshot_before_dispatch(&mut self, snapshot: Vec<Vec<u8>>) {
+    pub(super) fn reconcile_snapshot_before_dispatch(&mut self, snapshot: Vec<Vec<u8>>) {
         self.assert_not_poisoned();
         assert!(
             self.sealed,
@@ -378,7 +378,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
-    fn commit_snapshot(
+    pub(super) fn commit_snapshot(
         &mut self,
         snapshot: Vec<Vec<u8>>,
         events: Vec<GuestWriteEvent>,
@@ -440,7 +440,7 @@ impl CanonicalExecutableMutationStateV1 {
         self.journal_root_sha256 = journal_root_sha256;
     }
 
-    fn evidence_snapshot(&self) -> CanonicalExecutableMutationJournalEvidenceV1 {
+    pub(super) fn evidence_snapshot(&self) -> CanonicalExecutableMutationJournalEvidenceV1 {
         let open_host_transactions = self
             .host_transactions
             .values()
@@ -468,7 +468,7 @@ impl CanonicalExecutableMutationStateV1 {
 }
 
 impl CanonicalLiveBlockProgramV1 {
-    fn charge_canonical_instructions(&self, instructions: u32) {
+    pub(super) fn charge_canonical_instructions(&self, instructions: u32) {
         assert!(
             instructions > 0,
             "canonical instruction charge must be nonzero"
@@ -487,7 +487,7 @@ impl CanonicalLiveBlockProgramV1 {
         self.canonical_charged_instructions.set(charged);
     }
 
-    fn next_dispatch_budget(&self) -> InstructionBudget {
+    pub(super) fn next_dispatch_budget(&self) -> InstructionBudget {
         let configured = self.install.budget();
         let Some(limit) = self.canonical_instruction_limit.get() else {
             return configured;
@@ -508,14 +508,14 @@ impl CanonicalLiveBlockProgramV1 {
             .expect("canonical exact checkpoint budget was checked against the minimum")
     }
 
-    fn publish_checkpoint(
+    pub(super) fn publish_checkpoint(
         &self,
         instructions: u32,
         exit: BlockExit,
         prepared_continuation: Option<CanonicalPreparedContinuationV1>,
         ctx: &RsContext,
     ) {
-        let thread = super::current_thread_id("canonical checkpoint publication");
+        let thread = crate::current_thread_id("canonical checkpoint publication");
         self.thread_publications.borrow_mut().insert(
             thread,
             CanonicalThreadPublicationV1::Exact(CanonicalThreadCheckpointEvidenceV1 {
@@ -531,8 +531,8 @@ impl CanonicalLiveBlockProgramV1 {
         );
     }
 
-    fn publish_opaque_host(&self, target: GuestPc, resume: ExecutionKey) {
-        let thread = super::current_thread_id("canonical host publication");
+    pub(super) fn publish_opaque_host(&self, target: GuestPc, resume: ExecutionKey) {
+        let thread = crate::current_thread_id("canonical host publication");
         self.thread_publications.borrow_mut().insert(
             thread,
             CanonicalThreadPublicationV1::OpaqueHostInFlight {
@@ -543,8 +543,8 @@ impl CanonicalLiveBlockProgramV1 {
         );
     }
 
-    fn publish_parked_fault(&self, fault: CpuFault, ctx: &RsContext) {
-        let thread = super::current_thread_id("canonical parked-fault publication");
+    pub(super) fn publish_parked_fault(&self, fault: CpuFault, ctx: &RsContext) {
+        let thread = crate::current_thread_id("canonical parked-fault publication");
         self.thread_publications.borrow_mut().insert(
             thread,
             CanonicalThreadPublicationV1::ParkedFaultOpaque {
@@ -558,8 +558,8 @@ impl CanonicalLiveBlockProgramV1 {
         );
     }
 
-    fn publish_returned(&self, ctx: &RsContext) {
-        let thread = super::current_thread_id("canonical return publication");
+    pub(super) fn publish_returned(&self, ctx: &RsContext) {
+        let thread = crate::current_thread_id("canonical return publication");
         self.thread_publications.borrow_mut().insert(
             thread,
             CanonicalThreadPublicationV1::Returned {
@@ -570,7 +570,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[cfg(feature = "dynamic-mapped-runtime")]
-    fn enable_dynamic_mapped_execution(&self) {
+    pub(super) fn enable_dynamic_mapped_execution(&self) {
         let mut dynamic = self.dynamic_units.borrow_mut();
         assert!(
             dynamic.is_none(),
@@ -580,7 +580,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[cfg(feature = "dynamic-mapped-runtime")]
-    fn enable_dynamic_mapped_execution_with_exact_static_key_withheld(
+    pub(super) fn enable_dynamic_mapped_execution_with_exact_static_key_withheld(
         &self,
         selected: ExecutionKey,
     ) {
@@ -603,7 +603,7 @@ impl CanonicalLiveBlockProgramV1 {
         self.dynamic_withheld_static_key.set(Some(selected));
     }
 
-    fn dynamic_execution_installed(&self) -> bool {
+    pub(super) fn dynamic_execution_installed(&self) -> bool {
         #[cfg(feature = "dynamic-mapped-runtime")]
         {
             self.dynamic_units.borrow().is_some()
@@ -615,7 +615,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[cfg(feature = "dynamic-mapped-runtime")]
-    fn record_dynamic_execution(
+    pub(super) fn record_dynamic_execution(
         &self,
         attempted_entry: ExecutionKey,
         run: &fn64_recomp_rs::DynamicMappedRunV1,
@@ -760,7 +760,7 @@ impl CanonicalLiveBlockProgramV1 {
         aggregate.last_exit = run.run.exit;
     }
 
-    fn mint_bootstrap_writer_completion(
+    pub(super) fn mint_bootstrap_writer_completion(
         &self,
         storage: &[u8],
     ) -> Result<(), BootstrapWriterChannelCompletionErrorV1> {
@@ -791,7 +791,7 @@ impl CanonicalLiveBlockProgramV1 {
         Ok(())
     }
 
-    fn begin_cpu_writer_runtime_trace_epoch(
+    pub(super) fn begin_cpu_writer_runtime_trace_epoch(
         &self,
     ) -> Result<Option<CpuWriterRuntimeTraceEpochV1>, CpuWriterRuntimeStateErrorV1> {
         if self.cpu_writer_runtime_state_taken.get() {
@@ -831,7 +831,7 @@ impl CanonicalLiveBlockProgramV1 {
         }))
     }
 
-    fn take_cpu_writer_runtime_state(
+    pub(super) fn take_cpu_writer_runtime_state(
         &self,
         epoch: &CpuWriterRuntimeTraceEpochV1,
         storage: &[u8],
@@ -886,7 +886,7 @@ impl CanonicalLiveBlockProgramV1 {
         Ok(Some(receipt))
     }
 
-    fn begin_host_abi_writer_runtime_trace_epoch(
+    pub(super) fn begin_host_abi_writer_runtime_trace_epoch(
         &self,
     ) -> Result<Option<HostAbiWriterRuntimeTraceEpochV1>, HostAbiWriterRuntimeStateErrorV1> {
         if self.host_abi_writer_runtime_state_taken.get() {
@@ -923,7 +923,7 @@ impl CanonicalLiveBlockProgramV1 {
         }))
     }
 
-    fn take_host_abi_writer_runtime_state(
+    pub(super) fn take_host_abi_writer_runtime_state(
         &self,
         epoch: &HostAbiWriterRuntimeTraceEpochV1,
         storage: &[u8],
@@ -966,7 +966,7 @@ impl CanonicalLiveBlockProgramV1 {
         Ok(Some(receipt))
     }
 
-    fn begin_rsp_writer_runtime_trace_epoch(
+    pub(super) fn begin_rsp_writer_runtime_trace_epoch(
         &self,
     ) -> Result<Option<RspWriterRuntimeTraceEpochV1>, RspWriterRuntimeStateErrorV1> {
         if self.rsp_writer_runtime_state_taken.get() {
@@ -1002,7 +1002,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn take_rsp_writer_runtime_state(
+    pub(super) fn take_rsp_writer_runtime_state(
         &self,
         epoch: &RspWriterRuntimeTraceEpochV1,
         storage: &[u8],
@@ -1056,7 +1056,7 @@ impl CanonicalLiveBlockProgramV1 {
         Ok(Some(receipt))
     }
 
-    fn begin_rdp_renderer_writer_runtime_trace_epoch(
+    pub(super) fn begin_rdp_renderer_writer_runtime_trace_epoch(
         &self,
     ) -> Result<Option<RdpRendererWriterRuntimeTraceEpochV1>, RdpRendererWriterRuntimeStateErrorV1>
     {
@@ -1109,7 +1109,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn take_rdp_renderer_writer_runtime_state(
+    pub(super) fn take_rdp_renderer_writer_runtime_state(
         &self,
         epoch: &RdpRendererWriterRuntimeTraceEpochV1,
         storage: &[u8],
@@ -1171,7 +1171,7 @@ impl CanonicalLiveBlockProgramV1 {
         Ok(Some(receipt))
     }
 
-    fn begin_pi_writer_runtime_trace_epoch(
+    pub(super) fn begin_pi_writer_runtime_trace_epoch(
         &self,
         pending_device_pi: bool,
         pending_abi_pi: bool,
@@ -1218,7 +1218,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn take_pi_writer_runtime_state(
+    pub(super) fn take_pi_writer_runtime_state(
         &self,
         epoch: &PiWriterRuntimeTraceEpochV1,
         storage: &[u8],
@@ -1268,7 +1268,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn take_si_writer_runtime_state(
+    pub(super) fn take_si_writer_runtime_state(
         &self,
         storage: &[u8],
         validated_owned_bootstrap: bool,
@@ -1312,7 +1312,7 @@ impl CanonicalLiveBlockProgramV1 {
         Ok(Some(receipt))
     }
 
-    fn begin_sp_writer_runtime_trace_epoch(
+    pub(super) fn begin_sp_writer_runtime_trace_epoch(
         &self,
     ) -> Result<Option<SpWriterRuntimeTraceEpochV1>, SpWriterRuntimeStateErrorV1> {
         if self.sp_writer_runtime_state_taken.get() {
@@ -1363,7 +1363,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn take_sp_writer_runtime_state(
+    pub(super) fn take_sp_writer_runtime_state(
         &self,
         epoch: &SpWriterRuntimeTraceEpochV1,
         storage: &[u8],
@@ -1414,7 +1414,7 @@ impl CanonicalLiveBlockProgramV1 {
         Ok(Some(receipt))
     }
 
-    fn resolve_entry(&self, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+    pub(super) fn resolve_entry(&self, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
         if let Some(generations) = &self.generations {
             return self
                 .install
@@ -1423,7 +1423,7 @@ impl CanonicalLiveBlockProgramV1 {
         self.install.resolve_entry(target_pc)
     }
 
-    fn resolve_transfer(
+    pub(super) fn resolve_transfer(
         &self,
         source_bank: BankId,
         target_pc: GuestPc,
@@ -1438,7 +1438,7 @@ impl CanonicalLiveBlockProgramV1 {
         self.install.resolve_transfer(source_bank, target_pc)
     }
 
-    fn resolve_call(
+    pub(super) fn resolve_call(
         &self,
         source_bank: BankId,
         target_pc: GuestPc,
@@ -1451,7 +1451,7 @@ impl CanonicalLiveBlockProgramV1 {
         }
     }
 
-    fn dispatch_exposing_exceptions_at_budget(
+    pub(super) fn dispatch_exposing_exceptions_at_budget(
         &self,
         entry: ExecutionKey,
         budget: InstructionBudget,
@@ -1474,7 +1474,7 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     #[cfg(feature = "dynamic-mapped-runtime")]
-    fn reserves_bank(&self, bank: BankId) -> bool {
+    pub(super) fn reserves_bank(&self, bank: BankId) -> bool {
         if let Some(generations) = &self.generations {
             return self
                 .install
@@ -1483,7 +1483,7 @@ impl CanonicalLiveBlockProgramV1 {
         self.install.reserves_bank(bank)
     }
 
-    fn activate_for_fetch(
+    pub(super) fn activate_for_fetch(
         &self,
         target_pc: GuestPc,
         mem: &Rdram<'_>,
@@ -1496,13 +1496,13 @@ impl CanonicalLiveBlockProgramV1 {
             .map(|resolution| resolution.entry)
     }
 
-    fn reconcile_before_dispatch(&self, mem: &Rdram<'_>) {
+    pub(super) fn reconcile_before_dispatch(&self, mem: &Rdram<'_>) {
         self.reconcile_before_dispatch_with(|physical| {
             mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
         });
     }
 
-    fn reconcile_before_dispatch_with(&self, mut read_physical_byte: impl FnMut(u32) -> u8) {
+    pub(super) fn reconcile_before_dispatch_with(&self, mut read_physical_byte: impl FnMut(u32) -> u8) {
         let Some(state) = &self.mutation_state else {
             return;
         };
@@ -1513,7 +1513,7 @@ impl CanonicalLiveBlockProgramV1 {
             .reconcile_snapshot_before_dispatch(snapshot);
     }
 
-    fn begin_host_abi_transaction(
+    pub(super) fn begin_host_abi_transaction(
         &self,
         target: GuestPc,
         resume: ExecutionKey,
@@ -1522,7 +1522,7 @@ impl CanonicalLiveBlockProgramV1 {
         let Some(state) = &self.mutation_state else {
             return None;
         };
-        let thread = super::current_thread_id("catalog host mutation transaction");
+        let thread = crate::current_thread_id("catalog host mutation transaction");
         if let Some(outer) = state.borrow().active_host_transaction(thread) {
             self.flush_host_abi_transaction(outer, mem);
         }
@@ -1573,7 +1573,7 @@ impl CanonicalLiveBlockProgramV1 {
         });
     }
 
-    fn finish_host_abi_transaction(
+    pub(super) fn finish_host_abi_transaction(
         &self,
         token: Option<HostMutationTransactionTokenV1>,
         mem: &Rdram<'_>,
@@ -1589,7 +1589,7 @@ impl CanonicalLiveBlockProgramV1 {
             .finish_host_transaction(token);
     }
 
-    fn flush_active_host_abi_transaction_with(
+    pub(super) fn flush_active_host_abi_transaction_with(
         &self,
         thread: ThreadId,
         read_physical_byte: impl FnMut(u32) -> u8,
@@ -1603,13 +1603,13 @@ impl CanonicalLiveBlockProgramV1 {
         }
     }
 
-    fn invalidate_pending_physical_writes(&self, mem: &Rdram<'_>) -> Vec<GenerationId> {
+    pub(super) fn invalidate_pending_physical_writes(&self, mem: &Rdram<'_>) -> Vec<GenerationId> {
         self.invalidate_pending_physical_writes_with(|physical| {
             mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
         })
     }
 
-    fn invalidate_pending_physical_writes_with(
+    pub(super) fn invalidate_pending_physical_writes_with(
         &self,
         mut read_physical_byte: impl FnMut(u32) -> u8,
     ) -> Vec<GenerationId> {
@@ -1655,13 +1655,13 @@ impl CanonicalLiveBlockProgramV1 {
         invalidated
     }
 
-    fn mutation_evidence_snapshot(&self) -> Option<CanonicalExecutableMutationJournalEvidenceV1> {
+    pub(super) fn mutation_evidence_snapshot(&self) -> Option<CanonicalExecutableMutationJournalEvidenceV1> {
         self.mutation_state
             .as_ref()
             .map(|state| state.borrow().evidence_snapshot())
     }
 
-    fn generation_evidence_snapshot(&self) -> Option<BackedGenerationCatalogEvidenceV1> {
+    pub(super) fn generation_evidence_snapshot(&self) -> Option<BackedGenerationCatalogEvidenceV1> {
         self.generations
             .as_ref()
             .map(|generations| generations.borrow().evidence_snapshot())

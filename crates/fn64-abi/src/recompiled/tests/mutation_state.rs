@@ -27,7 +27,7 @@ use super::*;
     fn canonical_instruction_limit_clamps_the_final_dispatch_slice_exactly() {
         let _reset = PublicSiRuntimeStateTestReset;
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
 
         let bank = BankId::new(0xc11a);
         let entry = GuestPc::new(0x8000_7000);
@@ -246,7 +246,7 @@ use super::*;
     #[test]
     fn catalog_host_orders_real_rsp_and_rdp_wrappers_on_the_same_byte() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let words = [0x2402_0001u32, 0x03e0_0008];
         let rom = words
             .into_iter()
@@ -335,7 +335,7 @@ use super::*;
     #[test]
     fn suspended_host_transaction_orders_same_byte_device_write_before_resume_suffix() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let words = [0x2402_0001u32, 0x03e0_0008];
         let rom = words
             .into_iter()

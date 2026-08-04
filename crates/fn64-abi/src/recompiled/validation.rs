@@ -1,6 +1,6 @@
 use super::*;
 
-fn validate_pi_transition_trace(
+pub(super) fn validate_pi_transition_trace(
     trace: &[fn64_runtime::DeviceTraceEvent],
 ) -> Result<(u64, u64, u64, u64, u64, u64, u64, [u8; 32]), PiWriterRuntimeStateErrorV1> {
     #[derive(Clone, Copy)]
@@ -175,7 +175,7 @@ fn hash_sp_request(hasher: &mut sha2::Sha256, request: fn64_runtime::SpDmaReques
     hasher.update(request.encoded_len.to_be_bytes());
 }
 
-fn validate_sp_transition_trace(
+pub(super) fn validate_sp_transition_trace(
     trace: &[fn64_runtime::DeviceTraceEvent],
 ) -> Result<(u64, u64, u64, u64, u64, [u8; 32]), SpWriterRuntimeStateErrorV1> {
     let mut active = None;
@@ -314,7 +314,7 @@ fn hash_si_request(hasher: &mut sha2::Sha256, request: fn64_runtime::SiDmaReques
     hasher.update(request.dram_addr.offset().to_be_bytes());
 }
 
-fn validate_si_transition_trace(
+pub(super) fn validate_si_transition_trace(
     trace: &[fn64_runtime::DeviceTraceEvent],
 ) -> Result<(u64, u64, u64, [u8; 32]), SiWriterRuntimeStateErrorV1> {
     #[derive(Clone, Copy)]
@@ -434,7 +434,7 @@ fn validate_si_transition_trace(
     ))
 }
 
-fn validate_bootstrap_binding(
+pub(super) fn validate_bootstrap_binding(
     validated: &ValidatedBootstrapRdramV1,
     install: &CatalogGenerationInstallV1,
 ) -> Result<(), BootstrapImportErrorV1> {
@@ -502,7 +502,7 @@ fn validate_bootstrap_binding(
     Ok(())
 }
 
-fn validate_bootstrap_writer_completion_state(
+pub(super) fn validate_bootstrap_writer_completion_state(
     program_model_sha256: [u8; 32],
     bootstrap: &BootstrapOrImportValidationEvidenceV1,
     storage: &[u8],
@@ -640,7 +640,7 @@ fn validate_bootstrap_writer_completion_state(
     Ok(receipt)
 }
 
-fn validate_cpu_writer_quiescence(
+pub(super) fn validate_cpu_writer_quiescence(
     state: &CanonicalExecutableMutationStateV1,
 ) -> Result<(), CpuWriterRuntimeStateErrorV1> {
     if !state.sealed || state.expected_sha256.is_none() {
@@ -664,7 +664,7 @@ fn validate_cpu_writer_quiescence(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_cpu_writer_runtime_state_v1(
+pub(super) fn validate_cpu_writer_runtime_state_v1(
     program_model_sha256: [u8; 32],
     resolver_install_sha256: [u8; 32],
     abi_host_catalog_receipt_sha256: Option<[u8; 32]>,
@@ -765,7 +765,7 @@ fn validate_cpu_writer_runtime_state_v1(
     Ok(receipt)
 }
 
-fn validate_pi_writer_quiescence(
+pub(super) fn validate_pi_writer_quiescence(
     state: &CanonicalExecutableMutationStateV1,
 ) -> Result<(), PiWriterRuntimeStateErrorV1> {
     if !state.sealed || state.expected_sha256.is_none() {
@@ -789,7 +789,7 @@ fn validate_pi_writer_quiescence(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_pi_writer_runtime_state_v1(
+pub(super) fn validate_pi_writer_runtime_state_v1(
     program_model_sha256: [u8; 32],
     resolver_install_sha256: [u8; 32],
     abi_host_catalog_receipt_sha256: Option<[u8; 32]>,
@@ -896,7 +896,7 @@ fn validate_pi_writer_runtime_state_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_si_writer_runtime_state_v1(
+pub(super) fn validate_si_writer_runtime_state_v1(
     program_model_sha256: [u8; 32],
     resolver_install_sha256: [u8; 32],
     abi_host_catalog_receipt_sha256: Option<[u8; 32]>,
@@ -1001,7 +1001,7 @@ fn validate_si_writer_runtime_state_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_sp_writer_runtime_state_v1(
+pub(super) fn validate_sp_writer_runtime_state_v1(
     program_model_sha256: [u8; 32],
     resolver_install_sha256: [u8; 32],
     abi_host_catalog_receipt_sha256: Option<[u8; 32]>,
@@ -1122,7 +1122,7 @@ fn validate_sp_writer_runtime_state_v1(
     Ok(receipt)
 }
 
-fn validate_host_abi_writer_quiescence(
+pub(super) fn validate_host_abi_writer_quiescence(
     state: &CanonicalExecutableMutationStateV1,
 ) -> Result<(), HostAbiWriterRuntimeStateErrorV1> {
     if !state.sealed || state.expected_sha256.is_none() {
@@ -1146,7 +1146,7 @@ fn validate_host_abi_writer_quiescence(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_host_abi_writer_runtime_state_v1(
+pub(super) fn validate_host_abi_writer_runtime_state_v1(
     program_model_sha256: [u8; 32],
     resolver_install_sha256: [u8; 32],
     abi_host_catalog: Option<&AbiHostFunctionCatalogEvidenceV1>,
@@ -1362,7 +1362,7 @@ fn validate_host_abi_writer_runtime_state_v1(
     Ok(receipt)
 }
 
-fn validate_rsp_writer_quiescence(
+pub(super) fn validate_rsp_writer_quiescence(
     state: &CanonicalExecutableMutationStateV1,
 ) -> Result<(), RspWriterRuntimeStateErrorV1> {
     if !state.sealed || state.expected_sha256.is_none() {
@@ -1386,7 +1386,7 @@ fn validate_rsp_writer_quiescence(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_rsp_writer_runtime_state_v1(
+pub(super) fn validate_rsp_writer_runtime_state_v1(
     program_model_sha256: [u8; 32],
     resolver_install_sha256: [u8; 32],
     abi_host_catalog_receipt_sha256: Option<[u8; 32]>,
@@ -1571,7 +1571,7 @@ fn validate_rsp_writer_runtime_state_v1(
     Ok(receipt)
 }
 
-fn validate_rdp_renderer_writer_quiescence(
+pub(super) fn validate_rdp_renderer_writer_quiescence(
     state: &CanonicalExecutableMutationStateV1,
 ) -> Result<(), RdpRendererWriterRuntimeStateErrorV1> {
     if !state.sealed || state.expected_sha256.is_none() {
@@ -1595,7 +1595,7 @@ fn validate_rdp_renderer_writer_quiescence(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_rdp_renderer_writer_runtime_state_v1(
+pub(super) fn validate_rdp_renderer_writer_runtime_state_v1(
     program_model_sha256: [u8; 32],
     resolver_install_sha256: [u8; 32],
     abi_host_catalog_receipt_sha256: Option<[u8; 32]>,

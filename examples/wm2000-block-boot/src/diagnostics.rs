@@ -1,32 +1,32 @@
 use crate::*;
 
-fn sha256_hex(digest: [u8; 32]) -> String {
+pub(crate) fn sha256_hex(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn diagnostic_hex_u32(value: u32) -> String {
+pub(crate) fn diagnostic_hex_u32(value: u32) -> String {
     format!("0x{value:08x}")
 }
 
-fn diagnostic_hex_u64(value: u64) -> String {
+pub(crate) fn diagnostic_hex_u64(value: u64) -> String {
     format!("0x{value:016x}")
 }
 
-fn diagnostic_execution_key(key: ExecutionKey) -> serde_json::Value {
+pub(crate) fn diagnostic_execution_key(key: ExecutionKey) -> serde_json::Value {
     serde_json::json!({
         "bank": diagnostic_hex_u64(key.bank.get()),
         "pc": diagnostic_hex_u32(key.pc.get()),
     })
 }
 
-fn diagnostic_fault(fault: fn64_recomp_rs::CpuFault) -> serde_json::Value {
+pub(crate) fn diagnostic_fault(fault: fn64_recomp_rs::CpuFault) -> serde_json::Value {
     serde_json::json!({
         "at": diagnostic_execution_key(fault.at),
         "kind": format!("{:?}", fault.kind),
     })
 }
 
-fn diagnostic_pending_exit(exit: fn64_recomp_rs::BlockExit) -> serde_json::Value {
+pub(crate) fn diagnostic_pending_exit(exit: fn64_recomp_rs::BlockExit) -> serde_json::Value {
     use fn64_recomp_rs::BlockExit;
 
     match exit {
@@ -104,7 +104,7 @@ fn diagnostic_pending_exit(exit: fn64_recomp_rs::BlockExit) -> serde_json::Value
     }
 }
 
-fn diagnostic_prepared_continuation(
+pub(crate) fn diagnostic_prepared_continuation(
     continuation: Option<fn64_abi::recompiled::CanonicalPreparedContinuationV1>,
 ) -> serde_json::Value {
     use fn64_abi::recompiled::CanonicalPreparedContinuationV1;
@@ -124,14 +124,14 @@ fn diagnostic_prepared_continuation(
     }
 }
 
-fn diagnostic_optional_hex_u32(value: Option<u32>) -> serde_json::Value {
+pub(crate) fn diagnostic_optional_hex_u32(value: Option<u32>) -> serde_json::Value {
     value
         .map(diagnostic_hex_u32)
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn diagnostic_cpu(
+pub(crate) fn diagnostic_cpu(
     thread: fn64_runtime::ThreadId,
     cpu: &fn64_recomp_rs::RecompContextEvidenceSnapshotV1,
 ) -> serde_json::Value {
@@ -163,7 +163,7 @@ fn diagnostic_cpu(
     })
 }
 
-fn print_wm_publication_diagnostic_v1() {
+pub(crate) fn print_wm_publication_diagnostic_v1() {
     if std::env::var_os("FN64_WM_PUBLICATION_DIAGNOSTIC").is_none() {
         return;
     }
@@ -255,12 +255,12 @@ fn print_wm_publication_diagnostic_v1() {
     }
 }
 
-struct WmOperationalBoundaryV1 {
+pub(crate) struct WmOperationalBoundaryV1 {
     achieved_guest_instructions: u64,
-    scheduler_steps: u64,
-    sim_time: u64,
-    logical_rdram_len: usize,
-    logical_rdram_sha256: [u8; 32],
+    pub(crate) scheduler_steps: u64,
+    pub(crate) sim_time: u64,
+    pub(crate) logical_rdram_len: usize,
+    pub(crate) logical_rdram_sha256: [u8; 32],
     components: fn64_boot_harness::OperationalStateComponentDigestsV1,
     publications: fn64_boot_harness::OperationalThreadPublicationDigestsV2,
     executor_thread_count: usize,
@@ -273,7 +273,7 @@ struct WmOperationalBoundaryV1 {
     mutation_journal_quiescent: bool,
 }
 
-fn canonical_publication_thread(
+pub(crate) fn canonical_publication_thread(
     publication: &fn64_abi::recompiled::CanonicalThreadPublicationV1,
 ) -> fn64_runtime::ThreadId {
     match publication {
@@ -288,7 +288,7 @@ fn canonical_publication_thread(
     }
 }
 
-fn capture_wm_operational_boundary_v1(
+pub(crate) fn capture_wm_operational_boundary_v1(
     achieved_guest_instructions: u64,
     scheduler_steps: u64,
 ) -> WmOperationalBoundaryV1 {
@@ -355,7 +355,7 @@ fn capture_wm_operational_boundary_v1(
     }
 }
 
-fn print_wm_operational_boundary_v1(boundary: &WmOperationalBoundaryV1) {
+pub(crate) fn print_wm_operational_boundary_v1(boundary: &WmOperationalBoundaryV1) {
     println!(
         concat!(
             "[wm2000-operational-boundary] schema=fn64.wm2000.operational-boundary.v1 ",
@@ -388,7 +388,7 @@ fn print_wm_operational_boundary_v1(boundary: &WmOperationalBoundaryV1) {
     );
 }
 
-fn wm_operational_boundary_json_v1(boundary: &WmOperationalBoundaryV1) -> serde_json::Value {
+pub(crate) fn wm_operational_boundary_json_v1(boundary: &WmOperationalBoundaryV1) -> serde_json::Value {
     serde_json::json!({
         "schema": "fn64.wm2000.operational-boundary.v1",
         "component_schema": fn64_boot_harness::OPERATIONAL_STATE_COMPONENT_DIGEST_SCHEMA_V1,
@@ -422,7 +422,7 @@ fn wm_operational_boundary_json_v1(boundary: &WmOperationalBoundaryV1) -> serde_
     })
 }
 
-fn dynamic_exact_entry_withheld() -> bool {
+pub(crate) fn dynamic_exact_entry_withheld() -> bool {
     let Some(value) = std::env::var_os("FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY") else {
         return false;
     };

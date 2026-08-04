@@ -1040,12 +1040,18 @@ mod snapshots;
 mod execution;
 mod runners;
 
+// `execution`, `receipts`, `runners`, and `snapshots` carry this module's
+// public surface, so their globs stay `pub use`. `validation` holds only
+// crate-internal validators, so it re-exports nothing public; it is imported
+// (not re-exported) purely so sibling modules reach those validators through
+// their own `use super::*`. `live_program` needs no glob at all: it declares
+// only `impl` blocks for types declared here, and inherent impls are always
+// in scope with their type.
 pub use execution::*;
-pub use live_program::*;
 pub use receipts::*;
 pub use runners::*;
 pub use snapshots::*;
-pub use validation::*;
+use validation::*;
 
 #[cfg(test)]
 mod tests;
