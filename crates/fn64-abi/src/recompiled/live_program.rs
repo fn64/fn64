@@ -419,6 +419,22 @@ impl CanonicalExecutableMutationStateV1 {
         }
     }
 
+    /// Accept the current bytes as the baseline without journalling a batch.
+    ///
+    /// Used when a second commit path finds the queue already drained: there is
+    /// nothing to attribute, but leaving `expected` stale makes the next
+    /// dispatch re-detect a change that was already accounted for.
+    pub(super) fn adopt_snapshot(&mut self, snapshot: Vec<Vec<u8>>) {
+        self.assert_not_poisoned();
+        if !self.sealed {
+            return;
+        }
+        self.expected_sha256 = Some(self.digest_snapshot(&snapshot));
+        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
+            range.expected = bytes;
+        }
+    }
+
     pub(super) fn commit_snapshot(
         &mut self,
         snapshot: Vec<Vec<u8>>,
@@ -1718,9 +1734,45 @@ impl CanonicalLiveBlockProgramV1 {
         if let Some(state) = &self.mutation_state {
             state.borrow_mut().seal_with(&mut read_physical_byte);
             let snapshot = state.borrow().read_snapshot(read_physical_byte);
-            state
-                .borrow_mut()
-                .commit_snapshot(snapshot, events, invalidated.clone());
+            // Skip a commit that has nothing to say. Both the guest-execution
+            // path and the device-time advance
+            // (`process_live_executable_writes_from_host`) call this same
+            // method on the same canonical state, and each `std::mem::take`s
+            // the shared PENDING_ATTRIBUTED_EXECUTABLE_WRITES queue.
+            //
+            // Whichever runs first consumes the declaration and refreshes
+            // `watched[..].expected`. The second then arrives with an EMPTY
+            // event list, and if it commits anyway it re-reads RDRAM, sees the
+            // byte the first commit already accepted, and panics with
+            // `events=0 declarations=0` -- which is exactly the WM2000 failure
+            // at 0x8009b0b0.
+            //
+            // A commit with no writes and no events cannot establish anything,
+            // so declining it is not a weakening: the first commit already
+            // recorded the journal entry and advanced the baseline.
+            if writes.is_empty() && events.is_empty() {
+                // Nothing to attribute, but the baseline still has to advance.
+                //
+                // Both the guest-execution path and the device-time advance
+                // (`process_live_executable_writes_from_host`) call this on the
+                // SAME canonical state, and each `std::mem::take`s the shared
+                // PENDING_ATTRIBUTED_EXECUTABLE_WRITES queue. The first
+                // consumes the declaration and refreshes
+                // `watched[..].expected`; the second arrives empty.
+                //
+                // Committing anyway made the second re-detect the byte the
+                // first accepted (`events=0 declarations=0`). Skipping the
+                // commit entirely just moved the same stale baseline to the
+                // next `reconcile_snapshot_before_dispatch`, which reports it
+                // as "before canonical static dispatch" -- measured, not
+                // assumed. Adopting the snapshot without journalling an empty
+                // batch is what actually keeps the two callers consistent.
+                state.borrow_mut().adopt_snapshot(snapshot);
+            } else {
+                state
+                    .borrow_mut()
+                    .commit_snapshot(snapshot, events, invalidated.clone());
+            }
         }
         invalidated
     }
