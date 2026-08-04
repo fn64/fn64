@@ -713,6 +713,54 @@ fn merge_admitted_overlay_records<'a>(
     by_source.into_values().collect()
 }
 
+/// The load address an overlay image declares in its own header, if it has a
+/// recognizable one.
+///
+/// Some families prefix each loaded image with a fixed header carrying the
+/// destination and payload length. That is independent evidence: it lives in
+/// the image bytes, not the descriptor table, so it can settle a disagreement
+/// between the two that neither side can settle alone.
+///
+/// Measured on Batman of the Future, whose four overlays each open with
+/// `"MWo2"`, an index, load address `0x8022f280`, and a length that matches
+/// the descriptor's ROM interval exactly (0x2ad0, 0x11f0, 0x40c0, 0x1840),
+/// followed by an ASCII name ("SuitSelect", "StageName", "Option",
+/// "DemoPic").
+///
+/// Deliberately strict, because a false positive here overrides a proven
+/// descriptor field: the magic must match, the declared length must equal the
+/// record's own ROM length, and the address must be a word-aligned KSEG0
+/// address. Anything short of all three returns `None` and leaves the
+/// descriptor's own field standing.
+fn declared_image_load_address(rom: &NormalizedRom, rom_start: u32, byte_len: u32) -> Option<u32> {
+    /// `"MWo2"`. One family's marker, not a general N64 convention -- adding a
+    /// second means adding its own verified constant beside this one.
+    const IMAGE_HEADER_MAGIC: u32 = 0x4d57_6f32;
+    const HEADER_BYTES: u32 = 0x40;
+
+    if byte_len <= HEADER_BYTES {
+        return None;
+    }
+    let word = |index: u32| -> Option<u32> {
+        let offset = rom_start.checked_add(index * 4)? as usize;
+        rom.bytes
+            .get(offset..offset + 4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+    };
+    if word(0)? != IMAGE_HEADER_MAGIC {
+        return None;
+    }
+    let declared_load = word(2)?;
+    let declared_len = word(3)?;
+    if declared_len != byte_len
+        || !declared_load.is_multiple_of(4)
+        || !(0x8000_0000..0xa000_0000).contains(&declared_load)
+    {
+        return None;
+    }
+    Some(declared_load)
+}
+
 pub fn scan_recovered_overlay_regions(
     rom: &NormalizedRom,
     recovery: &crate::overlay_regions::OverlayRecovery,
@@ -891,7 +939,38 @@ pub fn scan_recovered_overlay_regions(
             );
             continue;
         };
-        if record.rom_start.wrapping_add(delta) != va_start || va_start != record.vram_dest {
+        // The descriptor field the search read may not be the destination at
+        // all. `enumerate_family_tables` assumes the AKI layout -- rom_start,
+        // rom_end, vram_dest in three adjacent words -- and slides that triple
+        // across the record. A family that stores its destination BEFORE
+        // rom_start cannot be expressed that way, so the search settles on
+        // whichever later word looks destination-like.
+        //
+        // Batman of the Future is that shape: the search reads word 7
+        // (0x8022f2c0) while delta_vote independently infers word 3
+        // (0x8022f280), a fixed 0x40 apart. Both are constant across every
+        // record, so neither the search nor delta_vote can break the tie
+        // alone -- delta_vote derives `delta` to reach its own answer.
+        //
+        // The loaded image itself breaks it. When the bytes at `rom_start`
+        // open with a header declaring their own load address, that is
+        // evidence from a third place, and it decides which field was real.
+        let header_destination = declared_image_load_address(rom, record.rom_start, byte_len);
+        let destination = match header_destination {
+            Some(declared) if declared != record.vram_dest => {
+                let note = db.insert(Fact::Evidence {
+                    subject: BankAddr::new(&bank, record.rom_start),
+                    note: format!(
+                        "loaded image at ROM 0x{:x} declares load address 0x{declared:08x} in its own header, overriding the descriptor field's 0x{:08x}",
+                        record.rom_start, record.vram_dest,
+                    ),
+                });
+                evidence.push(note);
+                declared
+            }
+            _ => record.vram_dest,
+        };
+        if record.rom_start.wrapping_add(delta) != va_start || va_start != destination {
             conclude_record_and_bank(
                 db,
                 &record_subject,
@@ -902,6 +981,9 @@ pub fn scan_recovered_overlay_regions(
             );
             continue;
         }
+        let destination_end = destination
+            .checked_add(byte_len)
+            .unwrap_or(destination_end);
 
         let mapping = db.insert(Fact::RomMapping {
             bank: bank.clone(),
