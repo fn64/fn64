@@ -491,6 +491,19 @@ under-declaration there is exactly what one would expect to surface first.
 The remaining question -- which writer -- needs the instrumented run to
 complete; static analysis has taken it as far as it goes.
 
+**A correlation worth chasing:** the panic reproduces with
+`FN64_RENDER_DUMP_DIR` set and did NOT appear in a 74-minute run with the
+variable unset, all else equal. The dump path writes PNG frames from a
+graphics task; if it reads or writes through a view that bypasses the
+attributed-write notification, that would produce exactly this signature --
+an under-declaring writer rather than a silent one. Not yet confirmed (the
+control run may simply not have reached the same point), so it is recorded
+as a lead, not a finding.
+
+The panic message now carries the declaring channels, their declared ranges,
+and every changed range, so the next occurrence names the writer without
+another instrumentation round.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
