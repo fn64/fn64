@@ -176,7 +176,8 @@ use super::*;
 
         let pending = fabric
             .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
-            .unwrap();
+            .unwrap()
+            .expect("unfrozen DPC submission must publish");
         let pending_snapshot = fabric.snapshot();
         let pending_execution = fabric.rsp_execution_state();
         assert_eq!(
@@ -194,7 +195,8 @@ use super::*;
         let mut fabric = fabric();
         let pending = fabric
             .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
-            .unwrap();
+            .unwrap()
+            .expect("unfrozen DPC submission must publish");
         let before = fabric.rsp_execution_state();
         let before_snapshot = fabric.snapshot();
 
@@ -642,7 +644,7 @@ use super::*;
 
 
     #[test]
-    fn dpc_status_commands_select_xbus_without_overwriting_transaction_bits() {
+    fn dpc_freeze_defers_end_until_clear_and_preserves_flush_latch() {
         let mut fabric = fabric();
         fabric
             .write_mmio(DPC_STATUS_REG, 0x02 | 0x08 | 0x20)
@@ -652,18 +654,30 @@ use super::*;
             DPC_STATUS_XBUS_DMEM_DMA | DPC_STATUS_FREEZE | DPC_STATUS_FLUSH
         );
         fabric.write_mmio(DPC_START_REG, 0x20).unwrap();
-        let submission = match fabric.write_mmio(DPC_END_REG, 0x40).unwrap() {
+        assert_eq!(
+            fabric.write_mmio(DPC_END_REG, 0x40).unwrap(),
+            DeviceMmioWriteEffect::None,
+            "FREEZE must latch END without exposing renderer work"
+        );
+        assert_eq!(fabric.pending_dpc_submission(), None);
+        assert_eq!(fabric.read_mmio(DPC_CURRENT_REG).unwrap(), 0x20);
+        assert_eq!(fabric.read_mmio(DPC_END_REG).unwrap(), 0x40);
+        assert_eq!(
+            fabric.read_mmio(DPC_STATUS_REG).unwrap() & DPC_STATUS_FLUSH,
+            DPC_STATUS_FLUSH,
+            "FLUSH remains an independently controlled mode latch"
+        );
+
+        let submission = match fabric.write_mmio(DPC_STATUS_REG, 0x04).unwrap() {
             DeviceMmioWriteEffect::DpcSubmissionRequested(submission) => submission,
-            other => panic!("XBUS END did not request renderer work: {other:?}"),
+            other => panic!("clearing FREEZE did not release renderer work: {other:?}"),
         };
         assert_eq!(submission.source, DpcSubmissionSource::Dmem);
         assert_ne!(
             fabric.read_mmio(DPC_STATUS_REG).unwrap() & DPC_STATUS_DMA_BUSY,
             0
         );
-        fabric
-            .write_mmio(DPC_STATUS_REG, 0x01 | 0x04 | 0x10)
-            .unwrap();
+        fabric.write_mmio(DPC_STATUS_REG, 0x01 | 0x10).unwrap();
         assert_eq!(
             fabric.read_mmio(DPC_STATUS_REG).unwrap()
                 & (DPC_STATUS_XBUS_DMEM_DMA | DPC_STATUS_FREEZE | DPC_STATUS_FLUSH),
