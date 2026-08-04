@@ -202,7 +202,7 @@ impl CanonicalExecutableMutationStateV1 {
         state.seal_with(|_| 0);
         let view = fn64_runtime::RdramView::from_storage(storage);
         let snapshot = state
-            .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+            .read_snapshot_from_view(&view);
         let events = evidence
             .publications
             .iter()
@@ -232,6 +232,35 @@ impl CanonicalExecutableMutationStateV1 {
         self.watched
             .iter()
             .map(|range| (range.physical_start, range.physical_end))
+            .collect()
+    }
+
+    /// Snapshot the watched ranges straight from an RDRAM view.
+    ///
+    /// [`Self::read_snapshot`] takes a per-byte closure, which forces a
+    /// bounds-checked call and a lane XOR for every byte. On WM2000 the
+    /// watched region is the 1 MiB boot bank and this runs at every dispatch
+    /// boundary, so that cost was measured at 21.6 ms per executor step --
+    /// about 36 steps/second, dominating every run.
+    ///
+    /// `copy_logical_bytes` does the same work one native word at a time, so
+    /// the check is amortized over four bytes. Callers that genuinely have
+    /// only a byte reader keep using `read_snapshot`; the hot paths should
+    /// use this.
+    pub(super) fn read_snapshot_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+    ) -> Vec<Vec<u8>> {
+        self.watched
+            .iter()
+            .map(|range| {
+                let mut bytes = vec![0u8; (range.physical_end - range.physical_start) as usize];
+                view.copy_logical_bytes(
+                    fn64_runtime::RdramAddr::from_offset(range.physical_start),
+                    &mut bytes,
+                );
+                bytes
+            })
             .collect()
     }
 

@@ -576,7 +576,7 @@ impl CatalogNestedWriterTransactionV1 {
         let view = fn64_runtime::RdramView::from_storage(rdram);
         let snapshot = state
             .borrow()
-            .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+            .read_snapshot_from_view(&view);
         let changed = state.borrow().current_changed_ranges(&snapshot);
         for (physical_start, physical_end) in changed {
             notify(physical_start, physical_end - physical_start);
