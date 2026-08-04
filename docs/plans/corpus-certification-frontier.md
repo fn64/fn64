@@ -519,8 +519,24 @@ carries process RDRAM, and a silent `RdramViewMut::from_storage(&mut [])` when
 the SI completion owner is `OsEvent` or `PfsIsPlug`. The silent branch is real,
 but it is handed an EMPTY slice, so it cannot be the source of a byte change.
 
-So the writer is still unidentified, and the remaining candidates are paths
-that write RDRAM without going through `DmaMemory` at all.
+**The write bypasses the byte-level chokepoint too.** Instrumenting
+`RdramPtr::write_u8` -- through which every raw byte write passes -- to print a
+backtrace on any write to `0x9b0b3` produced **zero hits in a run that still
+panicked** with the same `events=0 declarations=0`. The byte changed without
+`write_u8` ever being called for it.
+
+That points at `RdramPtr::write_u32` (`rdram.rs:391`), which writes four bytes
+through a single `write_unaligned` and never goes through `write_u8`. The
+geometry fits exactly: the mutated instruction sits at `0x8009b0b0`, so the
+aligned word write covers `0x9b0b0..0x9b0b4` and its last byte is the
+`0x9b0b3` the guard reports. Only that byte differs because only the store's
+low immediate byte changed.
+
+So the search narrows to callers of the word-level raw write that do not
+notify. Note the asymmetry worth fixing regardless of this bug: `write_u8`
+and `write_u32` are peers on the same pointer type, and neither notifies --
+attribution is expected to happen at a higher layer, which is exactly the
+kind of split that lets one path stay silent while its sibling is audited.
 
 **A correlation that did not survive testing.** `FN64_RENDER_DUMP_DIR` looked
 implicated: the panic appeared in a run with it set and not in a 74-minute run
