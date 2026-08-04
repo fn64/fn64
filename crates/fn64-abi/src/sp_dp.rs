@@ -93,7 +93,9 @@ pub unsafe extern "C" fn osDpSetNextBuffer_recomp(rdram: *mut u8, ctx: *mut Reco
         }
         Err(error) => panic!("osDpSetNextBuffer_recomp: {error}"),
     };
-    unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission) };
+    if let Some(submission) = submission {
+        unsafe { crate::task_dispatch::dispatch_dpc_submission(rdram, submission) };
+    }
     ctx.r2 = 0;
 }
 
@@ -200,6 +202,51 @@ mod tests {
             assert_eq!(snapshot.dpc_current, 0x1080);
             assert_eq!(snapshot.dpc_status, 0);
             assert_eq!(snapshot.pending_dpc, None);
+        });
+    }
+
+    #[test]
+    fn managed_dpc_buffer_is_invisible_until_freeze_clears() {
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let calls = Rc::new(Cell::new(0));
+        crate::set_render_backend(Box::new(CountingRawBackend(Rc::clone(&calls))), rdram.len());
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let mut freeze = ctx_zeroed();
+        freeze.r4 = 0x08;
+        unsafe { osDpSetStatus_recomp(rdram.as_mut_ptr(), &mut freeze) };
+
+        let mut submit = ctx_zeroed();
+        submit.r4 = 0xFFFF_FFFF_8000_1000;
+        submit.r6 = 0;
+        submit.r7 = 0x80;
+        unsafe { osDpSetNextBuffer_recomp(rdram.as_mut_ptr(), &mut submit) };
+        assert_eq!(submit.r2, 0, "a frozen END is accepted and retained");
+        assert_eq!(calls.get(), 0, "FREEZE must prevent backend visibility");
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert_eq!(snapshot.dpc_current, 0x1000);
+            assert_eq!(snapshot.dpc_end, 0x1080);
+            assert_eq!(snapshot.pending_dpc, None);
+            assert_ne!(snapshot.dpc_status & fn64_runtime::DPC_STATUS_FREEZE, 0);
+        });
+
+        let mut unfreeze = ctx_zeroed();
+        unfreeze.r4 = 0x04;
+        unsafe { osDpSetStatus_recomp(rdram.as_mut_ptr(), &mut unfreeze) };
+        assert_eq!(
+            calls.get(),
+            1,
+            "clearing FREEZE releases the retained range once"
+        );
+        with_host(|host| {
+            let snapshot = host.device_fabric.snapshot();
+            assert_eq!(snapshot.dpc_current, 0x1080);
+            assert_eq!(snapshot.pending_dpc, None);
+            assert_eq!(snapshot.dpc_status & fn64_runtime::DPC_STATUS_FREEZE, 0);
         });
     }
 

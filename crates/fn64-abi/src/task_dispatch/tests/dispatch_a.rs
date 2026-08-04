@@ -637,7 +637,8 @@ use super::*;
             host.device_fabric
                 .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Rdram, 0x100, 0x108)
                 .unwrap()
-        });
+        })
+        .expect("unfrozen DPC submission must publish");
         let before_rdram = live_rdram.clone();
         let (before_memory, before_registers) = with_host(|host| {
             (
@@ -1553,6 +1554,54 @@ use super::*;
         assert_eq!(snapshot.dpc_status, 0);
     }
 
+    #[test]
+    fn raw_mmio_freeze_holds_renderer_work_until_clear_freeze() {
+        const START: usize = 0x100;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        rdram[START..START + 4].copy_from_slice(&0xe900_0000u32.to_ne_bytes());
+        let calls = Rc::new(Cell::new(0));
+        set_render_backend(
+            Box::new(MutatingRawBackend {
+                calls: Rc::clone(&calls),
+                outcome: RawMutationOutcome::Complete,
+                mutation_offset: 0x400,
+            }),
+            rdram.len(),
+        );
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        assert!(crate::pi::write_live_device_mmio(
+            0xffff_ffff_a410_000c,
+            0x08
+        ));
+        assert!(crate::pi::write_live_device_mmio(
+            0xffff_ffff_a410_0000,
+            START as u32
+        ));
+        assert!(crate::pi::write_live_device_mmio(
+            0xffff_ffff_a410_0004,
+            (START + 8) as u32
+        ));
+        assert_eq!(calls.get(), 0, "frozen END escaped to the renderer");
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xffff_ffff_a410_0008),
+            Some(START as u32)
+        );
+
+        assert!(crate::pi::write_live_device_mmio(
+            0xffff_ffff_a410_000c,
+            0x04
+        ));
+        assert_eq!(calls.get(), 1, "clear-freeze did not release renderer work");
+        assert_eq!(
+            crate::pi::read_live_device_mmio(0xffff_ffff_a410_0008),
+            Some((START + 8) as u32)
+        );
+    }
 
     #[test]
     fn rejected_raw_renderer_mutations_never_reach_live_rdram() {
@@ -1703,7 +1752,8 @@ use super::*;
             host.device_fabric
                 .request_dpc_submission(fn64_runtime::DpcSubmissionSource::Dmem, 0, 8)
         })
-        .unwrap();
+        .unwrap()
+        .expect("unfrozen DPC submission must publish");
         let mut transaction = LiveDpcTransaction::new(submission);
         let fn64_runtime::DpcScheduledPhase::AwaitingAck(request) = transaction
             .acknowledgment

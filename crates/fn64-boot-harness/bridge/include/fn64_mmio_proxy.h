@@ -37,6 +37,9 @@
 
 extern "C" int32_t fn64_c_mmio_read_w(uint64_t vaddr);
 extern "C" void fn64_c_mmio_write_w(uint64_t vaddr, uint32_t value);
+extern "C" uint32_t fn64_c_mmio_read_subword(uint64_t vaddr, uint32_t width);
+extern "C" void fn64_c_mmio_write_subword(uint64_t vaddr, uint32_t width,
+                                            uint32_t value);
 extern "C" void fn64_c_mmio_bad_width(uint64_t vaddr, uint32_t width,
                                       uint32_t is_write);
 extern "C" void fn64_c_mem_unaligned(uint64_t vaddr, uint32_t width,
@@ -155,7 +158,11 @@ public:
             }
         }
         if (fn64_is_rcp_mmio_word(address)) {
-            if constexpr (sizeof(T) != sizeof(uint32_t)) {
+            if constexpr (sizeof(T) == sizeof(uint8_t) ||
+                          sizeof(T) == sizeof(uint16_t)) {
+                return static_cast<T>(
+                    fn64_c_mmio_read_subword(address, sizeof(T)));
+            } else if constexpr (sizeof(T) != sizeof(uint32_t)) {
                 fn64_c_mmio_bad_width(address, sizeof(T), 0);
                 return T{};
             } else {
@@ -195,7 +202,12 @@ private:
             }
         }
         if (fn64_is_rcp_mmio_word(address)) {
-            if constexpr (sizeof(T) != sizeof(uint32_t)) {
+            if constexpr (sizeof(T) == sizeof(uint8_t) ||
+                          sizeof(T) == sizeof(uint16_t)) {
+                fn64_c_mmio_write_subword(
+                    address, sizeof(T), static_cast<uint32_t>(value));
+                return;
+            } else if constexpr (sizeof(T) != sizeof(uint32_t)) {
                 fn64_c_mmio_bad_width(address, sizeof(T), 1);
                 return;
             } else {
