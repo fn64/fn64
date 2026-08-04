@@ -963,6 +963,35 @@ elsewhere. The options are to model an absent-device read explicitly, or to
 trap it loudly as unsupported with the device named. Either is defensible;
 silently returning zero is not.
 
+## Loop speed: what actually worked
+
+Recorded because two of the four attempts were duds and the ratio matters
+more than the wins:
+
+| lever | effect |
+|---|---|
+| MMIO fast path (KSEG1 pre-check) | **2.8x** -- 3.2h route -> 66min |
+| release build, once buildable | **2x** on the real route (28min -> 14min) |
+| per-package `opt-level = 3` | no measurable change |
+| word-wise RDRAM copy | no measurable change (138s -> 134s) |
+
+The release build was **broken, not slow**: `[profile.release]` carried
+`debug = true`, and DWARF for 35 crates of generated match arms is enormous
+and useless. Every earlier attempt ran 40+ minutes or was OOM-killed, which is
+why it kept being abandoned. With `debug = false` and `codegen-units = 256`
+for the cold generated shards it builds in under 8 minutes at 89 MB.
+
+Its microbenchmark (5,000 steps, 49.8s -> 42.2s, 1.2x) badly understated the
+real gain, because short runs are dominated by fixed startup. On the full
+route it is 2x.
+
+**What would actually remove the remaining cost is snapshot/restore.** Boot is
+deterministic, so every run re-executes an identical ~400k-step prefix to
+reach the same fault. `copy_registered_physical_rdram_logical` can dump RDRAM,
+but there is no executor or thread-state save, so this is a real feature
+rather than a config change -- and it is the highest-leverage remaining
+investment in iteration speed.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
