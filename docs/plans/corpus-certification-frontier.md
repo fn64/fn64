@@ -884,6 +884,33 @@ is faulting on an address the guest computed. Whether the pointer is garbage
 `0x8002261c+0xc` should have returned something else is the next question, and
 it is a different investigation from the mutation guard.
 
+## Blocker B: the windowed lane hangs inside frame 0
+
+With Blocker A fixed, the shell was re-run headless
+(`FN64_SHELL_HEADLESS_FRAMES=600`, no window, no audio) to test whether the
+mutation panic had been what stopped it presenting.
+
+It was not. The probe loop prints one diagnostic line per frame -- `swapped`,
+`steps`, `vi_swaps`, `sim_time`, `fb` -- and after **18m47s at 100% CPU it had
+printed zero lines**. Frame 0's `pump_one_frame` never returns.
+
+So the shell is not failing to *render*; it is not completing a single frame.
+That is a different defect from both the mutation guard (fixed) and the
+out-of-range pointer fault the batch runner hits at ~28 minutes -- notably the
+shell does NOT panic there, so the two lanes diverge in behaviour as well as
+in structure.
+
+The shell's pump drains to the next device event rather than bounding its
+step budget, which is the mechanism to look at: if WM2000's boot is waiting on
+a device event the pump itself is responsible for advancing, that is a
+deadlock rather than slowness, and no amount of run time resolves it.
+
+Worth stating plainly because it corrects an earlier inference: the missing
+first frame was attributed to WM2000's inherent debug-build cost, on the
+strength of a side-by-side comparison with the batch runner sitting at the
+same log point. That comparison was real, but the conclusion was wrong -- the
+batch runner was progressing and the shell was not.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
