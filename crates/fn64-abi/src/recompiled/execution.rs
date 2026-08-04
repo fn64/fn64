@@ -159,9 +159,26 @@ fn set_catalog_program_parts(
         Rc::new(RefCell::new(state))
     });
     let generations = generations.map(|generations| Rc::new(RefCell::new(generations)));
-    if mutation_state.is_some() {
+    if let Some(state) = mutation_state.as_ref() {
+        // Install the ranges the GUARD watches, not the ones passed in.
+        //
+        // `record_executable_and_renderer_write` decides whether a guest write
+        // is an attributed executable write by intersecting it with
+        // EXECUTABLE_WRITE_RANGES, while `commit_snapshot` later panics based
+        // on `mutation_state`'s watched set. Those are the same list only on
+        // the `new(&ranges)` path. `from_bootstrap` derives its watched ranges
+        // from the bootstrap receipt's own `watched_ranges` instead, so on
+        // that path -- which is the one WM2000 takes -- a store landing in the
+        // guard's set but outside `ranges` was never recorded as attributed.
+        //
+        // That is exactly the observed failure: a guest CPU store zeroes the
+        // instruction word at 0x8009b0b0, `notify_cpu_instruction_store` fires,
+        // and the commit boundary still reports `events=0 declarations=0`
+        // because the observer had filtered it out.
         EXECUTABLE_WRITE_RANGES.with(|installed| {
-            installed.borrow_mut().extend_from_slice(&ranges);
+            installed
+                .borrow_mut()
+                .extend_from_slice(&state.borrow().watched_ranges());
         });
         fn64_recomp_rs::set_guest_write_boundary_observer(Some(classify_live_executable_write));
         fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
