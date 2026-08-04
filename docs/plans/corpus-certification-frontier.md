@@ -682,12 +682,18 @@ That is **21.6 ms per executor step**, with graphics and audio at exactly
 zero. A per-step cost, not a per-instruction one -- which is why raising
 `opt-level` on the interpreter crates changed nothing measurable.
 
-The source is the executable-mutation guard. `read_snapshot`
-(`recompiled/live_program.rs:238`) allocates a fresh `Vec<Vec<u8>>` and reads
-its entire watched region **a byte at a time** through `read_u8`, each with a
-bounds check and a lane XOR, at every dispatch boundary. WM2000's watched
-region is the 1 MiB boot bank, so that is roughly a million checked reads plus
-a 1 MiB allocation per step.
+**The obvious suspect was wrong.** `read_snapshot`
+(`recompiled/live_program.rs:238`) allocated a fresh `Vec<Vec<u8>>` and read
+its entire watched region a byte at a time through `read_u8` -- roughly a
+million checked reads plus a 1 MiB allocation per step on WM2000's 1 MiB boot
+bank. That looked decisive, so `copy_logical_bytes` was rewritten to copy one
+native word at a time (differential-tested byte-identical at every alignment)
+and the ten hot call sites switched to it.
+
+It changed nothing: 5,000 steps went 138s -> 134s, and phase timing still
+reports ~27 ms per executor step. The snapshot was not the bottleneck. The
+rewrite is kept because it is strictly less work and removes a suspect, but
+the cost is elsewhere in the executor and remains unattributed.
 
 Two consequences worth stating:
 
