@@ -188,6 +188,43 @@ pub fn copy_registered_physical_rdram_logical() -> Option<Vec<u8>> {
     })
 }
 
+/// Read the registered physical RDRAM device through a call-scoped capability.
+///
+/// [`copy_registered_physical_rdram_logical`] answers "what does the whole
+/// device contain" for one-shot release evidence; it allocates eight MiB and
+/// reads it a byte at a time. A windowed host presenting the VI framebuffer
+/// asks a different question sixty times a second -- "what is in these ~150 KiB
+/// right now" -- and cannot pay that price per frame. This exposes the same
+/// capability the internal presentation path already uses
+/// (`task_dispatch::present_render_backend`) so an out-of-process presenter can
+/// read exactly the span it needs without copying the device or manufacturing a
+/// competing Rust slice.
+///
+/// `None` means no process RDRAM has been registered, which is the honest
+/// answer before boot rather than an empty read.
+///
+/// The process runtime is single-threaded. Callers must invoke this only at a
+/// host boundary where no guest coroutine or device operation is executing --
+/// the same contract [`copy_registered_physical_rdram_logical`] documents. A
+/// windowed presenter satisfies it by reading between executor pumps.
+pub fn with_registered_physical_rdram_read<R>(
+    read: impl for<'call> FnOnce(fn64_runtime::PhysicalRdramRead<'call>) -> R,
+) -> Option<R> {
+    let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    if rdram.is_null() {
+        assert_eq!(
+            allocation_len, 0,
+            "registered process RDRAM has a length but no storage pointer"
+        );
+        return None;
+    }
+    // SAFETY: registration owns a process-lifetime allocation, and the
+    // host-boundary contract above excludes concurrent guest/device access for
+    // this call. The higher-ranked capability prevents the reader from
+    // retaining it past the call, so no competing borrow can outlive us.
+    Some(unsafe { fn64_runtime::with_physical_rdram_read(rdram, allocation_len, read) })
+}
+
 /// Create and start thread 0 running `recomp_entrypoint` -- the harness's
 /// boot entry point. `recomp_entrypoint`'s own body (verified directly
 /// against `RecompiledFuncs/funcs_0.c`) computes its own jump target from
