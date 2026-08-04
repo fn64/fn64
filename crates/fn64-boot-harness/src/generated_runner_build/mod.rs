@@ -31,7 +31,10 @@ pub use build::*;
 pub use runtime_series_a::*;
 pub use runtime_series_b::*;
 pub use runtime_series_c::*;
-pub use stage::*;
+// `stage` holds only module-internal staging helpers, so it re-exports nothing
+// public; import (do not re-export) it so siblings still reach it via their own
+// `use super::*`.
+use stage::*;
 
 pub const GENERATED_RUNNER_BUILD_IDENTITY_SCHEMA_V2: &str =
     "fn64.generated-runner-build-identity.v2";
