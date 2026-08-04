@@ -12,8 +12,16 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 [ -f .claude/local.env ] && source .claude/local.env
 
+# Three tiers, cheapest first. The point is that the check you run after
+# every edit must be fast enough that you actually run it: --fast is the
+# inner loop (seconds), --quick adds the firewall (a minute), and the full
+# form adds the ROM gates (many minutes) before a commit.
 quick=0
-[ "${1:-}" = "--quick" ] && quick=1
+fast=0
+case ${1:-} in
+    --quick) quick=1 ;;
+    --fast) fast=1; quick=1 ;;
+esac
 status=0
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; status=1; }
 pass() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
@@ -43,6 +51,11 @@ if printf '%s' "$tests" | grep -q 'run'; then
     fi
 else
     fail "test run did not report a summary (compile error?)"
+fi
+
+if [ "$fast" = 1 ]; then
+    echo "== firewall + docs + ROM gates skipped (--fast)"
+    exit $status
 fi
 
 # wrong>0 is disqualifying in every configuration; a recall DROP is a
