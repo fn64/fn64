@@ -691,9 +691,37 @@ native word at a time (differential-tested byte-identical at every alignment)
 and the ten hot call sites switched to it.
 
 It changed nothing: 5,000 steps went 138s -> 134s, and phase timing still
-reports ~27 ms per executor step. The snapshot was not the bottleneck. The
-rewrite is kept because it is strictly less work and removes a suspect, but
-the cost is elsewhere in the executor and remains unattributed.
+reports ~27 ms per executor step. The snapshot was not the bottleneck.
+
+**Sampled the running process instead of guessing a third time**, and the
+answer is unambiguous:
+
+```
+5877 / 5965 samples   fn64_abi::pi::timing::read_raw_mmio_word
+```
+
+**98.5% of runtime is MMIO register reads.** Not one slow function -- the
+individual paths (`read_live_device_mmio`, `read_live_rcp_interrupt_mmio`)
+are short. It is sheer volume: the guest is spin-polling a device register in
+a tight loop, and every poll walks the MMIO window chain and takes the host
+lock.
+
+That reframes the whole "slow emulation" problem. It is not interpreter
+overhead, not the mutation guard, and not something an `opt-level` change or
+a faster memory copy can reach. WM2000 is busy-waiting on a device the
+harness advances only at step boundaries, so the emulator burns thousands of
+polls per unit of guest progress.
+
+Two implications:
+
+* the ~36 steps/second figure is not a fixed emulator cost -- it is specific
+  to whatever the guest is waiting for here, and would change entirely once
+  that wait is satisfied;
+* the fix is a device/scheduling question (advance time to the next deadline
+  when the guest is provably spinning), not a code-optimization one.
+
+Recorded after two wrong guesses -- the interpreter `opt-level` change and the
+byte-loop rewrite -- both of which measured as no-ops. Sampling took one run.
 
 Two consequences worth stating:
 
