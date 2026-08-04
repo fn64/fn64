@@ -538,12 +538,31 @@ Both instrumented runs covered only `RdramPtr`, which is why two 40-minute runs
 returned zero hits while still panicking. Reading the code found in a minute
 what the runs could not.
 
-**Prime candidate: `G_DMA_IO` / `gSPDmaWrite`** in
-`crates/fn64-render-reference/src/gbi/stream.rs:78`. It writes RSP memory back
-into DRAM through `RdramViewMut::write_logical_bytes` with **no declaration and
-no notification** -- that file contains zero notify calls. It is a graphics
-task DMAing arbitrary DRAM from inside the renderer crate, which sits outside
-the ABI layer where write attribution lives.
+**`G_DMA_IO` is the writer, but not the defect.** `gSPDmaWrite`
+(`crates/fn64-render-reference/src/gbi/stream.rs:78`) does write RSP memory
+back into DRAM through `RdramViewMut::write_logical_bytes` with no notify call
+in that file. But the renderer is not supposed to declare: the ABI brackets the
+whole task in `track_rdp_renderer_mutation`
+(`task_dispatch/setup.rs:436`), which is meant to diff and attribute whatever
+the backend touched.
+
+**The defect is in that bracket.** `track_catalog_nested_mutation`
+(`recompiled/snapshots.rs:1003`) has two branches:
+
+* canonical program active -> `commit_changed_bytes` diffs and notifies;
+* otherwise -> it snapshots ONLY the ranges already in
+  `EXECUTABLE_WRITE_RANGES` (`snapshots.rs:1014`) and, after the operation,
+  notifies only changes found *inside those ranges* (`:1035-1053`).
+
+So when the canonical program is not active, a renderer write to executable
+memory that lies outside the pre-registered ranges is never compared and never
+notified. That is precisely the observed signature: the byte changes, the
+guard's own watched set sees it later, and `events=0 declarations=0` because
+nothing ever declared it.
+
+This supersedes the previous entry blaming the renderer crate for missing a
+notify call -- the attribution seam exists and is in the right place; its
+non-canonical branch is just too narrow.
 
 That also retro-explains the frame-dump correlation retracted earlier: it was
 dismissed as a run-speed artifact, and the speed analysis was correct, but both
