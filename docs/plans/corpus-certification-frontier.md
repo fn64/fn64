@@ -992,6 +992,31 @@ but there is no executor or thread-state save, so this is a real feature
 rather than a config change -- and it is the highest-leverage remaining
 investment in iteration speed.
 
+## Blocker C: the 3.4x figure describes a running game, not this boot
+
+Worth separating, because the two numbers look contradictory and only one is
+about pacing.
+
+`docs/BOOT-NOTES-WM2000.md:1681` measured **22.027 s executor time against
+~6.39 s of guest time** on a 100,000-step route -- about 3.4x slower than
+realtime, with the guest actually retiring instructions.
+
+Computing the same ratio from a current 5,000-step run gives ~264,000x, which
+is not a regression and not comparable: `sim_time` advances 3 cycles per
+scheduling step, so a step that only waits on a device advances guest time
+without executing anything. WM2000's boot is device-bound, so most of those
+steps are waits.
+
+The consequence for Blocker C: **pacing is meaningless until a frame is
+presented.** Wall-clock pacing exists to stop a fast emulator outrunning
+realtime; a boot that is device-bound and has never reached a first VI field
+has nothing to pace against. The 3.4x figure is the one that matters, it was
+measured on a running route, and it will need re-measuring once the domain-1
+fault is resolved and frames actually arrive.
+
+Recorded to prevent the 264,000x number being read as a catastrophic
+regression by whoever looks next.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
