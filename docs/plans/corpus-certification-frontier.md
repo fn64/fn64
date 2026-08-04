@@ -641,6 +641,33 @@ with a playable match immediately behind it. Blocker B (the certified lane and
 the playable lane being different programs) is known engineering with a known
 shape. Continuing to spend exclusively on A is a worse bet than starting B.
 
+## Blocker B mapped: it is a three-function wiring gap, not two programs
+
+The earlier framing -- "the certified lane and the playable lane are different
+programs" -- overstates it. `crates/fn64-shell` already has a typed-Rust game
+path that needs no C recompiler:
+
+* `build.rs` branches on `FN64_RECOMP=rs`, which takes `ROM` directly and links
+  the game from a Rust crate instead of `RECOMPILED_DIR`;
+* the `rs` manifest (`crates/fn64-shell/rs/Cargo.toml`) already carries
+  **winit, gilrs, pixels, egui** plus every fn64 crate with the `recomp-rs`
+  feature -- window, gamepad, and UI are all present;
+* `main.rs` uses exactly **three** symbols from the linked game crate:
+  `recompiled::boot_thread`, `recompiled::entrypoint`, `recompiled::lookup`.
+
+So the shell does not need porting. It needs a game crate for WM2000 that
+exposes those three functions, in place of the out-of-tree
+`oot-recompiled = { path = "recompiled" }` it links today.
+
+WM2000's emitted code already exists as the 35 dense-AOT shards the block lane
+builds and certifies, but `examples/wm2000-block-shards/lib.rs` exports only
+`code_bank`. Bridging that to the three-function interface -- entry lookup,
+thread bootstrap, and entrypoint -- is the whole of Blocker B.
+
+That is bounded, known-shape engineering, unlike Blocker A, which after six
+measured eliminations remains an unidentified writer in a subsystem that had
+never executed before 2026-08-04.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
