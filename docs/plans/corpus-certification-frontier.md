@@ -923,6 +923,46 @@ strength of a side-by-side comparison with the batch runner sitting at the
 same log point. That comparison was real, but the conclusion was wrong -- the
 batch runner was progressing and the shell was not.
 
+## The shared fault: a CPU read of PI domain-1 address 1 has no window
+
+Both lanes now stop at `pc=0x80022620`, `MemoryFault` on
+`0xffffffffa6000000`. Disassembling the surrounding code identifies it
+precisely -- and corrects an earlier reading of mine that called the address
+"mapped by no PI domain".
+
+The routine is PI domain configuration:
+
+```
+0x800225ec:  lui  r10, 0xa460          ; PI register block
+0x800225f4:  ori  r10, r10, 0x18       ; -> 0xA4600018
+0x8002260c:  sw   r13, 0(r9)           ; write 3    (BSD dom1 page size)
+0x80022610:  sw   r11, 0(r10)          ; write 0xff (BSD dom1 release/latency)
+0x80022614:  lw   r14, 0xc(r16)        ; load a base address from a handle
+0x80022618:  lui  r1,  0xa000          ; KSEG1
+0x8002261c:  or   r15, r14, r1         ; uncached alias
+0x80022620:  lw   r2,  0(r15)          ; FAULT
+```
+
+So `0xc($s0)` held `0x06000000`, and that is **not** an unmapped address:
+`PI_DOM1_ADDR1 = 0x0600_0000..=0x07ff_ffff` (`pi/mmio.rs:107`), the N64DD
+window. The guest configures the PI domain and then probes the device.
+
+**The gap is an asymmetry.** `epi_domain_for_address` (`pi/mmio.rs:134`)
+accepts `PI_DOM1_ADDR1` for `osPiHandle` operations, but
+`cartridge_rom_window_offset` (`pi/timing.rs:35`) accepts only
+`PI_DOM1_ADDR2` -- the cartridge ROM. A direct CPU read of domain-1 address 1
+therefore matches no MMIO window, is not backed RDRAM, and faults.
+`PI_DOM1_ADDR1` appears exactly once outside its own definition, in that
+classifier, so CPU reads there have no handler at all.
+
+**What it needs is a hardware-behaviour decision, not a guess.** WM2000 has no
+N64DD, and real hardware returns open-bus for an absent device rather than
+faulting -- but the exact value is a measurement question, and inventing one
+would fabricate hardware behaviour in the same way this project has refused to
+elsewhere. The options are to model an absent-device read explicitly, or to
+trap it loudly as unsupported with the device named. Either is defensible;
+silently returning zero is not.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
