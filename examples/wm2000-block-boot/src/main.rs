@@ -120,6 +120,68 @@ struct ControllerScheduleDriver {
     operation_cursor: usize,
 }
 
+/// Live PCM evidence, kept as counters so a long run costs no memory.
+///
+/// The distinction these exist to make: a task SUBMISSION count proves the
+/// dispatcher ran, while `AUDIO_NONZERO_SAMPLES` proves the RSP produced
+/// actual signal. Audio that regressed to silence would leave the submission
+/// count untouched and drive this to zero.
+static AUDIO_BUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUDIO_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUDIO_NONZERO_SAMPLES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static AUDIO_PEAK_ABS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A headless [`fn64_audio::AudioBackend`] that retains statistics instead of
+/// samples.
+///
+/// The block lane has no host audio device, and opening one would make the
+/// gate depend on machine state. Accepting every buffer and measuring it keeps
+/// the delivery path exercised -- including the rate handling below -- while
+/// staying deterministic and constant-space.
+#[derive(Default)]
+struct PcmEvidenceBackend {
+    sample_rate_hz: u32,
+}
+
+impl fn64_audio::AudioBackend for PcmEvidenceBackend {
+    fn create(&mut self, cfg: &fn64_audio::AudioConfig) -> Result<(), fn64_audio::AudioError> {
+        self.sample_rate_hz = cfg.sample_rate_hz;
+        Ok(())
+    }
+
+    fn queue_samples(&mut self, samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        AUDIO_BUFFERS.fetch_add(1, Relaxed);
+        AUDIO_SAMPLES.fetch_add(samples.len() as u64, Relaxed);
+        let nonzero = samples.iter().filter(|sample| **sample != 0).count();
+        AUDIO_NONZERO_SAMPLES.fetch_add(nonzero as u64, Relaxed);
+        // i16::MIN negates out of range, so widen before taking magnitude.
+        let peak = samples
+            .iter()
+            .map(|sample| (*sample as i32).unsigned_abs() as u64)
+            .max()
+            .unwrap_or(0);
+        AUDIO_PEAK_ABS.fetch_max(peak, Relaxed);
+        Ok(())
+    }
+
+    /// Nothing is retained, so nothing is ever pending. A real device reports
+    /// its backlog here; this backend consuming instantly is what keeps the
+    /// lane from stalling on delivery it does not perform.
+    fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
+        Ok(0)
+    }
+
+    fn set_frequency(&mut self, sample_rate_hz: u32) {
+        self.sample_rate_hz = sample_rate_hz;
+    }
+
+    fn stream_rate_hz(&self) -> Option<u32> {
+        (self.sample_rate_hz != 0).then_some(self.sample_rate_hz)
+    }
+}
+
 static PROBE_STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CONTROLLER_READ_ORDINALS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
@@ -708,7 +770,19 @@ fn main() {
             fn64_abi::set_device_trace_enabled(false);
         }
         fn64_abi::set_audio_task_lle_accuracy();
-        fn64_abi::set_audio_rdram_len(fn64_recomp_rs::RDRAM_LEN);
+        // `set_audio_rdram_len` alone registers the AI-buffer bound but leaves
+        // no backend installed, so the RSP synthesizes PCM and the dispatcher
+        // throws it away. The gate headline's "audio submissions" then counts
+        // TASKS, which says nothing about whether a single correct sample was
+        // produced -- a silent regression would keep that number identical.
+        //
+        // This lane is headless, so it cannot open a host device. It installs
+        // a backend that keeps only statistics: enough to prove the audio path
+        // end to end, and bounded regardless of run length.
+        fn64_abi::set_audio_backend(
+            Box::new(PcmEvidenceBackend::default()),
+            fn64_recomp_rs::RDRAM_LEN,
+        );
         // NWXE verifies SRAM by issuing domain-2 PI writes during boot. The block
         // lane is intentionally ephemeral, so give it a typed in-memory 32 KiB
         // device; omitting the device is a harness error and remains a loud trap.

@@ -22,6 +22,7 @@ fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
 fn64-recomp-rs = { path = "../../crates/fn64-recomp-rs", default-features = false, features = ["production-aot"] }
 fn64-recomp-rs-codegen = { path = "../../crates/fn64-recomp-rs-codegen" }
 fn64-boot-harness = { path = "../../crates/fn64-boot-harness", features = ["recomp-rs"] }
+fn64-audio = { path = "../../crates/fn64-audio" }
 fn64-render = { path = "../../crates/fn64-render" }
 fn64-render-reference = { path = "../../crates/fn64-render-reference" }
 fn64-runtime = { path = "../../crates/fn64-runtime" }

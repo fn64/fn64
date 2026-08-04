@@ -1391,6 +1391,7 @@ name = "wm2000-block-boot"
 version = "0.0.0"
 dependencies = [
  "fn64-abi",
+ "fn64-audio",
  "fn64-boot-harness",
  "fn64-discover",
  "fn64-recomp-rs",
