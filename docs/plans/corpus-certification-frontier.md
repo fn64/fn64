@@ -504,11 +504,23 @@ regardless of whether any event was queued. Nothing declared anything, so the
 byte was written by a path that never notifies at all.
 
 That rules out the whole class of clipping, rounding, and partial-declaration
-bugs, and rules IN a writer that bypasses notification. The prime suspects
-named during the earlier analysis are now the ones to check first: the `Rdram`
-and `RdramViewMut` `DmaMemory` impls, which discard the channel and never
-notify -- previously dismissed as "not on the live path", a claim this
-measurement puts back in question.
+bugs, and rules IN a writer that bypasses notification.
+
+**The obvious suspect is eliminated, by measurement.** The `Rdram` and
+`RdramViewMut` `DmaMemory` impls discard the channel and never notify, so they
+were the natural candidates. Instrumenting both to print on every non-empty
+write and re-running the route produced **zero hits**: they are not reached on
+this path at all. The earlier "not on the live path" assessment was correct,
+and re-opening it cost one run to settle rather than an argument.
+
+`pi/timing.rs:197` does select between them -- `ProcessDmaMemory` (which
+notifies via `notify_committed_dma_write`) when a pending PI/SI/SP request
+carries process RDRAM, and a silent `RdramViewMut::from_storage(&mut [])` when
+the SI completion owner is `OsEvent` or `PfsIsPlug`. The silent branch is real,
+but it is handed an EMPTY slice, so it cannot be the source of a byte change.
+
+So the writer is still unidentified, and the remaining candidates are paths
+that write RDRAM without going through `DmaMemory` at all.
 
 **A correlation that did not survive testing.** `FN64_RENDER_DUMP_DIR` looked
 implicated: the panic appeared in a run with it set and not in a 74-minute run
