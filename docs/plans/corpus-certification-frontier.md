@@ -441,6 +441,56 @@ That is a discovery-layer question about which word the destination field
 resolve. Relaxing the guard would weaken a proven-bank invariant every ROM
 depends on, so it is left standing and recorded here instead.
 
+## WM2000 gameplay: the blocker is self-modifying code, under-declared
+
+The playable binary now builds and boots (121 MB), and running the committed
+route at `reference/wm2000-routes/entrance-to-match.schedule` fails with:
+
+```
+executable mutation changed physical RDRAM [0x0009b0b3, 0x0009b0b4)
+outside every attributed writer declaration
+```
+
+**The byte is real code.** Physical `0x9b0b3` -> VA `0x8009b0b3` -> ROM
+`0x9bcb3` is byte lane 3 of
+
+```
+0x8009b0b0:  0xa4450010    sh $a1, 0x10($v0)
+```
+
+i.e. the low byte of that store's 16-bit immediate offset, inside a dense run
+of contiguous code (SB/SH/LUI/LW/ADDIU/J). WM2000 patches store offsets at
+run time: genuine self-modifying code, not a phantom diff.
+
+**The guard is not at fault**, established by proof rather than reading:
+`first_uncovered_changed_range` was differential-tested against a brute-force
+reference over 200,000 randomized cases with zero mismatches, and
+`clipped_declarations` is byte-exact, so the unaligned address is not a
+clipping off-by-one. Every CPU store form declares a superset of what it
+changes (SB/SH exactly; SWL/SWR/SDL/SDR delegate to `store_w`/`store_d` and
+declare the full aligned word).
+
+**The failure is an UNDER-declaring writer, not a silent one.** The message
+comes from `commit_snapshot`, not `reconcile_snapshot_before_dispatch` --
+attributed events were in flight, they just did not cover this byte. A
+captured backtrace pins the call path:
+
+```
+_osSendMesg_recomp -> call_c -> invoke_catalog_block_host
+                   -> run_catalog_block_program
+```
+
+so it fires during the host-ABI transaction flush that
+`suspend_active_coroutine` triggers.
+
+Worth stating plainly: this code had **never executed** before 2026-08-04.
+The whole `recompiled/` module sits behind `recomp-rs`, which no default
+build compiles, so ~10k lines and 119 tests had never run once. A latent
+under-declaration there is exactly what one would expect to surface first.
+
+The remaining question -- which writer -- needs the instrumented run to
+complete; static analysis has taken it as far as it goes.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
