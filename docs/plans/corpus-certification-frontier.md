@@ -488,8 +488,27 @@ The whole `recompiled/` module sits behind `recomp-rs`, which no default
 build compiles, so ~10k lines and 119 tests had never run once. A latent
 under-declaration there is exactly what one would expect to surface first.
 
-The remaining question -- which writer -- needs the instrumented run to
-complete; static analysis has taken it as far as it goes.
+**Answered: the writer is silent, not under-declaring.** The enriched panic
+message reports
+
+```
+[0x0009b0b3,0x0009b0b4) outside every attributed writer declaration;
+declared={} changed={[0x0009b0b3,0x0009b0b4)} events=0 declarations=0
+```
+
+`events=0 declarations=0` inverts the earlier reading. The prior inference --
+that `commit_snapshot` raising it (rather than
+`reconcile_snapshot_before_dispatch`) implied attributed events were in
+flight -- was wrong: the commit path runs at the transaction boundary
+regardless of whether any event was queued. Nothing declared anything, so the
+byte was written by a path that never notifies at all.
+
+That rules out the whole class of clipping, rounding, and partial-declaration
+bugs, and rules IN a writer that bypasses notification. The prime suspects
+named during the earlier analysis are now the ones to check first: the `Rdram`
+and `RdramViewMut` `DmaMemory` impls, which discard the channel and never
+notify -- previously dismissed as "not on the live path", a claim this
+measurement puts back in question.
 
 **A correlation that did not survive testing.** `FN64_RENDER_DUMP_DIR` looked
 implicated: the panic appeared in a run with it set and not in a 74-minute run
