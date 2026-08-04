@@ -811,9 +811,30 @@ So, in order:
 
 The defect is not a missing writer, a missing notification, or a filtered
 event -- each was eliminated by measurement, and this chain shows all three
-working. It is that **the consuming commit does not advance the baseline** for
-the bytes it just accepted, so the same change is discovered again by the
-following commit with nothing left to attribute it to.
+working.
+
+**Two different commits compete for the same event.** The panic backtrace
+names its caller:
+
+```
+recompiled_gap_panic
+CanonicalExecutableMutationStateV1::commit_snapshot
+CanonicalLiveBlockProgramV1::...
+process_live_executable_writes_from_host
+fn64_abi::pi::timing::advance_device_time
+fn64_abi::host::run_one_step
+```
+
+So the panicking commit runs from the **device-time advance**, while the drain
+observed at log line 12 belongs to
+`invalidate_pending_physical_writes_with` on the guest-execution path. Both
+`std::mem::take` the same `PENDING_ATTRIBUTED_EXECUTABLE_WRITES`. Whichever
+runs first consumes the declaration and advances its own baseline; the other
+then re-reads RDRAM, still sees the changed byte against ITS stale `expected`,
+and finds an empty event list.
+
+That makes it an ordering/ownership defect between two commit paths sharing
+one thread-local queue -- not a missing declaration anywhere.
 
 That also retires the earlier `EXECUTABLE_WRITE_RANGES`-vs-watched-set
 hypothesis: the observer demonstrably records the event, so the filter is not
