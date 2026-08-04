@@ -217,14 +217,6 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
         "unexpected MMIO proxy output: {}",
         String::from_utf8_lossy(&proxy_run.stdout)
     );
-    let bad_width = Command::new(&proxy_bin)
-        .arg("--bad-width")
-        .output()
-        .unwrap_or_else(|error| panic!("failed to execute {:?}: {error}", proxy_bin));
-    assert!(
-        !bad_width.status.success(),
-        "generated-C subword MMIO must trap loudly rather than bypass DeviceFabric"
-    );
     for argument in [
         "--bad-kuseg",
         "--bad-kseg2",
@@ -267,7 +259,7 @@ fn c_caller_links_and_runs_against_fn64_abi_staticlib() {
         );
         assert!(
             String::from_utf8_lossy(&bad_width.stderr)
-                .contains("RCP registers require modeled word semantics"),
+                .contains("RCP SysAD boundary models byte, halfword, and word transactions"),
             "generated-C {argument} trap lost its named width diagnostic: {}",
             String::from_utf8_lossy(&bad_width.stderr)
         );

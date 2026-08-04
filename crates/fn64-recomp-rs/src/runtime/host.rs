@@ -583,7 +583,7 @@ impl<'a> Rdram<'a> {
     /// is the sole device authority.
     #[inline]
     pub(super) fn direct_storage_offset(vaddr: u64) -> Option<usize> {
-        if Self::is_word_only_mmio(vaddr) {
+        if Self::is_rcp_mmio(vaddr) {
             return None;
         }
 
@@ -609,7 +609,7 @@ impl<'a> Rdram<'a> {
             return offset;
         }
         let physical = (vaddr as u32) & 0x1fff_ffff;
-        let reason = if Self::is_word_only_mmio(vaddr) {
+        let reason = if Self::is_rcp_mmio(vaddr) {
             "modeled word-only device access was not consumed by the installed hook"
         } else {
             "only zero- or sign-extended KSEG0/KSEG1 are modeled"
@@ -672,11 +672,14 @@ impl<'a> Rdram<'a> {
         }
     }
 
-    /// Generated-C's proxy exposes RCP registers and PIF RAM only as modeled
-    /// word accesses. Keep the typed lane on that identical boundary instead
-    /// of letting a subword operation fall through to sparse host storage.
+    /// Generated-C's proxy exposes RCP registers and PIF RAM through the
+    /// RCP's 32-bit SysAD word transaction. Subword CPU reads select the
+    /// addressed big-endian lane from that word; subword writes place their
+    /// value in that lane and drive zero on the other lanes. Keep the typed
+    /// lane on that identical boundary instead of falling through to sparse
+    /// host storage.
     #[inline]
-    fn is_word_only_mmio(vaddr: u64) -> bool {
+    fn is_rcp_mmio(vaddr: u64) -> bool {
         let upper = vaddr >> 32;
         let low = vaddr as u32;
         let canonical_32 = upper == 0 || upper == u32::MAX as u64;
@@ -690,13 +693,35 @@ impl<'a> Rdram<'a> {
     }
 
     #[inline]
-    fn reject_nonword_mmio(vaddr: u64, width: u32, is_write: bool) {
-        if Self::is_word_only_mmio(vaddr) {
+    fn reject_unsupported_mmio_width(vaddr: u64, width: u32, is_write: bool) {
+        if Self::is_rcp_mmio(vaddr) {
             let operation = if is_write { "write" } else { "read" };
             trap_unsupported(format!(
-                "Rdram: raw MMIO {operation} at {vaddr:#018x} used unsupported {width}-byte access; RCP/PIF registers require modeled word semantics"
+                "Rdram: raw MMIO {operation} at {vaddr:#018x} used unsupported {width}-byte access; the RCP SysAD boundary models byte, halfword, and word transactions"
             ));
         }
+    }
+
+    #[inline]
+    fn read_mmio_lane(vaddr: u64, width: u32) -> Option<u32> {
+        let word = Self::read_mmio_word(vaddr & !3)?;
+        let shift = match width {
+            1 => 24 - ((vaddr as u32 & 3) * 8),
+            2 => 16 - ((vaddr as u32 & 2) * 8),
+            _ => return None,
+        };
+        let mask = if width == 1 { 0xff } else { 0xffff };
+        Some((word >> shift) & mask)
+    }
+
+    #[inline]
+    fn write_mmio_lane(vaddr: u64, width: u32, value: u32) -> bool {
+        let shift = match width {
+            1 => 24 - ((vaddr as u32 & 3) * 8),
+            2 => 16 - ((vaddr as u32 & 2) * 8),
+            _ => return false,
+        };
+        Self::write_mmio_word(vaddr & !3, value << shift)
     }
 
     /// Effective virtual address of a `off(base)` operand: full-width MIPS III
@@ -729,8 +754,10 @@ impl<'a> Rdram<'a> {
     /// Load a sign-extended halfword (byte offset XOR 2).
     #[inline]
     pub fn load_h(&self, vaddr: u64) -> i16 {
-        Self::reject_nonword_mmio(vaddr, 2, false);
         assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
+        if let Some(value) = Self::read_mmio_lane(vaddr, 2) {
+            return value as i16;
+        }
         let p = Self::backing_offset(vaddr) ^ 2;
         i16::from_ne_bytes(self.mem[p..p + 2].try_into().unwrap())
     }
@@ -744,7 +771,9 @@ impl<'a> Rdram<'a> {
     /// Load a sign-extended byte (byte offset XOR 3).
     #[inline]
     pub fn load_b(&self, vaddr: u64) -> i8 {
-        Self::reject_nonword_mmio(vaddr, 1, false);
+        if let Some(value) = Self::read_mmio_lane(vaddr, 1) {
+            return value as i8;
+        }
         let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p] as i8
     }
@@ -752,7 +781,9 @@ impl<'a> Rdram<'a> {
     /// Load a zero-extended byte (byte offset XOR 3).
     #[inline]
     pub fn load_bu(&self, vaddr: u64) -> u8 {
-        Self::reject_nonword_mmio(vaddr, 1, false);
+        if let Some(value) = Self::read_mmio_lane(vaddr, 1) {
+            return value as u8;
+        }
         let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p]
     }
@@ -804,8 +835,10 @@ impl<'a> Rdram<'a> {
     /// Store the low halfword of `val` (byte offset XOR 2).
     #[inline]
     pub fn store_h(&mut self, vaddr: u64, val: u16) {
-        Self::reject_nonword_mmio(vaddr, 2, true);
         assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
+        if Self::write_mmio_lane(vaddr, 2, u32::from(val)) {
+            return;
+        }
         let p = Self::backing_offset(vaddr) ^ 2;
         self.mem[p..p + 2].copy_from_slice(&val.to_ne_bytes());
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
@@ -816,7 +849,9 @@ impl<'a> Rdram<'a> {
     /// Store the low byte of `val` (byte offset XOR 3).
     #[inline]
     pub fn store_b(&mut self, vaddr: u64, val: u8) {
-        Self::reject_nonword_mmio(vaddr, 1, true);
+        if Self::write_mmio_lane(vaddr, 1, u32::from(val)) {
+            return;
+        }
         let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p] = val;
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
@@ -859,9 +894,9 @@ impl<'a> Rdram<'a> {
     pub fn store_wl(&mut self, vaddr: u64, val: u32) {
         let word_addr = vaddr & !0x3;
         let misalign = (vaddr & 0x3) as u32;
-        if Self::is_word_only_mmio(word_addr) {
+        if Self::is_rcp_mmio(word_addr) {
             if misalign != 0 {
-                Self::reject_nonword_mmio(vaddr, 4 - misalign, true);
+                Self::reject_unsupported_mmio_width(vaddr, 4 - misalign, true);
             }
             self.store_w(word_addr, val);
             return;
@@ -877,9 +912,9 @@ impl<'a> Rdram<'a> {
     pub fn store_wr(&mut self, vaddr: u64, val: u32) {
         let word_addr = vaddr & !0x3;
         let misalign = (vaddr & 0x3) as u32;
-        if Self::is_word_only_mmio(word_addr) {
+        if Self::is_rcp_mmio(word_addr) {
             if misalign != 3 {
-                Self::reject_nonword_mmio(vaddr, misalign + 1, true);
+                Self::reject_unsupported_mmio_width(vaddr, misalign + 1, true);
             }
             self.store_w(word_addr, val);
             return;
@@ -903,7 +938,7 @@ impl<'a> Rdram<'a> {
     /// at `vaddr+0` and `lo_word` at `vaddr+4`.
     #[inline]
     pub fn load_d(&self, vaddr: u64) -> u64 {
-        Self::reject_nonword_mmio(vaddr, 8, false);
+        Self::reject_unsupported_mmio_width(vaddr, 8, false);
         assert_eq!(vaddr & 7, 0, "unaligned LD at {vaddr:#018x}");
         let hi = self.load_w(vaddr) as u32 as u64;
         let lo = self.load_w(vaddr.wrapping_add(4)) as u32 as u64;
@@ -914,7 +949,7 @@ impl<'a> Rdram<'a> {
     /// `vaddr+4`, followed by one post-commit eight-byte write range.
     #[inline]
     pub fn store_d(&mut self, vaddr: u64, val: u64) {
-        Self::reject_nonword_mmio(vaddr, 8, true);
+        Self::reject_unsupported_mmio_width(vaddr, 8, true);
         assert_eq!(vaddr & 7, 0, "unaligned SD at {vaddr:#018x}");
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
             let high = Self::backing_offset(vaddr);
@@ -1097,6 +1132,10 @@ impl<'a> Rdram<'a> {
     /// Checked LH (aligned, sign-extended halfword).
     #[inline]
     pub fn try_load_h(&self, vaddr: u64) -> Result<i16, u64> {
+        assert_eq!(vaddr & 1, 0, "unaligned LH at {vaddr:#018x}");
+        if let Some(value) = Self::read_mmio_lane(vaddr, 2) {
+            return Ok(value as i16);
+        }
         if self.virtual_range_backed(vaddr, 2, 2) {
             Ok(self.load_h(vaddr))
         } else {
@@ -1139,6 +1178,9 @@ impl<'a> Rdram<'a> {
     /// Checked LB (sign-extended byte).
     #[inline]
     pub fn try_load_b(&self, vaddr: u64) -> Result<i8, u64> {
+        if let Some(value) = Self::read_mmio_lane(vaddr, 1) {
+            return Ok(value as i8);
+        }
         if self.virtual_range_backed(vaddr, 3, 1) {
             Ok(self.load_b(vaddr))
         } else {
@@ -1162,6 +1204,9 @@ impl<'a> Rdram<'a> {
     /// Checked LBU (zero-extended byte).
     #[inline]
     pub fn try_load_bu(&self, vaddr: u64) -> Result<u8, u64> {
+        if let Some(value) = Self::read_mmio_lane(vaddr, 1) {
+            return Ok(value as u8);
+        }
         if self.virtual_range_backed(vaddr, 3, 1) {
             Ok(self.load_bu(vaddr))
         } else {
@@ -1330,6 +1375,10 @@ impl<'a> Rdram<'a> {
     /// Checked SH.
     #[inline]
     pub fn try_store_h(&mut self, vaddr: u64, val: u16) -> Result<(), u64> {
+        assert_eq!(vaddr & 1, 0, "unaligned SH at {vaddr:#018x}");
+        if Self::write_mmio_lane(vaddr, 2, u32::from(val)) {
+            return Ok(());
+        }
         if self.virtual_range_backed(vaddr, 2, 2) {
             self.store_h(vaddr, val);
             Ok(())
@@ -1352,6 +1401,9 @@ impl<'a> Rdram<'a> {
     /// Checked SB.
     #[inline]
     pub fn try_store_b(&mut self, vaddr: u64, val: u8) -> Result<(), u64> {
+        if Self::write_mmio_lane(vaddr, 1, u32::from(val)) {
+            return Ok(());
+        }
         if self.virtual_range_backed(vaddr, 3, 1) {
             self.store_b(vaddr, val);
             Ok(())

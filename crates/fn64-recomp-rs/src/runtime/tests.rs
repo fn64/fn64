@@ -21,6 +21,9 @@
             std::cell::RefCell::new(Vec::new())
         };
         static MMIO_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static MMIO_WRITES: std::cell::RefCell<Vec<(u64, u32)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
         static UNSUPPORTED_CONTEXTS: std::cell::RefCell<Vec<String>> = const {
             std::cell::RefCell::new(Vec::new())
         };
@@ -34,14 +37,20 @@
         OBSERVED_READS.with(|reads| reads.borrow_mut().push(event));
     }
 
-    fn consume_mmio(_vaddr: u64, _value: u32) -> bool {
+    fn consume_mmio(vaddr: u64, value: u32) -> bool {
         MMIO_CALLS.with(|calls| calls.set(calls.get() + 1));
+        MMIO_WRITES.with(|writes| writes.borrow_mut().push((vaddr, value)));
         true
     }
 
     fn read_mmio(_vaddr: u64) -> Option<u32> {
         MMIO_CALLS.with(|calls| calls.set(calls.get() + 1));
         Some(0)
+    }
+
+    fn read_pattern_mmio(_vaddr: u64) -> Option<u32> {
+        MMIO_CALLS.with(|calls| calls.set(calls.get() + 1));
+        Some(0x81a2_c3e4)
     }
 
     fn observe_unsupported(context: &str) {
@@ -1110,23 +1119,52 @@
     }
 
     #[test]
-    fn nonword_rcp_and_pif_accesses_trap_before_any_side_effect() {
+    fn subword_rcp_and_pif_accesses_use_big_endian_sysad_lanes() {
+        MMIO_CALLS.with(|calls| calls.set(0));
+        MMIO_WRITES.with(|writes| writes.borrow_mut().clear());
+        let previous_mmio = super::set_mmio_hooks(Some(read_pattern_mmio), Some(consume_mmio));
+        let mut bytes = [0u8; 4];
+        let mut mem = Rdram::new(&mut bytes);
+        const RCP: u64 = 0xffff_ffff_a440_0000;
+        const PIF: u64 = 0xffff_ffff_bfc0_07c0;
+
+        assert_eq!(mem.load_b(RCP), -127);
+        assert_eq!(mem.load_bu(RCP + 1), 0xa2);
+        assert_eq!(mem.load_h(RCP), -32350);
+        assert_eq!(mem.load_hu(RCP + 2), 0xc3e4);
+        assert_eq!(mem.try_load_bu(PIF + 3), Ok(0xe4));
+        assert_eq!(mem.try_load_hu(PIF + 2), Ok(0xc3e4));
+
+        mem.store_b(RCP, 0x12);
+        mem.store_b(RCP + 3, 0x34);
+        mem.store_h(RCP, 0x5678);
+        assert_eq!(mem.try_store_h(RCP + 2, 0x9abc), Ok(()));
+        assert_eq!(mem.try_store_b(PIF + 1, 0xde), Ok(()));
+        assert_eq!(
+            MMIO_WRITES.with(|writes| writes.borrow().clone()),
+            vec![
+                (RCP, 0x1200_0000),
+                (RCP, 0x0000_0034),
+                (RCP, 0x5678_0000),
+                (RCP, 0x0000_9abc),
+                (PIF, 0x00de_0000),
+            ]
+        );
+        assert_eq!(mem.as_mut_slice(), [0; 4]);
+        super::set_mmio_hooks(previous_mmio.0, previous_mmio.1);
+    }
+
+    #[test]
+    fn unsupported_wide_and_partial_word_mmio_accesses_trap_before_any_side_effect() {
         OBSERVED_WRITES.with(|writes| writes.borrow_mut().clear());
         MMIO_CALLS.with(|calls| calls.set(0));
+        MMIO_WRITES.with(|writes| writes.borrow_mut().clear());
         let previous_observer = super::set_write_observer(Some(observe_write));
         let previous_mmio = super::set_mmio_hooks(Some(read_mmio), Some(consume_mmio));
         let mut bytes = [0u8; 4];
         let mut mem = Rdram::new(&mut bytes);
 
-        let operations: [RdramOperation; 8] = [
-            |mem| {
-                let _ = mem.load_h(0xffff_ffff_a400_0000);
-            },
-            |mem| {
-                let _ = mem.load_b(0xffff_ffff_9fc0_07c0);
-            },
-            |mem| mem.store_h(0xffff_ffff_a440_0000, 1),
-            |mem| mem.store_b(0xffff_ffff_bfc0_07c0, 1),
+        let operations: [RdramOperation; 4] = [
             |mem| {
                 let _ = mem.load_d(0xffff_ffff_a400_0000);
             },
@@ -1142,6 +1180,7 @@
         }
 
         assert_eq!(MMIO_CALLS.with(std::cell::Cell::get), 0);
+        assert!(MMIO_WRITES.with(|writes| writes.borrow().is_empty()));
         assert!(OBSERVED_WRITES.with(|writes| writes.borrow().is_empty()));
         assert_eq!(mem.as_mut_slice(), [0; 4]);
 
