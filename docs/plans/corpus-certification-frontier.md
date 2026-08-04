@@ -338,7 +338,48 @@ remains unprovable is bss beyond the union, which a load-only descriptor by
 definition does not record -- which is why recipes stay preferred wherever a
 ROM supplies them.
 
-### Batman still does not certify: a discovery-layer disagreement
+### Batman of the Future certifies: unsupported=0
+
+**Resolved.** The disagreement below was real, and the loaded image settled
+it. Each of Batman's overlays opens with a 0x40-byte header -- magic `"MWo2"`,
+an index, the load address `0x8022f280`, and a payload length matching its
+descriptor's ROM interval exactly -- followed by an ASCII name
+("SuitSelect", "StageName", "Option", "DemoPic"). Four independent
+confirmations that delta_vote's word 3 was right and the search's word 7 was
+the header offset past it. `declared_image_load_address` lets that header
+override the descriptor field, and the 4 overlay banks composed.
+
+That left one destination, `0x80281b0c`, which appears **nowhere** in the ROM
+-- not as a constant, a `j`/`jal` target, or a data word. It is computed at
+run time, and it falls inside the declared allocation extent
+`[0x80275890,0x8028e2a0)` of a descriptor record the search had dropped.
+
+The record was dropped for one reason: its ROM interval spans 0xd60 bytes,
+under the 0x1000 `min_region_len` floor. Every other clause in `record_valid`
+is a hard fact about the bytes; that floor is a heuristic. All six raw records
+carry the `MWo2` header with a matching declared length, so the dropped record
+was a real overlay rejected by a size guess. The floor -- and only the floor --
+is now waived for an image that declares its own length and agrees with the
+descriptor about it.
+
+Seven records recovered where four were admitted. One stays Open (delta_vote
+never resolved it) and is never composed, so recipes for uncomposed records
+are filtered before the gate's bank-count check; every surviving recipe still
+pairs with a bank by exact ROM interval.
+
+**Result: `HEADLINE unsupported=0`, empty punch list, 7 composed banks** --
+the first non-AKI corpus ROM with recovered overlays to certify.
+
+### The header mechanism is one family's, not a general one
+
+Surveyed all 287 corpus ROMs for a repeated ASCII magic followed by a KSEG0
+address and a plausible length. Only **3** ROMs show the shape at all (Batman,
+Daikatana, Ridge Racer 64), each with a single magic. `MWo2` is Batman's own
+marker, so `declared_image_load_address` stays deliberately narrow -- one
+verified constant, not a family of guesses. Generalizing it would be inventing
+a convention the corpus does not have.
+
+### The original diagnosis, kept for the record
 
 With the lane wired, Batman advances past the recipe stage and fails later:
 
