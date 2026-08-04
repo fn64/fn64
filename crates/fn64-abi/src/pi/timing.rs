@@ -42,6 +42,44 @@ pub(crate) fn cartridge_rom_window_offset(vaddr: u64) -> Option<u32> {
     .then(|| physical - 0x1000_0000)
 }
 
+/// Name an access to PI domain-1 address 1 instead of letting it fall through
+/// as an anonymous unbacked-memory fault.
+///
+/// `epi_domain_for_address` accepts `PI_DOM1_ADDR1` (0x0600_0000..=0x07ff_ffff,
+/// the N64DD window) for `osPiHandle` operations, but
+/// `cartridge_rom_window_offset` accepts only `PI_DOM1_ADDR2`, the cartridge
+/// ROM. So a direct CPU read there matched no window, was not backed RDRAM,
+/// and surfaced as `MemoryFault { addr: 0xffffffffa6000000 }` -- a message
+/// that says nothing about which device is missing.
+///
+/// WM2000 hits this: it configures the BSD domain-1 registers at
+/// 0xA4600018/0x20 and then probes the device at 0x8002_2620.
+///
+/// This deliberately traps rather than returning a value. Real hardware
+/// returns open-bus for an absent device, but the exact value is a
+/// MEASUREMENT question, and inventing one would fabricate hardware behaviour
+/// -- the same reason the U5 frontier leaves device timing open rather than
+/// guessing. Naming the device costs nothing and turns an anonymous fault into
+/// an actionable one.
+fn trap_absent_pi_domain1_device(vaddr: u64) {
+    let low = vaddr as u32;
+    let physical = low & 0x1FFF_FFFF;
+    if !crate::pi::mmio::PI_DOM1_ADDR1.contains(&physical) {
+        return;
+    }
+    let message = format!(
+        "CPU read of PI domain-1 address 1 at {vaddr:#018x} (physical          {physical:#010x}): this window is the N64DD, which no cartridge-only          ROM provides. Reads here have no modelled device; open-bus behaviour          is unmeasured and is not invented here."
+    );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.pi.absent-domain1-device",
+        &message,
+        Some(with_host(|host| host.device_fabric.now())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{message}");
+}
+
 pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
     if crate::boot_probe_enabled() {
         let low = vaddr as u32;
@@ -74,6 +112,7 @@ pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
     if let Some(value) = read_live_rcp_interrupt_mmio(vaddr) {
         return Some(value);
     }
+    trap_absent_pi_domain1_device(vaddr);
     let offset = RdramAddr::from_gpr(vaddr).offset();
     fn64_runtime::is_mmio_offset(offset).then(|| {
         crate::ai::MMIO.with(|cell| {
