@@ -787,6 +787,38 @@ The trap is the technique worth keeping: the guard reports the byte, so
 trapping the store of that exact byte turns "which writer?" from a
 multi-hour elimination tournament into one run.
 
+## The full causal chain, and why the byte is re-detected
+
+Traced end to end with three targeted probes rather than more elimination.
+Log line numbers from one run tell the whole story:
+
+```
+11  FN64DIAG observer saw 0x9b0b0 len=4 channel=CpuInstructionStore
+12  FN64DIAG drained target event, count=1
+14  panicked ... [0x0009b0b3,0x0009b0b4) ... events=0 declarations=0
+```
+
+So, in order:
+
+1. generated boot-shard code executes a guest CPU store that zeroes the
+   instruction word at `0x8009b0b0` (stack trace: `runner_00::run_00` ->
+   `try_store_w_translated` -> `store_backed_word`);
+2. `notify_cpu_instruction_store` fires and the observer records it as an
+   attributed executable write -- **the declaration exists**;
+3. one commit boundary drains it (`std::mem::take`, `count=1`) and succeeds;
+4. the NEXT commit re-detects the same changed byte, finds the list empty,
+   and panics with `events=0`.
+
+The defect is not a missing writer, a missing notification, or a filtered
+event -- each was eliminated by measurement, and this chain shows all three
+working. It is that **the consuming commit does not advance the baseline** for
+the bytes it just accepted, so the same change is discovered again by the
+following commit with nothing left to attribute it to.
+
+That also retires the earlier `EXECUTABLE_WRITE_RANGES`-vs-watched-set
+hypothesis: the observer demonstrably records the event, so the filter is not
+what loses it.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
