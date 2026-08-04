@@ -234,18 +234,60 @@ impl CandidateTable {
 }
 
 /// Per-record predicate: in-bounds, ordered, code-sized, plausible RDRAM
-/// destination. Pure; no promotion.
-fn record_valid(rec: &CandidateRecord, rom_len: u32, config: &SearchConfig) -> bool {
-    rec.rom_start >= config.min_rom_offset
+/// destination.
+///
+/// `min_region_len` is a heuristic -- a floor on how small a thing may be and
+/// still be worth calling an overlay -- while every other clause here is a
+/// hard fact about the bytes. So an image that proves it is a real overlay,
+/// by carrying a header whose declared length matches this record's own ROM
+/// interval, is exempt from the floor and nothing else.
+///
+/// Batman of the Future is why. Its descriptor array holds six records that
+/// all carry the `MWo2` header, but rec1 spans 0xd60 bytes -- under the
+/// 0x1000 floor -- so the search dropped it, and the destination
+/// `0x80281b0c` inside its declared allocation had nowhere to land. That was
+/// the ROM's last `unsupported` destination.
+fn record_valid(
+    rec: &CandidateRecord,
+    rom_len: u32,
+    config: &SearchConfig,
+    rom_bytes: &[u8],
+) -> bool {
+    let structurally_valid = rec.rom_start >= config.min_rom_offset
         && rec.rom_end > rec.rom_start
         && rec.rom_end <= rom_len
         && rec.rom_start.is_multiple_of(4)
         && rec.rom_end.is_multiple_of(4)
-        && rec.byte_len() >= config.min_region_len
         && rec.byte_len() <= config.max_region_len
         && rec.vram_dest >= config.vram_lo
         && rec.vram_dest < config.vram_hi
-        && rec.vram_dest.is_multiple_of(4)
+        && rec.vram_dest.is_multiple_of(4);
+    structurally_valid
+        && (rec.byte_len() >= config.min_region_len
+            || image_declares_its_own_length(rom_bytes, rec.rom_start, rec.byte_len()))
+}
+
+/// Whether the image at `rom_start` opens with a header declaring exactly
+/// `byte_len` bytes of payload.
+///
+/// This is the same `"MWo2"` header `banks::declared_image_load_address`
+/// verifies, checked here for one thing only: that the image agrees with the
+/// descriptor about its own size. An image that names its length is not a
+/// coincidence of plausible-looking words, so a record it agrees with is real
+/// however small it is.
+///
+/// Kept deliberately narrow -- it can only ever *admit* a record the size
+/// floor would have dropped, never reject one, so a false negative costs
+/// nothing and a false positive must be made hard.
+fn image_declares_its_own_length(rom_bytes: &[u8], rom_start: u32, byte_len: u32) -> bool {
+    const IMAGE_HEADER_MAGIC: u32 = 0x4d57_6f32;
+    let word = |index: u32| -> Option<u32> {
+        let offset = rom_start.checked_add(index * 4)? as usize;
+        rom_bytes
+            .get(offset..offset + 4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+    };
+    word(0) == Some(IMAGE_HEADER_MAGIC) && word(3) == Some(byte_len)
 }
 
 fn normalize_record_destination(
@@ -306,7 +348,7 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
             ]
             .into_iter()
             .filter_map(|semantics| normalize_record_destination(raw, semantics))
-            .any(|record| record_valid(&record, rom_len, config))
+            .any(|record| record_valid(&record, rom_len, config, rom_bytes))
             .then_some(offset as u32)
         })
         .collect::<Vec<_>>();
@@ -319,7 +361,7 @@ pub fn enumerate_family_tables(rom_bytes: &[u8], config: &SearchConfig) -> Vec<C
                 vram_dest: read_u32_be(rom_bytes, offset + 8)?,
             };
             let record = normalize_record_destination(raw, semantics)?;
-            record_valid(&record, rom_len, config).then_some(record)
+            record_valid(&record, rom_len, config, rom_bytes).then_some(record)
         };
 
     for &stride in &config.strides {

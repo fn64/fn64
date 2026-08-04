@@ -250,7 +250,7 @@
                             normalize_record_destination(raw, destination_field)
                         };
                         let first = read_rec(offset);
-                        if !first.is_some_and(|record| record_valid(&record, rom_len, config)) {
+                        if !first.is_some_and(|record| record_valid(&record, rom_len, config, rom_bytes)) {
                             offset += 4;
                             continue;
                         }
@@ -258,7 +258,7 @@
                         let mut base = offset;
                         while base <= rom_len.saturating_sub(stride) {
                             match read_rec(base) {
-                                Some(record) if record_valid(&record, rom_len, config) => {
+                                Some(record) if record_valid(&record, rom_len, config, rom_bytes) => {
                                     records.push(record);
                                     base += stride;
                                 }
@@ -1041,6 +1041,65 @@
             kept.iter().any(|t| t.record_stride == nested.record_stride),
             "subset alone must not drop a table whose stride is not a multiple"
         );
+    }
+
+    /// A record under `min_region_len` is normally dropped -- the floor is a
+    /// heuristic about what is worth calling an overlay. But an image that
+    /// declares its own length, and agrees with the descriptor about it, has
+    /// proven it is a real overlay however small.
+    ///
+    /// Batman of the Future is why this matters: its rec1 spans 0xd60 bytes,
+    /// under the 0x1000 floor, and the destination 0x80281b0c inside that
+    /// record's declared allocation was the ROM's last unsupported
+    /// destination.
+    #[test]
+    fn an_image_declaring_its_own_length_survives_the_size_floor() {
+        let config = SearchConfig::aki_family();
+        let short = config.min_region_len - 0x800;
+        let rom_start = 0x4000u32;
+        let mut rom = vec![0u8; 0x8000];
+        // "MWo2", index, load address, declared length.
+        rom[rom_start as usize..rom_start as usize + 4].copy_from_slice(&0x4d57_6f32u32.to_be_bytes());
+        rom[rom_start as usize + 12..rom_start as usize + 16]
+            .copy_from_slice(&short.to_be_bytes());
+        let record = CandidateRecord {
+            rom_start,
+            rom_end: rom_start + short,
+            vram_dest: 0x8010_0000,
+        };
+
+        assert!(
+            record_valid(&record, rom.len() as u32, &config, &rom),
+            "a header-declared length proves the record is real"
+        );
+
+        // Same record, no header: the floor applies as before.
+        let bare = vec![0u8; 0x8000];
+        assert!(
+            !record_valid(&record, bare.len() as u32, &config, &bare),
+            "without that proof the size floor must still reject it"
+        );
+    }
+
+    /// The waiver is only ever a licence to admit, never to reject: a header
+    /// that disagrees with the descriptor about the length proves nothing.
+    #[test]
+    fn a_header_length_disagreeing_with_the_record_waives_nothing() {
+        let config = SearchConfig::aki_family();
+        let short = config.min_region_len - 0x800;
+        let rom_start = 0x4000u32;
+        let mut rom = vec![0u8; 0x8000];
+        rom[rom_start as usize..rom_start as usize + 4].copy_from_slice(&0x4d57_6f32u32.to_be_bytes());
+        // Declares a different length than the record spans.
+        rom[rom_start as usize + 12..rom_start as usize + 16]
+            .copy_from_slice(&(short + 4).to_be_bytes());
+        let record = CandidateRecord {
+            rom_start,
+            rom_end: rom_start + short,
+            vram_dest: 0x8010_0000,
+        };
+
+        assert!(!record_valid(&record, rom.len() as u32, &config, &rom));
     }
 
     /// Starting a coarse walk one record early reads neighbouring words as
