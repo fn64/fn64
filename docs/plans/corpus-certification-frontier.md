@@ -900,10 +900,22 @@ out-of-range pointer fault the batch runner hits at ~28 minutes -- notably the
 shell does NOT panic there, so the two lanes diverge in behaviour as well as
 in structure.
 
-The shell's pump drains to the next device event rather than bounding its
-step budget, which is the mechanism to look at: if WM2000's boot is waiting on
-a device event the pump itself is responsible for advancing, that is a
-deadlock rather than slowness, and no amount of run time resolves it.
+**Cause and fix.** `STEPS_PER_PUMP` (200k) bounds a STEADY-STATE frame -- a
+guest that has not yielded in 200k scheduling steps is spinning. Boot is not
+steady state: WM2000's certified batch route needs ~420k steps to reach its
+menus, all before the first VI field, so frame 0 simply could not finish
+inside the bound. Boot now gets `BOOT_STEPS_PER_PUMP` (4M), selected on
+`vi_swap_count() == 0`, with every later frame keeping the 200k bound
+unchanged (`af6b5b9`).
+
+**The two lanes have now converged.** With that fix the shell runs ~28 minutes
+and stops at *exactly* the batch runner's failure -- same guard
+(`execution.rs:838`), same PC (`0x80022620`), same `MemoryFault` at
+`0xffffffffa6000000`. It no longer diverges in behaviour, and a single
+remaining defect gates both lanes.
+
+Still true: no frame has been presented, because that fault precedes the first
+VI field.
 
 Worth stating plainly because it corrects an earlier inference: the missing
 first frame was attributed to WM2000's inherent debug-build cost, on the
