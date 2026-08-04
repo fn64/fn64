@@ -378,6 +378,20 @@ pub(crate) fn print_runtime_progress() {
         host.audio_task_execution,
         fn64_abi::last_render_error(),
     );
+    // Audio submissions count TASKS. These count SIGNAL: a regression to
+    // silence leaves audio_submits untouched while nonzero_samples goes to
+    // zero, which is the whole reason the block lane installs a PCM backend
+    // instead of registering only the RDRAM bound.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        println!(
+            "[wm2000-block-audio] buffers={} samples={} nonzero_samples={} peak_abs={}",
+            crate::AUDIO_BUFFERS.load(Relaxed),
+            crate::AUDIO_SAMPLES.load(Relaxed),
+            crate::AUDIO_NONZERO_SAMPLES.load(Relaxed),
+            crate::AUDIO_PEAK_ABS.load(Relaxed),
+        );
+    }
     let timing = fn64_abi::phase_timing();
     if timing.executor_calls > 0 {
         println!(
