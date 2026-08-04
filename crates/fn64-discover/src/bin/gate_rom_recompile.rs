@@ -497,6 +497,24 @@ fn compose_catalog_bound_overlay_snapshots(
         .iter()
         .filter(|bank| bank.bank != BOOT_BANK)
         .collect();
+    // A descriptor record can be admitted by the overlay search and still not
+    // become a proven bank: `scan_recovered_overlay_regions` leaves a record
+    // Open when delta_vote never resolved it, and an Open bank is not
+    // composed. Batman of the Future has exactly one such record among seven.
+    //
+    // Those recipes describe overlays this composition does not contain, so
+    // they are dropped rather than counted. Dropping is safe in the direction
+    // that matters -- every remaining recipe still has to pair with a bank by
+    // exact ROM interval below, so a recipe cannot silently stand in for a
+    // different overlay. The reverse (a bank with no recipe) stays fatal.
+    let composed_intervals: BTreeSet<(u32, u32)> = overlay_banks
+        .iter()
+        .map(|bank| (bank.rom_start, bank.rom_end))
+        .collect();
+    let recipes: Vec<OverlayLoadRecipeV1> = recipes
+        .into_iter()
+        .filter(|recipe| composed_intervals.contains(&(recipe.rom_start, recipe.rom_end)))
+        .collect();
     if overlay_banks.len() != recipes.len() {
         return Err(format!(
             "recovered {} overlay bank(s) but {} admitted load recipe(s)",
