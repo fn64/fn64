@@ -1042,6 +1042,53 @@ That also means the trap added for it is doing its job: it converted an
 anonymous `MemoryFault` into a named, registered `LoudTrap` that says which
 device is missing and why no value is invented.
 
+## What the guest does with the domain-1 word: it parses fields, not presence
+
+Measured two things before choosing any return value.
+
+**1. What mupen64plus returns.** Paused at exactly `pc=0x80022620`, after the
+guest's BSD domain-1 writes landed:
+
+| address | value |
+|---|---|
+| `0xA6000000` | `0x00000000` |
+| `0xA6000004` | `0x00040004` |
+| `0xA6001234` | `0x12341234` |
+| `0xA7FFFF00` | `0xFF00FF00` |
+
+i.e. `(addr & 0xFFFF) | ((addr & 0xFFFF) << 16)`. This is deliberate modelling,
+not unmapped-read fall-through: `device.c:156` maps the DD ROM window to
+`RW(open_bus)` and `:166` replaces it with the real handler only when
+`dd_rom_size > 0`. The doubled 16-bit pattern is the known N64 open-bus effect
+(the PI bus is 16 bits, so the last address phase is read back twice).
+
+Note `0x06000000` *physical* returned `0xFFFFFFFF`, which is **not** data --
+that is `M64P_MEM_INVALID`, the debugger reporting a failed read.
+
+**2. What WM2000 does with it** -- which is the part that decides the design:
+
+```
+0x80022620:  lw    r2, 0(r15)
+0x80022624:  srl   r25, r2, 16      ; bits 16-19
+0x8002262c:  andi  r12, r25, 0xf    ; -> sb  +6
+0x80022628:  srl   r13, r2, 20      ; bits 20-23
+0x80022630:  andi  r14, r13, 0xf    ; -> sb  +7
+0x80022634:  srl   r24, r2, 8       ; byte  -> sb  +8
+                                    ; low byte -> sb  +5
+```
+
+It decomposes the word into nibble and byte fields and stores them into a
+struct. **This is device-ID parsing, not a presence test.** The hoped-for
+collapse -- where zero, open-bus and trap all behave identically because the
+guest only branches on non-zero -- does not happen here. The value is consumed
+as data, so returning a fabricated one would feed invented hardware identity
+into guest state rather than merely unblocking a branch.
+
+That strengthens the case for the trap standing as-is: the honest options are
+a measured value corroborated across implementations, or a loud stop. A
+plausible-looking guess is the one option ruled out by what the guest actually
+does with it.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
