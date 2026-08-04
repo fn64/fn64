@@ -621,9 +621,25 @@ What survives from the investigation, all measured rather than argued:
   run that still panicked);
 * the tracker's narrow branch was a real defect, now fixed, but not THIS one.
 
-The next honest step is to instrument `RdramViewMut`'s own write paths -- the
-type the earlier probes missed -- rather than reason further about which
-caller it might be. Probes on that type are already staged.
+`RdramViewMut` is eliminated too. All four of its write paths (`write_u32`,
+`write_u16`, `write_u8`, `write_logical_bytes`) were instrumented; a run that
+panicked with the same byte recorded exactly **two** hits, both
+`publish_rom_slice start=0x400 len=1048576` -- the 1 MiB IPL3 boot copy, which
+covers the byte trivially, happens at boot, and records its own
+`BootstrapPublicationEvidenceV1`.
+
+So the byte changes without passing through ANY instrumented write path:
+not `DmaMemory`, not `RdramPtr::write_u8`, not `RdramViewMut`. The remaining
+possibilities are writes through a raw pointer or slice that never touch these
+types at all -- for example generated AOT code writing its own `&mut [u8]`, or
+a `copy_from_slice` on a raw storage slice obtained elsewhere.
+
+**Assessment after six eliminations:** this is a deep, genuinely hard defect in
+a subsystem that had never executed before 2026-08-04. It is the only UNKNOWN
+on the gameplay path, but it is not the only blocker, and it is not the one
+with a playable match immediately behind it. Blocker B (the certified lane and
+the playable lane being different programs) is known engineering with a known
+shape. Continuing to spend exclusively on A is a worse bet than starting B.
 
 ## Honest scope
 
