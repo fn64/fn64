@@ -757,6 +757,36 @@ Two corrections that came out of that run:
 So the remaining gameplay work is gated on one defect rather than several,
 and the reproduction is now cheap enough to bisect.
 
+## The silent writer, identified: a guest CPU store
+
+Trapping directly on physical `0x9b0b3` in `store_backed_word` -- rather than
+waiting for the commit boundary to notice the byte -- named it in one run:
+
+```
+FN64DIAG store_backed_word vaddr=0xffffffff8009b0b0 phys=0x9b0b0 value=0x00000000
+  fn64_recomp_rs::runtime::host::Rdram::store_backed_word
+  fn64_recomp_rs::runtime::host::Rdram::try_store_w_translated
+  fn64_recomp_rs::execution::program::BlockProgram::run
+  fn64_abi::recompiled::runners::run_catalog_block_program
+```
+
+It is a **guest CPU store from recompiled block code**, through the
+*translated* address path, writing `0x00000000` over the instruction word at
+`0x8009b0b0`. The guest is zeroing that word, which is why only the low byte
+differed from the expected image and why a byte-granular hypothesis looked
+plausible for so long.
+
+Not a device, not the renderer, not DMA -- every one of which was eliminated
+by measurement first. And `store_backed_word` DOES call
+`notify_cpu_instruction_store`, so the declaration is produced; it simply is
+not present in `events` at the commit boundary that panics. That narrows the
+remaining defect to the window between notification and commit, rather than to
+any writer.
+
+The trap is the technique worth keeping: the guard reports the byte, so
+trapping the store of that exact byte turns "which writer?" from a
+multi-hour elimination tournament into one run.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
