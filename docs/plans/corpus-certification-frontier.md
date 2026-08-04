@@ -668,6 +668,39 @@ That is bounded, known-shape engineering, unlike Blocker A, which after six
 measured eliminations remains an unidentified writer in a subsystem that had
 never executed before 2026-08-04.
 
+## Why every WM2000 run is slow: a per-step 1 MiB byte-loop
+
+The route was assumed to cost ~48 minutes of emulation. Measured, it is worse
+and the cause is not what it looked like:
+
+* a 5,000-step run takes **138 seconds** -- about 36 steps/second, so the
+  420,000-step route is ~3.2 hours;
+* `FN64_PHASE_TIMING` attributes essentially all of it to one place:
+  `executor_ms=64903.965 calls=3000 gfx_ms=0.000 audio_ms=0.000`.
+
+That is **21.6 ms per executor step**, with graphics and audio at exactly
+zero. A per-step cost, not a per-instruction one -- which is why raising
+`opt-level` on the interpreter crates changed nothing measurable.
+
+The source is the executable-mutation guard. `read_snapshot`
+(`recompiled/live_program.rs:238`) allocates a fresh `Vec<Vec<u8>>` and reads
+its entire watched region **a byte at a time** through `read_u8`, each with a
+bounds check and a lane XOR, at every dispatch boundary. WM2000's watched
+region is the 1 MiB boot bank, so that is roughly a million checked reads plus
+a 1 MiB allocation per step.
+
+Two consequences worth stating:
+
+* it explains the windowed lane reaching no first frame in 3+ minutes -- the
+  batch runner sits at the identical point for the same duration, so this is
+  the shared cost, not a shell defect;
+* an aligned `u32` read is both correct and ~4x cheaper here (`read_u32` uses
+  lane_xor 0 while `read_u8` uses 3), and the snapshot could be diffed
+  incrementally rather than rebuilt, so this is fixable rather than inherent.
+
+It sits in the same subsystem as the undeclared-mutation defect, and neither
+had ever executed before 2026-08-04.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
