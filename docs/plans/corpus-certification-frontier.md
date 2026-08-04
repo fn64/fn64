@@ -596,6 +596,35 @@ The panic message now carries the declaring channels, their declared ranges,
 and every changed range, so the next occurrence names the writer without
 another instrumentation round.
 
+## The tracker fix was necessary but not sufficient
+
+`track_catalog_nested_mutation` genuinely watched the wrong set, and that is
+fixed (`snapshots.rs`, commit f59c9ae). Re-running the route afterwards:
+
+* the panic moved from ~38 minutes to ~48 minutes, so behavior changed;
+* but it is the SAME failure -- `[0x0009b0b3,0x0009b0b4)`, `declared={}`,
+  `events=0 declarations=0`.
+
+So the write does not travel through the renderer mutation bracket at all, and
+the `G_DMA_IO` hypothesis is not established. Worse, the aborting run never
+printed its progress line, so there is no evidence a graphics task executed on
+that run -- the renderer path may be entirely irrelevant to this byte.
+
+What survives from the investigation, all measured rather than argued:
+
+* the byte is genuine self-modifying code (a runtime-patched store immediate
+  at `0x8009b0b0`);
+* the guard is correct (200k randomized differential cases, zero mismatches);
+* clipping and partial-declaration causes are excluded by `events=0`;
+* the non-notifying `DmaMemory` impls are excluded (instrumented, zero hits);
+* byte-granular writes are excluded (instrumented `write_u8`, zero hits on a
+  run that still panicked);
+* the tracker's narrow branch was a real defect, now fixed, but not THIS one.
+
+The next honest step is to instrument `RdramViewMut`'s own write paths -- the
+type the earlier probes missed -- rather than reason further about which
+caller it might be. Probes on that type are already staged.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
