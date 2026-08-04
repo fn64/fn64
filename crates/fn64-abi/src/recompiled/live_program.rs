@@ -394,8 +394,37 @@ impl CanonicalExecutableMutationStateV1 {
         if let Some((physical_start, physical_end)) =
             Self::first_uncovered_changed_range(&declarations, &changed)
         {
+            // Name the writers that DID declare, and every range that changed.
+            //
+            // Without this the message says only that some byte was
+            // undeclared, which is the one fact that does not narrow anything:
+            // the whole question is which writer under-declared, and answering
+            // it previously meant re-instrumenting and re-running a
+            // multi-hour route. The channels and ranges are already in hand
+            // here, so carrying them costs nothing on the failure path and
+            // makes each occurrence self-explaining.
+            let declared = declarations
+                .iter()
+                .map(|declaration| {
+                    format!(
+                        "{:?}[{:#010x},{:#010x})",
+                        declaration.channel, declaration.physical_start, declaration.physical_end
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let changed_ranges = changed
+                .iter()
+                .map(|(start, end)| format!("[{start:#010x},{end:#010x})"))
+                .collect::<Vec<_>>()
+                .join(" ");
             recompiled_gap_panic(format!(
-                "executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) outside every attributed writer declaration"
+                "executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) \
+                 outside every attributed writer declaration; \
+                 declared={{{declared}}} changed={{{changed_ranges}}} \
+                 events={} declarations={}",
+                events.len(),
+                declarations.len()
             ));
         }
         if declarations.is_empty() && changed.is_empty() {
