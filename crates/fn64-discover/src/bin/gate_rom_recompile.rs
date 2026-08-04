@@ -38,7 +38,7 @@ use fn64_discover::dense_aot_pack::{
 use fn64_discover::facts::{FunctionEntryEvidence, ProofState};
 use fn64_discover::generation_topology::build_generation_topology_v1;
 use fn64_discover::overlay_load_mapping::{
-    admitted_overlay_load_mappings_v1, shared_slot_invalidation_range, OverlayLoadMappingV1,
+    admitted_overlay_load_mappings_v1, per_slot_invalidation_ranges, OverlayLoadMappingV1,
 };
 use fn64_discover::overlay_recipe::{
     admitted_overlay_load_recipes_v1, OverlayLoadRecipeV1, OVERLAY_RECIPE_SCHEMA_V1,
@@ -602,11 +602,20 @@ fn compose_catalog_bound_overlay_snapshots(
 fn synthesize_flat_text_recipes(
     mappings: &[OverlayLoadMappingV1],
 ) -> Option<Vec<OverlayLoadRecipeV1>> {
-    let invalidation = shared_slot_invalidation_range(mappings)?;
+    // One range per destination slot. A table may hold several independent
+    // slots (Cruis'n USA: two overlays sharing one, a third alone), so each
+    // overlay takes the union of ITS OWN slot -- not a union across slots,
+    // which would over-invalidate live memory belonging to an overlay that
+    // was never swapped.
+    let slot_ranges = per_slot_invalidation_ranges(mappings)?;
     mappings
         .iter()
         .map(|mapping| {
             let image = mapping.loaded_range()?;
+            let invalidation_end = slot_ranges
+                .iter()
+                .find(|range| range.start == image.start)?
+                .end;
             Some(OverlayLoadRecipeV1 {
                 schema: OVERLAY_RECIPE_SCHEMA_V1.to_string(),
                 descriptor_rom_offset: mapping.descriptor_rom_offset,
@@ -618,8 +627,8 @@ fn synthesize_flat_text_recipes(
                 data_start: image.end,
                 data_end: image.end,
                 bss_start: image.end,
-                // The union, not this overlay's own end: see above.
-                bss_end: invalidation.end,
+                // This slot's union, not this overlay's own end: see above.
+                bss_end: invalidation_end,
                 loaded_sha256: mapping.loaded_sha256.clone(),
             })
         })
