@@ -1017,6 +1017,31 @@ fault is resolved and frames actually arrive.
 Recorded to prevent the 264,000x number being read as a catastrophic
 regression by whoever looks next.
 
+## One fault now gates B, C and D
+
+Measured rather than assumed, by running each to its stopping point:
+
+* **B (playable lane)** -- the shell's frame-0 hang is fixed
+  (`BOOT_STEPS_PER_PUMP`), and it now stops at exactly the batch runner's
+  failure: same guard, same PC `0x80022620`, same address. No frame, because
+  that fault precedes the first VI field.
+* **D (audio output)** -- a dedicated 200,000-step run reached the same
+  domain-1 trap and printed **no** `[wm2000-block-audio]` line at all. The
+  fault precedes any audio task, so the PCM evidence added earlier cannot be
+  exercised yet.
+* **C (pacing)** -- pacing has nothing to pace against until a frame is
+  presented, and the 3.4x realtime figure needs re-measuring on a route that
+  actually renders.
+
+So these are not three independent pieces of work. They are one defect --
+a CPU read of PI domain-1 address 1, the N64DD window a cartridge-only ROM
+does not provide -- with three symptoms. Resolving it is what makes B, C and D
+measurable at all, and none of them can be closed before it.
+
+That also means the trap added for it is doing its job: it converted an
+anonymous `MemoryFault` into a named, registered `LoudTrap` that says which
+device is missing and why no value is invented.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
