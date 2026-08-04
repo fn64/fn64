@@ -95,7 +95,24 @@ fn64-recomp-rs-codegen = { path = "../../crates/fn64-recomp-rs-codegen" }
 sha2 = "0.10"
 
 [profile.release]
-debug = true
+# No debug info. This binary links 35 generated dense-AOT shard crates into
+# ~121 MB, and DWARF for generated match arms is both enormous and useless --
+# every earlier release build here either ran 40+ minutes or was OOM-killed,
+# and this was a large part of why.
+debug = false
+
+# The generated shards dominate compile time and are cold code: they are
+# dispatched through, not optimized around. Giving them many codegen units
+# lets rustc parallelize instead of serializing on a few huge ones, without
+# touching the -O level the hot handwritten crates get below.
+codegen-units = 256
+
+[profile.release.package.fn64-recomp-rs]
+codegen-units = 1
+[profile.release.package.fn64-runtime]
+codegen-units = 1
+[profile.release.package.fn64-abi]
+codegen-units = 1
 
 [profile.dev.build-override]
 # The shard build scripts perform exhaustive mechanical ROM discovery. Scope
