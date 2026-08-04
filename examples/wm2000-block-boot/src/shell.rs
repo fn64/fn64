@@ -285,6 +285,22 @@ struct Shell {
 /// window. Same value and rationale as `crates/fn64-shell`.
 const STEPS_PER_PUMP: u64 = 200_000;
 
+/// Bound for the pump that is still bringing the guest up to its first VI
+/// field, before any frame has been presented.
+///
+/// `STEPS_PER_PUMP` bounds a STEADY-STATE frame, where a guest that has not
+/// yielded within 200k scheduling steps is spinning. Boot is not steady state:
+/// WM2000's certified batch route needs ~420k steps just to reach its menus,
+/// all of it before the first field, so the steady-state bound turns a normal
+/// boot into either a 31-minute wait or a spurious assert -- measured, the
+/// headless probe printed zero frame lines in 18m47s at 100% CPU because
+/// frame 0 could not finish.
+///
+/// This is deliberately generous rather than unbounded: a guest that never
+/// reaches a first field still trips it, which is the case the bound exists
+/// for.
+const BOOT_STEPS_PER_PUMP: u64 = 4_000_000;
+
 /// Bound on consecutive device-time advances in one pump. WM2000's boot chains
 /// many short device deadlines between VI fields; without a cap the loop could
 /// stay inside one pump long enough to stop servicing window events.
@@ -474,9 +490,17 @@ impl Shell {
         loop {
             match drain.before_step(fn64_abi::next_runnable_priority()) {
                 fn64_boot_harness::DrainDecision::Step => {
+                    // Boot gets the generous bound; every later frame gets the
+                    // steady-state one. `vi_swap_count` is the boundary because
+                    // it marks the first field actually reaching the window.
+                    let budget = if fn64_abi::vi_swap_count() == 0 {
+                        BOOT_STEPS_PER_PUMP
+                    } else {
+                        STEPS_PER_PUMP
+                    };
                     assert!(
-                        steps < STEPS_PER_PUMP,
-                        "wm2000-shell: non-idle guest work exceeded {STEPS_PER_PUMP} scheduling steps in one frame pump"
+                        steps < budget,
+                        "wm2000-shell: non-idle guest work exceeded {budget} scheduling steps in one frame pump"
                     );
                     // Feed live input before the game polls the controller this
                     // step, so a press is visible within the frame it happened.
