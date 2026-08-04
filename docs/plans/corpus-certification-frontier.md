@@ -491,14 +491,18 @@ under-declaration there is exactly what one would expect to surface first.
 The remaining question -- which writer -- needs the instrumented run to
 complete; static analysis has taken it as far as it goes.
 
-**A correlation worth chasing:** the panic reproduces with
-`FN64_RENDER_DUMP_DIR` set and did NOT appear in a 74-minute run with the
-variable unset, all else equal. The dump path writes PNG frames from a
-graphics task; if it reads or writes through a view that bypasses the
-attributed-write notification, that would produce exactly this signature --
-an under-declaring writer rather than a silent one. Not yet confirmed (the
-control run may simply not have reached the same point), so it is recorded
-as a lead, not a finding.
+**A correlation that did not survive testing.** `FN64_RENDER_DUMP_DIR` looked
+implicated: the panic appeared in a run with it set and not in a 74-minute run
+without it. Retesting killed the idea. A third run WITH the dump directory ran
+33 minutes without panicking, and comparing progress rather than wall-clock
+explains why: the panicking run reached 46 log lines, the quiet ones 10-11.
+They were not avoiding the fault, they were running far behind it -- both
+controls were `nice`d and the original was not.
+
+The lesson is the caveat originally recorded with the lead: in a debug build
+this slow, "did not panic in N minutes" is nearly worthless as evidence unless
+progress is compared, not elapsed time. Dump-dir involvement is neither
+confirmed nor refuted; it was never actually tested.
 
 The panic message now carries the declaring channels, their declared ranges,
 and every changed range, so the next occurrence names the writer without
