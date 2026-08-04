@@ -1,0 +1,82 @@
+# fn64 WM2000 route: boot -> Exhibition -> Single Match -> entrance screen.
+#
+# COMMITTED ON PURPOSE. The 420,000-step route that first reached WM2000's
+# match-setup screen was written to /tmp, macOS reaped it, and that run is now
+# unreproducible -- the deepest gameplay state anyone has reached exists only
+# as prose in docs/BOOT-NOTES-WM2000.md:1812-1830. A route recipe is evidence;
+# it belongs in the repository.
+#
+# Format (crates/fn64-boot-harness/src/controller_input_schedule.rs):
+#   port first_read end_read buttons_hex stick_x stick_y
+# The clock is the controller READ ORDINAL, not time or instructions: a read
+# is a shared external boundary, so fn64 and a black-box emulator replay it
+# identically even when host calls are substituted. Ranges are half-open and
+# must not overlap per port. Roughly one read per game poll ~= one per frame.
+#
+# OSContPad.button bits: A=0x8000 B=0x4000 Z=0x2000 START=0x1000
+#                        dU=0x0800 dD=0x0400 dL=0x0200 dR=0x0100
+#
+# Held inputs are avoided: WM2000's menus advance on edges, so a button held
+# across a long read range registers once and then looks stuck. Every press
+# below is one short range followed by a release range.
+fn64.controller-input-schedule.v1
+
+# --- Boot splash sequence (THQ / JAKKS / AKI). Idle; the logos are timed.
+0    0   90 0x0000 0 0
+
+# --- Title screen: START to enter the main menu.
+0   90  100 0x1000 0 0
+0  100  130 0x0000 0 0
+
+# --- Main menu: A confirms Exhibition (the default highlighted entry).
+0  130  140 0x8000 0 0
+0  140  180 0x0000 0 0
+
+# --- Match-type menu: A confirms Single Match.
+0  180  190 0x8000 0 0
+0  190  230 0x0000 0 0
+
+# --- Wrestler select: A confirms player 1, then A confirms the CPU opponent.
+#     The recorded route reached STONE COLD VS STONE COLD by confirming the
+#     default highlight twice, which also proves the CPU-opponent path.
+0  230  240 0x8000 0 0
+0  240  280 0x0000 0 0
+0  280  290 0x8000 0 0
+0  290  330 0x0000 0 0
+
+# --- Rules / options page: A accepts the defaults.
+0  330  340 0x8000 0 0
+0  340  380 0x0000 0 0
+
+# --- Decision / confirm page: A commits the match setup.
+0  380  390 0x8000 0 0
+0  390  430 0x0000 0 0
+
+# --- Entrance / versus presentation. THIS IS THE FRONTIER.
+#     The prior route pressed START twice here, completed 1,707 graphics
+#     submits with render_error=None, and the selector gate word at
+#     0x8003dd0c stayed 0x00000000 -- the match-arena generation's four
+#     loader PCs (0x80022484, 0x80022498, 0x800224d4, 0x80022510) were never
+#     reached even once. The game is not failing to load the arena; it never
+#     asks.
+#
+#     So this section varies the input rather than repeating START, to
+#     discriminate between "wrong button", "waiting on a subsystem", and a
+#     real bug. Run with FN64_RENDER_DUMP_DIR set and compare frames across
+#     these presses.
+0  430  440 0x1000 0 0
+0  440  470 0x0000 0 0
+0  470  480 0x8000 0 0
+0  480  510 0x0000 0 0
+0  510  520 0x1000 0 0
+0  520  550 0x0000 0 0
+0  550  560 0x4000 0 0
+0  560  590 0x0000 0 0
+0  590  600 0x2000 0 0
+0  600  640 0x0000 0 0
+
+# --- Long idle tail: if the entrance is a timed cutscene rather than an
+#     input gate, the transition happens here with no input at all, and the
+#     loader PCs light up on their own. That is the cheapest discriminator
+#     in the whole schedule.
+0  640 1400 0x0000 0 0
