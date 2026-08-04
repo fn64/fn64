@@ -1089,6 +1089,27 @@ a measured value corroborated across implementations, or a loud stop. A
 plausible-looking guess is the one option ruled out by what the guest actually
 does with it.
 
+**3. The two emulators disagree, which settles it.** Checking Ares -- the more
+accuracy-focused implementation -- its bus does NOT return open bus for an
+address no device claims:
+
+```
+return freezeUnmapped(address), 0;
+```
+
+`freezeUnmapped` logs the access and sets `cpu.scc.sysadFrozen = true`
+(or raises an emulation exception in homebrew mode). The `0` is a formality;
+the machine stops. So mupen models address-derived open bus while Ares halts
+the CPU, and there is no cross-implementation consensus to adopt.
+
+That is exactly the condition under which fabricating a value would be wrong,
+and it means fn64's `abi.pi.absent-domain1-device` trap is not a placeholder
+awaiting a better answer -- it is **the same posture the more accurate
+emulator takes**. Closing this needs silicon measurement or a decision to
+model the N64DD, not a value copied from whichever emulator was asked first.
+
+Both were consulted before concluding; the disagreement is the finding.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
