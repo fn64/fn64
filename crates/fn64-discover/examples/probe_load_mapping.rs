@@ -11,6 +11,9 @@
 use fn64_discover::overlay_load_mapping::{admitted_overlay_load_mappings_v1, shared_slot_invalidation_range};
 use fn64_discover::overlay_recipe::admitted_overlay_load_recipes_v1;
 use fn64_discover::overlay_regions::{recover_overlay_regions, SearchConfig};
+use fn64_discover::banks::BankNamePattern;
+use fn64_discover::delta_vote::DeltaVoteConfig;
+use fn64_discover::{run_discovery_with_recovered_overlay_regions, Fact, RecoveredOverlayInput};
 
 fn main() {
     let rom = std::env::args().nth(1).expect("usage: <rom> [min_records]");
@@ -51,5 +54,24 @@ fn main() {
             }
         }
         Err(error) => println!("mappings=ERR {error:?}"),
+    }
+
+    let search = SearchConfig::aki_family();
+    let input = RecoveredOverlayInput {
+        min_mapped_regions: search.min_records,
+        search,
+        delta_vote: DeltaVoteConfig::default(),
+        table_name: "recovered_overlay_descriptors".to_string(),
+        bank_name: BankNamePattern::new("recovered_overlay_", 0, ""),
+    };
+    if let Ok((_, facts, _)) = run_discovery_with_recovered_overlay_regions(&bytes, &input) {
+        for i in 0..8 {
+            let name = format!("recovered_overlay_{i}");
+            if let Some(c) = facts.conclusion(&format!("bank:{name}")) {
+                println!("  {name}: {:?} ({})", c.state, c.rule);
+            }
+        }
+        let n = facts.proven_rom_mappings().len();
+        println!("proven banks={n}");
     }
 }
