@@ -1277,9 +1277,33 @@ that the guard address is ROM-specific, so it belongs behind discovery
 (recognising the routine and its guard) rather than as a hardcoded constant,
 which is the same standard every other host binding here meets.
 
-Worth stating plainly: this has *not* been implemented or tested. It is the
-cheapest of the three and the only one that fabricates nothing, but "cheapest
-and most honest" is a design argument, not evidence that it boots.
+**Discovery for it is now built and verified**: the recognizer finds the
+routine structurally and recovers the guard address from the same `lui`/`lw`
+pair it matches (WM2000 `0x80047f10`, No Mercy `0x80052e60`, corpus-stable at
+15 FOUND / 272 ABSENT / 0 errors), and `build.rs` emits it as
+`DRIVE_ROM_INIT_GUARD: Option<u32> = Some(0x80047F10)`.
+
+**Setting it is where this stops, for a structural reason worth recording.**
+There is no seam to write a synthesized word into guest RDRAM:
+
+* `BootstrapImportTransactionV1` publishes only ROM slices
+  (`publish_ipl3_cartridge_dma`, `publish_resident_rom_image`) -- every
+  published byte is traceable to the cartridge, by design;
+* `commit()` then seals an executable-memory baseline over
+  `executable_physical_ranges`, and the guard at `0x80047f10` lies inside the
+  1 MiB boot bank that baseline covers;
+* there is no post-boot host-write entry point either.
+
+So presetting the guard would either invalidate the bootstrap receipt or have
+to travel through the attributed-write machinery -- the same declaration path
+whose two-commit race was the bug fixed earlier in this session. Neither is a
+small change, and both touch the evidence chain that makes `unsupported=0`
+mean anything.
+
+That is the honest boundary: the option fabricates no *hardware* behaviour,
+but it does require synthesizing guest state, and this codebase deliberately
+has no way to do that. Whether to add one is a certification question, not an
+implementation detail.
 
 ## State at handoff
 

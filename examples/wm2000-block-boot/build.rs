@@ -580,6 +580,11 @@ fn main() {
     let guest_thread_globals =
         fn64_discover::host_bindings::discover_guest_thread_globals(dense_words, va_start)
             .expect("wm2000-block-boot build.rs: discovering guest thread globals");
+    // Optional: a cartridge-only title has no 64DD drive-init routine at all,
+    // so absence is normal and only an ambiguous shape is an error.
+    let drive_rom_init =
+        fn64_discover::host_bindings::discover_drive_rom_init_host_binding(dense_words, va_start)
+            .expect("wm2000-block-boot build.rs: discovering 64DD drive init");
     let binding_address = |symbol| {
         resident_host_bindings
             .iter()
@@ -809,6 +814,18 @@ fn main() {
         "pub const ENTRY_BANK_ID: u64 = {entry_bank_id:#018X};"
     );
     let _ = writeln!(pack, "pub const ENTRYPOINT: u32 = {entrypoint:#010X};");
+    // The once-only guard the guest's own 64DD init tests. Presetting it makes
+    // that routine take its already-initialised path, which returns the same
+    // static OSPiHandle* without probing a drive this cartridge has no device
+    // for. `None` for a title with no such routine.
+    let _ = match drive_rom_init {
+        Some(found) => writeln!(
+            pack,
+            "pub const DRIVE_ROM_INIT_GUARD: Option<u32> = Some({:#010X});",
+            found.guard_vram
+        ),
+        None => writeln!(pack, "pub const DRIVE_ROM_INIT_GUARD: Option<u32> = None;"),
+    };
     let _ = writeln!(
         pack,
         "pub const OS_SI_DEVICE_BUSY: u32 = {os_si_device_busy:#010X};"
