@@ -1252,6 +1252,35 @@ The first is defensible precisely because it answers at the ABI layer, where
 the contract is public, instead of at the bus layer, where mupen and Ares
 disagree and no measurement exists.
 
+**And the routine has a documented early exit that never touches the device.**
+Reading its full control flow:
+
+```
+0x80022550:  lui  r14, 0x8004
+0x80022554:  lw   r14, 0x7f10(r14)   ; guard word at 0x80047f10
+0x80022560:  bne  r14, r0, +0x1c     ; already initialised -> skip
+...
+0x8002257c:  sw   r0,  0x7f10(r1)    ; first-call path clears it, then probes
+0x80022680:  or   r2,  r16, r0       ; return the static OSPiHandle*
+0x80022690:  jr   ra
+```
+
+Both paths return the same static `OSPiHandle *` in `r2`; the guard only
+decides whether the probe runs. So a **third** option exists, smaller than
+either above: treat the drive as already-initialised by presetting that guard
+word, and the game's own code returns its handle without ever reading
+`0xA6000000`.
+
+That is attractive because it invents nothing -- no bus value, no ABI return
+contract -- it simply selects a path the guest already implements. The cost is
+that the guard address is ROM-specific, so it belongs behind discovery
+(recognising the routine and its guard) rather than as a hardcoded constant,
+which is the same standard every other host binding here meets.
+
+Worth stating plainly: this has *not* been implemented or tested. It is the
+cheapest of the three and the only one that fabricates nothing, but "cheapest
+and most honest" is a design argument, not evidence that it boots.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
