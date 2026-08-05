@@ -754,6 +754,11 @@ impl PrecompiledGenerationCatalog {
                     byte_len: generation.byte_len(),
                     expected_sha256: generation.expected_sha256,
                     actual_sha256,
+                    // A generation stores only its digest, never the compiled
+                    // bytes, so there is nothing here to diff live memory
+                    // against. Locating the first differing byte is an OFFLINE
+                    // question against the ROM-resident image.
+                    first_diff_offset: None,
                 });
             }
         }

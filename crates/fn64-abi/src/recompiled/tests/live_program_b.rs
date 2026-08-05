@@ -615,6 +615,7 @@ use super::*;
                 byte_len: 8,
                 expected_sha256: [0x11; 32],
                 actual_sha256: [0x22; 32],
+                first_diff_offset: None,
             },
             |offset| completed[usize::try_from(offset - DMA_PHYSICAL).unwrap()],
         )
