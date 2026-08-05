@@ -1787,3 +1787,85 @@ Reaching "all five playable" therefore needs, in order:
 
 Items 1 and 2 are mechanical but real work. Item 3 is the same set of unknowns
 for every title, so solving it once on WM2000 should carry.
+
+## Title-generic boot lane: three of five reach it, one wall remains
+
+Generalizing `examples/wm2000-block-boot/build.rs` removed the assertions that
+pinned it to WM2000, all of which were unnecessary -- every geometry it needs
+was already DERIVED from discovery:
+
+- `overlay_recipes.len() == 4` -> at least one. Discovery recovers 4 for
+  WM2000, 5 for No Mercy, 2 for Revenge and World Tour, 4 for VPW2.
+- `boot_shards.len() == 15` and `resident_tail_shards.len() == 2` -> the
+  halves must tile the bank and match the prepared inventory. The split point
+  follows from where the FIRST overlay loads, which is per-ROM.
+
+WM2000 still builds unchanged after these edits.
+
+### Host bindings: a real per-title gap, measured
+
+`crates/fn64-discover/examples/probe_host_bindings.rs` reports which of the 15
+WM-block runtime host symbols each title resolves uniquely:
+
+    WWF WrestleMania 2000     OK 15/15
+    WWF No Mercy (Rev A)      OK 15/15
+    Virtual Pro Wrestling 2   OK 15/15
+    WCW-nWo Revenge           FAIL -- OsSetEventMesg, 0 candidates
+    WCW vs. nWo World Tour    FAIL -- OsCreateMesgQueue, 0 candidates
+
+The two 1998 WCW titles are an earlier engine revision whose libultra shapes
+the current signatures do not match. That is a discovery question, not a lane
+question, and it bounds those two titles out of the lane until the signatures
+generalize.
+
+### The remaining wall: the shard package inventory is fixed
+
+`PREPARED_PACKAGES` is a 35-entry array encoding WM2000's shard distribution.
+Shard COUNT is derived per generation (`examples/wm2000-block-shards/build.rs:312`),
+but the package LIST is not, so a title whose overlays tile differently cannot
+be expressed:
+
+    WM2000   overlays=4  shards per overlay [3, 1, 6, 8]  total 18
+    NoMercy  overlays=5  shards per overlay [3, 3, 5, 8, 5] total 24
+    VPW2     overlays=4  shards per overlay [3, 2, 6, 8]  total 19
+
+Building the lane for No Mercy now gets through host bindings, every
+generalized assertion, and into shard emission before failing with "shard
+index 5 is outside generation recovered_overlay_2 with 5 shards" -- the fixed
+inventory asking for a shard that title does not have.
+
+So a title-generic lane needs the package set GENERATED per title rather than
+listed. That is mechanical (the counts are already computed) but it is a
+build-system change, not a constant to relax.
+
+### Narrowing the overlay-tail cause: four eliminations
+
+Working candidate (a) "the guest's PI DMA is truncated" against the other two,
+each eliminated by direct inspection rather than by argument:
+
+- **(c) discovery over-declared the extent -- DEAD.** The ROM's OWN descriptor
+  record at ROM `0x48a80` reads `start=0x4c160 end=0x73390 vram=0x800e1b90`,
+  i.e. `len=0x27230`. Discovery reports exactly that. The game's table says the
+  overlay is `0x27230` bytes.
+- **(b) publication stops short -- DEAD.** The lane publishes only the IPL3
+  1 MiB boot copy (`examples/wm2000-block-boot/src/main.rs:944`); overlays are
+  never published, so publication cannot truncate one.
+- **the pack clipped the generation -- DEAD.** The generated `pack.rs` carries
+  overlay A as `image_start: 0x800E1B90, image_end: 0x80108DC0`, the full
+  `0x27230`, not clipped to the bank end.
+- **the DMA path clamps -- DEAD.** `try_start_dma` (`fn64-runtime/src/rom.rs:646`)
+  allocates `vec![0u8; len]` and calls `dma_write_bytes` with the whole buffer;
+  `dma_write_bytes` (`rdram.rs:573`) forwards to `write_logical_bytes` with no
+  min/clamp/saturating bound anywhere in the path.
+
+One structural fact stands out and is NOT a coincidence: the present prefix
+`0x1e870` is not a multiple of any natural DMA chunk size (0x1000, 0x2000,
+0x4000, 0x8000, 0x10000), but `0x800e1b90 + 0x1e870` is EXACTLY `0x80100400`,
+the boot-bank end. Whatever stops at that boundary is doing so because it is a
+boundary, not because a transfer happened to end there.
+
+Diagnostic note: `PiBytesCommitted` records the ORIGINAL request
+(`fabric_ops.rs:812`), not the byte count actually written, so started-vs-
+committed lengths are always equal and cannot by themselves prove truncation.
+The dump is still worth having -- it shows whether the guest ever requests
+`0x27230` at that destination at all.
