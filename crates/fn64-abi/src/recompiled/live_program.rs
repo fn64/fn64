@@ -1739,14 +1739,44 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     pub(super) fn invalidate_pending_physical_writes(&self, mem: &Rdram<'_>) -> Vec<GenerationId> {
-        self.invalidate_pending_physical_writes_with(|physical| {
+        // The twin of `reconcile_before_dispatch`: it runs at the SAME dispatch
+        // boundaries and used to take the same per-byte snapshot -- a bounds
+        // check and a lane XOR for each of 1,048,576 bytes. Fixing only the
+        // reconcile side left half the cost in place.
+        //
+        // `mem` is right here, so read the snapshot word-wise and hand the
+        // slower closure path only the callers that genuinely have nothing but
+        // a byte reader.
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        self.invalidate_pending_physical_writes_from_view(&view, |physical| {
             mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
         })
     }
 
+    /// Same contract as [`Self::invalidate_pending_physical_writes_with`], but
+    /// snapshots word-wise from an RDRAM view.
+    ///
+    /// `seal_with` still needs a byte reader, so that stays a closure; only the
+    /// per-dispatch 1 MiB snapshot moves to the view.
+    pub(super) fn invalidate_pending_physical_writes_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        read_physical_byte: impl FnMut(u32) -> u8,
+    ) -> Vec<GenerationId> {
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, Some(view))
+    }
+
     pub(super) fn invalidate_pending_physical_writes_with(
         &self,
+        read_physical_byte: impl FnMut(u32) -> u8,
+    ) -> Vec<GenerationId> {
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, None)
+    }
+
+    fn invalidate_pending_physical_writes_inner(
+        &self,
         mut read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
     ) -> Vec<GenerationId> {
         let writes =
             PENDING_EXECUTABLE_WRITES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
@@ -1799,7 +1829,10 @@ impl CanonicalLiveBlockProgramV1 {
             // the same byte as the original Blocker A panic, in the gate lane
             // at 200k steps. The unconditional read is what makes the snapshot
             // the source of truth rather than the write queue.
-            let snapshot = state.borrow().read_snapshot(read_physical_byte);
+            let snapshot = match view {
+                Some(view) => state.borrow().read_snapshot_from_view(view),
+                None => state.borrow().read_snapshot(read_physical_byte),
+            };
             // Skip a commit that has nothing to say. Both the guest-execution
             // path and the device-time advance
             // (`process_live_executable_writes_from_host`) call this same
