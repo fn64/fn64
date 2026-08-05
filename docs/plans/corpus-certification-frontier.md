@@ -1422,3 +1422,75 @@ over the watched region, reconciling only dirtied 4 KiB pages.
 That changes when the firewall checks, not what any digest asserts, but it is
 still a change to the certification model's operational meaning and needs
 sign-off rather than a unilateral optimization.
+
+## Past the overlay entry: overlapping generations at one VRAM base
+
+Running the committed 26-phase route with `FN64_BLOCK_CONTINUE_AFTER_OVERLAY=1`
+and `FN64_ABSENT_N64DD=1` gets WM2000 past the digest-selected overlay entry at
+step 421,717 and stops at a NEW frontier:
+
+    generation activation at 0x800F61B4 failed:
+    AotMiss for bank:89C4A396A5B53C23 range 0x800E1B90..0x80100400
+    expected 5066618c... observed 2fb3f01e...
+
+Two generations share base `0x800e1b90`, one a strict PREFIX of the other:
+
+    entered  [0x800e1b90,0x80108dc0)  len 0x27230
+    failing  [0x800e1b90,0x80100400)  len 0x1e870   <- holds 0x800F61B4
+
+The guest loaded the LONGER image; activation hashed the SHORTER extent over
+those bytes and got a different digest, because the tail belongs to the other
+overlay. `verify_precompiled_image` (`fn64-recomp-rs/src/execution/mod.rs:193`)
+is exact and documents "no fallback path", so the firewall is correct here --
+the observed image genuinely is not the compiled one.
+
+This is the many-overlays-per-VRAM-slot shape the Paper Mario ground truth
+describes. The pack identifies a generation by `(base, length)`, which cannot
+distinguish two overlays sharing a base. What SHOULD identify one -- ROM source
+span, requesting loader PC, or the digest of the exact DMA'd bytes -- changes
+what an admitted generation asserts, so it is a certification decision.
+
+## The 22 multi-span misses: descriptors are INSTRUCTIONS, not data
+
+Every table search failed on these ROMs for a structural reason: they never
+store descriptors as data. The triple is materialized as `lui`/`addiu`
+immediates at each call site and passed to a DMA routine.
+
+VERIFIED independently on International Superstar Soccer '98, ROM `0x571bc`:
+
+    3c04002d  lui   a0,0x002d
+    24845d30  addiu a0,a0,0x5d30    -> a0 = 0x002d5d30   rom_start
+    3c05803d  lui   a1,0x803d
+    24a5f000  addiu a1,a1,0xf000    -> a1 = 0x803cf000   vram_dest (KSEG0)
+    3c06002e  lui   a2,0x002e
+    24c64380  addiu a2,a2,0x4380    -> a2 = 0x002e4380   rom_end
+    0c00081a  jal   0x2068                               DMA routine
+    00c43023  subu  a2,a2,a0        -> length = end - start (delay slot)
+
+The recovered span holds **127 `jr ra` sites over 58 KiB (2.21/KiB)** -- dense
+real code. (Two corrections to the original report: the triple starts at
+`0x571bc`, one word later than stated, and `vram_dest` is `0x803cf000`, not
+`0x803df000`. The mechanism is unaffected.)
+
+Reported non-boot code coverage, NOT yet independently re-measured: ISS '98,
+ISS 64, Turok 2, Viewpoint 2064, Roadsters and NBA 2000 at 100%; ~11 of 22 at
+>=90%.
+
+### Why this beats the field permutations that failed
+
+The rejected approach searched DATA for adjacent u32 triples, so any monotone
+counter array matched. This requires the words be `lui`+`addiu` OPCODE pairs
+inside executable code, terminated by a JAL, with jr-$ra density >= 0.5/KiB in
+the recovered span. A counter array cannot satisfy that: an incrementing
+integer sequence is not a valid `lui`/`addiu` encoding.
+
+### The other two mechanisms
+
+- **Unlinked relocatable objects (2 ROMs).** Jet Force Gemini and Mickey's
+  Speedway (both Rare) have 61-65% of span-2 `lui` immediates ZEROED awaiting
+  relocation, against 0% in their boot banks. No descriptor search helps;
+  these need relocation-table support.
+- **Undetermined (5-7 ROMs).** Castlevania LoD, Command & Conquer, Mischief
+  Makers, WCW Mayhem, Supercross 2000, South Park. Span-2 ROM offsets are
+  never materialized as immediates, and WCW's span-2 JAL targets are junk,
+  suggesting compressed data rather than resident code.
