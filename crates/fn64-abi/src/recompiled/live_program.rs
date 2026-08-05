@@ -311,15 +311,36 @@ impl CanonicalExecutableMutationStateV1 {
         let mut changed = Vec::new();
         for (range, current) in self.watched.iter().zip(snapshot) {
             assert_eq!(range.expected.len(), current.len());
+            let expected = range.expected.as_slice();
+            // Byte-at-a-time over the 1 MiB boot bank, at every dispatch
+            // boundary, with "nothing changed" as the overwhelmingly common
+            // answer. `==` on slices lowers to memcmp, so settle that case in
+            // one shot and only walk bytes once something actually differs.
+            if expected == current.as_slice() {
+                continue;
+            }
             let mut index = 0;
             while index < current.len() {
-                if range.expected[index] == current[index] {
+                // Skip equal bytes a chunk at a time. Chunk boundaries do not
+                // affect the result: the byte loop below still finds the exact
+                // first and last differing byte, so the emitted ranges are
+                // identical to the scalar scan's.
+                const CHUNK: usize = 16;
+                while index + CHUNK <= current.len()
+                    && expected[index..index + CHUNK] == current[index..index + CHUNK]
+                {
+                    index += CHUNK;
+                }
+                if index >= current.len() {
+                    break;
+                }
+                if expected[index] == current[index] {
                     index += 1;
                     continue;
                 }
                 let start = index;
                 index += 1;
-                while index < current.len() && range.expected[index] != current[index] {
+                while index < current.len() && expected[index] != current[index] {
                     index += 1;
                 }
                 changed.push((
