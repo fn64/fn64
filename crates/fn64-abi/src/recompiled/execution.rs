@@ -537,6 +537,35 @@ pub(crate) struct CatalogNestedWriterTransactionV1 {
 }
 
 impl CatalogNestedWriterTransactionV1 {
+    /// A transaction for the public attributed host-memory API
+    /// (`super::host_memory`), which writes on behalf of code outside the
+    /// guest rather than on behalf of a running thread.
+    pub(super) fn for_host_memory_api(
+        live: CanonicalLiveBlockProgramV1,
+        transaction_id: u64,
+    ) -> Self {
+        Self {
+            live: Some(live),
+            transaction_id: Some(transaction_id),
+            thread: None,
+            operation: "host memory api",
+            committed: false,
+        }
+    }
+
+    /// A transaction with nothing to journal, for a live program that has no
+    /// canonical mutation state. `commit_with` is then a no-op, so callers do
+    /// not need a second code path.
+    pub(super) fn inert() -> Self {
+        Self {
+            live: None,
+            transaction_id: None,
+            thread: None,
+            operation: "host memory api (no mutation state)",
+            committed: false,
+        }
+    }
+
     pub(super) fn is_canonical(&self) -> bool {
         self.transaction_id.is_some()
     }
@@ -552,7 +581,7 @@ impl CatalogNestedWriterTransactionV1 {
         }
     }
 
-    fn commit_with(mut self, mut read_physical_byte: impl FnMut(u32) -> u8) {
+    pub(super) fn commit_with(mut self, mut read_physical_byte: impl FnMut(u32) -> u8) {
         self.assert_thread_owner();
         if let Some(live) = &self.live {
             if let Some(transaction_id) = self.transaction_id {

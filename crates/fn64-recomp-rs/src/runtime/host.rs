@@ -554,6 +554,23 @@ impl<'a> Rdram<'a> {
     /// emitted code has no reason to use this; fn64's rs-lane host adapters use
     /// it to call the existing, audited `*_recomp` marshalling layer without
     /// allocating or copying a second RDRAM image.
+    ///
+    /// # This is an UNATTRIBUTED write path
+    ///
+    /// Every normal guest store goes through [`Self::store_w`]/`store_h`/
+    /// `store_b`, which call `notify_cpu_instruction_store` and so declare
+    /// themselves to the canonical mutation journal. Bytes written through this
+    /// slice declare nothing. If they land in a watched executable range, the
+    /// next dispatch fails as "unjournaled executable mutation" -- correctly,
+    /// but by then the writer is gone and the panic names only the address.
+    ///
+    /// It is `#[doc(hidden)]` rather than removed because exactly one caller
+    /// genuinely needs a raw pointer: `recompiled::runners`' FR-stable C shim
+    /// adapter, which hands it to the audited `*_recomp` layer that does its
+    /// own attribution. It is not a general-purpose accessor, and new callers
+    /// should use [`Self::store_w`] or the transacted host-memory API in
+    /// `fn64_abi` instead.
+    #[doc(hidden)]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.mem
     }

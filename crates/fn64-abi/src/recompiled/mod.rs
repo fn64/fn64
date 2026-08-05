@@ -1038,6 +1038,7 @@ mod validation;
 mod live_program;
 mod snapshots;
 mod execution;
+mod host_memory;
 mod runners;
 
 // `execution`, `receipts`, `runners`, and `snapshots` carry this module's
@@ -1048,6 +1049,7 @@ mod runners;
 // only `impl` blocks for types declared here, and inherent impls are always
 // in scope with their type.
 pub use execution::*;
+pub use host_memory::{read_guest_physical, write_guest_physical};
 pub use receipts::*;
 pub use runners::*;
 pub use snapshots::*;
