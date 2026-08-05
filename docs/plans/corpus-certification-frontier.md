@@ -1532,3 +1532,40 @@ independent blockers:
 Scope note: only WM2000 has been driven past CPU certification at all. No
 Mercy, Revenge, World Tour and VPW2 certify `unsupported=0` but have never
 been booted in a lane.
+
+### The AotMiss is NOT a generation-selection bug -- corrected
+
+I first read this as `(base, length)` failing to identify a generation when
+two overlays share a VRAM base, and proposed changing what identifies one.
+Reading the selector shows that diagnosis was wrong.
+
+`activate_for_fetch_with_digest` (`fn64-recomp-rs/src/generation/mod.rs:723`)
+collects EVERY generation containing the PC, digests each against its own
+`expected_sha256`, and admits the one that matches -- reporting
+`AmbiguousLiveImage` only if several match. Overlapping overlays at one base
+are therefore already handled correctly, and each generation already carries a
+distinct digest identity.
+
+The observed failure had `matches` EMPTY, which means something stronger: NO
+compiled generation matched the bytes in RAM, including the longer one the
+guest had entered. Both candidates were digested and both diverged.
+
+A second hypothesis also failed. `docs/UNIVERSAL-RUNTIME-PLAN.md:605-612`
+records that this image's "first 0x790 bytes are mutable non-code state",
+which would break the digest for every generation at that base. Measuring the
+ROM (`crates/fn64-discover/examples/probe_overlay_prefix_mutation.rs`) does not support applying
+that here: code-shaped words start at ROM `0xe2100`, only `0x100` into the
+scanned region, not `0x790`.
+
+So what remains established is narrow and worth stating without embellishment:
+
+- the selector is correct and is not the thing to change;
+- both candidate generations diverged from live memory at the activation;
+- the divergence is NOT explained by a 0x790-byte mutable prefix.
+
+The next measurement is the one no current diagnostic provides: WHERE the live
+bytes first differ from the compiled image. `AotMiss`
+(`fn64-recomp-rs/src/execution/mod.rs:157`) carries only two digests, so it
+cannot distinguish "the game wrote to a data field inside the image" from
+"this is a different overlay". Recording the first differing offset at the
+activation is the cheap next step, and it decides which fix is correct.
