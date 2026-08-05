@@ -42,6 +42,87 @@ pub(crate) fn cartridge_rom_window_offset(vaddr: u64) -> Option<u32> {
     .then(|| physical - 0x1000_0000)
 }
 
+/// Name an access to PI domain-1 address 1 instead of letting it fall through
+/// as an anonymous unbacked-memory fault.
+///
+/// `epi_domain_for_address` accepts `PI_DOM1_ADDR1` (0x0600_0000..=0x07ff_ffff,
+/// the N64DD window) for `osPiHandle` operations, but
+/// `cartridge_rom_window_offset` accepts only `PI_DOM1_ADDR2`, the cartridge
+/// ROM. So a direct CPU read there matched no window, was not backed RDRAM,
+/// and surfaced as `MemoryFault { addr: 0xffffffffa6000000 }` -- a message
+/// that says nothing about which device is missing.
+///
+/// WM2000 hits this: it configures the BSD domain-1 registers at
+/// 0xA4600018/0x20 and then probes the device at 0x8002_2620.
+///
+/// This deliberately traps rather than returning a value. Real hardware
+/// returns open-bus for an absent device, but the exact value is a
+/// MEASUREMENT question, and inventing one would fabricate hardware behaviour
+/// -- the same reason the U5 frontier leaves device timing open rather than
+/// guessing. Naming the device costs nothing and turns an anonymous fault into
+/// an actionable one.
+/// Model an ABSENT N64DD ASIC, opt-in via `FN64_ABSENT_N64DD=1`.
+///
+/// Disassembling WM2000's probe settles what this read is for, which the
+/// mupen-vs-Ares disagreement about open-bus never could:
+///
+/// ```text
+/// 0x80022550  lui  $14,0x8004 ; lw $14,0x7f10($14)   load guard
+/// 0x80022560  bne  $14,$0,+6                          guard!=0 -> 0x8002257c
+/// 0x8002257c  sw   $0,0x7f10($1)                      CLEAR the guard
+/// 0x80022584  lui  $24,0xa600                         DD base as a VALUE
+/// 0x80022590  sw   $24,0xc($16)                       store it in a struct
+/// 0x80022614  lw   $14,0xc($16)                       load it back
+/// 0x80022618  lui  $1,0xa000 ; or $15,$14,$1          force uncached
+/// 0x80022620  lw   $2,0x0($15)                        <-- THE TRAPPING READ
+/// 0x80022624  srl  $25,$2,16  ; andi $12,$25,0xf      version nibble
+/// 0x80022628  srl  $13,$2,20  ; andi $14,$13,0xf      version nibble
+/// 0x80022634  srl  $24,$2,8
+/// 0x80022638  sb   $12,0x6($16) .. sb $2,0x5($16)     store 4 derived bytes
+/// ```
+///
+/// The word is consumed ONLY as packed BCD version nibbles written into a
+/// device descriptor. No branch anywhere in this routine tests them, so no
+/// control-flow decision depends on which value an absent device returns --
+/// which is exactly why mupen (`(addr & 0xFFFF) | ((addr & 0xFFFF) << 16)`)
+/// and Ares (freeze, 0) can disagree and both boot cartridge games.
+///
+/// Zero is the honest encoding of "no ASIC answered": every version nibble
+/// reads back 0, i.e. no drive revision. It is not a measurement of open-bus
+/// on real silicon and does not claim to be -- `trap_absent_pi_domain1_device`
+/// still fires by default, and this only takes effect when a caller asserts
+/// the cartridge-only configuration it names.
+fn read_absent_n64dd_asic(vaddr: u64) -> Option<u32> {
+    let physical = (vaddr as u32) & 0x1FFF_FFFF;
+    if !crate::pi::mmio::PI_DOM1_ADDR1.contains(&physical) {
+        return None;
+    }
+    absent_n64dd_enabled().then_some(0)
+}
+
+fn absent_n64dd_enabled() -> bool {
+    std::env::var_os("FN64_ABSENT_N64DD").is_some_and(|value| value == "1")
+}
+
+fn trap_absent_pi_domain1_device(vaddr: u64) {
+    let low = vaddr as u32;
+    let physical = low & 0x1FFF_FFFF;
+    if !crate::pi::mmio::PI_DOM1_ADDR1.contains(&physical) {
+        return;
+    }
+    let message = format!(
+        "CPU read of PI domain-1 address 1 at {vaddr:#018x} (physical          {physical:#010x}): this window is the N64DD, which no cartridge-only          ROM provides. Reads here have no modelled device; open-bus behaviour          is unmeasured and is not invented here."
+    );
+    fn64_runtime::record_unsupported_event(
+        fn64_runtime::UnsupportedSubsystem::Abi,
+        "abi.pi.absent-domain1-device",
+        &message,
+        Some(with_host(|host| host.device_fabric.now())),
+        fn64_runtime::UnsupportedDisposition::LoudTrap,
+    );
+    panic!("{message}");
+}
+
 pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
     if crate::boot_probe_enabled() {
         let low = vaddr as u32;
@@ -74,6 +155,10 @@ pub(crate) fn read_raw_mmio_word(vaddr: u64) -> Option<u32> {
     if let Some(value) = read_live_rcp_interrupt_mmio(vaddr) {
         return Some(value);
     }
+    if let Some(value) = read_absent_n64dd_asic(vaddr) {
+        return Some(value);
+    }
+    trap_absent_pi_domain1_device(vaddr);
     let offset = RdramAddr::from_gpr(vaddr).offset();
     fn64_runtime::is_mmio_offset(offset).then(|| {
         crate::ai::MMIO.with(|cell| {
