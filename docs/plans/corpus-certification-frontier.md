@@ -1666,3 +1666,48 @@ This is a hypothesis, NOT yet confirmed: verifying it needs the live bytes at
 That is the next measurement, and it is cheap now that `AotMiss` can carry a
 first-differing offset -- if the divergence starts at `+0x1e870`, exactly where
 the boot bank ends, the hypothesis is confirmed.
+
+## Inline-descriptor recovery: mechanism real, value-shape rule NOT usable
+
+The 22 multi-span misses materialize their descriptors as `lui`/`addiu`
+instruction immediates rather than storing them as data. That mechanism is
+verified: ISS '98 at ROM `0x571bc` reconstructs
+`[0x2d5d30,0x2e4380) -> 0x803cf000`, and a prototype recovers that exact span
+(127 `jr ra` sites, 2.21/KiB).
+
+A prototype recovery rule was built and swept over all 287 corpus ROMs
+(`crates/fn64-discover/examples/probe_inline_descriptors.rs`). **The false
+positive measurement kills it:**
+
+    permissive rule   170/232 SINGLE_BANK ROMs fire (73.3%), 2,252 triples
+    strict rule       124/232 SINGLE_BANK ROMs fire (53.4%)
+
+Single-bank ROMs have no overlays by definition, so those firings are
+essentially all false. Strict mode required a `jal` in the window, three
+distinct destination registers, and no KSEG0 fallback; it preserved ISS '98 at
+100% coverage and cut triples 57%, and still fired on half the corpus.
+
+**Why the constraints cannot work.** The "plausible ROM offset" test admits
+`0x1000`, `0x1800`, `0x2000`, `0xc000` -- stack frame sizes, buffer lengths
+and struct constants -- because they trivially satisfy
+`>= 0x1000 && < rom_len && 4-aligned`. And the `jr ra` density guard cannot
+reject them: a single-bank ROM is UNIFORMLY code-dense, so an arbitrary
+interval scores well above 0.5/KiB. The density constraint only discriminates
+when code is sparse, which is exactly the case where it is not needed.
+
+Strict-mode coverage of the 22, for the record: 5 at >=90% (NBA in the Zone
+'99, ISS '98, Viewpoint 2064, Pokemon Stadium FR, Roadsters), 6 partial, and
+11 at zero -- including OoT and Jet Force Gemini, whose overlay payloads are
+gzip-compressed, so no uncompressed `jr ra` exists to cover regardless of
+descriptor recovery.
+
+**Do not ship this as an admission rule.** The discriminator cannot come from
+the constants' values. If pursued, it has to come from the CALLEE: resolve the
+`jal` target and require the same routine across many sites, i.e. prove a real
+DMA function rather than guess from operand shapes. ISS '98 has 10/10 sites
+calling `0x2068`, which is the shape that argument would rest on.
+
+Caveat on the false-positive metric itself: WM2000 is `SingleBank` and
+genuinely HAS overlays loaded from inside its resident span, so a small share
+of single-bank firings could be true positives. That does not rescue a 53%
+rate.
