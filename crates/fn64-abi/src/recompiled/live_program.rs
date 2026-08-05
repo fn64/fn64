@@ -1648,6 +1648,27 @@ impl CanonicalLiveBlockProgramV1 {
             .reconcile_snapshot_before_dispatch(snapshot);
     }
 
+    /// [`Self::reconcile_before_dispatch_with`] with a word-wise snapshot.
+    ///
+    /// `seal_with` still needs a byte reader; only the per-dispatch 1 MiB
+    /// snapshot moves to the view. For callers that hold the RDRAM allocation
+    /// but not an `Rdram` -- the scheduler mirror in `execution.rs` is the hot
+    /// one, running at every thread selection.
+    pub(super) fn reconcile_before_dispatch_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        mut read_physical_byte: impl FnMut(u32) -> u8,
+    ) {
+        let Some(state) = &self.mutation_state else {
+            return;
+        };
+        state.borrow_mut().seal_with(&mut read_physical_byte);
+        let snapshot = state.borrow().read_snapshot_from_view(view);
+        state
+            .borrow_mut()
+            .reconcile_snapshot_before_dispatch(snapshot);
+    }
+
     pub(super) fn begin_host_abi_transaction(
         &self,
         target: GuestPc,

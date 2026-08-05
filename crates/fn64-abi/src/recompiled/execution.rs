@@ -664,7 +664,18 @@ pub(crate) fn commit_scheduler_running_thread_mirror(
     // allocation is stable, and all raw reads/writes finish before the selected
     // coroutine receives RunToken.
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    live.reconcile_before_dispatch_with(|physical| unsafe {
+    // Scheduler selection is a dispatch boundary, so this reconciles the whole
+    // watched region -- 1 MiB on WM2000 -- every time a thread is picked.
+    // Through the byte closure that is a bounds check and a lane XOR per byte;
+    // the view path copies word-wise. Same bytes, same digests.
+    //
+    // SAFETY: `rdram`/`rdram_len` describe the same stable process allocation
+    // asserted non-null and in-range above, and the slice borrow ends inside
+    // this call.
+    let view = unsafe {
+        fn64_runtime::RdramView::from_storage(std::slice::from_raw_parts(rdram, rdram_len))
+    };
+    live.reconcile_before_dispatch_from_view(&view, |physical| unsafe {
         storage.read_u8(RdramAddr::from_offset(physical))
     });
     if unsafe { storage.read_u32(origin.global) } == origin.handle {
