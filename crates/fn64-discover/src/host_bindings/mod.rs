@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum HostBindingSymbol {
     OsCreateMesgQueue,
     OsCreateThread,
+    OsDriveRomInit,
     OsEPiStartDma,
     OsGetThreadPri,
     OsRecvMesg,
@@ -79,6 +80,7 @@ impl HostBindingSymbol {
         match self {
             Self::OsCreateMesgQueue
             | Self::OsCreateThread
+            | Self::OsDriveRomInit
             | Self::OsEPiStartDma
             | Self::OsGetThreadPri
             | Self::OsRecvMesg
@@ -99,6 +101,7 @@ impl HostBindingSymbol {
         match self {
             Self::OsCreateThread => HostSpawnedStatusEffect::InheritsCallerClearingFr,
             Self::OsCreateMesgQueue
+            | Self::OsDriveRomInit
             | Self::OsEPiStartDma
             | Self::OsGetThreadPri
             | Self::OsRecvMesg
@@ -1345,6 +1348,76 @@ fn is_si_device_busy(words: &[u32]) -> bool {
         && rd(words[5]) == 2
         && rs(words[5]) == 0
         && rt(words[5]) == 2
+}
+
+/// Structural shape of libultra's 64DD drive initialisation.
+///
+/// The routine is recognised by what it *does*, not by any address: it loads a
+/// once-only guard word through a `lui`/`lw` pair, branches away when that word
+/// is already non-zero, and on the first-call path installs the 64DD base
+/// `0xA600_0000` into the handle it will later probe.
+///
+/// The `lui $r, 0xA600` is the distinguishing behaviour. `0x0600_0000..=
+/// 0x07ff_ffff` is `PI_DOM1_ADDR1`, the disk-drive window, and a cartridge-only
+/// title has no device there -- which is why the probe that follows faults with
+/// `abi.pi.absent-domain1-device`. No other libultra role installs that base.
+///
+/// Window is 20 words. Measured on WM2000: the guard `lui`/`lw` sits at
+/// +0x00/+0x04 and the `lui $r, 0xA600` at +0x34, i.e. 13 words later, with
+/// register setup and the handle-pointer construction in between.
+fn is_drive_rom_init(words: &[u32]) -> bool {
+    // lui/lw pair loading the once-only guard.
+    if !(is_lui(words[0], 14) && is_lw(words[1], 14, 14)) {
+        return false;
+    }
+    // A branch that skips initialisation when the guard is already set.
+    let guard_branch = words[2..6]
+        .iter()
+        .any(|word| op(*word) == 0x05 && (rs(*word) == 14 || rt(*word) == 14));
+    if !guard_branch {
+        return false;
+    }
+    // The first-call path installs the 64DD base into the handle.
+    words[2..20]
+        .iter()
+        .any(|word| op(*word) == 0x0f && rs(*word) == 0 && (*word & 0xffff) == 0xa600)
+}
+
+/// Discover libultra's 64DD drive initialisation from its public guard-word and
+/// base-installation behavior.
+///
+/// This role is optional: a title that never touches the disk drive contains no
+/// such routine, and `Ok(None)` distinguishes that from a ROM where the shape is
+/// ambiguous, which stays a loud failure like every other role here.
+pub fn discover_drive_rom_init_host_binding(
+    words: &[u32],
+    va_start: u32,
+) -> Result<Option<HostBinding>, HostBindingDiscoveryError> {
+    if !va_start.is_multiple_of(4) {
+        return Err(HostBindingDiscoveryError::UnalignedImage);
+    }
+    match unique_match(
+        words,
+        va_start,
+        20,
+        HostBindingSymbol::OsDriveRomInit,
+        is_drive_rom_init,
+    ) {
+        Ok(vram) => Ok(Some(HostBinding {
+            symbol: HostBindingSymbol::OsDriveRomInit,
+            vram,
+        })),
+        // `unique_match` reports both "no match" and "several matches" as
+        // NonUniqueSemanticMatch; an empty candidate list is the absent case.
+        // A title with no disk-drive routine is normal, several is ambiguous
+        // and stays a loud failure like every other role here.
+        Err(HostBindingDiscoveryError::NonUniqueSemanticMatch { candidates, .. })
+            if candidates.is_empty() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Discover `__osSiDeviceBusy` from its public SI status-register behavior.

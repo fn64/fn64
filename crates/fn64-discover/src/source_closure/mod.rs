@@ -434,6 +434,7 @@ pub enum HostBindingSymbolV1 {
     OsSpTaskYield,
     OsSpTaskYielded,
     OsStartThread,
+    OsDriveRomInit,
 }
 
 impl From<crate::host_bindings::HostBindingSymbol> for HostBindingSymbolV1 {
@@ -442,6 +443,7 @@ impl From<crate::host_bindings::HostBindingSymbol> for HostBindingSymbolV1 {
         match symbol {
             Source::OsCreateMesgQueue => Self::OsCreateMesgQueue,
             Source::OsCreateThread => Self::OsCreateThread,
+            Source::OsDriveRomInit => Self::OsDriveRomInit,
             Source::OsEPiStartDma => Self::OsEPiStartDma,
             Source::OsGetThreadPri => Self::OsGetThreadPri,
             Source::OsRecvMesg => Self::OsRecvMesg,
