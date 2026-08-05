@@ -1223,12 +1223,34 @@ So the guest's own cart-init routine executes natively and probes hardware
 fn64 does not model. The fault is a **discovery gap**: a missing recognizer
 for a function whose host implementation already exists.
 
-That is a materially different and cheaper fix than choosing an N64DD return
-value, and it does not require resolving the mupen/Ares disagreement at all --
-a bound shim never executes the raw `lw`. Note `OS_EPI_START_DMA` resolves to
-`0x8002A700`, adjacent to the `0x8002a250` this routine calls, which is
-consistent with the whole PI/cart family living together and only part of it
-being recognized.
+**But the function is `osDriveRomInit`, not `osCartRomInit`, and that changes
+the fix again.** Walking back to the routine's entry at `0x80022540` shows what
+it does before the faulting load:
+
+```
+0x80022584:  lui  r24, 0xa600        ; the 64DD base address
+0x80022590:  sw   r24, 12(r16)       ; store it into the handle's +0xc field
+...
+0x80022614:  lw   r14, 0xc(r16)      ; read it back
+0x80022620:  lw   r2,  0(r15)        ; probe the device -> FAULT
+```
+
+The routine *itself* installs `0xA6000000` as the handle's base and then probes
+it. That is libultra's **64DD** drive initialisation, not cartridge ROM init --
+and `grep` finds no `osDriveRomInit`, `DriveRom` or `LeoDrive` shim anywhere in
+`fn64-abi`.
+
+So the earlier framing -- "add a discovery recognizer for a shim that already
+exists" -- was wrong. The shim does not exist. The honest options narrow to:
+
+* implement an `osDriveRomInit` shim that reports no drive present, which is a
+  *documented libultra return contract* rather than an invented hardware value,
+  and is therefore materially different from choosing an open-bus word; or
+* leave the trap and accept that WM2000 stops here.
+
+The first is defensible precisely because it answers at the ABI layer, where
+the contract is public, instead of at the bus layer, where mupen and Ares
+disagree and no measurement exists.
 
 ## Honest scope
 
