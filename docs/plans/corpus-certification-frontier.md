@@ -1494,3 +1494,41 @@ integer sequence is not a valid `lui`/`addiu` encoding.
   Makers, WCW Mayhem, Supercross 2000, South Park. Span-2 ROM offsets are
   never materialized as immediates, and WCW's span-2 JAL targets are junk,
   suggesting compressed data rather than resident code.
+
+## Measured speed after all four snapshot fixes, 2026-08-05
+
+Benchmarked on a quiet machine, gate lane, fixed 60,000-step run, same clean
+result each time (`steps=60000 sim_time=180000 thread0_dead=false`):
+
+    original                        351s    402 steps/s
+    hardware sha2 (96155aa)         234s
+    chunked compare (0c7ed91)       192s
+    word-wise reconcile (795efaf)   140s
+    word-wise invalidate (1447a1b)
+      + scheduler mirror (10aa3a6)   90s    667 steps/s
+
+Cumulative 3.9x. The last two commits shipped unbenchmarked because the
+machine was busy; this confirms them.
+
+### What that means for "playable"
+
+    667 steps/s  ->  0.043s of guest time per wall second
+                 ->  23.5x SLOWER than realtime
+                 ->  10.5 min to boot WM2000 to its menus
+
+So none of the AKI titles is playable, and speed is only one of three
+independent blockers:
+
+1. **Speed.** Value-preserving work tops out around 1,200-2,000 steps/s --
+   still ~10x short of the 10^4-10^5 needed for 30fps. Closing that gap
+   requires reducing HOW OFTEN reconciliation runs (page-protection dirty
+   tracking), which is a certification decision.
+2. **Overlapping generations.** WM2000 stops at an `AotMiss` because two
+   overlays share base `0x800e1b90` and `(base, length)` cannot distinguish
+   them. This fails at ANY speed.
+3. **Input.** The committed route replays, but the guest had not polled the
+   controller when the harness stopped, so input driving gameplay is unproven.
+
+Scope note: only WM2000 has been driven past CPU certification at all. No
+Mercy, Revenge, World Tour and VPW2 certify `unsupported=0` but have never
+been booted in a lane.
