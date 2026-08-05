@@ -215,6 +215,7 @@ pub mod boundaries;
 pub mod callback_flow;
 pub mod callgraph_match;
 pub mod candidate_cfg_probe;
+pub mod code_span_locality;
 pub mod candidate_corroboration;
 pub mod candidate_relation_report;
 pub mod catalog_transfer_fixed_point;
