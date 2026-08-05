@@ -262,6 +262,19 @@ pub enum GenerationLookupError {
         second: GenerationId,
     },
     AotMiss(AotMiss),
+    /// Several generations contained the PC and NONE matched live memory.
+    ///
+    /// Distinct from [`Self::AotMiss`], which names one generation and reads
+    /// as "this image changed". With several candidates that framing is
+    /// misleading: WM2000's activation at `0x800F61B4` had three, and the log
+    /// named only the resident tail, which sent three separate investigations
+    /// after the wrong generation. The count says "the loaded overlay is not
+    /// among the ones we can verify here", which is a different problem.
+    NoGenerationMatched {
+        pc: GuestPc,
+        candidates: usize,
+        first: AotMiss,
+    },
 }
 
 impl fmt::Display for GenerationLookupError {
@@ -276,6 +289,14 @@ impl fmt::Display for GenerationLookupError {
                 "live image at {pc} matches both {first} and {second}"
             ),
             Self::AotMiss(miss) => miss.fmt(formatter),
+            Self::NoGenerationMatched {
+                pc,
+                candidates,
+                first,
+            } => write!(
+                formatter,
+                "none of the {candidates} precompiled generations containing {pc} matched live memory; first: {first}"
+            ),
         }
     }
 }
@@ -742,12 +763,21 @@ impl PrecompiledGenerationCatalog {
 
         let mut matches = Vec::new();
         let mut first_miss = None;
+        // Every candidate that failed, so a total miss can name them all.
+        // Reporting only the FIRST hid the fact that WM2000's activation at
+        // 0x800F61B4 had three candidates and all three diverged; the log
+        // named the resident tail alone, which sent three separate
+        // investigations after the wrong generation.
+        let mut missed = Vec::new();
         for index in containing {
             let generation = &self.generations[index];
             let actual_sha256 = live_digest(generation);
             if actual_sha256 == generation.expected_sha256 {
                 matches.push(index);
-            } else if first_miss.is_none() {
+            } else {
+                missed.push(generation.id);
+            }
+            if actual_sha256 != generation.expected_sha256 && first_miss.is_none() {
                 first_miss = Some(AotMiss {
                     expected_bank: generation.key(pc).bank,
                     va_start: generation.image_start,
@@ -763,7 +793,18 @@ impl PrecompiledGenerationCatalog {
             }
         }
         let &selected = match matches.as_slice() {
-            [] => return Err(GenerationLookupError::AotMiss(first_miss.unwrap())),
+            [] => {
+                if missed.len() > 1 {
+                    return Err(GenerationLookupError::NoGenerationMatched {
+                        pc,
+                        candidates: missed.len(),
+                        first: first_miss.expect("a miss exists when matches is empty"),
+                    });
+                }
+                return Err(GenerationLookupError::AotMiss(
+                    first_miss.expect("a miss exists when matches is empty"),
+                ));
+            }
             [selected] => selected,
             [first, second, ..] => {
                 return Err(GenerationLookupError::AmbiguousLiveImage {

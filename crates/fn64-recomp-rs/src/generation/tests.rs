@@ -139,9 +139,14 @@
             .activate_for_fetch(VA, &Rdram::new(&mut storage))
             .unwrap();
         write_physical_bytes(&mut storage, 0x100, &[0xff; 4]);
+        // Two generations contain VA and the corrupted bytes match neither, so
+        // this is the "none of the candidates matched" case rather than "this
+        // one image changed". Reporting only the first miss is what made
+        // WM2000's three-candidate activation read as a single-generation
+        // failure.
         assert!(matches!(
             backed.activate_for_fetch(VA, &Rdram::new(&mut storage)),
-            Err(GenerationLookupError::AotMiss(_))
+            Err(GenerationLookupError::NoGenerationMatched { candidates: 2, .. })
         ));
 
         let image_long = [

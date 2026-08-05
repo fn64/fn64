@@ -1631,5 +1631,38 @@ so the gap is narrower than "no generation": the entered generation does not
 carry a shard for this PC, and activation therefore falls through to the
 resident tail.
 
-That is a pack-construction question about shard coverage, not a runtime
-firewall problem, and it is the concrete next thing to fix.
+### The pack is CORRECT -- shard coverage was the wrong diagnosis
+
+Inspecting the generated `pack.rs` directly kills that theory too. THREE
+generations contain the activation PC `0x800F61B4`:
+
+    id 0xC25FAF51EDD82E6E  [0x800e1b90,0x80100400)  len 0x1e870  resident tail
+    id 0x5DEA0D1723E94993  [0x800e1b90,0x80108dc0)  len 0x27230  overlay A
+    id 0x2A946A9A2236E4C5  [0x800e1b90,0x80153f10)  len 0x72380  overlay D
+
+`RESIDENT_TAIL_GENERATION.sha256` begins `[80, 102, 97, 140, ...]` = `5066618c`,
+confirming it is the "expected" digest in the AotMiss. And overlay A's
+generation expects `410822d4...`, which is EXACTLY
+`sha256(rom[0x04c160 .. +0x27230])` -- the pack's expectation for the loaded
+overlay is right.
+
+So the pack contains a correct generation for the resident overlay, with a
+shard covering the PC. Coverage was never the problem.
+
+### The remaining candidate: overlay A extends past the boot bank
+
+    overlay A generation ends at  0x80108dc0
+    boot bank ends at             0x80100400
+    overhang                      0x89c0 bytes
+
+A runtime digest of overlay A must therefore read `0x89c0` bytes BEYOND the
+1 MiB boot bank. If that memory does not hold the overlay's tail at activation
+time -- still zero, or holding other state -- the digest differs even though
+the overlay loaded correctly, and every generation at this base fails exactly
+as observed.
+
+This is a hypothesis, NOT yet confirmed: verifying it needs the live bytes at
+`[0x80100400,0x80108dc0)` at the moment of activation, which requires a run.
+That is the next measurement, and it is cheap now that `AotMiss` can carry a
+first-differing offset -- if the divergence starts at `+0x1e870`, exactly where
+the boot bank ends, the hypothesis is confirmed.
