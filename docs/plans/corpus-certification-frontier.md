@@ -1747,3 +1747,43 @@ publication that stops at `resident_image_end`, or a generation whose extent
 was derived from a recipe longer than what is actually transferred. That is a
 bounded question about one 0x89c0-byte transfer, which is a far smaller target
 than where this started.
+
+## Goal check: all five AKI titles, discovery through render
+
+Measured per stage rather than assumed, 2026-08-05.
+
+| stage | WM2000 | No Mercy | Revenge | World Tour | VPW2 |
+|---|---|---|---|---|---|
+| discovery (recipes/mappings) | 4/4 | 5/5 | 2/2 | 2/2 | 4/4 |
+| generic recompile gate | pass | pass | `unsupported=0` | `unsupported=0` | pass |
+| boot context captured | yes | NO | NO | NO | NO |
+| executable images captured | yes | NO | NO | NO | NO |
+| runtime lane (shard pack) | yes | NO | NO | NO | NO |
+| render / playable | no | no | no | no | no |
+
+**Discovery and recompilation generalize; the runtime lane does not.**
+
+Discovery recovers overlay geometry for all five with no per-game
+configuration, and `gate_rom_recompile` -- the generic gate, which takes only
+`FN64_DISCOVER_ROM` -- reports `unsupported=0` for Revenge and World Tour,
+matching the other three. That half of the pipeline is genuinely general.
+
+The runtime lane is not. `examples/wm2000-block-boot` names WM2000 in 63
+places, its 35 dense-AOT shard packages are all `wm2000-block-*`, and the only
+captures on disk are `wm2000-boot-context.json` and one WM2000 exception-image
+group. So the other four titles have never been booted, not because they fail,
+but because no lane exists to boot them in.
+
+Reaching "all five playable" therefore needs, in order:
+
+1. a per-title (or title-generic) shard pack and boot lane -- today this is a
+   WM2000-shaped example, not a pipeline stage;
+2. a captured BootContext and executable-image group per title, via the
+   existing `scripts/capture-boot-context.zsh` and
+   `capture-wm-executable-image-group.zsh`;
+3. the three blockers already measured on WM2000, which the others will hit
+   too: the overlay-tail transfer, reconciliation speed (23.5x slower than
+   realtime), and input driving gameplay.
+
+Items 1 and 2 are mechanical but real work. Item 3 is the same set of unknowns
+for every title, so solving it once on WM2000 should carry.
