@@ -1281,6 +1281,49 @@ Worth stating plainly: this has *not* been implemented or tested. It is the
 cheapest of the three and the only one that fabricates nothing, but "cheapest
 and most honest" is a design argument, not evidence that it boots.
 
+## State at handoff
+
+**Primary goal met and independently verified.** All five AKI titles certify at
+`HEADLINE unsupported=0` in the full 287-ROM corpus sweep, measured from the
+corpus ROMs rather than the private paths used to develop against.
+
+**Secondary goal measured, not met: 190/287 (66.2%).** The shape matters more
+than the rate -- 62 of the 97 failures reached full emission and failed only on
+unsupported destinations, 24 of them on exactly ONE and 31 on three or fewer.
+`NoUniqueAdmittedTable` (20 ROMs) is the largest single cause anywhere.
+
+**Gameplay: one defect gates the remaining three blockers.** WM2000's boot
+executes libultra's 64DD drive-init, which installs `0xA6000000` into its
+handle and probes it. That window is `PI_DOM1_ADDR1`; a cartridge-only title
+has no device there. Both lanes -- the certified batch runner and the windowed
+shell -- now stop at exactly this point, so the playable lane, audio
+verification, and pacing are all downstream of it.
+
+The recognizer for that role now exists and is verified (15 FOUND / 272 ABSENT
+/ 0 errors across the corpus). **Nothing consumes it yet**, and the three ways
+to answer it are recorded above in ascending order of invention: preset the
+guard word the guest already checks (invents nothing), implement an
+`osDriveRomInit` shim reporting no drive (a public libultra contract), or
+return a bus value (mupen and Ares disagree; no measurement exists).
+
+### Dead ends, so they are not repeated
+
+* `opt-level = 3` on the interpreter crates -- no measurable change.
+* Word-wise RDRAM copy -- correct and kept, but 138s -> 134s.
+* A frame-dump correlation -- a `nice` artefact; compare progress, not
+  wall-clock.
+* "Unbound existing shim" -- wrong; no `osDriveRomInit` shim exists.
+* Two unit tests that passed with the fix reverted -- deleted rather than kept
+  as false assurance.
+
+### What actually moved the loop
+
+MMIO KSEG1 pre-check (2.8x), release build once `debug = true` was removed
+from its profile (2x on the real route), and a byte-targeted store trap plus
+`RUST_BACKTRACE` that turned an unbounded search into single targeted runs.
+The remaining cost is re-executing an identical ~400k-step deterministic boot
+prefix; snapshot/restore of executor state is the lever nobody has built.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
