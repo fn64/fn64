@@ -18,6 +18,33 @@
 # CONSEQUENCE: no admission-rule tuning reaches 80% of the corpus. Those
 # ROMs need a DIFFERENT descriptor family (see vrom_family, or per-overlay
 # headers as in Bomberman 64), not a looser AKI-family threshold.
+#
+# FOLLOW-UP MEASUREMENT (2026-08-05) -- the ceiling is lower than "a second
+# family" implies, and this is the number that should drive planning:
+#
+#   186 / 229 (81%)  have NO CODE OVERLAYS AT ALL. >=95% of every JR RA sits
+#                    in ONE leading resident span. Independently reproduced on
+#                    Super Mario 64: 5,198 JR RA, 0.84 of them below 0x200000.
+#                    No descriptor family can unlock these -- there is nothing
+#                    to describe. They are single-bank games.
+#    43 / 229 (19%)  genuinely multi-span, real overlays exist (ISS 2000,
+#                    Pokemon Stadium, Sin & Punishment). Their descriptors are
+#                    SCATTERED POINTER REFERENCES, not contiguous arrays --
+#                    ISS 2000's off-bank code at 0x260000 is referenced by 550
+#                    ROM words, none as an adjacent triple.
+#     2 / 229        dmadata (OoT, MM): 16B [vromS][vromE][romS][romE], VROM-
+#                    indirect and Yaz0-compressed (1457/1510 entries in OoT).
+#     1 / 229        Rare deflate (Banjo-Kazooie).
+#
+# WHY THE SEARCH FINDS NOTHING: overlay_regions/mod.rs:371-378 hard-codes three
+# ADJACENT words [rom_start][rom_end][vram_dest]. All 6 field permutations were
+# tested across 224 ROMs and NO permutation helps; apparent hits are counter
+# arrays with jrra=0 in their regions. Relaxing the field layout is worth 0
+# ROMs and would admit garbage.
+#
+# So the realistic ceiling for table-shaped discovery is ~48 + 15-25 = 63-73 of
+# 287, not 287. "All N64 ROM support" via one more descriptor family is not
+# available; the single-bank majority needs no overlay discovery at all.
 cause	rom	detail
 ADMITTED_1	007 - The World Is Not Enough (Europe) (En,Fr,De)	candidates=4
 ADMITTED_1	Air Boarder 64 (Europe)	candidates=2
