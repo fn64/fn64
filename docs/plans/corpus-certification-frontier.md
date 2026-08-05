@@ -1379,3 +1379,46 @@ prefix; snapshot/restore of executor state is the lever nobody has built.
 - Certification does not require overlay geometry -- only 41 of 287 corpus
   ROMs recover any -- so single-bank titles certify without it. The failures
   above are ROMs that *need* overlays and do not get them.
+
+## Dispatch-path reconciliation: measured shape, 2026-08-05
+
+The certified lane runs ~402 guest scheduling steps/second. Three per-byte
+snapshot readers were converted to the word-wise path this session
+(795efaf, 1447a1b, 10aa3a6), and the remaining shape is:
+
+- **Two full 1 MiB reads per dispatch iteration** -- `runners.rs:622`
+  (`invalidate_pending_physical_writes`) and `:623`
+  (`reconcile_before_dispatch`), plus two full memcmps.
+- **Zero SHA-256 in the steady state.** `adopt_snapshot` returns before
+  `digest_snapshot` when the bytes compare equal, and `commit_snapshot` only
+  runs with non-empty writes/events. So hashing is no longer the cost;
+  sequential 1 MiB traffic and CALL FREQUENCY are.
+- The trigger is not "per 1024 guest instructions" (the closure budget) but
+  per block transfer, per host-ABI call, per thread selection
+  (`execution.rs:667`), and per scheduler turn (`runners.rs:878`).
+
+### `runners.rs:623` is NOT redundant -- checked
+
+An analysis proposed deleting `:623` outright, arguing `:622` always adopts
+the snapshot as `expected`, making the following reconcile provably empty.
+That is wrong on one path: `commit_snapshot` returns early at
+`live_program.rs:521-523` when `declarations` is non-empty but `changed` is
+empty, leaving `expected` UNADVANCED. `:623` is the check that catches a
+later divergence in that case.
+
+Deleting it is the same class of change as the reverted write-queue gate,
+which resurrected the `0x0009b0b3` panic at 200k steps while all unit tests
+passed. Sharing one snapshot between the two calls is the safe half of the
+idea and remains available.
+
+### The ceiling is a certification decision, not a mechanical fix
+
+Value-preserving work (shared snapshot, double-buffered scratch to stop
+allocating and freeing 2 MiB per dispatch) is estimated to reach roughly
+1,200-2,000 steps/s. Playable framerates need 10^4-10^5 steps/s, which means
+reducing HOW OFTEN reconciliation happens -- e.g. hardware page protection
+over the watched region, reconciling only dirtied 4 KiB pages.
+
+That changes when the firewall checks, not what any digest asserts, but it is
+still a change to the certification model's operational meaning and needs
+sign-off rather than a unilateral optimization.
