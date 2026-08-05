@@ -1073,6 +1073,87 @@ pub fn recover_overlay_regions(
 /// family. Keeping enumeration and admission separately callable lets build
 /// tooling reuse or profile the exhaustive ROM scan without weakening the
 /// proof rule: the candidates remain explicit inputs and the returned report
+/// Collapse admitted tables that describe the SAME array read at different
+/// strides, keeping the one that maps more regions.
+///
+/// `collapse_stride_aliases` already handles the case where one stride divides
+/// another. It cannot handle a phase-shifted re-read at a co-prime stride, and
+/// that is the shape behind the largest remaining corpus failure. Measured on
+/// all 287 corpus ROMs (`examples/probe_admitted_shapes.rs`), 26 have two or
+/// more admitted tables, and their pairwise ROM-interval relationship splits
+/// them cleanly:
+///
+/// ```text
+///   Knife Edge   stride 0x2c vs 0x28   shared=1 left_only=1 right_only=1  overlapping
+///   Dual Heroes  stride 0x24 vs 0x24   shared=0 left_only=2 right_only=2  disjoint
+/// ```
+///
+/// Two tables that share even one exact `(rom_start, rom_end)` record cannot
+/// both be independent descriptor arrays -- one ROM span cannot be a record of
+/// two different arrays at once. Two tables that share nothing may well be two
+/// real arrays, which is precisely Dual Heroes, so those keep refusing.
+///
+/// Corpus-wide this splits the 26 into 15 collapsible and 11 that stay
+/// ambiguous. Sharing is the discriminator; a subset test would NOT work,
+/// because Knife Edge's tables overlap without either containing the other.
+fn collapse_overlapping_admissions(admissions: &mut [TableAdmission]) {
+    let live: Vec<usize> = admissions
+        .iter()
+        .enumerate()
+        .filter(|(_, admission)| admission.admitted)
+        .map(|(index, _)| index)
+        .collect();
+    if live.len() < 2 {
+        return;
+    }
+    let intervals: Vec<Vec<(u32, u32)>> = live
+        .iter()
+        .map(|&index| admissions[index].table.interval_set())
+        .collect();
+
+    let mut dropped = vec![false; live.len()];
+    for left in 0..live.len() {
+        for right in (left + 1)..live.len() {
+            if dropped[left] || dropped[right] {
+                continue;
+            }
+            if admissions[live[left]].table.destination_field
+                != admissions[live[right]].table.destination_field
+            {
+                continue;
+            }
+            let shares = intervals[left]
+                .iter()
+                .any(|entry| intervals[right].contains(entry));
+            if !shares {
+                continue;
+            }
+            // Keep the table that maps more regions; on a tie keep the one
+            // with more records, then the earlier one, so the choice is a
+            // deterministic function of the ROM rather than of iteration
+            // order.
+            let left_key = (
+                admissions[live[left]].mapped_regions,
+                admissions[live[left]].table.records.len(),
+            );
+            let right_key = (
+                admissions[live[right]].mapped_regions,
+                admissions[live[right]].table.records.len(),
+            );
+            if right_key > left_key {
+                dropped[left] = true;
+            } else {
+                dropped[right] = true;
+            }
+        }
+    }
+    for (slot, &index) in live.iter().enumerate() {
+        if dropped[slot] {
+            admissions[index].admitted = false;
+        }
+    }
+}
+
 /// retains the complete searched configuration.
 pub fn admit_overlay_region_tables(
     rom_bytes: &[u8],
@@ -1229,6 +1310,8 @@ pub fn admit_overlay_region_tables(
             }
         }
     }
+
+    collapse_overlapping_admissions(&mut admissions);
 
     OverlayRecovery {
         config: config.clone(),
