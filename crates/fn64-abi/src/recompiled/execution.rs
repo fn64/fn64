@@ -875,6 +875,27 @@ pub(super) fn record_recompiled_unsupported(context: &str) {
 pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
     let context = context.into();
     record_recompiled_unsupported(&context);
+    // These panics fire inside non-unwinding generated code, so the process
+    // ABORTS -- any diagnostic printed at normal exit never runs. WM2000's
+    // AotMiss is exactly that case: the question is which PI DMA delivered
+    // the executable image, and by the time the harness could report it the
+    // process is gone. Dump here, where the evidence still exists.
+    if std::env::var_os("FN64_BLOCK_PI_DMA_DUMP").is_some() {
+        eprintln!("[pi-dma] transfers preceding: {context}");
+        for event in crate::copy_device_trace() {
+            let (tag, request) = match event.kind {
+                fn64_runtime::DeviceTraceKind::PiDmaStarted(request) => ("started", request),
+                fn64_runtime::DeviceTraceKind::PiBytesCommitted(request) => ("committed", request),
+                _ => continue,
+            };
+            eprintln!(
+                "[pi-dma] {tag} dram={:#010x} len={:#x} dir={:?}",
+                request.dram_addr.offset(),
+                request.len,
+                request.direction,
+            );
+        }
+    }
     panic!("{context}")
 }
 
