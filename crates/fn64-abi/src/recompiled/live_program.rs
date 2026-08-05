@@ -1617,9 +1617,24 @@ impl CanonicalLiveBlockProgramV1 {
     }
 
     pub(super) fn reconcile_before_dispatch(&self, mem: &Rdram<'_>) {
-        self.reconcile_before_dispatch_with(|physical| {
-            mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
-        });
+        let Some(state) = &self.mutation_state else {
+            return;
+        };
+        // This runs at EVERY dispatch boundary over the 1 MiB boot bank, and
+        // profiling put it at 1055 of 2627 samples once the hash moved to the
+        // hardware backend. `reconcile_before_dispatch_with` reads through a
+        // per-byte closure -- a bounds check and a lane XOR per byte -- which
+        // `read_snapshot_from_view` already replaces with a word-wise copy.
+        // Its own doc comment says the hot paths should use it; this is the
+        // hot path.
+        state
+            .borrow_mut()
+            .seal_with(|physical| mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical)));
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        let snapshot = state.borrow().read_snapshot_from_view(&view);
+        state
+            .borrow_mut()
+            .reconcile_snapshot_before_dispatch(snapshot);
     }
 
     pub(super) fn reconcile_before_dispatch_with(&self, mut read_physical_byte: impl FnMut(u32) -> u8) {

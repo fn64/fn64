@@ -558,6 +558,17 @@ impl<'a> Rdram<'a> {
         self.mem
     }
 
+    /// Borrow the backing allocation for reading.
+    ///
+    /// The shared counterpart to [`Self::as_mut_slice`], for callers that only
+    /// need to read. The canonical mutation journal wants this: it snapshots
+    /// the watched region at every dispatch boundary, and going through a
+    /// per-byte closure costs a bounds check and a lane XOR per byte over a
+    /// 1 MiB region.
+    pub fn as_slice(&self) -> &[u8] {
+        self.mem
+    }
+
     /// Snapshot one physical RDRAM interval in guest byte order.
     ///
     /// Canonical executable-image reconciliation uses this read-only API so
