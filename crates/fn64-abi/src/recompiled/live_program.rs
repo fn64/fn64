@@ -1752,26 +1752,17 @@ impl CanonicalLiveBlockProgramV1 {
             // ~42% of the shell's profile against 1 sample of actual guest
             // execution.
             //
-            // `writes` deliberately carries EVERY guest store, not just the ones
-            // hitting executable memory -- generation invalidation above needs
-            // the broad list, and two tests pin that. But a store outside every
-            // watched range cannot change a watched byte, so it cannot change
-            // the digest or produce a journal entry.
-            //
-            // So gate on the intersection rather than on emptiness: read and
-            // hash only when some write actually lands in a watched range.
-            let touches_watched = !events.is_empty()
-                || state.borrow().watched_ranges().iter().any(
-                    |&(watched_start, watched_end)| {
-                        writes.iter().any(|&(offset, len)| {
-                            let end = offset.saturating_add(len);
-                            offset < watched_end && end > watched_start
-                        })
-                    },
-                );
-            if !touches_watched {
-                return invalidated;
-            }
+            // NOTE: gating this read on "does some queued write intersect a
+            // watched range" is WRONG and was reverted. It assumes `writes`
+            // enumerates every mutation of watched memory, and it does not --
+            // at least one path reaches RDRAM without passing through
+            // `record_executable_and_renderer_write`. Skipping the read on that
+            // assumption leaves `expected` stale, and the next dispatch fails
+            // as "unjournaled executable mutation changed physical RDRAM
+            // [0x0009b0b3, 0x0009b0b4) before canonical static dispatch" --
+            // the same byte as the original Blocker A panic, in the gate lane
+            // at 200k steps. The unconditional read is what makes the snapshot
+            // the source of truth rather than the write queue.
             let snapshot = state.borrow().read_snapshot(read_physical_byte);
             // Skip a commit that has nothing to say. Both the guest-execution
             // path and the device-time advance
