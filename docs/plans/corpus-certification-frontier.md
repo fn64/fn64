@@ -1569,3 +1569,67 @@ bytes first differ from the compiled image. `AotMiss`
 cannot distinguish "the game wrote to a data field inside the image" from
 "this is a different overlay". Recording the first differing offset at the
 activation is the cheap next step, and it decides which fix is correct.
+
+### Resolved by offline diff: the live bytes are a correctly-loaded overlay
+
+The offline ROM-side comparison settles it. WM2000 has FOUR proven load
+mappings, and TWO of them load at `0x800e1b90`:
+
+    rom 0x04c160..0x073390  len 0x27230  -> 0x800e1b90   (overlay A)
+    rom 0x0d2720..0x144aa0  len 0x72380  -> 0x800e1b90   (overlay D, match arena)
+
+They are genuinely different code: their images first differ at byte `+0x8`
+(`0c0386eb…` vs `3c018015…`). So a digest over any shared extent must differ
+between them, exactly as expected for two overlays sharing a VRAM slot.
+
+Hashing the FAILING extent `[0x800e1b90,0x80100400)` (len `0x1e870`) over each
+ROM image identifies the live bytes exactly:
+
+    overlay A  2fb3f01e8389f402…   == the "observed" digest in the AotMiss
+    overlay D  774d8ba0a92a2f70…
+    expected   5066618cf9c46212…   == neither
+
+**The bytes in RAM are unmodified overlay A, correctly loaded from ROM.**
+Nothing is corrupt and no runtime write is involved -- the earlier
+"mutable-prefix" and "generation-selection" theories are both dead.
+
+The real defect is in the PACK: it contains a generation whose expected digest
+matches NEITHER ROM image at that extent. The activation asks "are these
+generation X's bytes?" about an extent (`0x1e870`) that is not overlay A's
+length (`0x27230`) nor overlay D's (`0x72380`), so the question can never be
+answered yes by correctly-loaded memory.
+
+And the mystery extent is now identified. It is not an overlay at all: it is
+the RESIDENT TAIL generation, built at `examples/wm2000-block-boot/build.rs:496-509`:
+
+    resident_image_start = min(recipe.load_start)          = 0x800e1b90
+    resident_image_end   = va_start + bank_bytes.len()
+                         = 0x80000400 + 0x100000           = 0x80100400
+
+i.e. the slice of the 1 MiB boot bank lying PAST where the first overlay
+loads, whose expected digest is the boot bank's own ROM bytes.
+
+So every step is behaving correctly:
+
+1. the pack emits a resident-tail generation for `[0x800e1b90,0x80100400)`,
+   digesting the boot bank's bytes there;
+2. the game DMAs overlay A over that same address range -- a legitimate
+   overlay load;
+3. execution reaches `0x800F61B4`, inside the region;
+4. the selector digests every generation containing that PC. The resident
+   tail no longer matches, because overlay A is resident now. Neither overlay
+   A's nor overlay D's generation matches either, because their extents
+   (`0x27230`, `0x72380`) differ from the resident tail's (`0x1e870`), so
+   their digests cover different byte ranges.
+
+The firewall is right that the resident tail is gone. What is missing is that
+the pack has no generation describing "overlay A resident at `0x800e1b90`"
+with overlay A's own extent AND a shard covering `0x800F61B4`. The overlay
+generations exist -- `probe_load_mapping` proves all four mappings and the
+route entered generation `6767235783115491731` at `[0x800e1b90,0x80108dc0)` --
+so the gap is narrower than "no generation": the entered generation does not
+carry a shard for this PC, and activation therefore falls through to the
+resident tail.
+
+That is a pack-construction question about shard coverage, not a runtime
+firewall problem, and it is the concrete next thing to fix.
