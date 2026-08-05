@@ -1837,3 +1837,35 @@ inventory asking for a shard that title does not have.
 So a title-generic lane needs the package set GENERATED per title rather than
 listed. That is mechanical (the counts are already computed) but it is a
 build-system change, not a constant to relax.
+
+### Narrowing the overlay-tail cause: four eliminations
+
+Working candidate (a) "the guest's PI DMA is truncated" against the other two,
+each eliminated by direct inspection rather than by argument:
+
+- **(c) discovery over-declared the extent -- DEAD.** The ROM's OWN descriptor
+  record at ROM `0x48a80` reads `start=0x4c160 end=0x73390 vram=0x800e1b90`,
+  i.e. `len=0x27230`. Discovery reports exactly that. The game's table says the
+  overlay is `0x27230` bytes.
+- **(b) publication stops short -- DEAD.** The lane publishes only the IPL3
+  1 MiB boot copy (`examples/wm2000-block-boot/src/main.rs:944`); overlays are
+  never published, so publication cannot truncate one.
+- **the pack clipped the generation -- DEAD.** The generated `pack.rs` carries
+  overlay A as `image_start: 0x800E1B90, image_end: 0x80108DC0`, the full
+  `0x27230`, not clipped to the bank end.
+- **the DMA path clamps -- DEAD.** `try_start_dma` (`fn64-runtime/src/rom.rs:646`)
+  allocates `vec![0u8; len]` and calls `dma_write_bytes` with the whole buffer;
+  `dma_write_bytes` (`rdram.rs:573`) forwards to `write_logical_bytes` with no
+  min/clamp/saturating bound anywhere in the path.
+
+One structural fact stands out and is NOT a coincidence: the present prefix
+`0x1e870` is not a multiple of any natural DMA chunk size (0x1000, 0x2000,
+0x4000, 0x8000, 0x10000), but `0x800e1b90 + 0x1e870` is EXACTLY `0x80100400`,
+the boot-bank end. Whatever stops at that boundary is doing so because it is a
+boundary, not because a transfer happened to end there.
+
+Diagnostic note: `PiBytesCommitted` records the ORIGINAL request
+(`fabric_ops.rs:812`), not the byte count actually written, so started-vs-
+committed lengths are always equal and cannot by themselves prove truncation.
+The dump is still worth having -- it shows whether the guest ever requests
+`0x27230` at that destination at all.
