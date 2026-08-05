@@ -1110,6 +1110,40 @@ model the N64DD, not a value copied from whichever emulator was asked first.
 
 Both were consulted before concluding; the disagreement is the finding.
 
+## The full corpus, measured: 190 of 287 (66.2%)
+
+The sweep is complete -- all 287 ROMs, no sampling. Earlier figures in this
+document (17/26, 27/39, 170/262) were partial runs; this supersedes them.
+
+**All five AKI titles certify at `unsupported=0`**, confirmed here from the
+corpus ROMs rather than the private paths: WWF WrestleMania 2000, WWF No
+Mercy, WCW/nWo Revenge, WCW vs. nWo World Tour, Virtual Pro Wrestling 2.
+
+The 97 failures split cleanly:
+
+| class | count |
+|---|---|
+| reached full emission, failed only on unsupported destinations | **62** |
+| `NoUniqueAdmittedTable` (competing overlay tables) | 20 |
+| `InvalidResidentSplit` (generation topology) | 6 |
+| `InvalidRangeRelations` (descriptor lacks section extents) | 5 |
+| `UnalignedField` / `SourceFieldsChanged` | 2 |
+
+The 62 are the interesting group, because they discovered, packed, emitted,
+compiled and probed successfully and then failed on a handful of
+destinations:
+
+* **24 ROMs fail on exactly ONE destination**
+* **31 fail on three or fewer**
+
+That is a very different shape from "66% works, 34% is broken". A third of
+the corpus is one to three unresolved destinations away from certifying, and
+those destinations are individually diagnosable the same way WM2000's were --
+each names a PC and an address.
+
+The remaining 33 fail earlier, in overlay recovery, and `NoUniqueAdmittedTable`
+at 20 ROMs is the single largest cause anywhere in the corpus.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
