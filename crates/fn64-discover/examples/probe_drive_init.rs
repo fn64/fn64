@@ -12,7 +12,10 @@ fn main() {
         .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
         .collect();
     match discover_drive_rom_init_host_binding(&words, entry) {
-        Ok(Some(binding)) => println!("FOUND at {:#010x}", binding.vram),
+        Ok(Some(found)) => println!(
+            "FOUND at {:#010x} guard={:#010x}",
+            found.binding.vram, found.guard_vram
+        ),
         Ok(None) => println!("absent (no disk-drive routine)"),
         Err(error) => println!("ERR {error:?}"),
     }

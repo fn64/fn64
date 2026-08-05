@@ -1383,6 +1383,20 @@ fn is_drive_rom_init(words: &[u32]) -> bool {
         .any(|word| op(*word) == 0x0f && rs(*word) == 0 && (*word & 0xffff) == 0xa600)
 }
 
+/// A recovered 64DD drive-init routine and the guard word it tests.
+///
+/// The guard is the useful output. Both of the routine's paths return the same
+/// static `OSPiHandle *`; the guard only decides whether the device probe runs.
+/// A consumer that presets it therefore selects a path the guest already
+/// implements, without inventing a bus value or a return contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriveRomInitBinding {
+    pub binding: HostBinding,
+    /// Physical address of the once-only guard word, recovered from the same
+    /// `lui`/`lw` pair the recognizer matches.
+    pub guard_vram: u32,
+}
+
 /// Discover libultra's 64DD drive initialisation from its public guard-word and
 /// base-installation behavior.
 ///
@@ -1392,7 +1406,7 @@ fn is_drive_rom_init(words: &[u32]) -> bool {
 pub fn discover_drive_rom_init_host_binding(
     words: &[u32],
     va_start: u32,
-) -> Result<Option<HostBinding>, HostBindingDiscoveryError> {
+) -> Result<Option<DriveRomInitBinding>, HostBindingDiscoveryError> {
     if !va_start.is_multiple_of(4) {
         return Err(HostBindingDiscoveryError::UnalignedImage);
     }
@@ -1403,10 +1417,19 @@ pub fn discover_drive_rom_init_host_binding(
         HostBindingSymbol::OsDriveRomInit,
         is_drive_rom_init,
     ) {
-        Ok(vram) => Ok(Some(HostBinding {
-            symbol: HostBindingSymbol::OsDriveRomInit,
-            vram,
-        })),
+        Ok(vram) => {
+            let index = ((vram - va_start) / 4) as usize;
+            // The matched window opens with the guard's own lui/lw pair, so its
+            // address is recoverable from the same words the predicate checked.
+            let guard_vram = absolute_from_lui_offset(words[index], imm(words[index + 1]));
+            Ok(Some(DriveRomInitBinding {
+                binding: HostBinding {
+                    symbol: HostBindingSymbol::OsDriveRomInit,
+                    vram,
+                },
+                guard_vram,
+            }))
+        }
         // `unique_match` reports both "no match" and "several matches" as
         // NonUniqueSemanticMatch; an empty candidate list is the absent case.
         // A title with no disk-drive routine is normal, several is ambiguous
