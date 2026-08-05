@@ -59,9 +59,24 @@ pub enum CodeSpanClass {
 }
 
 impl CodeSpanClass {
-    /// Whether "no overlay table found" should be read as complete rather than
-    /// as a gap. Only [`Self::MultiSpan`] indicates something was missed;
-    /// [`Self::NoCodeFound`] is inconclusive and deliberately not complete.
+    /// Whether "no overlay table found" is CONSISTENT with the ROM's code
+    /// layout, rather than evidence something was missed.
+    ///
+    /// # This is a weak signal, not a proof of absence
+    ///
+    /// Measured counter-example: WWF WrestleMania 2000 reports `SingleBank` at
+    /// concentration 1.00 (2,484 `jr $ra`, one span `[0x878,0x13d1c8)`) and it
+    /// *does* have overlays that discovery recovers. Its overlay images are
+    /// loaded from ROM offsets INSIDE that same contiguous span, so nothing in
+    /// the code-density profile distinguishes them from the resident bank.
+    ///
+    /// So a true return means only "the ROM does not look multi-span", which
+    /// is one input to a judgement, never the judgement itself. It is safe in
+    /// the aggregate -- it correctly separated 208 complete ROMs from 21 real
+    /// misses across the corpus -- and unsafe as a per-ROM verdict.
+    ///
+    /// [`Self::MultiSpan`] is the informative direction: distant code the
+    /// overlay search did not account for is a genuine gap.
     pub fn absent_overlays_are_expected(self) -> bool {
         matches!(self, Self::SingleBank | Self::MostlySingleBank)
     }
@@ -182,6 +197,20 @@ mod tests {
         let locality = measure_code_span_locality(&rom_with_jr_ra_at(&offsets, 0x800000));
         assert_eq!(locality.class, CodeSpanClass::MostlySingleBank);
         assert!((locality.largest_span_concentration - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn single_bank_does_not_prove_overlays_are_absent() {
+        // WM2000's real shape: every jr $ra in one contiguous span, yet the
+        // ROM has overlays discovery recovers -- their images live INSIDE that
+        // span. This pins the limitation so `absent_overlays_are_expected` is
+        // never mistaken for a proof of absence.
+        let offsets: Vec<usize> = (0..200).map(|index| 0x878 + index * 0x40).collect();
+        let locality = measure_code_span_locality(&rom_with_jr_ra_at(&offsets, 0x200000));
+        assert_eq!(locality.class, CodeSpanClass::SingleBank);
+        assert!((locality.largest_span_concentration - 1.0).abs() < 1e-9);
+        // True here, and yet overlays exist in the real ROM with this shape.
+        assert!(locality.class.absent_overlays_are_expected());
     }
 
     #[test]

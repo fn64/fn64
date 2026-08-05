@@ -18,6 +18,14 @@
 #
 # The remaining overlay-discovery gap is therefore ~21 ROMs, not 229.
 # Cross-check against corpus-zero-admitted-cause.tsv reproduces this.
+#
+# LIMITATION -- this is a weak signal, not a proof of absence. WWF
+# WrestleMania 2000 is SINGLE_BANK at concentration 1.00 and DOES have
+# overlays discovery recovers: its overlay images load from ROM offsets
+# inside that same contiguous span, so code density cannot distinguish
+# them from the resident bank. Use SINGLE_BANK as one input to a
+# judgement, never as the judgement. MULTI_SPAN is the informative
+# direction: distant unaccounted code is a genuine gap.
 class	rom	detail
 MOSTLY_SINGLE_BANK	1080 TenEighty Snowboarding (Japan, USA) (En,Ja)	jr_ra=2988 spans=4 concentration=0.84 largest=[0xdd0a6c,0xe5a368)
 MOSTLY_SINGLE_BANK	Body Harvest (Europe) (En,Fr,De)	jr_ra=3405 spans=6 concentration=0.88 largest=[0x878,0x1967cc)
