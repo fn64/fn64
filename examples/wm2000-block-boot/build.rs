@@ -431,10 +431,14 @@ fn main() {
         &overlay_recovery,
     )
     .expect("wm2000-block-boot build.rs: recovering one complete overlay recipe table");
-    assert_eq!(
-        overlay_recipes.len(),
-        4,
-        "wm2000-block-boot build.rs: NWXE closure requires four recovered overlay generations"
+    // Overlay COUNT is a property of the ROM, not of this lane: discovery
+    // recovers 4 for WM2000, 5 for No Mercy, 2 for Revenge and World Tour, and
+    // 4 for VPW2. Pinning it at 4 made the lane WM2000-only for no reason --
+    // every geometry below is already derived from `overlay_recipes` itself.
+    // What the lane genuinely requires is at least one recovered overlay.
+    assert!(
+        !overlay_recipes.is_empty(),
+        "wm2000-block-boot build.rs: closure requires at least one recovered overlay generation"
     );
     let overlay_names = (0..overlay_recipes.len())
         .map(|index| format!("recovered_overlay_{index}"))
@@ -663,15 +667,29 @@ fn main() {
             }
         })
         .collect::<Vec<_>>();
+    // Shard counts follow from the boot bank size and where the FIRST overlay
+    // loads, both of which are per-ROM: WM2000 splits 15 + 2, other titles
+    // split elsewhere. The invariant the lane actually needs is that the two
+    // halves together tile the bank and that the prepared package inventory
+    // has a shard for each, which the topology checks below enforce.
+    let expected_total_shards = PREPARED_PACKAGES
+        .iter()
+        .filter(|name| {
+            name.starts_with("wm2000-block-shard-")
+                || name.starts_with("wm2000-block-resident-tail-shard-")
+        })
+        .count();
     assert_eq!(
+        boot_shards.len() + resident_tail_shards.len(),
+        expected_total_shards,
+        "resident topology must tile the boot bank across the prepared packages: \
+         {} boot + {} tail vs {expected_total_shards} prepared",
         boot_shards.len(),
-        15,
-        "NWXE static-prefix package topology must cover exactly 15 shards"
-    );
-    assert_eq!(
         resident_tail_shards.len(),
-        2,
-        "NWXE resident-tail package topology must cover exactly two shards"
+    );
+    assert!(
+        !boot_shards.is_empty() && !resident_tail_shards.is_empty(),
+        "resident split must produce both a static prefix and a resident tail"
     );
     assert_eq!(
         boot_shards.last().map(|shard| {

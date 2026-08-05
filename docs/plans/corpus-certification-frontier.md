@@ -1787,3 +1787,53 @@ Reaching "all five playable" therefore needs, in order:
 
 Items 1 and 2 are mechanical but real work. Item 3 is the same set of unknowns
 for every title, so solving it once on WM2000 should carry.
+
+## Title-generic boot lane: three of five reach it, one wall remains
+
+Generalizing `examples/wm2000-block-boot/build.rs` removed the assertions that
+pinned it to WM2000, all of which were unnecessary -- every geometry it needs
+was already DERIVED from discovery:
+
+- `overlay_recipes.len() == 4` -> at least one. Discovery recovers 4 for
+  WM2000, 5 for No Mercy, 2 for Revenge and World Tour, 4 for VPW2.
+- `boot_shards.len() == 15` and `resident_tail_shards.len() == 2` -> the
+  halves must tile the bank and match the prepared inventory. The split point
+  follows from where the FIRST overlay loads, which is per-ROM.
+
+WM2000 still builds unchanged after these edits.
+
+### Host bindings: a real per-title gap, measured
+
+`crates/fn64-discover/examples/probe_host_bindings.rs` reports which of the 15
+WM-block runtime host symbols each title resolves uniquely:
+
+    WWF WrestleMania 2000     OK 15/15
+    WWF No Mercy (Rev A)      OK 15/15
+    Virtual Pro Wrestling 2   OK 15/15
+    WCW-nWo Revenge           FAIL -- OsSetEventMesg, 0 candidates
+    WCW vs. nWo World Tour    FAIL -- OsCreateMesgQueue, 0 candidates
+
+The two 1998 WCW titles are an earlier engine revision whose libultra shapes
+the current signatures do not match. That is a discovery question, not a lane
+question, and it bounds those two titles out of the lane until the signatures
+generalize.
+
+### The remaining wall: the shard package inventory is fixed
+
+`PREPARED_PACKAGES` is a 35-entry array encoding WM2000's shard distribution.
+Shard COUNT is derived per generation (`examples/wm2000-block-shards/build.rs:312`),
+but the package LIST is not, so a title whose overlays tile differently cannot
+be expressed:
+
+    WM2000   overlays=4  shards per overlay [3, 1, 6, 8]  total 18
+    NoMercy  overlays=5  shards per overlay [3, 3, 5, 8, 5] total 24
+    VPW2     overlays=4  shards per overlay [3, 2, 6, 8]  total 19
+
+Building the lane for No Mercy now gets through host bindings, every
+generalized assertion, and into shard emission before failing with "shard
+index 5 is outside generation recovered_overlay_2 with 5 shards" -- the fixed
+inventory asking for a shard that title does not have.
+
+So a title-generic lane needs the package set GENERATED per title rather than
+listed. That is mechanical (the counts are already computed) but it is a
+build-system change, not a constant to relax.
