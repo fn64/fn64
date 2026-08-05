@@ -1180,6 +1180,37 @@ divisibility -- record overlap is the obvious candidate, but it must not
 collapse Dual Heroes' two independent arrays, which is exactly the failure
 mode the divisibility requirement was protecting against.
 
+## The domain-1 read may be a binding gap, not a hardware-modelling gap
+
+Following the faulting routine further changes what the fix probably is.
+
+After parsing the word into device-ID fields, the code **stores them and
+proceeds** -- `0x80022654` calls `0x8002a250`, and the instructions after the
+return contain no comparison against the parsed nibbles. Nothing branches on
+the identity. That is the shape of libultra device initialisation recording
+what it found, not of a routine validating a device it requires.
+
+And fn64 **already shims that layer**: `os_cart_rom_init` is in the host
+function catalogue (`recompiled/runners.rs:1493`), alongside `os_pi_read_io`,
+`os_pi_start_dma`, and `os_epi_start_dma`. Those bindings are resolved by
+address discovery rather than hardcoded PCs, and the WM2000 run reports no
+cart-init binding at all.
+
+So the guest's own copy of that routine is executing natively and probing
+hardware fn64 does not model -- when the intent of the ABI layer is that such
+a routine is intercepted at its entry and answered by the shim.
+
+That reframes the blocker. It is plausibly not "choose a value for an absent
+N64DD" but "the cart/PI init function was not identified and bound", which is
+a *discovery* question with an existing answer path rather than a hardware
+measurement with no consensus. It also explains why the trap is reached at all:
+a bound shim would never execute the raw `lw`.
+
+Not asserted as fact -- confirming it means checking whether `0x8002a250` and
+its caller match a known `osCartRomInit`/`osPiReadIo` signature, and why the
+binder missed them. But it is a materially cheaper and more honest lead than
+adopting one emulator's open-bus value, and it should be tested first.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
