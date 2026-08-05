@@ -1206,10 +1206,29 @@ a *discovery* question with an existing answer path rather than a hardware
 measurement with no consensus. It also explains why the trap is reached at all:
 a bound shim would never execute the raw `lw`.
 
-Not asserted as fact -- confirming it means checking whether `0x8002a250` and
-its caller match a known `osCartRomInit`/`osPiReadIo` signature, and why the
-binder missed them. But it is a materially cheaper and more honest lead than
-adopting one emulator's open-bus value, and it should be tested first.
+**Confirmed.** The block lane issues a curated host-function catalogue
+(`block_program.rs:343`) binding exactly 15 shims: `OsSiDeviceBusy`,
+`OsCreateMesgQueue`, `OsEPiStartDma`, `OsRecvMesg`, `OsSendMesg`,
+`OsCreateThread`, `OsSetEventMesg`, `OsStartThread`, `OsGetThreadPri`,
+`OsSetThreadPri`, `OsSetTimer`, `OsSpTaskLoad`, `OsSpTaskStartGo`,
+`OsSpTaskYield`, `OsSpTaskYielded`. **`OsCartRomInit` is not among them.**
+
+Its addresses come from `build.rs`, which resolves each through
+`fn64_discover::host_bindings::HostBindingSymbol`. That enum contains exactly
+those same 15 variants and **no `OsCartRomInit`** -- so although the shim
+exists in the ABI catalogue (`recompiled/runners.rs:1493`), discovery has no
+recognizer for it and it can never be bound.
+
+So the guest's own cart-init routine executes natively and probes hardware
+fn64 does not model. The fault is a **discovery gap**: a missing recognizer
+for a function whose host implementation already exists.
+
+That is a materially different and cheaper fix than choosing an N64DD return
+value, and it does not require resolving the mupen/Ares disagreement at all --
+a bound shim never executes the raw `lw`. Note `OS_EPI_START_DMA` resolves to
+`0x8002A700`, adjacent to the `0x8002a250` this routine calls, which is
+consistent with the whole PI/cart family living together and only part of it
+being recognized.
 
 ## Honest scope
 
