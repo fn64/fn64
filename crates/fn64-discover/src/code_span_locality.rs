@@ -222,3 +222,50 @@ mod tests {
         assert_eq!(locality.class, CodeSpanClass::SingleBank);
     }
 }
+
+#[cfg(test)]
+mod table_family_outcome_tests {
+    use crate::TableFamilySearchOutcome;
+
+    #[test]
+    fn zero_candidates_and_candidates_none_admitted_are_distinct() {
+        // The whole point: these two both mean "no usable table" and both
+        // showed up as (n, 0) in the old bare counts, but they need opposite
+        // fixes. Across the corpus they split 229 to 10.
+        let none = TableFamilySearchOutcome::classify(0, 0);
+        let rejected = TableFamilySearchOutcome::classify(5, 0);
+        assert_eq!(none, TableFamilySearchOutcome::NoCandidates);
+        assert_eq!(rejected, TableFamilySearchOutcome::CandidatesNoneAdmitted);
+        assert_ne!(none, rejected);
+        assert!(none.needs_a_different_family());
+        assert!(!rejected.needs_a_different_family());
+    }
+
+    #[test]
+    fn one_admitted_table_is_the_usable_outcome() {
+        let outcome = TableFamilySearchOutcome::classify(3, 1);
+        assert_eq!(outcome, TableFamilySearchOutcome::UniqueTable);
+        assert!(!outcome.needs_a_different_family());
+    }
+
+    #[test]
+    fn several_admitted_tables_report_how_many() {
+        // Dual Heroes' shape: two real arrays, discovery correctly refuses.
+        let outcome = TableFamilySearchOutcome::classify(4, 2);
+        assert_eq!(
+            outcome,
+            TableFamilySearchOutcome::AmbiguousTables { admitted: 2 }
+        );
+        assert!(!outcome.needs_a_different_family());
+    }
+
+    #[test]
+    fn admitting_more_than_enumerated_still_classifies() {
+        // Defensive: admission passes are allowed to synthesize, so this must
+        // not panic or silently report NoCandidates.
+        assert_eq!(
+            TableFamilySearchOutcome::classify(0, 2),
+            TableFamilySearchOutcome::AmbiguousTables { admitted: 2 }
+        );
+    }
+}
