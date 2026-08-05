@@ -1711,3 +1711,39 @@ Caveat on the false-positive metric itself: WM2000 is `SingleBank` and
 genuinely HAS overlays loaded from inside its resident span, so a small share
 of single-bank firings could be true positives. That does not rescue a 53%
 rate.
+
+### Route confirms it: the divergence is past the boot-bank end
+
+Re-ran the route with the improved diagnostic. It now reports:
+
+    none of the 3 precompiled generations containing 0x800F61B4 matched live
+    memory; first: AotMiss for bank:89C4A396A5B53C23 range
+    0x800E1B90..0x80100400: expected 5066618c..., observed 2fb3f01e...
+
+which is the intended improvement -- previously this named ONE generation and
+read as "this image changed", sending three investigations after the wrong
+thing.
+
+The offset field stayed `None` here because this path goes through the
+digest-only selector, but the digests now settle it by elimination:
+
+1. the observed digest `2fb3f01e...` over `[0x800e1b90, +0x1e870)` equals
+   `sha256(rom[0x04c160 .. +0x1e870])` -- so the first `0x1e870` bytes in
+   memory ARE overlay A, exactly;
+2. overlay A's FULL-extent digest `sha256(rom[0x04c160 .. +0x27230])` is
+   `410822d4...`, which is exactly what the pack expects for overlay A's
+   generation;
+3. that generation did NOT match at runtime.
+
+(1) and (2) together mean the only bytes that can differ are the ones past
+`+0x1e870` -- i.e. va `[0x80100400, 0x80108dc0)`, precisely the `0x89c0`-byte
+region where overlay A extends BEYOND the 1 MiB boot bank. RDRAM is allocated
+at full `RDRAM_LEN`, so the region is backed; the overlay's tail simply is not
+there.
+
+So the boot-bank-overhang explanation is no longer a hypothesis. What remains
+unknown is WHY the tail is absent -- a DMA truncated at the bank boundary, a
+publication that stops at `resident_image_end`, or a generation whose extent
+was derived from a recipe longer than what is actually transferred. That is a
+bounded question about one 0x89c0-byte transfer, which is a far smaller target
+than where this started.
