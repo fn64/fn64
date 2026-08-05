@@ -1144,6 +1144,42 @@ each names a PC and an address.
 The remaining 33 fail earlier, in overlay recovery, and `NoUniqueAdmittedTable`
 at 20 ROMs is the single largest cause anywhere in the corpus.
 
+## `NoUniqueAdmittedTable`, the corpus's biggest cause, is at least two shapes
+
+It accounts for 20 of 287 ROMs, more than any other single cause, and 9 of
+those admit exactly **2** tables -- the same count Batman had before the
+stride-alias collapse fixed it. Sampling two of them shows the class is not
+homogeneous:
+
+**Dual Heroes** -- both tables stride 0x24, offsets `0x2c13c` and `0xe2efc`,
+~750 KB apart. Same shape, far apart: these look like two genuinely distinct
+descriptor arrays, and refusing to choose between them is arguably correct.
+
+**Knife Edge** -- offsets `0x2a464` and `0x2a494`, only 0x30 apart, with
+*different* strides (0x2c and 0x28), and their records **partially overlap**:
+
+```
+0x2a464 stride 0x2c:  [0x497140..0x4a30e0]  [0x4c0300..0x4d5e10]
+0x2a494 stride 0x28:                        [0x4c0300..0x4d5e10]  [0x4d5fc0..0x4dc330]
+```
+
+One record is shared; each table has one the other lacks. Adjacent offsets,
+mismatched strides, partial overlap -- that is one array being read at two
+phases, the same defect class the phase-shift collapse was built for.
+
+**Why the existing collapse misses it:** `borrows_from` requires the coarser
+table's stride to be a MULTIPLE of the denser one's, because that is what
+distinguishes an under-sampling from a genuinely different array. 0x2c and
+0x28 are neither multiples nor equal, so neither table can be treated as a
+misreading of the other under the current rule.
+
+So the 20 ROMs are not one fix. At minimum they are "two real tables"
+(correctly refused) and "one array at two incommensurate phases" (a real
+gap). Distinguishing them needs a rule that does not depend on stride
+divisibility -- record overlap is the obvious candidate, but it must not
+collapse Dual Heroes' two independent arrays, which is exactly the failure
+mode the divisibility requirement was protecting against.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was
