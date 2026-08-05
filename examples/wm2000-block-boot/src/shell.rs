@@ -279,6 +279,9 @@ struct Shell {
     /// False until the first pump has run the guest on the captured boot clock.
     /// See `pump_one_frame` for why the first retrace must not precede it.
     entered_first_dispatch: bool,
+    /// Present when `FN64_CONTROLLER_SCHEDULE` names a committed route, which
+    /// then owns the pad instead of the live gamepad.
+    schedule: Option<ScheduleDriver>,
 }
 
 /// Bound on scheduling steps per pump, so a pathological spin cannot wedge the
@@ -305,6 +308,85 @@ const BOOT_STEPS_PER_PUMP: u64 = 4_000_000;
 /// many short device deadlines between VI fields; without a cap the loop could
 /// stay inside one pump long enough to stop servicing window events.
 const DEVICE_ADVANCES_PER_PUMP: u32 = 4_096;
+
+/// Replay a committed controller route in the windowed lane.
+///
+/// The gate lane already accepts `FN64_CONTROLLER_SCHEDULE`; the shell only
+/// took live pad input, so the two lanes could not be driven through the same
+/// inputs and a route that reached a menu was not reproducible in the lane
+/// that draws it.
+///
+/// The clock is the controller READ ORDINAL, not wall time or step count --
+/// a read is a shared external boundary, so the same file replays identically
+/// in both lanes even though one is pumped by a window and the other by a
+/// batch loop.
+struct ScheduleDriver {
+    schedule: fn64_boot_harness::ControllerInputSchedule,
+    read_ordinals: [u64; 4],
+    current: [fn64_runtime::ContInput; 4],
+    cursor: usize,
+}
+
+impl ScheduleDriver {
+    fn load(path: &std::path::Path) -> Self {
+        let source = std::fs::read(path).unwrap_or_else(|error| {
+            panic!("reading controller schedule {}: {error}", path.display())
+        });
+        let schedule = fn64_boot_harness::parse_controller_input_schedule(&source)
+            .unwrap_or_else(|error| {
+                panic!("parsing controller schedule {}: {error}", path.display())
+            });
+        println!(
+            "[wm2000-shell] controller schedule={} phases={} sha256={}",
+            path.display(),
+            schedule.phases().len(),
+            schedule.source_sha256_hex(),
+        );
+        Self {
+            schedule,
+            read_ordinals: [0; 4],
+            current: [fn64_runtime::ContInput::default(); 4],
+            cursor: fn64_abi::copy_controller_operations().len(),
+        }
+    }
+
+    /// Advance each port's read ordinal by the reads the guest actually
+    /// performed since the last call.
+    fn observe_reads(&mut self) {
+        let operations = fn64_abi::copy_controller_operations_since(self.cursor);
+        self.cursor += operations.len();
+        for operation in operations {
+            if operation.device == fn64_runtime::ControllerOperationDevice::StandardController
+                && operation.operation == fn64_runtime::ControllerOperationKind::Read
+            {
+                let port = usize::from(operation.port);
+                self.read_ordinals[port] = self.read_ordinals[port]
+                    .checked_add(1)
+                    .expect("controller read ordinal overflow");
+            }
+        }
+    }
+
+    fn apply(&mut self) {
+        for port in 0..4 {
+            let input = self.schedule.input_for_read(port, self.read_ordinals[port]);
+            if input != self.current[port] {
+                fn64_abi::set_controller_state(port, input.button, input.stick_x, input.stick_y);
+                self.current[port] = input;
+                println!(
+                    "[wm2000-shell] controller input_edge port={port} read={} buttons={:#06x} \
+                     stick=({}, {}) sim_time={} vi_swaps={}",
+                    self.read_ordinals[port],
+                    input.button,
+                    input.stick_x,
+                    input.stick_y,
+                    fn64_abi::sim_time(),
+                    fn64_abi::vi_swap_count(),
+                );
+            }
+        }
+    }
+}
 
 impl Shell {
     fn boot() -> Self {
@@ -451,6 +533,8 @@ impl Shell {
             frame_intervals: TimingWindow::default(),
             pump_times: TimingWindow::default(),
             entered_first_dispatch: false,
+            schedule: std::env::var_os("FN64_CONTROLLER_SCHEDULE")
+                .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
         }
     }
 
@@ -502,10 +586,21 @@ impl Shell {
                         steps < budget,
                         "wm2000-shell: non-idle guest work exceeded {budget} scheduling steps in one frame pump"
                     );
-                    // Feed live input before the game polls the controller this
+                    // Feed input before the game polls the controller this
                     // step, so a press is visible within the frame it happened.
-                    let (buttons, sx, sy) = self.merged_input();
-                    fn64_abi::set_controller_state(0, buttons, sx, sy);
+                    // A committed route, when supplied, owns the pad outright:
+                    // mixing it with a live gamepad would make the replay
+                    // depend on whatever hardware happened to be attached.
+                    match self.schedule.as_mut() {
+                        Some(driver) => {
+                            driver.observe_reads();
+                            driver.apply();
+                        }
+                        None => {
+                            let (buttons, sx, sy) = self.merged_input();
+                            fn64_abi::set_controller_state(0, buttons, sx, sy);
+                        }
+                    }
                     let next_priority = fn64_abi::next_runnable_priority();
                     assert!(fn64_abi::run_one_step());
                     drain.record_step(next_priority.expect("drain authorized a runnable step"));
