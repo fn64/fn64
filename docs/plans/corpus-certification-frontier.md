@@ -1320,6 +1320,12 @@ but it does require synthesizing guest state, and this codebase deliberately
 has no way to do that. Whether to add one is a certification question, not an
 implementation detail.
 
+**Verified rather than assumed.** Probing discovery's own proven mappings
+confirms `guard 0x47f10 IS inside bank boot [0x400,0x100400)` -- the guard is
+covered by the resident boot bank, so a pre-boot write to it falls under the
+sealed executable-memory baseline exactly as feared. The constraint is real,
+not a cautious guess about one.
+
 ## State at handoff
 
 **Primary goal met and independently verified.** All five AKI titles certify at
