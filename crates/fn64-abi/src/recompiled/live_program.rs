@@ -429,6 +429,19 @@ impl CanonicalExecutableMutationStateV1 {
         if !self.sealed {
             return;
         }
+        // The overwhelmingly common case is that nothing changed: this path runs
+        // on every dispatch whose declaration queue was already drained. Equal
+        // bytes have an equal digest by definition, so re-hashing every watched
+        // byte to re-derive a value we already hold is pure cost -- and it was
+        // ~30% of the shell's entire profile before this check.
+        if self
+            .watched
+            .iter()
+            .map(|range| &range.expected)
+            .eq(snapshot.iter())
+        {
+            return;
+        }
         self.expected_sha256 = Some(self.digest_snapshot(&snapshot));
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
             range.expected = bytes;
@@ -1733,6 +1746,32 @@ impl CanonicalLiveBlockProgramV1 {
         invalidated.dedup();
         if let Some(state) = &self.mutation_state {
             state.borrow_mut().seal_with(&mut read_physical_byte);
+            // Reading the snapshot copies EVERY watched byte out of RDRAM, and
+            // the commit below then SHA-256s that copy. Both callers run this on
+            // every dispatch, so when neither has anything pending the pair was
+            // ~42% of the shell's profile against 1 sample of actual guest
+            // execution.
+            //
+            // `writes` deliberately carries EVERY guest store, not just the ones
+            // hitting executable memory -- generation invalidation above needs
+            // the broad list, and two tests pin that. But a store outside every
+            // watched range cannot change a watched byte, so it cannot change
+            // the digest or produce a journal entry.
+            //
+            // So gate on the intersection rather than on emptiness: read and
+            // hash only when some write actually lands in a watched range.
+            let touches_watched = !events.is_empty()
+                || state.borrow().watched_ranges().iter().any(
+                    |&(watched_start, watched_end)| {
+                        writes.iter().any(|&(offset, len)| {
+                            let end = offset.saturating_add(len);
+                            offset < watched_end && end > watched_start
+                        })
+                    },
+                );
+            if !touches_watched {
+                return invalidated;
+            }
             let snapshot = state.borrow().read_snapshot(read_physical_byte);
             // Skip a commit that has nothing to say. Both the guest-execution
             // path and the device-time advance
