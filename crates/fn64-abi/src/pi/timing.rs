@@ -200,6 +200,27 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
 
 /// Commit due device work before any executor resume is possible.
 pub(crate) fn advance_device_time(now: u64) -> u32 {
+    // Fast path: nothing to commit.
+    //
+    // This runs after EVERY guest step, and the loop below always performs at
+    // least one `advance_device_time_step`, which takes three separate
+    // host/executor borrows and collects pending PI/SI/SP state before
+    // discovering there is nothing due. It profiled as 38% of the certified
+    // lane's self time.
+    //
+    // When device time already equals `now` and no deadline is due, that step
+    // has no work: no event can fire, and the fabric clock needs no advance.
+    // Checking that in one borrow skips the rest.
+    let idle = with_host(|host| {
+        host.device_fabric.now().get() == now
+            && host
+                .device_fabric
+                .next_deadline()
+                .is_none_or(|deadline| deadline.get() > now)
+    });
+    if idle {
+        return 0;
+    }
     let mut vi_retrace_ticks = 0u32;
     loop {
         let step = with_host(|host| {
