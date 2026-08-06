@@ -1869,3 +1869,36 @@ Diagnostic note: `PiBytesCommitted` records the ORIGINAL request
 committed lengths are always equal and cannot by themselves prove truncation.
 The dump is still worth having -- it shows whether the guest ever requests
 `0x27230` at that destination at all.
+
+### CORRECTION: the overlay tail WAS transferred -- measured
+
+The PI DMA dump at the panic settles candidate (a), and it refutes the
+boot-bank-overhang conclusion recorded above.
+
+WM2000 does not load the overlay in one large DMA. It streams it in **0x200-byte
+chunks** -- 1,198 of them across the run, of which **314 committed chunks land
+in the overlay range**:
+
+    lowest committed dram   0x0e1b90   (exactly the overlay base)
+    highest committed end   0x108dc0   (exactly base + 0x27230)
+    bytes covered           0x27230    (exactly the declared length)
+
+Including **69 committed transfers into the tail region**
+`[0x100400, 0x108dc0)` -- the very bytes that were supposed to be missing --
+written as one contiguous burst and never rewritten.
+
+The trace is a snapshot taken AT the panic, so every event in it preceded the
+failed activation. **The complete, correct overlay was in RAM when the digest
+diverged.**
+
+So all five candidate causes are now dead: the descriptor, discovery, the pack,
+the publication path, the DMA path, and the transfer itself are all correct and
+complete. The "0x1e870 ends exactly at the boot-bank boundary" coincidence was
+real but not causal -- I read a boundary alignment as a truncation.
+
+What remains is the only thing the evidence still permits: the bytes were
+correct at transfer time and DIFFERENT at activation time, so something wrote
+to that region in between. The canonical mutation journal watches exactly this
+region and attributes every writer, which makes the next measurement obvious --
+dump the journal's declared writes over `[0x800e1b90, 0x80108dc0)` at the
+activation and name the writer.
