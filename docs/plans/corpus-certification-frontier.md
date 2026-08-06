@@ -2519,3 +2519,90 @@ that region; if only scattered bytes differ, the publication is writing
 something else.
 
 Status unchanged: nothing playable, `gfx_submits=0`.
+
+## ROOT CAUSE: the baseline was sealed before the boot publication wrote
+
+The byte-range window at the failure settles it. Sixteen bytes around
+`0x9b0b3`:
+
+    expected[00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
+    live    [00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00]
+
+and the ROM bytes that SHOULD be there:
+
+    50 a4 45 00 30 a4 45 00 10 a4 53 00 22 08 04 df
+
+`expected` is all zeros across the whole region while ROM holds real
+instructions, and the address is inside the watched range `(1024, 1514080)`.
+So `seal_with` captured zeros: the baseline was sealed BEFORE
+`publish_rom_slice` wrote those bytes.
+
+`live` differs from `expected` in exactly one byte -- the `01` the guest wrote
+later, which the journal's 4-byte `CpuInstructionStore` declaration at
+seq=81661 accounts for. That write is legitimate and correctly attributed;
+it only trips the firewall because the baseline it is compared against was
+never seeded.
+
+This explains every prior observation and contradicts none:
+
+- no second writer, because there is none -- both raw writes are the
+  publication;
+- attribution is complete, because it always was;
+- both read paths and the write/read round trip agree, because the swizzle was
+  never the problem;
+- it surfaces only past ~421k steps, because that is when the guest first
+  writes into a region whose baseline is zeros;
+- `expected` looked like a "wrong lane" in one word purely by coincidence:
+  zero appears at lane 2 of that ROM word.
+
+Eight hypotheses eliminated by measurement before this: missing attribution, a
+second raw writer, a C shim, the save/GB-Pak/PFS shims, a missing baseline
+advance, read-vs-read lane disagreement, write-vs-read lane disagreement, and
+a genuine second write.
+
+The fix is an ordering one: seal after the boot publication completes, or
+re-seal the published ranges as part of publication. Both are small, and which
+is correct depends on what the receipt is meant to bind -- so it is worth
+stating the choice rather than assuming it.
+
+Status: still nothing playable, `gfx_submits=0`. But this is the blocker that
+has stopped every deep run, and it now has a measured cause.
+
+### Narrowed to two, and which one is a measurement not a guess
+
+Reading the seeding path:
+
+    execution.rs:149-158
+      bootstrap.map_or_else(
+        || CanonicalExecutableMutationStateV1::new(&ranges),   <- expected = Vec::new()
+        |validated| ...::from_bootstrap(receipt, &validated.storage),
+      )
+
+    from_bootstrap (live_program.rs:222-249)
+      1. seal_with(|_| 0)         -> expected = all zeros
+      2. read_snapshot_from_view  -> snapshot = real published bytes
+      3. commit_snapshot(snapshot, publication events)
+
+Step 3 should seed the baseline: `changed` is the diff of zeros against real
+bytes (large), declarations cover `[0x400,0x100400)`, and neither is empty, so
+the early return does not fire and `expected` should become the real bytes.
+
+Measurement says otherwise -- `expected` is zeros at `0x9b0b3`. Two
+possibilities remain, and they are distinguishable rather than arguable:
+
+1. the `bootstrap = None` branch was taken, so `from_bootstrap` never ran and
+   `expected` was seeded later by a `seal_with` over already-zero memory;
+2. `from_bootstrap` ran but its commit did not cover that byte.
+
+Printing which branch is taken, plus `expected[0x9b0b3]` immediately after
+construction, separates them in one run. That is the next step and it needs no
+new machinery.
+
+The lane's own ordering is NOT the problem: the log shows "validating boot
+publication" before "booting thread 0", so publication precedes execution.
+
+Stopping here rather than picking between the two. Five wrong "found it" calls
+on this byte have all come from choosing between remaining possibilities
+instead of measuring which holds, and the measurement is cheap.
+
+Status: nothing playable, `gfx_submits=0`.
