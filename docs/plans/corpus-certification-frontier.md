@@ -2194,3 +2194,61 @@ to aim a playable build at, and 8x from realtime is what the current device
 model costs. Closing that further means understanding why device advance is
 38% of self time, which is a device-model question and has not been
 investigated at all.
+
+## Scoping the device-model cost
+
+`advance_device_time` is 38% of self time and did not yield to an idle guard
+(1,677 -> 1,544 samples), so the cost is real work rather than redundant
+bookkeeping. Measuring what that work IS bounds the investigation.
+
+### What actually fires
+
+Over WM2000's 421,717-step route:
+
+    device events   3,852 total   -> one per 109 steps
+      pi            3,823  99.2%
+      si                8   0.2%
+      vi                8   0.2%
+      rcp               7   0.2%
+      ai                6   0.2%
+      sp_dma            0   0.0%
+
+    device transitions 15,389    -> 3.6% of steps
+
+So only 3.6% of steps produce a device transition, yet the advance costs 38%.
+**The cost is in CHECKING for due work, not in doing it**, and what does fire
+is almost entirely PI DMA completion.
+
+### Why PI dominates
+
+The PI DMA dump over the same route: 1,198 transfers of `0x200` bytes and
+15,772 of 4 bytes. The guest streams overlays in 512-byte chunks and performs
+thousands of 4-byte PI reads, each scheduling a completion deadline. That is
+the GAME's I/O pattern, not fn64 overhead -- the device model is faithfully
+tracking what the program asks for.
+
+### The three questions worth asking, in order
+
+1. **Why does a per-step check cost 38% when 96.4% of steps have nothing due?**
+   `next_deadline` is O(1) on a BTreeMap. The idle guard only helped 2s, which
+   means most steps are NOT idle by its definition -- the fabric clock lags
+   `now` even with no deadline due, so the loop still advances it. Determining
+   whether that clock advance can be batched is the cheapest question here and
+   needs no model change.
+2. **Can PI completion deadlines be coalesced?** 15,772 four-byte reads each
+   scheduling a completion is the dominant event source. Whether adjacent
+   completions can share one deadline without changing when the guest can
+   OBSERVE completion is a device-accuracy question with a real answer.
+3. **Is the per-step advance necessary at all?** `host.rs:300-307` documents
+   the interleaving it closes: checkpoint-yield -> same-thread resume ->
+   overdue PI completion. That is a correctness constraint, so any batching
+   must preserve it.
+
+(1) is measurement, (2) is device accuracy, (3) is correctness. Only (1) is
+safe to attempt without a decision, and it is also the cheapest.
+
+### What this does NOT need
+
+Not a faster CPU model -- guest execution is 0.1% of self time. Not page
+protection. Not a rewrite. The certified lane is already spending almost none
+of its time running the game.
