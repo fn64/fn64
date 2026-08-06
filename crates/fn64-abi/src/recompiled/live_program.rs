@@ -492,6 +492,36 @@ impl CanonicalExecutableMutationStateV1 {
                         })
                 })
                 .unwrap_or((None, None));
+            // A RANGE around the byte, so the shape of the discrepancy is
+            // visible: a contiguous zero run means seal preceded publication
+            // for that region, while scattered differences mean the
+            // publication wrote something other than the ROM slice.
+            let window = self
+                .watched
+                .iter()
+                .zip(&snapshot)
+                .find_map(|(range, bytes)| {
+                    (range.physical_start <= physical_start
+                        && physical_start < range.physical_end)
+                        .then(|| {
+                            let index = (physical_start - range.physical_start) as usize;
+                            let lo = index.saturating_sub(8);
+                            let hi = (index + 8).min(bytes.len());
+                            let expected: Vec<String> = range.expected[lo..hi]
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
+                            let live: Vec<String> =
+                                bytes[lo..hi].iter().map(|byte| format!("{byte:02x}")).collect();
+                            format!(
+                                "at {:#010x} expected[{}] live[{}]",
+                                range.physical_start + lo as u32,
+                                expected.join(" "),
+                                live.join(" "),
+                            )
+                        })
+                })
+                .unwrap_or_default();
             let declarations = self
                 .entries
                 .iter()
@@ -507,7 +537,7 @@ impl CanonicalExecutableMutationStateV1 {
                 .collect::<Vec<_>>();
             recompiled_gap_panic(format!(
                 "unjournaled executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) before canonical static dispatch; \
-                 expected={expected_byte:?} live={live_byte:?} \
+                 expected={expected_byte:?} live={live_byte:?} window={window} \
                  journal_entries={} covering_declarations={} [{}]",
                 self.entries.len(),
                 declarations.len(),

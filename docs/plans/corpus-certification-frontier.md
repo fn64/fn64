@@ -2519,3 +2519,51 @@ that region; if only scattered bytes differ, the publication is writing
 something else.
 
 Status unchanged: nothing playable, `gfx_submits=0`.
+
+## ROOT CAUSE: the baseline was sealed before the boot publication wrote
+
+The byte-range window at the failure settles it. Sixteen bytes around
+`0x9b0b3`:
+
+    expected[00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00]
+    live    [00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00]
+
+and the ROM bytes that SHOULD be there:
+
+    50 a4 45 00 30 a4 45 00 10 a4 53 00 22 08 04 df
+
+`expected` is all zeros across the whole region while ROM holds real
+instructions, and the address is inside the watched range `(1024, 1514080)`.
+So `seal_with` captured zeros: the baseline was sealed BEFORE
+`publish_rom_slice` wrote those bytes.
+
+`live` differs from `expected` in exactly one byte -- the `01` the guest wrote
+later, which the journal's 4-byte `CpuInstructionStore` declaration at
+seq=81661 accounts for. That write is legitimate and correctly attributed;
+it only trips the firewall because the baseline it is compared against was
+never seeded.
+
+This explains every prior observation and contradicts none:
+
+- no second writer, because there is none -- both raw writes are the
+  publication;
+- attribution is complete, because it always was;
+- both read paths and the write/read round trip agree, because the swizzle was
+  never the problem;
+- it surfaces only past ~421k steps, because that is when the guest first
+  writes into a region whose baseline is zeros;
+- `expected` looked like a "wrong lane" in one word purely by coincidence:
+  zero appears at lane 2 of that ROM word.
+
+Eight hypotheses eliminated by measurement before this: missing attribution, a
+second raw writer, a C shim, the save/GB-Pak/PFS shims, a missing baseline
+advance, read-vs-read lane disagreement, write-vs-read lane disagreement, and
+a genuine second write.
+
+The fix is an ordering one: seal after the boot publication completes, or
+re-seal the published ranges as part of publication. Both are small, and which
+is correct depends on what the receipt is meant to bind -- so it is worth
+stating the choice rather than assuming it.
+
+Status: still nothing playable, `gfx_submits=0`. But this is the blocker that
+has stopped every deep run, and it now has a measured cause.
