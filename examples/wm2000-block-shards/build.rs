@@ -484,16 +484,10 @@ impl WmShardGenerator {
     fn resident_split(&mut self) -> usize {
         let va_start = self.boot_va_start;
         let first_overlay_start = self.first_overlay_start();
-        let boot_bytes = u32::try_from(BOOT_BYTES).expect("boot copy length fits u32");
         assert!(
-            va_start < first_overlay_start
-                && first_overlay_start
-                    < va_start
-                        .checked_add(boot_bytes)
-                        .expect("boot copy virtual range does not overflow"),
-            "first overlay load {first_overlay_start:#010X} must split the resident boot bank \
-             [{va_start:#010X}, {:#010X})",
-            va_start + boot_bytes,
+            va_start < first_overlay_start,
+            "first overlay load {first_overlay_start:#010X} must lie above the boot base \
+             {va_start:#010X}"
         );
         // Both runs are decoded as whole instruction words, so the split must
         // fall on a word boundary or a shard would silently drop a tail byte.
@@ -503,14 +497,11 @@ impl WmShardGenerator {
         );
         let split = ROM_START
             + usize::try_from(first_overlay_start - va_start).expect("static prefix fits usize");
-        // Both runs are nonempty and together tile the boot copy exactly once.
-        // `resolve_shard` re-derives each run's count the same way, from the
-        // generation extent it is handed.
-        let (boot_shards, tail_shards) = resident_shard_counts(split);
-        assert!(
-            boot_shards > 0 && tail_shards > 0,
-            "resident split {split:#x} must leave both a boot prefix and a resident tail"
-        );
+        // The one topology rule both rejects a split outside the boot copy --
+        // the first overlay must land strictly inside it, leaving both runs
+        // nonempty -- and states the tiling `resolve_shard` then applies to
+        // each run's generation extent.
+        resident_shard_counts(split);
         split
     }
 
