@@ -238,3 +238,120 @@ is both watched and constantly written. A page tree would fix the digest by
 redefining it; narrowing the region fixes all three and redefines nothing.
 Re-examine whether that 1.44 MiB genuinely needs to be watched as one unit
 before paying for the schema migration.
+
+## The coalescing hypothesis is FALSIFIED (2026-08-06, measured)
+
+The paragraph above proposes narrowing the region as the fix that "redefines
+nothing". Both halves of that are wrong, and both were settled by measurement
+rather than argument. This is the fourth hypothesis to die on this question.
+
+### The merge is not what widens the range
+
+The suspicion was that `executable_physical_ranges_for_parts`
+(`crates/fn64-abi/src/recompiled/receipts.rs:1108-1156`) coalesces with
+`start <= previous.1`, merging *adjacent* spans and not merely overlapping
+ones, and that the 1.44 MiB is therefore a code span glued to a data span.
+
+A probe printing the pre- and post-merge sets on WM2000 says otherwise:
+
+```
+[watched-probe] pre-merge count=35   (32 distinct after dedupe)
+[watched-probe] post-merge count=2
+[watched-probe]   post 0x00000180..0x00000190 len=16
+[watched-probe]   post 0x00000400..0x00171a60 len=1513056
+```
+
+The installed set (`EXECUTABLE_WRITE_RANGES`, `execution.rs:190`) matches the
+post-merge set exactly, so this is the set the boundary predicate consults.
+
+Recomputing the merge with strict overlap (`start < previous.1`) yields **17
+ranges covering 1,513,072 bytes — the identical byte set**. Not one byte fewer
+is watched. The only hole anywhere in the union is `0x190..0x400`, between the
+exception vector and the boot bank.
+
+**The spans are genuinely contiguous.** Changing the comparison operator is a
+pure no-op on which bytes are watched, and would buy nothing.
+
+### What the 1.44 MiB actually is
+
+Breaking the pre-merge spans down by provenance:
+
+- **31 distinct virtual banks**, nearly all exactly 16,384 words (64 KiB),
+  tiling `0x400..0x161460` back to back — `0x400`, `0x10400`, `0x20400`, …
+  Each is a *declared executable code bank*, not data that drifted in.
+- **One generation invalidation range** `0xe1b90..0x171a60` (589,520 bytes),
+  of which 522,448 bytes are already covered by those banks and 67,072 bytes
+  extend past `0x161460`.
+
+So the watched megabyte is not one over-broad span. It is 31 declared code
+banks that happen to abut. There is no code/data seam to cut along, and
+"narrowing the region" has no cheap version: every byte in it is claimed by
+something that declared itself executable.
+
+### Splitting DOES change certified digests
+
+Even setting the above aside, splitting is not free. Four hashed quantities
+absorb per-range framing, so re-partitioning the same bytes changes the
+message and therefore the digest:
+
+| quantity | site | what it absorbs |
+|---|---|---|
+| `expected_sha256` | `live_program.rs:368` `digest_snapshot` | `start`,`end`,bytes **per range** |
+| `watched_bytes_sha256` | `receipts.rs:1252` | `start`,`end`,bytes **per range** |
+| `journal_root_sha256` | `receipts.rs:1356` `canonical_mutation_initial_root` | `start`,`end` **per range** |
+| `bootstrap_receipt_sha256` | `receipts.rs:1371` | `watched_ranges.len()` **and** each `start`,`end` |
+
+Splitting `[A,C)` into `[A,B)+[B,C)` turns the hashed message from
+`A|C|bytes` into `A|B|bytes₁|B|C|bytes₂` — 8 extra framing bytes, different
+digest, identical memory. `bootstrap_receipt_sha256` hashes the range *count*
+outright, so 2 → 17 moves it directly.
+
+**This is the same certification cost as the page-tree migration**: versioned
+schema, full receipt regeneration, gate expectation updates. It is not the
+cheap bookkeeping change the paragraph above assumed.
+
+### The no-op-store idea is also a negative result
+
+Separately proposed: have `classify_live_executable_write` compare the stored
+value against the sealed baseline and return `Continue` when a store writes
+bytes already present. This redefines no hash, so it looked cheap.
+
+It does not pay. The BSS-clear destination `[0x4b4c0, 0xb1390)` is **not zero
+in the baseline** — the IPL3 boot DMA copied 1 MiB of ROM there, including
+real instruction words (`0x60000` holds `27bdffd8 afb00010`, a MIPS prologue).
+Over the 104,372 words the loop clears:
+
+```
+nonzero baseline words: 98493  (94.4%)
+already-zero words:      5879   (5.6%)
+```
+
+**94.4% of those stores genuinely change a byte.** A slice would still break
+every ~1.06 words. Note also that the boundary observer is documented
+post-commit (`host.rs:188`), so the comparison must be against the sealed
+`expected` baseline, not live RDRAM — comparing live memory to itself would
+always report "unchanged" and silently disable the guard.
+
+### Where this leaves the decision
+
+Both "cheap" alternatives to the page-tree migration are now closed:
+
+- Splitting the coalesced range changes the same certified surface the
+  migration does, and there is no code/data seam to split along anyway.
+- The no-op-store filter changes no hash but recovers 5.6% of stores.
+
+The remaining lever on the dispatch grain is still the one
+`dispatch-granularity.md` identifies — a resident-code range set distinct from
+the watched set, consulted only by the boundary predicate. That leaves all
+four digests untouched because it does not repartition the watched set; it
+adds a second, narrower set. Its cost is the correctness proof that the
+narrower set never misses a genuine self-modifying store, plus the timing
+granularity change on publication digests. Nothing measured here makes that
+cheaper, but nothing measured here rules it out either.
+
+Verification for this entry: 691/691 `fn64-abi`+`fn64-runtime`, 401/401
+`fn64-recomp-rs`, `grade-all.sh` wrong=0 on all five, 60k benchmark
+`sim_time=180000` at 36.16s (baseline ~36.5s). The probe was reverted; no
+source change is carried. (`fn64-discover` shows 1068/1069 — the OoT
+`auto_strategy_corpus` failure is pre-existing on this branch and unrelated:
+that crate does not depend on `fn64-abi`.)
