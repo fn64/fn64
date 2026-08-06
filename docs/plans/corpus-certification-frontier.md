@@ -2445,3 +2445,42 @@ captured. That distinguishes "the baseline was never correct" from "the byte
 genuinely changed", and the panic site already holds both.
 
 Status unchanged: nothing playable, `gfx_submits=0`.
+
+### The values: expected reads the wrong LANE
+
+Printing the actual bytes at the failure -- the last unmeasured link -- gives:
+
+    expected=Some(0)  live=Some(1)
+
+and the ROM word covering that address is `a4450010`, big-endian bytes
+`a4 45 00 10`:
+
+    expected[0x9b0b3] = 0x00 = the word's LANE 2
+    ROM      [0x9b0b3] = 0x10 = the word's LANE 3
+    live     [0x9b0b3] = 0x01 = neither -- written later by the guest
+
+So the sealed baseline holds the byte from lane 2 where the address selects
+lane 3. That is an off-by-one lane: the XOR-3 swizzle applied at one layer and
+not another, between what `publish_rom_slice` writes and what `seal_with`
+reads back.
+
+This is consistent with everything measured and inconsistent with nothing:
+
+- both raw writes trace to `publish_rom_slice` (there is no second writer);
+- the two READ paths agree with each other (0 mismatches over 0x100 bytes) --
+  they are consistently wrong together, which a read-vs-read test cannot see;
+- the journal's covering declaration is a 4-byte CPU store, which is a real
+  later write and explains `live=0x01`;
+- the failure only appears past ~421k steps, when the guest finally writes a
+  region whose baseline was mis-seeded at boot.
+
+The read-path comparison I ran earlier could not have caught this: it compared
+two readers against each other, not either reader against the WRITER. The
+mismatch is between write and read, so it needs a write-then-read round trip
+over the published image.
+
+That round trip is the next measurement and it is cheap: publish a known ROM
+slice, seal, and compare `expected` against the ROM bytes directly. If they
+differ by a lane, this is proven rather than inferred.
+
+Status unchanged: nothing playable, `gfx_submits=0`.

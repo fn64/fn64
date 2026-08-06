@@ -473,6 +473,25 @@ impl CanonicalExecutableMutationStateV1 {
             // DID declare this address -- which separates "no writer
             // attributed it" from "a writer attributed it and the baseline was
             // not advanced", the two causes that produce this same message.
+            // The actual VALUES. Every writer-side hypothesis is eliminated, so
+            // what matters now is whether `expected` was ever correct for this
+            // byte -- which the digests cannot say and no run has captured.
+            let (expected_byte, live_byte) = self
+                .watched
+                .iter()
+                .zip(&snapshot)
+                .find_map(|(range, bytes)| {
+                    (range.physical_start <= physical_start
+                        && physical_start < range.physical_end)
+                        .then(|| {
+                            let index = (physical_start - range.physical_start) as usize;
+                            (
+                                range.expected.get(index).copied(),
+                                bytes.get(index).copied(),
+                            )
+                        })
+                })
+                .unwrap_or((None, None));
             let declarations = self
                 .entries
                 .iter()
@@ -488,6 +507,7 @@ impl CanonicalExecutableMutationStateV1 {
                 .collect::<Vec<_>>();
             recompiled_gap_panic(format!(
                 "unjournaled executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) before canonical static dispatch; \
+                 expected={expected_byte:?} live={live_byte:?} \
                  journal_entries={} covering_declarations={} [{}]",
                 self.entries.len(),
                 declarations.len(),
