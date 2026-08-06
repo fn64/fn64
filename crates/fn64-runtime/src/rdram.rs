@@ -411,18 +411,27 @@ impl<'a> RdramView<'a> {
         for (index, byte) in out.iter_mut().enumerate().take(head as usize) {
             copy_byte(index as u32, byte);
         }
-        for word in 0..(body / 4) {
-            let logical = start + head + word * 4;
-            let native = self
-                .read_u32(RdramAddr::from_offset(logical))
-                .to_ne_bytes();
-            let at = (head + word * 4) as usize;
-            // `read_u32` reads the native word with lane XOR 0; `read_u8`
-            // would read the same four bytes in reverse order.
-            out[at] = native[3];
-            out[at + 1] = native[2];
-            out[at + 2] = native[1];
-            out[at + 3] = native[0];
+        // Bulk-copy the word-aligned body, then reverse each word in place.
+        //
+        // The previous form called `read_u32` per word and stored four bytes
+        // individually -- 262,144 iterations for a 1 MiB watched region, on a
+        // path that runs at every dispatch boundary. It profiled as the single
+        // largest self-time cost in the certified lane (1,849 samples, ahead
+        // of even the SHA-256).
+        //
+        // `read_u32` on an in-range aligned offset is a plain native-word
+        // load, so the whole body is one contiguous slice; copying it and then
+        // swapping each word gives byte-for-byte identical output, because
+        // `native[3], native[2], native[1], native[0]` IS a 4-byte reverse.
+        if body > 0 {
+            let body_start = (start + head) as usize;
+            let at = head as usize;
+            let bytes = body as usize;
+            out[at..at + bytes]
+                .copy_from_slice(&self.storage[body_start..body_start + bytes]);
+            for word in out[at..at + bytes].chunks_exact_mut(4) {
+                word.reverse();
+            }
         }
         for index in (head + body)..len {
             let byte = &mut out[index as usize];
