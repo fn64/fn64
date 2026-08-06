@@ -157,3 +157,45 @@ and an explicit note that digests recorded in existing docs are historical.
 
 The `FN64_FAST_MUTATION_JOURNAL=1` opt-out remains the iteration lane in the
 meantime; it does not affect certified runs.
+
+
+## Superseded in part (2026-08-06, later the same day)
+
+The dispatch-granularity investigation (`docs/plans/dispatch-granularity.md`,
+commit `8d85748`) found the residual this document deferred to, and it changes
+which fix should go first.
+
+**100% of slices (60,000/60,000) end on `BlockExit::ExecutableWrite` -- a guest
+store. Mean block length is 2.0 instructions; mean slice is 3.0 instructions
+across 1.5 blocks.**
+
+`EXECUTABLE_WRITE_RANGES` holds the entire 1 MiB boot bank -- the same region
+this document's digest hashes -- so `classify_live_executable_write`
+(`recompiled/snapshots.rs:983`) cannot tell a store to an ordinary guest
+variable from self-modifying code. Every store ends the block, refuses to
+chain, publishes a checkpoint, and round-trips the scheduler. The chaining
+machinery already works: the same census recorded 29,999 chained `Transfer`
+exits.
+
+So the two costs share one root cause -- an over-broad watched region -- but
+they are not equally expensive to fix:
+
+- The page-tree digest migration **necessarily redefines a hashed quantity**,
+  requiring a versioned schema and full receipt regeneration.
+- Narrowing the write-boundary predicate **redefines no hash**. It changes a
+  scheduling grain. `sim_time` totals are invariant to slice grouping
+  (`executor/mod.rs:1642-1650` accumulates retired instructions); what moves is
+  when timers and VI retraces are evaluated.
+
+**Revised recommendation: measure the boundary narrowing before committing to
+the migration's scope.** It is correctness-sensitive -- a predicate that is too
+permissive lets stale translated code execute -- so it needs care, but it costs
+no evidence values.
+
+One correction to this document's own analysis: the claim that SHA-256 offers
+no value-preserving shortcut is too strong. It holds for an edit before the
+end, but a strict UNCHANGED PREFIX is exactly the exception, and
+`sha2::Sha256: Clone` exposes the mid-stream state. A prefix cache is
+implemented and proven bit-identical over all 64 change-subsets of a five-range
+watched set; whether the prefix actually holds on WM2000 is unmeasured, and if
+the boot range is the one that changes it is a negative result.
