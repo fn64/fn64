@@ -557,7 +557,20 @@ impl CanonicalExecutableMutationStateV1 {
         let before_sha256 = self
             .expected_sha256
             .expect("sealed mutation state has no expected digest");
-        let after_sha256 = self.digest_snapshot(&snapshot);
+        // With no changed range, the snapshot equals `expected` byte for byte,
+        // so its digest IS `before_sha256` -- hashing 1 MiB to rediscover a
+        // value already in hand is pure cost. This case is common: a writer
+        // declares a store that writes back the same bytes, so the declaration
+        // list is non-empty while nothing actually differs.
+        //
+        // Not an approximation. `changed` comes from `current_changed_ranges`,
+        // which compares the snapshot against `expected` byte for byte, so
+        // empty means equal and equal bytes have an equal digest.
+        let after_sha256 = if changed.is_empty() {
+            before_sha256
+        } else {
+            self.digest_snapshot(&snapshot)
+        };
         invalidated_generations.sort_unstable();
         invalidated_generations.dedup();
         let sequence = self.next_sequence;
