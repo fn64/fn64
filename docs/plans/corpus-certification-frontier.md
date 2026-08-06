@@ -2125,3 +2125,36 @@ the 20% attributed to `copy_logical_bytes` is the COPY itself, not the
 allocation, and the copy is unavoidable while the journal reads a full
 snapshot per commit. Narrowing WHAT is copied and hashed is the only lever
 there, and that is the certification question, not a micro-optimisation.
+
+### Two more failed optimisations, and what they teach
+
+Both attempts targeted costs I had attributed from the profile, and both
+measured as no-ops:
+
+  snapshot memset removal        89s -> 88s   (~1%)
+  mirror cheap-check reordering  89s -> 90s   (none)
+
+The second is the more instructive. `commit_scheduler_running_thread_mirror`
+does a full 1 MiB `reconcile_before_dispatch` and only then checks whether the
+mirror word already holds the right handle -- which looked like obvious waste
+on a per-step path. Moving the cheap check first changed nothing, which means
+the 816 samples charged to `advance_device_time` are in its own body, not in
+the mirror it calls.
+
+So the standing attribution is:
+
+    1034  sha2 digest            32%   journal, certification-bound
+     816  advance_device_time    25%   device fabric self time, NOT the mirror
+     659  copy_logical_bytes     20%   the copy itself, not the allocation
+       6  BlockProgram::run     0.2%   guest execution
+
+Three of my optimisation attempts in a row have now failed because I inferred
+WHERE the cost was from a call-graph reading rather than confirming it. The
+sampler attributes self time to the frame that owns it; a parent's total is
+not evidence that its children are hot.
+
+`advance_device_time` commits the ABI-owned device fabric at an exact guest
+time, and its own comment explains the interleaving it closes
+(`host.rs:300-307`). Reordering or skipping it is a correctness question about
+device observability, not a micro-optimisation, so it needs the same care as
+the journal question rather than another quick attempt.
