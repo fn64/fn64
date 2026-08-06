@@ -2311,3 +2311,137 @@ this.
 
 Status: still not playable. `gfx_submits=0`, all 7 RSP tasks are audio, and
 this blocker is what stops execution reaching a graphics display list.
+
+### The undeclared writer is a generated C shim, caught by backtrace
+
+`FN64_WATCH_WRITE=0x9b0b3` plus `FN64_WATCH_WRITE_BACKTRACE=1` names it. Two
+raw writes touch the byte, and the second one's stack is:
+
+    RdramViewMut::write_u8
+    ...
+    fn64_abi::recompiled::runners::call_c
+    fn64_abi::recompiled::snapshots::invoke_catalog_block_host
+    fn64_abi::recompiled::runners::run_catalog_block_program
+
+So the single-byte store comes from a GENERATED C SHIM invoked through
+`call_c`, which hands the shim a raw `rdram` pointer via `Rdram::as_mut_slice`
+-- the exact unattributed write path documented earlier today when
+`as_mut_slice` was made `#[doc(hidden)]`. The C shim writes guest memory
+directly and nothing declares on its behalf.
+
+Two corrections to my own earlier work:
+
+- I first fixed `osFlashReadStatus_recomp` (save.rs), reasoning from "which
+  Rust code calls write_u8". The watch shows that shim never runs here; the
+  fix was reverted.
+- When I made `as_mut_slice` `#[doc(hidden)]` I described its one caller as
+  handing the pointer "to the audited `*_recomp` marshalling layer that does
+  its own attribution". That is not true for this write: the layer is audited
+  for FR/BEV state, not for declaring RDRAM stores.
+
+The fix is therefore not in a Rust shim but at the `call_c` boundary: bracket
+the C call in a host transaction, or diff the watched region across it, so the
+shim's writes are attributed to `HostAbi`. `begin_host_abi_transaction` /
+`finish_host_abi_transaction` already exist for exactly this and already diff
+and declare changed ranges at the boundary.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
+
+### Correction: the C-shim attribution was read from a merged stack
+
+The backtrace I used to name `call_c` as the undeclared writer was two
+captures concatenated by my own parser: `publish_rom_slice` / `main` is the
+BOOT PUBLICATION's stack, and `call_c` / `invoke_catalog_block_host` begins a
+separate one. Attributing the single-byte write to the C shim therefore rests
+on bad evidence, and the fix built on it -- declaring a diff across `call_c`
+-- was reverted.
+
+That fix also failed on its own terms: it queued an attributed event inside an
+active host transaction, tripping "catalog host transaction 4 reached an
+ordering boundary with 1 uncommitted child writer event(s)". And it was
+redundant regardless, because `invoke_catalog_block_host` ALREADY brackets the
+shim call in `begin_host_abi_transaction` / `finish_host_abi_transaction`
+(`snapshots.rs:892`), whose flush diffs the watched region and declares
+changed ranges as `HostAbi`.
+
+So the open question is narrower than "who writes the byte": a host
+transaction already covers C-shim calls and already declares what they change.
+Either this write happens outside that bracket, or the bracket's diff misses
+it. Both are checkable -- print the active transaction id at the raw-write
+watch -- and neither should be guessed at.
+
+What is solidly established and unchanged:
+
+- `FN64_WATCH_WRITE` catches exactly two raw writes to `0x0009b0b3`: the boot
+  publication, and one `write_u8`.
+- The journal's only covering declaration is a 4-byte CPU store at
+  `0x9b0b0` (seq=81661), which does not describe a one-byte write.
+- 27 raw writes across `save.rs`, `gbpak.rs` and `pfs.rs` declare nothing;
+  that gap is real even though it is not this failure.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
+
+### There is no second writer: both raw writes are the boot publication
+
+Tagging each backtrace line with its own capture -- so two stacks cannot be
+read as one, the mistake that produced the C-shim attribution -- settles this.
+
+Both raw writes to `0x0009b0b3` trace to the same place:
+
+    [watch-bt write_logical_bytes@0x00000400]  ... publish_rom_slice / main
+    [watch-bt write_u8@0x0009b0b3]             ... publish_rom_slice / main
+
+The `write_u8` is the boot publication's own per-byte tail, not a separate
+writer. `RdramPtr::write_u8` -- the genuinely raw, unattributed path -- was
+also instrumented and never fires for this address.
+
+So the "second undeclared write" theory is dead, and with it the C-shim
+theory. What remains is the original observation, now with everything else
+eliminated: the byte is written ONCE, by the declared boot publication
+(`seq=0 BootstrapOrImport [0x00000400,0x00100400)`), and a later dispatch
+finds it differing from `expected`.
+
+That points back at the baseline rather than at any writer: `expected` for
+this byte does not match what the publication actually wrote. Which is a
+different question from "who wrote it", and one the existing instruments can
+answer -- compare `expected[0x9b0b3]` against the published byte at seal time.
+
+Every writer-side hypothesis is now eliminated by measurement:
+missing attribution, a second raw write, a C shim, the save/GB-Pak/PFS shims,
+and a missing baseline advance. Recording that so the next attempt starts from
+the baseline side.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
+
+### The two read paths agree; the lane hypothesis is dead too
+
+`0x9b0b3` is lane 3 -- the last byte of its word -- which is exactly where a
+byte-order discrepancy between the per-byte (`read_u8`, lane XOR 3) and
+word-wise (`copy_logical_bytes`, per-word reverse) paths would surface. Since
+`seal_with` uses the per-byte reader and the snapshot uses the word-wise one,
+that looked like a real candidate.
+
+Tested directly: fill storage with a known pattern, read 0x100 bytes through
+both paths, compare. **Zero mismatches.** The paths agree byte for byte, which
+also confirms today's bulk-copy change is byte-identical to what it replaced.
+
+The byte also predates that change -- it appears in Blocker A, long before
+`dd87c77` -- so the bulk copy could not be the cause regardless.
+
+Hypotheses now eliminated by measurement, all of them:
+
+    missing attribution            journal shows a covering declaration
+    a second raw write             both writes trace to publish_rom_slice
+    a generated C shim             merged-stack artefact, retracted
+    save/GB-Pak/PFS shims          never run for this address
+    a missing baseline advance     pairing invalidate changed nothing
+    read-path lane disagreement    zero mismatches over 0x100 bytes
+
+What remains unexamined is narrow: the byte is written once by the declared
+boot publication, both read paths agree, and yet `expected` differs from live
+memory at a later dispatch. The next measurement is to print the actual byte
+values -- `expected[0x9b0b3]` versus live -- at the failure, which no run has
+captured. That distinguishes "the baseline was never correct" from "the byte
+genuinely changed", and the panic site already holds both.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
