@@ -2380,3 +2380,35 @@ What is solidly established and unchanged:
   that gap is real even though it is not this failure.
 
 Status unchanged: nothing playable, `gfx_submits=0`.
+
+### There is no second writer: both raw writes are the boot publication
+
+Tagging each backtrace line with its own capture -- so two stacks cannot be
+read as one, the mistake that produced the C-shim attribution -- settles this.
+
+Both raw writes to `0x0009b0b3` trace to the same place:
+
+    [watch-bt write_logical_bytes@0x00000400]  ... publish_rom_slice / main
+    [watch-bt write_u8@0x0009b0b3]             ... publish_rom_slice / main
+
+The `write_u8` is the boot publication's own per-byte tail, not a separate
+writer. `RdramPtr::write_u8` -- the genuinely raw, unattributed path -- was
+also instrumented and never fires for this address.
+
+So the "second undeclared write" theory is dead, and with it the C-shim
+theory. What remains is the original observation, now with everything else
+eliminated: the byte is written ONCE, by the declared boot publication
+(`seq=0 BootstrapOrImport [0x00000400,0x00100400)`), and a later dispatch
+finds it differing from `expected`.
+
+That points back at the baseline rather than at any writer: `expected` for
+this byte does not match what the publication actually wrote. Which is a
+different question from "who wrote it", and one the existing instruments can
+answer -- compare `expected[0x9b0b3]` against the published byte at seal time.
+
+Every writer-side hypothesis is now eliminated by measurement:
+missing attribution, a second raw write, a C shim, the save/GB-Pak/PFS shims,
+and a missing baseline advance. Recording that so the next attempt starts from
+the baseline side.
+
+Status unchanged: nothing playable, `gfx_submits=0`.

@@ -477,7 +477,13 @@ fn watch_raw_write(addr: RdramAddr, len: u32, kind: &str) {
         // Name the caller. Which shim issues this store is the whole question,
         // and a backtrace is the only thing that answers it directly.
         if std::env::var_os("FN64_WATCH_WRITE_BACKTRACE").is_some() {
-            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            // One capture per line, tagged, so two separate stacks cannot be
+            // read as one call chain -- which is exactly the mistake that
+            // produced a wrong attribution for this byte.
+            let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+            for line in backtrace.lines() {
+                eprintln!("[watch-bt {kind}@{start:#010x}] {line}");
+            }
         }
     }
 }
@@ -521,6 +527,11 @@ impl RdramPtr {
     /// # Safety
     /// The allocation must cover `addr.offset() ^ 3`.
     pub unsafe fn write_u8(self, addr: RdramAddr, value: u8) {
+        // RdramPtr is the RAW path: no bounds check, no attribution, and it is
+        // NOT RdramViewMut. Instrumenting only the view missed this writer
+        // entirely -- the byte write to 0x0009b0b3 produced no backtrace at
+        // all, which is what revealed the two types are distinct here.
+        watch_raw_write(addr, 1, "ptr_write_u8");
         unsafe { *self.0.as_ptr().add((addr.offset() ^ 3) as usize) = value };
     }
 
