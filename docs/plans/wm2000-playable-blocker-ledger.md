@@ -107,16 +107,36 @@ through `ProcessDmaMemory` or a raw pointer.
 | Overlapping watched ranges consulting different range objects | `CanonicalExecutableMutationStateV1::new` (`live_program.rs:44-49`) asserts `physical_start > previous_end`. |
 | `covering_declarations=2` in the panic proves the delta was declared | That filter (`live_program.rs:539-550`) scans the ENTIRE journal history; `seq=81661` of 104420 is an old acceptance. Misleading as written. |
 
+## Status: RESOLVED in `0a13c34`
+
+H1 (a DMA/device writeback) and H2 (`as_mut_slice()` into a C shim) were both
+wrong; the probe named `mirror_queue_to_rdram` directly, so neither needed
+elimination on its own merits.
+
+The fix is a pre-write publisher rather than a post-write notifier: the
+ordering-boundary assertion requires a child writer's bytes to be declared AND
+committed before any host transaction reaches a boundary, which notifying after
+the bytes are visible cannot satisfy. `recompiled/host_memory.rs:64`
+(`write_guest_physical`) already packages that, so it installs as a bare fn
+pointer. The three fields are contiguous and every call site rewrites all
+three, so one 12-byte declaration replaces three.
+
+A/B verified against a rebuilt baseline: without the fix, exit 134 at
+0x0009b0b3, and the mirror is absent from that panic's `covering_declarations`;
+with it, exit 0. 687/687, 401/401, `grade-all.sh` wrong=0 on all five.
+
 ## Open
 
-- **H1 — writer #4 is a DMA/device writeback.** A value of exactly `0x01`
-  reads like a status/flag byte, not data. PI/SI/SP completion and RSP/HLE
-  writeback all reach RDRAM outside both watches.
-- **H2 — writer #4 comes through `as_mut_slice()` into a C shim.**
-  `FN64_RECOMP_RS_SHIM_TRACE=1` shows only 8 shim calls in the whole run
-  (osCreateMesgQueue ×3, __osSiDeviceBusy ×2, osStartThread, osSendMesg,
-  osCreateThread), none of which obviously targets 0x8009b0b3 — so this is
-  ranked below H1 but not eliminated.
+- **Where does the route terminate now?** With
+  `FN64_BLOCK_CONTINUE_AFTER_OVERLAY=1` it runs past the 10-minute mark without
+  aborting, where it previously died at ~1,183,304. Endpoint not yet recorded.
+  Note a run WITHOUT that flag stops at ~421,692 with `thread0_dead=true` by
+  design at overlay entry -- not a regression, just a different stop condition.
+- **Next blockers are scoped, not started:** see
+  `rdram-write-attribution-audit.md` (the remaining unattributed writers and
+  the one structural change that would end this bug class) and
+  `per-title-shard-generation.md` / the title-generic boot lane (what the other
+  four AKI titles need in order to boot at all).
 
 ## Reproduce
 
