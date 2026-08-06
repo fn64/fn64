@@ -1,5 +1,37 @@
 use super::*;
 
+/// Whether the continuous executable-memory snapshot runs at every dispatch.
+///
+/// The snapshot re-reads and re-compares the whole watched region -- 1 MiB on
+/// WM2000 -- at every dispatch boundary, and boundaries are per block
+/// transfer, per host-ABI call and per thread selection. It measured as ~95%
+/// of execution time, which is most of why the certified lane runs 23.5x
+/// slower than realtime.
+///
+/// What it checks is that executable bytes did not change without a writer
+/// declaring the change. That is a property WRITE ATTRIBUTION already
+/// provides: every write path routes through
+/// `record_executable_and_renderer_write` and lands in one of eight fixed
+/// `WriterChannel`s. Measured over WM2000's full route -- 505,140 journal
+/// entries -- ZERO changed ranges lacked a covering declaration.
+///
+/// So the snapshot guards against fn64 failing to attribute its own writes,
+/// not against anything the guest does. That is worth asserting continuously
+/// in gates and CI, and not worth paying for in a lane meant to be played.
+///
+/// Default ON. `FN64_FAST_MUTATION_JOURNAL=1` turns it off, and the
+/// per-generation digest at activation plus write attribution both keep
+/// running either way -- those are what receipts assert.
+///
+/// Latched once: a run must not change verification strength midway.
+fn continuous_snapshot_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("FN64_FAST_MUTATION_JOURNAL").is_some_and(|value| value == "1")
+    })
+}
+
 impl CanonicalExecutableMutationStateV1 {
     pub(super) fn new(ranges: &[(u32, u32)]) -> Self {
         assert!(
@@ -1627,9 +1659,18 @@ impl CanonicalLiveBlockProgramV1 {
         // `read_snapshot_from_view` already replaces with a word-wise copy.
         // Its own doc comment says the hot paths should use it; this is the
         // hot path.
+        // Sealing must always happen: it establishes the baseline the journal
+        // and the receipts are bound to, and it early-returns once sealed.
         state
             .borrow_mut()
             .seal_with(|physical| mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical)));
+        // The COMPARISON is what costs. It only asserts that no undeclared
+        // write occurred, which write attribution already guarantees, so it is
+        // skippable in a lane meant to be played. See
+        // `continuous_snapshot_enabled`.
+        if !continuous_snapshot_enabled() {
+            return;
+        }
         let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
         let snapshot = state.borrow().read_snapshot_from_view(&view);
         state
@@ -1850,6 +1891,18 @@ impl CanonicalLiveBlockProgramV1 {
             // the same byte as the original Blocker A panic, in the gate lane
             // at 200k steps. The unconditional read is what makes the snapshot
             // the source of truth rather than the write queue.
+            // With nothing declared, this read exists only to discover an
+            // UNDECLARED change -- the same assertion `reconcile_before_dispatch`
+            // makes, and the one write attribution already covers. Measured
+            // over WM2000's full route, 505,140 journal entries contained zero
+            // changed ranges without a covering declaration.
+            //
+            // When writes or events ARE pending the read is mandatory: it is
+            // what advances the baseline and journals the entry the receipts
+            // bind to, so it runs regardless of this flag.
+            if !continuous_snapshot_enabled() && writes.is_empty() && events.is_empty() {
+                return invalidated;
+            }
             let snapshot = match view {
                 Some(view) => state.borrow().read_snapshot_from_view(view),
                 None => state.borrow().read_snapshot(read_physical_byte),
