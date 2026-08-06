@@ -880,6 +880,16 @@ pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
     // AotMiss is exactly that case: the question is which PI DMA delivered
     // the executable image, and by the time the harness could report it the
     // process is gone. Dump here, where the evidence still exists.
+    if std::env::var_os("FN64_DEVICE_ADVANCE_CENSUS").is_some() {
+        crate::pi::DEVICE_ADVANCE_CENSUS.with(|c| {
+            let c = c.borrow();
+            let total: u64 = c.iter().sum();
+            eprintln!(
+                "[device-census] total={total} lag+due={} lag+nothing={} current+due={} current+nothing={}",
+                c[0], c[1], c[2], c[3],
+            );
+        });
+    }
     if std::env::var_os("FN64_BLOCK_PI_DMA_DUMP").is_some() {
         eprintln!("[pi-dma] transfers preceding: {context}");
         for event in crate::copy_device_trace() {
