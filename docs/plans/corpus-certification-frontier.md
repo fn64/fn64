@@ -2311,3 +2311,38 @@ this.
 
 Status: still not playable. `gfx_submits=0`, all 7 RSP tasks are audio, and
 this blocker is what stops execution reaching a graphics display list.
+
+### The undeclared writer is a generated C shim, caught by backtrace
+
+`FN64_WATCH_WRITE=0x9b0b3` plus `FN64_WATCH_WRITE_BACKTRACE=1` names it. Two
+raw writes touch the byte, and the second one's stack is:
+
+    RdramViewMut::write_u8
+    ...
+    fn64_abi::recompiled::runners::call_c
+    fn64_abi::recompiled::snapshots::invoke_catalog_block_host
+    fn64_abi::recompiled::runners::run_catalog_block_program
+
+So the single-byte store comes from a GENERATED C SHIM invoked through
+`call_c`, which hands the shim a raw `rdram` pointer via `Rdram::as_mut_slice`
+-- the exact unattributed write path documented earlier today when
+`as_mut_slice` was made `#[doc(hidden)]`. The C shim writes guest memory
+directly and nothing declares on its behalf.
+
+Two corrections to my own earlier work:
+
+- I first fixed `osFlashReadStatus_recomp` (save.rs), reasoning from "which
+  Rust code calls write_u8". The watch shows that shim never runs here; the
+  fix was reverted.
+- When I made `as_mut_slice` `#[doc(hidden)]` I described its one caller as
+  handing the pointer "to the audited `*_recomp` marshalling layer that does
+  its own attribution". That is not true for this write: the layer is audited
+  for FR/BEV state, not for declaring RDRAM stores.
+
+The fix is therefore not in a Rust shim but at the `call_c` boundary: bracket
+the C call in a host transaction, or diff the watched region across it, so the
+shim's writes are attributed to `HostAbi`. `begin_host_abi_transaction` /
+`finish_host_abi_transaction` already exist for exactly this and already diff
+and declare changed ranges at the boundary.
+
+Status unchanged: nothing playable, `gfx_submits=0`.

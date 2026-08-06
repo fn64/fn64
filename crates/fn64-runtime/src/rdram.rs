@@ -474,6 +474,11 @@ fn watch_raw_write(addr: RdramAddr, len: u32, kind: &str) {
     let start = addr.offset();
     if start <= watch && watch < start.saturating_add(len) {
         eprintln!("[watch-write] {kind} [{start:#010x},+{len:#x}) covers {watch:#010x}");
+        // Name the caller. Which shim issues this store is the whole question,
+        // and a backtrace is the only thing that answers it directly.
+        if std::env::var_os("FN64_WATCH_WRITE_BACKTRACE").is_some() {
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
     }
 }
 
