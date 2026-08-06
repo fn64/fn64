@@ -546,7 +546,9 @@ impl WatchedExecutableBytesV1 {
     /// Replace the baseline, refreshing the storage-order mirror with it.
     ///
     /// The single writer of `expected`, so the mirror cannot go stale.
-    fn set_expected(&mut self, bytes: Vec<u8>) {
+    /// Returns the buffer it replaced so the caller can recycle it.
+    #[must_use]
+    fn set_expected(&mut self, bytes: Vec<u8>) -> Vec<u8> {
         self.expected_storage_order.clear();
         self.expected_storage_order.extend_from_slice(&bytes);
         // Mirror `RdramView::copy_logical_bytes`' mapping exactly: only the
@@ -557,7 +559,7 @@ impl WatchedExecutableBytesV1 {
         for word in self.expected_storage_order[head..head + body].chunks_exact_mut(4) {
             word.reverse();
         }
-        self.expected = bytes;
+        std::mem::replace(&mut self.expected, bytes)
     }
 
     /// Bytes before the first word-aligned storage word, as `copy_logical_bytes` computes it.
@@ -603,6 +605,12 @@ impl WatchedExecutableBytesV1 {
 
 struct CanonicalExecutableMutationStateV1 {
     watched: Vec<WatchedExecutableBytesV1>,
+    /// Retired baseline buffers, reused by `read_snapshot_from_view`.
+    ///
+    /// Pure allocator hygiene: nothing reads their contents, they are cleared
+    /// on return and fully overwritten before use. `RefCell` because the
+    /// snapshot read runs behind a shared borrow of the state.
+    recycled: RefCell<Vec<Vec<u8>>>,
     sealed: bool,
     expected_sha256: Option<[u8; 32]>,
     entries: Vec<ExecutableMutationBatchEvidenceV1>,

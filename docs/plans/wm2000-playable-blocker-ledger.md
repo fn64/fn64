@@ -197,11 +197,34 @@ render path changed.
 
 ### Still open
 
-- **Throughput.** ~1,450 steps/s is roughly 2,500x slower than hardware, and
-  that is now the binding constraint on iterating gameplay. Disabling the
-  mutation journal entirely (`FN64_FAST_MUTATION_JOURNAL=1`) moves a clean HEAD
-  60k-step benchmark only 37s -> 31s, so the journal is a minority cost and the
-  bulk is unidentified. A frame-pointer profile is the next step; `run_one_step`
-  is fully inlined in release and hides the breakdown.
+- **Throughput: the checkpoint digest.** A step advances **3 sim cycles**
+  (`sim_time=180000` for `steps=60000`, clean HEAD), so the gap to hardware is
+  ~31,000x. A frame-pointer profile at 200k steps attributes **70.30% of self
+  time to `sha2::sha256::aarch64::compress`**, against **0.06% for the
+  recompiled guest code** and 0.03% for `advance_device_time`. The stack is
+  `run_catalog_block_program -> commit_snapshot -> digest_snapshot -> sha2`:
+  every commit that changed anything re-hashes the full 1.14 MiB watched
+  region.
+
+  Corroborated independently from the other end: a census of
+  `Executor::handle_yield` over the 60k benchmark reports
+  `{"InstructionCheckpoint": 60000}` -- **100% of slice ends are checkpoint
+  publications**, never budget exhaustion, device access, or shims. This also
+  explains why raising `FN64_BLOCK_INSTRUCTION_BUDGET` from 4096 to 65536
+  produced byte-identical `sim_time` and wall time: the slice never ends on
+  budget.
+
+  Not fixable as a perf change. `expected_sha256` feeds `journal_root_sha256`
+  and is cross-checked against `watched_bytes_sha256`
+  (`recompiled/receipts.rs:1252`) across the receipt chain and the gates, so a
+  page-tree digest would change every certified evidence value in the project,
+  including the byte-exact rebuild proofs. That is a certification decision --
+  see `docs/plans/checkpoint-digest-cost.md`.
+
+  Three hypotheses were falsified by measurement before the profile settled it,
+  all recorded here so they are not re-proposed: the journal snapshot modelled
+  as ~100% of runtime (it is ~20% at 60k); the per-dispatch scheduler mirror at
+  `host.rs:312` (gating it out entirely: 38s -> 37s, ~3%); and a larger
+  per-dispatch instruction budget (no effect at all).
 - **A live window.** The display lists are produced; that they reach a window
   has never been shown.

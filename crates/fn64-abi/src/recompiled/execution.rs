@@ -632,12 +632,18 @@ impl CatalogNestedWriterTransactionV1 {
             .as_ref()
             .expect("canonical child writer transaction has no mutation state");
         let view = fn64_runtime::RdramView::from_storage(rdram);
-        let snapshot = state
-            .borrow()
-            .read_snapshot_from_view(&view);
-        let changed = state.borrow().current_changed_ranges(&snapshot);
-        for (physical_start, physical_end) in changed {
-            notify(physical_start, physical_end - physical_start);
+        // The dispatch reconcile short-circuits an unchanged region with one
+        // `memcmp` per range; this path was the remaining asymmetry, copying
+        // and word-reversing the whole watched region to build a snapshot
+        // whose only use is `current_changed_ranges`. When nothing changed
+        // that list is empty and the `notify` loop below has no iterations,
+        // so skipping the snapshot cannot change what is notified.
+        if !state.borrow().matches_view(&view) {
+            let snapshot = state.borrow().read_snapshot_from_view(&view);
+            let changed = state.borrow().current_changed_ranges(&snapshot);
+            for (physical_start, physical_end) in changed {
+                notify(physical_start, physical_end - physical_start);
+            }
         }
         self.commit(rdram);
     }

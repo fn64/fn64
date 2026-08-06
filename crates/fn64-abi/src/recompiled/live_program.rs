@@ -57,6 +57,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
         Self {
             watched,
+            recycled: RefCell::new(Vec::new()),
             sealed: false,
             expected_sha256: None,
             entries: Vec::new(),
@@ -304,7 +305,24 @@ impl CanonicalExecutableMutationStateV1 {
         self.watched
             .iter()
             .map(|range| {
-                let mut bytes = vec![0u8; (range.physical_end - range.physical_start) as usize];
+                let len = (range.physical_end - range.physical_start) as usize;
+                // Recycle a retired baseline buffer rather than asking the
+                // allocator for another megabyte.
+                //
+                // The snapshot is MOVED into `expected` by `commit_snapshot`
+                // and `adopt_snapshot`, which hands the buffer it replaces to
+                // `recycle`. Reusing those is what keeps a 1.14 MiB
+                // allocate-and-free off this path: profiling attributed 6.2%
+                // of self time to `_platform_memmove` and 2.7% to `madvise`,
+                // which is the allocator faulting in and returning fresh
+                // pages for a buffer the previous call had just released.
+                //
+                // `resize` after `clear` zero-fills, so a recycled buffer is
+                // indistinguishable from `vec![0u8; len]` before the copy --
+                // and `copy_logical_bytes` overwrites every byte regardless.
+                let mut bytes = self.take_recycled_buffer();
+                bytes.clear();
+                bytes.resize(len, 0);
                 view.copy_logical_bytes(
                     fn64_runtime::RdramAddr::from_offset(range.physical_start),
                     &mut bytes,
@@ -313,6 +331,12 @@ impl CanonicalExecutableMutationStateV1 {
             })
             .collect()
     }
+
+    /// A retired baseline buffer to refill, or a fresh one when the pool is empty.
+    fn take_recycled_buffer(&self) -> Vec<u8> {
+        self.recycled.borrow_mut().pop().unwrap_or_default()
+    }
+
 
     /// Whether every watched byte still equals the sealed baseline.
     ///
@@ -357,9 +381,15 @@ impl CanonicalExecutableMutationStateV1 {
         }
         let snapshot = self.read_snapshot(read_physical_byte);
         let expected_sha256 = self.digest_snapshot(&snapshot);
+        let mut recycled = self.recycled.borrow_mut();
+        let watched_len = self.watched.len();
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.set_expected(bytes);
+            let retired = range.set_expected(bytes);
+            if recycled.len() < watched_len {
+                recycled.push(retired);
+            }
         }
+        drop(recycled);
         self.journal_root_sha256 = canonical_mutation_initial_root(
             expected_sha256,
             self.watched
@@ -630,9 +660,15 @@ impl CanonicalExecutableMutationStateV1 {
             return;
         }
         self.expected_sha256 = Some(self.digest_snapshot(&snapshot));
+        let mut recycled = self.recycled.borrow_mut();
+        let watched_len = self.watched.len();
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.set_expected(bytes);
+            let retired = range.set_expected(bytes);
+            if recycled.len() < watched_len {
+                recycled.push(retired);
+            }
         }
+        drop(recycled);
     }
 
     pub(super) fn commit_snapshot(
@@ -732,9 +768,15 @@ impl CanonicalExecutableMutationStateV1 {
         entry.journal_root_sha256 = canonical_mutation_entry_root(self.journal_root_sha256, &entry);
         let journal_root_sha256 = entry.journal_root_sha256;
         self.entries.push(entry);
+        let mut recycled = self.recycled.borrow_mut();
+        let watched_len = self.watched.len();
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.set_expected(bytes);
+            let retired = range.set_expected(bytes);
+            if recycled.len() < watched_len {
+                recycled.push(retired);
+            }
         }
+        drop(recycled);
         self.expected_sha256 = Some(after_sha256);
         self.journal_root_sha256 = journal_root_sha256;
     }
