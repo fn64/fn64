@@ -1902,3 +1902,48 @@ to that region in between. The canonical mutation journal watches exactly this
 region and attributes every writer, which makes the next measurement obvious --
 dump the journal's declared writes over `[0x800e1b90, 0x80108dc0)` at the
 activation and name the writer.
+
+## ROOT CAUSE: the generation digest covers mutable DATA, not just text
+
+The mutation journal names the writer, and it is not a bug in any transfer.
+
+At the failing activation the journal holds 505,140 entries. Filtering to
+overlay A's tail `[0x100400, 0x108dc0)`:
+
+    DECLARED writes touching it: 71  {PiDma: 70, CpuInstructionStore: 1}
+    CHANGED ranges touching it:  5155
+
+The 70 `PiDma` declarations are the overlay load itself, matching the 69
+committed chunks measured earlier. The single `CpuInstructionStore` is the
+culprit -- at `seq=505139`, the LAST journal entry before the failed
+activation, the guest CPU stores 4 bytes at physical `0x107efc`, i.e.
+`+0x2636c` into overlay A, VA `0x80107efc`.
+
+That word and its neighbours are `00000000` in ROM: it is uninitialized data,
+which the game legitimately writes at runtime.
+
+And the recipe already knows this. `probe_recipe_sections` reports overlay 0 as
+
+    text=[0x800e1b90,0x800fef10)  data_end=0x80108dc0  bss_end=0x8011c900
+    text len=0x1d380   data len=0x9eb0   bss len=0x13b40
+
+The generation digests through `data_end` (`0x80108dc0`), so it covers
+`0x9eb0` bytes of DATA. The store at `0x80107efc` is past `text_end` and
+inside the digested range, so a legitimate data write invalidates the whole
+generation.
+
+**The fix is to digest only the text extent.** `OverlayLoadRecipeV1` already
+carries `text_start`/`text_end`/`data_end`/`bss_end`
+(`crates/fn64-discover/src/overlay_recipe.rs:26-30`); the pack builder simply
+uses the full image span instead.
+
+This also explains the shape of every earlier dead end. The bytes really were
+correct at transfer time, the pack really did expect the right ROM bytes, and
+the selector really was choosing correctly -- the image just stopped matching
+the moment the game touched its own data, which is normal program behaviour
+rather than a fault anywhere in fn64.
+
+Note this changes WHAT the digest asserts -- immutable text rather than the
+whole loaded image -- so it is a certification decision, not a silent fix.
+The argument for it is that digesting mutable data cannot ever hold: any
+correct program invalidates it.
