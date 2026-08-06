@@ -429,14 +429,12 @@ impl WmShardGenerator {
                 // VA 0x80107efc inside overlay 0's data span, which
                 // invalidated the whole generation and stopped the route.
                 //
-                // Rounded up to whole shards for the SHARD list only; the
-                // generation itself may now end mid-shard, so `image_end`
-                // stays at text_end and the trailing shard overhangs.
-                const SHARD_BYTES: u32 = 64 * 1024;
-                let text_span = (recipe.text_end - recipe.load_start)
-                    .div_ceil(SHARD_BYTES)
-                    * SHARD_BYTES;
-                let source_end = (recipe.rom_start + text_span).min(recipe.rom_end) as usize;
+                // Derived from the one shared helper so these shard extents
+                // match the ones the pack emits -- both are folded into
+                // catalog digests that have to agree.
+                let source_end = (recipe.rom_start
+                    + fn64_discover::overlay_recipe::generation_source_span(recipe))
+                    as usize;
                 (
                     Generation {
                         name: format!("recovered_overlay_{overlay_index}"),

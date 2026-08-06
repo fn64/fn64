@@ -40,6 +40,37 @@ pub struct OverlayLoadRecipeV1 {
     pub text_sha256: String,
 }
 
+/// Shard granularity the dense-AOT pack tiles generations with.
+pub const DENSE_SHARD_BYTES: u32 = 64 * 1024;
+
+/// How many ROM bytes of an overlay a GENERATION covers.
+///
+/// A generation covers the overlay's TEXT, not its whole loaded image: the
+/// data section is mutable, and a correct program writes it at runtime, so a
+/// generation digested over it cannot survive execution. WM2000 stores four
+/// bytes at VA `0x80107efc` inside overlay 0's data span, which invalidated
+/// the whole generation and stopped the certified route.
+///
+/// Rounded up to whole shards so the shard list tiles cleanly -- except when
+/// the image is SHORTER than one shard, where the exact text length is used.
+/// Overlay 1 of WM2000 is that case: text `0x5df0` inside a `0xd640` image,
+/// where rounding to `0x10000` and clamping to the image put the mutable data
+/// straight back.
+///
+/// Every consumer derives from this one function so they cannot disagree --
+/// the dense pack, the topology, the runtime catalog and the emitted pack all
+/// fold shard extents into digests that must match.
+pub fn generation_source_span(recipe: &OverlayLoadRecipeV1) -> u32 {
+    let text_len = recipe.text_end - recipe.load_start;
+    let rounded = text_len.div_ceil(DENSE_SHARD_BYTES) * DENSE_SHARD_BYTES;
+    let image_len = recipe.rom_end - recipe.rom_start;
+    if rounded <= image_len {
+        rounded
+    } else {
+        text_len
+    }
+}
+
 impl OverlayLoadRecipeV1 {
     pub fn loaded_byte_len(&self) -> u32 {
         self.rom_end - self.rom_start
@@ -161,8 +192,19 @@ pub fn parse_overlay_load_recipes_v1(
             text_sha256: {
                 // text_start/text_end are VIRTUAL; convert to the ROM window
                 // the loaded slice already represents.
-                let text_rom_start = rom_start + (text_start - load_start);
-                let text_rom_end = rom_start + (text_end - load_start);
+                // Must span exactly what a GENERATION covers, which is the
+                // shard-rounded text extent -- not bare text. A generation
+                // folds this digest into its identity, so a narrower digest
+                // here would never match the bytes the generation admits.
+                //
+                // Computed inline rather than via `generation_source_span`
+                // because the recipe is still being constructed here.
+                let text_len = text_end - load_start;
+                let rounded = text_len.div_ceil(DENSE_SHARD_BYTES) * DENSE_SHARD_BYTES;
+                let image_len = rom_end - rom_start;
+                let span = if rounded <= image_len { rounded } else { text_len };
+                let text_rom_start = rom_start;
+                let text_rom_end = rom_start + span;
                 let text = rom_bytes
                     .get(text_rom_start as usize..text_rom_end as usize)
                     .ok_or(OverlayRecipeError::DescriptorOutsideRom {

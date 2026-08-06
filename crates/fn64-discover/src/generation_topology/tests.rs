@@ -38,7 +38,8 @@
             DenseAotGenerationInput {
                 name: "overlay_a",
                 source_rom_start: 0x3000,
-                source_rom_end: 0x3020,
+                // Generation covers TEXT only (0x10), not the whole image.
+                source_rom_end: 0x3010,
                 load_start: OVERLAY,
                 text_start: OVERLAY,
                 text_end: OVERLAY + 0x10,
@@ -50,7 +51,7 @@
             DenseAotGenerationInput {
                 name: "overlay_b",
                 source_rom_start: 0x3020,
-                source_rom_end: 0x3040,
+                source_rom_end: 0x3030,
                 load_start: OVERLAY + 0x40,
                 text_start: OVERLAY + 0x40,
                 text_end: OVERLAY + 0x50,
@@ -375,7 +376,10 @@
     #[test]
     fn rejects_recipe_dense_disagreement() {
         let (rom, pack, mut recipes) = fixture();
-        recipes[1].loaded_sha256.replace_range(..1, "f");
+        // A generation is identified by its TEXT digest now, so corrupt that:
+        // `loaded_sha256` covers the whole loaded image and no longer decides
+        // whether a dense generation matches its recipe.
+        recipes[1].text_sha256.replace_range(..1, "f");
         assert_eq!(
             build_generation_topology_v1(&rom, &pack, "boot", RESIDENT_ID_DOMAIN, &recipes,),
             Err(GenerationTopologyError::OverlayRecipeMismatch { index: 1 })
@@ -462,7 +466,8 @@
             DenseAotGenerationInput {
                 name: "overlay_a",
                 source_rom_start: 0x3000,
-                source_rom_end: 0x3020,
+                // A generation spans its TEXT (0x10), not the whole image.
+                source_rom_end: 0x3010,
                 load_start: OVERLAY,
                 text_start: OVERLAY,
                 text_end: OVERLAY + 0x10,
@@ -474,7 +479,8 @@
             DenseAotGenerationInput {
                 name: "overlay_b",
                 source_rom_start: 0x3020,
-                source_rom_end: 0x3040,
+                // A generation spans its TEXT (0x10), not the whole image.
+                source_rom_end: 0x3030,
                 load_start: OVERLAY,
                 text_start: OVERLAY,
                 text_end: OVERLAY + 0x10,

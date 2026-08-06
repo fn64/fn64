@@ -739,9 +739,8 @@ fn main() {
         })
         .collect::<Vec<_>>();
     for (name, recipe) in overlay_names.iter().zip(&overlay_recipes) {
-        let source_rom_end = (recipe.rom_start
-            + ((recipe.text_end - recipe.load_start).div_ceil(SHARD_BYTES_U32) * SHARD_BYTES_U32))
-            .min(recipe.rom_end);
+        let source_rom_end =
+            recipe.rom_start + fn64_discover::overlay_recipe::generation_source_span(recipe);
         let source = &rom.bytes[recipe.rom_start as usize..source_rom_end as usize];
         for (shard_index, bytes) in source.chunks(BOOT_SHARD_BYTES).enumerate() {
             let words = bytes
@@ -1055,9 +1054,8 @@ fn main() {
         .zip(&overlay_dense_pack.generations)
         .enumerate()
     {
-        let source_rom_end = (recipe.rom_start
-            + ((recipe.text_end - recipe.load_start).div_ceil(SHARD_BYTES_U32) * SHARD_BYTES_U32))
-            .min(recipe.rom_end);
+        let source_rom_end =
+            recipe.rom_start + fn64_discover::overlay_recipe::generation_source_span(recipe);
         let source = &rom.bytes[recipe.rom_start as usize..source_rom_end as usize];
         let _ = writeln!(
             pack,
@@ -1112,8 +1110,10 @@ fn main() {
         // The generation is the TEXT extent only: the data section past it is
         // mutable, and digesting it made a correct program invalidate its own
         // generation. Generations may now end mid-shard, so this is exact.
+        // Same span as image_end below and as the shard source above, all
+        // from `generation_source_span`.
         let digest_rom_end =
-            (recipe.rom_start + (recipe.text_end - recipe.load_start)).min(recipe.rom_end);
+            recipe.rom_start + fn64_discover::overlay_recipe::generation_source_span(recipe);
         let digest: Vec<u8> =
             Sha256::digest(&rom.bytes[recipe.rom_start as usize..digest_rom_end as usize]).to_vec();
         let _full_image_digest = recipe
@@ -1130,7 +1130,7 @@ fn main() {
             "    OverlayGeneration {{ id: {:#018X}, image_start: {:#010X}, image_end: {:#010X}, invalidation_start: {:#010X}, invalidation_end: {:#010X}, sha256: {digest:?}, shards: OVERLAY_{index}_SHARDS }},",
             generation.bank_id,
             recipe.load_start,
-            recipe.text_end,
+            recipe.load_start + fn64_discover::overlay_recipe::generation_source_span(recipe),
             recipe.load_start,
             recipe.bss_end,
         );
