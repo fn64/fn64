@@ -21,7 +21,9 @@ fi
 typeset -r probe_root=${0:A:h:h}
 typeset -r probe_schedule=${1:A}
 typeset -r probe_max_steps=${2:-250000}
-typeset -r probe_binary=${FN64_WM_PROBE_BINARY:-$probe_root/examples/wm2000-block-boot/target/debug/wm2000-block-boot}
+# Release by default: this route runs hundreds of thousands of steps, and the
+# debug binary makes that a multi-hour wait. Override with FN64_WM_PROBE_BINARY.
+typeset -r probe_binary=${FN64_WM_PROBE_BINARY:-$probe_root/examples/wm2000-block-boot/target/release/wm2000-block-boot}
 typeset -r probe_guard_max_rss_mib=${FN64_GUARD_MAX_RSS_MIB:-2048}
 typeset -a probe_environment
 
@@ -54,6 +56,24 @@ probe_environment=(
     FN64_BLOCK_CONTINUE_AFTER_OVERLAY=1
     FN64_BLOCK_PROGRESS_ONLY=1
 )
+# The allowlist is deliberate -- it is what makes this wrapper reproducible --
+# but it silently dropped two variables the route cannot run without.
+#
+# FN64_ABSENT_N64DD: WM2000's IPL probes the N64DD window at 0xa6000000. On a
+# cartridge-only ROM that read has no modelled device, and the unwinding panic
+# at pi/timing.rs:80 aborts the route before any gameplay. Opting in is how
+# every other lane runs this ROM.
+#
+# FN64_EXECUTABLE_IMAGES: without the captured exception images the harness
+# cannot admit the general-exception preamble.
+#
+# Forwarded only when set, so the wrapper stays honest about its inputs.
+if [[ -n "$FN64_ABSENT_N64DD" ]]; then
+    probe_environment+=("FN64_ABSENT_N64DD=$FN64_ABSENT_N64DD")
+fi
+if [[ -n "$FN64_EXECUTABLE_IMAGES" ]]; then
+    probe_environment+=("FN64_EXECUTABLE_IMAGES=$FN64_EXECUTABLE_IMAGES")
+fi
 if (( $# == 3 )); then
     probe_environment+=("FN64_PROFILE_STOP_AT_GENERATION=$3")
 fi
