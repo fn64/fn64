@@ -1144,10 +1144,21 @@ where
             && run.exit == BlockExit::Checkpoint(entry)
             && !turn_budget.can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
         {
-            return Err(DispatchError::IndivisibleUnitExceedsBudget {
-                at: entry,
-                budget: turn_budget,
-                required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
+            // Budget remains, but not enough for an indivisible unit: a branch
+            // and its delay slot retire together, and the runner correctly
+            // refuses to start a pair it cannot finish.
+            //
+            // That is a SLICE boundary, not a program fault. Erroring aborted
+            // WM2000's certified route at pc=0x800040B8 with one instruction
+            // of a 4096 budget left. Checkpointing lets the caller resume at
+            // the same PC with a fresh budget, where the pair retires whole.
+            //
+            // Sound only because `instructions == 0`: the unit has not
+            // partially executed, so nothing is torn and no state is lost.
+            return Ok(DispatchRun {
+                exit: BlockExit::Checkpoint(entry),
+                instructions,
+                blocks,
             });
         }
         if run.instructions == 0
