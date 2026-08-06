@@ -210,7 +210,14 @@ pub fn build_dense_aot_pack_v1(
             || input.data_start > input.data_end
             || input.data_end != input.bss_start
             || input.bss_start > input.bss_end
-            || load_end != input.data_end
+            // The dense source may cover only the TEXT extent rather than the
+            // whole loaded image. The data section is mutable -- a correct
+            // program writes it at runtime -- so a generation digested over it
+            // cannot survive execution. Require the source to cover at least
+            // the text and never exceed the loaded image, instead of demanding
+            // it equal `data_end` exactly.
+            || load_end < input.text_end
+            || load_end > input.data_end
         {
             return Err(DenseAotPackError::InvalidRangeRelations);
         }

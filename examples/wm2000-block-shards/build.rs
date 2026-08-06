@@ -423,12 +423,26 @@ impl WmShardGenerator {
                     .overlay_recipes()
                     .get(overlay_index)
                     .unwrap_or_else(|| panic!("overlay generation {overlay_index} is absent"));
+                // Admit only the TEXT extent as executable image. `rom_end`
+                // covers the overlay's data section too, and a correct program
+                // writes its own data at runtime -- WM2000 stores four bytes at
+                // VA 0x80107efc inside overlay 0's data span, which
+                // invalidated the whole generation and stopped the route.
+                //
+                // Rounded up to whole shards for the SHARD list only; the
+                // generation itself may now end mid-shard, so `image_end`
+                // stays at text_end and the trailing shard overhangs.
+                const SHARD_BYTES: u32 = 64 * 1024;
+                let text_span = (recipe.text_end - recipe.load_start)
+                    .div_ceil(SHARD_BYTES)
+                    * SHARD_BYTES;
+                let source_end = (recipe.rom_start + text_span).min(recipe.rom_end) as usize;
                 (
                     Generation {
                         name: format!("recovered_overlay_{overlay_index}"),
                         source_start: recipe.rom_start as usize,
-                        source_end: recipe.rom_end as usize,
-                        affine_source_end: recipe.rom_end as usize,
+                        source_end,
+                        affine_source_end: source_end,
                         va_start: recipe.load_start,
                     },
                     index,
