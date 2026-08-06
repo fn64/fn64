@@ -895,6 +895,39 @@ pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
                 request.direction,
             );
         }
+        // The DMA proved the overlay arrives complete and correct, so whatever
+        // changed it did so afterwards. The journal watches that region and
+        // attributes every writer, which is the one thing that names it.
+        let live = crate::with_host(|host| host.canonical_recompiled_program.clone());
+        if let Some(journal) = live.and_then(|live| live.mutation_evidence_snapshot()) {
+            eprintln!(
+                "[journal] entries={} watched={:?} pending_attributed={}",
+                journal.entries.len(),
+                journal
+                    .watched_ranges
+                    .iter()
+                    .map(|range| (range.physical_start, range.physical_end))
+                    .collect::<Vec<_>>(),
+                journal.pending_attributed_writes,
+            );
+            for entry in &journal.entries {
+                for declaration in &entry.declared_writes {
+                    eprintln!(
+                        "[journal] seq={} channel={:?} [{:#010x},{:#010x})",
+                        entry.sequence,
+                        declaration.channel,
+                        declaration.physical_start,
+                        declaration.physical_end,
+                    );
+                }
+                for changed in &entry.changed_ranges {
+                    eprintln!(
+                        "[journal] seq={} CHANGED [{:#010x},{:#010x})",
+                        entry.sequence, changed.physical_start, changed.physical_end,
+                    );
+                }
+            }
+        }
     }
     panic!("{context}")
 }
