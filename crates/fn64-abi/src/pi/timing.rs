@@ -249,6 +249,17 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
     // With nothing due, no event handler can run and no PIF work can be
     // produced, so advancing the clock is the entire operation. VI retrace
     // ticks are likewise only produced by a firing VI event, hence zero.
+    // Advance the clock without a memory view when nothing is due.
+    // `advance_clock_if_idle` re-checks the deadline itself and refuses if any
+    // event IS due, so this cannot skip real device work -- which is the exact
+    // failure mode of the earlier empty-view version.
+    let advanced = with_host(|host| {
+        host.device_fabric
+            .advance_clock_if_idle(fn64_runtime::Cycles::new(now))
+    });
+    if advanced {
+        return 0;
+    }
     let nothing_due = with_host(|host| {
         host.device_fabric
             .next_deadline()
