@@ -152,3 +152,157 @@ export FN64_WATCH_WRITE=0x9b0b3          # add FN64_WATCH_WRITE_BACKTRACE=1 for 
 ```
 
 Deterministic — one pass suffices.
+
+## 2026-08-06: WM2000 renders and takes input
+
+The first measured run in this repository showing graphics, audio, and
+controller input live at once, from committed tooling.
+
+```
+[wm2000-block-boot] controller input_edge port=0 read=90 buttons=0x1000
+  stick=(0, 0) step=2412333 sim_time=328071095
+  gfx_submits=88 audio_submits=191
+  generations=[16226209253856221389, 17518568401266107605]
+[wm2000-block-boot] controller input_edge port=0 read=100 buttons=0x0000
+  step=2528050 sim_time=359624297 gfx_submits=98 audio_submits=210
+```
+
+`buttons=0x1000` is START at controller read 90 -- exactly what the route
+recipe annotates as "Title screen: START to enter the main menu". Graphics
+submits climb with the route, `render_error=None`, no panic.
+
+Program identity `b26d98af4aaaab86...`. Reproduce:
+
+```
+cd examples/wm2000-block-boot
+source ../../.claude/local.env
+export ROM="$FN64_DISCOVER_NWXE_ROM"
+C=~/Code/aki-recomp/captures; G="$C/wm-general-exception-images"
+export FN64_EXECUTABLE_IMAGES="$G/run-1/image.json:$G/run-2/image.json:$G/run-3/image.json"
+export FN64_BOOT_CONTEXT="$C/wm2000-boot-context.json"
+export FN64_ABSENT_N64DD=1 FN64_BLOCK_CONTINUE_AFTER_OVERLAY=1
+export FN64_CONTROLLER_SCHEDULE=../../reference/wm2000-routes/entrance-to-match.schedule
+export FN64_BLOCK_MAX_STEPS=12000000
+./target/release/wm2000-block-boot
+```
+
+**Budget at least 25 minutes of wall clock before the first graphics submit.**
+Two investigations today mistook a too-short run for a rendering failure. At
+~1,450 steps/s the first overlay entry is ~5 min in and the first submits
+~25 min in; a 420,000-step run covers 8.9 NTSC fields and legitimately shows
+`gfx_submits=0`.
+
+What unblocked it was `a7a50fe` -- the overlay digest extent. Nothing about the
+render path changed.
+
+### Still open
+
+- **Throughput: the checkpoint digest.** A step advances **3 sim cycles**
+  (`sim_time=180000` for `steps=60000`, clean HEAD), so the gap to hardware is
+  ~31,000x. A frame-pointer profile at 200k steps attributes **70.30% of self
+  time to `sha2::sha256::aarch64::compress`**, against **0.06% for the
+  recompiled guest code** and 0.03% for `advance_device_time`. The stack is
+  `run_catalog_block_program -> commit_snapshot -> digest_snapshot -> sha2`:
+  every commit that changed anything re-hashes the full 1.14 MiB watched
+  region.
+
+  Corroborated independently from the other end: a census of
+  `Executor::handle_yield` over the 60k benchmark reports
+  `{"InstructionCheckpoint": 60000}` -- **100% of slice ends are checkpoint
+  publications**, never budget exhaustion, device access, or shims. This also
+  explains why raising `FN64_BLOCK_INSTRUCTION_BUDGET` from 4096 to 65536
+  produced byte-identical `sim_time` and wall time: the slice never ends on
+  budget.
+
+  Not fixable as a perf change. `expected_sha256` feeds `journal_root_sha256`
+  and is cross-checked against `watched_bytes_sha256`
+  (`recompiled/receipts.rs:1252`) across the receipt chain and the gates, so a
+  page-tree digest would change every certified evidence value in the project,
+  including the byte-exact rebuild proofs. That is a certification decision --
+  see `docs/plans/checkpoint-digest-cost.md`.
+
+  Three hypotheses were falsified by measurement before the profile settled it,
+  all recorded here so they are not re-proposed: the journal snapshot modelled
+  as ~100% of runtime (it is ~20% at 60k); the per-dispatch scheduler mirror at
+  `host.rs:312` (gating it out entirely: 38s -> 37s, ~3%); and a larger
+  per-dispatch instruction budget (no effect at all).
+- **A live window.** The display lists are produced; that they reach a window
+  has never been shown.
+
+## 2026-08-06: WM2000 renders its copyright screen, legibly
+
+Frame dumps from the certified dense-AOT block program show the recompiled
+game drawing real, readable content -- not a uniform fill.
+
+`FN64_RENDER_DUMP_DIR` (wiring at `examples/wm2000-block-boot/src/main.rs:800-828`)
+produced 40 PNGs at **480x240**, the game's real VI width rather than the 320
+default. Frames 0-7 are a monotonic fade whose dominant background steps by
+exactly `0x21` per frame (`e7 c6 a5 84 63 42 21 00`), and the foreground is
+WM2000's copyright screen:
+
+> (c)1999 Asmik Ace Entertainment / AKI
+> WRESTLEMANIA 2000
+> (c)1999 World Wrestling Federation Entertainment, Inc.
+> ... Gangrel created by White Wolf, Inc. ... Licensed by Nintendo
+
+Two frames are retained as evidence in `reference/wm2000-frames/`.
+
+One reading correction worth recording: an automated decode of these frames
+reported "96.23% black with a 4339-pixel static white set riding above the
+fade", and read that set as a featureless overlay. Those 4,339 pixels are the
+**text glyphs**. A pixel-statistics summary could not distinguish "static
+overlay" from "legible typography"; looking at the image could. Prefer viewing
+a frame over summarizing it.
+
+Every frame logs `NON-CLEAR (0 tris)`: this content is fills and rectangles,
+not rasterized geometry, which is correct for a copyright screen. Triangle
+geometry remains unproven -- it belongs to menus and the match, deeper in the
+route.
+
+### The live window
+
+A purpose-built `wm2000-shell` binary (2nd `[[bin]]` of
+`examples/wm2000-block-boot`, `src/shell.rs`) runs the SAME certified program
+as the headless gate via `construct_catalog_program`. Confirmed open at
+1280x960, titled "fn64 -- WM2000 (dense AOT block program)", reference renderer
+registered, cpal audio live, `first-entry BootContext matches exactly`, and no
+panic on gfx dispatch. Launch it with `nohup` -- a foreground launch was
+SIGTERM'd at 12 minutes.
+
+RT64 does not apply to this lane, correcting an earlier assumption:
+`examples/wm2000-block-boot/Cargo.toml:40-41` depends only on
+`fn64-render`/`fn64-render-reference`. RT64 is wired into `crates/fn64-shell`,
+the function lane, which boots a linked whole-ROM crate; WM2000 is a dense-AOT
+shard catalog. Different contracts, not variants -- the reference backend is
+the correct choice here, not a fallback, and the recorded RT64 speedup does not
+transfer.
+
+The `task_dispatch.rs:295` gfx-dispatch blocker recorded in earlier notes is
+already fixed. That file is now a module directory, and the KSEG0->physical
+mask is covered by
+`crates/fn64-abi/src/task_dispatch/tests/dispatch_a.rs:970`, which cites the
+original panic and asserts `0x8038ce30 -> 0x0038ce30`.
+
+
+## 2026-08-06: deepest verified run -- 12M steps, clean exit
+
+The scheduled `entrance-to-match` route ran to its full 12,000,000-step budget
+and exited cleanly. No panic, no `unjournaled` mutation, no `AotMiss`.
+
+```
+done: steps=12000000 sim_time=1912427205 thread0_dead=true
+gfx_submits=694 audio_submits=1120
+process exit prepared: threads=10 detached_coroutines=9
+```
+
+It reached controller **read 560 of 1400** -- through the copyright screen,
+the Exhibition and match-type menus, the rules page, the Decision page that
+commits match setup, and into the entrance/versus presentation. Three recovered
+generations stayed resident throughout; the catalogued fourth
+(`3068194456377681093`) was still not entered, consistent with the note at
+`docs/BOOT-NOTES-WM2000.md` that no retained route recipe reaches it.
+
+**It stopped on the step budget, not on a fault and not at the end of the
+route.** The remaining 840 controller reads need roughly 3x the budget, which
+at current throughput is several more hours. Depth is now purely a throughput
+question -- see `docs/plans/dispatch-granularity.md`.
