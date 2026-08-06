@@ -13,6 +13,9 @@ branch `fix/overlay-stride-aliases`.
 **The slice does not end at a block boundary, and it does not end on budget.
 It ends because the guest stored to RDRAM.**
 
+This holds at 60,000 steps (100% of slices) and past the boot BSS clear at
+200,000 steps (99.8% of slices). It is structural, not a boot artifact.
+
 A census over the 60,000-step benchmark:
 
 ```
@@ -35,6 +38,46 @@ block_exit=[("ExecutableWrite", 60000), ("Transfer", 29999)]
 **100% of slices terminate on `BlockExit::ExecutableWrite`.** Not
 `Checkpoint`, not budget exhaustion, not a host call, not a message queue.
 Zero slices ended for any other reason.
+
+And they terminate at exactly **two** guest PCs, splitting the 60,000 evenly:
+
+```
+[dispatch-census] site ExecutableWrite pc=0x80000414 count=30000
+[dispatch-census] site ExecutableWrite pc=0x80000418 count=30000
+```
+
+### What that code is
+
+Decoding the boot bank at those addresses (ROM offset `0x1000` maps to VA
+`0x80000400`):
+
+```
+80000400  lui   $t0, 0x8005
+80000404  addiu $t0, $t0, -0x4b40    # t0 = 0x8004b4c0   destination
+80000408  lui   $t1, 0x0006
+8000040c  addiu $t1, $t1, 0x5ed0     # t1 = 0x00065ed0   byte count
+80000410  sw    $zero, 0($t0)        #   store 1
+80000414  sw    $zero, 4($t0)        #   store 2
+80000418  addi  $t0, $t0, 8
+8000041c  addi  $t1, $t1, -8
+80000420  bnez  $t1, 0x80000410
+80000424  nop
+```
+
+This is the boot stub's **BSS clear**: a 6-instruction loop zeroing 0x65ED0
+bytes (~417 KB) two words per iteration, ~52,000 iterations. It is not
+self-modifying code by any reading — it is `memset` on uninitialized data.
+
+The two `sw $zero` land inside the watched megabyte, so each one sets the
+executable-write boundary and ends a slice. The 6-instruction loop is therefore
+served as a 1-instruction slice and a 5-instruction slice, which is exactly the
+`slice_instruction_histogram 1:30000 5:30000` above. The exit PC is the
+*resume* address, so the store at `0x80000410` reports as `0x80000414` and the
+store at `0x80000414` reports as `0x80000418`.
+
+This is the cleanest possible demonstration of the problem: the single hottest
+loop in the boot path pays a full scheduler round trip per store, for stores
+that cannot possibly invalidate translated code.
 
 `sim_time=180000` and 36.7s, matching the clean baseline exactly — the census
 is observation-only.
@@ -138,18 +181,29 @@ What IS inherent, and must not be weakened:
 
 ### 3. What is the actual mean block length?
 
-**2.0 instructions per block; 3.0 instructions per slice; 1.5 blocks per
-slice.**
+**Boot phase (60,000 steps): 2.0 instructions per block; 3.0 per slice; 1.5
+blocks per slice.**
 
-The distribution is bimodal and tiny: blocks are 1 instruction (59,999 of
-89,999) or 4 instructions (29,999). Slices are 1 instruction (30,000) or 5
-instructions (30,000). This is a short store-bearing loop being cut at the
-store every iteration.
+**Past the BSS clear (200,000 steps): 3.398 per block; 7.163 per slice; 2.108
+blocks per slice.**
 
-For scale: the guest retires 180,000 instructions in 36.7s across 60,000
-scheduler round trips. That is **one full scheduler round trip, checkpoint
-publication, mutation-journal reconcile and device-fabric commit per 3 guest
-instructions.**
+Use the second set for any steady-state projection; the first is a boot-memset
+floor. Both are far below the 4096 budget, and in both cases the terminating
+exit is `ExecutableWrite` essentially always (100% and 99.8%).
+
+In the boot phase the distribution is bimodal and tiny: blocks are 1
+instruction (59,999 of 89,999) or 4 instructions (29,999); slices are 1
+instruction (30,000) or 5 instructions (30,000). That is the 6-instruction BSS
+loop being cut at each of its two stores.
+
+Past BSS the distribution gains a long tail — slices of 410, 411, 412 and 519
+blocks appear — but the mode stays low because most guest code stores
+frequently.
+
+For scale: at 60,000 steps the guest retires 180,000 instructions in 36.7s
+across 60,000 scheduler round trips. That is **one full scheduler round trip,
+checkpoint publication, mutation-journal reconcile and device-fabric commit
+per 3 guest instructions** (per ~7 past boot).
 
 ### 4. What would it take to execute N blocks per dispatch?
 
@@ -217,7 +271,7 @@ the cheaper one has not been measured yet.
 | Chain past `ExecutableWrite` in the slice loop | Exactly the interleaving `host.rs:538-541` closes: the store commits, then a later translated instruction from the pre-store image executes. The refusal at `program.rs:1511-1524` is load-bearing. |
 | Raise the instruction budget | Already falsified: 4096 vs 65536 is byte-identical. The budget is never the binding constraint. |
 | Batch checkpoints and publish every Nth | `publish_checkpoint` writes a per-thread map (`live_program.rs:1026-1047`) that is overwritten, so no record is lost — but the yield that follows it is what advances time, so batching still moves the timeline. |
-| Disable the mutation journal | `FN64_FAST_MUTATION_JOURNAL=1` already exists as the iteration lane and does not change granularity: it skips the *comparison* (`live_program.rs:2093`), not the boundary observer, which is installed unconditionally at `execution.rs:195`. |
+| Disable the mutation journal | `FN64_FAST_MUTATION_JOURNAL=1` already exists as the iteration lane and does not change granularity: it skips the *comparison* (`live_program.rs:2093`), not the boundary observer, which is installed unconditionally at `execution.rs:195`. Confirmed empirically — the 200,000-step run above used it and still ended 99.8% of slices on `ExecutableWrite`. |
 
 ## What this means for the digest decision
 
@@ -259,6 +313,60 @@ to be small, it is a much cheaper win than the migration and changes what the
 migration needs to carry. If it turns out to be large, the two should share one
 regeneration rather than forcing two.
 
+The BSS-clear attribution makes the upside concrete. The destination range is
+`[0x8004b4c0, 0x800b1390)` — entirely data, and entirely inside the watched
+bank. A predicate that excluded it would let that loop chain to its 4096
+budget instead of ending every 1-2 instructions, with the guest computing
+bit-identical results.
+
+The 200,000-step run supplies the existence proof that this pays off generally:
+slices of 410-519 blocks already occur wherever the guest happens not to
+store. That is the behaviour the predicate is suppressing everywhere else.
+
+### Scoping: the 60,000-step benchmark is entirely inside this one loop
+
+The BSS clear needs 52,186 iterations × 6 instructions = **313,116
+instructions and ~104,372 slices**. The standard benchmark stops at 180,000
+instructions and 60,000 slices, so **it never finishes the BSS clear** — the
+two-PC census confirms every slice end in that run is one of those two stores.
+
+So "3 guest cycles per dispatch" characterizes the boot memset specifically.
+Running past it changes the numbers but not the conclusion.
+
+### Past the BSS clear: 200,000 steps
+
+```
+[dispatch-census] slices=199751 instructions=1430877 blocks=421144
+                  instructions_per_slice=7.163 blocks_per_slice=2.108
+                  instructions_per_block=3.398
+[dispatch-census] slice_exit={"Checkpoint": 177, "ExecutableWrite": 199292,
+                              "ExecutableWriteResolveCall": 9,
+                              "HostCall": 272, "ThreadReturn": 1}
+[dispatch-census] site ExecutableWrite pc=0x80027154 count=93596
+[dispatch-census] site ExecutableWrite pc=0x80000414 count=52186
+[dispatch-census] site ExecutableWrite pc=0x80000418 count=52186
+```
+
+(`sim_time=1461877`, `thread0_dead=true`, 110s with
+`FN64_FAST_MUTATION_JOURNAL=1`.)
+
+The BSS clear completes — 52,186 at each PC, exactly the predicted iteration
+count — and a different hot store at `0x80027154` takes over for nearly half
+the remaining run.
+
+What this settles:
+
+- **Granularity improves ~2.4x once real code runs**: 7.163 instructions per
+  slice, 3.398 per block. So the 3.0 figure is a boot-phase floor, and any
+  steady-state speedup projection should use ~7, not ~3.
+- **The mechanism is not a boot artifact.** `ExecutableWrite` still ends
+  **199,292 of 199,751 slices — 99.8%**. Budget exhaustion accounts for 177.
+  Store-forced slice ends dominate real game code just as thoroughly.
+- **Chaining works and is being suppressed.** The `slice_block_histogram` tail
+  contains slices of 410, 411, 412 and 519 blocks — where the guest happens
+  not to store, the loop chains hundreds of blocks into one dispatch. That is
+  direct evidence the ceiling is the store predicate and nothing else.
+
 That experiment is cheap — the census in this document is confined to
 `fn64-abi`, so the iteration loop is a single-crate rebuild — and it is the
 obvious next step. This investigation deliberately stopped short of it: the
@@ -279,6 +387,15 @@ export FN64_EXECUTABLE_IMAGES="$G/run-1/image.json:$G/run-2/image.json:$G/run-3/
 export FN64_BOOT_CONTEXT="$C/wm2000-boot-context.json"
 export FN64_ABSENT_N64DD=1 FN64_BLOCK_MAX_STEPS=60000 FN64_DISPATCH_CENSUS=1
 time ./target/release/wm2000-block-boot 2>&1 | grep -E 'census|done: steps'
+```
+
+For the past-BSS numbers, raise the step count and use the fast journal lane so
+it finishes in ~110s instead of ~10 minutes (the journal does not affect
+granularity — see the shortcuts table):
+
+```
+FN64_BLOCK_MAX_STEPS=200000 FN64_FAST_MUTATION_JOURNAL=1 \
+  ./target/release/wm2000-block-boot 2>&1 | grep -E 'census|done: steps'
 ```
 
 Census implementation: `dispatch_census` in
