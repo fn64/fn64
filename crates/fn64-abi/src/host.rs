@@ -79,7 +79,26 @@ pub unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
         host.runtime_rdram_len = rdram_len;
         host.native_execution_destinations.clear();
     });
-    with_executor(|exec| unsafe { exec.set_rdram_base_with_len(rdram, rdram_len) });
+    with_executor(|exec| {
+        unsafe { exec.set_rdram_base_with_len(rdram, rdram_len) };
+        // The executor mirrors `OSMesgQueue` fields into guest RDRAM through a
+        // raw pointer, which no view type attributes. A queue may live inside
+        // a watched executable range -- WM2000 has one at 0x8009b0b0 -- so
+        // without this the mirror reads as memory changing under the
+        // recompiler and fails the next dispatch. `fn64-runtime` cannot call
+        // the recompiler crate in production (the dependency is dev-only and
+        // deliberately one-way), so the host installs the hook.
+        //
+        // The hook PUBLISHES rather than observes. The mirror runs while a
+        // host transaction is already open, and that transaction's ordering
+        // boundary requires zero uncommitted child writer events -- so a
+        // notification issued after a raw write is not enough. Routing through
+        // `write_guest_physical` brackets the bytes in a child writer
+        // transaction that commits before returning, which is the same path
+        // every other attributed host write already takes.
+        #[cfg(feature = "recomp-rs")]
+        exec.set_queue_mirror_publisher(crate::recompiled::write_guest_physical);
+    });
 }
 
 #[cfg(feature = "recomp-rs")]
