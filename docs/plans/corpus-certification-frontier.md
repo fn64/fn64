@@ -2017,3 +2017,37 @@ folds in a value derived before the bound was applied.
 That is a single digest-derivation question over geometry that is otherwise
 verified correct end to end -- much narrower than where this blocker started,
 and the last thing between here and a run that gets past the activation.
+
+### The catalog digest mismatch is overlay 1's prepared shard
+
+Located precisely. `canonical_definition_sha256` folds in every shard's start
+and end (`fn64-recomp-rs/src/generation/mod.rs:1104-1109`), so the runtime and
+build-time catalogs diverge whenever their shard geometry differs.
+
+The runtime reads `pack.rs`, and the pack's shard lists are:
+
+    OVERLAY_0_SHARDS  2 shards, last ends 0x80101b90   (image_end 0x800FEF10)
+    OVERLAY_1_SHARDS  1 shard,  last ends 0x80129f40   (image_end 0x801226F0)
+    OVERLAY_2_SHARDS  5 shards, last ends 0x8016c900
+    OVERLAY_3_SHARDS  7 shards, last ends 0x80151b90
+
+Overlays 0, 2 and 3 overhang by less than one 64 KiB shard, as intended.
+Overlay 1 overhangs by `0x7850` -- its shard is `0xd640` long, which is the
+FULL image to `data_end` (`0x80129f40`), not a 64 KiB block.
+
+Cause: overlay 1's text is only `0x5df0`, so its prepared shard package was
+generated once for the whole image and is a single short shard. The truncation
+applied in `wm2000-block-shards/build.rs` rounds the text extent up to
+`0x10000` and then clamps with `.min(recipe.rom_end)`, which for this overlay
+clamps straight back to the full image -- leaving it unchanged.
+
+So the shard CONTENT is fixed out-of-tree at the full image length while the
+generation now declares a shorter `image_end`. Any fix has to either
+regenerate that prepared package at the text length, or have the pack emit the
+shard's true length and let the generation's digest cover only
+`[image_start, image_end)` -- the latter is what "ending mid-shard" already
+permits, and needs the pack's emitted `byte_len` to stop being derived from
+the truncated source slice.
+
+The other three overlays are already correct, so this is one overlay's
+packaging rather than a design problem.
