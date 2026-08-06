@@ -2158,3 +2158,39 @@ time, and its own comment explains the interleaving it closes
 (`host.rs:300-307`). Reordering or skipping it is a correctness question about
 device observability, not a micro-optimisation, so it needs the same care as
 the journal question rather than another quick attempt.
+
+## Realtime: where the remaining gap actually is, 2026-08-06
+
+After the bulk-copy fix and the no-change digest skip, measured by SELF time:
+
+    1942  sha2 compress          44%
+    1677  advance_device_time    38%
+     298  memcmp                  7%
+     202  copy_logical_bytes      5%   (was 1849 before the bulk copy)
+       6  BlockProgram::run     0.1%   guest execution
+
+    strict  1,053 steps/s        fast  1,935 steps/s  (8.1x from realtime)
+    session: 351s -> 31s on the fast lane, 11.3x
+
+The remaining SHA-256 is load-bearing and cannot be deferred or narrowed:
+`after_sha256` becomes the next commit's `before_sha256`, so the digests form
+a chain, and each is needed to compute the next. It is also embedded in
+durable receipts (`receipts.rs:95`, `:116`), so its VALUE is fixed.
+
+And the arithmetic says removing it would not be enough anyway. Even if
+sha2 went to zero, the strict lane reaches ~1,873 steps/s -- still 8.4x from
+realtime, because `advance_device_time` then dominates.
+
+So realtime is not reachable by making the journal cheaper. The remaining
+costs are:
+
+1. the digest chain, which is what the certification model asserts;
+2. device-fabric advance, which commits device state at an exact guest time
+   to close a specific interleaving (`host.rs:300-307`).
+
+The honest conclusion is that the FAST lane at 1,935 steps/s -- journal off,
+per-generation digests and write attribution still on -- is the configuration
+to aim a playable build at, and 8x from realtime is what the current device
+model costs. Closing that further means understanding why device advance is
+38% of self time, which is a device-model question and has not been
+investigated at all.
