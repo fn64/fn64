@@ -2075,3 +2075,39 @@ Worth stating plainly: `gfx_submits=0` still, so nothing renders yet. What
 changed is that the blocker moved from "the pack cannot describe this overlay"
 to "the dispatcher splits an atomic pair", which is a narrower and more
 ordinary class of bug.
+
+## Can the certified lane reach realtime? Profiled, 2026-08-06
+
+At 1,304 steps/s the lane is 12x slower than realtime (was 23.5x at session
+start; 7.6x cumulative speedup so far). Sampling the STRICT configuration --
+mutation journal on, writes pending, so the commit path is mandatory --
+attributes the time:
+
+    1034  sha2::sha256::aarch64::compress      32%   journal digest
+     816  pi::timing::advance_device_time      25%   device timing, self time
+     659  RdramView::copy_logical_bytes        20%   snapshot copy
+      66  _platform_memcmp                      2%   change detection
+       6  BlockProgram::run                   0.2%   ACTUAL GUEST EXECUTION
+
+Guest execution is 6 samples of 3,240. Essentially none of the time is spent
+running the recompiled game; ~74% is journal machinery and device timing.
+
+That is the encouraging read: realtime does not require a faster CPU model,
+because the CPU model is already free. It requires not re-hashing 1 MiB per
+commit, not re-copying it, and understanding why device timing costs 25%.
+
+Three tractable directions, none of which is page protection:
+
+1. **Digest only what changed.** `digest_snapshot` hashes the whole watched
+   region per commit, but `current_changed_ranges` has already computed the
+   changed intervals by then. The digest VALUE must stay stable, so this
+   means restructuring what the journal commits to -- a certification
+   question, but a much narrower one than reconciliation granularity.
+2. **Stop re-copying the snapshot.** `read_snapshot_from_view` allocates and
+   fills a fresh 1 MiB `Vec<Vec<u8>>` per commit; a double-buffer swap is
+   value-identical and needs no certification decision.
+3. **Understand `advance_device_time`.** 25% in self time, unexamined so far.
+
+Estimated ceiling if 1 and 2 land: roughly 4-5x, i.e. 5,000-6,500 steps/s or
+~2.5x slower than realtime. Reaching parity would additionally need whatever
+(3) turns out to be.
