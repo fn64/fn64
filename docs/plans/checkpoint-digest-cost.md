@@ -349,6 +349,95 @@ narrower set never misses a genuine self-modifying store, plus the timing
 granularity change on publication digests. Nothing measured here makes that
 cheaper, but nothing measured here rules it out either.
 
+## The narrow boundary map is ruled out: the stores land on real code
+
+Measured 2026-08-06, same lane. The separate-boundary-map plan requires a
+conservative narrower set — one that excludes only spans which cannot back
+resident translated code. On WM2000 no such exclusion exists for the stores
+that actually end the slices, so the set cannot be narrowed at all.
+
+The slice-ending stores were attributed by PC census at 200,000 steps:
+
+```
+site ExecutableWrite pc=0x80027154 count=93596
+site ExecutableWrite pc=0x80000414 count=52186
+site ExecutableWrite pc=0x80000418 count=52186
+```
+
+Both dominant sites are data-clearing loops, disassembled from the ROM through
+`ROM_COPY = (0x1000, 0x101000, 0x80000400)`:
+
+```
+80000400  lui   $t0, 0x8005
+80000404  addiu $t0, $t0, -0x4b40   ; dest  = 0x8004b4c0
+80000408  lui   $t1, 0x0006
+8000040c  addiu $t1, $t1, 0x5ed0    ; count = 0x65ed0 = 417,488
+80000410  sw    $zero, 0($t0)
+80000414  sw    $zero, 4($t0)
+80000418  addi  $t0, $t0, 8
+8000041c  addi  $t1, $t1, -8
+80000420  bne   $t1, $zero, 0x80000410
+```
+
+The destination is **not** the code the loop is running from. It clears
+`0x8004b4c0..0x800b1390`, and that interval is covered by declared, compiled
+boot shards:
+
+| shard va_start | overlap | share of shard |
+|---|---|---|
+| 0x80040400 | 20,288 | 31% |
+| 0x80050400 | 65,536 | 100% |
+| 0x80060400 | 65,536 | 100% |
+| 0x80070400 | 65,536 | 100% |
+| 0x80080400 | 65,536 | 100% |
+| 0x80090400 | 65,536 | 100% |
+| 0x800a0400 | 65,536 | 100% |
+| 0x800b0400 | 3,984 | 6% |
+
+417,488 bytes — seven shards wholly inside the cleared region, two partly.
+These are not padding swept in by 64 KiB tiling. Shard 05
+(`0x80050400..0x80060400`, entirely inside the clear) carries 33 emitted
+functions and its `WORDS` are dense MIPS: `0x27BDFFF8` (`addiu $sp,$sp,-8`),
+`0xAFB00000` (`sw $s0,0($sp)`), `0x03E00008` (`jr $ra`). Sampling the ROM
+image across the destination shows ordinary prologues throughout, e.g.
+`27bdffd8 afb00010 00808021` at `0x80060000`.
+
+So the boot stub really does overwrite bytes that back resident translated
+code, and it does so 52,186 times in the censused window. A boundary map that
+excluded those spans would be excluding live code — the exact one-sided
+failure the plan forbids, where stale translated code executes. A map that
+includes them is the map we already have.
+
+This is a property of the program, not of how the range set is represented:
+the game's BSS/heap overlaps its own loaded code image, and the recompiler
+declared shards over the whole copied 1 MiB because the ROM copy is one
+contiguous blob. No authority — generation catalog or AOT extents — can
+certify those spans dead, because they are not dead; they are code that has
+been compiled and whose bytes are being zeroed before reuse as data.
+
+The 5.6% no-op-store measurement above is consistent and independent: 94.4% of
+the cleared words genuinely change value, so the writes are real mutations of
+real code bytes.
+
+### Why this closes the line rather than redirecting it
+
+Nothing narrower is available, and the payoff would have been small in any
+case. Slice granularity is not what costs the time — the profile above puts
+70.3% of self time in `sha2::compress` under `digest_snapshot`. Lengthening
+slices reduces the *number* of publications, but each publication still
+re-hashes the full watched region, and the census shows the run already
+reaches 410-519-block slices wherever the guest does not store. The dispatch
+grain is a symptom of the digest cost, not an independent blocker.
+
+Baseline for the record, 60k steps: 32.98s, `sim_time=180000` (invariant, as
+required). Census at 200k: `slices=199751 instructions_per_slice=7.163
+blocks_per_slice=2.108`, exit mix `{ExecutableWrite: 199292, HostCall: 272,
+Checkpoint: 177, ExecutableWriteResolveCall: 9, ThreadReturn: 1}`.
+
+No source change is carried for this entry — the probe used to obtain the
+range decomposition was reverted, and the boundary map was never written,
+because the derivation it depends on does not exist on this program.
+
 Verification for this entry: 691/691 `fn64-abi`+`fn64-runtime`, 401/401
 `fn64-recomp-rs`, `grade-all.sh` wrong=0 on all five, 60k benchmark
 `sim_time=180000` at 36.16s (baseline ~36.5s). The probe was reverted; no
