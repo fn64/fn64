@@ -740,8 +740,13 @@ pub(super) mod dispatch_census {
         pub(super) static CENSUS: RefCell<Census> = RefCell::new(Census::default());
     }
 
+    /// Read the environment once. This is consulted at every dispatch, so an
+    /// uncached `env::var_os` would allocate and scan the environment millions
+    /// of times on a long route even with the census disabled.
     pub(super) fn enabled() -> bool {
-        std::env::var_os("FN64_DISPATCH_CENSUS").is_some()
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_DISPATCH_CENSUS").is_some())
     }
 
     pub(super) fn exit_name(exit: &fn64_recomp_rs::BlockExit) -> &'static str {
