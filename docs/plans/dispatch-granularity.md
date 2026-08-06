@@ -306,12 +306,68 @@ So the honest framing for sequencing:
   may be small on this single-threaded route. **Nobody has measured that yet.**
 
 The actionable finding: **measure the boundary narrowing before committing to
-the digest migration's scope.** A one-line change to the predicate in
+the digest migration's scope.** A change to the predicate in
 `classify_live_executable_write`, run against the existing gates, answers
-empirically how much of the certified surface actually moves. If it turns out
-to be small, it is a much cheaper win than the migration and changes what the
-migration needs to carry. If it turns out to be large, the two should share one
-regeneration rather than forcing two.
+empirically how much of the certified surface actually moves.
+
+### The predicate is separable from the hashed set
+
+A natural objection: WM2000's watched set is two ranges (16 bytes and
+1,513,056 bytes), and `digest_snapshot` absorbs `(physical_start,
+physical_end, bytes)` **per range** (`live_program.rs:368-376`). Splitting the
+big range into finer ones therefore changes the absorbed byte sequence and the
+digest value even though the underlying bytes are identical — which would drag
+the boundary fix into the same certification migration it was meant to avoid.
+
+That objection applies to exactly one implementation strategy, and it is
+avoidable. **The boundary predicate and the hashed set are already different
+objects:**
+
+- `digest_snapshot` hashes `self.watched` (`live_program.rs:368-376`).
+- `classify_live_executable_write` tests `EXECUTABLE_WRITE_RANGES`
+  (`snapshots.rs:983-996`), a thread-local `Vec<(u32, u32)>` declared at
+  `mod.rs:67` and populated at `execution.rs:190` by *copying* from
+  `state.watched_ranges()`.
+
+The thread-local is a derived cache. Nothing in `digest_snapshot`,
+`commit_snapshot`, or the receipt chain reads it. So the predicate can be made
+finer without changing `self.watched`, and therefore without changing any
+hashed quantity. Two ways:
+
+**Option A — same-bytes short-circuit.** Return `Continue` when the store
+writes bytes already present. Provably sound: unchanged bytes cannot make
+translated code stale. The same reasoning is already relied on at
+`live_program.rs:904-908`, where a declaration whose bytes match skips the
+rehash. Changes no range list. It will not help the BSS clear on its first
+pass (those stores do change bytes), so it is a complement, not the fix.
+
+**Option B — a separate code map.** Add a new thread-local consulted *only* by
+`classify_live_executable_write`, leaving `EXECUTABLE_WRITE_RANGES` and
+`self.watched` byte-identical. This is what fixes the BSS loop, whose
+destination `[0x8004b4c0, 0x800b1390)` is data and would not appear in a code
+map.
+
+**The constraint Option B must respect** is recorded at `snapshots.rs:1019-1028`:
+a past bug used a narrower set for a comparison and missed a notification,
+surfacing later as an undeclared mutation with `events=0 declarations=0`. The
+lesson supports this design rather than contradicting it, provided the split is
+made in the right place:
+
+- **Attribution (`snapshots.rs:970`) keeps the WIDE set.** It feeds
+  `PENDING_ATTRIBUTED_EXECUTABLE_WRITES` and the undeclared-write guard.
+- **Only the boundary decision (`snapshots.rs:986`) takes the NARROW set.**
+
+"Must I declare this write?" and "must I stop executing right now?" are
+different questions. Conflating them caused the original bug; separating them
+is the fix. Any implementation must not narrow attribution.
+
+The residual risk is sourcing the code map, and it is one-sided: a range
+wrongly *excluded* means stale translated code executes, so the map must be
+conservative and derived from an authority that already knows which physical
+spans back resident generations — the generation catalog
+(`live_program.rs:2266-2320`) and the AOT install's own translated extents.
+That derivation is the part that must be proven rather than assumed, and it is
+why this was left as a separate task.
 
 The BSS-clear attribution makes the upside concrete. The destination range is
 `[0x8004b4c0, 0x800b1390)` — entirely data, and entirely inside the watched
@@ -367,11 +423,16 @@ What this settles:
   not to store, the loop chains hundreds of blocks into one dispatch. That is
   direct evidence the ceiling is the store predicate and nothing else.
 
-That experiment is cheap — the census in this document is confined to
-`fn64-abi`, so the iteration loop is a single-crate rebuild — and it is the
-obvious next step. This investigation deliberately stopped short of it: the
-brief was analysis, and changing the predicate is a correctness-sensitive
-change that deserves its own task with its own verification.
+That experiment is cheap. Because the census and the predicate both live in
+`fn64-abi`, the edit-measure loop is a single-crate rebuild: **19.7 seconds**,
+measured, versus the ~11 minutes a `fn64-recomp-rs` change costs by rebuilding
+all 32 shard crates. Option A above is a few lines and needs no new data
+source; Option B needs a conservative code map and is the one that must be
+proven.
+
+This investigation deliberately stopped short of implementing either: the brief
+was analysis, and a permissive error in the predicate means stale translated
+code executes, which deserves its own task with its own verification.
 
 ## Reproducing
 
