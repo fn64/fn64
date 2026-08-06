@@ -862,6 +862,56 @@
     }
 
     #[test]
+    fn a_generation_may_end_mid_shard() {
+        // Shards tile in fixed blocks, but an image need not be a whole number
+        // of them. WM2000's overlay 1 is the witness: 0x5df0 of text inside a
+        // 0xddc0 invalidation extent, so one 64 KiB shard cannot fit inside
+        // the extent and the image cannot be rounded up to a shard boundary.
+        // The final shard is allowed to overhang; the digest covers only
+        // [image_start, image_end), so the overhang carries no identity.
+        let generation = PrecompiledGeneration::new(
+            GenerationId::new(1),
+            VA,
+            GuestPc::new(VA.get() + 4),
+            VA,
+            GuestPc::new(VA.get() + 4),
+            [0; 32],
+            vec![PrecompiledShard::new(BankId::new(1), VA, GuestPc::new(VA.get() + 8)).unwrap()],
+        )
+        .expect("a shard overhanging image_end is admitted");
+        assert_eq!(generation.byte_len(), 4);
+    }
+
+    #[test]
+    fn a_shard_starting_at_image_end_is_still_rejected() {
+        // Relaxing the END must not admit a shard that contributes nothing.
+        // This one starts exactly where the image stops, so it is a gap in
+        // disguise rather than coverage.
+        let error = PrecompiledGeneration::new(
+            GenerationId::new(1),
+            VA,
+            GuestPc::new(VA.get() + 4),
+            VA,
+            GuestPc::new(VA.get() + 4),
+            [0; 32],
+            vec![
+                PrecompiledShard::new(BankId::new(1), VA, GuestPc::new(VA.get() + 4)).unwrap(),
+                PrecompiledShard::new(
+                    BankId::new(2),
+                    GuestPc::new(VA.get() + 4),
+                    GuestPc::new(VA.get() + 8),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationCatalogError::ShardCoverage { .. }
+        ));
+    }
+
+    #[test]
     fn shard_union_must_exactly_tile_the_hashed_image() {
         let error = PrecompiledGeneration::new(
             GenerationId::new(1),

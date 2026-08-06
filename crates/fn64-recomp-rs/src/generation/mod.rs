@@ -106,9 +106,36 @@ impl PrecompiledGeneration {
             });
         }
         shards.sort_unstable_by_key(|shard| (shard.start, shard.end, shard.bank));
+        // Shards must tile the image contiguously from `image_start` and COVER
+        // it, but the final shard may run PAST `image_end`.
+        //
+        // Requiring an exact end forced every generation onto a shard
+        // boundary, and that is unsatisfiable together with the two other
+        // rules. WM2000's overlay 1 is the witness: its text is 0x5df0 bytes,
+        // so it needs one 64 KiB shard, but its whole invalidation extent is
+        // only 0xddc0 -- a whole shard cannot fit inside it. Rounding the
+        // image up broke `InvalidationDoesNotContainImage`; clamping it down
+        // broke this check.
+        //
+        // Letting the last shard overhang keeps what the rule exists for --
+        // every executable byte of the image is backed by exactly one shard,
+        // with no gap and no overlap -- while letting `image_end` fall where
+        // the image actually ends. Bytes past `image_end` inside that final
+        // shard are not part of the generation's identity: the digest covers
+        // `[image_start, image_end)` only, which is precisely why a generation
+        // may end mid-shard without weakening what it asserts.
         let mut cursor = image_start;
         for shard in &shards {
-            if shard.start != cursor || shard.end > image_end {
+            if shard.start != cursor {
+                return Err(GenerationCatalogError::ShardCoverage {
+                    expected_start: cursor,
+                    actual_start: shard.start,
+                    actual_end: shard.end,
+                });
+            }
+            // A shard that starts at or past `image_end` contributes nothing:
+            // the image is already covered, so it is a gap in disguise.
+            if cursor >= image_end {
                 return Err(GenerationCatalogError::ShardCoverage {
                     expected_start: cursor,
                     actual_start: shard.start,
@@ -117,7 +144,7 @@ impl PrecompiledGeneration {
             }
             cursor = shard.end;
         }
-        if cursor != image_end {
+        if cursor < image_end {
             return Err(GenerationCatalogError::ShardCoverage {
                 expected_start: cursor,
                 actual_start: cursor,
