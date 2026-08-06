@@ -12,9 +12,17 @@ use fn64_discover::overlay_recipe::{admitted_overlay_load_recipes_v1, OverlayLoa
 use fn64_discover::overlay_regions::{recover_overlay_regions, SearchConfig};
 use sha2::{Digest, Sha256};
 
+// `ROM_START` and `BOOT_BYTES` are fixed by N64 hardware boot behavior: every
+// standard IPL3 DMAs exactly 1 MiB from ROM 0x1000. They are the same two
+// constants discovery publishes as `banks::BOOT_COPY_ROM_START` and
+// `banks::BOOT_COPY_SIZE`, and `boot_bank_va_start` asserts the agreement.
+//
+// The boot copy's *virtual* base is NOT universal -- it is the header entry
+// point minus a CIC-dependent load delta (0 for 6102/6105/7102, 0x100000 for
+// 6103, 0x200000 for 6106; see `crates/fn64-discover/src/banks/mod.rs`). It is
+// derived per ROM by `boot_bank_va_start`, never assumed.
 const ROM_START: usize = 0x1000;
 const BOOT_BYTES: usize = 0x10_0000;
-const VA_START: u32 = 0x8000_0400;
 const SHARD_BYTES: usize = 64 * 1024;
 // The artifact boundary remains 64 KiB, while static subrunners keep rustc
 // below the measured memory ceiling. Transfers leave through BlockProgram.
@@ -122,22 +130,77 @@ enum PackageTarget {
     Overlay { generation: usize, shard: usize },
 }
 
+/// Split the 1 MiB boot copy into its `(boot, resident_tail)` shard counts.
+///
+/// This is the whole resident topology rule, and it is title-generic: the two
+/// runs tile `[va_start, split)` and `[split, va_start + BOOT_BYTES)` at 64 KiB
+/// with a possibly-partial final shard each, and together they cover the boot
+/// copy exactly once. `split` is a ROM offset inside the boot copy.
+fn resident_shard_counts(split: usize) -> (usize, usize) {
+    assert!(
+        ROM_START < split && split < ROM_START + BOOT_BYTES,
+        "resident split {split:#x} must lie strictly inside the boot copy"
+    );
+    (
+        (split - ROM_START).div_ceil(SHARD_BYTES),
+        (ROM_START + BOOT_BYTES - split).div_ceil(SHARD_BYTES),
+    )
+}
+
+/// The boot copy's proven virtual base, taken from the discovered boot-bank
+/// `RomMapping` rather than assumed. The mapping's ROM extent must be exactly
+/// the IPL3 boot DMA this generator tiles, so the two agree by construction.
+fn boot_bank_va_start(rom: &fn64_discover::rom::NormalizedRom) -> u32 {
+    let mut db = fn64_discover::FactDb::new();
+    let discovery = fn64_discover::banks::discover_boot_bank(rom, &mut db);
+    assert!(
+        matches!(
+            discovery,
+            fn64_discover::banks::BootBankDiscovery::Proven { .. }
+        ),
+        "dense-AOT shard generation requires a proven IPL3-bound boot bank, got {discovery:?}"
+    );
+    let (rom_start, rom_end, va_start) = db
+        .proven_rom_mappings()
+        .into_iter()
+        .find_map(|fact| match fact {
+            fn64_discover::Fact::RomMapping {
+                bank,
+                rom_start,
+                rom_end,
+                va_start,
+                ..
+            } if bank == fn64_discover::banks::BOOT_BANK => Some((*rom_start, *rom_end, *va_start)),
+            _ => None,
+        })
+        .expect("proven boot bank publishes its ROM mapping");
+    assert_eq!(
+        (rom_start as usize, rom_end as usize),
+        (ROM_START, ROM_START + BOOT_BYTES),
+        "boot bank ROM extent must be the fixed IPL3 boot DMA this generator tiles"
+    );
+    va_start
+}
+
 pub struct WmShardGenerator {
     rom: fn64_discover::rom::NormalizedRom,
     overlay_recipes: Option<Vec<OverlayLoadRecipeV1>>,
     host_calls: Vec<u32>,
+    /// Proven boot-copy virtual base. CIC-dependent, so never a literal.
+    boot_va_start: u32,
 }
 
 impl WmShardGenerator {
     pub fn from_rom_bytes(source: &[u8]) -> Self {
         let rom = fn64_discover::normalize(source).expect("normalizing shard ROM input");
+        let boot_va_start = boot_bank_va_start(&rom);
         let resident_signature = rom.bytes[ROM_START..ROM_START + BOOT_BYTES]
             .chunks_exact(4)
             .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         let host_bindings = fn64_discover::host_bindings::discover_wm_block_runtime_host_bindings(
             &resident_signature,
-            VA_START,
+            boot_va_start,
         )
         .expect("discovering exact WM block runtime host bindings");
         assert_eq!(
@@ -149,6 +212,7 @@ impl WmShardGenerator {
             rom,
             overlay_recipes: None,
             host_calls: host_bindings.iter().map(|binding| binding.vram).collect(),
+            boot_va_start,
         }
     }
 
@@ -337,56 +401,40 @@ impl WmShardGenerator {
 
     fn resolve_generation(&mut self, target: PackageTarget) -> (Generation, usize) {
         match target {
-            PackageTarget::Boot(index @ 0..=13) => (
-                Generation {
-                    name: "boot".to_string(),
-                    source_start: ROM_START,
-                    source_end: ROM_START + BOOT_BYTES,
-                    affine_source_end: ROM_START + BOOT_BYTES,
-                    va_start: VA_START,
-                },
-                index,
-            ),
-            PackageTarget::Boot(14) => {
-                let first_overlay_start = self.first_overlay_start();
-                assert!(
-                    VA_START + 14 * (SHARD_BYTES as u32) < first_overlay_start
-                        && first_overlay_start <= VA_START + 15 * (SHARD_BYTES as u32),
-                    "first overlay invalidation no longer belongs to static-prefix shard 14"
-                );
+            // Boot and resident tail are the two halves of the one 1 MiB
+            // affine boot copy, split at the first overlay's load address:
+            // boot tiles `[va_start, first_overlay_start)` and the tail tiles
+            // `[first_overlay_start, va_start + BOOT_BYTES)`. Both runs are a
+            // plain 64 KiB tiling whose last shard may be partial, so neither
+            // needs to know which index the split lands on. `resolve_shard`
+            // bounds each index against the run's own derived shard count.
+            //
+            // Both keep `affine_source_end` at the end of the whole boot copy:
+            // the ROM bytes stay affine with consecutive guest VAs across the
+            // split, so the final owned word of either run may take its
+            // architectural delay instruction from the following word.
+            PackageTarget::Boot(index) => {
+                let split = self.resident_split();
                 (
                     Generation {
                         name: "boot".to_string(),
                         source_start: ROM_START,
-                        source_end: ROM_START
-                            + usize::try_from(first_overlay_start - VA_START)
-                                .expect("static-prefix length fits usize"),
+                        source_end: split,
                         affine_source_end: ROM_START + BOOT_BYTES,
-                        va_start: VA_START,
+                        va_start: self.boot_va_start,
                     },
-                    14,
+                    index,
                 )
             }
-            PackageTarget::Boot(index) => {
-                panic!("static boot shard index {index} is outside the exact prefix")
-            }
             PackageTarget::ResidentTail(index) => {
-                let first_overlay_start = self.first_overlay_start();
-                let source_start = ROM_START
-                    + usize::try_from(first_overlay_start - VA_START)
-                        .expect("resident-tail source offset fits usize");
-                assert_eq!(
-                    (ROM_START + BOOT_BYTES - source_start).div_ceil(SHARD_BYTES),
-                    2,
-                    "resident-tail package topology must cover exactly two shards"
-                );
+                let split = self.resident_split();
                 (
                     Generation {
                         name: "resident_tail".to_string(),
-                        source_start,
+                        source_start: split,
                         source_end: ROM_START + BOOT_BYTES,
                         affine_source_end: ROM_START + BOOT_BYTES,
-                        va_start: first_overlay_start,
+                        va_start: self.first_overlay_start(),
                     },
                     index,
                 )
@@ -423,6 +471,47 @@ impl WmShardGenerator {
                 )
             }
         }
+    }
+
+    /// ROM offset where the resident boot copy stops being static prefix and
+    /// starts being overlay-invalidated tail.
+    ///
+    /// The invariant that survives from the retired WM2000-shaped assertions
+    /// is the one that is genuinely general: the first overlay load must land
+    /// strictly inside the boot copy, so both runs are nonempty. Which shard
+    /// index the split falls in is per-title (WM2000: 14, No Mercy: 13) and is
+    /// deliberately no longer asserted.
+    fn resident_split(&mut self) -> usize {
+        let va_start = self.boot_va_start;
+        let first_overlay_start = self.first_overlay_start();
+        let boot_bytes = u32::try_from(BOOT_BYTES).expect("boot copy length fits u32");
+        assert!(
+            va_start < first_overlay_start
+                && first_overlay_start
+                    < va_start
+                        .checked_add(boot_bytes)
+                        .expect("boot copy virtual range does not overflow"),
+            "first overlay load {first_overlay_start:#010X} must split the resident boot bank \
+             [{va_start:#010X}, {:#010X})",
+            va_start + boot_bytes,
+        );
+        // Both runs are decoded as whole instruction words, so the split must
+        // fall on a word boundary or a shard would silently drop a tail byte.
+        assert!(
+            first_overlay_start.is_multiple_of(4),
+            "first overlay load {first_overlay_start:#010X} must be instruction-aligned"
+        );
+        let split = ROM_START
+            + usize::try_from(first_overlay_start - va_start).expect("static prefix fits usize");
+        // Both runs are nonempty and together tile the boot copy exactly once.
+        // `resolve_shard` re-derives each run's count the same way, from the
+        // generation extent it is handed.
+        let (boot_shards, tail_shards) = resident_shard_counts(split);
+        assert!(
+            boot_shards > 0 && tail_shards > 0,
+            "resident split {split:#x} must leave both a boot prefix and a resident tail"
+        );
+        split
     }
 
     fn first_overlay_start(&mut self) -> u32 {
@@ -513,6 +602,58 @@ mod tests {
             ..generation
         };
         assert_eq!(delay_lookahead_word(&rom, &non_affine, 2), None);
+    }
+
+    /// The resident topology is a tiling rule, not a per-title constant. Both
+    /// measured AKI splits are exercised, and neither is privileged: WM2000
+    /// puts the split in boot shard 14, No Mercy in boot shard 13.
+    #[test]
+    fn resident_runs_tile_the_boot_copy_for_every_split() {
+        // WM2000: first overlay at VA 0x800E1B90 over a 0x80000400 base.
+        assert_eq!(resident_shard_counts(ROM_START + 0xe_1790), (15, 2));
+        // No Mercy: first overlay at VA 0x800D9960 over the same base. Under
+        // the retired `Boot(0..=13)` / `== 2` constants this was rejected.
+        assert_eq!(resident_shard_counts(ROM_START + 0xd_9560), (14, 3));
+
+        // Exhaustive over every word-aligned split: expanding both runs into
+        // their 64 KiB shard extents must reproduce the boot copy exactly --
+        // contiguous from `ROM_START`, no gap, no overlap, no byte past the
+        // end -- with only each run's final shard allowed to be partial.
+        for split_offset in (4..BOOT_BYTES).step_by(4) {
+            let split = ROM_START + split_offset;
+            let (boot, tail) = resident_shard_counts(split);
+            assert!(boot > 0 && tail > 0, "both runs nonempty at {split:#x}");
+
+            let mut cursor = ROM_START;
+            for (run_start, run_end, count) in [
+                (ROM_START, split, boot),
+                (split, ROM_START + BOOT_BYTES, tail),
+            ] {
+                for index in 0..count {
+                    let start = run_start + index * SHARD_BYTES;
+                    let end = (start + SHARD_BYTES).min(run_end);
+                    assert_eq!(start, cursor, "shard tiling has a gap at {split:#x}");
+                    assert!(start < end, "empty shard at {split:#x}");
+                    assert!(
+                        end - start == SHARD_BYTES || index + 1 == count,
+                        "only a run's final shard may be partial, at {split:#x}"
+                    );
+                    cursor = end;
+                }
+                assert_eq!(cursor, run_end, "run does not reach its end at {split:#x}");
+            }
+            assert_eq!(
+                cursor,
+                ROM_START + BOOT_BYTES,
+                "runs do not cover the boot copy at {split:#x}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must lie strictly inside the boot copy")]
+    fn a_split_outside_the_boot_copy_is_rejected() {
+        resident_shard_counts(ROM_START + BOOT_BYTES);
     }
 }
 

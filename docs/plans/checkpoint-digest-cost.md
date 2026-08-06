@@ -135,3 +135,25 @@ Recorded so they are not re-proposed:
 | The journal snapshot is ~100% of runtime | journal on 36.6s vs off 31.0s at 60k — ~15% |
 | The per-dispatch scheduler mirror dominates | gating it out entirely: 38s -> 37s, ~3% |
 | A larger per-dispatch instruction budget amortizes overhead | 4096 vs 65536: byte-identical `sim_time`, identical wall time |
+
+## Decision (2026-08-06, from the project owner)
+
+**Sequence: finish the dispatch-granularity investigation first, then do the
+page-tree digest migration.**
+
+The migration is AUTHORIZED, including the consequence that every certified
+evidence value changes and the receipt chain is regenerated. It is gated behind
+`docs/plans/dispatch-granularity.md` for one reason: the digest is 70% of self
+time, but removing it entirely still leaves ~5,700x, because a dispatch
+advances only 3 guest cycles. Until that residual is understood, we cannot say
+whether the digest is the dominant lever or merely the largest visible one --
+and churning every receipt in the project before knowing that is the wrong
+order of operations.
+
+What the migration will need when it runs, unchanged from the analysis above:
+a versioned schema bump so old and new digests are distinguishable rather than
+silently incompatible, regeneration of the receipt chain and gate expectations,
+and an explicit note that digests recorded in existing docs are historical.
+
+The `FN64_FAST_MUTATION_JOURNAL=1` opt-out remains the iteration lane in the
+meantime; it does not affect certified runs.
