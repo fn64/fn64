@@ -199,3 +199,42 @@ end, but a strict UNCHANGED PREFIX is exactly the exception, and
 implemented and proven bit-identical over all 64 change-subsets of a five-range
 watched set; whether the prefix actually holds on WM2000 is unmeasured, and if
 the boot range is the one that changes it is a negative result.
+
+## The prefix cache is a NEGATIVE result (2026-08-06, measured)
+
+The open question above is now settled by measurement, and the answer is no.
+
+A census inside `digest_snapshot`, over the standard 60,000-step benchmark and
+again at 200,000 steps, reports the watched geometry and which range moves:
+
+```
+60k:   calls=53248  ranges=2 absorbed=80,567,205,920  skipped=851,936    first_changed{0=1,1=53246,15=1}
+200k: calls=167936  ranges=2 absorbed=254,096,572,512 skipped=2,686,880  first_changed{0=4,1=167931,15=1}
+```
+
+Three facts, and each alone is fatal:
+
+1. **WM2000 watches TWO ranges, not a boot bank plus a list of overlay slots.**
+   This document and the plan built on it both assumed the latter.
+2. **The megabyte is the LAST range, and it is the one that changes.** Range 0
+   is 16 bytes; range 1 is 1,513,056 bytes (1.44 MiB), and range 1 is what
+   differs on 53,246 of 53,248 digests at 60k and 167,931 of 167,936 at 200k.
+3. **So the usable prefix is 16 bytes.** The cache skips 0.001% of absorbed
+   bytes at both step counts.
+
+Wall clock confirms it: **36.52s at 60k**, against the 36.5-36.6s this document
+records at HEAD -- unchanged, within noise. `sim_time=180000` exactly, and the
+200k run reproduced its own counters (`sim_time=1461877`, `thread0_dead=true`).
+
+The mechanism is sound and the implementation was proven bit-identical over all
+64 change-subsets of a five-range watched set. It simply has nothing to work
+with here: only a strict prefix is resumable, and the changing range is last.
+The implementation was reverted rather than carried as dead weight.
+
+**This strengthens the case for narrowing the watched region rather than
+optimizing the hash over it.** All three costs -- the digest, the store-per-
+block dispatch grain, and this dead prefix -- trace to one 1.44 MiB range that
+is both watched and constantly written. A page tree would fix the digest by
+redefining it; narrowing the region fixes all three and redefines nothing.
+Re-examine whether that 1.44 MiB genuinely needs to be watched as one unit
+before paying for the schema migration.
