@@ -2143,3 +2143,34 @@ suffix to 15-read gaps while retaining two-read pulses, and checks the same UI
 states and generation prefix. No compressed schedule is authoritative until a
 bounded visual run establishes semantic equivalence and the required series
 establishes deterministic replay.
+
+## The 0x0009b0b3 unjournaled byte: measured facts (2026-08-06)
+
+The route aborts with `unjournaled executable mutation changed physical RDRAM
+[0x0009b0b3, 0x0009b0b4)`, `expected=Some(0) live=Some(1)`. Measured, not
+inferred:
+
+- **Exactly two writes touch the byte in a whole run.** `FN64_WATCH_WRITE=0x9b0b3`
+  (`crates/fn64-runtime/src/rdram.rs:464`) reports `write_logical_bytes
+  [0x00000400,+0x100000)` and one `write_u8 [0x0009b0b3,+0x1)`. Both land in
+  the first eleven lines of stderr, before any boot progress output.
+- **The ROM byte is 0x10, not 0 and not 1.** Publication maps ROM
+  [0x1000,0x101000) to physical [0x400,0x100400), so the byte comes from ROM
+  0x9bcb3; that word is `a4 45 00 10`, and under lane XOR 3 it is `10 00 45 a4`.
+  Neither lane order yields 0x00 or 0x01. The swizzle cannot explain the values
+  (already disproven in a2d1982/ba0af45 -- do not re-propose it).
+- **`covering_declarations` in the panic is a red herring.** The filter at
+  `live_program.rs:539-547` scans the whole journal history, so `seq=81661` of
+  104420 entries proves only that the byte was declared at some point, not that
+  the failing delta was.
+- `journal_entries=104420` is identical across runs; the failure is fully
+  deterministic.
+
+Ruled out by measurement: the `FN64_FAST_MUTATION_JOURNAL` gate (unset in these
+runs); the device-advance empty-view fast path (fixed in 121a8cf/8aaf654); and
+the *second* empty-`RdramViewMut` site at `pi/timing.rs:390` -- patching it to
+describe the real allocation broke 13 tests AND left the panic byte-identical,
+so that empty view is legitimate and the patch was reverted.
+
+The open question is how `expected` reads 0 and `live` reads 1 when ROM holds
+0x10 and no post-boot writer touches the byte.
