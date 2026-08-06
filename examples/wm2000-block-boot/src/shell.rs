@@ -6,7 +6,7 @@
 //! `crates/fn64-shell` is the FUNCTION-lane harness: its boot calls
 //! `fn64_abi::recompiled::boot_thread0(rdram_ptr, len, lookup, entrypoint, ..)`
 //! with a linked whole-ROM `*-recompiled` crate. WM2000 has no such crate. Its
-//! program is a 35-shard dense-AOT catalog sealed by
+//! program is the shared dense-AOT shard catalog sealed by
 //! `boot_thread0_validated_catalog_generation_program_v1`, which takes a
 //! `ValidatedBootstrapRdramV1` + `CatalogGenerationInstallV1` + `BootContext`
 //! instead of a lookup function. The two boot seams are not variants of one
@@ -22,7 +22,7 @@
 //! (`fn64_abi::with_registered_physical_rdram_read`), which is a different
 //! present path, not a parameterization of `fn64-shell`'s.
 //!
-//! Living in this package instead buys the thing that matters most: the 35
+//! Living in this package instead buys the thing that matters most: the
 //! generated shard crates, `build.rs`'s ROM discovery, and the one `OUT_DIR`
 //! `pack.rs` are SHARED with the batch runner. A separate crate would rebuild
 //! all of it (~3 GB of artifacts) and, worse, could drift from the certified
@@ -218,7 +218,7 @@ fn run_entry_aot_with_context_gate(
             println!("[wm2000-shell] first-entry BootContext matches exactly");
         }
     });
-    wm2000_block_shard_00::run(entry, budget, ctx, mem)
+    (DENSE_AOT_ARTIFACTS[0].runner)(entry, budget, ctx, mem)
 }
 
 fn run_overlay_aot_with_generation_gate(

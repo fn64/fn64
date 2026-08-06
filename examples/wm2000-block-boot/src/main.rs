@@ -262,8 +262,8 @@ thread_local! {
     static FIRST_ENTRY_BOOT_CONTEXT: std::cell::RefCell<Option<BootContext>> = const {
         std::cell::RefCell::new(None)
     };
-    static AOT_BANK_COUNTS: std::cell::RefCell<[u64; 35]> = const {
-        std::cell::RefCell::new([0; 35])
+    static AOT_BANK_COUNTS: std::cell::RefCell<[u64; DENSE_AOT_ARTIFACTS.len()]> = const {
+        std::cell::RefCell::new([0; DENSE_AOT_ARTIFACTS.len()])
     };
     static AOT_PC_COUNTS: std::cell::RefCell<Vec<u64>> = const {
         std::cell::RefCell::new(Vec::new())
@@ -525,7 +525,10 @@ fn run_entry_aot_with_context_gate(
     mem: &mut Rdram<'_>,
 ) -> BlockRun {
     validate_first_entry_boot_context(entry, ctx);
-    wm2000_block_shard_00::run(entry, budget, ctx, mem)
+    // Artifact 0, not a named crate. `block_program.rs` already selects this
+    // gate by `artifact_index == 0`, and bank IDs are content-derived rather
+    // than name-derived, so nothing here is title-specific except the symbol.
+    (DENSE_AOT_ARTIFACTS[0].runner)(entry, budget, ctx, mem)
 }
 
 fn run_overlay_aot_with_generation_gate(
@@ -835,10 +838,17 @@ fn main() {
         );
         println!("[wm2000-block-boot] registered reference renderer (320x240)");
         let (rom_start, rom_end, va_start) = pack::ROM_COPY;
+        // The contract this asserts is IPL3's fixed one-MiB boot DMA, which is
+        // universal; the literal triple was WM2000's instance of it. Checking
+        // the invariant rather than the instance lets a differently-based title
+        // through -- `va_start` is CIC-dependent (6103 subtracts 0x100000,
+        // 6106 subtracts 0x200000), and pinning it here rejected every ROM that
+        // is not WM2000 for no stated reason.
         assert_eq!(
-            pack::ROM_COPY,
-            (0x1000, 0x101000, 0x80000400),
-            "NWXE block pack no longer matches the IPL3 one-MiB boot DMA contract"
+            (rom_start, rom_end - rom_start),
+            (0x1000, 0x100000),
+            "block pack no longer matches the IPL3 one-MiB boot DMA contract: \
+             rom=[{rom_start:#x},{rom_end:#x}) va={va_start:#010X}"
         );
         println!(
             "[wm2000-block-boot] validating boot publication rom=[{rom_start:#x},{rom_end:#x}) to va {va_start:#010X}"

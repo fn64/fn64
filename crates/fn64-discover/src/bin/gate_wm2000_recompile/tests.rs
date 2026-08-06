@@ -212,7 +212,10 @@
             16 * DENSE_AOT_SHARD_BYTES,
             16,
         )];
-        let overlay_shards = [3usize, 1, 6, 8];
+        // The real text-bounded overlay geometry since 6ae673e ("bound overlay
+        // generations to their text extent"): 15 static-prefix + 2
+        // resident-tail + 2+1+5+7 overlay shards = 32 packages.
+        let overlay_shards = [2usize, 1, 5, 7];
         let recipes = overlay_shards
             .into_iter()
             .enumerate()
@@ -429,14 +432,17 @@
         let first_overlay_start = 0x8000_0400 + 14 * DENSE_AOT_SHARD_BYTES + 0x8000;
         let (pack, recipes) = static_graph_fixture(first_overlay_start);
         let packages = expected_static_shard_packages(&pack, &recipes).unwrap();
-        assert_eq!(packages.len(), 35);
+        assert_eq!(packages.len(), 32);
         assert!(packages.contains("wm2000-block-shard-14"));
         assert!(!packages.contains("wm2000-block-shard-15"));
         assert!(!packages.contains("wm2000-block-shard-16"));
         assert!(packages.contains("wm2000-block-resident-tail-shard-00"));
         assert!(packages.contains("wm2000-block-resident-tail-shard-01"));
-        assert!(packages.contains("wm2000-block-overlay-0-shard-02"));
-        assert!(packages.contains("wm2000-block-overlay-3-shard-07"));
+        assert!(packages.contains("wm2000-block-overlay-0-shard-01"));
+        assert!(packages.contains("wm2000-block-overlay-3-shard-06"));
+        // Retired by the text-extent bound; they must not come back.
+        assert!(!packages.contains("wm2000-block-overlay-0-shard-02"));
+        assert!(!packages.contains("wm2000-block-overlay-3-shard-07"));
     }
 
     #[test]

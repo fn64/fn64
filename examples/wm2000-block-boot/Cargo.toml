@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 # The interactive lane. A SECOND BINARY of this package rather than its own
 # crate, deliberately: both binaries then share this package's one `build.rs`
-# ROM discovery, its one `OUT_DIR` pack, and the 35 already-compiled generated
+# ROM discovery, its one `OUT_DIR` pack, and the already-compiled generated
 # shard crates -- and both construct their program through the same
 # `src/block_program.rs`, so the windowed lane cannot drift from the certified
 # headless one.
@@ -92,7 +92,7 @@ fn64-recomp-rs-codegen = { path = "../../crates/fn64-recomp-rs-codegen" }
 sha2 = "0.10"
 
 [profile.release]
-# No debug info. This binary links 35 generated dense-AOT shard crates into
+# No debug info. This binary links the whole generated dense-AOT shard catalog into
 # ~121 MB, and DWARF for generated match arms is both enormous and useless --
 # every earlier release build here either ran 40+ minutes or was OOM-killed,
 # and this was a large part of why.
@@ -124,7 +124,7 @@ opt-level = 1
 debug = 0
 incremental = false
 
-# The root link cannot safely load 35 opt-level-0 generated artifacts. Apply
+# The root link cannot safely load that many opt-level-0 generated artifacts. Apply
 # bounded optimization to dependency crates (including every generated shard)
 # and partition each large shard across many LLVM units. The standalone root
 # package itself remains in the ordinary dev profile.

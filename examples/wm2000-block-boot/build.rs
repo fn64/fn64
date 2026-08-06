@@ -25,40 +25,21 @@ use sha2::{Digest, Sha256};
 const BOOT_SHARD_BYTES: usize = 64 * 1024;
 /// Same shard granularity as the `u32` the recipe extents use.
 const SHARD_BYTES_U32: u32 = 64 * 1024;
-const PREPARED_PACKAGES: [&str; 32] = [
-    "wm2000-block-overlay-0-shard-00",
-    "wm2000-block-overlay-0-shard-01",
-    "wm2000-block-overlay-1-shard-00",
-    "wm2000-block-overlay-2-shard-00",
-    "wm2000-block-overlay-2-shard-01",
-    "wm2000-block-overlay-2-shard-02",
-    "wm2000-block-overlay-2-shard-03",
-    "wm2000-block-overlay-2-shard-04",
-    "wm2000-block-overlay-3-shard-00",
-    "wm2000-block-overlay-3-shard-01",
-    "wm2000-block-overlay-3-shard-02",
-    "wm2000-block-overlay-3-shard-03",
-    "wm2000-block-overlay-3-shard-04",
-    "wm2000-block-overlay-3-shard-05",
-    "wm2000-block-overlay-3-shard-06",
-    "wm2000-block-resident-tail-shard-00",
-    "wm2000-block-resident-tail-shard-01",
-    "wm2000-block-shard-00",
-    "wm2000-block-shard-01",
-    "wm2000-block-shard-02",
-    "wm2000-block-shard-03",
-    "wm2000-block-shard-04",
-    "wm2000-block-shard-05",
-    "wm2000-block-shard-06",
-    "wm2000-block-shard-07",
-    "wm2000-block-shard-08",
-    "wm2000-block-shard-09",
-    "wm2000-block-shard-10",
-    "wm2000-block-shard-11",
-    "wm2000-block-shard-12",
-    "wm2000-block-shard-13",
-    "wm2000-block-shard-14",
-];
+/// The one shard inventory, shared verbatim with the shard generator, the
+/// prepared materializer and the verifier. See
+/// `../wm2000-block-shards/shard_inventory.in`.
+const SHARD_INVENTORY: &[(&str, &str)] =
+    &include!("../wm2000-block-shards/shard_inventory.in");
+const SHARD_COUNT: usize = SHARD_INVENTORY.len();
+const PREPARED_PACKAGES: [&str; SHARD_COUNT] = {
+    let mut packages = [""; SHARD_COUNT];
+    let mut index = 0;
+    while index < SHARD_COUNT {
+        packages[index] = SHARD_INVENTORY[index].0;
+        index += 1;
+    }
+    packages
+};
 
 struct PreparedCandidateReceipts {
     source_mode: String,
@@ -166,7 +147,7 @@ fn prepared_candidate_receipts() -> PreparedCandidateReceipts {
     let lines = manifest_text.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 7 + PREPARED_PACKAGES.len());
     assert_eq!(lines[0], "schema fn64.wm-prepared-shard-tree.v2");
-    assert_eq!(lines[6], "artifact_count 35");
+    assert_eq!(lines[6], format!("artifact_count {}", PREPARED_PACKAGES.len()));
     let mut tree = Sha256::new();
     tree.update(b"fn64.wm-prepared-shard-complete-tree.v1\0");
     push_bytes(&mut tree, b"manifest.v2");
@@ -302,8 +283,8 @@ fn cargo_source_receipts() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     manifests.sort();
     assert_eq!(
         manifests.len(),
-        35,
-        "trusted WM generated source graph must contain exactly 35 shard manifests"
+        SHARD_COUNT,
+        "trusted WM generated source graph must contain exactly {SHARD_COUNT} shard manifests"
     );
     shard_sources.extend(manifests);
     let shard_cargo_source_tree_sha256 =

@@ -2,7 +2,7 @@
 //! shared verbatim by both binaries in this package.
 //!
 //! `main.rs` (the headless batch runner) and `shell.rs` (the interactive
-//! windowed runner) must boot the SAME program: the same 35 dense shards, the
+//! windowed runner) must boot the SAME program: the same dense shards, the
 //! same physically-backed generation catalog, the same captured
 //! exception-vector images, and the same Cargo-source attestation. Duplicating
 //! that ~440-line assembly into the second binary would let the two lanes drift
@@ -20,7 +20,7 @@
 //! what ran.
 //!
 //! Both binaries share this package's ONE `OUT_DIR`, so `pack.rs` and
-//! `runner.rs` are generated once by `build.rs` and the 35 generated shard
+//! `runner.rs` are generated once by `build.rs` and the generated shard
 //! crates are compiled once -- the shell lane costs no additional shard build.
 
 use crate::*;

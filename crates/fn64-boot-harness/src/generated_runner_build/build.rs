@@ -949,8 +949,8 @@ pub(super) fn wm_prepared_source_mode_v3(
         );
     }
     match (legacy, prepared) {
-        (35, 0) => Ok(PREPARED_SOURCE_MODE_INACTIVE_V1),
-        (0, 35) => Ok(PREPARED_SOURCE_MODE_CONSUMED_V1),
+        (count, 0) if count == SHARD_COUNT => Ok(PREPARED_SOURCE_MODE_INACTIVE_V1),
+        (0, count) if count == SHARD_COUNT => Ok(PREPARED_SOURCE_MODE_CONSUMED_V1),
         _ => Err(error(
             "WM shard manifests mix or omit legacy/prepared source modes",
         )),
@@ -1210,9 +1210,9 @@ pub(super) fn measure_prepared_tree_v3(
     );
     let root_entries = exact_directory_entries(root, "prepared shard root")?;
     if root_entries != expected_root || root_entries.contains(PREPARED_UPDATE_MARKER_NAME) {
-        return Err(error(
-            "prepared shard root does not contain exactly manifest.v2 and 35 package directories",
-        ));
+        return Err(error(format!(
+            "prepared shard root does not contain exactly manifest.v2 and {SHARD_COUNT} package directories",
+        )));
     }
 
     let manifest_path = root.join(PREPARED_MANIFEST_NAME);
@@ -1227,7 +1227,7 @@ pub(super) fn measure_prepared_tree_v3(
     let lines = manifest_text.lines().collect::<Vec<_>>();
     if lines.len() != 7 + PREPARED_PACKAGES.len()
         || lines[0] != "schema fn64.wm-prepared-shard-tree.v2"
-        || lines[6] != "artifact_count 35"
+        || lines[6] != format!("artifact_count {SHARD_COUNT}")
     {
         return Err(error("prepared root manifest has a noncanonical shape"));
     }

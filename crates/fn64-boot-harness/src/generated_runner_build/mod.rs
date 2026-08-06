@@ -130,80 +130,36 @@ const PREPARED_MANIFEST_NAME: &str = "manifest.v2";
 const PREPARED_UPDATE_MARKER_NAME: &str = ".update.v2";
 const PREPARED_SOURCE_MODE_INACTIVE_V1: &str = "legacy_with_prepared_candidate";
 const PREPARED_SOURCE_MODE_CONSUMED_V1: &str = "prepared_consumed";
-const PREPARED_PACKAGES: [&str; 35] = [
-    "wm2000-block-overlay-0-shard-00",
-    "wm2000-block-overlay-0-shard-01",
-    "wm2000-block-overlay-0-shard-02",
-    "wm2000-block-overlay-1-shard-00",
-    "wm2000-block-overlay-2-shard-00",
-    "wm2000-block-overlay-2-shard-01",
-    "wm2000-block-overlay-2-shard-02",
-    "wm2000-block-overlay-2-shard-03",
-    "wm2000-block-overlay-2-shard-04",
-    "wm2000-block-overlay-2-shard-05",
-    "wm2000-block-overlay-3-shard-00",
-    "wm2000-block-overlay-3-shard-01",
-    "wm2000-block-overlay-3-shard-02",
-    "wm2000-block-overlay-3-shard-03",
-    "wm2000-block-overlay-3-shard-04",
-    "wm2000-block-overlay-3-shard-05",
-    "wm2000-block-overlay-3-shard-06",
-    "wm2000-block-overlay-3-shard-07",
-    "wm2000-block-resident-tail-shard-00",
-    "wm2000-block-resident-tail-shard-01",
-    "wm2000-block-shard-00",
-    "wm2000-block-shard-01",
-    "wm2000-block-shard-02",
-    "wm2000-block-shard-03",
-    "wm2000-block-shard-04",
-    "wm2000-block-shard-05",
-    "wm2000-block-shard-06",
-    "wm2000-block-shard-07",
-    "wm2000-block-shard-08",
-    "wm2000-block-shard-09",
-    "wm2000-block-shard-10",
-    "wm2000-block-shard-11",
-    "wm2000-block-shard-12",
-    "wm2000-block-shard-13",
-    "wm2000-block-shard-14",
-];
-const SHARD_MANIFEST_DIRS: [&str; 35] = [
-    "overlay0-shard00",
-    "overlay0-shard01",
-    "overlay0-shard02",
-    "overlay1-shard00",
-    "overlay2-shard00",
-    "overlay2-shard01",
-    "overlay2-shard02",
-    "overlay2-shard03",
-    "overlay2-shard04",
-    "overlay2-shard05",
-    "overlay3-shard00",
-    "overlay3-shard01",
-    "overlay3-shard02",
-    "overlay3-shard03",
-    "overlay3-shard04",
-    "overlay3-shard05",
-    "overlay3-shard06",
-    "overlay3-shard07",
-    "shard15",
-    "shard16",
-    "shard00",
-    "shard01",
-    "shard02",
-    "shard03",
-    "shard04",
-    "shard05",
-    "shard06",
-    "shard07",
-    "shard08",
-    "shard09",
-    "shard10",
-    "shard11",
-    "shard12",
-    "shard13",
-    "shard14",
-];
+// The verifier measures the WM shard tree, so its inventory must be the same
+// inventory that tree is generated from. It is `include!`d from the shard
+// example rather than restated here -- the two copies drifted once already
+// (commit 6ae673e shrank the catalog to 32 and this copy stayed at 35).
+//
+// This is the one compile-time edge from a crate into `examples/`. It is a
+// data file with no code and no dependencies, and the verifier already binds
+// itself to this exact directory by path at runtime (see `wm_shard_root`), so
+// the coupling is stated rather than new.
+const SHARD_INVENTORY: &[(&str, &str)] =
+    &include!("../../../../examples/wm2000-block-shards/shard_inventory.in");
+const SHARD_COUNT: usize = SHARD_INVENTORY.len();
+const PREPARED_PACKAGES: [&str; SHARD_COUNT] = {
+    let mut packages = [""; SHARD_COUNT];
+    let mut index = 0;
+    while index < SHARD_COUNT {
+        packages[index] = SHARD_INVENTORY[index].0;
+        index += 1;
+    }
+    packages
+};
+const SHARD_MANIFEST_DIRS: [&str; SHARD_COUNT] = {
+    let mut dirs = [""; SHARD_COUNT];
+    let mut index = 0;
+    while index < SHARD_COUNT {
+        dirs[index] = SHARD_INVENTORY[index].1;
+        index += 1;
+    }
+    dirs
+};
 const IDENTITY_WATCHDOG: Duration = Duration::from_secs(60);
 const WRITER_RUNTIME_WATCHDOG: Duration = Duration::from_secs(10 * 60);
 // The selected WM Bootstrap path emitted 8,214,477 bytes of ordinary runtime
