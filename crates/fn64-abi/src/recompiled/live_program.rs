@@ -466,8 +466,32 @@ impl CanonicalExecutableMutationStateV1 {
         if let Some((physical_start, physical_end)) =
             self.current_changed_ranges(&snapshot).into_iter().next()
         {
+            // Report what the journal knows about this byte. The panic site in
+            // `execution.rs` cannot: `mutation_evidence_snapshot()` returns
+            // None there, so its dump prints nothing. Here the state is in
+            // hand, and the question is precisely whether some earlier entry
+            // DID declare this address -- which separates "no writer
+            // attributed it" from "a writer attributed it and the baseline was
+            // not advanced", the two causes that produce this same message.
+            let declarations = self
+                .entries
+                .iter()
+                .flat_map(|entry| {
+                    entry.declared_writes.iter().map(move |write| {
+                        (entry.sequence, write.channel, write.physical_start, write.physical_end)
+                    })
+                })
+                .filter(|(_, _, start, end)| *start <= physical_start && physical_end <= *end)
+                .map(|(sequence, channel, start, end)| {
+                    format!("seq={sequence} {channel:?} [{start:#010x},{end:#010x})")
+                })
+                .collect::<Vec<_>>();
             recompiled_gap_panic(format!(
-                "unjournaled executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) before canonical static dispatch"
+                "unjournaled executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) before canonical static dispatch; \
+                 journal_entries={} covering_declarations={} [{}]",
+                self.entries.len(),
+                declarations.len(),
+                declarations.join("; "),
             ));
         }
     }
