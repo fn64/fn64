@@ -493,3 +493,46 @@ then falls out of its own one-word unit and returns `ResolveTransfer`
 (`semantic/mod.rs:639-645`), so that lane re-snapshots and re-hashes per guest
 instruction. If it ever becomes the default, this analysis needs redoing
 against it.
+
+
+## Closed (2026-08-06): the narrow code map cannot be derived
+
+The remaining cheap lever -- a resident-code range set consulted only by the
+boundary predicate -- is ruled out, on a property of the game rather than a
+representation detail.
+
+**WM2000 zeroes its own loaded code image.** The boot stub's memset destination
+is `0x8004b4c0..0x800b1390` (417,488 bytes), computed at `0x80000404`/`0x8000040c`:
+
+```
+80000404  addiu $t0, $t0, -0x4b40   ; dest  = 0x8004b4c0
+8000040c  addiu $t1, $t1, 0x5ed0    ; count = 417,488
+80000410  sw    $zero, 0($t0)
+80000414  sw    $zero, 4($t0)
+```
+
+That interval is covered by compiled boot shards -- seven wholly inside, two
+partly. Shard 05 (`0x80050400..0x80060400`) lies entirely within it and holds 33
+emitted functions; the ROM image at that VA disassembles to dense MIPS with 22
+`jr $ra` returns in its first 64 KiB (verified independently against the ROM).
+
+Excluding those spans from the boundary map is the one-sided failure the design
+forbids: stale translated code would execute. Including them reproduces the map
+that already exists. No authority -- generation catalog or AOT extents -- can
+certify the spans dead, because they are not dead: they are compiled code being
+zeroed before reuse as data.
+
+Two corrections to earlier analysis in this document:
+
+- **The BSS pair is not the dominant slice-ending site.** The largest is
+  `0x80027154` at 93,596 slices, a separate byte-wise clear loop; the BSS stores
+  are 52,186 each. "100% of slices end on `ExecutableWrite`" holds in aggregate
+  (199,292/199,751); attributing that to one loop did not.
+- **Dispatch grain is a symptom, not an independent blocker.** 70.3% of self
+  time is `sha2::compress` under `digest_snapshot` against 0.06% in guest code.
+  Longer slices cut the NUMBER of publications, but each still re-hashes the
+  full watched region, and the census already shows 410-519-block slices
+  wherever the guest does not store.
+
+Every structural shortcut is now eliminated by measurement. What remains is the
+authorized page-tree digest migration.
