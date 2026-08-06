@@ -2252,3 +2252,34 @@ safe to attempt without a decision, and it is also the cheapest.
 Not a faster CPU model -- guest execution is 0.1% of self time. Not page
 protection. Not a rewrite. The certified lane is already spending almost none
 of its time running the game.
+
+## The 0x0009b0b3 byte returns past the overlay entry -- in BOTH lanes
+
+Running past the digest-selected overlay entry now fails with:
+
+    unjournaled executable mutation changed physical RDRAM
+    [0x0009b0b3, 0x0009b0b4) before canonical static dispatch
+
+I first attributed this to `FN64_FAST_MUTATION_JOURNAL`, since the failing run
+used it, and removed a gate that skipped a baseline-advancing read. That gate
+WAS unsound and its removal is correct on its own merits -- but it was not the
+cause. A control run with the journal fully ON fails at the same byte, so the
+flag is not implicated.
+
+What this means: `0x0009b0b3` is a real blocker that appears only past ~421k
+steps, which no run had reached before today's dispatch fix and speedups. It
+is the same address as Blocker A, whose diagnosis (6a2c330) was a commit
+boundary draining the declaration queue without advancing the baseline, fixed
+by `adopt_snapshot`. Either that fix is incomplete for a second code path, or
+a different mechanism produces the same symptom at this depth.
+
+Deliberately NOT guessing which. Every previous attempt to reason about this
+byte from code structure has been wrong -- six times on the AotMiss, twice on
+the write-queue gate. The journal itself can name the writer: the dump added
+in 28484b4 prints declared writes with their channel at the panic, and running
+it here is the next step rather than another hypothesis.
+
+Also worth recording plainly: rendering has still never been exercised.
+`gfx_submits=0` in every run, because all 7 RSP tasks the guest submits are
+audio. The game has not reached a graphics display list, and this blocker is
+what stops it getting further.
