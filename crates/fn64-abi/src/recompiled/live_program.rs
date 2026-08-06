@@ -1685,6 +1685,65 @@ impl CanonicalLiveBlockProgramV1 {
             .map(|resolution| resolution.entry)
     }
 
+    /// Snapshot the watched region so a C shim's writes can be declared.
+    ///
+    /// Generated C shims receive a raw `rdram` pointer and write guest memory
+    /// directly, below every attributed store path, so nothing declares for
+    /// them. A raw-write watch caught exactly that: a single-byte store to
+    /// `0x0009b0b3` from `call_c` with no covering declaration, which the next
+    /// dispatch correctly reported as an unjournaled mutation.
+    ///
+    /// Returns `None` when there is no mutation state to declare against.
+    pub(super) fn snapshot_for_host_shim(&self, mem: &Rdram<'_>) -> Option<Vec<Vec<u8>>> {
+        let state = self.mutation_state.as_ref()?;
+        if !state.borrow().sealed {
+            return None;
+        }
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        Some(state.borrow().read_snapshot_from_view(&view))
+    }
+
+    /// Declare every watched byte a C shim changed, as `HostAbi`.
+    ///
+    /// Pairs with [`Self::snapshot_for_host_shim`] taken before the call. The
+    /// shim's own writes are invisible to attribution, so the diff across the
+    /// call IS the declaration.
+    pub(super) fn declare_host_shim_writes(&self, before: Option<Vec<Vec<u8>>>, mem: &Rdram<'_>) {
+        let (Some(before), Some(state)) = (before, self.mutation_state.as_ref()) else {
+            return;
+        };
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        let after = state.borrow().read_snapshot_from_view(&view);
+        // Compare against the pre-call snapshot rather than `expected`: only
+        // what THIS shim changed belongs to it.
+        let mut changed = Vec::new();
+        for ((range, before_bytes), after_bytes) in
+            state.borrow().watched.iter().zip(&before).zip(&after)
+        {
+            if before_bytes == after_bytes {
+                continue;
+            }
+            let mut index = 0usize;
+            while index < after_bytes.len() {
+                if before_bytes[index] == after_bytes[index] {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < after_bytes.len() && before_bytes[index] != after_bytes[index] {
+                    index += 1;
+                }
+                changed.push((
+                    range.physical_start + start as u32,
+                    range.physical_start + index as u32,
+                ));
+            }
+        }
+        for (start, end) in changed {
+            fn64_recomp_rs::notify_host_abi_write(start, end - start);
+        }
+    }
+
     pub(super) fn reconcile_before_dispatch(&self, mem: &Rdram<'_>) {
         let Some(state) = &self.mutation_state else {
             return;

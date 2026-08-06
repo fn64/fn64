@@ -2346,3 +2346,37 @@ shim's writes are attributed to `HostAbi`. `begin_host_abi_transaction` /
 and declare changed ranges at the boundary.
 
 Status unchanged: nothing playable, `gfx_submits=0`.
+
+### Correction: the C-shim attribution was read from a merged stack
+
+The backtrace I used to name `call_c` as the undeclared writer was two
+captures concatenated by my own parser: `publish_rom_slice` / `main` is the
+BOOT PUBLICATION's stack, and `call_c` / `invoke_catalog_block_host` begins a
+separate one. Attributing the single-byte write to the C shim therefore rests
+on bad evidence, and the fix built on it -- declaring a diff across `call_c`
+-- was reverted.
+
+That fix also failed on its own terms: it queued an attributed event inside an
+active host transaction, tripping "catalog host transaction 4 reached an
+ordering boundary with 1 uncommitted child writer event(s)". And it was
+redundant regardless, because `invoke_catalog_block_host` ALREADY brackets the
+shim call in `begin_host_abi_transaction` / `finish_host_abi_transaction`
+(`snapshots.rs:892`), whose flush diffs the watched region and declares
+changed ranges as `HostAbi`.
+
+So the open question is narrower than "who writes the byte": a host
+transaction already covers C-shim calls and already declares what they change.
+Either this write happens outside that bracket, or the bracket's diff misses
+it. Both are checkable -- print the active transaction id at the raw-write
+watch -- and neither should be guessed at.
+
+What is solidly established and unchanged:
+
+- `FN64_WATCH_WRITE` catches exactly two raw writes to `0x0009b0b3`: the boot
+  publication, and one `write_u8`.
+- The journal's only covering declaration is a 4-byte CPU store at
+  `0x9b0b0` (seq=81661), which does not describe a one-byte write.
+- 27 raw writes across `save.rs`, `gbpak.rs` and `pfs.rs` declare nothing;
+  that gap is real even though it is not this failure.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
