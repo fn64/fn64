@@ -2445,3 +2445,77 @@ captured. That distinguishes "the baseline was never correct" from "the byte
 genuinely changed", and the panic site already holds both.
 
 Status unchanged: nothing playable, `gfx_submits=0`.
+
+### The values: expected reads the wrong LANE
+
+Printing the actual bytes at the failure -- the last unmeasured link -- gives:
+
+    expected=Some(0)  live=Some(1)
+
+and the ROM word covering that address is `a4450010`, big-endian bytes
+`a4 45 00 10`:
+
+    expected[0x9b0b3] = 0x00 = the word's LANE 2
+    ROM      [0x9b0b3] = 0x10 = the word's LANE 3
+    live     [0x9b0b3] = 0x01 = neither -- written later by the guest
+
+So the sealed baseline holds the byte from lane 2 where the address selects
+lane 3. That is an off-by-one lane: the XOR-3 swizzle applied at one layer and
+not another, between what `publish_rom_slice` writes and what `seal_with`
+reads back.
+
+This is consistent with everything measured and inconsistent with nothing:
+
+- both raw writes trace to `publish_rom_slice` (there is no second writer);
+- the two READ paths agree with each other (0 mismatches over 0x100 bytes) --
+  they are consistently wrong together, which a read-vs-read test cannot see;
+- the journal's covering declaration is a 4-byte CPU store, which is a real
+  later write and explains `live=0x01`;
+- the failure only appears past ~421k steps, when the guest finally writes a
+  region whose baseline was mis-seeded at boot.
+
+The read-path comparison I ran earlier could not have caught this: it compared
+two readers against each other, not either reader against the WRITER. The
+mismatch is between write and read, so it needs a write-then-read round trip
+over the published image.
+
+That round trip is the next measurement and it is cheap: publish a known ROM
+slice, seal, and compare `expected` against the ROM bytes directly. If they
+differ by a lane, this is proven rather than inferred.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
+
+### The lane hypothesis is dead too: the swizzle round-trips cleanly
+
+The write-then-read test the previous entry called for:
+
+    write_logical_bytes -> read_u8            0 mismatches
+    write_logical_bytes -> copy_logical_bytes 0 mismatches
+
+over a pattern whose bytes are distinct within each word, so a lane error
+could not hide. The swizzle is self-consistent end to end, and `expected=0x00`
+is NOT an RDRAM lane error. That retracts the previous entry's conclusion.
+
+What survives is the raw discrepancy, now with the arithmetic checked:
+
+    publication maps rom 0x1000 -> phys 0x400
+    phys 0x9b0b3 = rom 0x9bcb3, whose byte is 0x10
+    expected[0x9b0b3] = 0x00
+    live    [0x9b0b3] = 0x01
+
+So the sealed baseline does not hold the ROM byte for that address, and the
+swizzle is not why. Either seal ran before the publication reached that
+offset, or the publication wrote something other than the ROM slice there.
+
+Seven hypotheses are now eliminated by measurement: missing attribution, a
+second raw writer, a generated C shim, the save/GB-Pak/PFS shims, a missing
+baseline advance, read-path lane disagreement, and writer/reader lane
+disagreement.
+
+The next measurement follows directly and needs no new instrument: print
+`expected` alongside the ROM byte for a RANGE around the address at seal time.
+If a contiguous run of expected bytes is zero, seal preceded publication for
+that region; if only scattered bytes differ, the publication is writing
+something else.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
