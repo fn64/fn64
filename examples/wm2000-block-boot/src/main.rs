@@ -1393,6 +1393,7 @@ fn main() {
     if std::env::var_os("FN64_DEVICE_ADVANCE_CENSUS").is_some() {
         fn64_abi::print_device_advance_census();
     }
+    fn64_abi::recompiled::report_dispatch_census();
     println!(
         "[wm2000-block-boot] done: steps={steps} sim_time={} thread0_dead={}",
         fn64_abi::sim_time(),

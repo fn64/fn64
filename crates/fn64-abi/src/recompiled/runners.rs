@@ -485,6 +485,16 @@ pub(super) fn dispatch_unified_catalog_slice(
 ) -> Result<fn64_recomp_rs::DispatchRun, String> {
     let mut instructions = 0u32;
     let mut blocks = 0u32;
+    let census = dispatch_census::enabled();
+    macro_rules! finish_slice {
+        ($run:expr) => {{
+            let run = $run;
+            if census {
+                dispatch_census::record_slice(&run);
+            }
+            return Ok(run);
+        }};
+    }
 
     loop {
         if let UnifiedCatalogTargetV1::Static(entry) = target {
@@ -500,7 +510,7 @@ pub(super) fn dispatch_unified_catalog_slice(
             .checked_sub(instructions)
             .ok_or_else(|| "unified catalog consumed more than its slice budget".to_string())?;
         if remaining < InstructionBudget::MIN {
-            return Ok(fn64_recomp_rs::DispatchRun {
+            finish_slice!(fn64_recomp_rs::DispatchRun {
                 exit: BlockExit::Checkpoint(target.key()),
                 instructions,
                 blocks,
@@ -560,7 +570,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                                 .can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
                         {
                             if instructions > 0 {
-                                return Ok(fn64_recomp_rs::DispatchRun {
+                                finish_slice!(fn64_recomp_rs::DispatchRun {
                                     exit: BlockExit::Checkpoint(attempted),
                                     instructions,
                                     blocks,
@@ -604,7 +614,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                             attempted_instructions,
                             0,
                         )?;
-                        return Ok(fn64_recomp_rs::DispatchRun {
+                        finish_slice!(fn64_recomp_rs::DispatchRun {
                             exit: BlockExit::Fault(fault),
                             instructions,
                             blocks,
@@ -656,7 +666,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 resume,
             } => match resolve_unified_catalog_call(live, source_bank, target_pc, mem)? {
                 UnifiedCatalogCallV1::Host => {
-                    return Ok(fn64_recomp_rs::DispatchRun {
+                    finish_slice!(fn64_recomp_rs::DispatchRun {
                         exit: BlockExit::HostCall {
                             vram: target_pc,
                             resume,
@@ -674,7 +684,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 // run, then the writer resumes and resolves the new image.
                 // Resolving here would collapse both sides of that scheduler
                 // boundary into one unified slice.
-                return Ok(fn64_recomp_rs::DispatchRun {
+                finish_slice!(fn64_recomp_rs::DispatchRun {
                     exit,
                     instructions,
                     blocks,
@@ -694,7 +704,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 };
             }
             exit => {
-                return Ok(fn64_recomp_rs::DispatchRun {
+                finish_slice!(fn64_recomp_rs::DispatchRun {
                     exit,
                     instructions,
                     blocks,
@@ -702,6 +712,140 @@ pub(super) fn dispatch_unified_catalog_slice(
             }
         }
     }
+}
+
+/// Diagnostic-only census of catalog dispatch granularity. Gated on
+/// `FN64_DISPATCH_CENSUS`; it observes nothing the runtime consumes and takes
+/// no part in any certified evidence value.
+pub(super) mod dispatch_census {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    pub(super) struct Census {
+        /// Slices, keyed by the terminating exit's discriminant name.
+        pub exits: BTreeMap<&'static str, u64>,
+        /// Histogram of instructions retired per slice.
+        pub slice_instructions: BTreeMap<u32, u64>,
+        /// Histogram of inner turns (blocks) per slice.
+        pub slice_blocks: BTreeMap<u32, u64>,
+        /// Slice-terminating `(exit name, guest pc)` sites.
+        pub sites: BTreeMap<(&'static str, u32), u64>,
+        pub slices: u64,
+        pub total_instructions: u64,
+        pub total_blocks: u64,
+    }
+
+    thread_local! {
+        pub(super) static CENSUS: RefCell<Census> = RefCell::new(Census::default());
+    }
+
+    pub(super) fn enabled() -> bool {
+        std::env::var_os("FN64_DISPATCH_CENSUS").is_some()
+    }
+
+    pub(super) fn exit_name(exit: &fn64_recomp_rs::BlockExit) -> &'static str {
+        use fn64_recomp_rs::BlockExit as E;
+        match exit {
+            E::Transfer(_) => "Transfer",
+            E::ResolveTransfer { .. } => "ResolveTransfer",
+            E::ResolveCall { .. } => "ResolveCall",
+            E::HostCall { .. } => "HostCall",
+            E::ExecutableWrite { .. } => "ExecutableWrite",
+            E::ExecutableWriteResolveCall { .. } => "ExecutableWriteResolveCall",
+            E::ExecutableWriteFault(_) => "ExecutableWriteFault",
+            E::ImageChanged { .. } => "ImageChanged",
+            E::Checkpoint(_) => "Checkpoint",
+            E::Yield(_) => "Yield",
+            E::ThreadReturn => "ThreadReturn",
+            E::Fault(_) => "Fault",
+        }
+    }
+
+    /// The guest PC a slice's terminating exit names, so a hot exit can be
+    /// attributed to the code that produced it.
+    fn exit_pc(exit: &fn64_recomp_rs::BlockExit) -> u32 {
+        use fn64_recomp_rs::BlockExit as E;
+        match exit {
+            E::Transfer(key) | E::Checkpoint(key) | E::Yield(key) => key.pc.get(),
+            E::ResolveTransfer { target_pc, .. }
+            | E::ResolveCall { target_pc, .. }
+            | E::ExecutableWriteResolveCall { target_pc, .. } => target_pc.get(),
+            E::HostCall { vram, .. } => vram.get(),
+            E::ExecutableWrite { resume, .. } => resume.pc.get(),
+            E::ExecutableWriteFault(fault) | E::Fault(fault) => fault.at.pc.get(),
+            E::ImageChanged { at, .. } => at.pc.get(),
+            E::ThreadReturn => 0,
+        }
+    }
+
+    /// Record one completed slice (one scheduler round trip).
+    pub(super) fn record_slice(run: &fn64_recomp_rs::DispatchRun) {
+        CENSUS.with(|census| {
+            let mut census = census.borrow_mut();
+            census.slices += 1;
+            census.total_instructions += u64::from(run.instructions);
+            census.total_blocks += u64::from(run.blocks);
+            *census.exits.entry(exit_name(&run.exit)).or_default() += 1;
+            *census.slice_instructions.entry(run.instructions).or_default() += 1;
+            *census.slice_blocks.entry(run.blocks).or_default() += 1;
+            *census
+                .sites
+                .entry((exit_name(&run.exit), exit_pc(&run.exit)))
+                .or_default() += 1;
+        });
+    }
+
+    fn head(map: &BTreeMap<u32, u64>, limit: usize) -> String {
+        map.iter()
+            .take(limit)
+            .map(|(key, count)| format!("{key}:{count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(super) fn report() {
+        CENSUS.with(|census| {
+            let census = census.borrow();
+            if census.slices == 0 {
+                return;
+            }
+            eprintln!(
+                "[dispatch-census] slices={} instructions={} blocks={} \
+                 instructions_per_slice={:.3} blocks_per_slice={:.3} instructions_per_block={:.3}",
+                census.slices,
+                census.total_instructions,
+                census.total_blocks,
+                census.total_instructions as f64 / census.slices as f64,
+                census.total_blocks as f64 / census.slices as f64,
+                census.total_instructions as f64 / census.total_blocks.max(1) as f64,
+            );
+            eprintln!("[dispatch-census] slice_exit={:?}", census.exits);
+            eprintln!(
+                "[dispatch-census] slice_instruction_histogram {}",
+                head(&census.slice_instructions, 24)
+            );
+            eprintln!(
+                "[dispatch-census] slice_block_histogram {}",
+                head(&census.slice_blocks, 24)
+            );
+            let mut sites: Vec<_> = census.sites.iter().collect();
+            sites.sort_by(|left, right| right.1.cmp(left.1));
+            for ((exit, pc), count) in sites.into_iter().take(12) {
+                eprintln!("[dispatch-census] site {exit} pc={pc:#010x} count={count}");
+            }
+        });
+    }
+}
+
+/// Print the `FN64_DISPATCH_CENSUS` report, if the census was enabled. This is
+/// a diagnostic; it reads nothing the runtime writes and returns no value any
+/// certified evidence depends on.
+pub fn report_dispatch_census() {
+    if !dispatch_census::enabled() {
+        return;
+    }
+    dispatch_census::report();
 }
 
 #[cfg(feature = "dynamic-mapped-runtime")]
@@ -903,6 +1047,9 @@ pub(super) fn run_catalog_block_program(
                     "canonical catalog dispatch failed at {entry}: {error}"
                 ))
             });
+        if dispatch_census::enabled() {
+            dispatch_census::record_slice(&dispatched);
+        }
         live.invalidate_pending_physical_writes(mem);
 
         let image_changed_entry = match dispatched.exit {
