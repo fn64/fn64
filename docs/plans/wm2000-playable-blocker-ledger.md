@@ -1,8 +1,24 @@
 # WM2000 playability blocker — hypothesis ledger
 
 Goal: WM2000 recompile 100% playable through the fn64 pipeline (discovery →
-runtime → render). Current state: `gfx_submits=0`; no display list is ever
-submitted. This file is the working record for the blocker in front of that.
+runtime → render). This file is the working record for the blockers in front
+of that.
+
+**Correction (2026-08-06).** An earlier revision of this file said "Current
+state: `gfx_submits=0`; no display list is ever submitted." That was an
+artifact of the repro command, not a rendering blocker. The command omitted
+`FN64_CONTROLLER_SCHEDULE`, so every controller read returned
+`ContInput::default()` and the guest never left the audio-driven attract
+sequence -- it legitimately never builds a display list without input.
+`docs/BOOT-NOTES-WM2000.md` records the SAME harness binary reaching 175
+graphics tasks at 100k steps (:1643), 638 at 240k (:1725), and 1,707 at 420k
+(:1823) whenever a schedule is supplied. Rendering is not the blocker; run
+scheduled routes via `scripts/wm2000-route-probe.zsh`.
+
+The "732 VI swaps / uniform fill / the fade cover never lifts" note quoted in
+earlier planning is from a DIFFERENT harness (`examples/wm2000-boot`, the
+aki-recomp C lane), where the game had already reached gfx task #1241. It is
+not evidence about this lane.
 
 Rule for this file: a hypothesis leaves the OPEN table only with a measurement
 attached. Five hypotheses died twice across sessions because the evidence lived
