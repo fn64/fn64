@@ -2283,3 +2283,31 @@ Also worth recording plainly: rendering has still never been exercised.
 `gfx_submits=0` in every run, because all 7 RSP tasks the guest submits are
 audio. The game has not reached a graphics display list, and this blocker is
 what stops it getting further.
+
+### The 0x0009b0b3 declaration is a 4-byte store; the failing byte is its last
+
+The panic now reports the journal's own view, which narrows this considerably:
+
+    journal_entries=104420 covering_declarations=2
+      seq=0     BootstrapOrImport   [0x00000400,0x00100400)
+      seq=81661 CpuInstructionStore [0x0009b0b0,0x0009b0b4)
+
+The declaration is a 4-byte word store at `0x9b0b0`, and the failing byte
+`0x9b0b3` is its LAST byte -- so the write was attributed, accepted, and the
+baseline advanced. The byte nonetheless differs from `expected` at a later
+dispatch.
+
+That is a different claim than "a path failed to advance the baseline", which
+is what I had been testing. Pairing `invalidate_pending_physical_writes` with
+the loop's `reconcile_before_dispatch` (three of five reconcile sites lack it)
+changed nothing at all -- `journal_entries` stayed at exactly 104,420 and the
+declaration list was identical -- so that loop is not the path taken here.
+Reverted.
+
+What the evidence now supports is a SECOND write to the same byte that no
+writer declared, occurring after seq=81661 was accepted. The three reconcile
+sites without a paired invalidate are still worth auditing, but they are not
+this.
+
+Status: still not playable. `gfx_submits=0`, all 7 RSP tasks are audio, and
+this blocker is what stops execution reaching a graphics display list.
