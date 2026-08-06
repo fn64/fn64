@@ -453,6 +453,30 @@ pub struct RdramViewMut<'a> {
 #[derive(Clone, Copy)]
 pub struct RdramPtr(std::ptr::NonNull<u8>);
 
+/// Report every raw RDRAM write touching a watched physical address.
+///
+/// The attributed observers (`fn64_recomp_rs::set_write_observer`) only fire on
+/// declared writes, so they cannot see a writer that fails to declare -- which
+/// is exactly what WM2000's `0x0009b0b3` failure requires. This sits on the raw
+/// store path instead, below attribution, so nothing can bypass it.
+///
+/// Set `FN64_WATCH_WRITE=0x9b0b3` (hex, with or without `0x`) to arm it.
+fn watch_raw_write(addr: RdramAddr, len: u32, kind: &str) {
+    use std::sync::OnceLock;
+    static WATCH: OnceLock<Option<u32>> = OnceLock::new();
+    let watch = *WATCH.get_or_init(|| {
+        std::env::var("FN64_WATCH_WRITE").ok().and_then(|value| {
+            let value = value.trim().trim_start_matches("0x");
+            u32::from_str_radix(value, 16).ok()
+        })
+    });
+    let Some(watch) = watch else { return };
+    let start = addr.offset();
+    if start <= watch && watch < start.saturating_add(len) {
+        eprintln!("[watch-write] {kind} [{start:#010x},+{len:#x}) covers {watch:#010x}");
+    }
+}
+
 impl RdramPtr {
     /// # Safety
     /// `storage` must be non-null and remain valid for every logical address
@@ -540,6 +564,7 @@ impl<'a> RdramViewMut<'a> {
     }
 
     pub fn write_u32(&mut self, addr: RdramAddr, value: u32) {
+        watch_raw_write(addr, 4, "write_u32");
         assert!(
             addr.offset().is_multiple_of(4),
             "RDRAM u32 write at unaligned logical address {:#x}",
@@ -560,12 +585,14 @@ impl<'a> RdramViewMut<'a> {
     }
 
     pub fn write_u8(&mut self, addr: RdramAddr, value: u8) {
+        watch_raw_write(addr, 1, "write_u8");
         let index = self.as_view().range(addr, 1, 3, "write_u8").start;
         self.storage[index] = value;
     }
 
     /// Copy flat device/host bytes into storage in logical guest order.
     pub fn write_logical_bytes(&mut self, addr: RdramAddr, data: &[u8]) {
+        watch_raw_write(addr, data.len() as u32, "write_logical_bytes");
         for (index, &byte) in data.iter().enumerate() {
             let offset = u32::try_from(index).expect("logical RDRAM copy length exceeds u32");
             self.write_u8(
