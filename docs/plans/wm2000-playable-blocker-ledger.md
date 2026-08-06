@@ -228,3 +228,57 @@ render path changed.
   per-dispatch instruction budget (no effect at all).
 - **A live window.** The display lists are produced; that they reach a window
   has never been shown.
+
+## 2026-08-06: WM2000 renders its copyright screen, legibly
+
+Frame dumps from the certified dense-AOT block program show the recompiled
+game drawing real, readable content -- not a uniform fill.
+
+`FN64_RENDER_DUMP_DIR` (wiring at `examples/wm2000-block-boot/src/main.rs:800-828`)
+produced 40 PNGs at **480x240**, the game's real VI width rather than the 320
+default. Frames 0-7 are a monotonic fade whose dominant background steps by
+exactly `0x21` per frame (`e7 c6 a5 84 63 42 21 00`), and the foreground is
+WM2000's copyright screen:
+
+> (c)1999 Asmik Ace Entertainment / AKI
+> WRESTLEMANIA 2000
+> (c)1999 World Wrestling Federation Entertainment, Inc.
+> ... Gangrel created by White Wolf, Inc. ... Licensed by Nintendo
+
+Two frames are retained as evidence in `reference/wm2000-frames/`.
+
+One reading correction worth recording: an automated decode of these frames
+reported "96.23% black with a 4339-pixel static white set riding above the
+fade", and read that set as a featureless overlay. Those 4,339 pixels are the
+**text glyphs**. A pixel-statistics summary could not distinguish "static
+overlay" from "legible typography"; looking at the image could. Prefer viewing
+a frame over summarizing it.
+
+Every frame logs `NON-CLEAR (0 tris)`: this content is fills and rectangles,
+not rasterized geometry, which is correct for a copyright screen. Triangle
+geometry remains unproven -- it belongs to menus and the match, deeper in the
+route.
+
+### The live window
+
+A purpose-built `wm2000-shell` binary (2nd `[[bin]]` of
+`examples/wm2000-block-boot`, `src/shell.rs`) runs the SAME certified program
+as the headless gate via `construct_catalog_program`. Confirmed open at
+1280x960, titled "fn64 -- WM2000 (dense AOT block program)", reference renderer
+registered, cpal audio live, `first-entry BootContext matches exactly`, and no
+panic on gfx dispatch. Launch it with `nohup` -- a foreground launch was
+SIGTERM'd at 12 minutes.
+
+RT64 does not apply to this lane, correcting an earlier assumption:
+`examples/wm2000-block-boot/Cargo.toml:40-41` depends only on
+`fn64-render`/`fn64-render-reference`. RT64 is wired into `crates/fn64-shell`,
+the function lane, which boots a linked whole-ROM crate; WM2000 is a dense-AOT
+shard catalog. Different contracts, not variants -- the reference backend is
+the correct choice here, not a fallback, and the recorded RT64 speedup does not
+transfer.
+
+The `task_dispatch.rs:295` gfx-dispatch blocker recorded in earlier notes is
+already fixed. That file is now a module directory, and the KSEG0->physical
+mask is covered by
+`crates/fn64-abi/src/task_dispatch/tests/dispatch_a.rs:970`, which cites the
+original panic and asserts `0x8038ce30 -> 0x0038ce30`.
