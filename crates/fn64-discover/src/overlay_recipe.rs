@@ -29,6 +29,15 @@ pub struct OverlayLoadRecipeV1 {
     pub bss_start: u32,
     pub bss_end: u32,
     pub loaded_sha256: String,
+    /// SHA-256 of the TEXT extent only, i.e. `[text_start, text_end)`.
+    ///
+    /// `loaded_sha256` covers the whole loaded image, which includes the
+    /// overlay's data section. A correct program writes its own data at
+    /// runtime -- WM2000 stores four bytes at `0x80107efc`, inside overlay 0's
+    /// `0x9eb0`-byte data span -- so a whole-image digest cannot survive
+    /// execution. Only the text extent is immutable, so only it can identify a
+    /// generation across time.
+    pub text_sha256: String,
 }
 
 impl OverlayLoadRecipeV1 {
@@ -149,6 +158,18 @@ pub fn parse_overlay_load_recipes_v1(
             bss_start,
             bss_end,
             loaded_sha256: format!("{:x}", Sha256::digest(loaded)),
+            text_sha256: {
+                // text_start/text_end are VIRTUAL; convert to the ROM window
+                // the loaded slice already represents.
+                let text_rom_start = rom_start + (text_start - load_start);
+                let text_rom_end = rom_start + (text_end - load_start);
+                let text = rom_bytes
+                    .get(text_rom_start as usize..text_rom_end as usize)
+                    .ok_or(OverlayRecipeError::DescriptorOutsideRom {
+                        record: record_index,
+                    })?;
+                format!("{:x}", Sha256::digest(text))
+            },
         });
     }
     Ok(recipes)

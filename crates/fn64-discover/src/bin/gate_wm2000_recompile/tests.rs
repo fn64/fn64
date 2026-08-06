@@ -51,6 +51,7 @@
             bss_start: IMAGE_END,
             bss_end: IMAGE_END,
             loaded_sha256: format!("{:x}", Sha256::digest(overlay_bytes)),
+            text_sha256: format!("{:x}", Sha256::digest(overlay_bytes)),
         };
         let pack = build_dense_aot_pack_v1(
             &rom,
@@ -196,6 +197,7 @@
             bss_start: load_start + byte_len,
             bss_end: load_start + byte_len,
             loaded_sha256: SHA.to_string(),
+            text_sha256: SHA.to_string(),
         }
     }
 

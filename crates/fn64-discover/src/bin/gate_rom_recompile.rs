@@ -630,6 +630,10 @@ fn synthesize_flat_text_recipes(
                 // This slot's union, not this overlay's own end: see above.
                 bss_end: invalidation_end,
                 loaded_sha256: mapping.loaded_sha256.clone(),
+                // This synthesized recipe has no section split -- text spans
+                // the whole image (text_end == image.end above) -- so the text
+                // digest is the loaded digest by construction.
+                text_sha256: mapping.loaded_sha256.clone(),
             })
         })
         .collect()

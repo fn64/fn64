@@ -1947,3 +1947,37 @@ Note this changes WHAT the digest asserts -- immutable text rather than the
 whole loaded image -- so it is a certification decision, not a silent fix.
 The argument for it is that digesting mutable data cannot ever hold: any
 correct program invalidates it.
+
+### Implementing the text-only digest hits a shard-granularity conflict
+
+The fix is understood and the pack side works, but three constraints cannot be
+satisfied simultaneously for one overlay:
+
+1. the generation image must be shard-aligned -- shards tile it in whole
+   64 KiB blocks (`fn64-recomp-rs/src/generation/mod.rs:109-125`);
+2. the image must sit inside the invalidation extent, i.e.
+   `image_end <= bss_end`;
+3. the image must exclude the mutable data the guest writes, i.e. it should end
+   near `text_end`.
+
+WM2000's overlay 1 makes (1) and (2) incompatible:
+
+    load 0x8011c900   text_end 0x801226f0   bss_end 0x8012a6c0
+    text length  0x5df0   -> one 64 KiB shard -> image_end 0x8012c900
+    bss_end is only 0xddc0 past load
+    0x10000 > 0xddc0  =>  a whole shard does not fit inside the extent
+
+Rounding UP satisfies (1) and violates (2) (`InvalidationDoesNotContainImage`);
+clamping to `bss_end` satisfies (2) and violates (1) (`ShardCoverage`). The
+64 KiB shard granularity is the binding constraint, not the bound I chose.
+
+Verified working along the way, and kept: the pack DOES emit the text bound
+correctly once both sides agree -- overlay 0's `image_end` moved from
+`0x80108DC0` to `0x80101B90`, which excludes the store at `0x80107efc` that
+causes the failure. Only overlay 1 breaks.
+
+Resolving this needs one of: a smaller shard granularity for short overlays, a
+generation allowed to end mid-shard, or a per-overlay shard size. All three are
+changes to the shard contract itself, so this is a design decision rather than
+a parameter fix -- which is why the working tree was restored rather than left
+half-migrated.

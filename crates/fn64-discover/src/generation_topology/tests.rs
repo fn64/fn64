@@ -79,6 +79,7 @@
                 bss_start: generation.bss_start,
                 bss_end: generation.bss_end,
                 loaded_sha256: generation.loaded_sha256.clone(),
+                text_sha256: generation.loaded_sha256.clone(),
             })
             .collect();
         (rom, pack, recipes)
@@ -190,6 +191,7 @@
                 bss_start: generation.bss_start,
                 bss_end: generation.bss_end,
                 loaded_sha256: generation.loaded_sha256.clone(),
+                text_sha256: generation.loaded_sha256.clone(),
             })
             .collect::<Vec<_>>();
         let topology =
@@ -435,6 +437,7 @@
                 bss_start: generation.bss_start,
                 bss_end: generation.bss_end,
                 loaded_sha256: generation.loaded_sha256.clone(),
+                text_sha256: generation.loaded_sha256.clone(),
             })
             .collect();
         (rom, pack, recipes)
@@ -840,6 +843,7 @@
                 bss_start: generation.bss_start,
                 bss_end: generation.bss_end,
                 loaded_sha256: generation.loaded_sha256.clone(),
+                text_sha256: generation.loaded_sha256.clone(),
             })
             .collect::<Vec<_>>();
         let other_topology = build_generation_topology_v1(

@@ -31,6 +31,12 @@ fn main() {
                     recipe.data_end - recipe.text_end,
                     recipe.bss_end - recipe.data_end,
                 );
+                println!(
+                    "    loaded_sha256={}...  text_sha256={}...  differ={}",
+                    &recipe.loaded_sha256[..16],
+                    &recipe.text_sha256[..16],
+                    recipe.loaded_sha256 != recipe.text_sha256,
+                );
             }
         }
         Err(error) => println!("recipes unavailable: {error:?}"),
