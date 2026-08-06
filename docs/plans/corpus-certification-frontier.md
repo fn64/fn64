@@ -2051,3 +2051,27 @@ the truncated source slice.
 
 The other three overlays are already correct, so this is one overlay's
 packaging rather than a design problem.
+
+### Past the AotMiss: a new frontier at the indivisible-unit boundary
+
+With the generation source span centralized, the lane clears the catalog
+digest assertion, reaches the digest-selected overlay entry at step 421,717,
+and then stops somewhere new:
+
+    canonical catalog dispatch failed at (bank:81BF2E27273B27DB, pc=0x800040B8):
+    indivisible instruction unit at (bank:81BF2E27273B27DB, pc=0x80004074)
+    requires 2 instructions but only 1 remain
+
+The AotMiss that blocked this for the whole investigation is GONE. This is a
+different failure: a branch and its delay slot form one indivisible unit, and
+a dispatch slice ended between them with a single instruction of budget left.
+
+Not a budget-size problem -- the budget is 4096 (`main.rs:870`) and the
+failing PC sits 3,869 instructions past entry, i.e. mid-slice rather than on a
+4096 boundary. So the budget is being consumed unevenly and a slice can end
+one instruction short of an indivisible pair.
+
+Worth stating plainly: `gfx_submits=0` still, so nothing renders yet. What
+changed is that the blocker moved from "the pack cannot describe this overlay"
+to "the dispatcher splits an atomic pair", which is a narrower and more
+ordinary class of bug.
