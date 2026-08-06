@@ -26,10 +26,37 @@ Reached at step ~1,183,304 after entering a second overlay at
 | 1 | `write_logical_bytes [0x400,+0x100000)` (boot publication) | ROM byte `0x10` | yes |
 | 2 | `write_u8 [0x9b0b3,+0x1)` (boot publication) | — | yes |
 | 3 | `store_backed_word [0x9b0b0,+0x4)` (guest CPU store) | `0x0` | yes — `seq=81661 CpuInstructionStore` |
-| 4 | **UNKNOWN** | `0x1` | **no — invisible to both watches** |
+| 4 | **`mirror_queue_to_rdram [0x9b0b0,+0x4)` ×2** — FOUND | `0x1` | **no — the blocker** |
 
 Writer 3 legitimately explains `expected=0`: the guest zeroed the word, the
-store was declared, the baseline advanced. Writer 4 is the actual blocker.
+store was declared, the baseline advanced.
+
+## Root cause (CONFIRMED by measurement)
+
+`Executor::mirror_queue_to_rdram` (`crates/fn64-runtime/src/executor/mod.rs:666`)
+mirrors guest `OSMesgQueue` fields into RDRAM with raw
+`std::ptr::copy_nonoverlapping`, bypassing every view type and every
+`notify_*_write`. WM2000 has a queue at guest `0x8009b0b0`; a `validCount` of 1
+writes native `01 00 00 00` at storage offset `0x9b0b0`, and since storage
+offset `o` is logical byte `o^3`, the `01` lands at logical `0x0009b0b3` --
+inside a watched executable range.
+
+Proven with a temporary probe: `FN64_WATCH_WRITE=0x9b0b3` printed
+`mirror_queue_to_rdram [0x0009b0b0,+0x4) covers 0x0009b0b3` twice.
+
+Note this is a swizzle effect, but in the *writer*, not in the snapshot/baseline
+comparison -- the latter remains dead as a hypothesis.
+
+The repair is attribution, not suppression: the mirror is a legitimate host
+write that must declare itself on the `HostAbi` channel, exactly as fn64-abi's
+sibling scheduler running-thread mirror already does
+(`recompiled/execution.rs:698-710`). `fn64-runtime` cannot call the recompiler
+crate in production (dev-only, deliberately one-way, `Cargo.toml:18-23`), so the
+host installs a callback.
+
+In-tree corroboration written before the cause was known
+(`live_program.rs:2049-2052`): *"at least one path reaches RDRAM without passing
+through `record_executable_and_renderer_write`."* This is that path.
 
 ### Instrumentation coverage (why #4 is invisible)
 
