@@ -282,3 +282,27 @@ already fixed. That file is now a module directory, and the KSEG0->physical
 mask is covered by
 `crates/fn64-abi/src/task_dispatch/tests/dispatch_a.rs:970`, which cites the
 original panic and asserts `0x8038ce30 -> 0x0038ce30`.
+
+
+## 2026-08-06: deepest verified run -- 12M steps, clean exit
+
+The scheduled `entrance-to-match` route ran to its full 12,000,000-step budget
+and exited cleanly. No panic, no `unjournaled` mutation, no `AotMiss`.
+
+```
+done: steps=12000000 sim_time=1912427205 thread0_dead=true
+gfx_submits=694 audio_submits=1120
+process exit prepared: threads=10 detached_coroutines=9
+```
+
+It reached controller **read 560 of 1400** -- through the copyright screen,
+the Exhibition and match-type menus, the rules page, the Decision page that
+commits match setup, and into the entrance/versus presentation. Three recovered
+generations stayed resident throughout; the catalogued fourth
+(`3068194456377681093`) was still not entered, consistent with the note at
+`docs/BOOT-NOTES-WM2000.md` that no retained route recipe reaches it.
+
+**It stopped on the step budget, not on a fault and not at the end of the
+route.** The remaining 840 controller reads need roughly 3x the budget, which
+at current throughput is several more hours. Depth is now purely a throughput
+question -- see `docs/plans/dispatch-granularity.md`.
