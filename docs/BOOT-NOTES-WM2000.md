@@ -1819,10 +1819,31 @@ settings page, START returned, D-DOWN wrapped back to Decision, and A produced
 the `Single Match / STEVE AUSTIN VS STEVE AUSTIN` presentation. This removes
 the earlier ambiguity between a two-player roster screen and match setup.
 
-It does not enter the fourth catalog generation. A 420,000-step guarded run
+It does not enter the fourth catalog generation. A guarded run
 pressed START twice during the versus/entrance presentation, completed 1,707
 graphics submits and 1,162 controller operations with `render_error=None`, and
-remained in the same three recovered generations. The selector gate word at
+remained in the same three recovered generations.
+
+> **Step counts in this document predating 2026-08-06 are not comparable to
+> current ones -- multiply by ~21.6 before using one as a budget.** This run was
+> bounded at 420,000 steps under the then-current scheduler, where one step
+> advanced ~5,990 simulation cycles; a step now advances ~33. The conversion is
+> fixed by a milestone both eras print: the first overlay generation is entered
+> at step 19,523 / `sim_time=13,990,253` then, and at step 421,692 /
+> `sim_time=13,990,085` now -- `sim_time` agrees to 0.0012%, so the guest
+> executes identically and only the counter changed. This route is therefore
+> ~9.1 million steps today, ~1,700 fields of guest time. `sim_time` and the
+> graphics/controller counters are the durable quantities; step counts are not.
+>
+> The counter's DEFINITION is unchanged (`steps += 1` fires only on
+> `DrainDecision::Step`, never on `AdvanceField`), so this is not a unit change
+> -- one dispatch simply buys less guest time now.
+>
+> This run has also never been reproduced against the committed
+> `reference/wm2000-routes/entrance-to-match.schedule`, which is a later
+> reconstruction: the original ran from `/tmp` and was reaped, `FN64_ABSENT_N64DD`
+> did not exist until after this note was written, and none of the eleven
+> retained route logs printed a graphics counter. The selector gate word at
 `0x8003dd0c` remained `00000000`; peak process-tree RSS was 1,250 MiB under the
 2 GiB route cap. Therefore the catalogued generation
 `3068194456377681093` is not yet proven to be the ordinary single-match bank,
