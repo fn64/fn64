@@ -1606,6 +1606,24 @@ fn main() {
             &trace[trace_start..],
         );
     }
+    // Why the run stopped: a guest that reaches the step limit without
+    // submitting graphics is blocked on something, and the thread/queue state
+    // names it exactly. Printed unconditionally -- it is a few lines and it is
+    // the first question asked of every bounded run.
+    let control = fn64_abi::executor_control_evidence_snapshot();
+    println!(
+        "[wm2000-block-boot] final control: sim_time={} run_queue={:?} cp0_timer_pending={}",
+        control.sim_time, control.run_queue, control.cp0_timer_pending
+    );
+    for thread in &control.threads {
+        println!("[wm2000-block-boot]   thread {thread:?}");
+    }
+    for queue in &control.queues {
+        println!("[wm2000-block-boot]   queue {queue:?}");
+    }
+    for event in &control.event_table {
+        println!("[wm2000-block-boot]   event {event:?}");
+    }
     let exit = fn64_abi::prepare_process_exit();
     println!(
         "[wm2000-block-boot] process exit prepared: threads={} detached_coroutines={}",

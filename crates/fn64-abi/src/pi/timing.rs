@@ -260,11 +260,6 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
     if advanced {
         return 0;
     }
-    let nothing_due = with_host(|host| {
-        host.device_fabric
-            .next_deadline()
-            .is_none_or(|deadline| deadline.get() > now)
-    });
     // NOTE: an earlier version of this fast path advanced the fabric with an
     // EMPTY `RdramViewMut::from_storage(&mut [])`, on the reasoning that with
     // no deadline due no device work can touch memory. That was wrong, and it
@@ -280,10 +275,10 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
     // correctly at construction (`expected[0x9b0b3]=0x10`, matching ROM) and
     // only becomes zero later.
     //
-    // The clock still needs advancing, so the loop below does it with the real
-    // memory rather than skipping the step. That gives up the 58s -> 35s win
-    // this path bought; correctness first, and the win can be recovered by
-    // advancing the clock without a memory view at all.
+    // The win was recovered by `advance_clock_if_idle` above, which advances
+    // the clock with no memory view at all and re-checks the deadline itself,
+    // so it cannot be used to skip real device work. Below this point some
+    // event IS due, and the loop advances with the real memory.
     let mut vi_retrace_ticks = 0u32;
     loop {
         let step = with_host(|host| {

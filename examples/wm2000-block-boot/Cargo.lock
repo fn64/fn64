@@ -3271,14 +3271,12 @@ dependencies = [
  "winit",
  "wm2000-block-overlay-0-shard-00",
  "wm2000-block-overlay-0-shard-01",
- "wm2000-block-overlay-0-shard-02",
  "wm2000-block-overlay-1-shard-00",
  "wm2000-block-overlay-2-shard-00",
  "wm2000-block-overlay-2-shard-01",
  "wm2000-block-overlay-2-shard-02",
  "wm2000-block-overlay-2-shard-03",
  "wm2000-block-overlay-2-shard-04",
- "wm2000-block-overlay-2-shard-05",
  "wm2000-block-overlay-3-shard-00",
  "wm2000-block-overlay-3-shard-01",
  "wm2000-block-overlay-3-shard-02",
@@ -3286,7 +3284,6 @@ dependencies = [
  "wm2000-block-overlay-3-shard-04",
  "wm2000-block-overlay-3-shard-05",
  "wm2000-block-overlay-3-shard-06",
- "wm2000-block-overlay-3-shard-07",
  "wm2000-block-resident-tail-shard-00",
  "wm2000-block-resident-tail-shard-01",
  "wm2000-block-shard-00",
@@ -3318,16 +3315,6 @@ dependencies = [
 
 [[package]]
 name = "wm2000-block-overlay-0-shard-01"
-version = "0.0.0"
-dependencies = [
- "fn64-discover",
- "fn64-recomp-rs",
- "fn64-recomp-rs-codegen",
- "sha2",
-]
-
-[[package]]
-name = "wm2000-block-overlay-0-shard-02"
 version = "0.0.0"
 dependencies = [
  "fn64-discover",
@@ -3388,16 +3375,6 @@ dependencies = [
 
 [[package]]
 name = "wm2000-block-overlay-2-shard-04"
-version = "0.0.0"
-dependencies = [
- "fn64-discover",
- "fn64-recomp-rs",
- "fn64-recomp-rs-codegen",
- "sha2",
-]
-
-[[package]]
-name = "wm2000-block-overlay-2-shard-05"
 version = "0.0.0"
 dependencies = [
  "fn64-discover",
@@ -3468,16 +3445,6 @@ dependencies = [
 
 [[package]]
 name = "wm2000-block-overlay-3-shard-06"
-version = "0.0.0"
-dependencies = [
- "fn64-discover",
- "fn64-recomp-rs",
- "fn64-recomp-rs-codegen",
- "sha2",
-]
-
-[[package]]
-name = "wm2000-block-overlay-3-shard-07"
 version = "0.0.0"
 dependencies = [
  "fn64-discover",
