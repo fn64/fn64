@@ -152,3 +152,56 @@ export FN64_WATCH_WRITE=0x9b0b3          # add FN64_WATCH_WRITE_BACKTRACE=1 for 
 ```
 
 Deterministic — one pass suffices.
+
+## 2026-08-06: WM2000 renders and takes input
+
+The first measured run in this repository showing graphics, audio, and
+controller input live at once, from committed tooling.
+
+```
+[wm2000-block-boot] controller input_edge port=0 read=90 buttons=0x1000
+  stick=(0, 0) step=2412333 sim_time=328071095
+  gfx_submits=88 audio_submits=191
+  generations=[16226209253856221389, 17518568401266107605]
+[wm2000-block-boot] controller input_edge port=0 read=100 buttons=0x0000
+  step=2528050 sim_time=359624297 gfx_submits=98 audio_submits=210
+```
+
+`buttons=0x1000` is START at controller read 90 -- exactly what the route
+recipe annotates as "Title screen: START to enter the main menu". Graphics
+submits climb with the route, `render_error=None`, no panic.
+
+Program identity `b26d98af4aaaab86...`. Reproduce:
+
+```
+cd examples/wm2000-block-boot
+source ../../.claude/local.env
+export ROM="$FN64_DISCOVER_NWXE_ROM"
+C=~/Code/aki-recomp/captures; G="$C/wm-general-exception-images"
+export FN64_EXECUTABLE_IMAGES="$G/run-1/image.json:$G/run-2/image.json:$G/run-3/image.json"
+export FN64_BOOT_CONTEXT="$C/wm2000-boot-context.json"
+export FN64_ABSENT_N64DD=1 FN64_BLOCK_CONTINUE_AFTER_OVERLAY=1
+export FN64_CONTROLLER_SCHEDULE=../../reference/wm2000-routes/entrance-to-match.schedule
+export FN64_BLOCK_MAX_STEPS=12000000
+./target/release/wm2000-block-boot
+```
+
+**Budget at least 25 minutes of wall clock before the first graphics submit.**
+Two investigations today mistook a too-short run for a rendering failure. At
+~1,450 steps/s the first overlay entry is ~5 min in and the first submits
+~25 min in; a 420,000-step run covers 8.9 NTSC fields and legitimately shows
+`gfx_submits=0`.
+
+What unblocked it was `a7a50fe` -- the overlay digest extent. Nothing about the
+render path changed.
+
+### Still open
+
+- **Throughput.** ~1,450 steps/s is roughly 2,500x slower than hardware, and
+  that is now the binding constraint on iterating gameplay. Disabling the
+  mutation journal entirely (`FN64_FAST_MUTATION_JOURNAL=1`) moves a clean HEAD
+  60k-step benchmark only 37s -> 31s, so the journal is a minority cost and the
+  bulk is unidentified. A frame-pointer profile is the next step; `run_one_step`
+  is fully inlined in release and hides the breakdown.
+- **A live window.** The display lists are produced; that they reach a window
+  has never been shown.

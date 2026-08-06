@@ -104,12 +104,24 @@ debug = false
 # touching the -O level the hot handwritten crates get below.
 codegen-units = 256
 
+# Line tables for the three handwritten hot crates ONLY.
+#
+# `run_one_step` inlines its whole callee tree, so a sampling profiler
+# attributes ~92% of self time to one frame and cannot say which part costs.
+# Line tables let the sampler recover the inlined frames with file:line. The
+# generated shards stay at `debug = false` above -- DWARF for their match arms
+# is what made earlier release builds run 40+ minutes or get OOM-killed, and
+# they are dispatched through rather than optimized around, so they are not
+# what a profile needs to see into.
 [profile.release.package.fn64-recomp-rs]
 codegen-units = 1
+debug = 1
 [profile.release.package.fn64-runtime]
 codegen-units = 1
+debug = 1
 [profile.release.package.fn64-abi]
 codegen-units = 1
+debug = 1
 
 [profile.dev.build-override]
 # The shard build scripts perform exhaustive mechanical ROM discovery. Scope

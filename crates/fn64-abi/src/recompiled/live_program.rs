@@ -51,6 +51,7 @@ impl CanonicalExecutableMutationStateV1 {
                 physical_start,
                 physical_end,
                 expected: Vec::new(),
+                expected_storage_order: Vec::new(),
             });
             previous_end = physical_end;
         }
@@ -313,6 +314,22 @@ impl CanonicalExecutableMutationStateV1 {
             .collect()
     }
 
+    /// Whether every watched byte still equals the sealed baseline.
+    ///
+    /// The same question `current_changed_ranges(&read_snapshot_from_view(v))
+    /// .is_empty()` answers, decided without building the snapshot. On WM2000
+    /// the watched region is the 1 MiB boot bank and "nothing changed" is the
+    /// overwhelmingly common answer, so the snapshot the old form allocated,
+    /// copied, and word-reversed was thrown away unread on nearly every
+    /// dispatch. This settles it with one `memcmp` per range.
+    ///
+    /// A `false` answer commits to nothing: callers fall back to the copying
+    /// path, so every diagnostic, panic message and journal entry is produced
+    /// by exactly the code that produced it before.
+    pub(super) fn matches_view(&self, view: &fn64_runtime::RdramView<'_>) -> bool {
+        self.sealed && self.watched.iter().all(|range| range.matches_storage(view))
+    }
+
     pub(super) fn read_snapshot(&self, mut read_physical_byte: impl FnMut(u32) -> u8) -> Vec<Vec<u8>> {
         self.watched
             .iter()
@@ -341,7 +358,7 @@ impl CanonicalExecutableMutationStateV1 {
         let snapshot = self.read_snapshot(read_physical_byte);
         let expected_sha256 = self.digest_snapshot(&snapshot);
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.expected = bytes;
+            range.set_expected(bytes);
         }
         self.journal_root_sha256 = canonical_mutation_initial_root(
             expected_sha256,
@@ -469,6 +486,32 @@ impl CanonicalExecutableMutationStateV1 {
         None
     }
 
+    /// Run the dispatch reconcile without building a snapshot, if bytes match.
+    ///
+    /// Returns whether it fully discharged the reconcile. The guards are the
+    /// same three [`Self::reconcile_snapshot_before_dispatch`] runs, in the
+    /// same order, and they run unconditionally here -- only the comparison is
+    /// avoided, and only when [`Self::matches_view`] has already proved it
+    /// would find nothing. `false` means "not decided", and the caller then
+    /// runs the copying path unchanged, so any change is reported by exactly
+    /// the original code with its original diagnostics.
+    pub(super) fn reconcile_matched_before_dispatch(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+    ) -> bool {
+        self.assert_not_poisoned();
+        assert!(
+            self.sealed,
+            "canonical executable mutation state is not sealed"
+        );
+        let pending = PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|writes| writes.borrow().len());
+        assert_eq!(
+            pending, 0,
+            "canonical executable dispatch attempted with {pending} attributed write(s) not yet invalidated"
+        );
+        self.matches_view(view)
+    }
+
     pub(super) fn reconcile_snapshot_before_dispatch(&mut self, snapshot: Vec<Vec<u8>>) {
         self.assert_not_poisoned();
         assert!(
@@ -588,7 +631,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
         self.expected_sha256 = Some(self.digest_snapshot(&snapshot));
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.expected = bytes;
+            range.set_expected(bytes);
         }
     }
 
@@ -690,7 +733,7 @@ impl CanonicalExecutableMutationStateV1 {
         let journal_root_sha256 = entry.journal_root_sha256;
         self.entries.push(entry);
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.expected = bytes;
+            range.set_expected(bytes);
         }
         self.expected_sha256 = Some(after_sha256);
         self.journal_root_sha256 = journal_root_sha256;
@@ -1835,6 +1878,9 @@ impl CanonicalLiveBlockProgramV1 {
             return;
         }
         let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        if state.borrow().reconcile_matched_before_dispatch(&view) {
+            return;
+        }
         let snapshot = state.borrow().read_snapshot_from_view(&view);
         state
             .borrow_mut()
@@ -1867,6 +1913,9 @@ impl CanonicalLiveBlockProgramV1 {
             return;
         };
         state.borrow_mut().seal_with(&mut read_physical_byte);
+        if state.borrow().reconcile_matched_before_dispatch(view) {
+            return;
+        }
         let snapshot = state.borrow().read_snapshot_from_view(view);
         state
             .borrow_mut()
@@ -2078,6 +2127,29 @@ impl CanonicalLiveBlockProgramV1 {
             // The reconcile check in `reconcile_before_dispatch` IS skippable,
             // because it only compares and never advances anything. That one
             // stays gated; this one does not.
+            // Nothing to attribute AND the live bytes still equal the
+            // baseline: `adopt_snapshot` below is then provably a no-op, since
+            // its first act is to return early when `expected` already equals
+            // the snapshot. Skipping the read is skipping a copy whose only
+            // consumer would discard it.
+            //
+            // This is NOT the reverted write-queue gate. That one asked "does
+            // some queued write intersect a watched range" and skipped on the
+            // false premise that the queue enumerates every mutation -- so an
+            // undeclared write left `expected` stale and resurfaced later as
+            // the 0x0009b0b3 panic. This asks RDRAM ITSELF whether anything
+            // changed, which is the same source of truth the unconditional
+            // read consults. If any byte differs -- declared or not -- the
+            // match fails and the full read, commit and baseline advance run
+            // exactly as before. The snapshot stays the source of truth; only
+            // the copy it would have produced is elided.
+            if writes.is_empty() && events.is_empty() {
+                if let Some(view) = view {
+                    if state.borrow().matches_view(view) {
+                        return invalidated;
+                    }
+                }
+            }
             let snapshot = match view {
                 Some(view) => state.borrow().read_snapshot_from_view(view),
                 None => state.borrow().read_snapshot(read_physical_byte),

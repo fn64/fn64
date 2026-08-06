@@ -1,5 +1,89 @@
 use super::*;
 
+    /// The fast "nothing changed" predicate must agree with the copying path
+    /// on every byte, at every alignment.
+    ///
+    /// `matches_view` is what lets the dispatch guard skip building a 1 MiB
+    /// snapshot, so a disagreement in the `true` direction is exactly a
+    /// silently accepted executable mutation -- the failure the guard exists
+    /// to prevent. This drives one byte at a time across an unaligned watched
+    /// range and asserts the two answers are identical for all of them.
+    #[test]
+    fn matches_view_agrees_with_the_snapshot_comparison_at_every_offset() {
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        // Unaligned start and end, so the head and tail lanes are both
+        // exercised rather than only the word-aligned body.
+        for &(start, end) in &[(0x101u32, 0x117u32), (0x100, 0x120), (0x102, 0x106)] {
+            let mut storage = vec![0u8; 0x200];
+            for (index, byte) in storage.iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(31).wrapping_add(11);
+            }
+            let mut state = CanonicalExecutableMutationStateV1::new(&[(start, end)]);
+            {
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                state.seal_with(|physical| {
+                    view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
+                });
+            }
+            {
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                assert!(
+                    state.matches_view(&view),
+                    "a freshly sealed baseline must match its own storage at [{start:#x},{end:#x})"
+                );
+            }
+            // Flip each byte of the watched region in turn, including the
+            // unaligned head and tail, and require both paths to see it.
+            for physical in start..end {
+                let index = (physical ^ 3) as usize;
+                let original = storage[index];
+                storage[index] = original ^ 0xff;
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let snapshot = state.read_snapshot_from_view(&view);
+                let changed = !state.current_changed_ranges(&snapshot).is_empty();
+                assert!(
+                    changed,
+                    "the copying path must see the change at {physical:#x}"
+                );
+                assert!(
+                    !state.matches_view(&view),
+                    "matches_view must not report a match after {physical:#x} changed"
+                );
+                storage[index] = original;
+            }
+            // Bytes OUTSIDE the watched range must not affect either answer.
+            for outside in [start.wrapping_sub(1), end] {
+                let index = (outside ^ 3) as usize;
+                if index >= storage.len() {
+                    continue;
+                }
+                let original = storage[index];
+                storage[index] = original ^ 0xff;
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let snapshot = state.read_snapshot_from_view(&view);
+                assert!(state.current_changed_ranges(&snapshot).is_empty());
+                assert!(
+                    state.matches_view(&view),
+                    "a change at {outside:#x} is outside [{start:#x},{end:#x}) and must not match"
+                );
+                storage[index] = original;
+            }
+        }
+    }
+
+    /// An unsealed state must never report a match.
+    ///
+    /// Before sealing there is no baseline to compare against, and answering
+    /// "unchanged" would let the caller skip the seal-and-compare path
+    /// entirely.
+    #[test]
+    fn matches_view_never_matches_before_the_baseline_is_sealed() {
+        let storage = vec![0u8; 0x200];
+        let state = CanonicalExecutableMutationStateV1::new(&[(0x100, 0x110)]);
+        let view = fn64_runtime::RdramView::from_storage(&storage);
+        assert!(!state.matches_view(&view));
+    }
+
     #[test]
     fn canonical_mutation_state_traps_unjournaled_executable_bytes_before_dispatch() {
         PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());

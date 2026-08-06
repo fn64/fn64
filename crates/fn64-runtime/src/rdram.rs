@@ -342,6 +342,26 @@ impl<'a> RdramView<'a> {
         self.read_u8(addr) as i8
     }
 
+    /// Borrow a word-aligned span of raw native-word storage, if fully mapped.
+    ///
+    /// Storage order, NOT logical order -- the caller is responsible for the
+    /// `^3` lane mapping. Exposed for the one caller that legitimately wants
+    /// the un-swizzled bytes: the mutation guard's baseline comparison, which
+    /// holds its baseline pre-reversed and so can decide "unchanged" with a
+    /// single `memcmp` instead of copying and reversing 1 MiB per dispatch.
+    ///
+    /// Deliberately narrow: it hands out a shared slice and cannot write, so
+    /// it does not reopen the lane mapping to reimplementation the way a
+    /// mutable or address-taking accessor would. Callers converting storage
+    /// bytes to guest values must still go through the typed readers.
+    pub fn storage_slice(self, start: usize, len: usize) -> Option<&'a [u8]> {
+        assert!(
+            start % 4 == 0 && len % 4 == 0,
+            "storage_slice requires word-aligned bounds, got {start:#x}+{len:#x}"
+        );
+        self.storage.get(start..start.checked_add(len)?)
+    }
+
     /// Copy a device/struct byte sequence out in logical guest order.
     /// Copy a logical byte range out, one native word at a time.
     ///
@@ -815,6 +835,41 @@ mod tests {
     use super::*;
 
     static_assertions::assert_not_impl_any!(PhysicalRdramRead<'static>: Clone, Send, Sync);
+
+    /// `storage_slice` must expose exactly the bytes `copy_logical_bytes`
+    /// reads, in storage order -- the property the mutation guard's baseline
+    /// comparison relies on to skip building a snapshot. If the two ever
+    /// disagreed, the guard would silently accept a changed region.
+    #[test]
+    fn storage_slice_is_the_word_reverse_of_the_logical_copy() {
+        let mut storage = vec![0u8; 256];
+        for (index, byte) in storage.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let view = RdramView::from_storage(&storage);
+        for &(start, len) in &[(0usize, 64usize), (16, 32), (64, 4), (0, 256)] {
+            let mut logical = vec![0u8; len];
+            view.copy_logical_bytes(RdramAddr::from_offset(start as u32), &mut logical);
+            let raw = view.storage_slice(start, len).expect("span is mapped");
+            let mut reversed = logical.clone();
+            for word in reversed.chunks_exact_mut(4) {
+                word.reverse();
+            }
+            assert_eq!(
+                reversed, raw,
+                "storage_slice must equal the word-reversed logical copy at {start:#x}+{len:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_slice_reports_an_unmapped_span_rather_than_panicking() {
+        let storage = vec![0u8; 64];
+        let view = RdramView::from_storage(&storage);
+        assert!(view.storage_slice(32, 32).is_some());
+        assert!(view.storage_slice(32, 64).is_none());
+        assert!(view.storage_slice(64, 4).is_none());
+    }
 
     #[test]
     fn new_with_mmio_covers_the_real_crash_address() {

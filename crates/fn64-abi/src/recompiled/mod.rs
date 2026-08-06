@@ -519,7 +519,86 @@ impl SchedulerRunningThreadMirrorV1 {
 struct WatchedExecutableBytesV1 {
     physical_start: u32,
     physical_end: u32,
+    /// The sealed baseline in LOGICAL guest byte order.
+    ///
+    /// This is the evidence-bearing form: `digest_snapshot` hashes it, so its
+    /// order is part of every receipt and must not change.
     expected: Vec<u8>,
+    /// The same baseline in RDRAM STORAGE order, kept in lockstep by
+    /// [`WatchedExecutableBytesV1::set_expected`].
+    ///
+    /// Storage holds native words, so logical byte `n` lives at storage index
+    /// `n ^ 3` -- within an aligned word, a 4-byte reversal. Comparing the
+    /// live region against the baseline therefore did not need the logical
+    /// copy it was making: it allocated 1 MiB, `copy_from_slice`d into it,
+    /// reversed 262,144 words, and only then ran the `memcmp` that answers
+    /// "unchanged" -- four passes over 1 MiB per dispatch boundary, to reach a
+    /// predicate one pass can decide.
+    ///
+    /// Holding the pre-reversed mirror makes that predicate a direct `memcmp`
+    /// against the storage slice. It is derived state, never evidence: nothing
+    /// hashes it, and `set_expected` is the only writer, so the two forms
+    /// cannot drift.
+    expected_storage_order: Vec<u8>,
+}
+
+impl WatchedExecutableBytesV1 {
+    /// Replace the baseline, refreshing the storage-order mirror with it.
+    ///
+    /// The single writer of `expected`, so the mirror cannot go stale.
+    fn set_expected(&mut self, bytes: Vec<u8>) {
+        self.expected_storage_order.clear();
+        self.expected_storage_order.extend_from_slice(&bytes);
+        // Mirror `RdramView::copy_logical_bytes`' mapping exactly: only the
+        // word-aligned body is a reversal, and the unaligned head/tail bytes
+        // are compared per byte by `matches_storage` rather than reversed here.
+        let head = Self::head_len(self.physical_start, bytes.len());
+        let body = (bytes.len() - head) & !3;
+        for word in self.expected_storage_order[head..head + body].chunks_exact_mut(4) {
+            word.reverse();
+        }
+        self.expected = bytes;
+    }
+
+    /// Bytes before the first word-aligned storage word, as `copy_logical_bytes` computes it.
+    fn head_len(physical_start: u32, len: usize) -> usize {
+        (((4 - (physical_start % 4)) % 4) as usize).min(len)
+    }
+
+    /// Whether live RDRAM storage still equals the sealed baseline.
+    ///
+    /// Exactly the predicate `expected == read_snapshot_from_view(..)` computes,
+    /// without materializing the snapshot: the aligned body is one `memcmp`
+    /// against the pre-reversed mirror, and the at-most-three head and tail
+    /// bytes stay on the same per-byte lane-XOR path the copy uses, so an
+    /// unaligned range cannot be decided by a different rule than it was
+    /// before.
+    fn matches_storage(&self, view: &fn64_runtime::RdramView<'_>) -> bool {
+        let len = self.expected.len();
+        debug_assert_eq!(len, (self.physical_end - self.physical_start) as usize);
+        let head = Self::head_len(self.physical_start, len);
+        let body = (len - head) & !3;
+        let base = fn64_runtime::RdramAddr::from_offset(self.physical_start);
+        for index in (0..head).chain(head + body..len) {
+            let addr = match base.checked_add(index as u32) {
+                Some(addr) => addr,
+                None => return false,
+            };
+            if view.read_u8(addr) != self.expected[index] {
+                return false;
+            }
+        }
+        if body == 0 {
+            return true;
+        }
+        let start = self.physical_start as usize + head;
+        match view.storage_slice(start, body) {
+            Some(live) => live == &self.expected_storage_order[head..head + body],
+            // Out of range: fall back to reporting a difference so the copying
+            // path runs and raises the panic it owes for an unmapped byte.
+            None => false,
+        }
+    }
 }
 
 struct CanonicalExecutableMutationStateV1 {
