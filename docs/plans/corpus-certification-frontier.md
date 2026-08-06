@@ -2111,3 +2111,17 @@ Three tractable directions, none of which is page protection:
 Estimated ceiling if 1 and 2 land: roughly 4-5x, i.e. 5,000-6,500 steps/s or
 ~2.5x slower than realtime. Reaching parity would additionally need whatever
 (3) turns out to be.
+
+### Tried and reverted: skipping the snapshot buffer's zeroing
+
+`read_snapshot_from_view` allocates with `vec![0u8; len]`, which zeroes 1 MiB
+that `copy_logical_bytes` then overwrites entirely. Replacing it with
+`Vec::with_capacity` + `set_len` removes the memset.
+
+Measured: 89s -> 88s strict, 46s -> 45s fast. About 1%, i.e. nothing.
+
+Reverted -- an `unsafe` block that buys 1% is a bad trade. The lesson is that
+the 20% attributed to `copy_logical_bytes` is the COPY itself, not the
+allocation, and the copy is unavoidable while the journal reads a full
+snapshot per commit. Narrowing WHAT is copied and hashed is the only lever
+there, and that is the certification question, not a micro-optimisation.
