@@ -1981,3 +1981,39 @@ generation allowed to end mid-shard, or a per-overlay shard size. All three are
 changes to the shard contract itself, so this is a design decision rather than
 a parameter fix -- which is why the working tree was restored rather than left
 half-migrated.
+
+### Text-bounded generations: implemented, one digest path left
+
+With generations allowed to end mid-shard, the text-only bound now propagates
+through every layer that asserted the full loaded image:
+
+    dense_aot_pack.rs      load_end must COVER text and not exceed data_end
+                           (was: must EQUAL data_end)
+    generation_topology    overlay_matches bounds source_rom_end/load_end by
+                           the recipe instead of requiring equality
+    wm2000-block-shards    shards generated over text rounded to 64 KiB blocks
+    wm2000-block-boot      image_end and digest are exactly text_end
+    prepared packages      35 -> 32; text-bounded overlays need [2,1,5,7]
+                           shards, not [3,1,6,8]
+
+Verified in the generated pack -- every overlay generation ends exactly at its
+recipe's `text_end`:
+
+    0x800E1B90..0x800FEF10   0x8011C900..0x801226F0
+    0x8011C900..0x80161460   0x800E1B90..0x8014C640
+
+and overlay 0's digest is `03333900...`, the text digest, not the former
+whole-image `410822d4...`. The store at `0x80107efc` that broke activation is
+now outside every generation.
+
+Remaining: `block_program.rs:260` asserts the runtime-rebuilt dense catalog
+equals the build-time `DENSE_GENERATION_CATALOG_DEFINITION_SHA256`. The
+runtime builds from `pack::OVERLAY_GENERATIONS` (correct, text-bounded) while
+the constant comes from `build_backed_dense_generation_catalog_v1` via the
+topology. Both now see text-bounded geometry, yet the catalog-level digests
+differ (`9743...` runtime vs `6024...` build-time), so one of the two still
+folds in a value derived before the bound was applied.
+
+That is a single digest-derivation question over geometry that is otherwise
+verified correct end to end -- much narrower than where this blocker started,
+and the last thing between here and a run that gets past the activation.
