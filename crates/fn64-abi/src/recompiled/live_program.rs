@@ -1913,9 +1913,21 @@ impl CanonicalLiveBlockProgramV1 {
             // When writes or events ARE pending the read is mandatory: it is
             // what advances the baseline and journals the entry the receipts
             // bind to, so it runs regardless of this flag.
-            if !continuous_snapshot_enabled() && writes.is_empty() && events.is_empty() {
-                return invalidated;
-            }
+            // NOTE: this read is NOT skippable when the journal is off.
+            //
+            // It looks like a pure "did anything change undeclared" check, but
+            // it also ADVANCES the baseline: `adopt_snapshot` accepts the
+            // current bytes as `expected`. Skipping it leaves the baseline
+            // stale, and a later dispatch re-detects a change that was already
+            // accepted -- the exact failure 6a2c330 diagnosed, and it
+            // reproduced here as
+            // "unjournaled executable mutation changed physical RDRAM
+            //  [0x0009b0b3, 0x0009b0b4)" at 3M steps under
+            // FN64_FAST_MUTATION_JOURNAL=1.
+            //
+            // The reconcile check in `reconcile_before_dispatch` IS skippable,
+            // because it only compares and never advances anything. That one
+            // stays gated; this one does not.
             let snapshot = match view {
                 Some(view) => state.borrow().read_snapshot_from_view(view),
                 None => state.borrow().read_snapshot(read_physical_byte),
