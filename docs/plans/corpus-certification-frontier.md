@@ -2412,3 +2412,36 @@ and a missing baseline advance. Recording that so the next attempt starts from
 the baseline side.
 
 Status unchanged: nothing playable, `gfx_submits=0`.
+
+### The two read paths agree; the lane hypothesis is dead too
+
+`0x9b0b3` is lane 3 -- the last byte of its word -- which is exactly where a
+byte-order discrepancy between the per-byte (`read_u8`, lane XOR 3) and
+word-wise (`copy_logical_bytes`, per-word reverse) paths would surface. Since
+`seal_with` uses the per-byte reader and the snapshot uses the word-wise one,
+that looked like a real candidate.
+
+Tested directly: fill storage with a known pattern, read 0x100 bytes through
+both paths, compare. **Zero mismatches.** The paths agree byte for byte, which
+also confirms today's bulk-copy change is byte-identical to what it replaced.
+
+The byte also predates that change -- it appears in Blocker A, long before
+`dd87c77` -- so the bulk copy could not be the cause regardless.
+
+Hypotheses now eliminated by measurement, all of them:
+
+    missing attribution            journal shows a covering declaration
+    a second raw write             both writes trace to publish_rom_slice
+    a generated C shim             merged-stack artefact, retracted
+    save/GB-Pak/PFS shims          never run for this address
+    a missing baseline advance     pairing invalidate changed nothing
+    read-path lane disagreement    zero mismatches over 0x100 bytes
+
+What remains unexamined is narrow: the byte is written once by the declared
+boot publication, both read paths agree, and yet `expected` differs from live
+memory at a later dispatch. The next measurement is to print the actual byte
+values -- `expected[0x9b0b3]` versus live -- at the failure, which no run has
+captured. That distinguishes "the baseline was never correct" from "the byte
+genuinely changed", and the panic site already holds both.
+
+Status unchanged: nothing playable, `gfx_submits=0`.
