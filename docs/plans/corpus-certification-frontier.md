@@ -2567,3 +2567,42 @@ stating the choice rather than assuming it.
 
 Status: still nothing playable, `gfx_submits=0`. But this is the blocker that
 has stopped every deep run, and it now has a measured cause.
+
+### Narrowed to two, and which one is a measurement not a guess
+
+Reading the seeding path:
+
+    execution.rs:149-158
+      bootstrap.map_or_else(
+        || CanonicalExecutableMutationStateV1::new(&ranges),   <- expected = Vec::new()
+        |validated| ...::from_bootstrap(receipt, &validated.storage),
+      )
+
+    from_bootstrap (live_program.rs:222-249)
+      1. seal_with(|_| 0)         -> expected = all zeros
+      2. read_snapshot_from_view  -> snapshot = real published bytes
+      3. commit_snapshot(snapshot, publication events)
+
+Step 3 should seed the baseline: `changed` is the diff of zeros against real
+bytes (large), declarations cover `[0x400,0x100400)`, and neither is empty, so
+the early return does not fire and `expected` should become the real bytes.
+
+Measurement says otherwise -- `expected` is zeros at `0x9b0b3`. Two
+possibilities remain, and they are distinguishable rather than arguable:
+
+1. the `bootstrap = None` branch was taken, so `from_bootstrap` never ran and
+   `expected` was seeded later by a `seal_with` over already-zero memory;
+2. `from_bootstrap` ran but its commit did not cover that byte.
+
+Printing which branch is taken, plus `expected[0x9b0b3]` immediately after
+construction, separates them in one run. That is the next step and it needs no
+new machinery.
+
+The lane's own ordering is NOT the problem: the log shows "validating boot
+publication" before "booting thread 0", so publication precedes execution.
+
+Stopping here rather than picking between the two. Five wrong "found it" calls
+on this byte have all come from choosing between remaining possibilities
+instead of measuring which holds, and the measurement is cheap.
+
+Status: nothing playable, `gfx_submits=0`.
