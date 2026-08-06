@@ -147,6 +147,7 @@ fn set_catalog_program_parts(
     fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
     fn64_recomp_rs::set_host_lookup(None);
     let mutation_state = (!ranges.is_empty()).then(|| {
+        let had_bootstrap = bootstrap.is_some();
         let state = bootstrap.map_or_else(
             || CanonicalExecutableMutationStateV1::new(&ranges),
             |validated| {
@@ -156,6 +157,17 @@ fn set_catalog_program_parts(
                 )
             },
         );
+        // Which branch seeded the baseline, and what it holds for the byte
+        // that has blocked every deep run. `new()` leaves `expected` empty and
+        // relies on a later `seal_with` over live memory; `from_bootstrap`
+        // seals zeros and commits the published bytes over them. Only one of
+        // those can leave a zero baseline for published ROM.
+        if std::env::var_os("FN64_BASELINE_PROBE").is_some() {
+            let byte = state.expected_byte_at(0x0009_b0b3);
+            eprintln!(
+                "[baseline] from_bootstrap={had_bootstrap} expected[0x0009b0b3]={byte:?}"
+            );
+        }
         Rc::new(RefCell::new(state))
     });
     let generations = generations.map(|generations| Rc::new(RefCell::new(generations)));

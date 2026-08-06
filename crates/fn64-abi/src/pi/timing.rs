@@ -254,15 +254,25 @@ pub(crate) fn advance_device_time(now: u64) -> u32 {
             .next_deadline()
             .is_none_or(|deadline| deadline.get() > now)
     });
-    if nothing_due {
-        with_host(|host| {
-            let mut empty = fn64_runtime::RdramViewMut::from_storage(&mut []);
-            host.device_fabric
-                .advance_to_with_pif(Cycles::new(now), &mut empty, |_, _, _| {})
-                .unwrap_or_else(|error| panic!("device clock advance failed: {error}"));
-        });
-        return 0;
-    }
+    // NOTE: an earlier version of this fast path advanced the fabric with an
+    // EMPTY `RdramViewMut::from_storage(&mut [])`, on the reasoning that with
+    // no deadline due no device work can touch memory. That was wrong, and it
+    // is what zeroed the executable baseline: the view is passed as
+    // `DmaMemory`, so anything the fabric does commit goes into a zero-length
+    // buffer, and the mutation journal then reads zeros where published ROM
+    // bytes belong.
+    //
+    // Measured: with the fast path enabled the route dies at step 421,717 with
+    // "unjournaled executable mutation changed physical RDRAM
+    // [0x0009b0b3,0x0009b0b4)"; with it disabled the same build reaches the
+    // same step cleanly. The baseline probe confirms the byte is seeded
+    // correctly at construction (`expected[0x9b0b3]=0x10`, matching ROM) and
+    // only becomes zero later.
+    //
+    // The clock still needs advancing, so the loop below does it with the real
+    // memory rather than skipping the step. That gives up the 58s -> 35s win
+    // this path bought; correctness first, and the win can be recovered by
+    // advancing the clock without a memory view at all.
     let mut vi_retrace_ticks = 0u32;
     loop {
         let step = with_host(|host| {

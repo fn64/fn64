@@ -260,6 +260,23 @@ impl CanonicalExecutableMutationStateV1 {
     /// Exposed so the renderer/RSP mutation tracker can snapshot exactly what
     /// `commit_snapshot` will later compare against. Watching a different set
     /// there is what let an undeclared executable write slip through.
+    /// The sealed baseline byte for one physical address, if watched.
+    ///
+    /// Diagnostic for the zero-baseline blocker: it answers whether `expected`
+    /// ever received the published ROM bytes, which the digests cannot say.
+    pub(super) fn expected_byte_at(&self, physical: u32) -> Option<u8> {
+        self.watched.iter().find_map(|range| {
+            (range.physical_start <= physical && physical < range.physical_end)
+                .then(|| {
+                    range
+                        .expected
+                        .get((physical - range.physical_start) as usize)
+                        .copied()
+                })
+                .flatten()
+        })
+    }
+
     pub(super) fn watched_ranges(&self) -> Vec<(u32, u32)> {
         self.watched
             .iter()
