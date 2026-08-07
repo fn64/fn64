@@ -52,6 +52,7 @@ impl CanonicalExecutableMutationStateV1 {
                 physical_end,
                 expected: Vec::new(),
                 expected_storage_order: Vec::new(),
+                expected_page_digests: Vec::new(),
             });
             previous_end = physical_end;
         }
@@ -365,14 +366,67 @@ impl CanonicalExecutableMutationStateV1 {
             .collect()
     }
 
+    /// The v2 page-tree digest of an ARBITRARY snapshot, computed from scratch.
+    ///
+    /// A pure function of the watched range bounds and the bytes handed in --
+    /// it reads no cache and depends on no history. Callers pass snapshots that
+    /// are not the current baseline (validation hashes an all-zero snapshot to
+    /// reconstruct the sealed-from-zero `before_sha256`), so this must stay
+    /// cache-free to remain correct for them.
+    ///
+    /// [`Self::digest_expected`] is the incremental form, valid only for the
+    /// state's own baseline. The determinism test asserts the two agree.
     pub(super) fn digest_snapshot(&self, snapshot: &[Vec<u8>]) -> [u8; 32] {
-        let mut digest = sha2::Sha256::new();
-        for (range, bytes) in self.watched.iter().zip(snapshot) {
-            digest.update(range.physical_start.to_be_bytes());
-            digest.update(range.physical_end.to_be_bytes());
-            digest.update(bytes);
-        }
-        digest.finalize().into()
+        let pages = self
+            .watched
+            .iter()
+            .zip(snapshot)
+            .map(|(range, bytes)| {
+                let count = bytes.len().div_ceil(CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2);
+                (0..count)
+                    .map(|index| {
+                        let lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
+                        let hi = (lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(bytes.len());
+                        watched_page_digest_v2(
+                            range.physical_start,
+                            range.physical_end,
+                            index as u32,
+                            &bytes[lo..hi],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        watched_root_digest_v2(
+            self.watched
+                .iter()
+                .zip(&pages)
+                .map(|(range, pages)| {
+                    (range.physical_start, range.physical_end, pages.as_slice())
+                }),
+        )
+    }
+
+    /// The v2 root over the CURRENT baseline, from the maintained page digests.
+    ///
+    /// This is the incremental form and the reason the migration exists: it
+    /// hashes 32 bytes per page instead of every watched byte, because
+    /// `set_expected` has already refreshed exactly the pages whose bytes
+    /// changed.
+    ///
+    /// Equal to `digest_snapshot(&expected)` by construction --
+    /// `expected_page_digests` is maintained to be precisely what recomputing
+    /// every page of `expected` yields, and the root is a pure function of
+    /// those digests and the range bounds. Asserted in
+    /// `page_tree_root_is_independent_of_incremental_history`.
+    pub(super) fn digest_expected(&self) -> [u8; 32] {
+        watched_root_digest_v2(self.watched.iter().map(|range| {
+            (
+                range.physical_start,
+                range.physical_end,
+                range.expected_page_digests.as_slice(),
+            )
+        }))
     }
 
     pub(super) fn seal_with(&mut self, read_physical_byte: impl FnMut(u32) -> u8) {
@@ -380,7 +434,6 @@ impl CanonicalExecutableMutationStateV1 {
             return;
         }
         let snapshot = self.read_snapshot(read_physical_byte);
-        let expected_sha256 = self.digest_snapshot(&snapshot);
         let mut recycled = self.recycled.borrow_mut();
         let watched_len = self.watched.len();
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
@@ -390,6 +443,7 @@ impl CanonicalExecutableMutationStateV1 {
             }
         }
         drop(recycled);
+        let expected_sha256 = self.digest_expected();
         self.journal_root_sha256 = canonical_mutation_initial_root(
             expected_sha256,
             self.watched
@@ -659,7 +713,6 @@ impl CanonicalExecutableMutationStateV1 {
         {
             return;
         }
-        self.expected_sha256 = Some(self.digest_snapshot(&snapshot));
         let mut recycled = self.recycled.borrow_mut();
         let watched_len = self.watched.len();
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
@@ -669,6 +722,10 @@ impl CanonicalExecutableMutationStateV1 {
             }
         }
         drop(recycled);
+        // AFTER `set_expected`: the incremental root reads the page digests it
+        // just refreshed. This is the whole win -- 32 bytes per page instead of
+        // every watched byte.
+        self.expected_sha256 = Some(self.digest_expected());
     }
 
     pub(super) fn commit_snapshot(
@@ -736,10 +793,26 @@ impl CanonicalExecutableMutationStateV1 {
         // Not an approximation. `changed` comes from `current_changed_ranges`,
         // which compares the snapshot against `expected` byte for byte, so
         // empty means equal and equal bytes have an equal digest.
+        //
+        // The baseline is adopted BEFORE the digest is read, so the entry can
+        // be built from the incremental root. Moving the adoption earlier is
+        // safe here: every check that inspects the old baseline -- the
+        // `current_changed_ranges` comparison and the
+        // `first_uncovered_changed_range` guard -- has already run and
+        // panicked if it was going to, and `changed` is already materialized.
+        let mut recycled = self.recycled.borrow_mut();
+        let watched_len = self.watched.len();
+        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
+            let retired = range.set_expected(bytes);
+            if recycled.len() < watched_len {
+                recycled.push(retired);
+            }
+        }
+        drop(recycled);
         let after_sha256 = if changed.is_empty() {
             before_sha256
         } else {
-            self.digest_snapshot(&snapshot)
+            self.digest_expected()
         };
         invalidated_generations.sort_unstable();
         invalidated_generations.dedup();
@@ -768,15 +841,6 @@ impl CanonicalExecutableMutationStateV1 {
         entry.journal_root_sha256 = canonical_mutation_entry_root(self.journal_root_sha256, &entry);
         let journal_root_sha256 = entry.journal_root_sha256;
         self.entries.push(entry);
-        let mut recycled = self.recycled.borrow_mut();
-        let watched_len = self.watched.len();
-        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            let retired = range.set_expected(bytes);
-            if recycled.len() < watched_len {
-                recycled.push(retired);
-            }
-        }
-        drop(recycled);
         self.expected_sha256 = Some(after_sha256);
         self.journal_root_sha256 = journal_root_sha256;
     }
