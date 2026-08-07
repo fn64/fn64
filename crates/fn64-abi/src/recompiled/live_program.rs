@@ -385,7 +385,10 @@ impl CanonicalExecutableMutationStateV1 {
     /// running the full scan. That is the only failure mode the barrier has:
     /// it never returns a span list that omits a page it saw written.
     fn barrier_spans(&self) -> Option<Vec<(u32, u32)>> {
-        crate::write_barrier::guard::dirty_spans().map(crate::write_barrier::guard::normalize)
+        let spans =
+            crate::write_barrier::guard::dirty_spans().map(crate::write_barrier::guard::normalize);
+        crate::write_barrier::guard::stats::note(spans.as_ref());
+        spans
     }
 
     /// The changed ranges, decided against live storage without a snapshot.

@@ -959,6 +959,99 @@ pub mod guard {
     pub fn granule() -> usize {
         page_size()
     }
+
+    /// How often the barrier actually served a boundary, versus falling back.
+    ///
+    /// A speedup alone cannot distinguish "the barrier is doing the work" from
+    /// "the barrier is cheap and something else got faster", and a fallback is
+    /// silent by design. This counts both outcomes so the claim can be checked
+    /// rather than inferred. `FN64_MPROTECT_BARRIER_STATS=1`; inert otherwise.
+    pub mod stats {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SERVED: AtomicU64 = AtomicU64::new(0);
+        static FELL_BACK: AtomicU64 = AtomicU64::new(0);
+        static DIRTY_PAGES: AtomicU64 = AtomicU64::new(0);
+        static CLEAN_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+
+        pub fn enabled() -> bool {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var_os("FN64_MPROTECT_BARRIER_STATS").is_some()
+            })
+        }
+
+        /// Record the outcome of one boundary's ask.
+        pub fn note(spans: Option<&Vec<(u32, u32)>>) {
+            if !enabled() {
+                return;
+            }
+            arm_report();
+            match spans {
+                Some(spans) => {
+                    SERVED.fetch_add(1, Ordering::Relaxed);
+                    if spans.is_empty() {
+                        CLEAN_BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let granule = super::page_size() as u64;
+                    let pages: u64 = spans
+                        .iter()
+                        .map(|&(lo, hi)| (u64::from(hi) - u64::from(lo)).div_ceil(granule))
+                        .sum();
+                    DIRTY_PAGES.fetch_add(pages, Ordering::Relaxed);
+                }
+                None => {
+                    FELL_BACK.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        /// Print at exit rather than from a harness `main`.
+        ///
+        /// `examples/wm2000-block-boot/src/main.rs` is hashed verbatim into
+        /// `DISPATCH_SOURCE_SHA256` (`build.rs:794`), so any edit to it -- even
+        /// a comment -- changes the canonical program identity and invalidates
+        /// the A/B. Reporting from here keeps the measured program identical to
+        /// the unmeasured one.
+        fn arm_report() {
+            extern "C" fn at_exit() {
+                let served = SERVED.load(Ordering::Relaxed);
+                let fell_back = FELL_BACK.load(Ordering::Relaxed);
+                let total = served + fell_back;
+                let pages = DIRTY_PAGES.load(Ordering::Relaxed);
+                let clean = CLEAN_BOUNDARIES.load(Ordering::Relaxed);
+                let share = |n: u64| {
+                    if total == 0 {
+                        0.0
+                    } else {
+                        100.0 * n as f64 / total as f64
+                    }
+                };
+                let mean = if served == 0 {
+                    0.0
+                } else {
+                    pages as f64 / served as f64
+                };
+                println!(
+                    "[mprotect-barrier] boundaries={total} served={served} ({:.2}%) \
+                     fell_back={fell_back} ({:.2}%) clean={clean} ({:.2}%) \
+                     mean_dirty_pages_per_served={mean:.4}",
+                    share(served),
+                    share(fell_back),
+                    share(clean),
+                );
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
+            static ARMED: std::sync::Once = std::sync::Once::new();
+            ARMED.call_once(|| {
+                extern "C" {
+                    fn atexit(f: extern "C" fn()) -> i32;
+                }
+                unsafe { atexit(at_exit) };
+            });
+        }
+    }
 }
 
 #[cfg(test)]
