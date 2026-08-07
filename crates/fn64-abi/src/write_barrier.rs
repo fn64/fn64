@@ -309,7 +309,25 @@ pub fn page_size() -> usize {
 /// Whether the heap allocation lane is forced, for the A/B.
 fn heap_forced() -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(|| std::env::var_os("FN64_HEAP_RDRAM").is_some_and(|value| value != "0"))
+    *FORCED.get_or_init(|| env_flag("FN64_HEAP_RDRAM"))
+}
+
+/// Read a boolean environment flag, where only an affirmative value is on.
+///
+/// Absent, empty, and `0` all mean off. Anything else affirmative -- `1`,
+/// `true`, `yes`, `on`, any case, surrounding whitespace ignored -- means on,
+/// and any other value means off.
+///
+/// One helper rather than three hand-rolled predicates because the hand-rolled
+/// version got it wrong in a way that silently invalidated an A/B: see
+/// [`requested`].
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Whether the barrier is requested by the environment.
@@ -318,11 +336,20 @@ fn heap_forced() -> bool {
 /// one binary and the A/B is a single environment variable rather than a
 /// rebuild -- which is what makes "byte-identical output" a claim about the
 /// same program rather than two programs.
+///
+/// AN EMPTY VALUE IS OFF, and that is not a detail. `FN64_MPROTECT_BARRIER=`
+/// is how a shell writes "the off lane" in an inline `env` assignment, and the
+/// first version of this used `var_os(..).is_some_and(|v| v != "0")`, under
+/// which an empty-but-set variable read as ON. Both lanes of an A/B run with
+/// `FN64_MPROTECT_BARRIER=` and `=1` were therefore the SAME lane, which
+/// produced a fabricated 4.9x: the real comparison was against a binary from
+/// before an unrelated renderer optimisation, not against the scan.
+///
+/// Treating only `1`/`true`/`yes`/`on` as on means an empty value, `0`, and an
+/// absent variable all agree, so no spelling of "off" can silently mean "on".
 pub fn requested() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("FN64_MPROTECT_BARRIER").is_some_and(|value| value != "0")
-    })
+    *ENABLED.get_or_init(|| env_flag("FN64_MPROTECT_BARRIER"))
 }
 
 /// Largest number of distinct dirty pages the barrier will track per boundary.
@@ -976,9 +1003,7 @@ pub mod guard {
 
         pub fn enabled() -> bool {
             static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                std::env::var_os("FN64_MPROTECT_BARRIER_STATS").is_some()
-            })
+            *ENABLED.get_or_init(|| super::super::env_flag("FN64_MPROTECT_BARRIER_STATS"))
         }
 
         /// Record the outcome of one boundary's ask.
@@ -1057,6 +1082,37 @@ pub mod guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every spelling of "off" must be off, and only affirmatives on.
+    ///
+    /// This pins the bug that fabricated a 4.9x result. The gate was
+    /// `var_os(..).is_some_and(|v| v != "0")`, so `FN64_MPROTECT_BARRIER=` --
+    /// set but empty, which is exactly how a shell writes the off lane in an
+    /// inline `env` assignment -- read as ON. Both lanes of the A/B were the
+    /// barrier lane, and the "scan lane" number it was compared against came
+    /// from a binary predating an unrelated renderer optimisation.
+    ///
+    /// The env var itself cannot be exercised here (the gates are `OnceLock`
+    /// and the test binary is shared), so this tests the predicate directly.
+    #[test]
+    fn only_affirmative_env_values_enable_a_flag() {
+        fn decide(value: &str) -> bool {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        }
+        // The one that mattered: empty is OFF.
+        assert!(!decide(""), "an empty value must be off, not on");
+        assert!(!decide("0"));
+        assert!(!decide("false"));
+        assert!(!decide("no"));
+        assert!(!decide("off"));
+        assert!(!decide("  "));
+        for on in ["1", "true", "TRUE", "Yes", "on", " 1 "] {
+            assert!(decide(on), "{on:?} must enable the flag");
+        }
+    }
 
     #[test]
     fn page_aligned_rdram_starts_on_a_page_and_reads_back_zero() {

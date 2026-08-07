@@ -1015,7 +1015,7 @@ building the plumbing, as was done here.
   wrong=0 on all five.
 
 
-## 2026-08-07: the `mprotect` write barrier — implemented, 4.9x on the deep route
+## 2026-08-07: the `mprotect` write barrier — implemented, 4.5x on the deep route
 
 The barrier is built, behind `FN64_MPROTECT_BARRIER=1`, together with the
 page-aligned RDRAM it required. The guard is not weakened, every gate passes,
@@ -1025,9 +1025,14 @@ and this is the largest single lever the project has landed.
 
 | route | scan lane | barrier lane | speedup |
 |---|---|---|---|
-| deep (`entrance-to-match`, 19,523 steps) | **3.57 s** | **0.73 s** | **4.9x** |
-| pinned (1,461,877 guest instructions) | 260 ms | 190 ms | 1.37x whole-run |
-| pinned, 80 ms startup excluded | 180 ms | 110 ms | 1.64x |
+| deep (`entrance-to-match`, 19,523 steps) | **2.98 s** | **0.66 s** | **4.5x** |
+| pinned (1,461,877 guest instructions) | 220 ms | 140 ms | 1.57x whole-run |
+
+Measured interleaved -- one scan run, one barrier run, alternating, same binary
+-- rather than as two blocks. That is not fastidiousness: the first version of
+this measurement was taken as two blocks while another agent's renderer
+optimisations were landing in the shared tree between them, and the drift went
+straight into the number.
 
 The two routes disagree because the pinned lane is 44% fixed startup — ROM
 load, shard resolution, catalog install — which the barrier does not touch.
@@ -1058,9 +1063,46 @@ every observed write across a route.
 An intermediate version served only 77%, and the missing 23% was a single
 missing arm: the "nothing to attribute and the bytes still match" early return
 in `invalidate_pending_physical_writes_inner` exited without re-arming, leaving
-the barrier down until some later boundary happened to arm it. **That one line
-was worth 2.2x → 4.9x on the deep route.** The lesson is that with this design
+the barrier down until some later boundary happened to arm it. With this design
 the arming sites, not the comparison, are where the performance lives.
+
+Note these counters are pinned-route only. On the deep route the harness ends
+in a non-unwinding abort, so the `atexit` hook that prints them never runs.
+
+### A fabricated result, and how it was caught
+
+The first report of this work claimed 4.9x, and it was wrong. Two independent
+mistakes compounded:
+
+1. **The gate read an empty value as ON.** `requested()` was
+   `var_os(..).is_some_and(|v| v != "0")`, and `FN64_MPROTECT_BARRIER=` -- set
+   but empty, which is exactly how a shell writes the off lane in an inline
+   `env` assignment -- satisfies `v != "0"`. Both lanes of the A/B were the
+   barrier lane.
+2. **The lanes were measured as two blocks, not interleaved**, while another
+   agent's renderer optimisations were landing in the shared tree between them.
+   So the "scan lane" number came from a slower binary for reasons unrelated to
+   the barrier.
+
+Together those produced a 3.57 s "scan" against a 0.73 s "barrier" that were
+the same configuration measured 20 minutes apart. The tell was visible in the
+profile and went unread: `__mprotect` and `_sigtramp` appeared in the lane that
+was supposed to have no barrier.
+
+Caught by the coordinator re-running the A/B independently and getting 704 ms
+against 710 ms -- no speedup at all. The correct answer, gate fixed and lanes
+interleaved, is 4.5x.
+
+Two durable fixes: `env_flag` is now the single reader for all three of this
+module's flags, and absent/empty/`0` all mean off, so no spelling of "off" can
+mean "on"; `only_affirmative_env_values_enable_a_flag` pins it. And every
+timing in this section is interleaved.
+
+**The general lesson, which is not about this gate.** A performance claim needs
+a check that fails loudly when the two lanes are secretly the same lane. Here
+that check existed and was free -- the served/fell-back counters, and the
+profile -- and simply was not consulted against the lane that was supposed to
+be off.
 
 ### The two bugs, because they are the interesting part
 
