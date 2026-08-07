@@ -22,7 +22,7 @@ pub(crate) fn scanout(
     let filters = presentation.scanout.filters();
     let registers = presentation.scanout.registers();
     let active_window = registers.and_then(|registers| registers.active_window());
-    let mut output = source.clone();
+    let mut output = source.cloned_for_scanout();
     if filters.pixel_type == ViPixelType::Reserved {
         return Err(RenderError::Backend {
             backend: "reference",
@@ -577,6 +577,51 @@ mod tests {
     use fn64_render::{
         ViAaMode, ViFilterControl, ViScanoutField, ViScanoutRegisters, ViScanoutState,
     };
+
+    /// `scanout` clones its source with `cloned_for_scanout`, which skips the
+    /// two depth buffers because nothing in the filter chain reads them. That
+    /// is a PERFORMANCE shortcut resting on a CORRECTNESS premise, so pin the
+    /// premise: a scanout whose source carries arbitrary depth state must
+    /// produce the same pixels as one whose source does not. If a future
+    /// filter starts reading depth, this fails instead of silently scanning
+    /// out against `INFINITY`.
+    #[test]
+    fn scanout_pixels_do_not_depend_on_the_source_depth_buffers() {
+        let presentation = ViPresentation::default();
+        let plain = grayscale(&[0, 40, 80, 120, 160, 200, 240, 255], 4);
+
+        let mut with_depth = plain.clone();
+        for (index, slot) in with_depth.depth.iter_mut().enumerate() {
+            *slot = index as f32 * 0.25;
+        }
+        assert_ne!(
+            with_depth.depth, plain.depth,
+            "the fixture must actually differ in depth or it proves nothing"
+        );
+
+        let from_plain = scanout(&plain, presentation).expect("plain scanout");
+        let from_depth = scanout(&with_depth, presentation).expect("depth-laden scanout");
+        assert_eq!(
+            from_plain.pixels, from_depth.pixels,
+            "VI scanout must be a function of pixels and coverage, not depth"
+        );
+    }
+
+    /// The skipped buffers must still be PARALLEL to the pixel grid. A public
+    /// accessor hands the presented framebuffer out, and a short depth vector
+    /// would turn an indexed read into a panic.
+    #[test]
+    fn a_scanout_clone_keeps_every_buffer_parallel_to_the_pixel_grid() {
+        let source = grayscale(&[1, 2, 3, 4, 5, 6], 3);
+        let clone = source.cloned_for_scanout();
+        let pixels = (clone.width * clone.height) as usize;
+        assert_eq!(clone.pixels.len(), pixels * 4);
+        assert_eq!(clone.coverage.len(), pixels);
+        assert_eq!(clone.depth.len(), pixels, "depth must stay parallel");
+        assert_eq!(clone.encoded_depth.len(), pixels);
+        assert_eq!(clone.pixels, source.pixels);
+        assert_eq!(clone.color_layout(), source.color_layout());
+    }
 
     fn grayscale(values: &[u8], width: u32) -> Framebuffer {
         assert_eq!(values.len() % width as usize, 0);

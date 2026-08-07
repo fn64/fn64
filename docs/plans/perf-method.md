@@ -120,6 +120,32 @@ The census prints span graphics submits next to the distribution and warns
 outright at zero, because a beautiful p99 over a route that drew nothing is
 the most plausible-looking wrong number available here.
 
+### 12. A large byte count is not a bottleneck
+Bytes moved and time spent are different quantities, and reasoning from the
+first to the second is not measurement — it is the plausible-sounding story
+that rule 1 exists to stop.
+
+Earned on 2026-08-07. `vi::scanout` cloned a `Framebuffer` whose derived
+`Clone` copied two depth buffers — `depth` and `encoded_depth` — that nothing
+in the scanout chain reads: 600 KiB of every 975 KiB clone, **5.92 GB over
+9,637 fields**. The size of that number was treated as sufficient reason to
+dispatch. Eliminating all of it moved `vi_present` from 34,848.9 ms to
+35,142.9 ms: **+0.84%, the wrong direction, inside noise.** Mean field time
+34.85 → 34.94.
+
+The copy was never the cost. VI's 11.6% is per-pixel filter work —
+`filter_scanout` gathers eight neighbours across three channels for every
+full-coverage pixel, and `restore_rgba16_component_bounded_v1` alone is 2.84%
+self time. A bulk `memcpy` runs at streaming bandwidth; a gather-and-blend
+over the same bytes does not, and only the profile distinguishes them.
+
+The change was kept, labelled as measuring zero, because it deletes provably
+dead work and carries two invariant tests — one pinning the *premise* (output
+pixels must not depend on source depth) rather than the optimization, so a
+future depth-reading filter fails loudly instead of silently scanning out
+against `INFINITY`. Keep it for correctness; do not let it be remembered as a
+perf win.
+
 ## Measuring the 60fps bar
 
 **`reference/wm2000-routes/render-benchmark.zsh`** — one command, produces a
