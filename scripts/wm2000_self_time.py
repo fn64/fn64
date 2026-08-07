@@ -233,6 +233,11 @@ def main(argv=None):
 
     unresolved = self_time.get("<unresolved>", 0)
     print(f"\nSELF time, {len(args.exports)} run(s), {total:,} weighted samples")
+    print("NOTE: symbol NAMES are reliable; inlined-frame LINE NUMBERS and the")
+    print("      attribution of heavily-inlined helpers are not. Verify any")
+    print("      surprising attribution with `nm` or a counter before acting:")
+    print("      a run of this profiler attributed 6.21% to a #[cfg(test)]")
+    print("      function that `nm` proves is absent from the binary.")
     print(f"per-run load addresses: {[hex(s) if s else None for s in slides]}")
     if unresolved:
         print(f"unresolved: {unresolved:,} ({100*unresolved/total:.2f}%)")

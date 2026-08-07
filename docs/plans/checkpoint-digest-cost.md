@@ -769,27 +769,75 @@ Leaf calls and leaf bytes are **byte-identical across the lanes**, which is the
 control: only the root changed. Root-side hashing fell **18.3x** (186.6 MB to
 10.2 MB) and the total digest payload **3.15x**. The probe was reverted.
 
-### Measured, interleaved
+### Measured, interleaved -- CORRECTED
 
-15 A/B pairs, alternating, first pair discarded as cold, deep route. The two
-binaries were proven distinct (`cmp`) before timing -- a previous fabricated
-speedup in this project came from an env gate whose "off" spelling read as ON.
+The first measurement of this change was taken on a CONTENDED machine and its
+magnitude was wrong. Both numbers are kept, because the correction is the
+more useful record.
 
-| lane | median | min | mean | sd |
-|---|---|---|---|---|
-| v2 flat root | 773.5 ms | 740.2 | 776.2 | 22.1 |
-| v3 Merkle root | 726.3 ms | 706.3 | 728.1 | 12.9 |
+**Contended (load ~20, 15 competing `rustc`):** v2 773.5 ms, v3 726.3 ms,
+paired median delta 54.9 ms, 15/15 positive.
 
-**Paired delta: median 54.9 ms, 15/15 pairs positive. 1.065x.**
+**Quiet (load < 2, no competing processes), 15 interleaved pairs:**
 
-This is well short of the ~85 ms the optimistic arithmetic predicted, and it is
-reported as measured. Two reasons, both visible in the census above: the leaves
-are 71.8 MB of the 82.0 MB that remain, so the root was never more than ~72% of
-the digest's payload to begin with; and the absolute run time on this machine
-during this session was ~775 ms against the 420-440 ms recorded when the
-profile was taken, so the digest is a smaller share of a larger total. The
-paired, interleaved design is what makes the 54.9 ms trustworthy despite that
-drift -- the ratio is not.
+| lane | median | min | sd |
+|---|---|---|---|
+| v2 flat root | 421.5 ms | 416.9 | 3.4 |
+| v3 Merkle root | 392.3 ms | 384.8 | 3.4 |
+
+**Paired delta: median 30.3 ms, 15/15 positive, 1.074x.**
+
+Two things follow, and the second is the lesson.
+
+First, the quiet baseline **reproduces the documented 420-440 ms exactly**
+(421.5 ms). The 775 ms seen during development was entirely machine
+contention, not drift in the program.
+
+Second, **the interleaved paired design preserved the SIGN and the
+consistency but NOT the magnitude.** 15/15 positive was true in both
+conditions; 54.9 ms was inflated ~80% over the real 30.3 ms. Standard
+deviation tells the story: 22.1/12.9 ms contended against 3.4/3.4 ms quiet.
+Interleaving defends against drift and ordering, not against a noise floor
+six times the effect. A paired result on a loaded machine may be reported as
+directional, never as a magnitude.
+
+### The digest share did NOT fall, and that is the real finding
+
+Profiled with `scripts/profile-wm2000-self-time.zsh`, 5 runs per lane, same
+quiet machine, same session:
+
+| lane | `sha2::compress` SELF | total weighted cycles |
+|---|---|---|
+| v2 | 33.50% | 7.232 G |
+| v3 | **34.05%** | 7.245 G |
+
+The share is FLAT, and the totals are indistinguishable -- while the counted
+payload fell 3.15x. These are not contradictory once the census is read
+carefully, and the resolution matters for what to do next:
+
+- The payload that fell is the ROOT term, 186.6 MB to 10.2 MB.
+- The LEAF term did not move at all: 71,795,552 bytes on both lanes, byte for
+  byte. It is now **87.5% of all remaining digest payload.**
+- SHA-256 cost is not linear in payload alone -- it is dominated by
+  per-invocation setup at small message sizes. The root went from ONE call
+  absorbing 11,872 bytes to 9 node calls absorbing 64 bytes each. Fewer bytes,
+  but ~9x the `Sha256::new`/`finalize` pairs, and at 64 bytes of payload a
+  compression call is nearly all overhead.
+
+So v3 bought 30.3 ms of real wall clock while leaving the sha2 SHARE flat,
+because it traded a large-message hash for several small-message hashes. The
+saving is real and it is measured; the mechanism is not "less hashing" so much
+as "less memory traffic through the hasher".
+
+**This closes the root as a lever and re-opens the leaf.** The next lever on
+the digest is the PAGE SIZE, and the argument in
+`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`'s doc comment is now partly stale: it
+warns that shrinking pages inflates the root, which was true when the root was
+O(pages) but is not true under v3, where the root is O(log pages). Smaller
+pages would cut the 71.8 MB leaf term on single-store commits roughly in
+proportion. That is a v4 schema change and should be measured, not assumed --
+the counter-pressure is the same per-invocation overhead that just showed up in
+the root.
 
 ### Equivalence
 
