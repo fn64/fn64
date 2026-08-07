@@ -741,6 +741,14 @@ scripted presses would clear it. **Neither happened**, so the entrance
 presentation is waiting on something the route does not supply and time does not
 deliver.
 
+**The hang is byte-for-byte deterministic.** Two independent runs -- different
+binaries, different budgets, hours apart -- both stopped at exactly
+`read=600 step=653736 sim_time=1944932808`. That rules out a race, a timing
+window, or host nondeterminism: the guest reaches the same state and makes the
+same decision every time. Whatever it waits on is missing identically on each
+run, which is the easiest kind of bug to chase and means any fix is verifiable
+by a single reproduction.
+
 Candidates, none yet tested:
 - an RSP/RDP completion the presentation waits on (7 sp_tasks, all audio, and
   `rcp_completed=7` have been static since early boot)
