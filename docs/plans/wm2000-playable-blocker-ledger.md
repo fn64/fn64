@@ -1623,3 +1623,82 @@ verified by reproducing the hash outside the build byte-for-byte.
   more opportunity to be reached. Note the test named in earlier briefs,
   `a_prefix_generation_leaves_the_larger_one_resident_as_a_tail`, was never
   committed: **there is no live guard for it.**
+
+
+## 2026-08-07: there is no stall at read 600 — the route was silent, not stuck
+
+**Retraction.** The entry above ("the entrance presentation does not advance --
+a real boot blocker") is wrong, and so is every entry that carried the read-600
+stall forward. The route never stopped. It stopped *printing*.
+
+`entrance-to-match.schedule` drives input by controller read ordinal, and the
+harness logs a line only when the scripted input **changes** — an input EDGE.
+The schedule's last edge is at read 600; reads 600-1400 are all `0x0000`. After
+read 600 there is nothing left to log. A run that is progressing perfectly and a
+run that is genuinely wedged emit byte-identical stdout, which is precisely why
+four runs across three binaries "reproduced" the same final line. The
+determinism that was read as *"the guest reaches the same state and makes the
+same decision every time"* was the determinism of the schedule file.
+
+### The measurement
+
+`FN64_HEARTBEAT=20000` (`d1d6a4c`) prints step, `sim_time`, task submits, and the
+port-0 read ordinal on a step cadence, independent of edges. Same binary, same
+env, same route as the "stalled" runs:
+
+| steps | `sim_time` | gfx | audio | port0_reads |
+|---|---|---|---|---|
+| 240,000 | 1,866,926,554 | 679 | 1,094 | 575 |
+| **247,315** | **1,944,932,808** | **704** | **1,139** | **600** ← the "stall" |
+| 280,000 | 2,296,873,908 | 816 | 1,345 | 712 |
+| 640,000 | 6,227,973,003 | 2,074 | 3,650 | 1,970 |
+| 780,000 | 7,644,564,839 | 2,527 | 4,480 | **2,423** |
+
+The run passes read 640 — the schedule's own **"cheapest discriminator"** — and
+continues past read 1400, the end of the whole schedule, at a steady ~70 reads
+and ~65 graphics submits per 20,000 steps, with no render error. `idle_steps=0`
+throughout: the executor never once found nothing runnable.
+
+`sim_time` was never frozen. The claim that it was came from comparing two
+printings of the *same* log line, which by construction carries the same
+`sim_time` no matter how long the process runs.
+
+### What the sample actually showed
+
+The live stack read as pathology and was not. `try_store_w_translated` at four
+depths plus `_sigtramp`/`fault_handler`/`__mprotect` is the write barrier working
+normally. `sha2::compress` is the checkpoint digest. And 1,530 of 2,470 samples
+sat under `osSpTaskStartGo_recomp` → `dispatch_lle_task` →
+`dispatch_captured_raw_rdp` → the **software rasterizer** — the game rendering
+frames. Distinct `osSpTaskStartGo_recomp` call-site offsets appear in a single
+sample, so tasks were completing and new ones starting; a genuinely wedged
+process shows one offset.
+
+### The barrier is not implicated
+
+The experiment named as the highest-value first move was run: same route with
+`FN64_MPROTECT_BARRIER` **unset**. It reached read 600 at
+`step=247315 sim_time=1944932808 gfx_submits=704 audio_submits=1139` —
+byte-identical to the barrier lane, on every field. The barrier neither causes
+nor moves the behavior, which is now the expected result, because there is no
+behavior to cause.
+
+### The rule this earns
+
+**A log line printed on a state CHANGE cannot prove absence of progress.** Four
+"independent reproductions" agreed because they were reading a schedule file,
+not the guest. Before calling a long-running process stuck, print something on a
+cadence the process controls — steps, or wall clock — never on an event the
+input script controls. This belongs beside `perf-method.md`'s rule 6 (prove the
+lanes differ): here, prove the *runs* differ before believing they are the same.
+
+### What is actually open
+
+The read-600 blocker is closed — it never existed. What remains unproven is the
+positive claim: the route reaches an **entrance presentation and a match**.
+Progress past read 2,423 with 2,527 graphics submits and no render error shows
+the game is running and drawing, not what it is drawing. That needs frame
+evidence (`FN64_RENDER_DUMP_DIR`) or the selector gate word at `0x8003dd0c` and
+the four match-arena loader PCs (`0x80022484`, `0x80022498`, `0x800224d4`,
+`0x80022510`), which the earlier route observed as never reached. Those probes
+are unaffected by this retraction and are the right next step.

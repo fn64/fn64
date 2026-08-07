@@ -64,12 +64,26 @@ read as ON, so both lanes were the barrier lane. Check a counter or a symbol
 that must appear in one lane and not the other. `env_flag` now treats
 absent/empty/`0` alike, pinned by a test.
 
-### 7. Editing `fn64-recomp-rs` costs 32 crate rebuilds
+### 7. A line printed on a state CHANGE cannot prove absence of progress
+The route was believed to stall at controller read 600, "deterministic across
+four runs, three binaries, hours apart." It never stalled. The harness logs only
+when scripted input *changes*, and the schedule's last edge is read 600 — so a
+healthy run and a wedged one emit byte-identical stdout. The four reproductions
+agreed because they were all reading the same schedule file. `sim_time` looked
+frozen because two printings of the same log line necessarily carry the same
+`sim_time`.
+
+Before calling a long-running process stuck, print on a cadence the *process*
+controls — steps or wall clock — never on an event the input script controls.
+`FN64_HEARTBEAT=<steps>` does this. This is rule 6 (prove the lanes differ)
+pointed at runs instead of lanes.
+
+### 8. Editing `fn64-recomp-rs` costs 32 crate rebuilds
 ~9-11 minutes, versus ~25 s for `fn64-abi`. Every file in
 `crates/fn64-recomp-rs/src` is also a certified source, so an edit changes an
 identity digest. Prefer `fn64-abi`; when you must cross, say so in the commit.
 
-### 8. Never run a rebuild-triggering agent beside a benchmarking one
+### 9. Never run a rebuild-triggering agent beside a benchmarking one
 This produced rule 4's phantom. Serialize them.
 
 ## Where the cost is, as of `e7c4d04`
@@ -124,7 +138,11 @@ will not be until that 2.86% grows.
 
 Perf is no longer the binding constraint on the actual goal.
 
-1. **The route stalls at controller read 600.** Deterministic across three runs
-   at identical `step=653736 sim_time=1944932808`.
+1. ~~**The route stalls at controller read 600.**~~ **Retracted** — it does not.
+   The harness logs only on an input EDGE and the schedule has no edge after
+   read 600, so a healthy run and a wedged one print the same last line. With
+   `FN64_HEARTBEAT` the route runs past read 2,423. See the blocker ledger's
+   2026-08-07 retraction. What remains open is the positive claim that the
+   entrance presentation and a match are actually reached.
 2. **Only WM2000 boots.** The other four AKI titles need a generated crate
    inventory, not speed.
