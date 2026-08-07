@@ -480,3 +480,54 @@ aspiration.
 
 None of this touched the recompiled guest code, which was 0.06% of self time
 throughout. Every win came from runtime bookkeeping around it.
+
+
+## 2026-08-07: 16x from hardware, and the guest code is still invisible
+
+Measured on pinned guest work (1,461,877 instructions in 0.278s warm):
+**5,847,508 guest instructions/sec = 16.0x slower than the N64's 93.75 MHz.**
+Session start was ~19,000x.
+
+The remaining cost was `read_snapshot` (`live_program.rs:393`) at **74.9% of
+self time** -- it materializes the whole 1 MiB watched region through a per-byte
+`FnMut(u32) -> u8` closure. The word-wise alternative already existed and was
+documented; three call sites had simply never been converted, all with the RDRAM
+allocation already in hand:
+
+- `execution.rs:469` (`advance_device_time`) and `host_memory.rs:110`
+  (`write_guest_physical`), via a new `commit_with_optional_view`
+- `flush_host_abi_transaction`, which built a snapshot solely to feed
+  `current_changed_ranges`
+- `execution.rs:524` (`checkpoint_catalog_host_transaction_before_suspend`)
+
+Equivalence is byte-identical, verified by `diff` of complete run output across
+both lanes -- `sim_time`, `scheduler_steps`, RDRAM SHA-256, and every device
+counter. `trace` unchanged confirms the change removed work *per boundary*
+rather than removing boundaries.
+
+### A projection of mine that was wrong
+
+I predicted the recompiled guest code would now be ~12% of runtime, reasoning
+that it was 0.06% before a 233x overhead reduction and would therefore emerge as
+dominant. **It does not appear in the profile at all (<0.2%).** The reasoning
+failed because it assumed guest work per boundary held constant while overhead
+fell; instead the wins scale with boundary count, and guest work per boundary
+rose alongside. We are still in the runtime-bookkeeping project, and codegen
+remains irrelevant until guest code is visible at all.
+
+Also settled: `codegen-units=16` on the shards gives a 9-minute build for 10%,
+and `codegen-units=1` + `lto=thin` + `target-cpu=native` together measured 2.3x
+SLOWER. Codegen tuning is not the lever.
+
+### Where the remaining cost is
+
+**94% is `_platform_memcmp`** -- the correctness scan, running at memory
+bandwidth. 1 MiB `memcmp` measures 19.4 us / 54 GB/s on this machine, and the
+deep route's ~19,523 boundaries x ~3 scans x 19.4 us is the same order as its
+total runtime. The scan is already one `memcmp` per range with a chunked
+fallback; there is no constant factor left in it.
+
+Further gains require **reducing scan volume, not scan cost**: fewer boundaries,
+or a watched region smaller than the 1 MiB boot bank. The latter is the "narrow
+code map" already closed by measurement (WM2000 zeroes its own loaded code
+image), so boundary count is the honest next lever.
