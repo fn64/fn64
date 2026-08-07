@@ -980,15 +980,52 @@ pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     observe_renderer_write(event);
 }
 
+/// Whether one committed guest write must break the current block.
+///
+/// This is separate from [`record_executable_and_renderer_write`] above, which
+/// feeds `PENDING_ATTRIBUTED_EXECUTABLE_WRITES` and the journal. **Attribution
+/// stays wide**: narrowing it is what produced the `events=0 declarations=0`
+/// bug documented at the fallback in `track_catalog_nested_mutation` below.
+/// Only the boundary narrows here.
+///
+/// A write is a boundary when it lands in the watched executable region AND
+/// some generation backed by those bytes is currently resident. A write to
+/// bytes no resident generation backs cannot invalidate a live translation, so
+/// the block chains on.
+///
+/// # Why the un-resident case is safe
+///
+/// The obvious counterexample -- write bytes while nothing is resident, then
+/// activate a generation over them and execute stale code -- cannot happen.
+/// `activate_for_fetch_with_digest`
+/// (`fn64-recomp-rs` `generation/mod.rs:771`) computes `live_digest` from LIVE
+/// memory and compares it against `expected_sha256` for every containing
+/// candidate **unconditionally and before** consulting `self.active`; the
+/// `already_active` short-circuit happens after that loop. So a later
+/// activation over bytes changed earlier re-digests the changed bytes and
+/// returns `AotMiss`/`NoGenerationMatched` instead of activating.
+///
+/// `guest_write_token` would be the way to cache this, and it has no non-test
+/// consumers, so no activation path bypasses the digest.
 pub(super) fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWriteBoundary {
     let (start, len) = event.range();
     let end = start.saturating_add(len);
-    if EXECUTABLE_WRITE_RANGES.with(|ranges| {
+    if !EXECUTABLE_WRITE_RANGES.with(|ranges| {
         ranges
             .borrow()
             .iter()
             .any(|&(physical_start, physical_end)| start < physical_end && end > physical_start)
     }) {
+        return GuestWriteBoundary::Continue;
+    }
+    // Unanswerable means "assume resident". `resident_backing_intersects`
+    // returns `None` when there is no catalog or the catalog is already
+    // borrowed; both must break the block, because a permissive answer here
+    // would let stale translated code execute.
+    let resident = with_host(|host| host.canonical_recompiled_program.clone())
+        .and_then(|live| live.resident_backing_intersects(start, end))
+        .unwrap_or(true);
+    if resident {
         GuestWriteBoundary::ExecutableChanged
     } else {
         GuestWriteBoundary::Continue

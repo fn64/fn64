@@ -2464,4 +2464,64 @@ impl CanonicalLiveBlockProgramV1 {
             .as_ref()
             .map(|generations| generations.borrow().evidence_snapshot())
     }
+
+    /// Whether `[physical_start, physical_end)` intersects the physical backing
+    /// of any generation that is CURRENTLY RESIDENT.
+    ///
+    /// This is the same scan `invalidate_physical_write` performs
+    /// (`fn64-recomp-rs` `generation/mod.rs:1292`): for each active segment,
+    /// test the owning generation's backing spans for intersection. `active`
+    /// holds segments rather than generations, so this is a handful of interval
+    /// tests per store.
+    ///
+    /// `None` means the question cannot be answered right now -- there is no
+    /// generation catalog, or the catalog is already mutably borrowed by the
+    /// runner. Callers must treat `None` as "assume resident": this runs on the
+    /// guest store path, where a borrow panic would be a hard crash and a
+    /// permissive answer would let stale translated code execute.
+    pub(super) fn resident_backing_intersects(
+        &self,
+        physical_start: u32,
+        physical_end: u32,
+    ) -> Option<bool> {
+        let generations = self.generations.as_ref()?;
+        // `try_borrow`, never `borrow`. Every catalog mutation happens in the
+        // runner between dispatches rather than under translated code, so this
+        // is not expected to contend -- but "not expected" is not a safety
+        // argument for a panic on the hot store path.
+        let catalog = generations.try_borrow().ok()?;
+        Some(resident_backing_intersects_catalog(
+            &catalog,
+            physical_start,
+            physical_end,
+        ))
+    }
+}
+
+/// The resident-backing scan itself, over a borrowed catalog.
+///
+/// This mirrors `invalidate_physical_write` (`fn64-recomp-rs`
+/// `generation/mod.rs:1292`): for each ACTIVE generation, test that
+/// generation's physical backing spans for intersection. `active` holds
+/// segments rather than generations, and a generation's backing is typically
+/// one or two spans, so this is a handful of interval tests per store.
+pub(super) fn resident_backing_intersects_catalog(
+    catalog: &BackedPrecompiledGenerationCatalogV1,
+    physical_start: u32,
+    physical_end: u32,
+) -> bool {
+    let backings = catalog.backings();
+    catalog.active_generations().into_iter().any(|generation| {
+        backings
+            .binary_search_by_key(&generation, |backing| backing.generation())
+            .is_ok_and(|index| {
+                backings[index]
+                    .spans()
+                    .iter()
+                    .any(|span| {
+                        physical_start < span.physical_end()
+                            && physical_end > span.physical_start()
+                    })
+            })
+    })
 }
