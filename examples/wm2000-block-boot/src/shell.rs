@@ -373,15 +373,26 @@ impl ScheduleDriver {
             if input != self.current[port] {
                 fn64_abi::set_controller_state(port, input.button, input.stick_x, input.stick_y);
                 self.current[port] = input;
+                // Report the SAME counters the headless dump lane reports at
+                // this exact boundary (`main.rs`'s `input_edge` line), so the
+                // two lanes can be diffed row-for-row on one route. Printing
+                // only `vi_swaps` here is what made every previous window
+                // investigation ambiguous: `vi_swap_count` counts guest
+                // `osViSwapBuffer` calls, NOT VI retraces, so a zero there
+                // cannot distinguish "no retrace" from "retraces fine, guest
+                // never swapped" -- and those have opposite root causes.
+                let (graphics_tasks, audio_tasks) = fn64_abi::task_counts();
                 println!(
                     "[wm2000-shell] controller input_edge port={port} read={} buttons={:#06x} \
-                     stick=({}, {}) sim_time={} vi_swaps={}",
+                     stick=({}, {}) sim_time={} vi_swaps={} gfx_submits={} audio_submits={}",
                     self.read_ordinals[port],
                     input.button,
                     input.stick_x,
                     input.stick_y,
                     fn64_abi::sim_time(),
                     fn64_abi::vi_swap_count(),
+                    graphics_tasks,
+                    audio_tasks,
                 );
             }
         }
