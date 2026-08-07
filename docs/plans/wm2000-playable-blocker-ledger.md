@@ -1849,3 +1849,73 @@ orders of magnitude above p50 is not a slow hash.
 
 Measured on the committed presenter fix, release build, scheduled route
 `entrance-to-match`.
+
+### The 3-second frame, attributed (2026-08-07)
+
+**It is not a stall.** The pump is running the guest the whole time, at a
+normal per-step rate, for many more steps than a normal frame. Measured with
+`FN64_SHELL_SPIKE_MS`, which dumps a slow pump's own attribution rather than
+inferring one:
+
+```
+SPIKE wall=3028.2ms steps=19112 (3023.2ms, 158.18us/step)
+      advances=2 (3.8ms) unattributed=1.2ms
+      d_sim_time=34398276 d_gfx=2 d_audio=20
+```
+
+Three findings, each a counter rather than an inference:
+
+1. **99.8% is the scheduling arm.** `step_ms` is 3,023 of 3,028 ms. The
+   device-advance arm is 3.8 ms across 2 advances, and `unattributed` is
+   1.2 ms -- so nothing hides outside the two arms. The plausible
+   device-advance story is **falsified**: `advance_virtual_time` calls
+   `advance_hle_render_task`, and the pump allows up to
+   `DEVICE_ADVANCES_PER_PUMP` = 4,096 of them, so a chunked-HLE-render storm
+   in that arm could have produced exactly this wall time. It did not; the
+   arm ran twice.
+
+2. **It is a step-COUNT event, not a slowdown.** 158 us/step inside the spike
+   against a **380 us/step** mean over the 395 normal frames -- the spike's
+   steps are *faster* than average. Steps per frame: p50=61, p95=189,
+   p99=1,509, max=61,035. Nothing is slow; there is simply 300x more work.
+
+3. **The pump commits an exact integer number of VI fields.** `d_sim_time`
+   divided by the one-field delta (1,563,558) is **22.0** for this spike,
+   **30.0** for the 8.8 s boot spike, and **3.0** for a 306 ms one. Never a
+   fraction.
+
+That third number is the mechanism. `GuestDrain::before_step` yields
+`AdvanceField` only when the run queue is empty or the idle thread has taken
+two consecutive turns; virtual time cannot advance while the guest has real
+runnable work. Through a menu transition WM2000 stays continuously runnable
+for 19,112 steps, so no field boundary is reached until it finally quiesces --
+and then ONE `advance_to_next_device_event` commits all 22 accumulated fields
+at once. `pump_one_frame` breaks on the first `ViFields` regardless of its
+`retrace_ticks`, so those 22 fields are presented as a single frame.
+
+**Deterministic, and therefore not host-side.** Two 400-frame runs are
+byte-identical on `steps` and `swapped` for every frame, with the spikes at
+the same probe frames (7, 217, 390) and identical `d_sim_time`. A host cause
+-- GC-like batching, a syscall storm, page-fault clustering, filesystem I/O,
+the audio device -- cannot reproduce identical step counts, and the run was
+`FN64_NO_AUDIO=1` besides. `max_callback_gap_us` is now reachable through
+`fn64_abi::audio_stream_health()` for the windowed lane, where cpal's
+realtime thread gives an independent host-side clock.
+
+The spike sits between controller reads 100 and 130, a menu transition: the
+guest is doing a genuine burst of setup work. So this is **not a bug to fix**
+and not the same problem as the p50=22-28 ms general slowness. It is the frame
+pacer's honest report of a guest that ran 22 fields' worth of work before
+yielding.
+
+What it does mean: **`max_ms` over a window that contains a transition is not
+a 60fps verdict.** A worst-case bound is the right bar for steady-state play,
+but a burst frame is a scheduling artifact of draining to quiescence, not a
+dropped frame the player sees as a 3-second freeze -- the guest's own clock
+advanced 22 fields, so the game did not lose time. Judging the 60fps claim
+needs the tail taken over steady-state frames, with transition pumps
+identified (they are exactly the ones whose committed `retrace_ticks` exceeds
+1) rather than silently folded into `max`.
+
+Measured on `19d1ab7` + the spike gate, release build, headless lane
+(no winit), quiet machine, `entrance-to-match`.
