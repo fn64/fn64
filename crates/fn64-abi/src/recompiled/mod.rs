@@ -443,6 +443,43 @@ pub struct PendingExecutableWriteEvidenceSnapshot {
 pub const CANONICAL_EXECUTABLE_MUTATION_JOURNAL_SCHEMA_V1: &str =
     "fn64.canonical-executable-mutation-journal.v1";
 
+/// Domain separator for the v2 PAGE-TREE watched-bytes digest.
+///
+/// v1 was a flat SHA-256 over `(start, end, bytes)` per watched range. v2
+/// hashes each fixed-size page separately and binds the page digests through a
+/// root. The two are different functions of the same memory, so a v1 value and
+/// a v2 value for identical bytes must never be mistaken for one another --
+/// this prefix, the page size, and the page count all enter the hashed message,
+/// so a v2 root cannot collide with a v1 digest except by SHA-256 collision.
+///
+/// Recorded digests that predate this constant are v1 and stay v1: see
+/// `docs/plans/checkpoint-digest-cost.md`.
+pub const CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V2: &str = "fn64.canonical-watched-bytes-digest.v2";
+
+/// Bytes per page in the v2 watched-bytes digest.
+///
+/// 4096 bytes. The choice is bounded on both sides and the middle is flat:
+///
+/// - Too small and the per-page fixed cost dominates. Each page costs a
+///   `Sha256::new`, a 30-byte prefix, three integer fields and a `finalize` --
+///   roughly 2 compression blocks of overhead. At 4 KiB the payload is 64
+///   blocks, so overhead is ~3%. At 256 B it is ~33%, and the ROOT hash also
+///   grows: it covers 32 bytes per page, so a 1.44 MiB region at 256 B pages
+///   makes the root itself a 184 KiB hash -- re-run on EVERY commit, which is
+///   precisely the cost being removed.
+/// - Too large and a one-word store re-hashes more than it must. WM2000's
+///   observed writes are single stores, so the recompute is one page: 4 KiB
+///   instead of 1.44 MiB is a 369x reduction in hashed bytes.
+///
+/// At 4 KiB, WM2000's 1,513,056-byte range is 370 pages, so the root hashes
+/// 11,840 bytes -- under 1% of the flat digest -- and a single-store commit
+/// hashes one 4 KiB page plus that root.
+///
+/// A power of two, so the page index of an offset is a shift rather than a
+/// division. The value is part of the hashed message, so changing it later is a
+/// schema change and cannot happen silently.
+pub const CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2: usize = 4096;
+
 /// One exact attributed write declaration clipped to the sealed physical
 /// executable backing union.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -540,6 +577,16 @@ struct WatchedExecutableBytesV1 {
     /// hashes it, and `set_expected` is the only writer, so the two forms
     /// cannot drift.
     expected_storage_order: Vec<u8>,
+    /// The v2 page digests of `expected`, one per
+    /// [`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`]-byte page.
+    ///
+    /// Derived state, like `expected_storage_order`: it is always exactly what
+    /// recomputing every page of `expected` would produce. `set_expected`
+    /// refreshes the pages that changed and asserts nothing else could have,
+    /// so a stale entry is not representable through the normal path.
+    ///
+    /// Empty until the baseline is first set.
+    expected_page_digests: Vec<[u8; 32]>,
 }
 
 impl WatchedExecutableBytesV1 {
@@ -549,6 +596,7 @@ impl WatchedExecutableBytesV1 {
     /// Returns the buffer it replaced so the caller can recycle it.
     #[must_use]
     fn set_expected(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        self.refresh_page_digests(&bytes);
         self.expected_storage_order.clear();
         self.expected_storage_order.extend_from_slice(&bytes);
         // Mirror `RdramView::copy_logical_bytes`' mapping exactly: only the
@@ -560,6 +608,59 @@ impl WatchedExecutableBytesV1 {
             word.reverse();
         }
         std::mem::replace(&mut self.expected, bytes)
+    }
+
+    /// Number of v2 pages covering `len` bytes.
+    fn page_count(len: usize) -> usize {
+        len.div_ceil(CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2)
+    }
+
+    /// Bring `expected_page_digests` in line with `bytes`, rehashing only the
+    /// pages whose bytes actually differ from the current baseline.
+    ///
+    /// CONSERVATIVE BY CONSTRUCTION. The dirty set is decided here, by
+    /// comparing the incoming bytes against `expected` page by page -- not by
+    /// trusting a writer's declaration, not by consuming
+    /// `current_changed_ranges`, and not by any dirty flag maintained
+    /// elsewhere. A page is skipped only when its bytes are *equal*, proven by
+    /// a `memcmp` at the moment of the update, and equal bytes have an equal
+    /// digest by definition. There is no path by which a changed page keeps a
+    /// stale digest, because nothing other than byte equality can cause a skip.
+    ///
+    /// The whole-baseline cases -- first seal, or a length change -- rehash
+    /// every page.
+    fn refresh_page_digests(&mut self, bytes: &[u8]) {
+        let pages = Self::page_count(bytes.len());
+        let reusable = self.expected_page_digests.len() == pages
+            && self.expected.len() == bytes.len();
+        if !reusable {
+            self.expected_page_digests.clear();
+            self.expected_page_digests.reserve(pages);
+            for index in 0..pages {
+                let lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
+                let hi = (lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(bytes.len());
+                self.expected_page_digests.push(receipts::watched_page_digest_v2(
+                    self.physical_start,
+                    self.physical_end,
+                    index as u32,
+                    &bytes[lo..hi],
+                ));
+            }
+            return;
+        }
+        for index in 0..pages {
+            let lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
+            let hi = (lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(bytes.len());
+            if self.expected[lo..hi] == bytes[lo..hi] {
+                continue;
+            }
+            self.expected_page_digests[index] = receipts::watched_page_digest_v2(
+                self.physical_start,
+                self.physical_end,
+                index as u32,
+                &bytes[lo..hi],
+            );
+        }
     }
 
     /// Bytes before the first word-aligned storage word, as `copy_logical_bytes` computes it.

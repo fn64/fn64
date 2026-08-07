@@ -1263,6 +1263,65 @@ pub(super) fn watched_bytes_sha256(storage: &[u8], ranges: &[(u32, u32)]) -> [u8
     hasher.finalize().into()
 }
 
+/// The v2 digest of one page of one watched range.
+///
+/// Binds the schema, the page size, the range the page belongs to, the page's
+/// index within that range, and its bytes. Because the range bounds and the
+/// index are inside the leaf, a page's digest is not reusable at any other
+/// position -- two ranges that happen to hold identical bytes still produce
+/// different leaves, and so does the same page moved within a range.
+///
+/// The final page of a range may be shorter than [`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`];
+/// its actual length is hashed, so a short final page cannot be confused with a
+/// full one that happens to be zero-padded.
+pub(super) fn watched_page_digest_v2(
+    physical_start: u32,
+    physical_end: u32,
+    page_index: u32,
+    bytes: &[u8],
+) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V2.as_bytes());
+    hasher.update([0x00]); // leaf tag: distinguishes a page from the root below
+    hasher.update((CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u64).to_be_bytes());
+    hasher.update(physical_start.to_be_bytes());
+    hasher.update(physical_end.to_be_bytes());
+    hasher.update(page_index.to_be_bytes());
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// The v2 root over every page of every watched range.
+///
+/// `ranges` yields `(physical_start, physical_end, page_digests)` in watched
+/// order. The root depends ONLY on that -- on the range bounds and the page
+/// digests, in range order and page order. It does not depend on which pages
+/// were recomputed, in what order, or on how many commits preceded, which is
+/// what makes an incrementally maintained root equal to one computed from
+/// scratch.
+///
+/// The range count and each range's page count are hashed, so no regrouping of
+/// pages between ranges can produce the same root.
+pub(super) fn watched_root_digest_v2<'a>(
+    ranges: impl ExactSizeIterator<Item = (u32, u32, &'a [[u8; 32]])>,
+) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V2.as_bytes());
+    hasher.update([0x01]); // root tag
+    hasher.update((CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u64).to_be_bytes());
+    hasher.update((ranges.len() as u64).to_be_bytes());
+    for (physical_start, physical_end, pages) in ranges {
+        hasher.update(physical_start.to_be_bytes());
+        hasher.update(physical_end.to_be_bytes());
+        hasher.update((pages.len() as u64).to_be_bytes());
+        for page in pages {
+            hasher.update(page);
+        }
+    }
+    hasher.finalize().into()
+}
+
 pub(super) fn resolver_install_definition_sha256(install: &CatalogResolverInstallV1) -> [u8; 32] {
     let evidence = install.evidence();
     let mut hasher = sha2::Sha256::new();
