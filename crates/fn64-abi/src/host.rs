@@ -36,6 +36,17 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     crate::task_dispatch::advance_hle_render_task();
     let vi_retrace_ticks = crate::pi::advance_device_time(now);
     with_executor(|exec| exec.advance_time(now));
+    if vi_retrace_ticks != 0 {
+        // Per-field latency census, off unless `FN64_FRAME_CENSUS=1`. Armed
+        // here rather than from a harness `main` because this is the one seam
+        // both the headless and windowed lanes cross, and because
+        // `examples/wm2000-block-boot/src/main.rs` is hashed into the
+        // canonical program identity -- a diagnostic must not move that
+        // digest. `install` is `Once`-guarded and returns immediately when the
+        // gate is absent, which is every non-diagnostic run.
+        crate::frame_census::install();
+        crate::frame_census::observe_vi_fields(vi_retrace_ticks, now);
+    }
     VirtualTimeAdvance { vi_retrace_ticks }
 }
 
