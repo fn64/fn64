@@ -688,10 +688,17 @@ they are a substantial piece of engineering.
    `corosensei` coroutine stacks. It must be async-signal-safe: no allocation,
    no `RefCell`, no libc beyond the `mprotect` syscall. The benchmark handler
    meets that bar (two relaxed atomics and one `mprotect`) and took 325,500
-   faults without incident, including with `SA_ONSTACK`. The unmeasured risk is
-   fault delivery onto a coroutine stack rather than a normal thread stack —
-   that must be proven before any integration, and a handler that faults or
-   deadlocks here is a hard crash with no diagnostic.
+   faults without incident, including with `SA_ONSTACK`.
+
+   The open question was fault delivery onto a coroutine stack rather than a
+   normal thread stack, since a handler that faults or deadlocks there is a hard
+   crash with no diagnostic. **Settled directly, and it is clear:**
+   `reference/mprotect-bench/coroutine-fault.rs` takes 2,000 write faults from
+   inside a real `corosensei` coroutine across 20 suspend/resume cycles, with
+   `SA_ONSTACK` set, asserting after each that the store actually landed once
+   the handler re-armed the page. All 2,000 delivered; no lost stores, no
+   corruption of the stack switch. This was the obstacle most likely to
+   invalidate the approach outright, and it does not.
 
 4. **Unattributed writers are the real correctness gap, and it cuts the safe
    way.** The census only sees writes routed through `set_write_observer`. The
@@ -713,12 +720,74 @@ they are a substantial piece of engineering.
 
 6. Not yet checked: interaction with `FN64_WATCH_WRITE` and the debugger.
 
+### A measurement trap worth recording
+
+The first version of the probe printed its report from
+`examples/wm2000-block-boot/src/main.rs`, and that **changed the canonical
+program identity** -- `34712877...` became `57165dc1...`. Not a bug in the
+probe: `build.rs:794` reads `src/main.rs` verbatim into
+`DISPATCH_SOURCE_SHA256`, which feeds `ProgramArtifactIdentity` and therefore
+the whole receipt chain. *Any* edit to that file, including a comment, changes
+the identity of the program under measurement.
+
+It was initially misdiagnosed as a stale `OUT_DIR` -- a forced `build.rs` rerun
+reproduced the new digest, which looked like confirmation until a clean rebuild
+from the same state returned the old one. The A/B, not the single observation,
+is what settled it.
+
+The fix was to print from `fn64-abi` via `atexit` instead, leaving the harness
+source untouched. With that, the instrumented binary's complete run output is
+`diff`-identical to the clean baseline -- program identity, `sim_time`, RDRAM
+SHA-256 and every device counter -- with the census compiled in and disabled.
+**Instrument the library, never `wm2000-block-boot/src/main.rs`.**
+
 ### Status
 
 **Measured and favourable; not implemented.** The go/no-go number the design
 hinged on — faults per boundary — is 0.68 against a break-even of 9, an ~13x
 margin, so the lever exists. The probe is committed behind
 `FN64_MPROTECT_CENSUS` so the number can be re-derived on any route.
+
+Verification carried out: 568/568 tests across `fn64-abi` and `fn64-runtime`,
+and complete run output `diff`-identical to the clean baseline with the probe
+compiled in and disabled (2.90s both ways, `sim_time=13990253`,
+`steps=19523`).
+
+Reproduce the census (add `FN64_CONTROLLER_SCHEDULE` and a larger
+`FN64_BLOCK_MAX_STEPS` for the deep route):
+
+```
+cd examples/wm2000-block-boot
+source ../../.claude/local.env
+export ROM="$FN64_DISCOVER_NWXE_ROM"
+C=~/Code/aki-recomp/captures; G="$C/wm-general-exception-images"
+export FN64_EXECUTABLE_IMAGES="$G/run-1/image.json:$G/run-2/image.json:$G/run-3/image.json"
+export FN64_BOOT_CONTEXT="$C/wm2000-boot-context.json"
+export FN64_ABSENT_N64DD=1 FN64_BLOCK_MAX_STEPS=1300000
+FN64_MPROTECT_CENSUS=1 ./target/release/wm2000-block-boot
+```
+
+The standalone microbenchmark is retained at `reference/mprotect-bench/`
+(`main.rs` = the headline costs, `stress.rs` = the faults-per-boundary sweep
+that locates the break-even). It links nothing from this repository; build it
+with the included `Cargo.toml.txt`.
+
+### The next step, if this is taken up
+
+The obstacle most likely to invalidate the approach outright, signal delivery
+onto a `corosensei` coroutine stack, has been tested and cleared, so what
+remains is invasive but not in doubt.
+
+The expensive, structural piece is obstacle 1: moving RDRAM from a malloc'd
+`Box<[u8]>` to a page-aligned `mmap`. Everything else depends on it, and it
+touches the boot/publication path and the RDRAM-ownership contract. Obstacle 5
+(deriving the changed-byte set by comparing only the faulted pages) is what
+keeps the guard exactly as strong as it is today and should be designed
+alongside it, not after.
+
+Worth stating plainly: this is a multi-day structural change, not a patch. What
+the measurement establishes is that it is worth attempting, roughly 6x to ~2.6x
+of hardware, not that it is easy.
 
 Recorded honestly: the brief that commissioned this expected "the fault costs
 more than the scan" and eight hypotheses had died before it. This one did not.
@@ -760,3 +829,187 @@ This is now the top **playability** blocker, distinct from throughput. The
 perf work took the route from hours to minutes per attempt, which makes this
 tractable to investigate -- each hypothesis is now a minutes-long experiment
 rather than an overnight one.
+
+
+## 2026-08-07: the mprotect barrier's aliasing hazard, raised and closed
+
+A parallel trace of every RDRAM writer surfaced a hazard the barrier's
+feasibility study had not covered: `execution.rs:1158` (identically `:1576`,
+`:1680`, and four sites in `runners.rs`) creates a `&mut [u8]` over the WHOLE
+RDRAM allocation once inside the coroutine body and holds it across the entire
+guest run -- every yield, every host shim, every device tick. A write barrier
+would trap stores made through a reference that stays live across the fault.
+
+The existing `reference/mprotect-bench/coroutine-fault.rs` did NOT cover this:
+its faulting store is `ptr::write_volatile` on a raw pointer, so its 2,000-fault
+result said nothing about a long-lived borrow.
+
+`reference/mprotect-bench/borrowed-fault.rs` closes the gap by reproducing the
+real shape: one whole-region `&mut [u8]` created at coroutine entry and live
+across all faults and suspends; stores as safe bounds-checked indexing
+(`mem[i] = v`, which is literally what `Rdram::store_b` compiles to) rather than
+volatile; readback through the same borrow; an aliasing raw-pointer write to the
+same bytes while that `&mut` is live; suspends taken with the barrier both armed
+and disarmed; and an independent whole-region mirror compared byte-for-byte.
+
+**Reproduced independently: 4,000/4,000 faults delivered, mirror
+byte-identical.**
+
+The correctness argument deliberately rests on the MMU property alone -- *a byte
+of a `PROT_READ` page cannot change without a fault* -- and never on `&mut`
+uniqueness. `mprotect` changes page permissions; it creates no reference and
+invalidates no provenance, and the fault is transparent because the store
+retires after the handler returns.
+
+### Pre-existing aliasing debt, recorded not fixed
+
+Two live `&mut [u8]` over the same allocation is aliasing-UB-adjacent under
+Stacked/Tree Borrows **today**, independent of any barrier -- Miri would reject
+it. The writers involved include `host_memory.rs`, `pi/timing.rs:444`,
+`rsp_commit.rs:87`, `rsp_phase.rs:773` and `executor/mod.rs:734`. Addressing it
+means refactoring `Rdram<'a>`'s ~40 accessors onto raw pointers, a separate and
+much larger job.
+
+### One structural fact that simplifies the barrier
+
+Single OS thread, enforced by construction: `RunToken` is a ZST capability whose
+sole producer is `Executor::run_one_step`, so two coroutines executing
+concurrently "has no expressible call site" (`thread.rs:1-19`). `Executor`,
+`HostState`, `ACTIVE_RDRAM`, `WRITE_OBSERVER` and the page-epoch tables are all
+`thread_local!`; coroutine switches change the stack, not the thread. The only
+non-test spawn near the guest is the watchdog, which never touches RDRAM.
+
+
+## 2026-08-07: `guest_write_token` must NOT be wired into activation
+
+I proposed caching activation digests against `guest_write_token`, on the
+premise that it is page-epoch based and therefore observes RDRAM writes
+independently of the declaration path. **That premise is false, and acting on
+it would have silently deleted a fail-closed guard.**
+
+`mark_guest_write_pages` (`fn64-recomp-rs/src/runtime/host.rs:353`) has exactly
+two callers: `:466` inside `notify_attributed_guest_write` -- the common body of
+every `notify_*` gateway -- and `:516` inside `notify_cpu_instruction_store16`.
+There is no mprotect hook and no hardware dirty bit. **The page epoch is bumped
+only when a writer voluntarily declares**, which is the identical trigger as the
+write queue. The token re-encodes the queue; it does not observe memory.
+
+Undeclared writers therefore leave the token unchanged while mutating an image:
+`Rdram::as_mut_slice` (`runtime/host.rs:605`, self-documented as "an
+UNATTRIBUTED write path", live caller `runners.rs:1331`, a C shim that writes
+wherever the guest points it), the raw `copy_nonoverlapping`/`RdramPtr` writes at
+`pi/timing.rs:1064`/`:1096`, `mesgqueue.rs:148`, and ~25 sites across
+`pfs`/`gbpak`/`voice`/`si`. The attribution audit's "covered" verdicts do not
+transfer: mechanism 2 declares bytes at a later flush boundary, which is too
+late for a cache consulted at fetch.
+
+The consequence would be: a C shim mutates a byte of a generation's image, no
+epoch bumps, the cache reports "verified", and the guest executes stale
+translated code with no digest and no error.
+
+**The tree already says so, and I missed it.** `docs/plans/dispatch-granularity.md:570`
+states the safety argument as: `guest_write_token` "has **no non-test
+consumers**, so no activation path bypasses the digest." The zero-consumer
+property is a cited premise of a written safety argument, not an oversight
+awaiting a fix.
+
+Also corrected: `generation/mod.rs` IS a certified source
+(`fn64-recomp-rs/src/lib.rs:128`). The 27-entry
+`DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1` list is essentially all of that
+crate's `src`, so there is no digest-neutral file in `fn64-recomp-rs`.
+
+### The real fix targets the retirement loop, not the digest
+
+The measured cost is structural rather than cryptographic. Generations
+`17518568401266107605` `[0x8011c900,0x801226f0)` and `5227338575556428217`
+`[0x8011c900,0x80161460)` **share a start address**, so every activation of one
+retires the other and the next fetch re-hashes the full image -- 419,861 times,
+66.8 GB.
+
+Making activation not retire a generation whose image is byte-identical and
+still resident removes the re-hash **while every activation still digests**. No
+weakened verification, no soundness argument about writers required.
+
+## 2026-08-07: the reference renderer profiled and optimized -- 12.3% faster
+
+The reference renderer had never been profiled. A subsystem `sample` of a live
+route put `fn64_render` second only to `fn64_abi` and about 3x the recompiled
+guest code, so it was measured properly and optimized. Output is byte-identical.
+
+### The benchmark this needed, because the standard one renders nothing
+
+The documented A/B (`FN64_BLOCK_MAX_STEPS=40000000
+FN64_BLOCK_MIN_GUEST_INSTRUCTIONS=1461877`, ~229 ms) reports
+`gfx_submits=0 sp_tasks=0`. **It exercises zero rendering** and cannot measure
+this subsystem at all; a renderer change of any size moves it not at all.
+
+The isolated benchmark is `examples/xbus_replay` against a captured stream:
+
+```
+FN64_XBUS_STREAM_DUMP_DIR=/tmp/fn64-xbus FN64_XBUS_STREAM_DUMP_SKIP=20 \
+FN64_XBUS_STREAM_DUMP_RDRAM=20 ./target/release/wm2000-block-boot   # capture
+FN64_XBUS_REPLAY_REPEAT=60 ./target/release/examples/xbus_replay \
+    /tmp/fn64-xbus/xbus-0020.bin /tmp/out /tmp/fn64-xbus/rdram-0020.bin
+```
+
+Real captured RDP commands over real captured RDRAM, no guest execution in the
+sample. `FN64_XBUS_REPLAY_REPEAT` (added here) loops the replay and prints
+`best_render_ms` plus an FNV-1a framebuffer digest, so a change's speed and its
+byte-exactness are read off the same line. It asserts the digest is stable
+across iterations, so a nondeterministic renderer fails the harness itself.
+
+### Profile: texture sampling is half the renderer, the combiner is not
+
+`sample` of 400 replays, render-attributable samples only:
+
+```
+texture sampling   48.6%     <- read_tlut alone (220) > the whole combiner
+color combiner      8.5%
+blender             5.5%
+```
+
+### What was wrong, and what it cost
+
+1. **TLUT decode was recomputed per texel** (`6cbfa17`). A CI texel's color is
+   a pure function of `(index, texture_lut)`, both immutable for a
+   `TmemTexture`'s life, yet each fetch redid two masked byte reads, two
+   validity asserts, and a format conversion -- four times per bilinear pixel.
+   A lazily-filled 256-entry memo removed `read_tlut` from the profile
+   entirely: render samples 1260 -> 1031 (**-18%**). Lazy, not eager, because
+   `G_LOADTLUT` need not fill all 256 entries and an eager pass would trap on
+   entries the primitive never samples.
+
+2. **The per-texel TMEM accessors were out-of-line** (`59a9ce7`). `read_byte`
+   runs up to four times per texel and sixteen per bilinear pixel; its body was
+   dominated by panic formatting. Splitting the failure arm into a `#[cold]`
+   helper and inlining the accessors: 8.60 -> 8.16 ms.
+
+3. **Loop-invariant work in four pixel loops** (`7c8cea0`) -- `uses_texel1`
+   rescanning eight combiner sources per pixel, per-pixel `TextureDerivatives`
+   reconstruction, and a `getenv` per covered pixel in the triangle path.
+   **Not measurable on this workload** (7.914 -> 7.865 ms, inside the noise);
+   kept as an unconditionally correct hoist, recorded as unmeasured.
+
+Interleaved A/B, six alternating rounds against `c6d9ecc` to cancel load drift:
+**9.037 -> 7.926 ms, 12.3% faster**, identical digest every round.
+
+### Do not re-try: precomputing the combiner's constant inputs
+
+`evaluate_combiner` converts primitive, environment, k4/k5, key center/scale,
+and prim_lod_fraction to float per pixel, all derived from primitive-constant
+state. This looks like an obvious ~14-divisions-per-pixel win. **It is not.**
+Replacing every one of those with a literal -- an upper bound no real
+implementation can beat -- measured 8.73 ms against the honest 7.93 ms, i.e.
+*slower*. LLVM already hoists them; the measured cost is the combiner's
+data-dependent branching, not its arithmetic. Measure this ceiling before
+building the plumbing, as was done here.
+
+### Equivalence evidence
+
+- 40 route frames dumped via `FN64_RENDER_DUMP_DIR` before and after:
+  **all 40 byte-identical** by SHA-256.
+- Both committed `reference/wm2000-frames/` PNGs reproduce exactly.
+- Framebuffer digest `d0dbebc71bdf5264` unchanged across all three commits.
+- 462/462 render-reference (including the exact-panic-text TMEM test),
+  108/108 render + certification, 704/704 abi + runtime, `grade-all.sh`
+  wrong=0 on all five.
