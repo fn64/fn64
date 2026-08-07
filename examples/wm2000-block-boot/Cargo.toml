@@ -113,6 +113,17 @@ codegen-units = 256
 # is what made earlier release builds run 40+ minutes or get OOM-killed, and
 # they are dispatched through rather than optimized around, so they are not
 # what a profile needs to see into.
+# The ROOT package too. The `debug = false` at `:94-99` above is about the
+# GENERATED SHARD CRATES -- their DWARF is what made earlier release builds run
+# 40+ minutes or get OOM-killed -- and it stays false for them. But the root
+# package inheriting it is why `sample` attributes 99.99% of every profile to
+# `wm2000_block_boot::main`: the dispatch loop lives here, it inlines its whole
+# callee tree, and with no line tables the sampler cannot recover a single
+# inlined frame. This crate is ~4k lines of handwritten code, so its DWARF is
+# nothing like a shard's.
+[profile.release.package.wm2000-block-boot]
+debug = 1
+
 [profile.release.package.fn64-recomp-rs]
 codegen-units = 1
 debug = 1
