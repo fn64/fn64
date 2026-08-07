@@ -540,8 +540,20 @@ pub struct Barrier {
 
 /// What a boundary learned from the barrier.
 pub enum Dirty {
-    /// The barrier was not armed, overflowed, or cannot answer. Scan.
+    /// The barrier overflowed, was refused, or cannot answer. Scan.
+    ///
+    /// This is the only variant that invalidates a previously captured set:
+    /// it means the barrier's picture is incomplete, so nothing derived from
+    /// it can be trusted.
     Unknown,
+    /// The barrier was already disarmed, so there is nothing new to report.
+    ///
+    /// NOT the same as `Unknown`. A set captured by the disarm that already
+    /// happened remains valid -- the region has not been executing guest code
+    /// since -- so the caller must keep it rather than fall back to a scan.
+    /// Conflating the two made the second read within one boundary discard the
+    /// first read's pages, which is how a real mutation got through.
+    AlreadyDisarmed,
     /// Exactly these physical byte ranges may have changed; every byte outside
     /// them is provably identical to what it was when the barrier armed.
     Pages(Vec<(u32, u32)>),
@@ -634,8 +646,16 @@ impl Barrier {
     /// disjoint, covering every page that took a fault since [`Self::arm`].
     /// [`Dirty::Unknown`] means the caller must scan.
     pub fn take_dirty(&self) -> Dirty {
-        if !self.usable() || !STATE.armed.load(Ordering::SeqCst) {
+        if !self.usable() {
             return Dirty::Unknown;
+        }
+        if !STATE.armed.load(Ordering::SeqCst) {
+            // Already disarmed. Distinct from `Unknown`: there is nothing NEW
+            // to report, but the set captured by the disarm that already
+            // happened is still valid and must not be discarded. Collapsing
+            // this into `Unknown` is what made the second read of a boundary
+            // wipe the first read's pages.
+            return Dirty::AlreadyDisarmed;
         }
         STATE.armed.store(false, Ordering::SeqCst);
         // Unprotect first. Between here and the next `arm` the region is
@@ -785,6 +805,8 @@ pub mod guard {
                         None => *pending = Some(pages),
                     }
                 }),
+                // Nothing new; keep whatever an earlier disarm captured.
+                Dirty::AlreadyDisarmed => {}
                 // Unknown poisons the pending set: the boundary must scan.
                 Dirty::Unknown => PENDING.with(|pending| *pending.borrow_mut() = None),
             }
@@ -800,23 +822,63 @@ pub mod guard {
         PENDING.with(|pending| *pending.borrow_mut() = None);
     }
 
-    /// The dirty spans for this boundary, or `None` meaning "scan everything".
+    /// The dirty spans as of NOW, or `None` meaning "scan everything".
     ///
-    /// NOT consuming. One boundary can ask more than once -- the reconcile
-    /// asks, then the host-transaction commit asks again, and a `debug_assert`
-    /// in `invalidate_pending_physical_writes_inner` re-derives the list a
-    /// third time to check the reuse. Every one of those must get the SAME
-    /// answer, because they are all asking about the same instant: the region
-    /// is not executing guest code between them, so no new page can have been
-    /// written.
+    /// # This closes the recording window itself, and that is not optional
     ///
-    /// The set is cleared by [`arm_after_proven_clean`] and by
-    /// [`invalidate`], which are the two events that make it stale.
+    /// The faults live in the handler's array until a `take_dirty` moves them
+    /// here. An earlier version left that to the boundary's entry point and
+    /// let this be a pure read of what had already been captured -- and that
+    /// silently broke the guard.
+    ///
+    /// `reconcile_matched_before_dispatch` (`live_program.rs:2159`, `:2194`)
+    /// and `flush_host_abi_transaction` (`execution.rs:714`) reach the
+    /// comparison WITHOUT passing through
+    /// `invalidate_pending_physical_writes_inner`, so nothing had captured for
+    /// them. They read an empty leftover set and concluded "no page was
+    /// written, therefore nothing changed" while the handler was holding the
+    /// pages that said otherwise. On WM2000's deep route that surfaced as
+    ///
+    /// ```text
+    /// unjournaled executable mutation changed physical RDRAM
+    /// [0x00086090, 0x00086094) before canonical static dispatch
+    /// ```
+    ///
+    /// -- a real mutation the full scan catches and the barrier missed. It is
+    /// exactly the failure the barrier must never have.
+    ///
+    /// Capturing here instead makes the invariant structural rather than a
+    /// convention every call site has to remember: THE DIRTY SET IS READ AND
+    /// CLOSED IN ONE OPERATION, so a caller cannot obtain a set that predates
+    /// its own question. New comparison sites inherit it for free.
+    ///
+    /// Idempotent within a boundary. The second and third asks -- the commit
+    /// after the reconcile, and the `debug_assert` that re-derives the list to
+    /// check the reuse -- take an already-disarmed barrier, whose `take_dirty`
+    /// returns `Unknown` without clearing, so `PENDING` still holds the union
+    /// captured by the first ask. All of them see the same answer, which is
+    /// correct because no guest code runs between them.
     pub fn dirty_spans() -> Option<Vec<(u32, u32)>> {
         if !active() {
             return None;
         }
-        PENDING.with(|pending| pending.borrow().clone())
+        disarm_and_capture();
+        // CONSUMING. The set describes one window: the interval between the
+        // `arm` that opened it and the disarm just performed. Once a boundary
+        // reads it, the only thing that may produce another is a fresh `arm`.
+        //
+        // This is what makes a missed arm cost a scan instead of corrupting
+        // the guard. If a boundary path returns without arming, the next
+        // boundary finds `None` here and scans -- rather than finding a set
+        // that describes an OLDER window and treating every page outside it as
+        // proven-unchanged, which is exactly how a real mutation got through
+        // on WM2000's deep route.
+        //
+        // Within one boundary the repeated asks still agree, because
+        // `arm_after_proven_clean` has not run between them: the second ask
+        // gets `None` and scans, which is correct but slower. The reconcile
+        // arms immediately on its match path, so the common case reads once.
+        PENDING.with(|pending| pending.borrow_mut().take())
     }
 
     /// Re-protect the region.
@@ -826,6 +888,21 @@ pub mod guard {
     /// proved it. Arming when that is false would let the next boundary
     /// conclude "no faults, therefore unchanged" about a region that was
     /// already different.
+    ///
+    /// # Why forgetting to call this is safe, and forgetting to disarm is not
+    ///
+    /// This asymmetry is deliberate and it is what makes the integration
+    /// tractable. There are many boundary paths and no reliable way to
+    /// enumerate them all by inspection; a design in which missing one is
+    /// unsound would be a design that cannot be verified.
+    ///
+    /// Missing an ARM leaves the barrier down. `dirty_spans` then finds the
+    /// region unprotected, reports `None`, and the boundary runs the full
+    /// scan. Cost: one scan. Correctness: unchanged.
+    ///
+    /// Missing a DISARM would be unsound -- the boundary would read a stale
+    /// set. Which is why no caller is trusted to disarm: `dirty_spans` does it
+    /// itself, in the same operation as the read, so the two cannot separate.
     pub fn arm_after_proven_clean() {
         BARRIER.with(|slot| {
             let slot = slot.borrow();
@@ -834,7 +911,9 @@ pub mod guard {
             }
         });
         // The freshly armed region is clean by the precondition, so no page is
-        // dirty yet. Any set left over from before is stale.
+        // dirty yet. Any set left over from before is stale and must go: it
+        // describes writes that the baseline has since absorbed, and carrying
+        // it forward would re-report them as changes at the next boundary.
         PENDING.with(|pending| *pending.borrow_mut() = Some(Vec::new()));
     }
 

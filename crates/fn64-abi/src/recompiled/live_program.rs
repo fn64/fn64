@@ -2157,12 +2157,20 @@ impl CanonicalLiveBlockProgramV1 {
         }
         let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
         if state.borrow().reconcile_matched_before_dispatch(&view) {
+            // Just proved the region equals the baseline, which is exactly
+            // `arm`'s precondition -- and re-arming here is not optional. The
+            // comparison DISARMED the barrier to read the dirty set, so
+            // returning without arming leaves it down, and every page written
+            // afterwards accumulates into the next boundary's set instead of
+            // being cleared by a fresh window.
+            self.arm_barrier_over_clean_region();
             return;
         }
         let snapshot = state.borrow().read_snapshot_from_view(&view);
         state
             .borrow_mut()
             .reconcile_snapshot_before_dispatch(snapshot);
+        self.arm_barrier_over_clean_region();
     }
 
     pub(super) fn reconcile_before_dispatch_with(&self, mut read_physical_byte: impl FnMut(u32) -> u8) {
@@ -2192,12 +2200,17 @@ impl CanonicalLiveBlockProgramV1 {
         };
         state.borrow_mut().seal_with(&mut read_physical_byte);
         if state.borrow().reconcile_matched_before_dispatch(view) {
+            self.arm_barrier_over_clean_region();
             return;
         }
         let snapshot = state.borrow().read_snapshot_from_view(view);
+        // Panics on ANY difference, so reaching the next line means the region
+        // equals the baseline -- `arm`'s precondition, established by the
+        // absence of a panic rather than by a comparison of our own.
         state
             .borrow_mut()
             .reconcile_snapshot_before_dispatch(snapshot);
+        self.arm_barrier_over_clean_region();
     }
 
     pub(super) fn begin_host_abi_transaction(
