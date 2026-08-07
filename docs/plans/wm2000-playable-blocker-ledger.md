@@ -1420,3 +1420,65 @@ update order.
 Per-boundary **~55%** · device timing 12.5% · per-instruction ~11% ·
 **guest code 2.86%**. Runtime optimization is not finished, and codegen remains
 irrelevant.
+
+## 2026-08-07: the 66.8 GB is the unfinished half of `a7a50fe`
+
+Two of us independently concluded the thrash came from generation *retirement*
+at `generation/mod.rs:853`, where `intersects_invalidation` evicts on range
+overlap alone without checking byte validity. **A census disproved it:**
+
+```
+total_activations=419861  total_reactivations=0
+  gen 5227338575556428217  activations=106719  retired_others=0
+  gen 16226209253856221389 activations=306042  retired_others=0
+  gen 17518568401266107605 activations=7100    retired_others=0
+```
+
+`retired_others=0` on every one. That loop never fires on this route, and all
+three generations are resident simultaneously. Both readings of the code were
+right about what it says and wrong about what runs.
+
+### The real cause is on the write path
+
+`invalidate_physical_write` (`generation/mod.rs:1313`) tests writes against
+`backing.spans`, and those spans are built from the **invalidation extent**
+(`block_program.rs:242-248`), not the digested image:
+
+```
+invalidation span 241,008 B   <- what retirement tests
+digested image    119,680 B   <- what a7a50fe narrowed
+gap, mutable data 121,328 B   = 50% of the span
+```
+
+So **every ordinary guest write to overlay data retired the overlay's code**,
+and the next fetch re-hashed the entire text. The census attributes it exactly:
+`outside_digested_image` is **100.0%** for two generations and 99.99% for the
+third. Not one of the 419,861 re-hashes was caused by a write to executable
+bytes.
+
+This is the mirror image of `a7a50fe`, which shrank the *digest* to the text
+extent this morning. The *retirement* predicate was never narrowed to match.
+
+### Why the obvious fix is a net regression
+
+Narrowing `invalidate_physical_write` alone gives 334s -> 75s and zero
+activations, with `sim_time`/`gfx_submits`/`audio_submits` byte-identical — but
+takes **2.48x more scheduler steps** for the same guest work, and net route
+progress goes backwards (700k steps reaches read 140 instead of read 600).
+
+`resident_backing_intersects_catalog` (`live_program.rs:2770`) is documented as
+mirroring `invalidate_physical_write` and still uses the wide span. With
+generations no longer retired, `active_generations()` stays populated, so that
+predicate answers "resident" far more often and breaks the block on every
+overlay data write. **The two are a matched pair and must be narrowed
+together.**
+
+### A latent safety hole found on the way
+
+A test that **passes on unmodified code**
+(`a_prefix_generation_leaves_the_larger_one_resident_as_a_tail`) shows overlay 2
+surviving as a 227 KB tail whose image had just been proven not to match live
+memory — answering fetches with no digest taken. The `drain`/`replacement` loop
+clips by invalidation extent and leaves fragments behind, and `resolve_active`
+is a first-match linear scan. Recorded as a correctness finding independent of
+any performance work.
