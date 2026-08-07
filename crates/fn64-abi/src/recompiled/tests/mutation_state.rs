@@ -200,8 +200,8 @@ use super::*;
                         "layout {layout:?} round {round}: the storage-order mirror diverged"
                     );
                     assert_eq!(
-                        fast_range.expected_page_digests, slow_range.expected_page_digests,
-                        "layout {layout:?} round {round}: the page digests diverged"
+                        fast_range.expected_page_tree, slow_range.expected_page_tree,
+                        "layout {layout:?} round {round}: the page tree diverged"
                     );
                 }
                 assert_eq!(
@@ -281,8 +281,8 @@ use super::*;
                         slow_range.expected_storage_order
                     );
                     assert_eq!(
-                        fast_range.expected_page_digests,
-                        slow_range.expected_page_digests
+                        fast_range.expected_page_tree,
+                        slow_range.expected_page_tree
                     );
                 }
                 assert_eq!(fast.expected_sha256, slow.expected_sha256);
@@ -811,24 +811,34 @@ use super::*;
         ));
     }
 
-    /// The v2 root depends only on the watched bytes -- never on the
+    /// The v3 root depends only on the watched bytes -- never on the
     /// incremental history that produced them.
     ///
-    /// This is the load-bearing property of the page-tree migration. The
-    /// incremental root (`digest_expected`, from maintained page digests) is
-    /// read on every commit, while the from-scratch root (`digest_snapshot`,
-    /// which recomputes every page) is what validation recomputes and what any
-    /// independent verifier would compute. If those two could ever disagree,
-    /// the journal would certify a value no verifier could reproduce.
+    /// This is the load-bearing property of the Merkle-root migration. The
+    /// incremental root (`digest_expected`, read off the maintained tree's
+    /// apexes) is read on every commit, while the from-scratch root
+    /// (`digest_snapshot`, which recomputes every leaf and rebuilds every
+    /// level) is what validation recomputes and what any independent verifier
+    /// would compute. If those two could ever disagree, the journal would
+    /// certify a value no verifier could reproduce.
     ///
-    /// The test drives a long-lived state through many commits, each touching
-    /// different pages -- page boundaries, page interiors, spans crossing
-    /// several pages, and rewrites of pages already dirtied -- and after every
+    /// v3 makes this test strictly harder than v2 did. Under v2 an unrefreshed
+    /// leaf was the only way to go stale; under v3 a stale INTERNAL node is a
+    /// second, independent way, and it is invisible to any check that only
+    /// inspects leaves. So the geometry below is deliberately deep -- the large
+    /// range is 22 pages, a 6-level tree with odd widths at three of those
+    /// levels -- and the edits deliberately hit the promoted-odd-node path, the
+    /// short final page, and both sides of several internal nodes.
+    ///
+    /// The test drives a long-lived state through many commits and after every
     /// single one requires:
     ///
     ///   1. the incremental root equals the from-scratch root of the same bytes;
     ///   2. a FRESH state, sealed directly on those bytes with no history at
-    ///      all, produces that same root.
+    ///      all, produces that same root;
+    ///   3. every node of the maintained tree, at every level, equals the node
+    ///      the fresh state computed -- so a stale internal node fails here
+    ///      even in the (astronomically unlikely) event its root still matched.
     ///
     /// (2) is the part that rules out order dependence: the fresh state
     /// computes every page exactly once, in page order, having never seen any
@@ -839,11 +849,16 @@ use super::*;
     fn page_tree_root_is_independent_of_incremental_history() {
         PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
         // Two ranges, deliberately awkward: the first is far smaller than one
-        // page, the second spans several pages and does NOT end on a page
+        // page, the second spans many pages and does NOT end on a page
         // boundary, so the short final page is exercised. This mirrors WM2000's
         // shape (a 16-byte range and a ~1.44 MiB range) at test scale.
+        //
+        // 21 full pages plus a 777-byte tail is 22 leaves. Its levels are
+        // 22, 11, 6, 3, 2, 1 -- ODD at three of them, so the single-child
+        // promotion path is exercised at more than one height, which a
+        // power-of-two leaf count would never reach.
         const PAGE: u32 = CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u32;
-        let ranges = [(0x1000u32, 0x1010u32), (0x2000, 0x2000 + PAGE * 3 + 777)];
+        let ranges = [(0x1000u32, 0x1010u32), (0x2000, 0x2000 + PAGE * 21 + 777)];
         let total = |(start, end): (u32, u32)| (end - start) as usize;
 
         let mut image0 = vec![0u8; total(ranges[0])];
@@ -866,37 +881,130 @@ use super::*;
             state.seal_with(|physical| read(&a, &b, physical));
         }
 
+        // The SECOND commit path, driven over the same geometry and the same
+        // edits.
+        //
+        // `commit_snapshot` (above) reaches the tree through `set_expected` ->
+        // `refresh_page_digests`, which finds its dirty leaves by comparing
+        // every page against the old baseline. `adopt_from_view` -- the path
+        // the running emulator actually takes on every dispatch boundary --
+        // reaches it through `apply_changed_from_view` ->
+        // `refresh_page_digests_over`, which derives its dirty leaves from the
+        // changed-range list instead. Those are two independent dirty
+        // derivations feeding one tree, and a determinism test that exercises
+        // only one of them leaves the hot path uncovered. (Measured: skipping
+        // every third dirty leaf in `refresh_page_digests_over` did not move
+        // this test until this state was added.)
+        //
+        // Backed by real RDRAM storage, because that path reads through an
+        // `RdramView` rather than a byte closure.
+        let storage_len = (ranges[1].1 as usize).next_multiple_of(4);
+        let mut storage = vec![0u8; storage_len];
+        let write_storage = |storage: &mut [u8], image0: &[u8], image1: &[u8]| {
+            for &(start, end) in &ranges {
+                for physical in start..end {
+                    storage[(physical ^ 3) as usize] = read(image0, image1, physical);
+                }
+            }
+        };
+        write_storage(&mut storage, &image0, &image1);
+        let mut live = CanonicalExecutableMutationStateV1::new(&ranges);
+        {
+            let view = fn64_runtime::RdramView::from_storage(&storage);
+            live.seal_with(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        }
+
+        // The large range must really be the deep, odd-width tree the doc
+        // comment claims. If the geometry ever silently flattens, the odd-node
+        // promotion and the multi-level ancestor walk stop being covered, and
+        // this test would keep passing while testing much less.
+        let widths: Vec<usize> = state.watched[1]
+            .expected_page_tree
+            .levels
+            .iter()
+            .map(Vec::len)
+            .collect();
+        assert_eq!(
+            widths,
+            vec![22, 11, 6, 3, 2, 1],
+            "the determinism fixture must keep a deep tree with odd levels"
+        );
+        assert_eq!(
+            state.watched[0].expected_page_tree.levels.len(),
+            1,
+            "the sub-page range must be a single-leaf tree, its own edge case"
+        );
+
         // A fresh state sealed on the same bytes must already agree at seal.
-        let fresh_root = |image0: &[u8], image1: &[u8]| -> [u8; 32] {
+        let fresh = |image0: &[u8], image1: &[u8]| -> CanonicalExecutableMutationStateV1 {
             let mut fresh = CanonicalExecutableMutationStateV1::new(&ranges);
             fresh.seal_with(|physical| read(image0, image1, physical));
             fresh
+        };
+        let fresh_root = |image0: &[u8], image1: &[u8]| -> [u8; 32] {
+            fresh(image0, image1)
                 .expected_sha256
                 .expect("a sealed state always has an expected digest")
+        };
+        // Requirement 3: every node of the maintained tree, at every level,
+        // equals what a from-scratch build produces. A stale INTERNAL node is
+        // a failure mode v2 did not have, and it is invisible to any check
+        // that inspects only leaves or only the root.
+        let assert_trees_match = |state: &CanonicalExecutableMutationStateV1,
+                                  image0: &[u8],
+                                  image1: &[u8],
+                                  what: &str| {
+            let reference = fresh(image0, image1);
+            for (index, (live, want)) in state.watched.iter().zip(&reference.watched).enumerate() {
+                assert_eq!(
+                    live.expected_page_tree, want.expected_page_tree,
+                    "{what}: range {index}'s maintained Merkle tree diverged from a \
+                     from-scratch build of the same bytes"
+                );
+            }
         };
         assert_eq!(
             state.expected_sha256.expect("sealed"),
             fresh_root(&image0, &image1),
             "a freshly sealed state must agree with the incremental one at seal time"
         );
+        assert_trees_match(&state, &image0, &image1, "at seal");
 
         // Every write shape that could expose a page-boundary bug: the first
         // byte of a page, the last byte of a page, a span straddling a page
         // boundary, a span covering a whole page, a write inside the short
         // final page, and a rewrite of an already-dirtied page.
         let edits: &[(u32, u32)] = &[
-            (0x2000, 1),                    // first byte of page 0
-            (0x2000 + PAGE - 1, 1),         // last byte of page 0
-            (0x2000 + PAGE, 1),             // first byte of page 1
-            (0x2000 + PAGE - 2, 4),         // straddles the page 0/1 boundary
-            (0x2000 + PAGE * 2, PAGE),      // exactly all of page 2
-            (0x2000 + PAGE * 3, 1),         // first byte of the short final page
-            (0x2000 + PAGE * 3 + 776, 1),   // last byte of the whole range
-            (0x2000 + PAGE - 1, 2),         // re-dirty pages 0 and 1
-            (0x2000 + 5, 3),                // page 0 interior, third time
+            (0x2000, 1),                    // first byte of leaf 0
+            (0x2000 + PAGE - 1, 1),         // last byte of leaf 0
+            (0x2000 + PAGE, 1),             // first byte of leaf 1
+            (0x2000 + PAGE - 2, 4),         // straddles the leaf 0/1 boundary
+            (0x2000 + PAGE * 2, PAGE),      // exactly all of leaf 2
+            (0x2000 + PAGE * 21, 1),        // first byte of the short final leaf
+            (0x2000 + PAGE * 21 + 776, 1),  // last byte of the whole range
+            (0x2000 + PAGE - 1, 2),         // re-dirty leaves 0 and 1
+            (0x2000 + 5, 3),                // leaf 0 interior, third time
             (0x1000, 16),                   // the entire sub-page first range
             (0x1008, 4),                    // interior of the first range
-            (0x2000 + PAGE * 2 + 100, 900), // interior of page 2, again
+            (0x2000 + PAGE * 2 + 100, 900), // interior of leaf 2, again
+            // Leaf 20 is the LAST child of the last full pair; leaf 21 is the
+            // promoted odd node at height 1. Touch each alone, so a bug that
+            // only mishandles the promotion shows up isolated.
+            (0x2000 + PAGE * 20, 1),
+            (0x2000 + PAGE * 21 + 1, 1),
+            // Level 2 has width 6 and level 3 width 3 -- odd. Leaf 8 is under
+            // node 4 at height 1, node 2 at height 2, node 1 at height 3.
+            (0x2000 + PAGE * 8 + 17, 1),
+            // A span crossing four leaves at once, so several ancestors are
+            // dirty simultaneously and the parent-index dedupe is exercised.
+            (0x2000 + PAGE * 12 - 3, PAGE * 3 + 6),
+            // Two far-apart single-byte edits in one commit would need two
+            // separate declarations; instead alternate them across commits so
+            // disjoint subtrees are dirtied in successive rounds.
+            (0x2000 + PAGE * 3 + 1, 1),
+            (0x2000 + PAGE * 19 + 4095, 1), // last byte of leaf 19
+            (0x2000 + PAGE * 10, PAGE * 2), // exactly leaves 10 and 11
+            (0x2000 + PAGE * 21 + 776, 1),  // the range's final byte, again
         ];
 
         let mut nonce = 0u8;
@@ -945,6 +1053,30 @@ use super::*;
                  that has committed {} times",
                 round + 1
             );
+            assert_trees_match(&state, &image0, &image1, &format!("round {round}"));
+
+            // The same edit through the OTHER commit path. `adopt_from_view`
+            // derives its dirty leaves from the changed-range list rather than
+            // from a page-by-page comparison, so it is a genuinely different
+            // way to reach the same tree -- and it is the one the emulator
+            // runs. It must land on the identical root, and on the identical
+            // tree node for node.
+            write_storage(&mut storage, &image0, &image1);
+            {
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let changed = live
+                    .changed_ranges_from_view(&view)
+                    .expect("every watched byte is mapped");
+                live.adopt_from_view(&view, changed);
+            }
+            assert_eq!(
+                live.expected_sha256
+                    .expect("a sealed state always has an expected digest"),
+                incremental,
+                "round {round}: the view-driven commit path must reach the same root as \
+                 the snapshot-driven one"
+            );
+            assert_trees_match(&live, &image0, &image1, &format!("round {round} (from view)"));
         }
 
         // The journal chained across every commit, so the history really was
@@ -987,15 +1119,18 @@ use super::*;
             fresh_root(&original0, &original1),
             "restoring the original bytes must restore the original root"
         );
+        assert_trees_match(&state, &original0, &original1, "after restore");
     }
 
-    /// A v1 digest and a v2 digest of the same memory must not be confusable.
+    /// v1, v2 and v3 digests of the SAME memory must all be distinct.
     ///
-    /// Requirement 1 of the migration: the new digest is versioned, not
-    /// silently changed. This pins the v1 construction as a literal here --
-    /// nothing else in the tree still computes it -- and requires v2 to differ.
+    /// Requirement 1 of both migrations: the digest is versioned, not silently
+    /// changed. This pins the v1 and v2 constructions here -- the library no
+    /// longer computes either on any live path -- and requires the v3 root to
+    /// differ from both. Three mutually distinct values means no recorded
+    /// digest from any era can be mistaken for a current one.
     #[test]
-    fn the_v2_page_tree_root_differs_from_the_v1_flat_digest() {
+    fn the_v3_merkle_root_differs_from_both_the_v1_flat_and_v2_page_digests() {
         let ranges = [(0x100u32, 0x180u32)];
         let mut image = vec![0u8; 0x80];
         for (index, byte) in image.iter_mut().enumerate() {
@@ -1004,7 +1139,7 @@ use super::*;
         let mut state = CanonicalExecutableMutationStateV1::new(&ranges);
         state.seal_with(|physical| image[(physical - 0x100) as usize]);
 
-        // The v1 construction, verbatim from before the migration.
+        // The v1 construction, verbatim from before the first migration.
         let v1: [u8; 32] = {
             let mut digest = sha2::Sha256::new();
             digest.update(ranges[0].0.to_be_bytes());
@@ -1012,15 +1147,328 @@ use super::*;
             digest.update(&image);
             digest.finalize().into()
         };
-        let v2 = state.expected_sha256.expect("sealed");
+        // The v2 construction, verbatim from before this migration: one leaf
+        // per page under the v2 schema, absorbed flat into a v2 root.
+        let v2: [u8; 32] = {
+            let leaves = vec![watched_page_digest_v2(ranges[0].0, ranges[0].1, 0, &image)];
+            watched_root_digest_v2(
+                std::iter::once((ranges[0].0, ranges[0].1, leaves.as_slice())),
+            )
+        };
+        let v3 = state.expected_sha256.expect("sealed");
+
+        assert_ne!(v1, v2, "v1 and v2 must remain distinguishable");
         assert_ne!(
-            v1, v2,
-            "the versioned v2 root must not coincide with the v1 flat digest"
+            v1, v3,
+            "the versioned v3 root must not coincide with the v1 flat digest"
+        );
+        assert_ne!(
+            v2, v3,
+            "the versioned v3 root must not coincide with the v2 flat-root digest"
         );
 
-        // And the v2 root must bind the schema: a root computed with the same
-        // page digests but a different domain separator differs.
-        assert_eq!(v2, state.digest_snapshot(&[image.clone()]));
+        // The incremental root is the from-scratch root of the same bytes.
+        assert_eq!(v3, state.digest_snapshot(&[image.clone()]));
+    }
+
+    /// Every field the v3 tree claims to bind must actually change the digest.
+    ///
+    /// The determinism test cannot catch a MISSING binding: it compares the
+    /// incremental root against the from-scratch root, and both call the same
+    /// function, so they agree whether or not that function binds enough. (This
+    /// was measured -- deleting `height` from the node message, or `page_count`
+    /// from the range root, leaves the determinism test green.) So each bound
+    /// field is checked here by exhibiting two structures that differ only in
+    /// that field and requiring different digests.
+    #[test]
+    fn the_v3_tree_binds_its_structure() {
+        let left = [0x11u8; 32];
+        let right = [0x22u8; 32];
+
+        // A node binds its height, so two levels cannot be interchanged.
+        let h1 = watched_node_digest_v3(0x1000, 0x9000, 1, 0, &left, Some(&right));
+        let h2 = watched_node_digest_v3(0x1000, 0x9000, 2, 0, &left, Some(&right));
+        assert_ne!(h1, h2, "an internal node must bind its height");
+
+        // ...its index within the level, so siblings cannot be swapped.
+        let i1 = watched_node_digest_v3(0x1000, 0x9000, 1, 1, &left, Some(&right));
+        assert_ne!(h1, i1, "an internal node must bind its index");
+
+        // ...its range, so a subtree cannot be replayed under another range.
+        let other = watched_node_digest_v3(0x2000, 0x9000, 1, 0, &left, Some(&right));
+        assert_ne!(h1, other, "an internal node must bind its range start");
+        let other_end = watched_node_digest_v3(0x1000, 0x8000, 1, 0, &left, Some(&right));
+        assert_ne!(h1, other_end, "an internal node must bind its range end");
+
+        // ...and its child order.
+        let swapped = watched_node_digest_v3(0x1000, 0x9000, 1, 0, &right, Some(&left));
+        assert_ne!(h1, swapped, "an internal node must bind child order");
+
+        // The promoted single child is a DIFFERENT message from a pair that
+        // repeats it. This is the classic Merkle duplication malleability: with
+        // `H(x||x)` a tree whose second half repeats its first can be confused
+        // with a smaller tree. Distinct arity tags make that unrepresentable.
+        let promoted = watched_node_digest_v3(0x1000, 0x9000, 1, 0, &left, None);
+        let doubled = watched_node_digest_v3(0x1000, 0x9000, 1, 0, &left, Some(&left));
+        assert_ne!(
+            promoted, doubled,
+            "a promoted odd child must not hash as a pair of itself"
+        );
+
+        // A leaf and an internal node with the same 32 bytes under them must
+        // not collide: the tags differ, so no leaf can be read as a node.
+        let leaf = watched_page_digest_v3(0x1000, 0x9000, 0, &left);
+        assert_ne!(leaf, promoted, "leaf and node messages must be tagged apart");
+        assert_ne!(leaf, h1);
+
+        // The range root binds the page count, so a tree cannot be
+        // reinterpreted with a different number of leaves...
+        let r4 = watched_range_root_digest_v3(0x1000, 0x9000, 4, Some(&left));
+        let r5 = watched_range_root_digest_v3(0x1000, 0x9000, 5, Some(&left));
+        assert_ne!(r4, r5, "the range root must bind the page count");
+
+        // ...its bounds...
+        let r_other = watched_range_root_digest_v3(0x2000, 0x9000, 4, Some(&left));
+        assert_ne!(r4, r_other, "the range root must bind its bounds");
+
+        // ...and the presence of an apex, so an empty range is not confusable
+        // with a range whose apex happens to be some value.
+        let empty = watched_range_root_digest_v3(0x1000, 0x9000, 0, None);
+        assert_ne!(r4, empty);
+        assert_ne!(
+            empty,
+            watched_range_root_digest_v3(0x1000, 0x9000, 0, Some(&left)),
+            "an empty range must not hash like one carrying an apex"
+        );
+
+        // The range root is itself tagged apart from the node it wraps.
+        assert_ne!(r4, h1);
+        assert_ne!(r4, promoted);
+
+        // The top root binds the range count and the range order.
+        let one = watched_root_digest_v3([&left].into_iter());
+        let two = watched_root_digest_v3([&left, &right].into_iter());
+        assert_ne!(one, two, "the top root must bind the range count");
+        let reordered = watched_root_digest_v3([&right, &left].into_iter());
+        assert_ne!(two, reordered, "the top root must bind range order");
+
+        let _ = (r5, r_other, i1, other, other_end, swapped, leaf, promoted, h1, r4);
+    }
+
+    /// The exact hashed message of every v3 level, pinned field by field.
+    ///
+    /// `assert_ne!` between two computed values cannot detect a WEAKENING: drop
+    /// the range count from the top root and every `assert_ne!` about it still
+    /// passes, because both sides lost the same field. Measured -- the
+    /// structure test above stayed green through exactly that deletion.
+    ///
+    /// The only assertion that catches a dropped or reordered field is equality
+    /// against an INDEPENDENTLY constructed message. These four references are
+    /// written out longhand, in the order the spec claims, so deleting any
+    /// `hasher.update` in `receipts.rs` -- or reordering two of them, or
+    /// changing a tag byte, or changing the schema string -- fails here.
+    ///
+    /// They are not hardcoded digest literals: they are the construction
+    /// restated, so they stay meaningful if SHA-256's output ever needs
+    /// recomputing, and they cannot be "fixed" by pasting a new constant.
+    #[test]
+    fn the_v3_messages_are_exactly_what_the_schema_says() {
+        const SCHEMA: &str = CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3;
+        const PAGE: u64 = CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u64;
+        const FANOUT: u64 = CANONICAL_WATCHED_BYTES_FANOUT_V3 as u64;
+        let (left, right) = ([0x11u8; 32], [0x22u8; 32]);
+        let bytes: Vec<u8> = (0..200u32).map(|index| (index * 7 + 1) as u8).collect();
+        let digest = |parts: &[&[u8]]| -> [u8; 32] {
+            let mut hasher = sha2::Sha256::new();
+            for part in parts {
+                hasher.update(part);
+            }
+            hasher.finalize().into()
+        };
+
+        // Leaf: schema || 0x00 || page_bytes || start || end || index || len || bytes
+        assert_eq!(
+            watched_page_digest_v3(0x1000, 0x9000, 5, &bytes),
+            digest(&[
+                SCHEMA.as_bytes(),
+                &[0x00],
+                &PAGE.to_be_bytes(),
+                &0x1000u32.to_be_bytes(),
+                &0x9000u32.to_be_bytes(),
+                &5u32.to_be_bytes(),
+                &(bytes.len() as u64).to_be_bytes(),
+                &bytes,
+            ]),
+            "the v3 leaf message changed shape"
+        );
+
+        // Internal pair: schema || 0x02 || fanout || start || end || height || index || l || r
+        assert_eq!(
+            watched_node_digest_v3(0x1000, 0x9000, 3, 7, &left, Some(&right)),
+            digest(&[
+                SCHEMA.as_bytes(),
+                &[0x02],
+                &FANOUT.to_be_bytes(),
+                &0x1000u32.to_be_bytes(),
+                &0x9000u32.to_be_bytes(),
+                &3u32.to_be_bytes(),
+                &7u32.to_be_bytes(),
+                &left,
+                &right,
+            ]),
+            "the v3 internal-pair message changed shape"
+        );
+
+        // Promoted odd child: tag 0x03, and NO right child in the message.
+        assert_eq!(
+            watched_node_digest_v3(0x1000, 0x9000, 3, 7, &left, None),
+            digest(&[
+                SCHEMA.as_bytes(),
+                &[0x03],
+                &FANOUT.to_be_bytes(),
+                &0x1000u32.to_be_bytes(),
+                &0x9000u32.to_be_bytes(),
+                &3u32.to_be_bytes(),
+                &7u32.to_be_bytes(),
+                &left,
+            ]),
+            "the v3 promoted-single-child message changed shape"
+        );
+
+        // Range root: schema || 0x04 || page_bytes || fanout || start || end
+        //             || page_count || 0x01 || apex
+        assert_eq!(
+            watched_range_root_digest_v3(0x1000, 0x9000, 22, Some(&left)),
+            digest(&[
+                SCHEMA.as_bytes(),
+                &[0x04],
+                &PAGE.to_be_bytes(),
+                &FANOUT.to_be_bytes(),
+                &0x1000u32.to_be_bytes(),
+                &0x9000u32.to_be_bytes(),
+                &22u64.to_be_bytes(),
+                &[0x01],
+                &left,
+            ]),
+            "the v3 range-root message changed shape"
+        );
+        // ...and the empty form, which hashes 0x00 and no apex.
+        assert_eq!(
+            watched_range_root_digest_v3(0x1000, 0x9000, 0, None),
+            digest(&[
+                SCHEMA.as_bytes(),
+                &[0x04],
+                &PAGE.to_be_bytes(),
+                &FANOUT.to_be_bytes(),
+                &0x1000u32.to_be_bytes(),
+                &0x9000u32.to_be_bytes(),
+                &0u64.to_be_bytes(),
+                &[0x00],
+            ]),
+            "the v3 empty-range-root message changed shape"
+        );
+
+        // Top root: schema || 0x05 || page_bytes || fanout || range_count || roots
+        assert_eq!(
+            watched_root_digest_v3([&left, &right].into_iter()),
+            digest(&[
+                SCHEMA.as_bytes(),
+                &[0x05],
+                &PAGE.to_be_bytes(),
+                &FANOUT.to_be_bytes(),
+                &2u64.to_be_bytes(),
+                &left,
+                &right,
+            ]),
+            "the v3 top-root message changed shape"
+        );
+
+        // The five tag bytes are distinct, which is what keeps one level's
+        // message from ever being another's.
+        let tags = [0x00u8, 0x02, 0x03, 0x04, 0x05];
+        let mut seen = tags.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), tags.len(), "v3 level tags must be distinct");
+    }
+
+    /// A v3 message must never be a v2 message, at every level of the tree.
+    ///
+    /// The version test above compares whole roots, which differ for many
+    /// reasons at once; if the v3 leaf silently adopted the v2 schema string,
+    /// the roots would STILL differ (the root levels differ independently) and
+    /// that test would stay green -- measured. This pins the separation at the
+    /// leaf, where the two versions' messages are otherwise byte-identical in
+    /// shape.
+    #[test]
+    fn v3_leaves_are_not_v2_leaves() {
+        let bytes = vec![0x5au8; 128];
+        assert_ne!(
+            watched_page_digest_v3(0x1000, 0x2000, 3, &bytes),
+            watched_page_digest_v2(0x1000, 0x2000, 3, &bytes),
+            "a v3 leaf and a v2 leaf over the same page must be different values"
+        );
+        // The schema strings are what separates them, so pin that they differ
+        // and that neither is a prefix of the other (a prefix would leave the
+        // separation resting entirely on the fields that follow).
+        assert_ne!(
+            CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V2,
+            CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3
+        );
+        assert_eq!(
+            CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V2.len(),
+            CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3.len(),
+            "equal-length schema strings keep the separation in the tag bytes \
+             themselves rather than in a length shift"
+        );
+    }
+
+    /// Regrouping the same pages across ranges must not reach the same root.
+    ///
+    /// The strongest form of the structural claim: identical page CONTENTS,
+    /// repartitioned, must give a different root. `checkpoint-digest-cost.md`
+    /// records this as the reason splitting a watched range is a certification
+    /// change and not bookkeeping -- so it is worth pinning rather than
+    /// restating.
+    ///
+    /// Driven at the hash level rather than through `CanonicalExecutableMutation
+    /// StateV1`, because that constructor rejects adjacent ranges outright
+    /// (`[0x4000,0x5000) + [0x5000,0x6000)` panics as non-canonical: the
+    /// canonical form coalesces them). The rejection is a second, independent
+    /// barrier to the same confusion; this test covers the hash layer beneath
+    /// it, which is what a third-party verifier would recompute.
+    #[test]
+    fn regrouping_pages_between_ranges_changes_the_root() {
+        const PAGE: u32 = CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u32;
+        let mut image = vec![0u8; (PAGE * 2) as usize];
+        for (index, byte) in image.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(29).wrapping_add(3);
+        }
+        let (lo, mid, hi) = (0x4000u32, 0x4000 + PAGE, 0x4000 + PAGE * 2);
+
+        // One range of two pages: two leaves under one apex.
+        let joined = {
+            let leaves = [
+                watched_page_digest_v3(lo, hi, 0, &image[..PAGE as usize]),
+                watched_page_digest_v3(lo, hi, 1, &image[PAGE as usize..]),
+            ];
+            let apex = watched_node_digest_v3(lo, hi, 1, 0, &leaves[0], Some(&leaves[1]));
+            let range = watched_range_root_digest_v3(lo, hi, 2, Some(&apex));
+            watched_root_digest_v3(std::iter::once(&range))
+        };
+        // Two ranges of one page each: the identical bytes, regrouped.
+        let split = {
+            let first = watched_page_digest_v3(lo, mid, 0, &image[..PAGE as usize]);
+            let second = watched_page_digest_v3(mid, hi, 0, &image[PAGE as usize..]);
+            let a = watched_range_root_digest_v3(lo, mid, 1, Some(&first));
+            let b = watched_range_root_digest_v3(mid, hi, 1, Some(&second));
+            watched_root_digest_v3([&a, &b].into_iter())
+        };
+
+        assert_ne!(
+            joined, split,
+            "the same bytes partitioned differently must not reach the same root"
+        );
     }
 
     /// Bytes alone decide the root: two different watched ranges holding
