@@ -433,6 +433,25 @@ impl Framebuffer {
         let origin_y = rect.uly.floor();
         let ds = rect.dsdx as f32 / 1024.0;
         let dt = rect.dtdy as f32 / 1024.0;
+        // Loop-invariant sampler inputs. The derivatives come from the
+        // rectangle's constant dsdx/dtdy, and whether the combiner reads
+        // TEXEL1 is a property of the primitive's combiner mode -- but
+        // `uses_texel1` scans up to eight combiner sources, and it was being
+        // rescanned for every pixel.
+        let derivatives = if rect.flip {
+            TextureDerivatives {
+                dtdx: dt,
+                dsdy: ds,
+                ..TextureDerivatives::default()
+            }
+        } else {
+            TextureDerivatives {
+                dsdx: ds,
+                dtdy: dt,
+                ..TextureDerivatives::default()
+            }
+        };
+        let require_texel1 = rect.combiner.mode.uses_texel1(cycle_type);
         for y in min_y..=max_y {
             if !scissor.line_enabled(y) {
                 continue;
@@ -445,19 +464,6 @@ impl Framebuffer {
                 } else {
                     (rect.s + dx * ds, rect.t + dy * dt)
                 };
-                let derivatives = if rect.flip {
-                    TextureDerivatives {
-                        dtdx: dt,
-                        dsdy: ds,
-                        ..TextureDerivatives::default()
-                    }
-                } else {
-                    TextureDerivatives {
-                        dsdx: ds,
-                        dtdy: dt,
-                        ..TextureDerivatives::default()
-                    }
-                };
                 let (texel0, texel1, lod_fraction) = texture0.sample_rdp_pair(
                     rect.texture1.as_ref(),
                     TextureSampleRequest {
@@ -467,7 +473,7 @@ impl Framebuffer {
                         other_mode: rect.other_mode,
                         convert: rect.combiner.convert,
                         min_level: rect.combiner.min_lod_level,
-                        require_texel1: rect.combiner.mode.uses_texel1(cycle_type),
+                        require_texel1,
                     },
                 );
                 // Rectangle commands carry no shade attributes. Validation
@@ -784,6 +790,13 @@ impl Framebuffer {
         let max_y = (ceil_ratio(i64::from(yl_eighth - 1), 8) as i32)
             .min(ceil_ratio(i64::from(scissor_lry_eighth - 1), 8) as i32)
             .clamp(0, self.height as i32);
+        // Whether the combiner reads TEXEL1 is fixed by the primitive's
+        // combiner mode, but `uses_texel1` scans up to eight combiner sources
+        // and was being rescanned once per covered pixel.
+        let require_texel1 = triangle
+            .combiner
+            .mode
+            .uses_texel1(triangle.other_mode.cycle_type());
         for y in min_y..max_y {
             if !scissor.line_enabled(y) {
                 continue;
@@ -924,10 +937,7 @@ impl Framebuffer {
                                     other_mode: triangle.other_mode,
                                     convert: triangle.combiner.convert,
                                     min_level: triangle.combiner.min_lod_level,
-                                    require_texel1: triangle
-                                        .combiner
-                                        .mode
-                                        .uses_texel1(triangle.other_mode.cycle_type()),
+                                    require_texel1,
                                 },
                             )
                     } else {
@@ -1119,6 +1129,14 @@ impl Framebuffer {
             return;
         }
 
+        // Primitive-constant sampler inputs, hoisted out of the pixel loop.
+        // `uses_texel1` scans up to eight combiner sources, and the diagnostic
+        // env lookup was a `getenv` per covered pixel.
+        let require_texel1 = tri.combiner.mode.uses_texel1(tri.other_mode.cycle_type());
+        #[cfg(not(test))]
+        let affine_texture = std::env::var_os("FN64_DIAG_AFFINE_TEXTURE").is_some();
+        #[cfg(test)]
+        let affine_texture = false;
         for y in min_y..max_y {
             for x in min_x..max_x {
                 let coverage_mask = triangle_pixel_coverage([a, b, c], area, scissor, x, y);
@@ -1148,10 +1166,6 @@ impl Framebuffer {
                 // correction translates the plane without changing its
                 // adjacent-pixel gradient.
                 let (texel0, texel1, lod_fraction) = if let Some(tex) = &tri.texture {
-                    #[cfg(not(test))]
-                    let affine_texture = std::env::var_os("FN64_DIAG_AFFINE_TEXTURE").is_some();
-                    #[cfg(test)]
-                    let affine_texture = false;
                     let coordinates_at = |px: f32, py: f32| {
                         let point = Vertex {
                             x: px,
@@ -1198,10 +1212,7 @@ impl Framebuffer {
                             other_mode: tri.other_mode,
                             convert: tri.combiner.convert,
                             min_level: tri.combiner.min_lod_level,
-                            require_texel1: tri
-                                .combiner
-                                .mode
-                                .uses_texel1(tri.other_mode.cycle_type()),
+                            require_texel1,
                         },
                     )
                 } else {
@@ -1300,6 +1311,12 @@ impl Framebuffer {
             )
         };
 
+        // Fixed by the primitive's combiner mode; `uses_texel1` scans up to
+        // eight combiner sources, so it does not belong in the pixel loop.
+        let require_texel1 = line
+            .combiner
+            .mode
+            .uses_texel1(line.other_mode.cycle_type());
         for y in min_y..max_y {
             for x in min_x..max_x {
                 let coverage_mask = line_pixel_coverage(line, scissor, x, y);
@@ -1340,10 +1357,7 @@ impl Framebuffer {
                             other_mode: line.other_mode,
                             convert: line.combiner.convert,
                             min_level: line.combiner.min_lod_level,
-                            require_texel1: line
-                                .combiner
-                                .mode
-                                .uses_texel1(line.other_mode.cycle_type()),
+                            require_texel1,
                         },
                     )
                 } else {
