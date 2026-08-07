@@ -5,6 +5,14 @@
 //! byte-for-byte-legal zlib stream that just doesn't bother compressing.
 //! This avoids adding an external PNG/deflate crate dependency for what is,
 //! for this seam-proof deliverable, a small one-off image.
+//!
+//! The "one-off" assumption does not hold once frames are COMMITTED as
+//! evidence. A 480x240 dump is a flat 461 KB whatever it depicts, so the
+//! fourteen reference frames arrived at 6.5 MB; re-deflating them losslessly
+//! took the set to 1.6 MB, and a near-uniform fade frame to 1% of its dumped
+//! size. That is a property of this encoder, not of the images. Recompress at
+//! the commit boundary (stdlib `zlib` is enough -- see `1d1b903`) rather than
+//! taking a dependency here, and expect raw dumps to stay large.
 use std::io::Write;
 
 fn adler32(data: &[u8]) -> u32 {
