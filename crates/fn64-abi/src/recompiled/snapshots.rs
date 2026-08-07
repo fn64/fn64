@@ -1087,6 +1087,95 @@ pub mod mprotect_census {
     }
 }
 
+/// TEMPORARY (generation-activation census, 2026-08-07).
+///
+/// Counts physically backed catalog activations per generation, splitting
+/// first-time activations from re-activations of an already-live image. A
+/// re-activation re-reads and re-hashes the generation's whole image through
+/// its backing, so `reactivated * bytes` is the SHA-256 volume the route pays
+/// purely to re-prove images it already proved.
+///
+/// This exists because the WM2000 "entrance hang" profiles as 88%
+/// `activate_for_fetch` / 54% raw SHA-256: the question is whether that is one
+/// expensive activation or millions of cheap-looking repeats.
+///
+/// Enabled by `FN64_ACTIVATION_CENSUS=1`; inert otherwise. It installs itself
+/// through the public `set_backed_generation_activation_observer_v1` seam and
+/// prints from `atexit`, so no harness `main` is edited -- notably not
+/// `examples/wm2000-block-boot/src/main.rs`, whose bytes are hashed into the
+/// canonical program identity.
+pub mod activation_census {
+    /// generation id -> (activations, reactivations, image bytes, retired count)
+    static TOTALS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, [u64; 4]>>> =
+        std::sync::Mutex::new(None);
+
+    pub fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_ACTIVATION_CENSUS").is_some())
+    }
+
+    fn observe(observation: &fn64_recomp_rs::BackedGenerationActivationObservationV1) {
+        let bytes = u64::from(
+            observation
+                .entry
+                .pc
+                .get()
+                .saturating_sub(observation.requested_pc.get()),
+        );
+        let mut guard = TOTALS.lock().expect("activation census poisoned");
+        let totals = guard.get_or_insert_with(std::collections::BTreeMap::new);
+        let slot = totals.entry(observation.generation.get()).or_insert([0; 4]);
+        slot[0] += 1;
+        if !observation.newly_activated {
+            slot[1] += 1;
+        }
+        slot[2] = slot[2].max(bytes);
+        slot[3] += observation.retired.len() as u64;
+    }
+
+    /// Install the observer and arm the at-exit report. Idempotent.
+    pub fn install() {
+        if !enabled() {
+            return;
+        }
+        fn64_recomp_rs::set_backed_generation_activation_observer_v1(Some(observe));
+        extern "C" fn at_exit() {
+            print!("{}", report());
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            unsafe { atexit(at_exit) };
+        });
+    }
+
+    pub fn report() -> String {
+        let guard = TOTALS.lock().expect("activation census poisoned");
+        let Some(totals) = guard.as_ref() else {
+            return String::from("[activation-census] no activations observed\n");
+        };
+        let mut out = String::new();
+        let mut all = 0u64;
+        let mut re = 0u64;
+        for (generation, [activations, reactivations, _, retired]) in totals {
+            all += *activations;
+            re += *reactivations;
+            out.push_str(&format!(
+                "[activation-census] generation={generation} activations={activations} \
+                 reactivations={reactivations} retired_others={retired}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "[activation-census] total_activations={all} total_reactivations={re}\n"
+        ));
+        out
+    }
+}
+
 pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     let (offset, len) = event.range();
     mprotect_census::note_write(offset, len);

@@ -280,6 +280,12 @@ fn resolve_catalog_transfer_with_activation(
             kind: CpuFaultKind::NoActiveGeneration,
             ..
         }) => {
+            // TEMPORARY (generation-activation census, 2026-08-07). The
+            // observer is a thread-local, so it must be installed on the
+            // executor thread that actually activates. `install` is
+            // `Once`-guarded and returns immediately when the census env var
+            // is absent, which is every non-diagnostic run.
+            super::snapshots::activation_census::install();
             live.activate_for_fetch(target_pc, mem)
                 .map_err(|error| format!("generation activation at {target_pc} failed: {error}"))?;
             live.resolve_transfer(source_bank, target_pc)
