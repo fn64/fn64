@@ -1821,3 +1821,31 @@ already being delivered correctly to the queues WM2000 registered. Nothing in
 producing frames", the scanout origin is the portable answer and
 `osViSwapBuffer` is a title-specific implementation detail. OoT happens to use
 it; WM2000 does not.
+
+### First windowed frame-latency measurement (2026-08-07)
+
+With the presenter fixed, a windowed run produces per-frame latency for the
+first time. The acceptance bar is now **guaranteed 60fps** -- a worst-case
+bound, so `max` is the statistic that decides it, not the median.
+
+```
+frame #120  interval_ms[n=60 p50=22.4 p95=65.3 p99=67.2   max=67.2   OVER-16.7ms]
+frame #180  interval_ms[n=60 p50=22.1 p95=67.3 p99=68.9   max=68.9   OVER-16.7ms]
+frame #240  interval_ms[n=60 p50=60.0 p95=83.6 p99=3058.7 max=3058.7 OVER-16.7ms]
+```
+
+Not close: a p50 of 22 ms is already ~45fps, and **every** window breaches.
+The frame #240 row is the point of adding the tail statistics -- a single
+**3,058 ms** frame that p95 (83.6 ms) cannot see at all. One 3-second stall per
+240 frames is invisible to every statistic the heartbeat reported before.
+
+`pump_ms` tracks `interval_ms` closely (p50 20.2 vs 22.4; the 3,045 ms spike
+appears in both), so the cost is guest execution inside the pump, not
+presentation or winit. That points at the known throughput blocker above --
+70.30% of self time in `sha2` re-hashing the 1.14 MiB watched region on every
+checkpoint publication -- rather than at anything in the render path. The
+3-second outlier is unexplained and is its own investigation; a stall three
+orders of magnitude above p50 is not a slow hash.
+
+Measured on the committed presenter fix, release build, scheduled route
+`entrance-to-match`.
