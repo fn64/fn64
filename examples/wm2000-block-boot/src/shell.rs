@@ -272,7 +272,12 @@ struct Shell {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
     reported_first_frame: bool,
-    last_heartbeat_swap: u64,
+    /// Frames this shell has actually blitted to the window. The heartbeat
+    /// counts these rather than `vi_swap_count()`, which is zero for the whole
+    /// run of a game that programs VI_ORIGIN directly instead of calling
+    /// `osViSwapBuffer` -- see `present`.
+    presented_frames: u64,
+    last_heartbeat_frame: u64,
     next_frame_deadline: std::time::Instant,
     frame_intervals: TimingWindow,
     pump_times: TimingWindow,
@@ -380,16 +385,21 @@ impl ScheduleDriver {
                 // investigation ambiguous: `vi_swap_count` counts guest
                 // `osViSwapBuffer` calls, NOT VI retraces, so a zero there
                 // cannot distinguish "no retrace" from "retraces fine, guest
-                // never swapped" -- and those have opposite root causes.
+                // never swapped" -- and those have opposite root causes. And
+                // `scanout` next to it, because WM2000 never calls
+                // `osViSwapBuffer` at all: it flips VI_ORIGIN directly, so
+                // `vi_swaps` stays 0 for a run that is displaying fine.
                 let (graphics_tasks, audio_tasks) = fn64_abi::task_counts();
                 println!(
                     "[wm2000-shell] controller input_edge port={port} read={} buttons={:#06x} \
-                     stick=({}, {}) sim_time={} vi_swaps={} gfx_submits={} audio_submits={}",
+                     stick=({}, {}) sim_time={} scanout={:?} vi_swaps={} gfx_submits={} \
+                     audio_submits={}",
                     self.read_ordinals[port],
                     input.button,
                     input.stick_x,
                     input.stick_y,
                     fn64_abi::sim_time(),
+                    fn64_abi::scanout_vi_framebuffer(),
                     fn64_abi::vi_swap_count(),
                     graphics_tasks,
                     audio_tasks,
@@ -539,7 +549,8 @@ impl Shell {
             window: None,
             pixels: None,
             reported_first_frame: false,
-            last_heartbeat_swap: 0,
+            presented_frames: 0,
+            last_heartbeat_frame: 0,
             next_frame_deadline: std::time::Instant::now(),
             frame_intervals: TimingWindow::default(),
             pump_times: TimingWindow::default(),
@@ -576,7 +587,11 @@ impl Shell {
     /// device-advance budget is exhausted, so the window never stops pumping
     /// events for longer than a frame's worth of work.
     fn pump_one_frame(&mut self) -> RetraceOutcome {
-        let start_swaps = fn64_abi::vi_swap_count();
+        // Scanout origin, not `osViSwapBuffer` count -- see `present`. A game
+        // that programs VI_ORIGIN directly reports `vi_swap_count() == 0`
+        // forever, which would pin the boot step budget on every frame and
+        // report `swapped: false` on every frame that in fact flipped buffers.
+        let start_origin = fn64_abi::scanout_vi_framebuffer();
         let mut drain = fn64_boot_harness::GuestDrain::default();
         let mut steps = 0u64;
         let mut device_advances = 0u32;
@@ -586,9 +601,10 @@ impl Shell {
             match drain.before_step(fn64_abi::next_runnable_priority()) {
                 fn64_boot_harness::DrainDecision::Step => {
                     // Boot gets the generous bound; every later frame gets the
-                    // steady-state one. `vi_swap_count` is the boundary because
-                    // it marks the first field actually reaching the window.
-                    let budget = if fn64_abi::vi_swap_count() == 0 {
+                    // steady-state one. A programmed scanout origin is the
+                    // boundary because it marks the first field the window can
+                    // actually show.
+                    let budget = if fn64_abi::scanout_vi_framebuffer().is_none() {
                         BOOT_STEPS_PER_PUMP
                     } else {
                         STEPS_PER_PUMP
@@ -634,7 +650,7 @@ impl Shell {
             }
         }
         RetraceOutcome {
-            swapped: fn64_abi::vi_swap_count() > start_swaps,
+            swapped: fn64_abi::scanout_vi_framebuffer() != start_origin,
             steps,
         }
     }
@@ -659,7 +675,18 @@ impl Shell {
     /// precisely because presentation happens between pumps -- no guest
     /// coroutine or device operation is mid-flight.
     fn present(&mut self) {
-        let Some(fb_offset) = fn64_abi::current_vi_framebuffer() else {
+        // Read VI_ORIGIN, not `osViSwapBuffer` bookkeeping.
+        //
+        // WM2000 never calls `osViSwapBuffer`; it double-buffers by writing
+        // VI_ORIGIN through raw MMIO (measured: it alternates 0x0038fbc0 and
+        // 0x003c7fc0 every field). Keying the present on
+        // `current_vi_framebuffer()` therefore returned `None` on every frame
+        // of every run, so this function bailed before touching the window --
+        // which is why the window never showed a pixel while the headless
+        // dump lane, which hashes RDRAM directly, produced 2,239 good frames
+        // of the same run. `vi_swaps=0` was never a progress failure; it is
+        // the correct count of a libultra call this game does not make.
+        let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer() else {
             return;
         };
         let fb_offset = fb_offset as usize;
@@ -765,31 +792,35 @@ impl Shell {
             return;
         }
 
+        self.presented_frames += 1;
+        let frames = self.presented_frames;
         let swaps = fn64_abi::vi_swap_count();
         let rgba_hash = framebuffer::rgba_hash(&self.rgba);
         if !self.reported_first_frame {
             if blank {
                 println!(
-                    "[wm2000-shell] presenting VI framebuffer (swap #{swaps}) -- currently \
-                     BLANK/uniform (the game has not rendered visible geometry yet). Window + \
-                     present path are live."
+                    "[wm2000-shell] presenting VI framebuffer origin={fb_offset:#010x} \
+                     (osViSwapBuffer calls so far: {swaps}) -- currently BLANK/uniform (the game \
+                     has not rendered visible geometry yet). Window + present path are live."
                 );
             } else {
                 println!(
-                    "[wm2000-shell] presenting VI framebuffer (swap #{swaps}) -- non-uniform, \
+                    "[wm2000-shell] presenting VI framebuffer origin={fb_offset:#010x} \
+                     (osViSwapBuffer calls so far: {swaps}) -- non-uniform, \
                      rgba_hash={rgba_hash:016x} (a comparison key, not a correctness claim); \
                      vi_width={src_stride}"
                 );
             }
             self.reported_first_frame = true;
-        } else if swaps >= self.last_heartbeat_swap + 60 {
+        } else if frames >= self.last_heartbeat_frame + 60 {
             let state = if blank { "uniform" } else { "non-uniform" };
             let audio = fn64_abi::audio_output_stats();
             let interval = self.frame_intervals.take_stats();
             let pump = self.pump_times.take_stats();
             println!(
-                "[wm2000-shell] heartbeat: VI swap #{swaps} ({state}, rgba_hash={rgba_hash:016x}; \
-                 visual correctness not inferred); timing_ms median/p95: interval={:?} pump={:?}; \
+                "[wm2000-shell] heartbeat: presented frame #{frames} origin={fb_offset:#010x} \
+                 ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
+                 osViSwapBuffer calls={swaps}; timing_ms median/p95: interval={:?} pump={:?}; \
                  audio: ai_buffers={} samples={} nonzero={} backend_buffers={}",
                 interval.as_ref().map(|s| (s.median_ms, s.p95_ms)),
                 pump.as_ref().map(|s| (s.median_ms, s.p95_ms)),
@@ -798,7 +829,7 @@ impl Shell {
                 audio.nonzero_samples,
                 audio.backend_buffers,
             );
-            self.last_heartbeat_swap = swaps;
+            self.last_heartbeat_frame = frames;
         }
     }
 }
@@ -973,21 +1004,24 @@ fn main() {
             let outcome = shell.pump_one_frame();
             println!(
                 "[wm2000-shell] probe frame {frame}: swapped={} steps={} wall_ms={:.1} \
-                 vi_swaps={} sim_time={} fb={:?}",
+                 vi_swaps={} sim_time={} scanout={:?} swap_fb={:?}",
                 outcome.swapped,
                 outcome.steps,
                 started.elapsed().as_secs_f64() * 1000.0,
                 fn64_abi::vi_swap_count(),
                 fn64_abi::sim_time(),
+                fn64_abi::scanout_vi_framebuffer(),
                 fn64_abi::current_vi_framebuffer(),
             );
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
         }
         println!(
-            "[wm2000-shell] headless probe done: vi_swaps={} sim_time={} fb={:?} vi_width={:?}",
+            "[wm2000-shell] headless probe done: vi_swaps={} sim_time={} scanout={:?} \
+             swap_fb={:?} vi_width={:?}",
             fn64_abi::vi_swap_count(),
             fn64_abi::sim_time(),
+            fn64_abi::scanout_vi_framebuffer(),
             fn64_abi::current_vi_framebuffer(),
             fn64_abi::vi_width(),
         );

@@ -1732,3 +1732,92 @@ mark. `idle_steps=0` throughout, `render_error=None`.
 This retires the open question left by the read-600 retraction: the route was
 not merely *running*, it is *drawing the game*. What remains unproven is a match
 in progress — the entrance presentation and the arena itself.
+
+## 2026-08-07: the window never presented because WM2000 never calls `osViSwapBuffer`
+
+`vi_swaps=0` was read for months as "the guest never reaches the swap" and
+therefore as a scheduling failure -- the hypothesis being that WM2000's
+scheduler thread blocks in `osRecvMesg` waiting for a task completion that
+fn64's `event_table_contains` guard silently skips
+(`task_dispatch/lifecycle.rs:959-972` documents exactly that shape, derived
+from OoT's `sched.c`).
+
+**All three parts of that hypothesis are false, measured.**
+
+A 1,200-frame headless run of `wm2000-shell` under `FN64_BOOT_PROBE=1`
+(704 gfx submits, 1,139 audio submits, `vi_swaps=0`) shows:
+
+1. **The event registrations exist.** WM2000 calls `osSetEventMesg` eight
+   times, including both completion events fn64 posts:
+
+   ```
+   osSetEventMesg(event=4, mq=0x80052320, msg=0x0000029b)   # OS_EVENT_SP, 667
+   osSetEventMesg(event=9, mq=0x80052358, msg=0x0000029c)   # OS_EVENT_DP, 668
+   ```
+
+   Same message values as OoT's `RSP_DONE_MSG`/`RDP_DONE_MSG`, on two separate
+   queues rather than OoT's single shared `interruptQueue`. `event_table_contains`
+   therefore never skips either one, and the SP/DP posts land.
+
+2. **The guest is already flipping framebuffers.** VI_ORIGIN
+   (`0xa4400004`) is written 1,257 times over the run, alternating exactly two
+   addresses -- textbook double buffering:
+
+   ```
+   620 x 0x003c7fc0
+   599 x 0x0038fbc0
+   ```
+
+   plus 37 early writes of `0x000003c0` and one of `0x00000280` (boot).
+
+3. **`vi_swaps=0` is correct.** `Executor::vi().swap_count` counts
+   `osViSwapBuffer_recomp` entries and nothing else. WM2000 programs the VI
+   registers directly through raw MMIO and never calls the libultra entry
+   point, so the counter is a truthful zero for a game that is displaying
+   normally. It measures an API call, not progress.
+
+### The actual bug: the presenter was keyed on the wrong fact
+
+`shell.rs`'s `present()` opened with
+
+```rust
+let Some(fb_offset) = fn64_abi::current_vi_framebuffer() else { return; };
+```
+
+and `current_vi_framebuffer()` reads `ViState::current_framebuffer`, which
+*only* `osViSwapBuffer_recomp` ever assigns. For WM2000 that is `None` on every
+frame of every run, so `present()` returned before touching the window --
+which is why the window showed nothing while the headless dump lane, which
+hashes RDRAM directly and never consults this field, produced 2,239 good frames
+of the same route including the match setup screen. Two lanes, same guest, one
+of them asking a question the guest never answers.
+
+Two sibling bugs had the same root: `pump_one_frame` pinned the *boot* step
+budget forever (`vi_swap_count() == 0`) and reported `swapped: false` on every
+frame that in fact flipped, and the 60-frame heartbeat could never fire.
+
+### Fix
+
+Read the register the hardware actually scans from:
+
+- `DeviceFabric::vi_origin()` (`crates/fn64-runtime/src/device/fabric.rs`) --
+  `vi_registers[1]`, masked to 24 bits on write, `None` while still zero.
+  Mirrors the existing `vi_width()` accessor.
+- `fn64_abi::scanout_vi_framebuffer()` (`crates/fn64-abi/src/vi.rs`) -- the
+  presenter-facing accessor. `current_vi_framebuffer()` is retained and still
+  correct for its own question ("what did the guest last pass to
+  `osViSwapBuffer`", e.g. swap-keyed framebuffer hashing).
+- `examples/wm2000-block-boot/src/shell.rs` -- `present()`, the pump budget,
+  the `swapped` result, and the heartbeat all switch to the scanout origin.
+  The heartbeat now counts frames this shell actually blitted.
+
+No guard was weakened and no completion is fabricated: the SP/DP posts were
+already being delivered correctly to the queues WM2000 registered. Nothing in
+`fn64-recomp-rs` changed, so program identity is untouched.
+
+### Note for the next investigation
+
+`vi_swaps` is not a progress metric. For any question of the form "is the guest
+producing frames", the scanout origin is the portable answer and
+`osViSwapBuffer` is a title-specific implementation detail. OoT happens to use
+it; WM2000 does not.

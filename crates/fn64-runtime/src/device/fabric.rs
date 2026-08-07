@@ -637,6 +637,29 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         (width != 0).then_some(width)
     }
 
+    /// The physical RDRAM address the video interface is currently scanning
+    /// out, read straight from VI_ORIGIN (`vi_registers[1]`, masked to 24 bits
+    /// on write). `None` while the register is still zero, so a presenter can
+    /// tell "no scanout programmed yet" from "scanning out address 0".
+    ///
+    /// This is the ONLY origin fact that holds for every game, because it is
+    /// the register the hardware actually scans from. `osViSwapBuffer` is one
+    /// way to reach it, not the only one: libultra's VI manager latches the
+    /// swapped pointer into this register at the next retrace, but a game may
+    /// equally program VI_ORIGIN itself and never call the libultra entry
+    /// point at all. WM2000 is exactly that second shape -- it alternates two
+    /// framebuffers (`0x0038fbc0`/`0x003c7fc0`) by writing VI_ORIGIN through
+    /// raw MMIO, so `Executor::vi().current_framebuffer` (which only
+    /// `osViSwapBuffer_recomp` ever sets) stays `None` forever while the game
+    /// is in fact double-buffering normally. A presenter keyed on the libultra
+    /// call therefore shows nothing for such a game even though every frame
+    /// was rendered; keyed on this register it shows the same pixels the
+    /// hardware would.
+    pub fn vi_origin(&self) -> Option<u32> {
+        let origin = self.vi_registers[1];
+        (origin != 0).then_some(origin)
+    }
+
     /// Install an explicit field-duration override for compatibility tests or
     /// embedders without IPL state. This clears the typed television standard;
     /// production boot should call [`Self::configure_tv_type`] instead.

@@ -329,8 +329,8 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | VI/DP | `osCreateViManager_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:33` |
 | VI/DP | `osViBlack_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:176` |
 | VI/DP | `osViSetSpecialFeatures_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:111` |
-| VI/DP | `osViGetCurrentFramebuffer_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:366` |
-| VI/DP | `osViGetNextFramebuffer_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:393` |
+| VI/DP | `osViGetCurrentFramebuffer_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:380` |
+| VI/DP | `osViGetNextFramebuffer_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:407` |
 | VI/DP | `osViSwapBuffer_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:161` |
 | VI/DP | `osViSetMode_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:66` |
 | VI/DP | `osViSetEvent_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:48` |
@@ -374,10 +374,10 @@ These low-level or title-specific helpers are real ABI exports but are not part 
 | `osLeoDiskInit_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1203` |
 | `osPfsIsPlug_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:182` |
 | `osViFade_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:189` |
-| `osViGetCurrentField_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:421` |
-| `osViGetCurrentLine_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:407` |
-| `osViGetCurrentMode_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:446` |
-| `osViGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:431` |
+| `osViGetCurrentField_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:435` |
+| `osViGetCurrentLine_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:421` |
+| `osViGetCurrentMode_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:460` |
+| `osViGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:445` |
 | `osViRepeatLine_recomp` | **implemented** | `crates/fn64-abi/src/vi.rs:202` |
 <!-- END GENERATED NMR SURFACE -->
 
