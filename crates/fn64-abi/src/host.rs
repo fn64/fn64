@@ -371,7 +371,73 @@ pub fn run_one_step() -> bool {
         });
         EXECUTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
+    heartbeat(stepped, now);
     stepped
+}
+
+/// Steps between `FN64_HEARTBEAT` reports, or 0 when the gate is off.
+///
+/// Diagnostics only: a scheduling step is silent unless the harness happens to
+/// log at it, and WM2000's route schedule stops producing input EDGES at
+/// controller read 600 -- so a run that is progressing perfectly well and a run
+/// that is wedged look identical on stdout. This gate distinguishes them by
+/// printing virtual time and step count on a fixed step cadence regardless of
+/// what the guest is doing.
+///
+/// `FN64_HEARTBEAT=<steps>`; absent, empty, `0`, or unparseable means off, on
+/// the same reasoning as `write_barrier::env_flag` (an A/B whose off lane is
+/// silently the on lane is worse than no A/B).
+fn heartbeat_interval() -> u64 {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("FN64_HEARTBEAT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn heartbeat(stepped: bool, now: u64) {
+    let interval = heartbeat_interval();
+    if interval == 0 {
+        return;
+    }
+    thread_local! {
+        static STEPS: Cell<u64> = const { Cell::new(0) };
+        static IDLE_STEPS: Cell<u64> = const { Cell::new(0) };
+    }
+    if !stepped {
+        IDLE_STEPS.with(|idle| idle.set(idle.get() + 1));
+    }
+    let count = STEPS.with(|steps| {
+        let next = steps.get() + 1;
+        steps.set(next);
+        next
+    });
+    if count % interval != 0 {
+        return;
+    }
+    let (graphics_tasks, audio_tasks) = task_counts();
+    // The controller READ ORDINAL is the route schedule's clock, and the
+    // schedule's own annotation calls the long no-input tail "the cheapest
+    // discriminator". Reporting it here is what makes that discriminator
+    // readable: the harness only logs on an input EDGE, and the schedule has
+    // no edge after read 600, so the ordinal is otherwise invisible exactly
+    // where it matters most.
+    let port0_reads = with_host(|host| {
+        host.controller_operations
+            .iter()
+            .filter(|operation| {
+                operation.port == 0
+                    && operation.device == fn64_runtime::ControllerOperationDevice::StandardController
+                    && operation.operation == fn64_runtime::ControllerOperationKind::Read
+            })
+            .count()
+    });
+    eprintln!(
+        "[fn64-heartbeat] steps={count} sim_time={now} idle_steps={} gfx_submits={graphics_tasks} audio_submits={audio_tasks} port0_reads={port0_reads}",
+        IDLE_STEPS.with(Cell::get),
+    );
 }
 
 /// Priority the next [`run_one_step`] will dispatch, or `None` when the run
