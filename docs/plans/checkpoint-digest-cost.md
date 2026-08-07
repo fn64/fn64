@@ -1,5 +1,21 @@
 # The checkpoint digest is the throughput blocker
 
+> **STALE — 2026-08-07. Do not read the numbers below as current.**
+>
+> This document reports SHA-256 at 70.30% of self time and the 60k benchmark at
+> 36.5 s. Both predate the v2 page-tree migration and the `mprotect` write
+> barrier. **The same deep route now runs in ~0.43 s** — the headline claim is
+> false by more than an order of magnitude.
+>
+> What remains true: the *mechanism* it describes, and the reasoning about why
+> software substitutes for the guard must read the region. For current numbers
+> see `docs/plans/resolvable-self-time-profile.md`, which supersedes the profile
+> here.
+>
+> A stale profile in this file steered at least two optimization waves at the
+> wrong target. Date and supersede performance documents.
+
+
 Decision document. Records what was measured, why the obvious fix is not
 available as a performance change, and what a migration would have to cover.
 It does not recommend acting — the choice is a certification decision.
