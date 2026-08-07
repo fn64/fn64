@@ -456,6 +456,44 @@ pub const CANONICAL_EXECUTABLE_MUTATION_JOURNAL_SCHEMA_V1: &str =
 /// `docs/plans/checkpoint-digest-cost.md`.
 pub const CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V2: &str = "fn64.canonical-watched-bytes-digest.v2";
 
+/// Domain separator for the v3 MERKLE-ROOT watched-bytes digest.
+///
+/// v2 made the LEAVES incremental -- one SHA-256 per 4096-byte page, rehashed
+/// only where bytes moved -- but left the ROOT flat: every commit absorbed all
+/// 32 bytes of every page digest. On WM2000's 371 pages that is 11,872 bytes
+/// re-hashed for a four-byte guest store, and it measured at 20 of the 26
+/// self-time points `sha2::compress` still held after v2.
+///
+/// v3 keeps the v2 leaf function unchanged in shape and replaces the root with
+/// a binary Merkle tree per watched range, plus a small flat root over the
+/// range roots. A changed leaf now touches ceil(log2(pages)) internal nodes --
+/// 9 for WM2000's 370-page range -- instead of the whole leaf vector.
+///
+/// A v2 root and a v3 root over identical memory are different values and must
+/// never be confused. Every hashed message in v3 carries this prefix, and the
+/// leaf, internal-node, range-root and top-root messages each carry a distinct
+/// tag byte, so no v3 message is a v2 message and no v3 node can be read at
+/// another level of the tree.
+///
+/// Recorded digests that predate this constant are v1 or v2 and stay so: see
+/// `docs/plans/checkpoint-digest-cost.md`.
+pub const CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3: &str = "fn64.canonical-watched-bytes-digest.v3";
+
+/// Children per internal node in the v3 watched-bytes Merkle tree.
+///
+/// Two. The update cost of a single changed leaf is `ceil(log_f(n))` node
+/// hashes, each absorbing `f * 32` bytes plus a fixed header, so the bytes
+/// hashed per commit go as `f/ln(f) * ln(n)` -- minimised at `f = e`, and 2 is
+/// the nearest integer above 1. Concretely, for WM2000's 370 pages: `f=2` is 9
+/// nodes over 576 payload bytes, `f=4` is 5 nodes over 640, `f=16` is 3 over
+/// 1536. Binary also keeps the incremental update a plain parent walk with no
+/// sibling gather.
+///
+/// The value is hashed into every internal node and both root levels, so it
+/// cannot change without changing the digest -- a schema change, not a tuning
+/// knob.
+pub const CANONICAL_WATCHED_BYTES_FANOUT_V3: usize = 2;
+
 /// Bytes per page in the v2 watched-bytes digest.
 ///
 /// 4096 bytes. The choice is bounded on both sides and the middle is flat:
@@ -577,16 +615,153 @@ struct WatchedExecutableBytesV1 {
     /// hashes it, and `set_expected` is the only writer, so the two forms
     /// cannot drift.
     expected_storage_order: Vec<u8>,
-    /// The v2 page digests of `expected`, one per
-    /// [`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`]-byte page.
+    /// The v3 Merkle tree over the pages of `expected`, level by level.
+    ///
+    /// `levels[0]` is the leaf level: one v3 page digest per
+    /// [`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`]-byte page. `levels[h+1]` is
+    /// built from `levels[h]` by pairing adjacent nodes; an odd trailing node
+    /// is promoted through a distinct single-child message. The last level
+    /// holds exactly one node, the apex, unless the range has no pages at all
+    /// -- in which case the tree is empty and the range root binds the absence.
     ///
     /// Derived state, like `expected_storage_order`: it is always exactly what
-    /// recomputing every page of `expected` would produce. `set_expected`
-    /// refreshes the pages that changed and asserts nothing else could have,
-    /// so a stale entry is not representable through the normal path.
+    /// recomputing every page of `expected` and rebuilding every level would
+    /// produce. The dirty leaves are decided by byte comparison against the old
+    /// baseline, and every ancestor of a dirty leaf is recomputed, so a stale
+    /// node is not representable through the normal path.
     ///
     /// Empty until the baseline is first set.
-    expected_page_digests: Vec<[u8; 32]>,
+    expected_page_tree: WatchedPageTreeV3,
+}
+
+/// The maintained v3 Merkle tree over one watched range's pages.
+///
+/// Held level by level rather than as a heap array because the levels of a
+/// non-power-of-two tree have irregular sizes, and an explicit `Vec` per level
+/// makes the parent index a plain `i / 2` at every height with no padding
+/// leaves. Padding was rejected deliberately: filling to a power of two would
+/// have to hash something for the pad slots, and any such filler is a value an
+/// attacker could aim a real leaf at.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+struct WatchedPageTreeV3 {
+    /// `levels[0]` = leaves. Empty when the range has no pages.
+    levels: Vec<Vec<[u8; 32]>>,
+}
+
+impl WatchedPageTreeV3 {
+    fn leaves(&self) -> &[[u8; 32]] {
+        self.levels.first().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn leaves_mut(&mut self) -> &mut Vec<[u8; 32]> {
+        if self.levels.is_empty() {
+            self.levels.push(Vec::new());
+        }
+        &mut self.levels[0]
+    }
+
+    /// The apex: the single node of the top level, or `None` for no pages.
+    fn apex(&self) -> Option<&[u8; 32]> {
+        let last = self.levels.last()?;
+        debug_assert!(last.len() <= 1 || self.levels.len() == 1);
+        last.first()
+    }
+
+    /// Number of levels a tree over `leaves` leaves has, including the leaf
+    /// level. Zero leaves means zero levels.
+    fn level_count(leaves: usize) -> usize {
+        let mut count = 0usize;
+        let mut width = leaves;
+        while width > 0 {
+            count += 1;
+            if width == 1 {
+                break;
+            }
+            width = width.div_ceil(CANONICAL_WATCHED_BYTES_FANOUT_V3);
+        }
+        count
+    }
+
+    /// Rebuild every level above the leaves, from scratch.
+    ///
+    /// Used at seal and whenever the page count changes. The incremental form
+    /// is [`Self::recompute_ancestors`].
+    fn rebuild_upper_levels(&mut self, physical_start: u32, physical_end: u32) {
+        let leaves = self.leaves().len();
+        self.levels.truncate(1);
+        if leaves == 0 {
+            self.levels.clear();
+            return;
+        }
+        self.levels.reserve(Self::level_count(leaves));
+        let mut height = 0u32;
+        while self.levels[self.levels.len() - 1].len() > 1 {
+            let below = &self.levels[self.levels.len() - 1];
+            height += 1;
+            let mut level = Vec::with_capacity(below.len().div_ceil(2));
+            let mut index = 0u32;
+            let mut pair = below.chunks(CANONICAL_WATCHED_BYTES_FANOUT_V3);
+            while let Some(children) = pair.next() {
+                level.push(receipts::watched_node_digest_v3(
+                    physical_start,
+                    physical_end,
+                    height,
+                    index,
+                    &children[0],
+                    children.get(1),
+                ));
+                index += 1;
+            }
+            self.levels.push(level);
+        }
+    }
+
+    /// Recompute the ancestors of the leaves in `dirty`, bottom up.
+    ///
+    /// `dirty` must be sorted and deduplicated. Each level's dirty set is the
+    /// parent indices of the level below, so a single changed leaf touches
+    /// exactly one node per level -- `ceil(log2(pages))` hashes -- and a
+    /// clustered set of changed leaves shares ancestors instead of rehashing
+    /// them once each.
+    ///
+    /// CONSERVATIVE BY CONSTRUCTION, in the same sense as the leaf refresh: the
+    /// caller decides `dirty` by byte comparison, and EVERY ancestor of every
+    /// dirty leaf is recomputed here without exception. A node whose entire
+    /// subtree is clean has, by that comparison, identical leaves, and
+    /// identical children produce an identical node.
+    fn recompute_ancestors(&mut self, physical_start: u32, physical_end: u32, dirty: &[usize]) {
+        if dirty.is_empty() || self.levels.len() < 2 {
+            return;
+        }
+        let mut below_dirty: Vec<usize> = dirty.to_vec();
+        let mut parents: Vec<usize> = Vec::with_capacity(below_dirty.len());
+        for height in 1..self.levels.len() {
+            parents.clear();
+            let mut last: Option<usize> = None;
+            for &child in &below_dirty {
+                let parent = child / CANONICAL_WATCHED_BYTES_FANOUT_V3;
+                if last != Some(parent) {
+                    parents.push(parent);
+                    last = Some(parent);
+                }
+            }
+            let (lower, upper) = self.levels.split_at_mut(height);
+            let below = &lower[height - 1];
+            let level = &mut upper[0];
+            for &parent in &parents {
+                let lo = parent * CANONICAL_WATCHED_BYTES_FANOUT_V3;
+                level[parent] = receipts::watched_node_digest_v3(
+                    physical_start,
+                    physical_end,
+                    height as u32,
+                    parent as u32,
+                    &below[lo],
+                    below.get(lo + 1),
+                );
+            }
+            std::mem::swap(&mut below_dirty, &mut parents);
+        }
+    }
 }
 
 impl WatchedExecutableBytesV1 {
@@ -631,36 +806,44 @@ impl WatchedExecutableBytesV1 {
     /// every page.
     fn refresh_page_digests(&mut self, bytes: &[u8]) {
         let pages = Self::page_count(bytes.len());
-        let reusable = self.expected_page_digests.len() == pages
-            && self.expected.len() == bytes.len();
+        let reusable =
+            self.expected_page_tree.leaves().len() == pages && self.expected.len() == bytes.len();
         if !reusable {
-            self.expected_page_digests.clear();
-            self.expected_page_digests.reserve(pages);
+            let (physical_start, physical_end) = (self.physical_start, self.physical_end);
+            let leaves = self.expected_page_tree.leaves_mut();
+            leaves.clear();
+            leaves.reserve(pages);
             for index in 0..pages {
                 let lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
                 let hi = (lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(bytes.len());
-                self.expected_page_digests.push(receipts::watched_page_digest_v2(
-                    self.physical_start,
-                    self.physical_end,
+                leaves.push(receipts::watched_page_digest_v3(
+                    physical_start,
+                    physical_end,
                     index as u32,
                     &bytes[lo..hi],
                 ));
             }
+            self.expected_page_tree
+                .rebuild_upper_levels(physical_start, physical_end);
             return;
         }
+        let mut dirty: Vec<usize> = Vec::new();
         for index in 0..pages {
             let lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
             let hi = (lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(bytes.len());
             if self.expected[lo..hi] == bytes[lo..hi] {
                 continue;
             }
-            self.expected_page_digests[index] = receipts::watched_page_digest_v2(
+            self.expected_page_tree.leaves_mut()[index] = receipts::watched_page_digest_v3(
                 self.physical_start,
                 self.physical_end,
                 index as u32,
                 &bytes[lo..hi],
             );
+            dirty.push(index);
         }
+        self.expected_page_tree
+            .recompute_ancestors(self.physical_start, self.physical_end, &dirty);
     }
 
     /// Bytes before the first word-aligned storage word, as `copy_logical_bytes` computes it.
@@ -875,7 +1058,8 @@ impl WatchedExecutableBytesV1 {
     /// bytes have an identical digest.
     fn refresh_page_digests_over(&mut self, changed: &[(u32, u32)]) {
         let len = self.expected.len();
-        debug_assert_eq!(self.expected_page_digests.len(), Self::page_count(len));
+        debug_assert_eq!(self.expected_page_tree.leaves().len(), Self::page_count(len));
+        let mut dirty: Vec<usize> = Vec::new();
         let mut previous: Option<usize> = None;
         for &(physical_start, physical_end) in changed {
             let lo = (physical_start - self.physical_start) as usize;
@@ -892,14 +1076,31 @@ impl WatchedExecutableBytesV1 {
                 previous = Some(index);
                 let page_lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
                 let page_hi = (page_lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(len);
-                self.expected_page_digests[index] = receipts::watched_page_digest_v2(
+                self.expected_page_tree.leaves_mut()[index] = receipts::watched_page_digest_v3(
                     self.physical_start,
                     self.physical_end,
                     index as u32,
                     &self.expected[page_lo..page_hi],
                 );
+                dirty.push(index);
             }
         }
+        // `changed` is ascending and the per-range page spans are visited in
+        // order, so `dirty` is already sorted and deduplicated -- the property
+        // `recompute_ancestors` requires.
+        debug_assert!(dirty.windows(2).all(|pair| pair[0] < pair[1]));
+        self.expected_page_tree
+            .recompute_ancestors(self.physical_start, self.physical_end, &dirty);
+    }
+
+    /// The v3 root of this range: the apex bound to the range's own geometry.
+    fn range_root_v3(&self) -> [u8; 32] {
+        receipts::watched_range_root_digest_v3(
+            self.physical_start,
+            self.physical_end,
+            self.expected_page_tree.leaves().len() as u64,
+            self.expected_page_tree.apex(),
+        )
     }
 
     /// Whether live RDRAM storage still equals the sealed baseline.

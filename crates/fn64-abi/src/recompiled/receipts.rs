@@ -1276,6 +1276,11 @@ pub(super) fn watched_bytes_sha256(storage: &[u8], ranges: &[(u32, u32)]) -> [u8
 
 /// The v2 digest of one page of one watched range.
 ///
+/// SUPERSEDED by [`watched_page_digest_v3`]. Retained, and reachable only from
+/// tests, as the reference construction the version-distinguishability tests
+/// hash against: a v2 value and a v3 value over identical memory must differ,
+/// and that is checked rather than asserted.
+///
 /// Binds the schema, the page size, the range the page belongs to, the page's
 /// index within that range, and its bytes. Because the range bounds and the
 /// index are inside the leaf, a page's digest is not reusable at any other
@@ -1285,6 +1290,7 @@ pub(super) fn watched_bytes_sha256(storage: &[u8], ranges: &[(u32, u32)]) -> [u8
 /// The final page of a range may be shorter than [`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`];
 /// its actual length is hashed, so a short final page cannot be confused with a
 /// full one that happens to be zero-padded.
+#[cfg(test)]
 pub(super) fn watched_page_digest_v2(
     physical_start: u32,
     physical_end: u32,
@@ -1305,6 +1311,10 @@ pub(super) fn watched_page_digest_v2(
 
 /// The v2 root over every page of every watched range.
 ///
+/// SUPERSEDED by [`watched_root_digest_v3`], which replaces this flat absorb of
+/// every page digest with a Merkle tree. Retained, test-only, as the reference
+/// the version-distinguishability tests compare against.
+///
 /// `ranges` yields `(physical_start, physical_end, page_digests)` in watched
 /// order. The root depends ONLY on that -- on the range bounds and the page
 /// digests, in range order and page order. It does not depend on which pages
@@ -1314,6 +1324,7 @@ pub(super) fn watched_page_digest_v2(
 ///
 /// The range count and each range's page count are hashed, so no regrouping of
 /// pages between ranges can produce the same root.
+#[cfg(test)]
 pub(super) fn watched_root_digest_v2<'a>(
     ranges: impl ExactSizeIterator<Item = (u32, u32, &'a [[u8; 32]])>,
 ) -> [u8; 32] {
@@ -1329,6 +1340,127 @@ pub(super) fn watched_root_digest_v2<'a>(
         for page in pages {
             hasher.update(page);
         }
+    }
+    hasher.finalize().into()
+}
+
+/// The v3 digest of one page of one watched range.
+///
+/// Identical in shape to [`watched_page_digest_v2`] -- same bound fields, same
+/// order -- but under the v3 schema prefix, so a v2 leaf and a v3 leaf over the
+/// same page are different values. The leaf tag stays `0x00`; the schema string
+/// is what separates the versions, and it is the first thing hashed.
+///
+/// The final page of a range may be shorter than
+/// [`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`]; its actual length is hashed, so a
+/// short final page cannot be confused with a zero-padded full one.
+pub(super) fn watched_page_digest_v3(
+    physical_start: u32,
+    physical_end: u32,
+    page_index: u32,
+    bytes: &[u8],
+) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3.as_bytes());
+    hasher.update([0x00]); // leaf tag
+    hasher.update((CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u64).to_be_bytes());
+    hasher.update(physical_start.to_be_bytes());
+    hasher.update(physical_end.to_be_bytes());
+    hasher.update(page_index.to_be_bytes());
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// One internal node of a v3 per-range Merkle tree.
+///
+/// `height` is 1 for the parent of two leaves and increases toward the range
+/// root; `index` is the node's position within its level, counting from zero.
+/// Both are bound, so a node cannot be replayed at another position or another
+/// level -- with a fixed fanout of two and a bound leaf count, that pins the
+/// whole shape.
+///
+/// `right` is `None` for the last node of an odd level. That case hashes a
+/// distinct tag rather than duplicating the left child, because duplication is
+/// the classic Merkle malleability: with `H(x||x)` a tree of `2n` leaves whose
+/// second half repeats the first can be confused with a tree of `n`. Here the
+/// arities are different messages outright.
+pub(super) fn watched_node_digest_v3(
+    physical_start: u32,
+    physical_end: u32,
+    height: u32,
+    index: u32,
+    left: &[u8; 32],
+    right: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3.as_bytes());
+    // Distinct tags for the two arities: a promoted single child is not the
+    // same message as a pair, so no regrouping of levels can collide.
+    hasher.update([if right.is_some() { 0x02 } else { 0x03 }]);
+    hasher.update((CANONICAL_WATCHED_BYTES_FANOUT_V3 as u64).to_be_bytes());
+    hasher.update(physical_start.to_be_bytes());
+    hasher.update(physical_end.to_be_bytes());
+    hasher.update(height.to_be_bytes());
+    hasher.update(index.to_be_bytes());
+    hasher.update(left);
+    if let Some(right) = right {
+        hasher.update(right);
+    }
+    hasher.finalize().into()
+}
+
+/// The v3 root of one watched range's page tree.
+///
+/// Binds the range bounds, the page size, the fanout and the page COUNT around
+/// the tree's apex, so two ranges cannot be regrouped into one, and a tree
+/// cannot be reinterpreted with a different leaf count. `apex` is the single
+/// surviving node after the levels collapse; an empty range (no pages) has no
+/// apex and hashes the absence explicitly.
+pub(super) fn watched_range_root_digest_v3(
+    physical_start: u32,
+    physical_end: u32,
+    page_count: u64,
+    apex: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3.as_bytes());
+    hasher.update([0x04]); // range-root tag
+    hasher.update((CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u64).to_be_bytes());
+    hasher.update((CANONICAL_WATCHED_BYTES_FANOUT_V3 as u64).to_be_bytes());
+    hasher.update(physical_start.to_be_bytes());
+    hasher.update(physical_end.to_be_bytes());
+    hasher.update(page_count.to_be_bytes());
+    match apex {
+        Some(apex) => {
+            hasher.update([0x01]);
+            hasher.update(apex);
+        }
+        None => hasher.update([0x00]),
+    }
+    hasher.finalize().into()
+}
+
+/// The v3 top root over every watched range's range root.
+///
+/// This is the value that replaces the v2 flat root. It hashes 32 bytes per
+/// RANGE -- 64 bytes on WM2000 -- instead of 32 bytes per page, which is what
+/// makes a commit cost `O(log pages)` rather than `O(pages)`.
+///
+/// The range count is bound, and each range root already binds its own bounds
+/// and page count, so no redistribution of pages between ranges reaches the
+/// same top root.
+pub(super) fn watched_root_digest_v3<'a>(
+    range_roots: impl ExactSizeIterator<Item = &'a [u8; 32]>,
+) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CANONICAL_WATCHED_BYTES_DIGEST_SCHEMA_V3.as_bytes());
+    hasher.update([0x05]); // top-root tag
+    hasher.update((CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u64).to_be_bytes());
+    hasher.update((CANONICAL_WATCHED_BYTES_FANOUT_V3 as u64).to_be_bytes());
+    hasher.update((range_roots.len() as u64).to_be_bytes());
+    for root in range_roots {
+        hasher.update(root);
     }
     hasher.finalize().into()
 }

@@ -52,7 +52,7 @@ impl CanonicalExecutableMutationStateV1 {
                 physical_end,
                 expected: Vec::new(),
                 expected_storage_order: Vec::new(),
-                expected_page_digests: Vec::new(),
+                expected_page_tree: WatchedPageTreeV3::default(),
             });
             previous_end = physical_end;
         }
@@ -455,7 +455,7 @@ impl CanonicalExecutableMutationStateV1 {
             .collect()
     }
 
-    /// The v2 page-tree digest of an ARBITRARY snapshot, computed from scratch.
+    /// The v3 Merkle-root digest of an ARBITRARY snapshot, from scratch.
     ///
     /// A pure function of the watched range bounds and the bytes handed in --
     /// it reads no cache and depends on no history. Callers pass snapshots that
@@ -463,59 +463,67 @@ impl CanonicalExecutableMutationStateV1 {
     /// reconstruct the sealed-from-zero `before_sha256`), so this must stay
     /// cache-free to remain correct for them.
     ///
-    /// [`Self::digest_expected`] is the incremental form, valid only for the
-    /// state's own baseline. The determinism test asserts the two agree.
+    /// This is the DEFINITION of the digest: leaves in page order, levels
+    /// collapsed pairwise, the apex bound to the range geometry, and the range
+    /// roots bound in watched order. [`Self::digest_expected`] is the
+    /// incremental form, valid only for the state's own baseline; the
+    /// determinism test asserts the two agree after every commit.
     pub(super) fn digest_snapshot(&self, snapshot: &[Vec<u8>]) -> [u8; 32] {
-        let pages = self
+        let range_roots = self
             .watched
             .iter()
             .zip(snapshot)
             .map(|(range, bytes)| {
                 let count = bytes.len().div_ceil(CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2);
-                (0..count)
-                    .map(|index| {
+                let mut tree = WatchedPageTreeV3::default();
+                {
+                    let leaves = tree.leaves_mut();
+                    leaves.reserve(count);
+                    for index in 0..count {
                         let lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
                         let hi = (lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(bytes.len());
-                        watched_page_digest_v2(
+                        leaves.push(watched_page_digest_v3(
                             range.physical_start,
                             range.physical_end,
                             index as u32,
                             &bytes[lo..hi],
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                        ));
+                    }
+                }
+                tree.rebuild_upper_levels(range.physical_start, range.physical_end);
+                watched_range_root_digest_v3(
+                    range.physical_start,
+                    range.physical_end,
+                    count as u64,
+                    tree.apex(),
+                )
             })
             .collect::<Vec<_>>();
-        watched_root_digest_v2(
-            self.watched
-                .iter()
-                .zip(&pages)
-                .map(|(range, pages)| {
-                    (range.physical_start, range.physical_end, pages.as_slice())
-                }),
-        )
+        watched_root_digest_v3(range_roots.iter())
     }
 
-    /// The v2 root over the CURRENT baseline, from the maintained page digests.
+    /// The v3 root over the CURRENT baseline, from the maintained tree.
     ///
-    /// This is the incremental form and the reason the migration exists: it
-    /// hashes 32 bytes per page instead of every watched byte, because
-    /// `set_expected` has already refreshed exactly the pages whose bytes
-    /// changed.
+    /// This is the incremental form and the reason the v3 migration exists. v2
+    /// made the leaves incremental but left the root flat: it absorbed 32 bytes
+    /// per PAGE on every commit -- 11,872 bytes on WM2000 -- so a four-byte
+    /// guest store still paid for the whole region's worth of page digests.
+    /// v3 reads only one 32-byte apex per RANGE, because
+    /// `refresh_page_digests_over` has already walked the changed leaf's
+    /// ancestors: 9 node hashes for WM2000's 370-page range.
     ///
-    /// Equal to `digest_snapshot(&expected)` by construction --
-    /// `expected_page_digests` is maintained to be precisely what recomputing
-    /// every page of `expected` yields, and the root is a pure function of
-    /// those digests and the range bounds. Asserted in
+    /// Equal to `digest_snapshot(&expected)` by construction -- the tree is
+    /// maintained to be precisely what rebuilding it over `expected` yields,
+    /// and both roots are the same pure function of the apexes and the range
+    /// bounds. Asserted in
     /// `page_tree_root_is_independent_of_incremental_history`.
     pub(super) fn digest_expected(&self) -> [u8; 32] {
-        watched_root_digest_v2(self.watched.iter().map(|range| {
-            (
-                range.physical_start,
-                range.physical_end,
-                range.expected_page_digests.as_slice(),
-            )
-        }))
+        let range_roots = self
+            .watched
+            .iter()
+            .map(|range| range.range_root_v3())
+            .collect::<Vec<_>>();
+        watched_root_digest_v3(range_roots.iter())
     }
 
     pub(super) fn seal_with(&mut self, read_physical_byte: impl FnMut(u32) -> u8) {
