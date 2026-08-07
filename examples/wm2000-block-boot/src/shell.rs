@@ -817,13 +817,33 @@ impl Shell {
             let audio = fn64_abi::audio_output_stats();
             let interval = self.frame_intervals.take_stats();
             let pump = self.pump_times.take_stats();
+            // Report the whole distribution, and say outright whether the
+            // window held 60fps. The acceptance bar is a WORST-CASE bound, so
+            // `max` is the statistic that can falsify it -- a median of 8 ms
+            // next to a max of 45 ms is a miss, and median/p95 alone hide that.
+            let fmt = |s: &Option<timing::TimingStats>| {
+                s.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |s| {
+                        format!(
+                            "n={} p50={:.1} p95={:.1} p99={:.1} max={:.1}{}",
+                            s.samples,
+                            s.median_ms,
+                            s.p95_ms,
+                            s.p99_ms,
+                            s.max_ms,
+                            if s.holds_60fps() { "" } else { " OVER-16.7ms" },
+                        )
+                    },
+                )
+            };
             println!(
                 "[wm2000-shell] heartbeat: presented frame #{frames} origin={fb_offset:#010x} \
                  ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
-                 osViSwapBuffer calls={swaps}; timing_ms median/p95: interval={:?} pump={:?}; \
+                 osViSwapBuffer calls={swaps}; frame_interval_ms[{}] pump_ms[{}]; \
                  audio: ai_buffers={} samples={} nonzero={} backend_buffers={}",
-                interval.as_ref().map(|s| (s.median_ms, s.p95_ms)),
-                pump.as_ref().map(|s| (s.median_ms, s.p95_ms)),
+                fmt(&interval),
+                fmt(&pump),
                 audio.ai_buffers,
                 audio.samples,
                 audio.nonzero_samples,
