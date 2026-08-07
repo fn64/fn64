@@ -2178,7 +2178,31 @@ impl CanonicalLiveBlockProgramV1 {
     fn flush_host_abi_transaction_with(
         &self,
         token: HostMutationTransactionTokenV1,
+        read_physical_byte: impl FnMut(u32) -> u8,
+    ) {
+        self.flush_host_abi_transaction_inner(token, read_physical_byte, None);
+    }
+
+    /// [`Self::flush_host_abi_transaction_with`], plus the RDRAM view when the
+    /// caller has one.
+    ///
+    /// The changed-range list is all this needs; the full snapshot was only
+    /// ever the way to get it. `changed_ranges_from_view` produces exactly the
+    /// same ranges in the same order -- the equivalence is asserted by
+    /// `changed_ranges_from_view_matches_the_copying_path` -- with one
+    /// `memcmp` per watched range instead of rebuilding the region through a
+    /// per-byte closure. On WM2000 that region is the 1 MiB boot bank and this
+    /// runs at every HostAbi boundary; profiling attributed 90.7% of self time
+    /// here once the device-time and host-memory paths were converted.
+    ///
+    /// `None` from the view path means a watched byte is outside storage, and
+    /// the copying path is kept for exactly that case: it raises the panic
+    /// that owes.
+    fn flush_host_abi_transaction_inner(
+        &self,
+        token: HostMutationTransactionTokenV1,
         mut read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
     ) {
         let state = self
             .mutation_state
@@ -2191,22 +2215,39 @@ impl CanonicalLiveBlockProgramV1 {
             "catalog host transaction {} reached an ordering boundary with {pending} uncommitted child writer event(s)",
             token.transaction_id
         );
-        let snapshot = state.borrow().read_snapshot(&mut read_physical_byte);
-        let changed = state.borrow().current_changed_ranges(&snapshot);
+        let changed = match view.and_then(|view| state.borrow().changed_ranges_from_view(view)) {
+            Some(changed) => changed,
+            None => {
+                let snapshot = state.borrow().read_snapshot(&mut read_physical_byte);
+                state.borrow().current_changed_ranges(&snapshot)
+            }
+        };
         let first_new_entry = state.borrow().entries.len();
         for (physical_start, physical_end) in changed {
             fn64_recomp_rs::notify_host_abi_write(physical_start, physical_end - physical_start);
         }
-        self.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+        match view {
+            Some(view) => {
+                self.invalidate_pending_physical_writes_from_view(view, &mut read_physical_byte);
+            }
+            None => {
+                self.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+            }
+        }
         state
             .borrow_mut()
             .record_host_abi_boundary(token, first_new_entry);
     }
 
     fn flush_host_abi_transaction(&self, token: HostMutationTransactionTokenV1, mem: &Rdram<'_>) {
-        self.flush_host_abi_transaction_with(token, |physical| {
-            mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
-        });
+        // `mem` is right here, exactly as in
+        // `invalidate_pending_physical_writes` below.
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        self.flush_host_abi_transaction_inner(
+            token,
+            |physical| mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical)),
+            Some(&view),
+        );
     }
 
     pub(super) fn finish_host_abi_transaction(
@@ -2230,12 +2271,24 @@ impl CanonicalLiveBlockProgramV1 {
         thread: ThreadId,
         read_physical_byte: impl FnMut(u32) -> u8,
     ) {
+        self.flush_active_host_abi_transaction_from_view(thread, read_physical_byte, None);
+    }
+
+    /// [`Self::flush_active_host_abi_transaction_with`], plus the RDRAM view
+    /// when the caller has one. See [`Self::flush_host_abi_transaction_inner`]
+    /// for why the view matters.
+    pub(super) fn flush_active_host_abi_transaction_from_view(
+        &self,
+        thread: ThreadId,
+        read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
+    ) {
         let token = self
             .mutation_state
             .as_ref()
             .and_then(|state| state.borrow().active_host_transaction(thread));
         if let Some(token) = token {
-            self.flush_host_abi_transaction_with(token, read_physical_byte);
+            self.flush_host_abi_transaction_inner(token, read_physical_byte, view);
         }
     }
 
