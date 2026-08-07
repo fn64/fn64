@@ -91,6 +91,154 @@ use winit::window::{Window, WindowId};
 // `use crate::*`. The batch runner defines them alongside its profiling
 // instrumentation; this lane needs only the plain ones.
 
+/// Threshold in milliseconds above which a pump dumps its own attribution, or
+/// 0 when the gate is off.
+///
+/// Diagnostics only, and `OnceLock`-gated like every other `FN64_*` census, so
+/// an unset variable costs one relaxed load per frame.
+///
+/// This exists because a p99 says a frame was slow and nothing about WHY. A
+/// windowed run recorded a single **3,058 ms** frame against a p50 of 60 ms --
+/// three orders of magnitude, invisible to p95 -- and no statistic the
+/// heartbeat reports can distinguish the candidate causes: guest work in the
+/// scheduling arm, a device-advance storm in the other arm, or a host stall
+/// (audio callback, page faults, window back-pressure) that is not our work at
+/// all. Each predicts a DIFFERENT counter, so the outlier is attributable by
+/// counting rather than by inference:
+///
+/// - guest execution  -> `steps` is large; `sim_time` advances a lot
+/// - device-advance storm -> `advances` approaches its 4,096 cap with few steps
+/// - a host stall -> BOTH are ordinary and the wall clock is not
+///
+/// The third case is the one worth naming: an ordinary step count next to a
+/// three-second wall time is positive evidence that the time was not spent
+/// running the guest, which no amount of reading the pump loop can establish.
+///
+/// `FN64_SHELL_SPIKE_MS=<ms>`; absent, empty, `0`, or unparseable means off, on
+/// the same reasoning as `write_barrier::env_flag` (a diagnostic whose off lane
+/// is silently the on lane is worse than no diagnostic).
+fn spike_threshold_ms() -> f64 {
+    static THRESHOLD: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("FN64_SHELL_SPIKE_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Cheap counters read on both sides of one pump, so a slow frame can be
+/// attributed by DIFFERENCE rather than by absolute value.
+///
+/// Every field is an existing always-on counter: none of this turns on tracing
+/// or allocates. `host_evidence_snapshot()` would answer more questions but
+/// runs assertions and builds several `Vec`s, which is not something a frame
+/// path can afford to call unconditionally.
+#[derive(Clone, Copy)]
+struct PumpCounters {
+    sim_time: u64,
+    gfx_submits: u64,
+    audio_submits: u64,
+    vi_swaps: u64,
+    ai_buffers: u64,
+    backend_buffers: u64,
+    audio_samples: u64,
+    /// Counters from cpal's realtime thread, which runs INDEPENDENTLY of the
+    /// emulation thread. This is the host-vs-guest discriminator: a stall in
+    /// our pump leaves the audio callback ticking normally, whereas a stall in
+    /// the machine (scheduler preemption, page-fault storm, device
+    /// reconfiguration) stops both, and shows up here as a callback gap of the
+    /// same order as the frame.
+    audio_callbacks: u64,
+    audio_max_gap_us: u64,
+    audio_late_callbacks: u64,
+    audio_underrun_samples: u64,
+}
+
+impl PumpCounters {
+    fn read() -> Self {
+        let (gfx_submits, audio_submits) = fn64_abi::task_counts();
+        let audio = fn64_abi::audio_output_stats();
+        let health = fn64_abi::audio_stream_health().unwrap_or_default();
+        Self {
+            sim_time: fn64_abi::sim_time(),
+            gfx_submits,
+            audio_submits,
+            vi_swaps: fn64_abi::vi_swap_count(),
+            ai_buffers: audio.ai_buffers,
+            backend_buffers: audio.backend_buffers,
+            audio_samples: audio.samples,
+            audio_callbacks: health.callbacks,
+            audio_max_gap_us: health.max_callback_gap_us,
+            audio_late_callbacks: health.late_callbacks,
+            audio_underrun_samples: health.underrun_samples,
+        }
+    }
+}
+
+/// What one pump did, in counts. `steps` and `advances` come from the pump
+/// loop's own arms, so they attribute the wall time to a specific branch.
+struct PumpAttribution {
+    steps: u64,
+    advances: u32,
+    /// Wall time inside the scheduling arm only (`run_one_step` and the
+    /// controller feed), excluding device advances. The split matters: the two
+    /// arms have different fixes, and a pump that is 95% device advance is not
+    /// a guest-throughput problem however slow it looks.
+    step_ms: f64,
+    /// Wall time inside `advance_to_next_device_event` only.
+    advance_ms: f64,
+    before: PumpCounters,
+    after: PumpCounters,
+}
+
+impl PumpAttribution {
+    fn report(&self, total_ms: f64, frame: u64) {
+        let before = &self.before;
+        let after = &self.after;
+        // Wall time this pump did not spend in either arm. A large residual is
+        // itself the finding: it means the stall was not in guest stepping or
+        // device advance, which is where a host-side cause would show up.
+        let unattributed_ms = (total_ms - self.step_ms - self.advance_ms).max(0.0);
+        let per_step_us = if self.steps == 0 {
+            0.0
+        } else {
+            self.step_ms * 1000.0 / self.steps as f64
+        };
+        println!(
+            "[wm2000-shell] SPIKE frame #{frame}: wall={total_ms:.1}ms \
+             steps={} ({:.1}ms, {per_step_us:.2}us/step) advances={} ({:.1}ms) \
+             unattributed={unattributed_ms:.1}ms; \
+             d_sim_time={} d_gfx={} d_audio={} d_vi_swaps={} \
+             d_ai_buffers={} d_backend_buffers={} d_audio_samples={}; \
+             host: d_audio_callbacks={} audio_max_gap_us={} d_late_callbacks={} \
+             d_underrun_samples={}",
+            self.steps,
+            self.step_ms,
+            self.advances,
+            self.advance_ms,
+            after.sim_time.wrapping_sub(before.sim_time),
+            after.gfx_submits.wrapping_sub(before.gfx_submits),
+            after.audio_submits.wrapping_sub(before.audio_submits),
+            after.vi_swaps.wrapping_sub(before.vi_swaps),
+            after.ai_buffers.wrapping_sub(before.ai_buffers),
+            after.backend_buffers.wrapping_sub(before.backend_buffers),
+            after.audio_samples.wrapping_sub(before.audio_samples),
+            after.audio_callbacks.wrapping_sub(before.audio_callbacks),
+            // Not a delta: `max_callback_gap_us` is a running maximum, so its
+            // value AFTER the spike is what a host stall would have raised.
+            after.audio_max_gap_us,
+            after.audio_late_callbacks.wrapping_sub(before.audio_late_callbacks),
+            after
+                .audio_underrun_samples
+                .wrapping_sub(before.audio_underrun_samples),
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+}
+
 struct DenseAotArtifact {
     bank_id: u64,
     code_bank: fn() -> CodeBank,
@@ -597,6 +745,19 @@ impl Shell {
         let mut device_advances = 0u32;
         self.entered_first_dispatch = true;
 
+        // Per-arm attribution, off unless `FN64_SHELL_SPIKE_MS` is set. When
+        // off, `spike` is `None` and the only added cost per pump is one
+        // `OnceLock` read plus a null check per loop iteration.
+        let spike_ms = spike_threshold_ms();
+        let mut spike = (spike_ms > 0.0).then(|| {
+            (
+                std::time::Instant::now(),
+                PumpCounters::read(),
+                0.0f64, // accumulated step_ms
+                0.0f64, // accumulated advance_ms
+            )
+        });
+
         loop {
             match drain.before_step(fn64_abi::next_runnable_priority()) {
                 fn64_boot_harness::DrainDecision::Step => {
@@ -629,12 +790,20 @@ impl Shell {
                         }
                     }
                     let next_priority = fn64_abi::next_runnable_priority();
+                    let arm_started = spike.as_ref().map(|_| std::time::Instant::now());
                     assert!(fn64_abi::run_one_step());
+                    if let (Some(started), Some(spike)) = (arm_started, spike.as_mut()) {
+                        spike.2 += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                     drain.record_step(next_priority.expect("drain authorized a runnable step"));
                     steps += 1;
                 }
                 fn64_boot_harness::DrainDecision::AdvanceField => {
+                    let arm_started = spike.as_ref().map(|_| std::time::Instant::now());
                     let advanced = drain.advance_to_next_device_event();
+                    if let (Some(started), Some(spike)) = (arm_started, spike.as_mut()) {
+                        spike.3 += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                     device_advances += 1;
                     if matches!(advanced, fn64_boot_harness::DeviceAdvance::ViFields { .. }) {
                         // One field produced: hand the frame back to the window.
@@ -647,6 +816,20 @@ impl Shell {
                         break;
                     }
                 }
+            }
+        }
+        if let Some((started, before, step_ms, advance_ms)) = spike {
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+            if total_ms >= spike_ms {
+                PumpAttribution {
+                    steps,
+                    advances: device_advances,
+                    step_ms,
+                    advance_ms,
+                    before,
+                    after: PumpCounters::read(),
+                }
+                .report(total_ms, self.presented_frames);
             }
         }
         RetraceOutcome {

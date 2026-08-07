@@ -271,6 +271,15 @@ pub fn copy_audio_digest_bytes() -> Option<Vec<u8>> {
     AUDIO_DIGEST_CAPTURE.with(|cell| cell.borrow().clone())
 }
 
+/// The registered backend's cumulative host-stream delivery counters, or
+/// `None` when no backend is registered or the backend does not track them.
+///
+/// `max_callback_gap_us` is measured on cpal's own realtime thread, which
+/// makes it the one statistic reachable from here that observes the HOST
+/// rather than the guest. That is what lets a frame-latency investigation
+/// separate the two: if the emulation thread stalls for seconds while the
+/// audio callback keeps its cadence, the stall is ours; if both stop together,
+/// it is the machine's.
 pub fn audio_stream_health() -> Option<fn64_audio::AudioStreamHealth> {
     AUDIO_BACKEND.with(|cell| {
         cell.borrow()
