@@ -23,6 +23,20 @@ const FLASH_PAGE_COUNT: usize = fn64_runtime::SaveType::FlashRam.byte_len() / FL
 
 const FLASH_TYPE_1MBIT: u32 = 0x1111_8001;
 const FLASH_MAKER_MACRONIX_C: u32 = 0x00C2_001E;
+const FLASH_STATUS_READY: u8 = 0x80;
+const FLASH_STATUS_ERASE_ERROR_BIT: u8 = 0x20;
+const FLASH_STATUS_WRITE_ERROR_BIT: u8 = 0x10;
+const FLASH_STATUS_ERASE_BUSY: i32 = 2;
+const FLASH_STATUS_ERASE_OK: i32 = 0;
+const FLASH_STATUS_ERASE_ERROR: i32 = -1;
+
+const FLASH_DEVICE_TYPE: u8 = 8;
+const FLASH_PI_LATENCY: u8 = 5;
+const FLASH_PI_PAGE_SIZE: u8 = 0x0F;
+const FLASH_PI_RELEASE: u8 = 2;
+const FLASH_PI_PULSE: u8 = 0x0C;
+const FLASH_PI_DOMAIN: u8 = 1;
+const FLASH_KSEG1_BASE: u32 = 0xA800_0000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FlashIdentity {
@@ -57,13 +71,46 @@ impl Default for FlashState {
         Self {
             write_buffer: None,
             erase_complete: false,
-            status: 0,
+            status: FLASH_STATUS_READY,
             identity: FlashIdentity {
                 flash_type: FLASH_TYPE_1MBIT,
                 flash_maker: FLASH_MAKER_MACRONIX_C,
             },
         }
     }
+}
+
+/// Host-visible outcome for the most recent through-erase operation.
+///
+/// The Macronix MX29L-family Status Register table defines DQ7 as ready/busy
+/// and DQ5 as erase failure; the public `<PR/os_flash.h>` maps the three
+/// `osFlashCheckEraseEnd` results to 2, 0, and -1. Fn64's in-memory device
+/// completes erases before the initiating shim returns, but a host backed by a
+/// fallible or timed physical device can publish the other documented outcomes
+/// through this typed seam.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FlashEraseStatus {
+    Busy,
+    Succeeded,
+    Failed,
+}
+
+/// Publish the status of a host-managed through-erase operation.
+pub fn set_flash_erase_status(status: FlashEraseStatus) {
+    with_host(|host| match status {
+        FlashEraseStatus::Busy => {
+            host.flash.erase_complete = false;
+            host.flash.status = 0;
+        }
+        FlashEraseStatus::Succeeded => {
+            host.flash.erase_complete = true;
+            host.flash.status = FLASH_STATUS_READY;
+        }
+        FlashEraseStatus::Failed => {
+            host.flash.erase_complete = true;
+            host.flash.status = FLASH_STATUS_READY | FLASH_STATUS_ERASE_ERROR_BIT;
+        }
+    });
 }
 
 impl FlashState {
@@ -366,12 +413,17 @@ fn post_flash_completion(queue: u32) {
     }
 }
 
-/// `osFlashInit(void) -> OSPiHandle*`.
+/// `osFlashInit(void) -> OSPiHandle*`. Public `<PR/os_flash.h>` fixes the
+/// handle's device type, PI timing, and physical start address; the public
+/// `OSPiHandle` layout represents that start in uncached KSEG1 form. Its storage
+/// address is nevertheless a libultra BSS symbol in each linked ROM, so the
+/// host must register that address rather than fn64 guessing a writable hole
+/// in guest memory.
 ///
 /// # Safety
 /// Same guest-context contract as the other ABI shims.
 #[no_mangle]
-pub unsafe extern "C" fn osFlashInit_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
+pub unsafe extern "C" fn osFlashInit_recomp(rdram: *mut u8, ctx: *mut RecompContext) {
     with_pi_dma("osFlashInit_recomp", |dma| {
         require_flash_len("osFlashInit_recomp", dma);
     });
@@ -383,12 +435,29 @@ pub unsafe extern "C" fn osFlashInit_recomp(_rdram: *mut u8, ctx: *mut RecompCon
             )
         })
     });
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let base = RdramAddr::from_gpr(handle as u64);
+    unsafe {
+        // Public OSPiHandle prefix through baseAddress. Transfer state begins
+        // after byte 16 and is not initialized by the Flash acquisition API.
+        storage.write_u32(base, 0);
+        storage.write_u8(base.checked_add(4).unwrap(), FLASH_DEVICE_TYPE);
+        storage.write_u8(base.checked_add(5).unwrap(), FLASH_PI_LATENCY);
+        storage.write_u8(base.checked_add(6).unwrap(), FLASH_PI_PAGE_SIZE);
+        storage.write_u8(base.checked_add(7).unwrap(), FLASH_PI_RELEASE);
+        storage.write_u8(base.checked_add(8).unwrap(), FLASH_PI_PULSE);
+        storage.write_u8(base.checked_add(9).unwrap(), FLASH_PI_DOMAIN);
+        storage.write_u16(base.checked_add(10).unwrap(), 0);
+        storage.write_u32(base.checked_add(12).unwrap(), FLASH_KSEG1_BASE);
+    }
     unsafe { &mut *ctx }.r2 = handle as i32 as u64;
 }
 
-/// `osFlashReadStatus(u8 *flash_status)`. All storage mutations complete
-/// synchronously in the current device model, so the normal status is clear;
-/// the field remains explicit for the timed DeviceFabric migration.
+/// `osFlashReadStatus(u8 *flash_status)`. The Macronix MX29L-family Status
+/// Register table reports DQ7 set when ready and clear while busy; DQ5 and DQ4
+/// retain erase and write failures until `osFlashClearStatus`. Fn64's in-memory
+/// mutations complete synchronously, so guest code normally observes ready
+/// immediately.
 ///
 /// # Safety
 /// Same raw guest-memory contract as the other ABI shims.
@@ -425,9 +494,8 @@ pub unsafe extern "C" fn osFlashReadId_recomp(rdram: *mut u8, ctx: *mut RecompCo
     }
 }
 
-/// `osFlashClearStatus(void)`. Host storage operations either complete or
-/// trap on I/O failure, so clearing status resets the only modeled pending
-/// erase-completion latch.
+/// `osFlashClearStatus(void)`. Clearing the retained DQ5/DQ4 failure bits
+/// leaves DQ7 set because the synchronous in-memory device is ready.
 ///
 /// # Safety
 /// Same guest-context contract as the other ABI shims.
@@ -435,7 +503,7 @@ pub unsafe extern "C" fn osFlashReadId_recomp(rdram: *mut u8, ctx: *mut RecompCo
 pub unsafe extern "C" fn osFlashClearStatus_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
     with_host(|host| {
         host.flash.erase_complete = false;
-        host.flash.status = 0;
+        host.flash.status = FLASH_STATUS_READY;
     });
 }
 
@@ -451,6 +519,10 @@ fn flash_all_erase(shim: &str) {
         0,
         len,
     );
+    with_host(|host| {
+        host.flash.erase_complete = false;
+        host.flash.status = FLASH_STATUS_READY;
+    });
 }
 
 fn flash_sector_erase(shim: &str, page: u32) -> i32 {
@@ -469,6 +541,10 @@ fn flash_sector_erase(shim: &str, page: u32) -> i32 {
         sector * FLASH_SECTOR_SIZE,
         FLASH_SECTOR_SIZE,
     );
+    with_host(|host| {
+        host.flash.erase_complete = false;
+        host.flash.status = FLASH_STATUS_READY;
+    });
     0
 }
 
@@ -491,7 +567,7 @@ pub unsafe extern "C" fn osFlashAllErase_recomp(_rdram: *mut u8, ctx: *mut Recom
 #[no_mangle]
 pub unsafe extern "C" fn osFlashAllEraseThrough_recomp(_rdram: *mut u8, _ctx: *mut RecompContext) {
     flash_all_erase("osFlashAllEraseThrough_recomp");
-    with_host(|host| host.flash.erase_complete = true);
+    set_flash_erase_status(FlashEraseStatus::Succeeded);
 }
 
 /// `osFlashSectorErase(u32 page_num) -> s32`; page numbers are converted to
@@ -523,25 +599,29 @@ pub unsafe extern "C" fn osFlashSectorEraseThrough_recomp(
         result, 0,
         "osFlashSectorEraseThrough_recomp: page out of range"
     );
-    with_host(|host| host.flash.erase_complete = true);
+    set_flash_erase_status(FlashEraseStatus::Succeeded);
 }
 
-/// `osFlashCheckEraseEnd(void) -> s32`. The backing store has no partially
-/// committed state: a successful through-erase is complete before its shim
-/// returns, so the documented success result is zero. Calling this without a
-/// preceding through operation traps instead of manufacturing status.
+/// `osFlashCheckEraseEnd(void) -> s32`. Public `<PR/os_flash.h>` defines 2,
+/// -1, and 0 for erase-busy, erase-error, and erase-ok; the Programming Manual
+/// section 28.2.9 assigns those three outcomes to this function. The in-memory
+/// backing store transitions directly to success; [`set_flash_erase_status`]
+/// preserves the other documented observations for timed or fallible hosts
+/// without introducing an erase-duration policy here.
 ///
 /// # Safety
 /// Same guest-context contract as the other ABI shims.
 #[no_mangle]
 pub unsafe extern "C" fn osFlashCheckEraseEnd_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
-    require_flash_erase_complete("osFlashCheckEraseEnd_recomp");
-    set_result(unsafe { &mut *ctx }, 0);
-}
-
-fn require_flash_erase_complete(shim: &str) {
-    let complete = with_host(|host| host.flash.erase_complete);
-    assert!(complete, "{shim}: no through-erase operation is pending");
+    let (complete, status) = with_host(|host| (host.flash.erase_complete, host.flash.status));
+    let result = if !complete || status & FLASH_STATUS_READY == 0 {
+        FLASH_STATUS_ERASE_BUSY
+    } else if status & FLASH_STATUS_ERASE_ERROR_BIT != 0 {
+        FLASH_STATUS_ERASE_ERROR
+    } else {
+        FLASH_STATUS_ERASE_OK
+    };
+    set_result(unsafe { &mut *ctx }, result);
 }
 
 /// `osFlashWriteBuffer(OSIoMesg *mb, s32 priority, void *dramAddr,
@@ -595,6 +675,10 @@ pub unsafe extern "C" fn osFlashWriteArray_recomp(_rdram: *mut u8, ctx: *mut Rec
         page * FLASH_PAGE_SIZE,
         FLASH_PAGE_SIZE,
     );
+    with_host(|host| {
+        host.flash.status &= !FLASH_STATUS_WRITE_ERROR_BIT;
+        host.flash.status |= FLASH_STATUS_READY;
+    });
     set_result(ctx, 0);
 }
 
@@ -651,6 +735,10 @@ pub unsafe extern "C" fn osFlashReadArray_recomp(rdram: *mut u8, ctx: *mut Recom
 #[no_mangle]
 pub unsafe extern "C" fn osFlashChange_recomp(_rdram: *mut u8, ctx: *mut RecompContext) {
     let flash_num = unsafe { &*ctx }.r4 as u32;
+    assert!(
+        flash_num <= 3,
+        "osFlashChange_recomp: flash chip selector {flash_num} exceeds the documented 0..=3 range"
+    );
     assert_eq!(
         flash_num, 0,
         "osFlashChange_recomp: flash chip {flash_num} requested, but only chip 0 is installed"
@@ -810,7 +898,7 @@ mod tests {
             FlashEvidenceSnapshot {
                 write_buffer: None,
                 erase_complete: false,
-                status: 0,
+                status: FLASH_STATUS_READY,
                 identity: FlashIdentity {
                     flash_type: FLASH_TYPE_1MBIT,
                     flash_maker: FLASH_MAKER_MACRONIX_C,
@@ -896,19 +984,69 @@ mod tests {
     #[test]
     fn flash_erase_latch_predicts_the_next_completion_check() {
         install_flash();
-        assert!(std::panic::catch_unwind(|| {
-            require_flash_erase_complete("Flash evidence erase-latch test")
-        })
-        .is_err());
-
-        with_host(|host| host.flash.erase_complete = true);
-        assert!(flash_evidence_snapshot().erase_complete);
         let mut check = ctx_zeroed();
+        unsafe { osFlashCheckEraseEnd_recomp(std::ptr::null_mut(), &mut check) };
+        assert_eq!(check.r2, FLASH_STATUS_ERASE_BUSY as u64);
+
+        set_flash_erase_status(FlashEraseStatus::Succeeded);
+        assert!(flash_evidence_snapshot().erase_complete);
         unsafe { osFlashCheckEraseEnd_recomp(std::ptr::null_mut(), &mut check) };
         assert_eq!(check.r2, 0);
 
         unsafe { osFlashClearStatus_recomp(std::ptr::null_mut(), std::ptr::null_mut()) };
         assert!(!flash_evidence_snapshot().erase_complete);
+        assert_eq!(flash_evidence_snapshot().status, FLASH_STATUS_READY);
+    }
+
+    #[test]
+    fn flash_erase_status_reports_busy_success_and_failure() {
+        install_flash();
+        let mut check = ctx_zeroed();
+
+        set_flash_erase_status(FlashEraseStatus::Busy);
+        unsafe { osFlashCheckEraseEnd_recomp(std::ptr::null_mut(), &mut check) };
+        assert_eq!(check.r2, FLASH_STATUS_ERASE_BUSY as u64);
+
+        set_flash_erase_status(FlashEraseStatus::Succeeded);
+        unsafe { osFlashCheckEraseEnd_recomp(std::ptr::null_mut(), &mut check) };
+        assert_eq!(check.r2, FLASH_STATUS_ERASE_OK as u64);
+
+        set_flash_erase_status(FlashEraseStatus::Failed);
+        unsafe { osFlashCheckEraseEnd_recomp(std::ptr::null_mut(), &mut check) };
+        assert_eq!(check.r2, u64::MAX);
+        assert_eq!(
+            flash_evidence_snapshot().status,
+            FLASH_STATUS_READY | FLASH_STATUS_ERASE_ERROR_BIT
+        );
+    }
+
+    #[test]
+    fn flash_init_materializes_the_public_pi_handle() {
+        install_flash();
+        let mut rdram = vec![0xA5; 0x1300];
+        let mut init = ctx_zeroed();
+        unsafe { osFlashInit_recomp(rdram.as_mut_ptr(), &mut init) };
+
+        assert_eq!(init.r2 as u32, 0x8000_1200);
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        let base = RdramAddr::from_offset(0x1200);
+        assert_eq!(view.read_u32(base), 0);
+        assert_eq!(
+            view.read_u8(base.checked_add(4).unwrap()),
+            FLASH_DEVICE_TYPE
+        );
+        assert_eq!(view.read_u8(base.checked_add(5).unwrap()), FLASH_PI_LATENCY);
+        assert_eq!(
+            view.read_u8(base.checked_add(6).unwrap()),
+            FLASH_PI_PAGE_SIZE
+        );
+        assert_eq!(view.read_u8(base.checked_add(7).unwrap()), FLASH_PI_RELEASE);
+        assert_eq!(view.read_u8(base.checked_add(8).unwrap()), FLASH_PI_PULSE);
+        assert_eq!(view.read_u8(base.checked_add(9).unwrap()), FLASH_PI_DOMAIN);
+        assert_eq!(
+            view.read_u32(base.checked_add(12).unwrap()),
+            FLASH_KSEG1_BASE
+        );
     }
 
     #[test]
@@ -1035,7 +1173,7 @@ mod tests {
         let mut status = ctx_zeroed();
         status.r4 = 0x8000_0020;
         unsafe { osFlashReadStatus_recomp(rdram.as_mut_ptr(), &mut status) };
-        assert_eq!(rdram[0x20 ^ 3], 0);
+        assert_eq!(rdram[0x20 ^ 3], FLASH_STATUS_READY);
 
         let mut identity = ctx_zeroed();
         identity.r4 = 0x8000_0040;
@@ -1049,5 +1187,13 @@ mod tests {
             u32::from_ne_bytes(rdram[0x44..0x48].try_into().unwrap()),
             FLASH_MAKER_MACRONIX_C
         );
+    }
+
+    #[test]
+    fn flash_change_accepts_the_installed_chip_zero() {
+        install_flash();
+        let mut change = ctx_zeroed();
+        change.r4 = 0;
+        unsafe { osFlashChange_recomp(std::ptr::null_mut(), &mut change) };
     }
 }
