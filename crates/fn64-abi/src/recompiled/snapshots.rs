@@ -1105,8 +1105,21 @@ pub mod mprotect_census {
 /// `examples/wm2000-block-boot/src/main.rs`, whose bytes are hashed into the
 /// canonical program identity.
 pub mod activation_census {
-    /// generation id -> (activations, reactivations, image bytes, retired count)
+    /// generation id -> (activations, reactivations, unused, retired count)
     static TOTALS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, [u64; 4]>>> =
+        std::sync::Mutex::new(None);
+
+    /// (selected generation, requested pc) -> activations. Answers "is one PC
+    /// alternating between two generations, or are two PCs each stable?" --
+    /// the question that separates a genuine A/B overlay swap from a
+    /// retirement artifact.
+    #[allow(clippy::type_complexity)]
+    static BY_PC: std::sync::Mutex<Option<std::collections::BTreeMap<(u64, u32), u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// (activated generation, retired generation) -> count.
+    #[allow(clippy::type_complexity)]
+    static RETIREMENTS: std::sync::Mutex<Option<std::collections::BTreeMap<(u64, u64), u64>>> =
         std::sync::Mutex::new(None);
 
     pub fn enabled() -> bool {
@@ -1115,13 +1128,6 @@ pub mod activation_census {
     }
 
     fn observe(observation: &fn64_recomp_rs::BackedGenerationActivationObservationV1) {
-        let bytes = u64::from(
-            observation
-                .entry
-                .pc
-                .get()
-                .saturating_sub(observation.requested_pc.get()),
-        );
         let mut guard = TOTALS.lock().expect("activation census poisoned");
         let totals = guard.get_or_insert_with(std::collections::BTreeMap::new);
         let slot = totals.entry(observation.generation.get()).or_insert([0; 4]);
@@ -1129,8 +1135,26 @@ pub mod activation_census {
         if !observation.newly_activated {
             slot[1] += 1;
         }
-        slot[2] = slot[2].max(bytes);
         slot[3] += observation.retired.len() as u64;
+        drop(guard);
+
+        let mut guard = BY_PC.lock().expect("activation census poisoned");
+        let by_pc = guard.get_or_insert_with(std::collections::BTreeMap::new);
+        *by_pc
+            .entry((
+                observation.generation.get(),
+                observation.requested_pc.get(),
+            ))
+            .or_insert(0) += 1;
+        drop(guard);
+
+        let mut guard = RETIREMENTS.lock().expect("activation census poisoned");
+        let retirements = guard.get_or_insert_with(std::collections::BTreeMap::new);
+        for retired in &observation.retired {
+            *retirements
+                .entry((observation.generation.get(), retired.get()))
+                .or_insert(0) += 1;
+        }
     }
 
     /// Install the observer and arm the at-exit report. Idempotent.
@@ -1172,6 +1196,30 @@ pub mod activation_census {
         out.push_str(&format!(
             "[activation-census] total_activations={all} total_reactivations={re}\n"
         ));
+        drop(guard);
+
+        let guard = RETIREMENTS.lock().expect("activation census poisoned");
+        if let Some(retirements) = guard.as_ref() {
+            for ((activated, retired), count) in retirements {
+                out.push_str(&format!(
+                    "[activation-census] retire activated={activated} retired={retired} \
+                     count={count}\n"
+                ));
+            }
+        }
+        drop(guard);
+
+        let guard = BY_PC.lock().expect("activation census poisoned");
+        if let Some(by_pc) = guard.as_ref() {
+            let mut rows = by_pc.iter().collect::<Vec<_>>();
+            rows.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(**count));
+            for ((generation, pc), count) in rows.into_iter().take(24) {
+                out.push_str(&format!(
+                    "[activation-census] pc generation={generation} pc=0x{pc:08x} \
+                     activations={count}\n"
+                ));
+            }
+        }
         out
     }
 }
