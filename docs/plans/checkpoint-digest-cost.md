@@ -706,3 +706,202 @@ before/after pair in this investigation showed no speedup; that comparison was
 invalid -- the two binaries had been built with different
 `FN64_EXECUTABLE_IMAGES` environments, so one lane was not running the closed
 AOT catalog. Recorded because the null result was believed for a while.
+
+## Done (2026-08-07): the root becomes a tree, v2 -> v3
+
+The v2 migration above made the digest's LEAVES incremental and left its ROOT
+flat. This is the other half of it.
+
+### What was left
+
+`watched_root_digest_v2` absorbed 32 bytes of every page digest on every call.
+WM2000 watches 371 pages across two ranges, so each commit that changed
+anything -- however little -- re-absorbed 11,872 bytes into the root. A
+four-byte guest store rehashed one 4 KiB leaf and then the entire leaf vector.
+
+The resolvable self-time profile (`docs/plans/resolvable-self-time-profile.md`,
+5 runs, 7,532 samples) put `sha2::sha256::aarch64::compress` at **26.14%** of
+steady-state self time, of which **20 of the 26 points were `digest_expected`**
+(`live_program.rs`), i.e. the root and not the leaves.
+
+### What the digest is now
+
+Per watched range, a binary Merkle tree over that range's page leaves; then a
+small flat root over the range roots. Five tagged message forms, all prefixed
+with `fn64.canonical-watched-bytes-digest.v3`:
+
+| tag | form | message after the schema prefix |
+|---|---|---|
+| `0x00` | leaf | `page_bytes \|\| start \|\| end \|\| page_index \|\| len \|\| bytes` |
+| `0x02` | internal pair | `fanout \|\| start \|\| end \|\| height \|\| index \|\| left \|\| right` |
+| `0x03` | promoted single child | as above, **without** `right` |
+| `0x04` | range root | `page_bytes \|\| fanout \|\| start \|\| end \|\| page_count \|\| present \|\| apex` |
+| `0x05` | top root | `page_bytes \|\| fanout \|\| range_count \|\| range_roots...` |
+
+The structure is bound rather than inferred: fanout, page size, each node's
+height and index, each range's bounds and page count, and the range count. No
+regrouping of pages, levels or ranges reaches the same root.
+
+The odd trailing node is promoted through its **own** message rather than by
+hashing `H(x||x)`. Duplication is the classic Merkle malleability -- it lets a
+`2n`-leaf tree whose second half repeats its first collide with an `n`-leaf
+tree. Distinct arities make that unrepresentable.
+
+**Fanout 2, why.** Bytes hashed per commit go as `f/ln(f) * ln(n)`, minimised at
+`f = e`. For WM2000's 370 pages: `f=2` is 9 nodes over 576 payload bytes,
+`f=4` is 5 over 640, `f=16` is 3 over 1536. Binary also keeps the incremental
+update a plain parent walk with no sibling gather.
+
+The schema strings for v2 and v3 are the same LENGTH, deliberately, so the
+version separation rests on the bytes themselves rather than on a length shift.
+
+### The saving is counted, not inferred
+
+A temporary census inside the hash functions, both lanes, deep route
+(`FN64_BLOCK_MAX_STEPS=19523 FN64_MPROTECT_BARRIER=1`):
+
+```
+v2: leaf calls=17534 bytes=71,795,552 | node bytes=0         | root bytes=186,615,968 | TOTAL 258,411,520
+v3: leaf calls=17534 bytes=71,795,552 | node bytes=9,213,376 | root bytes=  1,006,016 | TOTAL  82,014,944
+```
+
+Leaf calls and leaf bytes are **byte-identical across the lanes**, which is the
+control: only the root changed. Root-side hashing fell **18.3x** (186.6 MB to
+10.2 MB) and the total digest payload **3.15x**. The probe was reverted.
+
+### Measured, interleaved
+
+15 A/B pairs, alternating, first pair discarded as cold, deep route. The two
+binaries were proven distinct (`cmp`) before timing -- a previous fabricated
+speedup in this project came from an env gate whose "off" spelling read as ON.
+
+| lane | median | min | mean | sd |
+|---|---|---|---|---|
+| v2 flat root | 773.5 ms | 740.2 | 776.2 | 22.1 |
+| v3 Merkle root | 726.3 ms | 706.3 | 728.1 | 12.9 |
+
+**Paired delta: median 54.9 ms, 15/15 pairs positive. 1.065x.**
+
+This is well short of the ~85 ms the optimistic arithmetic predicted, and it is
+reported as measured. Two reasons, both visible in the census above: the leaves
+are 71.8 MB of the 82.0 MB that remain, so the root was never more than ~72% of
+the digest's payload to begin with; and the absolute run time on this machine
+during this session was ~775 ms against the 420-440 ms recorded when the
+profile was taken, so the digest is a smaller share of a larger total. The
+paired, interleaved design is what makes the 54.9 ms trustworthy despite that
+drift -- the ratio is not.
+
+### Equivalence
+
+Complete run output `diff`-identical on both lanes, five paired deep-route runs,
+including `sim_time=13990253`, `thread0_dead=true`, every device counter and
+every event registration. Separately, over the long route
+(`FN64_BLOCK_MAX_STEPS=40000000 FN64_BLOCK_MIN_GUEST_INSTRUCTIONS=1461877`),
+both lanes report `achieved_guest_instructions=1461883 scheduler_steps=874
+sim_time=1492883` and the identical
+`logical_rdram_sha256=3514f2a1e2bf9b667f0a7d0d5bbd1370c85276c49864cb337e9be220aad22080`.
+
+### Determinism, proven against injected faults
+
+`page_tree_root_is_independent_of_incremental_history` is extended three ways,
+each because the v2 form was too weak for v3:
+
+1. **Deeper geometry.** The large range goes from 4 leaves to 22, whose levels
+   are 22, 11, 6, 3, 2, 1 -- odd at three heights, so the promoted-odd-node path
+   is reached at more than one level. The widths are asserted outright so the
+   fixture cannot silently flatten and keep passing.
+2. **Both commit paths.** The test drove only `commit_snapshot`
+   (`refresh_page_digests`, dirty set by page comparison). The path the emulator
+   actually takes is `adopt_from_view` (`refresh_page_digests_over`, dirty set
+   from the changed-range list). **Measured: skipping every third dirty leaf in
+   `refresh_page_digests_over` left the test green** until a second,
+   RDRAM-backed state was added to drive both paths over the same edits. The
+   equivalence tests did catch it, but only on 1 KiB storage -- a single-leaf
+   tree, which could never have caught a multi-level ancestor bug.
+3. **Node-by-node comparison.** A stale INTERNAL node is a failure mode v2 did
+   not have and is invisible to any check that inspects only leaves or only the
+   root. Every level is now compared against a from-scratch build after every
+   commit.
+
+`the_v3_messages_are_exactly_what_the_schema_says` pins each level's hashed
+message field by field against an independently written reference. It exists
+because **`assert_ne!` cannot detect a weakening**: delete the range count from
+the top root and every inequality about it still holds, because both sides lost
+the same field. Measured -- the structural test stayed green through exactly
+that deletion, through a dropped page count, through a reused v2 schema string
+and through a colliding tag byte.
+
+Twelve faults injected one at a time, all twelve caught: skipping the ancestor
+walk; stopping one level short of the apex; skipping every third dirty leaf on
+each of the two commit paths; duplicating the promoted odd child; reading the
+apex from the wrong level; omitting a node's height, index or range bounds;
+omitting the range root's page count or bounds; omitting the top root's range
+count; reusing the v2 schema string in a v3 leaf; and colliding two level tags.
+
+Two faults are correctly NOT failures, recorded so they are not mistaken for
+gaps: dropping the ancestor dedupe hashes a parent twice for the same value (a
+pure performance regression, no value change), and the single-arity tag and the
+child duplication each neutralise the other -- either alone is caught, and so is
+the combination.
+
+One methodological note. An early run of the fault matrix reported four faults
+as "not caught" that were in fact never applied: `%` in a patch string was eaten
+by shell `printf` escaping inside a bash function, so the lanes were identical.
+Each fault verdict here comes from a run that asserted the file changed first.
+
+### Regeneration: again, none
+
+Point 2 and 4 of the original checklist anticipated regenerating committed
+receipt values and gate expectations. As with v2, **that work did not exist.**
+An exhaustive search for 64-hex-character literals finds **zero** hardcoded
+digest expectations over watched executable memory anywhere in
+`crates/fn64-abi`. The hits elsewhere in the tree are ROM image content hashes
+(`examples/wm2000-block-boot`, unchanged by this migration), a NIST SHA-256 test
+vector in `examples/wm2000-block-shards/materializer.rs`, and discovery-gate
+JSON digests in `scripts/gate-determinism.sh`, none of which concern watched
+memory. `scripts/grade-all.sh` grades `fn64-discover` symbol recovery and
+contains no digest expectation.
+
+This is the second migration to cost no regeneration, which makes it a property
+of the design rather than luck: the receipt chain never pins a literal, so every
+assertion compares a recomputed value against a carried one.
+
+### `watched_bytes_sha256` stays v1 and stays flat
+
+The decision is unchanged, and for the same reason. It is the INDEPENDENT
+cross-check of the bootstrap watched bytes, it runs once, and it is not on the
+hot path. Making it a second Merkle tree would make the two agree by
+construction rather than by evidence, and two mechanisms agreeing by
+construction is weaker evidence than two agreeing by measurement.
+
+### Guards unchanged
+
+No guard weakened. `current_changed_ranges`, `first_uncovered_changed_range`,
+`matches_view`, `matches_storage`, the pending-write quiescence assertions and
+the poison path are untouched. The dirty set is still decided by byte
+comparison against the old baseline -- never by a writer's declaration -- and
+every ancestor of every dirty leaf is recomputed without exception, so a node
+whose subtree is clean has identical leaves and therefore an identical value.
+
+The v2 functions are retained under `#[cfg(test)]` as the reference the
+version-distinguishability tests hash against. Nothing on a live path computes
+them.
+
+### Verification
+
+- `cargo nextest run -p fn64-abi --features recomp-rs -p fn64-runtime`:
+  **712/712** (708 pre-existing + 4 new).
+- `cargo nextest run -p fn64-recomp-rs`: **401/401**.
+- `cargo nextest run -p fn64-discover`: **1069/1069**.
+- `scripts/grade-all.sh`: wrong=0 on all five (nw4e-donor 925, nw4e-solo 873,
+  nwxe-donor 779, nwxe-solo 725, revenge-solo 597).
+
+### What is the bottleneck now
+
+Not the root. The census says the leaves are 71.8 MB of the 82.0 MB of digest
+payload that remain -- 88% -- and they are already incremental at 1.005 rehashes
+per commit. The only lever left on the digest itself is the page size, and
+`CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2`'s doc comment already argues that 4 KiB
+sits in the flat middle of that curve. A meaningful further reduction has to
+come from committing less often or watching less memory, and this document
+records four separate falsified attempts at the latter.
