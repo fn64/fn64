@@ -353,3 +353,44 @@ Post-migration self time: `memcmp` 2757, `memmove` 1456,
 `sha2` 173. That is the 1.44 MiB copied out of RDRAM per commit purely so the
 comparison has a contiguous buffer -- addressable by comparing in place, which
 redefines no hashed quantity.
+
+
+## 2026-08-06: cumulative 7.9x, and the profile is now flat
+
+Two optimizations landed in sequence. The 60k benchmark, independently
+re-measured after each:
+
+| stage | 60k | sim_time |
+|---|---|---|
+| session start | ~36.5s | 180000 |
+| v2 page-tree digest | 12-13s | 180000 |
+| in-place watched comparison | **4.6s** | 180000 |
+
+**7.9x cumulative**, with `sim_time` byte-identical at every stage and progress
+counters byte-identical at 200k.
+
+The second change removed the per-commit snapshot copy. Its only consumers were
+a comparison against `expected` and a baseline update needing just the differing
+bytes, so both now read RDRAM in place through the pre-reversed storage-order
+mirror; only changed ranges are materialized, and only the pages they touch are
+rehashed.
+
+Profile confirmation on a live route, sampled from the running binary rather
+than taken on report: `memcmp` 2757 -> **22** samples, `memmove` 1456 -> 11,
+`current_changed_ranges` 1029 -> 11, `sha2` -> 8. The snapshot machinery that
+was ~52% of self time is now marginal. There is no longer a single dominant
+hotspot in the runtime.
+
+Practical effect: the full route to controller read 1400 goes from ~5.1 h at
+session start to roughly 40 min.
+
+### Still open: commit frequency
+
+100% of slices still end on `BlockExit::ExecutableWrite` at ~7.163 instructions
+per scheduler round-trip, while the census shows slices reaching 519 blocks
+wherever the guest does not store. The resident-generation predicate is the
+remaining lever and its safety argument has been verified:
+`activate_for_fetch_with_digest` re-digests live memory unconditionally BEFORE
+consulting `self.active`, so a generation activated later over bytes written
+earlier cannot execute stale code -- it re-digests and returns `AotMiss`.
+`guest_write_token` has no non-test consumers, so nothing short-circuits that.
