@@ -582,9 +582,16 @@ changes. Items 1-3 are strictly better uses of the same time.
 
 ### Not worth doing
 
-- **sha2 (3.32%)** — already using the aarch64 hardware path
-  (`sha2::sha256::aarch64::compress`). The v2 page tree already cut this from
-  hashing 1.44 MiB per commit to one 4 KiB page plus an 11,840-byte root.
+- **sha2 (3.32%)** — **RETRACTED. This number was wrong and this conclusion
+  sent later waves at the wrong target.** Re-measured with `xctrace`/PMU
+  sampling and ground-truth ASLR load addresses, SHA-256 is **26% of steady
+  state** — the single largest cost in the run — of which 20 points are
+  `digest_expected` re-hashing all 256 page digests of the 1 MiB watched region
+  on every commit. The `sample`-based figure here could not see it because the
+  release build inlines the dispatch loop and `sample` reports inclusive counts
+  without raw addresses. See `resolvable-self-time-profile.md` for the method,
+  the two silent traps that produce confident wrong profiles, and the corrected
+  category split.
 - **Guest codegen (2.51%)** — the ~12% figure the brief expected would have
   capped runtime work at 8x and made codegen the path forward. At 2.51% it does
   not. Revisit once the guard is fixed and guest code is a double-digit share.
