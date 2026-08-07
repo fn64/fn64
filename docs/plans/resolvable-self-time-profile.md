@@ -202,3 +202,33 @@ Then per row: read `<binary load-addr>` for the main image, subtract
 `load-addr - 0x100000000` from every main-image frame `addr`, and resolve with
 `atos -o /tmp/wm2000bb.dSYM -l 0x100000000`. Self time is the **leaf frame
 only**, weighted by the row's `cycle-weight`.
+
+## The 440 ms vs 775 ms discrepancy: machine load, not drift
+
+A v3-migration agent flagged ~335 ms unexplained between its runs (~775 ms) and
+the profile this document was taken from (~440 ms) — same route, same env, same
+build config. It was right to stop and flag it rather than optimize past it:
+that gap is six times the win it had just measured.
+
+**Cause: fifteen concurrent `rustc` processes at ~90% CPU each**, load average
+16.16. A second agent was rebuilding the 32 shard crates — an ~11 minute job
+triggered by any edit to `crates/fn64-recomp-rs`. The benchmark was competing
+with a full shard rebuild.
+
+Reproduced: the same binary and invocation that measured 430 ms on an idle
+machine measures 732-749 ms under that load. Nothing regressed.
+
+### The rule this needs
+
+**Absolute timings are only comparable on a quiet machine.** Before quoting one,
+check `uptime` and count heavy processes; if load exceeds ~2, the number
+describes contention rather than the code.
+
+Interleaved A/B pairs survive this — the v3 agent's paired design measured a
+trustworthy 54.9 ms delta *through* the contention, which is exactly what
+pairing is for. But the **ratio** to hardware does not survive, and that agent
+correctly declined to quote one.
+
+Practical consequence: **do not run a `fn64-recomp-rs`-editing agent concurrently
+with a benchmarking agent.** `fn64-abi` edits rebuild only the harness (~25 s);
+`fn64-recomp-rs` edits rebuild 32 crates and saturate the machine.
