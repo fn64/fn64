@@ -1280,3 +1280,33 @@ runs the other way), so the verify cannot ask whether the barrier is armed.
 mean a runtime flag test per instruction. And the sets differ: the barrier's
 span is the page-widened executable ranges bound at seal, while the verify
 covers whatever PC executes, and the barrier legitimately degrades to `Unknown`.
+
+## 2026-08-07: counted, not inferred — the syscall numbers I gave were wrong
+
+I inferred "~182,892 `mprotect` calls at ~1.7 us = ~316 ms" from a sampling
+profile. Both halves were inference: a sampling profiler attributes samples, not
+calls, and a boundary count is not a syscall count — the handler issues one per
+*fault*, while arm/disarm issue one per boundary they actually run on.
+
+Counted (`FN64_MPROTECT_BARRIER_SYSCALLS=1`, deep route, 19,523 steps,
+91,446 boundaries):
+
+```
+total   206,348   231.0 ms   (37% of the 620 ms run)
+  arm    91,551   111.9 ms   1222 ns each
+  disarm 91,551   110.5 ms   1207 ns each
+```
+
+So the direction was right and both numbers were wrong — 206k calls not 183k,
+231 ms not 316 ms. The counter is gated, `OnceLock`-cached, and routes every
+call site through one timed wrapper so no site can be counted in one place and
+missed in another.
+
+**Upper bound on the remaining lever:** 75% of boundaries are clean
+(`clean=68615`), so at most 137,230 syscalls — about **167 ms of the 620 ms** —
+are skippable. That would put WM2000 near **2.6x hardware**. Real, bounded, and
+not parity.
+
+This is the third time today an unverified inference of this exact shape
+produced a wrong number, after the fabricated 4.9x and the inclusive-vs-self
+profile. Count before optimizing.
