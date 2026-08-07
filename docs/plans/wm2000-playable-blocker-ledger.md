@@ -306,3 +306,50 @@ generations stayed resident throughout; the catalogued fourth
 route.** The remaining 840 controller reads need roughly 3x the budget, which
 at current throughput is several more hours. Depth is now purely a throughput
 question -- see `docs/plans/dispatch-granularity.md`.
+
+
+## 2026-08-06: the v2 page-tree digest -- 2.9x, independently reproduced
+
+The checkpoint digest migration landed. `digest_snapshot` no longer hashes the
+whole watched region on every commit; each range is partitioned into 4096-byte
+pages with a per-page SHA-256 leaf and a root over the leaves, so a commit
+rehashes only the pages whose bytes changed. Measured: **1.005 page rehashes per
+commit**.
+
+| | before | after |
+|---|---|---|
+| 60k benchmark | ~36.5s | **12-13s** |
+| throughput | 1,644 steps/s | **4,800 steps/s** |
+| 200k route | 107.5s | 43.2s |
+| SHA-256 self time | 70.30% | 2.3% |
+| `sim_time` (60k) | 180000 | 180000 |
+
+Verified independently of the implementing agent: 694/694 abi+runtime,
+401/401 recomp-rs, `grade-all.sh` wrong=0 on all five, and a live route running
+clean with zero `unjournaled`/`AotMiss` failures.
+
+**The expected certification cost did not exist.** This migration was gated
+behind three other investigations on the belief that it would force receipt-chain
+regeneration across gates, fixtures and docs. An exhaustive search found **zero
+hardcoded digest literals** over watched executable memory: `fn64-abi` owns the
+chain and computes it end to end, so no fixture, gate, test or reference edit was
+required. The blast radius was estimated from architecture rather than from
+grep, and that misestimate cost real sequencing time.
+
+`watched_bytes_sha256` deliberately stays v1 and flat. It is the independent
+bootstrap cross-check, runs once, and is not hot -- making it a second page tree
+would have the two agree by construction rather than by evidence.
+
+### What this buys in practice
+
+The 12M-step route that took ~2h20m now takes ~48 min, and the full route to
+controller read 1400 drops from ~5.1 h to ~1.7 h -- from impractical to
+runnable.
+
+### The bottleneck moved rather than vanished
+
+Post-migration self time: `memcmp` 2757, `memmove` 1456,
+`current_changed_ranges` 1029, `copy_logical_bytes` 920, `set_expected` 915,
+`sha2` 173. That is the 1.44 MiB copied out of RDRAM per commit purely so the
+comparison has a contiguous buffer -- addressable by comparing in place, which
+redefines no hashed quantity.
