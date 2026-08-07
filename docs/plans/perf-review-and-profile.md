@@ -478,6 +478,48 @@ the declaration queue. **Do not attempt the queue-driven version.** Given that
 history, this needs a full route under `FN64_DISABLE_RESIDENT_BOUNDARY` A/B
 before it is trusted.
 
+#### Resolved 2026-08-07: the page tree cannot narrow the scan. Lever closed.
+
+The proposal was to let the v2 page digests identify candidate pages and run
+the byte scan only inside them. The appeal is real — the region is 370 pages
+and the measured change rate is **1.005 page rehashes per commit**
+(`checkpoint-digest-cost.md:481`), so the scan does ~368x more work than the
+change requires.
+
+**It does not work, and the reason is not the write queue.** It fails on
+arithmetic that holds regardless of soundness.
+
+`expected_page_digests` is a **cache of the baseline**, not an observation of
+live RDRAM. All five call sites of `watched_page_digest_v2` hash either
+`self.expected` (`mod.rs:642`, `:657`, `:895`) or a caller-supplied snapshot
+(`live_program.rs:425`). **Not one hashes live RDRAM.** The stored digests
+therefore say nothing about what RDRAM currently holds; they describe what the
+baseline holds, which is precisely the side of the comparison that is already
+in hand and never the side that needs reading.
+
+To make a page digest answer "did live RDRAM change", it must be recomputed
+from live RDRAM — and SHA-256 must read **every byte of the page to produce
+it**. Detecting change across 370 pages by digest means hashing all 1,513,056
+bytes. The `memcmp` it would replace reads *the same 1,513,056 bytes* and stops
+early on the first difference. Digesting is strictly worse: same reads, plus
+SHA-256 compression per byte instead of a vectorized 32-byte-per-cycle compare.
+
+The dirty-page set is not free-standing information either. `refresh_page_digests`
+derives it at `mod.rs:654` with `if self.expected[lo..hi] == bytes[lo..hi]` —
+a full-region `memcmp` — and `refresh_page_digests_over` (`:876`) takes it from
+`changed`, which came from the scan. **The page tree's 1.005 rehashes/commit is
+a saving on hashing, achieved by consuming a comparison someone else already
+paid for. It is downstream of the scan, so it cannot replace the scan.**
+
+That is why the 57.56% is not addressable this way: the guard's cost is the
+*read* of the watched region, and every candidate substitute (digest, checksum,
+Merkle path) must perform that same read to be trustworthy. Only a mechanism
+that learns of writes **without reading** — hardware dirty bits or `mprotect`
+— could break the O(watched bytes) floor, and both are out of scope for a
+correctness guard that must not miss a write.
+
+Left on the table deliberately. The guard has caught two real corruptions.
+
 ### 3. Stop cloning the whole program on every watched store — ~4%, low risk
 
 **Mechanism.** `classify_live_executable_write` (`snapshots.rs:1045`) does
@@ -501,6 +543,26 @@ borrow, rather than cloning the program out to call a method on it. Or wrap
 **What would break.** Doing the test inside the closure means `HOST` is held
 while `generations.try_borrow()` runs. That is a *narrower* window than today
 (the clone already runs under the same borrow), but it must stay `try_borrow`.
+
+### Measured outcome of items 1 and 3 (landed 2026-08-07)
+
+8 runs each, same guest work (1,461,883 instructions), complete run output
+`diff`-identical to the baseline in every lane — `sim_time=1492883`,
+`logical_rdram_sha256=3514f2a1…`, and every device counter.
+
+| state | ms | M instr/s | vs 93.75 MHz |
+|---|---|---|---|
+| baseline | 271.1 | 5.39 | 17.4x |
+| + single HostAbi scan | 259.5 | 5.63 | 16.6x |
+| + no program clone | 241.3 | 6.06 | 15.5x |
+
+**11.0% total.** The clone (18.2 ms) paid more than the double scan (11.6 ms),
+inverting the profile's ranking — the double scan's predicted ~7% was measured
+against `flush_host_abi_transaction`'s two rows only, but the reuse also
+removes the `matches_view` short-circuit scan on the `checkpoint` path, while
+the clone's 4.17% inclusive understated the allocator traffic it caused.
+
+Item 2 (incremental reconcile) is closed as not viable — see above.
 
 ### 4. `target-cpu=native` in isolation — unknown, low risk
 
