@@ -638,12 +638,24 @@ impl CatalogNestedWriterTransactionV1 {
         // whose only use is `current_changed_ranges`. When nothing changed
         // that list is empty and the `notify` loop below has no iterations,
         // so skipping the snapshot cannot change what is notified.
-        if !state.borrow().matches_view(&view) {
-            let snapshot = state.borrow().read_snapshot_from_view(&view);
-            let changed = state.borrow().current_changed_ranges(&snapshot);
-            for (physical_start, physical_end) in changed {
-                notify(physical_start, physical_end - physical_start);
+        // `changed_ranges_from_view` subsumes the `matches_view` short-circuit
+        // it replaces: it settles "nothing changed" with the same `memcmp` per
+        // range and returns an empty list, so the `notify` loop below has no
+        // iterations -- and when something DID change it names the bytes
+        // without the snapshot the old form had to build to find them.
+        //
+        // `None` means an unmapped watched byte; the copying path below then
+        // raises the panic that owes, exactly as before.
+        let changed = state.borrow().changed_ranges_from_view(&view);
+        let changed = match changed {
+            Some(changed) => changed,
+            None => {
+                let snapshot = state.borrow().read_snapshot_from_view(&view);
+                state.borrow().current_changed_ranges(&snapshot)
             }
+        };
+        for (physical_start, physical_end) in changed {
+            notify(physical_start, physical_end - physical_start);
         }
         self.commit(rdram);
     }

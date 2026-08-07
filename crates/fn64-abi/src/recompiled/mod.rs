@@ -668,6 +668,240 @@ impl WatchedExecutableBytesV1 {
         (((4 - (physical_start % 4)) % 4) as usize).min(len)
     }
 
+    /// Append the ranges where live storage differs from the baseline.
+    ///
+    /// Exactly the ranges `current_changed_ranges` derives from
+    /// `read_snapshot_from_view`, decided without materializing the snapshot.
+    /// `matches_view` already answers the BOOLEAN form of this question in one
+    /// `memcmp` per range; this is the same comparison carried far enough to
+    /// name the differing bytes, so the commit path no longer has to copy and
+    /// word-reverse 1.44 MiB just to find the handful of bytes that moved.
+    ///
+    /// LANE MAPPING. Logical byte `n` lives at storage index `n ^ 3`. Across
+    /// the word-aligned body that XOR is precisely a 4-byte reversal, so the
+    /// body is compared as raw storage against the pre-reversed
+    /// `expected_storage_order` mirror and only the words that differ are
+    /// walked -- and inside such a word, storage lane `k` is logical lane
+    /// `3 - k`. The at-most-three head and tail bytes stay on the same
+    /// per-byte `read_u8` path `copy_logical_bytes` uses, so an unaligned
+    /// range cannot be decided by a different rule than the copy would apply.
+    ///
+    /// Returns `false` when storage is out of range, leaving `out` as it found
+    /// it: the caller then falls back to the copying path so the panic an
+    /// unmapped byte owes is raised by exactly the code that raised it before.
+    #[must_use]
+    fn changed_ranges_into(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        out: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        let len = self.expected.len();
+        debug_assert_eq!(len, (self.physical_end - self.physical_start) as usize);
+        let head = Self::head_len(self.physical_start, len);
+        let body = (len - head) & !3;
+        let base = fn64_runtime::RdramAddr::from_offset(self.physical_start);
+
+        // One coalescing sink for all three lanes. `current_changed_ranges`
+        // emits maximal runs of consecutive differing LOGICAL bytes, and a run
+        // can cross the head/body and body/tail seams, so the runs cannot be
+        // closed per lane -- they are closed when a byte matches or the region
+        // ends.
+        let first = out.len();
+        let physical_start = self.physical_start;
+        let push = |out: &mut Vec<(u32, u32)>, index: usize| {
+            let physical = physical_start + index as u32;
+            // Extend the open run only if it is one THIS range opened: a run
+            // from an earlier watched range must never absorb a byte from this
+            // one, even where the two happen to abut.
+            if out.len() > first {
+                if let Some((_, end)) = out.last_mut() {
+                    if *end == physical {
+                        *end = physical + 1;
+                        return;
+                    }
+                }
+            }
+            out.push((physical, physical + 1));
+        };
+
+        for index in 0..head {
+            let addr = match base.checked_add(index as u32) {
+                Some(addr) => addr,
+                None => {
+                    out.truncate(first);
+                    return false;
+                }
+            };
+            if view.read_u8(addr) != self.expected[index] {
+                push(out, index);
+            }
+        }
+
+        if body > 0 {
+            let start = self.physical_start as usize + head;
+            let Some(live) = view.storage_slice(start, body) else {
+                out.truncate(first);
+                return false;
+            };
+            let mirror = &self.expected_storage_order[head..head + body];
+            // The overwhelmingly common answer is "nothing changed", and the
+            // whole body settles that in one `memcmp`. Only when it fails does
+            // anything walk words.
+            if live != mirror {
+                // Chunk the scan so equal stretches are skipped a `memcmp` at a
+                // time rather than a word at a time. Chunk boundaries cannot
+                // affect the result: every differing byte is still visited, and
+                // `push` coalesces across them.
+                const CHUNK: usize = 256;
+                let mut word = 0;
+                let words = body / 4;
+                while word < words {
+                    let chunk = CHUNK.min(words - word);
+                    if live[word * 4..(word + chunk) * 4]
+                        == mirror[word * 4..(word + chunk) * 4]
+                    {
+                        word += chunk;
+                        continue;
+                    }
+                    for word in word..word + chunk {
+                        let at = word * 4;
+                        if live[at..at + 4] == mirror[at..at + 4] {
+                            continue;
+                        }
+                        // Storage lane `k` of an aligned word is logical lane
+                        // `3 - k`, so walk the lanes in logical order.
+                        for lane in 0..4 {
+                            if live[at + 3 - lane] != mirror[at + 3 - lane] {
+                                push(out, head + at + lane);
+                            }
+                        }
+                    }
+                    word += chunk;
+                }
+            }
+        }
+
+        for index in head + body..len {
+            let addr = match base.checked_add(index as u32) {
+                Some(addr) => addr,
+                None => {
+                    out.truncate(first);
+                    return false;
+                }
+            };
+            if view.read_u8(addr) != self.expected[index] {
+                push(out, index);
+            }
+        }
+        true
+    }
+
+    /// Refresh the baseline over only the ranges that changed.
+    ///
+    /// `set_expected` rewrites all three baseline forms over the whole watched
+    /// region -- 1.44 MiB of `expected`, 1.44 MiB of `expected_storage_order`,
+    /// and a `memcmp` per page to find the dirty pages. When the changed set is
+    /// known that is almost entirely wasted: the bytes outside it are already
+    /// correct in both mirrors, and their page digests are already correct too.
+    ///
+    /// `changed` is in physical addresses, ascending, disjoint, and clipped to
+    /// this range by construction (it comes from `changed_ranges_into` on this
+    /// same range). Bytes are read from the view with the same lane mapping
+    /// `copy_logical_bytes` applies, so `expected` lands byte-identical to what
+    /// the full-copy path would have produced -- which is the invariant the
+    /// mutation journal's guarantee rests on.
+    fn apply_changed_from_view(
+        &mut self,
+        view: &fn64_runtime::RdramView<'_>,
+        changed: &[(u32, u32)],
+    ) {
+        if changed.is_empty() {
+            return;
+        }
+        for &(physical_start, physical_end) in changed {
+            debug_assert!(
+                self.physical_start <= physical_start && physical_end <= self.physical_end
+            );
+            let lo = (physical_start - self.physical_start) as usize;
+            let hi = (physical_end - self.physical_start) as usize;
+            view.copy_logical_bytes(
+                fn64_runtime::RdramAddr::from_offset(physical_start),
+                &mut self.expected[lo..hi],
+            );
+        }
+        // Rebuild the storage-order mirror over the same spans, from the
+        // freshly updated logical bytes, so the two forms cannot drift.
+        //
+        // Widened to whole words across the body because the mirror is
+        // word-reversed there: a partial word cannot be reversed in isolation.
+        // Widening only re-derives bytes that are already correct, so it
+        // changes no value.
+        let len = self.expected.len();
+        let head = Self::head_len(self.physical_start, len);
+        let body = (len - head) & !3;
+        for &(physical_start, physical_end) in changed {
+            let lo = (physical_start - self.physical_start) as usize;
+            let hi = (physical_end - self.physical_start) as usize;
+            // Head and tail lanes are stored un-reversed.
+            for index in (lo..hi.min(head)).chain((lo.max(head + body))..hi) {
+                self.expected_storage_order[index] = self.expected[index];
+            }
+            let word_lo = lo.max(head).min(head + body);
+            let word_hi = hi.max(head).min(head + body);
+            if word_lo >= word_hi {
+                continue;
+            }
+            let word_lo = head + ((word_lo - head) & !3);
+            let word_hi = head + (word_hi - head).div_ceil(4) * 4;
+            self.expected_storage_order[word_lo..word_hi]
+                .copy_from_slice(&self.expected[word_lo..word_hi]);
+            for word in self.expected_storage_order[word_lo..word_hi].chunks_exact_mut(4) {
+                word.reverse();
+            }
+        }
+        self.refresh_page_digests_over(changed);
+    }
+
+    /// Rehash exactly the pages the changed ranges touch.
+    ///
+    /// Same contract as [`Self::refresh_page_digests`] and same conservatism,
+    /// reached from the other direction: that form finds the dirty pages by
+    /// comparing every page against the OLD baseline, which it can only do
+    /// while both baselines exist. Here `expected` has already been updated in
+    /// place, so the dirty set comes from `changed` -- which is itself derived
+    /// from a byte-for-byte comparison of live storage against the old
+    /// baseline, not from any writer's declaration. A page outside every
+    /// changed range has, by that comparison, identical bytes, and identical
+    /// bytes have an identical digest.
+    fn refresh_page_digests_over(&mut self, changed: &[(u32, u32)]) {
+        let len = self.expected.len();
+        debug_assert_eq!(self.expected_page_digests.len(), Self::page_count(len));
+        let mut previous: Option<usize> = None;
+        for &(physical_start, physical_end) in changed {
+            let lo = (physical_start - self.physical_start) as usize;
+            let hi = (physical_end - self.physical_start) as usize;
+            let first = lo / CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
+            let last = (hi - 1) / CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
+            for index in first..=last {
+                // Adjacent changed ranges routinely share a page; hashing it
+                // twice is correct but wasteful, and the ranges are ascending
+                // so the previous index is the only possible repeat.
+                if previous == Some(index) {
+                    continue;
+                }
+                previous = Some(index);
+                let page_lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
+                let page_hi = (page_lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(len);
+                self.expected_page_digests[index] = receipts::watched_page_digest_v2(
+                    self.physical_start,
+                    self.physical_end,
+                    index as u32,
+                    &self.expected[page_lo..page_hi],
+                );
+            }
+        }
+    }
+
     /// Whether live RDRAM storage still equals the sealed baseline.
     ///
     /// Exactly the predicate `expected == read_snapshot_from_view(..)` computes,
@@ -706,6 +940,15 @@ impl WatchedExecutableBytesV1 {
 
 struct CanonicalExecutableMutationStateV1 {
     watched: Vec<WatchedExecutableBytesV1>,
+    /// The changed set in flight, parked here for the duration of one commit.
+    ///
+    /// `commit_changed` needs the list both to build the journal entry and to
+    /// hand to the baseline-adoption closure, and that closure takes `&mut
+    /// Self` -- so the list cannot simultaneously be borrowed out of a local.
+    /// Parking it on the state for the length of the call is what lets both
+    /// commit forms share one body. Always empty between commits; nothing
+    /// reads it outside `commit_changed` and the closures it invokes.
+    pending_changed: Vec<(u32, u32)>,
     /// Retired baseline buffers, reused by `read_snapshot_from_view`.
     ///
     /// Pure allocator hygiene: nothing reads their contents, they are cleared

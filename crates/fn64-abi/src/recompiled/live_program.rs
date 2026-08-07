@@ -58,6 +58,7 @@ impl CanonicalExecutableMutationStateV1 {
         }
         Self {
             watched,
+            pending_changed: Vec::new(),
             recycled: RefCell::new(Vec::new()),
             sealed: false,
             expected_sha256: None,
@@ -353,6 +354,40 @@ impl CanonicalExecutableMutationStateV1 {
     /// by exactly the code that produced it before.
     pub(super) fn matches_view(&self, view: &fn64_runtime::RdramView<'_>) -> bool {
         self.sealed && self.watched.iter().all(|range| range.matches_storage(view))
+    }
+
+    /// The changed ranges, decided against live storage without a snapshot.
+    ///
+    /// Exactly what `current_changed_ranges(&read_snapshot_from_view(v))`
+    /// returns -- same ranges, same order -- and the equivalence is asserted
+    /// over randomized contents and change patterns by
+    /// `changed_ranges_from_view_matches_the_copying_path`.
+    ///
+    /// `matches_view` already decides the boolean form of this in one `memcmp`
+    /// per range, and this is the same comparison carried far enough to name
+    /// the bytes. That is what lets the commit path stop materializing 1.44 MiB
+    /// per commit: the snapshot's only consumers were this comparison and the
+    /// baseline update, and the update only needs the bytes that changed.
+    ///
+    /// `None` means some watched byte is outside storage. The caller must then
+    /// fall back to the copying path, which raises the panic that owes.
+    pub(super) fn changed_ranges_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+    ) -> Option<Vec<(u32, u32)>> {
+        // Before sealing there is no baseline: `expected` is empty, so a
+        // comparison against it means nothing. `matches_view` refuses the same
+        // way, and callers fall back to the copying path.
+        if !self.sealed {
+            return None;
+        }
+        let mut changed = Vec::new();
+        for range in &self.watched {
+            if !range.changed_ranges_into(view, &mut changed) {
+                return None;
+            }
+        }
+        Some(changed)
     }
 
     pub(super) fn read_snapshot(&self, mut read_physical_byte: impl FnMut(u32) -> u8) -> Vec<Vec<u8>> {
@@ -728,11 +763,35 @@ impl CanonicalExecutableMutationStateV1 {
         self.expected_sha256 = Some(self.digest_expected());
     }
 
+    /// Accept live RDRAM as the baseline without materializing a snapshot.
+    ///
+    /// The snapshot-free twin of [`Self::adopt_snapshot`]. `changed` comes from
+    /// [`Self::changed_ranges_from_view`], so an empty list means the live
+    /// bytes already equal the baseline -- the same early return
+    /// `adopt_snapshot` makes when `expected` equals the snapshot, reached
+    /// without the comparison having copied anything.
+    pub(super) fn adopt_from_view(
+        &mut self,
+        view: &fn64_runtime::RdramView<'_>,
+        changed: Vec<(u32, u32)>,
+    ) {
+        self.assert_not_poisoned();
+        if !self.sealed || changed.is_empty() {
+            return;
+        }
+        self.pending_changed = changed;
+        self.adopt_changed_from_view(view);
+        self.pending_changed.clear();
+        // AFTER the baseline update: the incremental root reads the page
+        // digests `apply_changed_from_view` just refreshed.
+        self.expected_sha256 = Some(self.digest_expected());
+    }
+
     pub(super) fn commit_snapshot(
         &mut self,
         snapshot: Vec<Vec<u8>>,
         events: Vec<GuestWriteEvent>,
-        mut invalidated_generations: Vec<GenerationId>,
+        invalidated_generations: Vec<GenerationId>,
     ) {
         self.assert_not_poisoned();
         assert!(
@@ -740,6 +799,74 @@ impl CanonicalExecutableMutationStateV1 {
             "canonical executable mutation state is not sealed"
         );
         let changed = self.current_changed_ranges(&snapshot);
+        self.commit_changed(changed, events, invalidated_generations, |state| {
+            let mut recycled = state.recycled.borrow_mut();
+            let watched_len = state.watched.len();
+            for (range, bytes) in state.watched.iter_mut().zip(snapshot) {
+                let retired = range.set_expected(bytes);
+                if recycled.len() < watched_len {
+                    recycled.push(retired);
+                }
+            }
+        });
+    }
+
+    /// Commit a change set whose bytes are already in live RDRAM.
+    ///
+    /// The snapshot-free twin of [`Self::commit_snapshot`]: the changed ranges
+    /// come from [`Self::changed_ranges_from_view`] rather than from a
+    /// materialized copy, and the baseline is refreshed over just those ranges
+    /// instead of being wholesale replaced. Everything downstream -- the
+    /// attribution guard, the journal entry, the digests -- is the same code
+    /// reached through [`Self::commit_changed`].
+    ///
+    /// The `expected` baseline lands byte-identical to what the copying path
+    /// would have produced: bytes inside the changed ranges are re-read through
+    /// the same `copy_logical_bytes` lane mapping, and bytes outside them were
+    /// proven equal to the baseline by the comparison that produced `changed`.
+    pub(super) fn commit_from_view(
+        &mut self,
+        view: &fn64_runtime::RdramView<'_>,
+        changed: Vec<(u32, u32)>,
+        events: Vec<GuestWriteEvent>,
+        invalidated_generations: Vec<GenerationId>,
+    ) {
+        self.assert_not_poisoned();
+        assert!(
+            self.sealed,
+            "canonical executable mutation state is not sealed"
+        );
+        self.commit_changed(changed, events, invalidated_generations, |state| {
+            state.adopt_changed_from_view(view);
+        });
+    }
+
+    /// Refresh the baseline over `self.pending_changed`, per watched range.
+    ///
+    /// Split out so both commit forms hand `commit_changed` a closure of the
+    /// same shape. The changed list is partitioned by watched range here rather
+    /// than carried per range, because the journal entry needs it flat.
+    fn adopt_changed_from_view(&mut self, view: &fn64_runtime::RdramView<'_>) {
+        let changed = std::mem::take(&mut self.pending_changed);
+        let mut cursor = 0;
+        for range in &mut self.watched {
+            let first = cursor;
+            while cursor < changed.len() && changed[cursor].0 < range.physical_end {
+                cursor += 1;
+            }
+            range.apply_changed_from_view(view, &changed[first..cursor]);
+        }
+        debug_assert_eq!(cursor, changed.len());
+        self.pending_changed = changed;
+    }
+
+    fn commit_changed(
+        &mut self,
+        changed: Vec<(u32, u32)>,
+        events: Vec<GuestWriteEvent>,
+        mut invalidated_generations: Vec<GenerationId>,
+        adopt: impl FnOnce(&mut Self),
+    ) {
         let declarations = self.clipped_declarations(&events);
         if let Some((physical_start, physical_end)) =
             Self::first_uncovered_changed_range(&declarations, &changed)
@@ -800,15 +927,9 @@ impl CanonicalExecutableMutationStateV1 {
         // `current_changed_ranges` comparison and the
         // `first_uncovered_changed_range` guard -- has already run and
         // panicked if it was going to, and `changed` is already materialized.
-        let mut recycled = self.recycled.borrow_mut();
-        let watched_len = self.watched.len();
-        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            let retired = range.set_expected(bytes);
-            if recycled.len() < watched_len {
-                recycled.push(retired);
-            }
-        }
-        drop(recycled);
+        self.pending_changed = changed;
+        adopt(self);
+        let changed = std::mem::take(&mut self.pending_changed);
         let after_sha256 = if changed.is_empty() {
             before_sha256
         } else {
@@ -2255,6 +2376,35 @@ impl CanonicalLiveBlockProgramV1 {
                         return invalidated;
                     }
                 }
+            }
+            // Decide the changed set against live RDRAM, without building the
+            // 1.44 MiB snapshot.
+            //
+            // The snapshot's only two consumers on this path were
+            // `current_changed_ranges`, which merely COMPARES it against the
+            // baseline, and the baseline update, which only needs the bytes
+            // that actually differ. `changed_ranges_from_view` answers the
+            // first directly against storage -- the same comparison
+            // `matches_view` already makes, carried far enough to name the
+            // bytes -- and the commit forms below refresh only those bytes.
+            //
+            // `None` means some watched byte lies outside storage. That falls
+            // through to the copying path, whose `copy_logical_bytes` raises
+            // the panic an unmapped byte owes, naming the first such byte. The
+            // fast path commits to nothing in that case.
+            let changed = match view {
+                Some(view) => state.borrow().changed_ranges_from_view(view),
+                None => None,
+            };
+            if let (Some(view), Some(changed)) = (view, changed) {
+                if writes.is_empty() && events.is_empty() {
+                    state.borrow_mut().adopt_from_view(view, changed);
+                } else {
+                    state
+                        .borrow_mut()
+                        .commit_from_view(view, changed, events, invalidated.clone());
+                }
+                return invalidated;
             }
             let snapshot = match view {
                 Some(view) => state.borrow().read_snapshot_from_view(view),

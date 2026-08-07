@@ -71,6 +71,226 @@ use super::*;
         }
     }
 
+    /// The snapshot-free comparison must name EXACTLY the same bytes.
+    ///
+    /// `changed_ranges_from_view` is what lets the commit path stop copying and
+    /// word-reversing the whole watched region, so a disagreement in the
+    /// "unchanged" direction is a silently accepted executable mutation -- the
+    /// exact failure mode the mutation journal exists to prevent, and one this
+    /// project has already paid for once.
+    ///
+    /// The swizzle is the trap: logical byte `a` lives at storage `a ^ 3`, and
+    /// getting the lane wrong inside a word produces a comparison that reports
+    /// "unchanged" for changed memory only for particular lane patterns -- so
+    /// this drives randomized contents and randomized change patterns across
+    /// unaligned starts, unaligned ends, sub-word ranges, ranges straddling
+    /// word boundaries, and multiple watched ranges at once.
+    ///
+    /// It also asserts the SECOND half of the contract: after a commit, the
+    /// `expected` baseline (and both derived mirrors, via the digest) must be
+    /// byte-identical to what the full-copy path would have produced.
+    #[test]
+    fn changed_ranges_from_view_matches_the_copying_path() {
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        // xorshift64*, so the pattern is reproducible without a dev-dependency.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        // Unaligned start, unaligned end, both unaligned, sub-word (entirely
+        // inside one storage word), a range shorter than the 3-byte head, one
+        // spanning many words, and a multi-range watched set.
+        let layouts: [&[(u32, u32)]; 9] = [
+            &[(0x100, 0x180)],
+            &[(0x101, 0x180)],
+            &[(0x100, 0x17f)],
+            &[(0x101, 0x17f)],
+            &[(0x102, 0x105)],
+            &[(0x101, 0x103)],
+            &[(0x105, 0x106)],
+            &[(0x103, 0x104)],
+            &[(0x101, 0x117), (0x120, 0x181), (0x1c2, 0x1c7)],
+        ];
+
+        for layout in layouts {
+            let mut storage = vec![0u8; 0x400];
+            for byte in storage.iter_mut() {
+                *byte = next() as u8;
+            }
+            let mut fast = CanonicalExecutableMutationStateV1::new(layout);
+            let mut slow = CanonicalExecutableMutationStateV1::new(layout);
+            {
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let read = |physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical));
+                fast.seal_with(read);
+                slow.seal_with(read);
+            }
+
+            for round in 0..64 {
+                // A random change pattern over the watched bytes: sometimes a
+                // single byte, sometimes a dense run, sometimes scattered, and
+                // sometimes nothing at all.
+                let density = next() % 5;
+                let watched = layout
+                    .iter()
+                    .flat_map(|&(start, end)| start..end)
+                    .collect::<Vec<_>>();
+                for &physical in &watched {
+                    let flip = match density {
+                        0 => false,
+                        1 => next() % 97 == 0,
+                        2 => next() % 7 == 0,
+                        3 => next() % 2 == 0,
+                        _ => true,
+                    };
+                    if flip {
+                        storage[(physical ^ 3) as usize] ^= (next() as u8) | 1;
+                    }
+                }
+                // Bytes outside every watched range must never influence the
+                // answer, so churn them on every round.
+                for physical in [0x0u32, 0x99, 0x1ff, 0x2ab, 0x3ff] {
+                    storage[(physical ^ 3) as usize] ^= next() as u8;
+                }
+
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let snapshot = slow.read_snapshot_from_view(&view);
+                let expected_changed = slow.current_changed_ranges(&snapshot);
+                let actual_changed = fast
+                    .changed_ranges_from_view(&view)
+                    .expect("every watched byte is mapped");
+                assert_eq!(
+                    actual_changed, expected_changed,
+                    "layout {layout:?} round {round}: the snapshot-free comparison \
+                     disagreed with the copying path"
+                );
+                assert_eq!(
+                    expected_changed.is_empty(),
+                    fast.matches_view(&view),
+                    "layout {layout:?} round {round}: matches_view must agree too"
+                );
+
+                // Commit through both paths and require the baselines to stay
+                // byte-identical. The digest covers `expected`; the direct
+                // comparison below covers it byte for byte, including the
+                // bytes the incremental path chose NOT to rewrite.
+                let events = layout
+                    .iter()
+                    .map(|&(start, end)| GuestWriteEvent::Range {
+                        channel: WriterChannel::HostAbi,
+                        physical_offset: start,
+                        len: end - start,
+                    })
+                    .collect::<Vec<_>>();
+                fast.commit_from_view(&view, actual_changed, events.clone(), Vec::new());
+                slow.commit_snapshot(snapshot, events, Vec::new());
+
+                for (fast_range, slow_range) in fast.watched.iter().zip(&slow.watched) {
+                    assert_eq!(
+                        fast_range.expected, slow_range.expected,
+                        "layout {layout:?} round {round}: the incremental baseline \
+                         diverged from the full-copy baseline"
+                    );
+                    assert_eq!(
+                        fast_range.expected_storage_order, slow_range.expected_storage_order,
+                        "layout {layout:?} round {round}: the storage-order mirror diverged"
+                    );
+                    assert_eq!(
+                        fast_range.expected_page_digests, slow_range.expected_page_digests,
+                        "layout {layout:?} round {round}: the page digests diverged"
+                    );
+                }
+                assert_eq!(
+                    fast.expected_sha256, slow.expected_sha256,
+                    "layout {layout:?} round {round}: the watched root diverged"
+                );
+                assert_eq!(
+                    fast.journal_root_sha256, slow.journal_root_sha256,
+                    "layout {layout:?} round {round}: the journal root diverged"
+                );
+                assert_eq!(fast.entries.len(), slow.entries.len());
+                assert_eq!(
+                    fast.entries.last().map(|entry| &entry.changed_ranges),
+                    slow.entries.last().map(|entry| &entry.changed_ranges)
+                );
+                // The freshly adopted baseline must now match live storage
+                // under BOTH comparisons.
+                assert!(fast.matches_view(&view));
+                assert!(fast
+                    .changed_ranges_from_view(&view)
+                    .expect("mapped")
+                    .is_empty());
+            }
+        }
+    }
+
+    /// `adopt_from_view` must land the same baseline as `adopt_snapshot`.
+    ///
+    /// The no-declaration path. It journals nothing, so the only observable is
+    /// the baseline itself -- which is exactly the invariant the journal's
+    /// guarantee rests on.
+    #[test]
+    fn adopt_from_view_matches_the_copying_adoption() {
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for &layout in &[
+            &[(0x101u32, 0x17fu32)][..],
+            &[(0x100, 0x180)][..],
+            &[(0x102, 0x105)][..],
+            &[(0x101, 0x110), (0x131, 0x172)][..],
+        ] {
+            let mut storage = vec![0u8; 0x200];
+            for byte in storage.iter_mut() {
+                *byte = next() as u8;
+            }
+            let mut fast = CanonicalExecutableMutationStateV1::new(layout);
+            let mut slow = CanonicalExecutableMutationStateV1::new(layout);
+            {
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let read = |physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical));
+                fast.seal_with(read);
+                slow.seal_with(read);
+            }
+            for _ in 0..32 {
+                for &(start, end) in layout {
+                    for physical in start..end {
+                        if next() % 11 == 0 {
+                            storage[(physical ^ 3) as usize] ^= (next() as u8) | 1;
+                        }
+                    }
+                }
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let snapshot = slow.read_snapshot_from_view(&view);
+                let changed = fast.changed_ranges_from_view(&view).expect("mapped");
+                fast.adopt_from_view(&view, changed);
+                slow.adopt_snapshot(snapshot);
+                for (fast_range, slow_range) in fast.watched.iter().zip(&slow.watched) {
+                    assert_eq!(fast_range.expected, slow_range.expected);
+                    assert_eq!(
+                        fast_range.expected_storage_order,
+                        slow_range.expected_storage_order
+                    );
+                    assert_eq!(
+                        fast_range.expected_page_digests,
+                        slow_range.expected_page_digests
+                    );
+                }
+                assert_eq!(fast.expected_sha256, slow.expected_sha256);
+                assert!(fast.entries.is_empty() && slow.entries.is_empty());
+            }
+        }
+    }
+
     /// An unsealed state must never report a match.
     ///
     /// Before sealing there is no baseline to compare against, and answering
