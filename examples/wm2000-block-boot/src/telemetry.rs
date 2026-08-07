@@ -395,7 +395,7 @@ pub(crate) fn print_runtime_progress() {
     let timing = fn64_abi::phase_timing();
     if timing.executor_calls > 0 {
         println!(
-            "[wm2000-block-profile] phase_timing executor_ms={:.3} calls={} gfx_ms={:.3} phases={} gfx_lle_ms={:.3} tasks={} gfx_lle_rsp_ms={:.3} gfx_lle_rdp_ms={:.3} audio_ms={:.3} tasks={}",
+            "[wm2000-block-profile] phase_timing executor_ms={:.3} calls={} gfx_ms={:.3} phases={} gfx_lle_ms={:.3} tasks={} gfx_lle_rsp_ms={:.3} gfx_lle_rdp_ms={:.3} audio_ms={:.3} tasks={} vi_present_ms={:.3} fields={}",
             timing.executor_ns as f64 / 1e6,
             timing.executor_calls,
             timing.gfx_ns as f64 / 1e6,
@@ -406,6 +406,28 @@ pub(crate) fn print_runtime_progress() {
             timing.gfx_lle_rdp_ns as f64 / 1e6,
             timing.audio_dispatch_ns as f64 / 1e6,
             timing.audio_dispatch_calls,
+            timing.vi_present_ns as f64 / 1e6,
+            timing.vi_present_calls,
+        );
+        println!(
+            "[wm2000-block-profile] phase_timing audio_lle_ms={:.3} tasks={} audio_lle_rsp_ms={:.3}",
+            timing.audio_lle_ns as f64 / 1e6,
+            timing.audio_lle_calls,
+            timing.audio_lle_rsp_ns as f64 / 1e6,
+        );
+        // `executor_ms` is INCLUSIVE of everything dispatched beneath
+        // `run_one_step`. Print the subtraction so a reader cannot repeat the
+        // rule-2 error (inclusive read as self time) that produced three
+        // artifact targets; see docs/plans/perf-method.md.
+        let nested_ns = timing
+            .gfx_ns
+            .saturating_add(timing.audio_dispatch_ns)
+            .saturating_add(timing.audio_lle_ns)
+            .saturating_add(timing.vi_present_ns);
+        println!(
+            "[wm2000-block-profile] phase_self executor_self_ms={:.3} (executor_ms minus gfx+audio+audio_lle+vi_present={:.3})",
+            timing.executor_ns.saturating_sub(nested_ns) as f64 / 1e6,
+            nested_ns as f64 / 1e6,
         );
     }
 }

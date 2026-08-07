@@ -70,6 +70,21 @@ thread_local! {
     pub(crate) static GFX_LLE_RDP_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
+    /// VI retrace presentation (`present_render_backend` -> `RenderBackend::
+    /// present`, which for the reference backend is the whole `vi::scanout`
+    /// filter chain). Timed separately from `GFX_NS` because presentation is
+    /// a PER-FIELD cost that does not scale with scene complexity, while
+    /// graphics task dispatch is per submit: conflating them hides a fixed
+    /// per-frame overhead inside a variable one.
+    pub(crate) static VI_PRESENT_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static VI_PRESENT_CALLS: Cell<u64> = const { Cell::new(0) };
+    /// Non-graphics LLE (the audio ucode under `LleAccuracy`). Distinct from
+    /// `AUDIO_DISPATCH_NS`, which only covers the `Translated` callback path
+    /// -- a lane WM2000 does not take, so that counter reads zero while the
+    /// interpreter runs thousands of tasks.
+    pub(crate) static AUDIO_LLE_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static AUDIO_LLE_CALLS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static AUDIO_LLE_RSP_NS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +325,15 @@ pub struct PhaseTiming {
     pub gfx_lle_rdp_ns: u64,
     pub audio_dispatch_ns: u64,
     pub audio_dispatch_calls: u64,
+    /// VI retrace presentation: the reference backend's `vi::scanout` filter
+    /// chain, once per emulated field. Not nested inside `gfx_ns`.
+    pub vi_present_ns: u64,
+    pub vi_present_calls: u64,
+    /// Audio (non-graphics) LLE microcode interpretation. Not nested inside
+    /// `gfx_ns`; disjoint from `audio_dispatch_ns`.
+    pub audio_lle_ns: u64,
+    pub audio_lle_calls: u64,
+    pub audio_lle_rsp_ns: u64,
 }
 
 pub fn phase_timing() -> PhaseTiming {
@@ -324,6 +348,11 @@ pub fn phase_timing() -> PhaseTiming {
         gfx_lle_rdp_ns: GFX_LLE_RDP_NS.with(Cell::get),
         audio_dispatch_ns: AUDIO_DISPATCH_NS.with(Cell::get),
         audio_dispatch_calls: AUDIO_DISPATCH_CALLS.with(Cell::get),
+        vi_present_ns: VI_PRESENT_NS.with(Cell::get),
+        vi_present_calls: VI_PRESENT_CALLS.with(Cell::get),
+        audio_lle_ns: AUDIO_LLE_NS.with(Cell::get),
+        audio_lle_calls: AUDIO_LLE_CALLS.with(Cell::get),
+        audio_lle_rsp_ns: AUDIO_LLE_RSP_NS.with(Cell::get),
     }
 }
 

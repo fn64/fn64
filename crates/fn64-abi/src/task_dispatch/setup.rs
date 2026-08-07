@@ -476,6 +476,7 @@ pub(crate) unsafe fn dispatch_gfx_task_chunk(
 /// closes the second half of `RenderBackend` without exposing RT64 or any
 /// foreign type outside `fn64-render-rt64`.
 pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
+    let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
     let (rdram, allocation_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
     // SAFETY: every retrace presentation runs after device commit and before
     // any guest coroutine resumes. The boot contract keeps this one process
@@ -488,6 +489,11 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
                 backend.present(fn64_render::PresentRequest::live(vi, memory))
             })
         })
+    }
+    if let Some(started) = started {
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        VI_PRESENT_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));
+        VI_PRESENT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     }
 }
 

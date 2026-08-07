@@ -50,6 +50,14 @@ pub(crate) unsafe fn dispatch_lle_task(
     // the aggregate graphics-phase total.
     let gfx_started = (recognize_graphics_microcode && PHASE_TIMING.with(Cell::get))
         .then(std::time::Instant::now);
+    // NON-graphics LLE -- in the WM2000 block lane that is the audio ucode,
+    // which runs under `AudioTaskExecutionPolicy::LleAccuracy` and therefore
+    // never reaches `dispatch_audio_task` (the only site that feeds
+    // `AUDIO_DISPATCH_NS`). Untimed, its cost silently joined "executor self"
+    // and read as runtime overhead. Time it here so the phase split accounts
+    // for every task the RSP interpreter runs, not just the graphics ones.
+    let non_gfx_started = (!recognize_graphics_microcode && PHASE_TIMING.with(Cell::get))
+        .then(std::time::Instant::now);
     let mut rsp_execution_ns = 0u64;
     let mut raw_rdp_ns = 0u64;
 
@@ -356,6 +364,12 @@ pub(crate) unsafe fn dispatch_lle_task(
         GFX_LLE_CALLS.with(|calls| calls.set(calls.get() + 1));
         GFX_LLE_RSP_NS.with(|total| total.set(total.get().saturating_add(rsp_execution_ns)));
         GFX_LLE_RDP_NS.with(|total| total.set(total.get().saturating_add(raw_rdp_ns)));
+    }
+    if let Some(started) = non_gfx_started {
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        AUDIO_LLE_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));
+        AUDIO_LLE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        AUDIO_LLE_RSP_NS.with(|total| total.set(total.get().saturating_add(rsp_execution_ns)));
     }
 
     LleTaskResult {
