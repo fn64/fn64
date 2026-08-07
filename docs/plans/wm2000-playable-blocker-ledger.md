@@ -1702,3 +1702,23 @@ evidence (`FN64_RENDER_DUMP_DIR`) or the selector gate word at `0x8003dd0c` and
 the four match-arena loader PCs (`0x80022484`, `0x80022498`, `0x800224d4`,
 `0x80022510`), which the earlier route observed as never reached. Those probes
 are unaffected by this retraction and are the right next step.
+
+## 2026-08-07: WM2000 renders its MATCH SETUP screen
+
+Not a copyright screen — a live game UI, captured at frame 1599 of a
+1,500,000-step scheduled route and committed as
+`reference/wm2000-frames/match-setup-screen.png`:
+
+> **Exhibition** · **Single Match** · **1P VS 2P** · **New Belt** ·
+> **Non Title Match** · **Controller Pak**
+
+over the WWF logo on a green diamond-plate background. Textured, layered UI with
+the versus banner — this is the game's real match-configuration screen, drawn by
+the recompiled program through the reference rasterizer.
+
+2,239 frames dumped in one run, against the 40 that were the previous high-water
+mark. `idle_steps=0` throughout, `render_error=None`.
+
+This retires the open question left by the read-600 retraction: the route was
+not merely *running*, it is *drawing the game*. What remains unproven is a match
+in progress — the entrance presentation and the arena itself.
