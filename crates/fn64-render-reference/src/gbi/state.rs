@@ -668,6 +668,21 @@ impl TmemTexture {
     }
 }
 
+/// The uninitialized-TMEM trap, out of line so `Tmem::read_byte` can inline.
+///
+/// Reproduces `assert_eq!(valid & mask, mask, ..)`'s message byte for byte --
+/// `gbi::tests::group4` asserts the exact panic text, and that diagnostic is
+/// the reason TMEM carries a validity mask at all.
+#[cold]
+#[inline(never)]
+fn uninitialized_tmem_read(context: String, address: usize, valid: u8, mask: u8) -> ! {
+    panic!(
+        "assertion `left == right` failed: {context} reads uninitialized TMEM bits at byte {address:#05x}\n  left: {}\n right: {}",
+        valid & mask,
+        mask
+    );
+}
+
 impl Tmem {
     #[inline]
     pub(super) fn physical_byte(logical: usize, odd_row: bool) -> usize {
@@ -700,6 +715,13 @@ impl Tmem {
     /// per-texel hot loop from allocating/formatting a context string on every
     /// valid read -- a live profile showed that eager formatting dominating the
     /// software rasterizer's texel fetch. `FnOnce` avoids any dynamic dispatch.
+    ///
+    /// `#[inline]` with the failure arm split into a `#[cold]` helper: this is
+    /// called one to four times per texel, and bilinear filtering multiplies
+    /// that by four again per pixel. Inlining lets the caller keep the
+    /// physical address in a register across a multi-byte texel; keeping the
+    /// panic formatting out of line stops it from inflating the inlined body.
+    #[inline]
     pub(super) fn read_byte(
         &self,
         logical: usize,
@@ -708,12 +730,9 @@ impl Tmem {
         context: impl FnOnce() -> String,
     ) -> u8 {
         let address = Self::physical_byte(logical, odd_row);
-        assert_eq!(
-            self.valid[address] & mask,
-            mask,
-            "{} reads uninitialized TMEM bits at byte {address:#05x}",
-            context()
-        );
+        if self.valid[address] & mask != mask {
+            uninitialized_tmem_read(context(), address, self.valid[address], mask);
+        }
         self.bytes[address]
     }
 
@@ -779,6 +798,7 @@ impl Tmem {
         self.write_byte(low + TMEM_HALF_BYTES + 1, odd_row, y1);
     }
 
+    #[inline]
     pub(super) fn read_texel(&self, tile: Tile, x: usize, row: usize, size: u8) -> u32 {
         let base = Self::row_base(tile, row);
         let odd_row = (usize::from(tile.ult) / 4 + row) & 1 != 0;
@@ -854,10 +874,12 @@ impl Tmem {
 }
 
 impl TmemTexture {
+    #[inline]
     pub(super) fn raw_texel(&self, x: usize, y: usize) -> u32 {
         self.storage.read_texel(self.tile, x, y, self.tile.siz)
     }
 
+    #[inline]
     pub(super) fn sample(&self, x: usize, y: usize) -> [u8; 4] {
         if self.tile.fmt == G_IM_FMT_YUV && self.tile.siz == G_IM_SIZ_16B {
             let base = Tmem::row_base(self.tile, y);
