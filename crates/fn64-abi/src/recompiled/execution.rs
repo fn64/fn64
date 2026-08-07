@@ -466,7 +466,29 @@ pub(crate) fn process_live_executable_writes_from_host() {
         // SAFETY: device/host publication runs only while guest execution is
         // suspended; the registered process allocation remains live.
         let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-        catalog.invalidate_pending_physical_writes_with(|physical| unsafe {
+        // Hand the view in as well as the byte reader.
+        //
+        // `invalidate_pending_physical_writes_inner` has two ways to learn
+        // what changed. With a view it runs `changed_ranges_from_view` -- one
+        // `memcmp` per watched range, then a copy of only the bytes that
+        // differ. Without one it falls back to `read_snapshot`, which
+        // materializes the whole watched region through a per-byte closure:
+        // on WM2000 that is the 1 MiB boot bank rebuilt byte by byte at every
+        // device-time advance. Profiling put this call at 6.2% of self time
+        // and its sibling at `commit_with` at 9.3%, essentially all of it
+        // inside that per-byte `collect`.
+        //
+        // The `assert!` above already proves the allocation covers every
+        // watched byte, which is the same fact `RdramPtr` reads on faith, so
+        // the slice carries no obligation the pointer did not already carry.
+        //
+        // SAFETY: as for `storage` above -- guest execution is suspended for
+        // the duration of this call and the process allocation outlives it.
+        // `rdram_len` is the registered length of that one allocation.
+        let view = fn64_runtime::RdramView::from_storage(unsafe {
+            std::slice::from_raw_parts(rdram as *const u8, rdram_len)
+        });
+        catalog.invalidate_pending_physical_writes_from_view(&view, |physical| unsafe {
             storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
         });
         fn64_recomp_rs::discard_executable_write_boundary();
@@ -529,9 +551,22 @@ pub(crate) fn checkpoint_catalog_host_transaction_before_suspend() {
     // suspension. The process allocation is stable, and reads finish before
     // the yielder can transfer control to another coroutine.
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    live.flush_active_host_abi_transaction_with(thread, |physical| unsafe {
-        storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
+    // Suspension is a dispatch boundary, so the flush reconciles the whole
+    // watched region -- 1 MiB on WM2000 -- every time a coroutine yields.
+    // Hand over the view so that scan is one `memcmp` per range rather than a
+    // per-byte rebuild of the region.
+    //
+    // SAFETY: `rdram`/`rdram_len` describe the same stable process allocation
+    // asserted non-null and covering the watched end above, and the slice
+    // borrow ends inside this call.
+    let view = fn64_runtime::RdramView::from_storage(unsafe {
+        std::slice::from_raw_parts(rdram as *const u8, rdram_len)
     });
+    live.flush_active_host_abi_transaction_from_view(
+        thread,
+        |physical| unsafe { storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical)) },
+        Some(&view),
+    );
 }
 
 /// Move-only ownership of one synchronous child writer publication.
@@ -593,7 +628,24 @@ impl CatalogNestedWriterTransactionV1 {
         }
     }
 
-    pub(super) fn commit_with(mut self, mut read_physical_byte: impl FnMut(u32) -> u8) {
+    pub(super) fn commit_with(self, read_physical_byte: impl FnMut(u32) -> u8) {
+        self.commit_with_optional_view(read_physical_byte, None);
+    }
+
+    /// [`Self::commit_with`], but also handing over the RDRAM view.
+    ///
+    /// The byte reader is still required -- `seal_with` genuinely needs one --
+    /// but when a view is available the changed-byte scan runs word-wise
+    /// (`changed_ranges_from_view`: one `memcmp` per watched range, then a
+    /// copy of only the differing bytes) instead of rebuilding the entire
+    /// watched region through the per-byte closure. On WM2000 the watched
+    /// region is the 1 MiB boot bank, and profiling attributed 9.3% of self
+    /// time to this commit path, nearly all of it in that per-byte `collect`.
+    pub(super) fn commit_with_optional_view(
+        mut self,
+        mut read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
+    ) {
         self.assert_thread_owner();
         if let Some(live) = &self.live {
             if let Some(transaction_id) = self.transaction_id {
@@ -603,7 +655,17 @@ impl CatalogNestedWriterTransactionV1 {
                     .borrow()
                     .assert_active_child_transaction(transaction_id);
             }
-            live.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+            match view {
+                Some(view) => {
+                    live.invalidate_pending_physical_writes_from_view(
+                        view,
+                        &mut read_physical_byte,
+                    );
+                }
+                None => {
+                    live.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+                }
+            }
             fn64_recomp_rs::discard_executable_write_boundary();
             if let Some(transaction_id) = self.transaction_id {
                 live.mutation_state
@@ -618,7 +680,10 @@ impl CatalogNestedWriterTransactionV1 {
 
     pub(crate) fn commit(self, rdram: &[u8]) {
         let view = fn64_runtime::RdramView::from_storage(rdram);
-        self.commit_with(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        self.commit_with_optional_view(
+            |physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)),
+            Some(&view),
+        );
     }
 
     pub(super) fn commit_changed_bytes(self, rdram: &[u8], notify: impl Fn(u32, u32)) {

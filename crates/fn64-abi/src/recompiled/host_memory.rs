@@ -107,8 +107,20 @@ pub fn write_guest_physical(physical_start: u32, bytes: &[u8]) -> bool {
         unsafe { storage.write_u8(RdramAddr::from_offset(physical_start + index as u32), byte) };
     }
     fn64_recomp_rs::notify_host_abi_write(physical_start, len);
-    transaction.commit_with(|physical| unsafe {
-        storage.read_u8(RdramAddr::from_offset(physical))
+    // Commit against the view, not just the byte reader: the view lets the
+    // changed-byte scan run one `memcmp` per watched range instead of
+    // rebuilding the whole watched region a byte at a time. See
+    // `commit_with_optional_view`.
+    //
+    // SAFETY: as for `storage` above -- `rdram` is non-null and `rdram_len` is
+    // the registered length of that one allocation, both checked at the top of
+    // this function, and neither the slice nor the view outlives this call.
+    let view = fn64_runtime::RdramView::from_storage(unsafe {
+        std::slice::from_raw_parts(rdram as *const u8, rdram_len)
     });
+    transaction.commit_with_optional_view(
+        |physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) },
+        Some(&view),
+    );
     true
 }
