@@ -1310,3 +1310,76 @@ not parity.
 This is the third time today an unverified inference of this exact shape
 produced a wrong number, after the fabricated 4.9x and the inclusive-vs-self
 profile. Count before optimizing.
+
+## 2026-08-07: the barrier stops disarming — 640 ms to 445 ms
+
+The counter above bounded the remaining lever at "137,230 syscalls, ~167 ms,
+the clean boundaries only". That bound was too conservative, because it assumed
+the dirty boundaries still needed their whole-span pair. They do not, and the
+result is 205 ms of syscall time removed rather than 167 ms.
+
+The realisation both changes share: **the span's protection state at the end of
+a boundary is the state it should have at the start of the next one**, so the
+unprotect/re-protect pair around every boundary was restoring a state that
+already held.
+
+| | syscalls | time | arm | disarm | reprotect | fault |
+|---|---|---|---|---|---|---|
+| baseline | 206,348 | 231.0 ms | 91,551 | 91,551 | — | 23,246 |
+| clean boundary keeps protection | 69,090 | 77.2 ms | 22,922 | 22,922 | — | 23,246 |
+| + re-protect only faulted pages | 46,494 | 26.0 ms | **1** | **1** | 23,246 | 23,246 |
+
+The whole-span call is now issued **once per run in each direction** — the
+initial arm after sealing, and the `force_disarm` at teardown. What remains is
+one single-page re-protect per fault, which is the irreducible cost of
+observing a write.
+
+Interleaved A/B, cold run of each discarded, lanes proven distinct by
+`FN64_MPROTECT_BARRIER_STATS` (`served=100.00%` on, `served=0` off):
+
+```
+pre-wave     0.63 0.65 0.64 0.64 0.64 0.66     640 ms
+clean skip   0.47 0.47 0.47 0.47 0.49 0.47     470 ms
++ selective  0.45 0.44 0.45 0.45 0.44 0.45     445 ms
+```
+
+**1.44x cumulative.** Complete run output is `diff`-identical to the pre-wave
+binary on both the barrier and scan lanes, and the barrier stats are byte
+identical too (`served=91445 fell_back=1 clean=68615
+mean_dirty_pages_per_served=0.2532`) — the fault count is unchanged at 23,246,
+which is the statement that the barrier still observes exactly what it observed.
+
+### Why this is not the stale-window bug again
+
+The bug at `dirty_spans` is a caller reading a set describing an *older* window
+than its own question, and the defence is that the set is consuming. That
+defence is untouched: this changes only whether syscalls are issued, never what
+the set says or when it is consumed. Closing a window still clears the set —
+either it was already empty, or the selective re-protect clears it after
+re-protecting exactly the pages it names — so the continuing window starts empty
+and has nothing to leak.
+
+The change is strictly in the safe direction. Staying protected makes the
+barrier observe **more**: a host write landing in what used to be the
+unprotected window now faults and is recorded, where before it was silently
+permitted. Missing an arm still costs only a scan, and the region now stays
+protected meanwhile, so pages that fault are recorded rather than lost — a
+better failure mode, not a worse one.
+
+### Two callers wanted "writable", not "observed"
+
+Since a boundary now leaves the region `PROT_READ`, *the barrier is down* and
+*the region is writable* stopped being the same statement. Both callers that
+depended on the old coincidence were fixed:
+
+- `prepare_process_exit` writes RDRAM from several paths and then **drops the
+  mapping**. It now calls `force_disarm`, which unprotects unconditionally.
+- `poison` cleared its flags but never its protection, which would have left
+  every subsequent guest store faulting into a handler that had just declared it
+  will not handle anything.
+
+### Where the time is now
+
+26 ms of the 445 ms is `mprotect`, down from 231 ms of 640 ms. The barrier is no
+longer the bottleneck it created; the next profile should be taken fresh rather
+than extrapolated from the old one — **as self time, counting children out.**
