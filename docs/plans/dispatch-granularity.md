@@ -536,3 +536,103 @@ Two corrections to earlier analysis in this document:
 
 Every structural shortcut is now eliminated by measurement. What remains is the
 authorized page-tree digest migration.
+
+
+## Landed (2026-08-06): the resident-generation boundary predicate
+
+The store-forced dispatch boundary is gone. `ExecutableWrite` fell from
+**99.8% of slice ends to 0**, and instructions-per-slice went **7.163 ->
+2339.013** at equal guest work.
+
+### The predicate
+
+`classify_live_executable_write` (`fn64-abi` `recompiled/snapshots.rs`) used to
+ask one question: does this write land in the watched executable region? That
+region covers every byte any generation could *ever* back, so a store to bytes
+no live translation depends on still forced a scheduler round trip.
+
+It now also asks whether any **currently resident** generation is backed by
+those bytes, mirroring the scan `invalidate_physical_write` already performs
+(`fn64-recomp-rs` `generation/mod.rs:1292`): for each active segment, test the
+owning generation's physical backing spans. `active` holds segments rather than
+generations, so this is a handful of interval tests per store.
+
+### Why this is safe, and why the earlier code-map result does not apply
+
+The counterexample to beat is: write bytes while nothing is resident, then
+activate a generation over them and execute stale code. It cannot happen.
+`activate_for_fetch_with_digest` (`generation/mod.rs:771`) computes
+`live_digest` from LIVE memory and compares it against `expected_sha256` for
+every containing candidate **unconditionally and before** consulting
+`self.active` -- the `already_active` short-circuit is at ~:846, after the
+loop. So the later activation re-digests the changed bytes and returns
+`AotMiss`/`NoGenerationMatched`. `guest_write_token` would be the way to cache
+past that digest, and it has **no non-test consumers**, so no activation path
+bypasses it.
+
+This is why the closed "narrow code map" result above does not forbid this.
+That result is about a STATIC map, and it stands: WM2000 zeroes its own loaded
+code image, so no static span can be certified dead. Residency is a DYNAMIC
+question with a different answer -- the boot stub zeroes those spans *before*
+any generation over them is activated.
+
+Attribution deliberately stays wide. Only the boundary narrowed;
+`record_executable_and_renderer_write` still feeds
+`PENDING_ATTRIBUTED_EXECUTABLE_WRITES` and the journal from the full watched
+region. Narrowing attribution is what caused the `events=0 declarations=0` bug.
+
+### Measured
+
+Go/no-go first: a temporary probe counted watched-region stores against
+resident backings. **Zero of 199,588 stores touched a resident generation**,
+with `no_catalog=0` and `borrow_busy=0`. The predicate can fire on all of them.
+
+A/B in one binary via `FN64_DISABLE_RESIDENT_BOUNDARY`, at equal guest work:
+
+| | before | after |
+|---|---|---|
+| 180,000 guest instructions | 5.276s | **0.093s** (57x) |
+| 1,461,877 guest instructions | 12.495s | **1.234s** (10.1x) |
+| deepest route (sim_time 13.99M) | 66.7s | **42.8s** |
+| slices @ 1.46M instructions | 199,751 | **625** |
+| instructions_per_slice | 7.163 | **2339.013** |
+| `ExecutableWrite` share | 199,292 / 199,751 | **0** |
+
+Remaining slice ends are `Checkpoint` (the 4096 budget) and `HostCall` -- both
+genuine boundaries. Nothing is left to remove here.
+
+**Beware the benchmark's units.** `FN64_BLOCK_MAX_STEPS` bounds *slices*, not
+instructions. With slices ~326x longer, the old "60k steps" run executes ~15x
+more guest work and takes *longer* in wall clock. Every comparison above uses
+`FN64_BLOCK_MIN_GUEST_INSTRUCTIONS` so both lanes run identical guest work.
+The headline "36.5s -> 4.6s" figure from prior entries is a 60,000-SLICE
+measurement and is no longer commensurable with these.
+
+Determinism at the deepest reachable guest state, both lanes: every device
+counter byte-identical -- `device_trace=15389 pi_started=3823 sp_tasks=7
+rcp_started=7 rcp_completed=7 vi_interrupts=8 controller_ops=1 audio_submits=7
+imem_replacements=7 si_started=8 ai_started=6`. Only `trace` differs (429,516
+vs 27,347), which counts scheduler round trips -- the quantity removed.
+
+### The re-entrancy hazard was real, on a different cell than predicted
+
+The analysis flagged the generation catalog's `RefCell`. That one is guarded,
+but it never fires: the catalog is only borrowed by the runner between
+dispatches. The cell that actually aborted was **`HOST`**.
+`advance_device_time_step` issues device writes from inside its own `with_host`
+closure, and those writes reach the boundary observer, so `with_host` there was
+a nested `borrow_mut`. The 60k run aborted with "RefCell already borrowed" at
+`lib.rs:1814`, one frame below `classify_live_executable_write`.
+
+`try_with_host` returns `None` rather than panicking. The predicate treats
+every unanswerable query -- HOST borrowed, no catalog installed, catalog
+borrowed -- as "resident", which is the conservative answer and reproduces the
+old behaviour exactly.
+
+### The baseline-accumulation effect did not materialize
+
+`commit_from_view`/`adopt_from_view` advance the baseline at each boundary, so
+far rarer boundaries mean far more changed bytes per commit. Per-commit cost
+does rise, but nowhere near enough to offset a 326x drop in commit count,
+because the in-place comparison is proportional to changed bytes rather than to
+region size. Measured, not projected: the numbers above are the net.
