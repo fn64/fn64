@@ -571,3 +571,184 @@ could break the O(watched bytes) floor: hardware dirty bits, or `mprotect`
 write-protection with a fault handler.
 
 That is the honest boundary of software-only optimization here.
+
+
+## 2026-08-07: the `mprotect` write barrier — measured, and it is favourable
+
+The previous section named `mprotect` write-protection as one of only two
+mechanisms that could break the O(watched bytes) floor, and left it unmeasured.
+It is now measured. **The arithmetic works**, which was not the expected
+outcome — the prior was that Mach fault delivery would be too slow.
+
+Everything below is measured on this machine (Apple M5 Pro, 16384-byte pages,
+93 pages over the 1,513,056-byte watched region). The microbenchmark is
+standalone and links nothing from this repository.
+
+### The two costs
+
+| quantity | measured |
+|---|---|
+| `memcmp`, whole region, all-equal (the scan being replaced) | **26,525 ns** (57.0 GB/s) |
+| whole-region `mprotect` protect+unprotect, no fault | 2,253 ns |
+| single-page `mprotect` protect+unprotect, no fault | 597 ns |
+| protect whole region + take **one** write fault + re-arm that page | **3,541 ns** |
+| marginal cost per additional fault (least squares over n=1..32) | 2,935 ns |
+| fixed cost per boundary (same fit) | 740 ns |
+
+A fault is therefore **~7.5x cheaper than the scan it replaces** at one fault
+per boundary, and the two cross over at **~9 distinct pages written per
+boundary**:
+
+| faults/boundary | ns/boundary | vs 26,525 ns scan |
+|---|---|---|
+| 1 | 3,541 | 7.49x cheaper |
+| 2 | 6,523 | 4.07x cheaper |
+| 4 | 12,571 | 2.11x cheaper |
+| 8 | 23,616 | 1.12x cheaper |
+| **16** | 48,865 | **1.84x MORE** |
+| 93 | 276,684 | 10.43x MORE |
+
+So the entire question reduces to one empirical number that had never been
+measured: **how many distinct 16 KiB pages does the guest write between two
+dispatch boundaries?**
+
+### The page census — the number that decides it
+
+Instrumented at `record_executable_and_renderer_write` (every observed guest
+write) and closed at `matches_view` (exactly one scan = one boundary), behind
+`FN64_MPROTECT_CENSUS=1`. Inert when unset — `sim_time`, `steps` and wall time
+are unchanged with the probe compiled in and disabled (2.90s both ways).
+
+Deep scheduled route, `entrance-to-match`, 400,000 steps:
+
+```
+boundaries=840169  distinct_pages_total=568514  mean_pages_per_boundary=0.6767
+     0 page(s):     457790 boundaries (54.49%)
+     1 page(s):     280938 boundaries (33.44%)
+     2 page(s):      66088 boundaries ( 7.87%)
+     3 page(s):      17081 boundaries ( 2.03%)
+     4 page(s):       7464 boundaries ( 0.89%)
+   >=5 page(s):       10799 boundaries ( 1.29%)
+```
+
+**Mean 0.68 pages per boundary. 54.5% of boundaries write no watched page at
+all, 98.7% write four or fewer, and only 0.054% exceed the 9-page break-even.**
+Reproduced on the shorter pinned workload (49,910 boundaries, mean 0.53), so
+the shape is not an artifact of one route.
+
+The 54.5% zero-page case is the important one: those boundaries pay a full
+26,525 ns scan today to discover that nothing changed, and would pay only the
+re-arm under a barrier. This is the same "nothing changed is the overwhelmingly
+common answer" observation that motivated `matches_view`, now quantified — and
+it is precisely the case a read-based guard can never exploit, because it must
+read to learn it.
+
+### Projection
+
+Weighting the measured per-fault costs by the measured distribution:
+
+| | |
+|---|---|
+| mprotect cost per boundary | **2,726 ns** |
+| scan cost per boundary | 26,525 ns |
+| component speedup | **9.7x** |
+
+`memcmp` is **1292 of ~1400 leaf samples (93%)** in a live `sample` of the
+running binary, so with Amdahl applied the projected whole-run speedup is
+**~6.0x**, which would move WM2000 from 15.5x slower than hardware to roughly
+**2.6x**. That is the largest single lever identified in this document.
+
+### Why this does not contradict the "incremental reconcile is impossible" proof
+
+It does not attempt to. That proof is about *software* substitutes: a digest,
+checksum or Merkle path must READ the region to be trustworthy, so it cannot
+beat the read it replaces. `mprotect` is not a substitute computation — it is
+the hardware MMU reporting writes as they happen, with no read at all. The
+proof explicitly named it as one of the two escapes and this measures it.
+
+### Obstacles to integration — assessed, not fought through
+
+Reported rather than solved, per the brief. None is arithmetic-fatal; together
+they are a substantial piece of engineering.
+
+1. **RDRAM is a `Box<[u8]>`** (`crates/fn64-abi/src/host.rs:105`,
+   `install_owned_process_rdram`) — malloc'd, so not page-aligned and not
+   legally `mprotect`-able. It would have to become an `mmap`'d, page-aligned
+   allocation, which touches the boot/publication path and the "RDRAM ownership
+   moves into the runtime" contract.
+
+2. **The watched region is unaligned** — `[0x400, 0x171a60)`, neither end on a
+   16 KiB boundary, and the region is the whole boot bank, so it contains guest
+   *data* as well as code. Whole-page protection therefore covers bytes outside
+   the watched set. **This is already priced in**: the census counts distinct
+   pages touched by *every* observed guest write, not only writes to code, so
+   the 0.68 mean is the spurious-fault-inclusive number.
+
+3. **Signal-handler safety.** The handler runs on the guest store path under
+   `corosensei` coroutine stacks. It must be async-signal-safe: no allocation,
+   no `RefCell`, no libc beyond the `mprotect` syscall. The benchmark handler
+   meets that bar (two relaxed atomics and one `mprotect`) and took 325,500
+   faults without incident, including with `SA_ONSTACK`. The unmeasured risk is
+   fault delivery onto a coroutine stack rather than a normal thread stack —
+   that must be proven before any integration, and a handler that faults or
+   deadlocks here is a hard crash with no diagnostic.
+
+4. **Unattributed writers are the real correctness gap, and it cuts the safe
+   way.** The census only sees writes routed through `set_write_observer`. The
+   ledger already documents paths that bypass it (`Rdram::as_mut_slice()` into a
+   C shim, `dma_write_bytes`, raw-pointer DMA). Those are *undercounted by the
+   census* but would still **fault** under a barrier — the MMU does not care
+   which Rust function issued the store. So the barrier detects a **superset**
+   of what the census saw, and the projection is conservative on correctness
+   while being mildly optimistic on cost (bulk DMA would fault once per page
+   touched; a host writer can unprotect around a known bulk write instead).
+
+5. **Equivalence bar.** A barrier reports *which pages* were written, not
+   *which bytes changed*. A store that rewrites a byte with its existing value
+   faults but changes nothing, so the barrier's dirty set is a superset of the
+   scan's changed set. To stay a true substitute the changed-byte set must still
+   be derived by comparing the faulted pages against the baseline — 16 KiB per
+   dirty page instead of 1.44 MiB per boundary. That preserves the guard exactly
+   and is where the 9.7x comes from; it is not a weakening.
+
+6. Not yet checked: interaction with `FN64_WATCH_WRITE` and the debugger.
+
+### Status
+
+**Measured and favourable; not implemented.** The go/no-go number the design
+hinged on — faults per boundary — is 0.68 against a break-even of 9, an ~13x
+margin, so the lever exists. The probe is committed behind
+`FN64_MPROTECT_CENSUS` so the number can be re-derived on any route.
+
+Recorded honestly: the brief that commissioned this expected "the fault costs
+more than the scan" and eight hypotheses had died before it. This one did not.
+
+
+## 2026-08-07: the entrance presentation does not advance -- a real boot blocker
+
+A scheduled route ran **13h44m at 100% CPU** and never progressed past
+controller **read 600**, holding at `step=653736 sim_time=1944932808
+gfx_submits=704 audio_submits=1139` with three resident generations.
+
+It is **not deadlocked**. Sampling the hung process shows active execution --
+`run_one_step`, `advance_device_time`, `deliver_or_enqueue`, `osRecvMesg_recomp`
+-- so the guest is running a loop that never satisfies its exit condition.
+
+The route recipe anticipated this case. Its annotation at read 640 calls the
+long idle tail *"the cheapest discriminator"*: if the entrance were a timed
+cutscene it would advance with no input, and if it were an input gate the
+scripted presses would clear it. **Neither happened**, so the entrance
+presentation is waiting on something the route does not supply and time does not
+deliver.
+
+Candidates, none yet tested:
+- an RSP/RDP completion the presentation waits on (7 sp_tasks, all audio, and
+  `rcp_completed=7` have been static since early boot)
+- a VI retrace count the presentation blocks on
+- a save/Controller Pak probe (`save_ops=0` for the whole run)
+- a controller read pattern the schedule does not reproduce
+
+This is now the top **playability** blocker, distinct from throughput. The
+perf work took the route from hours to minutes per attempt, which makes this
+tractable to investigate -- each hypothesis is now a minutes-long experiment
+rather than an overnight one.
