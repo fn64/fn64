@@ -535,7 +535,7 @@ impl BootstrapOrImportValidationReceiptV1 {
 /// Owned RDRAM whose executable baseline has been validated against one exact
 /// ROM and canonical catalog install. No mutable slice or raw pointer escapes.
 pub struct ValidatedBootstrapRdramV1 {
-    pub(super) storage: Box<[u8]>,
+    pub(super) storage: crate::write_barrier::ProcessRdram,
     pub(super) receipt: BootstrapOrImportValidationReceiptV1,
 }
 
@@ -883,7 +883,14 @@ pub struct BootstrapImportTransactionV1<'a> {
     install: &'a CatalogGenerationInstallV1,
     rom: &'a [u8],
     rom_sha256: [u8; 32],
-    pub(super) storage: Box<[u8]>,
+    /// The process allocation, page-aligned when the host granted one.
+    ///
+    /// Allocated in its final form here rather than converted later: the
+    /// transaction publishes ROM slices straight into these bytes and
+    /// `commit` moves them into `ValidatedBootstrapRdramV1` unchanged, so
+    /// allocating a `Box<[u8]>` and re-homing it would mean copying 8 MiB and
+    /// would leave the published bytes momentarily in two places.
+    pub(super) storage: crate::write_barrier::ProcessRdram,
     publications: Vec<BootstrapPublicationEvidenceV1>,
 }
 
@@ -905,7 +912,11 @@ impl<'a> BootstrapImportTransactionV1<'a> {
                 minimum,
             });
         }
-        let mut storage = vec![0; rdram_len].into_boxed_slice();
+        // Page-aligned when the host grants the mapping, heap otherwise. Both
+        // are zero-filled -- anonymous `mmap` is guaranteed zeroed, which is
+        // what the `vec![0; rdram_len]` this replaced relied on -- so the
+        // bytes the transaction starts from are identical either way.
+        let mut storage = crate::write_barrier::ProcessRdram::new(rdram_len);
         fn64_runtime::IplBootGlobals::cold(tv_type).install(&mut storage);
         Ok(Self {
             install,

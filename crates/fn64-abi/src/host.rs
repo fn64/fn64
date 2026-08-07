@@ -101,8 +101,21 @@ pub unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
     });
 }
 
+/// Move the validated bootstrap allocation into `HostState` and register it.
+///
+/// This is where "RDRAM ownership moves into the runtime" becomes true: after
+/// this returns, the only owner is `HostState`, the pointer is stable for the
+/// process, and nothing outside can retain a `Vec` or a mutable borrow.
+///
+/// The allocation arrives as a [`crate::write_barrier::ProcessRdram`], which is
+/// page-aligned when the bootstrap could `mmap` one. Page alignment is what the
+/// `mprotect` write barrier requires and is otherwise invisible: the type
+/// derefs to `[u8]` exactly as the `Box<[u8]>` it replaced did, and the
+/// ownership contract is unchanged in every other respect.
 #[cfg(feature = "recomp-rs")]
-pub(crate) fn install_owned_process_rdram(mut storage: Box<[u8]>) -> (*mut u8, usize) {
+pub(crate) fn install_owned_process_rdram(
+    mut storage: crate::write_barrier::ProcessRdram,
+) -> (*mut u8, usize) {
     assert!(
         !storage.is_empty(),
         "owned process RDRAM allocation must be nonempty"
@@ -116,9 +129,23 @@ pub(crate) fn install_owned_process_rdram(mut storage: Box<[u8]>) -> (*mut u8, u
         );
         host.owned_runtime_rdram = Some(storage);
     });
-    // SAFETY: HostState now owns the boxed allocation for the runtime lifetime.
+    // SAFETY: HostState now owns the allocation for the runtime lifetime.
     unsafe { register_process_rdram(pointer, length) };
     (pointer, length)
+}
+
+/// Whether the installed process RDRAM is page-aligned and so protectable.
+///
+/// The barrier asks once, at arming time. A `false` answer is not an error: it
+/// means the allocation came from the heap fallback and the guard stays on its
+/// unconditional scan, which is today's behaviour.
+#[cfg(feature = "recomp-rs")]
+pub(crate) fn process_rdram_is_page_aligned() -> bool {
+    with_host(|host| {
+        host.owned_runtime_rdram
+            .as_ref()
+            .is_some_and(|storage| storage.is_page_aligned())
+    })
 }
 
 /// Install the structurally discovered guest global that libultra's exception

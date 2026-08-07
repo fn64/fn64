@@ -233,7 +233,16 @@ impl ProcessRdram {
     ///
     /// Falls back to the heap on `mmap` failure, which keeps boot working on a
     /// machine or configuration where the mapping is refused.
+    ///
+    /// `FN64_HEAP_RDRAM=1` forces the heap lane. That exists for the A/B: it
+    /// puts the pre-change allocation and the page-aligned one in the SAME
+    /// binary, so "the output is byte-identical" is a statement about one
+    /// program under two settings rather than about two separately compiled
+    /// programs that might differ for unrelated reasons.
     pub fn new(len: usize) -> Self {
+        if heap_forced() {
+            return Self::Heap(vec![0u8; len].into_boxed_slice());
+        }
         match PageAlignedRdram::new(len) {
             Some(mapped) => Self::Mapped(mapped),
             None => Self::Heap(vec![0u8; len].into_boxed_slice()),
@@ -295,6 +304,12 @@ pub fn page_size() -> usize {
     assert!(size.is_power_of_two(), "host page size is not a power of two");
     SIZE.store(size, Ordering::Relaxed);
     size
+}
+
+/// Whether the heap allocation lane is forced, for the A/B.
+fn heap_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("FN64_HEAP_RDRAM").is_some_and(|value| value != "0"))
 }
 
 /// Whether the barrier is requested by the environment.
