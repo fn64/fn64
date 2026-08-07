@@ -285,30 +285,30 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | PI/ROM DMA | `osPiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1153` |
 | PI/ROM DMA | `osEPiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:922` |
 | PI/ROM DMA | `osEPiReadIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1034` |
-| SI/controller | `osContInit_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1180` |
-| SI/controller | `osContStartReadData_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1336` |
-| SI/controller | `osContGetReadData_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1112` |
-| SI/controller | `osContStartQuery_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1308` |
-| SI/controller | `osContGetQuery_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1030` |
-| SI/controller | `osContSetCh_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1290` |
-| EEPROM | `osEepromProbe_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:141` |
-| EEPROM | `osEepromWrite_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:287` |
-| EEPROM | `osEepromLongWrite_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:318` |
-| EEPROM | `osEepromRead_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:273` |
-| EEPROM | `osEepromLongRead_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:303` |
-| Flash | `osFlashInit_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:374` |
-| Flash | `osFlashReadStatus_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:396` |
-| Flash | `osFlashReadId_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:413` |
-| Flash | `osFlashClearStatus_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:435` |
-| Flash | `osFlashAllErase_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:480` |
-| Flash | `osFlashAllEraseThrough_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:492` |
-| Flash | `osFlashSectorErase_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:503` |
-| Flash | `osFlashSectorEraseThrough_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:514` |
-| Flash | `osFlashCheckEraseEnd_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:537` |
-| Flash | `osFlashWriteBuffer_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:553` |
-| Flash | `osFlashWriteArray_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:575` |
-| Flash | `osFlashReadArray_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:608` |
-| Flash | `osFlashChange_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:652` |
+| SI/controller | `osContInit_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1182` |
+| SI/controller | `osContStartReadData_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1338` |
+| SI/controller | `osContGetReadData_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1114` |
+| SI/controller | `osContStartQuery_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1310` |
+| SI/controller | `osContGetQuery_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1032` |
+| SI/controller | `osContSetCh_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1292` |
+| EEPROM | `osEepromProbe_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:188` |
+| EEPROM | `osEepromWrite_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:334` |
+| EEPROM | `osEepromLongWrite_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:365` |
+| EEPROM | `osEepromRead_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:320` |
+| EEPROM | `osEepromLongRead_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:350` |
+| Flash | `osFlashInit_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:426` |
+| Flash | `osFlashReadStatus_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:465` |
+| Flash | `osFlashReadId_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:482` |
+| Flash | `osFlashClearStatus_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:503` |
+| Flash | `osFlashAllErase_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:556` |
+| Flash | `osFlashAllEraseThrough_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:568` |
+| Flash | `osFlashSectorErase_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:579` |
+| Flash | `osFlashSectorEraseThrough_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:590` |
+| Flash | `osFlashCheckEraseEnd_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:615` |
+| Flash | `osFlashWriteBuffer_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:633` |
+| Flash | `osFlashWriteArray_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:655` |
+| Flash | `osFlashReadArray_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:692` |
+| Flash | `osFlashChange_recomp` | **implemented** | `crates/fn64-abi/src/save.rs:736` |
 | Controller Pak/PFS | `osPfsInitPak_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:284` |
 | Controller Pak/PFS | `osPfsFreeBlocks_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:313` |
 | Controller Pak/PFS | `osPfsAllocateFile_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:329` |
@@ -316,10 +316,10 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | Controller Pak/PFS | `osPfsFileState_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:383` |
 | Controller Pak/PFS | `osPfsFindFile_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:364` |
 | Controller Pak/PFS | `osPfsReadWriteFile_recomp` | **implemented** | `crates/fn64-abi/src/pfs.rs:413` |
-| Rumble Pak | `__osMotorAccess_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1439` |
-| Rumble Pak | `osMotorInit_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1372` |
-| Rumble Pak | `osMotorStart_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1449` |
-| Rumble Pak | `osMotorStop_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1460` |
+| Rumble Pak | `__osMotorAccess_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1441` |
+| Rumble Pak | `osMotorInit_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1374` |
+| Rumble Pak | `osMotorStart_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1451` |
+| Rumble Pak | `osMotorStop_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:1462` |
 | AI/audio | `osAiGetLength_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:131` |
 | AI/audio | `osAiGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:105` |
 | AI/audio | `osAiSetFrequency_recomp` | **implemented** | `crates/fn64-abi/src/ai.rs:47` |
@@ -359,7 +359,7 @@ These low-level or title-specific helpers are real ABI exports but are not part 
 | `__osPiGetAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1008` |
 | `__osPiRelAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1018` |
 | `__osSiDeviceBusy_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:633` |
-| `__osSiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:703` |
+| `__osSiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:705` |
 | `__osSpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:108` |
 | `__osSpSetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:30` |
 | `osDpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:118` |
