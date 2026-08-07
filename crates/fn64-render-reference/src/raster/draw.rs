@@ -36,6 +36,37 @@ impl Framebuffer {
         resized
     }
 
+    /// A clone for VI scanout: copies the buffers the scanout filter chain
+    /// reads (`pixels`, `coverage`) and reinitializes the two depth buffers to
+    /// their empty-framebuffer values instead of copying them.
+    ///
+    /// `vi::scanout` and everything it calls never read `depth` or
+    /// `encoded_depth`, and no consumer of `presented_framebuffer()` reads
+    /// them either -- every one reads `pixels`. Depth is per-pixel `f32` plus a
+    /// per-pixel `Option<EncodedDepth>`, so at 320x240 the derived `Clone`
+    /// copies 975 KiB of which 600 KiB (62%) is depth state the presented
+    /// frame has no meaning for.
+    ///
+    /// The buffers are RESIZED, not left empty: `Framebuffer`'s invariant is
+    /// that all four are parallel to `width * height`, and a public accessor
+    /// hands this value out. A shorter vector would turn a depth read into a
+    /// panic rather than a wrong answer, but both are worse than paying for
+    /// the initialization, which `vec!`/`resize` does without a source read.
+    pub(crate) fn cloned_for_scanout(&self) -> Self {
+        let pixel_count = self.pixels.len() / 4;
+        Framebuffer {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+            coverage: self.coverage.clone(),
+            depth: vec![f32::INFINITY; pixel_count],
+            encoded_depth: vec![None; pixel_count],
+            primitive_depth: self.primitive_depth,
+            color_layout: self.color_layout,
+            noise: self.noise,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn noise_position(&self) -> (u64, u64) {
         (self.noise.seed, self.noise.fragment_index)
