@@ -929,3 +929,87 @@ retires the other and the next fetch re-hashes the full image -- 419,861 times,
 Making activation not retire a generation whose image is byte-identical and
 still resident removes the re-hash **while every activation still digests**. No
 weakened verification, no soundness argument about writers required.
+
+## 2026-08-07: the reference renderer profiled and optimized -- 12.3% faster
+
+The reference renderer had never been profiled. A subsystem `sample` of a live
+route put `fn64_render` second only to `fn64_abi` and about 3x the recompiled
+guest code, so it was measured properly and optimized. Output is byte-identical.
+
+### The benchmark this needed, because the standard one renders nothing
+
+The documented A/B (`FN64_BLOCK_MAX_STEPS=40000000
+FN64_BLOCK_MIN_GUEST_INSTRUCTIONS=1461877`, ~229 ms) reports
+`gfx_submits=0 sp_tasks=0`. **It exercises zero rendering** and cannot measure
+this subsystem at all; a renderer change of any size moves it not at all.
+
+The isolated benchmark is `examples/xbus_replay` against a captured stream:
+
+```
+FN64_XBUS_STREAM_DUMP_DIR=/tmp/fn64-xbus FN64_XBUS_STREAM_DUMP_SKIP=20 \
+FN64_XBUS_STREAM_DUMP_RDRAM=20 ./target/release/wm2000-block-boot   # capture
+FN64_XBUS_REPLAY_REPEAT=60 ./target/release/examples/xbus_replay \
+    /tmp/fn64-xbus/xbus-0020.bin /tmp/out /tmp/fn64-xbus/rdram-0020.bin
+```
+
+Real captured RDP commands over real captured RDRAM, no guest execution in the
+sample. `FN64_XBUS_REPLAY_REPEAT` (added here) loops the replay and prints
+`best_render_ms` plus an FNV-1a framebuffer digest, so a change's speed and its
+byte-exactness are read off the same line. It asserts the digest is stable
+across iterations, so a nondeterministic renderer fails the harness itself.
+
+### Profile: texture sampling is half the renderer, the combiner is not
+
+`sample` of 400 replays, render-attributable samples only:
+
+```
+texture sampling   48.6%     <- read_tlut alone (220) > the whole combiner
+color combiner      8.5%
+blender             5.5%
+```
+
+### What was wrong, and what it cost
+
+1. **TLUT decode was recomputed per texel** (`6cbfa17`). A CI texel's color is
+   a pure function of `(index, texture_lut)`, both immutable for a
+   `TmemTexture`'s life, yet each fetch redid two masked byte reads, two
+   validity asserts, and a format conversion -- four times per bilinear pixel.
+   A lazily-filled 256-entry memo removed `read_tlut` from the profile
+   entirely: render samples 1260 -> 1031 (**-18%**). Lazy, not eager, because
+   `G_LOADTLUT` need not fill all 256 entries and an eager pass would trap on
+   entries the primitive never samples.
+
+2. **The per-texel TMEM accessors were out-of-line** (`59a9ce7`). `read_byte`
+   runs up to four times per texel and sixteen per bilinear pixel; its body was
+   dominated by panic formatting. Splitting the failure arm into a `#[cold]`
+   helper and inlining the accessors: 8.60 -> 8.16 ms.
+
+3. **Loop-invariant work in four pixel loops** (`7c8cea0`) -- `uses_texel1`
+   rescanning eight combiner sources per pixel, per-pixel `TextureDerivatives`
+   reconstruction, and a `getenv` per covered pixel in the triangle path.
+   **Not measurable on this workload** (7.914 -> 7.865 ms, inside the noise);
+   kept as an unconditionally correct hoist, recorded as unmeasured.
+
+Interleaved A/B, six alternating rounds against `c6d9ecc` to cancel load drift:
+**9.037 -> 7.926 ms, 12.3% faster**, identical digest every round.
+
+### Do not re-try: precomputing the combiner's constant inputs
+
+`evaluate_combiner` converts primitive, environment, k4/k5, key center/scale,
+and prim_lod_fraction to float per pixel, all derived from primitive-constant
+state. This looks like an obvious ~14-divisions-per-pixel win. **It is not.**
+Replacing every one of those with a literal -- an upper bound no real
+implementation can beat -- measured 8.73 ms against the honest 7.93 ms, i.e.
+*slower*. LLVM already hoists them; the measured cost is the combiner's
+data-dependent branching, not its arithmetic. Measure this ceiling before
+building the plumbing, as was done here.
+
+### Equivalence evidence
+
+- 40 route frames dumped via `FN64_RENDER_DUMP_DIR` before and after:
+  **all 40 byte-identical** by SHA-256.
+- Both committed `reference/wm2000-frames/` PNGs reproduce exactly.
+- Framebuffer digest `d0dbebc71bdf5264` unchanged across all three commits.
+- 462/462 render-reference (including the exact-panic-text TMEM test),
+  108/108 render + certification, 704/704 abi + runtime, `grade-all.sh`
+  wrong=0 on all five.
