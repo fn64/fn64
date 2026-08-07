@@ -957,8 +957,139 @@ pub(super) fn observe_renderer_write(event: GuestWriteEvent) {
     }
 }
 
+/// TEMPORARY (mprotect feasibility census, 2026-08-07).
+///
+/// Counts the DISTINCT 16 KiB host pages of the watched region that guest
+/// writes touch between two dispatch boundaries. That count is the number of
+/// write faults an `mprotect` write barrier would take per boundary, which is
+/// the only unknown in the fault-vs-scan comparison. Enabled by
+/// `FN64_MPROTECT_CENSUS=1`; inert otherwise.
+pub mod mprotect_census {
+    use std::cell::RefCell;
+
+    /// Apple Silicon page size; the granule an `mprotect` barrier would use.
+    const PAGE: u32 = 16384;
+
+    thread_local! {
+        static PAGES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// (boundaries, total distinct pages, histogram of pages-per-boundary).
+    ///
+    /// Process-global rather than thread-local so the at-exit report can be
+    /// printed from any thread: the counting happens on a coroutine-backed
+    /// executor thread whose thread-locals are not torn down at process exit,
+    /// so a thread-local total would never be observed.
+    static TOTALS: std::sync::Mutex<(u64, u64, Vec<u64>)> =
+        std::sync::Mutex::new((0, 0, Vec::new()));
+
+    pub fn enabled() -> bool {
+        // Read the environment once. `note_write` runs on every guest store, so
+        // a `getenv` here is itself visible in the profile.
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_MPROTECT_CENSUS").is_some())
+    }
+
+    /// Record that `[offset, offset+len)` was written.
+    pub(super) fn note_write(offset: u32, len: u32) {
+        if !enabled() {
+            return;
+        }
+        let first = offset / PAGE;
+        let last = offset.saturating_add(len.saturating_sub(1)) / PAGE;
+        PAGES.with(|pages| {
+            let mut pages = pages.borrow_mut();
+            for page in first..=last {
+                if !pages.contains(&page) {
+                    pages.push(page);
+                }
+            }
+        });
+    }
+
+    /// Close one dispatch boundary and fold its page count into the totals.
+    ///
+    /// Also arms the at-exit report on first use, so the census needs no edit
+    /// to any harness `main` -- notably not
+    /// `examples/wm2000-block-boot/src/main.rs`, whose bytes are hashed into
+    /// `DISPATCH_SOURCE_SHA256` (`build.rs:794`) and therefore into the
+    /// canonical program identity. Printing from here keeps the measured
+    /// program byte-identical to the unmeasured one.
+    pub fn note_boundary() {
+        if !enabled() {
+            return;
+        }
+        arm_report();
+        let count = PAGES.with(|pages| {
+            let mut pages = pages.borrow_mut();
+            let count = pages.len();
+            pages.clear();
+            count
+        });
+        {
+            let mut totals = TOTALS.lock().expect("mprotect census totals poisoned");
+            let (boundaries, total, histogram) = &mut *totals;
+            *boundaries += 1;
+            *total += count as u64;
+            if histogram.len() <= count {
+                histogram.resize(count + 1, 0);
+            }
+            histogram[count] += 1;
+        }
+    }
+
+    /// Register the at-exit report exactly once.
+    ///
+    /// `atexit` rather than a `Drop` guard: the counting runs on a
+    /// coroutine-backed executor thread that is not joined at process exit, so
+    /// no destructor of its would run. The totals are process-global, so the
+    /// handler can print them from whichever thread calls `exit`.
+    fn arm_report() {
+        extern "C" fn at_exit() {
+            print!("{}", report());
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            unsafe { atexit(at_exit) };
+        });
+    }
+
+    /// One line per bucket, plus the mean. Printed by the at-exit hook.
+    pub fn report() -> String {
+        {
+            let totals = TOTALS.lock().expect("mprotect census totals poisoned");
+            let (boundaries, total, histogram) = &*totals;
+            let mean = if *boundaries == 0 {
+                0.0
+            } else {
+                *total as f64 / *boundaries as f64
+            };
+            let mut out = format!(
+                "[mprotect-census] boundaries={boundaries} distinct_pages_total={total} \
+                 mean_pages_per_boundary={mean:.4}\n"
+            );
+            for (count, hits) in histogram.iter().enumerate() {
+                if *hits == 0 {
+                    continue;
+                }
+                let share = 100.0 * *hits as f64 / *boundaries.max(&1) as f64;
+                out.push_str(&format!(
+                    "[mprotect-census]   {count:>4} page(s): {hits:>10} boundaries ({share:5.2}%)\n"
+                ));
+            }
+            out
+        }
+    }
+}
+
 pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     let (offset, len) = event.range();
+    mprotect_census::note_write(offset, len);
     if event.channel() == WriterChannel::CpuInstructionStore {
         CPU_INSTRUCTION_STORE_TRACE.with(|trace| {
             if let Some(trace) = trace.borrow_mut().as_mut() {

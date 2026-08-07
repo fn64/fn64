@@ -688,10 +688,17 @@ they are a substantial piece of engineering.
    `corosensei` coroutine stacks. It must be async-signal-safe: no allocation,
    no `RefCell`, no libc beyond the `mprotect` syscall. The benchmark handler
    meets that bar (two relaxed atomics and one `mprotect`) and took 325,500
-   faults without incident, including with `SA_ONSTACK`. The unmeasured risk is
-   fault delivery onto a coroutine stack rather than a normal thread stack —
-   that must be proven before any integration, and a handler that faults or
-   deadlocks here is a hard crash with no diagnostic.
+   faults without incident, including with `SA_ONSTACK`.
+
+   The open question was fault delivery onto a coroutine stack rather than a
+   normal thread stack, since a handler that faults or deadlocks there is a hard
+   crash with no diagnostic. **Settled directly, and it is clear:**
+   `reference/mprotect-bench/coroutine-fault.rs` takes 2,000 write faults from
+   inside a real `corosensei` coroutine across 20 suspend/resume cycles, with
+   `SA_ONSTACK` set, asserting after each that the store actually landed once
+   the handler re-armed the page. All 2,000 delivered; no lost stores, no
+   corruption of the stack switch. This was the obstacle most likely to
+   invalidate the approach outright, and it does not.
 
 4. **Unattributed writers are the real correctness gap, and it cuts the safe
    way.** The census only sees writes routed through `set_write_observer`. The
@@ -713,12 +720,74 @@ they are a substantial piece of engineering.
 
 6. Not yet checked: interaction with `FN64_WATCH_WRITE` and the debugger.
 
+### A measurement trap worth recording
+
+The first version of the probe printed its report from
+`examples/wm2000-block-boot/src/main.rs`, and that **changed the canonical
+program identity** -- `34712877...` became `57165dc1...`. Not a bug in the
+probe: `build.rs:794` reads `src/main.rs` verbatim into
+`DISPATCH_SOURCE_SHA256`, which feeds `ProgramArtifactIdentity` and therefore
+the whole receipt chain. *Any* edit to that file, including a comment, changes
+the identity of the program under measurement.
+
+It was initially misdiagnosed as a stale `OUT_DIR` -- a forced `build.rs` rerun
+reproduced the new digest, which looked like confirmation until a clean rebuild
+from the same state returned the old one. The A/B, not the single observation,
+is what settled it.
+
+The fix was to print from `fn64-abi` via `atexit` instead, leaving the harness
+source untouched. With that, the instrumented binary's complete run output is
+`diff`-identical to the clean baseline -- program identity, `sim_time`, RDRAM
+SHA-256 and every device counter -- with the census compiled in and disabled.
+**Instrument the library, never `wm2000-block-boot/src/main.rs`.**
+
 ### Status
 
 **Measured and favourable; not implemented.** The go/no-go number the design
 hinged on — faults per boundary — is 0.68 against a break-even of 9, an ~13x
 margin, so the lever exists. The probe is committed behind
 `FN64_MPROTECT_CENSUS` so the number can be re-derived on any route.
+
+Verification carried out: 568/568 tests across `fn64-abi` and `fn64-runtime`,
+and complete run output `diff`-identical to the clean baseline with the probe
+compiled in and disabled (2.90s both ways, `sim_time=13990253`,
+`steps=19523`).
+
+Reproduce the census (add `FN64_CONTROLLER_SCHEDULE` and a larger
+`FN64_BLOCK_MAX_STEPS` for the deep route):
+
+```
+cd examples/wm2000-block-boot
+source ../../.claude/local.env
+export ROM="$FN64_DISCOVER_NWXE_ROM"
+C=~/Code/aki-recomp/captures; G="$C/wm-general-exception-images"
+export FN64_EXECUTABLE_IMAGES="$G/run-1/image.json:$G/run-2/image.json:$G/run-3/image.json"
+export FN64_BOOT_CONTEXT="$C/wm2000-boot-context.json"
+export FN64_ABSENT_N64DD=1 FN64_BLOCK_MAX_STEPS=1300000
+FN64_MPROTECT_CENSUS=1 ./target/release/wm2000-block-boot
+```
+
+The standalone microbenchmark is retained at `reference/mprotect-bench/`
+(`main.rs` = the headline costs, `stress.rs` = the faults-per-boundary sweep
+that locates the break-even). It links nothing from this repository; build it
+with the included `Cargo.toml.txt`.
+
+### The next step, if this is taken up
+
+The obstacle most likely to invalidate the approach outright, signal delivery
+onto a `corosensei` coroutine stack, has been tested and cleared, so what
+remains is invasive but not in doubt.
+
+The expensive, structural piece is obstacle 1: moving RDRAM from a malloc'd
+`Box<[u8]>` to a page-aligned `mmap`. Everything else depends on it, and it
+touches the boot/publication path and the RDRAM-ownership contract. Obstacle 5
+(deriving the changed-byte set by comparing only the faulted pages) is what
+keeps the guard exactly as strong as it is today and should be designed
+alongside it, not after.
+
+Worth stating plainly: this is a multi-day structural change, not a patch. What
+the measurement establishes is that it is worth attempting, roughly 6x to ~2.6x
+of hardware, not that it is easy.
 
 Recorded honestly: the brief that commissioned this expected "the fault costs
 more than the scan" and eight hypotheses had died before it. This one did not.

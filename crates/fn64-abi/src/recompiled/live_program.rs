@@ -353,6 +353,10 @@ impl CanonicalExecutableMutationStateV1 {
     /// path, so every diagnostic, panic message and journal entry is produced
     /// by exactly the code that produced it before.
     pub(super) fn matches_view(&self, view: &fn64_runtime::RdramView<'_>) -> bool {
+        // TEMPORARY (mprotect feasibility census, 2026-08-07). One scan is one
+        // boundary; closing the census here counts exactly the faults an
+        // `mprotect` barrier would take in place of this scan.
+        super::snapshots::mprotect_census::note_boundary();
         self.sealed && self.watched.iter().all(|range| range.matches_storage(view))
     }
 
