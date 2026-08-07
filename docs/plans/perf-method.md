@@ -146,6 +146,42 @@ future depth-reading filter fails loudly instead of silently scanning out
 against `INFINITY`. Keep it for correctness; do not let it be remembered as a
 perf win.
 
+### 13. In a shared tree, commit with a pathspec — `git add` is not enough
+`git commit` writes **the whole index**, not the paths you just added. When
+another agent is working in the same tree it may already have staged its own
+files, and your explicit `git add mine.md` then rides along with them.
+
+Earned on 2026-08-07, immediately after this file gained rule 12. The commit
+that recorded that rule ran `git add docs/plans/perf-method.md` — one path —
+and landed **two** files, because a peer had `vi.rs` staged. It took the call
+site `source.cloned_for_scanout()` without `raster/draw.rs`, which held the
+only definition. **HEAD did not compile**, and it was pushed. A peer caught
+it and repaired it in `199203e`.
+
+Reproduced minimally, so this is mechanism and not conjecture:
+
+```
+git add peer.txt      # someone else stages their file
+git add mine.txt      # you stage only yours
+git commit -m ...     # -> BOTH files land
+
+git commit -m ... -- mine.txt   # -> only mine.txt; peer.txt stays staged
+```
+
+Use `git commit -- <paths>`. It commits exactly those paths whatever the
+index holds, and leaves a peer's staged work alone. `git add -A` is worse
+still and has swept peers' work into unrelated commits three times.
+
+Two corollaries, both of which cost time today:
+- **A green test run in a dirty tree proves nothing about HEAD.** The tests
+  passed while the definition sat uncommitted beside the committed caller.
+  Extract HEAD (`git archive HEAD | tar -x -C <tmp>`) and check there.
+- **Do not edit a route file while someone is benchmarking it.** An
+  `entrance-to-match.schedule` edit mid-run split an interleaved A/B across
+  two different routes — a changed program, not a changed speed. Pin the
+  route (`FN64_CONTROLLER_SCHEDULE` at an extracted, hashed copy) and
+  announce edits.
+
 ## Measuring the 60fps bar
 
 **`reference/wm2000-routes/render-benchmark.zsh`** — one command, produces a
