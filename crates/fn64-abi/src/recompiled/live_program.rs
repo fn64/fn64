@@ -2567,7 +2567,15 @@ pub(super) fn resident_backing_intersects_catalog(
     catalog.active_generations().into_iter().any(|generation| {
         backings
             .binary_search_by_key(&generation, |backing| backing.generation())
-            .is_ok_and(|index| {
+            // `map_or(true, ..)`, not `is_ok_and`. A missing backing means the
+            // catalog disagrees with its own backing list -- a construction
+            // invariant enforced over in `fn64-recomp-rs`, a different crate
+            // from this caller. `is_ok_and` answers "not resident" there, the
+            // PERMISSIVE direction: a false negative lets the write skip its
+            // block boundary and stale translated code executes. Every other
+            // unanswerable case in this predicate resolves to "resident"
+            // (`unwrap_or(true)` in `snapshots.rs`); this one now matches.
+            .map_or(true, |index| {
                 backings[index]
                     .spans()
                     .iter()
