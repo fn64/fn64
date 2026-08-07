@@ -146,3 +146,38 @@ Perf is no longer the binding constraint on the actual goal.
    entrance presentation and a match are actually reached.
 2. **Only WM2000 boots.** The other four AKI titles need a generated crate
    inventory, not speed.
+
+## The goal is 1.0x, not "good enough"
+
+Stated by the project owner 2026-08-07: **WM2000 fully playable through the
+fn64 recomp and runtime means faithful runtime performance.** 2.4x hardware is
+~25 fps against a 60 fps target and does not qualify. Earlier framing in this
+session that treated 2.4x as possibly sufficient was wrong and is retracted.
+
+### What full speed requires, from the measured split
+
+| | share | verdict |
+|---|---|---|
+| mutation journal / digests | 34% | removable (guard) |
+| `changed_ranges_from_view` | 8% | removable (guard) |
+| mprotect syscalls | 5% | removable (guard) |
+| device fabric — PI/SI/VI/AI | 12.5% | **structural** |
+| `RdramView::read_u8` | 11% | **structural** |
+| `with_executor` dispatch | 11% | **structural** |
+| per-instruction translation | 11% | **structural** |
+| recompiled guest code | 2.86% | runs at 0.09x, ~11x faster than console |
+
+**Removing the entire guard lands near 1.27x — 47 fps, still not 60.** So
+"a release build without the correctness apparatus runs at hardware speed" is
+false, and that inference should not be drawn from the 2.86% figure. Half the
+remaining cost is *being an N64*: emulating its peripherals, its memory, and its
+scheduler.
+
+Reaching 1.0x therefore needs **both** halves:
+1. the guard made cheap enough to leave on, or cleanly optional
+2. genuine work on the structural half, which **nobody has attacked yet** —
+   every optimization this session targeted the guard
+
+Note `FN64_FAST_MUTATION_JOURNAL=1` already measures **zero** difference
+(435 ms vs 441 ms): the barrier absorbed that cost, so the removable 47% is not
+sitting idle waiting to be switched off.
