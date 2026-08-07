@@ -391,8 +391,11 @@ mod syscalls {
 
     /// `arm` -- protect the whole span at a boundary.
     pub static ARM: Site = Site::new();
-    /// `take_dirty` -- unprotect the whole span at a boundary.
+    /// `take_dirty` -- unprotect the whole span at a boundary. Since the
+    /// selective re-protect this is only the overflow and teardown fallback.
     pub static DISARM: Site = Site::new();
+    /// `take_dirty` -- re-protect one faulted page, keeping the window open.
+    pub static REPROTECT: Site = Site::new();
     /// The fault handler -- unprotect one page so the store can retire.
     pub static FAULT: Site = Site::new();
 
@@ -424,18 +427,28 @@ mod syscalls {
                     nanos as f64 / 1e6
                 )
             };
-            let total_calls = ARM.calls.load(Ordering::Relaxed)
-                + DISARM.calls.load(Ordering::Relaxed)
-                + FAULT.calls.load(Ordering::Relaxed);
-            let total_nanos = ARM.nanos.load(Ordering::Relaxed)
-                + DISARM.nanos.load(Ordering::Relaxed)
-                + FAULT.nanos.load(Ordering::Relaxed);
+            let sites = [
+                ("arm", &ARM),
+                ("disarm", &DISARM),
+                ("reprotect", &REPROTECT),
+                ("fault", &FAULT),
+            ];
+            let total_calls: u64 = sites
+                .iter()
+                .map(|(_, site)| site.calls.load(Ordering::Relaxed))
+                .sum();
+            let total_nanos: u64 = sites
+                .iter()
+                .map(|(_, site)| site.nanos.load(Ordering::Relaxed))
+                .sum();
+            let breakdown = sites
+                .iter()
+                .map(|(name, site)| line(name, site))
+                .collect::<Vec<_>>()
+                .join(" ");
             println!(
-                "[mprotect-syscalls] total={total_calls} ({:.1}ms) {} {} {}",
+                "[mprotect-syscalls] total={total_calls} ({:.1}ms) {breakdown}",
                 total_nanos as f64 / 1e6,
-                line("arm", &ARM),
-                line("disarm", &DISARM),
-                line("fault", &FAULT),
             );
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
@@ -780,10 +793,13 @@ impl Barrier {
     /// are the same statement -- which is what lets the next boundary skip the
     /// scan entirely.
     ///
-    /// Idempotent, and on the clean boundary that idempotence is the point: a
-    /// [`Self::take_dirty`] that saw no faults left the region armed and
-    /// protected, so this has nothing to do and issues no syscall. See that
-    /// method for why staying protected across the boundary is sound.
+    /// Idempotent, and that idempotence now carries the common case: every
+    /// [`Self::take_dirty`] that answered leaves the region armed and fully
+    /// protected, so this has nothing to do and issues no syscall. What remains
+    /// for it is the FIRST arm of a window that was genuinely torn down -- the
+    /// initial arm after sealing, and the arm after an overflow, a
+    /// `force_disarm` or a poison-free fallback. See [`Self::take_dirty`] for
+    /// why staying protected across a boundary is sound.
     pub fn arm(&self) {
         if !self.usable() {
             return;
@@ -826,13 +842,21 @@ impl Barrier {
     /// disjoint, covering every page that took a fault since [`Self::arm`].
     /// [`Dirty::Unknown`] means the caller must scan.
     ///
-    /// # The clean boundary never unprotects, and that is the whole optimisation
+    /// # The boundary never unprotects the span, and that is the optimisation
     ///
-    /// 75% of boundaries on WM2000's deep route take zero faults. For those the
-    /// unprotect below and the re-`mprotect` in the next [`Self::arm`] restore
-    /// exactly the state that already held, so both are elided: the region stays
-    /// `PROT_READ` and `armed` stays true, across the boundary and into the next
-    /// recording window.
+    /// A boundary used to unprotect the whole 1.44 MiB span here and re-protect
+    /// it in the next [`Self::arm`]. Neither call is needed, because the span's
+    /// protection state at the end of a boundary is the state it should have at
+    /// the start of the next one:
+    ///
+    /// - 75% of boundaries take zero faults, so the span is already entirely
+    ///   `PROT_READ` and there is nothing at all to do.
+    /// - On the rest, the pages the handler unprotected are the ONLY writable
+    ///   pages of the span, and re-protecting just those (0.2532 per boundary
+    ///   on average) restores the armed state without touching the other 87.
+    ///
+    /// Either way `armed` stays true and the recording window continues rather
+    /// than being torn down and rebuilt.
     ///
     /// This is sound because it makes the barrier STRICTLY MORE protected than
     /// the disarming version, never less. The invariant `arm` establishes --
@@ -859,10 +883,11 @@ impl Barrier {
     /// the defence needs both survive:
     ///
     /// - The set still describes the window ENDING NOW. Staying armed does not
-    ///   carry pages forward: the set was empty at this boundary, and the fresh
-    ///   window that continues starts from that same empty set. There is no
-    ///   older window whose pages could leak into a later answer, because an
-    ///   empty set has nothing to leak.
+    ///   carry pages forward, because the set is CLEARED as the window is
+    ///   closed -- either it was already empty, or the selective re-protect
+    ///   clears it after re-protecting exactly the pages it names. The window
+    ///   that continues therefore starts from empty, so there is no older
+    ///   window whose pages could leak into a later answer.
     /// - A missed `arm` still costs a scan and never soundness. If the boundary
     ///   returns without arming, `PENDING` is `None` and the next boundary
     ///   scans -- and the region is *still protected*, so the pages that fault
@@ -898,25 +923,24 @@ impl Barrier {
             // version told it too.
             return Dirty::Pages(Vec::new());
         }
-        STATE.armed.store(false, Ordering::SeqCst);
-        // Unprotect first. Between here and the next `arm` the region is
-        // ordinary writable memory, which is what every host-side path
-        // (baseline updates, DMA, the renderer) needs it to be.
-        // SAFETY: our own page-aligned mapping.
-        let ok = unsafe {
-            timed_mprotect(
-                &syscalls::DISARM,
-                self.start as *mut u8,
-                self.end - self.start,
-                PROT_READ | PROT_WRITE,
-            )
-        } == 0;
-        if !ok {
-            STATE.poisoned.store(true, Ordering::Relaxed);
-            return Dirty::Unknown;
-        }
         let used = STATE.dirty_len.load(Ordering::Relaxed);
         if used >= MAX_DIRTY_PAGES {
+            // Overflowed: the barrier does not know which pages are writable,
+            // so it cannot re-protect selectively. Fall back to the whole-span
+            // restore and hand the caller the scan.
+            STATE.armed.store(false, Ordering::SeqCst);
+            // SAFETY: our own page-aligned mapping.
+            let ok = unsafe {
+                timed_mprotect(
+                    &syscalls::DISARM,
+                    self.start as *mut u8,
+                    self.end - self.start,
+                    PROT_READ | PROT_WRITE,
+                )
+            } == 0;
+            if !ok {
+                STATE.poisoned.store(true, Ordering::Relaxed);
+            }
             return Dirty::Unknown;
         }
         let page = page_size();
@@ -925,6 +949,51 @@ impl Barrier {
             .collect();
         pages.sort_unstable();
         pages.dedup();
+
+        // Re-protect ONLY the pages that faulted, and stay armed.
+        //
+        // # Why the whole-span pair is not needed here either
+        //
+        // The faulted pages are, by construction, the ONLY pages of the span
+        // that are writable: `arm` protected all of them and the handler
+        // unprotects exactly one page per fault. So the whole-span unprotect
+        // this used to do, followed by the whole-span re-protect in the next
+        // `arm`, differed from "re-protect the faulted pages" only in the
+        // window between them -- and that window is precisely where the clean
+        // boundary already stopped unprotecting, for the reasons given above.
+        //
+        // The same soundness argument applies unchanged, and applies MORE
+        // strongly: staying protected can only cause a write to be recorded
+        // that would previously have been permitted silently. The dirty set is
+        // a superset of the changed-byte set by construction, and this can only
+        // enlarge the superset, never puncture it.
+        //
+        // The count is 0.2532 dirty pages per served boundary against a
+        // 1.44 MiB span, so this replaces a ~1.3us whole-span call with a
+        // ~0.37us single-page one on the ~25% of boundaries that are dirty --
+        // and replaces the next `arm`'s whole-span call with nothing.
+        //
+        // Clearing the dirty set here rather than in `arm` is what lets the
+        // window continue: the caller is about to absorb these pages into the
+        // baseline, and the window that continues starts from clean.
+        //
+        // If any re-protect fails the barrier's picture of which pages are
+        // writable is no longer complete, which is exactly what `poison` means.
+        // Poisoning restores write permission over the whole span, so the
+        // failure is a fallback to the scan rather than a stuck page.
+        for &index in &pages {
+            let page_base = self.start + index as usize * page;
+            // SAFETY: a page inside our own mapping, from an index the handler
+            // derived from this same span.
+            let ok = unsafe {
+                timed_mprotect(&syscalls::REPROTECT, page_base as *mut u8, page, PROT_READ)
+            } == 0;
+            if !ok {
+                poison();
+                return Dirty::Unknown;
+            }
+        }
+        STATE.dirty_len.store(0, Ordering::Relaxed);
         let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(pages.len());
         for index in pages {
             let lo = self.offset_start + index as usize * page;
@@ -1482,6 +1551,59 @@ mod tests {
             "a write after a clean boundary must still be reported"
         );
         assert_eq!(rdram[page * 3 + 7], 0xc3);
+    }
+
+    /// A dirty boundary re-protects the faulted pages and keeps recording.
+    ///
+    /// The property the selective re-protect rests on. If a re-protected page
+    /// were left writable, the SECOND write to it would not fault and the
+    /// boundary after that would report the page clean over changed bytes.
+    /// Writing the same page in two consecutive windows is what pins it.
+    #[test]
+    fn a_dirty_boundary_reprotects_and_the_same_page_faults_again() {
+        if !requested() {
+            return;
+        }
+        let page = page_size();
+        let mut rdram = PageAlignedRdram::new(page * 8).expect("mmap");
+        let base = rdram.as_ptr();
+        let barrier = Barrier::new(base, rdram.len(), 0, (page * 8) as u32);
+        if !barrier.usable() {
+            return;
+        }
+        barrier.arm();
+
+        rdram[page * 4 + 1] = 0x11;
+        let Dirty::Pages(first) = barrier.take_dirty() else {
+            panic!("barrier returned Unknown for a one-page write");
+        };
+        assert_eq!(first, vec![((page * 4) as u32, (page * 5) as u32)]);
+
+        // The window continues; `arm` is a no-op. Writing the SAME page again
+        // must fault again, which it can only do if the re-protect happened.
+        barrier.arm();
+        rdram[page * 4 + 2] = 0x22;
+        let Dirty::Pages(second) = barrier.take_dirty() else {
+            panic!("barrier returned Unknown for the second write");
+        };
+        assert_eq!(
+            second,
+            vec![((page * 4) as u32, (page * 5) as u32)],
+            "a page re-protected at the previous boundary must fault again"
+        );
+
+        // And a boundary with no write is clean, so the set really was cleared
+        // rather than carried forward.
+        barrier.arm();
+        let Dirty::Pages(third) = barrier.take_dirty() else {
+            panic!("barrier returned Unknown for a clean boundary");
+        };
+        assert!(
+            third.is_empty(),
+            "the previous window's pages must not carry forward: {third:?}"
+        );
+        assert_eq!(rdram[page * 4 + 1], 0x11);
+        assert_eq!(rdram[page * 4 + 2], 0x22);
     }
 
     /// `force_disarm` must leave the region genuinely writable.
