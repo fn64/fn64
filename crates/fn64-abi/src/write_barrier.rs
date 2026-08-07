@@ -779,11 +779,30 @@ impl Barrier {
     /// "no page faulted since arming" and "no byte differs from the baseline"
     /// are the same statement -- which is what lets the next boundary skip the
     /// scan entirely.
+    ///
+    /// Idempotent, and on the clean boundary that idempotence is the point: a
+    /// [`Self::take_dirty`] that saw no faults left the region armed and
+    /// protected, so this has nothing to do and issues no syscall. See that
+    /// method for why staying protected across the boundary is sound.
     pub fn arm(&self) {
         if !self.usable() {
             return;
         }
         syscalls::arm_report();
+        if STATE.armed.load(Ordering::SeqCst) && STATE.dirty_len.load(Ordering::Relaxed) == 0 {
+            // Already armed with an empty dirty set -- the state this call
+            // would establish. The region is protected, so nothing has been
+            // written unobserved since; re-issuing `mprotect(PROT_READ)` over
+            // an already-`PROT_READ` span would be a 1.2us no-op.
+            //
+            // The `dirty_len == 0` half is load-bearing, not belt-and-braces.
+            // Armed with a NONEMPTY set means faults were recorded that no
+            // boundary has consumed, and arming must clear them: those pages
+            // were absorbed into the baseline by the caller that just proved
+            // the region clean, so carrying them into the next window would
+            // re-report absorbed writes as changes.
+            return;
+        }
         STATE.dirty_len.store(0, Ordering::Relaxed);
         // SAFETY: our own page-aligned mapping.
         let ok = unsafe {
@@ -806,6 +825,55 @@ impl Barrier {
     /// The returned ranges are physical RDRAM byte offsets, ascending and
     /// disjoint, covering every page that took a fault since [`Self::arm`].
     /// [`Dirty::Unknown`] means the caller must scan.
+    ///
+    /// # The clean boundary never unprotects, and that is the whole optimisation
+    ///
+    /// 75% of boundaries on WM2000's deep route take zero faults. For those the
+    /// unprotect below and the re-`mprotect` in the next [`Self::arm`] restore
+    /// exactly the state that already held, so both are elided: the region stays
+    /// `PROT_READ` and `armed` stays true, across the boundary and into the next
+    /// recording window.
+    ///
+    /// This is sound because it makes the barrier STRICTLY MORE protected than
+    /// the disarming version, never less. The invariant `arm` establishes --
+    /// every byte of the region is write-protected and the recorded dirty set
+    /// describes every write since the baseline was proven -- holds continuously
+    /// rather than being torn down and rebuilt. A host write landing in the
+    /// window that used to be unprotected now faults and is RECORDED, where
+    /// before it was silently permitted and the boundary relied on the caller
+    /// having invalidated. Recording strictly more is the safe direction: the
+    /// dirty set is already a superset of the changed-byte set by construction.
+    ///
+    /// ## Why this does not reintroduce the stale-window bug
+    ///
+    /// The bug documented at [`guard::dirty_spans`] is a caller reading a set
+    /// that describes an OLDER window than its own question. The defence is that
+    /// the set is consuming: a boundary that reads it leaves `None` behind, so a
+    /// path that fails to `arm` gets `None` and scans, rather than getting a set
+    /// that predates it and treating every page outside it as proven-unchanged.
+    ///
+    /// That defence is untouched here, because this changes only whether two
+    /// syscalls are issued, never what the dirty set says or when it is
+    /// consumed. `guard::dirty_spans` still calls `disarm_and_capture` and still
+    /// `take`s `PENDING` in the same operation. Concretely, the two properties
+    /// the defence needs both survive:
+    ///
+    /// - The set still describes the window ENDING NOW. Staying armed does not
+    ///   carry pages forward: the set was empty at this boundary, and the fresh
+    ///   window that continues starts from that same empty set. There is no
+    ///   older window whose pages could leak into a later answer, because an
+    ///   empty set has nothing to leak.
+    /// - A missed `arm` still costs a scan and never soundness. If the boundary
+    ///   returns without arming, `PENDING` is `None` and the next boundary
+    ///   scans -- and the region is *still protected*, so the pages that fault
+    ///   meanwhile are recorded rather than lost. The failure mode is strictly
+    ///   better than before, not worse.
+    ///
+    /// The asymmetry the design rests on is preserved exactly: no caller is
+    /// trusted to disarm, because `dirty_spans` still reads and closes in one
+    /// operation. What changes is that "closing" a window with nothing in it no
+    /// longer requires making the region writable in order to make it read-only
+    /// again a moment later.
     pub fn take_dirty(&self) -> Dirty {
         if !self.usable() {
             return Dirty::Unknown;
@@ -817,6 +885,18 @@ impl Barrier {
             // this into `Unknown` is what made the second read of a boundary
             // wipe the first read's pages.
             return Dirty::AlreadyDisarmed;
+        }
+        if STATE.dirty_len.load(Ordering::Relaxed) == 0 {
+            // Nothing faulted. The region is already exactly as `arm` would
+            // leave it, so leave it -- armed, protected, and recording. Read
+            // AFTER the `armed` check and BEFORE clearing anything, so the
+            // ordinary path below is reached with the count unchanged.
+            //
+            // Returning an empty page list rather than `AlreadyDisarmed` is
+            // what makes this an optimisation rather than a behaviour change:
+            // the caller learns "no page changed", which is what the disarming
+            // version told it too.
+            return Dirty::Pages(Vec::new());
         }
         STATE.armed.store(false, Ordering::SeqCst);
         // Unprotect first. Between here and the next `arm` the region is
@@ -860,14 +940,35 @@ impl Barrier {
         Dirty::Pages(ranges)
     }
 
-    /// Unprotect without reading the dirty set, for a host path that is about
-    /// to write the region itself.
+    /// Unprotect unconditionally and stop recording, discarding the dirty set.
     ///
-    /// Distinct from [`Self::take_dirty`] in intent only -- both unprotect --
-    /// but a caller that discards the dirty set is asserting it will scan, and
-    /// naming that is worth a second method.
-    pub fn disarm(&self) {
-        let _ = self.take_dirty();
+    /// Distinct from [`Self::take_dirty`], which since the clean-boundary skip
+    /// may leave the region protected: this one always makes the region
+    /// ordinary writable memory. That is what a path which is about to write
+    /// the region from the host -- or to drop the mapping -- actually needs,
+    /// and it is not something a "did anything fault" answer can provide.
+    ///
+    /// Discarding the dirty set is safe in the only direction that matters: the
+    /// caller is asserting it will scan, and a discarded set means the next
+    /// boundary finds `None` and does exactly that.
+    pub fn force_disarm(&self) {
+        if !self.usable() {
+            return;
+        }
+        STATE.armed.store(false, Ordering::SeqCst);
+        STATE.dirty_len.store(0, Ordering::Relaxed);
+        // SAFETY: our own page-aligned mapping.
+        let ok = unsafe {
+            timed_mprotect(
+                &syscalls::DISARM,
+                self.start as *mut u8,
+                self.end - self.start,
+                PROT_READ | PROT_WRITE,
+            )
+        } == 0;
+        if !ok {
+            STATE.poisoned.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -876,9 +977,26 @@ impl Barrier {
 /// The escape hatch for a path that finds itself unable to reason about the
 /// protection state. Latching rather than toggling: a barrier that has been
 /// wrong once has no claim on the next boundary either.
+///
+/// Restores write permission over the recorded span on the way out. A poisoned
+/// barrier answers nothing and every boundary scans, but the region must still
+/// be WRITABLE for the process to keep running -- and since the clean-boundary
+/// skip leaves it protected across boundaries, "poisoned" and "unprotected" no
+/// longer coincide by accident. Clearing the flags without clearing the
+/// protection would leave every subsequent guest store faulting into a handler
+/// that has just declared it will not handle anything.
+///
+/// Best-effort by construction: if the `mprotect` fails there is nothing left
+/// to escalate to, and the flags are already latched.
 pub fn poison() {
+    let start = STATE.protected_start.load(Ordering::Relaxed);
+    let end = STATE.protected_end.load(Ordering::Relaxed);
     STATE.poisoned.store(true, Ordering::Relaxed);
     STATE.armed.store(false, Ordering::SeqCst);
+    if start != 0 && end > start {
+        // SAFETY: the span the barrier recorded, inside our own mapping.
+        unsafe { mprotect(start as *mut u8, end - start, PROT_READ | PROT_WRITE) };
+    }
 }
 
 /// The process's single barrier, and the guard's view of it.
@@ -971,6 +1089,26 @@ pub mod guard {
                 Dirty::AlreadyDisarmed => {}
                 // Unknown poisons the pending set: the boundary must scan.
                 Dirty::Unknown => PENDING.with(|pending| *pending.borrow_mut() = None),
+            }
+        });
+    }
+
+    /// Take the barrier fully down: unprotect the region and stop recording.
+    ///
+    /// For teardown and for any host path that needs the region to be ORDINARY
+    /// WRITABLE MEMORY rather than merely "observed". [`disarm_and_capture`]
+    /// cannot serve that need since the clean-boundary skip, because a boundary
+    /// with no faults deliberately leaves the region protected.
+    ///
+    /// The distinction matters exactly once and it matters absolutely: process
+    /// exit writes RDRAM from several paths and then DROPS the mapping. A page
+    /// left `PROT_READ` would fault somewhere in that sequence with the handler
+    /// already naming memory the allocator is about to reclaim.
+    pub fn force_disarm() {
+        BARRIER.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(barrier) = slot.as_ref() {
+                barrier.force_disarm();
             }
         });
     }
@@ -1299,5 +1437,83 @@ mod tests {
         );
         assert_eq!(rdram[page * 2 + 5], 0xa5);
         assert_eq!(rdram[page * 5], 0x5a);
+    }
+
+    /// A clean boundary must stay protected, and the next window must still
+    /// report a write made after it.
+    ///
+    /// This is the property the clean-boundary skip rests on. The failure it
+    /// pins is the one that would make the skip unsound: if the elided
+    /// `arm`/`disarm` pair left the region WRITABLE, a write in the following
+    /// window would not fault and the boundary after it would report clean over
+    /// changed bytes -- exactly the missed mutation the barrier exists to
+    /// prevent.
+    #[test]
+    fn a_clean_boundary_stays_armed_and_the_next_write_is_still_reported() {
+        if !requested() {
+            return;
+        }
+        let page = page_size();
+        let mut rdram = PageAlignedRdram::new(page * 8).expect("mmap");
+        let base = rdram.as_ptr();
+        let barrier = Barrier::new(base, rdram.len(), 0, (page * 8) as u32);
+        if !barrier.usable() {
+            return;
+        }
+        barrier.arm();
+
+        // A boundary with no writes: clean, and deliberately still protected.
+        let Dirty::Pages(ranges) = barrier.take_dirty() else {
+            panic!("a clean boundary must report pages, not Unknown");
+        };
+        assert!(ranges.is_empty(), "nothing was written, so nothing is dirty");
+
+        // `arm` over an already-armed clean region is a no-op, not a reset.
+        barrier.arm();
+
+        // The write lands in the continued window and must be observed.
+        rdram[page * 3 + 7] = 0xc3;
+        let Dirty::Pages(ranges) = barrier.take_dirty() else {
+            panic!("barrier returned Unknown for a one-page write");
+        };
+        assert_eq!(
+            ranges,
+            vec![((page * 3) as u32, (page * 4) as u32)],
+            "a write after a clean boundary must still be reported"
+        );
+        assert_eq!(rdram[page * 3 + 7], 0xc3);
+    }
+
+    /// `force_disarm` must leave the region genuinely writable.
+    ///
+    /// Teardown depends on this: `prepare_process_exit` writes RDRAM from
+    /// several paths and then drops the mapping. Since a clean `take_dirty` now
+    /// leaves the region protected, "the barrier is down" and "the region is
+    /// writable" are no longer the same statement, and this is the method that
+    /// promises the second one.
+    #[test]
+    fn force_disarm_leaves_the_region_writable_after_a_clean_boundary() {
+        if !requested() {
+            return;
+        }
+        let page = page_size();
+        let mut rdram = PageAlignedRdram::new(page * 4).expect("mmap");
+        let base = rdram.as_ptr();
+        let barrier = Barrier::new(base, rdram.len(), 0, (page * 4) as u32);
+        if !barrier.usable() {
+            return;
+        }
+        barrier.arm();
+        // Clean boundary: stays protected.
+        assert!(matches!(barrier.take_dirty(), Dirty::Pages(ranges) if ranges.is_empty()));
+        barrier.force_disarm();
+        // No fault may be taken here; the handler is disarmed, so a still-
+        // protected page would deliver SIGSEGV to the default handler.
+        rdram[page * 2] = 0x77;
+        assert_eq!(rdram[page * 2], 0x77);
+        assert!(
+            matches!(barrier.take_dirty(), Dirty::AlreadyDisarmed),
+            "force_disarm must leave the barrier disarmed"
+        );
     }
 }

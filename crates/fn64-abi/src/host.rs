@@ -412,9 +412,15 @@ pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
     // several paths and then drops the allocation; a page left `PROT_READ`
     // would fault somewhere in that sequence, and after the drop the handler's
     // recorded region would name memory the allocator has reclaimed.
+    //
+    // `force_disarm` rather than `disarm_and_capture`: the latter answers "what
+    // faulted" and, on a boundary where nothing did, deliberately leaves the
+    // region protected rather than paying two syscalls to restore the state it
+    // is already in. That is right for a boundary and wrong for teardown, which
+    // needs the region genuinely writable, not merely observed.
     #[cfg(feature = "recomp-rs")]
     {
-        crate::write_barrier::guard::disarm_and_capture();
+        crate::write_barrier::guard::force_disarm();
         crate::write_barrier::guard::invalidate();
     }
     crate::task_dispatch::drop_backends_for_process_exit();
