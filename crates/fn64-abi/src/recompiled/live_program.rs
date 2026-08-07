@@ -2763,35 +2763,51 @@ impl CanonicalLiveBlockProgramV1 {
 /// The resident-backing scan itself, over a borrowed catalog.
 ///
 /// This mirrors `invalidate_physical_write` (`fn64-recomp-rs`
-/// `generation/mod.rs:1292`): for each ACTIVE generation, test that
-/// generation's physical backing spans for intersection. `active` holds
-/// segments rather than generations, and a generation's backing is typically
-/// one or two spans, so this is a handful of interval tests per store.
+/// `generation/mod.rs`): for each ACTIVE generation, test that generation's
+/// DIGESTED IMAGE for intersection. `active` holds segments rather than
+/// generations, and a generation's backing is typically one or two spans, so
+/// this is a handful of interval tests per store.
+///
+/// The two predicates are a matched pair and must be narrowed together. They
+/// share `digested_image_intersects` precisely so the mirror cannot drift:
+/// retirement decides whether the translation survives the write, and this
+/// decides whether the write ends the block. If this one stayed wide while
+/// retirement narrowed, generations would remain resident and this would
+/// answer "resident" far more often -- measured as 2.48x more scheduler steps
+/// for byte-identical guest work.
 pub(super) fn resident_backing_intersects_catalog(
     catalog: &BackedPrecompiledGenerationCatalogV1,
     physical_start: u32,
     physical_end: u32,
 ) -> bool {
     let backings = catalog.backings();
+    let generations = catalog.generations();
     catalog.active_generations().into_iter().any(|generation| {
-        backings
-            .binary_search_by_key(&generation, |backing| backing.generation())
-            // `map_or(true, ..)`, not `is_ok_and`. A missing backing means the
-            // catalog disagrees with its own backing list -- a construction
-            // invariant enforced over in `fn64-recomp-rs`, a different crate
-            // from this caller. `is_ok_and` answers "not resident" there, the
-            // PERMISSIVE direction: a false negative lets the write skip its
-            // block boundary and stale translated code executes. Every other
-            // unanswerable case in this predicate resolves to "resident"
-            // (`unwrap_or(true)` in `snapshots.rs`); this one now matches.
-            .map_or(true, |index| {
-                backings[index]
-                    .spans()
-                    .iter()
-                    .any(|span| {
-                        physical_start < span.physical_end()
-                            && physical_end > span.physical_start()
-                    })
-            })
+        // `map_or(true, ..)`, not `is_ok_and`, in BOTH lookups. A missing
+        // backing or a missing generation means the catalog disagrees with its
+        // own lists -- a construction invariant enforced over in
+        // `fn64-recomp-rs`, a different crate from this caller. `is_ok_and`
+        // answers "not resident" there, the PERMISSIVE direction: a false
+        // negative lets the write skip its block boundary and stale translated
+        // code executes. Every other unanswerable case in this predicate
+        // resolves to "resident" (`unwrap_or(true)` in `snapshots.rs`); these
+        // match.
+        let Ok(backing_index) =
+            backings.binary_search_by_key(&generation, |backing| backing.generation())
+        else {
+            return true;
+        };
+        let Ok(generation_index) =
+            generations.binary_search_by_key(&generation, |generation| generation.id())
+        else {
+            return true;
+        };
+        let generation = &generations[generation_index];
+        backings[backing_index].digested_image_intersects(
+            generation.image_start(),
+            generation.image_end(),
+            physical_start,
+            physical_end,
+        )
     })
 }

@@ -760,6 +760,131 @@
         ));
     }
 
+    /// THE OVERLAY DATA-WRITE PROPERTY. A generation whose invalidation extent
+    /// is wider than its digested image -- every WM2000 overlay, where the
+    /// surplus is mutable data -- must survive writes to the surplus and must
+    /// still be retired by a write to its text.
+    ///
+    /// Testing the whole invalidation extent instead cost 419,861 activations
+    /// re-hashing 66.8 GB on the route to controller read 600, with 100% of
+    /// them attributed to writes outside the digested image.
+    #[test]
+    fn a_write_outside_the_digested_image_does_not_retire_the_generation() {
+        // Image is the first 8 bytes; the invalidation extent runs 16 further
+        // bytes past it, standing in for the overlay's mutable data.
+        let image_bytes = [0x24, 0x02, 0x00, 0x01, 0x24, 0x03, 0x00, 0x01];
+        let image_end = GuestPc::new(VA.get() + 8);
+        let invalidation_end = GuestPc::new(VA.get() + 24);
+        let overlay = PrecompiledGeneration::new(
+            GenerationId::new(1),
+            VA,
+            image_end,
+            VA,
+            invalidation_end,
+            Sha256::digest(image_bytes).into(),
+            vec![PrecompiledShard::new(BankId::new(11), VA, image_end).unwrap()],
+        )
+        .unwrap();
+        let mut catalog = PrecompiledGenerationCatalog::new();
+        catalog.register(overlay).unwrap();
+        let mut backed = BackedPrecompiledGenerationCatalogV1::new(
+            catalog,
+            vec![PrecompiledGenerationBackingV1::new(
+                GenerationId::new(1),
+                // The backing tiles the whole invalidation extent, as the
+                // constructor requires.
+                vec![BackedExecutableSpanV1::new(VA, 0x100, 24).unwrap()],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+
+        let mut storage = vec![0u8; 0x200];
+        write_physical_bytes(&mut storage, 0x100, &image_bytes);
+        {
+            let mem = Rdram::new(&mut storage);
+            backed.activate_for_fetch(VA, &mem).unwrap();
+        }
+        assert_eq!(backed.active_generations(), vec![GenerationId::new(1)]);
+
+        // Writes to the DATA tail -- inside the invalidation extent, outside
+        // the digested image -- must not retire anything.
+        for (start, end) in [(0x108, 0x10c), (0x10c, 0x110), (0x114, 0x118)] {
+            assert!(
+                backed.invalidate_physical_write(start, end).unwrap().is_empty(),
+                "a write to {start:#x}..{end:#x} is outside the digest and must not retire"
+            );
+        }
+        assert_eq!(
+            backed.active_generations(),
+            vec![GenerationId::new(1)],
+            "the generation must still be resident after data writes"
+        );
+
+        // A write that straddles the image/data boundary DOES touch digested
+        // bytes, so it must retire.
+        assert_eq!(
+            backed.invalidate_physical_write(0x104, 0x10c).unwrap(),
+            vec![GenerationId::new(1)],
+            "a write overlapping the digested image must retire"
+        );
+        assert!(backed.active_generations().is_empty());
+    }
+
+    /// The other half: a write landing squarely on executable bytes still
+    /// retires. Losing this would let stale translated code run.
+    #[test]
+    fn a_write_to_executable_bytes_still_retires_the_generation() {
+        let image_bytes = [0x24, 0x02, 0x00, 0x01, 0x24, 0x03, 0x00, 0x01];
+        let image_end = GuestPc::new(VA.get() + 8);
+        let build = || {
+            let overlay = PrecompiledGeneration::new(
+                GenerationId::new(1),
+                VA,
+                image_end,
+                VA,
+                GuestPc::new(VA.get() + 24),
+                Sha256::digest(image_bytes).into(),
+                vec![PrecompiledShard::new(BankId::new(11), VA, image_end).unwrap()],
+            )
+            .unwrap();
+            let mut catalog = PrecompiledGenerationCatalog::new();
+            catalog.register(overlay).unwrap();
+            BackedPrecompiledGenerationCatalogV1::new(
+                catalog,
+                vec![PrecompiledGenerationBackingV1::new(
+                    GenerationId::new(1),
+                    vec![BackedExecutableSpanV1::new(VA, 0x100, 24).unwrap()],
+                )
+                .unwrap()],
+            )
+            .unwrap()
+        };
+
+        let mut storage = vec![0u8; 0x200];
+        write_physical_bytes(&mut storage, 0x100, &image_bytes);
+
+        // Every word of the digested image retires it.
+        for physical in [0x100u32, 0x104] {
+            let mut backed = build();
+            {
+                let mem = Rdram::new(&mut storage);
+                backed.activate_for_fetch(VA, &mem).unwrap();
+            }
+            assert_eq!(
+                backed
+                    .invalidate_physical_write(physical, physical + 4)
+                    .unwrap(),
+                vec![GenerationId::new(1)],
+                "a write to executable bytes at {physical:#x} must retire"
+            );
+            assert_eq!(
+                backed.resolve_active(VA),
+                Err(GenerationLookupError::NoActiveGeneration { pc: VA })
+            );
+        }
+    }
+
     #[test]
     fn catalog_validation_rejects_a_missing_generated_shard_bank() {
         let mut catalog = PrecompiledGenerationCatalog::new();

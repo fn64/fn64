@@ -433,6 +433,47 @@ impl PrecompiledGenerationBackingV1 {
     pub fn spans(&self) -> &[BackedExecutableSpanV1] {
         &self.spans
     }
+
+    /// Whether `[physical_start, physical_end)` touches any byte this
+    /// generation's DIGEST covers.
+    ///
+    /// The backing spans tile the whole INVALIDATION extent, which is wider
+    /// than the image by construction (`PrecompiledGeneration::new` enforces
+    /// `invalidation_start <= image_start` and `invalidation_end >=
+    /// image_end`). The surplus is the overlay's mutable data: bytes the guest
+    /// writes constantly and that no digest ever reads.
+    ///
+    /// So this clips each span to `[image_start, image_end)` -- exactly the
+    /// clip `live_sha256_mapped_with` applies when it computes the digest, and
+    /// exactly the clip the image/matched unions apply in
+    /// `initial_generation_images`. "Would this write change the digest?" and
+    /// "does this write land in the digested bytes?" are then the same
+    /// question, which is what makes retiring on it correct.
+    ///
+    /// Testing the unclipped span instead retires an overlay's CODE whenever
+    /// the guest writes its DATA. On WM2000 that was 419,861 activations
+    /// re-hashing 66.8 GB, with a measured 100% of them attributed to bytes
+    /// outside the digested image and zero to executable bytes.
+    pub fn digested_image_intersects(
+        &self,
+        image_start: GuestPc,
+        image_end: GuestPc,
+        physical_start: u32,
+        physical_end: u32,
+    ) -> bool {
+        self.spans.iter().any(|span| {
+            let virtual_start = span.virtual_start.max(image_start);
+            let virtual_end = span.virtual_end().min(image_end);
+            if virtual_start >= virtual_end {
+                return false;
+            }
+            let clipped_start = span
+                .physical_at(virtual_start)
+                .expect("clipped image start left its backing span");
+            let clipped_end = clipped_start + (virtual_end.get() - virtual_start.get());
+            physical_start < clipped_end && physical_end > clipped_start
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1286,9 +1327,28 @@ impl BackedPrecompiledGenerationCatalogV1 {
         Ok(matching)
     }
 
-    /// Retire every active segment owned by a generation whose exact physical
-    /// invalidation backing intersects the committed write. A split active
-    /// generation is retired as one image because its digest is indivisible.
+    /// Retire every active segment owned by a generation whose DIGESTED IMAGE
+    /// intersects the committed write. A split active generation is retired as
+    /// one image because its digest is indivisible.
+    ///
+    /// The test is the digested image, not the whole invalidation extent. A
+    /// generation's identity is its digest over `[image_start, image_end)`;
+    /// a write outside that range cannot change the digest, so the activated
+    /// translation stays valid and there is nothing to retire. Retiring on the
+    /// wider extent meant every guest write to an overlay's data retired the
+    /// overlay's code and forced a full text re-hash on the next fetch.
+    ///
+    /// A write to executable bytes still retires, which is the property that
+    /// matters: `digested_image_intersects` clips to precisely the bytes the
+    /// digest reads, so it is narrower than the invalidation extent but never
+    /// narrower than the digest.
+    ///
+    /// This must stay in step with `resident_backing_intersects_catalog`
+    /// (`fn64-abi` `recompiled/live_program.rs`), which decides whether the
+    /// same write breaks the translated block. The two are a matched pair:
+    /// narrowing retirement alone leaves generations resident, which makes the
+    /// block-boundary predicate answer "resident" far more often and costs more
+    /// scheduler steps than it saves.
     pub fn invalidate_physical_write(
         &mut self,
         physical_start: u32,
@@ -1311,11 +1371,12 @@ impl BackedPrecompiledGenerationCatalogV1 {
                     .binary_search_by_key(&generation.id, |backing| backing.generation)
                     .expect("active generation has no validated physical backing")];
                 backing
-                    .spans
-                    .iter()
-                    .any(|span| {
-                        physical_start < span.physical_end() && physical_end > span.physical_start()
-                    })
+                    .digested_image_intersects(
+                        generation.image_start,
+                        generation.image_end,
+                        physical_start,
+                        physical_end,
+                    )
                     .then_some(generation.id)
             })
             .collect::<Vec<_>>();
