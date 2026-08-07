@@ -2576,6 +2576,13 @@ impl CanonicalLiveBlockProgramV1 {
                         None => state.borrow().matches_view(view),
                     };
                     if unchanged {
+                        // Proven equal to the baseline with nothing to
+                        // attribute, so `arm`'s precondition holds. Without
+                        // this the barrier stays down from here to the next
+                        // boundary that happens to arm, and every boundary in
+                        // between falls back to the full scan -- which was
+                        // measured as 23% of them.
+                        self.arm_barrier_over_clean_region();
                         return invalidated;
                     }
                 }
