@@ -1223,3 +1223,60 @@ The next candidates, in descending expected value:
    share; the separate finding that the entrance hashes 66.8 GB is the same
    cost seen from the other side.
 3. Codegen remains irrelevant until guest code is visible in a profile at all.
+
+## 2026-08-07: the post-barrier profile, corrected — I read inclusive as self
+
+I dispatched three optimization targets off a profile that was **cumulative
+(inclusive) time, not self time**. In `sample` output a frame's count includes
+everything it called. All three targets were artifacts:
+
+- `live_program::_` (42) is not a symbol. It is the demangled prefix of
+  `_$LT$impl…CanonicalLiveBlockProgramV1$GT$`, an inclusive total across
+  `invalidate_pending_physical_writes_inner`, `reconcile_before_dispatch`,
+  `flush_host_abi_transaction` and `arm_barrier_over_clean_region` — mostly the
+  barrier calls beneath it.
+- `verify_precompiled_instruction_word` (15) never appears in a self-time
+  profile at all. **All** generated shard code sums to 8 of 214 self samples.
+- The three address-translation functions (24) are ~6 self samples together.
+
+This is the exact error the project's own history warns about, and it cost an
+agent a full investigation cycle to unwind.
+
+**Corrected self time** (two independent samples, 12 s and 6 s, in agreement):
+
+```
+109  __mprotect                 50.9%
+ 34  sha2::sha256::compress
+ 23  _sigtramp                  (fault delivery)
+ 14  changed_ranges_from_view
+  6  _platform_memmove
+  4  try_store_w_translated
+```
+
+### The barrier is now the bottleneck it created
+
+~316 ms of the 620 ms deep route is the `mprotect` syscall itself: ~182,892
+calls (arm + disarm across 91,446 boundaries) at ~1.7 us. With `_sigtramp` and
+the SHA-256 re-rooting, **the barrier's own machinery is ~78% of remaining
+runtime.** It traded a 1.5 MB `memcmp` for two syscalls per boundary — a 4.5x
+win that is now the thing to attack.
+
+The lever is **syscall volume**, not per-instruction work:
+- `clean=68615` — **75% of boundaries have zero dirty pages** and still pay arm
+  + disarm.
+- Staying armed across a clean boundary skips both syscalls, but correctness
+  rests on `dirty_spans` being consuming; see the stale-window bug documented at
+  `write_barrier.rs:888`.
+- `mean_dirty_pages_per_served=0.2532` — narrower protected spans or batched
+  re-arm cut syscalls directly.
+
+### Target 1 is dead three ways, not one
+
+`verify_precompiled_instruction_word` cannot be gated on the barrier even if it
+were worth it: `fn64-recomp-rs` does not depend on `fn64-abi` (the dependency
+runs the other way), so the verify cannot ask whether the barrier is armed.
+`verify_live_words: true` is baked into the shards at generation
+(`examples/wm2000-block-shards/build.rs:270`), so making it conditional would
+mean a runtime flag test per instruction. And the sets differ: the barrier's
+span is the page-widened executable ranges bound at seal, while the verify
+covers whatever PC executes, and the barrier legitimately degrades to `Unknown`.
