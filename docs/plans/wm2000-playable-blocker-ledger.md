@@ -394,3 +394,59 @@ remaining lever and its safety argument has been verified:
 consulting `self.active`, so a generation activated later over bytes written
 earlier cannot execute stale code -- it re-digests and returns `AotMiss`.
 `guest_write_token` has no non-test consumers, so nothing short-circuits that.
+
+
+## 2026-08-06: the resident-generation boundary -- the store-forced dispatch is gone
+
+`classify_live_executable_write` asked only "does this write land in the watched
+executable region" -- a region covering every byte any generation could EVER
+back. It now also asks whether any **currently resident** generation is backed
+by those bytes.
+
+A go/no-go probe run before any code was written: **0 of 199,588 watched stores
+touched a resident generation.** Every one of them was forcing a scheduler
+round-trip for nothing.
+
+| | before | after |
+|---|---|---|
+| 1,461,877 guest instructions | 18.29s | **1.27s** (14.4x, re-measured independently) |
+| slices for that work | 199,751 | **625** |
+| instructions per slice | 7.163 | **2339.0** |
+| `ExecutableWrite` exit share | 99.8% | **0** |
+
+Remaining exits are `Checkpoint` (budget) and `HostCall` -- genuine boundaries.
+
+**Why this is safe, verified rather than assumed.** The digest loop in
+`activate_for_fetch_with_digest` (`generation/mod.rs:799-821`) runs over all
+containing candidates BEFORE the `already_active` check at :846, so a generation
+activated later over bytes changed while nothing was resident re-digests live
+memory and returns `AotMiss` rather than executing stale code.
+`guest_write_token` has only test consumers, so no activation path
+short-circuits that digest. Attribution stays wide at `snapshots.rs:970`; only
+the boundary at `:986` narrowed.
+
+The predicate fails safe: when residency cannot be determined -- `HOST` already
+borrowed, no canonical program, catalog borrowed -- it returns `true` and breaks
+the block. `unwrap_or(true)`, not `unwrap_or(false)`.
+
+**The re-entrancy hazard was real.** `advance_device_time_step` holds
+`with_host` open across a device write that reaches the boundary observer; the
+first build aborted with "RefCell already borrowed". Fixed with a
+non-panicking `try_with_host`.
+
+### A measurement correction that invalidates earlier step counts
+
+**`FN64_BLOCK_MAX_STEPS` bounds SLICES, not instructions.** With slices ~326x
+longer, a "60,000 step" run now executes 2,670,280 guest instructions instead of
+180,000. Every step-count comparison in this document predating this change
+measures a different amount of guest work on either side, including the "60k
+benchmark = 4.6s" figure.
+
+**Pin `FN64_BLOCK_MIN_GUEST_INSTRUCTIONS` for any A/B from here.** The 14.4x
+above was measured that way, toggling `FN64_DISABLE_RESIDENT_BOUNDARY` within a
+single binary.
+
+Determinism: every device counter byte-identical at the deepest reachable state
+(`device_trace=15389 pi_started=3823 sp_tasks=7 rcp_completed=7
+vi_interrupts=8`). Only `trace` differs -- it counts scheduler round trips, the
+quantity this change eliminates.
