@@ -444,3 +444,148 @@ Verification for this entry: 691/691 `fn64-abi`+`fn64-runtime`, 401/401
 source change is carried. (`fn64-discover` shows 1068/1069 — the OoT
 `auto_strategy_corpus` failure is pre-existing on this branch and unrelated:
 that crate does not depend on `fn64-abi`.)
+
+## Done (2026-08-06): the page-tree digest migration, v1 -> v2
+
+The migration this document authorized is implemented and measured. The digest
+went from 70.3% of self time to **2.3%**, and the 60k benchmark from **32.71s
+to 11.29s (2.90x)**.
+
+### What the digest is now
+
+`digest_snapshot` no longer hashes the watched bytes flat. Each watched range is
+partitioned into **4096-byte pages**; each page has its own SHA-256 leaf, and
+the root hashes the leaves.
+
+- Leaf: `"fn64.canonical-watched-bytes-digest.v2" || 0x00 || page_bytes ||
+  physical_start || physical_end || page_index || page_len || bytes`
+- Root: `"fn64.canonical-watched-bytes-digest.v2" || 0x01 || page_bytes ||
+  range_count || (physical_start || physical_end || page_count || leaves...)*`
+
+The leaf binds the range bounds and the page index, so a page cannot be replayed
+at a different address or a different position in the range; the leaf binds its
+own length, so a short final page cannot be confused with a zero-padded full
+one; the root binds the range count and each range's page count, so no
+regrouping of pages produces the same root. Distinct leaf and root tags mean a
+leaf can never be read as a root.
+
+**Page size = 4096, why.** The cost is bounded on both sides and flat between.
+Below ~1 KiB the per-page fixed cost (a `Sha256::new`, a 38-byte prefix, a
+`finalize` -- about 2 compression blocks) stops being amortized, AND the root
+grows, because the root hashes 32 bytes per page and is recomputed on *every*
+commit. Above ~16 KiB a single-word guest store re-hashes more than it must. At
+4 KiB, WM2000's 1,513,056-byte range is 370 pages: leaf overhead is ~3%, the
+root hashes 11,840 bytes, and a one-store commit hashes one 4 KiB page plus that
+root instead of 1.44 MiB.
+
+Measured on the 60k route: **55,759 page rehashes across 55,505 commits** --
+1.005 pages per commit. The incremental path does what it was designed to do.
+
+### v1 values are historical
+
+Every digest value recorded in this document and in
+`docs/plans/dispatch-granularity.md` prior to this section is a **v1 flat
+digest** and is not reproducible under v2. They are retained as the record of
+what was measured, not as expectations. No v1 value should be compared against
+a v2 run.
+
+`watched_bytes_sha256` (`receipts.rs`) **deliberately stays v1 and stays flat.**
+It is the independent cross-check of the bootstrap watched bytes, it runs once,
+and it is not on the hot path. Point 3 of the migration checklist above asked
+for a decision on it: the decision is that it remains an independent
+implementation, which is the only thing that makes the bootstrap cross-check
+worth having. Making it a second page-tree would have made the two agree by
+construction rather than by evidence.
+
+### Correction to this document's regeneration estimate
+
+The checklist above (points 2 and 4) anticipated regenerating committed receipt
+values and gate expectations. **That work did not exist.** An exhaustive search
+for 64-hex-character literals over the whole tree found **zero** hardcoded
+digest expectations over watched executable memory -- `crates/fn64-abi`, which
+owns the entire chain, contains no such literal in any file, source or test. The
+chain is computed-and-cross-checked end to end: every assertion compares a
+recomputed value against a carried one, never against a constant.
+
+Consequently the migration required **no fixture, gate, test, or reference-TSV
+edits at all**. The claim at point 4 that `scripts/grade-all.sh` "compares
+against stored digests" was also wrong: that script grades `fn64-discover`
+symbol recovery and contains no digest expectation. The digests in
+`scripts/gate-determinism.sh` are discovery-gate JSON outputs, unrelated to
+watched memory.
+
+This is worth recording as a property of the design, not luck: because the
+receipt chain never pinned a literal, a schema migration of the digest cost
+three source files and no regeneration.
+
+### Determinism
+
+`page_tree_root_is_independent_of_incremental_history`
+(`crates/fn64-abi/src/recompiled/tests/mutation_state.rs`) drives a long-lived
+state through 13 commits over two watched ranges -- one sub-page, one spanning
+several pages and ending mid-page -- touching page first bytes, page last bytes,
+spans straddling boundaries, whole pages, the short final page, and pages
+already dirtied. After every commit it requires the incrementally maintained
+root to equal (a) the from-scratch root of the same bytes and (b) the root of a
+**fresh state with no history**, sealed directly on those bytes. It then
+restores the original bytes and requires the original root back, so the cache
+holds no residue of the path taken.
+
+The test was verified to fail: skipping every third dirty page makes it fail at
+round 2.
+
+Dirty tracking is decided in `refresh_page_digests` by `memcmp` of the incoming
+page against the current baseline, at the moment of the update. A page is
+skipped only when its bytes are *equal*, and equal bytes have an equal digest.
+Nothing else can cause a skip -- not a writer's declaration, not
+`current_changed_ranges`, not a flag maintained elsewhere -- so a changed page
+keeping a stale digest is not representable.
+
+### Guards unchanged
+
+No guard weakened. `current_changed_ranges`, `first_uncovered_changed_range`,
+`matches_view`, the pending-write quiescence assertions and the poison path are
+untouched; the mutation journal still detects any undeclared change to watched
+executable memory. `commit_snapshot` adopts the baseline slightly earlier so the
+entry can be built from the incremental root -- after every check that inspects
+the old baseline has already run.
+
+### What is the bottleneck now
+
+Not the digest. Self time at 400k steps, after:
+
+| SELF | symbol |
+|---|---|
+| 2757 | `_platform_memcmp` |
+| 1456 | `_platform_memmove` |
+| 1029 | `current_changed_ranges` |
+| 920 | `RdramView::copy_logical_bytes` |
+| 915 | `WatchedExecutableBytesV1::set_expected` |
+| **173** | `sha2::sha256::aarch64::compress` |
+
+The remaining cost is the snapshot machinery -- copying and comparing 1.44 MiB
+per commit -- which is the over-broad watched region that
+`docs/plans/dispatch-granularity.md` identifies. Narrowing
+`EXECUTABLE_WRITE_RANGES` is now the next lever, and unlike this migration it
+redefines no hashed quantity.
+
+### Verification
+
+- `cargo nextest run -p fn64-abi --features recomp-rs -p fn64-runtime`:
+  **694/694** (691 pre-existing + 3 new).
+- `cargo nextest run -p fn64-recomp-rs`: **401/401**.
+- `cargo nextest run -p fn64-discover`: 1068/1069 -- the OoT
+  `auto_strategy_corpus` failure is pre-existing, confirmed by reverting this
+  change and re-running that test alone.
+- `scripts/grade-all.sh`: wrong=0 on all five configurations.
+- 60k, `FN64_ABSENT_N64DD=1 FN64_BLOCK_MAX_STEPS=60000`: **32.71s -> 11.29s**,
+  `sim_time=180000` both (invariant, as required), progress counters identical.
+- 200k route: **107.51s -> 43.19s (2.49x)**, `sim_time=1461877` both,
+  `thread0_dead=true` both, progress counters byte-identical
+  (`trace=200221 device_trace=421 pi_started=105`, all others 0).
+
+Timings are best-of-3 on the same build configuration. An earlier
+before/after pair in this investigation showed no speedup; that comparison was
+invalid -- the two binaries had been built with different
+`FN64_EXECUTABLE_IMAGES` environments, so one lane was not running the closed
+AOT catalog. Recorded because the null result was believed for a while.
