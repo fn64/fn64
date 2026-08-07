@@ -1042,10 +1042,26 @@ pub(super) fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWri
     //    `borrow_mut` and a hard abort. Hence `try_with_host`.
     //  - no canonical program is installed.
     //  - the generation catalog is itself already borrowed.
-    let resident = crate::try_with_host(|host| host.canonical_recompiled_program.clone())
-        .flatten()
-        .and_then(|live| live.resident_backing_intersects(start, end))
-        .unwrap_or(true);
+    // Answer the question INSIDE the closure, against a borrow. The previous
+    // form cloned the program out of `HOST` first, and
+    // `CanonicalLiveBlockProgramV1` is `Clone` but not free: every field is an
+    // `Rc` except `bootstrap_evidence`, which is an owned
+    // `BootstrapOrImportValidationEvidenceV1` that deep-clones. On a path that
+    // runs on EVERY store into the watched region that allocation-and-free pair
+    // was 4.17% of total runtime, and the clone was never used for anything but
+    // calling one `&self` method.
+    //
+    // This holds `HOST` while `generations.try_borrow()` runs, which is a
+    // NARROWER window than before -- the clone already ran under the same
+    // borrow -- and the inner borrow stays `try_borrow`, so a contended catalog
+    // still resolves conservatively rather than panicking.
+    let resident = crate::try_with_host(|host| {
+        host.canonical_recompiled_program
+            .as_ref()
+            .and_then(|live| live.resident_backing_intersects(start, end))
+    })
+    .flatten()
+    .unwrap_or(true);
     if resident {
         GuestWriteBoundary::ExecutableChanged
     } else {
