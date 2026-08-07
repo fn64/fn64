@@ -1482,3 +1482,101 @@ memory — answering fetches with no digest taken. The `drain`/`replacement` loo
 clips by invalidation extent and leaves fragments behind, and `resolve_active`
 is a first-match linear scan. Recorded as a correctness finding independent of
 any performance work.
+
+## 2026-08-07: narrowing BOTH predicates — the thrash is gone and steps drop
+
+Fixed in `6a9d4ec`. Both `invalidate_physical_write` (`fn64-recomp-rs`) and
+`resident_backing_intersects_catalog` (`fn64-abi`) now clip each backing span
+to `[image_start, image_end)` through one shared helper,
+`PrecompiledGenerationBackingV1::digested_image_intersects`. Sharing the helper
+is the point: the two are documented as a matched pair, and the previous
+attempt regressed precisely because only one of them moved.
+
+That clip is exactly what `live_sha256_mapped_with` applies when it computes
+the digest, so "would this write change the digest?" and "does this write land
+in digested bytes?" are now the same question.
+`PrecompiledGeneration::new` enforces `invalidation_start <= image_start` and
+`invalidation_end >= image_end`, so the narrowed extent is provably a subset of
+the old one and never smaller than the digest — a write to executable bytes
+still retires and still breaks the block.
+
+### Activation census, before and after
+
+```
+before (6a9d4ec~1), FN64_ACTIVATION_CENSUS=1, 700k steps:
+  [activation-census] generation=5227338575556428217  activations=106719 retired_others=0
+  [activation-census] generation=16226209253856221389 activations=306042 retired_others=0
+  [activation-census] generation=17518568401266107605 activations=7100   retired_others=0
+  [activation-census] total_activations=419861 total_reactivations=0
+
+after  (6a9d4ec):
+  (no census output at all)
+```
+
+The before-lane reproduces the documented **419,861** exactly, which is what
+qualifies it as the baseline. `retired_others=0` on every line reconfirms that
+`intersects_invalidation` never fires on this route.
+
+**Read the after-lane's silence correctly — it is the result, not a gap.**
+`activation_census::install()` sits inside the `NoActiveGeneration` fault arm
+in `runners.rs`, and it registers the observer *before* the activation that
+brought it there. So the first activation on each executor thread is never
+observed, and `TOTALS` only becomes `Some` once a LATER activation occurs.
+Before, 419,861 later activations followed. After, there are none: the three
+boot activations happen and nothing ever faults back in, so `TOTALS` stays
+`None` and the at-exit reporter prints nothing.
+
+Activations on the route therefore go **419,861 -> 0**, and the ~66.8 GB of
+SHA-256 over overlay text goes with them. Anyone re-running this should expect
+no census block on a fixed tree and should not read it as a broken harness.
+
+### Measured A/B, same route, same schedule, 700k step budget
+
+`FN64_CONTROLLER_SCHEDULE=entrance-to-match.schedule FN64_BLOCK_MAX_STEPS=700000`.
+Both lanes built from the same tree, before-lane at `6a9d4ec~1`.
+
+| anchor | `sim_time` | before steps | after steps | |
+|---|---|---|---|---|
+| read 100 | 359624297 | 182,605 | **83,299** | 2.19x fewer |
+| read 600 | 1944932808 | 653,736 | **247,315** | 2.64x fewer |
+
+**Steps go DOWN, not up.** This is the metric the single-predicate attempt got
+wrong at 2.48x in the other direction, and it is the direct evidence that
+narrowing the mirror alongside retirement is what makes the fix pay.
+
+Equivalence: a `diff` of every matched anchor (reads 90/100/200/300/400/500/600)
+across the two lanes is empty once the step field is removed — same `sim_time`,
+same `gfx_submits`, same `audio_submits`, same buttons and stick, same resident
+generation set at every point.
+
+The before-lane's read 600 (`step=653736 sim_time=1944932808 gfx_submits=704
+audio_submits=1139`) reproduces the 13h44m baseline figure exactly, so the two
+lanes are measuring the same route. The after-lane reaches that identical state
+in **minutes rather than hours**.
+
+### The route now goes well past the old wall
+
+The old run exhausted 13h44m without passing read 600. The after-lane spends
+its remaining budget beyond it and finishes the full 700,000 steps at
+`sim_time=6848390440` — 3.5x further in simulated time — with
+`gfx_submits=2272 audio_submits=4013`, 4,206,240 audio samples of which
+3,904,345 are nonzero (`peak_abs=30704`), and `render_error=None`.
+
+The read-600 entrance stall is therefore **not** the generation thrash. It
+remains open and is still the real boot blocker; what changed is that reaching
+it now costs minutes, so it is finally cheap to iterate on.
+
+### Interaction with the latent fragment hole
+
+None, and it is not made worse. The fragment hole lives in the
+`drain`/`replacement` loop on the ACTIVATION path, which still clips by
+invalidation extent; this change touches only the two WRITE-path predicates.
+The census already showed `retired_others=0` for all 419,861 activations on
+this route, so that loop never fires here. Worth noting for whoever picks the
+hole up: fragments now persist longer on average, because generations are no
+longer retired by data writes. That does not create the hole or widen its
+conditions, but it does mean a fragment has more opportunity to be reached, so
+the finding deserves a real fix rather than continued deferral.
+
+Note the test named above was written during investigation and never
+committed — there is no live guard for it in the tree.
