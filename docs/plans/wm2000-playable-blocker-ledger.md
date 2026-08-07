@@ -450,3 +450,33 @@ Determinism: every device counter byte-identical at the deepest reachable state
 (`device_trace=15389 pi_started=3823 sp_tasks=7 rcp_completed=7
 vi_interrupts=8`). Only `trace` differs -- it counts scheduler round trips, the
 quantity this change eliminates.
+
+
+## 2026-08-06: 233x faster this session -- 19,000x from hardware down to 81x
+
+Measured on pinned guest work (1,461,877 instructions in 1.269s):
+**1,151,991 guest instructions/sec against the N64's 93.75 MHz = 81x slower
+than hardware.** At session start the same measurement was ~19,000x.
+
+Three changes, each verified independently of the agent that wrote it, each
+leaving `sim_time` and the device counters byte-identical:
+
+| change | effect |
+|---|---|
+| v2 page-tree checkpoint digest | SHA-256 70.3% -> 2.3% of self time |
+| in-place watched-byte comparison | `memcmp` 2757 -> 22 samples; snapshot copy eliminated |
+| resident-generation boundary | `ExecutableWrite` exits 99.8% -> 0; instructions/slice 7.2 -> 2339 |
+
+**The profile is now flat.** Sampled on a live route: `memcmp` 24,
+`current_changed_ranges` 12, `sha2` 9, `memmove` 9, `advance_device_time` 7,
+`run_one_step` 6, and the new `classify_live_executable_write` predicate 2.
+Nothing dominates; there is no next obvious lever of the kind the previous three
+were.
+
+What that buys: a 60-second gameplay segment (~5.6B guest instructions) now
+takes ~81 minutes rather than ~10 days. Real-time is 81x away rather than four
+orders of magnitude, which makes it an engineering target rather than an
+aspiration.
+
+None of this touched the recompiled guest code, which was 0.06% of self time
+throughout. Every win came from runtime bookkeeping around it.
