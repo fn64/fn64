@@ -2215,20 +2215,52 @@ impl CanonicalLiveBlockProgramV1 {
             "catalog host transaction {} reached an ordering boundary with {pending} uncommitted child writer event(s)",
             token.transaction_id
         );
-        let changed = match view.and_then(|view| state.borrow().changed_ranges_from_view(view)) {
-            Some(changed) => changed,
-            None => {
-                let snapshot = state.borrow().read_snapshot(&mut read_physical_byte);
-                state.borrow().current_changed_ranges(&snapshot)
-            }
-        };
+        // `reusable_changed` is `Some` only when the view path answered. The
+        // copying fallback below is the unmapped-byte case, where the callee
+        // must run its own path so the owed panic is raised by the code that
+        // owes it.
+        let (changed, reusable_changed) =
+            match view.and_then(|view| state.borrow().changed_ranges_from_view(view)) {
+                Some(changed) => (changed.clone(), Some(changed)),
+                None => {
+                    let snapshot = state.borrow().read_snapshot(&mut read_physical_byte);
+                    (state.borrow().current_changed_ranges(&snapshot), None)
+                }
+            };
         let first_new_entry = state.borrow().entries.len();
         for (physical_start, physical_end) in changed {
             fn64_recomp_rs::notify_host_abi_write(physical_start, physical_end - physical_start);
         }
         match view {
             Some(view) => {
-                self.invalidate_pending_physical_writes_from_view(view, &mut read_physical_byte);
+                // Hand down the changed list computed at the top of this
+                // function instead of letting the callee rediscover it.
+                //
+                // The callee's own path is two more full scans of the same
+                // region: `matches_view` (one `memcmp` per watched range), and
+                // on a miss `changed_ranges_from_view` again. On WM2000 that
+                // region is the 1 MiB boot bank and this runs at every HostAbi
+                // boundary, so the redundant pair was ~7% of total runtime.
+                //
+                // Reuse is sound only if watched RDRAM cannot have changed
+                // between the two scans. The only thing that runs in between is
+                // the `notify_host_abi_write` loop above, and that writes no
+                // guest memory: it is `notify_attributed_guest_write`
+                // (`fn64-recomp-rs` `runtime/host.rs:464`), whose entire body is
+                // `mark_guest_write_pages` (a page-epoch counter),
+                // `WRITE_OBSERVER` (pushes onto the pending queues), and
+                // `request_guest_write_boundary` (sets a thread-local flag).
+                // None of the three touches RDRAM.
+                //
+                // `debug_assert` re-derives the list in debug builds and
+                // requires it to be identical, so a future writer added to that
+                // loop fails loudly in the test suite rather than silently
+                // reusing a stale answer.
+                self.invalidate_pending_physical_writes_reusing_changed(
+                    view,
+                    &mut read_physical_byte,
+                    reusable_changed,
+                );
             }
             None => {
                 self.invalidate_pending_physical_writes_with(&mut read_physical_byte);
@@ -2317,20 +2349,43 @@ impl CanonicalLiveBlockProgramV1 {
         view: &fn64_runtime::RdramView<'_>,
         read_physical_byte: impl FnMut(u32) -> u8,
     ) -> Vec<GenerationId> {
-        self.invalidate_pending_physical_writes_inner(read_physical_byte, Some(view))
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, Some(view), None)
+    }
+
+    /// [`Self::invalidate_pending_physical_writes_from_view`] for a caller that
+    /// has ALREADY scanned the watched region against this same view and is
+    /// handing the answer down.
+    ///
+    /// Only `flush_host_abi_transaction_inner` may use this, and only because
+    /// nothing between its scan and this call writes guest memory. See the call
+    /// site for that argument. Any other caller must take the scanning form:
+    /// a stale list here means the baseline advances over bytes that were never
+    /// compared.
+    fn invalidate_pending_physical_writes_reusing_changed(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        read_physical_byte: impl FnMut(u32) -> u8,
+        changed: Option<Vec<(u32, u32)>>,
+    ) -> Vec<GenerationId> {
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, Some(view), changed)
     }
 
     pub(super) fn invalidate_pending_physical_writes_with(
         &self,
         read_physical_byte: impl FnMut(u32) -> u8,
     ) -> Vec<GenerationId> {
-        self.invalidate_pending_physical_writes_inner(read_physical_byte, None)
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, None, None)
     }
 
+    /// `reused_changed`, when `Some`, is the changed-range list the caller
+    /// already computed against `view`. It replaces BOTH region scans this
+    /// function would otherwise perform -- the `matches_view` short-circuit and
+    /// the `changed_ranges_from_view` that follows a miss.
     fn invalidate_pending_physical_writes_inner(
         &self,
         mut read_physical_byte: impl FnMut(u32) -> u8,
         view: Option<&fn64_runtime::RdramView<'_>>,
+        reused_changed: Option<Vec<(u32, u32)>>,
     ) -> Vec<GenerationId> {
         let writes =
             PENDING_EXECUTABLE_WRITES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
@@ -2425,7 +2480,27 @@ impl CanonicalLiveBlockProgramV1 {
             // the copy it would have produced is elided.
             if writes.is_empty() && events.is_empty() {
                 if let Some(view) = view {
-                    if state.borrow().matches_view(view) {
+                    // With a reused list, "nothing changed" is the list being
+                    // empty -- the caller's scan already answered exactly the
+                    // question `matches_view` asks, against the same view and
+                    // the same baseline.
+                    let unchanged = match &reused_changed {
+                        Some(changed) => {
+                            debug_assert!(
+                                state.borrow().sealed,
+                                "reused changed-range list on an unsealed mutation state"
+                            );
+                            debug_assert_eq!(
+                                state.borrow().changed_ranges_from_view(view).as_ref(),
+                                Some(changed),
+                                "reused changed-range list disagrees with a fresh scan: \
+                                 something wrote watched RDRAM between the caller's scan and here"
+                            );
+                            changed.is_empty()
+                        }
+                        None => state.borrow().matches_view(view),
+                    };
+                    if unchanged {
                         return invalidated;
                     }
                 }
@@ -2445,9 +2520,12 @@ impl CanonicalLiveBlockProgramV1 {
             // through to the copying path, whose `copy_logical_bytes` raises
             // the panic an unmapped byte owes, naming the first such byte. The
             // fast path commits to nothing in that case.
-            let changed = match view {
-                Some(view) => state.borrow().changed_ranges_from_view(view),
-                None => None,
+            let changed = match (view, reused_changed) {
+                // Already scanned by the caller against this same view; the
+                // `debug_assert` above has re-derived and compared it.
+                (Some(_), Some(changed)) => Some(changed),
+                (Some(view), None) => state.borrow().changed_ranges_from_view(view),
+                (None, _) => None,
             };
             if let (Some(view), Some(changed)) = (view, changed) {
                 if writes.is_empty() && events.is_empty() {
