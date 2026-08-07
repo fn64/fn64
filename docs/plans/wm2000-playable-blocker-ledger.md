@@ -1919,3 +1919,56 @@ identified (they are exactly the ones whose committed `retrace_ticks` exceeds
 
 Measured on `19d1ab7` + the spike gate, release build, headless lane
 (no winit), quiet machine, `entrance-to-match`.
+
+## 2026-08-07: WM2000 reaches in-match gameplay
+
+The deepest state anyone had reached was the match-setup screen. It is now a
+running match: two wrestlers in the ring, an advancing clock, and a player-1
+who responds to the stick. Committed as `5ed7f2c`.
+
+**The dead end was a cancel, not a missing press.** The old schedule sent B at
+controller read 550 and Z at 590 while the Superstars roster was open, which
+backed out of the wrestler selection. With no wrestlers confirmed there was no
+match to load, and the route then idled 760 reads on an empty match-setup
+page. This file's earlier note that the arena-loader PCs were "never reached
+even once" was a correct observation carrying a wrong diagnosis -- it read the
+absence as the game never asking for the arena, when the game had been asked
+and then told to forget. Replacing the two cancels with A confirms was the
+entire fix at the frontier.
+
+Evidence is per-press and visual; every screen below was read off a dumped
+frame, not inferred from what a wrestling menu ought to do. Frames are
+committed in `reference/wm2000-frames/`.
+
+- The screen at read 230 is a **player-count menu** (1P VS 2P / 1P VS CPU /
+  Watch), not the wrestler select an earlier comment called it. The route
+  takes the default, so this is a local two-player card and **not** the
+  CPU-opponent path that comment claimed to prove.
+- The versus presentation is a **looping** cinematic, not a timed one: frame
+  hashes repeat with period ~600 submits, so idling never leaves it. START
+  breaks the loop. This settles the "timed cutscene or input gate?" question
+  the route file had left open.
+- The match clock is what distinguishes gameplay from a cutscene. It advances
+  `00:06` -> `00:17` -> `01:07` -> `01:55`, the two ATTITUDE meters **diverge**
+  (so match logic is computing, not merely animating), and `render_error=None`
+  with `gfx_submits=16586`.
+
+Deterministic: two independent runs produced identical `gfx_submits=16586`,
+`sim_time=18776001537`, `port0_reads=3115`.
+
+**This invalidates earlier frame-census figures as gameplay numbers.** The
+route now renders a match instead of idling on a menu:
+
+| route | submits | steps | submits per Msteps |
+|---|---|---|---|
+| pre-`5ed7f2c` (menu) | 4,900 | 1.5M | 3,267 |
+| post-`5ed7f2c` (match) | 16,586 | 2.1M | 7,898 |
+
+That is **2.42x more graphics work per step**. The software rasterizer measured
+31.6% of executor time -- already the largest single line -- on the *less*
+graphics-dense route, so 34.85-37.60 ms/field is a floor for gameplay rather
+than a typical value, and the case for a GPU backend is stronger than the
+menu-route split made it look.
+
+Still open, and not shown by any of this: **a live window.** These frames are
+headless dumps. That display lists reach an on-screen window remains unproven.
