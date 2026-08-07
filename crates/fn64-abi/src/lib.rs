@@ -1814,6 +1814,17 @@ fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> R {
     HOST.with(|h| f(&mut h.borrow_mut()))
 }
 
+/// `with_host` for callers reached from the guest store path, which can run
+/// underneath a caller that already holds `HOST` -- `advance_device_time_step`
+/// issues device writes from inside its own `with_host` closure, and those
+/// writes reach the executable-write boundary observer.
+///
+/// Returns `None` instead of panicking when `HOST` is already borrowed. Only
+/// callers that have a correct answer for "cannot tell" may use this.
+fn try_with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> Option<R> {
+    HOST.with(|h| h.try_borrow_mut().ok().map(|mut host| f(&mut host)))
+}
+
 /// Install `yielder`/`thread_id`/`rdram` as the active ones for the
 /// duration of `f`. See module doc.
 ///

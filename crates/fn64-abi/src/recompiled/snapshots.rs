@@ -1007,6 +1007,17 @@ pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
 ///
 /// `guest_write_token` would be the way to cache this, and it has no non-test
 /// consumers, so no activation path bypasses the digest.
+/// Kill switch restoring the pre-residency behaviour: every watched-region
+/// write breaks the block. This is the A/B control the speedup is measured
+/// against, and an escape hatch if the predicate is ever suspected.
+fn resident_boundary_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    // Read once. This is consulted on every watched store, so an uncached
+    // `env::var_os` would scan the environment millions of times per route.
+    *DISABLED.get_or_init(|| std::env::var_os("FN64_DISABLE_RESIDENT_BOUNDARY").is_some())
+}
+
 pub(super) fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWriteBoundary {
     let (start, len) = event.range();
     let end = start.saturating_add(len);
@@ -1018,11 +1029,21 @@ pub(super) fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWri
     }) {
         return GuestWriteBoundary::Continue;
     }
-    // Unanswerable means "assume resident". `resident_backing_intersects`
-    // returns `None` when there is no catalog or the catalog is already
-    // borrowed; both must break the block, because a permissive answer here
-    // would let stale translated code execute.
-    let resident = with_host(|host| host.canonical_recompiled_program.clone())
+    if resident_boundary_disabled() {
+        return GuestWriteBoundary::ExecutableChanged;
+    }
+    // Unanswerable means "assume resident", because a permissive answer would
+    // let stale translated code execute. There are three ways to be
+    // unanswerable, and all three must break the block:
+    //
+    //  - `HOST` is already borrowed. This is REACHED, not theoretical:
+    //    `advance_device_time_step` issues device writes from inside its own
+    //    `with_host` closure, so `with_host` here would be a nested
+    //    `borrow_mut` and a hard abort. Hence `try_with_host`.
+    //  - no canonical program is installed.
+    //  - the generation catalog is itself already borrowed.
+    let resident = crate::try_with_host(|host| host.canonical_recompiled_program.clone())
+        .flatten()
         .and_then(|live| live.resident_backing_intersects(start, end))
         .unwrap_or(true);
     if resident {
