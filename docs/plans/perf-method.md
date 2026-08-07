@@ -133,6 +133,19 @@ will not be until that 2.86% grows.
   deletion.
 - **`codegen-units` / LTO / `target-cpu=native` on the shards.** 10% for a
   9-minute build, or 2.3x *slower* with all three.
+- **`with_executor`'s `RefCell` borrow.** One call per scheduling step from
+  `run_one_step`; its 11% self time is the coroutine resume *inside* its closure
+  (71.59% inclusive), not the borrow. Rule 2 in a new costume.
+- **`RdramView::read_u8`, treated as a guest-load cost.** 92.7% of its samples
+  come from the mutation journal (`read_snapshot`) and bootstrap validation, not
+  from guest loads. It is guard work filed under a structural-looking name.
+- **The device fabric.** Already zero: `FN64_DEVICE_ADVANCE_CENSUS` reports
+  `no samples` on the deep route, because `advance_clock_if_idle` takes every
+  call.
+
+See `structural-half-is-mostly-guard.md` — the caller attribution behind all
+three, and why a p99 frame-time bound cannot be measured on this route at all
+(`gfx_submits=0`; it renders nothing).
 
 ## Two things that are not perf but block "playable"
 
@@ -161,11 +174,17 @@ session that treated 2.4x as possibly sufficient was wrong and is retracted.
 | mutation journal / digests | 34% | removable (guard) |
 | `changed_ranges_from_view` | 8% | removable (guard) |
 | mprotect syscalls | 5% | removable (guard) |
-| device fabric — PI/SI/VI/AI | 12.5% | **structural** |
-| `RdramView::read_u8` | 11% | **structural** |
-| `with_executor` dispatch | 11% | **structural** |
-| per-instruction translation | 11% | **structural** |
+| ~~device fabric — PI/SI/VI/AI~~ | ~~12.5%~~ | **struck — measures zero** |
+| ~~`RdramView::read_u8`~~ | ~~11%~~ | **guard, not structural — 92.7% journal** |
+| ~~`with_executor` dispatch~~ | ~~11%~~ | **the resume it wraps, not dispatch** |
+| per-instruction translation | ~4% | structural (was billed 11%) |
 | recompiled guest code | 2.86% | runs at 0.09x, ~11x faster than console |
+
+**The four struck/corrected rows were re-measured 2026-08-07 with caller
+attribution** (`scripts/wm2000_callers.py`) and a census, not self time alone.
+Three of the four "structural" rows were misclassified; `read_u8` in particular
+double-counts the journal already charged at 34%. There is no separate 50%
+structural half to attack. See `structural-half-is-mostly-guard.md`.
 
 **Removing the entire guard lands near 1.27x — 47 fps, still not 60.** So
 "a release build without the correctness apparatus runs at hardware speed" is
