@@ -878,3 +878,54 @@ concurrently "has no expressible call site" (`thread.rs:1-19`). `Executor`,
 `HostState`, `ACTIVE_RDRAM`, `WRITE_OBSERVER` and the page-epoch tables are all
 `thread_local!`; coroutine switches change the stack, not the thread. The only
 non-test spawn near the guest is the watchdog, which never touches RDRAM.
+
+
+## 2026-08-07: `guest_write_token` must NOT be wired into activation
+
+I proposed caching activation digests against `guest_write_token`, on the
+premise that it is page-epoch based and therefore observes RDRAM writes
+independently of the declaration path. **That premise is false, and acting on
+it would have silently deleted a fail-closed guard.**
+
+`mark_guest_write_pages` (`fn64-recomp-rs/src/runtime/host.rs:353`) has exactly
+two callers: `:466` inside `notify_attributed_guest_write` -- the common body of
+every `notify_*` gateway -- and `:516` inside `notify_cpu_instruction_store16`.
+There is no mprotect hook and no hardware dirty bit. **The page epoch is bumped
+only when a writer voluntarily declares**, which is the identical trigger as the
+write queue. The token re-encodes the queue; it does not observe memory.
+
+Undeclared writers therefore leave the token unchanged while mutating an image:
+`Rdram::as_mut_slice` (`runtime/host.rs:605`, self-documented as "an
+UNATTRIBUTED write path", live caller `runners.rs:1331`, a C shim that writes
+wherever the guest points it), the raw `copy_nonoverlapping`/`RdramPtr` writes at
+`pi/timing.rs:1064`/`:1096`, `mesgqueue.rs:148`, and ~25 sites across
+`pfs`/`gbpak`/`voice`/`si`. The attribution audit's "covered" verdicts do not
+transfer: mechanism 2 declares bytes at a later flush boundary, which is too
+late for a cache consulted at fetch.
+
+The consequence would be: a C shim mutates a byte of a generation's image, no
+epoch bumps, the cache reports "verified", and the guest executes stale
+translated code with no digest and no error.
+
+**The tree already says so, and I missed it.** `docs/plans/dispatch-granularity.md:570`
+states the safety argument as: `guest_write_token` "has **no non-test
+consumers**, so no activation path bypasses the digest." The zero-consumer
+property is a cited premise of a written safety argument, not an oversight
+awaiting a fix.
+
+Also corrected: `generation/mod.rs` IS a certified source
+(`fn64-recomp-rs/src/lib.rs:128`). The 27-entry
+`DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1` list is essentially all of that
+crate's `src`, so there is no digest-neutral file in `fn64-recomp-rs`.
+
+### The real fix targets the retirement loop, not the digest
+
+The measured cost is structural rather than cryptographic. Generations
+`17518568401266107605` `[0x8011c900,0x801226f0)` and `5227338575556428217`
+`[0x8011c900,0x80161460)` **share a start address**, so every activation of one
+retires the other and the next fetch re-hashes the full image -- 419,861 times,
+66.8 GB.
+
+Making activation not retire a generation whose image is byte-identical and
+still resident removes the re-hash **while every activation still digests**. No
+weakened verification, no soundness argument about writers required.

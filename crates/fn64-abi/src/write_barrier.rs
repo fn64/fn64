@@ -699,6 +699,189 @@ pub fn poison() {
     STATE.armed.store(false, Ordering::SeqCst);
 }
 
+/// The process's single barrier, and the guard's view of it.
+///
+/// RDRAM is a process singleton and so is the watched region, so the barrier is
+/// too. This module is the seam the mutation guard talks to; it owns the
+/// arm/disarm lifecycle so no call site has to reason about protection state.
+///
+/// # The lifecycle invariant
+///
+/// The barrier may be armed only while the watched region is known to equal the
+/// baseline, because "no page faulted since arming" is only useful if it means
+/// "no byte differs from the baseline". The guard establishes exactly that fact
+/// at every boundary it passes, so arming immediately after a passed boundary
+/// is sound and arming anywhere else is not.
+///
+/// Everything that could write RDRAM or the baseline outside that window
+/// disarms first. Disarming is unconditionally safe -- it can only cost a scan.
+/// Arming is the operation with a precondition, and it has exactly one caller.
+pub mod guard {
+    use super::{page_size, requested, Barrier, Dirty};
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// The armed barrier, if any. Thread-local because the executor and
+        /// everything that touches RDRAM is; the SIGNAL state behind it is
+        /// process-global, which is correct because a signal handler cannot
+        /// read a `thread_local!`.
+        static BARRIER: RefCell<Option<Barrier>> = const { RefCell::new(None) };
+        /// The dirty set the last disarm produced, waiting to be consumed by
+        /// the boundary that disarmed.
+        static PENDING: RefCell<Option<Vec<(u32, u32)>>> = const { RefCell::new(None) };
+    }
+
+    /// Bind the barrier to the installed RDRAM and the watched region.
+    ///
+    /// Idempotent and cheap to call; does nothing unless the barrier is
+    /// requested and the allocation is page-aligned.
+    pub fn bind(base: *mut u8, allocation_len: usize, watched: &[(u32, u32)]) {
+        if !requested() {
+            return;
+        }
+        let (Some(first), Some(last)) = (watched.first(), watched.last()) else {
+            return;
+        };
+        BARRIER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                return;
+            }
+            // Protect the whole span from the first watched byte to the last.
+            // Watched ranges are ascending and, on the routes that matter, a
+            // single contiguous bank; covering any gap between them only adds
+            // spurious faults, which cost a re-arm and never a missed write.
+            *slot = Some(Barrier::new(base, allocation_len, first.0, last.1));
+        });
+    }
+
+    /// Whether the barrier can answer for this boundary.
+    pub fn active() -> bool {
+        BARRIER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|barrier| barrier.usable())
+        })
+    }
+
+    /// Stop recording and keep the dirty set for [`take_dirty_spans`].
+    ///
+    /// Called at the top of every boundary and before every host write. Safe
+    /// to call when not armed.
+    pub fn disarm_and_capture() {
+        BARRIER.with(|slot| {
+            let slot = slot.borrow();
+            let Some(barrier) = slot.as_ref() else { return };
+            match barrier.take_dirty() {
+                Dirty::Pages(pages) => PENDING.with(|pending| {
+                    let mut pending = pending.borrow_mut();
+                    // Union with anything not yet consumed: two disarms before
+                    // a boundary reads the set must not lose the first one's
+                    // pages. Losing a page is the one failure that could make
+                    // the barrier miss a mutation, so this merges rather than
+                    // replaces.
+                    match pending.as_mut() {
+                        Some(existing) => existing.extend_from_slice(&pages),
+                        None => *pending = Some(pages),
+                    }
+                }),
+                // Unknown poisons the pending set: the boundary must scan.
+                Dirty::Unknown => PENDING.with(|pending| *pending.borrow_mut() = None),
+            }
+        });
+    }
+
+    /// Throw away any recorded dirty set, forcing the next boundary to scan.
+    ///
+    /// The correct response to anything that makes the barrier's picture
+    /// incomplete -- a host path that wrote RDRAM while disarmed, a baseline
+    /// change, a reseal.
+    pub fn invalidate() {
+        PENDING.with(|pending| *pending.borrow_mut() = None);
+    }
+
+    /// The dirty spans for this boundary, or `None` meaning "scan everything".
+    ///
+    /// NOT consuming. One boundary can ask more than once -- the reconcile
+    /// asks, then the host-transaction commit asks again, and a `debug_assert`
+    /// in `invalidate_pending_physical_writes_inner` re-derives the list a
+    /// third time to check the reuse. Every one of those must get the SAME
+    /// answer, because they are all asking about the same instant: the region
+    /// is not executing guest code between them, so no new page can have been
+    /// written.
+    ///
+    /// The set is cleared by [`arm_after_proven_clean`] and by
+    /// [`invalidate`], which are the two events that make it stale.
+    pub fn dirty_spans() -> Option<Vec<(u32, u32)>> {
+        if !active() {
+            return None;
+        }
+        PENDING.with(|pending| pending.borrow().clone())
+    }
+
+    /// Re-protect the region.
+    ///
+    /// PRECONDITION, and the only one in this module: the watched region must
+    /// currently equal the baseline. The caller is the boundary that just
+    /// proved it. Arming when that is false would let the next boundary
+    /// conclude "no faults, therefore unchanged" about a region that was
+    /// already different.
+    pub fn arm_after_proven_clean() {
+        BARRIER.with(|slot| {
+            let slot = slot.borrow();
+            if let Some(barrier) = slot.as_ref() {
+                barrier.arm();
+            }
+        });
+        // The freshly armed region is clean by the precondition, so no page is
+        // dirty yet. Any set left over from before is stale.
+        PENDING.with(|pending| *pending.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Clip a dirty span list to one watched range, in that range's own terms.
+    ///
+    /// Returns the byte ranges of `[range_start, range_end)` that the barrier
+    /// says may have changed, clipped and ascending. An empty result means the
+    /// barrier proved this whole watched range untouched.
+    pub fn clip(spans: &[(u32, u32)], range_start: u32, range_end: u32) -> Vec<(u32, u32)> {
+        let mut clipped: Vec<(u32, u32)> = Vec::new();
+        for &(lo, hi) in spans {
+            let lo = lo.max(range_start);
+            let hi = hi.min(range_end);
+            if lo >= hi {
+                continue;
+            }
+            match clipped.last_mut() {
+                Some((_, end)) if *end >= lo => *end = (*end).max(hi),
+                _ => clipped.push((lo, hi)),
+            }
+        }
+        clipped
+    }
+
+    /// Sort and merge a dirty span list so `clip` sees ascending, disjoint
+    /// input.
+    ///
+    /// The union in `disarm_and_capture` can leave the list unsorted and
+    /// overlapping, and `clip`'s coalescing assumes ascending order.
+    pub fn normalize(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+        spans.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+        for (lo, hi) in spans {
+            match merged.last_mut() {
+                Some((_, end)) if *end >= lo => *end = (*end).max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        merged
+    }
+
+    /// Page granule, for tests and diagnostics.
+    pub fn granule() -> usize {
+        page_size()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

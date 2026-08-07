@@ -56,6 +56,68 @@ fn main() {
         image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     }
 
+    // `FN64_XBUS_REPLAY_REPEAT=N` re-executes the same stream against a fresh
+    // backend N times and reports the per-iteration render cost plus an FNV-1a
+    // digest of the resulting framebuffer. This is the renderer's A/B harness:
+    // the stream and RDRAM are real capture data, so the loop measures the
+    // actual rasterizer hot path with no guest execution in the sample, and
+    // the digest makes an optimization's byte-exactness checkable directly
+    // (same digest before and after == identical pixels).
+    let repeat = std::env::var("FN64_XBUS_REPLAY_REPEAT")
+        .ok()
+        .map(|raw| {
+            raw.parse::<u32>()
+                .unwrap_or_else(|_| panic!("FN64_XBUS_REPLAY_REPEAT must be a u32, got {raw:?}"))
+        })
+        .unwrap_or(0);
+    if repeat > 0 {
+        // The staged command words are read-only, but rasterizing writes the
+        // color image back into `image`. Replay from a pristine copy each
+        // iteration so run N sees exactly the inputs run 1 saw.
+        let pristine = image.clone();
+        let mut digest = None::<u64>;
+        let mut best = f64::INFINITY;
+        for _ in 0..repeat {
+            image.copy_from_slice(&pristine);
+            let mut backend = ReferenceBackend::new().with_f3dex2();
+            backend
+                .create(&RenderConfig::ntsc(480, 240))
+                .expect("reference backend create");
+            let started = std::time::Instant::now();
+            backend
+                .process_rdp_commands(
+                    &mut image,
+                    staging as u32,
+                    (staging + stream.len()) as u32,
+                    0,
+                )
+                .expect("raw RDP stream replay");
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            best = best.min(elapsed);
+            let framebuffer = backend.framebuffer().expect("framebuffer after create()");
+            let mut hash: u64 = 0xcbf29ce484222325;
+            for &byte in &framebuffer.pixels {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            // Every iteration must be bit-identical; a digest that drifts
+            // between runs would mean the renderer is not deterministic and
+            // no A/B comparison below it could be trusted.
+            match digest {
+                None => digest = Some(hash),
+                Some(first) => assert_eq!(
+                    first, hash,
+                    "reference renderer produced a different framebuffer across identical replays"
+                ),
+            }
+        }
+        println!(
+            "repeat={repeat} best_render_ms={best:.3} fb_fnv1a={:016x}",
+            digest.expect("at least one iteration")
+        );
+        return;
+    }
+
     let mut backend =
         ReferenceBackend::new()
             .with_f3dex2()

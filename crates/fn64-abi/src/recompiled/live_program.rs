@@ -86,6 +86,10 @@ impl CanonicalExecutableMutationStateV1 {
         if self.poison.is_none() {
             self.poison = Some(reason);
         }
+        // A poisoned state is one whose baseline can no longer be trusted, and
+        // the barrier's whole claim is relative to that baseline. Drop the
+        // recorded pages so every later boundary scans.
+        crate::write_barrier::guard::invalidate();
     }
 
     pub(super) fn begin_child_transaction(&mut self) -> u64 {
@@ -357,7 +361,31 @@ impl CanonicalExecutableMutationStateV1 {
         // boundary; closing the census here counts exactly the faults an
         // `mprotect` barrier would take in place of this scan.
         super::snapshots::mprotect_census::note_boundary();
-        self.sealed && self.watched.iter().all(|range| range.matches_storage(view))
+        if !self.sealed {
+            return false;
+        }
+        // The barrier answers the same question by reading only the pages the
+        // MMU reported written, and falls through to the full scan whenever it
+        // cannot -- `take_dirty_spans` returns `None` for "scan". See
+        // `WatchedExecutableBytesV1::matches_storage_within` for why the
+        // restricted comparison decides the same predicate.
+        if let Some(spans) = self.barrier_spans() {
+            return self.watched.iter().all(|range| {
+                let clipped =
+                    crate::write_barrier::guard::clip(&spans, range.physical_start, range.physical_end);
+                range.matches_storage_within(view, &clipped)
+            });
+        }
+        self.watched.iter().all(|range| range.matches_storage(view))
+    }
+
+    /// The barrier's dirty spans for this boundary, normalized, or `None`.
+    ///
+    /// `None` means "the barrier cannot answer" and every caller responds by
+    /// running the full scan. That is the only failure mode the barrier has:
+    /// it never returns a span list that omits a page it saw written.
+    fn barrier_spans(&self) -> Option<Vec<(u32, u32)>> {
+        crate::write_barrier::guard::dirty_spans().map(crate::write_barrier::guard::normalize)
     }
 
     /// The changed ranges, decided against live storage without a snapshot.
@@ -384,6 +412,25 @@ impl CanonicalExecutableMutationStateV1 {
         // way, and callers fall back to the copying path.
         if !self.sealed {
             return None;
+        }
+        // As `matches_view`: read only the barrier's pages when it can answer,
+        // and the whole region when it cannot. `changed_ranges_within` names
+        // the same bytes over those pages that the full scan names over the
+        // region, which `barrier_restricted_changed_ranges_match_the_full_scan`
+        // asserts over randomized contents.
+        if let Some(spans) = self.barrier_spans() {
+            let mut changed = Vec::new();
+            for range in &self.watched {
+                let clipped = crate::write_barrier::guard::clip(
+                    &spans,
+                    range.physical_start,
+                    range.physical_end,
+                );
+                if !range.changed_ranges_within(view, &clipped, &mut changed) {
+                    return None;
+                }
+            }
+            return Some(changed);
         }
         let mut changed = Vec::new();
         for range in &self.watched {
@@ -2391,6 +2438,14 @@ impl CanonicalLiveBlockProgramV1 {
         view: Option<&fn64_runtime::RdramView<'_>>,
         reused_changed: Option<Vec<(u32, u32)>>,
     ) -> Vec<GenerationId> {
+        // Close the barrier's recording window before anything reads or writes
+        // the region. From here to the `arm` at the end of this function the
+        // region is ordinary writable memory, which is what the baseline
+        // update, the journal and every host writer need it to be.
+        //
+        // Unconditional and safe when not armed: the worst a spurious disarm
+        // costs is the scan that would have run anyway.
+        crate::write_barrier::guard::disarm_and_capture();
         let writes =
             PENDING_EXECUTABLE_WRITES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
         let events = PENDING_ATTRIBUTED_EXECUTABLE_WRITES
@@ -2539,6 +2594,11 @@ impl CanonicalLiveBlockProgramV1 {
                         .borrow_mut()
                         .commit_from_view(view, changed, events, invalidated.clone());
                 }
+                // The baseline now equals live RDRAM over every watched byte:
+                // bytes inside `changed` were just re-read into `expected`, and
+                // bytes outside it were proven equal by the comparison that
+                // produced `changed`. That is exactly `arm`'s precondition.
+                self.arm_barrier_over_clean_region();
                 return invalidated;
             }
             let snapshot = match view {
@@ -2584,8 +2644,44 @@ impl CanonicalLiveBlockProgramV1 {
                     .borrow_mut()
                     .commit_snapshot(snapshot, events, invalidated.clone());
             }
+            // Both snapshot forms replace `expected` wholesale with the bytes
+            // just read from live RDRAM, so the baseline again equals the
+            // region and the barrier's precondition holds.
+            self.arm_barrier_over_clean_region();
         }
         invalidated
+    }
+
+    /// Re-protect the watched region, having just made the baseline match it.
+    ///
+    /// The ONLY caller of `arm` in the crate, so the precondition -- the
+    /// watched region equals the sealed baseline -- has one place to be
+    /// checked rather than being restated at each boundary. Every path that
+    /// reaches here has either proven equality by comparison or established it
+    /// by writing the baseline from the live bytes.
+    ///
+    /// Binding happens here too rather than at boot: the watched ranges are not
+    /// known until the mutation state is sealed, and `bind` is idempotent.
+    fn arm_barrier_over_clean_region(&self) {
+        if !crate::write_barrier::requested() {
+            return;
+        }
+        let Some(state) = self.mutation_state.as_ref() else {
+            return;
+        };
+        let watched = {
+            let state = state.borrow();
+            if !state.sealed {
+                return;
+            }
+            state.watched_ranges()
+        };
+        let (base, len) = crate::host::registered_process_rdram();
+        if base.is_null() {
+            return;
+        }
+        crate::write_barrier::guard::bind(base, len, &watched);
+        crate::write_barrier::guard::arm_after_proven_clean();
     }
 
     pub(super) fn mutation_evidence_snapshot(&self) -> Option<CanonicalExecutableMutationJournalEvidenceV1> {

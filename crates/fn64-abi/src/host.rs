@@ -134,6 +134,15 @@ pub(crate) fn install_owned_process_rdram(
     (pointer, length)
 }
 
+/// The registered process RDRAM allocation, as `(base, len)`.
+///
+/// A null base means none is registered. The write barrier needs the base to
+/// compute page addresses; nothing else should reach for this.
+#[cfg(feature = "recomp-rs")]
+pub(crate) fn registered_process_rdram() -> (*mut u8, usize) {
+    with_host(|host| (host.runtime_rdram, host.runtime_rdram_len))
+}
+
 /// Whether the installed process RDRAM is page-aligned and so protectable.
 ///
 /// The barrier asks once, at arming time. A `false` answer is not an error: it
@@ -399,6 +408,15 @@ pub fn run_to_idle() {
 /// `osDestroyThread` behavior and must never be used to reset or continue a
 /// runtime in the same process.
 pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
+    // Take the barrier down before anything else. Teardown writes RDRAM from
+    // several paths and then drops the allocation; a page left `PROT_READ`
+    // would fault somewhere in that sequence, and after the drop the handler's
+    // recorded region would name memory the allocator has reclaimed.
+    #[cfg(feature = "recomp-rs")]
+    {
+        crate::write_barrier::guard::disarm_and_capture();
+        crate::write_barrier::guard::invalidate();
+    }
     crate::task_dispatch::drop_backends_for_process_exit();
     let summary = EXECUTOR.with(|slot| {
         slot.with(|slot| {

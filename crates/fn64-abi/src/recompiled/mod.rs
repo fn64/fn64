@@ -936,6 +936,252 @@ impl WatchedExecutableBytesV1 {
             None => false,
         }
     }
+
+    /// Widen dirty spans to whole storage words and merge the result.
+    ///
+    /// Two separate jobs that must happen in this order.
+    ///
+    /// WIDENING is forced by the storage-order mirror: across the body it is
+    /// word-reversed, so a partial word cannot be compared against it in
+    /// isolation. Widening only brings in bytes already known equal, so it
+    /// changes no verdict.
+    ///
+    /// MERGING is forced by widening. Two spans that fall in the same storage
+    /// word both widen to cover it, and a per-span loop would then visit that
+    /// word twice -- emitting its differing bytes twice, and producing a
+    /// changed-range list with duplicated and out-of-order entries that does
+    /// not equal what the full scan produces. Merging after widening makes
+    /// every word belong to exactly one span, which restores the invariant the
+    /// coalescing `push` depends on: spans arrive ascending and disjoint, so a
+    /// run of differing bytes is walked once, in order.
+    ///
+    /// (Found by `barrier_restricted_changed_ranges_match_the_full_scan`, which
+    /// is exactly the failure it exists to catch.)
+    fn word_align_spans(&self, spans: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let len = self.expected.len();
+        let head = Self::head_len(self.physical_start, len);
+        let body = (len - head) & !3;
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+        for &(span_start, span_end) in spans {
+            let lo = (span_start - self.physical_start) as usize;
+            let hi = (span_end - self.physical_start) as usize;
+            // Widen only the part that lands in the word-reversed body; the
+            // head and tail lanes are stored un-reversed and are compared per
+            // byte, so they need no widening.
+            let mut wide_lo = lo;
+            let mut wide_hi = hi;
+            let body_lo = lo.max(head).min(head + body);
+            let body_hi = hi.max(head).min(head + body);
+            if body_lo < body_hi {
+                wide_lo = wide_lo.min(head + ((body_lo - head) & !3));
+                wide_hi = wide_hi.max(head + (body_hi - head).div_ceil(4) * 4);
+            }
+            let widened = (
+                self.physical_start + wide_lo as u32,
+                self.physical_start + wide_hi as u32,
+            );
+            match out.last_mut() {
+                Some((_, end)) if *end >= widened.0 => *end = (*end).max(widened.1),
+                _ => out.push(widened),
+            }
+        }
+        out
+    }
+
+    /// [`Self::matches_storage`], reading only the spans the barrier reported.
+    ///
+    /// # Why this decides the same question
+    ///
+    /// The barrier was armed at a boundary that had just PROVEN this range
+    /// equals its baseline, and a byte of an `mprotect(PROT_READ)` page cannot
+    /// change without a write fault the handler recorded. So for every byte
+    /// outside `spans`:
+    ///
+    ///   - it equalled `expected` when the barrier armed, and
+    ///   - it has not been written since,
+    ///
+    /// therefore it still equals `expected`, and comparing it would be a
+    /// decided question. Only the bytes inside `spans` are undecided, and those
+    /// are compared here by the same code, byte for byte, as the full scan.
+    ///
+    /// `spans` is a SUPERSET of what actually changed -- a store that rewrites
+    /// a byte with its own value faults but changes nothing, and a fault marks
+    /// a whole 16 KiB page. That direction is the safe one: it can only cause
+    /// bytes to be compared that need not have been, never the reverse.
+    ///
+    /// `spans` must be ascending, disjoint, and already clipped to this range.
+    fn matches_storage_within(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        spans: &[(u32, u32)],
+    ) -> bool {
+        if spans.is_empty() {
+            // The barrier proved no page of this range was written since it
+            // armed over a region equal to the baseline. Nothing to compare.
+            return true;
+        }
+        let len = self.expected.len();
+        debug_assert_eq!(len, (self.physical_end - self.physical_start) as usize);
+        let head = Self::head_len(self.physical_start, len);
+        let body = (len - head) & !3;
+        let base = fn64_runtime::RdramAddr::from_offset(self.physical_start);
+        for &(span_start, span_end) in self.word_align_spans(spans).iter() {
+            debug_assert!(
+                self.physical_start <= span_start && span_end <= self.physical_end,
+                "dirty span is not clipped to this watched range"
+            );
+            let lo = (span_start - self.physical_start) as usize;
+            let hi = (span_end - self.physical_start) as usize;
+
+            // Head and tail lanes: the same per-byte `read_u8` path the full
+            // scan uses, so an unaligned edge cannot be decided by a different
+            // rule here than there.
+            for index in (lo..hi.min(head)).chain(lo.max(head + body)..hi) {
+                let addr = match base.checked_add(index as u32) {
+                    Some(addr) => addr,
+                    None => return false,
+                };
+                if view.read_u8(addr) != self.expected[index] {
+                    return false;
+                }
+            }
+
+            // Body: the same `memcmp` against the pre-reversed mirror, over the
+            // span only. Already word-aligned by `word_align_spans`.
+            let word_lo = lo.max(head).min(head + body);
+            let word_hi = hi.max(head).min(head + body);
+            if word_lo >= word_hi {
+                continue;
+            }
+            let start = self.physical_start as usize + word_lo;
+            match view.storage_slice(start, word_hi - word_lo) {
+                Some(live) => {
+                    if live != &self.expected_storage_order[word_lo..word_hi] {
+                        return false;
+                    }
+                }
+                // Unmapped: report a difference so the copying path runs and
+                // raises the panic an unmapped byte owes, exactly as the full
+                // scan does.
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// [`Self::changed_ranges_into`], reading only the spans the barrier
+    /// reported.
+    ///
+    /// Same argument as [`Self::matches_storage_within`]: bytes outside `spans`
+    /// are provably still equal to the baseline, so they cannot contribute a
+    /// changed range. Inside the spans this delegates to the very same
+    /// comparison the full scan runs, so the ranges it names are identical --
+    /// which the equivalence test asserts over randomized contents rather than
+    /// taking on the strength of this paragraph.
+    ///
+    /// One subtlety this must preserve: `changed_ranges_into` coalesces
+    /// maximal runs of consecutive differing LOGICAL bytes, and a run can cross
+    /// a span boundary. Spans are whole pages (or unions of them) and are
+    /// merged before arrival, so two adjacent differing bytes are never split
+    /// across two spans unless the pages themselves abut -- and `push` below
+    /// coalesces across that seam by comparing against the open run's end,
+    /// exactly as the full scan does across its chunk boundaries.
+    #[must_use]
+    fn changed_ranges_within(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        spans: &[(u32, u32)],
+        out: &mut Vec<(u32, u32)>,
+    ) -> bool {
+        if spans.is_empty() {
+            return true;
+        }
+        let len = self.expected.len();
+        debug_assert_eq!(len, (self.physical_end - self.physical_start) as usize);
+        let head = Self::head_len(self.physical_start, len);
+        let body = (len - head) & !3;
+        let base = fn64_runtime::RdramAddr::from_offset(self.physical_start);
+
+        let first = out.len();
+        let physical_start = self.physical_start;
+        let push = |out: &mut Vec<(u32, u32)>, index: usize| {
+            let physical = physical_start + index as u32;
+            if out.len() > first {
+                if let Some((_, end)) = out.last_mut() {
+                    if *end == physical {
+                        *end = physical + 1;
+                        return;
+                    }
+                }
+            }
+            out.push((physical, physical + 1));
+        };
+
+        for &(span_start, span_end) in self.word_align_spans(spans).iter() {
+            debug_assert!(
+                self.physical_start <= span_start && span_end <= self.physical_end,
+                "dirty span is not clipped to this watched range"
+            );
+            let lo = (span_start - self.physical_start) as usize;
+            let hi = (span_end - self.physical_start) as usize;
+
+            for index in lo..hi.min(head) {
+                let addr = match base.checked_add(index as u32) {
+                    Some(addr) => addr,
+                    None => {
+                        out.truncate(first);
+                        return false;
+                    }
+                };
+                if view.read_u8(addr) != self.expected[index] {
+                    push(out, index);
+                }
+            }
+
+            // Already word-aligned and merged by `word_align_spans`, so each
+            // storage word belongs to exactly one span and is visited once.
+            let word_lo = lo.max(head).min(head + body);
+            let word_hi = hi.max(head).min(head + body);
+            if word_lo < word_hi {
+                let start = self.physical_start as usize + word_lo;
+                let Some(live) = view.storage_slice(start, word_hi - word_lo) else {
+                    out.truncate(first);
+                    return false;
+                };
+                let mirror = &self.expected_storage_order[word_lo..word_hi];
+                if live != mirror {
+                    let words = (word_hi - word_lo) / 4;
+                    for word in 0..words {
+                        let at = word * 4;
+                        if live[at..at + 4] == mirror[at..at + 4] {
+                            continue;
+                        }
+                        // Storage lane `k` of an aligned word is logical lane
+                        // `3 - k`, so walk the lanes in logical order.
+                        for lane in 0..4 {
+                            if live[at + 3 - lane] != mirror[at + 3 - lane] {
+                                push(out, word_lo + at + lane);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for index in lo.max(head + body)..hi {
+                let addr = match base.checked_add(index as u32) {
+                    Some(addr) => addr,
+                    None => {
+                        out.truncate(first);
+                        return false;
+                    }
+                };
+                if view.read_u8(addr) != self.expected[index] {
+                    push(out, index);
+                }
+            }
+        }
+        true
+    }
 }
 
 struct CanonicalExecutableMutationStateV1 {

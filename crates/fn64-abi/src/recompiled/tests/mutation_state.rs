@@ -1050,3 +1050,235 @@ use super::*;
         let padded = watched_page_digest_v2(0x1000, 0x1040, 0, &padded);
         assert_ne!(short, padded, "page length must be bound, not inferred");
     }
+
+    /// The barrier-restricted comparison must decide EXACTLY what the full scan
+    /// decides, given a dirty set that covers every changed byte.
+    ///
+    /// This is the substitution the whole `mprotect` design rests on. The
+    /// barrier reports pages; the guard then compares only those pages and
+    /// concludes something about the WHOLE watched region. That conclusion is
+    /// sound only if bytes outside the dirty set cannot have changed -- which
+    /// the MMU guarantees at run time but which no test can observe directly.
+    ///
+    /// So this tests the half that IS testable and that a bug would actually
+    /// land in: given a dirty set that does cover the changes, does the
+    /// restricted comparison name the same bytes and reach the same verdict as
+    /// the full one? A lane-mapping or word-widening error in
+    /// `changed_ranges_within` shows up here as a disagreement, and the swizzle
+    /// makes those errors pattern-dependent rather than obvious -- hence
+    /// randomized contents, randomized change patterns, and every alignment.
+    #[test]
+    fn barrier_restricted_changed_ranges_match_the_full_scan() {
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        // The same alignment matrix the snapshot-free comparison is held to.
+        let layouts: [&[(u32, u32)]; 9] = [
+            &[(0x100, 0x180)],
+            &[(0x101, 0x180)],
+            &[(0x100, 0x17f)],
+            &[(0x101, 0x17f)],
+            &[(0x102, 0x105)],
+            &[(0x101, 0x103)],
+            &[(0x105, 0x106)],
+            &[(0x103, 0x104)],
+            &[(0x101, 0x117), (0x120, 0x181), (0x1c2, 0x1c7)],
+        ];
+
+        for layout in layouts {
+            let mut storage = vec![0u8; 0x400];
+            for byte in storage.iter_mut() {
+                *byte = next() as u8;
+            }
+            let mut state = CanonicalExecutableMutationStateV1::new(layout);
+            {
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                state.seal_with(|physical| {
+                    view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
+                });
+            }
+
+            for round in 0..96 {
+                let density = next() % 5;
+                let watched = layout
+                    .iter()
+                    .flat_map(|&(start, end)| start..end)
+                    .collect::<Vec<_>>();
+                let mut touched: Vec<u32> = Vec::new();
+                for &physical in &watched {
+                    let flip = match density {
+                        0 => false,
+                        1 => next() % 97 == 0,
+                        2 => next() % 7 == 0,
+                        3 => next() % 2 == 0,
+                        _ => true,
+                    };
+                    if flip {
+                        storage[(physical ^ 3) as usize] ^= (next() as u8) | 1;
+                        touched.push(physical);
+                    }
+                }
+                for physical in [0x0u32, 0x99, 0x1ff, 0x2ab, 0x3ff] {
+                    storage[(physical ^ 3) as usize] ^= next() as u8;
+                }
+
+                let view = fn64_runtime::RdramView::from_storage(&storage);
+                let full = state
+                    .changed_ranges_from_view(&view)
+                    .expect("every watched byte is mapped");
+
+                // Build a dirty set that COVERS every byte written, the way a
+                // real barrier's page granularity does. Three shapes, because
+                // the coverage the barrier gives is a superset of varying
+                // slack and the restricted comparison must be right for all of
+                // them:
+                //
+                //   - exactly the touched bytes (the tightest legal set);
+                //   - each touched byte widened to a small aligned granule
+                //     (what a page actually looks like, in miniature);
+                //   - the whole region (maximum slack -- must reduce to the
+                //     full scan's answer exactly).
+                let tight: Vec<(u32, u32)> = crate::write_barrier::guard::normalize(
+                    touched.iter().map(|&p| (p, p + 1)).collect(),
+                );
+                let granule = 16u32;
+                let widened: Vec<(u32, u32)> = crate::write_barrier::guard::normalize(
+                    touched
+                        .iter()
+                        .map(|&p| (p & !(granule - 1), (p & !(granule - 1)) + granule))
+                        .collect(),
+                );
+                let whole: Vec<(u32, u32)> = layout.to_vec();
+
+                for (label, spans) in [
+                    ("tight", &tight),
+                    ("page-widened", &widened),
+                    ("whole-region", &whole),
+                ] {
+                    let mut restricted = Vec::new();
+                    let mut ok = true;
+                    for range in &state.watched {
+                        let clipped = crate::write_barrier::guard::clip(
+                            spans,
+                            range.physical_start,
+                            range.physical_end,
+                        );
+                        if !range.changed_ranges_within(&view, &clipped, &mut restricted) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    assert!(ok, "layout {layout:?} round {round} {label}: unmapped byte");
+                    assert_eq!(
+                        restricted, full,
+                        "layout {layout:?} round {round} {label}: the barrier-restricted \
+                         comparison named different bytes than the full scan"
+                    );
+
+                    // And the boolean form, which is the one the dispatch guard
+                    // actually calls.
+                    let matched = state.watched.iter().all(|range| {
+                        let clipped = crate::write_barrier::guard::clip(
+                            spans,
+                            range.physical_start,
+                            range.physical_end,
+                        );
+                        range.matches_storage_within(&view, &clipped)
+                    });
+                    assert_eq!(
+                        matched,
+                        full.is_empty(),
+                        "layout {layout:?} round {round} {label}: the restricted predicate \
+                         disagreed with the full scan's verdict"
+                    );
+                }
+
+                // Advance the baseline so the next round starts clean, exactly
+                // as a real boundary does.
+                state.adopt_from_view(&view, full);
+            }
+        }
+    }
+
+    /// An EMPTY dirty set must mean "nothing changed", and that is only sound
+    /// because the barrier armed over a clean region.
+    ///
+    /// Stated as a test because it is the one place the restricted comparison
+    /// returns `true` without reading a single byte, and therefore the one
+    /// place a lifecycle bug -- arming when the region was NOT clean -- would
+    /// convert into a silently accepted mutation. The test cannot catch that
+    /// lifecycle bug (it is about when `arm` is called, not what the comparison
+    /// does), so it pins the contract instead: empty means untouched, and the
+    /// caller owes the precondition.
+    #[test]
+    fn an_empty_dirty_set_reports_a_match_without_reading() {
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        let mut storage = vec![0u8; 0x200];
+        for (index, byte) in storage.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(17);
+        }
+        let layout = [(0x101u32, 0x17fu32)];
+        let mut state = CanonicalExecutableMutationStateV1::new(&layout);
+        {
+            let view = fn64_runtime::RdramView::from_storage(&storage);
+            state.seal_with(|physical| {
+                view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
+            });
+        }
+        // Change a byte the dirty set does NOT mention. The restricted
+        // comparison must report a match, because it is entitled to assume the
+        // MMU would have reported that page. This is the documented contract,
+        // not a bug: it is what makes an empty set free.
+        storage[(0x110u32 ^ 3) as usize] ^= 0xff;
+        let view = fn64_runtime::RdramView::from_storage(&storage);
+        assert!(
+            state.watched[0].matches_storage_within(&view, &[]),
+            "an empty dirty set must short-circuit to a match"
+        );
+        // And the full scan, which has no such entitlement, must see it -- so
+        // the two differ exactly when the precondition is violated, which is
+        // what makes the precondition load-bearing rather than decorative.
+        assert!(
+            !state.matches_view(&view),
+            "the full scan must still see a change the dirty set omitted"
+        );
+    }
+
+    /// `clip` and `normalize` must produce ascending, disjoint spans confined
+    /// to the range asked about.
+    ///
+    /// The restricted comparison `debug_assert`s these properties and its
+    /// coalescing depends on them, so they are pinned here rather than left to
+    /// the caller's care.
+    #[test]
+    fn dirty_span_normalization_is_ascending_disjoint_and_clipped() {
+        use crate::write_barrier::guard::{clip, normalize};
+
+        // Unsorted, overlapping, duplicated -- what the union in
+        // `disarm_and_capture` can produce.
+        let merged = normalize(vec![
+            (0x300, 0x400),
+            (0x100, 0x200),
+            (0x180, 0x280),
+            (0x100, 0x200),
+            (0x400, 0x480),
+        ]);
+        assert_eq!(merged, vec![(0x100, 0x280), (0x300, 0x480)]);
+        for pair in merged.windows(2) {
+            assert!(pair[0].1 < pair[1].0, "spans must be disjoint and ascending");
+        }
+
+        // Clipping keeps only the overlap, and keeps it ascending.
+        assert_eq!(clip(&merged, 0x200, 0x340), vec![(0x200, 0x280), (0x300, 0x340)]);
+        // A range disjoint from every span clips to nothing, which is the
+        // "this watched range was untouched" answer.
+        assert!(clip(&merged, 0x280, 0x300).is_empty());
+        // A range inside one span clips to itself.
+        assert_eq!(clip(&merged, 0x120, 0x160), vec![(0x120, 0x160)]);
+    }

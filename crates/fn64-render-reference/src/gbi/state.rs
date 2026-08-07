@@ -578,11 +578,94 @@ impl std::fmt::Debug for Tmem {
 /// Immutable TMEM view captured with a primitive. The RDP register file may
 /// be mutated by later commands before the backend rasterizes the operation,
 /// so retaining only a tile number would violate command ordering.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct TmemTexture {
     pub(super) storage: std::rc::Rc<Tmem>,
     pub(super) tile: Tile,
     pub(super) texture_lut: u8,
+    /// Memoized palette entries for this view's `texture_lut` mode.
+    ///
+    /// A CI texel's color is a pure function of `(index, texture_lut)`, and
+    /// both `storage` and `texture_lut` are immutable for the life of this
+    /// view -- so decoding an index twice cannot observe a different color.
+    /// Palettized primitives dominate this renderer's profile (`read_tlut`
+    /// was its single largest symbol, larger than the whole color combiner),
+    /// because bilinear filtering re-decodes four TMEM palette entries for
+    /// every pixel.
+    ///
+    /// Filled lazily rather than eagerly: `G_LOADTLUT` need not populate all
+    /// 256 entries, and an eager pass would read -- and trap on -- entries the
+    /// primitive never samples. Per-index laziness keeps the uninitialized-
+    /// TMEM assert firing for exactly the indices the old code validated.
+    palette: Box<TlutCache>,
+}
+
+/// Sparse 256-entry memo of decoded TLUT colors.
+///
+/// `Cell` rather than `RefCell`: the entry is `Copy`, so get/set need no
+/// borrow flag, and the hit path becomes a plain load and compare. `Box`ed so
+/// cloning a `TmemTexture` (done per primitive) does not copy the table
+/// inline.
+#[derive(Clone, Debug)]
+struct TlutCache {
+    entries: [std::cell::Cell<Option<[u8; 4]>>; 256],
+}
+
+impl Default for TlutCache {
+    fn default() -> Self {
+        Self {
+            entries: [const { std::cell::Cell::new(None) }; 256],
+        }
+    }
+}
+
+/// The memo is derived state, so two views comparing equal must not be
+/// distinguished by how many palette entries either happens to have decoded.
+/// Equality stays defined by the identity fields alone -- the same relation
+/// the derived impl provided before the cache existed.
+impl PartialEq for TmemTexture {
+    fn eq(&self, other: &Self) -> bool {
+        self.storage == other.storage
+            && self.tile == other.tile
+            && self.texture_lut == other.texture_lut
+    }
+}
+
+impl Eq for TmemTexture {}
+
+impl TmemTexture {
+    pub(super) fn new(storage: std::rc::Rc<Tmem>, tile: Tile, texture_lut: u8) -> Self {
+        Self {
+            storage,
+            tile,
+            texture_lut,
+            palette: Box::new(TlutCache::default()),
+        }
+    }
+
+    /// Decode TLUT `index`, reusing this view's memo. Identical in value to
+    /// `Tmem::read_tlut`, including its uninitialized-TMEM trap on the first
+    /// access to any given index.
+    #[inline]
+    fn tlut_color(&self, index: usize) -> [u8; 4] {
+        assert!(
+            index < 256,
+            "CI texel index {index} exceeds the 256-entry TLUT"
+        );
+        if let Some(color) = self.palette.entries[index].get() {
+            return color;
+        }
+        self.tlut_color_miss(index)
+    }
+
+    /// The cold half of `tlut_color`, kept out of line so the hit path stays
+    /// a load, a compare, and a return at every call site.
+    #[cold]
+    fn tlut_color_miss(&self, index: usize) -> [u8; 4] {
+        let color = self.storage.read_tlut(index, self.texture_lut);
+        self.palette.entries[index].set(Some(color));
+        color
+    }
 }
 
 impl Tmem {
@@ -799,9 +882,9 @@ impl TmemTexture {
             match self.tile.siz {
                 G_IM_SIZ_4B => {
                     let index = (usize::from(self.tile.palette) << 4) | raw as usize;
-                    return self.storage.read_tlut(index, self.texture_lut);
+                    return self.tlut_color(index);
                 }
-                G_IM_SIZ_8B => return self.storage.read_tlut(raw as usize, self.texture_lut),
+                G_IM_SIZ_8B => return self.tlut_color(raw as usize),
                 _ => crate::render_unsupported_panic(
                     "render.gbi.texture-lut-size",
                     format!(
@@ -826,7 +909,7 @@ impl TmemTexture {
             (G_IM_FMT_CI, G_IM_SIZ_8B) => i8_to_rgba8888(raw as u8),
             (G_IM_FMT_CI, G_IM_SIZ_4B) => {
                 let index = (usize::from(self.tile.palette) << 4) | raw as usize;
-                self.storage.read_tlut(index, self.texture_lut)
+                self.tlut_color(index)
             }
             (format, size) => crate::render_unsupported_panic(
                 "render.gbi.texture-format",
