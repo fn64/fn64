@@ -680,9 +680,11 @@ pub unsafe extern "C" fn __osSiDeviceBusy_recomp(_rdram: *mut u8, ctx: *mut Reco
 /// non-EEPROM save device reports the PIF no-response bit; malformed packet
 /// shapes and address checksums trap with command/channel context, while a
 /// physical 4-Kbit EEPROM ignores its upper two block-address bits. Controller
-/// Pak block I/O uses the same physical
-/// data pages as the high-level PFS model; management-page inode/directory
-/// decoding remains open. Transfer Pak power, status/mode, bank, and Game Boy
+/// Pak block I/O uses the same physical image as the high-level PFS model;
+/// raw FAT and directory writes therefore determine later high-level note
+/// discovery, chains, and free space. The layout and checksum rules follow the
+/// public Controller Pak hardware map and filesystem geometry documented by
+/// n64brew. Transfer Pak power, status/mode, bank, and Game Boy
 /// bus windows use typed cartridge ROM/RAM plus common mapper state. MBC3 RTC
 /// oscillator, immutable latch, halt, 9-bit day, and sticky carry state advance
 /// on the same guest clock through raw and high-level paths. A separate host
