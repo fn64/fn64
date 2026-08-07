@@ -216,6 +216,23 @@ impl WmShardGenerator {
         }
     }
 
+    /// Construct only enough state to derive package topology.
+    ///
+    /// Topology depends on the boot mapping and recovered overlay recipes, not
+    /// on whether every runtime host adapter has a recognizer for this title's
+    /// libultra revision. Runner emission continues to use `from_rom_bytes`
+    /// and therefore keeps the exact 15/15 host-binding gate loud.
+    pub fn from_rom_bytes_for_topology(source: &[u8]) -> Self {
+        let rom = fn64_discover::normalize(source).expect("normalizing shard ROM input");
+        let boot_va_start = boot_bank_va_start(&rom);
+        Self {
+            rom,
+            overlay_recipes: None,
+            host_calls: Vec::new(),
+            boot_va_start,
+        }
+    }
+
     pub fn normalized_rom_sha256(&self) -> [u8; 32] {
         let source = self.rom.sha256.as_bytes();
         assert_eq!(
@@ -228,6 +245,49 @@ impl WmShardGenerator {
             digest[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
         }
         digest
+    }
+
+    /// Derive the complete Cargo package topology for this ROM.
+    ///
+    /// Package names remain the stable harness ABI; only their count and
+    /// manifest-directory mapping vary by title. Resident manifests retain
+    /// the historical contiguous `shardNN` directory scheme so a generated
+    /// topology round-trips the committed WM2000 tree byte-for-byte.
+    pub fn package_inventory(&mut self) -> Vec<(String, String)> {
+        let split = self.resident_split();
+        let (boot_count, tail_count) = resident_shard_counts(split);
+        let mut inventory = Vec::new();
+        for index in 0..boot_count {
+            inventory.push((
+                format!("wm2000-block-shard-{index:02}"),
+                format!("shard{index:02}"),
+            ));
+        }
+        for index in 0..tail_count {
+            inventory.push((
+                format!("wm2000-block-resident-tail-shard-{index:02}"),
+                format!("shard{:02}", boot_count + index),
+            ));
+        }
+        let overlay_counts = self
+            .overlay_recipes()
+            .iter()
+            .map(|recipe| {
+                usize::try_from(fn64_discover::overlay_recipe::generation_source_span(recipe))
+                    .expect("overlay source span fits usize")
+                    .div_ceil(SHARD_BYTES)
+            })
+            .collect::<Vec<_>>();
+        for (generation, shard_count) in overlay_counts.into_iter().enumerate() {
+            for shard in 0..shard_count {
+                inventory.push((
+                    format!("wm2000-block-overlay-{generation}-shard-{shard:02}"),
+                    format!("overlay{generation}-shard{shard:02}"),
+                ));
+            }
+        }
+        inventory.sort();
+        inventory
     }
 
     pub fn generate_package(&mut self, package: &str) -> GeneratedShard {
