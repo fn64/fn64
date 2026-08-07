@@ -1556,15 +1556,25 @@ in **minutes rather than hours**.
 
 ### The route now goes well past the old wall
 
-The old run exhausted 13h44m without passing read 600. The after-lane spends
-its remaining budget beyond it and finishes the full 700,000 steps at
-`sim_time=6848390440` — 3.5x further in simulated time — with
+The after-lane spends its budget beyond read 600 and finishes the full 700,000
+steps at `sim_time=6848390440` — 3.5x further in simulated time — with
 `gfx_submits=2272 audio_submits=4013`, 4,206,240 audio samples of which
 3,904,345 are nonzero (`peak_abs=30704`), and `render_error=None`.
 
-The read-600 entrance stall is therefore **not** the generation thrash. It
-remains open and is still the real boot blocker; what changed is that reaching
-it now costs minutes, so it is finally cheap to iterate on.
+> **Corrected by `c404dfa`.** This section originally closed by calling the
+> read-600 entrance stall a surviving blocker, "not the generation thrash." That
+> was wrong: **there is no stall at read 600 and there never was.** The route
+> stopped printing, not running — `entrance-to-match.schedule` logs only on
+> input EDGES, and its last edge is read 600. See the retraction entry below for
+> the heartbeat data that settles it.
+>
+> Worth recording how the error survived measurement: the numbers in the
+> paragraph above **already disproved the stall** — 3.5x further in `sim_time`
+> with submits still climbing is not a wedged process — and they were written
+> down and then narrated around, because "the entrance stall is the real boot
+> blocker" was inherited from the entry above rather than tested against the
+> run in hand. An inherited conclusion has to earn its place against new
+> evidence; this one was allowed to reinterpret the evidence instead.
 
 ### Interaction with the latent fragment hole
 
