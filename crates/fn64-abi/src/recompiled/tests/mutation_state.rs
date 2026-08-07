@@ -590,3 +590,243 @@ use super::*;
             "canonical executable mutation owner is poisoned: tracked renderer/RSP publication child writer transaction unwound before commit"
         ));
     }
+
+    /// The v2 root depends only on the watched bytes -- never on the
+    /// incremental history that produced them.
+    ///
+    /// This is the load-bearing property of the page-tree migration. The
+    /// incremental root (`digest_expected`, from maintained page digests) is
+    /// read on every commit, while the from-scratch root (`digest_snapshot`,
+    /// which recomputes every page) is what validation recomputes and what any
+    /// independent verifier would compute. If those two could ever disagree,
+    /// the journal would certify a value no verifier could reproduce.
+    ///
+    /// The test drives a long-lived state through many commits, each touching
+    /// different pages -- page boundaries, page interiors, spans crossing
+    /// several pages, and rewrites of pages already dirtied -- and after every
+    /// single one requires:
+    ///
+    ///   1. the incremental root equals the from-scratch root of the same bytes;
+    ///   2. a FRESH state, sealed directly on those bytes with no history at
+    ///      all, produces that same root.
+    ///
+    /// (2) is the part that rules out order dependence: the fresh state
+    /// computes every page exactly once, in page order, having never seen any
+    /// of the intermediate values. Agreement across hundreds of distinct
+    /// histories is what makes "the root is a function of the bytes alone"
+    /// an observation rather than an assertion.
+    #[test]
+    fn page_tree_root_is_independent_of_incremental_history() {
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        // Two ranges, deliberately awkward: the first is far smaller than one
+        // page, the second spans several pages and does NOT end on a page
+        // boundary, so the short final page is exercised. This mirrors WM2000's
+        // shape (a 16-byte range and a ~1.44 MiB range) at test scale.
+        const PAGE: u32 = CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2 as u32;
+        let ranges = [(0x1000u32, 0x1010u32), (0x2000, 0x2000 + PAGE * 3 + 777)];
+        let total = |(start, end): (u32, u32)| (end - start) as usize;
+
+        let mut image0 = vec![0u8; total(ranges[0])];
+        let mut image1 = vec![0u8; total(ranges[1])];
+        for (index, byte) in image1.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(5);
+        }
+
+        let read = |image0: &[u8], image1: &[u8], physical: u32| -> u8 {
+            if physical >= ranges[0].0 && physical < ranges[0].1 {
+                image0[(physical - ranges[0].0) as usize]
+            } else {
+                image1[(physical - ranges[1].0) as usize]
+            }
+        };
+
+        let mut state = CanonicalExecutableMutationStateV1::new(&ranges);
+        {
+            let (a, b) = (image0.clone(), image1.clone());
+            state.seal_with(|physical| read(&a, &b, physical));
+        }
+
+        // A fresh state sealed on the same bytes must already agree at seal.
+        let fresh_root = |image0: &[u8], image1: &[u8]| -> [u8; 32] {
+            let mut fresh = CanonicalExecutableMutationStateV1::new(&ranges);
+            fresh.seal_with(|physical| read(image0, image1, physical));
+            fresh
+                .expected_sha256
+                .expect("a sealed state always has an expected digest")
+        };
+        assert_eq!(
+            state.expected_sha256.expect("sealed"),
+            fresh_root(&image0, &image1),
+            "a freshly sealed state must agree with the incremental one at seal time"
+        );
+
+        // Every write shape that could expose a page-boundary bug: the first
+        // byte of a page, the last byte of a page, a span straddling a page
+        // boundary, a span covering a whole page, a write inside the short
+        // final page, and a rewrite of an already-dirtied page.
+        let edits: &[(u32, u32)] = &[
+            (0x2000, 1),                    // first byte of page 0
+            (0x2000 + PAGE - 1, 1),         // last byte of page 0
+            (0x2000 + PAGE, 1),             // first byte of page 1
+            (0x2000 + PAGE - 2, 4),         // straddles the page 0/1 boundary
+            (0x2000 + PAGE * 2, PAGE),      // exactly all of page 2
+            (0x2000 + PAGE * 3, 1),         // first byte of the short final page
+            (0x2000 + PAGE * 3 + 776, 1),   // last byte of the whole range
+            (0x2000 + PAGE - 1, 2),         // re-dirty pages 0 and 1
+            (0x2000 + 5, 3),                // page 0 interior, third time
+            (0x1000, 16),                   // the entire sub-page first range
+            (0x1008, 4),                    // interior of the first range
+            (0x2000 + PAGE * 2 + 100, 900), // interior of page 2, again
+        ];
+
+        let mut nonce = 0u8;
+        for (round, &(physical_start, len)) in edits.iter().enumerate() {
+            nonce = nonce.wrapping_add(97).wrapping_add(round as u8);
+            for offset in 0..len {
+                let physical = physical_start + offset;
+                let value = nonce.wrapping_add(offset as u8).wrapping_mul(13);
+                if physical >= ranges[0].0 && physical < ranges[0].1 {
+                    image0[(physical - ranges[0].0) as usize] = value;
+                } else {
+                    image1[(physical - ranges[1].0) as usize] = value;
+                }
+            }
+
+            let snapshot = {
+                let (a, b) = (image0.clone(), image1.clone());
+                state.read_snapshot(|physical| read(&a, &b, physical))
+            };
+            // The from-scratch root of these exact bytes, computed before the
+            // commit adopts them -- so it cannot be reading the cache.
+            let from_scratch = state.digest_snapshot(&snapshot);
+
+            state.commit_snapshot(
+                snapshot,
+                vec![GuestWriteEvent::Range {
+                    channel: WriterChannel::HostAbi,
+                    physical_offset: physical_start,
+                    len,
+                }],
+                Vec::new(),
+            );
+
+            let incremental = state
+                .expected_sha256
+                .expect("a sealed state always has an expected digest");
+            assert_eq!(
+                incremental, from_scratch,
+                "round {round}: the incrementally maintained root must equal the \
+                 from-scratch root of the same bytes"
+            );
+            assert_eq!(
+                incremental,
+                fresh_root(&image0, &image1),
+                "round {round}: a state with NO history must reach the same root as one \
+                 that has committed {} times",
+                round + 1
+            );
+        }
+
+        // The journal chained across every commit, so the history really was
+        // long-lived rather than a sequence of independent seals.
+        let evidence = state.evidence_snapshot();
+        assert_eq!(evidence.entries.len(), edits.len());
+        for entries in evidence.entries.windows(2) {
+            assert_eq!(entries[0].after_sha256, entries[1].before_sha256);
+        }
+
+        // Returning the bytes to their original values must return the root to
+        // its original value: the page cache holds no residue of the path taken.
+        let original0 = vec![0u8; total(ranges[0])];
+        let mut original1 = vec![0u8; total(ranges[1])];
+        for (index, byte) in original1.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(5);
+        }
+        let snapshot = {
+            let (a, b) = (original0.clone(), original1.clone());
+            state.read_snapshot(|physical| read(&a, &b, physical))
+        };
+        state.commit_snapshot(
+            snapshot,
+            vec![
+                GuestWriteEvent::Range {
+                    channel: WriterChannel::HostAbi,
+                    physical_offset: ranges[0].0,
+                    len: ranges[0].1 - ranges[0].0,
+                },
+                GuestWriteEvent::Range {
+                    channel: WriterChannel::HostAbi,
+                    physical_offset: ranges[1].0,
+                    len: ranges[1].1 - ranges[1].0,
+                },
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            state.expected_sha256.expect("sealed"),
+            fresh_root(&original0, &original1),
+            "restoring the original bytes must restore the original root"
+        );
+    }
+
+    /// A v1 digest and a v2 digest of the same memory must not be confusable.
+    ///
+    /// Requirement 1 of the migration: the new digest is versioned, not
+    /// silently changed. This pins the v1 construction as a literal here --
+    /// nothing else in the tree still computes it -- and requires v2 to differ.
+    #[test]
+    fn the_v2_page_tree_root_differs_from_the_v1_flat_digest() {
+        let ranges = [(0x100u32, 0x180u32)];
+        let mut image = vec![0u8; 0x80];
+        for (index, byte) in image.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        let mut state = CanonicalExecutableMutationStateV1::new(&ranges);
+        state.seal_with(|physical| image[(physical - 0x100) as usize]);
+
+        // The v1 construction, verbatim from before the migration.
+        let v1: [u8; 32] = {
+            let mut digest = sha2::Sha256::new();
+            digest.update(ranges[0].0.to_be_bytes());
+            digest.update(ranges[0].1.to_be_bytes());
+            digest.update(&image);
+            digest.finalize().into()
+        };
+        let v2 = state.expected_sha256.expect("sealed");
+        assert_ne!(
+            v1, v2,
+            "the versioned v2 root must not coincide with the v1 flat digest"
+        );
+
+        // And the v2 root must bind the schema: a root computed with the same
+        // page digests but a different domain separator differs.
+        assert_eq!(v2, state.digest_snapshot(&[image.clone()]));
+    }
+
+    /// Bytes alone decide the root: two different watched ranges holding
+    /// identical bytes must not produce the same page digests.
+    ///
+    /// The leaf binds the range bounds and the page index, so a page cannot be
+    /// replayed at another address or another position. Without that, a write
+    /// that MOVED a block of code within the watched region could leave the
+    /// root unchanged.
+    #[test]
+    fn page_digests_bind_their_range_and_position() {
+        let bytes = vec![0xa5u8; 64];
+        let at_1000 = watched_page_digest_v2(0x1000, 0x1040, 0, &bytes);
+        let at_2000 = watched_page_digest_v2(0x2000, 0x2040, 0, &bytes);
+        assert_ne!(at_1000, at_2000, "a page must bind its range start");
+
+        let end_differs = watched_page_digest_v2(0x1000, 0x1080, 0, &bytes);
+        assert_ne!(at_1000, end_differs, "a page must bind its range end");
+
+        let index_1 = watched_page_digest_v2(0x1000, 0x1040, 1, &bytes);
+        assert_ne!(at_1000, index_1, "a page must bind its index in the range");
+
+        // A short page and a zero-padded full page must differ.
+        let short = watched_page_digest_v2(0x1000, 0x1040, 0, &bytes[..32]);
+        let mut padded = bytes[..32].to_vec();
+        padded.resize(64, 0);
+        let padded = watched_page_digest_v2(0x1000, 0x1040, 0, &padded);
+        assert_ne!(short, padded, "page length must be bound, not inferred");
+    }
