@@ -1013,3 +1013,192 @@ building the plumbing, as was done here.
 - 462/462 render-reference (including the exact-panic-text TMEM test),
   108/108 render + certification, 704/704 abi + runtime, `grade-all.sh`
   wrong=0 on all five.
+
+
+## 2026-08-07: the `mprotect` write barrier — implemented, and the gap to the projection
+
+The barrier is built, behind `FN64_MPROTECT_BARRIER=1`, with the page-aligned
+RDRAM it required. It works, the guard is not weakened, and every gate passes.
+It is also **substantially slower than the projection**, and the reasons are
+measured rather than guessed.
+
+### Results
+
+| route | scan lane | barrier lane | speedup |
+|---|---|---|---|
+| pinned (1,461,877 guest instructions) | **250 ms** | **180 ms** | 1.39x whole-run |
+| pinned, startup (80 ms) excluded | 170 ms | 100 ms | **1.70x** |
+| deep (`entrance-to-match`, 19,523 steps) | 3.53 s | 1.60 s | **2.2x** |
+
+Pinned lane in the reportable units: **8,121,572 guest instructions/sec, 11.5x
+slower than hardware**, from 5,847,532/sec and 16.0x.
+
+Equivalence is `diff` of complete run output on BOTH routes — program identity
+`34712877`, `sim_time`, RDRAM SHA-256, `steps=19523`, every device counter.
+Only ASLR addresses and the process-unique thread id in the harness's terminal
+backtrace differ. 704/704 abi+runtime, 401/401 recomp-rs, 1069/1069 discover,
+`grade-all` wrong=0 on all five.
+
+### Why 1.7x and not 9.7x
+
+The 9.7x was a per-boundary component figure and it is not wrong; the mistake
+was treating it as if the barrier would serve every boundary. Measured
+(`FN64_MPROTECT_BARRIER_STATS=1`, pinned route):
+
+```
+boundaries=3286 served=2531 (77.02%) fell_back=755 (22.98%)
+clean=1984 (60.38%) mean_dirty_pages_per_served=0.2493
+```
+
+Two effects, both absent from the projection:
+
+1. **23% of boundaries still scan.** A boundary can ask for the dirty set
+   twice — the reconcile asks, then the commit asks again. The set is
+   consuming, so the second ask gets `None` and runs the full scan. Those 755
+   boundaries pay the old cost in full, and by Amdahl they alone cap the
+   achievable speedup near 4x regardless of how cheap the served ones get.
+
+2. **The scan was never 100% of the body.** The profile said 96% of *leaf
+   samples*, which is not the same as 96% of wall time — SHA-256, the
+   allocator, and guest execution are all still there. With the barrier on,
+   `memcmp` falls to 314 leaf samples from 981 but does not vanish, and
+   `__mprotect` (103) and `_sigtramp` (27) appear, which is the direct
+   confirmation that faults are being taken.
+
+The recoverable half is (1), and the fix is to make **arming total** rather
+than to make the read non-consuming — see below for why that direction and not
+the other.
+
+### The two bugs, because they are the interesting part
+
+Both weakened the guard, both were invisible on the pinned route, and both were
+caught only by running the deep route. Recorded in full because the failure
+mode they share is the one this design must never have.
+
+**A real missed mutation.** `dirty_spans` began as a pure read, with the
+capture left to the boundary's entry point. But
+`reconcile_matched_before_dispatch` (`live_program.rs:2159`, `:2194`) and
+`flush_host_abi_transaction` (`execution.rs:714`) reach the comparison without
+passing through `invalidate_pending_physical_writes_inner`, so nothing had
+captured for them. They read an empty leftover set and concluded "no page was
+written, therefore nothing changed" while the fault handler was holding the
+pages that said otherwise:
+
+```
+unjournaled executable mutation changed physical RDRAM
+[0x00086090, 0x00086094) before canonical static dispatch
+```
+
+That is the guard catching the barrier, which is the right way round, but a
+barrier that needs the guard to catch it is not a substitute for the guard.
+
+**Stale pages read as changes.** Returning from a boundary without re-arming
+left the recorded set accumulating into the next boundary, which then reported
+~2,000 spurious changed ranges and tripped the attribution assertion.
+
+### The design property that came out of them
+
+Both bugs are the same shape: a call site that had to remember something. The
+fix was not to add the missing call sites — there are many boundary paths and
+no reliable way to enumerate them by inspection — but to make forgetting safe:
+
+- **The read and the close are one operation.** `dirty_spans` disarms itself,
+  so a caller cannot obtain a set that predates its own question, and a new
+  comparison site inherits the property without knowing it exists.
+- **The set is consuming.** A missed arm therefore yields `None` and a full
+  scan, rather than a set describing an older window whose complement is
+  wrongly treated as proven-unchanged.
+
+Stated as the invariant: **missing an arm costs a scan; missing a disarm would
+be unsound, so no caller is trusted to disarm.** That asymmetry is what makes
+the integration verifiable, and it is also precisely what costs the 23%.
+
+### The guard is not weakened, and here is the argument
+
+The dirty page set is a **superset** of the changed byte set, and the
+byte-level comparison still runs — over the dirty pages instead of the whole
+region. The guard's answer is unchanged; only the bytes read to reach it fall.
+
+- The barrier arms only at a boundary that has just PROVEN the region equals
+  the baseline (one caller, `arm_barrier_over_clean_region`).
+- A byte of an `mprotect(PROT_READ)` page cannot change without a write fault.
+  That is the MMU's guarantee, not this code's.
+- So every byte the scan could find changed lies in some page the handler
+  recorded.
+
+It is a strict superset — a store rewriting a byte with its own value faults
+and changes nothing, and a fault marks a whole 16 KiB page — and both errors
+are in the safe direction.
+
+This also covers the writers no declaration path sees. `as_mut_slice`, the DMA
+paths, the RSP and renderer whole-allocation slices, and raw `RdramPtr` stores
+all bypass `set_write_observer`, and every one of them faults: the MMU does not
+care which Rust function issued the store. The declaration path is not
+consulted by the barrier at all.
+
+`barrier_restricted_changed_ranges_match_the_full_scan` asserts the restricted
+comparison names exactly the bytes the full scan names, over randomized
+contents and change patterns, at every alignment, for three dirty-set shapes.
+It found a real bug on first run: two spans landing in the same storage word
+each widened to cover it, so the word was visited twice and its differing bytes
+emitted twice. Fixed by widening and merging in one pass
+(`word_align_spans`).
+
+### The aliasing question, settled separately
+
+The real coroutine body holds one `&mut [u8]` over the whole allocation across
+the entire guest run (`execution.rs:1680-1690`). The earlier
+`coroutine-fault.rs` did NOT cover that shape — its faulting store was
+`ptr::write_volatile` on a raw pointer. `borrowed-fault.rs` does: whole-region
+`&mut` live across 4,000 faults and 70 suspend/resume cycles, stores as safe
+bounds-checked indexing, non-volatile readback through the same borrow, an
+aliasing raw write while the `&mut` is live, and an independent mirror compared
+byte-for-byte. All delivered, mirror identical, release and debug.
+
+That rules out the practical failure mode. It does not make the program
+Stacked-Borrows-clean — two live `&mut [u8]` over this allocation already exist
+independent of any barrier — and the correctness argument above deliberately
+never uses `&mut` uniqueness, only the MMU property.
+
+### Fallbacks
+
+Every case the barrier cannot cover runs the scan that exists today: not
+requested, allocation not page-aligned, `mprotect` refused, dirty set overflow
+past 512 pages, a fault outside the region, poisoned mutation state, process
+exit. There is no configuration in which a boundary is decided by neither.
+
+### What would recover the rest
+
+In descending order of expected value:
+
+1. **Make arming total.** The 23% fallback is 755 boundaries paying 26.5 us
+   each — about 20 ms of the pinned lane's 100 ms body. The double-ask pattern
+   (reconcile then commit) is the whole cause, and it is a plumbing problem:
+   carry the set through the boundary explicitly rather than re-reading a
+   thread-local. Worth roughly 1.25x on the body.
+2. **Re-arm per page rather than whole-region.** `arm` currently `mprotect`s
+   the entire 1.44 MiB span; the microbenchmark put whole-region protect at
+   2,253 ns against 597 ns for a single page. At 0.25 dirty pages per served
+   boundary, re-protecting only the pages that faulted is most of that
+   difference.
+3. Only then is codegen or the SHA-256 worth looking at.
+
+## Commit hygiene: `9fc0e37` contains work its message does not describe
+
+`9fc0e37 "docs: guest_write_token must not be wired into activation"` carries
+979 insertions across nine files, including two other agents' in-progress work:
+the mprotect write barrier (`recompiled/mod.rs`, `write_barrier.rs`,
+`tests/mutation_state.rs`) and the reference-renderer optimizations
+(`gbi/state.rs`, `gbi/geometry.rs`, `examples/xbus_replay.rs`). Only the
+`docs/plans/` change belongs to that message.
+
+Cause: `git add -A` while agents held uncommitted edits in a shared tree. **This
+is the third occurrence today** -- the same mistake produced `6a23270` (swept a
+build.rs change) and `74f1aa8` (swept `matches_view`). The code is intact and
+the follow-up commits `6cbfa17`, `59a9ce7`, `7c8cea0`, `00e72ed` attribute it
+correctly, so nothing is lost and the history is not being rewritten to fix a
+message.
+
+**Rule going forward: never `git add -A` in this tree.** Stage explicit paths.
+When agents are active, `git status --short` first and stage only files you
+edited yourself.
