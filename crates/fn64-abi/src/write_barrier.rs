@@ -352,6 +352,125 @@ pub fn requested() -> bool {
     *ENABLED.get_or_init(|| env_flag("FN64_MPROTECT_BARRIER"))
 }
 
+/// Count of `mprotect` calls and nanoseconds spent inside them, by call site.
+///
+/// # Why this exists before any optimisation did
+///
+/// The post-barrier profile attributed 50.9% of remaining self time to
+/// `__mprotect` and inferred ~182,892 calls at ~1.7 us from the boundary count.
+/// Both halves of that are inference: a sampling profiler attributes samples,
+/// not calls, and a boundary count is not a syscall count -- the handler issues
+/// one per FAULT, and `arm`/`take_dirty` each issue one per boundary they
+/// actually run on, which is not every boundary.
+///
+/// A previous measurement on this same barrier was fabricated by exactly this
+/// shape of unverified inference, so the count is counted. `FN64_MPROTECT_
+/// BARRIER_SYSCALLS=1`; inert otherwise, and the gate is read once into a
+/// `OnceLock` so the disabled lane is a predictable branch on a cached bool.
+///
+/// The clock is read only when enabled. `Instant::now` is a `mach_absolute_
+/// time` on Darwin, cheap relative to the syscall it brackets but not free,
+/// which is why the equivalence run is made with this off.
+mod syscalls {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One (count, nanoseconds) pair per call site.
+    pub struct Site {
+        pub calls: AtomicU64,
+        pub nanos: AtomicU64,
+    }
+
+    impl Site {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                nanos: AtomicU64::new(0),
+            }
+        }
+    }
+
+    /// `arm` -- protect the whole span at a boundary.
+    pub static ARM: Site = Site::new();
+    /// `take_dirty` -- unprotect the whole span at a boundary.
+    pub static DISARM: Site = Site::new();
+    /// The fault handler -- unprotect one page so the store can retire.
+    pub static FAULT: Site = Site::new();
+
+    pub fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| super::env_flag("FN64_MPROTECT_BARRIER_SYSCALLS"))
+    }
+
+    /// Record one call. Called from the signal handler for `FAULT`, so it does
+    /// nothing but add to two atomics -- no allocation, no lock, no formatting.
+    pub fn note(site: &Site, nanos: u64) {
+        site.calls.fetch_add(1, Ordering::Relaxed);
+        site.nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Print at exit, for the same reason the served/fell-back stats do: the
+    /// harness `main` is hashed into the program identity and must not change.
+    pub fn arm_report() {
+        if !enabled() {
+            return;
+        }
+        extern "C" fn at_exit() {
+            let line = |name: &str, site: &Site| {
+                let calls = site.calls.load(Ordering::Relaxed);
+                let nanos = site.nanos.load(Ordering::Relaxed);
+                let mean = if calls == 0 { 0.0 } else { nanos as f64 / calls as f64 };
+                format!(
+                    "{name}={calls} ({:.1}ms, {mean:.0}ns each)",
+                    nanos as f64 / 1e6
+                )
+            };
+            let total_calls = ARM.calls.load(Ordering::Relaxed)
+                + DISARM.calls.load(Ordering::Relaxed)
+                + FAULT.calls.load(Ordering::Relaxed);
+            let total_nanos = ARM.nanos.load(Ordering::Relaxed)
+                + DISARM.nanos.load(Ordering::Relaxed)
+                + FAULT.nanos.load(Ordering::Relaxed);
+            println!(
+                "[mprotect-syscalls] total={total_calls} ({:.1}ms) {} {} {}",
+                total_nanos as f64 / 1e6,
+                line("arm", &ARM),
+                line("disarm", &DISARM),
+                line("fault", &FAULT),
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            // SAFETY: a plain `extern "C" fn()` with no arguments.
+            unsafe { atexit(at_exit) };
+        });
+    }
+}
+
+/// `mprotect`, timed and counted when the syscall census is on.
+///
+/// One wrapper rather than three timing blocks, so no call site can be counted
+/// at one place and not another -- which is how a census undercounts and then
+/// "proves" the syscall is not the cost.
+///
+/// # Safety
+///
+/// As `mprotect`: `addr` must be page-aligned and `[addr, addr + len)` inside a
+/// mapping this process owns.
+unsafe fn timed_mprotect(site: &syscalls::Site, addr: *mut u8, len: usize, prot: i32) -> i32 {
+    if !syscalls::enabled() {
+        return mprotect(addr, len, prot);
+    }
+    let started = std::time::Instant::now();
+    let result = mprotect(addr, len, prot);
+    syscalls::note(site, started.elapsed().as_nanos() as u64);
+    result
+}
+
 /// Largest number of distinct dirty pages the barrier will track per boundary.
 ///
 /// Beyond this the barrier gives up on the boundary and reports "everything may
@@ -486,7 +605,14 @@ fn handle_fault(info: *mut SigInfo) -> bool {
     // whole mechanism: the page is now unprotected and further writes to it
     // cost nothing until the next boundary re-protects.
     // SAFETY: a page inside our own mapping.
-    let ok = unsafe { mprotect(page_base as *mut u8, page, PROT_READ | PROT_WRITE) } == 0;
+    let ok = unsafe {
+        timed_mprotect(
+            &syscalls::FAULT,
+            page_base as *mut u8,
+            page,
+            PROT_READ | PROT_WRITE,
+        )
+    } == 0;
     if !ok {
         // Cannot clear the fault. Latch and let the default handler run rather
         // than returning into an instruction that will fault again forever.
@@ -657,9 +783,17 @@ impl Barrier {
         if !self.usable() {
             return;
         }
+        syscalls::arm_report();
         STATE.dirty_len.store(0, Ordering::Relaxed);
         // SAFETY: our own page-aligned mapping.
-        let ok = unsafe { mprotect(self.start as *mut u8, self.end - self.start, PROT_READ) } == 0;
+        let ok = unsafe {
+            timed_mprotect(
+                &syscalls::ARM,
+                self.start as *mut u8,
+                self.end - self.start,
+                PROT_READ,
+            )
+        } == 0;
         if !ok {
             STATE.poisoned.store(true, Ordering::Relaxed);
             return;
@@ -690,7 +824,8 @@ impl Barrier {
         // (baseline updates, DMA, the renderer) needs it to be.
         // SAFETY: our own page-aligned mapping.
         let ok = unsafe {
-            mprotect(
+            timed_mprotect(
+                &syscalls::DISARM,
                 self.start as *mut u8,
                 self.end - self.start,
                 PROT_READ | PROT_WRITE,
