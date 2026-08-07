@@ -1713,6 +1713,14 @@ the four match-arena loader PCs (`0x80022484`, `0x80022498`, `0x800224d4`,
 `0x80022510`), which the earlier route observed as never reached. Those probes
 are unaffected by this retraction and are the right next step.
 
+> **Closed 2026-08-07 by frame evidence** (see the in-match entry at the end of
+> this file, commit `5ed7f2c`). The route reaches the versus presentation and a
+> live match; the frames are committed. The arena-loader PCs were never reached
+> because the route **cancelled its own wrestler selection** — B at read 550 and
+> Z at 590 backed out of the Superstars roster — so the game was asked to load
+> an arena and then told to forget. The observation above was right; reading it
+> as "the game never asks" was the wrong inference from a true fact.
+
 ## 2026-08-07: WM2000 renders its MATCH SETUP screen
 
 Not a copyright screen — a live game UI, captured at frame 1599 of a
