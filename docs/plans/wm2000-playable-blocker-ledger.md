@@ -531,3 +531,43 @@ Further gains require **reducing scan volume, not scan cost**: fewer boundaries,
 or a watched region smaller than the 1 MiB boot bank. The latter is the "narrow
 code map" already closed by measurement (WM2000 zeroes its own loaded code
 image), so boundary count is the honest next lever.
+
+
+## 2026-08-07: 15.5x, and the O(watched bytes) floor is proven
+
+Two more levers landed (`e68af57`, `6cd4980`): the HostAbi boundaries scanned
+the watched region twice, and `classify_live_executable_write` deep-cloned the
+whole program on every watched store. 271.1 ms -> 240.7 ms; re-measured
+independently at **229 ms = 6,065,880 guest instructions/sec = 15.5x slower than
+hardware.** Complete run output `diff`-identical in every lane.
+
+Note the profile mis-ranked these: it predicted 7% for the double scan and 4%
+for the clone; measured, the clone paid 7.0% and the double scan 4.3%.
+
+### The incremental reconcile is not viable -- proven, not abandoned
+
+The largest remaining lever (57.6% of runtime, the watched-region scan) cannot
+be made incremental. The argument is arithmetic, not soundness, so it would have
+failed even with a perfect soundness story:
+
+`expected_page_digests` is **a cache of the baseline, not an observation of live
+RDRAM.** All five call sites of `watched_page_digest_v2` hash either
+`self.expected` (`mod.rs:642`, `:657`, `:895`) or a caller-supplied snapshot
+(`live_program.rs:425`). None hashes live RDRAM. To make a page digest answer
+"did live RDRAM change", it must be recomputed from live RDRAM -- and SHA-256
+reads every byte of the page to do so. That is the same 1,513,056 bytes the
+`memcmp` reads, with per-byte compression instead of a vectorized compare and
+without `memcmp`'s early exit. **Strictly worse.**
+
+The 1.005 page-rehashes-per-commit figure is a saving on *hashing*, obtained by
+consuming a comparison the scan already paid for (`refresh_page_digests` derives
+its dirty set at `mod.rs:654` with a full-region `memcmp`). It is downstream of
+the scan and cannot replace it.
+
+**The general form:** the guard's cost IS the read of the watched region, and
+every candidate substitute -- digest, checksum, Merkle path -- must perform that
+read to be trustworthy. Only a mechanism that learns of writes *without reading*
+could break the O(watched bytes) floor: hardware dirty bits, or `mprotect`
+write-protection with a fault handler.
+
+That is the honest boundary of software-only optimization here.
