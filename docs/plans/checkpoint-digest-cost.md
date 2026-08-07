@@ -569,6 +569,107 @@ per commit -- which is the over-broad watched region that
 `EXECUTABLE_WRITE_RANGES` is now the next lever, and unlike this migration it
 redefines no hashed quantity.
 
+## The snapshot no longer materializes (2026-08-06)
+
+The bottleneck above was removed without narrowing the watched region at all.
+
+`read_snapshot_from_view` allocated a `Vec<u8>` per watched range and copied
+the whole 1.44 MiB out of RDRAM -- with a per-word byte-lane reversal -- before
+anything looked at it. Its consumers then mostly just **compared** it:
+`current_changed_ranges` against `expected`, and `commit_snapshot` updating
+`expected` from it. The copy existed only so the comparison had a contiguous
+logical-order buffer.
+
+`matches_view` / `matches_storage` already decided the **boolean** form of that
+comparison in one `memcmp` per range, against the pre-reversed
+`expected_storage_order` mirror. Two new methods carry that same shape further:
+
+- `WatchedExecutableBytesV1::changed_ranges_into` -- the same comparison,
+  carried far enough to name the differing bytes. The word-aligned body is one
+  `memcmp` against the mirror, chunked so equal stretches are skipped 256 words
+  at a time; only differing words are walked lane by lane. The at-most-three
+  head and tail bytes stay on `read_u8`.
+- `WatchedExecutableBytesV1::apply_changed_from_view` -- refreshes `expected`,
+  `expected_storage_order` and the page digests over **only** the changed
+  ranges, instead of rewriting all three over the whole region.
+
+### The lane mapping
+
+Logical byte `a` lives at storage `a ^ 3`, and across an aligned word that XOR
+*is* the little-endian reversal. So inside a differing word, storage lane `k`
+is logical lane `3 - k`. Getting this wrong reports "unchanged" for changed
+memory only for particular lane patterns -- a silent corruption this repository
+has already paid for once -- so it is proven rather than argued.
+
+`changed_ranges_from_view_matches_the_copying_path` drives randomized contents
+and randomized change patterns (five densities, from "nothing" to "every byte")
+over nine watched layouts: unaligned start, unaligned end, both, sub-word
+ranges entirely inside one storage word, ranges shorter than the 3-byte head,
+ranges straddling word boundaries, and a three-range watched set. Each round it
+asserts the new comparison returns **exactly** the ranges
+`current_changed_ranges(&read_snapshot_from_view(v))` returns, then commits
+through both paths and asserts `expected`, `expected_storage_order`, the page
+digests, the watched root and the journal root all stay byte-identical.
+`adopt_from_view_matches_the_copying_adoption` does the same for the
+no-declaration path.
+
+### The `expected` baseline invariant
+
+`expected` ends byte-identical to what the full-copy path produces. Bytes
+inside the changed ranges are re-read through `copy_logical_bytes` itself -- the
+same function the full copy used, so the same lane mapping by construction.
+Bytes outside them were proven equal to the baseline by the very comparison
+that produced the changed set. The storage-order mirror is widened to whole
+words across the body (a partial word cannot be reversed in isolation), which
+only re-derives bytes that are already correct.
+
+`refresh_page_digests_over` is as conservative as the form it parallels: the
+dirty set comes from `changed`, which is a byte-for-byte comparison of live
+storage against the old baseline -- not from a writer's declaration. A page
+outside every changed range has identical bytes by that comparison, and
+identical bytes have an identical digest.
+
+### Guards unchanged
+
+Nothing weakened. `first_uncovered_changed_range`, the pending-write quiescence
+assertions and the poison path are untouched, and they see the same changed
+list they saw before. `changed_ranges_from_view` returns `None` when the state
+is unsealed or a watched byte is unmapped, and every caller then falls back to
+the copying path -- so each panic message is still produced by exactly the code
+that produced it before.
+
+### Result
+
+| SELF (before) | symbol | after |
+|---|---|---|
+| 2757 | `_platform_memcmp` | ~25 |
+| 1456 | `_platform_memmove` | not in the top table |
+| 1029 | `current_changed_ranges` | not called on the commit path |
+| 920 | `RdramView::copy_logical_bytes` | only over changed bytes |
+| 915 | `WatchedExecutableBytesV1::set_expected` | not called on the commit path |
+| 173 | `sha2::sha256::aarch64::compress` | unchanged |
+
+At 400k steps the sampler now attributes 11,982 of 12,102 root samples to a
+single inlined `run_one_step` frame: the snapshot machinery has fallen out of
+the profile entirely.
+
+- 60k, `FN64_ABSENT_N64DD=1 FN64_BLOCK_MAX_STEPS=60000`: **11.54s -> 4.60s
+  (2.51x)**, `sim_time=180000` both, every progress counter identical.
+- 200k route: **42.33s -> 18.98s (2.23x)**, `sim_time=1461877` both,
+  `thread0_dead=true` both, counters byte-identical
+  (`trace=200221 device_trace=421 pi_started=105`).
+
+Best-of-3 on the same build configuration. Cumulative with the v2 page tree,
+the 60k benchmark has gone **32.71s -> 4.60s (7.1x)**.
+
+- `cargo nextest run -p fn64-abi --features recomp-rs -p fn64-runtime`:
+  **696/696** (694 pre-existing + 2 new equivalence tests).
+- `cargo nextest run -p fn64-recomp-rs`: **401/401**.
+- `cargo nextest run -p fn64-discover`: **1069/1069** -- the OoT
+  `auto_strategy_corpus` failure noted above did not reproduce on this run.
+- `scripts/grade-all.sh`: wrong=0 on all five (nw4e-donor 925, nw4e-solo 873,
+  nwxe-donor 779, nwxe-solo 725, revenge-solo 597).
+
 ### Verification
 
 - `cargo nextest run -p fn64-abi --features recomp-rs -p fn64-runtime`:
