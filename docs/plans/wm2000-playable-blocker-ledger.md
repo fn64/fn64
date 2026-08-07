@@ -1580,3 +1580,46 @@ the finding deserves a real fix rather than continued deferral.
 
 Note the test named above was written during investigation and never
 committed — there is no live guard for it in the tree.
+
+
+## 2026-08-07: the thrash is fixed and the entrance stall is NOT the thrash
+
+Both predicates narrowed together in `6a9d4ec` via one shared helper,
+`digested_image_intersects` — the sharing is what stops the documented mirror
+from drifting apart again.
+
+**Steps at matched `sim_time`, the metric the single-predicate attempt got
+wrong:**
+
+| anchor | `sim_time` | before | after | |
+|---|---|---|---|---|
+| read 100 | 359,624,297 | 182,605 | 83,299 | 2.19x fewer |
+| read 600 | 1,944,932,808 | 653,736 | 247,315 | **2.64x fewer** |
+
+Steps go **down**. A `diff` of all matched anchors (reads 90-600) is empty once
+the step field is stripped: identical `sim_time`, `gfx_submits`,
+`audio_submits`, buttons, stick, and resident generation set. Activations
+419,861 -> **0**.
+
+**The entrance stall survives the fix.** Re-run reaches read 600 in under a
+minute — against 13h44m before — and stops in the same place. The thrash was
+never causing the stall; it was hiding it behind ~400x of redundant hashing.
+Two separate bugs, now separated.
+
+Route reach with the budget freed: 700,000 steps to `sim_time=6,848,390,440`
+(3.5x further), `gfx_submits=2272 audio_submits=4013`, 3.9M nonzero audio
+samples, `render_error=None`.
+
+The certified source digest changed as expected, `9ba16d68…` -> `bcd08175…`,
+verified by reproducing the hash outside the build byte-for-byte.
+
+### Still open, and now cheap to chase
+
+- **The entrance stall at read 600** is the boot blocker, unchanged and
+  deterministic. It now costs minutes to reproduce.
+- **The latent fragment hole** deserves a real fix rather than deferral.
+  Generations are no longer retired by data writes, so fragments persist longer
+  on average — that does not create or widen the hole, but it gives a fragment
+  more opportunity to be reached. Note the test named in earlier briefs,
+  `a_prefix_generation_leaves_the_larger_one_resident_as_a_tail`, was never
+  committed: **there is no live guard for it.**
