@@ -1383,3 +1383,40 @@ depended on the old coincidence were fixed:
 26 ms of the 445 ms is `mprotect`, down from 231 ms of 640 ms. The barrier is no
 longer the bottleneck it created; the next profile should be taken fresh rather
 than extrapolated from the old one — **as self time, counting children out.**
+
+## 2026-08-07: the v2 page tree optimized the leaves and left the root O(n)
+
+A resolvable self-time profile (`xctrace`, 5 runs, 7,532 samples) puts
+`sha2::sha256::aarch64::compress` at **26.14%**, of which **20 of 26 points are
+`digest_expected`**. An in-tree note claiming sha2 was "3.32% — not worth doing"
+was wrong and had been steering optimization waves away from it.
+
+The cause is arithmetic and independently verified:
+
+```
+watched region      1,513,056 bytes / 4096 = 370 pages
+flat root absorbs   370 x 32 = 11,840 bytes per commit
+one leaf rehash              =  4,096 bytes
+```
+
+**The root costs 2.9x the leaf it was introduced to avoid.**
+`watched_root_digest_v2` (`recompiled/receipts.rs:1317`) iterates every page
+digest on every commit, so a 4-byte guest write rehashes one 4 KiB leaf and
+then re-absorbs all 370 digests. The v2 migration made the leaves incremental
+(measured 1.005 rehashes per commit) and left the root linear.
+
+A binary tree over the page digests makes a changed leaf update ~9 siblings
+(576 bytes) instead of 11,840 — a **21x reduction on the root**, worth roughly
+85 ms of the 440 ms route.
+
+That is a certified-identity change, so it is being done as a versioned v3
+migration with the same discipline as v1 to v2: distinct schema string and
+node tags, structure bound into the hashed message, and a determinism test
+proving an incrementally-updated root equals a from-scratch root regardless of
+update order.
+
+### Category split from the same profile
+
+Per-boundary **~55%** · device timing 12.5% · per-instruction ~11% ·
+**guest code 2.86%**. Runtime optimization is not finished, and codegen remains
+irrelevant.
