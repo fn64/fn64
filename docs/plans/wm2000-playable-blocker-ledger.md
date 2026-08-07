@@ -829,3 +829,52 @@ This is now the top **playability** blocker, distinct from throughput. The
 perf work took the route from hours to minutes per attempt, which makes this
 tractable to investigate -- each hypothesis is now a minutes-long experiment
 rather than an overnight one.
+
+
+## 2026-08-07: the mprotect barrier's aliasing hazard, raised and closed
+
+A parallel trace of every RDRAM writer surfaced a hazard the barrier's
+feasibility study had not covered: `execution.rs:1158` (identically `:1576`,
+`:1680`, and four sites in `runners.rs`) creates a `&mut [u8]` over the WHOLE
+RDRAM allocation once inside the coroutine body and holds it across the entire
+guest run -- every yield, every host shim, every device tick. A write barrier
+would trap stores made through a reference that stays live across the fault.
+
+The existing `reference/mprotect-bench/coroutine-fault.rs` did NOT cover this:
+its faulting store is `ptr::write_volatile` on a raw pointer, so its 2,000-fault
+result said nothing about a long-lived borrow.
+
+`reference/mprotect-bench/borrowed-fault.rs` closes the gap by reproducing the
+real shape: one whole-region `&mut [u8]` created at coroutine entry and live
+across all faults and suspends; stores as safe bounds-checked indexing
+(`mem[i] = v`, which is literally what `Rdram::store_b` compiles to) rather than
+volatile; readback through the same borrow; an aliasing raw-pointer write to the
+same bytes while that `&mut` is live; suspends taken with the barrier both armed
+and disarmed; and an independent whole-region mirror compared byte-for-byte.
+
+**Reproduced independently: 4,000/4,000 faults delivered, mirror
+byte-identical.**
+
+The correctness argument deliberately rests on the MMU property alone -- *a byte
+of a `PROT_READ` page cannot change without a fault* -- and never on `&mut`
+uniqueness. `mprotect` changes page permissions; it creates no reference and
+invalidates no provenance, and the fault is transparent because the store
+retires after the handler returns.
+
+### Pre-existing aliasing debt, recorded not fixed
+
+Two live `&mut [u8]` over the same allocation is aliasing-UB-adjacent under
+Stacked/Tree Borrows **today**, independent of any barrier -- Miri would reject
+it. The writers involved include `host_memory.rs`, `pi/timing.rs:444`,
+`rsp_commit.rs:87`, `rsp_phase.rs:773` and `executor/mod.rs:734`. Addressing it
+means refactoring `Rdram<'a>`'s ~40 accessors onto raw pointers, a separate and
+much larger job.
+
+### One structural fact that simplifies the barrier
+
+Single OS thread, enforced by construction: `RunToken` is a ZST capability whose
+sole producer is `Executor::run_one_step`, so two coroutines executing
+concurrently "has no expressible call site" (`thread.rs:1-19`). `Executor`,
+`HostState`, `ACTIVE_RDRAM`, `WRITE_OBSERVER` and the page-epoch tables are all
+`thread_local!`; coroutine switches change the stack, not the thread. The only
+non-test spawn near the guest is the watchdog, which never touches RDRAM.
