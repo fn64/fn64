@@ -1064,6 +1064,24 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+### 17. Do not budget instrumentation cost by counting clock reads
+An agent predicted its five new timers would cost **0.029 ms/field** — 33.8 ns
+measured per `Instant` pair × 856 reads. Measured: **+1.62 ms/field, +4.6% on
+the render field.** Wrong by **56x**, and it had told the coordinator the
+instrument was safe on that basis.
+
+**Arming a timer in the hottest loop costs what it does to inlining, register
+pressure and branch layout — not what the clock read costs.** The clock is the
+cheap part.
+
+Consequences to apply, not just to note:
+- Always run an **armed/control pair** and correct absolutes by the ratio.
+  Shares survive; absolute ms do not.
+- Any phase measuring **below the perturbation** is below the instrument's
+  resolution. Here the two sub-0.1 ms guard rows are unresolvable, and saying
+  "0.037 ms" about them overstates what was learned.
+- A budget of this shape is a *lower bound on the error*, never an estimate.
+
 ### RETRACTED: the "guest code is only 1.01 ms/field" figure was fabricated
 
 I claimed a layer partition measured guest code at **1.01 ms/field (4.5%)**,
@@ -1092,7 +1110,50 @@ a route with no frames in it, and carried into a table about a route that has
 them. **Before quoting any per-field figure, state which route produced it and
 whether that route rendered anything.**
 
-### Prime suspect for the 21.72 ms: a 4-byte mirror that reconciles 1 MiB
+### MEASURED: the executor split — apparatus is 24%, not the majority
+
+`f4aeb1c`, five sub-counters inside `run_one_step` behind `FN64_EXECUTOR_SPLIT`,
+reported by population with **nested counters subtracted, not summed**. Render
+field, 37.09 armed / 35.47 control:
+
+| phase | ms | share | kind |
+|---|---:|---:|---|
+| `gfx_ns` | 12.53 | 35.3% | graphics (rdp 7.04, rsp 5.98) |
+| **remainder inside the resume** | **11.96** | **33.7%** | guest + runtime |
+| mirror boundary | **8.43** | 23.8% | apparatus, **per-step** |
+| audio_lle / vi_present | 1.14 / 1.14 | 3.2% each | |
+| guard @ suspend / device | 0.037 / 0.038 | 0.1% | apparatus |
+
+**The hypothesis that executor self is mostly apparatus is REFUTED.** Named
+apparatus totals **24%** of the field, and the mutation journal's two flush
+seams come to **0.075 ms combined** — below this instrument's own perturbation.
+Making the guard cheaper *at those seams* is a closed line.
+
+**The 14.41 ms mirror prediction was 1.7x high** (measured 8.43), for exactly
+the reason its own falsifier named: a cheap early-out when nothing is dirty.
+Pre-registering the estimate is what made that judgeable.
+
+Three redirections:
+
+1. **A new 11.96 ms remainder appeared inside the coroutine resume** — guest
+   code plus the runtime it calls synchronously: `RdramView` reads,
+   `translate`/`backing_offset`, per-instruction validation, and
+   `runners.rs:1033`'s `reconcile_before_dispatch`, **which runs per loop
+   iteration, not per step**. This is now the largest unnamed cost.
+2. **The mirror is per-STEP, not per-submit** — and *cheaper* per call on render
+   fields (32.06 vs 59.11 µs), 2.17x total against a 4.01x call ratio. Its
+   bimodality is entirely "render fields take 4x more steps".
+3. **Steps per field (274.9 vs 68.5) is therefore a lever nobody has examined**,
+   and it multiplies everything per-step. The 79 µs/call resolves as many cheap
+   operations — 130.5 µs/step inclusive, no single phase dominating.
+
+**RDP drift, flagged not absorbed:** `gfx_lle_rdp` is 7.04 ms/render-field
+against the 5.82 baseline (+20.9%) while `gfx_lle_rsp` is flat (−1.7%). Same
+asymmetric signature as the earlier unexplained +8%, about half the magnitude,
+and **present in the control lane** — so it is not the instrument. Still
+unexplained, and it is on the line we are about to work.
+
+### Prime suspect for the 21.72 ms: a 4-byte mirror that reconciles 1 MiB (measured 8.43 — see above)
 
 **UNCONFIRMED — sized before the measurement, so the result is judged against a
 prediction.** Found by an explorer reading the dispatch prologue, not by a
