@@ -817,6 +817,65 @@ caveats travel with these numbers — the shell has **no warmup gate**, so the
 carries the `fn64-audio` `codegen-units=256` defect, making them a
 **pessimistic floor**.
 
+## Leading explanation of the bimodality: a 30 Hz guest loop (UNCONFIRMED)
+
+An independent read-only diagnosis, ranked by confidence and **not yet
+confirmed by measurement**. Recorded because it rules out the obvious
+hypothesis by arithmetic and names a cheap decisive test.
+
+**The hypothesis that survives: WM2000 runs its main loop at ~30 Hz** — it
+builds and submits its display list once per game frame, one game frame per two
+VI fields. The render field absorbs ~2.9 submits; the off-field carries only
+audio, present, and the runtime floor. All graphics work is **synchronous
+inside the field interval** (`osSpTaskStartGo_recomp`,
+`task_dispatch/lifecycle.rs:1015`, dispatch-before-completion at :1067-1073),
+so whichever field submits absorbs the entire per-submit cost — no smearing.
+
+Per-submit costs, derived from the measured split: RSP LLE **2.11 ms/submit**
+(3.04 ÷ 1.44), raw RDP seam **1.94 ms/submit** (2.80 ÷ 1.44). At 2.88 submits
+that is ~11.7 ms, plus the guard clustering on the same fields — **all four
+`read_snapshot` seams are per-submit or per-dispatch** — for a total delta near
+19.9 ms, giving modes at ~12.9 and ~32.8 ms. That matches p50 16.4 and p95 39.
+
+**"Submit batching, 2 vs 1" is RULED OUT by arithmetic** — and it was the
+brief's own leading guess. One extra submit is worth ≈2.11 + 1.94 + ~2.8 guard
+≈ **7 ms**, which puts modes at ~19 and ~26: *both over budget*, contradicting
+the observed 50% under. A fast mode at 16.4 cannot coexist with a per-field
+floor (executor self 12.58 + audio 1.37 + present 1.27) plus even one submit.
+
+Two supporting facts: **1.44 submits/field is itself the tell** — a non-integer
+average argues against per-field structure and for per-two-field (1.44 ≈ 2.88 ÷
+2). And the menu route shows the same cadence at lower weight, **0.51
+submits/field ≈ 1 task per 2 fields** — the same 30 Hz loop with 1-task menu
+frames instead of ~3-task match frames.
+
+Also ruled out, each with evidence: **interlaced field parity** (scanout
+asserts progressive carries field 0, `fn64-render/src/lib.rs:521-523`; WM2000 is
+480x240 progressive), **audio cadence** (0.92 submits/field — present on
+virtually every field, cannot alternate), **the double-buffer swap** (a single
+VI_ORIGIN MMIO latch; nothing host-side scales with it), and **census
+artifact** (per-field normalization of catch-up advances is tested at
+`frame_census.rs:161-164`).
+
+### The decisive test, and the data already exists
+
+`FieldSample` **already retains the cumulative gfx submit count per sample**
+(`frame_census.rs:150-155`, recorded at :234-239) — only `report()` discards it.
+Two numbers end the question:
+
+1. **Lag-1 autocorrelation of `per_field_ms`.** Strongly **negative** →
+   alternation. **Positive** → route-phase mixture (slow fields contiguous).
+   Opposite predictions from one number.
+2. **Contingency table, over-budget × submit-delta.** If alternation holds:
+   delta-0 fields ≈ 5,660 and almost all under budget; delta ≥ 1 fields average
+   ~2.9 submits and almost all over.
+
+**If confirmed, the consequence is severe and worth stating now: the render
+field must fit 16.667 ms on its own.** ~3 submits of RSP + RDP + guard have to
+fit alongside the ~13 ms floor. **No redistribution trick helps — the
+off-fields have no work to donate.** The targets become per-submit cost and the
+per-field floor, in that order.
+
 ## THE DISTRIBUTION IS BIMODAL — and this changes what to work on
 
 The single most important structural fact about the remaining gap, and it was
