@@ -467,7 +467,7 @@ Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
 ### 15. Verify the state you meant to cause, not the call you made
-Four instances in one day, 2026-08-07/08, all the same shape and none of them
+Five instances in one day, 2026-08-07/08, all the same shape and none of them
 subtle in hindsight:
 
 - **A green test run in a dirty tree.** The suite passed while the definition
@@ -484,6 +484,20 @@ subtle in hindsight:
   offending PID; an unconditional `echo "(empty = none)"` sat beneath it. The
   evidence was right there and the text next to it asserted the opposite.
 
+- **A log whose silence was a buffer.** `nobarrier-run.log` was declared a
+  finished short probe because it held 9,543 bytes across a 3-second window and
+  its stderr was 92 bytes of a benign notice. It was **still running**: `lsof`
+  showed PID 89169 holding it open `1w` at 102.6% CPU, and the stderr grew to
+  325 bytes minutes later. **stdout to a file is block-buffered (~4-8 KB), not
+  line-buffered** — 9,543 bytes is just past two 4 KB blocks, so a live process
+  routinely shows a frozen log between flushes. "Stopped at controller read
+  390" was where the last flush landed, not where the guest stopped. This is
+  rule 7 one layer down: there the harness printed only on an input edge, here
+  the kernel reveals output only on a block boundary. The check that
+  distinguishes them is `lsof` — it asks *who holds the file*, not *what the
+  file looks like*. File contents are downstream of a buffer; process state is
+  not.
+
 Two halves, and the second is the one that nearly slipped through:
 
 1. **Observe the state you intended to cause, not the call you made to cause
@@ -492,8 +506,8 @@ Two halves, and the second is the one that nearly slipped through:
    beside it.** A hardcoded verdict is an assertion with no evidence behind it,
    sitting exactly where evidence belongs.
 
-**Corollary — do not hand-shake on observations of quiet.** Two benchmark
-collisions came from an all-clear that was true when issued and stale when
+**Corollary — do not hand-shake on observations of quiet.** Three benchmark
+misreadings came from an all-clear that was true when issued and stale when
 acted on: a run started in the seconds between the check and the resume. A
 check and an action cannot be made atomic across agents, so no amount of
 re-checking fixes it. Coordinate on *declarations* — "N runs remain", "runs
