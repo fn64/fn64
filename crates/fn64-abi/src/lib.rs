@@ -2189,6 +2189,11 @@ mod ai;
 mod cache;
 mod debug;
 mod dispatch;
+/// Isolates the cost of `dispatch_captured_raw_rdp`'s whole-RDRAM staging copy
+/// and counts RSP interpreter instructions, both gated by
+/// `FN64_DPC_COPY_CENSUS=1`. Diagnostic only; see the module docs for why the
+/// seam's existing inclusive timer cannot answer either question.
+mod dpc_copy_census;
 /// Per-VI-field wall-clock latency, gated by `FN64_FRAME_CENSUS=1`. The test
 /// for the "guaranteed 60fps" bar; see the module docs for why both the
 /// frame-budget ratio and the wall-versus-virtual ratio are always reported.

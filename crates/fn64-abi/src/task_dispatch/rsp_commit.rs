@@ -130,6 +130,18 @@ pub(crate) unsafe fn dispatch_lle_task(
         if let Some(started) = rsp_started {
             rsp_execution_ns = rsp_execution_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
+        // Counts BOTH branches. `rsp_started` above is `gfx_started.map(..)`,
+        // so the RSP wall-time sub-timer never arms on the audio branch and
+        // `audio_lle_rsp_ms` reads 0.000 on every run despite audio LLE being
+        // almost entirely interpretation. These counters do not share that
+        // gate, and they answer the question wall time cannot: whether the
+        // interpreter is expensive per instruction or merely asked to run an
+        // enormous number of them (perf-method rule 3 -- count, do not infer).
+        crate::dpc_copy_census::note_rsp_chunk(
+            recognize_graphics_microcode,
+            result.steps,
+            words.len() as u64,
+        );
         total_steps = total_steps
             .checked_add(result.steps)
             .expect("RSP task step counter overflow");
@@ -1083,8 +1095,17 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
         staged_end <= 0x0100_0000,
         "captured RSP DPC staging range [{staging_start:#010x}, {staged_end:#010x}) exceeds the 24-bit RDP address space"
     );
-    let mut image = vec![0u8; staged_end];
-    image[..physical_len].copy_from_slice(real);
+    crate::dpc_copy_census::note_call();
+    let mut image = crate::dpc_copy_census::timed(
+        crate::dpc_copy_census::Phase::Alloc,
+        staged_end as u64,
+        || vec![0u8; staged_end],
+    );
+    crate::dpc_copy_census::timed(
+        crate::dpc_copy_census::Phase::CopyIn,
+        physical_len as u64,
+        || image[..physical_len].copy_from_slice(real),
+    );
     for (word_index, value) in words.iter().copied().enumerate() {
         let offset = staging_start + word_index * 4;
         image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
@@ -1128,8 +1149,16 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             }
         }
     }
+    // Times the copyback only, NOT `track_rdp_renderer_mutation`'s own
+    // bookkeeping around it: the closure is the memcpy and the wrapper is
+    // mutation-journal work, and conflating them would reproduce exactly the
+    // inclusive-as-self-time error this census exists to avoid.
     track_rdp_renderer_mutation(real, |real| {
-        real.copy_from_slice(&image[..physical_len]);
+        crate::dpc_copy_census::timed(
+            crate::dpc_copy_census::Phase::CopyBack,
+            physical_len as u64,
+            || real.copy_from_slice(&image[..physical_len]),
+        )
     });
     (
         full_sync,
