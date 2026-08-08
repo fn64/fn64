@@ -422,7 +422,7 @@ impl<'a> RdramView<'a> {
         let head = head.min(len);
         let body = (len - head) & !3;
 
-        let mut copy_byte = |index: u32, byte: &mut u8| {
+        let copy_byte = |index: u32, byte: &mut u8| {
             *byte = self.read_u8(
                 addr.checked_add(index)
                     .expect("logical RDRAM copy address overflow"),
