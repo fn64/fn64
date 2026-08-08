@@ -796,41 +796,103 @@ fn main() {
             fn64_runtime::SaveType::SramBanked,
         )));
         use fn64_render::RenderBackend as _;
-        let mut render_backend = fn64_render_reference::ReferenceBackend::new()
-            .with_f3dex2()
-            .with_clear_color([0, 0, 0, 255]);
-        if let Some(directory) = std::env::var_os("FN64_RENDER_DUMP_DIR") {
-            let first_task = std::env::var("FN64_RENDER_DUMP_FIRST_TASK")
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .expect("FN64_RENDER_DUMP_FIRST_TASK must be an unsigned integer")
-                })
-                .unwrap_or(0);
-            let limit = std::env::var("FN64_RENDER_DUMP_LIMIT")
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .expect("FN64_RENDER_DUMP_LIMIT must be an unsigned integer")
-                })
-                .unwrap_or(1);
-            assert!(limit != 0, "FN64_RENDER_DUMP_LIMIT must be nonzero");
-            let directory = std::path::PathBuf::from(directory);
-            println!(
-                "[wm2000-block-boot] render dump dir={} first_task={} limit={}",
-                directory.display(),
-                first_task,
-                limit,
-            );
-            render_backend = render_backend
-                .with_auto_dump(directory, "fn64-wm2000-block", limit)
-                .with_auto_dump_skip(first_task);
-        }
-        render_backend
-            .create(&fn64_render::RenderConfig::ntsc(320, 240))
-            .expect("ReferenceBackend create must be infallible for 320x240");
+        let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
+            let mut render_backend = fn64_render_reference::ReferenceBackend::new()
+                .with_f3dex2()
+                .with_clear_color([0, 0, 0, 255]);
+            if let Some(directory) = std::env::var_os("FN64_RENDER_DUMP_DIR") {
+                let first_task = std::env::var("FN64_RENDER_DUMP_FIRST_TASK")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .expect("FN64_RENDER_DUMP_FIRST_TASK must be an unsigned integer")
+                    })
+                    .unwrap_or(0);
+                let limit = std::env::var("FN64_RENDER_DUMP_LIMIT")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .expect("FN64_RENDER_DUMP_LIMIT must be an unsigned integer")
+                    })
+                    .unwrap_or(1);
+                assert!(limit != 0, "FN64_RENDER_DUMP_LIMIT must be nonzero");
+                let directory = std::path::PathBuf::from(directory);
+                println!(
+                    "[wm2000-block-boot] render dump dir={} first_task={} limit={}",
+                    directory.display(),
+                    first_task,
+                    limit,
+                );
+                render_backend = render_backend
+                    .with_auto_dump(directory, "fn64-wm2000-block", limit)
+                    .with_auto_dump_skip(first_task);
+            }
+            render_backend
+                .create(&fn64_render::RenderConfig::ntsc(320, 240))
+                .expect("ReferenceBackend create must be infallible for 320x240");
+            Box::new(render_backend)
+        };
+        // `FN64_RENDER=reference|rt64` picks the rasterizer, mirroring
+        // `../oot-boot/src/main.rs`'s selector. REFERENCE IS THE DEFAULT and
+        // must stay so: every committed route, gate, and recorded measurement
+        // on this lane was taken against it, and the deterministic-counter
+        // comparison below is only meaningful if the untouched arm is untouched.
+        //
+        // Why this lane can host RT64 at all, which was long assumed otherwise:
+        // both lanes converge on the same `register_process_rdram`, the
+        // `RenderBackend` trait takes a call-scoped `&mut [u8]` and expresses no
+        // ownership, and on WM2000's raw-RDP path `dispatch_captured_raw_rdp`
+        // already hands the backend an ABI-local staging `Vec` regardless of who
+        // owns the process allocation. See `docs/plans/rt64-on-the-block-lane.md`.
+        //
+        // Headless does NOT mean present-free, contrary to the expectation in
+        // `rt64-on-the-block-lane.md` that blocker C would be "mostly moot"
+        // here. `pi::timing` pumps `present_render_backend` at every guest VI
+        // retrace whether or not a window exists, so RT64's `present` runs on
+        // this lane too and its `PresentMemory::Physical` requirement is
+        // satisfied by the registered process allocation. What stays moot is
+        // only the part after present -- no swapchain blit, and nothing reads
+        // the result back -- so a headless number still excludes presentation
+        // cost. Getting pixels back out to a window remains real work for
+        // `wm2000-shell` (`shell.rs:903`).
+        let requested_renderer = fn64_boot_harness::parse_release_env_value(
+            "FN64_RENDER",
+            std::env::var_os("FN64_RENDER"),
+        )
+        .unwrap_or_else(|error| panic!("wm2000-block-boot: {error}"))
+        .unwrap_or_else(|| "reference".to_string())
+        .to_ascii_lowercase();
+        let (render_backend, active_renderer): (Box<dyn fn64_render::RenderBackend>, &'static str) =
+            match requested_renderer.as_str() {
+                "reference" => (create_reference(), "reference"),
+                "rt64" => {
+                    // RT64 needs a GPU, a Metal system-default device, and a
+                    // real (hidden) NSWindow, plus initialization on the macOS
+                    // MAIN THREAD. This loop runs on the main thread -- the only
+                    // `std::thread::spawn` in this binary is the opt-in
+                    // `FN64_BLOCK_WATCHDOG` diagnostic -- so that contract holds.
+                    // A failure here is loud on purpose: silently falling back
+                    // would report a reference-backend number under an RT64
+                    // label, which is the one result this comparison must not
+                    // be able to produce.
+                    let mut backend = fn64_render_rt64::Rt64Backend::new();
+                    backend
+                        .create(&fn64_render::RenderConfig::ntsc(320, 240))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "wm2000-block-boot: FN64_RENDER=rt64 requires a working native \
+                                 RT64 adapter (build with --features rt64 and FN64_RT64_DIR set, \
+                                 and run with a GPU/display available); create failed: {error}"
+                            )
+                        });
+                    (Box::new(backend), "rt64")
+                }
+                value => panic!(
+                    "wm2000-block-boot: FN64_RENDER must be reference or rt64, got {value:?}"
+                ),
+            };
         fn64_abi::set_render_backend_with_policy(
-            Box::new(render_backend),
+            render_backend,
             fn64_recomp_rs::RDRAM_LEN,
             if generated_runner_rsp_audit_mode {
                 fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy
@@ -838,7 +900,7 @@ fn main() {
                 fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized
             },
         );
-        println!("[wm2000-block-boot] registered reference renderer (320x240)");
+        println!("[wm2000-block-boot] registered {active_renderer} renderer (320x240)");
         let (rom_start, rom_end, va_start) = pack::ROM_COPY;
         // The contract this asserts is IPL3's fixed one-MiB boot DMA, which is
         // universal; the literal triple was WM2000's instance of it. Checking

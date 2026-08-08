@@ -588,8 +588,23 @@ void write_vi_registers(
         const uint32_t h_end = guest[9] & 0x03FFU;
         const uint32_t v_start = (guest[10] >> 16U) & 0x03FFU;
         const uint32_t v_end = guest[10] & 0x03FFU;
+        // A window is active only when BOTH axes are programmed, matching
+        // `ViActiveWindow::try_from_registers` (crates/fn64-render/src/lib.rs),
+        // which returns None -- "nothing to scan out yet" -- unless H_VIDEO and
+        // V_VIDEO are each nonzero. This predicate used OR where that Rust
+        // contract uses AND, and the two disagree on exactly the state a real
+        // guest passes through during boot: WM2000's first VI retrace has
+        // V_VIDEO programmed (v=[37,511]) and H_VIDEO still zero, which OR
+        // called "active" and then rejected for h_end <= h_start. That aborted
+        // the process on a frame the Rust side correctly treats as not-yet-
+        // programmed and skips.
+        //
+        // This only narrows what counts as active; it does not weaken any
+        // malformed-window check. A window with both axes written still gets
+        // the full width/ordering/parity validation below, which is what
+        // `cpp_vi_ingress_rejects_an_odd_half_line_extent` pins.
         const bool active_window =
-            ((h_start | h_end | v_start | v_end) != 0U);
+            (((h_start | h_end) != 0U) && ((v_start | v_end) != 0U));
         if (active_window &&
             (((guest[2] & 0x0FFFU) == 0U) || (h_end <= h_start) ||
              (v_end <= v_start) || (((v_end - v_start) & 1U) != 0U))) {

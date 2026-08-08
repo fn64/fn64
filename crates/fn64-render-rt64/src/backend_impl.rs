@@ -43,8 +43,13 @@ impl Rt64Backend {
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
     }
 
+    // `pub(super)`: the RenderBackend trait impl deliberately stayed in
+    // lib.rs (two guard tests scan that file for its decoder-path and
+    // rollback invariants), and four of its arms call this. A child module's
+    // private item is not visible to its PARENT, so leaving this private
+    // broke exactly those four call sites under the `rt64` feature.
     #[cfg(feature = "rt64")]
-    fn invalidate_native_state(&mut self) {
+    pub(super) fn invalidate_native_state(&mut self) {
         self.context = None;
         self.clear_active_native_identity();
     }

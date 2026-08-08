@@ -30,6 +30,16 @@ dynamic-withheld = [
     "fn64-abi/dynamic-mapped-runtime",
     "fn64-recomp-rs/dynamic-mapped-runtime",
 ]
+# Builds the native MIT RT64 renderer behind `FN64_RENDER=rt64`. NON-DEFAULT,
+# exactly as in `../wm2000-boot/Cargo.toml:20`: the native build needs
+# `FN64_RT64_DIR` pointing at an MIT RT64 checkout, plus a GPU and a display
+# server at run time, so CI and no-GPU hosts must keep building without it.
+#
+# `fn64-render-rt64` itself is an UNCONDITIONAL dependency (same as
+# wm2000-boot): its Rust surface compiles pure-Rust with the feature off, and
+# `Rt64Backend::create` then returns an error rather than failing to compile.
+# That is what lets one selector arm exist in `src/main.rs` for both builds.
+rt64 = ["fn64-render-rt64/rt64"]
 
 [dependencies]
 fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
@@ -39,6 +49,7 @@ fn64-boot-harness = { path = "../../crates/fn64-boot-harness", features = ["reco
 fn64-audio = { path = "../../crates/fn64-audio" }
 fn64-render = { path = "../../crates/fn64-render" }
 fn64-render-reference = { path = "../../crates/fn64-render-reference" }
+fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 sha2 = "0.10"
 serde_json = "1"

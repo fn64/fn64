@@ -1,28 +1,33 @@
 //! Raw C-ABI config wire types and their conversions.
 use super::*;
 
+// Fields are `pub(super)` for the same reason the `extern "C"` block below is:
+// `ffi/tests.rs` and `ffi/context.rs` are SIBLINGS of this module and cannot
+// see private fields here. These are internal C-ABI wire structs behind a
+// `pub(super)` type in a private `mod ffi`, so this reaches the `ffi` subtree
+// and no further -- `#[repr(C)]` layout, and therefore the ABI, is untouched.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[repr(C)]
 pub(super) struct RawUserConfig {
-    graphics_api: u32,
-    resolution: u32,
-    display_buffering: u32,
-    antialiasing: u32,
-    resolution_multiplier: f64,
-    downsample_multiplier: u32,
-    filtering: u32,
-    aspect_ratio: u32,
-    aspect_target: f64,
-    extended_aspect_ratio: u32,
-    extended_aspect_target: f64,
-    upscale_2d: u32,
-    three_point_filtering: u32,
-    refresh_rate: u32,
-    refresh_rate_target: u32,
-    internal_color_format: u32,
-    hardware_resolve: u32,
-    idle_work_active: u32,
-    developer_mode: u32,
+    pub(super) graphics_api: u32,
+    pub(super) resolution: u32,
+    pub(super) display_buffering: u32,
+    pub(super) antialiasing: u32,
+    pub(super) resolution_multiplier: f64,
+    pub(super) downsample_multiplier: u32,
+    pub(super) filtering: u32,
+    pub(super) aspect_ratio: u32,
+    pub(super) aspect_target: f64,
+    pub(super) extended_aspect_ratio: u32,
+    pub(super) extended_aspect_target: f64,
+    pub(super) upscale_2d: u32,
+    pub(super) three_point_filtering: u32,
+    pub(super) refresh_rate: u32,
+    pub(super) refresh_rate_target: u32,
+    pub(super) internal_color_format: u32,
+    pub(super) hardware_resolve: u32,
+    pub(super) idle_work_active: u32,
+    pub(super) developer_mode: u32,
 }
 
 const _: [(); 96] = [(); std::mem::size_of::<RawUserConfig>()];
@@ -30,14 +35,14 @@ const _: [(); 96] = [(); std::mem::size_of::<RawUserConfig>()];
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub(super) struct RawEnhancementConfig {
-    framebuffer_reinterpret_fix_uls: u32,
-    presentation_mode: u32,
-    remove_black_borders: u32,
-    rect_fix_lower_right: u32,
-    f3dex_force_branch: u32,
-    s2dex_fix_bilerp_mismatch: u32,
-    s2dex_framebuffer_fast_path: u32,
-    texture_lod_scale: u32,
+    pub(super) framebuffer_reinterpret_fix_uls: u32,
+    pub(super) presentation_mode: u32,
+    pub(super) remove_black_borders: u32,
+    pub(super) rect_fix_lower_right: u32,
+    pub(super) f3dex_force_branch: u32,
+    pub(super) s2dex_fix_bilerp_mismatch: u32,
+    pub(super) s2dex_framebuffer_fast_path: u32,
+    pub(super) texture_lod_scale: u32,
 }
 
 const _: [(); 32] = [(); std::mem::size_of::<RawEnhancementConfig>()];
@@ -105,10 +110,10 @@ impl TryFrom<RawEnhancementConfig> for RenderEnhancementSettings {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub(super) struct RawEmulatorConfig {
-    post_blend_noise: u32,
-    post_blend_noise_negative: u32,
-    framebuffer_render_to_ram: u32,
-    framebuffer_copy_with_gpu: u32,
+    pub(super) post_blend_noise: u32,
+    pub(super) post_blend_noise_negative: u32,
+    pub(super) framebuffer_render_to_ram: u32,
+    pub(super) framebuffer_copy_with_gpu: u32,
 }
 
 const _: [(); 16] = [(); std::mem::size_of::<RawEmulatorConfig>()];
@@ -332,15 +337,15 @@ impl TryFrom<RawUserConfig> for RenderRuntimeSettings {
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub(super) struct RawVi {
-    registers: [u32; 14],
-    registers_present: u8,
-    blanked: u8,
-    fade_enabled: u8,
-    repeat_line: u8,
-    fade_factor: u16,
-    aa_mode_specified: u8,
-    reserved: u8,
-    noise_seed: u64,
+    pub(super) registers: [u32; 14],
+    pub(super) registers_present: u8,
+    pub(super) blanked: u8,
+    pub(super) fade_enabled: u8,
+    pub(super) repeat_line: u8,
+    pub(super) fade_factor: u16,
+    pub(super) aa_mode_specified: u8,
+    pub(super) reserved: u8,
+    pub(super) noise_seed: u64,
 }
 
 const _: [(); 72] = [(); std::mem::size_of::<RawVi>()];
@@ -386,26 +391,35 @@ pub(super) fn validate_native_vi_filters(vi: &ViPresentation) -> Result<(), Stri
     Ok(())
 }
 
+// `pub(super)`, not private: `context.rs` is a SIBLING of this module, so it
+// cannot see private items here, and the shim's whole point is that
+// `Context`'s methods call these. The declarations were left private when this
+// block moved out of `ffi/mod.rs`, which is why every `fn64_rt64_*` call in
+// `context.rs` failed to resolve under the non-default `rt64` feature.
+//
+// `pub(super)` is the exact reach required -- `ffi` and its children, nothing
+// beyond. The C ABI surface itself is unchanged: visibility is a Rust-side
+// name-resolution property and does not affect linkage or the symbols emitted.
 unsafe extern "C" {
-    fn fn64_rt64_roundtrip_user_config(
+    pub(super) fn fn64_rt64_roundtrip_user_config(
         input: *const RawUserConfig,
         output: *mut RawUserConfig,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_roundtrip_enhancement_config(
+    pub(super) fn fn64_rt64_roundtrip_enhancement_config(
         input: *const RawEnhancementConfig,
         output: *mut RawEnhancementConfig,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_roundtrip_emulator_config(
+    pub(super) fn fn64_rt64_roundtrip_emulator_config(
         input: *const RawEmulatorConfig,
         output: *mut RawEmulatorConfig,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_inspect_replacement_pack(
+    pub(super) fn fn64_rt64_inspect_replacement_pack(
         path_utf8: *const c_char,
         config: *mut RawReplacementDatabaseConfig,
         database_bytes: *mut u8,
@@ -414,7 +428,7 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_capture_adapter_inputs(
+    pub(super) fn fn64_rt64_capture_adapter_inputs(
         task: *const RawTask,
         output_addr: u32,
         width: u32,
@@ -425,14 +439,14 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> c_int;
     #[cfg(test)]
-    fn fn64_rt64_probe_logical_rate(
+    pub(super) fn fn64_rt64_probe_logical_rate(
         nominal_refresh_rate: u32,
         factor: u32,
         logical_rate: *mut u32,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_create(
+    pub(super) fn fn64_rt64_create(
         width: u32,
         height: u32,
         nominal_refresh_rate: u32,
@@ -442,26 +456,26 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> *mut RawContext;
-    fn fn64_rt64_apply_user_config(
+    pub(super) fn fn64_rt64_apply_user_config(
         context: *mut RawContext,
         user_config: *const RawUserConfig,
         framebuffers_discarded: *mut u8,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_apply_enhancement_config(
+    pub(super) fn fn64_rt64_apply_enhancement_config(
         context: *mut RawContext,
         enhancement_config: *const RawEnhancementConfig,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_apply_emulator_config(
+    pub(super) fn fn64_rt64_apply_emulator_config(
         context: *mut RawContext,
         emulator_config: *const RawEmulatorConfig,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_load_replacement_packs(
+    pub(super) fn fn64_rt64_load_replacement_packs(
         context: *mut RawContext,
         packs: *const RawReplacementPack,
         pack_count: usize,
@@ -469,7 +483,7 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_reload_replacement_packs(
+    pub(super) fn fn64_rt64_reload_replacement_packs(
         context: *mut RawContext,
         packs: *const RawReplacementPack,
         pack_count: usize,
@@ -477,13 +491,13 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_set_replacement_enabled(
+    pub(super) fn fn64_rt64_set_replacement_enabled(
         context: *mut RawContext,
         enabled: u32,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_wait_texture_replacement_state(
+    pub(super) fn fn64_rt64_wait_texture_replacement_state(
         context: *mut RawContext,
         texture_hash: u64,
         require_replacement: u32,
@@ -491,20 +505,20 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_set_stream_workers_paused(
+    pub(super) fn fn64_rt64_set_stream_workers_paused(
         context: *mut RawContext,
         paused: u32,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_wait_stream_fallback_state(
+    pub(super) fn fn64_rt64_wait_stream_fallback_state(
         context: *mut RawContext,
         texture_hash: u64,
         state: *mut RawTextureReplacementState,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_process_task(
+    pub(super) fn fn64_rt64_process_task(
         context: *mut RawContext,
         rdram: *mut u8,
         rdram_len: usize,
@@ -519,7 +533,7 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_process_rdp_commands(
+    pub(super) fn fn64_rt64_process_rdp_commands(
         context: *mut RawContext,
         rdram: *mut u8,
         rdram_len: usize,
@@ -529,7 +543,7 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_present(
+    pub(super) fn fn64_rt64_present(
         context: *mut RawContext,
         rdram: *mut u8,
         rdram_len: usize,
@@ -537,12 +551,12 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_enable_present_capture(
+    pub(super) fn fn64_rt64_enable_present_capture(
         context: *mut RawContext,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_present_capture(
+    pub(super) fn fn64_rt64_read_present_capture(
         context: *mut RawContext,
         capture: *mut RawPresentCapture,
         bytes: *mut u8,
@@ -550,47 +564,47 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_present_selection(
+    pub(super) fn fn64_rt64_read_present_selection(
         context: *mut RawContext,
         selection: *mut RawPresentSelection,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_enable_deferred_workload_capture(
+    pub(super) fn fn64_rt64_enable_deferred_workload_capture(
         context: *mut RawContext,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_deferred_workload_evidence(
+    pub(super) fn fn64_rt64_read_deferred_workload_evidence(
         context: *mut RawContext,
         evidence: *mut RawDeferredWorkloadEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_framebuffer_copy_path_evidence(
+    pub(super) fn fn64_rt64_read_framebuffer_copy_path_evidence(
         context: *mut RawContext,
         evidence: *mut RawFramebufferCopyPathEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_s2dex_fast_path_evidence(
+    pub(super) fn fn64_rt64_read_s2dex_fast_path_evidence(
         context: *mut RawContext,
         evidence: *mut RawS2dexFastPathEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_enable_extended_gbi_evidence(
+    pub(super) fn fn64_rt64_enable_extended_gbi_evidence(
         context: *mut RawContext,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_extended_gbi_evidence(
+    pub(super) fn fn64_rt64_read_extended_gbi_evidence(
         context: *mut RawContext,
         evidence: *mut RawExtendedGbiEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_extended_present_capture(
+    pub(super) fn fn64_rt64_read_extended_present_capture(
         context: *mut RawContext,
         capture_index: u32,
         capture: *mut RawExtendedPresentCapture,
@@ -600,13 +614,13 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> c_int;
     #[cfg(feature = "hfr-evidence")]
-    fn fn64_rt64_enable_hfr_evidence(
+    pub(super) fn fn64_rt64_enable_hfr_evidence(
         context: *mut RawContext,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
     #[cfg(feature = "synthetic-f3dex2-evidence")]
-    fn fn64_rt64_process_synthetic_hfr_f3dex2(
+    pub(super) fn fn64_rt64_process_synthetic_hfr_f3dex2(
         context: *mut RawContext,
         rdram: *mut u8,
         rdram_len: usize,
@@ -618,7 +632,7 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> c_int;
     #[cfg(feature = "synthetic-s2dex-evidence")]
-    fn fn64_rt64_process_synthetic_s2dex2(
+    pub(super) fn fn64_rt64_process_synthetic_s2dex2(
         context: *mut RawContext,
         rdram: *mut u8,
         rdram_len: usize,
@@ -629,14 +643,14 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> c_int;
     #[cfg(feature = "hfr-evidence")]
-    fn fn64_rt64_read_hfr_evidence(
+    pub(super) fn fn64_rt64_read_hfr_evidence(
         context: *mut RawContext,
         evidence: *mut RawHfrEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
     #[cfg(feature = "hfr-evidence")]
-    fn fn64_rt64_read_hfr_present_capture(
+    pub(super) fn fn64_rt64_read_hfr_present_capture(
         context: *mut RawContext,
         capture_index: u32,
         capture: *mut RawExtendedPresentCapture,
@@ -646,19 +660,19 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> c_int;
     #[cfg(feature = "hfr-evidence")]
-    fn fn64_rt64_enable_hfr_pacing_evidence(
+    pub(super) fn fn64_rt64_enable_hfr_pacing_evidence(
         context: *mut RawContext,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
     #[cfg(feature = "hfr-evidence")]
-    fn fn64_rt64_read_hfr_pacing_evidence(
+    pub(super) fn fn64_rt64_read_hfr_pacing_evidence(
         context: *mut RawContext,
         evidence: *mut RawHfrPacingEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_set_debugger_inspection_for_evidence(
+    pub(super) fn fn64_rt64_set_debugger_inspection_for_evidence(
         context: *mut RawContext,
         paused: u32,
         framebuffer_index: i32,
@@ -667,25 +681,25 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_enable_ubershader_evidence(
+    pub(super) fn fn64_rt64_enable_ubershader_evidence(
         context: *mut RawContext,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_read_ubershader_evidence(
+    pub(super) fn fn64_rt64_read_ubershader_evidence(
         context: *mut RawContext,
         evidence: *mut RawUbershaderEvidence,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_resize(
+    pub(super) fn fn64_rt64_resize(
         context: *mut RawContext,
         width: u32,
         height: u32,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
-    fn fn64_rt64_destroy(context: *mut RawContext);
+    pub(super) fn fn64_rt64_destroy(context: *mut RawContext);
 }
 
 pub(crate) fn capture_adapter_inputs(
