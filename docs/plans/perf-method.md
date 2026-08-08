@@ -275,6 +275,59 @@ rebuild, and `examples/wm2000-block-boot/src/main.rs` is both (`build.rs` reads
 it into `DISPATCH_SOURCE_SHA256`), so putting a diagnostic there would move the
 canonical digest.
 
+## The gameplay baseline, 2026-08-07 — this supersedes the menu figures
+
+Everything above this line was measured on a route that idled in menus. The
+route now reaches a live match (`5ed7f2c`), and the numbers are materially
+worse. **Quote these when asked what 60fps has to beat.**
+
+Route sha `a9e1b25e` (HEAD's schedule), binary `cd3ec985` (clean HEAD), 2.1M
+steps, headless, `warmup_gfx=300`, started at load 1.78.
+
+| | gameplay | menu |
+|---|---|---|
+| mean | **52.79 ms** | 34.85 |
+| p50 | 43.05 | 42.64 |
+| p95 | 95.18 | 55.82 |
+| p99 | 100.30 | 60.58 |
+| over budget | 54.4% (6,164/11,321) | — |
+| **ratio A** (vs 16.667) | **3.17x** | 2.09x |
+| ratio B (wall vs virtual) | 3.155x @ 59.8 Hz | — |
+
+Both ratios agree because the guest is at nominal rate: **no discount here
+either.** The gap to close is **36.1 ms per frame**, not 20.9.
+
+Density confirms the cause: 1.44 graphics submits per field against the menu
+route's 0.51, **2.8x denser**.
+
+| component | gameplay | menu | ms/field |
+|---|---|---|---|
+| RSP gfx LLE — raw RDP rasterization | **34.8%** | 31.6% | **16.71** |
+| executor self (guest+runtime+guard) | 31.3% | 37.1% | 15.02 |
+| VI present (`vi::scanout`) | 8.1% | 11.6% | 3.89 |
+| RSP audio LLE | 7.0% | 11.0% | 3.35 |
+| gfx LLE other (setup/commit/copies) | 6.4% | 3.6% | 3.06 |
+| RSP gfx LLE — RSP interpretation | 6.3% | 1.5% | 3.02 |
+| gfx HLE preflight | 6.3% | 3.6% | 3.01 |
+| **graphics total** | **53.7%** | 40.3% | |
+
+**The rasterizer alone is 16.71 ms/field — it exceeds the entire 16.667 ms
+budget by itself.** An infinitely fast everything-else still misses 60fps.
+Everything that scales with submits rose; everything per-field or per-step fell
+in share. **The correctness guard is no longer the largest category on a
+gameplay route — graphics is, by a wide margin.**
+
+Two caveats, from the measurement rather than added later:
+
+- `max` is 1,452.55 ms and sits **inside** the steady window. The warmup gate
+  counts graphics submits, and the match load happens well after submit 300, so
+  an arena-load transient lands in the distribution. `p99` is only 1.05x `p95`,
+  so the body is well-behaved and that sample is not shaping the percentiles —
+  but it does inflate the mean. A gameplay-specific warmup boundary is worth
+  having before anyone treats 52.79 as precise.
+- **Single run, not an A/B.** Menu-route run-to-run variance was ~±6%, so read
+  52.79 as approximately **50–56 ms**.
+
 ## Where the cost is, as of `e7c4d04`
 
 Quiet-machine deep route (19,523 steps, `FN64_MPROTECT_BARRIER=1`): **382-392 ms**.
