@@ -861,6 +861,35 @@ because each mode has internal variance (the slow mode spans 36.5-38.3). **The
 string showed a perfect signal the coefficient rated 0.55.** That is why the
 raw sequence is reported first.
 
+### The 5.84 ms figure was the wrong denominator, and by a factor of ~3.4
+
+Every mean-based sizing in this file **understates the requirement**, because it
+averages across an off-field that already has 7.8 ms of headroom.
+
+| framing | requirement |
+|---|---|
+| mean (what was quoted all session) | remove **5.69 ms** from 22.36 |
+| **reality** | render field **35.84 -> 16.667 = remove 19.17 ms** |
+
+**A uniform saving of X ms delivers only ~X/2 to the render field**, because
+half of it lands on a field that did not need it:
+
+| uniform saving | reaches the render field | share of the 19.17 needed |
+|---|---:|---:|
+| 0.37 ms (the `codegen-units` win) | 0.18 ms | **1.0%** |
+| 1.00 ms | 0.50 ms | 2.6% |
+| 2.00 ms | 1.00 ms | 5.2% |
+
+So `c2caafe` — a real, range-disjoint, correctness-neutral win — is **1% of the
+way to the bar**, not the ~6% its mean delta implied. Every queued candidate
+must be re-sized against 19.17 ms on the render field, and **only the fraction
+of its saving that lands on a submitting field counts.**
+
+This also flips which candidates matter. A **per-submit** saving pays entirely
+into the population that needs it; a **per-field** saving pays half of it away.
+The guard's 3.8x concentration on render fields makes it a per-submit cost, not
+the uniform overhead it was filed as.
+
 ### What this changes
 
 **The goal is not 5.84 ms off the mean. It is 2.15x on the rendering field.**
