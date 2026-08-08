@@ -890,6 +890,36 @@ into the population that needs it; a **per-field** saving pays half of it away.
 The guard's 3.8x concentration on render fields makes it a per-submit cost, not
 the uniform overhead it was filed as.
 
+### RETRACTED: the "graphics RSP is 40% slower than audio" gap never existed
+
+Claimed: the graphics RSP path runs at 11.6 ns/instruction against audio's
+8.3 — same interpreter, 40% slower on one path. An agent was dispatched to
+explain it. **It is an artifact of my own arithmetic: one numerator, two
+denominators.**
+
+Both figures are `gfx_lle_rsp_ms`, the graphics-branch RSP wall time. From
+`/tmp/census-run.log`:
+
+| | | |
+|---|---|---|
+| 35,886.807 ms ÷ **2.978e9 gfx steps** | = **12.05 ns** | quoted as "graphics 11.6" |
+| 35,886.807 ms ÷ **4.131e9 gfx+audio steps** | = **8.69 ns** | quoted as "audio 8.3" |
+
+Ratio 1.387 against the claimed 11.6/8.3 = 1.398 — **agreeing to 0.7%**, which
+is the signature of a denominator error rather than two real measurements.
+
+**The audio interpreter's ns/instruction has never been measured at all.**
+`AUDIO_LLE_RSP_NS` exists (`task_dispatch/lifecycle.rs:87`) but is accumulated
+only at `rsp_commit.rs:399`, not on the path taken at `:130`, so it reads
+`0.000` on every run. There was no audio figure to compare against.
+
+This is rule 2's cousin and rule 10's exact shape: **two quantities that look
+comparable, aren't.** Rule 10 already says "state both ratios or you have said
+nothing" about wall-vs-virtual; the same discipline applies to any derived
+per-unit figure. **Before comparing two rates, state both numerators and both
+denominators explicitly** — if they share a numerator, there is only one
+measurement.
+
 ### Candidates re-sized against the render field (19.17 ms)
 
 | candidate | on the render field | % of 19.17 |
