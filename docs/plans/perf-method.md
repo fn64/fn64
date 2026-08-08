@@ -565,9 +565,42 @@ let instr = decode(word, pc);
 let delay = delay_word.map(|delay_word| decode(delay_word, pc.wrapping_add(4)));
 ```
 
-**Only 4 of 25 match arms use it** — `Jal`, `Jalr`, `Jr`, `Jump`. Every other
-instruction pays for a decode it discards. At 4.13B RSP instructions that is
-~3.3-3.7B wasted decodes depending on branch density.
+**CORRECTION — it is 6 arms, not 4, and the two I missed are the frequent
+ones.** The original entry said `Jal`/`Jalr`/`Jr`/`Jump`. Enumerating the
+`run_delay(` call sites instead of grepping near the word "delay" gives six:
+
+| line | arm |
+|---|---|
+| :263 | **`Instr::Branch`** (Beq/Bne) |
+| :288 | **`Instr::BranchZ`** (Blez/Bgtz/Bltz/Bgez) |
+| :294 | `Instr::Jump` |
+| :301 | `Instr::Jal` |
+| :307 | `Instr::Jr` |
+| :314 | `Instr::Jalr` |
+
+The two omitted arms are the **conditional-branch families**. In compiled MIPS
+every loop and every `if` becomes a `beq`/`bne`/`bltz`, while `jal`/`jr` appear
+only at call boundaries — and the RSP microcode dominating this workload
+(audio and gfx ucode) is loop-heavy. So this is not a rounding error on a rare
+arm; the omitted arms are plausibly the **majority** of delay-slot consumers.
+
+**The ceiling below is therefore too high by an unmeasured amount.** The
+discard rate is materially under the 80% assumed. Deliberately not substituting
+a guess: there is no branch-density count for this workload and inventing one
+is rule 3's error. **The measurement needed is a branch-mix histogram, not more
+arithmetic** — `FN64_DPC_COPY_CENSUS` (`14ec45a`) already counts retired RSP
+instructions, so a two-counter split of "delay consumed" vs "delay discarded"
+inside the existing loop would settle it cheaply. Do that before writing any
+fix.
+
+Note this makes the change *more* attractive to implement even as the ceiling
+falls: decoding lazily inside the six arms that need it is small, local, and
+provably equivalent — the delay word is already in hand at every site. A
+smaller win for a much smaller change is a better ratio. What it is not is a
+step toward 5.84 ms on its own.
+
+The original (wrong) arithmetic follows, kept because the prediction was
+pre-registered and should be judged as written:
 
 **But size it before dispatching.** `decode` is a leaf at 7.03% of samples, and
 RSP interpretation totals 3.04 ms/field (8.33 ns per instruction):
