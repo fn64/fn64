@@ -360,6 +360,38 @@ will not be until that 2.86% grows.
 3. **`digest_expected` allocates a `Vec` per call** — 15,719 allocations, 2
    elements each. Trivial, unmeasured, do not do it without a number.
 
+## The verification set, and two traps in it
+
+There was no written list of what to run before claiming a change is verified,
+so the set was folklore passed between sessions — and on 2026-08-07 that cost a
+red release gate. Run all of these:
+
+```
+cargo nextest run -p fn64-abi -p fn64-runtime -p fn64-recomp-rs   # 987
+cargo nextest run -p fn64-boot-harness                            # 231
+cargo nextest run -p fn64-discover                                # 1069
+cargo nextest run -p fn64-render-reference                        # 464
+cargo nextest run -p fn64-audio                                   # 345
+bash scripts/grade-all.sh                                         # wrong=0 x5
+```
+
+**Trap 1 — an omitted crate is an invisible failure.** `8c54a81` (FlashRAM
+status) reported "728/728 abi+runtime" and did not run `fn64-boot-harness`,
+whose three release-gate tests it had just turned red by changing
+`FlashState::default().status` from `0x00` to `0x80`. They stayed red across
+every later session that reused the same partial recipe. A test suite you do
+not run cannot tell you anything, and the crate you skip is the one that
+breaks.
+
+**Trap 2 — `git archive` extracts have a 7-test false-failure floor.** The
+"verify HEAD in isolation" recipe elsewhere in this file
+(`git archive HEAD | tar -x -C <tmp>`) produces a directory with **no `.git`**,
+so the seven tests asserting "this file is tracked by git" cannot pass there.
+They fail identically at any commit, healthy or not. That extract is the right
+tool for "does HEAD contain a consistent set of source files" (it caught a
+missing definition earlier the same day) and the wrong tool for a green/red
+verdict. For that, use a real `git worktree` checkout.
+
 ## Dead ends — do not retry without new evidence
 
 - **Hoisting loop-invariant span edges out of `raw_pixel_coverage`.** The
