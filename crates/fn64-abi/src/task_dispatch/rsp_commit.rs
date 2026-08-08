@@ -125,7 +125,22 @@ pub(crate) unsafe fn dispatch_lle_task(
         } else {
             CHUNK_STEPS
         };
-        let rsp_started = gfx_started.map(|_| std::time::Instant::now());
+        // Arm on EITHER branch. This used to read `gfx_started.map(..)`, which
+        // is `None` on the audio branch, so `rsp_execution_ns` stayed 0 there
+        // and the `AUDIO_LLE_RSP_NS` accumulation at the bottom of this
+        // function (:384) -- already written, already plumbed through to
+        // `audio_lle_rsp_ms` -- reported 0.000 on every run since it was added.
+        //
+        // That dead timer is why "the audio RSP path runs at 8.3 ns/instr"
+        // circulated: with no audio measurement to divide by, the figure was
+        // built from the GRAPHICS numerator over the COMBINED gfx+audio step
+        // count. Same numerator, two denominators -- perf-method rule 2's
+        // error in a new costume. This makes the comparison possible.
+        //
+        // `PHASE_TIMING` gates both `gfx_started` and `non_gfx_started`, so an
+        // unset run still takes no clock read.
+        let rsp_started =
+            (gfx_started.is_some() || non_gfx_started.is_some()).then(std::time::Instant::now);
         let result = fn64_audio::rsp::run_imem(&words, pc, &mut machine, chunk);
         if let Some(started) = rsp_started {
             rsp_execution_ns = rsp_execution_ns.saturating_add(started.elapsed().as_nanos() as u64);
