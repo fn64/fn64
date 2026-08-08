@@ -686,6 +686,43 @@ free: RT64 renders into its own GPU surface, so the shell's readback and its
 `fb_width`/stride assumptions both need revisiting (the capture API
 `enable_present_capture()` + `presented_pixels()` already exists).
 
+## PLAYABLE: re-verified on screen at HEAD, 2026-08-08 (`1659c52`)
+
+The last on-screen proof predated both `f74e4e9` (RT64) and `abc7871` (the
+1.95x view threading), and both touch code `shell.rs` shares — so "playable"
+had become an assertion about a build that no longer existed. Re-checked:
+
+**No regression.** Clock advances `00:07` -> `00:38` -> `00:48` across three
+captures 30 s apart, two wrestlers in the ring, both ATTITUDE meters drawn.
+5,940+ frames, zero panics, **20/20 distinct `rgba_hash`** across the last 20
+heartbeats. A pixel diff puts **10.1% of pixels changed**, concentrated in the
+crowd band (**30.4%**) against a near-static ring floor (**1.0%**) — which
+proves the animation is real *and* that the camera is stable, so it is not
+global drift.
+
+The verdict was deliberately withheld at the versus presentation, because this
+file records it as a **looping** cinematic: a frame of it proves rendering, not
+gameplay.
+
+**Audio survived, strongest evidence to date:** `ai_buffers=5745`,
+`samples=6,023,424`, `nonzero=5,721,107`, `backend_buffers=5745`. Equal counts
+means **zero cpal drops**; 48 kHz negotiated from the guest's 32 kHz;
+`FN64_NO_AUDIO` unset.
+
+Binary `3021d32f` at `cf234b1`, isolated clean worktree, route `a9e1b25e`,
+**REFERENCE backend** — `wm2000-shell` hardcodes it, so this is not the RT64
+lane.
+
+**Windowed timing, and it is worse than headless:** steady-state `pump_ms` p50
+median **21.1 ms**, with **80 of 80 late heartbeats over the 16.667 ms
+deadline — 100%**, against headless's ~50%. The median sits in the same regime
+as headless 22.51, which *suggests* the 1.95x carried through, but that is not
+a measurement: `pump_ms` excludes the blit and the spans are unmatched. Two
+caveats travel with these numbers — the shell has **no warmup gate**, so the
+4M-step boot pump (`max=8740 ms`) owns `max` for the whole run, and the binary
+carries the `fn64-audio` `codegen-units=256` defect, making them a
+**pessimistic floor**.
+
 ## THE STANDING BAR: 16.667 ms/field, hardware parity
 
 The goal is **at least as good as original hardware, with the game playable**.
