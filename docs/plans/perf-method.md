@@ -466,6 +466,33 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+## CAVEAT ON EVERY NUMBER BELOW: they are HEADLESS, and RT64 is headless-only
+
+`examples/wm2000-block-boot/src/shell.rs` — the windowed binary — **hardcodes
+`ReferenceBackend`** (`:608-612`) and contains **zero** occurrences of
+`FN64_RENDER`. The selector `f74e4e9` added went into `src/main.rs` (headless)
+only, which has eleven. So:
+
+- **`FN64_RENDER=rt64` on `wm2000-shell` is silently ignored.** It does not
+  error and does not warn; the window renders with the software backend
+  regardless. Anyone who set it, saw the game run, and concluded "RT64 works
+  windowed" was reasonably but wrongly served. A warn-on-ignored-variable guard
+  is worth adding.
+- **The measured 1.35x is headless-with-RT64.** A player using the window gets
+  neither. If RT64's headless 1.28x is the right adjustment and the guard fix
+  carries over, the windowed figure lands near **1.73x** — but that is an
+  ESTIMATE, and estimating is how this file accumulated its dead ends.
+  **Windowed-at-HEAD has never been measured.**
+- This also reframes **blocker C** in `rt64-on-the-block-lane.md`. The
+  `with_registered_physical_rdram_read` readback concern at `shell.rs:903` was
+  never tested because there is no RT64 path in the window to test. It is a
+  hypothesis about code that does not exist yet, not an observed failure.
+
+Wiring the selector into the shell is the obvious follow-up, and it is not
+free: RT64 renders into its own GPU surface, so the shell's readback and its
+`fb_width`/stride assumptions both need revisiting (the capture API
+`enable_present_capture()` + `presented_pixels()` already exists).
+
 ## THE STANDING BAR: 16.667 ms/field, hardware parity
 
 The goal is **at least as good as original hardware, with the game playable**.
