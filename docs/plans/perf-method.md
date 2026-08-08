@@ -328,6 +328,65 @@ Two caveats, from the measurement rather than added later:
 - **Single run, not an A/B.** Menu-route run-to-run variance was ~±6%, so read
   52.79 as approximately **50–56 ms**.
 
+## RT64 on the gameplay route, 2026-08-07: 1.28x, and it is not enough
+
+Wired in `f74e4e9`, non-default `rt64` feature, `FN64_RENDER=reference|rt64`.
+Same route (`a9e1b25e`), 2.1M steps, **two interleaved pairs**, quiet machine.
+
+| | reference | rt64 | change |
+|---|---:|---:|---|
+| mean | 56.28 / 56.43 | **44.13 / 43.91** | **1.28x** |
+| p50 | 43.26 / 44.36 | **27.88 / 28.61** | **1.55x** |
+| p95 | 101.88 / 102.11 | 78.40 / 78.11 | 1.30x |
+| p99 | 104.04 / 105.51 | 80.14 / 78.74 | 1.32x |
+| over budget | 82.9% / 86.2% | 50.0% / 50.0% | -34pp |
+| **ratio A** | 3.38x / 3.39x | **2.65x / 2.63x** | |
+
+Ranges are **fully disjoint** and each lane reproduces within 0.5%, far inside
+the ±6% this file warns about. The correctness gate passes exactly in both
+reps — `gfx_submits=16586`, `audio_submits=11005`, `sp_tasks=27591`,
+`vi_interrupts=12008`, `controller_ops=3115`, identical `sim_time`,
+`render_error=None`. Same guest program, different host cost.
+
+Three things this settles:
+
+1. **RT64 does not reach 60fps.** 3.38x -> 2.64x. Another **2.64x**, or 27.4 ms
+   per frame, still has to come out. It is the largest single win measured and
+   it is not sufficient.
+2. **The 11.9x recorded in `rt64-throughput-win` does not transfer.** That was
+   the *function* lane. The block lane gets 1.28x, now measured on two routes
+   rather than extrapolated.
+3. **The speedup does not scale with graphics density, which is the surprise.**
+   The menu prefix (0.51 submits/field) gave 1.34x; the gameplay route at
+   **2.8x the density** gave 1.28x — slightly *less*. If rasterization were the
+   whole cost, a denser route should favor the GPU more. It does not, so a
+   large share of what RT64 was expected to remove is not rasterization.
+
+p50 improves 1.55x while the mean improves only 1.28x because `max` is ~1,450
+ms in **both** lanes: the backend-independent arena-load transient already
+noted above sits inside the steady window and drags both means equally. The
+median is the more honest figure here.
+
+**Correction to `rt64-on-the-block-lane.md`: headless is NOT present-free.**
+`pi::timing` pumps `present_render_backend` at every guest retrace whether or
+not a window exists, so blocker C's `PresentMemory::Physical` requirement is
+already exercised and satisfied on this lane. Only the post-present blit is
+moot.
+
+Two pre-existing bugs had to be fixed to get here, both invisible because the
+`rt64` feature is non-default and CI never typechecks it:
+
+- **`fn64-render-rt64 --features rt64` did not compile at all** — 48 errors, a
+  visibility regression from the #119 file split. Public API and `#[repr(C)]`
+  ABI unchanged. Its suite went 33 -> 71 tests, because 38 were unbuildable.
+- **RT64 aborted on WM2000's first VI present.** The C++ shim used **OR** over
+  the four H/V fields to decide "window active" where the Rust contract
+  (`ViActiveWindow::try_from_registers`) uses **AND**. WM2000's first retrace
+  has V_VIDEO programmed (`v=[37,511]`) and H_VIDEO still zero — a normal
+  not-yet-programmed state Rust skips. A cross-language contract divergence
+  that only a real guest walks into; pinned by a mutation-tested regression
+  test using the captured registers.
+
 ## Where the cost is, as of `e7c4d04`
 
 Quiet-machine deep route (19,523 steps, `FN64_MPROTECT_BARRIER=1`): **382-392 ms**.
