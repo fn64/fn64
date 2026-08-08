@@ -485,6 +485,16 @@ actually guard.
 
 ### The negative result that explains a contradiction
 
+**PARTIALLY SUPERSEDED 2026-08-08 — the measurement stands, the explanation
+does not.** The reachability bug below was real and `abc7871` fixed it, but the
+flag still measures nothing *after* that fix: **−0.14 ms/render-field over
+three interleaved pairs with the barrier ON** (see the corrected section under
+"The write barrier now SAVES 12.4 ms/field"). So the bug was **not the whole
+reason** this read as null. The dominant reason is that with the barrier on,
+the ungated scheduler-mirror reconcile arms one step ahead of the gated call,
+leaving it an empty dirty set to compare. Keep the diagnosis below as the
+history of a genuine defect; do not keep it as the explanation of this null.
+
 `FN64_FAST_MUTATION_JOURNAL=1` on the RT64 lane measures **+1.15% mean — nothing,
 wrong direction** — while the profiler attributes 44% of samples to the guard.
 Both are right, and the reason is a reachability bug:
@@ -659,18 +669,34 @@ asserted it as the *flag's* cost. One measurement doing duty in two different
 experiments.
 
 Measured properly — flag on vs off, **barrier ON in both lanes**, 2.1M steps,
-route `a9e1b25e`:
+route `a9e1b25e`, RT64, headless, quiet machine, **three interleaved pairs**:
 
-| | lane A (flag off) | lane B (flag on) | delta |
+| pair | lane A (flag off) | lane B (flag on) | delta |
 |---|---:|---:|---|
-| render field mean | 36.08 | 35.59 | **−0.49 ms (−1.36%)** |
-| off-field mean | 8.92 | 8.95 | +0.03 |
-| overall mean | 22.50 | 22.26 | −0.24 |
+| rep 1 | 36.08 | 35.59 | **−0.49 ms (−1.36%)** |
+| rep 2 | 35.71 | 35.91 | **+0.20 ms (+0.56%)** |
+| rep 3 | 35.72 | 35.58 | **−0.14 ms (−0.39%)** |
+| **mean** | | | **−0.14 ms, sd 0.35** |
 
-Guest byte-identical on all seven counters, so the flag does not change the
-emulated program. **Read this as indistinguishable from zero pending
-replication** — −1.36% sits far inside the documented ±6% band and it is one
-pair.
+**The deltas span both signs.** Within-lane spread across reps (A 0.37 ms,
+B 0.33 ms) is as large as the between-lane delta, which is the definition of a
+result inside noise. Off-field moved +0.03 / −0.03 / +0.16 — nil, as expected
+for a per-dispatch cost. Guest byte-identical on all seven counters in all six
+runs, so the flag does not change the emulated program.
+
+**Do not quote rep 1's −0.49 alone.** An earlier revision of this entry did,
+before replication, and it reads as a small win; the second pair reversed its
+sign. **−0.14 ms is 0.75% of the 19.17 ms the render field needs.**
+
+**Rule 6a — the lane check CAN fail, and it passed.** `barrier_served`
+increments only in `stats::note()`, reached only from `barrier_spans()`
+(`live_program.rs:372`, `:424`), both *below* the gate on the block path.
+Boundaries fell **7,716,048 → 5,911,979 (−1,804,069, −23.4%)**, reproducing
+bit-for-bit across both proof reps. It fell but **not to zero** — pre-registered
+as the required outcome, because the ungated mirror and host-ABI paths still
+call the same comparison. A drop to zero would have falsified the mechanism
+below; an unchanged count would have meant the flag never reached the gate and
+the A/B was invalid.
 
 **So the two historical "measures zero" entries were RIGHT, and for a reason
 this file already half-states**: with the barrier on, `matches_view` compares
@@ -690,6 +716,41 @@ absorption is the more likely one, and it survives the fix.
 A dead end is still scoped to the route that produced it. But **check first
 whether the experiment varied the thing the entry names** — that is the error
 here, and it is worse than a scoping mistake.
+
+**Why the second comparison is free, traced in source rather than profiled.**
+`host.rs:361-382` runs `mirror_guest_running_thread` **before** `run_one_step()`
+on every scheduling step; its own comment says *"this is a FULL watched-region
+journal reconcile ... and it runs on every step."* That reaches
+`reconcile_before_dispatch_from_view` (`live_program.rs:2205-2225`), which is
+**not gated by `continuous_snapshot_enabled()`** and arms the barrier on its
+match path. The gated call at `runners.rs:1033` then asks a freshly-armed
+region, gets an empty dirty set, and matches trivially. Removing it removes
+almost nothing — which is exactly what three pairs measured.
+
+**Correctness: the comment's justification is wrong, but the conclusion is
+roughly right, and the flag is not the lever anyway.** The comment at
+`live_program.rs:2162` says the comparison "only asserts that no undeclared
+write occurred, which write attribution already guarantees." Attribution does
+**not** guarantee that: `write_barrier.rs:52-57` lists `as_mut_slice`, the DMA
+paths, the RSP/renderer slices and raw `RdramPtr` stores as bypassing the
+declaration path, and `live_program.rs:2088-2094` records generated C shims
+writing guest memory below every attributed store — with a mitigation
+(`snapshot_for_host_shim` / `declare_host_shim_writes`) that has **zero
+non-test callers**. What saves the flag is not attribution but the *ungated*
+mirror: it re-runs the same comparison one step later, so an undeclared write
+is still caught, with at most one step of delay. **Do not cite the 0x0009b0b3
+incident as evidence against this flag** — that failure belongs to the reverted
+write-queue gate and to the baseline-*advancing* read, both of which
+`live_program.rs:2545-2560` distinguishes from this one in as many words.
+
+**Zero test coverage.** Full-tree grep finds three non-doc occurrences of
+`FN64_FAST_MUTATION_JOURNAL`, all inside `live_program.rs` itself. No gate, no
+script, no CI job runs the flag-on lane.
+
+**One separable defect worth fixing regardless.** The gate returns *above*
+three O(1) assertions — `assert_not_poisoned`, the `sealed` assert, and
+`PENDING_ATTRIBUTED_EXECUTABLE_WRITES == 0` (`live_program.rs:680-692`). Only
+the memcmp was meant to be skippable. Move the gate below the asserts.
 
 **The 17.8% sys-time GPU attribution is RETRACTED.** `/usr/bin/time -l` on the
 barrier-off control: 422.99 real / 398.97 user / **36.02 sys = 8.5%**, with
@@ -1317,6 +1378,98 @@ dirty (75% of barrier boundaries find nothing); the view path copies word-wise
 and may be far faster than 20 GB/s assumed here; and the 4.0x call ratio may
 not translate to a 4.0x cost ratio if the dirty set differs by population.
 
+### MEASURED: the 21.72 ms splits 39% apparatus / 55% guest+runtime. The mirror is 8.43 ms.
+
+Measured 2026-08-08 at `5f21996` + this instrument, route `a9e1b25e`, RT64,
+headless, 2.1M steps, quiet machine (load 2.98). Gate:
+`FN64_EXECUTOR_SPLIT=1`, separate from `FN64_PHASE_TIMING` so its perturbation
+is itself measurable. Guest byte-identical in both lanes — `gfx_submits=16586`,
+`audio_submits=11005`, `sp_tasks=27591`, `vi_interrupts=12008`,
+`controller_ops=3115`, `sim_time=18776001537`, `render_error=None`.
+
+**The render field, fully named for the first time.** Values corrected for the
+instrument's +4.6% perturbation (see below); shares are perturbation-robust.
+
+| phase | ms/field | share | kind |
+|---|---:|---:|---|
+| **mirror boundary** (`mirror_guest_running_thread`) | **8.43** | **23.8%** | apparatus |
+| `gfx_ns` (nested in the resume) | 12.53 | 35.3% | graphics |
+| — `gfx_lle_rdp_ns` | 7.04 | 19.0% | |
+| — `gfx_lle_rsp_ns` | 5.98 | 16.1% | |
+| **remainder inside the resume** | **11.96** | **33.7%** | see below |
+| `audio_lle_ns` | 1.14 | 3.2% | |
+| `vi_present_ns` | 1.14 | 3.2% | |
+| guard @ suspend | 0.037 | 0.1% | apparatus |
+| guard @ device | 0.038 | 0.1% | apparatus |
+| `run_one_step` residual | 0.014 | 0.0% | |
+
+**The mirror prediction was 14.41 ms; measured is 8.43 — the estimate was 1.7x
+high, and the falsifier it named is the reason.** The doc above guessed a
+20 GB/s word-wise memcmp over 0.29 GB/render-field. The real path takes the
+cheap early-out often enough to land at **32.06 µs per call** on render fields.
+Note it is *cheaper per call* on render fields than on off-fields (32.06 vs
+59.11 µs): it is a **per-step** cost, and render fields simply make 4.0x more
+steps. Its 2.17x population ratio against a 4.01x call ratio says so directly.
+
+**Two conclusions, and the second is the one that redirects work.**
+
+1. **The named apparatus is 8.51 ms — 24% of the field, not the majority.**
+   The brief's hypothesis was that executor self is "mostly apparatus". It is
+   not: the mutation journal's two per-yield/per-device seams measure
+   **0.075 ms combined**, essentially nothing, and the whole named guard is
+   under a quarter of the field. `FN64_FAST_MUTATION_JOURNAL`'s recorded zero
+   was not a reachability accident here — those seams really are cheap now.
+2. **A NEW 11.96 ms remainder appeared, and it is inside the coroutine
+   resume.** `resume NET` (resume minus mirror minus guard) is 26.80 ms, of
+   which `gfx_ns` accounts for 13.10 and audio 1.19. The 11.96 ms left over is
+   **translated guest code plus the runtime it calls synchronously** — RDRAM
+   reads/writes through `RdramView`, `translate`/`backing_offset`, the
+   per-instruction validation, and the dispatch loop's own
+   `reconcile_before_dispatch` at `runners.rs:1033`, which the explorer found
+   runs **once per loop iteration**, not once per step.
+
+**So "executor self" was two different things in one bucket:** a per-step
+apparatus boundary (the mirror, 8.43) and a per-step guest+runtime cost
+(11.96). At **45.47 µs per step** on render fields against 25.70 on off-fields,
+the remainder is mostly per-step with a per-submit component (7.09x total ratio
+against a 4.01x call ratio).
+
+**The 79 µs/call headline resolves as "many cheap operations".** A render-field
+step costs 130.5 µs inclusive; no single phase dominates it. The step count
+itself — 274.9 per render field against 68.5 — is the multiplier on everything,
+which makes *steps per field* a lever nobody has examined.
+
+**Instrument perturbation, and my own budget arithmetic was wrong.** Mean
+23.08 armed against 22.18 control, **+4.1%**; render field 37.09 vs 35.47,
+**+4.6%**. I predicted 0.029 ms/field from 33.8 ns × 856 clock reads and
+measured **1.62 ms — 56x that**. `Instant::now` is not the cost; the cost is
+what arming it does to the surrounding code (inlining, register pressure,
+branch layout in the hottest loop in the program). **Do not budget
+instrumentation by multiplying a microbenchmarked clock read by a call count.**
+The control at 22.18 sits just below the 22.36–22.41 band; the armed lane at
+23.08 is outside it, so the absolute ms above are corrected by the
+control/armed ratio and the *shares* are the robust figures. The two
+sub-0.1 ms guard rows are smaller than the perturbation and should be read as
+"below this instrument's resolution", not as precise values.
+
+**Flagging the RDP line as required, not absorbing it.** `gfx_lle_rdp_ns` is
+**7.04 ms/render-field against the 5.82 baseline, +20.9%**, while
+`gfx_lle_rsp_ns` is 5.98 against 6.08, **−1.7%**. That is the same asymmetric
+signature as the unexplained +8% drift recorded above (RDP up, RSP flat or
+down), at about half the magnitude, and it is present in the *control* lane
+too, so it is not my instrument. Still unexplained.
+
+**UPDATE 2026-08-08 — the drift is ABSENT in the `FN64_FAST_MUTATION_JOURNAL`
+A/B, reported as a negative because a drift that comes and goes is a different
+problem from one that persists.** Same route, same binary, same RT64 headless
+lane, `FN64_PHASE_TIMING=1`: `gfx_lle_rdp_ns` reads **5.85 ms/render-field
+against the 5.82 baseline (+0.5%)** and `gfx_lle_rsp_ns` **5.97 against 6.08
+(−1.8%)**. Both lanes agree (B: 5.87 / 6.04). So the +20.9% excursion did not
+reproduce, and whatever causes it is **intermittent between runs rather than a
+standing property of the route or of phase timing**. That rules out the
+simplest explanations — it is not the instrument, and it is not a permanent
+regression introduced between the baseline and now.
+
 ### FOUND IT: executor self is 21.72 ms — 61% of the render field, not graphics
 
 The "unaccounted 23.94 ms" was never unmeasured. It was in the population split
@@ -1579,6 +1732,147 @@ somebody should:
 Until that split exists, the 5.84 ms figure is misleading: it is the mean's
 distance from the bar, and the mean is not what fails.
 
+## ANSWERED: the guest renders at 30 Hz. The split is perfect alternation.
+
+Measured 2026-08-08 at `c2caafe` (the `fn64-audio` `codegen-units=1` lane),
+route `a9e1b25e`, RT64, headless, 2.1M steps, quiet machine. Instrument:
+`FN64_FRAME_CENSUS_POPULATIONS=1` plus `FN64_FRAME_CENSUS_SEQUENCE`.
+
+**Look at the sequence before any statistic.** 400 consecutive steady-state
+fields from field 2000, `S` = over budget, `f` = under:
+
+```
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+```
+
+**Zero defects in 400 fields.** Representative samples:
+
+| field | ms | new gfx submits |
+|---:|---:|---:|
+| 2000 | 38.290 | 3 |
+| 2001 | **8.758** | **0** |
+| 2002 | 37.160 | 3 |
+| 2003 | **8.354** | **0** |
+
+**WM2000 runs its main loop at 30 Hz.** It builds a display list on every
+second VI field; the off-field carries only audio, present, and the runtime
+floor. That is a normal N64 design choice, not a bug, and the emulator must
+still deliver 60 fields per second regardless.
+
+### The contingency table — submits *partition* the populations
+
+| | fast | slow |
+|---|---:|---:|
+| advance carried 0 new submits | **5,657** | 0 |
+| advance carried >=1 | 4 | **5,659** |
+| mean submits when nonzero | 1.00 | **2.88** |
+
+100.0% of slow fields carried a submit; 0.1% of fast fields did. **Four fields
+out of 11,321 break the pattern.** This is not an association, it is a
+partition.
+
+### The two populations
+
+| | fast | slow |
+|---|---:|---:|
+| fields | 5,661 (50.0%) | 5,660 (50.0%) |
+| mean | **8.89 ms** | **35.84 ms** |
+| p50 / p95 | 8.80 / 9.63 | 36.99 / 38.33 |
+| share of wall time | **19.9%** | **80.1%** |
+
+Ratio 4.03x. **The program spends 80% of its time in 50% of its fields**, and
+the off-field is at **0.53x the budget** — it has more than 7 ms of headroom.
+
+### The prediction that was right, and the one that was wrong
+
+The brief's hypothesis was "slow half carries ~2 submits, fast half ~1 ->
+submit batching". **That is wrong**, and it was ruled out by arithmetic before
+the run: one extra submit is worth ~7 ms, which would put both modes over
+budget (~19 and ~26) and cannot produce a fast mode at 8.9. The surviving
+version — **~2.9 vs ~0** — is what measured. The 1.44 submits/field average was
+itself the tell: 1.44 = 2.88 per two fields.
+
+### Counter ratios: 16 of 21 differ, but they are ONE finding
+
+Every differing counter is downstream of "this field carried 2.88 display
+lists": `gfx_ns` 5,708x, `rsp_steps_gfx` 10,819x, `dpc_calls` 4,071x,
+`gfx_lle_rsp_ns` 10,962x. Do not read them as sixteen independent leads.
+
+**The three that do NOT differ are the load-bearing ones:**
+
+| counter | ratio |
+|---|---:|
+| `audio_tasks` | 1.006x |
+| `audio_lle_ns` | 1.002x |
+| `rsp_steps_audio` | 1.003x |
+
+Audio runs flat at 60 Hz across both populations. **That is what proves the
+alternation is a guest rendering cadence and not a host artifact** — a host
+scheduling effect would modulate audio too.
+
+One counter **inverts**: `vi_present_ns` is **0.513x**, i.e. presentation costs
+*more* on the cheap field. Consistent with present being per-field work that
+merely looks smaller beside 27 ms of rendering.
+
+The barrier concentrates 3.8x on slow fields (991 vs 263 boundaries/field), so
+**the guard is not a flat per-field tax — it rides the submits.** This retires
+the reading of the 682-boundaries-per-field candidate as uniform overhead.
+
+### Rule 16 — a statistic that cannot distinguish "random" from
+### "periodic with the wrong period" is not a test for periodicity
+
+Rule 6a in statistical clothing. Lag-1 autocorrelation was the requested
+decision statistic, with a rule fixed before the data: strongly negative ->
+alternation, strongly positive -> contiguous phase blocks, near zero ->
+neither. Synthetic sequences through the same estimator:
+
+| shape | lag1 | lag2 | lag3 |
+|---|---:|---:|---:|
+| period-2 `fSfS` | **-1.00** | +0.99 | -0.99 |
+| period-4 `ffSS` | **+0.00** | -0.99 | -0.00 |
+| period-3 `fSS` | **-0.50** | -0.50 | +0.99 |
+
+**A period-4 sequence reads lag1 = +0.00 — dead centre of the "random" band —
+while being perfectly periodic.** Period-3 reads -0.50, which looks like weak
+alternation when the real signal is at lag 3. Reporting lag-1 alone could have
+produced a confident wrong answer to the exact question being asked.
+
+The measured lag table: **lag1 = -0.550**, lag2 +0.572, lag3 -0.558, lag4
++0.572, lag5 -0.558, lag6 +0.572. Odd lags negative, even positive, equal
+magnitude — the textbook period-2 signature.
+
+Note lag1 is **-0.550 and not -0.998** purely because each mode has internal
+variance (the slow mode spans 36.5-38.3 ms). The alternation itself is
+defect-free. **The coefficient understates a signal the printed string shows as
+perfect** — which is the whole argument for printing the string first. Had only
+the number been reported, -0.550 sits close enough to the -0.3 threshold to
+invite hedging about a result that is in fact exact.
+
+The instrument prints the raw pattern first, then lags 1..6, then the
+contingency table. Decision rule and the period-3/period-4 blind spots are
+pinned as tests.
+
+### What this means for the bar
+
+**The ceiling on any fix aimed only at the slow half is the fast mean, 8.89
+ms/field = 0.53x budget — it clears the bar with 7.8 ms to spare.** So the
+population split is not merely diagnostic; the fix has room.
+
+But state the requirement correctly. The slow field must absorb **2.88 display
+lists in 16.667 ms** and currently takes 35.84. That is a **2.15x reduction on
+the rendering field specifically**, not a mean shave — and note the mean-based
+framing (5.84 ms, 26%) understates it, because averaging the requirement across
+an off-field that already has 7.8 ms of headroom flatters it.
+
+**Every queued mean-shaver is now sized against the wrong denominator.** The
+`run_imem` double-decode, the clean-boundary count and the DPC staging copy all
+distribute their savings across both populations; only the ~50% landing on the
+rendering field counts toward the bar.
+
 ## THE STANDING BAR: 16.667 ms/field, hardware parity
 
 The goal is **at least as good as original hardware, with the game playable**.
@@ -1817,9 +2111,13 @@ verdict. For that, use a real `git worktree` checkout.
 - **Caching activation on `guest_write_token`.** Unsound. Its zero-consumer
   property is a *cited premise* of a written safety argument
   (`dispatch-granularity.md:570`).
-- **An async guard worker.** Sound but worthless: deleting the whole journal
-  (`FN64_FAST_MUTATION_JOURNAL=1`) measures **0 ms**, and a thread cannot beat
-  deletion.
+- **An async guard worker.** Sound but worthless: the flag it would race
+  against (`FN64_FAST_MUTATION_JOURNAL=1`) measures **−0.14 ms/render-field,
+  inside noise** (three interleaved pairs, barrier ON — see "MEASURED:
+  `FN64_FAST_MUTATION_JOURNAL` costs nothing with the barrier on"), and a
+  thread cannot beat deletion of something that is already free. Note the flag
+  does **not** delete "the whole journal": write attribution, sealing, the
+  per-generation digest and two other comparison sites all keep running.
 - **`codegen-units` / LTO / `target-cpu=native` on the shards.** 10% for a
   9-minute build, or 2.3x *slower* with all three.
 - **`with_executor`'s `RefCell` borrow.** One call per scheduling step from
@@ -1898,3 +2196,15 @@ Reaching 1.0x therefore needs **both** halves:
 Note `FN64_FAST_MUTATION_JOURNAL=1` already measures **zero** difference
 (435 ms vs 441 ms): the barrier absorbed that cost, so the removable 47% is not
 sitting idle waiting to be switched off.
+
+**CONFIRMED 2026-08-08, and this entry's stated reason was the correct one.**
+Re-measured on the *rendering* route (`a9e1b25e`, RT64, barrier ON in both
+lanes, three interleaved pairs): **−0.14 ms/render-field, sd 0.35, deltas
+spanning both signs.** "The barrier absorbed that cost" is now traced to a
+specific mechanism — the ungated scheduler-mirror reconcile arms the barrier
+one step ahead of the gated call, so the gated comparison finds an empty dirty
+set. See the corrected section above. Two cautions on the figures *here*
+though: 435/441 ms are **whole-run totals, not ms/field**, and they come from
+the 19,523-step route that renders nothing (rule 11), so this entry's number
+never transferred to a rendering route in the first place — the agreement with
+the new measurement is a real result, not a restatement.
