@@ -62,6 +62,58 @@ thread_local! {
         Cell::new(std::env::var_os("FN64_PHASE_TIMING").is_some());
     pub(crate) static EXECUTOR_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static EXECUTOR_CALLS: Cell<u64> = const { Cell::new(0) };
+
+    /// Split `EXECUTOR_NS` -- which has no sub-counters and measured 21.72 ms
+    /// of a 35.84 ms WM2000 render field (61%, larger than all of graphics) --
+    /// into named phases inside `host::run_one_step`.
+    ///
+    /// A SEPARATE gate from `PHASE_TIMING`, deliberately. These timers sit in
+    /// the hottest loop in the program: `run_one_step` runs 274.9 times per
+    /// render field, and the guard checkpoint below runs on EVERY coroutine
+    /// yield, which is more often still. `Instant::now` is not free at that
+    /// rate, so an unconditional split would perturb the very quantity it
+    /// exists to explain. Keeping it independent means the perturbation is
+    /// itself measurable: run `FN64_PHASE_TIMING` alone, then with
+    /// `FN64_EXECUTOR_SPLIT`, and diff the mean (perf-method's standing
+    /// requirement to report instrument perturbation).
+    ///
+    /// `is_some()` rather than a truthiness parse matches `PHASE_TIMING`
+    /// above; every other new gate in this crate uses `env_flag`, but
+    /// consistency with the counter this one nests inside matters more here.
+    pub(crate) static EXECUTOR_SPLIT: Cell<bool> =
+        Cell::new(std::env::var_os("FN64_EXECUTOR_SPLIT").is_some());
+    /// `mirror_guest_running_thread` -- the SCHEDULER-SELECTION journal
+    /// boundary, which runs in `host::run_one_step`'s prologue on every step,
+    /// OUTSIDE the coroutine resume.
+    ///
+    /// Called out separately because its cost is invisible from the call
+    /// site: the name says "write the running-thread word", and under
+    /// `recomp-rs` it delegates to `commit_scheduler_running_thread_mirror`,
+    /// which reconciles the WHOLE watched region (1 MiB on WM2000) because
+    /// scheduler selection is a dispatch boundary. At 274.9 steps per render
+    /// field that is 274.9 full-region reconciles per field, and nothing in
+    /// the existing counters distinguishes it from the guest's own work.
+    pub(crate) static EXEC_MIRROR_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static EXEC_MIRROR_CALLS: Cell<u64> = const { Cell::new(0) };
+    /// `Executor::run_one_step` INCLUSIVE: scheduler pick, the coroutine
+    /// resume, and the yield handling. Everything `run_one_step` does except
+    /// `advance_device_time`.
+    pub(crate) static EXEC_RESUME_NS: Cell<u64> = const { Cell::new(0) };
+    /// `crate::pi::advance_device_time(now)` INCLUSIVE -- the device-fabric
+    /// commit that `host::run_one_step` runs after a step returns.
+    pub(crate) static EXEC_DEVTIME_NS: Cell<u64> = const { Cell::new(0) };
+    /// `checkpoint_catalog_host_transaction_before_suspend` -- the mutation
+    /// journal flush on every coroutine yield. NESTED INSIDE
+    /// `EXEC_RESUME_NS`: it runs on the guest's own stack, called by the
+    /// `_recomp` shim that is suspending. Not a peer of the resume.
+    pub(crate) static EXEC_GUARD_SUSPEND_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static EXEC_GUARD_SUSPEND_CALLS: Cell<u64> = const { Cell::new(0) };
+    /// `process_live_executable_writes_from_host` -- the journal's
+    /// device-originated-write reconciliation. NESTED INSIDE
+    /// `EXEC_DEVTIME_NS`.
+    pub(crate) static EXEC_GUARD_DEVICE_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static EXEC_GUARD_DEVICE_CALLS: Cell<u64> = const { Cell::new(0) };
+
     pub(crate) static GFX_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_CALLS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static GFX_LLE_NS: Cell<u64> = const { Cell::new(0) };
@@ -70,6 +122,21 @@ thread_local! {
     pub(crate) static GFX_LLE_RDP_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_NS: Cell<u64> = const { Cell::new(0) };
     pub(crate) static AUDIO_DISPATCH_CALLS: Cell<u64> = const { Cell::new(0) };
+    /// VI retrace presentation (`present_render_backend` -> `RenderBackend::
+    /// present`, which for the reference backend is the whole `vi::scanout`
+    /// filter chain). Timed separately from `GFX_NS` because presentation is
+    /// a PER-FIELD cost that does not scale with scene complexity, while
+    /// graphics task dispatch is per submit: conflating them hides a fixed
+    /// per-frame overhead inside a variable one.
+    pub(crate) static VI_PRESENT_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static VI_PRESENT_CALLS: Cell<u64> = const { Cell::new(0) };
+    /// Non-graphics LLE (the audio ucode under `LleAccuracy`). Distinct from
+    /// `AUDIO_DISPATCH_NS`, which only covers the `Translated` callback path
+    /// -- a lane WM2000 does not take, so that counter reads zero while the
+    /// interpreter runs thousands of tasks.
+    pub(crate) static AUDIO_LLE_NS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static AUDIO_LLE_CALLS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static AUDIO_LLE_RSP_NS: Cell<u64> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +338,15 @@ pub fn copy_audio_digest_bytes() -> Option<Vec<u8>> {
     AUDIO_DIGEST_CAPTURE.with(|cell| cell.borrow().clone())
 }
 
+/// The registered backend's cumulative host-stream delivery counters, or
+/// `None` when no backend is registered or the backend does not track them.
+///
+/// `max_callback_gap_us` is measured on cpal's own realtime thread, which
+/// makes it the one statistic reachable from here that observes the HOST
+/// rather than the guest. That is what lets a frame-latency investigation
+/// separate the two: if the emulation thread stalls for seconds while the
+/// audio callback keeps its cadence, the stall is ours; if both stop together,
+/// it is the machine's.
 pub fn audio_stream_health() -> Option<fn64_audio::AudioStreamHealth> {
     AUDIO_BACKEND.with(|cell| {
         cell.borrow()
@@ -301,6 +377,58 @@ pub struct PhaseTiming {
     pub gfx_lle_rdp_ns: u64,
     pub audio_dispatch_ns: u64,
     pub audio_dispatch_calls: u64,
+    /// VI retrace presentation: the reference backend's `vi::scanout` filter
+    /// chain, once per emulated field. Not nested inside `gfx_ns`.
+    pub vi_present_ns: u64,
+    pub vi_present_calls: u64,
+    /// Audio (non-graphics) LLE microcode interpretation. Not nested inside
+    /// `gfx_ns`; disjoint from `audio_dispatch_ns`.
+    pub audio_lle_ns: u64,
+    pub audio_lle_calls: u64,
+    pub audio_lle_rsp_ns: u64,
+
+    // ---- `executor_ns` split, from `FN64_EXECUTOR_SPLIT`. Zero when unset.
+    //
+    // NESTING, stated here because reading an inclusive counter as a peer of
+    // its parent is precisely how the 21.72 ms these exist to explain stayed
+    // hidden (perf-method rule 2):
+    //
+    //   executor_ns                              (host::run_one_step, total)
+    //     |- exec_resume_ns                      (the whole `with_executor`)
+    //     |    |- exec_mirror_ns                 (scheduler-selection boundary)
+    //     |    `- exec_guard_suspend_ns          (journal flush, per yield)
+    //     `- exec_devtime_ns                     (pi::advance_device_time)
+    //          `- exec_guard_device_ns           (journal device-write scan)
+    //
+    // `exec_mirror_ns` is nested INSIDE `exec_resume_ns`, not a peer of it:
+    // the mirror runs within the `with_executor` closure, before the
+    // coroutine resume. So the guest-plus-runtime figure is
+    // `exec_resume_ns - exec_mirror_ns - exec_guard_suspend_ns`, and
+    // `exec_resume_ns + exec_devtime_ns <= executor_ns`. The shortfall
+    // against `executor_ns` is `host::run_one_step`'s own frame: the
+    // `ReentrantCell` access, `peek_next_thread`, `with_rearmed_context`, and
+    // the counter updates themselves. The census reports that shortfall as an
+    // explicit residual rather than letting it hide -- an unnamed remainder is
+    // how the 21.72 ms got lost in the first place.
+    /// `mirror_guest_running_thread`: the scheduler-selection journal
+    /// boundary, once per step, outside the resume. Nested inside
+    /// `executor_ns`, disjoint from `exec_resume_ns`.
+    pub exec_mirror_ns: u64,
+    pub exec_mirror_calls: u64,
+    /// `Executor::run_one_step` inclusive: scheduler pick + coroutine resume
+    /// + yield handling. Nested inside `executor_ns`.
+    pub exec_resume_ns: u64,
+    /// `pi::advance_device_time` inclusive. Nested inside `executor_ns`,
+    /// disjoint from `exec_resume_ns`.
+    pub exec_devtime_ns: u64,
+    /// Mutation-journal flush at coroutine suspend. Nested inside
+    /// `exec_resume_ns` -- it runs on the guest's own stack.
+    pub exec_guard_suspend_ns: u64,
+    pub exec_guard_suspend_calls: u64,
+    /// Mutation-journal reconciliation of device-originated writes. Nested
+    /// inside `exec_devtime_ns`.
+    pub exec_guard_device_ns: u64,
+    pub exec_guard_device_calls: u64,
 }
 
 pub fn phase_timing() -> PhaseTiming {
@@ -315,7 +443,44 @@ pub fn phase_timing() -> PhaseTiming {
         gfx_lle_rdp_ns: GFX_LLE_RDP_NS.with(Cell::get),
         audio_dispatch_ns: AUDIO_DISPATCH_NS.with(Cell::get),
         audio_dispatch_calls: AUDIO_DISPATCH_CALLS.with(Cell::get),
+        vi_present_ns: VI_PRESENT_NS.with(Cell::get),
+        vi_present_calls: VI_PRESENT_CALLS.with(Cell::get),
+        audio_lle_ns: AUDIO_LLE_NS.with(Cell::get),
+        audio_lle_calls: AUDIO_LLE_CALLS.with(Cell::get),
+        audio_lle_rsp_ns: AUDIO_LLE_RSP_NS.with(Cell::get),
+        exec_mirror_ns: EXEC_MIRROR_NS.with(Cell::get),
+        exec_mirror_calls: EXEC_MIRROR_CALLS.with(Cell::get),
+        exec_resume_ns: EXEC_RESUME_NS.with(Cell::get),
+        exec_devtime_ns: EXEC_DEVTIME_NS.with(Cell::get),
+        exec_guard_suspend_ns: EXEC_GUARD_SUSPEND_NS.with(Cell::get),
+        exec_guard_suspend_calls: EXEC_GUARD_SUSPEND_CALLS.with(Cell::get),
+        exec_guard_device_ns: EXEC_GUARD_DEVICE_NS.with(Cell::get),
+        exec_guard_device_calls: EXEC_GUARD_DEVICE_CALLS.with(Cell::get),
     }
+}
+
+/// Accumulate `elapsed` ns and one call against an `FN64_EXECUTOR_SPLIT`
+/// counter pair. Saturating: a counter that wrapped would read as a wildly
+/// negative delta in the census's `saturating_sub`, which is worse than a
+/// pinned maximum.
+pub(crate) fn note_executor_split(
+    ns: &'static std::thread::LocalKey<Cell<u64>>,
+    calls: Option<&'static std::thread::LocalKey<Cell<u64>>>,
+    elapsed: u64,
+) {
+    ns.with(|total| total.set(total.get().saturating_add(elapsed)));
+    if let Some(calls) = calls {
+        calls.with(|c| c.set(c.get().saturating_add(1)));
+    }
+}
+
+/// True when `FN64_EXECUTOR_SPLIT` armed the sub-counters. Callers use this to
+/// skip `Instant::now` entirely on an unset run -- the split's timers sit in
+/// the hottest loop in the program (274.9 `run_one_step` calls and ~991 guard
+/// checkpoints per render field), so "arm the clock and discard the result"
+/// is not an acceptable off state.
+pub(crate) fn executor_split_enabled() -> bool {
+    EXECUTOR_SPLIT.with(Cell::get)
 }
 
 /// Total accumulated recompiled-audio-ucode time (ns) and call count since
