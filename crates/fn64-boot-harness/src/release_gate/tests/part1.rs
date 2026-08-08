@@ -9,9 +9,18 @@ fn device_state_v16_component_refactor_preserves_golden_wire() {
         crate::ProgramEvidenceSnapshot::NoProgram,
     );
     assert_eq!(bytes.len(), 8_860);
+    // Repinned in 8c54a81's wake. That commit gave FlashRAM a real status
+    // register, so `FlashState::default().status` moved from 0x00 to
+    // FLASH_STATUS_READY (0x80) -- DQ7 high means "ready", and an idle chip is
+    // ready, so 0x00 had meant "permanently busy". The wire shape is unchanged:
+    // the encoding is still 8,860 bytes and a byte-for-byte diff of the golden
+    // wire before and after that commit differs in exactly one position,
+    // offset 8746, which is the `flash.status` byte (it is followed by
+    // flash_type 0x11118001 and flash_maker 0x00C2001E). Value change, not a
+    // format change.
     assert_eq!(
         sha256_hex(&bytes),
-        "8fad6de2c8ffb517e0e7bd3abd41a2c20015797c6353b385af635be7ae784f89"
+        "5c9aeea87f6afb6aee77f9ec8c9168208fabb124503c0a6d51698971f3483e2d"
     );
 }
 
@@ -1357,9 +1366,12 @@ fn live_gate_rejects_function_execution_destination_before_arm() {
 fn schema_v29_fixed_cycle_digest_is_stable_and_complete() {
     assert_eq!(complete_digest(), complete_digest());
     assert_eq!(complete_digest().artifacts.len(), 5);
+    // Downstream of the same single byte: `complete_digest` captures the device
+    // snapshot through the golden wire repinned above, so 8c54a81's flash-status
+    // default moved this root too. Same cause, not an independent change.
     assert_eq!(
         complete_digest().root_sha256,
-        "3de3abd5723bf4b6dd63b970f3f881a08c7dfec4f6d36df16e12bf6e6505f8a6"
+        "1fce3630784c0954d2c90a5f17cfc72ce2dd8c50ab2180566a8f93db11f84ff9"
     );
 }
 

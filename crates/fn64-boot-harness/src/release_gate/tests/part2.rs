@@ -765,8 +765,14 @@ fn device_state_v16_wire_binds_executor_and_abi_host_families() {
     );
     changed_host!(
         "Flash sequencer",
+        // Perturb relative to the baseline rather than assigning a literal.
+        // This assertion previously wrote 0x80, which silently stopped being a
+        // mutation when `FlashState::default().status` became FLASH_STATUS_READY
+        // (0x80) in 8c54a81 -- the coverage claim then passed vacuously and the
+        // `assert_ne!` failed against an unchanged digest. Flipping a bit keeps
+        // the probe honest under any future default.
         |value: &mut fn64_abi::AbiHostEvidenceSnapshot| {
-            value.flash.status = 0x80;
+            value.flash.status ^= 0x20;
         }
     );
     changed_host!(
