@@ -822,10 +822,32 @@ pub(crate) fn begin_catalog_nested_writer(
             state.borrow().assert_not_poisoned();
         }
         if let Some(thread) = thread {
+            // Hand the view over as well as the byte reader, exactly as
+            // `checkpoint_catalog_host_transaction_before_suspend` does.
+            //
+            // This was the last caller of the view-less
+            // `flush_active_host_abi_transaction_with`. Without a view,
+            // `flush_host_abi_transaction_inner` cannot take the
+            // `changed_ranges_from_view` arm and falls to
+            // `read_snapshot(&mut read_physical_byte)` -- the whole watched
+            // region rebuilt through a per-byte closure -- and then hands
+            // `None` down again, so `invalidate_pending_physical_writes_inner`
+            // repeats it. On WM2000 that region is the 1 MiB boot bank and
+            // this runs on every nested-writer entry (RSP LLE dispatch, HLE
+            // rspboot, verified-audio publication, tracked renderer/RSP
+            // publication), so the seam paid two per-byte rebuilds per entry.
+            //
+            // The byte reader stays: `changed_ranges_from_view` returns `None`
+            // for an unsealed state or a watched byte outside storage, and the
+            // copying fallback must remain reachable so the panic an unmapped
+            // byte owes is raised by the code that owes it. Passing `Some`
+            // only opts into the ATTEMPT; it removes no fallback.
             let view = fn64_runtime::RdramView::from_storage(rdram);
-            live.flush_active_host_abi_transaction_with(thread, |physical| {
-                view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
-            });
+            live.flush_active_host_abi_transaction_from_view(
+                thread,
+                |physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)),
+                Some(&view),
+            );
         }
     }
     let transaction_id = live.as_ref().and_then(|live| {
