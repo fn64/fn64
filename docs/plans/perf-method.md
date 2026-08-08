@@ -1003,6 +1003,44 @@ throughout (`gfx_submits=16586`, `audio_submits=11005`, `sp_tasks=27591`,
 `vi_interrupts=12008`, `controller_ops=3115`, `sim_time=18776001537`,
 `render_error=None`).
 
+### 67% OF THE RENDER FIELD IS UNACCOUNTED FOR — and that is the real target
+
+Modern hardware is orders of magnitude faster than an N64. It should not be
+close. The measured lines say it is not the emulation of the console's *work*
+that breaks the bar:
+
+| line | ms | fits in 16.667 alone? |
+|---|---:|---|
+| RSP gfx interpretation | 6.08 | **yes, with 10.6 ms to spare** |
+| raw RDP seam | 5.82 | **yes** |
+| **named total** | **11.90** | |
+| **UNACCOUNTED** | **23.94** | **67% of the render field** |
+
+**Deleting both "biggest" lines entirely still leaves 23.94 ms = 1.44x
+budget.** They were ranked as 62% of the *requirement*; they are only 33% of
+the *field*. Sizing candidates against the 19.17 ms gap made them look
+decisive when the field is 35.84 ms and most of it has no name.
+
+Two corroborating measurements make this sharper:
+
+- **RSP interpretation is uniform at 11.25/11.27 ns per instruction** across
+  graphics and audio (`a54cf21`) — same run, same timer, −0.1% apart, against
+  run-to-run drift of 6.6%. So the interpreter is **large, not slow**: 526,161
+  instructions per render field at a rate with no defect in it. There is no
+  interpreter bug to find.
+- At ~39 cycles per RSP instruction on a ~3.5 GHz core, interpretation is
+  already in the normal range for emulating a vector coprocessor
+  instruction-by-instruction.
+
+**So the next measurement is not another candidate — it is finding the 23.94
+ms.** The phase counters cover graphics, audio, VI present and the guard;
+whatever holds two-thirds of the render field is either outside every counter
+or inside "executor self", which was 12.58 ms averaged over *all* fields and
+has never been split by population.
+
+Until that is named, every ranked candidate above is a minority share of a
+field whose majority cost is unidentified.
+
 ### Candidates re-sized against the render field (19.17 ms)
 
 | candidate | on the render field | % of 19.17 |
