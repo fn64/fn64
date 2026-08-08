@@ -1368,6 +1368,39 @@ the *binary* returns 0 and means nothing — the string is built at runtime from
 the `rt64` arm panics rather than falling back, so a mislabeled
 reference-backend number is not possible on this lane.
 
+### 20. Test the verifier on this machine, not just its logic
+
+The lane gate built to enforce rule 19 **crashed instead of verifying**:
+
+```
+find: Can't parse date/time: @1786223147
+```
+
+`find -newermt "@<epoch>"` is **GNU syntax; BSD `find` on macOS rejects it**. The
+gate had been tested against synthetic inputs and correctly failed all three
+bad-lane scenarios — but that testing exercised its *logic*, never its
+*portability*. On the real machine it aborted before counting anything.
+
+**It failed safe, which is the one good thing here**: no binary was stashed, so
+nothing unverified reached the benchmark. A gate that crashes is far better than
+one that passes on error — but it still cost a cycle, and a differently-written
+gate would have silently returned zero matches and reported a clean lane.
+
+Portable form, verified on this machine:
+
+```sh
+STAMPREF=$(mktemp /tmp/lane-stamp.XXXXXX)
+touch -t "$(date -r "$STAMP" +%Y%m%d%H%M.%S)" "$STAMPREF"
+find <dir> -name runner.rs -newer "$STAMPREF"
+rm -f "$STAMPREF"
+```
+
+The general rule: **a verification script is itself code that can be wrong, and
+synthetic-input testing does not cover the environment.** Run it once against
+the real tree before trusting it to gate a measurement — and prefer a
+construction whose failure mode is a crash over one whose failure mode is an
+empty result set, because empty reads as "clean" (rules 18 and 19).
+
 ### 19. A size difference proves "something changed", never "the thing you meant"
 
 I asserted two A/B binaries were the right lanes because one was **4.4 MB
