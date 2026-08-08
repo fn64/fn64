@@ -45,6 +45,40 @@ M ns each" from a profile got both numbers wrong. Twelve `FN64_*_CENSUS` /
 `_SYSCALLS` / `_STATS` gates exist in `fn64-abi` for exactly this. Add one
 rather than infer.
 
+### 6a. Before trusting a lane check, confirm it can FAIL
+**A check that returns the same answer regardless of the state it is checking
+is not a check.**
+
+Rule 6 says prove the lanes differ. This is the trap one level up: a
+*verification* that cannot distinguish the two outcomes it exists to
+distinguish. Caught 2026-08-08, mid-run, by the agent that had just written the
+check.
+
+The lane-activation check grepped the per-lane logs for
+`registered rt64 renderer`. That string **can never appear there**:
+`render-benchmark.zsh:222` pipes stdout through a whitelist —
+`^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done`
+— and the renderer line matches none of it. So the check would have reported
+the string absent in **all four logs, in both lanes**, whether RT64 was active
+or not. The dangerous reading is not "could not confirm"; it is glancing at
+four identical absences, calling them "no anomaly", and shipping the number.
+That is the exact shape of the env gate that fabricated a 4.9x — rebuilt from
+scratch by someone who knew that history.
+
+**The ten-second test: run the check against the lane it is supposed to
+reject.** Grepping lane A's log for `reference` also returned nothing, which
+would have exposed it immediately.
+
+The evidence did exist, in the unfiltered `tee` target
+`/tmp/fn64-render-benchmark.log`: `[wm2000-block-boot] registered rt64 renderer
+(320x240)`. Two consequences worth keeping:
+
+- **That path is fixed and every run overwrites it.** Four sequential runs
+  leave activation evidence for only the last. Snapshot it per-run.
+- **Two concurrent benchmarks silently corrupt each other's logs**, entirely
+  independent of CPU contention — an additional reason the serialization
+  protocol is load-bearing, beyond rule 4a.
+
 ### 4a. `rustc` is not the only thing that steals a core
 `XProtectRemediatorPirrit` — a macOS malware scan — was observed at **97.5% of
 a full core** on this machine, unannounced and unrelated to any agent. A
