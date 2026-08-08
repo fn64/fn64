@@ -1162,6 +1162,22 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+### 18. `pcpu` and `pgrep -f` both lie about this workload
+Two liveness checks that read plausibly and are wrong, both rule-15 shapes,
+both caught in practice on this project:
+
+- **`pcpu` reads 0.0 while the benchmark is running at 100%.** A healthy run
+  was nearly declared hung on that basis. **CPU TIME advancing is the only
+  honest liveness check** — sample it twice and compare.
+- **`pgrep -f wm2000-block-boot` counts your own monitoring shells**, and any
+  `eval`/snapshot wrapper whose command line contains the string. It reported
+  **2 concurrent benchmarks when there was 1**. Match on args and exclude the
+  wrappers, or count by CPU.
+
+A third instance of the same family: sampling a **recycled PID** that now
+belongs to an unrelated process. A PID is not a durable handle; re-verify the
+identity, not just the number.
+
 ### 17. Do not budget instrumentation cost by counting clock reads
 An agent predicted its five new timers would cost **0.029 ms/field** — 33.8 ns
 measured per `Instant` pair × 856 reads. Measured: **+1.62 ms/field, +4.6% on
