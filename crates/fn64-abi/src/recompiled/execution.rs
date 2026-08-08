@@ -445,7 +445,24 @@ fn register_live_executable_region_config(
 /// Apply DMA-originated executable writes after the device fabric has
 /// committed all bytes, but before it publishes completion messages or any
 /// guest coroutine can resume.
+///
+/// Wrapped for `FN64_EXECUTOR_SPLIT` on the same reasoning as
+/// `checkpoint_catalog_host_transaction_before_suspend` above.
 pub(crate) fn process_live_executable_writes_from_host() {
+    match crate::task_dispatch::executor_split_enabled().then(std::time::Instant::now) {
+        Some(at) => {
+            process_live_executable_writes_from_host_inner();
+            crate::task_dispatch::note_executor_split(
+                &crate::task_dispatch::EXEC_GUARD_DEVICE_NS,
+                Some(&crate::task_dispatch::EXEC_GUARD_DEVICE_CALLS),
+                at.elapsed().as_nanos() as u64,
+            );
+        }
+        None => process_live_executable_writes_from_host_inner(),
+    }
+}
+
+fn process_live_executable_writes_from_host_inner() {
     let (catalog, live) = with_host(|host| {
         (
             host.canonical_recompiled_program.clone(),
@@ -521,7 +538,25 @@ pub(crate) fn process_live_executable_writes_from_host() {
 /// `HostAbi write -> coroutine suspend -> device/other-thread same-byte write
 /// -> HostAbi resume`: the parent prefix advances the canonical baseline before
 /// any child or different guest coroutine can run.
+///
+/// Wrapped for `FN64_EXECUTOR_SPLIT` rather than timed at its two call sites
+/// in `suspend_active_coroutine`: a wrapper cannot drift out of sync with the
+/// call sites, and a third caller added later is timed automatically.
 pub(crate) fn checkpoint_catalog_host_transaction_before_suspend() {
+    match crate::task_dispatch::executor_split_enabled().then(std::time::Instant::now) {
+        Some(at) => {
+            checkpoint_catalog_host_transaction_before_suspend_inner();
+            crate::task_dispatch::note_executor_split(
+                &crate::task_dispatch::EXEC_GUARD_SUSPEND_NS,
+                Some(&crate::task_dispatch::EXEC_GUARD_SUSPEND_CALLS),
+                at.elapsed().as_nanos() as u64,
+            );
+        }
+        None => checkpoint_catalog_host_transaction_before_suspend_inner(),
+    }
+}
+
+fn checkpoint_catalog_host_transaction_before_suspend_inner() {
     let Some(thread) = crate::ACTIVE_THREAD_ID.with(Cell::get) else {
         return;
     };

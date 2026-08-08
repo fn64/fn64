@@ -1133,6 +1133,87 @@ dirty (75% of barrier boundaries find nothing); the view path copies word-wise
 and may be far faster than 20 GB/s assumed here; and the 4.0x call ratio may
 not translate to a 4.0x cost ratio if the dirty set differs by population.
 
+### MEASURED: the 21.72 ms splits 39% apparatus / 55% guest+runtime. The mirror is 8.43 ms.
+
+Measured 2026-08-08 at `5f21996` + this instrument, route `a9e1b25e`, RT64,
+headless, 2.1M steps, quiet machine (load 2.98). Gate:
+`FN64_EXECUTOR_SPLIT=1`, separate from `FN64_PHASE_TIMING` so its perturbation
+is itself measurable. Guest byte-identical in both lanes — `gfx_submits=16586`,
+`audio_submits=11005`, `sp_tasks=27591`, `vi_interrupts=12008`,
+`controller_ops=3115`, `sim_time=18776001537`, `render_error=None`.
+
+**The render field, fully named for the first time.** Values corrected for the
+instrument's +4.6% perturbation (see below); shares are perturbation-robust.
+
+| phase | ms/field | share | kind |
+|---|---:|---:|---|
+| **mirror boundary** (`mirror_guest_running_thread`) | **8.43** | **23.8%** | apparatus |
+| `gfx_ns` (nested in the resume) | 12.53 | 35.3% | graphics |
+| — `gfx_lle_rdp_ns` | 7.04 | 19.0% | |
+| — `gfx_lle_rsp_ns` | 5.98 | 16.1% | |
+| **remainder inside the resume** | **11.96** | **33.7%** | see below |
+| `audio_lle_ns` | 1.14 | 3.2% | |
+| `vi_present_ns` | 1.14 | 3.2% | |
+| guard @ suspend | 0.037 | 0.1% | apparatus |
+| guard @ device | 0.038 | 0.1% | apparatus |
+| `run_one_step` residual | 0.014 | 0.0% | |
+
+**The mirror prediction was 14.41 ms; measured is 8.43 — the estimate was 1.7x
+high, and the falsifier it named is the reason.** The doc above guessed a
+20 GB/s word-wise memcmp over 0.29 GB/render-field. The real path takes the
+cheap early-out often enough to land at **32.06 µs per call** on render fields.
+Note it is *cheaper per call* on render fields than on off-fields (32.06 vs
+59.11 µs): it is a **per-step** cost, and render fields simply make 4.0x more
+steps. Its 2.17x population ratio against a 4.01x call ratio says so directly.
+
+**Two conclusions, and the second is the one that redirects work.**
+
+1. **The named apparatus is 8.51 ms — 24% of the field, not the majority.**
+   The brief's hypothesis was that executor self is "mostly apparatus". It is
+   not: the mutation journal's two per-yield/per-device seams measure
+   **0.075 ms combined**, essentially nothing, and the whole named guard is
+   under a quarter of the field. `FN64_FAST_MUTATION_JOURNAL`'s recorded zero
+   was not a reachability accident here — those seams really are cheap now.
+2. **A NEW 11.96 ms remainder appeared, and it is inside the coroutine
+   resume.** `resume NET` (resume minus mirror minus guard) is 26.80 ms, of
+   which `gfx_ns` accounts for 13.10 and audio 1.19. The 11.96 ms left over is
+   **translated guest code plus the runtime it calls synchronously** — RDRAM
+   reads/writes through `RdramView`, `translate`/`backing_offset`, the
+   per-instruction validation, and the dispatch loop's own
+   `reconcile_before_dispatch` at `runners.rs:1033`, which the explorer found
+   runs **once per loop iteration**, not once per step.
+
+**So "executor self" was two different things in one bucket:** a per-step
+apparatus boundary (the mirror, 8.43) and a per-step guest+runtime cost
+(11.96). At **45.47 µs per step** on render fields against 25.70 on off-fields,
+the remainder is mostly per-step with a per-submit component (7.09x total ratio
+against a 4.01x call ratio).
+
+**The 79 µs/call headline resolves as "many cheap operations".** A render-field
+step costs 130.5 µs inclusive; no single phase dominates it. The step count
+itself — 274.9 per render field against 68.5 — is the multiplier on everything,
+which makes *steps per field* a lever nobody has examined.
+
+**Instrument perturbation, and my own budget arithmetic was wrong.** Mean
+23.08 armed against 22.18 control, **+4.1%**; render field 37.09 vs 35.47,
+**+4.6%**. I predicted 0.029 ms/field from 33.8 ns × 856 clock reads and
+measured **1.62 ms — 56x that**. `Instant::now` is not the cost; the cost is
+what arming it does to the surrounding code (inlining, register pressure,
+branch layout in the hottest loop in the program). **Do not budget
+instrumentation by multiplying a microbenchmarked clock read by a call count.**
+The control at 22.18 sits just below the 22.36–22.41 band; the armed lane at
+23.08 is outside it, so the absolute ms above are corrected by the
+control/armed ratio and the *shares* are the robust figures. The two
+sub-0.1 ms guard rows are smaller than the perturbation and should be read as
+"below this instrument's resolution", not as precise values.
+
+**Flagging the RDP line as required, not absorbing it.** `gfx_lle_rdp_ns` is
+**7.04 ms/render-field against the 5.82 baseline, +20.9%**, while
+`gfx_lle_rsp_ns` is 5.98 against 6.08, **−1.7%**. That is the same asymmetric
+signature as the unexplained +8% drift recorded above (RDP up, RSP flat or
+down), at about half the magnitude, and it is present in the *control* lane
+too, so it is not my instrument. Still unexplained.
+
 ### FOUND IT: executor self is 21.72 ms — 61% of the render field, not graphics
 
 The "unaccounted 23.94 ms" was never unmeasured. It was in the population split

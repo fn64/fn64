@@ -1,5 +1,8 @@
 use super::*;
-use crate::task_dispatch::{EXECUTOR_CALLS, EXECUTOR_NS, PHASE_TIMING};
+use crate::task_dispatch::{
+    executor_split_enabled, note_executor_split, EXECUTOR_CALLS, EXECUTOR_NS, EXEC_DEVTIME_NS,
+    EXEC_MIRROR_CALLS, EXEC_MIRROR_NS, EXEC_RESUME_NS, PHASE_TIMING,
+};
 
 // ---------------------------------------------------------------------
 // Host-facing (non-`_recomp`) helpers.
@@ -342,6 +345,11 @@ pub unsafe fn boot_thread0(
 /// fixed reappears.
 pub fn run_one_step() -> bool {
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
+    // Split `executor_ns`, which has no sub-counters and is 61% of a WM2000
+    // render field. Separately gated from `PHASE_TIMING` because these clocks
+    // are inside the hottest loop here; see `EXECUTOR_SPLIT`'s doc comment.
+    let split = executor_split_enabled();
+    let resume_started = split.then(std::time::Instant::now);
     let (stepped, now) = with_executor(|exec| {
         // `peek_next_thread` is a read-only preview of exactly which thread
         // `exec.run_one_step()` is about to resume -- read it BEFORE the
@@ -356,13 +364,33 @@ pub fn run_one_step() -> bool {
                 // the selected coroutine's guest OSThread pointer is visible
                 // before its first instruction and cannot interleave with a
                 // different resume because `run_one_step` owns RunToken.
-                mirror_guest_running_thread(id);
+                // Timed apart from the resume below: under `recomp-rs` this
+                // is a FULL watched-region journal reconcile (see
+                // `EXEC_MIRROR_NS`), not the four-byte store its name
+                // suggests, and it runs on every step.
+                match split.then(std::time::Instant::now) {
+                    Some(at) => {
+                        mirror_guest_running_thread(id);
+                        note_executor_split(
+                            &EXEC_MIRROR_NS,
+                            Some(&EXEC_MIRROR_CALLS),
+                            at.elapsed().as_nanos() as u64,
+                        );
+                    }
+                    None => mirror_guest_running_thread(id),
+                }
                 with_rearmed_context(id, || exec.run_one_step())
             }
             None => exec.run_one_step(),
         };
         (stepped, exec.sim_time())
     });
+    // Closes over the whole `with_executor` body -- scheduler pick, the
+    // mirror boundary, and the coroutine resume. `exec_mirror_ns` is nested
+    // inside this, not a peer of it; the census subtracts.
+    if let Some(at) = resume_started {
+        note_executor_split(&EXEC_RESUME_NS, None, at.elapsed().as_nanos() as u64);
+    }
     if stepped {
         // `run_one_step` returns only after a yielding coroutine is fully
         // suspended. Commit the ABI-owned device fabric at that exact guest
@@ -370,7 +398,15 @@ pub fn run_one_step() -> bool {
         // closes the interleaving checkpoint-yield -> same-thread resume ->
         // overdue PI completion, which would otherwise execute one extra
         // translated block before bytes/MI/queue state became observable.
-        crate::pi::advance_device_time(now);
+        match split.then(std::time::Instant::now) {
+            Some(at) => {
+                crate::pi::advance_device_time(now);
+                note_executor_split(&EXEC_DEVTIME_NS, None, at.elapsed().as_nanos() as u64);
+            }
+            None => {
+                crate::pi::advance_device_time(now);
+            }
+        }
     }
     if let Some(started) = started {
         EXECUTOR_NS.with(|total| {

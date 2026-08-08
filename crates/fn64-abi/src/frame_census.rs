@@ -203,6 +203,21 @@ struct Counters {
     gfx_lle_rdp_ns: u64,
     vi_present_ns: u64,
     audio_lle_ns: u64,
+    /// The `executor_ns` split, from `FN64_EXECUTOR_SPLIT`. Zero when unset.
+    ///
+    /// `executor_ns` is 61% of a WM2000 render field and had no sub-counters,
+    /// which is why two-thirds of that field went unnamed for a whole session.
+    /// See `PhaseTiming`'s nesting diagram: `exec_mirror_ns` and
+    /// `exec_guard_suspend_ns` are INSIDE `exec_resume_ns`, so the report must
+    /// subtract rather than sum.
+    exec_mirror_ns: u64,
+    exec_resume_ns: u64,
+    exec_devtime_ns: u64,
+    exec_guard_suspend_ns: u64,
+    exec_guard_device_ns: u64,
+    exec_mirror_calls: u64,
+    exec_guard_suspend_calls: u64,
+    exec_guard_device_calls: u64,
     /// Phase-timer call counts, from `FN64_PHASE_TIMING`. Zero when unset.
     executor_calls: u64,
     gfx_calls: u64,
@@ -250,6 +265,14 @@ impl Counters {
             gfx_lle_rdp_ns: phase.gfx_lle_rdp_ns,
             vi_present_ns: phase.vi_present_ns,
             audio_lle_ns: phase.audio_lle_ns,
+            exec_mirror_ns: phase.exec_mirror_ns,
+            exec_resume_ns: phase.exec_resume_ns,
+            exec_devtime_ns: phase.exec_devtime_ns,
+            exec_guard_suspend_ns: phase.exec_guard_suspend_ns,
+            exec_guard_device_ns: phase.exec_guard_device_ns,
+            exec_mirror_calls: phase.exec_mirror_calls,
+            exec_guard_suspend_calls: phase.exec_guard_suspend_calls,
+            exec_guard_device_calls: phase.exec_guard_device_calls,
             executor_calls: phase.executor_calls,
             gfx_calls: phase.gfx_calls,
             gfx_lle_calls: phase.gfx_lle_calls,
@@ -286,6 +309,14 @@ impl Counters {
             gfx_lle_rdp_ns,
             vi_present_ns,
             audio_lle_ns,
+            exec_mirror_ns,
+            exec_resume_ns,
+            exec_devtime_ns,
+            exec_guard_suspend_ns,
+            exec_guard_device_ns,
+            exec_mirror_calls,
+            exec_guard_suspend_calls,
+            exec_guard_device_calls,
             executor_calls,
             gfx_calls,
             gfx_lle_calls,
@@ -303,7 +334,7 @@ impl Counters {
 
     /// Every counter as `(label, value)`, in report order. One list so the
     /// bucket diff cannot silently omit a counter the sampler collects.
-    fn labelled(&self) -> [(&'static str, u64); 21] {
+    fn labelled(&self) -> [(&'static str, u64); 29] {
         [
             ("gfx_tasks", self.gfx_tasks),
             ("audio_tasks", self.audio_tasks),
@@ -326,6 +357,14 @@ impl Counters {
             ("barrier_fell_back", self.barrier_fell_back),
             ("barrier_dirty_pages", self.barrier_dirty_pages),
             ("barrier_clean", self.barrier_clean),
+            ("exec_mirror_ns", self.exec_mirror_ns),
+            ("exec_resume_ns", self.exec_resume_ns),
+            ("exec_devtime_ns", self.exec_devtime_ns),
+            ("exec_guard_suspend_ns", self.exec_guard_suspend_ns),
+            ("exec_guard_device_ns", self.exec_guard_device_ns),
+            ("exec_mirror_calls", self.exec_mirror_calls),
+            ("exec_guard_suspend_calls", self.exec_guard_suspend_calls),
+            ("exec_guard_device_calls", self.exec_guard_device_calls),
         ]
     }
 }
@@ -722,6 +761,14 @@ impl Bucket {
                 barrier_fell_back,
                 barrier_dirty_pages,
                 barrier_clean,
+                exec_mirror_ns,
+                exec_resume_ns,
+                exec_devtime_ns,
+                exec_guard_suspend_ns,
+                exec_guard_device_ns,
+                exec_mirror_calls,
+                exec_guard_suspend_calls,
+                exec_guard_device_calls,
             );
         }
         Self {
@@ -1270,6 +1317,131 @@ fn population_report(split: &PopulationSplit) -> String {
              untimed.\n",
         );
     }
+    out.push_str(&executor_split_report(&fast, &slow));
+    out
+}
+
+/// Decompose `executor_ns` -- the counter that measured 21.72 ms of a 35.84 ms
+/// WM2000 render field, 61%, with no sub-counters -- into named phases, per
+/// population.
+///
+/// # Why this does subtraction rather than printing the raw counters
+///
+/// The generic per-counter loop above already prints every `exec_*` value as a
+/// per-field ratio, and that is NOT sufficient. Three of these counters are
+/// nested inside another (`exec_mirror_ns` and `exec_guard_suspend_ns` inside
+/// `exec_resume_ns`; `exec_guard_device_ns` inside `exec_devtime_ns`), so
+/// reading them as a list of peers overstates the total and understates the
+/// residual. Reading an inclusive counter as a peer of its parent is exactly
+/// how the 21.72 ms stayed hidden in the first place -- `executor_ns` was
+/// tabulated beside `gfx_ns` when it CONTAINS it (perf-method rule 2). This
+/// section exists so the same mistake cannot be made one level down.
+///
+/// # The residual is printed even when it is small
+///
+/// `executor_ns - (resume + devtime)` is `host::run_one_step`'s own frame. It
+/// is expected to be near zero. It is printed anyway, and labelled, because an
+/// unnamed remainder is the thing that went unnoticed for a session; a
+/// remainder that is reported and boring is strictly better than one that is
+/// absent and assumed boring.
+fn executor_split_report(fast: &Bucket, slow: &Bucket) -> String {
+    let armed = fast.counters.exec_resume_ns > 0 || slow.counters.exec_resume_ns > 0;
+    if !armed {
+        return String::from(
+            "[executor-split] NOT ARMED (FN64_EXECUTOR_SPLIT unset). The executor_ns \
+             decomposition is absent, not zero -- do not read this as 'the phases cost \
+             nothing'.\n",
+        );
+    }
+    let mut out = String::from(
+        "[executor-split] executor_ns decomposed. NESTING: mirror and guard_suspend are INSIDE \
+         resume; guard_device is INSIDE devtime. Rows marked (of ...) are nested, not peers -- \
+         do not add them to the total.\n",
+    );
+    for (name, bucket) in [("fast", fast), ("slow", slow)] {
+        let fields = bucket.fields.max(1) as f64;
+        let c = &bucket.counters;
+        // ns totals -> ms per field in this population.
+        let ms = |ns: u64| ns as f64 / 1.0e6 / fields;
+        let per = |n: u64| n as f64 / fields;
+        let executor = ms(c.executor_ns);
+        let resume = ms(c.exec_resume_ns);
+        let devtime = ms(c.exec_devtime_ns);
+        let mirror = ms(c.exec_mirror_ns);
+        let guard_suspend = ms(c.exec_guard_suspend_ns);
+        let guard_device = ms(c.exec_guard_device_ns);
+        // The quantity the whole exercise is for: what is left of the resume
+        // once the apparatus nested inside it is removed. This is the closest
+        // thing to "the guest executing recompiled MIPS plus the runtime it
+        // calls" that these counters can express.
+        let resume_net = (resume - mirror - guard_suspend).max(0.0);
+        let residual = (executor - resume - devtime).max(0.0);
+        let guard_total = mirror + guard_suspend + guard_device;
+        let share = |v: f64| {
+            if executor > 0.0 {
+                100.0 * v / executor
+            } else {
+                0.0
+            }
+        };
+        out.push_str(&format!(
+            "[executor-split] {name}: executor_ns={executor:.3}ms/field over \
+             {:.1} calls/field ({:.1}us/call)\n",
+            per(c.executor_calls),
+            if c.executor_calls > 0 {
+                c.executor_ns as f64 / 1.0e3 / c.executor_calls as f64
+            } else {
+                0.0
+            },
+        ));
+        for (label, value, nested, calls) in [
+            ("resume (Executor step)", resume, false, 0u64),
+            ("  (of) mirror boundary", mirror, true, c.exec_mirror_calls),
+            (
+                "  (of) guard @ suspend",
+                guard_suspend,
+                true,
+                c.exec_guard_suspend_calls,
+            ),
+            ("  (of) resume NET", resume_net, true, 0),
+            ("devtime (advance)", devtime, false, 0),
+            (
+                "  (of) guard @ device",
+                guard_device,
+                true,
+                c.exec_guard_device_calls,
+            ),
+            ("residual (run_one_step frame)", residual, false, 0),
+        ] {
+            let call_note = if calls > 0 {
+                format!(
+                    "  {:.1} calls/field, {:.2}us/call",
+                    per(calls),
+                    value * 1000.0 / per(calls).max(f64::MIN_POSITIVE),
+                )
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "[executor-split] {name}:   {label:<30} {value:>8.3}ms/field {:>6.1}% of \
+                 executor{}{call_note}\n",
+                share(value),
+                if nested { "  [nested]" } else { "" },
+            ));
+        }
+        out.push_str(&format!(
+            "[executor-split] {name}: APPARATUS (mirror + guard@suspend + guard@device) = \
+             {guard_total:.3}ms/field = {:.1}% of executor_ns. GUEST+RUNTIME (resume net) = \
+             {resume_net:.3}ms/field = {:.1}%.\n",
+            share(guard_total),
+            share(resume_net),
+        ));
+    }
+    out.push_str(
+        "[executor-split] Read the SLOW row against the 16.667ms budget: that is the field the \
+         60fps bar fails on. A saving in a row that is large on the fast row and small on the \
+         slow one pays into the population that already has headroom.\n",
+    );
     out
 }
 
@@ -1663,6 +1835,142 @@ mod tests {
         );
     }
 
+    /// The bucket accumulator (`Bucket::from_samples`'s `add!`) is a
+    /// hand-maintained field list, and a counter omitted from it accumulates
+    /// to ZERO in both populations while `labelled()` dutifully prints it --
+    /// which reads as "this counter does not distinguish the populations",
+    /// the single most misleading output this module can produce. Adding the
+    /// executor-split counters hit exactly that: they were in the struct, the
+    /// sampler and the report, and silently absent from `add!`.
+    ///
+    /// This pins it generically. Every field `labelled()` reports must survive
+    /// a round trip through `from_samples`, so a future counter cannot be
+    /// added to the struct and forgotten in the accumulator.
+    #[test]
+    fn every_labelled_counter_survives_bucket_accumulation() {
+        // 1 in every field, so a surviving counter sums to the field count and
+        // a dropped one sums to zero -- unambiguous either way.
+        let ones = Counters {
+            gfx_tasks: 1,
+            audio_tasks: 1,
+            executor_ns: 1,
+            gfx_ns: 1,
+            gfx_lle_ns: 1,
+            gfx_lle_rsp_ns: 1,
+            gfx_lle_rdp_ns: 1,
+            vi_present_ns: 1,
+            audio_lle_ns: 1,
+            executor_calls: 1,
+            gfx_calls: 1,
+            gfx_lle_calls: 1,
+            audio_lle_calls: 1,
+            rsp_steps_gfx: 1,
+            rsp_steps_audio: 1,
+            rsp_entries: 1,
+            dpc_calls: 1,
+            barrier_served: 1,
+            barrier_fell_back: 1,
+            barrier_dirty_pages: 1,
+            barrier_clean: 1,
+            exec_mirror_ns: 1,
+            exec_resume_ns: 1,
+            exec_devtime_ns: 1,
+            exec_guard_suspend_ns: 1,
+            exec_guard_device_ns: 1,
+            exec_mirror_calls: 1,
+            exec_guard_suspend_calls: 1,
+            exec_guard_device_calls: 1,
+        };
+        let samples: Vec<FieldSample> = (0..10).map(|_| sample_with(20.0, ones)).collect();
+        let refs: Vec<&FieldSample> = samples.iter().collect();
+        let bucket = Bucket::from_samples(&refs);
+        for (label, value) in bucket.counters.labelled() {
+            assert_eq!(
+                value, 10,
+                "`{label}` is in `labelled()` but did not accumulate through \
+                 `Bucket::from_samples`'s `add!` list -- it would read zero in BOTH \
+                 populations and be reported as 'does not distinguish them'"
+            );
+        }
+    }
+
+    /// Rule 6a: before trusting the split, confirm it can FAIL. An unarmed
+    /// run must say ABSENT, not print zeros -- a zero decomposition is
+    /// indistinguishable from "the apparatus costs nothing", which is the
+    /// exact wrong conclusion this instrument exists to test for.
+    #[test]
+    fn an_unarmed_executor_split_reports_absent_rather_than_zero() {
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, Counters::default()))
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = executor_split_report(&split.fast, &split.slow);
+        assert!(
+            text.contains("NOT ARMED"),
+            "an unarmed split must say so; got:\n{text}"
+        );
+        assert!(
+            !text.contains("APPARATUS"),
+            "an unarmed split must not print an apparatus share; got:\n{text}"
+        );
+    }
+
+    /// The arithmetic the whole section exists for: nested counters are
+    /// SUBTRACTED, never summed. Pinned with numbers where a summing bug is
+    /// visible -- resume 10ms containing mirror 4ms and guard 3ms leaves a NET
+    /// of 3ms, and an implementation that treated them as peers would report
+    /// 17ms of phases inside a 12ms executor, which is impossible.
+    #[test]
+    fn nested_executor_phases_are_subtracted_not_summed() {
+        // Per field, in ns: executor 12ms = resume 10ms + devtime 1.5ms
+        // + 0.5ms residual. Inside resume: mirror 4ms, guard@suspend 3ms.
+        let counters = Counters {
+            executor_ns: 12_000_000,
+            executor_calls: 100,
+            exec_resume_ns: 10_000_000,
+            exec_devtime_ns: 1_500_000,
+            exec_mirror_ns: 4_000_000,
+            exec_mirror_calls: 100,
+            exec_guard_suspend_ns: 3_000_000,
+            exec_guard_suspend_calls: 400,
+            exec_guard_device_ns: 500_000,
+            exec_guard_device_calls: 10,
+            ..Counters::default()
+        };
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| {
+                sample_with(
+                    if i % 2 == 0 { 40.0 } else { 10.0 },
+                    // Both populations carry identical per-field work here;
+                    // this test is about the arithmetic, not the split.
+                    counters,
+                )
+            })
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = executor_split_report(&split.fast, &split.slow);
+
+        // resume NET = 10 - 4 - 3 = 3ms, NOT 10 and NOT 17.
+        assert!(
+            text.contains("resume NET") && text.contains("3.000ms/field"),
+            "resume net must subtract the nested phases (10-4-3=3); got:\n{text}"
+        );
+        // APPARATUS = mirror 4 + guard@suspend 3 + guard@device 0.5 = 7.5ms.
+        assert!(
+            text.contains("7.500ms/field"),
+            "apparatus must sum the three guard phases (4+3+0.5=7.5); got:\n{text}"
+        );
+        // Residual = 12 - 10 - 1.5 = 0.5ms, reported rather than dropped.
+        assert!(
+            text.contains("residual") && text.contains("0.500ms/field"),
+            "the run_one_step residual must be reported (12-10-1.5=0.5); got:\n{text}"
+        );
+        assert!(
+            text.contains("[nested]"),
+            "nested rows must be marked so they are not read as peers; got:\n{text}"
+        );
+    }
+
     /// The finding that must not be manufactured away: two populations 4x
     /// apart in wall time doing identical measurable work. The report has to
     /// say so in those words.
@@ -1798,12 +2106,20 @@ mod tests {
             barrier_fell_back: 262_144,
             barrier_dirty_pages: 524_288,
             barrier_clean: 1_048_576,
+            exec_mirror_ns: 1 << 21,
+            exec_resume_ns: 1 << 22,
+            exec_devtime_ns: 1 << 23,
+            exec_guard_suspend_ns: 1 << 24,
+            exec_guard_device_ns: 1 << 25,
+            exec_mirror_calls: 1 << 26,
+            exec_guard_suspend_calls: 1 << 27,
+            exec_guard_device_calls: 1 << 28,
         };
         let labelled = counters.labelled();
         let sum: u64 = labelled.iter().map(|&(_, v)| v).sum();
         assert_eq!(
             sum,
-            (1u64 << 21) - 1,
+            (1u64 << 29) - 1,
             "each distinct power of two must appear exactly once in `labelled`"
         );
         let mut names: Vec<&str> = labelled.iter().map(|&(n, _)| n).collect();
