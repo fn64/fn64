@@ -1162,6 +1162,87 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+## MEASURED: the biggest single item is `verify_live_words` — 3.50 ms, and it is a build flag
+
+**Correction to the section below.** The remainder is **not** primarily the
+`match pc` dispatch, and the codegen rewrite it implies is **not** the right
+first move.
+
+`examples/wm2000-block-shards/build.rs:330` passes **`verify_live_words: true`**.
+It is emitted at the top of `'run: loop` (`emit/mod.rs:602-616`), *before* the
+`match` — so **once per guest instruction** it does a bounds check, an
+`EXPECTED_WORDS` index, and **a full `mem.load_w` guest load** through
+`read_mmio_word` → `backing_offset`.
+
+Ablation on real emitted code (512-instruction runner, censused WM2000 mix:
+15.9% loads / 12.6% stores / 71.5% ALU), seven variants interleaved in one
+process, 5 samples each, 4 independent runs, each ablation verified textually
+distinguishable first:
+
+| component | ns/instr | ms/render field | % of the 19.17 gap |
+|---|---:|---:|---:|
+| **`verify_live_words` total** | **3.10** | **3.50** | **18%** |
+| — the guest load | 1.66 | 1.88 | 10% |
+| — call + `AotMiss` construction | 1.44 | 1.63 | 8% |
+| `advance_cop0_random` | 0.61 | 0.69 | 4% |
+| `post_straight_instruction_exit` | 0.26 | 0.29 | 2% |
+| residual (`match` + real work) | 4.02 | 4.54 | 24% |
+| **total as emitted** | **7.99** | **9.03** | **47%** |
+
+**Three of my named suspects are near-zero and should be dropped.**
+`advance_cop0_random`'s two integer divides are **0.61 ns** — LLVM
+strength-reduces them. The write-boundary TLS access is **0.26 ns**, and
+measured alone it flipped sign across reps (−0.93/+1.18/+1.09): a layout
+artifact, not a cost. And the per-load redundancy claim **does not hold** —
+`translate_data_address` returns early for `DirectVirtual`/`DirectPhysical`, and
+the 32-entry linear TLB scan is only reached for `Mapped` (KUSEG) addresses.
+**WM2000 is KSEG0 and never enters that loop.**
+
+**My "the emitter already knows block boundaries" premise was also wrong.**
+`emit/mod.rs:619` is `for (index, instr) in instrs.iter()...` — one arm
+**unconditionally per instruction**. The doc comment at :25-30 describes the
+*whole-function* emitter, not the dense shard runner WM2000 uses. Over the
+1 MiB boot copy: 262,144 arms emitted, **46,011 genuine block entries (17.6%)**,
+mean block **5.7 instructions**, so 82.4% of arms are removable — but that
+bounds only the 4.02 ns residual, most of which is the guest's real work.
+
+### Sizing: the gate is 78% of the win for a fraction of the cost
+
+| change | render field | ratio A | % of gap |
+|---|---:|---:|---:|
+| **gate `verify_live_words` off** | 35.47 → **31.97** | **1.92x** | **18%** |
+| + block-structured emission | → 30.98 | 1.86x | 23% |
+
+The gate needs **no emitter logic change** — `verify_live_words` is already a
+`bool` on `DenseBankShardInput`. Flipping `build.rs:330` touches the emitter's
+*caller*, avoiding the certified-source digest move (`emit/mod.rs` **is**
+certified, via `lib.rs:76`'s `generated_runner_emitter_source_receipt_v2`).
+
+**Block-structured emission should wait.** A further 0.99 ms (5% of the gap)
+does not justify a certified-source edit, a 32-crate rebuild, and a
+restructuring that must preserve the delay-slot rule exactly.
+
+### The correctness argument, with the gap stated honestly
+
+A **second detector is already live** — verified: `execution.rs:88` installs
+`classify_live_executable_write` as the guest-write-boundary observer, backed by
+`EXECUTABLE_WRITE_BOUNDARY` (`recomp-rs/runtime/host.rs:279`) and consumed by
+`post_straight_instruction_exit` at every instruction boundary. Plus
+`activate_for_fetch_with_digest` re-digests on every activation, so stale code
+cannot execute in the un-resident case either.
+
+**But this is defence-in-depth removal, not redundant-work removal, and must be
+argued as such.** `write_barrier.rs:52-57` lists paths that bypass the
+declaration channel (`as_mut_slice`, raw `RdramPtr` stores, some renderer
+slices); `verify_live_words` is the belt-and-braces detector for exactly those.
+The `sim_time=18776001537` byte-identity gate is what confirms no undeclared
+writer is being relied on in practice.
+
+The existing `verify_precompiled_instruction_word` dead end does **not** cover
+this: it is about fixing the check *inside* `fn64-recomp-rs`, and its stated
+reason — that crate "cannot see the barrier" — is precisely why the gate belongs
+at the `build.rs` call site.
+
 ## THE ANSWER: the recompiled code is an interpreter, and that is the whole gap
 
 The question was whether fn64 misses optimizations the original hardware or its
