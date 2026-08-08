@@ -466,6 +466,52 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+## RESULT: the guard fix landed at 1.95x — 44.13 -> 22.51 ms/field (`abc7871`)
+
+Two interleaved pairs, RT64 block lane, route `a9e1b25e`, 2.1M steps, quiet
+machine. **Ranges fully disjoint, each lane reproducing within 0.8%.**
+
+| | baseline | fix |
+|---|---:|---:|
+| mean | 44.14 / 43.81 | **22.44 / 22.57** |
+| p50 | 28.25 / 27.92 | **16.27 / 16.37** |
+| p95 | 79.00 / 78.01 | 38.41 / 38.49 |
+| p99 | 80.06 / 78.87 | 39.09 / 39.28 |
+| **ratio A** | 2.65x / 2.63x | **1.35x** |
+
+Guest byte-identical across all four runs (`gfx_submits=16586`,
+`audio_submits=11005`, `sp_tasks=27591`, `vi_interrupts=12008`,
+`controller_ops=3115`, identical `sim_time`, `render_error=None`).
+
+**The median field now fits the budget** — 16.27 ms against 16.667. But
+`over_16.667ms` is still ~50% and `holds_60fps=false`: 1.35x is a different
+regime from 2.64x, not a solved one.
+
+**The prediction below was BEATEN, and the reason is worth keeping.** The floor
+committed before the measurement was 25.91 ms for removing 100% of the guard at
+the four seams; measured is **22.51**, 3.40 ms below it. The estimate was built
+from the seams' profiled *share*, which undercounted the fix: `flush_host_abi_
+transaction_inner` handed `None` **down again**, so
+`invalidate_pending_physical_writes_inner` repeated the same per-byte rebuild —
+**two full rebuilds of the 1 MiB boot bank per nested-writer entry**, and one
+threading change feeds both. A share-based estimate cannot see a defect that
+double-counts itself.
+
+Correctness held under the falsification that mattered: the `None` arm lives
+*inside* `changed_ranges_from_view`, so passing `Some(&view)` opts into the
+attempt only and removes no fallback — an unmapped byte still raises its panic
+from the code that owes it. Path equivalence is pinned by
+`changed_ranges_from_view_matches_the_copying_path` over randomized contents.
+
+It is also not the rasterizer-hoist shape: judged on mean ms/field, the mean
+moved *with* the counter, p50 improved 1.72x, p95 and p99 both roughly halved,
+nothing regressed.
+
+**Not re-profiled.** Everything in the table below this line describes the
+44.13 ms world and is now stale. Candidate 0 in particular sits on a seam this
+fix targeted, so its 3.17 ms/field share has certainly changed and may have
+collapsed — re-measure against 22.51 before dispatching anything.
+
 ## The 60fps arithmetic: what the guard fix can and cannot buy
 
 Computed from the measured RT64 split, before the in-flight fix reports, so the
