@@ -1110,6 +1110,44 @@ a route with no frames in it, and carried into a table about a route that has
 them. **Before quoting any per-field figure, state which route produced it and
 whether that route rendered anything.**
 
+### The dispatch comparison is already 364x optimized — it cannot be the remainder
+
+Before dispatching work at `reconcile_before_dispatch` (the named lead into the
+11.96 ms remainder), the existing counters answer how expensive it can possibly
+be. **It is already near-optimal**, and the arithmetic says so:
+
+Per render field, from the population split:
+
+| | |
+|---|---|
+| `barrier_served` | **991.5** |
+| `barrier_fell_back` | **0.0** — the barrier answered *every* time, zero full scans |
+| clean boundaries | 745.6 (**75%**) — compare **zero bytes** |
+| dirty boundaries | 245.9, comparing **697 pages** = 2,790 KiB |
+| if it always scanned 1 MiB | 992 MiB |
+| **speedup already realized** | **~364x** |
+
+`matches_view` (`live_program.rs:359-380`) takes `barrier_spans()` and clips the
+comparison to dirty pages only, falling back to a full scan **only** when the
+barrier cannot answer — which measured **never** on this route.
+
+**So the 1 MiB-per-dispatch framing is wrong for the current code.** The
+comparison touches ~2.7 MiB per render field, not ~992 MiB, and three quarters
+of its boundaries do no comparison at all. Whatever the 11.96 ms remainder is,
+**this is not the bulk of it** — and my earlier "prime suspect" reasoning, which
+priced a 1 MiB reconcile per boundary, was pricing code that does not run.
+
+Two smaller notes from the same read:
+
+- The `TEMPORARY (mprotect feasibility census, 2026-08-07)` call at `:360-363`
+  inside the hottest comparison **is properly gated** (`note_boundary`
+  early-returns unless enabled, `snapshots.rs:1018-1021`). Not a cost. It is
+  still worth deleting once the census is finished, since "TEMPORARY" in the
+  hot path invites exactly the suspicion it just cost to dispel.
+- `barrier_spans` documents the only failure mode honestly: `None` means "the
+  barrier cannot answer" and every caller runs the full scan; **it never returns
+  a span list that omits a page it saw written.**
+
 ### MEASURED: the executor split — apparatus is 24%, not the majority
 
 `f4aeb1c`, five sub-counters inside `run_one_step` behind `FN64_EXECUTOR_SPLIT`,
