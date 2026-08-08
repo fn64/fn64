@@ -466,6 +466,36 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+### Sizing the `run_imem` double-decode before dispatching it
+
+`crates/fn64-audio/src/rsp/interpreter.rs:119` decodes the delay slot
+**unconditionally**, before the `match instr` that decides whether anything
+needs it:
+
+```rust
+let instr = decode(word, pc);
+let delay = delay_word.map(|delay_word| decode(delay_word, pc.wrapping_add(4)));
+```
+
+**Only 4 of 25 match arms use it** — `Jal`, `Jalr`, `Jr`, `Jump`. Every other
+instruction pays for a decode it discards. At 4.13B RSP instructions that is
+~3.3-3.7B wasted decodes depending on branch density.
+
+**But size it before dispatching.** `decode` is a leaf at 7.03% of samples, and
+RSP interpretation totals 3.04 ms/field (8.33 ns per instruction):
+
+| decode work removed | mean | ratio |
+|---|---:|---:|
+| 50% | 21.85 | 1.31x |
+| 80% | 21.38 | 1.28x |
+
+So the ceiling is roughly **1.3 ms of the 5.84 ms needed** — worth doing, and
+**not sufficient on its own**. Recording the estimate here, before the
+measurement, so the result is judged against a prediction rather than fitted to
+one. Note the same arithmetic style over-predicted once today (the guard fix
+beat its 25.91 ms floor because the defect double-counted itself), so treat
+this as a lower bound on the ceiling, not a guarantee.
+
 ## The write barrier now SAVES 12.4 ms/field, and the GPU attribution is retracted
 
 Measured 2026-08-08 on the RT64 gameplay route (`a9e1b25e`), barrier on vs off:
