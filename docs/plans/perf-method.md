@@ -1064,6 +1064,34 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+### RETRACTED: the "guest code is only 1.01 ms/field" figure was fabricated
+
+I claimed a layer partition measured guest code at **1.01 ms/field (4.5%)**,
+quoted it repeatedly, contrasted it with the 21.72 ms executor self, called the
+result a **21x contradiction**, and dispatched an agent to resolve it.
+
+**Neither "1.01 ms" nor "4.5%" appears anywhere in this repository.** I checked.
+The number does not exist.
+
+The real figure is **2.86%**, in
+`docs/plans/resolvable-self-time-profile.md:111` — a **self-time share**, not a
+per-field duration, and measured on the **19,523-step route that renders
+nothing** (`gfx_submits=0`, eight VI interrupts; see rule 11). Reconstructing:
+420 ms total, 84.5% steady = 354.9 ms, of which 2.86% = **10.15 ms of guest
+code for the entire run**, over ~8 fields = 1.27 ms/field. That is almost
+certainly what I rounded to "1.01".
+
+**There was never a contradiction to explain — there was a category error.**
+2.86% is a self-time share on a non-rendering route running 2,440 steps per
+field; 21.72 ms is a wall-time total on a rendering route running 185.5 steps
+per field carrying 2.88 display lists. The two quantities were never about the
+same thing, and no per-field figure transfers between those routes.
+
+This is rule 11 and rule 2 compounding: a share read as a duration, taken from
+a route with no frames in it, and carried into a table about a route that has
+them. **Before quoting any per-field figure, state which route produced it and
+whether that route rendered anything.**
+
 ### Prime suspect for the 21.72 ms: a 4-byte mirror that reconciles 1 MiB
 
 **UNCONFIRMED — sized before the measurement, so the result is judged against a
