@@ -1,5 +1,131 @@
 use super::*;
 
+/// Whether the continuous executable-memory snapshot runs at every dispatch.
+///
+/// The snapshot re-reads and re-compares the whole watched region -- 1 MiB on
+/// WM2000 -- at every dispatch boundary, and boundaries are per block
+/// transfer, per host-ABI call and per thread selection. It measured as ~95%
+/// of execution time, which is most of why the certified lane runs 23.5x
+/// slower than realtime.
+///
+/// What it checks is that executable bytes did not change without a writer
+/// declaring the change. That is a property WRITE ATTRIBUTION already
+/// provides: every write path routes through
+/// `record_executable_and_renderer_write` and lands in one of eight fixed
+/// `WriterChannel`s. Measured over WM2000's full route -- 505,140 journal
+/// entries -- ZERO changed ranges lacked a covering declaration.
+///
+/// So the snapshot guards against fn64 failing to attribute its own writes,
+/// not against anything the guest does. That is worth asserting continuously
+/// in gates and CI, and not worth paying for in a lane meant to be played.
+///
+/// Default ON. `FN64_FAST_MUTATION_JOURNAL=1` turns it off, and the
+/// per-generation digest at activation plus write attribution both keep
+/// running either way -- those are what receipts assert.
+///
+/// Latched once: a run must not change verification strength midway.
+fn continuous_snapshot_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("FN64_FAST_MUTATION_JOURNAL").is_some_and(|value| value == "1")
+    })
+}
+
+/// Does the SCHEDULER-MIRROR reconcile ever catch anything?
+///
+/// The mirror site costs 8.43 ms per WM2000 render field (23.8%) and is a
+/// candidate for gating. Gating it is only sound if it is genuinely redundant
+/// with the dispatch-loop reconcile that runs at the same per-step rate -- and
+/// "the two look alike" is a structural argument, which is exactly what rule 6a
+/// exists to reject. Two checks are redundant only under the states that
+/// ACTUALLY OCCUR, so this counts those states.
+///
+/// `FN64_MIRROR_RECONCILE_CENSUS=1`. Off by default and free when off: the call
+/// site tests `enabled()` before doing the comparison it would otherwise skip.
+///
+/// **It reports DIRTY BOUNDARIES, which is the number that decides the
+/// question.** A clean/dirty ratio alone cannot size what removal would save,
+/// because `matches_view` clips to MMU-reported dirty pages -- a measured ~364x
+/// optimization -- so "dirty" spans one page to four hundred. What matters for
+/// SOUNDNESS, though, is simply whether `dirty` is ever nonzero: a mirror that
+/// never once finds the region changed is catching nothing the gated site could
+/// not, and gating it removes a comparison rather than a detector.
+///
+/// Armed separately from `FN64_MPROTECT_BARRIER_STATS` because that one counts
+/// barrier ASKS across all sites; this one attributes outcomes to the mirror
+/// alone, which is the site under consideration.
+pub(super) mod mirror_reconcile_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CLEAN: AtomicU64 = AtomicU64::new(0);
+    static DIRTY: AtomicU64 = AtomicU64::new(0);
+
+    pub(in crate::recompiled) fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FN64_MIRROR_RECONCILE_CENSUS").is_some_and(|value| {
+                matches!(
+                    value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        })
+    }
+
+    /// Running `(clean, dirty)` totals, for tests and the census reporter.
+    pub(in crate::recompiled) fn running_totals() -> (u64, u64) {
+        (CLEAN.load(Ordering::Relaxed), DIRTY.load(Ordering::Relaxed))
+    }
+
+    /// Record one mirror reconcile outcome.
+    pub(in crate::recompiled) fn note(clean: bool) {
+        arm_report();
+        if clean {
+            CLEAN.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DIRTY.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Print at exit rather than from a harness `main`.
+    ///
+    /// `examples/wm2000-block-boot/src/main.rs` is hashed verbatim into
+    /// `DISPATCH_SOURCE_SHA256`, so reporting from there would change the
+    /// canonical program identity and invalidate the A/B. Same reasoning as
+    /// `write_barrier::guard::stats::arm_report`.
+    fn arm_report() {
+        extern "C" fn at_exit() {
+            let clean = CLEAN.load(Ordering::Relaxed);
+            let dirty = DIRTY.load(Ordering::Relaxed);
+            let total = clean + dirty;
+            let share = |n: u64| {
+                if total == 0 {
+                    0.0
+                } else {
+                    100.0 * n as f64 / total as f64
+                }
+            };
+            println!(
+                "[mirror-reconcile] boundaries={total} clean={clean} ({:.4}%) \
+                 dirty={dirty} ({:.4}%) -- dirty>0 means this site CAUGHT state \
+                 and gating it is not a pure comparison removal",
+                share(clean),
+                share(dirty),
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            unsafe { atexit(at_exit) };
+        });
+    }
+}
+
 impl CanonicalExecutableMutationStateV1 {
     pub(super) fn new(ranges: &[(u32, u32)]) -> Self {
         assert!(
@@ -19,11 +145,15 @@ impl CanonicalExecutableMutationStateV1 {
                 physical_start,
                 physical_end,
                 expected: Vec::new(),
+                expected_storage_order: Vec::new(),
+                expected_page_tree: WatchedPageTreeV3::default(),
             });
             previous_end = physical_end;
         }
         Self {
             watched,
+            pending_changed: Vec::new(),
+            recycled: RefCell::new(Vec::new()),
             sealed: false,
             expected_sha256: None,
             entries: Vec::new(),
@@ -50,6 +180,10 @@ impl CanonicalExecutableMutationStateV1 {
         if self.poison.is_none() {
             self.poison = Some(reason);
         }
+        // A poisoned state is one whose baseline can no longer be trusted, and
+        // the barrier's whole claim is relative to that baseline. Drop the
+        // recorded pages so every later boundary scans.
+        crate::write_barrier::guard::invalidate();
     }
 
     pub(super) fn begin_child_transaction(&mut self) -> u64 {
@@ -228,6 +362,23 @@ impl CanonicalExecutableMutationStateV1 {
     /// Exposed so the renderer/RSP mutation tracker can snapshot exactly what
     /// `commit_snapshot` will later compare against. Watching a different set
     /// there is what let an undeclared executable write slip through.
+    /// The sealed baseline byte for one physical address, if watched.
+    ///
+    /// Diagnostic for the zero-baseline blocker: it answers whether `expected`
+    /// ever received the published ROM bytes, which the digests cannot say.
+    pub(super) fn expected_byte_at(&self, physical: u32) -> Option<u8> {
+        self.watched.iter().find_map(|range| {
+            (range.physical_start <= physical && physical < range.physical_end)
+                .then(|| {
+                    range
+                        .expected
+                        .get((physical - range.physical_start) as usize)
+                        .copied()
+                })
+                .flatten()
+        })
+    }
+
     pub(super) fn watched_ranges(&self) -> Vec<(u32, u32)> {
         self.watched
             .iter()
@@ -254,7 +405,24 @@ impl CanonicalExecutableMutationStateV1 {
         self.watched
             .iter()
             .map(|range| {
-                let mut bytes = vec![0u8; (range.physical_end - range.physical_start) as usize];
+                let len = (range.physical_end - range.physical_start) as usize;
+                // Recycle a retired baseline buffer rather than asking the
+                // allocator for another megabyte.
+                //
+                // The snapshot is MOVED into `expected` by `commit_snapshot`
+                // and `adopt_snapshot`, which hands the buffer it replaces to
+                // `recycle`. Reusing those is what keeps a 1.14 MiB
+                // allocate-and-free off this path: profiling attributed 6.2%
+                // of self time to `_platform_memmove` and 2.7% to `madvise`,
+                // which is the allocator faulting in and returning fresh
+                // pages for a buffer the previous call had just released.
+                //
+                // `resize` after `clear` zero-fills, so a recycled buffer is
+                // indistinguishable from `vec![0u8; len]` before the copy --
+                // and `copy_logical_bytes` overwrites every byte regardless.
+                let mut bytes = self.take_recycled_buffer();
+                bytes.clear();
+                bytes.resize(len, 0);
                 view.copy_logical_bytes(
                     fn64_runtime::RdramAddr::from_offset(range.physical_start),
                     &mut bytes,
@@ -262,6 +430,112 @@ impl CanonicalExecutableMutationStateV1 {
                 bytes
             })
             .collect()
+    }
+
+    /// A retired baseline buffer to refill, or a fresh one when the pool is empty.
+    fn take_recycled_buffer(&self) -> Vec<u8> {
+        self.recycled.borrow_mut().pop().unwrap_or_default()
+    }
+
+
+    /// Whether every watched byte still equals the sealed baseline.
+    ///
+    /// The same question `current_changed_ranges(&read_snapshot_from_view(v))
+    /// .is_empty()` answers, decided without building the snapshot. On WM2000
+    /// the watched region is the 1 MiB boot bank and "nothing changed" is the
+    /// overwhelmingly common answer, so the snapshot the old form allocated,
+    /// copied, and word-reversed was thrown away unread on nearly every
+    /// dispatch. This settles it with one `memcmp` per range.
+    ///
+    /// A `false` answer commits to nothing: callers fall back to the copying
+    /// path, so every diagnostic, panic message and journal entry is produced
+    /// by exactly the code that produced it before.
+    pub(super) fn matches_view(&self, view: &fn64_runtime::RdramView<'_>) -> bool {
+        // TEMPORARY (mprotect feasibility census, 2026-08-07). One scan is one
+        // boundary; closing the census here counts exactly the faults an
+        // `mprotect` barrier would take in place of this scan.
+        super::snapshots::mprotect_census::note_boundary();
+        if !self.sealed {
+            return false;
+        }
+        // The barrier answers the same question by reading only the pages the
+        // MMU reported written, and falls through to the full scan whenever it
+        // cannot -- `take_dirty_spans` returns `None` for "scan". See
+        // `WatchedExecutableBytesV1::matches_storage_within` for why the
+        // restricted comparison decides the same predicate.
+        if let Some(spans) = self.barrier_spans() {
+            return self.watched.iter().all(|range| {
+                let clipped =
+                    crate::write_barrier::guard::clip(&spans, range.physical_start, range.physical_end);
+                range.matches_storage_within(view, &clipped)
+            });
+        }
+        self.watched.iter().all(|range| range.matches_storage(view))
+    }
+
+    /// The barrier's dirty spans for this boundary, normalized, or `None`.
+    ///
+    /// `None` means "the barrier cannot answer" and every caller responds by
+    /// running the full scan. That is the only failure mode the barrier has:
+    /// it never returns a span list that omits a page it saw written.
+    fn barrier_spans(&self) -> Option<Vec<(u32, u32)>> {
+        let spans =
+            crate::write_barrier::guard::dirty_spans().map(crate::write_barrier::guard::normalize);
+        crate::write_barrier::guard::stats::note(spans.as_ref());
+        spans
+    }
+
+    /// The changed ranges, decided against live storage without a snapshot.
+    ///
+    /// Exactly what `current_changed_ranges(&read_snapshot_from_view(v))`
+    /// returns -- same ranges, same order -- and the equivalence is asserted
+    /// over randomized contents and change patterns by
+    /// `changed_ranges_from_view_matches_the_copying_path`.
+    ///
+    /// `matches_view` already decides the boolean form of this in one `memcmp`
+    /// per range, and this is the same comparison carried far enough to name
+    /// the bytes. That is what lets the commit path stop materializing 1.44 MiB
+    /// per commit: the snapshot's only consumers were this comparison and the
+    /// baseline update, and the update only needs the bytes that changed.
+    ///
+    /// `None` means some watched byte is outside storage. The caller must then
+    /// fall back to the copying path, which raises the panic that owes.
+    pub(super) fn changed_ranges_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+    ) -> Option<Vec<(u32, u32)>> {
+        // Before sealing there is no baseline: `expected` is empty, so a
+        // comparison against it means nothing. `matches_view` refuses the same
+        // way, and callers fall back to the copying path.
+        if !self.sealed {
+            return None;
+        }
+        // As `matches_view`: read only the barrier's pages when it can answer,
+        // and the whole region when it cannot. `changed_ranges_within` names
+        // the same bytes over those pages that the full scan names over the
+        // region, which `barrier_restricted_changed_ranges_match_the_full_scan`
+        // asserts over randomized contents.
+        if let Some(spans) = self.barrier_spans() {
+            let mut changed = Vec::new();
+            for range in &self.watched {
+                let clipped = crate::write_barrier::guard::clip(
+                    &spans,
+                    range.physical_start,
+                    range.physical_end,
+                );
+                if !range.changed_ranges_within(view, &clipped, &mut changed) {
+                    return None;
+                }
+            }
+            return Some(changed);
+        }
+        let mut changed = Vec::new();
+        for range in &self.watched {
+            if !range.changed_ranges_into(view, &mut changed) {
+                return None;
+            }
+        }
+        Some(changed)
     }
 
     pub(super) fn read_snapshot(&self, mut read_physical_byte: impl FnMut(u32) -> u8) -> Vec<Vec<u8>> {
@@ -275,14 +549,75 @@ impl CanonicalExecutableMutationStateV1 {
             .collect()
     }
 
+    /// The v3 Merkle-root digest of an ARBITRARY snapshot, from scratch.
+    ///
+    /// A pure function of the watched range bounds and the bytes handed in --
+    /// it reads no cache and depends on no history. Callers pass snapshots that
+    /// are not the current baseline (validation hashes an all-zero snapshot to
+    /// reconstruct the sealed-from-zero `before_sha256`), so this must stay
+    /// cache-free to remain correct for them.
+    ///
+    /// This is the DEFINITION of the digest: leaves in page order, levels
+    /// collapsed pairwise, the apex bound to the range geometry, and the range
+    /// roots bound in watched order. [`Self::digest_expected`] is the
+    /// incremental form, valid only for the state's own baseline; the
+    /// determinism test asserts the two agree after every commit.
     pub(super) fn digest_snapshot(&self, snapshot: &[Vec<u8>]) -> [u8; 32] {
-        let mut digest = sha2::Sha256::new();
-        for (range, bytes) in self.watched.iter().zip(snapshot) {
-            digest.update(range.physical_start.to_be_bytes());
-            digest.update(range.physical_end.to_be_bytes());
-            digest.update(bytes);
-        }
-        digest.finalize().into()
+        let range_roots = self
+            .watched
+            .iter()
+            .zip(snapshot)
+            .map(|(range, bytes)| {
+                let count = bytes.len().div_ceil(CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2);
+                let mut tree = WatchedPageTreeV3::default();
+                {
+                    let leaves = tree.leaves_mut();
+                    leaves.reserve(count);
+                    for index in 0..count {
+                        let lo = index * CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2;
+                        let hi = (lo + CANONICAL_WATCHED_BYTES_PAGE_BYTES_V2).min(bytes.len());
+                        leaves.push(watched_page_digest_v3(
+                            range.physical_start,
+                            range.physical_end,
+                            index as u32,
+                            &bytes[lo..hi],
+                        ));
+                    }
+                }
+                tree.rebuild_upper_levels(range.physical_start, range.physical_end);
+                watched_range_root_digest_v3(
+                    range.physical_start,
+                    range.physical_end,
+                    count as u64,
+                    tree.apex(),
+                )
+            })
+            .collect::<Vec<_>>();
+        watched_root_digest_v3(range_roots.iter())
+    }
+
+    /// The v3 root over the CURRENT baseline, from the maintained tree.
+    ///
+    /// This is the incremental form and the reason the v3 migration exists. v2
+    /// made the leaves incremental but left the root flat: it absorbed 32 bytes
+    /// per PAGE on every commit -- 11,872 bytes on WM2000 -- so a four-byte
+    /// guest store still paid for the whole region's worth of page digests.
+    /// v3 reads only one 32-byte apex per RANGE, because
+    /// `refresh_page_digests_over` has already walked the changed leaf's
+    /// ancestors: 9 node hashes for WM2000's 370-page range.
+    ///
+    /// Equal to `digest_snapshot(&expected)` by construction -- the tree is
+    /// maintained to be precisely what rebuilding it over `expected` yields,
+    /// and both roots are the same pure function of the apexes and the range
+    /// bounds. Asserted in
+    /// `page_tree_root_is_independent_of_incremental_history`.
+    pub(super) fn digest_expected(&self) -> [u8; 32] {
+        let range_roots = self
+            .watched
+            .iter()
+            .map(|range| range.range_root_v3())
+            .collect::<Vec<_>>();
+        watched_root_digest_v3(range_roots.iter())
     }
 
     pub(super) fn seal_with(&mut self, read_physical_byte: impl FnMut(u32) -> u8) {
@@ -290,10 +625,16 @@ impl CanonicalExecutableMutationStateV1 {
             return;
         }
         let snapshot = self.read_snapshot(read_physical_byte);
-        let expected_sha256 = self.digest_snapshot(&snapshot);
+        let mut recycled = self.recycled.borrow_mut();
+        let watched_len = self.watched.len();
         for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.expected = bytes;
+            let retired = range.set_expected(bytes);
+            if recycled.len() < watched_len {
+                recycled.push(retired);
+            }
         }
+        drop(recycled);
+        let expected_sha256 = self.digest_expected();
         self.journal_root_sha256 = canonical_mutation_initial_root(
             expected_sha256,
             self.watched
@@ -311,15 +652,36 @@ impl CanonicalExecutableMutationStateV1 {
         let mut changed = Vec::new();
         for (range, current) in self.watched.iter().zip(snapshot) {
             assert_eq!(range.expected.len(), current.len());
+            let expected = range.expected.as_slice();
+            // Byte-at-a-time over the 1 MiB boot bank, at every dispatch
+            // boundary, with "nothing changed" as the overwhelmingly common
+            // answer. `==` on slices lowers to memcmp, so settle that case in
+            // one shot and only walk bytes once something actually differs.
+            if expected == current.as_slice() {
+                continue;
+            }
             let mut index = 0;
             while index < current.len() {
-                if range.expected[index] == current[index] {
+                // Skip equal bytes a chunk at a time. Chunk boundaries do not
+                // affect the result: the byte loop below still finds the exact
+                // first and last differing byte, so the emitted ranges are
+                // identical to the scalar scan's.
+                const CHUNK: usize = 16;
+                while index + CHUNK <= current.len()
+                    && expected[index..index + CHUNK] == current[index..index + CHUNK]
+                {
+                    index += CHUNK;
+                }
+                if index >= current.len() {
+                    break;
+                }
+                if expected[index] == current[index] {
                     index += 1;
                     continue;
                 }
                 let start = index;
                 index += 1;
-                while index < current.len() && range.expected[index] != current[index] {
+                while index < current.len() && expected[index] != current[index] {
                     index += 1;
                 }
                 changed.push((
@@ -399,6 +761,32 @@ impl CanonicalExecutableMutationStateV1 {
         None
     }
 
+    /// Run the dispatch reconcile without building a snapshot, if bytes match.
+    ///
+    /// Returns whether it fully discharged the reconcile. The guards are the
+    /// same three [`Self::reconcile_snapshot_before_dispatch`] runs, in the
+    /// same order, and they run unconditionally here -- only the comparison is
+    /// avoided, and only when [`Self::matches_view`] has already proved it
+    /// would find nothing. `false` means "not decided", and the caller then
+    /// runs the copying path unchanged, so any change is reported by exactly
+    /// the original code with its original diagnostics.
+    pub(super) fn reconcile_matched_before_dispatch(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+    ) -> bool {
+        self.assert_not_poisoned();
+        assert!(
+            self.sealed,
+            "canonical executable mutation state is not sealed"
+        );
+        let pending = PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|writes| writes.borrow().len());
+        assert_eq!(
+            pending, 0,
+            "canonical executable dispatch attempted with {pending} attributed write(s) not yet invalidated"
+        );
+        self.matches_view(view)
+    }
+
     pub(super) fn reconcile_snapshot_before_dispatch(&mut self, snapshot: Vec<Vec<u8>>) {
         self.assert_not_poisoned();
         assert!(
@@ -413,8 +801,82 @@ impl CanonicalExecutableMutationStateV1 {
         if let Some((physical_start, physical_end)) =
             self.current_changed_ranges(&snapshot).into_iter().next()
         {
+            // Report what the journal knows about this byte. The panic site in
+            // `execution.rs` cannot: `mutation_evidence_snapshot()` returns
+            // None there, so its dump prints nothing. Here the state is in
+            // hand, and the question is precisely whether some earlier entry
+            // DID declare this address -- which separates "no writer
+            // attributed it" from "a writer attributed it and the baseline was
+            // not advanced", the two causes that produce this same message.
+            // The actual VALUES. Every writer-side hypothesis is eliminated, so
+            // what matters now is whether `expected` was ever correct for this
+            // byte -- which the digests cannot say and no run has captured.
+            let (expected_byte, live_byte) = self
+                .watched
+                .iter()
+                .zip(&snapshot)
+                .find_map(|(range, bytes)| {
+                    (range.physical_start <= physical_start
+                        && physical_start < range.physical_end)
+                        .then(|| {
+                            let index = (physical_start - range.physical_start) as usize;
+                            (
+                                range.expected.get(index).copied(),
+                                bytes.get(index).copied(),
+                            )
+                        })
+                })
+                .unwrap_or((None, None));
+            // A RANGE around the byte, so the shape of the discrepancy is
+            // visible: a contiguous zero run means seal preceded publication
+            // for that region, while scattered differences mean the
+            // publication wrote something other than the ROM slice.
+            let window = self
+                .watched
+                .iter()
+                .zip(&snapshot)
+                .find_map(|(range, bytes)| {
+                    (range.physical_start <= physical_start
+                        && physical_start < range.physical_end)
+                        .then(|| {
+                            let index = (physical_start - range.physical_start) as usize;
+                            let lo = index.saturating_sub(8);
+                            let hi = (index + 8).min(bytes.len());
+                            let expected: Vec<String> = range.expected[lo..hi]
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
+                            let live: Vec<String> =
+                                bytes[lo..hi].iter().map(|byte| format!("{byte:02x}")).collect();
+                            format!(
+                                "at {:#010x} expected[{}] live[{}]",
+                                range.physical_start + lo as u32,
+                                expected.join(" "),
+                                live.join(" "),
+                            )
+                        })
+                })
+                .unwrap_or_default();
+            let declarations = self
+                .entries
+                .iter()
+                .flat_map(|entry| {
+                    entry.declared_writes.iter().map(move |write| {
+                        (entry.sequence, write.channel, write.physical_start, write.physical_end)
+                    })
+                })
+                .filter(|(_, _, start, end)| *start <= physical_start && physical_end <= *end)
+                .map(|(sequence, channel, start, end)| {
+                    format!("seq={sequence} {channel:?} [{start:#010x},{end:#010x})")
+                })
+                .collect::<Vec<_>>();
             recompiled_gap_panic(format!(
-                "unjournaled executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) before canonical static dispatch"
+                "unjournaled executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) before canonical static dispatch; \
+                 expected={expected_byte:?} live={live_byte:?} window={window} \
+                 journal_entries={} covering_declarations={} [{}]",
+                self.entries.len(),
+                declarations.len(),
+                declarations.join("; "),
             ));
         }
     }
@@ -429,17 +891,63 @@ impl CanonicalExecutableMutationStateV1 {
         if !self.sealed {
             return;
         }
-        self.expected_sha256 = Some(self.digest_snapshot(&snapshot));
-        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.expected = bytes;
+        // The overwhelmingly common case is that nothing changed: this path runs
+        // on every dispatch whose declaration queue was already drained. Equal
+        // bytes have an equal digest by definition, so re-hashing every watched
+        // byte to re-derive a value we already hold is pure cost -- and it was
+        // ~30% of the shell's entire profile before this check.
+        if self
+            .watched
+            .iter()
+            .map(|range| &range.expected)
+            .eq(snapshot.iter())
+        {
+            return;
         }
+        let mut recycled = self.recycled.borrow_mut();
+        let watched_len = self.watched.len();
+        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
+            let retired = range.set_expected(bytes);
+            if recycled.len() < watched_len {
+                recycled.push(retired);
+            }
+        }
+        drop(recycled);
+        // AFTER `set_expected`: the incremental root reads the page digests it
+        // just refreshed. This is the whole win -- 32 bytes per page instead of
+        // every watched byte.
+        self.expected_sha256 = Some(self.digest_expected());
+    }
+
+    /// Accept live RDRAM as the baseline without materializing a snapshot.
+    ///
+    /// The snapshot-free twin of [`Self::adopt_snapshot`]. `changed` comes from
+    /// [`Self::changed_ranges_from_view`], so an empty list means the live
+    /// bytes already equal the baseline -- the same early return
+    /// `adopt_snapshot` makes when `expected` equals the snapshot, reached
+    /// without the comparison having copied anything.
+    pub(super) fn adopt_from_view(
+        &mut self,
+        view: &fn64_runtime::RdramView<'_>,
+        changed: Vec<(u32, u32)>,
+    ) {
+        self.assert_not_poisoned();
+        if !self.sealed || changed.is_empty() {
+            return;
+        }
+        self.pending_changed = changed;
+        self.adopt_changed_from_view(view);
+        self.pending_changed.clear();
+        // AFTER the baseline update: the incremental root reads the page
+        // digests `apply_changed_from_view` just refreshed.
+        self.expected_sha256 = Some(self.digest_expected());
     }
 
     pub(super) fn commit_snapshot(
         &mut self,
         snapshot: Vec<Vec<u8>>,
         events: Vec<GuestWriteEvent>,
-        mut invalidated_generations: Vec<GenerationId>,
+        invalidated_generations: Vec<GenerationId>,
     ) {
         self.assert_not_poisoned();
         assert!(
@@ -447,6 +955,74 @@ impl CanonicalExecutableMutationStateV1 {
             "canonical executable mutation state is not sealed"
         );
         let changed = self.current_changed_ranges(&snapshot);
+        self.commit_changed(changed, events, invalidated_generations, |state| {
+            let mut recycled = state.recycled.borrow_mut();
+            let watched_len = state.watched.len();
+            for (range, bytes) in state.watched.iter_mut().zip(snapshot) {
+                let retired = range.set_expected(bytes);
+                if recycled.len() < watched_len {
+                    recycled.push(retired);
+                }
+            }
+        });
+    }
+
+    /// Commit a change set whose bytes are already in live RDRAM.
+    ///
+    /// The snapshot-free twin of [`Self::commit_snapshot`]: the changed ranges
+    /// come from [`Self::changed_ranges_from_view`] rather than from a
+    /// materialized copy, and the baseline is refreshed over just those ranges
+    /// instead of being wholesale replaced. Everything downstream -- the
+    /// attribution guard, the journal entry, the digests -- is the same code
+    /// reached through [`Self::commit_changed`].
+    ///
+    /// The `expected` baseline lands byte-identical to what the copying path
+    /// would have produced: bytes inside the changed ranges are re-read through
+    /// the same `copy_logical_bytes` lane mapping, and bytes outside them were
+    /// proven equal to the baseline by the comparison that produced `changed`.
+    pub(super) fn commit_from_view(
+        &mut self,
+        view: &fn64_runtime::RdramView<'_>,
+        changed: Vec<(u32, u32)>,
+        events: Vec<GuestWriteEvent>,
+        invalidated_generations: Vec<GenerationId>,
+    ) {
+        self.assert_not_poisoned();
+        assert!(
+            self.sealed,
+            "canonical executable mutation state is not sealed"
+        );
+        self.commit_changed(changed, events, invalidated_generations, |state| {
+            state.adopt_changed_from_view(view);
+        });
+    }
+
+    /// Refresh the baseline over `self.pending_changed`, per watched range.
+    ///
+    /// Split out so both commit forms hand `commit_changed` a closure of the
+    /// same shape. The changed list is partitioned by watched range here rather
+    /// than carried per range, because the journal entry needs it flat.
+    fn adopt_changed_from_view(&mut self, view: &fn64_runtime::RdramView<'_>) {
+        let changed = std::mem::take(&mut self.pending_changed);
+        let mut cursor = 0;
+        for range in &mut self.watched {
+            let first = cursor;
+            while cursor < changed.len() && changed[cursor].0 < range.physical_end {
+                cursor += 1;
+            }
+            range.apply_changed_from_view(view, &changed[first..cursor]);
+        }
+        debug_assert_eq!(cursor, changed.len());
+        self.pending_changed = changed;
+    }
+
+    fn commit_changed(
+        &mut self,
+        changed: Vec<(u32, u32)>,
+        events: Vec<GuestWriteEvent>,
+        mut invalidated_generations: Vec<GenerationId>,
+        adopt: impl FnOnce(&mut Self),
+    ) {
         let declarations = self.clipped_declarations(&events);
         if let Some((physical_start, physical_end)) =
             Self::first_uncovered_changed_range(&declarations, &changed)
@@ -491,7 +1067,30 @@ impl CanonicalExecutableMutationStateV1 {
         let before_sha256 = self
             .expected_sha256
             .expect("sealed mutation state has no expected digest");
-        let after_sha256 = self.digest_snapshot(&snapshot);
+        // With no changed range, the snapshot equals `expected` byte for byte,
+        // so its digest IS `before_sha256` -- hashing 1 MiB to rediscover a
+        // value already in hand is pure cost. This case is common: a writer
+        // declares a store that writes back the same bytes, so the declaration
+        // list is non-empty while nothing actually differs.
+        //
+        // Not an approximation. `changed` comes from `current_changed_ranges`,
+        // which compares the snapshot against `expected` byte for byte, so
+        // empty means equal and equal bytes have an equal digest.
+        //
+        // The baseline is adopted BEFORE the digest is read, so the entry can
+        // be built from the incremental root. Moving the adoption earlier is
+        // safe here: every check that inspects the old baseline -- the
+        // `current_changed_ranges` comparison and the
+        // `first_uncovered_changed_range` guard -- has already run and
+        // panicked if it was going to, and `changed` is already materialized.
+        self.pending_changed = changed;
+        adopt(self);
+        let changed = std::mem::take(&mut self.pending_changed);
+        let after_sha256 = if changed.is_empty() {
+            before_sha256
+        } else {
+            self.digest_expected()
+        };
         invalidated_generations.sort_unstable();
         invalidated_generations.dedup();
         let sequence = self.next_sequence;
@@ -519,9 +1118,6 @@ impl CanonicalExecutableMutationStateV1 {
         entry.journal_root_sha256 = canonical_mutation_entry_root(self.journal_root_sha256, &entry);
         let journal_root_sha256 = entry.journal_root_sha256;
         self.entries.push(entry);
-        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
-            range.expected = bytes;
-        }
         self.expected_sha256 = Some(after_sha256);
         self.journal_root_sha256 = journal_root_sha256;
     }
@@ -1582,10 +2178,104 @@ impl CanonicalLiveBlockProgramV1 {
             .map(|resolution| resolution.entry)
     }
 
+    /// Snapshot the watched region so a C shim's writes can be declared.
+    ///
+    /// Generated C shims receive a raw `rdram` pointer and write guest memory
+    /// directly, below every attributed store path, so nothing declares for
+    /// them. A raw-write watch caught exactly that: a single-byte store to
+    /// `0x0009b0b3` from `call_c` with no covering declaration, which the next
+    /// dispatch correctly reported as an unjournaled mutation.
+    ///
+    /// Returns `None` when there is no mutation state to declare against.
+    pub(super) fn snapshot_for_host_shim(&self, mem: &Rdram<'_>) -> Option<Vec<Vec<u8>>> {
+        let state = self.mutation_state.as_ref()?;
+        if !state.borrow().sealed {
+            return None;
+        }
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        Some(state.borrow().read_snapshot_from_view(&view))
+    }
+
+    /// Declare every watched byte a C shim changed, as `HostAbi`.
+    ///
+    /// Pairs with [`Self::snapshot_for_host_shim`] taken before the call. The
+    /// shim's own writes are invisible to attribution, so the diff across the
+    /// call IS the declaration.
+    pub(super) fn declare_host_shim_writes(&self, before: Option<Vec<Vec<u8>>>, mem: &Rdram<'_>) {
+        let (Some(before), Some(state)) = (before, self.mutation_state.as_ref()) else {
+            return;
+        };
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        let after = state.borrow().read_snapshot_from_view(&view);
+        // Compare against the pre-call snapshot rather than `expected`: only
+        // what THIS shim changed belongs to it.
+        let mut changed = Vec::new();
+        for ((range, before_bytes), after_bytes) in
+            state.borrow().watched.iter().zip(&before).zip(&after)
+        {
+            if before_bytes == after_bytes {
+                continue;
+            }
+            let mut index = 0usize;
+            while index < after_bytes.len() {
+                if before_bytes[index] == after_bytes[index] {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < after_bytes.len() && before_bytes[index] != after_bytes[index] {
+                    index += 1;
+                }
+                changed.push((
+                    range.physical_start + start as u32,
+                    range.physical_start + index as u32,
+                ));
+            }
+        }
+        for (start, end) in changed {
+            fn64_recomp_rs::notify_host_abi_write(start, end - start);
+        }
+    }
+
     pub(super) fn reconcile_before_dispatch(&self, mem: &Rdram<'_>) {
-        self.reconcile_before_dispatch_with(|physical| {
-            mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
-        });
+        let Some(state) = &self.mutation_state else {
+            return;
+        };
+        // This runs at EVERY dispatch boundary over the 1 MiB boot bank, and
+        // profiling put it at 1055 of 2627 samples once the hash moved to the
+        // hardware backend. `reconcile_before_dispatch_with` reads through a
+        // per-byte closure -- a bounds check and a lane XOR per byte -- which
+        // `read_snapshot_from_view` already replaces with a word-wise copy.
+        // Its own doc comment says the hot paths should use it; this is the
+        // hot path.
+        // Sealing must always happen: it establishes the baseline the journal
+        // and the receipts are bound to, and it early-returns once sealed.
+        state
+            .borrow_mut()
+            .seal_with(|physical| mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical)));
+        // The COMPARISON is what costs. It only asserts that no undeclared
+        // write occurred, which write attribution already guarantees, so it is
+        // skippable in a lane meant to be played. See
+        // `continuous_snapshot_enabled`.
+        if !continuous_snapshot_enabled() {
+            return;
+        }
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        if state.borrow().reconcile_matched_before_dispatch(&view) {
+            // Just proved the region equals the baseline, which is exactly
+            // `arm`'s precondition -- and re-arming here is not optional. The
+            // comparison DISARMED the barrier to read the dirty set, so
+            // returning without arming leaves it down, and every page written
+            // afterwards accumulates into the next boundary's set instead of
+            // being cleared by a fresh window.
+            self.arm_barrier_over_clean_region();
+            return;
+        }
+        let snapshot = state.borrow().read_snapshot_from_view(&view);
+        state
+            .borrow_mut()
+            .reconcile_snapshot_before_dispatch(snapshot);
+        self.arm_barrier_over_clean_region();
     }
 
     pub(super) fn reconcile_before_dispatch_with(&self, mut read_physical_byte: impl FnMut(u32) -> u8) {
@@ -1597,6 +2287,79 @@ impl CanonicalLiveBlockProgramV1 {
         state
             .borrow_mut()
             .reconcile_snapshot_before_dispatch(snapshot);
+    }
+
+    /// [`Self::reconcile_before_dispatch_with`] with a word-wise snapshot.
+    ///
+    /// `seal_with` still needs a byte reader; only the per-dispatch 1 MiB
+    /// snapshot moves to the view. For callers that hold the RDRAM allocation
+    /// but not an `Rdram` -- the scheduler mirror in `execution.rs` is the hot
+    /// one, running at every thread selection.
+    ///
+    /// # Why this one is gated too, as of the mirror fix
+    ///
+    /// This is the SCHEDULER-MIRROR reconcile, measured at **8.43 ms per
+    /// WM2000 render field -- 23.8% of the field**, the single largest named
+    /// line in `executor_ns`'s split. It ran the full `matches_view`
+    /// comparison UNCONDITIONALLY while its twin
+    /// [`Self::reconcile_before_dispatch`] gated the identical comparison on
+    /// [`continuous_snapshot_enabled`].
+    ///
+    /// That asymmetry is why `FN64_FAST_MUTATION_JOURNAL=1` measured **zero**
+    /// (−0.14 ms/render-field, sd 0.35, three interleaved pairs): the flag
+    /// could only switch off the site the barrier had already made nearly
+    /// free, while this one kept paying in full. Source-reading and
+    /// measurement reached that mechanism independently; see perf-method.md,
+    /// "PRE-REGISTERED, before measuring: only ONE of the two reconciles is
+    /// gated".
+    ///
+    /// **Sealing still always happens** -- it establishes the baseline the
+    /// journal and receipts are bound to, and it early-returns once sealed.
+    /// Only the COMPARISON is gated, exactly as at
+    /// [`Self::reconcile_before_dispatch`], and for the same stated reason:
+    /// the comparison only asserts that no undeclared write occurred, which
+    /// write attribution already guarantees over 505,140 journal entries with
+    /// zero uncovered changed ranges.
+    ///
+    /// **Arming is NOT gated**, and must not be. `arm_barrier_over_clean_region`
+    /// re-arms the write barrier; skipping it would leave the barrier down and
+    /// let every subsequent write accumulate into the next boundary's dirty set
+    /// instead of being cleared by a fresh window. The gated twin has the same
+    /// obligation and discharges it the same way.
+    pub(super) fn reconcile_before_dispatch_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        mut read_physical_byte: impl FnMut(u32) -> u8,
+    ) {
+        let Some(state) = &self.mutation_state else {
+            return;
+        };
+        state.borrow_mut().seal_with(&mut read_physical_byte);
+        // Census the outcome BEFORE the gate can skip it, so the redundancy
+        // question ("does this site ever catch anything?") is answerable in the
+        // very lane that would remove it. Costs nothing unless armed.
+        if mirror_reconcile_census::enabled() {
+            let clean = state.borrow().matches_view(view);
+            mirror_reconcile_census::note(clean);
+        }
+        if !continuous_snapshot_enabled() {
+            // Same obligation as the gated twin: the comparison is skipped, the
+            // re-arm is not.
+            self.arm_barrier_over_clean_region();
+            return;
+        }
+        if state.borrow().reconcile_matched_before_dispatch(view) {
+            self.arm_barrier_over_clean_region();
+            return;
+        }
+        let snapshot = state.borrow().read_snapshot_from_view(view);
+        // Panics on ANY difference, so reaching the next line means the region
+        // equals the baseline -- `arm`'s precondition, established by the
+        // absence of a panic rather than by a comparison of our own.
+        state
+            .borrow_mut()
+            .reconcile_snapshot_before_dispatch(snapshot);
+        self.arm_barrier_over_clean_region();
     }
 
     pub(super) fn begin_host_abi_transaction(
@@ -1628,7 +2391,31 @@ impl CanonicalLiveBlockProgramV1 {
     fn flush_host_abi_transaction_with(
         &self,
         token: HostMutationTransactionTokenV1,
+        read_physical_byte: impl FnMut(u32) -> u8,
+    ) {
+        self.flush_host_abi_transaction_inner(token, read_physical_byte, None);
+    }
+
+    /// [`Self::flush_host_abi_transaction_with`], plus the RDRAM view when the
+    /// caller has one.
+    ///
+    /// The changed-range list is all this needs; the full snapshot was only
+    /// ever the way to get it. `changed_ranges_from_view` produces exactly the
+    /// same ranges in the same order -- the equivalence is asserted by
+    /// `changed_ranges_from_view_matches_the_copying_path` -- with one
+    /// `memcmp` per watched range instead of rebuilding the region through a
+    /// per-byte closure. On WM2000 that region is the 1 MiB boot bank and this
+    /// runs at every HostAbi boundary; profiling attributed 90.7% of self time
+    /// here once the device-time and host-memory paths were converted.
+    ///
+    /// `None` from the view path means a watched byte is outside storage, and
+    /// the copying path is kept for exactly that case: it raises the panic
+    /// that owes.
+    fn flush_host_abi_transaction_inner(
+        &self,
+        token: HostMutationTransactionTokenV1,
         mut read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
     ) {
         let state = self
             .mutation_state
@@ -1641,22 +2428,71 @@ impl CanonicalLiveBlockProgramV1 {
             "catalog host transaction {} reached an ordering boundary with {pending} uncommitted child writer event(s)",
             token.transaction_id
         );
-        let snapshot = state.borrow().read_snapshot(&mut read_physical_byte);
-        let changed = state.borrow().current_changed_ranges(&snapshot);
+        // `reusable_changed` is `Some` only when the view path answered. The
+        // copying fallback below is the unmapped-byte case, where the callee
+        // must run its own path so the owed panic is raised by the code that
+        // owes it.
+        let (changed, reusable_changed) =
+            match view.and_then(|view| state.borrow().changed_ranges_from_view(view)) {
+                Some(changed) => (changed.clone(), Some(changed)),
+                None => {
+                    let snapshot = state.borrow().read_snapshot(&mut read_physical_byte);
+                    (state.borrow().current_changed_ranges(&snapshot), None)
+                }
+            };
         let first_new_entry = state.borrow().entries.len();
         for (physical_start, physical_end) in changed {
             fn64_recomp_rs::notify_host_abi_write(physical_start, physical_end - physical_start);
         }
-        self.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+        match view {
+            Some(view) => {
+                // Hand down the changed list computed at the top of this
+                // function instead of letting the callee rediscover it.
+                //
+                // The callee's own path is two more full scans of the same
+                // region: `matches_view` (one `memcmp` per watched range), and
+                // on a miss `changed_ranges_from_view` again. On WM2000 that
+                // region is the 1 MiB boot bank and this runs at every HostAbi
+                // boundary, so the redundant pair was ~7% of total runtime.
+                //
+                // Reuse is sound only if watched RDRAM cannot have changed
+                // between the two scans. The only thing that runs in between is
+                // the `notify_host_abi_write` loop above, and that writes no
+                // guest memory: it is `notify_attributed_guest_write`
+                // (`fn64-recomp-rs` `runtime/host.rs:464`), whose entire body is
+                // `mark_guest_write_pages` (a page-epoch counter),
+                // `WRITE_OBSERVER` (pushes onto the pending queues), and
+                // `request_guest_write_boundary` (sets a thread-local flag).
+                // None of the three touches RDRAM.
+                //
+                // `debug_assert` re-derives the list in debug builds and
+                // requires it to be identical, so a future writer added to that
+                // loop fails loudly in the test suite rather than silently
+                // reusing a stale answer.
+                self.invalidate_pending_physical_writes_reusing_changed(
+                    view,
+                    &mut read_physical_byte,
+                    reusable_changed,
+                );
+            }
+            None => {
+                self.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+            }
+        }
         state
             .borrow_mut()
             .record_host_abi_boundary(token, first_new_entry);
     }
 
     fn flush_host_abi_transaction(&self, token: HostMutationTransactionTokenV1, mem: &Rdram<'_>) {
-        self.flush_host_abi_transaction_with(token, |physical| {
-            mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
-        });
+        // `mem` is right here, exactly as in
+        // `invalidate_pending_physical_writes` below.
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        self.flush_host_abi_transaction_inner(
+            token,
+            |physical| mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical)),
+            Some(&view),
+        );
     }
 
     pub(super) fn finish_host_abi_transaction(
@@ -1680,25 +2516,98 @@ impl CanonicalLiveBlockProgramV1 {
         thread: ThreadId,
         read_physical_byte: impl FnMut(u32) -> u8,
     ) {
+        self.flush_active_host_abi_transaction_from_view(thread, read_physical_byte, None);
+    }
+
+    /// [`Self::flush_active_host_abi_transaction_with`], plus the RDRAM view
+    /// when the caller has one. See [`Self::flush_host_abi_transaction_inner`]
+    /// for why the view matters.
+    pub(super) fn flush_active_host_abi_transaction_from_view(
+        &self,
+        thread: ThreadId,
+        read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
+    ) {
         let token = self
             .mutation_state
             .as_ref()
             .and_then(|state| state.borrow().active_host_transaction(thread));
         if let Some(token) = token {
-            self.flush_host_abi_transaction_with(token, read_physical_byte);
+            self.flush_host_abi_transaction_inner(token, read_physical_byte, view);
         }
     }
 
     pub(super) fn invalidate_pending_physical_writes(&self, mem: &Rdram<'_>) -> Vec<GenerationId> {
-        self.invalidate_pending_physical_writes_with(|physical| {
+        // The twin of `reconcile_before_dispatch`: it runs at the SAME dispatch
+        // boundaries and used to take the same per-byte snapshot -- a bounds
+        // check and a lane XOR for each of 1,048,576 bytes. Fixing only the
+        // reconcile side left half the cost in place.
+        //
+        // `mem` is right here, so read the snapshot word-wise and hand the
+        // slower closure path only the callers that genuinely have nothing but
+        // a byte reader.
+        let view = fn64_runtime::RdramView::from_storage(mem.as_slice());
+        self.invalidate_pending_physical_writes_from_view(&view, |physical| {
             mem.load_bu(0xffff_ffff_8000_0000 | u64::from(physical))
         })
     }
 
+    /// Same contract as [`Self::invalidate_pending_physical_writes_with`], but
+    /// snapshots word-wise from an RDRAM view.
+    ///
+    /// `seal_with` still needs a byte reader, so that stays a closure; only the
+    /// per-dispatch 1 MiB snapshot moves to the view.
+    pub(super) fn invalidate_pending_physical_writes_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        read_physical_byte: impl FnMut(u32) -> u8,
+    ) -> Vec<GenerationId> {
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, Some(view), None)
+    }
+
+    /// [`Self::invalidate_pending_physical_writes_from_view`] for a caller that
+    /// has ALREADY scanned the watched region against this same view and is
+    /// handing the answer down.
+    ///
+    /// Only `flush_host_abi_transaction_inner` may use this, and only because
+    /// nothing between its scan and this call writes guest memory. See the call
+    /// site for that argument. Any other caller must take the scanning form:
+    /// a stale list here means the baseline advances over bytes that were never
+    /// compared.
+    fn invalidate_pending_physical_writes_reusing_changed(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+        read_physical_byte: impl FnMut(u32) -> u8,
+        changed: Option<Vec<(u32, u32)>>,
+    ) -> Vec<GenerationId> {
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, Some(view), changed)
+    }
+
     pub(super) fn invalidate_pending_physical_writes_with(
         &self,
-        mut read_physical_byte: impl FnMut(u32) -> u8,
+        read_physical_byte: impl FnMut(u32) -> u8,
     ) -> Vec<GenerationId> {
+        self.invalidate_pending_physical_writes_inner(read_physical_byte, None, None)
+    }
+
+    /// `reused_changed`, when `Some`, is the changed-range list the caller
+    /// already computed against `view`. It replaces BOTH region scans this
+    /// function would otherwise perform -- the `matches_view` short-circuit and
+    /// the `changed_ranges_from_view` that follows a miss.
+    fn invalidate_pending_physical_writes_inner(
+        &self,
+        mut read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
+        reused_changed: Option<Vec<(u32, u32)>>,
+    ) -> Vec<GenerationId> {
+        // Close the barrier's recording window before anything reads or writes
+        // the region. From here to the `arm` at the end of this function the
+        // region is ordinary writable memory, which is what the baseline
+        // update, the journal and every host writer need it to be.
+        //
+        // Unconditional and safe when not armed: the worst a spurious disarm
+        // costs is the scan that would have run anyway.
+        crate::write_barrier::guard::disarm_and_capture();
         let writes =
             PENDING_EXECUTABLE_WRITES.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
         let events = PENDING_ATTRIBUTED_EXECUTABLE_WRITES
@@ -1733,7 +2642,138 @@ impl CanonicalLiveBlockProgramV1 {
         invalidated.dedup();
         if let Some(state) = &self.mutation_state {
             state.borrow_mut().seal_with(&mut read_physical_byte);
-            let snapshot = state.borrow().read_snapshot(read_physical_byte);
+            // Reading the snapshot copies EVERY watched byte out of RDRAM, and
+            // the commit below then SHA-256s that copy. Both callers run this on
+            // every dispatch, so when neither has anything pending the pair was
+            // ~42% of the shell's profile against 1 sample of actual guest
+            // execution.
+            //
+            // NOTE: gating this read on "does some queued write intersect a
+            // watched range" is WRONG and was reverted. It assumes `writes`
+            // enumerates every mutation of watched memory, and it does not --
+            // at least one path reaches RDRAM without passing through
+            // `record_executable_and_renderer_write`. Skipping the read on that
+            // assumption leaves `expected` stale, and the next dispatch fails
+            // as "unjournaled executable mutation changed physical RDRAM
+            // [0x0009b0b3, 0x0009b0b4) before canonical static dispatch" --
+            // the same byte as the original Blocker A panic, in the gate lane
+            // at 200k steps. The unconditional read is what makes the snapshot
+            // the source of truth rather than the write queue.
+            // With nothing declared, this read exists only to discover an
+            // UNDECLARED change -- the same assertion `reconcile_before_dispatch`
+            // makes, and the one write attribution already covers. Measured
+            // over WM2000's full route, 505,140 journal entries contained zero
+            // changed ranges without a covering declaration.
+            //
+            // When writes or events ARE pending the read is mandatory: it is
+            // what advances the baseline and journals the entry the receipts
+            // bind to, so it runs regardless of this flag.
+            // NOTE: this read is NOT skippable when the journal is off.
+            //
+            // It looks like a pure "did anything change undeclared" check, but
+            // it also ADVANCES the baseline: `adopt_snapshot` accepts the
+            // current bytes as `expected`. Skipping it leaves the baseline
+            // stale, and a later dispatch re-detects a change that was already
+            // accepted -- the exact failure 6a2c330 diagnosed, and it
+            // reproduced here as
+            // "unjournaled executable mutation changed physical RDRAM
+            //  [0x0009b0b3, 0x0009b0b4)" at 3M steps under
+            // FN64_FAST_MUTATION_JOURNAL=1.
+            //
+            // The reconcile check in `reconcile_before_dispatch` IS skippable,
+            // because it only compares and never advances anything. That one
+            // stays gated; this one does not.
+            // Nothing to attribute AND the live bytes still equal the
+            // baseline: `adopt_snapshot` below is then provably a no-op, since
+            // its first act is to return early when `expected` already equals
+            // the snapshot. Skipping the read is skipping a copy whose only
+            // consumer would discard it.
+            //
+            // This is NOT the reverted write-queue gate. That one asked "does
+            // some queued write intersect a watched range" and skipped on the
+            // false premise that the queue enumerates every mutation -- so an
+            // undeclared write left `expected` stale and resurfaced later as
+            // the 0x0009b0b3 panic. This asks RDRAM ITSELF whether anything
+            // changed, which is the same source of truth the unconditional
+            // read consults. If any byte differs -- declared or not -- the
+            // match fails and the full read, commit and baseline advance run
+            // exactly as before. The snapshot stays the source of truth; only
+            // the copy it would have produced is elided.
+            if writes.is_empty() && events.is_empty() {
+                if let Some(view) = view {
+                    // With a reused list, "nothing changed" is the list being
+                    // empty -- the caller's scan already answered exactly the
+                    // question `matches_view` asks, against the same view and
+                    // the same baseline.
+                    let unchanged = match &reused_changed {
+                        Some(changed) => {
+                            debug_assert!(
+                                state.borrow().sealed,
+                                "reused changed-range list on an unsealed mutation state"
+                            );
+                            debug_assert_eq!(
+                                state.borrow().changed_ranges_from_view(view).as_ref(),
+                                Some(changed),
+                                "reused changed-range list disagrees with a fresh scan: \
+                                 something wrote watched RDRAM between the caller's scan and here"
+                            );
+                            changed.is_empty()
+                        }
+                        None => state.borrow().matches_view(view),
+                    };
+                    if unchanged {
+                        // Proven equal to the baseline with nothing to
+                        // attribute, so `arm`'s precondition holds. Without
+                        // this the barrier stays down from here to the next
+                        // boundary that happens to arm, and every boundary in
+                        // between falls back to the full scan -- which was
+                        // measured as 23% of them.
+                        self.arm_barrier_over_clean_region();
+                        return invalidated;
+                    }
+                }
+            }
+            // Decide the changed set against live RDRAM, without building the
+            // 1.44 MiB snapshot.
+            //
+            // The snapshot's only two consumers on this path were
+            // `current_changed_ranges`, which merely COMPARES it against the
+            // baseline, and the baseline update, which only needs the bytes
+            // that actually differ. `changed_ranges_from_view` answers the
+            // first directly against storage -- the same comparison
+            // `matches_view` already makes, carried far enough to name the
+            // bytes -- and the commit forms below refresh only those bytes.
+            //
+            // `None` means some watched byte lies outside storage. That falls
+            // through to the copying path, whose `copy_logical_bytes` raises
+            // the panic an unmapped byte owes, naming the first such byte. The
+            // fast path commits to nothing in that case.
+            let changed = match (view, reused_changed) {
+                // Already scanned by the caller against this same view; the
+                // `debug_assert` above has re-derived and compared it.
+                (Some(_), Some(changed)) => Some(changed),
+                (Some(view), None) => state.borrow().changed_ranges_from_view(view),
+                (None, _) => None,
+            };
+            if let (Some(view), Some(changed)) = (view, changed) {
+                if writes.is_empty() && events.is_empty() {
+                    state.borrow_mut().adopt_from_view(view, changed);
+                } else {
+                    state
+                        .borrow_mut()
+                        .commit_from_view(view, changed, events, invalidated.clone());
+                }
+                // The baseline now equals live RDRAM over every watched byte:
+                // bytes inside `changed` were just re-read into `expected`, and
+                // bytes outside it were proven equal by the comparison that
+                // produced `changed`. That is exactly `arm`'s precondition.
+                self.arm_barrier_over_clean_region();
+                return invalidated;
+            }
+            let snapshot = match view {
+                Some(view) => state.borrow().read_snapshot_from_view(view),
+                None => state.borrow().read_snapshot(read_physical_byte),
+            };
             // Skip a commit that has nothing to say. Both the guest-execution
             // path and the device-time advance
             // (`process_live_executable_writes_from_host`) call this same
@@ -1773,8 +2813,44 @@ impl CanonicalLiveBlockProgramV1 {
                     .borrow_mut()
                     .commit_snapshot(snapshot, events, invalidated.clone());
             }
+            // Both snapshot forms replace `expected` wholesale with the bytes
+            // just read from live RDRAM, so the baseline again equals the
+            // region and the barrier's precondition holds.
+            self.arm_barrier_over_clean_region();
         }
         invalidated
+    }
+
+    /// Re-protect the watched region, having just made the baseline match it.
+    ///
+    /// The ONLY caller of `arm` in the crate, so the precondition -- the
+    /// watched region equals the sealed baseline -- has one place to be
+    /// checked rather than being restated at each boundary. Every path that
+    /// reaches here has either proven equality by comparison or established it
+    /// by writing the baseline from the live bytes.
+    ///
+    /// Binding happens here too rather than at boot: the watched ranges are not
+    /// known until the mutation state is sealed, and `bind` is idempotent.
+    fn arm_barrier_over_clean_region(&self) {
+        if !crate::write_barrier::requested() {
+            return;
+        }
+        let Some(state) = self.mutation_state.as_ref() else {
+            return;
+        };
+        let watched = {
+            let state = state.borrow();
+            if !state.sealed {
+                return;
+            }
+            state.watched_ranges()
+        };
+        let (base, len) = crate::host::registered_process_rdram();
+        if base.is_null() {
+            return;
+        }
+        crate::write_barrier::guard::bind(base, len, &watched);
+        crate::write_barrier::guard::arm_after_proven_clean();
     }
 
     pub(super) fn mutation_evidence_snapshot(&self) -> Option<CanonicalExecutableMutationJournalEvidenceV1> {
@@ -1788,4 +2864,88 @@ impl CanonicalLiveBlockProgramV1 {
             .as_ref()
             .map(|generations| generations.borrow().evidence_snapshot())
     }
+
+    /// Whether `[physical_start, physical_end)` intersects the physical backing
+    /// of any generation that is CURRENTLY RESIDENT.
+    ///
+    /// This is the same scan `invalidate_physical_write` performs
+    /// (`fn64-recomp-rs` `generation/mod.rs:1292`): for each active segment,
+    /// test the owning generation's backing spans for intersection. `active`
+    /// holds segments rather than generations, so this is a handful of interval
+    /// tests per store.
+    ///
+    /// `None` means the question cannot be answered right now -- there is no
+    /// generation catalog, or the catalog is already mutably borrowed by the
+    /// runner. Callers must treat `None` as "assume resident": this runs on the
+    /// guest store path, where a borrow panic would be a hard crash and a
+    /// permissive answer would let stale translated code execute.
+    pub(super) fn resident_backing_intersects(
+        &self,
+        physical_start: u32,
+        physical_end: u32,
+    ) -> Option<bool> {
+        let generations = self.generations.as_ref()?;
+        // `try_borrow`, never `borrow`. Every catalog mutation happens in the
+        // runner between dispatches rather than under translated code, so this
+        // is not expected to contend -- but "not expected" is not a safety
+        // argument for a panic on the hot store path.
+        let catalog = generations.try_borrow().ok()?;
+        Some(resident_backing_intersects_catalog(
+            &catalog,
+            physical_start,
+            physical_end,
+        ))
+    }
+}
+
+/// The resident-backing scan itself, over a borrowed catalog.
+///
+/// This mirrors `invalidate_physical_write` (`fn64-recomp-rs`
+/// `generation/mod.rs`): for each ACTIVE generation, test that generation's
+/// DIGESTED IMAGE for intersection. `active` holds segments rather than
+/// generations, and a generation's backing is typically one or two spans, so
+/// this is a handful of interval tests per store.
+///
+/// The two predicates are a matched pair and must be narrowed together. They
+/// share `digested_image_intersects` precisely so the mirror cannot drift:
+/// retirement decides whether the translation survives the write, and this
+/// decides whether the write ends the block. If this one stayed wide while
+/// retirement narrowed, generations would remain resident and this would
+/// answer "resident" far more often -- measured as 2.48x more scheduler steps
+/// for byte-identical guest work.
+pub(super) fn resident_backing_intersects_catalog(
+    catalog: &BackedPrecompiledGenerationCatalogV1,
+    physical_start: u32,
+    physical_end: u32,
+) -> bool {
+    let backings = catalog.backings();
+    let generations = catalog.generations();
+    catalog.active_generations().into_iter().any(|generation| {
+        // `map_or(true, ..)`, not `is_ok_and`, in BOTH lookups. A missing
+        // backing or a missing generation means the catalog disagrees with its
+        // own lists -- a construction invariant enforced over in
+        // `fn64-recomp-rs`, a different crate from this caller. `is_ok_and`
+        // answers "not resident" there, the PERMISSIVE direction: a false
+        // negative lets the write skip its block boundary and stale translated
+        // code executes. Every other unanswerable case in this predicate
+        // resolves to "resident" (`unwrap_or(true)` in `snapshots.rs`); these
+        // match.
+        let Ok(backing_index) =
+            backings.binary_search_by_key(&generation, |backing| backing.generation())
+        else {
+            return true;
+        };
+        let Ok(generation_index) =
+            generations.binary_search_by_key(&generation, |generation| generation.id())
+        else {
+            return true;
+        };
+        let generation = &generations[generation_index];
+        backings[backing_index].digested_image_intersects(
+            generation.image_start(),
+            generation.image_end(),
+            physical_start,
+            physical_end,
+        )
+    })
 }
