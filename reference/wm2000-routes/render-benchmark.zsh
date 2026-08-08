@@ -215,16 +215,34 @@ print "warmup_gfx:   $WARMUP_GFX  (fields before this many graphics submits are 
 print "load:         $LOAD"
 print ""
 
+# The UNFILTERED stream, at a per-run path. Load-bearing, and it cost a
+# completed full-route census run to learn (perf-method rule 27).
+#
+# The filter below is an allowlist, so ANY report tag not named in it is
+# invisible in whatever log the caller captured -- that silently ate both a new
+# `[mirror-reconcile]` census and the pre-existing `[mprotect-barrier]` stats.
+# The old destination was a FIXED `/tmp` path that every subsequent run
+# overwrote, so by the time the omission was noticed the evidence was already
+# destroyed, and the instrument looked broken when it was working perfectly.
+#
+# A unique path per run means a dropped tag is recoverable after the fact
+# instead of needing the whole run repeated.
+FULL_LOG="${FN64_BENCHMARK_FULL_LOG:-/tmp/fn64-render-benchmark-$$-$(date +%Y%m%d-%H%M%S).log}"
+
 # `--line-buffered` is load-bearing: this run takes minutes, and a block-
 # buffered filter shows nothing until the process exits, which is
 # indistinguishable from a wedge. The heartbeat exists precisely so progress is
 # observable while running (rule 7); swallowing it in a pipe buffer defeats it.
-"$BINARY" 2>&1 | tee /tmp/fn64-render-benchmark.log | grep -E --line-buffered \
-    '^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done'
+#
+# `[mprotect-barrier]` and `[mirror-reconcile]` are in the allowlist because
+# they are gated diagnostics that print only when explicitly armed -- when off
+# they cost nothing, and when on they are the reason the run was made.
+"$BINARY" 2>&1 | tee "$FULL_LOG" | grep -E --line-buffered \
+    '^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done|^\[mprotect-barrier\]|^\[mirror-reconcile\]'
 
 # The census prints from `atexit`, so it lands after the harness's own summary.
 print ""
-print "full log: /tmp/fn64-render-benchmark.log"
+print "full log (UNFILTERED, per-run): $FULL_LOG"
 print ""
 print "READING THE RESULT"
 print "  RATIO A is the 60fps bar (target 16.667 ms/field). RATIO B is speed"
