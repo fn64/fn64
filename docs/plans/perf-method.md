@@ -272,6 +272,25 @@ The census prints span graphics submits next to the distribution and warns
 outright at zero, because a beautiful p99 over a route that drew nothing is
 the most plausible-looking wrong number available here.
 
+**That route has now produced TWO retracted figures** — the "1.01 ms guest
+code" claim and the "removing the entire guard lands near 1.27x" estimate.
+Both were self-time *shares* from a route with no frames, quoted as durations
+about a route that has them. Connecting them is what should stop a third.
+
+**11a. State the ROUTE and the BINARY beside every per-field figure.** Route
+alone is not sufficient, learned 2026-08-08: `examples/wm2000-block-boot/src/
+main.rs` is hashed verbatim into `DISPATCH_SOURCE_SHA256`, so **editing it
+changes the canonical program identity** and "the same route" then runs a
+*different program*. A delta measured across that boundary reads exactly like a
+performance change and is not one (rule 19: a difference proves something
+changed, never which thing).
+
+An A/B is only valid between two runs of the **same binary**, interleaved. When
+a figure must survive as a baseline, record the commit it was measured at — and
+prefer quoting **shares**, which are robust to both instrument perturbation
+(rule 17) and binary identity, over absolute milliseconds, which are robust to
+neither.
+
 ### 12. A large byte count is not a bottleneck
 Bytes moved and time spent are different quantities, and reasoning from the
 first to the second is not measurement — it is the plausible-sounding story
@@ -2362,6 +2381,17 @@ which baselines at **35.24 ms/field (2.11x budget)** — matching the 35.84 /
 route for this change, because **it is the route the 8.43 ms mirror figure was
 measured on.**
 
+> ⚠️ **The 35.24 baseline is pinned to the binary at `89e00d0` and expires
+> there.** `main.rs` was edited immediately afterwards by the ROM-content work,
+> and it is hashed into `DISPATCH_SOURCE_SHA256` — so a later run of "the same
+> route" is a **different program**. Treat 35.24 as a historical datum, not a
+> standing baseline: re-measure both lanes on the current tree before comparing
+> anything to it. Full reasoning at the ⚠️ note above the split table in "THE
+> RENDER FIELD IS 83% GUEST+RUNTIME".
+>
+> Note this makes the section's own lesson recursive: **a per-field figure needs
+> its route *and* its binary stated.** Route alone was not enough.
+
 **The 22.51 ms figure in "THE STANDING BAR" is a different route and must not
 be subtracted from.** An arithmetic of `22.51 − 8.43 = 14.1` was proposed and
 is void: the 8.43 was never measured on the route that produces 22.51. Two
@@ -2444,6 +2474,30 @@ headless, quiet machine, with all three required gates armed
 (`FN64_PHASE_TIMING=1 FN64_EXECUTOR_SPLIT=1 FN64_FRAME_CENSUS_POPULATIONS=1` —
 see rule 27). **This supersedes the apparatus framing in the split table
 below.**
+
+> ⚠️ **THESE ABSOLUTE ms FIGURES ARE PINNED TO A BINARY THAT NO LONGER EXISTS.
+> Do not diff a later run against them.**
+>
+> They were measured at commit `89e00d0`, before the ROM-content work edited
+> `examples/wm2000-block-boot/src/main.rs`. That file is **hashed verbatim into
+> `DISPATCH_SOURCE_SHA256`** (`examples/wm2000-block-shards/build.rs`), so
+> editing it changes the canonical program identity: the benchmark binary
+> after that point **is not the same program** that produced 56.232 ms.
+>
+> A delta taken against these numbers across that boundary measures *"a
+> different binary"* and reads exactly like a performance change. That is rule
+> 19's shape — a difference proves something changed, never *which* thing.
+>
+> **What to do instead:** re-measure BOTH lanes on the current tree. An A/B is
+> only ever valid between two runs of the same binary, interleaved, on a quiet
+> machine. Ask the coordinator for the tree state rather than inferring it from
+> the working directory — HEAD moved twice under this session while a peer
+> agent edited the shared worktree.
+>
+> **What survives the boundary: the SHARES.** 16.2% mirror / 83.2% resume NET /
+> 16.4% apparatus reproduced to three significant figures across both gate
+> lanes, and shares are robust to instrument perturbation (rule 17) in a way
+> absolute ms are not. **Quote the percentages, re-measure the milliseconds.**
 
 **The slow (render) field, the population that fails the bar:**
 
