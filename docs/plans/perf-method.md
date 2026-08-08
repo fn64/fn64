@@ -1020,6 +1020,147 @@ somebody should:
 Until that split exists, the 5.84 ms figure is misleading: it is the mean's
 distance from the bar, and the mean is not what fails.
 
+## ANSWERED: the guest renders at 30 Hz. The split is perfect alternation.
+
+Measured 2026-08-08 at `c2caafe` (the `fn64-audio` `codegen-units=1` lane),
+route `a9e1b25e`, RT64, headless, 2.1M steps, quiet machine. Instrument:
+`FN64_FRAME_CENSUS_POPULATIONS=1` plus `FN64_FRAME_CENSUS_SEQUENCE`.
+
+**Look at the sequence before any statistic.** 400 consecutive steady-state
+fields from field 2000, `S` = over budget, `f` = under:
+
+```
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+```
+
+**Zero defects in 400 fields.** Representative samples:
+
+| field | ms | new gfx submits |
+|---:|---:|---:|
+| 2000 | 38.290 | 3 |
+| 2001 | **8.758** | **0** |
+| 2002 | 37.160 | 3 |
+| 2003 | **8.354** | **0** |
+
+**WM2000 runs its main loop at 30 Hz.** It builds a display list on every
+second VI field; the off-field carries only audio, present, and the runtime
+floor. That is a normal N64 design choice, not a bug, and the emulator must
+still deliver 60 fields per second regardless.
+
+### The contingency table — submits *partition* the populations
+
+| | fast | slow |
+|---|---:|---:|
+| advance carried 0 new submits | **5,657** | 0 |
+| advance carried >=1 | 4 | **5,659** |
+| mean submits when nonzero | 1.00 | **2.88** |
+
+100.0% of slow fields carried a submit; 0.1% of fast fields did. **Four fields
+out of 11,321 break the pattern.** This is not an association, it is a
+partition.
+
+### The two populations
+
+| | fast | slow |
+|---|---:|---:|
+| fields | 5,661 (50.0%) | 5,660 (50.0%) |
+| mean | **8.89 ms** | **35.84 ms** |
+| p50 / p95 | 8.80 / 9.63 | 36.99 / 38.33 |
+| share of wall time | **19.9%** | **80.1%** |
+
+Ratio 4.03x. **The program spends 80% of its time in 50% of its fields**, and
+the off-field is at **0.53x the budget** — it has more than 7 ms of headroom.
+
+### The prediction that was right, and the one that was wrong
+
+The brief's hypothesis was "slow half carries ~2 submits, fast half ~1 ->
+submit batching". **That is wrong**, and it was ruled out by arithmetic before
+the run: one extra submit is worth ~7 ms, which would put both modes over
+budget (~19 and ~26) and cannot produce a fast mode at 8.9. The surviving
+version — **~2.9 vs ~0** — is what measured. The 1.44 submits/field average was
+itself the tell: 1.44 = 2.88 per two fields.
+
+### Counter ratios: 16 of 21 differ, but they are ONE finding
+
+Every differing counter is downstream of "this field carried 2.88 display
+lists": `gfx_ns` 5,708x, `rsp_steps_gfx` 10,819x, `dpc_calls` 4,071x,
+`gfx_lle_rsp_ns` 10,962x. Do not read them as sixteen independent leads.
+
+**The three that do NOT differ are the load-bearing ones:**
+
+| counter | ratio |
+|---|---:|
+| `audio_tasks` | 1.006x |
+| `audio_lle_ns` | 1.002x |
+| `rsp_steps_audio` | 1.003x |
+
+Audio runs flat at 60 Hz across both populations. **That is what proves the
+alternation is a guest rendering cadence and not a host artifact** — a host
+scheduling effect would modulate audio too.
+
+One counter **inverts**: `vi_present_ns` is **0.513x**, i.e. presentation costs
+*more* on the cheap field. Consistent with present being per-field work that
+merely looks smaller beside 27 ms of rendering.
+
+The barrier concentrates 3.8x on slow fields (991 vs 263 boundaries/field), so
+**the guard is not a flat per-field tax — it rides the submits.** This retires
+the reading of the 682-boundaries-per-field candidate as uniform overhead.
+
+### Rule 16 — a statistic that cannot distinguish "random" from
+### "periodic with the wrong period" is not a test for periodicity
+
+Rule 6a in statistical clothing. Lag-1 autocorrelation was the requested
+decision statistic, with a rule fixed before the data: strongly negative ->
+alternation, strongly positive -> contiguous phase blocks, near zero ->
+neither. Synthetic sequences through the same estimator:
+
+| shape | lag1 | lag2 | lag3 |
+|---|---:|---:|---:|
+| period-2 `fSfS` | **-1.00** | +0.99 | -0.99 |
+| period-4 `ffSS` | **+0.00** | -0.99 | -0.00 |
+| period-3 `fSS` | **-0.50** | -0.50 | +0.99 |
+
+**A period-4 sequence reads lag1 = +0.00 — dead centre of the "random" band —
+while being perfectly periodic.** Period-3 reads -0.50, which looks like weak
+alternation when the real signal is at lag 3. Reporting lag-1 alone could have
+produced a confident wrong answer to the exact question being asked.
+
+The measured lag table: **lag1 = -0.550**, lag2 +0.572, lag3 -0.558, lag4
++0.572, lag5 -0.558, lag6 +0.572. Odd lags negative, even positive, equal
+magnitude — the textbook period-2 signature.
+
+Note lag1 is **-0.550 and not -0.998** purely because each mode has internal
+variance (the slow mode spans 36.5-38.3 ms). The alternation itself is
+defect-free. **The coefficient understates a signal the printed string shows as
+perfect** — which is the whole argument for printing the string first. Had only
+the number been reported, -0.550 sits close enough to the -0.3 threshold to
+invite hedging about a result that is in fact exact.
+
+The instrument prints the raw pattern first, then lags 1..6, then the
+contingency table. Decision rule and the period-3/period-4 blind spots are
+pinned as tests.
+
+### What this means for the bar
+
+**The ceiling on any fix aimed only at the slow half is the fast mean, 8.89
+ms/field = 0.53x budget — it clears the bar with 7.8 ms to spare.** So the
+population split is not merely diagnostic; the fix has room.
+
+But state the requirement correctly. The slow field must absorb **2.88 display
+lists in 16.667 ms** and currently takes 35.84. That is a **2.15x reduction on
+the rendering field specifically**, not a mean shave — and note the mean-based
+framing (5.84 ms, 26%) understates it, because averaging the requirement across
+an off-field that already has 7.8 ms of headroom flatters it.
+
+**Every queued mean-shaver is now sized against the wrong denominator.** The
+`run_imem` double-decode, the clean-boundary count and the DPC staging copy all
+distribute their savings across both populations; only the ~50% landing on the
+rendering field counts toward the bar.
+
 ## THE STANDING BAR: 16.667 ms/field, hardware parity
 
 The goal is **at least as good as original hardware, with the game playable**.

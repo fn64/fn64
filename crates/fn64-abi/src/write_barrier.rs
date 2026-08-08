@@ -1348,6 +1348,22 @@ pub mod guard {
             *ENABLED.get_or_init(|| super::super::env_flag("FN64_MPROTECT_BARRIER_STATS"))
         }
 
+        /// Running totals for the counters `frame_census` samples per VI
+        /// field: `(served, fell_back, dirty_pages, clean_boundaries)`.
+        ///
+        /// Four relaxed loads. When `FN64_MPROTECT_BARRIER_STATS` is off these
+        /// all read zero, which is the correct answer -- nothing was counted --
+        /// and the bimodal census reports the bucket difference as "no data"
+        /// rather than as "no difference".
+        pub fn running_totals() -> (u64, u64, u64, u64) {
+            (
+                SERVED.load(Ordering::Relaxed),
+                FELL_BACK.load(Ordering::Relaxed),
+                DIRTY_PAGES.load(Ordering::Relaxed),
+                CLEAN_BOUNDARIES.load(Ordering::Relaxed),
+            )
+        }
+
         /// Record the outcome of one boundary's ask.
         pub fn note(spans: Option<&Vec<(u32, u32)>>) {
             if !enabled() {

@@ -148,6 +148,23 @@ pub(crate) fn note_rsp_chunk(graphics: bool, steps: u64, words: u64) {
     }
 }
 
+/// Running totals for the counters `frame_census` samples per VI field.
+///
+/// `(rsp_steps_gfx, rsp_steps_audio, rsp_entries, dpc_calls)`. Read
+/// unconditionally -- four relaxed atomic loads -- because the bimodal census
+/// arms this module's counters through its own gate and needs the running
+/// value at a field boundary, not the at-exit total. When
+/// `FN64_DPC_COPY_CENSUS` is off every counter reads zero, which is the
+/// correct answer: nothing was counted.
+pub(crate) fn running_totals() -> (u64, u64, u64, u64) {
+    (
+        RSP_STEPS_GFX.load(Relaxed),
+        RSP_STEPS_AUDIO.load(Relaxed),
+        RSP_ENTRIES.load(Relaxed),
+        CALLS.load(Relaxed),
+    )
+}
+
 fn arm_report() {
     extern "C" fn at_exit() {
         let calls = CALLS.load(Relaxed);
