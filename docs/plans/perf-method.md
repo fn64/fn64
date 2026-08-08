@@ -69,6 +69,21 @@ scratch by someone who knew that history.
 reject.** Grepping lane A's log for `reference` also returned nothing, which
 would have exposed it immediately.
 
+**Knowing this rule does not confer immunity — it recurred within the hour, and
+the second instance was nearly the expensive one.** A running A/B driver was
+diagnosed *dead* by `ps -eo pid,comm | grep -c "fn64-ab-codegen"` returning 0.
+`comm` reports the **interpreter** — every shell script shows as `/bin/zsh` —
+so that grep can never match a running zsh script under any circumstances.
+Verified: `comm` yields `/bin/zsh` for all shells while `ps -eo pid,args` finds
+the script immediately. A replacement driver was written on that false
+diagnosis and deleted before it ran; had it started, **two benchmarks would
+have shared the CPU and silently overwritten each other through the fixed log
+path** — both hazards named two paragraphs above, triggered together.
+
+The general form: `comm` is a proxy for "what is running" and drops exactly the
+information that identifies a script. Match on `args` when the identity lives
+in the arguments.
+
 The evidence did exist, in the unfiltered `tee` target
 `/tmp/fn64-render-benchmark.log`: `[wm2000-block-boot] registered rt64 renderer
 (320x240)`. Two consequences worth keeping:
