@@ -466,6 +466,47 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+## The write barrier now SAVES 12.4 ms/field, and the GPU attribution is retracted
+
+Measured 2026-08-08 on the RT64 gameplay route (`a9e1b25e`), barrier on vs off:
+
+| | barrier ON | barrier OFF |
+|---|---:|---:|
+| mean | **22.96 ms** | 35.32 ms |
+| p50 | — | 29.58 |
+| p95 / p99 | — | 59.30 / 67.21 |
+| ratio A | **1.38x** | 2.12x |
+| wall | ~268 s | 422.99 s |
+
+**Turning the barrier off makes the program 1.58x SLOWER.** It is not overhead
+to be removed; it saves ~12.4 ms/field by replacing a scanning journal with
+MMU-reported dirty pages.
+
+This **reverses a recorded dead end for this route.**
+`FN64_FAST_MUTATION_JOURNAL=1` is filed above as measuring **zero** — true on
+the old menu route, and **strongly negative here** (22.65 -> 35.32 ms/field).
+A dead end is scoped to the route that produced it; re-measure before reusing
+one.
+
+**The 17.8% sys-time GPU attribution is RETRACTED.** `/usr/bin/time -l` on the
+barrier-off control: 422.99 real / 398.97 user / **36.02 sys = 8.5%**, with
+**77 voluntary context switches** over seven minutes, 18 page faults, 0 swaps.
+A process blocked on a GPU driver shows neither profile. The barrier A/B bounds
+sys at ~1.05 ms/field for the barrier and ~3.0 ms/field elsewhere — a **bound,
+not an attribution**, because the barrier-off lane is a different program.
+
+What survives cleanly is a **refutation, not a null result**: `(u+s)/wall` =
+1.014 / 1.009 / 0.992 with 66-114 voluntary switches across three runs. The
+process is on-CPU essentially 100% of the time. **There is no GPU stall to
+pipeline away**, and that line of inquiry is closed rather than merely
+unsupported.
+
+Two cautions attached to the control's own numbers: `max=3182.79 ms` is ~90x
+p99 and sits inside the steady window — the same arena-load transient flagged
+at ~1,450 ms elsewhere — so the median is the honest comparator and the mean
+carries one outlier. And its `gfx_submits=16283` is the steady-span count, not
+the whole-run 16586; compare like to like before making a byte-identity claim.
+
 ### 15. Verify the state you meant to cause, not the call you made
 Five instances in one day, 2026-08-07/08, all the same shape and none of them
 subtle in hindsight:
