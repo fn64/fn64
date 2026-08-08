@@ -1368,6 +1368,34 @@ the *binary* returns 0 and means nothing — the string is built at runtime from
 the `rt64` arm panics rather than falling back, so a mislabeled
 reference-backend number is not possible on this lane.
 
+### 19. A size difference proves "something changed", never "the thing you meant"
+
+I asserted two A/B binaries were the right lanes because one was **4.4 MB
+smaller** (95,304,208 vs 90,878,784, distinct SHAs) — *"exactly the shape of
+removing a per-instruction verification block from every runner."* I called it a
+stronger lane check than a source grep, and I was **wrong**.
+
+Reading the *generated source* the armed build actually wrote showed the
+detector still present — `EXPECTED_WORDS` tables and `verify_live_word!` calls
+in the emitted `'run: loop`, 64 references in one runner alone, with a verified
+build-time mtime. **Had the A/B run, it would have measured verify-on against
+verify-on and reported a fabricated delta** — the 4.9x incident's exact shape.
+
+The size *had* changed, because 32 of 142 runners regenerated. A partially
+regenerated catalog is a different binary and an invalid experiment, and a byte
+count cannot tell those apart from the change you intended.
+
+**Root cause worth knowing on its own: `cargo:rerun-if-env-changed` only takes
+effect from the run that emits it onward.** On the first build after adding a
+new env-gated flag, cargo has no recorded dependency on that variable, so the
+build scripts do not re-run and the flag silently does nothing. Force it with
+`touch <build.rs>` on the first build after introducing the gate.
+
+The general rule: **verify the state you meant to cause, at the layer that owns
+it.** For a codegen flag that layer is the emitted source, not the binary's
+size. This is rule 15 again, and note it bit the *reviewer* — I proposed the
+weaker check to an agent that was already doing the stronger one.
+
 ### 18. `pcpu` and `pgrep -f` both lie about this workload
 Two liveness checks that read plausibly and are wrong, both rule-15 shapes,
 both caught in practice on this project:
@@ -1383,6 +1411,33 @@ both caught in practice on this project:
 A third instance of the same family: sampling a **recycled PID** that now
 belongs to an unrelated process. A PID is not a durable handle; re-verify the
 identity, not just the number.
+
+**Two more on 2026-08-08, from OPPOSITE directions, within minutes of each
+other. The generalization is the point: a query that cannot distinguish
+"absent" from "never looked" reports both as zero.**
+
+- **`comm` attributed 17 rustc to the wrong owner.** An agent holding a queued
+  build read `ps -eo pcpu,comm`, saw 17 busy rustc, and reported "the peer's
+  shard rebuild is running" — twice, in status messages. The peer's lock had
+  already released and **every one of those processes was the reporting
+  agent's own**, compiling shards into its own `target/`. `comm` shows the
+  binary and drops the argument list, which is where the identity lives:
+  `ps -eo args` named the target directory immediately. Note the failure is
+  *stable* — "is rustc busy" would have answered "peer is building" forever,
+  because the check cannot represent ownership at all.
+- **A glob that matched no files reported "0 references."** A grep for
+  `EXPECTED_WORDS` whose file glob matched nothing returned zero hits, which
+  reads exactly like *the detector has been deleted* — the alarming answer,
+  indistinguishable from *the question was never asked*. Caught only because
+  the count was suspiciously clean.
+
+**The check that worked in the same session was size-based**, and it worked
+because it could not silently degrade: verify-on 95,304,208 bytes vs verify-off
+90,878,784 — a 4.4 MB difference, independent of any glob, pattern or process
+name. Prefer a check whose failure mode is a *wrong number* over one whose
+failure mode is *zero*. Rule 6a's ten-second test applies directly: run the
+query against the state it is supposed to reject, and confirm the answer
+changes.
 
 ### 17. Do not budget instrumentation cost by counting clock reads
 An agent predicted its five new timers would cost **0.029 ms/field** — 33.8 ns
