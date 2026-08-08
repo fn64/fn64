@@ -466,6 +466,40 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+### 15. Verify the state you meant to cause, not the call you made
+Four instances in one day, 2026-08-07/08, all the same shape and none of them
+subtle in hindsight:
+
+- **A green test run in a dirty tree.** The suite passed while the definition
+  the committed caller needed sat uncommitted beside it. HEAD did not compile.
+- **`kill -STOP` returning 0 while the targets stayed `RN`.** The exit code
+  reports that a signal was *sent*, never that it *landed*. The verification is
+  `ps -o stat` showing `T`.
+- **`pgrep -f "wm2000-block-boot"` matching 21 PIDs** — the benchmark plus idle
+  zsh wrappers, `ugrep`, `/usr/bin/time`, and 15 *suspended* rustc whose command
+  lines contained the path. A monitor armed on that pattern waited for processes
+  that were waiting for the monitor: a self-deadlock. Instantaneous CPU
+  (`ps -eo pcpu,comm`, threshold) cannot make that mistake.
+- **A guard that worked, under a label that lied.** The check printed the
+  offending PID; an unconditional `echo "(empty = none)"` sat beneath it. The
+  evidence was right there and the text next to it asserted the opposite.
+
+Two halves, and the second is the one that nearly slipped through:
+
+1. **Observe the state you intended to cause, not the call you made to cause
+   it.** Exit codes, pattern matches, and "the command ran" are all proxies.
+2. **Make the label a function of the observation, never a constant printed
+   beside it.** A hardcoded verdict is an assertion with no evidence behind it,
+   sitting exactly where evidence belongs.
+
+**Corollary — do not hand-shake on observations of quiet.** Two benchmark
+collisions came from an all-clear that was true when issued and stale when
+acted on: a run started in the seconds between the check and the resume. A
+check and an action cannot be made atomic across agents, so no amount of
+re-checking fixes it. Coordinate on *declarations* — "N runs remain", "runs
+finished" — not on observed idleness. A suspended build resumes from cache with
+nothing lost; a contaminated measurement is silently wrong.
+
 ### 14. A rate-limited loop cannot report its own cost
 Retract the windowed **~18.8 ms p50** wherever it appears. It is not evidence
 the window is faster than the headless lane; it is not evidence of anything.
