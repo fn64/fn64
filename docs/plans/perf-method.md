@@ -1003,6 +1003,67 @@ throughout (`gfx_submits=16586`, `audio_submits=11005`, `sp_tasks=27591`,
 `vi_interrupts=12008`, `controller_ops=3115`, `sim_time=18776001537`,
 `render_error=None`).
 
+### CLOSED: async dispatch buys 0 ms, and WM2000 is already `HleOptimized`
+
+Two proposed tracks, both closed on evidence already in the tree.
+
+**Track A — asynchronous RSP/RDP dispatch: ceiling is 0 ms, not 13.4.**
+
+The deferral it asks for **already exists**. Every LLE path ends in
+`start_live_rcp_task_with_latency(..., pre_ucode_steps + lle.steps)`
+(`pi/mmio.rs:828` → `fabric_ops.rs:182`), scheduling the SP event at
+`now + sp_latency` with DP one cycle later. **The guest-observable interrupt is
+already delayed by the real instruction count** — 179,553 cycles per task
+against 1,563,624 per field, i.e. 11.5% of a field, which is the physically
+correct amount. The comment at `lifecycle.rs:1070-1073` describes *host*
+ordering, not guest visibility.
+
+A genuine chunked async path also exists — `HLE_RENDER_CONTINUATION` +
+`advance_hle_render_task` (`lifecycle.rs:152-224`), resuming at each host
+scheduling boundary and handling mid-task SIG0 yield. **That is precisely the
+architecture Track A proposed, already built.** WM2000 never enters it because
+it takes `NeedsLle` first.
+
+**The decisive reason is stronger than "not enough": the off-field's 7.8 ms is
+not host idle time.** `GuestDrain::advance_to_next_device_event`
+(`fn64-boot-harness/src/lib.rs:1317-1340`) *jumps* the virtual clock to the
+next deadline when the guest quiesces — it does not spin. The off-field costs
+8.89 ms of real host work. There is no wall-clock slack to donate, so moving
+rasterization there converts 35.84/8.89 into ~22.4/22.4: **the same total wall
+time, both fields still missing 16.667.** Async dispatch redistributes zero
+host work.
+
+**Track B — instruction volume: the premise was inverted. WM2000 already runs
+`HleOptimized`.**
+
+`main.rs:894-902` selects `LleAccuracy` **only** in
+`generated_runner_rsp_audit_mode`, which requires argv to be exactly
+`[exe, GENERATED_RUNNER_RSP_RUNTIME_ARGUMENT_V1]`. The benchmark passes no
+argv, and `HleOptimized` is the thread-local default. The brief's claim that
+WM2000 selects `LleAccuracy` was **false**.
+
+It is not recognized, and the counters prove a partition rather than a sample:
+`gfx_ms` accumulates at both the HLE chunk seam (`setup.rs:454`) and the LLE
+seam (`rsp_commit.rs:386`), and the census reads **`phases=33172` against
+`tasks=16586` — exactly 2x**. Every task is HLE-preflighted, rejected with
+`NeedsLle`, and re-run through LLE.
+
+**Populating the ucode catalog would not fix it.** `xbus_dpc=16586`,
+`dram_dpc=0` — 100% XBUS, so RDP commands live in DMEM produced by the
+microcode as it runs; there is no display list in RDRAM to decode. And
+`imem_replacements=60763` = **3.66 IMEM overlay swaps per task**: the ucode
+reloads its own text mid-task, so a single 4 KiB digest cannot identify it.
+`microcode.rs:11-12` already says F3DZEX2 is "named but unadmitted because
+those allowed sources do not specify its family-specific continuation and
+branch commands" — admitting it is a clean-room RE project under an MIT
+constraint, not a config change.
+
+**Correction to this file: the "gfx non-LLE (HLE preflight/chunk) 3.92
+ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
+2,213 µs/call before, **1.88-2.36 µs/call after**, reproducibly across two
+independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
+Nobody should target it.**
+
 ### 67% OF THE RENDER FIELD IS UNACCOUNTED FOR — and that is the real target
 
 Modern hardware is orders of magnitude faster than an N64. It should not be
