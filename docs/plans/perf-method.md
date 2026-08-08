@@ -4,6 +4,97 @@ Written 2026-08-07, after a session that made **nine wrong calls** on this
 question and shipped six real wins. The wins all came from handing an agent a
 measurement. The wrong calls all came from handing one a hypothesis.
 
+## CLOSED: the choppy audio is the speed deficit. There is no audio bug.
+
+Investigated 2026-08-08 after the owner played WM2000 and reported choppy audio
+at the title screen. **Outcome: no defect on the audio path. The stream is
+starved because the emulator runs at ~46% of real time, and the audio shortfall
+and the render-field shortfall are ONE measurement, not two problems.**
+
+Record this before the mechanism, because it was the expensive part: **the
+figure that opened the investigation was wrong by 2x.** "91.5% of real time"
+came from reading `AudioOutputStats::samples` as frames when it counts i16
+channel samples. Corrected, delivery is **45.7%**. See rule 21; the wrong number
+is left standing in `shell-frontend-gaps.md` with a correction beside it.
+
+### The arithmetic, which closes exactly
+
+**Guest side — healthy in virtual time.** On the byte-identity gate route,
+`sim_time=18776001537` is **200.28 virtual seconds** at 93.75 MHz:
+
+| | | |
+|---|---:|---|
+| `vi_interrupts=12008` | **59.96 fields/virtual-s** | nominal 60 ✓ |
+| `audio_submits=11005` | **54.95 buffers/virtual-s** | |
+| ratio audio/VI | **0.9165** | not 0.5 — no alternate-buffer drop |
+
+**Buffer geometry.** A measured AI buffer is 1048 i16 = **524 stereo frames =
+16.38 ms of audio at 32 kHz** — one VI field. So the guest produces almost
+exactly one field of audio per field, and needs **61.0 buffers/wall-second** to
+sustain realtime.
+
+**Host side — the deficit.** The owner's session delivered 1,290,576 samples ÷ 2
+= 645,288 frames over 44.1 s:
+
+| | |
+|---|---:|
+| delivered | **14,632 frames/wall-s** |
+| against 32,000 Hz | **45.7% of realtime** |
+| as buffers | **27.9/s against 61.0 needed** |
+
+**27.9 buffers/s is the emulator delivering VI fields at 27.9 Hz instead of 60.**
+The audio deficit *is* the field-rate deficit — the same number reached from two
+independent directions. 45.7% of realtime and the render field's 2.15x budget
+are the same phenomenon; **anyone treating them as two problems will
+double-count the work.**
+
+The guest's programmed rate is **inferred from buffer geometry** (524 frames
+landing on a 16.38 ms field boundary implies ~32 kHz) rather than read from
+`AiFrequencyChanged`. Provenance noted so the next person can tighten it; it did
+not need tightening to close this question.
+
+### What was ruled out, and how
+
+Three factor-of-two candidates, all eliminated — the near-50% figure beside a
+confirmed 30 Hz render period made a units/cadence error the leading
+hypothesis, ahead of guest speed:
+
+| candidate | verdict | evidence |
+|---|---|---|
+| **resampler applies 32→48 ratio to samples where it means frames** | eliminated | `BandlimitedResampler::process` divides by `channels`; `step` advances a frame-coordinate phase. **Mutation-tested**: injecting the exact 2x error failed 3 of 6 tests |
+| **stereo/mono mismatch** | eliminated | a mono misread would make a buffer 1048 frames = 32.8 ms = two fields; measured is 524 = one field |
+| **per-field cadence dropping one of two buffers** | eliminated | `audio_submits/vi_interrupts = 0.9165`, not ~0.5 |
+
+The resampler is correct and loses no material: equal rates pass through
+byte-identically, and the windowed-sinc path is pinned by six tests including
+image-band suppression.
+
+**The three video fixes that landed the same day (RT64, `AutoNoVsync`, 30 Hz
+frame pacing) did not help the audio, and could not have** — but not because
+audio is unrelated to them. They reduced render cost without moving
+wall-versus-virtual enough to change the field delivery rate, and field delivery
+rate is what audio production tracks.
+
+### The instrument that hid it, now fixed
+
+`examples/wm2000-block-boot/src/shell.rs` — the played binary — read
+`AudioStreamHealth` but printed `underrun_samples` / `late_callbacks` /
+`max_callback_gap_us` **only on SPIKE lines**. The routine heartbeat showed
+`ai_buffers`/`samples`/`nonzero`/`backend_buffers`, all of which read clean
+under starvation. Equal buffer counts were taken as proof of health for hours.
+
+The heartbeat now also prints the host counters and a computed
+**delivered-frames-per-wall-second against the guest's programmed rate**
+(`audio_rates()`, not a hardcoded 32 kHz), with the channel-sample unit named in
+the label. See rules 21 and 22.
+
+### Consequence
+
+**There is no audio fix that is not "make the emulator faster."** A resampling
+or time-stretching workaround would hide the shortfall at the cost of timing
+fidelity, and is not proposed. This line closes and points back at the
+**19.17 ms render-field** problem, which remains the single bar.
+
 This is not a list of optimizations. It is the procedure that produced the wins
 and would have prevented the wrong calls.
 
@@ -485,6 +576,16 @@ actually guard.
 
 ### The negative result that explains a contradiction
 
+**PARTIALLY SUPERSEDED 2026-08-08 — the measurement stands, the explanation
+does not.** The reachability bug below was real and `abc7871` fixed it, but the
+flag still measures nothing *after* that fix: **−0.14 ms/render-field over
+three interleaved pairs with the barrier ON** (see the corrected section under
+"The write barrier now SAVES 12.4 ms/field"). So the bug was **not the whole
+reason** this read as null. The dominant reason is that with the barrier on,
+the ungated scheduler-mirror reconcile arms one step ahead of the gated call,
+leaving it an empty dirty set to compare. Keep the diagnosis below as the
+history of a genuine defect; do not keep it as the explanation of this null.
+
 `FN64_FAST_MUTATION_JOURNAL=1` on the RT64 lane measures **+1.15% mean — nothing,
 wrong direction** — while the profiler attributes 44% of samples to the guard.
 Both are right, and the reason is a reachability bug:
@@ -648,11 +749,99 @@ Measured 2026-08-08 on the RT64 gameplay route (`a9e1b25e`), barrier on vs off:
 to be removed; it saves ~12.4 ms/field by replacing a scanning journal with
 MMU-reported dirty pages.
 
-This **reverses a recorded dead end for this route.**
+~~This **reverses a recorded dead end for this route.**
 `FN64_FAST_MUTATION_JOURNAL=1` is filed above as measuring **zero** — true on
-the old menu route, and **strongly negative here** (22.65 -> 35.32 ms/field).
-A dead end is scoped to the route that produced it; re-measure before reusing
-one.
+the old menu route, and **strongly negative here** (22.65 -> 35.32 ms/field).~~
+
+**RETRACTED — this sentence was mine and it is wrong.** The table above is a
+**barrier** A/B (`FN64_MPROTECT_BARRIER` on vs off). **The flag is not varied
+anywhere in that experiment.** I took the barrier-OFF number, 35.32, and
+asserted it as the *flag's* cost. One measurement doing duty in two different
+experiments.
+
+Measured properly — flag on vs off, **barrier ON in both lanes**, 2.1M steps,
+route `a9e1b25e`, RT64, headless, quiet machine, **three interleaved pairs**:
+
+| pair | lane A (flag off) | lane B (flag on) | delta |
+|---|---:|---:|---|
+| rep 1 | 36.08 | 35.59 | **−0.49 ms (−1.36%)** |
+| rep 2 | 35.71 | 35.91 | **+0.20 ms (+0.56%)** |
+| rep 3 | 35.72 | 35.58 | **−0.14 ms (−0.39%)** |
+| **mean** | | | **−0.14 ms, sd 0.35** |
+
+**The deltas span both signs.** Within-lane spread across reps (A 0.37 ms,
+B 0.33 ms) is as large as the between-lane delta, which is the definition of a
+result inside noise. Off-field moved +0.03 / −0.03 / +0.16 — nil, as expected
+for a per-dispatch cost. Guest byte-identical on all seven counters in all six
+runs, so the flag does not change the emulated program.
+
+**Do not quote rep 1's −0.49 alone.** An earlier revision of this entry did,
+before replication, and it reads as a small win; the second pair reversed its
+sign. **−0.14 ms is 0.75% of the 19.17 ms the render field needs.**
+
+**Rule 6a — the lane check CAN fail, and it passed.** `barrier_served`
+increments only in `stats::note()`, reached only from `barrier_spans()`
+(`live_program.rs:372`, `:424`), both *below* the gate on the block path.
+Boundaries fell **7,716,048 → 5,911,979 (−1,804,069, −23.4%)**, reproducing
+bit-for-bit across both proof reps. It fell but **not to zero** — pre-registered
+as the required outcome, because the ungated mirror and host-ABI paths still
+call the same comparison. A drop to zero would have falsified the mechanism
+below; an unchanged count would have meant the flag never reached the gate and
+the A/B was invalid.
+
+**So the two historical "measures zero" entries were RIGHT, and for a reason
+this file already half-states**: with the barrier on, `matches_view` compares
+only MMU-reported dirty pages, and the ungated mirror reconcile runs the same
+comparison on every step **and arms on its match path**
+(`write_barrier.rs:1246-1250`: *"The reconcile arms immediately on its match
+path, so the common case reads once"*). By the time the gated call runs, the
+dirty set is empty and the second comparison is already nearly free. **The
+barrier absorbed the cost.** No reachability bug is needed to explain it.
+
+That has a further consequence for the `+1.15%, nothing` entry above, which
+attributes its null result to the `None`-passed-where-a-view-was-in-hand bug
+that `abc7871` fixed: this measurement is **post-`abc7871`** and still reads
+~1%. So the reachability bug was **not the whole explanation** — barrier
+absorption is the more likely one, and it survives the fix.
+
+A dead end is still scoped to the route that produced it. But **check first
+whether the experiment varied the thing the entry names** — that is the error
+here, and it is worse than a scoping mistake.
+
+**Why the second comparison is free, traced in source rather than profiled.**
+`host.rs:361-382` runs `mirror_guest_running_thread` **before** `run_one_step()`
+on every scheduling step; its own comment says *"this is a FULL watched-region
+journal reconcile ... and it runs on every step."* That reaches
+`reconcile_before_dispatch_from_view` (`live_program.rs:2205-2225`), which is
+**not gated by `continuous_snapshot_enabled()`** and arms the barrier on its
+match path. The gated call at `runners.rs:1033` then asks a freshly-armed
+region, gets an empty dirty set, and matches trivially. Removing it removes
+almost nothing — which is exactly what three pairs measured.
+
+**Correctness: the comment's justification is wrong, but the conclusion is
+roughly right, and the flag is not the lever anyway.** The comment at
+`live_program.rs:2162` says the comparison "only asserts that no undeclared
+write occurred, which write attribution already guarantees." Attribution does
+**not** guarantee that: `write_barrier.rs:52-57` lists `as_mut_slice`, the DMA
+paths, the RSP/renderer slices and raw `RdramPtr` stores as bypassing the
+declaration path, and `live_program.rs:2088-2094` records generated C shims
+writing guest memory below every attributed store — with a mitigation
+(`snapshot_for_host_shim` / `declare_host_shim_writes`) that has **zero
+non-test callers**. What saves the flag is not attribution but the *ungated*
+mirror: it re-runs the same comparison one step later, so an undeclared write
+is still caught, with at most one step of delay. **Do not cite the 0x0009b0b3
+incident as evidence against this flag** — that failure belongs to the reverted
+write-queue gate and to the baseline-*advancing* read, both of which
+`live_program.rs:2545-2560` distinguishes from this one in as many words.
+
+**Zero test coverage.** Full-tree grep finds three non-doc occurrences of
+`FN64_FAST_MUTATION_JOURNAL`, all inside `live_program.rs` itself. No gate, no
+script, no CI job runs the flag-on lane.
+
+**One separable defect worth fixing regardless.** The gate returns *above*
+three O(1) assertions — `assert_not_poisoned`, the `sealed` assert, and
+`PENDING_ATTRIBUTED_EXECUTABLE_WRITES == 0` (`live_program.rs:680-692`). Only
+the memcmp was meant to be skippable. Move the gate below the asserts.
 
 **The 17.8% sys-time GPU attribution is RETRACTED.** `/usr/bin/time -l` on the
 barrier-off control: 422.99 real / 398.97 user / **36.02 sys = 8.5%**, with
@@ -1064,6 +1253,418 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+## MEASURED: the biggest single item is `verify_live_words` — 3.50 ms, and it is a build flag
+
+**Correction to the section below.** The remainder is **not** primarily the
+`match pc` dispatch, and the codegen rewrite it implies is **not** the right
+first move.
+
+`examples/wm2000-block-shards/build.rs:330` passes **`verify_live_words: true`**.
+It is emitted at the top of `'run: loop` (`emit/mod.rs:602-616`), *before* the
+`match` — so **once per guest instruction** it does a bounds check, an
+`EXPECTED_WORDS` index, and **a full `mem.load_w` guest load** through
+`read_mmio_word` → `backing_offset`.
+
+Ablation on real emitted code (512-instruction runner, censused WM2000 mix:
+15.9% loads / 12.6% stores / 71.5% ALU), seven variants interleaved in one
+process, 5 samples each, 4 independent runs, each ablation verified textually
+distinguishable first:
+
+| component | ns/instr | ms/render field | % of the 19.17 gap |
+|---|---:|---:|---:|
+| **`verify_live_words` total** | **3.10** | **3.50** | **18%** |
+| — the guest load | 1.66 | 1.88 | 10% |
+| — call + `AotMiss` construction | 1.44 | 1.63 | 8% |
+| `advance_cop0_random` | 0.61 | 0.69 | 4% |
+| `post_straight_instruction_exit` | 0.26 | 0.29 | 2% |
+| residual (`match` + real work) | 4.02 | 4.54 | 24% |
+| **total as emitted** | **7.99** | **9.03** | **47%** |
+
+**Three of my named suspects are near-zero and should be dropped.**
+`advance_cop0_random`'s two integer divides are **0.61 ns** — LLVM
+strength-reduces them. The write-boundary TLS access is **0.26 ns**, and
+measured alone it flipped sign across reps (−0.93/+1.18/+1.09): a layout
+artifact, not a cost. And the per-load redundancy claim **does not hold** —
+`translate_data_address` returns early for `DirectVirtual`/`DirectPhysical`, and
+the 32-entry linear TLB scan is only reached for `Mapped` (KUSEG) addresses.
+**WM2000 is KSEG0 and never enters that loop.**
+
+**My "the emitter already knows block boundaries" premise was also wrong.**
+`emit/mod.rs:619` is `for (index, instr) in instrs.iter()...` — one arm
+**unconditionally per instruction**. The doc comment at :25-30 describes the
+*whole-function* emitter, not the dense shard runner WM2000 uses. Over the
+1 MiB boot copy: 262,144 arms emitted, **46,011 genuine block entries (17.6%)**,
+mean block **5.7 instructions**, so 82.4% of arms are removable — but that
+bounds only the 4.02 ns residual, most of which is the guest's real work.
+
+### Sizing: the gate is 78% of the win for a fraction of the cost
+
+| change | render field | ratio A | % of gap |
+|---|---:|---:|---:|
+| **gate `verify_live_words` off** | 35.47 → **31.97** | **1.92x** | **18%** |
+| + block-structured emission | → 30.98 | 1.86x | 23% |
+
+The gate needs **no emitter logic change** — `verify_live_words` is already a
+`bool` on `DenseBankShardInput`. Flipping `build.rs:330` touches the emitter's
+*caller*, avoiding the certified-source digest move (`emit/mod.rs` **is**
+certified, via `lib.rs:76`'s `generated_runner_emitter_source_receipt_v2`).
+
+**Block-structured emission should wait.** A further 0.99 ms (5% of the gap)
+does not justify a certified-source edit, a 32-crate rebuild, and a
+restructuring that must preserve the delay-slot rule exactly.
+
+### The correctness argument, with the gap stated honestly
+
+A **second detector is already live** — verified: `execution.rs:88` installs
+`classify_live_executable_write` as the guest-write-boundary observer, backed by
+`EXECUTABLE_WRITE_BOUNDARY` (`recomp-rs/runtime/host.rs:279`) and consumed by
+`post_straight_instruction_exit` at every instruction boundary. Plus
+`activate_for_fetch_with_digest` re-digests on every activation, so stale code
+cannot execute in the un-resident case either.
+
+**But this is defence-in-depth removal, not redundant-work removal, and must be
+argued as such.** `write_barrier.rs:52-57` lists paths that bypass the
+declaration channel (`as_mut_slice`, raw `RdramPtr` stores, some renderer
+slices); `verify_live_words` is the belt-and-braces detector for exactly those.
+The `sim_time=18776001537` byte-identity gate is what confirms no undeclared
+writer is being relied on in practice.
+
+The existing `verify_precompiled_instruction_word` dead end does **not** cover
+this: it is about fixing the check *inside* `fn64-recomp-rs`, and its stated
+reason — that crate "cannot see the barrier" — is precisely why the gate belongs
+at the `build.rs` call site.
+
+## THE ANSWER: the recompiled code is an interpreter, and that is the whole gap
+
+The question was whether fn64 misses optimizations the original hardware or its
+1999 compiler had. **It does, and it is basic-block compilation itself.**
+
+`crates/fn64-recomp-rs-codegen/src/emit/mod.rs:14-20` documents the emitted
+shape in its own words:
+
+```
+'run: loop { match pc {
+    0x…00 => { <ops> ; pc = 0x…04; }     // straight-line fall-through
+    0x…10 => { <ops> ;                    // a branch site
+    0x…44 => { <ops> ; return; }          // jr $ra
+```
+
+**A PC-keyed dispatch table re-entered per guest instruction.** That is the
+shape of an interpreter written in Rust, not of compiled code. Per instruction,
+unconditionally: a `match pc` dispatch, `advance_cop0_random` (two integer
+divides), a TLS access for the write boundary, and — where `verify_live_words`
+is on — **a full guest memory load to re-read the instruction word before
+executing it.** Per guest *load*: segment classification runs **four times**,
+the alignment check three, bounds validation twice, and the 32-entry TLB is
+scanned linearly with **no break-on-match**. Registers never live in host
+registers across a block: every operand is `ctx.r(N)` into memory, and `ctx`
+escapes into the memory path, so LLVM must spill the register file around each
+load.
+
+**The arithmetic is the whole story:**
+
+| | |
+|---|---|
+| remainder | 11.96 ms over 1.13M guest instructions |
+| per guest instruction | **10.6 ns** |
+| on a ~3.5 GHz host | **~37 cycles per guest instruction** |
+| one N64 instruction at 93.75 MHz | **10.7 ns** |
+
+**We spend 10.6 ns emulating an instruction the console executed in 10.7 ns.**
+Modern hardware is ~37x faster per clock and the per-instruction dispatch loop
+gives all of it back. A well-formed static recompilation should approach 1-2
+cycles per guest instruction, not 37.
+
+**So "why isn't modern hardware enough" has a clean answer: it is enough, and
+we are not using it.** Threading, batching and caching are real but secondary —
+together worth roughly a third of the 18.80 ms gap. This is the other two
+thirds, and it is **codegen quality, not a correctness tax**: the guard is 24%
+of the field, the barrier pays for itself, and the RSP interpreter is
+large-not-slow at a defect-free 11.25 ns.
+
+**Cost of fixing it is the real obstacle.** Every file in `fn64-recomp-rs/src`
+is a certified source, so a codegen change moves identity digests, and rule 8
+prices it at 32 crate rebuilds. This is a program, not a patch.
+
+### CLOSED: the RSP cannot move to a worker thread — the deadline depends on the result
+
+Stronger than the existing "async buys 0" entry, which rests on the empirical
+claim that the off-field has no host slack. This one is structural.
+
+`fabric_ops.rs:179-181`: *"Schedule completion after a **measured** amount of
+synchronous RSP work."* The latency argument is
+`pre_ucode_steps.saturating_add(lle.steps)`, and **`lle.steps` is the retired
+instruction count produced by `total_steps` (`rsp_commit.rs:403`) — it does not
+exist until interpretation has finished.** The virtual deadline is *computed
+from* the work, so the scheduler must block on the worker immediately. You buy
+the handoff cost and nothing else. Even with infinite host slack it returns
+zero.
+
+Two further blockers: all state on the path is `thread_local!` (`HOST`,
+`RENDER_BACKEND`), so a worker would see **different empty instances** — a
+wrong-answer failure, not a deadlock. And `RunToken` (`thread.rs:178`) is
+`pub struct RunToken(())`, auto-`Send`/`Sync` — **reentrancy protection on one
+call stack, not serialization.** Its own doc says the guarantee holds *"since
+nothing in this crate spawns a second OS thread"*: an assumption, not an
+enforcement. The type would not catch the mistake.
+
+Threading the RSP correctly requires predicting instruction counts before
+executing them. That changes what the emulator is.
+
+### CLOSED: the instruction budget is not a free parameter, and steps are not budget-bound
+
+Re-tested 2026-08-08 on the **rendering** route under RT64, post-guard-fix, with
+the mirror's 8.43 ms/field known — conditions that did not exist when the
+original dead end was recorded. **The entry is strengthened, not reversed**, and
+for a reason nobody had established.
+
+`FN64_BLOCK_INSTRUCTION_BUDGET` defaults to 4096 and the benchmark never sets
+it. Three 300k-step probes, every counter normalized by its lane's `sim_time`:
+
+| counter | 4096 | 8192 | 16384 |
+|---|---:|---:|---:|
+| `vi_interrupts` | 1.0000 | **1.0000** | **1.0000** |
+| `audio_submits` | 1.0000 | 0.9999 | 1.0001 |
+| `gfx_submits` | 1.0000 | 1.2161 | **1.3228** |
+| `sp_tasks` | 1.0000 | 1.0869 | 1.1300 |
+| `pi_started` | 1.0000 | 0.9173 | **0.8742** |
+
+**The two exact `1.0000` rows are the evidence**, not decoration: they prove the
+normalization is sound, so the rows that move are moving for real. **Graphics
+submits rise 32% per unit of virtual time while PI DMAs fall 13% — opposite
+directions.** A program running faster moves its counters together or not at
+all. This is a *different emulation*. Run queues differ at equal step count too:
+`[17,3,1]` / `[17,1]` / `[6,1]`.
+
+**And the mechanism fails independently.** Steps would not have halved anyway: a
+2x budget buys only **1.178x** guest work per step, 4x buys 1.291x (7,960 →
+9,378 → 10,274 cycles/step against a budget-bound ideal of 1x/2x/4x). **Most
+dispatches already end on something other than budget exhaustion**, so the
+budget does not control step count. Either finding alone closes it.
+
+The clamp was verified inactive first, so this is a real result rather than a
+null one for an unrelated reason: `canonical_instruction_limit`'s only non-test
+setter is gated on `FN64_BLOCK_EXPECT_GUEST_INSTRUCTIONS`, which the benchmark
+never sets.
+
+**Consequence for the bar: the mirror-halving line comes off the projection.**
+The mirror is per-step, step count has no cheap knob, and reducing per-step
+apparatus now requires either a **cheaper mirror** or a change to **when** the
+watched region is verified. That is the architectural option, not the
+incremental one.
+
+One more rule-6a trap caught in passing: `grep "registered rt64 renderer"` on
+the *binary* returns 0 and means nothing — the string is built at runtime from
+`{active_renderer}` (`main.rs:903`). RT64 is genuinely linked (40 symbols), and
+the `rt64` arm panics rather than falling back, so a mislabeled
+reference-backend number is not possible on this lane.
+
+### 20. Test the verifier on this machine, not just its logic
+
+The lane gate built to enforce rule 19 **crashed instead of verifying**:
+
+```
+find: Can't parse date/time: @1786223147
+```
+
+`find -newermt "@<epoch>"` is **GNU syntax; BSD `find` on macOS rejects it**. The
+gate had been tested against synthetic inputs and correctly failed all three
+bad-lane scenarios — but that testing exercised its *logic*, never its
+*portability*. On the real machine it aborted before counting anything.
+
+**It failed safe, which is the one good thing here**: no binary was stashed, so
+nothing unverified reached the benchmark. A gate that crashes is far better than
+one that passes on error — but it still cost a cycle, and a differently-written
+gate would have silently returned zero matches and reported a clean lane.
+
+Portable form, verified on this machine:
+
+```sh
+STAMPREF=$(mktemp /tmp/lane-stamp.XXXXXX)
+touch -t "$(date -r "$STAMP" +%Y%m%d%H%M.%S)" "$STAMPREF"
+find <dir> -name runner.rs -newer "$STAMPREF"
+rm -f "$STAMPREF"
+```
+
+The general rule: **a verification script is itself code that can be wrong, and
+synthetic-input testing does not cover the environment.** Run it once against
+the real tree before trusting it to gate a measurement — and prefer a
+construction whose failure mode is a crash over one whose failure mode is an
+empty result set, because empty reads as "clean" (rules 18 and 19).
+
+### 21. The counter's UNIT is part of the counter, and a rate inherits its error
+
+Earned 2026-08-08 on the WM2000 choppy-audio investigation, which ran for hours
+against a headline figure that was **wrong by exactly 2x**.
+
+The claim was *"audio delivered at 91.5% of real time"* — 1,290,576 `samples`
+over 44.1 s = 29,273/s against a 32,000 Hz guest clock. Every step of that
+arithmetic is right except the unit. **`AudioOutputStats::samples` counts i16
+CHANNEL samples, not frames.** `deliver_ai_buffer`
+(`crates/fn64-abi/src/task_dispatch/setup.rs:160-171`) pushes one `i16` per
+**2 bytes** across the DMA range and `:186` adds that length; the very same
+function writes metadata at `:226-228` reading `channels=2` / `frames={len/2}`.
+Stereo frames are `samples / 2`, so the real delivery is **14,632 frames/s =
+45.7% of real time**, not 91.5%.
+
+The two readings are not a rounding apart — they are different diagnoses. 91.5%
+is an 8.5% shortfall that sounds like jitter or a scheduling boundary; 45.7% is
+the emulator running at less than half speed. **Hours were spent looking for a
+defect sized to the wrong number.**
+
+The rule: **before dividing a count by wall-clock seconds, find the line that
+increments it and read what one unit IS.** A rate is a quotient, and it
+inherits the error of its numerator silently — nothing about "29,273
+samples/sec" looks wrong. Where a counter's name is ambiguous across a known
+axis (samples/frames, bytes/words, fields/frames, packets/messages), the name
+alone is not evidence; the increment site is.
+
+Corollary, since this codebase demonstrably has the ambiguity live: **finding a
+units bug in one place is a reason to check its twin on every path that
+consumes the same quantity.** Here the resampler was the obvious suspect and
+was cleared — but by injecting a 2x error into
+`BandlimitedResampler::process`'s `step` and confirming **3 of 6 tests failed**,
+not by reading it. That is rule 6a: a units check that cannot fail is not a
+check.
+
+### 22. A healthy delivery path is not a healthy stream
+
+The same investigation, and the reason the units error survived so long.
+
+`backend_buffers == ai_buffers` held **exactly** throughout, i.e. cpal accepted
+every buffer and dropped none. That was read as *audio is healthy*. It is not
+that claim. **Equal counts prove nothing is being LOST; they say nothing about
+whether enough is ARRIVING.** The device was playing gaps because the producer
+was starving it, and a zero-drop counter reports that state as perfect.
+
+The general shape: for any producer/consumer seam, *delivered ÷ wall-clock
+seconds against the rate the consumer demands* is the health metric. Queue
+depths, drop counts, and buffer parity are all **downstream** of it and every
+one of them reads clean under starvation.
+
+**The contradicting instrument existed and was not on the line.**
+`AudioStreamHealth` already carried `underrun_samples` — the count of samples
+the callback zero-filled, which is starvation measured directly — and
+`crates/fn64-shell/src/main.rs:671-707` prints it. But
+`examples/wm2000-block-boot/src/shell.rs`, the binary actually being played,
+read that struct and printed those fields **only on SPIKE lines**, never in the
+routine heartbeat. So a starved run and a healthy run emitted the same quiet
+heartbeat, and the one number that could have falsified the diagnosis was
+absent from the only output anybody was reading. Fixed: the heartbeat now
+prints `underrun_samples`, `late_callbacks`, `max_callback_gap_us`, and a
+computed **delivered-frames-per-wall-second against the guest's programmed
+rate**.
+
+This is rule 7's family (*a line printed on a state CHANGE cannot prove absence
+of progress*) pointed at a diagnostic rather than a route: **put the counter
+that can contradict you on the routine line, not the exceptional one.** A
+statistic that only appears when something already looks wrong cannot tell you
+that something is wrong.
+
+### 19. A size difference proves "something changed", never "the thing you meant"
+
+I asserted two A/B binaries were the right lanes because one was **4.4 MB
+smaller** (95,304,208 vs 90,878,784, distinct SHAs) — *"exactly the shape of
+removing a per-instruction verification block from every runner."* I called it a
+stronger lane check than a source grep, and I was **wrong**.
+
+Reading the *generated source* the armed build actually wrote showed the
+detector still present — `EXPECTED_WORDS` tables and `verify_live_word!` calls
+in the emitted `'run: loop`, 64 references in one runner alone, with a verified
+build-time mtime. **Had the A/B run, it would have measured verify-on against
+verify-on and reported a fabricated delta** — the 4.9x incident's exact shape.
+
+The size *had* changed, because 32 of 142 runners regenerated. A partially
+regenerated catalog is a different binary and an invalid experiment, and a byte
+count cannot tell those apart from the change you intended.
+
+**Root cause worth knowing on its own: `cargo:rerun-if-env-changed` only takes
+effect from the run that emits it onward.** On the first build after adding a
+new env-gated flag, cargo has no recorded dependency on that variable, so the
+build scripts do not re-run and the flag silently does nothing. Force it with
+`touch <build.rs>` on the first build after introducing the gate.
+
+The general rule: **verify the state you meant to cause, at the layer that owns
+it.** For a codegen flag that layer is the emitted source, not the binary's
+size. This is rule 15 again, and note it bit the *reviewer* — I proposed the
+weaker check to an agent that was already doing the stronger one.
+
+### 18. `pcpu` and `pgrep -f` both lie about this workload
+Two liveness checks that read plausibly and are wrong, both rule-15 shapes,
+both caught in practice on this project:
+
+- **`pcpu` reads 0.0 while the benchmark is running at 100%.** A healthy run
+  was nearly declared hung on that basis. **CPU TIME advancing is the only
+  honest liveness check** — sample it twice and compare.
+- **`pgrep -f wm2000-block-boot` counts your own monitoring shells**, and any
+  `eval`/snapshot wrapper whose command line contains the string. It reported
+  **2 concurrent benchmarks when there was 1**. Match on args and exclude the
+  wrappers, or count by CPU.
+
+A third instance of the same family: sampling a **recycled PID** that now
+belongs to an unrelated process. A PID is not a durable handle; re-verify the
+identity, not just the number.
+
+**Two more on 2026-08-08, from OPPOSITE directions, within minutes of each
+other. The generalization is the point: a query that cannot distinguish
+"absent" from "never looked" reports both as zero.**
+
+- **`comm` attributed 17 rustc to the wrong owner.** An agent holding a queued
+  build read `ps -eo pcpu,comm`, saw 17 busy rustc, and reported "the peer's
+  shard rebuild is running" — twice, in status messages. The peer's lock had
+  already released and **every one of those processes was the reporting
+  agent's own**, compiling shards into its own `target/`. `comm` shows the
+  binary and drops the argument list, which is where the identity lives:
+  `ps -eo args` named the target directory immediately. Note the failure is
+  *stable* — "is rustc busy" would have answered "peer is building" forever,
+  because the check cannot represent ownership at all.
+- **A glob that matched no files reported "0 references."** A grep for
+  `EXPECTED_WORDS` whose file glob matched nothing returned zero hits, which
+  reads exactly like *the detector has been deleted* — the alarming answer,
+  indistinguishable from *the question was never asked*. Caught only because
+  the count was suspiciously clean.
+
+**The fix for both is rule 6a's ten-second test**: run the query against the
+state it is supposed to reject and confirm the answer *changes*. A grep that
+returns zero against a tree where the symbol certainly exists is broken, and
+that takes one command to establish.
+
+**What is NOT the fix: substituting a byte-size delta.** An earlier revision of
+this entry credited the same session's size check — verify-on 95,304,208 vs
+verify-off 90,878,784, a 4.4 MB difference — as the one that worked, on the
+reasoning that its failure mode is a wrong number rather than a zero. **That
+was wrong and the credit is withdrawn. The size check did not work; it nearly
+fabricated the A/B.** Only 32 of 142 runners had regenerated, the detector was
+still present in the emitted source of the "off" lane, and trusting the delta
+would have measured verify-on against verify-on. See rule 19: **a size
+difference proves something changed, never which thing.**
+
+Two things worth keeping from how that error was made. It bit the **reviewer**,
+who proposed the weaker check to an agent already doing the stronger one and
+described it as stronger. And the revision that credited it was written by an
+agent that had *already read* rule 19's entry two paragraphs above, noticed the
+tension, and reconciled it with an invented "narrower rule" instead of asking
+whether the premise was true. **A contradiction with an adjacent committed entry
+is evidence you are wrong, not an invitation to harmonize.**
+
+### 17. Do not budget instrumentation cost by counting clock reads
+An agent predicted its five new timers would cost **0.029 ms/field** — 33.8 ns
+measured per `Instant` pair × 856 reads. Measured: **+1.62 ms/field, +4.6% on
+the render field.** Wrong by **56x**, and it had told the coordinator the
+instrument was safe on that basis.
+
+**Arming a timer in the hottest loop costs what it does to inlining, register
+pressure and branch layout — not what the clock read costs.** The clock is the
+cheap part.
+
+Consequences to apply, not just to note:
+- Always run an **armed/control pair** and correct absolutes by the ratio.
+  Shares survive; absolute ms do not.
+- Any phase measuring **below the perturbation** is below the instrument's
+  resolution. Here the two sub-0.1 ms guard rows are unresolvable, and saying
+  "0.037 ms" about them overstates what was learned.
+- A budget of this shape is a *lower bound on the error*, never an estimate.
+
 ### RETRACTED: the "guest code is only 1.01 ms/field" figure was fabricated
 
 I claimed a layer partition measured guest code at **1.01 ms/field (4.5%)**,
@@ -1092,7 +1693,136 @@ a route with no frames in it, and carried into a table about a route that has
 them. **Before quoting any per-field figure, state which route produced it and
 whether that route rendered anything.**
 
-### Prime suspect for the 21.72 ms: a 4-byte mirror that reconciles 1 MiB
+### The watched region is reconciled ~3.6x per step, and only one site is gated
+
+Verified by reading, not inferred. Two independent reconciles of the **same
+region against the same baseline** run per step, microseconds apart, with
+nothing writing guest RDRAM in between:
+
+| site | path | gated by `FN64_FAST_MUTATION_JOURNAL`? |
+|---|---|---|
+| **mirror** | `host.rs:208` → `execution.rs:772` → `:808` → `reconcile_before_dispatch_from_view` (`live_program.rs:2205-2225`) | **NO** |
+| **dispatch** | `runners.rs:1029/1033` → `reconcile_before_dispatch` (`:2146`) | yes |
+
+`host.rs:367-371` states the mirror's true cost in its own words: *"under
+`recomp-rs` this is a FULL watched-region journal reconcile (see
+`EXEC_MIRROR_NS`), not the four-byte store its name suggests, and **it runs on
+every step**."* And `reconcile_before_dispatch_from_view` has **no
+`continuous_snapshot_enabled()` check** — it calls
+`reconcile_matched_before_dispatch` and `reconcile_snapshot_before_dispatch`
+unconditionally, including all three O(1) asserts.
+
+Measured: **274.9 steps and 991.5 `barrier_served` boundaries per render field
+= 3.61 comparisons per step.**
+
+**This closes the correctness question, in the flag's favour.** Both earlier
+arguments were wrong:
+
+- Mine ("no second detector, therefore load-bearing") — there *is* a second
+  detector, and it is the ungated one.
+- The counter-argument ("the repository records this flag failing") — that
+  incident belongs to the reverted write-queue gate and the baseline-*advancing*
+  read, not to this call site.
+
+With the flag on, an undeclared write is still caught **at the very next step's
+mirror**, by the same code with the same diagnostics and the same asserts.
+Detection is delayed by at most one step, not lost. The gated site is a
+**second** comparison, not the last line of defence. The C-shim escape path
+(`live_program.rs:2088-2094`, mitigation with zero non-test callers) remains
+real and worth wiring, but it is **orthogonal** — equally uncaught-until-next-
+boundary with the flag off.
+
+**It also supplies a benign explanation for the two historical "measures zero"
+entries**: if the mirror just proved the region clean microseconds earlier, the
+dispatch comparison takes its cheap early-out and is already nearly free. That
+requires no reachability bug. Pre-registered as the leading hypothesis before
+the A/B lands.
+
+Whichever site pays, **the redundancy itself is the finding** — and the mirror,
+at a measured 8.43 ms/field, is the ungated one.
+
+### The dispatch comparison is already 364x optimized — it cannot be the remainder
+
+Before dispatching work at `reconcile_before_dispatch` (the named lead into the
+11.96 ms remainder), the existing counters answer how expensive it can possibly
+be. **It is already near-optimal**, and the arithmetic says so:
+
+Per render field, from the population split:
+
+| | |
+|---|---|
+| `barrier_served` | **991.5** |
+| `barrier_fell_back` | **0.0** — the barrier answered *every* time, zero full scans |
+| clean boundaries | 745.6 (**75%**) — compare **zero bytes** |
+| dirty boundaries | 245.9, comparing **697 pages** = 2,790 KiB |
+| if it always scanned 1 MiB | 992 MiB |
+| **speedup already realized** | **~364x** |
+
+`matches_view` (`live_program.rs:359-380`) takes `barrier_spans()` and clips the
+comparison to dirty pages only, falling back to a full scan **only** when the
+barrier cannot answer — which measured **never** on this route.
+
+**So the 1 MiB-per-dispatch framing is wrong for the current code.** The
+comparison touches ~2.7 MiB per render field, not ~992 MiB, and three quarters
+of its boundaries do no comparison at all. Whatever the 11.96 ms remainder is,
+**this is not the bulk of it** — and my earlier "prime suspect" reasoning, which
+priced a 1 MiB reconcile per boundary, was pricing code that does not run.
+
+Two smaller notes from the same read:
+
+- The `TEMPORARY (mprotect feasibility census, 2026-08-07)` call at `:360-363`
+  inside the hottest comparison **is properly gated** (`note_boundary`
+  early-returns unless enabled, `snapshots.rs:1018-1021`). Not a cost. It is
+  still worth deleting once the census is finished, since "TEMPORARY" in the
+  hot path invites exactly the suspicion it just cost to dispel.
+- `barrier_spans` documents the only failure mode honestly: `None` means "the
+  barrier cannot answer" and every caller runs the full scan; **it never returns
+  a span list that omits a page it saw written.**
+
+### MEASURED: the executor split — apparatus is 24%, not the majority
+
+`f4aeb1c`, five sub-counters inside `run_one_step` behind `FN64_EXECUTOR_SPLIT`,
+reported by population with **nested counters subtracted, not summed**. Render
+field, 37.09 armed / 35.47 control:
+
+| phase | ms | share | kind |
+|---|---:|---:|---|
+| `gfx_ns` | 12.53 | 35.3% | graphics (rdp 7.04, rsp 5.98) |
+| **remainder inside the resume** | **11.96** | **33.7%** | guest + runtime |
+| mirror boundary | **8.43** | 23.8% | apparatus, **per-step** |
+| audio_lle / vi_present | 1.14 / 1.14 | 3.2% each | |
+| guard @ suspend / device | 0.037 / 0.038 | 0.1% | apparatus |
+
+**The hypothesis that executor self is mostly apparatus is REFUTED.** Named
+apparatus totals **24%** of the field, and the mutation journal's two flush
+seams come to **0.075 ms combined** — below this instrument's own perturbation.
+Making the guard cheaper *at those seams* is a closed line.
+
+**The 14.41 ms mirror prediction was 1.7x high** (measured 8.43), for exactly
+the reason its own falsifier named: a cheap early-out when nothing is dirty.
+Pre-registering the estimate is what made that judgeable.
+
+Three redirections:
+
+1. **A new 11.96 ms remainder appeared inside the coroutine resume** — guest
+   code plus the runtime it calls synchronously: `RdramView` reads,
+   `translate`/`backing_offset`, per-instruction validation, and
+   `runners.rs:1033`'s `reconcile_before_dispatch`, **which runs per loop
+   iteration, not per step**. This is now the largest unnamed cost.
+2. **The mirror is per-STEP, not per-submit** — and *cheaper* per call on render
+   fields (32.06 vs 59.11 µs), 2.17x total against a 4.01x call ratio. Its
+   bimodality is entirely "render fields take 4x more steps".
+3. **Steps per field (274.9 vs 68.5) is therefore a lever nobody has examined**,
+   and it multiplies everything per-step. The 79 µs/call resolves as many cheap
+   operations — 130.5 µs/step inclusive, no single phase dominating.
+
+**RDP drift, flagged not absorbed:** `gfx_lle_rdp` is 7.04 ms/render-field
+against the 5.82 baseline (+20.9%) while `gfx_lle_rsp` is flat (−1.7%). Same
+asymmetric signature as the earlier unexplained +8%, about half the magnitude,
+and **present in the control lane** — so it is not the instrument. Still
+unexplained, and it is on the line we are about to work.
+
+### Prime suspect for the 21.72 ms: a 4-byte mirror that reconciles 1 MiB (measured 8.43 — see above)
 
 **UNCONFIRMED — sized before the measurement, so the result is judged against a
 prediction.** Found by an explorer reading the dispatch prologue, not by a
@@ -1213,6 +1943,160 @@ sub-0.1 ms guard rows are smaller than the perturbation and should be read as
 signature as the unexplained +8% drift recorded above (RDP up, RSP flat or
 down), at about half the magnitude, and it is present in the *control* lane
 too, so it is not my instrument. Still unexplained.
+
+**UPDATE 2026-08-08 — the drift is ABSENT in the `FN64_FAST_MUTATION_JOURNAL`
+A/B, reported as a negative because a drift that comes and goes is a different
+problem from one that persists.** Same route, same binary, same RT64 headless
+lane, `FN64_PHASE_TIMING=1`: `gfx_lle_rdp_ns` reads **5.85 ms/render-field
+against the 5.82 baseline (+0.5%)** and `gfx_lle_rsp_ns` **5.97 against 6.08
+(−1.8%)**. Both lanes agree (B: 5.87 / 6.04). So the +20.9% excursion did not
+reproduce, and whatever causes it is **intermittent between runs rather than a
+standing property of the route or of phase timing**. That rules out the
+simplest explanations — it is not the instrument, and it is not a permanent
+regression introduced between the baseline and now.
+
+### SIZED BY READING, NOT TAKEN: `runners.rs:1033` is per-STEP, not per-iteration
+
+Recorded because a defect found and rejected should not need rediscovering.
+
+The `executor_ns` split above named "`reconcile_before_dispatch` at
+`runners.rs:1033`, which runs **once per loop iteration**, not once per step"
+as a component of the 11.96 ms resume remainder. Read as "many reconciles per
+step", that would be the cheapest and safest target available — no redundancy
+argument required, just a hoist out of a loop.
+
+**It is not that.** `run_catalog_block_program`'s loop body ends in
+`crate::suspend_active_coroutine(...)` at `runners.rs:1113`, inside the
+`dispatched.instructions > 0` arm. That call suspends the coroutine, so **one
+loop iteration is one scheduling step** — the loop does not spin within a step,
+it resumes where it suspended. "Per loop iteration" and "per step" are the same
+rate here, and the phrasing in the split section is misleading rather than
+wrong.
+
+The reconcile sites and their true rates:
+
+| site | rate |
+|---|---|
+| `runners.rs:1029` (pre-loop) | once per `run_catalog_block_program` entry |
+| `runners.rs:1033` (in-loop) | **once per step** |
+| `execution.rs:808` (the mirror) | **once per step**, ungated |
+| `runners.rs:639`, `:870` | dynamic-mapped lane, not this route |
+
+So there is **no loop-hoist win**, and the two per-step sites are the mirror
+and `:1033` — which is exactly the redundant pair the doc already identifies,
+at the same rate, not a separate cheaper defect. **Prefer-the-safer-target
+reasoning does not apply, because the safer target does not exist.**
+
+The one genuine cheap fix in this area remains the separable defect already
+filed: `continuous_snapshot_enabled()` gates *above* three O(1) assertions
+(`live_program.rs:680-692`), where only the memcmp was meant to be skippable.
+That is a correctness-of-gating fix worth making on its own terms, but it is
+O(1) work and cannot be a measurable share of 8.43 ms.
+
+### PRE-REGISTERED, before measuring: only ONE of the two reconciles is gated
+
+Written down before the A/B runs, so that a confirmation cannot become a
+post-hoc story and a refutation cannot be quietly dropped (rule 1's discipline
+applied to a mechanism rather than to a candidate).
+
+**The claim, from source alone.** The two per-step reconciles of the same
+region against the same baseline are gated differently:
+
+| site | function | `continuous_snapshot_enabled()` check? |
+|---|---|---|
+| dispatch loop, `runners.rs:1033` | `reconcile_before_dispatch` (`live_program.rs:2146`) | **YES**, at `:2160` — returns right after `seal_with` |
+| scheduler mirror, `execution.rs:808` | `reconcile_before_dispatch_from_view` (`:2204`) | **NO** — runs `matches_view` unconditionally |
+
+**What it predicts.** `FN64_FAST_MUTATION_JOURNAL=1` can only switch off the
+site that the barrier has already made nearly free, while the 8.43 ms ungated
+mirror keeps running at full cost. So the flag should measure ~zero — which is
+exactly what three interleaved pairs found (**−0.14 ms/render-field, sd 0.35**,
+deltas spanning both signs).
+
+**Why this is worth pre-registering rather than just asserting.** The doc
+reached the same mechanism *from measurement* at line 585 ("the ungated
+scheduler-mirror reconcile arms one step ahead of the gated call, leaving it an
+empty dirty set to compare"). Source-reading and measurement arriving at the
+same mechanism independently is the strongest evidence available here, and it
+is only strong if the source claim is recorded before the confirming
+measurement is run rather than after.
+
+**The falsifier, stated in advance.** If gating the mirror does *not* move the
+render field by an amount consistent with its measured 8.43 ms, then the mirror
+is not paying what the split attributes to it — most likely because the barrier
+early-out already makes most of those 274.9 calls nearly free and the 8.43 ms
+is concentrated in a few dirty boundaries. In that case the finding is that
+**the mirror is cheap per call and expensive only in aggregate**, and deletion
+of the comparison is not the lever; reducing steps per field is.
+
+**What must be proven before any removal, and it is not structural similarity.**
+Two checks that look alike are not redundant unless they are redundant *under
+the states that actually occur* (rule 6a's converse). The redundancy argument
+therefore requires, per population:
+
+- how often `matches_view` at the mirror finds the region clean vs dirty, and
+- **the dirty-page COUNT when dirty, not just the boolean.** `matches_view`
+  clips to MMU-reported dirty pages and that clipping is a measured ~364x
+  optimization, so "dirty" spans a wide range of real work: one dirty page and
+  400 dirty pages are both "dirty" and cost very differently. A clean/dirty
+  ratio alone cannot size what removal would save.
+- whether the gated site would have caught anything the mirror did not, on the
+  render-field population specifically.
+
+### THE MIRROR FIX: the gated comparison is a pure DETECTOR, proven from source
+
+The redundancy proof the fix requires, done by reading before any benchmark —
+because the soundness question is decidable from source and does not need a
+run, while the *size* of the win does.
+
+**What the fix is.** `reconcile_before_dispatch_from_view`
+(`live_program.rs:2204`, the scheduler mirror, 8.43 ms/render-field) now gates
+its comparison on `continuous_snapshot_enabled()` exactly as its twin
+`reconcile_before_dispatch` (`:2160`) already did. Sealing still always runs;
+`arm_barrier_over_clean_region` still always runs.
+
+**Why gating is sound, and this is the load-bearing part.**
+`reconcile_snapshot_before_dispatch` (`live_program.rs:790-882`) takes
+`&mut self` but **mutates nothing**. Verified mechanically over its whole body:
+zero assignments to `self`, zero collection mutations, no `commit_snapshot`, no
+`adopt_snapshot`. Its entire content is three O(1) asserts and a
+`recompiled_gap_panic` on the first changed range. The snapshot handed to it is
+**dropped**.
+
+So it is a **pure detector**: it either panics or does nothing observable.
+Gating it removes a *check*, never a state transition — which is exactly the
+property that makes "the other site does it too" more than a structural
+argument. A baseline-advancing read would be a different matter entirely, and
+the doc already distinguishes that case (`live_program.rs:2545-2560`); this is
+not it.
+
+**Two obligations that are NOT gated, and must not be:**
+
+1. **`seal_with`** — establishes the baseline the journal and receipts bind to.
+   Runs unconditionally, before the gate, and early-returns once sealed.
+2. **`arm_barrier_over_clean_region`** — the comparison DISARMS the barrier to
+   read the dirty set, so returning without re-arming would leave it down and
+   let every later write accumulate into the next boundary's set instead of
+   being cleared by a fresh window. The gated path re-arms on the way out.
+
+**What still needs measurement, and what does not.** Soundness: settled above,
+no run required. Size of the win: requires the A/B, and the pre-registered
+falsifier stands — if the field does not move by something consistent with
+8.43 ms, the mirror was cheap per call and expensive only in aggregate, and
+steps-per-field is the real lever.
+
+**The instrument that can falsify the redundancy claim empirically.**
+`FN64_MIRROR_RECONCILE_CENSUS=1` counts, at the mirror site and before the gate
+can skip it, how many boundaries read clean vs dirty. **`dirty > 0` on a real
+route would mean this site catches state**, and the gating argument would be
+wrong regardless of what the byte-identity gate says on one route. The census
+is armed independently of `FN64_MPROTECT_BARRIER_STATS`, which counts barrier
+asks across all sites rather than attributing outcomes to this one.
+
+Prior evidence pointing the same way, recorded here so the census is a
+confirmation rather than the only leg: write attribution over WM2000's full
+route produced **505,140 journal entries with ZERO changed ranges lacking a
+covering declaration** (`continuous_snapshot_enabled`'s own doc comment).
 
 ### FOUND IT: executor self is 21.72 ms — 61% of the render field, not graphics
 
@@ -1855,9 +2739,13 @@ verdict. For that, use a real `git worktree` checkout.
 - **Caching activation on `guest_write_token`.** Unsound. Its zero-consumer
   property is a *cited premise* of a written safety argument
   (`dispatch-granularity.md:570`).
-- **An async guard worker.** Sound but worthless: deleting the whole journal
-  (`FN64_FAST_MUTATION_JOURNAL=1`) measures **0 ms**, and a thread cannot beat
-  deletion.
+- **An async guard worker.** Sound but worthless: the flag it would race
+  against (`FN64_FAST_MUTATION_JOURNAL=1`) measures **−0.14 ms/render-field,
+  inside noise** (three interleaved pairs, barrier ON — see "MEASURED:
+  `FN64_FAST_MUTATION_JOURNAL` costs nothing with the barrier on"), and a
+  thread cannot beat deletion of something that is already free. Note the flag
+  does **not** delete "the whole journal": write attribution, sealing, the
+  per-generation digest and two other comparison sites all keep running.
 - **`codegen-units` / LTO / `target-cpu=native` on the shards.** 10% for a
   9-minute build, or 2.3x *slower* with all three.
 - **`with_executor`'s `RefCell` borrow.** One call per scheduling step from
@@ -1936,3 +2824,15 @@ Reaching 1.0x therefore needs **both** halves:
 Note `FN64_FAST_MUTATION_JOURNAL=1` already measures **zero** difference
 (435 ms vs 441 ms): the barrier absorbed that cost, so the removable 47% is not
 sitting idle waiting to be switched off.
+
+**CONFIRMED 2026-08-08, and this entry's stated reason was the correct one.**
+Re-measured on the *rendering* route (`a9e1b25e`, RT64, barrier ON in both
+lanes, three interleaved pairs): **−0.14 ms/render-field, sd 0.35, deltas
+spanning both signs.** "The barrier absorbed that cost" is now traced to a
+specific mechanism — the ungated scheduler-mirror reconcile arms the barrier
+one step ahead of the gated call, so the gated comparison finds an empty dirty
+set. See the corrected section above. Two cautions on the figures *here*
+though: 435/441 ms are **whole-run totals, not ms/field**, and they come from
+the 19,523-step route that renders nothing (rule 11), so this entry's number
+never transferred to a rendering route in the first place — the agreement with
+the new measurement is a real result, not a restatement.
