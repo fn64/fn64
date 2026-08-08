@@ -466,6 +466,47 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+## The 60fps arithmetic: what the guard fix can and cannot buy
+
+Computed from the measured RT64 split, before the in-flight fix reports, so the
+expectation is on record rather than fitted afterwards.
+
+The four `read_snapshot` seams total **18.22 ms/field — 41% of the 44.13 mean**:
+`osSpTaskStartGo_recomp` 5.97, `dispatch_lle_task` 5.89, `with_render_backend`
+3.19, `dispatch_captured_raw_rdp` 3.17.
+
+| guard removed | mean | vs 60fps | vs 30fps |
+|---|---:|---:|---:|
+| 100% (perfect) | 25.91 | **1.55x** | 0.78x ✓ |
+| 50% | 35.02 | 2.10x | 1.05x |
+| 25% | 39.58 | 2.37x | 1.19x |
+
+**Even a perfect result does not reach 60fps.** The fix is necessary and not
+sufficient: it buys a comfortable 30fps (0.78x) and leaves 1.55x.
+
+What is left afterwards is a **different problem from today's** — the profile
+inverts and no single line dominates:
+
+| component | ms/field | share of 25.91 |
+|---|---:|---:|
+| gfx LLE — raw RDP (RT64 residue) | 6.66 | 25.7% |
+| executor self, minus the guard seams | 4.11 | 15.9% |
+| RSP audio LLE | 3.95 | 15.2% |
+| gfx non-LLE preflight/chunk | 3.92 | 15.1% |
+| gfx LLE other (setup/commit/copies) | 3.92 | 15.1% |
+| gfx LLE — RSP interpretation | 2.95 | 11.4% |
+| VI present | 1.14 | 4.4% |
+
+Graphics becomes **72%** of the remainder, spread over five lines of 1–7 ms.
+Another **9.24 ms** must come out, and there is no 16.71 ms rasterizer to
+delete this time — it would be five or six separate wins, each small enough
+that rule 12 (a large byte count is not a bottleneck) and the counter-versus-
+outcome rule both bite hard.
+
+Worth noting `dispatch_captured_raw_rdp` appears in **both** tables: 3.17 ms of
+guard at its seam, and separately the untimed 8 MiB copy of candidate 0 below.
+Do not double-count them, and re-profile before treating either as available.
+
 ## Ranked candidates, with what would falsify each
 
 0. **The 8 MiB RDRAM copy per DPC submission — UNMEASURED, and do not dispatch
