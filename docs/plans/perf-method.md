@@ -1064,6 +1064,47 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+### Prime suspect for the 21.72 ms: a 4-byte mirror that reconciles 1 MiB
+
+**UNCONFIRMED — sized before the measurement, so the result is judged against a
+prediction.** Found by an explorer reading the dispatch prologue, not by a
+profiler; no existing counter sees it.
+
+`mirror_guest_running_thread` (`host.rs:188`) sounds like a 4-byte store, and
+its own range is exactly 4 bytes (`execution.rs:785`). Under `recomp-rs` it
+delegates to `commit_scheduler_running_thread_mirror` (`execution.rs:772`),
+whose comment states the cost outright:
+
+> *"Scheduler selection is a dispatch boundary, so this reconciles the whole
+> watched region — 1 MiB on WM2000 — every time a thread is picked."*
+
+It runs **in the prologue of every step, outside the coroutine resume** — so it
+is inside `executor_ns` and invisible to every phase counter.
+
+At 274.9 executor calls per render field:
+
+| | |
+|---|---|
+| reconciled per render field | **0.29 GB** |
+| over the 5,660 render fields | **1.6 TB** |
+| cost at ~20 GB/s (word-wise memcmp) | **14.41 ms/field** |
+| cost at ~2 GB/s (byte closure) | 144 ms/field — impossible, so the fast path must engage |
+
+**14.41 ms would be 66% of the 21.72 ms executor self.** The byte-closure figure
+exceeding the whole field is itself informative: it bounds which path is live.
+
+If this holds it is the answer to "why isn't modern hardware enough" — the
+render field is not dominated by emulating an N64, it is dominated by a
+correctness reconcile that runs once per scheduler selection and scales with
+how much code the guest executes. **Render fields make 4.0x more scheduler
+selections than off-fields (274.9 vs 68.5), which is exactly why the cost is
+bimodal.**
+
+Falsifiers: the reconcile may already take a cheap early-out when nothing is
+dirty (75% of barrier boundaries find nothing); the view path copies word-wise
+and may be far faster than 20 GB/s assumed here; and the 4.0x call ratio may
+not translate to a 4.0x cost ratio if the dirty set differs by population.
+
 ### FOUND IT: executor self is 21.72 ms — 61% of the render field, not graphics
 
 The "unaccounted 23.94 ms" was never unmeasured. It was in the population split
