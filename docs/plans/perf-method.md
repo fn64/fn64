@@ -1162,6 +1162,83 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+## THE ANSWER: the recompiled code is an interpreter, and that is the whole gap
+
+The question was whether fn64 misses optimizations the original hardware or its
+1999 compiler had. **It does, and it is basic-block compilation itself.**
+
+`crates/fn64-recomp-rs-codegen/src/emit/mod.rs:14-20` documents the emitted
+shape in its own words:
+
+```
+'run: loop { match pc {
+    0x…00 => { <ops> ; pc = 0x…04; }     // straight-line fall-through
+    0x…10 => { <ops> ;                    // a branch site
+    0x…44 => { <ops> ; return; }          // jr $ra
+```
+
+**A PC-keyed dispatch table re-entered per guest instruction.** That is the
+shape of an interpreter written in Rust, not of compiled code. Per instruction,
+unconditionally: a `match pc` dispatch, `advance_cop0_random` (two integer
+divides), a TLS access for the write boundary, and — where `verify_live_words`
+is on — **a full guest memory load to re-read the instruction word before
+executing it.** Per guest *load*: segment classification runs **four times**,
+the alignment check three, bounds validation twice, and the 32-entry TLB is
+scanned linearly with **no break-on-match**. Registers never live in host
+registers across a block: every operand is `ctx.r(N)` into memory, and `ctx`
+escapes into the memory path, so LLVM must spill the register file around each
+load.
+
+**The arithmetic is the whole story:**
+
+| | |
+|---|---|
+| remainder | 11.96 ms over 1.13M guest instructions |
+| per guest instruction | **10.6 ns** |
+| on a ~3.5 GHz host | **~37 cycles per guest instruction** |
+| one N64 instruction at 93.75 MHz | **10.7 ns** |
+
+**We spend 10.6 ns emulating an instruction the console executed in 10.7 ns.**
+Modern hardware is ~37x faster per clock and the per-instruction dispatch loop
+gives all of it back. A well-formed static recompilation should approach 1-2
+cycles per guest instruction, not 37.
+
+**So "why isn't modern hardware enough" has a clean answer: it is enough, and
+we are not using it.** Threading, batching and caching are real but secondary —
+together worth roughly a third of the 18.80 ms gap. This is the other two
+thirds, and it is **codegen quality, not a correctness tax**: the guard is 24%
+of the field, the barrier pays for itself, and the RSP interpreter is
+large-not-slow at a defect-free 11.25 ns.
+
+**Cost of fixing it is the real obstacle.** Every file in `fn64-recomp-rs/src`
+is a certified source, so a codegen change moves identity digests, and rule 8
+prices it at 32 crate rebuilds. This is a program, not a patch.
+
+### CLOSED: the RSP cannot move to a worker thread — the deadline depends on the result
+
+Stronger than the existing "async buys 0" entry, which rests on the empirical
+claim that the off-field has no host slack. This one is structural.
+
+`fabric_ops.rs:179-181`: *"Schedule completion after a **measured** amount of
+synchronous RSP work."* The latency argument is
+`pre_ucode_steps.saturating_add(lle.steps)`, and **`lle.steps` is the retired
+instruction count produced by `total_steps` (`rsp_commit.rs:403`) — it does not
+exist until interpretation has finished.** The virtual deadline is *computed
+from* the work, so the scheduler must block on the worker immediately. You buy
+the handoff cost and nothing else. Even with infinite host slack it returns
+zero.
+
+Two further blockers: all state on the path is `thread_local!` (`HOST`,
+`RENDER_BACKEND`), so a worker would see **different empty instances** — a
+wrong-answer failure, not a deadlock. And `RunToken` (`thread.rs:178`) is
+`pub struct RunToken(())`, auto-`Send`/`Sync` — **reentrancy protection on one
+call stack, not serialization.** Its own doc says the guarantee holds *"since
+nothing in this crate spawns a second OS thread"*: an assumption, not an
+enforcement. The type would not catch the mistake.
+
+Threading the RSP correctly requires predicting instruction counts before
+executing them. That changes what the emulator is.
+
 ### CLOSED: the instruction budget is not a free parameter, and steps are not budget-bound
 
 Re-tested 2026-08-08 on the **rendering** route under RT64, post-guard-fix, with
