@@ -4,6 +4,97 @@ Written 2026-08-07, after a session that made **nine wrong calls** on this
 question and shipped six real wins. The wins all came from handing an agent a
 measurement. The wrong calls all came from handing one a hypothesis.
 
+## CLOSED: the choppy audio is the speed deficit. There is no audio bug.
+
+Investigated 2026-08-08 after the owner played WM2000 and reported choppy audio
+at the title screen. **Outcome: no defect on the audio path. The stream is
+starved because the emulator runs at ~46% of real time, and the audio shortfall
+and the render-field shortfall are ONE measurement, not two problems.**
+
+Record this before the mechanism, because it was the expensive part: **the
+figure that opened the investigation was wrong by 2x.** "91.5% of real time"
+came from reading `AudioOutputStats::samples` as frames when it counts i16
+channel samples. Corrected, delivery is **45.7%**. See rule 21; the wrong number
+is left standing in `shell-frontend-gaps.md` with a correction beside it.
+
+### The arithmetic, which closes exactly
+
+**Guest side — healthy in virtual time.** On the byte-identity gate route,
+`sim_time=18776001537` is **200.28 virtual seconds** at 93.75 MHz:
+
+| | | |
+|---|---:|---|
+| `vi_interrupts=12008` | **59.96 fields/virtual-s** | nominal 60 ✓ |
+| `audio_submits=11005` | **54.95 buffers/virtual-s** | |
+| ratio audio/VI | **0.9165** | not 0.5 — no alternate-buffer drop |
+
+**Buffer geometry.** A measured AI buffer is 1048 i16 = **524 stereo frames =
+16.38 ms of audio at 32 kHz** — one VI field. So the guest produces almost
+exactly one field of audio per field, and needs **61.0 buffers/wall-second** to
+sustain realtime.
+
+**Host side — the deficit.** The owner's session delivered 1,290,576 samples ÷ 2
+= 645,288 frames over 44.1 s:
+
+| | |
+|---|---:|
+| delivered | **14,632 frames/wall-s** |
+| against 32,000 Hz | **45.7% of realtime** |
+| as buffers | **27.9/s against 61.0 needed** |
+
+**27.9 buffers/s is the emulator delivering VI fields at 27.9 Hz instead of 60.**
+The audio deficit *is* the field-rate deficit — the same number reached from two
+independent directions. 45.7% of realtime and the render field's 2.15x budget
+are the same phenomenon; **anyone treating them as two problems will
+double-count the work.**
+
+The guest's programmed rate is **inferred from buffer geometry** (524 frames
+landing on a 16.38 ms field boundary implies ~32 kHz) rather than read from
+`AiFrequencyChanged`. Provenance noted so the next person can tighten it; it did
+not need tightening to close this question.
+
+### What was ruled out, and how
+
+Three factor-of-two candidates, all eliminated — the near-50% figure beside a
+confirmed 30 Hz render period made a units/cadence error the leading
+hypothesis, ahead of guest speed:
+
+| candidate | verdict | evidence |
+|---|---|---|
+| **resampler applies 32→48 ratio to samples where it means frames** | eliminated | `BandlimitedResampler::process` divides by `channels`; `step` advances a frame-coordinate phase. **Mutation-tested**: injecting the exact 2x error failed 3 of 6 tests |
+| **stereo/mono mismatch** | eliminated | a mono misread would make a buffer 1048 frames = 32.8 ms = two fields; measured is 524 = one field |
+| **per-field cadence dropping one of two buffers** | eliminated | `audio_submits/vi_interrupts = 0.9165`, not ~0.5 |
+
+The resampler is correct and loses no material: equal rates pass through
+byte-identically, and the windowed-sinc path is pinned by six tests including
+image-band suppression.
+
+**The three video fixes that landed the same day (RT64, `AutoNoVsync`, 30 Hz
+frame pacing) did not help the audio, and could not have** — but not because
+audio is unrelated to them. They reduced render cost without moving
+wall-versus-virtual enough to change the field delivery rate, and field delivery
+rate is what audio production tracks.
+
+### The instrument that hid it, now fixed
+
+`examples/wm2000-block-boot/src/shell.rs` — the played binary — read
+`AudioStreamHealth` but printed `underrun_samples` / `late_callbacks` /
+`max_callback_gap_us` **only on SPIKE lines**. The routine heartbeat showed
+`ai_buffers`/`samples`/`nonzero`/`backend_buffers`, all of which read clean
+under starvation. Equal buffer counts were taken as proof of health for hours.
+
+The heartbeat now also prints the host counters and a computed
+**delivered-frames-per-wall-second against the guest's programmed rate**
+(`audio_rates()`, not a hardcoded 32 kHz), with the channel-sample unit named in
+the label. See rules 21 and 22.
+
+### Consequence
+
+**There is no audio fix that is not "make the emulator faster."** A resampling
+or time-stretching workaround would hide the shortfall at the cost of timing
+fidelity, and is not proposed. This line closes and points back at the
+**19.17 ms render-field** problem, which remains the single bar.
+
 This is not a list of optimizations. It is the procedure that produced the wins
 and would have prevented the wrong calls.
 
@@ -1400,6 +1491,75 @@ synthetic-input testing does not cover the environment.** Run it once against
 the real tree before trusting it to gate a measurement — and prefer a
 construction whose failure mode is a crash over one whose failure mode is an
 empty result set, because empty reads as "clean" (rules 18 and 19).
+
+### 21. The counter's UNIT is part of the counter, and a rate inherits its error
+
+Earned 2026-08-08 on the WM2000 choppy-audio investigation, which ran for hours
+against a headline figure that was **wrong by exactly 2x**.
+
+The claim was *"audio delivered at 91.5% of real time"* — 1,290,576 `samples`
+over 44.1 s = 29,273/s against a 32,000 Hz guest clock. Every step of that
+arithmetic is right except the unit. **`AudioOutputStats::samples` counts i16
+CHANNEL samples, not frames.** `deliver_ai_buffer`
+(`crates/fn64-abi/src/task_dispatch/setup.rs:160-171`) pushes one `i16` per
+**2 bytes** across the DMA range and `:186` adds that length; the very same
+function writes metadata at `:226-228` reading `channels=2` / `frames={len/2}`.
+Stereo frames are `samples / 2`, so the real delivery is **14,632 frames/s =
+45.7% of real time**, not 91.5%.
+
+The two readings are not a rounding apart — they are different diagnoses. 91.5%
+is an 8.5% shortfall that sounds like jitter or a scheduling boundary; 45.7% is
+the emulator running at less than half speed. **Hours were spent looking for a
+defect sized to the wrong number.**
+
+The rule: **before dividing a count by wall-clock seconds, find the line that
+increments it and read what one unit IS.** A rate is a quotient, and it
+inherits the error of its numerator silently — nothing about "29,273
+samples/sec" looks wrong. Where a counter's name is ambiguous across a known
+axis (samples/frames, bytes/words, fields/frames, packets/messages), the name
+alone is not evidence; the increment site is.
+
+Corollary, since this codebase demonstrably has the ambiguity live: **finding a
+units bug in one place is a reason to check its twin on every path that
+consumes the same quantity.** Here the resampler was the obvious suspect and
+was cleared — but by injecting a 2x error into
+`BandlimitedResampler::process`'s `step` and confirming **3 of 6 tests failed**,
+not by reading it. That is rule 6a: a units check that cannot fail is not a
+check.
+
+### 22. A healthy delivery path is not a healthy stream
+
+The same investigation, and the reason the units error survived so long.
+
+`backend_buffers == ai_buffers` held **exactly** throughout, i.e. cpal accepted
+every buffer and dropped none. That was read as *audio is healthy*. It is not
+that claim. **Equal counts prove nothing is being LOST; they say nothing about
+whether enough is ARRIVING.** The device was playing gaps because the producer
+was starving it, and a zero-drop counter reports that state as perfect.
+
+The general shape: for any producer/consumer seam, *delivered ÷ wall-clock
+seconds against the rate the consumer demands* is the health metric. Queue
+depths, drop counts, and buffer parity are all **downstream** of it and every
+one of them reads clean under starvation.
+
+**The contradicting instrument existed and was not on the line.**
+`AudioStreamHealth` already carried `underrun_samples` — the count of samples
+the callback zero-filled, which is starvation measured directly — and
+`crates/fn64-shell/src/main.rs:671-707` prints it. But
+`examples/wm2000-block-boot/src/shell.rs`, the binary actually being played,
+read that struct and printed those fields **only on SPIKE lines**, never in the
+routine heartbeat. So a starved run and a healthy run emitted the same quiet
+heartbeat, and the one number that could have falsified the diagnosis was
+absent from the only output anybody was reading. Fixed: the heartbeat now
+prints `underrun_samples`, `late_callbacks`, `max_callback_gap_us`, and a
+computed **delivered-frames-per-wall-second against the guest's programmed
+rate**.
+
+This is rule 7's family (*a line printed on a state CHANGE cannot prove absence
+of progress*) pointed at a diagnostic rather than a route: **put the counter
+that can contradict you on the routine line, not the exceptional one.** A
+statistic that only appears when something already looks wrong cannot tell you
+that something is wrong.
 
 ### 19. A size difference proves "something changed", never "the thing you meant"
 
