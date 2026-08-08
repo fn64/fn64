@@ -139,6 +139,19 @@ Whether `wm2000-block-boot`'s benchmark loop runs on the main thread must be
 checked before assuming this works. The precedent exists: `examples/wm2000-boot`
 already does it.
 
+> **Checked 2026-08-07: it does.** `examples/wm2000-block-boot/src/main.rs`
+> contains exactly one `std::thread::spawn`, at `:1036`, and it is an opt-in
+> `FN64_BLOCK_WATCHDOG` diagnostic that only prints `entries=`/`last_pc=` every
+> five seconds. The execution loop itself is not spawned — it runs on the main
+> thread, so RT64's macOS main-thread guard (`shim.cpp:1380`) is satisfied for
+> the headless lane without restructuring.
+>
+> Taken with **C** being "mostly moot" for headless, this narrows the headless
+> benchmark path to essentially **A alone** — the Cargo wiring, with a working
+> precedent at `examples/wm2000-boot/Cargo.toml:20`. That is the cheapest place
+> to get a real number for the 31.6% rasterizer line, and it is a different
+> question from shipping RT64 in the windowed shell, where **C** is real work.
+
 **C. Presentation semantics genuinely differ — this is where the original
 intuition had real content.** RT64's `present` requires
 `PresentMemory::Physical` (`crates/fn64-render-rt64/src/lib.rs:1375`,
