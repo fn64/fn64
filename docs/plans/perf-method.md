@@ -466,6 +466,38 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+### 14. A rate-limited loop cannot report its own cost
+Retract the windowed **~18.8 ms p50** wherever it appears. It is not evidence
+the window is faster than the headless lane; it is not evidence of anything.
+
+`shell.rs:1195-1208` holds a cadence: `const FRAME = 16_666_667` ns, a
+`next_frame_deadline`, and `ControlFlow::WaitUntil`. When the shell keeps up it
+**sleeps**. So `frame_interval_ms` measures the 16.667 ms clamp, not the work —
+it reads ~16.7 ms on an infinitely fast machine and on a barely-adequate one
+alike. **Quoting it as a per-field cost fabricates a pass of the exact bar it is
+being used to test.** ~18.8 ms is simply 16.667 plus scheduler slop: the
+signature of a rate-limited loop roughly keeping up.
+
+Its sibling `pump_ms` is honest but measures something else. It brackets
+`pump_one_frame()` only, and `pixels.render()` runs later under
+`RedrawRequested` (`:975`, `:1184`) — **outside the bracket**. So `pump_ms` is
+close to the headless quantity *minus the blit that is the entire reason a
+window differs*.
+
+Consequently **the composite windowed cost including presentation is not
+instrumented at all.** Neither statistic is it, and no combination of them is
+either.
+
+What each is good for: `pump_ms` for guest+runtime cost over a matched span
+(reference backend, blit-excluded); `frame_interval_ms` only for *is it keeping
+up or falling behind* — where the **fraction of frames that overrun the
+deadline** is meaningful even though the median is not. That fraction is the
+real playability signal.
+
+The general rule: **before quoting a latency, establish whether the loop
+producing it is free-running or clamped.** A clamped loop reports its clamp,
+and a clamp set to the target reports success.
+
 ## CAVEAT ON EVERY NUMBER BELOW: they are HEADLESS, and RT64 is headless-only
 
 `examples/wm2000-block-boot/src/shell.rs` — the windowed binary — **hardcodes
