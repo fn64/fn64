@@ -857,6 +857,35 @@ VI_ORIGIN MMIO latch; nothing host-side scales with it), and **census
 artifact** (per-field normalization of catch-up advances is tested at
 `frame_census.rs:161-164`).
 
+### Lag-1 alone is BLIND to period 4 — report lags 1..6 and the raw sequence
+
+Pinned before any real data, with synthetic sequences through the same
+estimator, so the reading cannot be restated afterwards:
+
+| sequence | lag1 | lag2 | lag3 | lag4 |
+|---|---:|---:|---:|---:|
+| period-2 `fSfS` | **−1.00** | +0.99 | −0.99 | +0.99 |
+| period-4 `ffSS` | **+0.00** | **−0.99** | −0.00 | +0.99 |
+| period-3 `fSS` | −0.50 | −0.50 | **+0.99** | −0.49 |
+| contiguous blocks | +0.99 | — | — | — |
+| random 50/50 | +0.00 | — | — | — |
+
+**A period-4 sequence reads `lag1 = +0.00` — squarely in the "random, neither
+candidate survives" band while being perfectly periodic.** Only `lag2` exposes
+it. Period-3 is subtler: `lag1 = −0.50` reads as weak alternation when the real
+signal is at `lag3`.
+
+So the decision rule is: strongly negative lag-1 → alternation; strongly
+positive → contiguous phase mixture; **near zero → check lags 2..6 before
+concluding anything**, because "neither" and "period 4" are indistinguishable at
+lag 1.
+
+Report **the raw f/S string first**, then lags 1..6, then the statistic's
+verdict. A few hundred characters of eyeball catches a cycle no single
+coefficient will. This is rule 6a in statistical clothing: a test that returns
+the same answer for "random" and "perfectly periodic with the wrong period" is
+not a test for periodicity.
+
 ### The decisive test, and the data already exists
 
 `FieldSample` **already retains the cumulative gfx submit count per sample**
