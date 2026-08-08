@@ -466,6 +466,48 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+### `fn64-audio` at codegen-units=256: a real defect, an overstated cure
+
+`examples/wm2000-block-boot/Cargo.toml` sets `[profile.release] codegen-units =
+256` (:116) and overrides three packages to `1` — `fn64-recomp-rs` (:139),
+`fn64-runtime` (:142), `fn64-abi` (:145). **`fn64-audio` has no override**, so
+the crate interpreting **4.13B RSP instructions** builds at 256.
+
+The mechanism is real and verified two ways. `nm` on the rlib shows `run_imem`
+(defined `T` in cgu.013) carrying undefined references to
+`rsp::ops::dispatch` and `rsp::recomp::decode::decode` — genuine cross-CGU
+calls at **8.26B invocations**. And `pub fn decode` (`decode.rs:362`) carries
+**no `#[inline]`**; the `#[inline]`s in that file are on the small private
+helpers `op`/`rs` at :263/:267. Cross-CGU with no `#[inline]` means LLVM sees
+only a declaration — it was **never asked**, rather than having declined.
+
+**But the cure was overstated when this was dispatched, and the correction
+belongs here.** `decode` disassembles to **667 instructions**, at two call
+sites inside an 873-instruction loop — far past any default inline cost
+threshold. Same-CGU placement makes a function an inlining *candidate*, not an
+inlined one. The realistic upside is `dispatch` at 126 instructions, not the
+one holding 8.3 KB of decode tables.
+
+**Pre-registered prediction, recorded before the A/B runs: 0-2%, most likely
+inside noise.** Judge the result against that. It is still worth measuring,
+because talking yourself out of a cheap measurement from a disassembler is
+rule 1's error aimed at a negative — and inlining is not the only same-CGU
+effect (constant propagation into `decode`, whose `pc` argument is derivable at
+one site, and register allocation across the call can pay without any inline).
+
+**This is not the recorded LTO dead end, and the reason is shape, not
+identity.** That entry is `codegen-units`/LTO/`target-cpu=native` on the
+**shards** — 32 generated crates of cold dispatched-through code paying 9
+minutes of build for 10%. This is one handwritten crate running a hot
+interpreter loop.
+
+**The two RSP items overlap and their results will not add.** There are exactly
+2 relocations to `decode` from `run_imem`, and they *are* the double-decode
+pair at `interpreter.rs:118-119`. If `codegen-units=1` inlines `decode`, the
+redundant delay-slot decode gets cheaper but stays redundant; if the delay slot
+is made conditional, one of the two sites disappears. Measure separately; do
+not sum.
+
 ### Sizing the `run_imem` double-decode before dispatching it
 
 `crates/fn64-audio/src/rsp/interpreter.rs:119` decodes the delay slot
