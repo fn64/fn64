@@ -920,6 +920,89 @@ per-unit figure. **Before comparing two rates, state both numerators and both
 denominators explicitly** — if they share a numerator, there is only one
 measurement.
 
+### MEASURED: both RSP paths cost 11.26 ns/instruction. The gfx line is LARGE, not SLOW.
+
+The retraction above left the audio rate unmeasured. It is now measured, which
+turns a "we compared unlike quantities" into a positive result.
+
+`rsp_commit.rs:128` armed its per-chunk timer with `gfx_started.map(..)` —
+`None` on the audio branch — so `rsp_execution_ns` stayed 0 there and
+`audio_lle_rsp_ms` printed `0.000` on every run. The accumulation at `:384`
+was always correct; the value was always zero. **One line**, gated by the same
+`FN64_PHASE_TIMING`, so an unset run still takes no clock read (`7af71f8`).
+
+Measured 2026-08-08, one run, **same timer, same function, same route**
+(`a9e1b25e`, RT64, headless, 2.1M steps, quiet machine at load 2.72):
+
+| path | RSP wall time | instructions | **ns/instruction** |
+|---|---:|---:|---:|
+| graphics | 33,511.987 ms | 2,978,070,834 | **11.253** |
+| audio | 12,991.325 ms | 1,153,167,300 | **11.266** |
+| | | **difference** | **−0.1%** |
+
+**The interpreter costs the same per instruction on both paths**, to three
+significant figures. This is a same-run, same-timer comparison, so it is
+immune to the between-run drift that moved the graphics rate 12.05 → 11.25
+(−6.6%) across two runs of the same binary lane. **The gfx-vs-audio difference
+is ~60x smaller than the run-to-run noise** — that ordering is what makes the
+equality the robust finding rather than the coincidence.
+
+**All four candidate explanations are eliminated, because there is nothing to
+explain:**
+
+| candidate | verdict |
+|---|---|
+| different instruction mix (vector-heavy gfx) | cannot be read off this comparison — the *rates are equal* |
+| chunking / re-entry cost | 67,989 steps per `run_imem` entry; per-chunk setup is amortized ~68,000-fold |
+| memory access patterns | no rate difference to attribute to them |
+| guard work inside the RSP timer | the timer brackets `run_imem` alone on both branches |
+
+One caveat worth stating so it is not over-read: **this does not prove a
+vector op costs the same as a scalar op.** It proves the two *microcode
+workloads* average to the same cost per instruction. A `Vu` arm really does
+pay an extra cross-CGU `dispatch()` plus 8-lane element work
+(`interpreter.rs:229`), and audio ucode is also vector-heavy on the RSP — the
+likeliest reading is that both workloads are vector-dominated, not that
+vectors are free. Settling that needs an opcode-mix histogram, not this table.
+
+**What this changes about the 6.08 ms line.** It is **not a slow interpreter**;
+it is **526,161 instructions per render field at a uniform rate**. That
+reframes the lever entirely:
+
+- **Making the interpreter faster** pays across *all* 4.13B instructions, gfx
+  and audio alike — a genuine but uniform per-instruction win, and the
+  double-decode is the only sized candidate there (and is a mean-shaver).
+- **Executing fewer instructions** is the only thing that touches the render
+  field specifically. That means HLE-ing the graphics microcode rather than
+  interpreting it, which is a correctness/architecture question, not a perf
+  micro-optimization.
+
+Stated plainly, because it closes a line of inquiry: **there is no interpreter
+defect to find here.** The honest framing is that the RSP line is large, and
+"large" is a different problem from "slow" with a different set of fixes.
+
+Two further facts from the same run, recorded because they were free:
+
+- **Audio LLE is 95.6% interpretation** (12,991 of 13,583 ms), against
+  graphics LLE's 39.2%. Audio is essentially pure `run_imem`; graphics carries
+  the RDP seam alongside it.
+- **`audio_lle_rsp_ms` was a dead instrument for its entire existence.** Rule
+  6a's shape one more time: a counter that reads `0.000` on every run is
+  indistinguishable from a counter measuring something genuinely zero, and
+  nobody checked which it was.
+
+**Instrument perturbation, reported as required:** this run's mean was
+**24.21 ms/field** against the 22.36–22.41 instrumented band — **+8.0%**,
+*outside* the ±6% run-to-run band. Do **not** attribute that to the one-line
+timer change: the internal split moved in a way that edit cannot cause —
+`gfx_lle_rdp_ms` rose 33,610 → 51,605 (**+53.5%**) while `gfx_lle_rsp_ms`
+*fell* 6.6%. Arming an `Instant` on the audio branch cannot move RDP time.
+Unexplained, flagged rather than rationalized, and it does not touch the
+ns/instruction result, which is a within-run ratio. Guest byte-identical
+throughout (`gfx_submits=16586`, `audio_submits=11005`, `sp_tasks=27591`,
+`vi_interrupts=12008`, `controller_ops=3115`, `sim_time=18776001537`,
+`render_error=None`).
+
 ### Candidates re-sized against the render field (19.17 ms)
 
 | candidate | on the render field | % of 19.17 |
