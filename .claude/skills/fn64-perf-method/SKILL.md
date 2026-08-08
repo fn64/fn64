@@ -163,7 +163,22 @@ Never `git add -A`.
 
 **Background every build** (`nohup` + log) — a build was lost to a 10-minute
 tool timeout. Use `$CLAUDE_JOB_DIR/tmp`, not `/tmp`, for scratch: parallel jobs
-clobber `/tmp`.
+clobber `/tmp`. Give each agent its own `CARGO_TARGET_DIR`: a shared target dir
+is the same contention class as a shared checkout, one layer down.
+
+**A source edit is a build.** A shared checkout means *file* contention, not
+just CPU contention — the sibling to "a diagnostic probe is a benchmark." An
+agent wrote six files over ~90 seconds while a peer's 32-crate build was
+reading the tree; the build died 14 minutes in on `telemetry.rs` consuming a
+`PhaseTiming` field `lifecycle.rs` had not yet declared. **Editing in
+dependency order would not have helped: no ordering makes a multi-file change
+atomic to a concurrent reader.** The only remedy is not writing while someone
+reads. Serialize writers against builders, not merely benchmarkers.
+
+Corollary for the reader: a build that fails on a file you never opened is
+someone else's in-flight edit, not your bug. Check `git status` mtimes before
+debugging it — and when a peer's uncommitted work is linked into *your*
+binary, name it as the first suspect if a result looks wrong.
 
 ## The environment
 
