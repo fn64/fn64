@@ -387,6 +387,65 @@ Two pre-existing bugs had to be fixed to get here, both invisible because the
   that only a real guest walks into; pinned by a mutation-tested regression
   test using the captured registers.
 
+## What the remaining 2.64x is, under RT64 — it is the guard, not graphics
+
+Profiled at `4f513f0` on route `a9e1b25e`, headless, quiet machine, both
+instruments (phase counters + caller-resolved sampling). Reproduces the A/B:
+reference 57.19, rt64 43.43 ms/field.
+
+| component | reference | rt64 | share | change |
+|---|---:|---:|---:|---|
+| **executor self (guest+runtime+guard)** | 16.34 | **18.96** | **45.7%** | **+2.61 worse** |
+| gfx LLE — raw RDP | 17.36 | 6.66 | 16.1% | −10.70 (2.61x) |
+| RSP audio LLE | 3.91 | 3.95 | 9.5% | — |
+| gfx non-LLE (HLE preflight/chunk) | 3.90 | 3.92 | 9.5% | — |
+| gfx LLE other (setup/commit/copies) | 3.94 | 3.92 | 9.4% | — |
+| gfx LLE — RSP interpretation | 2.99 | 2.95 | 7.1% | — |
+| VI present | 3.87 | **1.14** | 2.7% | −2.73 (3.39x) |
+
+**Only two lines moved.** Everything else is unchanged within 1%.
+
+**`RdramView::read_u8` is 44.06% of all samples, and 99.21% of that enters
+through `read_snapshot`** — the mutation-journal guard, not graphics. Its four
+seams: `osSpTaskStartGo_recomp` 5.97 ms/field, `dispatch_lle_task` 5.89,
+`with_render_backend` 3.19, `dispatch_captured_raw_rdp` 3.17.
+
+So **~60% of the remaining per-submit "graphics" cost is guard work at the
+renderer seam.** That is why the speedup did not scale with density: graphics
+rose 2.82x between routes while RT64's absolute saving rose only 1.34x (47% of
+proportional), because the residual per-submit cost is a guard a GPU cannot
+touch. RT64's native code does not appear in the self-time table at all — its
+work is off-CPU.
+
+The two instruments do not disagree; they slice different axes. Phase counters
+bucket by call-tree seam, the sampler by which function burned cycles. Joining
+them shows the counters' "graphics" bucket contains ~15.3% of total that is
+actually guard.
+
+### The negative result that explains a contradiction
+
+`FN64_FAST_MUTATION_JOURNAL=1` on the RT64 lane measures **+1.15% mean — nothing,
+wrong direction** — while the profiler attributes 44% of samples to the guard.
+Both are right, and the reason is a reachability bug:
+
+`execution.rs:825` builds an `RdramView`, then calls
+`flush_active_host_abi_transaction_with(thread, |physical| view.read_u8(..))` —
+a **closure**, not the view. That wrapper (`live_program.rs:2381`) hardcodes
+`None`, so at `:2298` the `changed_ranges_from_view` memcmp arm is skipped and
+`read_snapshot` runs a **per-byte closure call over the whole 1 MiB watched
+region** at every nested-writer entry. **That path is not gated by
+`continuous_snapshot_enabled()`**, so the journal switch cannot turn it off.
+
+`execution.rs:565` already calls the `_from_view` variant — the sibling fix the
+comment at `live_program.rs:2313-2318` records as worth ~7% of total runtime.
+This site was never converted. The fast path exists and is simply unreachable.
+
+Two further costs named and not touched: `dispatch_captured_raw_rdp` allocates
+and copies **the entire 8 MiB RDRAM per DPC submission** plus a copyback
+(`rsp_commit.rs:1085-1132`), backend-independent so RT64 cannot remove it; and
+RT64 adds **+19.5 s of `sys` time** (GPU driver), which is 62% of the
+executor-self regression — a real cost of the GPU lane, not an artifact.
+
 ## Where the cost is, as of `e7c4d04`
 
 Quiet-machine deep route (19,523 steps, `FN64_MPROTECT_BARRIER=1`): **382-392 ms**.
