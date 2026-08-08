@@ -466,6 +466,36 @@ Category split: per-boundary **~55%**, device timing ~12.5%, per-instruction
 Everything above 1.0x is the correctness apparatus. Codegen is not the lever and
 will not be until that 2.86% grows.
 
+## THE STANDING BAR: 16.667 ms/field, hardware parity
+
+The goal is **at least as good as original hardware, with the game playable**.
+That is `ratio A <= 1.00x` — 16.667 ms per emulated VI field — and
+`holds_60fps=true`, on the gameplay route with a real backend.
+
+Where it stands as of `abc7871`:
+
+| | value |
+|---|---|
+| now | **22.51 ms/field = 1.35x** |
+| target | 16.667 ms/field = 1.00x |
+| **gap** | **5.84 ms, 26% of current runtime** |
+| playable | **yes** — on screen, audio, two players, all verified |
+| 60fps | **no** — ~50% of fields over budget |
+
+Two things this bar is NOT, both of which have caused confusion here:
+
+- **It is not the game's frame rate.** N64 VI fields are 60 Hz whatever the
+  game renders. A title that draws every other field still requires its
+  emulator to deliver 60 fields/sec or wall-clock playback runs slow. The bar
+  is per-FIELD.
+- **It is not the median.** p50 already fits (16.27 ms). `holds_60fps` needs
+  the distribution, not its middle — ~50% of fields still miss, and the tail
+  (p95 ≈ 38 ms) is what a player feels.
+
+Progress so far, all measured on route `a9e1b25e`: **19,000x -> 3.38x** (many
+sessions) **-> 2.64x** (RT64, `f74e4e9`) **-> 1.35x** (view threading,
+`abc7871`).
+
 ## RESULT: the guard fix landed at 1.95x — 44.13 -> 22.51 ms/field (`abc7871`)
 
 Two interleaved pairs, RT64 block lane, route `a9e1b25e`, 2.1M steps, quiet
