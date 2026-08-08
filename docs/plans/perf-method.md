@@ -485,6 +485,16 @@ actually guard.
 
 ### The negative result that explains a contradiction
 
+**PARTIALLY SUPERSEDED 2026-08-08 — the measurement stands, the explanation
+does not.** The reachability bug below was real and `abc7871` fixed it, but the
+flag still measures nothing *after* that fix: **−0.14 ms/render-field over
+three interleaved pairs with the barrier ON** (see the corrected section under
+"The write barrier now SAVES 12.4 ms/field"). So the bug was **not the whole
+reason** this read as null. The dominant reason is that with the barrier on,
+the ungated scheduler-mirror reconcile arms one step ahead of the gated call,
+leaving it an empty dirty set to compare. Keep the diagnosis below as the
+history of a genuine defect; do not keep it as the explanation of this null.
+
 `FN64_FAST_MUTATION_JOURNAL=1` on the RT64 lane measures **+1.15% mean — nothing,
 wrong direction** — while the profiler attributes 44% of samples to the guard.
 Both are right, and the reason is a reachability bug:
@@ -659,18 +669,34 @@ asserted it as the *flag's* cost. One measurement doing duty in two different
 experiments.
 
 Measured properly — flag on vs off, **barrier ON in both lanes**, 2.1M steps,
-route `a9e1b25e`:
+route `a9e1b25e`, RT64, headless, quiet machine, **three interleaved pairs**:
 
-| | lane A (flag off) | lane B (flag on) | delta |
+| pair | lane A (flag off) | lane B (flag on) | delta |
 |---|---:|---:|---|
-| render field mean | 36.08 | 35.59 | **−0.49 ms (−1.36%)** |
-| off-field mean | 8.92 | 8.95 | +0.03 |
-| overall mean | 22.50 | 22.26 | −0.24 |
+| rep 1 | 36.08 | 35.59 | **−0.49 ms (−1.36%)** |
+| rep 2 | 35.71 | 35.91 | **+0.20 ms (+0.56%)** |
+| rep 3 | 35.72 | 35.58 | **−0.14 ms (−0.39%)** |
+| **mean** | | | **−0.14 ms, sd 0.35** |
 
-Guest byte-identical on all seven counters, so the flag does not change the
-emulated program. **Read this as indistinguishable from zero pending
-replication** — −1.36% sits far inside the documented ±6% band and it is one
-pair.
+**The deltas span both signs.** Within-lane spread across reps (A 0.37 ms,
+B 0.33 ms) is as large as the between-lane delta, which is the definition of a
+result inside noise. Off-field moved +0.03 / −0.03 / +0.16 — nil, as expected
+for a per-dispatch cost. Guest byte-identical on all seven counters in all six
+runs, so the flag does not change the emulated program.
+
+**Do not quote rep 1's −0.49 alone.** An earlier revision of this entry did,
+before replication, and it reads as a small win; the second pair reversed its
+sign. **−0.14 ms is 0.75% of the 19.17 ms the render field needs.**
+
+**Rule 6a — the lane check CAN fail, and it passed.** `barrier_served`
+increments only in `stats::note()`, reached only from `barrier_spans()`
+(`live_program.rs:372`, `:424`), both *below* the gate on the block path.
+Boundaries fell **7,716,048 → 5,911,979 (−1,804,069, −23.4%)**, reproducing
+bit-for-bit across both proof reps. It fell but **not to zero** — pre-registered
+as the required outcome, because the ungated mirror and host-ABI paths still
+call the same comparison. A drop to zero would have falsified the mechanism
+below; an unchanged count would have meant the flag never reached the gate and
+the A/B was invalid.
 
 **So the two historical "measures zero" entries were RIGHT, and for a reason
 this file already half-states**: with the barrier on, `matches_view` compares
@@ -690,6 +716,41 @@ absorption is the more likely one, and it survives the fix.
 A dead end is still scoped to the route that produced it. But **check first
 whether the experiment varied the thing the entry names** — that is the error
 here, and it is worse than a scoping mistake.
+
+**Why the second comparison is free, traced in source rather than profiled.**
+`host.rs:361-382` runs `mirror_guest_running_thread` **before** `run_one_step()`
+on every scheduling step; its own comment says *"this is a FULL watched-region
+journal reconcile ... and it runs on every step."* That reaches
+`reconcile_before_dispatch_from_view` (`live_program.rs:2205-2225`), which is
+**not gated by `continuous_snapshot_enabled()`** and arms the barrier on its
+match path. The gated call at `runners.rs:1033` then asks a freshly-armed
+region, gets an empty dirty set, and matches trivially. Removing it removes
+almost nothing — which is exactly what three pairs measured.
+
+**Correctness: the comment's justification is wrong, but the conclusion is
+roughly right, and the flag is not the lever anyway.** The comment at
+`live_program.rs:2162` says the comparison "only asserts that no undeclared
+write occurred, which write attribution already guarantees." Attribution does
+**not** guarantee that: `write_barrier.rs:52-57` lists `as_mut_slice`, the DMA
+paths, the RSP/renderer slices and raw `RdramPtr` stores as bypassing the
+declaration path, and `live_program.rs:2088-2094` records generated C shims
+writing guest memory below every attributed store — with a mitigation
+(`snapshot_for_host_shim` / `declare_host_shim_writes`) that has **zero
+non-test callers**. What saves the flag is not attribution but the *ungated*
+mirror: it re-runs the same comparison one step later, so an undeclared write
+is still caught, with at most one step of delay. **Do not cite the 0x0009b0b3
+incident as evidence against this flag** — that failure belongs to the reverted
+write-queue gate and to the baseline-*advancing* read, both of which
+`live_program.rs:2545-2560` distinguishes from this one in as many words.
+
+**Zero test coverage.** Full-tree grep finds three non-doc occurrences of
+`FN64_FAST_MUTATION_JOURNAL`, all inside `live_program.rs` itself. No gate, no
+script, no CI job runs the flag-on lane.
+
+**One separable defect worth fixing regardless.** The gate returns *above*
+three O(1) assertions — `assert_not_poisoned`, the `sealed` assert, and
+`PENDING_ATTRIBUTED_EXECUTABLE_WRITES == 0` (`live_program.rs:680-692`). Only
+the memcmp was meant to be skippable. Move the gate below the asserts.
 
 **The 17.8% sys-time GPU attribution is RETRACTED.** `/usr/bin/time -l` on the
 barrier-off control: 422.99 real / 398.97 user / **36.02 sys = 8.5%**, with
@@ -1398,6 +1459,17 @@ signature as the unexplained +8% drift recorded above (RDP up, RSP flat or
 down), at about half the magnitude, and it is present in the *control* lane
 too, so it is not my instrument. Still unexplained.
 
+**UPDATE 2026-08-08 — the drift is ABSENT in the `FN64_FAST_MUTATION_JOURNAL`
+A/B, reported as a negative because a drift that comes and goes is a different
+problem from one that persists.** Same route, same binary, same RT64 headless
+lane, `FN64_PHASE_TIMING=1`: `gfx_lle_rdp_ns` reads **5.85 ms/render-field
+against the 5.82 baseline (+0.5%)** and `gfx_lle_rsp_ns` **5.97 against 6.08
+(−1.8%)**. Both lanes agree (B: 5.87 / 6.04). So the +20.9% excursion did not
+reproduce, and whatever causes it is **intermittent between runs rather than a
+standing property of the route or of phase timing**. That rules out the
+simplest explanations — it is not the instrument, and it is not a permanent
+regression introduced between the baseline and now.
+
 ### FOUND IT: executor self is 21.72 ms — 61% of the render field, not graphics
 
 The "unaccounted 23.94 ms" was never unmeasured. It was in the population split
@@ -2039,9 +2111,13 @@ verdict. For that, use a real `git worktree` checkout.
 - **Caching activation on `guest_write_token`.** Unsound. Its zero-consumer
   property is a *cited premise* of a written safety argument
   (`dispatch-granularity.md:570`).
-- **An async guard worker.** Sound but worthless: deleting the whole journal
-  (`FN64_FAST_MUTATION_JOURNAL=1`) measures **0 ms**, and a thread cannot beat
-  deletion.
+- **An async guard worker.** Sound but worthless: the flag it would race
+  against (`FN64_FAST_MUTATION_JOURNAL=1`) measures **−0.14 ms/render-field,
+  inside noise** (three interleaved pairs, barrier ON — see "MEASURED:
+  `FN64_FAST_MUTATION_JOURNAL` costs nothing with the barrier on"), and a
+  thread cannot beat deletion of something that is already free. Note the flag
+  does **not** delete "the whole journal": write attribution, sealing, the
+  per-generation digest and two other comparison sites all keep running.
 - **`codegen-units` / LTO / `target-cpu=native` on the shards.** 10% for a
   9-minute build, or 2.3x *slower* with all three.
 - **`with_executor`'s `RefCell` borrow.** One call per scheduling step from
@@ -2120,3 +2196,15 @@ Reaching 1.0x therefore needs **both** halves:
 Note `FN64_FAST_MUTATION_JOURNAL=1` already measures **zero** difference
 (435 ms vs 441 ms): the barrier absorbed that cost, so the removable 47% is not
 sitting idle waiting to be switched off.
+
+**CONFIRMED 2026-08-08, and this entry's stated reason was the correct one.**
+Re-measured on the *rendering* route (`a9e1b25e`, RT64, barrier ON in both
+lanes, three interleaved pairs): **−0.14 ms/render-field, sd 0.35, deltas
+spanning both signs.** "The barrier absorbed that cost" is now traced to a
+specific mechanism — the ungated scheduler-mirror reconcile arms the barrier
+one step ahead of the gated call, so the gated comparison finds an empty dirty
+set. See the corrected section above. Two cautions on the figures *here*
+though: 435/441 ms are **whole-run totals, not ms/field**, and they come from
+the 19,523-step route that renders nothing (rule 11), so this entry's number
+never transferred to a rendering route in the first place — the agreement with
+the new measurement is a real result, not a restatement.
