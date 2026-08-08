@@ -40,8 +40,8 @@ pub use certification_profile::{
     FULL_PARITY_V1_DEFINITION_SHA256, FULL_PARITY_V1_SCHEMA,
 };
 pub use controller_input_schedule::{
-    parse_controller_input_schedule, ControllerInputPhase, ControllerInputSchedule,
-    ControllerInputScheduleError, CONTROLLER_INPUT_SCHEDULE_SCHEMA,
+    attach_controllers_for_driven_ports, parse_controller_input_schedule, ControllerInputPhase,
+    ControllerInputSchedule, ControllerInputScheduleError, CONTROLLER_INPUT_SCHEDULE_SCHEMA,
 };
 #[cfg(feature = "recomp-rs")]
 pub use generated_runner_build::{

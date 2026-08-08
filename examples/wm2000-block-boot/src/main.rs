@@ -196,12 +196,14 @@ impl ControllerScheduleDriver {
             fn64_boot_harness::parse_controller_input_schedule(&source).unwrap_or_else(|error| {
                 panic!("parsing controller schedule {}: {error}", path.display())
             });
+        let driven = schedule.driven_ports();
         println!(
-            "[wm2000-block-boot] controller schedule={} phases={} sha256={}",
+            "[wm2000-block-boot] controller schedule={} phases={} driven_ports={driven:?} sha256={}",
             path.display(),
             schedule.phases().len(),
             schedule.source_sha256_hex(),
         );
+        fn64_boot_harness::attach_controllers_for_driven_ports(driven);
         Self {
             schedule,
             read_ordinals: [0; 4],
