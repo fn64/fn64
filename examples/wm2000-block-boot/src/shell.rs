@@ -1024,9 +1024,27 @@ impl Shell {
                 "[wm2000-shell] heartbeat: presented frame #{frames} origin={fb_offset:#010x} \
                  ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
                  osViSwapBuffer calls={swaps}; frame_interval_ms[{}] pump_ms[{}]; \
-                 audio: ai_buffers={} samples={} nonzero={} backend_buffers={}",
+                 audio{}: ai_buffers={} samples={} nonzero={} backend_buffers={}",
                 fmt(&interval),
                 fmt(&pump),
+                // A zero audio counter has two completely different meanings and
+                // the log body cannot tell them apart. On 2026-08-07 a run with
+                // `FN64_NO_AUDIO=1` printed `ai_buffers=0 samples=0` and that was
+                // recorded in the blocker ledger as "audio is silent, MIT-clean
+                // HLE microcode remains a real project" -- when the same binary
+                // without the flag delivers 1,898 buffers and 1.69M nonzero
+                // samples. `FN64_NO_AUDIO` short-circuits `wire_audio` below,
+                // leaving `AUDIO_RDRAM_LEN` at 0, which makes
+                // `apply_live_ai_write_effect` skip `deliver_ai_buffer` entirely:
+                // every counter here is then pinned at zero BY REQUEST, in a run
+                // where the guest is synthesizing PCM the whole time. Say so on
+                // the same line as the numbers, so the disclaimer cannot be
+                // separated from the zero it explains.
+                if audio_disabled_by_request() {
+                    " (DISABLED by FN64_NO_AUDIO -- zeros below are the flag, not the guest)"
+                } else {
+                    ""
+                },
                 audio.ai_buffers,
                 audio.samples,
                 audio.nonzero_samples,
@@ -1048,8 +1066,14 @@ fn expand5(v: u16) -> u8 {
 /// Register a live cpal output stream. A create() failure (no device, headless
 /// CI) is logged, not fatal: the window and input still work, only sound is
 /// unavailable.
+/// Whether this run asked for silence. Read by the heartbeat as well as
+/// `wire_audio`, so a zeroed audio counter always carries its own explanation.
+fn audio_disabled_by_request() -> bool {
+    std::env::var_os("FN64_NO_AUDIO").is_some()
+}
+
 fn wire_audio() {
-    if std::env::var_os("FN64_NO_AUDIO").is_some() {
+    if audio_disabled_by_request() {
         println!("[wm2000-shell] FN64_NO_AUDIO set -- audio output disabled");
         return;
     }

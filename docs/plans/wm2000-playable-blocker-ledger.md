@@ -2019,16 +2019,94 @@ today (see `rt64-on-the-block-lane.md`).
 
 ### What remains
 
-Not correctness — **speed and sound**.
+Not correctness — **speed**. (Sound was on this list and should not have been;
+see the retraction below.)
 
 1. **The 60fps bar.** The windowed lane's own heartbeat reads p50 ~18.8 ms,
    p95 ~93 ms, p99 ~95 ms, every field flagged over 16.7 ms. That p50 is
    *better* than the headless 43.31 ms in `perf-method.md`, but the two cover
    different route phases and **must not be compared without a matched span**.
-2. **Audio is silent.** `ai_buffers=0 samples=0`. MIT-clean HLE audio microcode
-   remains a real project; the GPL-3.0 reference is barred by the licensing
-   thesis.
+2. ~~**Audio is silent.** `ai_buffers=0 samples=0`.~~ **Retracted 2026-08-07 —
+   the silence was the test invocation's own `FN64_NO_AUDIO=1`.** See the
+   retraction immediately below.
 3. **One binary, or two?** The shipping-named `fn64` binary cannot run WM2000,
    and the one that can lives under `examples/`. Unifying them is a real port
    across the catalog/generation boot seam, not an env-var change — it needs an
    explicit decision, not a drive-by fix.
+
+## RETRACTED 2026-08-07 — "audio is silent" was the harness's own flag
+
+**WM2000 audio works. It always did.** The `ai_buffers=0 samples=0` reading came
+from a run that had disabled audio on purpose, and the number was then read as a
+property of the emulator.
+
+The evidence is line 3 of the very log that produced the claim
+(`/tmp/wm2000-live-window-evidence.log`, the live-window run):
+
+```
+[wm2000-shell] loading ROM from .../wm2000.z64
+[wm2000-shell] discovered pack: 15 static-prefix shards + 2 resident-tail shards ...
+[wm2000-shell] FN64_NO_AUDIO set -- audio output disabled
+```
+
+`FN64_NO_AUDIO` short-circuits `wire_audio()` at
+`examples/wm2000-block-boot/src/shell.rs:1052` before `set_audio_backend` runs,
+so `AUDIO_RDRAM_LEN` stays 0. `apply_live_ai_write_effect` then skips
+`deliver_ai_buffer` entirely at `crates/fn64-abi/src/pi/mmio.rs:716` — the one
+site that increments `ai_buffers` (`task_dispatch/setup.rs:185`). Every audio
+counter is therefore **structurally pinned at zero by that flag**, in a run where
+the guest is synthesizing PCM normally the whole time.
+
+### The measurement that settles it
+
+Both lanes, HEAD binaries, `entrance-to-match`, `FN64_TRACE_AI_BUFFERS=1`:
+
+| lane | buffers | samples | nonzero | peak_abs |
+|---|---:|---:|---:|---:|
+| headless `wm2000-block-boot`, 400k steps | **1,898** | **1,990,144** | **1,688,483** | **30,704** |
+| windowed `wm2000-shell`, 1,200 pumps | **1,151** | — | 1104/1104 on the last buffers | — |
+| windowed `wm2000-shell` + `FN64_NO_AUDIO=1` | **0** | 0 | 0 | 0 |
+
+Headless final line: `[wm2000-block-audio] buffers=1898 samples=1990144
+nonzero_samples=1688483 peak_abs=30704`.
+
+The windowed lane additionally negotiated and opened a real device:
+
+```
+fn64-audio: device rejected 32000 Hz (...); opening at device-default 48000 Hz
+            with band-limited resampling
+[wm2000-shell] audio output wired (cpal, guest 32000 Hz -> stream 48000 Hz stereo)
+fn64-audio: output callback live (first pull: 1024 samples, ring holds 4240)
+```
+
+So the full chain is live: audio task under `LleAccuracy` -> `dispatch_lle_task`
+-> RSP synthesizes PCM into RDRAM -> guest writes AI_DRAM_ADDR/AI_LEN ->
+`AiDmaStarted` -> `deliver_ai_buffer` -> `CpalBackend::queue_samples` -> cpal
+realtime callback. **No stage is unimplemented, unregistered, or gated off.**
+
+Buffer #1 lands at probe frame 1, i.e. before the first 60-frame heartbeat, so
+"too early to have produced samples" is not available as an alternative reading
+of the zero either.
+
+Startup buffers are genuinely `nonzero=0` (silence) for the first ~285 DMAs and
+then ramp: `#286 nonzero=60 range=-2..=2`, `#287 nonzero=513 range=-70..=83`,
+reaching full-scale `range=-25921..=16895` later. That ramp is exactly why
+`FN64_DUMP_AUDIO_PCM` waits for a nonzero buffer
+(`crates/fn64-abi/src/task_dispatch/setup.rs:214`) — sampling only the first
+buffer would have produced a second, subtler version of this same false
+conclusion.
+
+### The rule this earns
+
+This is `perf-method.md` rule 6 (**prove the lanes differ**) pointed at a
+feature instead of a benchmark. A counter that a flag can pin to zero cannot be
+read as evidence about the subsystem until you have checked the flag. The
+windowed heartbeat prints `ai_buffers=...` unconditionally, including in runs
+where audio is disabled by request, so the honest zero and the alarming zero are
+indistinguishable in the log body — only the banner at line 3 separates them.
+
+It also retires the stale premise that rode along with the claim: **"MIT-clean
+HLE audio microcode remains a real project" is false.** `crates/fn64-audio` is
+24,202 lines with 345 passing tests, is already a dependency of the WM2000 lane
+(`examples/wm2000-block-boot/Cargo.toml:39`), and the 1,688,483 nonzero samples
+above are it working. Nothing here needs a GPL reference, and none was consulted.
