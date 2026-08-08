@@ -88,6 +88,14 @@ checkbox that appears not to work.
 ## Priority note
 
 None of this is on the 60fps critical path. The measured blocker there is
-audio delivered at **91.5% of real time** and a render field at **2.15x
-budget** — see `perf-method.md`. These are playability-and-polish items and
-should be scheduled against that, not ahead of it.
+~~audio delivered at **91.5% of real time**~~ **CORRECTED 2026-08-08: audio is
+delivered at 45.7% of real time** and a render field at **2.15x budget** — see
+`perf-method.md`. These are playability-and-polish items and should be
+scheduled against that, not ahead of it.
+
+The 91.5% figure was wrong because `AudioOutputStats::samples` counts **i16
+channel samples, not frames**; dividing by 32,000 instead of 16,000 frames/s
+halved the apparent deficit. The corrected figure is not a second problem:
+**45.7% of real time and 2.15x the frame budget are the same measurement**, so
+do not budget separate work against them. The wrong number is left visible
+because the error is the instructive part — see rule 21 in `perf-method.md`.
