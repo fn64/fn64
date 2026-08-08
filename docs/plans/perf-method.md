@@ -1162,6 +1162,54 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
+### CLOSED: the instruction budget is not a free parameter, and steps are not budget-bound
+
+Re-tested 2026-08-08 on the **rendering** route under RT64, post-guard-fix, with
+the mirror's 8.43 ms/field known — conditions that did not exist when the
+original dead end was recorded. **The entry is strengthened, not reversed**, and
+for a reason nobody had established.
+
+`FN64_BLOCK_INSTRUCTION_BUDGET` defaults to 4096 and the benchmark never sets
+it. Three 300k-step probes, every counter normalized by its lane's `sim_time`:
+
+| counter | 4096 | 8192 | 16384 |
+|---|---:|---:|---:|
+| `vi_interrupts` | 1.0000 | **1.0000** | **1.0000** |
+| `audio_submits` | 1.0000 | 0.9999 | 1.0001 |
+| `gfx_submits` | 1.0000 | 1.2161 | **1.3228** |
+| `sp_tasks` | 1.0000 | 1.0869 | 1.1300 |
+| `pi_started` | 1.0000 | 0.9173 | **0.8742** |
+
+**The two exact `1.0000` rows are the evidence**, not decoration: they prove the
+normalization is sound, so the rows that move are moving for real. **Graphics
+submits rise 32% per unit of virtual time while PI DMAs fall 13% — opposite
+directions.** A program running faster moves its counters together or not at
+all. This is a *different emulation*. Run queues differ at equal step count too:
+`[17,3,1]` / `[17,1]` / `[6,1]`.
+
+**And the mechanism fails independently.** Steps would not have halved anyway: a
+2x budget buys only **1.178x** guest work per step, 4x buys 1.291x (7,960 →
+9,378 → 10,274 cycles/step against a budget-bound ideal of 1x/2x/4x). **Most
+dispatches already end on something other than budget exhaustion**, so the
+budget does not control step count. Either finding alone closes it.
+
+The clamp was verified inactive first, so this is a real result rather than a
+null one for an unrelated reason: `canonical_instruction_limit`'s only non-test
+setter is gated on `FN64_BLOCK_EXPECT_GUEST_INSTRUCTIONS`, which the benchmark
+never sets.
+
+**Consequence for the bar: the mirror-halving line comes off the projection.**
+The mirror is per-step, step count has no cheap knob, and reducing per-step
+apparatus now requires either a **cheaper mirror** or a change to **when** the
+watched region is verified. That is the architectural option, not the
+incremental one.
+
+One more rule-6a trap caught in passing: `grep "registered rt64 renderer"` on
+the *binary* returns 0 and means nothing — the string is built at runtime from
+`{active_renderer}` (`main.rs:903`). RT64 is genuinely linked (40 symbols), and
+the `rt64` arm panics rather than falling back, so a mislabeled
+reference-backend number is not possible on this lane.
+
 ### 18. `pcpu` and `pgrep -f` both lie about this workload
 Two liveness checks that read plausibly and are wrong, both rule-15 shapes,
 both caught in practice on this project:
