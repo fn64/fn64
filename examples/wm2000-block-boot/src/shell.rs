@@ -417,6 +417,11 @@ struct Shell {
     gamepads: Gamepads,
     rgba: Vec<u8>,
     fb_width: usize,
+    /// Height of the present surface. The reference path holds this at
+    /// `FB_HEIGHT` (the guest's VI framebuffer is always 240 lines here), but
+    /// RT64 renders at its own internal resolution and resizes both axes, so
+    /// height can no longer be assumed constant.
+    fb_height: usize,
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
     reported_first_frame: bool,
@@ -435,6 +440,25 @@ struct Shell {
     /// Present when `FN64_CONTROLLER_SCHEDULE` names a committed route, which
     /// then owns the pad instead of the live gamepad.
     schedule: Option<ScheduleDriver>,
+    /// Which rasterizer `FN64_RENDER` selected, decided once at registration.
+    ///
+    /// This is not cosmetic: it picks the PRESENT PATH. The reference backend
+    /// rasterizes into guest RDRAM, so the window decodes RGBA5551 out of the
+    /// runtime's framebuffer. RT64 renders into its own GPU surface and writes
+    /// nothing back, so that decode would read a stale (usually black) buffer
+    /// forever -- the RT64 image has to come back through
+    /// `fn64_abi::capture_render_release_frame`.
+    active_renderer: ActiveRenderer,
+}
+
+/// The rasterizer in use, and therefore which of the two present paths runs.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ActiveRenderer {
+    /// Software rasterization into guest RDRAM; present decodes RGBA5551.
+    Reference,
+    /// Native GPU rasterization into RT64's own surface; present reads the
+    /// post-VI BGRA8 capture back through the ABI seam.
+    Rt64,
 }
 
 /// Bound on scheduling steps per pump, so a pathological spin cannot wedge the
@@ -605,22 +629,7 @@ impl Shell {
             fn64_runtime::SaveType::SramBanked,
         )));
 
-        use fn64_render::RenderBackend as _;
-        let mut render_backend = fn64_render_reference::ReferenceBackend::new()
-            .with_f3dex2()
-            .with_clear_color([0, 0, 0, 255]);
-        render_backend
-            .create(&fn64_render::RenderConfig::ntsc(
-                FB_WIDTH as u32,
-                FB_HEIGHT as u32,
-            ))
-            .expect("ReferenceBackend create must be infallible for 320x240");
-        fn64_abi::set_render_backend_with_policy(
-            Box::new(render_backend),
-            fn64_recomp_rs::RDRAM_LEN,
-            fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
-        );
-        println!("[wm2000-shell] registered reference renderer (320x240)");
+        let active_renderer = Self::register_render_backend();
 
         let mut program = fn64_recomp_rs::BlockProgram::new();
         // Destination history is a diagnostic ring the batch lane reads after a
@@ -696,6 +705,7 @@ impl Shell {
             gamepads: Gamepads::new(),
             rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
             fb_width: FB_WIDTH,
+            fb_height: FB_HEIGHT,
             window: None,
             pixels: None,
             reported_first_frame: false,
@@ -707,7 +717,103 @@ impl Shell {
             entered_first_dispatch: false,
             schedule: std::env::var_os("FN64_CONTROLLER_SCHEDULE")
                 .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
+            active_renderer,
         }
+    }
+
+    /// Select and register the rasterizer named by `FN64_RENDER`.
+    ///
+    /// REFERENCE IS THE DEFAULT and must stay so: it is what the owner plays,
+    /// and every committed route and recorded measurement on this lane was
+    /// taken against it.
+    ///
+    /// An unrecognized value is a hard error rather than a silent fallback.
+    /// That is the whole point of this function existing. Until now `shell.rs`
+    /// hardcoded `ReferenceBackend` and contained zero occurrences of
+    /// `FN64_RENDER`, so `FN64_RENDER=rt64` on the window was a SILENT no-op --
+    /// it did not error, did not warn, and rendered with the software backend
+    /// regardless. Anyone who set it, saw the game run, and concluded "RT64
+    /// works windowed" was reasonably but wrongly served, and that trap cost
+    /// real confusion (`docs/plans/perf-method.md`, the caveat section). A
+    /// backend selector whose off lane is silently the on lane is worse than no
+    /// selector.
+    fn register_render_backend() -> ActiveRenderer {
+        use fn64_render::RenderBackend as _;
+        let requested = fn64_boot_harness::parse_release_env_value(
+            "FN64_RENDER",
+            std::env::var_os("FN64_RENDER"),
+        )
+        .unwrap_or_else(|error| panic!("wm2000-shell: {error}"))
+        .unwrap_or_else(|| "reference".to_string())
+        .to_ascii_lowercase();
+
+        let (backend, active): (Box<dyn fn64_render::RenderBackend>, ActiveRenderer) =
+            match requested.as_str() {
+                "reference" => {
+                    let mut backend = fn64_render_reference::ReferenceBackend::new()
+                        .with_f3dex2()
+                        .with_clear_color([0, 0, 0, 255]);
+                    backend
+                        .create(&fn64_render::RenderConfig::ntsc(
+                            FB_WIDTH as u32,
+                            FB_HEIGHT as u32,
+                        ))
+                        .expect("ReferenceBackend create must be infallible for 320x240");
+                    (Box::new(backend), ActiveRenderer::Reference)
+                }
+                "rt64" => {
+                    // RT64 needs a GPU, a Metal system-default device, and a
+                    // real NSWindow, plus initialization on the macOS MAIN
+                    // THREAD. This shell satisfies that: it contains no
+                    // `std::thread::spawn` at all, and `Shell::new` runs from
+                    // `main` before `event_loop.run_app`, so registration and
+                    // every later present happen on the main thread.
+                    //
+                    // Failure here is loud on purpose. A fallback to reference
+                    // would report software-rasterizer behavior and timing
+                    // under an RT64 label, which is the one outcome this
+                    // selector must not be able to produce.
+                    let mut backend = fn64_render_rt64::Rt64Backend::new();
+                    backend
+                        .create(&fn64_render::RenderConfig::ntsc(
+                            FB_WIDTH as u32,
+                            FB_HEIGHT as u32,
+                        ))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "wm2000-shell: FN64_RENDER=rt64 requires a working native RT64 \
+                                 adapter (build with --features rt64 and FN64_RT64_DIR set, and \
+                                 run with a GPU/display available); create failed: {error}"
+                            )
+                        });
+                    // Without this the post-VI render target is never retained
+                    // and `capture_render_release_frame` has nothing to return,
+                    // so the window would open and draw nothing.
+                    backend.enable_present_capture().unwrap_or_else(|error| {
+                        panic!(
+                            "wm2000-shell: FN64_RENDER=rt64 needs post-VI present capture to get \
+                             pixels back into the window; enable failed: {error}"
+                        )
+                    });
+                    (Box::new(backend), ActiveRenderer::Rt64)
+                }
+                value => panic!(
+                    "wm2000-shell: FN64_RENDER must be reference or rt64, got {value:?}. \
+                     (Unset it for the default reference backend.)"
+                ),
+            };
+
+        fn64_abi::set_render_backend_with_policy(
+            backend,
+            fn64_recomp_rs::RDRAM_LEN,
+            fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
+        );
+        let label = match active {
+            ActiveRenderer::Reference => "reference",
+            ActiveRenderer::Rt64 => "rt64",
+        };
+        println!("[wm2000-shell] registered {label} renderer ({FB_WIDTH}x{FB_HEIGHT})");
+        active
     }
 
     /// Run the guest until it produces one VI field, then return.
@@ -859,7 +965,144 @@ impl Shell {
     /// `fn64_abi::with_registered_physical_rdram_read`, which is safe here
     /// precisely because presentation happens between pumps -- no guest
     /// coroutine or device operation is mid-flight.
+    ///
+    /// Two present paths, chosen by `active_renderer`, because the two backends
+    /// put their output in different places. See [`Self::present_rt64`].
     fn present(&mut self) {
+        match self.active_renderer {
+            ActiveRenderer::Reference => self.present_reference(),
+            ActiveRenderer::Rt64 => self.present_rt64(),
+        }
+    }
+
+    /// Present RT64's post-VI image.
+    ///
+    /// RT64 rasterizes into its own GPU render targets and does NOT write the
+    /// finished image back to `rdram[output_addr..]`, so the RGBA5551 decode in
+    /// [`Self::present_reference`] would read a stale -- in practice black --
+    /// buffer on every frame. That is blocker C in
+    /// `docs/plans/rt64-on-the-block-lane.md`, and it is real for the window in
+    /// a way it is not for the headless lane.
+    ///
+    /// The pixels come back through `fn64_abi::capture_render_release_frame`,
+    /// NOT through `Rt64Backend::presented_pixels`. That distinction is
+    /// load-bearing and easy to get wrong: `set_render_backend_with_policy`
+    /// MOVES the backend into `fn64-abi`, `with_render_backend` is
+    /// `pub(crate)`, and `RenderBackend` carries no `Any`/downcast -- so the
+    /// concrete `Rt64Backend` is simply not reachable from here after
+    /// registration. The ABI seam is the sanctioned route and says so in as
+    /// many words ("a host neither downcasts the backend nor reaches into RT64
+    /// after registration", `lifecycle.rs:602-606`); `examples/wm2000-boot`
+    /// already presents RT64 frames through it. It also normalizes RT64's
+    /// native format to BGRA8 for us.
+    ///
+    /// Geometry comes from the capture, never from `vi_width()`. RT64 renders
+    /// at its own internal resolution, which is generally NOT the guest's
+    /// 320x240 VI framebuffer, and it returns a row stride (`row_bytes`) that
+    /// may exceed the visible width. Reusing the reference path's `fb_width`
+    /// and `stride` assumptions here would tear or panic.
+    fn present_rt64(&mut self) {
+        let capture = match fn64_abi::capture_render_release_frame() {
+            Ok(capture) => capture,
+            // Before the guest's first completed VI present there is simply no
+            // image yet. That is an ordinary early-boot state, not an error:
+            // stay silent and let the next frame try again.
+            Err(fn64_render::RenderError::NotReady(_)) => return,
+            Err(error) => {
+                eprintln!("[wm2000-shell] RT64 present capture failed: {error}");
+                return;
+            }
+        };
+        assert_eq!(
+            capture.format,
+            fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+            "wm2000-shell: RT64 returned an unsupported post-VI pixel format"
+        );
+
+        let width = usize::try_from(capture.width).expect("RT64 capture width exceeds usize");
+        let height = usize::try_from(capture.height).expect("RT64 capture height exceeds usize");
+        let row_bytes =
+            usize::try_from(capture.row_bytes).expect("RT64 capture row stride exceeds usize");
+        let visible_row_bytes = width
+            .checked_mul(4)
+            .expect("RT64 capture visible row size overflow");
+        assert!(
+            row_bytes >= visible_row_bytes,
+            "wm2000-shell: RT64 capture row stride {row_bytes} is smaller than {width} BGRA8 pixels"
+        );
+        assert_eq!(
+            capture.bytes.len(),
+            row_bytes
+                .checked_mul(height)
+                .expect("RT64 capture byte length overflow"),
+            "wm2000-shell: RT64 capture byte length does not match its declared geometry"
+        );
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        // Resize the surface to RT64's OWN resolution the first time it is seen
+        // or whenever it changes. The reference path sizes from `vi_width()`;
+        // that value describes the guest framebuffer and has no authority over
+        // RT64's internal target.
+        if width != self.fb_width || height != self.fb_height {
+            let Some(pixels) = self.pixels.as_mut() else {
+                return;
+            };
+            if pixels
+                .resize_buffer(capture.width, capture.height)
+                .is_err()
+            {
+                return;
+            }
+            self.fb_width = width;
+            self.fb_height = height;
+            self.rgba = vec![0u8; width * height * 4];
+            println!(
+                "[wm2000-shell] resized present surface to {width}x{height} (RT64 internal \
+                 render resolution, not the guest's VI framebuffer)"
+            );
+        }
+
+        // BGRA -> RGBA, dropping any stride padding past the visible width.
+        let mut uniform_probe: Option<[u8; 4]> = None;
+        let mut blank = true;
+        for (row, source) in capture.bytes.chunks_exact(row_bytes).enumerate() {
+            let destination = &mut self.rgba[row * width * 4..(row + 1) * width * 4];
+            for (out, bgra) in destination
+                .chunks_exact_mut(4)
+                .zip(source[..visible_row_bytes].chunks_exact(4))
+            {
+                // N64's alpha is coverage, not window transparency -- force it
+                // opaque exactly as the reference path does.
+                let rgba = [bgra[2], bgra[1], bgra[0], 255];
+                match uniform_probe {
+                    None => uniform_probe = Some(rgba),
+                    Some(first) if first != rgba => blank = false,
+                    Some(_) => {}
+                }
+                out.copy_from_slice(&rgba);
+            }
+        }
+
+        let Some(pixels) = self.pixels.as_mut() else {
+            return;
+        };
+        pixels.frame_mut().copy_from_slice(&self.rgba);
+        if let Err(e) = pixels.render() {
+            eprintln!("[wm2000-shell] pixels.render() failed: {e}");
+            return;
+        }
+        self.presented_frames += 1;
+        let source = format!(
+            "rt64_post_vi={width}x{height} present={} workload={}",
+            capture.present_id, capture.workload_id
+        );
+        let detail = format!("row_bytes={row_bytes} backend={}", capture.backend_identity);
+        self.report_presented_frame(blank, &source, &detail);
+    }
+
+    fn present_reference(&mut self) {
         // Read VI_ORIGIN, not `osViSwapBuffer` bookkeeping.
         //
         // WM2000 never calls `osViSwapBuffer`; it double-buffers by writing
@@ -893,6 +1136,7 @@ impl Shell {
                     .is_ok()
                 {
                     self.fb_width = target_width;
+                    self.fb_height = FB_HEIGHT;
                     self.rgba = vec![0u8; target_width * FB_HEIGHT * 4];
                     println!(
                         "[wm2000-shell] resized present surface to {target_width}x{FB_HEIGHT} \
@@ -978,22 +1222,36 @@ impl Shell {
         }
 
         self.presented_frames += 1;
+        let origin = format!("origin={fb_offset:#010x}");
+        let first_frame_detail = format!("vi_width={src_stride}");
+        self.report_presented_frame(blank, &origin, &first_frame_detail);
+    }
+
+    /// Emit the first-frame line and the 60-frame heartbeat.
+    ///
+    /// Shared by both present paths ON PURPOSE. `pump_ms` and the late-frame
+    /// fraction reported here are how the two backends get compared, so they
+    /// must be the same statistic computed the same way -- a heartbeat that
+    /// differed per backend would make the comparison a measurement of the
+    /// logging. `source` names where the pixels came from, which is the only
+    /// part that legitimately differs.
+    fn report_presented_frame(&mut self, blank: bool, source: &str, first_frame_detail: &str) {
         let frames = self.presented_frames;
         let swaps = fn64_abi::vi_swap_count();
         let rgba_hash = framebuffer::rgba_hash(&self.rgba);
         if !self.reported_first_frame {
             if blank {
                 println!(
-                    "[wm2000-shell] presenting VI framebuffer origin={fb_offset:#010x} \
+                    "[wm2000-shell] presenting {source} \
                      (osViSwapBuffer calls so far: {swaps}) -- currently BLANK/uniform (the game \
                      has not rendered visible geometry yet). Window + present path are live."
                 );
             } else {
                 println!(
-                    "[wm2000-shell] presenting VI framebuffer origin={fb_offset:#010x} \
+                    "[wm2000-shell] presenting {source} \
                      (osViSwapBuffer calls so far: {swaps}) -- non-uniform, \
                      rgba_hash={rgba_hash:016x} (a comparison key, not a correctness claim); \
-                     vi_width={src_stride}"
+                     {first_frame_detail}"
                 );
             }
             self.reported_first_frame = true;
@@ -1023,7 +1281,7 @@ impl Shell {
                 )
             };
             println!(
-                "[wm2000-shell] heartbeat: presented frame #{frames} origin={fb_offset:#010x} \
+                "[wm2000-shell] heartbeat: presented frame #{frames} {source} \
                  ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
                  osViSwapBuffer calls={swaps}; frame_interval_ms[{}] pump_ms[{}]; \
                  audio{}: ai_buffers={} samples={} nonzero={} backend_buffers={}",
@@ -1120,7 +1378,7 @@ impl ApplicationHandler for Shell {
         };
         let win_size = window.inner_size();
         let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
-        match Pixels::new(self.fb_width as u32, FB_HEIGHT as u32, surface) {
+        match Pixels::new(self.fb_width as u32, self.fb_height as u32, surface) {
             Ok(px) => {
                 self.pixels = Some(px);
                 self.window = Some(window);
