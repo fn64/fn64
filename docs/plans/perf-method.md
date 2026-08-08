@@ -648,11 +648,48 @@ Measured 2026-08-08 on the RT64 gameplay route (`a9e1b25e`), barrier on vs off:
 to be removed; it saves ~12.4 ms/field by replacing a scanning journal with
 MMU-reported dirty pages.
 
-This **reverses a recorded dead end for this route.**
+~~This **reverses a recorded dead end for this route.**
 `FN64_FAST_MUTATION_JOURNAL=1` is filed above as measuring **zero** — true on
-the old menu route, and **strongly negative here** (22.65 -> 35.32 ms/field).
-A dead end is scoped to the route that produced it; re-measure before reusing
-one.
+the old menu route, and **strongly negative here** (22.65 -> 35.32 ms/field).~~
+
+**RETRACTED — this sentence was mine and it is wrong.** The table above is a
+**barrier** A/B (`FN64_MPROTECT_BARRIER` on vs off). **The flag is not varied
+anywhere in that experiment.** I took the barrier-OFF number, 35.32, and
+asserted it as the *flag's* cost. One measurement doing duty in two different
+experiments.
+
+Measured properly — flag on vs off, **barrier ON in both lanes**, 2.1M steps,
+route `a9e1b25e`:
+
+| | lane A (flag off) | lane B (flag on) | delta |
+|---|---:|---:|---|
+| render field mean | 36.08 | 35.59 | **−0.49 ms (−1.36%)** |
+| off-field mean | 8.92 | 8.95 | +0.03 |
+| overall mean | 22.50 | 22.26 | −0.24 |
+
+Guest byte-identical on all seven counters, so the flag does not change the
+emulated program. **Read this as indistinguishable from zero pending
+replication** — −1.36% sits far inside the documented ±6% band and it is one
+pair.
+
+**So the two historical "measures zero" entries were RIGHT, and for a reason
+this file already half-states**: with the barrier on, `matches_view` compares
+only MMU-reported dirty pages, and the ungated mirror reconcile runs the same
+comparison on every step **and arms on its match path**
+(`write_barrier.rs:1246-1250`: *"The reconcile arms immediately on its match
+path, so the common case reads once"*). By the time the gated call runs, the
+dirty set is empty and the second comparison is already nearly free. **The
+barrier absorbed the cost.** No reachability bug is needed to explain it.
+
+That has a further consequence for the `+1.15%, nothing` entry above, which
+attributes its null result to the `None`-passed-where-a-view-was-in-hand bug
+that `abc7871` fixed: this measurement is **post-`abc7871`** and still reads
+~1%. So the reachability bug was **not the whole explanation** — barrier
+absorption is the more likely one, and it survives the fix.
+
+A dead end is still scoped to the route that produced it. But **check first
+whether the experiment varied the thing the entry names** — that is the error
+here, and it is worse than a scoping mistake.
 
 **The 17.8% sys-time GPU attribution is RETRACTED.** `/usr/bin/time -l` on the
 barrier-off control: 422.99 real / 398.97 user / **36.02 sys = 8.5%**, with
