@@ -1829,6 +1829,14 @@ fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> R {
 ///
 /// Returns `None` instead of panicking when `HOST` is already borrowed. Only
 /// callers that have a correct answer for "cannot tell" may use this.
+///
+/// Gated on `recomp-rs` because its only caller —
+/// `recompiled::snapshots::guest_write_boundary` — is reachable only under
+/// that feature, so a default-feature build compiles it with no user and
+/// warns. This is NOT dead code: the comment at that call site records the
+/// nested-`borrow_mut` abort it exists to prevent as "REACHED, not
+/// theoretical".
+#[cfg(feature = "recomp-rs")]
 fn try_with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> Option<R> {
     HOST.with(|h| h.try_borrow_mut().ok().map(|mut host| f(&mut host)))
 }

@@ -198,7 +198,11 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
     true
 }
 
-/// Commit due device work before any executor resume is possible.
+// Commit due device work before any executor resume is possible.
+//
+// Plain comment, not `///`: rustdoc does not generate documentation for macro
+// invocations, so a doc comment here is silently dropped and warns. The
+// per-case doc comment inside the macro body does attach to the static.
 thread_local! {
     /// [clock_lags+due, clock_lags+nothing_due, current+due, current+nothing_due]
     pub(crate) static DEVICE_ADVANCE_CENSUS: std::cell::RefCell<[u64; 4]> =
