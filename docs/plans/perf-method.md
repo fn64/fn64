@@ -817,6 +817,50 @@ caveats travel with these numbers — the shell has **no warmup gate**, so the
 carries the `fn64-audio` `codegen-units=256` defect, making them a
 **pessimistic floor**.
 
+## THE DISTRIBUTION IS BIMODAL — and this changes what to work on
+
+The single most important structural fact about the remaining gap, and it was
+hiding in plain sight in every census line:
+
+| | A-rep1 | A-rep2 |
+|---|---:|---:|
+| **p50** | **16.41** | ~16.4 |
+| mean | 22.85 | 22.88 |
+| p95 | 39.03 | ~39 |
+| p99 | 39.75 | ~39.7 |
+| over 16.667 | 5,659 / 11,321 (50.0%) | 5,660 (50.0%) |
+
+**The median field ALREADY FITS the 16.667 ms budget.** p95 is 2.34x it. So
+roughly half the fields are comfortably inside and the other half miss badly.
+This is not a program that is uniformly 1.35x too slow; it is a program with
+**two populations of field**.
+
+**Consequence: shaving the mean cannot reach `holds_60fps`.** The
+`codegen-units=1` A/B improved the mean 1.6% and moved the over-budget count by
+**exactly one field** — 5,659 to 5,660. A uniform few-percent win redistributes
+nothing across the line, because almost no field sits near the line.
+
+Every candidate currently queued is a mean-shaver: the double-decode, the
+clean-boundary count, the DPC staging copy. They are all worth their cost on
+efficiency grounds and **none of them is a path to the bar**.
+
+**The question that matters is now: what makes the slow half slow?** Not "what
+is expensive on average". Concretely, before dispatching another mean-shaver,
+somebody should:
+
+1. **Split the census by population.** Emit the per-field cost distribution
+   bucketed by whether the field crossed 16.667 ms, and diff the phase counters
+   between the two buckets. If slow fields carry more graphics submits, that is
+   a scene-complexity story; if they carry the same work but more journal
+   boundaries or faults, it is an apparatus story.
+2. **Check for periodicity.** ~50/50 with a tight p50 and a tight p95 smells
+   like alternation or a repeating cycle (every Nth field doing extra work),
+   not random spread. `gfx_submits` per field is 1.44 on average — if the slow
+   half carries ~2 and the fast half ~1, the cause is submit batching.
+
+Until that split exists, the 5.84 ms figure is misleading: it is the mean's
+distance from the bar, and the mean is not what fails.
+
 ## THE STANDING BAR: 16.667 ms/field, hardware parity
 
 The goal is **at least as good as original hardware, with the game playable**.
