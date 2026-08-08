@@ -934,6 +934,35 @@ Worth noting `dispatch_captured_raw_rdp` appears in **both** tables: 3.17 ms of
 guard at its seam, and separately the untimed 8 MiB copy of candidate 0 below.
 Do not double-count them, and re-profile before treating either as available.
 
+## Candidate: 682 journal boundaries per field, 75% of them clean — UNSIZED
+
+7,716,048 boundaries over 11,321 fields is **682 per field**, and the census
+reports **75% find nothing dirty** — ~5.8M no-op boundaries. Alongside
+5,033,090 `mprotect` calls and 5,033,090 faults (445/field each). That is the
+"cheap thing done enormously often" shape that produced the 1.95x win, so it
+looks like an obvious target.
+
+**It is not obviously waste, and the framing above is a trap I nearly set for
+myself.** Two reasons to size it before dispatching:
+
+1. **The barrier already pays for itself.** Turning it off costs 12.4 ms/field
+   (22.96 -> 35.32). A clean boundary is the barrier correctly reporting "no
+   guest writes here" — that answer is the product, not overhead.
+2. **The 75% figure is telemetry, not a code path.** `CLEAN_BOUNDARIES` is
+   incremented inside `write_barrier.rs:1360`'s `note()`, which returns
+   immediately unless `enabled()`. It counts how often the barrier finds
+   nothing; it does not measure what finding nothing *costs*.
+
+**What would size it:** the per-boundary cost on the clean path specifically —
+time the `take_dirty` -> empty-span sequence, not the whole boundary. If a clean
+boundary is already a handful of instructions, 682/field is cheap and this
+closes. If it re-arms protection or walks a page list before discovering the
+list is empty, 5.8M of those is worth attacking.
+
+Until that exists this is an **unsized candidate**, filed here so nobody
+dispatches on the raw count. Rule 12 in a new costume: 5.8M is a large number
+attached to an unmeasured cost.
+
 ## Ranked candidates, with what would falsify each
 
 0. **The 8 MiB RDRAM copy per DPC submission — UNMEASURED, and do not dispatch
