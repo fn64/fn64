@@ -890,6 +890,31 @@ into the population that needs it; a **per-field** saving pays half of it away.
 The guard's 3.8x concentration on render fields makes it a per-submit cost, not
 the uniform overhead it was filed as.
 
+### Candidates re-sized against the render field (19.17 ms)
+
+| candidate | on the render field | % of 19.17 |
+|---|---:|---:|
+| gfx LLE — RSP microcode interpretation | **6.08 ms** | **31.7%** |
+| gfx LLE — raw RDP seam | **5.82 ms** | **30.4%** |
+| — of which the 8 MiB DPC staging copy | 1.71 ms | 8.9% |
+| guard at the render seams (3.8x concentrated) | unsized | ? |
+| `run_imem` double-decode (mean-shaver) | 0.65 ms | 3.4% |
+
+**Those top two lines together are 11.90 ms — 62% of the entire requirement.**
+Everything else on the list is a rounding error beside them.
+
+Two sizing traps, one of which I fell into while building this table:
+
+- **Do not double-scale.** `gfx_lle_rsp_ns` and `gfx_lle_rdp_ns` from the
+  population split are *already per-render-field*. Multiplying them by
+  `total/slow` again yields 12.16 and 11.64, which exceed the render field's own
+  budget — an impossible result that catches the error. Only figures quoted as
+  **per-field averages over all fields** need the 2x conversion.
+- **Share and magnitude move in opposite directions.** The DPC copy *doubles*
+  to 1.71 ms when correctly attributed to render fields only, yet its *share*
+  falls from 15.1% to 8.9% because the real gap is 3.4x larger. Both numbers are
+  right; quoting one as the other over- or under-sells the candidate.
+
 ### What this changes
 
 **The goal is not 5.84 ms off the mean. It is 2.15x on the rendering field.**
