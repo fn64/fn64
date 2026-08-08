@@ -1431,13 +1431,28 @@ other. The generalization is the point: a query that cannot distinguish
   indistinguishable from *the question was never asked*. Caught only because
   the count was suspiciously clean.
 
-**The check that worked in the same session was size-based**, and it worked
-because it could not silently degrade: verify-on 95,304,208 bytes vs verify-off
-90,878,784 — a 4.4 MB difference, independent of any glob, pattern or process
-name. Prefer a check whose failure mode is a *wrong number* over one whose
-failure mode is *zero*. Rule 6a's ten-second test applies directly: run the
-query against the state it is supposed to reject, and confirm the answer
-changes.
+**The fix for both is rule 6a's ten-second test**: run the query against the
+state it is supposed to reject and confirm the answer *changes*. A grep that
+returns zero against a tree where the symbol certainly exists is broken, and
+that takes one command to establish.
+
+**What is NOT the fix: substituting a byte-size delta.** An earlier revision of
+this entry credited the same session's size check — verify-on 95,304,208 vs
+verify-off 90,878,784, a 4.4 MB difference — as the one that worked, on the
+reasoning that its failure mode is a wrong number rather than a zero. **That
+was wrong and the credit is withdrawn. The size check did not work; it nearly
+fabricated the A/B.** Only 32 of 142 runners had regenerated, the detector was
+still present in the emitted source of the "off" lane, and trusting the delta
+would have measured verify-on against verify-on. See rule 19: **a size
+difference proves something changed, never which thing.**
+
+Two things worth keeping from how that error was made. It bit the **reviewer**,
+who proposed the weaker check to an agent already doing the stronger one and
+described it as stronger. And the revision that credited it was written by an
+agent that had *already read* rule 19's entry two paragraphs above, noticed the
+tension, and reconciled it with an invented "narrower rule" instead of asking
+whether the premise was true. **A contradiction with an adjacent committed entry
+is evidence you are wrong, not an invitation to harmonize.**
 
 ### 17. Do not budget instrumentation cost by counting clock reads
 An agent predicted its five new timers would cost **0.029 ms/field** — 33.8 ns
