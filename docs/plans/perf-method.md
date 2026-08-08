@@ -1492,6 +1492,318 @@ the real tree before trusting it to gate a measurement — and prefer a
 construction whose failure mode is a crash over one whose failure mode is an
 empty result set, because empty reads as "clean" (rules 18 and 19).
 
+### 28. Check WHICH POPULATION a candidate pays into before sizing it
+
+Earned 2026-08-08. The strongest-looking optimization target of the session was
+**57% of a fast field and 16% of a slow one**, and every measurement against it
+returned a null — because the fields it improved were the ones already inside
+budget.
+
+The census report states the rule in its own output, and it is worth quoting
+verbatim because it is the whole lesson in one sentence:
+
+> *"A saving in a row that is large on the fast row and small on the slow one
+> pays into the population that already has headroom."*
+
+On a bimodal workload — WM2000 is `SfSfSfSf`, ~50% of fields over budget — **a
+share computed over both populations tells you almost nothing about whether a
+candidate can move the bar.** The mirror boundary is the worked example:
+
+| | fast field | slow field |
+|---|---:|---:|
+| mirror | 4.16 ms (**57.0%**) | 9.13 ms (**16.2%**) |
+
+Read the blended number and it is the biggest line in the program. Read the
+slow row — the only population that fails 16.667 ms — and it is a sixth of a
+field that is 2.8x over. **Deleting it entirely could not have moved the bar,
+and the A/B confirmed exactly that.**
+
+**So: before sizing any candidate, split it by population and read the SLOW
+row.** A candidate that is large only on the fast row is not a 60fps candidate
+at all, however large its blended share. This compounds with rule 2 — an
+inclusive counter read as a peer, *and* a blended share read as a slow-field
+share, will both point at the same wrong target.
+
+### 27. The benchmark harness DISCARDS any report tag it does not know
+
+Earned 2026-08-08 by losing a completed full-route census run to it. **This
+will eat the next instrument too**, so it is filed separately from the
+contamination incident it was discovered during.
+
+`render-benchmark.zsh` pipes the binary through
+
+```
+grep -E '^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done'
+```
+
+**Any `atexit` reporter outside that allowlist is invisible in the saved log** —
+the new `[mirror-reconcile]` census and the *pre-existing*
+`[mprotect-barrier]` stats both vanish. The unfiltered copy goes to
+`/tmp/fn64-render-benchmark.log`, a **fixed path that every run overwrites**,
+so by the time the omission is noticed the next run has already destroyed the
+evidence. A full-route census was run, completed, and lost exactly this way;
+the figure that ended up in this document came from a 20k-step re-probe
+instead.
+
+**The instrument looked broken when it was working perfectly.** That is the
+expensive part: the first hypothesis was a dead counter, and diagnosing *that*
+is what caused the contamination in rule 26.
+
+**The remedy, and it is the rule:** when adding a counter that reports at exit,
+**save the unfiltered stream to a per-run path** (`"$BINARY" 2>&1 | tee
+"$OUT/run-N.full.log" | grep ...`). Do not extend the allowlist and assume that
+suffices — the next counter after yours will hit the same wall — and never rely
+on the shared `/tmp` tee surviving into the next run.
+
+This is rule 18's family once more: a pipeline that cannot distinguish *"the
+counter printed nothing"* from *"the counter's output was filtered away"*
+reports both as absent, and absent reads as "the feature is broken".
+
+**The sharpening, from a second incident the same hour: the filter also hides
+the diagnostics that would tell you data is missing.** An `FN64_EXECUTOR_SPLIT`
+pair was run without `FN64_FRAME_CENSUS_POPULATIONS`, which the split report
+actually depends on (`frame_census.rs:1320` calls it from the *population*
+report). The census code handles this correctly and prints
+
+> `[executor-split] NOT ARMED (FN64_EXECUTOR_SPLIT unset). The executor_ns
+> decomposition is absent, not zero -- do not read this as 'the phases cost
+> nothing'.`
+
+— textbook rule-18 discipline, distinguishing absent from zero. **That warning
+was never seen, because it rides on `[frame-populations]`, which the filter
+also drops.** Two 25-minute runs completed with no split data and no
+explanation of why.
+
+So an allowlist filter does not merely lose results; it **defeats the
+safeguards built to report their absence**. A well-instrumented program behind
+a lossy pipe is indistinguishable from a broken one. Capture the full stream
+first, filter for reading second — never the reverse.
+
+**A safeguard on a filtered channel is not a safeguard.** That is the part
+that generalizes past this harness, and it is a design rule, not a workflow
+tip:
+
+> **A warning must travel on a channel that cannot be configured off
+> independently of the data it is warning about.**
+
+Here the warning rode `[frame-populations]` while warning about
+`[executor-split]`, so one filter decision silenced both the data and the
+notice that the data was missing. The same shape appears whenever a diagnostic
+is emitted at a lower log level than the thing it guards, on a debug-only
+channel, or behind a second feature flag: the configuration that suppresses the
+signal suppresses the alarm with it. **Route alarms to stderr, to an always-on
+channel, or to a non-zero exit — anywhere the reader cannot accidentally
+deselect them while selecting for results.**
+
+**Related gate trap, and it is a design smell rather than only a user error.**
+Producing the `executor_ns` decomposition requires **three** environment
+variables:
+
+```
+FN64_PHASE_TIMING=1  FN64_EXECUTOR_SPLIT=1  FN64_FRAME_CENSUS_POPULATIONS=1
+```
+
+The third is **neither named by nor implied by** the other two — it is required
+only because `executor_split_report` happens to be called from inside
+`population_report` (`frame_census.rs:1320`). Nothing about "arm the executor
+split" suggests "also arm the population census", and arming two of three
+yields a full, healthy-looking run with the decomposition silently absent.
+
+**Arm all three, or the run is wasted.** A reasonable future cleanup is to have
+`FN64_EXECUTOR_SPLIT=1` imply the population report, since the split is
+useless without it — a gate whose stated purpose cannot be achieved by setting
+it alone is a gate with a missing dependency, not a user error.
+
+### 26. A diagnostic probe is a benchmark: cheap-feeling commands slip past the gate
+
+An operational failure from 2026-08-08, and a genuine gap in the rules as
+written. **Rule 4 says "quiet machine" and rule 9 says "no rebuild beside a
+benchmark" — neither says a diagnostic probe is a benchmark.**
+
+**A 20-second probe contends exactly like a 25-minute one.** An agent that had
+just *deferred a `cargo` build* to avoid disturbing a running measurement then
+launched a 20,000-step probe of the same binary **while the next measured run
+was in its steady window** — and had to discard that run. The rule it had
+internalized was "don't build during a measurement"; the rule that applies is
+**"don't run anything during a measurement."** A probe feels like a lookup
+rather than a workload, and that feeling is the whole failure: cheap-looking
+commands slip past a gate that expensive-looking ones respect.
+
+Before running *any* command while a benchmark is live, ask what it costs the
+scheduler, not what it costs you to type. If a diagnosis genuinely cannot wait,
+kill the measurement first and restart it — a discarded run you chose is
+cheaper than a contaminated one you have to detect later.
+
+**What made this one land: the probe was diagnosing a different trap.** The
+counter it was chasing had not failed — its output had been filtered away by
+the harness (rule 27). So a false "broken instrument" signal produced an
+urgent-feeling diagnostic, and the urgency is what walked it past the gate.
+
+**Traps compound: the second mistake is made while fixing the first.**
+Demonstrated twice in one session, both times by an agent actively holding the
+relevant rule in mind — once contaminating a run while diagnosing a filtered
+counter, once wasting two 25-minute runs on a missing third gate while fixing
+the filter. Believing you are being careful is not a control; it is the state
+you are in immediately before both of these.
+
+**That is the argument for a checklist over vigilance.** Vigilance is a
+resource that debugging consumes, and it is lowest exactly when the next
+irreversible action is taken. Before starting a measured run, verify
+mechanically: machine quiet, **every** required gate armed, output captured
+unfiltered, and nothing of your own about to run. Four checks, thirty seconds,
+and they do not degrade under pressure the way attention does.
+
+### 25. A mechanism that predicts the sign of a noise draw is not evidence
+
+Earned 2026-08-08, by an agent who made this error **in the same session in
+which it quoted the rule against it**, and caught it one rep later.
+
+Rep 1 of an A/B showed +0.51 ms/field. A mechanism was found in the source that
+explained it: gating a comparison stopped something from draining the write
+barrier's dirty set, so `arm()`'s `dirty_len == 0` fast path failed and every
+boundary bought a real `mprotect`. The prediction from the code was ~0.33
+ms/field against +0.51 observed — **same order, derived from source, not fitted
+to the number.** It was reported as a mechanism-backed regression.
+
+**Rep 2 came back −0.22. The true result was +0.145 ± 0.365, both signs, a
+null.** The mechanism explained a coin flip.
+
+**The mechanism made the error worse, not better.** This is the part worth
+internalizing. An unexplained one-rep delta feels like an unfinished
+measurement, and unfinished measurements get a second rep. A one-rep delta with
+a coherent, source-derived, quantitatively-close story attached feels like a
+*finding* — and findings get written up. **Feeling explained is precisely what
+stops you running rep 2.**
+
+Note what was *not* wrong with the mechanism: it is real in the source,
+`dirty_spans()` genuinely is consuming, and the fast path genuinely does depend
+on something draining the set. **A correct mechanism can still be attached to a
+noise sample.** Its correctness says nothing about whether it accounts for the
+delta in front of you.
+
+**The rule, stronger than "two reps minimum" because it names what defeats
+that rule:** when a single rep produces a delta *and* you can explain it, treat
+the explanation as a reason to be **more** suspicious, not less. Run the second
+rep before writing the story down. If the effect is real the mechanism will
+still be there in twenty minutes; if it is not, the story would have cost a
+retraction — and, in this instance, a false finding relayed onward to the
+project owner before it could be withdrawn.
+
+**Corollary for reporting:** state the rep count and the sign pattern in the
+same breath as the delta, always. "+0.51 ms" and "+0.51 ms, n=1" are different
+claims, and only the second one is honest about what it is.
+
+### 24. Ask what CONSUMES a call's side effects, not just what it computes
+
+Earned 2026-08-08, by a fix that was **proven sound and bought nothing**. The
+soundness proof was correct; it simply did not license the conclusion drawn
+from it.
+
+**Read the measurement note at the end of this rule before citing it.** The
+coupling below is a *source* fact and it is real. The regression that was first
+reported as its evidence **did not survive a second rep** and has been
+withdrawn.
+
+The scheduler-mirror reconcile looked redundant with the dispatch-loop
+reconcile: same region, same baseline, same per-step rate. It was gated behind
+`FN64_FAST_MUTATION_JOURNAL`, with a source proof that the thing being skipped
+(`reconcile_snapshot_before_dispatch`) is a **pure detector** that mutates
+nothing. The proof holds. The program **did not get faster** — the change
+measured **+0.145 ms/field, sd 0.365, signs spanning both directions**, i.e.
+nothing.
+
+**The comparison had a second consumer nobody had accounted for.**
+`matches_view` reaches `barrier_spans()` → `dirty_spans()`
+(`write_barrier.rs:1230`), which is documented **CONSUMING**: it calls
+`disarm_and_capture()` and *takes* the pending dirty set. That is precisely
+what leaves `dirty_len == 0`, which is the condition `arm()` (`:808`) tests to
+skip re-issuing `mprotect(PROT_READ)` over an already-protected span. Gate the
+comparison, nothing drains the set, the fast path fails, and **every mirror
+boundary buys a real ~1.2 µs syscall**: ~0.33 ms/field predicted from the code.
+
+**That prediction was never confirmed, and must not be quoted as though it
+were.** It matched rep 1's +0.51, which is how it came to be believed; rep 2
+returned −0.22 and the two-rep result is **+0.145 ± 0.365, both signs — a
+null**. So the measurement's actual verdict on this coupling is an **upper
+bound**: whatever the drained-set effect costs, it is smaller than this
+experiment can resolve, i.e. **under roughly 0.4 ms/field**. That bound is a
+real and falsifiable result. The regression is not. See rule 25.
+
+**The two questions that are not the same question:**
+
+| question | answer here | catches this bug? |
+|---|---|---|
+| Does this call write state the program later reads? | No — pure detector | **No** |
+| Does anything downstream depend on this call having RUN? | **Yes — the barrier's dirty-set drain** | **Yes** |
+
+A pure-detector proof answers the first. Only the second finds a side-effecting
+**producer** masquerading as a redundant check. **Two calls touching the same
+region are not necessarily doing the same job — one may be feeding the other.**
+
+**So: safe and worthless are compatible.** A soundness proof licenses a change;
+it never predicts a benefit. Keep such proofs — they are correct and reusable —
+but do not let one stand in for a measurement.
+
+The tell was in this document the whole time and was misread: *"the ungated
+scheduler-mirror reconcile arms the barrier one step ahead of the gated call,
+leaving it an empty dirty set to compare."* That sentence describes the mirror
+**doing work for the barrier**. It was read as evidence of redundancy; it is
+evidence of **coupling**.
+
+### 23. "Skippable?" is about whether a check WRITES, not what it looks like
+
+Earned 2026-08-08 gating the scheduler-mirror reconcile, and corroborated by a
+corruption investigation that reached the same boundary from the opposite
+direction years of context apart.
+
+Two functions in `live_program.rs` run what looks like the same check — compare
+the watched executable region against its baseline, complain if it changed.
+They are visually near-identical and differ in one call:
+
+| | does it write? | gateable? |
+|---|---|---|
+| `reconcile_snapshot_before_dispatch` | **No.** Takes `&mut self`, mutates nothing; three O(1) asserts and a panic. The snapshot is dropped. | **Yes** |
+| the host-ABI flush path (`:2810`) | **Yes.** Calls `adopt_snapshot`, which accepts current bytes as the new `expected`. | **Never** |
+
+Skipping the second one leaves the baseline stale, and a later dispatch
+re-detects a change that was already accepted. That is not hypothetical: it
+produced `unjournaled executable mutation changed physical RDRAM
+[0x0009b0b3, 0x0009b0b4)` at 3M steps, and the comment at
+`live_program.rs:2670-2685` was written by whoever debugged it — concluding, in
+its own words, that *"the reconcile check in `reconcile_before_dispatch` IS
+skippable, because it only compares and never advances anything. That one stays
+gated; this one does not."*
+
+**The rule:** before gating any verification, ask *does this code path change
+state that a later path depends on?* — not *does this look like a redundant
+check?* A pure detector panics or does nothing observable, so removing it
+removes a check. A detector that advances a baseline as a side effect is a
+state machine wearing a check's name, and removing it removes a transition.
+
+**Why this one is trustworthy.** A safety boundary discovered independently by
+a **failure** (someone holding a live corruption) and by an **audit** (someone
+hunting 8.43 ms), landing on the same side, is a real boundary rather than
+either party's convenience. That agreement is worth more than either finding
+alone, and more than the milliseconds that motivated the second one.
+
+**Corollary on method:** this question is *decidable by reading the function
+body* — it covers every route and takes minutes. Reach for a census when the
+question is "how often does this state occur, and at what cost", which source
+cannot answer. Soundness by reading, sizing by measurement; do not substitute
+one for the other.
+
+**What this rule does NOT license, learned the hard way the same day.** This
+rule establishes that gating a pure detector is *safe*. It says nothing about
+whether doing so is *profitable* — and in the case that produced it, gating the
+mirror's detector bought **nothing at all**: +0.145 ms/field, sd 0.365, signs
+spanning both directions over two interleaved reps. The change is sound,
+correct, and pointless, and it was reverted on those grounds.
+
+**Safe and worthless are compatible.** A soundness proof licenses a change; it
+never predicts a benefit. See rule 24 (what the comparison was also doing) and
+rule 25 (why one rep and a good story nearly made this a "regression" instead
+of a null).
+
 ### 21. The counter's UNIT is part of the counter, and a rate inherits its error
 
 Earned 2026-08-08 on the WM2000 choppy-audio investigation, which ran for hours
@@ -1623,6 +1935,29 @@ other. The generalization is the point: a query that cannot distinguish
   reads exactly like *the detector has been deleted* — the alarming answer,
   indistinguishable from *the question was never asked*. Caught only because
   the count was suspiciously clean.
+- **`clang` matched inside `installd`, and the contention detector cried
+  wolf.** A rule-18-compliant detector — sampling advancing CPU *time*, not
+  `pcpu` — reported CONTENTION mid-benchmark on two pids. They were
+  `system_installd` and `installd`, macOS package daemons that had matched an
+  unanchored `clang` pattern **as a substring of their own names**, burned
+  0.03 s between them, and exited. No compiler was running at any point.
+
+  This is the mirror image of the `pgrep -f` entry above: that one **matched
+  itself**, this one **matched something unrelated**. Same root cause — a
+  process query that cannot distinguish the thing it means from a string that
+  merely contains it.
+
+  **The remedy generalizes: match on the anchored BASENAME, never a substring
+  of the full command.** Strip the directory (`sub(/.*\//,"",n)`) and compare
+  for equality against an explicit set (`rustc`, `cargo`, `clang`, `clang++`,
+  `ld`, `lld`, `cc1`, `rustdoc`) rather than testing whether a pattern appears
+  anywhere in the line. A substring match over process names is never correct,
+  because process names are not a namespace anyone controls.
+
+  Note the failure was *safe but expensive*: a false CONTENTION costs a
+  discarded pair and a re-run, where a false ALL-CLEAR costs a fabricated
+  result. Bias detectors toward false positives, then anchor them so they stop
+  firing.
 
 **The fix for both is rule 6a's ten-second test**: run the query against the
 state it is supposed to reject and confirm the answer *changes*. A grep that
@@ -1877,7 +2212,7 @@ instrument's +4.6% perturbation (see below); shares are perturbation-robust.
 
 | phase | ms/field | share | kind |
 |---|---:|---:|---|
-| **mirror boundary** (`mirror_guest_running_thread`) | **8.43** | **23.8%** | apparatus |
+| ~~**mirror boundary**~~ (`mirror_guest_running_thread`) | ~~**8.43**~~ | ~~**23.8%**~~ | apparatus |
 | `gfx_ns` (nested in the resume) | 12.53 | 35.3% | graphics |
 | — `gfx_lle_rdp_ns` | 7.04 | 19.0% | |
 | — `gfx_lle_rsp_ns` | 5.98 | 16.1% | |
@@ -1887,6 +2222,20 @@ instrument's +4.6% perturbation (see below); shares are perturbation-robust.
 | guard @ suspend | 0.037 | 0.1% | apparatus |
 | guard @ device | 0.038 | 0.1% | apparatus |
 | `run_one_step` residual | 0.014 | 0.0% | |
+
+> **CORRECTED 2026-08-08 — the mirror row is struck because 23.8% is wrong for
+> the population that matters, and the error is instructive.** Re-measured with
+> all three gates armed on the full route: the mirror is **9.13 ms = 16.2% of a
+> 56.23 ms slow field**, and the *whole* apparatus is **16.4%**. The 23.8% here
+> was computed against a smaller field total and read as though it applied to
+> the render population.
+>
+> **The deeper error is the one to learn from: this row was sized over the
+> wrong population.** The mirror is **57.0% of a fast field** and **16.2% of a
+> slow one**. A share that large on the fast row is what made it look like the
+> biggest line in the program, and fast fields are the ones that already fit in
+> budget. See "THE RENDER FIELD IS 83% GUEST+RUNTIME" above; do not size a
+> candidate from this table without checking which population it pays into.
 
 **The mirror prediction was 14.41 ms; measured is 8.43 — the estimate was 1.7x
 high, and the falsifier it named is the reason.** The doc above guessed a
@@ -1910,8 +2259,17 @@ steps. Its 2.17x population ratio against a 4.01x call ratio says so directly.
    **translated guest code plus the runtime it calls synchronously** — RDRAM
    reads/writes through `RdramView`, `translate`/`backing_offset`, the
    per-instruction validation, and the dispatch loop's own
-   `reconcile_before_dispatch` at `runners.rs:1033`, which the explorer found
-   runs **once per loop iteration**, not once per step.
+   `reconcile_before_dispatch` at `runners.rs:1033`, which runs **once per
+   step**.
+
+   ~~which the explorer found runs **once per loop iteration**, not once per
+   step.~~ **CORRECTED 2026-08-08 in place, because the original phrasing sent
+   a later reader hunting for a loop-hoist win that does not exist.** One loop
+   iteration IS one step: `run_catalog_block_program`'s loop body ends in
+   `crate::suspend_active_coroutine(...)` (`runners.rs:1113`), which suspends
+   the coroutine, so the loop does not spin within a step — it resumes where it
+   suspended. "Per loop iteration" and "per step" are the same rate here. See
+   "SIZED BY READING, NOT TAKEN" below.
 
 **So "executor self" was two different things in one bucket:** a per-step
 apparatus boundary (the mirror, 8.43) and a per-step guest+runtime cost
@@ -1993,6 +2351,42 @@ filed: `continuous_snapshot_enabled()` gates *above* three O(1) assertions
 That is a correctness-of-gating fix worth making on its own terms, but it is
 O(1) work and cannot be a measurable share of 8.43 ms.
 
+### WHICH ROUTE: 35.24 ms/field, and why the 22.51 figure does not apply here
+
+Recorded because two figures from different routes were nearly combined into
+one subtraction, which is rule 11 in its most expensive form.
+
+**This fix is measured on `render-benchmark.zsh` at its default 1.5M steps**,
+which baselines at **35.24 ms/field (2.11x budget)** — matching the 35.84 /
+35.47 / 35.72 band every earlier mirror measurement used. That is the correct
+route for this change, because **it is the route the 8.43 ms mirror figure was
+measured on.**
+
+**The 22.51 ms figure in "THE STANDING BAR" is a different route and must not
+be subtracted from.** An arithmetic of `22.51 − 8.43 = 14.1` was proposed and
+is void: the 8.43 was never measured on the route that produces 22.51. Two
+numbers from two routes, one subtraction, an answer that means nothing — the
+same error shape as the retracted "1.01 ms guest code" figure above.
+
+**Always state the route beside a per-field figure.** The doc already says this
+(rule 11); this is the second time it has been needed in one week.
+
+**On the byte-identity tuple.** The gate values quoted in this session
+(`gfx_submits=16586`, `audio_submits=11005`, `sp_tasks=27591`,
+`vi_interrupts=12008`, `controller_ops=3115`, `sim_time=18776001537`) belong to
+a **~2.1M-step** route. At 1.5M steps this route ends at `gfx_submits=11153`,
+`audio_submits=7685`, `sp_tasks=18838`, `vi_interrupts=8386`,
+`controller_ops=2390`, `sim_time=13112786076`, `render_error=None`.
+
+**The gate was NOT redefined to match what the run produced.** That would make
+every future comparison meaningless — a gate rewritten to fit its own result is
+not a gate. Instead: the A/B's validity rests on lanes A and B being identical
+routes *to each other*, which they are, and guest identity is verified
+separately at the step count that produces the specified tuple. Determinism on
+this route is independently evidenced by the documented submit checkpoints
+(452 @200k, 1758 @400k, 3356 @600k) reproducing exactly, plus
+`render_error=None`.
+
 ### PRE-REGISTERED, before measuring: only ONE of the two reconciles is gated
 
 Written down before the A/B runs, so that a confirmation cannot become a
@@ -2043,6 +2437,190 @@ therefore requires, per population:
 - whether the gated site would have caught anything the mirror did not, on the
   render-field population specifically.
 
+### THE RENDER FIELD IS 83% GUEST+RUNTIME. The whole guard apparatus is 16.4%.
+
+Measured 2026-08-08 on the full 1.5M-step `render-benchmark.zsh` route, RT64
+headless, quiet machine, with all three required gates armed
+(`FN64_PHASE_TIMING=1 FN64_EXECUTOR_SPLIT=1 FN64_FRAME_CENSUS_POPULATIONS=1` —
+see rule 27). **This supersedes the apparatus framing in the split table
+below.**
+
+**The slow (render) field, the population that fails the bar:**
+
+| row | ms/field | % of executor_ns |
+|---|---:|---:|
+| `executor_ns` (278.9 calls, 201.7 µs/call) | **56.232** | 100% |
+| — resume (Executor step) | 55.966 | 99.5% |
+| — — *(of)* **mirror boundary** | **9.129** | **16.2%** |
+| — — *(of)* guard @ suspend | 0.039 | 0.1% |
+| — — *(of)* **resume NET** | **46.798** | **83.2%** |
+| — devtime (advance) | 0.251 | 0.4% |
+| — — *(of)* guard @ device | 0.046 | 0.1% |
+| — residual | 0.015 | 0.0% |
+| **APPARATUS** (mirror + both guards) | **9.214** | **16.4%** |
+| **GUEST+RUNTIME** (resume net) | **46.798** | **83.2%** |
+
+**Delete the entire named apparatus and the render field is still 46.8 ms —
+2.8x the 16.667 ms budget.** Every guard-side optimization available, taken
+together and taken to zero, does not approach the bar. That closes the guard as
+the primary target on this route.
+
+**The bimodality inverts the mirror's apparent importance**, and this is the
+part that explains every null measured against it:
+
+| | fast field | slow field |
+|---|---:|---:|
+| `executor_ns` | 7.30 ms | 56.23 ms |
+| mirror | 4.16 ms (**57.0%**) | 9.13 ms (**16.2%**) |
+| resume NET | 3.01 ms (41.2%) | 46.80 ms (**83.2%**) |
+| mirror µs/call | 59.36 | 32.74 |
+
+**The mirror dominates the population that already has headroom and is minor on
+the one that does not.** The census says it in its own output: *"A saving in a
+row that is large on the fast row and small on the slow one pays into the
+population that already has headroom."* Optimizing it buys time on fields that
+already fit — which is precisely why the A/B measured a null.
+
+Note the mirror is *cheaper per call* on slow fields (32.74 vs 59.36 µs); its
+larger absolute cost there is entirely the 4.0x call count. It is a **per-step**
+cost, and slow fields simply take more steps.
+
+**Consequences, and they redirect the whole effort:**
+
+1. **"Removing the entire guard lands near 1.27x" is not supported on this
+   route.** Removing the entire named apparatus lands at **2.8x**.
+2. **The next lever is `resume NET` — translated guest code plus the runtime it
+   calls synchronously.** It is **83% of the render field and has no
+   sub-counters**, exactly the position `executor_ns` was in before it was
+   split. The same rule 2 move, one level deeper, is the next measurement.
+3. **Stop sizing candidates against the apparatus.** Anything inside the 16.4%
+   is competing for a sixth of a field that is 2.8x over budget.
+
+#### THE NEXT MEASUREMENT: split `resume NET`, which is 83.2% and unnamed
+
+Stated as the named next step so whoever picks this up starts from *"83% is
+unnamed"* rather than rediscovering it.
+
+`resume NET` = **46.798 ms of a 56.23 ms render field** and has **no
+sub-counters**. That is exactly the position `executor_ns` was in before
+`f4aeb1c` split it — and splitting it is the same rule 2 move, one level
+deeper. From what is already known it contains at least:
+
+- **`gfx_ns`** (RSP microcode interpretation + the raw RDP seam), previously
+  ~12.5 ms/field on this route
+- **`audio_lle_ns`**, ~1.2 ms/field
+- **translated guest code** — the recompiled blocks themselves
+- **the runtime they call synchronously** — `RdramView` reads/writes,
+  `translate`/`backing_offset`, per-instruction validation, and the dispatch
+  loop's own `reconcile_before_dispatch` at `runners.rs:1033` (per-step; see
+  "SIZED BY READING")
+
+**Even after subtracting graphics and audio, roughly 33 ms/field has no name.**
+That is 2x the entire frame budget, in one bucket, on the population that fails
+the bar. **The 60fps bar is won or lost inside translated guest code and the
+runtime it calls synchronously, and nothing in the apparatus can reach it.**
+
+Arm it with all three gates (rule 27) and read the **slow** row (rule 28).
+
+#### The harness fix earned itself back on the run it was written for
+
+The per-run unfiltered log added during this session (rule 27) mattered
+immediately: the filter dropped `[executor-split]` again on **this very run**,
+and all 20 lines survived only in the unfiltered copy. Without it this would
+have been a third wasted 50-minute pair. **Fix an instrument the moment it
+bites, rather than working around it** — the payback here was under an hour.
+
+### MEASURED, AND REVERTED: gating the mirror comparison buys NOTHING
+
+The pre-registered falsifier fired. Recorded in full because a sound change
+that is also pointless is exactly the result most likely to be re-derived.
+
+Route `render-benchmark.zsh` default (1.5M steps), RT64 headless, quiet machine
+(contention detector armed and clean throughout), interleaved **A B A B** with
+disjoint ranges, two reps. Lane A = `FN64_FAST_MUTATION_JOURNAL` unset (mirror
+comparison runs); lane B = `=1` (comparison gated).
+
+| run | mean | p50 | p95 | p99 | fields |
+|---|---:|---:|---:|---:|---:|
+| rep1 A | 35.24 | 33.18 | 65.65 | 68.25 | 7699 |
+| rep1 B | 35.75 | 33.83 | 65.86 | 69.54 | 7699 |
+| rep2 A | 35.71 | 33.59 | 65.42 | 70.21 | 7699 |
+| rep2 B | 35.49 | 33.38 | 66.40 | 69.65 | 7699 |
+
+| rep | delta (mean) | delta (p99) |
+|---|---:|---:|
+| 1 | **+0.51** (+1.45%) | +1.29 |
+| 2 | **−0.22** (−0.62%) | −0.56 |
+| **mean** | **+0.145, sd 0.365, both signs** | |
+
+**Guest byte-identical in all four lanes** — `gfx_submits=11153`,
+`audio_submits=7685`, `sp_tasks=18838`, `vi_interrupts=8386`,
+`controller_ops=2390`, `sim_time=13112786076`, `render_error=None`, plus
+identical `fields=7699` and `over_budget=3853`. The lanes differ only in host
+cost, which is what makes this a valid A/B. `max` (~1.3 s in every lane) is a
+startup fault-in spike that owns the statistic and is excluded from comparison.
+
+**This is numerically the same null the flag produced before** (−0.14, sd 0.35,
+both signs), now for a partly different reason and on a lane where one of the
+two reconciles had been gated for the first time.
+
+**The conclusion, which is more useful than either sign would have been:**
+
+> `EXEC_MIRROR_NS` is 8.43 ms/render-field, but **removing its comparison
+> changes the render field by nothing measurable.** Therefore **most of that
+> 8.43 ms is not the comparison.**
+
+That is rule 2 one level down: a counter can measure work that **relocates**
+rather than disappears when you delete the thing the counter is named after.
+The split table's apparent "largest line" is not, on this evidence, a target —
+and the next person to size a candidate against it needs to know that first.
+
+**Reverted**, on "it buys nothing" rather than "it costs": a change that moves
+no measurable time while adding a divergent verification lane is not worth
+carrying. The **soundness proof stands** (rules 23 and 24 keep it); only the
+profit claim failed.
+
+**The census agrees, and it is the empirical leg the source proof could not
+supply.** `FN64_MIRROR_RECONCILE_CENSUS=1`, **on a 20,000-step probe**:
+
+```
+[mirror-reconcile] boundaries=19916 clean=19916 (100.0000%) dirty=0 (0.0000%)
+```
+
+**Zero dirty boundaries out of 19,916 — at 20k-step scope.** The mirror
+reconcile never once caught changed state there. The falsifier had every
+opportunity to fire and did not.
+
+**Carry the scope with the number, every time.** 20,000 steps is the **boot**
+portion of the route; the render-heavy region is later, and this route's own
+census shows the first ~50k steps render nothing at all. So the honest claim is
+*"the mirror caught nothing during boot"*, not *"the mirror never catches
+anything"*. A detector idle through boot could in principle fire under
+sustained rendering.
+
+Three reasons the conclusion still holds, none of which is the census alone:
+the **source proof** covers all executions and does not depend on route; the
+**A/B null** was measured on the full 1.5M route *with* sustained rendering and
+found no difference; and the **5.7x** barrier-to-mirror boundary ratio
+(113,670 vs 19,916) bounds how much of the guard's traffic this site can
+possibly own. **The scope caveat is a precision point about the evidence, not a
+doubt about the conclusion.**
+
+*(The full-route census did complete, but its output was destroyed by the
+harness's output filter before it could be read — see rule 26. Quote the
+full-route figure in place of this one if a later run captures it.)*
+
+Alongside it, same run: `[mprotect-barrier] boundaries=113670 served=113669
+fell_back=1 clean=90266 (79.41%) mean_dirty_pages_per_served=0.2087`. Note
+**113,670 barrier boundaries against 19,916 mirror boundaries — 5.7x.** The
+mirror is a *minority* of barrier traffic, which independently predicts that
+gating it could not have moved much, and it did not.
+
+**All three lines of evidence now agree:** safe to gate (source), catches
+nothing (census), changes nothing measurable (A/B). A rare case where the
+question is closed from three directions at once — and the answer is that this
+was never the lever.
+
 ### THE MIRROR FIX: the gated comparison is a pure DETECTOR, proven from source
 
 The redundancy proof the fix requires, done by reading before any benchmark —
@@ -2069,6 +2647,69 @@ property that makes "the other site does it too" more than a structural
 argument. A baseline-advancing read would be a different matter entirely, and
 the doc already distinguishes that case (`live_program.rs:2545-2560`); this is
 not it.
+
+#### A corruption investigation and a performance fix reached the same line from opposite directions
+
+**This adjacency is worth more than either finding alone, and it is the reason
+to trust the gate placement.** Two people, two years of context apart, working
+on opposite problems — one holding a live memory corruption, one hunting 8.43
+ms — drew the *same* boundary through this code and put the gate on the same
+side of it.
+
+The corruption investigation arrived at it by being burned: gating too much
+produced `unjournaled executable mutation changed physical RDRAM
+[0x0009b0b3, 0x0009b0b4)` at 3M steps. The performance work arrived at it by
+reading for what is safe to skip. **When a safety boundary is discovered
+independently by a failure and by an audit, and both land in the same place, it
+is a real boundary rather than either party's convenience.**
+
+The rule it yields, stated generally: **"is this check skippable?" is not a
+property of what the check looks like — it is a property of whether the check
+WRITES.** A comparison that only reads may be gated. A comparison that advances
+a baseline as a side effect may never be, no matter how much it resembles the
+first. The two are visually near-identical here and differ only in one call.
+
+**Independent corroboration, written by whoever debugged the `0x0009b0b3`
+failure.** The comment at `live_program.rs:2670-2685` draws exactly this
+distinction, from the opposite direction — a lane that *broke*:
+
+> "It looks like a pure 'did anything change undeclared' check, but it also
+> ADVANCES the baseline: `adopt_snapshot` accepts the current bytes as
+> `expected`. Skipping it leaves the baseline stale... **The reconcile check in
+> `reconcile_before_dispatch` IS skippable, because it only compares and never
+> advances anything. That one stays gated; this one does not.**"
+
+That is the same comparing-vs-advancing line this fix relies on, reached by
+someone who had a real corruption in hand. **Verified the mirror path falls on
+the safe side of it:** `adopt_snapshot` has exactly one call site
+(`live_program.rs:2810`), in the host-ABI flush the comment says must never be
+gated. The scheduler mirror reaches only `reconcile_snapshot_before_dispatch`,
+the pure detector. Different function, different obligation, and the gate went
+on the one that compares.
+
+**Why this is stronger than the census that was asked for, and when to reach
+for which.** The brief asked for a census proving the mirror never catches
+anything. A census can only ever report *"no dirty boundary was observed on the
+routes I ran"* — a sampled claim, bounded by route coverage, and one that a
+different route can overturn. The source argument reports *"this function
+cannot change state on any input"* — a decidable claim about all executions,
+established by reading the whole body. **Decidable beats sampled, and it beats
+it categorically, not marginally.**
+
+Generalizing, because the next person will reach for a census by default:
+
+- **When the question is "does this code path ever mutate/observe X?"** —
+  read the body. It is decidable, it covers every route, and it takes minutes.
+- **When the question is "how often does this state actually occur, and at what
+  cost?"** — census it. Frequency and magnitude are not derivable from source;
+  the mirror's 8.43 ms and the ~364x barrier clipping are both facts no amount
+  of reading would have produced.
+
+Here the soundness question was the first kind and the sizing question is the
+second, which is why this change carries both a source proof and an instrument.
+The census remains worth running as an **independent empirical falsifier** — if
+it ever reports `dirty > 0`, the source reading was wrong somewhere and that
+matters more than any timing result.
 
 **Two obligations that are NOT gated, and must not be:**
 
@@ -2810,16 +3451,31 @@ Three of the four "structural" rows were misclassified; `read_u8` in particular
 double-counts the journal already charged at 34%. There is no separate 50%
 structural half to attack. See `structural-half-is-mostly-guard.md`.
 
-**Removing the entire guard lands near 1.27x — 47 fps, still not 60.** So
+~~**Removing the entire guard lands near 1.27x — 47 fps, still not 60.**~~ So
 "a release build without the correctness apparatus runs at hardware speed" is
 false, and that inference should not be drawn from the 2.86% figure. Half the
 remaining cost is *being an N64*: emulating its peripherals, its memory, and its
 scheduler.
 
-Reaching 1.0x therefore needs **both** halves:
-1. the guard made cheap enough to leave on, or cleanly optional
+> **CORRECTED 2026-08-08 — "near 1.27x" is far too optimistic for the render
+> route, and struck rather than deleted because the reasoning that produced it
+> will otherwise be repeated.** Measured on the 1.5M-step rendering route with
+> the executor split armed: the **entire named apparatus is 16.4%** of a
+> 56.23 ms slow field (mirror 9.13 + both guard seams 0.085). Removing all of
+> it leaves **46.8 ms/field = 2.8x the budget**, not 1.27x.
+>
+> The old figure came from self-time shares on the 19,523-step route **that
+> renders nothing** (rule 11) — the same route that produced the retracted
+> "1.01 ms guest code" claim. A guard share measured where there are no frames
+> does not transfer to a field that has them.
+
+Reaching 1.0x therefore needs **both** halves — and the second is now known to
+be the overwhelming majority:
+1. ~~the guard made cheap enough to leave on, or cleanly optional~~ — **worth
+   at most 16.4% of the render field; cannot reach the bar even at zero cost**
 2. genuine work on the structural half, which **nobody has attacked yet** —
-   every optimization this session targeted the guard
+   every optimization this session targeted the guard. It is **83.2%** of the
+   render field (`resume NET`) and it has **no sub-counters**.
 
 Note `FN64_FAST_MUTATION_JOURNAL=1` already measures **zero** difference
 (435 ms vs 441 ms): the barrier absorbed that cost, so the removable 47% is not

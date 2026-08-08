@@ -2296,36 +2296,44 @@ impl CanonicalLiveBlockProgramV1 {
     /// but not an `Rdram` -- the scheduler mirror in `execution.rs` is the hot
     /// one, running at every thread selection.
     ///
-    /// # Why this one is gated too, as of the mirror fix
+    /// # Why this one is NOT gated, though gating it would be safe
     ///
     /// This is the SCHEDULER-MIRROR reconcile, measured at **8.43 ms per
     /// WM2000 render field -- 23.8% of the field**, the single largest named
-    /// line in `executor_ns`'s split. It ran the full `matches_view`
-    /// comparison UNCONDITIONALLY while its twin
-    /// [`Self::reconcile_before_dispatch`] gated the identical comparison on
-    /// [`continuous_snapshot_enabled`].
+    /// line in `executor_ns`'s split. Unlike its twin
+    /// [`Self::reconcile_before_dispatch`], it runs `matches_view`
+    /// unconditionally rather than behind [`continuous_snapshot_enabled`].
     ///
-    /// That asymmetry is why `FN64_FAST_MUTATION_JOURNAL=1` measured **zero**
-    /// (−0.14 ms/render-field, sd 0.35, three interleaved pairs): the flag
-    /// could only switch off the site the barrier had already made nearly
-    /// free, while this one kept paying in full. Source-reading and
-    /// measurement reached that mechanism independently; see perf-method.md,
-    /// "PRE-REGISTERED, before measuring: only ONE of the two reconciles is
-    /// gated".
+    /// **That asymmetry was tried as an optimization and measured as nothing.**
+    /// Gating this comparison too (2026-08-08) moved the render field
+    /// **+0.145 ms, sd 0.365, signs spanning both directions over two
+    /// interleaved reps** -- a null -- while being guest byte-identical. It was
+    /// reverted on "buys nothing", not on "costs": a change that moves no
+    /// measurable time but adds a divergent verification lane is not worth
+    /// carrying. See perf-method.md, "MEASURED, AND REVERTED: gating the mirror
+    /// comparison buys NOTHING".
     ///
-    /// **Sealing still always happens** -- it establishes the baseline the
-    /// journal and receipts are bound to, and it early-returns once sealed.
-    /// Only the COMPARISON is gated, exactly as at
-    /// [`Self::reconcile_before_dispatch`], and for the same stated reason:
-    /// the comparison only asserts that no undeclared write occurred, which
-    /// write attribution already guarantees over 505,140 journal entries with
-    /// zero uncovered changed ranges.
+    /// **Do not re-derive this.** Three things are already established:
     ///
-    /// **Arming is NOT gated**, and must not be. `arm_barrier_over_clean_region`
-    /// re-arms the write barrier; skipping it would leave the barrier down and
-    /// let every subsequent write accumulate into the next boundary's dirty set
-    /// instead of being cleared by a fresh window. The gated twin has the same
-    /// obligation and discharges it the same way.
+    /// 1. **It is SAFE to gate.** `reconcile_snapshot_before_dispatch` takes
+    ///    `&mut self` and mutates nothing -- asserts and a panic, snapshot
+    ///    dropped. It is a pure detector. That proof stands; it just did not
+    ///    imply a benefit (perf-method rules 23 and 24).
+    /// 2. **The comparison has a SECOND CONSUMER.** `matches_view` reaches
+    ///    `barrier_spans()` -> `dirty_spans()`, which is *consuming*: it
+    ///    disarms and takes the pending dirty set, which is what leaves
+    ///    `dirty_len == 0` so that `arm()` can skip re-issuing `mprotect`.
+    ///    Gating the comparison stops that drain. The effect is real in the
+    ///    source but bounded under ~0.4 ms/field by the measurement above.
+    /// 3. **Most of the 8.43 ms is therefore NOT this comparison**, since
+    ///    removing it changes nothing measurable.
+    ///
+    /// Sealing always happens regardless -- it establishes the baseline the
+    /// journal and receipts bind to, and early-returns once sealed. And
+    /// `arm_barrier_over_clean_region` must always run: the comparison disarms
+    /// the barrier to read the dirty set, so skipping the re-arm would leave it
+    /// down and let later writes accumulate into the next boundary instead of
+    /// being cleared by a fresh window.
     pub(super) fn reconcile_before_dispatch_from_view(
         &self,
         view: &fn64_runtime::RdramView<'_>,
@@ -2341,12 +2349,6 @@ impl CanonicalLiveBlockProgramV1 {
         if mirror_reconcile_census::enabled() {
             let clean = state.borrow().matches_view(view);
             mirror_reconcile_census::note(clean);
-        }
-        if !continuous_snapshot_enabled() {
-            // Same obligation as the gated twin: the comparison is skipped, the
-            // re-arm is not.
-            self.arm_barrier_over_clean_region();
-            return;
         }
         if state.borrow().reconcile_matched_before_dispatch(view) {
             self.arm_barrier_over_clean_region();
