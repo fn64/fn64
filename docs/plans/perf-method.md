@@ -45,6 +45,18 @@ M ns each" from a profile got both numbers wrong. Twelve `FN64_*_CENSUS` /
 `_SYSCALLS` / `_STATS` gates exist in `fn64-abi` for exactly this. Add one
 rather than infer.
 
+### 4a. `rustc` is not the only thing that steals a core
+`XProtectRemediatorPirrit` — a macOS malware scan — was observed at **97.5% of
+a full core** on this machine, unannounced and unrelated to any agent. A
+contention check that greps for `rustc`, `cargo` or `wm2000-block-boot` cannot
+see it, and no peer's "runs finished" declaration can clear it.
+
+Check by **CPU, over all processes**, not by name:
+`ps -eo pcpu,comm | awk '$1>10'`. Anything above ~10% that is not your own
+workload is a hazard, whoever owns it. This is rule 15 applied to the machine
+itself: observe the state (a busy core), not a proxy for it (a known process
+name).
+
 ### 4. Only measure on a quiet machine
 `uptime` and `pgrep rustc` before any timing. A concurrent 32-crate shard
 rebuild made a 421 ms baseline read 775 ms. `scripts/profile-wm2000-self-time.zsh`
