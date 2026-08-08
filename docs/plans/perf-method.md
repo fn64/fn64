@@ -1955,6 +1955,149 @@ standing property of the route or of phase timing**. That rules out the
 simplest explanations — it is not the instrument, and it is not a permanent
 regression introduced between the baseline and now.
 
+### SIZED BY READING, NOT TAKEN: `runners.rs:1033` is per-STEP, not per-iteration
+
+Recorded because a defect found and rejected should not need rediscovering.
+
+The `executor_ns` split above named "`reconcile_before_dispatch` at
+`runners.rs:1033`, which runs **once per loop iteration**, not once per step"
+as a component of the 11.96 ms resume remainder. Read as "many reconciles per
+step", that would be the cheapest and safest target available — no redundancy
+argument required, just a hoist out of a loop.
+
+**It is not that.** `run_catalog_block_program`'s loop body ends in
+`crate::suspend_active_coroutine(...)` at `runners.rs:1113`, inside the
+`dispatched.instructions > 0` arm. That call suspends the coroutine, so **one
+loop iteration is one scheduling step** — the loop does not spin within a step,
+it resumes where it suspended. "Per loop iteration" and "per step" are the same
+rate here, and the phrasing in the split section is misleading rather than
+wrong.
+
+The reconcile sites and their true rates:
+
+| site | rate |
+|---|---|
+| `runners.rs:1029` (pre-loop) | once per `run_catalog_block_program` entry |
+| `runners.rs:1033` (in-loop) | **once per step** |
+| `execution.rs:808` (the mirror) | **once per step**, ungated |
+| `runners.rs:639`, `:870` | dynamic-mapped lane, not this route |
+
+So there is **no loop-hoist win**, and the two per-step sites are the mirror
+and `:1033` — which is exactly the redundant pair the doc already identifies,
+at the same rate, not a separate cheaper defect. **Prefer-the-safer-target
+reasoning does not apply, because the safer target does not exist.**
+
+The one genuine cheap fix in this area remains the separable defect already
+filed: `continuous_snapshot_enabled()` gates *above* three O(1) assertions
+(`live_program.rs:680-692`), where only the memcmp was meant to be skippable.
+That is a correctness-of-gating fix worth making on its own terms, but it is
+O(1) work and cannot be a measurable share of 8.43 ms.
+
+### PRE-REGISTERED, before measuring: only ONE of the two reconciles is gated
+
+Written down before the A/B runs, so that a confirmation cannot become a
+post-hoc story and a refutation cannot be quietly dropped (rule 1's discipline
+applied to a mechanism rather than to a candidate).
+
+**The claim, from source alone.** The two per-step reconciles of the same
+region against the same baseline are gated differently:
+
+| site | function | `continuous_snapshot_enabled()` check? |
+|---|---|---|
+| dispatch loop, `runners.rs:1033` | `reconcile_before_dispatch` (`live_program.rs:2146`) | **YES**, at `:2160` — returns right after `seal_with` |
+| scheduler mirror, `execution.rs:808` | `reconcile_before_dispatch_from_view` (`:2204`) | **NO** — runs `matches_view` unconditionally |
+
+**What it predicts.** `FN64_FAST_MUTATION_JOURNAL=1` can only switch off the
+site that the barrier has already made nearly free, while the 8.43 ms ungated
+mirror keeps running at full cost. So the flag should measure ~zero — which is
+exactly what three interleaved pairs found (**−0.14 ms/render-field, sd 0.35**,
+deltas spanning both signs).
+
+**Why this is worth pre-registering rather than just asserting.** The doc
+reached the same mechanism *from measurement* at line 585 ("the ungated
+scheduler-mirror reconcile arms one step ahead of the gated call, leaving it an
+empty dirty set to compare"). Source-reading and measurement arriving at the
+same mechanism independently is the strongest evidence available here, and it
+is only strong if the source claim is recorded before the confirming
+measurement is run rather than after.
+
+**The falsifier, stated in advance.** If gating the mirror does *not* move the
+render field by an amount consistent with its measured 8.43 ms, then the mirror
+is not paying what the split attributes to it — most likely because the barrier
+early-out already makes most of those 274.9 calls nearly free and the 8.43 ms
+is concentrated in a few dirty boundaries. In that case the finding is that
+**the mirror is cheap per call and expensive only in aggregate**, and deletion
+of the comparison is not the lever; reducing steps per field is.
+
+**What must be proven before any removal, and it is not structural similarity.**
+Two checks that look alike are not redundant unless they are redundant *under
+the states that actually occur* (rule 6a's converse). The redundancy argument
+therefore requires, per population:
+
+- how often `matches_view` at the mirror finds the region clean vs dirty, and
+- **the dirty-page COUNT when dirty, not just the boolean.** `matches_view`
+  clips to MMU-reported dirty pages and that clipping is a measured ~364x
+  optimization, so "dirty" spans a wide range of real work: one dirty page and
+  400 dirty pages are both "dirty" and cost very differently. A clean/dirty
+  ratio alone cannot size what removal would save.
+- whether the gated site would have caught anything the mirror did not, on the
+  render-field population specifically.
+
+### THE MIRROR FIX: the gated comparison is a pure DETECTOR, proven from source
+
+The redundancy proof the fix requires, done by reading before any benchmark —
+because the soundness question is decidable from source and does not need a
+run, while the *size* of the win does.
+
+**What the fix is.** `reconcile_before_dispatch_from_view`
+(`live_program.rs:2204`, the scheduler mirror, 8.43 ms/render-field) now gates
+its comparison on `continuous_snapshot_enabled()` exactly as its twin
+`reconcile_before_dispatch` (`:2160`) already did. Sealing still always runs;
+`arm_barrier_over_clean_region` still always runs.
+
+**Why gating is sound, and this is the load-bearing part.**
+`reconcile_snapshot_before_dispatch` (`live_program.rs:790-882`) takes
+`&mut self` but **mutates nothing**. Verified mechanically over its whole body:
+zero assignments to `self`, zero collection mutations, no `commit_snapshot`, no
+`adopt_snapshot`. Its entire content is three O(1) asserts and a
+`recompiled_gap_panic` on the first changed range. The snapshot handed to it is
+**dropped**.
+
+So it is a **pure detector**: it either panics or does nothing observable.
+Gating it removes a *check*, never a state transition — which is exactly the
+property that makes "the other site does it too" more than a structural
+argument. A baseline-advancing read would be a different matter entirely, and
+the doc already distinguishes that case (`live_program.rs:2545-2560`); this is
+not it.
+
+**Two obligations that are NOT gated, and must not be:**
+
+1. **`seal_with`** — establishes the baseline the journal and receipts bind to.
+   Runs unconditionally, before the gate, and early-returns once sealed.
+2. **`arm_barrier_over_clean_region`** — the comparison DISARMS the barrier to
+   read the dirty set, so returning without re-arming would leave it down and
+   let every later write accumulate into the next boundary's set instead of
+   being cleared by a fresh window. The gated path re-arms on the way out.
+
+**What still needs measurement, and what does not.** Soundness: settled above,
+no run required. Size of the win: requires the A/B, and the pre-registered
+falsifier stands — if the field does not move by something consistent with
+8.43 ms, the mirror was cheap per call and expensive only in aggregate, and
+steps-per-field is the real lever.
+
+**The instrument that can falsify the redundancy claim empirically.**
+`FN64_MIRROR_RECONCILE_CENSUS=1` counts, at the mirror site and before the gate
+can skip it, how many boundaries read clean vs dirty. **`dirty > 0` on a real
+route would mean this site catches state**, and the gating argument would be
+wrong regardless of what the byte-identity gate says on one route. The census
+is armed independently of `FN64_MPROTECT_BARRIER_STATS`, which counts barrier
+asks across all sites rather than attributing outcomes to this one.
+
+Prior evidence pointing the same way, recorded here so the census is a
+confirmation rather than the only leg: write attribution over WM2000's full
+route produced **505,140 journal entries with ZERO changed ranges lacking a
+covering declaration** (`continuous_snapshot_enabled`'s own doc comment).
+
 ### FOUND IT: executor self is 21.72 ms — 61% of the render field, not graphics
 
 The "unaccounted 23.94 ms" was never unmeasured. It was in the population split

@@ -32,6 +32,100 @@ fn continuous_snapshot_enabled() -> bool {
     })
 }
 
+/// Does the SCHEDULER-MIRROR reconcile ever catch anything?
+///
+/// The mirror site costs 8.43 ms per WM2000 render field (23.8%) and is a
+/// candidate for gating. Gating it is only sound if it is genuinely redundant
+/// with the dispatch-loop reconcile that runs at the same per-step rate -- and
+/// "the two look alike" is a structural argument, which is exactly what rule 6a
+/// exists to reject. Two checks are redundant only under the states that
+/// ACTUALLY OCCUR, so this counts those states.
+///
+/// `FN64_MIRROR_RECONCILE_CENSUS=1`. Off by default and free when off: the call
+/// site tests `enabled()` before doing the comparison it would otherwise skip.
+///
+/// **It reports DIRTY BOUNDARIES, which is the number that decides the
+/// question.** A clean/dirty ratio alone cannot size what removal would save,
+/// because `matches_view` clips to MMU-reported dirty pages -- a measured ~364x
+/// optimization -- so "dirty" spans one page to four hundred. What matters for
+/// SOUNDNESS, though, is simply whether `dirty` is ever nonzero: a mirror that
+/// never once finds the region changed is catching nothing the gated site could
+/// not, and gating it removes a comparison rather than a detector.
+///
+/// Armed separately from `FN64_MPROTECT_BARRIER_STATS` because that one counts
+/// barrier ASKS across all sites; this one attributes outcomes to the mirror
+/// alone, which is the site under consideration.
+pub(super) mod mirror_reconcile_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CLEAN: AtomicU64 = AtomicU64::new(0);
+    static DIRTY: AtomicU64 = AtomicU64::new(0);
+
+    pub(in crate::recompiled) fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("FN64_MIRROR_RECONCILE_CENSUS").is_some_and(|value| {
+                matches!(
+                    value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        })
+    }
+
+    /// Running `(clean, dirty)` totals, for tests and the census reporter.
+    pub(in crate::recompiled) fn running_totals() -> (u64, u64) {
+        (CLEAN.load(Ordering::Relaxed), DIRTY.load(Ordering::Relaxed))
+    }
+
+    /// Record one mirror reconcile outcome.
+    pub(in crate::recompiled) fn note(clean: bool) {
+        arm_report();
+        if clean {
+            CLEAN.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DIRTY.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Print at exit rather than from a harness `main`.
+    ///
+    /// `examples/wm2000-block-boot/src/main.rs` is hashed verbatim into
+    /// `DISPATCH_SOURCE_SHA256`, so reporting from there would change the
+    /// canonical program identity and invalidate the A/B. Same reasoning as
+    /// `write_barrier::guard::stats::arm_report`.
+    fn arm_report() {
+        extern "C" fn at_exit() {
+            let clean = CLEAN.load(Ordering::Relaxed);
+            let dirty = DIRTY.load(Ordering::Relaxed);
+            let total = clean + dirty;
+            let share = |n: u64| {
+                if total == 0 {
+                    0.0
+                } else {
+                    100.0 * n as f64 / total as f64
+                }
+            };
+            println!(
+                "[mirror-reconcile] boundaries={total} clean={clean} ({:.4}%) \
+                 dirty={dirty} ({:.4}%) -- dirty>0 means this site CAUGHT state \
+                 and gating it is not a pure comparison removal",
+                share(clean),
+                share(dirty),
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            unsafe { atexit(at_exit) };
+        });
+    }
+}
+
 impl CanonicalExecutableMutationStateV1 {
     pub(super) fn new(ranges: &[(u32, u32)]) -> Self {
         assert!(
@@ -2201,6 +2295,37 @@ impl CanonicalLiveBlockProgramV1 {
     /// snapshot moves to the view. For callers that hold the RDRAM allocation
     /// but not an `Rdram` -- the scheduler mirror in `execution.rs` is the hot
     /// one, running at every thread selection.
+    ///
+    /// # Why this one is gated too, as of the mirror fix
+    ///
+    /// This is the SCHEDULER-MIRROR reconcile, measured at **8.43 ms per
+    /// WM2000 render field -- 23.8% of the field**, the single largest named
+    /// line in `executor_ns`'s split. It ran the full `matches_view`
+    /// comparison UNCONDITIONALLY while its twin
+    /// [`Self::reconcile_before_dispatch`] gated the identical comparison on
+    /// [`continuous_snapshot_enabled`].
+    ///
+    /// That asymmetry is why `FN64_FAST_MUTATION_JOURNAL=1` measured **zero**
+    /// (−0.14 ms/render-field, sd 0.35, three interleaved pairs): the flag
+    /// could only switch off the site the barrier had already made nearly
+    /// free, while this one kept paying in full. Source-reading and
+    /// measurement reached that mechanism independently; see perf-method.md,
+    /// "PRE-REGISTERED, before measuring: only ONE of the two reconciles is
+    /// gated".
+    ///
+    /// **Sealing still always happens** -- it establishes the baseline the
+    /// journal and receipts are bound to, and it early-returns once sealed.
+    /// Only the COMPARISON is gated, exactly as at
+    /// [`Self::reconcile_before_dispatch`], and for the same stated reason:
+    /// the comparison only asserts that no undeclared write occurred, which
+    /// write attribution already guarantees over 505,140 journal entries with
+    /// zero uncovered changed ranges.
+    ///
+    /// **Arming is NOT gated**, and must not be. `arm_barrier_over_clean_region`
+    /// re-arms the write barrier; skipping it would leave the barrier down and
+    /// let every subsequent write accumulate into the next boundary's dirty set
+    /// instead of being cleared by a fresh window. The gated twin has the same
+    /// obligation and discharges it the same way.
     pub(super) fn reconcile_before_dispatch_from_view(
         &self,
         view: &fn64_runtime::RdramView<'_>,
@@ -2210,6 +2335,19 @@ impl CanonicalLiveBlockProgramV1 {
             return;
         };
         state.borrow_mut().seal_with(&mut read_physical_byte);
+        // Census the outcome BEFORE the gate can skip it, so the redundancy
+        // question ("does this site ever catch anything?") is answerable in the
+        // very lane that would remove it. Costs nothing unless armed.
+        if mirror_reconcile_census::enabled() {
+            let clean = state.borrow().matches_view(view);
+            mirror_reconcile_census::note(clean);
+        }
+        if !continuous_snapshot_enabled() {
+            // Same obligation as the gated twin: the comparison is skipped, the
+            // re-arm is not.
+            self.arm_barrier_over_clean_region();
+            return;
+        }
         if state.borrow().reconcile_matched_before_dispatch(view) {
             self.arm_barrier_over_clean_region();
             return;

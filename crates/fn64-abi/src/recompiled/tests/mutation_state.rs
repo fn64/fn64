@@ -1730,3 +1730,87 @@ use super::*;
         // A range inside one span clips to itself.
         assert_eq!(clip(&merged, 0x120, 0x160), vec![(0x120, 0x160)]);
     }
+
+    /// The mirror census must count a clean boundary as clean and a changed
+    /// one as dirty, because `dirty` is the number the gating decision rests
+    /// on.
+    ///
+    /// The soundness argument for gating the scheduler-mirror reconcile is
+    /// that the site never catches anything -- so an instrument that could not
+    /// report "caught something" would make that argument unfalsifiable. This
+    /// pins that the two outcomes are actually distinguished, using the same
+    /// predicate the call site uses.
+    #[test]
+    fn mirror_census_distinguishes_a_clean_boundary_from_a_changed_one() {
+        use crate::recompiled::live_program::mirror_reconcile_census;
+
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
+        let mut storage = vec![0u8; 0x200];
+        for (index, byte) in storage.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        let mut state = CanonicalExecutableMutationStateV1::new(&[(0x100, 0x140)]);
+        {
+            let view = fn64_runtime::RdramView::from_storage(&storage);
+            state.seal_with(|physical| {
+                view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
+            });
+        }
+
+        // Sealed and untouched: the predicate the census records must say clean.
+        {
+            let view = fn64_runtime::RdramView::from_storage(&storage);
+            assert!(
+                state.matches_view(&view),
+                "an untouched sealed region must read clean"
+            );
+        }
+
+        // Change one watched byte: the same predicate must say dirty. This is
+        // the outcome whose ABSENCE over a whole route is the gating argument.
+        storage[0x120] ^= 0xff;
+        {
+            let view = fn64_runtime::RdramView::from_storage(&storage);
+            assert!(
+                !state.matches_view(&view),
+                "a changed watched byte must read dirty -- otherwise the census \
+                 could never falsify the redundancy claim"
+            );
+        }
+
+        // The counters are addressable and start from a defined state; the
+        // census is off by default, so `note` is what moves them, not `enabled`.
+        let (clean_before, dirty_before) = mirror_reconcile_census::running_totals();
+        mirror_reconcile_census::note(true);
+        mirror_reconcile_census::note(false);
+        let (clean_after, dirty_after) = mirror_reconcile_census::running_totals();
+        assert_eq!(
+            (clean_after - clean_before, dirty_after - dirty_before),
+            (1, 1),
+            "each outcome must land in its own counter"
+        );
+    }
+
+    /// `FN64_MIRROR_RECONCILE_CENSUS` must be off unless affirmatively set.
+    ///
+    /// Pins the bug shape that fabricated a 4.9x result elsewhere in this
+    /// crate: a gate written as `var_os(..).is_some()` reads `VAR=` -- set but
+    /// empty, exactly how a shell writes an off lane -- as ON, making both
+    /// lanes of an A/B the same lane.
+    #[test]
+    fn mirror_census_gate_is_off_unless_affirmatively_set() {
+        // The parse the gate uses, exercised directly: the gate itself latches
+        // in a `OnceLock` and cannot be re-read per case within one process.
+        let affirmative = |value: &str| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        };
+        for off in ["", " ", "0", "no", "off", "false", "2"] {
+            assert!(!affirmative(off), "{off:?} must not arm the census");
+        }
+        for on in ["1", "true", "yes", "on", "ON", " 1 "] {
+            assert!(affirmative(on), "{on:?} must arm the census");
+        }
+    }
