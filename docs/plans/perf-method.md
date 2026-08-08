@@ -468,6 +468,23 @@ will not be until that 2.86% grows.
 
 ## Ranked candidates, with what would falsify each
 
+0. **The 8 MiB RDRAM copy per DPC submission — UNMEASURED, and do not dispatch
+   on the byte count.** `dispatch_captured_raw_rdp` (`rsp_commit.rs:1085-1088`)
+   does `vec![0u8; staged_end]` plus `copy_from_slice(real)` over the whole
+   physical RDRAM on every submission, then copies back. At 16,586 submits that
+   is **129.6 GB** over the gameplay route, which looks decisive and **is not
+   evidence**. Rule 12 was earned this same day by a 5.92 GB clone with exactly
+   this shape that measured **+0.84%, the wrong direction**.
+   The RT64 profile bills this seam 3.17 ms/field (7.65% of samples), but that
+   figure is **guard work entering through it** — the seam is one of the four
+   `read_snapshot` entry points — not the memcpy. The copy's own cost has never
+   been isolated.
+   Falsify first, cheaply: instrument the allocate-and-copy pair alone under
+   `FN64_PHASE_TIMING` and read its self time. If it is small, this is rule 12
+   again and the entry stops here. Note also that the in-flight nested-writer
+   view fix targets the guard cost billed at this same seam, so **re-profile
+   after it lands** — this candidate may shrink or vanish without being touched.
+
 1. **Page size v4.** The argument against smaller pages in the v2 constant's doc
    comment is **stale**: it warned they inflate an O(pages) root, which the v3
    tree made O(log pages). Leaves are 87.5% of digest payload, so 1-2 KiB pages
