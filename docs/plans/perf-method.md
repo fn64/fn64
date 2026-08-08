@@ -309,6 +309,27 @@ will not be until that 2.86% grows.
 
 ## Dead ends — do not retry without new evidence
 
+- **Hoisting loop-invariant span edges out of `raw_pixel_coverage`.** The
+  hypothesis was right and the change still loses. `raw_span_edges_at_y_eighth`
+  recomputed two 64-bit mul-divs once per *sample* — 8x per pixel — when only
+  four distinct sub-scanlines exist and the enclosing loop had already computed
+  them. Hoisting into a per-row `RawScanlineCoverage` moved the targeted
+  counter **-10.21%** (`gfx_lle_rdp` 94,693.9 -> 85,028.3 ms, ranges fully
+  disjoint, hoist sd 593 vs base sd 2776, 6 interleaved runs on a pinned
+  route). **The program got 3.25% slower** (census mean 34.85 -> 35.98 ms), and
+  `audio_lle` — a phase the change cannot reach — rose **18.35%**
+  reproducibly with disjoint ranges, same guest program, byte-identical
+  block progress. The three billed phases net **-4.2 s** while the mean rises,
+  so the decisive effect is outside them; p50 is unchanged (41.65 vs 41.50), so
+  it lives in the tail, not in the per-pixel throughput the hoist targets. Code
+  layout / I-cache is the plausible reading and was **not** proven. The source
+  is saved with a mutation-tested exhaustive equivalence proof (726 pixel
+  positions x 3 primitives x 2 scissors) and is correct — it is worth reviving
+  only inside a larger rasterizer change where layout is re-settled anyway.
+  **The rule it illustrates: an optimization whose targeted counter improves
+  while the program regresses does not ship on the strength of the counter.**
+  That is rule 2's error wearing a new costume — reading the instrument
+  instead of the outcome.
 - **Narrowing the watched region.** Four falsified attempts. WM2000 zeroes its
   own loaded code image; compiled shards live inside the memset destination.
 - **`verify_precompiled_instruction_word`.** Unfixable at that layer:

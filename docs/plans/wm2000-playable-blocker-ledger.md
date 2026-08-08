@@ -1978,5 +1978,57 @@ graphics-dense route, so 34.85-37.60 ms/field is a floor for gameplay rather
 than a typical value, and the case for a GPU backend is stronger than the
 menu-route split made it look.
 
-Still open, and not shown by any of this: **a live window.** These frames are
-headless dumps. That display lists reach an on-screen window remains unproven.
+## 2026-08-07: WM2000 is playable on screen
+
+The frames above are headless dumps, and "display lists reach an on-screen
+window" was the last thing this file listed as unproven. **It is now proven by
+observation**: the window was opened, a match was played, and screenshots 30
+seconds apart show the match clock advancing `00:03` -> `00:26` with both
+wrestlers animating and both ATTITUDE meters drawn. 4,860+ frames presented,
+zero panics, zero render errors, and every heartbeat carried a distinct
+`rgba_hash` — content genuinely changing, not one frozen buffer re-presented.
+
+The window is titled `fn64 -- WM2000 (dense AOT block program)`, sized to the
+game's real 480x240 VI width, driven by the committed route verified by hash
+(`a9e1b25e9b1efd03...`) — the same input the headless lane uses.
+
+**The windowed lane is `wm2000-shell`, not `crates/fn64-shell`.** This matters
+because the shipping-named binary is the one that cannot play the game.
+`fn64-shell` is the OoT *function-lane* harness: it boots through
+`boot_thread0` with a linked whole-ROM `*-recompiled` crate
+(`crates/fn64-shell/src/main.rs:406-412`), defaults `FN64_CART_HANDLE_VRAM` to
+OoT's `0x8000_9EA0`, hardcodes sections `[0,1,2]`, and supports no scripted
+input at all. WM2000 runs from a second binary of `examples/wm2000-block-boot`
+(`src/shell.rs`), which shares `block_program.rs` with the certified headless
+binary and therefore cannot drift from the gated program.
+
+Two stale claims in this file's history are retired by the same run:
+
+- The **gfx-dispatch address mask** was never a shell defect. `task_dispatch.rs`
+  no longer exists (split in `7f4069e`); the mask lives in shared `fn64-abi` at
+  `task_dispatch/setup.rs:387` (`header.data_ptr & 0x1fff_ffff`, commented with
+  WM2000's exact `0x8038ce30`), which **both** lanes cross.
+- The **white window** was real and was fixed in `24a41ed`. WM2000 never calls
+  `osViSwapBuffer` — it writes VI_ORIGIN through raw MMIO, alternating
+  `0x0038fbc0`/`0x003c7fc0` — so a `present()` keyed on
+  `current_vi_framebuffer()` bailed every frame. It now uses
+  `scanout_vi_framebuffer()`.
+
+Both WM2000 lanes register the software `ReferenceBackend`; neither uses RT64
+today (see `rt64-on-the-block-lane.md`).
+
+### What remains
+
+Not correctness — **speed and sound**.
+
+1. **The 60fps bar.** The windowed lane's own heartbeat reads p50 ~18.8 ms,
+   p95 ~93 ms, p99 ~95 ms, every field flagged over 16.7 ms. That p50 is
+   *better* than the headless 43.31 ms in `perf-method.md`, but the two cover
+   different route phases and **must not be compared without a matched span**.
+2. **Audio is silent.** `ai_buffers=0 samples=0`. MIT-clean HLE audio microcode
+   remains a real project; the GPL-3.0 reference is barred by the licensing
+   thesis.
+3. **One binary, or two?** The shipping-named `fn64` binary cannot run WM2000,
+   and the one that can lives under `examples/`. Unifying them is a real port
+   across the catalog/generation boot seam, not an env-var change — it needs an
+   explicit decision, not a drive-by fix.
