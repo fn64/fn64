@@ -144,6 +144,46 @@ debug = 1
 [profile.release.package.fn64-abi]
 codegen-units = 1
 debug = 1
+# `fn64-audio` runs the RSP interpreter (`rsp::interpreter::run_imem`), which
+# retires ~4.13B RSP instructions on the gameplay route. It was the one hot
+# handwritten crate with NO override, so it inherited the 256 above -- the
+# generated-shard setting, which is wrong for it. The shards are cold code
+# dispatched through, and many units let rustc parallelize them; this crate is
+# a hot interpreter loop where the units cost real work.
+#
+# MEASURED, 2026-08-08, route a9e1b25e, RT64, headless, 2.1M steps, two
+# interleaved A/B pairs on a quiet machine. Mean ms/field:
+#
+#   baseline (256)  22.85 / 22.88     range [22.85, 22.88]
+#   this (1)        22.48 / 22.33     range [22.33, 22.48]
+#
+# Ranges FULLY DISJOINT, -1.79% mean, ratio A 1.37x -> 1.35x. Guest
+# byte-identical across all four runs (gfx_submits=16586, audio_submits=11005,
+# sp_tasks=27591, vi_interrupts=12008, controller_ops=3115, render_error=None,
+# identical sim_time).
+#
+# THE MECHANISM WAS CONFIRMED BY SYMBOL, NOT INFERRED FROM THE TIMING. Before:
+# `run_imem`'s object held UNDEFINED references to `decode::decode` and
+# `ops::dispatch` -- and neither carries `#[inline]`, so across a codegen-unit
+# boundary LLVM sees only a declaration and is NEVER ASKED to inline them.
+# After: 1 CGU, both callees defined locally, and ZERO `bl` instructions leave
+# `run_imem`. Total object text also SHRANK 22.8% (416,618 -> 321,621 bytes):
+# single-CGU dedup of helper/generic instantiations outweighs the inlining
+# growth. Whether that layout change contributes is UNPROVEN -- see the
+# rasterizer-hoist dead end, where layout moved the other way unpredictably.
+#
+# TWO THINGS THIS IS NOT:
+#  - It is NOT the recorded `codegen-units`/LTO dead end. That entry is 32
+#    GENERATED shard crates paying a 9-minute build for 10%. This is one
+#    handwritten crate; the incremental cost is ~3 s (24.46 s vs 21.51 s, warm
+#    rebuild plus relink -- NOT a cold build).
+#  - It is NOT progress toward 60fps. The distribution is bimodal (p50 ~16.5,
+#    p95 ~38) and this is a tail-only win: p95/p99 improve, the MEDIAN DOES
+#    NOT, and the over-budget count moved the wrong way (5,659/5,660 ->
+#    5,660/5,662). `holds_60fps` stays false. It is a cheap efficiency win.
+[profile.release.package.fn64-audio]
+codegen-units = 1
+debug = 1
 
 [profile.dev.build-override]
 # The shard build scripts perform exhaustive mechanical ROM discovery. Scope
