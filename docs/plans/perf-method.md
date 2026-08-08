@@ -817,7 +817,78 @@ caveats travel with these numbers — the shell has **no warmup gate**, so the
 carries the `fn64-audio` `codegen-units=256` defect, making them a
 **pessimistic floor**.
 
-## Leading explanation of the bimodality: a 30 Hz guest loop (UNCONFIRMED)
+## CONFIRMED: WM2000 renders at 30 Hz. The target is the render field, not the mean.
+
+Measured 2026-08-08 at `c2caafe`, RT64, route `a9e1b25e`. The 30 Hz hypothesis
+below is **confirmed**, including the number it predicted.
+
+**The raw sequence, 400 consecutive steady-state fields from field 2000:**
+
+```
+SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+```
+
+**Perfect period-2 alternation, zero defects across all 400.** Visible, not
+inferred from a coefficient. Representative fields: `2000: 38.29 ms gfx=3` /
+`2001: 8.76 ms gfx=0` / `2002: 37.16 ms gfx=3` / `2003: 8.35 ms gfx=0`.
+
+**Contingency table — essentially a clean partition:**
+
+| | fast | slow |
+|---|---:|---:|
+| submits = 0 | **5,657** | 0 |
+| submits > 0 | 4 | **5,659** |
+
+**100.0% of slow fields carried a submit; 0.1% of fast fields did.** Four
+fields out of 11,321 break the pattern. Mean submits when nonzero: **2.88 slow
+vs 1.00 fast** — the independent diagnosis predicted ~2.9 vs ~0 and ruled out
+2-vs-1 by arithmetic; measured is **2.876 vs 0.001**.
+
+**The two populations:**
+
+| | count | mean | p50 | p95 | share of wall |
+|---|---:|---:|---:|---:|---:|
+| fast | 5,661 | **8.89** | 8.80 | 9.63 | 19.9% |
+| slow | 5,660 | **35.84** | 36.99 | 38.33 | **80.1%** |
+
+**The program spends 80% of its time in 50% of its fields**, and the fast half
+runs at **0.53x budget** — less than half of it. The off-field was never the
+problem.
+
+Note the lag table read `lag1 = -0.550` with odd lags negative and even
+positive at equal magnitude — the textbook period-2 signature, but understated
+because each mode has internal variance (the slow mode spans 36.5-38.3). **The
+string showed a perfect signal the coefficient rated 0.55.** That is why the
+raw sequence is reported first.
+
+### What this changes
+
+**The goal is not 5.84 ms off the mean. It is 2.15x on the rendering field.**
+
+If the render field were brought to exactly 16.667 ms, the mean lands at
+**12.78 ms = 0.77x budget and `holds_60fps` becomes TRUE.** That is the only
+path — **the fast half has no work to donate**, so no redistribution or
+mean-shaving reaches the bar. Every queued candidate is a mean-shaver.
+
+Three findings that direct the work:
+
+- **The guard rides the submits, it is not per-field overhead.** Barrier work
+  concentrates **3.8x** on slow fields (991 vs 263 boundaries).
+- **Audio is flat across both populations** — `audio_tasks` 1.006x,
+  `audio_lle_ns` 1.002x, `rsp_steps_audio` 1.003x. Audio runs at 60 Hz while
+  rendering runs at 30 Hz, which is what proves the alternation is a **guest
+  cadence** and not a host artifact.
+- **`vi_present_ns` is the only counter that INVERTS: 0.513x** — present is
+  more expensive on the cheap fields.
+
+16 of 21 counters differ, but they are **not 16 independent findings** — all
+are downstream of "this field carried 2.88 display lists" (`gfx_ns` 5708x,
+`rsp_steps_gfx` 10819x, `dpc_calls` 4071x).
+
+Instrument perturbation is negligible: **22.36 instrumented vs 22.41 control**.
+Guest byte-identical in both.
+
+## Leading explanation of the bimodality: a 30 Hz guest loop (CONFIRMED — see above)
 
 An independent read-only diagnosis, ranked by confidence and **not yet
 confirmed by measurement**. Recorded because it rules out the obvious
