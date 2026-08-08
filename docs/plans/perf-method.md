@@ -1064,7 +1064,47 @@ ms/field" line is stale by ~1,300x.** The guard fix (`abc7871`) collapsed it:
 independent 2.1M-step runs — 0.003 ms/field. **The HLE preflight is free.
 Nobody should target it.**
 
-### 67% OF THE RENDER FIELD IS UNACCOUNTED FOR — and that is the real target
+### FOUND IT: executor self is 21.72 ms — 61% of the render field, not graphics
+
+The "unaccounted 23.94 ms" was never unmeasured. It was in the population split
+already, in `/tmp/bimodal-run2-full.log` from `95e3f92`, and nobody did the
+subtraction.
+
+Render field decomposition, all figures per slow field from that run:
+
+| | ms | share of 35.84 |
+|---|---:|---:|
+| `executor_ns` (**inclusive**) | 34.91 | 97% |
+| — of which `gfx_ns` (nested) | 11.99 | 33% |
+| — — `gfx_lle_rsp_ns` | 6.08 | 17% |
+| — — `gfx_lle_rdp_ns` | 5.82 | 16% |
+| — of which `audio_lle_ns` | 1.20 | 3% |
+| **= EXECUTOR SELF** | **21.72** | **61%** |
+| `vi_present_ns` | 0.89 | 2% |
+
+**Executor self is 21.72 ms of a 35.84 ms field — larger than every graphics
+line combined (11.99).** This is rule 2 at the top level: `executor_ns` is
+inclusive, and reading it as a peer of `gfx_ns` rather than its parent hid the
+single biggest cost in the program.
+
+**And it scales with submits, so it is per-submit work, not a floor.**
+`executor_calls` is **274.9/field on render fields against 68.5 on off-fields —
+4.0x** — matching `gfx_calls` at 5.75/field. That works out to **79.0 µs per
+executor call** on a render field. The barrier tracks it too
+(`barrier_served` 991.5 vs 262.8, 3.77x).
+
+So the correct statement of the problem: the render field is **not** dominated
+by emulating the RSP or the RDP. It is dominated by whatever the executor does
+**around** each of the ~5.75 graphics calls it makes per field — dispatch,
+scheduling, the mutation journal, and the guard, none of which is the console's
+own work.
+
+**Next measurement: split `executor_ns` itself.** It has no sub-counters. 21.72
+ms across 274.9 calls needs a breakdown by what the executor is actually doing
+between phase boundaries, and that is where the 60fps bar is won or lost —
+modern hardware is more than fast enough for 526k RSP instructions at 11.25 ns.
+
+### Formerly: "67% of the render field is unaccounted for" (resolved above)
 
 Modern hardware is orders of magnitude faster than an N64. It should not be
 close. The measured lines say it is not the emulation of the console's *work*
