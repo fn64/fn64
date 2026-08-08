@@ -1110,6 +1110,54 @@ a route with no frames in it, and carried into a table about a route that has
 them. **Before quoting any per-field figure, state which route produced it and
 whether that route rendered anything.**
 
+### The watched region is reconciled ~3.6x per step, and only one site is gated
+
+Verified by reading, not inferred. Two independent reconciles of the **same
+region against the same baseline** run per step, microseconds apart, with
+nothing writing guest RDRAM in between:
+
+| site | path | gated by `FN64_FAST_MUTATION_JOURNAL`? |
+|---|---|---|
+| **mirror** | `host.rs:208` → `execution.rs:772` → `:808` → `reconcile_before_dispatch_from_view` (`live_program.rs:2205-2225`) | **NO** |
+| **dispatch** | `runners.rs:1029/1033` → `reconcile_before_dispatch` (`:2146`) | yes |
+
+`host.rs:367-371` states the mirror's true cost in its own words: *"under
+`recomp-rs` this is a FULL watched-region journal reconcile (see
+`EXEC_MIRROR_NS`), not the four-byte store its name suggests, and **it runs on
+every step**."* And `reconcile_before_dispatch_from_view` has **no
+`continuous_snapshot_enabled()` check** — it calls
+`reconcile_matched_before_dispatch` and `reconcile_snapshot_before_dispatch`
+unconditionally, including all three O(1) asserts.
+
+Measured: **274.9 steps and 991.5 `barrier_served` boundaries per render field
+= 3.61 comparisons per step.**
+
+**This closes the correctness question, in the flag's favour.** Both earlier
+arguments were wrong:
+
+- Mine ("no second detector, therefore load-bearing") — there *is* a second
+  detector, and it is the ungated one.
+- The counter-argument ("the repository records this flag failing") — that
+  incident belongs to the reverted write-queue gate and the baseline-*advancing*
+  read, not to this call site.
+
+With the flag on, an undeclared write is still caught **at the very next step's
+mirror**, by the same code with the same diagnostics and the same asserts.
+Detection is delayed by at most one step, not lost. The gated site is a
+**second** comparison, not the last line of defence. The C-shim escape path
+(`live_program.rs:2088-2094`, mitigation with zero non-test callers) remains
+real and worth wiring, but it is **orthogonal** — equally uncaught-until-next-
+boundary with the flag off.
+
+**It also supplies a benign explanation for the two historical "measures zero"
+entries**: if the mirror just proved the region clean microseconds earlier, the
+dispatch comparison takes its cheap early-out and is already nearly free. That
+requires no reachability bug. Pre-registered as the leading hypothesis before
+the A/B lands.
+
+Whichever site pays, **the redundancy itself is the finding** — and the mirror,
+at a measured 8.43 ms/field, is the ungated one.
+
 ### The dispatch comparison is already 364x optimized — it cannot be the remainder
 
 Before dispatching work at `reconcile_before_dispatch` (the named lead into the
