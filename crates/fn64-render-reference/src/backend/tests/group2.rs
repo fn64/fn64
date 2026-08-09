@@ -1471,10 +1471,18 @@ fn same_color_image_bytes_reinterpret_between_index8_and_rgba16() {
 #[test]
 fn reference_renderer_rejects_invalid_non_rgba_16bit_targets_by_name() {
     let mut rdram = vec![0u8; 0x1000];
+    // G_SETCIMG format=3 size=2, then a G_FILLRECT that DRAWS through it,
+    // then G_ENDDL. The draw is what makes this an error: G_SETCIMG is a
+    // latch, so an unsupported format is only a fault once a primitive
+    // writes through it. Without the fill this stream is legal and must
+    // decode clean -- see
+    // `unsupported_color_image_latch_without_a_draw_is_not_an_error`.
     rdram[0x100..0x104].copy_from_slice(&0xff70_0003u32.to_ne_bytes());
     rdram[0x104..0x108].copy_from_slice(&0x400u32.to_ne_bytes());
-    rdram[0x108..0x10c].copy_from_slice(&0xdf00_0000u32.to_ne_bytes());
+    rdram[0x108..0x10c].copy_from_slice(&0xf600_0000u32.to_ne_bytes());
     rdram[0x10c..0x110].copy_from_slice(&0u32.to_ne_bytes());
+    rdram[0x110..0x114].copy_from_slice(&0xdf00_0000u32.to_ne_bytes());
+    rdram[0x114..0x118].copy_from_slice(&0u32.to_ne_bytes());
     let mut backend = ReferenceBackend::new()
         .with_f3dex2()
         .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
@@ -1493,4 +1501,70 @@ fn reference_renderer_rejects_invalid_non_rgba_16bit_targets_by_name() {
         .unwrap_err();
     assert!(error.to_string().contains("format=3 size=2"));
     assert!(error.to_string().contains("requires 8-bit intensity"));
+}
+
+/// G_SETCIMG is a latch, like G_SETTIMG ("Pointer + format latch only; no
+/// texel data moves until a G_LOAD*"). The RDP stores format/size/width/
+/// address and reads none of it until a primitive writes through the target,
+/// so latching a format this backend cannot execute is only an error if
+/// something actually draws to it.
+///
+/// WCW/nWo Revenge latches format=0 size=0 and the eager check aborted the
+/// frame at the latch. This is that stream: an unsupported G_SETCIMG
+/// followed straight by G_ENDDL, with no drawing op in between.
+#[test]
+fn unsupported_color_image_latch_without_a_draw_is_not_an_error() {
+    let mut rdram = vec![0u8; 0x1000];
+    // G_SETCIMG with format=0 size=0 -- Revenge's exact configuration.
+    rdram[0x100..0x104].copy_from_slice(&0xff00_0003u32.to_ne_bytes());
+    rdram[0x104..0x108].copy_from_slice(&0x400u32.to_ne_bytes());
+    rdram[0x108..0x10c].copy_from_slice(&0xdf00_0000u32.to_ne_bytes());
+    rdram[0x10c..0x110].copy_from_slice(&0u32.to_ne_bytes());
+    let mut backend = ReferenceBackend::new()
+        .with_f3dex2()
+        .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
+    backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
+    backend
+        .process_task(
+            &mut rdram,
+            &mut fn64_runtime::RspMemory::new(),
+            &OsTask {
+                task_type: fn64_render::M_GFXTASK,
+                data_ptr: 0x100,
+                ..OsTask::default()
+            },
+            0,
+        )
+        .expect("latching an unsupported color image without drawing is legal");
+}
+
+/// Deferring must not become tolerating: a draw through the latched
+/// format=0 size=0 target still fails, and still names the format.
+#[test]
+fn drawing_through_an_unsupported_color_image_latch_still_fails() {
+    let mut rdram = vec![0u8; 0x1000];
+    rdram[0x100..0x104].copy_from_slice(&0xff00_0003u32.to_ne_bytes());
+    rdram[0x104..0x108].copy_from_slice(&0x400u32.to_ne_bytes());
+    rdram[0x108..0x10c].copy_from_slice(&0xf600_0000u32.to_ne_bytes());
+    rdram[0x10c..0x110].copy_from_slice(&0u32.to_ne_bytes());
+    rdram[0x110..0x114].copy_from_slice(&0xdf00_0000u32.to_ne_bytes());
+    rdram[0x114..0x118].copy_from_slice(&0u32.to_ne_bytes());
+    let mut backend = ReferenceBackend::new()
+        .with_f3dex2()
+        .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
+    backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
+    let error = backend
+        .process_task(
+            &mut rdram,
+            &mut fn64_runtime::RspMemory::new(),
+            &OsTask {
+                task_type: fn64_render::M_GFXTASK,
+                data_ptr: 0x100,
+                ..OsTask::default()
+            },
+            0,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("format=0 size=0"), "{error}");
+    assert!(error.to_string().contains("requires 8-bit intensity"), "{error}");
 }

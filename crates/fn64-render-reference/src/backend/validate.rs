@@ -78,6 +78,24 @@ pub(super) fn require_reference_color_target(
             ),
         ));
     }
+    // G_SETCIMG is a latch and is no longer rejected when it is set, only
+    // when a primitive writes through it. This is where that lands: every
+    // drawing op passes through here, so an unsupported latched format
+    // fails at the draw with the same diagnostic it used to raise at the
+    // latch. Deferring must not become tolerating.
+    if let Some(target) = target {
+        if target.layout().is_none() {
+            return Err(render_unsupported_error(
+                "reference",
+                "render.rdp.color-image-layout",
+                format!(
+                    "{operation} draws through a G_SETCIMG format={} size={} target; \
+                     reference execution requires 8-bit intensity, RGBA16, or RGBA32",
+                    target.format, target.size
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 

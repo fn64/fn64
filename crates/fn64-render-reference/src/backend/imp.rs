@@ -697,12 +697,25 @@ impl ReferenceBackend {
                 state.dirty = true;
             }
             gbi::RenderOp::SetColorImage(target) => {
-                validate_reference_color_image(rdram, fb.height, *target)?;
+                // G_SETCIMG is a LATCH, exactly like G_SETTIMG ("Pointer +
+                // format latch only; no texel data moves until a G_LOAD*").
+                // The RDP stores format/size/width/address and reads none of
+                // it until a primitive writes through the target, so a
+                // configuration this backend cannot execute is only an error
+                // if something actually draws to it. WCW/nWo Revenge latches
+                // format=0 size=0 and the eager check aborted the frame at
+                // the latch.
+                //
+                // Deferring is not a relaxation: `require_reference_color_target`
+                // already gates every drawing op, and each now validates the
+                // latched target, so a draw through an unsupported format
+                // still fails with this same message.
+                let supported = target.layout().is_some();
                 let changes_target = state.active_target != Some(*target) || !state.target_loaded;
                 if changes_target {
-                    if let Some(previous) = state.active_target {
+                    if let (Some(previous), Some(layout)) = (state.active_target, target.layout()) {
                         let transition = previous.transition_to(*target);
-                        debug_assert_eq!(transition.to, target.layout().unwrap());
+                        debug_assert_eq!(transition.to, layout);
                     }
                     if state.depth_dirty {
                         if let Some(depth_target) = state.active_depth_image {
@@ -720,14 +733,21 @@ impl ReferenceBackend {
                             commit_color_image(rdram, previous, fb, &mut self.rdram_hidden_bits);
                         }
                     }
-                    load_color_image(rdram, *target, fb, &mut self.rdram_hidden_bits);
+                    // Only a target with a known layout can be loaded into the
+                    // framebuffer. An unsupported one is latched and left
+                    // unloaded; the pending work for the PREVIOUS target was
+                    // still committed above, so nothing already drawn is lost.
+                    if supported {
+                        validate_reference_color_image(rdram, fb.height, *target)?;
+                        load_color_image(rdram, *target, fb, &mut self.rdram_hidden_bits);
+                    }
                     if let Some(depth_target) = state.active_depth_image {
                         load_rdp_depth_image(rdram, depth_target, fb, &mut self.rdram_hidden_bits)?;
                     }
                     state.dirty = false;
                 }
                 state.active_target = Some(*target);
-                state.target_loaded = true;
+                state.target_loaded = supported;
                 state.saw_explicit_target = true;
             }
             gbi::RenderOp::SetDepthImage(target) => {
@@ -858,7 +878,14 @@ impl ReferenceBackend {
             }
             gbi::RenderOp::FullSync => {
                 if state.dirty {
-                    if let Some(target) = state.active_target {
+                    // `dirty` is only set by a drawing op, and every drawing
+                    // op rejects an unsupported latched target before it can
+                    // set it -- so a dirty framebuffer always has a layout.
+                    // Filtering rather than unwrapping keeps that an
+                    // invariant rather than a panic if it ever stops holding.
+                    if let Some(target) =
+                        state.active_target.filter(|t| t.layout().is_some())
+                    {
                         commit_color_image(rdram, target, fb, &mut self.rdram_hidden_bits);
                     }
                     state.dirty = false;
@@ -884,7 +911,10 @@ impl ReferenceBackend {
             .as_ref()
             .ok_or(RenderError::NotReady("create() not called"))?;
         if state.dirty {
-            if let Some(target) = state.active_target {
+            // See the FullSync commit: a dirty framebuffer always has a
+            // supported layout, because drawing through an unsupported
+            // latched target is rejected before it can dirty anything.
+            if let Some(target) = state.active_target.filter(|t| t.layout().is_some()) {
                 commit_color_image(rdram, target, fb, &mut self.rdram_hidden_bits);
             }
         }
