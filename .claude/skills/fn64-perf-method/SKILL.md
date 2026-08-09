@@ -116,6 +116,30 @@ bucket*, because **a child exceeding its parent** was the only signal that fired
 on the third; and **a label that is 95% something else is a wrong measurement
 wearing a plausible name.**
 
+**A frozen log is not a dead process; a rising CPU TIME is the only liveness
+check.** A run reported as "a quarter through, ~75 minutes left" had in fact
+been dead for 29 minutes — read from a log mtime. This route writes only on
+controller edges and heartbeats, so a quiet log is normal. **`ps` with an
+exact match plus an advancing `TIME` column is the check**, and it costs a
+second. Related: `pgrep -f "release/wm2000-block-boot"` returns 2 with **zero**
+benchmarks running because it matches your own monitoring shells — use
+`pgrep -x`.
+
+**And when a run dies, "cause unknown" beats a mechanism that fits.** The agent
+whose run was killed inferred a harness reap: plausible, self-consistent, and
+wrong — **the coordinator had restarted a run he did not own**, three drivers
+collided, and killing the duplicates took the original down with them. There
+was no direct evidence of a reap, only a dead run and an exited waiter, and a
+mechanism was built to fit. *A mechanism that explains the evidence is not
+thereby the cause.* Ask before diagnosing someone else's process death.
+
+**The coordination rule this violated is primary and worth stating alone:
+one owner per run.** Three agents were told to route machine access through a
+single coordinator so concurrent restarts could not happen; the coordinator
+then restarted an agent's run without checking whether it was already
+restarting. **Cost: ~40 minutes and two dead A/Bs.** If you did not start it,
+do not restart it — ask the owner.
+
 **6c. Match the probe's LAYER to the property's layer.** Three attempts to
 verify one claim, all returning clean zeros, all meaningless — and the speed and
 agreement made them convincing:
