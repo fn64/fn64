@@ -2935,6 +2935,83 @@ his *variance*. Two consequences:
    sequence dump armed in the shell, since the smoothing is what makes the
    windowed data ambiguous in the first place.
 
+#### PRE-REGISTERED, before the windowed run: what would make these the SAME phenomenon
+
+Written before seeing any windowed per-field data, because I have already
+reported a difference and the risk is now **finding whatever structure confirms
+it.** The headless signature is unusually sharp, which makes a numeric falsifier
+possible rather than a judgement call:
+
+| headless signature | value |
+|---|---:|
+| lag-1 autocorrelation of per-field cost | **−0.995** |
+| lag-2 autocorrelation | **+0.995** |
+| longest run of same-mode fields | **1** (of 4000) |
+| fields carrying a gfx submit, HIGH cluster | 2000/2000 |
+| fields carrying a gfx submit, LOW cluster | 0/2000 |
+| cluster gap / next-largest gap | 38.63 / 1.79 = **22x** |
+
+**I will call the windowed data the SAME phenomenon if, at per-field
+resolution, it shows:**
+
+1. **lag-1 autocorrelation more negative than −0.7** with lag-2 positive — i.e.
+   genuine alternation rather than drifting regimes; **and**
+2. **median run length of 1-2 fields** (max run under ~5), not the tens-of-
+   seconds stretches the 60-frame windows implied; **and**
+3. **a graphics submit predicting the slow cluster at >90%** — the mechanism
+   has to be the same mechanism, not merely a similar shape; **and**
+4. **a largest-gap-to-next-gap ratio above ~5x**, showing separated clusters
+   rather than a continuum.
+
+**All four.** Any single one can appear by coincidence in a bimodal-looking
+series.
+
+**I will call them DIFFERENT if the windowed data shows** lag-1 near zero or
+positive, runs of many consecutive slow fields, a weak or absent gfx-submit
+predictor, or a continuum with no dominant gap — **any of which is
+incompatible with the headless mechanism.**
+
+**And the outcome I must not paper over:** if the windowed data is *neither* —
+some alternation but weak, or clean clusters with a different predictor — then
+**I do not know**, and the honest report is a third measurement, not a verdict
+nudged toward the answer I already published. The temptation will be to read a
+lag-1 of −0.5 as "basically alternating"; the threshold above exists so that I
+cannot.
+
+**A methodological caveat that applies whatever the result:** the windowed lane
+adds blit and present cost the headless lane excludes, so its per-field costs
+are *this plus presentation* and are not directly comparable in magnitude. The
+four tests above are all about **structure**, not level, precisely for that
+reason.
+
+#### PRE-REGISTERED, before the DPC census: what "a lot of work" vs "slow work" looks like
+
+`gfx_lle_rdp_ns` is **26.4 ms/field** and spans the whole RDP seam, copies
+included. Writing the interpretation thresholds down first, because rule 12's
+converse trap is real: **having been told a large byte count is not a
+bottleneck, the reflex is to accept any large work count as justifying the
+time.**
+
+The N64's RDP fills roughly **one pixel per cycle** at 62.5 MHz — about
+**16 ns per pixel**, and a 320x240 frame is 76,800 pixels, so a single
+unoverdrawn full-screen pass is ~1.2 ms of *hardware* time. That is the yardstick.
+
+| if the census shows | reading | implication |
+|---|---|---|
+| **≳1.5M pixels/field** (≈20x screen overdraw) | **a lot of work** | the guest is genuinely drawing this much; per-pixel cost is near hardware-plausible and the fix is upstream (fewer primitives, less overdraw), not in the rasterizer inner loop |
+| **≲300k pixels/field** (≈4x screen) | **slow work** | ~88 ns/pixel against a ~16 ns hardware budget — **5x slower than the chip it emulates**, and the rasterizer inner loop is the target |
+| between | ambiguous | report as ambiguous and measure per-primitive cost before proposing anything |
+
+**The copies are the confound this gate exists to remove.** If subtracting the
+DPC copies leaves rasterization small, then **26.4 ms was never rasterization**
+and the target is the copy path — which is the depth-buffer lesson (rule 12)
+arriving from the opposite direction, since that one *removed* 5.92 GB of
+copying for **+0.84%, the wrong way**.
+
+**No optimization will be proposed before this lands**, and none on
+`ReferenceBackend` at all until the RT64 comparison settles which rasterizer the
+number describes.
+
 ### MEASURED: `resume NET` is 73% GRAPHICS, 21% guest code. The RDP alone is 26.4 ms — 1.6x the whole budget.
 
 Measured 2026-08-08 at `6faca4e` + this instrument, `render-benchmark.zsh` at its
@@ -3001,8 +3078,89 @@ per-instruction path. Absolutes here are corrected by control/armed = 0.9950.
 **RDP rasterization alone is 26.4 ms/field on the population that fails the
 bar — 1.58x the entire 16.667 ms budget.** Reduce translated guest code,
 the mirror, the journal, the dispatch machinery and audio *all to zero* and the
-slow field still costs ~28 ms. **Nothing outside graphics can reach 60fps on
-this route.**
+slow field still costs ~28 ms.
+
+**And the converse holds too, which I originally missed: zero the GRAPHICS and
+the field is still 21.5 ms — 1.29x the budget.** See "AN INFINITELY FAST
+RENDERER STILL MISSES 60FPS" below. **Neither half alone reaches the bar.**
+Graphics is the larger of the two and the only one that can be attacked without
+touching correctness apparatus, but a graphics-only fix lands at ~1.29x, not at
+60fps.
+
+> **SCOPE, AND IT IS LOAD-BEARING — this route uses the SOFTWARE rasterizer.**
+> The log line is `registered reference renderer`. The owner runs **RT64**, and
+> a hardware backend may collapse the 26.4 ms entirely. **Two things follow, and
+> the second is the one to hold onto:**
+>
+> 1. *"RDP is the target"* is **conditional on the reference backend** and is
+>    not yet established for the configuration that ships. A re-run under
+>    `FN64_RENDER=rt64` settles it and is in flight.
+> 2. **But see below — it does not matter as much as it looks, because an
+>    infinitely fast renderer still misses the bar on this route.**
+>
+> Do not optimize `ReferenceBackend` on the strength of this section. Sizing a
+> target from the wrong configuration is rule 11's error one level up — the
+> right number for a route nobody runs.
+
+#### AN INFINITELY FAST RENDERER STILL MISSES 60FPS. Host-side alone is 1.29x the budget.
+
+> **CORRECTED IN PLACE. I first wrote that the non-graphics rows "sum to well
+> under the budget" and that therefore the shape of the answer survives the
+> renderer question. That was wrong, and it was wrong in the direction of
+> comfort — I asserted a sum without computing it.** The correct figure inverts
+> the conclusion, so the error is left visible rather than swapped out.
+
+Set graphics to **exactly zero** and take everything else in `executor_ns`:
+
+| row | rep1 | rep2 |
+|---|---:|---:|
+| translated guest code | 9.528 | 9.462 |
+| **mirror boundary** | **8.848** | **8.797** |
+| invalidate writes | 2.018 | 1.961 |
+| PARKED | 0.574 | 0.563 |
+| other OS-call work | 0.248 | 0.242 |
+| devtime | 0.246 | 0.243 |
+| guards + residual + small phases | 0.138 | 0.135 |
+| **HOST-SIDE TOTAL** | **21.554** | **21.361** |
+| **vs 16.667 ms budget** | **1.29x** | **1.28x** |
+
+Verified two independent ways per rep: by subtraction
+(`executor_ns − gfx_ns − audio_lle_ns`) and by summing the named rows. They
+agree to **0.046 ms**.
+
+**Consequences, and they redirect the effort again:**
+
+1. **"Fix the RDP" cannot reach 60fps on this route no matter how it lands.**
+   Even if RT64 collapses rasterization to zero, the field is ~21.5 ms. The
+   renderer question decides *how far over* the bar we are, not *whether*.
+2. **The mirror is back, and it is now the second-largest line in the program**
+   at 8.85 ms — **41% of the host-side cost**, and 53% of it once translated
+   guest code is set aside. Tonight's null A/B (`+0.145 ± 0.365`) says it cannot
+   be *gated* away for free; it does not say it cannot be made cheaper. That is
+   a different question and it has not been asked.
+3. **Both halves have to fall.** Graphics must come down *and* host-side must
+   come down by ~5 ms. Neither alone is sufficient, which is a materially
+   different plan from "find the one bottleneck".
+
+**The methodological point, which is why this is recorded at length:** the
+original sentence had every individual number right and the conclusion wrong,
+because **"these are small" was asserted over a list instead of summed.** Three
+figures that each look modest against a 45 ms parent — 9.53, 8.85, 2.31 —
+total 1.29x a 16.667 ms budget. **A share of the wrong denominator is not a
+size.** The parent here is the *field budget*, not `resume NET`, and every row
+in a decomposition has to be checked against the denominator the decision uses.
+
+#### And the WORK behind the 26.4 ms is not yet measured
+
+`gfx_lle_rdp_ns` spans the **whole** RDP seam, copies included
+(`dpc_copy_census.rs:14-27`). So 26.4 ms is *time*, and nothing here says
+whether it is **many primitives** or **slow per primitive** — which need
+opposite fixes. `rsp_steps_gfx` read `NO DATA` on these runs because
+`FN64_DPC_COPY_CENSUS` was off.
+
+**That gate must be armed before any optimization is proposed.** This is rule 12
+exactly: a large number is not a bottleneck until you know what work produced
+it, and the depth-buffer case already cost a day by skipping that step.
 
 #### Does this contradict the closed RSP line? No — it NARROWS it, and that is worse.
 

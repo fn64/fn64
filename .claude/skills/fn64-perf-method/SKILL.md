@@ -146,6 +146,18 @@ program 3.25% slower.
 
 ## Reading a number
 
+**32. A share of the wrong denominator is not a size — SUM the list, do not eye
+it.** Having decomposed a 45.7 ms parent, I wrote that the non-graphics rows
+"sum to well under the budget" and concluded the answer survived the renderer
+question. Every individual number was right; **the sum was never computed.**
+9.53 + 8.85 + 2.31 + … = **21.55 ms = 1.29x a 16.667 ms budget** — so an
+infinitely fast renderer still misses 60fps, the opposite conclusion. Rows that
+look modest against their decomposition's parent can exceed the parent the
+*decision* uses. **Check every row against the denominator the decision uses
+(here the field budget, not `resume NET`), and add the numbers up in a tool.**
+Corollary: when you catch this, the "X is the bottleneck" framing usually
+becomes "both halves must fall", which is a materially different plan.
+
 **10. State both ratios, or you have said nothing.** *Wall ms per emulated VI
 field* (target 16.667) and *wall-versus-virtual* (target 1.000x) are different
 questions. They diverge whenever the guest does not emit fields at its nominal
