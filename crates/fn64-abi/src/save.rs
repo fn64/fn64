@@ -165,6 +165,25 @@ unsafe fn copy_from_guest(storage: fn64_runtime::RdramPtr, addr: RdramAddr, len:
     bytes
 }
 
+/// Copy save-device bytes into the guest's destination buffer, declaring the
+/// span to the canonical mutation journal.
+///
+/// The declaration is not bookkeeping. Every other writer of guest RDRAM
+/// already announces itself -- guest stores through `notify_cpu_instruction_
+/// store`, DMA through `notify_committed_dma_write` -- and a host adapter that
+/// writes without declaring is invisible until the next dispatch trips
+/// "executable mutation ... outside every attributed writer declaration"
+/// naming an address and no writer.
+///
+/// This path reached that tripwire once `osFlashReadArray` was bound as a host
+/// shim: it copies whole 128-byte pages into a guest buffer, and the only
+/// declaration in flight was the twelve-byte queue post from
+/// `post_flash_completion`, so the page landed unattributed. The EEPROM long-
+/// read path shares this helper and had the same latent gap; it simply had not
+/// yet written into a watched executable range.
+///
+/// Declaring here rather than at each call site keeps the guarantee with the
+/// bytes: every caller of this helper is attributed by construction.
 unsafe fn copy_to_guest(storage: fn64_runtime::RdramPtr, addr: RdramAddr, bytes: &[u8]) {
     for (index, &byte) in bytes.iter().enumerate() {
         let offset = u32::try_from(index).expect("EEPROM transfer length exceeds u32");
@@ -176,6 +195,27 @@ unsafe fn copy_to_guest(storage: fn64_runtime::RdramPtr, addr: RdramAddr, bytes:
             );
         }
     }
+    #[cfg(feature = "recomp-rs")]
+    if let Ok(len) = u32::try_from(bytes.len()) {
+        if len > 0 {
+            fn64_recomp_rs::notify_host_abi_write(addr.offset(), len);
+        }
+    }
+}
+
+/// Declare a host-adapter write of `len` bytes at `addr` to the canonical
+/// mutation journal.
+///
+/// Companion to [`copy_to_guest`] for the shims that write typed fields
+/// directly rather than copying a buffer. Same reasoning: an undeclared host
+/// write is invisible until a later dispatch reports an unattributed mutation.
+fn declare_guest_write(addr: RdramAddr, len: u32) {
+    #[cfg(feature = "recomp-rs")]
+    if len > 0 {
+        fn64_recomp_rs::notify_host_abi_write(addr.offset(), len);
+    }
+    #[cfg(not(feature = "recomp-rs"))]
+    let _ = (addr, len);
 }
 
 /// `osEepromProbe(OSMesgQueue *mq) -> s32`. The public type codes are 1 for
@@ -450,6 +490,8 @@ pub unsafe extern "C" fn osFlashInit_recomp(rdram: *mut u8, ctx: *mut RecompCont
         storage.write_u16(base.checked_add(10).unwrap(), 0);
         storage.write_u32(base.checked_add(12).unwrap(), FLASH_KSEG1_BASE);
     }
+    // The public OSPiHandle prefix this shim just wrote: bytes 0 through 15.
+    declare_guest_write(base, 16);
     unsafe { &mut *ctx }.r2 = handle as i32 as u64;
 }
 
@@ -470,6 +512,7 @@ pub unsafe extern "C" fn osFlashReadStatus_recomp(rdram: *mut u8, ctx: *mut Reco
     let status = with_host(|host| host.flash.status);
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     unsafe { storage.write_u8(destination, status) };
+    declare_guest_write(destination, 1);
 }
 
 /// `osFlashReadId(u32 *flash_type, u32 *flash_maker)`. The default values are
@@ -492,6 +535,9 @@ pub unsafe extern "C" fn osFlashReadId_recomp(rdram: *mut u8, ctx: *mut RecompCo
         storage.write_u32(type_destination, identity.flash_type);
         storage.write_u32(maker_destination, identity.flash_maker);
     }
+    // Two independent guest pointers, so two declarations rather than a span.
+    declare_guest_write(type_destination, 4);
+    declare_guest_write(maker_destination, 4);
 }
 
 /// `osFlashClearStatus(void)`. Clearing the retained DQ5/DQ4 failure bits
@@ -1084,6 +1130,111 @@ mod tests {
         assert_eq!(
             u32::from_ne_bytes(rdram[0x44..0x48].try_into().unwrap()),
             identity.flash_maker
+        );
+    }
+
+    /// Every host adapter that writes guest RDRAM must declare the span.
+    ///
+    /// This is the tripwire's evidence chain, not bookkeeping: an undeclared
+    /// write is invisible until a later dispatch reports "executable mutation
+    /// ... outside every attributed writer declaration" naming an address and
+    /// no writer. `osFlashReadArray` copies whole 128-byte pages into a guest
+    /// buffer and reached exactly that failure on the No Mercy route once it
+    /// was bound as a host shim.
+    ///
+    /// Asserting on the observed declarations rather than on the copied bytes
+    /// is what makes this a regression test for the declaration, not for the
+    /// copy: the bytes were always correct.
+    #[test]
+    #[cfg(feature = "recomp-rs")]
+    fn flash_shims_declare_every_guest_span_they_write() {
+        use std::sync::Mutex;
+        static OBSERVED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+        fn record(event: fn64_recomp_rs::GuestWriteEvent) {
+            if event.channel() == fn64_recomp_rs::WriterChannel::HostAbi {
+                let (start, len) = event.range();
+                OBSERVED.lock().unwrap().push((start, start + len));
+            }
+        }
+
+        install_flash();
+        let mut rdram = vec![0u8; 0x1000];
+        OBSERVED.lock().unwrap().clear();
+        let previous = fn64_recomp_rs::set_write_observer(Some(record));
+
+        // A one-page read into a guest buffer: the shape that tripped the wire.
+        let stack = 0x40usize;
+        rdram[stack + 0x10..stack + 0x14].copy_from_slice(&1u32.to_ne_bytes());
+        rdram[stack + 0x14..stack + 0x18].copy_from_slice(&0u32.to_ne_bytes());
+        let mut read = ctx_zeroed();
+        read.r6 = 0;
+        read.r7 = 0x8000_0300;
+        read.r29 = 0x8000_0040;
+        unsafe { osFlashReadArray_recomp(rdram.as_mut_ptr(), &mut read) };
+
+        // The status and identity shims write typed fields directly.
+        let mut status = ctx_zeroed();
+        status.r4 = 0x8000_0500;
+        unsafe { osFlashReadStatus_recomp(rdram.as_mut_ptr(), &mut status) };
+
+        let mut identity = ctx_zeroed();
+        identity.r4 = 0x8000_0600;
+        identity.r5 = 0x8000_0604;
+        unsafe { osFlashReadId_recomp(rdram.as_mut_ptr(), &mut identity) };
+
+        fn64_recomp_rs::set_write_observer(previous);
+        let observed = OBSERVED.lock().unwrap().clone();
+
+        let covers = |start: u32, end: u32| {
+            observed
+                .iter()
+                .any(|(declared_start, declared_end)| {
+                    *declared_start <= start && *declared_end >= end
+                })
+        };
+        assert!(
+            covers(0x300, 0x300 + FLASH_PAGE_SIZE as u32),
+            "the read-array destination page must be declared; observed {observed:#x?}"
+        );
+        assert!(
+            covers(0x500, 0x501),
+            "the status byte must be declared; observed {observed:#x?}"
+        );
+        assert!(
+            covers(0x600, 0x604) && covers(0x604, 0x608),
+            "both identity words must be declared; observed {observed:#x?}"
+        );
+    }
+
+    /// `osFlashInit` writes the sixteen-byte public `OSPiHandle` prefix.
+    #[test]
+    #[cfg(feature = "recomp-rs")]
+    fn flash_init_declares_the_handle_prefix_it_writes() {
+        use std::sync::Mutex;
+        static OBSERVED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+        fn record(event: fn64_recomp_rs::GuestWriteEvent) {
+            if event.channel() == fn64_recomp_rs::WriterChannel::HostAbi {
+                let (start, len) = event.range();
+                OBSERVED.lock().unwrap().push((start, start + len));
+            }
+        }
+
+        install_flash();
+        let mut rdram = vec![0u8; 0x2000];
+        OBSERVED.lock().unwrap().clear();
+        let previous = fn64_recomp_rs::set_write_observer(Some(record));
+        let mut ctx = ctx_zeroed();
+        unsafe { osFlashInit_recomp(rdram.as_mut_ptr(), &mut ctx) };
+        fn64_recomp_rs::set_write_observer(previous);
+
+        let observed = OBSERVED.lock().unwrap().clone();
+        assert!(
+            observed
+                .iter()
+                .any(|(start, end)| *start <= 0x1200 && *end >= 0x1210),
+            "the OSPiHandle prefix must be declared; observed {observed:#x?}"
         );
     }
 
