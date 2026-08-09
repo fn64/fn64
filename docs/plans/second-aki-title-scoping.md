@@ -982,3 +982,208 @@ match-setup screen was written to `/tmp`, macOS reaped it, and *"that run is
 now unreproducible — it survived only as prose."* **A route recipe is evidence
 and belongs in the repository**, which is why these two schedules are
 committed. The same reaping ate the trace-producer build directory tonight.
+
+## No Mercy bring-up: five of six, and Revenge's cascade does NOT recur here
+
+WWF No Mercy (USA), normalized ROM
+`11640379fdf534b39f34678036ad8e4cdc9b80b4f2cc72411433363372123976` (the
+Unlocked variant), 2026-08-09. Every artifact below records that digest.
+
+| item | state |
+|---|---|
+| host bindings | **15/15** on this image |
+| CPU recompile | **`unsupported = 0` of 57,284 blocks / 6 banks** |
+| shard tree | **generated**, `nomercy-block-*`, 38 packages |
+| boot context | **captured**, binds `11640379…`, `entry_pc = 0x80000400` |
+| executable images | **validated**, `25b1ec80…`, 3 agreeing runs |
+| input schedule | **not needed for boot** — `FN64_CONTROLLER_SCHEDULE` is an `Option` |
+
+### The filed boot context was the wrong image, exactly as suspected
+
+`captures/WWF-No-Mercy--USA---Rev-A--boot-context.json` binds
+**`fc561fce443010b1…`**, not the ROM on disk. Its filename says "Rev A"; the
+certified image is the Unlocked variant. Re-captured to
+`captures/nomercy-11640379-boot-context.json`.
+
+**That is the fifth ROM-variant collision** in this line of work (host
+bindings, No Mercy topology, VPW2 block count, Revenge's boot context, now No
+Mercy's), and the cause has been identical every time: **an artifact filed
+under a title string rather than a ROM digest.** The new file is named for the
+digest.
+
+### Executable images: No Mercy's own, not inherited
+
+    status            validated
+    capture_count     3
+    image_id          general-exception-preamble
+    capture_pc        0x80000180
+    byte_len          16
+    image_sha256      25b1ec80d013b3c0f94f807b38d72a5f75a2dc81cb30ae5cecb903c4ec0ef690
+    authority_sha256  8a793e726804f579dec3fd579a8d2e7462764bee1e5f3a5f95e5de59a8a5acd8
+
+Three distinct preambles now measured — WM2000 `92d005d9…`, Revenge
+`64bbe2d1…`, No Mercy `25b1ec80…` — so the image is genuinely per-title and
+copying one across titles would bind the wrong bytes.
+
+### The topology, and the count the older note got wrong
+
+    generated_packages=38  title=nomercy-block-shards
+
+**5 overlays, shape [2, 2, 5, 7, 5]** = 21 overlay shards, plus 14 boot-prefix
+and 3 resident-tail shards. The overlay shape matches the 2026-08-09 note; its
+**"42 inventory entries" does not — the generator emits 38.** Trust the
+generator, and prefer counting its output to quoting a remembered figure.
+
+| | overlays | shape | inventory entries | banks |
+|---|---:|---|---:|---:|
+| WM2000 (committed) | 4 | [3, 1, 6, 8] | 37 | 5 |
+| Revenge (committed) | 2 | [4, 6] | 31 | 3 |
+| **No Mercy (generated)** | **5** | **[2, 2, 5, 7, 5]** | **38** | **6** |
+
+### The resident-tail clamp is a NO-OP on this ROM, measured before building
+
+Revenge's first boot cost four cascading failures because its overlay
+invalidation union stops 21,600 bytes short of the boot copy's end, and both
+the shard generator and `build.rs` assumed it never would. **The obvious move
+was to assume No Mercy is Revenge-shaped. It is not, and assuming so would
+have been the same error in the other direction.**
+
+Measured from the library's own recipe recovery
+(`admitted_overlay_load_recipes_v1`) rather than inferred:
+
+    split (min load_start)   0x800d9960
+    invalidation union end   0x8016da30
+    boot copy end            ~0x80100400   (fixed 1 MiB IPL3 DMA)
+
+**The union runs well PAST the bank end**, which is WM2000's geometry, not
+Revenge's — so `tail_image_end = load_end.min(union_end)` selects the bank end
+and the clamp changes nothing.
+
+Confirmed a second way, because a single derivation of a geometry fact is what
+let the off-by-one shard survive in the first place: running **both** the
+unclamped generator (`examples/wm2000-block-shards/build.rs`) and the clamped
+one (`examples/revenge-block-shards/build.rs`) against this ROM yields
+**byte-identical 38-package inventories**. Two implementations that disagree
+on Revenge agree here, which is the direct evidence that the clamp is inactive.
+
+The clamped copy was taken as No Mercy's `build.rs` source anyway. It is a
+strict generalization — it reduces to the unclamped rule exactly when the union
+reaches the bank end — so it costs nothing today and removes a class of
+surprise if this title's geometry is ever re-derived.
+
+### The two generator traps still bite, and both were reapplied
+
+Neither is title-specific and neither is fixed upstream, so a third title will
+hit them again:
+
+1. **The boot `Cargo.toml` is templated from WM2000's verbatim**, so it names
+   a `wm2000-shell` `[[bin]]` whose source does not exist, carries a
+   window/input dependency stack nothing links, and puts the
+   `[profile.release.package.*]` override on a package absent from the graph —
+   where Cargo silently ignores it. All three reapplied as Revenge's committed
+   manifest documents.
+2. **The generator emits no `build.rs`**, so `PACKAGE_PREFIX` must be
+   retargeted by hand or a leaf crate reaches `package_target` with the wrong
+   prefix and panics.
+
+`write_topology` rewrites the boot manifest from the WM2000 template on **every
+regeneration** and drops edit 1 each time.
+
+## No Mercy first boot: T3 — runs 150k+ steps, then a FlashRAM store fn64 itself pointed at
+
+Built and booted 2026-08-09, ROM `11640379…`, `FN64_RENDER=reference`,
+headless, **no controller schedule** (`FN64_CONTROLLER_SCHEDULE` is an
+`Option`). Binary `examples/nomercy-block-boot`, canonical program artifact
+`9f5ff066916d21df1debe89fc8e78488dacb15596cead357ad08cb851a9bc06c`.
+
+| tier | result |
+|---|---|
+| **T1** workspace builds | **reached** — 38 shards, `Finished release in 5m 22s` |
+| **T2** boots / first entry | **reached** — *"first-entry BootContext matches exactly"* |
+| **T3** runs without faulting | **reached then lost** — 150,000+ steps, overlay entry at 92,061 |
+| **T4** non-uniform frames | **not reached** — `gfx_submits=0` throughout |
+
+The guest is genuinely executing, not spinning: `audio_submits` climbs
+monotonically 7 → 14 across the run, `idle_steps=0` at every heartbeat, and it
+enters its first overlay generation `[0x800d9960,0x800f2940)` at step 92,061.
+
+### The failure, which is fn64's and not the title's
+
+    canonical catalog stopped on non-architectural guest fault:
+    CpuFault { at: ExecutionKey { bank: BankId(6054620885710679290),
+                                  pc: GuestPc(0x8003d518) },
+               kind: MemoryFault { addr: 0xffffffffa8010000 } }
+
+**Deterministic** — identical PC, fault address, step (92,061) and `sim_time`
+across two runs.
+
+`0xA8010000` masks to physical `0x0801_0000`, inside **`PI_DOM2_ADDR2`
+(`0x0800_0000..=0x0fff_ffff`) — the SRAM/FlashRAM save-media window**
+(`pi/mmio.rs:167`).
+
+Disassembling the trapping instruction identifies it as a save-media register
+write helper, a five-instruction leaf:
+
+```text
+0x8003d508  8c82000c   lw   $2, 0xc($4)     load a base out of a struct
+0x8003d50c  3c03a000   lui  $3, 0xa000      KSEG1 uncached mask
+0x8003d510  00451025   or   $2, $2, $5      add the offset
+0x8003d514  00431025   or   $2, $2, $3      force uncached
+0x8003d518  ac460000   sw   $6, 0x0($2)     <-- THE TRAPPING STORE
+0x8003d51c  03e00008   jr   $ra
+```
+
+**The base it loads at offset `0xc` is one fn64 wrote itself.**
+`save.rs:451` — inside `osFlashInit_recomp` — does
+`storage.write_u32(base + 12, FLASH_KSEG1_BASE)` with
+`FLASH_KSEG1_BASE = 0xA800_0000` (`save.rs:39`). So the ABI hands the guest an
+`OSPiHandle` containing that pointer, the guest reads field `0xc` back and
+stores through it, and **the memory path then refuses the store.** The two
+halves of fn64 disagree about whether that address is addressable.
+
+The mechanism is a missing arm, not a wrong value: `write_raw_mmio_word`
+(`pi/timing.rs:169`) handles PIF RAM and live device MMIO and has **no
+save-media window case at all**, so the store returns `false`, is not backed
+RDRAM, and surfaces as an anonymous unbacked-memory fault. Its read sibling has
+the same gap in the other direction — `cartridge_rom_window_offset`
+(`timing.rs:35`) accepts only `PI_DOM1_ADDR2`, the cartridge ROM.
+
+**This is a recurrence of a defect class the file already documents.**
+`timing.rs:44-52` records exactly this shape for the N64DD window: a region
+reachable by PI *DMA* but not by *programmed CPU access*, surfacing as
+`MemoryFault { addr: 0xffffffffa6000000 }` — *"a message that says nothing
+about which device is missing."* Same sentence applies here with `a8010000`.
+
+### Why this was not fixed in the same session, deliberately
+
+The save window differs from the N64DD case in a way that matters: the N64DD
+fix could encode "no ASIC answered" as zero because *no control flow depends on
+the value*. FlashRAM is a **command sequencer** — stores into its window are
+commands (erase, page-write, status-read) whose ordering and status effects the
+guest does branch on, and `save.rs` already models that sequencer for the shim
+path. Wiring the CPU-store path to it is a real ABI change needing its own
+tests, and **guessing the semantics would fabricate hardware behaviour** — the
+error `timing.rs:56-63` names when it refuses to invent an open-bus value.
+
+**What the next session needs** is a `PI_DOM2_ADDR2` arm in
+`write_raw_mmio_word`/`read_raw_mmio_word` routed to the existing
+`crate::save` FlashRAM state, plus the decision of whether this title uses
+FlashRAM or SRAM at that base. The fault names the exact call site, so this is
+scoped rather than exploratory.
+
+### One trap worth recording, because it cost the Revenge re-run a result
+
+**Without `FN64_BLOCK_CONTINUE_AFTER_OVERLAY` set, the boot binary breaks at
+first overlay entry and exits 0** (`main.rs:1259`), having rendered nothing.
+`render-benchmark.zsh:184` exports it, so the scripted lane never sees this and
+a hand-rolled invocation does. The failure presents as **rc=0 with a
+progress-shaped log line** — nothing says "stopped early on purpose". The
+check that distinguishes a real run is `gfx_submits`, never the exit code.
+
+### A filename that will lie again
+
+The reference backend's dump prefix is the hardcoded literal
+`"fn64-wm2000-block"` (`main.rs:827`) for **every** title, so No Mercy's PNGs
+would land named `fn64-wm2000-block-NNNN.png`. Given that title-string filing
+has now caused five ROM-variant collisions in this session, any frame committed
+from a non-WM2000 title must be renamed and filed under its ROM digest.
