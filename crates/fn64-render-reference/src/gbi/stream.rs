@@ -283,6 +283,15 @@ pub(super) fn decode_stream_impl(
                 // Public gDPNoOpTag deliberately carries an arbitrary tag in
                 // w1. The untagged macro is the same command with tag zero.
             }
+            // RDP command ids 0x01..=0x07 are the rest of the low No
+            // Operation block that 0x00 opens: one command word, no state
+            // change, one stalled pipeline cycle. The guard is load-bearing --
+            // in the NON-raw GBI lane these same bytes are G_VTX (0x01),
+            // G_MODIFYVTX, G_CULLDL, G_BRANCH_Z, G_TRI1, G_TRI2 and G_QUAD
+            // (0x07), so an unguarded arm would silently swallow geometry.
+            // Unlike G_NOOP no public macro fixes the payload, so nothing is
+            // asserted about the low 24 bits or w1; the RDP ignores them.
+            0x01..=0x07 if raw_rdp => {}
             G_SPNOOP => {
                 assert_eq!(
                     w0 & 0x00ff_ffff,
