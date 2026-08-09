@@ -662,3 +662,50 @@ number.** Recording it rather than picking the one that suits: a figure in a
 doc and a figure from a generator disagreeing is exactly the shape that cost
 this project a day, and the generator's output is at least reproducible from a
 named ROM.
+
+## The topology discrepancy, narrowed (2026-08-09)
+
+Recounted both sides with the *record's* counting method — overlay shards only,
+not total inventory entries. My earlier "42 entries vs 24" compared different
+quantities and was not a like-for-like disagreement.
+
+**Validated the method against ground truth first.** The record says WM2000 is
+`[3, 1, 6, 8]` total 18, and the committed `shard_inventory.in` counted that way
+gives exactly `[3, 1, 6, 8]`. **So the record's counting is correct and the
+method reproduces it.**
+
+Applying the same count to the generated No Mercy tree:
+
+| | overlay-0 | 1 | 2 | 3 | 4 | total |
+|---|---:|---:|---:|---:|---:|---:|
+| recorded | 3 | 3 | 5 | 8 | 5 | **24** |
+| generated | 2 | 2 | 5 | 7 | 5 | **21** |
+| delta | −1 | −1 | 0 | −1 | 0 | **−3** |
+
+**Every overlay differs by exactly 0 or 1, never more.** That is the signature
+of an off-by-one in tiling or a boundary/rounding difference — not two different
+analyses of the ROM, and not the wrong ROM. Three overlays lost one shard each;
+two are unchanged.
+
+**Still unresolved, and now cheap to resolve.** Candidates, in the order I would
+check them:
+
+1. **A tiling change landed between the record (2026-08-07) and now.** The
+   shard-count derivation at `examples/wm2000-block-shards/build.rs:312` is
+   per-generation; a change to `SHARD_BYTES` or to `div_ceil` boundary handling
+   would move exactly the overlays whose extent is near a shard boundary and
+   leave the others alone — which is the pattern observed.
+2. **ROM variant.** The record predates the Unlocked-vs-Rev-A finding, and the
+   host-binding result was filed under a title string rather than a digest.
+   **But note WM2000 reproduces exactly**, so the deriver is not generally
+   drifting — this would have to be a No-Mercy-specific extent difference.
+3. **The record was computed by a different code path** than
+   `package_inventory()`.
+
+**The decisive test is cheap:** re-derive WM2000's overlays from the *current*
+generator and compare against the committed inventory. If current-WM2000 also
+comes out one-short on some overlays, hypothesis 1 is confirmed and the
+*record* is stale, not the generator. I did not run it — the generated WM2000
+tree I diffed earlier was byte-identical to committed, which already argues
+against hypothesis 1, so hypothesis 2 or 3 is more likely. **Stated as
+unresolved rather than concluded.**
