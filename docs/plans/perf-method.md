@@ -1492,6 +1492,70 @@ the real tree before trusting it to gate a measurement — and prefer a
 construction whose failure mode is a crash over one whose failure mode is an
 empty result set, because empty reads as "clean" (rules 18 and 19).
 
+### 29. FREEZE a log before analyzing it — a file still being written is not a population
+
+Earned 2026-08-08, by two agents reaching opposite conclusions about the same
+data and each retracting in turn. In rule 11's family: **a distribution needs a
+fixed population, and a log a process is still appending to is not one.**
+
+The owner left a windowed shell running. Two of us analyzed its heartbeat log
+minutes apart. Successive extractions of "the same" file returned
+**n = 117, 131, 151, 164, 172, 173, 183** — one growth curve, sampled at
+whatever moment each command ran.
+
+**The symptom is what makes this worth a rule, because the natural inference
+from it is wrong.** Two agents extract the same log and get different `n`. A
+differing count is exactly what a *wrong-key extraction* produces — and in this
+very log the keys invite it, since each heartbeat carries two distributions one
+space apart:
+
+```
+frame_interval_ms[n=60 p50=42.8 p95=71.8 ...]   pump_ms[n=60 p50=22.9 p95=69.0 ...]
+```
+
+So the count difference was read as a key-binding bug (rule 24's family,
+*"WHICH LINE the counter comes from is part of the counter"*), a hypothesis
+made more plausible by that error having cost 75 minutes earlier the same day.
+It produced a confident "you mixed two metrics" correction against an
+extraction that was in fact correctly anchored to `pump_ms[`, and a retraction
+of a real finding. **A recent expensive lesson makes its own error shape the
+first hypothesis reached for, whether or not it fits.**
+
+The remedy is mechanical:
+
+```zsh
+SNAP="$CLAUDE_JOB_DIR/tmp/frozen-$(date +%H%M%S).log"; cp "$LIVE_LOG" "$SNAP"
+```
+
+**Then cite the snapshot path in every claim derived from it.** Two agents
+citing the same frozen path cannot silently disagree about the population; two
+agents citing "the log" routinely will.
+
+**A second finding fell out of the freeze, and it is the one that mattered.**
+Recomputed on a fixed n=183, the claimed distribution was wrong in the
+direction of neatness: asserted bimodal with a "clean empty gap, essentially
+nothing lands there", it is actually **trimodal** — a tight cluster at
+11.0-11.9 (14%, plausibly the pacing clamp, rule 14), a broad one at 16.8-29.4
+(60%), and a broad one at 35.9-67.9 (27%) — and the gap called clean is 6.5 ms,
+the largest of **seven** gaps wider than 2 ms in the series. With n=183 over a
+57 ms range, gaps that size occur by chance. The moving file hid the third
+cluster (the early snapshot was too small to show it) and the rhetoric did the
+rest. **"Essentially nothing lands between" is a claim about a density, and it
+needs the gap compared against the other gaps in the same series.**
+
+**Related, and it is the caveat most likely to be skipped:** those values were
+p50s of 60-frame windows. *"The game gets slow for a few seconds"* and *"the
+emulator has multiple operating regimes"* produce identical multimodality at
+that resolution and are entirely different findings. **A smoothed series cannot
+distinguish them; raw per-field data can** (`FN64_FRAME_CENSUS_SEQUENCE`). Say
+which one you have before reporting a mode.
+
+The design consequence generalizes past logs: **do not hard-code a threshold
+derived from a distribution you have already revised once.** A regime split
+with a constant in it bakes the current guess into the instrument. Dump the
+per-field series and cluster afterward — same code, no constant, and it cannot
+encode a prior that turns out wrong.
+
 ### 28. Check WHICH POPULATION a candidate pays into before sizing it
 
 Earned 2026-08-08. The strongest-looking optimization target of the session was
@@ -1613,6 +1677,77 @@ yields a full, healthy-looking run with the decomposition silently absent.
 `FN64_EXECUTOR_SPLIT=1` imply the population report, since the split is
 useless without it — a gate whose stated purpose cannot be achieved by setting
 it alone is a gate with a missing dependency, not a user error.
+
+**Now FOUR, as of 2026-08-08.** Splitting `resume NET` adds
+`FN64_RESUME_SPLIT=1`, which is likewise reported from inside the population
+report and is therefore subject to the same trap:
+
+```
+FN64_PHASE_TIMING=1  FN64_EXECUTOR_SPLIT=1  FN64_FRAME_CENSUS_POPULATIONS=1  FN64_RESUME_SPLIT=1
+```
+
+The separation is deliberate rather than an oversight repeated — a third-level
+timer in the hottest loop must be independently disarmable so its own
+perturbation can be measured by running the level above it alone. But it makes
+the dependency problem worse, so two things now mitigate it: `[resume-split]`
+prints its own **NOT ARMED** line distinguishing *absent* from *zero*, and
+`[frame-populations]`, `[executor-split]` and `[resume-split]` are all in
+`render-benchmark.zsh`'s allowlist so those warnings survive the filter.
+**Verify all four are live in the unfiltered log before the warmup completes,
+not after the run finishes.**
+
+### 30. A WAIT is a workload: polling for a quiet machine keeps the machine busy
+
+Earned 2026-08-08 by two agents simultaneously, and it is rule 26 one step
+further down. Rule 26 says a *probe* is a benchmark — bounded, one-shot, feels
+cheap. **A polling loop is unbounded and it compounds.**
+
+The symptom, and it is what makes this recognizable in the moment:
+
+> **Load stays high with zero builders and zero benchmarks running.**
+
+That reads as *"something invisible is running"*, and the natural response is to
+hunt for a leftover build — which is more polling. One command names it:
+
+```zsh
+ps -Ao comm | grep -c sleep
+```
+
+It returned **19**. An agent waiting to start a benchmark had armed `until
+<cond>; do sleep N; done` loops for the build, then the artifact, then the load
+threshold, then the smoke run — several of them *nested*, waiting on other
+waiters' output files. They accumulated faster than they retired. Meanwhile the
+coordinating agent had four more armed against the same machine, because every
+status update it had given the owner all evening was backed by a poll, and it
+had never counted its own waiters as load.
+
+The route script's `--max-load 3.0` guard refused to start. Load would not fall
+below 3.4 with no compiler on the box. Killing the redundant waiters took it to
+2.73 immediately and the run started.
+
+**The dangerous property is that it is self-obscuring.** The load number was
+being read *to decide whether to start*, and the reading apparatus was moving
+the number being read. Every "not yet, wait longer" decision spawned another
+waiter and pushed the threshold further away — **a control loop with the wrong
+sign.**
+
+Two operational clauses, which are the whole rule:
+
+- **One waiter at a time, chained not nested.** Put the wait and the work in a
+  single background command — `until <load clears>; do sleep 15; done; <run the
+  thing>` — so the waiter *becomes* the run and nothing accumulates. Never a
+  waiter on load, plus a waiter on that waiter, plus a poll to check on both.
+- **Never poll a metric your polling affects.** If you must sample load, sample
+  it rarely and from one place, and prefer waiting on an *artifact*
+  (`until [[ -x "$BIN" ]]`) over waiting on a *machine state*.
+
+Corollary for coordinators: reading an agent's log files is cheaper than `ps`,
+and asking the agent is cheaper still. Several slow pollers are worse than one.
+
+**And do not override the guard to escape your own contention.** The temptation
+at load 3.4 with no build running is to pass `--max-load`. That is the "edit the
+gate to match the run" move; the guard was enforcing rule 4 and the statistic
+being measured was a *tail*, which is what contention distorts most.
 
 ### 26. A diagnostic probe is a benchmark: cheap-feeling commands slip past the gate
 
@@ -1946,6 +2081,35 @@ other. The generalization is the point: a query that cannot distinguish
   itself**, this one **matched something unrelated**. Same root cause — a
   process query that cannot distinguish the thing it means from a string that
   merely contains it.
+
+- **A `pgrep -f` that UNDER-matched reported a live build as finished — and
+  this is the dangerous direction.** Waiting on a cold 32-crate build,
+  `pgrep -f "cargo build --release --bin wm2000-block-boot"` returned nothing
+  while **15 `rustc` processes were compiling**, and the waiter printed
+  `BUILD PROCESS EXITED`. Two reasons it missed, both structural rather than a
+  typo: cargo's real argv is not the command line you typed, and **the actual
+  compile work lives in `rustc` children whose argv never contains your
+  string at all.**
+
+  Every other entry in this rule over-matches, which is self-limiting — an
+  over-match reads as "still busy" and costs you a wait. **An under-match reads
+  as "finished", and "finished" is acted on.** The next step after it was to
+  inspect a nonexistent binary and conclude the build had failed; a `ps` listing
+  showing 15 `rustc` with advancing CPU time is what stopped that.
+
+  **Remedy: wait on the ARTIFACT, not on a process.** `until [[ -x "$BIN" ]]`,
+  or a completion marker your own wrapper writes, plus an error-pattern check so
+  the loop has a terminal state on failure too:
+
+  ```zsh
+  until [[ -x "$BIN" ]] || grep -q "=== build done" "$LOG" \
+     || grep -qE "^error(\[|:)" "$LOG"; do sleep 15; done
+  ```
+
+  Confirm liveness with CPU time summed across `rustc`, sampled twice — never
+  with the absence of a `pgrep` hit. **Absence of a match is not evidence of
+  absence** (rules 19 and 23, and the glob entry two bullets up is the same
+  shape in a different tool).
 
   **The remedy generalizes: match on the anchored BASENAME, never a substring
   of the full command.** Strip the directory (`sub(/.*\//,"",n)`) and compare
@@ -2378,6 +2542,40 @@ a **~2.1M-step** route. At 1.5M steps this route ends at `gfx_submits=11153`,
 `audio_submits=7685`, `sp_tasks=18838`, `vi_interrupts=8386`,
 `controller_ops=2390`, `sim_time=13112786076`, `render_error=None`.
 
+**WHICH LINE the counter comes from is part of the counter.** A later agent
+checked this tuple with a script that scanned the whole run log and took the
+last `key=value` match. That manufactured a **phantom 303-submit deviation** in
+`gfx_submits` and cost **three 25-minute attribution runs** before the script
+itself was suspected. Both numbers are in every log, as different metrics:
+
+```
+[wm2000-block-progress] ... gfx_submits=11153 ...     <- run total (the tuple)
+[frame-census] steady-state rendering evidence:
+                  gfx_submits=10850 across the span   <- warmup excluded
+```
+
+The 303 gap is exactly the fields excluded by `warmup_gfx=300`. Same key, same
+log, two legitimate meanings, and the census line comes second.
+
+Same family for two more counters in that tuple: `sim_time` also appears on
+every heartbeat (only the `done:` line is the end-of-run value), and `fields`
+is ambiguous between `total_fields=8295`, `transient_fields=595` and
+steady-state `fields=7699`. **Anchor every counter to a named line; never
+free-text scan a log for a bare key.**
+
+Three generalizations, each earned by this:
+
+- **Proving a check can fail is not proving it reads the right thing.** The
+  script had been tested against an injected wrong *value* and caught it. It was
+  never tested for reading the wrong *line* — rule 6a done halfway.
+- **Agreement across runs is not validity when every run shares one
+  instrument.** Four binaries agreeing on the phantom looked like strong
+  corroboration; it was one parsing bug reproduced four times (rule 23's shared
+  blind spot, in a new place).
+- **A comment is not a verification.** The offending line was annotated
+  `# last occurrence wins: the summary line is emitted at end of run` — an
+  assumption written down and never checked.
+
 **The gate was NOT redefined to match what the run produced.** That would make
 every future comparison meaningless — a gate rewritten to fit its own result is
 not a gate. Instead: the A/B's validity rests on lanes A and B being identical
@@ -2521,6 +2719,313 @@ the bar. **The 60fps bar is won or lost inside translated guest code and the
 runtime it calls synchronously, and nothing in the apparatus can reach it.**
 
 Arm it with all three gates (rule 27) and read the **slow** row (rule 28).
+
+> **CORRECTION 2026-08-08 to the list above, found while instrumenting it.**
+> The components named are right, but a reader assembling "what is inside
+> `resume NET`" from this section plus the phase-timing counters will reach for
+> `vi_present_ns` as a fourth item, and **it does not belong**: VI presentation
+> is not inside `executor_ns` at all. See "VI PRESENTATION IS OUTSIDE
+> `executor_ns`" below. `gfx_ns` and `audio_lle_ns` genuinely are nested inside
+> the dispatch call — the guest reaches both by writing SP registers, which
+> lands in `task_dispatch::rsp_commit` on the guest's own stack.
+
+#### FOUND WHILE READING: VI presentation is OUTSIDE `executor_ns`, and telemetry double-subtracted it
+
+Recorded before the confirming run, so the claim is judged against a
+prediction rather than fitted to a result.
+
+`present_render_backend` (`task_dispatch/setup.rs:478`) has **exactly one call
+site**: `pi/timing.rs:703`, inside `advance_device_time_step`. That is reached
+from `advance_device_time`, which has two callers:
+
+| caller | inside `executor_ns`? |
+|---|---|
+| `host::run_one_step` (`host.rs:403`) | yes — this is the `exec_devtime_ns` bucket |
+| `host::advance_virtual_time` (`host.rs:40`) | **no** — the harness's own loop |
+
+`advance_virtual_time` is called only from `fn64-boot-harness`
+(`lib.rs:1039`, `:1340`), which the harness reaches on its **`AdvanceField`**
+arm (`main.rs:1259`, `shell.rs`), never inside `run_one_step`. So presentation
+runs on the harness side of the seam and was never counted into `executor_ns`.
+
+**Three independent lines agree**, and the third is the strongest because it is
+arithmetic rather than structure:
+
+1. the call graph above;
+2. `exec_devtime_ns` measures **0.251 ms/field** on the slow row while
+   `vi_present_ns` is ~**1.14 ms/field** — presentation cannot fit inside the
+   bucket that would have to contain it;
+3. the executor split **already closes to ~100% of `executor_ns` without it**
+   (16.2 + 0.1 + 83.2 + 0.4 + 0.0). If presentation were nested, the split
+   would over-close.
+
+**The consequence is a live defect in `telemetry.rs`.** Its `phase_self` line
+(`:422-431`) summed `vi_present_ns` into the quantity subtracted from
+`executor_ns`, labelled *"executor_ms minus gfx+audio+audio_lle+vi_present"* —
+**subtracting ~1.14 ms/field that was never added, understating executor self
+time.** This is rule 2 in mirror image: the original error read an inclusive
+counter as a peer; this one reads a *peer* as though it were *inclusive*. Both
+come from assuming a counter's nesting instead of checking it.
+
+**Fixed, but not on the strength of the argument.** Three converging inferences
+is exactly the condition rule 23 warns about — they share an assumption about
+where `advance_virtual_time` is called from, so they could all be wrong
+together. The runtime now counts which side of the seam each presentation
+actually ran on (`INSIDE_RUN_ONE_STEP`, a `Drop`-guarded flag over
+`run_one_step`'s body), and `telemetry.rs` subtracts `vi_present_ns` **only if
+that counter says it belongs**. The arithmetic follows the observation rather
+than either assumption, and the check can refute its author: a nonzero
+`vi_present_in_executor_calls` prints `REFUTED ... retract it`. Both outcomes
+are pinned by test (`vi_reachability_reports_confirmation_and_refutation_distinctly`).
+
+#### PRE-REGISTERED: the thresholds for the `resume NET` split, fixed before any number existed
+
+Written down before the measuring binary was built, because a fallback chosen
+after seeing the data is a rationalization and one chosen before is a protocol.
+That distinction is what saved the mirror line today.
+
+**The instrument.** Seven phases inside `run_catalog_block_program`'s loop body
+— reconcile `@1033`, cop0 sync, **dispatch** (the guest), invalidate, exit,
+suspend, resolve — behind a **fourth** gate, `FN64_RESUME_SPLIT`, separate from
+`FN64_EXECUTOR_SPLIT` for the same reason that one is separate from
+`FN64_PHASE_TIMING`: **so this instrument's own perturbation is measurable by
+running the level above it alone.**
+
+**One clock per boundary, differenced — not a start/stop pair per phase.** A
+pair doubles the reads and leaves an unattributed gap between each stop and the
+next start, into which the arming cost disappears. That would distort *shares*,
+which rule 17 identifies as the one quantity that usually survives
+perturbation. Differencing adjacent boundaries makes the phases contiguous by
+construction, so they sum to the whole arithmetically rather than by hope.
+
+The risk being managed: ~2,000 armed clock reads per render field against the
+~856 that already cost **+4.6%**. The failure that matters is not magnitude but
+*asymmetry* — if the dispatch bucket is perturbed differently from the cheap
+buckets, the shares distort and the measurement's one robust property is gone.
+
+| # | threshold | fixed at |
+|---|---|---|
+| 1 | **share stability.** `(gfx_ns + audio_lle_ns)` exists in *both* lanes and sits *inside* the dispatch bucket, so it is the fixed reference that makes an armed/control share comparison possible at all. | **3 percentage points** — two-thirds of the +4.6% measured one level up |
+| 2 | **resolution floor.** Any phase below the measured per-field perturbation is reported as *"below this instrument's resolution"*, never quoted as a value. | the armed−control delta itself |
+| 3 | **closure.** The seven phases plus a named residual must sum to `resume NET`. | **5%** — above it, *the residual is the finding* |
+
+**The fallback, specified in advance:** if threshold 1 trips, drop to a coarse
+3-bucket split — pre-dispatch (reconcile + cop0), dispatch, post-dispatch
+(invalidate + exit + suspend + resolve) — at 4 clock reads per step instead of
+8. **What that gives up, stated now:** it cannot separate the redundant
+reconcile at `:1033` from cop0 sync, so it cannot size the mirror-redundancy
+fix, and it cannot separate suspend from exit/resolve. It still answers the
+deliverable — how much of the 46.8 ms is translated guest code versus
+dispatch-loop overhead. **An honest coarse split beats a fine one that distorts
+what it measures.**
+
+**Rule 11a binds the writeup:** the peer's **56.232 / 46.798 ms** are pinned to
+binary `89e00d0` and are a *historical datum, not a baseline*. The `main.rs`
+edit moved `DISPATCH_SOURCE_SHA256`, and the `EXPECTED_WORDS` removal takes
+~3.10 ns of ~10.6 ns per instruction — **~29% of translated guest code, exactly
+the bucket being measured** — out of the tree. So `resume NET` is **re-derived
+in-report** from `exec_resume_ns − exec_mirror_ns − exec_guard_suspend_ns` on
+the measuring binary, and the buckets subtract from *that*. Quoting the peer's
+milliseconds and subtracting new buckets from them would be a cross-route
+subtraction wearing a disguise — the same shape as the void `22.51 − 8.43`.
+
+### THE HEADLESS ROUTE DOES NOT REPRODUCE THE OWNER'S CHOPPINESS. It is deterministic alternation.
+
+**Answered first because it frames everything below it.** The owner reports the
+windowed shell as "laggy/choppy". The headless 1.5M route this project optimizes
+against does **not** exhibit that behaviour, and the difference is not one of
+degree.
+
+From the raw per-field sequence (`FN64_FRAME_CENSUS_SEQUENCE=4000`,
+`_SKIP=2000`) — **unsmoothed, 4000 consecutive steady-state fields**:
+
+```
+[frame-sequence] pattern[ 2000] SfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSfSf
+```
+
+| | n | share | mean | range |
+|---|---:|---:|---:|---|
+| LOW (`f`) | 2000 | 50.0% | 11.07 ms | 6.30 – 13.12 |
+| HIGH (`S`) | 2000 | 50.0% | 58.34 ms | 51.76 – 66.64 |
+
+- **The gap between clusters is 38.63 ms. The next-largest gap in the sorted
+  series is 1.79 ms — a 22x margin.** This is the gap test rule 29 demands, and
+  unlike the windowed data it passes overwhelmingly.
+- **The predictor is exact: 2000/2000 HIGH fields carry a graphics submit;
+  0/2000 LOW fields do.** Not a correlation — a partition.
+- The alternation is strictly periodic: `SfSfSf…` for 4000 fields, 50.0/50.0.
+
+**Contrast with the windowed data** (frozen `shell-run2` snapshot, n=183
+60-frame windows): three soft clusters, largest gap 6.5 ms against six other
+gaps >2 ms, **irregular** runs of each mode, and the slow mode carrying *lower*
+mean workload. Those are different phenomena:
+
+| | headless 1.5M | windowed shell |
+|---|---|---|
+| structure | deterministic `SfSf` alternation | irregular, drifting |
+| separation | 38.63 ms gap, 22x its nearest peer | 6.5 ms, 1.3x its nearest peer |
+| cause | graphics submit, exactly | **unidentified** |
+| resolution | raw per-field | 60-frame p50s |
+
+**So the decomposition below is a correct account of a route that does not
+exhibit the owner's problem.** It explains why *rendering fields* cost 58 ms —
+which is a real and sufficient reason the bar fails — but it does not explain
+his *variance*. Two consequences:
+
+1. **The 60fps work below is still the right work.** A route whose render
+   fields cost 58 ms against a 16.667 ms budget fails the bar regardless of what
+   the shell adds, and fixing it is a precondition for anything else.
+2. **The owner's choppiness needs its own measurement on the windowed lane, at
+   per-field resolution.** Nothing in this run can settle it, and it must not be
+   claimed as explained by the numbers below. The obvious first step is the same
+   sequence dump armed in the shell, since the smoothing is what makes the
+   windowed data ambiguous in the first place.
+
+### MEASURED: `resume NET` is 73% GRAPHICS, 21% guest code. The RDP alone is 26.4 ms — 1.6x the whole budget.
+
+Measured 2026-08-08 at `6faca4e` + this instrument, `render-benchmark.zsh` at its
+default 1.5M steps, RT64 headless, quiet machine, four runs armed/control
+interleaved, two reps. Frozen snapshots (rule 29):
+`$CLAUDE_JOB_DIR/tmp/frozen-222012/{armed,control}-rep{1,2}.log`.
+
+**Guest byte-identical in all four lanes** on the authoritative
+`[wm2000-block-progress]` line: `gfx_submits=11153`, `audio_submits=7685`,
+`sp_tasks=18838`, `vi_interrupts=8386`, `controller_ops=2390`,
+`sim_time=13112786076`, `render_error=None`, plus identical `fields=7699` and
+`over_budget=3853` in every run.
+
+#### The correction that matters more than the numbers
+
+> **The brief that commissioned this work said `resume NET` was "83% of the
+> render field — translated guest code plus the runtime it calls, the part
+> nobody has attacked." The 83% is exactly right. The characterization was
+> wrong, and it was repeated to the owner for a day.**
+>
+> | | briefed as | measured |
+> |---|---|---|
+> | translated guest code | the bulk of 83% | **20.9%** |
+> | graphics + audio | not mentioned | **72.8%** |
+> | dispatch-loop machinery | — | 5.1% |
+>
+> `resume NET` was named correctly and described wrongly. The bucket was right;
+> its contents were assumed. **This is rule 2's failure mode wearing different
+> clothes — not "inclusive read as self", but "unnamed read as guessed".** An
+> unnamed 83% invites a story about what is inside it, and the story survives
+> precisely because no counter contradicts it.
+
+#### The slow (render) field, fully named
+
+| row | ms/field | % of resume NET |
+|---|---:|---:|
+| `executor_ns` (278.9 calls) | 54.831 | — |
+| — *(of)* mirror boundary | 8.848 | (16.1% of executor) |
+| — *(of)* **`resume NET`** | **45.687** | **100%** |
+| — — dispatch = **TRANSLATED GUEST CODE** | **9.528** | **20.9%** |
+| — — **host calls (OS shims)** | **33.524** | **73.4%** |
+| — — — *(of)* `gfx_ns` | **32.119** | **70.3%** |
+| — — — — *(of)* **RDP** | **26.396** | **57.8%** |
+| — — — — *(of)* RSP | 5.637 | 12.3% |
+| — — — *(of)* `audio_lle_ns` | 1.158 | 2.5% |
+| — — invalidate writes | 2.018 | 4.4% |
+| — — reconcile/cop0/exit/suspend/resolve | 0.043 | 0.1% |
+| — — PARKED (other threads ran) | 0.574 | 1.3% |
+
+**Closure: named = 45.113 against a 45.687 parent — the 0.574 ms PARKED row is
+the entire remainder, 1.3%.** No negative gap.
+
+**Reproducibility across reps is far inside the pre-registered 3 pp threshold:**
+guest code 20.9 / 20.7, graphics+audio 72.8 / 73.1, machinery 5.1 / 4.9, RDP
+82.2% / 82.3% of gfx. Largest share movement **0.3 pp**.
+
+**Instrument perturbation: +0.175 ms/field, sd 0.177 (+0.50%)**, both reps the
+same sign (+0.300, +0.050). An order of magnitude below the executor split's
++4.6%, because these timers sit at *exit boundaries* rather than in the
+per-instruction path. Absolutes here are corrected by control/armed = 0.9950.
+
+#### The headline, stated against the budget rather than as a share
+
+**RDP rasterization alone is 26.4 ms/field on the population that fails the
+bar — 1.58x the entire 16.667 ms budget.** Reduce translated guest code,
+the mirror, the journal, the dispatch machinery and audio *all to zero* and the
+slow field still costs ~28 ms. **Nothing outside graphics can reach 60fps on
+this route.**
+
+#### Does this contradict the closed RSP line? No — it NARROWS it, and that is worse.
+
+The closed-lines list carries *"RSP micro-optimization — uniform
+11.25 ns/instruction, no defect. The interpreter is large, not slow."* **That
+remains true and is not reopened here.** RSP is 5.637 ms/field, **17.6% of
+graphics and 12.3% of `resume NET`**.
+
+But the entry sits under a heading that reads as *"graphics is closed"*, and
+**graphics is 82% RDP, which that measurement never examined.** A future reader
+scanning closed lines for "should I look at the renderer?" finds a confident No
+that was only ever an answer about one sixth of it.
+
+> **A closed line is dangerous in proportion to how broadly its title reads
+> versus how narrowly it was measured.** Nobody re-derives a closed line — that
+> is the point of the list — so an entry whose scope is narrower than its name
+> silently closes territory it never covered. **State the denominator in the
+> title.** This one is now *"RSP interpretation (17.6% of graphics)"*.
+
+#### THE CLOSURE CHECK CAUGHT THREE DEFECTS IN ONE HOUR. Write the tolerance before the number exists.
+
+The strongest argument in this document for pre-registering a check **in code**
+rather than in your head. A single pre-registered rule — *the phases must sum to
+their parent within 5%, and the residual is printed unconditionally* — caught
+three distinct instrument defects on three consecutive smoke runs of the
+`resume NET` split. **None of the three was visible in the phase values
+themselves; all three looked like findings.**
+
+| # | symptom | cause |
+|---|---|---|
+| 1 | residual **−697%**; `suspend` 54.1 and `resolve` 197.3 ms/field inside a 40.6 ms field | the walking clock lapped **across the coroutine suspend** |
+| 2 | residual **−533%**; `resolve` still 189.7 ms/field | the fix covered the checkpoint suspend only — `invoke_catalog_block_host` suspends too |
+| 3 | closure **fine at 1.6%**, but `gfx_ns` (21.530) **exceeded its own parent** `dispatch` (7.713) | a **mislabelled bucket**: graphics is reached as a `BlockExit::HostCall`, inside the arm labelled "resolve next entry" |
+
+**Defect 1 is why a wall clock cannot time a stack that yields.**
+`suspend_active_coroutine` is a stackful switch: control leaves the stack and
+the executor resumes *other threads* before returning. A lap taken after it
+charges their work to this phase. **54 ms and 197 ms look like discoveries** —
+without the closure check the headline would have been "resolve is the
+bottleneck", dispatched on, and wrong.
+
+**Defect 2 is why a partial fix is more dangerous than none.** Bracketing the
+one obvious suspend site left the number wrong but *less absurdly* wrong. The
+same check that caught the original caught the half-fix.
+
+**The remedy for 1 and 2 generalizes: correct at the chokepoint, not the call
+sites.** There are **16 `suspend_active_coroutine` call sites** in this crate,
+reached from message queues, threads, SI, PFS and arbitrary guest code inside
+`dispatch`. Per-site bracketing is not merely tedious, it is **unsound** — no
+enumeration is complete, and a seventeenth site would silently rot the
+instrument. Timing the parked interval once, at the single function every yield
+must pass through, and subtracting it in `lap`, handles every path including
+ones added later. **Prefer the construction that cannot be outgrown.**
+
+**Defect 3 is the subtle one, and closure alone did not catch it — the
+parent/child relation did.** After the parked-time fix the split closed to 1.6%
+and looked healthy. But `gfx_ns` was 21.530 inside a `dispatch` bucket of 7.713:
+**a child exceeding its parent is impossible**, and it is the only signal that
+fired. Tracing rather than guessing found the cause: `gfx_ns` is armed in
+`dispatch_lle_task`, reached from `osSpTaskStartGo_recomp`, which the guest
+reaches as a `BlockExit::HostCall` — handled in the arm labelled *"resolve next
+entry"*. The arithmetic confirmed it independently: **resolve 22.610 − gfx
+21.530 = 1.08 ms**, which is the real resolution cost.
+
+> **A label that is 95% something else is not a mislabel — it is a wrong
+> measurement wearing a plausible name.** It would have survived every check in
+> this document except *"why does a child exceed its parent?"* Report nested
+> counters against their containing bucket, always, so that question can be
+> asked at all.
+
+**Two predictions were made and one was wrong, recorded because being wrong in
+public is the point of pre-registering.** After the parked-time subtraction I
+predicted the `PARKED` row *"should stay large"* since `resume NET` is
+wall-clock. **It is 1.6%.** The reason: the executor's other work happens
+*between* steps, outside the laps, not inside them — so the coroutine is rarely
+parked while its own step is being timed. The instrument was right and the
+reasoning was wrong, which is the whole reason to build the instrument.
 
 #### The harness fix earned itself back on the run it was written for
 
@@ -3475,7 +3980,12 @@ be the overwhelming majority:
    at most 16.4% of the render field; cannot reach the bar even at zero cost**
 2. genuine work on the structural half, which **nobody has attacked yet** —
    every optimization this session targeted the guard. It is **83.2%** of the
-   render field (`resume NET`) and it has **no sub-counters**.
+   render field (`resume NET`) and it has ~~**no sub-counters**~~ **seven, as
+   of 2026-08-08** — see "PRE-REGISTERED: the thresholds for the `resume NET`
+   split". `FN64_RESUME_SPLIT=1` (a *fourth* gate, alongside the three in rule
+   27) names it: reconcile / cop0 / **dispatch** / invalidate / exit / suspend
+   / resolve, with graphics and audio subtracted out of the dispatch bucket to
+   isolate translated guest code.
 
 Note `FN64_FAST_MUTATION_JOURNAL=1` already measures **zero** difference
 (435 ms vs 441 ms): the barrier absorbed that cost, so the removable 47% is not
