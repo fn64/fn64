@@ -476,8 +476,11 @@ pub fn validate_raw_rdp_command_range(
         };
         let supported = matches!(
             opcode,
-            G_NOOP | 0x08
-                ..=0x0f
+            // 0x00..=0x07 is the low No Operation block (G_NOOP is its 0x00
+            // member); the executor treats 0x01..=0x07 as no-ops on the raw
+            // lane only, since the same bytes are G_VTX..G_QUAD on the
+            // geometry lane. 0x08..=0x0f are the eight triangle layouts.
+            0x00..=0x0f
                     | G_TEXRECT
                     | G_TEXRECTFLIP
                     | G_RDPLOADSYNC
