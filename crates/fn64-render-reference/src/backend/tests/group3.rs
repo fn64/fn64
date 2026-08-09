@@ -371,6 +371,7 @@ fn copy_layout_matrix_admits_only_public_direct_pairs() {
                     lod: None,
                 }),
                 texture1: None,
+                fill_color: 0,
             };
             let admitted =
                 validate_copy_texture_rectangle(&rectangle, Some(target(destination))).is_ok();
@@ -420,6 +421,7 @@ fn copy_layout_matrix_admits_only_public_direct_pairs() {
                     lod: None,
                 }),
                 texture1: None,
+                fill_color: 0,
             };
             assert_eq!(
                 validate_copy_texture_rectangle(&rectangle, Some(target(destination))).is_ok(),
@@ -474,6 +476,7 @@ fn copy_source_gate_rejects_ci8_tlut_and_undefined_eight_bit_formats() {
             lod: None,
         }),
         texture1: None,
+        fill_color: 0,
     };
     assert!(validate_copy_texture_rectangle(&rectangle, Some(target)).is_err());
 
@@ -769,6 +772,7 @@ fn combined_texture_rectangle_rejects_unmodeled_state_by_name() {
         scissor: None,
         texture: Some(texture),
         texture1: None,
+        fill_color: 0,
     };
 
     let shade_error = validate_texture_rectangle(&rectangle, None).unwrap_err();
@@ -843,6 +847,7 @@ fn copy_texture_rectangle_rejects_mismatched_memory_layouts() {
         scissor: None,
         texture: Some(texture),
         texture1: None,
+        fill_color: 0,
     };
     let rgba16_target = gbi::ColorImage {
         format: gbi::ColorImage::RGBA_FORMAT,
@@ -1128,4 +1133,79 @@ fn unadmitted_s2dex_image_requests_lle_without_task_mutation() {
     );
     assert_eq!(rdram, before);
     assert_eq!(rsp, rsp_before);
+}
+
+/// A FILL-cycle texture rectangle is not invalid. The N64brew RDP command
+/// table says, in the Texture Rectangle section: "In FILL mode this behaves
+/// identically to Fill Rectangle, the texturing properties are ignored."
+/// The reference backend used to reject it, which aborted a WCW/nWo Revenge
+/// frame over a combination the hardware defines.
+#[test]
+fn fill_cycle_texture_rectangle_is_accepted_and_converts_to_a_fill_rectangle() {
+    let fill_cycle = gbi::OtherMode::from_raw(3 << 20, 0, 0);
+    assert_eq!(fill_cycle.cycle_type(), gbi::CycleType::Fill);
+
+    let rectangle = gbi::TextureRectangle {
+        ulx: 1.0,
+        uly: 2.0,
+        lrx: 5.0,
+        lry: 6.0,
+        tile: 0,
+        s: 0.0,
+        t: 0.0,
+        dsdx: 1 << 10,
+        dtdy: 1 << 10,
+        flip: false,
+        other_mode: fill_cycle,
+        combiner: gbi::CombinerState::default(),
+        blender: gbi::BlenderState::default(),
+        scissor: None,
+        texture: None,
+        texture1: None,
+        fill_color: 0x07c1_07c1,
+    };
+
+    validate_texture_rectangle(&rectangle, None)
+        .expect("a FILL-cycle texture rectangle is documented, not invalid");
+
+    // The conversion the backend dispatches through must carry the geometry
+    // unchanged and take its colour from the fill register.
+    let fill = rectangle.as_fill_cycle_rectangle();
+    assert_eq!((fill.ulx, fill.uly, fill.lrx, fill.lry), (1.0, 2.0, 5.0, 6.0));
+    assert_eq!(fill.fill_color, 0x07c1_07c1);
+    assert_eq!(fill.cycle_type, gbi::CycleType::Fill);
+}
+
+/// The fill-cycle blender hazard is a property of the cycle, not the command,
+/// so it must still reject -- and must name the texture rectangle rather than
+/// G_FILLRECT, so the diagnostic points at what the guest submitted.
+#[test]
+fn fill_cycle_texture_rectangle_still_rejects_an_unsafe_blender_contract() {
+    // IM_RD (bit 6) retains a framebuffer consumer; a depth read in fill
+    // cycle can hang the RDP.
+    let hazardous = gbi::OtherMode::from_raw(3 << 20, 1 << 6, 0);
+    let rectangle = gbi::TextureRectangle {
+        ulx: 0.0,
+        uly: 0.0,
+        lrx: 1.0,
+        lry: 1.0,
+        tile: 0,
+        s: 0.0,
+        t: 0.0,
+        dsdx: 1 << 10,
+        dtdy: 1 << 10,
+        flip: false,
+        other_mode: hazardous,
+        combiner: gbi::CombinerState::default(),
+        blender: gbi::BlenderState::default(),
+        scissor: None,
+        texture: None,
+        texture1: None,
+        fill_color: 0,
+    };
+
+    let error = validate_texture_rectangle(&rectangle, None).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("G_TEXRECT"), "must name the command: {text}");
+    assert!(text.contains("Fill cycle retains unsafe"), "{text}");
 }
