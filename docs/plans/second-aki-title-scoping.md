@@ -743,3 +743,57 @@ should expect 21 overlay shards.
 Recording the digest discipline again because it would have prevented this
 entirely: **a per-title figure without its ROM digest cannot be reconciled
 later.**
+
+## The two WCW titles are NOT the same problem (2026-08-09)
+
+`corpus-certification-frontier.md:1810-1814` records both as "FAIL — 0
+candidates" and bounds them out of the lane together. A per-symbol probe —
+each recognizer run independently over the same window, so nothing is hidden
+by the `?` short-circuit in `discover_wm_block_runtime_host_bindings` — shows
+they fail for different reasons and to wildly different degrees.
+
+| symbol | WM2000 | NoMercy | VPW2 | Revenge | WorldTour |
+|---|:-:|:-:|:-:|:-:|:-:|
+| osCreateMesgQueue | 1 | 1 | 1 | 1 | **0** |
+| osEPiStartDma | 1 | 1 | 1 | 1 | **0** |
+| osGetThreadPri | 1 | 1 | 1 | 1 | 1 |
+| osSendMesg | 1 | 1 | 1 | 1 | **0** |
+| osSetEventMesg | 1 | 1 | 1 | **0** | **0** |
+| osSetThreadPri | 1 | 1 | 1 | 1 | **0** |
+| osStartThread | 1 | 1 | 1 | 1 | **0** |
+| __osSiDeviceBusy | 1 | 1 | 1 | 1 | **0** |
+| osSetTimer | 1 | 1 | 1 | **0** | **0** |
+| **subtotal** | 9/9 | 9/9 | 9/9 | **7/9** | **1/9** |
+
+Out of **9**, not 15 — these are the directly-callable predicates; the other
+six (osCreateThread, osRecvMesg, four RSP task roles) resolve through
+multi-stage call-chain logic not yet expressible as standalone checks. Labelled
+honestly rather than inflated to 15.
+
+**Revenge: 7/9, two genuine behavioural gaps** — `osSetEventMesg` and
+`osSetTimer`, both truly absent rather than shadowed. The original probe named
+only the first because the chain short-circuits. **Plausibly two widenings.**
+
+**World Tour: 1/9, and probably not a recognizer problem.** Eight independent
+behavioural recognizers do not all miss for eight coincidental revision
+differences. The surviving one, `osGetThreadPri`, is a 6-word predicate — the
+most likely to match incidentally. **The leading hypothesis is scan coverage:**
+the probe hard-codes a 1 MB window at file offset `0x1000`, VA `0x80000400`,
+and if World Tour's resident libultra lies outside it, every recognizer misses
+for one reason rather than eight.
+
+Note ROM size does not separate them: World Tour is 12 MB, Revenge 17 MB,
+WM2000 32 MB. **The 12 MB title scores 1/9 and the 17 MB title 7/9**, so this
+is layout, not size.
+
+### Two corrections to the record, and one to me
+
+**The record's "0 candidates, bounded out of the lane" is true of one title
+and misleading for the other.** Revenge resolves 7 of 9; calling it bounded out
+alongside World Tour hid a tractable case behind an intractable-looking one.
+
+**And my own "two single-symbol gaps, one each" was wrong** — I read the `15`
+on the FAIL line as a score. It is `WM_BLOCK_RUNTIME_HOST_SYMBOLS.len()`,
+printed unconditionally on the error path (`probe_host_bindings.rs:30`), with
+no numerator. **A denominator printed without its numerator invites exactly
+this misreading**; the per-symbol probe prints both on both paths.
