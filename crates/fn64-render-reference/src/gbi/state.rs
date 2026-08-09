@@ -1137,6 +1137,7 @@ impl RdpDecodeState {
             scissor: state.scissor,
             texture: texture_for_tile(&state.tex, 0, texture_lut, &storage),
             texture1: texture_for_tile(&state.tex, 1, texture_lut, &storage),
+            fill_color: state.fill_color,
         };
         self.commit_task(&state);
         Ok(RenderOp::TextureRectangle(rectangle))
