@@ -1,6 +1,6 @@
 ---
 name: fn64-perf-method
-description: Use when measuring, profiling, benchmarking, or optimizing anything in fn64 — before dispatching a perf agent, before believing a benchmark number, before committing in a shared tree, or when a measurement looks surprising. Twenty-three rules, each earned by a specific wrong answer that was believed for hours.
+description: Use when measuring, profiling, benchmarking, or optimizing anything in fn64 — before dispatching a perf agent, before believing a benchmark number, before committing in a shared tree, or when a measurement looks surprising. Every rule earned by a specific wrong answer that was believed for hours.
 ---
 
 # fn64 measurement method
@@ -86,6 +86,18 @@ Serialize them. This produced rule 4's phantom.
 (`FN64_BLOCK_MAX_STEPS=19523`) has `gfx_submits=0` — it renders nothing, so
 every latency statistic over it describes an idle guest.
 
+**29. FREEZE a log before analyzing it.** A file a process is still writing is
+not a population. Two agents analyzing one live log got n = 117…183 — a growth
+curve — and the differing counts were read as a wrong-key extraction bug
+(plausible: that log carries `frame_interval_ms[` and `pump_ms[` one space
+apart), producing a confident correction of a *correct* extraction. `cp` to
+`$CLAUDE_JOB_DIR/tmp` and **cite the snapshot path in every claim**. Two
+corollaries earned in the same hour: a gap called "clean" must be compared
+against the other gaps in its own series (the "clean" one was 6.5 ms, largest
+of seven >2 ms, and the distribution was trimodal not bimodal); and a series of
+**windowed p50s cannot distinguish "the game got slow" from "the emulator has
+regimes"** — only raw per-field data can (`FN64_FRAME_CENSUS_SEQUENCE`).
+
 **Report per population, not just the mean.** WM2000's field distribution is
 bimodal (`SfSfSfSf`, 400 fields, zero defects; 100% of slow fields carry a
 submit, 0.1% of fast). An average over both populations hid the render cost for
@@ -138,15 +150,6 @@ rule 19 crashed instead of verifying: `find -newermt "@<epoch>"` is GNU syntax
 and BSD `find` on macOS rejects it. It had been tested against synthetic inputs
 and passed. Prefer constructions whose failure mode is a crash over an empty
 result. There is no `readelf` and no `timeout` here; binaries are Mach-O.
-
-**Freeze the log before you analyze it.** A distribution needs a fixed
-population, and a file a process is still writing is not one. Two agents
-extracting "the same" live log got n=117/131/164/172/183 and n=151/173 — every
-count differed, and the natural inference was an extraction bug rather than a
-moving target. One agent "verified" the other's finding against a different
-population and declared it wrong; both retracted. **Copy to a frozen snapshot,
-cite the snapshot, and treat differing n between readers as evidence the file
-moved, not that someone parsed it wrong.**
 
 **A key that appears twice is two metrics.** A byte-identity checker did
 `findall(...)[-1]` on `gfx_submits=` and silently compared the **steady-state
