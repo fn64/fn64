@@ -1,91 +1,79 @@
-# Where fn64 stands, and the four things left
+# fn64: position and plan (2026-08-09, end of session)
 
-Written 2026-08-09 at the end of a long session. **The standing goal — all five
-AKI titles 100% playable through discovery, runtime and render — is 1 of 5, and
-that title is not at 60fps.** This file is the handoff: what is true, what is
-scoped, and what to do first.
+**Goal: all five AKI titles 100% playable through fn64, discovery → runtime →
+render. Position: 1 of 5 playable; that title's emulation ceiling is 1.16 ms
+from its 30fps budget; four titles CPU-recompile.**
 
-## The five titles
+52 commits this session. Everything below is measured, with digests and logs.
 
-| title | state | what it needs |
+## Where each number stands — use these, not older figures
+
+| | value | provenance |
 |---|---|---|
-| WrestleMania 2000 | **boots and renders**, 1.94x budget | the 60fps work below |
-| No Mercy | 15/15 host bindings on the **on-disk ROM**; build can express it | executable-image PCs, input schedule |
-| VPW2 | 15/15 host bindings | an answer key; no `FN64_DISCOVER_*` entry |
-| WCW/nWo Revenge | **15/15 bindings, CPU-recompiles** (0 unsupported of 1749) | shard tree, boot context, executable-image PCs, input schedule |
-| WCW vs nWo World Tour | **1 of 9**, 7/7 skeleton-different | support for a 1996 libultra generation |
+| WM2000 emulation ceiling (rt64, headless) | **17.25 ms/field → 34.49 ms/frame → 29.0 fps** | two unprofiled reps, 0.17% apart, byte-identical, `renderer: rt64` in-log |
+| 30fps budget | 33.333 ms/frame | **gap: 1.16 ms** |
+| mirror fix (`8109435`) | 8.75 → 0.18 ms/field | −20% on the reference lane, confirmed unprofiled |
+| reference-lane figures (27.96 ms, 17.9 fps, 22.6 ms gap) | **wrong lane** — software rasterizer | `render-benchmark.zsh` never set `FN64_RENDER`; now echoes `renderer:` |
+| windowed / presented frame time | **UNMEASURED** | the shell adds present cost, "never less" (`render-benchmark.zsh:87`) |
 
-## The four remaining projects, in the order I would take them
+**The two claims are different and only the first is supported:** the
+*emulation ceiling* is 29.0 fps; whether the *game the owner plays* reaches it
+depends on presentation cost, which nobody has measured post-fix.
 
-### 1. ~~Revenge's two recognizers~~ — DONE 2026-08-09 (`10a73c7`, `7fa28f5`)
-Both predicates were pinning compiler artifacts rather than ABI: a hardcoded
-register in one, a hardcoded stack frame size in the other. Revenge inlines
-less, so its frame is 24 bytes not 32 and every o32 stack-argument offset
-shifted. Made frame-relative; **Revenge went 7/9 → 15/15 and now
-CPU-recompiles with `unsupported_destinations = 0` of 1,749.**
+## The plan, in order
 
-**Four of five AKI titles now CPU-recompile.** Revenge needs the same bring-up
-as No Mercy from here: shard tree, boot context, executable-image PCs, input
-schedule. **That bring-up — for either title — is now the shortest path to a
-second playable game**, and it is item 2.
+### 1. Measure the windowed lane post-fix (hours, decisive)
+`wm2000-shell` has never been measured since the mirror fix. The owner's last
+session showed p50 ~50 ms windowed — but that predates `8109435` and was on a
+binary carrying the 9 ms mirror defect. **One instrumented windowed session
+answers whether the played game is at ~29 fps or still stuttering**, and if the
+latter, present cost is the entire remaining problem and it is shell-side, not
+emulation. The owner must drive it (or an input schedule must replay a route);
+the measurement itself is the heartbeat that already exists.
 
-### 2. No Mercy's remaining bring-up — the only path to a second playable title
-Everything mechanical is done: 15/15 confirmed on the actual ROM, the topology
-generator produces its shape (21 overlay shards — **generate it, do not
-transcribe the stale 24**), and the build can select a non-WM2000 inventory.
-What is left is genuinely human-gated: locating the executable-image PCs and
-authoring an input schedule. See `docs/plans/second-aki-title-scoping.md`.
+### 2. Close the last 1.16 ms if the ceiling itself needs it (days)
+Post-fix decomposition (perturbation-corrected): rasterization 8.30, RSP 5.09,
+guest code 8.23, invalidate 1.68, staging 1.45, audio 0.98. **Four rows are
+individually ≥ the 1.16 ms gap.** No architecture work required. Closed lines:
+copyback narrowing (99.49% dead bytes, still wrong direction), RSP micro-opt,
+depth-copy elimination, mirror gating, instruction budgeting.
 
-### 3. 60fps — an architecture question, not an optimization pass
-Render field on RT64 is **36.5 ms against 16.667**. You must remove **19.8 ms,
-54% of the field**, and **no single line exceeds 0.67x budget**:
+### 3. Second playable title: author an input schedule for Revenge (human, days)
+Revenge is five of six: 15/15 bindings, recompiles (0 unsupported of 1,749),
+title-specific shard tree, boot context (`d8c097f8…`), validated exception
+images. **The schedule is genuinely human** — WM2000's is 124 lines of menu
+navigation, every screen evidenced by a committed frame dump. No Mercy is at
+the same point; Revenge's smaller ROM makes it the cheaper first attempt.
+Everything mechanical now exists: `--title` generation, inventory selection,
+digest-recorded artifacts.
 
-    guest code 9.79 | mirror 9.01 | RSP 5.76 | rasterization 4.00
-    invalidate 2.04 | staging memcpy 1.77
+### 4. VPW2 bookkeeping (hours)
+15/15 bindings, recompiles (0 of 4,648). Needs an answer key and
+`FN64_DISCOVER_*` env entries so regressions can be graded. Bookkeeping, not
+engineering.
 
-There is no bottleneck. Every single-target attempt this session came back null
-or misdirected. The two candidates large enough to matter are architectural:
-the **8 MiB-per-submission RDRAM round-trip**, and the **mirror's coupling to
-the write barrier** (proven safe to gate, proven to catch nothing, and gating
-it measured *null* because reading the dirty set is what lets the barrier take
-a free early-out). **Nobody has asked whether the mirror can be made cheaper
-rather than removed.**
+### 5. World Tour: a scoped project, not a fix (weeks; decide before starting)
+3/15 bindings; 7/7 skeleton-different code; a 1996 libultra generation. The
+per-symbol matrix and drift sweep are in `wcw-host-binding-recognizers.md`.
+Decide whether 5-of-5 justifies a parallel recognizer set before anyone starts.
 
-Use `FN64_PROFILE=1`. One command, one report, the counter tree enforced.
+## Standing hazards (all bitten this session, all documented in the skill)
 
-### 4. World Tour — a project, not a fix
-7 of 7 routines are different code, flat at 0 matches through 35% opcode drift.
-This is a 1996 launch title against 1998 siblings. Supporting it means a second
-libultra generation in the recognizer set. Worth knowing the size before
-anyone starts.
+- **State the renderer with every number** — two readers measured the wrong
+  lane in one day, one of them having just read the warning.
+- Shipped figures are **unprofiled means**, never profiled numbers or p50s.
+- Every per-title artifact carries its **ROM digest** — four variant collisions
+  in one session, all from title-string filing.
+- One owner per run; a frozen log is not a dead process; `pgrep -x` not `-f`.
+- Three pre-existing test failures predate this session; the suite was never
+  green. `emit.rs:1121`'s stale label list is wire-format for a receipt digest
+  — fixing it is a versioning decision.
 
-## Three things to check before trusting the tree
+## What was delivered this session, for the record
 
-1. **Three pre-existing test failures** predate this session. The suite was
-   never green. `the_spread_rows_...` in `frame_census` (a test-construction
-   artifact, diagnosed), `precompiled_admission::...miss_evidence` (a real
-   `first_diff_offset` semantics gap), and
-   `prepared_tree::...deterministic_and_idempotent` (33 vs 36).
-2. **`generated_runner_build/build.rs:1121`** hardcodes `src/emit.rs` in a
-   label list that is **wire format for a receipt digest**. `emit.rs` became
-   `emit/` in the #119 wave. Fixing it changes the receipt version — a
-   deliberate decision, not a typo repair.
-3. **`examples/wm2000-block-boot/src/shell.rs` is uncommitted** and belongs to
-   the owner: present-mode, frame-pacing, and the audio-heartbeat fix.
-
-## What this session established, so it is not re-derived
-
-- **fn64 can ship builds with no copyrighted ROM content.** Words come from the
-  user's ROM at runtime via emitted geometry; verified zero ROM words against a
-  control carrying 126, guest byte-identical 8 of 8, and the binary boots and
-  renders. `b86fc95`.
-- **The 60fps target is graphics, and graphics is RDP** — but 79% of the
-  reference lane's RDP was an artifact of the software rasterizer, not the
-  renderer the owner runs. Measure on RT64. `ab0b9be`.
-- **An infinitely fast renderer still misses 60fps**: host-side alone is 1.29x
-  budget. `0014aae`.
-- **Two blocked titles are two different problems**, and the record's "0
-  candidates, bounded out of the lane" was wrong about both. `9dbecc0`.
-- **The method rules are in the loadable skill** (`.claude/skills/fn64-perf-method/`),
-  including a section on running the work rather than the experiment — five
-  sequencing rules, each earned by a specific cost this session.
+ROM-free releasable builds (owner-verified, byte-identical, rebuild
+reproducible). Four of five titles CPU-recompiling — Revenge unblocked from
+"bounded out of the lane" by two behavioural recognizer fixes. The mirror fix:
+−20% shipped, from one line. FN64_PROFILE: one command, counter tree enforced,
+five historical instrument failures now caught by construction. The corrected
+target: 29.0 fps ceiling against a 30fps goal, not 54% of a field to remove.
