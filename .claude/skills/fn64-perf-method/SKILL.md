@@ -11,7 +11,30 @@ on. Full case detail — the runs, the retractions, the code sites — is in
 `docs/plans/perf-method.md` (2,838 lines). Read the relevant section there
 before acting on any rule you are about to lean on hard.
 
-**The standing bar: 16.667 ms per emulated VI field, hardware parity.**
+**The standing bar depends on the title's own render rate, and getting this
+wrong reframed the whole project.** 16.667 ms per emulated VI field is
+*hardware parity* — every VI field on time. But **WM2000 renders at 30 Hz**, so
+a drawn frame gets **two** field budgets: **33.333 ms**. Measured render field
+p50 is 36.46 ms, which is **2.19x the 60fps bar but only 1.09x the rate the
+game actually draws at**.
+
+|  | remove from the 36.46 ms render field |
+|---|---|
+| 60fps (hardware parity) | **19.80 ms — 54%** |
+| 30fps at p50 | **3.13 ms — 9%** |
+| 30fps clearing p95 (38.14) | 4.80 ms |
+| 30fps clearing p99 (38.85) | 5.51 ms |
+| 30fps with 10% margin on p99 | **~9.0 ms** |
+
+Every *pair* of the render field's named lines clears the p50 gap; the two
+smallest (`invalidate` 2.04 + `staging memcpy` 1.77) sum to 3.81. **Against the
+60fps bar this was an architecture problem with no bottleneck; against the rate
+the game renders at it is an ordinary optimization with fifteen viable routes.**
+
+**Always state which bar you are measuring against, and check the title's
+render rate before quoting a ratio.** A 2.19x that is really 1.09x is the
+difference between "rewrite the graphics architecture" and "land two small
+wins."
 
 ## Running the work (not the experiment)
 
