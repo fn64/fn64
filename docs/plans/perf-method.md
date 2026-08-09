@@ -4077,6 +4077,141 @@ it is large. The per-unit figure is what says whether there is a defect to
 fix, and here there is none — 12.17 vs 14.03 us is the same code doing the
 same thing at the same speed, more often.
 
+## MEASURED, NEGATIVE: the 167.8 dispatches/render-field are NOT reducible, and the "9.01 ms" that motivated the hunt is an arithmetic error
+
+Answering the follow-up the entry above opens ("the lever, if there is one, is
+the DISPATCH COUNT"). Resolved **entirely from the frozen logs**
+(`rt64-rep1.full.log` / `rt64-rep2.full.log`, lines 205-237 and 239-257), no new
+machine time. Both reps agree within 0.1% on every figure below.
+
+### The claim that was checked
+
+That the phases scaling with dispatch count — `mirror` 9.018 + `invalidate`
+2.042 + `reconcile` 0.005 + `cop0` 0.003 + `exit` 0.018 + `suspend` 0.007 +
+`resolve` 0.010 = **11.103 ms** — would fall to 2.09 ms if the render field
+dispatched at the non-render rate, saving **9.01 ms** of the 11.99 ms gap.
+
+**Both halves of that are wrong, and the larger error is the denominator.**
+
+### `mirror` does not scale with `resume_dispatch_calls`
+
+It is 81% of the 11.103 and it is driven by a **different counter**:
+
+| counter | fast | slow | ratio |
+|---|---:|---:|---:|
+| `resume_dispatch_calls` | 31.583 | 167.799 | **5.313x** |
+| `executor_calls` | 70.230 | 278.966 | **3.972x** |
+| `exec_mirror_calls` | 70.230 | 278.966 | 3.972x — *identical to `executor_calls`* |
+
+`exec_mirror_calls == executor_calls` exactly, in both reps. The mirror fires in
+`run_one_step` at **thread selection** (`fn64-abi/src/host.rs:397`,
+`mirror_guest_running_thread`), not in the catalog dispatch loop. There are
+279.0 thread selections and 167.8 catalog dispatches per render field; the
+111.2 difference is other threads. **Grouping it with per-dispatch phases mixes
+two populations that differ by 1.34x in count.**
+
+### And its per-call cost is not flat — it falls as the count rises
+
+| | fast | slow | ratio |
+|---|---:|---:|---:|
+| `exec_mirror_ns` | 4.108 ms | 9.018 ms | **2.195x** |
+| `exec_mirror_calls` | 70.230 | 278.966 | 3.972x |
+| **us/call** | **58.49** | **32.32** | **0.553x** |
+
+Cost rises 2.195x while calls rise 3.972x — **elasticity 0.570, strongly
+sublinear.** This is the opposite of the `invalidate` shape in the entry above
+(0.87x per-unit, i.e. flat), and it is why the two must not be summed as one
+"scales with count" bucket.
+
+The mechanism is in the code and is not in dispute.
+`commit_scheduler_running_thread_mirror`
+(`fn64-abi/src/recompiled/execution.rs:772`) calls
+`reconcile_before_dispatch_from_view`, whose own comment says it *"reconciles
+the whole watched region — 1 MiB on WM2000 — every time a thread is picked."*
+The reconcile's work is proportional to **bytes changed since the last
+reconcile**, not to the number of reconciles. More calls slice a roughly fixed
+per-field byte volume into more pieces, so per-call cost falls. **A phase whose
+work is set by guest write volume cannot be reduced by calling it less often —
+it does the same total work in fewer, larger pieces.**
+
+### The corrected ceiling: 6.60 ms, not 9.01 — and it is not reachable
+
+Modelling each phase by its **own measured** scaling (mirror at elasticity
+0.570 over its own 3.972x counter; the rest flat per-dispatch over 5.313x):
+
+| | slow | if count collapsed to the fast rate | saving |
+|---|---:|---:|---:|
+| mirror | 9.018 | 4.108 | 4.910 |
+| the other six | 2.084 | 0.392 | 1.692 |
+| **total** | **11.103** | **4.500** | **6.60 ms** |
+
+So the ceiling is **6.60 ms (55% of the gap), not 9.01 ms (75%)** — and that is
+still a *ceiling on a counterfactual that cannot be produced*, for the reasons
+below. A two-point solve treating mirror as `A*calls + B*bytes` returns the same
+4.910 for the call-driven part, but it is not independent evidence (it assumes
+equal byte-work across populations, which is false — the render field writes
+more), so **6.60 is an upper bound, not an estimate.**
+
+### The count itself is guest-determined
+
+| | fast | slow | delta |
+|---|---:|---:|---:|
+| `resume_dispatch_calls` | 31.583 | 167.799 | +136.2 |
+| `resume_hostcall_calls` | 26.858 | 71.443 | +44.6 |
+| non-host-call dispatches | 4.7 | 96.4 | +91.7 |
+| `gfx_lle_calls` | 0.001 | 2.818 | +2.8 |
+| `audio_lle_calls` | 0.917 | 0.925 | **+0.008** |
+
+Read the last row first. **Audio work is identical across both populations**, so
+the non-render field's 31.6 dispatches are the audio thread plus timers — the
+steady baseline. Every one of the render field's extra 136.2 dispatches appears
+on the only field that does graphics, at **48.3 dispatches and 15.8 host-call
+exits per SP graphics task.** A host call is `BlockExit::HostCall`, which is a
+guest OS-call shim (`osSpTaskStartGo_recomp` and friends) the guest itself
+invokes. **A dispatch that exists because the guest called an OS routine is not
+removable without changing the emulated program.**
+
+### The two structural routes are both already closed
+
+- **Raise the instruction budget.** Closed, and this data confirms the closure
+  rather than reopening it: budget is 4096
+  (`examples/wm2000-block-boot/src/shell.rs:656`) and the exits are host calls,
+  not budget exhaustion. `docs/plans/dispatch-granularity.md` already recorded
+  4096 vs 65536 as byte-identical, and the resident-generation predicate that
+  landed 2026-08-06 took `ExecutableWrite` from 99.8% of slice ends to **0**,
+  raising instructions-per-slice 7.163 -> 2339.013. **The store-forced boundary
+  this hunt was looking for was removed three days ago.** What remains is
+  `Checkpoint` and `HostCall`, described there as "both genuine boundaries.
+  Nothing is left to remove here."
+- **Gate the mirror's comparison.** Closed 2026-08-08, measured **+0.145 ms, sd
+  0.365, signs both directions** — a null — and reverted. The doc comment at
+  `live_program.rs:2304-2334` states the conclusion this analysis independently
+  reaches: *"Most of the 8.43 ms is therefore NOT this comparison, since
+  removing it changes nothing measurable."*
+
+### Verdict
+
+**Not reducible.** The dispatch count is set by the guest's own OS calls and by
+how many threads the scheduler must select; the largest phase attributed to it
+is not driven by it at all and is sublinear in its own driver. **The 35x
+instruction-rate figure is therefore not explained by "correctness machinery
+paid per dispatch"** — per-dispatch machinery is `2.332 ms of the render field,
+9.1% of resume NET` (`[resume-split] slow`), while `TRANSLATED GUEST CODE` is
+9.780 ms and `GRAPHICS+AUDIO` is 12.801 ms. The dispatch loop is not where the
+field goes.
+
+**Where the 11.99 ms actually is**, from the same frozen split: `gfx_ns` 11.626
+ms nested inside host calls — 45.6% of resume NET on the render field, and
+already known to be **82% RDP** and only 17.6% RSP. The remaining hunt belongs
+there, not in the scheduler.
+
+**Generalizable:** *before summing phases into a "scales with X" bucket, check
+each one's call counter against X.* Two counters that both rise on the render
+field are not the same driver — `exec_mirror_calls` rises 3.972x and
+`resume_dispatch_calls` 5.313x, and the phase worth 81% of the bucket followed
+the wrong one. This is rule 32 (sum the list) with a second edge: **check the
+numerator's driver, not just the denominator.**
+
 ## Candidate: 682 journal boundaries per field, 75% of them clean — UNSIZED
 
 7,716,048 boundaries over 11,321 fields is **682 per field**, and the census

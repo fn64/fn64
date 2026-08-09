@@ -18,13 +18,24 @@ a drawn frame gets **two** field budgets: **33.333 ms**. Measured render field
 p50 is 36.46 ms, which is **2.19x the 60fps bar but only 1.09x the rate the
 game actually draws at**.
 
-|  | remove from the 36.46 ms render field |
+**A DRAWN FRAME COSTS BOTH FIELDS.** WM2000 alternates strictly 1:1, so the
+pair is what must fit 33.333 ms:
+
+| | p50 | budget | gap |
+|---|---:|---:|---:|
+| non-render field | 8.858 ms | — | — |
+| render field | 36.462 ms | — | — |
+| **the PAIR (a drawn frame)** | **45.32 ms** | **33.333** | **11.99 ms** |
+
+**Do not quote 3.13 ms.** That figure compares the render field *alone* against
+the *pair's* budget, so it silently assumes the non-render field is free. It is
+not — it costs 8.86 ms. The two differ by 3.8x and the error was believed for
+hours. The real gap is **11.99 ms**, currently ~22 fps against a 30 fps target.
+
+|  | remove from the 45.32 ms drawn frame |
 |---|---|
-| 60fps (hardware parity) | **19.80 ms — 54%** |
-| 30fps at p50 | **3.13 ms — 9%** |
-| 30fps clearing p95 (38.14) | 4.80 ms |
-| 30fps clearing p99 (38.85) | 5.51 ms |
-| 30fps with 10% margin on p99 | **~9.0 ms** |
+| 60fps (hardware parity, per-field) | **19.80 ms from the render field — 54%** |
+| **30fps at p50** | **11.99 ms — 26%** |
 
 Every *pair* of the render field's named lines clears the p50 gap; the two
 smallest (`invalidate` 2.04 + `staging memcpy` 1.77) sum to 3.81. **Against the
@@ -358,6 +369,19 @@ Do not edit `examples/wm2000-block-boot/src/main.rs` — it is hashed into
 Any change on the emulation path must reproduce these exactly, or it changed the
 emulated program and does not ship:
 
+On the **1.5M-step render-benchmark route** (the one `--profile` uses), verify
+with `scripts/check-byte-identity.py` against `scripts/byte-identity-1p5M.txt`.
+**Do not write your own extraction** — one did `findall(...)[-1]` and
+manufactured a phantom failure that cost 75 minutes:
+
+```
+gfx_submits=11153  audio_submits=7685  sp_tasks=18838
+vi_interrupts=8386  controller_ops=2390  sim_time=13112786076
+render_error=None
+```
+
+On the older/deeper route:
+
 ```
 gfx_submits=16586  audio_submits=11005  sp_tasks=27591
 vi_interrupts=12008  controller_ops=3115  sim_time=18776001537
@@ -396,6 +420,17 @@ scoped — each names the specific mechanism it ruled out, not a category.
   statement about the barrier, which is a separate A/B — conflating the two
   produced a retracted claim.
 - **instruction budgeting** — changes the emulated program
+- **reducing the dispatch COUNT (167.8/render field; ceiling 6.60 ms, and
+  unreachable)** — the count is guest-determined: 48.3 dispatches and 15.8
+  `BlockExit::HostCall` exits per SP graphics task, while `audio_lle_calls` is
+  identical (0.925 vs 0.917) across populations. **The phase worth 81% of the
+  bucket does not scale with the dispatch counter at all:** `exec_mirror_calls`
+  == `executor_calls` (3.972x), not `resume_dispatch_calls` (5.313x), and its
+  per-call cost *falls* 58.49 -> 32.32 us as the count rises — elasticity 0.570,
+  because the reconcile's work is proportional to changed bytes, not to calls.
+  The store-forced boundary this hunt was chasing was already removed
+  2026-08-06 (`ExecutableWrite` 99.8% -> 0). Per-dispatch machinery is 2.332 ms
+  = 9.1% of resume NET; `gfx_ns` is 11.626 ms = 45.6%.
 - **RSP threading** — thread-local state
 - **RSP micro-optimization (17.6% of graphics — NOT the renderer)** — uniform
   11.25 ns/instruction, no defect. The interpreter is **large, not slow**:
