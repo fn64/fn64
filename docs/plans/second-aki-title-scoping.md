@@ -879,3 +879,65 @@ and the recompile receipts now do too.
 Only the two human-gated items: **locating the executable-image PCs** (no
 prior art outside WM2000) and **authoring an input schedule** (bespoke). Every
 mechanical prerequisite is satisfied.
+
+## Revenge executable-image group captured — the "human PC hunt" was a script
+
+    status            validated
+    capture_count     3            (three agreeing producer runs)
+    image_id          general-exception-preamble
+    capture_pc        0x80000180
+    byte_len          16
+    image_sha256      64bbe2d15fedd71b9f0926df5435fcbf3df504d6a2f8070e24af1bdd6de74845
+    authority_sha256  dfe2dcebdb11232e9842648361f56cd8d1d2be923bbe6819a3e55012aa9a7d08
+
+**Revenge's image digest `64bbe2d1…` differs from WM2000's `92d005d9…`**, so
+this is Revenge's own exception preamble, captured — not inherited.
+
+### The scoping doc was wrong twice about what needs a human
+
+It called this *"a human PC hunt with no prior art outside WM2000."* It is
+neither:
+
+- **The address is architectural.** `source_closure/mod.rs:18` defines
+  `MODELED_EXCEPTION_VECTOR_DESTINATIONS_V1` as a compiled-in `[u32; 6]`;
+  the discovery path iterates that fixed list asking who owns each. **No scan
+  for unknown PCs exists anywhere in it.**
+- **The producer is headless.** `tools/mupen-trace/mupen_trace.c` single-steps
+  the public `m64p_debugger` API to the target PC, reads N words and exits,
+  with no input and no video plugin attached.
+- **The wrapper is title-agnostic.** `scripts/capture-wm-executable-image-group.zsh`
+  contains **zero** `wm2000` literals; only its filename says "wm". Every
+  ROM-specific value is a flag.
+
+Same doc had already called the boot-context capture human-gated, and that
+turned out to be one command. **Two "needs a person" claims, both wrong, both
+believed until someone ran the thing.**
+
+### Two operational traps hit while doing it
+
+**A reported-present prerequisite was absent.** The RSP plugin was reported at
+`fn64-rsp-hle-build/mupen64plus-rsp-hle/projects/unix/…`; it actually lives at
+`fn64-rsp-hle-build/src/projects/unix/…`. The script's own path validation
+caught it — *"every input must be an absolute regular non-symlink file"* — and
+cost one restart rather than a bad capture. **Validate paths at the boundary,
+not by reporting them.**
+
+**`/private/tmp/fn64-wm-trace-build/` had been reaped empty by macOS**, which
+is exactly the hazard `capture-boot-context.zsh`'s header documents, and why
+the producer is rebuilt from source rather than trusted as a leftover binary.
+Any flow assuming a `/tmp` binary survives will fail this way.
+
+### Revenge's bring-up status
+
+| item | state |
+|---|---|
+| host bindings | **15/15** |
+| CPU recompile | **`unsupported = 0` of 1,749** |
+| shard tree | **generated**, `revenge-block-*` |
+| boot context | **captured**, binds `d8c097f8…` |
+| executable images | **validated**, `64bbe2d1…` |
+| input schedule | **outstanding — genuinely bespoke** |
+
+**Five of six done, and the sixth is the only one that really requires a
+person**, because an input schedule is a description of gameplay rather than a
+property of the ROM.
