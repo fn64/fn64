@@ -583,11 +583,15 @@ impl ReferenceBackend {
 
         match operation {
             gbi::RenderOp::Triangle(triangle) => {
-                require_reference_color_target(
+                let disposition = require_reference_color_target(
                     state.decode_mode,
                     state.active_target,
+                    rdram.len(),
                     "F3DEX2 triangle",
                 )?;
+                if disposition == ColorTargetDisposition::DropWrites {
+                    return Ok(());
+                }
                 if !no_depth
                     && (triangle.other_mode.depth_compare_enabled()
                         || triangle.other_mode.depth_update_enabled())
@@ -623,7 +627,15 @@ impl ReferenceBackend {
                 state.dirty = true;
             }
             gbi::RenderOp::Line(line) => {
-                require_reference_color_target(state.decode_mode, state.active_target, "G_LINE3D")?;
+                if require_reference_color_target(
+                    state.decode_mode,
+                    state.active_target,
+                    rdram.len(),
+                    "G_LINE3D",
+                )? == ColorTargetDisposition::DropWrites
+                {
+                    return Ok(());
+                }
                 if !no_depth
                     && line.other_mode.depth_compare_enabled()
                     && state.active_depth_image.is_none()
@@ -654,11 +666,15 @@ impl ReferenceBackend {
                 state.dirty = true;
             }
             gbi::RenderOp::RawTriangle(triangle) => {
-                require_reference_color_target(
+                if require_reference_color_target(
                     state.decode_mode,
                     state.active_target,
+                    rdram.len(),
                     "raw RDP triangle",
-                )?;
+                )? == ColorTargetDisposition::DropWrites
+                {
+                    return Ok(());
+                }
                 if !no_depth
                     && (triangle.other_mode.depth_compare_enabled()
                         || triangle.other_mode.depth_update_enabled())
@@ -710,7 +726,12 @@ impl ReferenceBackend {
                 // already gates every drawing op, and each now validates the
                 // latched target, so a draw through an unsupported format
                 // still fails with this same message.
-                let supported = target.layout().is_some();
+                // Loadable means BOTH a known layout and backing store. A
+                // target above installed RDRAM has nothing to read in and
+                // nothing to write out -- no Rambus device answers -- so it
+                // latches but never loads.
+                let supported =
+                    target.layout().is_some() && !target.is_unbacked_rdram(rdram.len());
                 let changes_target = state.active_target != Some(*target) || !state.target_loaded;
                 if changes_target {
                     if let (Some(previous), Some(layout)) = (state.active_target, target.layout()) {
@@ -772,11 +793,15 @@ impl ReferenceBackend {
                 fb.set_primitive_depth(state.active_primitive_depth);
             }
             gbi::RenderOp::FillRectangle(rectangle) => {
-                require_reference_color_target(
+                if require_reference_color_target(
                     state.decode_mode,
                     state.active_target,
+                    rdram.len(),
                     "G_FILLRECT",
-                )?;
+                )? == ColorTargetDisposition::DropWrites
+                {
+                    return Ok(());
+                }
                 validate_fill_rectangle(rectangle)?;
                 if (rectangle.other_mode.depth_compare_enabled()
                     || rectangle.other_mode.depth_update_enabled())
@@ -819,11 +844,15 @@ impl ReferenceBackend {
                 state.dirty = true;
             }
             gbi::RenderOp::TextureRectangle(rectangle) => {
-                require_reference_color_target(
+                if require_reference_color_target(
                     state.decode_mode,
                     state.active_target,
+                    rdram.len(),
                     texture_rectangle_name(rectangle),
-                )?;
+                )? == ColorTargetDisposition::DropWrites
+                {
+                    return Ok(());
+                }
                 validate_texture_rectangle(rectangle, state.active_target)?;
                 if (rectangle.other_mode.depth_compare_enabled()
                     || rectangle.other_mode.depth_update_enabled())
@@ -884,7 +913,7 @@ impl ReferenceBackend {
                     // Filtering rather than unwrapping keeps that an
                     // invariant rather than a panic if it ever stops holding.
                     if let Some(target) =
-                        state.active_target.filter(|t| t.layout().is_some())
+                        state.active_target.filter(|t| t.layout().is_some() && !t.is_unbacked_rdram(rdram.len()))
                     {
                         commit_color_image(rdram, target, fb, &mut self.rdram_hidden_bits);
                     }
@@ -914,7 +943,7 @@ impl ReferenceBackend {
             // See the FullSync commit: a dirty framebuffer always has a
             // supported layout, because drawing through an unsupported
             // latched target is rejected before it can dirty anything.
-            if let Some(target) = state.active_target.filter(|t| t.layout().is_some()) {
+            if let Some(target) = state.active_target.filter(|t| t.layout().is_some() && !t.is_unbacked_rdram(rdram.len())) {
                 commit_color_image(rdram, target, fb, &mut self.rdram_hidden_bits);
             }
         }

@@ -64,11 +64,22 @@ pub(super) fn validate_reference_color_image(
     Ok(())
 }
 
+/// Outcome of gating one drawing op on the latched colour target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ColorTargetDisposition {
+    /// The target is backed and executable; rasterize normally.
+    Execute,
+    /// The target addresses RDRAM that does not exist. The RDP still executes
+    /// the primitive; every resulting write is swallowed by the bus.
+    DropWrites,
+}
+
 pub(super) fn require_reference_color_target(
     decode_mode: DecodeMode,
     target: Option<gbi::ColorImage>,
+    rdram_len: usize,
     operation: &str,
-) -> Result<(), RenderError> {
+) -> Result<ColorTargetDisposition, RenderError> {
     if decode_mode != DecodeMode::Simple && target.is_none() {
         return Err(render_unsupported_error(
             "reference",
@@ -78,12 +89,24 @@ pub(super) fn require_reference_color_target(
             ),
         ));
     }
-    // G_SETCIMG is a latch and is no longer rejected when it is set, only
-    // when a primitive writes through it. This is where that lands: every
-    // drawing op passes through here, so an unsupported latched format
-    // fails at the draw with the same diagnostic it used to raise at the
-    // latch. Deferring must not become tolerating.
     if let Some(target) = target {
+        // A target outside installed RDRAM is not an error and not a mirror.
+        // No Rambus device answers, so the primitive executes and its writes
+        // are discarded (N64brew RDRAM Interface, "Accesses outside of mapped
+        // RDRAM chips"). This is checked BEFORE the format check because an
+        // unbacked target's format is equally unobservable -- nothing it
+        // writes can ever be read back.
+        //
+        // WCW/nWo Revenge reaches here with a stale format=0 size=0 target at
+        // 15.5 MiB, left in a reused command buffer past the list's SyncFull.
+        // The game ships and works on hardware precisely because these writes
+        // go nowhere.
+        if target.is_unbacked_rdram(rdram_len) {
+            return Ok(ColorTargetDisposition::DropWrites);
+        }
+        // G_SETCIMG is a latch, so an unsupported FORMAT is rejected only
+        // when a primitive writes through it -- and only when those writes
+        // would actually land. Deferring must not become tolerating.
         if target.layout().is_none() {
             return Err(render_unsupported_error(
                 "reference",
@@ -96,7 +119,7 @@ pub(super) fn require_reference_color_target(
             ));
         }
     }
-    Ok(())
+    Ok(ColorTargetDisposition::Execute)
 }
 
 pub(super) fn validate_texture_rectangle(
