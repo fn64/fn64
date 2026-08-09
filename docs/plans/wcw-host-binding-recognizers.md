@@ -409,3 +409,48 @@ Tour stays a project, not a recognizer fix.
 
 `10a73c7`'s effect is separately confirmed: **Revenge is now 15/15**, up from
 7/9, and the whole-chain probe agrees.
+
+## World Tour re-measured after both fixes: 1/9 → 2/9. Classification unchanged.
+
+The 1/9 predated `43f746e` and `10a73c7`, so it was stale. Re-measured with a
+per-symbol probe that runs every recognizer independently:
+
+| | legacy 9 | all 15 | evaluated only |
+|---|---|---|---|
+| WM2000 | 9/9 | 15/15 | 15/15 |
+| No Mercy | 9/9 | 15/15 | 15/15 |
+| VPW2 | 9/9 | 15/15 | 15/15 |
+| **Revenge** | **9/9** | **15/15** | 15/15 |
+| **World Tour** | **2/9** | **3/15** | **3/12** |
+
+**The +1 on the legacy nine is `osCreateMesgQueue` — precisely and only the
+role `43f746e` widened.** The third full-set match, `osCreateThread`, is not
+new resolution: it was never scored before because it was wrongly assumed
+inseparable. **All eight remaining evaluated roles are absent**, consistent
+with the skeleton triage's 7-of-7 `DIFFERENT_CODE` at zero matches through 35%
+opcode drift.
+
+**Verdict: still a second libultra generation.** Nothing here suggests
+over-specific matching was hiding more. The two fixes that took Revenge from
+7/9 to 15/15 moved World Tour by one role, which is what a genuinely different
+implementation looks like.
+
+All three World Tour matches were disassembled to rule out false positives
+inflating the count — the `osCreateMesgQueue` at `0x80011ae0` is the documented
+two-register 1996 compilation, and the other two have real prologues and
+documented field access.
+
+### The honest denominator is 12, not 9
+
+Six roles were recorded as inseparable; **three of them are not.**
+`osCreateThread` already had a public entry point, and
+`osSpTaskLoad`/`osSpTaskYielded` are standalone single-window predicates. Only
+three are genuinely derived — `osRecvMesg` needs `osCreateMesgQueue` and
+`osEPiStartDma` resolved to walk its call chain, and
+`osSpTaskStartGo`/`osSpTaskYield` match against helper addresses extracted from
+a resolved `osSpTaskLoad` body. Those report **not-reached**, scored as neither
+resolved nor evaluated. The legacy-9 column is retained so the comparison
+against the recorded 1/9 stays like-for-like.
+
+`cargo test --release -p fn64-discover`: **951 passed, 0 failed** (+3 pinning
+that not-reached never collapses into absent).
