@@ -1,8 +1,12 @@
 # Why the two WCW titles miss the host-binding recognizers
 
-Status: investigated 2026-08-09. One recognizer fixed; the remaining gaps are
-characterized and deliberately **not** attempted. Read the "what not to do"
-section before picking this up.
+Status: investigated 2026-08-09. Three recognizers fixed (`43f746e`,
+`10a73c7`); Revenge now resolves 15/15 and CPU-recompiles. World Tour's
+remaining gaps are characterized and deliberately **not** attempted. Read the
+"what not to do" section before picking this up.
+
+**Current numbers are in "Re-measured after both recognizer fixes" at the end
+of this document.** The 1/9 and 7/9 figures in the first matrix are pre-fix.
 
 The prior record (`corpus-certification-frontier.md:1810-1814`) lists both WCW
 titles as `FAIL -- 0 candidates` and treats them as bounded out of the boot
@@ -57,6 +61,10 @@ denominator here is 9, not 15.
 
 Revenge has two genuine gaps, not one — the second was hidden behind the
 short-circuit. World Tour is a different problem entirely.
+
+**The matrix above is the pre-fix measurement and is now stale.** See
+"Re-measured after both recognizer fixes" below for the current numbers; the
+probe is now a permanent example rather than a temporary test block.
 
 ## Ruled out: it is not a scan-window problem
 
@@ -311,3 +319,138 @@ means the grading harness's default needs no change.
 and `_DUMP` variables and the `revenge-solo` configuration already existed
 while the recognizers still rejected the ROM. The lane was waiting for
 discovery to catch up.
+
+## Re-measured after both recognizer fixes (2026-08-09)
+
+The 1/9 figure above predates `43f746e` (register-free `osCreateMesgQueue`) and
+`10a73c7` (frame-relative `osSetEventMesg`/`osSetTimer`). It was re-measured
+after both, because the whole-chain probe cannot answer the question: it
+short-circuits on `?` and reports only where it stopped.
+
+The per-symbol probe is now a permanent example rather than the temporary
+`#[ignore]` block that produced the original matrix:
+
+    cargo run --release -p fn64-discover \
+        --example probe_host_bindings_per_symbol -- <rom.z64> [more.z64 ...]
+
+It runs every recognizer independently and distinguishes **resolved** /
+**not-resolved** / **not-reached**. It prints numerator and denominator on
+every path — the whole-chain probe's bare `{total}` on failure is what got
+misread as a score.
+
+### The honest denominator is now 12, not 9
+
+The original matrix used 9 because six roles "were not expressible standalone".
+Three of those six in fact are: `osCreateThread` already had a public entry
+point (`discover_os_create_thread_host_binding`), and `osSpTaskLoad` and
+`osSpTaskYielded` are standalone single-window predicates.
+
+Only **three** roles are genuinely derived rather than matched:
+
+| role | derived from |
+|---|---|
+| `osRecvMesg` | call chain through resolved `osCreateMesgQueue` + `osEPiStartDma` |
+| `osSpTaskStartGo` | helper addresses extracted from a resolved `osSpTaskLoad` body |
+| `osSpTaskYield` | same |
+
+These are reported `not-reached` when their prerequisite fails. That is **not**
+evidence of absence, and the probe scores it as neither resolved nor evaluated.
+
+### Current matrix, all five ROMs
+
+`1` = resolved, `0` = recognizer ran and did not resolve, `-` = not reached.
+
+| symbol | WM2000 | No Mercy | VPW2 | Revenge | World Tour |
+|---|---|---|---|---|---|
+| osCreateMesgQueue | 1 | 1 | 1 | 1 | **1** |
+| osCreateThread | 1 | 1 | 1 | 1 | **1** |
+| osEPiStartDma | 1 | 1 | 1 | 1 | 0 |
+| osGetThreadPri | 1 | 1 | 1 | 1 | 1 |
+| osRecvMesg | 1 | 1 | 1 | 1 | – |
+| osSendMesg | 1 | 1 | 1 | 1 | 0 |
+| osSetEventMesg | 1 | 1 | 1 | **1** | 0 |
+| __osSiDeviceBusy | 1 | 1 | 1 | 1 | 0 |
+| osSetThreadPri | 1 | 1 | 1 | 1 | 0 |
+| osSetTimer | 1 | 1 | 1 | **1** | 0 |
+| osSpTaskLoad | 1 | 1 | 1 | 1 | 0 |
+| osSpTaskStartGo | 1 | 1 | 1 | 1 | – |
+| osSpTaskYield | 1 | 1 | 1 | 1 | – |
+| osSpTaskYielded | 1 | 1 | 1 | 1 | 0 |
+| osStartThread | 1 | 1 | 1 | 1 | 0 |
+| **all 15** | 15/15 | 15/15 | 15/15 | **15/15** | **3/15** |
+| **legacy 9** | 9/9 | 9/9 | 9/9 | **9/9** | **2/9** |
+| **evaluated only** | 15/15 | 15/15 | 15/15 | 15/15 | **3/12** |
+
+Cross-checked against `probe_host_bindings`: the two agree exactly. Four ROMs
+`OK 15/15`; World Tour `FAIL OsEPiStartDma, candidates: []`.
+
+### World Tour: 1/9 → 2/9. The classification does not change.
+
+On the comparable denominator World Tour moved from **1/9 to 2/9** — one role,
+`osCreateMesgQueue`, exactly the one `43f746e` was written to widen. On the
+full set it is **3/15**, the third being `osCreateThread`, which the original
+matrix never scored because it was wrongly assumed inseparable.
+
+All three matches were disassembled and confirmed genuine, not artifacts:
+
+- `osCreateMesgQueue` @ `0x80011ae0` (ROM `0x126e0`) — the documented
+  two-register 1996 compilation, six stores through `$a0` at offsets
+  `0/4/8/c/10/14`.
+- `osCreateThread` @ `0x80011560` — real prologue with `OSThread` field stores.
+- `osGetThreadPri` @ `0x8001d8d0` — null-check, `__osRunningThread` load from
+  `0x80033b00`, `lw $v0, 4($v0)` return.
+
+**The "second libultra generation" conclusion stands.** The +1 is the fix
+landing where it was aimed, not a sign that over-specific matching was hiding
+more. The eight remaining evaluated roles are all `absent`, consistent with the
+skeleton triage's 7-of-7 `DIFFERENT_CODE` at zero matches through 35% opcode
+drift — a much stronger negative than register or frame-size pinning. World
+Tour stays a project, not a recognizer fix.
+
+`10a73c7`'s effect is separately confirmed: **Revenge is now 15/15**, up from
+7/9, and the whole-chain probe agrees.
+
+## World Tour re-measured after both fixes: 1/9 → 2/9. Classification unchanged.
+
+The 1/9 predated `43f746e` and `10a73c7`, so it was stale. Re-measured with a
+per-symbol probe that runs every recognizer independently:
+
+| | legacy 9 | all 15 | evaluated only |
+|---|---|---|---|
+| WM2000 | 9/9 | 15/15 | 15/15 |
+| No Mercy | 9/9 | 15/15 | 15/15 |
+| VPW2 | 9/9 | 15/15 | 15/15 |
+| **Revenge** | **9/9** | **15/15** | 15/15 |
+| **World Tour** | **2/9** | **3/15** | **3/12** |
+
+**The +1 on the legacy nine is `osCreateMesgQueue` — precisely and only the
+role `43f746e` widened.** The third full-set match, `osCreateThread`, is not
+new resolution: it was never scored before because it was wrongly assumed
+inseparable. **All eight remaining evaluated roles are absent**, consistent
+with the skeleton triage's 7-of-7 `DIFFERENT_CODE` at zero matches through 35%
+opcode drift.
+
+**Verdict: still a second libultra generation.** Nothing here suggests
+over-specific matching was hiding more. The two fixes that took Revenge from
+7/9 to 15/15 moved World Tour by one role, which is what a genuinely different
+implementation looks like.
+
+All three World Tour matches were disassembled to rule out false positives
+inflating the count — the `osCreateMesgQueue` at `0x80011ae0` is the documented
+two-register 1996 compilation, and the other two have real prologues and
+documented field access.
+
+### The honest denominator is 12, not 9
+
+Six roles were recorded as inseparable; **three of them are not.**
+`osCreateThread` already had a public entry point, and
+`osSpTaskLoad`/`osSpTaskYielded` are standalone single-window predicates. Only
+three are genuinely derived — `osRecvMesg` needs `osCreateMesgQueue` and
+`osEPiStartDma` resolved to walk its call chain, and
+`osSpTaskStartGo`/`osSpTaskYield` match against helper addresses extracted from
+a resolved `osSpTaskLoad` body. Those report **not-reached**, scored as neither
+resolved nor evaluated. The legacy-9 column is retained so the comparison
+against the recorded 1/9 stays like-for-like.
+
+`cargo test --release -p fn64-discover`: **951 passed, 0 failed** (+3 pinning
+that not-reached never collapses into absent).
