@@ -38,6 +38,37 @@ tail that actually consumes wall time. **Never build a shipped-frame figure
 from profiled numbers or from p50s.** Take an unprofiled run's mean, double it
 for a 30 Hz title, and quote that.
 
+## THE TABLE ABOVE IS THE `reference` LANE. STATE THE RENDERER OR SAY NOTHING.
+
+Corrected 2026-08-09, and it is the largest single correction on this page.
+Every number in that table is a **software-rasterizer** number:
+`render-benchmark.zsh` does not export `FN64_RENDER` and `main.rs` defaults to
+`"reference"`. The owner runs **`FN64_RENDER=rt64`**. Re-measured there, same
+route, same commit, **two unprofiled reps agreeing to 0.17%, both guest
+byte-identical**:
+
+| | `reference` (the table above) | **`rt64` (what ships)** |
+|---|---:|---:|
+| per-field mean | 27.96 ms | **17.25 ms** |
+| drawn frame (x2) | 55.9 ms | **34.49 ms** |
+| fps | 17.9 | **29.0** |
+| **gap to 33.33** | **22.6 ms** | **1.16 ms** |
+
+**The gap is 20x smaller than the reference lane says, and WM2000 is at 29.0
+fps against a 30 fps target.** An agent was dispatched to find 22.6 ms in
+graphics; the honest answer was that the deficit is 3.5% of budget on the lane
+the owner runs. Post-fix graphics is **53.9%** of the render field, not 75.6%.
+Full result and the post-mirror-fix decomposition: `rt64-on-the-block-lane.md`.
+
+**So: a graphics figure without its renderer beside it is not a result.** This
+trap has now cost two separate investigations — the first produced a "graphics
+is 70% of the field" decomposition of a lane nobody runs, and the second
+happened *to an agent that had read the dead-ends list warning about the
+first*. `render-benchmark.zsh` now echoes `renderer:` in its provenance block
+(and `[fn64-profile]` prints `RENDERER:` with a not-comparable-across-backends
+warning), so a log can no longer be ambiguous. Check that line before reading
+any other number in the report.
+
 ## Running the work (not the experiment)
 
 Earned 2026-08-08, a full day on one perf question. Every rule below is about

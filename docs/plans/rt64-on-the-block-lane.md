@@ -429,3 +429,114 @@ population, which closes at 1.2–2.3%.**
 3. **The remaining target is host-side**, in this order by size: translated
    guest code (9.79), the mirror boundary (9.01), RSP interpretation (5.76),
    invalidate writes (2.04), the DPC staging memcpy (1.77).
+
+# MEASURED 2026-08-09, POST-MIRROR-FIX: the gap is 1.16 ms, not 22.6 ms. WM2000 is at 29.0 fps.
+
+Everything above this line was measured **before** `8109435` (the mirror fix).
+That commit removed a wholesale 1 MiB byte-by-byte RDRAM rebuild caused by
+passing `None` where a view was in scope, and it invalidated every
+decomposition on this page — the mirror boundary was **9.01 ms/field**, 25.9%
+of `executor_ns`, and it is now **0.19 ms**.
+
+This section re-measures the same route on the same lane after that fix.
+
+## The headline, and it reframes the project
+
+An agent was dispatched to close a **22.6 ms** gap on the premise that
+"graphics is 75.6% of the render field". **Both figures describe the
+`reference` software rasterizer, which is not the configuration the owner
+runs.** Re-measured under `FN64_RENDER=rt64`:
+
+| | briefed (`reference`) | **measured (`rt64`)** |
+|---|---:|---:|
+| per-field mean, unprofiled | 27.96 ms | **17.25 ms** |
+| drawn frame (30 Hz, x2) | 55.9 ms | **34.49 ms** |
+| fps | 17.9 | **29.0** |
+| gap to the 33.33 ms budget | **22.6 ms** | **1.16 ms** |
+
+**Two unprofiled reps, 17.23 / 17.26 ms/field, agreeing to 0.17%, both
+`GUEST BYTE-IDENTICAL` (8 of 8) against `scripts/byte-identity-1p5M.txt`.**
+Frozen: `$CLAUDE_JOB_DIR/tmp/rt64-control-FROZEN.log` and
+`rt64-control-rep2-FROZEN.log`.
+
+**The gap is 20x smaller than briefed, and it is 3.5% of the budget.** WM2000
+renders at 29.0 fps against a 30 fps target on the headless block lane. The
+strategic question "where do 22.6 ms come from" is malformed: *that gap does
+not exist on the owner's lane.*
+
+**Caveat that must ride with this number:** headless excludes presentation. A
+windowed frame is this plus present cost, never less
+(`render-benchmark.zsh:86`). 29.0 fps is the emulation ceiling, not a measured
+player experience.
+
+## The post-fix decomposition
+
+`FN64_PROFILE=1`, `FN64_RENDER=rt64`, byte-identical, one run, frozen at
+`$CLAUDE_JOB_DIR/tmp/rt64-postfix-rep1-FROZEN.log`. **Perturbation measured
+against the control above: profiled 20.26 vs unprofiled 17.25 ms/field, so
++17.6%, correction factor 0.850.** Rule 17 — shares survive, absolute ms do
+not, so both are given.
+
+Render (slow) field, n=3614; off-field n=4085; the two populations reproduce
+the census mean to 0.00%, and `over_16.667 == n_slow` exactly.
+
+| row | profiled ms | **corrected ms** | % of render field |
+|---|---:|---:|---:|
+| **render field** | 32.56 | **27.68** | 100% |
+| — graphics (`gfx_ns`) | 17.54 | **14.91** | **53.9%** |
+| — — RDP total | 11.47 | 9.75 | 35.2% |
+| — — — rasterization+ | 9.76 | 8.30 | 30.0% |
+| — — — staging copies | 1.71 | 1.45 | 5.2% |
+| — — RSP interpretation | 5.99 | 5.09 | 18.4% |
+| — non-graphics | 12.64 | 10.74 | 38.8% |
+| — — translated guest code | 9.68 | 8.23 | 29.7% |
+| — — invalidate writes | 1.98 | 1.68 | 6.1% |
+| — — audio LLE | 1.15 | 0.98 | 3.5% |
+| mirror boundary | 0.19 | 0.16 | 0.6% |
+
+Graphics is **53.9%** of the render field post-fix, not the 75.6% briefed —
+and the briefed figure was a reference-lane number besides.
+
+## An unexplained 2x that is probably RE-ATTRIBUTION, not regression
+
+Comparing whole-route totals, same route, same lane, same guest:
+
+| phase | Aug-8 (pre-fix) | Aug-9 (post-fix) | change |
+|---|---:|---:|---:|
+| `executor_ms` | 171,477 | 135,773 | **−35.7 s** |
+| `gfx_lle_rdp_ms` | 22,887 | 43,742 | **+20.9 s (1.91x)** |
+| — of which staging | 7,012 | 6,486 | −0.5 s |
+| — of which rasterization | 15,875 | 37,256 | **+21.4 s (2.35x)** |
+| `gfx_lle_rsp_ms` | 22,392 | 22,060 | 0.99x (flat) |
+| `vi_present_ms` | 10,918 | 28,839 | **+17.9 s (2.64x)** |
+
+**The program got faster overall** (census mean 22.31 → 20.26 ms/field
+profiled; 17.25 unprofiled), so this is not a regression. RSP is flat, which
+rules out a global slowdown. The two phases that rose are the two that touch
+the framebuffer/RDRAM mapping, and the mirror they used to sit behind is gone
+— so the natural reading is that work formerly billed to the mirror now
+surfaces in `gfx_lle_rdp` and `vi_present`.
+
+**That reading is NOT established.** No probe was run to confirm it, the
+barrier stats were unarmed in both eras, and this page's own rule applies: *a
+mechanism that explains the evidence is not thereby the cause.* Recorded as an
+open question, with the arithmetic attached, rather than as a finding.
+`vi_present_ns` is a tree ROOT (`counter_tree.rs:164`, parent `None`) — it is
+**beside** `gfx_ns`, not inside it, so its 28.8 s is additional to graphics
+and not double-counted in the table above.
+
+## What this redirects to, replacing the list above
+
+1. **The 22.6 ms framing is retired.** The gap is **1.16 ms**. Any plan sized
+   against the old number is sized against the wrong problem by 20x.
+2. **No single component "must" fall.** At a 1.16 ms gap, *four* separate rows
+   are individually gap-closing if eliminated: staging copies (1.45), the
+   invalidate writes (1.68), audio LLE (0.98 — nearly), or ~14% of
+   rasterization. This is the opposite of the pre-fix situation where nothing
+   sufficed.
+3. **The copyback is still not one of them** — see the closed-lines entry:
+   0.45% of the image changes and finding out costs 4.78x the copy. Confirmed
+   on THIS lane, not just the reference one.
+4. **Measure the windowed lane next.** The headless number is now close enough
+   to the bar that presentation cost decides whether the target is met, and it
+   has never been measured post-fix.
