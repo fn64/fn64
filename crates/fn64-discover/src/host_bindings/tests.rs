@@ -1301,4 +1301,205 @@ mod per_symbol_probe_agrees_with_the_chain {
         assert!(resolved.is_resolved());
         assert!(resolved.was_evaluated());
     }
+
+    /// The optional programmed-IO roles: `osEPiWriteIo` and `osEPiReadIo`.
+    ///
+    /// Fixtures are built from the public routine's shape rather than copied
+    /// from any ROM, so a clause that stops being load-bearing shows up here as
+    /// a test that still passes after the mutation it is supposed to catch.
+    mod programmed_io {
+        use super::*;
+
+        const BASE: u32 = 0x8000_1000;
+        const ACQUIRE: u32 = BASE + 0x400;
+        const RELEASE: u32 = BASE + 0x480;
+        const RAW_WRITE: u32 = BASE + 0x500;
+        const RAW_READ: u32 = BASE + 0x600;
+
+        fn jal_to(target: u32) -> u32 {
+            0x0c00_0000 | (target >> 2 & 0x03ff_ffff)
+        }
+
+        /// The public wrapper: frame, save `$ra`, preserve the three o32
+        /// arguments, then acquire / raw op / release, then tear the frame down.
+        fn wrapper(raw: u32) -> Vec<u32> {
+            vec![
+                0x27bd_ffe0,      // addiu $sp, $sp, -32
+                0xafb0_0010,      // sw    $s0, 16($sp)
+                0x0080_8021,      // move  $s0, $a0
+                0xafb1_0014,      // sw    $s1, 20($sp)
+                0x00a0_8821,      // move  $s1, $a1
+                0xafb2_0018,      // sw    $s2, 24($sp)
+                0xafbf_001c,      // sw    $ra, 28($sp)
+                jal_to(ACQUIRE),  // jal   __osPiGetAccess
+                0x00c0_9021,      // move  $s2, $a2   (delay slot)
+                0x0200_2021,      // move  $a0, $s0
+                0x0220_2821,      // move  $a1, $s1
+                jal_to(raw),      // jal   __osEPiRaw{Read,Write}Io
+                0x0240_3021,      // move  $a2, $s2   (delay slot)
+                jal_to(RELEASE),  // jal   __osPiRelAccess
+                0x0040_8021,      // move  $s0, $v0   (delay slot)
+                0x0200_1021,      // move  $v0, $s0
+                0x8fbf_001c,      // lw    $ra, 28($sp)
+                0x8fb2_0018,      // lw    $s2, 24($sp)
+                0x8fb1_0014,      // lw    $s1, 20($sp)
+                0x8fb0_0010,      // lw    $s0, 16($sp)
+                0x03e0_0008,      // jr    $ra
+                0x27bd_0020,      // addiu $sp, $sp, 32
+            ]
+        }
+
+        /// The raw device routine: poll PI status, publish the handle's bus
+        /// timing, then form the uncached device pointer from `handle + 12` and
+        /// perform exactly one access through it.
+        fn raw_device_io(store: bool) -> Vec<u32> {
+            let mut words = vec![
+                0x3c02_a460, // lui   $v0, 0xa460
+                0x3442_0010, // ori   $v0, $v0, 0x10   (PI_STATUS_REG)
+                0x8c42_0000, // lw    $v0, 0($v0)
+                0x3042_0003, // andi  $v0, $v0, 3
+                0x1440_fffd, // bnez  $v0, poll
+                0x0000_0000, // nop
+                0x8c82_000c, // lw    $v0, 12($a0)     handle->baseAddress
+                0x3c03_a000, // lui   $v1, 0xa000      uncached KSEG1
+                0x0045_1025, // or    $v0, $v0, $a1    | devAddr
+                0x0043_1025, // or    $v0, $v0, $v1
+            ];
+            words.push(if store {
+                0xac46_0000 // sw $a2, 0($v0)
+            } else {
+                0x8c42_0000 // lw $v0, 0($v0)
+            });
+            words.push(0x03e0_0008); // jr $ra
+            words.push(0x0000_1021); // move $v0, $zero
+            words
+        }
+
+        /// Lay the two wrappers and their callees into one image so discovery
+        /// runs over the same word array a real scan would see.
+        fn image() -> Vec<u32> {
+            let mut words = vec![0u32; 0x400];
+            let place = |words: &mut Vec<u32>, vram: u32, body: &[u32]| {
+                let index = ((vram - BASE) / 4) as usize;
+                if words.len() < index + body.len() {
+                    words.resize(index + body.len(), 0);
+                }
+                words[index..index + body.len()].copy_from_slice(body);
+            };
+            place(&mut words, BASE + 0x100, &wrapper(RAW_WRITE));
+            place(&mut words, BASE + 0x200, &wrapper(RAW_READ));
+            place(&mut words, RAW_WRITE, &raw_device_io(true));
+            place(&mut words, RAW_READ, &raw_device_io(false));
+            words
+        }
+
+        #[test]
+        fn both_programmed_io_roles_resolve_and_are_told_apart_by_direction() {
+            let bindings = discover_programmed_io_host_bindings(&image(), BASE);
+            assert_eq!(
+                bindings,
+                vec![
+                    HostBinding {
+                        symbol: HostBindingSymbol::OsEPiWriteIo,
+                        vram: BASE + 0x100,
+                    },
+                    HostBinding {
+                        symbol: HostBindingSymbol::OsEPiReadIo,
+                        vram: BASE + 0x200,
+                    },
+                ],
+                "the two halves differ only in the direction of the single \
+                 device access their raw routine performs"
+            );
+        }
+
+        /// An SRAM title links neither routine. That is not an error, which is
+        /// the whole reason these roles are discovered separately from the
+        /// gated fifteen.
+        #[test]
+        fn a_title_without_the_routines_yields_no_bindings_rather_than_failing() {
+            let words = vec![0u32; 0x400];
+            assert!(discover_programmed_io_host_bindings(&words, BASE).is_empty());
+        }
+
+        /// The clause that rejects the generic three-argument forwarding
+        /// wrapper: `__osPiGetAccess(void)` takes no arguments, so a routine
+        /// that establishes its first callee's arguments is something else.
+        #[test]
+        fn an_argument_taking_first_call_is_not_the_public_wrapper() {
+            let mut words = image();
+            let index = ((BASE + 0x100 - BASE) / 4) as usize;
+            // Establish $a0 for the acquire call.
+            words[index + 6] = 0x2404_0001; // addiu $a0, $zero, 1
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(
+                !bindings
+                    .iter()
+                    .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo),
+                "a wrapper whose first call takes arguments is not osEPiWriteIo"
+            );
+        }
+
+        /// The callee check. A same-shaped wrapper that forwards to something
+        /// which never forms an uncached device pointer out of `handle + 12` is
+        /// not programmed IO, and is what produced the corpus false positives.
+        #[test]
+        fn a_callee_that_is_not_pi_device_io_is_rejected() {
+            let mut words = image();
+            let index = ((RAW_WRITE - BASE) / 4) as usize;
+            // Load some other field instead of the handle's baseAddress.
+            words[index + 6] = 0x8c82_0020; // lw $v0, 32($a0)
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(
+                !bindings
+                    .iter()
+                    .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo),
+                "the callee must read the documented OSPiHandle baseAddress"
+            );
+        }
+
+        /// Acquire and release are distinct routines. A wrapper that calls the
+        /// same target twice is not the bus-bracketed shape.
+        #[test]
+        fn identical_bracket_targets_are_not_a_mutex_pair() {
+            let mut words = image();
+            let index = ((BASE + 0x100 - BASE) / 4) as usize;
+            words[index + 13] = jal_to(ACQUIRE);
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(!bindings
+                .iter()
+                .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo));
+        }
+
+        /// Ambiguity is dropped, never guessed: binding the wrong address would
+        /// redirect a guest call into an unrelated host shim.
+        #[test]
+        fn a_duplicated_role_is_omitted_rather_than_chosen_arbitrarily() {
+            let mut words = image();
+            let source = ((BASE + 0x100 - BASE) / 4) as usize;
+            let body = words[source..source + 22].to_vec();
+            let clone_at = ((BASE + 0x300 - BASE) / 4) as usize;
+            words[clone_at..clone_at + body.len()].copy_from_slice(&body);
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(
+                !bindings
+                    .iter()
+                    .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo),
+                "two candidate addresses must drop the role, not pick one"
+            );
+        }
+
+        /// These roles must stay out of the gated catalog, or the three titles
+        /// that resolve 15/15 today would start failing discovery.
+        #[test]
+        fn programmed_io_roles_are_not_part_of_the_gated_catalog() {
+            for symbol in PROGRAMMED_IO_HOST_SYMBOLS {
+                assert!(
+                    !WM_BLOCK_RUNTIME_HOST_SYMBOLS.contains(&symbol),
+                    "{symbol:?} must remain optional"
+                );
+            }
+            assert_eq!(WM_BLOCK_RUNTIME_HOST_SYMBOLS.len(), 15);
+        }
+    }
 }

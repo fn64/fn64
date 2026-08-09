@@ -41,7 +41,24 @@ pub enum HostBindingSymbol {
     OsSpTaskYield,
     OsSpTaskYielded,
     OsStartThread,
+    /// `osEPiWriteIo(OSPiHandle *, u32 devAddr, u32 data)`.
+    OsEPiWriteIo,
+    /// `osEPiReadIo(OSPiHandle *, u32 devAddr, u32 *data)`.
+    OsEPiReadIo,
 }
+
+/// The programmed-IO roles, discovered separately from
+/// [`WM_BLOCK_RUNTIME_HOST_SYMBOLS`] and deliberately NOT part of it.
+///
+/// These are optional by construction. A title that saves to SRAM reaches its
+/// save device entirely through PI DMA and never links these routines, so
+/// requiring them would fail discovery for the three titles that already
+/// resolve 15/15. A title that saves to FlashRAM issues its commands through
+/// them, and leaving them unbound means the guest's own recompiled copy drives
+/// raw hardware -- which is the No Mercy fault at pc `0x8003d518`, a `sw` into
+/// the FlashRAM command window at `0xA801_0000`.
+pub const PROGRAMMED_IO_HOST_SYMBOLS: [HostBindingSymbol; 2] =
+    [HostBindingSymbol::OsEPiReadIo, HostBindingSymbol::OsEPiWriteIo];
 
 /// Exact installed host target denominator shared by the WM production build
 /// and its executable-source receipt validator.
@@ -97,7 +114,9 @@ impl HostBindingSymbol {
             | Self::OsSpTaskStartGo
             | Self::OsSpTaskYield
             | Self::OsSpTaskYielded
-            | Self::OsStartThread => HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev,
+            | Self::OsStartThread
+            | Self::OsEPiWriteIo
+            | Self::OsEPiReadIo => HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev,
         }
     }
 
@@ -118,7 +137,9 @@ impl HostBindingSymbol {
             | Self::OsSpTaskStartGo
             | Self::OsSpTaskYield
             | Self::OsSpTaskYielded
-            | Self::OsStartThread => HostSpawnedStatusEffect::None,
+            | Self::OsStartThread
+            | Self::OsEPiWriteIo
+            | Self::OsEPiReadIo => HostSpawnedStatusEffect::None,
         }
     }
 }
@@ -1764,6 +1785,143 @@ fn is_si_device_busy(words: &[u32]) -> bool {
         && rt(words[5]) == 2
 }
 
+/// The body of a public `__osEPiRaw{Read,Write}Io`, validated through the
+/// wrapper that calls it.
+///
+/// Every clause is a published property of the routine rather than of one
+/// compilation: `OSPiHandle.baseAddress` lives at the documented offset 12, the
+/// caller's `devAddr` is ORed into it, the result is forced to the uncached
+/// KSEG1 view, and exactly one device access is performed through the pointer
+/// so formed. A routine that never builds an uncached PI device pointer out of
+/// `handle + 12` is not this routine, whatever else it resembles.
+///
+/// This exists because the wrapper shape alone is not decisive. A routine that
+/// preserves three arguments across a bracketed call is a common compiler
+/// idiom; measured over a 287-ROM corpus it is what Rogue Squadron's
+/// table-search helper and Turok 3's forwarding wrappers look like too.
+/// Checking the callee is what separates PI device IO from those.
+fn is_raw_epi_device_io(words: &[u32]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        // The handle's public `baseAddress` field, loaded from `$a0`.
+        if !(op(*word) == 0x23 && imm(*word) == 12 && rs(*word) == 4) {
+            return false;
+        }
+        let tail = &words[index + 1..words.len().min(index + 6)];
+        // The uncached KSEG1 device view, the devAddr merge, and the single
+        // access through the resulting pointer.
+        tail.iter()
+            .any(|word| op(*word) == 0x0f && rs(*word) == 0 && (*word & 0xffff) == 0xa000)
+            && tail.iter().any(|word| op(*word) == 0 && word & 0x3f == 0x25)
+            && tail
+                .iter()
+                .any(|word| op(*word) == 0x23 || op(*word) == 0x2b)
+    })
+}
+
+/// Recognize the public `osEPiWriteIo(OSPiHandle *, u32 devAddr, u32 data)` and
+/// `osEPiReadIo(OSPiHandle *, u32 devAddr, u32 *data)`.
+///
+/// Both are the same published shape -- acquire the PI bus, perform one raw
+/// device access, release it -- and differ only in which raw routine sits in
+/// the middle. The caller resolves that distinction; this predicate identifies
+/// the bracketed-IO shape and returns the three call targets in program order.
+///
+/// The clauses, each a property of the public routine:
+///
+/// * it builds a stack frame with a negative immediate and restores exactly
+///   that frame in the `jr $ra` delay slot;
+/// * it saves `$ra`, because it makes calls;
+/// * each of the three o32 arguments is moved to a callee-saved register
+///   before the first call, since each must survive it;
+/// * it makes exactly three calls, in the order acquire, raw op, release;
+/// * acquire and release are distinct entry points (`__osPiGetAccess` and
+///   `__osPiRelAccess` are different routines);
+/// * the acquire call is argument-free -- `__osPiGetAccess(void)` takes no
+///   arguments, so nothing may write `$a0`/`$a1`/`$a2` before it; and
+/// * the three preserved arguments are routed back into `$a0`/`$a1`/`$a2` for
+///   the raw op.
+///
+/// No register number, instruction schedule, frame size, or address is pinned.
+/// The argument-free-acquire clause is the one that rejects the generic
+/// three-argument forwarding wrapper this otherwise resembles.
+fn epi_io_wrapper_targets(words: &[u32]) -> Option<(u32, u32, u32)> {
+    if !(is_addiu(words[0], 29, 29, imm(words[0])) && imm(words[0]) < 0) {
+        return None;
+    }
+    let frame = imm(words[0]);
+    // The frame this routine created must be the frame it tears down.
+    let end = (4..words.len().saturating_sub(1)).find(|index| {
+        is_jr_ra(words[*index]) && is_addiu(words[index + 1], 29, 29, -frame)
+    })?;
+    let body = &words[..end];
+    if !body
+        .iter()
+        .any(|word| op(*word) == 0x2b && rt(*word) == 31 && rs(*word) == 29)
+    {
+        return None;
+    }
+
+    let calls = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| jal_field(*word).map(|target| (index, target)))
+        .collect::<Vec<_>>();
+    let [(acquire_at, acquire), (raw_at, raw), (_, release)] = calls[..] else {
+        return None;
+    };
+    if acquire == release || !(acquire_at < raw_at) {
+        return None;
+    }
+
+    // The acquire call takes no arguments.
+    let writes_argument = |word: u32| -> Option<u32> {
+        let target = match op(word) {
+            0 => rd(word),
+            0x08 | 0x09 | 0x0c | 0x0d | 0x0e | 0x0f | 0x23 | 0x24 | 0x25 => rt(word),
+            _ => return None,
+        };
+        (4..=6).contains(&target).then_some(target)
+    };
+    if body[..=acquire_at.min(body.len() - 1)]
+        .iter()
+        .enumerate()
+        .any(|(index, word)| index != acquire_at && writes_argument(*word).is_some())
+    {
+        return None;
+    }
+
+    // Each argument is preserved in a callee-saved register across the call,
+    // then routed back into its o32 argument register for the raw op.
+    let mut preserved = [None; 3];
+    for word in &body[..=(acquire_at + 1).min(body.len() - 1)] {
+        if op(*word) == 0 && *word & 0x3f == 0x21 && (16..24).contains(&rd(*word)) {
+            let source = match (rs(*word), rt(*word)) {
+                (source, 0) => source,
+                (0, source) => source,
+                _ => continue,
+            };
+            if (4..=6).contains(&source) {
+                preserved[source as usize - 4] = Some(rd(*word));
+            }
+        }
+    }
+    if preserved.iter().any(Option::is_none) {
+        return None;
+    }
+    let mut routed = [None; 3];
+    for word in &body[acquire_at + 1..=(raw_at + 1).min(body.len() - 1)] {
+        if op(*word) == 0 && *word & 0x3f == 0x21 && (4..=6).contains(&rd(*word)) {
+            let source = match (rs(*word), rt(*word)) {
+                (source, 0) => source,
+                (0, source) => source,
+                _ => continue,
+            };
+            routed[rd(*word) as usize - 4] = Some(source);
+        }
+    }
+    (routed == preserved).then_some((acquire, raw, release))
+}
+
 /// Structural shape of libultra's 64DD drive initialisation.
 ///
 /// The routine is recognised by what it *does*, not by any address: it loads a
@@ -2430,6 +2588,110 @@ fn probe_overlay_recv_mesg(
             candidates: several.to_vec(),
         },
     }
+}
+
+/// Discover the optional programmed-IO host bindings,
+/// [`PROGRAMMED_IO_HOST_SYMBOLS`].
+///
+/// Unlike [`discover_wm_block_runtime_host_bindings`] this never fails: a title
+/// that does not link these routines returns an empty map, which is the correct
+/// answer for an SRAM title rather than an error. Titles that do link them get
+/// both, or -- for a build that links only one half -- just that one.
+///
+/// `osEPiWriteIo` and `osEPiReadIo` share one shape and are separated by the
+/// raw routine each calls: the write half's callee ends in a store through the
+/// device pointer, the read half's in a load followed by a store to the
+/// caller's out-parameter. Both callees are validated as genuine PI device IO
+/// by [`is_raw_epi_device_io`] before either address is reported, so a
+/// same-shaped routine that forwards to something else cannot be installed.
+///
+/// Ambiguity is dropped rather than guessed. If either role matches more than
+/// one address the role is omitted, because binding the wrong address would
+/// redirect a guest call into an unrelated host shim.
+pub fn discover_programmed_io_host_bindings(words: &[u32], va_start: u32) -> Vec<HostBinding> {
+    /// Widest window the wrapper needs: prologue, three calls with their
+    /// argument routing, and the epilogue.
+    const WINDOW: usize = 40;
+    /// The raw callee's `lw handle+12` sits well past its PI-status poll.
+    const CALLEE_WINDOW: usize = 96;
+
+    if !va_start.is_multiple_of(4) || words.len() < WINDOW {
+        return Vec::new();
+    }
+
+    let callee_body = |target: u32| -> Option<&[u32]> {
+        // `jal_field` yields the raw 26-bit instruction field, which is a WORD
+        // address. Scale it to bytes before forming the segment-relative vram.
+        let vram = 0x8000_0000u32 | (target << 2);
+        let index = usize::try_from(vram.checked_sub(va_start)?).ok()? / 4;
+        (index < words.len()).then(|| &words[index..words.len().min(index + CALLEE_WINDOW)])
+    };
+
+    let mut writes = Vec::new();
+    let mut reads = Vec::new();
+    for (index, window) in words.windows(WINDOW).enumerate() {
+        let Some((_, raw, _)) = epi_io_wrapper_targets(window) else {
+            continue;
+        };
+        let Some(body) = callee_body(raw) else {
+            continue;
+        };
+        if !is_raw_epi_device_io(body) {
+            continue;
+        }
+        let Some(vram) = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(4))
+            .and_then(|offset| va_start.checked_add(offset))
+        else {
+            continue;
+        };
+        // The write half's raw routine stores the caller's data through the
+        // device pointer; the read half's loads from it. That is the ABI
+        // difference between the two, and the only thing distinguishing them.
+        if raw_epi_device_io_is_write(body) {
+            writes.push(vram);
+        } else {
+            reads.push(vram);
+        }
+    }
+
+    let mut bindings = Vec::new();
+    for (symbol, mut candidates) in [
+        (HostBindingSymbol::OsEPiReadIo, reads),
+        (HostBindingSymbol::OsEPiWriteIo, writes),
+    ] {
+        candidates.sort_unstable();
+        candidates.dedup();
+        if let [vram] = collapse_overlapping_runs(&candidates)[..] {
+            bindings.push(HostBinding { symbol, vram });
+        }
+    }
+    bindings.sort_by_key(|binding| binding.symbol);
+    bindings
+}
+
+/// Whether a validated raw EPI device routine is the WRITE half.
+///
+/// The two halves differ only in the direction of the single device access the
+/// public routine performs: the write half stores the caller's `data` through
+/// the uncached device pointer, the read half loads from it. Everything before
+/// that access -- the PI-status poll, the domain-register publication, the
+/// handle decode -- is identical in both.
+fn raw_epi_device_io_is_write(words: &[u32]) -> bool {
+    words
+        .iter()
+        .enumerate()
+        .find_map(|(index, word)| {
+            (op(*word) == 0x23 && imm(*word) == 12 && rs(*word) == 4).then_some(index)
+        })
+        .and_then(|index| {
+            words[index + 1..words.len().min(index + 6)]
+                .iter()
+                .find(|word| op(**word) == 0x23 || op(**word) == 0x2b)
+                .map(|word| op(*word) == 0x2b)
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

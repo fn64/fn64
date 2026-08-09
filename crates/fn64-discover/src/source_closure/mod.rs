@@ -435,6 +435,8 @@ pub enum HostBindingSymbolV1 {
     OsSpTaskYielded,
     OsStartThread,
     OsDriveRomInit,
+    OsEPiWriteIo,
+    OsEPiReadIo,
 }
 
 impl From<crate::host_bindings::HostBindingSymbol> for HostBindingSymbolV1 {
@@ -457,6 +459,8 @@ impl From<crate::host_bindings::HostBindingSymbol> for HostBindingSymbolV1 {
             Source::OsSpTaskYield => Self::OsSpTaskYield,
             Source::OsSpTaskYielded => Self::OsSpTaskYielded,
             Source::OsStartThread => Self::OsStartThread,
+            Source::OsEPiWriteIo => Self::OsEPiWriteIo,
+            Source::OsEPiReadIo => Self::OsEPiReadIo,
         }
     }
 }
