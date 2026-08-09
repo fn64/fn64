@@ -510,6 +510,18 @@ pub(crate) fn issue_wm2000_host_function_catalog() -> fn64_abi::recompiled::AbiH
             shim: Shim::OsEPiReadIo,
         });
     }
+    // The FlashRAM API. Present only for a title that links it; binding these
+    // means the guest's flash driver never runs and fn64's own osFlash*
+    // modelling carries the protocol.
+    for (target_pc, shim) in [
+        (pack::OS_FLASH_INIT, Shim::OsFlashInit),
+        (pack::OS_FLASH_SECTOR_ERASE, Shim::OsFlashSectorErase),
+        (pack::OS_FLASH_READ_ARRAY, Shim::OsFlashReadArray),
+    ] {
+        if let Some(target_pc) = target_pc {
+            bindings.push(Binding { target_pc, shim });
+        }
+    }
     fn64_abi::recompiled::issue_abi_host_function_catalog_v1(bindings)
         .expect("ABI-issued host-function catalog is exact and unambiguous")
 }
