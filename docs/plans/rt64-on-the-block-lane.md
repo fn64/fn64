@@ -429,3 +429,225 @@ population, which closes at 1.2–2.3%.**
 3. **The remaining target is host-side**, in this order by size: translated
    guest code (9.79), the mirror boundary (9.01), RSP interpretation (5.76),
    invalidate writes (2.04), the DPC staging memcpy (1.77).
+
+# MEASURED 2026-08-09, POST-MIRROR-FIX: the gap is 1.16 ms, not 22.6 ms. WM2000 is at 29.0 fps.
+
+Everything above this line was measured **before** `8109435` (the mirror fix).
+That commit removed a wholesale 1 MiB byte-by-byte RDRAM rebuild caused by
+passing `None` where a view was in scope, and it invalidated every
+decomposition on this page — the mirror boundary was **9.01 ms/field**, 25.9%
+of `executor_ns`, and it is now **0.19 ms**.
+
+This section re-measures the same route on the same lane after that fix.
+
+## The headline, and it reframes the project
+
+An agent was dispatched to close a **22.6 ms** gap on the premise that
+"graphics is 75.6% of the render field". **Both figures describe the
+`reference` software rasterizer, which is not the configuration the owner
+runs.** Re-measured under `FN64_RENDER=rt64`:
+
+| | briefed (`reference`) | **measured (`rt64`)** |
+|---|---:|---:|
+| per-field mean, unprofiled | 27.96 ms | **17.25 ms** |
+| drawn frame (30 Hz, x2) | 55.9 ms | **34.49 ms** |
+| fps | 17.9 | **29.0** |
+| gap to the 33.33 ms budget | **22.6 ms** | **1.16 ms** |
+
+**Two unprofiled reps, 17.23 / 17.26 ms/field, agreeing to 0.17%, both
+`GUEST BYTE-IDENTICAL` (8 of 8) against `scripts/byte-identity-1p5M.txt`.**
+Frozen: `$CLAUDE_JOB_DIR/tmp/rt64-control-FROZEN.log` and
+`rt64-control-rep2-FROZEN.log`.
+
+**The gap is 20x smaller than briefed, and it is 3.5% of the budget.** WM2000
+renders at 29.0 fps against a 30 fps target on the headless block lane. The
+strategic question "where do 22.6 ms come from" is malformed: *that gap does
+not exist on the owner's lane.*
+
+**Caveat that must ride with this number:** headless excludes presentation. A
+windowed frame is this plus present cost, never less
+(`render-benchmark.zsh:86`). 29.0 fps is the emulation ceiling, not a measured
+player experience.
+
+## The post-fix decomposition
+
+`FN64_PROFILE=1`, `FN64_RENDER=rt64`, byte-identical, one run, frozen at
+`$CLAUDE_JOB_DIR/tmp/rt64-postfix-rep1-FROZEN.log`. **Perturbation measured
+against the control above: profiled 20.26 vs unprofiled 17.25 ms/field, so
++17.6%, correction factor 0.850.** Rule 17 — shares survive, absolute ms do
+not, so both are given.
+
+Render (slow) field, n=3614; off-field n=4085; the two populations reproduce
+the census mean to 0.00%, and `over_16.667 == n_slow` exactly.
+
+| row | profiled ms | **corrected ms** | % of render field |
+|---|---:|---:|---:|
+| **render field** | 32.56 | **27.68** | 100% |
+| — graphics (`gfx_ns`) | 17.54 | **14.91** | **53.9%** |
+| — — RDP total | 11.47 | 9.75 | 35.2% |
+| — — — rasterization+ | 9.76 | 8.30 | 30.0% |
+| — — — staging copies | 1.71 | 1.45 | 5.2% |
+| — — RSP interpretation | 5.99 | 5.09 | 18.4% |
+| — non-graphics | 12.64 | 10.74 | 38.8% |
+| — — translated guest code | 9.68 | 8.23 | 29.7% |
+| — — invalidate writes | 1.98 | 1.68 | 6.1% |
+| — — audio LLE | 1.15 | 0.98 | 3.5% |
+| mirror boundary | 0.19 | 0.16 | 0.6% |
+
+Graphics is **53.9%** of the render field post-fix, not the 75.6% briefed —
+and the briefed figure was a reference-lane number besides.
+
+## An unexplained 2x that is probably RE-ATTRIBUTION, not regression
+
+Comparing whole-route totals, same route, same lane, same guest:
+
+| phase | Aug-8 (pre-fix) | Aug-9 (post-fix) | change |
+|---|---:|---:|---:|
+| `executor_ms` | 171,477 | 135,773 | **−35.7 s** |
+| `gfx_lle_rdp_ms` | 22,887 | 43,742 | **+20.9 s (1.91x)** |
+| — of which staging | 7,012 | 6,486 | −0.5 s |
+| — of which rasterization | 15,875 | 37,256 | **+21.4 s (2.35x)** |
+| `gfx_lle_rsp_ms` | 22,392 | 22,060 | 0.99x (flat) |
+| `vi_present_ms` | 10,918 | 28,839 | **+17.9 s (2.64x)** |
+
+**The program got faster overall** (census mean 22.31 → 20.26 ms/field
+profiled; 17.25 unprofiled), so this is not a regression. RSP is flat, which
+rules out a global slowdown. The two phases that rose are the two that touch
+the framebuffer/RDRAM mapping, and the mirror they used to sit behind is gone
+— so the natural reading is that work formerly billed to the mirror now
+surfaces in `gfx_lle_rdp` and `vi_present`.
+
+**That reading is NOT established.** No probe was run to confirm it, the
+barrier stats were unarmed in both eras, and this page's own rule applies: *a
+mechanism that explains the evidence is not thereby the cause.* Recorded as an
+open question, with the arithmetic attached, rather than as a finding.
+`vi_present_ns` is a tree ROOT (`counter_tree.rs:164`, parent `None`) — it is
+**beside** `gfx_ns`, not inside it, so its 28.8 s is additional to graphics
+and not double-counted in the table above.
+
+## What this redirects to, replacing the list above
+
+1. **The 22.6 ms framing is retired.** The gap is **1.16 ms**. Any plan sized
+   against the old number is sized against the wrong problem by 20x.
+2. **No single component "must" fall.** At a 1.16 ms gap, *four* separate rows
+   are individually gap-closing if eliminated: staging copies (1.45), the
+   invalidate writes (1.68), audio LLE (0.98 — nearly), or ~14% of
+   rasterization. This is the opposite of the pre-fix situation where nothing
+   sufficed.
+3. **The copyback is still not one of them** — see the closed-lines entry:
+   0.45% of the image changes and finding out costs 4.78x the copy. Confirmed
+   on THIS lane, not just the reference one.
+4. **Measure the windowed lane next.** The headless number is now close enough
+   to the bar that presentation cost decides whether the target is met, and it
+   has never been measured post-fix.
+
+# MEASURED 2026-08-09: the full per-field distribution. The spikes are an early burst worth 0.29 ms/frame, and the render field is TIGHT.
+
+The post-fix rt64 p50/p95/p99 **already existed** in the two frozen control
+logs (`rt64-control{,-rep2}-FROZEN.log:177`) as a whole-population figure —
+p50=10.39/10.31, p95=28.08/28.10, p99=28.80/28.82, max=1066/1073, mean
+17.23/17.26. What did not exist was the **per-field sequence**, and therefore
+the population split and the location of the ~1 s spikes.
+
+`FN64_PROFILE` sets `FN64_FRAME_CENSUS_SEQUENCE=400` with skip=0, so the
+profiled log samples only the **leading edge** of steady state: its in-window
+max is 47 ms against a run max of 1117, and its window mean is 12.68 against a
+run mean of 20.26. **That window is not representative and no spike was ever
+inside it.**
+
+One run, `FN64_FRAME_CENSUS_SEQUENCE=8000` + `FN64_FRAME_CENSUS_POPULATIONS=1`,
+`FN64_RENDER=rt64`, 100% coverage of all 7,698 dumpable steady fields.
+Frozen: `$CLAUDE_JOB_DIR/tmp/seq-rep1-FROZEN.log`. Pre-registration written
+before the run: `$CLAUDE_JOB_DIR/tmp/PREREG-spike-distribution.md`.
+**Guest byte-identical 8 of 8**, `fields=7699`.
+
+## The pre-registered falsifier F1 FIRED: the populations gate perturbs +1.86%
+
+Census mean **17.57 ms** against the unperturbed control's 17.25, outside the
+pre-registered 17.08–17.42 window. `FN64_FRAME_CENSUS_SEQUENCE` is exit-time
+only and costs nothing, but `FN64_FRAME_CENSUS_POPULATIONS` adds a
+`with_executor` borrow plus ~20 atomic loads per field (frame_census.rs:469).
+**Correction factor 0.9820; shares survive, absolutes are corrected** (rule 17).
+Corrected drawn frame reproduces the control's 2 x 17.25 = 34.50 to **0.04%**.
+
+## The distribution, per population
+
+| population | n | mean | p50 | p95 | p99 | max |
+|---|---:|---:|---:|---:|---:|---:|
+| **render** (carries a gfx submit) | 3852 | 26.12 | 27.45 | 28.98 | 29.85 | 1136.05 |
+| **non-render** (no submit) | 3846 | 9.00 | 8.93 | 9.73 | 9.89 | 10.20 |
+| all steady | 7698 | 17.57 | 10.45 | 28.65 | 29.52 | 1136.05 |
+
+**The populations are 1:1 (3852 / 3846, ratio 1.0016) and cleanly separated**
+— 100% of over-budget fields carry a submit, and the non-render population's
+entire range is 8.9–10.2 ms. So a 30 Hz **drawn frame is one render field plus
+one non-render field**, not two average fields:
+
+    render 25.65 + non-render 8.83 = 34.49 ms/frame = 29.00 fps   (corrected)
+
+**All of the 1.15 ms overage sits on the render field.** The non-render field
+is 8.83 ms — 25.6% of the frame — and is not a target.
+
+## The p95 concern resolves to nothing: the render population is TIGHT
+
+    render p25 25.27  p50 27.45  p75 28.11  p90 28.65  p95 28.98  p99 29.85
+
+**IQR = 2.84 ms. p99 − p50 = 2.40 ms.** There is no fat tail to harvest inside
+the render population; it is a dense band at 25–29 ms. **This is a mean
+problem, not a tail problem** — which means the brief's "p95 materially
+reduced" sub-goal is not a separate lever. Anything that moves the render
+field's mean moves its p95 with it, and nothing else will.
+
+## The ~1 s spikes: an EARLY BURST, not a recurring stall. Worth 0.29 ms/frame.
+
+Every field above 100 ms, in the whole run:
+
+| field | cost | gfx |
+|---:|---:|---:|
+| 829 | 135.77 ms | 2 |
+| 1460 | 121.32 ms | 4 |
+| **1806** | **1136.05 ms** | 3 |
+
+**Three spikes, all inside fields 829–1806, and ZERO in the remaining 5,892
+fields (~103 s).** The pre-registered discriminator was: *arena-load predicts
+few + early + none in the second half; recurring-stall predicts even spacing
+across both halves.* **Arena-load confirmed on all three counts;
+recurring-stall refuted.**
+
+Falsifier F3 (spike is a residual warmup transient the `warmup_gfx=300` gate
+missed) **did not fire** — the earliest spike is field 829, deep inside steady
+state, not in the first 100.
+
+**Decision arithmetic, by the rule fixed before the data.** Replacing each
+spike with the population median (a perfect fix still has to run the field):
+
+| removed | fields | mean effect | **per drawn frame** |
+|---|---:|---:|---:|
+| >500 ms | 1 | −0.146 ms | **−0.29 ms** |
+| >100 ms | 3 | −0.177 ms | **−0.35 ms** |
+| >50 ms | 5 | −0.189 ms | **−0.38 ms** |
+
+The pre-registered materiality floor was 0.20 ms/frame. **At 0.29–0.38 ms/frame
+this CLEARS the floor** — it is 25–33% of the 1.15 ms gap from three fields —
+but it is a one-off burst, so it is a **warmup/load** cost, not a steady-state
+one. Its value is real but bounded and it does not recur.
+
+**Cadence is NOT a rate for this run and must not be quoted as one.** A mean
+gap of 488 fields reads as "a hitch every 8.6 s", which is false: all three
+spikes fall in a 977-field span and nothing follows for 103 s. As a
+player-experience item — kept separate from the mean, per the protocol — the
+honest statement is **"a short burst of hitches early in the route, then none"**.
+
+## What this redirects to
+
+1. **The target is the render field's MEAN, and only that.** 25.65 ms
+   corrected, one per drawn frame. To reach 33.33 ms/frame needs −1.15 ms off
+   it; for the owner's "room to spare" (≤31.5 ms/frame, 5% margin) needs
+   **−2.99 ms = 11.6% of the render field.**
+2. **The non-render field (8.83 ms, 25.6% of the frame) is not a target** and
+   neither is the tail. Both are already tight.
+3. **The spikes are worth 0.29 ms/frame and are a load transient**, not a
+   steady-state defect. Cheap if the arena load is schedulable; not the main
+   line either way.
+4. **Do not re-derive the distribution.** It is in `seq-rep1-FROZEN.log` at
+   100% coverage, and the perturbation factor for that run is 0.9820.
