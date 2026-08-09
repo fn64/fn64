@@ -206,3 +206,226 @@ work per step than the gameplay route.
 That RT64 will be faster here. That is what the measurement is for. This
 document only establishes that **the stated reason for not measuring is
 wrong**, and that the cost it would attack is the largest one there is.
+
+---
+
+# MEASURED 2026-08-08: under RT64 the RDP is 5.75 ms, not 26.9. "Fix the RDP" does not describe the owner's configuration.
+
+The question that prompted this: the owner said **"fix the rdp"** after a
+decomposition showed graphics at 70% of the render field and the RDP at 57.8%
+of `resume NET`. **That decomposition ran on the SOFTWARE reference
+rasterizer.** `reference/wm2000-routes/render-benchmark.zsh` never exports
+`FN64_RENDER`, and `examples/wm2000-block-boot/src/main.rs:863` defaults to
+`"reference"`. The owner's windowed sessions run `FN64_RENDER=rt64`.
+
+So the prior figure was re-measured against the configuration he actually runs,
+before anything was optimized.
+
+**Four runs, `reference`/`rt64` interleaved, two reps, 1.5M steps, route
+`entrance-to-match.schedule`, quiet machine (load settled below the
+benchmark's own 3.0 gate before each run rather than relaxing the gate).**
+Frozen logs (rule 29):
+`$CLAUDE_JOB_DIR/tmp/frozen-rdp-step1/{reference,rt64}-rep{1,2}.full.log`.
+Pre-registration, written before the measuring binary existed:
+`$CLAUDE_JOB_DIR/tmp/PREREG.md`.
+
+**Guest byte-identical in all four runs**, checked with
+`scripts/check-byte-identity.py` against `scripts/byte-identity-1p5M.txt`:
+8 of 8 — `gfx_submits=11153`, `audio_submits=7685`, `sp_tasks=18838`,
+`vi_interrupts=8386`, `controller_ops=2390`, `sim_time=13112786076`,
+`render_error=None`, `fields=7699`. Same guest program, different host cost.
+
+## The answer
+
+| slow (render) field | reference | rt64 | change |
+|---|---:|---:|---|
+| `gfx_lle_rdp_ns` (**the RDP**) | 26.953 / 26.807 | **5.771 / 5.736** | **4.7x less** |
+| — of which staging memcpy | 1.972 / 2.158 | 1.772 / 1.740 | — |
+| — of which rasterization+ | 24.981 / 24.649 | **3.999 / 3.995** | **6.2x less** |
+| `gfx_lle_rsp_ns` (RSP interp) | 5.691 / 5.666 | 5.769 / 5.754 | unchanged |
+| `vi_present_ns` | 3.882 / 3.876 | **0.890 / 0.893** | **4.4x less** |
+| dispatch = guest code | 9.789 / 9.706 | 9.780 / 9.793 | unchanged |
+| `resume NET` | 46.711 / 46.330 | **25.499 / 25.457** | 1.82x less |
+| `executor_ns` | 55.949 / 55.567 | **34.795 / 34.741** | 1.60x less |
+| **RDP as % of `resume NET`** | **57.7 / 57.9** | **22.6 / 22.5** | −35 pp |
+
+Whole-route, in the owner's terms:
+
+| | reference | rt64 |
+|---|---:|---:|
+| **ratio A** | 2.13x / 2.12x | **1.34x / 1.34x** |
+| mean ms/field | 35.49 / 35.26 | **22.31 / 22.33** |
+| p50 | 32.90 / 33.44 | **16.61 / 17.02** |
+| p95 | 65.98 / 66.06 | 38.43 / 38.19 |
+| over budget | 50.1% / 50.0% | 50.0% / 50.0% |
+
+**Ranges fully disjoint; each lane reproduces within 1%.** RDP share agrees
+across reps to **0.2 pp** (reference) and **0.1 pp** (rt64), far inside the
+3 pp pre-registered threshold.
+
+## Judged against the thresholds fixed before the data existed
+
+| # | threshold | result |
+|---|---|---|
+| T1 | RDP "still dominant" iff > 8.33 ms/field | **5.75 ms — NOT dominant** |
+| T2 | RDP "collapsed" iff < 20% of `resume NET` | **22.6% — not collapsed** |
+| T3 | reps agree within 3 pp | **0.1–0.2 pp — passes** |
+| T4 | closure within 5% | **slow 1.2–2.3% — passes** (see the fast-field note) |
+
+**T1 and T2 disagree, and that is reported rather than resolved in favour of
+the tidier story.** The RDP is no longer the thing that makes the field miss
+the bar by itself — 5.75 ms against a 16.667 ms budget — but at 22.6% it is
+still the second-largest line in `resume NET`. The honest statement is
+**"greatly reduced, not eliminated"**, which is neither of the two headlines
+that were available before measuring.
+
+### The falsifier fired against my own brief, in the direction I wrote down
+
+The brief that commissioned this predicted RT64 would collapse the RDP and that
+the 70% would prove to be an artifact of a lane the owner does not use. The
+pre-registered falsifier was: *if rt64's RDP is within 20% of reference's, that
+framing is wrong.* It is **78.6% lower**, so the framing survives — the lanes
+genuinely differ, and the reference-lane figure did not describe the owner's
+configuration.
+
+**But the framing was still half wrong, and the half that failed matters more.**
+"The RDP is already fixed for his configuration" is **not** what the data says.
+5.75 ms/field is real, it is 22.6% of `resume NET`, and 1.77 ms of it is a
+staging memcpy that has nothing to do with rasterization.
+
+## The prior 1.28x figure cannot be compared to this, in either direction
+
+`perf-method.md:502-532` records RT64 on this lane at **1.28x** (56.28 → 44.13
+ms/field). Anyone reading the 1.60x above will reach for it. **It is not
+comparable:** it was measured before `abc7871` (the nested-writer view fix,
+44.13 → 22.51), and this file's own note on that commit says *"Not
+re-profiled. Everything in the table below this line describes the 44.13 ms
+world and is now stale."* The profile inverted at that commit. Both numbers are
+correct about different programs.
+
+The 2026-08-07 entry's third finding — *"the speedup does not scale with
+graphics density, so a large share of what RT64 was expected to remove is not
+rasterization"* — is **confirmed and now has a mechanism**: rasterization was
+never the whole of the reference lane's RDP bucket, and the guard work that
+dominated the field then has since been removed by `abc7871`.
+
+## What the reference lane's 26.9 ms actually contained
+
+`fn64-render-reference`'s `process_rdp_commands`
+(`crates/fn64-render-reference/src/backend/render_backend.rs:121` and `:140`)
+does **a second whole-RDRAM `to_vec()` clone and a full copy-back**, nested
+inside `dispatch_captured_raw_rdp` — i.e. *inside* the counter that read 26.9
+ms, and on top of the staging copy `FN64_DPC_COPY_CENSUS` already names. RT64
+pays none of it.
+
+So the reference lane's "RDP" was software rasterization **plus** an 8 MiB
+round-trip per submission that the owner's configuration does not perform.
+**A bucket named for a hardware unit contained an artifact of one backend
+choice** — the same failure mode as an unnamed 83% inviting a story about its
+contents.
+
+## The DPC staging copy: still not the target, now measured on both lanes
+
+`FN64_DPC_COPY_CENSUS` was armed in all four runs.
+
+| | reference | rt64 |
+|---|---:|---:|
+| staging (alloc+copy_in+copy_back) | 1.97 / 2.16 ms/field | 1.77 / 1.74 ms/field |
+| as share of the RDP seam | **7.3% / 8.1%** | **30.7% / 30.3%** |
+
+**Unit note, because getting this wrong is easy:** the census reports
+*whole-run totals*; the RDP figures are *per-field on the slow population*.
+The only sound bridge is the census's **per-call** microseconds multiplied by
+that population's own `dpc_calls`/field (2.816–2.818), which
+`[frame-populations]` samples separately. Subtracting a whole-run total from a
+per-field value would be a cross-population subtraction wearing a disguise.
+
+Read this carefully: **the staging copy barely moved between lanes (1.97 →
+1.77), so its share tripled purely because its denominator collapsed.** It is
+~1.8 ms/field either way — 10.6% of the whole 16.667 ms budget for a memcpy
+that produces no pixels. Candidate 0 is **not** vindicated as a large win, but
+it is no longer negligible relative to what remains. Rule 12 still applies: the
+129.6 GB byte count is not the argument, the 1.8 ms is, and eliminating it is
+worth at most that.
+
+## A negative control nobody designed, and it is the strongest evidence here
+
+`gfx_lle_rsp_ns` is armed around `run_imem` **only**
+(`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:142-147`). The renderer
+choice cannot reach it, so it is a built-in control on whether the two lanes
+are otherwise the same measurement.
+
+    reference  RSP 5.691 / 5.666 ms/field
+    rt64       RSP 5.769 / 5.754 ms/field
+
+And `[rsp-step-census]` is **identical to the instruction** across lanes:
+`entries=41144`, `gfx_steps=1949499081`, `audio_steps=780097224`,
+`total_steps=2729596305`, `imem_rebuild_words=42131456`. Guest code p50 also
+matches (9.923 vs 9.893). The RSP interpreter retired the same 2.73 billion
+instructions in both lanes, so the RDP difference is the renderer and nothing
+else.
+
+## What the render field is under RT64, and why graphics is no longer the lever
+
+| row | ms/field | share of `resume NET` |
+|---|---:|---:|
+| `executor_ns` | 34.77 | — |
+| — mirror boundary | 9.01 | (25.9% of executor) |
+| — **`resume NET`** | **25.48** | **100%** |
+| — — **dispatch = translated guest code** | **9.79** | **38.4%** |
+| — — RDP total | 5.75 | 22.6% |
+| — — — *of which* staging memcpy | 1.76 | 6.9% |
+| — — — *of which* rasterization+ | 4.00 | 15.7% |
+| — — RSP interpretation | 5.76 | 22.6% |
+| — — invalidate writes | 2.04 | 8.0% |
+| — — audio LLE | 1.17 | 4.6% |
+| — — PARKED | 0.58 | 2.3% |
+
+**The arithmetic that closes the question:**
+
+- Take **rasterization to zero** → 30.8 ms/field = **1.85x budget**.
+- Take **all graphics (RDP + RSP) to zero** → 23.3 ms/field = **1.40x budget**.
+
+**Neither reaches 60fps.** This agrees closely with the independently measured
+host-side-with-graphics-at-zero figure of 21.55 ms = 1.29x. **Under the
+configuration the owner runs, graphics cannot get WM2000 to 60fps, because
+everything that is not graphics already exceeds the budget.**
+
+The two largest lines in `resume NET` are now **translated guest code (38.4%)**
+and, outside it, the **mirror boundary (9.01 ms, 25.9% of `executor_ns`)** —
+neither of which is graphics.
+
+### And the closed RSP line needs its denominator restated again
+
+The closed-lines list carries *"RSP interpretation (17.6% of graphics)"*, whose
+scope was narrowed after the reference-lane measurement. **Under RT64 the
+denominator changes completely: RSP is 50.0% of graphics and 22.6% of `resume
+NET` — dead level with the entire RDP seam.** It is not reopened here (11.25
+ns/instruction with no defect is still a fact, and 2.73 billion instructions is
+the reason it is large), but a reader scanning that line for "is the RSP worth
+looking at?" would now get a materially different answer than the title
+suggests. **A closed line's title should state the denominator, and this one's
+denominator just moved.**
+
+## The one caveat on the numbers above
+
+The fast (off-render) population's closure residual is **6.5–6.7%**, above the
+5% pre-registered tolerance. Reported rather than waved through, per the
+protocol. It is **0.193–0.203 ms of positive PARKED time in all four runs,
+both lanes** — genuine coroutine suspension, never the impossible negative
+gap, and constant regardless of renderer. The percentage is large only because
+the denominator (3.0 ms) is small. **Every conclusion above rests on the slow
+population, which closes at 1.2–2.3%.**
+
+## What this redirects to
+
+1. **Stop treating the RDP as the barrier.** Under `FN64_RENDER=rt64` it is
+   5.75 ms of a 34.77 ms field, and 1.77 ms of that is a memcpy.
+2. **The headless benchmark should state its renderer.** Every number produced
+   by `render-benchmark.zsh` to date is a *reference-backend* number unless the
+   caller exported `FN64_RENDER`, and nothing in its output says so. That is
+   how a 70% graphics share came to describe a lane nobody runs. The script
+   should echo the active renderer, and the census should print it.
+3. **The remaining target is host-side**, in this order by size: translated
+   guest code (9.79), the mirror boundary (9.01), RSP interpretation (5.76),
+   invalidate writes (2.04), the DPC staging memcpy (1.77).
