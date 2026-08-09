@@ -497,7 +497,10 @@ mod tests {
     #[test]
     fn malformed_combined_stream_rejects_the_whole_preflight() {
         let first = OwnedRawDpcSubmission::from_rdram_words(0, 8, words(0xe6)).unwrap();
-        let invalid = OwnedRawDpcSubmission::from_rdram_words(8, 16, words(0x7f)).unwrap();
+        // 0x10 is in the one region left with no accepted command. This was
+        // 0x7f, which only rejected because the classifier read all eight
+        // wire bits; 0x7f masks to 0x3f (Set Color Image) and is now valid.
+        let invalid = OwnedRawDpcSubmission::from_rdram_words(8, 16, words(0x10)).unwrap();
         let error = RawDpcBatch::new(vec![first, invalid])
             .unwrap()
             .preflight(0x100)

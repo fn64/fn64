@@ -255,8 +255,8 @@ pub(super) fn decode_stream_impl(
             normalize_geometry_command(*family, wire_w0, wire_w1, command_pc)
         };
         let wire_opcode = (w0 >> 24) as u8;
-        let opcode = if raw_rdp && matches!(wire_opcode, 0x08..=0x0f | 0xc8..=0xcf) {
-            wire_opcode & 0x3f
+        let opcode = if raw_rdp {
+            canonical_raw_rdp_opcode(wire_opcode)
         } else {
             wire_opcode
         };

@@ -30,10 +30,14 @@ const G_NOOP: u8 = 0x00;
 /// notice it has lost the command boundary, so ids are widened when a real
 /// microcode emits them, not because a table lists them.
 const RDP_LOW_NOOP_END: u8 = 0x07;
-const G_TEXRECT: u8 = 0xe4;
-const G_TEXRECTFLIP: u8 = 0xe5;
-const G_RDPLOADSYNC: u8 = 0xe6;
-const G_RDPFULLSYNC: u8 = 0xe9;
+/// RDP-native command ids (bits 61:56), NOT the `0xc0`-based GBI spellings.
+/// The GBI names differ by exactly that prefix: `G_TEXRECT` is `0xe4` and is
+/// this `0x24` with bits 63:62 set. Widths are matched against the masked
+/// command so every spelling resolves to the same entry.
+const RDP_TEXRECT: u8 = 0x24;
+const RDP_TEXRECTFLIP: u8 = 0x25;
+const RDP_SYNC_LOAD: u8 = 0x26;
+const RDP_SYNC_FULL: u8 = 0x29;
 
 /// Inspect one exact raw DPC range for the command that generates the public
 /// DP completion interrupt.
@@ -67,16 +71,16 @@ pub fn inspect_raw_rdp_full_sync(
     let mut pc = start;
     while pc < end {
         let wire_opcode = (view.read_u32(fn64_runtime::RdramAddr::from_offset(pc)) >> 24) as u8;
-        let triangle_opcode = wire_opcode & 0x3f;
-        let opcode = if matches!(triangle_opcode, 0x08..=0x0f) {
-            triangle_opcode
-        } else {
-            wire_opcode
-        };
-        reached |= opcode == G_RDPFULLSYNC;
+        // Bits 63:62 are don't-care; the command is the low six bits. Masking
+        // here is what makes completion detection spelling-independent -- a
+        // Sync Full emitted as 0x29, 0x69, 0xa9 or 0xe9 is the same command
+        // and must all be seen, or the DP completion interrupt is missed.
+        let opcode = wire_opcode & 0x3f;
+        reached |= opcode == RDP_SYNC_FULL;
         let width = raw_rdp_command_width(opcode).ok_or_else(|| {
             reject(format!(
-                "raw RDP opcode {opcode:#04x} at {pc:#010x} has no public command width"
+                "raw RDP opcode {opcode:#04x} (wire byte {wire_opcode:#04x}) at {pc:#010x} \
+                 has no public command width"
             ))
         })?;
         pc = pc.checked_add(width).ok_or_else(|| {
@@ -102,34 +106,46 @@ pub fn inspect_raw_rdp_full_sync(
 /// Byte width of one public raw RDP command, or `None` when no public
 /// documentation assigns a command -- and therefore a stride -- at that
 /// opcode. `None` is a rejection, never a hint to advance by eight.
+///
+/// `opcode` is the whole top wire byte. The RDP's command field is only
+/// **bits 61:56** -- the low six bits of that byte -- and the command tables
+/// mark bits 63:62 as don't-care (`Set Color Image` is spelled
+/// `command = 0x3f[5:0]`). The hardware masks to six bits, so all four
+/// spellings of a command are the same command, and this function masks
+/// first for exactly that reason.
 pub fn raw_rdp_command_width(opcode: u8) -> Option<u32> {
-    let triangle_opcode = opcode & 0x3f;
-    if matches!(triangle_opcode, 0x08..=0x0f) {
-        return Some(match triangle_opcode {
-            0x08 => 32,
-            0x09 => 48,
-            0x0a => 96,
-            0x0b => 112,
-            0x0c => 96,
-            0x0d => 112,
-            0x0e => 160,
-            0x0f => 176,
-            _ => unreachable!(),
-        });
-    }
-    Some(match opcode {
-        // The low no-operation block. `0x00` is the public `G_NOOP`; `0x01`
-        // through `0x07` are the remaining No Operation ids of the same block
-        // and are one command word each, exactly like `0x00`. Accepted only in
-        // the RDP-native spelling, the same spelling the `0x08..=0x0f`
-        // triangles above arrive in. The `0xc0`-based GBI spelling of these
-        // ids (`0xc1..=0xc7`) is NOT accepted: the triangle normalization
-        // above masks only `0x08..=0x0f`, so `0xc7` reaches this match as
-        // `0xc7` and falls through to `None`. No public microcode emits that
-        // form, and inventing a width for it would be a guess.
+    // Bits 63:62 carry no command information. Reading the full byte made the
+    // accepted spelling depend on which prefix a microcode happened to emit:
+    // the `0xc0` form of every state command was accepted while the `0x00`,
+    // `0x40` and `0x80` forms of the same command were rejected as unknown.
+    // WCW/nWo Revenge emits `Set Color Image` as `0x7f` (`0x40 | 0x3f`) rather
+    // than the `0xff` the GBI macros produce, and was rejected mid-frame for
+    // it after twenty-three tasks had already scanned clean.
+    let command = opcode & 0x3f;
+    Some(match command {
+        // The low no-operation block: 0x00..=0x07 are all *No Operation*, one
+        // 64-bit command word each. `G_NOOP` is its 0x00 member under the
+        // public GBI name, which is why 0x00 was accepted long before its
+        // seven siblings were.
         G_NOOP..=RDP_LOW_NOOP_END => 8,
-        G_TEXRECT | G_TEXRECTFLIP => 16,
-        G_RDPLOADSYNC..=0xff => 8,
+        // The eight triangle layouts. The low three bits select shade (4),
+        // texture (2) and Z (1), and each enabled group appends coefficient
+        // words to the 32-byte edge base.
+        0x08 => 32,
+        0x09 => 48,
+        0x0a => 96,
+        0x0b => 112,
+        0x0c => 96,
+        0x0d => 112,
+        0x0e => 160,
+        0x0f => 176,
+        // Texture Rectangle / Texture Rectangle Flip are two command words.
+        RDP_TEXRECT | RDP_TEXRECTFLIP => 16,
+        // Every remaining assigned command -- the syncs, the tile and image
+        // setup, the colour and combine state -- is a single command word.
+        RDP_SYNC_LOAD..=0x3f => 8,
+        // 0x10..=0x23 are documented *No Operation* but are deliberately not
+        // accepted; see `RDP_LOW_NOOP_END`.
         _ => return None,
     })
 }
@@ -147,12 +163,12 @@ mod tests {
     fn full_sync_is_found_only_at_command_boundaries() {
         let mut rdram = vec![0; 40];
         write_word(&mut rdram, 0, 0x0800_0000);
-        write_word(&mut rdram, 8, u32::from(G_RDPFULLSYNC) << 24);
+        write_word(&mut rdram, 8, 0xe900_0000);
         assert_eq!(
             inspect_raw_rdp_full_sync(&rdram, 0, 32).unwrap(),
             DpFullSyncStatus::NotReached
         );
-        write_word(&mut rdram, 32, u32::from(G_RDPFULLSYNC) << 24);
+        write_word(&mut rdram, 32, 0xe900_0000);
         assert_eq!(
             inspect_raw_rdp_full_sync(&rdram, 0, 40).unwrap(),
             DpFullSyncStatus::Reached
@@ -170,8 +186,8 @@ mod tests {
             (0x0d, 112),
             (0x0e, 160),
             (0x0f, 176),
-            (G_TEXRECT, 16),
-            (G_TEXRECTFLIP, 16),
+            (0xe4, 16),
+            (0xe5, 16),
         ] {
             assert_eq!(raw_rdp_command_width(opcode), Some(width));
         }
@@ -191,36 +207,79 @@ mod tests {
         }
     }
 
-    /// The widened map must still be able to say no. These ids sit between the
-    /// triangle block and `G_TEXRECT` and carry no documented public command,
-    /// so advancing past them would be a guess.
+    /// The widened map must still be able to say no. `0x10..=0x23` is the
+    /// only unaccepted region left, and it must reject under every prefix --
+    /// masking must not become a way to launder an unknown command.
     #[test]
     fn undocumented_opcodes_are_still_rejected() {
-        for opcode in [0x10u8, 0x40, 0x7f, 0x80, 0xc7, 0xe3] {
-            assert_eq!(
-                raw_rdp_command_width(opcode),
-                None,
-                "opcode {opcode:#04x} has no public command width and must not be accepted"
-            );
+        for command in 0x10u8..=0x23 {
+            for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
+                let opcode = prefix | command;
+                assert_eq!(
+                    raw_rdp_command_width(opcode),
+                    None,
+                    "opcode {opcode:#04x} has no public command width and must not be accepted"
+                );
+            }
         }
     }
 
     /// A rejected opcode must surface as an error from the scanner itself, not
-    /// merely as a `None` width -- this is the path that stops a route.
+    /// merely as a `None` width -- this is the path that stops a route. The
+    /// message reports both the masked command and the raw wire byte, because
+    /// the two differing is exactly the confusion that cost a Revenge run.
     #[test]
     fn scanner_rejects_an_undocumented_opcode_loudly() {
         let mut rdram = vec![0; 16];
-        write_word(&mut rdram, 0, 0x4000_0000);
-        write_word(&mut rdram, 8, u32::from(G_RDPFULLSYNC) << 24);
+        write_word(&mut rdram, 0, 0x9000_0000);
+        write_word(&mut rdram, 8, 0xe900_0000);
         let error = inspect_raw_rdp_full_sync(&rdram, 0, 16).unwrap_err();
         let RenderError::Backend { backend, reason } = error else {
             panic!("undocumented raw RDP opcode must reject as a backend error");
         };
         assert_eq!(backend, "rdp-full-sync-inspection");
         assert!(
-            reason.contains("0x40") && reason.contains("no public command width"),
-            "rejection must name the offending opcode: {reason}"
+            reason.contains("0x10")
+                && reason.contains("0x90")
+                && reason.contains("no public command width"),
+            "rejection must name both the command and the wire byte: {reason}"
         );
+    }
+
+    /// Bits 63:62 are don't-care, so all four spellings of a command must
+    /// resolve identically. Revenge emits `Set Color Image` as `0x7f` where
+    /// the GBI macros emit `0xff`; reading the full byte accepted only the
+    /// latter and aborted the run mid-frame on the former.
+    #[test]
+    fn command_width_ignores_the_two_dont_care_prefix_bits() {
+        for command in 0x00u8..=0x3f {
+            let widths: Vec<_> = [0x00u8, 0x40, 0x80, 0xc0]
+                .into_iter()
+                .map(|prefix| raw_rdp_command_width(prefix | command))
+                .collect();
+            assert!(
+                widths.iter().all(|width| *width == widths[0]),
+                "command {command:#04x} resolves differently per prefix: {widths:?}"
+            );
+        }
+        assert_eq!(raw_rdp_command_width(0x7f), Some(8));
+        assert_eq!(raw_rdp_command_width(0xff), Some(8));
+    }
+
+    /// Completion detection must be spelling-independent too. A Sync Full the
+    /// scanner fails to recognize is a DP completion interrupt never raised.
+    #[test]
+    fn full_sync_is_recognized_under_every_prefix_spelling() {
+        for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
+            let mut rdram = vec![0; 8];
+            write_word(&mut rdram, 0, u32::from(prefix | RDP_SYNC_FULL) << 24);
+            assert_eq!(
+                inspect_raw_rdp_full_sync(&rdram, 0, 8).unwrap(),
+                DpFullSyncStatus::Reached,
+                "Sync Full spelled {:#04x} must be recognized",
+                prefix | RDP_SYNC_FULL
+            );
+        }
     }
 
     /// A no-operation command advances by exactly one word, so a `FullSync`
@@ -231,7 +290,7 @@ mod tests {
         for opcode in [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07] {
             let mut rdram = vec![0; 16];
             write_word(&mut rdram, 0, u32::from(opcode) << 24);
-            write_word(&mut rdram, 8, u32::from(G_RDPFULLSYNC) << 24);
+            write_word(&mut rdram, 8, 0xe900_0000);
             assert_eq!(
                 inspect_raw_rdp_full_sync(&rdram, 0, 16).unwrap(),
                 DpFullSyncStatus::Reached,
@@ -242,10 +301,10 @@ mod tests {
 
     #[test]
     fn texture_rectangle_payload_cannot_impersonate_full_sync() {
-        for opcode in [G_TEXRECT, G_TEXRECTFLIP] {
+        for opcode in [0xe4u8, 0xe5] {
             let mut rdram = vec![0; 24];
             write_word(&mut rdram, 0, u32::from(opcode) << 24);
-            write_word(&mut rdram, 8, u32::from(G_RDPFULLSYNC) << 24);
+            write_word(&mut rdram, 8, 0xe900_0000);
             assert_eq!(
                 inspect_raw_rdp_full_sync(&rdram, 0, 24).unwrap(),
                 DpFullSyncStatus::NotReached
