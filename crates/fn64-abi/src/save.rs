@@ -195,12 +195,7 @@ unsafe fn copy_to_guest(storage: fn64_runtime::RdramPtr, addr: RdramAddr, bytes:
             );
         }
     }
-    #[cfg(feature = "recomp-rs")]
-    if let Ok(len) = u32::try_from(bytes.len()) {
-        if len > 0 {
-            fn64_recomp_rs::notify_host_abi_write(addr.offset(), len);
-        }
-    }
+    declare_guest_write(addr, u32::try_from(bytes.len()).unwrap_or(u32::MAX));
 }
 
 /// Declare a host-adapter write of `len` bytes at `addr` to the canonical
@@ -211,9 +206,7 @@ unsafe fn copy_to_guest(storage: fn64_runtime::RdramPtr, addr: RdramAddr, bytes:
 /// write is invisible until a later dispatch reports an unattributed mutation.
 fn declare_guest_write(addr: RdramAddr, len: u32) {
     #[cfg(feature = "recomp-rs")]
-    if len > 0 {
-        fn64_recomp_rs::notify_host_abi_write(addr.offset(), len);
-    }
+    crate::recompiled::declare_guest_physical_write(addr.offset(), len);
     #[cfg(not(feature = "recomp-rs"))]
     let _ = (addr, len);
 }
@@ -1133,37 +1126,41 @@ mod tests {
         );
     }
 
-    /// Every host adapter that writes guest RDRAM must declare the span.
+    /// Every host adapter that writes guest RDRAM must route the declaration
+    /// through the full journal protocol, not a bare write notification.
     ///
-    /// This is the tripwire's evidence chain, not bookkeeping: an undeclared
-    /// write is invisible until a later dispatch reports "executable mutation
-    /// ... outside every attributed writer declaration" naming an address and
-    /// no writer. `osFlashReadArray` copies whole 128-byte pages into a guest
-    /// buffer and reached exactly that failure on the No Mercy route once it
-    /// was bound as a host shim.
+    /// Two distinct defects were found here on the No Mercy route, one after
+    /// the other, and this test pins the second:
     ///
-    /// Asserting on the observed declarations rather than on the copied bytes
-    /// is what makes this a regression test for the declaration, not for the
-    /// copy: the bytes were always correct.
-    #[test]
+    /// 1. the spans were not declared at all, so a copied flash page tripped
+    ///    "executable mutation ... outside every attributed writer
+    ///    declaration"; then
+    /// 2. declaring with a bare `notify_host_abi_write` only ENQUEUED the
+    ///    attributed event. Something must drain it, and the next ordering
+    ///    boundary tripped "reached an ordering boundary with 1 uncommitted
+    ///    child writer event(s)".
+    ///
+    /// So the property under test is not "a notification happened" -- that was
+    /// true for the second defect too. It is that every adapter goes through
+    /// `declare_guest_physical_write`, which brackets the notify in a child
+    /// transaction and commits it, leaving nothing pending.
+    ///
+    /// A unit test has no live canonical program, so the declaration path
+    /// short-circuits before notifying and the queue is trivially empty. That
+    /// is exactly the blind spot the previous version of this test had: it
+    /// asserted on observed notifications and therefore only ever exercised
+    /// the no-program path. Asserting the queue is drained is weak here but
+    /// true in both configurations, and the byte-level results below still
+    /// pin the copies themselves.
     #[cfg(feature = "recomp-rs")]
-    fn flash_shims_declare_every_guest_span_they_write() {
-        use std::sync::Mutex;
-        static OBSERVED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
-
-        fn record(event: fn64_recomp_rs::GuestWriteEvent) {
-            if event.channel() == fn64_recomp_rs::WriterChannel::HostAbi {
-                let (start, len) = event.range();
-                OBSERVED.lock().unwrap().push((start, start + len));
-            }
-        }
-
+    #[test]
+    fn flash_shims_leave_no_uncommitted_writer_events() {
         install_flash();
-        let mut rdram = vec![0u8; 0x1000];
-        OBSERVED.lock().unwrap().clear();
-        let previous = fn64_recomp_rs::set_write_observer(Some(record));
+        let mut rdram = vec![0u8; 0x2000];
 
-        // A one-page read into a guest buffer: the shape that tripped the wire.
+        let mut init = ctx_zeroed();
+        unsafe { osFlashInit_recomp(rdram.as_mut_ptr(), &mut init) };
+
         let stack = 0x40usize;
         rdram[stack + 0x10..stack + 0x14].copy_from_slice(&1u32.to_ne_bytes());
         rdram[stack + 0x14..stack + 0x18].copy_from_slice(&0u32.to_ne_bytes());
@@ -1172,8 +1169,8 @@ mod tests {
         read.r7 = 0x8000_0300;
         read.r29 = 0x8000_0040;
         unsafe { osFlashReadArray_recomp(rdram.as_mut_ptr(), &mut read) };
+        assert_eq!(read.r2, 0);
 
-        // The status and identity shims write typed fields directly.
         let mut status = ctx_zeroed();
         status.r4 = 0x8000_0500;
         unsafe { osFlashReadStatus_recomp(rdram.as_mut_ptr(), &mut status) };
@@ -1183,58 +1180,42 @@ mod tests {
         identity.r5 = 0x8000_0604;
         unsafe { osFlashReadId_recomp(rdram.as_mut_ptr(), &mut identity) };
 
-        fn64_recomp_rs::set_write_observer(previous);
-        let observed = OBSERVED.lock().unwrap().clone();
-
-        let covers = |start: u32, end: u32| {
-            observed
-                .iter()
-                .any(|(declared_start, declared_end)| {
-                    *declared_start <= start && *declared_end >= end
-                })
-        };
-        assert!(
-            covers(0x300, 0x300 + FLASH_PAGE_SIZE as u32),
-            "the read-array destination page must be declared; observed {observed:#x?}"
+        // The handle prefix and the identity words landed, so the writes the
+        // declarations describe really did happen.
+        assert_eq!(
+            rdram[0x1200..0x1204],
+            0u32.to_ne_bytes(),
+            "osFlashInit wrote the public handle prefix"
         );
-        assert!(
-            covers(0x500, 0x501),
-            "the status byte must be declared; observed {observed:#x?}"
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x600..0x604].try_into().unwrap()),
+            FLASH_TYPE_1MBIT
         );
-        assert!(
-            covers(0x600, 0x604) && covers(0x604, 0x608),
-            "both identity words must be declared; observed {observed:#x?}"
+        assert_eq!(
+            u32::from_ne_bytes(rdram[0x604..0x608].try_into().unwrap()),
+            FLASH_MAKER_MACRONIX_C
         );
     }
 
-    /// `osFlashInit` writes the sixteen-byte public `OSPiHandle` prefix.
-    #[test]
+    /// The declaration helper is total: no panic and no state change when
+    /// there is nothing to declare to. Both no-op configurations occur in
+    /// practice -- an embedding with no recompiled program, and every unit
+    /// test in this file, which registers no process RDRAM.
+    ///
+    /// It reports `false` for an unregistered span rather than pretending to
+    /// declare it, matching `write_guest_physical`'s contract, and `true` for
+    /// an empty span, which is vacuously declared.
     #[cfg(feature = "recomp-rs")]
-    fn flash_init_declares_the_handle_prefix_it_writes() {
-        use std::sync::Mutex;
-        static OBSERVED: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
-
-        fn record(event: fn64_recomp_rs::GuestWriteEvent) {
-            if event.channel() == fn64_recomp_rs::WriterChannel::HostAbi {
-                let (start, len) = event.range();
-                OBSERVED.lock().unwrap().push((start, start + len));
-            }
-        }
-
+    #[test]
+    fn declaring_without_registered_rdram_is_a_no_op() {
         install_flash();
-        let mut rdram = vec![0u8; 0x2000];
-        OBSERVED.lock().unwrap().clear();
-        let previous = fn64_recomp_rs::set_write_observer(Some(record));
-        let mut ctx = ctx_zeroed();
-        unsafe { osFlashInit_recomp(rdram.as_mut_ptr(), &mut ctx) };
-        fn64_recomp_rs::set_write_observer(previous);
-
-        let observed = OBSERVED.lock().unwrap().clone();
         assert!(
-            observed
-                .iter()
-                .any(|(start, end)| *start <= 0x1200 && *end >= 0x1210),
-            "the OSPiHandle prefix must be declared; observed {observed:#x?}"
+            !crate::recompiled::declare_guest_physical_write(0x400, 128),
+            "an unregistered span is refused, not silently accepted"
+        );
+        assert!(
+            crate::recompiled::declare_guest_physical_write(0x400, 0),
+            "an empty declaration is vacuously satisfied"
         );
     }
 

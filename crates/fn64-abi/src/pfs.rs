@@ -70,11 +70,10 @@ unsafe fn copy_to_guest(storage: fn64_runtime::RdramPtr, raw: u64, bytes: &[u8])
     // not tripped that wire only because these roles are not yet bound as
     // host shims for any title in the corpus.
     #[cfg(feature = "recomp-rs")]
-    if let Ok(len) = u32::try_from(bytes.len()) {
-        if len > 0 {
-            fn64_recomp_rs::notify_host_abi_write(base.offset(), len);
-        }
-    }
+    crate::recompiled::declare_guest_physical_write(
+        base.offset(),
+        u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+    );
 }
 
 fn read_key(
