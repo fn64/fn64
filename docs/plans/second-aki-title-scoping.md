@@ -842,3 +842,40 @@ still needs a boot context captured against the specific ROM (one command,
 WM2000), and an input schedule authored (bespoke, the acknowledged long pole).
 Those three are what separate "recompiles" from "plays", and no tooling landed
 tonight shortens the last two.
+
+## Revenge boot context captured — and a fourth ROM-variant collision
+
+    $ scripts/capture-boot-context.zsh "…/WCW-nWo Revenge - Starrcade Edition (USA) (v1.01).z64"
+    → captures/WCW-nWo-Revenge---Starrcade-Edition--USA---v1-01--boot-context.json
+      normalized_rom_sha256  d8c097f8880032fc…   (matches the certified ROM)
+      entry_pc               0x80000400
+
+**Three of Revenge's four bring-up items are now done:** certified
+(`unsupported = 0`), shard tree generated with a title-specific prefix, boot
+context captured against the same image.
+
+### There were already three different Revenge images in play, and none matched
+
+A capture for Revenge **already existed** — but it binds `66c137d3…`, and the
+two ROMs on disk are `d8c097f8…` (Starrcade v1.01, certified above) and
+`fd9996c7…` (the donor `grade-all.sh` defaults to). **Three distinct images,
+no two the same.**
+
+Had the existing capture been reused on the strength of its filename saying
+"Revenge", it would have bound register state the certified ROM never
+produced — and the script's own header explains why that is worse than having
+none: a hand-made or mismatched context *"would pass schema validation while
+binding register state the hardware never produced — forging the very
+authority under audit."*
+
+**This is the fourth ROM-variant collision this session** (host bindings,
+No Mercy topology, VPW2 block count, now the boot context). Every one had the
+same cause: **an artifact filed under a title string rather than a ROM
+digest.** The capture written above records its digest; the recognizer results
+and the recompile receipts now do too.
+
+### What is actually left for Revenge
+
+Only the two human-gated items: **locating the executable-image PCs** (no
+prior art outside WM2000) and **authoring an input schedule** (bespoke). Every
+mechanical prerequisite is satisfied.
