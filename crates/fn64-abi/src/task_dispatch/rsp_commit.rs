@@ -1164,6 +1164,14 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             }
         }
     }
+    // How much of the copyback below is real work. MUST run before it: the
+    // copy destroys the very difference being measured. Inert without
+    // `FN64_DPC_COPY_CENSUS`, and it copies nothing either way -- it exists
+    // to answer, by counting rather than by argument (perf-method rule 3),
+    // whether narrowing the copyback can pay at all. See the counters'
+    // doc comment for why the 3.4x copy_in/copy_back asymmetry raised the
+    // question and why rule 12 requires it be settled before acting.
+    crate::dpc_copy_census::note_copy_back_diff(&image[..physical_len], real);
     // Times the copyback only, NOT `track_rdp_renderer_mutation`'s own
     // bookkeeping around it: the closure is the memcpy and the wrapper is
     // mutation-journal work, and conflating them would reproduce exactly the
