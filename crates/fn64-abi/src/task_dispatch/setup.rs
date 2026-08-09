@@ -495,6 +495,18 @@ pub(crate) fn present_render_backend(vi: fn64_render::ViPresentation) {
         VI_PRESENT_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));
         VI_PRESENT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     }
+    // Settle by observation whether presentation is inside `executor_ns`.
+    // `telemetry.rs` subtracts `vi_present_ns` out of `executor_ns` as though
+    // it were nested; the call graph says it is not (this function's only
+    // caller is `advance_device_time_step`, which `run_one_step` and the
+    // harness's `advance_virtual_time` both reach, and only the former is
+    // inside `executor_ns`). Counting which side each call actually ran on
+    // replaces that two-step inference with a measurement that can refute it.
+    if INSIDE_RUN_ONE_STEP.with(Cell::get) {
+        VI_PRESENT_IN_EXECUTOR_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+    } else {
+        VI_PRESENT_OUTSIDE_EXECUTOR_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

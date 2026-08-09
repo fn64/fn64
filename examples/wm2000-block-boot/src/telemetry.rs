@@ -419,15 +419,49 @@ pub(crate) fn print_runtime_progress() {
         // `run_one_step`. Print the subtraction so a reader cannot repeat the
         // rule-2 error (inclusive read as self time) that produced three
         // artifact targets; see docs/plans/perf-method.md.
+        //
+        // `vi_present_ns` USED TO BE SUBTRACTED HERE AND SHOULD NOT HAVE BEEN.
+        // Presentation is reached only from `pi::timing`'s
+        // `advance_device_time_step`, which the harness drives through
+        // `advance_virtual_time` on its `AdvanceField` arm -- outside
+        // `run_one_step`, and so never counted into `executor_ns` in the first
+        // place. Subtracting it removed ~1.14 ms/field that was never added,
+        // understating executor self time. Corroborated three ways: the call
+        // graph, devtime measuring 0.251 ms/field against vi_present's ~1.14,
+        // and the executor split closing to ~100% WITHOUT it.
+        //
+        // Rather than trusting that argument, the runtime now counts which
+        // side of the seam each presentation ran on, and this line subtracts
+        // `vi_present_ns` only if the counter says it belongs -- so the
+        // arithmetic follows the observation instead of either assumption.
+        let vi_is_nested = timing.vi_present_in_executor_calls > 0;
         let nested_ns = timing
             .gfx_ns
             .saturating_add(timing.audio_dispatch_ns)
             .saturating_add(timing.audio_lle_ns)
-            .saturating_add(timing.vi_present_ns);
+            .saturating_add(if vi_is_nested {
+                timing.vi_present_ns
+            } else {
+                0
+            });
         println!(
-            "[wm2000-block-profile] phase_self executor_self_ms={:.3} (executor_ms minus gfx+audio+audio_lle+vi_present={:.3})",
+            "[wm2000-block-profile] phase_self executor_self_ms={:.3} (executor_ms minus gfx+audio+audio_lle{}={:.3})",
             timing.executor_ns.saturating_sub(nested_ns) as f64 / 1e6,
+            if vi_is_nested { "+vi_present" } else { "" },
             nested_ns as f64 / 1e6,
+        );
+        // The evidence for the line above, printed beside it so the reader can
+        // check the attribution rather than take it on faith.
+        println!(
+            "[wm2000-block-profile] vi_reachability in_executor={} outside_executor={} vi_present_ms={:.3} ({})",
+            timing.vi_present_in_executor_calls,
+            timing.vi_present_outside_executor_calls,
+            timing.vi_present_ns as f64 / 1e6,
+            if vi_is_nested {
+                "nested in executor_ns -- subtracted above"
+            } else {
+                "OUTSIDE executor_ns -- correctly NOT subtracted"
+            },
         );
     }
 }

@@ -344,6 +344,25 @@ pub unsafe fn boot_thread0(
 /// `with_executor` closure, or the re-arm is skipped and the bug this wave
 /// fixed reappears.
 pub fn run_one_step() -> bool {
+    // Mark the dynamic extent of this function so `present_render_backend` can
+    // record which side of the executor seam each VI presentation ran on. See
+    // `INSIDE_RUN_ONE_STEP`: this exists to make a reachability claim
+    // falsifiable rather than argued, because `telemetry.rs` currently
+    // subtracts `vi_present_ns` out of `executor_ns` and the call graph says
+    // presentation is reached from the harness, outside it.
+    //
+    // A guard type rather than a set/clear pair: the body below can panic
+    // (`recompiled_gap_panic` on any dispatch fault), and a leaked `true` would
+    // silently misattribute every later presentation to the executor -- turning
+    // a diagnostic into a source of the exact error it exists to detect.
+    struct StepDepth;
+    impl Drop for StepDepth {
+        fn drop(&mut self) {
+            crate::task_dispatch::INSIDE_RUN_ONE_STEP.with(|f| f.set(false));
+        }
+    }
+    crate::task_dispatch::INSIDE_RUN_ONE_STEP.with(|f| f.set(true));
+    let _step_depth = StepDepth;
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
     // Split `executor_ns`, which has no sub-counters and is 61% of a WM2000
     // render field. Separately gated from `PHASE_TIMING` because these clocks

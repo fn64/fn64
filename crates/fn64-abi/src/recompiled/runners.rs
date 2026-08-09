@@ -1030,7 +1030,17 @@ pub(super) fn run_catalog_block_program(
     entry = resolve_catalog_transfer_with_activation(live, entry.bank, entry.pc, mem)
         .unwrap_or_else(|error| recompiled_gap_panic(error));
     loop {
+        // Split `resume NET` -- 83.2% of a WM2000 render field with no
+        // sub-counters. One walking clock per loop iteration; one iteration is
+        // one scheduling step, because the body ends in
+        // `suspend_active_coroutine` below. Disarmed to nothing without
+        // `FN64_RESUME_SPLIT`. See `ResumePhaseClock`.
+        let mut phase = crate::task_dispatch::ResumePhaseClock::start();
         live.reconcile_before_dispatch(mem);
+        phase.lap(
+            &crate::task_dispatch::RESUME_RECONCILE_NS,
+            Some(&crate::task_dispatch::RESUME_RECONCILE_CALLS),
+        );
         let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
             (
                 executor.cp0_count(),
@@ -1051,6 +1061,11 @@ pub(super) fn run_catalog_block_program(
                 });
         }
 
+        // Everything since the reconcile lap: the COP0 borrow,
+        // `synchronize_cop0_timing`, both interrupt lines, and the pending
+        // interrupt's vector resolve when one fires.
+        phase.lap(&crate::task_dispatch::RESUME_COP0_NS, None);
+
         let dispatched = live
             .dispatch_exposing_exceptions_at_budget(entry, live.next_dispatch_budget(), ctx, mem)
             .unwrap_or_else(|error| {
@@ -1058,10 +1073,25 @@ pub(super) fn run_catalog_block_program(
                     "canonical catalog dispatch failed at {entry}: {error}"
                 ))
             });
+        // THE GUEST. Inclusive of every host shim the translated code called
+        // synchronously -- graphics and audio reach `rsp_commit` from guest SP
+        // register writes, so `gfx_ns` and `audio_lle_ns` are nested in this
+        // figure and must be subtracted to isolate recompiled MIPS plus the
+        // memory runtime. `vi_present_ns` is NOT nested here (harness arm).
+        phase.lap(
+            &crate::task_dispatch::RESUME_DISPATCH_NS,
+            Some(&crate::task_dispatch::RESUME_DISPATCH_CALLS),
+        );
         if dispatch_census::enabled() {
             dispatch_census::record_slice(&dispatched);
+            // Re-open the clock so a census run does not charge its own
+            // recording to the invalidate phase. Off in every benchmark run,
+            // but a diagnostic that silently inflates a neighbouring bucket is
+            // exactly the kind of instrument defect this split exists to avoid.
+            phase = crate::task_dispatch::ResumePhaseClock::start();
         }
         live.invalidate_pending_physical_writes(mem);
+        phase.lap(&crate::task_dispatch::RESUME_INVALIDATE_NS, None);
 
         let image_changed_entry = match dispatched.exit {
             BlockExit::ImageChanged { at, .. } => Some(
@@ -1114,9 +1144,23 @@ pub(super) fn run_catalog_block_program(
                 prepared_continuation,
                 ctx,
             );
+            // Exit classification, activation, COP0 write-back and checkpoint
+            // publication -- everything between the guest returning and the
+            // coroutine actually suspending.
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
             crate::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
                 instructions: dispatched.instructions,
             });
+            // The ON-STACK cost of suspending: the journal flush and the switch
+            // itself, with the time this stack spent PARKED subtracted by
+            // `ResumePhaseClock::lap`. Without that subtraction this row read
+            // 54.1 ms/field inside a 40.6 ms field, because it was charging
+            // every other thread's work to this one.
+            phase.lap(&crate::task_dispatch::RESUME_SUSPEND_NS, None);
+        } else {
+            // No guest progress: no suspend happens, so the exit work still
+            // belongs to the exit phase and the clock runs on unbroken.
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
         }
 
         match dispatched.exit {
@@ -1140,7 +1184,29 @@ pub(super) fn run_catalog_block_program(
                         vram.get()
                     ))
                 });
+                // THE HOST-CALL BUCKET, and it is where graphics actually
+                // lives. `osSpTaskStartGo_recomp` is a guest OS-call shim
+                // reached as a `BlockExit::HostCall`, and it runs
+                // `dispatch_lle_task` synchronously -- which is where `gfx_ns`
+                // is armed. Folding this into the next-entry resolution below
+                // produced a bucket that was ~95% graphics under a label that
+                // said "resolve", and made `gfx_ns` (21.530) exceed the
+                // `dispatch` bucket (7.713) that was supposed to contain it.
+                //
+                // Timed separately so "how much of the field is graphics" and
+                // "how much is the dispatch machinery" are different rows. The
+                // shim also suspends, but no bracketing is needed:
+                // `ResumePhaseClock::lap` subtracts parked time centrally for
+                // every suspend path (see its doc comment).
+                // Close the resolve phase at the exact instant the host call
+                // begins, so the `resolve_host` lookup above is charged to
+                // resolution and not to the host call.
+                phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                 invoke_catalog_block_host(live, vram, resume, host, ctx, mem);
+                phase.lap(
+                    &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                    Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                );
                 entry = resolve_catalog_transfer_with_activation(live, resume.bank, resume.pc, mem)
                     .unwrap_or_else(|fault| {
                         recompiled_gap_panic(format!(
@@ -1197,7 +1263,13 @@ pub(super) fn run_catalog_block_program(
                 {
                     CatalogCallResolutionV1::Guest(next) => entry = next,
                     CatalogCallResolutionV1::Host(host) => {
+                        // Second host-call site; same bucket as the arm above.
+                        phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                         invoke_catalog_block_host(live, target_pc, resume, host, ctx, mem);
+                        phase.lap(
+                            &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                            Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                        );
                         entry = resolve_catalog_transfer_with_activation(
                             live,
                             source_bank,
@@ -1235,6 +1307,12 @@ pub(super) fn run_catalog_block_program(
                 unreachable!("catalog dispatch returned an internal transfer boundary")
             }
         }
+        // Next-entry resolution and any host call the exit dispatched. The
+        // `ThreadReturn` arm returns above without lapping, so one final
+        // partial interval per thread exit goes unattributed -- bounded by the
+        // thread count, not the step count, and therefore far below the
+        // residual this split reports.
+        phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
     }
 }
 

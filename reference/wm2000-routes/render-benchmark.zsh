@@ -237,8 +237,15 @@ FULL_LOG="${FN64_BENCHMARK_FULL_LOG:-/tmp/fn64-render-benchmark-$$-$(date +%Y%m%
 # `[mprotect-barrier]` and `[mirror-reconcile]` are in the allowlist because
 # they are gated diagnostics that print only when explicitly armed -- when off
 # they cost nothing, and when on they are the reason the run was made.
+#
+# `[frame-populations]`, `[executor-split]` and `[resume-split]` are here
+# because the NOT-ARMED warnings ride on them. That is rule 27's sharpening:
+# a warning on a filtered channel is not a warning, and two 25-minute runs were
+# lost to an `[executor-split]` "NOT ARMED" notice that was printed, filtered,
+# and never seen. Read the unfiltered log regardless -- the allowlist is a
+# convenience for watching a live run, never the evidence.
 "$BINARY" 2>&1 | tee "$FULL_LOG" | grep -E --line-buffered \
-    '^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done|^\[mprotect-barrier\]|^\[mirror-reconcile\]'
+    '^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done|^\[mprotect-barrier\]|^\[mirror-reconcile\]|^\[frame-populations\]|^\[executor-split\]|^\[resume-split\]|^\[frame-sequence\] pattern|vi_reachability'
 
 # The census prints from `atexit`, so it lands after the harness's own summary.
 print ""
