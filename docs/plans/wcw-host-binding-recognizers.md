@@ -244,3 +244,40 @@ PCs, and an input schedule.
 **Four of five AKI titles now CPU-recompile.** World Tour remains the
 exception, and remains a second-libultra-generation project rather than a
 recognizer gap.
+
+## VPW2 re-verified in this tree (2026-08-09)
+
+Ran the same generic gate against VPW2 rather than inheriting the claim from a
+2026-08-07 note:
+
+    internal_name              VPW2 freem
+    normalized_rom_sha256      7706ed94ebc30171186e1d96eba6b1f83f095476…
+    banks                      5
+    pack_blocks                49347
+    total_destinations         4648
+    unsupported_destinations   0
+    dynamic_mips_destinations  97
+    rustc_compiles             true
+    harness_runs               true
+
+**Four of five AKI titles now CPU-recompile with `unsupported == 0`, each
+verified in this tree with its ROM digest recorded:**
+
+| title | digest | banks | blocks | destinations | unsupported |
+|---|---|---:|---:|---:|---:|
+| WM2000 | (see byte-identity-1p5M) | 5 | 43,032 | — | 0 |
+| No Mercy | `11640379…` | 6 | 57,284 | — | 0 |
+| VPW2 | `7706ed94…` | 5 | 49,347 | 4,648 | **0** |
+| Revenge | `d8c097f8…` | 3 | 25,057 | 1,749 | **0** |
+| World Tour | — | — | — | — | **blocked at discovery** |
+
+Note the earlier record put VPW2 at 49,329 blocks; this run measures 49,347.
+An 18-block difference on a re-run is the same provenance problem as the No
+Mercy topology figure — **the old number was filed without a ROM digest**, and
+the Freem Edition on disk may not be the image it described. The digest above
+is recorded so this one can be reconciled.
+
+**The remaining gap for VPW2 is not discovery.** It has no answer key and no
+`FN64_DISCOVER_*` entry in `.claude/local.env`, so nothing can grade a
+regression against it — that is the item to fix before anyone builds on this
+result, and it is bookkeeping rather than engineering.
