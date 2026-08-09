@@ -835,8 +835,22 @@ impl ReferenceBackend {
                     gbi::CycleType::OneCycle | gbi::CycleType::TwoCycle => {
                         fb.draw_texture_rectangle(rectangle)
                     }
+                    // "In FILL mode this behaves identically to Fill
+                    // Rectangle, the texturing properties are ignored."
+                    // Executing it as the Fill Rectangle it is documented to
+                    // be reuses the existing fill-cycle rasterizer, so the
+                    // inclusive-edge and no-subpixel rules come from one
+                    // implementation rather than a second copy that could
+                    // drift from it.
                     gbi::CycleType::Fill => {
-                        unreachable!("fill-cycle texture rectangle passed reference validation")
+                        let target = state.active_target.unwrap_or(gbi::ColorImage {
+                            format: gbi::ColorImage::RGBA_FORMAT,
+                            size: gbi::ColorImage::BITS_16,
+                            width: u16::try_from(fb.width)
+                                .expect("reference framebuffer width exceeds u16"),
+                            address: 0,
+                        });
+                        fb.draw_fill_rectangle(&rectangle.as_fill_cycle_rectangle(), target);
                     }
                 }
                 state.depth_dirty |= rectangle.other_mode.depth_update_enabled();

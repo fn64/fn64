@@ -90,14 +90,34 @@ pub(super) fn validate_texture_rectangle(
         gbi::CycleType::OneCycle | gbi::CycleType::TwoCycle => {
             validate_combined_texture_rectangle(rectangle)
         }
-        gbi::CycleType::Fill => Err(render_unsupported_error(
-            "reference",
-            "render.rdp.texture-rectangle-cycle",
-            format!(
-                "{} in Fill cycle is invalid; fill cycle bypasses texture sampling",
-                texture_rectangle_name(rectangle)
-            ),
-        )),
+        // NOT invalid. The N64brew RDP command table states, in the Texture
+        // Rectangle section itself: "In FILL mode this behaves identically to
+        // Fill Rectangle, the texturing properties are ignored." Sampling is
+        // bypassed, but the rectangle is still rasterized -- from the fill
+        // color register, which Fill Rectangle documents as the sole colour
+        // input in that mode. Rejecting it aborted a WCW/nWo Revenge frame
+        // over a combination the hardware defines.
+        //
+        // The fill-cycle blender hazard is a property of the CYCLE, not the
+        // command, so it applies here exactly as it does to G_FILLRECT: a
+        // retained depth consumer in fill cycle can hang the RDP. Checked
+        // here rather than inside the shared rasterizer so the diagnostic
+        // names the command the guest actually submitted.
+        gbi::CycleType::Fill => {
+            if let Err(hazards) = rectangle.other_mode.validate_fill_cycle_bypass() {
+                return Err(render_unsupported_error(
+                    "reference",
+                    "render.rdp.fill-cycle-hazard-state",
+                    format!(
+                        "{} in Fill cycle retains unsafe {hazards} state; the public fill \
+                         contract requires G_RM_NOOP/G_RM_NOOP2, and retaining Z/framebuffer \
+                         consumers is outside that safe contract (a depth read can hang the RDP)",
+                        texture_rectangle_name(rectangle)
+                    ),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 

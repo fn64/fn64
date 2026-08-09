@@ -1690,6 +1690,43 @@ pub struct TextureRectangle {
     /// Rectangles"). Retaining it makes two-cycle rectangle programs real
     /// rather than aliasing TEXEL1 to TEXEL0.
     pub texture1: Option<Texture>,
+    /// Fill color register latched at decode time. In FILL cycle a texture
+    /// rectangle "behaves identically to Fill Rectangle, the texturing
+    /// properties are ignored" (N64brew RDP command table, Texture
+    /// Rectangle), and Fill Rectangle's colour in that mode "is determined
+    /// solely by the fill color register" -- so the register, not the
+    /// combiner, is the only colour input on that path.
+    pub fill_color: u32,
+}
+
+impl TextureRectangle {
+    /// The Fill Rectangle this command is documented to be equivalent to when
+    /// the cycle type is FILL.
+    ///
+    /// Both commands encode `ulx`/`uly`/`lrx`/`lry` in the same bit positions
+    /// and are internally "equivalent to a left-major triangle where
+    /// dxhdy = dxmdy = dxldy = 0", so the geometry transfers unchanged. The
+    /// texturing fields are deliberately dropped rather than carried: the
+    /// command table says they are ignored in this mode.
+    pub fn as_fill_cycle_rectangle(&self) -> FillRectangle {
+        debug_assert_eq!(
+            self.other_mode.cycle_type(),
+            CycleType::Fill,
+            "fill-cycle conversion is only defined for a FILL-mode texture rectangle"
+        );
+        FillRectangle {
+            ulx: self.ulx,
+            uly: self.uly,
+            lrx: self.lrx,
+            lry: self.lry,
+            fill_color: self.fill_color,
+            cycle_type: CycleType::Fill,
+            scissor: self.scissor,
+            other_mode: self.other_mode,
+            combiner: self.combiner,
+            blender: self.blender,
+        }
+    }
 }
 
 /// Ordered RSP/RDP work produced by the F3DEX2 decoder.
