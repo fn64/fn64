@@ -201,3 +201,46 @@ Tour needs a second libultra generation.
   happens to do."** A recognizer that does defeats the module's design and is
   worse than leaving a title blocked. If the only way to match is
   non-behavioural, that is a finding to report, not a change to land.
+
+## Revenge passes the generic CPU-recompilation gate (2026-08-09)
+
+With the two recognizers landed (`10a73c7`), Revenge was run through
+`gate_rom_recompile` — the title-generic gate that takes one input
+(`FN64_DISCOVER_ROM`) and no per-game configuration.
+
+    internal_name              WCW / nWo  REVENGE
+    normalized_rom_sha256      d8c097f8880032fc63a73a78ad2fcabac8f4b593…
+    banks                      3
+    pack_blocks                25057
+    pack_words                 145559
+    total_destinations         1749
+    unsupported_destinations   0      <-- the release blocker
+    dynamic_mips_destinations  8
+    rustc_compiles             true
+    harness_runs               true
+
+**`unsupported == 0` is the criterion `docs/DISCOVER-PLAN.md` names as the
+release blocker, and it is met.** Every discovered bank was emitted as Rust,
+digest-verified, compiled by a real `rustc`, and probed at arbitrary guest PCs
+— including unaligned PCs, which fault as `AddressErrorLoad` rather than
+misbehaving.
+
+**ROM digest recorded above**, per the discipline this project keeps
+re-learning: a per-title result filed under a title string cannot be
+reconciled later. This is the Starrcade v1.01 image.
+
+### What this does and does not mean
+
+**Does:** Revenge is no longer blocked at discovery. It joins WM2000, No Mercy
+and VPW2 as a title whose whole ROM CPU-recompiles. The record's "0 candidates,
+bounded out of the lane" is now wrong in both of its claims about this title.
+
+**Does not:** this is a CPU-recompilation milestone, and the gate says so
+itself — `not_a_booting_game=true`, because RSP audio and RDP graphics are
+separate runtime subsystems the gate never consults. Revenge needs the same
+remaining bring-up as No Mercy: a shard tree, a boot context, executable-image
+PCs, and an input schedule.
+
+**Four of five AKI titles now CPU-recompile.** World Tour remains the
+exception, and remains a second-libultra-generation project rather than a
+recognizer gap.
