@@ -3881,6 +3881,36 @@ Two things this bar is NOT, both of which have caused confusion here:
   game renders. A title that draws every other field still requires its
   emulator to deliver 60 fields/sec or wall-clock playback runs slow. The bar
   is per-FIELD.
+
+  > **SHARPENED 2026-08-09, and it changes the size of the remaining problem
+  > by 6x.** The bar is per-field *on average*, which is not the same as
+  > per-field *uniformly* — and reading it as uniform has been sizing this
+  > project's remaining work against the wrong number.
+  >
+  > WM2000 is a **30 Hz title**: it renders every second field, which is
+  > exactly what the measured period-2 alternation says (`fSfSfS`, 100% of
+  > slow fields carry a submit, 0.0% of fast). The pair of fields must fit
+  > **2 x 16.667 = 33.333 ms** between drawn frames. It does not have to fit
+  > each field into 16.667 individually, because the non-render field does
+  > not draw and its cost is not what the player waits on.
+  >
+  > Measured against the correct denominator (frozen `rt64-rep1/rep2`):
+  >
+  > | | p50 | budget | gap |
+  > |---|---:|---:|---:|
+  > | non-render field | 8.858 ms | — | — |
+  > | render field | 36.462 ms | **33.333** | **3.13 ms** |
+  > | the PAIR | 45.32 ms | 33.333 | 11.99 ms |
+  >
+  > Note the pair does NOT fit either — 45.32 against 33.333. **The 3.13 ms
+  > figure is the render field measured against the whole pair's budget, so
+  > it already spends the non-render field's 8.86 ms.** Quoting 3.13 as "the
+  > gap" is only right if the non-render field is free, and it is not. State
+  > which of the two you mean; they differ by 3.8x and both are in use.
+  >
+  > What survives regardless: the remaining work is **single-digit
+  > milliseconds against a 33 ms budget**, not the 19.80 ms / 54% that a
+  > uniform 16.667 ms bar implies. Several individual named lines clear it.
 - **It is not the median.** p50 already fits (16.27 ms). `holds_60fps` needs
   the distribution, not its middle — ~50% of fields still miss, and the tail
   (p95 ≈ 38 ms) is what a player feels.
@@ -3975,6 +4005,77 @@ outcome rule both bite hard.
 Worth noting `dispatch_captured_raw_rdp` appears in **both** tables: 3.17 ms of
 guard at its seam, and separately the untimed 8 MiB copy of candidate 0 below.
 Do not double-count them, and re-profile before treating either as available.
+
+## MEASURED: the DPC staging copy is 1.79-1.82 ms/render-field, and 72% of it is the COPYBACK
+
+Frozen evidence: `rt64-rep1.full.log` / `rt64-rep2.full.log` line 179
+(`[dpc-copy-census]`), line 194 (`[frame-populations]` slow, n=3849 render
+fields, 11,153 DPC calls = 2.898 calls/render-field). RT64 lane, 1.5M steps.
+Two reps agreeing to 1.8%.
+
+| phase | rep1 | rep2 | us/call | **effective GB/s** |
+|---|---:|---:|---:|---:|
+| alloc | 0.115 | 0.114 | 39.7 | 197.0 |
+| copy_in | 0.386 | 0.380 | 133.2 | 58.7 |
+| **copy_back** | **1.321** | **1.296** | **455.9** | **17.1** |
+| total | 1.822 | 1.790 | 628.7 | |
+
+**The finding is not the byte count, it is the ASYMMETRY.** `copy_back` and
+`copy_in` move the same 8 MiB and `copy_back` costs **3.4x more** — 322.8
+us/call of excess, **0.935 ms per render field**. A bulk `memcpy` does not
+vary by 3.4x on byte count, so that excess is not bandwidth: it is what
+writing into the LIVE mapping costs versus streaming into fresh `mmap` pages.
+The flush that precedes this seam re-arms `PROT_READ` over the 1 MiB watched
+bank (`arm_barrier_over_clean_region`), so the copyback faults it back in.
+
+**Do not read this as "delete the copy".** The renderer genuinely mutates
+guest RDRAM and those bytes must reach the guest. The available move is
+narrowing the copyback to the bytes that actually changed — and that is rule
+12's exact shape, so `089d896` **counts before optimizing**:
+`[dpc-copyback-diff]` reports the changed share, the number of maximal
+differing runs, and the scan's own cost. If the changed share is large, the
+scan is pure added cost and the entry dies. **That run has not been made yet**
+— the number below the fold is unmeasured and nothing should be built on it.
+
+## MEASURED, NEGATIVE: `invalidate writes` is a FLAT PER-DISPATCH TAX, not render work
+
+Same frozen logs, line 228 and the `[resume-split]` blocks. The 2.04 ms on the
+render field looked like a target because it is 4.6x the non-render field's
+0.443 ms. **Divide by dispatches and the difference disappears:**
+
+| | invalidate | dispatches/field | **us/dispatch** |
+|---|---:|---:|---:|
+| render (slow) | 2.042 ms | 167.8 | **12.17** |
+| non-render (fast) | 0.443 ms | 31.6 | **14.03** |
+
+Per-dispatch cost is **0.87x** across populations while the dispatch count is
+**5.31x**. The render field does not do more expensive invalidation; it does
+5.3x more dispatches. **The 4.6x ratio is entirely a count, not a cost.**
+
+Three consequences, all of which close this line as a route to 3.13 ms:
+
+1. **The ceiling is 2.04 ms and it cannot be reached.** Deleting the phase
+   entirely still misses 3.13. Even that is not on offer — the phase is
+   `disarm_and_capture` + two queue takes + `matches_view`'s memcmp over the
+   barrier's dirty pages + the re-arm, and the `mprotect` alone is ~1.2 us
+   of the 12.17 (`write_barrier.rs:812`).
+2. **This 2.04 ms IS the barrier working**, and the barrier pays for itself:
+   turning it off costs 12.4 ms/field (22.96 -> 35.32). A clean boundary is
+   the product, not the overhead. Attacking the cost of answering "nothing
+   changed" risks the 12.4 to chase the 2.04.
+3. **The lever, if there is one, is the DISPATCH COUNT, not this phase.**
+   167.8 dispatches per render field against 31.6 is the number with the
+   leverage, and it is a scheduling question, not a barrier one. Anything
+   that reduces dispatches per field pays into this phase automatically —
+   and into `reconcile`, `cop0`, `exit`, `suspend` and `resolve`, which are
+   the same shape.
+
+**Corollary worth generalizing: a phase that scales with a COUNT is not sized
+by its total.** Both the brief that named this target and the ranked-candidate
+list read the 2.04 ms as render-field work because the render field is where
+it is large. The per-unit figure is what says whether there is a defect to
+fix, and here there is none — 12.17 vs 14.03 us is the same code doing the
+same thing at the same speed, more often.
 
 ## Candidate: 682 journal boundaries per field, 75% of them clean — UNSIZED
 
