@@ -615,3 +615,50 @@ I also briefly concluded the probe "does not exist" because `git grep` over
 and the frontier doc names that path two lines above the table I was reading.
 A search of the wrong directory is indistinguishable from absence — the same
 shape as rule 20, self-inflicted while investigating.
+
+## Generated No Mercy's shard topology — it works, with two caveats (2026-08-08)
+
+    $ python3 scripts/generate-wm-shard-topology.py \
+        --rom $FN64_DISCOVER_NW4E_ROM --output-root <scratch>
+    generated_packages=38
+
+**The derived topology is genuinely No Mercy's, not WM2000's:**
+
+| | overlays | shape | inventory entries |
+|---|---:|---|---:|
+| WM2000 (committed) | 4 | — | 37 |
+| No Mercy (generated) | **5** | **[2, 2, 5, 7, 5]** | **42** |
+
+So `package_inventory()` really is title-generic, and combined with the
+selector from `50d2c21` the build can now express this title. That is the
+mechanical half of a second title, done.
+
+### Caveat 1 — the generator hardcodes WM2000 in its OUTPUT PATHS
+
+It wrote to `<root>/examples/wm2000-block-shards/` and
+`<root>/examples/wm2000-block-boot/`, i.e. the *topology* is per-title but the
+*directory and package names* are not. The selector added in `50d2c21` selects
+by directory name, so those must differ before two titles can coexist.
+
+**This is the remaining piece of the same generalization** — small, and now
+precisely located: the generator's path construction, not its topology
+derivation.
+
+### Caveat 2 — the shape does NOT match the recorded figures
+
+`corpus-certification-frontier.md` records No Mercy as `[3, 3, 5, 8, 5]`,
+total 24. The generator produced `[2, 2, 5, 7, 5]`, 42 inventory entries and
+38 packages. **Both cannot be right.**
+
+Not investigated here. Candidates: the recorded figures predate a change to
+tiling or shard sizing; they were measured on the Rev A ROM rather than the
+on-disk Unlocked variant (the same variant question that just resolved for
+host bindings); or "shards per overlay" and "inventory entries" count
+different things — note 42 entries against 38 packages means the inventory
+carries rows that are not overlay shards.
+
+**Whoever brings up No Mercy must reconcile this before trusting either
+number.** Recording it rather than picking the one that suits: a figure in a
+doc and a figure from a generator disagreeing is exactly the shape that cost
+this project a day, and the generator's output is at least reproducible from a
+named ROM.
