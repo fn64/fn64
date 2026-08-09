@@ -789,12 +789,43 @@ fn main() {
             Box::new(PcmEvidenceBackend::default()),
             fn64_recomp_rs::RDRAM_LEN,
         );
-        // NWXE verifies SRAM by issuing domain-2 PI writes during boot. The block
-        // lane is intentionally ephemeral, so give it a typed in-memory 32 KiB
-        // device; omitting the device is a harness error and remains a loud trap.
+        // NW4E (No Mercy) is a FlashRAM title, not an SRAM one. The prior
+        // `SramBanked` wiring here was copied from the WM2000 template along
+        // with a comment naming NWXE -- WM2000's cart ID, not this title's.
+        //
+        // Evidence, from the booted ROM
+        // (`11640379fdf534b39f34678036ad8e4cdc9b80b4f2cc72411433363372123976`,
+        // vaddr->file = vaddr - 0x80000000 + 0xC00, anchored on entry
+        // 0x80000400 -> file 0x1000):
+        //
+        //   * The ROM carries its own `osFlashInit` at 0x8002fed0, which builds
+        //     an `OSPiHandle` whose seven public fields match fn64's own
+        //     FlashRAM constants exactly (`fn64-abi/src/save.rs:39,444-451`):
+        //     deviceType 8, latency 5, pageSize 0x0F, relDuration 2, pulse
+        //     0x0C, domain 1, baseAddress 0xA800_0000.
+        //   * That handle lives at 0x800b8448. `osFlashInit` holds
+        //     &handle.baseAddress (0x800b8454 = base + 12) in $16 and stores
+        //     the byte fields at base+4..base+9; all six offsets agree with the
+        //     public `OSPiHandle` layout only for base 0x800b8448.
+        //   * The full libultra flash command set is present and reaches the
+        //     device through `osEPiWriteIo` (0x8003d530): 0x78 chip-erase
+        //     (0x8003013c), 0x4B sector-erase (0x8003022c), 0xB4 read-array
+        //     (0x80030448), 0xA5 write-array (0x80030460), 0xD2 execute
+        //     (0x8003d684).
+        //
+        // A 32 KiB SRAM store could not work even if the flash path were bound:
+        // `require_flash_len` (`fn64-abi/src/save.rs:393-403`) hard-asserts the
+        // installed save is exactly 128 KiB.
+        //
+        // The block lane is intentionally ephemeral, so this is a typed
+        // in-memory device; omitting it is a harness error and stays a loud
+        // trap. Registering the handle address is required because the
+        // `OSPiHandle` storage is a libultra BSS symbol per linked ROM, which
+        // fn64 will not guess (see `set_flash_handle_vram`'s doc comment).
         fn64_abi::set_save(Box::new(fn64_runtime::InMemorySaveStorage::for_device(
-            fn64_runtime::SaveType::SramBanked,
+            fn64_runtime::SaveType::FlashRam,
         )));
+        fn64_abi::set_flash_handle_vram(0x800b_8448);
         use fn64_render::RenderBackend as _;
         let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
             let mut render_backend = fn64_render_reference::ReferenceBackend::new()
