@@ -1083,3 +1083,110 @@
             )
         ));
     }
+
+mod overlapping_run_collapse {
+    use super::*;
+
+    #[test]
+    fn one_routine_matching_at_adjacent_starts_is_one_candidate() {
+        // A window wider than the routine also matches when it merely contains
+        // it, so the same routine matches at several adjacent start offsets.
+        let run = [0x8000_1000, 0x8000_1004, 0x8000_1008, 0x8000_100c];
+        assert_eq!(collapse_overlapping_runs(&run), vec![0x8000_100c]);
+    }
+
+    #[test]
+    fn the_reported_address_is_the_routine_entry_not_the_padding_before_it() {
+        // Callers resolve `jal` targets against this address, so a run must
+        // report its latest start -- the routine's own entry -- rather than an
+        // earlier start that matched only by including preceding filler.
+        let run = [0x8000_2000, 0x8000_2004];
+        assert_eq!(collapse_overlapping_runs(&run), vec![0x8000_2004]);
+    }
+
+    #[test]
+    fn genuinely_distinct_routines_stay_separate_candidates() {
+        // Two real routines are never adjacent at word granularity, so
+        // collapsing cannot hide real ambiguity.
+        let distinct = [0x8000_1000, 0x8000_1004, 0x8000_3000];
+        assert_eq!(
+            collapse_overlapping_runs(&distinct),
+            vec![0x8000_1004, 0x8000_3000]
+        );
+    }
+
+    #[test]
+    fn an_empty_candidate_list_stays_empty() {
+        assert!(collapse_overlapping_runs(&[]).is_empty());
+    }
+}
+
+mod create_mesg_queue_is_register_allocation_free {
+    use super::*;
+
+    /// The documented six-word queue init, with the sentinel materialized once
+    /// into `$v0` -- the 1998-era build's allocation.
+    fn single_register_form() -> Vec<u32> {
+        vec![
+            0x3c02_8005, // lui   $v0, 0x8005
+            0x2442_8860, // addiu $v0, $v0, -0x77a0
+            0xac82_0000, // sw    $v0, 0($a0)     mtqueue
+            0xac82_0004, // sw    $v0, 4($a0)     fullqueue
+            0xac80_0008, // sw    $zero, 8($a0)   validCount
+            0xac80_000c, // sw    $zero, 12($a0)  first
+            0xac86_0010, // sw    $a2, 16($a0)    msgCount
+            0x03e0_0008, // jr    $ra
+            0xac85_0014, // sw    $a1, 20($a0)    msg
+            0, 0, 0,
+        ]
+    }
+
+    /// The same behavior with the sentinel materialized into two registers,
+    /// which is what the 1996-era build emits. Same ABI, different allocation.
+    fn two_register_form() -> Vec<u32> {
+        vec![
+            0x3c0e_8003, // lui   $t6, 0x8003
+            0x3c0f_8003, // lui   $t7, 0x8003
+            0x25ce_3af0, // addiu $t6, $t6, 0x3af0
+            0x25ef_3af0, // addiu $t7, $t7, 0x3af0
+            0xac8e_0000, // sw    $t6, 0($a0)
+            0xac8f_0004, // sw    $t7, 4($a0)
+            0xac80_0008, // sw    $zero, 8($a0)
+            0xac80_000c, // sw    $zero, 12($a0)
+            0xac86_0010, // sw    $a2, 16($a0)
+            0x03e0_0008, // jr    $ra
+            0xac85_0014, // sw    $a1, 20($a0)
+            0,
+        ]
+    }
+
+    #[test]
+    fn both_compilations_of_the_same_routine_are_recognized() {
+        assert!(is_create_mesg_queue(&single_register_form()));
+        assert!(is_create_mesg_queue(&two_register_form()));
+    }
+
+    #[test]
+    fn queue_heads_taking_different_sentinels_are_rejected() {
+        // Requiring both heads to receive the SAME computed address is what
+        // keeps this a queue-initializer predicate rather than "any six
+        // stores through $a0".
+        let mut words = two_register_form();
+        words[1] = 0x3c0f_8004; // $t7 now denotes a different address
+        assert!(!is_create_mesg_queue(&words));
+    }
+
+    #[test]
+    fn a_missing_documented_field_is_rejected() {
+        let mut words = single_register_form();
+        words[6] = 0x0000_0000; // drop the msgCount store
+        assert!(!is_create_mesg_queue(&words));
+    }
+
+    #[test]
+    fn storing_the_wrong_argument_to_a_field_is_rejected() {
+        let mut words = single_register_form();
+        words[8] = 0xac86_0014; // msg <- $a2 instead of the o32 second argument
+        assert!(!is_create_mesg_queue(&words));
+    }
+}

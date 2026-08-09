@@ -1811,12 +1811,22 @@ WM-block runtime host symbols each title resolves uniquely:
     WWF No Mercy (Rev A)      OK 15/15
     Virtual Pro Wrestling 2   OK 15/15
     WCW-nWo Revenge           FAIL -- OsSetEventMesg, 0 candidates
-    WCW vs. nWo World Tour    FAIL -- OsCreateMesgQueue, 0 candidates
+    WCW vs. nWo World Tour    FAIL -- OsEPiStartDma, 0 candidates
 
-The two 1998 WCW titles are an earlier engine revision whose libultra shapes
-the current signatures do not match. That is a discovery question, not a lane
-question, and it bounds those two titles out of the lane until the signatures
-generalize.
+That is a discovery question, not a lane question, and it bounds those two
+titles out of the lane until the signatures generalize.
+
+Read the failing symbol carefully: discovery short-circuits on the first
+failure, so it names where it stopped, not the only gap. The per-symbol
+breakdown is in `wcw-host-binding-recognizers.md`, and the two titles are
+**not** the same problem. Revenge resolves 7 of 9 separable roles and shares
+WM2000's libultra build lineage; its two gaps (`osSetEventMesg`, `osSetTimer`)
+need recognizers written for a different implementation. World Tour resolves 1
+of 9, and an opcode-skeleton triage finds 7 of 7 routines are genuinely
+different code rather than differently-allocated -- it is a 1996 libultra
+generation, and supporting it is a project rather than a signature widening.
+Neither title is close, but "0 candidates, bounded out" understates Revenge and
+misdiagnoses World Tour.
 
 ### The remaining wall: the shard package inventory is fixed
 

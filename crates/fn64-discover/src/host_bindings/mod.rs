@@ -342,17 +342,63 @@ fn jal_field(word: u32) -> Option<u32> {
     (op(word) == 3).then_some(word & 0x03ff_ffff)
 }
 
+/// `osCreateMesgQueue(mq, msg, count)` initializes the documented six-word
+/// `OSMesgQueue` through `$a0`: both thread queues are set to the same
+/// "no waiting thread" sentinel, `validCount` and `first` are zeroed, and the
+/// caller's count and buffer are stored.
+///
+/// Which register carries the sentinel, and whether the compiler materializes
+/// it once or once per store, is a register-allocation artifact rather than
+/// ABI behavior: the 1996-era build loads it into two registers where the
+/// 1998-era build reuses one. Pinning `$v0` and a fixed store order therefore
+/// described a particular compilation instead of the documented behavior, so
+/// the sentinel is identified by the address it computes and the store order
+/// is left free. Requiring both queue heads to receive the *same* computed
+/// address is what keeps this a queue-initializer predicate rather than
+/// "any six stores through `$a0`".
 fn is_create_mesg_queue(words: &[u32]) -> bool {
-    words.len() >= 9
-        && is_lui(words[0], 2)
-        && is_addiu(words[1], 2, 2, imm(words[1]))
-        && is_sw(words[2], 2, 4, 0)
-        && is_sw(words[3], 2, 4, 4)
-        && is_sw(words[4], 0, 4, 8)
-        && is_sw(words[5], 0, 4, 12)
-        && is_sw(words[6], 6, 4, 16)
-        && is_jr_ra(words[7])
-        && is_sw(words[8], 5, 4, 20)
+    if words.len() < 9 {
+        return false;
+    }
+    let stored_to_queue = |offset: i16, source: u32| {
+        words
+            .iter()
+            .any(|&word| is_sw(word, source, 4, offset))
+    };
+    // validCount and first are zeroed; msgCount and msg come from the o32
+    // third and second arguments.
+    if !(stored_to_queue(8, 0)
+        && stored_to_queue(12, 0)
+        && stored_to_queue(16, 6)
+        && stored_to_queue(20, 5))
+    {
+        return false;
+    }
+    if !words.iter().any(|&word| is_jr_ra(word)) {
+        return false;
+    }
+    let queue_head_source = |offset: i16| {
+        words
+            .iter()
+            .find(|&&word| op(word) == 0x2b && rs(word) == 4 && imm(word) == offset)
+            .map(|&word| rt(word))
+    };
+    let (Some(mtqueue), Some(fullqueue)) = (queue_head_source(0), queue_head_source(4)) else {
+        return false;
+    };
+    // Fold the lui/addiu pair that forms each queue head's value so the two
+    // are compared by the address they denote, not by register identity.
+    let sentinel = |register: u32| {
+        let high = words.iter().find(|&&word| is_lui(word, register))?;
+        let low = words
+            .iter()
+            .find(|&&word| op(word) == 9 && rt(word) == register && rs(word) == register)?;
+        Some(absolute_from_lui_offset(*high, imm(*low)))
+    };
+    match (sentinel(mtqueue), sentinel(fullqueue)) {
+        (Some(first), Some(second)) => first == second,
+        _ => false,
+    }
 }
 
 fn is_epi_start_dma(words: &[u32]) -> bool {
@@ -1300,10 +1346,40 @@ fn unique_match(
         .collect::<Vec<_>>();
     candidates.sort_unstable();
     candidates.dedup();
+    let candidates = collapse_overlapping_runs(&candidates);
     match candidates.as_slice() {
         [address] => Ok(*address),
         _ => Err(HostBindingDiscoveryError::NonUniqueSemanticMatch { symbol, candidates }),
     }
+}
+
+/// Collapse a run of consecutive word addresses to its last address.
+///
+/// An order-free predicate over a window wider than the routine also matches
+/// when the window merely *contains* the routine, so one routine matches at
+/// several adjacent start offsets. Those are one candidate reported several
+/// times, not several routines, and counting them separately would report a
+/// correct predicate as ambiguous.
+///
+/// The run's last address is the reported one because that is the latest start
+/// whose window still satisfies the predicate, which is the routine's own
+/// entry; earlier starts only match by including preceding filler. Callers
+/// resolve `jal` targets against this address, so returning a run's first
+/// address would name an instruction inside the caller's padding instead of
+/// the function entry. Only strictly adjacent (4-byte apart) addresses are
+/// collapsed: two genuinely distinct routines are never adjacent at word
+/// granularity, so this cannot merge real duplicates.
+fn collapse_overlapping_runs(sorted: &[u32]) -> Vec<u32> {
+    let mut collapsed: Vec<u32> = Vec::new();
+    for &address in sorted {
+        if collapsed.last() == Some(&address.wrapping_sub(4)) {
+            // Extend the current run: the entry is its latest start.
+            *collapsed.last_mut().expect("run has a first address") = address;
+        } else {
+            collapsed.push(address);
+        }
+    }
+    collapsed
 }
 
 fn unique_create_thread_match(
@@ -1507,10 +1583,12 @@ pub fn discover_overlay_loader_host_bindings(
                 .ok_or(HostBindingDiscoveryError::AddressOverflow)?,
         )
         .ok_or(HostBindingDiscoveryError::AddressOverflow)?;
+    // Twelve words: the six documented stores plus the lui/addiu pairs, which
+    // the 1996-era build emits once per queue head rather than once in total.
     let create = unique_match(
         words,
         va_start,
-        9,
+        12,
         HostBindingSymbol::OsCreateMesgQueue,
         is_create_mesg_queue,
     )?;
