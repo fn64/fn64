@@ -4038,6 +4038,18 @@ scan is pure added cost and the entry dies.
 
 ### MEASURED, NEGATIVE (2026-08-09): narrowing the copyback LOSES 4.67x
 
+**RENDERER: `reference` (software rasterizer).** Stated first because this
+page's own dead-ends list says to always state the renderer beside a graphics
+figure, and the first version of this section did not — the run was launched
+without `FN64_RENDER`, which defaults to `reference`
+(`wm2000-block-boot/src/main.rs:863`), reproducing the exact trap recorded
+below. The RT64 re-measurement is reported at the end of this section. The
+*staging seam itself* is backend-independent — the `dpc_*` counters wrap
+`dispatch_captured_raw_rdp`'s own copies in
+`crates/fn64-abi/src/task_dispatch/rsp_commit.rs`, upstream of
+`with_render_backend` — but **which bytes the renderer dirties is not**, so
+the changed share had to be confirmed on the owner's lane.
+
 The run has now been made, on the post-mirror-fix binary (`8109435`), 281
 calls, frozen at
 `$CLAUDE_JOB_DIR/tmp/copyback-diff-FROZEN-124359.log`:

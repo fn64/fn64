@@ -274,6 +274,24 @@ print "binary:       $BINARY"
 print "steps:        $STEPS"
 print "warmup_gfx:   $WARMUP_GFX  (fields before this many graphics submits are the transient)"
 print "load:         $LOAD"
+# --- WHICH RENDERER. Rule 6b (echo the gate's VALUE) applied to the one gate
+# this script does not set.
+#
+# `main.rs` defaults `FN64_RENDER` to "reference" -- the SOFTWARE rasterizer --
+# so every number this script produces is a reference-lane number unless the
+# caller exported the variable. That is not a footnote: under RT64 the RDP
+# seam measures 5.75 ms/field against reference's 26.9, a 4.7x difference in
+# the largest graphics line, and a whole "graphics is 70% of the field"
+# decomposition was once built on the lane nobody runs. It happened again on
+# 2026-08-09, to an agent that had read the dead-ends list.
+#
+# This line is the cheapest possible guard: the value is printed where the
+# provenance block already is, so a log can never again be ambiguous about
+# which rasterizer produced it. The binary's own
+# "[wm2000-block-boot] registered <name> renderer" line confirms it BY EFFECT
+# downstream; this states the INTENT up front, and a disagreement between the
+# two is itself the signal.
+print "renderer:     ${FN64_RENDER:-reference (DEFAULT -- software rasterizer, NOT rt64)}"
 print ""
 
 # The UNFILTERED stream, at a per-run path. Load-bearing, and it cost a
