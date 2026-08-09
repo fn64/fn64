@@ -628,6 +628,23 @@ fn main() {
     let drive_rom_init =
         fn64_discover::host_bindings::discover_drive_rom_init_host_binding(dense_words, va_start)
             .expect("wm2000-block-boot build.rs: discovering 64DD drive init");
+    // Optional: only a title whose save media is command-driven (FlashRAM)
+    // links the programmed-IO routines. An SRAM title reaches its save device
+    // entirely through PI DMA, so absence is normal rather than an error.
+    let programmed_io = fn64_discover::host_bindings::discover_programmed_io_host_bindings(
+        dense_words,
+        va_start,
+    );
+    let programmed_io_address = |symbol| {
+        programmed_io
+            .iter()
+            .find(|binding| binding.symbol == symbol)
+            .map(|binding| binding.vram)
+    };
+    let os_epi_write_io =
+        programmed_io_address(fn64_discover::host_bindings::HostBindingSymbol::OsEPiWriteIo);
+    let os_epi_read_io =
+        programmed_io_address(fn64_discover::host_bindings::HostBindingSymbol::OsEPiReadIo);
     let binding_address = |symbol| {
         resident_host_bindings
             .iter()
@@ -934,6 +951,20 @@ fn main() {
             found.guard_vram
         ),
         None => writeln!(pack, "pub const DRIVE_ROM_INIT_GUARD: Option<u32> = None;"),
+    };
+    let _ = match os_epi_write_io {
+        Some(vram) => writeln!(
+            pack,
+            "pub const OS_EPI_WRITE_IO: Option<u32> = Some({vram:#010X});"
+        ),
+        None => writeln!(pack, "pub const OS_EPI_WRITE_IO: Option<u32> = None;"),
+    };
+    let _ = match os_epi_read_io {
+        Some(vram) => writeln!(
+            pack,
+            "pub const OS_EPI_READ_IO: Option<u32> = Some({vram:#010X});"
+        ),
+        None => writeln!(pack, "pub const OS_EPI_READ_IO: Option<u32> = None;"),
     };
     let _ = writeln!(
         pack,
