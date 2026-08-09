@@ -4034,8 +4034,41 @@ narrowing the copyback to the bytes that actually changed — and that is rule
 12's exact shape, so `089d896` **counts before optimizing**:
 `[dpc-copyback-diff]` reports the changed share, the number of maximal
 differing runs, and the scan's own cost. If the changed share is large, the
-scan is pure added cost and the entry dies. **That run has not been made yet**
-— the number below the fold is unmeasured and nothing should be built on it.
+scan is pure added cost and the entry dies.
+
+### MEASURED, NEGATIVE (2026-08-09): narrowing the copyback LOSES 4.67x
+
+The run has now been made, on the post-mirror-fix binary (`8109435`), 281
+calls, frozen at
+`$CLAUDE_JOB_DIR/tmp/copyback-diff-FROZEN-124359.log`:
+
+```
+[dpc-copyback-diff] changed_bytes=12111045 of 2357198848 (0.5138% of the image)
+  runs=812176 (2890.3 runs/call, 15 bytes/run)
+  diff_ms=541.019 (1925.334 us/call) vs copy_back 412.641 us/call
+```
+
+**The changed share is 0.5138% — and the idea still dies.** Two independent
+reasons, either sufficient:
+
+1. **Finding the changed bytes costs 4.67x the copy it would avoid**:
+   1925.3 us/call to scan versus 412.6 us/call to copy. Scanning to avoid
+   copying is a net **+1512.7 us/call**.
+2. **The changes are shattered, not clustered**: 2,890 maximal runs per call
+   at **15 bytes each**. Even given the diff for free, a narrowed copyback is
+   ~2,890 short memcpys replacing one 8 MiB streaming one, and rule 12's
+   original case is exactly that a gather does not run at streaming
+   bandwidth.
+
+This is the strongest rule-12 instance on the project: **99.49% of 2.2 GiB is
+provably dead copying and eliminating it is still the wrong direction.** A
+predicted small changed share was correct and irrelevant — the share was never
+the operative variable, the *fragmentation* and the *scan cost* were.
+
+**Ceiling, for anyone tempted to revisit:** the whole copyback is 0.413
+ms/call. Against WM2000's measured 22.6 ms gap to the 30fps budget, deleting
+it entirely and for free is worth at most a few percent. It cannot be part of
+a plan that closes the gap.
 
 ## MEASURED, NEGATIVE: `invalidate writes` is a FLAT PER-DISPATCH TAX, not render work
 

@@ -474,6 +474,15 @@ scoped — each names the specific mechanism it ruled out, not a category.
   denominator in the title.*
 - **depth-buffer copy elimination** — measured +0.84%, kept for correctness
   only (rule 12)
+- **narrowing the DPC copyback (0.413 ms/call = ~1.9% of the 22.6 ms gap)** —
+  measured 2026-08-09 on the post-mirror-fix binary. The renderer changes only
+  **0.5138%** of the 8 MiB image, and the line still dies twice over: the scan
+  to find those bytes costs **1925.3 us/call against the 412.6 us/call copy it
+  would avoid (4.67x)**, and the changes are **2,890 runs/call at 15 bytes
+  each** — a narrowed copyback is thousands of short memcpys replacing one
+  streaming one. **The strongest rule-12 case yet: 99.49% provably dead bytes,
+  eliminating them is still the wrong direction.** Do not re-derive from the
+  byte count.
 
 ## Writing it down
 
