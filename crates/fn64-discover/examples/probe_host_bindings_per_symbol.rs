@@ -56,6 +56,11 @@ fn symbol_name(symbol: HostBindingSymbol) -> &'static str {
         HostBindingSymbol::OsSpTaskYield => "osSpTaskYield",
         HostBindingSymbol::OsSpTaskYielded => "osSpTaskYielded",
         HostBindingSymbol::OsStartThread => "osStartThread",
+        HostBindingSymbol::OsEPiWriteIo => "osEPiWriteIo",
+        HostBindingSymbol::OsEPiReadIo => "osEPiReadIo",
+        HostBindingSymbol::OsFlashInit => "osFlashInit",
+        HostBindingSymbol::OsFlashSectorErase => "osFlashSectorErase",
+        HostBindingSymbol::OsFlashReadArray => "osFlashReadArray",
     }
 }
 
