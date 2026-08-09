@@ -3405,6 +3405,21 @@ verdict. For that, use a real `git worktree` checkout.
 
 ## Dead ends — do not retry without new evidence
 
+- **Optimizing the RDP on the strength of the reference-lane 57.8%.** Measured
+  2026-08-08: **`render-benchmark.zsh` never exports `FN64_RENDER`**, and
+  `wm2000-block-boot/src/main.rs:863` defaults to `"reference"`, so every
+  number that script has ever produced is a **software-rasterizer** number
+  unless the caller set the variable. Under `FN64_RENDER=rt64` — the
+  configuration the owner actually runs — the RDP seam falls **26.9 -> 5.75
+  ms/field** and its share of `resume NET` falls **57.8% -> 22.6%**; ratio A
+  goes 2.13x -> 1.34x. Four runs, interleaved, guest byte-identical, reps
+  agreeing to 0.2 pp. **Rasterization to zero still leaves 1.85x budget and
+  ALL graphics to zero leaves 1.40x**, so graphics is not the path to 60fps on
+  the owner's lane. Full result, including why the reference bucket was so
+  large (a *second* whole-RDRAM clone inside
+  `fn64-render-reference`'s `process_rdp_commands`, which RT64 does not pay),
+  in `rt64-on-the-block-lane.md`. **Always state the renderer beside any
+  graphics figure taken on this lane.**
 - **Hoisting loop-invariant span edges out of `raw_pixel_coverage`.** The
   hypothesis was right and the change still loses. `raw_span_edges_at_y_eighth`
   recomputed two 64-bit mul-divs once per *sample* — 8x per pixel — when only
