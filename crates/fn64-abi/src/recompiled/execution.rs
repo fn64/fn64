@@ -687,8 +687,29 @@ pub(crate) fn commit_scheduler_running_thread_mirror(
     };
     unsafe { storage.write_u32(origin.global, origin.handle) };
     fn64_recomp_rs::notify_host_abi_write(physical_start, 4);
-    transaction
-        .commit_with(|physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) });
+    // Hand the view down. `commit_with` is `commit_with_optional_view(.., None)`,
+    // and that `None` skipped the word-wise fast path at
+    // `live_program.rs:2760` -- which requires `Some(view)` -- dropping the
+    // commit onto `read_snapshot`, a byte-at-a-time rebuild of the WHOLE 1 MiB
+    // watched region (bounds check plus a `^3` lane XOR per byte) on every
+    // scheduler pick that changes the running thread.
+    //
+    // Measured before the change: the mirror boundary was 8.99 ms per render
+    // field at 32.25 us/call, of which a 20 s sample put 75.4% in that inlined
+    // byte loop and 22.9% in the `commit_snapshot` it feeds -- against 1.3% in
+    // mprotect syscalls. The barrier itself was never the cost: it served
+    // 100.00% of 5,538,929 boundaries with one fall-back, and `arm`/`disarm`
+    // issued one syscall EACH for the entire run.
+    //
+    // The view is the same one built at the top of this function and already
+    // used for the reconcile two statements up, over the same region, with the
+    // same lifetime -- so this adds no borrow, no unsafe, and no new read.
+    // `commit_with_optional_view`'s own doc comment describes precisely this
+    // cost; this call site was simply left behind when the others were fixed.
+    transaction.commit_with_optional_view(
+        |physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) },
+        Some(&view),
+    );
     true
 }
 
