@@ -1517,6 +1517,14 @@ pub enum AbiHostShimV1 {
     OsSpTaskYield,
     OsSpTaskYielded,
     OsStartThread,
+    /// `osEPiWriteIo(OSPiHandle *, u32 devAddr, u32 data)`.
+    ///
+    /// Programmed single-word device IO, the path a FlashRAM title uses to
+    /// issue save-media commands. An SRAM title never links it.
+    OsEPiWriteIo,
+    /// `osEPiReadIo(OSPiHandle *, u32 devAddr, u32 *data)`, the read
+    /// counterpart used for command status and identity polls.
+    OsEPiReadIo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

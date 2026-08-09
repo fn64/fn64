@@ -1856,6 +1856,8 @@ pub(super) fn abi_host_shim_callable(shim: AbiHostShimV1) -> RecompFunc {
         AbiHostShimV1::OsSpTaskYield => os_sp_task_yield,
         AbiHostShimV1::OsSpTaskYielded => os_sp_task_yielded,
         AbiHostShimV1::OsStartThread => os_start_thread,
+        AbiHostShimV1::OsEPiWriteIo => os_epi_write_io,
+        AbiHostShimV1::OsEPiReadIo => os_epi_read_io,
     }
 }
 
@@ -1877,7 +1879,12 @@ pub(super) fn abi_host_shim_writer_effects(shim: AbiHostShimV1) -> Vec<WriterCha
         ]
     };
     match shim {
-        AbiHostShimV1::OsEPiStartDma => {
+        // Programmed single-word IO commits through the same PI save-device
+        // path as a domain-2 DMA, so it carries the same channels as
+        // `osEPiStartDma` rather than the HostAbi-only default.
+        AbiHostShimV1::OsEPiStartDma
+        | AbiHostShimV1::OsEPiWriteIo
+        | AbiHostShimV1::OsEPiReadIo => {
             vec![WriterChannel::PiDma, WriterChannel::HostAbi]
         }
         AbiHostShimV1::OsRecvMesg | AbiHostShimV1::OsSendMesg | AbiHostShimV1::OsStartThread => {
