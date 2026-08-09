@@ -2,6 +2,38 @@
 
 # WM2000 render benchmark: per-frame latency during SUSTAINED RENDERING.
 #
+#
+# WHERE DOES THE TIME GO? RUN THIS:
+#
+#     ./reference/wm2000-routes/render-benchmark.zsh --profile
+#
+# That is the whole answer. One command, one authoritative report, tagged
+# `[fn64-profile]`. You do not need to know which env gates exist, and you
+# should not set them by hand -- `--profile` exports the single `FN64_PROFILE`
+# flag and the binary composes the rest, each at a value its OWN parser
+# accepts. The gates disagree about what "on" means: `FN64_EXECUTOR_SPLIT=0`
+# ARMS its instrument while `FN64_FRAME_CENSUS_POPULATIONS=0` disarms its own.
+#
+# What `--profile` guarantees, and why each guarantee exists:
+#
+#   * EVERY ROW STATES BOTH DENOMINATORS -- its share of its parent AND its
+#     ratio to the 16.667 ms budget. "20.9% of resume NET" reads as small;
+#     the same row as "0.57x budget" does not, and three such rows summed to
+#     1.29x the budget while every individual number was correct.
+#   * THE ROWS ARE SUMMED FOR YOU, against the budget. Do not eye a list.
+#   * A CHILD EXCEEDING ITS PARENT REFUSES TO PRINT its subtree. That check
+#     alone catches three of the four instrument defects found in one evening.
+#   * A PARTIAL PROFILE IS REFUSED, exit 70, naming the gate that did not arm.
+#     A plausible subset gets believed; nothing does not.
+#   * PER POPULATION AND PER PERCENTILE (p50/p95/p99), never a bare mean. A
+#     mean has hidden the real distribution twice: bimodal, then trimodal.
+#   * PROVENANCE IN THE REPORT -- binary, route, step count, and each gate's
+#     state VERIFIED BY EFFECT rather than echoed.
+#   * GUEST BYTE-IDENTITY is checked automatically on the 1.5M route.
+#
+# If it refuses, read the refusal: it names the missing gate and what was lost.
+# A refusal is the tool working. Full method: `docs/plans/perf-method.md`.
+#
 # COMMITTED ON PURPOSE, for the same reason `entrance-to-match.schedule` is:
 # a route recipe is evidence and belongs in the repository. The run that first
 # reached WM2000's match-setup screen -- 3,917 graphics submits, 7,029 audio
@@ -102,6 +134,8 @@ MAX_LOAD=3.0
 HEARTBEAT=200000
 BINARY=""
 DUMP_DIR=""
+PROFILE=0
+BASELINE_MS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -111,6 +145,8 @@ while [[ $# -gt 0 ]]; do
         --heartbeat)  HEARTBEAT="$2"; shift 2 ;;
         --binary)     BINARY="$2"; shift 2 ;;
         --dump-dir)   DUMP_DIR="$2"; shift 2 ;;
+        --profile)     PROFILE=1; shift ;;
+        --baseline-ms) BASELINE_MS="$2"; shift 2 ;;
         -h|--help)    sed -n '1,80p' "$0"; exit 0 ;;
         *) print -u2 "unknown argument: $1"; exit 2 ;;
     esac
@@ -178,6 +214,31 @@ export FN64_HEARTBEAT="$HEARTBEAT"
 export FN64_FRAME_CENSUS=1
 export FN64_FRAME_CENSUS_WARMUP_GFX="$WARMUP_GFX"
 
+# --- `--profile`: ONE gate that arms every decomposition channel.
+#
+# This script historically exported NONE of the five gates a decomposition
+# needs, so getting one meant remembering all five names and each gate's own
+# truthiness convention -- and they do not agree. `FN64_EXECUTOR_SPLIT=0` ARMS
+# the instrument (it is `var_os().is_some()`) while `FN64_FRAME_CENSUS_
+# POPULATIONS=0` disarms it (`env_flag`). Two conventions, opposite meanings,
+# identical-looking values.
+#
+# So this exports the single flag and lets the binary compose the rest, each at
+# a value its own parser accepts. Do not expand this into five exports here:
+# that reintroduces exactly the per-gate knowledge the flag exists to remove.
+if (( PROFILE )); then
+    export FN64_PROFILE=1
+    # Rule 17: the instrument's cost is MEASURED, never predicted -- a
+    # predicted 0.029 ms/field once measured +1.62, wrong by 56x. Pass the
+    # control lane's ms/field in with --baseline-ms and the report states the
+    # perturbation, the correction factor, and the resolution floor below
+    # which a row cannot be trusted. Without it the header says UNMEASURED
+    # rather than implying zero.
+    if [[ -n "$BASELINE_MS" ]]; then
+        export FN64_PROFILE_BASELINE_MS="$BASELINE_MS"
+    fi
+fi
+
 if [[ -n "$DUMP_DIR" ]]; then
     mkdir -p "$DUMP_DIR"
     export FN64_RENDER_DUMP_DIR="$DUMP_DIR"
@@ -244,8 +305,15 @@ FULL_LOG="${FN64_BENCHMARK_FULL_LOG:-/tmp/fn64-render-benchmark-$$-$(date +%Y%m%
 # lost to an `[executor-split]` "NOT ARMED" notice that was printed, filtered,
 # and never seen. Read the unfiltered log regardless -- the allowlist is a
 # convenience for watching a live run, never the evidence.
+# `^\[fn64-profile\]` is in the allowlist because this filter is an ALLOWLIST:
+# a tag not named here is invisible in the stream the operator watches, and
+# that has already cost two 25-minute runs and one whole census. The profile
+# report is the authoritative output of `--profile`; dropping it here would
+# make the flag silently useless. Add the tag in the SAME change that
+# introduces it, always.
 "$BINARY" 2>&1 | tee "$FULL_LOG" | grep -E --line-buffered \
-    '^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done|^\[mprotect-barrier\]|^\[mirror-reconcile\]|^\[frame-populations\]|^\[executor-split\]|^\[resume-split\]|^\[frame-sequence\] pattern|vi_reachability'
+    '^\[frame-census\]|^\[fn64-heartbeat\]|render_error|steady idle|^\[wm2000-block-boot\] done|^\[mprotect-barrier\]|^\[mirror-reconcile\]|^\[frame-populations\]|^\[executor-split\]|^\[resume-split\]|^\[fn64-profile\]|^\[frame-sequence\] pattern|vi_reachability'
+BENCH_STATUS=${pipestatus[1]}
 
 # The census prints from `atexit`, so it lands after the harness's own summary.
 print ""
@@ -256,3 +324,39 @@ print "  RATIO A is the 60fps bar (target 16.667 ms/field). RATIO B is speed"
 print "  versus the console (target 1.000x). Report BOTH -- they answer"
 print "  different questions and quoting one for the other is a known error."
 print "  This is the HEADLESS lane: guest+runtime only, no presentation cost."
+
+# --- Guest byte-identity, run automatically rather than left as a step a tired
+# person can skip. The emulated program must not change: a perf number from a
+# run that emulated something else is not a perf number.
+#
+# Uses the anchored checker and the recorded per-ROUTE tuple. The route is part
+# of the tuple -- checking a 1.5M run against the 2.1M expectation fails and
+# burns the run. Never hand-roll the extraction: a `findall(...)[-1]` scan once
+# compared a steady-state span count against a whole-run total and cost three
+# 25-minute runs.
+IDENTITY_EXPECT="$REPO/scripts/byte-identity-1p5M.txt"
+if (( PROFILE )) && [[ "$STEPS" == 1500000 && -f "$IDENTITY_EXPECT" ]]; then
+    print ""
+    print "GUEST BYTE-IDENTITY"
+    if python3 "$REPO/scripts/check-byte-identity.py" "$IDENTITY_EXPECT" "$FULL_LOG"; then
+        print "  guest byte-identity holds: the emulated program is unchanged."
+    else
+        print -u2 "  GUEST BYTE-IDENTITY FAILED -- this run emulated a different program."
+        print -u2 "  Its timings describe that other program and must not be reported."
+        exit 4
+    fi
+fi
+
+# Propagate the binary's own exit status. Under FN64_PROFILE the binary exits
+# non-zero when a constituent gate failed to arm, and a refusal that the script
+# swallows into a green exit is not a refusal.
+if (( BENCH_STATUS != 0 )); then
+    print -u2 ""
+    print -u2 "BENCHMARK EXITED $BENCH_STATUS."
+    if (( BENCH_STATUS == 70 )); then
+        print -u2 "  Exit 70 is FN64_PROFILE refusing to print a partial profile:"
+        print -u2 "  a constituent channel did not arm. Grep the unfiltered log for"
+        print -u2 "  '[fn64-profile] MISSING' -- it names the gate and what was lost."
+    fi
+    exit "$BENCH_STATUS"
+fi

@@ -36,14 +36,41 @@ lines = open(log_path, errors="replace").read().splitlines()
 # The guest byte-identity tuple is defined by the progress summary, so anchor
 # to it explicitly and fail loudly if it is absent rather than falling back to
 # a scan that can pick up a different metric with the same key name.
-progress = [l for l in lines if "[wm2000-block-progress]" in l]
+# TWO ways this anchor was too loose, both found by a real byte-identical run
+# being reported as a failure:
+#
+#   1. `"[tag]" in l` matches the tag ANYWHERE in the line, including inside
+#      prose that merely NAMES the tag. The profile report's scope legend
+#      explains the `gfx_submits` collision and cites `[wm2000-block-progress]`
+#      as an example; that mention became a later "match" than the data line.
+#   2. `[-1]` then preferred it, because it appears later in the log.
+#
+#   Result: a run whose counters were byte-identical reported `6 not found`.
+#   An instrument broke another instrument, using the very text that explains
+#   name collisions. A LOG LINE IS AN API when anything parses the log.
+#
+# So: require the tag at the START of the line (the data line always begins
+# with it; prose that cites it does not), and require the line to actually
+# CARRY the counters rather than merely bear the tag. Both conditions, because
+# either alone is a scan that can pick the wrong line.
+progress = [
+    l for l in lines
+    if l.startswith("[wm2000-block-progress]") and "gfx_submits=" in l
+]
 if not progress:
-    print("FATAL: no [wm2000-block-progress] summary line in this log.\n"
+    print("FATAL: no [wm2000-block-progress] summary line carrying counters in this log.\n"
           "Cannot check byte-identity: the counters live on that line and a\n"
-          "free-text scan can match a different metric of the same name.",
+          "free-text scan can match a different metric of the same name.\n"
+          "(A line that merely MENTIONS the tag does not count -- that is how a\n"
+          "byte-identical run was once reported as a failure.)",
           file=sys.stderr)
     sys.exit(2)
-summary = progress[-1]
+if len(progress) > 1:
+    print(f"FATAL: {len(progress)} candidate progress summary lines carry counters.\n"
+          "The anchor is ambiguous, and picking one would be a guess. Refusing.",
+          file=sys.stderr)
+    sys.exit(2)
+summary = progress[0]
 
 # `fields` is NOT on the progress line and is ambiguous by itself: the census
 # emits total_fields=8295, transient_fields=595 and a steady-state fields=7699.

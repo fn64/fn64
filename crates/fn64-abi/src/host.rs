@@ -47,6 +47,12 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
         // canonical program identity -- a diagnostic must not move that
         // digest. `install` is `Once`-guarded and returns immediately when the
         // gate is absent, which is every non-diagnostic run.
+        // Belt-and-braces: `FN64_PROFILE` normally arms from a pre-main
+        // constructor, which is the only point early enough to beat the
+        // `thread_local!` gate cells. This call covers a linker configuration
+        // that drops the init section. `arm` is `Once`-guarded and returns
+        // immediately when the flag is absent.
+        crate::profile::arm();
         crate::frame_census::install();
         crate::frame_census::observe_vi_fields(vi_retrace_ticks, now);
     }

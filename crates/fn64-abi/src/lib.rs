@@ -2211,10 +2211,18 @@ mod dispatch;
 /// `FN64_DPC_COPY_CENSUS=1`. Diagnostic only; see the module docs for why the
 /// seam's existing inclusive timer cannot answer either question.
 mod dpc_copy_census;
+/// The counter tree declared as DATA -- every counter names its parent, and
+/// children summing above their parent is a hard error that refuses to print
+/// the affected subtree. Promotes the `PhaseTiming` nesting diagram from prose
+/// a human must obey into a check the code performs.
+pub mod counter_tree;
 /// Per-VI-field wall-clock latency, gated by `FN64_FRAME_CENSUS=1`. The test
 /// for the "guaranteed 60fps" bar; see the module docs for why both the
 /// frame-budget ratio and the wall-versus-virtual ratio are always reported.
 pub mod frame_census;
+/// `FN64_PROFILE=1`: one gate that arms every constituent channel and emits one
+/// authoritative report. Composes the existing gates; does not replace them.
+pub mod profile;
 mod gbpak;
 mod host;
 mod mesgqueue;

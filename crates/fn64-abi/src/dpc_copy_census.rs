@@ -165,6 +165,24 @@ pub(crate) fn running_totals() -> (u64, u64, u64, u64) {
     )
 }
 
+/// The staging-copy phase timers, for per-field sampling.
+///
+/// These previously existed only as a whole-run `atexit` summary, which is why
+/// a per-field figure for them could not be found in a frozen benchmark log:
+/// the numbers were never sampled per field, so no amount of re-reading an old
+/// log would produce them. The staging memcpy is now a live optimization
+/// target, and a target needs a per-field cost against the 16.667 ms budget --
+/// not a run total that hides which population pays it.
+///
+/// Returned as `(alloc, copy_in, copy_back)` in nanoseconds.
+pub(crate) fn staging_totals() -> (u64, u64, u64) {
+    (
+        ALLOC_NS.load(Relaxed),
+        COPY_IN_NS.load(Relaxed),
+        COPY_BACK_NS.load(Relaxed),
+    )
+}
+
 fn arm_report() {
     extern "C" fn at_exit() {
         let calls = CALLS.load(Relaxed);
