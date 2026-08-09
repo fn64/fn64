@@ -172,6 +172,13 @@ mod tests {
 
     #[test]
     fn rejects_misaligned_and_reversed_spans() {
+        // `shard_words` resolves the published image before it validates the
+        // span, so without this the assertions below meet `NotPublished` and
+        // never reach the alignment checks they exist to pin. Publishing is a
+        // `OnceCell` set shared by the whole test binary: a matching image is
+        // accepted whether or not another test got here first.
+        publish_normalized_rom_image(vec![0u8; 0x40]);
+
         // Unaligned length.
         assert_eq!(
             shard_words(0x10, 0x13).unwrap_err(),

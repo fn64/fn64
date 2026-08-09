@@ -134,6 +134,7 @@ const DYNAMIC_MAPPED_EXECUTION_LIBRARY_SOURCES_V1: &[(&str, &[u8])] = &[
     ),
     ("src/interp.rs", include_bytes!("interp.rs")),
     ("src/lib.rs", include_bytes!("lib.rs")),
+    ("src/rom_image.rs", include_bytes!("rom_image.rs")),
     ("src/runtime/fpu_ops.rs", include_bytes!("runtime/fpu_ops.rs")),
     ("src/runtime/host.rs", include_bytes!("runtime/host.rs")),
     ("src/runtime/mod.rs", include_bytes!("runtime/mod.rs")),
