@@ -290,18 +290,40 @@ not**. No code may be copied or adapted from any GPL runtime.
 
 ## Closed lines — do not re-propose without new evidence
 
-Each was closed by measurement, not opinion:
+Each was closed by measurement, not opinion.
 
-- **async RSP dispatch** — the deadline is computed *from* the work
-- **HLE graphics** — 16,586/16,586 submits rejected it
-- **`FN64_FAST_MUTATION_JOURNAL`** — the barrier absorbs it; it can only gate
-  the site that was already cheap
+**Every entry states its DENOMINATOR.** Audited 2026-08-08 after one entry was
+found closing far more territory than it measured: *"RSP micro-optimization"*
+read as *graphics is closed* while covering 17.6% of graphics and never touching
+the 82% that is RDP. **An entry whose scope is narrower than its title silently
+closes ground it never examined, and the whole function of this list is that
+nobody re-derives its entries.** The other six were checked and are correctly
+scoped — each names the specific mechanism it ruled out, not a category.
+
+- **async RSP dispatch (ceiling 0 ms, not 13.4)** — the deadline is computed
+  *from* the work: `lle.steps` does not exist until interpretation finishes, so
+  the scheduler must block on the worker. The off-field is not host idle either
+  — the harness *jumps* the virtual clock, so there is no slack to donate.
+- **HLE graphics for THIS title's microcode** — 16,586/16,586 submits rejected
+  with `NeedsLle`; 100% XBUS (`dram_dpc=0`) and 3.66 IMEM overlay swaps per
+  task, so no display list exists in RDRAM to decode and no 4 KiB digest can
+  identify the ucode. Admitting F3DZEX2 is a clean-room RE project, not config.
+- **`FN64_FAST_MUTATION_JOURNAL` (this flag only, barrier ON in both lanes)** —
+  −0.14 ms, sd 0.35, three interleaved pairs, deltas of both signs. The barrier
+  absorbs it; it can only gate the site that was already cheap. *Not* a
+  statement about the barrier, which is a separate A/B — conflating the two
+  produced a retracted claim.
 - **instruction budgeting** — changes the emulated program
 - **RSP threading** — thread-local state
-- **RSP micro-optimization** — uniform 11.25 ns/instruction, no defect. The
-  interpreter is **large, not slow**: 526,161 instructions per render field at
-  ~39 cycles each is normal for instruction-by-instruction vector coprocessor
-  emulation.
+- **RSP micro-optimization (17.6% of graphics — NOT the renderer)** — uniform
+  11.25 ns/instruction, no defect. The interpreter is **large, not slow**:
+  526,161 instructions per render field at ~39 cycles each is normal.
+  **Scope, added 2026-08-08 because this entry read far broader than it was
+  measured:** RSP is **5.64 ms/field, 17.6% of graphics**; the RDP is
+  **26.40 ms, 82.3%** and was never examined by that work. Do not read this
+  line as "graphics is closed". *A closed line is dangerous in proportion to
+  how broadly its title reads versus how narrowly it was measured — state the
+  denominator in the title.*
 - **depth-buffer copy elimination** — measured +0.84%, kept for correctness
   only (rule 12)
 
