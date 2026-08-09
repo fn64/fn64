@@ -13,6 +13,53 @@ before acting on any rule you are about to lean on hard.
 
 **The standing bar: 16.667 ms per emulated VI field, hardware parity.**
 
+## Running the work (not the experiment)
+
+Earned 2026-08-08, a full day on one perf question. Every rule below is about
+sequencing and coordination, not measurement — and they cost more time that day
+than any measurement error did.
+
+**Instrument, then measure, then optimize. Never interleave.** Four separate
+measurements each discovered their instrument was broken *after* arming it, at
+hour three, hour six, hour nine and hour twelve. Building the profiler first
+would have cost one hour and saved most of them. **If the current cost of a
+thing is not already in a trustworthy report, the next task is the report — not
+the fix.**
+
+**Do not dispatch an optimization for a cost you have not measured.** Three
+targets were named and briefed that day; all three were wrong when measured —
+the apparatus (5.1% of the field), then "translated guest code" (20.9%, briefed
+as the bulk of 83%), then RDP (79% of it an artifact of a renderer the owner
+does not use). Rule 1 exists; violating it in a brief is the same error as
+violating it in an experiment.
+
+**Search for existing evidence before spending machine time.** Three 25-minute
+runs were dispatched to answer a question that two already-finished logs
+contained. Check the log directory, the frozen snapshots and the doc before
+queueing a run.
+
+**Verify a subagent's finding before relaying it upward, or label it
+unverified.** Three agent findings reached the owner as fact that day and all
+three were wrong: a VI-attribution claim, a mirror regression that was a single
+noisy rep, and a byte-identity deviation that was a parser bug. A relayed claim
+inherits your credibility, not the reporter's.
+
+**Fewer agents on entangled work.** Three agents sharing one worktree cost ~2
+hours of holding plus a 14-minute build destroyed by a file collision the
+coordinator authorized. Two agents on genuinely independent work finish sooner
+than four on coupled work, because coordination is the cost.
+
+**What worked, and should be default:** pre-registering thresholds, predictions
+and falsifiers *before* data (caught three real defects; three agents retracted
+their own findings unprompted); enforcing closure tolerances **in code** rather
+than in intent; and a **one-minute smoke run** before any 25-minute one — one
+smoke caught two defects that would each have cost a full run.
+
+**Read your instrument's first real output before trusting it.** Three defects
+that day surfaced by printing the report and looking at it, not by code review
+— including a decomposition that read 45.7 ms inside a 10 ms field while every
+parent/child relation held.
+
 ## The three that cost the most time
 
 **1. Measure before dispatching, not after.** Every win on this project came
