@@ -183,6 +183,14 @@ same answer regardless of the state it is checking is not a check. Prove the
 verifier distinguishes the two outcomes it exists to distinguish — ideally by
 injecting the defect and watching it catch it.
 
+**A `*-block-boot` binary STOPS AT FIRST OVERLAY ENTRY by design unless
+`FN64_BLOCK_CONTINUE_AFTER_OVERLAY` is set** (`main.rs:1131`; the benchmark
+script exports it, hand-rolled invocations forget it). The failure shape is
+rc=0 with a plausible-looking log — ~16k steps, `gfx_submits=0`, an
+evidence-snapshot dump that reads like progress. It cost one full Revenge
+route run before diagnosis. **The discriminator is `gfx_submits`, never the
+exit code.** Rule 15's shape: verify the state you meant to cause.
+
 **15. Verify the state you meant to cause, not the call you made.** `kill -STOP`
 returning 0 says a signal was sent, not that it landed (`ps -o stat` showing `T`
 says that). A green test run in a dirty tree says nothing about HEAD. Five
