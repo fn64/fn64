@@ -142,11 +142,61 @@ def main():
                     help="ROM offset known to be embedded in the un-gated lane")
     ap.add_argument("--require-control", metavar="BINARY",
                     help="fail unless a control hit is found in this binary")
+    ap.add_argument("--no-synthetic-control", action="store_true",
+                    help="skip the binary-independent self-test (not advised)")
+    ap.add_argument("--require-clean", metavar="BINARY", action="append",
+                    help="repeatable; fail unless this binary has ZERO ROM-word hits")
     ap.add_argument("--json-out")
     args = ap.parse_args()
 
     rom = open(args.rom, "rb").read()
     print(f"ROM {args.rom}: {len(rom)} bytes ({len(rom)/2**20:.1f} MiB)")
+
+    # --- rule 6a, binary-INDEPENDENT: prove the matcher works before using it.
+    #
+    # `--require-control` uses the un-gated binary as the positive control, but
+    # that only works while some binary still embeds ROM words. Once BOTH lanes
+    # are clean -- which is the whole point of the geometry substitution -- that
+    # control has nothing to find and would either fail or be quietly dropped,
+    # leaving a zero that proves nothing.
+    #
+    # This control depends on no binary at all: synthesize a buffer containing a
+    # known ROM run in each ordering and confirm the matcher finds each one, and
+    # confirm it does NOT find a run that was never planted. A search that fails
+    # here is broken regardless of what the binaries contain.
+    if not args.no_synthetic_control:
+        probe_off = args.control_offset
+        probe = rom[probe_off:probe_off + args.run_len]
+        planted = {}
+        haystack = bytearray()
+        for oname, fn in ORDERINGS.items():
+            haystack += bytes(64)                 # padding so offsets differ
+            planted[oname] = len(haystack)
+            haystack += fn(probe)
+        absent = bytes((b ^ 0xA5) for b in ORDERINGS["z64"](probe))
+        synth_ok = True
+        for oname, fn in ORDERINGS.items():
+            needle = fn(probe)
+            at = bytes(haystack).find(needle)
+            if at != planted[oname]:
+                print(f"  SYNTHETIC CONTROL FAIL: ordering {oname} planted at "
+                      f"{planted[oname]:#x} but found at {at:#x}", file=sys.stderr)
+                synth_ok = False
+        if bytes(haystack).find(absent) != -1:
+            print("  SYNTHETIC CONTROL FAIL: matched a run that was never planted "
+                  "-- the matcher reports false positives", file=sys.stderr)
+            synth_ok = False
+        n_ord = len(ORDERINGS)
+        n_found = sum(
+            1 for oname, fn in ORDERINGS.items()
+            if bytes(haystack).find(fn(probe)) == planted[oname]
+        )
+        print(f"synthetic control: {n_found}/{n_ord} orderings planted and found at "
+              f"ROM {probe_off:#x} -- {'PASS' if synth_ok else 'FAIL'}")
+        if not synth_ok:
+            print("\nThe matcher itself is broken. Every zero below is meaningless.",
+                  file=sys.stderr)
+            sys.exit(2)
 
     # --- build the sample set: fixed stride across the WHOLE ROM
     samples = []          # (rom_off, run_bytes)
@@ -256,6 +306,26 @@ def main():
             else:
                 print("  PASS -- the search demonstrably finds embedded ROM content.\n"
                       "  Absences reported for other binaries are therefore meaningful.")
+
+    # --- the acceptance assertion: named binaries must carry NO ROM words.
+    # Only meaningful because the synthetic control above already proved the
+    # matcher finds planted content in every ordering.
+    for binpath in (args.require_clean or []):
+        res = results.get(binpath)
+        print(f"\n{'='*78}\nCLEAN REQUIREMENT ({binpath})")
+        if res is None:
+            print("  FAIL -- was not searched", file=sys.stderr)
+            ok = False
+            continue
+        n = len(res["hits"])
+        if n:
+            offs = sorted({h["rom_off"] for h in res["hits"]})
+            print(f"  FAIL -- {n} hits from {len(offs)} distinct ROM offsets; "
+                  f"first: {', '.join(hex(o) for o in offs[:8])}", file=sys.stderr)
+            ok = False
+        else:
+            print("  PASS -- zero verbatim ROM runs found, in any of the "
+                  f"{len(ORDERINGS)} orderings.")
 
     if args.json_out:
         json.dump(results, open(args.json_out, "w"), indent=1)

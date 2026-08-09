@@ -107,6 +107,68 @@ impl ResolvedShard {
     }
 }
 
+/// Whether emitted runners re-read each instruction word from live guest
+/// memory before executing it (`verify_live_words`).
+///
+/// **This flag controls a DETECTOR, not redundant work.** Read the whole note
+/// before turning it off, and see `docs/plans/perf-method.md`.
+///
+/// # What it costs
+///
+/// The check is emitted at the top of the runner's `'run: loop`, above the
+/// `match pc`, so it executes **once per guest instruction**: a bounds test, an
+/// `EXPECTED_WORDS` index, and a full `Rdram::load_w` guest load. Ablated
+/// against the real emitter output on a realistic WM2000 instruction mix it
+/// measures **3.10 ns/instruction** — the single largest per-instruction cost
+/// in the emitted body, ahead of `advance_cop0_random` (0.61 ns) and
+/// `post_straight_instruction_exit` (0.26 ns).
+///
+/// # What it detects, and what still detects it when this is off
+///
+/// It catches a guest write that changes executable bytes underneath a live
+/// translation. Two other mechanisms cover that, and they are what the
+/// opt-out rests on:
+///
+/// - **Declared writes** reach `request_guest_write_boundary`
+///   (`fn64-recomp-rs` `runtime/host.rs:531`) → `classify_live_executable_write`
+///   (`fn64-abi` `recompiled/snapshots.rs:1289`), which sets
+///   `EXECUTABLE_WRITE_BOUNDARY` when the write hits a resident executable
+///   range. `post_straight_instruction_exit` consumes that at every
+///   architectural instruction boundary and exits with
+///   `BlockExit::ExecutableWrite`.
+/// - **The un-resident case** is covered by `activate_for_fetch_with_digest`
+///   (`fn64-recomp-rs` `generation/mod.rs`), which re-digests LIVE memory
+///   before activating any generation, so bytes changed while nothing was
+///   resident cannot later be executed as stale code.
+///
+/// # The gap this opt-out accepts
+///
+/// `fn64-abi` `write_barrier.rs:52-57` lists writers that bypass the
+/// declaration channel — `as_mut_slice`, the DMA paths, the RSP/renderer
+/// slices and raw `RdramPtr` stores. `verify_live_words` was the belt-and-
+/// braces detector for exactly those. Turning it off is a **defence-in-depth
+/// removal**, justified on a given route only by the seven-counter byte
+/// identity holding across the A/B, never by the two mechanisms above alone.
+///
+/// # Default
+///
+/// **On**, matching the behaviour that predates this flag. Set
+/// `FN64_WM_SHARD_VERIFY_LIVE_WORDS=0` to opt out. Absent, empty and `0` all
+/// mean the same thing on the *other* flags in this tree (`fn64-abi`'s
+/// `env_flag`), and an empty value reading as "set" is precisely what
+/// fabricated a 4.9x speedup once before — so this parses explicitly and
+/// treats anything it does not recognise as "leave verification on".
+fn emit_live_word_verification() -> bool {
+    println!("cargo:rerun-if-env-changed=FN64_WM_SHARD_VERIFY_LIVE_WORDS");
+    match std::env::var_os("FN64_WM_SHARD_VERIFY_LIVE_WORDS") {
+        None => true,
+        Some(value) => !matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+    }
+}
+
 fn delay_lookahead_word(
     rom: &[u8],
     generation: &Generation,
@@ -327,7 +389,7 @@ impl WmShardGenerator {
                         shard_vram_start: runner_va,
                         words: runner_words,
                         delay_lookahead,
-                        verify_live_words: true,
+                        verify_live_words: emit_live_word_verification(),
                     },
                     &self.host_calls,
                 )
@@ -376,6 +438,23 @@ impl WmShardGenerator {
         let _ = writeln!(metadata, "pub const BANK_ID: u64 = {id:#018X};");
         let _ = writeln!(metadata, "pub const VA_START: u32 = {va_start:#010X};");
         let _ = writeln!(metadata, "pub const BYTE_LEN: u32 = {byte_len:#010X};");
+        // Geometry, not content: where these instruction words live in the
+        // user's normalized ROM. `code_bank()` reads them from the runtime ROM
+        // and the existing `code_bank_sha256` assertion in `block_program.rs`
+        // proves the recovered words are the ones this shard was built from.
+        // These offsets index the NORMALIZED big-endian image (`self.rom` is
+        // `fn64_discover::normalize(source)`), so the runtime normalizes before
+        // slicing and a .n64/.v64 user file resolves to one identity.
+        let _ = writeln!(
+            metadata,
+            "pub const ROM_START: u32 = {:#010X};",
+            u32::try_from(byte_start).unwrap()
+        );
+        let _ = writeln!(
+            metadata,
+            "pub const ROM_END: u32 = {:#010X};",
+            u32::try_from(byte_end).unwrap()
+        );
         let _ = writeln!(
             metadata,
             "pub const SOURCE_SHA256: [u8; 32] = {source_sha256:?};"
@@ -384,11 +463,6 @@ impl WmShardGenerator {
             metadata,
             "pub const RUNNER_SOURCE_SHA256: [u8; 32] = {runner_source_sha256:?};"
         );
-        let _ = write!(metadata, "pub static WORDS: &[u32] = &[");
-        for word in words {
-            let _ = write!(metadata, "{word:#010X}, ");
-        }
-        let _ = writeln!(metadata, "];");
         GeneratedShard {
             package: package.to_owned(),
             runner,

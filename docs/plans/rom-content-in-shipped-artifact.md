@@ -635,7 +635,540 @@ WM2000 on one route: the method generalizes, the specific numbers do not.
 **Scope, restated:** this traces which bytes are where. It is not legal advice
 and nothing here should be read as a conclusion about lawfulness.
 
+---
+
+# IMPLEMENTATION: the geometry substitution
+
+Added 2026-08-08 by a third agent, which **implemented** §2b rather than
+studying it. Where this contradicts either section above, the contradiction is
+called out.
+
+## What `WORDS` is load-bearing for — settled from source, and it is NOT what §1c implied
+
+The study conditioned the substitution on the `production-aot` feature because
+`CodeSpan` admission is what stops the interpreter running data as code. That
+caution was right to raise and **wrong in its conclusion**: the substitution is
+safe unconditionally, and the reason is stronger than a feature flag.
+
+1. **Nothing executes from `WORDS`.** The production path is
+   `run_inner` (`execution/program.rs:1264-1336`). Its one contact with the
+   words is line 1317:
+   ```rust
+   if let Err(fault) = self.code.resolve(entry) { ... }
+   ```
+   `resolve` returns `Result<ResolvedInstruction, CpuFault>` where
+   `ResolvedInstruction { key, word }` — and the `Ok` value is **bound to
+   `if let Err`, i.e. computed and discarded**. Execution is `run(...)`, the
+   generated `match pc` arms.
+2. **Admission reads a length, not a value.** `CodeSpan::resolve`
+   (`program.rs:72-75`) is `self.words.get((offset / 4))`, and every admission
+   call site takes `.is_some()` (`:763`, `:834`, `:857`, `:1317`). A span of the
+   right length filled with arbitrary words admits and rejects exactly the same
+   PCs. **Admission is geometry.**
+3. **`classify()` — the only function that decodes a resolved word
+   (`program.rs:868-880`) — has zero non-test callers** in the workspace.
+
+Applying the per-call-site test "does this *check* something, or *derive* state
+the program depends on": **every non-test reader of `.words()` is a SHA-256
+hasher** (`main.rs:66`, `shell.rs:270`, `catalog_v1.rs:250`,
+`program.rs:1092/1130`). Only `evidence_snapshot` derives state — and
+substitution preserves it **byte-identically, because the recovered words are
+equal**. That is why this is a substitution rather than a gate.
+
+## The mechanism
+
+Each shard emits `ROM_START`/`ROM_END` beside the existing `VA_START`/`BYTE_LEN`
+instead of a literal array. `code_bank()` recovers the words from the user's ROM
+via `fn64_recomp_rs::shard_words`.
+
+**Why it matches by construction, not by luck:** the build-time decode at
+`wm2000-block-shards/build.rs:488-491` is literally
+`rom.bytes[byte_start..byte_end].chunks_exact(4).map(u32::from_be_bytes)`, and
+`shard_words` performs the identical operation on the same offsets of the same
+normalized image. Boot and overlay shards share that one path. So the existing
+`assert_eq!(code_bank_sha256(&code_bank), expected.code_sha256)`
+(`block_program.rs:98`, `:156`) cannot pass with the wrong bytes and cannot fail
+with the right ones.
+
+**Verification reuses the strongest check that already existed** rather than
+adding one. No new surface.
+
+### Proven against the committed artifact, before anything was rebuilt
+
+The construction argument above is structural. It was also tested against real
+data: take the digests `block_program.rs:98` actually asserts, out of the
+existing `pack.rs`, and check whether reading the ROM at the build-recorded
+geometry reproduces them.
+
+| generation | shards | reconstruct from ROM geometry |
+|---|---:|---|
+| `BOOT_SHARDS` | 15 | **15/15**, contiguous from ROM `0x1000` |
+| `RESIDENT_TAIL_SHARDS` | 2 | **2/2**, from the split at ROM `0xe2790` |
+| `OVERLAY_*_SHARDS` | 15 | **not brute-force verified** — see below |
+
+Boot shard 0's recorded `code_sha256` is `[7, 130, 99, 212, ...]`; hashing ROM
+`0x1000..0x11000` as big-endian words gives `078263d47acc...`. Same bytes.
+
+**The overlays are unverified by construction-analogy, and checked at build.**
+`resolve_generation` sets their `source_start` to `recipe.rom_start`, the same
+plain-ROM-offset mechanism confirmed on the other 17, and `code_bank_sha256`
+proves it at startup and fails loudly if not. Locating their base by scanning
+was too slow to be worth it; this is stated as unchecked rather than implied.
+
+### A self-correction worth keeping, because it looked like a real defect
+
+The first pass of that table read **14/16 boot** and **0/2 resident tail**.
+Both numbers were wrong, and both were the *probe's* error rather than the
+code's:
+
+- "14/16" assumed 16 full 64 KiB boot shards. There are **15**, the last
+  partial at `0x1790`; the probe only tested full-size spans.
+- "0/2" assumed the resident tail followed the 1 MiB boot copy at ROM
+  `0x101000`. It does not — it is the **second half of the same copy**, from
+  the split.
+
+Reading `resolve_generation` (`wm2000-block-shards/build.rs:536-600`) settled
+it for all three generation kinds at once. **This is rule 23's shape:** several
+narrow probes agreeing on one wrong offset assumption looks exactly like
+corroborated evidence of a bug. Each probe answered the question literally
+asked; none answered the question meant.
+
+## Corrections to §2b and §2c
+
+1. **The diagnostic does NOT regress.** §2b predicted exact-diverging-PC would
+   become a hash mismatch, and proposed 64 KiB span granularity as mitigation.
+   That assumed *removal*. Under substitution the words exist at runtime, so
+   `receipts.rs:1209-1213` keeps its word-for-word compare and its exact PC.
+   Nothing is paid and no mitigation is needed.
+2. **`NORMALIZED_ROM_SHA256` is now unconditional** (`build.rs`), derived from
+   `rom.sha256` and still cross-checked against prepared receipts in prepared
+   mode. It is enforced at startup by `assert_normalized_rom_identity()` in
+   `block_program.rs` — the one construction path both binaries share — naming
+   the expected title and both digests.
+3. **The interpreter footnote is retired, not satisfied.** The substitution is
+   safe even in a `dev-interpreter` build: the words come from the same
+   geometry with the same values, so admission extent *and* interpreted content
+   are unchanged. No feature conditioning was needed.
+
+## The exception image (confirms Result 6)
+
+Verified independently: the 4 words at ROM `0x37380` are
+`3C1A8003 275A6790 03400008 00000000`, and that 16-byte run occurs **exactly
+once** in the ROM. The build now *searches* for each captured image and
+**panics unless the match is unique**, rather than hardcoding the offset — so a
+title whose images are genuinely CPU-synthesized fails loudly instead of
+silently binding an arbitrary offset. §1f's "no clean runtime substitution" is
+refuted for this image, as Result 6 found.
+
+## The acceptance test had to change, and this is the important part
+
+**The audit's positive control does not survive its own fix.**
+`--require-control` used the verify-on binary as the control: a lane known to
+embed ROM words, so a zero there meant the search was broken. After the
+substitution **both lanes are clean**, so that control has nothing to find — it
+would hard-fail or be quietly dropped, leaving a zero that proves nothing.
+That is precisely the false-zero shape the audit's own Mach-O parser bug
+produced (0 sections mapped, every hit reading `(outside any section)`).
+
+So `scripts/rom-content-audit-search.py` gained a **binary-independent
+synthetic control**: it plants a known ROM run in all four orderings and
+requires the matcher to find each at its planted offset, plus a never-planted
+run it must *not* find. Proved in **both** directions (rule 6a):
+
+- healthy → `4/4 orderings planted and found -- PASS`, exit 0
+- `swap4` made a no-op (the exact endianness defect that causes a false zero)
+  → `SYNTHETIC CONTROL FAIL: ordering swap4 planted at 0xc0 but found at 0x40`,
+  exit 2
+
+`--require-clean BINARY` makes acceptance machine-checked; proved against a
+synthetic binary carrying 256 B of real ROM words in `swap4` (correctly FAILs,
+exit 1) and a clean one (PASSes, exit 0).
+
+**The archived pre-change binaries are retained as the real-Mach-O positive
+control** — a synthetic buffer proves the matcher works, but only a binary of
+this same program known to carry ROM words proves it works *on this shape*.
+
+## MEASURED RESULT
+
+Built `examples/wm2000-block-boot`, `--release --features rt64`, geometry
+substitution plus `FN64_WM_SHARD_VERIFY_LIVE_WORDS=0`.
+
+### The search: zero ROM words
+
+| binary | size | hits | orderings | sections |
+|---|---:|---:|---|---:|
+| **geometry** | 88,988,512 | **0** | — | 25 |
+| `verifyon` (archived control) | 95,303,296 | 126 | swap4 only | 25 |
+
+Three controls, all passing, which is what makes the zero mean anything:
+**synthetic 4/4 orderings** (binary-independent), **archived control 126 hits**,
+**`--require-clean` PASS**. 838 sampled runs across the whole ROM, four
+orderings. 25 sections mapped, so the audit's 0-section parser bug is absent.
+
+### Size, per section
+
+| section | `verifyoff` | geometry | delta |
+|---|---:|---:|---:|
+| **`__TEXT,__const`** | 7,085,632 | 5,180,416 | **−1,905,216** |
+| `__TEXT,__text` | 79,909,196 | 79,923,384 | +14,188 |
+| **file total** | 90,877,936 | **88,988,512** | **−1,889,424** |
+
+**The `__TEXT,__const` drop reconciles to 0.3%** — removed arrays measured
+1,910,656 B, section fell 1,905,216 B. That is the arrays and nothing else,
+which is far stronger evidence than the whole-file delta.
+
+**Attribution caveat:** the `+14,188` in `__TEXT,__text` is a *different
+agent's* telemetry work that landed in the same binary. It is not the geometry
+change and is not claimed as such. A clean attribution would need their tree
+built without this change.
+
+**Against the original un-gated binary: 6,314,784 B smaller (6.02 MiB).**
+
+### The boot caught a real bug that every static check missed
+
+First run **panicked at startup**: the exception image's `words()` was called by
+the banner at `main.rs:737`, *before* `load_rom` published the ROM at `:766`.
+
+This is the load-bearing lesson of the whole exercise. At the moment it failed,
+**all of the following were already true and verified**: 32/32 shard digests
+reproduced from geometry, 0 of 32 `WORDS` arrays, 0 of 33 `EXPECTED_WORDS`,
+zero ROM-word hits with both controls passing. None of it proved the binary
+ran, and it did not.
+
+Fix: **a count is pure geometry and must not need a ROM.** Added `word_count()`
+returning `(rom_end - rom_start) / 4`. The error was reaching for the words when
+only the length was wanted — the same conflation the substitution exists to
+avoid. Every other ROM-dependent call site was then audited rather than fixing
+only the one that fired; `main.rs` was the sole exposed site.
+
+### GUEST BYTE-IDENTITY: PASSES, 8 of 8 — and the "deviation" was my instrument
+
+**Final result. The geometry substitution is guest byte-identical.**
+
+| run | binary | result |
+|---|---|---|
+| **geometry** | 88,988,512 B, 0 ROM words | **8 of 8 match** |
+| control (change reverted) | 95,326,192 B, 126 ROM words | **8 of 8 match** |
+| verify-ON (archived) | 95,303,296 B | **8 of 8 match** |
+| peer 19:21 | pre-dates all of today | **8 of 8 match** |
+
+`gfx_submits=11153`, `audio_submits=7685`, `sp_tasks=18838`,
+`vi_interrupts=8386`, `controller_ops=2390`, `sim_time=13112786076`,
+`fields=7699`, `render_error=None`.
+
+#### The phantom, kept because the error is the instructive part
+
+For ~75 minutes this section reported a **303-submit deviation** in
+`gfx_submits` (11153 expected, 10850 observed) and three 25-minute experiments
+were run to attribute it. **There was no deviation. The checking script was
+wrong.**
+
+Both numbers appear in the same log, on different lines, as different metrics:
+
+```
+[wm2000-block-progress] ... gfx_submits=11153 ...          <- run total
+[frame-census] steady-state rendering evidence:
+                  gfx_submits=10850 across the span        <- warmup excluded
+```
+
+The script scanned the whole file and took the **last** match. The census line
+follows the progress line, so it compared a steady-state span count against a
+whole-run expectation. The 303 gap is exactly the fields excluded by
+`warmup_gfx=300`.
+
+**Three lessons, each earned here:**
+
+1. **Proving a check can fail is not proving it reads the right thing.** The
+   script was tested against an injected wrong *value* and passed. It was never
+   tested for reading the wrong *line*. Rule 6a done halfway.
+2. **Agreement across runs is not validity when every run uses the same
+   instrument.** Four binaries agreeing on "10850" felt like strong
+   corroboration; it was one parsing bug reproduced four times. This is rule 23's
+   shared-blind-spot in a new place.
+3. **A comment is not a verification.** The offending line was annotated
+   `# last occurrence wins: the summary line is emitted at end of run` — an
+   assumption written down and never checked.
+
+Two further defects surfaced in the same script while fixing it: `sim_time` was
+matched off heartbeat lines rather than the `done:` line, and `fields` was
+ambiguous between `total_fields=8295`, `transient_fields=595` and steady
+`fields=7699`. All three counters are now anchored to named lines, and a log
+without a `[wm2000-block-progress]` line is a hard exit rather than a silent
+fallback to a scan that can match a different metric of the same name.
+
+#### What the wasted runs did establish
+
+Not nothing: the geometry binary, the reverted control, and the verify-ON binary
+independently produce **byte-identical guest state**. That is stronger evidence
+than the single run originally planned — obtained expensively.
+
+#### The investigation record below is left standing
+
+Everything that follows was written while the phantom was believed real. It is
+retained rather than deleted: the attribution reasoning was sound given the
+input, and it documents how three candidate causes were excluded. Read it as a
+worked example whose premise turned out false.
+
+**`10850` predates the geometry binary by 35 minutes.** Two runs from another
+agent's mirror A/B — logs timestamped **19:21** and **19:26** — both report
+`gfx_submits=10850` with identical `sim_time` and `audio_submits`. The geometry
+binary was not built until **19:56**. Three independent runs across at least two
+binaries, all `10850`.
+
+So the geometry substitution **did not** cause it, established by a run that
+predates the change rather than by elimination. It also shows the counter is
+**stable run-to-run** (two runs five minutes apart, same value), so this is not
+a drifting counter — the recorded `11153` is simply stale for every binary built
+today. That mattered to exclude: a drifting `gfx_submits` would have undermined
+every byte-identity claim made against this route.
+
+**What those two runs were, checked rather than assumed.** They are from the
+peer's mirror work, but they are **not** the gated/ungated A/B pair: both report
+identical `exec_mirror_calls` (70.126 fast / 278.854 slow per field), so they are
+two runs of the *same* lane. They therefore establish **run-to-run stability of
+`gfx_submits` on one binary**, which is what excludes the drifting-counter
+worry — but they do **not** eliminate mirror gating as a cause. That variable
+remains open; it was tempting to claim and the logs do not support it.
+
+They also differ from the geometry run in one instrumented respect worth
+recording: both have `FN64_FRAME_CENSUS_POPULATIONS` armed (33
+`[frame-populations]` lines) while the default route has none. That is the same
+gating that made `over_budget` absent below.
+
+**Method note worth more than the result:** all of this came from reading the
+run-log directory, not from running anything. Three 25-minute experiments were
+queued to answer a question two finished runs had already answered. Check for
+existing evidence before designing an experiment.
+
+**A constraint that rules out whole classes of explanation:** `gfx_submits` and
+`audio_submits` come from the *same* `task_log()` borrow —
+`host.rs:591` returns `(gfx_count(), audio_count())` as one tuple and
+`frame_census.rs:539` reads `.0`. Any effect on sampling, census timing, or
+counter plumbing generally would move both. Only graphics moved. Whatever this
+is, it is specific to graphics-task dispatch.
+
+For scale: 303 submits is ~55k steps' worth at the observed end-of-run rate
+(~555 per 100k steps), so it is not a rounding or tail-truncation artifact.
+
+### `FN64_WM_SHARD_VERIFY_LIVE_WORDS`: a mechanism that exists but does not fire
+
+**This section was first written as "the flag is NOT guest-neutral — a
+correction to §2a," to explain a `gfx_submits` deviation that turned out not to
+exist (above). §2a needs no correction: there was no effect to explain.**
+
+**What survives is a genuine source finding with no measured consequence**, kept
+because the mechanism is real and someone will otherwise rediscover it. The
+original framing is left visible rather than swapped out — it is an example of
+building an explanation for a phantom, which is the hazard of reasoning from a
+mechanism toward an observation instead of the other way round.
+
+Sequence, so the reasoning is auditable:
+
+1. Source inspection found a real mechanism (below) by which the detector could
+   change block boundaries. Stated as "not guest-neutral."
+2. A verify-ON run of the same route was then measured, with the detector
+   confirmed armed (**1,872 `EXPECTED_WORDS` occurrences** in its generated
+   source versus 0 in the geometry lane — rule 6, lanes proven different).
+3. **`ImageChanged` occurred 0 times across the full route.** The early-exit
+   path was never taken, so no block boundary was ever altered.
+
+**Honest statement: the detector *can* change block structure; there is no
+evidence it does on this workload; its removal is not demonstrated to carry a
+behavioral cost.** The mechanism is real and worth knowing about — it is not
+observation-only in the general case — but §2a's practical claim survives for
+WM2000 on this route.
+
+Leading hypothesis for the deviation, with a **mechanism confirmed in source**
+though its firing on this route is **not yet demonstrated**.
+
+The study (§2a) treats the live-word detector as observation-only: "a
+defence-in-depth removal" plus a performance win. As a *content* channel that is
+right. As a *behavioral* channel it is wrong. The emitted macro
+(`emit/mod.rs:571`) is:
+
+```rust
+if let Err(miss) = verify_precompiled_instruction_word($bank, ...) {
+    finish!(BlockExit::ImageChanged { at: ..., miss });
+}
+```
+
+`finish!` **exits the runner loop**, and downstream `program.rs:1329` reads:
+
+```rust
+if !matches!(result.exit, BlockExit::ImageChanged { .. }) {
+    self.observe_execution_destination(...);
+}
+```
+
+So on a genuine word mismatch the detector **changes where a block ends and
+suppresses the execution-destination observation**. WM2000 reloads overlays
+continuously (45 overlay/generation events in the measured run), which is
+exactly when a verified PC can legitimately hold different words.
+
+This also fits the gfx-only asymmetry: the verification is emitted into the AOT
+guest runners that generate display lists; audio dispatch does not traverse
+those per-instruction checks the same way. And the timeline fits — `11153` was
+recorded on a **verify-ON** binary, while every lane since has been verify-OFF.
+
+**Not yet shown: that it fires here.** The mechanism requires an actual mismatch
+at a verified PC. Confirming it needs a verify-ON run of the same route; a
+mechanism that *could* explain an effect is not one that does.
+
+**And a candidate explanation was refuted at zero cost by reading two adjacent
+functions.** `FN64_FRAME_CENSUS_POPULATIONS` looked like it might select a
+different source for `gfx_submits` (`frame_census.rs:538-539`):
+
+```rust
+let counters = population_split_enabled().then(Counters::sample);
+let gfx_submits = counters.map_or_else(|| crate::task_counts().0, |c| c.gfx_tasks);
+```
+
+It does not. `Counters::sample()` (`:267-268`) opens with
+`let (gfx_tasks, audio_tasks) = crate::task_counts();` — **both branches read
+the same function.** Armed or unarmed, `gfx_submits` is the same value. The
+populations gate explains `over_budget`'s absence and nothing else.
+
+Worth recording as method: the cheap test was reading the callee, not running a
+25-minute experiment. Look for the cheap test first.
+
+### A negative worth keeping: WM2000 never self-modifies at a verified PC on this route
+
+`ImageChanged = 0` over the full 1.5M-step route, with the detector armed
+(1,872 `EXPECTED_WORDS` occurrences). **No live instruction word ever mismatched
+its baked expectation.**
+
+That is a fact about WM2000, not only about the flag. The route performs
+continuous overlay reloading — 45 overlay/generation events, four distinct
+generations entered — and the working assumption was that reloads would trip the
+detector at some verified PC. They do not. Overlay generations are swapped as
+whole immutable images through the generation catalog rather than by writing
+over live code that a runner is mid-execution on.
+
+Useful to whoever next reasons about self-modifying code here: the
+defence-in-depth detector that §2a debates removing **caught nothing on the one
+route we have measured**, which is a materially different situation from "it is
+protecting us and we are turning it off." It says nothing about other titles or
+other routes.
+
+**If confirmed, the release consequence is independent of the geometry work:**
+turning the detector off is not free, and §2a's cost accounting is incomplete.
+The two changes must stay separated — geometry is a *content* change with a
+byte-exactness criterion (met: 32/32 digests, zero ROM words); the flag is a
+*behavioral* change with a measurable effect (open).
+
+### Observed in passing during the owner's windowed run — NOT investigated
+
+The owner launched `wm2000-shell` against the geometry binary with his own ROM.
+It loaded the ROM at launch, rebuilt all 32 code banks from geometry, matched the
+boot context, rendered **1,080+ frames at p50 34.4 ms**, and exited cleanly —
+**with zero copyrighted ROM content compiled in.** The release shape works end
+to end.
+
+Two defects were visible in that session. Both are recorded as observations
+only; neither was investigated and neither is related to the ROM work:
+
+- **Audio produced 1,071,984 samples, all zero** (`nonzero=0` throughout). That
+  is silence being *produced*, not starvation — the delivery path is healthy and
+  the content is empty, which per rule 22 are different failures.
+- **`osViSwapBuffer calls=0`** across the whole session.
+
+Neither is caused by the geometry substitution: the guest byte-identity tuple
+matches exactly, so the emulated program is unchanged. They predate this work.
+
+### An instrument trap worth generalizing: a warning gated on the flag it warns about
+
+While checking the byte-identity tuple, `over_budget` came back NOT FOUND. It
+turned out to be benign — the counter lives in the `[frame-populations]` block
+(`frame_census.rs:1150`), gated on `FN64_FRAME_CENSUS_POPULATIONS`
+(`:454`), which `render-benchmark.zsh` never exports. The channel is
+known-absent on the default route, not silently dark.
+
+**But the reason it looked silent is the durable lesson.** There *is* a
+NOT-ARMED notice for exactly this case at `frame_census.rs:1331`
+(`[frame-populations] counters NOT SAMPLED (FN64_FRAME_CENSUS_POPULATIONS
+unset)`). It did not print because **the block that would print it sits behind
+the very gate it warns about.** A warning conditioned on the same flag it warns
+about is unreachable by construction: it can only fire when it is not needed.
+
+This is the sharper form of the peer's filtered-warning case recorded in
+`render-benchmark.zsh` (two 25-minute runs lost to a NOT-ARMED notice that was
+printed but filtered out of the watched stream). There the warning existed and
+was hidden; here it exists and cannot fire. Both produce the same observation —
+a clean-looking log from an unarmed instrument — so **"no warnings in the log"
+is not evidence that the instruments were armed.** Check the gate, not the
+absence of complaints.
+
+Practical consequence adopted here: the recorded expectation file distinguishes
+`NOT FOUND` from `match` rather than only flagging mismatches, so a run that
+emitted nothing cannot report "all match". That check produced this false alarm,
+which is the correct trade — a false alarm from a working check beats a quiet
+pass from a broken one.
+
+## KNOWN LIMITATION: hermetic build-identity mode cannot work, and the reason is structural
+
+`wm2000-block-boot` has a build-provenance mode entered by one CLI argument
+(`runner_reports.rs:2-16`). It deliberately does not load a ROM
+(`main.rs:742-744`) and its launcher runs the child with **`.env_clear()`**
+(`fn64-boot-harness/src/generated_runner_build/build.rs:1874`), so no `ROM`
+variable exists. It nevertheless reaches `construct_catalog_program`, because
+the identity early-return sits *after* the call (`main.rs:951` constructs,
+`:985` returns). With geometry-sourced words that mode now **panics** in
+`shard_words`.
+
+**The tension is real and does not dissolve.** `.env_clear()` exists precisely
+so a build identity cannot depend on ambient environment — that is what makes
+the attestation reproducible. Geometry-sourced words *require* ambient
+environment, because the ROM is the user's file named by an env var. The mode
+wants to attest what was built without possessing what it was built from.
+
+**Reordering does not fix it** (checked, not assumed).
+`generated_runner_build_identity` takes the constructed `CatalogBlockProgramV1`
+and draws nine payload fields from `generated_runner_source_attestation()`,
+including `program_identity_sha256` — which is the `evidence_snapshot` identity
+and hashes every instruction word (`program.rs:1130`), while the attestation
+re-hashes actual span words (`catalog_v1.rs:250`). Moving the early return
+above `:951` would leave nothing to report.
+
+**What was explicitly rejected:** letting `code_bank()` yield placeholder words
+when no ROM is published, with identity mode skipping the digest asserts. The
+`code_bank_sha256 == expected.code_sha256` checks are the entire reason
+geometry-sourced words can be trusted. A lane where they may pass against
+fabricated input would destroy that property — worse than the panic.
+
+**Not a blocker for a release build.** No gate binary references
+`runner_reports`; the three scripts naming `generated_runner_build` cite it as a
+source path in linter allowlists, and none invoke it. Normal boot, render, and
+the ROM-content result are unaffected. Recorded as an open design conflict
+rather than a defect to patch: whoever revisits it must choose between hermetic
+identity attestation and a content-free artifact, because under this design
+they are mutually exclusive.
+
 ### Reproducing
+
+**The geometry lane, end to end** — build, rule-19 source check, and the search
+with all three controls:
+
+```
+scripts/rom-content-audit-accept.zsh
+```
+
+Exits non-zero unless the build succeeds, the generated source carries **0**
+`WORDS` / **0** `EXPECTED_WORDS` / geometry in **every** shard, and the search
+reports zero ROM-word hits with its controls passing.
+
+**Guest byte-identity** (the emulated program must be unchanged):
+
+```
+reference/wm2000-routes/render-benchmark.zsh \
+  --binary target-audit-geometry/release/wm2000-block-boot --steps 1500000
+python3 scripts/check-byte-identity.py scripts/byte-identity-1p5M.txt \
+  /tmp/fn64-render-benchmark-<pid>-<stamp>.log
+```
+
+Read the **unfiltered** per-run log the script prints, not the filtered stream:
+the allowlist is for watching a live run and has hidden a fatal panic before.
+
+**The original two-lane audit**, unchanged:
 
 ```
 scripts/rom-content-audit-build.zsh                 # both lanes
@@ -647,5 +1180,15 @@ python3 scripts/rom-content-audit-search.py \
   --require-control target-audit-verifyon/release/wm2000-block-boot
 ```
 
-`--require-control` is not optional decoration: it is what makes a reported
-absence mean anything.
+**On the controls, all three of which are load-bearing:**
+
+- `--require-control` proves the search finds ROM content in a **real binary**
+  known to contain it. Not optional decoration.
+- The **synthetic control** (always on) proves the matcher works in all four
+  orderings against a planted needle, and rejects a needle never planted. It
+  depends on no binary — necessary once *both* lanes are clean, at which point
+  `--require-control` has nothing left to find.
+- `--require-clean` is the acceptance assertion itself.
+
+Keep `target-audit-verifyon/` — it is the only archived binary known to embed
+ROM words, and therefore the only real-binary positive control available.

@@ -924,8 +924,39 @@ fn main() {
         "pub const PREPARED_SOURCE_MODE: &str = {:?};",
         prepared.source_mode
     );
+    // The normalized-ROM digest is emitted UNCONDITIONALLY, not only in
+    // prepared mode. It is the identity a release build checks the user's ROM
+    // against at startup, so a build that left it all-zero would silently
+    // accept the wrong ROM -- worse than baking the words in. `rom.sha256` is
+    // the digest of the normalized big-endian image, which is also the form
+    // the shard geometry offsets index.
+    let normalized_rom_sha256 = {
+        let hex_digits = rom.sha256.as_bytes();
+        assert_eq!(
+            hex_digits.len(),
+            64,
+            "normalized ROM digest is a canonical SHA-256"
+        );
+        let mut digest = [0u8; 32];
+        for (index, pair) in hex_digits.chunks_exact(2).enumerate() {
+            let nibble = |c: u8| match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => panic!("normalized ROM digest is not hexadecimal"),
+            };
+            digest[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+        }
+        digest
+    };
+    if prepared.source_mode != "legacy_without_prepared_candidate" {
+        assert_eq!(
+            prepared.normalized_rom_sha256, normalized_rom_sha256,
+            "prepared receipts and the build ROM must name one image"
+        );
+    }
     for (name, digest) in [
-        ("NORMALIZED_ROM_SHA256", prepared.normalized_rom_sha256),
+        ("NORMALIZED_ROM_SHA256", normalized_rom_sha256),
         ("PREPARED_MANIFEST_SHA256", prepared.manifest_sha256),
         ("PREPARED_TREE_SHA256", prepared.tree_sha256),
         (
@@ -1119,17 +1150,78 @@ fn main() {
     let _ = writeln!(pack, "];");
     let _ = writeln!(
         pack,
-        "pub struct ExternalExecutableImage {{ pub image_id: &'static str, pub generation: u64, pub bank_id: u64, pub va_start: u32, pub va_end: u32, pub sha256_hex: &'static str, pub sha256: [u8; 32], pub words: &'static [u32] }}"
+        // A plain struct of geometry plus a plain `words()` method that reads
+        // the user's ROM. No `Deref`, no lazily-materializing static: on the
+        // release-critical "no copyrighted content" path the absence of
+        // embedded words should be auditable by reading this, and a clever
+        // container that produces ROM words on first deref is not.
+        //
+        // `words()` recovers from the ROM on each call. The only caller that
+        // runs per-execution is `verify_precompiled_words` on the exception
+        // vector, over 4 words; the rest are startup. Callers keep the same
+        // `&[u32]`-shaped argument, so `verify_precompiled_words` and
+        // `CodeBank::new` are unchanged.
+        "pub struct ExternalExecutableImage {{ pub image_id: &'static str, pub generation: u64, pub bank_id: u64, pub va_start: u32, pub va_end: u32, pub sha256_hex: &'static str, pub sha256: [u8; 32], pub rom_start: u32, pub rom_end: u32 }}\n\
+         impl ExternalExecutableImage {{\n\
+         \x20   /// This image's instruction words, read from the user's ROM at the\n\
+         \x20   /// offsets recorded at build time. Nothing is embedded; the caller\n\
+         \x20   /// verifies the result against `self.sha256`, exactly as it did\n\
+         \x20   /// when these words were a baked array.\n\
+         \x20   pub fn words(&self) -> Vec<u32> {{\n\
+         \x20       fn64_recomp_rs::shard_words(self.rom_start, self.rom_end)\n\
+         \x20           .unwrap_or_else(|error| panic!(\"external executable image {{:?}} cannot recover its words from the user's ROM: {{error}}\", self.image_id))\n\
+         \x20   }}\n\
+         \x20   /// How many instruction words this image has, WITHOUT reading the ROM.\n\
+         \x20   ///\n\
+         \x20   /// A count is pure geometry, so it must not require a published ROM.\n\
+         \x20   /// The startup banner prints this before `load_rom` runs; calling\n\
+         \x20   /// `words()` there panicked, because recovery needs an image that\n\
+         \x20   /// does not exist yet. Length is derivable from the extent alone.\n\
+         \x20   pub fn word_count(&self) -> usize {{\n\
+         \x20       ((self.rom_end - self.rom_start) / 4) as usize\n\
+         \x20   }}\n\
+         }}"
     );
-    for (index, vector_bank) in vector_banks.iter().enumerate() {
-        let _ = write!(
-            pack,
-            "pub static EXTERNAL_IMAGE_{index:02}_WORDS: &[u32] = &["
-        );
-        for word in &vector_bank.blocks[0].words {
-            let _ = write!(pack, "{word:#010X}, ");
+    // Captured exception-vector images are ROM content too, so they are
+    // located in the ROM and emitted as geometry rather than as literal words.
+    // The audit established that WM2000's one image (4 words at VA 0x80000180)
+    // appears verbatim at ROM 0x37380; this searches rather than hardcodes so
+    // the failure is loud on any ROM or route where it does not hold.
+    //
+    // The search must find EXACTLY ONE occurrence. A unique match is what makes
+    // the offset an identity; several matches would make the choice arbitrary,
+    // and this is small enough (16 bytes) that coincidence is a real risk worth
+    // rejecting rather than tie-breaking.
+    let mut external_image_rom_offsets: Vec<u32> = Vec::with_capacity(vector_banks.len());
+    for vector_bank in &vector_banks {
+        let needle: Vec<u8> = vector_bank.blocks[0]
+            .words
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect();
+        let mut found: Option<usize> = None;
+        let mut occurrences = 0usize;
+        for offset in (0..rom.bytes.len().saturating_sub(needle.len())).step_by(4) {
+            if rom.bytes[offset..offset + needle.len()] == needle[..] {
+                occurrences += 1;
+                if found.is_none() {
+                    found = Some(offset);
+                }
+                if occurrences > 1 {
+                    break;
+                }
+            }
         }
-        let _ = writeln!(pack, "];");
+        let offset = match (found, occurrences) {
+            (Some(offset), 1) => offset,
+            (_, count) => panic!(
+                "captured exception image {:?} (generation {}) has {count} word-aligned \
+                 occurrences in the ROM; exactly one is required for it to be emitted as \
+                 geometry instead of embedded words",
+                vector_bank.bank, count
+            ),
+        };
+        external_image_rom_offsets.push(u32::try_from(offset).expect("ROM offset exceeds u32"));
     }
     let _ = writeln!(
         pack,
@@ -1148,9 +1240,11 @@ fn main() {
             .collect::<Vec<_>>();
         let block = &vector_bank.blocks[0];
         let va_end = block.start_va + block.words.len() as u32 * 4;
+        let rom_start = external_image_rom_offsets[index];
+        let rom_end = rom_start + block.words.len() as u32 * 4;
         let _ = writeln!(
             pack,
-            "    ExternalExecutableImage {{ image_id: {:?}, generation: {}, bank_id: {:#018X}, va_start: {:#010X}, va_end: {va_end:#010X}, sha256_hex: {:?}, sha256: {digest_bytes:?}, words: EXTERNAL_IMAGE_{index:02}_WORDS }},",
+            "    ExternalExecutableImage {{ image_id: {:?}, generation: {}, bank_id: {:#018X}, va_start: {:#010X}, va_end: {va_end:#010X}, sha256_hex: {:?}, sha256: {digest_bytes:?}, rom_start: {rom_start:#010X}, rom_end: {rom_end:#010X} }},",
             image.capture.image_id,
             image.capture.generation,
             vector_bank.bank_id,

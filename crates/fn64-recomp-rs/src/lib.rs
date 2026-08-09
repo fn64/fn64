@@ -331,6 +331,7 @@ pub mod generation;
 pub mod interp;
 #[cfg(all(not(feature = "dev-interpreter"), feature = "dynamic-mapped-runtime"))]
 mod interp;
+pub mod rom_image;
 pub mod runtime;
 mod semantic;
 pub mod static_micro_op;
@@ -392,6 +393,10 @@ pub use interp::{
     run_bank, run_bank_with_memory_port, run_bank_with_mmio, AlignedDirectWordAddress,
     CartridgeReadOutcome, CartridgeStoreOutcome, CartridgeWordPort, MemoryPort, MmioOutcome,
     MmioPort, NoMmio, UnsupportedOp,
+};
+pub use rom_image::{
+    normalized_rom_image, normalized_rom_image_published, publish_normalized_rom_image,
+    shard_words, RomImageError,
 };
 pub use runtime::{
     call_host_or_recompiled, discard_executable_write_boundary, guest_write_token,

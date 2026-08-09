@@ -1,0 +1,33 @@
+# Guest byte-identity tuple for the 1.5M-STEP route (render-benchmark.zsh default).
+#
+# ROUTE IS PART OF THE TUPLE. The 16586/11005/27591/12008/3115/18776001537 set
+# quoted in briefs belongs to a ~2.1M-step route (perf-method.md:2407). Checking
+# a 1.5M run against it fails, and you burn the run to find out.
+#
+# Chosen lane (a): 1.5M steps, for direct comparability with today's mirror A/B
+# and split runs, which used this same route (perf-method.md:2610).
+#
+# Source: docs/plans/perf-method.md:2407-2409 and :2610-2613.
+gfx_submits=11153
+audio_submits=7685
+sp_tasks=18838
+vi_interrupts=8386
+controller_ops=2390
+sim_time=13112786076
+render_error=None
+fields=7699
+# over_budget=3853 -- DELIBERATELY NOT CHECKED on this route.
+#
+# Emitted at frame_census.rs:1150 inside the `[frame-populations]` block, which
+# is gated on FN64_FRAME_CENSUS_POPULATIONS (frame_census.rs:454).
+# render-benchmark.zsh never exports that variable, so the channel is never
+# armed by the default route. The 11153 expectation recorded over_budget=3853
+# because the peer's split work armed the populations gate explicitly.
+#
+# Listing it as expected makes every default-route run report a spurious
+# NOT FOUND. 8 of 8 is the correct denominator for this route.
+#
+# The NOT-ARMED notice for this channel (frame_census.rs:1331) can never fire:
+# it is printed by a block behind the very gate it warns about. A warning gated
+# on the same flag it warns about is unreachable by construction -- worth
+# knowing before trusting any "no warnings" read of a census log.
