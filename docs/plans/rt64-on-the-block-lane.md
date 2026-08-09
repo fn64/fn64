@@ -540,3 +540,114 @@ and not double-counted in the table above.
 4. **Measure the windowed lane next.** The headless number is now close enough
    to the bar that presentation cost decides whether the target is met, and it
    has never been measured post-fix.
+
+# MEASURED 2026-08-09: the full per-field distribution. The spikes are an early burst worth 0.29 ms/frame, and the render field is TIGHT.
+
+The post-fix rt64 p50/p95/p99 **already existed** in the two frozen control
+logs (`rt64-control{,-rep2}-FROZEN.log:177`) as a whole-population figure —
+p50=10.39/10.31, p95=28.08/28.10, p99=28.80/28.82, max=1066/1073, mean
+17.23/17.26. What did not exist was the **per-field sequence**, and therefore
+the population split and the location of the ~1 s spikes.
+
+`FN64_PROFILE` sets `FN64_FRAME_CENSUS_SEQUENCE=400` with skip=0, so the
+profiled log samples only the **leading edge** of steady state: its in-window
+max is 47 ms against a run max of 1117, and its window mean is 12.68 against a
+run mean of 20.26. **That window is not representative and no spike was ever
+inside it.**
+
+One run, `FN64_FRAME_CENSUS_SEQUENCE=8000` + `FN64_FRAME_CENSUS_POPULATIONS=1`,
+`FN64_RENDER=rt64`, 100% coverage of all 7,698 dumpable steady fields.
+Frozen: `$CLAUDE_JOB_DIR/tmp/seq-rep1-FROZEN.log`. Pre-registration written
+before the run: `$CLAUDE_JOB_DIR/tmp/PREREG-spike-distribution.md`.
+**Guest byte-identical 8 of 8**, `fields=7699`.
+
+## The pre-registered falsifier F1 FIRED: the populations gate perturbs +1.86%
+
+Census mean **17.57 ms** against the unperturbed control's 17.25, outside the
+pre-registered 17.08–17.42 window. `FN64_FRAME_CENSUS_SEQUENCE` is exit-time
+only and costs nothing, but `FN64_FRAME_CENSUS_POPULATIONS` adds a
+`with_executor` borrow plus ~20 atomic loads per field (frame_census.rs:469).
+**Correction factor 0.9820; shares survive, absolutes are corrected** (rule 17).
+Corrected drawn frame reproduces the control's 2 x 17.25 = 34.50 to **0.04%**.
+
+## The distribution, per population
+
+| population | n | mean | p50 | p95 | p99 | max |
+|---|---:|---:|---:|---:|---:|---:|
+| **render** (carries a gfx submit) | 3852 | 26.12 | 27.45 | 28.98 | 29.85 | 1136.05 |
+| **non-render** (no submit) | 3846 | 9.00 | 8.93 | 9.73 | 9.89 | 10.20 |
+| all steady | 7698 | 17.57 | 10.45 | 28.65 | 29.52 | 1136.05 |
+
+**The populations are 1:1 (3852 / 3846, ratio 1.0016) and cleanly separated**
+— 100% of over-budget fields carry a submit, and the non-render population's
+entire range is 8.9–10.2 ms. So a 30 Hz **drawn frame is one render field plus
+one non-render field**, not two average fields:
+
+    render 25.65 + non-render 8.83 = 34.49 ms/frame = 29.00 fps   (corrected)
+
+**All of the 1.15 ms overage sits on the render field.** The non-render field
+is 8.83 ms — 25.6% of the frame — and is not a target.
+
+## The p95 concern resolves to nothing: the render population is TIGHT
+
+    render p25 25.27  p50 27.45  p75 28.11  p90 28.65  p95 28.98  p99 29.85
+
+**IQR = 2.84 ms. p99 − p50 = 2.40 ms.** There is no fat tail to harvest inside
+the render population; it is a dense band at 25–29 ms. **This is a mean
+problem, not a tail problem** — which means the brief's "p95 materially
+reduced" sub-goal is not a separate lever. Anything that moves the render
+field's mean moves its p95 with it, and nothing else will.
+
+## The ~1 s spikes: an EARLY BURST, not a recurring stall. Worth 0.29 ms/frame.
+
+Every field above 100 ms, in the whole run:
+
+| field | cost | gfx |
+|---:|---:|---:|
+| 829 | 135.77 ms | 2 |
+| 1460 | 121.32 ms | 4 |
+| **1806** | **1136.05 ms** | 3 |
+
+**Three spikes, all inside fields 829–1806, and ZERO in the remaining 5,892
+fields (~103 s).** The pre-registered discriminator was: *arena-load predicts
+few + early + none in the second half; recurring-stall predicts even spacing
+across both halves.* **Arena-load confirmed on all three counts;
+recurring-stall refuted.**
+
+Falsifier F3 (spike is a residual warmup transient the `warmup_gfx=300` gate
+missed) **did not fire** — the earliest spike is field 829, deep inside steady
+state, not in the first 100.
+
+**Decision arithmetic, by the rule fixed before the data.** Replacing each
+spike with the population median (a perfect fix still has to run the field):
+
+| removed | fields | mean effect | **per drawn frame** |
+|---|---:|---:|---:|
+| >500 ms | 1 | −0.146 ms | **−0.29 ms** |
+| >100 ms | 3 | −0.177 ms | **−0.35 ms** |
+| >50 ms | 5 | −0.189 ms | **−0.38 ms** |
+
+The pre-registered materiality floor was 0.20 ms/frame. **At 0.29–0.38 ms/frame
+this CLEARS the floor** — it is 25–33% of the 1.15 ms gap from three fields —
+but it is a one-off burst, so it is a **warmup/load** cost, not a steady-state
+one. Its value is real but bounded and it does not recur.
+
+**Cadence is NOT a rate for this run and must not be quoted as one.** A mean
+gap of 488 fields reads as "a hitch every 8.6 s", which is false: all three
+spikes fall in a 977-field span and nothing follows for 103 s. As a
+player-experience item — kept separate from the mean, per the protocol — the
+honest statement is **"a short burst of hitches early in the route, then none"**.
+
+## What this redirects to
+
+1. **The target is the render field's MEAN, and only that.** 25.65 ms
+   corrected, one per drawn frame. To reach 33.33 ms/frame needs −1.15 ms off
+   it; for the owner's "room to spare" (≤31.5 ms/frame, 5% margin) needs
+   **−2.99 ms = 11.6% of the render field.**
+2. **The non-render field (8.83 ms, 25.6% of the frame) is not a target** and
+   neither is the tail. Both are already tight.
+3. **The spikes are worth 0.29 ms/frame and are a load transient**, not a
+   steady-state defect. Cheap if the arena load is schedulable; not the main
+   line either way.
+4. **Do not re-derive the distribution.** It is in `seq-rep1-FROZEN.log` at
+   100% coverage, and the perturbation factor for that run is 0.9820.
