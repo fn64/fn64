@@ -14,12 +14,49 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# The shared generator module and the boot Cargo.toml template this script
+# splices a dependency block into both live in the committed WM2000 tree
+# regardless of which title is being generated -- these are read-only
+# sources, not the per-title output paths (see write_topology / --title).
 SOURCE_SHARDS = ROOT / "examples" / "wm2000-block-shards"
 SOURCE_BOOT = ROOT / "examples" / "wm2000-block-boot"
+
+# Matches FN64_WM_SHARD_TITLE's own default in crates/fn64-boot-harness/build.rs
+# (DEFAULT_WM_SHARD_DIR) -- same convention, same string, so an unspecified
+# --title reproduces today's WM2000 output byte-for-byte.
+DEFAULT_TITLE = "wm2000-block-shards"
 
 
 def fail(message: str) -> None:
     raise SystemExit(f"generate WM shard topology: {message}")
+
+
+def validate_title(title: str) -> None:
+    """Mirror crates/fn64-boot-harness/build.rs::validate_shard_title.
+
+    This validates shape (bare path segment, safe characters), not identity --
+    unlike the package-name shapes, drift here fails loudly as a bad directory
+    name or a bad `include!` path, not a silent mismatch, so duplicating the
+    check instead of shelling out to Rust for it is low-risk.
+    """
+    if not title:
+        fail("--title must not be empty")
+    if title in (".", ".."):
+        fail(f"--title must not be a directory-traversal segment: {title!r}")
+    if "/" in title or "\\" in title:
+        fail(f"--title must be a single path segment, got {title!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", title):
+        fail(
+            "--title must contain only ASCII alphanumerics, '-' and '_', "
+            f"got {title!r}"
+        )
+
+
+def package_prefix_for_title(title: str) -> str:
+    """`<prefix>-shards` -> `<prefix>`, matching the existing directory <->
+    package-prefix convention (`wm2000-block-shards` directory,
+    `wm2000-block` package prefix, `wm2000-block-boot` sibling directory)."""
+    return title.removesuffix("-shards")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -31,27 +68,47 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         help="repository-shaped output root (may be the fn64 checkout)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--title",
+        default=DEFAULT_TITLE,
+        help=(
+            "bare directory name under examples/ to generate into, and the "
+            "source of the Cargo package-name prefix (same convention as "
+            f"FN64_WM_SHARD_TITLE; default {DEFAULT_TITLE!r} reproduces the "
+            "committed WM2000 tree byte-for-byte)"
+        ),
+    )
+    arguments = parser.parse_args()
+    validate_title(arguments.title)
+    return arguments
 
 
 def rust_string(value: Path) -> str:
     return json.dumps(os.fspath(value))
 
 
-def discover_inventory(rom: Path) -> list[tuple[str, str]]:
+def discover_inventory(rom: Path, package_prefix: str) -> list[tuple[str, str]]:
     if not rom.is_absolute() or not rom.is_file():
         fail("--rom must name an absolute regular file")
     with tempfile.TemporaryDirectory(prefix="fn64-shard-topology.") as temporary:
         package = Path(temporary)
         build_rs = SOURCE_SHARDS / "build.rs"
+        # The prefix is a Python value passed to Rust as a plain argument, not
+        # re-derived by either side: Python builds package_prefix once (from
+        # --title) and uses that same string both here and in
+        # execution_order's regexes, so there is nothing left to drift.
         main_source = f'''#[allow(dead_code)]
 #[path = {rust_string(build_rs)}]
 mod generator;
 
 fn main() {{
-    let source = std::fs::read(std::env::args_os().nth(1).expect("ROM argument"))
-        .expect("reading ROM");
-    let mut generator = generator::WmShardGenerator::from_rom_bytes_for_topology(&source);
+    let mut args = std::env::args_os();
+    let rom_path = args.nth(1).expect("ROM argument");
+    let package_prefix = args.next().expect("package-prefix argument");
+    let package_prefix = package_prefix.to_str().expect("package prefix is UTF-8");
+    let source = std::fs::read(rom_path).expect("reading ROM");
+    let mut generator =
+        generator::WmShardGenerator::from_rom_bytes_for_topology(&source, package_prefix);
     for (package, directory) in generator.package_inventory() {{
         println!("{{package}}\\t{{directory}}");
     }}
@@ -89,6 +146,7 @@ sha2 = "0.10"
                 os.fspath(package / "Cargo.toml"),
                 "--",
                 os.fspath(rom),
+                package_prefix,
             ],
             check=True,
             text=True,
@@ -110,14 +168,26 @@ sha2 = "0.10"
     return inventory
 
 
-def execution_order(inventory: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def execution_order(
+    inventory: list[tuple[str, str]], package_prefix: str
+) -> list[tuple[str, str]]:
+    # Built from the same package_prefix string passed to the Rust probe in
+    # discover_inventory, not a second hardcoded "wm2000-block" -- see the
+    # emitter/parser note there. re.escape guards prefixes containing regex
+    # metacharacters (title validation already forbids everything but
+    # alphanumerics/-/_, so this is defence in depth, not load-bearing).
+    escaped = re.escape(package_prefix)
+    boot_pattern = re.compile(rf"{escaped}-shard-(\d+)")
+    tail_pattern = re.compile(rf"{escaped}-resident-tail-shard-(\d+)")
+    overlay_pattern = re.compile(rf"{escaped}-overlay-(\d+)-shard-(\d+)")
+
     def key(item: tuple[str, str]) -> tuple[int, int, int]:
         package = item[0]
-        if match := re.fullmatch(r"wm2000-block-shard-(\d+)", package):
+        if match := boot_pattern.fullmatch(package):
             return (0, 0, int(match.group(1)))
-        if match := re.fullmatch(r"wm2000-block-resident-tail-shard-(\d+)", package):
+        if match := tail_pattern.fullmatch(package):
             return (1, 0, int(match.group(1)))
-        match = re.fullmatch(r"wm2000-block-overlay-(\d+)-shard-(\d+)", package)
+        match = overlay_pattern.fullmatch(package)
         if not match:
             fail(f"unexpected generated package name {package}")
         return (2, int(match.group(1)), int(match.group(2)))
@@ -125,30 +195,37 @@ def execution_order(inventory: list[tuple[str, str]]) -> list[tuple[str, str]]:
     return sorted(inventory, key=key)
 
 
-def inventory_source(inventory: list[tuple[str, str]]) -> str:
+def inventory_source(inventory: list[tuple[str, str]], title: str) -> str:
     historical = """//
 // The inventory is 32, not 35. Commit 6ae673e (\"bound overlay generations to
 // their text extent\") shrank the text-bounded overlays from [3,1,6,8] shards
 // to [2,1,5,7], retiring overlay-0-shard-02, overlay-2-shard-05 and
 // overlay-3-shard-07.
-""" if len(inventory) == 32 else """//
+""" if title == DEFAULT_TITLE and len(inventory) == 32 else """//
 // This inventory was derived mechanically from the selected ROM. Re-running
 // `scripts/generate-wm-shard-topology.py` is the only supported way to change
 // its package count or manifest-directory mapping.
 """
     entries = "".join(f'    ("{package}", "{directory}"),\n' for package, directory in inventory)
-    return f'''// Single source of truth for the WM2000 dense-AOT shard inventory.
+    # WM2000's committed header wording predates --title and names the title
+    # by its product name, not its directory; preserved verbatim so
+    # regenerating with the default title reproduces the committed file
+    # byte-for-byte. A real second title gets generic wording instead of a
+    # guessed product name.
+    inventory_label = "WM2000" if title == DEFAULT_TITLE else title
+    boot_label = "WM root pack build" if title == DEFAULT_TITLE else "root pack build"
+    return f'''// Single source of truth for the {inventory_label} dense-AOT shard inventory.
 //
 // This file is `include!`d verbatim by every consumer that must agree on the
 // shard catalog, so the list cannot drift between them again:
 //
-//   examples/wm2000-block-shards/build.rs        (legacy shard generator)
-//   examples/wm2000-block-shards/materializer.rs (prepared-tree consumer)
-//   examples/wm2000-block-boot/build.rs          (WM root pack build)
+//   examples/{title}/build.rs        (legacy shard generator)
+//   examples/{title}/materializer.rs (prepared-tree consumer)
+//   examples/{package_prefix_for_title(title)}-boot/build.rs          ({boot_label})
 //   crates/fn64-boot-harness/src/generated_runner_build/mod.rs (verifier)
 //
 // Each entry pairs the Cargo package name with the directory under
-// `examples/wm2000-block-shards/` that holds its leaf manifest. The two are
+// `examples/{title}/` that holds its leaf manifest. The two are
 // not mechanically derivable from one another: the resident-tail packages
 // live in the historically numbered `shard15`/`shard16` directories.
 //
@@ -251,13 +328,22 @@ def dense_aot_source(ordered: list[tuple[str, str]]) -> str:
     return output + "];\n"
 
 
-def replace_boot_dependencies(source: str, ordered: list[tuple[str, str]]) -> str:
+def replace_boot_dependencies(
+    source: str, ordered: list[tuple[str, str]], title: str
+) -> str:
     dependencies = "".join(
-        f'{package} = {{ path = "../wm2000-block-shards/{directory}" }}\n'
+        f'{package} = {{ path = "../{title}/{directory}" }}\n'
         for package, directory in ordered
     )
+    # `source` is always read from SOURCE_BOOT, the committed WM2000
+    # Cargo.toml template (see write_topology) -- regardless of which title
+    # is being generated. So the pattern that LOCATES the block to replace
+    # must match WM2000's own prefix, not this run's target `package_prefix`;
+    # only the replacement text (`dependencies`, built from `ordered` and
+    # `title` above) uses the target.
+    source_prefix = package_prefix_for_title(DEFAULT_TITLE)
     pattern = re.compile(
-        r'^wm2000-block-(?:shard|resident-tail|overlay).*?\n\n(?=\[build-dependencies\])',
+        rf'^{re.escape(source_prefix)}-(?:shard|resident-tail|overlay).*?\n\n(?=\[build-dependencies\])',
         re.MULTILINE | re.DOTALL,
     )
     replaced, count = pattern.subn(dependencies + "\n", source)
@@ -266,12 +352,16 @@ def replace_boot_dependencies(source: str, ordered: list[tuple[str, str]]) -> st
     return replaced
 
 
-def write_topology(output_root: Path, inventory: list[tuple[str, str]]) -> None:
-    shards = output_root / "examples" / "wm2000-block-shards"
-    boot = output_root / "examples" / "wm2000-block-boot"
+def write_topology(
+    output_root: Path, inventory: list[tuple[str, str]], title: str
+) -> None:
+    package_prefix = package_prefix_for_title(title)
+    boot_title = f"{package_prefix}-boot"
+    shards = output_root / "examples" / title
+    boot = output_root / "examples" / boot_title
     shards.mkdir(parents=True, exist_ok=True)
     (boot / "src").mkdir(parents=True, exist_ok=True)
-    ordered = execution_order(inventory)
+    ordered = execution_order(inventory, package_prefix)
 
     old_dirs: set[str] = set()
     old_inventory = shards / "shard_inventory.in"
@@ -284,23 +374,37 @@ def write_topology(output_root: Path, inventory: list[tuple[str, str]]) -> None:
             shutil.rmtree(target)
 
     (shards / "Cargo.toml").write_text(workspace_manifest(inventory))
-    (shards / "shard_inventory.in").write_text(inventory_source(inventory))
+    (shards / "shard_inventory.in").write_text(inventory_source(inventory, title))
     for package, directory in inventory:
         target = shards / directory
         target.mkdir(parents=True, exist_ok=True)
         (target / "Cargo.toml").write_text(leaf_manifest(package, directory))
 
+    # The boot Cargo.toml template always comes from the committed WM2000
+    # tree (SOURCE_BOOT) -- it is the shared dependency-block shape, not
+    # per-title content. replace_boot_dependencies rewrites it for this
+    # title's own prefix and shard directory.
     boot_source = (SOURCE_BOOT / "Cargo.toml").read_text()
-    (boot / "Cargo.toml").write_text(replace_boot_dependencies(boot_source, ordered))
+    boot_source = boot_source.replace(
+        f'name = "{package_prefix_for_title(DEFAULT_TITLE)}-boot"',
+        f'name = "{boot_title}"',
+    )
+    (boot / "Cargo.toml").write_text(
+        replace_boot_dependencies(boot_source, ordered, title)
+    )
     (boot / "src" / "dense_aot.rs").write_text(dense_aot_source(ordered))
 
 
 def main() -> None:
     arguments = parse_arguments()
     output_root = arguments.output_root.resolve()
-    inventory = discover_inventory(arguments.rom.resolve())
-    write_topology(output_root, inventory)
-    print(f"generated_packages={len(inventory)} output_root={output_root}")
+    package_prefix = package_prefix_for_title(arguments.title)
+    inventory = discover_inventory(arguments.rom.resolve(), package_prefix)
+    write_topology(output_root, inventory, arguments.title)
+    print(
+        f"generated_packages={len(inventory)} output_root={output_root} "
+        f"title={arguments.title}"
+    )
 
 
 if __name__ == "__main__":

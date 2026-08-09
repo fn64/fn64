@@ -185,7 +185,7 @@ fn delay_lookahead_word(
         .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PackageTarget {
     Boot(usize),
     ResidentTail(usize),
@@ -244,12 +244,29 @@ fn boot_bank_va_start(rom: &fn64_discover::rom::NormalizedRom) -> u32 {
     va_start
 }
 
+/// The stable package-name prefix for WM2000's own build: every consumer
+/// that does not generate a topology for another title links against this
+/// literal, so it stays a plain `const` and the default this generator falls
+/// back to.
+///
+/// This is the *only* place the string is written for WM2000's own build.
+/// `package_inventory` and `package_target` both read it from
+/// `self.package_prefix`, never as a second literal, so the emitter and the
+/// parser cannot drift the way `docs/plans/second-aki-title-scoping.md`
+/// describes the topology constants having drifted before.
+pub const PACKAGE_PREFIX: &str = "wm2000-block";
+
 pub struct WmShardGenerator {
     rom: fn64_discover::rom::NormalizedRom,
     overlay_recipes: Option<Vec<OverlayLoadRecipeV1>>,
     host_calls: Vec<u32>,
     /// Proven boot-copy virtual base. CIC-dependent, so never a literal.
     boot_va_start: u32,
+    /// Cargo package-name prefix for every package this generator emits or
+    /// parses. Defaults to `PACKAGE_PREFIX` (WM2000's own build); a topology
+    /// probe for another title overrides it so package names never collide
+    /// with WM2000's tree. See `package_inventory` and `package_target`.
+    package_prefix: String,
 }
 
 impl WmShardGenerator {
@@ -275,6 +292,7 @@ impl WmShardGenerator {
             overlay_recipes: None,
             host_calls: host_bindings.iter().map(|binding| binding.vram).collect(),
             boot_va_start,
+            package_prefix: PACKAGE_PREFIX.to_owned(),
         }
     }
 
@@ -284,7 +302,12 @@ impl WmShardGenerator {
     /// on whether every runtime host adapter has a recognizer for this title's
     /// libultra revision. Runner emission continues to use `from_rom_bytes`
     /// and therefore keeps the exact 15/15 host-binding gate loud.
-    pub fn from_rom_bytes_for_topology(source: &[u8]) -> Self {
+    ///
+    /// `package_prefix` names the Cargo package prefix the returned
+    /// generator's `package_inventory()` will emit. Pass `PACKAGE_PREFIX` to
+    /// reproduce WM2000's own tree; a second title passes its own prefix so
+    /// the two never share package names or output directories.
+    pub fn from_rom_bytes_for_topology(source: &[u8], package_prefix: &str) -> Self {
         let rom = fn64_discover::normalize(source).expect("normalizing shard ROM input");
         let boot_va_start = boot_bank_va_start(&rom);
         Self {
@@ -292,6 +315,7 @@ impl WmShardGenerator {
             overlay_recipes: None,
             host_calls: Vec::new(),
             boot_va_start,
+            package_prefix: package_prefix.to_owned(),
         }
     }
 
@@ -318,16 +342,22 @@ impl WmShardGenerator {
     pub fn package_inventory(&mut self) -> Vec<(String, String)> {
         let split = self.resident_split();
         let (boot_count, tail_count) = resident_shard_counts(split);
+        // Owned, not `&str` borrowed from `self`: `overlay_recipes()` below
+        // needs `&mut self`, and a borrow of `self.package_prefix` held
+        // across that call is exactly the conflict the borrow checker
+        // rejects. The clone is one short-lived heap string per invocation.
+        let prefix = self.package_prefix.clone();
+        let prefix = prefix.as_str();
         let mut inventory = Vec::new();
         for index in 0..boot_count {
             inventory.push((
-                format!("wm2000-block-shard-{index:02}"),
+                boot_shard_package(prefix, index),
                 format!("shard{index:02}"),
             ));
         }
         for index in 0..tail_count {
             inventory.push((
-                format!("wm2000-block-resident-tail-shard-{index:02}"),
+                resident_tail_shard_package(prefix, index),
                 format!("shard{:02}", boot_count + index),
             ));
         }
@@ -343,7 +373,7 @@ impl WmShardGenerator {
         for (generation, shard_count) in overlay_counts.into_iter().enumerate() {
             for shard in 0..shard_count {
                 inventory.push((
-                    format!("wm2000-block-overlay-{generation}-shard-{shard:02}"),
+                    overlay_shard_package(prefix, generation, shard),
                     format!("overlay{generation}-shard{shard:02}"),
                 ));
             }
@@ -481,7 +511,7 @@ impl WmShardGenerator {
     }
 
     fn resolve_shard(&mut self, package: &str) -> ResolvedShard {
-        let target = package_target(package);
+        let target = self.package_target(package);
         let (generation, index) = self.resolve_generation(target);
         let image_byte_len = generation.source_end - generation.source_start;
         let shard_count = image_byte_len.div_ceil(SHARD_BYTES);
@@ -660,13 +690,44 @@ impl WmShardGenerator {
                 .expect("recovering one unambiguous complete overlay recipe table")
         })
     }
+
+    /// Parse a package name `package_inventory` emitted back into its target.
+    ///
+    /// Reads `self.package_prefix`, the same field `package_inventory` reads
+    /// to emit the name in the first place -- one field, not two literals, is
+    /// what keeps this method and that one from drifting apart the way a
+    /// prefix duplicated across languages can. Delegates to `package_target`,
+    /// the free function the round-trip test exercises directly.
+    fn package_target(&self, package: &str) -> PackageTarget {
+        package_target(&self.package_prefix, package)
+    }
 }
 
-fn package_target(package: &str) -> PackageTarget {
-    if let Some(index) = package.strip_prefix("wm2000-block-shard-") {
+/// Format a boot-shard package name. The one place `-shard-{NN}` is written
+/// for emission; `package_target` below is the one place it is read back.
+fn boot_shard_package(prefix: &str, index: usize) -> String {
+    format!("{prefix}-shard-{index:02}")
+}
+
+/// Format a resident-tail-shard package name. See `boot_shard_package`.
+fn resident_tail_shard_package(prefix: &str, index: usize) -> String {
+    format!("{prefix}-resident-tail-shard-{index:02}")
+}
+
+/// Format an overlay-shard package name. See `boot_shard_package`.
+fn overlay_shard_package(prefix: &str, generation: usize, shard: usize) -> String {
+    format!("{prefix}-overlay-{generation}-shard-{shard:02}")
+}
+
+/// Parse any package name the three `*_package` functions above can emit
+/// back into its `PackageTarget`. This and they are the emitter/parser pair:
+/// both take the same `prefix`, and `package_names_round_trip_through_target`
+/// below fails if a change to one shape is not mirrored in the other.
+fn package_target(prefix: &str, package: &str) -> PackageTarget {
+    if let Some(index) = package.strip_prefix(&format!("{prefix}-shard-")) {
         return PackageTarget::Boot(index.parse().expect("boot shard package suffix is decimal"));
     }
-    if let Some(index) = package.strip_prefix("wm2000-block-resident-tail-shard-") {
+    if let Some(index) = package.strip_prefix(&format!("{prefix}-resident-tail-shard-")) {
         return PackageTarget::ResidentTail(
             index
                 .parse()
@@ -674,7 +735,7 @@ fn package_target(package: &str) -> PackageTarget {
         );
     }
     let suffix = package
-        .strip_prefix("wm2000-block-overlay-")
+        .strip_prefix(&format!("{prefix}-overlay-"))
         .expect("package names either a boot shard or overlay shard");
     let (generation, shard) = suffix
         .split_once("-shard-")
@@ -727,6 +788,62 @@ mod tests {
             ..generation
         };
         assert_eq!(delay_lookahead_word(&rom, &non_affine, 2), None);
+    }
+
+    /// Enforces emitter/parser agreement: for any prefix, every package name
+    /// the three `*_package` emitters can produce must parse back through
+    /// `package_target` to the exact target it was formatted from. This is
+    /// the in-tree half of the emitter/parser pair described in
+    /// `docs/plans/second-aki-title-scoping.md` -- a change to one shape
+    /// (say, adding a separator or renumbering a suffix) that is not mirrored
+    /// in the other fails this test immediately, rather than only surfacing
+    /// once a generated tree fails to build.
+    #[test]
+    fn package_names_round_trip_through_target() {
+        for prefix in ["wm2000-block", "nomercy-block", "a", "x-y-z"] {
+            for index in [0usize, 2, 13, 99] {
+                let package = boot_shard_package(prefix, index);
+                assert_eq!(
+                    package_target(prefix, &package),
+                    PackageTarget::Boot(index),
+                    "boot shard {package:?} did not round-trip for prefix {prefix:?}"
+                );
+
+                let package = resident_tail_shard_package(prefix, index);
+                assert_eq!(
+                    package_target(prefix, &package),
+                    PackageTarget::ResidentTail(index),
+                    "resident-tail shard {package:?} did not round-trip for prefix {prefix:?}"
+                );
+            }
+            for generation in [0usize, 1, 4] {
+                for shard in [0usize, 2, 7] {
+                    let package = overlay_shard_package(prefix, generation, shard);
+                    assert_eq!(
+                        package_target(prefix, &package),
+                        PackageTarget::Overlay { generation, shard },
+                        "overlay shard {package:?} did not round-trip for prefix {prefix:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `package_inventory`'s WM2000 call site defaults to `PACKAGE_PREFIX`,
+    /// so a plain WM2000 build must keep emitting exactly the historical
+    /// package-name shapes -- this pins that default, independent of the
+    /// round-trip property above.
+    #[test]
+    fn default_prefix_matches_wm2000_package_names() {
+        assert_eq!(boot_shard_package(PACKAGE_PREFIX, 7), "wm2000-block-shard-07");
+        assert_eq!(
+            resident_tail_shard_package(PACKAGE_PREFIX, 1),
+            "wm2000-block-resident-tail-shard-01"
+        );
+        assert_eq!(
+            overlay_shard_package(PACKAGE_PREFIX, 2, 3),
+            "wm2000-block-overlay-2-shard-03"
+        );
     }
 
     /// The resident topology is a tiling rule, not a per-title constant. Both
