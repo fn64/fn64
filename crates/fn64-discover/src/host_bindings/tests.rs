@@ -1502,4 +1502,217 @@ mod per_symbol_probe_agrees_with_the_chain {
             assert_eq!(WM_BLOCK_RUNTIME_HOST_SYMBOLS.len(), 15);
         }
     }
+
+    /// The FlashRAM API roles.
+    ///
+    /// Binding these keeps the guest's flash driver from running at all, so
+    /// nothing has to decode the command register. Fixtures are synthesised
+    /// from the published protocol rather than copied from a ROM.
+    mod flash {
+        use super::*;
+
+        const BASE: u32 = 0x8000_2000;
+        const EPI_WRITE: u32 = BASE + 0x800;
+        const EPI_READ: u32 = BASE + 0x900;
+
+        fn jal_to(target: u32) -> u32 {
+            0x0c00_0000 | (target >> 2 & 0x03ff_ffff)
+        }
+
+        fn lui(register: u32, immediate: u16) -> u32 {
+            0x3c00_0000 | (register << 16) | u32::from(immediate)
+        }
+
+        fn li(register: u32, value: u16) -> u32 {
+            0x2400_0000 | (register << 16) | u32::from(value)
+        }
+
+        /// Select the sector with 0x4B, launch with 0x78, poll until ready.
+        fn sector_erase() -> Vec<u32> {
+            vec![
+                0x27bd_ff88,             // addiu $sp, $sp, -120
+                lui(2, 0x4b00),          // the sector-select command
+                0x0082_3025,             // or    $a2, $a0, $v0
+                jal_to(EPI_WRITE),       // jal   osEPiWriteIo
+                0x0000_0000,
+                lui(6, 0x7800),          // the erase command
+                jal_to(EPI_WRITE),       // jal   osEPiWriteIo
+                0x0000_0000,
+                jal_to(EPI_READ),        // jal   osEPiReadIo  (status)
+                0x27a6_005c,
+                0x8fa2_005c,             // lw    $v0, 0x5c($sp)
+                0x3042_0002,             // andi  $v0, $v0, 2   (busy bit)
+                0x1440_fff9,             // bnez  $v0, poll     (backward)
+                0x0000_0000,
+                0x03e0_0008,             // jr    $ra
+                0x27bd_0078,
+            ]
+        }
+
+        /// Enter read-array mode with 0xF0, then loop pages.
+        fn read_array() -> Vec<u32> {
+            vec![
+                0x27bd_ffc8,             // addiu $sp, $sp, -56
+                0x8fb4_0048,             // lw    $s4, 0x48($sp)  o32 arg 5
+                0x8fb6_004c,             // lw    $s6, 0x4c($sp)  o32 arg 6
+                lui(6, 0xf000),          // read-array mode
+                jal_to(EPI_WRITE),       // jal   osEPiWriteIo
+                0x0045_2825,
+                jal_to(EPI_READ),        // jal   osEPiReadIo
+                0x27a6_0010,
+                0x2e82_0101,             // page loop test
+                0x1040_fffa,             // beqz  ..., loop      (backward)
+                0x0000_0000,
+                0x03e0_0008,             // jr    $ra
+                0x27bd_0038,
+            ]
+        }
+
+        /// Build the published handle: type 8, latency 5, pageSize 0x0F,
+        /// relDuration 2, pulse 0x0C, domain 1, base 0xA800_0000.
+        fn flash_init() -> Vec<u32> {
+            vec![
+                0x27bd_ffe0,             // addiu $sp, $sp, -32
+                0xafbf_001c,             // sw    $ra, 28($sp)
+                lui(3, 0xa800),          // the published device base
+                0x1043_0030,             // beq   $v0, $v1, done  (idempotent)
+                li(2, 8),                // deviceType
+                0xa022_844c,             // sb    $v0, ...
+                li(2, 5),                // latency
+                0xa022_844d,             // sb
+                li(2, 0x0c),             // pulse
+                0xa022_8450,             // sb
+                li(2, 0x0f),             // pageSize
+                0xa022_844e,             // sb
+                li(2, 2),                // relDuration
+                0xa022_844f,             // sb
+                li(2, 1),                // domain
+                0xa022_8451,             // sb
+                0x03e0_0008,             // jr    $ra
+                0x27bd_0020,
+            ]
+        }
+
+        fn image() -> Vec<u32> {
+            let mut words = vec![0u32; 0x400];
+            let mut place = |vram: u32, body: &[u32]| {
+                let index = ((vram - BASE) / 4) as usize;
+                words[index..index + body.len()].copy_from_slice(body);
+            };
+            place(BASE + 0x100, &flash_init());
+            place(BASE + 0x200, &sector_erase());
+            place(BASE + 0x300, &read_array());
+            words
+        }
+
+        fn anchors() -> Vec<HostBinding> {
+            vec![
+                HostBinding {
+                    symbol: HostBindingSymbol::OsEPiWriteIo,
+                    vram: EPI_WRITE,
+                },
+                HostBinding {
+                    symbol: HostBindingSymbol::OsEPiReadIo,
+                    vram: EPI_READ,
+                },
+            ]
+        }
+
+        #[test]
+        fn all_three_flash_roles_resolve_at_their_own_addresses() {
+            let found = discover_flash_host_bindings(&image(), BASE, &anchors());
+            let mut rendered = found
+                .iter()
+                .map(|binding| (binding.symbol, binding.vram))
+                .collect::<Vec<_>>();
+            rendered.sort_by_key(|entry| entry.1);
+            assert_eq!(
+                rendered,
+                vec![
+                    (HostBindingSymbol::OsFlashInit, BASE + 0x100),
+                    (HostBindingSymbol::OsFlashSectorErase, BASE + 0x200),
+                    (HostBindingSymbol::OsFlashReadArray, BASE + 0x300),
+                ]
+            );
+        }
+
+        /// The command-issuing roles are resolved against the title's OWN
+        /// programmed-IO wrappers. Without them there is no anchor, and
+        /// claiming a match anyway is what would produce corpus false
+        /// positives -- fourteen titles carry the same command constants.
+        #[test]
+        fn command_roles_need_the_programmed_io_anchors() {
+            let found = discover_flash_host_bindings(&image(), BASE, &[]);
+            assert_eq!(
+                found
+                    .iter()
+                    .map(|binding| binding.symbol)
+                    .collect::<Vec<_>>(),
+                vec![HostBindingSymbol::OsFlashInit],
+                "only the unparameterised role may resolve without anchors"
+            );
+        }
+
+        /// Erase is 0x4B then 0x78. Dropping either published command word
+        /// must stop the match.
+        #[test]
+        fn both_documented_erase_commands_are_load_bearing() {
+            for immediate in [0x4b00u16, 0x7800] {
+                let mut words = image();
+                let index = ((BASE + 0x200 - BASE) / 4) as usize;
+                for word in words[index..index + 16].iter_mut() {
+                    if op(*word) == 0x0f && (*word as u16) == immediate {
+                        *word = 0;
+                    }
+                }
+                let found = discover_flash_host_bindings(&words, BASE, &anchors());
+                assert!(
+                    !found
+                        .iter()
+                        .any(|b| b.symbol == HostBindingSymbol::OsFlashSectorErase),
+                    "command {immediate:#06x} must be required"
+                );
+            }
+        }
+
+        /// Every published handle field is load-bearing for init.
+        #[test]
+        fn each_published_handle_field_is_load_bearing() {
+            for value in [8u16, 5, 0x0c, 0x0f, 2, 1] {
+                let mut words = image();
+                let index = ((BASE + 0x100 - BASE) / 4) as usize;
+                for word in words[index..index + 18].iter_mut() {
+                    if op(*word) == 9 && rs(*word) == 0 && (*word as u16) == value {
+                        *word = 0;
+                    }
+                }
+                let found = discover_flash_host_bindings(&words, BASE, &anchors());
+                assert!(
+                    !found
+                        .iter()
+                        .any(|b| b.symbol == HostBindingSymbol::OsFlashInit),
+                    "handle field {value:#x} must be required"
+                );
+            }
+        }
+
+        /// A title with no FlashRAM resolves nothing, without erroring.
+        #[test]
+        fn a_title_without_flash_yields_no_bindings() {
+            let words = vec![0u32; 0x400];
+            assert!(discover_flash_host_bindings(&words, BASE, &anchors()).is_empty());
+        }
+
+        /// These roles stay out of the gated catalog, like the programmed-IO
+        /// pair, so the titles that resolve 15/15 keep doing so.
+        #[test]
+        fn flash_roles_are_not_part_of_the_gated_catalog() {
+            for symbol in FLASH_HOST_SYMBOLS {
+                assert!(
+                    !WM_BLOCK_RUNTIME_HOST_SYMBOLS.contains(&symbol),
+                    "{symbol:?} must remain optional"
+                );
+            }
+        }
+    }
 }

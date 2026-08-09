@@ -645,6 +645,29 @@ fn main() {
         programmed_io_address(fn64_discover::host_bindings::HostBindingSymbol::OsEPiWriteIo);
     let os_epi_read_io =
         programmed_io_address(fn64_discover::host_bindings::HostBindingSymbol::OsEPiReadIo);
+    // Optional: the FlashRAM API. Binding these keeps the guest's own flash
+    // driver from executing, so nothing has to decode the command register --
+    // `PiDeviceAddress` carries only a byte offset for domain 2, and a command
+    // word routed through it would land in the save image instead of being
+    // interpreted. The two command-issuing roles resolve against this title's
+    // own programmed-IO wrappers.
+    let flash_bindings = fn64_discover::host_bindings::discover_flash_host_bindings(
+        dense_words,
+        va_start,
+        &programmed_io,
+    );
+    let flash_address = |symbol| {
+        flash_bindings
+            .iter()
+            .find(|binding| binding.symbol == symbol)
+            .map(|binding| binding.vram)
+    };
+    let os_flash_init =
+        flash_address(fn64_discover::host_bindings::HostBindingSymbol::OsFlashInit);
+    let os_flash_sector_erase =
+        flash_address(fn64_discover::host_bindings::HostBindingSymbol::OsFlashSectorErase);
+    let os_flash_read_array =
+        flash_address(fn64_discover::host_bindings::HostBindingSymbol::OsFlashReadArray);
     let binding_address = |symbol| {
         resident_host_bindings
             .iter()
@@ -966,6 +989,19 @@ fn main() {
         ),
         None => writeln!(pack, "pub const OS_EPI_READ_IO: Option<u32> = None;"),
     };
+    for (name, resolved) in [
+        ("OS_FLASH_INIT", os_flash_init),
+        ("OS_FLASH_SECTOR_ERASE", os_flash_sector_erase),
+        ("OS_FLASH_READ_ARRAY", os_flash_read_array),
+    ] {
+        let _ = match resolved {
+            Some(vram) => writeln!(
+                pack,
+                "pub const {name}: Option<u32> = Some({vram:#010X});"
+            ),
+            None => writeln!(pack, "pub const {name}: Option<u32> = None;"),
+        };
+    }
     let _ = writeln!(
         pack,
         "pub const OS_SI_DEVICE_BUSY: u32 = {os_si_device_busy:#010X};"
