@@ -16,11 +16,24 @@ longer-route re-run is in flight past the 0x07 wall.**
 Predecode delta −1.67 ms/field (predicted −2.5–2.8 from sample shares — shares
 inflate, as pre-registered; target met regardless). p95 also fell 28.1 → 24.4.
 
-**60fps tier (per-game conversion): render field must fit 16.667 ms.** Now at
-~23.0 → **−6.3 ms to go.** Named leads: memmove 11.1% (attributed:
-staging-dominated per the workflow), guest-runtime wrapper ~2x its payload,
-sha digests ~5%, mprotect+barrier ~9%. All defect-shaped. Plus the standing
-constraint: nothing may key on "every second field renders."
+**60fps tier (per-game conversion): render field must fit 16.667 ms.**
+CORRECTED 2026-08-09 (the −6.3/23.0 figures were stale): corrected render
+field is **25.65 ms** (`rt64-on-the-block-lane.md:489`), and the gap to the
+30fps ceiling is **−1.15 ms** (−2.99 for the 5% margin). The four "defect
+leads" were re-audited: mprotect+barrier is OFF by default (premise false),
+the wrapper 2x was the already-fixed mirror boundary, sha roots were closed
+by the v3 Merkle migration. What actually remains, measured:
+- **`FN64_WM_SHARD_VERIFY_LIVE_WORDS=0`: −3.50 ms predicted (−2.2
+  realistic)** — ablation-measured, already gated in build.rs, no emitter
+  change. ALONE closes the gap. Defence-in-depth removal (the belt-and-braces
+  detector for bypass writers), adjacent to the 0x0009b0b3 lesson → needs the
+  FULL byte-identity verification set before shipping, not a partial one.
+- rt64 `NativeRdramRollback` copies all 8 MiB per submission (2.818/field,
+  −0.4 to −1.4 ms) — likely redundant with the ABI staging contract.
+- RDP-stream digest per-word updates + double image hash (−0.2 to −0.5 ms);
+  `rsp_rdp_observations` also grows unboundedly (memory bug, independent).
+Plus the standing constraint: nothing may key on "every second field
+renders."
 
 ## The plan, in order
 
