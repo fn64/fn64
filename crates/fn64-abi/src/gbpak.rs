@@ -131,6 +131,17 @@ unsafe fn copy_to_guest(storage: fn64_runtime::RdramPtr, raw: u64, bytes: &[u8])
             );
         }
     }
+    // Declare the copied span, exactly as the save adapters do: an
+    // undeclared host write is invisible to the canonical mutation journal
+    // until a later dispatch reports an unattributed mutation. This path has
+    // not tripped that wire only because these roles are not yet bound as
+    // host shims for any title in the corpus.
+    #[cfg(feature = "recomp-rs")]
+    if let Ok(len) = u32::try_from(bytes.len()) {
+        if len > 0 {
+            fn64_recomp_rs::notify_host_abi_write(base.offset(), len);
+        }
+    }
 }
 
 fn read_bus(pak: &mut fn64_runtime::TransferPak, address: u16, size: usize) -> Vec<u8> {
