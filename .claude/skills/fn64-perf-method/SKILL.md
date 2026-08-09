@@ -139,6 +139,20 @@ and BSD `find` on macOS rejects it. It had been tested against synthetic inputs
 and passed. Prefer constructions whose failure mode is a crash over an empty
 result. There is no `readelf` and no `timeout` here; binaries are Mach-O.
 
+**A key that appears twice is two metrics.** A byte-identity checker did
+`findall(...)[-1]` on `gfx_submits=` and silently compared the **steady-state
+span** count (`[frame-census]`, line 175) against a **whole-run** expectation
+(`[wm2000-block-progress]`, line 63). The 303 difference was exactly the
+`warmup_gfx=300` fields the census excludes. It reported a guest byte-identity
+failure that did not exist, and drove three 25-minute attribution runs. **Anchor
+every extraction to a named line, and make a missing anchor fatal rather than
+falling back to a scan.**
+
+Its author had proven the checker could detect a wrong *value* — rule 6a done
+halfway. Proving a check can fail is not proving it reads the right thing.
+**And four runs agreeing was not evidence: consistency across runs is not
+validity when every run goes through the same broken instrument.**
+
 **23. Several narrow checks agreeing is not corroboration when they share a
 blind spot.** Three individually-true probes concluded a commit was not on the
 branch: `git log --oneline -3` (it was 15 back), a grep of `host.rs` for an
