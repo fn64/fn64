@@ -116,6 +116,22 @@ bucket*, because **a child exceeding its parent** was the only signal that fired
 on the third; and **a label that is 95% something else is a wrong measurement
 wearing a plausible name.**
 
+**6c. Match the probe's LAYER to the property's layer.** Three attempts to
+verify one claim, all returning clean zeros, all meaningless — and the speed and
+agreement made them convincing:
+
+| probe | result | why it could never have answered |
+|---|---|---|
+| `strings \| grep commit_with_optional_view` | 0 in both lanes | the function **inlines at O3**; the name is in neither file |
+| `nm -U \| grep -c set_expected` | 1 in both | `nm` lists **symbols, not call sites** — one symbol called twice counts once |
+| `strings \| grep <catalog digest>` | absent in both | the digest is **computed at runtime**, never a literal |
+
+Each asked *the file* what only *the running program* or *the disassembly* can
+answer. **When a probe returns zero, first ask whether it could have returned
+nonzero** — that is rule 6a pointed at verification rather than at gates. Three
+fast agreeing answers are more dangerous than one slow ambiguous one, and this
+happened while checking a subagent's work, not while doing the work.
+
 **6a. Before trusting a check, confirm it CAN fail.** A check that returns the
 same answer regardless of the state it is checking is not a check. Prove the
 verifier distinguishes the two outcomes it exists to distinguish — ideally by
