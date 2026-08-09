@@ -797,3 +797,48 @@ on the FAIL line as a score. It is `WM_BLOCK_RUNTIME_HOST_SYMBOLS.len()`,
 printed unconditionally on the error path (`probe_host_bindings.rs:30`), with
 no numerator. **A denominator printed without its numerator invites exactly
 this misreading**; the per-symbol probe prints both on both paths.
+
+## The title-parameterized generator works end to end (2026-08-09)
+
+First use of `--title` (`fb51ab5`) against a non-WM2000 ROM:
+
+    $ python3 scripts/generate-wm-shard-topology.py \
+        --rom "…/WCW-nWo Revenge - Starrcade Edition (USA) (v1.01).z64" \
+        --title revenge-block-shards --output-root <scratch>
+    generated_packages=27  title=revenge-block-shards
+
+**Output is fully title-specific** — directories `revenge-block-shards/` and
+`revenge-block-boot/`, packages `revenge-block-shard-NN`,
+`revenge-block-resident-tail-shard-NN`, `revenge-block-overlay-N-shard-NN`.
+Nothing named `wm2000` anywhere in the tree.
+
+**And the topology is genuinely Revenge's**, not WM2000's copied under a new
+name:
+
+| | overlays | shape | inventory entries | banks |
+|---|---:|---|---:|---:|
+| WM2000 (committed) | 4 | [3, 1, 6, 8] | 37 | 5 |
+| Revenge (generated) | **2** | **[4, 6]** | **31** | **3** |
+
+Two overlays against four, and the 3-bank structure matches what
+`gate_rom_recompile` independently reported for this ROM. The deriver is
+reading the image, not templating.
+
+### What this closes
+
+**Every mechanical blocker between a certified ROM and a shard tree is now
+gone.** The chain that was three separate walls this morning —
+
+1. `PREPARED_PACKAGES` a fixed array → selectable by directory (`50d2c21`)
+2. generator hardcoding WM2000 in output paths and package names → `--title`
+   (`fb51ab5`)
+3. Revenge rejected at discovery → 15/15 and `unsupported = 0` (`10a73c7`)
+
+— is walkable end to end for two titles, Revenge and No Mercy.
+
+**What remains is not mechanical.** A generated tree is not a booting game: it
+still needs a boot context captured against the specific ROM (one command,
+~1 min), the executable-image PCs located (a human hunt, no prior art outside
+WM2000), and an input schedule authored (bespoke, the acknowledged long pole).
+Those three are what separate "recompiles" from "plays", and no tooling landed
+tonight shortens the last two.
