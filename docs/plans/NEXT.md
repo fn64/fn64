@@ -12,18 +12,22 @@ scoped, and what to do first.
 | WrestleMania 2000 | **boots and renders**, 1.94x budget | the 60fps work below |
 | No Mercy | 15/15 host bindings on the **on-disk ROM**; build can express it | executable-image PCs, input schedule |
 | VPW2 | 15/15 host bindings | an answer key; no `FN64_DISCOVER_*` entry |
-| WCW/nWo Revenge | **7 of 9** separable roles resolve | two recognizers, `osSetEventMesg` + `osSetTimer` |
+| WCW/nWo Revenge | **15/15 bindings, CPU-recompiles** (0 unsupported of 1749) | shard tree, boot context, executable-image PCs, input schedule |
 | WCW vs nWo World Tour | **1 of 9**, 7/7 skeleton-different | support for a 1996 libultra generation |
 
 ## The four remaining projects, in the order I would take them
 
-### 1. Revenge's two recognizers — the best ratio of work to titles
-Its libultra shares WM2000's lineage (5 of 7 triaged routines are the same code
-with different register allocation). Only `osSetEventMesg` and `osSetTimer` are
-genuinely different code, and both are absent rather than ambiguous. Write two
-behavioural recognizers against the published ABI, in the style of
-`crates/fn64-discover/src/host_bindings/`. **Method and evidence:**
-`docs/plans/wcw-host-binding-recognizers.md`.
+### 1. ~~Revenge's two recognizers~~ — DONE 2026-08-09 (`10a73c7`, `7fa28f5`)
+Both predicates were pinning compiler artifacts rather than ABI: a hardcoded
+register in one, a hardcoded stack frame size in the other. Revenge inlines
+less, so its frame is 24 bytes not 32 and every o32 stack-argument offset
+shifted. Made frame-relative; **Revenge went 7/9 → 15/15 and now
+CPU-recompiles with `unsupported_destinations = 0` of 1,749.**
+
+**Four of five AKI titles now CPU-recompile.** Revenge needs the same bring-up
+as No Mercy from here: shard tree, boot context, executable-image PCs, input
+schedule. **That bring-up — for either title — is now the shortest path to a
+second playable game**, and it is item 2.
 
 ### 2. No Mercy's remaining bring-up — the only path to a second playable title
 Everything mechanical is done: 15/15 confirmed on the actual ROM, the topology
