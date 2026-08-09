@@ -935,8 +935,16 @@ struct HostState {
     runtime_rdram_len: usize,
     /// Canonical bootstrap owns its process allocation here so no caller can
     /// retain a mutable `Vec` or raw-pointer lifetime after validation.
+    ///
+    /// A page-aligned `mmap` rather than the `Box<[u8]>` this was, so the
+    /// `mprotect` write barrier can protect it. `mprotect` works on whole
+    /// pages, and a malloc'd buffer shares its first and last page with
+    /// unrelated heap objects -- protecting it would fault on their next write,
+    /// somewhere with no handler and no diagnosis. See
+    /// [`write_barrier::PageAlignedRdram`]. It derefs to `[u8]`, so every
+    /// reader of this field is unchanged.
     #[cfg(feature = "recomp-rs")]
-    owned_runtime_rdram: Option<Box<[u8]>>,
+    owned_runtime_rdram: Option<write_barrier::ProcessRdram>,
     /// CPU-side images of immutable `OSTask::ucode_boot` ranges. The public
     /// task contract points these fields at rspboot text, and the real CPU's
     /// non-coherent data cache can retain that text while a CIC/custom RSP
@@ -1814,6 +1822,25 @@ fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> R {
     HOST.with(|h| f(&mut h.borrow_mut()))
 }
 
+/// `with_host` for callers reached from the guest store path, which can run
+/// underneath a caller that already holds `HOST` -- `advance_device_time_step`
+/// issues device writes from inside its own `with_host` closure, and those
+/// writes reach the executable-write boundary observer.
+///
+/// Returns `None` instead of panicking when `HOST` is already borrowed. Only
+/// callers that have a correct answer for "cannot tell" may use this.
+///
+/// Gated on `recomp-rs` because its only caller —
+/// `recompiled::snapshots::guest_write_boundary` — is reachable only under
+/// that feature, so a default-feature build compiles it with no user and
+/// warns. This is NOT dead code: the comment at that call site records the
+/// nested-`borrow_mut` abort it exists to prevent as "REACHED, not
+/// theoretical".
+#[cfg(feature = "recomp-rs")]
+fn try_with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> Option<R> {
+    HOST.with(|h| h.try_borrow_mut().ok().map(|mut host| f(&mut host)))
+}
+
 /// Install `yielder`/`thread_id`/`rdram` as the active ones for the
 /// duration of `f`. See module doc.
 ///
@@ -2179,6 +2206,23 @@ mod ai;
 mod cache;
 mod debug;
 mod dispatch;
+/// Isolates the cost of `dispatch_captured_raw_rdp`'s whole-RDRAM staging copy
+/// and counts RSP interpreter instructions, both gated by
+/// `FN64_DPC_COPY_CENSUS=1`. Diagnostic only; see the module docs for why the
+/// seam's existing inclusive timer cannot answer either question.
+mod dpc_copy_census;
+/// The counter tree declared as DATA -- every counter names its parent, and
+/// children summing above their parent is a hard error that refuses to print
+/// the affected subtree. Promotes the `PhaseTiming` nesting diagram from prose
+/// a human must obey into a check the code performs.
+pub mod counter_tree;
+/// Per-VI-field wall-clock latency, gated by `FN64_FRAME_CENSUS=1`. The test
+/// for the "guaranteed 60fps" bar; see the module docs for why both the
+/// frame-budget ratio and the wall-versus-virtual ratio are always reported.
+pub mod frame_census;
+/// `FN64_PROFILE=1`: one gate that arms every constituent channel and emits one
+/// authoritative report. Composes the existing gates; does not replace them.
+pub mod profile;
 mod gbpak;
 mod host;
 mod mesgqueue;
@@ -2194,6 +2238,8 @@ mod thread;
 mod timer;
 mod vi;
 mod voice;
+#[cfg(feature = "recomp-rs")]
+pub mod write_barrier;
 
 pub use ai::*;
 pub use cache::*;

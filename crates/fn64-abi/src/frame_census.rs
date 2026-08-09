@@ -255,6 +255,13 @@ struct Counters {
     rsp_entries: u64,
     /// `dispatch_captured_raw_rdp` entries, from `FN64_DPC_COPY_CENSUS`.
     dpc_calls: u64,
+    /// The staging-copy phases, from `FN64_DPC_COPY_CENSUS`. Nested under the
+    /// RDP seam. Sampled per field because the staging memcpy is an
+    /// optimization target and a run total cannot say which population pays
+    /// it -- nor whether it is 0.11x the budget or 1.1x.
+    dpc_alloc_ns: u64,
+    dpc_copy_in_ns: u64,
+    dpc_copy_back_ns: u64,
     /// Mutation-journal boundaries, from `FN64_MPROTECT_BARRIER_STATS`.
     /// Zero when unset.
     barrier_served: u64,
@@ -271,6 +278,8 @@ impl Counters {
         let phase = crate::phase_timing();
         let (rsp_steps_gfx, rsp_steps_audio, rsp_entries, dpc_calls) =
             crate::dpc_copy_census::running_totals();
+        let (dpc_alloc_ns, dpc_copy_in_ns, dpc_copy_back_ns) =
+            crate::dpc_copy_census::staging_totals();
         // The barrier lives behind `recomp-rs`. Without that feature there is
         // no journal to count boundaries for, so zeros are the true answer and
         // the report's NO DATA line is the correct rendering of them.
@@ -319,6 +328,9 @@ impl Counters {
             rsp_steps_audio,
             rsp_entries,
             dpc_calls,
+            dpc_alloc_ns,
+            dpc_copy_in_ns,
+            dpc_copy_back_ns,
             barrier_served,
             barrier_fell_back,
             barrier_dirty_pages,
@@ -376,6 +388,9 @@ impl Counters {
             rsp_steps_audio,
             rsp_entries,
             dpc_calls,
+            dpc_alloc_ns,
+            dpc_copy_in_ns,
+            dpc_copy_back_ns,
             barrier_served,
             barrier_fell_back,
             barrier_dirty_pages,
@@ -385,7 +400,7 @@ impl Counters {
 
     /// Every counter as `(label, value)`, in report order. One list so the
     /// bucket diff cannot silently omit a counter the sampler collects.
-    fn labelled(&self) -> [(&'static str, u64); 42] {
+    fn labelled(&self) -> [(&'static str, u64); 45] {
         [
             ("gfx_tasks", self.gfx_tasks),
             ("audio_tasks", self.audio_tasks),
@@ -404,6 +419,9 @@ impl Counters {
             ("rsp_steps_audio", self.rsp_steps_audio),
             ("rsp_entries", self.rsp_entries),
             ("dpc_calls", self.dpc_calls),
+            ("dpc_alloc_ns", self.dpc_alloc_ns),
+            ("dpc_copy_in_ns", self.dpc_copy_in_ns),
+            ("dpc_copy_back_ns", self.dpc_copy_back_ns),
             ("barrier_served", self.barrier_served),
             ("barrier_fell_back", self.barrier_fell_back),
             ("barrier_dirty_pages", self.barrier_dirty_pages),
@@ -598,15 +616,45 @@ pub(crate) fn observe_vi_fields(retrace_ticks: u32, now_sim_time: u64) {
 /// program's identity digest for a diagnostic.
 pub fn install() {
     if !enabled() {
+        // THE TRAP THIS AVOIDS: if `FN64_PROFILE` is set but the census gate
+        // did not arm, returning here silently would emit NOTHING -- no report
+        // and no warning, because the warning would live behind the very gate
+        // that failed. That is the shape that cost two 25-minute runs, and
+        // `scripts/byte-identity-1p5M.txt` documents a live instance of it.
+        //
+        // So the refusal is raised HERE, on the path where the gate is OFF,
+        // and it is not conditioned on the census gate it reports about.
+        if crate::profile::enabled() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprint!(
+                    "{} FN64_PROFILE is set but FN64_FRAME_CENSUS did not arm, so no census \
+                     exists to report. Nothing below is a measurement.\n",
+                    crate::profile::TAG,
+                );
+                use std::io::Write as _;
+                let _ = std::io::stderr().flush();
+                std::process::exit(70);
+            });
+        }
         return;
     }
     static ARMED_ONCE: std::sync::Once = std::sync::Once::new();
     ARMED_ONCE.call_once(|| {
         ARMED.store(true, Ordering::Relaxed);
         extern "C" fn at_exit() {
-            print!("{}", report());
+            let text = report();
+            print!("{text}");
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
+            // Requirement: under FN64_PROFILE, refuse rather than present a
+            // plausible subset. A non-zero exit is what makes the refusal
+            // impossible to skim past -- a printed warning has already been
+            // filtered, missed and acted on twice.
+            if crate::profile::enabled() && text.contains("REFUSING TO PRINT") {
+                let _ = std::io::stderr().flush();
+                std::process::exit(70);
+            }
         }
         extern "C" {
             fn atexit(f: extern "C" fn()) -> i32;
@@ -786,6 +834,11 @@ struct Bucket {
     wall_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
+    /// The tail. Reported alongside p50/p95 because a mean has hidden the real
+    /// distribution twice on this project -- a bimodal field split, then a
+    /// trimodal windowed one -- and the 60fps bar is a WORST-CASE bound, so the
+    /// tail is the quantity it actually tests.
+    p99_ms: f64,
     mean_ms: f64,
     counters: Counters,
     /// Per-field p50/p95 for each `resume NET` phase, in ms.
@@ -874,6 +927,9 @@ impl Bucket {
                 rsp_steps_audio,
                 rsp_entries,
                 dpc_calls,
+                dpc_alloc_ns,
+                dpc_copy_in_ns,
+                dpc_copy_back_ns,
                 barrier_served,
                 barrier_fell_back,
                 barrier_dirty_pages,
@@ -928,6 +984,7 @@ impl Bucket {
             wall_ms,
             p50_ms: nearest_rank(&ms, 50),
             p95_ms: nearest_rank(&ms, 95),
+            p99_ms: nearest_rank(&ms, 99),
             mean_ms: wall_ms / fields as f64,
             counters,
             phase_p50_ms: PhasePercentiles {
@@ -1490,6 +1547,11 @@ fn population_report(split: &PopulationSplit) -> String {
     }
     out.push_str(&executor_split_report(&fast, &slow));
     out.push_str(&resume_split_report(&fast, &slow));
+    // The composed, tree-checked view. Additive: the sections above are
+    // unchanged and committed scripts still parse them.
+    if crate::profile::enabled() {
+        out.push_str(&profile_report(split));
+    }
     out
 }
 
@@ -1845,6 +1907,297 @@ fn resume_split_report(fast: &Bucket, slow: &Bucket) -> String {
          code-quality problem and no amount of runtime trimming reaches it; if DISPATCH-LOOP \
          OVERHEAD dominates, the per-step apparatus is the target.\n",
     );
+    out
+}
+
+/// The `FN64_PROFILE` report: one authoritative decomposition, tree-checked,
+/// with both denominators on every row.
+///
+/// # What this adds over the sections above
+///
+/// The sections above are correct and stay as they are. What they lack is
+/// enforcement: each re-derives the counter nesting by hand, and three of them
+/// got it wrong in one evening. This function routes the same numbers through
+/// [`crate::counter_tree`], so a child exceeding its parent **refuses to print
+/// the affected subtree** rather than presenting it as a finding.
+///
+/// It also states every row against BOTH denominators. "20.9% of resume NET"
+/// is what let three modest-looking rows be read as small when they summed to
+/// 1.29x the frame budget -- the opposite conclusion.
+fn profile_report(split: &PopulationSplit) -> String {
+    use crate::profile;
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} ================ FN64_PROFILE ================\n",
+        profile::TAG,
+    ));
+
+    // Arming is verified BY EFFECT: did the channel produce data? An env echo
+    // cannot distinguish `FN64_EXECUTOR_SPLIT=0` (which ARMS) from
+    // `FN64_FRAME_CENSUS_POPULATIONS=0` (which disarms).
+    let c = &split.slow.counters;
+    let f = &split.fast.counters;
+    let witness = |gate: &str| match gate {
+        "FN64_FRAME_CENSUS" => split.fast.fields + split.slow.fields > 0,
+        "FN64_FRAME_CENSUS_POPULATIONS" => split.armed,
+        "FN64_PHASE_TIMING" => c.executor_ns > 0 || f.executor_ns > 0,
+        "FN64_EXECUTOR_SPLIT" => c.exec_resume_ns > 0 || f.exec_resume_ns > 0,
+        "FN64_RESUME_SPLIT" => c.resume_dispatch_ns > 0 || f.resume_dispatch_ns > 0,
+        // The sequence dump is a request for N fields, not a counter; it is
+        // armed iff a length was asked for.
+        "FN64_FRAME_CENSUS_SEQUENCE" => sequence_dump_len() > 0,
+        // Witnessed by the RSP instruction counters rather than the staging
+        // timers: a route that never reaches `dispatch_captured_raw_rdp`
+        // legitimately has zero staging time, but any rendering route retires
+        // RSP instructions. Using the staging timers here would report a
+        // correct zero as a broken channel.
+        "FN64_DPC_COPY_CENSUS" => {
+            c.rsp_entries > 0 || f.rsp_entries > 0 || c.dpc_calls > 0 || f.dpc_calls > 0
+        }
+        _ => false,
+    };
+    let missing = profile::verify(&witness);
+
+    // Provenance travels FIRST and always: a per-field figure without its
+    // route and binary is not a result, and reconstructing provenance after
+    // the fact cost the worst hours of the evening this was built in.
+    out.push_str(&profile::Provenance::collect(&missing).report());
+    // The instrument's own cost, from an armed/control pair. `--profile` runs
+    // the control lane first and passes its ms/field in; absent that, the
+    // header says UNMEASURED rather than implying zero.
+    let armed_ms = {
+        let f = split.fast.wall_ms + split.slow.wall_ms;
+        let n = (split.fast.fields + split.slow.fields).max(1) as f64;
+        f / n
+    };
+    // NAMED TO AVOID A NEAR-MISS COLLISION: `FN64_PROFILE_CONTROL` already
+    // exists and means something unrelated (the typed executor control
+    // snapshot, `main.rs:1506`). `FN64_PROFILE_CONTROL_MS` would sit one
+    // suffix away from it and read as its variant, so this uses a distinct
+    // stem instead.
+    let control_ms = std::env::var("FN64_PROFILE_BASELINE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok());
+    out.push_str(&profile::perturbation_report(armed_ms, control_ms));
+    out.push_str(&profile::scope_legend());
+
+    // Refuse rather than print a plausible subset.
+    if !missing.is_empty() {
+        out.push_str(&profile::not_armed_report(&missing));
+        return out;
+    }
+
+    for (name, bucket) in [("fast", &split.fast), ("slow", &split.slow)] {
+        let fields = bucket.fields.max(1) as f64;
+        let k = &bucket.counters;
+        let ms = |ns: u64| ns as f64 / 1.0e6 / fields;
+        // The tree's view of this population, in ms/field.
+        let lookup = |counter: &str| -> f64 {
+            match counter {
+                "executor_ns" => ms(k.executor_ns),
+                "exec_resume_ns" => ms(k.exec_resume_ns),
+                "exec_mirror_ns" => ms(k.exec_mirror_ns),
+                "exec_guard_suspend_ns" => ms(k.exec_guard_suspend_ns),
+                "exec_devtime_ns" => ms(k.exec_devtime_ns),
+                "exec_guard_device_ns" => ms(k.exec_guard_device_ns),
+                "resume_reconcile_ns" => ms(k.resume_reconcile_ns),
+                "resume_cop0_ns" => ms(k.resume_cop0_ns),
+                "resume_dispatch_ns" => ms(k.resume_dispatch_ns),
+                "resume_invalidate_ns" => ms(k.resume_invalidate_ns),
+                "resume_exit_ns" => ms(k.resume_exit_ns),
+                "resume_suspend_ns" => ms(k.resume_suspend_ns),
+                "resume_resolve_ns" => ms(k.resume_resolve_ns),
+                "resume_hostcall_ns" => ms(k.resume_hostcall_ns),
+                "gfx_ns" => ms(k.gfx_ns),
+                "gfx_lle_ns" => ms(k.gfx_lle_ns),
+                "gfx_lle_rsp_ns" => ms(k.gfx_lle_rsp_ns),
+                "gfx_lle_rdp_ns" => ms(k.gfx_lle_rdp_ns),
+                "dpc_alloc_ns" => ms(k.dpc_alloc_ns),
+                "dpc_copy_in_ns" => ms(k.dpc_copy_in_ns),
+                "dpc_copy_back_ns" => ms(k.dpc_copy_back_ns),
+                "audio_lle_ns" => ms(k.audio_lle_ns),
+                "vi_present_ns" => ms(k.vi_present_ns),
+                _ => 0.0,
+            }
+        };
+
+        // THE CHECK. Runs before any row is formatted.
+        let violations = crate::counter_tree::validate(&lookup);
+
+        let resume_net = crate::counter_tree::value_of("resume_net", &lookup);
+        out.push_str(&format!(
+            "{} {name}: fields={} p50={:.3} p95={:.3} p99={:.3} mean={:.3} ms/field \
+             ({:.2}x budget at p50, {:.2}x at p95)\n",
+            profile::TAG,
+            bucket.fields,
+            bucket.p50_ms,
+            bucket.p95_ms,
+            bucket.p99_ms,
+            bucket.mean_ms,
+            bucket.p50_ms / profile::FRAME_BUDGET_MS,
+            bucket.p95_ms / profile::FRAME_BUDGET_MS,
+        ));
+
+        // THE OUTERMOST CHECK, which the tree alone cannot make: the whole
+        // decomposition must fit inside the MEASURED FIELD. `executor_ns` is
+        // the tree's root, but the field's wall time is the real container,
+        // and it is not a counter -- so a decomposition claiming 45.687 ms
+        // inside a 10.000 ms field passes every parent/child test and is still
+        // impossible. Found by reading this report's own first output: the
+        // fast bucket showed 2.74x budget of resume NET inside a 0.60x field.
+        let field_ms = bucket.mean_ms;
+        let claimed = lookup("executor_ns").max(resume_net);
+        if field_ms > 0.0
+            && claimed > field_ms * (1.0 + crate::counter_tree::CLOSURE_TOLERANCE)
+        {
+            out.push_str(&format!(
+                "{} {name}: DECOMPOSITION EXCEEDS ITS FIELD -- the phases claim {claimed:.3}ms \
+                 inside a measured {field_ms:.3}ms field ({:.1}x). No parent/child check can \
+                 catch this because the field's wall time is not a counter. THE INSTRUMENT IS \
+                 BROKEN; DO NOT READ THE ROWS BELOW.\n",
+                profile::TAG,
+                claimed / field_ms,
+            ));
+        }
+
+        if !violations.is_empty() {
+            for v in &violations {
+                out.push_str(&v.report());
+            }
+        }
+
+        // `resume NET` and its siblings. The mirror is a SIBLING here while
+        // being nested inside `exec_resume_ns` -- the relationship the tree
+        // declares and three hand-written report sites got wrong.
+        let mirror = lookup("exec_mirror_ns");
+        let devtime = lookup("exec_devtime_ns");
+        if !crate::counter_tree::suppressed_by("resume_net", &violations) {
+            out.push_str(&profile::row(
+                "resume NET (guest + runtime)",
+                resume_net,
+                lookup("executor_ns"),
+                "executor",
+            ));
+            out.push_str(&profile::row(
+                "mirror boundary [sibling of NET]",
+                mirror,
+                lookup("executor_ns"),
+                "executor",
+            ));
+            out.push_str(&profile::row(
+                "devtime (advance)",
+                devtime,
+                lookup("executor_ns"),
+                "executor",
+            ));
+        }
+
+        // The resume NET decomposition, every row against BOTH denominators.
+        let mut named = Vec::new();
+        for (label, counter) in [
+            ("reconcile @1033", "resume_reconcile_ns"),
+            ("cop0 sync + interrupts", "resume_cop0_ns"),
+            ("dispatch = TRANSLATED GUEST CODE", "resume_dispatch_ns"),
+            ("host calls (OS shims)", "resume_hostcall_ns"),
+            ("invalidate writes", "resume_invalidate_ns"),
+            ("exit + publish checkpoint", "resume_exit_ns"),
+            ("suspend (on-stack)", "resume_suspend_ns"),
+            ("resolve next entry", "resume_resolve_ns"),
+        ] {
+            if crate::counter_tree::suppressed_by(counter, &violations) {
+                continue;
+            }
+            let v = lookup(counter);
+            named.push(v);
+            out.push_str(&profile::row(label, v, resume_net, "resume NET"));
+        }
+
+        // Graphics, nested inside the host calls.
+        for (label, counter) in [
+            ("  (of) gfx_ns", "gfx_ns"),
+            ("    (of) RSP interpretation", "gfx_lle_rsp_ns"),
+            ("    (of) RDP rasterization", "gfx_lle_rdp_ns"),
+            // The staging copy, named per phase. An optimization target needs
+            // its own row against the budget, not a share of a run total.
+            ("      (of) staging alloc", "dpc_alloc_ns"),
+            ("      (of) staging copy_in", "dpc_copy_in_ns"),
+            ("      (of) staging copy_back", "dpc_copy_back_ns"),
+            ("  (of) audio_lle_ns", "audio_lle_ns"),
+        ] {
+            if crate::counter_tree::suppressed_by(counter, &violations) {
+                continue;
+            }
+            // Each row against ITS OWN parent, taken from the tree rather than
+            // a denominator hardcoded at the call site. Hardcoding is how a
+            // staging cost gets stated as a share of host calls when it is
+            // really a share of the RDP seam -- a share of the wrong
+            // denominator is not a size.
+            let parent = crate::counter_tree::node(counter)
+                .and_then(|n| n.parent)
+                .unwrap_or("resume_hostcall_ns");
+            // A readable name for the denominator. The raw counter identifier
+            // is correct but reads as jargon in a column a human scans.
+            let parent_label = match parent {
+                "resume_hostcall_ns" => "host calls",
+                "gfx_ns" => "gfx",
+                "gfx_lle_ns" => "gfx LLE",
+                "gfx_lle_rdp_ns" => "RDP",
+                "resume_net" => "resume NET",
+                other => other,
+            };
+            out.push_str(&profile::row(
+                label,
+                lookup(counter),
+                lookup(parent),
+                parent_label,
+            ));
+        }
+
+        // Closure, preserved exactly: printed unconditionally, and a negative
+        // residual is an instrument failure rather than a small number.
+        let named_total: f64 = named.iter().sum();
+        let gap = resume_net - named_total;
+        out.push_str(&profile::row(
+            "PARKED (other threads ran)",
+            gap,
+            resume_net,
+            "resume NET",
+        ));
+        if gap < 0.0 && resume_net > 0.0 && (gap.abs() / resume_net) > 0.05 {
+            out.push_str(&format!(
+                "{} {name}: NEGATIVE RESIDUAL -- the phases claim MORE than resume NET \
+                 contains, which is impossible. THE INSTRUMENT IS BROKEN; DO NOT READ THE ROWS \
+                 ABOVE.\n",
+                profile::TAG,
+            ));
+        }
+
+        // THE SUM, computed in a tool rather than eyed. Every row above can be
+        // individually right while the total contradicts the conclusion drawn
+        // from them.
+        out.push_str(&profile::total_row(
+            "HOST-SIDE TOTAL (excl. graphics)",
+            &[
+                lookup("resume_reconcile_ns"),
+                lookup("resume_cop0_ns"),
+                lookup("resume_dispatch_ns"),
+                lookup("resume_invalidate_ns"),
+                lookup("resume_exit_ns"),
+                lookup("resume_resolve_ns"),
+                mirror,
+                devtime,
+                gap.max(0.0),
+            ],
+        ));
+    }
+    out.push_str(&format!(
+        "{} Every row states BOTH its share of its parent AND its ratio to the {:.3}ms budget. \
+         A share of the wrong denominator is not a size: check each row against the \
+         denominator THE DECISION uses.\n",
+        profile::TAG,
+        profile::FRAME_BUDGET_MS,
+    ));
     out
 }
 
@@ -2296,6 +2649,9 @@ mod tests {
             resume_dispatch_calls: 1,
             vi_present_in_executor_calls: 1,
             vi_present_outside_executor_calls: 1,
+            dpc_alloc_ns: 1,
+            dpc_copy_in_ns: 1,
+            dpc_copy_back_ns: 1,
         };
         let samples: Vec<FieldSample> = (0..10).map(|_| sample_with(20.0, ones)).collect();
         let refs: Vec<&FieldSample> = samples.iter().collect();
@@ -2787,12 +3143,15 @@ mod tests {
             resume_dispatch_calls: 1 << 37,
             vi_present_in_executor_calls: 1 << 38,
             vi_present_outside_executor_calls: 1 << 39,
+            dpc_alloc_ns: 1 << 42,
+            dpc_copy_in_ns: 1 << 43,
+            dpc_copy_back_ns: 1 << 44,
         };
         let labelled = counters.labelled();
         let sum: u64 = labelled.iter().map(|&(_, v)| v).sum();
         assert_eq!(
             sum,
-            (1u64 << 42) - 1,
+            (1u64 << 45) - 1,
             "each distinct power of two must appear exactly once in `labelled`"
         );
         let mut names: Vec<&str> = labelled.iter().map(|&(n, _)| n).collect();
@@ -2952,5 +3311,298 @@ mod tests {
         }
         std::env::remove_var(name);
         assert!(!env_flag(name), "an absent variable must read as off");
+    }
+
+    // ---- FN64_PROFILE composition ------------------------------------
+    //
+    // These exercise `profile_report` directly rather than through the env
+    // gate: `profile::enabled()` memoizes a `OnceLock`, so a test that set the
+    // variable would leak into every other test in the binary and would be
+    // order-dependent. Calling the formatter with known counters tests the
+    // thing that can actually be wrong.
+
+    /// The counters behind the recorded acceptance table, as ns totals over
+    /// one field. Slow population, 1.5M-step route.
+    fn acceptance_counters() -> Counters {
+        Counters {
+            // The recorded slow field is 56.23 ms and `resume NET` is 45.687 ms
+            // INSIDE it -- 83.2% (perf-method.md:2725-2727, :3064). An earlier
+            // draft of this fixture used 45.687 as the FIELD, which made
+            // `exec_resume` 55 ms inside a 45.687 ms field: impossible, and the
+            // outermost check correctly rejected it. The fixture was wrong,
+            // not the check -- which is the check earning its place.
+            executor_ns: 56_230_000,
+            executor_calls: 100,
+            exec_resume_ns: 55_000_000,
+            exec_mirror_ns: 8_848_000,
+            exec_guard_suspend_ns: 465_000,
+            resume_dispatch_ns: 9_528_000,
+            resume_dispatch_calls: 100,
+            resume_hostcall_ns: 32_700_000,
+            gfx_ns: 32_119_000,
+            gfx_lle_ns: 32_033_000,
+            gfx_lle_rsp_ns: 5_637_000,
+            gfx_lle_rdp_ns: 26_396_000,
+            resume_reconcile_ns: 1_000_000,
+            resume_cop0_ns: 900_000,
+            resume_invalidate_ns: 500_000,
+            resume_exit_ns: 400_000,
+            resume_resolve_ns: 300_000,
+            // Witnesses the DPC census channel; without it the report
+            // correctly refuses, which is the check working.
+            rsp_entries: 100,
+            dpc_alloc_ns: 120_000,
+            dpc_copy_in_ns: 900_000,
+            dpc_copy_back_ns: 750_000,
+            ..Counters::default()
+        }
+    }
+
+    fn acceptance_split() -> PopulationSplit {
+        let counters = acceptance_counters();
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| sample_with(if i % 2 == 0 { 56.230 } else { 10.0 }, counters))
+            .collect();
+        PopulationSplit::from_samples(&samples, true).expect("40 samples")
+    }
+
+    /// The sequence channel is the one constituent with no counter to witness:
+    /// it is a request for N fields, so "did it arm" is "was a length asked
+    /// for". `sequence_dump_len` memoizes a `OnceLock`, so a test cannot set
+    /// the variable and observe an effect -- this arms it once for the whole
+    /// test binary, before any test reads it.
+    ///
+    /// Without this the report correctly REFUSES in every profile test, which
+    /// is the check doing its job rather than a bug.
+    fn arm_sequence_channel_for_tests() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("FN64_FRAME_CENSUS_SEQUENCE").is_none() {
+                // SAFETY: test-only, and `Once` serializes it against the
+                // other profile tests that call this first.
+                unsafe { std::env::set_var("FN64_FRAME_CENSUS_SEQUENCE", "400") };
+            }
+        });
+        // Force the memoized read now, so it cannot be captured as 0 later.
+        assert!(sequence_dump_len() > 0, "sequence channel must arm for these tests");
+    }
+
+    /// EVERY ROW STATES BOTH DENOMINATORS. This is the fix for the single most
+    /// consequential error: "20.9% of resume NET" is what let guest code be
+    /// named the target, when "0.57x budget" alongside it would have shown
+    /// three modest-looking rows summing past the budget.
+    #[test]
+    fn the_profile_report_states_both_denominators_on_every_row() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        let guest = text
+            .lines()
+            .find(|l| l.contains("TRANSLATED GUEST CODE"))
+            .expect("guest-code row present");
+        assert!(guest.contains("9.528ms/field"), "{guest}");
+        assert!(guest.contains("% of resume NET"), "share of parent: {guest}");
+        assert!(guest.contains("x budget"), "ratio to budget: {guest}");
+    }
+
+    /// The rows are SUMMED in code, against the denominator the decision uses.
+    /// Every individual number can be right while the sum contradicts the
+    /// conclusion drawn from them.
+    #[test]
+    fn the_profile_report_sums_the_rows_against_the_budget() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        assert!(
+            text.contains("SUM OF THE ROWS ABOVE"),
+            "the report must add the rows up, not leave it to the eye:\n{text}",
+        );
+    }
+
+    /// Percentiles, never a bare mean: a mean has hidden the distribution
+    /// twice on this project.
+    #[test]
+    fn the_profile_report_gives_percentiles_per_population() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        for population in ["fast", "slow"] {
+            let line = text
+                .lines()
+                .find(|l| l.contains(&format!("{population}: fields=")))
+                .unwrap_or_else(|| panic!("{population} summary line present in:\n{text}"));
+            for stat in ["p50=", "p95=", "p99="] {
+                assert!(line.contains(stat), "{population} missing {stat}: {line}");
+            }
+        }
+    }
+
+    /// Provenance travels with the numbers. Reconstructing where a figure came
+    /// from cost the worst hours of the evening this was built in.
+    #[test]
+    fn the_profile_report_carries_its_own_provenance() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        assert!(text.contains("PROVENANCE"), "{text}");
+        assert!(text.contains("binary:"), "{text}");
+        assert!(text.contains("route:"), "{text}");
+    }
+
+    /// The scope legend is present at the point of reading, because six tags
+    /// carry `gfx_submits` with four different meanings.
+    #[test]
+    fn the_profile_report_disambiguates_colliding_names() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        assert!(text.contains("NAME SCOPES"), "{text}");
+        assert!(text.contains("NOT a contradiction"), "{text}");
+    }
+
+    /// THE CHECK, end to end: a child exceeding its parent must refuse to
+    /// print that subtree rather than presenting it as a finding. This is the
+    /// `gfx_ns` 21.5 > parent 7.7 defect, which a human caught by eye.
+    #[test]
+    fn the_profile_report_refuses_a_subtree_whose_child_exceeds_its_parent() {
+        arm_sequence_channel_for_tests();
+        let counters = Counters {
+            executor_ns: 40_000_000,
+            executor_calls: 100,
+            exec_resume_ns: 38_000_000,
+            resume_dispatch_ns: 1_000_000,
+            resume_dispatch_calls: 100,
+            // 21.5ms of graphics inside a 7.7ms host-call parent: impossible.
+            resume_hostcall_ns: 7_700_000,
+            gfx_ns: 21_500_000,
+            // Witness for the DPC channel: without it the report refuses on
+            // an unarmed channel BEFORE reaching the tree check under test.
+            rsp_entries: 100,
+            ..Counters::default()
+        };
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, counters))
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = profile_report(&split);
+        assert!(
+            text.contains("TREE VIOLATION") && text.contains("REFUSING"),
+            "a child exceeding its parent must refuse the subtree:\n{text}",
+        );
+        assert!(
+            !text.contains("(of) RDP rasterization"),
+            "the refused subtree's rows must NOT be printed:\n{text}",
+        );
+    }
+
+    /// A healthy decomposition must NOT trip the refusal, or the check fires
+    /// always and means nothing (rule 6a).
+    #[test]
+    fn a_healthy_profile_report_prints_its_rows() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        println!("{text}");
+        assert!(
+            !text.contains("TREE VIOLATION"),
+            "the acceptance counters must close:\n{text}",
+        );
+        assert!(text.contains("TRANSLATED GUEST CODE"), "{text}");
+        assert!(text.contains("RDP rasterization"), "{text}");
+    }
+
+    /// An unarmed channel must refuse the whole report rather than present a
+    /// plausible subset, and must NAME the gate that failed.
+    #[test]
+    fn the_profile_report_refuses_when_a_channel_did_not_arm() {
+        // Population counters never sampled: `armed: false`.
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, Counters::default()))
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, false).expect("40 samples");
+        let text = profile_report(&split);
+        assert!(
+            text.contains("REFUSING TO PRINT"),
+            "a partial profile must be refused:\n{text}",
+        );
+        assert!(
+            text.contains("FN64_FRAME_CENSUS_POPULATIONS"),
+            "the refusal must name the missing gate:\n{text}",
+        );
+        assert!(
+            !text.contains("TRANSLATED GUEST CODE"),
+            "no rows may be printed alongside a refusal:\n{text}",
+        );
+    }
+
+    /// THE OUTERMOST CHECK, which the parent/child tree cannot make.
+    ///
+    /// Found by reading this report's own first real output: the fast bucket
+    /// claimed `resume NET` = 45.687 ms inside a measured 10.000 ms field --
+    /// 2.74x the budget of phases inside a 0.60x field. Every parent/child
+    /// relation held, because the field's wall time is not a counter and so is
+    /// not in the tree. An impossible decomposition passed the check that
+    /// exists to catch impossible decompositions.
+    #[test]
+    fn a_decomposition_larger_than_its_own_field_is_caught() {
+        arm_sequence_channel_for_tests();
+        // 45ms of phases inside a 10ms field: impossible, and invisible to
+        // every parent/child test because the tree closes internally.
+        let counters = Counters {
+            executor_ns: 45_000_000,
+            executor_calls: 100,
+            exec_resume_ns: 45_000_000,
+            resume_dispatch_ns: 45_000_000,
+            resume_dispatch_calls: 100,
+            rsp_entries: 100,
+            ..Counters::default()
+        };
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|_| sample_with(10.0, counters))
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = profile_report(&split);
+        assert!(
+            text.contains("DECOMPOSITION EXCEEDS ITS FIELD"),
+            "phases larger than the field they sit in must be refused:\n{text}",
+        );
+        // And the tree itself must be silent here -- proving this check is
+        // catching something the parent/child relations genuinely cannot.
+        let ms = |ns: u64| ns as f64 / 1.0e6 / 40.0;
+        let lookup = |c: &str| match c {
+            "executor_ns" | "exec_resume_ns" => ms(counters.executor_ns * 40),
+            "resume_dispatch_ns" => ms(counters.resume_dispatch_ns * 40),
+            _ => 0.0,
+        };
+        assert!(
+            crate::counter_tree::validate(&lookup).is_empty(),
+            "premise of this test: the tree closes internally, so only the \
+             field-level check can catch it",
+        );
+    }
+
+    /// A decomposition that FITS its field must not trip the outermost check,
+    /// or it fires always and means nothing.
+    #[test]
+    fn a_decomposition_within_its_field_is_not_flagged() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        let slow_section = text
+            .split("slow: fields=")
+            .nth(1)
+            .expect("slow section present");
+        assert!(
+            !slow_section.contains("DECOMPOSITION EXCEEDS ITS FIELD"),
+            "45.687ms of resume NET inside a 56.230ms field must be accepted:\n{slow_section}",
+        );
+    }
+
+    /// The mirror is a SIBLING of resume NET while being nested inside
+    /// `exec_resume_ns`. That single relationship is what prose made
+    /// confusable and three hand-written report sites got wrong.
+    #[test]
+    fn the_profile_report_places_the_mirror_beside_resume_net() {
+        arm_sequence_channel_for_tests();
+        let text = profile_report(&acceptance_split());
+        let mirror = text
+            .lines()
+            .find(|l| l.contains("mirror boundary"))
+            .expect("mirror row present");
+        assert!(mirror.contains("sibling of NET"), "{mirror}");
+        assert!(mirror.contains("8.848ms/field"), "{mirror}");
     }
 }
