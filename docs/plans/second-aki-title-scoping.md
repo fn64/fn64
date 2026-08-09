@@ -709,3 +709,37 @@ comes out one-short on some overlays, hypothesis 1 is confirmed and the
 tree I diffed earlier was byte-identical to committed, which already argues
 against hypothesis 1, so hypothesis 2 or 3 is more likely. **Stated as
 unresolved rather than concluded.**
+
+### RESOLVED by the decisive test: the generator is correct, the record is suspect
+
+Ran the test named above — re-derived WM2000 from the **current** generator:
+
+    overlay-0: 3   overlay-1: 1   overlay-2: 6   overlay-3: 8   total 18
+
+**Exactly the recorded and committed WM2000 shape.** So the generator reproduces
+a known-good title bit for bit while producing `[2,2,5,7,5]`=21 for No Mercy
+against a recorded `[3,3,5,8,5]`=24.
+
+**Hypothesis 1 (a tiling change landed since the record) is eliminated.** A
+changed shard boundary would have moved WM2000's overlays too, and it did not.
+
+That leaves the No-Mercy-specific explanations, and the record is now the weaker
+side of the disagreement:
+
+- **ROM variant.** The record predates the Rev-A-vs-Unlocked finding. Different
+  overlay *extents* between revisions would produce exactly this: three overlays
+  crossing a shard boundary in one image and not the other, two unaffected.
+  **This is the leading explanation** — it is the only one consistent with
+  WM2000 reproducing exactly, and the variant question was already live for host
+  bindings on this same title.
+- **The record came from a different code path** than `package_inventory()`.
+
+**Practical consequence: trust the generator, not the record.** The generated
+figure is reproducible from a named ROM on demand; the recorded one is a
+2026-08-07 note whose ROM is not identified by digest. Anyone bringing up No
+Mercy should generate the topology rather than transcribe `[3,3,5,8,5]`, and
+should expect 21 overlay shards.
+
+Recording the digest discipline again because it would have prevented this
+entirely: **a per-title figure without its ROM digest cannot be reconciled
+later.**
