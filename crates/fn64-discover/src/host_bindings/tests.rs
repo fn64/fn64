@@ -492,7 +492,8 @@
         let send_index = 180usize;
         let create_thread_index = 240usize;
         let start_thread_index = 290usize;
-        let set_event_index = 330usize;
+        // 23 words, so it must end clear of `get_thread_pri` at 352.
+        let set_event_index = 324usize;
         let get_thread_pri_index = 352usize;
         let set_thread_pri_index = 360usize;
         let sp_task_load_index = 420usize;
@@ -501,7 +502,14 @@
         let sp_task_yielded_index = 600usize;
         let set_timer_index = 650usize;
         let loader_index = 120usize;
-        let mut words = vec![0u32; 740];
+        // 760, not 740: `unique_match` scans with `windows(width)`, which yields
+        // nothing once fewer than `width` elements remain. At the timer's 100-word
+        // width the last window starts at len-100, so a 740-word array stops
+        // offering windows at 640 and the routine at 650 is never presented to the
+        // predicate at all -- zero candidates because nothing was ever scanned.
+        // Size this against the widest WIDTH plus its start index, not the widest
+        // body: 650 + 100 = 750, and the slack keeps the next widening honest.
+        let mut words = vec![0u32; 760];
         words[create_index..create_index + 9].copy_from_slice(&[
             0x3c02_8123,
             0x2442_4560,
@@ -580,21 +588,35 @@
         start_words[12] = 0x1462_001e;
         start_words[13] = 0x2402_0002;
         start_words[14] = 0xa602_0010;
+        // The compilation that delegates the `OS_EVENT_PRENMI` handling rather
+        // than inlining it: the arguments are captured across the interrupt
+        // disable, the selector is scaled by the eight-byte entry stride, and
+        // the queue and message are stored through the resulting entry.
         let set_event = base + set_event_index as u32 * 4;
-        let event_words = &mut words[set_event_index..set_event_index + 19];
-        event_words[0] = 0x27bd_ffd8;
+        let event_words = &mut words[set_event_index..set_event_index + 23];
+        event_words[0] = 0x27bd_ffe0;
+        event_words[1] = 0xafb0_0010;
         event_words[2] = 0x0080_8021;
+        event_words[3] = 0xafb1_0014;
         event_words[4] = 0x00a0_8821;
-        event_words[6] = 0x00c0_9021;
-        event_words[8] = jal(set_event + 8 * 4, base + 0x1000);
-        event_words[10] = 0x0010_18c0;
-        event_words[12] = 0x2484_ed68;
-        event_words[13] = 0x0064_1821;
-        event_words[14] = 0x0040_9821;
-        event_words[15] = 0x2402_000e;
-        event_words[16] = 0xac71_0000;
-        event_words[17] = 0x1602_0010;
-        event_words[18] = 0xac72_0004;
+        event_words[5] = 0xafb2_0018;
+        event_words[6] = 0xafbf_001c;
+        event_words[7] = jal(set_event + 7 * 4, base + 0x1000);
+        event_words[8] = 0x00c0_9021;
+        event_words[9] = 0x0010_80c0;
+        event_words[10] = 0x3c03_8123;
+        event_words[11] = 0x2463_df30;
+        event_words[12] = 0x0203_8021;
+        event_words[13] = 0x0040_2021;
+        event_words[14] = 0xae11_0000;
+        event_words[15] = jal(set_event + 15 * 4, base + 0x1040);
+        event_words[16] = 0xae12_0004;
+        event_words[17] = 0x8fbf_001c;
+        event_words[18] = 0x8fb2_0018;
+        event_words[19] = 0x8fb1_0014;
+        event_words[20] = 0x8fb0_0010;
+        event_words[21] = 0x03e0_0008;
+        event_words[22] = 0x27bd_0020;
         let get_thread_pri = base + get_thread_pri_index as u32 * 4;
         words[get_thread_pri_index..get_thread_pri_index + 6].copy_from_slice(&[
             0x1480_0003,
@@ -1006,8 +1028,17 @@
             }) if candidates.len() == 2
         ));
 
+        // Each offset below is one clause of the published contract: the frame
+        // and its restore, the stack-passed countdown/queue/message loads, the
+        // eight `OSTimer` field writes, and the zero-interval reload. Breaking
+        // any one of them must make the routine unrecognizable. Positions that
+        // merely implement the list walk are deliberately absent -- they are
+        // not part of what `osSetTimer` promises, and a build that delegates
+        // the walk must still be recognized.
         let timer_index = usize::try_from((expected_timer.vram - base) / 4).unwrap();
-        for offset in [1usize, 10, 14, 24, 59, 68, 73] {
+        for offset in [
+            0usize, 1, 2, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 24, 73, 74,
+        ] {
             let mut broken = words.clone();
             broken[timer_index + offset] ^= 1;
             assert!(matches!(
@@ -1019,7 +1050,7 @@
             ));
         }
         let mut duplicate_timer = words.clone();
-        duplicate_timer.extend_from_slice(&words[timer_index..timer_index + 75]);
+        duplicate_timer.extend_from_slice(&words[timer_index..timer_index + 100]);
         assert!(matches!(
             discover_timer_host_bindings(&duplicate_timer, base),
             Err(HostBindingDiscoveryError::NonUniqueSemanticMatch {
