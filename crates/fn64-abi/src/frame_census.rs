@@ -218,6 +218,31 @@ struct Counters {
     exec_mirror_calls: u64,
     exec_guard_suspend_calls: u64,
     exec_guard_device_calls: u64,
+    /// The `resume NET` split, from `FN64_RESUME_SPLIT`. Zero when unset.
+    ///
+    /// `resume NET` is 83.2% of a WM2000 render field and had no sub-counters
+    /// -- the same position `executor_ns` was in one level up. These name it.
+    /// `resume_dispatch_ns` is INCLUSIVE of `gfx_ns` and `audio_lle_ns`, and
+    /// `resume_suspend_ns` is inclusive of `exec_guard_suspend_ns`, so the
+    /// report subtracts rather than sums (the report is the only place that
+    /// knows the nesting; see `resume_split_report`).
+    resume_reconcile_ns: u64,
+    resume_cop0_ns: u64,
+    resume_dispatch_ns: u64,
+    resume_invalidate_ns: u64,
+    resume_exit_ns: u64,
+    resume_suspend_ns: u64,
+    resume_resolve_ns: u64,
+    resume_hostcall_ns: u64,
+    resume_hostcall_calls: u64,
+    resume_reconcile_calls: u64,
+    resume_dispatch_calls: u64,
+    /// VI-presentation reachability, ungated. Counts which side of the
+    /// executor seam each presentation ran on, so "presentation is outside
+    /// `executor_ns`" is settled by observation rather than by call-graph
+    /// inference. `vi_present_in_executor_calls` is expected to be ZERO.
+    vi_present_in_executor_calls: u64,
+    vi_present_outside_executor_calls: u64,
     /// Phase-timer call counts, from `FN64_PHASE_TIMING`. Zero when unset.
     executor_calls: u64,
     gfx_calls: u64,
@@ -273,6 +298,19 @@ impl Counters {
             exec_mirror_calls: phase.exec_mirror_calls,
             exec_guard_suspend_calls: phase.exec_guard_suspend_calls,
             exec_guard_device_calls: phase.exec_guard_device_calls,
+            resume_reconcile_ns: phase.resume_reconcile_ns,
+            resume_cop0_ns: phase.resume_cop0_ns,
+            resume_dispatch_ns: phase.resume_dispatch_ns,
+            resume_invalidate_ns: phase.resume_invalidate_ns,
+            resume_exit_ns: phase.resume_exit_ns,
+            resume_suspend_ns: phase.resume_suspend_ns,
+            resume_resolve_ns: phase.resume_resolve_ns,
+            resume_hostcall_ns: phase.resume_hostcall_ns,
+            resume_hostcall_calls: phase.resume_hostcall_calls,
+            resume_reconcile_calls: phase.resume_reconcile_calls,
+            resume_dispatch_calls: phase.resume_dispatch_calls,
+            vi_present_in_executor_calls: phase.vi_present_in_executor_calls,
+            vi_present_outside_executor_calls: phase.vi_present_outside_executor_calls,
             executor_calls: phase.executor_calls,
             gfx_calls: phase.gfx_calls,
             gfx_lle_calls: phase.gfx_lle_calls,
@@ -317,6 +355,19 @@ impl Counters {
             exec_mirror_calls,
             exec_guard_suspend_calls,
             exec_guard_device_calls,
+            resume_reconcile_ns,
+            resume_cop0_ns,
+            resume_dispatch_ns,
+            resume_invalidate_ns,
+            resume_exit_ns,
+            resume_suspend_ns,
+            resume_resolve_ns,
+            resume_hostcall_ns,
+            resume_hostcall_calls,
+            resume_reconcile_calls,
+            resume_dispatch_calls,
+            vi_present_in_executor_calls,
+            vi_present_outside_executor_calls,
             executor_calls,
             gfx_calls,
             gfx_lle_calls,
@@ -334,7 +385,7 @@ impl Counters {
 
     /// Every counter as `(label, value)`, in report order. One list so the
     /// bucket diff cannot silently omit a counter the sampler collects.
-    fn labelled(&self) -> [(&'static str, u64); 29] {
+    fn labelled(&self) -> [(&'static str, u64); 42] {
         [
             ("gfx_tasks", self.gfx_tasks),
             ("audio_tasks", self.audio_tasks),
@@ -365,6 +416,25 @@ impl Counters {
             ("exec_mirror_calls", self.exec_mirror_calls),
             ("exec_guard_suspend_calls", self.exec_guard_suspend_calls),
             ("exec_guard_device_calls", self.exec_guard_device_calls),
+            ("resume_reconcile_ns", self.resume_reconcile_ns),
+            ("resume_cop0_ns", self.resume_cop0_ns),
+            ("resume_dispatch_ns", self.resume_dispatch_ns),
+            ("resume_invalidate_ns", self.resume_invalidate_ns),
+            ("resume_exit_ns", self.resume_exit_ns),
+            ("resume_suspend_ns", self.resume_suspend_ns),
+            ("resume_resolve_ns", self.resume_resolve_ns),
+            ("resume_hostcall_ns", self.resume_hostcall_ns),
+            ("resume_hostcall_calls", self.resume_hostcall_calls),
+            ("resume_reconcile_calls", self.resume_reconcile_calls),
+            ("resume_dispatch_calls", self.resume_dispatch_calls),
+            (
+                "vi_present_in_executor_calls",
+                self.vi_present_in_executor_calls,
+            ),
+            (
+                "vi_present_outside_executor_calls",
+                self.vi_present_outside_executor_calls,
+            ),
         ]
     }
 }
@@ -718,6 +788,53 @@ struct Bucket {
     p95_ms: f64,
     mean_ms: f64,
     counters: Counters,
+    /// Per-field p50/p95 for each `resume NET` phase, in ms.
+    ///
+    /// # Why a distribution and not just the mean
+    ///
+    /// The owner's complaint is not that emulation is slow on average -- it is
+    /// that it is CHOPPY. `pump_ms` (the shell's wrapper around exactly this
+    /// work) runs p50 ~20 ms with p95 67-88: **the step spikes 3-4x above its
+    /// own median**, and that is what breaks the pace. A mean-only split cannot
+    /// see that, and worse, it can hide it: one flat bucket and one spiky
+    /// bucket average into an unremarkable pair of numbers. Reporting means
+    /// where the distribution was the finding is the same error that hid the
+    /// render cost for a day, one level down.
+    ///
+    /// # Why it is free
+    ///
+    /// The per-field values already exist -- each `FieldSample` carries its own
+    /// counter DELTA, and this function already has the whole slice in hand and
+    /// currently just sums it. So percentiles need **no new clock reads in the
+    /// hot loop** and no retained state: they are computed here, at report
+    /// time, from data that was being discarded. `Bucket` stays `Copy`.
+    ///
+    /// # Why no regime threshold
+    ///
+    /// A tempting alternative was a low/high regime partition with a constant
+    /// boundary. Rejected: the windowed evidence that motivated it was revised
+    /// once already (asserted bimodal, actually trimodal), and **a threshold
+    /// constant bakes the current guess into the instrument**. Percentiles plus
+    /// the raw per-field dump (`FN64_FRAME_CENSUS_SEQUENCE`) let the clustering
+    /// be done on the bucket data afterward, so a wrong prior cannot be
+    /// encoded. See perf-method rule 29.
+    phase_p50_ms: PhasePercentiles,
+    phase_p95_ms: PhasePercentiles,
+}
+
+/// One value per `resume NET` phase, in report order. A struct rather than an
+/// array so a mis-ordered field is a compile error rather than a silently
+/// swapped column.
+#[derive(Debug, Clone, Copy, Default)]
+struct PhasePercentiles {
+    reconcile: f64,
+    cop0: f64,
+    dispatch: f64,
+    invalidate: f64,
+    exit: f64,
+    suspend: f64,
+    resolve: f64,
+    hostcall: f64,
 }
 
 impl Bucket {
@@ -769,8 +886,42 @@ impl Bucket {
                 exec_mirror_calls,
                 exec_guard_suspend_calls,
                 exec_guard_device_calls,
+                resume_reconcile_ns,
+                resume_cop0_ns,
+                resume_dispatch_ns,
+                resume_invalidate_ns,
+                resume_exit_ns,
+                resume_suspend_ns,
+                resume_resolve_ns,
+                resume_hostcall_ns,
+                resume_hostcall_calls,
+                resume_reconcile_calls,
+                resume_dispatch_calls,
+                vi_present_in_executor_calls,
+                vi_present_outside_executor_calls,
             );
         }
+        // Per-phase distributions, from the same per-field deltas summed
+        // above. Each field's phase cost is divided by that field's own field
+        // count, matching `per_field_ms` -- one advance can commit several
+        // overdue fields, and charging a multi-field advance's whole cost to
+        // one "frame" reports a latency nobody experienced.
+        let percentiles = |pick: fn(&Counters) -> u64| {
+            let mut v: Vec<f64> = samples
+                .iter()
+                .map(|s| pick(&s.counters) as f64 / 1.0e6 / f64::from(s.fields.max(1)))
+                .collect();
+            v.sort_by(f64::total_cmp);
+            (nearest_rank(&v, 50), nearest_rank(&v, 95))
+        };
+        let (reconcile_p50, reconcile_p95) = percentiles(|c| c.resume_reconcile_ns);
+        let (cop0_p50, cop0_p95) = percentiles(|c| c.resume_cop0_ns);
+        let (dispatch_p50, dispatch_p95) = percentiles(|c| c.resume_dispatch_ns);
+        let (invalidate_p50, invalidate_p95) = percentiles(|c| c.resume_invalidate_ns);
+        let (exit_p50, exit_p95) = percentiles(|c| c.resume_exit_ns);
+        let (suspend_p50, suspend_p95) = percentiles(|c| c.resume_suspend_ns);
+        let (resolve_p50, resolve_p95) = percentiles(|c| c.resume_resolve_ns);
+        let (hostcall_p50, hostcall_p95) = percentiles(|c| c.resume_hostcall_ns);
         Self {
             advances: ms.len(),
             fields,
@@ -779,6 +930,26 @@ impl Bucket {
             p95_ms: nearest_rank(&ms, 95),
             mean_ms: wall_ms / fields as f64,
             counters,
+            phase_p50_ms: PhasePercentiles {
+                reconcile: reconcile_p50,
+                cop0: cop0_p50,
+                dispatch: dispatch_p50,
+                invalidate: invalidate_p50,
+                exit: exit_p50,
+                suspend: suspend_p50,
+                resolve: resolve_p50,
+                hostcall: hostcall_p50,
+            },
+            phase_p95_ms: PhasePercentiles {
+                reconcile: reconcile_p95,
+                cop0: cop0_p95,
+                dispatch: dispatch_p95,
+                invalidate: invalidate_p95,
+                exit: exit_p95,
+                suspend: suspend_p95,
+                resolve: resolve_p95,
+                hostcall: hostcall_p95,
+            },
         }
     }
 }
@@ -1318,6 +1489,7 @@ fn population_report(split: &PopulationSplit) -> String {
         );
     }
     out.push_str(&executor_split_report(&fast, &slow));
+    out.push_str(&resume_split_report(&fast, &slow));
     out
 }
 
@@ -1441,6 +1613,237 @@ fn executor_split_report(fast: &Bucket, slow: &Bucket) -> String {
         "[executor-split] Read the SLOW row against the 16.667ms budget: that is the field the \
          60fps bar fails on. A saving in a row that is large on the fast row and small on the \
          slow one pays into the population that already has headroom.\n",
+    );
+    out
+}
+
+/// Split `resume NET` -- the 83.2% of a render field that the level above
+/// names but does not decompose.
+///
+/// # Why this exists
+///
+/// `executor_ns` was 61% of a render field with no sub-counters, and splitting
+/// it revealed that the named apparatus is only 16.4%: **deleting every guard,
+/// mirror and journal seam together leaves 46.8 ms against a 16.667 ms
+/// budget.** What remains -- `resume NET`, translated guest code plus the
+/// runtime it calls synchronously -- is where the 60fps bar is actually won or
+/// lost, and it was one undifferentiated bucket. This is the same rule 2 move,
+/// one level deeper.
+///
+/// # The nesting, which is the whole difficulty
+///
+/// Two of these rows are INCLUSIVE of counters reported elsewhere, and reading
+/// them as peers is precisely the error that hid the original 21.72 ms:
+///
+/// - `resume_dispatch_ns` contains `gfx_ns` and `audio_lle_ns`. The guest
+///   reaches graphics and audio by writing SP registers, which lands in
+///   `task_dispatch::rsp_commit` on the guest's own stack, inside the dispatch
+///   call. So "translated guest code" is `dispatch - gfx - audio`, and the
+///   report prints that subtraction rather than leaving it to the reader.
+/// - `resume_suspend_ns` is **retired and reads zero**: no timer spans the
+///   coroutine suspend, because `suspend_active_coroutine` is a stackful switch
+///   and a wall clock across it measures other threads' work. See the SUSPEND
+///   GAP row.
+///
+/// And one counter is deliberately NOT subtracted: `vi_present_ns` is not in
+/// this tree at all. See the reachability line the report prints.
+///
+/// # Closure is the honesty check
+///
+/// The seven phases plus a residual must sum to `resume NET`. The residual is
+/// printed unconditionally and as a percentage, because a decomposition that
+/// does not close is not a decomposition -- and if the residual is large, the
+/// residual is the finding rather than an embarrassment to be trimmed.
+fn resume_split_report(fast: &Bucket, slow: &Bucket) -> String {
+    let armed = fast.counters.resume_dispatch_ns > 0 || slow.counters.resume_dispatch_ns > 0;
+    let mut out = String::new();
+
+    // The reachability result travels FIRST and unconditionally, because it is
+    // ungated and answers a question the gated rows cannot: whether
+    // `vi_present_ns` belongs inside `executor_ns` at all. A warning that rides
+    // on a gate can be silenced by deselecting that gate (perf-method rule 27).
+    let inside = fast.counters.vi_present_in_executor_calls
+        + slow.counters.vi_present_in_executor_calls;
+    let outside = fast.counters.vi_present_outside_executor_calls
+        + slow.counters.vi_present_outside_executor_calls;
+    if inside == 0 && outside > 0 {
+        out.push_str(&format!(
+            "[resume-split] VI REACHABILITY: {outside} presentations, ALL outside run_one_step, \
+             0 inside. CONFIRMED BY OBSERVATION: vi_present_ns is NOT nested in executor_ns -- it \
+             runs on the harness's advance_virtual_time arm. Do not subtract it from executor \
+             self time.\n",
+        ));
+    } else if inside > 0 {
+        out.push_str(&format!(
+            "[resume-split] VI REACHABILITY: {inside} presentations INSIDE run_one_step and \
+             {outside} outside. REFUTED: vi_present_ns IS (at least partly) nested in \
+             executor_ns. The claim that presentation is harness-only is WRONG -- retract it.\n",
+        ));
+    } else {
+        out.push_str(
+            "[resume-split] VI REACHABILITY: no presentations observed; the seam is untested on \
+             this route, which is not the same as confirmed.\n",
+        );
+    }
+
+    if !armed {
+        out.push_str(
+            "[resume-split] NOT ARMED (FN64_RESUME_SPLIT unset). The resume NET decomposition is \
+             absent, not zero -- do not read this as 'the guest costs nothing'.\n",
+        );
+        return out;
+    }
+    out.push_str(
+        "[resume-split] resume NET decomposed into SIX phases plus a NAMED GAP. NESTING: \
+         gfx+audio are INSIDE dispatch. Rows marked (of ...) are nested, not peers.\n",
+    );
+    out.push_str(
+        "[resume-split] THE GAP IS DELIBERATE: suspend_active_coroutine is a stackful switch, \
+         so the executor runs OTHER threads before this stack continues. A timer spanning it \
+         measures wall time across a context switch -- measured -697% residual when tried. The \
+         part that matters is exec_guard_suspend_ns; the rest is executor scheduling and belongs \
+         to the parent counter. Named, not attributed.\n",
+    );
+    for (name, bucket) in [("fast", fast), ("slow", slow)] {
+        let fields = bucket.fields.max(1) as f64;
+        let c = &bucket.counters;
+        let ms = |ns: u64| ns as f64 / 1.0e6 / fields;
+        let per = |n: u64| n as f64 / fields;
+        // Re-derive resume NET here rather than inheriting a published figure:
+        // it is pinned to a binary (DISPATCH_SOURCE_SHA256) and a route, and a
+        // bucket subtracted from someone else's total is a cross-route
+        // subtraction wearing a disguise.
+        let resume_net = (ms(c.exec_resume_ns) - ms(c.exec_mirror_ns)
+            - ms(c.exec_guard_suspend_ns))
+        .max(0.0);
+        let reconcile = ms(c.resume_reconcile_ns);
+        let cop0 = ms(c.resume_cop0_ns);
+        let dispatch = ms(c.resume_dispatch_ns);
+        let invalidate = ms(c.resume_invalidate_ns);
+        let exit = ms(c.resume_exit_ns);
+        let suspend = ms(c.resume_suspend_ns);
+        let resolve = ms(c.resume_resolve_ns);
+        let hostcall = ms(c.resume_hostcall_ns);
+        let named =
+            reconcile + cop0 + dispatch + invalidate + exit + suspend + resolve + hostcall;
+        // Every phase has parked time subtracted by `ResumePhaseClock::lap`, so
+        // these are ON-STACK costs and should close against `resume NET` --
+        // which is itself wall-clock and therefore INCLUDES the time this
+        // coroutine spent suspended while other threads ran. The gap is that
+        // parked time: real, expected, positive, and not attributable to any
+        // phase of THIS stack.
+        let gap = resume_net - named;
+        // The quantity the whole exercise is for: recompiled MIPS plus the
+        // memory runtime, with the graphics and audio nested inside dispatch
+        // taken back out.
+        let gfx = ms(c.gfx_ns);
+        let audio = ms(c.audio_lle_ns);
+        // `dispatch` is now translated guest code DIRECTLY: graphics and audio
+        // are reached through OS-call shims, which are the `hostcall` bucket,
+        // so nothing needs subtracting out of dispatch. What remains inside
+        // `hostcall` after gfx+audio is the rest of the guest's OS-call surface.
+        let guest_code = dispatch;
+        let hostcall_other = (hostcall - gfx - audio).max(0.0);
+        let share = |v: f64| {
+            if resume_net > 0.0 {
+                100.0 * v / resume_net
+            } else {
+                0.0
+            }
+        };
+        out.push_str(&format!(
+            "[resume-split] {name}: resume NET={resume_net:.3}ms/field over {:.1} \
+             dispatches/field\n",
+            per(c.resume_dispatch_calls),
+        ));
+        for (label, value, nested) in [
+            ("reconcile @1033", reconcile, false),
+            ("cop0 sync + interrupts", cop0, false),
+            ("dispatch = TRANSLATED GUEST CODE", dispatch, false),
+            ("host calls (OS shims)", hostcall, false),
+            ("  (of) gfx_ns", gfx, true),
+            ("  (of) audio_lle_ns", audio, true),
+            ("  (of) other OS-call work", hostcall_other, true),
+            ("invalidate writes", invalidate, false),
+            ("exit + publish checkpoint", exit, false),
+            ("suspend (on-stack, parked subtracted)", suspend, false),
+            ("resolve next entry", resolve, false),
+        ] {
+            out.push_str(&format!(
+                "[resume-split] {name}:   {label:<34} {value:>8.3}ms/field {:>6.1}% of resume \
+                 NET{}\n",
+                share(value),
+                if nested { "  [nested]" } else { "" },
+            ));
+        }
+        out.push_str(&format!(
+            "[resume-split] {name}:   {:<34} {gap:>8.3}ms/field {:>6.1}% of resume NET  \
+             [CLOSURE: named={named:.3}]\n",
+            "PARKED (other threads ran)",
+            share(gap),
+        ));
+        // A NEGATIVE gap still means the instrument is broken: the phases claim
+        // more time than their own parent contains, which is impossible. That
+        // is the check that caught the lap-across-the-suspend defect, and it
+        // must survive the fix rather than be relaxed by it. A large POSITIVE
+        // gap is expected here and is not a failure.
+        if gap < 0.0 && share(gap.abs()) > 5.0 {
+            out.push_str(&format!(
+                "[resume-split] {name}: NEGATIVE GAP -- the phases claim MORE than resume NET \
+                 contains, which is impossible. The instrument is broken (a timer spanning the \
+                 coroutine suspend does this); do not read the phases above.\n",
+            ));
+        }
+        out.push_str(&format!(
+            "[resume-split] {name}: TRANSLATED GUEST CODE = {guest_code:.3}ms/field = {:.1}%. \
+             GRAPHICS+AUDIO = {:.3}ms/field = {:.1}%. DISPATCH-LOOP MACHINERY = {:.3}ms/field \
+             = {:.1}%.\n",
+            share(guest_code),
+            gfx + audio,
+            share(gfx + audio),
+            reconcile + cop0 + invalidate + exit + suspend + resolve + hostcall_other,
+            share(reconcile + cop0 + invalidate + exit + suspend + resolve + hostcall_other),
+        ));
+        // The DISTRIBUTION, because the owner's complaint is choppiness rather
+        // than slowness: the shell's `pump_ms` runs p50 ~20 with p95 67-88, so
+        // the step spikes 3-4x above its own median. A phase whose p95/p50 is
+        // far above the others is where that spike lives, and a mean-only
+        // table cannot show it.
+        let p50 = &bucket.phase_p50_ms;
+        let p95 = &bucket.phase_p95_ms;
+        for (label, a, b) in [
+            ("reconcile @1033", p50.reconcile, p95.reconcile),
+            ("cop0 sync + interrupts", p50.cop0, p95.cop0),
+            ("dispatch (GUEST)", p50.dispatch, p95.dispatch),
+            ("invalidate writes", p50.invalidate, p95.invalidate),
+            ("exit + publish checkpoint", p50.exit, p95.exit),
+            ("suspend (on-stack)", p50.suspend, p95.suspend),
+            ("host calls (OS shims)", p50.hostcall, p95.hostcall),
+            ("resolve next entry", p50.resolve, p95.resolve),
+        ] {
+            out.push_str(&format!(
+                "[resume-split] {name}: SPREAD {label:<28} p50={a:>8.3} p95={b:>8.3} \
+                 ms/field  p95/p50={:.1}x\n",
+                if a > 0.0 { b / a } else { 0.0 },
+            ));
+        }
+        out.push_str(&format!(
+            "[resume-split] {name}: field p50={:.3} p95={:.3} ms  p95/p50={:.1}x -- compare \
+             against the phase spreads above: the phase whose ratio matches the FIELD's is the \
+             one carrying the choppiness.\n",
+            bucket.p50_ms,
+            bucket.p95_ms,
+            if bucket.p50_ms > 0.0 {
+                bucket.p95_ms / bucket.p50_ms
+            } else {
+                0.0
+            },
+        ));
+    }
+    out.push_str(
+        "[resume-split] Read the SLOW row. If TRANSLATED GUEST CODE dominates, the bar is a \
+         code-quality problem and no amount of runtime trimming reaches it; if DISPATCH-LOOP \
+         OVERHEAD dominates, the per-step apparatus is the target.\n",
     );
     out
 }
@@ -1880,6 +2283,19 @@ mod tests {
             exec_mirror_calls: 1,
             exec_guard_suspend_calls: 1,
             exec_guard_device_calls: 1,
+            resume_reconcile_ns: 1,
+            resume_cop0_ns: 1,
+            resume_dispatch_ns: 1,
+            resume_invalidate_ns: 1,
+            resume_exit_ns: 1,
+            resume_suspend_ns: 1,
+            resume_resolve_ns: 1,
+            resume_hostcall_ns: 1,
+            resume_hostcall_calls: 1,
+            resume_reconcile_calls: 1,
+            resume_dispatch_calls: 1,
+            vi_present_in_executor_calls: 1,
+            vi_present_outside_executor_calls: 1,
         };
         let samples: Vec<FieldSample> = (0..10).map(|_| sample_with(20.0, ones)).collect();
         let refs: Vec<&FieldSample> = samples.iter().collect();
@@ -1968,6 +2384,250 @@ mod tests {
         assert!(
             text.contains("[nested]"),
             "nested rows must be marked so they are not read as peers; got:\n{text}"
+        );
+    }
+
+    /// Rule 6a one level deeper: an unarmed `resume NET` split must say ABSENT
+    /// rather than print a decomposition of zeros. A zero here would read as
+    /// "translated guest code costs nothing", which is the most misleading
+    /// sentence this module could emit.
+    #[test]
+    fn an_unarmed_resume_split_reports_absent_rather_than_zero() {
+        let split = PopulationSplit::from_samples(
+            &(0..40)
+                .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, Counters::default()))
+                .collect::<Vec<_>>(),
+            true,
+        )
+        .expect("40 samples");
+        let text = resume_split_report(&split.fast, &split.slow);
+        assert!(
+            text.contains("NOT ARMED") && text.contains("absent, not zero"),
+            "an unarmed resume split must distinguish absent from zero; got:\n{text}"
+        );
+        assert!(
+            !text.contains("TRANSLATED GUEST CODE ="),
+            "an unarmed split must not print a guest-code figure at all; got:\n{text}"
+        );
+    }
+
+    /// The arithmetic the whole report rests on: `dispatch` is INCLUSIVE of
+    /// graphics and audio, so translated guest code is the subtraction, and
+    /// the seven phases must close against a re-derived `resume NET`.
+    #[test]
+    fn resume_split_subtracts_nested_graphics_and_closes_against_resume_net() {
+        // resume NET = resume 20 - mirror 4 - guard@suspend 1 = 15ms.
+        // Phases: reconcile 1 + cop0 2 + dispatch 3 + invalidate 0.5
+        //       + exit 0.5 + resolve 0.4 + hostcall 7 = 14.4.
+        // PARKED = 15 - 14.4 = 0.6.
+        // gfx 6 + audio 1 nest inside HOSTCALL (7), not dispatch.
+        // TRANSLATED GUEST CODE is dispatch itself = 3.
+        let counters = Counters {
+            executor_ns: 25_000_000,
+            executor_calls: 100,
+            exec_resume_ns: 20_000_000,
+            exec_mirror_ns: 4_000_000,
+            exec_guard_suspend_ns: 1_000_000,
+            gfx_ns: 6_000_000,
+            audio_lle_ns: 1_000_000,
+            resume_reconcile_ns: 1_000_000,
+            resume_cop0_ns: 2_000_000,
+            resume_dispatch_ns: 3_000_000,
+            resume_dispatch_calls: 100,
+            resume_invalidate_ns: 500_000,
+            resume_exit_ns: 500_000,
+            resume_resolve_ns: 400_000,
+            resume_hostcall_ns: 7_000_000,
+            resume_hostcall_calls: 20,
+            vi_present_outside_executor_calls: 7,
+            ..Counters::default()
+        };
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, counters))
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = resume_split_report(&split.fast, &split.slow);
+
+        assert!(
+            text.contains("resume NET=15.000ms/field"),
+            "resume NET must be re-derived as 20-4-1=15, not inherited; got:\n{text}"
+        );
+        // The headline: dispatch IS translated guest code, 3ms.
+        assert!(
+            text.contains("TRANSLATED GUEST CODE = 3.000ms/field"),
+            "dispatch is translated guest code directly; got:\n{text}"
+        );
+        // gfx+audio nest in HOSTCALL and must not exceed it -- the inversion
+        // that a child exceeding its parent exposed on the real route.
+        assert!(
+            text.contains("host calls (OS shims)") && text.contains("7.000ms/field"),
+            "the host-call bucket must be its own row; got:\n{text}"
+        );
+        // Closure: 15 - 14.4 = 0.6, named as the suspend gap rather than
+        // absorbed into a phase or hidden.
+        assert!(
+            text.contains("PARKED (other threads ran)") && text.contains("0.600ms/field"),
+            "parked time must be reported so the split's closure is visible; got:\n{text}"
+        );
+        // A POSITIVE gap is expected and must not be flagged as brokenness.
+        assert!(
+            !text.contains("NEGATIVE GAP"),
+            "a positive suspend gap is the normal case, not an instrument fault; got:\n{text}"
+        );
+    }
+
+    /// The check that caught the real defect, pinned so the fix cannot relax
+    /// it. Phases claiming MORE than their own parent contains is impossible,
+    /// and it is exactly what a timer spanning the coroutine suspend produced
+    /// (-697% on the first smoke run). A positive gap is normal; a negative one
+    /// means the instrument is lying and the phases must not be read.
+    #[test]
+    fn phases_exceeding_resume_net_are_reported_as_a_broken_instrument() {
+        let counters = Counters {
+            executor_ns: 25_000_000,
+            executor_calls: 100,
+            exec_resume_ns: 10_000_000,
+            // 40ms of phases inside a 10ms parent: impossible.
+            resume_dispatch_ns: 40_000_000,
+            resume_dispatch_calls: 100,
+            ..Counters::default()
+        };
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, counters))
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = resume_split_report(&split.fast, &split.slow);
+        assert!(
+            text.contains("NEGATIVE GAP") && text.contains("instrument is broken"),
+            "phases exceeding resume NET must be called an instrument fault, not a finding; \
+             got:\n{text}"
+        );
+    }
+
+    /// A decomposition that does not close must SAY so. Pre-registered at 5%:
+    /// the point of a stated tolerance is that a large residual becomes the
+    /// finding rather than being quietly presented as a set of phases.
+    #[test]
+    fn the_suspend_gap_is_always_printed_even_when_it_dominates() {
+        // resume NET = 20ms with only 5ms on-stack: a 15ms suspend gap, 75% of
+        // the parent. That is a legitimate outcome once the clock stops at the
+        // switch -- but it must be VISIBLE, because an unnamed 75% is exactly
+        // how the original 21.72 ms stayed hidden for a session. The report
+        // must print it as a row and must not silently absorb it.
+        let counters = Counters {
+            executor_ns: 25_000_000,
+            executor_calls: 100,
+            exec_resume_ns: 20_000_000,
+            resume_dispatch_ns: 5_000_000,
+            resume_dispatch_calls: 100,
+            ..Counters::default()
+        };
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, counters))
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = resume_split_report(&split.fast, &split.slow);
+        assert!(
+            text.contains("PARKED (other threads ran)") && text.contains("15.000ms/field"),
+            "a dominating suspend gap must still be printed as its own row; got:\n{text}"
+        );
+        // It is a gap, not an instrument fault -- do not cry wolf on it.
+        assert!(
+            !text.contains("NEGATIVE GAP"),
+            "a positive gap is not brokenness; got:\n{text}"
+        );
+    }
+
+    /// A mean-only split cannot tell a flat bucket from a spiky one, and the
+    /// owner's complaint is choppiness rather than slowness. This pins that
+    /// the spread rows actually distinguish the two: same MEAN, different
+    /// distribution, and the report must say so.
+    #[test]
+    fn the_spread_rows_distinguish_a_spiky_phase_from_a_flat_one_at_equal_mean() {
+        // `dispatch` alternates 2ms / 18ms (mean 10, p95/p50 = 9x).
+        // `cop0` is a flat 10ms every field (mean 10, p95/p50 = 1x).
+        // A mean-only table would show these as identical.
+        let samples: Vec<FieldSample> = (0..40)
+            .map(|i| {
+                let spiky = if i % 2 == 0 { 2_000_000 } else { 18_000_000 };
+                sample_with(
+                    40.0,
+                    Counters {
+                        exec_resume_ns: 40_000_000,
+                        resume_dispatch_ns: spiky,
+                        resume_dispatch_calls: 1,
+                        resume_cop0_ns: 10_000_000,
+                        ..Counters::default()
+                    },
+                )
+            })
+            .collect();
+        let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+        let text = resume_split_report(&split.fast, &split.slow);
+
+        // Both phases carry the same total, so the mean rows agree...
+        assert!(
+            text.contains("SPREAD dispatch (GUEST)"),
+            "the spread rows must be emitted; got:\n{text}"
+        );
+        // ...and the spread rows must not.
+        let spiky_line = text
+            .lines()
+            .find(|l| l.contains("SPREAD dispatch (GUEST)"))
+            .expect("dispatch spread row");
+        let flat_line = text
+            .lines()
+            .find(|l| l.contains("SPREAD cop0"))
+            .expect("cop0 spread row");
+        assert!(
+            spiky_line.contains("9.0x"),
+            "an alternating 2/18ms phase must report a 9x spread; got:\n{spiky_line}"
+        );
+        assert!(
+            flat_line.contains("1.0x"),
+            "a constant phase must report a 1x spread; got:\n{flat_line}"
+        );
+    }
+
+    /// The VI reachability check must be able to REFUTE its own hypothesis.
+    /// A check that reports "confirmed" regardless of the state it inspects is
+    /// not a check (rule 6a), so both outcomes are pinned here.
+    #[test]
+    fn vi_reachability_reports_confirmation_and_refutation_distinctly() {
+        let confirming = Counters {
+            vi_present_outside_executor_calls: 12,
+            ..Counters::default()
+        };
+        let refuting = Counters {
+            vi_present_in_executor_calls: 3,
+            vi_present_outside_executor_calls: 9,
+            ..Counters::default()
+        };
+        let render = |counters| {
+            let samples: Vec<FieldSample> = (0..40)
+                .map(|i| sample_with(if i % 2 == 0 { 40.0 } else { 10.0 }, counters))
+                .collect();
+            let split = PopulationSplit::from_samples(&samples, true).expect("40 samples");
+            resume_split_report(&split.fast, &split.slow)
+        };
+        let confirmed = render(confirming);
+        assert!(
+            confirmed.contains("CONFIRMED BY OBSERVATION")
+                && confirmed.contains("NOT nested in executor_ns"),
+            "all-outside presentations must confirm the claim; got:\n{confirmed}"
+        );
+        let refuted = render(refuting);
+        assert!(
+            refuted.contains("REFUTED") && refuted.contains("retract it"),
+            "any inside-executor presentation must REFUTE the claim, not soften it; \
+             got:\n{refuted}"
+        );
+        // The two outcomes must be distinguishable, which is the property that
+        // makes this a check rather than a restatement.
+        assert_ne!(
+            confirmed.contains("REFUTED"),
+            refuted.contains("REFUTED"),
+            "the reachability check must distinguish its two outcomes"
         );
     }
 
@@ -2114,12 +2774,25 @@ mod tests {
             exec_mirror_calls: 1 << 26,
             exec_guard_suspend_calls: 1 << 27,
             exec_guard_device_calls: 1 << 28,
+            resume_reconcile_ns: 1 << 29,
+            resume_cop0_ns: 1 << 30,
+            resume_dispatch_ns: 1 << 31,
+            resume_invalidate_ns: 1 << 32,
+            resume_exit_ns: 1 << 33,
+            resume_suspend_ns: 1 << 34,
+            resume_resolve_ns: 1 << 35,
+            resume_hostcall_ns: 1 << 40,
+            resume_hostcall_calls: 1 << 41,
+            resume_reconcile_calls: 1 << 36,
+            resume_dispatch_calls: 1 << 37,
+            vi_present_in_executor_calls: 1 << 38,
+            vi_present_outside_executor_calls: 1 << 39,
         };
         let labelled = counters.labelled();
         let sum: u64 = labelled.iter().map(|&(_, v)| v).sum();
         assert_eq!(
             sum,
-            (1u64 << 29) - 1,
+            (1u64 << 42) - 1,
             "each distinct power of two must appear exactly once in `labelled`"
         );
         let mut names: Vec<&str> = labelled.iter().map(|&(n, _)| n).collect();

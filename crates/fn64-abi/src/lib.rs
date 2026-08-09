@@ -1919,16 +1919,33 @@ fn suspend_active_coroutine(yield_value: Yield) -> Resume {
     // ponytail: one flat cost; per-call calibration belongs to the R5
     // faithful-rate work if a title ever needs it.
     const C_LANE_OS_CALL_CYCLES: u32 = 250;
-    if !matches!(yield_value, Yield::InstructionCheckpoint { .. }) {
+    // THE one chokepoint every coroutine yield passes through, which is why
+    // the `resume NET` phase clock corrects itself here rather than at the 16
+    // scattered call sites that reach it. While this stack is parked the
+    // executor runs OTHER threads, so any phase timer that was running when
+    // the yield happened would otherwise charge their work to itself. See
+    // `ResumePhaseClock::lap`, which subtracts what this accumulates.
+    //
+    // Costs one `Instant::now` pair per yield ONLY when `FN64_RESUME_SPLIT` is
+    // armed -- `resume_split_enabled()` is a thread-local bool read, and on an
+    // unarmed run no clock is read at all.
+    let parked = crate::task_dispatch::resume_split_enabled().then(std::time::Instant::now);
+    let result = (|| {
+        if !matches!(yield_value, Yield::InstructionCheckpoint { .. }) {
+            #[cfg(feature = "recomp-rs")]
+            recompiled::checkpoint_catalog_host_transaction_before_suspend();
+            let _ = yielder.suspend(Yield::InstructionCheckpoint {
+                instructions: C_LANE_OS_CALL_CYCLES,
+            });
+        }
         #[cfg(feature = "recomp-rs")]
         recompiled::checkpoint_catalog_host_transaction_before_suspend();
-        let _ = yielder.suspend(Yield::InstructionCheckpoint {
-            instructions: C_LANE_OS_CALL_CYCLES,
-        });
+        yielder.suspend(yield_value)
+    })();
+    if let Some(parked) = parked {
+        crate::task_dispatch::note_suspended_ns(parked.elapsed().as_nanos() as u64);
     }
-    #[cfg(feature = "recomp-rs")]
-    recompiled::checkpoint_catalog_host_transaction_before_suspend();
-    yielder.suspend(yield_value)
+    result
 }
 
 // ---------------------------------------------------------------------
