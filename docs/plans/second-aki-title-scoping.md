@@ -584,3 +584,34 @@ receipt. The first reading would have parked this indefinitely.
 
 Recorded rather than fixed: it is an identity-artifact change and belongs with
 whoever owns the receipt schema.
+
+## RESOLVED: No Mercy passes 15/15 on the ON-DISK ROM (2026-08-08)
+
+The open variant question is closed. Ran the probe against the actual file
+rather than trusting the record:
+
+    $ cargo run --release -p fn64-discover --example probe_host_bindings -- \
+        $FN64_DISCOVER_NW4E_ROM
+    nomercy  OK  15/15
+
+**ROM digest `11640379fdf534b3…`** — the Unlocked variant on disk, NOT the "Rev A" the
+frontier doc's 15/15 was recorded against. Both pass.
+
+So the pessimistic branch does not fire: **No Mercy does not reclassify toward
+the blocked pile.** It remains the reachable second title, and the shard
+selector landed in `50d2c21` can now be pointed at a real generated tree.
+
+**Two process notes, both mine:**
+
+The record could not answer this. `corpus-certification-frontier.md:1811`
+files the result under the title string `"WWF No Mercy (Rev A)"` — a title,
+not a digest — so two facts agreed while describing possibly different ROMs.
+**The remedy already recorded above (state the ROM digest beside every
+per-title result) is applied here: the digest is in this section.**
+
+I also briefly concluded the probe "does not exist" because `git grep` over
+`crates/*/src/bin/*` returned nothing. It is an `examples/` target
+(`crates/fn64-discover/examples/probe_host_bindings.rs`, committed 2026-08-05),
+and the frontier doc names that path two lines above the table I was reading.
+A search of the wrong directory is indistinguishable from absence — the same
+shape as rule 20, self-inflicted while investigating.
