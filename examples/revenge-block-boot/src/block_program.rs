@@ -428,7 +428,7 @@ pub(crate) fn construct_catalog_program(
 pub(crate) fn issue_wm2000_host_function_catalog() -> fn64_abi::recompiled::AbiHostFunctionCatalogV1
 {
     use fn64_abi::recompiled::{AbiHostShimBindingV1 as Binding, AbiHostShimV1 as Shim};
-    fn64_abi::recompiled::issue_abi_host_function_catalog_v1(vec![
+    let mut bindings = vec![
         Binding {
             target_pc: pack::OS_SI_DEVICE_BUSY,
             shim: Shim::OsSiDeviceBusy,
@@ -489,6 +489,27 @@ pub(crate) fn issue_wm2000_host_function_catalog() -> fn64_abi::recompiled::AbiH
             target_pc: pack::OS_SP_TASK_YIELDED,
             shim: Shim::OsSpTaskYielded,
         },
-    ])
-    .expect("ABI-issued host-function catalog is exact and unambiguous")
+    ];
+    // The optional programmed-IO pair. Present only for a title whose save
+    // media is command-driven; an SRAM title resolves neither and the catalog
+    // stays exactly the fifteen above.
+    //
+    // Binding these matters because a `BlockExit::HostCall` whose vram has no
+    // catalog entry panics in `resolve_host_function` rather than falling back
+    // to guest code. Leaving them discovered-but-unbound would convert No
+    // Mercy's save-media fault into an unknown-host-call panic.
+    if let Some(target_pc) = pack::OS_EPI_WRITE_IO {
+        bindings.push(Binding {
+            target_pc,
+            shim: Shim::OsEPiWriteIo,
+        });
+    }
+    if let Some(target_pc) = pack::OS_EPI_READ_IO {
+        bindings.push(Binding {
+            target_pc,
+            shim: Shim::OsEPiReadIo,
+        });
+    }
+    fn64_abi::recompiled::issue_abi_host_function_catalog_v1(bindings)
+        .expect("ABI-issued host-function catalog is exact and unambiguous")
 }
