@@ -9,10 +9,14 @@
 //! validCount) % msgCount`, and the overlay helper calls the DMA routine in a
 //! retry loop before a blocking receive on its stack queue.
 //! The RSP task recognizers likewise follow the public task-load, start, yield,
-//! and yielded-query register/field behavior. Timer discovery follows the
-//! public o32 `osSetTimer` arguments, `OSTimer` fields, and list insertion
-//! behavior. Every role must have one unique structural match or discovery
-//! fails loudly.
+//! and yielded-query register/field behavior. `osSetEventMesg` scales the event
+//! selector by the documented eight-byte `OSEventState` stride and stores the
+//! queue and message through the resulting entry, between an interrupt disable
+//! and its matching restore. Timer discovery follows the public o32
+//! `osSetTimer` arguments and `OSTimer` fields, resolving the stack-passed
+//! arguments relative to the callee's own frame so that builds which inline the
+//! list walk and builds which delegate it are both recognized. Every role must
+//! have one unique structural match or discovery fails loudly.
 
 use crate::cfg::{classify_control, BlockTerminator, Cfg, ControlOp, WordClass};
 use crate::facts::FactDb;
@@ -23,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum HostBindingSymbol {
     OsCreateMesgQueue,
     OsCreateThread,
+    OsDriveRomInit,
     OsEPiStartDma,
     OsGetThreadPri,
     OsRecvMesg,
@@ -36,7 +41,24 @@ pub enum HostBindingSymbol {
     OsSpTaskYield,
     OsSpTaskYielded,
     OsStartThread,
+    /// `osEPiWriteIo(OSPiHandle *, u32 devAddr, u32 data)`.
+    OsEPiWriteIo,
+    /// `osEPiReadIo(OSPiHandle *, u32 devAddr, u32 *data)`.
+    OsEPiReadIo,
 }
+
+/// The programmed-IO roles, discovered separately from
+/// [`WM_BLOCK_RUNTIME_HOST_SYMBOLS`] and deliberately NOT part of it.
+///
+/// These are optional by construction. A title that saves to SRAM reaches its
+/// save device entirely through PI DMA and never links these routines, so
+/// requiring them would fail discovery for the three titles that already
+/// resolve 15/15. A title that saves to FlashRAM issues its commands through
+/// them, and leaving them unbound means the guest's own recompiled copy drives
+/// raw hardware -- which is the No Mercy fault at pc `0x8003d518`, a `sw` into
+/// the FlashRAM command window at `0xA801_0000`.
+pub const PROGRAMMED_IO_HOST_SYMBOLS: [HostBindingSymbol; 2] =
+    [HostBindingSymbol::OsEPiReadIo, HostBindingSymbol::OsEPiWriteIo];
 
 /// Exact installed host target denominator shared by the WM production build
 /// and its executable-source receipt validator.
@@ -79,6 +101,7 @@ impl HostBindingSymbol {
         match self {
             Self::OsCreateMesgQueue
             | Self::OsCreateThread
+            | Self::OsDriveRomInit
             | Self::OsEPiStartDma
             | Self::OsGetThreadPri
             | Self::OsRecvMesg
@@ -91,7 +114,9 @@ impl HostBindingSymbol {
             | Self::OsSpTaskStartGo
             | Self::OsSpTaskYield
             | Self::OsSpTaskYielded
-            | Self::OsStartThread => HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev,
+            | Self::OsStartThread
+            | Self::OsEPiWriteIo
+            | Self::OsEPiReadIo => HostCurrentStatusEffect::CBridgeRuntimeEnforcedPreservesBev,
         }
     }
 
@@ -99,6 +124,7 @@ impl HostBindingSymbol {
         match self {
             Self::OsCreateThread => HostSpawnedStatusEffect::InheritsCallerClearingFr,
             Self::OsCreateMesgQueue
+            | Self::OsDriveRomInit
             | Self::OsEPiStartDma
             | Self::OsGetThreadPri
             | Self::OsRecvMesg
@@ -111,7 +137,9 @@ impl HostBindingSymbol {
             | Self::OsSpTaskStartGo
             | Self::OsSpTaskYield
             | Self::OsSpTaskYielded
-            | Self::OsStartThread => HostSpawnedStatusEffect::None,
+            | Self::OsStartThread
+            | Self::OsEPiWriteIo
+            | Self::OsEPiReadIo => HostSpawnedStatusEffect::None,
         }
     }
 }
@@ -311,10 +339,6 @@ fn is_move_addu(word: u32, target: u32, source: u32) -> bool {
         && ((rs(word) == source && rt(word) == 0) || (rt(word) == source && rs(word) == 0))
 }
 
-fn is_zero_addu(word: u32, target: u32) -> bool {
-    op(word) == 0 && word & 0x3f == 0x21 && rd(word) == target && rs(word) == 0 && rt(word) == 0
-}
-
 fn is_jr_ra(word: u32) -> bool {
     op(word) == 0 && word & 0x3f == 8 && rs(word) == 31
 }
@@ -339,17 +363,63 @@ fn jal_field(word: u32) -> Option<u32> {
     (op(word) == 3).then_some(word & 0x03ff_ffff)
 }
 
+/// `osCreateMesgQueue(mq, msg, count)` initializes the documented six-word
+/// `OSMesgQueue` through `$a0`: both thread queues are set to the same
+/// "no waiting thread" sentinel, `validCount` and `first` are zeroed, and the
+/// caller's count and buffer are stored.
+///
+/// Which register carries the sentinel, and whether the compiler materializes
+/// it once or once per store, is a register-allocation artifact rather than
+/// ABI behavior: the 1996-era build loads it into two registers where the
+/// 1998-era build reuses one. Pinning `$v0` and a fixed store order therefore
+/// described a particular compilation instead of the documented behavior, so
+/// the sentinel is identified by the address it computes and the store order
+/// is left free. Requiring both queue heads to receive the *same* computed
+/// address is what keeps this a queue-initializer predicate rather than
+/// "any six stores through `$a0`".
 fn is_create_mesg_queue(words: &[u32]) -> bool {
-    words.len() >= 9
-        && is_lui(words[0], 2)
-        && is_addiu(words[1], 2, 2, imm(words[1]))
-        && is_sw(words[2], 2, 4, 0)
-        && is_sw(words[3], 2, 4, 4)
-        && is_sw(words[4], 0, 4, 8)
-        && is_sw(words[5], 0, 4, 12)
-        && is_sw(words[6], 6, 4, 16)
-        && is_jr_ra(words[7])
-        && is_sw(words[8], 5, 4, 20)
+    if words.len() < 9 {
+        return false;
+    }
+    let stored_to_queue = |offset: i16, source: u32| {
+        words
+            .iter()
+            .any(|&word| is_sw(word, source, 4, offset))
+    };
+    // validCount and first are zeroed; msgCount and msg come from the o32
+    // third and second arguments.
+    if !(stored_to_queue(8, 0)
+        && stored_to_queue(12, 0)
+        && stored_to_queue(16, 6)
+        && stored_to_queue(20, 5))
+    {
+        return false;
+    }
+    if !words.iter().any(|&word| is_jr_ra(word)) {
+        return false;
+    }
+    let queue_head_source = |offset: i16| {
+        words
+            .iter()
+            .find(|&&word| op(word) == 0x2b && rs(word) == 4 && imm(word) == offset)
+            .map(|&word| rt(word))
+    };
+    let (Some(mtqueue), Some(fullqueue)) = (queue_head_source(0), queue_head_source(4)) else {
+        return false;
+    };
+    // Fold the lui/addiu pair that forms each queue head's value so the two
+    // are compared by the address they denote, not by register identity.
+    let sentinel = |register: u32| {
+        let high = words.iter().find(|&&word| is_lui(word, register))?;
+        let low = words
+            .iter()
+            .find(|&&word| op(word) == 9 && rt(word) == register && rs(word) == register)?;
+        Some(absolute_from_lui_offset(*high, imm(*low)))
+    };
+    match (sentinel(mtqueue), sentinel(fullqueue)) {
+        (Some(first), Some(second)) => first == second,
+        _ => false,
+    }
 }
 
 fn is_epi_start_dma(words: &[u32]) -> bool {
@@ -1039,30 +1109,195 @@ fn is_create_thread(words: &[u32]) -> bool {
         && sw(0x12c).is_some()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetEventMesgValue {
+    Unknown,
+    /// The `OSEvent` selector, o32 argument one.
+    Event,
+    /// The `OSMesgQueue *`, o32 argument two.
+    Queue,
+    /// The `OSMesg`, o32 argument three.
+    Mesg,
+    /// A statically formed address, i.e. the event-state table base.
+    TableBase,
+    /// The event selector scaled by the documented eight-byte entry stride.
+    ScaledIndex,
+    /// `&table[event]`: the scaled index added to the table base.
+    EntryPointer,
+    /// The interrupt mask returned by the disable call, to be handed back to
+    /// the matching restore call.
+    SavedMask,
+}
+
+/// Recognize the public `osSetEventMesg(OSEvent, OSMesgQueue *, OSMesg)`.
+///
+/// Every clause below is a published-ABI property of the routine, not a
+/// property of any particular compilation of it:
+///
+/// * it is a routine with a stack frame it restores before `jr $ra`;
+/// * the three o32 argument registers carry the event, queue and message,
+///   and each must survive the interrupt-disable call to be used afterwards;
+/// * the table update is bracketed by an interrupt disable and a restore, and
+///   the mask the disable returns is the argument the restore consumes;
+/// * the event selector is scaled by eight, the `OSEventState` entry stride
+///   (one `OSMesgQueue *` plus one `OSMesg`);
+/// * the scaled index is added to a statically formed table base to form the
+///   entry address; and
+/// * the queue is stored at entry offset zero and the message at offset four.
+///
+/// No register assignment, instruction schedule, table address or event
+/// constant is pinned. Builds that special-case `OS_EVENT_PRENMI` after the
+/// store and builds that do not are both accepted, because that branch is not
+/// part of the routine's documented contract.
 fn is_set_event_mesg(words: &[u32]) -> bool {
-    words.len() >= 19
-        && is_addiu(words[0], 29, 29, imm(words[0]))
-        && imm(words[0]) < 0
-        && is_move_addu(words[2], 16, 4)
-        && is_move_addu(words[4], 17, 5)
-        && is_move_addu(words[6], 18, 6)
-        && jal_target(words[8], 0).is_some()
-        && op(words[10]) == 0
-        && words[10] & 0x3f == 0
-        && rt(words[10]) == 16
-        && rd(words[10]) == 3
-        && (words[10] >> 6 & 31) == 3
-        && is_addiu(words[12], 4, 4, imm(words[12]))
-        && op(words[13]) == 0
-        && words[13] & 0x3f == 0x21
-        && rd(words[13]) == 3
-        && rs(words[13]) == 3
-        && rt(words[13]) == 4
-        && is_move_addu(words[14], 19, 2)
-        && is_addiu(words[15], 2, 0, 14)
-        && is_sw(words[16], 17, 3, 0)
-        && is_bne(words[17], 16, 2)
-        && is_sw(words[18], 18, 3, 4)
+    use SetEventMesgValue as V;
+
+    const MIN_WORDS: usize = 8;
+    if words.len() < MIN_WORDS || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return false;
+    }
+    let frame_size = imm(words[0]);
+
+    let mut registers = [V::Unknown; 32];
+    registers[4] = V::Event;
+    registers[5] = V::Queue;
+    registers[6] = V::Mesg;
+    let mut spill: BTreeMap<i16, V> = BTreeMap::new();
+    let mut calls = 0usize;
+    let mut restored_mask = false;
+    let mut stored_queue = false;
+    let mut stored_mesg = false;
+    let mut saw_return = false;
+
+    let mut index = 1;
+    while index < words.len() {
+        let word = words[index];
+        if is_jr_ra(word) {
+            // The frame must be given back in the return's delay slot.
+            saw_return = words
+                .get(index + 1)
+                .is_some_and(|&slot| is_addiu(slot, 29, 29, frame_size.wrapping_neg()));
+            break;
+        }
+        if jal_field(word).is_some() {
+            if let Some(&slot) = words.get(index + 1) {
+                set_event_step(&mut registers, &mut spill, slot, &mut stored_queue, &mut stored_mesg);
+            }
+            // A restore call consumes the mask the disable call produced.
+            if calls > 0 && registers[4] == V::SavedMask {
+                restored_mask = true;
+            }
+            calls += 1;
+            for caller_saved in (1usize..16).chain([24usize, 25, 31]) {
+                registers[caller_saved] = V::Unknown;
+            }
+            registers[2] = if calls == 1 { V::SavedMask } else { V::Unknown };
+            index += 2;
+            continue;
+        }
+        set_event_step(&mut registers, &mut spill, word, &mut stored_queue, &mut stored_mesg);
+        index += 1;
+    }
+
+    saw_return && calls >= 2 && restored_mask && stored_queue && stored_mesg
+}
+
+fn set_event_step(
+    registers: &mut [SetEventMesgValue; 32],
+    spill: &mut BTreeMap<i16, SetEventMesgValue>,
+    word: u32,
+    stored_queue: &mut bool,
+    stored_mesg: &mut bool,
+) {
+    use SetEventMesgValue as V;
+
+    match op(word) {
+        // sw: either a callee-saved spill or a field write through the entry.
+        0x2b => {
+            let source = registers[rt(word) as usize];
+            if rs(word) == 29 {
+                spill.insert(imm(word), source);
+            } else if registers[rs(word) as usize] == V::EntryPointer {
+                match (imm(word), source) {
+                    (0, V::Queue) => *stored_queue = true,
+                    (4, V::Mesg) => *stored_mesg = true,
+                    _ => {}
+                }
+            }
+        }
+        // lw: reloading a spilled argument restores its tag.
+        0x23 => {
+            if rt(word) != 0 {
+                registers[rt(word) as usize] = if rs(word) == 29 {
+                    spill.get(&imm(word)).copied().unwrap_or(V::Unknown)
+                } else {
+                    V::Unknown
+                };
+            }
+        }
+        0 => {
+            let destination = rd(word) as usize;
+            if destination == 0 {
+                return;
+            }
+            match word & 0x3f {
+                // sll by three is the documented eight-byte entry stride.
+                0x00 => {
+                    registers[destination] =
+                        if (word >> 6 & 31) == 3 && registers[rt(word) as usize] == V::Event {
+                            V::ScaledIndex
+                        } else {
+                            V::Unknown
+                        };
+                }
+                // addu/or: register moves propagate, index+base forms the entry.
+                0x21 | 0x2d | 0x25 => {
+                    let left = registers[rs(word) as usize];
+                    let right = registers[rt(word) as usize];
+                    registers[destination] = if rt(word) == 0 {
+                        left
+                    } else if rs(word) == 0 {
+                        right
+                    } else if matches!(
+                        (left, right),
+                        (V::ScaledIndex, V::TableBase) | (V::TableBase, V::ScaledIndex)
+                    ) {
+                        V::EntryPointer
+                    } else {
+                        V::Unknown
+                    };
+                }
+                // jr/jalr write no general register we track.
+                0x08 | 0x09 => {}
+                _ => registers[destination] = V::Unknown,
+            }
+        }
+        // lui begins a statically formed address.
+        0x0f => {
+            if rt(word) != 0 {
+                registers[rt(word) as usize] = V::TableBase;
+            }
+        }
+        // addiu/ori complete a statically formed address.
+        0x09 | 0x0d => {
+            if rt(word) != 0 {
+                registers[rt(word) as usize] = if rs(word) != 29
+                    && registers[rs(word) as usize] == V::TableBase
+                {
+                    V::TableBase
+                } else {
+                    V::Unknown
+                };
+            }
+        }
+        // Branches and jumps write nothing we track.
+        0x02..=0x07 | 0x14..=0x17 | 0x01 => {}
+        _ => {
+            if rt(word) != 0 && !is_store_opcode(op(word)) {
+                registers[rt(word) as usize] = V::Unknown;
+            }
+        }
+    }
 }
 
 fn is_start_thread(words: &[u32]) -> bool {
@@ -1184,38 +1419,211 @@ fn is_sp_task_load(words: &[u32]) -> bool {
         && is_addiu(words[130], 29, 29, -imm(words[0]))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SetTimerValue {
+    Unknown,
+    /// Anything provably zero, used to clear the unlinked list pointers.
+    Zero,
+    /// The `OSTimer *`, o32 argument one.
+    Timer,
+    /// High and low words of the `countdown` argument. Under o32 the first
+    /// 64-bit argument after the pointer is eight-byte aligned, so it occupies
+    /// `$a2`/`$a3`... which is the *interval*; `countdown` therefore arrives in
+    /// the caller's argument save area. See the offsets computed below.
+    CountdownHigh,
+    CountdownLow,
+    /// High and low words of the `interval` argument, in `$a2`/`$a3`.
+    IntervalHigh,
+    IntervalLow,
+    /// The destination `OSMesgQueue *`, from the argument save area.
+    Queue,
+    /// The `OSMesg`, from the argument save area.
+    Mesg,
+}
+
+/// Recognize the public
+/// `osSetTimer(OSTimer *, OSTime countdown, OSTime interval, OSMesgQueue *, OSMesg)`.
+///
+/// Every clause is a published-ABI property of the routine:
+///
+/// * it is a routine with a stack frame it restores before `jr $ra`;
+/// * `$a0` is the `OSTimer *`, and `$a2`/`$a3` carry the 64-bit `interval`
+///   (o32 eight-byte-aligns the first 64-bit argument after the pointer, so
+///   `countdown` spills to the caller's argument save area at `frame + 16`,
+///   with the queue and message following at `frame + 24` and `frame + 28`);
+/// * the eight documented `OSTimer` words are written at their documented
+///   offsets: `next`/`prev` cleared because the timer is not yet linked,
+///   `value` from `countdown`, `interval` from `interval`, then `mq` and
+///   `msg`; and
+/// * an `interval` of zero makes the timer one-shot, so on that path `interval`
+///   is also written from the `countdown` argument.
+///
+/// The stack-argument offsets are derived from the frame size rather than
+/// pinned, so a build that inlines the timer-list walk and a build that
+/// delegates it are both accepted despite their different frames. No register
+/// assignment, instruction schedule or callee address is pinned.
 fn is_set_timer(words: &[u32]) -> bool {
-    words.len() >= 75
-        && is_addiu(words[0], 29, 29, -32)
-        // o32 stack arguments become sp+0x30..0x3c after this frame: the
-        // interval high/low words, destination queue, and message.
-        && is_lw_at(words[1], 2, 29, 0x30)
-        && is_lw_at(words[2], 3, 29, 0x34)
-        && is_move_addu(words[4], 16, 4)
-        // Public OSTimer linkage/deadline/interval/route fields.
-        && is_sw(words[8], 0, 16, 0)
-        && is_sw(words[9], 0, 16, 4)
-        && is_sw(words[10], 6, 16, 0x10)
-        && is_sw(words[11], 7, 16, 0x14)
-        && is_sw(words[12], 2, 16, 8)
-        && is_sw(words[13], 3, 16, 0x0c)
-        && is_lw_at(words[14], 4, 29, 0x38)
-        && is_lw_at(words[15], 5, 29, 0x3c)
-        && is_sw(words[17], 4, 16, 0x18)
-        && is_sw(words[19], 4, 16, 0x18)
-        && is_sw(words[20], 2, 16, 0x10)
-        && is_sw(words[21], 3, 16, 0x14)
-        && is_sw(words[22], 4, 16, 0x18)
-        && jal_field(words[23]).is_some()
-        && is_sw(words[24], 5, 16, 0x1c)
-        && jal_field(words[30]).is_some()
-        && jal_field(words[58]).is_some()
-        && is_move_addu(words[59], 4, 16)
-        && jal_field(words[64]).is_some()
-        && jal_field(words[66]).is_some()
-        && is_zero_addu(words[68], 2)
-        && is_jr_ra(words[73])
-        && is_addiu(words[74], 29, 29, 32)
+    use SetTimerValue as V;
+
+    const MIN_WORDS: usize = 12;
+    if words.len() < MIN_WORDS || !is_addiu(words[0], 29, 29, imm(words[0])) || imm(words[0]) >= 0 {
+        return false;
+    }
+    let frame_size = i32::from(imm(words[0])).unsigned_abs();
+    let (
+        Ok(countdown_high_slot),
+        Ok(countdown_low_slot),
+        Ok(queue_slot),
+        Ok(mesg_slot),
+    ) = (
+        i16::try_from(frame_size + 16),
+        i16::try_from(frame_size + 20),
+        i16::try_from(frame_size + 24),
+        i16::try_from(frame_size + 28),
+    ) else {
+        return false;
+    };
+
+    let mut registers = [V::Unknown; 32];
+    registers[0] = V::Zero;
+    registers[4] = V::Timer;
+    registers[6] = V::IntervalHigh;
+    registers[7] = V::IntervalLow;
+    let mut spill: BTreeMap<i16, V> = BTreeMap::new();
+    // Every value observed written to each `OSTimer` word, across all paths.
+    let mut fields: BTreeMap<i16, BTreeSet<V>> = BTreeMap::new();
+    let mut saw_return = false;
+
+    let mut index = 1;
+    while index < words.len() {
+        let word = words[index];
+        if is_jr_ra(word) {
+            saw_return = words
+                .get(index + 1)
+                .is_some_and(|&slot| is_addiu(slot, 29, 29, imm(words[0]).wrapping_neg()));
+            break;
+        }
+        if jal_field(word).is_some() {
+            if let Some(&slot) = words.get(index + 1) {
+                set_timer_step(
+                    &mut registers,
+                    &mut spill,
+                    &mut fields,
+                    slot,
+                    countdown_high_slot,
+                    countdown_low_slot,
+                    queue_slot,
+                    mesg_slot,
+                );
+            }
+            for caller_saved in (1usize..16).chain([24usize, 25, 31]) {
+                registers[caller_saved] = V::Unknown;
+            }
+            index += 2;
+            continue;
+        }
+        set_timer_step(
+            &mut registers,
+            &mut spill,
+            &mut fields,
+            word,
+            countdown_high_slot,
+            countdown_low_slot,
+            queue_slot,
+            mesg_slot,
+        );
+        index += 1;
+    }
+
+    let wrote = |offset: i16, value: V| {
+        fields
+            .get(&offset)
+            .is_some_and(|values| values.contains(&value))
+    };
+
+    saw_return
+        // Not yet linked into the timer list.
+        && wrote(0x00, V::Zero)
+        && wrote(0x04, V::Zero)
+        // value = countdown
+        && wrote(0x08, V::CountdownHigh)
+        && wrote(0x0c, V::CountdownLow)
+        // interval = interval
+        && wrote(0x10, V::IntervalHigh)
+        && wrote(0x14, V::IntervalLow)
+        // A zero interval means one-shot at countdown.
+        && wrote(0x10, V::CountdownHigh)
+        && wrote(0x14, V::CountdownLow)
+        // Where the expiry message is delivered.
+        && wrote(0x18, V::Queue)
+        && wrote(0x1c, V::Mesg)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_timer_step(
+    registers: &mut [SetTimerValue; 32],
+    spill: &mut BTreeMap<i16, SetTimerValue>,
+    fields: &mut BTreeMap<i16, BTreeSet<SetTimerValue>>,
+    word: u32,
+    countdown_high_slot: i16,
+    countdown_low_slot: i16,
+    queue_slot: i16,
+    mesg_slot: i16,
+) {
+    use SetTimerValue as V;
+
+    match op(word) {
+        0x2b => {
+            let source = registers[rt(word) as usize];
+            if rs(word) == 29 {
+                spill.insert(imm(word), source);
+            } else if registers[rs(word) as usize] == V::Timer {
+                fields.entry(imm(word)).or_default().insert(source);
+            }
+        }
+        0x23 => {
+            if rt(word) != 0 {
+                registers[rt(word) as usize] = if rs(word) == 29 {
+                    match imm(word) {
+                        offset if offset == countdown_high_slot => V::CountdownHigh,
+                        offset if offset == countdown_low_slot => V::CountdownLow,
+                        offset if offset == queue_slot => V::Queue,
+                        offset if offset == mesg_slot => V::Mesg,
+                        offset => spill.get(&offset).copied().unwrap_or(V::Unknown),
+                    }
+                } else {
+                    V::Unknown
+                };
+            }
+        }
+        0 => {
+            let destination = rd(word) as usize;
+            if destination == 0 {
+                return;
+            }
+            match word & 0x3f {
+                // Register moves propagate the tracked value.
+                0x21 | 0x2d | 0x25 => {
+                    registers[destination] = if rt(word) == 0 {
+                        registers[rs(word) as usize]
+                    } else if rs(word) == 0 {
+                        registers[rt(word) as usize]
+                    } else {
+                        V::Unknown
+                    };
+                }
+                0x08 | 0x09 => {}
+                _ => registers[destination] = V::Unknown,
+            }
+        }
+        // Branches and jumps write nothing we track.
+        0x02..=0x07 | 0x14..=0x17 | 0x01 => {}
+        _ => {
+            if rt(word) != 0 && !is_store_opcode(op(word)) {
+                registers[rt(word) as usize] = V::Unknown;
+            }
+        }
+    }
 }
 
 fn is_sp_task_start_go(words: &[u32], busy: u32, set_status: u32) -> bool {
@@ -1297,10 +1705,40 @@ fn unique_match(
         .collect::<Vec<_>>();
     candidates.sort_unstable();
     candidates.dedup();
+    let candidates = collapse_overlapping_runs(&candidates);
     match candidates.as_slice() {
         [address] => Ok(*address),
         _ => Err(HostBindingDiscoveryError::NonUniqueSemanticMatch { symbol, candidates }),
     }
+}
+
+/// Collapse a run of consecutive word addresses to its last address.
+///
+/// An order-free predicate over a window wider than the routine also matches
+/// when the window merely *contains* the routine, so one routine matches at
+/// several adjacent start offsets. Those are one candidate reported several
+/// times, not several routines, and counting them separately would report a
+/// correct predicate as ambiguous.
+///
+/// The run's last address is the reported one because that is the latest start
+/// whose window still satisfies the predicate, which is the routine's own
+/// entry; earlier starts only match by including preceding filler. Callers
+/// resolve `jal` targets against this address, so returning a run's first
+/// address would name an instruction inside the caller's padding instead of
+/// the function entry. Only strictly adjacent (4-byte apart) addresses are
+/// collapsed: two genuinely distinct routines are never adjacent at word
+/// granularity, so this cannot merge real duplicates.
+fn collapse_overlapping_runs(sorted: &[u32]) -> Vec<u32> {
+    let mut collapsed: Vec<u32> = Vec::new();
+    for &address in sorted {
+        if collapsed.last() == Some(&address.wrapping_sub(4)) {
+            // Extend the current run: the entry is its latest start.
+            *collapsed.last_mut().expect("run has a first address") = address;
+        } else {
+            collapsed.push(address);
+        }
+    }
+    collapsed
 }
 
 fn unique_create_thread_match(
@@ -1345,6 +1783,236 @@ fn is_si_device_busy(words: &[u32]) -> bool {
         && rd(words[5]) == 2
         && rs(words[5]) == 0
         && rt(words[5]) == 2
+}
+
+/// The body of a public `__osEPiRaw{Read,Write}Io`, validated through the
+/// wrapper that calls it.
+///
+/// Every clause is a published property of the routine rather than of one
+/// compilation: `OSPiHandle.baseAddress` lives at the documented offset 12, the
+/// caller's `devAddr` is ORed into it, the result is forced to the uncached
+/// KSEG1 view, and exactly one device access is performed through the pointer
+/// so formed. A routine that never builds an uncached PI device pointer out of
+/// `handle + 12` is not this routine, whatever else it resembles.
+///
+/// This exists because the wrapper shape alone is not decisive. A routine that
+/// preserves three arguments across a bracketed call is a common compiler
+/// idiom; measured over a 287-ROM corpus it is what Rogue Squadron's
+/// table-search helper and Turok 3's forwarding wrappers look like too.
+/// Checking the callee is what separates PI device IO from those.
+fn is_raw_epi_device_io(words: &[u32]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        // The handle's public `baseAddress` field, loaded from `$a0`.
+        if !(op(*word) == 0x23 && imm(*word) == 12 && rs(*word) == 4) {
+            return false;
+        }
+        let tail = &words[index + 1..words.len().min(index + 6)];
+        // The uncached KSEG1 device view, the devAddr merge, and the single
+        // access through the resulting pointer.
+        tail.iter()
+            .any(|word| op(*word) == 0x0f && rs(*word) == 0 && (*word & 0xffff) == 0xa000)
+            && tail.iter().any(|word| op(*word) == 0 && word & 0x3f == 0x25)
+            && tail
+                .iter()
+                .any(|word| op(*word) == 0x23 || op(*word) == 0x2b)
+    })
+}
+
+/// Recognize the public `osEPiWriteIo(OSPiHandle *, u32 devAddr, u32 data)` and
+/// `osEPiReadIo(OSPiHandle *, u32 devAddr, u32 *data)`.
+///
+/// Both are the same published shape -- acquire the PI bus, perform one raw
+/// device access, release it -- and differ only in which raw routine sits in
+/// the middle. The caller resolves that distinction; this predicate identifies
+/// the bracketed-IO shape and returns the three call targets in program order.
+///
+/// The clauses, each a property of the public routine:
+///
+/// * it builds a stack frame with a negative immediate and restores exactly
+///   that frame in the `jr $ra` delay slot;
+/// * it saves `$ra`, because it makes calls;
+/// * each of the three o32 arguments is moved to a callee-saved register
+///   before the first call, since each must survive it;
+/// * it makes exactly three calls, in the order acquire, raw op, release;
+/// * acquire and release are distinct entry points (`__osPiGetAccess` and
+///   `__osPiRelAccess` are different routines);
+/// * the acquire call is argument-free -- `__osPiGetAccess(void)` takes no
+///   arguments, so nothing may write `$a0`/`$a1`/`$a2` before it; and
+/// * the three preserved arguments are routed back into `$a0`/`$a1`/`$a2` for
+///   the raw op.
+///
+/// No register number, instruction schedule, frame size, or address is pinned.
+/// The argument-free-acquire clause is the one that rejects the generic
+/// three-argument forwarding wrapper this otherwise resembles.
+fn epi_io_wrapper_targets(words: &[u32]) -> Option<(u32, u32, u32)> {
+    if !(is_addiu(words[0], 29, 29, imm(words[0])) && imm(words[0]) < 0) {
+        return None;
+    }
+    let frame = imm(words[0]);
+    // The frame this routine created must be the frame it tears down.
+    let end = (4..words.len().saturating_sub(1)).find(|index| {
+        is_jr_ra(words[*index]) && is_addiu(words[index + 1], 29, 29, -frame)
+    })?;
+    let body = &words[..end];
+    if !body
+        .iter()
+        .any(|word| op(*word) == 0x2b && rt(*word) == 31 && rs(*word) == 29)
+    {
+        return None;
+    }
+
+    let calls = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| jal_field(*word).map(|target| (index, target)))
+        .collect::<Vec<_>>();
+    let [(acquire_at, acquire), (raw_at, raw), (_, release)] = calls[..] else {
+        return None;
+    };
+    if acquire == release || !(acquire_at < raw_at) {
+        return None;
+    }
+
+    // The acquire call takes no arguments.
+    let writes_argument = |word: u32| -> Option<u32> {
+        let target = match op(word) {
+            0 => rd(word),
+            0x08 | 0x09 | 0x0c | 0x0d | 0x0e | 0x0f | 0x23 | 0x24 | 0x25 => rt(word),
+            _ => return None,
+        };
+        (4..=6).contains(&target).then_some(target)
+    };
+    if body[..=acquire_at.min(body.len() - 1)]
+        .iter()
+        .enumerate()
+        .any(|(index, word)| index != acquire_at && writes_argument(*word).is_some())
+    {
+        return None;
+    }
+
+    // Each argument is preserved in a callee-saved register across the call,
+    // then routed back into its o32 argument register for the raw op.
+    let mut preserved = [None; 3];
+    for word in &body[..=(acquire_at + 1).min(body.len() - 1)] {
+        if op(*word) == 0 && *word & 0x3f == 0x21 && (16..24).contains(&rd(*word)) {
+            let source = match (rs(*word), rt(*word)) {
+                (source, 0) => source,
+                (0, source) => source,
+                _ => continue,
+            };
+            if (4..=6).contains(&source) {
+                preserved[source as usize - 4] = Some(rd(*word));
+            }
+        }
+    }
+    if preserved.iter().any(Option::is_none) {
+        return None;
+    }
+    let mut routed = [None; 3];
+    for word in &body[acquire_at + 1..=(raw_at + 1).min(body.len() - 1)] {
+        if op(*word) == 0 && *word & 0x3f == 0x21 && (4..=6).contains(&rd(*word)) {
+            let source = match (rs(*word), rt(*word)) {
+                (source, 0) => source,
+                (0, source) => source,
+                _ => continue,
+            };
+            routed[rd(*word) as usize - 4] = Some(source);
+        }
+    }
+    (routed == preserved).then_some((acquire, raw, release))
+}
+
+/// Structural shape of libultra's 64DD drive initialisation.
+///
+/// The routine is recognised by what it *does*, not by any address: it loads a
+/// once-only guard word through a `lui`/`lw` pair, branches away when that word
+/// is already non-zero, and on the first-call path installs the 64DD base
+/// `0xA600_0000` into the handle it will later probe.
+///
+/// The `lui $r, 0xA600` is the distinguishing behaviour. `0x0600_0000..=
+/// 0x07ff_ffff` is `PI_DOM1_ADDR1`, the disk-drive window, and a cartridge-only
+/// title has no device there -- which is why the probe that follows faults with
+/// `abi.pi.absent-domain1-device`. No other libultra role installs that base.
+///
+/// Window is 20 words. Measured on WM2000: the guard `lui`/`lw` sits at
+/// +0x00/+0x04 and the `lui $r, 0xA600` at +0x34, i.e. 13 words later, with
+/// register setup and the handle-pointer construction in between.
+fn is_drive_rom_init(words: &[u32]) -> bool {
+    // lui/lw pair loading the once-only guard.
+    if !(is_lui(words[0], 14) && is_lw(words[1], 14, 14)) {
+        return false;
+    }
+    // A branch that skips initialisation when the guard is already set.
+    let guard_branch = words[2..6]
+        .iter()
+        .any(|word| op(*word) == 0x05 && (rs(*word) == 14 || rt(*word) == 14));
+    if !guard_branch {
+        return false;
+    }
+    // The first-call path installs the 64DD base into the handle.
+    words[2..20]
+        .iter()
+        .any(|word| op(*word) == 0x0f && rs(*word) == 0 && (*word & 0xffff) == 0xa600)
+}
+
+/// A recovered 64DD drive-init routine and the guard word it tests.
+///
+/// The guard is the useful output. Both of the routine's paths return the same
+/// static `OSPiHandle *`; the guard only decides whether the device probe runs.
+/// A consumer that presets it therefore selects a path the guest already
+/// implements, without inventing a bus value or a return contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriveRomInitBinding {
+    pub binding: HostBinding,
+    /// Physical address of the once-only guard word, recovered from the same
+    /// `lui`/`lw` pair the recognizer matches.
+    pub guard_vram: u32,
+}
+
+/// Discover libultra's 64DD drive initialisation from its public guard-word and
+/// base-installation behavior.
+///
+/// This role is optional: a title that never touches the disk drive contains no
+/// such routine, and `Ok(None)` distinguishes that from a ROM where the shape is
+/// ambiguous, which stays a loud failure like every other role here.
+pub fn discover_drive_rom_init_host_binding(
+    words: &[u32],
+    va_start: u32,
+) -> Result<Option<DriveRomInitBinding>, HostBindingDiscoveryError> {
+    if !va_start.is_multiple_of(4) {
+        return Err(HostBindingDiscoveryError::UnalignedImage);
+    }
+    match unique_match(
+        words,
+        va_start,
+        20,
+        HostBindingSymbol::OsDriveRomInit,
+        is_drive_rom_init,
+    ) {
+        Ok(vram) => {
+            let index = ((vram - va_start) / 4) as usize;
+            // The matched window opens with the guard's own lui/lw pair, so its
+            // address is recoverable from the same words the predicate checked.
+            let guard_vram = absolute_from_lui_offset(words[index], imm(words[index + 1]));
+            Ok(Some(DriveRomInitBinding {
+                binding: HostBinding {
+                    symbol: HostBindingSymbol::OsDriveRomInit,
+                    vram,
+                },
+                guard_vram,
+            }))
+        }
+        // `unique_match` reports both "no match" and "several matches" as
+        // NonUniqueSemanticMatch; an empty candidate list is the absent case.
+        // A title with no disk-drive routine is normal, several is ambiguous
+        // and stays a loud failure like every other role here.
+        Err(HostBindingDiscoveryError::NonUniqueSemanticMatch { candidates, .. })
+            if candidates.is_empty() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Discover `__osSiDeviceBusy` from its public SI status-register behavior.
@@ -1411,10 +2079,12 @@ pub fn discover_overlay_loader_host_bindings(
                 .ok_or(HostBindingDiscoveryError::AddressOverflow)?,
         )
         .ok_or(HostBindingDiscoveryError::AddressOverflow)?;
+    // Twelve words: the six documented stores plus the lui/addiu pairs, which
+    // the 1996-era build emits once per queue head rather than once in total.
     let create = unique_match(
         words,
         va_start,
-        9,
+        12,
         HostBindingSymbol::OsCreateMesgQueue,
         is_create_mesg_queue,
     )?;
@@ -1440,10 +2110,12 @@ pub fn discover_overlay_loader_host_bindings(
         HostBindingSymbol::OsSendMesg,
         is_send_mesg,
     )?;
+    // Wide enough to contain the epilogue of the longer compilation, which
+    // carries an `OS_EVENT_PRENMI` tail after the table store.
     let set_event = unique_match(
         words,
         va_start,
-        19,
+        48,
         HostBindingSymbol::OsSetEventMesg,
         is_set_event_mesg,
     )?;
@@ -1642,10 +2314,12 @@ pub fn discover_timer_host_bindings(
                 .ok_or(HostBindingDiscoveryError::AddressOverflow)?,
         )
         .ok_or(HostBindingDiscoveryError::AddressOverflow)?;
+    // Wide enough to contain the epilogue of the longer compilation, which
+    // inlines the timer-list walk rather than delegating it.
     let set_timer = unique_match(
         words,
         va_start,
-        75,
+        100,
         HostBindingSymbol::OsSetTimer,
         is_set_timer,
     )?;
@@ -1680,6 +2354,344 @@ pub fn discover_wm_block_runtime_host_bindings(
         }
     }
     Ok(bindings)
+}
+
+/// Per-symbol outcome of running one recognizer independently of the chain.
+///
+/// [`discover_wm_block_runtime_host_bindings`] is a chain of `?`, so it aborts
+/// at the first failing symbol and never evaluates the rest. Under that chain
+/// "did not resolve" and "was never evaluated" are indistinguishable, which
+/// has been misread as a score at least once. These variants keep them apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostBindingProbeOutcome {
+    /// Exactly one structural match; the role resolves standalone.
+    Resolved { vram: u32 },
+    /// The recognizer ran and found nothing.
+    Absent,
+    /// The recognizer ran and found several candidates, so the role is
+    /// ambiguous rather than missing.
+    Ambiguous { candidates: Vec<u32> },
+    /// The recognizer ran and failed for some other reason.
+    Failed { detail: String },
+    /// The recognizer was never run because it is only reachable through
+    /// multi-stage call-chain logic whose earlier stage did not resolve. This
+    /// is *not* evidence the role is absent.
+    NotReached { needs: &'static str },
+}
+
+impl HostBindingProbeOutcome {
+    /// Whether this role resolved. Only [`Self::Resolved`] counts; in
+    /// particular [`Self::NotReached`] is not a failure, it is an absence of
+    /// measurement, and must never be scored as either.
+    pub fn is_resolved(&self) -> bool {
+        matches!(self, Self::Resolved { .. })
+    }
+
+    /// Whether the recognizer actually ran, and so contributes a denominator.
+    pub fn was_evaluated(&self) -> bool {
+        !matches!(self, Self::NotReached { .. })
+    }
+
+    fn from_unique(result: Result<u32, HostBindingDiscoveryError>) -> Self {
+        match result {
+            Ok(vram) => Self::Resolved { vram },
+            Err(HostBindingDiscoveryError::NonUniqueSemanticMatch { candidates, .. })
+                if candidates.is_empty() =>
+            {
+                Self::Absent
+            }
+            Err(HostBindingDiscoveryError::NonUniqueSemanticMatch { candidates, .. }) => {
+                Self::Ambiguous { candidates }
+            }
+            Err(error) => Self::Failed {
+                detail: format!("{error:?}"),
+            },
+        }
+    }
+}
+
+/// Run every host-binding recognizer independently and report the per-symbol
+/// outcome.
+///
+/// This is a *measurement* surface: it reuses the recognizers verbatim and
+/// changes none of them. Its only reason to exist is that the production entry
+/// point short-circuits, which makes it unable to answer "how many roles does
+/// this ROM resolve".
+///
+/// Twelve of the fifteen roles are separable this way. The remaining three are
+/// genuinely derived from an earlier stage's output rather than matched
+/// standalone -- `osRecvMesg` is identified by a call chain through the
+/// resolved `osCreateMesgQueue` and `osEPiStartDma` addresses, and
+/// `osSpTaskStartGo`/`osSpTaskYield` are matched against helper addresses
+/// extracted from a resolved `osSpTaskLoad` body. When their prerequisite
+/// resolves they are evaluated for real; when it does not they are reported
+/// [`HostBindingProbeOutcome::NotReached`] rather than counted as absent.
+///
+/// The returned vector is symbol-sorted and always contains every one of
+/// [`WM_BLOCK_RUNTIME_HOST_SYMBOLS`].
+pub fn probe_wm_block_runtime_host_bindings(
+    words: &[u32],
+    va_start: u32,
+) -> Vec<(HostBindingSymbol, HostBindingProbeOutcome)> {
+    use HostBindingProbeOutcome as Outcome;
+    use HostBindingSymbol as Symbol;
+
+    if !va_start.is_multiple_of(4) {
+        return WM_BLOCK_RUNTIME_HOST_SYMBOLS
+            .into_iter()
+            .map(|symbol| {
+                (
+                    symbol,
+                    Outcome::Failed {
+                        detail: format!("{:?}", HostBindingDiscoveryError::UnalignedImage),
+                    },
+                )
+            })
+            .collect();
+    }
+
+    let unique = |width: usize, symbol: Symbol, predicate: &dyn Fn(&[u32]) -> bool| {
+        Outcome::from_unique(unique_match(words, va_start, width, symbol, predicate))
+    };
+
+    // The seven overlay-loader roles that are single-window predicates.
+    let create = unique(12, Symbol::OsCreateMesgQueue, &is_create_mesg_queue);
+    let epi = unique(15, Symbol::OsEPiStartDma, &is_epi_start_dma);
+    let get_thread_pri = unique(6, Symbol::OsGetThreadPri, &is_get_thread_pri);
+    let send = unique(57, Symbol::OsSendMesg, &is_send_mesg);
+    let set_event = unique(48, Symbol::OsSetEventMesg, &is_set_event_mesg);
+    let set_thread_pri = unique(20, Symbol::OsSetThreadPri, &is_set_thread_pri);
+    let start_thread = unique(15, Symbol::OsStartThread, &is_start_thread);
+
+    // Roles with their own public entry point.
+    let create_thread = Outcome::from_unique(unique_create_thread_match(words, va_start));
+    let set_timer = unique(100, Symbol::OsSetTimer, &is_set_timer);
+    let si_busy = unique(6, Symbol::OsSiDeviceBusy, &is_si_device_busy);
+
+    // The RSP task group. Load and Yielded stand alone; StartGo and Yield are
+    // matched against helper addresses that only exist once Load resolves.
+    let load = unique(131, Symbol::OsSpTaskLoad, &is_sp_task_load);
+    let task_yielded = unique(19, Symbol::OsSpTaskYielded, &is_sp_task_yielded);
+    let (start_go, task_yield) = match &load {
+        Outcome::Resolved { vram } => {
+            let index = ((vram - va_start) / 4) as usize;
+            let load_words = &words[index..index + 131];
+            let set_status = jal_field(load_words[97]).expect("load recognizer proved status call");
+            let busy = jal_field(load_words[114]).expect("load recognizer proved busy call");
+            (
+                unique(11, Symbol::OsSpTaskStartGo, &|candidate: &[u32]| {
+                    is_sp_task_start_go(candidate, busy, set_status)
+                }),
+                unique(7, Symbol::OsSpTaskYield, &|candidate: &[u32]| {
+                    is_sp_task_yield(candidate, set_status)
+                }),
+            )
+        }
+        _ => (
+            Outcome::NotReached {
+                needs: "osSpTaskLoad",
+            },
+            Outcome::NotReached {
+                needs: "osSpTaskLoad",
+            },
+        ),
+    };
+
+    // osRecvMesg is identified by the overlay call chain, which needs both the
+    // queue initializer and the DMA starter resolved first.
+    let recv = match (&create, &epi) {
+        (Outcome::Resolved { vram: create_vram }, Outcome::Resolved { vram: epi_vram }) => {
+            probe_overlay_recv_mesg(words, va_start, *create_vram, *epi_vram)
+        }
+        _ => Outcome::NotReached {
+            needs: "osCreateMesgQueue + osEPiStartDma",
+        },
+    };
+
+    let mut outcomes = vec![
+        (Symbol::OsCreateMesgQueue, create),
+        (Symbol::OsCreateThread, create_thread),
+        (Symbol::OsEPiStartDma, epi),
+        (Symbol::OsGetThreadPri, get_thread_pri),
+        (Symbol::OsRecvMesg, recv),
+        (Symbol::OsSendMesg, send),
+        (Symbol::OsSetEventMesg, set_event),
+        (Symbol::OsSiDeviceBusy, si_busy),
+        (Symbol::OsSetThreadPri, set_thread_pri),
+        (Symbol::OsSetTimer, set_timer),
+        (Symbol::OsSpTaskLoad, load),
+        (Symbol::OsSpTaskStartGo, start_go),
+        (Symbol::OsSpTaskYield, task_yield),
+        (Symbol::OsSpTaskYielded, task_yielded),
+        (Symbol::OsStartThread, start_thread),
+    ];
+    outcomes.sort_by_key(|(symbol, _)| *symbol);
+    outcomes
+}
+
+/// The `osRecvMesg` half of the overlay call chain, factored out so the probe
+/// can run it once its two prerequisites are known. This mirrors the chain
+/// search in [`discover_overlay_loader_host_bindings`] exactly.
+fn probe_overlay_recv_mesg(
+    words: &[u32],
+    va_start: u32,
+    create: u32,
+    epi: u32,
+) -> HostBindingProbeOutcome {
+    let mut chains = Vec::new();
+    for (create_call_index, &word) in words.iter().enumerate() {
+        let create_call_pc = va_start + create_call_index as u32 * 4;
+        if jal_target(word, create_call_pc) != Some(create) {
+            continue;
+        }
+        let search_end = (create_call_index + 128).min(words.len());
+        for epi_call_index in create_call_index + 1..search_end {
+            let epi_call_pc = va_start + epi_call_index as u32 * 4;
+            if jal_target(words[epi_call_index], epi_call_pc) != Some(epi) {
+                continue;
+            }
+            let recv_end = (epi_call_index + 12).min(words.len());
+            for recv_call_index in epi_call_index + 1..recv_end {
+                if recv_call_index < 2 || recv_call_index + 1 >= words.len() {
+                    continue;
+                }
+                let recv_call_pc = va_start + recv_call_index as u32 * 4;
+                let Some(recv) = jal_target(words[recv_call_index], recv_call_pc) else {
+                    continue;
+                };
+                if is_addiu(
+                    words[recv_call_index - 2],
+                    4,
+                    29,
+                    imm(words[recv_call_index - 2]),
+                ) && is_addiu(
+                    words[recv_call_index - 1],
+                    5,
+                    29,
+                    imm(words[recv_call_index - 1]),
+                ) && is_addiu(words[recv_call_index + 1], 6, 0, 1)
+                {
+                    chains.push((create_call_pc, epi_call_pc, recv));
+                }
+            }
+        }
+    }
+    chains.sort_unstable();
+    chains.dedup();
+    let mut recv_targets = chains.iter().map(|(_, _, recv)| *recv).collect::<Vec<_>>();
+    recv_targets.sort_unstable();
+    recv_targets.dedup();
+    match recv_targets.as_slice() {
+        [recv] => HostBindingProbeOutcome::Resolved { vram: *recv },
+        [] => HostBindingProbeOutcome::Absent,
+        several => HostBindingProbeOutcome::Ambiguous {
+            candidates: several.to_vec(),
+        },
+    }
+}
+
+/// Discover the optional programmed-IO host bindings,
+/// [`PROGRAMMED_IO_HOST_SYMBOLS`].
+///
+/// Unlike [`discover_wm_block_runtime_host_bindings`] this never fails: a title
+/// that does not link these routines returns an empty map, which is the correct
+/// answer for an SRAM title rather than an error. Titles that do link them get
+/// both, or -- for a build that links only one half -- just that one.
+///
+/// `osEPiWriteIo` and `osEPiReadIo` share one shape and are separated by the
+/// raw routine each calls: the write half's callee ends in a store through the
+/// device pointer, the read half's in a load followed by a store to the
+/// caller's out-parameter. Both callees are validated as genuine PI device IO
+/// by [`is_raw_epi_device_io`] before either address is reported, so a
+/// same-shaped routine that forwards to something else cannot be installed.
+///
+/// Ambiguity is dropped rather than guessed. If either role matches more than
+/// one address the role is omitted, because binding the wrong address would
+/// redirect a guest call into an unrelated host shim.
+pub fn discover_programmed_io_host_bindings(words: &[u32], va_start: u32) -> Vec<HostBinding> {
+    /// Widest window the wrapper needs: prologue, three calls with their
+    /// argument routing, and the epilogue.
+    const WINDOW: usize = 40;
+    /// The raw callee's `lw handle+12` sits well past its PI-status poll.
+    const CALLEE_WINDOW: usize = 96;
+
+    if !va_start.is_multiple_of(4) || words.len() < WINDOW {
+        return Vec::new();
+    }
+
+    let callee_body = |target: u32| -> Option<&[u32]> {
+        // `jal_field` yields the raw 26-bit instruction field, which is a WORD
+        // address. Scale it to bytes before forming the segment-relative vram.
+        let vram = 0x8000_0000u32 | (target << 2);
+        let index = usize::try_from(vram.checked_sub(va_start)?).ok()? / 4;
+        (index < words.len()).then(|| &words[index..words.len().min(index + CALLEE_WINDOW)])
+    };
+
+    let mut writes = Vec::new();
+    let mut reads = Vec::new();
+    for (index, window) in words.windows(WINDOW).enumerate() {
+        let Some((_, raw, _)) = epi_io_wrapper_targets(window) else {
+            continue;
+        };
+        let Some(body) = callee_body(raw) else {
+            continue;
+        };
+        if !is_raw_epi_device_io(body) {
+            continue;
+        }
+        let Some(vram) = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(4))
+            .and_then(|offset| va_start.checked_add(offset))
+        else {
+            continue;
+        };
+        // The write half's raw routine stores the caller's data through the
+        // device pointer; the read half's loads from it. That is the ABI
+        // difference between the two, and the only thing distinguishing them.
+        if raw_epi_device_io_is_write(body) {
+            writes.push(vram);
+        } else {
+            reads.push(vram);
+        }
+    }
+
+    let mut bindings = Vec::new();
+    for (symbol, mut candidates) in [
+        (HostBindingSymbol::OsEPiReadIo, reads),
+        (HostBindingSymbol::OsEPiWriteIo, writes),
+    ] {
+        candidates.sort_unstable();
+        candidates.dedup();
+        if let [vram] = collapse_overlapping_runs(&candidates)[..] {
+            bindings.push(HostBinding { symbol, vram });
+        }
+    }
+    bindings.sort_by_key(|binding| binding.symbol);
+    bindings
+}
+
+/// Whether a validated raw EPI device routine is the WRITE half.
+///
+/// The two halves differ only in the direction of the single device access the
+/// public routine performs: the write half stores the caller's `data` through
+/// the uncached device pointer, the read half loads from it. Everything before
+/// that access -- the PI-status poll, the domain-register publication, the
+/// handle decode -- is identical in both.
+fn raw_epi_device_io_is_write(words: &[u32]) -> bool {
+    words
+        .iter()
+        .enumerate()
+        .find_map(|(index, word)| {
+            (op(*word) == 0x23 && imm(*word) == 12 && rs(*word) == 4).then_some(index)
+        })
+        .and_then(|index| {
+            words[index + 1..words.len().min(index + 6)]
+                .iter()
+                .find(|word| op(**word) == 0x23 || op(**word) == 0x2b)
+                .map(|word| op(*word) == 0x2b)
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -492,7 +492,8 @@
         let send_index = 180usize;
         let create_thread_index = 240usize;
         let start_thread_index = 290usize;
-        let set_event_index = 330usize;
+        // 23 words, so it must end clear of `get_thread_pri` at 352.
+        let set_event_index = 324usize;
         let get_thread_pri_index = 352usize;
         let set_thread_pri_index = 360usize;
         let sp_task_load_index = 420usize;
@@ -501,7 +502,14 @@
         let sp_task_yielded_index = 600usize;
         let set_timer_index = 650usize;
         let loader_index = 120usize;
-        let mut words = vec![0u32; 740];
+        // 760, not 740: `unique_match` scans with `windows(width)`, which yields
+        // nothing once fewer than `width` elements remain. At the timer's 100-word
+        // width the last window starts at len-100, so a 740-word array stops
+        // offering windows at 640 and the routine at 650 is never presented to the
+        // predicate at all -- zero candidates because nothing was ever scanned.
+        // Size this against the widest WIDTH plus its start index, not the widest
+        // body: 650 + 100 = 750, and the slack keeps the next widening honest.
+        let mut words = vec![0u32; 760];
         words[create_index..create_index + 9].copy_from_slice(&[
             0x3c02_8123,
             0x2442_4560,
@@ -580,21 +588,35 @@
         start_words[12] = 0x1462_001e;
         start_words[13] = 0x2402_0002;
         start_words[14] = 0xa602_0010;
+        // The compilation that delegates the `OS_EVENT_PRENMI` handling rather
+        // than inlining it: the arguments are captured across the interrupt
+        // disable, the selector is scaled by the eight-byte entry stride, and
+        // the queue and message are stored through the resulting entry.
         let set_event = base + set_event_index as u32 * 4;
-        let event_words = &mut words[set_event_index..set_event_index + 19];
-        event_words[0] = 0x27bd_ffd8;
+        let event_words = &mut words[set_event_index..set_event_index + 23];
+        event_words[0] = 0x27bd_ffe0;
+        event_words[1] = 0xafb0_0010;
         event_words[2] = 0x0080_8021;
+        event_words[3] = 0xafb1_0014;
         event_words[4] = 0x00a0_8821;
-        event_words[6] = 0x00c0_9021;
-        event_words[8] = jal(set_event + 8 * 4, base + 0x1000);
-        event_words[10] = 0x0010_18c0;
-        event_words[12] = 0x2484_ed68;
-        event_words[13] = 0x0064_1821;
-        event_words[14] = 0x0040_9821;
-        event_words[15] = 0x2402_000e;
-        event_words[16] = 0xac71_0000;
-        event_words[17] = 0x1602_0010;
-        event_words[18] = 0xac72_0004;
+        event_words[5] = 0xafb2_0018;
+        event_words[6] = 0xafbf_001c;
+        event_words[7] = jal(set_event + 7 * 4, base + 0x1000);
+        event_words[8] = 0x00c0_9021;
+        event_words[9] = 0x0010_80c0;
+        event_words[10] = 0x3c03_8123;
+        event_words[11] = 0x2463_df30;
+        event_words[12] = 0x0203_8021;
+        event_words[13] = 0x0040_2021;
+        event_words[14] = 0xae11_0000;
+        event_words[15] = jal(set_event + 15 * 4, base + 0x1040);
+        event_words[16] = 0xae12_0004;
+        event_words[17] = 0x8fbf_001c;
+        event_words[18] = 0x8fb2_0018;
+        event_words[19] = 0x8fb1_0014;
+        event_words[20] = 0x8fb0_0010;
+        event_words[21] = 0x03e0_0008;
+        event_words[22] = 0x27bd_0020;
         let get_thread_pri = base + get_thread_pri_index as u32 * 4;
         words[get_thread_pri_index..get_thread_pri_index + 6].copy_from_slice(&[
             0x1480_0003,
@@ -1006,8 +1028,17 @@
             }) if candidates.len() == 2
         ));
 
+        // Each offset below is one clause of the published contract: the frame
+        // and its restore, the stack-passed countdown/queue/message loads, the
+        // eight `OSTimer` field writes, and the zero-interval reload. Breaking
+        // any one of them must make the routine unrecognizable. Positions that
+        // merely implement the list walk are deliberately absent -- they are
+        // not part of what `osSetTimer` promises, and a build that delegates
+        // the walk must still be recognized.
         let timer_index = usize::try_from((expected_timer.vram - base) / 4).unwrap();
-        for offset in [1usize, 10, 14, 24, 59, 68, 73] {
+        for offset in [
+            0usize, 1, 2, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 24, 73, 74,
+        ] {
             let mut broken = words.clone();
             broken[timer_index + offset] ^= 1;
             assert!(matches!(
@@ -1019,7 +1050,7 @@
             ));
         }
         let mut duplicate_timer = words.clone();
-        duplicate_timer.extend_from_slice(&words[timer_index..timer_index + 75]);
+        duplicate_timer.extend_from_slice(&words[timer_index..timer_index + 100]);
         assert!(matches!(
             discover_timer_host_bindings(&duplicate_timer, base),
             Err(HostBindingDiscoveryError::NonUniqueSemanticMatch {
@@ -1083,3 +1114,392 @@
             )
         ));
     }
+
+mod overlapping_run_collapse {
+    use super::*;
+
+    #[test]
+    fn one_routine_matching_at_adjacent_starts_is_one_candidate() {
+        // A window wider than the routine also matches when it merely contains
+        // it, so the same routine matches at several adjacent start offsets.
+        let run = [0x8000_1000, 0x8000_1004, 0x8000_1008, 0x8000_100c];
+        assert_eq!(collapse_overlapping_runs(&run), vec![0x8000_100c]);
+    }
+
+    #[test]
+    fn the_reported_address_is_the_routine_entry_not_the_padding_before_it() {
+        // Callers resolve `jal` targets against this address, so a run must
+        // report its latest start -- the routine's own entry -- rather than an
+        // earlier start that matched only by including preceding filler.
+        let run = [0x8000_2000, 0x8000_2004];
+        assert_eq!(collapse_overlapping_runs(&run), vec![0x8000_2004]);
+    }
+
+    #[test]
+    fn genuinely_distinct_routines_stay_separate_candidates() {
+        // Two real routines are never adjacent at word granularity, so
+        // collapsing cannot hide real ambiguity.
+        let distinct = [0x8000_1000, 0x8000_1004, 0x8000_3000];
+        assert_eq!(
+            collapse_overlapping_runs(&distinct),
+            vec![0x8000_1004, 0x8000_3000]
+        );
+    }
+
+    #[test]
+    fn an_empty_candidate_list_stays_empty() {
+        assert!(collapse_overlapping_runs(&[]).is_empty());
+    }
+}
+
+mod create_mesg_queue_is_register_allocation_free {
+    use super::*;
+
+    /// The documented six-word queue init, with the sentinel materialized once
+    /// into `$v0` -- the 1998-era build's allocation.
+    fn single_register_form() -> Vec<u32> {
+        vec![
+            0x3c02_8005, // lui   $v0, 0x8005
+            0x2442_8860, // addiu $v0, $v0, -0x77a0
+            0xac82_0000, // sw    $v0, 0($a0)     mtqueue
+            0xac82_0004, // sw    $v0, 4($a0)     fullqueue
+            0xac80_0008, // sw    $zero, 8($a0)   validCount
+            0xac80_000c, // sw    $zero, 12($a0)  first
+            0xac86_0010, // sw    $a2, 16($a0)    msgCount
+            0x03e0_0008, // jr    $ra
+            0xac85_0014, // sw    $a1, 20($a0)    msg
+            0, 0, 0,
+        ]
+    }
+
+    /// The same behavior with the sentinel materialized into two registers,
+    /// which is what the 1996-era build emits. Same ABI, different allocation.
+    fn two_register_form() -> Vec<u32> {
+        vec![
+            0x3c0e_8003, // lui   $t6, 0x8003
+            0x3c0f_8003, // lui   $t7, 0x8003
+            0x25ce_3af0, // addiu $t6, $t6, 0x3af0
+            0x25ef_3af0, // addiu $t7, $t7, 0x3af0
+            0xac8e_0000, // sw    $t6, 0($a0)
+            0xac8f_0004, // sw    $t7, 4($a0)
+            0xac80_0008, // sw    $zero, 8($a0)
+            0xac80_000c, // sw    $zero, 12($a0)
+            0xac86_0010, // sw    $a2, 16($a0)
+            0x03e0_0008, // jr    $ra
+            0xac85_0014, // sw    $a1, 20($a0)
+            0,
+        ]
+    }
+
+    #[test]
+    fn both_compilations_of_the_same_routine_are_recognized() {
+        assert!(is_create_mesg_queue(&single_register_form()));
+        assert!(is_create_mesg_queue(&two_register_form()));
+    }
+
+    #[test]
+    fn queue_heads_taking_different_sentinels_are_rejected() {
+        // Requiring both heads to receive the SAME computed address is what
+        // keeps this a queue-initializer predicate rather than "any six
+        // stores through $a0".
+        let mut words = two_register_form();
+        words[1] = 0x3c0f_8004; // $t7 now denotes a different address
+        assert!(!is_create_mesg_queue(&words));
+    }
+
+    #[test]
+    fn a_missing_documented_field_is_rejected() {
+        let mut words = single_register_form();
+        words[6] = 0x0000_0000; // drop the msgCount store
+        assert!(!is_create_mesg_queue(&words));
+    }
+
+    #[test]
+    fn storing_the_wrong_argument_to_a_field_is_rejected() {
+        let mut words = single_register_form();
+        words[8] = 0xac86_0014; // msg <- $a2 instead of the o32 second argument
+        assert!(!is_create_mesg_queue(&words));
+    }
+}
+
+/// The per-symbol probe is a measurement surface over the same recognizers the
+/// production chain uses. If the two ever disagree the probe is reporting
+/// fiction, so the agreement is pinned rather than assumed.
+mod per_symbol_probe_agrees_with_the_chain {
+    use super::*;
+
+    /// A synthetic image the chain resolves completely would be large; instead
+    /// assert the structural invariants that make the probe's numbers legible.
+    #[test]
+    fn the_probe_reports_every_symbol_exactly_once() {
+        let words = vec![0u32; 512];
+        let outcomes = probe_wm_block_runtime_host_bindings(&words, 0x8000_0400);
+        assert_eq!(outcomes.len(), WM_BLOCK_RUNTIME_HOST_SYMBOLS.len());
+        for symbol in WM_BLOCK_RUNTIME_HOST_SYMBOLS {
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == symbol)
+                    .count(),
+                1,
+                "{symbol:?} must appear exactly once"
+            );
+        }
+    }
+
+    /// Zeroed words match nothing, so every standalone role is Absent and the
+    /// three derived roles are NotReached. Absent and NotReached must never
+    /// collapse into one another -- that conflation is the whole reason this
+    /// probe exists.
+    #[test]
+    fn derived_roles_are_not_reached_rather_than_absent() {
+        let words = vec![0u32; 512];
+        let outcomes = probe_wm_block_runtime_host_bindings(&words, 0x8000_0400);
+        let outcome = |symbol: HostBindingSymbol| {
+            outcomes
+                .iter()
+                .find(|(candidate, _)| *candidate == symbol)
+                .map(|(_, outcome)| outcome.clone())
+                .expect("every symbol is reported")
+        };
+        for symbol in [
+            HostBindingSymbol::OsRecvMesg,
+            HostBindingSymbol::OsSpTaskStartGo,
+            HostBindingSymbol::OsSpTaskYield,
+        ] {
+            assert!(
+                matches!(outcome(symbol), HostBindingProbeOutcome::NotReached { .. }),
+                "{symbol:?} is only reachable through an earlier stage"
+            );
+        }
+        for symbol in [
+            HostBindingSymbol::OsCreateMesgQueue,
+            HostBindingSymbol::OsEPiStartDma,
+            HostBindingSymbol::OsSetTimer,
+            HostBindingSymbol::OsSiDeviceBusy,
+            HostBindingSymbol::OsSpTaskLoad,
+        ] {
+            assert_eq!(
+                outcome(symbol),
+                HostBindingProbeOutcome::Absent,
+                "{symbol:?} was evaluated and found nothing"
+            );
+        }
+    }
+
+    /// NotReached is neither resolved nor evaluated. Scoring it as either
+    /// would produce exactly the misleading denominator this probe replaces.
+    #[test]
+    fn not_reached_is_scored_as_neither_resolved_nor_evaluated() {
+        let not_reached = HostBindingProbeOutcome::NotReached { needs: "whatever" };
+        assert!(!not_reached.is_resolved());
+        assert!(!not_reached.was_evaluated());
+        let absent = HostBindingProbeOutcome::Absent;
+        assert!(!absent.is_resolved());
+        assert!(absent.was_evaluated());
+        let resolved = HostBindingProbeOutcome::Resolved { vram: 0x8000_0400 };
+        assert!(resolved.is_resolved());
+        assert!(resolved.was_evaluated());
+    }
+
+    /// The optional programmed-IO roles: `osEPiWriteIo` and `osEPiReadIo`.
+    ///
+    /// Fixtures are built from the public routine's shape rather than copied
+    /// from any ROM, so a clause that stops being load-bearing shows up here as
+    /// a test that still passes after the mutation it is supposed to catch.
+    mod programmed_io {
+        use super::*;
+
+        const BASE: u32 = 0x8000_1000;
+        const ACQUIRE: u32 = BASE + 0x400;
+        const RELEASE: u32 = BASE + 0x480;
+        const RAW_WRITE: u32 = BASE + 0x500;
+        const RAW_READ: u32 = BASE + 0x600;
+
+        fn jal_to(target: u32) -> u32 {
+            0x0c00_0000 | (target >> 2 & 0x03ff_ffff)
+        }
+
+        /// The public wrapper: frame, save `$ra`, preserve the three o32
+        /// arguments, then acquire / raw op / release, then tear the frame down.
+        fn wrapper(raw: u32) -> Vec<u32> {
+            vec![
+                0x27bd_ffe0,      // addiu $sp, $sp, -32
+                0xafb0_0010,      // sw    $s0, 16($sp)
+                0x0080_8021,      // move  $s0, $a0
+                0xafb1_0014,      // sw    $s1, 20($sp)
+                0x00a0_8821,      // move  $s1, $a1
+                0xafb2_0018,      // sw    $s2, 24($sp)
+                0xafbf_001c,      // sw    $ra, 28($sp)
+                jal_to(ACQUIRE),  // jal   __osPiGetAccess
+                0x00c0_9021,      // move  $s2, $a2   (delay slot)
+                0x0200_2021,      // move  $a0, $s0
+                0x0220_2821,      // move  $a1, $s1
+                jal_to(raw),      // jal   __osEPiRaw{Read,Write}Io
+                0x0240_3021,      // move  $a2, $s2   (delay slot)
+                jal_to(RELEASE),  // jal   __osPiRelAccess
+                0x0040_8021,      // move  $s0, $v0   (delay slot)
+                0x0200_1021,      // move  $v0, $s0
+                0x8fbf_001c,      // lw    $ra, 28($sp)
+                0x8fb2_0018,      // lw    $s2, 24($sp)
+                0x8fb1_0014,      // lw    $s1, 20($sp)
+                0x8fb0_0010,      // lw    $s0, 16($sp)
+                0x03e0_0008,      // jr    $ra
+                0x27bd_0020,      // addiu $sp, $sp, 32
+            ]
+        }
+
+        /// The raw device routine: poll PI status, publish the handle's bus
+        /// timing, then form the uncached device pointer from `handle + 12` and
+        /// perform exactly one access through it.
+        fn raw_device_io(store: bool) -> Vec<u32> {
+            let mut words = vec![
+                0x3c02_a460, // lui   $v0, 0xa460
+                0x3442_0010, // ori   $v0, $v0, 0x10   (PI_STATUS_REG)
+                0x8c42_0000, // lw    $v0, 0($v0)
+                0x3042_0003, // andi  $v0, $v0, 3
+                0x1440_fffd, // bnez  $v0, poll
+                0x0000_0000, // nop
+                0x8c82_000c, // lw    $v0, 12($a0)     handle->baseAddress
+                0x3c03_a000, // lui   $v1, 0xa000      uncached KSEG1
+                0x0045_1025, // or    $v0, $v0, $a1    | devAddr
+                0x0043_1025, // or    $v0, $v0, $v1
+            ];
+            words.push(if store {
+                0xac46_0000 // sw $a2, 0($v0)
+            } else {
+                0x8c42_0000 // lw $v0, 0($v0)
+            });
+            words.push(0x03e0_0008); // jr $ra
+            words.push(0x0000_1021); // move $v0, $zero
+            words
+        }
+
+        /// Lay the two wrappers and their callees into one image so discovery
+        /// runs over the same word array a real scan would see.
+        fn image() -> Vec<u32> {
+            let mut words = vec![0u32; 0x400];
+            let place = |words: &mut Vec<u32>, vram: u32, body: &[u32]| {
+                let index = ((vram - BASE) / 4) as usize;
+                if words.len() < index + body.len() {
+                    words.resize(index + body.len(), 0);
+                }
+                words[index..index + body.len()].copy_from_slice(body);
+            };
+            place(&mut words, BASE + 0x100, &wrapper(RAW_WRITE));
+            place(&mut words, BASE + 0x200, &wrapper(RAW_READ));
+            place(&mut words, RAW_WRITE, &raw_device_io(true));
+            place(&mut words, RAW_READ, &raw_device_io(false));
+            words
+        }
+
+        #[test]
+        fn both_programmed_io_roles_resolve_and_are_told_apart_by_direction() {
+            let bindings = discover_programmed_io_host_bindings(&image(), BASE);
+            assert_eq!(
+                bindings,
+                vec![
+                    HostBinding {
+                        symbol: HostBindingSymbol::OsEPiWriteIo,
+                        vram: BASE + 0x100,
+                    },
+                    HostBinding {
+                        symbol: HostBindingSymbol::OsEPiReadIo,
+                        vram: BASE + 0x200,
+                    },
+                ],
+                "the two halves differ only in the direction of the single \
+                 device access their raw routine performs"
+            );
+        }
+
+        /// An SRAM title links neither routine. That is not an error, which is
+        /// the whole reason these roles are discovered separately from the
+        /// gated fifteen.
+        #[test]
+        fn a_title_without_the_routines_yields_no_bindings_rather_than_failing() {
+            let words = vec![0u32; 0x400];
+            assert!(discover_programmed_io_host_bindings(&words, BASE).is_empty());
+        }
+
+        /// The clause that rejects the generic three-argument forwarding
+        /// wrapper: `__osPiGetAccess(void)` takes no arguments, so a routine
+        /// that establishes its first callee's arguments is something else.
+        #[test]
+        fn an_argument_taking_first_call_is_not_the_public_wrapper() {
+            let mut words = image();
+            let index = ((BASE + 0x100 - BASE) / 4) as usize;
+            // Establish $a0 for the acquire call.
+            words[index + 6] = 0x2404_0001; // addiu $a0, $zero, 1
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(
+                !bindings
+                    .iter()
+                    .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo),
+                "a wrapper whose first call takes arguments is not osEPiWriteIo"
+            );
+        }
+
+        /// The callee check. A same-shaped wrapper that forwards to something
+        /// which never forms an uncached device pointer out of `handle + 12` is
+        /// not programmed IO, and is what produced the corpus false positives.
+        #[test]
+        fn a_callee_that_is_not_pi_device_io_is_rejected() {
+            let mut words = image();
+            let index = ((RAW_WRITE - BASE) / 4) as usize;
+            // Load some other field instead of the handle's baseAddress.
+            words[index + 6] = 0x8c82_0020; // lw $v0, 32($a0)
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(
+                !bindings
+                    .iter()
+                    .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo),
+                "the callee must read the documented OSPiHandle baseAddress"
+            );
+        }
+
+        /// Acquire and release are distinct routines. A wrapper that calls the
+        /// same target twice is not the bus-bracketed shape.
+        #[test]
+        fn identical_bracket_targets_are_not_a_mutex_pair() {
+            let mut words = image();
+            let index = ((BASE + 0x100 - BASE) / 4) as usize;
+            words[index + 13] = jal_to(ACQUIRE);
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(!bindings
+                .iter()
+                .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo));
+        }
+
+        /// Ambiguity is dropped, never guessed: binding the wrong address would
+        /// redirect a guest call into an unrelated host shim.
+        #[test]
+        fn a_duplicated_role_is_omitted_rather_than_chosen_arbitrarily() {
+            let mut words = image();
+            let source = ((BASE + 0x100 - BASE) / 4) as usize;
+            let body = words[source..source + 22].to_vec();
+            let clone_at = ((BASE + 0x300 - BASE) / 4) as usize;
+            words[clone_at..clone_at + body.len()].copy_from_slice(&body);
+            let bindings = discover_programmed_io_host_bindings(&words, BASE);
+            assert!(
+                !bindings
+                    .iter()
+                    .any(|binding| binding.symbol == HostBindingSymbol::OsEPiWriteIo),
+                "two candidate addresses must drop the role, not pick one"
+            );
+        }
+
+        /// These roles must stay out of the gated catalog, or the three titles
+        /// that resolve 15/15 today would start failing discovery.
+        #[test]
+        fn programmed_io_roles_are_not_part_of_the_gated_catalog() {
+            for symbol in PROGRAMMED_IO_HOST_SYMBOLS {
+                assert!(
+                    !WM_BLOCK_RUNTIME_HOST_SYMBOLS.contains(&symbol),
+                    "{symbol:?} must remain optional"
+                );
+            }
+            assert_eq!(WM_BLOCK_RUNTIME_HOST_SYMBOLS.len(), 15);
+        }
+    }
+}
