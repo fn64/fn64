@@ -274,12 +274,23 @@ pub(super) fn decode_stream_impl(
 
         match opcode {
             G_NOOP => {
-                assert_eq!(
-                    w0 & 0x00ff_ffff,
-                    0,
-                    "G_NOOP reserved first-word payload must be zero at RDRAM {:#010x}",
-                    pc - 8
-                );
+                // The public F3DEX2 macros generate zero here and stay
+                // checked. The raw RDP lane does not: the command table marks
+                // EVERY bit of No Operation don't-care except command[5:0] at
+                // 61:56 -- all of word 1 and bits 55:0 of word 0 are "--" --
+                // and the command "stalls the RDP pipeline for 1 cycle"
+                // without consuming an input. WCW/nWo Revenge submits
+                // 0x000a0000 in those bits; hardware ignores it, so asserting
+                // on it aborted a route over a field the RDP never reads.
+                // Same split, and same reasoning, as the sync commands below.
+                if !raw_rdp {
+                    assert_eq!(
+                        w0 & 0x00ff_ffff,
+                        0,
+                        "G_NOOP reserved first-word payload must be zero at RDRAM {:#010x}",
+                        pc - 8
+                    );
+                }
                 // Public gDPNoOpTag deliberately carries an arbitrary tag in
                 // w1. The untagged macro is the same command with tag zero.
             }
@@ -1086,18 +1097,20 @@ pub(super) fn decode_stream_impl(
                 }));
             }
             G_RDPLOADSYNC | G_RDPPIPESYNC | G_RDPTILESYNC => {
-                assert_eq!(
-                    w0 & 0x00ff_ffff,
-                    0,
-                    "{} reserved first-word payload must be zero",
-                    opcode_name(opcode)
-                );
                 // SGI RDP Command Summary Tables 1/32/33 assign no field to
-                // this word. F3DEX2 macros generate zero and remain checked,
+                // either word. F3DEX2 macros generate zero and remain checked,
                 // while the raw RDP stream admitted by DPC can retain an
                 // unrelated word there; the hardware command has no input to
-                // consume it.
+                // consume it. That argument covers BOTH words equally -- w0's
+                // bits 55:0 are as unassigned as w1 -- so the lane split
+                // applies to both, as it does for G_NOOP above.
                 if !raw_rdp {
+                    assert_eq!(
+                        w0 & 0x00ff_ffff,
+                        0,
+                        "{} reserved first-word payload must be zero",
+                        opcode_name(opcode)
+                    );
                     assert_eq!(
                         w1,
                         0,
@@ -1107,12 +1120,12 @@ pub(super) fn decode_stream_impl(
                 }
             }
             G_RDPFULLSYNC => {
-                assert_eq!(
-                    w0 & 0x00ff_ffff,
-                    0,
-                    "G_RDPFULLSYNC reserved first-word payload must be zero"
-                );
                 if !raw_rdp {
+                    assert_eq!(
+                        w0 & 0x00ff_ffff,
+                        0,
+                        "G_RDPFULLSYNC reserved first-word payload must be zero"
+                    );
                     assert_eq!(w1, 0, "G_RDPFULLSYNC reserved second word must be zero");
                 }
                 state.ops.push(RenderOp::FullSync);
