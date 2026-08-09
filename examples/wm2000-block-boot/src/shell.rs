@@ -397,7 +397,7 @@ fn run_nwxe_exception_image_with_digest_gate(
     fn64_boot_harness::verify_precompiled_words(
         entry.bank,
         GuestPc::new(image.va_start),
-        image.words,
+        &image.words(),
         image.sha256,
         mem,
     )
