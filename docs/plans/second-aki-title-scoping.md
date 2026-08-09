@@ -941,3 +941,44 @@ Any flow assuming a `/tmp` binary survives will fail this way.
 **Five of six done, and the sixth is the only one that really requires a
 person**, because an input schedule is a description of gameplay rather than a
 property of the ROM.
+
+## The input schedule IS genuinely bespoke — checked, not assumed
+
+Having been wrong twice about what needs a person, I checked this one rather
+than asserting it. **It holds.**
+
+`reference/wm2000-routes/entrance-to-match.schedule` (124 lines) is a route
+through *this game's menus* — boot → Exhibition → Single Match → in-match
+gameplay — and its own header states the method:
+
+> Every screen named in the comments below was **read off a dumped frame**, not
+> inferred from what a wrestling menu "probably" does — the representative
+> frames are committed alongside in `reference/wm2000-frames/` and each section
+> cites the one that evidences it.
+
+**That cannot be derived from the ROM.** It requires running the game, looking
+at frames, identifying which screen each is, and deciding what a successful
+session looks like. There is no fixed constant to read, no architectural
+address, no title-agnostic script — the three things that made the previous
+two items mechanical.
+
+**So the boundary between tooling and human work is now established rather
+than assumed:**
+
+| item | mechanical? | evidence |
+|---|---|---|
+| host bindings | **yes** | signature-scanned, zero addresses |
+| CPU recompile | **yes** | one env var, no per-game config |
+| shard tree | **yes** | `--title`, topology derived from the image |
+| boot context | **yes** | one command, ~1 min, headless |
+| executable images | **yes** | architectural PC, headless producer |
+| **input schedule** | **NO** | a description of gameplay, read off frames |
+
+Five of six are tooling. The sixth is a person watching a game.
+
+**A second caution from that header, worth repeating because it already cost
+this project a result:** the 420,000-step route that first reached WM2000's
+match-setup screen was written to `/tmp`, macOS reaped it, and *"that run is
+now unreproducible — it survived only as prose."* **A route recipe is evidence
+and belongs in the repository**, which is why these two schedules are
+committed. The same reaping ate the trace-producer build directory tonight.
