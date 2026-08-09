@@ -1,0 +1,50 @@
+// Single source of truth for the revenge-block-shards dense-AOT shard inventory.
+//
+// This file is `include!`d verbatim by every consumer that must agree on the
+// shard catalog, so the list cannot drift between them again:
+//
+//   examples/revenge-block-shards/build.rs        (legacy shard generator)
+//   examples/revenge-block-shards/materializer.rs (prepared-tree consumer)
+//   examples/revenge-block-boot/build.rs          (root pack build)
+//   crates/fn64-boot-harness/src/generated_runner_build/mod.rs (verifier)
+//
+// Each entry pairs the Cargo package name with the directory under
+// `examples/revenge-block-shards/` that holds its leaf manifest. The two are
+// not mechanically derivable from one another: the resident-tail packages
+// live in the historically numbered `shard15`/`shard16` directories.
+//
+// Entries are sorted by package name. `materialize_package` binary-searches
+// this order, and the verifier zips the directory column against the package
+// column, so both the sort and the pairing are load-bearing.
+//
+// This inventory was derived mechanically from the selected ROM. Re-running
+// `scripts/generate-wm-shard-topology.py` is the only supported way to change
+// its package count or manifest-directory mapping.
+[
+    ("revenge-block-overlay-0-shard-00", "overlay0-shard00"),
+    ("revenge-block-overlay-0-shard-01", "overlay0-shard01"),
+    ("revenge-block-overlay-0-shard-02", "overlay0-shard02"),
+    ("revenge-block-overlay-0-shard-03", "overlay0-shard03"),
+    ("revenge-block-overlay-1-shard-00", "overlay1-shard00"),
+    ("revenge-block-overlay-1-shard-01", "overlay1-shard01"),
+    ("revenge-block-overlay-1-shard-02", "overlay1-shard02"),
+    ("revenge-block-overlay-1-shard-03", "overlay1-shard03"),
+    ("revenge-block-overlay-1-shard-04", "overlay1-shard04"),
+    ("revenge-block-overlay-1-shard-05", "overlay1-shard05"),
+    ("revenge-block-resident-tail-shard-00", "shard09"),
+    ("revenge-block-resident-tail-shard-01", "shard10"),
+    ("revenge-block-resident-tail-shard-02", "shard11"),
+    ("revenge-block-resident-tail-shard-03", "shard12"),
+    ("revenge-block-resident-tail-shard-04", "shard13"),
+    ("revenge-block-resident-tail-shard-05", "shard14"),
+    ("revenge-block-resident-tail-shard-06", "shard15"),
+    ("revenge-block-shard-00", "shard00"),
+    ("revenge-block-shard-01", "shard01"),
+    ("revenge-block-shard-02", "shard02"),
+    ("revenge-block-shard-03", "shard03"),
+    ("revenge-block-shard-04", "shard04"),
+    ("revenge-block-shard-05", "shard05"),
+    ("revenge-block-shard-06", "shard06"),
+    ("revenge-block-shard-07", "shard07"),
+    ("revenge-block-shard-08", "shard08"),
+]

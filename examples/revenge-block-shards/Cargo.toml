@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "shard00", "shard01", "shard02", "shard03",
+    "shard04", "shard05", "shard06", "shard07",
+    "shard08", "shard09", "shard10", "shard11",
+    "shard12", "shard13", "shard14", "shard15",
+    "overlay*-shard*",
+]
+
+[profile.dev.build-override]
+# Mechanical ROM discovery is CPU-bound and is shared build-time machinery,
+# not generated guest code. Leaving host build dependencies at opt-level 0
+# makes each overlay shard repeat the same recovery roughly forty times more
+# slowly; keep target crates in the ordinary dev profile while optimizing only
+# build scripts and their dependencies.
+opt-level = 1
