@@ -287,10 +287,31 @@ impl WmShardGenerator {
             fn64_discover::host_bindings::WM_BLOCK_RUNTIME_HOST_SYMBOLS.len(),
             "shared WM host catalog must remain exact"
         );
+        // The optional programmed-IO roles (`osEPiWriteIo`/`osEPiReadIo`).
+        //
+        // Deliberately NOT gated: an SRAM title reaches its save device
+        // entirely through PI DMA and links neither routine, so this resolves
+        // empty for WM2000, Revenge, and VPW2 and appends nothing. A FlashRAM
+        // title issues its commands through them, and leaving them unbound is
+        // what let No Mercy's own recompiled `__osEPiRawWriteIo` drive raw
+        // hardware -- the T3 fault at pc 0x8003d518, a `sw` into the FlashRAM
+        // command window at 0xA801_0000.
+        //
+        // `host_calls` is consumed as a membership set (`contains`), so
+        // appending is order-independent and adding addresses a title does not
+        // contain cannot change its generated output.
+        let programmed_io = fn64_discover::host_bindings::discover_programmed_io_host_bindings(
+            &resident_signature,
+            boot_va_start,
+        );
         Self {
             rom,
             overlay_recipes: None,
-            host_calls: host_bindings.iter().map(|binding| binding.vram).collect(),
+            host_calls: host_bindings
+                .iter()
+                .chain(programmed_io.iter())
+                .map(|binding| binding.vram)
+                .collect(),
             boot_va_start,
             package_prefix: PACKAGE_PREFIX.to_owned(),
         }
