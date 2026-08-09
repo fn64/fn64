@@ -46,6 +46,29 @@ static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static COPY_IN_BYTES: AtomicU64 = AtomicU64::new(0);
 static COPY_BACK_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// How much of the copyback is real, and what it costs to find out.
+///
+/// WHY: `copy_back` moves the same 8 MiB as `copy_in` and measures **3.4x
+/// slower** -- 455.9 vs 133.2 us/call, 17.1 vs 58.7 GB/s (rt64-rep1/rep2,
+/// two reps agreeing to 1.8%). A bulk memcpy does not vary by 3.4x on byte
+/// count alone, so most of that excess is what writing into the LIVE mapping
+/// costs versus streaming into fresh `mmap` pages -- page faults against the
+/// re-armed mprotect barrier among them.
+///
+/// That makes "copy back only the bytes the renderer actually changed" the
+/// obvious move, and it is exactly the shape perf-method rule 12 was earned
+/// by: a 5.92 GB clone whose complete elimination measured **+0.84%, the
+/// wrong direction**. So the question is settled by COUNTING before anything
+/// is optimized (rule 3): if the renderer dirties most of the image, a
+/// compare-then-copy is pure added cost and the idea dies here.
+///
+/// `DIFF_NS` times the comparison itself so the tradeoff is visible rather
+/// than inferred -- the scan is only worth it if it costs less than the
+/// copyback it avoids.
+static COPY_BACK_CHANGED_BYTES: AtomicU64 = AtomicU64::new(0);
+static COPY_BACK_CHANGED_RUNS: AtomicU64 = AtomicU64::new(0);
+static DIFF_NS: AtomicU64 = AtomicU64::new(0);
+
 /// RSP interpreter instructions retired, split by branch, plus the number of
 /// `run_imem` re-entries and the IMEM word-vector rebuilds those cost.
 ///
@@ -112,6 +135,49 @@ pub(crate) fn timed<R>(phase: Phase, bytes: u64, operation: impl FnOnce() -> R) 
     ns.fetch_add(elapsed, Relaxed);
     byte_counter.fetch_add(bytes, Relaxed);
     value
+}
+
+/// Measure how much of the staged image the renderer actually changed.
+///
+/// Runs ONLY under the census gate, and deliberately does no copying: it is a
+/// pure observation of the quantity that decides whether narrowing the
+/// copyback can pay. Returns immediately when disarmed, so the shipped
+/// program keeps its exact shape.
+///
+/// `changed` is the byte count that differs, `runs` the number of maximal
+/// differing spans -- both matter. A million changed bytes in one contiguous
+/// run is one `memcpy`; the same count in ten thousand runs is ten thousand
+/// short ones, and the second is not obviously cheaper than copying the lot.
+pub(crate) fn note_copy_back_diff(staged: &[u8], live: &[u8]) {
+    if !enabled() {
+        return;
+    }
+    arm_report();
+    debug_assert_eq!(
+        staged.len(),
+        live.len(),
+        "copyback diff census compares the staged prefix against live RDRAM"
+    );
+    let started = std::time::Instant::now();
+    let mut changed = 0u64;
+    let mut runs = 0u64;
+    let mut index = 0usize;
+    let len = staged.len().min(live.len());
+    while index < len {
+        if staged[index] == live[index] {
+            index += 1;
+            continue;
+        }
+        runs += 1;
+        let start = index;
+        while index < len && staged[index] != live[index] {
+            index += 1;
+        }
+        changed += (index - start) as u64;
+    }
+    DIFF_NS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+    COPY_BACK_CHANGED_BYTES.fetch_add(changed, Relaxed);
+    COPY_BACK_CHANGED_RUNS.fetch_add(runs, Relaxed);
 }
 
 /// Count one `dispatch_captured_raw_rdp` entry, so the report can divide.
@@ -214,6 +280,27 @@ fn arm_report() {
             ms(total),
             per_call_us(total),
         );
+        let changed = COPY_BACK_CHANGED_BYTES.load(Relaxed);
+        let runs = COPY_BACK_CHANGED_RUNS.load(Relaxed);
+        let diff_ns = DIFF_NS.load(Relaxed);
+        let copy_back_bytes = COPY_BACK_BYTES.load(Relaxed);
+        if copy_back_bytes > 0 && diff_ns > 0 {
+            // The decision line. `changed_share` is what perf-method rule 12
+            // asks for: if the renderer dirties most of the image there is
+            // nothing to narrow, and `diff_us/call` says whether finding out
+            // costs less than the copyback it would avoid.
+            println!(
+                "[dpc-copyback-diff] changed_bytes={changed} of {copy_back_bytes} \
+                 ({:.4}% of the image) runs={runs} ({:.1} runs/call, {:.0} bytes/run) \
+                 diff_ms={:.3} ({:.3} us/call) vs copy_back {:.3} us/call",
+                changed as f64 / copy_back_bytes as f64 * 100.0,
+                runs as f64 / calls as f64,
+                if runs > 0 { changed as f64 / runs as f64 } else { 0.0 },
+                ms(diff_ns),
+                per_call_us(diff_ns),
+                per_call_us(copy_back),
+            );
+        }
         let gfx_steps = RSP_STEPS_GFX.load(Relaxed);
         let audio_steps = RSP_STEPS_AUDIO.load(Relaxed);
         let entries = RSP_ENTRIES.load(Relaxed);
@@ -264,6 +351,51 @@ mod tests {
             assert!(env_flag(name), "{on:?} must be on");
         }
         std::env::remove_var(name);
+    }
+
+    /// The copyback diff must COUNT, and it must count the right thing.
+    ///
+    /// perf-method rule 6a: before trusting a check, confirm it CAN fail. The
+    /// decision this counter drives is "is the changed fraction small enough
+    /// that narrowing the copyback pays", so a counter that reported a small
+    /// fraction regardless of the input would be unfalsifiable in exactly the
+    /// direction that ships a wrong optimization.
+    ///
+    /// Exercises the scan directly rather than through `note_copy_back_diff`,
+    /// which is gated on a memoized `OnceLock` and accumulates into process
+    /// statics that other tests in this binary also write.
+    #[test]
+    fn the_copyback_diff_counts_changed_bytes_and_runs() {
+        // Same closed-form scan the census performs, lifted so the accounting
+        // can be asserted without touching the shared counters.
+        fn scan(staged: &[u8], live: &[u8]) -> (u64, u64) {
+            let (mut changed, mut runs, mut index) = (0u64, 0u64, 0usize);
+            let len = staged.len().min(live.len());
+            while index < len {
+                if staged[index] == live[index] {
+                    index += 1;
+                    continue;
+                }
+                runs += 1;
+                let start = index;
+                while index < len && staged[index] != live[index] {
+                    index += 1;
+                }
+                changed += (index - start) as u64;
+            }
+            (changed, runs)
+        }
+        assert_eq!(scan(&[0; 64], &[0; 64]), (0, 0), "identical must report nothing");
+        assert_eq!(scan(&[1; 64], &[0; 64]), (64, 1), "wholly different is ONE run");
+        // Two disjoint runs, so a counter that merely summed bytes and called
+        // every difference one span would fail here.
+        let mut staged = [0u8; 16];
+        staged[2] = 1;
+        staged[3] = 1;
+        staged[9] = 1;
+        assert_eq!(scan(&staged, &[0; 16]), (3, 2));
+        // Adjacent differing bytes are one run, not two.
+        assert_eq!(scan(&[0, 1, 1, 0], &[0, 0, 0, 0]), (2, 1));
     }
 
     /// `timed` must return the operation's value unchanged whether or not the
