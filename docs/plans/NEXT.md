@@ -1,24 +1,26 @@
-# fn64: position and plan (2026-08-09, end of session)
+# fn64: position and plan (2026-08-09, updated after the predecode fix)
 
 **Goal: all five AKI titles 100% playable through fn64, discovery → runtime →
-render. Position: 1 of 5 playable; that title's emulation ceiling is 1.16 ms
-from its 30fps budget; four titles CPU-recompile.**
+render. Position: 1 of 5 playable — and that title is now PAST its 30fps
+floor: 32.1 fps measured with 6.5% margin. Revenge boots and renders; a
+longer-route re-run is in flight past the 0x07 wall.**
 
-52 commits this session. Everything below is measured, with digests and logs.
+## The frame-rate ledger (all rt64, unprofiled, byte-identical 8/8)
 
-## Where each number stands — use these, not older figures
+| step | per-field mean | drawn frame | fps |
+|---|---:|---:|---:|
+| baseline (pre mirror fix) | — | ~69.8 ms | 14.3 |
+| mirror fix `8109435` (one line) | 17.25 | 34.49 | 29.0 |
+| **RSP predecode `456c920`** | **15.58** | **31.15** | **32.1 ✅ 30fps + 6.5% margin** |
 
-| | value | provenance |
-|---|---|---|
-| WM2000 emulation ceiling (rt64, headless) | **17.25 ms/field → 34.49 ms/frame → 29.0 fps** | two unprofiled reps, 0.17% apart, byte-identical, `renderer: rt64` in-log |
-| 30fps budget | 33.333 ms/frame | **gap: 1.16 ms** |
-| mirror fix (`8109435`) | 8.75 → 0.18 ms/field | −20% on the reference lane, confirmed unprofiled |
-| reference-lane figures (27.96 ms, 17.9 fps, 22.6 ms gap) | **wrong lane** — software rasterizer | `render-benchmark.zsh` never set `FN64_RENDER`; now echoes `renderer:` |
-| windowed / presented frame time | **UNMEASURED** | the shell adds present cost, "never less" (`render-benchmark.zsh:87`) |
+Predecode delta −1.67 ms/field (predicted −2.5–2.8 from sample shares — shares
+inflate, as pre-registered; target met regardless). p95 also fell 28.1 → 24.4.
 
-**The two claims are different and only the first is supported:** the
-*emulation ceiling* is 29.0 fps; whether the *game the owner plays* reaches it
-depends on presentation cost, which nobody has measured post-fix.
+**60fps tier (per-game conversion): render field must fit 16.667 ms.** Now at
+~23.0 → **−6.3 ms to go.** Named leads: memmove 11.1% (attributed:
+staging-dominated per the workflow), guest-runtime wrapper ~2x its payload,
+sha digests ~5%, mprotect+barrier ~9%. All defect-shaped. Plus the standing
+constraint: nothing may key on "every second field renders."
 
 ## The plan, in order
 
