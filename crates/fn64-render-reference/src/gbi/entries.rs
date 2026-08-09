@@ -469,11 +469,7 @@ pub fn validate_raw_rdp_command_range(
     let mut pc = start;
     while pc < end {
         let wire_opcode = (read_u32(rdram, pc as usize) >> 24) as u8;
-        let opcode = if matches!(wire_opcode, 0x08..=0x0f | 0xc8..=0xcf) {
-            wire_opcode & 0x3f
-        } else {
-            wire_opcode
-        };
+        let opcode = canonical_raw_rdp_opcode(wire_opcode);
         let supported = matches!(
             opcode,
             // 0x00..=0x07 is the low No Operation block (G_NOOP is its 0x00
@@ -516,7 +512,8 @@ pub fn validate_raw_rdp_command_range(
                 "reference",
                 "render.gbi.raw-rdp.command",
                 format!(
-                    "raw RDP opcode {} ({opcode:#04x}) at {pc:#010x} is unsupported",
+                    "raw RDP opcode {} ({opcode:#04x}, wire byte {wire_opcode:#04x}) \
+                     at {pc:#010x} is unsupported",
                     raw_rdp_opcode_name(opcode)
                 ),
             ));
@@ -558,6 +555,32 @@ pub(super) fn raw_rdp_opcode_name(opcode: u8) -> &'static str {
 /// shade, texture, and Z groups from SGI *RDP Command Summary* Table 11.
 pub(super) fn raw_rdp_command_width(opcode: u8) -> Option<u32> {
     fn64_render::raw_rdp_command_width(opcode)
+}
+
+/// Canonical spelling of a raw-lane RDP wire byte.
+///
+/// The RDP command field is bits 61:56 -- the low six bits of the top wire
+/// byte -- and bits 63:62 are documented don't-care. A command may therefore
+/// legitimately arrive under any of four spellings, and WCW/nWo Revenge does
+/// emit `Set Color Image` as `0x7f` where the GBI macros emit `0xff`.
+///
+/// The decoder's match arms are written in the public GBI names, so the two
+/// halves of the command space normalize in opposite directions: triangles
+/// (`0x08..=0x0f`) are matched bare, while every other command is matched
+/// under its `0xc0`-based GBI constant. Mapping to those two canonical forms
+/// here keeps a single spelling reaching the match without rewriting every
+/// arm, and keeps the geometry lane -- where these same bytes are G_VTX and
+/// friends -- entirely untouched.
+pub(super) fn canonical_raw_rdp_opcode(wire_opcode: u8) -> u8 {
+    let command = wire_opcode & 0x3f;
+    // 0x00..=0x07 (the No Operation block, whose 0x00 is G_NOOP) and
+    // 0x08..=0x0f (the triangles) are matched bare; everything else is
+    // matched under its 0xc0-based GBI constant.
+    if matches!(command, 0x00..=0x0f) {
+        command
+    } else {
+        0xc0 | command
+    }
 }
 
 pub(super) fn decode_rdp_edge_coefficients(rdram: &[u8], pc: usize) -> Option<RdpEdgeCoefficients> {

@@ -429,6 +429,34 @@ fn raw_rdp_low_no_operation_block_is_accepted_and_one_word_wide() {
     }
 }
 
+/// Bits 63:62 of the top wire byte are don't-care, so a command may arrive
+/// under any of four spellings. WCW/nWo Revenge emits Set Color Image as
+/// 0x7f where the GBI macros emit 0xff, and was rejected mid-frame for it.
+#[test]
+fn raw_rdp_accepts_every_prefix_spelling_of_a_command() {
+    for prefix in [0x00u8, 0x40, 0x80, 0xc0] {
+        assert_eq!(
+            canonical_raw_rdp_opcode(prefix | 0x3f),
+            G_SETCIMG,
+            "Set Color Image spelled {:#04x} must canonicalize to G_SETCIMG",
+            prefix | 0x3f
+        );
+        // Sync Full must stay recognizable under every spelling too: an
+        // unrecognized one is a DP completion interrupt never raised.
+        let mut rdram = vec![0u8; 8];
+        wr_cmd(&mut rdram, 0, ((prefix | 0x29) as u32) << 24, 0);
+        validate_raw_rdp_command_range(&rdram, 0, 8).unwrap();
+        assert_eq!(
+            raw_rdp_full_sync_status(&rdram, 0, 8).unwrap(),
+            fn64_render::DpFullSyncStatus::Reached
+        );
+    }
+    // The triangles keep their bare spelling, since the decoder matches them
+    // on the 6-bit command rather than a GBI constant.
+    assert_eq!(canonical_raw_rdp_opcode(0xcf), 0x0f);
+    assert_eq!(canonical_raw_rdp_opcode(0x0f), 0x0f);
+}
+
 #[test]
 fn raw_rdp_unknown_opcode_records_returned_error() {
     fn64_runtime::arm_unsupported_events(None).unwrap();
@@ -444,7 +472,11 @@ fn raw_rdp_unknown_opcode_records_returned_error() {
         events[0].disposition,
         fn64_runtime::UnsupportedDisposition::ReturnedError
     );
+    // 0x10 is in the No Operation region this decoder deliberately does not
+    // accept. The diagnostic must carry the wire byte as submitted, not only
+    // the canonical spelling (0xd0), or a reader cannot find it in the stream.
     assert!(events[0].context.contains("0x10"));
+    assert!(events[0].context.contains("wire byte 0x10"));
 }
 
 
