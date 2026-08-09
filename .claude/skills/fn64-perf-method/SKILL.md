@@ -18,34 +18,25 @@ a drawn frame gets **two** field budgets: **33.333 ms**. Measured render field
 p50 is 36.46 ms, which is **2.19x the 60fps bar but only 1.09x the rate the
 game actually draws at**.
 
-**A DRAWN FRAME COSTS BOTH FIELDS.** WM2000 alternates strictly 1:1, so the
-pair is what must fit 33.333 ms:
+**A DRAWN FRAME COSTS BOTH FIELDS**, and the only numbers that describe what
+ships are **unprofiled means**. Measured on the shipping binary, same route,
+7,699 steady fields:
 
-| | p50 | budget | gap |
-|---|---:|---:|---:|
-| non-render field | 8.858 ms | — | — |
-| render field | 36.462 ms | — | — |
-| **the PAIR (a drawn frame)** | **45.32 ms** | **33.333** | **11.99 ms** |
+| | before the mirror fix | after (`8109435`) |
+|---|---:|---:|
+| per-field p50 | 31.13 ms | **23.98 ms** |
+| per-field p95 | 64.65 ms | 54.56 ms |
+| **per-field mean** | **34.89 ms** | **27.96 ms** |
+| **drawn frame (x2)** | 69.8 ms — **14.3 fps** | **55.9 ms — 17.9 fps** |
+| 30fps budget | 33.33 ms | **gap: 22.6 ms** |
 
-**Do not quote 3.13 ms.** That figure compares the render field *alone* against
-the *pair's* budget, so it silently assumes the non-render field is free. It is
-not — it costs 8.86 ms. The two differ by 3.8x and the error was believed for
-hours. The real gap is **11.99 ms**, currently ~22 fps against a 30 fps target.
-
-|  | remove from the 45.32 ms drawn frame |
-|---|---|
-| 60fps (hardware parity, per-field) | **19.80 ms from the render field — 54%** |
-| **30fps at p50** | **11.99 ms — 26%** |
-
-Every *pair* of the render field's named lines clears the p50 gap; the two
-smallest (`invalidate` 2.04 + `staging memcpy` 1.77) sum to 3.81. **Against the
-60fps bar this was an architecture problem with no bottleneck; against the rate
-the game renders at it is an ordinary optimization with fifteen viable routes.**
-
-**Always state which bar you are measuring against, and check the title's
-render rate before quoting a ratio.** A 2.19x that is really 1.09x is the
-difference between "rewrite the graphics architecture" and "land two small
-wins."
+**Two figures quoted for hours were wrong, both optimistic, both from the same
+mistake.** "45.32 ms pair / 22 fps / 11.99 ms gap" was built from **profiled
+per-population p50s** (8.858 + 36.462). Profiling inflates the absolute cost,
+and on a bimodal distribution **p50 is not the mean** — the mean carries the
+tail that actually consumes wall time. **Never build a shipped-frame figure
+from profiled numbers or from p50s.** Take an unprofiled run's mean, double it
+for a 30 Hz title, and quote that.
 
 ## Running the work (not the experiment)
 
