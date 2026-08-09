@@ -26,21 +26,41 @@ needs no route; this frame is reached by the game's own attract sequence.
     at 200k   gfx_submits=507  audio_submits=1035  render_error=None
     overlay   entered generation [0x80090000,0x800c5ad0) at step 15,987
 
-The run stops shortly after this frame, and **not on anything title-specific**:
-the raw-RDP scanner rejects opcode `0x07` ("has no public command width",
-`crates/fn64-render/src/rdp_completion.rs:96-101`). Opcodes `0x01`–`0x07` are
-absent from its Table 11 map. Revenge's microcode emits one; WM2000's never
-does. Widening that map is the next step for a longer route.
+The run stopped shortly after this frame, and **not on anything
+title-specific**: the raw-RDP scanner rejected opcode `0x07` ("has no public
+command width"). Opcodes `0x01`–`0x07` were absent from its Table 11 map;
+Revenge's microcode emits one and WM2000's never does. That has since been
+fixed, along with four more of the same kind — see the run2 table below.
 
 ## Reproduction (run2, 2026-08-09)
 
-After the `0x01`–`0x07` No-Op widening landed, a re-run **reproduced the frame
-byte-identical** (sha256 `9794211091c53fb7dd73e52501f959843cf943566e13eac8cc637893f1731ec1`,
-same task #654 / 259 tris), continued past the old `0x07` wall, and stopped a
-few tasks later on the next unmapped scanner case: `raw RDP opcode 0x7f at
-0x00800cf8 has no public command width` (`rsp_commit.rs:858`, non-unwinding
-panic). `0x7f` exceeds the 6-bit RDP command space, so the leading suspicion is
-scanner misalignment rather than stream content; under diagnosis.
+Every re-run since has **reproduced the frame byte-identical** (sha256
+`9794211091c53fb7dd73e52501f959843cf943566e13eac8cc637893f1731ec1`, same task
+#654 / 259 tris), with task #656 the last to decode. Each re-run then advanced
+one wall further:
+
+| # | stop | verdict |
+|---|---|---|
+| 1 | scanner: `0x07` "no public command width" | ours — `0x01`–`0x07` are all *No Operation*, one word each |
+| 2 | scanner: `0x7f` same message | ours — the command field is bits 61:56; `0x7f` masks to `0x3f` (Set Color Image). Only the `0xc0` spelling of every state command was accepted |
+| 3 | decoder: `G_NOOP reserved first-word payload must be zero` (`w0=0x000a0000`) | ours — the No Operation table marks every bit don't-care but `command[5:0]`; the rule was written for the GBI `gDPNoOp` and applied to the raw lane |
+| 4 | backend: `G_TEXRECT in Fill cycle is invalid` | ours — "In FILL mode this behaves identically to Fill Rectangle, the texturing properties are ignored" |
+| 5 | backend: `G_SETCIMG format=0 size=0 is unsupported` | ours — `G_SETCIMG` is a latch; validation now defers to the first draw through the target |
+
+**Five walls, five ours.** Not one was a defect in Revenge's stream: each was a
+faithfulness rule written against what WM2000's F3DEX2 macros emit rather than
+against what the RDP accepts. `0x7f` looked like scanner misalignment when
+first seen — it was not; the field extraction was correct and the classifier
+was reading eight bits of a six-bit field.
+
+**Open question for the next run.** Wall 5 was fixed by deferring, which is
+right whether or not a draw follows the latch. But whether Revenge's stream
+*does* draw through that `format=0 size=0` target is **not yet established** —
+the console log does not show it. If the next run fails at a draw naming
+`format=0 size=0`, that is a genuinely new case (a 4-bit colour image is not a
+real framebuffer configuration) and wants reporting, not invented semantics.
+`FN64_XBUS_STREAM_DUMP_DIR` / `_SKIP` dump the captured command stream if the
+question needs settling directly.
 
 The exact invocation — recorded because the original session documented the
 outcome but not the command, which cost a full re-diagnosis. Run from
