@@ -77,3 +77,23 @@ reproducible). Four of five titles CPU-recompiling — Revenge unblocked from
 −20% shipped, from one line. FN64_PROFILE: one command, counter tree enforced,
 five historical instrument failures now caught by construction. The corrected
 target: 29.0 fps ceiling against a 30fps goal, not 54% of a field to remove.
+
+## Standing constraint: native rate now, no ceiling later (owner, 2026-08-09)
+
+30 Hz titles render **faithfully at 30 fps** — that is the guaranteed floor.
+But nothing in the architecture may **block** a per-game higher rate later:
+
+- The emulation core is already rate-agnostic: VI fields run at hardware 60 Hz
+  and the guest decides when it renders. The render/non-render bimodality is
+  guest behaviour, not an emulator assumption. Keep it that way — no
+  optimization may key on "every second field renders."
+- The only 30-ism found in a sweep is the shell's `FN64_FRAME_PACE_MS`
+  *default* (33.3 ms, env-overridable, 0 disables). Make it per-title when the
+  shell grows config; it blocks nothing today.
+- **60 fps conversion is a per-title, clean-room patch layer** (decoupling or
+  doubling the game's 30 Hz update, as recomp-community 60fps mods do) plus an
+  emulator budget of **16.667 ms per render field** (−9.0 ms from today, −6.4
+  post-predecode). The profile says the remaining cost is defect-shaped
+  (wrapper 2x its payload, prepare 2x execute, memmove under attribution),
+  not intrinsic — so the budget is credible, and the patch layer is the part
+  fn64 does not have yet.
