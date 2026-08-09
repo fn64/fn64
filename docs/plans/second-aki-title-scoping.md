@@ -481,3 +481,31 @@ inherits an unsolved problem that is not title-specific.**
 - Actual build/link cost for 38 packages. **Settled by:** one build. Not run here.
 - Where the 287-ROM corpus directory lives (source of the capture digests).
   **Settled by:** locating the ROM matching `fc561fce…`.
+
+## Next action, and why it is not done yet (2026-08-08, coordinator)
+
+**Run `probe_host_bindings` against the on-disk No Mercy ROM.** That is the
+single highest-value open item and everything downstream depends on it.
+
+It could not be answered from the record. `corpus-certification-frontier.md:1811`
+names the title as "WWF No Mercy (Rev A)" — a **title string, not a ROM digest**
+— so the 15/15 cannot be matched to an artifact. The two facts (15/15 passes;
+the on-disk ROM is `11640379…`) agree with each other while describing possibly
+different ROMs, which is rule 23's shape.
+
+It also could not be run: `probe_host_bindings` is not built in any target dir,
+so settling it costs a build plus a run, and the `resume NET` measurement held
+the machine (rule 9 — never build beside a benchmark).
+
+**Do it first when the machine frees.** Three outcomes:
+
+- **15/15 on the Unlocked ROM** — No Mercy is confirmed reachable and the
+  variant question closes.
+- **fewer than 15** — the reachable-title count drops from 2 to 1 unless a
+  Rev A ROM is obtained, and the scoping recommendation changes.
+- **a different failure** — the probe itself needs attention before any title
+  planning continues.
+
+Lesson worth carrying regardless: **record the ROM digest beside every per-title
+result.** A title string cannot distinguish variants, and this project has four
+No Mercy images on disk of which none matches the capture's `fc561fce…`.
