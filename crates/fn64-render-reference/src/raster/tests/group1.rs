@@ -1571,3 +1571,76 @@ fn rgb_dither_selector_sweep_matches_every_public_threshold() {
         }
     }
 }
+
+/// A texture rectangle in FILL cycle "behaves identically to Fill Rectangle,
+/// the texturing properties are ignored" (N64brew RDP command table, Texture
+/// Rectangle), and Fill Rectangle's colour in FILL mode "is determined solely
+/// by the fill color register". So a texrect bound to a RED texture must
+/// paint the GREEN fill colour, and must cover the inclusive lower/right edge
+/// that fill mode uses. WCW/nWo Revenge submits this combination; the
+/// reference backend used to reject it as invalid.
+#[test]
+fn fill_cycle_texture_rectangle_paints_the_fill_color_not_its_texture() {
+    // RGBA5551 green with the coverage/alpha bit set, doubled into both
+    // halves the way the fill-colour register is programmed for 16-bit.
+    const GREEN_5551: u32 = 0x07c1_07c1;
+    // Cycle type lives in high bits 21:20; 3 selects FILL. The low word is
+    // zero: the public fill contract requires G_RM_NOOP, and retaining a
+    // framebuffer/Z consumer (IM_RD at bit 6) is a real hardware hazard the
+    // rasterizer rejects for fill-cycle primitives.
+    let fill_cycle = OtherMode::from_raw(3 << 20, 0, 0);
+    assert_eq!(fill_cycle.cycle_type(), CycleType::Fill);
+
+    let mut rect = texture_rectangle(
+        solid_texture([255, 0, 0, 255]),
+        fill_cycle,
+        CombinerState::default(),
+    );
+    rect.lrx = 2.0;
+    rect.lry = 2.0;
+    rect.fill_color = GREEN_5551;
+
+    let converted = rect.as_fill_cycle_rectangle();
+    assert_eq!(converted.fill_color, GREEN_5551);
+    assert_eq!(converted.cycle_type, CycleType::Fill);
+    assert_eq!((converted.ulx, converted.uly), (0.0, 0.0));
+    assert_eq!((converted.lrx, converted.lry), (2.0, 2.0));
+
+    let mut fb = Framebuffer::new(4, 4);
+    fb.clear(0, 0, 0, 255);
+    fb.draw_fill_rectangle(
+        &converted,
+        ColorImage {
+            format: ColorImage::RGBA_FORMAT,
+            size: ColorImage::BITS_16,
+            width: 4,
+            address: 0,
+        },
+    );
+
+    // Fill mode includes the lower/right edge, so 0..=2 is painted and
+    // column/row 3 is untouched. The texture is red; no red may appear.
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let offset = (y * 4 + x) * 4;
+            let pixel = &fb.pixels[offset..offset + 4];
+            let inside = x <= 2 && y <= 2;
+            if inside {
+                assert_eq!(
+                    pixel[0], 0,
+                    "fill-cycle texrect must not sample its texture at ({x}, {y})"
+                );
+                assert!(
+                    pixel[1] > 200,
+                    "fill-cycle texrect must paint the fill colour at ({x}, {y}): {pixel:?}"
+                );
+            } else {
+                assert_eq!(
+                    pixel,
+                    &[0, 0, 0, 255],
+                    "fill-cycle texrect must not paint outside its rectangle at ({x}, {y})"
+                );
+            }
+        }
+    }
+}

@@ -176,6 +176,7 @@ pub(super) fn texture_rectangle(
         scissor: None,
         texture: Some(texture),
         texture1: None,
+        fill_color: 0,
     }
 }
 

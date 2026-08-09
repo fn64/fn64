@@ -1355,6 +1355,7 @@ pub(super) fn decode_stream_impl(
                         state.other_mode.texture_lut(),
                         &storage,
                     ),
+                    fill_color: state.fill_color,
                 }));
             }
             G_SPECIAL_1 | G_SPECIAL_2 | G_SPECIAL_3 => panic!(
