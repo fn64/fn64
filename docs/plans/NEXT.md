@@ -37,14 +37,19 @@ renders."
 
 ## The plan, in order
 
-### 1. Measure the windowed lane post-fix (hours, decisive)
-`wm2000-shell` has never been measured since the mirror fix. The owner's last
-session showed p50 ~50 ms windowed — but that predates `8109435` and was on a
-binary carrying the 9 ms mirror defect. **One instrumented windowed session
-answers whether the played game is at ~29 fps or still stuttering**, and if the
-latter, present cost is the entire remaining problem and it is shell-side, not
-emulation. The owner must drive it (or an input schedule must replay a route);
-the measurement itself is the heartbeat that already exists.
+### 1. Measure the windowed lane post-fix — DONE 2026-08-09, still over budget
+Owner played `wm2000-shell` (rt64, AutoNoVsync, 1280x960, ~63k frames):
+**frame_interval p50 46–51 ms (~20 fps), p95 67–106, p99 spikes 200–296 ms.**
+`pump_ms` is bimodal — p50 flips between ~16 ms and ~48 ms across heartbeat
+windows — so the cost is split between the emulation pump and the present
+path, not one owner. Caveats binding the next measurement: this binary ran
+with `verify_live_words` ON (worth ~7 ms/drawn frame; build the next shell
+with `FN64_WM_SHARD_VERIFY_LIVE_WORDS=0` after the A/B clears it), and
+`rsp_rdp_observations` grows unboundedly across a long session (the 200+ ms
+p99 spikes may be reallocation/memory pressure — falsifiable by capping or
+by watching RSS against spike timing). Block lane simultaneously measures
+15.58 ms/field — the gap between 31.15 ms core and ~48 ms presented is the
+shell-side + verify budget to reclaim.
 
 ### 2. Close the last 1.16 ms if the ceiling itself needs it (days)
 Post-fix decomposition (perturbation-corrected): rasterization 8.30, RSP 5.09,
