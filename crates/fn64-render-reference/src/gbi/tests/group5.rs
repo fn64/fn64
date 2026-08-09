@@ -429,6 +429,48 @@ fn raw_rdp_low_no_operation_block_is_accepted_and_one_word_wide() {
     }
 }
 
+/// The No Operation command table marks every bit don't-care except
+/// `command[5:0]` at 61:56 -- all of word 1 and bits 55:0 of word 0 are
+/// "--", and the command stalls the pipeline for a cycle without consuming
+/// an input. WCW/nWo Revenge submits 0x000a0000 in those bits; hardware
+/// ignores it, so the raw lane must not assert on it.
+#[test]
+fn raw_rdp_no_operation_admits_an_unassigned_payload() {
+    let mut rdram = vec![0u8; 32];
+    wr_cmd(&mut rdram, 0, 0x000a_0000, 0xdead_beef);
+    wr_cmd(&mut rdram, 8, (G_RDPFULLSYNC as u32) << 24, 0);
+    wr_cmd(&mut rdram, 16, (G_ENDDL as u32) << 24, 0);
+    let ops = decode_raw_rdp_ops(&rdram, 0).unwrap();
+    assert!(
+        ops.iter().any(|op| matches!(op, RenderOp::FullSync)),
+        "the scan must continue through a payload-bearing No Operation"
+    );
+}
+
+/// The same don't-care argument the sync commands already made for their
+/// second word covers their first word's bits 55:0 too.
+#[test]
+fn raw_rdp_sync_commands_admit_unassigned_first_word_bits() {
+    for opcode in [G_RDPLOADSYNC, G_RDPPIPESYNC, G_RDPTILESYNC, G_RDPFULLSYNC] {
+        let mut rdram = vec![0u8; 24];
+        wr_cmd(&mut rdram, 0, ((opcode as u32) << 24) | 0x000a_0000, 0xdead_beef);
+        wr_cmd(&mut rdram, 8, (G_ENDDL as u32) << 24, 0);
+        decode_raw_rdp_ops(&rdram, 0).unwrap_or_else(|error| {
+            panic!("raw {opcode:#04x} must admit unassigned payload bits: {error}")
+        });
+    }
+}
+
+/// The exemption is raw-lane only. F3DEX2 macros generate zero here, so the
+/// geometry lane keeps checking -- a tagged GBI no-op still traps.
+#[test]
+#[should_panic(expected = "G_NOOP reserved first-word payload must be zero")]
+fn gbi_lane_still_rejects_a_nonzero_noop_first_word() {
+    let mut rdram = vec![0u8; 0x1010];
+    wr_cmd(&mut rdram, 0x1000, ((G_NOOP as u32) << 24) | 0x000a_0000, 0);
+    let _ = decode_display_list_f3dex2_ops(&rdram, 0x1000);
+}
+
 /// Bits 63:62 of the top wire byte are don't-care, so a command may arrive
 /// under any of four spellings. WCW/nWo Revenge emits Set Color Image as
 /// 0x7f where the GBI macros emit 0xff, and was rejected mid-frame for it.
