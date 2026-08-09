@@ -1858,6 +1858,9 @@ pub(super) fn abi_host_shim_callable(shim: AbiHostShimV1) -> RecompFunc {
         AbiHostShimV1::OsStartThread => os_start_thread,
         AbiHostShimV1::OsEPiWriteIo => os_epi_write_io,
         AbiHostShimV1::OsEPiReadIo => os_epi_read_io,
+        AbiHostShimV1::OsFlashInit => os_flash_init,
+        AbiHostShimV1::OsFlashSectorErase => os_flash_sector_erase,
+        AbiHostShimV1::OsFlashReadArray => os_flash_read_array,
     }
 }
 
@@ -1884,7 +1887,12 @@ pub(super) fn abi_host_shim_writer_effects(shim: AbiHostShimV1) -> Vec<WriterCha
         // `osEPiStartDma` rather than the HostAbi-only default.
         AbiHostShimV1::OsEPiStartDma
         | AbiHostShimV1::OsEPiWriteIo
-        | AbiHostShimV1::OsEPiReadIo => {
+        | AbiHostShimV1::OsEPiReadIo
+        // The FlashRAM API commits to the same PI-backed save store, and
+        // `osFlashReadArray` additionally writes the caller's guest buffer.
+        | AbiHostShimV1::OsFlashInit
+        | AbiHostShimV1::OsFlashSectorErase
+        | AbiHostShimV1::OsFlashReadArray => {
             vec![WriterChannel::PiDma, WriterChannel::HostAbi]
         }
         AbiHostShimV1::OsRecvMesg | AbiHostShimV1::OsSendMesg | AbiHostShimV1::OsStartThread => {
