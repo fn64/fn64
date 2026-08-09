@@ -696,3 +696,4 @@ fn writer_audit_bundle_evidence() -> GeneratedRunnerWriterAuditBundleEvidenceV1 
 }
 
 mod part1;
+mod shard_selector;

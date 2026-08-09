@@ -139,8 +139,20 @@ const PREPARED_SOURCE_MODE_CONSUMED_V1: &str = "prepared_consumed";
 // data file with no code and no dependencies, and the verifier already binds
 // itself to this exact directory by path at runtime (see `wm_shard_root`), so
 // the coupling is stated rather than new.
-const SHARD_INVENTORY: &[(&str, &str)] =
-    &include!("../../../../examples/wm2000-block-shards/shard_inventory.in");
+//
+// The directory NAME is a build-time selector, not a fixed literal: `build.rs`
+// emits `FN64_WM_SHARD_DIR` via `cargo:rustc-env` (default
+// "wm2000-block-shards", so an unset selector reproduces today's build
+// byte-for-byte), and `env!` expands to a string literal before `concat!`
+// assembles the `include!` path -- both happen at compile time, so this
+// remains a `const`. A title whose overlays tile differently gets its own
+// `shard_inventory.in` under `examples/<selector>/` and its own directory
+// tree; this file does not choose which one, `FN64_WM_SHARD_TITLE` does.
+const SHARD_INVENTORY: &[(&str, &str)] = &include!(concat!(
+    "../../../../examples/",
+    env!("FN64_WM_SHARD_DIR"),
+    "/shard_inventory.in"
+));
 const SHARD_COUNT: usize = SHARD_INVENTORY.len();
 const PREPARED_PACKAGES: [&str; SHARD_COUNT] = {
     let mut packages = [""; SHARD_COUNT];
