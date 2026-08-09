@@ -124,3 +124,62 @@ pub fn write_guest_physical(physical_start: u32, bytes: &[u8]) -> bool {
     );
     true
 }
+
+/// Declare guest bytes an ABI adapter has ALREADY written, with the full
+/// journal protocol.
+///
+/// [`write_guest_physical`] is for callers that want this module to perform the
+/// write. The ABI's own save adapters cannot use it: they write through
+/// `RdramPtr`, whose `write_u8`/`write_u32` apply the native-word lane swizzle
+/// that guest `MEM_BU`/`MEM_W` reads expect, while this module writes flat
+/// physical bytes. Routing them through the flat path would silently reorder
+/// every save transfer.
+///
+/// So they keep their own writes and call this instead, which supplies the part
+/// they were missing. `notify_host_abi_write` alone only ENQUEUES an attributed
+/// event onto `PENDING_ATTRIBUTED_EXECUTABLE_WRITES`; something must then drain
+/// it. Every other declaring writer brackets the notify in a child transaction
+/// that commits (see the scheduler mirror at `execution.rs:815`), and an
+/// undrained event trips "reached an ordering boundary with N uncommitted child
+/// writer event(s)" at the next boundary.
+///
+/// `physical_start` is a physical RDRAM offset, matching
+/// [`write_guest_physical`]. Returns `false` and declares nothing when no
+/// recompiled program is live or the span leaves registered RDRAM.
+pub fn declare_guest_physical_write(physical_start: u32, len: u32) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(physical_end) = physical_start.checked_add(len) else {
+        return false;
+    };
+    let (rdram, rdram_len) = with_host(|host| (host.runtime_rdram, host.runtime_rdram_len));
+    if rdram.is_null() || physical_end as usize > rdram_len {
+        return false;
+    }
+    // Without a live canonical program there is no journal, and there is
+    // nothing to declare to -- the bytes the caller wrote are just memory.
+    let Some(live) = with_host(|host| host.canonical_recompiled_program.clone()) else {
+        return true;
+    };
+    let transaction = match live.mutation_state.as_ref() {
+        Some(state) => {
+            let transaction_id = state.borrow_mut().begin_child_transaction();
+            CatalogNestedWriterTransactionV1::for_host_memory_api(live.clone(), transaction_id)
+        }
+        None => CatalogNestedWriterTransactionV1::inert(),
+    };
+    fn64_recomp_rs::notify_host_abi_write(physical_start, len);
+    // SAFETY: `rdram` is non-null and `rdram_len` is the registered length of
+    // that one allocation, both checked above; neither borrow outlives this
+    // call. Same contract as `write_guest_physical`.
+    let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
+    let view = fn64_runtime::RdramView::from_storage(unsafe {
+        std::slice::from_raw_parts(rdram as *const u8, rdram_len)
+    });
+    transaction.commit_with_optional_view(
+        |physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) },
+        Some(&view),
+    );
+    true
+}

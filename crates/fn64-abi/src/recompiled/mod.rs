@@ -1941,7 +1941,7 @@ mod runners;
 // only `impl` blocks for types declared here, and inherent impls are always
 // in scope with their type.
 pub use execution::*;
-pub use host_memory::{read_guest_physical, write_guest_physical};
+pub use host_memory::{declare_guest_physical_write, read_guest_physical, write_guest_physical};
 pub use receipts::*;
 pub use runners::*;
 pub use snapshots::*;
