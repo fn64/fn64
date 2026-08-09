@@ -407,6 +407,28 @@ fn raw_rdp_full_sync_inspection_rejects_truncated_commands() {
 }
 
 
+/// RDP command ids 0x01..=0x07 are the rest of the No Operation block that
+/// 0x00 opens. WCW/nWo Revenge's microcode emits one; WM2000's never does,
+/// which is why the omission survived until a second title booted.
+#[test]
+fn raw_rdp_low_no_operation_block_is_accepted_and_one_word_wide() {
+    for opcode in 0x01u8..=0x07 {
+        let mut rdram = vec![0u8; 16];
+        wr_cmd(&mut rdram, 0, (opcode as u32) << 24, 0);
+        wr_cmd(&mut rdram, 8, (G_RDPFULLSYNC as u32) << 24, 0);
+
+        validate_raw_rdp_command_range(&rdram, 0, 16).unwrap_or_else(|error| {
+            panic!("RDP No Operation {opcode:#04x} must validate: {error}")
+        });
+        assert_eq!(raw_rdp_command_width(opcode), Some(8));
+        assert_eq!(
+            raw_rdp_full_sync_status(&rdram, 0, 16).unwrap(),
+            fn64_render::DpFullSyncStatus::Reached,
+            "No Operation {opcode:#04x} must advance exactly one command word"
+        );
+    }
+}
+
 #[test]
 fn raw_rdp_unknown_opcode_records_returned_error() {
     fn64_runtime::arm_unsupported_events(None).unwrap();
