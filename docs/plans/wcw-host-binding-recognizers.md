@@ -281,3 +281,33 @@ is recorded so this one can be reconciled.
 `FN64_DISCOVER_*` entry in `.claude/local.env`, so nothing can grade a
 regression against it — that is the item to fix before anyone builds on this
 result, and it is bookkeeping rather than engineering.
+
+## Regression check: grade-all clean, and a second Revenge variant confirms
+
+`scripts/grade-all.sh`, all five configurations, after `10a73c7`:
+
+    config            exact  wrong
+    nw4e-donor          925      0
+    nw4e-solo           873      0
+    nwxe-donor          779      0
+    nwxe-solo           725      0
+    revenge-solo        597      0
+
+**`wrong = 0` everywhere.** This is the suite that would catch a recognizer
+change corrupting function-boundary recall, and it is clean.
+
+### The harness already had a Revenge lane, pointed at a DIFFERENT image
+
+`grade-all.sh:15-16` defaults to `~/Code/aki-recomp/donors/wcw-nwo-revenge.z64`
+— digest `fd9996c7…` — not the Starrcade v1.01 (`d8c097f8…`) certified above.
+Two distinct Revenge images, both on disk.
+
+**The donor image also probes `OK 15/15`.** That is a third variant the
+predicates were never tuned against (after Starrcade and Unlocked), and it is
+independent evidence they describe the routine rather than an image. It also
+means the grading harness's default needs no change.
+
+**Worth noting the harness anticipated this title** — the `FN64_DISCOVER_REVENGE_ROM`
+and `_DUMP` variables and the `revenge-solo` configuration already existed
+while the recognizers still rejected the ROM. The lane was waiting for
+discovery to catch up.
