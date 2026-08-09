@@ -20,6 +20,21 @@ from a number; every wasted day came from reasoning about code structure. If
 you cannot state the current cost of the thing you are about to optimize, you
 are not ready to optimize it.
 
+**31. Pre-register the closure tolerance IN CODE — it caught three defects in
+one hour.** Buckets must sum to their parent, the residual prints
+unconditionally, and the report refuses to present a split that does not close.
+On three consecutive smoke runs this caught: a walking clock lapping **across a
+coroutine suspend** (−697%; `resolve` read 197 ms/field inside a 40 ms field);
+the **partial fix** that covered one suspend site of many (−533%); and a
+**mislabelled bucket** where `gfx_ns` (21.5) exceeded its own parent (7.7).
+**None was visible in the phase values — all three looked like findings.**
+Corollaries: *a wall clock cannot time a stack that yields* (correct at the one
+chokepoint every yield passes, never at the N call sites — N was 16 and no
+enumeration is complete); *always report a nested counter against its containing
+bucket*, because **a child exceeding its parent** was the only signal that fired
+on the third; and **a label that is 95% something else is a wrong measurement
+wearing a plausible name.**
+
 **6a. Before trusting a check, confirm it CAN fail.** A check that returns the
 same answer regardless of the state it is checking is not a check. Prove the
 verifier distinguishes the two outcomes it exists to distinguish — ideally by
@@ -62,12 +77,34 @@ phase measuring below the perturbation is below the instrument's resolution.
 **4. Only measure on a quiet machine.** A concurrent shard rebuild made a 421 ms
 baseline read 775 ms.
 
+**30. A WAIT is a workload.** Rule 26 one step down: a probe is bounded, a
+**polling loop is unbounded and compounds**. Symptom: *load stays high with zero
+builders and zero benchmarks* — `ps -Ao comm | grep -c sleep` returned **19**,
+stacked `until…sleep…done` waiters (some nested on other waiters), holding load
+above the route script's own `--max-load 3.0` guard. Self-obscuring: the load
+was being read to decide whether to start, and the reading moved the number — a
+control loop with the wrong sign. **One waiter at a time, chained not nested**
+(put the wait and the work in ONE background command so the waiter becomes the
+run); **never poll a metric your polling affects**; prefer waiting on an
+artifact over a machine state. Do not pass `--max-load` to escape your own
+contention — that is editing the gate to match the run.
+
 **5. Interleave A/B pairs.** Not six of A then six of B — other agents land
 commits between blocks. Interleaving preserves an effect's *direction* through
 contention but not its *magnitude*.
 
 **Two or more reps, always.** A single pair reversed sign on rep 2: a −0.49 ms
 "win" became −0.14 ± 0.35, inside noise.
+
+**6b. Echo the gate's VALUE at the moment it takes effect.** One line —
+`FN64_X=${FN64_X:-<unset>}` printed by the lane runner itself — caught an A/B
+90 seconds in where **both lanes were the control lane.** A zsh `set -- $spec`
+did not word-split, so the lane name arrived as `"armed 1"`, matched neither
+branch, and fell through to the else that *unsets* the gate. Four runs, a
+clean-looking A/B, a perturbation of ~0.000, and a believable fabricated
+result. Rule 6 says prove the lanes differ; this is how, and it costs nothing.
+Make an unrecognized lane or rep **exit non-zero** rather than defaulting into
+a branch.
 
 **6. Prove the lanes differ before believing a number.** A fabricated 4.9x came
 from an env gate where an empty value read as ON, so both lanes were the same
@@ -144,6 +181,19 @@ while the benchmark runs at 100% — **advancing CPU TIME is the only honest
 liveness check**, sampled twice. `pgrep -f` counts your own monitoring shells
 and any wrapper whose command line contains the string. A PID is not a durable
 handle; PIDs get recycled.
+
+> **And it under-matches too, which is the worse direction.** `pgrep -f "cargo
+> build --release --bin wm2000-block-boot"` returned nothing while **15 `rustc`
+> processes were running** — cargo's real argv is not the command line you
+> typed, and the compile work lives in `rustc` children whose argv never
+> contains your string. An over-match reads as "still busy" and costs you a
+> wait; an **under-match reads as "finished" and is acted on.** Mine fired a
+> "BUILD PROCESS EXITED" that was false, seconds before I would have called a
+> mid-flight build a failure. **Wait on the ARTIFACT (`until [[ -x $BIN ]]`) or
+> on a completion marker your own script writes — never on a process pattern**
+> — and confirm liveness with advancing CPU time summed across `rustc`, not
+> with the absence of a `pgrep` hit. *Absence of a match is not evidence of
+> absence* (rules 19, 23).
 
 **20. Test the verifier on this machine, not just its logic.** A gate enforcing
 rule 19 crashed instead of verifying: `find -newermt "@<epoch>"` is GNU syntax
