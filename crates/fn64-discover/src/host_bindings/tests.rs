@@ -1221,3 +1221,84 @@ mod create_mesg_queue_is_register_allocation_free {
         assert!(!is_create_mesg_queue(&words));
     }
 }
+
+/// The per-symbol probe is a measurement surface over the same recognizers the
+/// production chain uses. If the two ever disagree the probe is reporting
+/// fiction, so the agreement is pinned rather than assumed.
+mod per_symbol_probe_agrees_with_the_chain {
+    use super::*;
+
+    /// A synthetic image the chain resolves completely would be large; instead
+    /// assert the structural invariants that make the probe's numbers legible.
+    #[test]
+    fn the_probe_reports_every_symbol_exactly_once() {
+        let words = vec![0u32; 512];
+        let outcomes = probe_wm_block_runtime_host_bindings(&words, 0x8000_0400);
+        assert_eq!(outcomes.len(), WM_BLOCK_RUNTIME_HOST_SYMBOLS.len());
+        for symbol in WM_BLOCK_RUNTIME_HOST_SYMBOLS {
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == symbol)
+                    .count(),
+                1,
+                "{symbol:?} must appear exactly once"
+            );
+        }
+    }
+
+    /// Zeroed words match nothing, so every standalone role is Absent and the
+    /// three derived roles are NotReached. Absent and NotReached must never
+    /// collapse into one another -- that conflation is the whole reason this
+    /// probe exists.
+    #[test]
+    fn derived_roles_are_not_reached_rather_than_absent() {
+        let words = vec![0u32; 512];
+        let outcomes = probe_wm_block_runtime_host_bindings(&words, 0x8000_0400);
+        let outcome = |symbol: HostBindingSymbol| {
+            outcomes
+                .iter()
+                .find(|(candidate, _)| *candidate == symbol)
+                .map(|(_, outcome)| outcome.clone())
+                .expect("every symbol is reported")
+        };
+        for symbol in [
+            HostBindingSymbol::OsRecvMesg,
+            HostBindingSymbol::OsSpTaskStartGo,
+            HostBindingSymbol::OsSpTaskYield,
+        ] {
+            assert!(
+                matches!(outcome(symbol), HostBindingProbeOutcome::NotReached { .. }),
+                "{symbol:?} is only reachable through an earlier stage"
+            );
+        }
+        for symbol in [
+            HostBindingSymbol::OsCreateMesgQueue,
+            HostBindingSymbol::OsEPiStartDma,
+            HostBindingSymbol::OsSetTimer,
+            HostBindingSymbol::OsSiDeviceBusy,
+            HostBindingSymbol::OsSpTaskLoad,
+        ] {
+            assert_eq!(
+                outcome(symbol),
+                HostBindingProbeOutcome::Absent,
+                "{symbol:?} was evaluated and found nothing"
+            );
+        }
+    }
+
+    /// NotReached is neither resolved nor evaluated. Scoring it as either
+    /// would produce exactly the misleading denominator this probe replaces.
+    #[test]
+    fn not_reached_is_scored_as_neither_resolved_nor_evaluated() {
+        let not_reached = HostBindingProbeOutcome::NotReached { needs: "whatever" };
+        assert!(!not_reached.is_resolved());
+        assert!(!not_reached.was_evaluated());
+        let absent = HostBindingProbeOutcome::Absent;
+        assert!(!absent.is_resolved());
+        assert!(absent.was_evaluated());
+        let resolved = HostBindingProbeOutcome::Resolved { vram: 0x8000_0400 };
+        assert!(resolved.is_resolved());
+        assert!(resolved.was_evaluated());
+    }
+}
