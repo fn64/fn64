@@ -1587,6 +1587,24 @@ pub struct PrimitiveDepth {
 }
 
 impl ColorImage {
+    /// Whether this target's base address lies outside the RDRAM actually
+    /// installed, making every write through it a documented no-op.
+    ///
+    /// N64brew *RDRAM Interface*, "Accesses outside of mapped RDRAM chips":
+    /// memory-space accesses "that hit addresses where there is no RDRAM chip
+    /// mapped will result in a sort of 'no-operation' behavior: reads will
+    /// return zero, and writes will be ignored", and "the same goes for
+    /// accessing addresses above 8 MiB, no Rambus device will respond to
+    /// requests". Explicitly NOT a mirror of low memory. The page's caveat
+    /// about stray non-zero values is scoped "at least during reads", so the
+    /// write rule stands unqualified.
+    ///
+    /// This is a property of the RAMBUS bus rather than of one bus master, so
+    /// it governs RDP writes exactly as it governs CPU writes.
+    pub fn is_unbacked_rdram(self, rdram_len: usize) -> bool {
+        self.address as usize >= rdram_len
+    }
+
     pub const RGBA_FORMAT: u8 = 0;
     pub const CI_FORMAT: u8 = 2;
     pub const IA_FORMAT: u8 = 3;

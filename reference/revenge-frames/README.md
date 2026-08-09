@@ -28,39 +28,78 @@ needs no route; this frame is reached by the game's own attract sequence.
 
 The run stopped shortly after this frame, and **not on anything
 title-specific**: the raw-RDP scanner rejected opcode `0x07` ("has no public
-command width"). Opcodes `0x01`–`0x07` were absent from its Table 11 map;
-Revenge's microcode emits one and WM2000's never does. That has since been
-fixed, along with four more of the same kind — see the run2 table below.
+command width"). That was the first of five apparent walls which turned out to
+share a single cause — the guest legally declares a command range far longer
+than its display list, and we were decoding the leftover bytes. See below.
 
-## Reproduction (run2, 2026-08-09)
+## Reproduction (run2-run5, 2026-08-09) — one root cause, five masks
 
-Every re-run since has **reproduced the frame byte-identical** (sha256
+Every re-run **reproduced the frame byte-identical** (sha256
 `9794211091c53fb7dd73e52501f959843cf943566e13eac8cc637893f1731ec1`, same task
-#654 / 259 tris), with task #656 the last to decode. Each re-run then advanced
-one wall further:
+#654 / 259 tris), with task #656 the last to decode. Each fix advanced the run
+a few commands further, to a new-looking wall:
 
-| # | stop | verdict |
+| # | stop | spec verdict |
 |---|---|---|
-| 1 | scanner: `0x07` "no public command width" | ours — `0x01`–`0x07` are all *No Operation*, one word each |
-| 2 | scanner: `0x7f` same message | ours — the command field is bits 61:56; `0x7f` masks to `0x3f` (Set Color Image). Only the `0xc0` spelling of every state command was accepted |
-| 3 | decoder: `G_NOOP reserved first-word payload must be zero` (`w0=0x000a0000`) | ours — the No Operation table marks every bit don't-care but `command[5:0]`; the rule was written for the GBI `gDPNoOp` and applied to the raw lane |
-| 4 | backend: `G_TEXRECT in Fill cycle is invalid` | ours — "In FILL mode this behaves identically to Fill Rectangle, the texturing properties are ignored" |
-| 5 | backend: `G_SETCIMG format=0 size=0 is unsupported` | ours — `G_SETCIMG` is a latch; validation now defers to the first draw through the target |
+| 1 | scanner: `0x07` "no public command width" | `0x01`-`0x07` are all *No Operation*, one word each |
+| 2 | scanner: `0x7f` same message | the command field is bits 61:56; `0x7f` masks to `0x3f`. Only the `0xc0` spelling of each state command was accepted |
+| 3 | decoder: `G_NOOP reserved first-word payload must be zero` (`w0=0x000a0000`) | No Operation marks every bit don't-care but `command[5:0]` |
+| 4 | backend: `G_TEXRECT in Fill cycle is invalid` | "In FILL mode this behaves identically to Fill Rectangle, the texturing properties are ignored" |
+| 5 | backend: `G_SETCIMG format=0 size=0 is unsupported` | `G_SETCIMG` is a latch, like `G_SETTIMG`; format matters at the draw |
 
-**Five walls, five ours.** Not one was a defect in Revenge's stream: each was a
-faithfulness rule written against what WM2000's F3DEX2 macros emit rather than
-against what the RDP accepts. `0x7f` looked like scanner misalignment when
-first seen — it was not; the field extraction was correct and the classifier
-was reading eight bits of a six-bit field.
+**These are five real spec corrections and each stands on its own.** But they
+were not five bugs. Dumping the command stream (`RSP_TRACE_DPC_WORDS`) showed
+**one** root cause wearing five masks.
 
-**Open question for the next run.** Wall 5 was fixed by deferring, which is
-right whether or not a draw follows the latch. But whether Revenge's stream
-*does* draw through that `format=0 size=0` target is **not yet established** —
-the console log does not show it. If the next run fails at a draw naming
-`format=0 size=0`, that is a genuinely new case (a 4-bit colour image is not a
-real framebuffer configuration) and wants reporting, not invented semantics.
-`FN64_XBUS_STREAM_DUMP_DIR` / `_SKIP` dump the captured command stream if the
-question needs settling directly.
+### The root cause: residue past `SyncFull`
+
+Task #657's display list ends at byte 3,280 of a **65,376-byte** submitted
+range. `SyncFull` sits at offset `0xcc8` — 5.0% in. The remaining 62,096 bytes
+are the *previous* frame's list, still resident in a reused command buffer.
+Every one of walls 1, 2, 3 and 5 was our decoders reading that residue:
+
+    0x0cc8  SyncFull            <- the real end of the list
+    0x0ce8  "NoOp 0x07"         <- wall 1     (float 2.04688)
+    0x0cf0  "NoOp" payload      <- wall 3     (0x000a0000)
+    0x0cf8  "SetColorImage"     <- walls 2, 5 (0x7ff80000 is float NaN)
+    0x0d28  clean commands resume — last frame's list
+
+The tell was there at wall 2 and I missed it: that "Set Color Image" decodes
+as `width=2049` at `addr=0xf80000`, for a game whose three real framebuffers
+are all `width=480` at `0x147000`/`0x17f400`/`0x1b7800`. A **valid command ID
+with an implausible payload** should have triggered a payload check
+immediately. The transferable rule: *when a rejection moves after a fix,
+validate the plausibility of the payload, not just the legality of the
+opcode* — a wall that relocates by a few commands is evidence you are decoding
+data, not commands.
+
+### Not our bookkeeping — and not a reason to stop at `SyncFull`
+
+The DPC range is exactly what the guest programmed. Every range starts at
+`0x3eefd0`; if `dp_current` were stale, #657 would start at #656's *end*. It
+does not, and #655 is a 51-command range immediately after an 8,165-command
+one, so there is no high-water mark. `[dp_current, dp_end)` is also the
+documented model — N64brew *RDP Interface* describes incremental transfers
+where "the DPC_END register can be updated ... and the DMA will continue
+running until the new end pointer is reached".
+
+Hardware does **not** stop at `SyncFull` either: it fetches until
+`CURRENT == END`, so the residue *is* consumed. Revenge ships and works on
+hardware because consuming it is harmless — the stale `G_SETCIMG` points at
+15.5 MiB, and per N64brew *RDRAM Interface* ("Accesses outside of mapped RDRAM
+chips") no Rambus device answers: reads return zero and **"writes will be
+ignored"**, explicitly not mirrored into low memory. The page's stray-value
+caveat is scoped "at least during reads", so the write rule is unqualified.
+
+So the fix is to execute the residue with that tolerance rather than to stop
+early: a colour target outside installed RDRAM latches, draws through it
+execute, and their writes are discarded. Stopping at `SyncFull` was rejected
+as unfaithful — it would also have broken the legal two-list incremental case
+and silently discarded whatever the residue does.
+
+**Strictness is unchanged for addresses that exist.** An unsupported format at
+a backed address is still a loud error; only the unbacked case is tolerated,
+because only there is the write unobservable.
 
 The exact invocation — recorded because the original session documented the
 outcome but not the command, which cost a full re-diagnosis. Run from

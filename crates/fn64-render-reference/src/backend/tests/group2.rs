@@ -1568,3 +1568,82 @@ fn drawing_through_an_unsupported_color_image_latch_still_fails() {
     assert!(error.to_string().contains("format=0 size=0"), "{error}");
     assert!(error.to_string().contains("requires 8-bit intensity"), "{error}");
 }
+
+/// The real WCW/nWo Revenge failure shape, reduced: a raw RDP command range
+/// whose `SyncFull` lands early, followed by residue left in a reused command
+/// buffer because the guest declared `DPC_END` far past its list.
+///
+/// Hardware does NOT stop at `SyncFull` -- it fetches until CURRENT==END --
+/// so the residue IS consumed. It is harmless there because the stale
+/// `G_SETCIMG` addresses RDRAM that does not exist, and per N64brew *RDRAM
+/// Interface* ("Accesses outside of mapped RDRAM chips") no Rambus device
+/// answers: "writes will be ignored". Revenge ships and works on hardware
+/// for exactly this reason.
+///
+/// So the residue must execute without error and without touching memory.
+#[test]
+fn residue_after_sync_full_executes_with_writes_dropped() {
+    let mut rdram = vec![0u8; 0x1000];
+    let mut put = |off: usize, w0: u32, w1: u32| {
+        rdram[off..off + 4].copy_from_slice(&w0.to_ne_bytes());
+        rdram[off + 4..off + 8].copy_from_slice(&w1.to_ne_bytes());
+    };
+    // Real list: FILL cycle (high bits 21:20 = 3), valid RGBA16 target,
+    // fill colour, one fill, SyncFull.
+    put(0x100, 0xef30_0000, 0x0000_0000);
+    put(0x108, 0xff10_0003, 0x0000_0800);
+    put(0x110, 0xf700_0000, 0x0001_0001);
+    put(0x118, 0xf600_0000, 0x0000_0000);
+    put(0x120, 0xe900_0000, 0x0000_0000);
+    // Residue past SyncFull, exactly as observed in Revenge task #657:
+    // a 0x40-spelled Set Color Image, format=0 size=0, at 15.5 MiB.
+    put(0x128, 0x7f00_1800, 0x00f8_0000);
+    // ...and a fill drawing through it. On hardware these writes vanish.
+    put(0x130, 0xf600_0000, 0x0000_0000);
+
+    let before = rdram.clone();
+    let mut backend = ReferenceBackend::new();
+    backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
+    backend
+        .process_rdp_commands(&mut rdram, 0x100, 0x138, 0)
+        .expect("residue past SyncFull must execute, not fault");
+
+    assert_eq!(
+        &rdram[0x100..0x138],
+        &before[0x100..0x138],
+        "the command buffer must not be modified by residue execution"
+    );
+}
+
+/// The dropped-write rule is scoped to addresses with no RDRAM behind them.
+/// An unsupported format at a REAL address is still a loud error -- tolerance
+/// for the unbacked case must not become tolerance in general.
+#[test]
+fn unsupported_format_at_a_backed_address_still_fails() {
+    let mut rdram = vec![0u8; 0x1000];
+    // format=0 size=0 but addressing real, backed memory.
+    rdram[0x100..0x104].copy_from_slice(&0xff00_0003u32.to_ne_bytes());
+    rdram[0x104..0x108].copy_from_slice(&0x800u32.to_ne_bytes());
+    rdram[0x108..0x10c].copy_from_slice(&0xf600_0000u32.to_ne_bytes());
+    rdram[0x10c..0x110].copy_from_slice(&0u32.to_ne_bytes());
+    rdram[0x110..0x114].copy_from_slice(&0xdf00_0000u32.to_ne_bytes());
+    rdram[0x114..0x118].copy_from_slice(&0u32.to_ne_bytes());
+
+    let mut backend = ReferenceBackend::new()
+        .with_f3dex2()
+        .with_f3dex2_ucode_text(&[0; fn64_runtime::RSP_MEMORY_BANK_SIZE]);
+    backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
+    let error = backend
+        .process_task(
+            &mut rdram,
+            &mut fn64_runtime::RspMemory::new(),
+            &OsTask {
+                task_type: fn64_render::M_GFXTASK,
+                data_ptr: 0x100,
+                ..OsTask::default()
+            },
+            0,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("format=0 size=0"), "{error}");
+}
