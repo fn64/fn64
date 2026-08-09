@@ -647,6 +647,12 @@ pub enum AbiHostShimV1 {
     /// `osEPiReadIo(OSPiHandle *, u32 devAddr, u32 *data)`, the read
     /// counterpart used for command status and identity polls.
     OsEPiReadIo,
+    /// `osFlashInit(void) -> OSPiHandle *`.
+    OsFlashInit,
+    /// `osFlashSectorErase(u32 page_num) -> s32`.
+    OsFlashSectorErase,
+    /// `osFlashReadArray(OSIoMesg *, s32, u32, void *, u32, OSMesgQueue *)`.
+    OsFlashReadArray,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

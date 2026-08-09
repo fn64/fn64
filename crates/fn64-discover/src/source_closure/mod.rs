@@ -437,6 +437,9 @@ pub enum HostBindingSymbolV1 {
     OsDriveRomInit,
     OsEPiWriteIo,
     OsEPiReadIo,
+    OsFlashInit,
+    OsFlashSectorErase,
+    OsFlashReadArray,
 }
 
 impl From<crate::host_bindings::HostBindingSymbol> for HostBindingSymbolV1 {
@@ -461,6 +464,9 @@ impl From<crate::host_bindings::HostBindingSymbol> for HostBindingSymbolV1 {
             Source::OsStartThread => Self::OsStartThread,
             Source::OsEPiWriteIo => Self::OsEPiWriteIo,
             Source::OsEPiReadIo => Self::OsEPiReadIo,
+            Source::OsFlashInit => Self::OsFlashInit,
+            Source::OsFlashSectorErase => Self::OsFlashSectorErase,
+            Source::OsFlashReadArray => Self::OsFlashReadArray,
         }
     }
 }
