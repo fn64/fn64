@@ -509,3 +509,42 @@ the machine (rule 9 — never build beside a benchmark).
 Lesson worth carrying regardless: **record the ROM digest beside every per-title
 result.** A title string cannot distinguish variants, and this project has four
 No Mercy images on disk of which none matches the capture's `fc561fce…`.
+
+## The critical path, located precisely (2026-08-08, coordinator)
+
+Verified the study's two structural claims by reading, and the second is
+tighter than "a build-system change" suggests.
+
+**The shard generator is genuinely title-agnostic.** Of 14 WM2000/NWXE
+references in `examples/wm2000-block-shards/build.rs`, **8 are comments or test
+names, 1 is an error message, and 5 are Cargo package-name prefixes**
+(`wm2000-block-shard-`, `-resident-tail-shard-`, `-overlay-` at `:324`, `:330`,
+`:346`, `:666`, `:669`, `:677`). None encodes topology. Line 616 states the
+generator already knows both splits: *"the index the split falls in is
+per-title (WM2000: 14, No Mercy: 13)"*.
+
+**The binding is in the boot harness, and it is a hardcoded path, not a
+constant.** `generated_runner_build/mod.rs:142-143`:
+
+```rust
+const SHARD_INVENTORY: &[(&str, &str)] =
+    &include!("../../../../examples/wm2000-block-shards/shard_inventory.in");
+```
+
+`SHARD_COUNT`, `PREPARED_PACKAGES` and `SHARD_MANIFEST_DIRS` are all derived
+from that one `include!` in const context, so they follow automatically — they
+are **not** independent per-title constants. The 37-entry inventory file is the
+single source of truth and already describes itself that way.
+
+Alongside it, `generated_runner_build/build.rs` hardcodes the same directory
+**six times** (`:867`, `:874`, `:876`, `:882`, `:888` and `wm_shard_root`).
+
+**So the per-title surface is one `include!` path plus six string literals in
+one file** — not a build-system redesign. A second title needs its own shard
+crate directory and inventory, and these seven sites need to select between
+them. That is a smaller change than the study's M–L estimate implies, though
+selecting at compile time across two inventories in const context is the part
+that needs design rather than editing.
+
+**Unverified:** whether anything outside `generated_runner_build` assumes the
+WM2000 inventory. Grepped only that crate.
