@@ -139,6 +139,15 @@ and BSD `find` on macOS rejects it. It had been tested against synthetic inputs
 and passed. Prefer constructions whose failure mode is a crash over an empty
 result. There is no `readelf` and no `timeout` here; binaries are Mach-O.
 
+**Freeze the log before you analyze it.** A distribution needs a fixed
+population, and a file a process is still writing is not one. Two agents
+extracting "the same" live log got n=117/131/164/172/183 and n=151/173 — every
+count differed, and the natural inference was an extraction bug rather than a
+moving target. One agent "verified" the other's finding against a different
+population and declared it wrong; both retracted. **Copy to a frozen snapshot,
+cite the snapshot, and treat differing n between readers as evidence the file
+moved, not that someone parsed it wrong.**
+
 **A key that appears twice is two metrics.** A byte-identity checker did
 `findall(...)[-1]` on `gfx_submits=` and silently compared the **steady-state
 span** count (`[frame-census]`, line 175) against a **whole-run** expectation
