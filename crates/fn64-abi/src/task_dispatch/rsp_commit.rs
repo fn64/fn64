@@ -354,16 +354,21 @@ pub(crate) unsafe fn dispatch_lle_task(
             });
         }
         for replacement in replacements {
+            // One 4 KiB IMEM digest serves both observations. They described
+            // the same `replacement.image` and nothing mutates it between
+            // them, so the two hashes were always equal; computing it once
+            // makes that identity structural rather than coincidental.
+            let text_sha256 = imem_sha256(&replacement.image);
             observations.push(RspRdpObservationKind::ImemReplacementCommitted {
                 task_addr,
                 imem_generation: replacement.generation,
-                text_sha256: imem_sha256(&replacement.image),
+                text_sha256,
             });
             if let Some(data) = recognition_data {
                 observations.push(RspRdpObservationKind::MicrocodeRecognition {
                     task_addr,
                     imem_generation: replacement.generation,
-                    text_sha256: imem_sha256(&replacement.image),
+                    text_sha256,
                     data_addr: data.addr,
                     data_size: data.size,
                     data_sha256: data.sha256,

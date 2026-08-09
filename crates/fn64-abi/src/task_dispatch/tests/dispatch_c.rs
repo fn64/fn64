@@ -1669,3 +1669,103 @@ use super::*;
             fn64_runtime::DpcScheduledPhase::Complete
         );
     }
+
+
+    /// The batched `canonical_rdp_words_sha256` must produce the exact value
+    /// the per-word `Digest::update` loop produced, because that value ships
+    /// as `command_sha256` in release-gate evidence.
+    ///
+    /// The reference here is the literal pre-batching implementation, not a
+    /// recomputation through the same chunking, so a chunking bug cannot
+    /// cancel out on both sides.
+    #[test]
+    fn canonical_rdp_words_sha256_matches_per_word_updates() {
+        fn per_word_reference(words: &[u32]) -> [u8; 32] {
+            let mut digest = Sha256::new();
+            for word in words {
+                digest.update(word.to_be_bytes());
+            }
+            digest.finalize().into()
+        }
+
+        // Lengths straddling the 1024-word chunk boundary: empty, short,
+        // exactly one chunk, one over, and several chunks plus a remainder.
+        for len in [0usize, 1, 2, 7, 1023, 1024, 1025, 2048, 3000] {
+            let words: Vec<u32> = (0..len)
+                .map(|index| (index as u32).wrapping_mul(0x9e37_79b9) ^ 0xe900_0000)
+                .collect();
+            assert_eq!(
+                canonical_rdp_words_sha256(&words),
+                per_word_reference(&words),
+                "batched RDP command digest diverged from the per-word loop at {len} words"
+            );
+        }
+    }
+
+    /// Byte order is load-bearing: the digest is defined over the BIG-endian
+    /// image of each word. A host-order staging bug would pass the identity
+    /// test above only if the reference had the same bug, so pin one literal
+    /// vector against an independently written big-endian byte sequence.
+    #[test]
+    fn canonical_rdp_words_sha256_digests_the_big_endian_image() {
+        let words = [0xe900_0000u32, 0x0000_0001, 0xdead_beef];
+        let expected: [u8; 32] = Sha256::digest([
+            0xe9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef,
+        ])
+        .into();
+        assert_eq!(canonical_rdp_words_sha256(&words), expected);
+    }
+
+    /// `task_microcode_data_identity` batches its `Digest::update` calls, but
+    /// the sequence it digests is the LOGICAL byte order produced by
+    /// `RdramPtr::read_u8`, which reads storage index `addr ^ 3`. Chunking
+    /// over raw storage instead would reorder every 4-byte group and change
+    /// `data_sha256` in release-gate evidence.
+    ///
+    /// The span deliberately starts at an unaligned logical address and runs
+    /// past the 4096-byte staging chunk, so both the lane mapping and the
+    /// chunk boundary are exercised.
+    #[test]
+    fn microcode_data_identity_batches_the_swizzled_logical_order() {
+        const DATA: u32 = 0x1001;
+        const LEN: usize = 5000;
+        crate::load_rom(Vec::new());
+        let mut rdram = vec![0u8; 0x4000];
+        let payload: Vec<u8> = (0..LEN).map(|index| (index % 251) as u8).collect();
+        {
+            let mut view = fn64_runtime::RdramViewMut::from_storage(&mut rdram);
+            for (offset, byte) in payload.iter().copied().enumerate() {
+                view.write_u8(RdramAddr::from_offset(DATA + offset as u32), byte);
+            }
+        }
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let identity = unsafe {
+            task_microcode_data_identity(
+                rdram.as_mut_ptr(),
+                RdramAddr::from_offset(0x40),
+                DATA,
+                LEN as u32,
+            )
+        };
+
+        // Independent per-byte reference through the same accessor: this is
+        // the literal pre-batching loop.
+        let mut reference = Sha256::new();
+        {
+            let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram.as_mut_ptr()) };
+            for offset in 0..LEN as u32 {
+                reference.update([unsafe {
+                    memory.read_u8(RdramAddr::from_offset(DATA).checked_add(offset).unwrap())
+                }]);
+            }
+        }
+        let reference: [u8; 32] = reference.finalize().into();
+        assert_eq!(identity.sha256, reference);
+        // And the logical order is the payload as written, not lane order.
+        let expected: [u8; 32] = Sha256::digest(&payload).into();
+        assert_eq!(identity.sha256, expected);
+    }
