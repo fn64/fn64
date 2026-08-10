@@ -53,7 +53,7 @@ that the gate does not produce.
 | 6 | Boot context capture | `~/Code/aki-recomp/captures/*-boot-context.json` | **Semi-mechanical** (one automated emulator run) |
 | 7 | Executable-image group (≥3 captures) | `captures/wm-general-exception-images/` | **Semi-mechanical** (automated run + human-located PCs) |
 | 8 | Scripted input schedule | `reference/wm2000-routes/*.schedule` | **Bespoke** (hand-authored, frame-verified) |
-| 9 | Byte-identity tuple | `.claude/skills/fn64-perf-method/SKILL.md:254-259` | **Bespoke** (per-title, only exists once a route runs) |
+| 9 | Byte-identity tuple | `.claude/skills/fn64-perf-method/REFERENCE.md:322-332` | **Bespoke** (per-title, only exists once a route runs) |
 | 10 | RSP audio / RDP graphics | `crates/fn64-audio/`, RT64 | **Shared** — not per-title |
 
 ### 1.1 The shard pack — 22 title references, only 6 functional
