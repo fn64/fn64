@@ -1942,6 +1942,7 @@ mod runners;
 // in scope with their type.
 pub use execution::*;
 pub use host_memory::{declare_guest_physical_write, read_guest_physical, write_guest_physical};
+pub use live_program::*;
 pub use receipts::*;
 pub use runners::*;
 pub use snapshots::*;
