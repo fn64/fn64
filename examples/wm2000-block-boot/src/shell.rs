@@ -78,7 +78,7 @@ use gamepad::Gamepads;
 use input_map::{InputConfig, PadState};
 use timing::{RetraceOutcome, TimingWindow};
 
-use pixels::{Pixels, SurfaceTexture};
+use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -1237,19 +1237,28 @@ impl Shell {
     /// part that legitimately differs.
     fn report_presented_frame(&mut self, blank: bool, source: &str, first_frame_detail: &str) {
         let frames = self.presented_frames;
-        let swaps = fn64_abi::vi_swap_count();
+        // NOT `vi_swap_count()`. That counts `osViSwapBuffer_recomp` entries,
+        // and WM2000 never calls it -- it flips VI_ORIGIN through raw MMIO, so
+        // the count is a permanent zero for a title that is presenting fine
+        // (measured 2026-08-07, blocker ledger 1744-1830). Printing it here has
+        // now been read as a subsystem failure twice, most recently in a
+        // 1,080-frame windowed session that was rendering and animating
+        // throughout. A counter that is structurally zero for the title under
+        // test does not belong on the routine progress line; the scanout origin
+        // is the portable fact.
+        let scanout = fn64_abi::scanout_vi_framebuffer();
         let rgba_hash = framebuffer::rgba_hash(&self.rgba);
         if !self.reported_first_frame {
             if blank {
                 println!(
                     "[wm2000-shell] presenting {source} \
-                     (osViSwapBuffer calls so far: {swaps}) -- currently BLANK/uniform (the game \
+                     (scanout={scanout:?}) -- currently BLANK/uniform (the game \
                      has not rendered visible geometry yet). Window + present path are live."
                 );
             } else {
                 println!(
                     "[wm2000-shell] presenting {source} \
-                     (osViSwapBuffer calls so far: {swaps}) -- non-uniform, \
+                     (scanout={scanout:?}) -- non-uniform, \
                      rgba_hash={rgba_hash:016x} (a comparison key, not a correctness claim); \
                      {first_frame_detail}"
                 );
@@ -1283,7 +1292,7 @@ impl Shell {
             println!(
                 "[wm2000-shell] heartbeat: presented frame #{frames} {source} \
                  ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
-                 osViSwapBuffer calls={swaps}; frame_interval_ms[{}] pump_ms[{}]; \
+                 scanout={scanout:?}; frame_interval_ms[{}] pump_ms[{}]; \
                  audio{}: ai_buffers={} samples={} nonzero={} backend_buffers={}",
                 fmt(&interval),
                 fmt(&pump),
@@ -1378,7 +1387,30 @@ impl ApplicationHandler for Shell {
         };
         let win_size = window.inner_size();
         let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
-        match Pixels::new(self.fb_width as u32, self.fb_height as u32, surface) {
+        // `Pixels::new` defaults to `PresentMode::AutoVsync`
+        // (pixels-0.15.0/src/builder.rs:57), which BLOCKS each present until the
+        // next vblank. Measured on a live RT64 session: pump_ms p50 9.7 -- the
+        // guest comfortably inside the 16.667 ms budget -- while frame_interval
+        // p50 was 26.0, p95 40.5, p99 47.2. Those are not vsync multiples; a
+        // loop that keeps up clusters AT 16.7/33.3/50. Spreading between them is
+        // missed-deadline judder: ~9.7 ms of work, then a full vblank wait, and
+        // the 16.3 ms difference is exactly that wait.
+        //
+        // The guest is not the bottleneck for on-screen smoothness here, the
+        // presentation policy is. `FN64_PRESENT_MODE=vsync` restores the old
+        // behaviour; the default is now no-vsync so the emulator's own pacing
+        // governs, and tearing is preferable to a 1.5x frame-time penalty on a
+        // guest that already fits its budget.
+        let present_mode = match std::env::var("FN64_PRESENT_MODE").as_deref() {
+            Ok("vsync") => pixels::wgpu::PresentMode::AutoVsync,
+            Ok("mailbox") => pixels::wgpu::PresentMode::Mailbox,
+            _ => pixels::wgpu::PresentMode::AutoNoVsync,
+        };
+        println!("[wm2000-shell] present mode: {present_mode:?}");
+        match PixelsBuilder::new(self.fb_width as u32, self.fb_height as u32, surface)
+            .present_mode(present_mode)
+            .build()
+        {
             Ok(px) => {
                 self.pixels = Some(px);
                 self.window = Some(window);
@@ -1450,22 +1482,40 @@ impl ApplicationHandler for Shell {
         self.gamepads.poll();
         let _ = self.gamepads.take_pressed();
 
-        const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+        // WM2000 renders at 30 Hz: it submits ~2.88 display lists on every
+        // second VI field and none on the other. Measured live, that makes
+        // pump_ms alternate ~10 ms / ~42 ms, and a fixed 16.667 ms deadline
+        // cannot hold it -- the render field always overshoots, re-anchors at
+        // `now_t + FRAME`, and the following cheap field then arrives early.
+        // The result is 10/42/10/42 reaching the eye as judder, which reads as
+        // far worse than a slower but EVEN cadence.
+        //
+        // So pace to what the guest can actually sustain rather than to the
+        // field rate it cannot. `FN64_FRAME_PACE_MS` overrides; 0 restores the
+        // old 16.667 ms behaviour. The default of 33.333 (30 Hz) matches the
+        // game's own render cadence, so both populations fit inside one
+        // deadline and frames land evenly.
+        let frame_ns: u64 = match std::env::var("FN64_FRAME_PACE_MS").ok().and_then(|v| v.parse::<f64>().ok()) {
+            Some(ms) if ms <= 0.0 => 16_666_667,
+            Some(ms) => (ms * 1e6) as u64,
+            None => 33_333_333,
+        };
+        let frame: std::time::Duration = std::time::Duration::from_nanos(frame_ns);
         let now_t = std::time::Instant::now();
         if now_t >= self.next_frame_deadline {
             self.frame_intervals
                 .record(now_t.saturating_duration_since(
-                    self.next_frame_deadline.checked_sub(FRAME).unwrap_or(now_t),
+                    self.next_frame_deadline.checked_sub(frame).unwrap_or(now_t),
                 ));
             self.pump_one_frame();
             self.pump_times.record(now_t.elapsed());
             // Hold cadence while we keep up; re-anchor (dropping missed frames)
             // when we fall behind, so a slow pump cannot spiral into catch-up.
             self.next_frame_deadline =
-                if now_t.saturating_duration_since(self.next_frame_deadline) < FRAME {
-                    self.next_frame_deadline + FRAME
+                if now_t.saturating_duration_since(self.next_frame_deadline) < frame {
+                    self.next_frame_deadline + frame
                 } else {
-                    now_t + FRAME
+                    now_t + frame
                 };
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw();
