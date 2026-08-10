@@ -15,7 +15,7 @@ titles fail for entirely different reasons, and only one of them is close.
 
 ## The probe output does not say what it looks like it says
 
-`examples/probe_host_bindings.rs` prints `found.len()/{total}` on success but
+`crates/fn64-discover/examples/probe_host_bindings.rs` prints `found.len()/{total}` on success but
 only `{total}` on failure:
 
 ```rust

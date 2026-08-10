@@ -847,7 +847,9 @@ every event registration. Separately, over the long route
 (`FN64_BLOCK_MAX_STEPS=40000000 FN64_BLOCK_MIN_GUEST_INSTRUCTIONS=1461877`),
 both lanes report `achieved_guest_instructions=1461883 scheduler_steps=874
 sim_time=1492883` and the identical
-`logical_rdram_sha256=3514f2a1e2bf9b667f0a7d0d5bbd1370c85276c49864cb337e9be220aad22080`.
+`logical_rdram_sha256=3514f2a1e2bf9b667f0a7d0d5bbd1370c85276c49864cb337e9be220aad22080` (no test owns it).
+Reproducing that digest needs the ROM and a 40M-step run, so it is the record
+of a measurement rather than a gate.
 
 ### Determinism, proven against injected faults
 

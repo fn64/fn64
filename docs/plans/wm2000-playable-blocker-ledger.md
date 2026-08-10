@@ -943,7 +943,7 @@ FN64_BLOCK_MIN_GUEST_INSTRUCTIONS=1461877`, ~229 ms) reports
 `gfx_submits=0 sp_tasks=0`. **It exercises zero rendering** and cannot measure
 this subsystem at all; a renderer change of any size moves it not at all.
 
-The isolated benchmark is `examples/xbus_replay` against a captured stream:
+The isolated benchmark is `crates/fn64-render-reference/examples/xbus_replay.rs` against a captured stream:
 
 ```
 FN64_XBUS_STREAM_DUMP_DIR=/tmp/fn64-xbus FN64_XBUS_STREAM_DUMP_SKIP=20 \

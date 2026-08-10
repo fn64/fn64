@@ -106,8 +106,8 @@ validated`, `capture_count: 3`, `image_id: general-exception-preamble`,
 they do.
 
 **Verify the binding before using them:** every `image.json` and the boot
-context carry `normalized_rom_sha256`, and it must equal
-`358e9a345438155c6bd57da4bbf0f7a9fa1b4f7d5b1b726e8076c38f0f987e52`. No Mercy's
+context carry `normalized_rom_sha256`, and it must equal the ROM identity
+`358e9a345438155c6bd57da4bbf0f7a9fa1b4f7d5b1b726e8076c38f0f987e52` (a ROM identity, so no test owns it). No Mercy's
 filed context bound `fc561fce…` — a different ROM — and only this check caught
 it.
 

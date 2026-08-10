@@ -1094,7 +1094,7 @@ regeneration** and drops edit 1 each time.
 Built and booted 2026-08-09, ROM `11640379…`, `FN64_RENDER=reference`,
 headless, **no controller schedule** (`FN64_CONTROLLER_SCHEDULE` is an
 `Option`). Binary `examples/nomercy-block-boot`, canonical program artifact
-`9f5ff066916d21df1debe89fc8e78488dacb15596cead357ad08cb851a9bc06c`.
+`9f5ff066916d21df1debe89fc8e78488dacb15596cead357ad08cb851a9bc06c` (no test owns it; rebuilding needs the ROM).
 
 | tier | result |
 |---|---|
