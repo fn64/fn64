@@ -338,7 +338,7 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | RSP/SP | `osSpTaskLoad_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:867` |
 | RSP/SP | `osSpTaskStartGo_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:977` |
 | RSP/SP | `osSpTaskYield_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1355` |
-| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1379` |
+| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1387` |
 | RSP/SP | `__osSpSetPc_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:12` |
 | Voice/ISV | `osVoiceSetWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:233` |
 | Voice/ISV | `osVoiceCheckWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:200` |
@@ -360,9 +360,9 @@ These low-level or title-specific helpers are real ABI exports but are not part 
 | `__osPiRelAccess_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:939` |
 | `__osSiDeviceBusy_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:633` |
 | `__osSiRawStartDma_recomp` | **implemented** | `crates/fn64-abi/src/si/mod.rs:705` |
-| `__osSpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:106` |
+| `__osSpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:108` |
 | `__osSpSetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:30` |
-| `osDpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:116` |
+| `osDpGetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:118` |
 | `osDpSetStatus_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:46` |
 | `osEPiWriteIo_recomp` | **implemented** | `crates/fn64-abi/src/pi/timing.rs:1089` |
 | `osGbpakCheckConnector_recomp` | **implemented** | `crates/fn64-abi/src/gbpak.rs:346` |
