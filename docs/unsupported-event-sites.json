@@ -59,18 +59,53 @@
   ],
   "sites": [
     {
-      "operation": "abi.generated-c-direct-device.bad-address",
+      "operation": "abi.pi.absent-domain1-device",
       "subsystem": "abi",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/lib.rs",
-      "trigger": "used unsupported mapped address with width"
+      "path": "crates/fn64-abi/src/pi/timing.rs",
+      "trigger": "CPU read of PI domain-1 address 1"
     },
     {
-      "operation": "abi.generated-c-memory.unaligned",
-      "subsystem": "abi",
+      "operation": "runtime.overlay.get-function",
+      "subsystem": "runtime",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/lib.rs",
-      "trigger": "generated-C {width}-byte {operation} at unaligned guest address"
+      "path": "crates/fn64-runtime/src/overlay.rs",
+      "trigger": "get_function: no loaded section resolves vram"
+    },
+    {
+      "operation": "runtime.transfer-pak.read-address",
+      "subsystem": "runtime",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-runtime/src/transfer_pak.rs",
+      "trigger": "Transfer Pak read uses unsupported accessory address"
+    },
+    {
+      "operation": "runtime.transfer-pak.power-value",
+      "subsystem": "runtime",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-runtime/src/transfer_pak.rs",
+      "trigger": "Transfer Pak power/probe write at"
+    },
+    {
+      "operation": "runtime.transfer-pak.write-address",
+      "subsystem": "runtime",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-runtime/src/transfer_pak.rs",
+      "trigger": "Transfer Pak write uses unsupported accessory address"
+    },
+    {
+      "operation": "runtime.transfer-pak.battery-metadata-version",
+      "subsystem": "runtime",
+      "disposition": "returned_error",
+      "path": "crates/fn64-runtime/src/transfer_pak.rs",
+      "trigger": "MBC3 battery metadata version {version} is unsupported"
+    },
+    {
+      "operation": "runtime.transfer-pak.cartridge-type",
+      "subsystem": "runtime",
+      "disposition": "returned_error",
+      "path": "crates/fn64-runtime/src/transfer_pak.rs",
+      "trigger": "Game Boy cartridge type {other:#04x} is unsupported"
     },
     {
       "operation": "abi.generated-c-mmio.bad-width",
@@ -80,11 +115,18 @@
       "trigger": "used unsupported {width}-byte access"
     },
     {
-      "operation": "abi.pi.absent-domain1-device",
+      "operation": "abi.generated-c-memory.unaligned",
       "subsystem": "abi",
       "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/pi/timing.rs",
-      "trigger": "CPU read of PI domain-1 address 1"
+      "path": "crates/fn64-abi/src/lib.rs",
+      "trigger": "generated-C {width}-byte {operation} at unaligned guest address"
+    },
+    {
+      "operation": "abi.generated-c-direct-device.bad-address",
+      "subsystem": "abi",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/lib.rs",
+      "trigger": "used unsupported mapped address with width"
     },
     {
       "operation": "abi.pi.epi-handle",
@@ -92,55 +134,6 @@
       "disposition": "loud_trap",
       "path": "crates/fn64-abi/src/pi/mmio.rs",
       "trigger": "fn64_runtime::UnsupportedSubsystem::Abi,\n        \"abi.pi.epi-handle\""
-    },
-    {
-      "operation": "audio.hle.compact-memory-unsupported-opcode",
-      "subsystem": "audio",
-      "disposition": "returned_error",
-      "path": "crates/fn64-audio/src/compact_memory_abi.rs",
-      "trigger": "compact audio DMA reached uncharacterized selector {opcode:#04x}"
-    },
-    {
-      "operation": "audio.rsp.delay-slot-control-transfer",
-      "subsystem": "audio",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
-      "trigger": "unsupported RSP control transfer"
-    },
-    {
-      "operation": "audio.rsp.imem-overrun",
-      "subsystem": "audio",
-      "disposition": "returned_error",
-      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
-      "trigger": "ran outside admitted IMEM"
-    },
-    {
-      "operation": "audio.rsp.recompiler-step-budget",
-      "subsystem": "audio",
-      "disposition": "returned_error",
-      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
-      "trigger": "exceeded its fixed step budget"
-    },
-    {
-      "operation": "audio.rsp.unhandled-jump-target",
-      "subsystem": "audio",
-      "disposition": "returned_error",
-      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
-      "trigger": "has no admitted instruction"
-    },
-    {
-      "operation": "audio.rsp.unimplemented-vu-op",
-      "subsystem": "audio",
-      "disposition": "returned_error",
-      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
-      "trigger": "has no dispatch body"
-    },
-    {
-      "operation": "audio.rsp.unknown-instruction",
-      "subsystem": "audio",
-      "disposition": "returned_error",
-      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
-      "trigger": "unimplemented RSP instruction word"
     },
     {
       "operation": "audio.task.missing-execution-policy",
@@ -155,6 +148,55 @@
       "disposition": "loud_trap",
       "path": "crates/fn64-abi/src/task_dispatch/rsp_commit.rs",
       "trigger": "task_offset={o:#010x} exit_reason={reason}"
+    },
+    {
+      "operation": "audio.rsp.unknown-instruction",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
+      "trigger": "unimplemented RSP instruction word"
+    },
+    {
+      "operation": "audio.hle.compact-memory-unsupported-opcode",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/compact_memory_abi.rs",
+      "trigger": "compact audio DMA reached uncharacterized selector {opcode:#04x}"
+    },
+    {
+      "operation": "audio.rsp.unimplemented-vu-op",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
+      "trigger": "has no dispatch body"
+    },
+    {
+      "operation": "audio.rsp.delay-slot-control-transfer",
+      "subsystem": "audio",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
+      "trigger": "unsupported RSP control transfer"
+    },
+    {
+      "operation": "audio.rsp.unhandled-jump-target",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
+      "trigger": "has no admitted instruction"
+    },
+    {
+      "operation": "audio.rsp.imem-overrun",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
+      "trigger": "ran outside admitted IMEM"
+    },
+    {
+      "operation": "audio.rsp.recompiler-step-budget",
+      "subsystem": "audio",
+      "disposition": "returned_error",
+      "path": "crates/fn64-audio/src/rsp/recomp/mod.rs",
+      "trigger": "exceeded its fixed step budget"
     },
     {
       "operation": "audio.ucode-executor.unimplemented",
@@ -178,11 +220,11 @@
       "trigger": "recompiler.cpu.unsupported-instruction"
     },
     {
-      "operation": "render.backend.unsupported-ucode",
+      "operation": "render.raw-rdp.default-backend",
       "subsystem": "render",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-abi/src/task_dispatch/setup.rs",
-      "trigger": "backend rejected unlisted microcode at RDRAM offset"
+      "disposition": "returned_error",
+      "path": "crates/fn64-render/src/lib.rs",
+      "trigger": "raw RDP command execution ["
     },
     {
       "operation": "render.geometry-task-inspection.rejected",
@@ -192,60 +234,18 @@
       "trigger": "inspector={INSPECTOR}; reason={reason}"
     },
     {
+      "operation": "render.backend.unsupported-ucode",
+      "subsystem": "render",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/task_dispatch/setup.rs",
+      "trigger": "backend rejected unlisted microcode at RDRAM offset"
+    },
+    {
       "operation": "render.hle-ucode.needs-lle",
       "subsystem": "render",
       "disposition": "needs_lle",
       "path": "crates/fn64-abi/src/task_dispatch/lifecycle.rs",
       "trigger": "microcode_sha256={digest}"
-    },
-    {
-      "operation": "render.raw-rdp.default-backend",
-      "subsystem": "render",
-      "disposition": "returned_error",
-      "path": "crates/fn64-render/src/lib.rs",
-      "trigger": "raw RDP command execution ["
-    },
-    {
-      "operation": "runtime.overlay.get-function",
-      "subsystem": "runtime",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-runtime/src/overlay.rs",
-      "trigger": "get_function: no loaded section resolves vram"
-    },
-    {
-      "operation": "runtime.transfer-pak.battery-metadata-version",
-      "subsystem": "runtime",
-      "disposition": "returned_error",
-      "path": "crates/fn64-runtime/src/transfer_pak.rs",
-      "trigger": "MBC3 battery metadata version {version} is unsupported"
-    },
-    {
-      "operation": "runtime.transfer-pak.cartridge-type",
-      "subsystem": "runtime",
-      "disposition": "returned_error",
-      "path": "crates/fn64-runtime/src/transfer_pak.rs",
-      "trigger": "Game Boy cartridge type {other:#04x} is unsupported"
-    },
-    {
-      "operation": "runtime.transfer-pak.power-value",
-      "subsystem": "runtime",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-runtime/src/transfer_pak.rs",
-      "trigger": "Transfer Pak power/probe write at"
-    },
-    {
-      "operation": "runtime.transfer-pak.read-address",
-      "subsystem": "runtime",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-runtime/src/transfer_pak.rs",
-      "trigger": "Transfer Pak read uses unsupported accessory address"
-    },
-    {
-      "operation": "runtime.transfer-pak.write-address",
-      "subsystem": "runtime",
-      "disposition": "loud_trap",
-      "path": "crates/fn64-runtime/src/transfer_pak.rs",
-      "trigger": "Transfer Pak write uses unsupported accessory address"
     }
   ]
 }
