@@ -3,6 +3,8 @@
 Status: active implementation plan
 Last updated: 2026-08-01
 
+Execution handoff: [`plans/discover-pipeline-improvements.md`](plans/discover-pipeline-improvements.md)
+
 ## Composing milestone: byte-exact rebuild proven, known + novel (2026-08-01)
 
 `gate_rom_rebuild` composes automatic discovery into the Phase-8 end

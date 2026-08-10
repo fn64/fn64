@@ -1,34 +1,97 @@
 # fn64
 
-**A Rust runtime for N64 static recompilation. MIT-licensed, because sharing
-shouldn't require a lawyer.**
+**A Rust foundation for Nintendo 64 recompilation projects and native ports.**
 
-`fn64` runs the C emitted by an N64 static recompiler ([our fork of
-N64Recomp](https://github.com/fn64/n64recomp), MIT) as a native desktop app.
-It's the layer under the game: scheduler, message queues, timers, DMA and
-overlay lifecycle, save/input/audio, persistent RSP memory/DMA and task dispatch. That layer exists
-elsewhere — GPL-3.0, C++, and carrying race conditions we've personally
-excavated. So we're building the one we actually want.
+fn64 connects ROM discovery, typed-Rust code generation, the N64Recomp ABI, a
+libultra runtime, rendering seams, and executable evidence in one clean-room,
+permissively licensed stack.
 
-## Why
+[Explore fn64](https://fn64.github.io/) ·
+[Read the design](docs/DESIGN.md) ·
+[See the roadmap](docs/ROADMAP.md) ·
+[Contribute](AGENTS.md)
 
-- **License, obviously.** Everything here is MIT OR Apache-2.0, end to end.
-  Ship it, fork it, embed it, never ask permission. (No game content or
-  ROM-derived bytes live in this repo — users recompile their own ROMs,
-  locally, always.)
-- **We already paid the tuition.** We spent weeks inside the incumbent runtime
-  with lldb and hardware watchpoints: a scheduler handoff that lets two "only"
-  threads run at once, queue structs corrupted through bypass writes, a lost
-  function that fell off the end of its own C body. We wrote down every
-  invariant that code was supposed to keep. fn64 is those invariants with a
-  compiler enforcing them — Rust's ownership model turns our bug archaeology
-  into type errors.
-- **General on purpose.** The ABI belongs to the recompiler, not to any one
-  game. fn64's core has zero game-specific assumptions; the libultra surface
-  is implemented exactly as far as shipping ports need, and everything else is
-  a trap that *names itself* when hit. No silent shrugs.
+> [!IMPORTANT]
+> fn64 is pre-alpha. Ocarina of Time boots through native recompiled code with
+> RT64 rendering, audio-ucode execution, and input, but fn64 is not ready to
+> ship a finished port. Open fidelity and release gates are tracked in public.
 
-## Crates
+## Who fn64 is for
+
+fn64 is for developers building N64 native ports who want to spend less time
+rebuilding the infrastructure around a game:
+
+- **Already using N64Recomp?** Link generated code against a strongly typed
+  implementation of its ABI, backed by a Rust libultra runtime and device
+  model.
+- **Starting from a ROM?** Use evidence-carrying analysis to recover functions
+  and sections even when a finished decompilation does not exist.
+- **Trying to trust the result?** Keep ABI tests, instruction oracles,
+  deterministic backends, and named release gates beside the code they grade.
+
+fn64 does not contain game assets, ROM bytes, or recompiled-game output. Users
+provide and recompile their own game content locally.
+
+## What fn64 provides
+
+```text
+local ROM ──▶ discover ──▶ typed Rust runners ──▶ fn64 ABI + runtime
+                                                        │
+                                                        ▼
+                                      reference or RT64 rendering ──▶ native app
+```
+
+The reusable stack covers function and section discovery, typed static
+recompilation, scheduler and libultra services, DMA and overlays, input, save,
+audio and RSP task dispatch, renderer integration, and certification. The core
+stays game-agnostic.
+
+## Why fn64
+
+| | The promise | What that means here |
+|---|---|---|
+| **Future** | A reusable Rust foundation | Discovery, typed codegen, execution, the libultra runtime, rendering seams, and certification are designed to outlast any single port. |
+| **Faithful** | Evidence over optimism | ABI smoke tests link a real C caller, instruction oracles compare emitted code, unsupported behavior traps loudly, and every known gap stays named. |
+| **Friendly** | A project people can join | Humans and agentic contributors share one explicit contract; load-bearing docs preserve context; project code is MIT OR Apache-2.0. |
+| **Fast** | Native execution with measurable headroom | Static recompilation produces native host code. Rust adds predictable memory behavior and zero-cost abstractions; performance claims require measurements. |
+
+### ROM discovery without pretending every ROM is solved
+
+`fn64-discover` recovers function and section metadata directly from a locally
+supplied ROM. Structural analysis, load-image recovery, provenance-recorded
+signatures, and owner-proof rules map executable code without guessing across
+ambiguous boundaries.
+
+Discovery fails honestly. Every unresolved bank keeps a named blocker, every
+corpus run retains its misses, and grading against games with public answer
+keys uses a strict `wrong == 0` posture. The cold, config-free CPU-recompile
+gate reaches zero unsupported destinations on all five tested AKI titles,
+including a first-run Japanese title with no decomp, answer key, or per-game
+configuration. This is a promising result, not a universal-discovery claim;
+the remaining cold-start frontier is documented in
+[`docs/DISCOVER-PLAN.md`](docs/DISCOVER-PLAN.md).
+
+### Rust is the mechanism, not the pitch
+
+The goal is not to translate C syntax into Rust syntax. The goal is to encode
+the invariants a runtime depends on: one runnable guest thread, typed RDRAM and
+MMIO addresses, explicit queue ownership, deterministic device state, and
+one-way crate dependencies. Where an invariant can be a type, it is. Where a
+feature is missing, the runtime traps with the symbol and call context instead
+of silently continuing with corrupted state.
+
+Foreign code is bounded instead of scattered. The pure-Rust runtime can be
+tested without a window or C++ toolchain, while optional RT64 integration is
+quarantined behind one explicit crate and unsafe-code boundary.
+
+## Start here
+
+- Port builders: read the [architecture and migration plan](docs/DESIGN.md).
+- Discovery contributors: inspect the [current discovery frontier](docs/DISCOVER-PLAN.md).
+- Runtime contributors: start with the [ABI completeness ledger](docs/COMPLETENESS.md).
+- Humans and agents: follow the same [operating contract](AGENTS.md).
+
+## Architecture
 
 One workspace, separate crates, each publishable alone:
 
@@ -40,7 +103,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
 | `fn64-render` | Backend-neutral render seam, content-addressed ordered microcode admission, and raw-DPC completion inspection |
 | `fn64-render-reference` | Deterministic pure-Rust `ReferenceBackend`, geometry/object decoders, software rasterizer, and VI reference path |
-| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/fn64/rt64) (MIT, C++); all C++ interop remains quarantined here |
+| `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); all C++ interop remains quarantined here |
 | `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-recomp-rs` | Linked typed execution runtime for generated VR4300 Rust runners |
 | `fn64-recomp-rs-codegen` | Build-side typed-Rust emitter and whole-ROM driver; absent from generated runners' runtime dependency graph |
