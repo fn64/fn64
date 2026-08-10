@@ -1,6 +1,6 @@
 use crate::*;
 
-const DENSE_AOT_ARTIFACTS: &[DenseAotArtifact] = &[
+pub(crate) const DENSE_AOT_ARTIFACTS: &[DenseAotArtifact] = &[
     DenseAotArtifact {
         bank_id: wm2000_block_shard_00::BANK_ID,
         code_bank: wm2000_block_shard_00::code_bank,
@@ -178,7 +178,7 @@ const DENSE_AOT_ARTIFACTS: &[DenseAotArtifact] = &[
     },
 ];
 
-const DENSE_AOT_IDENTITIES: &[LinkedDenseIdentity] = &[
+pub(crate) const DENSE_AOT_IDENTITIES: &[LinkedDenseIdentity] = &[
     LinkedDenseIdentity {
         source_sha256: wm2000_block_shard_00::SOURCE_SHA256,
         runner_source_sha256: wm2000_block_shard_00::RUNNER_SOURCE_SHA256,

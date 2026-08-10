@@ -343,13 +343,90 @@ impl<'a> RdramView<'a> {
     }
 
     /// Copy a device/struct byte sequence out in logical guest order.
+    /// Copy a logical byte range out, one native word at a time.
+    ///
+    /// The obvious implementation calls [`Self::read_u8`] per byte, and that is
+    /// what this did. Each such call re-runs the bounds check and applies the
+    /// lane XOR individually, so copying the 1 MiB executable region the
+    /// mutation guard watches cost roughly a million checked reads -- 21.6 ms
+    /// per executor step, measured, which dominated every WM2000 run.
+    ///
+    /// Storage holds native words, and logical byte `n` lives at storage index
+    /// `n ^ 3` (`read_u8`'s lane XOR). Within one aligned word that is exactly
+    /// a byte reversal, so an aligned word can be copied with a single
+    /// bounds-checked read plus a reverse -- amortizing the check over four
+    /// bytes instead of paying it per byte.
+    ///
+    /// The unaligned head and tail stay on the per-byte path: they are at most
+    /// three bytes each, and getting them subtly wrong would corrupt guest
+    /// memory in a way the word path would hide.
     pub fn copy_logical_bytes(self, addr: RdramAddr, out: &mut [u8]) {
-        for (index, byte) in out.iter_mut().enumerate() {
-            let offset = u32::try_from(index).expect("logical RDRAM copy length exceeds u32");
+        let len = u32::try_from(out.len()).expect("logical RDRAM copy length exceeds u32");
+        if len == 0 {
+            return;
+        }
+        // Prove every byte is mapped before any fast-path read, so a partial
+        // copy cannot precede the panic an out-of-range copy owes.
+        //
+        // Checked per byte rather than over the whole span on purpose: the
+        // per-byte path this replaced failed at the FIRST unmapped byte and
+        // named it, and a caller diagnosing a bad copy wants that byte, not
+        // the range it happened to sit in. `lle_debug_task_data_loudly_
+        // rejects_an_unmapped_native_word_lane` asserts on exactly that
+        // message.
+        // Fast check over the whole span. A per-byte loop here would undo the
+        // very cost this function exists to remove.
+        let end = addr
+            .offset()
+            .checked_add(len)
+            .expect("logical RDRAM copy overflow");
+        if (end as usize) > self.storage.len() {
+            // Slow path only on the way to a panic: re-walk per byte so the
+            // message names the FIRST unmapped byte, which is what the
+            // per-byte implementation reported and what a caller diagnosing a
+            // bad copy actually wants. `lle_debug_task_data_loudly_rejects_an
+            // _unmapped_native_word_lane` asserts on exactly that message.
+            for index in 0..len {
+                let _ = self.range(
+                    addr.checked_add(index)
+                        .expect("logical RDRAM copy address overflow"),
+                    1,
+                    3,
+                    "read_u8",
+                );
+            }
+        }
+
+        let start = addr.offset();
+        let head = (4 - (start % 4)) % 4;
+        let head = head.min(len);
+        let body = (len - head) & !3;
+
+        let mut copy_byte = |index: u32, byte: &mut u8| {
             *byte = self.read_u8(
-                addr.checked_add(offset)
+                addr.checked_add(index)
                     .expect("logical RDRAM copy address overflow"),
             );
+        };
+        for (index, byte) in out.iter_mut().enumerate().take(head as usize) {
+            copy_byte(index as u32, byte);
+        }
+        for word in 0..(body / 4) {
+            let logical = start + head + word * 4;
+            let native = self
+                .read_u32(RdramAddr::from_offset(logical))
+                .to_ne_bytes();
+            let at = (head + word * 4) as usize;
+            // `read_u32` reads the native word with lane XOR 0; `read_u8`
+            // would read the same four bytes in reverse order.
+            out[at] = native[3];
+            out[at + 1] = native[2];
+            out[at + 2] = native[1];
+            out[at + 3] = native[0];
+        }
+        for index in (head + body)..len {
+            let byte = &mut out[index as usize];
+            copy_byte(index, byte);
         }
     }
 }
@@ -855,4 +932,44 @@ mod tests {
         assert_eq!(unsafe { raw.read_u16(RdramAddr::from_offset(0)) }, 0x1234);
         assert_eq!(unsafe { raw.read_u8(RdramAddr::from_offset(2)) }, 0x56);
     }
+
+    /// The word-wise `copy_logical_bytes` must agree with the per-byte reader
+    /// it replaced, at every offset and length -- including the unaligned head
+    /// and tail that take the slow path.
+    ///
+    /// This is a differential test against the obvious implementation, because
+    /// the fast path's correctness rests on one non-obvious fact: logical byte
+    /// `n` lives at storage `n ^ 3`, which within an aligned word is a byte
+    /// reversal. Getting that backwards would still produce plausible-looking
+    /// bytes, so asserting against a reference is worth more than asserting
+    /// against hand-written expectations.
+    #[test]
+    fn word_wise_copy_matches_the_per_byte_reader_at_every_alignment() {
+        let mut storage = vec![0u8; 256];
+        for (index, byte) in storage.iter_mut().enumerate() {
+            // Distinct per byte, and not a function of the low two bits alone,
+            // so a lane-order mistake cannot coincidentally match.
+            *byte = (index as u8).wrapping_mul(7).wrapping_add(index as u8 >> 3);
+        }
+        let view = RdramView::from_storage(&storage);
+
+        for start in 0..16u32 {
+            for len in 0..=24usize {
+                if start as usize + len > storage.len() {
+                    continue;
+                }
+                let addr = RdramAddr::from_offset(start);
+                let reference: Vec<u8> = (0..len)
+                    .map(|index| view.read_u8(addr.checked_add(index as u32).unwrap()))
+                    .collect();
+                let mut actual = vec![0u8; len];
+                view.copy_logical_bytes(addr, &mut actual);
+                assert_eq!(
+                    actual, reference,
+                    "copy_logical_bytes disagreed at start={start} len={len}"
+                );
+            }
+        }
+    }
 }
+

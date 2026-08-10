@@ -317,7 +317,7 @@ pub(super) fn error(message: impl Into<String>) -> GeneratedRunnerBuildError {
 pub(super) struct ScratchDirectory(PathBuf);
 
 impl ScratchDirectory {
-    fn create(nonce: &[u8; 32]) -> Result<Self, GeneratedRunnerBuildError> {
+    pub(super) fn create(nonce: &[u8; 32]) -> Result<Self, GeneratedRunnerBuildError> {
         let path = std::env::temp_dir().join(format!("fn64-generated-runner-{}", hex(nonce)));
         fs::create_dir(&path).map_err(|source| {
             error(format!(
@@ -344,7 +344,7 @@ impl ScratchDirectory {
         Ok(Self(canonical))
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.0
     }
 }

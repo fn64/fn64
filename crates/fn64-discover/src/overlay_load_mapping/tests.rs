@@ -322,6 +322,62 @@ fn mappings_without_a_destination_yield_no_range() {
     assert!(shared_slot_invalidation_range(&mappings).is_none());
 }
 
+/// Cruis'n USA's measured shape: two overlays share one slot while a third
+/// sits alone elsewhere. That is resident overlays plus a swapping pair, not
+/// one engine, and each slot deserves its own union -- a union ACROSS slots
+/// would invalidate live memory belonging to an overlay never swapped.
+#[test]
+fn each_destination_slot_gets_its_own_invalidation_range() {
+    let (mut rom, mut table) = load_only_rom();
+    table.records.push(CandidateRecord {
+        rom_start: 0x2200,
+        rom_end: 0x2280,
+        vram_dest: 0x8020_0000,
+    });
+    // Two records share 0x80100000; the third is far away.
+    table.records[0].vram_dest = 0x8010_0000;
+    table.records[1].vram_dest = 0x8010_0000;
+    for (index, record) in table.records.iter().enumerate() {
+        let base = table.table_rom_offset as usize + index * table.record_stride as usize;
+        put(&mut rom, base, record.rom_start);
+        put(&mut rom, base + 4, record.rom_end);
+        put(&mut rom, base + 8, record.vram_dest);
+    }
+
+    let mappings = parse_overlay_load_mappings_v1(&rom, &table).unwrap();
+    let ranges = per_slot_invalidation_ranges(&mappings).unwrap();
+
+    assert_eq!(ranges.len(), 2, "one range per distinct slot");
+    assert_eq!(
+        ranges[0],
+        0x8010_0000..0x8010_0100,
+        "the shared slot unions its two members"
+    );
+    assert_eq!(ranges[1], 0x8020_0000..0x8020_0080);
+    assert!(
+        shared_slot_invalidation_range(&mappings).is_none(),
+        "the single-slot helper still refuses a multi-slot table"
+    );
+}
+
+/// If one slot's union reaches into another's, the groups are not independent
+/// and invalidating either would clobber the other's live bytes.
+#[test]
+fn overlapping_slot_groups_are_refused() {
+    let (mut rom, mut table) = load_only_rom();
+    // Second slot starts inside the first overlay's own extent.
+    table.records[0].vram_dest = 0x8010_0000;
+    table.records[1].vram_dest = 0x8010_0080;
+    for (index, record) in table.records.iter().enumerate() {
+        let base = table.table_rom_offset as usize + index * table.record_stride as usize;
+        put(&mut rom, base + 8, record.vram_dest);
+    }
+
+    let mappings = parse_overlay_load_mappings_v1(&rom, &table).unwrap();
+
+    assert!(per_slot_invalidation_ranges(&mappings).is_none());
+}
+
 /// The load-bearing property of this whole module. A load-only mapping proves
 /// no section extents, so it must not be convertible into codegen input --
 /// `DenseAotGenerationInput` requires all six and re-validates them, and

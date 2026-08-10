@@ -15,7 +15,7 @@ use super::*;
         assert_eq!(recompiled.r(31), 0xA000_0000_0000_001F);
     }
 
-    pub(super) unsafe extern "C" fn no_op_fpr_shim(_rdram: *mut u8, ctx: *mut CContext) {
+    pub(in crate::recompiled) unsafe extern "C" fn no_op_fpr_shim(_rdram: *mut u8, ctx: *mut CContext) {
         // Safety: `call_c` supplies its live stack-local C context.
         let ctx = unsafe { &mut *ctx };
         ctx.assert_float_mode_matches_status();
@@ -29,13 +29,13 @@ use super::*;
         assert_eq!(ctx.f_odd, expected);
     }
 
-    pub(super) unsafe extern "C" fn write_f5_word_shim(_rdram: *mut u8, ctx: *mut CContext) {
+    pub(in crate::recompiled) unsafe extern "C" fn write_f5_word_shim(_rdram: *mut u8, ctx: *mut CContext) {
         // Safety: `call_c` arms `f_odd` for this live context. N64Recomp's
         // generated odd-register expression for f5 is `(5 - 1) * 2`.
         unsafe { *(*ctx).f_odd.add(8) = 0xDEAD_BEEF };
     }
 
-    pub(super) unsafe extern "C" fn change_fr_shim(_rdram: *mut u8, ctx: *mut CContext) {
+    pub(in crate::recompiled) unsafe extern "C" fn change_fr_shim(_rdram: *mut u8, ctx: *mut CContext) {
         // Safety: `call_c` supplies its live stack-local C context.
         let ctx = unsafe { &mut *ctx };
         ctx.status_reg ^= STATUS_FR;
@@ -43,7 +43,7 @@ use super::*;
         ctx.arm_fpr_alias();
     }
 
-    pub(super) unsafe extern "C" fn change_bev_shim(_rdram: *mut u8, ctx: *mut CContext) {
+    pub(in crate::recompiled) unsafe extern "C" fn change_bev_shim(_rdram: *mut u8, ctx: *mut CContext) {
         // Safety: `call_c` supplies its live stack-local C context.
         unsafe { &mut *ctx }.status_reg ^= STATUS_BEV;
     }

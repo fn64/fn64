@@ -271,6 +271,9 @@ pub(crate) unsafe fn dispatch_lle_task(
                 .request_dpc_submission(source, start, end)
         })
         .unwrap_or_else(|error| panic!("RSP DPC submission rejected: {error}"));
+        let Some(submission) = submission else {
+            continue;
+        };
         let mut transaction = LiveDpcTransaction::new(submission);
         let rdp_started = gfx_started.map(|_| std::time::Instant::now());
         let (full_sync, observation) =
@@ -930,7 +933,9 @@ pub(crate) unsafe fn dispatch_raw_rdp(rdram: *mut u8, start: u32, end: u32) {
         )
     })
     .unwrap_or_else(|error| panic!("dispatch_raw_rdp: DPC submission rejected: {error}"));
-    unsafe { dispatch_dpc_submission(rdram, submission) };
+    if let Some(submission) = submission {
+        unsafe { dispatch_dpc_submission(rdram, submission) };
+    }
 }
 
 /// Submit an XBUS DPC range whose command bytes live in persistent RSP DMEM.
@@ -969,6 +974,9 @@ pub(crate) unsafe fn dispatch_raw_rdp_xbus(
         )
     })
     .unwrap_or_else(|error| panic!("dispatch_raw_rdp_xbus: DPC submission rejected: {error}"));
+    let Some(submission) = submission else {
+        return;
+    };
     let mut transaction = LiveDpcTransaction::new(submission);
     let (full_sync, observation) =
         unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction) };

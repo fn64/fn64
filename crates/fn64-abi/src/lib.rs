@@ -413,11 +413,65 @@ pub extern "C" fn fn64_c_mmio_write_w(vaddr: u64, value: u32) {
     );
 }
 
+/// Generated-C byte/halfword MMIO reads use one aligned 32-bit RCP SysAD
+/// transaction, then select the addressed big-endian lane in the CPU. This
+/// must not read the sparse compatibility bytes: register reads can have live
+/// effects (notably SP_SEMAPHORE), and the word transaction is their sole
+/// authority.
+#[no_mangle]
+pub extern "C" fn fn64_c_mmio_read_subword(vaddr: u64, width: u32) -> u32 {
+    assert!(
+        matches!(width, 1 | 2),
+        "generated-C MMIO subword read has invalid width {width}"
+    );
+    assert!(
+        width == 1 || vaddr & 1 == 0,
+        "generated-C unaligned MMIO halfword read at {vaddr:#018X}"
+    );
+    charge_c_lane_mmio_access();
+    let word_addr = vaddr & !3;
+    let word = pi::read_raw_mmio_word(word_addr).unwrap_or_else(|| {
+        panic!("generated-C raw MMIO read is outside the modeled RCP window: {vaddr:#018X}")
+    });
+    let shift = if width == 1 {
+        24 - ((vaddr as u32 & 3) * 8)
+    } else {
+        16 - ((vaddr as u32 & 2) * 8)
+    };
+    let mask = if width == 1 { 0xff } else { 0xffff };
+    (word >> shift) & mask
+}
+
+/// Generated-C byte/halfword MMIO writes place the value in its addressed
+/// big-endian SysAD lane and drive zero on every other lane. RCP registers do
+/// not receive an RDRAM-style read/modify/write.
+#[no_mangle]
+pub extern "C" fn fn64_c_mmio_write_subword(vaddr: u64, width: u32, value: u32) {
+    assert!(
+        matches!(width, 1 | 2),
+        "generated-C MMIO subword write has invalid width {width}"
+    );
+    assert!(
+        width == 1 || vaddr & 1 == 0,
+        "generated-C unaligned MMIO halfword write at {vaddr:#018X}"
+    );
+    charge_c_lane_mmio_access();
+    let shift = if width == 1 {
+        24 - ((vaddr as u32 & 3) * 8)
+    } else {
+        16 - ((vaddr as u32 & 2) * 8)
+    };
+    assert!(
+        pi::write_raw_mmio_word(vaddr & !3, value << shift),
+        "generated-C raw MMIO write is outside the modeled RCP window: {vaddr:#018X}"
+    );
+}
+
 #[no_mangle]
 pub extern "C" fn fn64_c_mmio_bad_width(vaddr: u64, width: u32, is_write: u32) {
     let operation = if is_write == 0 { "read" } else { "write" };
     let context = format!(
-        "generated-C raw MMIO {operation} at {vaddr:#018X} used unsupported {width}-byte access; RCP registers require modeled word semantics"
+        "generated-C raw MMIO {operation} at {vaddr:#018X} used unsupported {width}-byte access; the RCP SysAD boundary models byte, halfword, and word transactions"
     );
     fn64_runtime::record_unsupported_event(
         fn64_runtime::UnsupportedSubsystem::Abi,

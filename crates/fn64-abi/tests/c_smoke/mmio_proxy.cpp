@@ -125,10 +125,6 @@ int main(int argc, char** argv) {
         return 21;
     }
 
-    if (argc > 1 && std::strcmp(argv[1], "--bad-width") == 0) {
-        MEM_H(0, UINT64_C(0xFFFFFFFFA4400000)) = UINT16_C(1);
-        return 6;
-    }
     if (argc > 1 && std::strcmp(argv[1], "--bad-kuseg") == 0) {
         (void)static_cast<uint32_t>(MEM_W(0, UINT64_C(0x0000000000000000)));
         return 12;
@@ -186,6 +182,39 @@ int main(int argc, char** argv) {
     if (static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA4400018))) !=
         UINT32_C(0x000003FF)) {
         return 4;
+    }
+
+    // RCP subword accesses are one aligned SysAD word transaction. Reads
+    // select a big-endian lane; writes place the value in that lane and drive
+    // zero elsewhere rather than read/modify/writing a side-effect register.
+    if (static_cast<uint8_t>(MEM_BU(1, UINT64_C(0xFFFFFFFFA4400000))) !=
+            UINT8_C(1) ||
+        static_cast<uint16_t>(MEM_HU(2, UINT64_C(0xFFFFFFFFA4400000))) !=
+            UINT16_C(0xFFFF)) {
+        return 34;
+    }
+    MEM_B(1, UINT64_C(0xFFFFFFFFA4400000)) = UINT8_C(1);
+    if (static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA4400000))) !=
+            UINT32_C(0x00010000)) {
+        return 35;
+    }
+    MEM_H(2, UINT64_C(0xFFFFFFFFA4400000)) = UINT16_C(0x2345);
+    if (static_cast<uint32_t>(MEM_W(0, UINT64_C(0xFFFFFFFFA4400000))) !=
+            UINT32_C(0x00002345)) {
+        return 36;
+    }
+
+    // A byte store to the low lane of DPC_STATUS must carry the public
+    // command bit into the live fabric, proving subword writes do not mutate
+    // only the generated-C sparse mirror.
+    MEM_B(3, UINT64_C(0xFFFFFFFFA410000C)) = UINT8_C(0x08);
+    if (static_cast<uint8_t>(MEM_BU(3, UINT64_C(0xFFFFFFFFA410000C))) !=
+            UINT8_C(0x02)) {
+        return 37;
+    }
+    MEM_B(3, UINT64_C(0xFFFFFFFFA410000C)) = UINT8_C(0x04);
+    if (static_cast<uint8_t>(MEM_BU(3, UINT64_C(0xFFFFFFFFA410000C))) != 0) {
+        return 38;
     }
 
     // Generated-C AI register writes and reads round-trip through DeviceFabric,

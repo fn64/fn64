@@ -71,7 +71,7 @@ fn set_entry_lookup_config(
     });
 }
 
-fn set_block_program(program: LiveBlockProgram, rdram_len: usize) {
+pub(super) fn set_block_program(program: LiveBlockProgram, rdram_len: usize) {
     assert!(rdram_len > 0, "recompiled RDRAM length must be nonzero");
     PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
     PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
@@ -94,14 +94,14 @@ fn set_block_program(program: LiveBlockProgram, rdram_len: usize) {
     });
 }
 
-fn set_catalog_block_program(
+pub(super) fn set_catalog_block_program(
     install: CatalogResolverInstallV1,
     rdram_len: usize,
 ) -> CanonicalLiveBlockProgramV1 {
     set_catalog_program_parts(install, None, rdram_len, None)
 }
 
-fn set_catalog_generation_program(
+pub(super) fn set_catalog_generation_program(
     install: CatalogGenerationInstallV1,
     rdram_len: usize,
 ) -> CanonicalLiveBlockProgramV1 {
@@ -159,9 +159,26 @@ fn set_catalog_program_parts(
         Rc::new(RefCell::new(state))
     });
     let generations = generations.map(|generations| Rc::new(RefCell::new(generations)));
-    if mutation_state.is_some() {
+    if let Some(state) = mutation_state.as_ref() {
+        // Install the ranges the GUARD watches, not the ones passed in.
+        //
+        // `record_executable_and_renderer_write` decides whether a guest write
+        // is an attributed executable write by intersecting it with
+        // EXECUTABLE_WRITE_RANGES, while `commit_snapshot` later panics based
+        // on `mutation_state`'s watched set. Those are the same list only on
+        // the `new(&ranges)` path. `from_bootstrap` derives its watched ranges
+        // from the bootstrap receipt's own `watched_ranges` instead, so on
+        // that path -- which is the one WM2000 takes -- a store landing in the
+        // guard's set but outside `ranges` was never recorded as attributed.
+        //
+        // That is exactly the observed failure: a guest CPU store zeroes the
+        // instruction word at 0x8009b0b0, `notify_cpu_instruction_store` fires,
+        // and the commit boundary still reports `events=0 declarations=0`
+        // because the observer had filtered it out.
         EXECUTABLE_WRITE_RANGES.with(|installed| {
-            installed.borrow_mut().extend_from_slice(&ranges);
+            installed
+                .borrow_mut()
+                .extend_from_slice(&state.borrow().watched_ranges());
         });
         fn64_recomp_rs::set_guest_write_boundary_observer(Some(classify_live_executable_write));
         fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
@@ -470,8 +487,8 @@ pub(crate) fn process_live_executable_writes_from_host() {
 /// `HostAbi write -> coroutine suspend -> device/other-thread same-byte write
 /// -> HostAbi resume`: the parent prefix advances the canonical baseline before
 /// any child or different guest coroutine can run.
-pub(super) fn checkpoint_catalog_host_transaction_before_suspend() {
-    let Some(thread) = super::ACTIVE_THREAD_ID.with(Cell::get) else {
+pub(crate) fn checkpoint_catalog_host_transaction_before_suspend() {
+    let Some(thread) = crate::ACTIVE_THREAD_ID.with(Cell::get) else {
         return;
     };
     let (live, rdram, rdram_len) = with_host(|host| {
@@ -520,14 +537,14 @@ pub(crate) struct CatalogNestedWriterTransactionV1 {
 }
 
 impl CatalogNestedWriterTransactionV1 {
-    fn is_canonical(&self) -> bool {
+    pub(super) fn is_canonical(&self) -> bool {
         self.transaction_id.is_some()
     }
 
     fn assert_thread_owner(&self) {
         if let Some(expected) = self.thread {
             assert_eq!(
-                super::ACTIVE_THREAD_ID.with(Cell::get),
+                crate::ACTIVE_THREAD_ID.with(Cell::get),
                 Some(expected),
                 "{} child writer transaction changed guest-thread owner before commit",
                 self.operation
@@ -563,7 +580,7 @@ impl CatalogNestedWriterTransactionV1 {
         self.commit_with(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
     }
 
-    fn commit_changed_bytes(self, rdram: &[u8], notify: impl Fn(u32, u32)) {
+    pub(super) fn commit_changed_bytes(self, rdram: &[u8], notify: impl Fn(u32, u32)) {
         self.assert_thread_owner();
         let live = self
             .live
@@ -576,7 +593,7 @@ impl CatalogNestedWriterTransactionV1 {
         let view = fn64_runtime::RdramView::from_storage(rdram);
         let snapshot = state
             .borrow()
-            .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+            .read_snapshot_from_view(&view);
         let changed = state.borrow().current_changed_ranges(&snapshot);
         for (physical_start, physical_end) in changed {
             notify(physical_start, physical_end - physical_start);
@@ -593,7 +610,7 @@ impl CatalogNestedWriterTransactionV1 {
 /// not enter the host-call lifecycle trace: scheduler selection has no guest
 /// call target/resume pair. Consequently the existing host-call-only
 /// completion receipt remains open rather than miscounting this boundary.
-pub(super) fn commit_scheduler_running_thread_mirror(
+pub(crate) fn commit_scheduler_running_thread_mirror(
     origin: SchedulerRunningThreadMirrorV1,
 ) -> bool {
     let live = with_host(|host| host.canonical_recompiled_program.clone());
@@ -663,7 +680,7 @@ pub(crate) fn begin_catalog_nested_writer(
     rdram: &[u8],
     operation: &'static str,
 ) -> CatalogNestedWriterTransactionV1 {
-    let thread = super::ACTIVE_THREAD_ID.with(Cell::get);
+    let thread = crate::ACTIVE_THREAD_ID.with(Cell::get);
     let live = with_host(|host| host.canonical_recompiled_program.clone());
     if let Some(live) = &live {
         if let Some(state) = &live.mutation_state {
@@ -794,18 +811,18 @@ pub(crate) fn preflight_non_executable_host_writes(
 }
 
 fn pause_active_recompiled_thread() {
-    super::suspend_active_coroutine(fn64_runtime::Yield::PauseSelf);
+    crate::suspend_active_coroutine(fn64_runtime::Yield::PauseSelf);
 }
 
-fn read_raw_mmio(vaddr: u64) -> Option<u32> {
+pub(super) fn read_raw_mmio(vaddr: u64) -> Option<u32> {
     crate::pi::read_raw_mmio_word(vaddr)
 }
 
-fn write_raw_mmio(vaddr: u64, value: u32) -> bool {
+pub(super) fn write_raw_mmio(vaddr: u64, value: u32) -> bool {
     crate::pi::write_raw_mmio_word(vaddr, value)
 }
 
-fn record_recompiled_unsupported(context: &str) {
+pub(super) fn record_recompiled_unsupported(context: &str) {
     fn64_runtime::record_unsupported_event(
         fn64_runtime::UnsupportedSubsystem::Recompiler,
         "recompiler.cpu.unsupported-instruction",
@@ -827,7 +844,7 @@ pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
 ///
 /// # Safety
 /// `rdram` must address `rdram_len` live bytes for every coroutine's lifetime,
-/// exactly like [`super::boot_thread0`]'s existing C ABI contract.
+/// exactly like [`crate::boot_thread0`]'s existing C ABI contract.
 pub unsafe fn boot_thread0(
     rdram: *mut u8,
     rdram_len: usize,
@@ -927,7 +944,7 @@ unsafe fn boot_thread0_config(
             panic!("function entry observation requires a stable generated-artifact identity")
         }
     }
-    unsafe { super::register_process_rdram(rdram, rdram_len) };
+    unsafe { crate::register_process_rdram(rdram, rdram_len) };
     fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
     fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
 
@@ -1334,7 +1351,7 @@ unsafe fn boot_thread0_catalog_live_v1(
     thread_id: ThreadId,
     priority: Priority,
 ) {
-    unsafe { super::register_process_rdram(rdram, rdram_len) };
+    unsafe { crate::register_process_rdram(rdram, rdram_len) };
     fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
     fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
 
@@ -1397,7 +1414,7 @@ fn validate_block_boot_context(entry: GuestPc, boot_context: &BootContext) {
     });
 }
 
-fn validate_restored_catalog_boot_context(
+pub(super) fn validate_restored_catalog_boot_context(
     entry: ExecutionKey,
     boot_context: &BootContext,
     ctx: &RsContext,
@@ -1442,7 +1459,7 @@ unsafe fn boot_thread0_block_program_config(
         precompiled_generations: Rc::new(RefCell::new(None)),
     };
     set_block_program(live.clone(), rdram_len);
-    unsafe { super::register_process_rdram(rdram, rdram_len) };
+    unsafe { crate::register_process_rdram(rdram, rdram_len) };
     fn64_recomp_rs::set_host_pause(Some(pause_active_recompiled_thread));
     fn64_recomp_rs::set_mmio_hooks(Some(read_raw_mmio), Some(write_raw_mmio));
     fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
@@ -1479,7 +1496,7 @@ unsafe fn boot_thread0_block_program_config(
     });
 }
 
-fn park_host_scheduled_exception(
+pub(super) fn park_host_scheduled_exception(
     canonical_live: Option<&CanonicalLiveBlockProgramV1>,
     fault: CpuFault,
     ctx: &mut RsContext,
@@ -1487,11 +1504,11 @@ fn park_host_scheduled_exception(
     let CpuFaultKind::Exception { exception, .. } = fault.kind else {
         return false;
     };
-    let host_scheduled = super::ACTIVE_THREAD_ID
+    let host_scheduled = crate::ACTIVE_THREAD_ID
         .with(|active| active.get())
         .is_some_and(|thread| with_host(|host| host.thread_handle_vrams.contains_key(&thread)));
     if std::env::var_os("FN64_PROFILE_EXCEPTIONS").is_some() {
-        let active = super::ACTIVE_THREAD_ID.with(|active| active.get());
+        let active = crate::ACTIVE_THREAD_ID.with(|active| active.get());
         let handles = with_host(|host| host.thread_handle_vrams.clone());
         eprintln!(
             "[fn64-exception-profile] exception={exception:?} active={active:?} thread_handles={handles:?} host_scheduled={host_scheduled}"
@@ -1519,7 +1536,7 @@ fn park_host_scheduled_exception(
     if let Some(live) = canonical_live {
         live.publish_parked_fault(fault, ctx);
     }
-    let resumed = super::suspend_active_coroutine(fn64_runtime::Yield::StopSelf);
+    let resumed = crate::suspend_active_coroutine(fn64_runtime::Yield::StopSelf);
     fn64_runtime::record_unsupported_event(
         fn64_runtime::UnsupportedSubsystem::Recompiler,
         "recompiler.cpu.fault-context-resume",
