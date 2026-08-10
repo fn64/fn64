@@ -1553,6 +1553,21 @@ pub fn copy_rsp_rdp_observations() -> Vec<RspRdpObservationEvent> {
     with_host(|host| host.rsp_rdp_observations.clone())
 }
 
+/// How many observations have been recorded, without copying them.
+///
+/// The history only ever grows within a ROM load (`record_rsp_rdp_observations`
+/// extends; `pi::mmio` clears it only when a new image is published), so a
+/// count is a complete advance detector for any caller asking "did anything
+/// happen since I looked?" -- which is what the VI-boundary check asks, and
+/// what every one of its sibling checks already asks with `.len()`.
+///
+/// Evidence consumers must keep using [`copy_rsp_rdp_observations`]: the
+/// release gate digests the whole ordered sequence and asserts
+/// `total_observations == ordered.len()`, and a count cannot stand in for that.
+pub fn rsp_rdp_observation_count() -> usize {
+    with_host(|host| host.rsp_rdp_observations.len())
+}
+
 pub(crate) fn record_rsp_rdp_observations(kinds: Vec<RspRdpObservationKind>) {
     if kinds.is_empty() {
         return;
