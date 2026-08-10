@@ -1,10 +1,17 @@
-# fn64 WM2000 route: boot -> Exhibition -> Single Match -> entrance screen.
+# fn64 WM2000 route: boot -> Exhibition -> Single Match -> IN-MATCH GAMEPLAY.
+#
+# As of 2026-08-07 this route reaches a live match: both wrestlers in the ring,
+# a running match clock, and a controllable player 1. Every screen named in the
+# comments below was read off a dumped frame, not inferred from what a wrestling
+# menu "probably" does -- the representative frames are committed alongside in
+# `reference/wm2000-frames/` and each section cites the one that evidences it.
 #
 # COMMITTED ON PURPOSE. The 420,000-step route that first reached WM2000's
 # match-setup screen was written to /tmp, macOS reaped it, and that run is now
-# unreproducible -- the deepest gameplay state anyone has reached exists only
-# as prose in docs/BOOT-NOTES-WM2000.md:1812-1830. A route recipe is evidence;
-# it belongs in the repository.
+# unreproducible -- it survived only as prose in
+# docs/BOOT-NOTES-WM2000.md:1812-1830. A route recipe is evidence; it belongs in
+# the repository. That match-setup screen is no longer the deepest state
+# reached: this file now goes past it into the match itself.
 #
 # Format (crates/fn64-boot-harness/src/controller_input_schedule.rs):
 #   port first_read end_read buttons_hex stick_x stick_y
@@ -36,9 +43,11 @@ fn64.controller-input-schedule.v1
 0  180  190 0x8000 0 0
 0  190  230 0x0000 0 0
 
-# --- Wrestler select: A confirms player 1, then A confirms the CPU opponent.
-#     The recorded route reached STONE COLD VS STONE COLD by confirming the
-#     default highlight twice, which also proves the CPU-opponent path.
+# --- Player-count menu: "1P VS 2P" / "1P VS CPU" / "Watch". A takes the
+#     default highlight (1P VS 2P), which is why the match below is a local
+#     two-player card and NOT the CPU-opponent path. Observed 2026-08-07 in
+#     `reference/wm2000-frames/` at gfx submit 350; the earlier comment here
+#     called this a wrestler select, which it is not.
 0  230  240 0x8000 0 0
 0  240  280 0x0000 0 0
 0  280  290 0x8000 0 0
@@ -48,35 +57,68 @@ fn64.controller-input-schedule.v1
 0  330  340 0x8000 0 0
 0  340  380 0x0000 0 0
 
-# --- Decision / confirm page: A commits the match setup.
+# --- Match-setup page ("New Belt" / "Non Title Match" / "Controller Pak",
+#     with both wrestler slots EMPTY). A opens the Superstars roster.
 0  380  390 0x8000 0 0
 0  390  430 0x0000 0 0
-
-# --- Entrance / versus presentation. THIS IS THE FRONTIER.
-#     The prior route pressed START twice here, completed 1,707 graphics
-#     submits with render_error=None, and the selector gate word at
-#     0x8003dd0c stayed 0x00000000 -- the match-arena generation's four
-#     loader PCs (0x80022484, 0x80022498, 0x800224d4, 0x80022510) were never
-#     reached even once. The game is not failing to load the arena; it never
-#     asks.
-#
-#     So this section varies the input rather than repeating START, to
-#     discriminate between "wrong button", "waiting on a subsystem", and a
-#     real bug. Run with FN64_RENDER_DUMP_DIR set and compare frames across
-#     these presses.
 0  430  440 0x1000 0 0
 0  440  470 0x0000 0 0
 0  470  480 0x8000 0 0
 0  480  510 0x0000 0 0
 0  510  520 0x1000 0 0
 0  520  550 0x0000 0 0
-0  550  560 0x4000 0 0
-0  560  590 0x0000 0 0
-0  590  600 0x2000 0 0
-0  600  640 0x0000 0 0
 
-# --- Long idle tail: if the entrance is a timed cutscene rather than an
-#     input gate, the transition happens here with no input at all, and the
-#     loader PCs light up on their own. That is the cheapest discriminator
-#     in the whole schedule.
-0  640 1400 0x0000 0 0
+# --- Superstars roster: STEVE AUSTIN / THE ROCK / TRIPLE H / MANKIND /
+#     UNDERTAKER / KANE / BIG SHOW, with a 3D model preview and a
+#     "STONE COLD 6'2" 252lbs" stat card.  See
+#     `reference/wm2000-frames/wrestler-select-roster.png`.
+#
+#     THIS IS WHERE THE ROUTE USED TO DEAD-END, and the cause was not a
+#     missing press -- it was a CANCEL. The old schedule sent B (0x4000) at
+#     read 550 and Z (0x2000) at 590; `wrestler-select-cancelled.png` catches
+#     the roster mid-animation sliding back out. The route reached the roster,
+#     threw the selection away, and then idled 760 reads on the empty
+#     match-setup screen. The old comment's claim that the arena loader "is
+#     never asked for" was a true observation with the wrong diagnosis: no
+#     wrestlers were ever confirmed, so there was no match to load.
+#
+#     A on the default highlight confirms Steve Austin for each slot.
+0  550  560 0x8000 0 0
+0  560  600 0x0000 0 0
+0  600  610 0x8000 0 0
+0  610  700 0x0000 0 0
+
+# --- Decision page: Time Limit 30 Min., Pin/TKO/Submission/Rope Break Yes,
+#     header now reading "STONE COLD / STONE COLD" -- both slots filled.
+#     A commits it and the match loads. (`decision-screen.png`)
+0  700  710 0x8000 0 0
+0  710  900 0x0000 0 0
+
+# --- Versus presentation: a LOOPING cinematic, not a timed one. Camera sweeps
+#     the entrance rigging and cuts to the card "Single Match / STEVE AUSTIN
+#     VS STEVE AUSTIN" (`versus-presentation.png`). Frame hashes repeat with
+#     period ~600 submits, so idling here never exits -- that is the empirical
+#     answer to the old "timed cutscene or input gate?" question. START skips
+#     it; the A and second START clear the arena-load prompts behind it.
+0  900  910 0x1000 0 0
+0  910 1000 0x0000 0 0
+0 1000 1010 0x8000 0 0
+0 1010 1200 0x0000 0 0
+0 1200 1210 0x1000 0 0
+0 1210 1900 0x0000 0 0
+
+# --- IN-MATCH GAMEPLAY. Both wrestlers are in the RAW IS WAR ring with the
+#     crowd, two ATTITUDE meters, and a RUNNING MATCH CLOCK -- the clock is
+#     the discriminator against a cutscene, and it advances 00:06 -> 00:17
+#     across `in-match-clock-0006.png` and `in-match-clock-0017.png`.
+#
+#     These stick deflections prove the wrestler is CONTROLLABLE rather than
+#     merely on screen: over the first range 1P walks left across the ring and
+#     turns to face the opponent while the camera tracks him, and the ATTITUDE
+#     meters diverge. Analog stick is x/y in the last two columns.
+0 1900 1980 0x0000 80 0
+0 1980 2060 0x0000 -80 0
+0 2060 2070 0x8000 0 0
+0 2070 2200 0x0000 0 0
+0 2200 2280 0x0000 0 80
+0 2280 3000 0x0000 0 0

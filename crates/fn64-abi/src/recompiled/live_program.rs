@@ -202,7 +202,7 @@ impl CanonicalExecutableMutationStateV1 {
         state.seal_with(|_| 0);
         let view = fn64_runtime::RdramView::from_storage(storage);
         let snapshot = state
-            .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+            .read_snapshot_from_view(&view);
         let events = evidence
             .publications
             .iter()
@@ -232,6 +232,35 @@ impl CanonicalExecutableMutationStateV1 {
         self.watched
             .iter()
             .map(|range| (range.physical_start, range.physical_end))
+            .collect()
+    }
+
+    /// Snapshot the watched ranges straight from an RDRAM view.
+    ///
+    /// [`Self::read_snapshot`] takes a per-byte closure, which forces a
+    /// bounds-checked call and a lane XOR for every byte. On WM2000 the
+    /// watched region is the 1 MiB boot bank and this runs at every dispatch
+    /// boundary, so that cost was measured at 21.6 ms per executor step --
+    /// about 36 steps/second, dominating every run.
+    ///
+    /// `copy_logical_bytes` does the same work one native word at a time, so
+    /// the check is amortized over four bytes. Callers that genuinely have
+    /// only a byte reader keep using `read_snapshot`; the hot paths should
+    /// use this.
+    pub(super) fn read_snapshot_from_view(
+        &self,
+        view: &fn64_runtime::RdramView<'_>,
+    ) -> Vec<Vec<u8>> {
+        self.watched
+            .iter()
+            .map(|range| {
+                let mut bytes = vec![0u8; (range.physical_end - range.physical_start) as usize];
+                view.copy_logical_bytes(
+                    fn64_runtime::RdramAddr::from_offset(range.physical_start),
+                    &mut bytes,
+                );
+                bytes
+            })
             .collect()
     }
 
@@ -387,6 +416,22 @@ impl CanonicalExecutableMutationStateV1 {
             recompiled_gap_panic(format!(
                 "unjournaled executable mutation changed physical RDRAM [{physical_start:#010x}, {physical_end:#010x}) before canonical static dispatch"
             ));
+        }
+    }
+
+    /// Accept the current bytes as the baseline without journalling a batch.
+    ///
+    /// Used when a second commit path finds the queue already drained: there is
+    /// nothing to attribute, but leaving `expected` stale makes the next
+    /// dispatch re-detect a change that was already accounted for.
+    pub(super) fn adopt_snapshot(&mut self, snapshot: Vec<Vec<u8>>) {
+        self.assert_not_poisoned();
+        if !self.sealed {
+            return;
+        }
+        self.expected_sha256 = Some(self.digest_snapshot(&snapshot));
+        for (range, bytes) in self.watched.iter_mut().zip(snapshot) {
+            range.expected = bytes;
         }
     }
 
@@ -1689,9 +1734,45 @@ impl CanonicalLiveBlockProgramV1 {
         if let Some(state) = &self.mutation_state {
             state.borrow_mut().seal_with(&mut read_physical_byte);
             let snapshot = state.borrow().read_snapshot(read_physical_byte);
-            state
-                .borrow_mut()
-                .commit_snapshot(snapshot, events, invalidated.clone());
+            // Skip a commit that has nothing to say. Both the guest-execution
+            // path and the device-time advance
+            // (`process_live_executable_writes_from_host`) call this same
+            // method on the same canonical state, and each `std::mem::take`s
+            // the shared PENDING_ATTRIBUTED_EXECUTABLE_WRITES queue.
+            //
+            // Whichever runs first consumes the declaration and refreshes
+            // `watched[..].expected`. The second then arrives with an EMPTY
+            // event list, and if it commits anyway it re-reads RDRAM, sees the
+            // byte the first commit already accepted, and panics with
+            // `events=0 declarations=0` -- which is exactly the WM2000 failure
+            // at 0x8009b0b0.
+            //
+            // A commit with no writes and no events cannot establish anything,
+            // so declining it is not a weakening: the first commit already
+            // recorded the journal entry and advanced the baseline.
+            if writes.is_empty() && events.is_empty() {
+                // Nothing to attribute, but the baseline still has to advance.
+                //
+                // Both the guest-execution path and the device-time advance
+                // (`process_live_executable_writes_from_host`) call this on the
+                // SAME canonical state, and each `std::mem::take`s the shared
+                // PENDING_ATTRIBUTED_EXECUTABLE_WRITES queue. The first
+                // consumes the declaration and refreshes
+                // `watched[..].expected`; the second arrives empty.
+                //
+                // Committing anyway made the second re-detect the byte the
+                // first accepted (`events=0 declarations=0`). Skipping the
+                // commit entirely just moved the same stale baseline to the
+                // next `reconcile_snapshot_before_dispatch`, which reports it
+                // as "before canonical static dispatch" -- measured, not
+                // assumed. Adopting the snapshot without journalling an empty
+                // batch is what actually keeps the two callers consistent.
+                state.borrow_mut().adopt_snapshot(snapshot);
+            } else {
+                state
+                    .borrow_mut()
+                    .commit_snapshot(snapshot, events, invalidated.clone());
+            }
         }
         invalidated
     }

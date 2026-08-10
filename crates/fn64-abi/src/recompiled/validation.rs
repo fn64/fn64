@@ -553,7 +553,7 @@ pub(super) fn validate_bootstrap_writer_completion_state(
     }
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -702,7 +702,7 @@ pub(super) fn validate_cpu_writer_runtime_state_v1(
 
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -824,7 +824,7 @@ pub(super) fn validate_pi_writer_runtime_state_v1(
 
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -943,7 +943,7 @@ pub(super) fn validate_si_writer_runtime_state_v1(
 
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1056,7 +1056,7 @@ pub(super) fn validate_sp_writer_runtime_state_v1(
 
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1179,7 +1179,7 @@ pub(super) fn validate_host_abi_writer_runtime_state_v1(
 
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1432,7 +1432,7 @@ pub(super) fn validate_rsp_writer_runtime_state_v1(
 
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()
@@ -1647,7 +1647,7 @@ pub(super) fn validate_rdp_renderer_writer_runtime_state_v1(
 
     let view = fn64_runtime::RdramView::from_storage(storage);
     let snapshot = state
-        .read_snapshot(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        .read_snapshot_from_view(&view);
     if state
         .watched
         .iter()

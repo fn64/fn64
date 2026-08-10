@@ -7,10 +7,12 @@
 //! publication in runtime-owned RDRAM, then drives the executor until the guest
 //! either idles, reaches an unobserved PC, or reaches a runtime-behavior fault.
 
+mod block_program;
 mod dense_aot;
 mod diagnostics;
 mod runner_reports;
 mod telemetry;
+use block_program::*;
 use dense_aot::*;
 use diagnostics::*;
 use runner_reports::*;
@@ -857,249 +859,32 @@ fn main() {
     } else if std::env::var_os("FN64_BLOCK_PC_TRACE").is_none() {
         program.set_execution_destination_history_enabled(false);
     }
-    assert_eq!(
-        DENSE_AOT_ARTIFACTS.len(),
-        pack::BOOT_SHARDS.len()
-            + pack::RESIDENT_TAIL_SHARDS.len()
-            + pack::OVERLAY_GENERATIONS
-                .iter()
-                .map(|generation| generation.shards.len())
-                .sum::<usize>()
+    let instruction_budget = std::env::var("FN64_BLOCK_INSTRUCTION_BUDGET")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .ok()
+                .and_then(InstructionBudget::new)
+                .expect("FN64_BLOCK_INSTRUCTION_BUDGET must be an integer of at least two")
+        })
+        .unwrap_or_else(|_| InstructionBudget::new(4096).expect("nonzero budget"));
+    let ConstructedCatalogProgram {
+        catalog_program,
+        generation_catalog,
+        generation_backings,
+        generated_runner_bindings,
+        program_evidence,
+    } = construct_catalog_program(
+        program,
+        GateRunners {
+            dense_instrumentation: full_aot_instrumentation
+                .then_some(run_dense_aot_with_context_gate as GeneratedBankFn),
+            entry_context: run_entry_aot_with_context_gate as GeneratedBankFn,
+            overlay_generation: run_overlay_aot_with_generation_gate as GeneratedBankFn,
+            external_digest: run_nwxe_exception_image_with_digest_gate as GeneratedBankFn,
+        },
+        instruction_budget,
     );
-    assert_eq!(DENSE_AOT_IDENTITIES.len(), DENSE_AOT_ARTIFACTS.len());
-    let mut generated_runner_bindings = Vec::with_capacity(DENSE_AOT_ARTIFACTS.len() + 1);
-    for (artifact_index, ((artifact, identity), expected)) in DENSE_AOT_ARTIFACTS
-        .iter()
-        .zip(DENSE_AOT_IDENTITIES)
-        .take(pack::BOOT_SHARDS.len())
-        .zip(pack::BOOT_SHARDS)
-        .enumerate()
-    {
-        assert_eq!(artifact.bank_id, expected.bank_id);
-        assert_eq!(identity.source_sha256, expected.source_sha256);
-        let bank = BankId::new(expected.bank_id);
-        let code_bank = (artifact.code_bank)();
-        assert_eq!(code_bank.id(), bank);
-        assert_eq!(code_bank_sha256(&code_bank), expected.code_sha256);
-        assert_eq!(code_bank.vram_start(), GuestPc::new(expected.va_start));
-        assert_eq!(
-            code_bank.vram_end(),
-            GuestPc::new(expected.va_start + expected.byte_len)
-        );
-        let mut region = ExecutableRegion::new(
-            GuestPc::new(expected.va_start),
-            GuestPc::new(expected.va_start + expected.byte_len),
-        );
-        let (runner, role) = if full_aot_instrumentation {
-            (
-                run_dense_aot_with_context_gate as GeneratedBankFn,
-                GeneratedAdapterRole::DenseInstrumentationGate,
-            )
-        } else if artifact_index == 0 {
-            (
-                run_entry_aot_with_context_gate as GeneratedBankFn,
-                GeneratedAdapterRole::EntryContextGate,
-            )
-        } else {
-            (artifact.runner, GeneratedAdapterRole::DirectGenerated)
-        };
-        region
-            .install(
-                &mut program,
-                code_bank,
-                GeneratedBankRunner::new_with_artifact_identity(
-                    bank,
-                    runner,
-                    ProgramArtifactIdentity::generated_adapter(
-                        pack::ROOT_ADAPTER_SOURCE_SHA256,
-                        identity.runner_source_sha256,
-                        bank,
-                        role,
-                    ),
-                ),
-            )
-            .expect("installing dense boot-shard runner");
-        generated_runner_bindings.push(CargoGeneratedRunnerSourceBindingV1 {
-            bank,
-            generated_runner_source_sha256: identity.runner_source_sha256,
-            code_words_sha256: expected.code_sha256,
-            vram_start: GuestPc::new(expected.va_start),
-            vram_end: GuestPc::new(expected.va_start + expected.byte_len),
-            composite_subrunner_count: expected.byte_len.div_ceil(2 * 1024),
-            adapter_role: role,
-        });
-    }
-    let dynamic_shards = std::iter::once(&pack::RESIDENT_TAIL_GENERATION)
-        .chain(pack::OVERLAY_GENERATIONS.iter())
-        .flat_map(|generation| generation.shards.iter());
-    for (dynamic_index, ((artifact, identity), expected)) in DENSE_AOT_ARTIFACTS
-        .iter()
-        .zip(DENSE_AOT_IDENTITIES)
-        .skip(pack::BOOT_SHARDS.len())
-        .zip(dynamic_shards)
-        .enumerate()
-    {
-        assert_eq!(artifact.bank_id, expected.bank_id);
-        assert_eq!(identity.source_sha256, expected.source_sha256);
-        let bank = BankId::new(artifact.bank_id);
-        let code = (artifact.code_bank)();
-        assert_eq!(code.id(), bank);
-        assert_eq!(code_bank_sha256(&code), expected.code_sha256);
-        assert_eq!(code.vram_start(), GuestPc::new(expected.va_start));
-        assert_eq!(
-            code.vram_end(),
-            GuestPc::new(expected.va_start + expected.byte_len)
-        );
-        let (runner, role) = if full_aot_instrumentation {
-            (
-                run_dense_aot_with_context_gate as GeneratedBankFn,
-                GeneratedAdapterRole::DenseInstrumentationGate,
-            )
-        } else if dynamic_index < pack::RESIDENT_TAIL_SHARDS.len() {
-            (artifact.runner, GeneratedAdapterRole::DirectGenerated)
-        } else {
-            (
-                run_overlay_aot_with_generation_gate as GeneratedBankFn,
-                GeneratedAdapterRole::OverlayGenerationGate,
-            )
-        };
-        program
-            .register(
-                code,
-                GeneratedBankRunner::new_with_artifact_identity(
-                    bank,
-                    runner,
-                    ProgramArtifactIdentity::generated_adapter(
-                        pack::ROOT_ADAPTER_SOURCE_SHA256,
-                        identity.runner_source_sha256,
-                        bank,
-                        role,
-                    ),
-                ),
-            )
-            .expect("pre-registering immutable dynamic AOT artifact");
-        generated_runner_bindings.push(CargoGeneratedRunnerSourceBindingV1 {
-            bank,
-            generated_runner_source_sha256: identity.runner_source_sha256,
-            code_words_sha256: expected.code_sha256,
-            vram_start: GuestPc::new(expected.va_start),
-            vram_end: GuestPc::new(expected.va_start + expected.byte_len),
-            composite_subrunner_count: expected.byte_len.div_ceil(2 * 1024),
-            adapter_role: role,
-        });
-    }
-    let mut generation_catalog = PrecompiledGenerationCatalog::new();
-    let mut generation_backings = Vec::new();
-    let mut dense_definition_catalog = PrecompiledGenerationCatalog::new();
-    let mut dense_definition_backings = Vec::new();
-    for generation in
-        std::iter::once(&pack::RESIDENT_TAIL_GENERATION).chain(pack::OVERLAY_GENERATIONS.iter())
-    {
-        let generation_id = GenerationId::new(generation.id);
-        let image_start = GuestPc::new(generation.image_start);
-        let image_end = GuestPc::new(generation.image_end);
-        let invalidation_start = GuestPc::new(generation.invalidation_start);
-        let invalidation_end = GuestPc::new(generation.invalidation_end);
-        let shards = generation
-            .shards
-            .iter()
-            .map(|shard| {
-                PrecompiledShard::new(
-                    BankId::new(shard.bank_id),
-                    GuestPc::new(shard.va_start),
-                    GuestPc::new(shard.va_start + shard.byte_len),
-                )
-                .expect("generated dynamic shard geometry is valid")
-            })
-            .collect::<Vec<_>>();
-        let compiled_generation = PrecompiledGeneration::new(
-            generation_id,
-            image_start,
-            image_end,
-            invalidation_start,
-            invalidation_end,
-            generation.sha256,
-            shards,
-        )
-        .expect("generated dynamic generation geometry is valid");
-        dense_definition_catalog
-            .register(compiled_generation.clone())
-            .expect("dense generated generation catalog is unambiguous");
-        generation_catalog
-            .register(compiled_generation)
-            .expect("generated dynamic generation catalog is unambiguous");
-        assert!(
-            (0x8000_0000..0xc000_0000).contains(&invalidation_start.get())
-                && invalidation_end.get() <= 0xc000_0000,
-            "generated dynamic generation backing must be direct-mapped KSEG"
-        );
-        let backing = PrecompiledGenerationBackingV1::new(
-            generation_id,
-            vec![BackedExecutableSpanV1::new(
-                invalidation_start,
-                invalidation_start.get() & 0x1fff_ffff,
-                invalidation_end.get() - invalidation_start.get(),
-            )
-            .expect("generated dynamic physical backing is valid")],
-        )
-        .expect("generated dynamic generation backing is contiguous");
-        dense_definition_backings.push(backing.clone());
-        generation_backings.push(backing);
-    }
-    let dense_definition = BackedPrecompiledGenerationCatalogV1::new(
-        dense_definition_catalog,
-        dense_definition_backings,
-    )
-    .expect("dense generated generations have exact physical backings");
-    assert_eq!(
-        dense_definition.canonical_definition_sha256(),
-        pack::DENSE_GENERATION_CATALOG_DEFINITION_SHA256,
-        "runtime dense generation catalog must equal the build-time ROM-derived definition"
-    );
-    for image in pack::EXTERNAL_EXECUTABLE_IMAGES {
-        let bank = BankId::new(image.bank_id);
-        let image_start = GuestPc::new(image.va_start);
-        let image_end = GuestPc::new(image.va_end);
-        register_external_executable_generation(
-            &mut generation_catalog,
-            &mut generation_backings,
-            bank,
-            image_start,
-            image_end,
-            image.sha256,
-        );
-        let code = CodeBank::new(bank, GuestPc::new(image.va_start), image.words.to_vec())
-            .expect("admitting captured exception-vector image");
-        assert_eq!(code_bank_sha256(&code), image.sha256);
-        let mut region =
-            ExecutableRegion::new(GuestPc::new(image.va_start), GuestPc::new(image.va_end));
-        region
-            .install(
-                &mut program,
-                code,
-                GeneratedBankRunner::new_with_artifact_identity(
-                    bank,
-                    run_nwxe_exception_image_with_digest_gate,
-                    ProgramArtifactIdentity::generated_adapter(
-                        pack::ROOT_ADAPTER_SOURCE_SHA256,
-                        pack::EXTERNAL_RUNNER_SOURCE_SHA256,
-                        bank,
-                        GeneratedAdapterRole::ExternalDigestGate,
-                    ),
-                ),
-            )
-            .expect("installing captured exception-vector runner");
-        generated_runner_bindings.push(CargoGeneratedRunnerSourceBindingV1 {
-            bank,
-            generated_runner_source_sha256: pack::EXTERNAL_RUNNER_SOURCE_SHA256,
-            code_words_sha256: image.sha256,
-            vram_start: GuestPc::new(image.va_start),
-            vram_end: GuestPc::new(image.va_end),
-            composite_subrunner_count: 1,
-            adapter_role: GeneratedAdapterRole::ExternalDigestGate,
-        });
-    }
-    let program_evidence = program.evidence_snapshot();
     let build_receipt = fn64_recomp_rs::static_execution_build_receipt();
     if !generated_runner_protocol_mode {
         println!(
@@ -1121,34 +906,6 @@ fn main() {
         println!("[wm2000-block-boot] canonical program artifact={program_artifact}");
         println!("[wm2000-block-boot] booting thread 0 from the discovered pack...");
     }
-    let instruction_budget = std::env::var("FN64_BLOCK_INSTRUCTION_BUDGET")
-        .map(|value| {
-            value
-                .parse::<u32>()
-                .ok()
-                .and_then(InstructionBudget::new)
-                .expect("FN64_BLOCK_INSTRUCTION_BUDGET must be an integer of at least two")
-        })
-        .unwrap_or_else(|_| InstructionBudget::new(4096).expect("nonzero budget"));
-    let catalog_program =
-        CatalogBlockProgramV1::new_with_cargo_generated_runner_source_attestation_v2(
-            program,
-            ExecutionKey::new(entry_bank(), GuestPc::new(pack::ENTRYPOINT)),
-            instruction_budget,
-            CargoGeneratedProgramSourceAttestationV2 {
-                root_adapter_source_sha256: pack::ROOT_ADAPTER_SOURCE_SHA256,
-                shard_cargo_source_tree_sha256: pack::SHARD_CARGO_SOURCE_TREE_SHA256,
-                expected_emitter_source_sha256: pack::EMITTER_SOURCE_SHA256,
-                externally_measured_emitter_source_sha256:
-                    fn64_recomp_rs_codegen::generated_runner_emitter_source_receipt_v2()
-                        .source_sha256(),
-                expected_runtime_source_sha256: pack::RUNTIME_SOURCE_SHA256,
-                runtime_source_receipt: fn64_recomp_rs::generated_runner_runtime_source_receipt_v1(
-                ),
-                runners: &generated_runner_bindings,
-            },
-        )
-        .expect("Cargo-source-attested block program has one admitted fixed entry");
     let generated_build_identity = generated_runner_protocol_mode
         .then(|| generated_runner_build_identity(&catalog_program, &generated_runner_bindings));
     if generated_runner_build_identity_mode {
@@ -1161,70 +918,7 @@ fn main() {
     }
     let (rom, boot_context) =
         boot_inputs.expect("normal boot mode initialized ROM and BootContext before admission");
-    use fn64_abi::recompiled::{AbiHostShimBindingV1 as Binding, AbiHostShimV1 as Shim};
-    let host_functions = fn64_abi::recompiled::issue_abi_host_function_catalog_v1(vec![
-        Binding {
-            target_pc: pack::OS_SI_DEVICE_BUSY,
-            shim: Shim::OsSiDeviceBusy,
-        },
-        Binding {
-            target_pc: pack::OS_CREATE_MESG_QUEUE,
-            shim: Shim::OsCreateMesgQueue,
-        },
-        Binding {
-            target_pc: pack::OS_EPI_START_DMA,
-            shim: Shim::OsEPiStartDma,
-        },
-        Binding {
-            target_pc: pack::OS_RECV_MESG,
-            shim: Shim::OsRecvMesg,
-        },
-        Binding {
-            target_pc: pack::OS_SEND_MESG,
-            shim: Shim::OsSendMesg,
-        },
-        Binding {
-            target_pc: pack::OS_CREATE_THREAD,
-            shim: Shim::OsCreateThread,
-        },
-        Binding {
-            target_pc: pack::OS_SET_EVENT_MESG,
-            shim: Shim::OsSetEventMesg,
-        },
-        Binding {
-            target_pc: pack::OS_START_THREAD,
-            shim: Shim::OsStartThread,
-        },
-        Binding {
-            target_pc: pack::OS_GET_THREAD_PRI,
-            shim: Shim::OsGetThreadPri,
-        },
-        Binding {
-            target_pc: pack::OS_SET_THREAD_PRI,
-            shim: Shim::OsSetThreadPri,
-        },
-        Binding {
-            target_pc: pack::OS_SET_TIMER,
-            shim: Shim::OsSetTimer,
-        },
-        Binding {
-            target_pc: pack::OS_SP_TASK_LOAD,
-            shim: Shim::OsSpTaskLoad,
-        },
-        Binding {
-            target_pc: pack::OS_SP_TASK_START_GO,
-            shim: Shim::OsSpTaskStartGo,
-        },
-        Binding {
-            target_pc: pack::OS_SP_TASK_YIELD,
-            shim: Shim::OsSpTaskYield,
-        },
-        Binding {
-            target_pc: pack::OS_SP_TASK_YIELDED,
-            shim: Shim::OsSpTaskYielded,
-        },
-    ])
-    .expect("ABI-issued host-function catalog is exact and unambiguous");
+    let host_functions = issue_wm2000_host_function_catalog();
     let resolver = fn64_abi::recompiled::CatalogResolverInstallV1::new_with_abi_host_catalog(
         catalog_program,
         host_functions,
