@@ -59,6 +59,13 @@
   ],
   "sites": [
     {
+      "operation": "abi.pi.absent-domain1-device",
+      "subsystem": "abi",
+      "disposition": "loud_trap",
+      "path": "crates/fn64-abi/src/pi/timing.rs",
+      "trigger": "CPU read of PI domain-1 address 1"
+    },
+    {
       "operation": "runtime.overlay.get-function",
       "subsystem": "runtime",
       "disposition": "loud_trap",
