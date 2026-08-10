@@ -442,6 +442,36 @@
     }
 
     #[test]
+    fn sustained_controller_reads_publish_each_poll_once_with_fresh_input() {
+        reset_controller_manager();
+        initialize_controller_manager_for_test(1);
+        let queue = RdramAddr::from_offset(8);
+        with_executor(|exec| {
+            exec.create_mesg_queue(queue, 1);
+            exec.set_event_mesg(OS_EVENT_SI, queue, 0xCAFE);
+        });
+        let mut rdram = vec![0u8; 0x40];
+
+        for (buttons, stick_x, stick_y) in [(0x8000, 11, -12), (0x4000, -21, 22)] {
+            set_controller_state(0, buttons, stick_x, stick_y);
+            start_controller_poll(queue, ControllerPollKind::Read, 1).unwrap();
+            crate::advance_virtual_time(crate::sim_time().saturating_add(1));
+            assert_eq!(
+                with_executor(|exec| exec.recv_mesg(999, queue, false)),
+                fn64_runtime::RecvMesgOutcome::Delivered(0xCAFE)
+            );
+
+            let mut get = ctx_zeroed();
+            get.r4 = 0x8000_0020;
+            unsafe { osContGetReadData_recomp(rdram.as_mut_ptr(), &mut get) };
+            let view = fn64_runtime::RdramView::from_storage(&rdram);
+            assert_eq!(view.read_u16(RdramAddr::from_offset(0x20)), buttons);
+            assert_eq!(view.read_u8(RdramAddr::from_offset(0x22)) as i8, stick_x);
+            assert_eq!(view.read_u8(RdramAddr::from_offset(0x23)) as i8, stick_y);
+        }
+    }
+
+    #[test]
     fn controller_read_latches_start_channel_prefix() {
         reset_controller_manager();
         initialize_controller_manager_for_test(1);

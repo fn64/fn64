@@ -546,6 +546,114 @@ mod tests {
         );
     }
 
+    /// This is the complete live audio path, not three isolated seam tests:
+    /// an admitted audio IMEM image writes PCM through SP DMA, the interpreter
+    /// commits those bytes to process RDRAM, and the CPU's later AI submission
+    /// delivers those exact samples to the registered host backend.
+    #[test]
+    fn rsp_audio_lle_output_reaches_the_ai_backend_as_pcm() {
+        use std::sync::{Arc, Mutex};
+
+        struct CaptureBackend(Arc<Mutex<Vec<i16>>>);
+
+        impl AudioBackend for CaptureBackend {
+            fn create(
+                &mut self,
+                _cfg: &fn64_audio::AudioConfig,
+            ) -> Result<(), fn64_audio::AudioError> {
+                Ok(())
+            }
+
+            fn queue_samples(&mut self, samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .extend_from_slice(samples);
+                Ok(())
+            }
+
+            fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
+                Ok(0)
+            }
+
+            fn set_frequency(&mut self, _sample_rate_hz: u32) {}
+        }
+
+        const HEADER: usize = 0x40;
+        const PCM: usize = 0x800;
+        const IMAGE: usize = 0x1000;
+        const RDRAM_LEN: usize = IMAGE + fn64_runtime::RSP_MEMORY_BANK_SIZE;
+        let mtc0 = |rt: u32, rd: u32| (0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
+
+        crate::load_rom(Vec::new());
+        configure_ntsc();
+        set_audio_task_lle_accuracy();
+        let mut rdram = vec![0u8; RDRAM_LEN];
+        for (field, value) in [
+            (0x00, fn64_runtime::M_AUDTASK),
+            (0x08, IMAGE as u32),
+            (0x0c, fn64_runtime::RSP_MEMORY_BANK_SIZE as u32),
+            (0x10, IMAGE as u32),
+            (0x14, fn64_runtime::RSP_MEMORY_BANK_SIZE as u32),
+        ] {
+            rdram[HEADER + field..HEADER + field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        // Store two nonzero signed samples in DMEM, then DMA eight bytes to
+        // the future AI buffer. The remaining two samples stay zero.
+        for (index, word) in [
+            0x3c01_1234, // lui   $1, 0x1234
+            0x3421_fedc, // ori   $1, $1, 0xfedc
+            0xac01_0000, // sw    $1, 0($0)
+            0x2402_0000 | PCM as u32,
+            mtc0(2, 1), // SP_DRAM_ADDR = PCM
+            mtc0(0, 0), // SP_MEM_ADDR = DMEM[0]
+            0x2403_0007,
+            mtc0(3, 3), // SP_WR_LEN = 7, committing eight bytes
+            0x0000_000d,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = IMAGE + index * 4;
+            rdram[offset..offset + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = CaptureBackend(Arc::clone(&captured));
+        backend
+            .create(&fn64_audio::AudioConfig::new(32_000, 2))
+            .unwrap();
+        set_audio_backend(Box::new(backend), rdram.len());
+        with_host(|host| {
+            host.runtime_rdram = rdram.as_mut_ptr();
+            host.runtime_rdram_len = rdram.len();
+        });
+
+        let mut task = ctx_zeroed();
+        task.r4 = 0x8000_0000 + HEADER as u64;
+        unsafe {
+            crate::task_dispatch::osSpTaskLoad_recomp(rdram.as_mut_ptr(), &mut task);
+            crate::task_dispatch::osSpTaskStartGo_recomp(rdram.as_mut_ptr(), &mut task);
+        }
+        let view = fn64_runtime::RdramView::from_storage(&rdram);
+        assert_eq!(view.read_u16(RdramAddr::from_offset(PCM as u32)), 0x1234);
+        assert_eq!(
+            view.read_u16(RdramAddr::from_offset(PCM as u32 + 2)),
+            0xfedc
+        );
+
+        let mut ai = ctx_zeroed();
+        ai.r4 = 0x8000_0000 + PCM as u64;
+        ai.r5 = 8;
+        unsafe { osAiSetNextBuffer_recomp(rdram.as_mut_ptr(), &mut ai) };
+        assert_eq!(ai.r2, 0);
+        assert_eq!(
+            *captured.lock().unwrap_or_else(|error| error.into_inner()),
+            [0x1234, -292, 0, 0],
+            "host PCM must be the exact samples written by the live RSP image"
+        );
+    }
+
     /// osAiSetFrequency must write the true DAC playback rate to $v0
     /// (aisetfreq.c: osViClock / dacRate), or -1 for an unusably-low rate.
     /// Fails against the bug (never writes r2): stale $v0 survives.

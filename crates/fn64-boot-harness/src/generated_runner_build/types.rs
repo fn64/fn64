@@ -12,7 +12,7 @@ pub enum GeneratedRunnerAdapterRoleV1 {
 }
 
 impl GeneratedRunnerAdapterRoleV1 {
-    const fn tag(self) -> u8 {
+    pub(super) const fn tag(self) -> u8 {
         match self {
             Self::DirectGenerated => 0,
             Self::EntryContextGate => 1,
@@ -103,43 +103,43 @@ pub struct Wm2000GeneratedRunnerBuildInputsV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PreparedSourceClaimsV3 {
-    generator_source_sha256: String,
-    discovery_source_sha256: String,
-    emitter_source_sha256: String,
-    runtime_source_sha256: String,
-    materializer_source_sha256: String,
+    pub(super) generator_source_sha256: String,
+    pub(super) discovery_source_sha256: String,
+    pub(super) emitter_source_sha256: String,
+    pub(super) runtime_source_sha256: String,
+    pub(super) materializer_source_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProducerBuildMeasurementV3 {
-    manifest_sha256: String,
-    lock_sha256: String,
-    cargo_graph_sha256: String,
-    cargo_source_sha256: String,
-    binary_sha256: String,
-    binary: PathBuf,
+    pub(super) manifest_sha256: String,
+    pub(super) lock_sha256: String,
+    pub(super) cargo_graph_sha256: String,
+    pub(super) cargo_source_sha256: String,
+    pub(super) binary_sha256: String,
+    pub(super) binary: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PreparedTreeMeasurementV3 {
-    root: PathBuf,
-    normalized_rom_sha256: String,
-    manifest_sha256: String,
-    tree_sha256: String,
-    descriptor_sha256: String,
-    claims: PreparedSourceClaimsV3,
+    pub(super) root: PathBuf,
+    pub(super) normalized_rom_sha256: String,
+    pub(super) manifest_sha256: String,
+    pub(super) tree_sha256: String,
+    pub(super) descriptor_sha256: String,
+    pub(super) claims: PreparedSourceClaimsV3,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct BuildEnvironmentV3 {
-    path: std::ffi::OsString,
-    home: PathBuf,
-    cargo_home: PathBuf,
-    temp: PathBuf,
-    rustc: PathBuf,
-    identity_sha256: String,
-    rustc_sha256: String,
-    cargo_config_sha256: String,
+    pub(super) path: std::ffi::OsString,
+    pub(super) home: PathBuf,
+    pub(super) cargo_home: PathBuf,
+    pub(super) temp: PathBuf,
+    pub(super) rustc: PathBuf,
+    pub(super) identity_sha256: String,
+    pub(super) rustc_sha256: String,
+    pub(super) cargo_config_sha256: String,
 }
 
 /// Integrity projection retained inside the opaque capability.
@@ -179,12 +179,12 @@ pub struct GeneratedRunnerBuildEvidenceV1 {
 /// be implemented in this module, consume this capability, and launch the SI
 /// child with the retained staged ROM, BootContext, and capture-group paths.
 pub struct VerifiedGeneratedRunnerBuildV1 {
-    evidence: GeneratedRunnerBuildEvidenceV1,
-    selected_binary: PathBuf,
-    private_inputs: Wm2000GeneratedRunnerBuildInputsV1,
-    prepared: PreparedTreeMeasurementV3,
-    producer: ProducerBuildMeasurementV3,
-    _scratch: ScratchDirectory,
+    pub(super) evidence: GeneratedRunnerBuildEvidenceV1,
+    pub(super) selected_binary: PathBuf,
+    pub(super) private_inputs: Wm2000GeneratedRunnerBuildInputsV1,
+    pub(super) prepared: PreparedTreeMeasurementV3,
+    pub(super) producer: ProducerBuildMeasurementV3,
+    pub(super) _scratch: ScratchDirectory,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerBuildV1 {
@@ -245,7 +245,7 @@ pub enum BootstrapWriterChannelV1 {
 }
 
 impl BootstrapWriterChannelV1 {
-    const fn tag(self) -> u8 {
+    pub(super) const fn tag(self) -> u8 {
         match self {
             Self::BootstrapOrImport => fn64_recomp_rs::WriterChannel::BootstrapOrImport as u8,
         }
@@ -324,8 +324,8 @@ pub struct GeneratedRunnerBootstrapRuntimeSeriesEvidenceV1 {
 }
 
 pub struct VerifiedGeneratedRunnerBootstrapRuntimeSeriesV1 {
-    evidence: GeneratedRunnerBootstrapRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerBootstrapRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerBootstrapRuntimeSeriesV1 {
@@ -413,8 +413,8 @@ pub struct GeneratedRunnerCpuRuntimeSeriesEvidenceV1 {
 /// Move-only parent authority for ten directly owned, semantically identical
 /// CPU instruction-store audit launches of one exact generated runner.
 pub struct VerifiedGeneratedRunnerCpuRuntimeSeriesV1 {
-    evidence: GeneratedRunnerCpuRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerCpuRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerCpuRuntimeSeriesV1 {
@@ -506,8 +506,8 @@ pub struct GeneratedRunnerHostAbiRuntimeSeriesEvidenceV1 {
 /// Move-only parent authority for ten directly owned, semantically identical
 /// canonical Host ABI audit launches of one exact generated runner.
 pub struct VerifiedGeneratedRunnerHostAbiRuntimeSeriesV1 {
-    evidence: GeneratedRunnerHostAbiRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerHostAbiRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerHostAbiRuntimeSeriesV1 {
@@ -600,8 +600,8 @@ pub struct GeneratedRunnerPiRuntimeSeriesEvidenceV1 {
 /// Move-only parent authority for ten directly owned, semantically identical
 /// PI-DMA audit launches of one exact generated runner.
 pub struct VerifiedGeneratedRunnerPiRuntimeSeriesV1 {
-    evidence: GeneratedRunnerPiRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerPiRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerPiRuntimeSeriesV1 {
@@ -690,8 +690,8 @@ pub struct GeneratedRunnerRdpRendererRuntimeSeriesEvidenceV1 {
 /// Move-only parent authority for ten directly owned, semantically identical
 /// RDP renderer audit launches of one exact generated runner.
 pub struct VerifiedGeneratedRunnerRdpRendererRuntimeSeriesV1 {
-    evidence: GeneratedRunnerRdpRendererRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerRdpRendererRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerRdpRendererRuntimeSeriesV1 {
@@ -779,8 +779,8 @@ pub struct GeneratedRunnerRspRuntimeSeriesEvidenceV1 {
 /// Move-only parent authority for ten directly owned, semantically identical
 /// RSP execution/HLE audit launches of one exact generated runner.
 pub struct VerifiedGeneratedRunnerRspRuntimeSeriesV1 {
-    evidence: GeneratedRunnerRspRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerRspRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerRspRuntimeSeriesV1 {
@@ -880,8 +880,8 @@ pub struct GeneratedRunnerSiRuntimeSeriesEvidenceV1 {
 /// capability, including its private staged inputs, and has no constructor,
 /// clone, or serialization implementation outside this module.
 pub struct VerifiedGeneratedRunnerSiRuntimeSeriesV1 {
-    evidence: GeneratedRunnerSiRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerSiRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerSiRuntimeSeriesV1 {
@@ -974,8 +974,8 @@ pub struct GeneratedRunnerSpRuntimeSeriesEvidenceV1 {
 /// receipt alone grants no writer-denominator credit; this outer exact-ten
 /// series is the sole accepted runtime-series input to `complete_sp`.
 pub struct VerifiedGeneratedRunnerSpRuntimeSeriesV1 {
-    evidence: GeneratedRunnerSpRuntimeSeriesEvidenceV1,
-    _build: VerifiedGeneratedRunnerBuildV1,
+    pub(super) evidence: GeneratedRunnerSpRuntimeSeriesEvidenceV1,
+    pub(super) _build: VerifiedGeneratedRunnerBuildV1,
 }
 
 impl fmt::Debug for VerifiedGeneratedRunnerSpRuntimeSeriesV1 {
@@ -1229,7 +1229,7 @@ impl VerifiedGeneratedRunnerWriterAuditBundleV1 {
 }
 
 #[derive(Debug)]
-pub struct GeneratedRunnerBuildError(String);
+pub struct GeneratedRunnerBuildError(pub(super) String);
 
 impl fmt::Display for GeneratedRunnerBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

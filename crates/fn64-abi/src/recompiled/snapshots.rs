@@ -1,7 +1,7 @@
 use super::*;
 
-struct LiveTransferResolver {
-    live: LiveBlockProgram,
+pub(super) struct LiveTransferResolver {
+    pub(super) live: LiveBlockProgram,
 }
 
 impl TransferResolver for LiveTransferResolver {
@@ -29,7 +29,7 @@ impl TransferResolver for LiveTransferResolver {
 }
 
 impl LiveBlockProgram {
-    fn resolve_transfer(
+    pub(super) fn resolve_transfer(
         &self,
         source_bank: BankId,
         target_pc: GuestPc,
@@ -50,7 +50,7 @@ impl LiveBlockProgram {
         (self.transfer_lookup)(source_bank, target_pc)
     }
 
-    fn resolve_entry(&self, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
+    pub(super) fn resolve_entry(&self, target_pc: GuestPc) -> Result<ExecutionKey, CpuFault> {
         if let Some(catalog) = self.precompiled_generations.borrow().as_ref() {
             if let Ok(key) = catalog.resolve_active(target_pc) {
                 return Ok(key);
@@ -845,7 +845,7 @@ fn observe_block_host_boundary(
         let mut boundaries = boundaries.borrow_mut();
         boundaries.push_back(BlockHostBoundaryObservation {
             at: fn64_runtime::Cycles::new(crate::sim_time()),
-            thread: super::current_thread_id("block host-boundary observation"),
+            thread: crate::current_thread_id("block host-boundary observation"),
             phase,
             target,
             resume,
@@ -868,7 +868,7 @@ fn observe_block_host_boundary(
     });
 }
 
-fn invoke_observed_block_host(
+pub(super) fn invoke_observed_block_host(
     target: GuestPc,
     resume: ExecutionKey,
     host: RecompFunc,
@@ -880,7 +880,7 @@ fn invoke_observed_block_host(
     observe_block_host_boundary(BlockHostBoundaryPhase::Exit, target, resume, ctx);
 }
 
-fn invoke_catalog_block_host(
+pub(super) fn invoke_catalog_block_host(
     live: &CanonicalLiveBlockProgramV1,
     target: GuestPc,
     resume: ExecutionKey,
@@ -928,7 +928,7 @@ pub fn copy_function_execution_destinations() -> Vec<FunctionExecutionDestinatio
     FUNCTION_EXECUTION_DESTINATIONS.with(|destinations| destinations.borrow().clone())
 }
 
-fn observe_function_entry(function: TranslatedFunctionIdentity) {
+pub(super) fn observe_function_entry(function: TranslatedFunctionIdentity) {
     let artifact_identity = FUNCTION_LANE_ARTIFACT_IDENTITY
         .with(std::cell::Cell::get)
         .unwrap_or_else(|| {
@@ -946,18 +946,18 @@ fn observe_function_entry(function: TranslatedFunctionIdentity) {
     });
 }
 
-fn observe_renderer_write(event: GuestWriteEvent) {
+pub(super) fn observe_renderer_write(event: GuestWriteEvent) {
     if let GuestWriteEvent::NonRdpWrite16 {
         logical_offset,
         value,
         ..
     } = event
     {
-        super::task_dispatch::observe_non_rdp_write16(logical_offset, value);
+        crate::task_dispatch::observe_non_rdp_write16(logical_offset, value);
     }
 }
 
-fn record_executable_and_renderer_write(event: GuestWriteEvent) {
+pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     let (offset, len) = event.range();
     if event.channel() == WriterChannel::CpuInstructionStore {
         CPU_INSTRUCTION_STORE_TRACE.with(|trace| {
@@ -980,7 +980,7 @@ fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     observe_renderer_write(event);
 }
 
-fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWriteBoundary {
+pub(super) fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWriteBoundary {
     let (start, len) = event.range();
     let end = start.saturating_add(len);
     if EXECUTABLE_WRITE_RANGES.with(|ranges| {
@@ -1011,7 +1011,28 @@ fn track_catalog_nested_mutation<R>(
         transaction.commit_changed_bytes(rdram, notify);
         return result;
     }
-    let ranges = EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone());
+    // Watch the ranges the GUARD will later check, not just this thread's
+    // registered write ranges.
+    //
+    // The canonical branch above diffs `mutation_state`'s watched set -- the
+    // same set `commit_snapshot` compares against when it decides a byte was
+    // undeclared. This branch used `EXECUTABLE_WRITE_RANGES`, a different set,
+    // so a renderer write landing on executable bytes outside it was never
+    // compared here and never notified. It then surfaced at the next commit as
+    // an undeclared mutation with `events=0 declarations=0`, because nothing
+    // had declared it -- WM2000 patching a store's immediate at 0x8009b0b0
+    // during a graphics task is exactly that case.
+    //
+    // Falling back to the thread-local set keeps behavior unchanged when no
+    // canonical program is installed, which is the only situation it was ever
+    // the right answer for.
+    let ranges = with_host(|host| host.canonical_recompiled_program.clone())
+        .and_then(|live| {
+            live.mutation_state
+                .as_ref()
+                .map(|state| state.borrow().watched_ranges())
+        })
+        .unwrap_or_else(|| EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow().clone()));
     let before = {
         let view = fn64_runtime::RdramView::from_storage(rdram);
         ranges
@@ -1149,7 +1170,7 @@ pub(crate) fn track_rsp_execution_or_hle_mutation<R>(
     (result, journal_sequences)
 }
 
-fn process_executable_writes(
+pub(super) fn process_executable_writes(
     live: &LiveBlockProgram,
     mut read_logical_byte: impl FnMut(u32) -> u8,
 ) -> Vec<BankId> {
@@ -1213,7 +1234,7 @@ fn process_executable_writes(
     retired
 }
 
-fn activate_fetch_generation(
+pub(super) fn activate_fetch_generation(
     live: &LiveBlockProgram,
     at: ExecutionKey,
     miss: AotMiss,

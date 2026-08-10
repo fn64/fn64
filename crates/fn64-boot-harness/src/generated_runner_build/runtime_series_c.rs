@@ -463,7 +463,7 @@ pub(super) enum WriterRuntimeAuditProtocol {
 }
 
 impl WriterRuntimeAuditProtocol {
-    const fn argument(self) -> &'static str {
+    pub(super) const fn argument(self) -> &'static str {
         match self {
             Self::Bootstrap => GENERATED_RUNNER_BOOTSTRAP_RUNTIME_ARGUMENT_V1,
             Self::Cpu => GENERATED_RUNNER_CPU_RUNTIME_ARGUMENT_V1,
@@ -476,7 +476,7 @@ impl WriterRuntimeAuditProtocol {
         }
     }
 
-    const fn nonce_environment(self) -> &'static str {
+    pub(super) const fn nonce_environment(self) -> &'static str {
         match self {
             Self::Bootstrap => GENERATED_RUNNER_BOOTSTRAP_RUNTIME_NONCE_ENV_V1,
             Self::Cpu => GENERATED_RUNNER_CPU_RUNTIME_NONCE_ENV_V1,
@@ -489,7 +489,7 @@ impl WriterRuntimeAuditProtocol {
         }
     }
 
-    const fn report_prefix(self) -> &'static str {
+    pub(super) const fn report_prefix(self) -> &'static str {
         match self {
             Self::Bootstrap => GENERATED_RUNNER_BOOTSTRAP_RUNTIME_REPORT_PREFIX_V1,
             Self::Cpu => GENERATED_RUNNER_CPU_RUNTIME_REPORT_PREFIX_V1,

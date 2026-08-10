@@ -498,7 +498,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
         source: DpcSubmissionSource,
         start: u32,
         end: u32,
-    ) -> Result<DpcSubmission, DeviceFault> {
+    ) -> Result<Option<DpcSubmission>, DeviceFault> {
         if self.pending_dpc.is_some() {
             return Err(DeviceFault::DpBusy);
         }
@@ -511,7 +511,12 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
             DpcSubmissionSource::Rdram => self.dpc.status &= !DPC_STATUS_XBUS_DMEM_DMA,
             DpcSubmissionSource::Dmem => self.dpc.status |= DPC_STATUS_XBUS_DMEM_DMA,
         }
+        self.dpc.status &= !DPC_STATUS_START_VALID;
+        if self.dpc.status & DPC_STATUS_FREEZE != 0 {
+            return Ok(None);
+        }
         self.begin_dpc_submission(source, start, end, rollback)
+            .map(Some)
     }
 
     /// Commit renderer acceptance. CURRENT advances only here, after the

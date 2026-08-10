@@ -11,6 +11,20 @@ publish = false
 [workspace]
 resolver = "2"
 
+[[bin]]
+name = "wm2000-block-boot"
+path = "src/main.rs"
+
+# The interactive lane. A SECOND BINARY of this package rather than its own
+# crate, deliberately: both binaries then share this package's one `build.rs`
+# ROM discovery, its one `OUT_DIR` pack, and the 35 already-compiled generated
+# shard crates -- and both construct their program through the same
+# `src/block_program.rs`, so the windowed lane cannot drift from the certified
+# headless one.
+[[bin]]
+name = "wm2000-shell"
+path = "src/shell.rs"
+
 [features]
 dynamic-withheld = [
     "fn64-abi/dynamic-mapped-runtime",
@@ -22,11 +36,22 @@ fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
 fn64-recomp-rs = { path = "../../crates/fn64-recomp-rs", default-features = false, features = ["production-aot"] }
 fn64-recomp-rs-codegen = { path = "../../crates/fn64-recomp-rs-codegen" }
 fn64-boot-harness = { path = "../../crates/fn64-boot-harness", features = ["recomp-rs"] }
+fn64-audio = { path = "../../crates/fn64-audio" }
 fn64-render = { path = "../../crates/fn64-render" }
 fn64-render-reference = { path = "../../crates/fn64-render-reference" }
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 sha2 = "0.10"
 serde_json = "1"
+# Window/input stack for the `wm2000-shell` binary. Same versions as
+# crates/fn64-shell/rs/Cargo.toml, because that shell's `framebuffer`,
+# `input_map`, `gamepad`, and `timing` modules are included from there by
+# `#[path]` and must compile against the same APIs.
+winit = { version = "0.30", features = ["serde"] }
+pixels = "0.15"
+gilrs = { version = "0.11", features = ["serde-serialize"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
 wm2000-block-shard-00 = { path = "../wm2000-block-shards/shard00" }
 wm2000-block-shard-01 = { path = "../wm2000-block-shards/shard01" }
 wm2000-block-shard-02 = { path = "../wm2000-block-shards/shard02" }
@@ -93,6 +118,21 @@ incremental = false
 opt-level = 1
 codegen-units = 16
 
+# The CPU interpreter and block dispatcher. This was the one hot crate the
+# per-package overrides below had missed -- fn64-runtime, fn64-abi and
+# fn64-render-reference were already named, fn64-recomp-rs was not, and it
+# executes every guest instruction.
+#
+# A route run to WM2000's menus takes ~48 minutes of EMULATION, a cost that
+# was misread as inherent to the route. Optimizing the whole build is the
+# obvious fix and the wrong one: the dense-AOT shards are hundreds of MiB of
+# generated match arms whose LLVM cost is superlinear, which is why release
+# builds of this example take 40+ minutes and have been OOM-killed twice.
+# Naming the executing crates buys the run-time win without that compile-time
+# cost, which is exactly what the existing entries below were already doing.
+[profile.dev.package.fn64-recomp-rs]
+opt-level = 3
+
 # Raw-DPC LLE spends most of its host time in the deterministic reference
 # renderer. Optimize that bounded handwritten crate without enabling release
 # codegen across the generated shard catalog.
@@ -103,10 +143,10 @@ opt-level = 2
 # small handwritten memory-contract crate without changing generated shard
 # codegen or enabling a broad dependency override.
 [profile.dev.package.fn64-runtime]
-opt-level = 2
+opt-level = 3
 
 # Unadmitted F3DZEX2 tasks deliberately fall back to the clean-room RSP
 # interpreter in fn64-abi. Keep that handwritten hot path optimized without
 # applying release codegen to the generated static-AOT shard catalog.
 [profile.dev.package.fn64-abi]
-opt-level = 2
+opt-level = 3

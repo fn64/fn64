@@ -283,3 +283,31 @@ Conditions 1 and 4 fail on *absent private inputs* rather than evidence
 limits; supplying a validated BootContext and external image captures would
 likely close them. Conditions 2 and 5 would still block on the 27-root CFG,
 so the frontier stays open regardless.
+
+### Measured 2026-08-05: the private inputs exist now, and they move 1 and 4
+
+The prediction above was correct. A BootContext captured through the public
+m64p debugger and a three-run general-exception image group (both persisted
+under `~/Code/aki-recomp/captures/`) were supplied via `FN64_BOOT_CONTEXT`
+and `FN64_EXECUTABLE_IMAGES`. Controlled comparison, same binary, same ROM,
+`FN64_DENSE_MANIFEST_ONLY=1`:
+
+| field | no captures | with captures |
+|---|---|---|
+| `source_frontier_receipt` | `4cd5e0fe...` | `cc1463fd...` |
+| `initial_bev_clear` | `false` | **`true`** |
+| `external_images` | `0` | **`1`** |
+| `open_exception_vectors` | `6` | **`5`** |
+
+The no-capture receipt reproduces `4cd5e0fe...` byte-for-byte -- the value
+recorded at the top of this section -- so this is the documented state plus
+one input, not a different measurement.
+
+**Condition 1 is closed** (`initial_bev_clear=true`). **Condition 4 moved but
+is not closed**: one of six vectors gained a scanned owner, and the remaining
+five need their own image captures.
+
+Conditions 2 and 5 are unchanged, exactly as predicted: `cop0_value_open=4`
+and `open_cpu_word_stores=52` against `roots=27 blocks=197`. The frontier
+stays open on the CFG limit, which no capture can supply -- that part of the
+original analysis holds.

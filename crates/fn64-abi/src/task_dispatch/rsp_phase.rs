@@ -632,12 +632,14 @@ pub(crate) unsafe fn commit_verified_audio_effects(
     let verified_writes = apply_verified_audio_rdram_patches(&mut shadow, &rdram_patches);
     let architectural_state = machine_state.into_architectural_state();
 
+    // Named `_writes` so the binding stays unused-clean without `recomp-rs`;
+    // the preflight below is the only consumer and is itself feature-gated.
     let _writes = merge_canonical_rdram_write_ranges(
         verified_writes,
         canonical_changed_rdram_ranges(live, &shadow),
     );
     #[cfg(feature = "recomp-rs")]
-    if let Err(reason) = crate::recompiled::preflight_non_executable_host_writes(&writes) {
+    if let Err(reason) = crate::recompiled::preflight_non_executable_host_writes(&_writes) {
         fn64_runtime::record_unsupported_event(
             fn64_runtime::UnsupportedSubsystem::Recompiler,
             "recompiler.verified-audio.executable-write",

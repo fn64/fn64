@@ -472,6 +472,10 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 Self::validate_dpc_range(source, start, end)?;
                 self.dpc.end = end;
                 self.dpc.current = start;
+                self.dpc.status &= !DPC_STATUS_START_VALID;
+                if self.dpc.status & DPC_STATUS_FREEZE != 0 {
+                    return Ok(DeviceMmioWriteEffect::None);
+                }
                 let submission = self.begin_dpc_submission(source, start, end, rollback)?;
                 return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested(submission));
             }
@@ -479,6 +483,7 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 return Err(DeviceFault::UnmodeledMmioWrite { addr, value });
             }
             DPC_STATUS_REG => {
+                let was_frozen = self.dpc.status & DPC_STATUS_FREEZE != 0;
                 apply_dpc_status_mode_commands(&mut self.dpc.status, value);
                 // Interleaving closed: END admission captured a status rollback,
                 // then the CPU issues a mode command before the renderer cancels.
@@ -498,6 +503,26 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
                 }
                 if value & DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND != 0 {
                     self.dpc.clock = DpcCounter24::ZERO;
+                }
+                if was_frozen
+                    && self.dpc.status & DPC_STATUS_FREEZE == 0
+                    && self.pending_dpc.is_none()
+                    && self.dpc.current < self.dpc.end
+                {
+                    let source = if self.dpc.status & DPC_STATUS_XBUS_DMEM_DMA != 0 {
+                        DpcSubmissionSource::Dmem
+                    } else {
+                        DpcSubmissionSource::Rdram
+                    };
+                    Self::validate_dpc_range(source, self.dpc.current, self.dpc.end)?;
+                    let rollback = self.dpc;
+                    let submission = self.begin_dpc_submission(
+                        source,
+                        self.dpc.current,
+                        self.dpc.end,
+                        rollback,
+                    )?;
+                    return Ok(DeviceMmioWriteEffect::DpcSubmissionRequested(submission));
                 }
                 return Ok(DeviceMmioWriteEffect::None);
             }

@@ -24,6 +24,7 @@
 
 use crate::overlay_regions::{CandidateTable, OverlayRecovery};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 pub const OVERLAY_LOAD_MAPPING_SCHEMA_V1: &str = "fn64.overlay-load-mapping.v1";
@@ -121,16 +122,55 @@ impl OverlayLoadMappingV1 {
 pub fn shared_slot_invalidation_range(
     mappings: &[OverlayLoadMappingV1],
 ) -> Option<std::ops::Range<u32>> {
-    let (first, rest) = mappings.split_first()?;
-    let slot = first.load_start?;
-    let mut end = first.proven_reach_end()?;
-    for mapping in rest {
-        if mapping.load_start? != slot {
-            return None;
-        }
-        end = end.max(mapping.proven_reach_end()?);
+    let ranges = per_slot_invalidation_ranges(mappings)?;
+    let [range] = ranges.as_slice() else {
+        return None;
+    };
+    Some(range.clone())
+}
+
+/// One invalidation range per destination slot.
+///
+/// [`shared_slot_invalidation_range`] requires the whole table to contend for
+/// a single slot, which is stricter than the soundness argument needs. A table
+/// may hold several independent slots -- Cruis'n USA has two overlays sharing
+/// `0x80025c80` and a third alone at `0x80000480`; Flying Dragon has two fully
+/// disjoint destinations. Those are resident overlays, not one swapping
+/// engine, and refusing them lost information that was there to be had.
+///
+/// Grouping by slot preserves the argument exactly: within a group the union
+/// covers every byte any activation can occupy, and swapping one member
+/// clears whatever a larger sibling wrote. Between groups nothing is shared,
+/// so no group's range may cover another's -- a group whose union reached into
+/// a neighbour's slot would over-invalidate live memory belonging to an
+/// overlay that was never swapped, so overlapping groups return `None`.
+///
+/// Ranges come back sorted by slot, and every mapping must have proved a
+/// destination: a table with even one name-pointer record cannot be reasoned
+/// about this way.
+pub fn per_slot_invalidation_ranges(
+    mappings: &[OverlayLoadMappingV1],
+) -> Option<Vec<std::ops::Range<u32>>> {
+    if mappings.is_empty() {
+        return None;
     }
-    Some(slot..end)
+    let mut ends: BTreeMap<u32, u32> = BTreeMap::new();
+    for mapping in mappings {
+        let slot = mapping.load_start?;
+        let end = mapping.proven_reach_end()?;
+        ends.entry(slot)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
+    }
+    let ranges: Vec<std::ops::Range<u32>> =
+        ends.into_iter().map(|(slot, end)| slot..end).collect();
+    if ranges
+        .windows(2)
+        .any(|pair| pair[1].start < pair[0].end)
+    {
+        return None;
+    }
+    Some(ranges)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

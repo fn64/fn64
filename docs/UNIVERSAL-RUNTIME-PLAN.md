@@ -300,9 +300,12 @@ DACRATE and BITRATE changes are rejected under the same live-FIFO rule;
 idempotent rewrites are accepted without mutating the active transfer. Typed
 requests must match the public integer rate derived from the admitted divisor.
 Exact silicon AI/DPC timing and counters, the precise AI-interrupt phase, the
-hardware semantics of mid-transfer AI control/rate writes, FREEZE/FLUSH,
-subword raw access, native-C mid-task visibility,
-and silicon bus behavior remain outside the current model.
+hardware semantics of mid-transfer AI control/rate writes, native-C mid-task
+visibility, and silicon bus timing remain outside the current model. DPC
+FREEZE/FLUSH command-state handling and byte/halfword RCP/PIF SysAD lane
+semantics are implemented as described in U5; partial-word and doubleword
+device transactions remain loud rather than being decomposed into
+side-effecting word accesses.
 
 Translated blocks consume a deterministic cycle budget. At block boundaries,
 MMIO, or an earlier device deadline, control returns to the dispatcher. It
@@ -948,8 +951,20 @@ two-slot FIFO and the ENABLED bit reflects the same latch; 0-to-1 begins drain.
 Mid-transfer CONTROL/DACRATE/BITRATE writes fail with named unsupported faults.
 The hardware interrupt phase, other assertion causes, DAC clock-domain phase,
 and per-edge `AI_LEN` timing remain explicitly unclaimed. Exact silicon AI/DPC
-timing and counters, FREEZE/FLUSH, subword raw access, native-C mid-task
-visibility, and silicon behavior remain open. The
+timing and counters, native-C mid-task visibility, and silicon behavior remain
+open. DPC FREEZE now retains START/END/CURRENT without exposing renderer work,
+and clearing FREEZE releases that exact range once; FLUSH remains an
+independently commanded/readable mode latch across pending transaction commit
+or cancellation. This synchronous boundary has no partially executing renderer
+pipeline to discard. Raw byte and halfword RCP/PIF reads select the addressed
+big-endian lane from one aligned 32-bit SysAD transaction, and writes place
+their value in that lane with zero on the other lanes; typed Rust and
+generated-C proxy paths share those rules. Partial `SWL`/`SWR` and 64-bit
+device transactions remain loud because their device-bus behavior is not
+established here. The register/command definitions come from the public SGI
+*Nintendo 64 RSP Programmer's Guide* Chapter 4 and `rcp.h`; the transaction
+behavior was checked on 2026-08-03 against the permitted ISC ares sources
+`ares/n64/memory/io.hpp` and `ares/n64/rdp/io.cpp`. The
 public `rcp.h` command semantics also converge SP/SI/VI/AI/DP acknowledgement
 on the common MI source. That RCP/MI authority exists from host-state creation,
 independent of cartridge ROM installation; PI separately retains a loud
@@ -1028,7 +1043,13 @@ SI schedules separate 64-byte DRAM-to-PIF and
 PIF-to-DRAM transfers against
 persistent PIF RAM; typed raw registers, the raw SI shim, and controller starts
 share BUSY/error/status, MI, and post-commit OS event ordering. The current
-one-cycle SI policy still needs hardware-derived timing. External channel 4
+one-cycle SI policy still needs hardware-derived timing. Repeated controller
+reads stage a fresh Joybus packet, publish it only at that transfer's deadline,
+and permit the next poll after the prior event is consumed; an end-to-end
+two-poll regression changes buttons and both stick axes between polls. Whether
+host input is sampled at SI start, at PIF execution, or at completion is part
+of the still-open hardware-timing measurement rather than a value chosen by
+the runtime contract. External channel 4
 now executes EEPROM probe/read/write packets against the same 512-byte or
 2048-byte save store and typed programming deadline as `osEeprom*`; tests
 prove raw-to-shim and shim-to-raw byte convergence, device identity/no-response
@@ -1086,8 +1107,14 @@ rather than measured chip-revision timing. Raw Voice Info, result/status,
 captured five-write initialization, and initialization/clear/start/stop forms
 share high-level state. No-result `0x09`, region-dependent `0x0A` staging,
 `0x0D` power/gain writes, and the remaining `0x0C` dictionary-transfer mode
-trap with typed evidence at the command-specific public capture frontier. HLE ucode work
-is still host-atomic, but
+trap with typed evidence at the command-specific public capture frontier.
+Native-C mid-task visibility remains a code frontier: generated-C MMIO and
+loop-backedge checkpoints can return to the executor, but an HLE task backend
+still owns one synchronous host call and publishes no resumable intermediate
+task state. Closing that requires a typed chunk/continuation protocol shared by
+the task dispatcher and every production backend; exact chunk deadlines remain
+a separate hardware-trace measurement problem. HLE ucode work is still
+host-atomic, but
 SP and graphics DP completion occur as separate fabric events after measured
 rspboot work and on successive deadlines, preserving SP-before-DP MI and message order. Persistent RSP
 DMEM/IMEM, PC/status/semaphore, double-buffered aligned DMA, and task/rspboot
@@ -1097,7 +1124,14 @@ BREAK, including IMEM overlay replacement and DRAM/XBUS DPC forwarding. Known
 HLE tasks execute rspboot through the first DMA-loaded ucode entry and commit
 its observable state before backend dispatch. All renderer entry paths use one
 loud missing/error gate. Task-entry LLE fallback preserves the rspboot machine
-snapshot. Exact DP timing, production-backend chunk checkpoints, hardware
+snapshot. Audio release execution is not a submission counter or silent HLE
+stub: `LleAccuracy` executes the admitted live IMEM image, commits its SP-DMA
+PCM writes into process RDRAM, and the later CPU-selected AI DMA delivers that
+exact guest-order range to the registered backend. One deterministic
+end-to-end regression executes a synthetic public-instruction RSP image and
+asserts its two nonzero samples at both the RDRAM and host-PCM boundaries.
+Exact audio microcode arithmetic for a particular ROM remains corpus evidence,
+not a generic device-code gap. Exact DP timing, production-backend chunk checkpoints, hardware
 validation of VI timing, and save-device timing remain open.
 
 EEPROM timing and high-level waits come from the public libultra Programming

@@ -354,7 +354,7 @@ pub fn build_wm2000_generated_runner_v1(
 }
 
 impl GeneratedRunnerBuildEvidenceV1 {
-    fn verify_integrity(&self) -> Result<(), GeneratedRunnerBuildError> {
+    pub(super) fn verify_integrity(&self) -> Result<(), GeneratedRunnerBuildError> {
         if self.schema != VERIFIED_GENERATED_RUNNER_BUILD_SCHEMA_V5 {
             return Err(error("unsupported verified generated-runner build schema"));
         }
@@ -440,7 +440,7 @@ impl GeneratedRunnerBuildEvidenceV1 {
         Ok(())
     }
 
-    fn recompute_authority_sha256(&self) -> String {
+    pub(super) fn recompute_authority_sha256(&self) -> String {
         let mut digest = Sha256::new();
         digest.update(b"fn64.verified-generated-runner-build.v5\0");
         for bytes in [

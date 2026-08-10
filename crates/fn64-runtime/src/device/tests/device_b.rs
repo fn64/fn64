@@ -991,7 +991,8 @@ use super::*;
 
         let submission = fabric
             .request_dpc_submission(DpcSubmissionSource::Rdram, 0x100, 0x180)
-            .unwrap();
+            .unwrap()
+            .expect("unfrozen DPC submission must publish");
         // Clear all four counters while the renderer submission is pending.
         let clear_all = DPC_STATUS_CLEAR_CLOCK_COUNTER_COMMAND
             | DPC_STATUS_CLEAR_CMD_COUNTER_COMMAND
@@ -1032,7 +1033,6 @@ use super::*;
             ),
             (0x02, 0x01, DPC_STATUS_XBUS_DMEM_DMA, 0),
             (0x04, 0x08, DPC_STATUS_FREEZE, DPC_STATUS_FREEZE),
-            (0x08, 0x04, DPC_STATUS_FREEZE, 0),
             (0x10, 0x20, DPC_STATUS_FLUSH, DPC_STATUS_FLUSH),
             (0x20, 0x10, DPC_STATUS_FLUSH, 0),
         ];
@@ -1043,7 +1043,8 @@ use super::*;
 
             let submission = fabric
                 .request_dpc_submission(DpcSubmissionSource::Dmem, 0x100, 0x180)
-                .unwrap();
+                .unwrap()
+                .expect("unfrozen DPC submission must publish");
             fabric.write_mmio(DPC_STATUS_REG, interleaved).unwrap();
             fabric.cancel_dpc_submission(submission.token).unwrap();
 

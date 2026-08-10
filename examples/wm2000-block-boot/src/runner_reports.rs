@@ -1,6 +1,6 @@
 use crate::*;
 
-fn generated_runner_build_identity_mode() -> bool {
+pub(crate) fn generated_runner_build_identity_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -15,7 +15,7 @@ fn generated_runner_build_identity_mode() -> bool {
     )
 }
 
-fn generated_runner_bootstrap_audit_mode() -> bool {
+pub(crate) fn generated_runner_bootstrap_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -30,7 +30,7 @@ fn generated_runner_bootstrap_audit_mode() -> bool {
     )
 }
 
-fn generated_runner_si_audit_mode() -> bool {
+pub(crate) fn generated_runner_si_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -45,7 +45,7 @@ fn generated_runner_si_audit_mode() -> bool {
     )
 }
 
-fn generated_runner_cpu_audit_mode() -> bool {
+pub(crate) fn generated_runner_cpu_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -60,7 +60,7 @@ fn generated_runner_cpu_audit_mode() -> bool {
     )
 }
 
-fn generated_runner_pi_audit_mode() -> bool {
+pub(crate) fn generated_runner_pi_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -75,7 +75,7 @@ fn generated_runner_pi_audit_mode() -> bool {
     )
 }
 
-fn generated_runner_rdp_renderer_audit_mode() -> bool {
+pub(crate) fn generated_runner_rdp_renderer_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -90,7 +90,7 @@ fn generated_runner_rdp_renderer_audit_mode() -> bool {
     )
 }
 
-fn generated_runner_rsp_audit_mode() -> bool {
+pub(crate) fn generated_runner_rsp_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -105,7 +105,7 @@ fn generated_runner_rsp_audit_mode() -> bool {
     )
 }
 
-fn generated_runner_host_abi_audit_mode() -> bool {
+pub(crate) fn generated_runner_host_abi_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -120,7 +120,7 @@ fn generated_runner_host_abi_audit_mode() -> bool {
     )
 }
 
-fn generated_runner_sp_audit_mode() -> bool {
+pub(crate) fn generated_runner_sp_audit_mode() -> bool {
     let mut arguments = std::env::args_os();
     let _executable = arguments
         .next()
@@ -135,7 +135,7 @@ fn generated_runner_sp_audit_mode() -> bool {
     )
 }
 
-fn bootstrap_audit_nonce() -> String {
+pub(crate) fn bootstrap_audit_nonce() -> String {
     let nonce = std::env::var(fn64_boot_harness::GENERATED_RUNNER_BOOTSTRAP_RUNTIME_NONCE_ENV_V1)
         .expect("fixed bootstrap audit mode requires its verifier-owned nonce");
     assert!(
@@ -148,7 +148,7 @@ fn bootstrap_audit_nonce() -> String {
     nonce
 }
 
-fn si_audit_nonce() -> String {
+pub(crate) fn si_audit_nonce() -> String {
     let nonce = std::env::var(fn64_boot_harness::GENERATED_RUNNER_SI_RUNTIME_NONCE_ENV_V1)
         .expect("fixed SI audit mode requires its verifier-owned nonce");
     assert!(
@@ -161,7 +161,7 @@ fn si_audit_nonce() -> String {
     nonce
 }
 
-fn cpu_audit_nonce() -> String {
+pub(crate) fn cpu_audit_nonce() -> String {
     let nonce = std::env::var(fn64_boot_harness::GENERATED_RUNNER_CPU_RUNTIME_NONCE_ENV_V1)
         .expect("fixed CPU audit mode requires its verifier-owned nonce");
     assert!(
@@ -174,7 +174,7 @@ fn cpu_audit_nonce() -> String {
     nonce
 }
 
-fn pi_audit_nonce() -> String {
+pub(crate) fn pi_audit_nonce() -> String {
     let nonce = std::env::var(fn64_boot_harness::GENERATED_RUNNER_PI_RUNTIME_NONCE_ENV_V1)
         .expect("fixed PI audit mode requires its verifier-owned nonce");
     assert!(
@@ -187,7 +187,7 @@ fn pi_audit_nonce() -> String {
     nonce
 }
 
-fn rdp_renderer_audit_nonce() -> String {
+pub(crate) fn rdp_renderer_audit_nonce() -> String {
     let nonce =
         std::env::var(fn64_boot_harness::GENERATED_RUNNER_RDP_RENDERER_RUNTIME_NONCE_ENV_V1)
             .expect("fixed RDP renderer audit mode requires its verifier-owned nonce");
@@ -201,7 +201,7 @@ fn rdp_renderer_audit_nonce() -> String {
     nonce
 }
 
-fn rsp_audit_nonce() -> String {
+pub(crate) fn rsp_audit_nonce() -> String {
     let nonce = std::env::var(fn64_boot_harness::GENERATED_RUNNER_RSP_RUNTIME_NONCE_ENV_V1)
         .expect("fixed RSP audit mode requires its verifier-owned nonce");
     assert!(
@@ -214,7 +214,7 @@ fn rsp_audit_nonce() -> String {
     nonce
 }
 
-fn host_abi_audit_nonce() -> String {
+pub(crate) fn host_abi_audit_nonce() -> String {
     let nonce = std::env::var(fn64_boot_harness::GENERATED_RUNNER_HOST_ABI_RUNTIME_NONCE_ENV_V1)
         .expect("fixed Host ABI audit mode requires its verifier-owned nonce");
     assert!(
@@ -227,7 +227,7 @@ fn host_abi_audit_nonce() -> String {
     nonce
 }
 
-fn sp_audit_nonce() -> String {
+pub(crate) fn sp_audit_nonce() -> String {
     let nonce = std::env::var(fn64_boot_harness::GENERATED_RUNNER_SP_RUNTIME_NONCE_ENV_V1)
         .expect("fixed SP audit mode requires its verifier-owned nonce");
     assert!(
@@ -240,7 +240,7 @@ fn sp_audit_nonce() -> String {
     nonce
 }
 
-fn protocol_adapter_role(
+pub(crate) fn protocol_adapter_role(
     role: GeneratedAdapterRole,
 ) -> fn64_boot_harness::GeneratedRunnerAdapterRoleV1 {
     match role {
@@ -262,7 +262,7 @@ fn protocol_adapter_role(
     }
 }
 
-fn generated_runner_build_identity(
+pub(crate) fn generated_runner_build_identity(
     program: &CatalogBlockProgramV1,
     bindings: &[CargoGeneratedRunnerSourceBindingV1],
 ) -> fn64_boot_harness::GeneratedRunnerBuildIdentityV1 {
@@ -321,7 +321,7 @@ fn generated_runner_build_identity(
     }
 }
 
-fn emit_generated_runner_build_identity(
+pub(crate) fn emit_generated_runner_build_identity(
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
 ) {
     let wire = serde_json::to_string(&identity)
@@ -332,7 +332,7 @@ fn emit_generated_runner_build_identity(
     );
 }
 
-fn bootstrap_runtime_report(
+pub(crate) fn bootstrap_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedBootstrapWriterChannelReceiptV1,
@@ -413,7 +413,7 @@ fn bootstrap_runtime_report(
     }
 }
 
-fn si_runtime_report(
+pub(crate) fn si_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedSiWriterRuntimeStateReceiptV1,
@@ -461,7 +461,7 @@ fn si_runtime_report(
     }
 }
 
-fn cpu_runtime_report(
+pub(crate) fn cpu_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedCpuWriterRuntimeStateReceiptV1,
@@ -508,7 +508,7 @@ fn cpu_runtime_report(
     }
 }
 
-fn host_abi_runtime_report(
+pub(crate) fn host_abi_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedHostAbiWriterRuntimeStateReceiptV1,
@@ -559,7 +559,7 @@ fn host_abi_runtime_report(
     }
 }
 
-fn pi_runtime_report(
+pub(crate) fn pi_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedPiWriterRuntimeStateReceiptV1,
@@ -612,7 +612,7 @@ fn pi_runtime_report(
     }
 }
 
-fn rdp_renderer_runtime_report(
+pub(crate) fn rdp_renderer_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedRdpRendererWriterRuntimeStateReceiptV1,
@@ -669,7 +669,7 @@ fn rdp_renderer_runtime_report(
     }
 }
 
-fn rsp_runtime_report(
+pub(crate) fn rsp_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedRspWriterRuntimeStateReceiptV1,
@@ -723,7 +723,7 @@ fn rsp_runtime_report(
     }
 }
 
-fn sp_runtime_report(
+pub(crate) fn sp_runtime_report(
     nonce: String,
     identity: &fn64_boot_harness::GeneratedRunnerBuildIdentityV1,
     receipt: fn64_abi::recompiled::ValidatedSpWriterRuntimeStateReceiptV1,
@@ -774,7 +774,7 @@ fn sp_runtime_report(
     }
 }
 
-fn take_completed_si_audit_receipt(
+pub(crate) fn take_completed_si_audit_receipt(
 ) -> Option<fn64_abi::recompiled::ValidatedSiWriterRuntimeStateReceiptV1> {
     use fn64_abi::recompiled::SiWriterRuntimeStateErrorV1 as Error;
     match fn64_abi::recompiled::take_validated_si_writer_runtime_state_receipt_v1() {
@@ -790,7 +790,7 @@ fn take_completed_si_audit_receipt(
     }
 }
 
-fn take_completed_cpu_audit_receipt(
+pub(crate) fn take_completed_cpu_audit_receipt(
     epoch: &fn64_abi::recompiled::CpuWriterRuntimeTraceEpochV1,
 ) -> Option<fn64_abi::recompiled::ValidatedCpuWriterRuntimeStateReceiptV1> {
     use fn64_abi::recompiled::CpuWriterRuntimeStateErrorV1 as Error;
@@ -802,7 +802,7 @@ fn take_completed_cpu_audit_receipt(
     }
 }
 
-fn take_completed_pi_audit_receipt(
+pub(crate) fn take_completed_pi_audit_receipt(
     epoch: &fn64_abi::recompiled::PiWriterRuntimeTraceEpochV1,
 ) -> Option<fn64_abi::recompiled::ValidatedPiWriterRuntimeStateReceiptV1> {
     use fn64_abi::recompiled::PiWriterRuntimeStateErrorV1 as Error;
@@ -819,7 +819,7 @@ fn take_completed_pi_audit_receipt(
     }
 }
 
-fn take_completed_rdp_renderer_audit_receipt(
+pub(crate) fn take_completed_rdp_renderer_audit_receipt(
     epoch: &fn64_abi::recompiled::RdpRendererWriterRuntimeTraceEpochV1,
 ) -> Option<fn64_abi::recompiled::ValidatedRdpRendererWriterRuntimeStateReceiptV1> {
     use fn64_abi::recompiled::RdpRendererWriterRuntimeStateErrorV1 as Error;
@@ -837,7 +837,7 @@ fn take_completed_rdp_renderer_audit_receipt(
     }
 }
 
-fn take_completed_rsp_audit_receipt(
+pub(crate) fn take_completed_rsp_audit_receipt(
     epoch: &fn64_abi::recompiled::RspWriterRuntimeTraceEpochV1,
 ) -> Option<fn64_abi::recompiled::ValidatedRspWriterRuntimeStateReceiptV1> {
     use fn64_abi::recompiled::RspWriterRuntimeStateErrorV1 as Error;
@@ -851,7 +851,7 @@ fn take_completed_rsp_audit_receipt(
     }
 }
 
-fn take_completed_host_abi_audit_receipt(
+pub(crate) fn take_completed_host_abi_audit_receipt(
     epoch: &fn64_abi::recompiled::HostAbiWriterRuntimeTraceEpochV1,
 ) -> Option<fn64_abi::recompiled::ValidatedHostAbiWriterRuntimeStateReceiptV1> {
     use fn64_abi::recompiled::HostAbiWriterRuntimeStateErrorV1 as Error;
@@ -863,7 +863,7 @@ fn take_completed_host_abi_audit_receipt(
     }
 }
 
-fn take_completed_sp_audit_receipt(
+pub(crate) fn take_completed_sp_audit_receipt(
     epoch: &fn64_abi::recompiled::SpWriterRuntimeTraceEpochV1,
 ) -> Option<fn64_abi::recompiled::ValidatedSpWriterRuntimeStateReceiptV1> {
     use fn64_abi::recompiled::SpWriterRuntimeStateErrorV1 as Error;
