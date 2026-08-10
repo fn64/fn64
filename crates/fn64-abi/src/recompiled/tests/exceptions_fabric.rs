@@ -3,7 +3,7 @@ use super::*;
     #[test]
     fn canonical_publication_static_break_replaces_exact_with_parked_fault() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x1000];
         let thread_id = 0xb4eb;
 
@@ -31,7 +31,7 @@ use super::*;
     #[test]
     fn canonical_publication_dynamic_break_replaces_exact_with_parked_fault() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x1000];
         let thread_id = 0xb4ec;
 
@@ -58,7 +58,7 @@ use super::*;
     #[test]
     fn block_program_vectors_mid_function_break_instead_of_panicking() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x1000];
         let mut program = BlockProgram::new();
         program
@@ -112,7 +112,7 @@ use super::*;
     #[test]
     fn checkpoint_due_pi_enters_ip2_handler_before_the_next_guest_block() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut rom = vec![0u8; 0x100];
         rom[0x20..0x24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
         crate::load_rom_with_fixed_pi_latency(rom, 5);
@@ -180,7 +180,7 @@ use super::*;
     #[test]
     fn checkpoint_count_compare_match_enters_ip7_and_compare_write_acks_it() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let mut bytes = vec![0u8; 0x100];
         let mut program = BlockProgram::new();
         program

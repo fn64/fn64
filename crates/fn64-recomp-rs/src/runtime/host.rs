@@ -621,7 +621,34 @@ impl<'a> Rdram<'a> {
 
     #[inline]
     fn read_mmio_word(vaddr: u64) -> Option<u32> {
+        if !Self::may_be_mmio(vaddr) {
+            return None;
+        }
         MMIO_READ.with(|slot| slot.get().and_then(|read| read(vaddr)))
+    }
+
+    /// Cheap rejection for addresses no MMIO window can claim.
+    ///
+    /// `try_load_w` and friends consult MMIO BEFORE the backed-memory fast
+    /// path, because a device register must win over stale RDRAM. That
+    /// ordering is correct, but it meant every ordinary guest word load walked
+    /// the whole window chain -- PIF, cartridge, device, RCP interrupt -- and
+    /// took the host lock, only to be rejected.
+    ///
+    /// Sampling the WM2000 block runner put **98.5% of total runtime** in
+    /// `read_raw_mmio_word` (5877 of 5965 samples) for exactly this reason. An
+    /// address histogram then showed the callers were KSEG0 RDRAM addresses
+    /// like `0x800771fc`, each seen a handful of times -- not a hot register,
+    /// just ordinary memory paying MMIO dispatch on every access.
+    ///
+    /// Every real N64 MMIO window lives in KSEG1 (`0xA0000000..0xC0000000`),
+    /// which is uncached precisely because it is device space. Testing the
+    /// segment first keeps the MMIO-before-memory ordering intact while making
+    /// the common case two compares.
+    #[inline(always)]
+    fn may_be_mmio(vaddr: u64) -> bool {
+        let segment = vaddr as u32;
+        (0xA000_0000..0xC000_0000).contains(&segment)
     }
 
     #[inline]

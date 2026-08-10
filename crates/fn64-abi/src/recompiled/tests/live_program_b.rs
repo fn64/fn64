@@ -3,7 +3,7 @@ use super::*;
     #[test]
     fn canonical_publication_binds_prepared_generation_continuation() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let generation_word = 0x2402_0091u32;
         let generation_image = generation_word.to_be_bytes();
         let mut bytes = vec![0u8; 0x7000];
@@ -114,7 +114,7 @@ use super::*;
     #[test]
     fn canonical_generation_cpu_write_retires_a_before_b_executes() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let image_a = 0x2402_0001u32.to_be_bytes();
         let image_b = 0x2402_0002u32.to_be_bytes();
         let mut bytes = vec![0u8; 0x6004];
@@ -252,7 +252,7 @@ use super::*;
     #[test]
     fn interpreter_cpu_store_retires_generation_before_its_next_instruction() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         REWRITE_BUILDS.with(|builds| builds.borrow_mut().clear());
         REWRITE_B_ENTRIES.with(|entries| entries.borrow_mut().clear());
         let mut bytes = vec![0u8; 0x200];
@@ -363,7 +363,7 @@ use super::*;
     #[test]
     fn pi_dma_rebuilds_executable_region_before_completion_is_observable() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         REWRITE_BUILDS.with(|builds| builds.borrow_mut().clear());
         let mut rom = vec![0u8; 0x100];
         rom[0x20..0x28].copy_from_slice(&[0x3c, 0x08, 0x12, 0x34, 0x35, 0x08, 0x56, 0x78]);

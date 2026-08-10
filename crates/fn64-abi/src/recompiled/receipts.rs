@@ -14,8 +14,8 @@ pub struct CatalogGenerationInstallEvidenceV1 {
 /// and unclaimed static span against the resolver's private program before the
 /// pair can enter HostState.
 pub struct CatalogGenerationInstallV1 {
-    resolver: CatalogResolverInstallV1,
-    generations: BackedPrecompiledGenerationCatalogV1,
+    pub(super) resolver: CatalogResolverInstallV1,
+    pub(super) generations: BackedPrecompiledGenerationCatalogV1,
 }
 
 impl CatalogGenerationInstallV1 {
@@ -125,7 +125,7 @@ pub struct BootstrapWriterChannelCompletionEvidenceV1 {
 /// Plain evidence or a self-hash cannot manufacture this type.
 #[derive(Debug)]
 pub struct ValidatedBootstrapWriterChannelReceiptV1 {
-    evidence: BootstrapWriterChannelCompletionEvidenceV1,
+    pub(super) evidence: BootstrapWriterChannelCompletionEvidenceV1,
 }
 
 impl ValidatedBootstrapWriterChannelReceiptV1 {
@@ -178,7 +178,7 @@ pub struct CpuWriterRuntimeStateEvidenceV1 {
 /// Copied evidence cannot recreate this authority.
 #[derive(Debug)]
 pub struct ValidatedCpuWriterRuntimeStateReceiptV1 {
-    evidence: CpuWriterRuntimeStateEvidenceV1,
+    pub(super) evidence: CpuWriterRuntimeStateEvidenceV1,
 }
 
 impl ValidatedCpuWriterRuntimeStateReceiptV1 {
@@ -194,8 +194,8 @@ impl ValidatedCpuWriterRuntimeStateReceiptV1 {
 /// One unforgeable fresh CPU-store audit epoch minted by the canonical owner.
 #[derive(Debug)]
 pub struct CpuWriterRuntimeTraceEpochV1 {
-    epoch_id: u64,
-    program_model_sha256: [u8; 32],
+    pub(super) epoch_id: u64,
+    pub(super) program_model_sha256: [u8; 32],
 }
 
 /// Auditable evidence behind one fresh, quiescent PI-DMA audit window.
@@ -236,7 +236,7 @@ pub struct PiWriterRuntimeStateEvidenceV1 {
 /// Copied evidence cannot recreate this authority.
 #[derive(Debug)]
 pub struct ValidatedPiWriterRuntimeStateReceiptV1 {
-    evidence: PiWriterRuntimeStateEvidenceV1,
+    pub(super) evidence: PiWriterRuntimeStateEvidenceV1,
 }
 
 impl ValidatedPiWriterRuntimeStateReceiptV1 {
@@ -252,8 +252,8 @@ impl ValidatedPiWriterRuntimeStateReceiptV1 {
 /// One unforgeable fresh PI-DMA trace epoch minted by the canonical owner.
 #[derive(Debug)]
 pub struct PiWriterRuntimeTraceEpochV1 {
-    epoch_id: u64,
-    program_model_sha256: [u8; 32],
+    pub(super) epoch_id: u64,
+    pub(super) program_model_sha256: [u8; 32],
 }
 
 /// Auditable evidence behind the ABI-local SI runtime-state prerequisite.
@@ -292,7 +292,7 @@ pub struct SiWriterRuntimeStateEvidenceV1 {
 /// the writer denominator must not accept this prerequisite directly.
 #[derive(Debug)]
 pub struct ValidatedSiWriterRuntimeStateReceiptV1 {
-    evidence: SiWriterRuntimeStateEvidenceV1,
+    pub(super) evidence: SiWriterRuntimeStateEvidenceV1,
 }
 
 impl ValidatedSiWriterRuntimeStateReceiptV1 {
@@ -341,7 +341,7 @@ pub struct SpWriterRuntimeStateEvidenceV1 {
 /// and the writer denominator must not accept this prerequisite directly.
 #[derive(Debug)]
 pub struct ValidatedSpWriterRuntimeStateReceiptV1 {
-    evidence: SpWriterRuntimeStateEvidenceV1,
+    pub(super) evidence: SpWriterRuntimeStateEvidenceV1,
 }
 
 /// One unforgeable fresh-trace epoch owned by a canonical SP audit.
@@ -352,8 +352,8 @@ pub struct ValidatedSpWriterRuntimeStateReceiptV1 {
 /// runtime state.
 #[derive(Debug)]
 pub struct SpWriterRuntimeTraceEpochV1 {
-    epoch_id: u64,
-    program_model_sha256: [u8; 32],
+    pub(super) epoch_id: u64,
+    pub(super) program_model_sha256: [u8; 32],
 }
 
 /// Auditable evidence behind one fresh canonical Host ABI writer window.
@@ -390,7 +390,7 @@ pub struct HostAbiWriterRuntimeStateEvidenceV1 {
 /// caller-supplied host pointers cannot enter its constructor.
 #[derive(Debug)]
 pub struct ValidatedHostAbiWriterRuntimeStateReceiptV1 {
-    evidence: HostAbiWriterRuntimeStateEvidenceV1,
+    pub(super) evidence: HostAbiWriterRuntimeStateEvidenceV1,
 }
 
 impl ValidatedHostAbiWriterRuntimeStateReceiptV1 {
@@ -407,8 +407,8 @@ impl ValidatedHostAbiWriterRuntimeStateReceiptV1 {
 /// executable-mutation owner.
 #[derive(Debug)]
 pub struct HostAbiWriterRuntimeTraceEpochV1 {
-    epoch_id: u64,
-    program_model_sha256: [u8; 32],
+    pub(super) epoch_id: u64,
+    pub(super) program_model_sha256: [u8; 32],
 }
 
 /// Auditable evidence behind one fresh ABI-owned RSP writeback window.
@@ -439,7 +439,7 @@ pub struct RspWriterRuntimeStateEvidenceV1 {
 /// Move-only ABI-local proof of one fresh RSP writeback window.
 #[derive(Debug)]
 pub struct ValidatedRspWriterRuntimeStateReceiptV1 {
-    evidence: RspWriterRuntimeStateEvidenceV1,
+    pub(super) evidence: RspWriterRuntimeStateEvidenceV1,
 }
 
 impl ValidatedRspWriterRuntimeStateReceiptV1 {
@@ -455,8 +455,8 @@ impl ValidatedRspWriterRuntimeStateReceiptV1 {
 /// One unforgeable fresh RSP trace epoch minted by the canonical owner.
 #[derive(Debug)]
 pub struct RspWriterRuntimeTraceEpochV1 {
-    epoch_id: u64,
-    program_model_sha256: [u8; 32],
+    pub(super) epoch_id: u64,
+    pub(super) program_model_sha256: [u8; 32],
 }
 
 /// Auditable evidence behind one fresh ABI-owned renderer publication window.
@@ -490,7 +490,7 @@ pub struct RdpRendererWriterRuntimeStateEvidenceV1 {
 /// window. Plain evidence and copied hashes cannot construct this authority.
 #[derive(Debug)]
 pub struct ValidatedRdpRendererWriterRuntimeStateReceiptV1 {
-    evidence: RdpRendererWriterRuntimeStateEvidenceV1,
+    pub(super) evidence: RdpRendererWriterRuntimeStateEvidenceV1,
 }
 
 impl ValidatedRdpRendererWriterRuntimeStateReceiptV1 {
@@ -507,8 +507,8 @@ impl ValidatedRdpRendererWriterRuntimeStateReceiptV1 {
 /// One process-unique renderer trace epoch minted by the canonical owner.
 #[derive(Debug)]
 pub struct RdpRendererWriterRuntimeTraceEpochV1 {
-    epoch_id: u64,
-    program_model_sha256: [u8; 32],
+    pub(super) epoch_id: u64,
+    pub(super) program_model_sha256: [u8; 32],
 }
 
 impl ValidatedSpWriterRuntimeStateReceiptV1 {
@@ -535,8 +535,8 @@ impl BootstrapOrImportValidationReceiptV1 {
 /// Owned RDRAM whose executable baseline has been validated against one exact
 /// ROM and canonical catalog install. No mutable slice or raw pointer escapes.
 pub struct ValidatedBootstrapRdramV1 {
-    storage: Box<[u8]>,
-    receipt: BootstrapOrImportValidationReceiptV1,
+    pub(super) storage: Box<[u8]>,
+    pub(super) receipt: BootstrapOrImportValidationReceiptV1,
 }
 
 impl ValidatedBootstrapRdramV1 {
@@ -883,7 +883,7 @@ pub struct BootstrapImportTransactionV1<'a> {
     install: &'a CatalogGenerationInstallV1,
     rom: &'a [u8],
     rom_sha256: [u8; 32],
-    storage: Box<[u8]>,
+    pub(super) storage: Box<[u8]>,
     publications: Vec<BootstrapPublicationEvidenceV1>,
 }
 
@@ -1101,11 +1101,11 @@ fn direct_rdram_physical_address(address: u32) -> Option<u32> {
         .then_some(physical)
 }
 
-fn executable_physical_ranges(install: &CatalogGenerationInstallV1) -> Vec<(u32, u32)> {
+pub(super) fn executable_physical_ranges(install: &CatalogGenerationInstallV1) -> Vec<(u32, u32)> {
     executable_physical_ranges_for_parts(&install.resolver, Some(&install.generations))
 }
 
-fn executable_physical_ranges_for_parts(
+pub(super) fn executable_physical_ranges_for_parts(
     resolver: &CatalogResolverInstallV1,
     generations: Option<&BackedPrecompiledGenerationCatalogV1>,
 ) -> Vec<(u32, u32)> {
@@ -1156,7 +1156,7 @@ fn executable_physical_ranges_for_parts(
     canonical
 }
 
-fn validate_initial_entry_image(
+pub(super) fn validate_initial_entry_image(
     install: &CatalogGenerationInstallV1,
     storage: &[u8],
 ) -> Result<(), BootstrapImportErrorV1> {
@@ -1249,7 +1249,7 @@ fn validate_initial_entry_image(
     Ok(())
 }
 
-fn watched_bytes_sha256(storage: &[u8], ranges: &[(u32, u32)]) -> [u8; 32] {
+pub(super) fn watched_bytes_sha256(storage: &[u8], ranges: &[(u32, u32)]) -> [u8; 32] {
     let view = fn64_runtime::RdramView::from_storage(storage);
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:bootstrap-watched-bytes:v1");
@@ -1263,7 +1263,7 @@ fn watched_bytes_sha256(storage: &[u8], ranges: &[(u32, u32)]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn resolver_install_definition_sha256(install: &CatalogResolverInstallV1) -> [u8; 32] {
+pub(super) fn resolver_install_definition_sha256(install: &CatalogResolverInstallV1) -> [u8; 32] {
     let evidence = install.evidence();
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:catalog-resolver-install-definition:v2");
@@ -1298,7 +1298,7 @@ fn resolver_install_definition_sha256(install: &CatalogResolverInstallV1) -> [u8
     hasher.finalize().into()
 }
 
-fn abi_host_function_catalog_receipt_sha256(
+pub(super) fn abi_host_function_catalog_receipt_sha256(
     evidence: &AbiHostFunctionCatalogEvidenceV1,
 ) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
@@ -1317,7 +1317,7 @@ fn abi_host_function_catalog_receipt_sha256(
     hasher.finalize().into()
 }
 
-fn bootstrap_receipt_sha256(evidence: &BootstrapOrImportValidationEvidenceV1) -> [u8; 32] {
+pub(super) fn bootstrap_receipt_sha256(evidence: &BootstrapOrImportValidationEvidenceV1) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:bootstrap-or-import-validation-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1353,7 +1353,7 @@ fn bootstrap_receipt_sha256(evidence: &BootstrapOrImportValidationEvidenceV1) ->
     hasher.finalize().into()
 }
 
-fn canonical_mutation_initial_root(
+pub(super) fn canonical_mutation_initial_root(
     expected_sha256: [u8; 32],
     ranges: impl IntoIterator<Item = PendingExecutableWriteEvidenceSnapshot>,
 ) -> [u8; 32] {
@@ -1367,7 +1367,7 @@ fn canonical_mutation_initial_root(
     root.finalize().into()
 }
 
-fn canonical_mutation_entry_root(
+pub(super) fn canonical_mutation_entry_root(
     previous_root: [u8; 32],
     entry: &ExecutableMutationBatchEvidenceV1,
 ) -> [u8; 32] {
@@ -1391,7 +1391,7 @@ fn canonical_mutation_entry_root(
     root.finalize().into()
 }
 
-fn canonical_writer_program_model_sha256(
+pub(super) fn canonical_writer_program_model_sha256(
     resolver: &CatalogResolverInstallV1,
     generations: Option<&BackedPrecompiledGenerationCatalogV1>,
     watched_ranges: &[PendingExecutableWriteEvidenceSnapshot],
@@ -1416,7 +1416,7 @@ fn canonical_writer_program_model_sha256(
     hasher.finalize().into()
 }
 
-fn bootstrap_writer_channel_completion_receipt_sha256(
+pub(super) fn bootstrap_writer_channel_completion_receipt_sha256(
     evidence: &BootstrapWriterChannelCompletionEvidenceV1,
 ) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
@@ -1462,7 +1462,7 @@ fn bootstrap_writer_channel_completion_receipt_sha256(
     hasher.finalize().into()
 }
 
-fn si_writer_runtime_state_receipt_sha256(evidence: &SiWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn si_writer_runtime_state_receipt_sha256(evidence: &SiWriterRuntimeStateEvidenceV1) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:si-writer-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1492,7 +1492,7 @@ fn si_writer_runtime_state_receipt_sha256(evidence: &SiWriterRuntimeStateEvidenc
     hasher.finalize().into()
 }
 
-fn cpu_writer_runtime_state_receipt_sha256(evidence: &CpuWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn cpu_writer_runtime_state_receipt_sha256(evidence: &CpuWriterRuntimeStateEvidenceV1) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:cpu-instruction-store-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1521,7 +1521,7 @@ fn cpu_writer_runtime_state_receipt_sha256(evidence: &CpuWriterRuntimeStateEvide
     hasher.finalize().into()
 }
 
-fn pi_writer_runtime_state_receipt_sha256(evidence: &PiWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn pi_writer_runtime_state_receipt_sha256(evidence: &PiWriterRuntimeStateEvidenceV1) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:pi-writer-runtime-state-receipt:v2");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1556,7 +1556,7 @@ fn pi_writer_runtime_state_receipt_sha256(evidence: &PiWriterRuntimeStateEvidenc
     hasher.finalize().into()
 }
 
-fn sp_writer_runtime_state_receipt_sha256(evidence: &SpWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn sp_writer_runtime_state_receipt_sha256(evidence: &SpWriterRuntimeStateEvidenceV1) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:sp-writer-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1589,7 +1589,7 @@ fn sp_writer_runtime_state_receipt_sha256(evidence: &SpWriterRuntimeStateEvidenc
     hasher.finalize().into()
 }
 
-fn host_abi_writer_runtime_state_receipt_sha256(
+pub(super) fn host_abi_writer_runtime_state_receipt_sha256(
     evidence: &HostAbiWriterRuntimeStateEvidenceV1,
 ) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
@@ -1624,7 +1624,7 @@ fn host_abi_writer_runtime_state_receipt_sha256(
     hasher.finalize().into()
 }
 
-fn rsp_writer_runtime_state_receipt_sha256(evidence: &RspWriterRuntimeStateEvidenceV1) -> [u8; 32] {
+pub(super) fn rsp_writer_runtime_state_receipt_sha256(evidence: &RspWriterRuntimeStateEvidenceV1) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"fn64:rsp-execution-writeback-runtime-state-receipt:v1");
     hasher.update((evidence.schema.len() as u64).to_be_bytes());
@@ -1659,7 +1659,7 @@ fn rsp_writer_runtime_state_receipt_sha256(evidence: &RspWriterRuntimeStateEvide
     hasher.finalize().into()
 }
 
-fn rdp_renderer_writer_runtime_state_receipt_sha256(
+pub(super) fn rdp_renderer_writer_runtime_state_receipt_sha256(
     evidence: &RdpRendererWriterRuntimeStateEvidenceV1,
 ) -> [u8; 32] {
     let mut hasher = sha2::Sha256::new();
@@ -1696,7 +1696,7 @@ fn rdp_renderer_writer_runtime_state_receipt_sha256(
     hasher.finalize().into()
 }
 
-fn hash_pi_request(hasher: &mut sha2::Sha256, request: fn64_runtime::PiDmaRequest) {
+pub(super) fn hash_pi_request(hasher: &mut sha2::Sha256, request: fn64_runtime::PiDmaRequest) {
     hasher.update([match request.direction {
         fn64_runtime::DmaDirection::ToRdram => 0,
         fn64_runtime::DmaDirection::FromRdram => 1,

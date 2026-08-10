@@ -441,6 +441,528 @@ That is a discovery-layer question about which word the destination field
 resolve. Relaxing the guard would weaken a proven-bank invariant every ROM
 depends on, so it is left standing and recorded here instead.
 
+## WM2000 gameplay: the blocker is self-modifying code, under-declared
+
+The playable binary now builds and boots (121 MB), and running the committed
+route at `reference/wm2000-routes/entrance-to-match.schedule` fails with:
+
+```
+executable mutation changed physical RDRAM [0x0009b0b3, 0x0009b0b4)
+outside every attributed writer declaration
+```
+
+**The byte is real code.** Physical `0x9b0b3` -> VA `0x8009b0b3` -> ROM
+`0x9bcb3` is byte lane 3 of
+
+```
+0x8009b0b0:  0xa4450010    sh $a1, 0x10($v0)
+```
+
+i.e. the low byte of that store's 16-bit immediate offset, inside a dense run
+of contiguous code (SB/SH/LUI/LW/ADDIU/J). WM2000 patches store offsets at
+run time: genuine self-modifying code, not a phantom diff.
+
+**The guard is not at fault**, established by proof rather than reading:
+`first_uncovered_changed_range` was differential-tested against a brute-force
+reference over 200,000 randomized cases with zero mismatches, and
+`clipped_declarations` is byte-exact, so the unaligned address is not a
+clipping off-by-one. Every CPU store form declares a superset of what it
+changes (SB/SH exactly; SWL/SWR/SDL/SDR delegate to `store_w`/`store_d` and
+declare the full aligned word).
+
+**The failure is an UNDER-declaring writer, not a silent one.** The message
+comes from `commit_snapshot`, not `reconcile_snapshot_before_dispatch` --
+attributed events were in flight, they just did not cover this byte. A
+captured backtrace pins the call path:
+
+```
+_osSendMesg_recomp -> call_c -> invoke_catalog_block_host
+                   -> run_catalog_block_program
+```
+
+so it fires during the host-ABI transaction flush that
+`suspend_active_coroutine` triggers.
+
+Worth stating plainly: this code had **never executed** before 2026-08-04.
+The whole `recompiled/` module sits behind `recomp-rs`, which no default
+build compiles, so ~10k lines and 119 tests had never run once. A latent
+under-declaration there is exactly what one would expect to surface first.
+
+**Answered: the writer is silent, not under-declaring.** The enriched panic
+message reports
+
+```
+[0x0009b0b3,0x0009b0b4) outside every attributed writer declaration;
+declared={} changed={[0x0009b0b3,0x0009b0b4)} events=0 declarations=0
+```
+
+`events=0 declarations=0` inverts the earlier reading. The prior inference --
+that `commit_snapshot` raising it (rather than
+`reconcile_snapshot_before_dispatch`) implied attributed events were in
+flight -- was wrong: the commit path runs at the transaction boundary
+regardless of whether any event was queued. Nothing declared anything, so the
+byte was written by a path that never notifies at all.
+
+That rules out the whole class of clipping, rounding, and partial-declaration
+bugs, and rules IN a writer that bypasses notification.
+
+**The obvious suspect is eliminated, by measurement.** The `Rdram` and
+`RdramViewMut` `DmaMemory` impls discard the channel and never notify, so they
+were the natural candidates. Instrumenting both to print on every non-empty
+write and re-running the route produced **zero hits**: they are not reached on
+this path at all. The earlier "not on the live path" assessment was correct,
+and re-opening it cost one run to settle rather than an argument.
+
+`pi/timing.rs:197` does select between them -- `ProcessDmaMemory` (which
+notifies via `notify_committed_dma_write`) when a pending PI/SI/SP request
+carries process RDRAM, and a silent `RdramViewMut::from_storage(&mut [])` when
+the SI completion owner is `OsEvent` or `PfsIsPlug`. The silent branch is real,
+but it is handed an EMPTY slice, so it cannot be the source of a byte change.
+
+**The write bypasses the byte-level chokepoint too.** Instrumenting
+`RdramPtr::write_u8` -- through which every raw byte write passes -- to print a
+backtrace on any write to `0x9b0b3` produced **zero hits in a run that still
+panicked** with the same `events=0 declarations=0`. The byte changed without
+`write_u8` ever being called for it.
+
+That points at `RdramPtr::write_u32` (`rdram.rs:391`), which writes four bytes
+through a single `write_unaligned` and never goes through `write_u8`. The
+geometry fits exactly: the mutated instruction sits at `0x8009b0b0`, so the
+aligned word write covers `0x9b0b0..0x9b0b4` and its last byte is the
+`0x9b0b3` the guard reports. Only that byte differs because only the store's
+low immediate byte changed.
+
+**The probes had been on the wrong type.** `RdramPtr` and `RdramViewMut` are
+distinct types, each with its OWN `write_u8`/`write_u32`/`write_logical_bytes`.
+Both instrumented runs covered only `RdramPtr`, which is why two 40-minute runs
+returned zero hits while still panicking. Reading the code found in a minute
+what the runs could not.
+
+**`G_DMA_IO` is the writer, but not the defect.** `gSPDmaWrite`
+(`crates/fn64-render-reference/src/gbi/stream.rs:78`) does write RSP memory
+back into DRAM through `RdramViewMut::write_logical_bytes` with no notify call
+in that file. But the renderer is not supposed to declare: the ABI brackets the
+whole task in `track_rdp_renderer_mutation`
+(`task_dispatch/setup.rs:436`), which is meant to diff and attribute whatever
+the backend touched.
+
+**The defect is in that bracket.** `track_catalog_nested_mutation`
+(`recompiled/snapshots.rs:1003`) has two branches:
+
+* canonical program active -> `commit_changed_bytes` diffs and notifies;
+* otherwise -> it snapshots ONLY the ranges already in
+  `EXECUTABLE_WRITE_RANGES` (`snapshots.rs:1014`) and, after the operation,
+  notifies only changes found *inside those ranges* (`:1035-1053`).
+
+So when the canonical program is not active, a renderer write to executable
+memory that lies outside the pre-registered ranges is never compared and never
+notified. That is precisely the observed signature: the byte changes, the
+guard's own watched set sees it later, and `events=0 declarations=0` because
+nothing ever declared it.
+
+This supersedes the previous entry blaming the renderer crate for missing a
+notify call -- the attribution seam exists and is in the right place; its
+non-canonical branch is just too narrow.
+
+That also retro-explains the frame-dump correlation retracted earlier: it was
+dismissed as a run-speed artifact, and the speed analysis was correct, but both
+observations are downstream of graphics-task execution, so the correlation may
+have been real for the wrong reason.
+
+Contrast with the path that does it correctly: the verified-audio commit
+(`task_dispatch/rsp_phase.rs:632`) writes to a SHADOW copy, merges the changed
+ranges, and runs `preflight_non_executable_host_writes` to reject executable
+overlap before touching live RDRAM. `G_DMA_IO` does none of that.
+
+Structural note worth fixing regardless: `write_u8` and `write_u32` are peers
+on each type and none of them notify -- attribution is expected at a higher
+layer, which is exactly the split that lets a renderer-crate caller write guest
+code with nothing watching.
+
+**A correlation that did not survive testing.** `FN64_RENDER_DUMP_DIR` looked
+implicated: the panic appeared in a run with it set and not in a 74-minute run
+without it. Retesting killed the idea. A third run WITH the dump directory ran
+33 minutes without panicking, and comparing progress rather than wall-clock
+explains why: the panicking run reached 46 log lines, the quiet ones 10-11.
+They were not avoiding the fault, they were running far behind it -- both
+controls were `nice`d and the original was not.
+
+The lesson is the caveat originally recorded with the lead: in a debug build
+this slow, "did not panic in N minutes" is nearly worthless as evidence unless
+progress is compared, not elapsed time. Dump-dir involvement is neither
+confirmed nor refuted; it was never actually tested.
+
+The panic message now carries the declaring channels, their declared ranges,
+and every changed range, so the next occurrence names the writer without
+another instrumentation round.
+
+## The tracker fix was necessary but not sufficient
+
+`track_catalog_nested_mutation` genuinely watched the wrong set, and that is
+fixed (`snapshots.rs`, commit f59c9ae). Re-running the route afterwards:
+
+* the panic moved from ~38 minutes to ~48 minutes, so behavior changed;
+* but it is the SAME failure -- `[0x0009b0b3,0x0009b0b4)`, `declared={}`,
+  `events=0 declarations=0`.
+
+So the write does not travel through the renderer mutation bracket at all, and
+the `G_DMA_IO` hypothesis is not established. Worse, the aborting run never
+printed its progress line, so there is no evidence a graphics task executed on
+that run -- the renderer path may be entirely irrelevant to this byte.
+
+What survives from the investigation, all measured rather than argued:
+
+* the byte is genuine self-modifying code (a runtime-patched store immediate
+  at `0x8009b0b0`);
+* the guard is correct (200k randomized differential cases, zero mismatches);
+* clipping and partial-declaration causes are excluded by `events=0`;
+* the non-notifying `DmaMemory` impls are excluded (instrumented, zero hits);
+* byte-granular writes are excluded (instrumented `write_u8`, zero hits on a
+  run that still panicked);
+* the tracker's narrow branch was a real defect, now fixed, but not THIS one.
+
+`RdramViewMut` is eliminated too. All four of its write paths (`write_u32`,
+`write_u16`, `write_u8`, `write_logical_bytes`) were instrumented; a run that
+panicked with the same byte recorded exactly **two** hits, both
+`publish_rom_slice start=0x400 len=1048576` -- the 1 MiB IPL3 boot copy, which
+covers the byte trivially, happens at boot, and records its own
+`BootstrapPublicationEvidenceV1`.
+
+So the byte changes without passing through ANY instrumented write path:
+not `DmaMemory`, not `RdramPtr::write_u8`, not `RdramViewMut`. The remaining
+possibilities are writes through a raw pointer or slice that never touch these
+types at all -- for example generated AOT code writing its own `&mut [u8]`, or
+a `copy_from_slice` on a raw storage slice obtained elsewhere.
+
+**Assessment after six eliminations:** this is a deep, genuinely hard defect in
+a subsystem that had never executed before 2026-08-04. It is the only UNKNOWN
+on the gameplay path, but it is not the only blocker, and it is not the one
+with a playable match immediately behind it. Blocker B (the certified lane and
+the playable lane being different programs) is known engineering with a known
+shape. Continuing to spend exclusively on A is a worse bet than starting B.
+
+## Blocker B mapped: it is a three-function wiring gap, not two programs
+
+The earlier framing -- "the certified lane and the playable lane are different
+programs" -- overstates it. `crates/fn64-shell` already has a typed-Rust game
+path that needs no C recompiler:
+
+* `build.rs` branches on `FN64_RECOMP=rs`, which takes `ROM` directly and links
+  the game from a Rust crate instead of `RECOMPILED_DIR`;
+* the `rs` manifest (`crates/fn64-shell/rs/Cargo.toml`) already carries
+  **winit, gilrs, pixels, egui** plus every fn64 crate with the `recomp-rs`
+  feature -- window, gamepad, and UI are all present;
+* `main.rs` uses exactly **three** symbols from the linked game crate:
+  `recompiled::boot_thread`, `recompiled::entrypoint`, `recompiled::lookup`.
+
+So the shell does not need porting. It needs a game crate for WM2000 that
+exposes those three functions, in place of the out-of-tree
+`oot-recompiled = { path = "recompiled" }` it links today.
+
+WM2000's emitted code already exists as the 35 dense-AOT shards the block lane
+builds and certifies, but `examples/wm2000-block-shards/lib.rs` exports only
+`code_bank`. Bridging that to the three-function interface -- entry lookup,
+thread bootstrap, and entrypoint -- is the whole of Blocker B.
+
+That is bounded, known-shape engineering, unlike Blocker A, which after six
+measured eliminations remains an unidentified writer in a subsystem that had
+never executed before 2026-08-04.
+
+## Why every WM2000 run is slow: a per-step 1 MiB byte-loop
+
+The route was assumed to cost ~48 minutes of emulation. Measured, it is worse
+and the cause is not what it looked like:
+
+* a 5,000-step run takes **138 seconds** -- about 36 steps/second, so the
+  420,000-step route is ~3.2 hours;
+* `FN64_PHASE_TIMING` attributes essentially all of it to one place:
+  `executor_ms=64903.965 calls=3000 gfx_ms=0.000 audio_ms=0.000`.
+
+That is **21.6 ms per executor step**, with graphics and audio at exactly
+zero. A per-step cost, not a per-instruction one -- which is why raising
+`opt-level` on the interpreter crates changed nothing measurable.
+
+**The obvious suspect was wrong.** `read_snapshot`
+(`recompiled/live_program.rs:238`) allocated a fresh `Vec<Vec<u8>>` and read
+its entire watched region a byte at a time through `read_u8` -- roughly a
+million checked reads plus a 1 MiB allocation per step on WM2000's 1 MiB boot
+bank. That looked decisive, so `copy_logical_bytes` was rewritten to copy one
+native word at a time (differential-tested byte-identical at every alignment)
+and the ten hot call sites switched to it.
+
+It changed nothing: 5,000 steps went 138s -> 134s, and phase timing still
+reports ~27 ms per executor step. The snapshot was not the bottleneck.
+
+**Sampled the running process instead of guessing a third time**, and the
+answer is unambiguous:
+
+```
+5877 / 5965 samples   fn64_abi::pi::timing::read_raw_mmio_word
+```
+
+**98.5% of runtime is MMIO register reads.** Not one slow function -- the
+individual paths (`read_live_device_mmio`, `read_live_rcp_interrupt_mmio`)
+are short. It is sheer volume: the guest is spin-polling a device register in
+a tight loop, and every poll walks the MMIO window chain and takes the host
+lock.
+
+That reframes the whole "slow emulation" problem. It is not interpreter
+overhead, not the mutation guard, and not something an `opt-level` change or
+a faster memory copy can reach. WM2000 is busy-waiting on a device the
+harness advances only at step boundaries, so the emulator burns thousands of
+polls per unit of guest progress.
+
+Two implications:
+
+* the ~36 steps/second figure is not a fixed emulator cost -- it is specific
+  to whatever the guest is waiting for here, and would change entirely once
+  that wait is satisfied;
+* the fix is a device/scheduling question (advance time to the next deadline
+  when the guest is provably spinning), not a code-optimization one.
+
+Recorded after two wrong guesses -- the interpreter `opt-level` change and the
+byte-loop rewrite -- both of which measured as no-ops. Sampling took one run.
+
+Two consequences worth stating:
+
+* it explains the windowed lane reaching no first frame in 3+ minutes -- the
+  batch runner sits at the identical point for the same duration, so this is
+  the shared cost, not a shell defect;
+* an aligned `u32` read is both correct and ~4x cheaper here (`read_u32` uses
+  lane_xor 0 while `read_u8` uses 3), and the snapshot could be diffed
+  incrementally rather than rebuilt, so this is fixable rather than inherent.
+
+It sits in the same subsystem as the undeclared-mutation defect, and neither
+had ever executed before 2026-08-04.
+
+## The MMIO fast path, confirmed end to end
+
+The KSEG1 pre-check (`50975c2`) was measured on short runs; the full route
+confirms it. The undeclared-mutation panic that previously landed at ~48
+minutes now lands at **~19 minutes**, same byte, same
+`events=0 declarations=0` -- the identical failure, reached 2.5x sooner.
+
+Two corrections that came out of that run:
+
+* **The panic is early in boot, not deep in the route.** It aborts before any
+  progress line is printed -- no graphics submissions, no controller
+  operations, no VI interrupts. Wall-clock had made it look like a late-route
+  fault; step-count bisection shows 30,000 steps do NOT reproduce it, so it
+  sits somewhere between 30k and 420k rather than at the end.
+* **Rendering cannot be evaluated until it is fixed.** The run dumped zero
+  frames because the fault precedes the first graphics task. That also
+  explains the windowed lane never presenting a frame: it is not a shell
+  defect, it is this panic.
+
+So the remaining gameplay work is gated on one defect rather than several,
+and the reproduction is now cheap enough to bisect.
+
+## The silent writer, identified: a guest CPU store
+
+Trapping directly on physical `0x9b0b3` in `store_backed_word` -- rather than
+waiting for the commit boundary to notice the byte -- named it in one run:
+
+```
+FN64DIAG store_backed_word vaddr=0xffffffff8009b0b0 phys=0x9b0b0 value=0x00000000
+  fn64_recomp_rs::runtime::host::Rdram::store_backed_word
+  fn64_recomp_rs::runtime::host::Rdram::try_store_w_translated
+  fn64_recomp_rs::execution::program::BlockProgram::run
+  fn64_abi::recompiled::runners::run_catalog_block_program
+```
+
+It is a **guest CPU store from recompiled block code**, through the
+*translated* address path, writing `0x00000000` over the instruction word at
+`0x8009b0b0`. The guest is zeroing that word, which is why only the low byte
+differed from the expected image and why a byte-granular hypothesis looked
+plausible for so long.
+
+Not a device, not the renderer, not DMA -- every one of which was eliminated
+by measurement first. And `store_backed_word` DOES call
+`notify_cpu_instruction_store`, so the declaration is produced; it simply is
+not present in `events` at the commit boundary that panics. That narrows the
+remaining defect to the window between notification and commit, rather than to
+any writer.
+
+The trap is the technique worth keeping: the guard reports the byte, so
+trapping the store of that exact byte turns "which writer?" from a
+multi-hour elimination tournament into one run.
+
+## The full causal chain, and why the byte is re-detected
+
+Traced end to end with three targeted probes rather than more elimination.
+Log line numbers from one run tell the whole story:
+
+```
+11  FN64DIAG observer saw 0x9b0b0 len=4 channel=CpuInstructionStore
+12  FN64DIAG drained target event, count=1
+14  panicked ... [0x0009b0b3,0x0009b0b4) ... events=0 declarations=0
+```
+
+So, in order:
+
+1. generated boot-shard code executes a guest CPU store that zeroes the
+   instruction word at `0x8009b0b0` (stack trace: `runner_00::run_00` ->
+   `try_store_w_translated` -> `store_backed_word`);
+2. `notify_cpu_instruction_store` fires and the observer records it as an
+   attributed executable write -- **the declaration exists**;
+3. one commit boundary drains it (`std::mem::take`, `count=1`) and succeeds;
+4. the NEXT commit re-detects the same changed byte, finds the list empty,
+   and panics with `events=0`.
+
+The defect is not a missing writer, a missing notification, or a filtered
+event -- each was eliminated by measurement, and this chain shows all three
+working.
+
+**Two different commits compete for the same event.** The panic backtrace
+names its caller:
+
+```
+recompiled_gap_panic
+CanonicalExecutableMutationStateV1::commit_snapshot
+CanonicalLiveBlockProgramV1::...
+process_live_executable_writes_from_host
+fn64_abi::pi::timing::advance_device_time
+fn64_abi::host::run_one_step
+```
+
+So the panicking commit runs from the **device-time advance**, while the drain
+observed at log line 12 belongs to
+`invalidate_pending_physical_writes_with` on the guest-execution path. Both
+`std::mem::take` the same `PENDING_ATTRIBUTED_EXECUTABLE_WRITES`. Whichever
+runs first consumes the declaration and advances its own baseline; the other
+then re-reads RDRAM, still sees the changed byte against ITS stale `expected`,
+and finds an empty event list.
+
+That makes it an ordering/ownership defect between two commit paths sharing
+one thread-local queue -- not a missing declaration anywhere.
+
+That also retires the earlier `EXECUTABLE_WRITE_RANGES`-vs-watched-set
+hypothesis: the observer demonstrably records the event, so the filter is not
+what loses it.
+
+## Blocker A is fixed; the next stop is a different failure
+
+The undeclared-mutation panic is resolved (`1a25cb4`). Two commit paths --
+guest execution and the device-time advance -- call
+`invalidate_pending_physical_writes_with` on the same canonical state, and each
+`std::mem::take`s the shared declaration queue. The first consumes the
+declaration and refreshes `watched[..].expected`; the second arrives empty,
+re-reads RDRAM, and re-detects the byte the first already accepted.
+
+The intermediate attempt is what made the final one correct: skipping the
+empty commit removed that panic and produced a *different* one, `before
+canonical static dispatch`, because the baseline was then never refreshed at
+all. So the baseline must advance; what must not happen is journalling an empty
+batch as a mutation. `adopt_snapshot` does exactly that.
+
+Verified on the full 420k route: **zero occurrences of either mutation-guard
+message**, where every prior run failed at ~19 minutes.
+
+**The route now reaches ~28 minutes and stops elsewhere:**
+
+```
+CpuFault { pc: 0x80022620, kind: MemoryFault { addr: 0xffffffffa6000000 } }
+```
+
+Disassembling that PC shows the standard libultra uncached-alias idiom:
+
+```
+0x80022614:  lw   $t6, 0xc($s0)     ; load a pointer
+0x80022618:  lui  $at, 0xa000       ; KSEG1 base
+0x8002261c:  or   $t7, $t6, $at     ; force uncached
+0x80022620:  lw   $v0, 0($t7)       ; FAULT
+```
+
+So `$t6` held `0x06000000` and the uncached alias is `0xA6000000`. Physical
+`0x06000000` falls in the gap between `PI_DOM2_ADDR1` (ends `0x05ffffff`) and
+`PI_DOM2_ADDR2` (starts `0x08000000`) -- mapped by no PI domain and beyond the
+8 MiB RDRAM allocation.
+
+That is a *loaded pointer* being out of range, not a decode bug: the emulator
+is faulting on an address the guest computed. Whether the pointer is garbage
+(uninitialised memory the guest expected something else to fill) or the load at
+`0x8002261c+0xc` should have returned something else is the next question, and
+it is a different investigation from the mutation guard.
+
+## Blocker B: the windowed lane hangs inside frame 0
+
+With Blocker A fixed, the shell was re-run headless
+(`FN64_SHELL_HEADLESS_FRAMES=600`, no window, no audio) to test whether the
+mutation panic had been what stopped it presenting.
+
+It was not. The probe loop prints one diagnostic line per frame -- `swapped`,
+`steps`, `vi_swaps`, `sim_time`, `fb` -- and after **18m47s at 100% CPU it had
+printed zero lines**. Frame 0's `pump_one_frame` never returns.
+
+So the shell is not failing to *render*; it is not completing a single frame.
+That is a different defect from both the mutation guard (fixed) and the
+out-of-range pointer fault the batch runner hits at ~28 minutes -- notably the
+shell does NOT panic there, so the two lanes diverge in behaviour as well as
+in structure.
+
+**Cause and fix.** `STEPS_PER_PUMP` (200k) bounds a STEADY-STATE frame -- a
+guest that has not yielded in 200k scheduling steps is spinning. Boot is not
+steady state: WM2000's certified batch route needs ~420k steps to reach its
+menus, all before the first VI field, so frame 0 simply could not finish
+inside the bound. Boot now gets `BOOT_STEPS_PER_PUMP` (4M), selected on
+`vi_swap_count() == 0`, with every later frame keeping the 200k bound
+unchanged (`af6b5b9`).
+
+**The two lanes have now converged.** With that fix the shell runs ~28 minutes
+and stops at *exactly* the batch runner's failure -- same guard
+(`execution.rs:838`), same PC (`0x80022620`), same `MemoryFault` at
+`0xffffffffa6000000`. It no longer diverges in behaviour, and a single
+remaining defect gates both lanes.
+
+Still true: no frame has been presented, because that fault precedes the first
+VI field.
+
+Worth stating plainly because it corrects an earlier inference: the missing
+first frame was attributed to WM2000's inherent debug-build cost, on the
+strength of a side-by-side comparison with the batch runner sitting at the
+same log point. That comparison was real, but the conclusion was wrong -- the
+batch runner was progressing and the shell was not.
+
+## The shared fault: a CPU read of PI domain-1 address 1 has no window
+
+Both lanes now stop at `pc=0x80022620`, `MemoryFault` on
+`0xffffffffa6000000`. Disassembling the surrounding code identifies it
+precisely -- and corrects an earlier reading of mine that called the address
+"mapped by no PI domain".
+
+The routine is PI domain configuration:
+
+```
+0x800225ec:  lui  r10, 0xa460          ; PI register block
+0x800225f4:  ori  r10, r10, 0x18       ; -> 0xA4600018
+0x8002260c:  sw   r13, 0(r9)           ; write 3    (BSD dom1 page size)
+0x80022610:  sw   r11, 0(r10)          ; write 0xff (BSD dom1 release/latency)
+0x80022614:  lw   r14, 0xc(r16)        ; load a base address from a handle
+0x80022618:  lui  r1,  0xa000          ; KSEG1
+0x8002261c:  or   r15, r14, r1         ; uncached alias
+0x80022620:  lw   r2,  0(r15)          ; FAULT
+```
+
+So `0xc($s0)` held `0x06000000`, and that is **not** an unmapped address:
+`PI_DOM1_ADDR1 = 0x0600_0000..=0x07ff_ffff` (`pi/mmio.rs:107`), the N64DD
+window. The guest configures the PI domain and then probes the device.
+
+**The gap is an asymmetry.** `epi_domain_for_address` (`pi/mmio.rs:134`)
+accepts `PI_DOM1_ADDR1` for `osPiHandle` operations, but
+`cartridge_rom_window_offset` (`pi/timing.rs:35`) accepts only
+`PI_DOM1_ADDR2` -- the cartridge ROM. A direct CPU read of domain-1 address 1
+therefore matches no MMIO window, is not backed RDRAM, and faults.
+`PI_DOM1_ADDR1` appears exactly once outside its own definition, in that
+classifier, so CPU reads there have no handler at all.
+
+**What it needs is a hardware-behaviour decision, not a guess.** WM2000 has no
+N64DD, and real hardware returns open-bus for an absent device rather than
+faulting -- but the exact value is a measurement question, and inventing one
+would fabricate hardware behaviour in the same way this project has refused to
+elsewhere. The options are to model an absent-device read explicitly, or to
+trap it loudly as unsupported with the device named. Either is defensible;
+silently returning zero is not.
+
 ## Honest scope
 
 - 26 of 287 ROMs sampled; the wider batch was still running when this was

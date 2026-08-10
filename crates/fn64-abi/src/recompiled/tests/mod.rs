@@ -1,12 +1,14 @@
     use super::*;
     use fn64_recomp_rs::{
         run_bank, BackedExecutableSpanV1, BlockRun, BootCicIdentity, BootCop0Context, BootRegion,
-        CodeBank, CodeCatalog, CodeSpan, CpuFaultKind, GeneratedBankRunner, GenerationId,
+        CodeBank, CodeCatalog, CpuFaultKind, GeneratedBankRunner, GenerationId,
         PhysicalCodeBank, PrecompiledGeneration, PrecompiledGenerationBackingV1, PrecompiledShard,
         Sha256Digest, BOOT_CONTEXT_SCHEMA_V1,
     };
     use sha2::Digest;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(feature = "dynamic-mapped-runtime")]
+    use std::sync::atomic::AtomicUsize;
 
     static TRANSIENT_FR_SHIM_ENTERED: AtomicBool = AtomicBool::new(false);
 
@@ -583,7 +585,7 @@
     impl Drop for PublicSiRuntimeStateTestReset {
         fn drop(&mut self) {
             with_executor(|executor| *executor = fn64_runtime::Executor::new());
-            with_host(|host| *host = super::super::HostState::default());
+            with_host(|host| *host = crate::HostState::default());
             PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
             PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow_mut().clear());
             EXECUTABLE_WRITE_RANGES.with(|ranges| ranges.borrow_mut().clear());
@@ -672,7 +674,7 @@
         let rdram = storage.as_mut_ptr();
         let rdram_len = storage.len();
         with_host(|host| {
-            *host = super::super::HostState::default();
+            *host = crate::HostState::default();
             host.runtime_rdram = rdram;
             host.runtime_rdram_len = rdram_len;
             host.owned_runtime_rdram = Some(storage);
@@ -694,11 +696,6 @@
             kind: fn64_runtime::SiDmaKind::PifToDram,
             dram_addr: fn64_runtime::RdramAddr::from_offset(0x6000),
         }
-    }
-
-
-    fn canonical_install_rejects_an_allocation_shorter_than_its_static_backing() {
-        set_catalog_generation_program(bootstrap_test_install(0x2402_0001), 0x100);
     }
 
 
@@ -1609,7 +1606,7 @@
         // The tested state is intentionally stopped forever; retire its
         // dormant coroutine while the caller's backing RDRAM is still live.
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
     }
 
 mod bootstrap_writers;
@@ -1619,3 +1616,9 @@ mod live_program_b;
 mod c_adapter;
 mod exceptions_fabric;
 mod mutation_state;
+
+// `is_test_c_shim` in `runners.rs` names these as `tests::<shim>`, which it
+// could do directly while every test lived in one inline `mod tests`. They
+// now live in the `c_adapter` submodule, so re-export them under the same
+// path the caller already uses.
+pub(in crate::recompiled) use c_adapter::{change_bev_shim, change_fr_shim, no_op_fpr_shim, write_f5_word_shim};

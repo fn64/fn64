@@ -1,9 +1,10 @@
 use super::*;
+use fn64_recomp_rs::CodeSpan;
 
     #[test]
     fn validated_boot_owns_rdram_and_starts_journal_with_bootstrap_batch() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let expected_word = 0x2402_0001;
         let install = bootstrap_test_install(expected_word);
         let mut rom = vec![0; 0x40];
@@ -54,7 +55,7 @@ use super::*;
         }
         assert!(crate::is_thread_dead(0xb007));
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
     }
 
 
@@ -62,7 +63,7 @@ use super::*;
     fn canonical_scheduler_mirror_commits_exact_host_abi_write_before_dispatch() {
         let _reset = PublicSiRuntimeStateTestReset;
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
 
         let entry_word = 0x2402_0001;
         let static_word = 0;
@@ -163,7 +164,7 @@ use super::*;
     #[test]
     fn validated_dynamic_boot_retains_input_provenance_without_static_authority() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let expected_word = 0x2402_0001;
         let install = bootstrap_test_install(expected_word);
         let mut rom = vec![0; 0x40];
@@ -208,14 +209,14 @@ use super::*;
         assert!(crate::is_thread_dead(0xb008));
         assert_eq!(canonical_block_charged_instructions_v1(), Some(1));
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
     }
 
 
     #[test]
     fn validated_boot_rejects_a_receipt_from_another_catalog_before_installing_memory() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let expected_word = 0x2402_0001;
         let receipt_install = bootstrap_test_install(expected_word);
         let different_install = bootstrap_test_install(0x2402_0002);
@@ -253,7 +254,7 @@ use super::*;
     #[test]
     fn validated_boot_rejects_a_different_installed_rom_before_installing_memory() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let expected_word = 0x2402_0001;
         let install = bootstrap_test_install(expected_word);
         let mut receipt_rom = vec![0; 0x40];
@@ -295,6 +296,9 @@ use super::*;
     #[should_panic(
         expected = "canonical executable backing ends at physical RDRAM 0x00007004, beyond the installed 0x100-byte allocation"
     )]
+    fn canonical_install_rejects_an_allocation_shorter_than_its_static_backing() {
+        set_catalog_generation_program(bootstrap_test_install(0x2402_0001), 0x100);
+    }
 
     #[test]
     fn catalog_resolver_install_captures_pointer_free_canonical_evidence() {
@@ -1147,7 +1151,7 @@ use super::*;
     #[test]
     fn canonical_unified_executable_write_publishes_before_continuation() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
-        with_host(|host| *host = super::super::HostState::default());
+        with_host(|host| *host = crate::HostState::default());
         let bank = BankId::new(0xca82);
         let entry = ExecutionKey::new(bank, INSTALL_PC);
         let resume = ExecutionKey::new(bank, GuestPc::new(INSTALL_PC.get() + 4));
