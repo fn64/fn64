@@ -1267,6 +1267,7 @@ impl Shell {
         } else if frames >= self.last_heartbeat_frame + 60 {
             let state = if blank { "uniform" } else { "non-uniform" };
             let audio = fn64_abi::audio_output_stats();
+            let stream_health = fn64_abi::audio_stream_health().unwrap_or_default();
             let interval = self.frame_intervals.take_stats();
             let pump = self.pump_times.take_stats();
             // Report the whole distribution, and say outright whether the
@@ -1293,7 +1294,8 @@ impl Shell {
                 "[wm2000-shell] heartbeat: presented frame #{frames} {source} \
                  ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
                  scanout={scanout:?}; frame_interval_ms[{}] pump_ms[{}]; \
-                 audio{}: ai_buffers={} samples={} nonzero={} backend_buffers={}",
+                 audio{}: ai_buffers={} samples={} nonzero={} backend_buffers={} \
+                 underrun={}/{} slots ({:.1}% STARVED)",
                 fmt(&interval),
                 fmt(&pump),
                 // A zero audio counter has two completely different meanings and
@@ -1318,6 +1320,30 @@ impl Shell {
                 audio.samples,
                 audio.nonzero_samples,
                 audio.backend_buffers,
+                // The mechanical choppiness signal, on the ROUTINE line.
+                //
+                // `underrun_samples` counts output slots the device filled with
+                // silence because the ring was empty, and `fn64-audio` already
+                // documents it as the signal a point-in-time ring depth cannot
+                // provide -- but it only printed inside the SPIKE report, which
+                // is gated on frame time. Steady starvation never trips a frame
+                // spike: a 44-minute session logged ZERO spikes while delivering
+                // 29,281 channel samples/sec against the 64,000/sec that 32 kHz
+                // stereo demands, and the audio was choppy throughout.
+                //
+                // `ai_buffers == backend_buffers` held exactly all session, so
+                // every queue-health counter read clean. Equal counts prove
+                // nothing is being LOST; they say nothing about whether enough
+                // is ARRIVING (perf-method rule 22). This is the counter that
+                // can contradict the clean ones, so it belongs here.
+                stream_health.underrun_samples,
+                stream_health.requested_samples,
+                if stream_health.requested_samples == 0 {
+                    0.0
+                } else {
+                    stream_health.underrun_samples as f64 * 100.0
+                        / stream_health.requested_samples as f64
+                },
             );
             self.last_heartbeat_frame = frames;
         }
