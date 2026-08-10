@@ -2927,14 +2927,20 @@ mod tests {
             "the spread rows must be emitted; got:\n{text}"
         );
         // ...and the spread rows must not.
-        let spiky_line = text
-            .lines()
-            .find(|l| l.contains("SPREAD dispatch (GUEST)"))
-            .expect("dispatch spread row");
-        let flat_line = text
-            .lines()
-            .find(|l| l.contains("SPREAD cop0"))
-            .expect("cop0 spread row");
+        //
+        // Read the SLOW bucket specifically. Every sample above is 40 ms, so
+        // the 16.667 ms partition puts all forty in `slow` and leaves `fast`
+        // empty -- and the report emits a row set per bucket, `fast` first. A
+        // bare `find` takes the empty bucket's row and reads p50=0, p95=0,
+        // which looks like a broken instrument rather than an unpopulated one.
+        let row = |bucket: &str, label: &str| {
+            let prefix = format!("{bucket}: SPREAD {label}");
+            text.lines()
+                .find(|l| l.contains(&prefix))
+                .unwrap_or_else(|| panic!("no {prefix} row in:\n{text}"))
+        };
+        let spiky_line = row("slow", "dispatch (GUEST)");
+        let flat_line = row("slow", "cop0");
         assert!(
             spiky_line.contains("9.0x"),
             "an alternating 2/18ms phase must report a 9x spread; got:\n{spiky_line}"
