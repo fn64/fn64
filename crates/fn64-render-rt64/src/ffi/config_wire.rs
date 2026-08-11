@@ -540,6 +540,7 @@ unsafe extern "C" {
         start: u32,
         end: u32,
         output_addr: u32,
+        wait_for_completion: c_int,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;

@@ -708,6 +708,7 @@ int fn64_rt64_process_rdp_commands(
     uint32_t start,
     uint32_t end,
     uint32_t output_addr,
+    int wait_for_completion,
     char *error,
     size_t error_capacity);
 

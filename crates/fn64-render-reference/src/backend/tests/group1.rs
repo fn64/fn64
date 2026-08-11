@@ -991,6 +991,7 @@ fn raw_depth_image_fill_clears_persistent_depth_across_color_switch() {
             START as u32,
             (START + commands.len() * 8) as u32,
             0,
+            true,
         )
         .unwrap();
 
@@ -1047,6 +1048,7 @@ fn raw_depth_fill_halfwords_replicate_lsbs_into_hidden_delta_bits() {
             START as u32,
             (START + commands.len() * 8) as u32,
             0,
+            true,
         )
         .unwrap();
 
@@ -1108,7 +1110,7 @@ fn raw_edge_triangle_rasterizes_into_commanded_color_image() {
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let view = fn64_runtime::RdramView::from_storage(&rdram);
@@ -1195,7 +1197,7 @@ fn raw_z_triangles_use_near_zero_depth_regardless_of_submission_order() {
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let view = fn64_runtime::RdramView::from_storage(&rdram);
@@ -1266,7 +1268,7 @@ fn raw_depth_update_persists_visible_and_hidden_bits_across_image_switches() {
     let mut backend = ReferenceBackend::new().with_f3dex2();
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let pixel = 4 * 8 + 2;
@@ -1338,7 +1340,7 @@ fn raw_primitive_depth_supplies_z_and_delta_without_triangle_coefficients() {
     let mut backend = ReferenceBackend::new().with_f3dex2();
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let pixel = 4 * 8 + 2;
@@ -1426,7 +1428,7 @@ fn raw_decal_mode_accepts_correlated_depth_and_rejects_behind_depth() {
     let mut backend = ReferenceBackend::new().with_f3dex2();
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let pixel = 4 * 8 + 2;
@@ -1485,7 +1487,7 @@ fn raw_shade_triangle_rasterizes_component_gradient() {
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let view = fn64_runtime::RdramView::from_storage(&rdram);

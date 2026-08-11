@@ -54,6 +54,7 @@ impl fn64_render::RenderBackend for CompleteRenderBackend {
         _start: u32,
         _end: u32,
         _output_addr: u32,
+        _wait_for_completion: bool,
     ) -> Result<fn64_render::FrameStatus, fn64_render::RenderError> {
         Ok(fn64_render::FrameStatus::Complete)
     }

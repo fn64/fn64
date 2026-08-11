@@ -159,6 +159,7 @@ mod tests {
             _start: u32,
             _end: u32,
             _output_addr: u32,
+            _wait_for_completion: bool,
         ) -> Result<FrameStatus, RenderError> {
             self.0.set(self.0.get() + 1);
             Ok(FrameStatus::Complete)

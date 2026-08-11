@@ -3847,6 +3847,7 @@ extern "C" int fn64_rt64_process_rdp_commands(
     uint32_t start,
     uint32_t end,
     uint32_t output_addr,
+    int wait_for_completion,
     char *error,
     size_t error_capacity) {
     try {
@@ -3944,7 +3945,15 @@ extern "C" int fn64_rt64_process_rdp_commands(
             }
             deferred_worker_lock.unlock();
         }
-        if (submitted_workload > previous_workload) {
+        // Deferring the wait is only safe when nothing below this point reads
+        // completed-workload state before the CALLER'S own eventual wait (the
+        // next call in the same field passing wait_for_completion=1, or a
+        // present). `deferred_snapshot_ok`'s branch and `present_capture`
+        // below both read state that only exists once the workload has
+        // actually completed, so they force the wait regardless of the
+        // caller's request -- same as before this change for those cases.
+        const bool must_wait_for_capture = capture_deferred || context->present_capture_enabled;
+        if (submitted_workload > previous_workload && (wait_for_completion != 0 || must_wait_for_capture)) {
             context->application->workloadQueue->waitForWorkloadId(submitted_workload);
         }
         if (!deferred_snapshot_ok) {

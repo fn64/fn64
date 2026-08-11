@@ -390,9 +390,57 @@ impl Context {
         end: u32,
         output_addr: u32,
     ) -> Result<(), String> {
+        // Waits for completion -- the safe, unconditional default every
+        // existing caller keeps getting. Use `process_rdp_commands_async`
+        // when the caller itself will wait before it next needs completed
+        // GPU state (present, or a later submission in the same field
+        // passing `wait_for_completion = true`).
+        self.process_rdp_commands_inner(rdram, start, end, output_addr, true)
+    }
+
+    /// Submit without blocking for GPU completion.
+    ///
+    /// `waitForWorkloadId` compares a monotonic counter (`waitId <=
+    /// workloadId`), so RT64's queue is strictly FIFO: waiting for
+    /// submission N's id also waits for every submission before it. A field
+    /// with several coalesced DPC ranges therefore only needs ONE wait, on
+    /// the last one -- not one after each. Measured on the render-benchmark
+    /// route (rt64 lane): `waitForWorkloadId` inside this call was the
+    /// majority of an ~11 ms/field cost paid up to ~2.9 times/field, when
+    /// only the final submission before the frame is consumed needs to
+    /// block at all.
+    ///
+    /// SAFETY of skipping the wait: nothing between this call and the
+    /// caller's own next wait may read completed-workload state. The C++
+    /// side already enforces this for its own internal readers (deferred
+    /// capture, present capture force the wait regardless of this flag);
+    /// the Rust caller's obligation is to pass `wait_for_completion = true`
+    /// on the LAST submission of a field, so the field's own completion is
+    /// still established before anything downstream reads the framebuffer.
+    pub(crate) fn process_rdp_commands_async(
+        &mut self,
+        rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        output_addr: u32,
+        wait_for_completion: bool,
+    ) -> Result<(), String> {
+        self.process_rdp_commands_inner(rdram, start, end, output_addr, wait_for_completion)
+    }
+
+    fn process_rdp_commands_inner(
+        &mut self,
+        rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        output_addr: u32,
+        wait_for_completion: bool,
+    ) -> Result<(), String> {
         let mut error = [0; ERROR_CAPACITY];
-        // SAFETY: the context is alive and uniquely borrowed, and RT64 waits
-        // for the submitted render-to-RAM workload before this call returns.
+        // SAFETY: the context is alive and uniquely borrowed. RT64 waits for
+        // the submitted render-to-RAM workload before this call returns IFF
+        // `wait_for_completion` is nonzero; see `process_rdp_commands_async`
+        // for the caller obligation when it is not.
         let ok = unsafe {
             fn64_rt64_process_rdp_commands(
                 self.0.as_ptr(),
@@ -401,6 +449,7 @@ impl Context {
                 start,
                 end,
                 output_addr,
+                c_int::from(wait_for_completion),
                 error.as_mut_ptr(),
                 error.len(),
             )

@@ -281,7 +281,7 @@ fn render(
     guest_cycle: u64,
 ) -> Result<CaptureStats, Box<dyn Error>> {
     let (mut rdram, end) = fixture();
-    if backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)?
+    if backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)?
         != FrameStatus::Complete
     {
         return Err(io::Error::other("aspect raw-RDP fixture did not complete").into());

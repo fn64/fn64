@@ -1288,6 +1288,7 @@ impl RenderBackend for Rt64Backend {
         start: u32,
         end: u32,
         output_addr: u32,
+        wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
         #[cfg(feature = "rt64")]
@@ -1322,11 +1323,13 @@ impl RenderBackend for Rt64Backend {
             // rollback (2026-08-10, 4,032-call sample, this route), i.e. paid
             // on every successful call to protect a failure path that
             // discards the very memory it would restore.
-            if let Err(reason) =
-                context
-                    .context_mut()
-                    .process_rdp_commands(rdram, start, end, output_addr)
-            {
+            if let Err(reason) = context.context_mut().process_rdp_commands_async(
+                rdram,
+                start,
+                end,
+                output_addr,
+                wait_for_completion,
+            ) {
                 drop(context);
                 self.invalidate_native_state();
                 return Err(RenderError::Backend {

@@ -311,8 +311,28 @@ pub(crate) unsafe fn dispatch_lle_task(
         };
         let mut transaction = LiveDpcTransaction::new(submission);
         let rdp_started = gfx_started.map(|_| std::time::Instant::now());
-        let (full_sync, observation) =
-            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, &mut transaction) };
+        // Defer the GPU-completion wait for every submission except the
+        // last one this loop will make: RT64's queue is a monotonic
+        // counter (`waitId <= workloadId`), so waiting on the LAST
+        // submission's id also waits for every earlier one in this same
+        // field's command stream -- there is no reordering risk. Nothing
+        // between here and the loop's own end reads GPU-completed state
+        // (the pushes below are pure Rust bookkeeping), so skipping the
+        // wait on non-final iterations cannot observe stale data. Measured
+        // as the majority of an ~11 ms/field cost when every iteration
+        // waited (2026-08-10, render-benchmark route, rt64 lane).
+        let wait_for_completion = index >= dp_submissions.len();
+        let (full_sync, observation) = unsafe {
+            dispatch_captured_raw_rdp(
+                rdram,
+                &words,
+                start,
+                end,
+                xbus,
+                wait_for_completion,
+                &mut transaction,
+            )
+        };
         if let Some(started) = rdp_started {
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
@@ -925,11 +945,17 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 let inspected =
                     preflight_raw_dpc_completion(&image, start, end, "dispatch_raw_rdp");
                 let result = with_render_backend("dispatch_raw_rdp", |backend| {
+                    // `true`: this call site is single-shot per invocation,
+                    // not the coalesced-submission loop in
+                    // `dispatch_captured_raw_rdp` below, which is the one
+                    // this session measured and verified safe to defer.
+                    // Preserve existing (always-wait) behavior here.
                     let status = backend.process_rdp_commands(
                         &mut image,
                         start,
                         end,
                         render_output_addr(),
+                        true,
                     )?;
                     Ok(RenderDispatchResult {
                         status,
@@ -961,7 +987,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
                 .collect::<Vec<_>>();
             let (full_sync, observation) = unsafe {
-                dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction)
+                dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
             };
             (full_sync, observation, "dispatch_raw_rdp_xbus")
         }
@@ -1024,8 +1050,9 @@ pub(crate) unsafe fn dispatch_raw_rdp_xbus(
         return;
     };
     let mut transaction = LiveDpcTransaction::new(submission);
-    let (full_sync, observation) =
-        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction) };
+    let (full_sync, observation) = unsafe {
+        dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
+    };
     complete_committed_dpc(transaction, full_sync, observation, "dispatch_raw_rdp_xbus");
 }
 
@@ -1041,6 +1068,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     source_start: u32,
     source_end: u32,
     xbus: bool,
+    wait_for_completion: bool,
     transaction: &mut LiveDpcTransaction,
 ) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
     assert!(
@@ -1142,6 +1170,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             staging_start as u32,
             staged_end as u32,
             render_output_addr(),
+            wait_for_completion,
         )?;
         Ok(RenderDispatchResult {
             status,

@@ -1141,12 +1141,22 @@ pub trait RenderBackend {
     /// `process_task`; it must not be inferred from backend call history.
     /// Backends that do not implement raw command execution return a named
     /// error; the default must never pretend the range rendered successfully.
+    ///
+    /// `wait_for_completion`: when `false`, a backend MAY return before the
+    /// submitted work is complete, as long as it becomes complete no later
+    /// than this backend's next call with `wait_for_completion = true` (or
+    /// any other call that reads GPU-completed state, e.g. present).
+    /// Callers must always pass `true` for the last submission before
+    /// anything downstream needs the finished frame. A backend that has no
+    /// concept of asynchronous completion may ignore the flag and always
+    /// wait -- that is always correct, just not always fast.
     fn process_rdp_commands(
         &mut self,
         _rdram: &mut [u8],
         start: u32,
         end: u32,
         _output_addr: u32,
+        _wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
         let reason =
             format!("raw RDP command execution [{start:#010x}, {end:#010x}) is unsupported");
@@ -1572,7 +1582,7 @@ mod tests {
             frames_presented: 0,
         };
         let error = backend
-            .process_rdp_commands(&mut [], 0x100, 0x108, 0)
+            .process_rdp_commands(&mut [], 0x100, 0x108, 0, true)
             .unwrap_err();
         assert!(error.to_string().contains("is unsupported"));
         let events = fn64_runtime::copy_unsupported_events();

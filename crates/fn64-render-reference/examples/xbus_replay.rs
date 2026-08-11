@@ -90,6 +90,7 @@ fn main() {
                     staging as u32,
                     (staging + stream.len()) as u32,
                     0,
+                    true,
                 )
                 .expect("raw RDP stream replay");
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
@@ -131,6 +132,7 @@ fn main() {
             staging as u32,
             (staging + stream.len()) as u32,
             0,
+            true,
         )
         .expect("raw RDP stream replay");
     println!(

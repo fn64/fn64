@@ -110,7 +110,12 @@ impl RenderBackend for ReferenceBackend {
         start: u32,
         end: u32,
         _output_addr: u32,
+        _wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
+        // The software rasterizer has no async completion to defer -- every
+        // call is synchronous CPU work, so the flag is accepted (never
+        // ignored silently -- it is a named parameter) and always honored
+        // as `true` per the trait's documented fallback.
         gbi::validate_raw_rdp_command_range(rdram, start, end)?;
         let terminated_len = (end as usize)
             .checked_add(8)
@@ -172,6 +177,7 @@ impl RenderBackend for ReferenceBackend {
                 group.staging_start(),
                 group.staging_end(),
                 output_addr,
+                true,
             )?;
             if status != FrameStatus::Complete {
                 return Err(RenderError::Backend {

@@ -1420,6 +1420,7 @@ use super::*;
                 _start: u32,
                 _end: u32,
                 _output_addr: u32,
+                _wait_for_completion: bool,
             ) -> Result<FrameStatus, RenderError> {
                 self.0
                     .borrow_mut()
@@ -1784,6 +1785,7 @@ use super::*;
                 &[0xe900_0000, 0],
                 0,
                 8,
+                true,
                 true,
                 &mut transaction,
             )

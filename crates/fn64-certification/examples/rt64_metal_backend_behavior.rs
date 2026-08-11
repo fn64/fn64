@@ -72,8 +72,13 @@ fn submit_raw(
 ) -> Result<(Vec<u8>, RenderReleaseCapture), Box<dyn Error>> {
     let mut rdram = fixture(spec);
     let end = COMMANDS + COMMAND_COUNT * 8;
-    let status =
-        backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end as u32, spec.target)?;
+    let status = backend.process_rdp_commands(
+        &mut rdram,
+        COMMANDS as u32,
+        end as u32,
+        spec.target,
+        true,
+    )?;
     if status != FrameStatus::Complete {
         return Err(
             io::Error::other(format!("Metal raw-RDP submission returned {status:?}")).into(),
