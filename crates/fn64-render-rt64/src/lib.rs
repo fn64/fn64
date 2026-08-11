@@ -40,7 +40,7 @@ use fn64_render::{
 use fn64_render::{PresentMemory, TaskAdmissionPlan, TaskAdmissionRawWindow};
 use sha2::Digest;
 #[cfg(feature = "rt64")]
-use transaction::{NativeContextLease, NativeRdramRollback, NativeTaskMemoryRollback};
+use transaction::{NativeContextLease, NativeTaskMemoryRollback};
 
 #[cfg(feature = "rt64")]
 const RT64_GBI_TEXT_RECOGNITION_BYTES: usize = 0x18d0;
@@ -1310,22 +1310,30 @@ impl RenderBackend for Rt64Backend {
             let full_sync = fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)?;
             let mut context = NativeContextLease::take(&mut self.context)
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
-            let mut transaction = NativeRdramRollback::new(rdram, &mut self.native_rdram_preimage);
-            if let Err(reason) = context.context_mut().process_rdp_commands(
-                transaction.memory_mut(),
-                start,
-                end,
-                output_addr,
-            ) {
+            // No RDRAM rollback here, deliberately: on the only path that
+            // would read `native_rdram_preimage` (the `Err` arm below), this
+            // function calls `invalidate_native_state()`, which drops
+            // `self.context` and tears down the whole native renderer
+            // session before returning. A caller that gets `RenderError`
+            // never continues against the RDRAM this transaction touched --
+            // the session is gone. Restoring bytes that no live session will
+            // ever read is pure cost: an 8 MiB copy_from_slice on the ONLY
+            // call site this measured at 1.088ms/call RT64 FFI + 0.125ms/call
+            // rollback (2026-08-10, 4,032-call sample, this route), i.e. paid
+            // on every successful call to protect a failure path that
+            // discards the very memory it would restore.
+            if let Err(reason) =
+                context
+                    .context_mut()
+                    .process_rdp_commands(rdram, start, end, output_addr)
+            {
                 drop(context);
-                drop(transaction);
                 self.invalidate_native_state();
                 return Err(RenderError::Backend {
                     backend: "rt64",
                     reason,
                 });
             }
-            transaction.commit();
             context.restore();
             self.last_dp_full_sync = full_sync;
             Ok(FrameStatus::Complete)
