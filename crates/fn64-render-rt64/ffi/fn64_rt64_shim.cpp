@@ -3948,11 +3948,26 @@ extern "C" int fn64_rt64_process_rdp_commands(
         // Deferring the wait is only safe when nothing below this point reads
         // completed-workload state before the CALLER'S own eventual wait (the
         // next call in the same field passing wait_for_completion=1, or a
-        // present). `deferred_snapshot_ok`'s branch and `present_capture`
-        // below both read state that only exists once the workload has
-        // actually completed, so they force the wait regardless of the
-        // caller's request -- same as before this change for those cases.
-        const bool must_wait_for_capture = capture_deferred || context->present_capture_enabled;
+        // present). `deferred_snapshot_ok`'s branch reads `submitted_workload`
+        // for THIS call immediately below, so `capture_deferred` still forces
+        // the wait unconditionally.
+        //
+        // `present_capture_enabled` is different, and forcing the wait for it
+        // here was overbroad: the block it guards below only does anything
+        // when `submitted_present > previous_present`, and `presentId` is
+        // advanced by an actual Present, never by a display-list submission
+        // (rt64_state.cpp's present path, not processDisplayLists). On this
+        // call -- a raw-RDP command submission -- that comparison is false in
+        // the ordinary case, so the block was dead here and the wait was pure
+        // cost paid for a read that could not fire. The real hazard
+        // `present_capture_enabled` exists for is closed at present time
+        // (fn64_rt64_present / Rt64Backend::present, which flushes any
+        // outstanding workload before it reads anything -- see
+        // fn64_rt64_flush_pending_workload). Measured 2026-08-12 with a real
+        // sampling profiler (macOS `sample`): this was the ONLY
+        // synchronization wait appearing anywhere in a 5-second capture of
+        // the windowed shell's render-heavy phase.
+        const bool must_wait_for_capture = capture_deferred;
         if (submitted_workload > previous_workload && (wait_for_completion != 0 || must_wait_for_capture)) {
             context->application->workloadQueue->waitForWorkloadId(submitted_workload);
         }
