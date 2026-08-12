@@ -311,27 +311,26 @@ pub(crate) unsafe fn dispatch_lle_task(
         };
         let mut transaction = LiveDpcTransaction::new(submission);
         let rdp_started = gfx_started.map(|_| std::time::Instant::now());
-        // Defer the GPU-completion wait for every submission except the
-        // last one this loop will make: RT64's queue is a monotonic
-        // counter (`waitId <= workloadId`), so waiting on the LAST
-        // submission's id also waits for every earlier one in this same
-        // field's command stream -- there is no reordering risk. Nothing
-        // between here and the loop's own end reads GPU-completed state
-        // (the pushes below are pure Rust bookkeeping), so skipping the
-        // wait on non-final iterations cannot observe stale data. Measured
-        // as the majority of an ~11 ms/field cost when every iteration
-        // waited (2026-08-10, render-benchmark route, rt64 lane).
-        let wait_for_completion = index >= dp_submissions.len();
+        // Always defer the GPU-completion wait here. RT64's queue is a
+        // monotonic counter (`waitId <= workloadId`, rt64_workload_queue.cpp
+        // :93), so waiting for a later submission's id also waits for every
+        // earlier one -- there is no reordering risk from deferring past
+        // this call. Nothing between here and this task's return reads
+        // GPU-completed state: `full_sync`/`observation` are decided from
+        // the submitted command bytes and the synchronous submit-time
+        // status (`FrameStatus`/`DpFullSyncStatus`), not from waiting.
+        // `Rt64Backend::present` flushes any outstanding workload before it
+        // reads anything, which is the one place downstream that genuinely
+        // needs completed state. Measured 2026-08-10 (render-benchmark
+        // route, rt64 lane): waiting after every submission, when a task's
+        // submissions were already fully merged by the loop above, was
+        // costing ~11 ms/field with ZERO submissions actually deferred by
+        // an earlier same-task-only version of this change -- the repeated
+        // wait cost is paid ACROSS separate RSP tasks in one field
+        // (sp_tasks ~2.9/field), which this field-wide (present-flushed)
+        // version reaches and the earlier per-task version could not.
         let (full_sync, observation) = unsafe {
-            dispatch_captured_raw_rdp(
-                rdram,
-                &words,
-                start,
-                end,
-                xbus,
-                wait_for_completion,
-                &mut transaction,
-            )
+            dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, false, &mut transaction)
         };
         if let Some(started) = rdp_started {
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);

@@ -544,6 +544,11 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    pub(super) fn fn64_rt64_flush_pending_workload(
+        context: *mut RawContext,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     pub(super) fn fn64_rt64_present(
         context: *mut RawContext,
         rdram: *mut u8,

@@ -712,6 +712,11 @@ int fn64_rt64_process_rdp_commands(
     char *error,
     size_t error_capacity);
 
+int fn64_rt64_flush_pending_workload(
+    Fn64Rt64Context *context,
+    char *error,
+    size_t error_capacity);
+
 int fn64_rt64_present(
     Fn64Rt64Context *context,
     uint8_t *rdram,

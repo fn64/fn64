@@ -464,6 +464,29 @@ impl Context {
         }
     }
 
+    /// Wait for whatever workload is currently outstanding.
+    ///
+    /// `process_rdp_commands_async(.., wait_for_completion: false)` can leave
+    /// GPU work in flight. Anything about to read completed-frame state (a
+    /// present, most obviously) must flush first. Cheap when nothing is
+    /// outstanding: `waitForWorkloadId` against an already-reached id returns
+    /// immediately (rt64_workload_queue.cpp:93-95, `waitId <= workloadId`).
+    pub(crate) fn flush_pending_workload(&mut self) -> Result<(), String> {
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the context is alive and uniquely borrowed.
+        let ok = unsafe {
+            fn64_rt64_flush_pending_workload(self.0.as_ptr(), error.as_mut_ptr(), error.len())
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(error_string(
+                &error,
+                "RT64 workload flush failed without a diagnostic",
+            ))
+        }
+    }
+
     pub(crate) fn present(
         &mut self,
         memory: &fn64_runtime::PhysicalRdramRead<'_>,

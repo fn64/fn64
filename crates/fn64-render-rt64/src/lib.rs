@@ -1400,9 +1400,21 @@ impl RenderBackend for Rt64Backend {
             if let Some(footprint) = fn64_render::programmed_vi_source_footprint(vi)? {
                 footprint.validate_rdram_len(memory.len())?;
             }
-            self.context
+            let context = self
+                .context
                 .as_mut()
-                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
+            // A raw-RDP submission earlier this field may have deferred its
+            // GPU-completion wait (`process_rdp_commands_async`). Present is
+            // the one place that unconditionally must see completed state --
+            // flush before it reads anything.
+            context
+                .flush_pending_workload()
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64",
+                    reason,
+                })?;
+            context
                 .present(&memory, vi)
                 .map_err(|reason| RenderError::Backend {
                     backend: "rt64",

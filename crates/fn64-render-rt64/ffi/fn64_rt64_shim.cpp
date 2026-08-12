@@ -4004,6 +4004,34 @@ extern "C" int fn64_rt64_process_rdp_commands(
     }
 }
 
+// Wait for whatever workload is currently outstanding, regardless of which
+// call submitted it. `application->state->workloadId` is the same monotonic
+// counter `waitForWorkloadId` compares against (rt64_workload_queue.cpp:93,
+// `waitId <= workloadId`), and every submission path sets it -- reading it
+// fresh here rather than threading a caller-supplied id means this correctly
+// flushes the true latest submission even if several were made without
+// waiting. Mirrors the shutdown-flush idiom already used in
+// ~Fn64Rt64Context.
+extern "C" int fn64_rt64_flush_pending_workload(
+    Fn64Rt64Context *context,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if ((context == nullptr) || !context->setup_complete) {
+            set_error(error, error_capacity, "RT64 context is not initialized");
+            return 0;
+        }
+        context->application->workloadQueue->waitForWorkloadId(context->application->state->workloadId);
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 workload flush threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 workload flush failed with an unknown C++ exception");
+        return 0;
+    }
+}
+
 extern "C" int fn64_rt64_present(
     Fn64Rt64Context *context,
     uint8_t *rdram,
