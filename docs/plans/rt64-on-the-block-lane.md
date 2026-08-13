@@ -651,3 +651,136 @@ honest statement is **"a short burst of hitches early in the route, then none"**
    line either way.
 4. **Do not re-derive the distribution.** It is in `seq-rep1-FROZEN.log` at
    100% coverage, and the perturbation factor for that run is 0.9820.
+
+---
+
+# Addendum, 2026-08-13: the windowed RT64 lane, and where its remaining cost is
+
+Written after a session that shipped nine perf commits on
+`fix/overlay-stride-aliases`. Everything below was **measured on the windowed
+RT64 lane** (`FN64_RENDER=rt64`, `wm2000-shell`), which is what a person
+actually plays — not the headless reference lane the body of this document
+profiles. That distinction cost most of a session to notice and is the first
+finding.
+
+## Finding 0: six of nine fixes were in a backend the windowed lane never runs
+
+`FN64_RENDER` selects `reference` XOR `rt64` (`shell.rs:801`). Every windowed
+session runs `rt64`. Four of this session's commits (`10b1996`, `f46ef27`,
+`6adb548`, `10a2d68`) optimize `fn64-render-reference` — the software
+rasterizer — and are **inert on the windowed lane**. They are real, verified,
+byte-identical wins for the headless/reference lane and for this document's
+own numbers; they are not wins for what a player experiences. Check which
+backend a measurement's binary actually used before attributing a windowed
+symptom to a reference-lane fix.
+
+## Finding 1: audio starvation is a symptom of field-rate, not of audio
+
+`audio_lle_ns` is 0.773 ms/field in the fast population and 0.774 ms/field in
+the slow one — flat, ~2-5% of host-side cost, and it does **not** grow when
+frames get slower. Starvation is measured at the host CPAL callback, which
+drains on a real-time clock regardless of emulator progress. A shell comment
+already recorded the mechanism: 29,281 channel-samples/sec delivered against
+the 64,000/sec that 32 kHz stereo demands, sustained, with **zero** frame
+spikes logged. Audio starvation therefore tracks whatever fraction of
+real-time the whole emulator achieves; it cannot be fixed in the audio path.
+Session movement: ~58% → ~49.6%, entirely from CPU/graphics-side work.
+
+## Finding 2: the "it gets worse over time" report is the game, not a leak
+
+`pump_ms` p95/p99 step from ~12-16 ms to a ~27 ms plateau inside the first
+~1800 frames, then hold flat through frame 7320. Not continued decay.
+
+The cause is measurable and mundane: `gfx_submits` per unit `sim_time` is
+**~0.32 for the route's first ~1.6M sim-time units, then ~0.72-0.96 for the
+rest** — the guest submits roughly 3x more RDP work per unit of game time once
+`entrance-to-match.schedule` reaches match play. `GBI_RDP::fullSync` sample
+count roughly doubles across the same boundary. The emulator is correctly
+working harder because WM2000 is genuinely drawing more.
+
+`workload_id` vs `present_id` is **not** a backlog: present increments
+1.008/field, workload 1.332/field — a constant ratio for the whole route. The
+absolute gap grows because the rates differ by design, not because anything
+falls behind.
+
+## Finding 3: the remaining windowed cost is a wait, and the GPU is idle during it
+
+Live `sample` on the windowed process, busy/match phase:
+
+| item | share of a 25 s capture |
+|---|---:|
+| `pump_one_frame` | 35.6% |
+| `run_one_step` (guest emulation + dispatch) | 32.5% |
+| `run_catalog_block_program` (recompiled MIPS) | 30.1% |
+| `try_store_w_translated` | 7.4% |
+| RT64 `fullSync` | 3.4% |
+| RT64 `processDisplayLists` | 1.8% |
+
+Within RT64's `fullSync`, **143 of 190 samples (75%) are
+`_dispatch_semaphore_wait_slow` → `semaphore_wait_trap`**, inside
+`RT64::State::fullSync()::$_5::operator()` (the `renderAndSynchronize`
+lambda) at compiled offset +3320.
+
+**And the GPU is idle while that wait happens.** `ioreg -r -c IOAccelerator`
+`Device Utilization %` reads **0 across 8 consecutive 1-second samples** while
+the shell is in its busy phase and the CPU is blocked. Ruled out by direct
+measurement, in order: render resolution (fn64 correctly uses
+`resolution_multiplier: 1.0`, native 320x240; the 1280x960 window is
+presentation-layer scaling only), debug/validation overhead
+(`CMAKE_BUILD_TYPE=Release`, no `MTL_*`/`METAL_*` env, nothing in entitlements
+or CMake), hardware class (M5 Pro, 15 cores), and GPU saturation (0%).
+
+Two candidate waits were checked and are **not** the dominant one:
+`TextureCache::waitForGPUUploads` (3 and 6 samples in the early/late captures)
+and `checkRDRAM`'s `RenderWorkerExecution` (86 → 77 samples, i.e. flat, and
+falling as a share while other costs grow).
+
+## Finding 4: fn64 does not compile RT64's `rt64_state.cpp` at all
+
+This is the fact a future investigator most needs and it is not obvious.
+
+`crates/fn64-render-rt64/ffi/CMakeLists.txt:872-910` reads
+`${FN64_RT64_SOURCE_DIR}/src/hle/rt64_state.cpp`, asserts its SHA256 against a
+pinned literal held at `ffi/CMakeLists.txt:876` (read the value there; the
+build is the only thing that should assert it), string-replaces two exact
+contexts to inject
+`fn64_rt64_vi_retrace_event(...)` into the screen-update condition, writes the
+result to `${CMAKE_CURRENT_BINARY_DIR}/fn64_rt64_state.cpp`, marks the
+**original** `HEADER_FILE_ONLY TRUE`, and compiles only the generated copy.
+`rt64_video_interface.cpp` gets the same treatment at `:820-867`
+(`fn64_rt64_vi_filter_constants`), and `rt64_interpreter.cpp` at `:919+`.
+
+Consequences, both learned the hard way:
+
+1. **Editing `rt64_state.cpp` in the RT64 checkout has no effect on the
+   build** — the raw file is excluded from compilation.
+2. **It also breaks the build**, because the SHA256 pin fires first:
+   `CMake Error ... RT64 State changed; review the fn64 VI retrace overlay`.
+
+Temporary instrumentation of these files must therefore be added *as another
+string-replace stanza in fn64's own CMakeLists*, with the pinned hash updated
+in the same commit. That is a change to an integrity guard on a third-party
+dependency and deserves its own review; it was **not** attempted here.
+
+Also note `crates/fn64-render-rt64/build.rs` declares no
+`cargo:rerun-if-changed` for the RT64 tree, so cargo will not notice upstream
+source changes. Forcing a genuine RT64 rebuild takes
+`cargo clean -p fn64-render-rt64 --release` — deleting `out/librt64.a` and the
+`rt64-cmake-build/` directory by hand is **not** sufficient (a build that
+appears to succeed in ~3 s with an unchanged binary size has silently relinked
+a cached archive).
+
+## What this redirects to
+
+1. **Identify what `renderAndSynchronize` waits on at +3320 with the GPU
+   idle.** This is the open question. It needs either RT64 rebuilt with debug
+   line tables, or an instrumentation stanza added to fn64's CMake patch set
+   per Finding 4. Everything else in the windowed frame budget has been
+   attributed.
+2. **Do not chase audio.** Finding 1 settles it.
+3. **Do not chase a leak or a backlog.** Finding 2 settles both.
+4. **`DisplayBuffering::Triple` was tried and measured flat** (49.6-50.1%
+   starvation, tail latency unchanged); fn64 defaults to `Double` at
+   `settings.rs:249`, matching RT64 upstream. `PresentMode::Mailbox` is
+   unsupported by this Metal surface (`Fifo`/`Immediate` only) and panics.
+   Both are dead ends already paid for.
