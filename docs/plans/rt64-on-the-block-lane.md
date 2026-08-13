@@ -770,13 +770,56 @@ source changes. Forcing a genuine RT64 rebuild takes
 appears to succeed in ~3 s with an unchanged binary size has silently relinked
 a cached archive).
 
+## Finding 5: the +3320 wait is real but small; it is not the busy-phase cost
+
+Answered Finding 3's open question directly, with live numbers instead of a
+sampling profiler's offset. Extended `ffi/CMakeLists.txt`'s existing
+hash-pinned patch mechanism (Finding 4) with a new, explicitly TEMPORARY,
+opt-in stanza gated on `-DFN64_RT64_WAIT_TRACE=ON` (wired from `build.rs` via
+the `FN64_RT64_WAIT_TRACE` env var, same pattern as the existing
+`CARGO_FEATURE_*` gates). It times exactly
+`renderAndSynchronize`'s `commandList->end()` / `execute()` / `wait()` triple
+at `rt64_state.cpp:1443-1447` (the branch that actually runs whenever there
+are framebuffers to draw — the sibling `else` branch at `:1544-1558` is the
+no-render tile-only path and is not live during normal play) and prints a
+running average every 200 calls.
+
+Live numbers, same route, same windowed process:
+
+| phase | calls | wait total | avg wait/call |
+|---|---:|---:|---:|
+| light (menu), calls 0-200 | 200 | 84.35 ms | 0.4217 ms |
+| busy (match), calls 1600-1800 | 200 | 71.47 ms | 0.3848 ms |
+
+**The average is flat, and if anything slightly lower under load.** Call
+*frequency* grows with the game's own submission rate (Finding 2's ~3x), so
+the wait's **estimated per-field contribution** grows too — roughly 0.07
+ms/field early, roughly 0.43 ms/field busy — but that is 2-3% of the ~15
+ms/field step-up `pump_ms` shows (12 ms → 27 ms plateau), not the cause of
+it. The `sample` finding that put 75% of `fullSync`'s time in this wait
+(Finding 3) does not survive contact with a direct timer; treat it as an
+artifact of `sample`'s ~1 ms bucket granularity colliding with a lot of very
+short adjacent frames, not as a real attribution. **This closes the
+question Finding 3 opened, in the negative:** this wait is not where the
+busy-phase cost lives.
+
+The instrumentation stanza is left in place (inert, `OFF` by default) rather
+than deleted, since it is now proven mechanically sound (matched both
+anchors on the first real build, zero `FATAL_ERROR`s) and answering the next
+candidate wait needs the identical apparatus. Re-enable with
+`FN64_RT64_WAIT_TRACE=1`, and `cargo clean -p fn64-render-rt64 --release`
+first per Finding 4's caution about stale cached archives.
+
 ## What this redirects to
 
-1. **Identify what `renderAndSynchronize` waits on at +3320 with the GPU
-   idle.** This is the open question. It needs either RT64 rebuilt with debug
-   line tables, or an instrumentation stanza added to fn64's CMake patch set
-   per Finding 4. Everything else in the windowed frame budget has been
-   attributed.
+1. **The busy-phase ~15 ms/field step-up is not in RT64's GPU-side
+   synchronization.** Finding 5 closes that branch. The likeliest remaining
+   location is CPU-side dispatch that scales with submission rate the same
+   way `gfx_submits` does: `dispatch_lle_task`'s (RSP interpretation) share
+   of a live capture roughly doubled between the light and busy windows this
+   session (7.94% -> 17.79%, Finding 3's table), which was never itself
+   instrumented directly the way Finding 5 instruments RT64. That is the next
+   thing to time directly, not guess at from a sampling profiler.
 2. **Do not chase audio.** Finding 1 settles it.
 3. **Do not chase a leak or a backlog.** Finding 2 settles both.
 4. **`DisplayBuffering::Triple` was tried and measured flat** (49.6-50.1%
