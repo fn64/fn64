@@ -810,19 +810,70 @@ candidate wait needs the identical apparatus. Re-enable with
 `FN64_RT64_WAIT_TRACE=1`, and `cargo clean -p fn64-render-rt64 --release`
 first per Finding 4's caution about stale cached archives.
 
+## Finding 6: dispatch_lle_task's RSP-interpretation guess was wrong. RDP rasterization is the real cost, at 27.5 ms/field, measured directly.
+
+Finding 5's redirect proposed timing `dispatch_lle_task` (RSP interpretation)
+directly, since a `sample` capture showed its *symbol* share roughly doubling
+between light and busy windows. That instrumentation already exists and
+didn't need building: `PHASE_TIMING`
+(`crates/fn64-abi/src/task_dispatch/lifecycle.rs:61`, armed by
+`FN64_PHASE_TIMING`, which `--profile` arms automatically) already wraps
+`dispatch_lle_task` in `std::time::Instant` and reports real wall-clock
+ms/field for both `RSP interpretation` and `RDP rasterization` as siblings
+under `gfx_ns`, split by a fast/slow field-population census
+(`FN64_FRAME_CENSUS_POPULATIONS`, also auto-armed).
+
+Ran the same sanctioned command the file's own header prescribes,
+`./reference/wm2000-routes/render-benchmark.zsh --profile`, on the same
+1.5M-step route (byte-identical: 8/8 counters matched). Real numbers, split
+by population:
+
+| population | fields | mean ms/field | RSP interpretation | RDP rasterization |
+|---|---:|---:|---:|---:|
+| fast (menu/idle) | 3846 | 5.826 | 0.000 ms/field (0.0%) | 0.000 ms/field (0.0%) |
+| slow (match/busy) | 3853 | 48.337 | 3.881 ms/field (12.3% of gfx LLE, 0.23x budget) | **27.523 ms/field (87.4% of gfx LLE, 1.65x budget)** |
+
+**RSP interpretation is not the cost.** It is a real, present cost in the
+slow population (3.881 ms/field) but a minor one relative to the whole
+budget. **RDP rasterization is** — at 27.523 ms/field it is, by itself,
+1.65x the entire 16.667 ms/field 60fps budget, and roughly 7x larger than
+RSP interpretation. The `sample` symbol-share doubling that motivated
+Finding 5's redirect was measuring the wrong denominator (symbol-frequency
+share, not wall-clock ms/field) — the same class of error `perf-method`
+warns about, now caught by direct measurement rather than repeated.
+
+This is not a new finding out of nowhere: `docs/plans/rt64-on-the-block-lane.md:25`
+(2026-08-07, this file's own opening table) already named "RSP graphics LLE –
+raw RDP rasterization" as the single largest line in the whole system, at
+11.00 ms/field on that day's route/build. Finding 6 confirms the same
+component is still the dominant cost under the current windowed RT64 lane and
+gives its current, larger, population-split number. The `f46ef27`/`10a2d68`
+commits this session (raw-RDP row-edge precomputation, scratch-buffer reuse)
+already targeted this exact code path and were real, measured wins
+(32.764→26.571 ms/field on the reference-backend suite) — this is
+confirmation to keep cutting the same line, not a new direction.
+
+The staging-copy breakdown under RDP rasterization is small in comparison
+and already known: `staging alloc` 0.110 ms/field, `staging copy_in` 0.392
+ms/field, `staging copy_back` 1.391 ms/field — together under 7% of the
+27.523 ms/field RDP total. The remaining ~25.6 ms/field is rasterization work
+itself, not copy overhead.
+
 ## What this redirects to
 
-1. **The busy-phase ~15 ms/field step-up is not in RT64's GPU-side
-   synchronization.** Finding 5 closes that branch. The likeliest remaining
-   location is CPU-side dispatch that scales with submission rate the same
-   way `gfx_submits` does: `dispatch_lle_task`'s (RSP interpretation) share
-   of a live capture roughly doubled between the light and busy windows this
-   session (7.94% -> 17.79%, Finding 3's table), which was never itself
-   instrumented directly the way Finding 5 instruments RT64. That is the next
-   thing to time directly, not guess at from a sampling profiler.
+1. **RDP rasterization is the dominant remaining cost, measured directly
+   at 27.523 ms/field in the busy population (Finding 6), not RSP
+   interpretation.** The next concrete step is the same kind of targeted,
+   measured cut `f46ef27`/`10a2d68` already made in this area this session —
+   profile *inside* `draw_raw_rdp_triangle_impl`/`raw_pixel_coverage*` and
+   `CoverageMask` construction with `sample` while a busy-population field is
+   in flight, to find what's actually consuming the 25+ ms, rather than
+   guessing from the coarse RDP-vs-RSP split alone.
 2. **Do not chase audio.** Finding 1 settles it.
 3. **Do not chase a leak or a backlog.** Finding 2 settles both.
-4. **`DisplayBuffering::Triple` was tried and measured flat** (49.6-50.1%
+4. **Do not chase RT64's GPU-side wait.** Finding 5 settles it — flat
+   ~0.4 ms/call, 2-3% of the step-up.
+5. **`DisplayBuffering::Triple` was tried and measured flat** (49.6-50.1%
    starvation, tail latency unchanged); fn64 defaults to `Double` at
    `settings.rs:249`, matching RT64 upstream. `PresentMode::Mailbox` is
    unsupported by this Metal surface (`Fifo`/`Immediate` only) and panics.
