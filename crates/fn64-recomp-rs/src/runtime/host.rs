@@ -1144,6 +1144,7 @@ impl<'a> Rdram<'a> {
     /// the shared RDRAM/device backing layout. Physical addresses beyond the
     /// N64's 29-bit direct window remain a loud unbacked boundary after a
     /// successful TLB lookup; they are never truncated into a different page.
+    #[inline]
     fn translated_backing_address(
         ctx: &RecompContext,
         vaddr: u64,
@@ -1163,10 +1164,12 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    #[inline]
     fn translated_load_address(ctx: &RecompContext, vaddr: u64) -> Result<u64, DataAccessError> {
         Self::translated_backing_address(ctx, vaddr, DataAccessKind::Load)
     }
 
+    #[inline]
     fn translated_store_address(ctx: &RecompContext, vaddr: u64) -> Result<u64, DataAccessError> {
         Self::translated_backing_address(ctx, vaddr, DataAccessKind::Store)
     }
