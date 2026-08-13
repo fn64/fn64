@@ -297,20 +297,48 @@ fn filter_scanout(
             if !restoration_enabled {
                 continue;
             }
+            // Every interior pixel (all but the outermost ring) has exactly
+            // eight neighbors at fixed offsets -- the general form below
+            // recomputes that same 3x3 window's `saturating_sub`/`min` clamp
+            // and an `x == neighbor_x && y == neighbor_y` skip check for
+            // every pixel and every channel, when only border pixels need
+            // either. Measured live with `sample` on WM2000 (this filter is
+            // active for its RGBA16 output): restore_rgba16_component_
+            // bounded_v1 alone was ~3% of a 20s in-process capture during
+            // rasterization -- the third-largest single named cost -- and
+            // this loop is its caller.
+            let interior = x > 0 && x + 1 < width && y > 0 && y + 1 < height;
             for channel in 0..3 {
                 let center = original[pixel * 4 + channel] >> 3;
                 let mut neighbors = [0u8; 8];
-                let mut neighbor_count = 0;
-                for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
-                    for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
-                        if neighbor_x == x && neighbor_y == y {
-                            continue;
+                let neighbor_count = if interior {
+                    let row_above = pixel - width;
+                    let row_below = pixel + width;
+                    neighbors = [
+                        original[(row_above - 1) * 4 + channel] >> 3,
+                        original[row_above * 4 + channel] >> 3,
+                        original[(row_above + 1) * 4 + channel] >> 3,
+                        original[(pixel - 1) * 4 + channel] >> 3,
+                        original[(pixel + 1) * 4 + channel] >> 3,
+                        original[(row_below - 1) * 4 + channel] >> 3,
+                        original[row_below * 4 + channel] >> 3,
+                        original[(row_below + 1) * 4 + channel] >> 3,
+                    ];
+                    8
+                } else {
+                    let mut neighbor_count = 0;
+                    for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                        for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                            if neighbor_x == x && neighbor_y == y {
+                                continue;
+                            }
+                            neighbors[neighbor_count] =
+                                original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
+                            neighbor_count += 1;
                         }
-                        neighbors[neighbor_count] =
-                            original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
-                        neighbor_count += 1;
                     }
-                }
+                    neighbor_count
+                };
                 out[channel] =
                     restore_rgba16_component_bounded_v1(center, &neighbors[..neighbor_count]);
             }
