@@ -46,6 +46,7 @@ impl ReferenceBackend {
             suppress_task_diagnostics: false,
             continuation: None,
             next_continuation_token: 1,
+            raw_rdp_scratch: Vec::new(),
         }
     }
 
