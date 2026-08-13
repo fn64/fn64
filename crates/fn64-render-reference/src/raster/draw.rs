@@ -834,7 +834,11 @@ impl Framebuffer {
             }
             let mut min_left = i64::MAX;
             let mut max_right = i64::MIN;
-            for offset_y in [1, 3, 5, 7] {
+            // Every sample in `row_edges` shares its own `raw_pixel_coverage`
+            // recompute, so this is evaluated once here rather than in the
+            // per-pixel test below -- see `raw_pixel_coverage_with_row_edges`.
+            let mut row_edges = [(0i64, 0i64); 4];
+            for (row_index, offset_y) in [1, 3, 5, 7].into_iter().enumerate() {
                 let row_y_eighth = y * 8 + offset_y;
                 if row_y_eighth < yh_eighth
                     || row_y_eighth >= yl_eighth
@@ -844,6 +848,7 @@ impl Framebuffer {
                     continue;
                 }
                 let (left_x, right_x) = raw_span_edges_at_y_eighth(edge, row_y_eighth);
+                row_edges[row_index] = (left_x, right_x);
                 if right_x > left_x {
                     min_left = min_left.min(left_x);
                     max_right = max_right.max(right_x);
@@ -860,7 +865,8 @@ impl Framebuffer {
                 .clamp(0, self.width as i32);
 
             for x in min_x..max_x {
-                let coverage_mask = raw_pixel_coverage(edge, scissor, x, y);
+                let coverage_mask =
+                    raw_pixel_coverage_with_row_edges(scissor, x, y, yh_eighth, yl_eighth, row_edges);
                 let coverage = coverage_mask.coverage();
                 if coverage.count() == 0 {
                     continue;
