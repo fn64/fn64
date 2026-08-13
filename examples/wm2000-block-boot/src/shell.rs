@@ -1552,6 +1552,28 @@ impl ApplicationHandler for Shell {
 }
 
 fn main() {
+    // Default the mprotect write-barrier on for this shell: the headless
+    // benchmark (`render-benchmark.zsh`) already sets it unconditionally, and
+    // `docs/plans/perf-method.md` records it as a replicated 1.58x win (MMU
+    // dirty-page tracking replacing a full-region memcmp scan on every
+    // guest-thread mirror boundary) with byte-identical output. The windowed
+    // shell never inherited that default, so every interactive run was
+    // paying the scan: a live `sample` capture during rendering showed
+    // `_platform_memcmp` at ~51% of main-thread CPU time, gone (~0.4%) with
+    // the barrier on. Must run before `Shell::boot()` -- the flag is read
+    // through a `OnceLock` the first time an executable image binds RDRAM.
+    // Checking `var_os` (not defaulting inside `write_barrier`) preserves the
+    // escape hatch: an explicit `FN64_MPROTECT_BARRIER=` (empty) or `=0` from
+    // the caller is left alone, matching `write_barrier::requested()`'s own
+    // empty-is-off rule.
+    if std::env::var_os("FN64_MPROTECT_BARRIER").is_none() {
+        // SAFETY: single-threaded at this point in `main`, before any other
+        // code reads or writes process environment.
+        unsafe {
+            std::env::set_var("FN64_MPROTECT_BARRIER", "1");
+        }
+    }
+
     let mut shell = Shell::boot();
 
     // Headless seam self-test: drive N pumps with no window, so a machine with
