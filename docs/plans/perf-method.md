@@ -813,6 +813,35 @@ one. Note the same arithmetic style over-predicted once today (the guard fix
 beat its 25.91 ms floor because the defect double-counted itself), so treat
 this as a lower bound on the ceiling, not a guarantee.
 
+**RESOLVED, 2026-08-14: the fix shipped as `456c920` (per-call predecode
+table) BEFORE this ceiling arithmetic was checked against a real
+measurement — its own commit message says "pending unprofiled A/B
+measurement," and no entry in this file ever closed that out. Closed now.**
+Reconstructed the pre-`456c920` live-double-decode shape by temporarily
+reverting just the hot-loop lookup (`decoded[idx]` -> `decode(word, pc)`,
+`decoded.get(idx+1)` -> `decode(delay_word, pc+4)`) on top of current HEAD,
+keeping the unused `predecode_imem` call in place so only the hot path
+changed; verified with the full `fn64-audio` test suite (including
+`rsp_predecode_equivalence.rs`) before measuring, then reverted via `git
+checkout` immediately after. Interleaved 2x2 on the RT64 lane
+(`entrance-to-match.schedule`, headless, `--features rt64`,
+byte-identical `sim_time=13112786076` on all 4 runs,
+`FN64_FRAME_CENSUS_POPULATIONS=1` only):
+
+| | live double-decode | predecode table (shipped) |
+|---|---:|---:|
+| run 1 | 23.96 | 21.19 |
+| run 2 | 23.35 | 20.99 |
+| mean | 23.655 | 21.090 |
+
+**−2.565 ms/field, −10.84%**, both binaries' own run-to-run spread under
+2.6% (well inside the gap). This confirms the commit's pre-registered
+55%-of-RSP-time claim in direction and rough magnitude — real, working as
+intended, nothing to change. No code change from this entry: the
+already-shipped predecode table is correct and stays. Filed here so the
+still-open "pending unprofiled A/B measurement" note in `456c920` is not
+mistaken for a live gap by a later search of this file.
+
 ## The write barrier now SAVES 12.4 ms/field, and the GPU attribution is retracted
 
 Measured 2026-08-08 on the RT64 gameplay route (`a9e1b25e`), barrier on vs off:
