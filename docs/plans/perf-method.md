@@ -4,6 +4,16 @@ Written 2026-08-07, after a session that made **nine wrong calls** on this
 question and shipped six real wins. The wins all came from handing an agent a
 measurement. The wrong calls all came from handing one a hypothesis.
 
+**2026-08-14 addendum:** the windowed shell's ~49-50% audio starvation
+turned out to be `pump_one_frame()` (drives VI/audio DMA) called once per
+33.333ms tick instead of twice, from `fbbb5d7`'s judder-smoothing pacing
+change — a call-frequency bug in the event loop, not a per-field cost.
+Every instrument below measures per-field cost against a fixed step
+count; none of them can see event-loop call frequency in the real
+windowed binary. When a real-time symptom has no matching signal in a
+per-field profile, check the shell's own call frequency before assuming
+the bottleneck is per-field. Fixed in `58abfa0`.
+
 ## CLOSED: the choppy audio is the speed deficit. There is no audio bug.
 
 Investigated 2026-08-08 after the owner played WM2000 and reported choppy audio
