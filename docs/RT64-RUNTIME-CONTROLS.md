@@ -96,12 +96,15 @@ policy. Each replacement entry binds its position, canonical content SHA-256,
 raw `rt64.json` SHA-256, and effective database configuration. Directory
 content identity is a sorted relative-path/file-byte encoding; `.rtz` identity
 is the exact archive bytes. Machine-local absolute paths are operational input
-only and are deliberately excluded from evidence. The host hashes before and
-after C++ inspection, again after activation, and once more at release capture
-so a mutable streamed pack cannot retain a stale evidence identity.
-Configured-but-not-active inputs never enter capture, and any failed, raced,
-or subsequently changed load forgets the active replacement identity until a
-successful reload or recreation. This proves
+only and are deliberately excluded from evidence. Activation copies the
+inspected bytes into a process-owned temporary snapshot, re-inspects that copy,
+and passes only its private paths to C++. A post-activation inspection must
+still match the original identity. The snapshot then stays alive with the
+native context, so Stream policy cannot observe later edits to the caller's
+mutable pack and release capture does no per-frame filesystem walk or hashing.
+Configured-but-not-active inputs never enter capture, and any failed or raced
+load destroys native state before its snapshot is removed. An explicit reload
+or recreation is required to adopt later source-pack changes. This proves
 which policy and pack bytes were active but does not by itself close behavior
 claims. The separate synthetic Metal fixture covers DDS/mipmap, Rice selection,
 and a deterministic held-queue Stream fallback-to-final transition without

@@ -83,7 +83,12 @@ impl<'a> From<(&'a str, &'a OverlayLoadRecipeV1)> for DenseAotGenerationInput<'a
         Self {
             name,
             source_rom_start: recipe.rom_start,
-            source_rom_end: recipe.rom_end,
+            // TEXT extent, not the whole loaded image. See
+            // `overlay_recipe::generation_source_span` -- every consumer
+            // derives from that one function so their shard extents, which
+            // are folded into catalog digests, cannot disagree.
+            source_rom_end: recipe.rom_start
+                + crate::overlay_recipe::generation_source_span(recipe),
             load_start: recipe.load_start,
             text_start: recipe.text_start,
             text_end: recipe.text_end,
@@ -210,7 +215,14 @@ pub fn build_dense_aot_pack_v1(
             || input.data_start > input.data_end
             || input.data_end != input.bss_start
             || input.bss_start > input.bss_end
-            || load_end != input.data_end
+            // The dense source may cover only the TEXT extent rather than the
+            // whole loaded image. The data section is mutable -- a correct
+            // program writes it at runtime -- so a generation digested over it
+            // cannot survive execution. Require the source to cover at least
+            // the text and never exceed the loaded image, instead of demanding
+            // it equal `data_end` exactly.
+            || load_end < input.text_end
+            || load_end > input.data_end
         {
             return Err(DenseAotPackError::InvalidRangeRelations);
         }

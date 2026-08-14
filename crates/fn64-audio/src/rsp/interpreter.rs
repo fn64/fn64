@@ -40,6 +40,18 @@ pub fn run_imem(
     assert!(pc.is_multiple_of(4), "RSP PC {pc:#x} is not word-aligned");
     assert!(step_budget > 0, "RSP interpreter budget must be nonzero");
 
+    // Predecode the whole IMEM image once per call instead of decoding every
+    // step. Measured motivation (rt64 lane, 30 s in-process self-time sample):
+    // per-step decode() was 2549 self-time samples vs 655 for execute — ~55%
+    // of all RSP-interpreter time — because the loop decoded both the current
+    // word AND its delay slot on every retired step (~128k-214k decode calls
+    // per run_imem entry). This table costs <=1024 decode calls per entry
+    // (~5 entries/field), an expected ~2.5-2.8 ms/field recovery. It is exact
+    // because every pc this loop ever passes to decode is normalized into the
+    // 0x1000..=0x1ffc window, so words[idx] is always decoded at
+    // pc = 0x1000 + 4*idx — precisely the table key (see `predecode_imem`).
+    let decoded = predecode_imem(words);
+
     let mut pc = if machine.ctx.resume_address != 0 {
         let resume = 0x1000 | (machine.ctx.resume_address & 0x0fff);
         machine.ctx.resume_address = 0;
@@ -115,8 +127,16 @@ pub fn run_imem(
                 }
             }
         }
-        let instr = decode(word, pc);
-        let delay = delay_word.map(|delay_word| decode(delay_word, pc.wrapping_add(4)));
+        // In-bounds: `words.get(idx)` succeeded above and
+        // `decoded.len() == words.len()`.
+        let instr = decoded[idx];
+        // `Some` iff `delay_word` is `Some`, by construction of the table.
+        let delay = decoded.get(idx + 1).copied();
+        debug_assert_eq!(instr, decode(word, pc));
+        debug_assert_eq!(
+            delay,
+            delay_word.map(|delay_word| decode(delay_word, pc.wrapping_add(4)))
+        );
 
         let reason = match instr {
             Instr::Break => {
@@ -323,6 +343,32 @@ pub fn run_imem(
             return InterpreterResult { reason, pc, steps };
         }
     }
+}
+
+/// Decode one complete IMEM image into a table with one [`Instr`] per word:
+/// entry `i` holds `decode(words[i], 0x1000 + 4 * i as u32)` — exactly the
+/// `(word, pc)` pair the step loop passed to `decode` when it decoded per
+/// step, because [`run_imem`] normalizes every pc into the 0x1000..=0x1ffc
+/// window before decoding (entry pc, `next_pc`, decoded branch/jump targets,
+/// and the `Jr`/`Jalr` masking all preserve it).
+///
+/// INVARIANT this relies on: `decode(word, pc)` is a pure function of
+/// `(word, pc & 0x0fff)` — pc feeds only `branch_target()` and
+/// `link_address()`, both of which mask through `& 0x0FFF` after an add.
+/// Pinned by the pc-window lemma test in
+/// `tests/rsp_predecode_equivalence.rs`; the `debug_assert_eq!` pair in the
+/// step loop re-checks full equivalence on every debug-build run.
+///
+/// `pub` (rather than `pub(crate)`) solely so the integration-test crate can
+/// exercise table/per-step equivalence directly; it is also the seam where a
+/// digest-keyed cross-call cache would slot in if a measurement ever
+/// justifies one.
+pub fn predecode_imem(words: &[u32]) -> Vec<Instr> {
+    words
+        .iter()
+        .enumerate()
+        .map(|(i, &word)| decode(word, 0x1000 + (i as u32) * 4))
+        .collect()
 }
 
 fn next_pc(pc: u32) -> u32 {

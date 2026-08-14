@@ -21,7 +21,13 @@ set -eu
 
 typeset -r repo=${0:A:h:h}
 typeset -r rom=${1:?usage: capture-boot-context.zsh <rom.z64> [dest.json]}
-typeset -r dest=${2:-$HOME/Code/aki-recomp/captures/${${rom:t:r}}-boot-context.json}
+# Corpus ROM filenames carry spaces and parentheses -- "WWF No Mercy (USA)
+# (Rev A).z64" -- and run-black-box-trace rejects a trace ID that is not a
+# portable identifier. Slugify once and use it for both the trace ID and the
+# default destination, so the script works on any corpus file rather than only
+# on hand-renamed copies.
+typeset -r slug=${${${rom:t:r}//[^A-Za-z0-9]/-}//---#/-}
+typeset -r dest=${2:-$HOME/Code/aki-recomp/captures/${slug}-boot-context.json}
 
 typeset -r core=/private/tmp/fn64-mupen-core-current/mupen64plus-core/projects/unix/libmupen64plus.dylib
 typeset -r rsp=/private/tmp/fn64-rsp-hle-build/src/projects/unix/mupen64plus-rsp-hle.dylib
@@ -46,7 +52,7 @@ typeset -r out=$(mktemp -d /private/tmp/fn64-capture.XXXXXX)/run
     --producer "$build/mupen_trace" \
     --discover "$repo/target/release/fn64-discover" \
     --core "$core" --rsp "$rsp" --rom "$rom" \
-    --trace-id "$(basename "${rom:t:r}")-boot" \
+    --trace-id "${slug}-boot" \
     --steps 2000000 --timeout-seconds 420 --out-dir "$out"
 
 [[ -s "$out/boot-context.json" ]] || {

@@ -41,7 +41,10 @@ mod settings;
 pub mod vi_public_filters;
 mod vi_source;
 
-use std::{fmt, num::NonZeroU64};
+use std::{
+    fmt,
+    num::{NonZeroU32, NonZeroU64},
+};
 
 pub use geometry_task_inspection::{
     inspect_geometry_task, GeometryTaskInspection, GeometryTaskInspectionPolicy,
@@ -554,6 +557,20 @@ pub struct ViPresentation {
     pub noise_seed: u64,
 }
 
+impl ViPresentation {
+    /// Guest-programmed active digital output lines for this exact field.
+    ///
+    /// This is deliberately distinct from the physical source-row footprint:
+    /// `Y_SCALE`, interlace, fade, and repeat-line select source samples, while
+    /// `V_START` names the output rectangle. Backends that extend a source
+    /// image for filtering can retain their complete storage while hosts use
+    /// this typed extent to keep those extension rows out of interactive UI.
+    pub fn active_output_height(self) -> Option<NonZeroU32> {
+        let height = self.scanout.registers()?.active_window()?.output_height();
+        Some(NonZeroU32::new(height).expect("ViActiveWindow proves a nonzero output height"))
+    }
+}
+
 /// Memory authority for one exact VI presentation boundary.
 ///
 /// Integrated execution always supplies `Physical`. The compatibility form
@@ -629,6 +646,344 @@ pub enum ReleaseCaptureFormat {
     PostViBgra8Unorm,
 }
 
+impl ReleaseCaptureFormat {
+    pub const fn bytes_per_pixel(self) -> u32 {
+        match self {
+            Self::PostViBgra8Unorm => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReleaseCapturePixelsError {
+    ZeroDimension,
+    ZeroVisibleHeight,
+    VisibleHeightExceedsStorage { visible: u32, storage: u32 },
+    TightRowBytesOverflow,
+    RowBytesTooSmall { minimum: u32, actual: u32 },
+    ByteLengthOverflow,
+    ByteLengthMismatch { expected: usize, actual: usize },
+}
+
+impl std::fmt::Display for ReleaseCapturePixelsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroDimension => formatter.write_str("release capture dimensions must be nonzero"),
+            Self::ZeroVisibleHeight => {
+                formatter.write_str("release capture visible height must be nonzero")
+            }
+            Self::VisibleHeightExceedsStorage { visible, storage } => write!(
+                formatter,
+                "release capture visible height {visible} exceeds storage height {storage}"
+            ),
+            Self::TightRowBytesOverflow => {
+                formatter.write_str("release capture tight row byte count overflows u32")
+            }
+            Self::RowBytesTooSmall { minimum, actual } => write!(
+                formatter,
+                "release capture row pitch {actual} is smaller than the {minimum}-byte pixel row"
+            ),
+            Self::ByteLengthOverflow => {
+                formatter.write_str("release capture byte length overflows usize")
+            }
+            Self::ByteLengthMismatch { expected, actual } => write!(
+                formatter,
+                "release capture storage has {actual} bytes; layout requires exactly {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseCapturePixelsError {}
+
+/// Read-only fields of one validated owned release image.
+///
+/// This view is public so capture field reads remain concise. Only
+/// [`ReleaseCapturePixels`] can install it as an owned image, and that wrapper
+/// deliberately provides no mutable dereference: callers can edit pixel values
+/// but cannot change the vector length independently of its layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseCapturePixelsView {
+    pub format: ReleaseCaptureFormat,
+    pub width: u32,
+    pub height: u32,
+    /// Guest-programmed active output lines at the captured present.
+    /// Storage remains `height` rows so renderer evidence is never cropped.
+    pub visible_height: u32,
+    pub row_bytes: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Owned pixel storage whose format, dimensions, row pitch, and exact byte
+/// length are one validated value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseCapturePixels(ReleaseCapturePixelsView);
+
+impl ReleaseCapturePixels {
+    fn layout_byte_len(
+        format: ReleaseCaptureFormat,
+        width: u32,
+        height: u32,
+        visible_height: u32,
+        row_bytes: u32,
+    ) -> Result<usize, ReleaseCapturePixelsError> {
+        if width == 0 || height == 0 {
+            return Err(ReleaseCapturePixelsError::ZeroDimension);
+        }
+        if visible_height == 0 {
+            return Err(ReleaseCapturePixelsError::ZeroVisibleHeight);
+        }
+        if visible_height > height {
+            return Err(ReleaseCapturePixelsError::VisibleHeightExceedsStorage {
+                visible: visible_height,
+                storage: height,
+            });
+        }
+        let minimum = width
+            .checked_mul(format.bytes_per_pixel())
+            .ok_or(ReleaseCapturePixelsError::TightRowBytesOverflow)?;
+        if row_bytes < minimum {
+            return Err(ReleaseCapturePixelsError::RowBytesTooSmall {
+                minimum,
+                actual: row_bytes,
+            });
+        }
+        usize::try_from(row_bytes)
+            .ok()
+            .and_then(|row| usize::try_from(height).ok().and_then(|height| row.checked_mul(height)))
+            .ok_or(ReleaseCapturePixelsError::ByteLengthOverflow)
+    }
+
+    pub fn try_new(
+        format: ReleaseCaptureFormat,
+        width: u32,
+        height: u32,
+        visible_height: u32,
+        row_bytes: u32,
+        bytes: Vec<u8>,
+    ) -> Result<Self, ReleaseCapturePixelsError> {
+        let expected =
+            Self::layout_byte_len(format, width, height, visible_height, row_bytes)?;
+        if bytes.len() != expected {
+            return Err(ReleaseCapturePixelsError::ByteLengthMismatch {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(ReleaseCapturePixelsView {
+            format,
+            width,
+            height,
+            visible_height,
+            row_bytes,
+            bytes,
+        }))
+    }
+
+    /// Validate a caller-reused allocation before transferring its ownership.
+    /// Validation failure leaves `reuse` unchanged.
+    pub fn try_from_reused(
+        format: ReleaseCaptureFormat,
+        width: u32,
+        height: u32,
+        visible_height: u32,
+        row_bytes: u32,
+        reuse: &mut Vec<u8>,
+    ) -> Result<Self, ReleaseCapturePixelsError> {
+        let expected =
+            Self::layout_byte_len(format, width, height, visible_height, row_bytes)?;
+        if reuse.len() != expected {
+            return Err(ReleaseCapturePixelsError::ByteLengthMismatch {
+                expected,
+                actual: reuse.len(),
+            });
+        }
+        Self::try_new(
+            format,
+            width,
+            height,
+            visible_height,
+            row_bytes,
+            std::mem::take(reuse),
+        )
+    }
+
+    /// Change the validated layout and resize owned storage with zeroed new
+    /// bytes. An invalid layout leaves both metadata and storage unchanged.
+    pub fn try_resize(
+        &mut self,
+        format: ReleaseCaptureFormat,
+        width: u32,
+        height: u32,
+        visible_height: u32,
+        row_bytes: u32,
+    ) -> Result<(), ReleaseCapturePixelsError> {
+        let byte_len =
+            Self::layout_byte_len(format, width, height, visible_height, row_bytes)?;
+        self.0.bytes.resize(byte_len, 0);
+        self.0.format = format;
+        self.0.width = width;
+        self.0.height = height;
+        self.0.visible_height = visible_height;
+        self.0.row_bytes = row_bytes;
+        Ok(())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0.bytes
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.0.bytes
+    }
+
+    /// Complete rows inside the guest-programmed active output extent.
+    /// Renderer-owned extension rows remain available through [`Self::as_bytes`].
+    pub fn visible_bytes(&self) -> &[u8] {
+        let visible_len = usize::try_from(self.0.row_bytes)
+            .expect("validated row pitch fits the host")
+            .checked_mul(
+                usize::try_from(self.0.visible_height)
+                    .expect("validated visible height fits the host"),
+            )
+            .expect("validated visible byte length fits the host");
+        &self.0.bytes[..visible_len]
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0.bytes
+    }
+}
+
+impl std::ops::Deref for ReleaseCapturePixels {
+    type Target = ReleaseCapturePixelsView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod release_capture_pixels_tests {
+    use super::{ReleaseCaptureFormat, ReleaseCapturePixels, ReleaseCapturePixelsError};
+
+    #[test]
+    fn construction_binds_layout_to_exact_storage_length() {
+        let format = ReleaseCaptureFormat::PostViBgra8Unorm;
+        let pixels = ReleaseCapturePixels::try_new(format, 2, 2, 2, 12, vec![0; 24]).unwrap();
+        assert_eq!(pixels.format, format);
+        assert_eq!(
+            (
+                pixels.width,
+                pixels.height,
+                pixels.visible_height,
+                pixels.row_bytes,
+            ),
+            (2, 2, 2, 12)
+        );
+        assert_eq!(pixels.as_bytes().len(), 24);
+
+        assert_eq!(
+            ReleaseCapturePixels::try_new(format, 2, 2, 2, 8, vec![0; 15]).unwrap_err(),
+            ReleaseCapturePixelsError::ByteLengthMismatch {
+                expected: 16,
+                actual: 15,
+            }
+        );
+        assert_eq!(
+            ReleaseCapturePixels::try_new(format, 2, 2, 2, 7, vec![0; 14]).unwrap_err(),
+            ReleaseCapturePixelsError::RowBytesTooSmall {
+                minimum: 8,
+                actual: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn reused_storage_moves_only_after_validation() {
+        let format = ReleaseCaptureFormat::PostViBgra8Unorm;
+        let mut reuse = Vec::with_capacity(64);
+        reuse.resize(16, 0x5a);
+        let allocation = reuse.as_ptr();
+        let pixels =
+            ReleaseCapturePixels::try_from_reused(format, 2, 2, 2, 8, &mut reuse).unwrap();
+        assert!(reuse.is_empty());
+        assert_eq!(pixels.as_bytes().as_ptr(), allocation);
+
+        let mut reuse = pixels.into_bytes();
+        let allocation = reuse.as_ptr();
+        let error = ReleaseCapturePixels::try_from_reused(format, 2, 3, 3, 8, &mut reuse)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ReleaseCapturePixelsError::ByteLengthMismatch {
+                expected: 24,
+                actual: 16,
+            }
+        );
+        assert_eq!(reuse.as_ptr(), allocation);
+        assert_eq!(reuse.len(), 16);
+    }
+
+    #[test]
+    fn resize_is_transactional_for_invalid_layouts() {
+        let format = ReleaseCaptureFormat::PostViBgra8Unorm;
+        let mut pixels = ReleaseCapturePixels::try_new(format, 2, 2, 2, 8, vec![1; 16]).unwrap();
+        let before = pixels.clone();
+        assert_eq!(
+            pixels.try_resize(format, 3, 2, 2, 11).unwrap_err(),
+            ReleaseCapturePixelsError::RowBytesTooSmall {
+                minimum: 12,
+                actual: 11,
+            }
+        );
+        assert_eq!(pixels, before);
+
+        pixels.try_resize(format, 3, 2, 2, 16).unwrap();
+        assert_eq!(
+            (
+                pixels.width,
+                pixels.height,
+                pixels.visible_height,
+                pixels.row_bytes,
+            ),
+            (3, 2, 2, 16)
+        );
+        assert_eq!(pixels.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn visible_height_retains_renderer_extension_rows_outside_visible_prefix() {
+        let format = ReleaseCaptureFormat::PostViBgra8Unorm;
+        let row_bytes = 8;
+        let mut bytes = vec![0x11; row_bytes * 240];
+        bytes[row_bytes * 237..].fill(0xee);
+        let pixels =
+            ReleaseCapturePixels::try_new(format, 2, 240, 237, row_bytes as u32, bytes)
+                .unwrap();
+
+        assert_eq!(pixels.visible_bytes().len(), row_bytes * 237);
+        assert!(pixels.visible_bytes().iter().all(|byte| *byte == 0x11));
+        assert_eq!(pixels.as_bytes().len(), row_bytes * 240);
+        assert!(pixels.as_bytes()[row_bytes * 237..]
+            .iter()
+            .all(|byte| *byte == 0xee));
+        assert_eq!(
+            ReleaseCapturePixels::try_new(format, 2, 240, 0, 8, vec![0; 8 * 240])
+                .unwrap_err(),
+            ReleaseCapturePixelsError::ZeroVisibleHeight
+        );
+        assert_eq!(
+            ReleaseCapturePixels::try_new(format, 2, 240, 241, 8, vec![0; 8 * 240])
+                .unwrap_err(),
+            ReleaseCapturePixelsError::VisibleHeightExceedsStorage {
+                visible: 241,
+                storage: 240,
+            }
+        );
+    }
+}
+
 /// Concrete graphics API that produced an RT64 release image.
 ///
 /// This is intentionally distinct from [`RenderGraphicsApi`], which models a
@@ -697,14 +1052,18 @@ pub struct RenderReleaseCapture {
     /// recreation, fail inspection, or fail activation must never be
     /// substituted here.
     pub settings_sha256: [u8; 32],
-    pub width: u32,
-    pub height: u32,
-    pub row_bytes: u32,
-    pub format: ReleaseCaptureFormat,
+    pub pixels: ReleaseCapturePixels,
     /// Completed RT64 workload selected by this presentation.
     pub workload_id: NonZeroU64,
     pub present_id: u64,
-    pub bytes: Vec<u8>,
+}
+
+impl std::ops::Deref for RenderReleaseCapture {
+    type Target = ReleaseCapturePixelsView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pixels.0
+    }
 }
 
 impl RenderConfig {
@@ -1141,12 +1500,22 @@ pub trait RenderBackend {
     /// `process_task`; it must not be inferred from backend call history.
     /// Backends that do not implement raw command execution return a named
     /// error; the default must never pretend the range rendered successfully.
+    ///
+    /// `wait_for_completion`: when `false`, a backend MAY return before the
+    /// submitted work is complete, as long as it becomes complete no later
+    /// than this backend's next call with `wait_for_completion = true` (or
+    /// any other call that reads GPU-completed state, e.g. present).
+    /// Callers must always pass `true` for the last submission before
+    /// anything downstream needs the finished frame. A backend that has no
+    /// concept of asynchronous completion may ignore the flag and always
+    /// wait -- that is always correct, just not always fast.
     fn process_rdp_commands(
         &mut self,
         _rdram: &mut [u8],
         start: u32,
         end: u32,
         _output_addr: u32,
+        _wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
         let reason =
             format!("raw RDP command execution [{start:#010x}, {end:#010x}) is unsupported");
@@ -1247,6 +1616,22 @@ pub trait RenderBackend {
             backend: "render-release-capture",
             reason: "registered backend does not expose typed release capture".to_string(),
         })
+    }
+
+    /// Fill and return the most recent completed renderer image using a
+    /// caller-owned allocation when the backend supports it.
+    ///
+    /// On success, ownership of `reuse` moves into the returned capture and
+    /// the caller can recover it from [`ReleaseCapturePixels::into_bytes`]
+    /// after consuming the image. On failure, `reuse` remains caller-owned. The
+    /// default preserves existing backend behavior and leaves `reuse`
+    /// untouched; allocation-sensitive backends override this seam.
+    fn release_capture_into(
+        &mut self,
+        reuse: &mut Vec<u8>,
+    ) -> Result<RenderReleaseCapture, RenderError> {
+        let _ = reuse;
+        self.release_capture()
     }
 
     /// Report the concrete backend and active capabilities for fixed-cycle
@@ -1572,7 +1957,7 @@ mod tests {
             frames_presented: 0,
         };
         let error = backend
-            .process_rdp_commands(&mut [], 0x100, 0x108, 0)
+            .process_rdp_commands(&mut [], 0x100, 0x108, 0, true)
             .unwrap_err();
         assert!(error.to_string().contains("is unsupported"));
         let events = fn64_runtime::copy_unsupported_events();
@@ -1712,6 +2097,32 @@ mod tests {
             ViActiveWindow::try_from_registers(0x006c_02ec, 0x0025_01ff),
             Some(window)
         );
+    }
+
+    #[test]
+    fn active_output_height_is_owned_by_window_not_source_resampling() {
+        let mut words = [0u32; ViScanoutRegisters::WORD_COUNT];
+        words[0] = 2;
+        words[2] = 480;
+        words[9] = 0x006c_02ec;
+        words[10] = 0x0025_01ff;
+        words[12] = u32::from(ViScaleAxis::ONE);
+        words[13] = 0x0123_0200;
+        let progressive = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+            ..ViPresentation::default()
+        };
+        assert_eq!(progressive.active_output_height().unwrap().get(), 237);
+
+        words[0] |= 1 << 6;
+        words[4] = 1;
+        words[13] = 0x03ff_07ff;
+        let interlaced_resampled = ViPresentation {
+            scanout: ViScanoutState::Registers(ViScanoutRegisters::from_words(words)),
+            ..ViPresentation::default()
+        };
+        assert_eq!(interlaced_resampled.active_output_height(), progressive.active_output_height());
+        assert_eq!(ViPresentation::default().active_output_height(), None);
     }
 
     #[test]

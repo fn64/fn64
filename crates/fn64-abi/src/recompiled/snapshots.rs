@@ -957,8 +957,276 @@ pub(super) fn observe_renderer_write(event: GuestWriteEvent) {
     }
 }
 
+/// TEMPORARY (mprotect feasibility census, 2026-08-07).
+///
+/// Counts the DISTINCT 16 KiB host pages of the watched region that guest
+/// writes touch between two dispatch boundaries. That count is the number of
+/// write faults an `mprotect` write barrier would take per boundary, which is
+/// the only unknown in the fault-vs-scan comparison. Enabled by
+/// `FN64_MPROTECT_CENSUS=1`; inert otherwise.
+pub mod mprotect_census {
+    use std::cell::RefCell;
+
+    /// Apple Silicon page size; the granule an `mprotect` barrier would use.
+    const PAGE: u32 = 16384;
+
+    thread_local! {
+        static PAGES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// (boundaries, total distinct pages, histogram of pages-per-boundary).
+    ///
+    /// Process-global rather than thread-local so the at-exit report can be
+    /// printed from any thread: the counting happens on a coroutine-backed
+    /// executor thread whose thread-locals are not torn down at process exit,
+    /// so a thread-local total would never be observed.
+    static TOTALS: std::sync::Mutex<(u64, u64, Vec<u64>)> =
+        std::sync::Mutex::new((0, 0, Vec::new()));
+
+    pub fn enabled() -> bool {
+        // Read the environment once. `note_write` runs on every guest store, so
+        // a `getenv` here is itself visible in the profile.
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_MPROTECT_CENSUS").is_some())
+    }
+
+    /// Record that `[offset, offset+len)` was written.
+    pub(super) fn note_write(offset: u32, len: u32) {
+        if !enabled() {
+            return;
+        }
+        let first = offset / PAGE;
+        let last = offset.saturating_add(len.saturating_sub(1)) / PAGE;
+        PAGES.with(|pages| {
+            let mut pages = pages.borrow_mut();
+            for page in first..=last {
+                if !pages.contains(&page) {
+                    pages.push(page);
+                }
+            }
+        });
+    }
+
+    /// Close one dispatch boundary and fold its page count into the totals.
+    ///
+    /// Also arms the at-exit report on first use, so the census needs no edit
+    /// to any harness `main` -- notably not
+    /// `examples/wm2000-block-boot/src/main.rs`, whose bytes are hashed into
+    /// `DISPATCH_SOURCE_SHA256` (`build.rs:794`) and therefore into the
+    /// canonical program identity. Printing from here keeps the measured
+    /// program byte-identical to the unmeasured one.
+    pub fn note_boundary() {
+        if !enabled() {
+            return;
+        }
+        arm_report();
+        let count = PAGES.with(|pages| {
+            let mut pages = pages.borrow_mut();
+            let count = pages.len();
+            pages.clear();
+            count
+        });
+        {
+            let mut totals = TOTALS.lock().expect("mprotect census totals poisoned");
+            let (boundaries, total, histogram) = &mut *totals;
+            *boundaries += 1;
+            *total += count as u64;
+            if histogram.len() <= count {
+                histogram.resize(count + 1, 0);
+            }
+            histogram[count] += 1;
+        }
+    }
+
+    /// Register the at-exit report exactly once.
+    ///
+    /// `atexit` rather than a `Drop` guard: the counting runs on a
+    /// coroutine-backed executor thread that is not joined at process exit, so
+    /// no destructor of its would run. The totals are process-global, so the
+    /// handler can print them from whichever thread calls `exit`.
+    fn arm_report() {
+        extern "C" fn at_exit() {
+            print!("{}", report());
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            unsafe { atexit(at_exit) };
+        });
+    }
+
+    /// One line per bucket, plus the mean. Printed by the at-exit hook.
+    pub fn report() -> String {
+        {
+            let totals = TOTALS.lock().expect("mprotect census totals poisoned");
+            let (boundaries, total, histogram) = &*totals;
+            let mean = if *boundaries == 0 {
+                0.0
+            } else {
+                *total as f64 / *boundaries as f64
+            };
+            let mut out = format!(
+                "[mprotect-census] boundaries={boundaries} distinct_pages_total={total} \
+                 mean_pages_per_boundary={mean:.4}\n"
+            );
+            for (count, hits) in histogram.iter().enumerate() {
+                if *hits == 0 {
+                    continue;
+                }
+                let share = 100.0 * *hits as f64 / *boundaries.max(&1) as f64;
+                out.push_str(&format!(
+                    "[mprotect-census]   {count:>4} page(s): {hits:>10} boundaries ({share:5.2}%)\n"
+                ));
+            }
+            out
+        }
+    }
+}
+
+/// TEMPORARY (generation-activation census, 2026-08-07).
+///
+/// Counts physically backed catalog activations per generation, splitting
+/// first-time activations from re-activations of an already-live image. A
+/// re-activation re-reads and re-hashes the generation's whole image through
+/// its backing, so `reactivated * bytes` is the SHA-256 volume the route pays
+/// purely to re-prove images it already proved.
+///
+/// This exists because the WM2000 "entrance hang" profiles as 88%
+/// `activate_for_fetch` / 54% raw SHA-256: the question is whether that is one
+/// expensive activation or millions of cheap-looking repeats.
+///
+/// Enabled by `FN64_ACTIVATION_CENSUS=1`; inert otherwise. It installs itself
+/// through the public `set_backed_generation_activation_observer_v1` seam and
+/// prints from `atexit`, so no harness `main` is edited -- notably not
+/// `examples/wm2000-block-boot/src/main.rs`, whose bytes are hashed into the
+/// canonical program identity.
+pub mod activation_census {
+    /// generation id -> (activations, reactivations, unused, retired count)
+    static TOTALS: std::sync::Mutex<Option<std::collections::BTreeMap<u64, [u64; 4]>>> =
+        std::sync::Mutex::new(None);
+
+    /// (selected generation, requested pc) -> activations. Answers "is one PC
+    /// alternating between two generations, or are two PCs each stable?" --
+    /// the question that separates a genuine A/B overlay swap from a
+    /// retirement artifact.
+    #[allow(clippy::type_complexity)]
+    static BY_PC: std::sync::Mutex<Option<std::collections::BTreeMap<(u64, u32), u64>>> =
+        std::sync::Mutex::new(None);
+
+    /// (activated generation, retired generation) -> count.
+    #[allow(clippy::type_complexity)]
+    static RETIREMENTS: std::sync::Mutex<Option<std::collections::BTreeMap<(u64, u64), u64>>> =
+        std::sync::Mutex::new(None);
+
+    pub fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_ACTIVATION_CENSUS").is_some())
+    }
+
+    fn observe(observation: &fn64_recomp_rs::BackedGenerationActivationObservationV1) {
+        let mut guard = TOTALS.lock().expect("activation census poisoned");
+        let totals = guard.get_or_insert_with(std::collections::BTreeMap::new);
+        let slot = totals.entry(observation.generation.get()).or_insert([0; 4]);
+        slot[0] += 1;
+        if !observation.newly_activated {
+            slot[1] += 1;
+        }
+        slot[3] += observation.retired.len() as u64;
+        drop(guard);
+
+        let mut guard = BY_PC.lock().expect("activation census poisoned");
+        let by_pc = guard.get_or_insert_with(std::collections::BTreeMap::new);
+        *by_pc
+            .entry((
+                observation.generation.get(),
+                observation.requested_pc.get(),
+            ))
+            .or_insert(0) += 1;
+        drop(guard);
+
+        let mut guard = RETIREMENTS.lock().expect("activation census poisoned");
+        let retirements = guard.get_or_insert_with(std::collections::BTreeMap::new);
+        for retired in &observation.retired {
+            *retirements
+                .entry((observation.generation.get(), retired.get()))
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// Install the observer and arm the at-exit report. Idempotent.
+    pub fn install() {
+        if !enabled() {
+            return;
+        }
+        fn64_recomp_rs::set_backed_generation_activation_observer_v1(Some(observe));
+        extern "C" fn at_exit() {
+            print!("{}", report());
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            extern "C" {
+                fn atexit(f: extern "C" fn()) -> i32;
+            }
+            unsafe { atexit(at_exit) };
+        });
+    }
+
+    pub fn report() -> String {
+        let guard = TOTALS.lock().expect("activation census poisoned");
+        let Some(totals) = guard.as_ref() else {
+            return String::from("[activation-census] no activations observed\n");
+        };
+        let mut out = String::new();
+        let mut all = 0u64;
+        let mut re = 0u64;
+        for (generation, [activations, reactivations, _, retired]) in totals {
+            all += *activations;
+            re += *reactivations;
+            out.push_str(&format!(
+                "[activation-census] generation={generation} activations={activations} \
+                 reactivations={reactivations} retired_others={retired}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "[activation-census] total_activations={all} total_reactivations={re}\n"
+        ));
+        drop(guard);
+
+        let guard = RETIREMENTS.lock().expect("activation census poisoned");
+        if let Some(retirements) = guard.as_ref() {
+            for ((activated, retired), count) in retirements {
+                out.push_str(&format!(
+                    "[activation-census] retire activated={activated} retired={retired} \
+                     count={count}\n"
+                ));
+            }
+        }
+        drop(guard);
+
+        let guard = BY_PC.lock().expect("activation census poisoned");
+        if let Some(by_pc) = guard.as_ref() {
+            let mut rows = by_pc.iter().collect::<Vec<_>>();
+            rows.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(**count));
+            for ((generation, pc), count) in rows.into_iter().take(24) {
+                out.push_str(&format!(
+                    "[activation-census] pc generation={generation} pc=0x{pc:08x} \
+                     activations={count}\n"
+                ));
+            }
+        }
+        out
+    }
+}
+
 pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     let (offset, len) = event.range();
+    mprotect_census::note_write(offset, len);
     if event.channel() == WriterChannel::CpuInstructionStore {
         CPU_INSTRUCTION_STORE_TRACE.with(|trace| {
             if let Some(trace) = trace.borrow_mut().as_mut() {
@@ -980,15 +1248,89 @@ pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
     observe_renderer_write(event);
 }
 
+/// Whether one committed guest write must break the current block.
+///
+/// This is separate from [`record_executable_and_renderer_write`] above, which
+/// feeds `PENDING_ATTRIBUTED_EXECUTABLE_WRITES` and the journal. **Attribution
+/// stays wide**: narrowing it is what produced the `events=0 declarations=0`
+/// bug documented at the fallback in `track_catalog_nested_mutation` below.
+/// Only the boundary narrows here.
+///
+/// A write is a boundary when it lands in the watched executable region AND
+/// some generation backed by those bytes is currently resident. A write to
+/// bytes no resident generation backs cannot invalidate a live translation, so
+/// the block chains on.
+///
+/// # Why the un-resident case is safe
+///
+/// The obvious counterexample -- write bytes while nothing is resident, then
+/// activate a generation over them and execute stale code -- cannot happen.
+/// `activate_for_fetch_with_digest`
+/// (`fn64-recomp-rs` `generation/mod.rs:771`) computes `live_digest` from LIVE
+/// memory and compares it against `expected_sha256` for every containing
+/// candidate **unconditionally and before** consulting `self.active`; the
+/// `already_active` short-circuit happens after that loop. So a later
+/// activation over bytes changed earlier re-digests the changed bytes and
+/// returns `AotMiss`/`NoGenerationMatched` instead of activating.
+///
+/// `guest_write_token` would be the way to cache this, and it has no non-test
+/// consumers, so no activation path bypasses the digest.
+/// Kill switch restoring the pre-residency behaviour: every watched-region
+/// write breaks the block. This is the A/B control the speedup is measured
+/// against, and an escape hatch if the predicate is ever suspected.
+fn resident_boundary_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    // Read once. This is consulted on every watched store, so an uncached
+    // `env::var_os` would scan the environment millions of times per route.
+    *DISABLED.get_or_init(|| std::env::var_os("FN64_DISABLE_RESIDENT_BOUNDARY").is_some())
+}
+
 pub(super) fn classify_live_executable_write(event: GuestWriteEvent) -> GuestWriteBoundary {
     let (start, len) = event.range();
     let end = start.saturating_add(len);
-    if EXECUTABLE_WRITE_RANGES.with(|ranges| {
+    if !EXECUTABLE_WRITE_RANGES.with(|ranges| {
         ranges
             .borrow()
             .iter()
             .any(|&(physical_start, physical_end)| start < physical_end && end > physical_start)
     }) {
+        return GuestWriteBoundary::Continue;
+    }
+    if resident_boundary_disabled() {
+        return GuestWriteBoundary::ExecutableChanged;
+    }
+    // Unanswerable means "assume resident", because a permissive answer would
+    // let stale translated code execute. There are three ways to be
+    // unanswerable, and all three must break the block:
+    //
+    //  - `HOST` is already borrowed. This is REACHED, not theoretical:
+    //    `advance_device_time_step` issues device writes from inside its own
+    //    `with_host` closure, so `with_host` here would be a nested
+    //    `borrow_mut` and a hard abort. Hence `try_with_host`.
+    //  - no canonical program is installed.
+    //  - the generation catalog is itself already borrowed.
+    // Answer the question INSIDE the closure, against a borrow. The previous
+    // form cloned the program out of `HOST` first, and
+    // `CanonicalLiveBlockProgramV1` is `Clone` but not free: every field is an
+    // `Rc` except `bootstrap_evidence`, which is an owned
+    // `BootstrapOrImportValidationEvidenceV1` that deep-clones. On a path that
+    // runs on EVERY store into the watched region that allocation-and-free pair
+    // was 4.17% of total runtime, and the clone was never used for anything but
+    // calling one `&self` method.
+    //
+    // This holds `HOST` while `generations.try_borrow()` runs, which is a
+    // NARROWER window than before -- the clone already ran under the same
+    // borrow -- and the inner borrow stays `try_borrow`, so a contended catalog
+    // still resolves conservatively rather than panicking.
+    let resident = crate::try_with_host(|host| {
+        host.canonical_recompiled_program
+            .as_ref()
+            .and_then(|live| live.resident_backing_intersects(start, end))
+    })
+    .flatten()
+    .unwrap_or(true);
+    if resident {
         GuestWriteBoundary::ExecutableChanged
     } else {
         GuestWriteBoundary::Continue

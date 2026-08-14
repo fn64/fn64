@@ -23,43 +23,23 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const BOOT_SHARD_BYTES: usize = 64 * 1024;
-const PREPARED_PACKAGES: [&str; 35] = [
-    "wm2000-block-overlay-0-shard-00",
-    "wm2000-block-overlay-0-shard-01",
-    "wm2000-block-overlay-0-shard-02",
-    "wm2000-block-overlay-1-shard-00",
-    "wm2000-block-overlay-2-shard-00",
-    "wm2000-block-overlay-2-shard-01",
-    "wm2000-block-overlay-2-shard-02",
-    "wm2000-block-overlay-2-shard-03",
-    "wm2000-block-overlay-2-shard-04",
-    "wm2000-block-overlay-2-shard-05",
-    "wm2000-block-overlay-3-shard-00",
-    "wm2000-block-overlay-3-shard-01",
-    "wm2000-block-overlay-3-shard-02",
-    "wm2000-block-overlay-3-shard-03",
-    "wm2000-block-overlay-3-shard-04",
-    "wm2000-block-overlay-3-shard-05",
-    "wm2000-block-overlay-3-shard-06",
-    "wm2000-block-overlay-3-shard-07",
-    "wm2000-block-resident-tail-shard-00",
-    "wm2000-block-resident-tail-shard-01",
-    "wm2000-block-shard-00",
-    "wm2000-block-shard-01",
-    "wm2000-block-shard-02",
-    "wm2000-block-shard-03",
-    "wm2000-block-shard-04",
-    "wm2000-block-shard-05",
-    "wm2000-block-shard-06",
-    "wm2000-block-shard-07",
-    "wm2000-block-shard-08",
-    "wm2000-block-shard-09",
-    "wm2000-block-shard-10",
-    "wm2000-block-shard-11",
-    "wm2000-block-shard-12",
-    "wm2000-block-shard-13",
-    "wm2000-block-shard-14",
-];
+/// Same shard granularity as the `u32` the recipe extents use.
+const SHARD_BYTES_U32: u32 = 64 * 1024;
+/// The one shard inventory, shared verbatim with the shard generator, the
+/// prepared materializer and the verifier. See
+/// `../wm2000-block-shards/shard_inventory.in`.
+const SHARD_INVENTORY: &[(&str, &str)] =
+    &include!("../wm2000-block-shards/shard_inventory.in");
+const SHARD_COUNT: usize = SHARD_INVENTORY.len();
+const PREPARED_PACKAGES: [&str; SHARD_COUNT] = {
+    let mut packages = [""; SHARD_COUNT];
+    let mut index = 0;
+    while index < SHARD_COUNT {
+        packages[index] = SHARD_INVENTORY[index].0;
+        index += 1;
+    }
+    packages
+};
 
 struct PreparedCandidateReceipts {
     source_mode: String,
@@ -167,7 +147,7 @@ fn prepared_candidate_receipts() -> PreparedCandidateReceipts {
     let lines = manifest_text.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 7 + PREPARED_PACKAGES.len());
     assert_eq!(lines[0], "schema fn64.wm-prepared-shard-tree.v2");
-    assert_eq!(lines[6], "artifact_count 35");
+    assert_eq!(lines[6], format!("artifact_count {}", PREPARED_PACKAGES.len()));
     let mut tree = Sha256::new();
     tree.update(b"fn64.wm-prepared-shard-complete-tree.v1\0");
     push_bytes(&mut tree, b"manifest.v2");
@@ -303,8 +283,8 @@ fn cargo_source_receipts() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     manifests.sort();
     assert_eq!(
         manifests.len(),
-        35,
-        "trusted WM generated source graph must contain exactly 35 shard manifests"
+        SHARD_COUNT,
+        "trusted WM generated source graph must contain exactly {SHARD_COUNT} shard manifests"
     );
     shard_sources.extend(manifests);
     let shard_cargo_source_tree_sha256 =
@@ -431,10 +411,14 @@ fn main() {
         &overlay_recovery,
     )
     .expect("wm2000-block-boot build.rs: recovering one complete overlay recipe table");
-    assert_eq!(
-        overlay_recipes.len(),
-        4,
-        "wm2000-block-boot build.rs: NWXE closure requires four recovered overlay generations"
+    // Overlay COUNT is a property of the ROM, not of this lane: discovery
+    // recovers 4 for WM2000, 5 for No Mercy, 2 for Revenge and World Tour, and
+    // 4 for VPW2. Pinning it at 4 made the lane WM2000-only for no reason --
+    // every geometry below is already derived from `overlay_recipes` itself.
+    // What the lane genuinely requires is at least one recovered overlay.
+    assert!(
+        !overlay_recipes.is_empty(),
+        "wm2000-block-boot build.rs: closure requires at least one recovered overlay generation"
     );
     let overlay_names = (0..overlay_recipes.len())
         .map(|index| format!("recovered_overlay_{index}"))
@@ -580,6 +564,11 @@ fn main() {
     let guest_thread_globals =
         fn64_discover::host_bindings::discover_guest_thread_globals(dense_words, va_start)
             .expect("wm2000-block-boot build.rs: discovering guest thread globals");
+    // Optional: a cartridge-only title has no 64DD drive-init routine at all,
+    // so absence is normal and only an ambiguous shape is an error.
+    let drive_rom_init =
+        fn64_discover::host_bindings::discover_drive_rom_init_host_binding(dense_words, va_start)
+            .expect("wm2000-block-boot build.rs: discovering 64DD drive init");
     let binding_address = |symbol| {
         resident_host_bindings
             .iter()
@@ -658,15 +647,29 @@ fn main() {
             }
         })
         .collect::<Vec<_>>();
+    // Shard counts follow from the boot bank size and where the FIRST overlay
+    // loads, both of which are per-ROM: WM2000 splits 15 + 2, other titles
+    // split elsewhere. The invariant the lane actually needs is that the two
+    // halves together tile the bank and that the prepared package inventory
+    // has a shard for each, which the topology checks below enforce.
+    let expected_total_shards = PREPARED_PACKAGES
+        .iter()
+        .filter(|name| {
+            name.starts_with("wm2000-block-shard-")
+                || name.starts_with("wm2000-block-resident-tail-shard-")
+        })
+        .count();
     assert_eq!(
+        boot_shards.len() + resident_tail_shards.len(),
+        expected_total_shards,
+        "resident topology must tile the boot bank across the prepared packages: \
+         {} boot + {} tail vs {expected_total_shards} prepared",
         boot_shards.len(),
-        15,
-        "NWXE static-prefix package topology must cover exactly 15 shards"
-    );
-    assert_eq!(
         resident_tail_shards.len(),
-        2,
-        "NWXE resident-tail package topology must cover exactly two shards"
+    );
+    assert!(
+        !boot_shards.is_empty() && !resident_tail_shards.is_empty(),
+        "resident split must produce both a static prefix and a resident tail"
     );
     assert_eq!(
         boot_shards.last().map(|shard| {
@@ -717,7 +720,9 @@ fn main() {
         })
         .collect::<Vec<_>>();
     for (name, recipe) in overlay_names.iter().zip(&overlay_recipes) {
-        let source = &rom.bytes[recipe.rom_start as usize..recipe.rom_end as usize];
+        let source_rom_end =
+            recipe.rom_start + fn64_discover::overlay_recipe::generation_source_span(recipe);
+        let source = &rom.bytes[recipe.rom_start as usize..source_rom_end as usize];
         for (shard_index, bytes) in source.chunks(BOOT_SHARD_BYTES).enumerate() {
             let words = bytes
                 .chunks_exact(4)
@@ -809,6 +814,18 @@ fn main() {
         "pub const ENTRY_BANK_ID: u64 = {entry_bank_id:#018X};"
     );
     let _ = writeln!(pack, "pub const ENTRYPOINT: u32 = {entrypoint:#010X};");
+    // The once-only guard the guest's own 64DD init tests. Presetting it makes
+    // that routine take its already-initialised path, which returns the same
+    // static OSPiHandle* without probing a drive this cartridge has no device
+    // for. `None` for a title with no such routine.
+    let _ = match drive_rom_init {
+        Some(found) => writeln!(
+            pack,
+            "pub const DRIVE_ROM_INIT_GUARD: Option<u32> = Some({:#010X});",
+            found.guard_vram
+        ),
+        None => writeln!(pack, "pub const DRIVE_ROM_INIT_GUARD: Option<u32> = None;"),
+    };
     let _ = writeln!(
         pack,
         "pub const OS_SI_DEVICE_BUSY: u32 = {os_si_device_busy:#010X};"
@@ -907,8 +924,39 @@ fn main() {
         "pub const PREPARED_SOURCE_MODE: &str = {:?};",
         prepared.source_mode
     );
+    // The normalized-ROM digest is emitted UNCONDITIONALLY, not only in
+    // prepared mode. It is the identity a release build checks the user's ROM
+    // against at startup, so a build that left it all-zero would silently
+    // accept the wrong ROM -- worse than baking the words in. `rom.sha256` is
+    // the digest of the normalized big-endian image, which is also the form
+    // the shard geometry offsets index.
+    let normalized_rom_sha256 = {
+        let hex_digits = rom.sha256.as_bytes();
+        assert_eq!(
+            hex_digits.len(),
+            64,
+            "normalized ROM digest is a canonical SHA-256"
+        );
+        let mut digest = [0u8; 32];
+        for (index, pair) in hex_digits.chunks_exact(2).enumerate() {
+            let nibble = |c: u8| match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => panic!("normalized ROM digest is not hexadecimal"),
+            };
+            digest[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+        }
+        digest
+    };
+    if prepared.source_mode != "legacy_without_prepared_candidate" {
+        assert_eq!(
+            prepared.normalized_rom_sha256, normalized_rom_sha256,
+            "prepared receipts and the build ROM must name one image"
+        );
+    }
     for (name, digest) in [
-        ("NORMALIZED_ROM_SHA256", prepared.normalized_rom_sha256),
+        ("NORMALIZED_ROM_SHA256", normalized_rom_sha256),
         ("PREPARED_MANIFEST_SHA256", prepared.manifest_sha256),
         ("PREPARED_TREE_SHA256", prepared.tree_sha256),
         (
@@ -1018,7 +1066,9 @@ fn main() {
         .zip(&overlay_dense_pack.generations)
         .enumerate()
     {
-        let source = &rom.bytes[recipe.rom_start as usize..recipe.rom_end as usize];
+        let source_rom_end =
+            recipe.rom_start + fn64_discover::overlay_recipe::generation_source_span(recipe);
+        let source = &rom.bytes[recipe.rom_start as usize..source_rom_end as usize];
         let _ = writeln!(
             pack,
             "pub static OVERLAY_{index}_SHARDS: &[DenseShard] = &["
@@ -1069,7 +1119,16 @@ fn main() {
         .zip(&overlay_dense_pack.generations)
         .enumerate()
     {
-        let digest = recipe
+        // The generation is the TEXT extent only: the data section past it is
+        // mutable, and digesting it made a correct program invalidate its own
+        // generation. Generations may now end mid-shard, so this is exact.
+        // Same span as image_end below and as the shard source above, all
+        // from `generation_source_span`.
+        let digest_rom_end =
+            recipe.rom_start + fn64_discover::overlay_recipe::generation_source_span(recipe);
+        let digest: Vec<u8> =
+            Sha256::digest(&rom.bytes[recipe.rom_start as usize..digest_rom_end as usize]).to_vec();
+        let _full_image_digest = recipe
             .loaded_sha256
             .as_bytes()
             .chunks_exact(2)
@@ -1083,7 +1142,7 @@ fn main() {
             "    OverlayGeneration {{ id: {:#018X}, image_start: {:#010X}, image_end: {:#010X}, invalidation_start: {:#010X}, invalidation_end: {:#010X}, sha256: {digest:?}, shards: OVERLAY_{index}_SHARDS }},",
             generation.bank_id,
             recipe.load_start,
-            recipe.data_end,
+            recipe.load_start + fn64_discover::overlay_recipe::generation_source_span(recipe),
             recipe.load_start,
             recipe.bss_end,
         );
@@ -1091,17 +1150,78 @@ fn main() {
     let _ = writeln!(pack, "];");
     let _ = writeln!(
         pack,
-        "pub struct ExternalExecutableImage {{ pub image_id: &'static str, pub generation: u64, pub bank_id: u64, pub va_start: u32, pub va_end: u32, pub sha256_hex: &'static str, pub sha256: [u8; 32], pub words: &'static [u32] }}"
+        // A plain struct of geometry plus a plain `words()` method that reads
+        // the user's ROM. No `Deref`, no lazily-materializing static: on the
+        // release-critical "no copyrighted content" path the absence of
+        // embedded words should be auditable by reading this, and a clever
+        // container that produces ROM words on first deref is not.
+        //
+        // `words()` recovers from the ROM on each call. The only caller that
+        // runs per-execution is `verify_precompiled_words` on the exception
+        // vector, over 4 words; the rest are startup. Callers keep the same
+        // `&[u32]`-shaped argument, so `verify_precompiled_words` and
+        // `CodeBank::new` are unchanged.
+        "pub struct ExternalExecutableImage {{ pub image_id: &'static str, pub generation: u64, pub bank_id: u64, pub va_start: u32, pub va_end: u32, pub sha256_hex: &'static str, pub sha256: [u8; 32], pub rom_start: u32, pub rom_end: u32 }}\n\
+         impl ExternalExecutableImage {{\n\
+         \x20   /// This image's instruction words, read from the user's ROM at the\n\
+         \x20   /// offsets recorded at build time. Nothing is embedded; the caller\n\
+         \x20   /// verifies the result against `self.sha256`, exactly as it did\n\
+         \x20   /// when these words were a baked array.\n\
+         \x20   pub fn words(&self) -> Vec<u32> {{\n\
+         \x20       fn64_recomp_rs::shard_words(self.rom_start, self.rom_end)\n\
+         \x20           .unwrap_or_else(|error| panic!(\"external executable image {{:?}} cannot recover its words from the user's ROM: {{error}}\", self.image_id))\n\
+         \x20   }}\n\
+         \x20   /// How many instruction words this image has, WITHOUT reading the ROM.\n\
+         \x20   ///\n\
+         \x20   /// A count is pure geometry, so it must not require a published ROM.\n\
+         \x20   /// The startup banner prints this before `load_rom` runs; calling\n\
+         \x20   /// `words()` there panicked, because recovery needs an image that\n\
+         \x20   /// does not exist yet. Length is derivable from the extent alone.\n\
+         \x20   pub fn word_count(&self) -> usize {{\n\
+         \x20       ((self.rom_end - self.rom_start) / 4) as usize\n\
+         \x20   }}\n\
+         }}"
     );
-    for (index, vector_bank) in vector_banks.iter().enumerate() {
-        let _ = write!(
-            pack,
-            "pub static EXTERNAL_IMAGE_{index:02}_WORDS: &[u32] = &["
-        );
-        for word in &vector_bank.blocks[0].words {
-            let _ = write!(pack, "{word:#010X}, ");
+    // Captured exception-vector images are ROM content too, so they are
+    // located in the ROM and emitted as geometry rather than as literal words.
+    // The audit established that WM2000's one image (4 words at VA 0x80000180)
+    // appears verbatim at ROM 0x37380; this searches rather than hardcodes so
+    // the failure is loud on any ROM or route where it does not hold.
+    //
+    // The search must find EXACTLY ONE occurrence. A unique match is what makes
+    // the offset an identity; several matches would make the choice arbitrary,
+    // and this is small enough (16 bytes) that coincidence is a real risk worth
+    // rejecting rather than tie-breaking.
+    let mut external_image_rom_offsets: Vec<u32> = Vec::with_capacity(vector_banks.len());
+    for vector_bank in &vector_banks {
+        let needle: Vec<u8> = vector_bank.blocks[0]
+            .words
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect();
+        let mut found: Option<usize> = None;
+        let mut occurrences = 0usize;
+        for offset in (0..rom.bytes.len().saturating_sub(needle.len())).step_by(4) {
+            if rom.bytes[offset..offset + needle.len()] == needle[..] {
+                occurrences += 1;
+                if found.is_none() {
+                    found = Some(offset);
+                }
+                if occurrences > 1 {
+                    break;
+                }
+            }
         }
-        let _ = writeln!(pack, "];");
+        let offset = match (found, occurrences) {
+            (Some(offset), 1) => offset,
+            (_, count) => panic!(
+                "captured exception image {:?} (generation {}) has {count} word-aligned \
+                 occurrences in the ROM; exactly one is required for it to be emitted as \
+                 geometry instead of embedded words",
+                vector_bank.bank, count
+            ),
+        };
+        external_image_rom_offsets.push(u32::try_from(offset).expect("ROM offset exceeds u32"));
     }
     let _ = writeln!(
         pack,
@@ -1120,9 +1240,11 @@ fn main() {
             .collect::<Vec<_>>();
         let block = &vector_bank.blocks[0];
         let va_end = block.start_va + block.words.len() as u32 * 4;
+        let rom_start = external_image_rom_offsets[index];
+        let rom_end = rom_start + block.words.len() as u32 * 4;
         let _ = writeln!(
             pack,
-            "    ExternalExecutableImage {{ image_id: {:?}, generation: {}, bank_id: {:#018X}, va_start: {:#010X}, va_end: {va_end:#010X}, sha256_hex: {:?}, sha256: {digest_bytes:?}, words: EXTERNAL_IMAGE_{index:02}_WORDS }},",
+            "    ExternalExecutableImage {{ image_id: {:?}, generation: {}, bank_id: {:#018X}, va_start: {:#010X}, va_end: {va_end:#010X}, sha256_hex: {:?}, sha256: {digest_bytes:?}, rom_start: {rom_start:#010X}, rom_end: {rom_end:#010X} }},",
             image.capture.image_id,
             image.capture.generation,
             vector_bank.bank_id,

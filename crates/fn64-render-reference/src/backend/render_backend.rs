@@ -110,7 +110,12 @@ impl RenderBackend for ReferenceBackend {
         start: u32,
         end: u32,
         _output_addr: u32,
+        _wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
+        // The software rasterizer has no async completion to defer -- every
+        // call is synchronous CPU work, so the flag is accepted (never
+        // ignored silently -- it is a named parameter) and always honored
+        // as `true` per the trait's documented fallback.
         gbi::validate_raw_rdp_command_range(rdram, start, end)?;
         let terminated_len = (end as usize)
             .checked_add(8)
@@ -118,7 +123,15 @@ impl RenderBackend for ReferenceBackend {
                 backend: "reference",
                 reason: "raw RDP terminator address overflow".to_string(),
             })?;
-        let mut image = rdram.to_vec();
+        // Reuse the scratch buffer's allocation across the ~18,838 raw-RDP
+        // tasks/route instead of `rdram.to_vec()`ing a fresh 8 MiB copy every
+        // call. `take` leaves an empty Vec in `self` for the duration of this
+        // call (nothing else reads it -- it holds no state between calls,
+        // see the field doc) and the used buffer is put back at the end so
+        // the next call inherits its capacity.
+        let mut image = std::mem::take(&mut self.raw_rdp_scratch);
+        image.clear();
+        image.extend_from_slice(rdram);
         image.resize(terminated_len.max(image.len()), 0);
         image[end as usize..end as usize + 4].copy_from_slice(&0xdf00_0000u32.to_ne_bytes());
         image[end as usize + 4..end as usize + 8].copy_from_slice(&0u32.to_ne_bytes());
@@ -139,6 +152,7 @@ impl RenderBackend for ReferenceBackend {
         if result.is_ok() {
             rdram.copy_from_slice(&image[..rdram.len()]);
         }
+        self.raw_rdp_scratch = image;
         result
     }
 
@@ -172,6 +186,7 @@ impl RenderBackend for ReferenceBackend {
                 group.staging_start(),
                 group.staging_end(),
                 output_addr,
+                true,
             )?;
             if status != FrameStatus::Complete {
                 return Err(RenderError::Backend {

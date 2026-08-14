@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 # The interactive lane. A SECOND BINARY of this package rather than its own
 # crate, deliberately: both binaries then share this package's one `build.rs`
-# ROM discovery, its one `OUT_DIR` pack, and the 35 already-compiled generated
+# ROM discovery, its one `OUT_DIR` pack, and the already-compiled generated
 # shard crates -- and both construct their program through the same
 # `src/block_program.rs`, so the windowed lane cannot drift from the certified
 # headless one.
@@ -30,6 +30,16 @@ dynamic-withheld = [
     "fn64-abi/dynamic-mapped-runtime",
     "fn64-recomp-rs/dynamic-mapped-runtime",
 ]
+# Builds the native MIT RT64 renderer behind `FN64_RENDER=rt64`. NON-DEFAULT,
+# exactly as in `../wm2000-boot/Cargo.toml:20`: the native build needs
+# `FN64_RT64_DIR` pointing at an MIT RT64 checkout, plus a GPU and a display
+# server at run time, so CI and no-GPU hosts must keep building without it.
+#
+# `fn64-render-rt64` itself is an UNCONDITIONAL dependency (same as
+# wm2000-boot): its Rust surface compiles pure-Rust with the feature off, and
+# `Rt64Backend::create` then returns an error rather than failing to compile.
+# That is what lets one selector arm exist in `src/main.rs` for both builds.
+rt64 = ["fn64-render-rt64/rt64"]
 
 [dependencies]
 fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
@@ -39,6 +49,7 @@ fn64-boot-harness = { path = "../../crates/fn64-boot-harness", features = ["reco
 fn64-audio = { path = "../../crates/fn64-audio" }
 fn64-render = { path = "../../crates/fn64-render" }
 fn64-render-reference = { path = "../../crates/fn64-render-reference" }
+fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 sha2 = "0.10"
 serde_json = "1"
@@ -48,6 +59,7 @@ serde_json = "1"
 # `#[path]` and must compile against the same APIs.
 winit = { version = "0.30", features = ["serde"] }
 pixels = "0.15"
+libc = "0.2"
 gilrs = { version = "0.11", features = ["serde-serialize"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -71,14 +83,12 @@ wm2000-block-resident-tail-shard-00 = { path = "../wm2000-block-shards/shard15" 
 wm2000-block-resident-tail-shard-01 = { path = "../wm2000-block-shards/shard16" }
 wm2000-block-overlay-0-shard-00 = { path = "../wm2000-block-shards/overlay0-shard00" }
 wm2000-block-overlay-0-shard-01 = { path = "../wm2000-block-shards/overlay0-shard01" }
-wm2000-block-overlay-0-shard-02 = { path = "../wm2000-block-shards/overlay0-shard02" }
 wm2000-block-overlay-1-shard-00 = { path = "../wm2000-block-shards/overlay1-shard00" }
 wm2000-block-overlay-2-shard-00 = { path = "../wm2000-block-shards/overlay2-shard00" }
 wm2000-block-overlay-2-shard-01 = { path = "../wm2000-block-shards/overlay2-shard01" }
 wm2000-block-overlay-2-shard-02 = { path = "../wm2000-block-shards/overlay2-shard02" }
 wm2000-block-overlay-2-shard-03 = { path = "../wm2000-block-shards/overlay2-shard03" }
 wm2000-block-overlay-2-shard-04 = { path = "../wm2000-block-shards/overlay2-shard04" }
-wm2000-block-overlay-2-shard-05 = { path = "../wm2000-block-shards/overlay2-shard05" }
 wm2000-block-overlay-3-shard-00 = { path = "../wm2000-block-shards/overlay3-shard00" }
 wm2000-block-overlay-3-shard-01 = { path = "../wm2000-block-shards/overlay3-shard01" }
 wm2000-block-overlay-3-shard-02 = { path = "../wm2000-block-shards/overlay3-shard02" }
@@ -86,7 +96,6 @@ wm2000-block-overlay-3-shard-03 = { path = "../wm2000-block-shards/overlay3-shar
 wm2000-block-overlay-3-shard-04 = { path = "../wm2000-block-shards/overlay3-shard04" }
 wm2000-block-overlay-3-shard-05 = { path = "../wm2000-block-shards/overlay3-shard05" }
 wm2000-block-overlay-3-shard-06 = { path = "../wm2000-block-shards/overlay3-shard06" }
-wm2000-block-overlay-3-shard-07 = { path = "../wm2000-block-shards/overlay3-shard07" }
 
 [build-dependencies]
 fn64-discover = { path = "../../crates/fn64-discover" }
@@ -95,7 +104,87 @@ fn64-recomp-rs-codegen = { path = "../../crates/fn64-recomp-rs-codegen" }
 sha2 = "0.10"
 
 [profile.release]
-debug = true
+# No debug info. This binary links the whole generated dense-AOT shard catalog into
+# ~121 MB, and DWARF for generated match arms is both enormous and useless --
+# every earlier release build here either ran 40+ minutes or was OOM-killed,
+# and this was a large part of why.
+debug = false
+
+# The generated shards dominate compile time and are cold code: they are
+# dispatched through, not optimized around. Giving them many codegen units
+# lets rustc parallelize instead of serializing on a few huge ones, without
+# touching the -O level the hot handwritten crates get below.
+codegen-units = 256
+
+# Line tables for the three handwritten hot crates ONLY.
+#
+# `run_one_step` inlines its whole callee tree, so a sampling profiler
+# attributes ~92% of self time to one frame and cannot say which part costs.
+# Line tables let the sampler recover the inlined frames with file:line. The
+# generated shards stay at `debug = false` above -- DWARF for their match arms
+# is what made earlier release builds run 40+ minutes or get OOM-killed, and
+# they are dispatched through rather than optimized around, so they are not
+# what a profile needs to see into.
+# The ROOT package too. The `debug = false` at `:94-99` above is about the
+# GENERATED SHARD CRATES -- their DWARF is what made earlier release builds run
+# 40+ minutes or get OOM-killed -- and it stays false for them. But the root
+# package inheriting it is why `sample` attributes 99.99% of every profile to
+# `wm2000_block_boot::main`: the dispatch loop lives here, it inlines its whole
+# callee tree, and with no line tables the sampler cannot recover a single
+# inlined frame. This crate is ~4k lines of handwritten code, so its DWARF is
+# nothing like a shard's.
+[profile.release.package.wm2000-block-boot]
+debug = 1
+
+[profile.release.package.fn64-recomp-rs]
+codegen-units = 1
+debug = 1
+[profile.release.package.fn64-runtime]
+codegen-units = 1
+debug = 1
+[profile.release.package.fn64-abi]
+codegen-units = 1
+debug = 1
+# `fn64-audio` runs the RSP interpreter (`rsp::interpreter::run_imem`), which
+# retires ~4.13B RSP instructions on the gameplay route. It was the one hot
+# handwritten crate with NO override, so it inherited the 256 above -- the
+# generated-shard setting, which is wrong for it. The shards are cold code
+# dispatched through, and many units let rustc parallelize them; this crate is
+# a hot interpreter loop where the units cost real work.
+#
+# MEASURED, 2026-08-08, route a9e1b25e, RT64, headless, 2.1M steps, two
+# interleaved A/B pairs on a quiet machine. Mean ms/field:
+#
+#   baseline (256)  22.85 / 22.88     range [22.85, 22.88]
+#   this (1)        22.48 / 22.33     range [22.33, 22.48]
+#
+# Ranges FULLY DISJOINT, -1.79% mean, ratio A 1.37x -> 1.35x. Guest
+# byte-identical across all four runs (gfx_submits=16586, audio_submits=11005,
+# sp_tasks=27591, vi_interrupts=12008, controller_ops=3115, render_error=None,
+# identical sim_time).
+#
+# THE MECHANISM WAS CONFIRMED BY SYMBOL, NOT INFERRED FROM THE TIMING. Before:
+# `run_imem`'s object held UNDEFINED references to `decode::decode` and
+# `ops::dispatch` -- and neither carries `#[inline]`, so across a codegen-unit
+# boundary LLVM sees only a declaration and is NEVER ASKED to inline them.
+# After: 1 CGU, both callees defined locally, and ZERO `bl` instructions leave
+# `run_imem`. Total object text also SHRANK 22.8% (416,618 -> 321,621 bytes):
+# single-CGU dedup of helper/generic instantiations outweighs the inlining
+# growth. Whether that layout change contributes is UNPROVEN -- see the
+# rasterizer-hoist dead end, where layout moved the other way unpredictably.
+#
+# TWO THINGS THIS IS NOT:
+#  - It is NOT the recorded `codegen-units`/LTO dead end. That entry is 32
+#    GENERATED shard crates paying a 9-minute build for 10%. This is one
+#    handwritten crate; the incremental cost is ~3 s (24.46 s vs 21.51 s, warm
+#    rebuild plus relink -- NOT a cold build).
+#  - It is NOT progress toward 60fps. The distribution is bimodal (p50 ~16.5,
+#    p95 ~38) and this is a tail-only win: p95/p99 improve, the MEDIAN DOES
+#    NOT, and the over-budget count moved the wrong way (5,659/5,660 ->
+#    5,660/5,662). `holds_60fps` stays false. It is a cheap efficiency win.
+[profile.release.package.fn64-audio]
+codegen-units = 1
+debug = 1
 
 [profile.dev.build-override]
 # The shard build scripts perform exhaustive mechanical ROM discovery. Scope
@@ -110,7 +199,7 @@ opt-level = 1
 debug = 0
 incremental = false
 
-# The root link cannot safely load 35 opt-level-0 generated artifacts. Apply
+# The root link cannot safely load that many opt-level-0 generated artifacts. Apply
 # bounded optimization to dependency crates (including every generated shard)
 # and partition each large shard across many LLVM units. The standalone root
 # package itself remains in the ordinary dev profile.

@@ -101,6 +101,16 @@ reports that batch capability as `Unsupported`; it does not expose staged
 replay as an exact runtime path. Support requires a native separate-command-
 buffer entry point carrying temporal DPC/interrupt/FullSync observations.
 
+The task rollback still copies the full physical RDRAM allocation before
+native entry. The ABI mutation barrier is not a safe substitute: its current
+dirty-page result is produced after each first write and retains no pre-write
+page bytes, while RT64 framebuffer writeback may also be performed by GPU work
+that a CPU page-fault barrier cannot prove it observed. Exact rollback and the
+`NeedsLle` unchanged check therefore need either pre-write copy-on-write pages
+owned by this native lease or an RT64 write-set contract that covers CPU and
+GPU writes. Until one of those mechanisms exists, narrowing the preimage would
+weaken failure atomicity rather than remove a proven cost.
+
 Presentation temporarily lends RT64 the live physical-RDRAM allocation and
 the vblank-latched VI image. Native queues are synchronized before the Rust
 borrow returns. Resize and capture paths validate workload/present identity so
@@ -108,6 +118,29 @@ stale output cannot satisfy release evidence. VI fields before the first
 graphics workload remain presentable, but their zero-workload readbacks are
 not published as release captures; the first later capture with nonzero
 workload provenance replaces them.
+
+The release path retains its readback allocation across frames through
+`RenderBackend::release_capture_into`. Its `ReleaseCapturePixels` result binds
+format, storage dimensions, the exact live-register active-output height, row
+pitch, and exact byte length as one validated owned value. The active height
+must be nonzero and cannot exceed storage height. Renderer-owned filter or
+swapchain extension rows remain in the complete evidence bytes, while an
+interactive host can consume the validated visible prefix without guessing a
+crop from target dimensions. Callers recover the `Vec<u8>` only when they are
+ready to reuse it.
+
+This removes Rust allocation churn, not the synchronous GPU readback. RT64
+still owns a hidden SDL/Metal surface and the current C++ seam exposes CPU
+pixels rather than a host-window/shared-texture handle. Removing that copy
+requires a new native presentation surface contract, including queue lifetime
+and workload/present provenance; it is not safe to infer at this API boundary.
+
+Replacement packs are similarly stabilized at activation rather than capture.
+The adapter copies inspected pack bytes into a process-owned snapshot, validates
+that snapshot before and after native activation, and gives RT64 only snapshot
+paths. The snapshot lives until the native context stops referencing it, so
+release capture does not re-walk or re-hash the caller's mutable filesystem.
+Explicit reload/recreate is the boundary that adopts changed source bytes.
 
 Every native task path validates a complete aligned declared display-list
 range before FFI. A nonzero physical output address must be 64-bit aligned and

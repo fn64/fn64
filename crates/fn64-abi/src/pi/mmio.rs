@@ -20,6 +20,57 @@ pub(crate) fn notify_committed_dma_write(channel: fn64_runtime::DmaWriterChannel
     let _ = (channel, offset, len);
 }
 
+/// Normalize a cartridge image to canonical big-endian order.
+///
+/// `.z64` is already big-endian, `.n64` is word-reversed and `.v64` is
+/// byte-pair-swapped. Returns `None` when the header magic is unrecognized --
+/// the caller then publishes nothing and a shard's later recovery attempt
+/// fails loudly with its own span in the message, which is a better error
+/// than a silently mis-ordered image would produce.
+///
+/// This mirrors `fn64_discover::normalize`'s ordering half. `fn64-abi` does
+/// not depend on `fn64-discover` (a build-time analysis crate), so the
+/// transform is restated here rather than importing the pipeline.
+#[cfg(feature = "recomp-rs")]
+fn normalize_rom_to_big_endian(bytes: &[u8]) -> Option<Vec<u8>> {
+    const MAGIC_Z64: u32 = 0x8037_1240;
+    const MAGIC_N64: u32 = 0x4012_3780;
+    const MAGIC_V64: u32 = 0x3780_4012;
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    match u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) {
+        MAGIC_Z64 => Some(bytes.to_vec()),
+        MAGIC_N64 => Some(
+            bytes
+                .chunks_exact(4)
+                .flat_map(|word| [word[3], word[2], word[1], word[0]])
+                .collect(),
+        ),
+        MAGIC_V64 => Some(
+            bytes
+                .chunks_exact(2)
+                .flat_map(|pair| [pair[1], pair[0]])
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Publish the normalized image to `fn64-recomp-rs` so generated shard crates
+/// can recover their instruction words instead of embedding them.
+///
+/// A no-op without the `recomp-rs` feature, and a no-op for the many tests
+/// that install small synthetic ROMs with no valid header magic.
+fn publish_normalized_rom_image_for_shards(bytes: &[u8]) {
+    #[cfg(feature = "recomp-rs")]
+    if let Some(normalized) = normalize_rom_to_big_endian(bytes) {
+        fn64_recomp_rs::publish_normalized_rom_image(normalized);
+    }
+    #[cfg(not(feature = "recomp-rs"))]
+    let _ = bytes;
+}
+
 /// Install the real ROM bytes the PI/EPI DMA shims read from. Must be
 /// called once before any `osEPiStartDma_recomp`/`osCartRomInit_recomp`
 /// call, per `README.md`'s "no game content ships in this repo" rule --
@@ -41,6 +92,11 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         byte_len: u64::try_from(bytes.len()).expect("installed ROM length exceeds evidence wire"),
         sha256: Sha256::digest(&bytes).into(),
     };
+    // Publish the normalized image for generated shard crates to recover their
+    // instruction words from, so no verbatim ROM words ship in the artifact.
+    // Every entry point already routes the user's ROM through here, which is
+    // why this is the seam rather than each shell's boot path.
+    publish_normalized_rom_image_for_shards(&bytes);
     with_host(|host| {
         let tv_type = host.device_fabric.tv_type();
         let mut device_fabric = DeviceFabric::new(
@@ -60,6 +116,8 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         host.save_operations.clear();
         host.controller_operations.clear();
         host.rsp_rdp_observations.clear();
+        host.rsp_rdp_observation_count = 0;
+        host.rsp_rdp_observation_retention = crate::RspRdpObservationRetention::CompleteEvidence;
         host.rsp_boot_images.clear();
         host.loaded_rsp_task = None;
         host.rsp_task_lineages.clear();

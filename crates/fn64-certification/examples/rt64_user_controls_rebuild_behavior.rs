@@ -191,7 +191,7 @@ fn active_policy_sha256(
 
 fn render(backend: &mut Rt64Backend, guest_cycle: u64) -> Result<Observation, Box<dyn Error>> {
     let (mut rdram, end) = fixture();
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "user-control fixture returned {status:?} instead of Complete"

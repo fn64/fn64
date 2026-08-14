@@ -433,6 +433,7 @@
             _start: u32,
             _end: u32,
             _output_addr: u32,
+            _wait_for_completion: bool,
         ) -> Result<FrameStatus, RenderError> {
             let call = self.calls.get() + 1;
             self.calls.set(call);

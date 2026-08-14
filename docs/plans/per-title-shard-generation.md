@@ -159,54 +159,25 @@ which is the better-tested branch. This item is **clear**.
 
 ## 4. Cost for one additional title (No Mercy, NW4E)
 
-### 4a. The actual blocker: the package inventory is four hand-written arrays
+### 4a. RESOLVED: the package inventory is now one file
 
-`PREPARED_PACKAGES` / `PACKAGES` are duplicated in four places. They must agree
-because `canonical_definition_sha256` folds every shard extent into a digest
-checked across all of them:
+**This blocker is fixed.** The inventory was six hand-maintained arrays that
+had already drifted: commit `6ae673e` reduced it 35 -> 32 (retiring
+`overlay-0-shard-02`, `overlay-2-shard-05`, `overlay-3-shard-07`) but updated
+only some copies, leaving `materializer.rs` declaring `[&str; 35]` with 32
+initializers -- a file that did not compile, latent only because it is reached
+solely through prepared mode and `#[cfg(test)]`.
 
-| File | Declared | Actual entries |
-|---|---|---|
-| `examples/wm2000-block-shards/build.rs:23` | `[&str; 35]` | **35** |
-| `examples/wm2000-block-shards/materializer.rs:18` | `[&str; 35]` | **32** |
-| `crates/fn64-boot-harness/src/generated_runner_build/mod.rs:133` | `[&str; 35]` | **35** |
-| `examples/wm2000-block-boot/build.rs:28` | `[&str; 32]` | **32** |
+There is now a single source of truth,
+`examples/wm2000-block-shards/shard_inventory.in`: a list of
+`(package, manifest_dir)` pairs `include!`d by every consumer, each of which
+derives its arrays and its *length* from the data rather than restating a
+count. The three surplus crate directories were deleted, and
+`scripts/lint-wm-shard-dependencies.py` now measures the inventory file and
+rejects both a restated list and a hardcoded array length.
 
-Plus `SHARD_MANIFEST_DIRS` (`generated_runner_build/mod.rs:170`, 35 entries) and
-35 committed crate directories under `examples/wm2000-block-shards/`.
-
-### PRE-EXISTING BUG FOUND — fix this first
-
-Commit `6ae673e` reduced the inventory 35 → 32 (dropping
-`overlay-0-shard-02`, `overlay-2-shard-05`, `overlay-3-shard-07`) but only
-updated **two of the four** lists. Consequences:
-
-1. **`materializer.rs:18` does not compile.** It declares `[&str; 35]` and
-   supplies 32 initializers. Verified by compiling the file standalone:
-
-   ```
-   error[E0308]: mismatched types
-     --> materializer.rs:18:34
-      | expected an array with a size of 35, found one with a size of 32
-   ```
-
-   This is latent only because `materializer.rs` is reachable solely through
-   `prepared_build.rs:1` (prepared mode, gated on
-   `FN64_WM_PREPARED_SHARD_ROOT`) and via `#[cfg(test)]` in
-   `producer.rs:9-11`. `cargo check` and `cargo check --tests` on
-   `wm2000-prepared-shard-producer` both pass today — the file is simply never
-   built. **The moment prepared mode is exercised, it fails to compile.**
-
-2. `wm2000-block-shards/build.rs:23` and
-   `generated_runner_build/mod.rs:133` still list all 35, so the producer would
-   emit 3 surplus shards that `wm2000-block-boot/build.rs:28` does not expect.
-
-3. 3 surplus crate directories remain on disk (`overlay0-shard02`,
-   `overlay2-shard05`, `overlay3-shard07`).
-
-**This must be resolved before per-title work starts** — otherwise a second
-title is built on an inventory that is internally inconsistent by three
-packages.
+Per-title work therefore starts from a consistent inventory. Adding a title
+means generating a new inventory file, not editing six arrays in agreement.
 
 ### 4b. Hard assertions No Mercy trips
 

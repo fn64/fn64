@@ -13,6 +13,37 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+// The default preserves WM2000's current behavior byte-for-byte when the
+// selector is unset, so the existing byte-identity gate is the regression
+// proof for every change this selector makes possible.
+const DEFAULT_WM_SHARD_DIR: &str = "wm2000-block-shards";
+const WM_SHARD_TITLE_ENV: &str = "FN64_WM_SHARD_TITLE";
+
+/// Validate the selector is a bare directory name: no path separators, no
+/// `..` traversal, non-empty. `SHARD_INVENTORY`'s `include!` and every
+/// `wm2000-block-shards` literal this feeds resolve it relative to
+/// `examples/`, so anything else would either escape that directory or
+/// silently fail to `include!` at all -- and an invalid value must fail the
+/// build loudly rather than fall back to the default, the same way a typo'd
+/// env value must never be read as "unset" elsewhere in this project.
+fn validate_shard_title(title: &str) {
+    assert!(!title.is_empty(), "{WM_SHARD_TITLE_ENV} must not be empty");
+    assert!(
+        title != "." && title != "..",
+        "{WM_SHARD_TITLE_ENV} must not be a directory-traversal segment: {title:?}"
+    );
+    assert!(
+        !title.contains('/') && !title.contains('\\'),
+        "{WM_SHARD_TITLE_ENV} must be a single path segment, got {title:?}"
+    );
+    assert!(
+        title
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "{WM_SHARD_TITLE_ENV} must contain only ASCII alphanumerics, '-' and '_', got {title:?}"
+    );
+}
+
 fn main() {
     let cargo = PathBuf::from(env::var_os("CARGO").expect("Cargo must identify its executable"));
     assert!(
@@ -38,4 +69,9 @@ fn main() {
         "cargo:rustc-env=FN64_BUILD_TARGET={}",
         env::var("TARGET").expect("Cargo must identify its target")
     );
+
+    println!("cargo:rerun-if-env-changed={WM_SHARD_TITLE_ENV}");
+    let shard_dir = env::var(WM_SHARD_TITLE_ENV).unwrap_or_else(|_| DEFAULT_WM_SHARD_DIR.to_owned());
+    validate_shard_title(&shard_dir);
+    println!("cargo:rustc-env=FN64_WM_SHARD_DIR={shard_dir}");
 }

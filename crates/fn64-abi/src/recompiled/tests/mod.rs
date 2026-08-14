@@ -1616,6 +1616,7 @@ mod live_program_b;
 mod c_adapter;
 mod exceptions_fabric;
 mod mutation_state;
+mod resident_boundary;
 
 // `is_test_c_shim` in `runners.rs` names these as `tests::<shim>`, which it
 // could do directly while every test lived in one inline `mod tests`. They

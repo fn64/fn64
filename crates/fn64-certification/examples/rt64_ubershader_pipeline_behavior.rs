@@ -206,7 +206,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     backend.enable_ubershader_evidence()?;
 
     let (mut rdram, end) = fixture();
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)?;
     if status != FrameStatus::Complete {
         return Err(
             io::Error::other(format!("ubershader raw workload returned {status:?}")).into(),

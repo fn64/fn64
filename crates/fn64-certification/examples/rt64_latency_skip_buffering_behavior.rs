@@ -86,7 +86,7 @@ fn submit_fill(
         write_command(rdram, index, word0, word1);
     }
     let end = COMMANDS + COMMAND_COUNT * 8;
-    let status = backend.process_rdp_commands(rdram, COMMANDS as u32, end as u32, vi_output)?;
+    let status = backend.process_rdp_commands(rdram, COMMANDS as u32, end as u32, vi_output, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "latency fixture returned {status:?} while filling {target:#010x}"

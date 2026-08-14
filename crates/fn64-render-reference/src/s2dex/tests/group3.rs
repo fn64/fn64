@@ -108,7 +108,7 @@ fn segment_table_resolves_background_payload_and_image_together() {
     write_command(&mut rdram, MODE + 8, 0xdf00_0000, 0);
 
     let mut rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, MODE as u32, &mut rdp).unwrap();
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, MODE as u32, &mut rdp).unwrap();
     let operations = decode_ops(&rdram, DL as u32, &mut rdp).unwrap();
     let RenderOp::TextureRectangle(rectangle) = &operations[0] else {
         panic!("segmented background must remain a texture rectangle")
@@ -555,7 +555,7 @@ fn admitted_s2dex_families_render_wrapped_copy_background_windows_identically() 
                 write_command(&mut rdram, MODE + 8, u32::from(G_ENDDL) << 24, 0);
 
                 let mut rdp = RdpDecodeState::default();
-                crate::gbi::decode_raw_rdp_ops_with_state(&rdram, MODE as u32, &mut rdp)
+                crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, MODE as u32, &mut rdp)
                     .unwrap();
                 let operations =
                     decode_ops_for_family(&rdram, DL as u32, &mut rdp, selected_family)
@@ -630,7 +630,7 @@ fn copy_background_reuses_bounded_scratch_for_every_wire_and_loader_remainder() 
             write_command(&mut rdram, MODE + 8, u32::from(G_ENDDL) << 24, 0);
 
             let mut rdp = RdpDecodeState::default();
-            crate::gbi::decode_raw_rdp_ops_with_state(&rdram, MODE as u32, &mut rdp).unwrap();
+            crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, MODE as u32, &mut rdp).unwrap();
             let operations =
                 decode_ops_for_family(&rdram, DL as u32, &mut rdp, family).unwrap();
             assert_eq!(
@@ -784,7 +784,7 @@ fn scaled_background_maps_source_gradient_and_is_transactional() {
     write_command(&mut rdram, 0x300, 0xef00_0000 | (2 << 12), 0);
     write_command(&mut rdram, 0x308, 0xdf00_0000, 0);
     let mut bilinear = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, 0x300, &mut bilinear).unwrap();
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, 0x300, &mut bilinear).unwrap();
     let before = format!("{bilinear:?}");
     let error = decode_ops(&rdram, DL as u32, &mut bilinear).unwrap_err();
     assert!(
@@ -966,7 +966,7 @@ fn tlut_and_ci4_tile_loads_feed_object_rectangle() {
     write_command(&mut rdram, MODE + 8, 0xdf00_0000, 0);
 
     let mut rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, MODE as u32, &mut rdp).unwrap();
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, MODE as u32, &mut rdp).unwrap();
     let operations = decode_ops(&rdram, DL as u32, &mut rdp).unwrap();
     let (texture, other_mode) = rectangle_texture(&operations[0]);
     assert_eq!(
@@ -1002,7 +1002,7 @@ fn single_tlut_entry_copies_its_complete_native_storage_word() {
     write_command(&mut rdram, MODE + 8, 0xdf00_0000, 0);
 
     let mut rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, MODE as u32, &mut rdp).unwrap();
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, MODE as u32, &mut rdp).unwrap();
     let operations = decode_ops(&rdram, DL as u32, &mut rdp).unwrap();
     let (texture, other_mode) = rectangle_texture(&operations[0]);
     assert_eq!(

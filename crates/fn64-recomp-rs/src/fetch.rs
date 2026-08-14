@@ -421,6 +421,10 @@ pub struct DynamicMappedUnitCatalogV1 {
 
 /// Prevent a self-modifying workload from growing host memory without bound.
 /// Saturation is loud so a caller cannot mistake a partial run for closure.
+///
+/// Gated with the `impl` below that is its only consumer: ungated, a default
+/// build compiles a constant with no user and warns.
+#[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]
 const DYNAMIC_MAPPED_UNIT_CATALOG_CAPACITY: usize = 131_072;
 
 #[cfg(any(feature = "dev-interpreter", feature = "dynamic-mapped-runtime"))]

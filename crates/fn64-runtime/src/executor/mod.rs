@@ -186,6 +186,22 @@ pub struct Executor {
     /// `None` until set (tests that never boot a real rdram just skip the
     /// mirror, which is correct: there is no guest struct to keep in sync).
     rdram_base: Option<*mut u8>,
+    /// Attributed publication hook for [`Self::mirror_queue_to_rdram`].
+    ///
+    /// The mirror writes the guest's `OSMesgQueue` through a raw pointer, so
+    /// no view type attributes it. An `OSMesgQueue` may sit inside a watched
+    /// executable range, where an undeclared write fails the next dispatch as
+    /// an "unjournaled executable mutation". The host that owns the writer
+    /// channels installs this; `fn64-runtime` does not depend on the
+    /// recompiler crate in production, so the call cannot be made directly.
+    ///
+    /// This publishes rather than merely observing: the host must open its
+    /// child writer transaction BEFORE the bytes become visible and commit it
+    /// before returning, so a notification issued after a raw write cannot
+    /// express it. Arguments are the physical RDRAM offset and the bytes in
+    /// GUEST byte order. Returning `false` means the host declined (no live
+    /// program, or out of range) and the caller must write the bytes itself.
+    queue_mirror_publisher: Option<fn(u32, &[u8]) -> bool>,
     /// Byte length of the `rdram_base` allocation. Zero means "not yet
     /// registered"; the length-less legacy registration stores `usize::MAX`
     /// (no bounds enforcement). Default-derived as 0, which is fine: mirrors
@@ -642,6 +658,12 @@ impl Executor {
         self.rdram_len = len;
     }
 
+    /// Install the attributed publication hook the `OSMesgQueue` mirror uses
+    /// instead of its raw write. See [`Self::queue_mirror_publisher`].
+    pub fn set_queue_mirror_publisher(&mut self, publish: fn(u32, &[u8]) -> bool) {
+        self.queue_mirror_publisher = Some(publish);
+    }
+
     /// Mirror a queue's live count/head into its rdram `OSMesgQueue` struct
     /// so guest `MQ_GET_COUNT`/`MQ_IS_FULL`/`MQ_IS_EMPTY` reads see truth.
     /// No-op if no rdram base is registered (unit tests) or the queue isn't
@@ -667,13 +689,64 @@ impl Executor {
             mq_addr.offset(),
             self.rdram_len,
         );
-        let write = |off: u32, val: i32| unsafe {
-            let o = mq_addr.offset().wrapping_add(off) as usize;
-            std::ptr::copy_nonoverlapping(val.to_ne_bytes().as_ptr(), base.add(o), 4);
-        };
-        write(MQ_VALIDCOUNT_OFF, valid);
-        write(MQ_FIRST_OFF, first);
-        write(MQ_MSGCOUNT_OFF, msgcount);
+        // Declare the write. This mirror bypasses `RdramViewMut`/`RdramPtr`
+        // and writes the allocation through a raw pointer, so nothing else
+        // attributes it -- and an OSMesgQueue can sit inside a watched
+        // executable range, which is not a guest bug: the linker is free to
+        // place queue objects anywhere in the image.
+        //
+        // Undeclared, it reads as memory changing under the recompiler and
+        // fails the next dispatch as "unjournaled executable mutation". WM2000
+        // has a queue at guest 0x8009b0b0, so mirroring its `validCount` of 1
+        // wrote logical byte 0x0009b0b3 (native `01 00 00 00`, and storage
+        // offset o is logical o^3) and killed the route at ~1.18M steps.
+        //
+        // `HostAbi` is the correct channel and the sibling raw mirror --
+        // fn64-abi's scheduler running-thread mirror -- already declares
+        // exactly this way.
+        //
+        // The three fields are CONTIGUOUS (0x08, 0x0c, 0x10), so this is one
+        // 12-byte update, not three 4-byte ones. Publishing it as a single
+        // span is both more truthful -- guest code never observes a partial
+        // mirror, every call site rewrites all three -- and what lets the
+        // publication commit as one child writer transaction. Three separate
+        // declarations would each have to be committed before the next
+        // ordering boundary, and the mirror runs while a host transaction is
+        // already open.
+        //
+        // Bytes go out in GUEST order. Native `to_ne_bytes` at storage offset
+        // `o` and guest-order `to_be_bytes` at logical `o` are the same bytes:
+        // logical `a` lives at storage `a ^ 3`, and within one aligned word
+        // that XOR is exactly the little-endian-host byte reversal.
+        let mut bytes = [0u8; 12];
+        bytes[0..4].copy_from_slice(&valid.to_be_bytes());
+        bytes[4..8].copy_from_slice(&first.to_be_bytes());
+        bytes[8..12].copy_from_slice(&msgcount.to_be_bytes());
+        let start = mq_addr.offset().wrapping_add(MQ_VALIDCOUNT_OFF);
+        debug_assert_eq!(MQ_FIRST_OFF, MQ_VALIDCOUNT_OFF + 4);
+        debug_assert_eq!(MQ_MSGCOUNT_OFF, MQ_VALIDCOUNT_OFF + 8);
+
+        // The publisher opens its child writer transaction BEFORE the bytes
+        // become visible and commits it before returning, which is why it
+        // writes rather than merely being told about a write that already
+        // happened. It declines (`false`) when there is no journal to declare
+        // to; then the raw write below is all that is needed.
+        if let Some(publish) = self.queue_mirror_publisher {
+            if publish(start, &bytes) {
+                return;
+            }
+        }
+        // SAFETY: `base` is the one registered process RDRAM allocation and
+        // the bounds assert above proved this span lies inside it.
+        unsafe {
+            let write = |off: u32, val: i32| {
+                let o = mq_addr.offset().wrapping_add(off) as usize;
+                std::ptr::copy_nonoverlapping(val.to_ne_bytes().as_ptr(), base.add(o), 4);
+            };
+            write(MQ_VALIDCOUNT_OFF, valid);
+            write(MQ_FIRST_OFF, first);
+            write(MQ_MSGCOUNT_OFF, msgcount);
+        }
     }
 
     // ---- OSThread lifecycle -------------------------------------------

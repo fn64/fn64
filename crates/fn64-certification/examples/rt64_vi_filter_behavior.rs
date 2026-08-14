@@ -403,7 +403,7 @@ fn run_created(backend: &mut Rt64Backend) -> Result<ViFilterRunSummary, Box<dyn 
     backend.enable_present_capture()?;
 
     let (mut rdram, command_end) = fixture();
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, command_end, TARGET)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, command_end, TARGET, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "native VI fixture returned {status:?} instead of Complete"

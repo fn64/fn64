@@ -35,3 +35,7 @@ __pycache__/
 
 # Raw corpus sweep output: regenerate with scripts/, not source of truth.
 crates/fn64-discover/reference/corpus-certification-sample.tsv
+
+# Throwaway target dirs for the two-lane ROM-content binary audit
+# (scripts/rom-content-audit-build.zsh). Multi-GB build output, never committed.
+/target-audit-*
