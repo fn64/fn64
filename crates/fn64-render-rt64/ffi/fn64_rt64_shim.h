@@ -738,6 +738,34 @@ int fn64_rt64_enable_present_capture(
     char *error,
     size_t error_capacity);
 
+/* Registers a per-frame draw callback that fires after present-capture's own
+ * readback (if enabled) but before the frame is finalized/presented, drawing
+ * into the same already-open command list RT64's present thread hands to
+ * this shim. `command_list`/`framebuffer` are opaque `plume::RenderCommandList*`/
+ * `plume::RenderFramebuffer*`, matching how this header keeps `plume` types
+ * internal to the C++ side everywhere else -- a caller linking against the
+ * same `plume` headers (as fn64-rmlui does) casts back to the real types.
+ * The callback runs on RT64's present thread, not the caller's thread; it
+ * must not block or call back into this shim's registration functions.
+ * Calling this twice for the same `context` replaces the previously
+ * registered callback/user_data rather than erroring, mirroring
+ * `fn64_rt64_enable_present_capture`'s idempotent-enable behavior. */
+int fn64_rt64_register_overlay_draw(
+    Fn64Rt64Context *context,
+    void (*callback)(void *command_list, void *framebuffer, void *user_data),
+    void *user_data,
+    char *error,
+    size_t error_capacity);
+
+/* Removes a callback registered via fn64_rt64_register_overlay_draw. A no-op
+ * success if `context` has no registered callback. Also called automatically
+ * from the context's own destruction, so an explicit call is only needed to
+ * stop drawing an overlay before the context itself goes away. */
+int fn64_rt64_unregister_overlay_draw(
+    Fn64Rt64Context *context,
+    char *error,
+    size_t error_capacity);
+
 int fn64_rt64_read_present_capture(
     Fn64Rt64Context *context,
     Fn64Rt64PresentCapture *capture,
