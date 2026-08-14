@@ -54,6 +54,11 @@ fn main() {
     println!("cargo:rerun-if-changed=ffi/CMakeLists.txt");
     println!("cargo:rerun-if-changed=ffi/fn64_rmlui_shim.cpp");
     println!("cargo:rerun-if-changed=ffi/fn64_rmlui_shim.h");
+    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_render_interface.cpp");
+    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_render_interface.h");
+    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_ui.h");
+    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_ui_vs.hlsl");
+    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_ui_ps.hlsl");
 
     if env::var_os("CARGO_FEATURE_RMLUI").is_none() {
         // Pure-Rust default for CI/no-GPU hosts, matching
@@ -99,7 +104,16 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let cmake_source = out_dir.join("rmlui-cmake-source");
     std::fs::create_dir_all(&cmake_source).expect("create fn64-rmlui CMake source wrapper");
-    for file in ["CMakeLists.txt", "fn64_rmlui_shim.cpp", "fn64_rmlui_shim.h"] {
+    for file in [
+        "CMakeLists.txt",
+        "fn64_rmlui_shim.cpp",
+        "fn64_rmlui_shim.h",
+        "fn64_rmlui_render_interface.cpp",
+        "fn64_rmlui_render_interface.h",
+        "fn64_rmlui_ui.h",
+        "fn64_rmlui_ui_vs.hlsl",
+        "fn64_rmlui_ui_ps.hlsl",
+    ] {
         let source = manifest_dir.join("ffi").join(file);
         let destination = cmake_source.join(file);
         std::fs::copy(&source, &destination).unwrap_or_else(|e| {
