@@ -842,6 +842,35 @@ already-shipped predecode table is correct and stays. Filed here so the
 still-open "pending unprofiled A/B measurement" note in `456c920` is not
 mistaken for a live gap by a later search of this file.
 
+**RESOLVED, 2026-08-14: `56c5444` ("hand the RDRAM view to the scheduler
+mirror's commit") had the same unclosed shape — its own message says "the
+remainder needs an unprofiled A/B" and no later entry ever ran it. Closed
+now, same session as the predecode closure above.** Reconstructed the
+pre-fix shape by temporarily reverting `commit_scheduler_running_thread_
+mirror`'s final call from `commit_with_optional_view(.., Some(&view))`
+back to `commit_with(..)` (the byte-at-a-time `read_snapshot` path,
+dropping the already-in-scope view), verified against the full 523-test
+`fn64-abi` suite, then reverted via `git checkout` after measuring. RT64
+lane, `entrance-to-match.schedule`, headless, `--features rt64`,
+byte-identical `sim_time=13112786076` on both runs,
+`FN64_FRAME_CENSUS_POPULATIONS=1` only:
+
+| | byte-loop (pre-fix) | view fast path (shipped) |
+|---|---:|---:|
+| slow-population mean | 29.80 ms | 21.92 ms |
+
+**−7.88 ms/field, −26.4%** — larger than the commit's own conservative
+"at least ~8.6 ms of the mirror alone" estimate once the profiling
+instrument's own inflation (this session's earlier `FN64_PROFILE`
+correction) is accounted for. One pair, not interleaved-repeated like the
+predecode closure above, but the gap is large enough (26%, vs this
+session's observed ~7% run-to-run noise ceiling) to be unambiguous without
+further repeats. No code change: already correct and shipped. Two
+real, substantial, previously-unverified wins closed in one session
+— together these two changes (predecode table + mirror view fast path)
+plausibly account for a meaningful share of why the corrected 21.1 ms/field
+baseline is as good as it is, not overhead still waiting to be found.
+
 ## The write barrier now SAVES 12.4 ms/field, and the GPU attribution is retracted
 
 Measured 2026-08-08 on the RT64 gameplay route (`a9e1b25e`), barrier on vs off:
