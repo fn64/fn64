@@ -98,6 +98,67 @@ fidelity, and is not proposed. This line closes and points back at the
 This is not a list of optimizations. It is the procedure that produced the wins
 and would have prevented the wrong calls.
 
+## CORRECTED, 2026-08-14: the RT64-lane busy-field figure was profiler-inflated by 26%
+
+An agent session spent most of a `/loop` iteration chasing a **26.684 ms/field**
+busy-population figure on the RT64 lane (`entrance-to-match.schedule`,
+byte-identical `sim_time=13112786076`), measured with `FN64_PROFILE=1` armed
+(`RESUME_SPLIT` + `EXECUTOR_SPLIT` + `PHASE_TIMING` + `FRAME_CENSUS_SEQUENCE`
++ `DPC_COPY_CENSUS` together). It ruled out several candidates against that
+number (RSP SIMD, RDP copyback diffing, mprotect hysteresis) and treated the
+gap to the 16.667 ms budget as **1.6x**.
+
+Rule 17 (below) already documents that this exact instrument arms at up to
+**56x its predicted cost** and that a related measurement inflated the
+render-field mean by **+4.1-4.6%** — but nobody re-ran the RT64-lane number
+with the instrument OFF to check by how much. Doing so now, same route, same
+binary, byte-identical `sim_time`:
+
+| instrumentation | slow-population mean | vs budget |
+|---|---:|---:|
+| `FN64_PROFILE=1` (full: RESUME_SPLIT+EXECUTOR_SPLIT+PHASE_TIMING+...) | 26.684 ms | 1.60x |
+| `FN64_FRAME_CENSUS_POPULATIONS=1` only | 21.10 ms | 1.27x |
+| `FN64_FRAME_CENSUS_POPULATIONS=1` + `FN64_EXECUTOR_SPLIT=1` | 21.17 ms | 1.27x |
+
+**The full profiling stack was inflating the number it was trying to measure
+by 26.4%.** The lighter gates (`FRAME_CENSUS_POPULATIONS`, `EXECUTOR_SPLIT`
+alone) agree with each other to 0.3%, so the corrected figure is **~21.1
+ms/field, 1.27x budget** — matching the independently-recorded "RT64 on the
+gameplay route, 2026-08-07: 1.28x" entry below almost exactly, which is a
+useful cross-check that this correction, not the original 1.6x, is the real
+number.
+
+**This does not invalidate the session's A/B comparisons** (VecDeque fix,
+mprotect barrier ON/OFF, vmacf restructure) — those all measured BEFORE and
+AFTER under the *same* instrumentation, so the perturbation was present on
+both sides and cancels in the delta. What it invalidates is any conclusion
+about the ABSOLUTE gap to 60fps drawn from an armed run without a matching
+unarmed control.
+
+**Re-verified with a THIRD gate level** (`FRAME_CENSUS_POPULATIONS` +
+`PHASE_TIMING` + `DPC_COPY_CENSUS`, no `RESUME_SPLIT`/`EXECUTOR_SPLIT`):
+slow-population mean came back to **26.40 ms** — close to the original
+26.684, not the 21.1 lightly-gated figure. So `PHASE_TIMING` and/or
+`DPC_COPY_CENSUS` carry real perturbation too; it is not concentrated in
+`RESUME_SPLIT` alone, and **any breakdown by gfx/RSP/RDP costs real
+measured time to obtain** — there is no gate level that shows the
+composition for free at the 21.1 ms baseline. What DOES survive: the
+*shares* within that breakdown. RDP was 70.8% of `gfx_ns` under the full
+stack (26.684 ms total) and 71.5% under this lighter one (26.40 ms total) —
+agreement to 0.7 points. Rule 17's claim that shares survive perturbation
+even when absolute milliseconds do not is confirmed here, on this lane, not
+just asserted. **So the RDP-staging-vs-RT64-internal finding (~82% of the
+RDP bucket is inside RT64's own call, not fn64's staging copy) stands** —
+read its share, not its millisecond figure, as the trustworthy number.
+
+**The corrected target: cut the slow population from ~21.1 ms (true,
+minimally-perturbed baseline) to 16.667 ms — a 21% cut, not the 38% the
+fully-armed number implied.** But sizing WHERE that cut comes from still
+requires an armed run (26.40-26.684 ms), because the breakdown gates
+themselves cost measured time. Read such a run's bucket SHARES, not its
+absolute milliseconds, and remember the true total is ~21%, not ~27-33%,
+lower than what that same armed run reports.
+
 ## The record this is drawn from
 
 | verdict | claim | reality |
