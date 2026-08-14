@@ -240,25 +240,41 @@ extern "C" void fn64_rmlui_context_destroy(Fn64RmluiContext *context) {
     if (context == nullptr) {
         return;
     }
-    // Unregister first, so the draw-hook trampoline can never fire again
-    // while `context` is being torn down -- it may still run concurrently
-    // from RT64's present thread up until this call returns, matching the
-    // same ordering discipline fn64_rt64_shim.cpp's own context destructor
-    // already uses for its registries (unregister the callback before
-    // freeing the state it points at). The render interface (and the
-    // plume pipeline/textures/buffers it owns) is only destroyed after
-    // this returns, once no further callback invocation is possible.
-    char rt64_error[256] = {0};
-    if (!fn64_rt64_unregister_overlay_draw(context->rt64, rt64_error, sizeof(rt64_error))) {
-        // Best-effort: context teardown must proceed regardless, but this
-        // is unexpected enough (the register call above always succeeds
-        // before this destroy could run) to leave a trace for debugging.
-        std::fprintf(stderr, "fn64-rmlui: fn64_rt64_unregister_overlay_draw failed: %s\n", rt64_error);
+    // Called from Rust's Drop for Context (lib.rs) -- an exception
+    // unwinding out of this function would be undefined behavior twice
+    // over (unwinding across the extern "C" boundary, inside a Drop impl).
+    // Caught and logged rather than propagated, matching
+    // fn64_rt64_shim.cpp's own noexcept-equivalent discipline for every
+    // extern "C" function; there is no error-reporting slot a destructor
+    // can use, so the same best-effort stderr trace already used below for
+    // the unregister failure covers this too.
+    try {
+        // Unregister first, so the draw-hook trampoline can never fire
+        // again while `context` is being torn down -- it may still run
+        // concurrently from RT64's present thread up until this call
+        // returns, matching the same ordering discipline
+        // fn64_rt64_shim.cpp's own context destructor already uses for its
+        // registries (unregister the callback before freeing the state it
+        // points at). The render interface (and the plume
+        // pipeline/textures/buffers it owns) is only destroyed after this
+        // returns, once no further callback invocation is possible.
+        char rt64_error[256] = {0};
+        if (!fn64_rt64_unregister_overlay_draw(context->rt64, rt64_error, sizeof(rt64_error))) {
+            // Best-effort: context teardown must proceed regardless, but
+            // this is unexpected enough (the register call above always
+            // succeeds before this destroy could run) to leave a trace for
+            // debugging.
+            std::fprintf(stderr, "fn64-rmlui: fn64_rt64_unregister_overlay_draw failed: %s\n", rt64_error);
+        }
+        if (context->context != nullptr) {
+            Rml::RemoveContext(context->context->GetName());
+        }
+        delete context;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_destroy threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_destroy failed with an unknown C++ exception\n");
     }
-    if (context->context != nullptr) {
-        Rml::RemoveContext(context->context->GetName());
-    }
-    delete context;
 }
 
 extern "C" void fn64_rmlui_context_set_dimensions(
@@ -268,9 +284,15 @@ extern "C" void fn64_rmlui_context_set_dimensions(
     if ((context == nullptr) || (context->context == nullptr)) {
         return;
     }
-    context->context->SetDimensions(Rml::Vector2i(int(width), int(height)));
-    if (context->render_interface) {
-        context->render_interface->SetViewportSize(width, height);
+    try {
+        context->context->SetDimensions(Rml::Vector2i(int(width), int(height)));
+        if (context->render_interface) {
+            context->render_interface->SetViewportSize(width, height);
+        }
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_set_dimensions threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_set_dimensions failed with an unknown C++ exception\n");
     }
 }
 
@@ -288,26 +310,48 @@ extern "C" Fn64RmluiDocument *fn64_rmlui_load_document_from_memory(
         set_last_error("null RML source buffer");
         return nullptr;
     }
-    const std::string rml(rml_source, rml_source_len);
-    const std::string url = (source_url != nullptr) ? source_url : "";
-    Rml::ElementDocument *document =
-        context->context->LoadDocumentFromMemory(rml, url.empty() ? "[fn64 document from memory]" : url);
-    if (document == nullptr) {
-        set_last_error("Rml::Context::LoadDocumentFromMemory failed");
+    try {
+        const std::string rml(rml_source, rml_source_len);
+        const std::string url = (source_url != nullptr) ? source_url : "";
+        Rml::ElementDocument *document =
+            context->context->LoadDocumentFromMemory(rml, url.empty() ? "[fn64 document from memory]" : url);
+        if (document == nullptr) {
+            set_last_error("Rml::Context::LoadDocumentFromMemory failed");
+            return nullptr;
+        }
+        return new Fn64RmluiDocument{document};
+    } catch (const std::exception &exception) {
+        set_last_error(std::string("Rml::Context::LoadDocumentFromMemory threw: ") + exception.what());
+        return nullptr;
+    } catch (...) {
+        set_last_error("Rml::Context::LoadDocumentFromMemory failed with an unknown C++ exception");
         return nullptr;
     }
-    return new Fn64RmluiDocument{document};
 }
 
 extern "C" void fn64_rmlui_document_show(Fn64RmluiDocument *document) {
-    if ((document != nullptr) && (document->document != nullptr)) {
+    if ((document == nullptr) || (document->document == nullptr)) {
+        return;
+    }
+    try {
         document->document->Show();
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_document_show threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_document_show failed with an unknown C++ exception\n");
     }
 }
 
 extern "C" void fn64_rmlui_document_hide(Fn64RmluiDocument *document) {
-    if ((document != nullptr) && (document->document != nullptr)) {
+    if ((document == nullptr) || (document->document == nullptr)) {
+        return;
+    }
+    try {
         document->document->Hide();
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_document_hide threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_document_hide failed with an unknown C++ exception\n");
     }
 }
 
@@ -315,13 +359,22 @@ extern "C" void fn64_rmlui_document_close(Fn64RmluiDocument *document) {
     if (document == nullptr) {
         return;
     }
-    if (document->document != nullptr) {
-        // Close() defers actual destruction to the owning Context's next
-        // Update() call (RmlUi's own documented behavior), matching the
-        // header's note on fn64_rmlui_document_close.
-        document->document->Close();
+    // Called from Rust's Drop for Document (lib.rs) -- same rationale as
+    // fn64_rmlui_context_destroy above for why this whole body is guarded
+    // rather than left to unwind.
+    try {
+        if (document->document != nullptr) {
+            // Close() defers actual destruction to the owning Context's
+            // next Update() call (RmlUi's own documented behavior),
+            // matching the header's note on fn64_rmlui_document_close.
+            document->document->Close();
+        }
+        delete document;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_document_close threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_document_close failed with an unknown C++ exception\n");
     }
-    delete document;
 }
 
 extern "C" Fn64RmluiElement *fn64_rmlui_document_get_element_by_id(
@@ -332,12 +385,20 @@ extern "C" Fn64RmluiElement *fn64_rmlui_document_get_element_by_id(
         set_last_error("null document or element id");
         return nullptr;
     }
-    Rml::Element *element = document->document->GetElementById(id);
-    if (element == nullptr) {
-        set_last_error(std::string("no element with id \"") + id + "\"");
+    try {
+        Rml::Element *element = document->document->GetElementById(id);
+        if (element == nullptr) {
+            set_last_error(std::string("no element with id \"") + id + "\"");
+            return nullptr;
+        }
+        return new Fn64RmluiElement{element};
+    } catch (const std::exception &exception) {
+        set_last_error(std::string("Rml::ElementDocument::GetElementById threw: ") + exception.what());
+        return nullptr;
+    } catch (...) {
+        set_last_error("Rml::ElementDocument::GetElementById failed with an unknown C++ exception");
         return nullptr;
     }
-    return new Fn64RmluiElement{element};
 }
 
 extern "C" void fn64_rmlui_element_set_text(
@@ -347,7 +408,13 @@ extern "C" void fn64_rmlui_element_set_text(
     if ((element == nullptr) || (element->element == nullptr) || (text == nullptr)) {
         return;
     }
-    element->element->SetInnerRML(std::string(text, text_len));
+    try {
+        element->element->SetInnerRML(std::string(text, text_len));
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_set_text threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_set_text failed with an unknown C++ exception\n");
+    }
 }
 
 extern "C" void fn64_rmlui_element_set_attribute(
@@ -358,7 +425,13 @@ extern "C" void fn64_rmlui_element_set_attribute(
         (name == nullptr) || (value == nullptr)) {
         return;
     }
-    element->element->SetAttribute(name, value);
+    try {
+        element->element->SetAttribute(name, value);
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_set_attribute threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_set_attribute failed with an unknown C++ exception\n");
+    }
 }
 
 extern "C" void fn64_rmlui_element_set_class(
@@ -368,7 +441,13 @@ extern "C" void fn64_rmlui_element_set_class(
     if ((element == nullptr) || (element->element == nullptr) || (class_name == nullptr)) {
         return;
     }
-    element->element->SetClass(class_name, enabled != 0);
+    try {
+        element->element->SetClass(class_name, enabled != 0);
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_set_class threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_set_class failed with an unknown C++ exception\n");
+    }
 }
 
 extern "C" size_t fn64_rmlui_element_get_attribute(
@@ -382,14 +461,22 @@ extern "C" size_t fn64_rmlui_element_get_attribute(
     if ((element == nullptr) || (element->element == nullptr) || (name == nullptr)) {
         return 0;
     }
-    const Rml::String value = element->element->GetAttribute<Rml::String>(name, Rml::String());
-    if ((buffer == nullptr) || (buffer_capacity == 0)) {
+    try {
+        const Rml::String value = element->element->GetAttribute<Rml::String>(name, Rml::String());
+        if ((buffer == nullptr) || (buffer_capacity == 0)) {
+            return value.size();
+        }
+        const size_t copy_len = std::min(value.size(), buffer_capacity - 1);
+        std::memcpy(buffer, value.data(), copy_len);
+        buffer[copy_len] = '\0';
         return value.size();
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_get_attribute threw: %s\n", exception.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_get_attribute failed with an unknown C++ exception\n");
+        return 0;
     }
-    const size_t copy_len = std::min(value.size(), buffer_capacity - 1);
-    std::memcpy(buffer, value.data(), copy_len);
-    buffer[copy_len] = '\0';
-    return value.size();
 }
 
 namespace {
@@ -439,7 +526,13 @@ extern "C" void fn64_rmlui_element_on_click(
     if ((element == nullptr) || (element->element == nullptr) || (callback == nullptr)) {
         return;
     }
-    element->element->AddEventListener("click", new Fn64RmluiEventListener(callback, user_data));
+    try {
+        element->element->AddEventListener("click", new Fn64RmluiEventListener(callback, user_data));
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_on_click threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_on_click failed with an unknown C++ exception\n");
+    }
 }
 
 extern "C" void fn64_rmlui_element_on_change(
@@ -449,12 +542,32 @@ extern "C" void fn64_rmlui_element_on_change(
     if ((element == nullptr) || (element->element == nullptr) || (callback == nullptr)) {
         return;
     }
-    element->element->AddEventListener("change", new Fn64RmluiEventListener(callback, user_data));
+    try {
+        element->element->AddEventListener("change", new Fn64RmluiEventListener(callback, user_data));
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_on_change threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_element_on_change failed with an unknown C++ exception\n");
+    }
 }
 
+// Called every tick from the main/UI thread (see shell.rs's about_to_wait);
+// this is where RmlUi dispatches queued input and fires on_change/on_click
+// listeners synchronously, so it is the one function in this file most
+// likely to run arbitrary caller-provided (via Fn64RmluiEventCallback)
+// and RmlUi-internal code together -- guarded like every other function
+// here rather than left as the sole unguarded frequently-called entry
+// point.
 extern "C" void fn64_rmlui_context_update(Fn64RmluiContext *context) {
-    if ((context != nullptr) && (context->context != nullptr)) {
+    if ((context == nullptr) || (context->context == nullptr)) {
+        return;
+    }
+    try {
         context->context->Update();
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_update threw: %s\n", exception.what());
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_update failed with an unknown C++ exception\n");
     }
 }
 
@@ -466,7 +579,15 @@ extern "C" int fn64_rmlui_context_process_mouse_move(
     if ((context == nullptr) || (context->context == nullptr)) {
         return 0;
     }
-    return context->context->ProcessMouseMove(int(x), int(y), int(key_modifier_state)) ? 1 : 0;
+    try {
+        return context->context->ProcessMouseMove(int(x), int(y), int(key_modifier_state)) ? 1 : 0;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_move threw: %s\n", exception.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_move failed with an unknown C++ exception\n");
+        return 0;
+    }
 }
 
 extern "C" int fn64_rmlui_context_process_mouse_button_down(
@@ -476,7 +597,15 @@ extern "C" int fn64_rmlui_context_process_mouse_button_down(
     if ((context == nullptr) || (context->context == nullptr)) {
         return 0;
     }
-    return context->context->ProcessMouseButtonDown(int(button), int(key_modifier_state)) ? 1 : 0;
+    try {
+        return context->context->ProcessMouseButtonDown(int(button), int(key_modifier_state)) ? 1 : 0;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_button_down threw: %s\n", exception.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_button_down failed with an unknown C++ exception\n");
+        return 0;
+    }
 }
 
 extern "C" int fn64_rmlui_context_process_mouse_button_up(
@@ -486,7 +615,15 @@ extern "C" int fn64_rmlui_context_process_mouse_button_up(
     if ((context == nullptr) || (context->context == nullptr)) {
         return 0;
     }
-    return context->context->ProcessMouseButtonUp(int(button), int(key_modifier_state)) ? 1 : 0;
+    try {
+        return context->context->ProcessMouseButtonUp(int(button), int(key_modifier_state)) ? 1 : 0;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_button_up threw: %s\n", exception.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_button_up failed with an unknown C++ exception\n");
+        return 0;
+    }
 }
 
 extern "C" int fn64_rmlui_context_process_mouse_wheel(
@@ -496,7 +633,15 @@ extern "C" int fn64_rmlui_context_process_mouse_wheel(
     if ((context == nullptr) || (context->context == nullptr)) {
         return 0;
     }
-    return context->context->ProcessMouseWheel(delta, int(key_modifier_state)) ? 1 : 0;
+    try {
+        return context->context->ProcessMouseWheel(delta, int(key_modifier_state)) ? 1 : 0;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_wheel threw: %s\n", exception.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_mouse_wheel failed with an unknown C++ exception\n");
+        return 0;
+    }
 }
 
 extern "C" int fn64_rmlui_context_process_key_down(
@@ -506,8 +651,16 @@ extern "C" int fn64_rmlui_context_process_key_down(
     if ((context == nullptr) || (context->context == nullptr)) {
         return 0;
     }
-    return context->context->ProcessKeyDown(
-        Rml::Input::KeyIdentifier(key_identifier), int(key_modifier_state)) ? 1 : 0;
+    try {
+        return context->context->ProcessKeyDown(
+            Rml::Input::KeyIdentifier(key_identifier), int(key_modifier_state)) ? 1 : 0;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_key_down threw: %s\n", exception.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_key_down failed with an unknown C++ exception\n");
+        return 0;
+    }
 }
 
 extern "C" int fn64_rmlui_context_process_key_up(
@@ -517,8 +670,16 @@ extern "C" int fn64_rmlui_context_process_key_up(
     if ((context == nullptr) || (context->context == nullptr)) {
         return 0;
     }
-    return context->context->ProcessKeyUp(
-        Rml::Input::KeyIdentifier(key_identifier), int(key_modifier_state)) ? 1 : 0;
+    try {
+        return context->context->ProcessKeyUp(
+            Rml::Input::KeyIdentifier(key_identifier), int(key_modifier_state)) ? 1 : 0;
+    } catch (const std::exception &exception) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_key_up threw: %s\n", exception.what());
+        return 0;
+    } catch (...) {
+        std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_process_key_up failed with an unknown C++ exception\n");
+        return 0;
+    }
 }
 
 extern "C" const char *fn64_rmlui_last_error(void) {
