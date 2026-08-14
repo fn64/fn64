@@ -891,6 +891,7 @@ dependencies = [
  "gilrs",
  "pixels",
  "serde",
+ "tempfile",
  "toml",
  "winit",
 ]

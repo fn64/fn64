@@ -33,6 +33,18 @@ display buffering, and internal color format are setup-owned and require
 backend recreation; fn64 reports that result explicitly rather than retaining
 an apparently applied value.
 
+The WM2000 interactive shell has a bounded experiment surface for these live
+controls. F7 cycles native 1x, high-resolution 2x, high-resolution 2x with an
+explicit 2x box downsample, and native 1x with MSAA4x. F6 reloads the complete
+strict TOML image named by `FN64_RT64_SETTINGS_FILE`; the file is also applied
+once at startup. The schema requires `resolution`, `resolution_multiplier`,
+`downsample_multiplier`, and `antialiasing`, rejects unknown fields, and is
+illustrated by `examples/wm2000-block-boot/rt64-aa.example.toml`. Each
+successful mutation prints its complete settings digest and whether RT64
+discarded framebuffer resources. These shortcuts are an experiment harness,
+not the settings UI policy; they intentionally cross the same typed
+registered-renderer seam that a later frontend uses.
+
 The Metal user-control gate also isolates the four live fields that do not
 intentionally discard framebuffer resources: Manual 72 Hz refresh targeting,
 disabled hardware resolve, enabled idle work, and developer mode. Each phase
