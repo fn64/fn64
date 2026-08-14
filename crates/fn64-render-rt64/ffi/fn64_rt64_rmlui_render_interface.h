@@ -1,5 +1,5 @@
-#ifndef FN64_RMLUI_RENDER_INTERFACE_H
-#define FN64_RMLUI_RENDER_INTERFACE_H
+#ifndef FN64_RT64_RMLUI_RENDER_INTERFACE_H
+#define FN64_RT64_RMLUI_RENDER_INTERFACE_H
 
 #include <RmlUi/Core/RenderInterface.h>
 
@@ -9,19 +9,25 @@
 #include "plume_render_interface.h"
 
 // Bridges RmlUi's RenderInterface abstraction directly onto plume's public
-// RenderDevice/RenderCommandList API. One instance is constructed per
-// Fn64RmluiContext, at overlay-registration time (see
-// fn64_rmlui_shim.cpp::fn64_rmlui_context_create), when a live plume
-// RenderDevice* is first available. The pipeline, descriptor-set layout,
-// and default white texture/sampler are all built once in the constructor;
-// nothing here allocates a plume::RenderPipeline or plume::RenderSampler
-// per frame or per draw call.
+// RenderDevice/RenderCommandList API. Lives in fn64-render-rt64 (not
+// fn64-rmlui) because implementing Rml::RenderInterface using plume types
+// unavoidably needs BOTH RmlUi's and RT64/plume's headers at once -- there
+// is no way to build this one class without both, regardless of which
+// crate's source tree it lives in, so it lives where plume is already a
+// first-class dependency rather than making fn64-rmlui (which otherwise has
+// zero RT64/plume knowledge) pull them in just for this. One instance is
+// constructed per Fn64RmluiContext, at overlay-registration time (see
+// fn64_rt64_rmlui_bridge.cpp's fn64_rt64_create_rmlui_render_interface),
+// when a live plume RenderDevice* is first available. The pipeline,
+// descriptor-set layout, and default white texture/sampler are all built
+// once in the constructor; nothing here allocates a plume::RenderPipeline
+// or plume::RenderSampler per frame or per draw call.
 //
 // Threading/lifetime: every method below (including the 8 pure virtuals
 // RmlUi requires) is only ever called either from fn64-rmlui's own
 // single-threaded Rust-driven Update() path (which touches no plume state)
 // or from within the RT64 present-thread draw callback registered via
-// fn64_rt64_register_overlay_draw, which is where CompileGeometry/
+// this crate's own overlay-draw registry, which is where CompileGeometry/
 // RenderGeometry/LoadTexture/GenerateTexture/ReleaseGeometry/ReleaseTexture
 // actually touch plume objects (RmlUi calls these synchronously from inside
 // Rml::Context::Render(), which this class's owner calls from that same
@@ -36,7 +42,7 @@ public:
     // RT64::Application::setup()'s RenderSwapChainDesc construction -- the
     // caller passes the real values rather than this class hardcoding them,
     // so a future swapchain format change only needs updating at the one
-    // call site in fn64_rmlui_shim.cpp).
+    // call site in fn64_rt64_rmlui_bridge.cpp).
     Fn64RmluiRenderInterface(
         plume::RenderDevice *device,
         plume::RenderFormat colorFormat,
@@ -49,7 +55,7 @@ public:
     Fn64RmluiRenderInterface(const Fn64RmluiRenderInterface &) = delete;
     Fn64RmluiRenderInterface &operator=(const Fn64RmluiRenderInterface &) = delete;
 
-    // Called once per frame by fn64_rmlui_shim.cpp's registered draw-hook
+    // Called once per frame by fn64_rt64_rmlui_bridge.cpp's registered draw-hook
     // trampoline, bracketing the Rml::Context::Render() call that in turn
     // invokes the RenderInterface virtuals below. Stashes the live
     // command list/framebuffer as member state, since none of RmlUi's
@@ -58,8 +64,10 @@ public:
     void EndFrame();
 
     // Must be called whenever the context's logical pixel dimensions change
-    // (mirrors fn64_rmlui_context_set_dimensions), since the vertex shader's
-    // pixel-to-clip-space mapping depends on the viewport size.
+    // (mirrors fn64_rmlui_context_set_dimensions on the fn64-rmlui side of
+    // the boundary, via fn64_rt64_rmlui_render_interface_set_viewport_size),
+    // since the vertex shader's pixel-to-clip-space mapping depends on the
+    // viewport size.
     void SetViewportSize(uint32_t width, uint32_t height);
 
     // Rml::RenderInterface's 8 required pure virtuals. RmlUi's optional
@@ -115,4 +123,4 @@ private:
     std::unique_ptr<plume::RenderDescriptorSet> whiteDescriptorSet_;
 };
 
-#endif // FN64_RMLUI_RENDER_INTERFACE_H
+#endif // FN64_RT64_RMLUI_RENDER_INTERFACE_H

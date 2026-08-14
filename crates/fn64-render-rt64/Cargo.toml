@@ -32,6 +32,13 @@ extended-gbi-evidence = ["synthetic-f3dex2-evidence"]
 # Repository-owned native/C archive fixture for schema-v10 release evidence.
 # This does not enable or build RT64.
 synthetic-native-archive-evidence = []
+# Builds the RmlUi settings-UI render-interface bridge (implements RmlUi's
+# Rml::RenderInterface using plume calls -- see ffi/fn64_rt64_rmlui_bridge.h
+# for why this lives here rather than in fn64-rmlui, which has zero
+# RT64/plume knowledge otherwise). Requires `rt64`. Non-default: builds
+# RmlUi + links Freetype, real cost most callers of this crate (headless
+# certification/batch lanes especially) never need.
+rmlui = ["rt64"]
 
 [dependencies]
 fn64-runtime = { path = "../fn64-runtime" }

@@ -5,6 +5,21 @@ if(NOT DEFINED FN64_RT64_SOURCE_DIR)
     message(FATAL_ERROR "FN64_RT64_SOURCE_DIR must name the sibling MIT RT64 checkout")
 endif()
 
+# FN64_RT64_RMLUI (default OFF, set from build.rs via CARGO_FEATURE_RMLUI --
+# see this crate's own Cargo feature named `rmlui`) additionally builds the
+# RmlUi<->plume render-interface bridge (fn64_rt64_rmlui_bridge.cpp,
+# fn64_rt64_rmlui_render_interface.cpp, and their two shaders) into this
+# same fn64_rt64_shim archive, and requires FN64_RMLUI_SOURCE_DIR. This
+# bridge implements Rml::RenderInterface using plume calls, so it
+# unavoidably needs both RmlUi's and RT64/plume's headers at once -- it
+# lives here (not in fn64-rmlui, which otherwise has zero RT64/plume
+# knowledge) because this crate is the one that already owns plume as a
+# first-class dependency; see fn64_rt64_rmlui_bridge.h's own doc comment.
+option(FN64_RT64_RMLUI "Build the RmlUi settings-UI render-interface bridge" OFF)
+if(FN64_RT64_RMLUI AND NOT DEFINED FN64_RMLUI_SOURCE_DIR)
+    message(FATAL_ERROR "FN64_RT64_RMLUI requires FN64_RMLUI_SOURCE_DIR to name the sibling MIT RmlUi checkout")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(RT64_STATIC ON CACHE BOOL "Build only RT64's static render/HLE library" FORCE)
@@ -20,6 +35,18 @@ set(PLUME_BUILD_EXAMPLES OFF CACHE BOOL "Do not build plume examples" FORCE)
 # texture tools. This source tree defines no mupen plugin target; its GPL
 # mupen64plus subtree is therefore neither compiled nor linked.
 add_subdirectory("${FN64_RT64_SOURCE_DIR}" rt64-build EXCLUDE_FROM_ALL)
+
+if(FN64_RT64_RMLUI)
+    # RmlUi's own default build (Freetype only, no SVG/Lottie/Lua/samples)
+    # -- verified elsewhere to configure cleanly and to carry zero
+    # dependency overlap with RT64's own dependency set (no shared library
+    # name between RmlUi's {Freetype} and RT64's {zstd, nfd, re-spirv,
+    # plume, SDL2}, so no version-pin collision is possible building both
+    # in one tree).
+    set(RMLUI_SAMPLES OFF CACHE BOOL "Do not build RmlUi's sample viewer" FORCE)
+    set(RMLUI_LUA_BINDINGS OFF CACHE BOOL "This bridge does not use RmlUi's Lua scripting plugin" FORCE)
+    add_subdirectory("${FN64_RMLUI_SOURCE_DIR}" rmlui-build EXCLUDE_FROM_ALL)
+endif()
 
 # The pinned S2DEX implementation loads the public uObjTxtr prefix for
 # G_OBJ_LDTX_RECT and then unconditionally asserts instead of drawing the
@@ -1387,3 +1414,51 @@ target_include_directories(fn64_rt64_shim PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/rt64-build/src"
 )
 target_link_libraries(fn64_rt64_shim PRIVATE rt64)
+
+if(FN64_RT64_RMLUI)
+    # Compile this bridge's UI vertex/pixel shaders directly into
+    # fn64_rt64_shim's own sources (build_vertex_shader/build_pixel_shader
+    # call target_sources(fn64_rt64_shim, ...) internally -- see RT64's own
+    # top-level CMakeLists.txt -- so no separate custom-target/
+    # add_dependencies dance is needed here the way fn64-rmlui's own
+    # now-removed CMakeLists.txt once needed: that one targeted `rt64`, a
+    # DIFFERENT directory's target, which needed the extra step to work
+    # around CMake's directory-scoped custom-command visibility; this file
+    # defines fn64_rt64_shim itself, in this same directory, so no such
+    # workaround applies). Same directory-scope re-import dance the VI
+    # shader block above already uses: build_vertex_shader/
+    # build_pixel_shader are CMake functions defined inside RT64's own
+    # CMakeLists.txt, so DXC/its option variables must be re-imported from
+    # that child directory's scope before calling them here.
+    foreach(FN64_RMLUI_SHADER_VARIABLE
+            DXC DXC_VS_OPTS DXC_PS_OPTS DXC_SPV_OPTS SPIRVCROSS)
+        get_directory_property(
+            FN64_RMLUI_IMPORTED_${FN64_RMLUI_SHADER_VARIABLE}
+            DIRECTORY "${FN64_RT64_SOURCE_DIR}"
+            DEFINITION ${FN64_RMLUI_SHADER_VARIABLE})
+        set(${FN64_RMLUI_SHADER_VARIABLE} "${FN64_RMLUI_IMPORTED_${FN64_RMLUI_SHADER_VARIABLE}}")
+    endforeach()
+    target_include_directories(fn64_rt64_shim PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    build_vertex_shader(
+        fn64_rt64_shim
+        "fn64_rt64_rmlui_ui_vs.hlsl"
+        "src/shaders/Fn64RmluiUiVS.hlsl"
+        "-I${CMAKE_CURRENT_SOURCE_DIR}")
+    build_pixel_shader(
+        fn64_rt64_shim
+        "fn64_rt64_rmlui_ui_ps.hlsl"
+        "src/shaders/Fn64RmluiUiPS.hlsl"
+        "-I${CMAKE_CURRENT_SOURCE_DIR}")
+
+    target_sources(fn64_rt64_shim PRIVATE
+        fn64_rt64_rmlui_bridge.cpp
+        fn64_rt64_rmlui_render_interface.cpp
+    )
+    target_include_directories(fn64_rt64_shim PRIVATE
+        # Generated shader blob headers (Fn64RmluiUiVS.hlsl.spirv.h etc.),
+        # built by build_vertex_shader/build_pixel_shader above into
+        # ${CMAKE_BINARY_DIR}/src/shaders.
+        "${CMAKE_BINARY_DIR}/src"
+    )
+    target_link_libraries(fn64_rt64_shim PRIVATE RmlUi::Core)
+endif()

@@ -1,10 +1,10 @@
-#include "fn64_rmlui_render_interface.h"
+#include "fn64_rt64_rmlui_render_interface.h"
 
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
 
-#include "fn64_rmlui_ui.h"
+#include "fn64_rt64_rmlui_ui.h"
 
 // Generated shader blobs (see CMakeLists.txt's build_vertex_shader/
 // build_pixel_shader calls). One or two of these three headers exist

@@ -47,8 +47,12 @@ rt64 = ["fn64-render-rt64/rt64"]
 # (persistence, tab/capture bookkeeping) still compiles without it -- only
 # the `#[cfg(feature = "rmlui")]`-gated live `fn64_rmlui::Context`/`Document`
 # fields disappear, matching `rt64`'s own "pure-Rust off, real native on"
-# shape.
-rmlui = ["fn64-rmlui/rmlui"]
+# shape. Also enables fn64-render-rt64/rmlui: fn64-rmlui itself has zero
+# RT64/plume knowledge (see its own Cargo.toml doc comment) -- the actual
+# GPU render-interface bridge fn64-rmlui calls into lives in
+# fn64-render-rt64, gated behind that crate's own `rmlui` feature, which
+# would otherwise stay off even with this feature enabled.
+rmlui = ["fn64-rmlui/rmlui", "fn64-render-rt64/rmlui"]
 
 [dependencies]
 fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }

@@ -4,14 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Thin RmlUi UI binding for fn64's shell, drawing through fn64-render-rt64's overlay-draw hook. All C++ interop quarantined here, mirroring fn64-render-rt64's own convention."
+description = "Thin, renderer-agnostic RmlUi UI binding for fn64's shell. Has zero RT64/plume knowledge -- the GPU-side render-interface bridge lives in fn64-render-rt64 instead (its own opt-in `rmlui` feature), which this crate calls into but never links directly."
 
 [features]
 default = []
 # Builds the sibling RmlUi checkout and the crate-local C ABI shim, and
-# links against fn64-render-rt64's overlay-draw registration calls. The
-# default remains pure Rust for CI/no-GPU hosts, matching
-# fn64-render-rt64's own default-off `rt64` feature.
+# links against fn64-render-rt64's overlay-draw registration + RmlUi
+# render-interface bridge calls (requires fn64-render-rt64's own `rmlui`
+# feature enabled in the same build -- not a Cargo dependency edge, see
+# build.rs's own comment on why). The default remains pure Rust for
+# CI/no-GPU hosts, matching fn64-render-rt64's own default-off `rt64`
+# feature.
 rmlui = []
 
 [build-dependencies]
