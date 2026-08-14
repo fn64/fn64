@@ -79,6 +79,7 @@ use input_map::{InputConfig, PadState};
 use timing::{RetraceOutcome, TimingWindow};
 
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -1559,11 +1560,43 @@ impl ApplicationHandler for Shell {
                 w.request_redraw();
             }
         }
+        if SIGNALED_EXIT.load(Ordering::Relaxed) {
+            event_loop.exit();
+            return;
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
     }
 }
 
+/// Set by [`install_signal_handler`]; checked once per `about_to_wait` tick.
+///
+/// `winit`'s `NSApplication`-backed event loop on macOS does not reliably act
+/// on a bare `SIGTERM`/`SIGINT` while parked in its Cocoa run loop -- both
+/// were confirmed to leave the process running (`kill -TERM`/`kill -INT`,
+/// process stays alive, no custom handler existed to explain it). `ControlFlow::
+/// WaitUntil` already wakes this loop every frame deadline (33.3 ms default),
+/// so a flag checked here closes the gap without touching the run loop itself.
+static SIGNALED_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Install a `SIGTERM`/`SIGINT` handler that sets [`SIGNALED_EXIT`] instead of
+/// relying on the default disposition, which this process does not reliably
+/// act on. Async-signal-safe: only an atomic store, matching the restriction
+/// on what a signal handler may safely do.
+fn install_signal_handler() {
+    extern "C" fn handle(_signal: libc::c_int) {
+        SIGNALED_EXIT.store(true, Ordering::Relaxed);
+    }
+    // SAFETY: installed once, before the event loop starts, from the single
+    // startup thread; `handle` only performs an atomic store, which is
+    // async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGTERM, handle as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
+    }
+}
+
 fn main() {
+    install_signal_handler();
     // Default the mprotect write-barrier on for this shell: the headless
     // benchmark (`render-benchmark.zsh`) already sets it unconditionally, and
     // `docs/plans/perf-method.md` records it as a replicated 1.58x win (MMU
