@@ -803,12 +803,14 @@ short adjacent frames, not as a real attribution. **This closes the
 question Finding 3 opened, in the negative:** this wait is not where the
 busy-phase cost lives.
 
-The instrumentation stanza is left in place (inert, `OFF` by default) rather
-than deleted, since it is now proven mechanically sound (matched both
-anchors on the first real build, zero `FATAL_ERROR`s) and answering the next
-candidate wait needs the identical apparatus. Re-enable with
-`FN64_RT64_WAIT_TRACE=1`, and `cargo clean -p fn64-render-rt64 --release`
-first per Finding 4's caution about stale cached archives.
+**Removed 2026-08-13**, once RT64 became `wm2000-shell`'s default renderer:
+the stanza was explicitly TEMPORARY (its own comment said so) and existed
+only to answer the question this finding closes. Leaving diagnostic-only
+CMake string-patching in the tree once RT64 is the production default lane
+is a real liability, not a convenience -- reviving it for a future question
+means re-deriving the patch from this record (the exact CMake stanza and
+its `#include`/wait-block text are preserved in the git history at
+`acc0179`), not keeping it live and inert indefinitely.
 
 ## Finding 6: dispatch_lle_task's RSP-interpretation guess was wrong. RDP rasterization is the real cost, at 27.5 ms/field, measured directly.
 

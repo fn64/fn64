@@ -159,7 +159,6 @@ fn build_synthetic_native_archives(manifest_dir: &Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed=FN64_RT64_DIR");
     println!("cargo:rerun-if-env-changed=FN64_RT64_SOURCE_ID");
-    println!("cargo:rerun-if-env-changed=FN64_RT64_WAIT_TRACE");
     println!("cargo:rerun-if-changed=ffi/CMakeLists.txt");
     println!("cargo:rerun-if-changed=ffi/fn64_rt64_shim.cpp");
     println!("cargo:rerun-if-changed=ffi/fn64_rt64_shim.h");
@@ -278,16 +277,6 @@ fn main() {
                 "-DFN64_RT64_SYNTHETIC_S2DEX_EVIDENCE=OFF"
             },
         )
-        // TEMPORARY diagnostic gate, not a real overlay (not in
-        // RT64_SOURCE_OVERLAY_ID above): times the renderAndSynchronize
-        // execute+wait inside RT64::State::fullSync() to check a live
-        // `sample` finding (docs/plans/rt64-on-the-block-lane.md, 2026-08-13
-        // addendum, Finding 3). Off unless FN64_RT64_WAIT_TRACE is set.
-        .arg(if env::var_os("FN64_RT64_WAIT_TRACE").is_some() {
-            "-DFN64_RT64_WAIT_TRACE=ON"
-        } else {
-            "-DFN64_RT64_WAIT_TRACE=OFF"
-        })
         .arg("-DCMAKE_BUILD_TYPE=Release");
     run(&mut configure, "RT64 CMake configure");
 
