@@ -241,14 +241,19 @@ pub(super) fn run_block_program(
                 let vector = fault.enter_exception(ctx).unwrap_or_else(|| {
                     let destinations = live.program.borrow().copy_execution_destinations();
                     let recent_start = destinations.len().saturating_sub(16);
+                    // Read the Copy CP0 fields before taking `ctx`'s mutable
+                    // borrow for `indirect_transfer_observations()` below --
+                    // that borrow (needed to make the ring buffer's tail
+                    // contiguous) would otherwise conflict with reading them
+                    // inside the same `format!`.
+                    let cop0_status = ctx.cop0_status;
+                    let cop0_cause = ctx.cop0_cause;
+                    let cop0_epc = ctx.cop0_epc;
+                    let cop0_badvaddr = ctx.cop0_badvaddr;
                     let indirect = ctx.indirect_transfer_observations();
                     let indirect_start = indirect.len().saturating_sub(8);
                     recompiled_gap_panic(format!(
-                        "live BlockProgram stopped on non-architectural guest fault: {fault:?}; current CP0 status={:#010x} cause={:#010x} epc={:#010x} badvaddr={:#018x}; recent entered destinations={:?}; recent indirect transfers={:?}",
-                        ctx.cop0_status,
-                        ctx.cop0_cause,
-                        ctx.cop0_epc,
-                        ctx.cop0_badvaddr,
+                        "live BlockProgram stopped on non-architectural guest fault: {fault:?}; current CP0 status={cop0_status:#010x} cause={cop0_cause:#010x} epc={cop0_epc:#010x} badvaddr={cop0_badvaddr:#018x}; recent entered destinations={:?}; recent indirect transfers={:?}",
                         &destinations[recent_start..],
                         &indirect[indirect_start..],
                     ))

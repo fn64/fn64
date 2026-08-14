@@ -596,7 +596,16 @@ pub struct RecompContext {
     thread_return_pc: Option<u32>,
     /// Bounded diagnostic history. It never participates in guest execution,
     /// pack identity, or generation selection.
-    indirect_transfers: Vec<IndirectTransferObservation>,
+    ///
+    /// `VecDeque`, not `Vec`: this is pushed on every indirect branch/call
+    /// the recompiled code executes, and a `Vec` here meant dropping the
+    /// oldest entry via `remove(0)` -- an O(n) shift of the remaining
+    /// (up to `INDIRECT_TRANSFER_HISTORY_LIMIT`-1) ~300-byte entries on
+    /// every push once the history fills, which it does almost immediately.
+    /// `push_back`/`pop_front` are O(1). `make_contiguous()` is called right
+    /// after each push so the existing `&[T]` accessor keeps working with no
+    /// change to its callers.
+    indirect_transfers: std::collections::VecDeque<IndirectTransferObservation>,
 }
 
 impl RecompContext {
@@ -848,9 +857,9 @@ impl RecompContext {
         link_pc: Option<u32>,
     ) {
         if self.indirect_transfers.len() == Self::INDIRECT_TRANSFER_HISTORY_LIMIT {
-            self.indirect_transfers.remove(0);
+            self.indirect_transfers.pop_front();
         }
-        self.indirect_transfers.push(IndirectTransferObservation {
+        self.indirect_transfers.push_back(IndirectTransferObservation {
             source_bank,
             source_pc,
             source_register,
@@ -866,8 +875,14 @@ impl RecompContext {
     }
 
     /// Exact retained order, oldest to newest.
-    pub fn indirect_transfer_observations(&self) -> &[IndirectTransferObservation] {
-        &self.indirect_transfers
+    ///
+    /// `&mut self`: a ring-buffered `VecDeque` is not contiguous once it has
+    /// wrapped, so producing a real `&[T]` needs `make_contiguous()`. That
+    /// cost lands here, on this rare diagnostic read, rather than on every
+    /// push in [`Self::record_indirect_transfer`] -- the hot path this type
+    /// changed from `Vec` to avoid paying an O(n) shift on.
+    pub fn indirect_transfer_observations(&mut self) -> &[IndirectTransferObservation] {
+        self.indirect_transfers.make_contiguous()
     }
 
     /// Write a 32-bit result into GPR `idx`, sign-extending into the 64-bit
