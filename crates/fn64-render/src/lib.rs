@@ -1120,6 +1120,42 @@ pub struct RenderReleaseCapture {
     pub present_id: u64,
 }
 
+/// Positive, finite effective raster scale selected by a renderer.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RenderResolutionScale {
+    x: f32,
+    y: f32,
+}
+
+impl RenderResolutionScale {
+    pub fn try_new(x: f32, y: f32) -> Option<Self> {
+        (x.is_finite() && y.is_finite() && x > 0.0 && y > 0.0).then_some(Self { x, y })
+    }
+
+    pub fn x(self) -> f32 {
+        self.x
+    }
+
+    pub fn y(self) -> f32 {
+        self.y
+    }
+}
+
+/// Effective managed framebuffer geometry selected by the renderer's most
+/// recent completed presentation.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RenderTargetDiagnostic {
+    pub present_id: NonZeroU64,
+    pub target_address: u32,
+    /// Scale selected for the workload before target-specific normalization.
+    pub workload_resolution_scale: RenderResolutionScale,
+    /// Scale retained by the concrete target sampled by VI.
+    pub resolution_scale: RenderResolutionScale,
+    pub raster_width: NonZeroU32,
+    pub raster_height: NonZeroU32,
+    pub downsample_multiplier: NonZeroU32,
+}
+
 impl std::ops::Deref for RenderReleaseCapture {
     type Target = ReleaseCapturePixelsView;
 
@@ -1703,6 +1739,16 @@ pub trait RenderBackend {
         RenderBackendEvidence::Unidentified
     }
 
+    /// Inspect effective target geometry after both renderer workers are idle.
+    /// This is an explicit diagnostic seam rather than release-capture data:
+    /// implementations may need synchronization that is inappropriate on the
+    /// ordinary presentation path.
+    fn render_target_diagnostic(&mut self) -> Result<RenderTargetDiagnostic, RenderError> {
+        Err(RenderError::NotReady(
+            "render-target diagnostics are unsupported by this backend",
+        ))
+    }
+
     /// The output target changed size (a real window resize, or a harness
     /// reconfiguring a headless target). Infallible by design: a backend
     /// that cannot honor a resize should surface that at the next
@@ -1787,6 +1833,16 @@ pub enum NonRdpWrite16Disposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_resolution_scale_admits_only_positive_finite_axes() {
+        let scale = RenderResolutionScale::try_new(2.0, 1.5).unwrap();
+        assert_eq!((scale.x(), scale.y()), (2.0, 1.5));
+        for invalid in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert_eq!(RenderResolutionScale::try_new(invalid, 1.0), None);
+            assert_eq!(RenderResolutionScale::try_new(1.0, invalid), None);
+        }
+    }
 
     /// A minimal in-crate fake backend, used ONLY to prove the trait object
     /// is dyn-safe and that its contract (create-before-use, unsupported-

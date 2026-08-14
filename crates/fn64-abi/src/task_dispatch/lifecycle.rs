@@ -932,6 +932,28 @@ pub fn capture_render_release_frame_into(
     })
 }
 
+/// Inspect the registered renderer's effective managed target geometry.
+/// Unlike release capture, this diagnostic may wait renderer workers idle and
+/// therefore belongs in explicit probes rather than an interactive frame loop.
+pub fn render_target_diagnostic(
+) -> Result<fn64_render::RenderTargetDiagnostic, fn64_render::RenderError> {
+    if HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some()) {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-target-diagnostic",
+            reason: "an HLE renderer continuation is still live".into(),
+        });
+    }
+    RENDER_BACKEND.with(|cell| {
+        let mut registered = cell.borrow_mut();
+        registered
+            .as_mut()
+            .ok_or(fn64_render::RenderError::NotReady(
+                "render_target_diagnostic: no render backend registered",
+            ))?
+            .render_target_diagnostic()
+    })
+}
+
 /// Snapshot the concrete registered backend and graphics execution policy.
 /// The backend self-reports through the trait object; callers cannot attach a
 /// separate label after registration.

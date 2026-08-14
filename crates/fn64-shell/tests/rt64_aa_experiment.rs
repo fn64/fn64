@@ -44,6 +44,13 @@ fn presets_isolate_high_resolution_downsample_and_msaa_axes() {
     assert_eq!(msaa.resolution, RenderResolution::Original);
     assert_eq!(msaa.antialiasing, RenderAntialiasing::Msaa4x);
     assert_eq!(settings_sha256_hex(&native).len(), 64);
+    for preset in Rt64AaPreset::ALL {
+        assert_eq!(Rt64AaPreset::from_settings(&preset.settings()), Some(preset));
+    }
+
+    let mut custom = supersample;
+    custom.antialiasing = RenderAntialiasing::Msaa2x;
+    assert_eq!(Rt64AaPreset::from_settings(&custom), None);
 }
 
 #[test]

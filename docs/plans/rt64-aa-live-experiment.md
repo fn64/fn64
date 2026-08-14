@@ -27,8 +27,11 @@ internal-resolution path.
 ## Run
 
 Build the WM2000 shell with its existing private inputs and RT64 feature. F7
-cycles the four presets above. The window title names the active preset so a
-visual comparison does not depend on access to the launching terminal. Every
+toggles directly between native and 2x box-downsampled supersampling; F8 cycles
+all four presets above. A startup or reloaded TOML that exactly matches a
+preset updates the same typed active-preset state, so the next key press cannot
+silently start from a stale cursor. The window title names the active preset so
+a visual comparison does not depend on access to the launching terminal. Every
 successful transition prints
 `mode=...`, the complete settings SHA-256, and
 `framebuffers_discarded=...`. Wait for at least one complete heartbeat window
@@ -70,6 +73,27 @@ available to the real interactive workload for visual and frame-time A/Bs.
 
 ## Validation on 2026-08-14
 
+The first WM2000 visual run found a real integration defect: all four modes
+were byte-identical because fn64 added RT64's conventional leading scanline to
+VI_ORIGIN before crossing the native boundary, then pinned RT64 subtracted the
+same row in `VI::fbAddress()`. That cancellation made presentation miss the
+managed color targets at `0x0038f800`/`0x003c7c00` and create native 1x scratch
+targets at the guest VI origins `0x0038fbc0`/`0x003c7fc0`. The same no-op was
+reproduced at 1,200 fields without input and at 4,000 fields under the committed
+entrance route: native and 2x-box hashes were respectively identical within
+each checkpoint.
+
+The adapter now preserves guest VI_ORIGIN and lets RT64 apply its lookup bias
+once. A typed, explicit diagnostic waits both renderer workers and reports the
+pre-normalization workload scale plus the exact target scale/raster/downsample
+selected by the completed present. At the 1,200-field checkpoint, native now
+selects `0x003c7c00`, scale 1x, raster 480x240, downsample 1, SHA-256
+`51830b74...`; the existing 2x-box preset selects the same managed target at
+scale 2x, raster 960x480, downsample 2, SHA-256 `5524bbd5...`. This is one
+native baseline followed by ten consecutive clean 2x runs of the same compiled
+artifact; every 2x run reproduced both the managed-target geometry and exact
+distinct capture identity.
+
 - The typed registered-renderer update seam and strict parser/preset tests
   passed ten consecutive clean runs.
 - The live Metal resolution/downsample fixture passed ten consecutive clean
@@ -82,3 +106,7 @@ available to the real interactive workload for visual and frame-time A/Bs.
 - The private-input WM2000 shell compiled with RT64, and one zero-frame smoke
   launch applied the example config through the real shell -> ABI -> RT64
   path. That launch is a smoke check, not a ten-run or visual-quality claim.
+- After correcting live-origin ownership, ten consecutive 1,200-field WM2000
+  Metal runs selected the 960x480 managed 2x target and reproduced the exact
+  `5524bbd5...` post-VI capture. The paired native checkpoint selected 480x240
+  and produced distinct `51830b74...` pixels.

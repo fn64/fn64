@@ -673,6 +673,9 @@ impl Context {
                 "RT64 present-selection query failed without a diagnostic",
             ));
         }
+        if selection.reserved != 0 {
+            return Err("RT64 present selection returned nonzero reserved metadata".into());
+        }
         Ok(crate::Rt64PresentSelection {
             present_id: selection.present_id,
             source_texture_identity: selection.source_texture_identity,
@@ -680,6 +683,13 @@ impl Context {
             target_width: selection.target_width,
             target_height: selection.target_height,
             target_size: selection.target_size,
+            workload_resolution_scale_x: selection.workload_resolution_scale_x,
+            workload_resolution_scale_y: selection.workload_resolution_scale_y,
+            resolution_scale_x: selection.resolution_scale_x,
+            resolution_scale_y: selection.resolution_scale_y,
+            raster_width: selection.raster_width,
+            raster_height: selection.raster_height,
+            downsample_multiplier: selection.downsample_multiplier,
         })
     }
 

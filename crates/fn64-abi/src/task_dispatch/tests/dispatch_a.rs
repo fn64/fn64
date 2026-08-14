@@ -1365,6 +1365,22 @@ use super::*;
                 })
             }
 
+            fn render_target_diagnostic(
+                &mut self,
+            ) -> Result<fn64_render::RenderTargetDiagnostic, RenderError> {
+                Ok(fn64_render::RenderTargetDiagnostic {
+                    present_id: std::num::NonZeroU64::new(7).unwrap(),
+                    target_address: 0x0012_3400,
+                    workload_resolution_scale:
+                        fn64_render::RenderResolutionScale::try_new(2.0, 2.0).unwrap(),
+                    resolution_scale:
+                        fn64_render::RenderResolutionScale::try_new(2.0, 2.0).unwrap(),
+                    raster_width: std::num::NonZeroU32::new(640).unwrap(),
+                    raster_height: std::num::NonZeroU32::new(480).unwrap(),
+                    downsample_multiplier: std::num::NonZeroU32::new(2).unwrap(),
+                })
+            }
+
             fn resize(&mut self, _w: u32, _h: u32) {}
 
             fn supported_ucodes(&self) -> &[UcodeId] {
@@ -1381,6 +1397,14 @@ use super::*;
         assert_eq!(capture.settings_sha256, [0x5a; 32]);
         assert_eq!(capture.present_id, 7);
         assert_eq!(capture.bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let target = render_target_diagnostic().unwrap();
+        assert_eq!(target.present_id.get(), 7);
+        assert_eq!(target.target_address, 0x0012_3400);
+        assert_eq!(target.workload_resolution_scale.x(), 2.0);
+        assert_eq!(target.resolution_scale.y(), 2.0);
+        assert_eq!(target.raster_width.get(), 640);
+        assert_eq!(target.raster_height.get(), 480);
+        assert_eq!(target.downsample_multiplier.get(), 2);
         assert_eq!(last_render_error(), None);
         assert_eq!(
             render_environment_evidence_snapshot(),

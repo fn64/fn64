@@ -45,6 +45,14 @@ discarded framebuffer resources. These shortcuts are an experiment harness,
 not the settings UI policy; they intentionally cross the same typed
 registered-renderer seam that a later frontend uses.
 
+An explicit headless diagnostic can additionally report the positive finite
+workload scale and the concrete managed target's positive finite scale,
+nonzero raster extent, and downsample multiplier after both RT64 workers are
+idle. This evidence caught a former double origin compensation that sent
+WM2000 presentation through RT64's native scratch upload and made every F7
+resolution mode inert; the ordinary frame path does not pay for the diagnostic
+wait.
+
 The Metal user-control gate also isolates the four live fields that do not
 intentionally discard framebuffer resources: Manual 72 Hz refresh targeting,
 disabled hardware resolve, enabled idle work, and developer mode. Each phase
