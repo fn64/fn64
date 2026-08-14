@@ -502,7 +502,7 @@ fn validate_present_capture_metadata(
     Ok((host_len, format, graphics_api))
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[repr(C)]
 struct RawPresentSelection {
     present_id: u64,
@@ -511,9 +511,17 @@ struct RawPresentSelection {
     target_width: u32,
     target_height: u32,
     target_size: u32,
+    workload_resolution_scale_x: f32,
+    workload_resolution_scale_y: f32,
+    resolution_scale_x: f32,
+    resolution_scale_y: f32,
+    raster_width: u32,
+    raster_height: u32,
+    downsample_multiplier: u32,
+    reserved: u32,
 }
 
-const _: [(); 32] = [(); std::mem::size_of::<RawPresentSelection>()];
+const _: [(); 64] = [(); std::mem::size_of::<RawPresentSelection>()];
 
 const DEFERRED_MAX_FRAMEBUFFER_PAIRS: usize = 4;
 const DEFERRED_MAX_DRAW_CALLS: usize = 16;
@@ -1452,10 +1460,25 @@ fn replacement_identity_from_raw(
 }
 
 // Split by concern: raw config wire structs, the Context impl, and the
-// test module live in child modules; children see this module's private
-// items, so the FFI surface and field visibilities are unchanged.
+// test module live in child modules.
+//
+// The re-exports below are load-bearing, and the original split omitted them:
+// a child sees this module's OWN items, but not names this module merely
+// `use`d privately, and two children cannot see each other at all. So
+// `config_wire`'s `unsafe extern "C"` block was invisible to `context.rs`
+// (37 unresolved `fn64_rt64_*` symbols) and `context.rs`'s `error_string` was
+// invisible to `config_wire.rs` (6 more), while `crate::ffi::Context` did not
+// resolve from lib.rs because `mod context;` alone publishes no name here.
+//
+// `pub(crate)` rather than a private `use`, precisely so the children and
+// lib.rs resolve these through `ffi`. This does not widen the crate's public
+// API: the crate root exports no `ffi`, so `pub(crate)` is the whole reach.
+//
+// None of this is reachable without the non-default `rt64` feature, which is
+// why `cargo build`/CI never typechecked it and the split landed green.
 mod config_wire;
-use config_wire::*;
+pub(crate) use config_wire::*;
 mod context;
+pub(crate) use context::*;
 #[cfg(test)]
 mod tests;

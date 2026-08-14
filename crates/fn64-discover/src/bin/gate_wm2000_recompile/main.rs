@@ -66,6 +66,12 @@ use std::time::Instant;
 
 const ROM_VAR: &str = "FN64_DISCOVER_NWXE_ROM";
 const BOOT_CONTEXT_VAR: &str = "FN64_BOOT_CONTEXT";
+/// The shipped WM shard inventory, `include!`d from the one source the shard
+/// crates, the WM root pack build and the verifier all share. This gate
+/// checks that the topology it derives from the dense pack equals the
+/// inventory the WM root actually links, so the two cannot drift apart.
+const SHARD_INVENTORY: &[(&str, &str)] =
+    &include!("../../../../../examples/wm2000-block-shards/shard_inventory.in");
 const EXPECTED_BANKS: usize = 5;
 const WM_RESIDENT_TAIL_IDENTITY_DOMAIN_V1: &[u8] = b"fn64:wm2000-resident-tail-generation:v1:";
 
@@ -524,10 +530,23 @@ fn expected_static_shard_packages(
             ));
         }
     }
-    if expected.len() != 35 {
+    // The derived topology must equal the inventory the WM root actually
+    // links. Comparing the names, not just a count, is what makes this an
+    // agreement rather than a restated number: a hardcoded 35 here outlived
+    // the 6ae673e text-extent change and would have rejected the real
+    // 32-package graph.
+    let inventory = SHARD_INVENTORY
+        .iter()
+        .map(|(package, _)| (*package).to_owned())
+        .collect::<BTreeSet<_>>();
+    if expected != inventory {
+        let missing = inventory.difference(&expected).collect::<Vec<_>>();
+        let unexpected = expected.difference(&inventory).collect::<Vec<_>>();
         return Err(format!(
-            "static shard dependency topology has {} packages, expected 35",
-            expected.len()
+            "static shard dependency topology has {} packages and disagrees with the \
+             shipped shard inventory ({} packages): missing={missing:?} unexpected={unexpected:?}",
+            expected.len(),
+            inventory.len(),
         ));
     }
     Ok(expected)

@@ -1181,6 +1181,72 @@ use super::*;
 
 
     #[test]
+    fn runtime_settings_cross_the_owned_renderer_seam_without_downcasting() {
+        struct SettingsBackend(Rc<RefCell<Option<fn64_render::RenderRuntimeSettings>>>);
+
+        impl RenderBackend for SettingsBackend {
+            fn create(&mut self, _cfg: &RenderConfig) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            no_rust_hidden_sidecar!();
+
+            fn process_task(
+                &mut self,
+                _rdram: &mut [u8],
+                _rsp_memory: &mut fn64_runtime::RspMemory,
+                _task: &fn64_render::OsTask,
+                _output_addr: u32,
+            ) -> Result<FrameStatus, RenderError> {
+                Ok(FrameStatus::Complete)
+            }
+
+            fn present(
+                &mut self,
+                _request: fn64_render::PresentRequest<'_>,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn resize(&mut self, _w: u32, _h: u32) {}
+
+            fn supported_ucodes(&self) -> &[UcodeId] {
+                &[]
+            }
+
+            fn apply_runtime_settings(
+                &mut self,
+                settings: &fn64_render::RenderRuntimeSettings,
+            ) -> Result<fn64_render::RenderSettingsApply, RenderError> {
+                self.0.replace(Some(settings.clone()));
+                Ok(fn64_render::RenderSettingsApply::LiveApplied {
+                    settings_sha256: settings.sha256(),
+                    framebuffers_discarded: true,
+                })
+            }
+        }
+
+        let observed = Rc::new(RefCell::new(None));
+        set_render_backend(Box::new(SettingsBackend(observed.clone())), 0);
+        let settings = fn64_render::RenderRuntimeSettings {
+            resolution: fn64_render::RenderResolution::Manual,
+            resolution_multiplier: fn64_render::ResolutionMultiplier::new(2.0).unwrap(),
+            downsample_multiplier: fn64_render::DownsampleMultiplier::new(2).unwrap(),
+            ..fn64_render::RenderRuntimeSettings::default()
+        };
+        assert_eq!(
+            apply_render_runtime_settings(&settings).unwrap(),
+            fn64_render::RenderSettingsApply::LiveApplied {
+                settings_sha256: settings.sha256(),
+                framebuffers_discarded: true,
+            }
+        );
+        assert_eq!(observed.borrow().as_ref(), Some(&settings));
+        assert_eq!(last_render_error(), None);
+    }
+
+
+    #[test]
     fn unsupported_backend_ucode_records_typed_event_before_loud_failure() {
         set_render_backend(Box::new(UnsupportedUcodeBackend), 0);
         fn64_runtime::arm_unsupported_events(None).unwrap();
@@ -1265,21 +1331,53 @@ use super::*;
                 Ok(())
             }
 
-            fn release_capture(
+            fn release_capture(&mut self) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
+                self.release_capture_into(&mut Vec::new())
+            }
+
+            fn release_capture_into(
                 &mut self,
+                reuse: &mut Vec<u8>,
             ) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
+                reuse.clear();
+                reuse.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
                 Ok(fn64_render::RenderReleaseCapture {
                     guest_cycle: 0x1234,
                     backend_identity: "synthetic-release-backend".to_string(),
                     source_authoritative: true,
                     settings_sha256: [0x5a; 32],
-                    width: 2,
-                    height: 1,
-                    row_bytes: 8,
-                    format: fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+                    pixels: fn64_render::ReleaseCapturePixels::try_from_reused(
+                        fn64_render::ReleaseCaptureLayout::try_new(
+                            fn64_render::ReleaseCaptureLayoutSpec {
+                                format: fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+                                width: 2,
+                                storage_height: 1,
+                                visible_height: 1,
+                                row_bytes: 8,
+                            },
+                        )
+                        .unwrap(),
+                        reuse,
+                    )
+                    .unwrap(),
                     workload_id: std::num::NonZeroU64::new(5).unwrap(),
                     present_id: 7,
-                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                })
+            }
+
+            fn render_target_diagnostic(
+                &mut self,
+            ) -> Result<fn64_render::RenderTargetDiagnostic, RenderError> {
+                Ok(fn64_render::RenderTargetDiagnostic {
+                    present_id: std::num::NonZeroU64::new(7).unwrap(),
+                    target_address: 0x0012_3400,
+                    workload_resolution_scale:
+                        fn64_render::RenderResolutionScale::try_new(2.0, 2.0).unwrap(),
+                    resolution_scale:
+                        fn64_render::RenderResolutionScale::try_new(2.0, 2.0).unwrap(),
+                    raster_width: std::num::NonZeroU32::new(640).unwrap(),
+                    raster_height: std::num::NonZeroU32::new(480).unwrap(),
+                    downsample_multiplier: std::num::NonZeroU32::new(2).unwrap(),
                 })
             }
 
@@ -1299,6 +1397,14 @@ use super::*;
         assert_eq!(capture.settings_sha256, [0x5a; 32]);
         assert_eq!(capture.present_id, 7);
         assert_eq!(capture.bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let target = render_target_diagnostic().unwrap();
+        assert_eq!(target.present_id.get(), 7);
+        assert_eq!(target.target_address, 0x0012_3400);
+        assert_eq!(target.workload_resolution_scale.x(), 2.0);
+        assert_eq!(target.resolution_scale.y(), 2.0);
+        assert_eq!(target.raster_width.get(), 640);
+        assert_eq!(target.raster_height.get(), 480);
+        assert_eq!(target.downsample_multiplier.get(), 2);
         assert_eq!(last_render_error(), None);
         assert_eq!(
             render_environment_evidence_snapshot(),
@@ -1318,6 +1424,15 @@ use super::*;
             render_environment_evidence_snapshot().renderer_tv_type(),
             Some(fn64_runtime::TvType::Pal)
         );
+
+        set_render_backend(Box::new(CaptureBackend), 0);
+        let mut reuse = Vec::with_capacity(64);
+        let allocation = reuse.as_ptr();
+        let capture = capture_render_release_frame_into(&mut reuse).unwrap();
+        assert_eq!(capture.bytes.as_ptr(), allocation);
+        reuse = capture.pixels.into_bytes();
+        assert!(reuse.capacity() >= 64);
+        assert_eq!(reuse, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
 
@@ -1420,6 +1535,7 @@ use super::*;
                 _start: u32,
                 _end: u32,
                 _output_addr: u32,
+                _wait_for_completion: bool,
             ) -> Result<FrameStatus, RenderError> {
                 self.0
                     .borrow_mut()
@@ -1784,6 +1900,7 @@ use super::*;
                 &[0xe900_0000, 0],
                 0,
                 8,
+                true,
                 true,
                 &mut transaction,
             )

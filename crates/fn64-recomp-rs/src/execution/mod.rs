@@ -160,6 +160,19 @@ pub struct AotMiss {
     pub byte_len: u32,
     pub expected_sha256: [u8; 32],
     pub actual_sha256: [u8; 32],
+    /// Byte offset from `va_start` where live memory first differs from the
+    /// compiled image, when the caller can determine it.
+    ///
+    /// Two digests prove the image is not the compiled one but say nothing
+    /// about WHY, and the two explanations need opposite fixes: a low offset
+    /// inside a data field means the game wrote to mutable state the digest
+    /// covers, while a divergence spread from offset zero means this is a
+    /// different overlay entirely. On WM2000 that distinction is what blocks
+    /// the route past its overlay entry, and no diagnostic recorded it.
+    ///
+    /// `None` when the comparison is digest-only (the caller never held both
+    /// byte images), which keeps this additive for existing callers.
+    pub first_diff_offset: Option<u32>,
 }
 
 impl fmt::Display for AotMiss {
@@ -172,7 +185,15 @@ impl fmt::Display for AotMiss {
             self.va_start.get().saturating_add(self.byte_len),
             Sha256Display(self.expected_sha256),
             Sha256Display(self.actual_sha256),
-        )
+        )?;
+        if let Some(offset) = self.first_diff_offset {
+            write!(
+                formatter,
+                "; first differing byte at +{offset:#x} (va {:#010X})",
+                self.va_start.get().saturating_add(offset),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -216,6 +237,10 @@ pub fn verify_precompiled_image(
             byte_len,
             expected_sha256,
             actual_sha256,
+            // Digest-only comparison: this seam holds the live bytes and the
+            // expected DIGEST, never the expected bytes, so there is nothing
+            // to diff against.
+            first_diff_offset: None,
         })
     }
 }
@@ -242,6 +267,15 @@ pub fn verify_precompiled_instruction_word(
         byte_len: 4,
         expected_sha256: Sha256::digest(expected_word.to_be_bytes()).into(),
         actual_sha256: Sha256::digest(actual_word.to_be_bytes()).into(),
+        // One word, and it differs, so the first differing byte is within it.
+        first_diff_offset: Some(
+            expected_word
+                .to_be_bytes()
+                .iter()
+                .zip(actual_word.to_be_bytes().iter())
+                .position(|(expected, actual)| expected != actual)
+                .expect("words differ, so some byte differs") as u32,
+        ),
     })
 }
 
@@ -1110,10 +1144,21 @@ where
             && run.exit == BlockExit::Checkpoint(entry)
             && !turn_budget.can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
         {
-            return Err(DispatchError::IndivisibleUnitExceedsBudget {
-                at: entry,
-                budget: turn_budget,
-                required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
+            // Budget remains, but not enough for an indivisible unit: a branch
+            // and its delay slot retire together, and the runner correctly
+            // refuses to start a pair it cannot finish.
+            //
+            // That is a SLICE boundary, not a program fault. Erroring aborted
+            // WM2000's certified route at pc=0x800040B8 with one instruction
+            // of a 4096 budget left. Checkpointing lets the caller resume at
+            // the same PC with a fresh budget, where the pair retires whole.
+            //
+            // Sound only because `instructions == 0`: the unit has not
+            // partially executed, so nothing is torn and no state is lost.
+            return Ok(DispatchRun {
+                exit: BlockExit::Checkpoint(entry),
+                instructions,
+                blocks,
             });
         }
         if run.instructions == 0

@@ -1,0 +1,38 @@
+// Fixture inventory for the No Mercy (NW4E) topology recorded in
+// `docs/plans/corpus-certification-frontier.md:1829`: 5 overlay generations,
+// shard counts [3, 3, 5, 8, 5] per generation, 24 entries total.
+//
+// This is NOT a real, buildable No Mercy shard tree -- there are no sibling
+// `lib.rs`/leaf `Cargo.toml` files here, and bringing No Mercy up is
+// explicitly out of scope (see docs/plans/corpus-certification-frontier.md,
+// "The remaining wall"). Its only job is to be a second, differently-shaped
+// `shard_inventory.in` that `FN64_WM_SHARD_TITLE` can select at compile time,
+// so `shard_selector_test.rs` can prove the `include!` path in
+// `generated_runner_build/mod.rs` is a real selector and not a fixed literal
+// wearing an env-var costume.
+[
+    ("nomercy-block-overlay-0-shard-00", "overlay0-shard00"),
+    ("nomercy-block-overlay-0-shard-01", "overlay0-shard01"),
+    ("nomercy-block-overlay-0-shard-02", "overlay0-shard02"),
+    ("nomercy-block-overlay-1-shard-00", "overlay1-shard00"),
+    ("nomercy-block-overlay-1-shard-01", "overlay1-shard01"),
+    ("nomercy-block-overlay-1-shard-02", "overlay1-shard02"),
+    ("nomercy-block-overlay-2-shard-00", "overlay2-shard00"),
+    ("nomercy-block-overlay-2-shard-01", "overlay2-shard01"),
+    ("nomercy-block-overlay-2-shard-02", "overlay2-shard02"),
+    ("nomercy-block-overlay-2-shard-03", "overlay2-shard03"),
+    ("nomercy-block-overlay-2-shard-04", "overlay2-shard04"),
+    ("nomercy-block-overlay-3-shard-00", "overlay3-shard00"),
+    ("nomercy-block-overlay-3-shard-01", "overlay3-shard01"),
+    ("nomercy-block-overlay-3-shard-02", "overlay3-shard02"),
+    ("nomercy-block-overlay-3-shard-03", "overlay3-shard03"),
+    ("nomercy-block-overlay-3-shard-04", "overlay3-shard04"),
+    ("nomercy-block-overlay-3-shard-05", "overlay3-shard05"),
+    ("nomercy-block-overlay-3-shard-06", "overlay3-shard06"),
+    ("nomercy-block-overlay-3-shard-07", "overlay3-shard07"),
+    ("nomercy-block-overlay-4-shard-00", "overlay4-shard00"),
+    ("nomercy-block-overlay-4-shard-01", "overlay4-shard01"),
+    ("nomercy-block-overlay-4-shard-02", "overlay4-shard02"),
+    ("nomercy-block-overlay-4-shard-03", "overlay4-shard03"),
+    ("nomercy-block-overlay-4-shard-04", "overlay4-shard04"),
+]

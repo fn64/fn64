@@ -259,22 +259,23 @@ pub fn decode_raw_rdp_ops(rdram: &[u8], start: u32) -> Result<Vec<RenderOp>, Ren
 }
 
 pub(crate) fn decode_raw_rdp_ops_with_state(
-    rdram: &[u8],
+    rdram: &mut [u8],
     start: u32,
     rdp_state: &mut RdpDecodeState,
 ) -> Result<Vec<RenderOp>, RenderError> {
     let mut state = rdp_state.begin_task();
-    let mut scratch = rdram.to_vec();
     let mut family = GeometryWireFamily::F3dex2;
-    decode_stream_impl(
-        &mut scratch,
-        start,
-        &mut state,
-        true,
-        None,
-        None,
-        &mut family,
-    );
+    // No `rdram.to_vec()` scratch copy here (unlike the sibling decoders):
+    // raw-RDP tasks always pass `rsp_memory: None` below, and the only
+    // commands `decode_stream_impl` writes RDRAM through -- G_DMA_IO,
+    // G_LOAD_UCODE -- panic without live RSP memory. So `rdram` is read-only
+    // in practice on this path, and the caller already owns a genuine
+    // `&mut [u8]` (see `prepare_reference_task`'s `DecodeMode::RawRdp` arm),
+    // so decoding can borrow it directly instead of cloning all 8 MiB of
+    // guest RDRAM on every task. Measured live with `sample` on WM2000
+    // (100% raw-RDP/XBUS submission, ~18,838 tasks/route): this clone alone
+    // was ~4.5% of a 10s in-process capture during heavy rasterization.
+    decode_stream_impl(rdram, start, &mut state, true, None, None, &mut family);
     rdp_state.commit_task(&state);
     Ok(state.ops)
 }

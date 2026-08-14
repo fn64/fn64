@@ -241,14 +241,19 @@ pub(super) fn run_block_program(
                 let vector = fault.enter_exception(ctx).unwrap_or_else(|| {
                     let destinations = live.program.borrow().copy_execution_destinations();
                     let recent_start = destinations.len().saturating_sub(16);
+                    // Read the Copy CP0 fields before taking `ctx`'s mutable
+                    // borrow for `indirect_transfer_observations()` below --
+                    // that borrow (needed to make the ring buffer's tail
+                    // contiguous) would otherwise conflict with reading them
+                    // inside the same `format!`.
+                    let cop0_status = ctx.cop0_status;
+                    let cop0_cause = ctx.cop0_cause;
+                    let cop0_epc = ctx.cop0_epc;
+                    let cop0_badvaddr = ctx.cop0_badvaddr;
                     let indirect = ctx.indirect_transfer_observations();
                     let indirect_start = indirect.len().saturating_sub(8);
                     recompiled_gap_panic(format!(
-                        "live BlockProgram stopped on non-architectural guest fault: {fault:?}; current CP0 status={:#010x} cause={:#010x} epc={:#010x} badvaddr={:#018x}; recent entered destinations={:?}; recent indirect transfers={:?}",
-                        ctx.cop0_status,
-                        ctx.cop0_cause,
-                        ctx.cop0_epc,
-                        ctx.cop0_badvaddr,
+                        "live BlockProgram stopped on non-architectural guest fault: {fault:?}; current CP0 status={cop0_status:#010x} cause={cop0_cause:#010x} epc={cop0_epc:#010x} badvaddr={cop0_badvaddr:#018x}; recent entered destinations={:?}; recent indirect transfers={:?}",
                         &destinations[recent_start..],
                         &indirect[indirect_start..],
                     ))
@@ -1856,6 +1861,11 @@ pub(super) fn abi_host_shim_callable(shim: AbiHostShimV1) -> RecompFunc {
         AbiHostShimV1::OsSpTaskYield => os_sp_task_yield,
         AbiHostShimV1::OsSpTaskYielded => os_sp_task_yielded,
         AbiHostShimV1::OsStartThread => os_start_thread,
+        AbiHostShimV1::OsEPiWriteIo => os_epi_write_io,
+        AbiHostShimV1::OsEPiReadIo => os_epi_read_io,
+        AbiHostShimV1::OsFlashInit => os_flash_init,
+        AbiHostShimV1::OsFlashSectorErase => os_flash_sector_erase,
+        AbiHostShimV1::OsFlashReadArray => os_flash_read_array,
     }
 }
 
@@ -1877,7 +1887,17 @@ pub(super) fn abi_host_shim_writer_effects(shim: AbiHostShimV1) -> Vec<WriterCha
         ]
     };
     match shim {
-        AbiHostShimV1::OsEPiStartDma => {
+        // Programmed single-word IO commits through the same PI save-device
+        // path as a domain-2 DMA, so it carries the same channels as
+        // `osEPiStartDma` rather than the HostAbi-only default.
+        AbiHostShimV1::OsEPiStartDma
+        | AbiHostShimV1::OsEPiWriteIo
+        | AbiHostShimV1::OsEPiReadIo
+        // The FlashRAM API commits to the same PI-backed save store, and
+        // `osFlashReadArray` additionally writes the caller's guest buffer.
+        | AbiHostShimV1::OsFlashInit
+        | AbiHostShimV1::OsFlashSectorErase
+        | AbiHostShimV1::OsFlashReadArray => {
             vec![WriterChannel::PiDma, WriterChannel::HostAbi]
         }
         AbiHostShimV1::OsRecvMesg | AbiHostShimV1::OsSendMesg | AbiHostShimV1::OsStartThread => {

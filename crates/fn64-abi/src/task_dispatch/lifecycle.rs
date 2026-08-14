@@ -427,6 +427,10 @@ pub fn audio_frames_remaining() -> Option<u32> {
         cell.borrow()
             .as_ref()
             .and_then(|backend| backend.frames_remaining().ok())
+            .map(|frames| {
+                u32::try_from(frames.get())
+                    .expect("bounded host audio ring frame count must fit the ABI u32")
+            })
     })
 }
 
@@ -471,7 +475,7 @@ pub fn audio_rates() -> Option<(u32, u32)> {
     AUDIO_BACKEND.with(|cell| {
         let borrowed = cell.borrow();
         let stream_rate = borrowed.as_ref()?.stream_rate_hz()?;
-        Some((guest_rate, stream_rate))
+        Some((guest_rate, stream_rate.get()))
     })
 }
 
@@ -761,7 +765,7 @@ pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
     AUDIO_GUEST_RATE.with(|cell| cell.set(sample_rate_hz));
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            backend.set_frequency(sample_rate_hz);
+            backend.set_frequency(fn64_audio::GuestSampleRateHz::new(sample_rate_hz));
         }
     });
 }
@@ -841,6 +845,36 @@ pub fn last_render_error() -> Option<String> {
     RENDER_LAST_ERROR.with(|cell| cell.borrow().clone())
 }
 
+/// Apply one complete typed runtime-settings image to the registered renderer.
+///
+/// Interactive hosts call this only between guest/frame pumps. An HLE task
+/// continuation proves the renderer is mid-operation, so changing its
+/// resources at that boundary is rejected instead of racing continuation
+/// state. The backend remains owned here; callers do not downcast it.
+pub fn apply_render_runtime_settings(
+    settings: &fn64_render::RenderRuntimeSettings,
+) -> Result<fn64_render::RenderSettingsApply, fn64_render::RenderError> {
+    if HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some()) {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-runtime-settings",
+            reason: "an HLE renderer continuation is still live".into(),
+        });
+    }
+    RENDER_BACKEND.with(|cell| {
+        let mut registered = cell.borrow_mut();
+        let backend = registered
+            .as_mut()
+            .ok_or(fn64_render::RenderError::NotReady(
+                "apply_render_runtime_settings: no render backend registered",
+            ))?;
+        let result = backend.apply_runtime_settings(settings);
+        RENDER_LAST_ERROR.with(|last| {
+            last.replace(result.as_ref().err().map(ToString::to_string));
+        });
+        result
+    })
+}
+
 /// Drop registered host backends at the terminal process boundary while the
 /// caller's RDRAM allocation is still live.
 ///
@@ -867,6 +901,16 @@ pub(crate) fn drop_backends_for_process_exit() {
 /// remain typed errors.
 pub fn capture_render_release_frame(
 ) -> Result<fn64_render::RenderReleaseCapture, fn64_render::RenderError> {
+    capture_render_release_frame_into(&mut Vec::new())
+}
+
+/// Capture through the registered backend while offering an allocation from
+/// an earlier capture for reuse. A successful result owns the allocation;
+/// callers recover it with `RenderReleaseCapture::pixels.into_bytes()` after
+/// presenting or hashing the image. Errors leave `reuse` owned by the caller.
+pub fn capture_render_release_frame_into(
+    reuse: &mut Vec<u8>,
+) -> Result<fn64_render::RenderReleaseCapture, fn64_render::RenderError> {
     if HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some()) {
         return Err(fn64_render::RenderError::Backend {
             backend: "render-release-capture",
@@ -880,11 +924,33 @@ pub fn capture_render_release_frame(
             .ok_or(fn64_render::RenderError::NotReady(
                 "capture_render_release_frame: no render backend registered",
             ))?;
-        let result = backend.release_capture();
+        let result = backend.release_capture_into(reuse);
         RENDER_LAST_ERROR.with(|last| {
             last.replace(result.as_ref().err().map(ToString::to_string));
         });
         result
+    })
+}
+
+/// Inspect the registered renderer's effective managed target geometry.
+/// Unlike release capture, this diagnostic may wait renderer workers idle and
+/// therefore belongs in explicit probes rather than an interactive frame loop.
+pub fn render_target_diagnostic(
+) -> Result<fn64_render::RenderTargetDiagnostic, fn64_render::RenderError> {
+    if HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some()) {
+        return Err(fn64_render::RenderError::Backend {
+            backend: "render-target-diagnostic",
+            reason: "an HLE renderer continuation is still live".into(),
+        });
+    }
+    RENDER_BACKEND.with(|cell| {
+        let mut registered = cell.borrow_mut();
+        registered
+            .as_mut()
+            .ok_or(fn64_render::RenderError::NotReady(
+                "render_target_diagnostic: no render backend registered",
+            ))?
+            .render_target_diagnostic()
     })
 }
 

@@ -225,6 +225,20 @@ pub struct RspRdpObservationEvent {
     pub kind: RspRdpObservationKind,
 }
 
+/// Retention policy for committed RSP/RDP observation evidence.
+///
+/// Complete retention is the default and is required by certification and
+/// release-evidence consumers. Interactive hosts may explicitly select
+/// constant-space retention when they will not request release evidence from
+/// that ROM lifetime. The runtime still counts every committed observation in
+/// interactive mode, but discards its payload after the commit succeeds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RspRdpObservationRetention {
+    #[default]
+    CompleteEvidence,
+    InteractiveConstantSpace,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RspRdpObservationKind {
     MicrocodeRecognition {
@@ -1008,6 +1022,14 @@ struct HostState {
     /// Exact microcode-recognition and committed RSP/RDP mechanism history.
     /// This is release observation, not future-affecting device state.
     rsp_rdp_observations: Vec<RspRdpObservationEvent>,
+    /// Total committed observations in this ROM lifetime, including payloads
+    /// intentionally discarded by interactive constant-space retention.
+    rsp_rdp_observation_count: usize,
+    /// Whether committed observation payloads remain available for release
+    /// evidence. Switching to interactive mode is one-way until a new ROM
+    /// lifetime resets the policy and count, because discarded payloads cannot
+    /// be rebuilt.
+    rsp_rdp_observation_retention: RspRdpObservationRetention,
     /// Stable destinations entered by prepared generated-C bodies. Native
     /// pointers are retained only in the registration map used to translate
     /// the in-body hook back to generated section identity.
@@ -1118,6 +1140,8 @@ impl Default for HostState {
             save_operations: Vec::new(),
             controller_operations: Vec::new(),
             rsp_rdp_observations: Vec::new(),
+            rsp_rdp_observation_count: 0,
+            rsp_rdp_observation_retention: RspRdpObservationRetention::CompleteEvidence,
             native_execution_destinations: Vec::new(),
             native_destination_by_pointer: std::collections::HashMap::new(),
             thread_handles: std::collections::HashMap::new(),
@@ -1340,6 +1364,8 @@ fn classify_host_evidence_fields(host: &HostState) {
         save_operations: _,
         controller_operations: _,
         rsp_rdp_observations: _,
+        rsp_rdp_observation_count: _,
+        rsp_rdp_observation_retention: _,
         native_execution_destinations: _,
         native_destination_by_pointer: _,
         thread_handles: _,
@@ -1558,7 +1584,64 @@ pub fn copy_controller_operations_since(
 /// live IMEM image; mechanism entries require their corresponding memory or
 /// renderer commit to have succeeded.
 pub fn copy_rsp_rdp_observations() -> Vec<RspRdpObservationEvent> {
-    with_host(|host| host.rsp_rdp_observations.clone())
+    with_host(|host| {
+        assert_eq!(
+            host.rsp_rdp_observation_retention,
+            RspRdpObservationRetention::CompleteEvidence,
+            "copy_rsp_rdp_observations: full history is unavailable after interactive constant-space retention; start a new ROM lifetime with complete-evidence retention"
+        );
+        assert_eq!(
+            host.rsp_rdp_observations.len(),
+            host.rsp_rdp_observation_count,
+            "copy_rsp_rdp_observations: retained history is incomplete"
+        );
+        host.rsp_rdp_observations.clone()
+    })
+}
+
+/// Select whether this ROM lifetime retains complete RSP/RDP evidence.
+///
+/// [`RspRdpObservationRetention::CompleteEvidence`] is the default. Selecting
+/// [`RspRdpObservationRetention::InteractiveConstantSpace`] clears any retained
+/// payloads immediately and keeps only the total count. Complete retention can
+/// be restored only before any payload has been discarded; otherwise a new ROM
+/// lifetime is required so release evidence can never be silently incomplete.
+/// Loading a ROM always starts that lifetime in complete-evidence mode; an
+/// interactive host selects constant-space retention after loading its ROM.
+pub fn set_rsp_rdp_observation_retention(mode: RspRdpObservationRetention) {
+    with_host(|host| match mode {
+        RspRdpObservationRetention::CompleteEvidence => {
+            assert_eq!(
+                host.rsp_rdp_observations.len(),
+                host.rsp_rdp_observation_count,
+                "set_rsp_rdp_observation_retention: discarded interactive observations cannot be restored; load a new ROM before enabling complete evidence"
+            );
+            host.rsp_rdp_observation_retention = mode;
+        }
+        RspRdpObservationRetention::InteractiveConstantSpace => {
+            host.rsp_rdp_observations = Vec::new();
+            host.rsp_rdp_observation_retention = mode;
+        }
+    });
+}
+
+/// Current RSP/RDP observation retention policy.
+pub fn rsp_rdp_observation_retention() -> RspRdpObservationRetention {
+    with_host(|host| host.rsp_rdp_observation_retention)
+}
+
+/// How many observations have been recorded, without copying them.
+///
+/// The history only ever grows within a ROM load (`record_rsp_rdp_observations`
+/// advances this count; `pi::mmio` clears it only when a new image is
+/// published), so it remains a complete advance detector even when an
+/// interactive host suppresses payload retention.
+///
+/// Evidence consumers must keep using [`copy_rsp_rdp_observations`]: the
+/// release gate digests the whole ordered sequence and asserts
+/// `total_observations == ordered.len()`, and a count cannot stand in for that.
+pub fn rsp_rdp_observation_count() -> usize {
+    with_host(|host| host.rsp_rdp_observation_count)
 }
 
 pub(crate) fn record_rsp_rdp_observations(kinds: Vec<RspRdpObservationKind>) {
@@ -1567,11 +1650,17 @@ pub(crate) fn record_rsp_rdp_observations(kinds: Vec<RspRdpObservationKind>) {
     }
     let at = Cycles::new(sim_time());
     with_host(|host| {
-        host.rsp_rdp_observations.extend(
-            kinds
-                .into_iter()
-                .map(|kind| RspRdpObservationEvent { at, kind }),
-        );
+        host.rsp_rdp_observation_count = host
+            .rsp_rdp_observation_count
+            .checked_add(kinds.len())
+            .expect("RSP/RDP observation count overflow");
+        if host.rsp_rdp_observation_retention == RspRdpObservationRetention::CompleteEvidence {
+            host.rsp_rdp_observations.extend(
+                kinds
+                    .into_iter()
+                    .map(|kind| RspRdpObservationEvent { at, kind }),
+            );
+        }
     });
 }
 
@@ -2204,6 +2293,11 @@ unsafe fn read_offset_word(rdram: *mut u8, base_offset: u32, extra_offset: u32) 
 
 mod ai;
 mod cache;
+/// The counter tree declared as DATA -- every counter names its parent, and
+/// children summing above their parent is a hard error that refuses to print
+/// the affected subtree. Promotes the `PhaseTiming` nesting diagram from prose
+/// a human must obey into a check the code performs.
+pub mod counter_tree;
 mod debug;
 mod dispatch;
 /// Isolates the cost of `dispatch_captured_raw_rdp`'s whole-RDRAM staging copy
@@ -2211,23 +2305,18 @@ mod dispatch;
 /// `FN64_DPC_COPY_CENSUS=1`. Diagnostic only; see the module docs for why the
 /// seam's existing inclusive timer cannot answer either question.
 mod dpc_copy_census;
-/// The counter tree declared as DATA -- every counter names its parent, and
-/// children summing above their parent is a hard error that refuses to print
-/// the affected subtree. Promotes the `PhaseTiming` nesting diagram from prose
-/// a human must obey into a check the code performs.
-pub mod counter_tree;
 /// Per-VI-field wall-clock latency, gated by `FN64_FRAME_CENSUS=1`. The test
 /// for the "guaranteed 60fps" bar; see the module docs for why both the
 /// frame-budget ratio and the wall-versus-virtual ratio are always reported.
 pub mod frame_census;
-/// `FN64_PROFILE=1`: one gate that arms every constituent channel and emits one
-/// authoritative report. Composes the existing gates; does not replace them.
-pub mod profile;
 mod gbpak;
 mod host;
 mod mesgqueue;
 mod pfs;
 mod pi;
+/// `FN64_PROFILE=1`: one gate that arms every constituent channel and emits one
+/// authoritative report. Composes the existing gates; does not replace them.
+pub mod profile;
 mod save;
 mod si;
 mod softmath;

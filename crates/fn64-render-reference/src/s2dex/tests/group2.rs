@@ -123,7 +123,7 @@ fn average_shrink_notxclamp_matches_clamped_rectangles_across_public_paths() {
         }
         write_command(&mut rdram, offset, u32::from(end) << 24, 0);
         let mut rdp = RdpDecodeState::default();
-        crate::gbi::decode_raw_rdp_ops_with_state(&rdram, SETUP as u32, &mut rdp).unwrap();
+        crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, SETUP as u32, &mut rdp).unwrap();
         decode_ops_for_family(&rdram, DL as u32, &mut rdp, family).unwrap()
     };
 
@@ -310,7 +310,7 @@ fn average_shrink_rectangles_exhaust_families_paths_scales_and_flips() {
 
                             let mut rdp = RdpDecodeState::default();
                             crate::gbi::decode_raw_rdp_ops_with_state(
-                                &rdram,
+                                &mut rdram,
                                 SETUP as u32,
                                 &mut rdp,
                             )
@@ -484,7 +484,7 @@ fn average_shrink_matrix_relative_base_scale_cross_term_is_exact() {
         write_command(&mut rdram, DL + 24, u32::from(G_ENDDL) << 24, 0);
 
         let mut rdp = RdpDecodeState::default();
-        crate::gbi::decode_raw_rdp_ops_with_state(&rdram, SETUP as u32, &mut rdp).unwrap();
+        crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, SETUP as u32, &mut rdp).unwrap();
         let operations = decode_ops(&rdram, DL as u32, &mut rdp).unwrap();
         let RenderOp::TextureRectangle(rectangle) = &operations[0] else {
             panic!("Average shrink RectangleR must remain a texture rectangle")
@@ -629,7 +629,7 @@ fn average_shrink_one_raster_matches_exact_four_texel_cells_under_all_flips() {
         );
         write_command(&mut rdram, DL + 16, u32::from(G_ENDDL) << 24, 0);
         let mut rdp = RdpDecodeState::default();
-        crate::gbi::decode_raw_rdp_ops_with_state(&rdram, SETUP as u32, &mut rdp).unwrap();
+        crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, SETUP as u32, &mut rdp).unwrap();
         let operations = decode_ops(&rdram, DL as u32, &mut rdp).unwrap();
         let RenderOp::TextureRectangle(rectangle) = &operations[0] else {
             panic!("Average shrink raster must remain a texture rectangle")
@@ -708,7 +708,7 @@ fn average_shrink_keeps_unpublished_neighbor_classes_loud_and_transactional() {
     };
 
     let mut average_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, AVERAGE_SETUP as u32, &mut average_rdp)
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, AVERAGE_SETUP as u32, &mut average_rdp)
         .unwrap();
     write_command(
         &mut rdram,
@@ -751,7 +751,7 @@ fn average_shrink_keeps_unpublished_neighbor_classes_loud_and_transactional() {
     }
 
     let mut copy_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, COPY_SETUP as u32, &mut copy_rdp)
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, COPY_SETUP as u32, &mut copy_rdp)
         .unwrap();
     let error = rectangle_error(&mut rdram, G_OBJRM_SHRINKSIZE_1, &mut copy_rdp);
     assert!(error.contains("Copy cycle does not support"), "{error}");
@@ -1025,7 +1025,7 @@ fn object_perimeter_shrink_and_widen_compose_across_families_and_draw_paths() {
     write_command(&mut rdram, COPY_SETUP, 0xef00_0000 | (2 << 20), 0);
     write_command(&mut rdram, COPY_SETUP + 8, 0xdf00_0000, 0);
     let mut copy_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, COPY_SETUP as u32, &mut copy_rdp)
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, COPY_SETUP as u32, &mut copy_rdp)
         .unwrap();
     let error = decode_ops(&rdram, RECT_DL as u32, &mut copy_rdp).unwrap_err();
     assert!(error.to_string().contains("Copy cycle does not support"));
@@ -1089,11 +1089,11 @@ fn object_bilerp_mode_matches_filter_and_preserves_corrected_texel_centers() {
     write_command(&mut rdram, BILERP_SETUP + 16, 0xdf00_0000, 0);
 
     let mut point_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, POINT_SETUP as u32, &mut point_rdp)
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, POINT_SETUP as u32, &mut point_rdp)
         .unwrap();
     let point = decode_ops(&rdram, POINT_DL as u32, &mut point_rdp).unwrap();
     let mut bilerp_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, BILERP_SETUP as u32, &mut bilerp_rdp)
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, BILERP_SETUP as u32, &mut bilerp_rdp)
         .unwrap();
     let bilerp = decode_ops(&rdram, BILERP_DL as u32, &mut bilerp_rdp).unwrap();
     let (RenderOp::TextureRectangle(point), RenderOp::TextureRectangle(bilerp)) =
@@ -1235,7 +1235,7 @@ fn shrink_modes_match_across_compound_rectangle_matrix_and_rotating_paths() {
     write_command(&mut rdram, SETUP + 16, 0xdf00_0000, 0);
 
     let mut base_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, SETUP as u32, &mut base_rdp).unwrap();
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, SETUP as u32, &mut base_rdp).unwrap();
     let rectangle_ops = decode_ops(&rdram, RECT_DL as u32, &mut base_rdp.clone()).unwrap();
     let relative_ops = decode_ops(&rdram, RELATIVE_DL as u32, &mut base_rdp.clone()).unwrap();
     let rotating_ops = decode_ops(&rdram, ROTATING_DL as u32, &mut base_rdp.clone()).unwrap();

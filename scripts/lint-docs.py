@@ -57,15 +57,25 @@ def docs() -> list[Path]:
 
 
 def superseded(text: str) -> bool:
-    """True if a doc marks ITSELF superseded with a top-of-file banner.
+    """True if a doc marks ITSELF not-yet-live or no-longer-live up top.
 
     A superseded design record documents the paths and env vars it PROPOSED
     or REJECTED, which by definition need not exist in code -- the drift
     rules ("a named file/var that isn't real is a silent no-op instruction")
     are about live, actionable docs, not history. The opt-out is a
     `> **SUPERSEDED` banner in the first few lines -- the doc's OWN status,
-    not a doc that merely mentions the word elsewhere."""
-    return any("**SUPERSEDED" in line for line in text.splitlines()[:5])
+    not a doc that merely mentions the word elsewhere.
+
+    A STAGED RUNBOOK is the same case pointing forward instead of back. The
+    VPW2 bring-up runbook names `examples/vpw2-block-boot` and
+    `FN64_DISCOVER_NA2J_ROM` because step 4 is where you create them; it says
+    "**Nothing here has been executed.**" in its header. Those names are the
+    instruction, not drift, and the drift rule would push toward deleting the
+    very steps the runbook exists to record. Widened to the first 10 lines so
+    a title plus a paragraph of framing still reaches the banner."""
+    head = text.splitlines()[:10]
+    return any("**SUPERSEDED" in line or "**Nothing here has been executed" in line
+               for line in head)
 
 
 # --- 1. every repo-relative path a doc names must exist -----------------------
@@ -85,10 +95,22 @@ def check_refs() -> None:
         if superseded(text):
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
+            # A path inside ANOTHER repository is that repo's, not ours.
+            # n64recomp-comparison.md:493 lists ~/Code/aki-recomp's own
+            # README/AGENTS/docs -- naming them is the comparison's whole
+            # point, and they can never exist here (aki-recomp is GPL-3.0 and
+            # deliberately absent).
+            if "aki-recomp" in line or "~/Code/" in line:
+                continue
             for raw in REF.findall(line):
                 ref = raw.rstrip(TRAIL)
                 # Illustrative globs/wildcards aren't claims about one file.
-                if "*" in ref or ref.endswith("/"):
+                # REF's character class stops at `*`, so `shard*/` arrives here
+                # already truncated to `shard` -- check the ORIGINAL line for a
+                # wildcard immediately after the match, or the glob loses its
+                # own exemption and gets reported as a missing file.
+                after = line[line.index(raw) + len(raw):]
+                if "*" in ref or ref.endswith("/") or after[:1] == "*":
                     continue
                 # Build artifacts (target/, recompiled/) exist only after a
                 # build and are gitignored; a doc naming one is telling you to
@@ -157,9 +179,26 @@ def check_env_vars() -> None:
         if superseded(text):
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
+            low = line.lower()
+            # A doc ASSERTING A VAR'S ABSENCE is the drift rule's ally, not its
+            # target. runtime-parity-gap.md:262 says FN64_SAVE/FN64_SRAM/...
+            # "have zero hits repo-wide" -- that is the measurement, and
+            # demanding the names exist would invert the claim.
+            if any(k in low for k in ("zero hits", "no environment override",
+                                      "appears nowhere", "nothing grades",
+                                      "does not exist", "no such")):
+                continue
             for var in ENV.findall(line):
                 # RECOMP_FUNC is a generated-C symbol prefix, not an env var.
                 if var == "RECOMP_FUNC":
+                    continue
+                # A PREFIX or PLACEHOLDER names a family, not a variable:
+                # `FN64_PROFILE_*`, `FN64_PROFILE_<SUBSYSTEM>`, and the
+                # `FN64_X=${FN64_X:-<unset>}` shell idiom are all describing a
+                # shape. Only a bare, fully-spelled name is a live instruction
+                # a reader could paste and have silently no-op.
+                rest = line[line.index(var) + len(var):]
+                if rest[:1] in ("*", "<") or var in ("FN64_X",):
                     continue
                 if var not in live:
                     rel = doc.relative_to(ROOT)
@@ -224,6 +263,14 @@ def check_doc_hashes_are_tested() -> None:
             # CONTENT hashes (a framebuffer SHA, a golden digest) assert a fact
             # a test can re-check. Distinguish by context, not by the hash.
             if any(k in low for k in ("commit", "github.com", "pinned", "tree/", "blob/")):
+                continue
+            # A ROM/capture IDENTITY is provenance too. `normalized_rom_sha256`
+            # names WHICH cartridge image a run used -- the discriminator that
+            # caught No Mercy's boot context binding fc561fce…, a different ROM.
+            # The file is deliberately not in the repository, so no test can
+            # re-derive it; demanding one would push these toward deletion and
+            # lose the identity that makes a filed capture auditable.
+            if any(k in low for k in ("rom_sha256", "rom `", "sha256  ", "cart ")):
                 continue
             # An explicitly-unverified claim is honest prose, not a false gate.
             if "not tested" in low or "no test" in low:

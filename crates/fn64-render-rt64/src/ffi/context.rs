@@ -17,6 +17,16 @@ pub(super) fn error_string(buffer: &[c_char; ERROR_CAPACITY], fallback: &str) ->
 
 pub(crate) struct Context(NonNull<RawContext>);
 
+pub(crate) struct PresentedPixelMetadata {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) row_bytes: u32,
+    pub(crate) format: crate::Rt64PresentPixelFormat,
+    pub(crate) graphics_api: ActiveRenderGraphicsApi,
+    pub(crate) present_id: u64,
+    pub(crate) workload_id: u64,
+}
+
 impl Context {
     pub(crate) fn create(
         width: u32,
@@ -390,9 +400,57 @@ impl Context {
         end: u32,
         output_addr: u32,
     ) -> Result<(), String> {
+        // Waits for completion -- the safe, unconditional default every
+        // existing caller keeps getting. Use `process_rdp_commands_async`
+        // when the caller itself will wait before it next needs completed
+        // GPU state (present, or a later submission in the same field
+        // passing `wait_for_completion = true`).
+        self.process_rdp_commands_inner(rdram, start, end, output_addr, true)
+    }
+
+    /// Submit without blocking for GPU completion.
+    ///
+    /// `waitForWorkloadId` compares a monotonic counter (`waitId <=
+    /// workloadId`), so RT64's queue is strictly FIFO: waiting for
+    /// submission N's id also waits for every submission before it. A field
+    /// with several coalesced DPC ranges therefore only needs ONE wait, on
+    /// the last one -- not one after each. Measured on the render-benchmark
+    /// route (rt64 lane): `waitForWorkloadId` inside this call was the
+    /// majority of an ~11 ms/field cost paid up to ~2.9 times/field, when
+    /// only the final submission before the frame is consumed needs to
+    /// block at all.
+    ///
+    /// SAFETY of skipping the wait: nothing between this call and the
+    /// caller's own next wait may read completed-workload state. The C++
+    /// side already enforces this for its own internal readers (deferred
+    /// capture, present capture force the wait regardless of this flag);
+    /// the Rust caller's obligation is to pass `wait_for_completion = true`
+    /// on the LAST submission of a field, so the field's own completion is
+    /// still established before anything downstream reads the framebuffer.
+    pub(crate) fn process_rdp_commands_async(
+        &mut self,
+        rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        output_addr: u32,
+        wait_for_completion: bool,
+    ) -> Result<(), String> {
+        self.process_rdp_commands_inner(rdram, start, end, output_addr, wait_for_completion)
+    }
+
+    fn process_rdp_commands_inner(
+        &mut self,
+        rdram: &mut [u8],
+        start: u32,
+        end: u32,
+        output_addr: u32,
+        wait_for_completion: bool,
+    ) -> Result<(), String> {
         let mut error = [0; ERROR_CAPACITY];
-        // SAFETY: the context is alive and uniquely borrowed, and RT64 waits
-        // for the submitted render-to-RAM workload before this call returns.
+        // SAFETY: the context is alive and uniquely borrowed. RT64 waits for
+        // the submitted render-to-RAM workload before this call returns IFF
+        // `wait_for_completion` is nonzero; see `process_rdp_commands_async`
+        // for the caller obligation when it is not.
         let ok = unsafe {
             fn64_rt64_process_rdp_commands(
                 self.0.as_ptr(),
@@ -401,6 +459,7 @@ impl Context {
                 start,
                 end,
                 output_addr,
+                c_int::from(wait_for_completion),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -411,6 +470,29 @@ impl Context {
             Err(error_string(
                 &error,
                 "RT64 raw RDP processing failed without a diagnostic",
+            ))
+        }
+    }
+
+    /// Wait for whatever workload is currently outstanding.
+    ///
+    /// `process_rdp_commands_async(.., wait_for_completion: false)` can leave
+    /// GPU work in flight. Anything about to read completed-frame state (a
+    /// present, most obviously) must flush first. Cheap when nothing is
+    /// outstanding: `waitForWorkloadId` against an already-reached id returns
+    /// immediately (rt64_workload_queue.cpp:93-95, `waitId <= workloadId`).
+    pub(crate) fn flush_pending_workload(&mut self) -> Result<(), String> {
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the context is alive and uniquely borrowed.
+        let ok = unsafe {
+            fn64_rt64_flush_pending_workload(self.0.as_ptr(), error.as_mut_ptr(), error.len())
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(error_string(
+                &error,
+                "RT64 workload flush failed without a diagnostic",
             ))
         }
     }
@@ -493,7 +575,27 @@ impl Context {
         Ok(graphics_api)
     }
 
-    pub(crate) fn presented_pixels(&mut self) -> Result<crate::Rt64PresentedPixels, String> {
+    pub(crate) fn presented_pixels_into(
+        &mut self,
+        reuse: &mut Vec<u8>,
+    ) -> Result<crate::Rt64PresentedPixels, String> {
+        let metadata = self.read_presented_pixels_into(reuse)?;
+        Ok(crate::Rt64PresentedPixels {
+            width: metadata.width,
+            height: metadata.height,
+            row_bytes: metadata.row_bytes,
+            format: metadata.format,
+            graphics_api: metadata.graphics_api,
+            present_id: metadata.present_id,
+            workload_id: metadata.workload_id,
+            bytes: std::mem::take(reuse),
+        })
+    }
+
+    pub(crate) fn read_presented_pixels_into(
+        &mut self,
+        bytes: &mut Vec<u8>,
+    ) -> Result<PresentedPixelMetadata, String> {
         let mut metadata = RawPresentCapture::default();
         let mut error = [0; ERROR_CAPACITY];
         // SAFETY: the context is alive and uniquely borrowed; null with zero
@@ -515,7 +617,7 @@ impl Context {
             ));
         }
         let (byte_len, format, graphics_api) = validate_present_capture_metadata(metadata)?;
-        let mut bytes = vec![0; byte_len];
+        bytes.resize(byte_len, 0);
         let queried_metadata = metadata;
         error.fill(0);
         // SAFETY: `bytes` is writable for exactly the capacity advertised by
@@ -540,7 +642,7 @@ impl Context {
         if metadata != queried_metadata {
             return Err("RT64 present capture metadata changed during synchronous readback".into());
         }
-        Ok(crate::Rt64PresentedPixels {
+        Ok(PresentedPixelMetadata {
             width: metadata.width,
             height: metadata.height,
             row_bytes: metadata.row_bytes,
@@ -548,7 +650,6 @@ impl Context {
             graphics_api,
             present_id: metadata.present_id,
             workload_id: metadata.workload_id,
-            bytes,
         })
     }
 
@@ -572,6 +673,9 @@ impl Context {
                 "RT64 present-selection query failed without a diagnostic",
             ));
         }
+        if selection.reserved != 0 {
+            return Err("RT64 present selection returned nonzero reserved metadata".into());
+        }
         Ok(crate::Rt64PresentSelection {
             present_id: selection.present_id,
             source_texture_identity: selection.source_texture_identity,
@@ -579,6 +683,13 @@ impl Context {
             target_width: selection.target_width,
             target_height: selection.target_height,
             target_size: selection.target_size,
+            workload_resolution_scale_x: selection.workload_resolution_scale_x,
+            workload_resolution_scale_y: selection.workload_resolution_scale_y,
+            resolution_scale_x: selection.resolution_scale_x,
+            resolution_scale_y: selection.resolution_scale_y,
+            raster_width: selection.raster_width,
+            raster_height: selection.raster_height,
+            downsample_multiplier: selection.downsample_multiplier,
         })
     }
 
@@ -1269,4 +1380,3 @@ impl Drop for Context {
         unsafe { fn64_rt64_destroy(self.0.as_ptr()) };
     }
 }
-

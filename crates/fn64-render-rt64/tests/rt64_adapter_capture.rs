@@ -74,7 +74,9 @@ fn typed_task_and_vi_cross_cpp_boundary_without_a_graphics_device() {
 
     let mut expected_registers = [0; 24];
     expected_registers[9] = 0x0001_001e;
-    expected_registers[10] = 0x0010_0280;
+    // The shim preserves the guest origin because pinned RT64 owns the
+    // leading-row normalization used to match VI scanout to managed targets.
+    expected_registers[10] = 0x0010_0000;
     expected_registers[11] = 320;
     expected_registers[12] = 2;
     expected_registers[14] = 0x03e5_2239;
@@ -99,6 +101,9 @@ fn cpp_capture_distinguishes_compatibility_unspecified_from_explicit_mode_zero()
 
     let mut words = [0; ViScanoutRegisters::WORD_COUNT];
     words[0] = 2;
+    // Compatibility output address zero names the color-image base; the
+    // equivalent live VI register convention points one RGBA16 row later.
+    words[1] = cfg.width * 2;
     words[2] = cfg.width;
     words[6] = 525;
     words[7] = 3093;
@@ -153,7 +158,7 @@ fn capture_rejects_rgba32_dither_restoration_like_live_presentation() {
 }
 
 #[test]
-fn odd_interlaced_origin_compensation_uses_two_effective_source_rows() {
+fn odd_interlaced_origin_is_not_precompensated_a_second_time() {
     let (task, cfg, mut vi) = fixture();
     let mut words = vi.scanout.registers().unwrap().words();
     words[0] |= 1 << 6;
@@ -163,7 +168,7 @@ fn odd_interlaced_origin_compensation_uses_two_effective_source_rows() {
 
     let capture = capture_rt64_adapter_inputs(&task, 0, cfg, vi).unwrap();
     assert_eq!(capture.registers[11], 0x1140);
-    assert_eq!(capture.registers[10], 0x0010_0500);
+    assert_eq!(capture.registers[10], 0x0010_0000);
     assert_eq!(capture.registers_after_submission, capture.registers);
 }
 

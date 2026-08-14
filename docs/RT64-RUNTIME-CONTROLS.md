@@ -33,6 +33,28 @@ display buffering, and internal color format are setup-owned and require
 backend recreation; fn64 reports that result explicitly rather than retaining
 an apparently applied value.
 
+The WM2000 interactive shell has a bounded experiment surface for these live
+controls. F7 toggles directly between native 1x and high-resolution 2x with an
+explicit 2x box downsample; F8 cycles those modes plus high-resolution 2x
+without explicit downsampling and native 1x with MSAA4x. F6 reloads the
+complete strict TOML image named by `FN64_RT64_SETTINGS_FILE`; the file is also
+applied once at startup. The schema requires `resolution`,
+`resolution_multiplier`, `downsample_multiplier`, and `antialiasing`, rejects
+unknown fields, and is illustrated by
+`examples/wm2000-block-boot/rt64-aa.example.toml`. Each successful mutation
+prints its complete settings digest and whether RT64 discarded framebuffer
+resources. These shortcuts are an experiment harness, not the settings UI
+policy; they intentionally cross the same typed registered-renderer seam that
+a later frontend uses.
+
+An explicit headless diagnostic can additionally report the positive finite
+workload scale and the concrete managed target's positive finite scale,
+nonzero raster extent, and downsample multiplier after both RT64 workers are
+idle. This evidence caught a former double origin compensation that sent
+WM2000 presentation through RT64's native scratch upload and made every F7
+resolution mode inert; the ordinary frame path does not pay for the diagnostic
+wait.
+
 The Metal user-control gate also isolates the four live fields that do not
 intentionally discard framebuffer resources: Manual 72 Hz refresh targeting,
 disabled hardware resolve, enabled idle work, and developer mode. Each phase
@@ -96,12 +118,15 @@ policy. Each replacement entry binds its position, canonical content SHA-256,
 raw `rt64.json` SHA-256, and effective database configuration. Directory
 content identity is a sorted relative-path/file-byte encoding; `.rtz` identity
 is the exact archive bytes. Machine-local absolute paths are operational input
-only and are deliberately excluded from evidence. The host hashes before and
-after C++ inspection, again after activation, and once more at release capture
-so a mutable streamed pack cannot retain a stale evidence identity.
-Configured-but-not-active inputs never enter capture, and any failed, raced,
-or subsequently changed load forgets the active replacement identity until a
-successful reload or recreation. This proves
+only and are deliberately excluded from evidence. Activation copies the
+inspected bytes into a process-owned temporary snapshot, re-inspects that copy,
+and passes only its private paths to C++. A post-activation inspection must
+still match the original identity. The snapshot then stays alive with the
+native context, so Stream policy cannot observe later edits to the caller's
+mutable pack and release capture does no per-frame filesystem walk or hashing.
+Configured-but-not-active inputs never enter capture, and any failed or raced
+load destroys native state before its snapshot is removed. An explicit reload
+or recreation is required to adopt later source-pack changes. This proves
 which policy and pack bytes were active but does not by itself close behavior
 claims. The separate synthetic Metal fixture covers DDS/mipmap, Rice selection,
 and a deterministic held-queue Stream fallback-to-final transition without

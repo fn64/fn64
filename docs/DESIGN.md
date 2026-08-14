@@ -104,7 +104,15 @@ may run at a different device rate and resamples at that boundary. `AI_LEN`
 reports only the current emulated DMA. The host output prebuffer is separate,
 starts after two AI DMAs are queued, and exists only to absorb callback jitter;
 letting its depth leak into `AI_LEN` would make guest buffer sizing depend on
-host latency rather than N64 hardware state.
+host latency rather than N64 hardware state. The host ring allocates its full
+250 ms bound before playback and keeps the producer's drop-oldest policy. The
+realtime callback never waits for the producer lock: a contended pull becomes
+counted silence, preserving callback deadlines without changing DMA progress.
+That split is also enforced by the Rust seam: guest and host sample rates are
+distinct nonzero types, `GuestPcm16` proves complete interleaved frames, and
+guest sample slots, host sample slots, host frames, and guest DMA bytes cannot
+be passed interchangeably. Raw integers exist only at device, cpal, atomic,
+and C-ABI edges where their representation is required.
 
 `fn64-rt64` depends on `fn64-render`, which owns the backend-neutral task,
 microcode-admission, runtime-policy, and raw-DPC completion seams, and on
@@ -1983,16 +1991,25 @@ task calls out:
   Enabling black with an effective Y scale other than the manual-required 1.0
   traps loudly, as do blacking while fade/repeat is active and enabling fade
   and repeat together. The RT64 adapter sends the complete register image
-  through its quarantined C boundary, compensates RT64's origin convention
-  with the image's own source width and RGBA16/RGBA32 pixel size, and retains
-  that image when later HLE/raw submissions or resizes refresh address aliases.
+  through its quarantined C boundary and preserves the guest's origin so
+  pinned RT64 applies its own one-row/odd-serrated-two-row framebuffer lookup
+  normalization exactly once. Precompensating that value in fn64 cancels the
+  native lookup and forces RT64's 1x scratch-upload path. The adapter retains
+  the complete image when later HLE/raw submissions or resizes refresh address
+  aliases. Backend-only compatibility callers have no live VI origin and name
+  the color-image base, so only that explicit state synthesizes RT64's inverse
+  lookup bias.
   A scoped foreign binding installs the call's RDRAM pointer in RT64 Core and
   State, waits both workload and presentation queues idle—including exception
   exits—and restores placeholder aliases before the Rust capability ends.
   Standalone backend-geometry compatibility remains available for behavior
   fixtures, but the backend records that authority and refuses to emit a
   fixed-cycle release capture until a complete live-register presentation has
-  succeeded.
+  succeeded. A successful capture also binds the exact active digital output
+  height from that same `ViPresentation` to its complete renderer-owned pixel
+  storage. The active height is validated as nonzero and no greater than the
+  stored height; native filter-extension rows remain in release evidence even
+  when an interactive presenter excludes them from the visible prefix.
   Black still disables pixel type, repeat-line uses zero Y scale, and fade uses
   zero Y scale plus the 10-bit Y subpixel offset without discarding the retained
   image. The no-device adapter capture proves the first and post-submission
@@ -2688,6 +2705,15 @@ counts. The summary is progress telemetry only: it cannot replace the ordered
 trace in a release digest. The WM2000 block harness uses this mode only under
 `FN64_BLOCK_PROGRESS_ONLY`, with `FN64_BLOCK_DEVICE_TRACE=1` as the explicit
 opt-in when full diagnostic history is needed.
+Committed RSP/RDP observations follow a separate typed retention policy because
+they are release evidence rather than device-trace diagnostics. Every ROM load
+starts in `CompleteEvidence`, retaining the exact ordered payloads required by
+the release gate. An interactive host may then select
+`InteractiveConstantSpace`; the ABI clears retained payloads, continues a
+monotonic total count, and loudly rejects any later full-history request from
+that ROM lifetime. Loading a new ROM restores complete retention. Thus an
+interactive session cannot grow this observation vector without bound, while a
+certification consumer cannot accidentally digest a truncated history.
 DeviceState v11 binds the audio-task execution policy and translated artifact
 identity. DeviceState v12 additionally binds DPC CLOCK, BUFBUSY, PIPEBUSY, and
 TMEM. DeviceState v13 binds the ABI-owned RSP interpreter continuation:

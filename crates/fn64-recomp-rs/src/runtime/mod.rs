@@ -596,7 +596,16 @@ pub struct RecompContext {
     thread_return_pc: Option<u32>,
     /// Bounded diagnostic history. It never participates in guest execution,
     /// pack identity, or generation selection.
-    indirect_transfers: Vec<IndirectTransferObservation>,
+    ///
+    /// `VecDeque`, not `Vec`: this is pushed on every indirect branch/call
+    /// the recompiled code executes, and a `Vec` here meant dropping the
+    /// oldest entry via `remove(0)` -- an O(n) shift of the remaining
+    /// (up to `INDIRECT_TRANSFER_HISTORY_LIMIT`-1) ~300-byte entries on
+    /// every push once the history fills, which it does almost immediately.
+    /// `push_back`/`pop_front` are O(1). `make_contiguous()` is called right
+    /// after each push so the existing `&[T]` accessor keeps working with no
+    /// change to its callers.
+    indirect_transfers: std::collections::VecDeque<IndirectTransferObservation>,
 }
 
 impl RecompContext {
@@ -848,9 +857,9 @@ impl RecompContext {
         link_pc: Option<u32>,
     ) {
         if self.indirect_transfers.len() == Self::INDIRECT_TRANSFER_HISTORY_LIMIT {
-            self.indirect_transfers.remove(0);
+            self.indirect_transfers.pop_front();
         }
-        self.indirect_transfers.push(IndirectTransferObservation {
+        self.indirect_transfers.push_back(IndirectTransferObservation {
             source_bank,
             source_pc,
             source_register,
@@ -866,8 +875,14 @@ impl RecompContext {
     }
 
     /// Exact retained order, oldest to newest.
-    pub fn indirect_transfer_observations(&self) -> &[IndirectTransferObservation] {
-        &self.indirect_transfers
+    ///
+    /// `&mut self`: a ring-buffered `VecDeque` is not contiguous once it has
+    /// wrapped, so producing a real `&[T]` needs `make_contiguous()`. That
+    /// cost lands here, on this rare diagnostic read, rather than on every
+    /// push in [`Self::record_indirect_transfer`] -- the hot path this type
+    /// changed from `Vec` to avoid paying an O(n) shift on.
+    pub fn indirect_transfer_observations(&mut self) -> &[IndirectTransferObservation] {
+        self.indirect_transfers.make_contiguous()
     }
 
     /// Write a 32-bit result into GPR `idx`, sign-extending into the 64-bit
@@ -1218,6 +1233,7 @@ impl RecompContext {
     /// and privilege failures return AdEL/AdES currency before any TLB lookup
     /// or memory side effect. Instruction fetch retains a separate 32-bit-PC
     /// boundary in [`Self::translate_instruction_address`].
+    #[inline]
     pub fn translate_data_address(
         &self,
         vaddr: u64,
@@ -1241,10 +1257,55 @@ impl RecompContext {
         }
     }
 
+    /// Classify `vaddr` and take the two direct routes inline; the mapped
+    /// route (needing a TLB scan) is out of line in
+    /// [`Self::translate_mapped_data_address_diagnostic`].
+    ///
+    /// Split from one function so the common case -- kseg0/kseg1 and
+    /// XKPHYS/compatibility direct addresses, which is what every ordinary
+    /// N64 title's load/store traffic resolves to -- stays small enough for
+    /// LLVM to inline into its many `_translated` call sites. The undivided
+    /// function's body (TLB linear scan, up to 32 entries, plus every TLB
+    /// fault's error construction) was too large for automatic inlining to
+    /// consider profitable regardless of `#[inline]` on the callers; a
+    /// live `sample` on WM2000 (windowed RT64) found this address-
+    /// translation cost the single largest per-instruction cost after
+    /// verify_precompiled_instruction_word (see `wm2000-block-shards/
+    /// build.rs`'s SMC-verify default) was already turned off for this
+    /// title. Splitting does not change any observable result: every
+    /// TranslatedDataAddress/error variant this used to return, it still
+    /// returns, from whichever function now owns that branch.
+    #[inline]
     fn translate_data_address_diagnostic(
         &self,
         vaddr: u64,
         access: DataAccessKind,
+    ) -> Result<TranslatedDataAddress, InstructionTranslationDiagnosticErrorV1> {
+        let route = self.classify_data_address(vaddr).map_err(|()| {
+            InstructionTranslationDiagnosticErrorV1::Access(DataAccessError::AddressError {
+                vaddr,
+                access,
+            })
+        })?;
+        match route {
+            AddressRoute::DirectVirtual(address) => Ok(TranslatedDataAddress::Direct(address)),
+            AddressRoute::DirectPhysical(physical) => {
+                Ok(TranslatedDataAddress::DirectPhysical(physical))
+            }
+            AddressRoute::Mapped { extended } => {
+                self.translate_mapped_data_address_diagnostic(vaddr, access, extended)
+            }
+        }
+    }
+
+    /// The out-of-line TLB-scan path `translate_data_address_diagnostic`
+    /// delegates `AddressRoute::Mapped` to. See that function's doc for why
+    /// this is a separate, deliberately non-`#[inline]` function.
+    fn translate_mapped_data_address_diagnostic(
+        &self,
+        vaddr: u64,
+        access: DataAccessKind,
+        extended: bool,
     ) -> Result<TranslatedDataAddress, InstructionTranslationDiagnosticErrorV1> {
         const PAGE_MASK_BITS: u32 = 0x01ff_e000;
         const VPN2_32_BITS: u64 = 0x0000_0000_ffff_e000;
@@ -1255,24 +1316,6 @@ impl RecompContext {
         const VALID: u32 = 1 << 1;
         const DIRTY: u32 = 1 << 2;
 
-        let route = self.classify_data_address(vaddr).map_err(|()| {
-            InstructionTranslationDiagnosticErrorV1::Access(DataAccessError::AddressError {
-                vaddr,
-                access,
-            })
-        })?;
-        match route {
-            AddressRoute::DirectVirtual(address) => {
-                return Ok(TranslatedDataAddress::Direct(address));
-            }
-            AddressRoute::DirectPhysical(physical) => {
-                return Ok(TranslatedDataAddress::DirectPhysical(physical));
-            }
-            AddressRoute::Mapped { .. } => {}
-        }
-        let AddressRoute::Mapped { extended } = route else {
-            unreachable!("direct routes returned above")
-        };
         let low = vaddr as u32;
 
         let mut matched = None;

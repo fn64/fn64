@@ -718,6 +718,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-render-rt64"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "fn64-render",
+ "fn64-runtime",
+ "sha2",
+]
+
+[[package]]
 name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
@@ -2139,6 +2149,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -3251,8 +3271,10 @@ dependencies = [
  "fn64-recomp-rs-codegen",
  "fn64-render",
  "fn64-render-reference",
+ "fn64-render-rt64",
  "fn64-runtime",
  "gilrs",
+ "libc",
  "pixels",
  "serde",
  "serde_json",
@@ -3261,14 +3283,12 @@ dependencies = [
  "winit",
  "wm2000-block-overlay-0-shard-00",
  "wm2000-block-overlay-0-shard-01",
- "wm2000-block-overlay-0-shard-02",
  "wm2000-block-overlay-1-shard-00",
  "wm2000-block-overlay-2-shard-00",
  "wm2000-block-overlay-2-shard-01",
  "wm2000-block-overlay-2-shard-02",
  "wm2000-block-overlay-2-shard-03",
  "wm2000-block-overlay-2-shard-04",
- "wm2000-block-overlay-2-shard-05",
  "wm2000-block-overlay-3-shard-00",
  "wm2000-block-overlay-3-shard-01",
  "wm2000-block-overlay-3-shard-02",
@@ -3276,7 +3296,6 @@ dependencies = [
  "wm2000-block-overlay-3-shard-04",
  "wm2000-block-overlay-3-shard-05",
  "wm2000-block-overlay-3-shard-06",
- "wm2000-block-overlay-3-shard-07",
  "wm2000-block-resident-tail-shard-00",
  "wm2000-block-resident-tail-shard-01",
  "wm2000-block-shard-00",
@@ -3308,16 +3327,6 @@ dependencies = [
 
 [[package]]
 name = "wm2000-block-overlay-0-shard-01"
-version = "0.0.0"
-dependencies = [
- "fn64-discover",
- "fn64-recomp-rs",
- "fn64-recomp-rs-codegen",
- "sha2",
-]
-
-[[package]]
-name = "wm2000-block-overlay-0-shard-02"
 version = "0.0.0"
 dependencies = [
  "fn64-discover",
@@ -3378,16 +3387,6 @@ dependencies = [
 
 [[package]]
 name = "wm2000-block-overlay-2-shard-04"
-version = "0.0.0"
-dependencies = [
- "fn64-discover",
- "fn64-recomp-rs",
- "fn64-recomp-rs-codegen",
- "sha2",
-]
-
-[[package]]
-name = "wm2000-block-overlay-2-shard-05"
 version = "0.0.0"
 dependencies = [
  "fn64-discover",
@@ -3458,16 +3457,6 @@ dependencies = [
 
 [[package]]
 name = "wm2000-block-overlay-3-shard-06"
-version = "0.0.0"
-dependencies = [
- "fn64-discover",
- "fn64-recomp-rs",
- "fn64-recomp-rs-codegen",
- "sha2",
-]
-
-[[package]]
-name = "wm2000-block-overlay-3-shard-07"
 version = "0.0.0"
 dependencies = [
  "fn64-discover",

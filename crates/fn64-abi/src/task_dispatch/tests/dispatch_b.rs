@@ -1214,6 +1214,7 @@ use super::*;
                 start: u32,
                 end: u32,
                 output_addr: u32,
+                _wait_for_completion: bool,
             ) -> Result<FrameStatus, RenderError> {
                 let first = fn64_runtime::RdramView::from_storage(rdram)
                     .read_u32(fn64_runtime::RdramAddr::from_offset(start));

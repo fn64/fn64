@@ -34,13 +34,14 @@ fn synthetic_prepared_tree(
             "discovery_source_sha256 {}\n",
             "emitter_source_sha256 {}\n",
             "runtime_source_sha256 {}\n",
-            "artifact_count 35\n"
+            "artifact_count {}\n"
         ),
         rom,
         claims.generator_source_sha256,
         claims.discovery_source_sha256,
         claims.emitter_source_sha256,
         claims.runtime_source_sha256,
+        PREPARED_PACKAGES.len(),
     );
     for package in PREPARED_PACKAGES {
         let package_root = root.join(package);
@@ -695,3 +696,4 @@ fn writer_audit_bundle_evidence() -> GeneratedRunnerWriterAuditBundleEvidenceV1 
 }
 
 mod part1;
+mod shard_selector;

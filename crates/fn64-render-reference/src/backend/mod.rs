@@ -106,6 +106,12 @@ pub struct ReferenceBackend {
     /// committed operation boundaries.
     continuation: Option<ReferenceTaskContinuation>,
     next_continuation_token: u64,
+    /// Reused scratch buffer for `process_rdp_commands`'s terminator-append
+    /// copy. Holds no state between calls -- every call clears and refills
+    /// it before reading it -- kept only so each of the ~18,838 raw-RDP
+    /// tasks/route reuses one allocation's capacity instead of `to_vec()`ing
+    /// a fresh 8 MiB RDRAM copy from scratch.
+    raw_rdp_scratch: Vec<u8>,
 }
 
 #[derive(Clone)]

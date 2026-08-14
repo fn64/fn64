@@ -747,6 +747,34 @@ impl<R: RomStorage, T: PiTimingModel> DeviceFabric<R, T> {
     /// Advance deterministic device time and fully commit every due event.
     /// Notifications are returned only after their device and MI state is
     /// guest-visible, so the executor can post them before resuming a thread.
+    /// Advance the fabric clock when nothing is due, touching no memory.
+    ///
+    /// `advance_to`/`advance_to_with_pif` both require a `DmaMemory` because a
+    /// due event may commit bytes through it. When NOTHING is due there is no
+    /// such commit, and the whole operation is moving `now` forward.
+    ///
+    /// This exists because the obvious shortcut -- calling `advance_to_with_pif`
+    /// with an empty view -- is unsound and silently corrupts state: the view
+    /// is still handed to the fabric as `DmaMemory`, so anything committed
+    /// lands in a zero-length buffer. That zeroed WM2000's executable baseline
+    /// and cost a full debugging session.
+    ///
+    /// Returns `false` and does nothing when a deadline IS due, so a caller
+    /// cannot use it to skip real work; the assertion is enforced, not assumed.
+    pub fn advance_clock_if_idle(&mut self, requested: Cycles) -> bool {
+        if requested < self.now {
+            return false;
+        }
+        if self
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= requested)
+        {
+            return false;
+        }
+        self.now = requested;
+        true
+    }
+
     pub fn advance_to<M: DmaMemory + ?Sized>(
         &mut self,
         requested: Cycles,
