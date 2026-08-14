@@ -1835,6 +1835,28 @@ impl RenderBackend for Rt64Backend {
         }
     }
 
+    /// The raw `Fn64Rt64Context*`, for a caller building a settings-UI
+    /// overlay bound to this same device (`fn64_rmlui::Context::create`
+    /// takes exactly this pointer).
+    ///
+    /// Deliberately re-derived from `self.context` on every call rather
+    /// than something a caller obtains once and caches: `self.context` can
+    /// become `None` mid-process (`invalidate_native_state`, reached from
+    /// several ordinary task-processing error paths, not just teardown),
+    /// and a cached copy of the old pointer would dangle the moment that
+    /// happens with no signal to whoever cached it. A caller must go
+    /// through `fn64_abi::settings_ui_render_context_ptr` (the same
+    /// "reach the registered backend, call one trait method, never
+    /// downcast" seam `apply_render_runtime_settings` already uses) every
+    /// time it needs this pointer, not just once at registration.
+    #[cfg(feature = "rt64")]
+    fn settings_ui_render_context_ptr(&self) -> Result<*mut std::ffi::c_void, RenderError> {
+        self.context
+            .as_ref()
+            .map(ffi::Context::as_raw_ptr)
+            .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))
+    }
+
     fn apply_enhancement_settings(
         &mut self,
         settings: &RenderEnhancementSettings,
