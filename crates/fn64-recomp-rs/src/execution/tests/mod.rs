@@ -931,6 +931,7 @@ use programs::mapped_observation_bank;
             byte_len: 8,
             expected_sha256: [0x11; 32],
             actual_sha256: [0x22; 32],
+            first_diff_offset: None,
         };
         BlockRun::new(BlockExit::ImageChanged { at: entry, miss }, 0)
     }
@@ -1254,3 +1255,40 @@ use programs::mapped_observation_bank;
             })
         ));
     }
+
+#[cfg(test)]
+mod aot_miss_offset_tests {
+    use super::super::{AotMiss, BankId, GuestPc};
+
+    #[test]
+    fn a_digest_only_miss_reports_no_offset_and_says_nothing_extra() {
+        // The seams that hold only a digest must not invent a location.
+        let miss = AotMiss {
+            expected_bank: BankId::new(7),
+            va_start: GuestPc::new(0x8000_1000),
+            byte_len: 0x40,
+            expected_sha256: [0x11; 32],
+            actual_sha256: [0x22; 32],
+            first_diff_offset: None,
+        };
+        let rendered = miss.to_string();
+        assert!(!rendered.contains("first differing byte"), "{rendered}");
+    }
+
+    #[test]
+    fn a_located_miss_names_the_offset_and_its_address() {
+        // This is the whole point: "which byte" distinguishes a game writing
+        // to a data field inside the image from a different overlay entirely.
+        let miss = AotMiss {
+            expected_bank: BankId::new(7),
+            va_start: GuestPc::new(0x8000_1000),
+            byte_len: 0x40,
+            expected_sha256: [0x11; 32],
+            actual_sha256: [0x22; 32],
+            first_diff_offset: Some(0x24),
+        };
+        let rendered = miss.to_string();
+        assert!(rendered.contains("first differing byte at +0x24"), "{rendered}");
+        assert!(rendered.contains("0x80001024"), "{rendered}");
+    }
+}

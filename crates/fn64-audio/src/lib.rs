@@ -70,7 +70,7 @@ pub mod whole_task;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
@@ -245,12 +245,12 @@ impl UcodeExecutor for LoudStubUcodeExecutor {
 }
 
 /// Shared ring buffer between the producer side (`CpalBackend::queue_samples`,
-/// called from the emulation thread) and the cpal audio callback (called on
-/// cpal's own realtime thread). A `Mutex<VecDeque<i16>>` rather than a
-/// lock-free SPSC ring: this backend's job is proving the sample-delivery
-/// seam is wired end-to-end, not winning a realtime-audio benchmark: see
-/// this crate's module doc, "this half is real ... ordinary buffer
-/// plumbing", not a claim of production-grade low-latency audio.
+/// called from the emulation thread) and cpal's realtime callback. The
+/// callback only attempts the lock: producer contention is rendered as a
+/// counted underrun instead of ever blocking the device thread. The producer
+/// needs exclusive access to preserve the established drop-oldest overflow
+/// policy and its per-DMA byte accounting; a strict SPSC producer cannot
+/// safely evict the consumer's oldest slots.
 type SampleRing = Arc<Mutex<OutputRing>>;
 
 #[derive(Debug)]
@@ -260,23 +260,57 @@ struct DmaSpan {
     guest_bytes_total: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OutputRing {
     samples: VecDeque<i16>,
     dmas: VecDeque<DmaSpan>,
+    sample_cap: usize,
 }
 
 impl OutputRing {
-    fn push_dma(&mut self, output: Vec<i16>, guest_bytes: u32) {
-        if output.is_empty() {
-            return;
+    fn with_capacity(sample_cap: usize) -> Self {
+        OutputRing {
+            samples: VecDeque::with_capacity(sample_cap),
+            // Every retained DMA owns at least one retained sample, so this
+            // worst-case metadata bound cannot be exceeded while samples are
+            // capped. Preallocating it keeps producer work inside the shared
+            // critical section allocation-free as well.
+            dmas: VecDeque::with_capacity(sample_cap),
+            sample_cap,
         }
-        self.dmas.push_back(DmaSpan {
-            output_samples_total: output.len(),
-            output_samples_remaining: output.len(),
-            guest_bytes_total: guest_bytes,
-        });
-        self.samples.extend(output);
+    }
+
+    /// Append one DMA without ever growing the realtime sample storage.
+    ///
+    /// Logically this is the old `extend` followed by `cap_samples`: oldest
+    /// queued samples (including an oversized DMA's prefix) are discarded,
+    /// and DMA progress advances by the same count. Doing the eviction first
+    /// keeps `samples.len() <= sample_cap` throughout, so `extend` cannot
+    /// allocate after stream creation.
+    fn push_dma(&mut self, output: &[i16], guest_bytes: u32) -> usize {
+        if output.is_empty() {
+            return 0;
+        }
+        let dropped = self
+            .samples
+            .len()
+            .saturating_add(output.len())
+            .saturating_sub(self.sample_cap);
+        let old_dropped = dropped.min(self.samples.len());
+        if old_dropped > 0 {
+            self.samples.drain(..old_dropped);
+            self.consume_spans(old_dropped);
+        }
+        let input_dropped = dropped - old_dropped;
+        if input_dropped < output.len() {
+            self.dmas.push_back(DmaSpan {
+                output_samples_total: output.len(),
+                output_samples_remaining: output.len() - input_dropped,
+                guest_bytes_total: guest_bytes,
+            });
+        }
+        self.samples.extend(&output[input_dropped..]);
+        dropped
     }
 
     fn consume_spans(&mut self, mut samples: usize) {
@@ -309,25 +343,16 @@ impl OutputRing {
 
     fn drain_into_f32(&mut self, output: &mut [f32]) -> usize {
         let delivered = output.len().min(self.samples.len());
-        for slot in &mut output[..delivered] {
-            let sample = self
-                .samples
-                .pop_front()
-                .expect("delivered length was bounded");
-            *slot = f32::from(sample) / 32768.0;
+        {
+            let (front, back) = self.samples.as_slices();
+            for (slot, sample) in output[..delivered].iter_mut().zip(front.iter().chain(back)) {
+                *slot = f32::from(*sample) / 32768.0;
+            }
         }
+        self.samples.drain(..delivered);
         output[delivered..].fill(0.0);
         self.consume_spans(delivered);
         output.len() - delivered
-    }
-
-    fn cap_samples(&mut self, cap: usize) -> usize {
-        let dropped = self.samples.len().saturating_sub(cap);
-        if dropped > 0 {
-            self.samples.drain(..dropped);
-            self.consume_spans(dropped);
-        }
-        dropped
     }
 
     fn current_dma_bytes_remaining(&self) -> u32 {
@@ -341,6 +366,24 @@ impl OutputRing {
 
     fn has_ai_double_buffer(&self) -> bool {
         self.dmas.len() >= 2
+    }
+}
+
+fn drain_ring_into_f32(mut ring: MutexGuard<'_, OutputRing>, output: &mut [f32]) -> usize {
+    ring.drain_into_f32(output)
+}
+
+/// Never wait on the emulation thread from cpal's realtime callback. A busy
+/// producer is indistinguishable from an empty ring for this one pull: both
+/// must become silence and both are included in `underrun_samples`.
+fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> usize {
+    match ring.try_lock() {
+        Ok(guard) => drain_ring_into_f32(guard, output),
+        Err(TryLockError::Poisoned(error)) => drain_ring_into_f32(error.into_inner(), output),
+        Err(TryLockError::WouldBlock) => {
+            output.fill(0.0);
+            output.len()
+        }
     }
 }
 
@@ -369,6 +412,10 @@ pub struct CpalBackend {
     /// (`osAiSetFrequency`).
     guest_rate_hz: u32,
     resampler: BandlimitedResampler,
+    /// Reused producer-side conversion storage. Its capacity is reserved from
+    /// the exact rate ratio before resampling, avoiding a guaranteed growth
+    /// allocation for common 28.8/32 kHz -> 48 kHz conversion.
+    resample_output: Vec<i16>,
     /// One-shot flag so ring-overflow drops are reported loudly exactly once
     /// per stream, not once per queue call.
     warned_overflow: bool,
@@ -378,6 +425,7 @@ pub struct CpalBackend {
     late_callbacks: Arc<AtomicU64>,
     max_callback_gap_us: Arc<AtomicU64>,
     output_dump: Option<PcmStreamDump>,
+    output_dump_checked: bool,
 }
 
 impl Default for CpalBackend {
@@ -389,13 +437,14 @@ impl Default for CpalBackend {
 impl CpalBackend {
     pub fn new() -> Self {
         CpalBackend {
-            ring: Arc::new(Mutex::new(OutputRing::default())),
+            ring: Arc::new(Mutex::new(OutputRing::with_capacity(0))),
             channels: 2,
             stream: None,
             stream_started: false,
             stream_rate_hz: 0,
             guest_rate_hz: 0,
             resampler: BandlimitedResampler::new(),
+            resample_output: Vec::new(),
             warned_overflow: false,
             callback_count: Arc::new(AtomicU64::new(0)),
             requested_samples: Arc::new(AtomicU64::new(0)),
@@ -403,6 +452,7 @@ impl CpalBackend {
             late_callbacks: Arc::new(AtomicU64::new(0)),
             max_callback_gap_us: Arc::new(AtomicU64::new(0)),
             output_dump: None,
+            output_dump_checked: false,
         }
     }
 
@@ -410,30 +460,6 @@ impl CpalBackend {
     pub fn stream_rate_hz(&self) -> Option<u32> {
         self.stream.as_ref().map(|_| self.stream_rate_hz)
     }
-}
-
-/// Drop the OLDEST samples so `ring` holds at most `cap` samples; returns
-/// how many were dropped. Bounding the ring keeps output latency finite when
-/// the producer outruns the drain (a paused/App-Napped callback, or a
-/// headless probe pumping the game far faster than real time -- previously
-/// an unbounded memory leak). Dropping the oldest skips playback ahead
-/// instead of letting it lag ever further behind the game.
-#[cfg(test)]
-fn cap_ring(ring: &mut VecDeque<i16>, cap: usize) -> usize {
-    let excess = ring.len().saturating_sub(cap);
-    if excess > 0 {
-        ring.drain(..excess);
-    }
-    excess
-}
-
-#[cfg(test)]
-fn drain_ring(ring: &mut VecDeque<i16>, output: &mut [i16]) -> usize {
-    let underrun = output.len().saturating_sub(ring.len());
-    for slot in output {
-        *slot = ring.pop_front().unwrap_or(0);
-    }
-    underrun
 }
 
 const OUTPUT_STREAM_DUMP_SECONDS: u64 = 12;
@@ -594,6 +620,23 @@ impl BandlimitedResampler {
         self.phase = 0.0;
     }
 
+    fn output_samples_hint(
+        input_samples: usize,
+        channels: usize,
+        in_hz: u32,
+        out_hz: u32,
+    ) -> usize {
+        if in_hz == out_hz {
+            return input_samples;
+        }
+        let input_frames = input_samples / channels;
+        let output_frames = (input_frames as u128)
+            .saturating_mul(u128::from(out_hz))
+            .div_ceil(u128::from(in_hz))
+            .saturating_add(1);
+        usize::try_from(output_frames.saturating_mul(channels as u128)).unwrap_or(usize::MAX)
+    }
+
     fn sample_at(&self, pos: f64, channel: usize) -> i16 {
         let frame_count = self.frames.len() / self.channels;
         let center = pos.floor() as isize;
@@ -700,13 +743,17 @@ impl AudioBackend for CpalBackend {
                 sample_rate: rate_hz,
                 buffer_size: cpal::BufferSize::Default,
             };
-            let ring = Arc::clone(&self.ring);
+            // Allocate the complete 250 ms latency bound before cpal can run
+            // its callback. `OutputRing::push_dma` evicts before appending, so
+            // neither sample nor DMA-span storage grows on either thread.
+            let ring_capacity = (rate_hz as usize / 4).max(1) * cfg.channels.max(1) as usize;
+            let ring = Arc::new(Mutex::new(OutputRing::with_capacity(ring_capacity)));
+            let callback_ring = Arc::clone(&ring);
             let callback_count = Arc::clone(&self.callback_count);
             let requested_samples = Arc::clone(&self.requested_samples);
             let underrun_samples = Arc::clone(&self.underrun_samples);
             let late_callbacks = Arc::clone(&self.late_callbacks);
             let max_callback_gap_us = Arc::clone(&self.max_callback_gap_us);
-            let mut first_pull = true;
             let mut last_pull = None;
             device
                 .build_output_stream(
@@ -728,22 +775,9 @@ impl AudioBackend for CpalBackend {
                                 Ordering::Relaxed,
                             );
                         }
-                        let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
-                        if first_pull {
-                            first_pull = false;
-                            // One line per stream: proves the realtime
-                            // callback actually runs (a created-and-played
-                            // stream whose callback never fires is silent
-                            // with no error anywhere else).
-                            eprintln!(
-                                "fn64-audio: output callback live (first pull: {} samples,                                  ring holds {})",
-                                data.len(),
-                                ring.samples.len()
-                            );
-                        }
                         callback_count.fetch_add(1, Ordering::Relaxed);
                         requested_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
-                        let underrun = ring.drain_into_f32(data);
+                        let underrun = try_drain_ring_into_f32(&callback_ring, data);
                         underrun_samples.fetch_add(underrun as u64, Ordering::Relaxed);
                     },
                     move |err| {
@@ -755,6 +789,7 @@ impl AudioBackend for CpalBackend {
                     },
                     None,
                 )
+                .map(|stream| (stream, ring))
         };
 
         // Prefer a stream at the guest's own rate (no conversion). Devices
@@ -764,8 +799,8 @@ impl AudioBackend for CpalBackend {
         // different-rate stream: the rate mismatch chronically starves or
         // floods the ring and the callback's zero-fill renders that as
         // loud static.
-        let (stream, stream_rate_hz) = match build(cfg.sample_rate_hz) {
-            Ok(stream) => (stream, cfg.sample_rate_hz),
+        let (stream, ring, stream_rate_hz) = match build(cfg.sample_rate_hz) {
+            Ok((stream, ring)) => (stream, ring, cfg.sample_rate_hz),
             Err(requested_err) => {
                 let default_cfg =
                     device
@@ -784,7 +819,7 @@ impl AudioBackend for CpalBackend {
                      device-default {fallback_hz} Hz with band-limited resampling",
                     cfg.sample_rate_hz
                 );
-                let stream = build(fallback_hz).map_err(|e| AudioError::Backend {
+                let (stream, ring) = build(fallback_hz).map_err(|e| AudioError::Backend {
                     backend: "cpal",
                     reason: format!(
                         "build_output_stream failed at requested {} Hz and at \
@@ -792,16 +827,18 @@ impl AudioBackend for CpalBackend {
                         cfg.sample_rate_hz
                     ),
                 })?;
-                (stream, fallback_hz)
+                (stream, ring, fallback_hz)
             }
         };
 
+        self.ring = ring;
         self.channels = cfg.channels;
         self.stream_rate_hz = stream_rate_hz;
         self.guest_rate_hz = cfg.sample_rate_hz;
         self.resampler = BandlimitedResampler::new();
         self.stream_started = false;
         self.output_dump = None;
+        self.output_dump_checked = false;
         self.stream = Some(stream);
         Ok(())
     }
@@ -810,39 +847,50 @@ impl AudioBackend for CpalBackend {
         if self.stream.is_none() {
             return Err(AudioError::NotReady("create() not called"));
         }
-        let mut converted = Vec::with_capacity(samples.len());
-        self.resampler.process(
-            samples,
-            self.channels.max(1) as usize,
+        let channels = self.channels.max(1) as usize;
+        let reserve = BandlimitedResampler::output_samples_hint(
+            samples.len(),
+            channels,
             self.guest_rate_hz,
             self.stream_rate_hz,
-            &mut converted,
         );
-        if self.output_dump.is_none() {
+        self.resample_output.clear();
+        if self.resample_output.capacity() < reserve {
+            self.resample_output.reserve(reserve);
+        }
+        self.resampler.process(
+            samples,
+            channels,
+            self.guest_rate_hz,
+            self.stream_rate_hz,
+            &mut self.resample_output,
+        );
+        if !self.output_dump_checked {
+            self.output_dump_checked = true;
             self.output_dump = PcmStreamDump::maybe_create_from_env(self.stream_rate_hz);
         }
         if let Some(dump) = self.output_dump.as_mut() {
-            dump.write_samples(&converted);
+            dump.write_samples(&self.resample_output);
         }
-        let should_start = {
+        let (should_start, dropped, ring_cap) = {
             let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-            ring.push_dma(
-                converted,
+            let dropped = ring.push_dma(
+                &self.resample_output,
                 u32::try_from(samples.len().saturating_mul(2)).unwrap_or(u32::MAX),
             );
-            // Bound output latency: ~250 ms of stream audio. Correct
-            // retrace/DMA scheduling keeps the ring well below this; the cap
-            // is the backstop for an unpaced producer.
-            let cap = (self.stream_rate_hz as usize / 4).max(1) * self.channels.max(1) as usize;
-            let dropped = ring.cap_samples(cap);
-            if dropped > 0 && !self.warned_overflow {
-                self.warned_overflow = true;
-                eprintln!(
-                    "fn64-audio: output ring exceeded {cap} samples; dropped {dropped} oldest                  (producer outrunning the drain -- reported once)"
-                );
-            }
-            !self.stream_started && ring.has_ai_double_buffer()
+            (
+                !self.stream_started && ring.has_ai_double_buffer(),
+                dropped,
+                ring.sample_cap,
+            )
         };
+        if dropped > 0 && !self.warned_overflow {
+            self.warned_overflow = true;
+            eprintln!(
+                "fn64-audio: output ring exceeded {ring_cap} samples; dropped {dropped} oldest \
+                 (producer outrunning the drain -- reported once)"
+            );
+        }
         if should_start {
             self.stream
                 .as_ref()
@@ -1056,6 +1104,26 @@ mod tests {
     }
 
     #[test]
+    fn resampler_output_hint_covers_upsampling_without_growth() {
+        let mut resampler = BandlimitedResampler::new();
+        let mut output = Vec::new();
+        for sample_count in [2, 30, 106, 2096, 14, 512] {
+            let input: Vec<i16> = (0..sample_count).collect();
+            let hint = BandlimitedResampler::output_samples_hint(input.len(), 2, 28_800, 48_000);
+            output.clear();
+            if output.capacity() < hint {
+                output.reserve(hint);
+            }
+            let allocated = output.capacity();
+
+            resampler.process(&input, 2, 28_800, 48_000, &mut output);
+
+            assert!(output.len() <= hint, "{sample_count} input samples");
+            assert_eq!(output.capacity(), allocated, "{sample_count} input samples");
+        }
+    }
+
+    #[test]
     fn resampler_preserves_stereo_channel_identity() {
         // L = constant 1000, R = constant -2000: linear interpolation of
         // constants is the constant, so ANY cross-channel mixup (the L/R
@@ -1093,32 +1161,46 @@ mod tests {
     }
 
     #[test]
-    fn cap_ring_drops_oldest_keeps_newest() {
-        let mut ring: VecDeque<i16> = (0..100).collect();
-        assert_eq!(cap_ring(&mut ring, 40), 60);
-        assert_eq!(ring.len(), 40);
-        assert_eq!(*ring.front().unwrap(), 60, "oldest dropped, newest kept");
-        assert_eq!(*ring.back().unwrap(), 99);
-        // Under cap: untouched.
-        assert_eq!(cap_ring(&mut ring, 40), 0);
-        assert_eq!(ring.len(), 40);
+    fn preallocated_ring_drops_oldest_keeps_newest_without_growing() {
+        let mut ring = OutputRing::with_capacity(40);
+        let allocated = ring.samples.capacity();
+        let allocated_dmas = ring.dmas.capacity();
+        let input: Vec<i16> = (0..100).collect();
+        assert_eq!(ring.push_dma(&input, 200), 60);
+        assert_eq!(ring.samples.len(), 40);
+        assert_eq!(
+            *ring.samples.front().unwrap(),
+            60,
+            "oldest dropped, newest kept"
+        );
+        assert_eq!(*ring.samples.back().unwrap(), 99);
+        assert_eq!(ring.samples.capacity(), allocated);
+        assert_eq!(ring.dmas.capacity(), allocated_dmas);
+        assert_eq!(ring.current_dma_bytes_remaining(), 80);
     }
 
     #[test]
-    fn drain_ring_counts_every_silence_filled_output_slot() {
-        let mut ring = VecDeque::from([10, 20, 30]);
-        let mut output = [99; 5];
+    fn realtime_callback_uses_silence_instead_of_waiting_for_busy_producer() {
+        let mut output_ring = OutputRing::with_capacity(8);
+        output_ring.push_dma(&[10, 20, 30], 6);
+        let ring = Arc::new(Mutex::new(output_ring));
+        let producer_guard = ring.lock().unwrap();
+        let mut output = [99.0; 5];
 
-        assert_eq!(drain_ring(&mut ring, &mut output), 2);
-        assert_eq!(output, [10, 20, 30, 0, 0]);
-        assert!(ring.is_empty());
+        assert_eq!(try_drain_ring_into_f32(&ring, &mut output), 5);
+        assert_eq!(output, [0.0; 5]);
+        assert_eq!(
+            producer_guard.samples.len(),
+            3,
+            "contention consumes nothing"
+        );
     }
 
     #[test]
     fn ai_length_tracks_only_the_head_dma_not_host_prebuffer() {
-        let mut ring = OutputRing::default();
-        ring.push_dma(vec![1; 8], 16);
-        ring.push_dma(vec![2; 8], 16);
+        let mut ring = OutputRing::with_capacity(32);
+        ring.push_dma(&[1; 8], 16);
+        ring.push_dma(&[2; 8], 16);
         assert!(ring.has_ai_double_buffer());
         assert_eq!(ring.current_dma_bytes_remaining(), 16);
 
@@ -1136,9 +1218,26 @@ mod tests {
     }
 
     #[test]
+    fn overflow_advances_head_dma_before_retaining_newest_dma() {
+        let mut ring = OutputRing::with_capacity(10);
+        ring.push_dma(&[1; 8], 16);
+        assert_eq!(ring.push_dma(&[2; 8], 16), 6);
+        assert_eq!(ring.current_dma_bytes_remaining(), 4);
+        assert_eq!(
+            ring.samples.iter().copied().collect::<Vec<_>>(),
+            [1, 1, 2, 2, 2, 2, 2, 2, 2, 2]
+        );
+
+        let mut head_tail = [0; 2];
+        assert_eq!(ring.drain_into(&mut head_tail), 0);
+        assert_eq!(head_tail, [1, 1]);
+        assert_eq!(ring.current_dma_bytes_remaining(), 16);
+    }
+
+    #[test]
     fn f32_drain_converts_i16_samples_at_the_host_boundary() {
-        let mut ring = OutputRing::default();
-        ring.push_dma(vec![i16::MIN, -16384, 0, 16384], 8);
+        let mut ring = OutputRing::with_capacity(8);
+        ring.push_dma(&[i16::MIN, -16384, 0, 16384], 8);
         let mut output = [99.0; 6];
 
         assert_eq!(ring.drain_into_f32(&mut output), 2);

@@ -241,14 +241,19 @@ pub(super) fn run_block_program(
                 let vector = fault.enter_exception(ctx).unwrap_or_else(|| {
                     let destinations = live.program.borrow().copy_execution_destinations();
                     let recent_start = destinations.len().saturating_sub(16);
+                    // Read the Copy CP0 fields before taking `ctx`'s mutable
+                    // borrow for `indirect_transfer_observations()` below --
+                    // that borrow (needed to make the ring buffer's tail
+                    // contiguous) would otherwise conflict with reading them
+                    // inside the same `format!`.
+                    let cop0_status = ctx.cop0_status;
+                    let cop0_cause = ctx.cop0_cause;
+                    let cop0_epc = ctx.cop0_epc;
+                    let cop0_badvaddr = ctx.cop0_badvaddr;
                     let indirect = ctx.indirect_transfer_observations();
                     let indirect_start = indirect.len().saturating_sub(8);
                     recompiled_gap_panic(format!(
-                        "live BlockProgram stopped on non-architectural guest fault: {fault:?}; current CP0 status={:#010x} cause={:#010x} epc={:#010x} badvaddr={:#018x}; recent entered destinations={:?}; recent indirect transfers={:?}",
-                        ctx.cop0_status,
-                        ctx.cop0_cause,
-                        ctx.cop0_epc,
-                        ctx.cop0_badvaddr,
+                        "live BlockProgram stopped on non-architectural guest fault: {fault:?}; current CP0 status={cop0_status:#010x} cause={cop0_cause:#010x} epc={cop0_epc:#010x} badvaddr={cop0_badvaddr:#018x}; recent entered destinations={:?}; recent indirect transfers={:?}",
                         &destinations[recent_start..],
                         &indirect[indirect_start..],
                     ))
@@ -280,6 +285,12 @@ fn resolve_catalog_transfer_with_activation(
             kind: CpuFaultKind::NoActiveGeneration,
             ..
         }) => {
+            // TEMPORARY (generation-activation census, 2026-08-07). The
+            // observer is a thread-local, so it must be installed on the
+            // executor thread that actually activates. `install` is
+            // `Once`-guarded and returns immediately when the census env var
+            // is absent, which is every non-diagnostic run.
+            super::snapshots::activation_census::install();
             live.activate_for_fetch(target_pc, mem)
                 .map_err(|error| format!("generation activation at {target_pc} failed: {error}"))?;
             live.resolve_transfer(source_bank, target_pc)
@@ -485,6 +496,16 @@ pub(super) fn dispatch_unified_catalog_slice(
 ) -> Result<fn64_recomp_rs::DispatchRun, String> {
     let mut instructions = 0u32;
     let mut blocks = 0u32;
+    let census = dispatch_census::enabled();
+    macro_rules! finish_slice {
+        ($run:expr) => {{
+            let run = $run;
+            if census {
+                dispatch_census::record_slice(&run);
+            }
+            return Ok(run);
+        }};
+    }
 
     loop {
         if let UnifiedCatalogTargetV1::Static(entry) = target {
@@ -500,7 +521,7 @@ pub(super) fn dispatch_unified_catalog_slice(
             .checked_sub(instructions)
             .ok_or_else(|| "unified catalog consumed more than its slice budget".to_string())?;
         if remaining < InstructionBudget::MIN {
-            return Ok(fn64_recomp_rs::DispatchRun {
+            finish_slice!(fn64_recomp_rs::DispatchRun {
                 exit: BlockExit::Checkpoint(target.key()),
                 instructions,
                 blocks,
@@ -560,7 +581,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                                 .can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
                         {
                             if instructions > 0 {
-                                return Ok(fn64_recomp_rs::DispatchRun {
+                                finish_slice!(fn64_recomp_rs::DispatchRun {
                                     exit: BlockExit::Checkpoint(attempted),
                                     instructions,
                                     blocks,
@@ -604,7 +625,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                             attempted_instructions,
                             0,
                         )?;
-                        return Ok(fn64_recomp_rs::DispatchRun {
+                        finish_slice!(fn64_recomp_rs::DispatchRun {
                             exit: BlockExit::Fault(fault),
                             instructions,
                             blocks,
@@ -656,7 +677,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 resume,
             } => match resolve_unified_catalog_call(live, source_bank, target_pc, mem)? {
                 UnifiedCatalogCallV1::Host => {
-                    return Ok(fn64_recomp_rs::DispatchRun {
+                    finish_slice!(fn64_recomp_rs::DispatchRun {
                         exit: BlockExit::HostCall {
                             vram: target_pc,
                             resume,
@@ -674,7 +695,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 // run, then the writer resumes and resolves the new image.
                 // Resolving here would collapse both sides of that scheduler
                 // boundary into one unified slice.
-                return Ok(fn64_recomp_rs::DispatchRun {
+                finish_slice!(fn64_recomp_rs::DispatchRun {
                     exit,
                     instructions,
                     blocks,
@@ -694,7 +715,7 @@ pub(super) fn dispatch_unified_catalog_slice(
                 };
             }
             exit => {
-                return Ok(fn64_recomp_rs::DispatchRun {
+                finish_slice!(fn64_recomp_rs::DispatchRun {
                     exit,
                     instructions,
                     blocks,
@@ -702,6 +723,145 @@ pub(super) fn dispatch_unified_catalog_slice(
             }
         }
     }
+}
+
+/// Diagnostic-only census of catalog dispatch granularity. Gated on
+/// `FN64_DISPATCH_CENSUS`; it observes nothing the runtime consumes and takes
+/// no part in any certified evidence value.
+pub(super) mod dispatch_census {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    pub(super) struct Census {
+        /// Slices, keyed by the terminating exit's discriminant name.
+        pub exits: BTreeMap<&'static str, u64>,
+        /// Histogram of instructions retired per slice.
+        pub slice_instructions: BTreeMap<u32, u64>,
+        /// Histogram of inner turns (blocks) per slice.
+        pub slice_blocks: BTreeMap<u32, u64>,
+        /// Slice-terminating `(exit name, guest pc)` sites.
+        pub sites: BTreeMap<(&'static str, u32), u64>,
+        pub slices: u64,
+        pub total_instructions: u64,
+        pub total_blocks: u64,
+    }
+
+    thread_local! {
+        pub(super) static CENSUS: RefCell<Census> = RefCell::new(Census::default());
+    }
+
+    /// Read the environment once. This is consulted at every dispatch, so an
+    /// uncached `env::var_os` would allocate and scan the environment millions
+    /// of times on a long route even with the census disabled.
+    pub(super) fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FN64_DISPATCH_CENSUS").is_some())
+    }
+
+    pub(super) fn exit_name(exit: &fn64_recomp_rs::BlockExit) -> &'static str {
+        use fn64_recomp_rs::BlockExit as E;
+        match exit {
+            E::Transfer(_) => "Transfer",
+            E::ResolveTransfer { .. } => "ResolveTransfer",
+            E::ResolveCall { .. } => "ResolveCall",
+            E::HostCall { .. } => "HostCall",
+            E::ExecutableWrite { .. } => "ExecutableWrite",
+            E::ExecutableWriteResolveCall { .. } => "ExecutableWriteResolveCall",
+            E::ExecutableWriteFault(_) => "ExecutableWriteFault",
+            E::ImageChanged { .. } => "ImageChanged",
+            E::Checkpoint(_) => "Checkpoint",
+            E::Yield(_) => "Yield",
+            E::ThreadReturn => "ThreadReturn",
+            E::Fault(_) => "Fault",
+        }
+    }
+
+    /// The guest PC a slice's terminating exit names, so a hot exit can be
+    /// attributed to the code that produced it.
+    fn exit_pc(exit: &fn64_recomp_rs::BlockExit) -> u32 {
+        use fn64_recomp_rs::BlockExit as E;
+        match exit {
+            E::Transfer(key) | E::Checkpoint(key) | E::Yield(key) => key.pc.get(),
+            E::ResolveTransfer { target_pc, .. }
+            | E::ResolveCall { target_pc, .. }
+            | E::ExecutableWriteResolveCall { target_pc, .. } => target_pc.get(),
+            E::HostCall { vram, .. } => vram.get(),
+            E::ExecutableWrite { resume, .. } => resume.pc.get(),
+            E::ExecutableWriteFault(fault) | E::Fault(fault) => fault.at.pc.get(),
+            E::ImageChanged { at, .. } => at.pc.get(),
+            E::ThreadReturn => 0,
+        }
+    }
+
+    /// Record one completed slice (one scheduler round trip).
+    pub(super) fn record_slice(run: &fn64_recomp_rs::DispatchRun) {
+        CENSUS.with(|census| {
+            let mut census = census.borrow_mut();
+            census.slices += 1;
+            census.total_instructions += u64::from(run.instructions);
+            census.total_blocks += u64::from(run.blocks);
+            *census.exits.entry(exit_name(&run.exit)).or_default() += 1;
+            *census.slice_instructions.entry(run.instructions).or_default() += 1;
+            *census.slice_blocks.entry(run.blocks).or_default() += 1;
+            *census
+                .sites
+                .entry((exit_name(&run.exit), exit_pc(&run.exit)))
+                .or_default() += 1;
+        });
+    }
+
+    fn head(map: &BTreeMap<u32, u64>, limit: usize) -> String {
+        map.iter()
+            .take(limit)
+            .map(|(key, count)| format!("{key}:{count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(super) fn report() {
+        CENSUS.with(|census| {
+            let census = census.borrow();
+            if census.slices == 0 {
+                return;
+            }
+            eprintln!(
+                "[dispatch-census] slices={} instructions={} blocks={} \
+                 instructions_per_slice={:.3} blocks_per_slice={:.3} instructions_per_block={:.3}",
+                census.slices,
+                census.total_instructions,
+                census.total_blocks,
+                census.total_instructions as f64 / census.slices as f64,
+                census.total_blocks as f64 / census.slices as f64,
+                census.total_instructions as f64 / census.total_blocks.max(1) as f64,
+            );
+            eprintln!("[dispatch-census] slice_exit={:?}", census.exits);
+            eprintln!(
+                "[dispatch-census] slice_instruction_histogram {}",
+                head(&census.slice_instructions, 24)
+            );
+            eprintln!(
+                "[dispatch-census] slice_block_histogram {}",
+                head(&census.slice_blocks, 24)
+            );
+            let mut sites: Vec<_> = census.sites.iter().collect();
+            sites.sort_by(|left, right| right.1.cmp(left.1));
+            for ((exit, pc), count) in sites.into_iter().take(12) {
+                eprintln!("[dispatch-census] site {exit} pc={pc:#010x} count={count}");
+            }
+        });
+    }
+}
+
+/// Print the `FN64_DISPATCH_CENSUS` report, if the census was enabled. This is
+/// a diagnostic; it reads nothing the runtime writes and returns no value any
+/// certified evidence depends on.
+pub fn report_dispatch_census() {
+    if !dispatch_census::enabled() {
+        return;
+    }
+    dispatch_census::report();
 }
 
 #[cfg(feature = "dynamic-mapped-runtime")]
@@ -875,7 +1035,17 @@ pub(super) fn run_catalog_block_program(
     entry = resolve_catalog_transfer_with_activation(live, entry.bank, entry.pc, mem)
         .unwrap_or_else(|error| recompiled_gap_panic(error));
     loop {
+        // Split `resume NET` -- 83.2% of a WM2000 render field with no
+        // sub-counters. One walking clock per loop iteration; one iteration is
+        // one scheduling step, because the body ends in
+        // `suspend_active_coroutine` below. Disarmed to nothing without
+        // `FN64_RESUME_SPLIT`. See `ResumePhaseClock`.
+        let mut phase = crate::task_dispatch::ResumePhaseClock::start();
         live.reconcile_before_dispatch(mem);
+        phase.lap(
+            &crate::task_dispatch::RESUME_RECONCILE_NS,
+            Some(&crate::task_dispatch::RESUME_RECONCILE_CALLS),
+        );
         let (count, count_phase, compare, timer_pending) = with_executor(|executor| {
             (
                 executor.cp0_count(),
@@ -896,6 +1066,11 @@ pub(super) fn run_catalog_block_program(
                 });
         }
 
+        // Everything since the reconcile lap: the COP0 borrow,
+        // `synchronize_cop0_timing`, both interrupt lines, and the pending
+        // interrupt's vector resolve when one fires.
+        phase.lap(&crate::task_dispatch::RESUME_COP0_NS, None);
+
         let dispatched = live
             .dispatch_exposing_exceptions_at_budget(entry, live.next_dispatch_budget(), ctx, mem)
             .unwrap_or_else(|error| {
@@ -903,7 +1078,25 @@ pub(super) fn run_catalog_block_program(
                     "canonical catalog dispatch failed at {entry}: {error}"
                 ))
             });
+        // THE GUEST. Inclusive of every host shim the translated code called
+        // synchronously -- graphics and audio reach `rsp_commit` from guest SP
+        // register writes, so `gfx_ns` and `audio_lle_ns` are nested in this
+        // figure and must be subtracted to isolate recompiled MIPS plus the
+        // memory runtime. `vi_present_ns` is NOT nested here (harness arm).
+        phase.lap(
+            &crate::task_dispatch::RESUME_DISPATCH_NS,
+            Some(&crate::task_dispatch::RESUME_DISPATCH_CALLS),
+        );
+        if dispatch_census::enabled() {
+            dispatch_census::record_slice(&dispatched);
+            // Re-open the clock so a census run does not charge its own
+            // recording to the invalidate phase. Off in every benchmark run,
+            // but a diagnostic that silently inflates a neighbouring bucket is
+            // exactly the kind of instrument defect this split exists to avoid.
+            phase = crate::task_dispatch::ResumePhaseClock::start();
+        }
         live.invalidate_pending_physical_writes(mem);
+        phase.lap(&crate::task_dispatch::RESUME_INVALIDATE_NS, None);
 
         let image_changed_entry = match dispatched.exit {
             BlockExit::ImageChanged { at, .. } => Some(
@@ -956,9 +1149,23 @@ pub(super) fn run_catalog_block_program(
                 prepared_continuation,
                 ctx,
             );
+            // Exit classification, activation, COP0 write-back and checkpoint
+            // publication -- everything between the guest returning and the
+            // coroutine actually suspending.
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
             crate::suspend_active_coroutine(fn64_runtime::Yield::InstructionCheckpoint {
                 instructions: dispatched.instructions,
             });
+            // The ON-STACK cost of suspending: the journal flush and the switch
+            // itself, with the time this stack spent PARKED subtracted by
+            // `ResumePhaseClock::lap`. Without that subtraction this row read
+            // 54.1 ms/field inside a 40.6 ms field, because it was charging
+            // every other thread's work to this one.
+            phase.lap(&crate::task_dispatch::RESUME_SUSPEND_NS, None);
+        } else {
+            // No guest progress: no suspend happens, so the exit work still
+            // belongs to the exit phase and the clock runs on unbroken.
+            phase.lap(&crate::task_dispatch::RESUME_EXIT_NS, None);
         }
 
         match dispatched.exit {
@@ -982,7 +1189,29 @@ pub(super) fn run_catalog_block_program(
                         vram.get()
                     ))
                 });
+                // THE HOST-CALL BUCKET, and it is where graphics actually
+                // lives. `osSpTaskStartGo_recomp` is a guest OS-call shim
+                // reached as a `BlockExit::HostCall`, and it runs
+                // `dispatch_lle_task` synchronously -- which is where `gfx_ns`
+                // is armed. Folding this into the next-entry resolution below
+                // produced a bucket that was ~95% graphics under a label that
+                // said "resolve", and made `gfx_ns` (21.530) exceed the
+                // `dispatch` bucket (7.713) that was supposed to contain it.
+                //
+                // Timed separately so "how much of the field is graphics" and
+                // "how much is the dispatch machinery" are different rows. The
+                // shim also suspends, but no bracketing is needed:
+                // `ResumePhaseClock::lap` subtracts parked time centrally for
+                // every suspend path (see its doc comment).
+                // Close the resolve phase at the exact instant the host call
+                // begins, so the `resolve_host` lookup above is charged to
+                // resolution and not to the host call.
+                phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                 invoke_catalog_block_host(live, vram, resume, host, ctx, mem);
+                phase.lap(
+                    &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                    Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                );
                 entry = resolve_catalog_transfer_with_activation(live, resume.bank, resume.pc, mem)
                     .unwrap_or_else(|fault| {
                         recompiled_gap_panic(format!(
@@ -1039,7 +1268,13 @@ pub(super) fn run_catalog_block_program(
                 {
                     CatalogCallResolutionV1::Guest(next) => entry = next,
                     CatalogCallResolutionV1::Host(host) => {
+                        // Second host-call site; same bucket as the arm above.
+                        phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
                         invoke_catalog_block_host(live, target_pc, resume, host, ctx, mem);
+                        phase.lap(
+                            &crate::task_dispatch::RESUME_HOSTCALL_NS,
+                            Some(&crate::task_dispatch::RESUME_HOSTCALL_CALLS),
+                        );
                         entry = resolve_catalog_transfer_with_activation(
                             live,
                             source_bank,
@@ -1077,6 +1312,12 @@ pub(super) fn run_catalog_block_program(
                 unreachable!("catalog dispatch returned an internal transfer boundary")
             }
         }
+        // Next-entry resolution and any host call the exit dispatched. The
+        // `ThreadReturn` arm returns above without lapping, so one final
+        // partial interval per thread exit goes unattributed -- bounded by the
+        // thread count, not the step count, and therefore far below the
+        // residual this split reports.
+        phase.lap(&crate::task_dispatch::RESUME_RESOLVE_NS, None);
     }
 }
 

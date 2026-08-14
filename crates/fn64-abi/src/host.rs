@@ -1,5 +1,8 @@
 use super::*;
-use crate::task_dispatch::{EXECUTOR_CALLS, EXECUTOR_NS, PHASE_TIMING};
+use crate::task_dispatch::{
+    executor_split_enabled, note_executor_split, EXECUTOR_CALLS, EXECUTOR_NS, EXEC_DEVTIME_NS,
+    EXEC_MIRROR_CALLS, EXEC_MIRROR_NS, EXEC_RESUME_NS, PHASE_TIMING,
+};
 
 // ---------------------------------------------------------------------
 // Host-facing (non-`_recomp`) helpers.
@@ -36,6 +39,23 @@ pub fn advance_virtual_time(now: u64) -> VirtualTimeAdvance {
     crate::task_dispatch::advance_hle_render_task();
     let vi_retrace_ticks = crate::pi::advance_device_time(now);
     with_executor(|exec| exec.advance_time(now));
+    if vi_retrace_ticks != 0 {
+        // Per-field latency census, off unless `FN64_FRAME_CENSUS=1`. Armed
+        // here rather than from a harness `main` because this is the one seam
+        // both the headless and windowed lanes cross, and because
+        // `examples/wm2000-block-boot/src/main.rs` is hashed into the
+        // canonical program identity -- a diagnostic must not move that
+        // digest. `install` is `Once`-guarded and returns immediately when the
+        // gate is absent, which is every non-diagnostic run.
+        // Belt-and-braces: `FN64_PROFILE` normally arms from a pre-main
+        // constructor, which is the only point early enough to beat the
+        // `thread_local!` gate cells. This call covers a linker configuration
+        // that drops the init section. `arm` is `Once`-guarded and returns
+        // immediately when the flag is absent.
+        crate::profile::arm();
+        crate::frame_census::install();
+        crate::frame_census::observe_vi_fields(vi_retrace_ticks, now);
+    }
     VirtualTimeAdvance { vi_retrace_ticks }
 }
 
@@ -79,11 +99,43 @@ pub unsafe fn register_process_rdram(rdram: *mut u8, rdram_len: usize) {
         host.runtime_rdram_len = rdram_len;
         host.native_execution_destinations.clear();
     });
-    with_executor(|exec| unsafe { exec.set_rdram_base_with_len(rdram, rdram_len) });
+    with_executor(|exec| {
+        unsafe { exec.set_rdram_base_with_len(rdram, rdram_len) };
+        // The executor mirrors `OSMesgQueue` fields into guest RDRAM through a
+        // raw pointer, which no view type attributes. A queue may live inside
+        // a watched executable range -- WM2000 has one at 0x8009b0b0 -- so
+        // without this the mirror reads as memory changing under the
+        // recompiler and fails the next dispatch. `fn64-runtime` cannot call
+        // the recompiler crate in production (the dependency is dev-only and
+        // deliberately one-way), so the host installs the hook.
+        //
+        // The hook PUBLISHES rather than observes. The mirror runs while a
+        // host transaction is already open, and that transaction's ordering
+        // boundary requires zero uncommitted child writer events -- so a
+        // notification issued after a raw write is not enough. Routing through
+        // `write_guest_physical` brackets the bytes in a child writer
+        // transaction that commits before returning, which is the same path
+        // every other attributed host write already takes.
+        #[cfg(feature = "recomp-rs")]
+        exec.set_queue_mirror_publisher(crate::recompiled::write_guest_physical);
+    });
 }
 
+/// Move the validated bootstrap allocation into `HostState` and register it.
+///
+/// This is where "RDRAM ownership moves into the runtime" becomes true: after
+/// this returns, the only owner is `HostState`, the pointer is stable for the
+/// process, and nothing outside can retain a `Vec` or a mutable borrow.
+///
+/// The allocation arrives as a [`crate::write_barrier::ProcessRdram`], which is
+/// page-aligned when the bootstrap could `mmap` one. Page alignment is what the
+/// `mprotect` write barrier requires and is otherwise invisible: the type
+/// derefs to `[u8]` exactly as the `Box<[u8]>` it replaced did, and the
+/// ownership contract is unchanged in every other respect.
 #[cfg(feature = "recomp-rs")]
-pub(crate) fn install_owned_process_rdram(mut storage: Box<[u8]>) -> (*mut u8, usize) {
+pub(crate) fn install_owned_process_rdram(
+    mut storage: crate::write_barrier::ProcessRdram,
+) -> (*mut u8, usize) {
     assert!(
         !storage.is_empty(),
         "owned process RDRAM allocation must be nonempty"
@@ -97,9 +149,32 @@ pub(crate) fn install_owned_process_rdram(mut storage: Box<[u8]>) -> (*mut u8, u
         );
         host.owned_runtime_rdram = Some(storage);
     });
-    // SAFETY: HostState now owns the boxed allocation for the runtime lifetime.
+    // SAFETY: HostState now owns the allocation for the runtime lifetime.
     unsafe { register_process_rdram(pointer, length) };
     (pointer, length)
+}
+
+/// The registered process RDRAM allocation, as `(base, len)`.
+///
+/// A null base means none is registered. The write barrier needs the base to
+/// compute page addresses; nothing else should reach for this.
+#[cfg(feature = "recomp-rs")]
+pub(crate) fn registered_process_rdram() -> (*mut u8, usize) {
+    with_host(|host| (host.runtime_rdram, host.runtime_rdram_len))
+}
+
+/// Whether the installed process RDRAM is page-aligned and so protectable.
+///
+/// The barrier asks once, at arming time. A `false` answer is not an error: it
+/// means the allocation came from the heap fallback and the guard stays on its
+/// unconditional scan, which is today's behaviour.
+#[cfg(feature = "recomp-rs")]
+pub(crate) fn process_rdram_is_page_aligned() -> bool {
+    with_host(|host| {
+        host.owned_runtime_rdram
+            .as_ref()
+            .is_some_and(|storage| storage.is_page_aligned())
+    })
 }
 
 /// Install the structurally discovered guest global that libultra's exception
@@ -275,7 +350,31 @@ pub unsafe fn boot_thread0(
 /// `with_executor` closure, or the re-arm is skipped and the bug this wave
 /// fixed reappears.
 pub fn run_one_step() -> bool {
+    // Mark the dynamic extent of this function so `present_render_backend` can
+    // record which side of the executor seam each VI presentation ran on. See
+    // `INSIDE_RUN_ONE_STEP`: this exists to make a reachability claim
+    // falsifiable rather than argued, because `telemetry.rs` currently
+    // subtracts `vi_present_ns` out of `executor_ns` and the call graph says
+    // presentation is reached from the harness, outside it.
+    //
+    // A guard type rather than a set/clear pair: the body below can panic
+    // (`recompiled_gap_panic` on any dispatch fault), and a leaked `true` would
+    // silently misattribute every later presentation to the executor -- turning
+    // a diagnostic into a source of the exact error it exists to detect.
+    struct StepDepth;
+    impl Drop for StepDepth {
+        fn drop(&mut self) {
+            crate::task_dispatch::INSIDE_RUN_ONE_STEP.with(|f| f.set(false));
+        }
+    }
+    crate::task_dispatch::INSIDE_RUN_ONE_STEP.with(|f| f.set(true));
+    let _step_depth = StepDepth;
     let started = PHASE_TIMING.with(Cell::get).then(std::time::Instant::now);
+    // Split `executor_ns`, which has no sub-counters and is 61% of a WM2000
+    // render field. Separately gated from `PHASE_TIMING` because these clocks
+    // are inside the hottest loop here; see `EXECUTOR_SPLIT`'s doc comment.
+    let split = executor_split_enabled();
+    let resume_started = split.then(std::time::Instant::now);
     let (stepped, now) = with_executor(|exec| {
         // `peek_next_thread` is a read-only preview of exactly which thread
         // `exec.run_one_step()` is about to resume -- read it BEFORE the
@@ -290,13 +389,33 @@ pub fn run_one_step() -> bool {
                 // the selected coroutine's guest OSThread pointer is visible
                 // before its first instruction and cannot interleave with a
                 // different resume because `run_one_step` owns RunToken.
-                mirror_guest_running_thread(id);
+                // Timed apart from the resume below: under `recomp-rs` this
+                // is a FULL watched-region journal reconcile (see
+                // `EXEC_MIRROR_NS`), not the four-byte store its name
+                // suggests, and it runs on every step.
+                match split.then(std::time::Instant::now) {
+                    Some(at) => {
+                        mirror_guest_running_thread(id);
+                        note_executor_split(
+                            &EXEC_MIRROR_NS,
+                            Some(&EXEC_MIRROR_CALLS),
+                            at.elapsed().as_nanos() as u64,
+                        );
+                    }
+                    None => mirror_guest_running_thread(id),
+                }
                 with_rearmed_context(id, || exec.run_one_step())
             }
             None => exec.run_one_step(),
         };
         (stepped, exec.sim_time())
     });
+    // Closes over the whole `with_executor` body -- scheduler pick, the
+    // mirror boundary, and the coroutine resume. `exec_mirror_ns` is nested
+    // inside this, not a peer of it; the census subtracts.
+    if let Some(at) = resume_started {
+        note_executor_split(&EXEC_RESUME_NS, None, at.elapsed().as_nanos() as u64);
+    }
     if stepped {
         // `run_one_step` returns only after a yielding coroutine is fully
         // suspended. Commit the ABI-owned device fabric at that exact guest
@@ -304,7 +423,15 @@ pub fn run_one_step() -> bool {
         // closes the interleaving checkpoint-yield -> same-thread resume ->
         // overdue PI completion, which would otherwise execute one extra
         // translated block before bytes/MI/queue state became observable.
-        crate::pi::advance_device_time(now);
+        match split.then(std::time::Instant::now) {
+            Some(at) => {
+                crate::pi::advance_device_time(now);
+                note_executor_split(&EXEC_DEVTIME_NS, None, at.elapsed().as_nanos() as u64);
+            }
+            None => {
+                crate::pi::advance_device_time(now);
+            }
+        }
     }
     if let Some(started) = started {
         EXECUTOR_NS.with(|total| {
@@ -316,7 +443,73 @@ pub fn run_one_step() -> bool {
         });
         EXECUTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
+    heartbeat(stepped, now);
     stepped
+}
+
+/// Steps between `FN64_HEARTBEAT` reports, or 0 when the gate is off.
+///
+/// Diagnostics only: a scheduling step is silent unless the harness happens to
+/// log at it, and WM2000's route schedule stops producing input EDGES at
+/// controller read 600 -- so a run that is progressing perfectly well and a run
+/// that is wedged look identical on stdout. This gate distinguishes them by
+/// printing virtual time and step count on a fixed step cadence regardless of
+/// what the guest is doing.
+///
+/// `FN64_HEARTBEAT=<steps>`; absent, empty, `0`, or unparseable means off, on
+/// the same reasoning as `write_barrier::env_flag` (an A/B whose off lane is
+/// silently the on lane is worse than no A/B).
+fn heartbeat_interval() -> u64 {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("FN64_HEARTBEAT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn heartbeat(stepped: bool, now: u64) {
+    let interval = heartbeat_interval();
+    if interval == 0 {
+        return;
+    }
+    thread_local! {
+        static STEPS: Cell<u64> = const { Cell::new(0) };
+        static IDLE_STEPS: Cell<u64> = const { Cell::new(0) };
+    }
+    if !stepped {
+        IDLE_STEPS.with(|idle| idle.set(idle.get() + 1));
+    }
+    let count = STEPS.with(|steps| {
+        let next = steps.get() + 1;
+        steps.set(next);
+        next
+    });
+    if count % interval != 0 {
+        return;
+    }
+    let (graphics_tasks, audio_tasks) = task_counts();
+    // The controller READ ORDINAL is the route schedule's clock, and the
+    // schedule's own annotation calls the long no-input tail "the cheapest
+    // discriminator". Reporting it here is what makes that discriminator
+    // readable: the harness only logs on an input EDGE, and the schedule has
+    // no edge after read 600, so the ordinal is otherwise invisible exactly
+    // where it matters most.
+    let port0_reads = with_host(|host| {
+        host.controller_operations
+            .iter()
+            .filter(|operation| {
+                operation.port == 0
+                    && operation.device == fn64_runtime::ControllerOperationDevice::StandardController
+                    && operation.operation == fn64_runtime::ControllerOperationKind::Read
+            })
+            .count()
+    });
+    eprintln!(
+        "[fn64-heartbeat] steps={count} sim_time={now} idle_steps={} gfx_submits={graphics_tasks} audio_submits={audio_tasks} port0_reads={port0_reads}",
+        IDLE_STEPS.with(Cell::get),
+    );
 }
 
 /// Priority the next [`run_one_step`] will dispatch, or `None` when the run
@@ -353,6 +546,21 @@ pub fn run_to_idle() {
 /// `osDestroyThread` behavior and must never be used to reset or continue a
 /// runtime in the same process.
 pub fn prepare_process_exit() -> fn64_runtime::ProcessExitSummary {
+    // Take the barrier down before anything else. Teardown writes RDRAM from
+    // several paths and then drops the allocation; a page left `PROT_READ`
+    // would fault somewhere in that sequence, and after the drop the handler's
+    // recorded region would name memory the allocator has reclaimed.
+    //
+    // `force_disarm` rather than `disarm_and_capture`: the latter answers "what
+    // faulted" and, on a boundary where nothing did, deliberately leaves the
+    // region protected rather than paying two syscalls to restore the state it
+    // is already in. That is right for a boundary and wrong for teardown, which
+    // needs the region genuinely writable, not merely observed.
+    #[cfg(feature = "recomp-rs")]
+    {
+        crate::write_barrier::guard::force_disarm();
+        crate::write_barrier::guard::invalidate();
+    }
     crate::task_dispatch::drop_backends_for_process_exit();
     let summary = EXECUTOR.with(|slot| {
         slot.with(|slot| {

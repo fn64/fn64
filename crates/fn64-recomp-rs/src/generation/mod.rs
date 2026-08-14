@@ -106,9 +106,36 @@ impl PrecompiledGeneration {
             });
         }
         shards.sort_unstable_by_key(|shard| (shard.start, shard.end, shard.bank));
+        // Shards must tile the image contiguously from `image_start` and COVER
+        // it, but the final shard may run PAST `image_end`.
+        //
+        // Requiring an exact end forced every generation onto a shard
+        // boundary, and that is unsatisfiable together with the two other
+        // rules. WM2000's overlay 1 is the witness: its text is 0x5df0 bytes,
+        // so it needs one 64 KiB shard, but its whole invalidation extent is
+        // only 0xddc0 -- a whole shard cannot fit inside it. Rounding the
+        // image up broke `InvalidationDoesNotContainImage`; clamping it down
+        // broke this check.
+        //
+        // Letting the last shard overhang keeps what the rule exists for --
+        // every executable byte of the image is backed by exactly one shard,
+        // with no gap and no overlap -- while letting `image_end` fall where
+        // the image actually ends. Bytes past `image_end` inside that final
+        // shard are not part of the generation's identity: the digest covers
+        // `[image_start, image_end)` only, which is precisely why a generation
+        // may end mid-shard without weakening what it asserts.
         let mut cursor = image_start;
         for shard in &shards {
-            if shard.start != cursor || shard.end > image_end {
+            if shard.start != cursor {
+                return Err(GenerationCatalogError::ShardCoverage {
+                    expected_start: cursor,
+                    actual_start: shard.start,
+                    actual_end: shard.end,
+                });
+            }
+            // A shard that starts at or past `image_end` contributes nothing:
+            // the image is already covered, so it is a gap in disguise.
+            if cursor >= image_end {
                 return Err(GenerationCatalogError::ShardCoverage {
                     expected_start: cursor,
                     actual_start: shard.start,
@@ -117,7 +144,7 @@ impl PrecompiledGeneration {
             }
             cursor = shard.end;
         }
-        if cursor != image_end {
+        if cursor < image_end {
             return Err(GenerationCatalogError::ShardCoverage {
                 expected_start: cursor,
                 actual_start: cursor,
@@ -262,6 +289,19 @@ pub enum GenerationLookupError {
         second: GenerationId,
     },
     AotMiss(AotMiss),
+    /// Several generations contained the PC and NONE matched live memory.
+    ///
+    /// Distinct from [`Self::AotMiss`], which names one generation and reads
+    /// as "this image changed". With several candidates that framing is
+    /// misleading: WM2000's activation at `0x800F61B4` had three, and the log
+    /// named only the resident tail, which sent three separate investigations
+    /// after the wrong generation. The count says "the loaded overlay is not
+    /// among the ones we can verify here", which is a different problem.
+    NoGenerationMatched {
+        pc: GuestPc,
+        candidates: usize,
+        first: AotMiss,
+    },
 }
 
 impl fmt::Display for GenerationLookupError {
@@ -276,6 +316,14 @@ impl fmt::Display for GenerationLookupError {
                 "live image at {pc} matches both {first} and {second}"
             ),
             Self::AotMiss(miss) => miss.fmt(formatter),
+            Self::NoGenerationMatched {
+                pc,
+                candidates,
+                first,
+            } => write!(
+                formatter,
+                "none of the {candidates} precompiled generations containing {pc} matched live memory; first: {first}"
+            ),
         }
     }
 }
@@ -384,6 +432,47 @@ impl PrecompiledGenerationBackingV1 {
 
     pub fn spans(&self) -> &[BackedExecutableSpanV1] {
         &self.spans
+    }
+
+    /// Whether `[physical_start, physical_end)` touches any byte this
+    /// generation's DIGEST covers.
+    ///
+    /// The backing spans tile the whole INVALIDATION extent, which is wider
+    /// than the image by construction (`PrecompiledGeneration::new` enforces
+    /// `invalidation_start <= image_start` and `invalidation_end >=
+    /// image_end`). The surplus is the overlay's mutable data: bytes the guest
+    /// writes constantly and that no digest ever reads.
+    ///
+    /// So this clips each span to `[image_start, image_end)` -- exactly the
+    /// clip `live_sha256_mapped_with` applies when it computes the digest, and
+    /// exactly the clip the image/matched unions apply in
+    /// `initial_generation_images`. "Would this write change the digest?" and
+    /// "does this write land in the digested bytes?" are then the same
+    /// question, which is what makes retiring on it correct.
+    ///
+    /// Testing the unclipped span instead retires an overlay's CODE whenever
+    /// the guest writes its DATA. On WM2000 that was 419,861 activations
+    /// re-hashing 66.8 GB, with a measured 100% of them attributed to bytes
+    /// outside the digested image and zero to executable bytes.
+    pub fn digested_image_intersects(
+        &self,
+        image_start: GuestPc,
+        image_end: GuestPc,
+        physical_start: u32,
+        physical_end: u32,
+    ) -> bool {
+        self.spans.iter().any(|span| {
+            let virtual_start = span.virtual_start.max(image_start);
+            let virtual_end = span.virtual_end().min(image_end);
+            if virtual_start >= virtual_end {
+                return false;
+            }
+            let clipped_start = span
+                .physical_at(virtual_start)
+                .expect("clipped image start left its backing span");
+            let clipped_end = clipped_start + (virtual_end.get() - virtual_start.get());
+            physical_start < clipped_end && physical_end > clipped_start
+        })
     }
 }
 
@@ -742,23 +831,48 @@ impl PrecompiledGenerationCatalog {
 
         let mut matches = Vec::new();
         let mut first_miss = None;
+        // Every candidate that failed, so a total miss can name them all.
+        // Reporting only the FIRST hid the fact that WM2000's activation at
+        // 0x800F61B4 had three candidates and all three diverged; the log
+        // named the resident tail alone, which sent three separate
+        // investigations after the wrong generation.
+        let mut missed = Vec::new();
         for index in containing {
             let generation = &self.generations[index];
             let actual_sha256 = live_digest(generation);
             if actual_sha256 == generation.expected_sha256 {
                 matches.push(index);
-            } else if first_miss.is_none() {
+            } else {
+                missed.push(generation.id);
+            }
+            if actual_sha256 != generation.expected_sha256 && first_miss.is_none() {
                 first_miss = Some(AotMiss {
                     expected_bank: generation.key(pc).bank,
                     va_start: generation.image_start,
                     byte_len: generation.byte_len(),
                     expected_sha256: generation.expected_sha256,
                     actual_sha256,
+                    // A generation stores only its digest, never the compiled
+                    // bytes, so there is nothing here to diff live memory
+                    // against. Locating the first differing byte is an OFFLINE
+                    // question against the ROM-resident image.
+                    first_diff_offset: None,
                 });
             }
         }
         let &selected = match matches.as_slice() {
-            [] => return Err(GenerationLookupError::AotMiss(first_miss.unwrap())),
+            [] => {
+                if missed.len() > 1 {
+                    return Err(GenerationLookupError::NoGenerationMatched {
+                        pc,
+                        candidates: missed.len(),
+                        first: first_miss.expect("a miss exists when matches is empty"),
+                    });
+                }
+                return Err(GenerationLookupError::AotMiss(
+                    first_miss.expect("a miss exists when matches is empty"),
+                ));
+            }
             [selected] => selected,
             [first, second, ..] => {
                 return Err(GenerationLookupError::AmbiguousLiveImage {
@@ -1213,9 +1327,28 @@ impl BackedPrecompiledGenerationCatalogV1 {
         Ok(matching)
     }
 
-    /// Retire every active segment owned by a generation whose exact physical
-    /// invalidation backing intersects the committed write. A split active
-    /// generation is retired as one image because its digest is indivisible.
+    /// Retire every active segment owned by a generation whose DIGESTED IMAGE
+    /// intersects the committed write. A split active generation is retired as
+    /// one image because its digest is indivisible.
+    ///
+    /// The test is the digested image, not the whole invalidation extent. A
+    /// generation's identity is its digest over `[image_start, image_end)`;
+    /// a write outside that range cannot change the digest, so the activated
+    /// translation stays valid and there is nothing to retire. Retiring on the
+    /// wider extent meant every guest write to an overlay's data retired the
+    /// overlay's code and forced a full text re-hash on the next fetch.
+    ///
+    /// A write to executable bytes still retires, which is the property that
+    /// matters: `digested_image_intersects` clips to precisely the bytes the
+    /// digest reads, so it is narrower than the invalidation extent but never
+    /// narrower than the digest.
+    ///
+    /// This must stay in step with `resident_backing_intersects_catalog`
+    /// (`fn64-abi` `recompiled/live_program.rs`), which decides whether the
+    /// same write breaks the translated block. The two are a matched pair:
+    /// narrowing retirement alone leaves generations resident, which makes the
+    /// block-boundary predicate answer "resident" far more often and costs more
+    /// scheduler steps than it saves.
     pub fn invalidate_physical_write(
         &mut self,
         physical_start: u32,
@@ -1238,11 +1371,12 @@ impl BackedPrecompiledGenerationCatalogV1 {
                     .binary_search_by_key(&generation.id, |backing| backing.generation)
                     .expect("active generation has no validated physical backing")];
                 backing
-                    .spans
-                    .iter()
-                    .any(|span| {
-                        physical_start < span.physical_end() && physical_end > span.physical_start()
-                    })
+                    .digested_image_intersects(
+                        generation.image_start,
+                        generation.image_end,
+                        physical_start,
+                        physical_end,
+                    )
                     .then_some(generation.id)
             })
             .collect::<Vec<_>>();

@@ -105,7 +105,7 @@
             cop0_watch_hi: snapshot.cop0_watch_hi,
             os_interrupt_mask: snapshot.os_interrupt_mask,
             thread_return_pc: snapshot.thread_return_pc,
-            indirect_transfers: Vec::new(),
+            indirect_transfers: std::collections::VecDeque::new(),
         }
     }
 

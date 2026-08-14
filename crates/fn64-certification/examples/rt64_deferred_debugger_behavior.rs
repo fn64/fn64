@@ -297,7 +297,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     backend.enable_deferred_workload_capture_for_evidence()?;
 
     let (mut rdram, end) = fixture();
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, B)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, B, true)?;
     if status != FrameStatus::Complete {
         return Err(
             io::Error::other(format!("deferred fixture raw workload returned {status:?}")).into(),
@@ -321,7 +321,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     backend.set_debugger_inspection_for_evidence(true, 0, -1, false)?;
     let paused_submission = backend
-        .process_rdp_commands(&mut rdram, COMMANDS as u32, end, B)
+        .process_rdp_commands(&mut rdram, COMMANDS as u32, end, B, true)
         .expect_err("paused RT64 debugger must not bypass raw RDP parsing");
     match paused_submission {
         fn64_render::RenderError::Backend { backend, reason }

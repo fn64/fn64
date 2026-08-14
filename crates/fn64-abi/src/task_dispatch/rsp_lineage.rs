@@ -450,14 +450,35 @@ pub(crate) unsafe fn task_microcode_data_identity(
 
     let memory = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
     let mut digest = Sha256::new();
-    for offset in 0..size {
-        let byte_addr = addr.checked_add(offset).unwrap_or_else(|| {
-            panic!(
-                "RSP task {:#010x} microcode-data logical address overflow at byte {offset:#x}",
-                task_addr.offset()
-            )
-        });
-        digest.update([unsafe { memory.read_u8(byte_addr) }]);
+    // Batches the SAME logical byte sequence the per-byte loop produced.
+    //
+    // The sequence is NOT a contiguous slice of host storage: `RdramPtr`
+    // reads logical byte `a` from storage index `a ^ 3` (the native-word lane
+    // mapping, `fn64_runtime::rdram`'s `range(.., lane_xor = 3)`). Chunking
+    // over raw storage would digest the bytes in lane order and silently
+    // change `TaskMicrocodeDataIdentity::sha256` -- which the release gate
+    // reads as `rsp_rdp.ordered[].observation.data_sha256`. So the staging
+    // buffer is filled through the same `read_u8` accessor, preserving the
+    // logical order exactly, and only the `Digest::update` calls are batched.
+    // `microcode_data_identity_batches_the_swizzled_logical_order` pins the
+    // result against a literal per-byte digest.
+    const CHUNK: usize = 4096;
+    let mut staged = [0u8; CHUNK];
+    let mut offset = 0u32;
+    while offset < size {
+        let span = CHUNK.min((size - offset) as usize);
+        for slot in 0..span {
+            let byte_addr = addr.checked_add(offset + slot as u32).unwrap_or_else(|| {
+                panic!(
+                    "RSP task {:#010x} microcode-data logical address overflow at byte {:#x}",
+                    task_addr.offset(),
+                    offset + slot as u32
+                )
+            });
+            staged[slot] = unsafe { memory.read_u8(byte_addr) };
+        }
+        digest.update(&staged[..span]);
+        offset += span as u32;
     }
     TaskMicrocodeDataIdentity {
         addr,
@@ -511,10 +532,36 @@ pub(crate) unsafe fn classify_task_microcode_family(
     fn64_render::identify_f3dzex2(&window).map(fn64_render::F3dzex2Variant::family)
 }
 
+/// Number of command words staged per `Digest::update` call.
+///
+/// Pure batching of the SAME byte sequence: SHA-256 is defined over the
+/// concatenation, so `update(a); update(b)` and `update(a ++ b)` produce an
+/// identical digest. The value in the release-gate evidence
+/// (`RspRdpObservationKind::{Dram,Xbus}DpcCommitted::command_sha256`,
+/// validated by `release_gate/publication.rs`) is therefore unchanged by
+/// construction, and `canonical_rdp_words_sha256_matches_per_word_updates`
+/// pins that against the literal per-word loop this replaced.
+///
+/// 1024 words is 4 KiB per update -- comfortably past the point where the
+/// per-call overhead of the digest's block buffer stops dominating, while
+/// keeping the scratch buffer inside a stack-friendly, cache-resident size.
+const RDP_WORD_DIGEST_CHUNK: usize = 1024;
+
+/// Digest the canonical big-endian image of an RDP command stream.
+///
+/// The words arrive as host-order `u32`, so the big-endian conversion is
+/// load-bearing: it, not the host's byte order, defines the digested
+/// sequence. Batching converts a chunk at a time instead of calling
+/// `Digest::update` once per 4-byte word.
 pub(crate) fn canonical_rdp_words_sha256(words: &[u32]) -> [u8; 32] {
     let mut digest = Sha256::new();
-    for word in words {
-        digest.update(word.to_be_bytes());
+    let mut staged = [0u8; RDP_WORD_DIGEST_CHUNK * 4];
+    for chunk in words.chunks(RDP_WORD_DIGEST_CHUNK) {
+        let staged = &mut staged[..chunk.len() * 4];
+        for (slot, word) in chunk.iter().enumerate() {
+            staged[slot * 4..slot * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        digest.update(&*staged);
     }
     digest.finalize().into()
 }

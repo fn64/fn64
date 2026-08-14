@@ -1462,10 +1462,22 @@ impl BlockProgram {
                 && run.exit == BlockExit::Checkpoint(entry)
                 && !turn_budget.can_fit(0, InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS)
             {
-                return Err(DispatchError::IndivisibleUnitExceedsBudget {
-                    at: entry,
-                    budget: turn_budget,
-                    required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
+                // The slice has budget left, but not enough for an indivisible
+                // unit: a branch and its delay slot are two instructions that
+                // must retire together, and the runner correctly refuses to
+                // start one it cannot finish.
+                //
+                // This is a SLICE boundary, not a program fault. Erroring here
+                // aborted WM2000 at pc=0x800040B8 with one instruction of a
+                // 4096 budget left. Checkpoint instead: the caller resumes at
+                // the same PC with a full budget and the pair retires whole.
+                //
+                // Only safe because `instructions == 0` -- the unit has not
+                // partially executed, so nothing is torn.
+                return Ok(DispatchRun {
+                    exit: BlockExit::Checkpoint(entry),
+                    instructions,
+                    blocks,
                 });
             }
             let continuing_without_progress = run.instructions == 0

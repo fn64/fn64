@@ -36,6 +36,37 @@ impl Framebuffer {
         resized
     }
 
+    /// A clone for VI scanout: copies the buffers the scanout filter chain
+    /// reads (`pixels`, `coverage`) and reinitializes the two depth buffers to
+    /// their empty-framebuffer values instead of copying them.
+    ///
+    /// `vi::scanout` and everything it calls never read `depth` or
+    /// `encoded_depth`, and no consumer of `presented_framebuffer()` reads
+    /// them either -- every one reads `pixels`. Depth is per-pixel `f32` plus a
+    /// per-pixel `Option<EncodedDepth>`, so at 320x240 the derived `Clone`
+    /// copies 975 KiB of which 600 KiB (62%) is depth state the presented
+    /// frame has no meaning for.
+    ///
+    /// The buffers are RESIZED, not left empty: `Framebuffer`'s invariant is
+    /// that all four are parallel to `width * height`, and a public accessor
+    /// hands this value out. A shorter vector would turn a depth read into a
+    /// panic rather than a wrong answer, but both are worse than paying for
+    /// the initialization, which `vec!`/`resize` does without a source read.
+    pub(crate) fn cloned_for_scanout(&self) -> Self {
+        let pixel_count = self.pixels.len() / 4;
+        Framebuffer {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+            coverage: self.coverage.clone(),
+            depth: vec![f32::INFINITY; pixel_count],
+            encoded_depth: vec![None; pixel_count],
+            primitive_depth: self.primitive_depth,
+            color_layout: self.color_layout,
+            noise: self.noise,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn noise_position(&self) -> (u64, u64) {
         (self.noise.seed, self.noise.fragment_index)
@@ -433,6 +464,25 @@ impl Framebuffer {
         let origin_y = rect.uly.floor();
         let ds = rect.dsdx as f32 / 1024.0;
         let dt = rect.dtdy as f32 / 1024.0;
+        // Loop-invariant sampler inputs. The derivatives come from the
+        // rectangle's constant dsdx/dtdy, and whether the combiner reads
+        // TEXEL1 is a property of the primitive's combiner mode -- but
+        // `uses_texel1` scans up to eight combiner sources, and it was being
+        // rescanned for every pixel.
+        let derivatives = if rect.flip {
+            TextureDerivatives {
+                dtdx: dt,
+                dsdy: ds,
+                ..TextureDerivatives::default()
+            }
+        } else {
+            TextureDerivatives {
+                dsdx: ds,
+                dtdy: dt,
+                ..TextureDerivatives::default()
+            }
+        };
+        let require_texel1 = rect.combiner.mode.uses_texel1(cycle_type);
         for y in min_y..=max_y {
             if !scissor.line_enabled(y) {
                 continue;
@@ -445,19 +495,6 @@ impl Framebuffer {
                 } else {
                     (rect.s + dx * ds, rect.t + dy * dt)
                 };
-                let derivatives = if rect.flip {
-                    TextureDerivatives {
-                        dtdx: dt,
-                        dsdy: ds,
-                        ..TextureDerivatives::default()
-                    }
-                } else {
-                    TextureDerivatives {
-                        dsdx: ds,
-                        dtdy: dt,
-                        ..TextureDerivatives::default()
-                    }
-                };
                 let (texel0, texel1, lod_fraction) = texture0.sample_rdp_pair(
                     rect.texture1.as_ref(),
                     TextureSampleRequest {
@@ -467,7 +504,7 @@ impl Framebuffer {
                         other_mode: rect.other_mode,
                         convert: rect.combiner.convert,
                         min_level: rect.combiner.min_lod_level,
-                        require_texel1: rect.combiner.mode.uses_texel1(cycle_type),
+                        require_texel1,
                     },
                 );
                 // Rectangle commands carry no shade attributes. Validation
@@ -784,13 +821,24 @@ impl Framebuffer {
         let max_y = (ceil_ratio(i64::from(yl_eighth - 1), 8) as i32)
             .min(ceil_ratio(i64::from(scissor_lry_eighth - 1), 8) as i32)
             .clamp(0, self.height as i32);
+        // Whether the combiner reads TEXEL1 is fixed by the primitive's
+        // combiner mode, but `uses_texel1` scans up to eight combiner sources
+        // and was being rescanned once per covered pixel.
+        let require_texel1 = triangle
+            .combiner
+            .mode
+            .uses_texel1(triangle.other_mode.cycle_type());
         for y in min_y..max_y {
             if !scissor.line_enabled(y) {
                 continue;
             }
             let mut min_left = i64::MAX;
             let mut max_right = i64::MIN;
-            for offset_y in [1, 3, 5, 7] {
+            // Every sample in `row_edges` shares its own `raw_pixel_coverage`
+            // recompute, so this is evaluated once here rather than in the
+            // per-pixel test below -- see `raw_pixel_coverage_with_row_edges`.
+            let mut row_edges = [(0i64, 0i64); 4];
+            for (row_index, offset_y) in [1, 3, 5, 7].into_iter().enumerate() {
                 let row_y_eighth = y * 8 + offset_y;
                 if row_y_eighth < yh_eighth
                     || row_y_eighth >= yl_eighth
@@ -800,6 +848,7 @@ impl Framebuffer {
                     continue;
                 }
                 let (left_x, right_x) = raw_span_edges_at_y_eighth(edge, row_y_eighth);
+                row_edges[row_index] = (left_x, right_x);
                 if right_x > left_x {
                     min_left = min_left.min(left_x);
                     max_right = max_right.max(right_x);
@@ -816,7 +865,8 @@ impl Framebuffer {
                 .clamp(0, self.width as i32);
 
             for x in min_x..max_x {
-                let coverage_mask = raw_pixel_coverage(edge, scissor, x, y);
+                let coverage_mask =
+                    raw_pixel_coverage_with_row_edges(scissor, x, y, yh_eighth, yl_eighth, row_edges);
                 let coverage = coverage_mask.coverage();
                 if coverage.count() == 0 {
                     continue;
@@ -924,10 +974,7 @@ impl Framebuffer {
                                     other_mode: triangle.other_mode,
                                     convert: triangle.combiner.convert,
                                     min_level: triangle.combiner.min_lod_level,
-                                    require_texel1: triangle
-                                        .combiner
-                                        .mode
-                                        .uses_texel1(triangle.other_mode.cycle_type()),
+                                    require_texel1,
                                 },
                             )
                     } else {
@@ -1119,6 +1166,14 @@ impl Framebuffer {
             return;
         }
 
+        // Primitive-constant sampler inputs, hoisted out of the pixel loop.
+        // `uses_texel1` scans up to eight combiner sources, and the diagnostic
+        // env lookup was a `getenv` per covered pixel.
+        let require_texel1 = tri.combiner.mode.uses_texel1(tri.other_mode.cycle_type());
+        #[cfg(not(test))]
+        let affine_texture = std::env::var_os("FN64_DIAG_AFFINE_TEXTURE").is_some();
+        #[cfg(test)]
+        let affine_texture = false;
         for y in min_y..max_y {
             for x in min_x..max_x {
                 let coverage_mask = triangle_pixel_coverage([a, b, c], area, scissor, x, y);
@@ -1148,10 +1203,6 @@ impl Framebuffer {
                 // correction translates the plane without changing its
                 // adjacent-pixel gradient.
                 let (texel0, texel1, lod_fraction) = if let Some(tex) = &tri.texture {
-                    #[cfg(not(test))]
-                    let affine_texture = std::env::var_os("FN64_DIAG_AFFINE_TEXTURE").is_some();
-                    #[cfg(test)]
-                    let affine_texture = false;
                     let coordinates_at = |px: f32, py: f32| {
                         let point = Vertex {
                             x: px,
@@ -1198,10 +1249,7 @@ impl Framebuffer {
                             other_mode: tri.other_mode,
                             convert: tri.combiner.convert,
                             min_level: tri.combiner.min_lod_level,
-                            require_texel1: tri
-                                .combiner
-                                .mode
-                                .uses_texel1(tri.other_mode.cycle_type()),
+                            require_texel1,
                         },
                     )
                 } else {
@@ -1300,6 +1348,12 @@ impl Framebuffer {
             )
         };
 
+        // Fixed by the primitive's combiner mode; `uses_texel1` scans up to
+        // eight combiner sources, so it does not belong in the pixel loop.
+        let require_texel1 = line
+            .combiner
+            .mode
+            .uses_texel1(line.other_mode.cycle_type());
         for y in min_y..max_y {
             for x in min_x..max_x {
                 let coverage_mask = line_pixel_coverage(line, scissor, x, y);
@@ -1340,10 +1394,7 @@ impl Framebuffer {
                             other_mode: line.other_mode,
                             convert: line.combiner.convert,
                             min_level: line.combiner.min_lod_level,
-                            require_texel1: line
-                                .combiner
-                                .mode
-                                .uses_texel1(line.other_mode.cycle_type()),
+                            require_texel1,
                         },
                     )
                 } else {

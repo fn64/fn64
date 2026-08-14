@@ -423,6 +423,63 @@ use super::*;
             .contains("invalid width or active window"));
     }
 
+    /// A half-programmed VI window is a normal boot state, not a malformed one.
+    ///
+    /// These are WM2000's REAL registers at its first VI retrace, captured from
+    /// the block lane: V_VIDEO written (v=[37,511], a valid even extent) and
+    /// H_VIDEO still zero. `ViActiveWindow::try_from_registers`
+    /// (crates/fn64-render/src/lib.rs) requires BOTH axes to be nonzero and
+    /// returns None here -- "nothing to scan out yet" -- so the Rust side skips
+    /// the frame. The C++ predicate used OR over all four fields, called this
+    /// active, and then rejected it for `h_end <= h_start`, aborting the
+    /// process on the first present of every run.
+    ///
+    /// This pins the two sides agreeing. The sibling test above still pins that
+    /// a FULLY programmed window with a bad extent is rejected, so this is a
+    /// narrowing of "active", not a weakening of validation.
+    #[test]
+    fn cpp_vi_ingress_accepts_a_vertical_only_window_as_not_yet_programmed() {
+        let task = RawTask::default();
+        let mut vi = RawVi {
+            registers: [0; 14],
+            registers_present: 1,
+            blanked: 0,
+            fade_enabled: 0,
+            repeat_line: 0,
+            fade_factor: 0,
+            aa_mode_specified: 1,
+            reserved: 0,
+            noise_seed: 0,
+        };
+        vi.registers[0] = 0x0000_311e;
+        vi.registers[2] = 320;
+        // H_VIDEO unwritten; V_VIDEO programmed to v=[37,511].
+        vi.registers[9] = 0x0000_0000;
+        vi.registers[10] = 0x0025_01ff;
+        let mut capture = RawAdapterCapture::default();
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: every pointer references a live fixed-size C-layout value;
+        // the adapter capture retains none of them.
+        let ok = unsafe {
+            fn64_rt64_capture_adapter_inputs(
+                &task,
+                0,
+                320,
+                240,
+                &vi,
+                &mut capture,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(
+            ok,
+            1,
+            "half-programmed VI window rejected: {}",
+            error_string(&error, "no diagnostic")
+        );
+    }
+
     fn present_capture_wire(format: u32) -> RawPresentCapture {
         RawPresentCapture {
             width: 3,

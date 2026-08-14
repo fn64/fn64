@@ -85,7 +85,18 @@ use super::*;
     }
 
     #[test]
-    fn rt64_raw_rdp_submission_owns_context_and_rdram_rollback() {
+    fn rt64_raw_rdp_submission_owns_context_and_invalidates_on_failure() {
+        // No RDRAM rollback here anymore (2026-08-10): the only path that
+        // would read the pre-image is the `Err` arm, which calls
+        // `invalidate_native_state()` and tears down `self.context` before
+        // returning -- no caller ever resumes against the RDRAM this
+        // submission touched after a failure, so restoring it was pure cost.
+        // Measured on the render-benchmark route (rt64 lane, 4,032-call
+        // sample): rollback's `copy_from_slice`/`extend_from_slice` over the
+        // full RDRAM image cost ~0.125ms/call against ~1.088ms/call for the
+        // RT64 FFI itself -- real, and now gone. What still must hold: the
+        // context is taken (owned) before the FFI call, and a failure still
+        // invalidates the native session rather than leaving it half-applied.
         let source = include_str!("lib.rs");
         let rt64_impl = source
             .find("impl RenderBackend for Rt64Backend")
@@ -101,9 +112,17 @@ use super::*;
         let process_rdp = &source[process_start..process_end];
 
         assert!(process_rdp.contains("NativeContextLease::take(&mut self.context)"));
-        assert!(process_rdp.contains("NativeRdramRollback::new("));
-        assert!(process_rdp.contains("&mut self.native_rdram_preimage"));
-        assert!(process_rdp.contains("transaction.commit()"));
+        assert!(
+            process_rdp.contains("self.invalidate_native_state()"),
+            "a failed raw RDP submission must invalidate the native session, \
+             not leave it in a half-applied state"
+        );
+        assert!(
+            !process_rdp.contains("NativeRdramRollback::new("),
+            "raw RDP submission must not construct an RDRAM rollback -- its \
+             only consumer (the failure path) tears down the whole native \
+             context, so restoring bytes for it is dead weight"
+        );
         assert!(
             !process_rdp.contains("self.context.as_mut()"),
             "raw RDP execution must take context ownership before FFI"
@@ -134,6 +153,7 @@ use super::*;
         backend.last_present = Some(CompletedRt64Present {
             guest_cycle: 91,
             authority: Rt64PresentAuthority::LiveRegisters,
+            active_output_height: std::num::NonZeroU32::new(237),
         });
         backend.active_settings = Some(RenderRuntimeSettings::default());
         backend.active_enhancement_settings = Some(RenderEnhancementSettings::default());
@@ -164,9 +184,10 @@ use super::*;
         let compatibility = CompletedRt64Present {
             guest_cycle: 17,
             authority: Rt64PresentAuthority::BackendOnlyCompatibility,
+            active_output_height: None,
         };
         assert!(matches!(
-            compatibility.release_guest_cycle(),
+            compatibility.release_geometry(),
             Err(RenderError::NotReady(
                 "RT64 release capture requires a completed live-register VI present"
             ))
@@ -174,8 +195,22 @@ use super::*;
         let live = CompletedRt64Present {
             guest_cycle: 19,
             authority: Rt64PresentAuthority::LiveRegisters,
+            active_output_height: std::num::NonZeroU32::new(237),
         };
-        assert_eq!(live.release_guest_cycle().unwrap(), 19);
+        assert_eq!(live.release_geometry().unwrap().0, 19);
+        assert_eq!(live.release_geometry().unwrap().1.get(), 237);
+
+        let inactive = CompletedRt64Present {
+            guest_cycle: 23,
+            authority: Rt64PresentAuthority::LiveRegisters,
+            active_output_height: None,
+        };
+        assert!(matches!(
+            inactive.release_geometry(),
+            Err(RenderError::NotReady(
+                "RT64 release capture requires a completed active VI output window"
+            ))
+        ));
     }
 
     #[cfg(feature = "rt64")]

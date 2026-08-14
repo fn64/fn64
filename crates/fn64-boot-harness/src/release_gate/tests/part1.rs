@@ -114,6 +114,7 @@ fn operational_thread_publication_digests_have_stable_golden_wire() {
                     byte_len: 4,
                     expected_sha256: [0x21; 32],
                     actual_sha256: [0x22; 32],
+                    first_diff_offset: None,
                 },
             },
             prepared_continuation: Some(
@@ -256,6 +257,7 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
             byte_len: 4,
             expected_sha256: [0x31; 32],
             actual_sha256: [0x32; 32],
+            first_diff_offset: None,
         },
     };
     checkpoint.prepared_continuation = Some(
@@ -557,6 +559,7 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
             byte_len: 4,
             expected_sha256: [0x31; 32],
             actual_sha256: [0x32; 32],
+            first_diff_offset: None,
         },
     };
     checkpoint.prepared_continuation = Some(CanonicalPreparedContinuationV1::ImageChanged {
@@ -713,6 +716,7 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
                     byte_len: 4,
                     expected_sha256: [0x31; 32],
                     actual_sha256: [0x32; 32],
+                    first_diff_offset: None,
                 },
             },
             prepared_continuation: None,

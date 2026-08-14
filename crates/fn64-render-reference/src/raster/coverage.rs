@@ -180,6 +180,7 @@ impl PartialAttributeSamplePolicy {
 pub(crate) struct CoverageMask(pub(super) u8);
 
 impl CoverageMask {
+    #[inline]
     pub(super) fn from_samples(mut covered: impl FnMut(i32, i32) -> bool) -> Self {
         let bits = COVERAGE_SAMPLES.iter().enumerate().fold(
             0u8,

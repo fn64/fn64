@@ -22,7 +22,7 @@ pub(crate) fn scanout(
     let filters = presentation.scanout.filters();
     let registers = presentation.scanout.registers();
     let active_window = registers.and_then(|registers| registers.active_window());
-    let mut output = source.clone();
+    let mut output = source.cloned_for_scanout();
     if filters.pixel_type == ViPixelType::Reserved {
         return Err(RenderError::Backend {
             backend: "reference",
@@ -297,20 +297,48 @@ fn filter_scanout(
             if !restoration_enabled {
                 continue;
             }
+            // Every interior pixel (all but the outermost ring) has exactly
+            // eight neighbors at fixed offsets -- the general form below
+            // recomputes that same 3x3 window's `saturating_sub`/`min` clamp
+            // and an `x == neighbor_x && y == neighbor_y` skip check for
+            // every pixel and every channel, when only border pixels need
+            // either. Measured live with `sample` on WM2000 (this filter is
+            // active for its RGBA16 output): restore_rgba16_component_
+            // bounded_v1 alone was ~3% of a 20s in-process capture during
+            // rasterization -- the third-largest single named cost -- and
+            // this loop is its caller.
+            let interior = x > 0 && x + 1 < width && y > 0 && y + 1 < height;
             for channel in 0..3 {
                 let center = original[pixel * 4 + channel] >> 3;
                 let mut neighbors = [0u8; 8];
-                let mut neighbor_count = 0;
-                for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
-                    for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
-                        if neighbor_x == x && neighbor_y == y {
-                            continue;
+                let neighbor_count = if interior {
+                    let row_above = pixel - width;
+                    let row_below = pixel + width;
+                    neighbors = [
+                        original[(row_above - 1) * 4 + channel] >> 3,
+                        original[row_above * 4 + channel] >> 3,
+                        original[(row_above + 1) * 4 + channel] >> 3,
+                        original[(pixel - 1) * 4 + channel] >> 3,
+                        original[(pixel + 1) * 4 + channel] >> 3,
+                        original[(row_below - 1) * 4 + channel] >> 3,
+                        original[row_below * 4 + channel] >> 3,
+                        original[(row_below + 1) * 4 + channel] >> 3,
+                    ];
+                    8
+                } else {
+                    let mut neighbor_count = 0;
+                    for neighbor_y in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                        for neighbor_x in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                            if neighbor_x == x && neighbor_y == y {
+                                continue;
+                            }
+                            neighbors[neighbor_count] =
+                                original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
+                            neighbor_count += 1;
                         }
-                        neighbors[neighbor_count] =
-                            original[(neighbor_y * width + neighbor_x) * 4 + channel] >> 3;
-                        neighbor_count += 1;
                     }
-                }
+                    neighbor_count
+                };
                 out[channel] =
                     restore_rgba16_component_bounded_v1(center, &neighbors[..neighbor_count]);
             }
@@ -577,6 +605,51 @@ mod tests {
     use fn64_render::{
         ViAaMode, ViFilterControl, ViScanoutField, ViScanoutRegisters, ViScanoutState,
     };
+
+    /// `scanout` clones its source with `cloned_for_scanout`, which skips the
+    /// two depth buffers because nothing in the filter chain reads them. That
+    /// is a PERFORMANCE shortcut resting on a CORRECTNESS premise, so pin the
+    /// premise: a scanout whose source carries arbitrary depth state must
+    /// produce the same pixels as one whose source does not. If a future
+    /// filter starts reading depth, this fails instead of silently scanning
+    /// out against `INFINITY`.
+    #[test]
+    fn scanout_pixels_do_not_depend_on_the_source_depth_buffers() {
+        let presentation = ViPresentation::default();
+        let plain = grayscale(&[0, 40, 80, 120, 160, 200, 240, 255], 4);
+
+        let mut with_depth = plain.clone();
+        for (index, slot) in with_depth.depth.iter_mut().enumerate() {
+            *slot = index as f32 * 0.25;
+        }
+        assert_ne!(
+            with_depth.depth, plain.depth,
+            "the fixture must actually differ in depth or it proves nothing"
+        );
+
+        let from_plain = scanout(&plain, presentation).expect("plain scanout");
+        let from_depth = scanout(&with_depth, presentation).expect("depth-laden scanout");
+        assert_eq!(
+            from_plain.pixels, from_depth.pixels,
+            "VI scanout must be a function of pixels and coverage, not depth"
+        );
+    }
+
+    /// The skipped buffers must still be PARALLEL to the pixel grid. A public
+    /// accessor hands the presented framebuffer out, and a short depth vector
+    /// would turn an indexed read into a panic.
+    #[test]
+    fn a_scanout_clone_keeps_every_buffer_parallel_to_the_pixel_grid() {
+        let source = grayscale(&[1, 2, 3, 4, 5, 6], 3);
+        let clone = source.cloned_for_scanout();
+        let pixels = (clone.width * clone.height) as usize;
+        assert_eq!(clone.pixels.len(), pixels * 4);
+        assert_eq!(clone.coverage.len(), pixels);
+        assert_eq!(clone.depth.len(), pixels, "depth must stay parallel");
+        assert_eq!(clone.encoded_depth.len(), pixels);
+        assert_eq!(clone.pixels, source.pixels);
+        assert_eq!(clone.color_layout(), source.color_layout());
+    }
 
     fn grayscale(values: &[u8], width: u32) -> Framebuffer {
         assert_eq!(values.len() % width as usize, 0);

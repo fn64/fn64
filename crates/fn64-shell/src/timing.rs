@@ -69,6 +69,23 @@ pub struct TimingStats {
     pub samples: usize,
     pub median_ms: f64,
     pub p95_ms: f64,
+    /// The tail percentile and the outright worst sample in the window.
+    ///
+    /// "Guaranteed 60fps" is a bound on the WORST frame, not on the average
+    /// one: a run whose median is 8 ms and whose max is 45 ms misses the bar
+    /// on every frame that took 45 ms, and neither the median nor p95 shows
+    /// it. `max_ms` is the only statistic here that can falsify the claim,
+    /// and `p99_ms` says whether a breach is a lone outlier or routine.
+    pub p99_ms: f64,
+    pub max_ms: f64,
+}
+
+impl TimingStats {
+    /// Whether every sample in this window fit inside one 60 Hz frame
+    /// (16.667 ms). Worst-case, per the acceptance bar -- not the mean.
+    pub fn holds_60fps(&self) -> bool {
+        self.max_ms <= 1000.0 / 60.0
+    }
 }
 
 #[derive(Default)]
@@ -101,6 +118,10 @@ impl TimingWindow {
             samples: milliseconds.len(),
             median_ms: nearest_rank(&milliseconds, 50),
             p95_ms: nearest_rank(&milliseconds, 95),
+            p99_ms: nearest_rank(&milliseconds, 99),
+            max_ms: *milliseconds
+                .last()
+                .expect("the empty window returned early above"),
         })
     }
 }
@@ -127,9 +148,44 @@ mod tests {
                 samples: 20,
                 median_ms: 10.0,
                 p95_ms: 19.0,
+                p99_ms: 20.0,
+                max_ms: 20.0,
             })
         );
         assert_eq!(window.take_stats(), None);
+    }
+
+    /// The worst-case bar cannot be read off the median or p95: this window is
+    /// comfortably fast by both and still misses 60fps on one frame in fifty.
+    #[test]
+    fn a_single_long_frame_fails_the_60fps_bound_while_median_and_p95_stay_fast()
+    {
+        let mut window = TimingWindow::default();
+        for _ in 0..49 {
+            window.record(Duration::from_millis(8));
+        }
+        window.record(Duration::from_millis(45));
+
+        let stats = window.take_stats().expect("50 samples recorded");
+        assert_eq!(stats.median_ms, 8.0);
+        assert_eq!(stats.p95_ms, 8.0, "p95 cannot see one frame in fifty");
+        assert_eq!(stats.max_ms, 45.0);
+        assert!(
+            !stats.holds_60fps(),
+            "a 45 ms frame misses the worst-case 60fps bar"
+        );
+    }
+
+    #[test]
+    fn a_window_entirely_inside_one_field_holds_the_bound() {
+        let mut window = TimingWindow::default();
+        for _ in 0..50 {
+            window.record(Duration::from_micros(16_000));
+        }
+
+        let stats = window.take_stats().expect("50 samples recorded");
+        assert_eq!(stats.max_ms, 16.0);
+        assert!(stats.holds_60fps(), "16.0 ms fits inside a 16.667 ms field");
     }
 
     #[test]
@@ -143,6 +199,11 @@ mod tests {
         assert_eq!(stats.samples, MAX_SAMPLES);
         assert_eq!(stats.median_ms, 300.0);
         assert_eq!(stats.p95_ms, 570.0);
+        assert_eq!(stats.p99_ms, 594.0);
+        assert_eq!(
+            stats.max_ms, 600.0,
+            "the oldest sample is evicted, so the window's max is the newest"
+        );
     }
 
     #[test]

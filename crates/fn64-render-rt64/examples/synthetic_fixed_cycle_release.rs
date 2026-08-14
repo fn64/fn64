@@ -559,9 +559,10 @@ impl RenderBackend for ObservedReferenceBackend {
         start: u32,
         end: u32,
         output_addr: u32,
+        wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
         self.inner
-            .process_rdp_commands(rdram, start, end, output_addr)
+            .process_rdp_commands(rdram, start, end, output_addr, wait_for_completion)
     }
 
     fn present(&mut self, request: fn64_render::PresentRequest<'_>) -> Result<(), RenderError> {

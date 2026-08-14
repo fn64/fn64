@@ -1452,10 +1452,25 @@ fn replacement_identity_from_raw(
 }
 
 // Split by concern: raw config wire structs, the Context impl, and the
-// test module live in child modules; children see this module's private
-// items, so the FFI surface and field visibilities are unchanged.
+// test module live in child modules.
+//
+// The re-exports below are load-bearing, and the original split omitted them:
+// a child sees this module's OWN items, but not names this module merely
+// `use`d privately, and two children cannot see each other at all. So
+// `config_wire`'s `unsafe extern "C"` block was invisible to `context.rs`
+// (37 unresolved `fn64_rt64_*` symbols) and `context.rs`'s `error_string` was
+// invisible to `config_wire.rs` (6 more), while `crate::ffi::Context` did not
+// resolve from lib.rs because `mod context;` alone publishes no name here.
+//
+// `pub(crate)` rather than a private `use`, precisely so the children and
+// lib.rs resolve these through `ffi`. This does not widen the crate's public
+// API: the crate root exports no `ffi`, so `pub(crate)` is the whole reach.
+//
+// None of this is reachable without the non-default `rt64` feature, which is
+// why `cargo build`/CI never typechecked it and the split landed green.
 mod config_wire;
-use config_wire::*;
+pub(crate) use config_wire::*;
 mod context;
+pub(crate) use context::*;
 #[cfg(test)]
 mod tests;

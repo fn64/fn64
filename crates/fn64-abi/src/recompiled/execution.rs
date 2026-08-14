@@ -147,6 +147,7 @@ fn set_catalog_program_parts(
     fn64_recomp_rs::set_unsupported_observer(Some(record_recompiled_unsupported));
     fn64_recomp_rs::set_host_lookup(None);
     let mutation_state = (!ranges.is_empty()).then(|| {
+        let had_bootstrap = bootstrap.is_some();
         let state = bootstrap.map_or_else(
             || CanonicalExecutableMutationStateV1::new(&ranges),
             |validated| {
@@ -156,6 +157,17 @@ fn set_catalog_program_parts(
                 )
             },
         );
+        // Which branch seeded the baseline, and what it holds for the byte
+        // that has blocked every deep run. `new()` leaves `expected` empty and
+        // relies on a later `seal_with` over live memory; `from_bootstrap`
+        // seals zeros and commits the published bytes over them. Only one of
+        // those can leave a zero baseline for published ROM.
+        if std::env::var_os("FN64_BASELINE_PROBE").is_some() {
+            let byte = state.expected_byte_at(0x0009_b0b3);
+            eprintln!(
+                "[baseline] from_bootstrap={had_bootstrap} expected[0x0009b0b3]={byte:?}"
+            );
+        }
         Rc::new(RefCell::new(state))
     });
     let generations = generations.map(|generations| Rc::new(RefCell::new(generations)));
@@ -433,7 +445,24 @@ fn register_live_executable_region_config(
 /// Apply DMA-originated executable writes after the device fabric has
 /// committed all bytes, but before it publishes completion messages or any
 /// guest coroutine can resume.
+///
+/// Wrapped for `FN64_EXECUTOR_SPLIT` on the same reasoning as
+/// `checkpoint_catalog_host_transaction_before_suspend` above.
 pub(crate) fn process_live_executable_writes_from_host() {
+    match crate::task_dispatch::executor_split_enabled().then(std::time::Instant::now) {
+        Some(at) => {
+            process_live_executable_writes_from_host_inner();
+            crate::task_dispatch::note_executor_split(
+                &crate::task_dispatch::EXEC_GUARD_DEVICE_NS,
+                Some(&crate::task_dispatch::EXEC_GUARD_DEVICE_CALLS),
+                at.elapsed().as_nanos() as u64,
+            );
+        }
+        None => process_live_executable_writes_from_host_inner(),
+    }
+}
+
+fn process_live_executable_writes_from_host_inner() {
     let (catalog, live) = with_host(|host| {
         (
             host.canonical_recompiled_program.clone(),
@@ -454,7 +483,29 @@ pub(crate) fn process_live_executable_writes_from_host() {
         // SAFETY: device/host publication runs only while guest execution is
         // suspended; the registered process allocation remains live.
         let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-        catalog.invalidate_pending_physical_writes_with(|physical| unsafe {
+        // Hand the view in as well as the byte reader.
+        //
+        // `invalidate_pending_physical_writes_inner` has two ways to learn
+        // what changed. With a view it runs `changed_ranges_from_view` -- one
+        // `memcmp` per watched range, then a copy of only the bytes that
+        // differ. Without one it falls back to `read_snapshot`, which
+        // materializes the whole watched region through a per-byte closure:
+        // on WM2000 that is the 1 MiB boot bank rebuilt byte by byte at every
+        // device-time advance. Profiling put this call at 6.2% of self time
+        // and its sibling at `commit_with` at 9.3%, essentially all of it
+        // inside that per-byte `collect`.
+        //
+        // The `assert!` above already proves the allocation covers every
+        // watched byte, which is the same fact `RdramPtr` reads on faith, so
+        // the slice carries no obligation the pointer did not already carry.
+        //
+        // SAFETY: as for `storage` above -- guest execution is suspended for
+        // the duration of this call and the process allocation outlives it.
+        // `rdram_len` is the registered length of that one allocation.
+        let view = fn64_runtime::RdramView::from_storage(unsafe {
+            std::slice::from_raw_parts(rdram as *const u8, rdram_len)
+        });
+        catalog.invalidate_pending_physical_writes_from_view(&view, |physical| unsafe {
             storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
         });
         fn64_recomp_rs::discard_executable_write_boundary();
@@ -487,7 +538,25 @@ pub(crate) fn process_live_executable_writes_from_host() {
 /// `HostAbi write -> coroutine suspend -> device/other-thread same-byte write
 /// -> HostAbi resume`: the parent prefix advances the canonical baseline before
 /// any child or different guest coroutine can run.
+///
+/// Wrapped for `FN64_EXECUTOR_SPLIT` rather than timed at its two call sites
+/// in `suspend_active_coroutine`: a wrapper cannot drift out of sync with the
+/// call sites, and a third caller added later is timed automatically.
 pub(crate) fn checkpoint_catalog_host_transaction_before_suspend() {
+    match crate::task_dispatch::executor_split_enabled().then(std::time::Instant::now) {
+        Some(at) => {
+            checkpoint_catalog_host_transaction_before_suspend_inner();
+            crate::task_dispatch::note_executor_split(
+                &crate::task_dispatch::EXEC_GUARD_SUSPEND_NS,
+                Some(&crate::task_dispatch::EXEC_GUARD_SUSPEND_CALLS),
+                at.elapsed().as_nanos() as u64,
+            );
+        }
+        None => checkpoint_catalog_host_transaction_before_suspend_inner(),
+    }
+}
+
+fn checkpoint_catalog_host_transaction_before_suspend_inner() {
     let Some(thread) = crate::ACTIVE_THREAD_ID.with(Cell::get) else {
         return;
     };
@@ -517,9 +586,22 @@ pub(crate) fn checkpoint_catalog_host_transaction_before_suspend() {
     // suspension. The process allocation is stable, and reads finish before
     // the yielder can transfer control to another coroutine.
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    live.flush_active_host_abi_transaction_with(thread, |physical| unsafe {
-        storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
+    // Suspension is a dispatch boundary, so the flush reconciles the whole
+    // watched region -- 1 MiB on WM2000 -- every time a coroutine yields.
+    // Hand over the view so that scan is one `memcmp` per range rather than a
+    // per-byte rebuild of the region.
+    //
+    // SAFETY: `rdram`/`rdram_len` describe the same stable process allocation
+    // asserted non-null and covering the watched end above, and the slice
+    // borrow ends inside this call.
+    let view = fn64_runtime::RdramView::from_storage(unsafe {
+        std::slice::from_raw_parts(rdram as *const u8, rdram_len)
     });
+    live.flush_active_host_abi_transaction_from_view(
+        thread,
+        |physical| unsafe { storage.read_u8(fn64_runtime::RdramAddr::from_offset(physical)) },
+        Some(&view),
+    );
 }
 
 /// Move-only ownership of one synchronous child writer publication.
@@ -537,6 +619,35 @@ pub(crate) struct CatalogNestedWriterTransactionV1 {
 }
 
 impl CatalogNestedWriterTransactionV1 {
+    /// A transaction for the public attributed host-memory API
+    /// (`super::host_memory`), which writes on behalf of code outside the
+    /// guest rather than on behalf of a running thread.
+    pub(super) fn for_host_memory_api(
+        live: CanonicalLiveBlockProgramV1,
+        transaction_id: u64,
+    ) -> Self {
+        Self {
+            live: Some(live),
+            transaction_id: Some(transaction_id),
+            thread: None,
+            operation: "host memory api",
+            committed: false,
+        }
+    }
+
+    /// A transaction with nothing to journal, for a live program that has no
+    /// canonical mutation state. `commit_with` is then a no-op, so callers do
+    /// not need a second code path.
+    pub(super) fn inert() -> Self {
+        Self {
+            live: None,
+            transaction_id: None,
+            thread: None,
+            operation: "host memory api (no mutation state)",
+            committed: false,
+        }
+    }
+
     pub(super) fn is_canonical(&self) -> bool {
         self.transaction_id.is_some()
     }
@@ -552,7 +663,24 @@ impl CatalogNestedWriterTransactionV1 {
         }
     }
 
-    fn commit_with(mut self, mut read_physical_byte: impl FnMut(u32) -> u8) {
+    pub(super) fn commit_with(self, read_physical_byte: impl FnMut(u32) -> u8) {
+        self.commit_with_optional_view(read_physical_byte, None);
+    }
+
+    /// [`Self::commit_with`], but also handing over the RDRAM view.
+    ///
+    /// The byte reader is still required -- `seal_with` genuinely needs one --
+    /// but when a view is available the changed-byte scan runs word-wise
+    /// (`changed_ranges_from_view`: one `memcmp` per watched range, then a
+    /// copy of only the differing bytes) instead of rebuilding the entire
+    /// watched region through the per-byte closure. On WM2000 the watched
+    /// region is the 1 MiB boot bank, and profiling attributed 9.3% of self
+    /// time to this commit path, nearly all of it in that per-byte `collect`.
+    pub(super) fn commit_with_optional_view(
+        mut self,
+        mut read_physical_byte: impl FnMut(u32) -> u8,
+        view: Option<&fn64_runtime::RdramView<'_>>,
+    ) {
         self.assert_thread_owner();
         if let Some(live) = &self.live {
             if let Some(transaction_id) = self.transaction_id {
@@ -562,7 +690,17 @@ impl CatalogNestedWriterTransactionV1 {
                     .borrow()
                     .assert_active_child_transaction(transaction_id);
             }
-            live.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+            match view {
+                Some(view) => {
+                    live.invalidate_pending_physical_writes_from_view(
+                        view,
+                        &mut read_physical_byte,
+                    );
+                }
+                None => {
+                    live.invalidate_pending_physical_writes_with(&mut read_physical_byte);
+                }
+            }
             fn64_recomp_rs::discard_executable_write_boundary();
             if let Some(transaction_id) = self.transaction_id {
                 live.mutation_state
@@ -577,7 +715,10 @@ impl CatalogNestedWriterTransactionV1 {
 
     pub(crate) fn commit(self, rdram: &[u8]) {
         let view = fn64_runtime::RdramView::from_storage(rdram);
-        self.commit_with(|physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)));
+        self.commit_with_optional_view(
+            |physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)),
+            Some(&view),
+        );
     }
 
     pub(super) fn commit_changed_bytes(self, rdram: &[u8], notify: impl Fn(u32, u32)) {
@@ -591,10 +732,28 @@ impl CatalogNestedWriterTransactionV1 {
             .as_ref()
             .expect("canonical child writer transaction has no mutation state");
         let view = fn64_runtime::RdramView::from_storage(rdram);
-        let snapshot = state
-            .borrow()
-            .read_snapshot_from_view(&view);
-        let changed = state.borrow().current_changed_ranges(&snapshot);
+        // The dispatch reconcile short-circuits an unchanged region with one
+        // `memcmp` per range; this path was the remaining asymmetry, copying
+        // and word-reversing the whole watched region to build a snapshot
+        // whose only use is `current_changed_ranges`. When nothing changed
+        // that list is empty and the `notify` loop below has no iterations,
+        // so skipping the snapshot cannot change what is notified.
+        // `changed_ranges_from_view` subsumes the `matches_view` short-circuit
+        // it replaces: it settles "nothing changed" with the same `memcmp` per
+        // range and returns an empty list, so the `notify` loop below has no
+        // iterations -- and when something DID change it names the bytes
+        // without the snapshot the old form had to build to find them.
+        //
+        // `None` means an unmapped watched byte; the copying path below then
+        // raises the panic that owes, exactly as before.
+        let changed = state.borrow().changed_ranges_from_view(&view);
+        let changed = match changed {
+            Some(changed) => changed,
+            None => {
+                let snapshot = state.borrow().read_snapshot_from_view(&view);
+                state.borrow().current_changed_ranges(&snapshot)
+            }
+        };
         for (physical_start, physical_end) in changed {
             notify(physical_start, physical_end - physical_start);
         }
@@ -635,7 +794,18 @@ pub(crate) fn commit_scheduler_running_thread_mirror(
     // allocation is stable, and all raw reads/writes finish before the selected
     // coroutine receives RunToken.
     let storage = unsafe { fn64_runtime::RdramPtr::from_storage_ptr(rdram) };
-    live.reconcile_before_dispatch_with(|physical| unsafe {
+    // Scheduler selection is a dispatch boundary, so this reconciles the whole
+    // watched region -- 1 MiB on WM2000 -- every time a thread is picked.
+    // Through the byte closure that is a bounds check and a lane XOR per byte;
+    // the view path copies word-wise. Same bytes, same digests.
+    //
+    // SAFETY: `rdram`/`rdram_len` describe the same stable process allocation
+    // asserted non-null and in-range above, and the slice borrow ends inside
+    // this call.
+    let view = unsafe {
+        fn64_runtime::RdramView::from_storage(std::slice::from_raw_parts(rdram, rdram_len))
+    };
+    live.reconcile_before_dispatch_from_view(&view, |physical| unsafe {
         storage.read_u8(RdramAddr::from_offset(physical))
     });
     if unsafe { storage.read_u32(origin.global) } == origin.handle {
@@ -652,8 +822,29 @@ pub(crate) fn commit_scheduler_running_thread_mirror(
     };
     unsafe { storage.write_u32(origin.global, origin.handle) };
     fn64_recomp_rs::notify_host_abi_write(physical_start, 4);
-    transaction
-        .commit_with(|physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) });
+    // Hand the view down. `commit_with` is `commit_with_optional_view(.., None)`,
+    // and that `None` skipped the word-wise fast path at
+    // `live_program.rs:2760` -- which requires `Some(view)` -- dropping the
+    // commit onto `read_snapshot`, a byte-at-a-time rebuild of the WHOLE 1 MiB
+    // watched region (bounds check plus a `^3` lane XOR per byte) on every
+    // scheduler pick that changes the running thread.
+    //
+    // Measured before the change: the mirror boundary was 8.99 ms per render
+    // field at 32.25 us/call, of which a 20 s sample put 75.4% in that inlined
+    // byte loop and 22.9% in the `commit_snapshot` it feeds -- against 1.3% in
+    // mprotect syscalls. The barrier itself was never the cost: it served
+    // 100.00% of 5,538,929 boundaries with one fall-back, and `arm`/`disarm`
+    // issued one syscall EACH for the entire run.
+    //
+    // The view is the same one built at the top of this function and already
+    // used for the reconcile two statements up, over the same region, with the
+    // same lifetime -- so this adds no borrow, no unsafe, and no new read.
+    // `commit_with_optional_view`'s own doc comment describes precisely this
+    // cost; this call site was simply left behind when the others were fixed.
+    transaction.commit_with_optional_view(
+        |physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) },
+        Some(&view),
+    );
     true
 }
 
@@ -687,10 +878,32 @@ pub(crate) fn begin_catalog_nested_writer(
             state.borrow().assert_not_poisoned();
         }
         if let Some(thread) = thread {
+            // Hand the view over as well as the byte reader, exactly as
+            // `checkpoint_catalog_host_transaction_before_suspend` does.
+            //
+            // This was the last caller of the view-less
+            // `flush_active_host_abi_transaction_with`. Without a view,
+            // `flush_host_abi_transaction_inner` cannot take the
+            // `changed_ranges_from_view` arm and falls to
+            // `read_snapshot(&mut read_physical_byte)` -- the whole watched
+            // region rebuilt through a per-byte closure -- and then hands
+            // `None` down again, so `invalidate_pending_physical_writes_inner`
+            // repeats it. On WM2000 that region is the 1 MiB boot bank and
+            // this runs on every nested-writer entry (RSP LLE dispatch, HLE
+            // rspboot, verified-audio publication, tracked renderer/RSP
+            // publication), so the seam paid two per-byte rebuilds per entry.
+            //
+            // The byte reader stays: `changed_ranges_from_view` returns `None`
+            // for an unsealed state or a watched byte outside storage, and the
+            // copying fallback must remain reachable so the panic an unmapped
+            // byte owes is raised by the code that owes it. Passing `Some`
+            // only opts into the ATTEMPT; it removes no fallback.
             let view = fn64_runtime::RdramView::from_storage(rdram);
-            live.flush_active_host_abi_transaction_with(thread, |physical| {
-                view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
-            });
+            live.flush_active_host_abi_transaction_from_view(
+                thread,
+                |physical| view.read_u8(fn64_runtime::RdramAddr::from_offset(physical)),
+                Some(&view),
+            );
         }
     }
     let transaction_id = live.as_ref().and_then(|live| {
@@ -835,6 +1048,70 @@ pub(super) fn record_recompiled_unsupported(context: &str) {
 pub(crate) fn recompiled_gap_panic(context: impl Into<String>) -> ! {
     let context = context.into();
     record_recompiled_unsupported(&context);
+    // These panics fire inside non-unwinding generated code, so the process
+    // ABORTS -- any diagnostic printed at normal exit never runs. WM2000's
+    // AotMiss is exactly that case: the question is which PI DMA delivered
+    // the executable image, and by the time the harness could report it the
+    // process is gone. Dump here, where the evidence still exists.
+    if std::env::var_os("FN64_DEVICE_ADVANCE_CENSUS").is_some() {
+        crate::pi::DEVICE_ADVANCE_CENSUS.with(|c| {
+            let c = c.borrow();
+            let total: u64 = c.iter().sum();
+            eprintln!(
+                "[device-census] total={total} lag+due={} lag+nothing={} current+due={} current+nothing={}",
+                c[0], c[1], c[2], c[3],
+            );
+        });
+    }
+    if std::env::var_os("FN64_BLOCK_PI_DMA_DUMP").is_some() {
+        eprintln!("[pi-dma] transfers preceding: {context}");
+        for event in crate::copy_device_trace() {
+            let (tag, request) = match event.kind {
+                fn64_runtime::DeviceTraceKind::PiDmaStarted(request) => ("started", request),
+                fn64_runtime::DeviceTraceKind::PiBytesCommitted(request) => ("committed", request),
+                _ => continue,
+            };
+            eprintln!(
+                "[pi-dma] {tag} dram={:#010x} len={:#x} dir={:?}",
+                request.dram_addr.offset(),
+                request.len,
+                request.direction,
+            );
+        }
+        // The DMA proved the overlay arrives complete and correct, so whatever
+        // changed it did so afterwards. The journal watches that region and
+        // attributes every writer, which is the one thing that names it.
+        let live = crate::with_host(|host| host.canonical_recompiled_program.clone());
+        if let Some(journal) = live.and_then(|live| live.mutation_evidence_snapshot()) {
+            eprintln!(
+                "[journal] entries={} watched={:?} pending_attributed={}",
+                journal.entries.len(),
+                journal
+                    .watched_ranges
+                    .iter()
+                    .map(|range| (range.physical_start, range.physical_end))
+                    .collect::<Vec<_>>(),
+                journal.pending_attributed_writes,
+            );
+            for entry in &journal.entries {
+                for declaration in &entry.declared_writes {
+                    eprintln!(
+                        "[journal] seq={} channel={:?} [{:#010x},{:#010x})",
+                        entry.sequence,
+                        declaration.channel,
+                        declaration.physical_start,
+                        declaration.physical_end,
+                    );
+                }
+                for changed in &entry.changed_ranges {
+                    eprintln!(
+                        "[journal] seq={} CHANGED [{:#010x},{:#010x})",
+                        entry.sequence, changed.physical_start, changed.physical_end,
+                    );
+                }
+            }
+        }
+    }
     panic!("{context}")
 }
 

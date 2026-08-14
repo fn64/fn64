@@ -344,7 +344,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let s2dex_bytes = target_bytes(&rdram, S2DEX_TARGET);
 
     let raw_end = write_raw_control(&mut rdram);
-    if backend.process_rdp_commands(&mut rdram, RAW_DL as u32, raw_end, RAW_TARGET)?
+    if backend.process_rdp_commands(&mut rdram, RAW_DL as u32, raw_end, RAW_TARGET, true)?
         != FrameStatus::Complete
     {
         return Err(io::Error::other("independent raw-RDP control did not complete").into());

@@ -1,0 +1,57 @@
+// Single source of truth for the WM2000 dense-AOT shard inventory.
+//
+// This file is `include!`d verbatim by every consumer that must agree on the
+// shard catalog, so the list cannot drift between them again:
+//
+//   examples/wm2000-block-shards/build.rs        (legacy shard generator)
+//   examples/wm2000-block-shards/materializer.rs (prepared-tree consumer)
+//   examples/wm2000-block-boot/build.rs          (WM root pack build)
+//   crates/fn64-boot-harness/src/generated_runner_build/mod.rs (verifier)
+//
+// Each entry pairs the Cargo package name with the directory under
+// `examples/wm2000-block-shards/` that holds its leaf manifest. The two are
+// not mechanically derivable from one another: the resident-tail packages
+// live in the historically numbered `shard15`/`shard16` directories.
+//
+// Entries are sorted by package name. `materialize_package` binary-searches
+// this order, and the verifier zips the directory column against the package
+// column, so both the sort and the pairing are load-bearing.
+//
+// The inventory is 32, not 35. Commit 6ae673e ("bound overlay generations to
+// their text extent") shrank the text-bounded overlays from [3,1,6,8] shards
+// to [2,1,5,7], retiring overlay-0-shard-02, overlay-2-shard-05 and
+// overlay-3-shard-07.
+[
+    ("wm2000-block-overlay-0-shard-00", "overlay0-shard00"),
+    ("wm2000-block-overlay-0-shard-01", "overlay0-shard01"),
+    ("wm2000-block-overlay-1-shard-00", "overlay1-shard00"),
+    ("wm2000-block-overlay-2-shard-00", "overlay2-shard00"),
+    ("wm2000-block-overlay-2-shard-01", "overlay2-shard01"),
+    ("wm2000-block-overlay-2-shard-02", "overlay2-shard02"),
+    ("wm2000-block-overlay-2-shard-03", "overlay2-shard03"),
+    ("wm2000-block-overlay-2-shard-04", "overlay2-shard04"),
+    ("wm2000-block-overlay-3-shard-00", "overlay3-shard00"),
+    ("wm2000-block-overlay-3-shard-01", "overlay3-shard01"),
+    ("wm2000-block-overlay-3-shard-02", "overlay3-shard02"),
+    ("wm2000-block-overlay-3-shard-03", "overlay3-shard03"),
+    ("wm2000-block-overlay-3-shard-04", "overlay3-shard04"),
+    ("wm2000-block-overlay-3-shard-05", "overlay3-shard05"),
+    ("wm2000-block-overlay-3-shard-06", "overlay3-shard06"),
+    ("wm2000-block-resident-tail-shard-00", "shard15"),
+    ("wm2000-block-resident-tail-shard-01", "shard16"),
+    ("wm2000-block-shard-00", "shard00"),
+    ("wm2000-block-shard-01", "shard01"),
+    ("wm2000-block-shard-02", "shard02"),
+    ("wm2000-block-shard-03", "shard03"),
+    ("wm2000-block-shard-04", "shard04"),
+    ("wm2000-block-shard-05", "shard05"),
+    ("wm2000-block-shard-06", "shard06"),
+    ("wm2000-block-shard-07", "shard07"),
+    ("wm2000-block-shard-08", "shard08"),
+    ("wm2000-block-shard-09", "shard09"),
+    ("wm2000-block-shard-10", "shard10"),
+    ("wm2000-block-shard-11", "shard11"),
+    ("wm2000-block-shard-12", "shard12"),
+    ("wm2000-block-shard-13", "shard13"),
+    ("wm2000-block-shard-14", "shard14"),
+]

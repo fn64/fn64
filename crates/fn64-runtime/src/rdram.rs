@@ -342,6 +342,26 @@ impl<'a> RdramView<'a> {
         self.read_u8(addr) as i8
     }
 
+    /// Borrow a word-aligned span of raw native-word storage, if fully mapped.
+    ///
+    /// Storage order, NOT logical order -- the caller is responsible for the
+    /// `^3` lane mapping. Exposed for the one caller that legitimately wants
+    /// the un-swizzled bytes: the mutation guard's baseline comparison, which
+    /// holds its baseline pre-reversed and so can decide "unchanged" with a
+    /// single `memcmp` instead of copying and reversing 1 MiB per dispatch.
+    ///
+    /// Deliberately narrow: it hands out a shared slice and cannot write, so
+    /// it does not reopen the lane mapping to reimplementation the way a
+    /// mutable or address-taking accessor would. Callers converting storage
+    /// bytes to guest values must still go through the typed readers.
+    pub fn storage_slice(self, start: usize, len: usize) -> Option<&'a [u8]> {
+        assert!(
+            start % 4 == 0 && len % 4 == 0,
+            "storage_slice requires word-aligned bounds, got {start:#x}+{len:#x}"
+        );
+        self.storage.get(start..start.checked_add(len)?)
+    }
+
     /// Copy a device/struct byte sequence out in logical guest order.
     /// Copy a logical byte range out, one native word at a time.
     ///
@@ -402,7 +422,7 @@ impl<'a> RdramView<'a> {
         let head = head.min(len);
         let body = (len - head) & !3;
 
-        let mut copy_byte = |index: u32, byte: &mut u8| {
+        let copy_byte = |index: u32, byte: &mut u8| {
             *byte = self.read_u8(
                 addr.checked_add(index)
                     .expect("logical RDRAM copy address overflow"),
@@ -411,18 +431,27 @@ impl<'a> RdramView<'a> {
         for (index, byte) in out.iter_mut().enumerate().take(head as usize) {
             copy_byte(index as u32, byte);
         }
-        for word in 0..(body / 4) {
-            let logical = start + head + word * 4;
-            let native = self
-                .read_u32(RdramAddr::from_offset(logical))
-                .to_ne_bytes();
-            let at = (head + word * 4) as usize;
-            // `read_u32` reads the native word with lane XOR 0; `read_u8`
-            // would read the same four bytes in reverse order.
-            out[at] = native[3];
-            out[at + 1] = native[2];
-            out[at + 2] = native[1];
-            out[at + 3] = native[0];
+        // Bulk-copy the word-aligned body, then reverse each word in place.
+        //
+        // The previous form called `read_u32` per word and stored four bytes
+        // individually -- 262,144 iterations for a 1 MiB watched region, on a
+        // path that runs at every dispatch boundary. It profiled as the single
+        // largest self-time cost in the certified lane (1,849 samples, ahead
+        // of even the SHA-256).
+        //
+        // `read_u32` on an in-range aligned offset is a plain native-word
+        // load, so the whole body is one contiguous slice; copying it and then
+        // swapping each word gives byte-for-byte identical output, because
+        // `native[3], native[2], native[1], native[0]` IS a 4-byte reverse.
+        if body > 0 {
+            let body_start = (start + head) as usize;
+            let at = head as usize;
+            let bytes = body as usize;
+            out[at..at + bytes]
+                .copy_from_slice(&self.storage[body_start..body_start + bytes]);
+            for word in out[at..at + bytes].chunks_exact_mut(4) {
+                word.reverse();
+            }
         }
         for index in (head + body)..len {
             let byte = &mut out[index as usize];
@@ -443,6 +472,41 @@ pub struct RdramViewMut<'a> {
 /// centralized and cannot be reimplemented differently by each shim.
 #[derive(Clone, Copy)]
 pub struct RdramPtr(std::ptr::NonNull<u8>);
+
+/// Report every raw RDRAM write touching a watched physical address.
+///
+/// The attributed observers (`fn64_recomp_rs::set_write_observer`) only fire on
+/// declared writes, so they cannot see a writer that fails to declare -- which
+/// is exactly what WM2000's `0x0009b0b3` failure requires. This sits on the raw
+/// store path instead, below attribution, so nothing can bypass it.
+///
+/// Set `FN64_WATCH_WRITE=0x9b0b3` (hex, with or without `0x`) to arm it.
+fn watch_raw_write(addr: RdramAddr, len: u32, kind: &str) {
+    use std::sync::OnceLock;
+    static WATCH: OnceLock<Option<u32>> = OnceLock::new();
+    let watch = *WATCH.get_or_init(|| {
+        std::env::var("FN64_WATCH_WRITE").ok().and_then(|value| {
+            let value = value.trim().trim_start_matches("0x");
+            u32::from_str_radix(value, 16).ok()
+        })
+    });
+    let Some(watch) = watch else { return };
+    let start = addr.offset();
+    if start <= watch && watch < start.saturating_add(len) {
+        eprintln!("[watch-write] {kind} [{start:#010x},+{len:#x}) covers {watch:#010x}");
+        // Name the caller. Which shim issues this store is the whole question,
+        // and a backtrace is the only thing that answers it directly.
+        if std::env::var_os("FN64_WATCH_WRITE_BACKTRACE").is_some() {
+            // One capture per line, tagged, so two separate stacks cannot be
+            // read as one call chain -- which is exactly the mistake that
+            // produced a wrong attribution for this byte.
+            let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+            for line in backtrace.lines() {
+                eprintln!("[watch-bt {kind}@{start:#010x}] {line}");
+            }
+        }
+    }
+}
 
 impl RdramPtr {
     /// # Safety
@@ -483,6 +547,11 @@ impl RdramPtr {
     /// # Safety
     /// The allocation must cover `addr.offset() ^ 3`.
     pub unsafe fn write_u8(self, addr: RdramAddr, value: u8) {
+        // RdramPtr is the RAW path: no bounds check, no attribution, and it is
+        // NOT RdramViewMut. Instrumenting only the view missed this writer
+        // entirely -- the byte write to 0x0009b0b3 produced no backtrace at
+        // all, which is what revealed the two types are distinct here.
+        watch_raw_write(addr, 1, "ptr_write_u8");
         unsafe { *self.0.as_ptr().add((addr.offset() ^ 3) as usize) = value };
     }
 
@@ -531,6 +600,7 @@ impl<'a> RdramViewMut<'a> {
     }
 
     pub fn write_u32(&mut self, addr: RdramAddr, value: u32) {
+        watch_raw_write(addr, 4, "write_u32");
         assert!(
             addr.offset().is_multiple_of(4),
             "RDRAM u32 write at unaligned logical address {:#x}",
@@ -551,12 +621,14 @@ impl<'a> RdramViewMut<'a> {
     }
 
     pub fn write_u8(&mut self, addr: RdramAddr, value: u8) {
+        watch_raw_write(addr, 1, "write_u8");
         let index = self.as_view().range(addr, 1, 3, "write_u8").start;
         self.storage[index] = value;
     }
 
     /// Copy flat device/host bytes into storage in logical guest order.
     pub fn write_logical_bytes(&mut self, addr: RdramAddr, data: &[u8]) {
+        watch_raw_write(addr, data.len() as u32, "write_logical_bytes");
         for (index, &byte) in data.iter().enumerate() {
             let offset = u32::try_from(index).expect("logical RDRAM copy length exceeds u32");
             self.write_u8(
@@ -763,6 +835,41 @@ mod tests {
     use super::*;
 
     static_assertions::assert_not_impl_any!(PhysicalRdramRead<'static>: Clone, Send, Sync);
+
+    /// `storage_slice` must expose exactly the bytes `copy_logical_bytes`
+    /// reads, in storage order -- the property the mutation guard's baseline
+    /// comparison relies on to skip building a snapshot. If the two ever
+    /// disagreed, the guard would silently accept a changed region.
+    #[test]
+    fn storage_slice_is_the_word_reverse_of_the_logical_copy() {
+        let mut storage = vec![0u8; 256];
+        for (index, byte) in storage.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let view = RdramView::from_storage(&storage);
+        for &(start, len) in &[(0usize, 64usize), (16, 32), (64, 4), (0, 256)] {
+            let mut logical = vec![0u8; len];
+            view.copy_logical_bytes(RdramAddr::from_offset(start as u32), &mut logical);
+            let raw = view.storage_slice(start, len).expect("span is mapped");
+            let mut reversed = logical.clone();
+            for word in reversed.chunks_exact_mut(4) {
+                word.reverse();
+            }
+            assert_eq!(
+                reversed, raw,
+                "storage_slice must equal the word-reversed logical copy at {start:#x}+{len:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_slice_reports_an_unmapped_span_rather_than_panicking() {
+        let storage = vec![0u8; 64];
+        let view = RdramView::from_storage(&storage);
+        assert!(view.storage_slice(32, 32).is_some());
+        assert!(view.storage_slice(32, 64).is_none());
+        assert!(view.storage_slice(64, 4).is_none());
+    }
 
     #[test]
     fn new_with_mmio_covers_the_real_crash_address() {

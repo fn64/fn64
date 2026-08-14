@@ -339,18 +339,28 @@ pub fn resident_tail_generation_id_v1(
 }
 
 fn overlay_matches(generation: &DenseAotGenerationV1, recipe: &OverlayLoadRecipeV1) -> bool {
+    // A generation may cover only the TEXT extent rather than the whole loaded
+    // image: the data section is mutable, and a generation digested over it
+    // cannot survive the guest writing its own data. So the ROM span and load
+    // end are bounded by the recipe rather than equal to it, while the section
+    // boundaries below still have to agree exactly -- those are what identify
+    // WHICH overlay this is.
     recipe.schema == OVERLAY_RECIPE_SCHEMA_V1
         && generation.source_rom_start == recipe.rom_start
-        && generation.source_rom_end == recipe.rom_end
+        && generation.source_rom_end
+            == recipe.rom_start + crate::overlay_recipe::generation_source_span(recipe)
         && generation.load_start == recipe.load_start
-        && generation.load_end == recipe.data_end
+        && generation.load_end
+            == recipe.load_start + crate::overlay_recipe::generation_source_span(recipe)
         && generation.text_start == recipe.text_start
         && generation.text_end == recipe.text_end
         && generation.data_start == recipe.data_start
         && generation.data_end == recipe.data_end
         && generation.bss_start == recipe.bss_start
         && generation.bss_end == recipe.bss_end
-        && generation.loaded_sha256 == recipe.loaded_sha256
+        // The generation digests its text extent, so the recipe's
+        // whole-image digest no longer identifies it.
+        && generation.loaded_sha256 == recipe.text_sha256
 }
 
 fn topology_sha256(

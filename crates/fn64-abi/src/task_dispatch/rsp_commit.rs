@@ -50,6 +50,14 @@ pub(crate) unsafe fn dispatch_lle_task(
     // the aggregate graphics-phase total.
     let gfx_started = (recognize_graphics_microcode && PHASE_TIMING.with(Cell::get))
         .then(std::time::Instant::now);
+    // NON-graphics LLE -- in the WM2000 block lane that is the audio ucode,
+    // which runs under `AudioTaskExecutionPolicy::LleAccuracy` and therefore
+    // never reaches `dispatch_audio_task` (the only site that feeds
+    // `AUDIO_DISPATCH_NS`). Untimed, its cost silently joined "executor self"
+    // and read as runtime overhead. Time it here so the phase split accounts
+    // for every task the RSP interpreter runs, not just the graphics ones.
+    let non_gfx_started = (!recognize_graphics_microcode && PHASE_TIMING.with(Cell::get))
+        .then(std::time::Instant::now);
     let mut rsp_execution_ns = 0u64;
     let mut raw_rdp_ns = 0u64;
 
@@ -117,11 +125,38 @@ pub(crate) unsafe fn dispatch_lle_task(
         } else {
             CHUNK_STEPS
         };
-        let rsp_started = gfx_started.map(|_| std::time::Instant::now());
+        // Arm on EITHER branch. This used to read `gfx_started.map(..)`, which
+        // is `None` on the audio branch, so `rsp_execution_ns` stayed 0 there
+        // and the `AUDIO_LLE_RSP_NS` accumulation at the bottom of this
+        // function (:384) -- already written, already plumbed through to
+        // `audio_lle_rsp_ms` -- reported 0.000 on every run since it was added.
+        //
+        // That dead timer is why "the audio RSP path runs at 8.3 ns/instr"
+        // circulated: with no audio measurement to divide by, the figure was
+        // built from the GRAPHICS numerator over the COMBINED gfx+audio step
+        // count. Same numerator, two denominators -- perf-method rule 2's
+        // error in a new costume. This makes the comparison possible.
+        //
+        // `PHASE_TIMING` gates both `gfx_started` and `non_gfx_started`, so an
+        // unset run still takes no clock read.
+        let rsp_started =
+            (gfx_started.is_some() || non_gfx_started.is_some()).then(std::time::Instant::now);
         let result = fn64_audio::rsp::run_imem(&words, pc, &mut machine, chunk);
         if let Some(started) = rsp_started {
             rsp_execution_ns = rsp_execution_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
+        // Counts BOTH branches. `rsp_started` above is `gfx_started.map(..)`,
+        // so the RSP wall-time sub-timer never arms on the audio branch and
+        // `audio_lle_rsp_ms` reads 0.000 on every run despite audio LLE being
+        // almost entirely interpretation. These counters do not share that
+        // gate, and they answer the question wall time cannot: whether the
+        // interpreter is expensive per instruction or merely asked to run an
+        // enormous number of them (perf-method rule 3 -- count, do not infer).
+        crate::dpc_copy_census::note_rsp_chunk(
+            recognize_graphics_microcode,
+            result.steps,
+            words.len() as u64,
+        );
         total_steps = total_steps
             .checked_add(result.steps)
             .expect("RSP task step counter overflow");
@@ -276,8 +311,27 @@ pub(crate) unsafe fn dispatch_lle_task(
         };
         let mut transaction = LiveDpcTransaction::new(submission);
         let rdp_started = gfx_started.map(|_| std::time::Instant::now());
-        let (full_sync, observation) =
-            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, &mut transaction) };
+        // Always defer the GPU-completion wait here. RT64's queue is a
+        // monotonic counter (`waitId <= workloadId`, rt64_workload_queue.cpp
+        // :93), so waiting for a later submission's id also waits for every
+        // earlier one -- there is no reordering risk from deferring past
+        // this call. Nothing between here and this task's return reads
+        // GPU-completed state: `full_sync`/`observation` are decided from
+        // the submitted command bytes and the synchronous submit-time
+        // status (`FrameStatus`/`DpFullSyncStatus`), not from waiting.
+        // `Rt64Backend::present` flushes any outstanding workload before it
+        // reads anything, which is the one place downstream that genuinely
+        // needs completed state. Measured 2026-08-10 (render-benchmark
+        // route, rt64 lane): waiting after every submission, when a task's
+        // submissions were already fully merged by the loop above, was
+        // costing ~11 ms/field with ZERO submissions actually deferred by
+        // an earlier same-task-only version of this change -- the repeated
+        // wait cost is paid ACROSS separate RSP tasks in one field
+        // (sp_tasks ~2.9/field), which this field-wide (present-flushed)
+        // version reaches and the earlier per-task version could not.
+        let (full_sync, observation) = unsafe {
+            dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, false, &mut transaction)
+        };
         if let Some(started) = rdp_started {
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
@@ -319,16 +373,21 @@ pub(crate) unsafe fn dispatch_lle_task(
             });
         }
         for replacement in replacements {
+            // One 4 KiB IMEM digest serves both observations. They described
+            // the same `replacement.image` and nothing mutates it between
+            // them, so the two hashes were always equal; computing it once
+            // makes that identity structural rather than coincidental.
+            let text_sha256 = imem_sha256(&replacement.image);
             observations.push(RspRdpObservationKind::ImemReplacementCommitted {
                 task_addr,
                 imem_generation: replacement.generation,
-                text_sha256: imem_sha256(&replacement.image),
+                text_sha256,
             });
             if let Some(data) = recognition_data {
                 observations.push(RspRdpObservationKind::MicrocodeRecognition {
                     task_addr,
                     imem_generation: replacement.generation,
-                    text_sha256: imem_sha256(&replacement.image),
+                    text_sha256,
                     data_addr: data.addr,
                     data_size: data.size,
                     data_sha256: data.sha256,
@@ -356,6 +415,12 @@ pub(crate) unsafe fn dispatch_lle_task(
         GFX_LLE_CALLS.with(|calls| calls.set(calls.get() + 1));
         GFX_LLE_RSP_NS.with(|total| total.set(total.get().saturating_add(rsp_execution_ns)));
         GFX_LLE_RDP_NS.with(|total| total.set(total.get().saturating_add(raw_rdp_ns)));
+    }
+    if let Some(started) = non_gfx_started {
+        let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        AUDIO_LLE_NS.with(|total| total.set(total.get().saturating_add(elapsed_ns)));
+        AUDIO_LLE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        AUDIO_LLE_RSP_NS.with(|total| total.set(total.get().saturating_add(rsp_execution_ns)));
     }
 
     LleTaskResult {
@@ -879,11 +944,17 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 let inspected =
                     preflight_raw_dpc_completion(&image, start, end, "dispatch_raw_rdp");
                 let result = with_render_backend("dispatch_raw_rdp", |backend| {
+                    // `true`: this call site is single-shot per invocation,
+                    // not the coalesced-submission loop in
+                    // `dispatch_captured_raw_rdp` below, which is the one
+                    // this session measured and verified safe to defer.
+                    // Preserve existing (always-wait) behavior here.
                     let status = backend.process_rdp_commands(
                         &mut image,
                         start,
                         end,
                         render_output_addr(),
+                        true,
                     )?;
                     Ok(RenderDispatchResult {
                         status,
@@ -915,7 +986,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
                 .collect::<Vec<_>>();
             let (full_sync, observation) = unsafe {
-                dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction)
+                dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
             };
             (full_sync, observation, "dispatch_raw_rdp_xbus")
         }
@@ -978,8 +1049,9 @@ pub(crate) unsafe fn dispatch_raw_rdp_xbus(
         return;
     };
     let mut transaction = LiveDpcTransaction::new(submission);
-    let (full_sync, observation) =
-        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction) };
+    let (full_sync, observation) = unsafe {
+        dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
+    };
     complete_committed_dpc(transaction, full_sync, observation, "dispatch_raw_rdp_xbus");
 }
 
@@ -995,6 +1067,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     source_start: u32,
     source_end: u32,
     xbus: bool,
+    wait_for_completion: bool,
     transaction: &mut LiveDpcTransaction,
 ) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
     assert!(
@@ -1069,8 +1142,17 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
         staged_end <= 0x0100_0000,
         "captured RSP DPC staging range [{staging_start:#010x}, {staged_end:#010x}) exceeds the 24-bit RDP address space"
     );
-    let mut image = vec![0u8; staged_end];
-    image[..physical_len].copy_from_slice(real);
+    crate::dpc_copy_census::note_call();
+    let mut image = crate::dpc_copy_census::timed(
+        crate::dpc_copy_census::Phase::Alloc,
+        staged_end as u64,
+        || vec![0u8; staged_end],
+    );
+    crate::dpc_copy_census::timed(
+        crate::dpc_copy_census::Phase::CopyIn,
+        physical_len as u64,
+        || image[..physical_len].copy_from_slice(real),
+    );
     for (word_index, value) in words.iter().copied().enumerate() {
         let offset = staging_start + word_index * 4;
         image[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
@@ -1087,6 +1169,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             staging_start as u32,
             staged_end as u32,
             render_output_addr(),
+            wait_for_completion,
         )?;
         Ok(RenderDispatchResult {
             status,
@@ -1114,8 +1197,24 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             }
         }
     }
+    // How much of the copyback below is real work. MUST run before it: the
+    // copy destroys the very difference being measured. Inert without
+    // `FN64_DPC_COPY_CENSUS`, and it copies nothing either way -- it exists
+    // to answer, by counting rather than by argument (perf-method rule 3),
+    // whether narrowing the copyback can pay at all. See the counters'
+    // doc comment for why the 3.4x copy_in/copy_back asymmetry raised the
+    // question and why rule 12 requires it be settled before acting.
+    crate::dpc_copy_census::note_copy_back_diff(&image[..physical_len], real);
+    // Times the copyback only, NOT `track_rdp_renderer_mutation`'s own
+    // bookkeeping around it: the closure is the memcpy and the wrapper is
+    // mutation-journal work, and conflating them would reproduce exactly the
+    // inclusive-as-self-time error this census exists to avoid.
     track_rdp_renderer_mutation(real, |real| {
-        real.copy_from_slice(&image[..physical_len]);
+        crate::dpc_copy_census::timed(
+            crate::dpc_copy_census::Phase::CopyBack,
+            physical_len as u64,
+            || real.copy_from_slice(&image[..physical_len]),
+        )
     });
     (
         full_sync,

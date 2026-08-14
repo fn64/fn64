@@ -943,17 +943,17 @@ fn lazy_context_preserves_exact_uninitialized_read_diagnostics() {
         "assertion `left == right` failed: TLUT index 7 reads uninitialized TMEM bits at byte 0x838\n  left: 0\n right: 255"
     );
 
-    let yuv = TmemTexture {
-        storage: std::rc::Rc::new(Tmem::default()),
-        tile: Tile {
+    let yuv = TmemTexture::new(
+        std::rc::Rc::new(Tmem::default()),
+        Tile {
             fmt: G_IM_FMT_YUV,
             siz: G_IM_SIZ_16B,
             line: 1,
             tmem: 3,
             ..Default::default()
         },
-        texture_lut: 0,
-    };
+        0,
+    );
     assert_eq!(
         panic_text(|| {
             let _ = yuv.sample(2, 4);
@@ -1026,11 +1026,7 @@ fn yuv_tmem_splits_chroma_low_and_luma_high() {
         &storage.bytes[TMEM_HALF_BYTES..TMEM_HALF_BYTES + 2],
         &[0x10, 0x30]
     );
-    let texture = TmemTexture {
-        storage: std::rc::Rc::new(storage),
-        tile,
-        texture_lut: 0,
-    };
+    let texture = TmemTexture::new(std::rc::Rc::new(storage), tile, 0);
     assert_eq!(texture.sample(0, 0), [0x10, 0x20, 0x40, 255]);
     assert_eq!(texture.sample(1, 0), [0x30, 0x20, 0x40, 255]);
 }
@@ -1167,11 +1163,7 @@ fn ci4_samples_quadricated_tlut_at_palette_bank_address() {
     };
     storage.write_texel(tile, 0, 0, false, G_IM_SIZ_4B, 1);
     storage.write_tlut(256, 0x21, 0xf801);
-    let texture = TmemTexture {
-        storage: std::rc::Rc::new(storage),
-        tile,
-        texture_lut: 2,
-    };
+    let texture = TmemTexture::new(std::rc::Rc::new(storage), tile, 2);
     assert_eq!(texture.sample(0, 0), [255, 0, 0, 255]);
 }
 
@@ -1193,11 +1185,7 @@ fn tlut_mode_palettizes_eight_bit_texels_regardless_of_tile_format() {
     };
     storage.write_texel(tile, 0, 0, false, G_IM_SIZ_8B, 0x42);
     storage.write_tlut(256, 0x42, 0xf801);
-    let texture = TmemTexture {
-        storage: std::rc::Rc::new(storage),
-        tile,
-        texture_lut: 2,
-    };
+    let texture = TmemTexture::new(std::rc::Rc::new(storage), tile, 2);
     assert_eq!(texture.sample(0, 0), [255, 0, 0, 255]);
 }
 

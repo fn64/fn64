@@ -178,7 +178,7 @@ fn render(
     pattern: TexturePattern,
 ) -> Result<Rt64PresentedPixels, Box<dyn Error>> {
     let (mut rdram, end) = fixture(pattern);
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "resolution fixture returned {status:?} instead of Complete"
@@ -590,7 +590,7 @@ mod tests {
         backend.create(&RenderConfig::ntsc(WIDTH, HEIGHT)).unwrap();
         assert_eq!(
             backend
-                .process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)
+                .process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)
                 .unwrap(),
             FrameStatus::Complete
         );

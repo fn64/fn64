@@ -46,6 +46,7 @@ impl ReferenceBackend {
             suppress_task_diagnostics: false,
             continuation: None,
             next_continuation_token: 1,
+            raw_rdp_scratch: Vec::new(),
         }
     }
 
@@ -369,7 +370,7 @@ impl ReferenceBackend {
                 operations
             }
             DecodeMode::RawRdp => gbi::decode_raw_rdp_ops_with_state(
-                &*rdram,
+                rdram,
                 task.data_ptr,
                 &mut self.rdp_decode_state,
             )?,

@@ -198,8 +198,91 @@ pub(crate) fn write_raw_mmio_word(vaddr: u64, value: u32) -> bool {
     true
 }
 
-/// Commit due device work before any executor resume is possible.
+// Commit due device work before any executor resume is possible.
+//
+// Plain comment, not `///`: rustdoc does not generate documentation for macro
+// invocations, so a doc comment here is silently dropped and warns. The
+// per-case doc comment inside the macro body does attach to the static.
+thread_local! {
+    /// [clock_lags+due, clock_lags+nothing_due, current+due, current+nothing_due]
+    pub(crate) static DEVICE_ADVANCE_CENSUS: std::cell::RefCell<[u64; 4]> =
+        const { std::cell::RefCell::new([0; 4]) };
+}
+
+/// Report the device-advance case census gathered under
+/// `FN64_DEVICE_ADVANCE_CENSUS`.
+pub fn print_device_advance_census() {
+    DEVICE_ADVANCE_CENSUS.with(|c| {
+        let c = c.borrow();
+        let total: u64 = c.iter().sum();
+        if total == 0 {
+            println!("[device-census] no samples");
+            return;
+        }
+        println!(
+            "[device-census] total={total} lag+due={} ({:.1}%) lag+nothing={} ({:.1}%) current+due={} ({:.1}%) current+nothing={} ({:.1}%)",
+            c[0], c[0] as f64 / total as f64 * 100.0,
+            c[1], c[1] as f64 / total as f64 * 100.0,
+            c[2], c[2] as f64 / total as f64 * 100.0,
+            c[3], c[3] as f64 / total as f64 * 100.0,
+        );
+    });
+}
+
 pub(crate) fn advance_device_time(now: u64) -> u32 {
+    // Fast path: nothing to commit.
+    //
+    // This runs after EVERY guest step, and the loop below always performs at
+    // least one `advance_device_time_step`, which takes three separate
+    // host/executor borrows and collects pending PI/SI/SP state before
+    // discovering there is nothing due. It profiled as 38% of the certified
+    // lane's self time.
+    //
+    // When device time already equals `now` and no deadline is due, that step
+    // has no work: no event can fire, and the fabric clock needs no advance.
+    // Checking that in one borrow skips the rest.
+    // Fast path: no deadline is due, so only the fabric CLOCK needs to move.
+    //
+    // A census over 60,000 steps found this case is 100% of calls: the clock
+    // always lags `now` and nothing is ever due at this point, because due
+    // work is committed when it is scheduled rather than discovered here. The
+    // loop below nonetheless ran a full `advance_device_time_step` every time,
+    // taking three host/executor borrows and collecting pending PI/SI/SP state
+    // before finding no event to fire. That was 38% of the lane's self time.
+    //
+    // With nothing due, no event handler can run and no PIF work can be
+    // produced, so advancing the clock is the entire operation. VI retrace
+    // ticks are likewise only produced by a firing VI event, hence zero.
+    // Advance the clock without a memory view when nothing is due.
+    // `advance_clock_if_idle` re-checks the deadline itself and refuses if any
+    // event IS due, so this cannot skip real device work -- which is the exact
+    // failure mode of the earlier empty-view version.
+    let advanced = with_host(|host| {
+        host.device_fabric
+            .advance_clock_if_idle(fn64_runtime::Cycles::new(now))
+    });
+    if advanced {
+        return 0;
+    }
+    // NOTE: an earlier version of this fast path advanced the fabric with an
+    // EMPTY `RdramViewMut::from_storage(&mut [])`, on the reasoning that with
+    // no deadline due no device work can touch memory. That was wrong, and it
+    // is what zeroed the executable baseline: the view is passed as
+    // `DmaMemory`, so anything the fabric does commit goes into a zero-length
+    // buffer, and the mutation journal then reads zeros where published ROM
+    // bytes belong.
+    //
+    // Measured: with the fast path enabled the route dies at step 421,717 with
+    // "unjournaled executable mutation changed physical RDRAM
+    // [0x0009b0b3,0x0009b0b4)"; with it disabled the same build reaches the
+    // same step cleanly. The baseline probe confirms the byte is seeded
+    // correctly at construction (`expected[0x9b0b3]=0x10`, matching ROM) and
+    // only becomes zero later.
+    //
+    // The win was recovered by `advance_clock_if_idle` above, which advances
+    // the clock with no memory view at all and re-checks the deadline itself,
+    // so it cannot be used to skip real device work. Below this point some
+    // event IS due, and the loop advances with the real memory.
     let mut vi_retrace_ticks = 0u32;
     loop {
         let step = with_host(|host| {
