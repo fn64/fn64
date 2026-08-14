@@ -129,8 +129,7 @@ struct ControllerScheduleDriver {
 /// count untouched and drive this to zero.
 static AUDIO_BUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AUDIO_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static AUDIO_NONZERO_SAMPLES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AUDIO_NONZERO_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AUDIO_PEAK_ABS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A headless [`fn64_audio::AudioBackend`] that retains statistics instead of
@@ -147,11 +146,15 @@ struct PcmEvidenceBackend {
 
 impl fn64_audio::AudioBackend for PcmEvidenceBackend {
     fn create(&mut self, cfg: &fn64_audio::AudioConfig) -> Result<(), fn64_audio::AudioError> {
-        self.sample_rate_hz = cfg.sample_rate_hz;
+        self.sample_rate_hz = cfg.sample_rate_hz.get();
         Ok(())
     }
 
-    fn queue_samples(&mut self, samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+    fn queue_samples(
+        &mut self,
+        pcm: fn64_audio::GuestPcm16<'_>,
+    ) -> Result<(), fn64_audio::AudioError> {
+        let samples = pcm.samples();
         use std::sync::atomic::Ordering::Relaxed;
         AUDIO_BUFFERS.fetch_add(1, Relaxed);
         AUDIO_SAMPLES.fetch_add(samples.len() as u64, Relaxed);
@@ -170,16 +173,16 @@ impl fn64_audio::AudioBackend for PcmEvidenceBackend {
     /// Nothing is retained, so nothing is ever pending. A real device reports
     /// its backlog here; this backend consuming instantly is what keeps the
     /// lane from stalling on delivery it does not perform.
-    fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
-        Ok(0)
+    fn frames_remaining(&self) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+        Ok(fn64_audio::HostFrameCount::ZERO)
     }
 
-    fn set_frequency(&mut self, sample_rate_hz: u32) {
-        self.sample_rate_hz = sample_rate_hz;
+    fn set_frequency(&mut self, sample_rate_hz: fn64_audio::GuestSampleRateHz) {
+        self.sample_rate_hz = sample_rate_hz.get();
     }
 
-    fn stream_rate_hz(&self) -> Option<u32> {
-        (self.sample_rate_hz != 0).then_some(self.sample_rate_hz)
+    fn stream_rate_hz(&self) -> Option<fn64_audio::HostSampleRateHz> {
+        (self.sample_rate_hz != 0).then(|| fn64_audio::HostSampleRateHz::new(self.sample_rate_hz))
     }
 }
 
@@ -642,7 +645,8 @@ fn main() {
         "dynamic withheld execution requires FN64_BLOCK_MIN_GUEST_INSTRUCTIONS"
     );
     #[cfg(feature = "dynamic-withheld")]
-    let dynamic_telemetry_output = dynamic_exact_entry_withheld.then(prepare_dynamic_telemetry_output);
+    let dynamic_telemetry_output =
+        dynamic_exact_entry_withheld.then(prepare_dynamic_telemetry_output);
     SUPPRESS_PROTOCOL_DIAGNOSTICS.store(
         generated_runner_protocol_mode,
         std::sync::atomic::Ordering::Relaxed,

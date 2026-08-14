@@ -200,7 +200,7 @@ mod game {
         pump_steps_total: u64,
         pump_steps_max: u64,
         pump_step_samples: u64,
-        last_audio_underrun_samples: u64,
+        last_audio_underrun_sample_slots: u64,
         last_audio_late_callbacks: u64,
     }
 
@@ -433,7 +433,7 @@ mod game {
                 pump_steps_total: 0,
                 pump_steps_max: 0,
                 pump_step_samples: 0,
-                last_audio_underrun_samples: 0,
+                last_audio_underrun_sample_slots: 0,
                 last_audio_late_callbacks: 0,
             }
         }
@@ -671,8 +671,8 @@ mod game {
                     let audio_health = fn64_abi::audio_stream_health();
                     let (
                         audio_callbacks,
-                        audio_underruns,
-                        window_underruns,
+                        audio_underrun_sample_slots,
+                        window_underrun_sample_slots,
                         audio_late_callbacks,
                         window_late_callbacks,
                         max_callback_gap_us,
@@ -680,10 +680,11 @@ mod game {
                         .map(|health| {
                             (
                                 health.callbacks,
-                                health.underrun_samples,
+                                health.underrun_sample_slots.get(),
                                 health
-                                    .underrun_samples
-                                    .saturating_sub(self.last_audio_underrun_samples),
+                                    .underrun_sample_slots
+                                    .get()
+                                    .saturating_sub(self.last_audio_underrun_sample_slots),
                                 health.late_callbacks,
                                 health
                                     .late_callbacks
@@ -702,8 +703,8 @@ mod game {
                          timing_ms median/p95: interval={:.2}/{:.2} pump={:.2}/{:.2} \
                          present={:.2}/{:.2} (n={}); pump_steps avg/max={average_steps:.1}/{}; audio: \
                          ai_buffers={} samples={} nonzero={} backend_buffers={} ring_frames={:?} \
-                         callbacks={audio_callbacks} underrun_samples={audio_underruns} \
-                         (+{window_underruns} window) late_callbacks={audio_late_callbacks} \
+                         callbacks={audio_callbacks} underrun_sample_slots={audio_underrun_sample_slots} \
+                         (+{window_underrun_sample_slots} window) late_callbacks={audio_late_callbacks} \
                          (+{window_late_callbacks} window) max_callback_gap_us={max_callback_gap_us} \
                          ai_status_reads/busy={ai_status_reads}/{ai_busy_returns} \
                          ai_length_reads/last={ai_length_reads}/{ai_length_last} \
@@ -726,7 +727,7 @@ mod game {
                     self.pump_steps_total = 0;
                     self.pump_steps_max = 0;
                     self.pump_step_samples = 0;
-                    self.last_audio_underrun_samples = audio_underruns;
+                    self.last_audio_underrun_sample_slots = audio_underrun_sample_slots;
                     self.last_audio_late_callbacks = audio_late_callbacks;
                 }
             }
@@ -1022,7 +1023,9 @@ mod game {
         let mut backend = CpalBackend::new();
         match backend.create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2)) {
             Ok(()) => {
-                let stream_rate = backend.stream_rate_hz().unwrap_or(N64_BOOT_AI_RATE_HZ);
+                let stream_rate = backend
+                    .stream_rate_hz()
+                    .unwrap_or_else(|| fn64_audio::HostSampleRateHz::new(N64_BOOT_AI_RATE_HZ));
                 fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
                 println!(
                     "[fn64-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \

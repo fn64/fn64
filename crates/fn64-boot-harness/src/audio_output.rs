@@ -56,7 +56,10 @@ pub fn wire_live_audio_output(
     let mut backend = CpalBackend::new();
     match backend.create(&AudioConfig::new(guest_rate_hz, 2)) {
         Ok(()) => {
-            let stream_rate_hz = backend.stream_rate_hz().unwrap_or(guest_rate_hz);
+            let stream_rate_hz = backend
+                .stream_rate_hz()
+                .unwrap_or_else(|| fn64_audio::HostSampleRateHz::new(guest_rate_hz))
+                .get();
             fn64_abi::set_audio_backend(Box::new(backend), rdram_len);
             LiveAudioOutput::Active {
                 guest_rate_hz,

@@ -154,7 +154,7 @@ struct PumpCounters {
     audio_callbacks: u64,
     audio_max_gap_us: u64,
     audio_late_callbacks: u64,
-    audio_underrun_samples: u64,
+    audio_underrun_sample_slots: u64,
 }
 
 impl PumpCounters {
@@ -173,7 +173,7 @@ impl PumpCounters {
             audio_callbacks: health.callbacks,
             audio_max_gap_us: health.max_callback_gap_us,
             audio_late_callbacks: health.late_callbacks,
-            audio_underrun_samples: health.underrun_samples,
+            audio_underrun_sample_slots: health.underrun_sample_slots.get(),
         }
     }
 }
@@ -220,7 +220,7 @@ impl PumpAttribution {
              d_sim_time={} d_gfx={} d_audio={} d_vi_swaps={} \
              d_ai_buffers={} d_backend_buffers={} d_audio_samples={}; \
              host: d_audio_callbacks={} audio_max_gap_us={} d_late_callbacks={} \
-             d_underrun_samples={}",
+             d_underrun_sample_slots={}",
             self.steps,
             self.step_ms,
             self.advances,
@@ -238,8 +238,8 @@ impl PumpAttribution {
             after.audio_max_gap_us,
             after.audio_late_callbacks.wrapping_sub(before.audio_late_callbacks),
             after
-                .audio_underrun_samples
-                .wrapping_sub(before.audio_underrun_samples),
+                .audio_underrun_sample_slots
+                .wrapping_sub(before.audio_underrun_sample_slots),
         );
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
@@ -438,8 +438,8 @@ struct Shell {
     /// `osViSwapBuffer` -- see `present`.
     presented_frames: u64,
     last_heartbeat_frame: u64,
-    last_audio_requested_samples: u64,
-    last_audio_underrun_samples: u64,
+    last_audio_requested_sample_slots: u64,
+    last_audio_underrun_sample_slots: u64,
     next_frame_deadline: std::time::Instant,
     frame_intervals: TimingWindow,
     pump_times: TimingWindow,
@@ -825,8 +825,8 @@ impl Shell {
             reported_first_frame: false,
             presented_frames: 0,
             last_heartbeat_frame: 0,
-            last_audio_requested_samples: 0,
-            last_audio_underrun_samples: 0,
+            last_audio_requested_sample_slots: 0,
+            last_audio_underrun_sample_slots: 0,
             next_frame_deadline: std::time::Instant::now(),
             frame_intervals: TimingWindow::default(),
             pump_times: TimingWindow::default(),
@@ -1453,11 +1453,13 @@ impl Shell {
             let audio = fn64_abi::audio_output_stats();
             let stream_health = fn64_abi::audio_stream_health().unwrap_or_default();
             let requested_delta = stream_health
-                .requested_samples
-                .saturating_sub(self.last_audio_requested_samples);
+                .requested_sample_slots
+                .get()
+                .saturating_sub(self.last_audio_requested_sample_slots);
             let underrun_delta = stream_health
-                .underrun_samples
-                .saturating_sub(self.last_audio_underrun_samples);
+                .underrun_sample_slots
+                .get()
+                .saturating_sub(self.last_audio_underrun_sample_slots);
             let interval = self.frame_intervals.take_stats();
             let pump = self.pump_times.take_stats();
             let present_budget_ms = present_cadence().interval.as_secs_f64() * 1000.0;
@@ -1517,7 +1519,7 @@ impl Shell {
                 audio.backend_buffers,
                 // The mechanical choppiness signal, on the ROUTINE line.
                 //
-                // `underrun_samples` counts output slots the device filled with
+                // `underrun_sample_slots` counts output slots the device filled with
                 // silence because the ring was empty, and `fn64-audio` already
                 // documents it as the signal a point-in-time ring depth cannot
                 // provide -- but it only printed inside the SPIKE report, which
@@ -1538,12 +1540,12 @@ impl Shell {
                 } else {
                     underrun_delta as f64 * 100.0 / requested_delta as f64
                 },
-                stream_health.underrun_samples,
-                stream_health.requested_samples,
+                stream_health.underrun_sample_slots,
+                stream_health.requested_sample_slots,
             );
             self.last_heartbeat_frame = frames;
-            self.last_audio_requested_samples = stream_health.requested_samples;
-            self.last_audio_underrun_samples = stream_health.underrun_samples;
+            self.last_audio_requested_sample_slots = stream_health.requested_sample_slots.get();
+            self.last_audio_underrun_sample_slots = stream_health.underrun_sample_slots.get();
         }
     }
 }
@@ -1575,7 +1577,9 @@ fn wire_audio() {
     let mut backend = CpalBackend::new();
     match backend.create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2)) {
         Ok(()) => {
-            let stream_rate = backend.stream_rate_hz().unwrap_or(N64_BOOT_AI_RATE_HZ);
+            let stream_rate = backend
+                .stream_rate_hz()
+                .unwrap_or_else(|| fn64_audio::HostSampleRateHz::new(N64_BOOT_AI_RATE_HZ));
             fn64_abi::set_audio_backend(Box::new(backend), fn64_recomp_rs::RDRAM_LEN);
             println!(
                 "[wm2000-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \

@@ -108,6 +108,11 @@ host latency rather than N64 hardware state. The host ring allocates its full
 250 ms bound before playback and keeps the producer's drop-oldest policy. The
 realtime callback never waits for the producer lock: a contended pull becomes
 counted silence, preserving callback deadlines without changing DMA progress.
+That split is also enforced by the Rust seam: guest and host sample rates are
+distinct nonzero types, `GuestPcm16` proves complete interleaved frames, and
+guest sample slots, host sample slots, host frames, and guest DMA bytes cannot
+be passed interchangeably. Raw integers exist only at device, cpal, atomic,
+and C-ABI edges where their representation is required.
 
 `fn64-rt64` depends on `fn64-render`, which owns the backend-neutral task,
 microcode-admission, runtime-policy, and raw-DPC completion seams, and on

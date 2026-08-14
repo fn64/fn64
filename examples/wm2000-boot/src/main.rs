@@ -920,11 +920,11 @@ fn main() {
     let audio_health_before_drain = fn64_abi::audio_stream_health();
     if let Some(health) = audio_health_before_drain {
         println!(
-            "[wm2000-boot] host audio health before drain: callbacks={} requested_samples={} \
-             underrun_samples={} late_callbacks={} max_callback_gap_us={}",
+            "[wm2000-boot] host audio health before drain: callbacks={} requested_sample_slots={} \
+             underrun_sample_slots={} late_callbacks={} max_callback_gap_us={}",
             health.callbacks,
-            health.requested_samples,
-            health.underrun_samples,
+            health.requested_sample_slots,
+            health.underrun_sample_slots,
             health.late_callbacks,
             health.max_callback_gap_us,
         );
@@ -935,20 +935,20 @@ fn main() {
         println!("[wm2000-boot] host audio queue drained before exit");
     }
     if let Some(health) = fn64_abi::audio_stream_health() {
-        let drain_underrun_samples = audio_health_before_drain
+        let drain_underrun_sample_slots = audio_health_before_drain
             .map(|before| {
                 health
-                    .underrun_samples
-                    .saturating_sub(before.underrun_samples)
+                    .underrun_sample_slots
+                    .saturating_sub(before.underrun_sample_slots)
             })
-            .unwrap_or(0);
+            .unwrap_or(fn64_audio::HostSampleSlotCount::ZERO);
         println!(
-            "[wm2000-boot] host audio health after drain: callbacks={} requested_samples={} \
-             underrun_samples={} (+{} drain) late_callbacks={} max_callback_gap_us={}",
+            "[wm2000-boot] host audio health after drain: callbacks={} requested_sample_slots={} \
+             underrun_sample_slots={} (+{} drain) late_callbacks={} max_callback_gap_us={}",
             health.callbacks,
-            health.requested_samples,
-            health.underrun_samples,
-            drain_underrun_samples,
+            health.requested_sample_slots,
+            health.underrun_sample_slots,
+            drain_underrun_sample_slots,
             health.late_callbacks,
             health.max_callback_gap_us,
         );

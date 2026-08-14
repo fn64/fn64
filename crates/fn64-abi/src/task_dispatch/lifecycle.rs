@@ -427,6 +427,10 @@ pub fn audio_frames_remaining() -> Option<u32> {
         cell.borrow()
             .as_ref()
             .and_then(|backend| backend.frames_remaining().ok())
+            .map(|frames| {
+                u32::try_from(frames.get())
+                    .expect("bounded host audio ring frame count must fit the ABI u32")
+            })
     })
 }
 
@@ -471,7 +475,7 @@ pub fn audio_rates() -> Option<(u32, u32)> {
     AUDIO_BACKEND.with(|cell| {
         let borrowed = cell.borrow();
         let stream_rate = borrowed.as_ref()?.stream_rate_hz()?;
-        Some((guest_rate, stream_rate))
+        Some((guest_rate, stream_rate.get()))
     })
 }
 
@@ -761,7 +765,7 @@ pub(crate) fn notify_audio_frequency(sample_rate_hz: u32) {
     AUDIO_GUEST_RATE.with(|cell| cell.set(sample_rate_hz));
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            backend.set_frequency(sample_rate_hz);
+            backend.set_frequency(fn64_audio::GuestSampleRateHz::new(sample_rate_hz));
         }
     });
 }

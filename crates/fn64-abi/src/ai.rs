@@ -463,25 +463,32 @@ mod tests {
                 self.ready = true;
                 Ok(())
             }
-            fn queue_samples(&mut self, samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+            fn queue_samples(
+                &mut self,
+                pcm: fn64_audio::GuestPcm16<'_>,
+            ) -> Result<(), fn64_audio::AudioError> {
                 if !self.ready {
                     return Err(fn64_audio::AudioError::NotReady("create() not called"));
                 }
                 self.samples_seen
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .extend_from_slice(samples);
+                    .extend_from_slice(pcm.samples());
                 Ok(())
             }
-            fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
-                Ok((self
-                    .samples_seen
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .len()
-                    / 2) as u32)
+            fn frames_remaining(
+                &self,
+            ) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+                Ok(fn64_audio::HostFrameCount::new(
+                    (self
+                        .samples_seen
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .len()
+                        / 2) as u64,
+                ))
             }
-            fn set_frequency(&mut self, _sample_rate_hz: u32) {}
+            fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
         }
 
         const RDRAM_LEN: usize = 4096;
@@ -564,19 +571,24 @@ mod tests {
                 Ok(())
             }
 
-            fn queue_samples(&mut self, samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+            fn queue_samples(
+                &mut self,
+                pcm: fn64_audio::GuestPcm16<'_>,
+            ) -> Result<(), fn64_audio::AudioError> {
                 self.0
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .extend_from_slice(samples);
+                    .extend_from_slice(pcm.samples());
                 Ok(())
             }
 
-            fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
-                Ok(0)
+            fn frames_remaining(
+                &self,
+            ) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+                Ok(fn64_audio::HostFrameCount::ZERO)
             }
 
-            fn set_frequency(&mut self, _sample_rate_hz: u32) {}
+            fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
         }
 
         const HEADER: usize = 0x40;
@@ -768,17 +780,22 @@ mod tests {
             ) -> Result<(), fn64_audio::AudioError> {
                 Ok(())
             }
-            fn queue_samples(&mut self, _samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+            fn queue_samples(
+                &mut self,
+                _pcm: fn64_audio::GuestPcm16<'_>,
+            ) -> Result<(), fn64_audio::AudioError> {
                 Ok(())
             }
-            fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
-                Ok(0)
+            fn frames_remaining(
+                &self,
+            ) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+                Ok(fn64_audio::HostFrameCount::ZERO)
             }
-            fn set_frequency(&mut self, sample_rate_hz: u32) {
+            fn set_frequency(&mut self, sample_rate_hz: fn64_audio::GuestSampleRateHz) {
                 self.rates
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .push(sample_rate_hz);
+                    .push(sample_rate_hz.get());
             }
         }
 
@@ -818,18 +835,23 @@ mod tests {
             ) -> Result<(), fn64_audio::AudioError> {
                 Ok(())
             }
-            fn queue_samples(&mut self, _samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+            fn queue_samples(
+                &mut self,
+                _pcm: fn64_audio::GuestPcm16<'_>,
+            ) -> Result<(), fn64_audio::AudioError> {
                 Ok(())
             }
-            fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
-                Ok(4800)
+            fn frames_remaining(
+                &self,
+            ) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+                Ok(fn64_audio::HostFrameCount::new(4800))
             }
-            fn set_frequency(&mut self, _sample_rate_hz: u32) {}
-            fn stream_rate_hz(&self) -> Option<u32> {
-                Some(48_000)
+            fn set_frequency(&mut self, _sample_rate_hz: fn64_audio::GuestSampleRateHz) {}
+            fn stream_rate_hz(&self) -> Option<fn64_audio::HostSampleRateHz> {
+                Some(fn64_audio::HostSampleRateHz::new(48_000))
             }
-            fn current_dma_bytes_remaining(&self) -> Option<u32> {
-                Some(self.dma_bytes)
+            fn current_dma_bytes_remaining(&self) -> Option<fn64_audio::GuestDmaByteCount> {
+                Some(fn64_audio::GuestDmaByteCount::new(self.dma_bytes))
             }
         }
 
