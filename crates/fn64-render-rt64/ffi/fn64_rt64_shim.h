@@ -730,10 +730,15 @@ int fn64_rt64_enable_present_capture(
     char *error,
     size_t error_capacity);
 
-/* Registers a per-frame draw callback that fires after present-capture's own
- * readback (if enabled) but before the frame is finalized/presented, drawing
+/* Registers a per-frame draw callback that fires before present-capture's own
+ * readback (if enabled) and before the frame is finalized/presented, drawing
  * into the same already-open command list RT64's present thread hands to
- * this shim. `command_list`/`framebuffer` are opaque `plume::RenderCommandList*`/
+ * this shim -- present-capture's readback runs last so it captures whatever
+ * this callback draws composited into the frame (see fn64_rt64_shim.cpp's
+ * draw_hook_dispatch for the full ordering rationale: present-capture is
+ * also the readback wm2000-shell's own present path uses for every frame
+ * the player sees, so a UI overlay has to land before it, not after).
+ * `command_list`/`framebuffer` are opaque `plume::RenderCommandList*`/
  * `plume::RenderFramebuffer*`, matching how this header keeps `plume` types
  * internal to the C++ side everywhere else -- a caller linking against the
  * same `plume` headers (as fn64-rmlui does) casts back to the real types.

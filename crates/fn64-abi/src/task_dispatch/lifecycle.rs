@@ -898,6 +898,29 @@ pub fn capture_render_release_frame_into(
     })
 }
 
+/// Stage or live-apply a runtime settings change through the registered
+/// backend's own `RenderBackend::apply_runtime_settings`. Same "go through
+/// the owned trait object, never downcast" discipline as
+/// `capture_render_release_frame` above -- this calls a method the trait
+/// itself declares (every `RenderBackend`, RT64 or reference, implements
+/// or inherits a default for it), not something that reaches past the
+/// trait object for backend-specific state, so it does not weaken the "a
+/// host neither downcasts the backend nor reaches into RT64 after
+/// registration" rule that function's own doc comment states.
+pub fn apply_render_runtime_settings(
+    settings: &fn64_render::RenderRuntimeSettings,
+) -> Result<fn64_render::RenderSettingsApply, fn64_render::RenderError> {
+    RENDER_BACKEND.with(|cell| {
+        let mut registered = cell.borrow_mut();
+        let backend = registered
+            .as_mut()
+            .ok_or(fn64_render::RenderError::NotReady(
+                "apply_render_runtime_settings: no render backend registered",
+            ))?;
+        backend.apply_runtime_settings(settings)
+    })
+}
+
 /// Snapshot the concrete registered backend and graphics execution policy.
 /// The backend self-reports through the trait object; callers cannot attach a
 /// separate label after registration.
