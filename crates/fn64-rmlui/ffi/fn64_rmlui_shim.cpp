@@ -372,28 +372,62 @@ extern "C" void fn64_rmlui_element_set_class(
 
 namespace {
 
-// TODO(fn64-rmlui event-callback pass): wire Fn64RmluiEventCallback into
-// RmlUi's Rml::EventListener via Element::AddEventListener("click"/
-// "change", ...). Deferred alongside the render-interface work: this
-// skeleton's fn64_rmlui_element_on_click/on_change intentionally
-// no-op for now rather than half-wiring an event-listener class with no
-// way to test it end-to-end without a working render path to see the
-// element being clicked in the first place.
+// Bridges one Fn64RmluiEventCallback to RmlUi's Rml::EventListener
+// interface. AddEventListener does not take ownership (see Element.h's own
+// comment: a listener is only detached, e.g. on element destruction or an
+// explicit RemoveEventListener call with the same parameters) -- this class
+// owns itself instead, freeing itself from OnDetach so callers never need a
+// matching "destroy listener" call. Each fn64_rmlui_element_on_click/
+// on_change call creates and attaches its own instance, so calling either
+// more than once on the same element attaches multiple independent
+// listeners rather than replacing a prior one -- the natural RmlUi
+// behavior, since Element::AddEventListener has no "replace" concept either.
+class Fn64RmluiEventListener : public Rml::EventListener {
+public:
+    Fn64RmluiEventListener(Fn64RmluiEventCallback callback, void *user_data)
+        : callback_(callback), user_data_(user_data) {}
+
+    void ProcessEvent(Rml::Event &event) override {
+        if (callback_ == nullptr) {
+            return;
+        }
+        Rml::Element *element = event.GetCurrentElement();
+        if (element == nullptr) {
+            return;
+        }
+        Fn64RmluiElement handle{element};
+        callback_(&handle, user_data_);
+    }
+
+    void OnDetach(Rml::Element * /*element*/) override {
+        delete this;
+    }
+
+private:
+    Fn64RmluiEventCallback callback_ = nullptr;
+    void *user_data_ = nullptr;
+};
 
 } // namespace
 
 extern "C" void fn64_rmlui_element_on_click(
-    Fn64RmluiElement * /*element*/,
-    Fn64RmluiEventCallback /*callback*/,
-    void * /*user_data*/) {
-    // See TODO above; not yet implemented.
+    Fn64RmluiElement *element,
+    Fn64RmluiEventCallback callback,
+    void *user_data) {
+    if ((element == nullptr) || (element->element == nullptr) || (callback == nullptr)) {
+        return;
+    }
+    element->element->AddEventListener("click", new Fn64RmluiEventListener(callback, user_data));
 }
 
 extern "C" void fn64_rmlui_element_on_change(
-    Fn64RmluiElement * /*element*/,
-    Fn64RmluiEventCallback /*callback*/,
-    void * /*user_data*/) {
-    // See TODO above; not yet implemented.
+    Fn64RmluiElement *element,
+    Fn64RmluiEventCallback callback,
+    void *user_data) {
+    if ((element == nullptr) || (element->element == nullptr) || (callback == nullptr)) {
+        return;
+    }
+    element->element->AddEventListener("change", new Fn64RmluiEventListener(callback, user_data));
 }
 
 extern "C" void fn64_rmlui_context_update(Fn64RmluiContext *context) {
