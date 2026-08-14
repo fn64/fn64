@@ -1117,6 +1117,25 @@ bool extended_workload_snapshot(
 namespace {
 std::mutex present_capture_registry_mutex;
 std::vector<Fn64Rt64Context *> present_capture_contexts;
+
+// One caller-provided draw callback layered on top of present-capture's own
+// readback, e.g. fn64-rmlui's UI overlay. `RT64::SetRenderHooks`'s draw slot
+// is a single process-wide raw-function-pointer -- it cannot hold more than
+// one callback and cannot capture state -- so `draw_hook_dispatch` below is
+// the one function actually installed there, and this registry is how a
+// second (third, ...) caller gets to draw into the same already-open
+// command list without contending for that one slot. Plain C function
+// pointer + user_data, not std::function: this crosses the same extern "C"
+// boundary every other shim export does, and a non-C++ caller (fn64-rmlui's
+// Rust side) cannot construct a std::function anyway.
+struct DrawHookRegistrant {
+    Fn64Rt64Context *context = nullptr;
+    void (*callback)(void *command_list, void *framebuffer, void *user_data) = nullptr;
+    void *user_data = nullptr;
+};
+std::mutex draw_hook_registry_mutex;
+std::vector<DrawHookRegistrant> draw_hook_registrants;
+
 std::mutex vi_filter_registry_mutex;
 std::vector<Fn64Rt64Context *> vi_filter_contexts;
 struct ViHistoryRateEntry {
@@ -1149,6 +1168,14 @@ void capture_present_draw(
     plume::RenderCommandList *command_list,
     plume::RenderFramebuffer *framebuffer) noexcept;
 void unregister_present_capture(Fn64Rt64Context *context);
+// The function actually installed via `RT64::SetRenderHooks`'s draw slot.
+// Runs `capture_present_draw` first (unchanged, so present-capture keeps
+// reading a UI-free frame), then every external registrant in
+// `draw_hook_registrants`, in registration order.
+void draw_hook_dispatch(
+    plume::RenderCommandList *command_list,
+    plume::RenderFramebuffer *framebuffer) noexcept;
+void unregister_overlay_draw(Fn64Rt64Context *context);
 void register_vi_filter_context(Fn64Rt64Context *context);
 void unregister_vi_filter_context(Fn64Rt64Context *context);
 void register_vi_history_rate(const void *history, uint32_t nominal_refresh_rate);
@@ -1328,6 +1355,7 @@ struct Fn64Rt64Context {
             std::fprintf(stderr, "fn64 RT64 shutdown diagnostic: capture-unregister begin\n");
         }
         unregister_present_capture(this);
+        unregister_overlay_draw(this);
 #if defined(FN64_RT64_HFR_EVIDENCE)
         unregister_hfr_pacing(this);
 #endif
@@ -2691,6 +2719,45 @@ void capture_present_draw(
     }
 }
 
+// The function RT64::SetRenderHooks actually installs. Stage 1 is
+// present-capture's own readback, unchanged, so it keeps seeing a UI-free
+// frame. Stage 2 runs every external registrant (e.g. fn64-rmlui's overlay)
+// in registration order, strictly after stage 1's copy commands are
+// recorded into the same command list.
+//
+// The registrants are snapshot-copied out from under `draw_hook_registry_mutex`
+// before any of them run, rather than holding that mutex across the calls.
+// Each registrant is foreign code (potentially reentering into Rust) that
+// this function does not control the duration of, and `draw_hook_registry_mutex`
+// is the same mutex a caller's register/unregister call takes from a
+// different thread -- holding it across an unbounded foreign call invites
+// contention or deadlock for no benefit. `capture_present_draw` above holds
+// its own registry mutex for its whole (short, internal, bounded) body; that
+// shape does not extend safely to callbacks this function does not own.
+void draw_hook_dispatch(
+    plume::RenderCommandList *command_list,
+    plume::RenderFramebuffer *framebuffer) noexcept {
+    capture_present_draw(command_list, framebuffer);
+
+    std::vector<DrawHookRegistrant> registrants;
+    {
+        std::scoped_lock registry_lock(draw_hook_registry_mutex);
+        registrants = draw_hook_registrants;
+    }
+    for (const DrawHookRegistrant &registrant : registrants) {
+        try {
+            registrant.callback(command_list, framebuffer, registrant.user_data);
+        } catch (...) {
+            // Crosses RT64's present loop, same discipline as
+            // capture_present_draw above: never unwind into it. An overlay
+            // registrant has no per-context error slot to report into the
+            // way present-capture does, since it owns none of this file's
+            // state; a registrant that needs error reporting is responsible
+            // for capturing its own failures inside its callback.
+        }
+    }
+}
+
 void register_vi_history_rate(const void *history, uint32_t nominal_refresh_rate) {
     std::scoped_lock lock(vi_history_rate_registry_mutex);
     if ((nominal_refresh_rate != 50U) && (nominal_refresh_rate != 60U)) {
@@ -2724,23 +2791,74 @@ void unregister_vi_history_rate(const void *history) {
     }
 }
 
+// present_capture_contexts and draw_hook_registrants share one underlying
+// RT64 hook slot (RT64::SetRenderHooks has exactly one draw callback, which
+// is draw_hook_dispatch, dispatching to both). The slot may only be torn
+// down once BOTH registries are empty -- this is the one place the two
+// cannot stay fully independent. Each unregister path (here and
+// unregister_overlay_draw below) releases its OWN registry's mutex before
+// checking the other registry, so no caller ever holds both
+// present_capture_registry_mutex and draw_hook_registry_mutex at the same
+// time -- there is exactly one mutex held at any instant on this path, so
+// no lock-ordering cycle is possible between the two.
+bool draw_hook_slot_still_needed() {
+    std::scoped_lock draw_hook_lock(draw_hook_registry_mutex);
+    return !draw_hook_registrants.empty();
+}
+
 void unregister_present_capture(Fn64Rt64Context *context) {
-    std::scoped_lock registry_lock(present_capture_registry_mutex);
-    if (!context->present_capture_enabled) {
-        return;
+    bool present_capture_now_empty = false;
+    {
+        std::scoped_lock registry_lock(present_capture_registry_mutex);
+        if (!context->present_capture_enabled) {
+            return;
+        }
+        present_capture_contexts.erase(
+            std::remove(
+                present_capture_contexts.begin(),
+                present_capture_contexts.end(),
+                context),
+            present_capture_contexts.end());
+        context->present_capture_enabled = false;
+        present_capture_now_empty = present_capture_contexts.empty();
     }
-    present_capture_contexts.erase(
-        std::remove(
-            present_capture_contexts.begin(),
-            present_capture_contexts.end(),
-            context),
-        present_capture_contexts.end());
-    context->present_capture_enabled = false;
-    if (present_capture_contexts.empty() &&
+    if (present_capture_now_empty &&
+        !draw_hook_slot_still_needed() &&
         (RT64::GetRenderHookInit() == nullptr) &&
-        (RT64::GetRenderHookDraw() == capture_present_draw) &&
+        (RT64::GetRenderHookDraw() == draw_hook_dispatch) &&
         (RT64::GetRenderHookDeinit() == nullptr)) {
         RT64::SetRenderHooks(nullptr, nullptr, nullptr);
+    }
+}
+
+void unregister_overlay_draw(Fn64Rt64Context *context) {
+    bool draw_hook_now_empty = false;
+    {
+        std::scoped_lock registry_lock(draw_hook_registry_mutex);
+        const size_t prior_size = draw_hook_registrants.size();
+        draw_hook_registrants.erase(
+            std::remove_if(
+                draw_hook_registrants.begin(),
+                draw_hook_registrants.end(),
+                [context](const DrawHookRegistrant &registrant) {
+                    return registrant.context == context;
+                }),
+            draw_hook_registrants.end());
+        if (draw_hook_registrants.size() == prior_size) {
+            // Not registered; matches present-capture's idempotent-unregister
+            // shape (an early return above for the already-disabled case).
+            return;
+        }
+        draw_hook_now_empty = draw_hook_registrants.empty();
+    }
+    if (draw_hook_now_empty) {
+        std::scoped_lock present_capture_lock(present_capture_registry_mutex);
+        if (present_capture_contexts.empty() &&
+            (RT64::GetRenderHookInit() == nullptr) &&
+            (RT64::GetRenderHookDraw() == draw_hook_dispatch) &&
+            (RT64::GetRenderHookDeinit() == nullptr)) {
+            RT64::SetRenderHooks(nullptr, nullptr, nullptr);
+        }
     }
 }
 
@@ -4215,6 +4333,29 @@ extern "C" int fn64_rt64_present(
     }
 }
 
+// Installs draw_hook_dispatch as RT64's single draw hook if the slot is
+// currently empty, or verifies this shim already owns it if not. Shared by
+// both registration entry points (present-capture and the overlay-draw
+// registry) since either may be the first caller to need the slot. Caller
+// must hold the mutex for whichever registry it is registering into; this
+// function does not take any lock itself, it only inspects/installs the
+// global RT64 hook state.
+bool ensure_draw_hook_dispatch_installed(char *error, size_t error_capacity) {
+    if ((RT64::GetRenderHookInit() == nullptr) &&
+        (RT64::GetRenderHookDraw() == nullptr) &&
+        (RT64::GetRenderHookDeinit() == nullptr)) {
+        RT64::SetRenderHooks(nullptr, draw_hook_dispatch, nullptr);
+        return true;
+    }
+    if ((RT64::GetRenderHookInit() != nullptr) ||
+        (RT64::GetRenderHookDraw() != draw_hook_dispatch) ||
+        (RT64::GetRenderHookDeinit() != nullptr)) {
+        set_error(error, error_capacity, "RT64 render hooks are already owned by another embedder");
+        return false;
+    }
+    return true;
+}
+
 extern "C" int fn64_rt64_enable_present_capture(
     Fn64Rt64Context *context,
     char *error,
@@ -4228,18 +4369,7 @@ extern "C" int fn64_rt64_enable_present_capture(
         if (context->present_capture_enabled) {
             return 1;
         }
-        if (present_capture_contexts.empty()) {
-            if ((RT64::GetRenderHookInit() != nullptr) ||
-                (RT64::GetRenderHookDraw() != nullptr) ||
-                (RT64::GetRenderHookDeinit() != nullptr)) {
-                set_error(error, error_capacity, "RT64 render hooks are already owned by another embedder");
-                return 0;
-            }
-            RT64::SetRenderHooks(nullptr, capture_present_draw, nullptr);
-        } else if ((RT64::GetRenderHookInit() != nullptr) ||
-                   (RT64::GetRenderHookDraw() != capture_present_draw) ||
-                   (RT64::GetRenderHookDeinit() != nullptr)) {
-            set_error(error, error_capacity, "RT64 present-capture hook ownership changed");
+        if (!ensure_draw_hook_dispatch_installed(error, error_capacity)) {
             return 0;
         }
         present_capture_contexts.push_back(context);
@@ -4250,6 +4380,76 @@ extern "C" int fn64_rt64_enable_present_capture(
         return 0;
     } catch (...) {
         set_error(error, error_capacity, "RT64 present-capture enable failed with an unknown C++ exception");
+        return 0;
+    }
+}
+
+// fn64-rmlui's own registration entry point (and any future second overlay
+// draw-hook caller). context->setup_complete gates this the same way as
+// present-capture, since ensure_draw_hook_dispatch_installed touches the
+// same process-global RT64 hook slot either function may need to install.
+extern "C" int fn64_rt64_register_overlay_draw(
+    Fn64Rt64Context *context,
+    void (*callback)(void *command_list, void *framebuffer, void *user_data),
+    void *user_data,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if ((context == nullptr) || !context->setup_complete) {
+            set_error(error, error_capacity, "RT64 context is not initialized");
+            return 0;
+        }
+        if (callback == nullptr) {
+            set_error(error, error_capacity, "null overlay draw callback");
+            return 0;
+        }
+        std::scoped_lock registry_lock(draw_hook_registry_mutex);
+        if (!ensure_draw_hook_dispatch_installed(error, error_capacity)) {
+            return 0;
+        }
+        const auto existing = std::find_if(
+            draw_hook_registrants.begin(),
+            draw_hook_registrants.end(),
+            [context](const DrawHookRegistrant &registrant) {
+                return registrant.context == context;
+            });
+        if (existing != draw_hook_registrants.end()) {
+            // Replace, not reject: a hot-reloaded UI document set
+            // re-registering is expected to just update the callback/
+            // user_data in place, mirroring fn64_rt64_enable_present_capture
+            // treating a second enable call as a no-op success rather than
+            // an error.
+            existing->callback = callback;
+            existing->user_data = user_data;
+            return 1;
+        }
+        draw_hook_registrants.push_back(DrawHookRegistrant{context, callback, user_data});
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 overlay-draw register threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 overlay-draw register failed with an unknown C++ exception");
+        return 0;
+    }
+}
+
+extern "C" int fn64_rt64_unregister_overlay_draw(
+    Fn64Rt64Context *context,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if (context == nullptr) {
+            set_error(error, error_capacity, "null RT64 context");
+            return 0;
+        }
+        unregister_overlay_draw(context);
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 overlay-draw unregister threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 overlay-draw unregister failed with an unknown C++ exception");
         return 0;
     }
 }
