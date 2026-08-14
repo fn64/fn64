@@ -81,6 +81,12 @@ unsafe extern "C" {
         class_name: *const c_char,
         enabled: c_int,
     );
+    pub(crate) fn fn64_rmlui_element_get_attribute(
+        element: *mut RawElement,
+        name: *const c_char,
+        buffer: *mut c_char,
+        buffer_capacity: usize,
+    ) -> usize;
 
     pub(crate) fn fn64_rmlui_element_on_click(
         element: *mut RawElement,

@@ -75,6 +75,20 @@ void fn64_rmlui_element_set_text(Fn64RmluiElement *element, const char *text, si
 void fn64_rmlui_element_set_attribute(Fn64RmluiElement *element, const char *name, const char *value);
 void fn64_rmlui_element_set_class(Fn64RmluiElement *element, const char *class_name, int enabled);
 
+/* Reads an attribute back as a UTF-8 string (RmlUi's `<select>`/
+ * `<input type="range">` controls keep their current selection/drag value
+ * live in the "value" attribute, so `fn64_rmlui_element_get_attribute(el,
+ * "value", ...)` from inside an on_change callback reads what the user just
+ * set). Writes into `buffer` (NUL-terminated, truncated to fit
+ * buffer_capacity) and returns the untruncated length the attribute would
+ * need, matching `fn64_rmlui_last_error`'s "capacity, not ownership" shape;
+ * returns 0 and an empty buffer if the element has no such attribute. */
+size_t fn64_rmlui_element_get_attribute(
+    Fn64RmluiElement *element,
+    const char *name,
+    char *buffer,
+    size_t buffer_capacity);
+
 /* Event callbacks ---------------------------------------------------------
  * `user_data` is an opaque pointer the Rust side controls (typically a
  * boxed closure or a slot index into a Rust-side table); this shim never

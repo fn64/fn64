@@ -52,6 +52,54 @@ use block_program::*;
 use dense_aot::*;
 use settings_menu::SettingsMenu;
 
+/// One settings-menu UI change, queued by an `on_click`/`on_change`
+/// callback and drained by `Shell::drain_menu_ui_events` on the next
+/// `about_to_wait` tick.
+///
+/// RmlUi's C ABI event callback is a plain function pointer plus one
+/// `void *user_data` (see `fn64_rmlui::Element::on_change`'s own doc
+/// comment) -- it has no route back to `&mut Shell`, only to the one
+/// `&mut Element` it fired on. Queuing here, applying from `Shell` on the
+/// next tick, is the standard way to bridge a C-callback event source into
+/// code that needs real application state, and mirrors how
+/// `MENU_UI_EVENTS` is a thread-local rather than a `Shell` field for the
+/// same reason a boxed closure can capture it but not `&mut Shell`.
+#[cfg(feature = "rmlui")]
+enum MenuUiEvent {
+    SelectTab(settings_menu::Tab),
+    ArmCapture(settings_menu::Capture),
+    FieldChanged(MenuUiField, String),
+}
+
+/// Which `VideoAudioSettings` field an `on_change` callback fired for.
+#[cfg(feature = "rmlui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuUiField {
+    ResolutionMultiplier,
+    Antialiasing,
+    AspectRatio,
+    AspectTarget,
+    PresentMode,
+    MasterVolume,
+}
+
+#[cfg(feature = "rmlui")]
+thread_local! {
+    static MENU_UI_EVENTS: std::cell::RefCell<Vec<MenuUiEvent>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Shared by every per-field `on_change` closure in
+/// `Shell::wire_settings_ui_callbacks`: reads the element's own live
+/// "value" attribute (what the user just selected/dragged to) and queues a
+/// `FieldChanged` event with it. A free function, not a method, since the
+/// closures passed to `fn64_rmlui::Element::on_change` cannot capture
+/// `&mut Shell` (see `MenuUiEvent`'s own doc comment).
+#[cfg(feature = "rmlui")]
+fn queue_field_change(element: &mut fn64_rmlui::Element, field: MenuUiField) {
+    let value = element.attribute("value");
+    MENU_UI_EVENTS.with(|events| events.borrow_mut().push(MenuUiEvent::FieldChanged(field, value)));
+}
+
 use fn64_recomp_rs::{
     BackedExecutableSpanV1, BackedPrecompiledGenerationCatalogV1, BankId, BlockRun, BootContext,
     CargoGeneratedProgramSourceAttestationV2, CargoGeneratedRunnerSourceBindingV1,
@@ -471,6 +519,15 @@ struct Shell {
     /// Storage returned by the prior RT64 release capture. Recovering it after
     /// each present keeps allocation and page-zeroing out of the frame path.
     rt64_capture_reuse: Vec<u8>,
+    /// The raw `Fn64Rt64Context*` `register_render_backend` obtained from the
+    /// concrete `Rt64Backend` before boxing it into `fn64_abi`'s registry --
+    /// see `Rt64Backend::settings_ui_context_ptr`'s own doc comment for why
+    /// that call site is the only place this pointer is ever obtainable.
+    /// `None` for the reference backend (no RT64 context exists) or if RT64
+    /// creation somehow left no context, though `register_render_backend`
+    /// already panics before returning in that case.
+    #[cfg(feature = "rmlui")]
+    settings_ui_context_ptr: Option<*mut std::ffi::c_void>,
 }
 
 /// The rasterizer in use, and therefore which of the two present paths runs.
@@ -768,7 +825,8 @@ impl Shell {
             fn64_runtime::SaveType::SramBanked,
         )));
 
-        let active_renderer = Self::register_render_backend();
+        #[cfg_attr(not(feature = "rmlui"), allow(unused_variables))]
+        let (active_renderer, settings_ui_context_ptr) = Self::register_render_backend();
 
         let mut program = fn64_recomp_rs::BlockProgram::new();
         // Destination history is a diagnostic ring the batch lane reads after a
@@ -862,6 +920,8 @@ impl Shell {
                 .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
             active_renderer,
             rt64_capture_reuse: Vec::new(),
+            #[cfg(feature = "rmlui")]
+            settings_ui_context_ptr,
         }
     }
 
@@ -892,7 +952,7 @@ impl Shell {
     /// served, and that trap cost real confusion
     /// (`docs/plans/perf-method.md`, the caveat section). A backend selector
     /// whose off lane is silently the on lane is worse than no selector.
-    fn register_render_backend() -> ActiveRenderer {
+    fn register_render_backend() -> (ActiveRenderer, Option<*mut std::ffi::c_void>) {
         use fn64_render::RenderBackend as _;
         let requested = fn64_boot_harness::parse_release_env_value(
             "FN64_RENDER",
@@ -901,6 +961,14 @@ impl Shell {
         .unwrap_or_else(|error| panic!("wm2000-shell: {error}"))
         .unwrap_or_else(|| "rt64".to_string())
         .to_ascii_lowercase();
+
+        // Populated only for the "rt64" arm below -- see
+        // `Rt64Backend::settings_ui_context_ptr`'s own doc comment for why
+        // this is the one and only place a raw `Fn64Rt64Context*` can still
+        // be obtained (the concrete backend is boxed into `fn64_abi`'s
+        // non-downcastable registry a few lines below this match).
+        #[cfg_attr(not(feature = "rmlui"), allow(unused_mut))]
+        let mut settings_ui_context_ptr: Option<*mut std::ffi::c_void> = None;
 
         let (backend, active): (Box<dyn fn64_render::RenderBackend>, ActiveRenderer) =
             match requested.as_str() {
@@ -950,6 +1018,17 @@ impl Shell {
                              pixels back into the window; enable failed: {error}"
                         )
                     });
+                    #[cfg(feature = "rmlui")]
+                    {
+                        settings_ui_context_ptr =
+                            Some(backend.settings_ui_context_ptr().unwrap_or_else(|error| {
+                                panic!(
+                                    "wm2000-shell: FN64_RENDER=rt64 needs a settings-UI context \
+                                     pointer for the F1 menu to render; this should be \
+                                     unreachable right after a successful create(): {error}"
+                                )
+                            }));
+                    }
                     (Box::new(backend), ActiveRenderer::Rt64)
                 }
                 value => panic!(
@@ -969,7 +1048,7 @@ impl Shell {
             ActiveRenderer::Rt64 => "rt64",
         };
         println!("[wm2000-shell] registered {label} renderer ({FB_WIDTH}x{FB_HEIGHT})");
-        active
+        (active, settings_ui_context_ptr)
     }
 
     /// Run the guest until it produces one VI field, then return.
@@ -1170,30 +1249,283 @@ impl Shell {
     }
 
     /// Construct the live RmlUi context/document on first open, if not
-    /// already built. A no-op today: see `settings_menu.rs`'s own top-of-
-    /// file doc comment for exactly why a live `fn64_rmlui::Context` is not
-    /// yet constructible from `Shell` at all (no route to a raw
-    /// `Fn64Rt64Context*` once `register_render_backend` has moved the
-    /// concrete `Rt64Backend` into `fn64_abi`'s registry). This method
-    /// exists now, and is called from the one correct call site
-    /// (menu-open, once), so wiring up construction later is a change
-    /// entirely inside this one function.
+    /// already built. Needs `self.settings_ui_context_ptr` -- `None` only
+    /// for the reference backend (no RT64 context exists at all) or if
+    /// `FN64_RENDER=rt64` failed to obtain one, though
+    /// `register_render_backend` already panics before returning in that
+    /// second case, so `None` here in practice means "reference backend,
+    /// no settings UI to show."
     #[cfg(feature = "rmlui")]
     fn ensure_settings_ui(&mut self) {
         if self.menu.ui.is_some() {
             return;
         }
-        // No route to a raw Fn64Rt64Context* exists from here today (see
-        // this function's own doc comment) -- left unbuilt rather than
-        // guessed at. When that seam exists, this becomes:
-        //   let context = unsafe {
-        //       fn64_rmlui::Context::create(rt64_context_ptr, w, h)
-        //   }?;
-        //   let mut document = context.load_document_from_memory(
-        //       settings_menu::SETTINGS_RML, "settings.rml")?;
-        //   document.show();
-        //   self.menu.ui = Some(settings_menu::SettingsUi { context, document });
-        //   self.sync_menu_ui_from_settings();
+        let Some(rt64_context_ptr) = self.settings_ui_context_ptr else {
+            eprintln!(
+                "[wm2000-shell] settings menu has nothing to render: FN64_RENDER=reference has \
+                 no RT64 context for RmlUi to draw into"
+            );
+            return;
+        };
+        // SAFETY: `rt64_context_ptr` is the live `Fn64Rt64Context*` obtained
+        // from `register_render_backend`'s own concrete `Rt64Backend`
+        // before it was boxed into `fn64_abi`'s registry; that backend is
+        // registered for the remaining lifetime of this process (never
+        // re-created or torn down), so the pointer stays valid for as long
+        // as `Shell` itself does, which outlives this call.
+        let mut context = match unsafe {
+            fn64_rmlui::Context::create(rt64_context_ptr, self.fb_width as u32, self.fb_height as u32)
+        } {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("[wm2000-shell] fn64_rmlui::Context::create failed: {error}");
+                return;
+            }
+        };
+        let mut document =
+            match context.load_document_from_memory(settings_menu::SETTINGS_RML, "settings.rml") {
+                Ok(document) => document,
+                Err(error) => {
+                    eprintln!("[wm2000-shell] failed to load settings.rml: {error}");
+                    return;
+                }
+            };
+        document.show();
+        self.menu.ui = Some(settings_menu::SettingsUi { context, document });
+        self.wire_settings_ui_callbacks();
+        self.sync_menu_ui_from_settings();
+        println!("[wm2000-shell] settings menu UI constructed");
+    }
+
+    /// Attach every control's `on_change` (and the Input tab's bindings'
+    /// `on_click`) exactly once, right after the document is first loaded.
+    /// RmlUi's `AddEventListener` has no "replace" semantics (see
+    /// `fn64_rmlui::Element::on_click`'s own doc comment), so this must
+    /// never run more than once per document -- `ensure_settings_ui`'s own
+    /// `self.menu.ui.is_some()` early return is what guarantees that.
+    #[cfg(feature = "rmlui")]
+    fn wire_settings_ui_callbacks(&mut self) {
+        let Some(ui) = self.menu.ui.as_mut() else {
+            return;
+        };
+        let document = &mut ui.document;
+
+        document
+            .require_element(settings_menu::Tab::Video.tab_button_id())
+            .on_click(|_element| {
+                MENU_UI_EVENTS.with(|events| events.borrow_mut().push(MenuUiEvent::SelectTab(settings_menu::Tab::Video)));
+            });
+        document
+            .require_element(settings_menu::Tab::Audio.tab_button_id())
+            .on_click(|_element| {
+                MENU_UI_EVENTS.with(|events| events.borrow_mut().push(MenuUiEvent::SelectTab(settings_menu::Tab::Audio)));
+            });
+        document
+            .require_element(settings_menu::Tab::Input.tab_button_id())
+            .on_click(|_element| {
+                MENU_UI_EVENTS.with(|events| events.borrow_mut().push(MenuUiEvent::SelectTab(settings_menu::Tab::Input)));
+            });
+
+        document
+            .require_element("video_resolution_multiplier")
+            .on_change(|element| queue_field_change(element, MenuUiField::ResolutionMultiplier));
+        document
+            .require_element("video_antialiasing")
+            .on_change(|element| queue_field_change(element, MenuUiField::Antialiasing));
+        document
+            .require_element("video_aspect_ratio")
+            .on_change(|element| queue_field_change(element, MenuUiField::AspectRatio));
+        document
+            .require_element("video_aspect_target")
+            .on_change(|element| queue_field_change(element, MenuUiField::AspectTarget));
+        document
+            .require_element("video_present_mode")
+            .on_change(|element| queue_field_change(element, MenuUiField::PresentMode));
+        document
+            .require_element("audio_master_volume")
+            .on_change(|element| queue_field_change(element, MenuUiField::MasterVolume));
+
+        for (element_id, capture) in settings_menu::SettingsMenu::binding_slots() {
+            let capture = capture;
+            document.require_element(element_id).on_click(move |_element| {
+                MENU_UI_EVENTS.with(|events| events.borrow_mut().push(MenuUiEvent::ArmCapture(capture)));
+            });
+        }
+    }
+
+    /// Push this menu's current `VideoAudioSettings` into the live RmlUi
+    /// document -- called once right after construction, and again any time
+    /// settings are changed from outside the UI (there is currently no such
+    /// path, but this keeps the UI-from-state direction real rather than
+    /// assumed).
+    #[cfg(feature = "rmlui")]
+    fn sync_menu_ui_from_settings(&mut self) {
+        let settings = self.menu.settings.clone();
+        let Some(ui) = self.menu.ui.as_mut() else {
+            return;
+        };
+        let document = &mut ui.document;
+        for tab in settings_menu::Tab::ALL {
+            document
+                .require_element(tab.panel_id())
+                .set_class("active", tab == self.menu.active_tab);
+            document
+                .require_element(tab.tab_button_id())
+                .set_class("active", tab == self.menu.active_tab);
+        }
+        document
+            .require_element("video_resolution_multiplier")
+            .set_attribute("value", &settings.resolution_multiplier.to_string());
+        document
+            .require_element("video_resolution_multiplier_value")
+            .set_text(&format!("{:.2}x", settings.resolution_multiplier));
+        document
+            .require_element("video_antialiasing")
+            .set_attribute("value", &(settings.antialiasing as i32).to_string());
+        document
+            .require_element("video_aspect_ratio")
+            .set_attribute("value", &(settings.aspect_ratio as i32).to_string());
+        document
+            .require_element("video_aspect_target")
+            .set_attribute("value", &settings.aspect_target.to_string());
+        document
+            .require_element("video_aspect_target_value")
+            .set_text(&format!("{:.2}", settings.aspect_target));
+        document
+            .require_element("video_present_mode")
+            .set_attribute("value", &(settings.present_mode as i32).to_string());
+        document
+            .require_element("audio_master_volume")
+            .set_attribute("value", &settings.master_volume.to_string());
+        document
+            .require_element("audio_master_volume_value")
+            .set_text(&format!("{:.0}%", settings.master_volume * 100.0));
+    }
+
+    /// Drain `MENU_UI_EVENTS` (populated synchronously by RmlUi event
+    /// callbacks during `fn64_rmlui::Context::update`, called from
+    /// `about_to_wait` while the menu is open) and apply each to
+    /// `self.menu`. Kept separate from the callbacks themselves because a
+    /// callback only has `&mut Element`, not `&mut Shell` -- RmlUi's C ABI
+    /// callback has no route back to arbitrary Rust state beyond the one
+    /// `Element` it fired on (see `fn64_rmlui::Element::on_change`'s own
+    /// doc comment on why callbacks are boxed/leaked rather than closures
+    /// over `Shell`).
+    #[cfg(feature = "rmlui")]
+    fn drain_menu_ui_events(&mut self) {
+        let events = MENU_UI_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()));
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match event {
+                MenuUiEvent::SelectTab(tab) => {
+                    self.menu.active_tab = tab;
+                }
+                MenuUiEvent::ArmCapture(capture) => {
+                    self.menu.capture = Some(capture);
+                }
+                MenuUiEvent::FieldChanged(field, value) => {
+                    self.apply_menu_field_change(field, &value);
+                }
+            }
+        }
+        self.sync_menu_ui_from_settings();
+        self.apply_live_render_settings();
+    }
+
+    /// One field's raw `<select>`/`<input>` string value, parsed and written
+    /// into `self.menu.settings`, marking it dirty on any successful change.
+    /// Malformed values (should not happen -- `settings.rml`'s own controls
+    /// only ever emit values these parsers accept) are logged and ignored
+    /// rather than panicking, since this runs from a UI event, not a
+    /// programmer-controlled call site.
+    #[cfg(feature = "rmlui")]
+    fn apply_menu_field_change(&mut self, field: MenuUiField, value: &str) {
+        let settings = &mut self.menu.settings;
+        let ok = match field {
+            MenuUiField::ResolutionMultiplier => value.parse::<f64>().is_ok_and(|parsed| {
+                settings.resolution_multiplier = parsed;
+                settings.resolution = settings_menu::ResolutionMode::Manual;
+                true
+            }),
+            MenuUiField::Antialiasing => settings_menu::AntialiasingMode::from_select_value(value)
+                .is_some_and(|parsed| {
+                    settings.antialiasing = parsed;
+                    true
+                }),
+            MenuUiField::AspectRatio => settings_menu::AspectRatioMode::from_select_value(value)
+                .is_some_and(|parsed| {
+                    settings.aspect_ratio = parsed;
+                    true
+                }),
+            MenuUiField::AspectTarget => value.parse::<f64>().is_ok_and(|parsed| {
+                settings.aspect_target = parsed;
+                true
+            }),
+            MenuUiField::PresentMode => settings_menu::PresentModeSetting::from_select_value(value)
+                .is_some_and(|parsed| {
+                    settings.present_mode = parsed;
+                    true
+                }),
+            MenuUiField::MasterVolume => value.parse::<f32>().is_ok_and(|parsed| {
+                settings.master_volume = parsed.clamp(0.0, 1.0);
+                true
+            }),
+        };
+        if ok {
+            self.menu.dirty = true;
+        } else {
+            eprintln!(
+                "[wm2000-shell] settings menu: ignoring malformed {field:?} value {value:?}"
+            );
+        }
+    }
+
+    /// Push the subset of `self.menu.settings` RT64 owns into the live
+    /// backend via `RenderBackend::apply_runtime_settings` -- the trait
+    /// method every `RenderBackend`, RT64 or reference, already implements,
+    /// so this does not need (or want) the raw context pointer
+    /// `ensure_settings_ui` uses: settings live-apply was never blocked by
+    /// the "no downcasting" rule the way rendering was, because
+    /// `apply_runtime_settings` is part of the trait object's own public
+    /// surface (`fn64_abi::capture_render_release_frame`'s "never downcast"
+    /// rule is about reaching past the trait object for backend-specific
+    /// state, not about calling the trait's own methods through it).
+    #[cfg(feature = "rmlui")]
+    fn apply_live_render_settings(&mut self) {
+        let settings = match self.menu.settings.to_render_runtime_settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("[wm2000-shell] settings menu: not applying, {error}");
+                return;
+            }
+        };
+        match fn64_abi::apply_render_runtime_settings(&settings) {
+            Ok(fn64_render::RenderSettingsApply::LiveApplied {
+                framebuffers_discarded,
+                ..
+            }) => {
+                if framebuffers_discarded {
+                    println!(
+                        "[wm2000-shell] settings menu: applied (framebuffers were discarded)"
+                    );
+                }
+            }
+            Ok(fn64_render::RenderSettingsApply::StagedForCreate { .. }) => {
+                // No context yet (reference backend, or RT64 not yet
+                // created) -- nothing to apply live; the setting still took
+                // effect in self.menu.settings and will be persisted.
+            }
+            Ok(fn64_render::RenderSettingsApply::RestartRequired { .. }) => {
+                eprintln!(
+                    "[wm2000-shell] settings menu: this change needs a restart to take effect"
+                );
+            }
+            Err(error) => {
+                eprintln!("[wm2000-shell] settings menu: live-apply failed: {error}");
+            }
+        }
     }
 
     #[cfg(not(feature = "rmlui"))]
@@ -1908,10 +2240,29 @@ impl ApplicationHandler for Shell {
         // behaviour; the default is now no-vsync so the emulator's own pacing
         // governs, and tearing is preferable to a 1.5x frame-time penalty on a
         // guest that already fits its budget.
-        let present_mode = match std::env::var("FN64_PRESENT_MODE").as_deref() {
-            Ok("vsync") => pixels::wgpu::PresentMode::AutoVsync,
-            Ok("mailbox") => pixels::wgpu::PresentMode::Mailbox,
-            _ => pixels::wgpu::PresentMode::AutoNoVsync,
+        // FN64_PRESENT_MODE still wins if set (unchanged precedence); with it
+        // unset, the persisted settings-menu choice is the fallback default
+        // instead of the old hardcoded AutoNoVsync -- see
+        // `VideoAudioSettings::present_mode`'s own doc comment for why this
+        // is the one settings-menu field this shell cannot live-apply
+        // (`Pixels`' present mode is fixed at surface-build time; changing
+        // it takes effect on the next launch, not immediately on commit).
+        let present_mode = match std::env::var("FN64_PRESENT_MODE") {
+            Ok(value) => match value.as_str() {
+                "vsync" => pixels::wgpu::PresentMode::AutoVsync,
+                "mailbox" => pixels::wgpu::PresentMode::Mailbox,
+                _ => pixels::wgpu::PresentMode::AutoNoVsync,
+            },
+            Err(_) => {
+                #[cfg(feature = "rmlui")]
+                {
+                    self.menu.settings.present_mode.to_wgpu()
+                }
+                #[cfg(not(feature = "rmlui"))]
+                {
+                    pixels::wgpu::PresentMode::AutoNoVsync
+                }
+            }
         };
         println!("[wm2000-shell] present mode: {present_mode:?}");
         match PixelsBuilder::new(self.fb_width as u32, self.fb_height as u32, surface)
@@ -2043,6 +2394,11 @@ impl ApplicationHandler for Shell {
             #[cfg(feature = "rmlui")]
             if let Some(ui) = self.menu.ui.as_mut() {
                 ui.context.update();
+                // `update()` is where RmlUi dispatches queued input events
+                // and fires on_change/on_click listeners synchronously, so
+                // MENU_UI_EVENTS is only ever non-empty right after this
+                // call returns.
+                self.drain_menu_ui_events();
             }
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw();

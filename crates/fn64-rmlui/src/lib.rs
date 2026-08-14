@@ -335,6 +335,47 @@ impl Element {
         };
     }
 
+    /// Read an attribute back as a UTF-8 string. RmlUi's `<select>`/
+    /// `<input type="range">` controls keep their current selection/drag
+    /// value live in the "value" attribute, so `attribute("value")` from
+    /// inside an `on_change` callback reads what the user just set. Returns
+    /// an empty string if the element has no such attribute (RmlUi's own
+    /// `GetAttribute` default), or if `name` is not representable as a C
+    /// string.
+    pub fn attribute(&self, name: &str) -> String {
+        let Ok(name) = CString::new(name) else {
+            return String::new();
+        };
+        let mut buffer = vec![0_u8; 128];
+        // SAFETY: the element is alive; `buffer` is writable for its full
+        // capacity for the duration of this synchronous call.
+        let needed = unsafe {
+            ffi::fn64_rmlui_element_get_attribute(
+                self.0.as_ptr(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if needed >= buffer.len() {
+            // The shim reports the untruncated length even when it had to
+            // truncate to fit; retry once with a buffer sized to it.
+            buffer = vec![0_u8; needed + 1];
+            // SAFETY: same as above, with a buffer now sized to hold the
+            // full value plus its NUL terminator.
+            unsafe {
+                ffi::fn64_rmlui_element_get_attribute(
+                    self.0.as_ptr(),
+                    name.as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+        }
+        let nul_at = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+        String::from_utf8_lossy(&buffer[..nul_at]).into_owned()
+    }
+
     pub fn set_class(&mut self, class_name: &str, enabled: bool) {
         let Ok(class_name) = CString::new(class_name) else {
             return;
