@@ -72,6 +72,8 @@ mod input_map;
 mod gamepad;
 #[path = "../../../crates/fn64-shell/src/timing.rs"]
 mod timing;
+#[path = "../../../crates/fn64-shell/src/rt64_aa_experiment.rs"]
+mod rt64_aa_experiment;
 
 use framebuffer::{FB_HEIGHT, FB_WIDTH};
 use gamepad::Gamepads;
@@ -458,6 +460,11 @@ struct Shell {
     /// forever -- the RT64 image has to come back through
     /// `fn64_abi::capture_render_release_frame`.
     active_renderer: ActiveRenderer,
+    /// Optional strict TOML image reloaded by F6. The path is captured once at
+    /// startup; changing process environment after boot is not a settings API.
+    rt64_settings_path: Option<std::path::PathBuf>,
+    /// Index into `Rt64AaPreset::ALL`; F7 advances only after an apply succeeds.
+    rt64_aa_preset_index: usize,
     /// Storage returned by the prior RT64 release capture. Recovering it after
     /// each present keeps allocation and page-zeroing out of the frame path.
     rt64_capture_reuse: Vec<u8>,
@@ -744,6 +751,31 @@ impl Shell {
         )));
 
         let active_renderer = Self::register_render_backend();
+        let rt64_settings_path = fn64_boot_harness::parse_release_env_value(
+            "FN64_RT64_SETTINGS_FILE",
+            std::env::var_os("FN64_RT64_SETTINGS_FILE"),
+        )
+        .unwrap_or_else(|error| panic!("wm2000-shell: {error}"))
+        .map(std::path::PathBuf::from);
+        if let Some(path) = rt64_settings_path.as_deref() {
+            assert!(
+                path.is_absolute(),
+                "wm2000-shell: FN64_RT64_SETTINGS_FILE must be an absolute path, got {}",
+                path.display()
+            );
+        }
+        if let Some(path) = rt64_settings_path.as_deref() {
+            let settings = rt64_aa_experiment::load(path)
+                .unwrap_or_else(|error| panic!("wm2000-shell: {error}"));
+            assert!(
+                Self::apply_rt64_runtime_settings(
+                    active_renderer,
+                    &format!("config:{}", path.display()),
+                    &settings,
+                ),
+                "wm2000-shell: startup RT64 settings were not applied"
+            );
+        }
 
         let mut program = fn64_recomp_rs::BlockProgram::new();
         // Destination history is a diagnostic ring the batch lane reads after a
@@ -834,6 +866,8 @@ impl Shell {
             schedule: std::env::var_os("FN64_CONTROLLER_SCHEDULE")
                 .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
             active_renderer,
+            rt64_settings_path,
+            rt64_aa_preset_index: 0,
             rt64_capture_reuse: Vec::new(),
         }
     }
@@ -942,7 +976,89 @@ impl Shell {
             ActiveRenderer::Rt64 => "rt64",
         };
         println!("[wm2000-shell] registered {label} renderer ({FB_WIDTH}x{FB_HEIGHT})");
+        if active == ActiveRenderer::Rt64 {
+            println!(
+                "[wm2000-shell] RT64 AA experiment: F7 cycles native/high-2x/box-SSAA/MSAA; \
+                 F6 reloads FN64_RT64_SETTINGS_FILE"
+            );
+        }
         active
+    }
+
+    fn apply_rt64_runtime_settings(
+        active_renderer: ActiveRenderer,
+        label: &str,
+        settings: &fn64_render::RenderRuntimeSettings,
+    ) -> bool {
+        if active_renderer != ActiveRenderer::Rt64 {
+            eprintln!(
+                "[wm2000-shell] RT64 settings {label:?} rejected: active renderer is reference"
+            );
+            return false;
+        }
+        let sha256 = rt64_aa_experiment::settings_sha256_hex(settings);
+        match fn64_abi::apply_render_runtime_settings(settings) {
+            Ok(fn64_render::RenderSettingsApply::LiveApplied {
+                framebuffers_discarded,
+                ..
+            }) => {
+                println!(
+                    "[wm2000-shell] RT64 settings applied: mode={label} sha256={sha256} \
+                     framebuffers_discarded={framebuffers_discarded}"
+                );
+                true
+            }
+            Ok(fn64_render::RenderSettingsApply::RestartRequired { fields, .. }) => {
+                eprintln!(
+                    "[wm2000-shell] RT64 settings {label:?} require renderer restart for \
+                     {fields:?}; active settings are unchanged"
+                );
+                false
+            }
+            Ok(fn64_render::RenderSettingsApply::StagedForCreate { .. }) => {
+                eprintln!(
+                    "[wm2000-shell] RT64 settings {label:?} were only staged after renderer \
+                     registration; active settings are unknown"
+                );
+                false
+            }
+            Err(error) => {
+                eprintln!("[wm2000-shell] RT64 settings {label:?} failed: {error}");
+                false
+            }
+        }
+    }
+
+    fn cycle_rt64_aa_preset(&mut self) {
+        let next = (self.rt64_aa_preset_index + 1) % rt64_aa_experiment::Rt64AaPreset::ALL.len();
+        let preset = rt64_aa_experiment::Rt64AaPreset::ALL[next];
+        if Self::apply_rt64_runtime_settings(
+            self.active_renderer,
+            preset.label(),
+            &preset.settings(),
+        ) {
+            self.rt64_aa_preset_index = next;
+        }
+    }
+
+    fn reload_rt64_settings(&mut self) {
+        let Some(path) = self.rt64_settings_path.as_deref() else {
+            eprintln!(
+                "[wm2000-shell] F6 reload rejected: set FN64_RT64_SETTINGS_FILE to an exact \
+                 TOML file before launch"
+            );
+            return;
+        };
+        match rt64_aa_experiment::load(path) {
+            Ok(settings) => {
+                Self::apply_rt64_runtime_settings(
+                    self.active_renderer,
+                    &format!("config:{}", path.display()),
+                    &settings,
+                );
+            }
+            Err(error) => eprintln!("[wm2000-shell] F6 reload failed: {error}"),
+        }
     }
 
     /// Run the guest until it produces one VI field, then return.
@@ -1674,6 +1790,14 @@ impl ApplicationHandler for Shell {
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
+                    if code == KeyCode::F6 && pressed {
+                        self.reload_rt64_settings();
+                        return;
+                    }
+                    if code == KeyCode::F7 && pressed {
+                        self.cycle_rt64_aa_preset();
+                        return;
+                    }
                     if code == KeyCode::F11 && pressed {
                         if let Some(window) = self.window.as_ref() {
                             let next = match window.fullscreen() {
