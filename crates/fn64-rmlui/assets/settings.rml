@@ -1,0 +1,294 @@
+<rml>
+<head>
+	<title>fn64 Settings</title>
+	<style>
+	body
+	{
+		width: 640dp;
+		height: 440dp;
+		margin: auto;
+		background-color: #14141799;
+		border: 2dp #2A2A2F;
+		padding: 18dp;
+		font-size: 15dp;
+		color: #E8E6E1;
+	}
+
+	#tab_strip
+	{
+		display: block;
+		width: 100%;
+		height: 40dp;
+		margin-bottom: 12dp;
+	}
+
+	#tab_strip button
+	{
+		display: inline-block;
+		width: 120dp;
+		height: 36dp;
+		margin-right: 6dp;
+		text-align: center;
+		color: #8A8883;
+		background-color: #1E1E22;
+		border: 1dp #2A2A2F;
+	}
+
+	#tab_strip button.tab-active
+	{
+		color: #E8E6E1;
+		background-color: #2A2A2F;
+		border: 1dp #2E64FE;
+	}
+
+	.panel
+	{
+		display: none;
+		width: 100%;
+	}
+
+	.panel.panel-visible
+	{
+		display: block;
+	}
+
+	.row
+	{
+		display: block;
+		width: 100%;
+		height: 34dp;
+		margin-bottom: 6dp;
+	}
+
+	.row .row-label
+	{
+		display: inline-block;
+		width: 220dp;
+		color: #8A8883;
+	}
+
+	.row select,
+	.row input.text-value
+	{
+		display: inline-block;
+		width: 220dp;
+		color: #E8E6E1;
+		background-color: #1E1E22;
+		border: 1dp #2A2A2F;
+	}
+
+	.row input[type="range"]
+	{
+		display: inline-block;
+		width: 220dp;
+	}
+
+	.row-value
+	{
+		display: inline-block;
+		width: 60dp;
+		color: #F5B301;
+		text-align: right;
+	}
+
+	#footer
+	{
+		display: block;
+		width: 100%;
+		margin-top: 16dp;
+		color: #8A8883;
+		font-size: 12dp;
+		text-align: center;
+	}
+
+	#bind_hint
+	{
+		display: block;
+		width: 100%;
+		margin-top: 8dp;
+		color: #F5B301;
+		font-size: 13dp;
+		text-align: center;
+	}
+
+	.section-label
+	{
+		display: block;
+		width: 100%;
+		margin-top: 10dp;
+		margin-bottom: 4dp;
+		color: #8A8883;
+		font-size: 12dp;
+	}
+
+	.bind-button
+	{
+		display: inline-block;
+		width: 100dp;
+		text-align: center;
+		color: #E8E6E1;
+		background-color: #1E1E22;
+		border: 1dp #2A2A2F;
+	}
+
+	.bind-button.bind-armed
+	{
+		color: #14141B;
+		background-color: #F5B301;
+		border: 1dp #F5B301;
+	}
+	</style>
+</head>
+<body>
+	<div id="tab_strip">
+		<button id="tab_button_video" class="tab-active">Video</button>
+		<button id="tab_button_audio">Audio</button>
+		<button id="tab_button_input">Input</button>
+	</div>
+
+	<div id="panel_video" class="panel panel-visible">
+		<div class="row">
+			<span class="row-label">Resolution</span>
+			<select id="video_resolution">
+				<option value="0">Original</option>
+				<option value="1">Window Integer Scale</option>
+				<option value="2">Manual</option>
+			</select>
+		</div>
+		<div class="row" id="row_resolution_multiplier">
+			<span class="row-label">Resolution Multiplier</span>
+			<input id="video_resolution_multiplier" type="range" min="1" max="32" step="1" value="1" />
+			<span class="row-value" id="video_resolution_multiplier_value">1x</span>
+		</div>
+		<div class="row">
+			<span class="row-label">Anti-Aliasing</span>
+			<select id="video_antialiasing">
+				<option value="0">Off</option>
+				<option value="1">MSAA 2x</option>
+				<option value="2">MSAA 4x</option>
+				<option value="3">MSAA 8x</option>
+			</select>
+		</div>
+		<div class="row">
+			<span class="row-label">Aspect Ratio</span>
+			<select id="video_aspect_ratio">
+				<option value="0">Original</option>
+				<option value="1">Expand</option>
+				<option value="2">Manual</option>
+			</select>
+		</div>
+		<div class="row" id="row_aspect_target">
+			<span class="row-label">Aspect Target (x100)</span>
+			<input id="video_aspect_target" type="range" min="10" max="10000" step="1" value="1778" />
+			<span class="row-value" id="video_aspect_target_value">17.78</span>
+		</div>
+		<div class="row">
+			<span class="row-label">Present Mode</span>
+			<select id="video_present_mode">
+				<option value="0">No VSync</option>
+				<option value="1">VSync</option>
+				<option value="2">Mailbox</option>
+			</select>
+		</div>
+	</div>
+
+	<div id="panel_audio" class="panel">
+		<div class="row">
+			<span class="row-label">Master Volume</span>
+			<input id="audio_master_volume" type="range" min="0" max="100" step="1" value="100" />
+			<span class="row-value" id="audio_master_volume_value">100%</span>
+		</div>
+	</div>
+
+	<div id="panel_input" class="panel">
+		<span class="section-label">STICK</span>
+		<div class="row">
+			<span class="row-label">Stick Up</span>
+			<button class="bind-button" id="bind_stick_up">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">Stick Down</span>
+			<button class="bind-button" id="bind_stick_down">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">Stick Left</span>
+			<button class="bind-button" id="bind_stick_left">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">Stick Right</span>
+			<button class="bind-button" id="bind_stick_right">-</button>
+		</div>
+
+		<span class="section-label">FACE / TRIGGERS</span>
+		<div class="row">
+			<span class="row-label">A</span>
+			<button class="bind-button" id="bind_button_a">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">B</span>
+			<button class="bind-button" id="bind_button_b">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">Start</span>
+			<button class="bind-button" id="bind_button_start">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">Z</span>
+			<button class="bind-button" id="bind_button_z">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">L</span>
+			<button class="bind-button" id="bind_button_l">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">R</span>
+			<button class="bind-button" id="bind_button_r">-</button>
+		</div>
+
+		<span class="section-label">C-CLUSTER / D-PAD</span>
+		<div class="row">
+			<span class="row-label">C-Up</span>
+			<button class="bind-button" id="bind_button_cup">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">C-Down</span>
+			<button class="bind-button" id="bind_button_cdown">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">C-Left</span>
+			<button class="bind-button" id="bind_button_cleft">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">C-Right</span>
+			<button class="bind-button" id="bind_button_cright">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">D-Up</span>
+			<button class="bind-button" id="bind_button_dup">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">D-Down</span>
+			<button class="bind-button" id="bind_button_ddown">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">D-Left</span>
+			<button class="bind-button" id="bind_button_dleft">-</button>
+		</div>
+		<div class="row">
+			<span class="row-label">D-Right</span>
+			<button class="bind-button" id="bind_button_dright">-</button>
+		</div>
+
+		<span class="section-label">ANALOG</span>
+		<div class="row">
+			<span class="row-label">Deadzone</span>
+			<input id="input_deadzone" type="range" min="0" max="50" step="1" value="15" />
+			<span class="row-value" id="input_deadzone_value">0.15</span>
+		</div>
+	</div>
+
+	<div id="bind_hint" style="display: none;">press a key to bind -- Esc cancels</div>
+
+	<div id="footer">F1 close - F11 fullscreen - changes save on close</div>
+</body>
+</rml>
