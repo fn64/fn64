@@ -921,6 +921,30 @@ pub fn apply_render_runtime_settings(
     })
 }
 
+/// Fetch the registered backend's raw settings-UI render-context pointer
+/// through `RenderBackend::settings_ui_render_context_ptr`. Same
+/// "go through the owned trait object, never downcast, never cache the
+/// result past this one call" discipline as `apply_render_runtime_settings`
+/// above -- call this fresh every time a settings-UI overlay needs the
+/// pointer (e.g. right before `fn64_rmlui::Context::create`), never once at
+/// startup and held: the concrete backend can invalidate and later recreate
+/// its native context out from under a cached copy (RT64's own
+/// `invalidate_native_state`, reached from several ordinary
+/// task-processing error paths), which is exactly the staleness this
+/// function's per-call re-derivation exists to avoid.
+pub fn settings_ui_render_context_ptr(
+) -> Result<*mut std::ffi::c_void, fn64_render::RenderError> {
+    RENDER_BACKEND.with(|cell| {
+        let registered = cell.borrow();
+        let backend = registered
+            .as_ref()
+            .ok_or(fn64_render::RenderError::NotReady(
+                "settings_ui_render_context_ptr: no render backend registered",
+            ))?;
+        backend.settings_ui_render_context_ptr()
+    })
+}
+
 /// Snapshot the concrete registered backend and graphics execution policy.
 /// The backend self-reports through the trait object; callers cannot attach a
 /// separate label after registration.

@@ -519,15 +519,6 @@ struct Shell {
     /// Storage returned by the prior RT64 release capture. Recovering it after
     /// each present keeps allocation and page-zeroing out of the frame path.
     rt64_capture_reuse: Vec<u8>,
-    /// The raw `Fn64Rt64Context*` `register_render_backend` obtained from the
-    /// concrete `Rt64Backend` before boxing it into `fn64_abi`'s registry --
-    /// see `Rt64Backend::settings_ui_context_ptr`'s own doc comment for why
-    /// that call site is the only place this pointer is ever obtainable.
-    /// `None` for the reference backend (no RT64 context exists) or if RT64
-    /// creation somehow left no context, though `register_render_backend`
-    /// already panics before returning in that case.
-    #[cfg(feature = "rmlui")]
-    settings_ui_context_ptr: Option<*mut std::ffi::c_void>,
 }
 
 /// The rasterizer in use, and therefore which of the two present paths runs.
@@ -825,8 +816,7 @@ impl Shell {
             fn64_runtime::SaveType::SramBanked,
         )));
 
-        #[cfg_attr(not(feature = "rmlui"), allow(unused_variables))]
-        let (active_renderer, settings_ui_context_ptr) = Self::register_render_backend();
+        let active_renderer = Self::register_render_backend();
 
         let mut program = fn64_recomp_rs::BlockProgram::new();
         // Destination history is a diagnostic ring the batch lane reads after a
@@ -920,8 +910,6 @@ impl Shell {
                 .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
             active_renderer,
             rt64_capture_reuse: Vec::new(),
-            #[cfg(feature = "rmlui")]
-            settings_ui_context_ptr,
         }
     }
 
@@ -952,7 +940,7 @@ impl Shell {
     /// served, and that trap cost real confusion
     /// (`docs/plans/perf-method.md`, the caveat section). A backend selector
     /// whose off lane is silently the on lane is worse than no selector.
-    fn register_render_backend() -> (ActiveRenderer, Option<*mut std::ffi::c_void>) {
+    fn register_render_backend() -> ActiveRenderer {
         use fn64_render::RenderBackend as _;
         let requested = fn64_boot_harness::parse_release_env_value(
             "FN64_RENDER",
@@ -961,14 +949,6 @@ impl Shell {
         .unwrap_or_else(|error| panic!("wm2000-shell: {error}"))
         .unwrap_or_else(|| "rt64".to_string())
         .to_ascii_lowercase();
-
-        // Populated only for the "rt64" arm below -- see
-        // `Rt64Backend::settings_ui_context_ptr`'s own doc comment for why
-        // this is the one and only place a raw `Fn64Rt64Context*` can still
-        // be obtained (the concrete backend is boxed into `fn64_abi`'s
-        // non-downcastable registry a few lines below this match).
-        #[cfg_attr(not(feature = "rmlui"), allow(unused_mut))]
-        let mut settings_ui_context_ptr: Option<*mut std::ffi::c_void> = None;
 
         let (backend, active): (Box<dyn fn64_render::RenderBackend>, ActiveRenderer) =
             match requested.as_str() {
@@ -1018,17 +998,6 @@ impl Shell {
                              pixels back into the window; enable failed: {error}"
                         )
                     });
-                    #[cfg(feature = "rmlui")]
-                    {
-                        settings_ui_context_ptr =
-                            Some(backend.settings_ui_context_ptr().unwrap_or_else(|error| {
-                                panic!(
-                                    "wm2000-shell: FN64_RENDER=rt64 needs a settings-UI context \
-                                     pointer for the F1 menu to render; this should be \
-                                     unreachable right after a successful create(): {error}"
-                                )
-                            }));
-                    }
                     (Box::new(backend), ActiveRenderer::Rt64)
                 }
                 value => panic!(
@@ -1048,7 +1017,7 @@ impl Shell {
             ActiveRenderer::Rt64 => "rt64",
         };
         println!("[wm2000-shell] registered {label} renderer ({FB_WIDTH}x{FB_HEIGHT})");
-        (active, settings_ui_context_ptr)
+        active
     }
 
     /// Run the guest until it produces one VI field, then return.
@@ -1249,30 +1218,42 @@ impl Shell {
     }
 
     /// Construct the live RmlUi context/document on first open, if not
-    /// already built. Needs `self.settings_ui_context_ptr` -- `None` only
-    /// for the reference backend (no RT64 context exists at all) or if
-    /// `FN64_RENDER=rt64` failed to obtain one, though
-    /// `register_render_backend` already panics before returning in that
-    /// second case, so `None` here in practice means "reference backend,
-    /// no settings UI to show."
+    /// already built.
+    ///
+    /// Fetches the raw `Fn64Rt64Context*` fresh from
+    /// `fn64_abi::settings_ui_render_context_ptr` right here, rather than
+    /// from a value cached at registration time -- `Rt64Backend::context`
+    /// can become `None` mid-process well after registration
+    /// (`invalidate_native_state`, reached from several ordinary
+    /// task-processing error paths, not just teardown), which would dangle
+    /// a cached copy with nothing to signal the staleness. Re-deriving it
+    /// on every call through the registered-backend trait-object seam
+    /// means this always observes whatever the backend's real, current
+    /// state is, never a copy that could have gone stale since an earlier
+    /// call.
     #[cfg(feature = "rmlui")]
     fn ensure_settings_ui(&mut self) {
         if self.menu.ui.is_some() {
             return;
         }
-        let Some(rt64_context_ptr) = self.settings_ui_context_ptr else {
-            eprintln!(
-                "[wm2000-shell] settings menu has nothing to render: FN64_RENDER=reference has \
-                 no RT64 context for RmlUi to draw into"
-            );
-            return;
+        let rt64_context_ptr = match fn64_abi::settings_ui_render_context_ptr() {
+            Ok(ptr) => ptr,
+            Err(error) => {
+                eprintln!(
+                    "[wm2000-shell] settings menu has nothing to render: {error} (expected for \
+                     FN64_RENDER=reference, which has no RT64 context for RmlUi to draw into)"
+                );
+                return;
+            }
         };
-        // SAFETY: `rt64_context_ptr` is the live `Fn64Rt64Context*` obtained
-        // from `register_render_backend`'s own concrete `Rt64Backend`
-        // before it was boxed into `fn64_abi`'s registry; that backend is
-        // registered for the remaining lifetime of this process (never
-        // re-created or torn down), so the pointer stays valid for as long
-        // as `Shell` itself does, which outlives this call.
+        // SAFETY: `rt64_context_ptr` was just obtained from the registered
+        // backend's own live state (`fn64_abi::settings_ui_render_context_ptr`
+        // above), synchronously, on this same thread, with nothing between
+        // that call and this one able to invalidate it (single-threaded,
+        // no re-entrancy into backend registration/invalidation from
+        // inside this function) -- it is live for the duration of this one
+        // `Context::create` call, which is the only guarantee this
+        // function needs or makes about it.
         let mut context = match unsafe {
             fn64_rmlui::Context::create(rt64_context_ptr, self.fb_width as u32, self.fb_height as u32)
         } {
@@ -1295,6 +1276,19 @@ impl Shell {
         self.wire_settings_ui_callbacks();
         self.sync_menu_ui_from_settings();
         println!("[wm2000-shell] settings menu UI constructed");
+        // KNOWN RESIDUAL GAP: this closes staleness at construction time
+        // (the pointer above is always freshly re-derived), but a
+        // `self.menu.ui` already constructed here has no way to learn if
+        // the backend's RT64 context is later invalidated out from under
+        // it while the menu stays open across that -- `~Fn64Rt64Context`
+        // does unregister its own overlay-draw slot cleanly (so the
+        // shared registry itself is not left dangling), but this crate's
+        // own `fn64_rmlui::Context`/`Fn64RmluiRenderInterface` would still
+        // be a live Rust object holding a now-stale `RenderDevice*`
+        // internally, with nothing here tearing it down. Not fixed in
+        // this pass: doing so needs either an invalidation callback RT64
+        // doesn't currently expose, or `Shell` polling backend liveness
+        // every tick, both real scope beyond re-deriving this one pointer.
     }
 
     /// Attach every control's `on_change` (and the Input tab's bindings'

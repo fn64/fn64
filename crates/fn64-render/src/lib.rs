@@ -1399,6 +1399,28 @@ pub trait RenderBackend {
         })
     }
 
+    /// A raw, backend-owned handle a UI overlay needs to render into this
+    /// backend's own device/surface (RT64's own opaque `Fn64Rt64Context*`,
+    /// for backends that have one; other backends have nothing analogous
+    /// and use the default error below).
+    ///
+    /// Deliberately a trait method rather than something a caller obtains
+    /// once and caches: the concrete backend can invalidate and later
+    /// recreate its native context (RT64's own error-recovery path does
+    /// this via `invalidate_native_state`), which would silently dangle a
+    /// cached pointer. Re-deriving this fresh on every use, through
+    /// `fn64_abi`'s existing "reach the registered backend, call one trait
+    /// method, never downcast" seam
+    /// (`fn64_abi::settings_ui_render_context_ptr`), is what keeps a caller
+    /// from ever holding a pointer across a point where it could go stale.
+    fn settings_ui_render_context_ptr(&self) -> Result<*mut std::ffi::c_void, RenderError> {
+        Err(RenderError::Backend {
+            backend: "settings-ui-render-context",
+            reason: "registered backend does not implement a settings-UI render context"
+                .to_string(),
+        })
+    }
+
     /// Stage or live-apply the complete pinned RT64 enhancement policy.
     fn apply_enhancement_settings(
         &mut self,
