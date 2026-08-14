@@ -59,6 +59,17 @@ impl Context {
             .ok_or_else(|| error_string(&error, "RT64 create failed without a diagnostic"))
     }
 
+    /// The raw `Fn64Rt64Context*`, opaque to this crate's own Rust surface
+    /// but meaningful to fn64-rmlui's shim (`fn64_rmlui_context_create`'s
+    /// `rt64` parameter). Exists only so `Rt64Backend::settings_ui_context_ptr`
+    /// can hand this out to a caller that will construct an RmlUi overlay
+    /// bound to this same device -- this crate does not interpret the
+    /// pointer itself, matching how `fn64_rt64_get_render_device` already
+    /// crosses this same boundary for the render-device pointer.
+    pub(crate) fn as_raw_ptr(&self) -> *mut c_void {
+        self.0.as_ptr().cast::<c_void>()
+    }
+
     pub(crate) fn apply_user_config(
         &mut self,
         settings: &RenderRuntimeSettings,

@@ -200,9 +200,40 @@ fn main() {
                 .is_some_and(|name| names.contains(&name))
         })
     };
-    // Matches fn64-render-rt64/build.rs: RT64 removes the conventional
-    // `lib` prefix, so stage a normal `librt64.a` in this crate's own
-    // OUT_DIR without touching the vendored checkout.
+    // This crate builds its OWN independent copy of RT64 (see this file's
+    // and ffi/CMakeLists.txt's own comments on why: no supported way to
+    // share one CMake build tree across two crates' build.rs invocations).
+    // That copy is not just a duplicate: it additionally compiles this
+    // crate's own fn64_rmlui_ui_vs.hlsl/fn64_rmlui_ui_ps.hlsl shader blobs
+    // into it (ffi/CMakeLists.txt's own shader-compilation block attaches
+    // them to `rt64` via `add_dependencies(rt64 fn64_rmlui_ui_shaders)`),
+    // so it is NOT symbol-for-symbol interchangeable with
+    // fn64-render-rt64's own independently-built `rt64.a`, even though both
+    // archives share the same on-disk filename.
+    //
+    // A prior version of this file treated the two as interchangeable --
+    // staging this crate's rt64.a under the generic name `librt64.a` but
+    // then deliberately skipping `-lrt64` for it (reasoning that
+    // fn64-render-rt64's own `-lrt64` would already satisfy the linker in
+    // any binary that links both crates). That was silently wrong the
+    // moment the two archives diverged: `wm2000-shell` (which links both
+    // fn64-render-rt64 and fn64-rmlui) resolved the single ambiguous
+    // `-lrt64` to fn64-render-rt64's copy, which has none of
+    // Fn64RmluiRenderInterface's shader symbols, producing undefined-symbol
+    // linker errors for Fn64RmluiUi{VS,PS}Blob{SPIRV,MSL} -- caught by
+    // actually linking wm2000-shell end to end, which fn64-rmlui's own
+    // standalone `cargo build -p fn64-rmlui` never exercises (it has only
+    // one `rt64.a` in scope, so the collision is invisible there).
+    //
+    // Fixed by staging this crate's rt64.a under a name that cannot collide
+    // with fn64-render-rt64's own `rt64` link name, and always linking it.
+    // Duplicate RT64 symbols between the two archives (everything except
+    // this crate's added shaders) are resolved by ordinary static-linking
+    // "first definition wins, unreferenced symbols in later archives are
+    // simply not pulled in" semantics -- this crate's `rt64` copy is listed
+    // in the link line, so ITS shader symbols get pulled in even where
+    // fn64-render-rt64's identically-named non-shader symbols are also
+    // present and already satisfied by its own archive.
     let rt64_archive = archives
         .iter()
         .find(|path| {
@@ -211,39 +242,39 @@ fn main() {
                 .is_some_and(|name| name == "rt64.a" || name == "librt64.a")
         })
         .expect("CMake did not produce the static RT64 core library");
-    let cargo_rt64 = out_dir.join("librt64.a");
+    let cargo_rt64 = out_dir.join("libfn64_rmlui_rt64.a");
     std::fs::copy(rt64_archive, &cargo_rt64).unwrap_or_else(|e| {
         panic!("failed to stage {} as {}: {e}", rt64_archive.display(), cargo_rt64.display())
     });
     println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=fn64_rmlui_rt64");
 
     // Static archive order is significant: the shim references RmlUi and
     // RT64; RT64 references the libraries that follow it. Same discipline
-    // as fn64-render-rt64/build.rs's own link-order comment.
+    // as fn64-render-rt64/build.rs's own link-order comment. rt64.a is
+    // excluded from this loop: it is staged and linked separately above,
+    // under its own fn64_rmlui_rt64 name, per this function's own comment
+    // on why it cannot share fn64-render-rt64's `-lrt64` directive.
     for (names, link_name) in [
         (&["libfn64_rmlui_shim.a"][..], "fn64_rmlui_shim"),
         (&["librmlui_debugger.a"][..], "rmlui_debugger"),
         (&["librmlui.a"][..], "rmlui"),
-        (&["librt64.a", "rt64.a"][..], "rt64"),
         (&["libre-spirv.a"][..], "re-spirv"),
         (&["libnfd.a"][..], "nfd"),
         (&["libzstd.a", "libzstd_static.a"][..], "zstd"),
         (&["libplume.a"][..], "plume"),
     ] {
-        // rt64.a is skipped here deliberately: it's staged and linked
-        // separately below as librt64.a (RT64 drops the conventional `lib`
-        // prefix, same as fn64-render-rt64/build.rs handles it).
         // rmlui_debugger is genuinely optional -- RmlUi's Debugger module
         // is added unconditionally in its own CMakeLists.txt today, but
         // this stays lenient in case a future RmlUi version/config gates
         // it, since fn64-rmlui does not need the debugger module at all.
-        let optional = link_name == "rt64" || link_name == "rmlui_debugger";
+        let optional = link_name == "rmlui_debugger";
         let found = has(names);
         assert!(
             optional || found,
             "CMake did not produce expected static library {names:?}"
         );
-        if found && (link_name != "rt64") {
+        if found {
             println!("cargo:rustc-link-lib=static={link_name}");
         }
     }

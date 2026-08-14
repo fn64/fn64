@@ -1169,9 +1169,10 @@ void capture_present_draw(
     plume::RenderFramebuffer *framebuffer) noexcept;
 void unregister_present_capture(Fn64Rt64Context *context);
 // The function actually installed via `RT64::SetRenderHooks`'s draw slot.
-// Runs `capture_present_draw` first (unchanged, so present-capture keeps
-// reading a UI-free frame), then every external registrant in
-// `draw_hook_registrants`, in registration order.
+// Runs every external registrant in `draw_hook_registrants` first (in
+// registration order), then `capture_present_draw` last, so present-capture's
+// readback captures whatever the registrants drew -- see this function's own
+// definition further down for the full ordering rationale.
 void draw_hook_dispatch(
     plume::RenderCommandList *command_list,
     plume::RenderFramebuffer *framebuffer) noexcept;
@@ -2719,11 +2720,28 @@ void capture_present_draw(
     }
 }
 
-// The function RT64::SetRenderHooks actually installs. Stage 1 is
-// present-capture's own readback, unchanged, so it keeps seeing a UI-free
-// frame. Stage 2 runs every external registrant (e.g. fn64-rmlui's overlay)
-// in registration order, strictly after stage 1's copy commands are
-// recorded into the same command list.
+// The function RT64::SetRenderHooks actually installs. Stage 1 runs every
+// external registrant (e.g. fn64-rmlui's settings-menu overlay) in
+// registration order; stage 2 is present-capture's own readback, which now
+// runs LAST so it captures whatever stage 1 drew composited into the frame.
+//
+// This ordering is deliberate and was flipped from an earlier version that
+// ran present-capture first (so it saw a UI-free frame). That was correct
+// for present-capture's original sole purpose -- a clean post-VI game frame
+// for offline evidence/diffing -- but present-capture is ALSO the one
+// readback `wm2000-shell`'s own present path uses for every frame the
+// player sees (`fn64_abi::capture_render_release_frame`, see
+// `examples/wm2000-block-boot/src/shell.rs`'s own doc comment on
+// `active_renderer`). With present-capture first, an RmlUi overlay drawn in
+// stage 2 would never reach the window -- it would be recorded into the
+// command list strictly after present-capture's copy had already been
+// issued. Running the overlay first and present-capture last makes
+// present-capture's readback the source of truth for "what actually got
+// presented," UI included, which is what a player-facing settings menu
+// requires and does not change present-capture's contract for a run with no
+// registered overlay (draw_hook_registrants is empty, so stage 1 is a no-op
+// scan of an empty vector and behavior is unchanged for every existing
+// present-capture consumer, e.g. `fn64-certification`'s evidence capture).
 //
 // The registrants are snapshot-copied out from under `draw_hook_registry_mutex`
 // before any of them run, rather than holding that mutex across the calls.
@@ -2731,14 +2749,12 @@ void capture_present_draw(
 // this function does not control the duration of, and `draw_hook_registry_mutex`
 // is the same mutex a caller's register/unregister call takes from a
 // different thread -- holding it across an unbounded foreign call invites
-// contention or deadlock for no benefit. `capture_present_draw` above holds
+// contention or deadlock for no benefit. `capture_present_draw` below holds
 // its own registry mutex for its whole (short, internal, bounded) body; that
 // shape does not extend safely to callbacks this function does not own.
 void draw_hook_dispatch(
     plume::RenderCommandList *command_list,
     plume::RenderFramebuffer *framebuffer) noexcept {
-    capture_present_draw(command_list, framebuffer);
-
     std::vector<DrawHookRegistrant> registrants;
     {
         std::scoped_lock registry_lock(draw_hook_registry_mutex);
@@ -2749,13 +2765,15 @@ void draw_hook_dispatch(
             registrant.callback(command_list, framebuffer, registrant.user_data);
         } catch (...) {
             // Crosses RT64's present loop, same discipline as
-            // capture_present_draw above: never unwind into it. An overlay
+            // capture_present_draw below: never unwind into it. An overlay
             // registrant has no per-context error slot to report into the
             // way present-capture does, since it owns none of this file's
             // state; a registrant that needs error reporting is responsible
             // for capturing its own failures inside its callback.
         }
     }
+
+    capture_present_draw(command_list, framebuffer);
 }
 
 void register_vi_history_rate(const void *history, uint32_t nominal_refresh_rate) {

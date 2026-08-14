@@ -159,6 +159,33 @@ impl Rt64Backend {
         }
     }
 
+    /// The raw `Fn64Rt64Context*`, for a caller building a settings-UI
+    /// overlay bound to this same device (fn64-rmlui's `Context::create`
+    /// takes exactly this pointer).
+    ///
+    /// Must be called on the concrete `Rt64Backend` before it is registered
+    /// with `fn64_abi::set_render_backend_with_policy` and erased behind
+    /// `Box<dyn RenderBackend>` -- that registry is deliberately
+    /// non-downcastable (`fn64_abi::task_dispatch::lifecycle::
+    /// capture_render_release_frame`'s own doc comment: "a host neither
+    /// downcasts the backend nor reaches into RT64 after registration"),
+    /// so this is the one and only place a raw context pointer can still be
+    /// obtained. Same call-before-registration shape as
+    /// `enable_present_capture` above, which is why this method sits next
+    /// to it rather than being reachable through the trait object later.
+    ///
+    /// The returned pointer is valid for as long as this `Rt64Backend`
+    /// (now living inside `fn64_abi`'s registry) stays registered, which in
+    /// practice is the process lifetime for `wm2000-shell` -- it is never
+    /// re-created or torn down after `register_render_backend` runs once.
+    #[cfg(feature = "rt64")]
+    pub fn settings_ui_context_ptr(&self) -> Result<*mut std::ffi::c_void, RenderError> {
+        self.context
+            .as_ref()
+            .map(ffi::Context::as_raw_ptr)
+            .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))
+    }
+
     /// Wait for the sole/selected TMEM texture, optionally including its
     /// installed replacement. Completion is defined by RT64's live cache map;
     /// the C++ seam does not use a duration, sleep, or timing threshold.
