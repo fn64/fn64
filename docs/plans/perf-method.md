@@ -4439,6 +4439,62 @@ verdict. For that, use a real `git worktree` checkout.
 - **`verify_precompiled_instruction_word`.** Unfixable at that layer:
   `fn64-recomp-rs` does not depend on `fn64-abi`, so it cannot see the barrier,
   and `verify_live_words` is baked in at shard generation.
+- **Auto-vectorization-friendly restructuring of `vmacf` (RSP VU interpreter).**
+  2026-08-14. `fn64_audio::rsp::interpreter::run_imem`'s own subtree showed
+  `dispatch_mac` (26.5-34.9%) + `ops::dispatch` (20.0-25.7%) as roughly half
+  its self-time across 3 stable samples on the windowed shell, and
+  `crates/fn64-audio/src/rsp/vu_ops/mac.rs`'s own doc comment says "All math
+  is portable scalar Rust ... no SIMD" — a plausible target. Two paths to
+  SIMD exist in principle; only one was actually available:
+  `std::simd`/portable_simd requires nightly (confirmed unavailable — this
+  project's toolchain is stable `rustc 1.96.1`), and hand-written
+  `core::arch::aarch64` NEON intrinsics require `unsafe`, which
+  `fn64-audio/src/lib.rs:43`'s crate-root `#![forbid(unsafe_code)]`
+  categorically rules out. That leaves only auto-vectorization: reshape the
+  existing safe scalar loop so LLVM's own loop vectorizer packs it, no new
+  API and no `unsafe`.
+
+  Restructured `vmacf`: flattened the per-lane `Accumulator::add` +
+  `::signed` pair (interleaved with the multiply) into a `[i64; 8]` computed
+  first and written back in a second pass, and changed `clamp_signed` from a
+  branchy `if`/`else if` to `i64::clamp` (branchless min/max). Verified with
+  a 20,000-case randomized equivalence test against a frozen copy of the old
+  scalar shape (byte-identical `vd` AND accumulator state on every case),
+  plus the existing hand-picked-boundary unit tests and the crate's own
+  `all_44_compute_ops_match_reference_at_instruction_boundaries` differential
+  suite — all green.
+
+  Disassembly (`otool -tV`, address-range-bounded on `nm`'s exact
+  `dispatch_mac` symbol boundaries, not a truncated eyeball read) showed the
+  clamp DID vectorize — `cmgt.2d`/`bif.16b`, real NEON — but only 2 lanes at
+  a time, not 8. The multiply-accumulate chain itself (the dominant cost)
+  stayed **fully scalar**: 8 independent `smull x_n, w_n, w_m` instructions
+  across distinct GPRs, LLVM's unroll-with-register-parallelism strategy,
+  not a pack. Root cause is structural, not a tuning miss: `i16 * i16 -> i32`
+  then `<<1` into an `i64` accumulator is a mixed-width widening chain, and
+  LLVM's auto-vectorizer is well known to decline exactly this shape without
+  an explicit SIMD intrinsic to anchor it on — which is the whole reason
+  widening-multiply SIMD instructions and hand-written intrinsics exist as a
+  distinct category from what an optimizer will infer on its own.
+
+  Measured on the headless reference-lane binary (both BEFORE and AFTER
+  built from the same worktree, byte-identical `sim_time=13112786076` on
+  every run, 2 runs each side): slow-population mean 43.191 / 43.586
+  (BEFORE) vs 43.370 / 43.275 ms/field (AFTER) — the two BEFORE runs differ
+  from each other (0.9%) by more than BEFORE-vs-AFTER differ (0.15%). RSP
+  interpretation itself: 3.633 / 3.664 (BEFORE) vs 3.666 / 3.659 (AFTER) —
+  flat. **No measurable win, no regression.** Reverted rather than shipped
+  as a no-op diff (this codebase's convention: a change either measurably
+  helps or it does not go in). **The rule it adds: auto-vectorization is not
+  a safe-code substitute for SIMD intrinsics on a widening multiply-
+  accumulate loop — it reliably vectorizes the surrounding branchless glue
+  (here, the clamp) and just as reliably declines the widening multiply
+  chain itself, which is usually the part that was expensive.** Any future
+  SIMD attempt on this interpreter that stays inside
+  `#![forbid(unsafe_code)]` should expect the same ceiling unless the loop
+  is restructured around an operation LLVM's vectorizer specifically
+  recognizes (e.g. same-width lane math with no widening step), not just
+  reshaped for locality.
 - **Caching activation on `guest_write_token`.** Unsound. Its zero-consumer
   property is a *cited premise* of a written safety argument
   (`dispatch-granularity.md:570`).
