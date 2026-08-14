@@ -728,6 +728,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-rmlui"
+version = "0.0.0"
+
+[[package]]
 name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
@@ -3272,6 +3276,7 @@ dependencies = [
  "fn64-render",
  "fn64-render-reference",
  "fn64-render-rt64",
+ "fn64-rmlui",
  "fn64-runtime",
  "gilrs",
  "libc",

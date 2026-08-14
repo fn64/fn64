@@ -40,6 +40,15 @@ dynamic-withheld = [
 # `Rt64Backend::create` then returns an error rather than failing to compile.
 # That is what lets one selector arm exist in `src/main.rs` for both builds.
 rt64 = ["fn64-render-rt64/rt64"]
+# Builds the native RmlUi settings-menu binding behind F1 in `wm2000-shell`.
+# NON-DEFAULT for the same reason `rt64` is: `FN64_RT64_DIR`/`FN64_RMLUI_DIR`
+# must point at real MIT source checkouts, and `fn64-rmlui` itself is an
+# UNCONDITIONAL dependency below so `SettingsMenu`'s Rust-side state
+# (persistence, tab/capture bookkeeping) still compiles without it -- only
+# the `#[cfg(feature = "rmlui")]`-gated live `fn64_rmlui::Context`/`Document`
+# fields disappear, matching `rt64`'s own "pure-Rust off, real native on"
+# shape.
+rmlui = ["fn64-rmlui/rmlui"]
 
 [dependencies]
 fn64-abi = { path = "../../crates/fn64-abi", features = ["recomp-rs"] }
@@ -50,6 +59,7 @@ fn64-audio = { path = "../../crates/fn64-audio" }
 fn64-render = { path = "../../crates/fn64-render" }
 fn64-render-reference = { path = "../../crates/fn64-render-reference" }
 fn64-render-rt64 = { path = "../../crates/fn64-render-rt64" }
+fn64-rmlui = { path = "../../crates/fn64-rmlui" }
 fn64-runtime = { path = "../../crates/fn64-runtime" }
 sha2 = "0.10"
 serde_json = "1"
