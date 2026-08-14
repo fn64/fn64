@@ -723,20 +723,31 @@ impl Shell {
 
     /// Select and register the rasterizer named by `FN64_RENDER`.
     ///
-    /// REFERENCE IS THE DEFAULT and must stay so: it is what the owner plays,
-    /// and every committed route and recorded measurement on this lane was
-    /// taken against it.
+    /// RT64 IS THE DEFAULT for this windowed binary. Measured 2026-08-13 on
+    /// the entrance-to-match route: RT64's busy-population mean is 27.520
+    /// ms/field headless (vs reference's 44.276 ms/field, both byte-identical
+    /// on the same route), and the windowed lane's own `pump_ms` stays inside
+    /// the shell's 33.333 ms present-pacing budget through the same busy
+    /// phase -- reference does not. `FN64_RENDER=reference` still selects the
+    /// software rasterizer explicitly for anyone who needs it or lacks a
+    /// working RT64 adapter; it did not change and remains fully supported.
+    ///
+    /// `wm2000-block-boot` (the HEADLESS binary, not this one) keeps
+    /// `reference` as ITS default -- every committed route and recorded
+    /// measurement on that lane was taken against it, and flipping it would
+    /// invalidate that history. This function is `shell.rs`-only.
     ///
     /// An unrecognized value is a hard error rather than a silent fallback.
-    /// That is the whole point of this function existing. Until now `shell.rs`
-    /// hardcoded `ReferenceBackend` and contained zero occurrences of
-    /// `FN64_RENDER`, so `FN64_RENDER=rt64` on the window was a SILENT no-op --
-    /// it did not error, did not warn, and rendered with the software backend
-    /// regardless. Anyone who set it, saw the game run, and concluded "RT64
-    /// works windowed" was reasonably but wrongly served, and that trap cost
-    /// real confusion (`docs/plans/perf-method.md`, the caveat section). A
-    /// backend selector whose off lane is silently the on lane is worse than no
-    /// selector.
+    /// That is the whole point of this function existing. Before `42271e3`
+    /// ("give wm2000-shell an RT64 path, and make an ignored FN64_RENDER
+    /// loud") landed, `shell.rs` hardcoded `ReferenceBackend` and contained
+    /// zero occurrences of `FN64_RENDER`, so `FN64_RENDER=rt64` on the window
+    /// was a SILENT no-op -- it did not error, did not warn, and rendered
+    /// with the software backend regardless. Anyone who set it, saw the game
+    /// run, and concluded "RT64 works windowed" was reasonably but wrongly
+    /// served, and that trap cost real confusion
+    /// (`docs/plans/perf-method.md`, the caveat section). A backend selector
+    /// whose off lane is silently the on lane is worse than no selector.
     fn register_render_backend() -> ActiveRenderer {
         use fn64_render::RenderBackend as _;
         let requested = fn64_boot_harness::parse_release_env_value(
@@ -744,7 +755,7 @@ impl Shell {
             std::env::var_os("FN64_RENDER"),
         )
         .unwrap_or_else(|error| panic!("wm2000-shell: {error}"))
-        .unwrap_or_else(|| "reference".to_string())
+        .unwrap_or_else(|| "rt64".to_string())
         .to_ascii_lowercase();
 
         let (backend, active): (Box<dyn fn64_render::RenderBackend>, ActiveRenderer) =
@@ -799,7 +810,8 @@ impl Shell {
                 }
                 value => panic!(
                     "wm2000-shell: FN64_RENDER must be reference or rt64, got {value:?}. \
-                     (Unset it for the default reference backend.)"
+                     (Unset it for the default rt64 backend, or set FN64_RENDER=reference \
+                     for the software rasterizer.)"
                 ),
             };
 
