@@ -4571,6 +4571,28 @@ verdict. For that, use a real `git worktree` checkout.
   changed-bytes-only copyback without a fundamentally different way to find
   the changed region (e.g. from the renderer's own dirty-rect tracking, not
   a host-side byte scan).
+- **Removing/narrowing the mprotect barrier's attribution specifically on
+  `copy_back`.** `dpc_copy_census.rs`'s own doc comment already measured
+  `copy_back` at 3.4x `copy_in`'s per-byte cost (455.9 vs 133.2 us/call) and
+  attributed the gap to "writing into the LIVE mapping... page faults
+  against the re-armed mprotect barrier." Confirmed directly 2026-08-14: an
+  isolated `FN64_MPROTECT_BARRIER=0` run (byte-identical
+  `sim_time=13112786076`, `FN64_DPC_COPY_CENSUS=1`) shows `copy_back` at
+  **110.557 us/call**, statistically equal to `copy_in`'s 119.531 —
+  confirming the ENTIRE 3.4x gap (402.359 -> 110.557, barrier-on vs off) is
+  the barrier's fault-and-track cost on this one call site, not the memcpy.
+  Isolated size: **291.8 us/call x 11153 calls = 0.423 ms/field, ~2% of the
+  21.1 ms corrected busy-field baseline.** Real, precisely quantified — but
+  not separately removable: `copy_back` writes through
+  `track_rdp_renderer_mutation`, which exists so the barrier's dirty-page
+  bookkeeping stays correct after a renderer-originated write, and the
+  narrowing approach for exactly this write (diff first, copy only what
+  changed) is the same shape the entry above already measured as **4.76x
+  more expensive than doing the write plainly.** The barrier's whole-run
+  necessity is independently settled (ON is 85.8% faster than OFF,
+  documented 2026-08-13) — this run's much longer wall-clock time with the
+  barrier off is further confirmation, not new evidence. Nothing to change
+  here without inventing a third mechanism this codebase does not have.
 - **Optimizing "RDP rasterization" further on the RT64 lane, past the staging
   copy.** Measured 2026-08-14 (same run as above): of RDP rasterization's
   9.776 ms/field, the three fn64-side sub-timers (`alloc` 0.115, `copy_in`
