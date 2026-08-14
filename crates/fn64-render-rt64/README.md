@@ -127,7 +127,9 @@ must be nonzero and cannot exceed storage height. Renderer-owned filter or
 swapchain extension rows remain in the complete evidence bytes, while an
 interactive host can consume the validated visible prefix without guessing a
 crop from target dimensions. Callers recover the `Vec<u8>` only when they are
-ready to reuse it.
+ready to reuse it. Backends first construct a validated `ReleaseCaptureLayout`
+from a named `ReleaseCaptureLayoutSpec`; this keeps width, storage height,
+visible height, and row pitch from being transposed at the capture boundary.
 
 This removes Rust allocation churn, not the synchronous GPU readback. RT64
 still owns a hidden SDL/Metal surface and the current C++ seam exposes CPU
