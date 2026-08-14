@@ -13,16 +13,23 @@
 #include <mutex>
 
 // fn64_rt64_shim.h for Fn64Rt64Context and the overlay-draw registration
-// calls. This crate depends on fn64-render-rt64's shim at the C++ level
-// only (see fn64-rmlui/build.rs) -- it is not a Cargo dependency, since
-// fn64-rmlui's Rust surface never calls into fn64-render-rt64's Rust
-// surface, only its C ABI, matching how the two crates' native builds are
-// deliberately independent (see build.rs's own comment on why RT64 is
-// built twice rather than shared across the two crates' OUT_DIRs).
+// calls; fn64_rt64_rmlui_bridge.h for the render-interface construction
+// this crate no longer does itself. This crate depends on fn64-render-rt64
+// at the C++ level only (see fn64-rmlui/build.rs) -- it is not a Cargo
+// dependency, since fn64-rmlui's Rust surface never calls into
+// fn64-render-rt64's Rust surface, only its C ABI. Deliberately does NOT
+// include plume_render_interface.h or any other RT64/plume header
+// anywhere in this file: fn64-rmlui itself has zero GPU/renderer
+// knowledge, only an Rml::RenderInterface* it treats as opaque past
+// construction (Rml::CreateContext's own parameter type, not a plume
+// type). See fn64_rt64_rmlui_bridge.h's own comment on why the render
+// interface had to move to fn64-render-rt64 rather than staying here: the
+// class that implements Rml::RenderInterface using plume calls
+// unavoidably needs both RmlUi's and RT64's headers at once, and
+// fn64-render-rt64 is the crate that should own that intersection, not
+// this one.
 #include "fn64_rt64_shim.h"
-
-#include "plume_render_interface.h"
-#include "fn64_rmlui_render_interface.h"
+#include "fn64_rt64_rmlui_bridge.h"
 
 namespace {
 
@@ -102,9 +109,10 @@ void ensure_rmlui_initialised() {
     // process-global default, but Rml::CreateContext also accepts a
     // render_interface argument scoped to just that one context, which is
     // the shape fn64_rmlui_context_create actually uses below (each
-    // Fn64RmluiContext constructs and owns its own Fn64RmluiRenderInterface
-    // bound to the specific Fn64Rt64Context/RenderDevice it was created
-    // with, rather than relying on one shared global instance).
+    // Fn64RmluiContext gets its own render interface, constructed by
+    // fn64-render-rt64's fn64_rt64_create_rmlui_render_interface and bound
+    // to the specific Fn64Rt64Context/RenderDevice it was created with,
+    // rather than relying on one shared global instance).
     if (!Rml::Initialise()) {
         std::terminate();
     }
@@ -116,7 +124,14 @@ void ensure_rmlui_initialised() {
 struct Fn64RmluiContext {
     Rml::Context *context = nullptr;
     Fn64Rt64Context *rt64 = nullptr;
-    std::unique_ptr<Fn64RmluiRenderInterface> render_interface;
+    // Opaque: really a Fn64RmluiRenderInterface* constructed by
+    // fn64-render-rt64's fn64_rt64_create_rmlui_render_interface, but this
+    // crate has no RT64/plume headers to name that concrete type with (see
+    // this file's own top-of-file comment on why). Only ever passed back
+    // to fn64_rt64_rmlui_render_interface_set_viewport_size and
+    // fn64_rt64_destroy_rmlui_render_interface, both of which treat it the
+    // same way -- never dereferenced on this side of the boundary.
+    Rml::RenderInterface *render_interface = nullptr;
 };
 
 struct Fn64RmluiDocument {
@@ -134,24 +149,27 @@ namespace {
 // comment on why it's a raw function pointer + user_data rather than
 // std::function). `user_data` is the owning Fn64RmluiContext*, set at
 // registration time in fn64_rmlui_context_create.
+//
+// `command_list`/`framebuffer` are forwarded to fn64-render-rt64's own
+// begin_frame/end_frame calls verbatim, untouched -- this file never casts
+// them to plume types itself (it has no plume headers to cast to), unlike
+// before this crate's render-interface moved to fn64-render-rt64. Only
+// fn64-render-rt64's own fn64_rt64_rmlui_render_interface_begin_frame
+// implementation knows what they really are.
 void fn64_rmlui_draw_hook_trampoline(void *command_list, void *framebuffer, void *user_data) {
     auto *context = static_cast<Fn64RmluiContext *>(user_data);
-    if ((context == nullptr) || (context->context == nullptr) || !context->render_interface) {
+    if ((context == nullptr) || (context->context == nullptr) || (context->render_interface == nullptr)) {
         return;
     }
-    auto *plume_command_list = static_cast<plume::RenderCommandList *>(command_list);
-    auto *plume_framebuffer = static_cast<plume::RenderFramebuffer *>(framebuffer);
     // Rml::RenderInterface's virtuals (CompileGeometry/RenderGeometry/...)
     // take no command-list parameter of their own -- Context::Render()
     // calls them synchronously and expects the render interface to already
     // know where to draw, so the live command list/framebuffer are stashed
-    // as member state on the render interface for the duration of this one
-    // Render() call, mirroring the header's documented per-frame lifecycle
-    // (fn64-rmlui never hands RT64's command list/framebuffer to Rust; they
-    // stay entirely on the C++ side of this boundary).
-    context->render_interface->BeginFrame(plume_command_list, plume_framebuffer);
+    // as member state on the render interface (inside fn64-render-rt64,
+    // via begin_frame below) for the duration of this one Render() call.
+    fn64_rt64_rmlui_render_interface_begin_frame(context->render_interface, command_list, framebuffer);
     context->context->Render();
-    context->render_interface->EndFrame();
+    fn64_rt64_rmlui_render_interface_end_frame(context->render_interface);
 }
 
 } // namespace
@@ -168,42 +186,23 @@ extern "C" Fn64RmluiContext *fn64_rmlui_context_create(
     ensure_rmlui_initialised();
 
     char rt64_error[256] = {0};
-    void *raw_device = fn64_rt64_get_render_device(rt64, rt64_error, sizeof(rt64_error));
-    if (raw_device == nullptr) {
-        set_last_error(std::string("fn64_rt64_get_render_device failed: ") + rt64_error);
+    // Constructs the RmlUi<->plume render-interface bridge and hands back
+    // an opaque Rml::RenderInterface* -- see fn64_rt64_rmlui_bridge.h's
+    // own doc comment for why this crate no longer constructs that object
+    // itself (it has no plume headers to build one with).
+    void *raw_render_interface = fn64_rt64_create_rmlui_render_interface(
+        rt64, width, height, rt64_error, sizeof(rt64_error));
+    if (raw_render_interface == nullptr) {
+        set_last_error(std::string("fn64_rt64_create_rmlui_render_interface failed: ") + rt64_error);
         return nullptr;
     }
-    auto *device = static_cast<plume::RenderDevice *>(raw_device);
-
-    // RT64's swap chain is always created as single-sample
-    // plume::RenderFormat::B8G8R8A8_UNORM (see
-    // RT64::Application::setup()'s RenderSwapChainDesc construction) --
-    // this is what the overlay draw callback's plume::RenderFramebuffer
-    // actually targets, so the render interface's pipeline is built against
-    // those exact values rather than guessing or re-deriving them from the
-    // N64 framebuffer's own (HDR-capable, potentially multisampled) color
-    // format.
-#if defined(_WIN32)
-    const plume::RenderShaderFormat shader_format = plume::RenderShaderFormat::DXIL;
-#elif defined(__APPLE__)
-    const plume::RenderShaderFormat shader_format = plume::RenderShaderFormat::METAL;
-#else
-    const plume::RenderShaderFormat shader_format = plume::RenderShaderFormat::SPIRV;
-#endif
-
-    std::unique_ptr<Fn64RmluiRenderInterface> render_interface;
-    try {
-        render_interface = std::make_unique<Fn64RmluiRenderInterface>(
-            device,
-            plume::RenderFormat::B8G8R8A8_UNORM,
-            plume::RenderMultisampling(),
-            shader_format,
-            width,
-            height);
-    } catch (const std::exception &exception) {
-        set_last_error(std::string("Fn64RmluiRenderInterface construction failed: ") + exception.what());
-        return nullptr;
-    }
+    // SAFETY: fn64_rt64_create_rmlui_render_interface's own doc comment
+    // guarantees the returned pointer really is a Rml::RenderInterface*
+    // (fn64-render-rt64 upcasts internally before returning it) -- both
+    // this crate and fn64-render-rt64 link the identical RmlUi checkout
+    // and ABI, so this static_cast recovers the same typed pointer the
+    // producing side started from.
+    auto *render_interface = static_cast<Rml::RenderInterface *>(raw_render_interface);
 
     // Context names must be unique per Rml::CreateContext call; fn64
     // currently creates at most one RmlUi context per process (one
@@ -213,13 +212,14 @@ extern "C" Fn64RmluiContext *fn64_rmlui_context_create(
     Rml::Context *rml_context = Rml::CreateContext(
         "fn64_settings_menu",
         Rml::Vector2i(int(width), int(height)),
-        render_interface.get());
+        render_interface);
     if (rml_context == nullptr) {
         set_last_error("Rml::CreateContext failed");
+        fn64_rt64_destroy_rmlui_render_interface(rt64, raw_render_interface, rt64_error, sizeof(rt64_error));
         return nullptr;
     }
 
-    auto *out = new Fn64RmluiContext{rml_context, rt64, std::move(render_interface)};
+    auto *out = new Fn64RmluiContext{rml_context, rt64, render_interface};
 
     if (!fn64_rt64_register_overlay_draw(
             rt64,
@@ -229,6 +229,7 @@ extern "C" Fn64RmluiContext *fn64_rmlui_context_create(
             sizeof(rt64_error))) {
         set_last_error(std::string("fn64_rt64_register_overlay_draw failed: ") + rt64_error);
         Rml::RemoveContext(rml_context->GetName());
+        fn64_rt64_destroy_rmlui_render_interface(rt64, raw_render_interface, rt64_error, sizeof(rt64_error));
         delete out;
         return nullptr;
     }
@@ -266,6 +267,12 @@ extern "C" void fn64_rmlui_context_destroy(Fn64RmluiContext *context) {
             // debugging.
             std::fprintf(stderr, "fn64-rmlui: fn64_rt64_unregister_overlay_draw failed: %s\n", rt64_error);
         }
+        if (context->render_interface != nullptr) {
+            if (!fn64_rt64_destroy_rmlui_render_interface(
+                    context->rt64, context->render_interface, rt64_error, sizeof(rt64_error))) {
+                std::fprintf(stderr, "fn64-rmlui: fn64_rt64_destroy_rmlui_render_interface failed: %s\n", rt64_error);
+            }
+        }
         if (context->context != nullptr) {
             Rml::RemoveContext(context->context->GetName());
         }
@@ -286,8 +293,8 @@ extern "C" void fn64_rmlui_context_set_dimensions(
     }
     try {
         context->context->SetDimensions(Rml::Vector2i(int(width), int(height)));
-        if (context->render_interface) {
-            context->render_interface->SetViewportSize(width, height);
+        if (context->render_interface != nullptr) {
+            fn64_rt64_rmlui_render_interface_set_viewport_size(context->render_interface, width, height);
         }
     } catch (const std::exception &exception) {
         std::fprintf(stderr, "fn64-rmlui: fn64_rmlui_context_set_dimensions threw: %s\n", exception.what());

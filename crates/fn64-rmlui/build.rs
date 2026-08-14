@@ -49,16 +49,10 @@ fn check_mit_license(dir: &Path, project_name: &str) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=FN64_RT64_DIR");
     println!("cargo:rerun-if-env-changed=FN64_RMLUI_DIR");
     println!("cargo:rerun-if-changed=ffi/CMakeLists.txt");
     println!("cargo:rerun-if-changed=ffi/fn64_rmlui_shim.cpp");
     println!("cargo:rerun-if-changed=ffi/fn64_rmlui_shim.h");
-    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_render_interface.cpp");
-    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_render_interface.h");
-    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_ui.h");
-    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_ui_vs.hlsl");
-    println!("cargo:rerun-if-changed=ffi/fn64_rmlui_ui_ps.hlsl");
 
     if env::var_os("CARGO_FEATURE_RMLUI").is_none() {
         // Pure-Rust default for CI/no-GPU hosts, matching
@@ -67,16 +61,6 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-
-    let default_rt64 = manifest_dir.join("../../../no-mercy-recompiled/third_party/rt64");
-    let rt64_dir = env::var_os("FN64_RT64_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(default_rt64)
-        .canonicalize()
-        .unwrap_or_else(|e| {
-            panic!("RT64 source checkout not found ({e}); set FN64_RT64_DIR to its MIT source tree")
-        });
-    check_mit_license(&rt64_dir, "RT64");
 
     let default_rmlui = manifest_dir
         .join("../../../no-mercy-recompiled/third_party/RecompFrontend/recompui/lib/RmlUi");
@@ -89,11 +73,21 @@ fn main() {
         });
     check_mit_license(&rmlui_dir, "RmlUi");
 
-    // fn64-render-rt64's own C shim header, for Fn64Rt64Context and the
-    // overlay-draw registration calls this crate's shim calls into. Not a
-    // Cargo dependency (this crate only needs the header at C++ compile
-    // time, not fn64-render-rt64's Rust surface), so locate it by relative
-    // path within the workspace rather than through Cargo metadata.
+    // fn64-render-rt64's own C shim headers (fn64_rt64_shim.h and, when
+    // its own `rmlui` feature is enabled, fn64_rt64_rmlui_bridge.h) for
+    // Fn64Rt64Context, the overlay-draw registration calls, and the
+    // RmlUi<->plume render-interface bridge this crate's shim calls into
+    // but does not implement itself (see ffi/CMakeLists.txt's own comment
+    // on why that bridge moved to fn64-render-rt64: it unavoidably needs
+    // both RmlUi's and RT64/plume's headers at once, so it lives where
+    // plume is already a first-class dependency). Not a Cargo dependency
+    // (this crate only needs the headers at C++ compile time, plus the
+    // already-built fn64-render-rt64 archives at final link time, which
+    // Cargo assembles across every crate's own `cargo:rustc-link-lib`
+    // directives regardless of a declared Cargo dependency edge -- so
+    // locating the header by relative path within the workspace is
+    // sufficient and matches this file's own pre-existing convention for
+    // it, rather than requiring a new `links`/`DEP_*` metadata channel).
     let render_rt64_ffi_dir = manifest_dir
         .join("../fn64-render-rt64/ffi")
         .canonicalize()
@@ -104,16 +98,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let cmake_source = out_dir.join("rmlui-cmake-source");
     std::fs::create_dir_all(&cmake_source).expect("create fn64-rmlui CMake source wrapper");
-    for file in [
-        "CMakeLists.txt",
-        "fn64_rmlui_shim.cpp",
-        "fn64_rmlui_shim.h",
-        "fn64_rmlui_render_interface.cpp",
-        "fn64_rmlui_render_interface.h",
-        "fn64_rmlui_ui.h",
-        "fn64_rmlui_ui_vs.hlsl",
-        "fn64_rmlui_ui_ps.hlsl",
-    ] {
+    for file in ["CMakeLists.txt", "fn64_rmlui_shim.cpp", "fn64_rmlui_shim.h"] {
         let source = manifest_dir.join("ffi").join(file);
         let destination = cmake_source.join(file);
         std::fs::copy(&source, &destination).unwrap_or_else(|e| {
@@ -129,21 +114,13 @@ fn main() {
         .arg(&cmake_source)
         .arg("-B")
         .arg(&build_dir)
-        .arg(format!("-DFN64_RT64_SOURCE_DIR={}", rt64_dir.display()))
         .arg(format!("-DFN64_RMLUI_SOURCE_DIR={}", rmlui_dir.display()))
         .arg(format!("-DFN64_RENDER_RT64_FFI_DIR={}", render_rt64_ffi_dir.display()))
-        .arg("-DRT64_STATIC=ON")
-        .arg("-DBUILD_SHARED_LIBS=OFF")
-        .arg("-DNFD_BUILD_TESTS=OFF")
-        .arg("-DNFD_INSTALL=OFF")
-        .arg("-DZSTD_BUILD_PROGRAMS=OFF")
-        .arg("-DZSTD_BUILD_TESTS=OFF")
-        .arg("-DPLUME_BUILD_EXAMPLES=OFF")
         .arg("-DCMAKE_BUILD_TYPE=Release");
     run(&mut configure, "fn64-rmlui CMake configure");
 
     let cargo_jobs =
-        env::var("NUM_JOBS").expect("Cargo must publish NUM_JOBS to bound the RmlUi/RT64 native build");
+        env::var("NUM_JOBS").expect("Cargo must publish NUM_JOBS to bound the RmlUi native build");
     assert!(
         cargo_jobs.parse::<usize>().is_ok_and(|jobs| jobs > 0),
         "Cargo NUM_JOBS must be a positive integer, got {cargo_jobs:?}"
@@ -162,13 +139,6 @@ fn main() {
 
     let expected = [
         "libfn64_rmlui_shim.a",
-        "rt64.a",
-        "librt64.a",
-        "libre-spirv.a",
-        "libnfd.a",
-        "libzstd.a",
-        "libzstd_static.a",
-        "libplume.a",
         // RmlUi's core module sets OUTPUT_NAME "rmlui" explicitly
         // (Source/Core/CMakeLists.txt), so its archive is librmlui.a, not
         // librmlui_core.a/libRmlUiCore.a as the CMake TARGET name
@@ -200,69 +170,21 @@ fn main() {
                 .is_some_and(|name| names.contains(&name))
         })
     };
-    // This crate builds its OWN independent copy of RT64 (see this file's
-    // and ffi/CMakeLists.txt's own comments on why: no supported way to
-    // share one CMake build tree across two crates' build.rs invocations).
-    // That copy is not just a duplicate: it additionally compiles this
-    // crate's own fn64_rmlui_ui_vs.hlsl/fn64_rmlui_ui_ps.hlsl shader blobs
-    // into it (ffi/CMakeLists.txt's own shader-compilation block attaches
-    // them to `rt64` via `add_dependencies(rt64 fn64_rmlui_ui_shaders)`),
-    // so it is NOT symbol-for-symbol interchangeable with
-    // fn64-render-rt64's own independently-built `rt64.a`, even though both
-    // archives share the same on-disk filename.
-    //
-    // A prior version of this file treated the two as interchangeable --
-    // staging this crate's rt64.a under the generic name `librt64.a` but
-    // then deliberately skipping `-lrt64` for it (reasoning that
-    // fn64-render-rt64's own `-lrt64` would already satisfy the linker in
-    // any binary that links both crates). That was silently wrong the
-    // moment the two archives diverged: `wm2000-shell` (which links both
-    // fn64-render-rt64 and fn64-rmlui) resolved the single ambiguous
-    // `-lrt64` to fn64-render-rt64's copy, which has none of
-    // Fn64RmluiRenderInterface's shader symbols, producing undefined-symbol
-    // linker errors for Fn64RmluiUi{VS,PS}Blob{SPIRV,MSL} -- caught by
-    // actually linking wm2000-shell end to end, which fn64-rmlui's own
-    // standalone `cargo build -p fn64-rmlui` never exercises (it has only
-    // one `rt64.a` in scope, so the collision is invisible there).
-    //
-    // Fixed by staging this crate's rt64.a under a name that cannot collide
-    // with fn64-render-rt64's own `rt64` link name, and always linking it.
-    // Duplicate RT64 symbols between the two archives (everything except
-    // this crate's added shaders) are resolved by ordinary static-linking
-    // "first definition wins, unreferenced symbols in later archives are
-    // simply not pulled in" semantics -- this crate's `rt64` copy is listed
-    // in the link line, so ITS shader symbols get pulled in even where
-    // fn64-render-rt64's identically-named non-shader symbols are also
-    // present and already satisfied by its own archive.
-    let rt64_archive = archives
-        .iter()
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "rt64.a" || name == "librt64.a")
-        })
-        .expect("CMake did not produce the static RT64 core library");
-    let cargo_rt64 = out_dir.join("libfn64_rmlui_rt64.a");
-    std::fs::copy(rt64_archive, &cargo_rt64).unwrap_or_else(|e| {
-        panic!("failed to stage {} as {}: {e}", rt64_archive.display(), cargo_rt64.display())
-    });
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=fn64_rmlui_rt64");
-
-    // Static archive order is significant: the shim references RmlUi and
-    // RT64; RT64 references the libraries that follow it. Same discipline
-    // as fn64-render-rt64/build.rs's own link-order comment. rt64.a is
-    // excluded from this loop: it is staged and linked separately above,
-    // under its own fn64_rmlui_rt64 name, per this function's own comment
-    // on why it cannot share fn64-render-rt64's `-lrt64` directive.
+    // Static archive order is significant: the shim references RmlUi.
+    // Same discipline as fn64-render-rt64/build.rs's own link-order
+    // comment. No `rt64` entry here at all any more -- this crate does
+    // not build or link RT64 (see ffi/CMakeLists.txt's own comment on
+    // why: the code that used to need it moved to fn64-render-rt64,
+    // which is the crate whose own build.rs links its RT64 archives
+    // instead). Cargo's final link line for any binary that depends on
+    // both crates includes both sets of `cargo:rustc-link-lib`
+    // directives, so fn64-render-rt64's `rt64`/`plume`/etc. archives are
+    // still present in the final binary -- just declared once, by the
+    // one crate that actually builds them, instead of twice.
     for (names, link_name) in [
         (&["libfn64_rmlui_shim.a"][..], "fn64_rmlui_shim"),
         (&["librmlui_debugger.a"][..], "rmlui_debugger"),
         (&["librmlui.a"][..], "rmlui"),
-        (&["libre-spirv.a"][..], "re-spirv"),
-        (&["libnfd.a"][..], "nfd"),
-        (&["libzstd.a", "libzstd_static.a"][..], "zstd"),
-        (&["libplume.a"][..], "plume"),
     ] {
         // rmlui_debugger is genuinely optional -- RmlUi's Debugger module
         // is added unconditionally in its own CMakeLists.txt today, but

@@ -217,20 +217,58 @@ fn main() {
     };
     println!("cargo:rustc-env=FN64_RT64_SOURCE_OVERLAY_ID={source_overlay_id}");
 
+    println!("cargo:rerun-if-env-changed=FN64_RMLUI_DIR");
+    let rmlui_enabled = env::var_os("CARGO_FEATURE_RMLUI").is_some();
+    let rmlui_dir = if rmlui_enabled {
+        let default_rmlui = manifest_dir
+            .join("../../../no-mercy-recompiled/third_party/RecompFrontend/recompui/lib/RmlUi");
+        let dir = env::var_os("FN64_RMLUI_DIR")
+            .map(PathBuf::from)
+            .unwrap_or(default_rmlui)
+            .canonicalize()
+            .unwrap_or_else(|e| {
+                panic!("RmlUi source checkout not found ({e}); set FN64_RMLUI_DIR to its MIT source tree")
+            });
+        let rmlui_license = dir.join("LICENSE.txt");
+        let rmlui_license = if rmlui_license.is_file() { rmlui_license } else { dir.join("LICENSE") };
+        let rmlui_license_text = std::fs::read_to_string(&rmlui_license)
+            .unwrap_or_else(|e| panic!("failed to read RmlUi license {}: {e}", rmlui_license.display()));
+        assert!(
+            rmlui_license_text.contains("MIT License"),
+            "RmlUi source at {} does not carry the expected MIT license",
+            dir.display()
+        );
+        Some(dir)
+    } else {
+        None
+    };
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     // RT64's spirv-cross helper redirects its generated files beneath
     // CMAKE_SOURCE_DIR. Configure from an OUT_DIR copy of this tiny wrapper
     // so enabling the feature never writes build products into the checkout.
     let cmake_source = out_dir.join("rt64-cmake-source");
     std::fs::create_dir_all(&cmake_source).expect("create RT64 CMake source wrapper");
-    for file in [
+    let mut staged_files = vec![
         "CMakeLists.txt",
         "fn64_rt64_shim.cpp",
         "fn64_rt64_shim.h",
         "fn64_rt64_raster_ps_overlay.hlsli",
         "fn64_rt64_video_interface.h",
         "fn64_rt64_video_interface_ps.hlsl",
-    ] {
+    ];
+    if rmlui_enabled {
+        staged_files.extend([
+            "fn64_rt64_rmlui_bridge.h",
+            "fn64_rt64_rmlui_bridge.cpp",
+            "fn64_rt64_rmlui_render_interface.h",
+            "fn64_rt64_rmlui_render_interface.cpp",
+            "fn64_rt64_rmlui_ui.h",
+            "fn64_rt64_rmlui_ui_vs.hlsl",
+            "fn64_rt64_rmlui_ui_ps.hlsl",
+        ]);
+    }
+    for file in staged_files {
         let source = manifest_dir.join("ffi").join(file);
         let destination = cmake_source.join(file);
         std::fs::copy(&source, &destination).unwrap_or_else(|e| {
@@ -277,7 +315,15 @@ fn main() {
                 "-DFN64_RT64_SYNTHETIC_S2DEX_EVIDENCE=OFF"
             },
         )
+        .arg(if rmlui_enabled {
+            "-DFN64_RT64_RMLUI=ON"
+        } else {
+            "-DFN64_RT64_RMLUI=OFF"
+        })
         .arg("-DCMAKE_BUILD_TYPE=Release");
+    if let Some(rmlui_dir) = &rmlui_dir {
+        configure.arg(format!("-DFN64_RMLUI_SOURCE_DIR={}", rmlui_dir.display()));
+    }
     run(&mut configure, "RT64 CMake configure");
 
     let cargo_jobs =
@@ -301,7 +347,7 @@ fn main() {
     // CMake owns the transitive build graph, while Cargo owns the final link.
     // Publish every directory containing the exact static targets linked by
     // `rt64` plus this crate's shim. No mupen target exists or is built.
-    let expected = [
+    let mut expected = vec![
         "libfn64_rt64_shim.a",
         "rt64.a",
         "librt64.a",
@@ -311,6 +357,19 @@ fn main() {
         "libzstd_static.a",
         "libplume.a",
     ];
+    if rmlui_enabled {
+        // RmlUi's core module sets OUTPUT_NAME "rmlui" explicitly
+        // (Source/Core/CMakeLists.txt), so its archive is librmlui.a, not
+        // librmlui_core.a/libRmlUiCore.a as the CMake TARGET name
+        // (rmlui_core) or its RmlUi::Core ALIAS might suggest. The
+        // Debugger module has no such OUTPUT_NAME override, so it keeps
+        // its raw target name, librmlui_debugger.a. Freetype is NOT in
+        // this list: RmlUi's CMake resolves it via `find_package(Freetype)`
+        // against the SYSTEM install, never built by this crate's CMake
+        // run, so it's linked separately below via pkg-config instead.
+        expected.push("librmlui.a");
+        expected.push("librmlui_debugger.a");
+    }
     let archives = find_archives(&build_dir, &expected);
     for archive in &archives {
         if let Some(parent) = archive.parent() {
@@ -346,21 +405,63 @@ fn main() {
     });
     println!("cargo:rustc-link-search=native={}", out_dir.display());
 
-    // Static archive order is significant: the shim references RT64, and
-    // RT64 references the four libraries that follow it.
-    for (names, link_name) in [
+    // Static archive order is significant: the shim references RT64 (and,
+    // when rmlui_enabled, RmlUi), and RT64 references the libraries that
+    // follow it.
+    let mut link_entries: Vec<(&[&str], &str)> = vec![
         (&["libfn64_rt64_shim.a"][..], "fn64_rt64_shim"),
+    ];
+    if rmlui_enabled {
+        link_entries.push((&["librmlui_debugger.a"][..], "rmlui_debugger"));
+        link_entries.push((&["librmlui.a"][..], "rmlui"));
+    }
+    link_entries.extend([
         (&["librt64.a", "rt64.a"][..], "rt64"),
         (&["libre-spirv.a"][..], "re-spirv"),
         (&["libnfd.a"][..], "nfd"),
         (&["libzstd.a", "libzstd_static.a"][..], "zstd"),
         (&["libplume.a"][..], "plume"),
-    ] {
+    ]);
+    for (names, link_name) in link_entries {
+        // `rt64` is exempted from the assert (its own archive is always
+        // present, per the .expect() a few lines above -- this "optional"
+        // only ever meant "optional to assert a specific naming variant
+        // matched", not "optional to link", hence the unconditional
+        // println below rather than gating it on has(names) too).
+        // rmlui_debugger is genuinely optional -- RmlUi's Debugger module
+        // is added unconditionally in its own CMakeLists.txt today, but
+        // this stays lenient in case a future RmlUi version/config gates
+        // it, since this bridge does not need the debugger module at all.
+        if link_name == "rmlui_debugger" {
+            if has(names) {
+                println!("cargo:rustc-link-lib=static={link_name}");
+            }
+            continue;
+        }
         assert!(
             link_name == "rt64" || has(names),
             "CMake did not produce expected static library {names:?}"
         );
         println!("cargo:rustc-link-lib=static={link_name}");
+    }
+
+    if rmlui_enabled {
+        // Freetype, RmlUi's one real dependency, is resolved by RmlUi's
+        // own CMake against the system install, never built by this
+        // crate's CMake run -- so it needs its own search path and link
+        // directive, the same pkg-config pattern already used below for
+        // SDL2.
+        let freetype_libdir = Command::new("pkg-config")
+            .args(["--variable=libdir", "freetype2"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .expect("pkg-config could not locate Freetype's library directory");
+        println!("cargo:rustc-link-search=native={freetype_libdir}");
+        println!("cargo:rustc-link-lib=dylib=freetype");
     }
 
     let sdl_libdir = Command::new("pkg-config")
