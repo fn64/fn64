@@ -17,10 +17,19 @@ third mode is the supersampling experiment; the second distinguishes the
 high-resolution renderer from its explicit downsample pass, while the fourth
 distinguishes multisampling from both.
 
+RT64's internal raster multiplier is independent of the post-VI presentation
+geometry. On the WM2000 shell all four presets therefore continue to capture
+320x237 and Pixels scales that image to the host window. The expected visual
+differential is edge/filter quality, not a larger capture. Compare model
+silhouettes and diagonal geometry; unchanged UI sprites do not reject the
+internal-resolution path.
+
 ## Run
 
 Build the WM2000 shell with its existing private inputs and RT64 feature. F7
-cycles the four presets above. Every successful transition prints
+cycles the four presets above. The window title names the active preset so a
+visual comparison does not depend on access to the launching terminal. Every
+successful transition prints
 `mode=...`, the complete settings SHA-256, and
 `framebuffers_discarded=...`. Wait for at least one complete heartbeat window
 after each transition before comparing `pump_ms`, frame cadence, and audio

@@ -428,8 +428,8 @@ struct Shell {
     fb_width: usize,
     /// Height of the present surface. The reference path holds this at
     /// `FB_HEIGHT` (the guest's VI framebuffer is always 240 lines here), but
-    /// RT64 renders at its own internal resolution and resizes both axes, so
-    /// height can no longer be assumed constant.
+    /// RT64's post-VI output can resize both axes independently of its internal
+    /// raster target, so height can no longer be assumed constant.
     fb_height: usize,
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
@@ -463,6 +463,10 @@ struct Shell {
     /// Optional strict TOML image reloaded by F6. The path is captured once at
     /// startup; changing process environment after boot is not a settings API.
     rt64_settings_path: Option<std::path::PathBuf>,
+    /// Human-readable identity of the settings image that was actually
+    /// accepted. Kept with the window owner so terminal-free experiments do
+    /// not confuse the requested preset with the active one.
+    rt64_active_mode_label: String,
     /// Index into `Rt64AaPreset::ALL`; F7 advances only after an apply succeeds.
     rt64_aa_preset_index: usize,
     /// Storage returned by the prior RT64 release capture. Recovering it after
@@ -483,6 +487,7 @@ enum ActiveRenderer {
 /// Bound on scheduling steps per pump, so a pathological spin cannot wedge the
 /// window. Same value and rationale as `crates/fn64-shell`.
 const STEPS_PER_PUMP: u64 = 200_000;
+const WINDOW_TITLE: &str = "fn64 -- WM2000 (dense AOT block program)";
 
 /// Bound for the pump that is still bringing the guest up to its first VI
 /// field, before any frame has been presented.
@@ -764,17 +769,19 @@ impl Shell {
                 path.display()
             );
         }
+        let mut rt64_active_mode_label = match active_renderer {
+            ActiveRenderer::Reference => "reference".to_owned(),
+            ActiveRenderer::Rt64 => rt64_aa_experiment::Rt64AaPreset::Native.label().to_owned(),
+        };
         if let Some(path) = rt64_settings_path.as_deref() {
             let settings = rt64_aa_experiment::load(path)
                 .unwrap_or_else(|error| panic!("wm2000-shell: {error}"));
+            let label = format!("config:{}", path.display());
             assert!(
-                Self::apply_rt64_runtime_settings(
-                    active_renderer,
-                    &format!("config:{}", path.display()),
-                    &settings,
-                ),
+                Self::apply_rt64_runtime_settings(active_renderer, &label, &settings),
                 "wm2000-shell: startup RT64 settings were not applied"
             );
+            rt64_active_mode_label = label;
         }
 
         let mut program = fn64_recomp_rs::BlockProgram::new();
@@ -867,6 +874,7 @@ impl Shell {
                 .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
             active_renderer,
             rt64_settings_path,
+            rt64_active_mode_label,
             rt64_aa_preset_index: 0,
             rt64_capture_reuse: Vec::new(),
         }
@@ -1038,6 +1046,13 @@ impl Shell {
             &preset.settings(),
         ) {
             self.rt64_aa_preset_index = next;
+            self.rt64_active_mode_label = preset.label().to_owned();
+            if let Some(window) = self.window.as_ref() {
+                window.set_title(&format!(
+                    "{WINDOW_TITLE} -- RT64 {}",
+                    self.rt64_active_mode_label
+                ));
+            }
         }
     }
 
@@ -1051,11 +1066,16 @@ impl Shell {
         };
         match rt64_aa_experiment::load(path) {
             Ok(settings) => {
-                Self::apply_rt64_runtime_settings(
-                    self.active_renderer,
-                    &format!("config:{}", path.display()),
-                    &settings,
-                );
+                let label = format!("config:{}", path.display());
+                if Self::apply_rt64_runtime_settings(self.active_renderer, &label, &settings) {
+                    self.rt64_active_mode_label = label;
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_title(&format!(
+                            "{WINDOW_TITLE} -- RT64 {}",
+                            self.rt64_active_mode_label
+                        ));
+                    }
+                }
             }
             Err(error) => eprintln!("[wm2000-shell] F6 reload failed: {error}"),
         }
@@ -1256,11 +1276,11 @@ impl Shell {
     /// already presents RT64 frames through it. It also normalizes RT64's
     /// native format to BGRA8 for us.
     ///
-    /// Geometry comes from the capture, never from `vi_width()`. RT64 renders
-    /// at its own internal resolution, which is generally NOT the guest's
-    /// 320x240 VI framebuffer, and it returns a row stride (`row_bytes`) that
-    /// may exceed the visible width. Reusing the reference path's `fb_width`
-    /// and `stride` assumptions here would tear or panic.
+    /// Geometry comes from the post-VI capture, never from `vi_width()` or the
+    /// independently configured RT64 internal raster multiplier. The capture
+    /// returns a row stride (`row_bytes`) that may exceed the visible width.
+    /// Reusing the reference path's `fb_width` and `stride` assumptions here
+    /// would tear or panic.
     fn present_rt64(&mut self) {
         let capture = match fn64_abi::capture_render_release_frame_into(
             &mut self.rt64_capture_reuse,
@@ -1315,8 +1335,8 @@ impl Shell {
             self.fb_width = width;
             self.fb_height = height;
             println!(
-                "[wm2000-shell] resized present surface to {width}x{height} (RT64 internal \
-                 render resolution, not the guest's VI framebuffer)"
+                "[wm2000-shell] resized present surface to {width}x{height} (RT64 post-VI \
+                 output; internal raster resolution is configured separately)"
             );
         }
 
@@ -1717,8 +1737,14 @@ impl ApplicationHandler for Shell {
             return;
         }
         let size = LogicalSize::new((FB_WIDTH * 2) as f64, (FB_HEIGHT * 2) as f64);
+        let initial_title = match self.active_renderer {
+            ActiveRenderer::Reference => format!("{WINDOW_TITLE} -- reference"),
+            ActiveRenderer::Rt64 => {
+                format!("{WINDOW_TITLE} -- RT64 {}", self.rt64_active_mode_label)
+            }
+        };
         let attrs = Window::default_attributes()
-            .with_title("fn64 -- WM2000 (dense AOT block program)")
+            .with_title(initial_title)
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(FB_WIDTH as f64, FB_HEIGHT as f64));
         let window = match event_loop.create_window(attrs) {
