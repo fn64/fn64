@@ -4495,6 +4495,41 @@ verdict. For that, use a real `git worktree` checkout.
   is restructured around an operation LLVM's vectorizer specifically
   recognizes (e.g. same-width lane math with no widening step), not just
   reshaped for locality.
+- **Diffing the DPC copyback to skip unchanged bytes (RT64 lane).** Already
+  answered by `dpc_copy_census.rs`'s own `DIFF_NS` instrument, re-confirmed
+  2026-08-14: on `entrance-to-match.schedule` (RT64, headless, byte-identical
+  `sim_time=13112786076`), only 0.4514% of the staged image actually changes
+  per copyback (`changed_bytes=422335619` of `93558145024`) — a tempting
+  "obviously wasteful" number. But the scan needed to FIND that 0.45%
+  (`diff_ms=22348.140`, 2003.778 us/call) costs **4.76x more** than the
+  `copy_back` it would replace (420.726 us/call) — comparing every byte is
+  not cheaper than copying every byte. This is `perf-method` rule 12's exact
+  shape again (a 5.92 GB clone whose elimination measured +0.84%, the wrong
+  direction): the module's own doc comment predicted this outcome before any
+  new measurement, and the fresh numbers confirm it. Do not attempt a
+  changed-bytes-only copyback without a fundamentally different way to find
+  the changed region (e.g. from the renderer's own dirty-rect tracking, not
+  a host-side byte scan).
+- **Optimizing "RDP rasterization" further on the RT64 lane, past the staging
+  copy.** Measured 2026-08-14 (same run as above): of RDP rasterization's
+  9.776 ms/field, the three fn64-side sub-timers (`alloc` 0.115, `copy_in`
+  0.370, `copy_back` 1.253) account for only 1.738 ms/field — the remaining
+  **8.038 ms/field (82.2% of the bucket, 30.1% of total field time)** is time
+  inside the RT64 FFI call itself (`backend.process_rdp_commands` ->
+  `RT64::Application::processDisplayLists`), not fn64-side overhead. A prior
+  instrument on this same call this session
+  (`FN64_RT64_ENCODE_TRACE`, reverted once its question was answered) found
+  the call itself averaged ~0.6 ms — meaning most of the 8.038 ms is real GPU
+  submission/rendering work RT64 does on the target hardware (Apple M5 Pro,
+  confirmed via the run's own `Device Name:` line), not a fn64-side stall.
+  Consistent with `profile.rs`'s own `Provenance` doc comment (RT64 puts
+  "~4 ms" in this bucket, though the measured 9.776 ms here is notably higher
+  — worth a fresh look at whether that comment is stale, separately from
+  this entry). This is GPU-side work inside RT64's own renderer; per the
+  session's `/goal` ("ideally without forking/patching rt64"), it is out of
+  scope without either forking RT64 or a fn64-side change to what gets
+  submitted (fewer/cheaper display lists), not how the submission call
+  itself is timed.
 - **Caching activation on `guest_write_token`.** Unsound. Its zero-consumer
   property is a *cited premise* of a written safety argument
   (`dispatch-granularity.md:570`).
