@@ -4385,6 +4385,55 @@ verdict. For that, use a real `git worktree` checkout.
   while the program regresses does not ship on the strength of the counter.**
   That is rule 2's error wearing a new costume — reading the instrument
   instead of the outcome.
+
+  **RESOLVED FALSE ALARM, 2026-08-13: `f46ef27` is the same shape and was
+  independently re-verified clean, not a repeat of this dead end.** A later
+  session (agent) shipped `f46ef27`
+  ("stop recomputing raw-RDP row edges per pixel") without cross-referencing
+  this entry — same target (`raw_span_edges_at_y_eighth`), same hoist shape
+  (per-row precomputation, `raw_pixel_coverage_with_row_edges`), verified at
+  commit time only on the targeted RDP number and the overall mean, not a
+  full phase breakdown. That is exactly the gap this entry's own rule warns
+  against, so once noticed it was treated as a live risk on an
+  already-pushed commit, not assumed innocent by resemblance to a good
+  result.
+
+  Re-verified with the same rigor this entry used: two isolated worktrees at
+  `10b1996` (parent) and `f46ef27` itself, both built and run headless
+  through `render-benchmark.zsh --profile` on the identical 1.5M-step route,
+  both 8/8 guest-byte-identical. Full `[fn64-profile]` phase breakdown
+  compared, not just the targeted line:
+
+  | phase (slow population) | pre | post | delta |
+  |---|---:|---:|---:|
+  | **overall mean** | 51.948 | 50.328 | **-3.12%** |
+  | RDP rasterization | 31.011 | 28.996 | -6.5% |
+  | RSP interpretation | 3.653 | 3.694 | +1.1% |
+  | audio_lle_ns | 0.773 | 0.790 | +2.2% |
+  | dispatch (translated guest) | 9.304 | 9.537 | +2.5% |
+  | HOST-SIDE TOTAL | 12.207 | 12.525 | +2.6% |
+
+  `audio_lle_ns` rose in the same direction as this entry's telltale sign,
+  but at roughly 1/8th the magnitude (2.2% vs 18.35%) and the overall
+  slow-population mean fell 3.12% — the opposite of this entry's outcome,
+  where the mean rose 3.25% while the targeted counter improved. One
+  interleaved pair, not the six this entry used; judged sufficient because
+  both the targeted metric and the aggregate moved together, clearly,
+  outside noise, with nothing at dead-end scale. **Verdict: `f46ef27` is a
+  real, clean win. It stays.** The mechanism difference from this entry's
+  failure was not investigated (both hoist the same computation into
+  materially different destinations — `RawScanlineCoverage` construction
+  here vs. a `[(i64,i64);4]` passed straight through as a parameter in
+  `f46ef27` — so a smaller/absent code-layout perturbation is plausible but
+  unproven, same as this entry leaves its own I-cache reading unproven).
+
+  **What this changes about the rule:** the rule stands — verify the
+  aggregate, not just the targeted counter — but it is not "this exact code
+  shape is cursed." Two changes that hoist the same computation can land on
+  opposite sides of a layout-sensitive regression depending on how the hoist
+  is expressed. Do not skip re-deriving the aggregate check on a *new*
+  instance of this shape just because an *old* instance of it failed.
+
 - **Narrowing the watched region.** Four falsified attempts. WM2000 zeroes its
   own loaded code image; compiled shards live inside the memset destination.
 - **`verify_precompiled_instruction_word`.** Unfixable at that layer:
