@@ -47,8 +47,10 @@
 
 mod block_program;
 mod dense_aot;
+mod settings_menu;
 use block_program::*;
 use dense_aot::*;
+use settings_menu::SettingsMenu;
 
 use fn64_recomp_rs::{
     BackedExecutableSpanV1, BackedPrecompiledGenerationCatalogV1, BankId, BlockRun, BootContext,
@@ -422,6 +424,14 @@ struct Shell {
     pad: PadState,
     config: InputConfig,
     gamepads: Gamepads,
+    /// F1-toggled Video/Audio/Input settings menu. A sibling struct rather
+    /// than inlined fields, mirroring `crates/fn64-shell/src/overlay.rs`'s
+    /// `Overlay` being a sibling of that binary's `App`.
+    menu: SettingsMenu,
+    /// Edge-detected d-pad/stick state for gamepad menu navigation, read
+    /// once per `about_to_wait` tick while `menu.open`. `None` entries mean
+    /// "not currently held"; see `Shell::poll_menu_gamepad_navigation`.
+    menu_nav_held: MenuNavHeld,
     rgba: Vec<u8>,
     fb_width: usize,
     /// Height of the present surface. The reference path holds this at
@@ -471,6 +481,21 @@ enum ActiveRenderer {
     /// Native GPU rasterization into RT64's own surface; present reads the
     /// post-VI BGRA8 capture back through the ABI seam.
     Rt64,
+}
+
+/// Which menu-navigation directions/activation were held as of the last
+/// `about_to_wait` gamepad poll, so `Shell::poll_menu_gamepad_navigation`
+/// can edge-detect a rising press (mirrors `fn64-shell/src/main.rs:518-521`'s
+/// existing "gate gamepad input while a menu owns the pad" fix in shape,
+/// generalized here to also SYNTHESIZE menu navigation from the same poll
+/// rather than only suppressing it).
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+struct MenuNavHeld {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    activate: bool,
 }
 
 /// Bound on scheduling steps per pump, so a pathological spin cannot wedge the
@@ -817,6 +842,8 @@ impl Shell {
             pad: PadState::new(),
             config: InputConfig::load(),
             gamepads: Gamepads::new(),
+            menu: SettingsMenu::new(),
+            menu_nav_held: MenuNavHeld::default(),
             rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
             fb_width: FB_WIDTH,
             fb_height: FB_HEIGHT,
@@ -1090,7 +1117,18 @@ impl Shell {
         }
     }
 
+    /// `(buttons, stick_x, stick_y)` the guest sees this tick. Neutral
+    /// whenever the settings menu is open -- gamepad state is consumed here
+    /// independently of winit's key events (`about_to_wait` polls
+    /// `self.gamepads` directly, not through `window_event`), so gating
+    /// keyboard input in `window_event`'s early-return above does not by
+    /// itself stop a held gamepad button/stick from still driving the game
+    /// while the menu owns input. Mirrors `fn64-shell/src/main.rs:518-521`'s
+    /// existing fix for the identical problem in that binary's own loop.
     fn merged_input(&self) -> (u16, i8, i8) {
+        if self.menu.open {
+            return (0, 0, 0);
+        }
         let (kb_buttons, kb_x, kb_y) = self.pad.resolve();
         let (gp_buttons, gp_x, gp_y) = self.gamepads.resolve(&self.config);
         let (sx, sy) = if gp_x != 0 || gp_y != 0 {
@@ -1099,6 +1137,227 @@ impl Shell {
             (kb_x, kb_y)
         };
         (kb_buttons | gp_buttons, sx, sy)
+    }
+
+    /// F1 was pressed. Opens the menu if closed, closes it (saving any
+    /// dirty settings) if open.
+    fn toggle_settings_menu(&mut self) {
+        if self.menu.open {
+            self.close_settings_menu();
+        } else {
+            self.open_settings_menu();
+        }
+    }
+
+    fn open_settings_menu(&mut self) {
+        self.menu.open = true;
+        self.menu.capture = None;
+        // Keys held at the moment the menu opens must not stay latched
+        // into the game -- same discipline `input_map.rs:411-415`'s
+        // `PadState::clear` doc comment already documents for
+        // `crates/fn64-shell`'s own overlay-open path.
+        self.pad.clear();
+        self.menu_nav_held = MenuNavHeld::default();
+        self.ensure_settings_ui();
+        println!("[wm2000-shell] settings menu opened (F1)");
+    }
+
+    fn close_settings_menu(&mut self) {
+        self.menu.open = false;
+        self.menu.capture = None;
+        self.menu.save_if_dirty();
+        println!("[wm2000-shell] settings menu closed (F1/Esc)");
+    }
+
+    /// Construct the live RmlUi context/document on first open, if not
+    /// already built. A no-op today: see `settings_menu.rs`'s own top-of-
+    /// file doc comment for exactly why a live `fn64_rmlui::Context` is not
+    /// yet constructible from `Shell` at all (no route to a raw
+    /// `Fn64Rt64Context*` once `register_render_backend` has moved the
+    /// concrete `Rt64Backend` into `fn64_abi`'s registry). This method
+    /// exists now, and is called from the one correct call site
+    /// (menu-open, once), so wiring up construction later is a change
+    /// entirely inside this one function.
+    #[cfg(feature = "rmlui")]
+    fn ensure_settings_ui(&mut self) {
+        if self.menu.ui.is_some() {
+            return;
+        }
+        // No route to a raw Fn64Rt64Context* exists from here today (see
+        // this function's own doc comment) -- left unbuilt rather than
+        // guessed at. When that seam exists, this becomes:
+        //   let context = unsafe {
+        //       fn64_rmlui::Context::create(rt64_context_ptr, w, h)
+        //   }?;
+        //   let mut document = context.load_document_from_memory(
+        //       settings_menu::SETTINGS_RML, "settings.rml")?;
+        //   document.show();
+        //   self.menu.ui = Some(settings_menu::SettingsUi { context, document });
+        //   self.sync_menu_ui_from_settings();
+    }
+
+    #[cfg(not(feature = "rmlui"))]
+    fn ensure_settings_ui(&mut self) {}
+
+    /// Route one keyboard key to the menu: RmlUi's key processing if a
+    /// `KeyIdentifier` translation exists for it, otherwise (and always, in
+    /// parallel) the press-to-bind capture flow when a binding slot is
+    /// armed -- `apply_key_capture` already no-ops when nothing is armed,
+    /// matching `overlay.rs`'s own call shape.
+    fn forward_key_to_menu(&mut self, code: KeyCode, pressed: bool) {
+        if pressed && self.menu.apply_key_capture(&mut self.config, code) {
+            return;
+        }
+        #[cfg(feature = "rmlui")]
+        {
+            let Some(ui) = self.menu.ui.as_mut() else {
+                return;
+            };
+            let Some(key) = winit_keycode_to_rmlui(code) else {
+                return;
+            };
+            let modifiers = fn64_rmlui::KeyModifiers::NONE;
+            if pressed {
+                ui.context.process_key_down(key, modifiers);
+            } else {
+                ui.context.process_key_up(key, modifiers);
+            }
+        }
+        #[cfg(not(feature = "rmlui"))]
+        {
+            let _ = (code, pressed);
+        }
+    }
+
+    fn forward_mouse_move_to_menu(&mut self, x: f64, y: f64) {
+        #[cfg(feature = "rmlui")]
+        {
+            let Some(ui) = self.menu.ui.as_mut() else {
+                return;
+            };
+            ui.context
+                .process_mouse_move(x as i32, y as i32, fn64_rmlui::KeyModifiers::NONE);
+        }
+        #[cfg(not(feature = "rmlui"))]
+        {
+            let _ = (x, y);
+        }
+    }
+
+    fn forward_mouse_button_to_menu(&mut self, button: winit::event::MouseButton, pressed: bool) {
+        #[cfg(feature = "rmlui")]
+        {
+            let Some(ui) = self.menu.ui.as_mut() else {
+                return;
+            };
+            // RmlUi's own convention: 0 = left, 1 = right, 2 = middle
+            // (`Context.h`'s `ProcessMouseButtonDown` documentation).
+            let Some(rmlui_button) = (match button {
+                winit::event::MouseButton::Left => Some(0),
+                winit::event::MouseButton::Right => Some(1),
+                winit::event::MouseButton::Middle => Some(2),
+                _ => None,
+            }) else {
+                return;
+            };
+            let modifiers = fn64_rmlui::KeyModifiers::NONE;
+            if pressed {
+                ui.context.process_mouse_button_down(rmlui_button, modifiers);
+            } else {
+                ui.context.process_mouse_button_up(rmlui_button, modifiers);
+            }
+        }
+        #[cfg(not(feature = "rmlui"))]
+        {
+            let _ = (button, pressed);
+        }
+    }
+
+    fn forward_mouse_wheel_to_menu(&mut self, delta: winit::event::MouseScrollDelta) {
+        #[cfg(feature = "rmlui")]
+        {
+            let Some(ui) = self.menu.ui.as_mut() else {
+                return;
+            };
+            let lines = match delta {
+                winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                // RmlUi's own delta unit is "lines"; pixel deltas are
+                // rescaled by the same rough line-height guess
+                // `overlay.rs`'s egui translation already uses for its own
+                // pixel-delta case (20.0 there is points, not lines, but
+                // both exist for the identical reason: touchpads deliver
+                // pixel deltas, not discrete wheel notches).
+                winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as f32,
+            };
+            ui.context
+                .process_mouse_wheel(-lines, fn64_rmlui::KeyModifiers::NONE);
+        }
+        #[cfg(not(feature = "rmlui"))]
+        {
+            let _ = delta;
+        }
+    }
+
+    /// Edge-detect the gamepad's d-pad/left-stick and A button while the
+    /// menu is open, synthesizing RmlUi key-down calls on rising edges.
+    /// RmlUi has no gamepad concept at all, so this is the only route a
+    /// controller has to drive menu navigation. Call once per
+    /// `about_to_wait` tick, after `self.gamepads.poll()`.
+    fn poll_menu_gamepad_navigation(&mut self) {
+        if !self.menu.open {
+            return;
+        }
+        let (raw_x, raw_y) = self.gamepads.raw_stick();
+        const NAV_THRESHOLD: f32 = 0.5;
+        let now = MenuNavHeld {
+            up: raw_y > NAV_THRESHOLD,
+            down: raw_y < -NAV_THRESHOLD,
+            left: raw_x < -NAV_THRESHOLD,
+            right: raw_x > NAV_THRESHOLD,
+            activate: self.gamepads.is_pressed(gilrs::Button::South),
+        };
+        // Only consumed under `#[cfg(feature = "rmlui")]` below -- there is
+        // no menu to navigate without a live RmlUi context, but edge
+        // detection still needs to run every tick (updating
+        // `self.menu_nav_held`) regardless of the feature gate, so a
+        // pending press doesn't appear to "arrive" as a false rising edge
+        // the instant the feature becomes enabled mid-session.
+        #[cfg_attr(not(feature = "rmlui"), allow(unused_variables))]
+        let rising = MenuNavHeld {
+            up: now.up && !self.menu_nav_held.up,
+            down: now.down && !self.menu_nav_held.down,
+            left: now.left && !self.menu_nav_held.left,
+            right: now.right && !self.menu_nav_held.right,
+            activate: now.activate && !self.menu_nav_held.activate,
+        };
+        self.menu_nav_held = now;
+
+        #[cfg(feature = "rmlui")]
+        {
+            let Some(ui) = self.menu.ui.as_mut() else {
+                return;
+            };
+            let modifiers = fn64_rmlui::KeyModifiers::NONE;
+            let mut send = |key: fn64_rmlui::KeyIdentifier| {
+                ui.context.process_key_down(key, modifiers);
+                ui.context.process_key_up(key, modifiers);
+            };
+            if rising.up {
+                send(fn64_rmlui::KeyIdentifier::Up);
+            }
+            if rising.down {
+                send(fn64_rmlui::KeyIdentifier::Down);
+            }
+            if rising.left {
+                send(fn64_rmlui::KeyIdentifier::Left);
+            }
+            if rising.right {
+                send(fn64_rmlui::KeyIdentifier::Right);
+            }
+            if rising.activate {
+                send(fn64_rmlui::KeyIdentifier::Return);
+            }
+        }
     }
 
     /// Blit the current VI framebuffer to the window.
@@ -1556,6 +1815,30 @@ fn expand5(v: u16) -> u8 {
     ((v * 255 + 15) / 31) as u8
 }
 
+/// `winit::keyboard::KeyCode` -> `fn64_rmlui::KeyIdentifier`, for the subset
+/// the settings menu's own RmlUi document actually needs (no text-entry
+/// field exists anywhere in `settings.rml`, so alphanumeric keys are not
+/// mapped). Lives here rather than in `fn64-rmlui` itself -- see
+/// `fn64-rmlui/src/keys.rs`'s own bottom-of-file comment on why: `winit` is
+/// this binary's dependency, not that crate's, and the two live in
+/// different Cargo workspaces with no shared lockfile to resolve a shared
+/// version against.
+#[cfg(feature = "rmlui")]
+fn winit_keycode_to_rmlui(code: KeyCode) -> Option<fn64_rmlui::KeyIdentifier> {
+    use fn64_rmlui::KeyIdentifier as KI;
+    Some(match code {
+        KeyCode::Tab => KI::Tab,
+        KeyCode::Enter | KeyCode::NumpadEnter => KI::Return,
+        KeyCode::Escape => KI::Escape,
+        KeyCode::ArrowLeft => KI::Left,
+        KeyCode::ArrowUp => KI::Up,
+        KeyCode::ArrowRight => KI::Right,
+        KeyCode::ArrowDown => KI::Down,
+        KeyCode::F1 => KI::F1,
+        _ => return None,
+    })
+}
+
 /// Register a live cpal output stream. A create() failure (no device, headless
 /// CI) is logged, not fatal: the window and input still work, only sound is
 /// unavailable.
@@ -1670,6 +1953,19 @@ impl ApplicationHandler for Shell {
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
+
+                    // F1 toggles the settings menu. Checked first,
+                    // unconditionally, before any other key logic -- per the
+                    // design, this must win regardless of menu state (it is
+                    // the only way back OUT of a stuck-closed menu too).
+                    if code == KeyCode::F1 && pressed {
+                        self.toggle_settings_menu();
+                        return;
+                    }
+
+                    // F11 (fullscreen) passes through unconditionally
+                    // regardless of menu state -- explicitly preserved, not
+                    // routed to the menu even while it is open.
                     if code == KeyCode::F11 && pressed {
                         if let Some(window) = self.window.as_ref() {
                             let next = match window.fullscreen() {
@@ -1680,6 +1976,22 @@ impl ApplicationHandler for Shell {
                         }
                         return;
                     }
+
+                    // While the menu is open: Escape closes the menu instead
+                    // of quitting (a deliberate behavior change from the
+                    // menu-closed default below), and every other key routes
+                    // to RmlUi's key processing -- an early return, not a
+                    // secondary check, so key events can never double-fire
+                    // into `self.pad.apply` while the menu owns input.
+                    if self.menu.open {
+                        if code == KeyCode::Escape && pressed {
+                            self.close_settings_menu();
+                            return;
+                        }
+                        self.forward_key_to_menu(code, pressed);
+                        return;
+                    }
+
                     if code == KeyCode::Escape && pressed {
                         println!("[wm2000-shell] Esc pressed -- exiting");
                         event_loop.exit();
@@ -1695,6 +2007,21 @@ impl ApplicationHandler for Shell {
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.menu.open {
+                    self.forward_mouse_move_to_menu(position.x, position.y);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.menu.open {
+                    self.forward_mouse_button_to_menu(button, state == ElementState::Pressed);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.menu.open {
+                    self.forward_mouse_wheel_to_menu(delta);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.present();
             }
@@ -1704,7 +2031,23 @@ impl ApplicationHandler for Shell {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.gamepads.poll();
-        let _ = self.gamepads.take_pressed();
+        let pressed = self.gamepads.take_pressed();
+        if self.menu.open {
+            if let Some(button) = pressed {
+                self.menu.apply_pad_capture(&mut self.config, button);
+            }
+            self.poll_menu_gamepad_navigation();
+        }
+
+        if self.menu.open {
+            #[cfg(feature = "rmlui")]
+            if let Some(ui) = self.menu.ui.as_mut() {
+                ui.context.update();
+            }
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
+        }
 
         // WM2000 draws at 30 Hz, but VI, device time, and audio still advance
         // at 60 Hz. Pump both VI fields as one presentation unit, then show
