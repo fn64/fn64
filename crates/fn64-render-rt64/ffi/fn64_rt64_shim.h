@@ -758,6 +758,20 @@ int fn64_rt64_unregister_overlay_draw(
     char *error,
     size_t error_capacity);
 
+/* Returns the context's live `plume::RenderDevice*`, opaque as `void*` for
+ * the same reason fn64_rt64_register_overlay_draw's command_list/framebuffer
+ * parameters are -- a caller linking against the same `plume` headers (as
+ * fn64-rmlui does, to construct its own RmlUi render-interface bridge
+ * against this device) casts back to the real type. Only valid once the
+ * context has completed setup (the same precondition
+ * fn64_rt64_register_overlay_draw already enforces); returns NULL and sets
+ * `error` otherwise. The returned pointer is owned by `context` and must
+ * not be used past `context`'s destruction. */
+void *fn64_rt64_get_render_device(
+    Fn64Rt64Context *context,
+    char *error,
+    size_t error_capacity);
+
 int fn64_rt64_read_present_capture(
     Fn64Rt64Context *context,
     Fn64Rt64PresentCapture *capture,

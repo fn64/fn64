@@ -4454,6 +4454,25 @@ extern "C" int fn64_rt64_unregister_overlay_draw(
     }
 }
 
+extern "C" void *fn64_rt64_get_render_device(
+    Fn64Rt64Context *context,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if ((context == nullptr) || !context->setup_complete || !context->application) {
+            set_error(error, error_capacity, "RT64 context is not initialized");
+            return nullptr;
+        }
+        return context->application->device.get();
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 render-device query threw: ") + exception.what());
+        return nullptr;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 render-device query failed with an unknown C++ exception");
+        return nullptr;
+    }
+}
+
 extern "C" int fn64_rt64_read_present_capture(
     Fn64Rt64Context *context,
     Fn64Rt64PresentCapture *capture,

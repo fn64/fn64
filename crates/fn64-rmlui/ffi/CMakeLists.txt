@@ -56,7 +56,59 @@ set(RMLUI_SAMPLES OFF CACHE BOOL "Do not build RmlUi's sample viewer" FORCE)
 set(RMLUI_LUA_BINDINGS OFF CACHE BOOL "fn64-rmlui does not use RmlUi's Lua scripting plugin" FORCE)
 add_subdirectory("${FN64_RMLUI_SOURCE_DIR}" rmlui-build EXCLUDE_FROM_ALL)
 
-add_library(fn64_rmlui_shim STATIC fn64_rmlui_shim.cpp)
+# Compile fn64-rmlui's UI vertex/pixel shaders. Same directory-scope
+# re-import dance fn64-render-rt64/ffi/CMakeLists.txt already uses (see its
+# comment above its own build_shader calls): build_vertex_shader/
+# build_pixel_shader are CMake functions defined inside RT64's own
+# CMakeLists.txt, so DXC/its option variables must be re-imported from that
+# child directory's scope before calling them here. build_vertex_shader/
+# build_pixel_shader are used directly (rather than build_shader with a
+# manually-supplied OPTIONS list) since this crate has exactly one VS/PS
+# entry point pair each named VSMain/PSMain -- the exact case those two
+# convenience wrappers exist for.
+foreach(FN64_RMLUI_SHADER_VARIABLE
+        DXC DXC_VS_OPTS DXC_PS_OPTS DXC_SPV_OPTS SPIRVCROSS)
+    get_directory_property(
+        FN64_RMLUI_IMPORTED_${FN64_RMLUI_SHADER_VARIABLE}
+        DIRECTORY "${FN64_RT64_SOURCE_DIR}"
+        DEFINITION ${FN64_RMLUI_SHADER_VARIABLE})
+    set(${FN64_RMLUI_SHADER_VARIABLE} "${FN64_RMLUI_IMPORTED_${FN64_RMLUI_SHADER_VARIABLE}}")
+endforeach()
+target_include_directories(rt64 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+build_vertex_shader(
+    rt64
+    "fn64_rmlui_ui_vs.hlsl"
+    "src/shaders/Fn64RmluiUiVS.hlsl"
+    "-I${CMAKE_CURRENT_SOURCE_DIR}")
+build_pixel_shader(
+    rt64
+    "fn64_rmlui_ui_ps.hlsl"
+    "src/shaders/Fn64RmluiUiPS.hlsl"
+    "-I${CMAKE_CURRENT_SOURCE_DIR}")
+set(FN64_RMLUI_UI_SHADER_OUTPUTS
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RmluiUiVS.hlsl.spirv.c"
+    "${CMAKE_BINARY_DIR}/src/shaders/Fn64RmluiUiPS.hlsl.spirv.c")
+if(APPLE)
+    list(APPEND FN64_RMLUI_UI_SHADER_OUTPUTS
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RmluiUiVS.hlsl.metal.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RmluiUiPS.hlsl.metal.c")
+elseif(WIN32)
+    list(APPEND FN64_RMLUI_UI_SHADER_OUTPUTS
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RmluiUiVS.hlsl.dxil.c"
+        "${CMAKE_BINARY_DIR}/src/shaders/Fn64RmluiUiPS.hlsl.dxil.c")
+endif()
+# CMake custom-command visibility is directory-scoped while `rt64` belongs to
+# the child directory; this explicit parent target publishes the generated
+# shader objects before fn64_rmlui_shim compiles the C++ that includes their
+# generated headers.
+add_custom_target(fn64_rmlui_ui_shaders DEPENDS ${FN64_RMLUI_UI_SHADER_OUTPUTS})
+add_dependencies(rt64 fn64_rmlui_ui_shaders)
+
+add_library(fn64_rmlui_shim STATIC
+    fn64_rmlui_shim.cpp
+    fn64_rmlui_render_interface.cpp
+)
+add_dependencies(fn64_rmlui_shim fn64_rmlui_ui_shaders)
 target_compile_definitions(fn64_rmlui_shim PRIVATE
     HLSL_CPU
     FFX_GCC
@@ -68,6 +120,12 @@ target_include_directories(fn64_rmlui_shim PRIVATE
     "${FN64_RT64_SOURCE_DIR}/src/contrib/plume/contrib/metal-cpp"
     "${FN64_RT64_SOURCE_DIR}/src/contrib/hlslpp/include"
     "${CMAKE_CURRENT_BINARY_DIR}/rt64-build/src"
+    # Generated shader blob headers (Fn64RmluiUiVS.hlsl.spirv.h etc.), built
+    # by build_vertex_shader/build_pixel_shader above into
+    # ${CMAKE_BINARY_DIR}/src/shaders. rt64 itself gets this path via its
+    # own PRIVATE target_include_directories in RT64's top-level
+    # CMakeLists.txt, which is not visible to this separate target.
+    "${CMAKE_BINARY_DIR}/src"
     # fn64-render-rt64's own shim header, for the Fn64Rt64Context opaque
     # type and fn64_rt64_register_overlay_draw/unregister_overlay_draw --
     # this crate calls into that shim, it does not redefine or duplicate
