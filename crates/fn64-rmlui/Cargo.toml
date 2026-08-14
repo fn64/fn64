@@ -1,0 +1,17 @@
+[package]
+name = "fn64-rmlui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin RmlUi UI binding for fn64's shell, drawing through fn64-render-rt64's overlay-draw hook. All C++ interop quarantined here, mirroring fn64-render-rt64's own convention."
+
+[features]
+default = []
+# Builds the sibling RmlUi checkout and the crate-local C ABI shim, and
+# links against fn64-render-rt64's overlay-draw registration calls. The
+# default remains pure Rust for CI/no-GPU hosts, matching
+# fn64-render-rt64's own default-off `rt64` feature.
+rmlui = []
+
+[build-dependencies]

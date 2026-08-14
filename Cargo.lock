@@ -864,6 +864,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-rmlui"
+version = "0.0.0"
+
+[[package]]
 name = "fn64-runtime"
 version = "0.0.0"
 dependencies = [
