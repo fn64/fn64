@@ -4634,6 +4634,40 @@ verdict. For that, use a real `git worktree` checkout.
 - **The device fabric.** Already zero: `FN64_DEVICE_ADVANCE_CENSUS` reports
   `no samples` on the deep route, because `advance_clock_if_idle` takes every
   call.
+- **Single-slot content-memoizing `imem_sha256`.** 2026-08-14. Hypothesis:
+  `imem_replacements=41144` (RSP `SwapOverlay` events) across only
+  `sp_tasks=18838` -- 2.18/task -- suggested WM2000 alternates between a
+  small, fixed set of audio/graphics overlay images rather than loading
+  distinct microcode each time, and each replacement unconditionally
+  SHA-256s its 4KiB IMEM image (`imem_sha256`, `rsp_lineage.rs`) feeding the
+  same `RspRdpObservationKind` stream the release gate certifies against
+  (load-bearing, like the RDP word digest already found necessary). Added a
+  thread-local single-slot memo (`(image, digest)` of the last call; a
+  cache hit on content match returns the stored digest instead of
+  rehashing) and verified equivalence with 4 targeted tests (repeated same
+  image, alternating two images, cache-then-miss-then-hit) plus the full
+  527-test `fn64-abi` suite, all green.
+
+  Measured on the RT64 lane (`entrance-to-match.schedule`, headless,
+  `--features rt64`, byte-identical `sim_time=13112786076` on all 4 runs,
+  `FN64_FRAME_CENSUS_POPULATIONS=1` only): BEFORE 21.07 / 22.72 ms (mean
+  21.895), AFTER 22.54 / 21.79 ms (mean 22.165) -- **+1.23%, the wrong
+  direction, and smaller than BEFORE's own run-to-run spread (7.5%).**
+  Total bytes hashed by this call site across the whole run
+  (41144 x 4KiB = 160.72 MiB) is small next to the multi-GB RDP word digest
+  volume already measured, so the true per-field cost was likely well under
+  0.1 ms -- invisible against this route's noise floor on this machine, and
+  the cache's own cost (a 4KiB array compare plus a 4KiB copy into the slot
+  on every miss) plausibly offset what little there was to save. Reverted;
+  not shipped as a no-op-or-worse diff.
+
+  **The rule it adds:** before caching/memoizing a hash-on-a-hot-path
+  purely from a plausible repetition hypothesis, size the TOTAL BYTES
+  hashed by that specific call site (not the whole subsystem's digest
+  volume) against a call site already measured as significant -- 160 MiB
+  next to RDP's multi-GB scale was the tell this was never going to move
+  the needle, and would have saved two A/B measurement cycles if checked
+  before implementing.
 
 See `structural-half-is-mostly-guard.md` — the caller attribution behind all
 three, and why a p99 frame-time bound cannot be measured on **this** route at
