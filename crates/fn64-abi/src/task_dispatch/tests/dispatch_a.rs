@@ -1265,21 +1265,32 @@ use super::*;
                 Ok(())
             }
 
-            fn release_capture(
+            fn release_capture(&mut self) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
+                self.release_capture_into(&mut Vec::new())
+            }
+
+            fn release_capture_into(
                 &mut self,
+                reuse: &mut Vec<u8>,
             ) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
+                reuse.clear();
+                reuse.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
                 Ok(fn64_render::RenderReleaseCapture {
                     guest_cycle: 0x1234,
                     backend_identity: "synthetic-release-backend".to_string(),
                     source_authoritative: true,
                     settings_sha256: [0x5a; 32],
-                    width: 2,
-                    height: 1,
-                    row_bytes: 8,
-                    format: fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+                    pixels: fn64_render::ReleaseCapturePixels::try_from_reused(
+                        fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+                        2,
+                        1,
+                        1,
+                        8,
+                        reuse,
+                    )
+                    .unwrap(),
                     workload_id: std::num::NonZeroU64::new(5).unwrap(),
                     present_id: 7,
-                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 })
             }
 
@@ -1318,6 +1329,15 @@ use super::*;
             render_environment_evidence_snapshot().renderer_tv_type(),
             Some(fn64_runtime::TvType::Pal)
         );
+
+        set_render_backend(Box::new(CaptureBackend), 0);
+        let mut reuse = Vec::with_capacity(64);
+        let allocation = reuse.as_ptr();
+        let capture = capture_render_release_frame_into(&mut reuse).unwrap();
+        assert_eq!(capture.bytes.as_ptr(), allocation);
+        reuse = capture.pixels.into_bytes();
+        assert!(reuse.capacity() >= 64);
+        assert_eq!(reuse, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
 

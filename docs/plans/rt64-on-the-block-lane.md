@@ -774,10 +774,9 @@ a cached archive).
 
 Answered Finding 3's open question directly, with live numbers instead of a
 sampling profiler's offset. Extended `ffi/CMakeLists.txt`'s existing
-hash-pinned patch mechanism (Finding 4) with a new, explicitly TEMPORARY,
-opt-in stanza gated on `-DFN64_RT64_WAIT_TRACE=ON` (wired from `build.rs` via
-the `FN64_RT64_WAIT_TRACE` env var, same pattern as the existing
-`CARGO_FEATURE_*` gates). It times exactly
+hash-pinned patch mechanism (Finding 4) with a temporary opt-in stanza whose
+`FN64_RT64_WAIT_TRACE` switch now appears nowhere in code because the
+instrumentation was removed after this measurement. It timed exactly
 `renderAndSynchronize`'s `commandList->end()` / `execute()` / `wait()` triple
 at `rt64_state.cpp:1443-1447` (the branch that actually runs whenever there
 are framebuffers to draw — the sibling `else` branch at `:1544-1558` is the

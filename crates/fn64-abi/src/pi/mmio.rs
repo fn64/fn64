@@ -116,6 +116,8 @@ pub fn load_rom_with_fixed_pi_latency(bytes: Vec<u8>, latency_cycles: u64) {
         host.save_operations.clear();
         host.controller_operations.clear();
         host.rsp_rdp_observations.clear();
+        host.rsp_rdp_observation_count = 0;
+        host.rsp_rdp_observation_retention = crate::RspRdpObservationRetention::CompleteEvidence;
         host.rsp_boot_images.clear();
         host.loaded_rsp_task = None;
         host.rsp_task_lineages.clear();

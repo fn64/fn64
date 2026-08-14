@@ -30,8 +30,10 @@ by the v3 Merkle migration. What actually remains, measured:
   FULL byte-identity verification set before shipping, not a partial one.
 - rt64 `NativeRdramRollback` copies all 8 MiB per submission (2.818/field,
   −0.4 to −1.4 ms) — likely redundant with the ABI staging contract.
-- RDP-stream digest per-word updates + double image hash (−0.2 to −0.5 ms);
-  `rsp_rdp_observations` also grows unboundedly (memory bug, independent).
+- RDP-stream digest per-word updates + double image hash (−0.2 to −0.5 ms).
+  The independent unbounded `rsp_rdp_observations` memory bug now has an
+  explicit typed interactive constant-space mode; complete ordered retention
+  remains the default and remains mandatory for certification/release evidence.
 Plus the standing constraint: nothing may key on "every second field
 renders."
 
@@ -45,9 +47,9 @@ windows — so the cost is split between the emulation pump and the present
 path, not one owner. Caveats binding the next measurement: this binary ran
 with `verify_live_words` ON (worth ~7 ms/drawn frame; build the next shell
 with `FN64_WM_SHARD_VERIFY_LIVE_WORDS=0` after the A/B clears it), and
-`rsp_rdp_observations` grows unboundedly across a long session (the 200+ ms
-p99 spikes may be reallocation/memory pressure — falsifiable by capping or
-by watching RSS against spike timing). Block lane simultaneously measures
+interactive sessions must select constant-space RSP/RDP observation retention
+after loading the ROM; the certification lane continues retaining complete
+ordered evidence. Block lane simultaneously measures
 15.58 ms/field — the gap between 31.15 ms core and ~48 ms presented is the
 shell-side + verify budget to reclaim.
 

@@ -4669,7 +4669,8 @@ verdict. For that, use a real `git worktree` checkout.
   inside the RT64 FFI call itself (`backend.process_rdp_commands` ->
   `RT64::Application::processDisplayLists`), not fn64-side overhead. A prior
   instrument on this same call this session
-  (`FN64_RT64_ENCODE_TRACE`, reverted once its question was answered) found
+  (`FN64_RT64_ENCODE_TRACE`, which now appears nowhere in code because it was
+  reverted once its question was answered) found
   the call itself averaged ~0.6 ms — meaning most of the 8.038 ms is real GPU
   submission/rendering work RT64 does on the target hardware (Apple M5 Pro,
   confirmed via the run's own `Device Name:` line), not a fn64-side stall.
@@ -4835,3 +4836,87 @@ though: 435/441 ms are **whole-run totals, not ms/field**, and they come from
 the 19,523-step route that renders nothing (rule 11), so this entry's number
 never transferred to a rendering route in the first place — the agreement with
 the new measurement is a real result, not a restatement.
+
+## Window pacing correction and constant-space interactive path (2026-08-14)
+
+The week-long windowed choppiness and roughly 50% audio starvation had a
+mechanical clocking cause, not an audio-loss cause. The shell's default wall
+deadline had been changed to 33.333 ms while `pump_one_frame` still returned
+after one committed VI field. That advanced about 30 NTSC fields per wall
+second even though device time, AI production, and VI retrace authority are
+60 Hz. The long-run logs' 49.5–50.2% callback starvation were the exact ratio
+predicted by that mismatch.
+
+The interactive shell now advances two 60 Hz VI fields per 33.333 ms visible
+presentation. `FN64_FRAME_PACE_MS=0` deliberately remains the one-field
+16.667 ms diagnostic lane. Deadline debt is computed from a fresh post-pump
+`Instant` and retained for ordinary overruns, but a large stall reanchors the
+deadline rather than scheduling a burst against an already-past timestamp.
+The cadence/debt tests passed 10/10 consecutive runs.
+
+A second mechanical hitch was exposed by `FN64_SHELL_SPIKE_MS=100` before this
+change. `pump_one_frame` only recognized VI edges returned by the quiescent
+`DeviceAdvance::ViFields` arm. Runnable recompiled checkpoints advance the same
+device clock, so one pump could cross 3–27 VI edges while executing tens of
+thousands of guest steps and then expose the accumulated work as a 100–1156 ms
+hitch. The pump now observes the constant-space committed VI counter after each
+scheduling step and returns at the first edge regardless of which clock path
+committed it. The summary is a thread-local counter copy: no retained-trace
+scan, allocation, mutex, or I/O is added to the step loop.
+
+One optimized Metal/RT64 live run reached frame 1020. After startup, heartbeat
+windows at frames 300, 360, 420, 480, 540, 600, 660, 720, 840, 900, 960, and
+1020 reported zero new underrun slots; a heavier workload window at frame 780
+briefly reported 1.03% and recovered at the next heartbeat. No post-startup
+`>100 ms` guest-pump spike appeared. Four subsequent fresh-window launches
+each reached a zero-underrun steady window, emitted no non-startup `>100 ms`
+pump spike, and exited cleanly before the visual-edge investigation interrupted
+the planned exact-ten live series. This is strong evidence that the permanent
+~50% starvation mechanism is gone, but that interrupted series is not itself an
+exact-ten live claim. After the typed visible-height change, the optimized shell
+was rebuilt and a fresh exact-ten series completed: all ten independent RT64
+window launches reached a heartbeat with zero new underrun slots, emitted no
+non-startup `>=100 ms` pump spike, reported `320x237` visible pixels backed by
+the unchanged `320x240` release capture, and exited cleanly after SIGINT.
+
+The same pass removes avoidable interactive growth/churn without weakening
+release evidence:
+
+- interactive sessions explicitly discard retained RSP/RDP observation payloads
+  while keeping checked totals; complete evidence remains the per-ROM default
+  and cannot be silently reconstructed after discard;
+- the cpal callback never blocks on the producer, the bounded 250 ms sample and
+  DMA-span queues are preallocated, resampler output storage is reused, and the
+  existing drop-oldest/DMA-byte semantics remain intact;
+- RT64 release captures carry a validated owning pixel value binding format,
+  width, storage height, visible height, row pitch, and exact byte length while
+  reusing the same `Vec<u8>` allocation; BGRA-to-RGBA conversion writes directly
+  into Pixels' upload buffer instead of making another full-frame copy;
+- replacement packs are copied to a privately owned, revalidated activation
+  snapshot. RT64 receives only snapshot paths, so capture no longer walks or
+  hashes the original pack filesystem every frame while later streaming stays
+  bound to the validated bytes.
+
+Two tempting copies remain architectural. RT64 still presents to its hidden
+native target, synchronously reads pixels to the CPU, and uploads them to the
+visible Pixels surface; eliminating that needs a native-window or shared-texture
+contract. `NativeRdramRollback` still snapshots the full physical image because
+the renderer may mutate arbitrary RDRAM and the current dirty-page barrier has
+neither pre-write bytes nor a complete CPU+GPU renderer write set. Neither copy
+was weakened on performance grounds.
+
+The reported noisy bottom scanline was captured before the Pixels upload. An
+LLDB dump of RT64's exact 320x240 tight BGRA readback found rows 1 through 236
+stable and rows 237 through 239 distinct but nearly uniform; repeated fresh
+runs also produced identical whole-frame hashes at matching route frames. This
+rules out nondeterministic host storage, row pitch, BGRA conversion, and window
+compositing. The boundary is RT64's `VI::fbSize()` extension heuristic: the
+guest programs V_START 37..511, or 237 active output lines, while RT64 adds two
+filter rows and rounds 239 to a four-row multiple, yielding 240 stored rows.
+Release capture now retains the complete evidence bytes while carrying the
+exact `ViPresentation` active-output height as validated metadata. Interactive
+presentation uses only that typed visible prefix, excluding the three extension
+rows; release evidence is not cropped. The rebuilt live shell reported a
+`320x237` surface backed by `320x240` capture storage on every launch in the
+fresh exact-ten cadence/audio series. A direct visual eye-check remains separate
+from this geometry and byte-boundary evidence.

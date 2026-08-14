@@ -17,6 +17,16 @@ pub(super) fn error_string(buffer: &[c_char; ERROR_CAPACITY], fallback: &str) ->
 
 pub(crate) struct Context(NonNull<RawContext>);
 
+pub(crate) struct PresentedPixelMetadata {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) row_bytes: u32,
+    pub(crate) format: crate::Rt64PresentPixelFormat,
+    pub(crate) graphics_api: ActiveRenderGraphicsApi,
+    pub(crate) present_id: u64,
+    pub(crate) workload_id: u64,
+}
+
 impl Context {
     pub(crate) fn create(
         width: u32,
@@ -565,7 +575,27 @@ impl Context {
         Ok(graphics_api)
     }
 
-    pub(crate) fn presented_pixels(&mut self) -> Result<crate::Rt64PresentedPixels, String> {
+    pub(crate) fn presented_pixels_into(
+        &mut self,
+        reuse: &mut Vec<u8>,
+    ) -> Result<crate::Rt64PresentedPixels, String> {
+        let metadata = self.read_presented_pixels_into(reuse)?;
+        Ok(crate::Rt64PresentedPixels {
+            width: metadata.width,
+            height: metadata.height,
+            row_bytes: metadata.row_bytes,
+            format: metadata.format,
+            graphics_api: metadata.graphics_api,
+            present_id: metadata.present_id,
+            workload_id: metadata.workload_id,
+            bytes: std::mem::take(reuse),
+        })
+    }
+
+    pub(crate) fn read_presented_pixels_into(
+        &mut self,
+        bytes: &mut Vec<u8>,
+    ) -> Result<PresentedPixelMetadata, String> {
         let mut metadata = RawPresentCapture::default();
         let mut error = [0; ERROR_CAPACITY];
         // SAFETY: the context is alive and uniquely borrowed; null with zero
@@ -587,7 +617,7 @@ impl Context {
             ));
         }
         let (byte_len, format, graphics_api) = validate_present_capture_metadata(metadata)?;
-        let mut bytes = vec![0; byte_len];
+        bytes.resize(byte_len, 0);
         let queried_metadata = metadata;
         error.fill(0);
         // SAFETY: `bytes` is writable for exactly the capacity advertised by
@@ -612,7 +642,7 @@ impl Context {
         if metadata != queried_metadata {
             return Err("RT64 present capture metadata changed during synchronous readback".into());
         }
-        Ok(crate::Rt64PresentedPixels {
+        Ok(PresentedPixelMetadata {
             width: metadata.width,
             height: metadata.height,
             row_bytes: metadata.row_bytes,
@@ -620,7 +650,6 @@ impl Context {
             graphics_api,
             present_id: metadata.present_id,
             workload_id: metadata.workload_id,
-            bytes,
         })
     }
 
@@ -1341,4 +1370,3 @@ impl Drop for Context {
         unsafe { fn64_rt64_destroy(self.0.as_ptr()) };
     }
 }
-

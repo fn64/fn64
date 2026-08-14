@@ -69,7 +69,7 @@
       "evidence": [
         { "kind": "official_readme", "path": "README.md", "line": 13, "needle": "D3D12, Vulkan and Metal" },
         { "kind": "pinned_source", "path": "src/hle/rt64_application.cpp", "line": 168, "needle": "GraphicsAPI::Metal" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_metal_backend_behavior.rs", "line": 273, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_metal_backend_behavior.rs", "line": 278, "needle": "validate_capture(resized, &resized_capture, &identity, policy_sha256)", "claim_id": "backend-metal" }
       ]
     },
     {
@@ -259,7 +259,7 @@
         { "kind": "official_readme", "path": "README.md", "line": 69, "needle": "direct copy of one of its regions" },
         { "kind": "pinned_source", "path": "src/hle/rt64_framebuffer_manager.cpp", "line": 105, "needle": "createTileCopySetup" },
         { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_framebuffer_rdram_region_behavior.rs", "line": 205, "needle": "if sampled_after != expected_sampled", "claim_id": "framebuffer-detection-region-copy" },
-        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_enhancement_emulator_controls_behavior.rs", "line": 677, "needle": "gpu_copy.copy_path.path != Rt64FramebufferCopyPath::GpuTileCopy", "claim_id": "framebuffer-detection-region-copy" }
+        { "kind": "fn64_feature_test", "path": "crates/fn64-certification/examples/rt64_enhancement_emulator_controls_behavior.rs", "line": 682, "needle": "gpu_copy.copy_path.path != Rt64FramebufferCopyPath::GpuTileCopy", "claim_id": "framebuffer-detection-region-copy" }
       ]
     },
     {

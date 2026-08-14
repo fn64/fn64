@@ -867,6 +867,16 @@ pub(crate) fn drop_backends_for_process_exit() {
 /// remain typed errors.
 pub fn capture_render_release_frame(
 ) -> Result<fn64_render::RenderReleaseCapture, fn64_render::RenderError> {
+    capture_render_release_frame_into(&mut Vec::new())
+}
+
+/// Capture through the registered backend while offering an allocation from
+/// an earlier capture for reuse. A successful result owns the allocation;
+/// callers recover it with `RenderReleaseCapture::pixels.into_bytes()` after
+/// presenting or hashing the image. Errors leave `reuse` owned by the caller.
+pub fn capture_render_release_frame_into(
+    reuse: &mut Vec<u8>,
+) -> Result<fn64_render::RenderReleaseCapture, fn64_render::RenderError> {
     if HLE_RENDER_CONTINUATION.with(|cell| cell.borrow().is_some()) {
         return Err(fn64_render::RenderError::Backend {
             backend: "render-release-capture",
@@ -880,7 +890,7 @@ pub fn capture_render_release_frame(
             .ok_or(fn64_render::RenderError::NotReady(
                 "capture_render_release_frame: no render backend registered",
             ))?;
-        let result = backend.release_capture();
+        let result = backend.release_capture_into(reuse);
         RENDER_LAST_ERROR.with(|last| {
             last.replace(result.as_ref().err().map(ToString::to_string));
         });

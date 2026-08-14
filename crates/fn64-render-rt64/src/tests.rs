@@ -153,6 +153,7 @@ use super::*;
         backend.last_present = Some(CompletedRt64Present {
             guest_cycle: 91,
             authority: Rt64PresentAuthority::LiveRegisters,
+            active_output_height: std::num::NonZeroU32::new(237),
         });
         backend.active_settings = Some(RenderRuntimeSettings::default());
         backend.active_enhancement_settings = Some(RenderEnhancementSettings::default());
@@ -183,9 +184,10 @@ use super::*;
         let compatibility = CompletedRt64Present {
             guest_cycle: 17,
             authority: Rt64PresentAuthority::BackendOnlyCompatibility,
+            active_output_height: None,
         };
         assert!(matches!(
-            compatibility.release_guest_cycle(),
+            compatibility.release_geometry(),
             Err(RenderError::NotReady(
                 "RT64 release capture requires a completed live-register VI present"
             ))
@@ -193,8 +195,22 @@ use super::*;
         let live = CompletedRt64Present {
             guest_cycle: 19,
             authority: Rt64PresentAuthority::LiveRegisters,
+            active_output_height: std::num::NonZeroU32::new(237),
         };
-        assert_eq!(live.release_guest_cycle().unwrap(), 19);
+        assert_eq!(live.release_geometry().unwrap().0, 19);
+        assert_eq!(live.release_geometry().unwrap().1.get(), 237);
+
+        let inactive = CompletedRt64Present {
+            guest_cycle: 23,
+            authority: Rt64PresentAuthority::LiveRegisters,
+            active_output_height: None,
+        };
+        assert!(matches!(
+            inactive.release_geometry(),
+            Err(RenderError::NotReady(
+                "RT64 release capture requires a completed active VI output window"
+            ))
+        ));
     }
 
     #[cfg(feature = "rt64")]

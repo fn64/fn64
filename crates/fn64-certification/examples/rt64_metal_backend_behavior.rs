@@ -486,13 +486,17 @@ mod tests {
             backend_identity: identity.canonical_id(),
             source_authoritative: true,
             settings_sha256: [3; 32],
-            width: spec.width + 1,
-            height: spec.height,
-            row_bytes: (spec.width + 1) * 4,
-            format: ReleaseCaptureFormat::PostViBgra8Unorm,
+            pixels: fn64_render::ReleaseCapturePixels::try_new(
+                ReleaseCaptureFormat::PostViBgra8Unorm,
+                spec.width + 1,
+                spec.height,
+                spec.height,
+                (spec.width + 1) * 4,
+                vec![1; ((spec.width + 1) * spec.height * 4) as usize],
+            )
+            .unwrap(),
             workload_id: std::num::NonZeroU64::new(1).unwrap(),
             present_id: 1,
-            bytes: vec![1; ((spec.width + 1) * spec.height * 4) as usize],
         };
         assert!(validate_capture(spec, &capture, &identity, [3; 32]).is_err());
     }

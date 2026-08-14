@@ -76,7 +76,7 @@ mod timing;
 use framebuffer::{FB_HEIGHT, FB_WIDTH};
 use gamepad::Gamepads;
 use input_map::{InputConfig, PadState};
-use timing::{RetraceOutcome, TimingWindow};
+use timing::TimingWindow;
 
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -192,6 +192,12 @@ struct PumpAttribution {
     advance_ms: f64,
     before: PumpCounters,
     after: PumpCounters,
+}
+
+struct PumpOutcome {
+    swapped: bool,
+    steps: u64,
+    vi_fields: u64,
 }
 
 impl PumpAttribution {
@@ -432,6 +438,8 @@ struct Shell {
     /// `osViSwapBuffer` -- see `present`.
     presented_frames: u64,
     last_heartbeat_frame: u64,
+    last_audio_requested_samples: u64,
+    last_audio_underrun_samples: u64,
     next_frame_deadline: std::time::Instant,
     frame_intervals: TimingWindow,
     pump_times: TimingWindow,
@@ -450,6 +458,9 @@ struct Shell {
     /// forever -- the RT64 image has to come back through
     /// `fn64_abi::capture_render_release_frame`.
     active_renderer: ActiveRenderer,
+    /// Storage returned by the prior RT64 release capture. Recovering it after
+    /// each present keeps allocation and page-zeroing out of the frame path.
+    rt64_capture_reuse: Vec<u8>,
 }
 
 /// The rasterizer in use, and therefore which of the two present paths runs.
@@ -496,22 +507,38 @@ struct PresentCadence {
     vi_fields: usize,
 }
 
+fn present_cadence_from_override(override_ms: Option<f64>) -> PresentCadence {
+    let interval_ns = match override_ms {
+        Some(ms) if !ms.is_finite() => panic!("FN64_FRAME_PACE_MS must be finite"),
+        Some(ms) if ms <= 0.0 => VI_FIELD_NS,
+        Some(ms) => {
+            let interval_ns = (ms * 1e6) as u64;
+            assert!(
+                interval_ns > 0,
+                "FN64_FRAME_PACE_MS must select a nonzero interval"
+            );
+            interval_ns
+        }
+        None => 2 * VI_FIELD_NS,
+    };
+    let vi_fields = ((interval_ns + VI_FIELD_NS / 2) / VI_FIELD_NS).max(1) as usize;
+    PresentCadence {
+        interval: std::time::Duration::from_nanos(interval_ns),
+        vi_fields,
+    }
+}
+
 fn present_cadence() -> PresentCadence {
     static CADENCE: std::sync::OnceLock<PresentCadence> = std::sync::OnceLock::new();
     *CADENCE.get_or_init(|| {
-        let interval_ns = match std::env::var("FN64_FRAME_PACE_MS")
+        let override_ms = std::env::var("FN64_FRAME_PACE_MS")
             .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-        {
-            Some(ms) if ms <= 0.0 => VI_FIELD_NS,
-            Some(ms) => (ms * 1e6) as u64,
-            None => 2 * VI_FIELD_NS,
-        };
-        let vi_fields = ((interval_ns + VI_FIELD_NS / 2) / VI_FIELD_NS).max(1) as usize;
-        PresentCadence {
-            interval: std::time::Duration::from_nanos(interval_ns),
-            vi_fields,
-        }
+            .map(|value| {
+                value
+                    .parse::<f64>()
+                    .expect("FN64_FRAME_PACE_MS must be a number")
+            });
+        present_cadence_from_override(override_ms)
     })
 }
 
@@ -525,6 +552,47 @@ fn advance_present_deadline(
         completed + interval
     } else {
         next
+    }
+}
+
+#[cfg(test)]
+mod present_cadence_tests {
+    use super::*;
+
+    #[test]
+    fn default_pairs_two_vi_fields_into_one_30hz_present() {
+        let cadence = present_cadence_from_override(None);
+        assert_eq!(
+            cadence.interval,
+            std::time::Duration::from_nanos(33_333_334)
+        );
+        assert_eq!(cadence.vi_fields, 2);
+    }
+
+    #[test]
+    fn zero_override_preserves_one_field_diagnostic_lane() {
+        let cadence = present_cadence_from_override(Some(0.0));
+        assert_eq!(
+            cadence.interval,
+            std::time::Duration::from_nanos(VI_FIELD_NS)
+        );
+        assert_eq!(cadence.vi_fields, 1);
+    }
+
+    #[test]
+    fn ordinary_overrun_retains_debt_but_large_stall_reanchors() {
+        let interval = std::time::Duration::from_nanos(2 * VI_FIELD_NS);
+        let scheduled = std::time::Instant::now();
+        let next = scheduled + interval;
+        assert_eq!(
+            advance_present_deadline(scheduled, next + interval, interval),
+            next
+        );
+        let stalled = next + interval.saturating_mul(2);
+        assert_eq!(
+            advance_present_deadline(scheduled, stalled, interval),
+            stalled + interval
+        );
     }
 }
 
@@ -653,9 +721,13 @@ impl Shell {
         fn64_abi::load_rom(rom.clone());
         fn64_abi::set_guest_running_thread_global(pack::OS_RUNNING_THREAD);
         // An interactive session runs for minutes, not a bounded probe. The
-        // per-step executor/device traces are diagnostic buffers that grow
-        // without bound; leaving them on would make the window stutter and then
-        // exhaust memory. Opt back in with the same env vars the batch lane uses.
+        // per-step traces and exact RSP/RDP evidence history grow without
+        // bound; leaving them on would make the window stutter and then exhaust
+        // memory. Release runs retain the default complete-evidence mode.
+        fn64_abi::set_rsp_rdp_observation_retention(
+            fn64_abi::RspRdpObservationRetention::InteractiveConstantSpace,
+        );
+        // Opt the diagnostic traces back in with the batch lane's env vars.
         if std::env::var_os("FN64_BLOCK_EXECUTOR_TRACE").is_none() {
             fn64_abi::set_trace_enabled(false);
         }
@@ -753,6 +825,8 @@ impl Shell {
             reported_first_frame: false,
             presented_frames: 0,
             last_heartbeat_frame: 0,
+            last_audio_requested_samples: 0,
+            last_audio_underrun_samples: 0,
             next_frame_deadline: std::time::Instant::now(),
             frame_intervals: TimingWindow::default(),
             pump_times: TimingWindow::default(),
@@ -760,6 +834,7 @@ impl Shell {
             schedule: std::env::var_os("FN64_CONTROLLER_SCHEDULE")
                 .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
             active_renderer,
+            rt64_capture_reuse: Vec::new(),
         }
     }
 
@@ -896,12 +971,13 @@ impl Shell {
     /// Returns when a retrace lands (one frame to present) or when the step /
     /// device-advance budget is exhausted, so the window never stops pumping
     /// events for longer than a frame's worth of work.
-    fn pump_one_frame(&mut self) -> RetraceOutcome {
+    fn pump_one_frame(&mut self) -> PumpOutcome {
         // Scanout origin, not `osViSwapBuffer` count -- see `present`. A game
         // that programs VI_ORIGIN directly reports `vi_swap_count() == 0`
         // forever, which would pin the boot step budget on every frame and
         // report `swapped: false` on every frame that in fact flipped buffers.
         let start_origin = fn64_abi::scanout_vi_framebuffer();
+        let start_vi_interrupts = fn64_abi::device_trace_summary().vi_interrupts;
         let mut drain = fn64_boot_harness::GuestDrain::default();
         let mut steps = 0u64;
         let mut device_advances = 0u32;
@@ -959,6 +1035,17 @@ impl Shell {
                     }
                     drain.record_step(next_priority.expect("drain authorized a runnable step"));
                     steps += 1;
+                    // Instruction checkpoints advance the same device clock
+                    // as the explicit quiescent arm. A runnable guest can
+                    // therefore cross a VI edge inside `run_one_step`; if we
+                    // only inspect `DeviceAdvance::ViFields` below, this loop
+                    // batches many retraces into one visible hitch. The
+                    // constant-space summary remains active with trace
+                    // retention disabled and is the exact committed-edge
+                    // counter for both paths.
+                    if fn64_abi::device_trace_summary().vi_interrupts > start_vi_interrupts {
+                        break;
+                    }
                 }
                 fn64_boot_harness::DrainDecision::AdvanceField => {
                     let arm_started = spike.as_ref().map(|_| std::time::Instant::now());
@@ -994,9 +1081,12 @@ impl Shell {
                 .report(total_ms, self.presented_frames);
             }
         }
-        RetraceOutcome {
+        PumpOutcome {
             swapped: fn64_abi::scanout_vi_framebuffer() != start_origin,
             steps,
+            vi_fields: fn64_abi::device_trace_summary()
+                .vi_interrupts
+                .saturating_sub(start_vi_interrupts),
         }
     }
 
@@ -1056,7 +1146,9 @@ impl Shell {
     /// may exceed the visible width. Reusing the reference path's `fb_width`
     /// and `stride` assumptions here would tear or panic.
     fn present_rt64(&mut self) {
-        let capture = match fn64_abi::capture_render_release_frame() {
+        let capture = match fn64_abi::capture_render_release_frame_into(
+            &mut self.rt64_capture_reuse,
+        ) {
             Ok(capture) => capture,
             // Before the guest's first completed VI present there is simply no
             // image yet. That is an ordinary early-boot state, not an error:
@@ -1067,6 +1159,12 @@ impl Shell {
                 return;
             }
         };
+        macro_rules! recover_capture_and_return {
+            () => {{
+                self.rt64_capture_reuse = capture.pixels.into_bytes();
+                return;
+            }};
+        }
         assert_eq!(
             capture.format,
             fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
@@ -1074,55 +1172,59 @@ impl Shell {
         );
 
         let width = usize::try_from(capture.width).expect("RT64 capture width exceeds usize");
-        let height = usize::try_from(capture.height).expect("RT64 capture height exceeds usize");
+        let storage_height =
+            usize::try_from(capture.height).expect("RT64 capture storage height exceeds usize");
+        let height = usize::try_from(capture.visible_height)
+            .expect("RT64 capture visible height exceeds usize");
         let row_bytes =
             usize::try_from(capture.row_bytes).expect("RT64 capture row stride exceeds usize");
         let visible_row_bytes = width
             .checked_mul(4)
             .expect("RT64 capture visible row size overflow");
-        assert!(
-            row_bytes >= visible_row_bytes,
-            "wm2000-shell: RT64 capture row stride {row_bytes} is smaller than {width} BGRA8 pixels"
-        );
-        assert_eq!(
-            capture.bytes.len(),
-            row_bytes
-                .checked_mul(height)
-                .expect("RT64 capture byte length overflow"),
-            "wm2000-shell: RT64 capture byte length does not match its declared geometry"
-        );
-        if width == 0 || height == 0 {
-            return;
-        }
 
-        // Resize the surface to RT64's OWN resolution the first time it is seen
-        // or whenever it changes. The reference path sizes from `vi_width()`;
-        // that value describes the guest framebuffer and has no authority over
-        // RT64's internal target.
+        // RT64 keeps filtering-extension rows in its complete release image.
+        // The validated capture type separately binds the guest-programmed
+        // active output height, so the interactive surface excludes those
+        // rows without mutating or weakening the renderer evidence bytes.
         if width != self.fb_width || height != self.fb_height {
             let Some(pixels) = self.pixels.as_mut() else {
-                return;
+                recover_capture_and_return!();
             };
             if pixels
-                .resize_buffer(capture.width, capture.height)
+                .resize_buffer(capture.width, capture.visible_height)
                 .is_err()
             {
-                return;
+                recover_capture_and_return!();
             }
             self.fb_width = width;
             self.fb_height = height;
-            self.rgba = vec![0u8; width * height * 4];
             println!(
                 "[wm2000-shell] resized present surface to {width}x{height} (RT64 internal \
                  render resolution, not the guest's VI framebuffer)"
             );
         }
 
-        // BGRA -> RGBA, dropping any stride padding past the visible width.
+        let next_presented_frame = self.presented_frames.saturating_add(1);
+        let report_due = !self.reported_first_frame
+            || next_presented_frame >= self.last_heartbeat_frame.saturating_add(60);
+
+        // BGRA -> RGBA directly into Pixels' upload buffer, dropping any
+        // stride padding past the visible width. The former intermediate
+        // `self.rgba` pass copied the complete frame a second time.
+        let Some(pixels) = self.pixels.as_mut() else {
+            recover_capture_and_return!();
+        };
         let mut uniform_probe: Option<[u8; 4]> = None;
         let mut blank = true;
-        for (row, source) in capture.bytes.chunks_exact(row_bytes).enumerate() {
-            let destination = &mut self.rgba[row * width * 4..(row + 1) * width * 4];
+        let destination_frame = pixels.frame_mut();
+        for (row, source) in capture
+            .pixels
+            .visible_bytes()
+            .chunks_exact(row_bytes)
+            .enumerate()
+        {
+            let destination =
+                &mut destination_frame[row * width * 4..(row + 1) * width * 4];
             for (out, bgra) in destination
                 .chunks_exact_mut(4)
                 .zip(source[..visible_row_bytes].chunks_exact(4))
@@ -1138,22 +1240,29 @@ impl Shell {
                 out.copy_from_slice(&rgba);
             }
         }
-
-        let Some(pixels) = self.pixels.as_mut() else {
-            return;
-        };
-        pixels.frame_mut().copy_from_slice(&self.rgba);
+        let rgba_hash = report_due.then(|| framebuffer::rgba_hash(destination_frame));
         if let Err(e) = pixels.render() {
             eprintln!("[wm2000-shell] pixels.render() failed: {e}");
-            return;
+            recover_capture_and_return!();
         }
         self.presented_frames += 1;
-        let source = format!(
-            "rt64_post_vi={width}x{height} present={} workload={}",
-            capture.present_id, capture.workload_id
-        );
-        let detail = format!("row_bytes={row_bytes} backend={}", capture.backend_identity);
-        self.report_presented_frame(blank, &source, &detail);
+        if self.frame_report_due() {
+            let source = format!(
+                "rt64_post_vi={width}x{height} present={} workload={}",
+                capture.present_id, capture.workload_id
+            );
+            let detail = format!(
+                "storage={width}x{storage_height} row_bytes={row_bytes} backend={}",
+                capture.backend_identity
+            );
+            self.report_presented_frame(
+                blank,
+                rgba_hash.expect("report cadence computed before render"),
+                &source,
+                &detail,
+            );
+        }
+        self.rt64_capture_reuse = capture.pixels.into_bytes();
     }
 
     fn present_reference(&mut self) {
@@ -1276,9 +1385,21 @@ impl Shell {
         }
 
         self.presented_frames += 1;
-        let origin = format!("origin={fb_offset:#010x}");
-        let first_frame_detail = format!("vi_width={src_stride}");
-        self.report_presented_frame(blank, &origin, &first_frame_detail);
+        if self.frame_report_due() {
+            let origin = format!("origin={fb_offset:#010x}");
+            let first_frame_detail = format!("vi_width={src_stride}");
+            self.report_presented_frame(
+                blank,
+                framebuffer::rgba_hash(&self.rgba),
+                &origin,
+                &first_frame_detail,
+            );
+        }
+    }
+
+    fn frame_report_due(&self) -> bool {
+        !self.reported_first_frame
+            || self.presented_frames >= self.last_heartbeat_frame.saturating_add(60)
     }
 
     /// Emit the first-frame line and the 60-frame heartbeat.
@@ -1289,8 +1410,18 @@ impl Shell {
     /// differed per backend would make the comparison a measurement of the
     /// logging. `source` names where the pixels came from, which is the only
     /// part that legitimately differs.
-    fn report_presented_frame(&mut self, blank: bool, source: &str, first_frame_detail: &str) {
+    fn report_presented_frame(
+        &mut self,
+        blank: bool,
+        rgba_hash: u64,
+        source: &str,
+        first_frame_detail: &str,
+    ) {
         let frames = self.presented_frames;
+        assert!(
+            self.frame_report_due(),
+            "wm2000-shell: frame report called outside its bounded cadence"
+        );
         // NOT `vi_swap_count()`. That counts `osViSwapBuffer_recomp` entries,
         // and WM2000 never calls it -- it flips VI_ORIGIN through raw MMIO, so
         // the count is a permanent zero for a title that is presenting fine
@@ -1301,7 +1432,6 @@ impl Shell {
         // test does not belong on the routine progress line; the scanout origin
         // is the portable fact.
         let scanout = fn64_abi::scanout_vi_framebuffer();
-        let rgba_hash = framebuffer::rgba_hash(&self.rgba);
         if !self.reported_first_frame {
             if blank {
                 println!(
@@ -1318,16 +1448,23 @@ impl Shell {
                 );
             }
             self.reported_first_frame = true;
-        } else if frames >= self.last_heartbeat_frame + 60 {
+        } else {
             let state = if blank { "uniform" } else { "non-uniform" };
             let audio = fn64_abi::audio_output_stats();
             let stream_health = fn64_abi::audio_stream_health().unwrap_or_default();
+            let requested_delta = stream_health
+                .requested_samples
+                .saturating_sub(self.last_audio_requested_samples);
+            let underrun_delta = stream_health
+                .underrun_samples
+                .saturating_sub(self.last_audio_underrun_samples);
             let interval = self.frame_intervals.take_stats();
             let pump = self.pump_times.take_stats();
-            // Report the whole distribution, and say outright whether the
-            // window held 60fps. The acceptance bar is a WORST-CASE bound, so
-            // `max` is the statistic that can falsify it -- a median of 8 ms
-            // next to a max of 45 ms is a miss, and median/p95 alone hide that.
+            let present_budget_ms = present_cadence().interval.as_secs_f64() * 1000.0;
+            // This is a 30 Hz presentation unit containing two 60 Hz VI
+            // fields. Compare both distributions to that unit, not to one VI
+            // field: labeling every healthy 33.333 ms present as a 16.7 ms
+            // miss hid the distinction this heartbeat exists to measure.
             let fmt = |s: &Option<timing::TimingStats>| {
                 s.as_ref().map_or_else(
                     || "none".to_string(),
@@ -1339,7 +1476,11 @@ impl Shell {
                             s.p95_ms,
                             s.p99_ms,
                             s.max_ms,
-                            if s.holds_60fps() { "" } else { " OVER-16.7ms" },
+                            if s.max_ms <= present_budget_ms {
+                                "".to_string()
+                            } else {
+                                format!(" OVER-{present_budget_ms:.1}ms")
+                            },
                         )
                     },
                 )
@@ -1349,7 +1490,7 @@ impl Shell {
                  ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
                  scanout={scanout:?}; frame_interval_ms[{}] pump_ms[{}]; \
                  audio{}: ai_buffers={} samples={} nonzero={} backend_buffers={} \
-                 underrun={}/{} slots ({:.1}% STARVED)",
+                 underrun_window={}/{} slots ({:.2}% STARVED); cumulative={}/{}",
                 fmt(&interval),
                 fmt(&pump),
                 // A zero audio counter has two completely different meanings and
@@ -1390,16 +1531,19 @@ impl Shell {
                 // nothing is being LOST; they say nothing about whether enough
                 // is ARRIVING (perf-method rule 22). This is the counter that
                 // can contradict the clean ones, so it belongs here.
-                stream_health.underrun_samples,
-                stream_health.requested_samples,
-                if stream_health.requested_samples == 0 {
+                underrun_delta,
+                requested_delta,
+                if requested_delta == 0 {
                     0.0
                 } else {
-                    stream_health.underrun_samples as f64 * 100.0
-                        / stream_health.requested_samples as f64
+                    underrun_delta as f64 * 100.0 / requested_delta as f64
                 },
+                stream_health.underrun_samples,
+                stream_health.requested_samples,
             );
             self.last_heartbeat_frame = frames;
+            self.last_audio_requested_samples = stream_health.requested_samples;
+            self.last_audio_underrun_samples = stream_health.underrun_samples;
         }
     }
 }
@@ -1577,8 +1721,15 @@ impl ApplicationHandler for Shell {
                         .unwrap_or(now_t),
                 ),
             );
-            for _ in 0..cadence.vi_fields {
-                self.pump_one_frame();
+            let mut produced_fields = 0usize;
+            while produced_fields < cadence.vi_fields {
+                let outcome = self.pump_one_frame();
+                if outcome.vi_fields == 0 {
+                    break;
+                }
+                produced_fields = produced_fields.saturating_add(
+                    usize::try_from(outcome.vi_fields).unwrap_or(usize::MAX),
+                );
             }
             self.pump_times.record(now_t.elapsed());
             // Retain ordinary deadline debt so a slow render field can be
@@ -1666,10 +1817,11 @@ fn main() {
             let started = std::time::Instant::now();
             let outcome = shell.pump_one_frame();
             println!(
-                "[wm2000-shell] probe frame {frame}: swapped={} steps={} wall_ms={:.1} \
+                "[wm2000-shell] probe frame {frame}: swapped={} steps={} vi_fields={} wall_ms={:.1} \
                  vi_swaps={} sim_time={} scanout={:?} swap_fb={:?}",
                 outcome.swapped,
                 outcome.steps,
+                outcome.vi_fields,
                 started.elapsed().as_secs_f64() * 1000.0,
                 fn64_abi::vi_swap_count(),
                 fn64_abi::sim_time(),
