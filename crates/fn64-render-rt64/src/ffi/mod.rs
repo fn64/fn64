@@ -502,7 +502,7 @@ fn validate_present_capture_metadata(
     Ok((host_len, format, graphics_api))
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[repr(C)]
 struct RawPresentSelection {
     present_id: u64,
@@ -511,9 +511,17 @@ struct RawPresentSelection {
     target_width: u32,
     target_height: u32,
     target_size: u32,
+    workload_resolution_scale_x: f32,
+    workload_resolution_scale_y: f32,
+    resolution_scale_x: f32,
+    resolution_scale_y: f32,
+    raster_width: u32,
+    raster_height: u32,
+    downsample_multiplier: u32,
+    reserved: u32,
 }
 
-const _: [(); 32] = [(); std::mem::size_of::<RawPresentSelection>()];
+const _: [(); 64] = [(); std::mem::size_of::<RawPresentSelection>()];
 
 const DEFERRED_MAX_FRAMEBUFFER_PAIRS: usize = 4;
 const DEFERRED_MAX_DRAW_CALLS: usize = 16;

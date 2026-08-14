@@ -450,7 +450,7 @@
         { "kind": "test", "path": "crates/fn64-render-rt64/src/tests.rs", "needle": "fn rt64_release_authority_rejects_backend_only_compatibility" },
         { "kind": "test", "path": "crates/fn64-abi/src/vi.rs", "needle": "fn raw_mmio_retrace_rereads_live_origin_bytes_without_a_graphics_task" },
         { "kind": "test", "path": "crates/fn64-render-rt64/tests/rt64_adapter_capture.rs", "needle": "fn typed_task_and_vi_cross_cpp_boundary_without_a_graphics_device" },
-        { "kind": "test", "path": "crates/fn64-render-rt64/tests/rt64_adapter_capture.rs", "needle": "fn odd_interlaced_origin_compensation_uses_two_effective_source_rows" },
+        { "kind": "test", "path": "crates/fn64-render-rt64/tests/rt64_adapter_capture.rs", "needle": "fn odd_interlaced_origin_is_not_precompensated_a_second_time" },
         { "kind": "test", "path": "crates/fn64-render-rt64/tests/rt64_adapter_capture.rs", "needle": "fn cpp_capture_distinguishes_compatibility_unspecified_from_explicit_mode_zero" },
         { "kind": "test", "path": "crates/fn64-certification/examples/rt64_vi_filter_behavior.rs", "needle": "aa_selector_evidence=separate-qualified-coverage-gate" },
         { "kind": "test", "path": "crates/fn64-certification/examples/rt64_vi_aa_selector_behavior.rs", "needle": "vi_aa_selector_evidence" },

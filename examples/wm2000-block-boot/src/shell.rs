@@ -467,8 +467,9 @@ struct Shell {
     /// accepted. Kept with the window owner so terminal-free experiments do
     /// not confuse the requested preset with the active one.
     rt64_active_mode_label: String,
-    /// Index into `Rt64AaPreset::ALL`; F7 advances only after an apply succeeds.
-    rt64_aa_preset_index: usize,
+    /// Exact preset represented by the active settings, or `None` for a
+    /// custom TOML image. Updated only after the renderer accepts a change.
+    rt64_active_preset: Option<rt64_aa_experiment::Rt64AaPreset>,
     /// Storage returned by the prior RT64 release capture. Recovering it after
     /// each present keeps allocation and page-zeroing out of the frame path.
     rt64_capture_reuse: Vec<u8>,
@@ -773,6 +774,8 @@ impl Shell {
             ActiveRenderer::Reference => "reference".to_owned(),
             ActiveRenderer::Rt64 => rt64_aa_experiment::Rt64AaPreset::Native.label().to_owned(),
         };
+        let mut rt64_active_preset = (active_renderer == ActiveRenderer::Rt64)
+            .then_some(rt64_aa_experiment::Rt64AaPreset::Native);
         if let Some(path) = rt64_settings_path.as_deref() {
             let settings = rt64_aa_experiment::load(path)
                 .unwrap_or_else(|error| panic!("wm2000-shell: {error}"));
@@ -782,6 +785,7 @@ impl Shell {
                 "wm2000-shell: startup RT64 settings were not applied"
             );
             rt64_active_mode_label = label;
+            rt64_active_preset = rt64_aa_experiment::Rt64AaPreset::from_settings(&settings);
         }
 
         let mut program = fn64_recomp_rs::BlockProgram::new();
@@ -875,7 +879,7 @@ impl Shell {
             active_renderer,
             rt64_settings_path,
             rt64_active_mode_label,
-            rt64_aa_preset_index: 0,
+            rt64_active_preset,
             rt64_capture_reuse: Vec::new(),
         }
     }
@@ -986,8 +990,8 @@ impl Shell {
         println!("[wm2000-shell] registered {label} renderer ({FB_WIDTH}x{FB_HEIGHT})");
         if active == ActiveRenderer::Rt64 {
             println!(
-                "[wm2000-shell] RT64 AA experiment: F7 cycles native/high-2x/box-SSAA/MSAA; \
-                 F6 reloads FN64_RT64_SETTINGS_FILE"
+                "[wm2000-shell] RT64 AA experiment: F7 toggles native/2x-box-SSAA; \
+                 F8 cycles all modes; F6 reloads FN64_RT64_SETTINGS_FILE"
             );
         }
         active
@@ -1037,15 +1041,13 @@ impl Shell {
         }
     }
 
-    fn cycle_rt64_aa_preset(&mut self) {
-        let next = (self.rt64_aa_preset_index + 1) % rt64_aa_experiment::Rt64AaPreset::ALL.len();
-        let preset = rt64_aa_experiment::Rt64AaPreset::ALL[next];
+    fn apply_rt64_aa_preset(&mut self, preset: rt64_aa_experiment::Rt64AaPreset) {
         if Self::apply_rt64_runtime_settings(
             self.active_renderer,
             preset.label(),
             &preset.settings(),
         ) {
-            self.rt64_aa_preset_index = next;
+            self.rt64_active_preset = Some(preset);
             self.rt64_active_mode_label = preset.label().to_owned();
             if let Some(window) = self.window.as_ref() {
                 window.set_title(&format!(
@@ -1054,6 +1056,30 @@ impl Shell {
                 ));
             }
         }
+    }
+
+    fn toggle_rt64_ssaa(&mut self) {
+        let preset = if self.rt64_active_preset
+            == Some(rt64_aa_experiment::Rt64AaPreset::Supersample2x)
+        {
+            rt64_aa_experiment::Rt64AaPreset::Native
+        } else {
+            rt64_aa_experiment::Rt64AaPreset::Supersample2x
+        };
+        self.apply_rt64_aa_preset(preset);
+    }
+
+    fn cycle_rt64_aa_preset(&mut self) {
+        let current = self
+            .rt64_active_preset
+            .and_then(|active| {
+                rt64_aa_experiment::Rt64AaPreset::ALL
+                    .iter()
+                    .position(|preset| *preset == active)
+            })
+            .unwrap_or(0);
+        let next = (current + 1) % rt64_aa_experiment::Rt64AaPreset::ALL.len();
+        self.apply_rt64_aa_preset(rt64_aa_experiment::Rt64AaPreset::ALL[next]);
     }
 
     fn reload_rt64_settings(&mut self) {
@@ -1068,6 +1094,8 @@ impl Shell {
             Ok(settings) => {
                 let label = format!("config:{}", path.display());
                 if Self::apply_rt64_runtime_settings(self.active_renderer, &label, &settings) {
+                    self.rt64_active_preset =
+                        rt64_aa_experiment::Rt64AaPreset::from_settings(&settings);
                     self.rt64_active_mode_label = label;
                     if let Some(window) = self.window.as_ref() {
                         window.set_title(&format!(
@@ -1821,6 +1849,10 @@ impl ApplicationHandler for Shell {
                         return;
                     }
                     if code == KeyCode::F7 && pressed {
+                        self.toggle_rt64_ssaa();
+                        return;
+                    }
+                    if code == KeyCode::F8 && pressed {
                         self.cycle_rt64_aa_preset();
                         return;
                     }
@@ -1966,24 +1998,27 @@ fn main() {
             .to_string_lossy()
             .parse()
             .expect("FN64_SHELL_HEADLESS_FRAMES must be an unsigned integer");
+        let quiet = std::env::var_os("FN64_SHELL_HEADLESS_QUIET").is_some();
         println!("[wm2000-shell] headless probe: pumping {frames} retraces without a window");
         for frame in 0..frames {
             let started = std::time::Instant::now();
             let outcome = shell.pump_one_frame();
-            println!(
-                "[wm2000-shell] probe frame {frame}: swapped={} steps={} vi_fields={} wall_ms={:.1} \
-                 vi_swaps={} sim_time={} scanout={:?} swap_fb={:?}",
-                outcome.swapped,
-                outcome.steps,
-                outcome.vi_fields,
-                started.elapsed().as_secs_f64() * 1000.0,
-                fn64_abi::vi_swap_count(),
-                fn64_abi::sim_time(),
-                fn64_abi::scanout_vi_framebuffer(),
-                fn64_abi::current_vi_framebuffer(),
-            );
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
+            if !quiet {
+                println!(
+                    "[wm2000-shell] probe frame {frame}: swapped={} steps={} vi_fields={} wall_ms={:.1} \
+                     vi_swaps={} sim_time={} scanout={:?} swap_fb={:?}",
+                    outcome.swapped,
+                    outcome.steps,
+                    outcome.vi_fields,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    fn64_abi::vi_swap_count(),
+                    fn64_abi::sim_time(),
+                    fn64_abi::scanout_vi_framebuffer(),
+                    fn64_abi::current_vi_framebuffer(),
+                );
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
         }
         println!(
             "[wm2000-shell] headless probe done: vi_swaps={} sim_time={} scanout={:?} \
@@ -1994,6 +2029,57 @@ fn main() {
             fn64_abi::current_vi_framebuffer(),
             fn64_abi::vi_width(),
         );
+        if std::env::var_os("FN64_SHELL_HEADLESS_CAPTURE_HASH").is_some()
+            && shell.active_renderer == ActiveRenderer::Rt64
+        {
+            let capture = fn64_abi::capture_render_release_frame_into(
+                &mut shell.rt64_capture_reuse,
+            )
+            .expect("FN64_SHELL_HEADLESS_CAPTURE_HASH requires one completed RT64 present");
+            let visible_row_bytes = usize::try_from(capture.width)
+                .expect("RT64 capture width exceeds usize")
+                .checked_mul(4)
+                .expect("RT64 capture visible row size overflow");
+            let row_bytes =
+                usize::try_from(capture.row_bytes).expect("RT64 capture row stride exceeds usize");
+            let mut hasher = Sha256::new();
+            for row in capture.pixels.visible_bytes().chunks_exact(row_bytes) {
+                hasher.update(&row[..visible_row_bytes]);
+            }
+            let sha256 = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            println!(
+                "[wm2000-shell] headless RT64 capture: mode={} present={} workload={} \
+                 visible={}x{} storage={}x{} row_bytes={} sha256={sha256}",
+                shell.rt64_active_mode_label,
+                capture.present_id,
+                capture.workload_id,
+                capture.width,
+                capture.visible_height,
+                capture.width,
+                capture.height,
+                capture.row_bytes,
+            );
+            let target = fn64_abi::render_target_diagnostic()
+                .expect("FN64_SHELL_HEADLESS_CAPTURE_HASH requires RT64 target diagnostics");
+            println!(
+                "[wm2000-shell] headless RT64 target: present={} address={:#010x} \
+                 workload_scale={}x{} target_scale={}x{} raster={}x{} downsample={}",
+                target.present_id,
+                target.target_address,
+                target.workload_resolution_scale.x(),
+                target.workload_resolution_scale.y(),
+                target.resolution_scale.x(),
+                target.resolution_scale.y(),
+                target.raster_width,
+                target.raster_height,
+                target.downsample_multiplier,
+            );
+            shell.rt64_capture_reuse = capture.pixels.into_bytes();
+        }
         let exit = fn64_abi::prepare_process_exit();
         println!("[wm2000-shell] process exit prepared: {exit:?}");
         return;

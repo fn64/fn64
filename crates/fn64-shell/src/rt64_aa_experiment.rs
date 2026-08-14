@@ -57,6 +57,12 @@ impl Rt64AaPreset {
         }
         settings
     }
+
+    pub fn from_settings(settings: &RenderRuntimeSettings) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.settings() == *settings)
+    }
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]

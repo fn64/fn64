@@ -180,7 +180,7 @@ pub struct Rt64PresentedPixels {
 /// Exact managed render target sampled by the most recently completed RT64
 /// VI draw. The texture identity is process-local and intended for behavioral
 /// evidence, while the address and dimensions name guest-visible state.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Rt64PresentSelection {
     pub present_id: u64,
     pub source_texture_identity: u64,
@@ -188,6 +188,13 @@ pub struct Rt64PresentSelection {
     pub target_width: u32,
     pub target_height: u32,
     pub target_size: u32,
+    pub workload_resolution_scale_x: f32,
+    pub workload_resolution_scale_y: f32,
+    pub resolution_scale_x: f32,
+    pub resolution_scale_y: f32,
+    pub raster_width: u32,
+    pub raster_height: u32,
+    pub downsample_multiplier: u32,
 }
 
 pub const RT64_DEFERRED_MAX_FRAMEBUFFER_PAIRS: usize = 4;
@@ -1260,6 +1267,74 @@ impl RenderBackend for Rt64Backend {
         #[cfg(not(feature = "rt64"))]
         {
             fn64_render::RenderBackendEvidence::Unidentified
+        }
+    }
+
+    fn render_target_diagnostic(
+        &mut self,
+    ) -> Result<fn64_render::RenderTargetDiagnostic, RenderError> {
+        #[cfg(feature = "rt64")]
+        {
+            let selection = self
+                .context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .present_selection()
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason,
+                })?;
+            let nonzero = |field: &'static str, value| {
+                std::num::NonZeroU32::new(value).ok_or_else(|| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason: format!("RT64 returned zero {field}"),
+                })
+            };
+            Ok(fn64_render::RenderTargetDiagnostic {
+                present_id: std::num::NonZeroU64::new(selection.present_id).ok_or_else(|| {
+                    RenderError::Backend {
+                        backend: "rt64-render-target-diagnostic",
+                        reason: "RT64 returned zero present ID".into(),
+                    }
+                })?,
+                target_address: selection.target_address,
+                workload_resolution_scale: fn64_render::RenderResolutionScale::try_new(
+                    selection.workload_resolution_scale_x,
+                    selection.workload_resolution_scale_y,
+                )
+                .ok_or_else(|| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason: format!(
+                        "RT64 returned invalid workload resolution scale {}x{}",
+                        selection.workload_resolution_scale_x,
+                        selection.workload_resolution_scale_y
+                    ),
+                })?,
+                resolution_scale: fn64_render::RenderResolutionScale::try_new(
+                    selection.resolution_scale_x,
+                    selection.resolution_scale_y,
+                )
+                .ok_or_else(|| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason: format!(
+                        "RT64 returned invalid resolution scale {}x{}",
+                        selection.resolution_scale_x, selection.resolution_scale_y
+                    ),
+                })?,
+                raster_width: nonzero("raster width", selection.raster_width)?,
+                raster_height: nonzero("raster height", selection.raster_height)?,
+                downsample_multiplier: nonzero(
+                    "downsample multiplier",
+                    selection.downsample_multiplier,
+                )?,
+            })
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            Err(RenderError::NotReady(
+                "RT64 render-target diagnostics require the rt64 feature",
+            ))
         }
     }
 

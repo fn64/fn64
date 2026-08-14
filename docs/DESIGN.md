@@ -1991,9 +1991,14 @@ task calls out:
   Enabling black with an effective Y scale other than the manual-required 1.0
   traps loudly, as do blacking while fade/repeat is active and enabling fade
   and repeat together. The RT64 adapter sends the complete register image
-  through its quarantined C boundary, compensates RT64's origin convention
-  with the image's own source width and RGBA16/RGBA32 pixel size, and retains
-  that image when later HLE/raw submissions or resizes refresh address aliases.
+  through its quarantined C boundary and preserves the guest's origin so
+  pinned RT64 applies its own one-row/odd-serrated-two-row framebuffer lookup
+  normalization exactly once. Precompensating that value in fn64 cancels the
+  native lookup and forces RT64's 1x scratch-upload path. The adapter retains
+  the complete image when later HLE/raw submissions or resizes refresh address
+  aliases. Backend-only compatibility callers have no live VI origin and name
+  the color-image base, so only that explicit state synthesizes RT64's inverse
+  lookup bias.
   A scoped foreign binding installs the call's RDRAM pointer in RT64 Core and
   State, waits both workload and presentation queues idle—including exception
   exits—and restores placeholder aliases before the Rust capability ends.
