@@ -487,6 +487,47 @@ const BOOT_STEPS_PER_PUMP: u64 = 4_000_000;
 /// stay inside one pump long enough to stop servicing window events.
 const DEVICE_ADVANCES_PER_PUMP: u32 = 4_096;
 
+/// NTSC VI remains a 60 Hz device clock even when the title draws at 30 Hz.
+const VI_FIELD_NS: u64 = 16_666_667;
+
+#[derive(Clone, Copy)]
+struct PresentCadence {
+    interval: std::time::Duration,
+    vi_fields: usize,
+}
+
+fn present_cadence() -> PresentCadence {
+    static CADENCE: std::sync::OnceLock<PresentCadence> = std::sync::OnceLock::new();
+    *CADENCE.get_or_init(|| {
+        let interval_ns = match std::env::var("FN64_FRAME_PACE_MS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+        {
+            Some(ms) if ms <= 0.0 => VI_FIELD_NS,
+            Some(ms) => (ms * 1e6) as u64,
+            None => 2 * VI_FIELD_NS,
+        };
+        let vi_fields = ((interval_ns + VI_FIELD_NS / 2) / VI_FIELD_NS).max(1) as usize;
+        PresentCadence {
+            interval: std::time::Duration::from_nanos(interval_ns),
+            vi_fields,
+        }
+    })
+}
+
+fn advance_present_deadline(
+    scheduled: std::time::Instant,
+    completed: std::time::Instant,
+    interval: std::time::Duration,
+) -> std::time::Instant {
+    let next = scheduled + interval;
+    if completed.saturating_duration_since(next) >= interval.saturating_mul(2) {
+        completed + interval
+    } else {
+        next
+    }
+}
+
 /// Replay a committed controller route in the windowed lane.
 ///
 /// The gate lane already accepts `FN64_CONTROLLER_SCHEDULE`; the shell only
@@ -1521,41 +1562,33 @@ impl ApplicationHandler for Shell {
         self.gamepads.poll();
         let _ = self.gamepads.take_pressed();
 
-        // WM2000 renders at 30 Hz: it submits ~2.88 display lists on every
-        // second VI field and none on the other. Measured live, that makes
-        // pump_ms alternate ~10 ms / ~42 ms, and a fixed 16.667 ms deadline
-        // cannot hold it -- the render field always overshoots, re-anchors at
-        // `now_t + FRAME`, and the following cheap field then arrives early.
-        // The result is 10/42/10/42 reaching the eye as judder, which reads as
-        // far worse than a slower but EVEN cadence.
-        //
-        // So pace to what the guest can actually sustain rather than to the
-        // field rate it cannot. `FN64_FRAME_PACE_MS` overrides; 0 restores the
-        // old 16.667 ms behaviour. The default of 33.333 (30 Hz) matches the
-        // game's own render cadence, so both populations fit inside one
-        // deadline and frames land evenly.
-        let frame_ns: u64 = match std::env::var("FN64_FRAME_PACE_MS").ok().and_then(|v| v.parse::<f64>().ok()) {
-            Some(ms) if ms <= 0.0 => 16_666_667,
-            Some(ms) => (ms * 1e6) as u64,
-            None => 33_333_333,
-        };
-        let frame: std::time::Duration = std::time::Duration::from_nanos(frame_ns);
+        // WM2000 draws at 30 Hz, but VI, device time, and audio still advance
+        // at 60 Hz. Pump both VI fields as one presentation unit, then show
+        // only the latest capture. Advancing one field per 33.333 ms halves
+        // the entire machine and makes the audio callback fill half its slots
+        // with silence even when both individual field populations are fast.
+        let cadence = present_cadence();
         let now_t = std::time::Instant::now();
         if now_t >= self.next_frame_deadline {
-            self.frame_intervals
-                .record(now_t.saturating_duration_since(
-                    self.next_frame_deadline.checked_sub(frame).unwrap_or(now_t),
-                ));
-            self.pump_one_frame();
+            self.frame_intervals.record(
+                now_t.saturating_duration_since(
+                    self.next_frame_deadline
+                        .checked_sub(cadence.interval)
+                        .unwrap_or(now_t),
+                ),
+            );
+            for _ in 0..cadence.vi_fields {
+                self.pump_one_frame();
+            }
             self.pump_times.record(now_t.elapsed());
-            // Hold cadence while we keep up; re-anchor (dropping missed frames)
-            // when we fall behind, so a slow pump cannot spiral into catch-up.
-            self.next_frame_deadline =
-                if now_t.saturating_duration_since(self.next_frame_deadline) < frame {
-                    self.next_frame_deadline + frame
-                } else {
-                    now_t + frame
-                };
+            // Retain ordinary deadline debt so a slow render field can be
+            // recovered by the following cheap field. Only a stall exceeding
+            // two complete presentation units is dropped, bounding catch-up.
+            self.next_frame_deadline = advance_present_deadline(
+                self.next_frame_deadline,
+                std::time::Instant::now(),
+                cadence.interval,
+            );
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw();
             }
