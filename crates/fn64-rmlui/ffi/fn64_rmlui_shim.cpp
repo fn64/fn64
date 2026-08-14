@@ -4,6 +4,7 @@
 #include <RmlUi/Core/SystemInterface.h>
 #include <RmlUi/Core/FileInterface.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -368,6 +369,27 @@ extern "C" void fn64_rmlui_element_set_class(
         return;
     }
     element->element->SetClass(class_name, enabled != 0);
+}
+
+extern "C" size_t fn64_rmlui_element_get_attribute(
+    Fn64RmluiElement *element,
+    const char *name,
+    char *buffer,
+    size_t buffer_capacity) {
+    if ((buffer != nullptr) && (buffer_capacity > 0)) {
+        buffer[0] = '\0';
+    }
+    if ((element == nullptr) || (element->element == nullptr) || (name == nullptr)) {
+        return 0;
+    }
+    const Rml::String value = element->element->GetAttribute<Rml::String>(name, Rml::String());
+    if ((buffer == nullptr) || (buffer_capacity == 0)) {
+        return value.size();
+    }
+    const size_t copy_len = std::min(value.size(), buffer_capacity - 1);
+    std::memcpy(buffer, value.data(), copy_len);
+    buffer[copy_len] = '\0';
+    return value.size();
 }
 
 namespace {
