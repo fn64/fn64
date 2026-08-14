@@ -4891,7 +4891,9 @@ release evidence:
 - RT64 release captures carry a validated owning pixel value binding format,
   width, storage height, visible height, row pitch, and exact byte length while
   reusing the same `Vec<u8>` allocation; BGRA-to-RGBA conversion writes directly
-  into Pixels' upload buffer instead of making another full-frame copy;
+  into Pixels' upload buffer instead of making another full-frame copy. A named,
+  validated layout token now crosses the backend seam, so adjacent dimensions
+  and row pitch cannot be supplied positionally to pixel ownership;
 - replacement packs are copied to a privately owned, revalidated activation
   snapshot. RT64 receives only snapshot paths, so capture no longer walks or
   hashes the original pack filesystem every frame while later streaming stays

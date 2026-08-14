@@ -1281,11 +1281,16 @@ use super::*;
                     source_authoritative: true,
                     settings_sha256: [0x5a; 32],
                     pixels: fn64_render::ReleaseCapturePixels::try_from_reused(
-                        fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
-                        2,
-                        1,
-                        1,
-                        8,
+                        fn64_render::ReleaseCaptureLayout::try_new(
+                            fn64_render::ReleaseCaptureLayoutSpec {
+                                format: fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+                                width: 2,
+                                storage_height: 1,
+                                visible_height: 1,
+                                row_bytes: 8,
+                            },
+                        )
+                        .unwrap(),
                         reuse,
                     )
                     .unwrap(),

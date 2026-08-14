@@ -1748,18 +1748,23 @@ impl RenderBackend for Rt64Backend {
                 }
             };
             let present_id = pixels.present_id;
-            let pixels = fn64_render::ReleaseCapturePixels::try_from_reused(
-                format,
-                pixels.width,
-                pixels.height,
-                active_output_height.get(),
-                pixels.row_bytes,
-                reuse,
-            )
-            .map_err(|error| RenderError::Backend {
-                backend: "rt64-release-capture",
-                reason: error.to_string(),
-            })?;
+            let layout =
+                fn64_render::ReleaseCaptureLayout::try_new(fn64_render::ReleaseCaptureLayoutSpec {
+                    format,
+                    width: pixels.width,
+                    storage_height: pixels.height,
+                    visible_height: active_output_height.get(),
+                    row_bytes: pixels.row_bytes,
+                })
+                .map_err(|error| RenderError::Backend {
+                    backend: "rt64-release-capture",
+                    reason: error.to_string(),
+                })?;
+            let pixels = fn64_render::ReleaseCapturePixels::try_from_reused(layout, reuse)
+                .map_err(|error| RenderError::Backend {
+                    backend: "rt64-release-capture",
+                    reason: error.to_string(),
+                })?;
             Ok(fn64_render::RenderReleaseCapture {
                 guest_cycle,
                 backend_identity: identity.canonical_id(),

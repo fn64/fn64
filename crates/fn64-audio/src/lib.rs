@@ -65,7 +65,13 @@ pub mod hle_snapshot;
 pub mod hle_transaction;
 pub mod rsp;
 pub mod standard_abi;
+mod units;
 pub mod whole_task;
+
+pub use units::{
+    ChannelCount, GuestDmaByteCount, GuestPcm16, GuestSampleRateHz, GuestSampleSlotCount,
+    HostFrameCount, HostSampleRateHz, HostSampleSlotCount,
+};
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -115,28 +121,28 @@ impl std::error::Error for AudioError {}
 /// mono test fixture backend isn't forced to lie about it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AudioConfig {
-    pub sample_rate_hz: u32,
-    pub channels: u16,
+    pub sample_rate_hz: GuestSampleRateHz,
+    pub channels: ChannelCount,
 }
 
 impl AudioConfig {
     pub fn new(sample_rate_hz: u32, channels: u16) -> Self {
         AudioConfig {
-            sample_rate_hz,
-            channels,
+            sample_rate_hz: GuestSampleRateHz::new(sample_rate_hz),
+            channels: ChannelCount::new(channels),
         }
     }
 }
 
-/// Cumulative host-stream delivery counters. `underrun_samples` counts the
-/// exact output slots filled with silence because the producer ring was empty;
-/// it is the mechanical choppiness signal that a point-in-time ring depth
-/// cannot provide.
+/// Cumulative host-stream delivery counters. `underrun_sample_slots` counts
+/// the exact interleaved output slots filled with silence because the producer
+/// ring was empty; it is the mechanical choppiness signal that a point-in-time
+/// ring depth cannot provide.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioStreamHealth {
     pub callbacks: u64,
-    pub requested_samples: u64,
-    pub underrun_samples: u64,
+    pub requested_sample_slots: HostSampleSlotCount,
+    pub underrun_sample_slots: HostSampleSlotCount,
     pub late_callbacks: u64,
     pub max_callback_gap_us: u64,
 }
@@ -157,10 +163,12 @@ pub trait AudioBackend {
     /// Enqueue one buffer of already-decoded interleaved PCM samples (i16,
     /// matching the N64 AI DMA's own sample format) for playback. Mirrors
     /// `RenderBackend::process_task` taking a raw byte slice: this crate
-    /// does not interpret *how* `samples` was produced (live RSP task output,
+    /// does not interpret *how* `pcm` was produced (live RSP task output,
     /// silence, or a test tone). Live execution is owned by fn64's task
-    /// dispatcher and RSP interpreter, not this delivery trait.
-    fn queue_samples(&mut self, samples: &[i16]) -> Result<(), AudioError>;
+    /// dispatcher and RSP interpreter, not this delivery trait. `GuestPcm16`
+    /// proves the buffer contains complete frames and carries its channel
+    /// count across the trait-object seam.
+    fn queue_samples(&mut self, pcm: GuestPcm16<'_>) -> Result<(), AudioError>;
 
     /// How many queued sample FRAMES (one frame = one sample per channel,
     /// matching libultra's own "sample" vs "frame" usage in
@@ -169,7 +177,7 @@ pub trait AudioBackend {
     /// capacity signal; it is not an emulated AI register. Guest-visible
     /// DMA progress comes from
     /// [`current_dma_bytes_remaining`](Self::current_dma_bytes_remaining).
-    fn frames_remaining(&self) -> Result<u32, AudioError>;
+    fn frames_remaining(&self) -> Result<HostFrameCount, AudioError>;
 
     /// Change the output sample rate at runtime, matching real hardware's
     /// `osAiSetFrequency` being callable mid-game (title music vs SFX often
@@ -177,12 +185,12 @@ pub trait AudioBackend {
     /// `RenderBackend::resize`: a backend that cannot honor a rate change
     /// should surface that at the next `queue_samples` call via
     /// `AudioError`, not here.
-    fn set_frequency(&mut self, sample_rate_hz: u32);
+    fn set_frequency(&mut self, sample_rate_hz: GuestSampleRateHz);
 
     /// The host stream's actual rate, when the backend knows it. This is
     /// telemetry for proving guest/device conversion, not an AI-register
     /// input. Default `None` keeps existing/fake backends contract-compatible.
-    fn stream_rate_hz(&self) -> Option<u32> {
+    fn stream_rate_hz(&self) -> Option<HostSampleRateHz> {
         None
     }
 
@@ -190,7 +198,7 @@ pub trait AudioBackend {
     /// playback queue. This is deliberately distinct from
     /// [`frames_remaining`](Self::frames_remaining): host-side prebuffering
     /// is not visible in the hardware `AI_LEN` register.
-    fn current_dma_bytes_remaining(&self) -> Option<u32> {
+    fn current_dma_bytes_remaining(&self) -> Option<GuestDmaByteCount> {
         None
     }
 
@@ -257,7 +265,7 @@ type SampleRing = Arc<Mutex<OutputRing>>;
 struct DmaSpan {
     output_samples_total: usize,
     output_samples_remaining: usize,
-    guest_bytes_total: u32,
+    guest_bytes_total: GuestDmaByteCount,
 }
 
 #[derive(Debug)]
@@ -287,7 +295,7 @@ impl OutputRing {
     /// and DMA progress advances by the same count. Doing the eviction first
     /// keeps `samples.len() <= sample_cap` throughout, so `extend` cannot
     /// allocate after stream creation.
-    fn push_dma(&mut self, output: &[i16], guest_bytes: u32) -> usize {
+    fn push_dma(&mut self, output: &[i16], guest_bytes: GuestDmaByteCount) -> usize {
         if output.is_empty() {
             return 0;
         }
@@ -355,13 +363,14 @@ impl OutputRing {
         output.len() - delivered
     }
 
-    fn current_dma_bytes_remaining(&self) -> u32 {
+    fn current_dma_bytes_remaining(&self) -> GuestDmaByteCount {
         let Some(front) = self.dmas.front() else {
-            return 0;
+            return GuestDmaByteCount::ZERO;
         };
-        let remaining = u64::from(front.guest_bytes_total) * front.output_samples_remaining as u64
+        let remaining = u64::from(front.guest_bytes_total.get())
+            * front.output_samples_remaining as u64
             / front.output_samples_total as u64;
-        u32::try_from(remaining).unwrap_or(u32::MAX) & !3
+        GuestDmaByteCount::new(u32::try_from(remaining).unwrap_or(u32::MAX) & !3)
     }
 
     fn has_ai_double_buffer(&self) -> bool {
@@ -375,7 +384,7 @@ fn drain_ring_into_f32(mut ring: MutexGuard<'_, OutputRing>, output: &mut [f32])
 
 /// Never wait on the emulation thread from cpal's realtime callback. A busy
 /// producer is indistinguishable from an empty ring for this one pull: both
-/// must become silence and both are included in `underrun_samples`.
+/// must become silence and both are included in `underrun_sample_slots`.
 fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> usize {
     match ring.try_lock() {
         Ok(guard) => drain_ring_into_f32(guard, output),
@@ -395,7 +404,7 @@ fn try_drain_ring_into_f32(ring: &SampleRing, output: &mut [f32]) -> usize {
 /// the ring runs dry.
 pub struct CpalBackend {
     ring: SampleRing,
-    channels: u16,
+    channels: ChannelCount,
     stream: Option<Stream>,
     stream_started: bool,
     /// The rate the host stream actually runs at, negotiated in [`create`]:
@@ -406,11 +415,11 @@ pub struct CpalBackend {
     /// zero-fill turns that into loud static -- hence [`BandlimitedResampler`].
     /// The host callback itself writes `f32`, CoreAudio's native path on macOS;
     /// the emulated AI/ring stays i16 until that final device boundary.
-    stream_rate_hz: u32,
+    stream_rate_hz: Option<HostSampleRateHz>,
     /// The guest-side production rate the queued samples arrive at. Seeded
     /// from the `create` config, updated live by `set_frequency`
     /// (`osAiSetFrequency`).
-    guest_rate_hz: u32,
+    guest_rate_hz: Option<GuestSampleRateHz>,
     resampler: BandlimitedResampler,
     /// Reused producer-side conversion storage. Its capacity is reserved from
     /// the exact rate ratio before resampling, avoiding a guaranteed growth
@@ -420,8 +429,8 @@ pub struct CpalBackend {
     /// per stream, not once per queue call.
     warned_overflow: bool,
     callback_count: Arc<AtomicU64>,
-    requested_samples: Arc<AtomicU64>,
-    underrun_samples: Arc<AtomicU64>,
+    requested_sample_slots: Arc<AtomicU64>,
+    underrun_sample_slots: Arc<AtomicU64>,
     late_callbacks: Arc<AtomicU64>,
     max_callback_gap_us: Arc<AtomicU64>,
     output_dump: Option<PcmStreamDump>,
@@ -438,17 +447,17 @@ impl CpalBackend {
     pub fn new() -> Self {
         CpalBackend {
             ring: Arc::new(Mutex::new(OutputRing::with_capacity(0))),
-            channels: 2,
+            channels: ChannelCount::STEREO,
             stream: None,
             stream_started: false,
-            stream_rate_hz: 0,
-            guest_rate_hz: 0,
+            stream_rate_hz: None,
+            guest_rate_hz: None,
             resampler: BandlimitedResampler::new(),
             resample_output: Vec::new(),
             warned_overflow: false,
             callback_count: Arc::new(AtomicU64::new(0)),
-            requested_samples: Arc::new(AtomicU64::new(0)),
-            underrun_samples: Arc::new(AtomicU64::new(0)),
+            requested_sample_slots: Arc::new(AtomicU64::new(0)),
+            underrun_sample_slots: Arc::new(AtomicU64::new(0)),
             late_callbacks: Arc::new(AtomicU64::new(0)),
             max_callback_gap_us: Arc::new(AtomicU64::new(0)),
             output_dump: None,
@@ -457,8 +466,9 @@ impl CpalBackend {
     }
 
     /// The negotiated host stream rate, once `create` has succeeded.
-    pub fn stream_rate_hz(&self) -> Option<u32> {
-        self.stream.as_ref().map(|_| self.stream_rate_hz)
+    pub fn stream_rate_hz(&self) -> Option<HostSampleRateHz> {
+        self.stream.as_ref()?;
+        self.stream_rate_hz
     }
 }
 
@@ -467,24 +477,29 @@ const OUTPUT_STREAM_DUMP_SECONDS: u64 = 12;
 struct PcmStreamDump {
     file: std::fs::File,
     path: std::path::PathBuf,
-    sample_rate_hz: u32,
+    sample_rate_hz: HostSampleRateHz,
+    channels: ChannelCount,
     samples_written: u64,
     buffers_written: u64,
 }
 
 impl PcmStreamDump {
-    fn maybe_create_from_env(sample_rate_hz: u32) -> Option<Self> {
+    fn maybe_create_from_env(
+        sample_rate_hz: HostSampleRateHz,
+        channels: ChannelCount,
+    ) -> Option<Self> {
         let path = std::env::var_os("FN64_DUMP_AUDIO_OUTPUT_STREAM_PCM")?;
         let path = std::path::PathBuf::from(path);
         match std::fs::File::create(&path) {
             Ok(file) => {
                 eprintln!(
-                    "fn64-audio: capturing up to {OUTPUT_STREAM_DUMP_SECONDS}s of post-resample stereo PCM at {sample_rate_hz} Hz to {path:?}"
+                    "fn64-audio: capturing up to {OUTPUT_STREAM_DUMP_SECONDS}s of post-resample {channels}-channel PCM at {sample_rate_hz} Hz to {path:?}"
                 );
                 Some(PcmStreamDump {
                     file,
                     path,
                     sample_rate_hz,
+                    channels,
                     samples_written: 0,
                     buffers_written: 0,
                 })
@@ -499,8 +514,8 @@ impl PcmStreamDump {
     fn write_samples(&mut self, samples: &[i16]) {
         use std::io::Write as _;
 
-        let max_samples = u64::from(self.sample_rate_hz)
-            .saturating_mul(2)
+        let max_samples = u64::from(self.sample_rate_hz.get())
+            .saturating_mul(u64::from(self.channels.get()))
             .saturating_mul(OUTPUT_STREAM_DUMP_SECONDS);
         let remaining = max_samples.saturating_sub(self.samples_written);
         let take = usize::try_from(remaining.min(samples.len() as u64)).unwrap_or(samples.len());
@@ -518,12 +533,15 @@ impl PcmStreamDump {
         self.samples_written += take as u64;
         self.buffers_written += 1;
         let meta = format!(
-            "format=s16le\nchannels=2\nsample_rate_hz={}\nsamples={}\nframes={}\nbuffers={}\nseconds={:.6}\n",
+            "format=s16le\nchannels={}\nsample_rate_hz={}\nsample_slots={}\nframes={}\nbuffers={}\nseconds={:.6}\n",
+            self.channels,
             self.sample_rate_hz,
             self.samples_written,
-            self.samples_written / 2,
+            self.samples_written / u64::from(self.channels.get()),
             self.buffers_written,
-            self.samples_written as f64 / 2.0 / f64::from(self.sample_rate_hz),
+            self.samples_written as f64
+                / f64::from(self.channels.get())
+                / f64::from(self.sample_rate_hz.get()),
         );
         if let Err(error) = std::fs::write(self.path.with_extension("meta"), meta) {
             eprintln!("fn64-audio: failed to update post-resample PCM metadata: {error}");
@@ -544,9 +562,9 @@ impl PcmStreamDump {
 /// interpolation.
 struct BandlimitedResampler {
     frames: Vec<i16>,
-    channels: usize,
-    in_hz: u32,
-    out_hz: u32,
+    channels: Option<ChannelCount>,
+    in_hz: Option<GuestSampleRateHz>,
+    out_hz: Option<HostSampleRateHz>,
     /// Fractional read position in `frames` coordinates.
     phase: f64,
 }
@@ -557,9 +575,9 @@ impl BandlimitedResampler {
     fn new() -> Self {
         BandlimitedResampler {
             frames: Vec::new(),
-            channels: 0,
-            in_hz: 0,
-            out_hz: 0,
+            channels: None,
+            in_hz: None,
+            out_hz: None,
             phase: 0.0,
         }
     }
@@ -569,37 +587,40 @@ impl BandlimitedResampler {
     /// unchanged (byte-identical to the pre-resampler behavior).
     fn process(
         &mut self,
-        input: &[i16],
-        channels: usize,
-        in_hz: u32,
-        out_hz: u32,
+        input: GuestPcm16<'_>,
+        in_hz: GuestSampleRateHz,
+        out_hz: HostSampleRateHz,
         out: &mut Vec<i16>,
     ) {
-        debug_assert!(channels > 0 && in_hz > 0 && out_hz > 0);
-        if in_hz == out_hz {
+        let channels = input.channels();
+        let channel_slots = channels.as_usize();
+        if in_hz.get() == out_hz.get() {
             self.reset();
-            out.extend_from_slice(input);
+            out.extend_from_slice(input.samples());
             return;
         }
 
-        if self.channels != channels || self.in_hz != in_hz || self.out_hz != out_hz {
+        if self.channels != Some(channels)
+            || self.in_hz != Some(in_hz)
+            || self.out_hz != Some(out_hz)
+        {
             self.reset();
-            self.channels = channels;
-            self.in_hz = in_hz;
-            self.out_hz = out_hz;
+            self.channels = Some(channels);
+            self.in_hz = Some(in_hz);
+            self.out_hz = Some(out_hz);
         }
 
-        let in_frames = input.len() / channels;
+        let in_frames = input.samples().len() / channel_slots;
         self.frames
-            .extend_from_slice(&input[..in_frames * channels]);
-        let total_frames = self.frames.len() / channels;
+            .extend_from_slice(&input.samples()[..in_frames * channel_slots]);
+        let total_frames = self.frames.len() / channel_slots;
         if total_frames == 0 {
             return;
         }
 
-        let step = in_hz as f64 / out_hz as f64;
+        let step = f64::from(in_hz.get()) / f64::from(out_hz.get());
         while self.phase + (Self::RADIUS as f64) < total_frames as f64 - 1.0e-9 {
-            for ch in 0..channels {
+            for ch in 0..channel_slots {
                 out.push(self.sample_at(self.phase, ch));
             }
             self.phase += step;
@@ -607,38 +628,42 @@ impl BandlimitedResampler {
 
         let keep_from = (self.phase.floor() as isize - Self::RADIUS).max(0) as usize;
         if keep_from > 0 {
-            self.frames.drain(..keep_from * channels);
+            self.frames.drain(..keep_from * channel_slots);
             self.phase -= keep_from as f64;
         }
     }
 
     fn reset(&mut self) {
         self.frames.clear();
-        self.channels = 0;
-        self.in_hz = 0;
-        self.out_hz = 0;
+        self.channels = None;
+        self.in_hz = None;
+        self.out_hz = None;
         self.phase = 0.0;
     }
 
     fn output_samples_hint(
-        input_samples: usize,
-        channels: usize,
-        in_hz: u32,
-        out_hz: u32,
+        input: GuestPcm16<'_>,
+        in_hz: GuestSampleRateHz,
+        out_hz: HostSampleRateHz,
     ) -> usize {
-        if in_hz == out_hz {
-            return input_samples;
+        if in_hz.get() == out_hz.get() {
+            return input.samples().len();
         }
-        let input_frames = input_samples / channels;
+        let channels = input.channels().as_usize();
+        let input_frames = input.samples().len() / channels;
         let output_frames = (input_frames as u128)
-            .saturating_mul(u128::from(out_hz))
-            .div_ceil(u128::from(in_hz))
+            .saturating_mul(u128::from(out_hz.get()))
+            .div_ceil(u128::from(in_hz.get()))
             .saturating_add(1);
         usize::try_from(output_frames.saturating_mul(channels as u128)).unwrap_or(usize::MAX)
     }
 
     fn sample_at(&self, pos: f64, channel: usize) -> i16 {
-        let frame_count = self.frames.len() / self.channels;
+        let channels = self
+            .channels
+            .expect("resampler samples require a configured channel count")
+            .as_usize();
+        let frame_count = self.frames.len() / channels;
         let center = pos.floor() as isize;
         let mut sum = 0.0;
         let mut weight_sum = 0.0;
@@ -648,7 +673,7 @@ impl BandlimitedResampler {
                 continue;
             };
             let clamped = index.clamp(0, frame_count.saturating_sub(1) as isize) as usize;
-            let sample = self.frames[clamped * self.channels + channel] as f64;
+            let sample = self.frames[clamped * channels + channel] as f64;
             sum += sample * weight;
             weight_sum += weight;
         }
@@ -737,21 +762,21 @@ impl AudioBackend for CpalBackend {
             reason: "no default output device".to_string(),
         })?;
 
-        let build = |rate_hz: u32| {
+        let build = |rate_hz: HostSampleRateHz| {
             let stream_config = StreamConfig {
-                channels: cfg.channels,
-                sample_rate: rate_hz,
+                channels: cfg.channels.get(),
+                sample_rate: rate_hz.get(),
                 buffer_size: cpal::BufferSize::Default,
             };
             // Allocate the complete 250 ms latency bound before cpal can run
             // its callback. `OutputRing::push_dma` evicts before appending, so
             // neither sample nor DMA-span storage grows on either thread.
-            let ring_capacity = (rate_hz as usize / 4).max(1) * cfg.channels.max(1) as usize;
+            let ring_capacity = (rate_hz.get() as usize / 4).max(1) * cfg.channels.as_usize();
             let ring = Arc::new(Mutex::new(OutputRing::with_capacity(ring_capacity)));
             let callback_ring = Arc::clone(&ring);
             let callback_count = Arc::clone(&self.callback_count);
-            let requested_samples = Arc::clone(&self.requested_samples);
-            let underrun_samples = Arc::clone(&self.underrun_samples);
+            let requested_sample_slots = Arc::clone(&self.requested_sample_slots);
+            let underrun_sample_slots = Arc::clone(&self.underrun_sample_slots);
             let late_callbacks = Arc::clone(&self.late_callbacks);
             let max_callback_gap_us = Arc::clone(&self.max_callback_gap_us);
             let mut last_pull = None;
@@ -764,7 +789,7 @@ impl AudioBackend for CpalBackend {
                             let gap = now.saturating_duration_since(last);
                             let expected = std::time::Duration::from_secs_f64(
                                 data.len() as f64
-                                    / f64::from(stream_config.channels.max(1))
+                                    / f64::from(stream_config.channels)
                                     / f64::from(stream_config.sample_rate),
                             );
                             if gap > expected.mul_f64(1.5) {
@@ -776,9 +801,9 @@ impl AudioBackend for CpalBackend {
                             );
                         }
                         callback_count.fetch_add(1, Ordering::Relaxed);
-                        requested_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        requested_sample_slots.fetch_add(data.len() as u64, Ordering::Relaxed);
                         let underrun = try_drain_ring_into_f32(&callback_ring, data);
-                        underrun_samples.fetch_add(underrun as u64, Ordering::Relaxed);
+                        underrun_sample_slots.fetch_add(underrun as u64, Ordering::Relaxed);
                     },
                     move |err| {
                         // cpal stream error callback: no runtime state to
@@ -799,8 +824,9 @@ impl AudioBackend for CpalBackend {
         // different-rate stream: the rate mismatch chronically starves or
         // floods the ring and the callback's zero-fill renders that as
         // loud static.
-        let (stream, ring, stream_rate_hz) = match build(cfg.sample_rate_hz) {
-            Ok((stream, ring)) => (stream, ring, cfg.sample_rate_hz),
+        let requested_host_rate = HostSampleRateHz::new(cfg.sample_rate_hz.get());
+        let (stream, ring, stream_rate_hz) = match build(requested_host_rate) {
+            Ok((stream, ring)) => (stream, ring, requested_host_rate),
             Err(requested_err) => {
                 let default_cfg =
                     device
@@ -819,7 +845,8 @@ impl AudioBackend for CpalBackend {
                      device-default {fallback_hz} Hz with band-limited resampling",
                     cfg.sample_rate_hz
                 );
-                let (stream, ring) = build(fallback_hz).map_err(|e| AudioError::Backend {
+                let fallback_rate = HostSampleRateHz::new(fallback_hz);
+                let (stream, ring) = build(fallback_rate).map_err(|e| AudioError::Backend {
                     backend: "cpal",
                     reason: format!(
                         "build_output_stream failed at requested {} Hz and at \
@@ -827,14 +854,14 @@ impl AudioBackend for CpalBackend {
                         cfg.sample_rate_hz
                     ),
                 })?;
-                (stream, ring, fallback_hz)
+                (stream, ring, fallback_rate)
             }
         };
 
         self.ring = ring;
         self.channels = cfg.channels;
-        self.stream_rate_hz = stream_rate_hz;
-        self.guest_rate_hz = cfg.sample_rate_hz;
+        self.stream_rate_hz = Some(stream_rate_hz);
+        self.guest_rate_hz = Some(cfg.sample_rate_hz);
         self.resampler = BandlimitedResampler::new();
         self.stream_started = false;
         self.output_dump = None;
@@ -843,41 +870,47 @@ impl AudioBackend for CpalBackend {
         Ok(())
     }
 
-    fn queue_samples(&mut self, samples: &[i16]) -> Result<(), AudioError> {
+    fn queue_samples(&mut self, pcm: GuestPcm16<'_>) -> Result<(), AudioError> {
         if self.stream.is_none() {
             return Err(AudioError::NotReady("create() not called"));
         }
-        let channels = self.channels.max(1) as usize;
-        let reserve = BandlimitedResampler::output_samples_hint(
-            samples.len(),
-            channels,
-            self.guest_rate_hz,
-            self.stream_rate_hz,
-        );
+        if pcm.channels() != self.channels {
+            return Err(AudioError::Backend {
+                backend: "cpal",
+                reason: format!(
+                    "queued PCM has {} channels but stream was created with {}",
+                    pcm.channels(),
+                    self.channels
+                ),
+            });
+        }
+        let guest_rate_hz = self
+            .guest_rate_hz
+            .expect("created stream must retain its guest sample rate");
+        let stream_rate_hz = self
+            .stream_rate_hz
+            .expect("created stream must retain its host sample rate");
+        let reserve = BandlimitedResampler::output_samples_hint(pcm, guest_rate_hz, stream_rate_hz);
         self.resample_output.clear();
         if self.resample_output.capacity() < reserve {
             self.resample_output.reserve(reserve);
         }
         self.resampler.process(
-            samples,
-            channels,
-            self.guest_rate_hz,
-            self.stream_rate_hz,
+            pcm,
+            guest_rate_hz,
+            stream_rate_hz,
             &mut self.resample_output,
         );
         if !self.output_dump_checked {
             self.output_dump_checked = true;
-            self.output_dump = PcmStreamDump::maybe_create_from_env(self.stream_rate_hz);
+            self.output_dump = PcmStreamDump::maybe_create_from_env(stream_rate_hz, self.channels);
         }
         if let Some(dump) = self.output_dump.as_mut() {
             dump.write_samples(&self.resample_output);
         }
         let (should_start, dropped, ring_cap) = {
             let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-            let dropped = ring.push_dma(
-                &self.resample_output,
-                u32::try_from(samples.len().saturating_mul(2)).unwrap_or(u32::MAX),
-            );
+            let dropped = ring.push_dma(&self.resample_output, pcm.dma_bytes());
             (
                 !self.stream_started && ring.has_ai_double_buffer(),
                 dropped,
@@ -905,32 +938,32 @@ impl AudioBackend for CpalBackend {
         Ok(())
     }
 
-    fn frames_remaining(&self) -> Result<u32, AudioError> {
+    fn frames_remaining(&self) -> Result<HostFrameCount, AudioError> {
         if self.stream.is_none() {
             return Err(AudioError::NotReady("create() not called"));
         }
         let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-        let channels = self.channels.max(1) as usize;
-        Ok((ring.samples.len() / channels) as u32)
+        Ok(HostFrameCount::new(
+            u64::try_from(ring.samples.len() / self.channels.as_usize())
+                .expect("host ring frame count must fit u64"),
+        ))
     }
 
-    fn set_frequency(&mut self, sample_rate_hz: u32) {
+    fn set_frequency(&mut self, sample_rate_hz: GuestSampleRateHz) {
         // Real hardware allows `osAiSetFrequency` mid-game. The live cpal
         // stream keeps its negotiated rate; only the producer-side resample
         // ratio changes, so this is cheap and infallible (matching
         // `RenderBackend::resize`'s contract). A zero rate is a caller bug
         // upstream (`osAiSetFrequency` returns -1 before reaching us) and
-        // is ignored rather than poisoning the ratio.
-        if sample_rate_hz != 0 {
-            self.guest_rate_hz = sample_rate_hz;
-        }
+        // cannot cross this typed boundary.
+        self.guest_rate_hz = Some(sample_rate_hz);
     }
 
-    fn stream_rate_hz(&self) -> Option<u32> {
+    fn stream_rate_hz(&self) -> Option<HostSampleRateHz> {
         CpalBackend::stream_rate_hz(self)
     }
 
-    fn current_dma_bytes_remaining(&self) -> Option<u32> {
+    fn current_dma_bytes_remaining(&self) -> Option<GuestDmaByteCount> {
         self.stream.as_ref()?;
         let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         Some(ring.current_dma_bytes_remaining())
@@ -940,8 +973,12 @@ impl AudioBackend for CpalBackend {
         self.stream.as_ref()?;
         Some(AudioStreamHealth {
             callbacks: self.callback_count.load(Ordering::Relaxed),
-            requested_samples: self.requested_samples.load(Ordering::Relaxed),
-            underrun_samples: self.underrun_samples.load(Ordering::Relaxed),
+            requested_sample_slots: HostSampleSlotCount::new(
+                self.requested_sample_slots.load(Ordering::Relaxed),
+            ),
+            underrun_sample_slots: HostSampleSlotCount::new(
+                self.underrun_sample_slots.load(Ordering::Relaxed),
+            ),
             late_callbacks: self.late_callbacks.load(Ordering::Relaxed),
             max_callback_gap_us: self.max_callback_gap_us.load(Ordering::Relaxed),
         })
@@ -959,34 +996,52 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         ready: bool,
-        channels: u16,
-        queued_frames: u32,
+        channels: Option<ChannelCount>,
+        queued_frames: HostFrameCount,
     }
 
     impl AudioBackend for FakeBackend {
         fn create(&mut self, cfg: &AudioConfig) -> Result<(), AudioError> {
             self.ready = true;
-            self.channels = cfg.channels;
+            self.channels = Some(cfg.channels);
             Ok(())
         }
 
-        fn queue_samples(&mut self, samples: &[i16]) -> Result<(), AudioError> {
+        fn queue_samples(&mut self, pcm: GuestPcm16<'_>) -> Result<(), AudioError> {
             if !self.ready {
                 return Err(AudioError::NotReady("create() not called"));
             }
-            let channels = self.channels.max(1) as u32;
-            self.queued_frames += samples.len() as u32 / channels;
+            let channels = self.channels.expect("ready fake must retain channels");
+            assert_eq!(pcm.channels(), channels);
+            let added = u64::try_from(pcm.samples().len() / channels.as_usize()).unwrap();
+            self.queued_frames = HostFrameCount::new(self.queued_frames.get() + added);
             Ok(())
         }
 
-        fn frames_remaining(&self) -> Result<u32, AudioError> {
+        fn frames_remaining(&self) -> Result<HostFrameCount, AudioError> {
             if !self.ready {
                 return Err(AudioError::NotReady("create() not called"));
             }
             Ok(self.queued_frames)
         }
 
-        fn set_frequency(&mut self, _sample_rate_hz: u32) {}
+        fn set_frequency(&mut self, _sample_rate_hz: GuestSampleRateHz) {}
+    }
+
+    fn stereo(samples: &[i16]) -> GuestPcm16<'_> {
+        GuestPcm16::new(samples, ChannelCount::STEREO)
+    }
+
+    fn guest_rate(rate: u32) -> GuestSampleRateHz {
+        GuestSampleRateHz::new(rate)
+    }
+
+    fn host_rate(rate: u32) -> HostSampleRateHz {
+        HostSampleRateHz::new(rate)
+    }
+
+    fn dma_bytes(bytes: u32) -> GuestDmaByteCount {
+        GuestDmaByteCount::new(bytes)
     }
 
     #[test]
@@ -994,14 +1049,14 @@ mod tests {
         let mut backend: Box<dyn AudioBackend> = Box::<FakeBackend>::default();
         backend.create(&AudioConfig::new(32000, 2)).unwrap();
         let samples = [0i16; 8]; // 4 stereo frames
-        backend.queue_samples(&samples).unwrap();
-        assert_eq!(backend.frames_remaining().unwrap(), 4);
+        backend.queue_samples(stereo(&samples)).unwrap();
+        assert_eq!(backend.frames_remaining().unwrap(), HostFrameCount::new(4));
     }
 
     #[test]
     fn queue_samples_before_create_is_not_ready() {
         let mut backend = FakeBackend::default();
-        let err = backend.queue_samples(&[0i16; 4]).unwrap_err();
+        let err = backend.queue_samples(stereo(&[0i16; 4])).unwrap_err();
         assert!(matches!(err, AudioError::NotReady(_)));
     }
 
@@ -1016,8 +1071,8 @@ mod tests {
     fn frames_remaining_accounts_for_channel_count() {
         let mut backend = FakeBackend::default();
         backend.create(&AudioConfig::new(48000, 2)).unwrap();
-        backend.queue_samples(&[1, 2, 3, 4, 5, 6]).unwrap(); // 3 stereo frames
-        assert_eq!(backend.frames_remaining().unwrap(), 3);
+        backend.queue_samples(stereo(&[1, 2, 3, 4, 5, 6])).unwrap(); // 3 stereo frames
+        assert_eq!(backend.frames_remaining().unwrap(), HostFrameCount::new(3));
     }
 
     #[test]
@@ -1060,7 +1115,7 @@ mod tests {
     #[test]
     fn cpal_backend_reports_not_ready_before_create() {
         let mut backend = CpalBackend::new();
-        let err = backend.queue_samples(&[0i16; 2]).unwrap_err();
+        let err = backend.queue_samples(stereo(&[0i16; 2])).unwrap_err();
         assert!(matches!(err, AudioError::NotReady(_)));
         let err = backend.frames_remaining().unwrap_err();
         assert!(matches!(err, AudioError::NotReady(_)));
@@ -1082,7 +1137,12 @@ mod tests {
         let mut rs = BandlimitedResampler::new();
         let input: Vec<i16> = (0..64).collect();
         let mut out = Vec::new();
-        rs.process(&input, 2, 32000, 32000, &mut out);
+        rs.process(
+            stereo(&input),
+            guest_rate(32000),
+            host_rate(32000),
+            &mut out,
+        );
         assert_eq!(out, input);
     }
 
@@ -1094,7 +1154,12 @@ mod tests {
         let mut rs = BandlimitedResampler::new();
         let input: Vec<i16> = (0..4000).collect(); // 2000 stereo frames
         let mut out = Vec::new();
-        rs.process(&input, 2, 32000, 48000, &mut out);
+        rs.process(
+            stereo(&input),
+            guest_rate(32000),
+            host_rate(48000),
+            &mut out,
+        );
         let frames_out = out.len() / 2;
         let expected = 2000 * 3 / 2;
         assert!(
@@ -1109,14 +1174,23 @@ mod tests {
         let mut output = Vec::new();
         for sample_count in [2, 30, 106, 2096, 14, 512] {
             let input: Vec<i16> = (0..sample_count).collect();
-            let hint = BandlimitedResampler::output_samples_hint(input.len(), 2, 28_800, 48_000);
+            let hint = BandlimitedResampler::output_samples_hint(
+                stereo(&input),
+                guest_rate(28_800),
+                host_rate(48_000),
+            );
             output.clear();
             if output.capacity() < hint {
                 output.reserve(hint);
             }
             let allocated = output.capacity();
 
-            resampler.process(&input, 2, 28_800, 48_000, &mut output);
+            resampler.process(
+                stereo(&input),
+                guest_rate(28_800),
+                host_rate(48_000),
+                &mut output,
+            );
 
             assert!(output.len() <= hint, "{sample_count} input samples");
             assert_eq!(output.capacity(), allocated, "{sample_count} input samples");
@@ -1135,7 +1209,12 @@ mod tests {
             input.push(-2000i16);
         }
         let mut out = Vec::new();
-        rs.process(&input, 2, 32000, 48000, &mut out);
+        rs.process(
+            stereo(&input),
+            guest_rate(32000),
+            host_rate(48000),
+            &mut out,
+        );
         assert!(!out.is_empty());
         for frame in out.chunks_exact(2) {
             assert_eq!(frame, [1000, -2000]);
@@ -1150,12 +1229,22 @@ mod tests {
         let input: Vec<i16> = (0..600).map(|i| ((i * 37) % 5000) as i16).collect();
 
         let mut whole = Vec::new();
-        BandlimitedResampler::new().process(&input, 2, 32000, 48000, &mut whole);
+        BandlimitedResampler::new().process(
+            stereo(&input),
+            guest_rate(32000),
+            host_rate(48000),
+            &mut whole,
+        );
 
         let mut chunked = Vec::new();
         let mut rs = BandlimitedResampler::new();
         for chunk in [&input[..106], &input[106..340], &input[340..]] {
-            rs.process(chunk, 2, 32000, 48000, &mut chunked);
+            rs.process(
+                stereo(chunk),
+                guest_rate(32000),
+                host_rate(48000),
+                &mut chunked,
+            );
         }
         assert_eq!(whole, chunked);
     }
@@ -1166,7 +1255,7 @@ mod tests {
         let allocated = ring.samples.capacity();
         let allocated_dmas = ring.dmas.capacity();
         let input: Vec<i16> = (0..100).collect();
-        assert_eq!(ring.push_dma(&input, 200), 60);
+        assert_eq!(ring.push_dma(&input, dma_bytes(200)), 60);
         assert_eq!(ring.samples.len(), 40);
         assert_eq!(
             *ring.samples.front().unwrap(),
@@ -1176,13 +1265,13 @@ mod tests {
         assert_eq!(*ring.samples.back().unwrap(), 99);
         assert_eq!(ring.samples.capacity(), allocated);
         assert_eq!(ring.dmas.capacity(), allocated_dmas);
-        assert_eq!(ring.current_dma_bytes_remaining(), 80);
+        assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(80));
     }
 
     #[test]
     fn realtime_callback_uses_silence_instead_of_waiting_for_busy_producer() {
         let mut output_ring = OutputRing::with_capacity(8);
-        output_ring.push_dma(&[10, 20, 30], 6);
+        output_ring.push_dma(&[10, 20, 30], dma_bytes(6));
         let ring = Arc::new(Mutex::new(output_ring));
         let producer_guard = ring.lock().unwrap();
         let mut output = [99.0; 5];
@@ -1199,20 +1288,20 @@ mod tests {
     #[test]
     fn ai_length_tracks_only_the_head_dma_not_host_prebuffer() {
         let mut ring = OutputRing::with_capacity(32);
-        ring.push_dma(&[1; 8], 16);
-        ring.push_dma(&[2; 8], 16);
+        ring.push_dma(&[1; 8], dma_bytes(16));
+        ring.push_dma(&[2; 8], dma_bytes(16));
         assert!(ring.has_ai_double_buffer());
-        assert_eq!(ring.current_dma_bytes_remaining(), 16);
+        assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(16));
 
         let mut output = [0; 6];
         assert_eq!(ring.drain_into(&mut output), 0);
-        assert_eq!(ring.current_dma_bytes_remaining(), 4);
+        assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(4));
 
         let mut output = [0; 2];
         assert_eq!(ring.drain_into(&mut output), 0);
         assert_eq!(
             ring.current_dma_bytes_remaining(),
-            16,
+            dma_bytes(16),
             "the second queued DMA becomes current only after the first drains"
         );
     }
@@ -1220,9 +1309,9 @@ mod tests {
     #[test]
     fn overflow_advances_head_dma_before_retaining_newest_dma() {
         let mut ring = OutputRing::with_capacity(10);
-        ring.push_dma(&[1; 8], 16);
-        assert_eq!(ring.push_dma(&[2; 8], 16), 6);
-        assert_eq!(ring.current_dma_bytes_remaining(), 4);
+        ring.push_dma(&[1; 8], dma_bytes(16));
+        assert_eq!(ring.push_dma(&[2; 8], dma_bytes(16)), 6);
+        assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(4));
         assert_eq!(
             ring.samples.iter().copied().collect::<Vec<_>>(),
             [1, 1, 2, 2, 2, 2, 2, 2, 2, 2]
@@ -1231,18 +1320,18 @@ mod tests {
         let mut head_tail = [0; 2];
         assert_eq!(ring.drain_into(&mut head_tail), 0);
         assert_eq!(head_tail, [1, 1]);
-        assert_eq!(ring.current_dma_bytes_remaining(), 16);
+        assert_eq!(ring.current_dma_bytes_remaining(), dma_bytes(16));
     }
 
     #[test]
     fn f32_drain_converts_i16_samples_at_the_host_boundary() {
         let mut ring = OutputRing::with_capacity(8);
-        ring.push_dma(&[i16::MIN, -16384, 0, 16384], 8);
+        ring.push_dma(&[i16::MIN, -16384, 0, 16384], dma_bytes(8));
         let mut output = [99.0; 6];
 
         assert_eq!(ring.drain_into_f32(&mut output), 2);
         assert_eq!(output, [-1.0, -0.5, 0.0, 0.5, 0.0, 0.0]);
-        assert_eq!(ring.current_dma_bytes_remaining(), 0);
+        assert_eq!(ring.current_dma_bytes_remaining(), GuestDmaByteCount::ZERO);
     }
 
     #[test]
@@ -1251,7 +1340,12 @@ mod tests {
         let mut rs = BandlimitedResampler::new();
         let input: Vec<i16> = (0..400).collect(); // 200 stereo frames
         let mut out = Vec::new();
-        rs.process(&input, 2, 32000, 22050, &mut out);
+        rs.process(
+            stereo(&input),
+            guest_rate(32000),
+            host_rate(22050),
+            &mut out,
+        );
         let frames_out = out.len() / 2;
         let expected = (200.0 * 22050.0 / 32000.0) as usize; // ~137
         assert!(
@@ -1268,7 +1362,12 @@ mod tests {
         let input = tone(4096, 12_000.0, 32_000.0, 12_000.0);
         let linear = linear_resample_for_quality_test(&input, 2, 32_000, 48_000);
         let mut bandlimited = Vec::new();
-        BandlimitedResampler::new().process(&input, 2, 32_000, 48_000, &mut bandlimited);
+        BandlimitedResampler::new().process(
+            stereo(&input),
+            guest_rate(32_000),
+            host_rate(48_000),
+            &mut bandlimited,
+        );
 
         let linear_tone = goertzel_power_mono(&linear, 2, 48_000.0, 12_000.0);
         let linear_image = goertzel_power_mono(&linear, 2, 48_000.0, 20_000.0);

@@ -696,6 +696,98 @@ impl std::fmt::Display for ReleaseCapturePixelsError {
 
 impl std::error::Error for ReleaseCapturePixelsError {}
 
+/// Named, unvalidated input for a release-capture layout.
+///
+/// The fields intentionally distinguish renderer storage height from the
+/// guest-visible height. Named construction also prevents adjacent `u32`
+/// dimensions and row pitch from being silently transposed at backend seams.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseCaptureLayoutSpec {
+    pub format: ReleaseCaptureFormat,
+    pub width: u32,
+    pub storage_height: u32,
+    pub visible_height: u32,
+    pub row_bytes: u32,
+}
+
+/// Validated format and storage geometry for one release capture.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseCaptureLayout {
+    format: ReleaseCaptureFormat,
+    width: u32,
+    storage_height: u32,
+    visible_height: u32,
+    row_bytes: u32,
+    byte_len: usize,
+}
+
+impl ReleaseCaptureLayout {
+    pub fn try_new(spec: ReleaseCaptureLayoutSpec) -> Result<Self, ReleaseCapturePixelsError> {
+        if spec.width == 0 || spec.storage_height == 0 {
+            return Err(ReleaseCapturePixelsError::ZeroDimension);
+        }
+        if spec.visible_height == 0 {
+            return Err(ReleaseCapturePixelsError::ZeroVisibleHeight);
+        }
+        if spec.visible_height > spec.storage_height {
+            return Err(ReleaseCapturePixelsError::VisibleHeightExceedsStorage {
+                visible: spec.visible_height,
+                storage: spec.storage_height,
+            });
+        }
+        let minimum = spec
+            .width
+            .checked_mul(spec.format.bytes_per_pixel())
+            .ok_or(ReleaseCapturePixelsError::TightRowBytesOverflow)?;
+        if spec.row_bytes < minimum {
+            return Err(ReleaseCapturePixelsError::RowBytesTooSmall {
+                minimum,
+                actual: spec.row_bytes,
+            });
+        }
+        let byte_len = usize::try_from(spec.row_bytes)
+            .ok()
+            .and_then(|row| {
+                usize::try_from(spec.storage_height)
+                    .ok()
+                    .and_then(|height| row.checked_mul(height))
+            })
+            .ok_or(ReleaseCapturePixelsError::ByteLengthOverflow)?;
+        Ok(Self {
+            format: spec.format,
+            width: spec.width,
+            storage_height: spec.storage_height,
+            visible_height: spec.visible_height,
+            row_bytes: spec.row_bytes,
+            byte_len,
+        })
+    }
+
+    pub const fn format(self) -> ReleaseCaptureFormat {
+        self.format
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn storage_height(self) -> u32 {
+        self.storage_height
+    }
+
+    pub const fn visible_height(self) -> u32 {
+        self.visible_height
+    }
+
+    pub const fn row_bytes(self) -> u32 {
+        self.row_bytes
+    }
+
+    pub const fn byte_len(self) -> usize {
+        self.byte_len
+    }
+}
+
 /// Read-only fields of one validated owned release image.
 ///
 /// This view is public so capture field reads remain concise. Only
@@ -720,50 +812,11 @@ pub struct ReleaseCapturePixelsView {
 pub struct ReleaseCapturePixels(ReleaseCapturePixelsView);
 
 impl ReleaseCapturePixels {
-    fn layout_byte_len(
-        format: ReleaseCaptureFormat,
-        width: u32,
-        height: u32,
-        visible_height: u32,
-        row_bytes: u32,
-    ) -> Result<usize, ReleaseCapturePixelsError> {
-        if width == 0 || height == 0 {
-            return Err(ReleaseCapturePixelsError::ZeroDimension);
-        }
-        if visible_height == 0 {
-            return Err(ReleaseCapturePixelsError::ZeroVisibleHeight);
-        }
-        if visible_height > height {
-            return Err(ReleaseCapturePixelsError::VisibleHeightExceedsStorage {
-                visible: visible_height,
-                storage: height,
-            });
-        }
-        let minimum = width
-            .checked_mul(format.bytes_per_pixel())
-            .ok_or(ReleaseCapturePixelsError::TightRowBytesOverflow)?;
-        if row_bytes < minimum {
-            return Err(ReleaseCapturePixelsError::RowBytesTooSmall {
-                minimum,
-                actual: row_bytes,
-            });
-        }
-        usize::try_from(row_bytes)
-            .ok()
-            .and_then(|row| usize::try_from(height).ok().and_then(|height| row.checked_mul(height)))
-            .ok_or(ReleaseCapturePixelsError::ByteLengthOverflow)
-    }
-
     pub fn try_new(
-        format: ReleaseCaptureFormat,
-        width: u32,
-        height: u32,
-        visible_height: u32,
-        row_bytes: u32,
+        layout: ReleaseCaptureLayout,
         bytes: Vec<u8>,
     ) -> Result<Self, ReleaseCapturePixelsError> {
-        let expected =
-            Self::layout_byte_len(format, width, height, visible_height, row_bytes)?;
+        let expected = layout.byte_len();
         if bytes.len() != expected {
             return Err(ReleaseCapturePixelsError::ByteLengthMismatch {
                 expected,
@@ -771,11 +824,11 @@ impl ReleaseCapturePixels {
             });
         }
         Ok(Self(ReleaseCapturePixelsView {
-            format,
-            width,
-            height,
-            visible_height,
-            row_bytes,
+            format: layout.format(),
+            width: layout.width(),
+            height: layout.storage_height(),
+            visible_height: layout.visible_height(),
+            row_bytes: layout.row_bytes(),
             bytes,
         }))
     }
@@ -783,50 +836,28 @@ impl ReleaseCapturePixels {
     /// Validate a caller-reused allocation before transferring its ownership.
     /// Validation failure leaves `reuse` unchanged.
     pub fn try_from_reused(
-        format: ReleaseCaptureFormat,
-        width: u32,
-        height: u32,
-        visible_height: u32,
-        row_bytes: u32,
+        layout: ReleaseCaptureLayout,
         reuse: &mut Vec<u8>,
     ) -> Result<Self, ReleaseCapturePixelsError> {
-        let expected =
-            Self::layout_byte_len(format, width, height, visible_height, row_bytes)?;
+        let expected = layout.byte_len();
         if reuse.len() != expected {
             return Err(ReleaseCapturePixelsError::ByteLengthMismatch {
                 expected,
                 actual: reuse.len(),
             });
         }
-        Self::try_new(
-            format,
-            width,
-            height,
-            visible_height,
-            row_bytes,
-            std::mem::take(reuse),
-        )
+        Self::try_new(layout, std::mem::take(reuse))
     }
 
-    /// Change the validated layout and resize owned storage with zeroed new
-    /// bytes. An invalid layout leaves both metadata and storage unchanged.
-    pub fn try_resize(
-        &mut self,
-        format: ReleaseCaptureFormat,
-        width: u32,
-        height: u32,
-        visible_height: u32,
-        row_bytes: u32,
-    ) -> Result<(), ReleaseCapturePixelsError> {
-        let byte_len =
-            Self::layout_byte_len(format, width, height, visible_height, row_bytes)?;
-        self.0.bytes.resize(byte_len, 0);
-        self.0.format = format;
-        self.0.width = width;
-        self.0.height = height;
-        self.0.visible_height = visible_height;
-        self.0.row_bytes = row_bytes;
-        Ok(())
+    /// Install another validated layout and resize owned storage with zeroed
+    /// new bytes.
+    pub fn resize(&mut self, layout: ReleaseCaptureLayout) {
+        self.0.bytes.resize(layout.byte_len(), 0);
+        self.0.format = layout.format();
+        self.0.width = layout.width();
+        self.0.height = layout.storage_height();
+        self.0.visible_height = layout.visible_height();
+        self.0.row_bytes = layout.row_bytes();
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -865,12 +896,31 @@ impl std::ops::Deref for ReleaseCapturePixels {
 
 #[cfg(test)]
 mod release_capture_pixels_tests {
-    use super::{ReleaseCaptureFormat, ReleaseCapturePixels, ReleaseCapturePixelsError};
+    use super::{
+        ReleaseCaptureFormat, ReleaseCaptureLayout, ReleaseCaptureLayoutSpec, ReleaseCapturePixels,
+        ReleaseCapturePixelsError,
+    };
+
+    fn layout(
+        width: u32,
+        storage_height: u32,
+        visible_height: u32,
+        row_bytes: u32,
+    ) -> Result<ReleaseCaptureLayout, ReleaseCapturePixelsError> {
+        ReleaseCaptureLayout::try_new(ReleaseCaptureLayoutSpec {
+            format: ReleaseCaptureFormat::PostViBgra8Unorm,
+            width,
+            storage_height,
+            visible_height,
+            row_bytes,
+        })
+    }
 
     #[test]
     fn construction_binds_layout_to_exact_storage_length() {
         let format = ReleaseCaptureFormat::PostViBgra8Unorm;
-        let pixels = ReleaseCapturePixels::try_new(format, 2, 2, 2, 12, vec![0; 24]).unwrap();
+        let pixels =
+            ReleaseCapturePixels::try_new(layout(2, 2, 2, 12).unwrap(), vec![0; 24]).unwrap();
         assert_eq!(pixels.format, format);
         assert_eq!(
             (
@@ -884,14 +934,14 @@ mod release_capture_pixels_tests {
         assert_eq!(pixels.as_bytes().len(), 24);
 
         assert_eq!(
-            ReleaseCapturePixels::try_new(format, 2, 2, 2, 8, vec![0; 15]).unwrap_err(),
+            ReleaseCapturePixels::try_new(layout(2, 2, 2, 8).unwrap(), vec![0; 15]).unwrap_err(),
             ReleaseCapturePixelsError::ByteLengthMismatch {
                 expected: 16,
                 actual: 15,
             }
         );
         assert_eq!(
-            ReleaseCapturePixels::try_new(format, 2, 2, 2, 7, vec![0; 14]).unwrap_err(),
+            layout(2, 2, 2, 7).unwrap_err(),
             ReleaseCapturePixelsError::RowBytesTooSmall {
                 minimum: 8,
                 actual: 7,
@@ -901,18 +951,17 @@ mod release_capture_pixels_tests {
 
     #[test]
     fn reused_storage_moves_only_after_validation() {
-        let format = ReleaseCaptureFormat::PostViBgra8Unorm;
         let mut reuse = Vec::with_capacity(64);
         reuse.resize(16, 0x5a);
         let allocation = reuse.as_ptr();
         let pixels =
-            ReleaseCapturePixels::try_from_reused(format, 2, 2, 2, 8, &mut reuse).unwrap();
+            ReleaseCapturePixels::try_from_reused(layout(2, 2, 2, 8).unwrap(), &mut reuse).unwrap();
         assert!(reuse.is_empty());
         assert_eq!(pixels.as_bytes().as_ptr(), allocation);
 
         let mut reuse = pixels.into_bytes();
         let allocation = reuse.as_ptr();
-        let error = ReleaseCapturePixels::try_from_reused(format, 2, 3, 3, 8, &mut reuse)
+        let error = ReleaseCapturePixels::try_from_reused(layout(2, 3, 3, 8).unwrap(), &mut reuse)
             .unwrap_err();
         assert_eq!(
             error,
@@ -927,11 +976,11 @@ mod release_capture_pixels_tests {
 
     #[test]
     fn resize_is_transactional_for_invalid_layouts() {
-        let format = ReleaseCaptureFormat::PostViBgra8Unorm;
-        let mut pixels = ReleaseCapturePixels::try_new(format, 2, 2, 2, 8, vec![1; 16]).unwrap();
+        let mut pixels =
+            ReleaseCapturePixels::try_new(layout(2, 2, 2, 8).unwrap(), vec![1; 16]).unwrap();
         let before = pixels.clone();
         assert_eq!(
-            pixels.try_resize(format, 3, 2, 2, 11).unwrap_err(),
+            layout(3, 2, 2, 11).unwrap_err(),
             ReleaseCapturePixelsError::RowBytesTooSmall {
                 minimum: 12,
                 actual: 11,
@@ -939,7 +988,7 @@ mod release_capture_pixels_tests {
         );
         assert_eq!(pixels, before);
 
-        pixels.try_resize(format, 3, 2, 2, 16).unwrap();
+        pixels.resize(layout(3, 2, 2, 16).unwrap());
         assert_eq!(
             (
                 pixels.width,
@@ -954,12 +1003,11 @@ mod release_capture_pixels_tests {
 
     #[test]
     fn visible_height_retains_renderer_extension_rows_outside_visible_prefix() {
-        let format = ReleaseCaptureFormat::PostViBgra8Unorm;
         let row_bytes = 8;
         let mut bytes = vec![0x11; row_bytes * 240];
         bytes[row_bytes * 237..].fill(0xee);
         let pixels =
-            ReleaseCapturePixels::try_new(format, 2, 240, 237, row_bytes as u32, bytes)
+            ReleaseCapturePixels::try_new(layout(2, 240, 237, row_bytes as u32).unwrap(), bytes)
                 .unwrap();
 
         assert_eq!(pixels.visible_bytes().len(), row_bytes * 237);
@@ -969,18 +1017,32 @@ mod release_capture_pixels_tests {
             .iter()
             .all(|byte| *byte == 0xee));
         assert_eq!(
-            ReleaseCapturePixels::try_new(format, 2, 240, 0, 8, vec![0; 8 * 240])
-                .unwrap_err(),
+            layout(2, 240, 0, 8).unwrap_err(),
             ReleaseCapturePixelsError::ZeroVisibleHeight
         );
         assert_eq!(
-            ReleaseCapturePixels::try_new(format, 2, 240, 241, 8, vec![0; 8 * 240])
-                .unwrap_err(),
+            layout(2, 240, 241, 8).unwrap_err(),
             ReleaseCapturePixelsError::VisibleHeightExceedsStorage {
                 visible: 241,
                 storage: 240,
             }
         );
+    }
+
+    #[test]
+    fn named_layout_spec_distinguishes_storage_visible_and_pitch() {
+        let layout = ReleaseCaptureLayout::try_new(ReleaseCaptureLayoutSpec {
+            format: ReleaseCaptureFormat::PostViBgra8Unorm,
+            width: 320,
+            storage_height: 240,
+            visible_height: 237,
+            row_bytes: 1280,
+        })
+        .unwrap();
+        assert_eq!(layout.storage_height(), 240);
+        assert_eq!(layout.visible_height(), 237);
+        assert_eq!(layout.row_bytes(), 1280);
+        assert_eq!(layout.byte_len(), 307_200);
     }
 }
 

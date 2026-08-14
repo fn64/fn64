@@ -487,11 +487,16 @@ mod tests {
             source_authoritative: true,
             settings_sha256: [3; 32],
             pixels: fn64_render::ReleaseCapturePixels::try_new(
-                ReleaseCaptureFormat::PostViBgra8Unorm,
-                spec.width + 1,
-                spec.height,
-                spec.height,
-                (spec.width + 1) * 4,
+                fn64_render::ReleaseCaptureLayout::try_new(
+                    fn64_render::ReleaseCaptureLayoutSpec {
+                        format: ReleaseCaptureFormat::PostViBgra8Unorm,
+                        width: spec.width + 1,
+                        storage_height: spec.height,
+                        visible_height: spec.height,
+                        row_bytes: (spec.width + 1) * 4,
+                    },
+                )
+                .unwrap(),
                 vec![1; ((spec.width + 1) * spec.height * 4) as usize],
             )
             .unwrap(),
