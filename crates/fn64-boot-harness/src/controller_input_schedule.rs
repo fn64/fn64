@@ -54,6 +54,31 @@ impl ControllerInputSchedule {
     pub fn phases(&self) -> &[ControllerInputPhase] {
         &self.phases
     }
+
+    /// Which physical ports this route actually drives, as a 4-slot mask.
+    ///
+    /// A route that only ever names port 0 describes a single-player session;
+    /// one that names port 1 describes a two-player card and needs a
+    /// controller physically present in that port, or the game's
+    /// `osContStartQuery` sees `CONT_ABSENT` and never polls it. Deriving the
+    /// hardware configuration from the route rather than a separate env var
+    /// keeps the two from disagreeing: a schedule cannot declare presses for a
+    /// port the harness left empty.
+    ///
+    /// A phase is only counted when it commands something -- an all-neutral
+    /// phase is what a schedule writes to RELEASE a button, so a port whose
+    /// every phase is idle was never really driven. This keeps a route that
+    /// pads port 1 with neutral filler from silently changing the guest's
+    /// probe answers.
+    pub fn driven_ports(&self) -> [bool; 4] {
+        let mut driven = [false; 4];
+        for phase in &self.phases {
+            if phase.input != ContInput::default() {
+                driven[usize::from(phase.port)] = true;
+            }
+        }
+        driven
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +214,30 @@ pub fn parse_controller_input_schedule(
     })
 }
 
+/// Physically populate every port the route drives, and leave the rest as the
+/// `PifModel` default has them.
+///
+/// This is the missing half of the input seam. `set_controller_state` feeds a
+/// port's button/stick bytes, but a port whose `PortState` is `Absent` answers
+/// `osContStartQuery` with `CONT_ABSENT` -- so libultra's Controller Manager
+/// records it as unconnected in `osContGetQuery`'s bitpattern and the game
+/// never issues read-data for it. Feeding inputs to an absent port is
+/// therefore inert: the bytes are stored and nothing reads them.
+///
+/// Port 0 stays populated unconditionally, matching the `PifModel` default, so
+/// a route that drives nothing still boots as a single-player session and the
+/// committed single-player routes are unaffected.
+pub fn attach_controllers_for_driven_ports(driven: [bool; 4]) {
+    for (port, driven) in driven.into_iter().enumerate() {
+        if driven && port != 0 {
+            fn64_abi::set_controller_port_state(
+                port,
+                fn64_runtime::PortState::StandardControllerNoPak,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +257,30 @@ mod tests {
         assert_eq!(schedule.phases().len(), 3);
         let expected: [u8; 32] = Sha256::digest(source).into();
         assert_eq!(schedule.source_sha256(), expected);
+    }
+
+    #[test]
+    fn driven_ports_follow_the_route_not_the_line_count() {
+        // Port 0 presses A, port 1 deflects its stick -- both are driven, and
+        // the harness must physically populate both or the guest's probe
+        // answers CONT_ABSENT for port 1 and never reads it.
+        let two_player = parse_controller_input_schedule(
+            b"fn64.controller-input-schedule.v1\n\
+              0 0 4 8000 0 0\n\
+              1 0 4 0000 -80 0\n",
+        )
+        .unwrap();
+        assert_eq!(two_player.driven_ports(), [true, true, false, false]);
+
+        // A port whose every phase is neutral is filler, not a player: it
+        // must not change the hardware the guest probes.
+        let padded = parse_controller_input_schedule(
+            b"fn64.controller-input-schedule.v1\n\
+              0 0 4 8000 0 0\n\
+              1 0 4 0000 0 0\n",
+        )
+        .unwrap();
+        assert_eq!(padded.driven_ports(), [true, false, false, false]);
     }
 
     #[test]

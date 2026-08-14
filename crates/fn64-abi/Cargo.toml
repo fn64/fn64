@@ -38,7 +38,16 @@ fn64-audio = { path = "../fn64-audio" }
 # coroutine model; not a second, competing coroutine implementation.
 corosensei = "0.3"
 fn64-recomp-rs = { path = "../fn64-recomp-rs", optional = true, default-features = false, features = ["aot-runtime"] }
-sha2 = "0.10"
+# `asm` selects sha2's aarch64/x86 hardware backend. The canonical mutation
+# journal SHA-256s the whole watched region -- the 1 MiB boot bank on WM2000 --
+# at every dispatch boundary, and profiling the shell found ~42% of samples in
+# `sha2::sha256::soft::compress`, the pure-software fallback, against ONE
+# sample in actual guest execution.
+#
+# This is a backend swap, not a semantic one: the backend runtime-detects the
+# CPU feature and falls back to `soft` when absent, so digests are identical on
+# every host and no receipt or journal root changes.
+sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 # Only for a test proving the gfx-task seam actually reaches a real backend

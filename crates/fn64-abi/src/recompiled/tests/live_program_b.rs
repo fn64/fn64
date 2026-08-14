@@ -112,6 +112,143 @@ use super::*;
 
 
     #[test]
+    fn host_memory_api_write_is_journaled_as_host_abi() {
+        // The point of the attributed host-memory API: a write from OUTSIDE the
+        // guest still lands in the mutation journal with a declaring writer.
+        // Writing the same bytes through `Rdram::as_mut_slice` declares
+        // nothing, which is the hole this closes -- so this test fails if the
+        // API ever stops bracketing its write in a child transaction.
+        with_executor(|executor| *executor = fn64_runtime::Executor::new());
+        with_host(|host| *host = crate::HostState::default());
+        let image_a = 0x2402_0001u32.to_be_bytes();
+        let image_b = 0x2402_0002u32.to_be_bytes();
+        let mut bytes = vec![0u8; 0x6004];
+        for (index, byte) in image_a.iter().copied().enumerate() {
+            bytes[(0x80 + index) ^ 3] = byte;
+        }
+        let mut program = BlockProgram::new();
+        for (bank, word, identity) in [
+            (CATALOG_REWRITE_A, 0x2402_0001, 0x81),
+            (CATALOG_REWRITE_B, 0x2402_0002, 0x82),
+        ] {
+            program
+                .register(
+                    CodeBank::new(bank, CATALOG_REWRITE_ENTRY, vec![word]).unwrap(),
+                    GeneratedBankRunner::new_with_artifact_identity(
+                        bank,
+                        catalog_rewrite_runner,
+                        ProgramArtifactIdentity::new([identity; 32]),
+                    ),
+                )
+                .unwrap();
+        }
+        let resolver = CatalogResolverInstallV1::new(
+            CatalogBlockProgramV1::new(
+                program,
+                ExecutionKey::new(CATALOG_REWRITE_A, CATALOG_REWRITE_ENTRY),
+                InstructionBudget::new(4).unwrap(),
+            )
+            .unwrap(),
+            HostFunctionCatalogV1::new(Vec::new()).unwrap(),
+            ProgramArtifactIdentity::new([0x83; 32]),
+        );
+        let mut catalog = PrecompiledGenerationCatalog::new();
+        for (id, bank, image) in [
+            (1, CATALOG_REWRITE_A, image_a),
+            (2, CATALOG_REWRITE_B, image_b),
+        ] {
+            catalog
+                .register(
+                    PrecompiledGeneration::new(
+                        GenerationId::new(id),
+                        CATALOG_REWRITE_ENTRY,
+                        GuestPc::new(CATALOG_REWRITE_ENTRY.get() + 4),
+                        CATALOG_REWRITE_ENTRY,
+                        GuestPc::new(CATALOG_REWRITE_ENTRY.get() + 4),
+                        sha2::Sha256::digest(image).into(),
+                        vec![PrecompiledShard::new(
+                            bank,
+                            CATALOG_REWRITE_ENTRY,
+                            GuestPc::new(CATALOG_REWRITE_ENTRY.get() + 4),
+                        )
+                        .unwrap()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let backing = |id| {
+            PrecompiledGenerationBackingV1::new(
+                GenerationId::new(id),
+                vec![BackedExecutableSpanV1::new(CATALOG_REWRITE_ENTRY, 0x80, 4).unwrap()],
+            )
+            .unwrap()
+        };
+        let generations =
+            BackedPrecompiledGenerationCatalogV1::new(catalog, vec![backing(2), backing(1)])
+                .unwrap();
+        let install = CatalogGenerationInstallV1::new(resolver, generations).unwrap();
+
+        // SAFETY: `bytes` remains live until the installed thread returns.
+        unsafe {
+            boot_thread0_catalog_generation_program_v1(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                install,
+                test_boot_context(CATALOG_REWRITE_ENTRY),
+                0xca83,
+                10,
+            );
+        }
+
+        let before = catalog_generation_install_evidence_snapshot()
+            .unwrap()
+            .mutation_journal
+            .unwrap()
+            .entries
+            .len();
+
+        // Write image_b over the watched executable span through the public API.
+        assert!(
+            crate::recompiled::write_guest_physical(0x80, &image_b),
+            "attributed host write was refused"
+        );
+        process_live_executable_writes_from_host();
+
+        let journal = catalog_generation_install_evidence_snapshot()
+            .unwrap()
+            .mutation_journal
+            .unwrap();
+        assert_eq!(
+            journal.entries.len(),
+            before + 1,
+            "host memory API write did not produce a journal entry"
+        );
+        let entry = journal.entries.last().unwrap();
+        assert_eq!(
+            entry.declared_writes[0].channel,
+            WriterChannel::HostAbi,
+            "host memory API write was not attributed to HostAbi"
+        );
+        assert!(
+            entry
+                .declared_writes
+                .iter()
+                .any(|declaration| declaration.physical_start <= 0x80
+                    && declaration.physical_end >= 0x84),
+            "declaration does not cover the bytes written: {:?}",
+            entry.declared_writes
+        );
+
+        // And the bytes actually landed.
+        assert_eq!(
+            crate::recompiled::read_guest_physical(0x80, 4).unwrap(),
+            image_b.to_vec(),
+            "read_guest_physical did not observe the write"
+        );
+    }
+
+    #[test]
     fn canonical_generation_cpu_write_retires_a_before_b_executes() {
         with_executor(|executor| *executor = fn64_runtime::Executor::new());
         with_host(|host| *host = crate::HostState::default());
@@ -478,6 +615,7 @@ use super::*;
                 byte_len: 8,
                 expected_sha256: [0x11; 32],
                 actual_sha256: [0x22; 32],
+                first_diff_offset: None,
             },
             |offset| completed[usize::try_from(offset - DMA_PHYSICAL).unwrap()],
         )

@@ -92,8 +92,13 @@ fn presentation() -> ViPresentation {
 fn submit(backend: &mut impl RenderBackend) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut rdram = fixture();
     let end = COMMANDS + 5 * 8;
-    let status =
-        backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end as u32, TARGET as u32)?;
+    let status = backend.process_rdp_commands(
+        &mut rdram,
+        COMMANDS as u32,
+        end as u32,
+        TARGET as u32,
+        true,
+    )?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "raw RDP fixture returned {status:?} instead of Complete"

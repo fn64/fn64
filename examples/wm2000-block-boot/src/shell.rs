@@ -6,7 +6,7 @@
 //! `crates/fn64-shell` is the FUNCTION-lane harness: its boot calls
 //! `fn64_abi::recompiled::boot_thread0(rdram_ptr, len, lookup, entrypoint, ..)`
 //! with a linked whole-ROM `*-recompiled` crate. WM2000 has no such crate. Its
-//! program is a 35-shard dense-AOT catalog sealed by
+//! program is the shared dense-AOT shard catalog sealed by
 //! `boot_thread0_validated_catalog_generation_program_v1`, which takes a
 //! `ValidatedBootstrapRdramV1` + `CatalogGenerationInstallV1` + `BootContext`
 //! instead of a lookup function. The two boot seams are not variants of one
@@ -22,7 +22,7 @@
 //! (`fn64_abi::with_registered_physical_rdram_read`), which is a different
 //! present path, not a parameterization of `fn64-shell`'s.
 //!
-//! Living in this package instead buys the thing that matters most: the 35
+//! Living in this package instead buys the thing that matters most: the
 //! generated shard crates, `build.rs`'s ROM discovery, and the one `OUT_DIR`
 //! `pack.rs` are SHARED with the batch runner. A separate crate would rebuild
 //! all of it (~3 GB of artifacts) and, worse, could drift from the certified
@@ -72,13 +72,16 @@ mod input_map;
 mod gamepad;
 #[path = "../../../crates/fn64-shell/src/timing.rs"]
 mod timing;
+#[path = "../../../crates/fn64-shell/src/rt64_aa_experiment.rs"]
+mod rt64_aa_experiment;
 
 use framebuffer::{FB_HEIGHT, FB_WIDTH};
 use gamepad::Gamepads;
 use input_map::{InputConfig, PadState};
-use timing::{RetraceOutcome, TimingWindow};
+use timing::TimingWindow;
 
-use pixels::{Pixels, SurfaceTexture};
+use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -90,6 +93,160 @@ use winit::window::{Window, WindowId};
 // `block_program.rs` and `dense_aot.rs` reach for these crate-root items via
 // `use crate::*`. The batch runner defines them alongside its profiling
 // instrumentation; this lane needs only the plain ones.
+
+/// Threshold in milliseconds above which a pump dumps its own attribution, or
+/// 0 when the gate is off.
+///
+/// Diagnostics only, and `OnceLock`-gated like every other `FN64_*` census, so
+/// an unset variable costs one relaxed load per frame.
+///
+/// This exists because a p99 says a frame was slow and nothing about WHY. A
+/// windowed run recorded a single **3,058 ms** frame against a p50 of 60 ms --
+/// three orders of magnitude, invisible to p95 -- and no statistic the
+/// heartbeat reports can distinguish the candidate causes: guest work in the
+/// scheduling arm, a device-advance storm in the other arm, or a host stall
+/// (audio callback, page faults, window back-pressure) that is not our work at
+/// all. Each predicts a DIFFERENT counter, so the outlier is attributable by
+/// counting rather than by inference:
+///
+/// - guest execution  -> `steps` is large; `sim_time` advances a lot
+/// - device-advance storm -> `advances` approaches its 4,096 cap with few steps
+/// - a host stall -> BOTH are ordinary and the wall clock is not
+///
+/// The third case is the one worth naming: an ordinary step count next to a
+/// three-second wall time is positive evidence that the time was not spent
+/// running the guest, which no amount of reading the pump loop can establish.
+///
+/// `FN64_SHELL_SPIKE_MS=<ms>`; absent, empty, `0`, or unparseable means off, on
+/// the same reasoning as `write_barrier::env_flag` (a diagnostic whose off lane
+/// is silently the on lane is worse than no diagnostic).
+fn spike_threshold_ms() -> f64 {
+    static THRESHOLD: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("FN64_SHELL_SPIKE_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Cheap counters read on both sides of one pump, so a slow frame can be
+/// attributed by DIFFERENCE rather than by absolute value.
+///
+/// Every field is an existing always-on counter: none of this turns on tracing
+/// or allocates. `host_evidence_snapshot()` would answer more questions but
+/// runs assertions and builds several `Vec`s, which is not something a frame
+/// path can afford to call unconditionally.
+#[derive(Clone, Copy)]
+struct PumpCounters {
+    sim_time: u64,
+    gfx_submits: u64,
+    audio_submits: u64,
+    vi_swaps: u64,
+    ai_buffers: u64,
+    backend_buffers: u64,
+    audio_samples: u64,
+    /// Counters from cpal's realtime thread, which runs INDEPENDENTLY of the
+    /// emulation thread. This is the host-vs-guest discriminator: a stall in
+    /// our pump leaves the audio callback ticking normally, whereas a stall in
+    /// the machine (scheduler preemption, page-fault storm, device
+    /// reconfiguration) stops both, and shows up here as a callback gap of the
+    /// same order as the frame.
+    audio_callbacks: u64,
+    audio_max_gap_us: u64,
+    audio_late_callbacks: u64,
+    audio_underrun_sample_slots: u64,
+}
+
+impl PumpCounters {
+    fn read() -> Self {
+        let (gfx_submits, audio_submits) = fn64_abi::task_counts();
+        let audio = fn64_abi::audio_output_stats();
+        let health = fn64_abi::audio_stream_health().unwrap_or_default();
+        Self {
+            sim_time: fn64_abi::sim_time(),
+            gfx_submits,
+            audio_submits,
+            vi_swaps: fn64_abi::vi_swap_count(),
+            ai_buffers: audio.ai_buffers,
+            backend_buffers: audio.backend_buffers,
+            audio_samples: audio.samples,
+            audio_callbacks: health.callbacks,
+            audio_max_gap_us: health.max_callback_gap_us,
+            audio_late_callbacks: health.late_callbacks,
+            audio_underrun_sample_slots: health.underrun_sample_slots.get(),
+        }
+    }
+}
+
+/// What one pump did, in counts. `steps` and `advances` come from the pump
+/// loop's own arms, so they attribute the wall time to a specific branch.
+struct PumpAttribution {
+    steps: u64,
+    advances: u32,
+    /// Wall time inside the scheduling arm only (`run_one_step` and the
+    /// controller feed), excluding device advances. The split matters: the two
+    /// arms have different fixes, and a pump that is 95% device advance is not
+    /// a guest-throughput problem however slow it looks.
+    step_ms: f64,
+    /// Wall time inside `advance_to_next_device_event` only.
+    advance_ms: f64,
+    before: PumpCounters,
+    after: PumpCounters,
+}
+
+struct PumpOutcome {
+    swapped: bool,
+    steps: u64,
+    vi_fields: u64,
+}
+
+impl PumpAttribution {
+    fn report(&self, total_ms: f64, frame: u64) {
+        let before = &self.before;
+        let after = &self.after;
+        // Wall time this pump did not spend in either arm. A large residual is
+        // itself the finding: it means the stall was not in guest stepping or
+        // device advance, which is where a host-side cause would show up.
+        let unattributed_ms = (total_ms - self.step_ms - self.advance_ms).max(0.0);
+        let per_step_us = if self.steps == 0 {
+            0.0
+        } else {
+            self.step_ms * 1000.0 / self.steps as f64
+        };
+        println!(
+            "[wm2000-shell] SPIKE frame #{frame}: wall={total_ms:.1}ms \
+             steps={} ({:.1}ms, {per_step_us:.2}us/step) advances={} ({:.1}ms) \
+             unattributed={unattributed_ms:.1}ms; \
+             d_sim_time={} d_gfx={} d_audio={} d_vi_swaps={} \
+             d_ai_buffers={} d_backend_buffers={} d_audio_samples={}; \
+             host: d_audio_callbacks={} audio_max_gap_us={} d_late_callbacks={} \
+             d_underrun_sample_slots={}",
+            self.steps,
+            self.step_ms,
+            self.advances,
+            self.advance_ms,
+            after.sim_time.wrapping_sub(before.sim_time),
+            after.gfx_submits.wrapping_sub(before.gfx_submits),
+            after.audio_submits.wrapping_sub(before.audio_submits),
+            after.vi_swaps.wrapping_sub(before.vi_swaps),
+            after.ai_buffers.wrapping_sub(before.ai_buffers),
+            after.backend_buffers.wrapping_sub(before.backend_buffers),
+            after.audio_samples.wrapping_sub(before.audio_samples),
+            after.audio_callbacks.wrapping_sub(before.audio_callbacks),
+            // Not a delta: `max_callback_gap_us` is a running maximum, so its
+            // value AFTER the spike is what a host stall would have raised.
+            after.audio_max_gap_us,
+            after.audio_late_callbacks.wrapping_sub(before.audio_late_callbacks),
+            after
+                .audio_underrun_sample_slots
+                .wrapping_sub(before.audio_underrun_sample_slots),
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+}
 
 struct DenseAotArtifact {
     bank_id: u64,
@@ -218,7 +375,7 @@ fn run_entry_aot_with_context_gate(
             println!("[wm2000-shell] first-entry BootContext matches exactly");
         }
     });
-    wm2000_block_shard_00::run(entry, budget, ctx, mem)
+    (DENSE_AOT_ARTIFACTS[0].runner)(entry, budget, ctx, mem)
 }
 
 fn run_overlay_aot_with_generation_gate(
@@ -249,7 +406,7 @@ fn run_nwxe_exception_image_with_digest_gate(
     fn64_boot_harness::verify_precompiled_words(
         entry.bank,
         GuestPc::new(image.va_start),
-        image.words,
+        &image.words(),
         image.sha256,
         mem,
     )
@@ -269,21 +426,69 @@ struct Shell {
     gamepads: Gamepads,
     rgba: Vec<u8>,
     fb_width: usize,
+    /// Height of the present surface. The reference path holds this at
+    /// `FB_HEIGHT` (the guest's VI framebuffer is always 240 lines here), but
+    /// RT64's post-VI output can resize both axes independently of its internal
+    /// raster target, so height can no longer be assumed constant.
+    fb_height: usize,
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
     reported_first_frame: bool,
-    last_heartbeat_swap: u64,
+    /// Frames this shell has actually blitted to the window. The heartbeat
+    /// counts these rather than `vi_swap_count()`, which is zero for the whole
+    /// run of a game that programs VI_ORIGIN directly instead of calling
+    /// `osViSwapBuffer` -- see `present`.
+    presented_frames: u64,
+    last_heartbeat_frame: u64,
+    last_audio_requested_sample_slots: u64,
+    last_audio_underrun_sample_slots: u64,
     next_frame_deadline: std::time::Instant,
     frame_intervals: TimingWindow,
     pump_times: TimingWindow,
     /// False until the first pump has run the guest on the captured boot clock.
     /// See `pump_one_frame` for why the first retrace must not precede it.
     entered_first_dispatch: bool,
+    /// Present when `FN64_CONTROLLER_SCHEDULE` names a committed route, which
+    /// then owns the pad instead of the live gamepad.
+    schedule: Option<ScheduleDriver>,
+    /// Which rasterizer `FN64_RENDER` selected, decided once at registration.
+    ///
+    /// This is not cosmetic: it picks the PRESENT PATH. The reference backend
+    /// rasterizes into guest RDRAM, so the window decodes RGBA5551 out of the
+    /// runtime's framebuffer. RT64 renders into its own GPU surface and writes
+    /// nothing back, so that decode would read a stale (usually black) buffer
+    /// forever -- the RT64 image has to come back through
+    /// `fn64_abi::capture_render_release_frame`.
+    active_renderer: ActiveRenderer,
+    /// Optional strict TOML image reloaded by F6. The path is captured once at
+    /// startup; changing process environment after boot is not a settings API.
+    rt64_settings_path: Option<std::path::PathBuf>,
+    /// Human-readable identity of the settings image that was actually
+    /// accepted. Kept with the window owner so terminal-free experiments do
+    /// not confuse the requested preset with the active one.
+    rt64_active_mode_label: String,
+    /// Exact preset represented by the active settings, or `None` for a
+    /// custom TOML image. Updated only after the renderer accepts a change.
+    rt64_active_preset: Option<rt64_aa_experiment::Rt64AaPreset>,
+    /// Storage returned by the prior RT64 release capture. Recovering it after
+    /// each present keeps allocation and page-zeroing out of the frame path.
+    rt64_capture_reuse: Vec<u8>,
+}
+
+/// The rasterizer in use, and therefore which of the two present paths runs.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ActiveRenderer {
+    /// Software rasterization into guest RDRAM; present decodes RGBA5551.
+    Reference,
+    /// Native GPU rasterization into RT64's own surface; present reads the
+    /// post-VI BGRA8 capture back through the ABI seam.
+    Rt64,
 }
 
 /// Bound on scheduling steps per pump, so a pathological spin cannot wedge the
 /// window. Same value and rationale as `crates/fn64-shell`.
 const STEPS_PER_PUMP: u64 = 200_000;
+const WINDOW_TITLE: &str = "fn64 -- WM2000 (dense AOT block program)";
 
 /// Bound for the pump that is still bringing the guest up to its first VI
 /// field, before any frame has been presented.
@@ -305,6 +510,201 @@ const BOOT_STEPS_PER_PUMP: u64 = 4_000_000;
 /// many short device deadlines between VI fields; without a cap the loop could
 /// stay inside one pump long enough to stop servicing window events.
 const DEVICE_ADVANCES_PER_PUMP: u32 = 4_096;
+
+/// NTSC VI remains a 60 Hz device clock even when the title draws at 30 Hz.
+const VI_FIELD_NS: u64 = 16_666_667;
+
+#[derive(Clone, Copy)]
+struct PresentCadence {
+    interval: std::time::Duration,
+    vi_fields: usize,
+}
+
+fn present_cadence_from_override(override_ms: Option<f64>) -> PresentCadence {
+    let interval_ns = match override_ms {
+        Some(ms) if !ms.is_finite() => panic!("FN64_FRAME_PACE_MS must be finite"),
+        Some(ms) if ms <= 0.0 => VI_FIELD_NS,
+        Some(ms) => {
+            let interval_ns = (ms * 1e6) as u64;
+            assert!(
+                interval_ns > 0,
+                "FN64_FRAME_PACE_MS must select a nonzero interval"
+            );
+            interval_ns
+        }
+        None => 2 * VI_FIELD_NS,
+    };
+    let vi_fields = ((interval_ns + VI_FIELD_NS / 2) / VI_FIELD_NS).max(1) as usize;
+    PresentCadence {
+        interval: std::time::Duration::from_nanos(interval_ns),
+        vi_fields,
+    }
+}
+
+fn present_cadence() -> PresentCadence {
+    static CADENCE: std::sync::OnceLock<PresentCadence> = std::sync::OnceLock::new();
+    *CADENCE.get_or_init(|| {
+        let override_ms = std::env::var("FN64_FRAME_PACE_MS")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<f64>()
+                    .expect("FN64_FRAME_PACE_MS must be a number")
+            });
+        present_cadence_from_override(override_ms)
+    })
+}
+
+fn advance_present_deadline(
+    scheduled: std::time::Instant,
+    completed: std::time::Instant,
+    interval: std::time::Duration,
+) -> std::time::Instant {
+    let next = scheduled + interval;
+    if completed.saturating_duration_since(next) >= interval.saturating_mul(2) {
+        completed + interval
+    } else {
+        next
+    }
+}
+
+#[cfg(test)]
+mod present_cadence_tests {
+    use super::*;
+
+    #[test]
+    fn default_pairs_two_vi_fields_into_one_30hz_present() {
+        let cadence = present_cadence_from_override(None);
+        assert_eq!(
+            cadence.interval,
+            std::time::Duration::from_nanos(33_333_334)
+        );
+        assert_eq!(cadence.vi_fields, 2);
+    }
+
+    #[test]
+    fn zero_override_preserves_one_field_diagnostic_lane() {
+        let cadence = present_cadence_from_override(Some(0.0));
+        assert_eq!(
+            cadence.interval,
+            std::time::Duration::from_nanos(VI_FIELD_NS)
+        );
+        assert_eq!(cadence.vi_fields, 1);
+    }
+
+    #[test]
+    fn ordinary_overrun_retains_debt_but_large_stall_reanchors() {
+        let interval = std::time::Duration::from_nanos(2 * VI_FIELD_NS);
+        let scheduled = std::time::Instant::now();
+        let next = scheduled + interval;
+        assert_eq!(
+            advance_present_deadline(scheduled, next + interval, interval),
+            next
+        );
+        let stalled = next + interval.saturating_mul(2);
+        assert_eq!(
+            advance_present_deadline(scheduled, stalled, interval),
+            stalled + interval
+        );
+    }
+}
+
+/// Replay a committed controller route in the windowed lane.
+///
+/// The gate lane already accepts `FN64_CONTROLLER_SCHEDULE`; the shell only
+/// took live pad input, so the two lanes could not be driven through the same
+/// inputs and a route that reached a menu was not reproducible in the lane
+/// that draws it.
+///
+/// The clock is the controller READ ORDINAL, not wall time or step count --
+/// a read is a shared external boundary, so the same file replays identically
+/// in both lanes even though one is pumped by a window and the other by a
+/// batch loop.
+struct ScheduleDriver {
+    schedule: fn64_boot_harness::ControllerInputSchedule,
+    read_ordinals: [u64; 4],
+    current: [fn64_runtime::ContInput; 4],
+    cursor: usize,
+}
+
+impl ScheduleDriver {
+    fn load(path: &std::path::Path) -> Self {
+        let source = std::fs::read(path).unwrap_or_else(|error| {
+            panic!("reading controller schedule {}: {error}", path.display())
+        });
+        let schedule = fn64_boot_harness::parse_controller_input_schedule(&source)
+            .unwrap_or_else(|error| {
+                panic!("parsing controller schedule {}: {error}", path.display())
+            });
+        let driven = schedule.driven_ports();
+        println!(
+            "[wm2000-shell] controller schedule={} phases={} driven_ports={driven:?} sha256={}",
+            path.display(),
+            schedule.phases().len(),
+            schedule.source_sha256_hex(),
+        );
+        fn64_boot_harness::attach_controllers_for_driven_ports(driven);
+        Self {
+            schedule,
+            read_ordinals: [0; 4],
+            current: [fn64_runtime::ContInput::default(); 4],
+            cursor: fn64_abi::copy_controller_operations().len(),
+        }
+    }
+
+    /// Advance each port's read ordinal by the reads the guest actually
+    /// performed since the last call.
+    fn observe_reads(&mut self) {
+        let operations = fn64_abi::copy_controller_operations_since(self.cursor);
+        self.cursor += operations.len();
+        for operation in operations {
+            if operation.device == fn64_runtime::ControllerOperationDevice::StandardController
+                && operation.operation == fn64_runtime::ControllerOperationKind::Read
+            {
+                let port = usize::from(operation.port);
+                self.read_ordinals[port] = self.read_ordinals[port]
+                    .checked_add(1)
+                    .expect("controller read ordinal overflow");
+            }
+        }
+    }
+
+    fn apply(&mut self) {
+        for port in 0..4 {
+            let input = self.schedule.input_for_read(port, self.read_ordinals[port]);
+            if input != self.current[port] {
+                fn64_abi::set_controller_state(port, input.button, input.stick_x, input.stick_y);
+                self.current[port] = input;
+                // Report the SAME counters the headless dump lane reports at
+                // this exact boundary (`main.rs`'s `input_edge` line), so the
+                // two lanes can be diffed row-for-row on one route. Printing
+                // only `vi_swaps` here is what made every previous window
+                // investigation ambiguous: `vi_swap_count` counts guest
+                // `osViSwapBuffer` calls, NOT VI retraces, so a zero there
+                // cannot distinguish "no retrace" from "retraces fine, guest
+                // never swapped" -- and those have opposite root causes. And
+                // `scanout` next to it, because WM2000 never calls
+                // `osViSwapBuffer` at all: it flips VI_ORIGIN directly, so
+                // `vi_swaps` stays 0 for a run that is displaying fine.
+                let (graphics_tasks, audio_tasks) = fn64_abi::task_counts();
+                println!(
+                    "[wm2000-shell] controller input_edge port={port} read={} buttons={:#06x} \
+                     stick=({}, {}) sim_time={} scanout={:?} vi_swaps={} gfx_submits={} \
+                     audio_submits={}",
+                    self.read_ordinals[port],
+                    input.button,
+                    input.stick_x,
+                    input.stick_y,
+                    fn64_abi::sim_time(),
+                    fn64_abi::scanout_vi_framebuffer(),
+                    fn64_abi::vi_swap_count(),
+                    graphics_tasks,
+                    audio_tasks,
+                );
+            }
+        }
+    }
+}
 
 impl Shell {
     fn boot() -> Self {
@@ -334,9 +734,13 @@ impl Shell {
         fn64_abi::load_rom(rom.clone());
         fn64_abi::set_guest_running_thread_global(pack::OS_RUNNING_THREAD);
         // An interactive session runs for minutes, not a bounded probe. The
-        // per-step executor/device traces are diagnostic buffers that grow
-        // without bound; leaving them on would make the window stutter and then
-        // exhaust memory. Opt back in with the same env vars the batch lane uses.
+        // per-step traces and exact RSP/RDP evidence history grow without
+        // bound; leaving them on would make the window stutter and then exhaust
+        // memory. Release runs retain the default complete-evidence mode.
+        fn64_abi::set_rsp_rdp_observation_retention(
+            fn64_abi::RspRdpObservationRetention::InteractiveConstantSpace,
+        );
+        // Opt the diagnostic traces back in with the batch lane's env vars.
         if std::env::var_os("FN64_BLOCK_EXECUTOR_TRACE").is_none() {
             fn64_abi::set_trace_enabled(false);
         }
@@ -352,22 +756,37 @@ impl Shell {
             fn64_runtime::SaveType::SramBanked,
         )));
 
-        use fn64_render::RenderBackend as _;
-        let mut render_backend = fn64_render_reference::ReferenceBackend::new()
-            .with_f3dex2()
-            .with_clear_color([0, 0, 0, 255]);
-        render_backend
-            .create(&fn64_render::RenderConfig::ntsc(
-                FB_WIDTH as u32,
-                FB_HEIGHT as u32,
-            ))
-            .expect("ReferenceBackend create must be infallible for 320x240");
-        fn64_abi::set_render_backend_with_policy(
-            Box::new(render_backend),
-            fn64_recomp_rs::RDRAM_LEN,
-            fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
-        );
-        println!("[wm2000-shell] registered reference renderer (320x240)");
+        let active_renderer = Self::register_render_backend();
+        let rt64_settings_path = fn64_boot_harness::parse_release_env_value(
+            "FN64_RT64_SETTINGS_FILE",
+            std::env::var_os("FN64_RT64_SETTINGS_FILE"),
+        )
+        .unwrap_or_else(|error| panic!("wm2000-shell: {error}"))
+        .map(std::path::PathBuf::from);
+        if let Some(path) = rt64_settings_path.as_deref() {
+            assert!(
+                path.is_absolute(),
+                "wm2000-shell: FN64_RT64_SETTINGS_FILE must be an absolute path, got {}",
+                path.display()
+            );
+        }
+        let mut rt64_active_mode_label = match active_renderer {
+            ActiveRenderer::Reference => "reference".to_owned(),
+            ActiveRenderer::Rt64 => rt64_aa_experiment::Rt64AaPreset::Native.label().to_owned(),
+        };
+        let mut rt64_active_preset = (active_renderer == ActiveRenderer::Rt64)
+            .then_some(rt64_aa_experiment::Rt64AaPreset::Native);
+        if let Some(path) = rt64_settings_path.as_deref() {
+            let settings = rt64_aa_experiment::load(path)
+                .unwrap_or_else(|error| panic!("wm2000-shell: {error}"));
+            let label = format!("config:{}", path.display());
+            assert!(
+                Self::apply_rt64_runtime_settings(active_renderer, &label, &settings),
+                "wm2000-shell: startup RT64 settings were not applied"
+            );
+            rt64_active_mode_label = label;
+            rt64_active_preset = rt64_aa_experiment::Rt64AaPreset::from_settings(&settings);
+        }
 
         let mut program = fn64_recomp_rs::BlockProgram::new();
         // Destination history is a diagnostic ring the batch lane reads after a
@@ -443,14 +862,250 @@ impl Shell {
             gamepads: Gamepads::new(),
             rgba: vec![0u8; FB_WIDTH * FB_HEIGHT * 4],
             fb_width: FB_WIDTH,
+            fb_height: FB_HEIGHT,
             window: None,
             pixels: None,
             reported_first_frame: false,
-            last_heartbeat_swap: 0,
+            presented_frames: 0,
+            last_heartbeat_frame: 0,
+            last_audio_requested_sample_slots: 0,
+            last_audio_underrun_sample_slots: 0,
             next_frame_deadline: std::time::Instant::now(),
             frame_intervals: TimingWindow::default(),
             pump_times: TimingWindow::default(),
             entered_first_dispatch: false,
+            schedule: std::env::var_os("FN64_CONTROLLER_SCHEDULE")
+                .map(|path| ScheduleDriver::load(std::path::Path::new(&path))),
+            active_renderer,
+            rt64_settings_path,
+            rt64_active_mode_label,
+            rt64_active_preset,
+            rt64_capture_reuse: Vec::new(),
+        }
+    }
+
+    /// Select and register the rasterizer named by `FN64_RENDER`.
+    ///
+    /// RT64 IS THE DEFAULT for this windowed binary. Measured 2026-08-13 on
+    /// the entrance-to-match route: RT64's busy-population mean is 27.520
+    /// ms/field headless (vs reference's 44.276 ms/field, both byte-identical
+    /// on the same route), and the windowed lane's own `pump_ms` stays inside
+    /// the shell's 33.333 ms present-pacing budget through the same busy
+    /// phase -- reference does not. `FN64_RENDER=reference` still selects the
+    /// software rasterizer explicitly for anyone who needs it or lacks a
+    /// working RT64 adapter; it did not change and remains fully supported.
+    ///
+    /// `wm2000-block-boot` (the HEADLESS binary, not this one) keeps
+    /// `reference` as ITS default -- every committed route and recorded
+    /// measurement on that lane was taken against it, and flipping it would
+    /// invalidate that history. This function is `shell.rs`-only.
+    ///
+    /// An unrecognized value is a hard error rather than a silent fallback.
+    /// That is the whole point of this function existing. Before `42271e3`
+    /// ("give wm2000-shell an RT64 path, and make an ignored FN64_RENDER
+    /// loud") landed, `shell.rs` hardcoded `ReferenceBackend` and contained
+    /// zero occurrences of `FN64_RENDER`, so `FN64_RENDER=rt64` on the window
+    /// was a SILENT no-op -- it did not error, did not warn, and rendered
+    /// with the software backend regardless. Anyone who set it, saw the game
+    /// run, and concluded "RT64 works windowed" was reasonably but wrongly
+    /// served, and that trap cost real confusion
+    /// (`docs/plans/perf-method.md`, the caveat section). A backend selector
+    /// whose off lane is silently the on lane is worse than no selector.
+    fn register_render_backend() -> ActiveRenderer {
+        use fn64_render::RenderBackend as _;
+        let requested = fn64_boot_harness::parse_release_env_value(
+            "FN64_RENDER",
+            std::env::var_os("FN64_RENDER"),
+        )
+        .unwrap_or_else(|error| panic!("wm2000-shell: {error}"))
+        .unwrap_or_else(|| "rt64".to_string())
+        .to_ascii_lowercase();
+
+        let (backend, active): (Box<dyn fn64_render::RenderBackend>, ActiveRenderer) =
+            match requested.as_str() {
+                "reference" => {
+                    let mut backend = fn64_render_reference::ReferenceBackend::new()
+                        .with_f3dex2()
+                        .with_clear_color([0, 0, 0, 255]);
+                    backend
+                        .create(&fn64_render::RenderConfig::ntsc(
+                            FB_WIDTH as u32,
+                            FB_HEIGHT as u32,
+                        ))
+                        .expect("ReferenceBackend create must be infallible for 320x240");
+                    (Box::new(backend), ActiveRenderer::Reference)
+                }
+                "rt64" => {
+                    // RT64 needs a GPU, a Metal system-default device, and a
+                    // real NSWindow, plus initialization on the macOS MAIN
+                    // THREAD. This shell satisfies that: it contains no
+                    // `std::thread::spawn` at all, and `Shell::new` runs from
+                    // `main` before `event_loop.run_app`, so registration and
+                    // every later present happen on the main thread.
+                    //
+                    // Failure here is loud on purpose. A fallback to reference
+                    // would report software-rasterizer behavior and timing
+                    // under an RT64 label, which is the one outcome this
+                    // selector must not be able to produce.
+                    let mut backend = fn64_render_rt64::Rt64Backend::new();
+                    backend
+                        .create(&fn64_render::RenderConfig::ntsc(
+                            FB_WIDTH as u32,
+                            FB_HEIGHT as u32,
+                        ))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "wm2000-shell: FN64_RENDER=rt64 requires a working native RT64 \
+                                 adapter (build with --features rt64 and FN64_RT64_DIR set, and \
+                                 run with a GPU/display available); create failed: {error}"
+                            )
+                        });
+                    // Without this the post-VI render target is never retained
+                    // and `capture_render_release_frame` has nothing to return,
+                    // so the window would open and draw nothing.
+                    backend.enable_present_capture().unwrap_or_else(|error| {
+                        panic!(
+                            "wm2000-shell: FN64_RENDER=rt64 needs post-VI present capture to get \
+                             pixels back into the window; enable failed: {error}"
+                        )
+                    });
+                    (Box::new(backend), ActiveRenderer::Rt64)
+                }
+                value => panic!(
+                    "wm2000-shell: FN64_RENDER must be reference or rt64, got {value:?}. \
+                     (Unset it for the default rt64 backend, or set FN64_RENDER=reference \
+                     for the software rasterizer.)"
+                ),
+            };
+
+        fn64_abi::set_render_backend_with_policy(
+            backend,
+            fn64_recomp_rs::RDRAM_LEN,
+            fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized,
+        );
+        let label = match active {
+            ActiveRenderer::Reference => "reference",
+            ActiveRenderer::Rt64 => "rt64",
+        };
+        println!("[wm2000-shell] registered {label} renderer ({FB_WIDTH}x{FB_HEIGHT})");
+        if active == ActiveRenderer::Rt64 {
+            println!(
+                "[wm2000-shell] RT64 AA experiment: F7 toggles native/2x-box-SSAA; \
+                 F8 cycles all modes; F6 reloads FN64_RT64_SETTINGS_FILE"
+            );
+        }
+        active
+    }
+
+    fn apply_rt64_runtime_settings(
+        active_renderer: ActiveRenderer,
+        label: &str,
+        settings: &fn64_render::RenderRuntimeSettings,
+    ) -> bool {
+        if active_renderer != ActiveRenderer::Rt64 {
+            eprintln!(
+                "[wm2000-shell] RT64 settings {label:?} rejected: active renderer is reference"
+            );
+            return false;
+        }
+        let sha256 = rt64_aa_experiment::settings_sha256_hex(settings);
+        match fn64_abi::apply_render_runtime_settings(settings) {
+            Ok(fn64_render::RenderSettingsApply::LiveApplied {
+                framebuffers_discarded,
+                ..
+            }) => {
+                println!(
+                    "[wm2000-shell] RT64 settings applied: mode={label} sha256={sha256} \
+                     framebuffers_discarded={framebuffers_discarded}"
+                );
+                true
+            }
+            Ok(fn64_render::RenderSettingsApply::RestartRequired { fields, .. }) => {
+                eprintln!(
+                    "[wm2000-shell] RT64 settings {label:?} require renderer restart for \
+                     {fields:?}; active settings are unchanged"
+                );
+                false
+            }
+            Ok(fn64_render::RenderSettingsApply::StagedForCreate { .. }) => {
+                eprintln!(
+                    "[wm2000-shell] RT64 settings {label:?} were only staged after renderer \
+                     registration; active settings are unknown"
+                );
+                false
+            }
+            Err(error) => {
+                eprintln!("[wm2000-shell] RT64 settings {label:?} failed: {error}");
+                false
+            }
+        }
+    }
+
+    fn apply_rt64_aa_preset(&mut self, preset: rt64_aa_experiment::Rt64AaPreset) {
+        if Self::apply_rt64_runtime_settings(
+            self.active_renderer,
+            preset.label(),
+            &preset.settings(),
+        ) {
+            self.rt64_active_preset = Some(preset);
+            self.rt64_active_mode_label = preset.label().to_owned();
+            if let Some(window) = self.window.as_ref() {
+                window.set_title(&format!(
+                    "{WINDOW_TITLE} -- RT64 {}",
+                    self.rt64_active_mode_label
+                ));
+            }
+        }
+    }
+
+    fn toggle_rt64_ssaa(&mut self) {
+        let preset = if self.rt64_active_preset
+            == Some(rt64_aa_experiment::Rt64AaPreset::Supersample2x)
+        {
+            rt64_aa_experiment::Rt64AaPreset::Native
+        } else {
+            rt64_aa_experiment::Rt64AaPreset::Supersample2x
+        };
+        self.apply_rt64_aa_preset(preset);
+    }
+
+    fn cycle_rt64_aa_preset(&mut self) {
+        let current = self
+            .rt64_active_preset
+            .and_then(|active| {
+                rt64_aa_experiment::Rt64AaPreset::ALL
+                    .iter()
+                    .position(|preset| *preset == active)
+            })
+            .unwrap_or(0);
+        let next = (current + 1) % rt64_aa_experiment::Rt64AaPreset::ALL.len();
+        self.apply_rt64_aa_preset(rt64_aa_experiment::Rt64AaPreset::ALL[next]);
+    }
+
+    fn reload_rt64_settings(&mut self) {
+        let Some(path) = self.rt64_settings_path.as_deref() else {
+            eprintln!(
+                "[wm2000-shell] F6 reload rejected: set FN64_RT64_SETTINGS_FILE to an exact \
+                 TOML file before launch"
+            );
+            return;
+        };
+        match rt64_aa_experiment::load(path) {
+            Ok(settings) => {
+                let label = format!("config:{}", path.display());
+                if Self::apply_rt64_runtime_settings(self.active_renderer, &label, &settings) {
+                    self.rt64_active_preset =
+                        rt64_aa_experiment::Rt64AaPreset::from_settings(&settings);
+                    self.rt64_active_mode_label = label;
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_title(&format!(
+                            "{WINDOW_TITLE} -- RT64 {}",
+                            self.rt64_active_mode_label
+                        ));
+                    }
+                }
+            }
+            Err(error) => eprintln!("[wm2000-shell] F6 reload failed: {error}"),
         }
     }
 
@@ -480,20 +1135,39 @@ impl Shell {
     /// Returns when a retrace lands (one frame to present) or when the step /
     /// device-advance budget is exhausted, so the window never stops pumping
     /// events for longer than a frame's worth of work.
-    fn pump_one_frame(&mut self) -> RetraceOutcome {
-        let start_swaps = fn64_abi::vi_swap_count();
+    fn pump_one_frame(&mut self) -> PumpOutcome {
+        // Scanout origin, not `osViSwapBuffer` count -- see `present`. A game
+        // that programs VI_ORIGIN directly reports `vi_swap_count() == 0`
+        // forever, which would pin the boot step budget on every frame and
+        // report `swapped: false` on every frame that in fact flipped buffers.
+        let start_origin = fn64_abi::scanout_vi_framebuffer();
+        let start_vi_interrupts = fn64_abi::device_trace_summary().vi_interrupts;
         let mut drain = fn64_boot_harness::GuestDrain::default();
         let mut steps = 0u64;
         let mut device_advances = 0u32;
         self.entered_first_dispatch = true;
 
+        // Per-arm attribution, off unless `FN64_SHELL_SPIKE_MS` is set. When
+        // off, `spike` is `None` and the only added cost per pump is one
+        // `OnceLock` read plus a null check per loop iteration.
+        let spike_ms = spike_threshold_ms();
+        let mut spike = (spike_ms > 0.0).then(|| {
+            (
+                std::time::Instant::now(),
+                PumpCounters::read(),
+                0.0f64, // accumulated step_ms
+                0.0f64, // accumulated advance_ms
+            )
+        });
+
         loop {
             match drain.before_step(fn64_abi::next_runnable_priority()) {
                 fn64_boot_harness::DrainDecision::Step => {
                     // Boot gets the generous bound; every later frame gets the
-                    // steady-state one. `vi_swap_count` is the boundary because
-                    // it marks the first field actually reaching the window.
-                    let budget = if fn64_abi::vi_swap_count() == 0 {
+                    // steady-state one. A programmed scanout origin is the
+                    // boundary because it marks the first field the window can
+                    // actually show.
+                    let budget = if fn64_abi::scanout_vi_framebuffer().is_none() {
                         BOOT_STEPS_PER_PUMP
                     } else {
                         STEPS_PER_PUMP
@@ -502,17 +1176,47 @@ impl Shell {
                         steps < budget,
                         "wm2000-shell: non-idle guest work exceeded {budget} scheduling steps in one frame pump"
                     );
-                    // Feed live input before the game polls the controller this
+                    // Feed input before the game polls the controller this
                     // step, so a press is visible within the frame it happened.
-                    let (buttons, sx, sy) = self.merged_input();
-                    fn64_abi::set_controller_state(0, buttons, sx, sy);
+                    // A committed route, when supplied, owns the pad outright:
+                    // mixing it with a live gamepad would make the replay
+                    // depend on whatever hardware happened to be attached.
+                    match self.schedule.as_mut() {
+                        Some(driver) => {
+                            driver.observe_reads();
+                            driver.apply();
+                        }
+                        None => {
+                            let (buttons, sx, sy) = self.merged_input();
+                            fn64_abi::set_controller_state(0, buttons, sx, sy);
+                        }
+                    }
                     let next_priority = fn64_abi::next_runnable_priority();
+                    let arm_started = spike.as_ref().map(|_| std::time::Instant::now());
                     assert!(fn64_abi::run_one_step());
+                    if let (Some(started), Some(spike)) = (arm_started, spike.as_mut()) {
+                        spike.2 += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                     drain.record_step(next_priority.expect("drain authorized a runnable step"));
                     steps += 1;
+                    // Instruction checkpoints advance the same device clock
+                    // as the explicit quiescent arm. A runnable guest can
+                    // therefore cross a VI edge inside `run_one_step`; if we
+                    // only inspect `DeviceAdvance::ViFields` below, this loop
+                    // batches many retraces into one visible hitch. The
+                    // constant-space summary remains active with trace
+                    // retention disabled and is the exact committed-edge
+                    // counter for both paths.
+                    if fn64_abi::device_trace_summary().vi_interrupts > start_vi_interrupts {
+                        break;
+                    }
                 }
                 fn64_boot_harness::DrainDecision::AdvanceField => {
+                    let arm_started = spike.as_ref().map(|_| std::time::Instant::now());
                     let advanced = drain.advance_to_next_device_event();
+                    if let (Some(started), Some(spike)) = (arm_started, spike.as_mut()) {
+                        spike.3 += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                     device_advances += 1;
                     if matches!(advanced, fn64_boot_harness::DeviceAdvance::ViFields { .. }) {
                         // One field produced: hand the frame back to the window.
@@ -527,9 +1231,26 @@ impl Shell {
                 }
             }
         }
-        RetraceOutcome {
-            swapped: fn64_abi::vi_swap_count() > start_swaps,
+        if let Some((started, before, step_ms, advance_ms)) = spike {
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+            if total_ms >= spike_ms {
+                PumpAttribution {
+                    steps,
+                    advances: device_advances,
+                    step_ms,
+                    advance_ms,
+                    before,
+                    after: PumpCounters::read(),
+                }
+                .report(total_ms, self.presented_frames);
+            }
+        }
+        PumpOutcome {
+            swapped: fn64_abi::scanout_vi_framebuffer() != start_origin,
             steps,
+            vi_fields: fn64_abi::device_trace_summary()
+                .vi_interrupts
+                .saturating_sub(start_vi_interrupts),
         }
     }
 
@@ -552,8 +1273,175 @@ impl Shell {
     /// `fn64_abi::with_registered_physical_rdram_read`, which is safe here
     /// precisely because presentation happens between pumps -- no guest
     /// coroutine or device operation is mid-flight.
+    ///
+    /// Two present paths, chosen by `active_renderer`, because the two backends
+    /// put their output in different places. See [`Self::present_rt64`].
     fn present(&mut self) {
-        let Some(fb_offset) = fn64_abi::current_vi_framebuffer() else {
+        match self.active_renderer {
+            ActiveRenderer::Reference => self.present_reference(),
+            ActiveRenderer::Rt64 => self.present_rt64(),
+        }
+    }
+
+    /// Present RT64's post-VI image.
+    ///
+    /// RT64 rasterizes into its own GPU render targets and does NOT write the
+    /// finished image back to `rdram[output_addr..]`, so the RGBA5551 decode in
+    /// [`Self::present_reference`] would read a stale -- in practice black --
+    /// buffer on every frame. That is blocker C in
+    /// `docs/plans/rt64-on-the-block-lane.md`, and it is real for the window in
+    /// a way it is not for the headless lane.
+    ///
+    /// The pixels come back through `fn64_abi::capture_render_release_frame`,
+    /// NOT through `Rt64Backend::presented_pixels`. That distinction is
+    /// load-bearing and easy to get wrong: `set_render_backend_with_policy`
+    /// MOVES the backend into `fn64-abi`, `with_render_backend` is
+    /// `pub(crate)`, and `RenderBackend` carries no `Any`/downcast -- so the
+    /// concrete `Rt64Backend` is simply not reachable from here after
+    /// registration. The ABI seam is the sanctioned route and says so in as
+    /// many words ("a host neither downcasts the backend nor reaches into RT64
+    /// after registration", `lifecycle.rs:602-606`); `examples/wm2000-boot`
+    /// already presents RT64 frames through it. It also normalizes RT64's
+    /// native format to BGRA8 for us.
+    ///
+    /// Geometry comes from the post-VI capture, never from `vi_width()` or the
+    /// independently configured RT64 internal raster multiplier. The capture
+    /// returns a row stride (`row_bytes`) that may exceed the visible width.
+    /// Reusing the reference path's `fb_width` and `stride` assumptions here
+    /// would tear or panic.
+    fn present_rt64(&mut self) {
+        let capture = match fn64_abi::capture_render_release_frame_into(
+            &mut self.rt64_capture_reuse,
+        ) {
+            Ok(capture) => capture,
+            // Before the guest's first completed VI present there is simply no
+            // image yet. That is an ordinary early-boot state, not an error:
+            // stay silent and let the next frame try again.
+            Err(fn64_render::RenderError::NotReady(_)) => return,
+            Err(error) => {
+                eprintln!("[wm2000-shell] RT64 present capture failed: {error}");
+                return;
+            }
+        };
+        macro_rules! recover_capture_and_return {
+            () => {{
+                self.rt64_capture_reuse = capture.pixels.into_bytes();
+                return;
+            }};
+        }
+        assert_eq!(
+            capture.format,
+            fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm,
+            "wm2000-shell: RT64 returned an unsupported post-VI pixel format"
+        );
+
+        let width = usize::try_from(capture.width).expect("RT64 capture width exceeds usize");
+        let storage_height =
+            usize::try_from(capture.height).expect("RT64 capture storage height exceeds usize");
+        let height = usize::try_from(capture.visible_height)
+            .expect("RT64 capture visible height exceeds usize");
+        let row_bytes =
+            usize::try_from(capture.row_bytes).expect("RT64 capture row stride exceeds usize");
+        let visible_row_bytes = width
+            .checked_mul(4)
+            .expect("RT64 capture visible row size overflow");
+
+        // RT64 keeps filtering-extension rows in its complete release image.
+        // The validated capture type separately binds the guest-programmed
+        // active output height, so the interactive surface excludes those
+        // rows without mutating or weakening the renderer evidence bytes.
+        if width != self.fb_width || height != self.fb_height {
+            let Some(pixels) = self.pixels.as_mut() else {
+                recover_capture_and_return!();
+            };
+            if pixels
+                .resize_buffer(capture.width, capture.visible_height)
+                .is_err()
+            {
+                recover_capture_and_return!();
+            }
+            self.fb_width = width;
+            self.fb_height = height;
+            println!(
+                "[wm2000-shell] resized present surface to {width}x{height} (RT64 post-VI \
+                 output; internal raster resolution is configured separately)"
+            );
+        }
+
+        let next_presented_frame = self.presented_frames.saturating_add(1);
+        let report_due = !self.reported_first_frame
+            || next_presented_frame >= self.last_heartbeat_frame.saturating_add(60);
+
+        // BGRA -> RGBA directly into Pixels' upload buffer, dropping any
+        // stride padding past the visible width. The former intermediate
+        // `self.rgba` pass copied the complete frame a second time.
+        let Some(pixels) = self.pixels.as_mut() else {
+            recover_capture_and_return!();
+        };
+        let mut uniform_probe: Option<[u8; 4]> = None;
+        let mut blank = true;
+        let destination_frame = pixels.frame_mut();
+        for (row, source) in capture
+            .pixels
+            .visible_bytes()
+            .chunks_exact(row_bytes)
+            .enumerate()
+        {
+            let destination =
+                &mut destination_frame[row * width * 4..(row + 1) * width * 4];
+            for (out, bgra) in destination
+                .chunks_exact_mut(4)
+                .zip(source[..visible_row_bytes].chunks_exact(4))
+            {
+                // N64's alpha is coverage, not window transparency -- force it
+                // opaque exactly as the reference path does.
+                let rgba = [bgra[2], bgra[1], bgra[0], 255];
+                match uniform_probe {
+                    None => uniform_probe = Some(rgba),
+                    Some(first) if first != rgba => blank = false,
+                    Some(_) => {}
+                }
+                out.copy_from_slice(&rgba);
+            }
+        }
+        let rgba_hash = report_due.then(|| framebuffer::rgba_hash(destination_frame));
+        if let Err(e) = pixels.render() {
+            eprintln!("[wm2000-shell] pixels.render() failed: {e}");
+            recover_capture_and_return!();
+        }
+        self.presented_frames += 1;
+        if self.frame_report_due() {
+            let source = format!(
+                "rt64_post_vi={width}x{height} present={} workload={}",
+                capture.present_id, capture.workload_id
+            );
+            let detail = format!(
+                "storage={width}x{storage_height} row_bytes={row_bytes} backend={}",
+                capture.backend_identity
+            );
+            self.report_presented_frame(
+                blank,
+                rgba_hash.expect("report cadence computed before render"),
+                &source,
+                &detail,
+            );
+        }
+        self.rt64_capture_reuse = capture.pixels.into_bytes();
+    }
+
+    fn present_reference(&mut self) {
+        // Read VI_ORIGIN, not `osViSwapBuffer` bookkeeping.
+        //
+        // WM2000 never calls `osViSwapBuffer`; it double-buffers by writing
+        // VI_ORIGIN through raw MMIO (measured: it alternates 0x0038fbc0 and
+        // 0x003c7fc0 every field). Keying the present on
+        // `current_vi_framebuffer()` therefore returned `None` on every frame
+        // of every run, so this function bailed before touching the window --
+        // which is why the window never showed a pixel while the headless
+        // dump lane, which hashes RDRAM directly, produced 2,239 good frames
+        // of the same run. `vi_swaps=0` was never a progress failure; it is
+        // the correct count of a libultra call this game does not make.
+        let Some(fb_offset) = fn64_abi::scanout_vi_framebuffer() else {
             return;
         };
         let fb_offset = fb_offset as usize;
@@ -575,6 +1463,7 @@ impl Shell {
                     .is_ok()
                 {
                     self.fb_width = target_width;
+                    self.fb_height = FB_HEIGHT;
                     self.rgba = vec![0u8; target_width * FB_HEIGHT * 4];
                     println!(
                         "[wm2000-shell] resized present surface to {target_width}x{FB_HEIGHT} \
@@ -659,40 +1548,168 @@ impl Shell {
             return;
         }
 
-        let swaps = fn64_abi::vi_swap_count();
-        let rgba_hash = framebuffer::rgba_hash(&self.rgba);
+        self.presented_frames += 1;
+        if self.frame_report_due() {
+            let origin = format!("origin={fb_offset:#010x}");
+            let first_frame_detail = format!("vi_width={src_stride}");
+            self.report_presented_frame(
+                blank,
+                framebuffer::rgba_hash(&self.rgba),
+                &origin,
+                &first_frame_detail,
+            );
+        }
+    }
+
+    fn frame_report_due(&self) -> bool {
+        !self.reported_first_frame
+            || self.presented_frames >= self.last_heartbeat_frame.saturating_add(60)
+    }
+
+    /// Emit the first-frame line and the 60-frame heartbeat.
+    ///
+    /// Shared by both present paths ON PURPOSE. `pump_ms` and the late-frame
+    /// fraction reported here are how the two backends get compared, so they
+    /// must be the same statistic computed the same way -- a heartbeat that
+    /// differed per backend would make the comparison a measurement of the
+    /// logging. `source` names where the pixels came from, which is the only
+    /// part that legitimately differs.
+    fn report_presented_frame(
+        &mut self,
+        blank: bool,
+        rgba_hash: u64,
+        source: &str,
+        first_frame_detail: &str,
+    ) {
+        let frames = self.presented_frames;
+        assert!(
+            self.frame_report_due(),
+            "wm2000-shell: frame report called outside its bounded cadence"
+        );
+        // NOT `vi_swap_count()`. That counts `osViSwapBuffer_recomp` entries,
+        // and WM2000 never calls it -- it flips VI_ORIGIN through raw MMIO, so
+        // the count is a permanent zero for a title that is presenting fine
+        // (measured 2026-08-07, blocker ledger 1744-1830). Printing it here has
+        // now been read as a subsystem failure twice, most recently in a
+        // 1,080-frame windowed session that was rendering and animating
+        // throughout. A counter that is structurally zero for the title under
+        // test does not belong on the routine progress line; the scanout origin
+        // is the portable fact.
+        let scanout = fn64_abi::scanout_vi_framebuffer();
         if !self.reported_first_frame {
             if blank {
                 println!(
-                    "[wm2000-shell] presenting VI framebuffer (swap #{swaps}) -- currently \
-                     BLANK/uniform (the game has not rendered visible geometry yet). Window + \
-                     present path are live."
+                    "[wm2000-shell] presenting {source} \
+                     (scanout={scanout:?}) -- currently BLANK/uniform (the game \
+                     has not rendered visible geometry yet). Window + present path are live."
                 );
             } else {
                 println!(
-                    "[wm2000-shell] presenting VI framebuffer (swap #{swaps}) -- non-uniform, \
+                    "[wm2000-shell] presenting {source} \
+                     (scanout={scanout:?}) -- non-uniform, \
                      rgba_hash={rgba_hash:016x} (a comparison key, not a correctness claim); \
-                     vi_width={src_stride}"
+                     {first_frame_detail}"
                 );
             }
             self.reported_first_frame = true;
-        } else if swaps >= self.last_heartbeat_swap + 60 {
+        } else {
             let state = if blank { "uniform" } else { "non-uniform" };
             let audio = fn64_abi::audio_output_stats();
+            let stream_health = fn64_abi::audio_stream_health().unwrap_or_default();
+            let requested_delta = stream_health
+                .requested_sample_slots
+                .get()
+                .saturating_sub(self.last_audio_requested_sample_slots);
+            let underrun_delta = stream_health
+                .underrun_sample_slots
+                .get()
+                .saturating_sub(self.last_audio_underrun_sample_slots);
             let interval = self.frame_intervals.take_stats();
             let pump = self.pump_times.take_stats();
+            let present_budget_ms = present_cadence().interval.as_secs_f64() * 1000.0;
+            // This is a 30 Hz presentation unit containing two 60 Hz VI
+            // fields. Compare both distributions to that unit, not to one VI
+            // field: labeling every healthy 33.333 ms present as a 16.7 ms
+            // miss hid the distinction this heartbeat exists to measure.
+            let fmt = |s: &Option<timing::TimingStats>| {
+                s.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |s| {
+                        format!(
+                            "n={} p50={:.1} p95={:.1} p99={:.1} max={:.1}{}",
+                            s.samples,
+                            s.median_ms,
+                            s.p95_ms,
+                            s.p99_ms,
+                            s.max_ms,
+                            if s.max_ms <= present_budget_ms {
+                                "".to_string()
+                            } else {
+                                format!(" OVER-{present_budget_ms:.1}ms")
+                            },
+                        )
+                    },
+                )
+            };
             println!(
-                "[wm2000-shell] heartbeat: VI swap #{swaps} ({state}, rgba_hash={rgba_hash:016x}; \
-                 visual correctness not inferred); timing_ms median/p95: interval={:?} pump={:?}; \
-                 audio: ai_buffers={} samples={} nonzero={} backend_buffers={}",
-                interval.as_ref().map(|s| (s.median_ms, s.p95_ms)),
-                pump.as_ref().map(|s| (s.median_ms, s.p95_ms)),
+                "[wm2000-shell] heartbeat: presented frame #{frames} {source} \
+                 ({state}, rgba_hash={rgba_hash:016x}; visual correctness not inferred); \
+                 scanout={scanout:?}; frame_interval_ms[{}] pump_ms[{}]; \
+                 audio{}: ai_buffers={} samples={} nonzero={} backend_buffers={} \
+                 underrun_window={}/{} slots ({:.2}% STARVED); cumulative={}/{}",
+                fmt(&interval),
+                fmt(&pump),
+                // A zero audio counter has two completely different meanings and
+                // the log body cannot tell them apart. On 2026-08-07 a run with
+                // `FN64_NO_AUDIO=1` printed `ai_buffers=0 samples=0` and that was
+                // recorded in the blocker ledger as "audio is silent, MIT-clean
+                // HLE microcode remains a real project" -- when the same binary
+                // without the flag delivers 1,898 buffers and 1.69M nonzero
+                // samples. `FN64_NO_AUDIO` short-circuits `wire_audio` below,
+                // leaving `AUDIO_RDRAM_LEN` at 0, which makes
+                // `apply_live_ai_write_effect` skip `deliver_ai_buffer` entirely:
+                // every counter here is then pinned at zero BY REQUEST, in a run
+                // where the guest is synthesizing PCM the whole time. Say so on
+                // the same line as the numbers, so the disclaimer cannot be
+                // separated from the zero it explains.
+                if audio_disabled_by_request() {
+                    " (DISABLED by FN64_NO_AUDIO -- zeros below are the flag, not the guest)"
+                } else {
+                    ""
+                },
                 audio.ai_buffers,
                 audio.samples,
                 audio.nonzero_samples,
                 audio.backend_buffers,
+                // The mechanical choppiness signal, on the ROUTINE line.
+                //
+                // `underrun_sample_slots` counts output slots the device filled with
+                // silence because the ring was empty, and `fn64-audio` already
+                // documents it as the signal a point-in-time ring depth cannot
+                // provide -- but it only printed inside the SPIKE report, which
+                // is gated on frame time. Steady starvation never trips a frame
+                // spike: a 44-minute session logged ZERO spikes while delivering
+                // 29,281 channel samples/sec against the 64,000/sec that 32 kHz
+                // stereo demands, and the audio was choppy throughout.
+                //
+                // `ai_buffers == backend_buffers` held exactly all session, so
+                // every queue-health counter read clean. Equal counts prove
+                // nothing is being LOST; they say nothing about whether enough
+                // is ARRIVING (perf-method rule 22). This is the counter that
+                // can contradict the clean ones, so it belongs here.
+                underrun_delta,
+                requested_delta,
+                if requested_delta == 0 {
+                    0.0
+                } else {
+                    underrun_delta as f64 * 100.0 / requested_delta as f64
+                },
+                stream_health.underrun_sample_slots,
+                stream_health.requested_sample_slots,
             );
-            self.last_heartbeat_swap = swaps;
+            self.last_heartbeat_frame = frames;
+            self.last_audio_requested_sample_slots = stream_health.requested_sample_slots.get();
+            self.last_audio_underrun_sample_slots = stream_health.underrun_sample_slots.get();
         }
     }
 }
@@ -708,8 +1725,14 @@ fn expand5(v: u16) -> u8 {
 /// Register a live cpal output stream. A create() failure (no device, headless
 /// CI) is logged, not fatal: the window and input still work, only sound is
 /// unavailable.
+/// Whether this run asked for silence. Read by the heartbeat as well as
+/// `wire_audio`, so a zeroed audio counter always carries its own explanation.
+fn audio_disabled_by_request() -> bool {
+    std::env::var_os("FN64_NO_AUDIO").is_some()
+}
+
 fn wire_audio() {
-    if std::env::var_os("FN64_NO_AUDIO").is_some() {
+    if audio_disabled_by_request() {
         println!("[wm2000-shell] FN64_NO_AUDIO set -- audio output disabled");
         return;
     }
@@ -718,7 +1741,9 @@ fn wire_audio() {
     let mut backend = CpalBackend::new();
     match backend.create(&AudioConfig::new(N64_BOOT_AI_RATE_HZ, 2)) {
         Ok(()) => {
-            let stream_rate = backend.stream_rate_hz().unwrap_or(N64_BOOT_AI_RATE_HZ);
+            let stream_rate = backend
+                .stream_rate_hz()
+                .unwrap_or_else(|| fn64_audio::HostSampleRateHz::new(N64_BOOT_AI_RATE_HZ));
             fn64_abi::set_audio_backend(Box::new(backend), fn64_recomp_rs::RDRAM_LEN);
             println!(
                 "[wm2000-shell] audio output wired (cpal, guest {N64_BOOT_AI_RATE_HZ} Hz -> \
@@ -740,8 +1765,14 @@ impl ApplicationHandler for Shell {
             return;
         }
         let size = LogicalSize::new((FB_WIDTH * 2) as f64, (FB_HEIGHT * 2) as f64);
+        let initial_title = match self.active_renderer {
+            ActiveRenderer::Reference => format!("{WINDOW_TITLE} -- reference"),
+            ActiveRenderer::Rt64 => {
+                format!("{WINDOW_TITLE} -- RT64 {}", self.rt64_active_mode_label)
+            }
+        };
         let attrs = Window::default_attributes()
-            .with_title("fn64 -- WM2000 (dense AOT block program)")
+            .with_title(initial_title)
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(FB_WIDTH as f64, FB_HEIGHT as f64));
         let window = match event_loop.create_window(attrs) {
@@ -754,7 +1785,30 @@ impl ApplicationHandler for Shell {
         };
         let win_size = window.inner_size();
         let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
-        match Pixels::new(self.fb_width as u32, FB_HEIGHT as u32, surface) {
+        // `Pixels::new` defaults to `PresentMode::AutoVsync`
+        // (pixels-0.15.0/src/builder.rs:57), which BLOCKS each present until the
+        // next vblank. Measured on a live RT64 session: pump_ms p50 9.7 -- the
+        // guest comfortably inside the 16.667 ms budget -- while frame_interval
+        // p50 was 26.0, p95 40.5, p99 47.2. Those are not vsync multiples; a
+        // loop that keeps up clusters AT 16.7/33.3/50. Spreading between them is
+        // missed-deadline judder: ~9.7 ms of work, then a full vblank wait, and
+        // the 16.3 ms difference is exactly that wait.
+        //
+        // The guest is not the bottleneck for on-screen smoothness here, the
+        // presentation policy is. `FN64_PRESENT_MODE=vsync` restores the old
+        // behaviour; the default is now no-vsync so the emulator's own pacing
+        // governs, and tearing is preferable to a 1.5x frame-time penalty on a
+        // guest that already fits its budget.
+        let present_mode = match std::env::var("FN64_PRESENT_MODE").as_deref() {
+            Ok("vsync") => pixels::wgpu::PresentMode::AutoVsync,
+            Ok("mailbox") => pixels::wgpu::PresentMode::Mailbox,
+            _ => pixels::wgpu::PresentMode::AutoNoVsync,
+        };
+        println!("[wm2000-shell] present mode: {present_mode:?}");
+        match PixelsBuilder::new(self.fb_width as u32, self.fb_height as u32, surface)
+            .present_mode(present_mode)
+            .build()
+        {
             Ok(px) => {
                 self.pixels = Some(px);
                 self.window = Some(window);
@@ -790,6 +1844,18 @@ impl ApplicationHandler for Shell {
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
+                    if code == KeyCode::F6 && pressed {
+                        self.reload_rt64_settings();
+                        return;
+                    }
+                    if code == KeyCode::F7 && pressed {
+                        self.toggle_rt64_ssaa();
+                        return;
+                    }
+                    if code == KeyCode::F8 && pressed {
+                        self.cycle_rt64_aa_preset();
+                        return;
+                    }
                     if code == KeyCode::F11 && pressed {
                         if let Some(window) = self.window.as_ref() {
                             let next = match window.fullscreen() {
@@ -826,32 +1892,103 @@ impl ApplicationHandler for Shell {
         self.gamepads.poll();
         let _ = self.gamepads.take_pressed();
 
-        const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+        // WM2000 draws at 30 Hz, but VI, device time, and audio still advance
+        // at 60 Hz. Pump both VI fields as one presentation unit, then show
+        // only the latest capture. Advancing one field per 33.333 ms halves
+        // the entire machine and makes the audio callback fill half its slots
+        // with silence even when both individual field populations are fast.
+        let cadence = present_cadence();
         let now_t = std::time::Instant::now();
         if now_t >= self.next_frame_deadline {
-            self.frame_intervals
-                .record(now_t.saturating_duration_since(
-                    self.next_frame_deadline.checked_sub(FRAME).unwrap_or(now_t),
-                ));
-            self.pump_one_frame();
+            self.frame_intervals.record(
+                now_t.saturating_duration_since(
+                    self.next_frame_deadline
+                        .checked_sub(cadence.interval)
+                        .unwrap_or(now_t),
+                ),
+            );
+            let mut produced_fields = 0usize;
+            while produced_fields < cadence.vi_fields {
+                let outcome = self.pump_one_frame();
+                if outcome.vi_fields == 0 {
+                    break;
+                }
+                produced_fields = produced_fields.saturating_add(
+                    usize::try_from(outcome.vi_fields).unwrap_or(usize::MAX),
+                );
+            }
             self.pump_times.record(now_t.elapsed());
-            // Hold cadence while we keep up; re-anchor (dropping missed frames)
-            // when we fall behind, so a slow pump cannot spiral into catch-up.
-            self.next_frame_deadline =
-                if now_t.saturating_duration_since(self.next_frame_deadline) < FRAME {
-                    self.next_frame_deadline + FRAME
-                } else {
-                    now_t + FRAME
-                };
+            // Retain ordinary deadline debt so a slow render field can be
+            // recovered by the following cheap field. Only a stall exceeding
+            // two complete presentation units is dropped, bounding catch-up.
+            self.next_frame_deadline = advance_present_deadline(
+                self.next_frame_deadline,
+                std::time::Instant::now(),
+                cadence.interval,
+            );
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw();
             }
+        }
+        if SIGNALED_EXIT.load(Ordering::Relaxed) {
+            event_loop.exit();
+            return;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline));
     }
 }
 
+/// Set by [`install_signal_handler`]; checked once per `about_to_wait` tick.
+///
+/// `winit`'s `NSApplication`-backed event loop on macOS does not reliably act
+/// on a bare `SIGTERM`/`SIGINT` while parked in its Cocoa run loop -- both
+/// were confirmed to leave the process running (`kill -TERM`/`kill -INT`,
+/// process stays alive, no custom handler existed to explain it). `ControlFlow::
+/// WaitUntil` already wakes this loop every frame deadline (33.3 ms default),
+/// so a flag checked here closes the gap without touching the run loop itself.
+static SIGNALED_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Install a `SIGTERM`/`SIGINT` handler that sets [`SIGNALED_EXIT`] instead of
+/// relying on the default disposition, which this process does not reliably
+/// act on. Async-signal-safe: only an atomic store, matching the restriction
+/// on what a signal handler may safely do.
+fn install_signal_handler() {
+    extern "C" fn handle(_signal: libc::c_int) {
+        SIGNALED_EXIT.store(true, Ordering::Relaxed);
+    }
+    // SAFETY: installed once, before the event loop starts, from the single
+    // startup thread; `handle` only performs an atomic store, which is
+    // async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGTERM, handle as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
+    }
+}
+
 fn main() {
+    install_signal_handler();
+    // Default the mprotect write-barrier on for this shell: the headless
+    // benchmark (`render-benchmark.zsh`) already sets it unconditionally, and
+    // `docs/plans/perf-method.md` records it as a replicated 1.58x win (MMU
+    // dirty-page tracking replacing a full-region memcmp scan on every
+    // guest-thread mirror boundary) with byte-identical output. The windowed
+    // shell never inherited that default, so every interactive run was
+    // paying the scan: a live `sample` capture during rendering showed
+    // `_platform_memcmp` at ~51% of main-thread CPU time, gone (~0.4%) with
+    // the barrier on. Must run before `Shell::boot()` -- the flag is read
+    // through a `OnceLock` the first time an executable image binds RDRAM.
+    // Checking `var_os` (not defaulting inside `write_barrier`) preserves the
+    // escape hatch: an explicit `FN64_MPROTECT_BARRIER=` (empty) or `=0` from
+    // the caller is left alone, matching `write_barrier::requested()`'s own
+    // empty-is-off rule.
+    if std::env::var_os("FN64_MPROTECT_BARRIER").is_none() {
+        // SAFETY: single-threaded at this point in `main`, before any other
+        // code reads or writes process environment.
+        unsafe {
+            std::env::set_var("FN64_MPROTECT_BARRIER", "1");
+        }
+    }
+
     let mut shell = Shell::boot();
 
     // Headless seam self-test: drive N pumps with no window, so a machine with
@@ -861,30 +1998,88 @@ fn main() {
             .to_string_lossy()
             .parse()
             .expect("FN64_SHELL_HEADLESS_FRAMES must be an unsigned integer");
+        let quiet = std::env::var_os("FN64_SHELL_HEADLESS_QUIET").is_some();
         println!("[wm2000-shell] headless probe: pumping {frames} retraces without a window");
         for frame in 0..frames {
             let started = std::time::Instant::now();
             let outcome = shell.pump_one_frame();
-            println!(
-                "[wm2000-shell] probe frame {frame}: swapped={} steps={} wall_ms={:.1} \
-                 vi_swaps={} sim_time={} fb={:?}",
-                outcome.swapped,
-                outcome.steps,
-                started.elapsed().as_secs_f64() * 1000.0,
-                fn64_abi::vi_swap_count(),
-                fn64_abi::sim_time(),
-                fn64_abi::current_vi_framebuffer(),
-            );
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
+            if !quiet {
+                println!(
+                    "[wm2000-shell] probe frame {frame}: swapped={} steps={} vi_fields={} wall_ms={:.1} \
+                     vi_swaps={} sim_time={} scanout={:?} swap_fb={:?}",
+                    outcome.swapped,
+                    outcome.steps,
+                    outcome.vi_fields,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    fn64_abi::vi_swap_count(),
+                    fn64_abi::sim_time(),
+                    fn64_abi::scanout_vi_framebuffer(),
+                    fn64_abi::current_vi_framebuffer(),
+                );
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
         }
         println!(
-            "[wm2000-shell] headless probe done: vi_swaps={} sim_time={} fb={:?} vi_width={:?}",
+            "[wm2000-shell] headless probe done: vi_swaps={} sim_time={} scanout={:?} \
+             swap_fb={:?} vi_width={:?}",
             fn64_abi::vi_swap_count(),
             fn64_abi::sim_time(),
+            fn64_abi::scanout_vi_framebuffer(),
             fn64_abi::current_vi_framebuffer(),
             fn64_abi::vi_width(),
         );
+        if std::env::var_os("FN64_SHELL_HEADLESS_CAPTURE_HASH").is_some()
+            && shell.active_renderer == ActiveRenderer::Rt64
+        {
+            let capture = fn64_abi::capture_render_release_frame_into(
+                &mut shell.rt64_capture_reuse,
+            )
+            .expect("FN64_SHELL_HEADLESS_CAPTURE_HASH requires one completed RT64 present");
+            let visible_row_bytes = usize::try_from(capture.width)
+                .expect("RT64 capture width exceeds usize")
+                .checked_mul(4)
+                .expect("RT64 capture visible row size overflow");
+            let row_bytes =
+                usize::try_from(capture.row_bytes).expect("RT64 capture row stride exceeds usize");
+            let mut hasher = Sha256::new();
+            for row in capture.pixels.visible_bytes().chunks_exact(row_bytes) {
+                hasher.update(&row[..visible_row_bytes]);
+            }
+            let sha256 = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            println!(
+                "[wm2000-shell] headless RT64 capture: mode={} present={} workload={} \
+                 visible={}x{} storage={}x{} row_bytes={} sha256={sha256}",
+                shell.rt64_active_mode_label,
+                capture.present_id,
+                capture.workload_id,
+                capture.width,
+                capture.visible_height,
+                capture.width,
+                capture.height,
+                capture.row_bytes,
+            );
+            let target = fn64_abi::render_target_diagnostic()
+                .expect("FN64_SHELL_HEADLESS_CAPTURE_HASH requires RT64 target diagnostics");
+            println!(
+                "[wm2000-shell] headless RT64 target: present={} address={:#010x} \
+                 workload_scale={}x{} target_scale={}x{} raster={}x{} downsample={}",
+                target.present_id,
+                target.target_address,
+                target.workload_resolution_scale.x(),
+                target.workload_resolution_scale.y(),
+                target.resolution_scale.x(),
+                target.resolution_scale.y(),
+                target.raster_width,
+                target.raster_height,
+                target.downsample_multiplier,
+            );
+            shell.rt64_capture_reuse = capture.pixels.into_bytes();
+        }
         let exit = fn64_abi::prepare_process_exit();
         println!("[wm2000-shell] process exit prepared: {exit:?}");
         return;

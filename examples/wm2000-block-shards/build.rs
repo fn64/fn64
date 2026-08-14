@@ -152,19 +152,37 @@ impl ResolvedShard {
 ///
 /// # Default
 ///
-/// **On**, matching the behaviour that predates this flag. Set
-/// `FN64_WM_SHARD_VERIFY_LIVE_WORDS=0` to opt out. Absent, empty and `0` all
-/// mean the same thing on the *other* flags in this tree (`fn64-abi`'s
-/// `env_flag`), and an empty value reading as "set" is precisely what
-/// fabricated a 4.9x speedup once before — so this parses explicitly and
-/// treats anything it does not recognise as "leave verification on".
+/// **Off**, for this title, on this route. Byte-identity (all eight
+/// counters, `entrance-to-match.schedule`, 1.5M steps) held with this flag
+/// off, and headless field timing showed a real drop in dispatch cost
+/// (TRANSLATED GUEST CODE, "slow" population: 9.539ms/field -> 8.770ms/field)
+/// -- the acceptance bar this doc set above, met. Windowed RT64 audio
+/// starvation moved from a ~50.0% floor (unchanged across seven other perf
+/// fixes this session) to ~49.5-49.7%, replicated stable through 840+
+/// presented frames, no crashes.
+///
+/// This still trades away exactly what `# The gap this opt-out accepts`
+/// above says it trades away: a guest write that reaches RDRAM through a
+/// path that bypasses the declaration channel (raw `RdramPtr` stores, some
+/// DMA/RSP paths) and that changes executable bytes underneath a live
+/// translation would go undetected. It is not free just because this A/B
+/// passed -- it is a title-specific bet that this route's guest program
+/// does not do that, checked the only way available (byte-identity on the
+/// one route measured), not proven for every code path or every route.
+///
+/// Set `FN64_WM_SHARD_VERIFY_LIVE_WORDS=1` to opt back in if that bet looks
+/// wrong for a route this hasn't been checked against. Absent, empty and `0`
+/// all mean "off" together with any other unrecognised spelling; only `1`/
+/// `true`/`yes`/`on` mean "on" -- explicit parsing survives in both
+/// directions for the same reason the prior default did: an empty value
+/// reading as "set" is precisely what fabricated a 4.9x speedup once before.
 fn emit_live_word_verification() -> bool {
     println!("cargo:rerun-if-env-changed=FN64_WM_SHARD_VERIFY_LIVE_WORDS");
     match std::env::var_os("FN64_WM_SHARD_VERIFY_LIVE_WORDS") {
-        None => true,
-        Some(value) => !matches!(
+        None => false,
+        Some(value) => matches!(
             value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
+            "1" | "true" | "yes" | "on"
         ),
     }
 }

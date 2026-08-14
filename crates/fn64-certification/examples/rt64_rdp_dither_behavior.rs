@@ -111,7 +111,7 @@ fn fixture(case: Case) -> (Vec<u8>, u32) {
 
 fn render(backend: &mut Rt64Backend, case: Case) -> Result<Vec<u16>, Box<dyn Error>> {
     let (mut rdram, end) = fixture(case);
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "{} raw-DPC submission returned {status:?}",

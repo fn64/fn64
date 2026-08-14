@@ -1,7 +1,8 @@
 //! One-shot producer for a private WM prepared-shard source tree.
 //!
 //! This process never executes ROM code. It performs the same static
-//! discovery and emission as the legacy shard build, once for all 35 shards.
+//! discovery and emission as the legacy shard build, once for every shard
+//! in the shared `shard_inventory.in` catalog.
 
 #[allow(dead_code)]
 #[path = "build.rs"]

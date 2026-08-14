@@ -255,7 +255,10 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
 
     AUDIO_BACKEND.with(|cell| {
         if let Some(backend) = cell.borrow_mut().as_mut() {
-            let result = backend.queue_samples(&samples);
+            let result = backend.queue_samples(fn64_audio::GuestPcm16::new(
+                &samples,
+                fn64_audio::ChannelCount::STEREO,
+            ));
             if result.is_ok() {
                 AUDIO_OUTPUT_STATS.with(|cell| {
                     let mut stats = cell.get();

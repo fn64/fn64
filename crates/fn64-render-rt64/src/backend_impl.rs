@@ -28,6 +28,8 @@ impl Rt64Backend {
             configured_replacement_packs: Vec::new(),
             configured_replacement_enabled: RenderReplacementSettings::default().enabled,
             active_replacement_settings: None,
+            #[cfg(feature = "rt64")]
+            active_replacement_snapshot: None,
         }
     }
 
@@ -40,11 +42,20 @@ impl Rt64Backend {
         self.active_enhancement_settings = None;
         self.active_emulator_settings = None;
         self.active_replacement_settings = None;
+        #[cfg(feature = "rt64")]
+        {
+            self.active_replacement_snapshot = None;
+        }
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
     }
 
+    // `pub(super)`: the RenderBackend trait impl deliberately stayed in
+    // lib.rs (two guard tests scan that file for its decoder-path and
+    // rollback invariants), and four of its arms call this. A child module's
+    // private item is not visible to its PARENT, so leaving this private
+    // broke exactly those four call sites under the `rt64` feature.
     #[cfg(feature = "rt64")]
-    fn invalidate_native_state(&mut self) {
+    pub(super) fn invalidate_native_state(&mut self) {
         self.context = None;
         self.clear_active_native_identity();
     }
@@ -238,13 +249,23 @@ impl Rt64Backend {
 
     /// Read the most recent completed post-VI swapchain render target.
     pub fn presented_pixels(&mut self) -> Result<Rt64PresentedPixels, RenderError> {
+        self.presented_pixels_into(&mut Vec::new())
+    }
+
+    /// Read the latest capture using storage recovered from a prior capture.
+    /// The returned value owns that storage; errors leave `reuse` available to
+    /// its caller.
+    pub fn presented_pixels_into(
+        &mut self,
+        reuse: &mut Vec<u8>,
+    ) -> Result<Rt64PresentedPixels, RenderError> {
         #[cfg(feature = "rt64")]
         {
             let result = self
                 .context
                 .as_mut()
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
-                .presented_pixels();
+                .presented_pixels_into(reuse);
             result.map_err(|reason| {
                 if reason == "RT64 has no completed post-workload present capture" {
                     return RenderError::NotReady(
@@ -260,6 +281,7 @@ impl Rt64Backend {
 
         #[cfg(not(feature = "rt64"))]
         {
+            let _ = reuse;
             Err(RenderError::Backend {
                 backend: "rt64-present-capture",
                 reason: "fn64-render-rt64 was built without the opt-in `rt64` Cargo feature"
@@ -1033,40 +1055,62 @@ impl Rt64Backend {
             self.configured_replacement_packs = resolved.clone();
             self.configured_replacement_enabled = enabled;
             let configured_policy_sha = self.configured_runtime_policy().sha256();
-            let Some(context) = self.context.as_mut() else {
+            if self.context.is_none() {
                 return Ok(RenderPolicyApply::StagedForCreate {
                     policy_sha256: configured_policy_sha,
                 });
-            };
-            let ffi_inputs =
-                replacement_ffi_inputs(&resolved).map_err(|reason| RenderError::Backend {
+            }
+            let snapshot =
+                create_replacement_snapshot(&resolved).map_err(|reason| RenderError::Backend {
                     backend: "rt64-replacement-load",
                     reason,
                 })?;
-            if let Err(reason) = context.load_replacement_packs(&ffi_inputs, enabled) {
-                self.active_replacement_settings = None;
-                return Err(RenderError::Backend {
-                    backend: "rt64-replacement-load",
-                    reason,
-                });
-            }
-            let after = resolve_replacement_packs(inputs).map_err(|reason| {
-                self.active_replacement_settings = None;
+            let native_replacements = snapshot
+                .as_ref()
+                .map_or([].as_slice(), |snapshot| snapshot.packs.as_slice());
+            let ffi_inputs = replacement_ffi_inputs(native_replacements).map_err(|reason| {
                 RenderError::Backend {
                     backend: "rt64-replacement-load",
                     reason,
                 }
             })?;
-            if after != resolved {
-                self.active_replacement_settings = None;
+            if let Err(reason) = self
+                .context
+                .as_mut()
+                .expect("context presence was checked")
+                .load_replacement_packs(&ffi_inputs, enabled)
+            {
+                self.invalidate_native_state();
                 return Err(RenderError::Backend {
                     backend: "rt64-replacement-load",
-                    reason: "replacement-pack bytes changed while RT64 activated them".into(),
+                    reason,
                 });
             }
+            let snapshot_inputs: Vec<_> = native_replacements
+                .iter()
+                .map(|pack| pack.input.clone())
+                .collect();
+            let after = match resolve_replacement_packs(&snapshot_inputs) {
+                Ok(after) => after,
+                Err(reason) => {
+                    self.invalidate_native_state();
+                    return Err(RenderError::Backend {
+                        backend: "rt64-replacement-load",
+                        reason,
+                    });
+                }
+            };
+            if !replacement_identities_match(&resolved, &after) {
+                self.invalidate_native_state();
+                return Err(RenderError::Backend {
+                    backend: "rt64-replacement-load",
+                    reason: "replacement snapshot bytes changed while RT64 activated it".into(),
+                });
+            }
+            self.active_replacement_snapshot = snapshot;
             self.active_replacement_settings = Some(RenderReplacementSettings {
                 enabled,
-                packs: after.into_iter().map(|pack| pack.identity).collect(),
+                packs: resolved.into_iter().map(|pack| pack.identity).collect(),
             });
             let policy_sha256 = self
                 .active_runtime_policy()
@@ -1103,40 +1147,62 @@ impl Rt64Backend {
                     reason,
                 })?;
             self.configured_replacement_packs = resolved.clone();
-            let Some(context) = self.context.as_mut() else {
+            if self.context.is_none() {
                 return Ok(RenderPolicyApply::StagedForCreate {
                     policy_sha256: self.configured_runtime_policy().sha256(),
                 });
-            };
-            let ffi_inputs =
-                replacement_ffi_inputs(&resolved).map_err(|reason| RenderError::Backend {
+            }
+            let snapshot =
+                create_replacement_snapshot(&resolved).map_err(|reason| RenderError::Backend {
                     backend: "rt64-replacement-reload",
                     reason,
                 })?;
-            if let Err(reason) = context.reload_replacement_packs(&ffi_inputs, enabled) {
-                self.active_replacement_settings = None;
-                return Err(RenderError::Backend {
-                    backend: "rt64-replacement-reload",
-                    reason,
-                });
-            }
-            let after = resolve_replacement_packs(&inputs).map_err(|reason| {
-                self.active_replacement_settings = None;
+            let native_replacements = snapshot
+                .as_ref()
+                .map_or([].as_slice(), |snapshot| snapshot.packs.as_slice());
+            let ffi_inputs = replacement_ffi_inputs(native_replacements).map_err(|reason| {
                 RenderError::Backend {
                     backend: "rt64-replacement-reload",
                     reason,
                 }
             })?;
-            if after != resolved {
-                self.active_replacement_settings = None;
+            if let Err(reason) = self
+                .context
+                .as_mut()
+                .expect("context presence was checked")
+                .reload_replacement_packs(&ffi_inputs, enabled)
+            {
+                self.invalidate_native_state();
                 return Err(RenderError::Backend {
                     backend: "rt64-replacement-reload",
-                    reason: "replacement-pack bytes changed while RT64 reloaded them".into(),
+                    reason,
                 });
             }
+            let snapshot_inputs: Vec<_> = native_replacements
+                .iter()
+                .map(|pack| pack.input.clone())
+                .collect();
+            let after = match resolve_replacement_packs(&snapshot_inputs) {
+                Ok(after) => after,
+                Err(reason) => {
+                    self.invalidate_native_state();
+                    return Err(RenderError::Backend {
+                        backend: "rt64-replacement-reload",
+                        reason,
+                    });
+                }
+            };
+            if !replacement_identities_match(&resolved, &after) {
+                self.invalidate_native_state();
+                return Err(RenderError::Backend {
+                    backend: "rt64-replacement-reload",
+                    reason: "replacement snapshot bytes changed while RT64 reloaded it".into(),
+                });
+            }
+            self.active_replacement_snapshot = snapshot;
             self.active_replacement_settings = Some(RenderReplacementSettings {
                 enabled,
-                packs: after.into_iter().map(|pack| pack.identity).collect(),
+                packs: resolved.into_iter().map(|pack| pack.identity).collect(),
             });
             Ok(RenderPolicyApply::LiveApplied {
                 policy_sha256: self

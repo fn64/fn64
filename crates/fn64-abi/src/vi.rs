@@ -219,6 +219,20 @@ pub fn next_vi_framebuffer() -> Option<u32> {
     with_executor(|exec| exec.vi().next_framebuffer.map(|a| a.offset()))
 }
 
+/// The physical address the video interface is actually scanning out, read
+/// from the VI_ORIGIN register rather than from `osViSwapBuffer` bookkeeping.
+///
+/// Prefer this over [`current_vi_framebuffer`] in a presenter. The two agree
+/// for a game that swaps through libultra, but only this one is defined for a
+/// game that programs VI_ORIGIN directly -- see
+/// `DeviceFabric::vi_origin`'s doc comment for the WM2000 case that makes the
+/// distinction load-bearing. [`current_vi_framebuffer`] remains the right
+/// answer when the question is specifically "what did the guest last pass to
+/// `osViSwapBuffer`" (framebuffer hashing keyed to that call, for instance).
+pub fn scanout_vi_framebuffer() -> Option<u32> {
+    with_host(|host| host.device_fabric.vi_origin())
+}
+
 /// The total number of `osViSwapBuffer` calls observed so far -- see
 /// `current_vi_framebuffer`'s doc comment for why this crate exposes a
 /// plain function rather than requiring the harness to reach into

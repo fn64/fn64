@@ -316,7 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     require_production_rejection(&mut backend, &mut rdram)?;
     let source_end = write_source_commands(&mut rdram);
     write_ordinary_source(&mut rdram);
-    if backend.process_rdp_commands(&mut rdram, SOURCE_COMMANDS as u32, source_end, SOURCE)?
+    if backend.process_rdp_commands(&mut rdram, SOURCE_COMMANDS as u32, source_end, SOURCE, true)?
         != FrameStatus::Complete
     {
         return Err(io::Error::other("S2DEX source workload did not complete").into());

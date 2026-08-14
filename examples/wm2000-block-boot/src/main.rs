@@ -129,8 +129,7 @@ struct ControllerScheduleDriver {
 /// count untouched and drive this to zero.
 static AUDIO_BUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AUDIO_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static AUDIO_NONZERO_SAMPLES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static AUDIO_NONZERO_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AUDIO_PEAK_ABS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A headless [`fn64_audio::AudioBackend`] that retains statistics instead of
@@ -147,11 +146,15 @@ struct PcmEvidenceBackend {
 
 impl fn64_audio::AudioBackend for PcmEvidenceBackend {
     fn create(&mut self, cfg: &fn64_audio::AudioConfig) -> Result<(), fn64_audio::AudioError> {
-        self.sample_rate_hz = cfg.sample_rate_hz;
+        self.sample_rate_hz = cfg.sample_rate_hz.get();
         Ok(())
     }
 
-    fn queue_samples(&mut self, samples: &[i16]) -> Result<(), fn64_audio::AudioError> {
+    fn queue_samples(
+        &mut self,
+        pcm: fn64_audio::GuestPcm16<'_>,
+    ) -> Result<(), fn64_audio::AudioError> {
+        let samples = pcm.samples();
         use std::sync::atomic::Ordering::Relaxed;
         AUDIO_BUFFERS.fetch_add(1, Relaxed);
         AUDIO_SAMPLES.fetch_add(samples.len() as u64, Relaxed);
@@ -170,16 +173,16 @@ impl fn64_audio::AudioBackend for PcmEvidenceBackend {
     /// Nothing is retained, so nothing is ever pending. A real device reports
     /// its backlog here; this backend consuming instantly is what keeps the
     /// lane from stalling on delivery it does not perform.
-    fn frames_remaining(&self) -> Result<u32, fn64_audio::AudioError> {
-        Ok(0)
+    fn frames_remaining(&self) -> Result<fn64_audio::HostFrameCount, fn64_audio::AudioError> {
+        Ok(fn64_audio::HostFrameCount::ZERO)
     }
 
-    fn set_frequency(&mut self, sample_rate_hz: u32) {
-        self.sample_rate_hz = sample_rate_hz;
+    fn set_frequency(&mut self, sample_rate_hz: fn64_audio::GuestSampleRateHz) {
+        self.sample_rate_hz = sample_rate_hz.get();
     }
 
-    fn stream_rate_hz(&self) -> Option<u32> {
-        (self.sample_rate_hz != 0).then_some(self.sample_rate_hz)
+    fn stream_rate_hz(&self) -> Option<fn64_audio::HostSampleRateHz> {
+        (self.sample_rate_hz != 0).then(|| fn64_audio::HostSampleRateHz::new(self.sample_rate_hz))
     }
 }
 
@@ -196,12 +199,14 @@ impl ControllerScheduleDriver {
             fn64_boot_harness::parse_controller_input_schedule(&source).unwrap_or_else(|error| {
                 panic!("parsing controller schedule {}: {error}", path.display())
             });
+        let driven = schedule.driven_ports();
         println!(
-            "[wm2000-block-boot] controller schedule={} phases={} sha256={}",
+            "[wm2000-block-boot] controller schedule={} phases={} driven_ports={driven:?} sha256={}",
             path.display(),
             schedule.phases().len(),
             schedule.source_sha256_hex(),
         );
+        fn64_boot_harness::attach_controllers_for_driven_ports(driven);
         Self {
             schedule,
             read_ordinals: [0; 4],
@@ -262,8 +267,8 @@ thread_local! {
     static FIRST_ENTRY_BOOT_CONTEXT: std::cell::RefCell<Option<BootContext>> = const {
         std::cell::RefCell::new(None)
     };
-    static AOT_BANK_COUNTS: std::cell::RefCell<[u64; 35]> = const {
-        std::cell::RefCell::new([0; 35])
+    static AOT_BANK_COUNTS: std::cell::RefCell<[u64; DENSE_AOT_ARTIFACTS.len()]> = const {
+        std::cell::RefCell::new([0; DENSE_AOT_ARTIFACTS.len()])
     };
     static AOT_PC_COUNTS: std::cell::RefCell<Vec<u64>> = const {
         std::cell::RefCell::new(Vec::new())
@@ -525,7 +530,10 @@ fn run_entry_aot_with_context_gate(
     mem: &mut Rdram<'_>,
 ) -> BlockRun {
     validate_first_entry_boot_context(entry, ctx);
-    wm2000_block_shard_00::run(entry, budget, ctx, mem)
+    // Artifact 0, not a named crate. `block_program.rs` already selects this
+    // gate by `artifact_index == 0`, and bank IDs are content-derived rather
+    // than name-derived, so nothing here is title-specific except the symbol.
+    (DENSE_AOT_ARTIFACTS[0].runner)(entry, budget, ctx, mem)
 }
 
 fn run_overlay_aot_with_generation_gate(
@@ -554,7 +562,7 @@ fn run_nwxe_exception_image_with_digest_gate(
     fn64_boot_harness::verify_precompiled_words(
         entry.bank,
         GuestPc::new(image.va_start),
-        image.words,
+        &image.words(),
         image.sha256,
         mem,
     )
@@ -637,7 +645,8 @@ fn main() {
         "dynamic withheld execution requires FN64_BLOCK_MIN_GUEST_INSTRUCTIONS"
     );
     #[cfg(feature = "dynamic-withheld")]
-    let dynamic_telemetry_output = dynamic_exact_entry_withheld.then(prepare_dynamic_telemetry_output);
+    let dynamic_telemetry_output =
+        dynamic_exact_entry_withheld.then(prepare_dynamic_telemetry_output);
     SUPPRESS_PROTOCOL_DIAGNOSTICS.store(
         generated_runner_protocol_mode,
         std::sync::atomic::Ordering::Relaxed,
@@ -729,7 +738,7 @@ fn main() {
                 image.bank_id,
                 image.va_start,
                 image.va_end,
-                image.words.len(),
+                image.word_count(),
                 image.sha256_hex,
             );
         }
@@ -791,41 +800,103 @@ fn main() {
             fn64_runtime::SaveType::SramBanked,
         )));
         use fn64_render::RenderBackend as _;
-        let mut render_backend = fn64_render_reference::ReferenceBackend::new()
-            .with_f3dex2()
-            .with_clear_color([0, 0, 0, 255]);
-        if let Some(directory) = std::env::var_os("FN64_RENDER_DUMP_DIR") {
-            let first_task = std::env::var("FN64_RENDER_DUMP_FIRST_TASK")
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .expect("FN64_RENDER_DUMP_FIRST_TASK must be an unsigned integer")
-                })
-                .unwrap_or(0);
-            let limit = std::env::var("FN64_RENDER_DUMP_LIMIT")
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .expect("FN64_RENDER_DUMP_LIMIT must be an unsigned integer")
-                })
-                .unwrap_or(1);
-            assert!(limit != 0, "FN64_RENDER_DUMP_LIMIT must be nonzero");
-            let directory = std::path::PathBuf::from(directory);
-            println!(
-                "[wm2000-block-boot] render dump dir={} first_task={} limit={}",
-                directory.display(),
-                first_task,
-                limit,
-            );
-            render_backend = render_backend
-                .with_auto_dump(directory, "fn64-wm2000-block", limit)
-                .with_auto_dump_skip(first_task);
-        }
-        render_backend
-            .create(&fn64_render::RenderConfig::ntsc(320, 240))
-            .expect("ReferenceBackend create must be infallible for 320x240");
+        let create_reference = || -> Box<dyn fn64_render::RenderBackend> {
+            let mut render_backend = fn64_render_reference::ReferenceBackend::new()
+                .with_f3dex2()
+                .with_clear_color([0, 0, 0, 255]);
+            if let Some(directory) = std::env::var_os("FN64_RENDER_DUMP_DIR") {
+                let first_task = std::env::var("FN64_RENDER_DUMP_FIRST_TASK")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .expect("FN64_RENDER_DUMP_FIRST_TASK must be an unsigned integer")
+                    })
+                    .unwrap_or(0);
+                let limit = std::env::var("FN64_RENDER_DUMP_LIMIT")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .expect("FN64_RENDER_DUMP_LIMIT must be an unsigned integer")
+                    })
+                    .unwrap_or(1);
+                assert!(limit != 0, "FN64_RENDER_DUMP_LIMIT must be nonzero");
+                let directory = std::path::PathBuf::from(directory);
+                println!(
+                    "[wm2000-block-boot] render dump dir={} first_task={} limit={}",
+                    directory.display(),
+                    first_task,
+                    limit,
+                );
+                render_backend = render_backend
+                    .with_auto_dump(directory, "fn64-wm2000-block", limit)
+                    .with_auto_dump_skip(first_task);
+            }
+            render_backend
+                .create(&fn64_render::RenderConfig::ntsc(320, 240))
+                .expect("ReferenceBackend create must be infallible for 320x240");
+            Box::new(render_backend)
+        };
+        // `FN64_RENDER=reference|rt64` picks the rasterizer, mirroring
+        // `../oot-boot/src/main.rs`'s selector. REFERENCE IS THE DEFAULT and
+        // must stay so: every committed route, gate, and recorded measurement
+        // on this lane was taken against it, and the deterministic-counter
+        // comparison below is only meaningful if the untouched arm is untouched.
+        //
+        // Why this lane can host RT64 at all, which was long assumed otherwise:
+        // both lanes converge on the same `register_process_rdram`, the
+        // `RenderBackend` trait takes a call-scoped `&mut [u8]` and expresses no
+        // ownership, and on WM2000's raw-RDP path `dispatch_captured_raw_rdp`
+        // already hands the backend an ABI-local staging `Vec` regardless of who
+        // owns the process allocation. See `docs/plans/rt64-on-the-block-lane.md`.
+        //
+        // Headless does NOT mean present-free, contrary to the expectation in
+        // `rt64-on-the-block-lane.md` that blocker C would be "mostly moot"
+        // here. `pi::timing` pumps `present_render_backend` at every guest VI
+        // retrace whether or not a window exists, so RT64's `present` runs on
+        // this lane too and its `PresentMemory::Physical` requirement is
+        // satisfied by the registered process allocation. What stays moot is
+        // only the part after present -- no swapchain blit, and nothing reads
+        // the result back -- so a headless number still excludes presentation
+        // cost. Getting pixels back out to a window remains real work for
+        // `wm2000-shell` (`shell.rs:903`).
+        let requested_renderer = fn64_boot_harness::parse_release_env_value(
+            "FN64_RENDER",
+            std::env::var_os("FN64_RENDER"),
+        )
+        .unwrap_or_else(|error| panic!("wm2000-block-boot: {error}"))
+        .unwrap_or_else(|| "reference".to_string())
+        .to_ascii_lowercase();
+        let (render_backend, active_renderer): (Box<dyn fn64_render::RenderBackend>, &'static str) =
+            match requested_renderer.as_str() {
+                "reference" => (create_reference(), "reference"),
+                "rt64" => {
+                    // RT64 needs a GPU, a Metal system-default device, and a
+                    // real (hidden) NSWindow, plus initialization on the macOS
+                    // MAIN THREAD. This loop runs on the main thread -- the only
+                    // `std::thread::spawn` in this binary is the opt-in
+                    // `FN64_BLOCK_WATCHDOG` diagnostic -- so that contract holds.
+                    // A failure here is loud on purpose: silently falling back
+                    // would report a reference-backend number under an RT64
+                    // label, which is the one result this comparison must not
+                    // be able to produce.
+                    let mut backend = fn64_render_rt64::Rt64Backend::new();
+                    backend
+                        .create(&fn64_render::RenderConfig::ntsc(320, 240))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "wm2000-block-boot: FN64_RENDER=rt64 requires a working native \
+                                 RT64 adapter (build with --features rt64 and FN64_RT64_DIR set, \
+                                 and run with a GPU/display available); create failed: {error}"
+                            )
+                        });
+                    (Box::new(backend), "rt64")
+                }
+                value => panic!(
+                    "wm2000-block-boot: FN64_RENDER must be reference or rt64, got {value:?}"
+                ),
+            };
         fn64_abi::set_render_backend_with_policy(
-            Box::new(render_backend),
+            render_backend,
             fn64_recomp_rs::RDRAM_LEN,
             if generated_runner_rsp_audit_mode {
                 fn64_abi::GraphicsTaskExecutionPolicy::LleAccuracy
@@ -833,12 +904,19 @@ fn main() {
                 fn64_abi::GraphicsTaskExecutionPolicy::HleOptimized
             },
         );
-        println!("[wm2000-block-boot] registered reference renderer (320x240)");
+        println!("[wm2000-block-boot] registered {active_renderer} renderer (320x240)");
         let (rom_start, rom_end, va_start) = pack::ROM_COPY;
+        // The contract this asserts is IPL3's fixed one-MiB boot DMA, which is
+        // universal; the literal triple was WM2000's instance of it. Checking
+        // the invariant rather than the instance lets a differently-based title
+        // through -- `va_start` is CIC-dependent (6103 subtracts 0x100000,
+        // 6106 subtracts 0x200000), and pinning it here rejected every ROM that
+        // is not WM2000 for no stated reason.
         assert_eq!(
-            pack::ROM_COPY,
-            (0x1000, 0x101000, 0x80000400),
-            "NWXE block pack no longer matches the IPL3 one-MiB boot DMA contract"
+            (rom_start, rom_end - rom_start),
+            (0x1000, 0x100000),
+            "block pack no longer matches the IPL3 one-MiB boot DMA contract: \
+             rom=[{rom_start:#x},{rom_end:#x}) va={va_start:#010X}"
         );
         println!(
             "[wm2000-block-boot] validating boot publication rom=[{rom_start:#x},{rom_end:#x}) to va {va_start:#010X}"
@@ -1380,6 +1458,10 @@ fn main() {
         );
         return;
     }
+    if std::env::var_os("FN64_DEVICE_ADVANCE_CENSUS").is_some() {
+        fn64_abi::print_device_advance_census();
+    }
+    fn64_abi::recompiled::report_dispatch_census();
     println!(
         "[wm2000-block-boot] done: steps={steps} sim_time={} thread0_dead={}",
         fn64_abi::sim_time(),
@@ -1602,6 +1684,24 @@ fn main() {
             &destinations[destination_start..],
             &trace[trace_start..],
         );
+    }
+    // Why the run stopped: a guest that reaches the step limit without
+    // submitting graphics is blocked on something, and the thread/queue state
+    // names it exactly. Printed unconditionally -- it is a few lines and it is
+    // the first question asked of every bounded run.
+    let control = fn64_abi::executor_control_evidence_snapshot();
+    println!(
+        "[wm2000-block-boot] final control: sim_time={} run_queue={:?} cp0_timer_pending={}",
+        control.sim_time, control.run_queue, control.cp0_timer_pending
+    );
+    for thread in &control.threads {
+        println!("[wm2000-block-boot]   thread {thread:?}");
+    }
+    for queue in &control.queues {
+        println!("[wm2000-block-boot]   queue {queue:?}");
+    }
+    for event in &control.event_table {
+        println!("[wm2000-block-boot]   event {event:?}");
     }
     let exit = fn64_abi::prepare_process_exit();
     println!(

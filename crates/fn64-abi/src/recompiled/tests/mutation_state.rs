@@ -1814,3 +1814,58 @@ use super::*;
             assert!(affirmative(on), "{on:?} must arm the census");
         }
     }
+
+
+
+/// The declaration protocol has two halves, and a bare notification is only
+/// the first.
+///
+/// `notify_host_abi_write` hands the event to the installed `WRITE_OBSERVER`,
+/// which enqueues it onto `PENDING_ATTRIBUTED_EXECUTABLE_WRITES` when it
+/// intersects a watched executable range. Something must then DRAIN that
+/// queue, and `flush_host_abi_transaction_inner` (`live_program.rs:2427`)
+/// asserts it is empty at every ordering boundary:
+///
+///   catalog host transaction N reached an ordering boundary with
+///   1 uncommitted child writer event(s)
+///
+/// That is the exact panic the No Mercy route hit once the save adapters began
+/// declaring their spans with a bare notify. The drain is what
+/// `declare_guest_physical_write` supplies, by bracketing the notify in a child
+/// transaction and committing it -- the same shape the scheduler mirror uses at
+/// `execution.rs:815`.
+///
+/// This test pins the queue's role directly: an event placed on it is still
+/// there until drained, so a declaration path that only enqueues cannot be
+/// correct. It drives the queue rather than the notify because the observer
+/// that feeds it is installed by a live program, which a unit test has none of
+/// -- and that absence is precisely why `save.rs`'s own tests could not catch
+/// this defect.
+#[test]
+fn an_attributed_event_stays_pending_until_something_drains_it() {
+    PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|events| events.borrow_mut().clear());
+    PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|events| {
+        events.borrow_mut().push(GuestWriteEvent::Range {
+            channel: WriterChannel::HostAbi,
+            physical_offset: 0x1000,
+            len: 0x80,
+        });
+    });
+
+    let pending = PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|events| events.borrow().len());
+    assert_eq!(
+        pending, 1,
+        "an enqueued attributed event is what the ordering boundary counts"
+    );
+
+    // Draining is the second half of the protocol; without it the boundary
+    // assertion above fires.
+    let drained = PENDING_ATTRIBUTED_EXECUTABLE_WRITES
+        .with(|events| std::mem::take(&mut *events.borrow_mut()));
+    assert_eq!(drained.len(), 1);
+    assert_eq!(
+        PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|events| events.borrow().len()),
+        0,
+        "a committed declaration leaves nothing pending"
+    );
+}

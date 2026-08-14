@@ -1,0 +1,6 @@
+# Load this at startup with FN64_RT64_SETTINGS_FILE=/path/to/this/file.
+# Edit it while wm2000-shell is running, then press F6 to apply it live.
+resolution = "manual"
+resolution_multiplier = 2.0
+downsample_multiplier = 2
+antialiasing = "none"

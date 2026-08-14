@@ -174,6 +174,14 @@ typedef struct Fn64Rt64PresentSelection {
     uint32_t target_width;
     uint32_t target_height;
     uint32_t target_size;
+    float workload_resolution_scale_x;
+    float workload_resolution_scale_y;
+    float resolution_scale_x;
+    float resolution_scale_y;
+    uint32_t raster_width;
+    uint32_t raster_height;
+    uint32_t downsample_multiplier;
+    uint32_t reserved;
 } Fn64Rt64PresentSelection;
 
 enum {
@@ -539,7 +547,7 @@ static_assert(sizeof(Fn64Rt64Task) == 14 * sizeof(uint32_t));
 static_assert(sizeof(Fn64Rt64ViState) == 72);
 static_assert(sizeof(Fn64Rt64AdapterCapture) == 69 * sizeof(uint32_t));
 static_assert(sizeof(Fn64Rt64PresentCapture) == 48);
-static_assert(sizeof(Fn64Rt64PresentSelection) == 32);
+static_assert(sizeof(Fn64Rt64PresentSelection) == 64);
 static_assert(sizeof(Fn64Rt64DeferredWorkloadSnapshot) == 328);
 static_assert(sizeof(Fn64Rt64DeferredWorkloadEvidence) == 656);
 static_assert(sizeof(Fn64Rt64FramebufferCopyPathEvidence) == 48);
@@ -708,6 +716,12 @@ int fn64_rt64_process_rdp_commands(
     uint32_t start,
     uint32_t end,
     uint32_t output_addr,
+    int wait_for_completion,
+    char *error,
+    size_t error_capacity);
+
+int fn64_rt64_flush_pending_workload(
+    Fn64Rt64Context *context,
     char *error,
     size_t error_capacity);
 

@@ -359,7 +359,7 @@ fn texel1_gap_rotating_sprite_preserves_tile_pair_across_both_wire_families() {
             write_command(&mut rdram, MODE + 32, 0xdf00_0000, 0);
 
             let mut rdp = RdpDecodeState::default();
-            crate::gbi::decode_raw_rdp_ops_with_state(&rdram, MODE as u32, &mut rdp).unwrap();
+            crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, MODE as u32, &mut rdp).unwrap();
 
             let (matrix_opcode, load_opcode, sprite_opcode, compound_opcode, end_opcode) =
                 match family {
@@ -470,7 +470,7 @@ fn texel1_gap_rotating_sprite_without_tile_one_stays_loud_and_transactional() {
     write_command(&mut rdram, DL + 24, u32::from(G_ENDDL) << 24, 0);
 
     let mut rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, MODE as u32, &mut rdp).unwrap();
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, MODE as u32, &mut rdp).unwrap();
     let before = format!("{rdp:?}");
     let error = decode_ops(&rdram, DL as u32, &mut rdp).unwrap_err();
     assert!(
@@ -887,7 +887,7 @@ fn notxclamp_point_perimeters_exhaust_families_paths_flips_and_base_scales() {
         }
         write_command(&mut rdram, offset, u32::from(end) << 24, 0);
         let mut rdp = RdpDecodeState::default();
-        crate::gbi::decode_raw_rdp_ops_with_state(&rdram, SETUP as u32, &mut rdp).unwrap();
+        crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, SETUP as u32, &mut rdp).unwrap();
         decode_ops_for_family(&rdram, DL as u32, &mut rdp, family).unwrap()
     };
 
@@ -1188,7 +1188,7 @@ fn notxclamp_point_perimeters_reject_spills_and_unpublished_paths_transactionall
     }
 
     let mut bilerp_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, BILERP_SETUP as u32, &mut bilerp_rdp)
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, BILERP_SETUP as u32, &mut bilerp_rdp)
         .unwrap();
     let error = rectangle_error(
         &mut rdram,
@@ -1198,7 +1198,7 @@ fn notxclamp_point_perimeters_reject_spills_and_unpublished_paths_transactionall
     assert!(error.contains("filter-footprint arithmetic"), "{error}");
 
     let mut copy_rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, COPY_SETUP as u32, &mut copy_rdp)
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, COPY_SETUP as u32, &mut copy_rdp)
         .unwrap();
     let error = rectangle_error(
         &mut rdram,
@@ -1277,7 +1277,7 @@ fn average_filter_uses_box_samples_and_loudly_rejects_unknown_corrections() {
     write_command(&mut rdram, SETUP + 16, 0xdf00_0000, 0);
 
     let mut rdp = RdpDecodeState::default();
-    crate::gbi::decode_raw_rdp_ops_with_state(&rdram, SETUP as u32, &mut rdp).unwrap();
+    crate::gbi::decode_raw_rdp_ops_with_state(&mut rdram, SETUP as u32, &mut rdp).unwrap();
     let operations = decode_ops(&rdram, AVERAGE_DL as u32, &mut rdp).unwrap();
     let RenderOp::TextureRectangle(rectangle) = &operations[0] else {
         panic!("average fixture must emit one rectangle")

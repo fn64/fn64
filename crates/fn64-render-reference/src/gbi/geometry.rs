@@ -99,11 +99,11 @@ pub(super) fn texture_for_tile(
         shift_t: tile.shift_t,
         origin_s: tile.uls as f32 / 4.0,
         origin_t: tile.ult as f32 / 4.0,
-        tmem: Some(std::rc::Rc::new(TmemTexture {
-            storage: storage.clone(),
+        tmem: Some(std::rc::Rc::new(TmemTexture::new(
+            storage.clone(),
             tile,
             texture_lut,
-        })),
+        ))),
         lod: None,
     })
 }

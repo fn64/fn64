@@ -29,6 +29,53 @@ pub struct OverlayLoadRecipeV1 {
     pub bss_start: u32,
     pub bss_end: u32,
     pub loaded_sha256: String,
+    /// SHA-256 of the TEXT extent only, i.e. `[text_start, text_end)`.
+    ///
+    /// `loaded_sha256` covers the whole loaded image, which includes the
+    /// overlay's data section. A correct program writes its own data at
+    /// runtime -- WM2000 stores four bytes at `0x80107efc`, inside overlay 0's
+    /// `0x9eb0`-byte data span -- so a whole-image digest cannot survive
+    /// execution. Only the text extent is immutable, so only it can identify a
+    /// generation across time.
+    pub text_sha256: String,
+}
+
+/// Shard granularity the dense-AOT pack tiles generations with.
+pub const DENSE_SHARD_BYTES: u32 = 64 * 1024;
+
+/// How many ROM bytes of an overlay a GENERATION covers.
+///
+/// A generation covers the overlay's TEXT, not its whole loaded image: the
+/// data section is mutable, and a correct program writes it at runtime, so a
+/// generation digested over it cannot survive execution. WM2000 stores four
+/// bytes at VA `0x80107efc` inside overlay 0's data span, which invalidated
+/// the whole generation and stopped the certified route.
+///
+/// This is EXACTLY the text length -- never rounded to a shard boundary.
+///
+/// Rounding up to whole shards was the earlier rule, on the belief that a
+/// generation's image had to end on a shard boundary for the shard list to
+/// tile. It does not. `PrecompiledGeneration::new`
+/// (`fn64-recomp-rs/src/generation/mod.rs:109-126`) requires only that shards
+/// tile contiguously from `image_start` and COVER `image_end`; the final shard
+/// may legitimately overhang, because "the digest covers
+/// `[image_start, image_end)` only, which is precisely why a generation may end
+/// mid-shard without weakening what it asserts."
+///
+/// Rounding up therefore bought nothing and cost correctness: it pulled the
+/// overlay's own mutable DATA back inside the digested extent, which is the
+/// exact failure this function exists to prevent. On WM2000 it put `0x2c80`
+/// data bytes into overlay 0's digest and `0x5550` into overlay 3's. Once the
+/// guest wrote its own data there, re-entering that overlay's TEXT could never
+/// re-activate: the certified route died at `0x800E1FAC` -- an address inside
+/// overlay 0's text -- because all three generations containing it digested
+/// bytes the guest had legitimately written.
+///
+/// Every consumer derives from this one function so they cannot disagree --
+/// the dense pack, the topology, the runtime catalog and the emitted pack all
+/// fold shard extents into digests that must match.
+pub fn generation_source_span(recipe: &OverlayLoadRecipeV1) -> u32 {
+    recipe.text_end - recipe.load_start
 }
 
 impl OverlayLoadRecipeV1 {
@@ -149,6 +196,29 @@ pub fn parse_overlay_load_recipes_v1(
             bss_start,
             bss_end,
             loaded_sha256: format!("{:x}", Sha256::digest(loaded)),
+            text_sha256: {
+                // text_start/text_end are VIRTUAL; convert to the ROM window
+                // the loaded slice already represents.
+                // Must span exactly what a GENERATION covers, which is the
+                // bare text extent. A generation folds this digest into its
+                // identity, so any disagreement here would never match the
+                // bytes the generation admits.
+                //
+                // Computed inline rather than via `generation_source_span`
+                // because the recipe is still being constructed here. It must
+                // stay identical to that function: the exact text length, with
+                // no shard rounding, so the overlay's mutable data never lands
+                // inside the digested extent.
+                let span = text_end - load_start;
+                let text_rom_start = rom_start;
+                let text_rom_end = rom_start + span;
+                let text = rom_bytes
+                    .get(text_rom_start as usize..text_rom_end as usize)
+                    .ok_or(OverlayRecipeError::DescriptorOutsideRom {
+                        record: record_index,
+                    })?;
+                format!("{:x}", Sha256::digest(text))
+            },
         });
     }
     Ok(recipes)

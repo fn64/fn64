@@ -174,7 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("fixture seed regions are not uniform").into());
     }
 
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, SAMPLED)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, SAMPLED, true)?;
     if status != FrameStatus::Complete {
         return Err(
             io::Error::other(format!("framebuffer behavior fixture returned {status:?}")).into(),

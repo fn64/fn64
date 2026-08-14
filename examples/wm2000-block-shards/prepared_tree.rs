@@ -89,12 +89,13 @@ impl PreparedTreePublication {
         }
         let staging = create_staging_directory(&canonical_parent)?;
         let manifest = format!(
-            "schema {ROOT_SCHEMA_V2}\nnormalized_rom_sha256 {}\ngenerator_source_sha256 {}\ndiscovery_source_sha256 {}\nemitter_source_sha256 {}\nruntime_source_sha256 {}\nartifact_count 35\n",
+            "schema {ROOT_SCHEMA_V2}\nnormalized_rom_sha256 {}\ngenerator_source_sha256 {}\ndiscovery_source_sha256 {}\nemitter_source_sha256 {}\nruntime_source_sha256 {}\nartifact_count {}\n",
             hex(normalized_rom_sha256),
             hex(claims.generator_source_sha256),
             hex(claims.discovery_source_sha256),
             hex(claims.emitter_source_sha256),
             hex(claims.runtime_source_sha256),
+            PACKAGES.len(),
         );
         Ok(Self {
             output: canonical_output,
@@ -108,7 +109,7 @@ impl PreparedTreePublication {
     pub fn push(&mut self, artifact: GeneratedShard) -> Result<(), PublishError> {
         let expected = PACKAGES
             .get(self.next_package)
-            .ok_or_else(|| error("prepared publication received more than 35 packages"))?;
+            .ok_or_else(|| error("prepared publication received more packages than the inventory"))?;
         if artifact.package != *expected {
             return Err(error("prepared artifact stream is not canonical"));
         }
@@ -148,7 +149,7 @@ impl PreparedTreePublication {
     pub fn finish(mut self) -> Result<[u8; 32], PublishError> {
         if self.next_package != PACKAGES.len() {
             return Err(error(
-                "prepared artifact stream ended before all 35 packages",
+                "prepared artifact stream ended before the whole shard inventory",
             ));
         }
         let staging = self
@@ -792,7 +793,7 @@ mod tests {
         assert!(wrong.push(Fixture::artifact(PACKAGES[1])).is_err());
         drop(wrong);
         let mut missing = fixture.begin(&fixture.output).unwrap();
-        for package in &PACKAGES[..34] {
+        for package in &PACKAGES[..PACKAGES.len() - 1] {
             missing.push(Fixture::artifact(package)).unwrap();
         }
         assert!(missing.finish().is_err());

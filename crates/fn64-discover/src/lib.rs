@@ -215,6 +215,8 @@ pub mod boundaries;
 pub mod callback_flow;
 pub mod callgraph_match;
 pub mod candidate_cfg_probe;
+pub mod code_span_locality;
+pub mod container_coverage;
 pub mod candidate_corroboration;
 pub mod candidate_relation_report;
 pub mod catalog_transfer_fixed_point;
@@ -951,6 +953,17 @@ pub struct StrategyOutcome {
     pub wrapper_shape_rejections: WrapperRejectionCounts,
 }
 
+impl StrategyOutcome {
+    /// Why this strategy's table search succeeded or failed.
+    ///
+    /// Derived from the counts already recorded rather than stored, so it
+    /// cannot drift out of step with them and the serialized shape is
+    /// unchanged.
+    pub fn table_family_outcome(&self) -> TableFamilySearchOutcome {
+        TableFamilySearchOutcome::classify(self.candidate_tables, self.admitted_tables)
+    }
+}
+
 /// Serializable form of [`pi_dma::WrapperRejectionCensus`].
 ///
 /// The wrapper proof rule is the dominant geometry frontier across a large
@@ -979,6 +992,61 @@ pub struct WrapperRejectionCounts {
 impl WrapperRejectionCounts {
     fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// Why a table-family search produced no usable table.
+///
+/// [`StrategyOutcome`] records `candidate_tables` and `admitted_tables` as
+/// bare counts, and zero-and-zero reads the same as several-and-zero. Those
+/// two failures need opposite fixes -- one wants a new descriptor family, the
+/// other wants admission relaxed -- and across the 287-ROM corpus they split
+/// 229 to 10, so treating them alike misallocates by more than 20x. The split
+/// had to be recovered afterwards by an external probe
+/// (`examples/probe_zero_admitted_cause.rs`); this makes it a first-class
+/// result instead.
+///
+/// This measures the CURRENT BUILD's capability, not a property of the ROM,
+/// so it moves as families are added. Compare it against
+/// [`code_span_locality`] -- which does not move -- to tell "we improved"
+/// apart from "the ROM was always like this".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableFamilySearchOutcome {
+    /// The family shape does not occur in this ROM: nothing was enumerated.
+    /// Admission rules are irrelevant here; only a different family can help.
+    NoCandidates,
+    /// Candidates were enumerated but none cleared admission. Worth inspecting
+    /// how close the best one came before concluding anything.
+    CandidatesNoneAdmitted,
+    /// Exactly one table admitted -- the usable outcome.
+    UniqueTable,
+    /// Several tables admitted and discovery declined to choose. Either the
+    /// ROM really has several arrays, or the search is double-counting one.
+    AmbiguousTables { admitted: usize },
+}
+
+impl TableFamilySearchOutcome {
+    /// Classify from the counts [`StrategyOutcome`] already carries.
+    pub fn classify(candidate_tables: usize, admitted_tables: usize) -> Self {
+        // Order matters: what was ADMITTED decides the outcome, and the
+        // candidate count only distinguishes the two zero-admitted cases.
+        // Testing `candidate_tables == 0` first would classify an admitted
+        // table as NoCandidates whenever an admission pass synthesizes one,
+        // which a test caught.
+        match (admitted_tables, candidate_tables) {
+            (1, _) => Self::UniqueTable,
+            (0, 0) => Self::NoCandidates,
+            (0, _) => Self::CandidatesNoneAdmitted,
+            (admitted, _) => Self::AmbiguousTables { admitted },
+        }
+    }
+
+    /// Whether a different descriptor family is the only thing that could
+    /// help. True only for [`Self::NoCandidates`]: every other outcome found
+    /// something this family recognizes.
+    pub fn needs_a_different_family(self) -> bool {
+        matches!(self, Self::NoCandidates)
     }
 }
 

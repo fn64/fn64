@@ -40,7 +40,7 @@ use fn64_render::{
 use fn64_render::{PresentMemory, TaskAdmissionPlan, TaskAdmissionRawWindow};
 use sha2::Digest;
 #[cfg(feature = "rt64")]
-use transaction::{NativeContextLease, NativeRdramRollback, NativeTaskMemoryRollback};
+use transaction::{NativeContextLease, NativeTaskMemoryRollback};
 
 #[cfg(feature = "rt64")]
 const RT64_GBI_TEXT_RECOGNITION_BYTES: usize = 0x18d0;
@@ -180,7 +180,7 @@ pub struct Rt64PresentedPixels {
 /// Exact managed render target sampled by the most recently completed RT64
 /// VI draw. The texture identity is process-local and intended for behavioral
 /// evidence, while the address and dimensions name guest-visible state.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Rt64PresentSelection {
     pub present_id: u64,
     pub source_texture_identity: u64,
@@ -188,6 +188,13 @@ pub struct Rt64PresentSelection {
     pub target_width: u32,
     pub target_height: u32,
     pub target_size: u32,
+    pub workload_resolution_scale_x: f32,
+    pub workload_resolution_scale_y: f32,
+    pub resolution_scale_x: f32,
+    pub resolution_scale_y: f32,
+    pub raster_width: u32,
+    pub raster_height: u32,
+    pub downsample_multiplier: u32,
 }
 
 pub const RT64_DEFERRED_MAX_FRAMEBUFFER_PAIRS: usize = 4;
@@ -712,6 +719,27 @@ struct ResolvedReplacementPack {
 }
 
 #[cfg(feature = "rt64")]
+#[derive(Debug)]
+struct ReplacementPackSnapshot {
+    root: PathBuf,
+    packs: Vec<ResolvedReplacementPack>,
+}
+
+#[cfg(feature = "rt64")]
+impl Drop for ReplacementPackSnapshot {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "fn64-render-rt64: failed to remove replacement snapshot {:?}: {error}",
+                    self.root
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rt64")]
 fn hash_replacement_content(path: &Path) -> Result<[u8; 32], String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("replacement-pack metadata failed for {path:?}: {error}"))?;
@@ -861,6 +889,201 @@ fn resolve_replacement_packs(
 }
 
 #[cfg(feature = "rt64")]
+fn replacement_identities_match(
+    left: &[ResolvedReplacementPack],
+    right: &[ResolvedReplacementPack],
+) -> bool {
+    left.iter()
+        .map(|pack| &pack.identity)
+        .eq(right.iter().map(|pack| &pack.identity))
+}
+
+#[cfg(feature = "rt64")]
+fn copy_replacement_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::create_dir(destination).map_err(|error| {
+        format!("replacement snapshot directory create failed for {destination:?}: {error}")
+    })?;
+    let entries = std::fs::read_dir(source)
+        .map_err(|error| {
+            format!("replacement snapshot directory read failed for {source:?}: {error}")
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!("replacement snapshot entry read failed for {source:?}: {error}")
+        })?;
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source_path).map_err(|error| {
+            format!("replacement snapshot metadata failed for {source_path:?}: {error}")
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "replacement snapshot source contains a symbolic link: {source_path:?}"
+            ));
+        }
+        if metadata.is_dir() {
+            copy_replacement_directory(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&source_path, &destination_path).map_err(|error| {
+                format!(
+                    "replacement snapshot copy failed from {source_path:?} to {destination_path:?}: {error}"
+                )
+            })?;
+        } else {
+            return Err(format!(
+                "replacement snapshot source contains a non-file entry: {source_path:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rt64")]
+fn create_replacement_snapshot(
+    packs: &[ResolvedReplacementPack],
+) -> Result<Option<ReplacementPackSnapshot>, String> {
+    if packs.is_empty() {
+        return Ok(None);
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+    let mut root = None;
+    for _ in 0..1024 {
+        let candidate = std::env::temp_dir().join(format!(
+            "fn64-rt64-replacements-{}-{}",
+            std::process::id(),
+            NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                root = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "replacement snapshot root create failed for {candidate:?}: {error}"
+                ));
+            }
+        }
+    }
+    let root = root.ok_or_else(|| {
+        "replacement snapshot could not allocate a unique temporary directory".to_string()
+    })?;
+    let mut snapshot = ReplacementPackSnapshot {
+        root,
+        packs: Vec::new(),
+    };
+    let mut inputs = Vec::with_capacity(packs.len());
+    for (index, pack) in packs.iter().enumerate() {
+        let metadata = std::fs::symlink_metadata(&pack.canonical_path).map_err(|error| {
+            format!(
+                "replacement snapshot metadata failed for {:?}: {error}",
+                pack.canonical_path
+            )
+        })?;
+        let destination = if metadata.is_file() {
+            snapshot.root.join(format!("pack-{index}.rtz"))
+        } else if metadata.is_dir() {
+            snapshot.root.join(format!("pack-{index}"))
+        } else {
+            return Err(format!(
+                "replacement snapshot source is neither a directory nor .rtz file: {:?}",
+                pack.canonical_path
+            ));
+        };
+        if metadata.is_file() {
+            std::fs::copy(&pack.canonical_path, &destination).map_err(|error| {
+                format!(
+                    "replacement snapshot copy failed from {:?} to {destination:?}: {error}",
+                    pack.canonical_path
+                )
+            })?;
+        } else {
+            copy_replacement_directory(&pack.canonical_path, &destination)?;
+        }
+        inputs.push(Rt64ReplacementPackInput::new(destination));
+    }
+    snapshot.packs = resolve_replacement_packs(&inputs)?;
+    if !replacement_identities_match(packs, &snapshot.packs) {
+        return Err("replacement-pack bytes changed while creating the active snapshot".into());
+    }
+    Ok(Some(snapshot))
+}
+
+#[cfg(all(test, feature = "rt64"))]
+mod replacement_snapshot_tests {
+    use super::{
+        create_replacement_snapshot, replacement_identities_match, resolve_replacement_packs,
+        Rt64ReplacementPackInput,
+    };
+
+    struct SourcePack(std::path::PathBuf);
+
+    impl SourcePack {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "fn64-rt64-snapshot-source-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create replacement snapshot source");
+            std::fs::write(
+                path.join("rt64.json"),
+                b"{\"configuration\":{\"configurationVersion\":3,\"autoPath\":\"rt64\",\"defaultOperation\":\"stream\",\"defaultShift\":\"half\",\"hashVersion\":5},\"textures\":[],\"operationFilters\":[],\"shiftFilters\":[],\"extraFiles\":[]}",
+            )
+            .expect("write replacement snapshot database");
+            std::fs::write(path.join("payload.bin"), b"original")
+                .expect("write replacement snapshot payload");
+            Self(path)
+        }
+    }
+
+    impl Drop for SourcePack {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove replacement snapshot source");
+        }
+    }
+
+    #[test]
+    fn active_snapshot_owns_the_validated_bytes_until_drop() {
+        let source = SourcePack::new();
+        let original = resolve_replacement_packs(&[Rt64ReplacementPackInput::new(&source.0)])
+            .expect("inspect source replacement pack");
+        let snapshot = create_replacement_snapshot(&original)
+            .expect("create replacement snapshot")
+            .expect("nonempty pack set has a snapshot");
+        let snapshot_root = snapshot.root.clone();
+        assert_ne!(snapshot.packs[0].canonical_path, original[0].canonical_path);
+        assert!(replacement_identities_match(&original, &snapshot.packs));
+
+        std::fs::write(source.0.join("payload.bin"), b"changed")
+            .expect("mutate original replacement pack");
+        let changed = resolve_replacement_packs(&[Rt64ReplacementPackInput::new(&source.0)])
+            .expect("inspect changed replacement pack");
+        assert!(!replacement_identities_match(&original, &changed));
+        let snapshot_inputs: Vec<_> = snapshot
+            .packs
+            .iter()
+            .map(|pack| pack.input.clone())
+            .collect();
+        let reinspected_snapshot =
+            resolve_replacement_packs(&snapshot_inputs).expect("reinspect owned snapshot");
+        assert!(replacement_identities_match(
+            &original,
+            &reinspected_snapshot
+        ));
+
+        drop(snapshot);
+        assert!(!snapshot_root.exists());
+    }
+}
+
+#[cfg(feature = "rt64")]
 fn replacement_ffi_inputs(
     packs: &[ResolvedReplacementPack],
 ) -> Result<Vec<(CString, RenderReplacementPackIdentity)>, String> {
@@ -891,17 +1114,21 @@ enum Rt64PresentAuthority {
 struct CompletedRt64Present {
     guest_cycle: u64,
     authority: Rt64PresentAuthority,
+    active_output_height: Option<std::num::NonZeroU32>,
 }
 
 impl CompletedRt64Present {
     #[cfg(any(feature = "rt64", test))]
-    fn release_guest_cycle(self) -> Result<u64, RenderError> {
+    fn release_geometry(self) -> Result<(u64, std::num::NonZeroU32), RenderError> {
         if self.authority != Rt64PresentAuthority::LiveRegisters {
             return Err(RenderError::NotReady(
                 "RT64 release capture requires a completed live-register VI present",
             ));
         }
-        Ok(self.guest_cycle)
+        let active_output_height = self.active_output_height.ok_or(RenderError::NotReady(
+            "RT64 release capture requires a completed active VI output window",
+        ))?;
+        Ok((self.guest_cycle, active_output_height))
     }
 }
 
@@ -969,12 +1196,13 @@ pub struct Rt64Backend {
     configured_replacement_packs: Vec<ResolvedReplacementPack>,
     configured_replacement_enabled: bool,
     active_replacement_settings: Option<RenderReplacementSettings>,
+    #[cfg(feature = "rt64")]
+    active_replacement_snapshot: Option<ReplacementPackSnapshot>,
 }
 
 // The inherent impl lives in backend_impl.rs; as a child module it sees
 // this file's private fields, so nothing here widened for the move.
 mod backend_impl;
-
 
 impl Default for Rt64Backend {
     fn default() -> Self {
@@ -1042,6 +1270,74 @@ impl RenderBackend for Rt64Backend {
         }
     }
 
+    fn render_target_diagnostic(
+        &mut self,
+    ) -> Result<fn64_render::RenderTargetDiagnostic, RenderError> {
+        #[cfg(feature = "rt64")]
+        {
+            let selection = self
+                .context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .present_selection()
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason,
+                })?;
+            let nonzero = |field: &'static str, value| {
+                std::num::NonZeroU32::new(value).ok_or_else(|| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason: format!("RT64 returned zero {field}"),
+                })
+            };
+            Ok(fn64_render::RenderTargetDiagnostic {
+                present_id: std::num::NonZeroU64::new(selection.present_id).ok_or_else(|| {
+                    RenderError::Backend {
+                        backend: "rt64-render-target-diagnostic",
+                        reason: "RT64 returned zero present ID".into(),
+                    }
+                })?,
+                target_address: selection.target_address,
+                workload_resolution_scale: fn64_render::RenderResolutionScale::try_new(
+                    selection.workload_resolution_scale_x,
+                    selection.workload_resolution_scale_y,
+                )
+                .ok_or_else(|| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason: format!(
+                        "RT64 returned invalid workload resolution scale {}x{}",
+                        selection.workload_resolution_scale_x,
+                        selection.workload_resolution_scale_y
+                    ),
+                })?,
+                resolution_scale: fn64_render::RenderResolutionScale::try_new(
+                    selection.resolution_scale_x,
+                    selection.resolution_scale_y,
+                )
+                .ok_or_else(|| RenderError::Backend {
+                    backend: "rt64-render-target-diagnostic",
+                    reason: format!(
+                        "RT64 returned invalid resolution scale {}x{}",
+                        selection.resolution_scale_x, selection.resolution_scale_y
+                    ),
+                })?,
+                raster_width: nonzero("raster width", selection.raster_width)?,
+                raster_height: nonzero("raster height", selection.raster_height)?,
+                downsample_multiplier: nonzero(
+                    "downsample multiplier",
+                    selection.downsample_multiplier,
+                )?,
+            })
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            Err(RenderError::NotReady(
+                "RT64 render-target diagnostics require the rt64 feature",
+            ))
+        }
+    }
+
     fn create(&mut self, cfg: &RenderConfig) -> Result<(), RenderError> {
         self.active_tv_type = None;
         self.active_surface_size = None;
@@ -1053,6 +1349,7 @@ impl RenderBackend for Rt64Backend {
         #[cfg(feature = "rt64")]
         {
             self.context = None;
+            self.active_replacement_snapshot = None;
             let replacement_inputs: Vec<_> = self
                 .configured_replacement_packs
                 .iter()
@@ -1066,6 +1363,15 @@ impl RenderBackend for Rt64Backend {
                     }
                 })?;
             self.configured_replacement_packs = replacements.clone();
+            let snapshot = create_replacement_snapshot(&replacements).map_err(|reason| {
+                RenderError::Backend {
+                    backend: "rt64-replacement-create",
+                    reason,
+                }
+            })?;
+            let native_replacements = snapshot
+                .as_ref()
+                .map_or([].as_slice(), |snapshot| snapshot.packs.as_slice());
             let mut context = ffi::Context::create(
                 cfg.width,
                 cfg.height,
@@ -1078,40 +1384,44 @@ impl RenderBackend for Rt64Backend {
                 backend: "rt64",
                 reason,
             })?;
-            let ffi_inputs =
-                replacement_ffi_inputs(&replacements).map_err(|reason| RenderError::Backend {
+            let ffi_inputs = replacement_ffi_inputs(native_replacements).map_err(|reason| {
+                RenderError::Backend {
                     backend: "rt64-replacement-create",
                     reason,
-                })?;
+                }
+            })?;
             context
                 .load_replacement_packs(&ffi_inputs, self.configured_replacement_enabled)
                 .map_err(|reason| RenderError::Backend {
                     backend: "rt64-replacement-create",
                     reason,
                 })?;
+            let snapshot_inputs: Vec<_> = native_replacements
+                .iter()
+                .map(|pack| pack.input.clone())
+                .collect();
             let replacements_after =
-                resolve_replacement_packs(&replacement_inputs).map_err(|reason| {
+                resolve_replacement_packs(&snapshot_inputs).map_err(|reason| {
                     RenderError::Backend {
                         backend: "rt64-replacement-create",
                         reason,
                     }
                 })?;
-            if replacements_after != replacements {
+            if !replacement_identities_match(&replacements, &replacements_after) {
                 return Err(RenderError::Backend {
                     backend: "rt64-replacement-create",
-                    reason: "replacement-pack bytes changed while RT64 created the backend".into(),
+                    reason: "replacement snapshot bytes changed while RT64 created the backend"
+                        .into(),
                 });
             }
             self.context = Some(context);
+            self.active_replacement_snapshot = snapshot;
             self.active_settings = Some(self.configured_settings.clone());
             self.active_enhancement_settings = Some(self.configured_enhancement_settings.clone());
             self.active_emulator_settings = Some(self.configured_emulator_settings.clone());
             self.active_replacement_settings = Some(RenderReplacementSettings {
                 enabled: self.configured_replacement_enabled,
-                packs: replacements_after
-                    .into_iter()
-                    .map(|pack| pack.identity)
-                    .collect(),
+                packs: replacements.into_iter().map(|pack| pack.identity).collect(),
             });
             self.active_tv_type = Some(cfg.tv_type);
             self.active_surface_size = Some(ingress::ActiveSurfaceSize {
@@ -1288,6 +1598,7 @@ impl RenderBackend for Rt64Backend {
         start: u32,
         end: u32,
         output_addr: u32,
+        wait_for_completion: bool,
     ) -> Result<FrameStatus, RenderError> {
         self.last_dp_full_sync = fn64_render::DpFullSyncStatus::Unidentified;
         #[cfg(feature = "rt64")]
@@ -1310,22 +1621,32 @@ impl RenderBackend for Rt64Backend {
             let full_sync = fn64_render::inspect_raw_rdp_full_sync(rdram, start, end)?;
             let mut context = NativeContextLease::take(&mut self.context)
                 .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
-            let mut transaction = NativeRdramRollback::new(rdram, &mut self.native_rdram_preimage);
-            if let Err(reason) = context.context_mut().process_rdp_commands(
-                transaction.memory_mut(),
+            // No RDRAM rollback here, deliberately: on the only path that
+            // would read `native_rdram_preimage` (the `Err` arm below), this
+            // function calls `invalidate_native_state()`, which drops
+            // `self.context` and tears down the whole native renderer
+            // session before returning. A caller that gets `RenderError`
+            // never continues against the RDRAM this transaction touched --
+            // the session is gone. Restoring bytes that no live session will
+            // ever read is pure cost: an 8 MiB copy_from_slice on the ONLY
+            // call site this measured at 1.088ms/call RT64 FFI + 0.125ms/call
+            // rollback (2026-08-10, 4,032-call sample, this route), i.e. paid
+            // on every successful call to protect a failure path that
+            // discards the very memory it would restore.
+            if let Err(reason) = context.context_mut().process_rdp_commands_async(
+                rdram,
                 start,
                 end,
                 output_addr,
+                wait_for_completion,
             ) {
                 drop(context);
-                drop(transaction);
                 self.invalidate_native_state();
                 return Err(RenderError::Backend {
                     backend: "rt64",
                     reason,
                 });
             }
-            transaction.commit();
             context.restore();
             self.last_dp_full_sync = full_sync;
             Ok(FrameStatus::Complete)
@@ -1368,6 +1689,7 @@ impl RenderBackend for Rt64Backend {
 
     fn present(&mut self, request: PresentRequest<'_>) -> Result<(), RenderError> {
         let (vi, memory) = request.into_parts();
+        let active_output_height = vi.active_output_height();
         let authority = if vi.scanout.registers().is_some() {
             Rt64PresentAuthority::LiveRegisters
         } else {
@@ -1389,9 +1711,21 @@ impl RenderBackend for Rt64Backend {
             if let Some(footprint) = fn64_render::programmed_vi_source_footprint(vi)? {
                 footprint.validate_rdram_len(memory.len())?;
             }
-            self.context
+            let context = self
+                .context
                 .as_mut()
-                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?;
+            // A raw-RDP submission earlier this field may have deferred its
+            // GPU-completion wait (`process_rdp_commands_async`). Present is
+            // the one place that unconditionally must see completed state --
+            // flush before it reads anything.
+            context
+                .flush_pending_workload()
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64",
+                    reason,
+                })?;
+            context
                 .present(&memory, vi)
                 .map_err(|reason| RenderError::Backend {
                     backend: "rt64",
@@ -1400,13 +1734,14 @@ impl RenderBackend for Rt64Backend {
             self.last_present = Some(CompletedRt64Present {
                 guest_cycle: vi.noise_seed,
                 authority,
+                active_output_height,
             });
             Ok(())
         }
 
         #[cfg(not(feature = "rt64"))]
         {
-            let _ = (vi, memory, authority);
+            let _ = (vi, memory, authority, active_output_height);
             Err(RenderError::NotReady(
                 "Rt64Backend is unavailable without the `rt64` Cargo feature",
             ))
@@ -1414,51 +1749,51 @@ impl RenderBackend for Rt64Backend {
     }
 
     fn release_capture(&mut self) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
+        self.release_capture_into(&mut Vec::new())
+    }
+
+    fn release_capture_into(
+        &mut self,
+        reuse: &mut Vec<u8>,
+    ) -> Result<fn64_render::RenderReleaseCapture, RenderError> {
         #[cfg(feature = "rt64")]
         {
             let completed = self.last_present.ok_or(RenderError::NotReady(
                 "RT64 release capture requested before a completed VI present",
             ))?;
-            let guest_cycle = completed.release_guest_cycle()?;
-            let replacement_inputs: Vec<_> = self
-                .configured_replacement_packs
-                .iter()
-                .map(|pack| pack.input.clone())
-                .collect();
-            let replacement_enabled = self
-                .active_replacement_settings
-                .as_ref()
-                .ok_or(RenderError::NotReady(
-                    "RT64 release capture has no active replacement identity",
-                ))?
-                .enabled;
-            let current_replacements = match resolve_replacement_packs(&replacement_inputs) {
-                Ok(packs) => RenderReplacementSettings {
-                    enabled: replacement_enabled,
-                    packs: packs.into_iter().map(|pack| pack.identity).collect(),
-                },
-                Err(reason) => {
-                    self.active_replacement_settings = None;
-                    return Err(RenderError::Backend {
-                        backend: "rt64-release-capture",
-                        reason: format!(
-                            "active replacement packs could not be revalidated: {reason}"
-                        ),
-                    });
-                }
-            };
-            if self.active_replacement_settings.as_ref() != Some(&current_replacements) {
-                self.active_replacement_settings = None;
+            let (guest_cycle, active_output_height) = completed.release_geometry()?;
+            let active_replacements =
+                self.active_replacement_settings
+                    .as_ref()
+                    .ok_or(RenderError::NotReady(
+                        "RT64 release capture has no active replacement identity",
+                    ))?;
+            if !active_replacements.packs.is_empty() && self.active_replacement_snapshot.is_none() {
                 return Err(RenderError::Backend {
                     backend: "rt64-release-capture",
-                    reason: "active replacement-pack bytes changed after activation; reload or recreate before capture".into(),
+                    reason: "active replacement identity has no owned native snapshot".into(),
                 });
             }
             let policy = self.active_runtime_policy().ok_or(RenderError::NotReady(
                 "RT64 release capture has no complete active runtime policy",
             ))?;
             let settings_sha256 = policy.sha256();
-            let mut pixels = self.presented_pixels()?;
+            let pixels = self
+                .context
+                .as_mut()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .read_presented_pixels_into(reuse)
+                .map_err(|reason| {
+                    if reason == "RT64 has no completed post-workload present capture" {
+                        return RenderError::NotReady(
+                            "RT64 has no completed post-workload present capture",
+                        );
+                    }
+                    RenderError::Backend {
+                        backend: "rt64-present-capture",
+                        reason,
+                    }
+                })?;
             let graphics_api = pixels.graphics_api;
             if !graphics_api_matches_request(policy.user.graphics_api, graphics_api) {
                 return Err(RenderError::Backend {
@@ -1481,29 +1816,44 @@ impl RenderBackend for Rt64Backend {
                     fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm
                 }
                 Rt64PresentPixelFormat::Rgba8Unorm => {
-                    for pixel in pixels.bytes.chunks_exact_mut(4) {
+                    for pixel in reuse.chunks_exact_mut(4) {
                         pixel.swap(0, 2);
                     }
                     fn64_render::ReleaseCaptureFormat::PostViBgra8Unorm
                 }
             };
+            let present_id = pixels.present_id;
+            let layout =
+                fn64_render::ReleaseCaptureLayout::try_new(fn64_render::ReleaseCaptureLayoutSpec {
+                    format,
+                    width: pixels.width,
+                    storage_height: pixels.height,
+                    visible_height: active_output_height.get(),
+                    row_bytes: pixels.row_bytes,
+                })
+                .map_err(|error| RenderError::Backend {
+                    backend: "rt64-release-capture",
+                    reason: error.to_string(),
+                })?;
+            let pixels = fn64_render::ReleaseCapturePixels::try_from_reused(layout, reuse)
+                .map_err(|error| RenderError::Backend {
+                    backend: "rt64-release-capture",
+                    reason: error.to_string(),
+                })?;
             Ok(fn64_render::RenderReleaseCapture {
                 guest_cycle,
                 backend_identity: identity.canonical_id(),
                 source_authoritative: identity.is_source_authoritative(),
                 settings_sha256,
-                width: pixels.width,
-                height: pixels.height,
-                row_bytes: pixels.row_bytes,
-                format,
+                pixels,
                 workload_id,
-                present_id: pixels.present_id,
-                bytes: pixels.bytes,
+                present_id,
             })
         }
 
         #[cfg(not(feature = "rt64"))]
         {
+            let _ = reuse;
             Err(RenderError::Backend {
                 backend: "rt64-release-capture",
                 reason: "fn64-render-rt64 was built without the opt-in `rt64` Cargo feature"

@@ -864,7 +864,7 @@ pub(super) fn wm_shard_root(package_root: &Path) -> Result<PathBuf, GeneratedRun
     Ok(package_root
         .parent()
         .ok_or_else(|| error("WM root package has no examples parent"))?
-        .join("wm2000-block-shards"))
+        .join(env!("FN64_WM_SHARD_DIR")))
 }
 
 pub(super) fn wm_shard_cargo_source_sha256(
@@ -873,23 +873,23 @@ pub(super) fn wm_shard_cargo_source_sha256(
 ) -> Result<String, GeneratedRunnerBuildError> {
     let shard_root = wm_shard_root(package_root)?;
     let mut files = vec![(
-        "../wm2000-block-shards/lib.rs".to_owned(),
+        format!("../{}/lib.rs", env!("FN64_WM_SHARD_DIR")),
         shard_root.join("lib.rs"),
     )];
     match prepared_source_mode {
         PREPARED_SOURCE_MODE_INACTIVE_V1 => {
             files.push((
-                "../wm2000-block-shards/build.rs".to_owned(),
+                format!("../{}/build.rs", env!("FN64_WM_SHARD_DIR")),
                 shard_root.join("build.rs"),
             ));
         }
         PREPARED_SOURCE_MODE_CONSUMED_V1 => {
             files.push((
-                "../wm2000-block-shards/prepared_build.rs".to_owned(),
+                format!("../{}/prepared_build.rs", env!("FN64_WM_SHARD_DIR")),
                 shard_root.join("prepared_build.rs"),
             ));
             files.push((
-                "../wm2000-block-shards/materializer.rs".to_owned(),
+                format!("../{}/materializer.rs", env!("FN64_WM_SHARD_DIR")),
                 shard_root.join("materializer.rs"),
             ));
         }
@@ -905,7 +905,8 @@ pub(super) fn wm_shard_cargo_source_sha256(
         })?;
         files.push((
             format!(
-                "../wm2000-block-shards/{}",
+                "../{}/{}",
+                env!("FN64_WM_SHARD_DIR"),
                 relative.to_string_lossy().replace('\\', "/")
             ),
             manifest,
@@ -949,8 +950,8 @@ pub(super) fn wm_prepared_source_mode_v3(
         );
     }
     match (legacy, prepared) {
-        (35, 0) => Ok(PREPARED_SOURCE_MODE_INACTIVE_V1),
-        (0, 35) => Ok(PREPARED_SOURCE_MODE_CONSUMED_V1),
+        (count, 0) if count == SHARD_COUNT => Ok(PREPARED_SOURCE_MODE_INACTIVE_V1),
+        (0, count) if count == SHARD_COUNT => Ok(PREPARED_SOURCE_MODE_CONSUMED_V1),
         _ => Err(error(
             "WM shard manifests mix or omit legacy/prepared source modes",
         )),
@@ -1082,7 +1083,7 @@ pub(super) fn collect_package_files(
 pub(super) fn prepared_source_claims_v3(
     workspace: &Path,
 ) -> Result<PreparedSourceClaimsV3, GeneratedRunnerBuildError> {
-    let shard_root = workspace.join("examples/wm2000-block-shards");
+    let shard_root = workspace.join("examples").join(env!("FN64_WM_SHARD_DIR"));
     Ok(PreparedSourceClaimsV3 {
         generator_source_sha256: source_tree_sha256(
             &shard_root,
@@ -1158,7 +1159,7 @@ pub(super) fn producer_cargo_source_sha256_v3(
     workspace: &Path,
 ) -> Result<String, GeneratedRunnerBuildError> {
     let external_sources = source_tree_sha256(
-        &workspace.join("examples/wm2000-block-shards"),
+        &workspace.join("examples").join(env!("FN64_WM_SHARD_DIR")),
         b"fn64.wm-prepared-producer-external-sources.v1\0",
         &["build.rs", "prepared_tree.rs", "producer.rs"],
     )?;
@@ -1210,9 +1211,9 @@ pub(super) fn measure_prepared_tree_v3(
     );
     let root_entries = exact_directory_entries(root, "prepared shard root")?;
     if root_entries != expected_root || root_entries.contains(PREPARED_UPDATE_MARKER_NAME) {
-        return Err(error(
-            "prepared shard root does not contain exactly manifest.v2 and 35 package directories",
-        ));
+        return Err(error(format!(
+            "prepared shard root does not contain exactly manifest.v2 and {SHARD_COUNT} package directories",
+        )));
     }
 
     let manifest_path = root.join(PREPARED_MANIFEST_NAME);
@@ -1227,7 +1228,7 @@ pub(super) fn measure_prepared_tree_v3(
     let lines = manifest_text.lines().collect::<Vec<_>>();
     if lines.len() != 7 + PREPARED_PACKAGES.len()
         || lines[0] != "schema fn64.wm-prepared-shard-tree.v2"
-        || lines[6] != "artifact_count 35"
+        || lines[6] != format!("artifact_count {SHARD_COUNT}")
     {
         return Err(error("prepared root manifest has a noncanonical shape"));
     }

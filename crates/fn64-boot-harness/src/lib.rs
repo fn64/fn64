@@ -40,8 +40,8 @@ pub use certification_profile::{
     FULL_PARITY_V1_DEFINITION_SHA256, FULL_PARITY_V1_SCHEMA,
 };
 pub use controller_input_schedule::{
-    parse_controller_input_schedule, ControllerInputPhase, ControllerInputSchedule,
-    ControllerInputScheduleError, CONTROLLER_INPUT_SCHEDULE_SCHEMA,
+    attach_controllers_for_driven_ports, parse_controller_input_schedule, ControllerInputPhase,
+    ControllerInputSchedule, ControllerInputScheduleError, CONTROLLER_INPUT_SCHEDULE_SCHEMA,
 };
 #[cfg(feature = "recomp-rs")]
 pub use generated_runner_build::{
@@ -1100,7 +1100,17 @@ impl CommittedViBoundary {
             && fn64_abi::copy_device_trace().len() == self.device_trace_events
             && fn64_abi::copy_save_operations().len() == self.save_operation_events
             && fn64_abi::copy_controller_operations().len() == self.controller_operation_events
-            && fn64_abi::copy_rsp_rdp_observations() == self.rsp_rdp_observations
+            // Count, not contents. This check asks only whether anything
+            // advanced since the boundary was committed, which is what every
+            // sibling line above asks with `.len()`. The history only grows
+            // within a ROM load, so a count detects an advance exactly as a
+            // deep compare does -- while a deep compare also CLONES the whole
+            // vector on every VI boundary, which is O(n) per field against an
+            // n that grows ~2.8/field. That is quadratic over a session and is
+            // the shape behind `pump_ms` climbing 12.7 -> 29.1 ms within one
+            // windowed run. `into_evidence` below still carries the full
+            // ordered sequence, so the release gate is unaffected.
+            && fn64_abi::rsp_rdp_observation_count() == self.rsp_rdp_observations.len()
             && fn64_abi::copy_native_execution_destinations() == self.native_execution_destinations
             && {
                 #[cfg(feature = "recomp-rs")]

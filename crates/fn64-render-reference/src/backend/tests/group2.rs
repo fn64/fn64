@@ -89,7 +89,7 @@ fn raw_shade_texture_z_triangle_executes_maximum_width_layout() {
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
 
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let view = fn64_runtime::RdramView::from_storage(&rdram);
@@ -178,7 +178,7 @@ fn raw_command_stream_triangle_selects_mips_and_trilinear_fraction() {
     let mut backend = ReferenceBackend::new().with_f3dex2();
     backend.create(&RenderConfig::ntsc(8, 8)).unwrap();
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let view = fn64_runtime::RdramView::from_storage(&rdram);
@@ -266,7 +266,7 @@ fn raw_yuv_texture_rectangle_applies_set_convert_into_rdram() {
     backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
 
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let view = fn64_runtime::RdramView::from_storage(&rdram);
@@ -350,7 +350,7 @@ fn raw_chroma_key_commands_drive_alpha_fixup_and_compare() {
     backend.create(&RenderConfig::ntsc(2, 1)).unwrap();
 
     backend
-        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0)
+        .process_rdp_commands(&mut rdram, START as u32, end as u32, 0, true)
         .unwrap();
 
     let view = fn64_runtime::RdramView::from_storage(&rdram);
@@ -999,6 +999,7 @@ fn fill_cycle_rejects_every_unsafe_bypass_state_before_mutation() {
             START as u32,
             (START + commands.len() * 8) as u32,
             0,
+            true,
         )
         .expect_err("unsafe Fill-cycle IM_RD must reject before target writeback");
     assert!(error.to_string().contains("unsafe IM_RD state"));
@@ -1181,7 +1182,7 @@ fn raw_dpc_and_f3dex2_hle_share_one_persistent_rdp_register_file() {
     write_command(&mut rdram, RAW + 8, 0xff10_0000, TARGET);
     write_command(&mut rdram, RAW + 16, 0xf700_0000, 0x07c1_07c1);
     backend
-        .process_rdp_commands(&mut rdram, RAW as u32, (RAW + 24) as u32, 0)
+        .process_rdp_commands(&mut rdram, RAW as u32, (RAW + 24) as u32, 0, true)
         .unwrap();
 
     // The next admitted HLE task consumes those same registers.
@@ -1605,7 +1606,7 @@ fn residue_after_sync_full_executes_with_writes_dropped() {
     let mut backend = ReferenceBackend::new();
     backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
     backend
-        .process_rdp_commands(&mut rdram, 0x100, 0x138, 0)
+        .process_rdp_commands(&mut rdram, 0x100, 0x138, 0, true)
         .expect("residue past SyncFull must execute, not fault");
 
     assert_eq!(

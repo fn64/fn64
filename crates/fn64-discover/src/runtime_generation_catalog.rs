@@ -114,7 +114,26 @@ pub fn build_backed_dense_generation_catalog_v1(
             CatalogGenerationRoleV1::ResidentTail => RESIDENT_TAIL_ARTIFACT_IDENTITY_V1,
             CatalogGenerationRoleV1::Overlay => generation.materialized_bank.as_str(),
         };
-        let shards = bytes
+        // Shards tile in whole DENSE_AOT_SHARD_BYTES blocks and the LAST one
+        // may overhang `image_end` -- a generation may end mid-shard. So the
+        // shard list is chunked from the dense bank's own bytes, not from the
+        // digest slice above: chunking `bytes` would emit a final shard that
+        // stops at `image_end` and disagree with the shard geometry the pack
+        // emits, which is exactly the catalog-digest mismatch this produced.
+        let shard_span_end = source_start
+            .checked_add(byte_len.div_ceil(DENSE_AOT_SHARD_BYTES) * DENSE_AOT_SHARD_BYTES)
+            .ok_or_else(|| format!("runtime generation {} shard span overflow", generation.name))?
+            .min(dense.source_rom_end);
+        let shard_bytes_all = rom
+            .bytes
+            .get(source_start as usize..shard_span_end as usize)
+            .ok_or_else(|| {
+                format!(
+                    "runtime generation {} shard span is outside the ROM",
+                    generation.name
+                )
+            })?;
+        let shards = shard_bytes_all
             .chunks(DENSE_AOT_SHARD_BYTES as usize)
             .enumerate()
             .map(|(index, shard_bytes)| {

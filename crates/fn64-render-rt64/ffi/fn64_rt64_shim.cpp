@@ -588,8 +588,23 @@ void write_vi_registers(
         const uint32_t h_end = guest[9] & 0x03FFU;
         const uint32_t v_start = (guest[10] >> 16U) & 0x03FFU;
         const uint32_t v_end = guest[10] & 0x03FFU;
+        // A window is active only when BOTH axes are programmed, matching
+        // `ViActiveWindow::try_from_registers` (crates/fn64-render/src/lib.rs),
+        // which returns None -- "nothing to scan out yet" -- unless H_VIDEO and
+        // V_VIDEO are each nonzero. This predicate used OR where that Rust
+        // contract uses AND, and the two disagree on exactly the state a real
+        // guest passes through during boot: WM2000's first VI retrace has
+        // V_VIDEO programmed (v=[37,511]) and H_VIDEO still zero, which OR
+        // called "active" and then rejected for h_end <= h_start. That aborted
+        // the process on a frame the Rust side correctly treats as not-yet-
+        // programmed and skips.
+        //
+        // This only narrows what counts as active; it does not weaken any
+        // malformed-window check. A window with both axes written still gets
+        // the full width/ordering/parity validation below, which is what
+        // `cpp_vi_ingress_rejects_an_odd_half_line_extent` pins.
         const bool active_window =
-            ((h_start | h_end | v_start | v_end) != 0U);
+            (((h_start | h_end) != 0U) && ((v_start | v_end) != 0U));
         if (active_window &&
             (((guest[2] & 0x0FFFU) == 0U) || (h_end <= h_start) ||
              (v_end <= v_start) || (((v_end - v_start) & 1U) != 0U))) {
@@ -615,21 +630,29 @@ void write_vi_registers(
         registers[9 + index] = guest[index];
     }
     registers[9] = (vi.blanked != 0U) ? 0U : guest[0];
-    // RT64 compensates for the VI origin convention by subtracting one row,
-    // or two for an odd serrated field. Supplying the same row count makes
-    // decodeVI().fbAddress() equal the guest's exact physical VI_ORIGIN. The
-    // source stride and pixel width come from the same retained register image.
-    const uint32_t bytes_per_pixel = ((guest[0] & 3U) == 3U) ? 4U : 2U;
-    const uint32_t effective_width = guest[2] & 0x0FFFU;
-    const uint32_t origin_rows =
-        (((guest[0] & (1U << 6U)) != 0U) && ((guest[4] & 1U) != 0U)) ? 2U : 1U;
-    const uint64_t adjusted_origin =
-        static_cast<uint64_t>(guest[1] & 0x00FFFFFFU) +
-        static_cast<uint64_t>(effective_width) * bytes_per_pixel * origin_rows;
-    if (adjusted_origin > UINT32_MAX) {
-        throw std::runtime_error("VI origin compensation overflows u32");
+    if (vi.registers_present != 0U) {
+        // Preserve a live guest origin. RT64's VI::fbAddress() already
+        // subtracts the conventional leading row (two for an odd serrated
+        // field) when matching scanout to an HLE-managed color target. Adding
+        // that row here cancels RT64's lookup normalization and forces its
+        // native scratch-upload path.
+        registers[10] = guest[1] & 0x00FFFFFFU;
     }
-    registers[10] = static_cast<uint32_t>(adjusted_origin);
+    else {
+        // Compatibility callers name a color-image base rather than supplying
+        // a live VI origin, so synthesize the inverse of RT64's lookup bias.
+        const uint32_t bytes_per_pixel = ((guest[0] & 3U) == 3U) ? 4U : 2U;
+        const uint32_t effective_width = guest[2] & 0x0FFFU;
+        const uint32_t origin_rows =
+            (((guest[0] & (1U << 6U)) != 0U) && ((guest[4] & 1U) != 0U)) ? 2U : 1U;
+        const uint64_t adjusted_origin =
+            static_cast<uint64_t>(guest[1] & 0x00FFFFFFU) +
+            static_cast<uint64_t>(effective_width) * bytes_per_pixel * origin_rows;
+        if (adjusted_origin > UINT32_MAX) {
+            throw std::runtime_error("compatibility VI origin synthesis overflows u32");
+        }
+        registers[10] = static_cast<uint32_t>(adjusted_origin);
+    }
     // VI_Y_SCALE is `offset << 16 | scale`. A zero scale repeats one
     // sampled row; its 10-bit offset chooses the interpolation between
     // source rows zero and one. These are the hardware mechanisms behind
@@ -3832,6 +3855,7 @@ extern "C" int fn64_rt64_process_rdp_commands(
     uint32_t start,
     uint32_t end,
     uint32_t output_addr,
+    int wait_for_completion,
     char *error,
     size_t error_capacity) {
     try {
@@ -3929,7 +3953,30 @@ extern "C" int fn64_rt64_process_rdp_commands(
             }
             deferred_worker_lock.unlock();
         }
-        if (submitted_workload > previous_workload) {
+        // Deferring the wait is only safe when nothing below this point reads
+        // completed-workload state before the CALLER'S own eventual wait (the
+        // next call in the same field passing wait_for_completion=1, or a
+        // present). `deferred_snapshot_ok`'s branch reads `submitted_workload`
+        // for THIS call immediately below, so `capture_deferred` still forces
+        // the wait unconditionally.
+        //
+        // `present_capture_enabled` is different, and forcing the wait for it
+        // here was overbroad: the block it guards below only does anything
+        // when `submitted_present > previous_present`, and `presentId` is
+        // advanced by an actual Present, never by a display-list submission
+        // (rt64_state.cpp's present path, not processDisplayLists). On this
+        // call -- a raw-RDP command submission -- that comparison is false in
+        // the ordinary case, so the block was dead here and the wait was pure
+        // cost paid for a read that could not fire. The real hazard
+        // `present_capture_enabled` exists for is closed at present time
+        // (fn64_rt64_present / Rt64Backend::present, which flushes any
+        // outstanding workload before it reads anything -- see
+        // fn64_rt64_flush_pending_workload). Measured 2026-08-12 with a real
+        // sampling profiler (macOS `sample`): this was the ONLY
+        // synchronization wait appearing anywhere in a 5-second capture of
+        // the windowed shell's render-heavy phase.
+        const bool must_wait_for_capture = capture_deferred;
+        if (submitted_workload > previous_workload && (wait_for_completion != 0 || must_wait_for_capture)) {
             context->application->workloadQueue->waitForWorkloadId(submitted_workload);
         }
         if (!deferred_snapshot_ok) {
@@ -3976,6 +4023,34 @@ extern "C" int fn64_rt64_process_rdp_commands(
         return 0;
     } catch (...) {
         set_error(error, error_capacity, "RT64 raw RDP processing failed with an unknown C++ exception");
+        return 0;
+    }
+}
+
+// Wait for whatever workload is currently outstanding, regardless of which
+// call submitted it. `application->state->workloadId` is the same monotonic
+// counter `waitForWorkloadId` compares against (rt64_workload_queue.cpp:93,
+// `waitId <= workloadId`), and every submission path sets it -- reading it
+// fresh here rather than threading a caller-supplied id means this correctly
+// flushes the true latest submission even if several were made without
+// waiting. Mirrors the shutdown-flush idiom already used in
+// ~Fn64Rt64Context.
+extern "C" int fn64_rt64_flush_pending_workload(
+    Fn64Rt64Context *context,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if ((context == nullptr) || !context->setup_complete) {
+            set_error(error, error_capacity, "RT64 context is not initialized");
+            return 0;
+        }
+        context->application->workloadQueue->waitForWorkloadId(context->application->state->workloadId);
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity, std::string("RT64 workload flush threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity, "RT64 workload flush failed with an unknown C++ exception");
         return 0;
     }
 }
@@ -4362,6 +4437,16 @@ extern "C" int fn64_rt64_read_present_selection(
         selection->target_width = framebuffer->width;
         selection->target_height = framebuffer->height;
         selection->target_size = framebuffer->siz;
+        selection->workload_resolution_scale_x =
+            context->application->sharedQueueResources->resolutionScale.x;
+        selection->workload_resolution_scale_y =
+            context->application->sharedQueueResources->resolutionScale.y;
+        selection->resolution_scale_x = matched_target->resolutionScale.x;
+        selection->resolution_scale_y = matched_target->resolutionScale.y;
+        selection->raster_width = matched_target->width;
+        selection->raster_height = matched_target->height;
+        selection->downsample_multiplier = matched_target->downsampleMultiplier;
+        selection->reserved = 0U;
         return 1;
 #else
         set_error(error, error_capacity, "RT64 present-selection evidence requires the Metal backend");

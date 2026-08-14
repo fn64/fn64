@@ -1298,7 +1298,14 @@ use super::super::*;
         };
         let mut resolver = |_source_bank, _target_pc| unreachable!();
 
-        let final_budget = InstructionBudget::new(1).unwrap();
+        // A slice that cannot fit an indivisible unit CHECKPOINTS; it does not
+        // fail. The unit has not partially executed (instructions == 0), so
+        // the caller resumes at the same PC with a full budget and the
+        // branch/delay-slot pair retires whole.
+        //
+        // This previously returned IndivisibleUnitExceedsBudget, which aborted
+        // WM2000's certified route at pc=0x800040B8 with one instruction of a
+        // 4096 budget left -- a slice boundary reported as a program fault.
         assert_eq!(
             dispatch_until_boundary(
                 first,
@@ -1306,10 +1313,10 @@ use super::super::*;
                 &mut runner,
                 &mut resolver,
             ),
-            Err(DispatchError::IndivisibleUnitExceedsBudget {
-                at: next,
-                budget: final_budget,
-                required: InstructionBudget::CONTROL_TRANSFER_INSTRUCTIONS,
+            Ok(DispatchRun {
+                exit: BlockExit::Checkpoint(next),
+                instructions: 1,
+                blocks: 1,
             })
         );
         assert_eq!(calls, 2);

@@ -2,7 +2,7 @@
 //! shared verbatim by both binaries in this package.
 //!
 //! `main.rs` (the headless batch runner) and `shell.rs` (the interactive
-//! windowed runner) must boot the SAME program: the same 35 dense shards, the
+//! windowed runner) must boot the SAME program: the same dense shards, the
 //! same physically-backed generation catalog, the same captured
 //! exception-vector images, and the same Cargo-source attestation. Duplicating
 //! that ~440-line assembly into the second binary would let the two lanes drift
@@ -20,7 +20,7 @@
 //! what ran.
 //!
 //! Both binaries share this package's ONE `OUT_DIR`, so `pack.rs` and
-//! `runner.rs` are generated once by `build.rs` and the 35 generated shard
+//! `runner.rs` are generated once by `build.rs` and the generated shard
 //! crates are compiled once -- the shell lane costs no additional shard build.
 
 use crate::*;
@@ -57,6 +57,56 @@ pub(crate) struct ConstructedCatalogProgram {
     pub(crate) program_evidence: fn64_recomp_rs::BlockProgramEvidenceSnapshot,
 }
 
+/// Reject a ROM that is not the image this binary was built from, before any
+/// shard tries to recover its instruction words from it.
+///
+/// Shards no longer carry a baked copy of their words; they read them out of
+/// the user's ROM at a build-recorded offset. That makes ROM identity a
+/// correctness precondition rather than a convenience, so it is checked here --
+/// the one construction path both binaries share -- and the error names the
+/// expected title instead of surfacing as a digest mismatch several frames
+/// deeper.
+///
+/// This is a *clear early error*, not the security boundary. The binding proof
+/// stays where it already was: each bank's recovered words are hashed and
+/// compared against `expected.code_sha256` below. A ROM that somehow passed
+/// this check but carried different code would still fail there.
+fn assert_normalized_rom_identity() {
+    // A build that emitted no digest cannot check one. This was previously the
+    // ordinary case (the constant was prepared-mode-only and otherwise all
+    // zeros); `build.rs` now emits it unconditionally, so all-zero means a
+    // stale artifact rather than a supported configuration.
+    assert_ne!(
+        pack::NORMALIZED_ROM_SHA256,
+        [0u8; 32],
+        "this build carries no normalized-ROM digest, so it cannot verify the user's ROM; \
+         rebuild so build.rs emits NORMALIZED_ROM_SHA256"
+    );
+    let image = fn64_recomp_rs::normalized_rom_image().expect(
+        "no normalized ROM image was published; fn64_abi::load_rom must run before the \
+         catalog program is constructed",
+    );
+    let actual: [u8; 32] = Sha256::digest(image).into();
+    assert_eq!(
+        actual,
+        pack::NORMALIZED_ROM_SHA256,
+        "the supplied ROM is not the image this binary was built from.\n  \
+         expected (normalized SHA-256): {}\n  \
+         supplied (normalized SHA-256): {}\n  \
+         this build recompiled WM2000 (WRESTLEMANIA 2000, NWXE) and requires that exact ROM.",
+        hex32(pack::NORMALIZED_ROM_SHA256),
+        hex32(actual),
+    );
+}
+
+fn hex32(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    digest.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
 /// Build the canonical program: install every dense shard against its
 /// build-time ROM-derived digest, register the physically-backed generation
 /// catalog, admit the captured exception-vector images, and seal the result
@@ -66,12 +116,47 @@ pub(crate) struct ConstructedCatalogProgram {
 /// one binds a runtime artifact to the digest `build.rs` recovered from the
 /// ROM. They are identical for both lanes by construction, because both lanes
 /// call this function.
+///
+/// # KNOWN LIMITATION: this requires a published ROM, and one caller has none
+///
+/// Since shards became geometry-sourced, `(artifact.code_bank)()` below reads
+/// each shard's words out of the user's ROM. So this function now has a
+/// precondition it never had: `fn64_abi::load_rom` must already have run.
+/// Both boot paths satisfy it (`main.rs:766` and `shell.rs:611`, each ahead of
+/// their `construct_catalog_program` call).
+///
+/// **The hermetic build-identity mode does not, and cannot.** It is entered by
+/// a single CLI argument (`runner_reports.rs:2-16`), deliberately skips ROM
+/// loading (`main.rs:742-744`), and its launcher runs the child with
+/// `.env_clear()` (`fn64-boot-harness/src/generated_runner_build/build.rs:1874`)
+/// so no `ROM` variable exists. It nonetheless reaches this function, because
+/// the identity early-return sits *after* the call site (`main.rs:951` builds
+/// the catalog, `:985` returns). Result: that mode panics in `shard_words`.
+///
+/// **The tension is real and worth stating plainly rather than patching over.**
+/// `.env_clear()` exists precisely so a build identity cannot depend on ambient
+/// environment — that is what makes the identity reproducible and trustworthy.
+/// Geometry-sourced words require ambient environment, because the ROM is the
+/// user's file and is named by one. Those two requirements are in direct
+/// opposition, and no amount of local cleverness dissolves it: the mode wants
+/// to attest what was built without possessing what it was built from.
+///
+/// The fix is to not construct the catalog in a mode that only reports source
+/// digests. What was explicitly rejected is teaching the digest assertions to
+/// accept placeholder words when no ROM is published: the
+/// `code_bank_sha256 == expected.code_sha256` checks at `:98`/`:156` are the
+/// entire reason geometry-sourced words can be trusted, and a lane where they
+/// may pass against fabricated input would be worse than this panic.
+///
+/// Not a blocker for a release build: no gate binary or script invokes identity
+/// mode, and normal boot, render, and the ROM-content result are unaffected.
 pub(crate) fn construct_catalog_program(
     program: fn64_recomp_rs::BlockProgram,
     gates: GateRunners,
     instruction_budget: InstructionBudget,
 ) -> ConstructedCatalogProgram {
     let mut program = program;
+    assert_normalized_rom_identity();
     assert_eq!(
         DENSE_AOT_ARTIFACTS.len(),
         pack::BOOT_SHARDS.len()
@@ -274,7 +359,7 @@ pub(crate) fn construct_catalog_program(
             image_end,
             image.sha256,
         );
-        let code = CodeBank::new(bank, GuestPc::new(image.va_start), image.words.to_vec())
+        let code = CodeBank::new(bank, GuestPc::new(image.va_start), image.words())
             .expect("admitting captured exception-vector image");
         assert_eq!(code_bank_sha256(&code), image.sha256);
         let mut region =

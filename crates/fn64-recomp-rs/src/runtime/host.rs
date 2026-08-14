@@ -17,6 +17,37 @@ pub const RDRAM_VBASE: u64 = 0xFFFF_FFFF_8000_0000;
 /// A checked view over rdram. All emitted memory accesses go through these
 /// typed methods; the address translation and the big-endian sub-word swizzle
 /// live here and nowhere else.
+/// Guest-CPU-store counterpart to `fn64_runtime::rdram::watch_raw_write`.
+///
+/// That watch instruments `fn64_runtime`'s view types, but recompiled guest
+/// code stores through THIS crate's `Rdram`, which writes `self.mem[..]`
+/// directly. The two types share a name and nothing else, so a byte written
+/// by the guest is invisible to `FN64_WATCH_WRITE` -- which is how a run was
+/// read as "only two writes touch this address" when a guest store was in
+/// fact zeroing it. Same env var, so one setting covers both seams.
+pub(super) fn watch_guest_store(physical: u32, len: u32, value: u64, kind: &str) {
+    use std::sync::OnceLock;
+    static WATCH: OnceLock<Option<u32>> = OnceLock::new();
+    let watch = *WATCH.get_or_init(|| {
+        std::env::var("FN64_WATCH_WRITE").ok().and_then(|value| {
+            let value = value.trim().trim_start_matches("0x");
+            u32::from_str_radix(value, 16).ok()
+        })
+    });
+    let Some(watch) = watch else { return };
+    if physical <= watch && watch < physical.saturating_add(len) {
+        eprintln!(
+            "[watch-guest] {kind} [{physical:#010x},+{len:#x}) covers {watch:#010x} value={value:#x}"
+        );
+        if std::env::var_os("FN64_WATCH_WRITE_BACKTRACE").is_some() {
+            let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+            for line in backtrace.lines() {
+                eprintln!("[watch-guest-bt {kind}@{physical:#010x}] {line}");
+            }
+        }
+    }
+}
+
 pub struct Rdram<'a> {
     mem: &'a mut [u8],
 }
@@ -554,7 +585,35 @@ impl<'a> Rdram<'a> {
     /// emitted code has no reason to use this; fn64's rs-lane host adapters use
     /// it to call the existing, audited `*_recomp` marshalling layer without
     /// allocating or copying a second RDRAM image.
+    ///
+    /// # This is an UNATTRIBUTED write path
+    ///
+    /// Every normal guest store goes through [`Self::store_w`]/`store_h`/
+    /// `store_b`, which call `notify_cpu_instruction_store` and so declare
+    /// themselves to the canonical mutation journal. Bytes written through this
+    /// slice declare nothing. If they land in a watched executable range, the
+    /// next dispatch fails as "unjournaled executable mutation" -- correctly,
+    /// but by then the writer is gone and the panic names only the address.
+    ///
+    /// It is `#[doc(hidden)]` rather than removed because exactly one caller
+    /// genuinely needs a raw pointer: `recompiled::runners`' FR-stable C shim
+    /// adapter, which hands it to the audited `*_recomp` layer that does its
+    /// own attribution. It is not a general-purpose accessor, and new callers
+    /// should use [`Self::store_w`] or the transacted host-memory API in
+    /// `fn64_abi` instead.
+    #[doc(hidden)]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.mem
+    }
+
+    /// Borrow the backing allocation for reading.
+    ///
+    /// The shared counterpart to [`Self::as_mut_slice`], for callers that only
+    /// need to read. The canonical mutation journal wants this: it snapshots
+    /// the watched region at every dispatch boundary, and going through a
+    /// per-byte closure costs a bounds check and a lane XOR per byte over a
+    /// 1 MiB region.
+    pub fn as_slice(&self) -> &[u8] {
         self.mem
     }
 
@@ -667,6 +726,7 @@ impl<'a> Rdram<'a> {
         let p = Self::backing_offset(vaddr);
         self.mem[p..p + 4].copy_from_slice(&value.to_ne_bytes());
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            watch_guest_store(offset, 4, u64::from(value), "store_backed_word");
             notify_cpu_instruction_store(offset, 4);
         }
     }
@@ -869,6 +929,7 @@ impl<'a> Rdram<'a> {
         let p = Self::backing_offset(vaddr) ^ 2;
         self.mem[p..p + 2].copy_from_slice(&val.to_ne_bytes());
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            watch_guest_store(offset, 2, u64::from(val), "store_h");
             notify_cpu_instruction_store16(offset, val);
         }
     }
@@ -882,6 +943,7 @@ impl<'a> Rdram<'a> {
         let p = Self::backing_offset(vaddr) ^ 3;
         self.mem[p] = val;
         if let Some(offset) = Self::physical_rdram_offset(vaddr) {
+            watch_guest_store(offset, 1, u64::from(val), "store_b");
             notify_cpu_instruction_store(offset, 1);
         }
     }
@@ -985,6 +1047,7 @@ impl<'a> Rdram<'a> {
             // observer runs only after both halves are coherent.
             self.mem[low..low + 4].copy_from_slice(&(val as u32).to_ne_bytes());
             self.mem[high..high + 4].copy_from_slice(&((val >> 32) as u32).to_ne_bytes());
+            watch_guest_store(offset, 8, val, "store_d");
             notify_cpu_instruction_store(offset, 8);
         } else {
             self.store_w(vaddr.wrapping_add(4), val as u32);
@@ -1081,6 +1144,7 @@ impl<'a> Rdram<'a> {
     /// the shared RDRAM/device backing layout. Physical addresses beyond the
     /// N64's 29-bit direct window remain a loud unbacked boundary after a
     /// successful TLB lookup; they are never truncated into a different page.
+    #[inline]
     fn translated_backing_address(
         ctx: &RecompContext,
         vaddr: u64,
@@ -1100,10 +1164,12 @@ impl<'a> Rdram<'a> {
         }
     }
 
+    #[inline]
     fn translated_load_address(ctx: &RecompContext, vaddr: u64) -> Result<u64, DataAccessError> {
         Self::translated_backing_address(ctx, vaddr, DataAccessKind::Load)
     }
 
+    #[inline]
     fn translated_store_address(ctx: &RecompContext, vaddr: u64) -> Result<u64, DataAccessError> {
         Self::translated_backing_address(ctx, vaddr, DataAccessKind::Store)
     }

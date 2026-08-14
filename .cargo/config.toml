@@ -16,3 +16,18 @@
 # overrides this setting.
 [build]
 incremental = false
+
+# Local build-speed overrides (this machine).
+#
+# Linking dominates this workspace's edit-run loop: the wm2000-block-boot
+# binary is ~121 MB linked from 35 generated dense-AOT shard crates, and
+# Apple's ld is single-threaded over that. ld64.lld is parallel and cut the
+# link phase substantially.
+#
+# Incremental is disabled workspace-wide above for one-shot gate builds, and
+# that reasoning stands -- but the comment there says to re-enable it per
+# shell for an interactive edit-compile-test loop, which is exactly what
+# driving WM2000 routes is. Set CARGO_INCREMENTAL=1 in that shell rather than
+# flipping the workspace default, so cold gate/CI builds keep their profile.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/lld/bin/ld64.lld"]

@@ -54,6 +54,10 @@ pub fn verify_precompiled_words(
                 byte_len,
                 expected_sha256,
                 actual_sha256: Sha256::digest(bytes).into(),
+                // This seam walks the EXPECTED words, so unlike the digest-only
+                // callers it knows exactly which word first diverged. `offset`
+                // is that word's byte offset from `va_start`.
+                first_diff_offset: Some(offset),
             });
         }
     }

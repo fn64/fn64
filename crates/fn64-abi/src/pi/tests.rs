@@ -42,6 +42,72 @@
         load_rom(vec![1]);
 
         assert!(crate::copy_rsp_rdp_observations().is_empty());
+        assert_eq!(crate::rsp_rdp_observation_count(), 0);
+    }
+
+    #[test]
+    fn interactive_rsp_rdp_retention_is_constant_space_and_counted() {
+        load_rom(vec![0]);
+        crate::set_rsp_rdp_observation_retention(
+            crate::RspRdpObservationRetention::InteractiveConstantSpace,
+        );
+        for start in 0..10_000u32 {
+            crate::record_rsp_rdp_observations(vec![
+                crate::RspRdpObservationKind::DramDpcCommitted {
+                    start,
+                    end: start + 8,
+                    command_sha256: [0x5a; 32],
+                },
+            ]);
+        }
+
+        assert_eq!(crate::rsp_rdp_observation_count(), 10_000);
+        crate::with_host(|host| {
+            assert!(host.rsp_rdp_observations.is_empty());
+            assert_eq!(host.rsp_rdp_observations.capacity(), 0);
+        });
+        assert_eq!(
+            crate::rsp_rdp_observation_retention(),
+            crate::RspRdpObservationRetention::InteractiveConstantSpace
+        );
+        let unavailable = std::panic::catch_unwind(crate::copy_rsp_rdp_observations);
+        assert!(unavailable.is_err());
+
+        // A new ROM starts a new evidence lifetime. No payload has been
+        // discarded in that lifetime, so complete retention can be selected
+        // again without pretending the prior history was reconstructed.
+        load_rom(vec![1]);
+        crate::set_rsp_rdp_observation_retention(
+            crate::RspRdpObservationRetention::CompleteEvidence,
+        );
+        assert!(crate::copy_rsp_rdp_observations().is_empty());
+    }
+
+    #[test]
+    fn complete_rsp_rdp_retention_cannot_resume_after_discarding_payloads() {
+        load_rom(vec![0]);
+        crate::set_rsp_rdp_observation_retention(
+            crate::RspRdpObservationRetention::InteractiveConstantSpace,
+        );
+        crate::record_rsp_rdp_observations(vec![
+            crate::RspRdpObservationKind::DramDpcCommitted {
+                start: 0,
+                end: 8,
+                command_sha256: [0x5a; 32],
+            },
+        ]);
+
+        let restore = std::panic::catch_unwind(|| {
+            crate::set_rsp_rdp_observation_retention(
+                crate::RspRdpObservationRetention::CompleteEvidence,
+            );
+        });
+        assert!(restore.is_err());
+
+        load_rom(vec![1]);
+        crate::set_rsp_rdp_observation_retention(
+            crate::RspRdpObservationRetention::CompleteEvidence,
+        );
     }
 
     #[test]

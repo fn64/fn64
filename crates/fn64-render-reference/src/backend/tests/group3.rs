@@ -939,6 +939,7 @@ fn admitted_s2dex_object_rectangle_renders_preloaded_tmem_to_rdram() {
             SETUP as u32,
             (SETUP + setup.len() * 8) as u32,
             0,
+            true,
         )
         .unwrap();
     assert_eq!(backend.supported_ucodes(), &[UcodeId::S2dex2]);
@@ -990,6 +991,7 @@ fn admitted_s2dex_object_rectangle_renders_preloaded_tmem_to_rdram() {
             SETUP as u32,
             (SETUP + setup.len() * 8) as u32,
             0,
+            true,
         )
         .unwrap();
     direct
@@ -998,6 +1000,7 @@ fn admitted_s2dex_object_rectangle_renders_preloaded_tmem_to_rdram() {
             DIRECT as u32,
             (DIRECT + equivalent_rdp.len() * 8) as u32,
             0,
+            true,
         )
         .unwrap();
     let s2dex_target = &rdram[TARGET as usize..TARGET as usize + source.len() * 2];

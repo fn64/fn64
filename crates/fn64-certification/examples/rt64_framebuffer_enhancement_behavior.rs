@@ -205,7 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (mut rdram, end) = fixture();
     let source_before = pixels(&rdram, SOURCE, SOURCE_WIDTH * SOURCE_HEIGHT);
     let reinterpreted_before = pixels(&rdram, REINTERPRETED, REGION_WIDTH * REGION_HEIGHT);
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, REINTERPRETED)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, REINTERPRETED, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "framebuffer enhancement fixture returned {status:?}"

@@ -311,8 +311,27 @@ pub(crate) unsafe fn dispatch_lle_task(
         };
         let mut transaction = LiveDpcTransaction::new(submission);
         let rdp_started = gfx_started.map(|_| std::time::Instant::now());
-        let (full_sync, observation) =
-            unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, &mut transaction) };
+        // Always defer the GPU-completion wait here. RT64's queue is a
+        // monotonic counter (`waitId <= workloadId`, rt64_workload_queue.cpp
+        // :93), so waiting for a later submission's id also waits for every
+        // earlier one -- there is no reordering risk from deferring past
+        // this call. Nothing between here and this task's return reads
+        // GPU-completed state: `full_sync`/`observation` are decided from
+        // the submitted command bytes and the synchronous submit-time
+        // status (`FrameStatus`/`DpFullSyncStatus`), not from waiting.
+        // `Rt64Backend::present` flushes any outstanding workload before it
+        // reads anything, which is the one place downstream that genuinely
+        // needs completed state. Measured 2026-08-10 (render-benchmark
+        // route, rt64 lane): waiting after every submission, when a task's
+        // submissions were already fully merged by the loop above, was
+        // costing ~11 ms/field with ZERO submissions actually deferred by
+        // an earlier same-task-only version of this change -- the repeated
+        // wait cost is paid ACROSS separate RSP tasks in one field
+        // (sp_tasks ~2.9/field), which this field-wide (present-flushed)
+        // version reaches and the earlier per-task version could not.
+        let (full_sync, observation) = unsafe {
+            dispatch_captured_raw_rdp(rdram, &words, start, end, xbus, false, &mut transaction)
+        };
         if let Some(started) = rdp_started {
             raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
         }
@@ -354,16 +373,21 @@ pub(crate) unsafe fn dispatch_lle_task(
             });
         }
         for replacement in replacements {
+            // One 4 KiB IMEM digest serves both observations. They described
+            // the same `replacement.image` and nothing mutates it between
+            // them, so the two hashes were always equal; computing it once
+            // makes that identity structural rather than coincidental.
+            let text_sha256 = imem_sha256(&replacement.image);
             observations.push(RspRdpObservationKind::ImemReplacementCommitted {
                 task_addr,
                 imem_generation: replacement.generation,
-                text_sha256: imem_sha256(&replacement.image),
+                text_sha256,
             });
             if let Some(data) = recognition_data {
                 observations.push(RspRdpObservationKind::MicrocodeRecognition {
                     task_addr,
                     imem_generation: replacement.generation,
-                    text_sha256: imem_sha256(&replacement.image),
+                    text_sha256,
                     data_addr: data.addr,
                     data_size: data.size,
                     data_sha256: data.sha256,
@@ -920,11 +944,17 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 let inspected =
                     preflight_raw_dpc_completion(&image, start, end, "dispatch_raw_rdp");
                 let result = with_render_backend("dispatch_raw_rdp", |backend| {
+                    // `true`: this call site is single-shot per invocation,
+                    // not the coalesced-submission loop in
+                    // `dispatch_captured_raw_rdp` below, which is the one
+                    // this session measured and verified safe to defer.
+                    // Preserve existing (always-wait) behavior here.
                     let status = backend.process_rdp_commands(
                         &mut image,
                         start,
                         end,
                         render_output_addr(),
+                        true,
                     )?;
                     Ok(RenderDispatchResult {
                         status,
@@ -956,7 +986,7 @@ pub(crate) unsafe fn dispatch_dpc_submission(
                 .map(|word| u32::from_be_bytes(word.try_into().expect("four DMEM bytes")))
                 .collect::<Vec<_>>();
             let (full_sync, observation) = unsafe {
-                dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction)
+                dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
             };
             (full_sync, observation, "dispatch_raw_rdp_xbus")
         }
@@ -1019,8 +1049,9 @@ pub(crate) unsafe fn dispatch_raw_rdp_xbus(
         return;
     };
     let mut transaction = LiveDpcTransaction::new(submission);
-    let (full_sync, observation) =
-        unsafe { dispatch_captured_raw_rdp(rdram, &words, start, end, true, &mut transaction) };
+    let (full_sync, observation) = unsafe {
+        dispatch_captured_raw_rdp(rdram, &words, start, end, true, true, &mut transaction)
+    };
     complete_committed_dpc(transaction, full_sync, observation, "dispatch_raw_rdp_xbus");
 }
 
@@ -1036,6 +1067,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     source_start: u32,
     source_end: u32,
     xbus: bool,
+    wait_for_completion: bool,
     transaction: &mut LiveDpcTransaction,
 ) -> (fn64_render::DpFullSyncStatus, RspRdpObservationKind) {
     assert!(
@@ -1137,6 +1169,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             staging_start as u32,
             staged_end as u32,
             render_output_addr(),
+            wait_for_completion,
         )?;
         Ok(RenderDispatchResult {
             status,

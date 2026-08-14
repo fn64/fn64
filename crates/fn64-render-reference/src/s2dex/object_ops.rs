@@ -1184,7 +1184,7 @@ pub(super) fn load_background_tile(
         scratch.bytes[offset + 4..offset + 8].copy_from_slice(&w1.to_ne_bytes());
     }
     let load_ops = crate::gbi::decode_raw_rdp_ops_with_state(
-        &scratch.bytes[..command_end],
+        &mut scratch.bytes[..command_end],
         command_start as u32,
         rdp,
     )?;
@@ -1415,7 +1415,7 @@ pub(super) fn apply_object_texture(
         scratch.bytes[offset + 4..offset + 8].copy_from_slice(&w1.to_ne_bytes());
     }
     let operations = crate::gbi::decode_raw_rdp_ops_with_state(
-        &scratch.bytes[..command_end],
+        &mut scratch.bytes[..command_end],
         command_start as u32,
         rdp,
     )?;

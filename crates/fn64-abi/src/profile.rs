@@ -307,9 +307,15 @@ pub struct Provenance {
     /// Which render backend produced these numbers.
     ///
     /// Load-bearing, not decoration: the same route decomposes very differently
-    /// on the two backends. The software reference rasterizer puts ~26 ms/field
-    /// in RDP rasterization; RT64 puts ~4 ms there and the profile is dominated
-    /// instead by the mirror and the staging copy. **A row compared across
+    /// on the two backends. The software reference rasterizer puts ~25-26
+    /// ms/field in RDP rasterization; RT64 puts ~9.8 ms/field there (measured
+    /// 2026-08-14, `entrance-to-match.schedule`, corrected from an earlier
+    /// "~4 ms" estimate here that undercounted — see `perf-method.md`'s
+    /// "Optimizing RDP rasterization further on the RT64 lane" dead end for
+    /// the breakdown). Of that 9.8 ms, only ~1.7 ms (alloc + copy_in +
+    /// copy_back) is the fn64-side staging copy; the remaining ~8.0 ms is
+    /// time inside RT64's own `processDisplayLists` call -- real GPU
+    /// submission/render work, not a fn64-side stall. **A row compared across
     /// backends is not a comparison.** `FN64_RENDER` defaults to `reference`,
     /// so an unset value is a real answer rather than a missing one.
     pub renderer: String,

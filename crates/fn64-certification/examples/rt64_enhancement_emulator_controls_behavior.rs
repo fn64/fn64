@@ -148,7 +148,7 @@ fn digest(bytes: &[u8]) -> String {
 
 fn render(backend: &mut Rt64Backend, guest_cycle: u64) -> Result<Observation, Box<dyn Error>> {
     let (mut rdram, end) = fixture();
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "enhancement/emulator fixture returned {status:?} instead of Complete"
@@ -416,8 +416,13 @@ fn render_copy_region_profile(
     }
 
     let (mut rdram, sampled_start, end) = copy_region_fixture();
-    let source_status =
-        backend.process_rdp_commands(&mut rdram, COMMANDS as u32, sampled_start, COPY_SOURCE)?;
+    let source_status = backend.process_rdp_commands(
+        &mut rdram,
+        COMMANDS as u32,
+        sampled_start,
+        COPY_SOURCE,
+        true,
+    )?;
     if source_status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "copy-mode source fixture returned {source_status:?}"
@@ -425,7 +430,7 @@ fn render_copy_region_profile(
         .into());
     }
     backend.enable_deferred_workload_capture_for_evidence()?;
-    let status = backend.process_rdp_commands(&mut rdram, sampled_start, end, COPY_SAMPLED)?;
+    let status = backend.process_rdp_commands(&mut rdram, sampled_start, end, COPY_SAMPLED, true)?;
     if status != FrameStatus::Complete {
         return Err(
             io::Error::other(format!("copy-mode region fixture returned {status:?}")).into(),

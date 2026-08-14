@@ -183,7 +183,7 @@ fn render_at(
     target: u32,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let (mut rdram, end) = fixture(footprint, target);
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, target)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, target, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!("texture fixture returned {status:?}")).into());
     }

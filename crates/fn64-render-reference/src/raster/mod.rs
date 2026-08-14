@@ -350,6 +350,64 @@ pub(super) fn raw_pixel_coverage(
     })
 }
 
+/// As [`raw_pixel_coverage`], but for a caller that has already evaluated
+/// `raw_span_edges_at_y_eighth` for this row's four sample offsets (in
+/// [`COVERAGE_SAMPLES`] Y order: 1, 3, 5, 7 eighths).
+///
+/// `draw_raw_rdp_triangle_impl`'s outer scanline loop computes exactly these
+/// four edges already, to find the row's covered X range before walking its
+/// pixels. `raw_pixel_coverage` used unmodified would recompute the same
+/// four `fixed_mul_ratio` evaluations from scratch for every pixel in the
+/// row via `from_samples`' per-sample closure -- for an 8-sample mask that
+/// shares each Y offset across two X samples, that is every edge evaluated
+/// twice per pixel that was already known. A per-call cache inside
+/// `raw_pixel_coverage` was tried and measured as a net loss (live `sample`,
+/// WM2000): a 4-entry lookup checked on every one of 8 samples costs more
+/// than the two cheap i64 multiplies it replaces. Accepting the row's
+/// answers as a parameter instead removes the recompute AND the cache
+/// entirely, at the caller that actually has them for free.
+pub(super) fn raw_pixel_coverage_with_row_edges(
+    scissor: ScissorRect,
+    x: i32,
+    y: i32,
+    yh_eighth: i32,
+    yl_eighth: i32,
+    row_edges: [(i64, i64); 4],
+) -> CoverageMask {
+    if !scissor.line_enabled(y) {
+        return CoverageMask::default();
+    }
+    let scissor_ulx_eighth = (scissor.ulx * 8.0).round() as i32;
+    let scissor_uly_eighth = (scissor.uly * 8.0).round() as i32;
+    let scissor_lrx_eighth = (scissor.lrx * 8.0).round() as i32;
+    let scissor_lry_eighth = (scissor.lry * 8.0).round() as i32;
+    CoverageMask::from_samples(|offset_x, offset_y| {
+        let sample_x_eighth = x * 8 + offset_x;
+        let sample_y_eighth = y * 8 + offset_y;
+        if sample_x_eighth < scissor_ulx_eighth
+            || sample_x_eighth >= scissor_lrx_eighth
+            || sample_y_eighth < scissor_uly_eighth
+            || sample_y_eighth >= scissor_lry_eighth
+            || sample_y_eighth < yh_eighth
+            || sample_y_eighth >= yl_eighth
+        {
+            return false;
+        }
+        // COVERAGE_SAMPLES' Y offsets are [1,1,3,3,5,5,7,7]; row_edges is
+        // indexed in that same order, one entry per distinct offset.
+        let row_index = match offset_y {
+            1 => 0,
+            3 => 1,
+            5 => 2,
+            7 => 3,
+            other => unreachable!("coverage sample Y offset {other} outside the public checkerboard"),
+        };
+        let (left_x, right_x) = row_edges[row_index];
+        let sample_x = i64::from(sample_x_eighth) * Q16_ONE / 8;
+        sample_x >= left_x && sample_x < right_x
+    })
+}
+
 pub(super) fn triangle_pixel_coverage(
     vertices: [Vertex; 3],
     area: f32,

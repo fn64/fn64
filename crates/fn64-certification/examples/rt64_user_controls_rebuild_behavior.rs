@@ -42,7 +42,7 @@ const IDLE_WORK_POLICY_SHA256: &str =
 const DEVELOPER_MODE_POLICY_SHA256: &str =
     "ac4a48da879d3acd5087e09a4e2066c275e78c04f13bf11f370f64c0ef7ff9d2";
 const SOURCE_OVERLAY_ID: &str =
-    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1";
+    "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3";
 
 #[derive(Clone, Debug)]
 struct Observation {
@@ -191,7 +191,7 @@ fn active_policy_sha256(
 
 fn render(backend: &mut Rt64Backend, guest_cycle: u64) -> Result<Observation, Box<dyn Error>> {
     let (mut rdram, end) = fixture();
-    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET)?;
+    let status = backend.process_rdp_commands(&mut rdram, COMMANDS as u32, end, TARGET, true)?;
     if status != FrameStatus::Complete {
         return Err(io::Error::other(format!(
             "user-control fixture returned {status:?} instead of Complete"
