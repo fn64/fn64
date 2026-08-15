@@ -58,14 +58,14 @@ fn prepared_tree_measurement_rejects_extra_marker_and_digest_drift() {
 }
 
 #[test]
-fn wm_shard_source_graph_uses_hardened_sibling_paths() {
+fn shard_source_graph_uses_hardened_sibling_paths() {
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo_root = crate_root
         .parent()
         .and_then(Path::parent)
         .expect("boot-harness crate is under the workspace crates directory");
     let package_root = repo_root.join("examples/wm2000-block-boot");
-    let shard_root = wm_shard_root(&package_root).expect("derive shard sibling");
+    let shard_root = shard_root(&package_root).expect("derive shard sibling");
     assert!(
         !shard_root
             .components()
@@ -73,8 +73,8 @@ fn wm_shard_source_graph_uses_hardened_sibling_paths() {
         "hardened source readers reject lexical parent traversal"
     );
 
-    let mode = wm_prepared_source_mode_v3(&package_root).expect("classify shard source mode");
-    let digest = wm_shard_cargo_source_sha256(&package_root, mode)
+    let mode = prepared_source_mode_v3(&package_root).expect("classify shard source mode");
+    let digest = shard_cargo_source_sha256(&package_root, mode)
         .expect("hash the exact shard source graph through hardened reads");
     assert_eq!(digest.len(), 64);
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -167,7 +167,7 @@ fn independent_emitter_source_measurement_matches_the_linked_receipt() {
         .parent()
         .and_then(Path::parent)
         .expect("boot-harness crate is under the workspace crates directory");
-    let measured = wm_emitter_source_sha256(repo_root).expect("measure emitter source");
+    let measured = emitter_source_sha256(repo_root).expect("measure emitter source");
     let linked = hex(
         &fn64_recomp_rs_codegen::generated_runner_emitter_source_receipt_v2().source_sha256(),
     );
@@ -1288,10 +1288,10 @@ fn selected_build_command_binds_two_jobs_and_the_exact_process_group_guard() {
     let manifest = workspace.join("examples/wm2000-block-boot/Cargo.toml");
     let staged_boot_context =
         PathBuf::from("/private/tmp/fn64-command-policy/private-inputs/boot-context.json");
-    let inputs = Wm2000GeneratedRunnerBuildInputsV1 {
+    let inputs = GeneratedRunnerBuildInputsV1 {
         rom: PathBuf::from("/private/tmp/fn64-command-policy.rom"),
         boot_context: staged_boot_context.clone(),
-        executable_image_groups: vec![Wm2000ExecutableImageGroupV1 {
+        executable_image_groups: vec![ExecutableImageGroupV1 {
             environment_name: "FN64_EXECUTABLE_IMAGE_TEST".to_owned(),
             captures: vec![
                 PathBuf::from("/private/tmp/capture-a"),
@@ -1388,10 +1388,10 @@ fn selected_build_command_binds_two_jobs_and_the_exact_process_group_guard() {
 
 #[test]
 fn writer_runtime_commands_have_only_exact_retained_private_inputs() {
-    let inputs = Wm2000GeneratedRunnerBuildInputsV1 {
+    let inputs = GeneratedRunnerBuildInputsV1 {
         rom: PathBuf::from("/private/tmp/staged/rom"),
         boot_context: PathBuf::from("/private/tmp/staged/boot-context"),
-        executable_image_groups: vec![Wm2000ExecutableImageGroupV1 {
+        executable_image_groups: vec![ExecutableImageGroupV1 {
             environment_name: "FN64_EXECUTABLE_IMAGE_TEST".to_owned(),
             captures: vec![
                 PathBuf::from("/private/tmp/staged/capture-a"),
@@ -1484,10 +1484,10 @@ fn private_input_binding_retains_exact_boot_context_path_and_bytes() {
             path
         })
         .collect::<Vec<_>>();
-    let mut inputs = Wm2000GeneratedRunnerBuildInputsV1 {
+    let mut inputs = GeneratedRunnerBuildInputsV1 {
         rom,
         boot_context,
-        executable_image_groups: vec![Wm2000ExecutableImageGroupV1 {
+        executable_image_groups: vec![ExecutableImageGroupV1 {
             environment_name: "FN64_EXECUTABLE_IMAGE_TEST".to_owned(),
             captures,
         }],
