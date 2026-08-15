@@ -28,7 +28,7 @@ fn run() -> Result<(), String> {
     let mut total_bytes = 0u64;
     let mut total_instructions = 0u64;
     let mut inventory = Sha256::new();
-    inventory.update(b"fn64:wm-static-micro-op-profile:v2:");
+    inventory.update(b"fn64:block-boot-static-micro-op-profile:v2:");
 
     for package in generator::PACKAGES {
         let profile = generator.profile_static_micro_ops(package);

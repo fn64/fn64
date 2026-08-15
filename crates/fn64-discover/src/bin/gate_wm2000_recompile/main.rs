@@ -73,7 +73,7 @@ const BOOT_CONTEXT_VAR: &str = "FN64_BOOT_CONTEXT";
 const SHARD_INVENTORY: &[(&str, &str)] =
     &include!("../../../../../examples/wm2000-block-shards/shard_inventory.in");
 const EXPECTED_BANKS: usize = 5;
-const WM_RESIDENT_TAIL_IDENTITY_DOMAIN_V1: &[u8] = b"fn64:wm2000-resident-tail-generation:v1:";
+const WM_RESIDENT_TAIL_IDENTITY_DOMAIN_V1: &[u8] = b"fn64:block-boot-resident-tail-generation:v1:";
 
 struct PhysicalBank {
     bank: String,

@@ -855,7 +855,7 @@ pub(super) fn cargo_metadata_source_sha256(metadata: &[u8]) -> Result<String, Ge
 pub(super) fn root_adapter_source_sha256(package_root: &Path) -> Result<String, GeneratedRunnerBuildError> {
     source_tree_sha256(
         package_root,
-        b"fn64:wm2000-root-adapter-source:v1:",
+        b"fn64:block-boot-root-adapter-source:v1:",
         &["Cargo.toml", "Cargo.lock", "build.rs", "src/main.rs"],
     )
 }
@@ -914,7 +914,7 @@ pub(super) fn shard_cargo_source_sha256(
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut digest = Sha256::new();
-    digest.update(b"fn64:wm2000-shard-cargo-source-tree:v1:");
+    digest.update(b"fn64:block-boot-shard-cargo-source-tree:v1:");
     for (label, path) in files {
         push_bytes(&mut digest, label.as_bytes());
         let source = crate::private_fs::read_regular_stable(&path, "WM shard Cargo source")
