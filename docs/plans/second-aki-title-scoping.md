@@ -45,21 +45,21 @@ that the gate does not produce.
 
 | # | Item | Where | Classification |
 |---|---|---|---|
-| 1 | Shard pack emitter | `examples/wm2000-block-shards/build.rs` | **Mechanical** |
-| 2 | Shard crate directories (32) | `examples/wm2000-block-shards/shard*/`, `overlay*/` | **Mechanical** (generatable boilerplate) |
+| 1 | Shard pack emitter | `recomps/wm2000/packages/wm2000-block-shards/build.rs` | **Mechanical** |
+| 2 | Shard crate directories (32) | `recomps/wm2000/packages/wm2000-block-shards/shard*/`, `overlay*/` | **Mechanical** (generatable boilerplate) |
 | 3 | Shard inventory / package list | `shard_inventory.in`, `generated_runner_build/mod.rs:142-162` | **Mechanical but structural — the critical path** |
 | 4 | Host-binding recognizers (15) | `crates/fn64-discover/src/host_bindings/mod.rs` | **Mechanical** (signature-scanned) |
-| 5 | Boot example build | `examples/wm2000-block-boot/build.rs` | **Mechanical** |
+| 5 | Boot example build | `recomps/wm2000/packages/wm2000-block-boot/build.rs` | **Mechanical** |
 | 6 | Boot context capture | `~/Code/aki-recomp/captures/*-boot-context.json` | **Semi-mechanical** (one automated emulator run) |
 | 7 | Executable-image group (≥3 captures) | `captures/wm-general-exception-images/` | **Semi-mechanical** (automated run + human-located PCs) |
-| 8 | Scripted input schedule | `reference/wm2000-routes/*.schedule` | **Bespoke** (hand-authored, frame-verified) |
+| 8 | Scripted input schedule | `recomps/wm2000/reference/wm2000-routes/*.schedule` | **Bespoke** (hand-authored, frame-verified) |
 | 9 | Byte-identity tuple | `.claude/skills/fn64-perf-method/REFERENCE.md:322-332` | **Bespoke** (per-title, only exists once a route runs) |
 | 10 | RSP audio / RDP graphics | `crates/fn64-audio/`, RT64 | **Shared** — not per-title |
 
 ### 1.1 The shard pack — 22 title references, only 6 functional
 
 I counted 22 case-insensitive `nwxe|wm2000|wm_|WM ` matches in
-`examples/wm2000-block-shards/build.rs` (813 lines). Classified:
+`recomps/wm2000/packages/wm2000-block-shards/build.rs` (813 lines). Classified:
 
 - **16 are doc comments or an env-var name** — lines 32, 121, 156, 162-163, 267,
   271, 317, 586, 613, 616, 733, 737, 740, and the `WM_BLOCK_RUNTIME_HOST_SYMBOLS`
@@ -104,7 +104,7 @@ prefix and generating crate directories.
 
 32 directories, each containing only a 17-line `Cargo.toml`. The sole
 title-specific content is the `name =` line; `build`, `lib`, and all dependency
-paths point at shared parents (`examples/wm2000-block-shards/shard00/Cargo.toml`).
+paths point at shared parents (`recomps/wm2000/packages/wm2000-block-shards/shard00/Cargo.toml`).
 Generating 38 of these for No Mercy is templating, not design.
 
 ### 1.3 The package list — the actual critical path
@@ -177,7 +177,7 @@ recognizers' generality is narrower than "structural matching" suggests.
 
 ### 1.5 The boot example — already substantially generalized
 
-`examples/wm2000-block-boot/build.rs` (1,291 lines) has 48 lines mentioning the
+`recomps/wm2000/packages/wm2000-block-boot/build.rs` (1,291 lines) has 48 lines mentioning the
 title, but the geometry is derived. The decisive evidence is `build.rs:414-418`:
 
 > Overlay COUNT is a property of the ROM, not of this lane: discovery recovers 4
@@ -261,7 +261,7 @@ For WM2000 this is **one image, 16 bytes, 4 words at VA `0x80000180`** — the M
 general exception vector preamble (`captures/wm-general-exception-images/run-1/image.json`,
 `byte_len:16`). Not a large gameplay trace.
 
-Captured by `scripts/capture-wm-executable-image-group.zsh` (in-tree, MIT), which
+Captured by `recomps/wm2000/scripts/capture-wm-executable-image-group.zsh` (in-tree, MIT), which
 runs the producer **≥3 times** (`:10`, `:91`) and validates byte-identity across
 runs into a group receipt via `validate_executable_image_group`. Reproducibility
 is enforced on producer, PCs, lineage, geometry, digest, and exact words
@@ -270,7 +270,7 @@ is enforced on producer, PCs, lineage, geometry, digest, and exact words
 **The human step:** the script requires `--capture-pc`, `--first-pc`, `--start`,
 `--word-count`, `--image-id` (usage at `:18`). These are **not discovered** — a
 human locates them, typically via the `FN64_WATCH_WORD` diagnostics in
-`tools/mupen-trace/README.md`. `docs/BOOT-NOTES-WM2000.md:1310` calls it a
+`tools/mupen-trace/README.md`. `recomps/wm2000/docs/BOOT-NOTES-WM2000.md:1310` calls it a
 "manual producer recipe."
 
 For a sibling title the target is the same architectural artifact (the exception
@@ -284,7 +284,7 @@ and reading what it demands.
 
 ### 1.8 Input schedule and byte-identity — genuinely bespoke
 
-`reference/wm2000-routes/entrance-to-match.schedule` (124 lines) and
+`recomps/wm2000/reference/wm2000-routes/entrance-to-match.schedule` (124 lines) and
 `two-player-match.schedule` (175 lines) are hand-authored controller scripts:
 `port first_read end_read buttons_hex stick_x stick_y`, clocked on **controller
 read ordinal**, not time. Every screen transition was *"read off a dumped frame,
@@ -306,7 +306,7 @@ The gate names these as separate subsystems, which is true, but they are **not
 per-title costs**. I found 114 title mentions across `crates/fn64-abi/src/` and
 `crates/fn64-recomp-rs/src/` and **every one is a test name or a comment** — zero
 title-specific runtime logic. `crates/fn64-audio/src/rsp/` is a complete MIT-clean
-RSP audio stack (verified end-to-end for OoT, per `docs/WM2000-AUDIO-STATUS.md`).
+RSP audio stack (verified end-to-end for OoT, per `recomps/wm2000/docs/WM2000-AUDIO-STATUS.md`).
 
 **Caveat:** shared does not mean free. `docs/plans/corpus-certification-frontier.md:1524-1531`
 names three runtime blockers *every* title will hit — the overlay-tail transfer,
@@ -516,7 +516,7 @@ Verified the study's two structural claims by reading, and the second is
 tighter than "a build-system change" suggests.
 
 **The shard generator is genuinely title-agnostic.** Of 14 WM2000/NWXE
-references in `examples/wm2000-block-shards/build.rs`, **8 are comments or test
+references in `recomps/wm2000/packages/wm2000-block-shards/build.rs`, **8 are comments or test
 names, 1 is an error message, and 5 are Cargo package-name prefixes**
 (`wm2000-block-shard-`, `-resident-tail-shard-`, `-overlay-` at `:324`, `:330`,
 `:346`, `:666`, `:669`, `:677`). None encodes topology. Line 616 states the
@@ -528,7 +528,7 @@ constant.** `generated_runner_build/mod.rs:142-143`:
 
 ```rust
 const SHARD_INVENTORY: &[(&str, &str)] =
-    &include!("../../../../examples/wm2000-block-shards/shard_inventory.in");
+    &include!("../../../../recomps/wm2000/packages/wm2000-block-shards/shard_inventory.in");
 ```
 
 `SHARD_COUNT`, `PREPARED_PACKAGES` and `SHARD_MANIFEST_DIRS` are all derived
@@ -618,7 +618,7 @@ shape as rule 20, self-inflicted while investigating.
 
 ## Generated No Mercy's shard topology — it works, with two caveats (2026-08-08)
 
-    $ python3 scripts/generate-wm-shard-topology.py \
+    $ python3 recomps/wm2000/scripts/generate-wm-shard-topology.py \
         --rom $FN64_DISCOVER_NW4E_ROM --output-root <scratch>
     generated_packages=38
 
@@ -635,8 +635,8 @@ mechanical half of a second title, done.
 
 ### Caveat 1 — the generator hardcodes WM2000 in its OUTPUT PATHS
 
-It wrote to `<root>/examples/wm2000-block-shards/` and
-`<root>/examples/wm2000-block-boot/`, i.e. the *topology* is per-title but the
+It wrote to `<root>/recomps/wm2000/packages/wm2000-block-shards/` and
+`<root>/recomps/wm2000/packages/wm2000-block-boot/`, i.e. the *topology* is per-title but the
 *directory and package names* are not. The selector added in `50d2c21` selects
 by directory name, so those must differ before two titles can coexist.
 
@@ -691,7 +691,7 @@ two are unchanged.
 check them:
 
 1. **A tiling change landed between the record (2026-08-07) and now.** The
-   shard-count derivation at `examples/wm2000-block-shards/build.rs:312` is
+   shard-count derivation at `recomps/wm2000/packages/wm2000-block-shards/build.rs:312` is
    per-generation; a change to `SHARD_BYTES` or to `div_ceil` boundary handling
    would move exactly the overlays whose extent is near a shard boundary and
    leave the others alone — which is the pattern observed.
@@ -802,7 +802,7 @@ this misreading**; the per-symbol probe prints both on both paths.
 
 First use of `--title` (`fb51ab5`) against a non-WM2000 ROM:
 
-    $ python3 scripts/generate-wm-shard-topology.py \
+    $ python3 recomps/wm2000/scripts/generate-wm-shard-topology.py \
         --rom "…/WCW-nWo Revenge - Starrcade Edition (USA) (v1.01).z64" \
         --title revenge-block-shards --output-root <scratch>
     generated_packages=27  title=revenge-block-shards
@@ -905,7 +905,7 @@ neither:
 - **The producer is headless.** `tools/mupen-trace/mupen_trace.c` single-steps
   the public `m64p_debugger` API to the target PC, reads N words and exits,
   with no input and no video plugin attached.
-- **The wrapper is title-agnostic.** `scripts/capture-wm-executable-image-group.zsh`
+- **The wrapper is title-agnostic.** `recomps/wm2000/scripts/capture-wm-executable-image-group.zsh`
   contains **zero** `wm2000` literals; only its filename says "wm". Every
   ROM-specific value is a flag.
 
@@ -947,13 +947,13 @@ property of the ROM.
 Having been wrong twice about what needs a person, I checked this one rather
 than asserting it. **It holds.**
 
-`reference/wm2000-routes/entrance-to-match.schedule` (124 lines) is a route
+`recomps/wm2000/reference/wm2000-routes/entrance-to-match.schedule` (124 lines) is a route
 through *this game's menus* — boot → Exhibition → Single Match → in-match
 gameplay — and its own header states the method:
 
 > Every screen named in the comments below was **read off a dumped frame**, not
 > inferred from what a wrestling menu "probably" does — the representative
-> frames are committed alongside in `reference/wm2000-frames/` and each section
+> frames are committed alongside in `recomps/wm2000/reference/wm2000-frames/` and each section
 > cites the one that evidences it.
 
 **That cannot be derived from the ROM.** It requires running the game, looking
@@ -986,8 +986,10 @@ committed. The same reaping ate the trace-producer build directory tonight.
 ## No Mercy bring-up: five of six, and Revenge's cascade does NOT recur here
 
 WWF No Mercy (USA), normalized ROM
-`11640379fdf534b39f34678036ad8e4cdc9b80b4f2cc72411433363372123976` (the
-Unlocked variant), 2026-08-09. Every artifact below records that digest.
+`11640379fdf534b39f34678036ad8e4cdc9b80b4f2cc72411433363372123976` (no test
+here checks it -- the harness that did moved to recomps/wm2000 with the game
+code, so this is a recorded observation, not a gated claim), the Unlocked
+variant, 2026-08-09. Every artifact below records that digest.
 
 | item | state |
 |---|---|
@@ -1061,8 +1063,8 @@ and the clamp changes nothing.
 
 Confirmed a second way, because a single derivation of a geometry fact is what
 let the off-by-one shard survive in the first place: running **both** the
-unclamped generator (`examples/wm2000-block-shards/build.rs`) and the clamped
-one (`examples/revenge-block-shards/build.rs`) against this ROM yields
+unclamped generator (`recomps/wm2000/packages/wm2000-block-shards/build.rs`) and the clamped
+one (`recomps/wm2000/packages/revenge-block-shards/build.rs`) against this ROM yields
 **byte-identical 38-package inventories**. Two implementations that disagree
 on Revenge agree here, which is the direct evidence that the clamp is inactive.
 
@@ -1093,7 +1095,7 @@ regeneration** and drops edit 1 each time.
 
 Built and booted 2026-08-09, ROM `11640379…`, `FN64_RENDER=reference`,
 headless, **no controller schedule** (`FN64_CONTROLLER_SCHEDULE` is an
-`Option`). Binary `examples/nomercy-block-boot`, canonical program artifact
+`Option`). Binary `recomps/wm2000/packages/nomercy-block-boot`, canonical program artifact
 `9f5ff066916d21df1debe89fc8e78488dacb15596cead357ad08cb851a9bc06c` (no test owns it; rebuilding needs the ROM).
 
 | tier | result |

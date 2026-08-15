@@ -463,7 +463,7 @@ counts `2 candidate / 1 admitted / 4 recipes`; enumeration fell from 1,569 ms
 to 14--15 ms and the complete pipeline from 1,780 ms to 201--209 ms across
 10/10 receipt-identical runs.
 
-`scripts/wm2000-static-frontier.zsh` is the current low-cost inventory loop. It
+`recomps/wm2000/scripts/wm2000-static-frontier.zsh` is the current low-cost inventory loop. It
 first checks the standalone target's normal Cargo feature graph, then runs only
 the dense manifest path under a sampled 2 GiB process-group cap; it does not
 emit or compile generated shards and does not execute an input route. The wrapper now
@@ -1109,7 +1109,7 @@ on the full 34-shard graph completed hot in 0.12 seconds without recompilation;
 the one-time guarded rebuild completed in 51.5 seconds and peaked below 3.83
 GiB aggregate RSS.
 
-`scripts/profile-wm2000-shard.zsh` is the bounded compile-side counterpart.
+`recomps/wm2000/scripts/profile-wm2000-shard.zsh` is the bounded compile-side counterpart.
 It defaults to the historically worst
 `wm2000-block-overlay-2-shard-04`, creates a fresh explicit target without
 deleting any existing target, fixes Cargo to one job, and runs under the common

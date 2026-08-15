@@ -19,9 +19,9 @@ and which must be fixed before any per-title work begins.
 
 ### The one real generator
 
-`examples/wm2000-block-shards/build.rs` is the generator. It is a single file
+`recomps/wm2000/packages/wm2000-block-shards/build.rs` is the generator. It is a single file
 compiled in two roles (`build.rs:543-546`): Cargo runs `main()` as the legacy
-per-crate build script, and `examples/wm2000-block-shards/producer.rs:6-8`
+per-crate build script, and `recomps/wm2000/packages/wm2000-block-shards/producer.rs:6-8`
 `#[path]`-includes the same file as an inert module so the one-shot producer can
 call it 35 times in one process.
 
@@ -169,11 +169,11 @@ initializers -- a file that did not compile, latent only because it is reached
 solely through prepared mode and `#[cfg(test)]`.
 
 There is now a single source of truth,
-`examples/wm2000-block-shards/shard_inventory.in`: a list of
+`recomps/wm2000/packages/wm2000-block-shards/shard_inventory.in`: a list of
 `(package, manifest_dir)` pairs `include!`d by every consumer, each of which
 derives its arrays and its *length* from the data rather than restating a
 count. The three surplus crate directories were deleted, and
-`scripts/lint-wm-shard-dependencies.py` now measures the inventory file and
+`recomps/wm2000/scripts/lint-wm-shard-dependencies.py` now measures the inventory file and
 rejects both a restated list and a hardcoded array length.
 
 Per-title work therefore starts from a consistent inventory. Adding a title
@@ -230,7 +230,7 @@ scripts/capture-boot-context.zsh ~/Code/aki-recomp/games/NW4E/nomercy.z64
 
 No executable-image group exists for No Mercy at all — only
 `~/Code/aki-recomp/captures/wm-general-exception-images/` (WM2000). That needs
-`scripts/capture-wm-executable-image-group.zsh`, ≥3 captures.
+`recomps/wm2000/scripts/capture-wm-executable-image-group.zsh`, ≥3 captures.
 
 ### 4d. Command sequence, assuming the generator is made title-generic
 
@@ -240,7 +240,7 @@ The generation step itself is one command (`producer.rs:66-121`):
 cargo run --release -p fn64-wm-prepared-shard-producer --bin fn64-wm-prepared-shard-producer -- \
     --rom      /Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64 \
     --output   /absolute/new/private/nw4e-prepared-tree \
-    --generator-source-sha256 <sha256 of examples/wm2000-block-shards/build.rs> \
+    --generator-source-sha256 <sha256 of recomps/wm2000/packages/wm2000-block-shards/build.rs> \
     --discovery-source-sha256 <sha256 of the discovery source set> \
     --emitter-source-sha256   <sha256 of the emitter source set> \
     --runtime-source-sha256   <sha256 of the runtime source set>
@@ -259,7 +259,7 @@ ROM=/Users/jer/Code/aki-recomp/games/NW4E/nomercy.z64 \
 FN64_BOOT_CONTEXT=/absolute/nw4e-boot-context.json \
 FN64_EXECUTABLE_IMAGE_GROUPS=NW4E_GROUP_A,NW4E_GROUP_B,NW4E_GROUP_C \
 FN64_WM_PREPARED_SHARD_ROOT=/absolute/new/private/nw4e-prepared-tree \
-scripts/build-wm2000-withheld-pair.zsh /absolute/new/output-dir
+recomps/wm2000/scripts/build-wm2000-withheld-pair.zsh /absolute/new/output-dir
 ```
 
 ### 4e. Build/link cost — scales, and No Mercy is worse

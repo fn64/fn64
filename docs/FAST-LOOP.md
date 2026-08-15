@@ -255,7 +255,7 @@ export FN64_GAME_DIR=/path/to/your/rom-derived/workspace  # no default: set it
 export CARGO_TARGET_DIR=/tmp/fn64-shared-target
 export RECOMP_RS_DIR="$(./scripts/native-emit.sh)"
 export FN64_RECOMP=rs
-# build via examples/oot-boot/rs/Cargo.toml (crate emit compiles in parallel,
+# build via recomps/wm2000/packages/oot-boot/rs/Cargo.toml (crate emit compiles in parallel,
 # incremental after the modcrate fix) -> run ./oot
 ```
 
@@ -288,8 +288,8 @@ scripts/lint-writer-channel-topology.py --selftest
 scripts/lint-writer-channel-topology.py
 scripts/lint-compiler-memory-safety.py --selftest
 scripts/lint-compiler-memory-safety.py
-scripts/lint-wm-shard-dependencies.py --selftest
-scripts/lint-wm-shard-dependencies.py
+recomps/wm2000/scripts/lint-wm-shard-dependencies.py --selftest
+recomps/wm2000/scripts/lint-wm-shard-dependencies.py
 ```
 
 The writer-topology sweep locks the sealed `DmaMemory` implementation
@@ -309,9 +309,9 @@ For a cold, compiler-side measurement of one generated WM2000 shard without
 touching accumulated Cargo targets, use:
 
 ```sh
-scripts/profile-wm2000-shard.zsh --selftest
-scripts/profile-wm2000-shard.zsh --dry-run
-ROM=/path/to/local/NWXE.z64 scripts/profile-wm2000-shard.zsh
+recomps/wm2000/scripts/profile-wm2000-shard.zsh --selftest
+recomps/wm2000/scripts/profile-wm2000-shard.zsh --dry-run
+ROM=/path/to/local/NWXE.z64 recomps/wm2000/scripts/profile-wm2000-shard.zsh
 ```
 
 The default is the historically worst overlay shard. The real run uses a fresh
@@ -354,8 +354,8 @@ The supported private acquisition path for one reproducible executable-image
 group is likewise bounded and serialized:
 
 ```sh
-scripts/capture-wm-executable-image-group.zsh --selftest
-scripts/capture-wm-executable-image-group.zsh \
+recomps/wm2000/scripts/capture-wm-executable-image-group.zsh --selftest
+recomps/wm2000/scripts/capture-wm-executable-image-group.zsh \
   --producer /absolute/path/to/mupen_trace \
   --core /absolute/path/to/libmupen64plus.dylib \
   --rsp /absolute/path/to/rsp-plugin.dylib \
@@ -390,7 +390,7 @@ ROM=/absolute/private/NWXE.z64 \
 FN64_BOOT_CONTEXT=/absolute/private/boot-context.json \
 FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGES \
 FN64_EXECUTABLE_IMAGES=/absolute/private/image-1.json:/absolute/private/image-2.json:/absolute/private/image-3.json \
-scripts/build-wm2000-withheld-pair.zsh \
+recomps/wm2000/scripts/build-wm2000-withheld-pair.zsh \
   /absolute/private/new-wm-withheld-build
 ```
 
@@ -434,7 +434,7 @@ ROM=/absolute/private/NWXE.z64 \
 FN64_BOOT_CONTEXT=/absolute/private/boot-context.json \
 FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGES \
 FN64_EXECUTABLE_IMAGES=/absolute/private/image-1.json:/absolute/private/image-2.json:/absolute/private/image-3.json \
-scripts/build-wm2000-withheld-pair.zsh \
+recomps/wm2000/scripts/build-wm2000-withheld-pair.zsh \
   /absolute/private/new-wm-withheld-build
 ```
 
@@ -454,7 +454,7 @@ ROM=/absolute/private/NWXE.z64 \
 FN64_BOOT_CONTEXT=/absolute/private/boot-context.json \
 FN64_EXECUTABLE_IMAGE_GROUPS=FN64_EXECUTABLE_IMAGES \
 FN64_EXECUTABLE_IMAGES=/absolute/private/image-1.json:/absolute/private/image-2.json:/absolute/private/image-3.json \
-scripts/build-wm2000-withheld-pair.zsh \
+recomps/wm2000/scripts/build-wm2000-withheld-pair.zsh \
   /absolute/private/new-wm-withheld-build
 ```
 
@@ -476,7 +476,7 @@ FN64_BOOT_CONTEXT=/absolute/private/boot-context.json \
 FN64_WM_PAIR_RECEIPT=/absolute/private/new-wm-withheld-build/receipt.json \
 FN64_WM_AOT_BINARY=/absolute/private/new-wm-withheld-build/wm2000-block-boot.aot \
 FN64_WM_DYNAMIC_BINARY=/absolute/private/new-wm-withheld-build/wm2000-block-boot.dynamic-withheld \
-scripts/wm2000-withheld-rdram-diff.zsh \
+recomps/wm2000/scripts/wm2000-withheld-rdram-diff.zsh \
   /absolute/private/controller-schedule.json 100000 2000000
 ```
 
@@ -509,8 +509,8 @@ it still binds cumulative work, CPU state, pending exit, and prepared
 continuation. A one-instruction final slice may retire a straight instruction,
 while an indivisible branch/delay pair fails loudly and produces no comparison
 receipt. Exercise both wrappers without private inputs using
-`scripts/test-build-wm2000-withheld-pair.zsh` and
-`scripts/test-wm2000-withheld-rdram-diff.zsh`. The current exact-entry builder
+`recomps/wm2000/scripts/test-build-wm2000-withheld-pair.zsh` and
+`recomps/wm2000/scripts/test-wm2000-withheld-rdram-diff.zsh`. The current exact-entry builder
 and comparator wrapper contracts passed 10/10 consecutive runs after the
 schema migration on 2026-07-31. The canonical ABI
 publication and boot-harness digest suites independently passed the
@@ -756,7 +756,7 @@ inventory directly:
 
 ```sh
 cargo run --quiet \
-  --manifest-path examples/wm2000-prepared-shard-producer/Cargo.toml \
+  --manifest-path recomps/wm2000/packages/wm2000-prepared-shard-producer/Cargo.toml \
   --bin fn64-wm-static-micro-op-profile -- \
   --rom /absolute/private/path/NWXE.z64
 ```
@@ -803,7 +803,7 @@ the graphics microcode phase, synthesizes the DP FullSync completion required
 to advance the game scheduler, and leaves audio on live-image LLE. The harness
 rejects that setting in every release or discovery mode, labels it in stdout,
 and does not permit the result to claim graphics or whole-run parity.
-The `examples/oot-boot/oot run` wrapper propagates the boot process's failure
+The `recomps/wm2000/packages/oot-boot/oot run` wrapper propagates the boot process's failure
 status even though its output is filtered.
 
 For task-level RSP replay, set `FN64_DUMP_AUDIO_TASK=/tmp/fn64-task.rdram`.
@@ -824,7 +824,7 @@ RSP_TRACE_WRITE_RDRAM=/tmp/interp.rdram \
   --task-dump /tmp/fn64-task.rdram /tmp/fn64-task.meta 2000000
 
 RSP_TRACE_WRITE_RDRAM=/tmp/generated.rdram \
-  cargo run --manifest-path examples/oot-boot/audio-ucode/Cargo.toml \
+  cargo run --manifest-path recomps/wm2000/packages/oot-boot/audio-ucode/Cargo.toml \
   --bin replay_task -- /tmp/fn64-task.rdram /tmp/fn64-task.meta
 
 cmp /tmp/interp.rdram /tmp/generated.rdram

@@ -230,11 +230,6 @@ path = "src/bin/gate_trace.rs"
 test = false
 
 [[bin]]
-name = "gate_wm2000_recompile"
-path = "src/bin/gate_wm2000_recompile/main.rs"
-test = true
-
-[[bin]]
 name = "headless-bridge"
 path = "src/bin/headless_bridge.rs"
 test = false

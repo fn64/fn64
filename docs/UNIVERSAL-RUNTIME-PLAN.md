@@ -70,7 +70,7 @@ assertions on 2026-07-31. This closes measurement of a shared guest-work
 horizon, not complete state equality: typed native-host continuation and
 canonical atomic full-machine serialization remain open.
 
-`scripts/wm2000-withheld-rdram-diff.zsh` is the first executable A/B wrapper.
+`recomps/wm2000/scripts/wm2000-withheld-rdram-diff.zsh` is the first executable A/B wrapper.
 It runs separately retained AOT and `dynamic-withheld` binaries sequentially
 under the memory guard, derives the baseline's achieved checkpoint at or above
 the requested guest-instruction minimum, requires the dynamic lane to hit that
