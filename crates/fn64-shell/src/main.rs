@@ -37,6 +37,10 @@
 // content-free build (no game linked) the binary's `main` never touches them,
 // so `dead_code` would fire on every item -- allow it here rather than
 // littering per-item attributes; the tests + game module are the real users.
+/// Content-free UI demo: the real presentation path driven by a synthetic
+/// RDRAM field, so a checkout with no game content can still open the window.
+#[cfg(not(fn64_game_linked))]
+mod demo;
 #[allow(dead_code)]
 mod framebuffer;
 #[allow(dead_code)]
@@ -51,10 +55,21 @@ mod timing;
 #[cfg(not(fn64_game_linked))]
 fn main() {
     // Content-free build: no game symbols were linked (RECOMPILED_DIR was
-    // unset at build time -- see build.rs). Report honestly instead of
-    // opening an empty window with nothing to boot.
+    // unset at build time -- see build.rs). `--demo` drives the real window,
+    // framebuffer conversion, and overlay from a synthetic RDRAM field so the
+    // UI stack stays verifiable in a checkout with no game content; without
+    // it, report the intake contract honestly rather than opening a window
+    // with nothing to boot.
+    if std::env::args().any(|a| a == "--demo") {
+        demo::run();
+        return;
+    }
     eprintln!(
         "fn64-shell: built WITHOUT a linked game (RECOMPILED_DIR was unset at build time).\n\
+         \n\
+         For a content-free UI demo (synthetic framebuffer, no ROM required):\n\
+         \n\
+         \x20 cargo run -p fn64-shell -- --demo\n\
          \n\
          To get a live, playable window, rebuild with the game intake env vars set (same\n\
          contract as examples/oot-boot), e.g. for OoT:\n\
