@@ -737,6 +737,27 @@ guest sample slots, host sample slots, host frames, and guest DMA bytes cannot
 be passed interchangeably. Raw integers exist only at device, cpal, atomic,
 and C-ABI edges where their representation is required.
 
+The game-neutral multiplayer-input foundation follows the same ownership
+rule. `fn64-runtime::multiplayer` gives a transport/input coordinator only the
+producer half of a bounded mailbox carrying immutable, session- and
+controller-poll-qualified bundles. The simulation thread exclusively owns the
+consumer, deterministic reorder window, recording, replay cursor, and the
+future authoritative SI integration. A poll names one exact session, fixed
+port set, and SI/PIF read-transaction ordinal. Missing input leaves that ordinal
+unconsumed and returns an error; it never becomes an inferred neutral pad.
+Duplicate, conflicting, stale, wrong-session, wrong-port-set, and
+outside-window bundles fail explicitly. Network sockets, relay/NAT policy,
+lobbies, and executor/RDRAM access are deliberately absent from the module.
+See `docs/NETPLAY.md` for the integration boundary and staged scope.
+
+This mechanism is delayed-lockstep groundwork, not rollback or savestate
+support. It does not alter the whole-function lane's arbitrary-native-
+continuation limit documented in the negative result below. Before networking
+can drive a game, the ABI/SI owner must consume one exact bundle at controller
+read admission (or gate the timed completion before PIF input is sampled),
+rather than rely on a shell repeatedly changing live controller state between
+guest steps.
+
 `fn64-rt64` depends on `fn64-render`, which owns the backend-neutral task,
 microcode-admission, runtime-policy, and raw-DPC completion seams, and on
 `fn64-runtime` for persistent RSP memory and device value types. It is the ONLY

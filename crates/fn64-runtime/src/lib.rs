@@ -18,6 +18,7 @@ pub mod executor;
 mod executor_census;
 pub mod mesgqueue;
 pub mod mmio;
+pub mod multiplayer;
 pub mod overlay;
 pub mod peripherals;
 pub mod pfs;
@@ -90,6 +91,14 @@ pub use mesgqueue::{
 pub use mmio::{
     is_mmio_offset, AiRegs, MmioSpace, AI_STATUS_BUSY, AI_STATUS_ENABLED, AI_STATUS_FULL,
     RDRAM_MMIO_WINDOW_END, RDRAM_MMIO_WINDOW_START, RDRAM_RCP_MMIO_END,
+};
+pub use multiplayer::{
+    bounded_input_loopback, BrokerConfigError, BrokerSubmitError, BrokeredInputSource,
+    ControllerInputSource, ControllerPollOrdinal, ControllerPort, ControllerPortError,
+    ControllerPortSet, ControllerReadOrdinal, DeterministicInputBroker, InputBundle,
+    InputBundleError, InputDelay, InputIngress, InputMailboxError, InputPollRequest,
+    InputRecording, InputRecordingError, InputSourceError, NetplaySessionId, RecordingInputSource,
+    ReplayInputSource, SubmitDisposition,
 };
 pub use overlay::{
     FuncEntry, FuncEntryEvidenceSnapshot, Section, SectionEvidenceSnapshot, SectionIndex,

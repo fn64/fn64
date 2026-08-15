@@ -97,7 +97,7 @@ One workspace, separate crates, each publishable alone:
 
 | Crate | Role |
 |---|---|
-| `fn64-runtime` | Core: scheduler, OS message queues, timers, PI/SI/VI/AI plumbing, rdram model, overlays |
+| `fn64-runtime` | Core: scheduler, OS message queues, timers, PI/SI/VI/AI plumbing, deterministic multiplayer-input broker, rdram model, overlays |
 | `fn64-abi` | The `extern "C"` surface recompiled code links against |
 | `fn64-boot-harness` | Shared generated-section bridge, registration callback, and RDRAM allocation for boot hosts |
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
