@@ -14,6 +14,7 @@ ponytail: a dict literal, not a manifest format. Add a row when a frame earns a
 cited digest; reach for a parsed manifest only if these outgrow one screen.
 """
 import hashlib
+import os
 import pathlib
 import sys
 
@@ -28,12 +29,45 @@ FRAMES = {
 }
 
 
+def game_repo_path(rel: str) -> pathlib.Path | None:
+    """Where a moved reference frame lives now, if a game checkout is present.
+
+    The frames were extracted to their own repository with the rest of the game
+    content, so `reference/revenge-frames/x.png` is now
+    `<game-repo>/reference/revenge-frames/x.png`. FN64_SHARD_ROOT points at that
+    repo's `packages/` directory, so its parent is the repo root.
+    """
+    shard_root = os.environ.get("FN64_SHARD_ROOT")
+    if not shard_root:
+        return None
+    candidate = pathlib.Path(shard_root).parent / rel
+    return candidate if candidate.is_file() else None
+
+
 def main() -> int:
     failures = []
     for rel, expected in sorted(FRAMES.items()):
         path = ROOT / rel
         if not path.is_file():
-            failures.append(f"{rel}: cited by the docs but not in the repository")
+            # The frame moved to the game repository. Verify it THERE when a
+            # checkout is present; skip when it is not, because fn64 must build
+            # and lint standalone -- a plain clone has no game content at all.
+            # Failing here would make the extracted repo a build dependency of
+            # fn64, which is the coupling the extraction removed.
+            moved = game_repo_path(rel)
+            if moved is None:
+                print(
+                    f"reference-frame-digests: {rel}: not in this repository "
+                    "(extracted to the game repo); set FN64_SHARD_ROOT to verify "
+                    "its digest",
+                    file=sys.stderr,
+                )
+                continue
+            actual = hashlib.sha256(moved.read_bytes()).hexdigest()
+            if actual != expected:
+                failures.append(
+                    f"{rel}: docs cite {expected}, game-repo file hashes {actual}"
+                )
             continue
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         if actual != expected:
