@@ -3,32 +3,31 @@
 Raised 2026-08-08 after a play session. Three questions, three answers, and one
 structural problem underneath all of them.
 
-## The structural problem: the UI and the game are in different binaries
+## The structural split: bridged by one shared UI seam
 
 | | `crates/fn64-shell` (binary `fn64`) | `recomps/wm2000/packages/wm2000-block-boot` (binary `wm2000-shell`) |
 |---|---|---|
 | runs WM2000 | **no** — OoT function lane, hardcoded OoT cart VRAM, no scripted input | **yes** |
-| controller GUI | **yes** — `overlay.rs`, 466 lines | no |
-| `input_map` + saved config | **yes** — `~/.config/fn64/input.toml` | no |
+| controller GUI | **yes** — shared `overlay.rs`, behind **F1** | **yes** — includes that same module by path |
+| `input_map` + saved config | **yes** — platform config dir (`fn64/input.toml`) | **yes** — same module and file |
 | RT64 selector | yes | yes (added `42271e3`) |
 
-**The shipping-named binary cannot play the game; the one that can is a bare
-window.** This is the third time today that split has cost real time — after
-the `FN64_RENDER=rt64` silent no-op on the shell and the stale "blocker A" in
-the RT64 analysis. Every frontend feature request lands on the question "which
-binary?" before it lands on the feature.
+The function and block lanes remain different boot contracts, but frontend
+behavior no longer needs two implementations. The extracted WM2000 shell
+includes fn64-shell's game-neutral framebuffer, input map, gamepad, overlay,
+and timing modules directly; its RT64 and reference present paths both end in
+the same overlay compositor. Frontend changes therefore land once in fn64 and
+are compiled by each game harness.
 
-**Resolve the split before building on either side**, or each item below gets
-implemented twice.
-
-## 1. Controller configuration GUI — EXISTS, in the wrong binary
+## 1. Controller configuration GUI — AVAILABLE IN BOTH SHELLS
 
 `crates/fn64-shell/src/overlay.rs` already provides, behind **F1**:
 
-- press-to-bind remapping for **keyboard and gamepad**
+- press-to-bind remapping and explicit unbinding for **keyboard and gamepad**
 - a deadzone slider with a **live analog-stick scope**
-- auto-save to `InputConfig` TOML at `~/.config/fn64/input.toml`
-  (`input_map.rs:227-240`, via `dirs`)
+- connected-controller status and explicit keyboard/gamepad columns
+- guarded restore-defaults and a direct Done action
+- auto-save to `InputConfig` TOML in the platform config directory (via `dirs`)
 
 It renders egui over the paused-input framebuffer. Note the version pin it
 documents at `overlay.rs:6-12`: pixels 0.15 pins wgpu 0.19, which pins egui to
@@ -37,9 +36,11 @@ overlay therefore hand-rolls ~40 lines of event translation (cursor, clicks,
 scroll) rather than taking `egui-winit`. **Any port must carry that constraint,
 not rediscover it.**
 
-**Work: port `overlay.rs` + `input_map.rs` to `wm2000-shell`,** or unify the
-binaries first. `wm2000-shell` currently has a hardcoded key map and no config
-file — see the gamepad plumbing added in `332b97e` for the multi-port seam.
+WM2000 consumes the module through the same `#[path]` seam as its input map and
+gamepad support. Opening the modal clears held keyboard state, supplies neutral
+live input while editing, consumes armed keyboard/gamepad captures, and leaves
+committed controller schedules authoritative. Both renderer lanes composite
+the panel after filling the same Pixels surface.
 
 ## 2. ROM drag-and-drop / no-ROM startup — DOES NOT EXIST
 
