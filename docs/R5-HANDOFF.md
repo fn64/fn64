@@ -86,13 +86,13 @@ committed anywhere; reproduce fresh rather than hunting for the PNG.
 
 3. **Not a framebuffer geometry (width/height) mismatch.** Both the shell
    (`framebuffer.rs`: `FB_WIDTH=320, FB_HEIGHT=240`) and the headless
-   harness (`examples/oot-boot/src/main.rs`: same constants, same `^2`) use
+   harness (`recomps/wm2000/packages/oot-boot/src/main.rs`: same constants, same `^2`) use
    identical geometry and identical decode logic. If it were a width bug
    both would show it.
 
 4. **The headless harness's PNG dump is clean at swap 40** (reference
    backend, `OOT_MAX_SWAPS=40`, dumped via `capture_framebuffer` in
-   `examples/oot-boot/src/main.rs`). White background, blue logo shape,
+   `recomps/wm2000/packages/oot-boot/src/main.rs`). White background, blue logo shape,
    correct colors. So the SAME decode function, on the SAME rdram-address
    source, at a similar point in boot, produces a correct frame in one
    harness and garbage in the other. **This is the load-bearing fact.** The
@@ -158,7 +158,7 @@ a shared, tested conversion helper that all four sites (and any others found
 during the sweep) are migrated to use, so a fifth instance isn't possible by
 construction. Search for every place that does raw `rdram[...]` indexing
 combined with a manual `^ 2` or similar swizzle, in `fn64-abi`, `fn64-shell`,
-`fn64-runtime`, and `examples/oot-boot` — that's the sweep's scope.
+`fn64-runtime`, and `recomps/wm2000/packages/oot-boot` — that's the sweep's scope.
 
 ## Separately, and only after the above is real: R5 audio/video timing
 

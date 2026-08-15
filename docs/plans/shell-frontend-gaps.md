@@ -5,7 +5,7 @@ structural problem underneath all of them.
 
 ## The structural problem: the UI and the game are in different binaries
 
-| | `crates/fn64-shell` (binary `fn64`) | `examples/wm2000-block-boot` (binary `wm2000-shell`) |
+| | `crates/fn64-shell` (binary `fn64`) | `recomps/wm2000/packages/wm2000-block-boot` (binary `wm2000-shell`) |
 |---|---|---|
 | runs WM2000 | **no** — OoT function lane, hardcoded OoT cart VRAM, no scripted input | **yes** |
 | controller GUI | **yes** — `overlay.rs`, 466 lines | no |
@@ -46,7 +46,7 @@ file — see the gamepad plumbing added in `332b97e` for the multi-port seam.
 `shell.rs` has **zero** `DroppedFile` handling. The ROM arrives via the `ROM`
 env var, and it is needed at **build** time, not just run time — the shard
 catalog is generated against a specific ROM by
-`examples/wm2000-block-shards/build.rs`.
+`recomps/wm2000/packages/wm2000-block-shards/build.rs`.
 
 **That makes "drop a ROM to play it" a much larger feature than it appears.**
 The block lane is compiled *per title*; it cannot accept an arbitrary ROM at

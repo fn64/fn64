@@ -87,7 +87,7 @@ rate is what audio production tracks.
 
 ### The instrument that hid it, now fixed
 
-`examples/wm2000-block-boot/src/shell.rs` — the played binary — read
+`recomps/wm2000/packages/wm2000-block-boot/src/shell.rs` — the played binary — read
 `AudioStreamHealth` but printed `underrun_samples` / `late_callbacks` /
 `max_callback_gap_us` **only on SPIKE lines**. The routine heartbeat showed
 `ai_buffers`/`samples`/`nonzero`/`backend_buffers`, all of which read clean
@@ -198,7 +198,7 @@ to optimize, you are not ready to optimize it.
 A sampling profiler attributes samples to every frame on the stack. Reading
 inclusive totals as self time produced three targets that were **all**
 artifacts, including a "symbol" (`live_program::_`) that was a demangled prefix
-covering the calls beneath it. `scripts/wm2000_self_time.py` computes this
+covering the calls beneath it. `recomps/wm2000/scripts/wm2000_self_time.py` computes this
 correctly; use it.
 
 ### 3. Count, do not infer
@@ -270,7 +270,7 @@ name).
 
 ### 4. Only measure on a quiet machine
 `uptime` and `pgrep rustc` before any timing. A concurrent 32-crate shard
-rebuild made a 421 ms baseline read 775 ms. `scripts/profile-wm2000-self-time.zsh`
+rebuild made a 421 ms baseline read 775 ms. `recomps/wm2000/scripts/profile-wm2000-self-time.zsh`
 refuses above a load threshold and re-checks *between* runs, because a build
 starting mid-profile poisons only the later traces and leaves a plausible
 average.
@@ -349,7 +349,7 @@ Both were self-time *shares* from a route with no frames, quoted as durations
 about a route that has them. Connecting them is what should stop a third.
 
 **11a. State the ROUTE and the BINARY beside every per-field figure.** Route
-alone is not sufficient, learned 2026-08-08: `examples/wm2000-block-boot/src/
+alone is not sufficient, learned 2026-08-08: `recomps/wm2000/packages/wm2000-block-boot/src/
 main.rs` is hashed verbatim into `DISPATCH_SOURCE_SHA256`, so **editing it
 changes the canonical program identity** and "the same route" then runs a
 *different program*. A delta measured across that boundary reads exactly like a
@@ -426,7 +426,7 @@ Two corollaries, both of which cost time today:
 
 ## Measuring the 60fps bar
 
-**`reference/wm2000-routes/render-benchmark.zsh`** — one command, produces a
+**`recomps/wm2000/reference/wm2000-routes/render-benchmark.zsh`** — one command, produces a
 frame-latency distribution over sustained rendering. Before it existed
 (2026-08-07) the "guaranteed 60fps" bar had no test at all.
 
@@ -513,7 +513,7 @@ The gate is `FN64_FRAME_CENSUS=1`, implemented in
 `crates/fn64-abi/src/frame_census.rs` and hooked into `advance_virtual_time` —
 the one seam both lanes cross. It is in `fn64-abi` on purpose: that crate is
 neither hashed into the program identity nor subject to rule 8's 32-crate
-rebuild, and `examples/wm2000-block-boot/src/main.rs` is both (`build.rs` reads
+rebuild, and `recomps/wm2000/packages/wm2000-block-boot/src/main.rs` is both (`build.rs` reads
 it into `DISPATCH_SOURCE_SHA256`), so putting a diagnostic there would move the
 canonical digest.
 
@@ -720,7 +720,7 @@ will not be until that 2.86% grows.
 
 ### `fn64-audio` at codegen-units=256: a real defect, an overstated cure
 
-`examples/wm2000-block-boot/Cargo.toml` sets `[profile.release] codegen-units =
+`recomps/wm2000/packages/wm2000-block-boot/Cargo.toml` sets `[profile.release] codegen-units =
 256` (:116) and overrides three packages to `1` — `fn64-recomp-rs` (:139),
 `fn64-runtime` (:142), `fn64-abi` (:145). **`fn64-audio` has no override**, so
 the crate interpreting **4.13B RSP instructions** builds at 256.
@@ -1092,7 +1092,7 @@ and a clamp set to the target reports success.
 
 ## CAVEAT ON EVERY NUMBER BELOW: they are HEADLESS, and RT64 is headless-only
 
-`examples/wm2000-block-boot/src/shell.rs` — the windowed binary — **hardcodes
+`recomps/wm2000/packages/wm2000-block-boot/src/shell.rs` — the windowed binary — **hardcodes
 `ReferenceBackend`** (`:608-612`) and contains **zero** occurrences of
 `FN64_RENDER`. The selector `f74e4e9` added went into `src/main.rs` (headless)
 only, which has eleven. So:
@@ -1407,7 +1407,7 @@ Nobody should target it.**
 `match pc` dispatch, and the codegen rewrite it implies is **not** the right
 first move.
 
-`examples/wm2000-block-shards/build.rs:330` passes **`verify_live_words: true`**.
+`recomps/wm2000/packages/wm2000-block-shards/build.rs:330` passes **`verify_live_words: true`**.
 It is emitted at the top of `'run: loop` (`emit/mod.rs:602-616`), *before* the
 `match` — so **once per guest instruction** it does a bounds check, an
 `EXPECTED_WORDS` index, and **a full `mem.load_w` guest load** through
@@ -2141,7 +2141,7 @@ one of them reads clean under starvation.
 `AudioStreamHealth` already carried `underrun_samples` — the count of samples
 the callback zero-filled, which is starvation measured directly — and
 `crates/fn64-shell/src/main.rs:671-707` prints it. But
-`examples/wm2000-block-boot/src/shell.rs`, the binary actually being played,
+`recomps/wm2000/packages/wm2000-block-boot/src/shell.rs`, the binary actually being played,
 read that struct and printed those fields **only on SPIKE lines**, never in the
 routine heartbeat. So a starved run and a healthy run emitted the same quiet
 heartbeat, and the one number that could have falsified the diagnosis was
@@ -2806,8 +2806,8 @@ below.**
 > Do not diff a later run against them.**
 >
 > They were measured at commit `89e00d0`, before the ROM-content work edited
-> `examples/wm2000-block-boot/src/main.rs`. That file is **hashed verbatim into
-> `DISPATCH_SOURCE_SHA256`** (`examples/wm2000-block-shards/build.rs`), so
+> `recomps/wm2000/packages/wm2000-block-boot/src/main.rs`. That file is **hashed verbatim into
+> `DISPATCH_SOURCE_SHA256`** (`recomps/wm2000/packages/wm2000-block-shards/build.rs`), so
 > editing it changes the canonical program identity: the benchmark binary
 > after that point **is not the same program** that produced 56.232 ms.
 >
@@ -4349,7 +4349,7 @@ removable without changing the emulated program.**
 
 - **Raise the instruction budget.** Closed, and this data confirms the closure
   rather than reopening it: budget is 4096
-  (`examples/wm2000-block-boot/src/shell.rs:656`) and the exits are host calls,
+  (`recomps/wm2000/packages/wm2000-block-boot/src/shell.rs:656`) and the exits are host calls,
   not budget exhaustion. `docs/plans/dispatch-granularity.md` already recorded
   4096 vs 65536 as byte-identical, and the resident-generation predicate that
   landed 2026-08-06 took `ExecutableWrite` from 99.8% of slice ends to **0**,
@@ -4785,7 +4785,7 @@ an estimate from a route that rendered nothing; this is 8,984 rendered fields.
 | recompiled guest code | 2.86% | runs at 0.09x, ~11x faster than console |
 
 **The four struck/corrected rows were re-measured 2026-08-07 with caller
-attribution** (`scripts/wm2000_callers.py`) and a census, not self time alone.
+attribution** (`recomps/wm2000/scripts/wm2000_callers.py`) and a census, not self time alone.
 Three of the four "structural" rows were misclassified; `read_u8` in particular
 double-counts the journal already charged at 34%. There is no separate 50%
 structural half to attack. See `structural-half-is-mostly-guard.md`.

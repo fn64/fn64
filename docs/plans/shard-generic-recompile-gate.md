@@ -104,7 +104,7 @@ Current state, verified: the shard **emitter** is shared
 test suites) and the shard **geometry** is shared
 (`DENSE_AOT_SHARD_BYTES`), but **compile-unit splitting is not**: WM2000
 expresses it as 35 hand-listed crates in
-`examples/wm2000-block-shards/build.rs`, and `gate_rom_recompile` had no
+`recomps/wm2000/packages/wm2000-block-shards/build.rs`, and `gate_rom_recompile` had no
 splitting at all. Nothing names the invariant "one rustc invocation must
 not exceed N emitted words."
 

@@ -8,7 +8,7 @@ executor thread onto a worker.
 worth building, because the work it would move costs approximately nothing.
 Measured, the entire category-B apparatus is 0 ms of a 430 ms run.**
 
-Measured 2026-08-07 on WM2000, `examples/wm2000-block-boot`, Apple Silicon, at
+Measured 2026-08-07 on WM2000, `recomps/wm2000/packages/wm2000-block-boot`, Apple Silicon, at
 `a867dba` — i.e. *after* the page-tree digest migration, the `mprotect` write
 barrier, and the two barrier refinements (`c9db8a3`, `976e7a4`).
 

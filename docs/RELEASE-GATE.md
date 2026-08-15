@@ -1,6 +1,6 @@
 # Fixed-cycle release evidence
 
-Status: live minimum-scenario gate wired into `examples/oot-boot`; no
+Status: live minimum-scenario gate wired into `recomps/wm2000/packages/oot-boot`; no
 zero-unsupported full-ROM claim has been made.
 
 `fn64-boot-harness` exposes two layers:
@@ -393,7 +393,7 @@ destinations are still not enumerated.
 
 ## OoT private-host path
 
-`examples/oot-boot` accepts the generic runner-owned tuple:
+`recomps/wm2000/packages/oot-boot` accepts the generic runner-owned tuple:
 
 ```text
 FN64_RELEASE_GATE_CYCLE=C

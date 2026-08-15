@@ -41,7 +41,7 @@ complete strict TOML image named by `FN64_RT64_SETTINGS_FILE`; the file is also
 applied once at startup. The schema requires `resolution`,
 `resolution_multiplier`, `downsample_multiplier`, and `antialiasing`, rejects
 unknown fields, and is illustrated by
-`examples/wm2000-block-boot/rt64-aa.example.toml`. Each successful mutation
+`recomps/wm2000/packages/wm2000-block-boot/rt64-aa.example.toml`. Each successful mutation
 prints its complete settings digest and whether RT64 discarded framebuffer
 resources. These shortcuts are an experiment harness, not the settings UI
 policy; they intentionally cross the same typed registered-renderer seam that

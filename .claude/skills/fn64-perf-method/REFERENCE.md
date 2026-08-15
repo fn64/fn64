@@ -302,13 +302,13 @@ smoke caught two defects that would each have cost a full run.
 `FN64_DISCOVER_NWXE_ROM`, **not** a bare `ROM`; the shard build wants `ROM` and
 panics with `ROM must name the user's NWXE image: NotPresent` without it. Builds
 also need `FN64_EXECUTABLE_IMAGES` (three capture paths) and `FN64_BOOT_CONTEXT`
-— see `reference/wm2000-routes/render-benchmark.zsh`.
+— see `recomps/wm2000/reference/wm2000-routes/render-benchmark.zsh`.
 
 RT64 lives at `~/Code/no-mercy-recompiled/third_party/rt64` (MIT; `build.rs`
 asserts the LICENSE). The `lib/rt64` copies in jessetbh repos are UNLICENSED —
-do not use them. Build from inside `examples/wm2000-block-boot`.
+do not use them. Build from inside `recomps/wm2000/packages/wm2000-block-boot`.
 
-Do not edit `examples/wm2000-block-boot/src/main.rs` — it is hashed into
+Do not edit `recomps/wm2000/packages/wm2000-block-boot/src/main.rs` — it is hashed into
 `DISPATCH_SOURCE_SHA256`.
 
 ## Guest byte-identity gate
