@@ -4955,3 +4955,32 @@ binary; a fresh interleaved render-route A/B is still required before assigning
 an end-to-end speedup to this change. The affected runtime diagnostics, complete
 audio library, and raw/XBUS ABI renderer seam passed ten consecutive clean test
 runs; the full audio suite and all 382 ABI nextest cases also passed once.
+
+### Follow-up: finish the registered hot seams and reuse transaction storage
+
+The same retained stacks also place direct environment reads below
+`run_imem`, the generated-C shim adapter, and periodic controller/audio
+boundaries. Those switches now use typed process-lifetime configurations;
+dependent execution-trace settings are not parsed while their parent trace is
+off. A CI sweep registers the interpreter, CP0/DMA, shim, controller, AI, and
+captured raw-DPC functions and rejects a direct `env::var*` call inside them.
+This is a regression mechanism for the bug class, not another one-off list of
+cached booleans.
+
+Two allocation owners are now reused without changing their byte contracts.
+AI delivery retains its guest-order `Vec<i16>` after the synchronous backend
+call. Captured raw DPC dispatch retains the synthetic full-RDRAM transaction
+image after copyback; every subsequent use overwrites the complete physical
+prefix and command suffix before renderer admission. The existing DPC census
+measured its allocation/zero phase at about 0.115 ms per render field. Reuse
+removes that repeated allocation and zeroing, but does not remove the required
+full-RDRAM copy-in, copyback, rollback authority, or RT64 work. Consecutive
+submission tests pin allocation identity and unchanged renderer/evidence
+results. No fresh render-route A/B has yet assigned an end-to-end delta to this
+follow-up.
+
+The execution-trace parser and both storage-reuse behaviors passed ten
+consecutive focused runs. The complete `fn64-audio` suite passed with 353 unit
+tests plus its integration and documentation tests, all 383 `fn64-abi`
+nextest cases passed, and the documentation, NMR-surface, hot-path environment,
+and whitespace sweeps were clean.

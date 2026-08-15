@@ -108,6 +108,10 @@ host latency rather than N64 hardware state. The host ring allocates its full
 250 ms bound before playback and keeps the producer's drop-oldest policy. The
 realtime callback never waits for the producer lock: a contended pull becomes
 counted silence, preserving callback deadlines without changing DMA progress.
+Guest-order AI sample decoding reuses one thread-owned buffer across
+submissions, and disabled audio diagnostics are launch-time cached values, so
+the ordinary DMA path neither reallocates its sample vector nor scans the
+process environment at buffer cadence.
 That split is also enforced by the Rust seam: guest and host sample rates are
 distinct nonzero types, `GuestPcm16` proves complete interleaved frames, and
 guest sample slots, host sample slots, host frames, and guest DMA bytes cannot
@@ -1714,7 +1718,10 @@ task calls out:
   byte, while the generated-code allocation's appended MMIO/non-RDRAM backing is
   never exposed or transactionally cloned. Captured XBUS/LLE command words use
   a synthetic suffix and only the physical prefix is copied back, but RDP
-  commands can address that suffix during execution. Exact RT64 LLE captured-
+  commands can address that suffix during execution. The transaction image is
+  retained as thread-owned scratch after completion and completely overwritten
+  before its next admission; reuse changes allocation churn, not rollback or
+  evidence authority. Exact RT64 LLE captured-
   DPC execution therefore remains a release residual until the native seam
   accepts a separate command buffer and enforces physical-memory bounds. One
   fabric-owned DPC register file and typed

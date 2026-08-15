@@ -14,9 +14,72 @@ use super::decode::{
 use super::ops::{dispatch, OpInvocation, OpStatus};
 use super::recomp::runtime::RspMachine;
 use super::recomp::{trap_delay_slot_control, trap_imem_overrun, trap_unknown, trap_unknown_vu};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 
 static EXEC_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, PartialEq, Eq)]
+enum RspExecutionTrace {
+    Disabled,
+    Enabled {
+        instruction_limit: u64,
+        gprs: Box<[u8]>,
+    },
+}
+
+fn rsp_execution_trace() -> &'static RspExecutionTrace {
+    static CONFIG: OnceLock<RspExecutionTrace> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let enabled = std::env::var_os("RSP_TRACE_EXEC").is_some();
+        if !enabled {
+            return RspExecutionTrace::Disabled;
+        }
+        let raw_limit = std::env::var("RSP_TRACE_EXEC_LIMIT").ok();
+        let raw_gprs = std::env::var("RSP_TRACE_EXEC_GPRS").ok();
+        parse_rsp_execution_trace(true, raw_limit.as_deref(), raw_gprs.as_deref())
+    })
+}
+
+fn parse_rsp_execution_trace(
+    enabled: bool,
+    raw_limit: Option<&str>,
+    raw_gprs: Option<&str>,
+) -> RspExecutionTrace {
+    if !enabled {
+        return RspExecutionTrace::Disabled;
+    }
+    let instruction_limit = raw_limit
+        .map(|raw| {
+            raw.parse::<u64>()
+                .unwrap_or_else(|_| panic!("RSP_TRACE_EXEC_LIMIT must be an integer, got {raw:?}"))
+        })
+        .unwrap_or(u64::MAX);
+    let gprs = raw_gprs
+        .map(|raw| {
+            raw.split(',')
+                .map(|field| {
+                    let register = field.trim().parse::<u8>().unwrap_or_else(|_| {
+                        panic!(
+                            "RSP_TRACE_EXEC_GPRS must be comma-separated register indices, got {raw:?}"
+                        )
+                    });
+                    assert!(
+                        register < 32,
+                        "RSP_TRACE_EXEC_GPRS register index must be below 32, got {register}"
+                    );
+                    register
+                })
+                .collect::<Box<[_]>>()
+        })
+        .unwrap_or_default();
+    RspExecutionTrace::Enabled {
+        instruction_limit,
+        gprs,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InterpreterResult {
@@ -60,34 +123,19 @@ pub fn run_imem(
         0x1000 | (pc & 0x0fff)
     };
     let mut steps = 0u64;
-    let trace_execution = !crate::rsp::recomp::content_safe_diagnostics()
-        && std::env::var_os("RSP_TRACE_EXEC").is_some();
-    let trace_limit = std::env::var("RSP_TRACE_EXEC_LIMIT")
-        .ok()
-        .map(|raw| {
-            raw.parse::<u64>()
-                .unwrap_or_else(|_| panic!("RSP_TRACE_EXEC_LIMIT must be an integer, got {raw:?}"))
-        })
-        .unwrap_or(u64::MAX);
-    let trace_gprs = std::env::var("RSP_TRACE_EXEC_GPRS")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(|field| {
-                    let register = field.trim().parse::<u8>().unwrap_or_else(|_| {
-                        panic!(
-                            "RSP_TRACE_EXEC_GPRS must be comma-separated register indices, got {raw:?}"
-                        )
-                    });
-                    assert!(
-                        register < 32,
-                        "RSP_TRACE_EXEC_GPRS register index must be below 32, got {register}"
-                    );
-                    register
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let trace = match (
+        crate::rsp::recomp::content_safe_diagnostics(),
+        rsp_execution_trace(),
+    ) {
+        (
+            false,
+            RspExecutionTrace::Enabled {
+                instruction_limit,
+                gprs,
+            },
+        ) => Some((*instruction_limit, gprs.as_ref())),
+        _ => None,
+    };
 
     loop {
         if steps == step_budget {
@@ -109,7 +157,7 @@ pub fn run_imem(
         };
         steps += 1;
         let delay_word = words.get(idx + 1).copied();
-        if trace_execution {
+        if let Some((trace_limit, trace_gprs)) = trace {
             let sequence = EXEC_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             if sequence < trace_limit {
                 eprintln!(
@@ -572,6 +620,31 @@ fn exec_store(machine: &mut RspMachine<'_>, op: StoreOp, rt: u8, base: u8, off: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_execution_trace_ignores_dependent_configuration() {
+        assert_eq!(
+            parse_rsp_execution_trace(false, Some("not-an-integer"), Some("99,wat")),
+            RspExecutionTrace::Disabled
+        );
+    }
+
+    #[test]
+    fn enabled_execution_trace_parses_limit_and_registers_once() {
+        assert_eq!(
+            parse_rsp_execution_trace(true, Some("17"), Some("1, 8,31")),
+            RspExecutionTrace::Enabled {
+                instruction_limit: 17,
+                gprs: Box::from([1, 8, 31]),
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "RSP_TRACE_EXEC_GPRS register index must be below 32")]
+    fn enabled_execution_trace_rejects_out_of_range_registers() {
+        let _ = parse_rsp_execution_trace(true, None, Some("32"));
+    }
 
     #[test]
     fn executes_scalar_delay_slot_and_break_from_arbitrary_pc() {

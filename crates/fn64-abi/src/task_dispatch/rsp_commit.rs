@@ -1,6 +1,43 @@
 use super::*;
 use fn64_audio::rsp::runtime::RspDpCommandSource;
 
+struct XbusStreamDump {
+    directory: std::path::PathBuf,
+    skip: u64,
+    rdram_index: Option<u64>,
+}
+
+struct XbusDiagnostics {
+    stream_dump: Option<XbusStreamDump>,
+    diff_trace: bool,
+}
+
+fn xbus_diagnostics() -> &'static XbusDiagnostics {
+    static CONFIG: std::sync::OnceLock<XbusDiagnostics> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let stream_dump = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR").map(|directory| {
+            let parse_index = |name: &str, default: Option<u64>| {
+                std::env::var(name).ok().map_or(default, |raw| {
+                    Some(
+                        raw.parse::<u64>()
+                            .unwrap_or_else(|_| panic!("{name} must be a u64, got {raw:?}")),
+                    )
+                })
+            };
+            XbusStreamDump {
+                directory: directory.into(),
+                skip: parse_index("FN64_XBUS_STREAM_DUMP_SKIP", Some(0))
+                    .expect("XBUS dump skip has a default"),
+                rdram_index: parse_index("FN64_XBUS_STREAM_DUMP_RDRAM", None),
+            }
+        });
+        XbusDiagnostics {
+            stream_dump,
+            diff_trace: std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some(),
+        }
+    })
+}
+
 fn rsp_trace_dpc_words_limit() -> Option<usize> {
     static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -1088,8 +1125,9 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     }
     let real = unsafe { renderer_rdram_slice(rdram) };
     let physical_len = real.len();
+    let xbus_diagnostics = xbus_diagnostics();
     if xbus {
-        if let Some(dir) = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR") {
+        if let Some(dump) = xbus_diagnostics.stream_dump.as_ref() {
             thread_local! {
                 static XBUS_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
             }
@@ -1098,22 +1136,18 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
                 cell.set(index + 1);
                 index
             });
-            let skip = std::env::var("FN64_XBUS_STREAM_DUMP_SKIP")
-                .ok()
-                .map_or(0, |raw| {
-                    raw.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("FN64_XBUS_STREAM_DUMP_SKIP must be a u64, got {raw:?}")
-                    })
+            if index >= dump.skip && index < dump.skip.saturating_add(16) {
+                std::fs::create_dir_all(&dump.directory).unwrap_or_else(|error| {
+                    panic!(
+                        "FN64_XBUS_STREAM_DUMP_DIR {:?}: {error}",
+                        dump.directory
+                    )
                 });
-            if index >= skip && index < skip.saturating_add(16) {
-                let dir = std::path::PathBuf::from(dir);
-                std::fs::create_dir_all(&dir)
-                    .unwrap_or_else(|error| panic!("FN64_XBUS_STREAM_DUMP_DIR {dir:?}: {error}"));
                 let stream = words
                     .iter()
                     .flat_map(|word| word.to_be_bytes())
                     .collect::<Vec<_>>();
-                let path = dir.join(format!("xbus-{index:04}.bin"));
+                let path = dump.directory.join(format!("xbus-{index:04}.bin"));
                 std::fs::write(&path, stream)
                     .unwrap_or_else(|error| panic!("writing XBUS stream dump {path:?}: {error}"));
                 eprintln!(
@@ -1121,15 +1155,8 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
                     words.len() * 4,
                     path.display()
                 );
-                let dump_rdram = std::env::var("FN64_XBUS_STREAM_DUMP_RDRAM")
-                    .ok()
-                    .map(|raw| {
-                        raw.parse::<u64>().unwrap_or_else(|_| {
-                            panic!("FN64_XBUS_STREAM_DUMP_RDRAM must be a u64, got {raw:?}")
-                        })
-                    });
-                if dump_rdram == Some(index) {
-                    let rdram_path = dir.join(format!("rdram-{index:04}.bin"));
+                if dump.rdram_index == Some(index) {
+                    let rdram_path = dump.directory.join(format!("rdram-{index:04}.bin"));
                     std::fs::write(&rdram_path, &*real).unwrap_or_else(|error| {
                         panic!("writing RDRAM dump {rdram_path:?}: {error}")
                     });
@@ -1148,10 +1175,11 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
         "captured RSP DPC staging range [{staging_start:#010x}, {staged_end:#010x}) exceeds the 24-bit RDP address space"
     );
     crate::dpc_copy_census::note_call();
-    let mut image = crate::dpc_copy_census::timed(
+    let mut image = RAW_DPC_STAGING_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    crate::dpc_copy_census::timed(
         crate::dpc_copy_census::Phase::Alloc,
         staged_end as u64,
-        || vec![0u8; staged_end],
+        || image.resize(staged_end, 0),
     );
     crate::dpc_copy_census::timed(
         crate::dpc_copy_census::Phase::CopyIn,
@@ -1185,7 +1213,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     let full_sync =
         require_matching_raw_dpc_completion(inspected, rendered, "dispatch_captured_raw_rdp");
     transaction.validate_atomic_completion();
-    if xbus && std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
+    if xbus && xbus_diagnostics.diff_trace {
         let mut offset = 0usize;
         while offset < physical_len {
             if image[offset] != real[offset] {
@@ -1221,10 +1249,9 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             || real.copy_from_slice(&image[..physical_len]),
         )
     });
-    (
-        full_sync,
-        dpc_observation(xbus, source_start, source_end, words),
-    )
+    let observation = dpc_observation(xbus, source_start, source_end, words);
+    RAW_DPC_STAGING_SCRATCH.with(|cell| *cell.borrow_mut() = image);
+    (full_sync, observation)
 }
 
 pub(crate) fn require_committed_full_sync_evidence(

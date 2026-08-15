@@ -1552,6 +1552,11 @@ fn is_admitted_fr_stable_c_shim(shim: CShim) -> bool {
         }
 }
 
+fn shim_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FN64_RECOMP_RS_SHIM_TRACE").is_some())
+}
+
 pub(super) fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static str, shim: CShim) {
     // An exit snapshot cannot observe a shim which changes FR, accesses the
     // other FPR view, then restores FR. Admit only the closed host-shim set
@@ -1560,7 +1565,7 @@ pub(super) fn call_c(ctx: &mut RsContext, mem: &mut Rdram<'_>, name: &'static st
         is_admitted_fr_stable_c_shim(shim),
         "C shim {name} is not in the FR-stable adapter registry"
     );
-    if std::env::var_os("FN64_RECOMP_RS_SHIM_TRACE").is_some() {
+    if shim_trace_enabled() {
         eprintln!("[fn64-recomp-rs-shim] {name}");
     }
     let mut c = c_from_recompiled(ctx);
@@ -1956,4 +1961,3 @@ pub fn os_set_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
 pub fn os_get_int_mask(ctx: &mut RsContext, _mem: &mut Rdram<'_>) {
     ctx.set_r(2, ctx.os_interrupt_mask() as u64);
 }
-
