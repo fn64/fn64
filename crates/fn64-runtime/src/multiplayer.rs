@@ -468,7 +468,9 @@ impl DeterministicInputBroker {
             });
         }
         let distance = ordinal.get() - self.next.get();
-        if distance >= self.capacity.get() as u64 {
+        let outside_window =
+            u64::try_from(self.capacity.get()).is_ok_and(|capacity| distance >= capacity);
+        if outside_window {
             return Err(BrokerSubmitError::OutsideWindow {
                 expected: self.next,
                 found: ordinal,
@@ -889,7 +891,11 @@ impl ControllerInputSource for ReplayInputSource {
         &mut self,
         request: InputPollRequest,
     ) -> Result<InputBundle, InputSourceError> {
-        let offset = u64::try_from(self.cursor).expect("input replay cursor exceeds u64");
+        let next_cursor = self
+            .cursor
+            .checked_add(1)
+            .ok_or(InputSourceError::OrdinalExhausted)?;
+        let offset = u64::try_from(self.cursor).map_err(|_| InputSourceError::OrdinalExhausted)?;
         let next = self
             .recording
             .first
@@ -902,7 +908,7 @@ impl ControllerInputSource for ReplayInputSource {
             .get(self.cursor)
             .copied()
             .ok_or(InputSourceError::ReplayExhausted { ordinal: next })?;
-        self.cursor += 1;
+        self.cursor = next_cursor;
         Ok(bundle)
     }
 }
@@ -1139,6 +1145,49 @@ mod tests {
                 ordinal: ControllerPollOrdinal::new(2)
             })
         );
+    }
+
+    #[test]
+    fn ordinal_overflow_rejects_before_consuming_or_recording_input() {
+        let maximum = ControllerPollOrdinal::new(u64::MAX);
+        let maximum_bundle = InputBundle::try_new(
+            SESSION,
+            maximum,
+            [
+                (ControllerPort::PORT_1, ContInput::default()),
+                (ControllerPort::PORT_2, ContInput::default()),
+            ],
+        )
+        .unwrap();
+        let maximum_request = InputPollRequest::new(SESSION, maximum, ports());
+
+        let mut broker =
+            DeterministicInputBroker::new(SESSION, ports(), NonZeroUsize::new(1).unwrap(), maximum)
+                .unwrap();
+        broker.submit(maximum_bundle).unwrap();
+        assert_eq!(
+            broker.take_for_poll(maximum_request),
+            Err(InputSourceError::OrdinalExhausted)
+        );
+        assert_eq!(
+            broker.submit(maximum_bundle),
+            Err(BrokerSubmitError::Duplicate { ordinal: maximum })
+        );
+
+        let mut recording = InputRecording::new(SESSION, ports(), maximum).unwrap();
+        assert_eq!(
+            recording.append(maximum_bundle),
+            Err(InputRecordingError::OrdinalExhausted)
+        );
+        assert!(recording.bundles().is_empty());
+
+        let mut replay = ReplayInputSource::new(recording);
+        replay.cursor = usize::MAX;
+        assert_eq!(
+            replay.take_for_poll(maximum_request),
+            Err(InputSourceError::OrdinalExhausted)
+        );
+        assert_eq!(replay.cursor, usize::MAX);
     }
 
     #[test]
