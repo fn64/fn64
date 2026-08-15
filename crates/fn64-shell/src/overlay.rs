@@ -76,6 +76,15 @@ impl Overlay {
         }
     }
 
+    /// Create the egui GPU pipeline while the window is still being set up.
+    /// `Renderer::new` is a one-time host cost; deferring it until F1 makes
+    /// opening settings the frame that pays for shader/pipeline creation.
+    pub fn prepare(&mut self, pixels: &pixels::Pixels<'static>) {
+        self.renderer.get_or_insert_with(|| {
+            egui_wgpu::Renderer::new(pixels.device(), pixels.surface_texture_format(), None, 1)
+        });
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.capture = None;

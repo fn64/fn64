@@ -36,6 +36,11 @@ overlay therefore hand-rolls ~40 lines of event translation (cursor, clicks,
 scroll) rather than taking `egui-winit`. **Any port must carry that constraint,
 not rediscover it.**
 
+The shell also creates the egui-wgpu renderer during window setup. That keeps
+the backend's one-time shader/pipeline creation off the first frame in which
+the player presses F1; game shells that include this module call
+`Overlay::prepare` immediately after constructing their Pixels surface.
+
 WM2000 consumes the module through the same `#[path]` seam as its input map and
 gamepad support. Opening the modal clears held keyboard state, supplies neutral
 live input while editing, consumes armed keyboard/gamepad captures, and leaves
