@@ -148,11 +148,15 @@ const PREPARED_SOURCE_MODE_CONSUMED_V1: &str = "prepared_consumed";
 // remains a `const`. A title whose overlays tile differently gets its own
 // `shard_inventory.in` under `examples/<selector>/` and its own directory
 // tree; this file does not choose which one, `FN64_WM_SHARD_TITLE` does.
-const SHARD_INVENTORY: &[(&str, &str)] = &include!(concat!(
-    "../../../../examples/",
-    env!("FN64_WM_SHARD_DIR"),
-    "/shard_inventory.in"
-));
+// Staged into OUT_DIR by `build.rs`, NOT read from a sibling directory. The
+// former `include!("../../../../examples/", env!("FN64_WM_SHARD_DIR"), ...)`
+// made this crate uncompilable whenever the game packages were not present at
+// that exact relative path, which is precisely what blocked moving them to
+// their own repository. `FN64_SHARD_ROOT` now selects where they live and
+// build.rs copies the inventory in; unset, it resolves to the in-repo
+// `examples/` and the build is byte-identical to before.
+const SHARD_INVENTORY: &[(&str, &str)] =
+    &include!(concat!(env!("OUT_DIR"), "/shard_inventory.in"));
 const SHARD_COUNT: usize = SHARD_INVENTORY.len();
 const PREPARED_PACKAGES: [&str; SHARD_COUNT] = {
     let mut packages = [""; SHARD_COUNT];
