@@ -201,13 +201,110 @@ impl ApplicationHandler for Demo {
     }
 }
 
-/// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames.
+/// Write one converted field to a PNG without opening a window, so the demo is
+/// inspectable on a headless machine and in CI. Reuses the same
+/// filter-0 + stored-DEFLATE encoding as `examples/oot-boot`'s
+/// `dump_rgba5551_as_png`; no image crate is pulled in for a diagnostic dump.
+pub fn capture_png(path: &str, frame: u64) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+    paint_field(&mut rdram, frame);
+    let mut rgba = vec![0u8; FB_WIDTH * FB_HEIGHT * 4];
+    framebuffer::rgba5551_to_rgba8888(
+        fn64_runtime::RdramView::from_storage(&rdram),
+        fn64_runtime::RdramAddr::from_offset(0),
+        FB_WIDTH,
+        FB_WIDTH,
+        &mut rgba,
+    );
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+    fn adler32(data: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + u32::from(byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+    fn chunk(file: &mut std::fs::File, kind: &[u8; 4], data: &[u8]) -> std::io::Result<()> {
+        file.write_all(&(data.len() as u32).to_be_bytes())?;
+        file.write_all(kind)?;
+        file.write_all(data)?;
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        file.write_all(&crc32(&crc_input).to_be_bytes())
+    }
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])?;
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(FB_WIDTH as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(FB_HEIGHT as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
+    chunk(&mut file, b"IHDR", &ihdr)?;
+
+    let stride = FB_WIDTH * 4;
+    let mut raw = Vec::with_capacity((stride + 1) * FB_HEIGHT);
+    for row in 0..FB_HEIGHT {
+        raw.push(0u8); // filter type 0
+        raw.extend_from_slice(&rgba[row * stride..(row + 1) * stride]);
+    }
+    // zlib-wrapped stored DEFLATE: valid, just not size-optimal.
+    let mut idat = vec![0x78, 0x01];
+    let mut offset = 0;
+    loop {
+        let block = (raw.len() - offset).min(65535);
+        let final_block = offset + block >= raw.len();
+        idat.push(u8::from(final_block));
+        idat.extend_from_slice(&(block as u16).to_le_bytes());
+        idat.extend_from_slice(&(!(block as u16)).to_le_bytes());
+        idat.extend_from_slice(&raw[offset..offset + block]);
+        offset += block;
+        if final_block {
+            break;
+        }
+    }
+    idat.extend_from_slice(&adler32(&raw).to_be_bytes());
+    chunk(&mut file, b"IDAT", &idat)?;
+    chunk(&mut file, b"IEND", &[])?;
+    Ok(())
+}
+
+/// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames;
+/// `FN64_DEMO_PNG=path` writes one field and exits without opening a window.
 pub fn run() {
     let max_frames = std::env::var("FN64_DEMO_FRAMES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
 
     println!("[fn64-demo] content-free UI demo: synthetic framebuffer, no ROM, no recompilation.");
+
+    // Headless capture: no display needed, so this works over ssh and in CI.
+    if let Ok(path) = std::env::var("FN64_DEMO_PNG") {
+        let frame = max_frames.unwrap_or(0);
+        match capture_png(&path, frame) {
+            Ok(()) => println!("[fn64-demo] wrote {path} (frame {frame}, {FB_WIDTH}x{FB_HEIGHT})"),
+            Err(e) => {
+                eprintln!("[fn64-demo] failed to write {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if let Some(n) = max_frames {
         println!("[fn64-demo] will exit after {n} frames (FN64_DEMO_FRAMES)");
     }
