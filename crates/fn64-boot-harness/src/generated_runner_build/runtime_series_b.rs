@@ -33,7 +33,7 @@ pub fn parse_generated_runner_host_abi_runtime_report_v1(
     Ok(report)
 }
 
-pub fn run_wm2000_generated_runner_host_abi_runtime_series_v1(
+pub fn run_generated_runner_host_abi_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerHostAbiRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_host_abi_runtime_series_evidence_v1(&build)?;
@@ -401,7 +401,7 @@ pub fn parse_generated_runner_pi_runtime_report_v1(
     Ok(report)
 }
 
-pub fn run_wm2000_generated_runner_pi_runtime_series_v1(
+pub fn run_generated_runner_pi_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerPiRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_pi_runtime_series_evidence_v1(&build)?;
@@ -775,7 +775,7 @@ pub fn parse_generated_runner_rdp_renderer_runtime_report_v1(
     Ok(report)
 }
 
-pub fn run_wm2000_generated_runner_rdp_renderer_runtime_series_v1(
+pub fn run_generated_runner_rdp_renderer_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerRdpRendererRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_rdp_renderer_runtime_series_evidence_v1(&build)?;

@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn validate_inputs(
-    inputs: &Wm2000GeneratedRunnerBuildInputsV1,
+    inputs: &GeneratedRunnerBuildInputsV1,
 ) -> Result<(), GeneratedRunnerBuildError> {
     validate_input_path(&inputs.rom, "ROM")?;
     validate_input_path(&inputs.boot_context, "BootContext")?;
@@ -46,9 +46,9 @@ pub(super) fn validate_input_path(path: &Path, label: &str) -> Result<(), Genera
 }
 
 pub(super) fn stage_private_inputs(
-    inputs: &Wm2000GeneratedRunnerBuildInputsV1,
+    inputs: &GeneratedRunnerBuildInputsV1,
     scratch: &Path,
-) -> Result<Wm2000GeneratedRunnerBuildInputsV1, GeneratedRunnerBuildError> {
+) -> Result<GeneratedRunnerBuildInputsV1, GeneratedRunnerBuildError> {
     let directory = scratch.join("private-inputs");
     fs::create_dir(&directory).map_err(|source| {
         error(format!(
@@ -78,13 +78,13 @@ pub(super) fn stage_private_inputs(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Wm2000ExecutableImageGroupV1 {
+            Ok(ExecutableImageGroupV1 {
                 environment_name: group.environment_name.clone(),
                 captures,
             })
         })
         .collect::<Result<Vec<_>, GeneratedRunnerBuildError>>()?;
-    Ok(Wm2000GeneratedRunnerBuildInputsV1 {
+    Ok(GeneratedRunnerBuildInputsV1 {
         rom,
         boot_context,
         executable_image_groups,
@@ -130,7 +130,7 @@ pub(super) fn stage_private_input_file(
 }
 
 pub(super) fn private_inputs_sha256(
-    inputs: &Wm2000GeneratedRunnerBuildInputsV1,
+    inputs: &GeneratedRunnerBuildInputsV1,
 ) -> Result<String, GeneratedRunnerBuildError> {
     let mut digest = Sha256::new();
     digest.update(b"fn64.wm2000-generated-runner-private-inputs.v2\0");

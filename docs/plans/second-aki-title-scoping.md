@@ -537,7 +537,7 @@ are **not** independent per-title constants. The 37-entry inventory file is the
 single source of truth and already describes itself that way.
 
 Alongside it, `generated_runner_build/build.rs` hardcodes the same directory
-**six times** (`:867`, `:874`, `:876`, `:882`, `:888` and `wm_shard_root`).
+**six times** (`:867`, `:874`, `:876`, `:882`, `:888` and `shard_root`).
 
 **So the per-title surface is one `include!` path plus six string literals in
 one file** — not a build-system redesign. A second title needs its own shard

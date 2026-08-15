@@ -122,8 +122,8 @@ pub(super) fn cargo_config_sha256_v3(
 /// `platform_certification`: this reuses that executable identity, invokes a
 /// frozen standalone build in a fresh target directory, accepts exactly one
 /// matching compiler artifact, and launches only its fixed identity mode.
-pub fn build_wm2000_generated_runner_v1(
-    inputs: Wm2000GeneratedRunnerBuildInputsV1,
+pub fn build_generated_runner_v1(
+    inputs: GeneratedRunnerBuildInputsV1,
 ) -> Result<VerifiedGeneratedRunnerBuildV1, GeneratedRunnerBuildError> {
     validate_inputs(&inputs)?;
     let workspace = repository_workspace()?;
@@ -132,11 +132,11 @@ pub fn build_wm2000_generated_runner_v1(
     let lock = package_root.join("Cargo.lock");
     let manifest_sha256 = sha256_file(&manifest, "WM generated-runner manifest")?;
     let lock_sha256 = sha256_file(&lock, "WM generated-runner lockfile")?;
-    let prepared_source_mode = wm_prepared_source_mode_v3(&package_root)?;
-    let expected_root_adapter_source_sha256 = wm_root_adapter_source_sha256(&package_root)?;
+    let prepared_source_mode = prepared_source_mode_v3(&package_root)?;
+    let expected_root_adapter_source_sha256 = root_adapter_source_sha256(&package_root)?;
     let expected_shard_source_sha256 =
-        wm_shard_cargo_source_sha256(&package_root, prepared_source_mode)?;
-    let expected_emitter_source_sha256 = wm_emitter_source_sha256(&workspace)?;
+        shard_cargo_source_sha256(&package_root, prepared_source_mode)?;
+    let expected_emitter_source_sha256 = emitter_source_sha256(&workspace)?;
     let expected_runtime_source_sha256 =
         hex(&fn64_recomp_rs::generated_runner_runtime_source_receipt_v1().source_sha256());
     let prepared_claims = prepared_source_claims_v3(&workspace)?;
@@ -206,7 +206,7 @@ pub fn build_wm2000_generated_runner_v1(
     )?;
     build_environment.revalidate()?;
     if prepared_source_claims_v3(&workspace)? != prepared_claims
-        || wm_prepared_source_mode_v3(&package_root)? != prepared_source_mode
+        || prepared_source_mode_v3(&package_root)? != prepared_source_mode
     {
         return Err(error(
             "prepared source authority changed during Cargo build",
@@ -243,7 +243,7 @@ pub fn build_wm2000_generated_runner_v1(
     }
     validate_prepared_identity_v3(&identity, &prepared, &producer, prepared_source_mode)?;
     if prepared_source_claims_v3(&workspace)? != prepared_claims
-        || wm_prepared_source_mode_v3(&package_root)? != prepared_source_mode
+        || prepared_source_mode_v3(&package_root)? != prepared_source_mode
     {
         return Err(error(
             "prepared source authority changed during identity child",
@@ -852,7 +852,7 @@ pub(super) fn cargo_metadata_source_sha256(metadata: &[u8]) -> Result<String, Ge
     Ok(hex(&digest.finalize()))
 }
 
-pub(super) fn wm_root_adapter_source_sha256(package_root: &Path) -> Result<String, GeneratedRunnerBuildError> {
+pub(super) fn root_adapter_source_sha256(package_root: &Path) -> Result<String, GeneratedRunnerBuildError> {
     source_tree_sha256(
         package_root,
         b"fn64:wm2000-root-adapter-source:v1:",
@@ -860,18 +860,18 @@ pub(super) fn wm_root_adapter_source_sha256(package_root: &Path) -> Result<Strin
     )
 }
 
-pub(super) fn wm_shard_root(package_root: &Path) -> Result<PathBuf, GeneratedRunnerBuildError> {
+pub(super) fn shard_root(package_root: &Path) -> Result<PathBuf, GeneratedRunnerBuildError> {
     Ok(package_root
         .parent()
         .ok_or_else(|| error("WM root package has no examples parent"))?
         .join(env!("FN64_WM_SHARD_DIR")))
 }
 
-pub(super) fn wm_shard_cargo_source_sha256(
+pub(super) fn shard_cargo_source_sha256(
     package_root: &Path,
     prepared_source_mode: &str,
 ) -> Result<String, GeneratedRunnerBuildError> {
-    let shard_root = wm_shard_root(package_root)?;
+    let shard_root = shard_root(package_root)?;
     let mut files = vec![(
         format!("../{}/lib.rs", env!("FN64_WM_SHARD_DIR")),
         shard_root.join("lib.rs"),
@@ -924,10 +924,10 @@ pub(super) fn wm_shard_cargo_source_sha256(
     Ok(hex(&digest.finalize()))
 }
 
-pub(super) fn wm_prepared_source_mode_v3(
+pub(super) fn prepared_source_mode_v3(
     package_root: &Path,
 ) -> Result<&'static str, GeneratedRunnerBuildError> {
-    let shard_root = wm_shard_root(package_root)?;
+    let shard_root = shard_root(package_root)?;
     let manifests = exact_shard_manifests(&shard_root)?;
     let mut legacy = 0usize;
     let mut prepared = 0usize;
@@ -1100,7 +1100,7 @@ pub(super) fn prepared_source_claims_v3(
             &workspace.join("crates/fn64-discover"),
             b"fn64.wm-prepared-discovery-source.v1\0",
         )?,
-        emitter_source_sha256: wm_emitter_source_sha256(workspace)?,
+        emitter_source_sha256: emitter_source_sha256(workspace)?,
         runtime_source_sha256: hex(
             &fn64_recomp_rs::generated_runner_runtime_source_receipt_v1().source_sha256(),
         ),
@@ -1111,7 +1111,7 @@ pub(super) fn prepared_source_claims_v3(
     })
 }
 
-pub(super) fn wm_emitter_source_sha256(workspace: &Path) -> Result<String, GeneratedRunnerBuildError> {
+pub(super) fn emitter_source_sha256(workspace: &Path) -> Result<String, GeneratedRunnerBuildError> {
     let root = workspace.join("crates/fn64-recomp-rs-codegen");
     let mut digest = Sha256::new();
     digest.update(b"fn64:generated-runner-emitter-source:v2:");
@@ -1640,7 +1640,7 @@ pub(super) fn build_selected_binary(
     memory_guard: &Path,
     cargo: &Path,
     manifest: &Path,
-    inputs: &Wm2000GeneratedRunnerBuildInputsV1,
+    inputs: &GeneratedRunnerBuildInputsV1,
     prepared: &PreparedTreeMeasurementV3,
     producer: &ProducerBuildMeasurementV3,
     prepared_source_mode: &str,
@@ -1692,7 +1692,7 @@ pub(super) fn guarded_build_command(
     memory_guard: &Path,
     cargo: &Path,
     manifest: &Path,
-    inputs: &Wm2000GeneratedRunnerBuildInputsV1,
+    inputs: &GeneratedRunnerBuildInputsV1,
     prepared: &PreparedTreeMeasurementV3,
     producer: &ProducerBuildMeasurementV3,
     prepared_source_mode: &str,

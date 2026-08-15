@@ -36,7 +36,7 @@ pub fn parse_generated_runner_bootstrap_runtime_report_v1(
     Ok(report)
 }
 
-pub fn run_wm2000_generated_runner_bootstrap_runtime_series_v1(
+pub fn run_generated_runner_bootstrap_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerBootstrapRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_bootstrap_runtime_series_evidence_v1(&build)?;
@@ -546,7 +546,7 @@ pub fn parse_generated_runner_cpu_runtime_report_v1(
     Ok(report)
 }
 
-pub fn run_wm2000_generated_runner_cpu_runtime_series_v1(
+pub fn run_generated_runner_cpu_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerCpuRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_cpu_runtime_series_evidence_v1(&build)?;
