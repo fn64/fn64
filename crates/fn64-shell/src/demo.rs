@@ -171,23 +171,36 @@ impl ApplicationHandler for Demo {
             // the same bindings as the game path (`main.rs`), so the demo
             // teaches the real shortcuts rather than demo-only ones.
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        match code {
-                            KeyCode::F1 => {
-                                self.overlay.toggle();
-                                println!(
-                                    "[fn64-demo] settings overlay {}",
-                                    if self.overlay.open { "opened" } else { "closed" }
-                                );
-                            }
-                            KeyCode::Escape if self.overlay.open => {
-                                self.overlay.toggle();
-                                println!("[fn64-demo] settings overlay closed");
-                            }
-                            _ => {}
+                if event.repeat || event.state != ElementState::Pressed {
+                    return;
+                }
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                if code == KeyCode::F1 {
+                    self.overlay.toggle();
+                    println!(
+                        "[fn64-demo] settings overlay {}",
+                        if self.overlay.open { "opened" } else { "closed" }
+                    );
+                    return;
+                }
+                if self.overlay.open {
+                    if code == KeyCode::Escape {
+                        // Armed capture? Cancel it. Otherwise close. Same
+                        // precedence as the game path, or Escape would abandon
+                        // a rebind AND shut the panel in one press.
+                        if self.overlay.capture.is_some() {
+                            self.overlay.capture = None;
+                        } else {
+                            self.overlay.toggle();
+                            println!("[fn64-demo] settings overlay closed");
                         }
+                        return;
                     }
+                    // Feed the armed rebind. Without this the panel advertises
+                    // "press a key to bind" and silently ignores every press.
+                    self.overlay.apply_key_capture(&mut self.config, code);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -248,116 +261,29 @@ impl ApplicationHandler for Demo {
         // gilrs only advances its state when its queue is drained, so the
         // overlay's pad-rebind capture needs this even with no pad attached.
         self.gamepads.poll();
+        // Drain the press and feed an armed pad capture, as the game path
+        // does. Polling without draining leaves pad rebinding permanently
+        // inert while the UI says it is listening.
+        let pad_press = self.gamepads.take_pressed();
+        if matches!(self.overlay.capture, Some(crate::overlay::Capture::Pad(_))) {
+            if let Some(button) = pad_press {
+                self.overlay.apply_pad_capture(&mut self.config, button);
+            }
+        }
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
     }
 }
 
-/// Write one converted field to a PNG without opening a window, so the demo is
-/// inspectable on a headless machine and in CI. Reuses the same
-/// filter-0 + stored-DEFLATE encoding as `examples/oot-boot`'s
-/// `dump_rgba5551_as_png`; no image crate is pulled in for a diagnostic dump.
-pub fn capture_png(path: &str, frame: u64) -> std::io::Result<()> {
-    use std::io::Write;
 
-    let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
-    paint_field(&mut rdram, frame);
-    let mut rgba = vec![0u8; FB_WIDTH * FB_HEIGHT * 4];
-    framebuffer::rgba5551_to_rgba8888(
-        fn64_runtime::RdramView::from_storage(&rdram),
-        fn64_runtime::RdramAddr::from_offset(0),
-        FB_WIDTH,
-        FB_WIDTH,
-        &mut rgba,
-    );
-
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = 0xFFFF_FFFFu32;
-        for &byte in data {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            }
-        }
-        !crc
-    }
-    fn adler32(data: &[u8]) -> u32 {
-        let (mut a, mut b) = (1u32, 0u32);
-        for &byte in data {
-            a = (a + u32::from(byte)) % 65521;
-            b = (b + a) % 65521;
-        }
-        (b << 16) | a
-    }
-    fn chunk(file: &mut std::fs::File, kind: &[u8; 4], data: &[u8]) -> std::io::Result<()> {
-        file.write_all(&(data.len() as u32).to_be_bytes())?;
-        file.write_all(kind)?;
-        file.write_all(data)?;
-        let mut crc_input = Vec::with_capacity(4 + data.len());
-        crc_input.extend_from_slice(kind);
-        crc_input.extend_from_slice(data);
-        file.write_all(&crc32(&crc_input).to_be_bytes())
-    }
-
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])?;
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&(FB_WIDTH as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(FB_HEIGHT as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
-    chunk(&mut file, b"IHDR", &ihdr)?;
-
-    let stride = FB_WIDTH * 4;
-    let mut raw = Vec::with_capacity((stride + 1) * FB_HEIGHT);
-    for row in 0..FB_HEIGHT {
-        raw.push(0u8); // filter type 0
-        raw.extend_from_slice(&rgba[row * stride..(row + 1) * stride]);
-    }
-    // zlib-wrapped stored DEFLATE: valid, just not size-optimal.
-    let mut idat = vec![0x78, 0x01];
-    let mut offset = 0;
-    loop {
-        let block = (raw.len() - offset).min(65535);
-        let final_block = offset + block >= raw.len();
-        idat.push(u8::from(final_block));
-        idat.extend_from_slice(&(block as u16).to_le_bytes());
-        idat.extend_from_slice(&(!(block as u16)).to_le_bytes());
-        idat.extend_from_slice(&raw[offset..offset + block]);
-        offset += block;
-        if final_block {
-            break;
-        }
-    }
-    idat.extend_from_slice(&adler32(&raw).to_be_bytes());
-    chunk(&mut file, b"IDAT", &idat)?;
-    chunk(&mut file, b"IEND", &[])?;
-    Ok(())
-}
-
-/// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames;
-/// `FN64_DEMO_PNG=path` writes one field and exits without opening a window.
+/// Run the demo window. `FN64_DEMO_FRAMES=N` exits after N frames.
 pub fn run() {
     let max_frames = std::env::var("FN64_DEMO_FRAMES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
 
     println!("[fn64-demo] content-free UI demo: synthetic framebuffer, no ROM, no recompilation.");
-
-    // Headless capture: no display needed, so this works over ssh and in CI.
-    if let Ok(path) = std::env::var("FN64_DEMO_PNG") {
-        let frame = max_frames.unwrap_or(0);
-        match capture_png(&path, frame) {
-            Ok(()) => println!("[fn64-demo] wrote {path} (frame {frame}, {FB_WIDTH}x{FB_HEIGHT})"),
-            Err(e) => {
-                eprintln!("[fn64-demo] failed to write {path}: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
     println!("[fn64-demo] F1 = settings overlay, Escape = close it, window close = quit.");
     if let Some(n) = max_frames {
         println!("[fn64-demo] will exit after {n} frames (FN64_DEMO_FRAMES)");
@@ -376,9 +302,15 @@ pub fn run() {
         window: None,
         pixels: None,
         overlay: Overlay::new(),
-        // Default rather than `InputConfig::load()`: the demo must not read or
-        // rewrite the user's real keybind file as a side effect of being run.
-        config: InputConfig::default(),
+        // Default rather than `InputConfig::load()` so the demo does not READ
+        // the user's bindings, and `persist: false` so it cannot WRITE them:
+        // the overlay calls `config.save()` whenever a widget marks the config
+        // dirty (dragging the deadzone slider does), which would otherwise
+        // serialize these shipped defaults over a real `input.toml`.
+        config: InputConfig {
+            persist: false,
+            ..InputConfig::default()
+        },
         gamepads: Gamepads::new(),
         rdram: vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE],
         rgba: vec![0; FB_WIDTH * FB_HEIGHT * 4],
@@ -432,5 +364,48 @@ mod tests {
             framebuffer::rgba_hash(&rgba),
             "the sweep must advance between frames"
         );
+    }
+
+    /// Pins CHANNEL ORDER and ROW STRIDE at exact coordinates.
+    ///
+    /// The liveness test above passes even with R/B swapped or the row stride
+    /// off by one -- both produce a non-uniform, animating image. Only exact
+    /// pixels catch those, and they are the two failures `paint_field`'s doc
+    /// comment claims the pattern proves.
+    #[test]
+    fn corner_markers_are_red_at_exact_coordinates() {
+        let mut rdram = vec![0u8; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE];
+        let mut rgba = vec![0u8; FB_WIDTH * FB_HEIGHT * 4];
+        paint_field(&mut rdram, 0);
+        framebuffer::rgba5551_to_rgba8888(
+            fn64_runtime::RdramView::from_storage(&rdram),
+            fn64_runtime::RdramAddr::from_offset(0),
+            FB_WIDTH,
+            FB_WIDTH,
+            &mut rgba,
+        );
+        let px = |x: usize, y: usize| {
+            let i = (y * FB_WIDTH + x) * 4;
+            (rgba[i], rgba[i + 1], rgba[i + 2])
+        };
+
+        // Red corner markers: pure red pins channel order (a R/B swap makes
+        // these blue), and checking all four corners pins the row stride (an
+        // off-by-one walks the bottom row off its column).
+        for (x, y) in [
+            (0, 0),
+            (FB_WIDTH - 1, 0),
+            (0, FB_HEIGHT - 1),
+            (FB_WIDTH - 1, FB_HEIGHT - 1),
+        ] {
+            assert_eq!(
+                px(x, y),
+                (255, 0, 0),
+                "corner marker at ({x},{y}) must be pure red"
+            );
+        }
+        // Just inside the marker is NOT red, so the markers are 4px and the
+        // whole field did not simply come out red.
+        assert_ne!(px(4, 4), (255, 0, 0), "the marker must stop at 4px");
     }
 }
