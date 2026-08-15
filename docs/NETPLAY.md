@@ -65,7 +65,9 @@ bundles instead use `ControllerPollOrdinal`, one SI/PIF read transaction for
 the session's fixed port set. These clocks are separate types because channel
 prefixes and port presence can make the per-port successful-operation counts
 diverge. A schedule's neutral value outside a declared phase is part of that
-complete local script, not a netplay fallback.
+complete local script, not a netplay fallback. Its retained raw-index
+compatibility method traps when the caller names a port outside `0..=3`;
+neutral input never hides an invalid physical port.
 
 ## Remaining SI integration seam
 

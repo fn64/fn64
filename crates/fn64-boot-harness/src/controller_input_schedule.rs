@@ -45,9 +45,8 @@ impl ControllerInputSchedule {
     /// Compatibility edge for existing scripted boot hosts. New input paths
     /// should retain the typed port and ordinal through the poll boundary.
     pub fn input_for_read(&self, port: usize, read_ordinal: u64) -> ContInput {
-        let Ok(port) = ControllerPort::try_from(port) else {
-            return ContInput::default();
-        };
+        let port = ControllerPort::try_from(port)
+            .unwrap_or_else(|error| panic!("ControllerInputSchedule::input_for_read: {error}"));
         self.input_for_typed_read(port, ControllerReadOrdinal::new(read_ordinal))
     }
 
@@ -270,6 +269,16 @@ mod tests {
         assert_eq!(schedule.phases().len(), 3);
         let expected: [u8; 32] = Sha256::digest(source).into();
         assert_eq!(schedule.source_sha256(), expected);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ControllerInputSchedule::input_for_read: controller port 4 is outside physical ports 0..=3"
+    )]
+    fn raw_compatibility_edge_rejects_an_invalid_port_loudly() {
+        let schedule =
+            parse_controller_input_schedule(b"fn64.controller-input-schedule.v1\n").unwrap();
+        let _ = schedule.input_for_read(4, 0);
     }
 
     #[test]
