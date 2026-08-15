@@ -23,14 +23,17 @@
 //! a loaded capture if a real frame is ever needed and licensable.
 
 use crate::framebuffer::{self, FB_HEIGHT, FB_WIDTH};
+use crate::gamepad::Gamepads;
+use crate::input_map::InputConfig;
 use crate::overlay::Overlay;
 use std::sync::Arc;
 
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 /// One RGBA5551 pixel, N64 layout: `RRRRRGGG GGBBBBB1`.
@@ -96,6 +99,12 @@ struct Demo {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
     overlay: Overlay,
+    /// The settings the overlay edits. Real `InputConfig`, so the demo
+    /// exercises the production settings UI rather than a mock panel.
+    config: InputConfig,
+    /// The overlay's rebind UI reads live pad state; empty without a
+    /// controller, which is a valid state rather than a special demo case.
+    gamepads: Gamepads,
     rdram: Vec<u8>,
     rgba: Vec<u8>,
     frame: u64,
@@ -156,6 +165,29 @@ impl ApplicationHandler for Demo {
                     let _ = px.resize_surface(new_size.width, new_size.height);
                 }
             }
+            // F1 opens/closes the settings overlay, Escape closes it --
+            // the same bindings as the game path (`main.rs`), so the demo
+            // teaches the real shortcuts rather than demo-only ones.
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        match code {
+                            KeyCode::F1 => {
+                                self.overlay.toggle();
+                                println!(
+                                    "[fn64-demo] settings overlay {}",
+                                    if self.overlay.open { "opened" } else { "closed" }
+                                );
+                            }
+                            KeyCode::Escape if self.overlay.open => {
+                                self.overlay.toggle();
+                                println!("[fn64-demo] settings overlay closed");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 paint_field(&mut self.rdram, self.frame);
                 framebuffer::rgba5551_to_rgba8888(
@@ -167,11 +199,27 @@ impl ApplicationHandler for Demo {
                 );
                 if let Some(px) = self.pixels.as_mut() {
                     px.frame_mut().copy_from_slice(&self.rgba);
-                    if let Err(e) = px.render() {
-                        eprintln!("[fn64-demo] render error: {e}");
-                        event_loop.exit();
-                        return;
-                    }
+                }
+                // Same branch the game path takes: the overlay composites over
+                // the presented field, so an open overlay renders through
+                // egui instead of the plain pixels present.
+                let render_result = if self.overlay.open {
+                    let window = self.window.as_ref().expect("window exists with pixels");
+                    let size = window.inner_size();
+                    self.overlay.render_over(
+                        self.pixels.as_ref().expect("checked above"),
+                        (size.width.max(1), size.height.max(1)),
+                        window.scale_factor() as f32,
+                        &mut self.config,
+                        &self.gamepads,
+                    )
+                } else {
+                    self.pixels.as_ref().expect("checked above").render()
+                };
+                if let Err(e) = render_result {
+                    eprintln!("[fn64-demo] render error: {e}");
+                    event_loop.exit();
+                    return;
                 }
                 self.frame += 1;
                 // Periodic proof-of-life: a window that opens but never
@@ -195,6 +243,9 @@ impl ApplicationHandler for Demo {
     /// never starts: nothing asks for the FIRST frame, so the window opens and
     /// stays blank.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // gilrs only advances its state when its queue is drained, so the
+        // overlay's pad-rebind capture needs this even with no pad attached.
+        self.gamepads.poll();
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
@@ -305,6 +356,7 @@ pub fn run() {
         return;
     }
 
+    println!("[fn64-demo] F1 = settings overlay, Escape = close it, window close = quit.");
     if let Some(n) = max_frames {
         println!("[fn64-demo] will exit after {n} frames (FN64_DEMO_FRAMES)");
     }
@@ -322,6 +374,10 @@ pub fn run() {
         window: None,
         pixels: None,
         overlay: Overlay::new(),
+        // Default rather than `InputConfig::load()`: the demo must not read or
+        // rewrite the user's real keybind file as a side effect of being run.
+        config: InputConfig::default(),
+        gamepads: Gamepads::new(),
         rdram: vec![0; fn64_runtime::rdram::DEFAULT_RDRAM_SIZE],
         rgba: vec![0; FB_WIDTH * FB_HEIGHT * 4],
         frame: 0,
