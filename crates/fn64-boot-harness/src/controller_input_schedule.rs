@@ -5,7 +5,7 @@
 //! independently by its successful read ordinal gives fn64 and a black-box
 //! emulator input plugin the same replay clock.
 
-use fn64_runtime::ContInput;
+use fn64_runtime::{ContInput, ControllerPort, ControllerReadOrdinal};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -13,9 +13,9 @@ pub const CONTROLLER_INPUT_SCHEDULE_SCHEMA: &str = "fn64.controller-input-schedu
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControllerInputPhase {
-    pub port: u8,
-    pub first_read: u64,
-    pub end_read: u64,
+    pub port: ControllerPort,
+    pub first_read: ControllerReadOrdinal,
+    pub end_read: ControllerReadOrdinal,
     pub input: ContInput,
 }
 
@@ -26,16 +26,29 @@ pub struct ControllerInputSchedule {
 }
 
 impl ControllerInputSchedule {
-    pub fn input_for_read(&self, port: usize, read_ordinal: u64) -> ContInput {
+    pub fn input_for_typed_read(
+        &self,
+        port: ControllerPort,
+        read_ordinal: ControllerReadOrdinal,
+    ) -> ContInput {
         self.phases
             .iter()
             .find(|phase| {
-                usize::from(phase.port) == port
+                phase.port == port
                     && read_ordinal >= phase.first_read
                     && read_ordinal < phase.end_read
             })
             .map(|phase| phase.input)
             .unwrap_or_default()
+    }
+
+    /// Compatibility edge for existing scripted boot hosts. New input paths
+    /// should retain the typed port and ordinal through the poll boundary.
+    pub fn input_for_read(&self, port: usize, read_ordinal: u64) -> ContInput {
+        let Ok(port) = ControllerPort::try_from(port) else {
+            return ContInput::default();
+        };
+        self.input_for_typed_read(port, ControllerReadOrdinal::new(read_ordinal))
     }
 
     pub const fn source_sha256(&self) -> [u8; 32] {
@@ -74,7 +87,7 @@ impl ControllerInputSchedule {
         let mut driven = [false; 4];
         for phase in &self.phases {
             if phase.input != ContInput::default() {
-                driven[usize::from(phase.port)] = true;
+                driven[phase.port.index()] = true;
             }
         }
         driven
@@ -197,9 +210,9 @@ pub fn parse_controller_input_schedule(
         let stick_x: i8 = parse_number(stick_x, line_number, "stick_x")?;
         let stick_y: i8 = parse_number(stick_y, line_number, "stick_y")?;
         phases.push(ControllerInputPhase {
-            port,
-            first_read,
-            end_read,
+            port: ControllerPort::try_from(port).expect("validated physical controller port"),
+            first_read: ControllerReadOrdinal::new(first_read),
+            end_read: ControllerReadOrdinal::new(end_read),
             input: ContInput {
                 button: buttons,
                 stick_x,
