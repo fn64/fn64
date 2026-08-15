@@ -4,7 +4,7 @@ Decided 2026-07-16 (user + session). Three phases; R and D run as **parallel
 wave tracks** (disjoint crates). Render endgame this phase: **RT64 as the
 faithful renderer, wgpu port deferred to Phase P**. Executor mix:
 **codex-heavy implementation waves, session-model adversarial verify + merge
-gate** (see DELEGATION.md).
+gate** (see DELEGATION.md). ROM target selection: see COVERAGE-CORPUS.md.
 
 Status legend: `[ ]` open, `[~]` dispatched/in-flight, `[x]` merged+verified
 (AGENTS.md bars). Update this file in the same commit as the work it tracks.
