@@ -247,7 +247,7 @@ pub fn note_dma_overlay_load(
             .load_sections_covered_by_dma(rom_addr, dest_vram, len);
         (exact, covered)
     });
-    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+    if crate::debug_boot_enabled() {
         eprintln!(
             "[DEBUG note_dma_overlay_load] rom={rom_addr:#010x} dest={dest_vram:#010x} \
              len={len:#x} -> exact={loaded:?} covered={covered:?}"

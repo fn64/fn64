@@ -1333,7 +1333,7 @@ impl Executor {
         msg: Mesg,
         attributed_thread: Option<ThreadId>,
     ) {
-        if std::env::var("FN64_DEBUG_SEND").is_ok() {
+        if crate::debug_send_diagnostics().enabled() {
             eprintln!(
                 "[DEBUG deliver_or_enqueue] queue_offset={:#x} msg={msg:#x} attributed_thread={attributed_thread:?}",
                 queue_addr.offset()
@@ -1409,7 +1409,7 @@ impl Executor {
         msg: Mesg,
         placement: SendPlacement,
     ) -> SendOutcome {
-        if std::env::var("FN64_DEBUG_SEND").is_ok() {
+        if crate::debug_send_diagnostics().enabled() {
             eprintln!(
                 "[DEBUG try_deliver_send] sender={sender} mq_addr_offset={:#x} msg={msg:#x} \
                  placement={placement:?}",

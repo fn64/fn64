@@ -179,11 +179,25 @@ use super::*;
         backend.create(&RenderConfig::ntsc(4, 2)).unwrap();
         prepare_renderer_rdram(&mut rdram);
         set_render_backend(Box::new(backend), rdram.len());
+        RAW_DPC_STAGING_SCRATCH.with(|cell| *cell.borrow_mut() = Vec::new());
 
         unsafe {
             dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &dmem, 0, (commands.len() * 8) as u32);
         }
+        let first_staging = RAW_DPC_STAGING_SCRATCH.with(|cell| {
+            let image = cell.borrow();
+            assert!(!image.is_empty());
+            (image.as_ptr(), image.capacity())
+        });
+        unsafe {
+            dispatch_raw_rdp_xbus(rdram.as_mut_ptr(), &dmem, 0, (commands.len() * 8) as u32);
+        }
+        let second_staging = RAW_DPC_STAGING_SCRATCH.with(|cell| {
+            let image = cell.borrow();
+            (image.as_ptr(), image.capacity())
+        });
 
+        assert_eq!(second_staging, first_staging);
         assert_eq!(last_render_error(), None);
         let view = fn64_runtime::RdramView::from_storage(&rdram);
         for index in 0..8 {
@@ -198,16 +212,28 @@ use super::*;
                 .into_iter()
                 .map(|event| event.kind)
                 .collect::<Vec<_>>(),
-            vec![RspRdpObservationKind::XbusDpcCommitted {
-                start: 0,
-                end: (commands.len() * 8) as u32,
-                command_sha256: canonical_rdp_words_sha256(
-                    &commands
-                        .into_iter()
-                        .flat_map(|(w0, w1)| [w0, w1])
-                        .collect::<Vec<_>>()
-                ),
-            }]
+            vec![
+                RspRdpObservationKind::XbusDpcCommitted {
+                    start: 0,
+                    end: (commands.len() * 8) as u32,
+                    command_sha256: canonical_rdp_words_sha256(
+                        &commands
+                            .into_iter()
+                            .flat_map(|(w0, w1)| [w0, w1])
+                            .collect::<Vec<_>>()
+                    ),
+                },
+                RspRdpObservationKind::XbusDpcCommitted {
+                    start: 0,
+                    end: (commands.len() * 8) as u32,
+                    command_sha256: canonical_rdp_words_sha256(
+                        &commands
+                            .into_iter()
+                            .flat_map(|(w0, w1)| [w0, w1])
+                            .collect::<Vec<_>>()
+                    ),
+                },
+            ]
         );
     }
 
@@ -1357,6 +1383,25 @@ use super::*;
         set_audio_digest_capture(false);
     }
 
+    #[test]
+    fn ai_pcm_decode_reuses_scratch_storage_across_buffers() {
+        AUDIO_SAMPLE_SCRATCH.with(|cell| *cell.borrow_mut() = Vec::new());
+        let mut rdram = vec![0u8; 16];
+        set_audio_rdram_len(rdram.len());
+
+        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 16) };
+        let first = AUDIO_SAMPLE_SCRATCH.with(|cell| {
+            let samples = cell.borrow();
+            (samples.as_ptr(), samples.capacity())
+        });
+        unsafe { deliver_ai_buffer(rdram.as_mut_ptr(), 0, 4) };
+        let second = AUDIO_SAMPLE_SCRATCH.with(|cell| {
+            let samples = cell.borrow();
+            (samples.as_ptr(), samples.capacity())
+        });
+
+        assert_eq!(second, first);
+    }
 
     #[test]
     fn malformed_or_failed_raw_dpc_backend_result_poisons_without_publication() {

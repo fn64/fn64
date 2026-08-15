@@ -28,6 +28,9 @@ thread_local! {
     /// The scheduler owns only this opaque token and immutable task identity;
     /// renderer-local stacks/state remain behind `RenderBackend`.
     pub(crate) static HLE_RENDER_CONTINUATION: RefCell<Option<HleRenderContinuation>> = const { RefCell::new(None) };
+    /// Reused full-RDRAM raw-DPC transaction image. Dispatch overwrites the
+    /// physical prefix and complete command suffix before renderer admission.
+    pub(crate) static RAW_DPC_STAGING_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 
     /// The single registered audio backend, if the shell/harness has called
     /// `set_audio_backend`. Finished samples enter it at
@@ -54,6 +57,9 @@ thread_local! {
     pub(crate) static AUDIO_PCM_STREAM_DUMP: RefCell<Option<AudioStreamDump>> = const { RefCell::new(None) };
     pub(crate) static AUDIO_OUTPUT_STATS: Cell<AudioOutputStats> = const { Cell::new(AudioOutputStats::new()) };
     pub(crate) static AUDIO_DIGEST_CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// Reused guest-order PCM decode storage. AI DMA delivery is synchronous,
+    /// so no backend can retain this slice after `queue_samples` returns.
+    pub(crate) static AUDIO_SAMPLE_SCRATCH: RefCell<Vec<i16>> = const { RefCell::new(Vec::new()) };
 
     /// Coarse wall-time attribution for the rs-lane OoT performance harness.
     /// Kept behind an environment flag so ordinary execution pays no

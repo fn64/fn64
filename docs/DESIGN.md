@@ -108,6 +108,10 @@ host latency rather than N64 hardware state. The host ring allocates its full
 250 ms bound before playback and keeps the producer's drop-oldest policy. The
 realtime callback never waits for the producer lock: a contended pull becomes
 counted silence, preserving callback deadlines without changing DMA progress.
+Guest-order AI sample decoding reuses one thread-owned buffer across
+submissions, and disabled audio diagnostics are launch-time cached values, so
+the ordinary DMA path neither reallocates its sample vector nor scans the
+process environment at buffer cadence.
 That split is also enforced by the Rust seam: guest and host sample rates are
 distinct nonzero types, `GuestPcm16` proves complete interleaved frames, and
 guest sample slots, host sample slots, host frames, and guest DMA bytes cannot
@@ -1703,13 +1707,24 @@ task calls out:
   and custom tasks execute from that persistent image through the clean-room
   scalar/vector interpreter: IMEM DMA replaces a generation and resumes at the
   saved PC; BREAK commits DMEM, RDRAM DMA writes, status, and DRAM/XBUS DPC
-  submissions before the guest resumes. Every renderer task and DRAM-backed
+  submissions before the guest resumes. Each submission owns exactly one
+  source-typed command image: logical XBUS bytes
+  or canonical RDRAM words captured at CMD_END, never independently mutable
+  copies of both. Deferred dispatch consumes and coalesces those owned images;
+  it does not reread a command range after later RSP writes can change it.
+  The release-evidence encoder derives the historical XBUS word image directly
+  from those owned logical bytes while serializing, preserving its established
+  wire schema without retaining a second mutable command representation.
+  Every renderer task and DRAM-backed
   raw-DPC entry receives an 8 MiB physical-RDRAM
   view. Registration must cover that complete device, including its final
   byte, while the generated-code allocation's appended MMIO/non-RDRAM backing is
   never exposed or transactionally cloned. Captured XBUS/LLE command words use
   a synthetic suffix and only the physical prefix is copied back, but RDP
-  commands can address that suffix during execution. Exact RT64 LLE captured-
+  commands can address that suffix during execution. The transaction image is
+  retained as thread-owned scratch after completion and completely overwritten
+  before its next admission; reuse changes allocation churn, not rollback or
+  evidence authority. Exact RT64 LLE captured-
   DPC execution therefore remains a release residual until the native seam
   accepts a separate command buffer and enforces physical-memory bounds. One
   fabric-owned DPC register file and typed

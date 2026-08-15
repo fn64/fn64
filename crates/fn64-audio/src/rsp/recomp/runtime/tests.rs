@@ -1,5 +1,56 @@
 use super::*;
 
+#[test]
+fn disabled_or_exhausted_dma_traces_do_not_build_the_payload() {
+    let sequence = AtomicU64::new(0);
+    let builds = std::cell::Cell::new(0);
+    let build = || {
+        builds.set(builds.get() + 1);
+        7u8
+    };
+
+    assert_eq!(build_dma_trace(None, false, &sequence, build), None);
+    assert_eq!(
+        build_dma_trace(
+            Some(DmaTraceConfig { limit: 0 }),
+            false,
+            &sequence,
+            build
+        ),
+        None
+    );
+    assert_eq!(
+        build_dma_trace(
+            Some(DmaTraceConfig { limit: 2 }),
+            true,
+            &sequence,
+            build
+        ),
+        None
+    );
+    assert_eq!(builds.get(), 0);
+
+    assert_eq!(
+        build_dma_trace(
+            Some(DmaTraceConfig { limit: 2 }),
+            false,
+            &sequence,
+            build
+        ),
+        Some((1, 7))
+    );
+    assert_eq!(builds.get(), 1);
+}
+
+#[test]
+fn disabled_dma_trace_does_not_parse_its_dependent_limit() {
+    assert_eq!(parse_dma_trace_config(false, Some("invalid")), None);
+    assert_eq!(
+        parse_dma_trace_config(true, Some("13")),
+        Some(DmaTraceConfig { limit: 13 })
+    );
+}
+
 fn populate_distinct_architectural_state(machine: &mut RspMachine<'_>) {
     machine.ctx.r = core::array::from_fn(|index| 0x1000_0000 | index as u32);
     machine.ctx.dma_dram_address = 0x0102_0304;
@@ -29,20 +80,12 @@ fn populate_distinct_architectural_state(machine: &mut RspMachine<'_>) {
     machine.dp_pipe_busy = 0xd1d2_d3d4;
     machine.dp_tmem_busy = 0xe1e2_e3e4;
     machine.dp_submissions = vec![
-        RspDpSubmission {
-            start: 0x100,
-            end: 0x108,
-            xbus: true,
-            payload: vec![0x01, 0x23, 0x45, 0x67],
-            words: vec![0x0123_4567],
-        },
-        RspDpSubmission {
-            start: 0x200,
-            end: 0x208,
-            xbus: false,
-            payload: Vec::new(),
-            words: vec![0x89ab_cdef],
-        },
+        RspDpSubmission::from_xbus_bytes(
+            0x100,
+            0x108,
+            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+        ),
+        RspDpSubmission::from_rdram_words(0x200, 0x208, vec![0x89ab_cdef, 0x0123_4567]),
     ];
 }
 
@@ -280,9 +323,12 @@ fn architectural_equality_distinguishes_each_owned_field() {
     assert_distinct!(|state: &mut RspArchitecturalState| state.dp_busy ^= 1);
     assert_distinct!(|state: &mut RspArchitecturalState| state.dp_pipe_busy ^= 1);
     assert_distinct!(|state: &mut RspArchitecturalState| state.dp_tmem_busy ^= 1);
-    assert_distinct!(
-        |state: &mut RspArchitecturalState| state.dp_submissions[0].payload[0] ^= 1
-    );
+    assert_distinct!(|state: &mut RspArchitecturalState| {
+        let RspDpCommandSource::XbusBytes(bytes) = &mut state.dp_submissions[0].source else {
+            panic!("first fixture submission must be XBUS")
+        };
+        bytes[0] ^= 1;
+    });
     assert_distinct!(|state: &mut RspArchitecturalState| state.dp_submissions.reverse());
 }
 
@@ -550,18 +596,16 @@ fn cp0_status_break_semaphore_and_dp_registers_are_observable() {
     assert_eq!(m.read_cp0(6), 0);
     assert_eq!(
         m.take_dp_submissions(),
-        vec![RspDpSubmission {
-            start: 0x000008,
-            end: 0x000018,
-            xbus: false,
-            payload: Vec::new(),
-            words: vec![0; 4],
-        }]
+        vec![RspDpSubmission::from_rdram_words(
+            0x000008,
+            0x000018,
+            vec![0; 4],
+        )]
     );
     m.write_cp0(11, 1 << 1);
     m.write_cp0(8, 0x80);
     m.write_cp0(9, 0x100);
-    assert!(m.take_dp_submissions()[0].xbus);
+    assert!(m.take_dp_submissions()[0].is_xbus());
 }
 
 #[test]
@@ -581,24 +625,29 @@ fn dpc_end_advances_submit_only_unconsumed_fifo_bytes() {
     assert_eq!(
         m.take_dp_submissions(),
         vec![
-            RspDpSubmission {
-                start: 0x180,
-                end: 0x1a0,
-                xbus: false,
-                payload: Vec::new(),
-                words: vec![0; 8],
-            },
-            RspDpSubmission {
-                start: 0x1a0,
-                end: 0x1c8,
-                xbus: false,
-                payload: Vec::new(),
-                words: vec![0; 10],
-            },
+            RspDpSubmission::from_rdram_words(0x180, 0x1a0, vec![0; 8]),
+            RspDpSubmission::from_rdram_words(0x1a0, 0x1c8, vec![0; 10]),
         ],
         "each END write starts at CURRENT rather than replaying from START"
     );
     assert_eq!(m.read_cp0(10), 0x1c8);
+}
+
+#[test]
+fn rdram_dpc_submission_owns_the_words_visible_at_cmd_end() {
+    let mut rdram = vec![0u8; 0x200];
+    write_rdram_word(&mut rdram, 0x100, 0x1122_3344);
+    write_rdram_word(&mut rdram, 0x104, 0x5566_7788);
+    let mut machine = RspMachine::new(&mut rdram);
+    machine.write_cp0(8, 0x100);
+    machine.write_cp0(9, 0x108);
+    write_rdram_word(machine.rdram, 0x100, 0xdead_beef);
+
+    let submission = machine.take_dp_submissions().pop().unwrap();
+    assert_eq!(
+        submission.source(),
+        &RspDpCommandSource::RdramWords(vec![0x1122_3344, 0x5566_7788])
+    );
 }
 
 fn write_rdram_word(rdram: &mut [u8], offset: usize, value: u32) {

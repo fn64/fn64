@@ -18,23 +18,44 @@ pub(crate) const RETIRED_ENV_VARS: &[(&str, &str)] = &[
     ),
 ];
 
+struct AudioDiagnostics {
+    trace_buffers: bool,
+    stream_dump_path: Option<std::path::PathBuf>,
+    one_shot_dump_path: Option<std::path::PathBuf>,
+}
+
+/// Audio evidence switches are launch-time configuration. AI delivery runs at
+/// the guest buffer cadence, so it must not rescan the process environment.
+fn audio_diagnostics() -> &'static AudioDiagnostics {
+    static CONFIG: std::sync::OnceLock<AudioDiagnostics> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| AudioDiagnostics {
+        trace_buffers: std::env::var_os("FN64_TRACE_AI_BUFFERS").is_some(),
+        stream_dump_path: std::env::var_os("FN64_DUMP_AUDIO_STREAM_PCM")
+            .map(std::path::PathBuf::from),
+        one_shot_dump_path: std::env::var_os("FN64_DUMP_AUDIO_PCM")
+            .map(std::path::PathBuf::from),
+    })
+}
+
 /// Panic if any pre-rename `OOT_*` knob is still set, naming its replacement.
 ///
-/// Called from the audio task/AI-buffer seams rather than a `thread_local!`
-/// initializer: an initializer only runs when its flag is first read, so a
-/// stale `OOT_DUMP_AUDIO_PCM` -- whose new name is never consulted on a run
-/// that sets only the old one -- would never trip the check.
+/// The first audio task/AI-buffer seam scans all retired spellings together.
+/// That preserves the loud trap even when the corresponding new knob is not
+/// used, while later buffers pay only a completed `OnceLock` check.
 pub(crate) fn assert_no_legacy_env_vars() {
-    for (old, new) in RENAMED_ENV_VARS {
-        if std::env::var_os(old).is_some() {
-            panic!("{}", legacy_env_var_message(old, new));
+    static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| {
+        for (old, new) in RENAMED_ENV_VARS {
+            if std::env::var_os(old).is_some() {
+                panic!("{}", legacy_env_var_message(old, new));
+            }
         }
-    }
-    for (name, replacement) in RETIRED_ENV_VARS {
-        if std::env::var_os(name).is_some() {
-            panic!("{name} was retired; {replacement}");
+        for (name, replacement) in RETIRED_ENV_VARS {
+            if std::env::var_os(name).is_some() {
+                panic!("{name} was retired; {replacement}");
+            }
         }
-    }
+    });
 }
 
 /// The trap's message, split out so a test can assert the wording without
@@ -66,14 +87,13 @@ pub(crate) struct AudioTaskDumpState {
 pub(crate) fn dump_audio_pcm_stream(samples: &[i16]) {
     use std::io::Write as _;
 
-    let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_STREAM_PCM") else {
+    let Some(path) = audio_diagnostics().stream_dump_path.as_deref() else {
         return;
     };
     AUDIO_PCM_STREAM_DUMP.with(|cell| {
         let mut state = cell.borrow_mut();
         if state.is_none() {
-            let path = std::path::PathBuf::from(path);
-            match std::fs::File::create(&path) {
+            match std::fs::File::create(path) {
                 Ok(file) => {
                     let sample_rate_hz = AUDIO_GUEST_RATE.with(Cell::get);
                     eprintln!(
@@ -81,7 +101,7 @@ pub(crate) fn dump_audio_pcm_stream(samples: &[i16]) {
                     );
                     *state = Some(AudioStreamDump {
                         file,
-                        path,
+                        path: path.to_path_buf(),
                         sample_rate_hz,
                         samples_written: 0,
                         buffers_written: 0,
@@ -157,18 +177,18 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
     let view = fn64_runtime::RdramView::from_storage(bytes);
     let start_addr =
         RdramAddr::from_offset(u32::try_from(start).expect("AI PCM RDRAM start exceeds u32"));
-    let samples: Vec<i16> = (0..byte_len)
-        .step_by(2)
-        .map(|guest_offset| {
-            view.read_i16(
-                start_addr
-                    .checked_add(
-                        u32::try_from(guest_offset).expect("AI PCM buffer length exceeds u32"),
-                    )
-                    .expect("AI PCM logical address overflow"),
-            )
-        })
-        .collect();
+    let mut samples = AUDIO_SAMPLE_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    samples.clear();
+    samples.reserve(byte_len / 2);
+    samples.extend((0..byte_len).step_by(2).map(|guest_offset| {
+        view.read_i16(
+            start_addr
+                .checked_add(
+                    u32::try_from(guest_offset).expect("AI PCM buffer length exceeds u32"),
+                )
+                .expect("AI PCM logical address overflow"),
+        )
+    }));
 
     AUDIO_DIGEST_CAPTURE.with(|cell| {
         let mut capture = cell.borrow_mut();
@@ -198,7 +218,7 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
         ai_index
     });
 
-    if std::env::var_os("FN64_TRACE_AI_BUFFERS").is_some() {
+    if audio_diagnostics().trace_buffers {
         eprintln!(
             "[fn64-abi] ai_buffer #{ai_index}: start={start:#x} bytes={byte_len:#x} samples={} nonzero={nonzero} range={}..={}",
             samples.len(),
@@ -212,14 +232,13 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
     // for nonzero avoids capturing an expected startup-silence buffer and
     // falsely concluding the synth stayed silent.
     if nonzero != 0 {
-        if let Some(path) = std::env::var_os("FN64_DUMP_AUDIO_PCM") {
+        if let Some(path) = audio_diagnostics().one_shot_dump_path.as_deref() {
             AUDIO_PCM_DUMPED.with(|dumped| {
                 if !dumped.get() {
                     let pcm: Vec<u8> = samples
                         .iter()
                         .flat_map(|sample| sample.to_le_bytes())
                         .collect();
-                    let path = std::path::Path::new(&path);
                     match std::fs::write(path, pcm) {
                         Ok(()) => {
                             let meta = format!(
@@ -269,6 +288,7 @@ pub(crate) unsafe fn deliver_ai_buffer(rdram: *mut u8, start: usize, byte_len: u
             AUDIO_LAST_ERROR.with(|cell| cell.replace(result.err().map(|error| error.to_string())));
         }
     });
+    AUDIO_SAMPLE_SCRATCH.with(|cell| *cell.borrow_mut() = samples);
 }
 
 /// Run one renderer operation through the process's single registered backend.
