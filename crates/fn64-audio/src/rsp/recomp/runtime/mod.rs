@@ -29,6 +29,7 @@ use crate::rsp::dmem::{Dmem, DMEM_SIZE};
 use crate::rsp::vu::{Vec8, VuState, LANES};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 static DMA_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -51,19 +52,75 @@ pub enum RspDmaDirection {
     Write,
 }
 
+/// The one owned representation of an RDP command-DMA range.
+///
+/// XBUS retains logical DMEM bytes because the ucode can reuse its small
+/// command ring before deferred rendering. RDRAM retains canonical command
+/// words captured at CMD_END. The variants make it impossible to retain two
+/// independently mutable copies of the same command stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RspDpCommandSource {
+    RdramWords(Vec<u32>),
+    XbusBytes(Vec<u8>),
+}
+
 /// One RDP command-DMA range submitted through the RSP's DPC CP0 registers.
-/// `xbus` records whether the command source is RSP DMEM rather than RDRAM.
-/// XBUS bytes are captured at submission time because the ucode reuses its
-/// small DMEM command ring before deferred host rendering consumes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RspDpSubmission {
     pub start: u32,
     pub end: u32,
-    pub xbus: bool,
-    /// Logical big-endian XBUS bytes; empty for RDRAM-backed submissions.
-    pub payload: Vec<u8>,
-    /// Logical command words captured when CMD_END admits the range.
-    pub words: Vec<u32>,
+    source: RspDpCommandSource,
+}
+
+impl RspDpSubmission {
+    pub fn from_rdram_words(start: u32, end: u32, words: Vec<u32>) -> Self {
+        let byte_len = Self::validated_byte_len("RDRAM", start, end);
+        let expected = byte_len / core::mem::size_of::<u32>();
+        assert_eq!(
+            words.len(),
+            expected,
+            "RSP RDRAM DPC range [{start:#010x}, {end:#010x}) requires {expected} words"
+        );
+        Self {
+            start,
+            end,
+            source: RspDpCommandSource::RdramWords(words),
+        }
+    }
+
+    pub fn from_xbus_bytes(start: u32, end: u32, bytes: Vec<u8>) -> Self {
+        let expected = Self::validated_byte_len("XBUS", start, end);
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "RSP XBUS DPC range [{start:#010x}, {end:#010x}) requires {expected} bytes"
+        );
+        Self {
+            start,
+            end,
+            source: RspDpCommandSource::XbusBytes(bytes),
+        }
+    }
+
+    pub const fn is_xbus(&self) -> bool {
+        matches!(self.source, RspDpCommandSource::XbusBytes(_))
+    }
+
+    pub const fn source(&self) -> &RspDpCommandSource {
+        &self.source
+    }
+
+    pub fn into_parts(self) -> (u32, u32, RspDpCommandSource) {
+        (self.start, self.end, self.source)
+    }
+
+    fn validated_byte_len(source: &str, start: u32, end: u32) -> usize {
+        assert!(
+            start < end && start.is_multiple_of(8) && end.is_multiple_of(8),
+            "RSP {source} DPC range [{start:#010x}, {end:#010x}) must be ordered and 8-byte aligned"
+        );
+        (end - start) as usize
+    }
 }
 
 /// The logical IMEM byte range replaced by one pending SP read-DMA.
@@ -613,7 +670,7 @@ impl<'a> RspMachine<'a> {
     /// Write one RSP-view CP0 register. A read-DMA into IMEM returns
     /// `SwapOverlay`; all other writes complete synchronously.
     pub fn write_cp0(&mut self, reg: u8, value: u32) -> Option<RspExitReason> {
-        if !super::content_safe_diagnostics() && std::env::var_os("RSP_TRACE_CP0").is_some() {
+        if rsp_trace_cp0_enabled() && !super::content_safe_diagnostics() {
             eprintln!("[fn64-rsp-cp0] write c{reg}={value:#010x}");
         }
         match reg {
@@ -653,31 +710,24 @@ impl<'a> RspMachine<'a> {
                     // close the interleaving where a later SP DMA or an
                     // earlier framebuffer write aliases and overwrites this
                     // command range before deferred host rendering begins.
-                    let payload = if xbus {
-                        (start..end)
-                            .map(|address| self.dmem.read_bu(address & 0x0fff))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let words = if xbus {
-                        let start = (start & 0x0fff) as usize;
-                        let end = (end & 0x0fff) as usize;
+                    let submission = if xbus {
+                        let dmem_start = (start & 0x0fff) as usize;
+                        let dmem_end = (end & 0x0fff) as usize;
                         assert!(
-                            start < end && end <= DMEM_SIZE,
-                            "RSP XBUS DPC range [{start:#05x}, {end:#05x}) exceeds DMEM"
+                            dmem_start < dmem_end && dmem_end <= DMEM_SIZE,
+                            "RSP XBUS DPC range [{dmem_start:#05x}, {dmem_end:#05x}) exceeds DMEM"
                         );
-                        (start..end)
-                            .step_by(4)
-                            .map(|offset| self.dmem.read_w(offset as u32) as u32)
-                            .collect()
+                        let bytes = (dmem_start..dmem_end)
+                            .map(|address| self.dmem.read_bu(address as u32))
+                            .collect();
+                        RspDpSubmission::from_xbus_bytes(start, end, bytes)
                     } else {
                         assert!(
                             end as usize <= self.rdram.len(),
                             "RSP DPC range end {end:#010x} exceeds RDRAM length {:#x}",
                             self.rdram.len()
                         );
-                        (start..end)
+                        let words = (start..end)
                             .step_by(4)
                             .map(|address| {
                                 u32::from_ne_bytes(
@@ -686,15 +736,10 @@ impl<'a> RspMachine<'a> {
                                         .expect("four RDRAM command bytes"),
                                 )
                             })
-                            .collect()
+                            .collect();
+                        RspDpSubmission::from_rdram_words(start, end, words)
                     };
-                    self.dp_submissions.push(RspDpSubmission {
-                        start,
-                        end,
-                        xbus,
-                        payload,
-                        words,
-                    });
+                    self.dp_submissions.push(submission);
                 }
                 // No RDP execution engine lives in fn64-audio. Model the
                 // command DMA as instant so polling loops observe idle.
@@ -1020,7 +1065,7 @@ impl<'a> RspMachine<'a> {
             sp_mem_address: self.ctx.dma_mem_address & 0x1ff8,
             raw_length_descriptor: len,
         });
-        trace_dma(DmaTrace {
+        trace_dma(|| DmaTrace {
             direction: if self.ctx.dma_mem_address & 0x1000 != 0 {
                 "read-imem"
             } else {
@@ -1136,7 +1181,7 @@ impl<'a> RspMachine<'a> {
             sp_mem_address: self.ctx.dma_mem_address & 0x1ff8,
             raw_length_descriptor: len,
         });
-        trace_dma(DmaTrace {
+        trace_dma(|| DmaTrace {
             direction: "write",
             dram,
             mem,
@@ -1283,21 +1328,81 @@ struct DmaTrace {
     checksum: u64,
 }
 
-fn trace_dma(trace: DmaTrace) {
-    if super::content_safe_diagnostics() || std::env::var_os("RSP_TRACE_DMA").is_none() {
-        return;
-    }
-    let seq = DMA_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let limit = std::env::var("RSP_TRACE_DMA_LIMIT")
-        .ok()
-        .map(|raw| {
-            raw.parse::<u64>()
-                .unwrap_or_else(|_| panic!("RSP_TRACE_DMA_LIMIT must be an integer, got {raw:?}"))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DmaTraceConfig {
+    limit: u64,
+}
+
+#[inline]
+fn rsp_trace_cp0_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RSP_TRACE_CP0").is_some())
+}
+
+#[inline]
+fn dma_trace_config() -> Option<DmaTraceConfig> {
+    static CONFIG: OnceLock<Option<DmaTraceConfig>> = OnceLock::new();
+    *CONFIG.get_or_init(|| match std::env::var_os("RSP_TRACE_DMA") {
+        Some(_) => {
+            parse_dma_trace_config(true, std::env::var("RSP_TRACE_DMA_LIMIT").ok().as_deref())
+        }
+        None => None,
+    })
+}
+
+fn parse_dma_trace_config(enabled: bool, limit: Option<&str>) -> Option<DmaTraceConfig> {
+    enabled.then(|| DmaTraceConfig {
+        limit: limit
+            .map(|raw| {
+                raw.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("RSP_TRACE_DMA_LIMIT must be an integer, got {raw:?}")
+                })
+            })
+            .unwrap_or(u64::MAX),
+    })
+}
+
+#[inline]
+fn dma_trace_words_limit() -> Option<usize> {
+    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RSP_TRACE_DMA_WORDS").ok().map(|raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|_| panic!("RSP_TRACE_DMA_WORDS must be an integer, got {raw:?}"))
         })
-        .unwrap_or(u64::MAX);
-    if seq >= limit {
+    })
+}
+
+fn build_dma_trace<T>(
+    config: Option<DmaTraceConfig>,
+    content_safe: bool,
+    sequence: &AtomicU64,
+    build: impl FnOnce() -> T,
+) -> Option<(u64, T)> {
+    if content_safe {
+        return None;
+    }
+    let config = config?;
+    let seq = sequence.fetch_add(1, Ordering::Relaxed);
+    if seq >= config.limit {
+        return None;
+    }
+    Some((seq, build()))
+}
+
+fn trace_dma(build: impl FnOnce() -> DmaTrace) {
+    let config = dma_trace_config();
+    if config.is_none() {
         return;
     }
+    let Some((seq, trace)) = build_dma_trace(
+        config,
+        super::content_safe_diagnostics(),
+        &DMA_TRACE_SEQ,
+        build,
+    ) else {
+        return;
+    };
     let DmaTrace {
         direction,
         dram,
@@ -1315,15 +1420,12 @@ fn trace_dma(trace: DmaTrace) {
 }
 
 fn trace_dma_words(rdram: &[u8], mut dram: usize, line_len: usize, lines: usize, skip: usize) {
+    let Some(limit) = dma_trace_words_limit() else {
+        return;
+    };
     if super::content_safe_diagnostics() {
         return;
     }
-    let Some(limit) = std::env::var("RSP_TRACE_DMA_WORDS").ok().map(|raw| {
-        raw.parse::<usize>()
-            .unwrap_or_else(|_| panic!("RSP_TRACE_DMA_WORDS must be an integer, got {raw:?}"))
-    }) else {
-        return;
-    };
     let mut words = Vec::new();
     for _ in 0..lines {
         for bytes in rdram[dram..dram + line_len].chunks(4) {

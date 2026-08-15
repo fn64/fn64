@@ -1703,7 +1703,12 @@ task calls out:
   and custom tasks execute from that persistent image through the clean-room
   scalar/vector interpreter: IMEM DMA replaces a generation and resumes at the
   saved PC; BREAK commits DMEM, RDRAM DMA writes, status, and DRAM/XBUS DPC
-  submissions before the guest resumes. Every renderer task and DRAM-backed
+  submissions before the guest resumes. Each submission owns exactly one
+  source-typed command image: logical XBUS bytes
+  or canonical RDRAM words captured at CMD_END, never independently mutable
+  copies of both. Deferred dispatch consumes and coalesces those owned images;
+  it does not reread a command range after later RSP writes can change it.
+  Every renderer task and DRAM-backed
   raw-DPC entry receives an 8 MiB physical-RDRAM
   view. Registration must cover that complete device, including its final
   byte, while the generated-code allocation's appended MMIO/non-RDRAM backing is

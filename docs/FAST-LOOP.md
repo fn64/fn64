@@ -837,6 +837,14 @@ DMA stream to its first `N` operations. `RSP_TRACE_DMA_WORDS=N` adds the first
 `N` native-storage words from each read source; keep it bounded because command
 buffers are game data and the diagnostic can be large.
 
+RSP DMA/CP0 trace settings are launch-time configuration: set them before the
+process starts, because each setting is parsed once on first use. Disabled or
+limit-exhausted DMA tracing neither constructs the source checksum nor formats
+the source-word payload. Message-delivery diagnostics (`FN64_DEBUG_SEND` and
+optional `FN64_DEBUG_SEND_WORDS=N`) follow the same launch-time rule so normal
+queue operations never lock or scan the process environment. The legacy
+bootstrap queue trace (`FN64_DEBUG_BOOT`) is likewise fixed on first use.
+
 `RSP_TRACE_EXEC=1` logs every interpreter PC and raw instruction word.
 `RSP_TRACE_EXEC_LIMIT=N` bounds that process-wide stream to the first `N`
 instructions. The trace is intentionally verbose and disabled by default.
@@ -845,7 +853,9 @@ emitted instruction record; indices are decimal and comma-separated.
 `RSP_TRACE_CP0=1` logs RSP-side CP0 writes, including the scalar values which
 program SP DMA and DPC registers.
 `RSP_TRACE_DPC_WORDS=N` prints the first `N` logical command words from each
-completed LLE DPC range before it is submitted to the renderer.
+completed LLE DPC range before it is submitted to the renderer. Its limit is
+also launch-time configuration, and tracing a prefix borrows the owned command
+buffer without allocating a second vector.
 `RSP_TRACE_RDRAM_WORDS=OFFSET:COUNT` prints native-storage words from one
 hexadecimal RDRAM offset when an LLE task begins; `COUNT` is decimal.
 `RSP_TRACE_DMEM_WORDS=OFFSET:COUNT` prints big-endian logical DMEM words at

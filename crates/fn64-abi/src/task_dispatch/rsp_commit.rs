@@ -1,4 +1,15 @@
 use super::*;
+use fn64_audio::rsp::runtime::RspDpCommandSource;
+
+fn rsp_trace_dpc_words_limit() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|_| panic!("RSP_TRACE_DPC_WORDS must be decimal, got {raw:?}"))
+        })
+    })
+}
 
 pub(crate) fn commit_rsp_memory_state(
     dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
@@ -241,57 +252,51 @@ pub(crate) unsafe fn dispatch_lle_task(
 
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
     let mut dpc_observations = Vec::with_capacity(dp_submissions.len());
-    let trace_limit = std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
-        raw.parse::<usize>()
-            .unwrap_or_else(|_| panic!("RSP_TRACE_DPC_WORDS must be decimal, got {raw:?}"))
-    });
+    let trace_limit = rsp_trace_dpc_words_limit();
     // Consecutive END extensions are one hardware command stream. A 16-byte
     // command can straddle two 8-byte END writes, so decoding each submission
     // separately creates a false truncated-command trap.
-    let mut index = 0;
-    while index < dp_submissions.len() {
-        let (start, end, xbus, words) = if dp_submissions[index].xbus {
-            let start = dp_submissions[index].start;
-            let mut end = dp_submissions[index].end;
-            let mut stream = Vec::new();
-            while index < dp_submissions.len() && dp_submissions[index].xbus {
-                let submission = &dp_submissions[index];
-                assert_eq!(
-                    submission.payload.len(),
-                    submission.end.wrapping_sub(submission.start) as usize,
-                    "RSP XBUS DPC range [{:#010x}, {:#010x}) payload was not captured at submission time",
-                    submission.start,
-                    submission.end
-                );
-                stream.extend_from_slice(&submission.payload);
-                end = submission.end;
-                index += 1;
+    let mut pending = dp_submissions.into_iter().peekable();
+    while let Some(first) = pending.next() {
+        let (start, mut end, source) = first.into_parts();
+        let (xbus, words) = match source {
+            RspDpCommandSource::XbusBytes(mut stream) => {
+                while pending
+                    .peek()
+                    .is_some_and(|submission| submission.is_xbus())
+                {
+                    let next = pending.next().expect("peeked XBUS submission disappeared");
+                    let (_, next_end, next_source) = next.into_parts();
+                    let RspDpCommandSource::XbusBytes(bytes) = next_source else {
+                        unreachable!("XBUS predicate and owned command source diverged")
+                    };
+                    stream.extend_from_slice(&bytes);
+                    end = next_end;
+                }
+                let words = stream
+                    .chunks_exact(4)
+                    .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
+                    .collect::<Vec<_>>();
+                (true, words)
             }
-            let words = stream
-                .chunks_exact(4)
-                .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
-                .collect::<Vec<_>>();
-            (start, end, true, words)
-        } else {
-            let start = dp_submissions[index].start;
-            let mut end = dp_submissions[index].end;
-            index += 1;
-            while index < dp_submissions.len()
-                && !dp_submissions[index].xbus
-                && dp_submissions[index].start == end
-            {
-                end = dp_submissions[index].end;
-                index += 1;
+            RspDpCommandSource::RdramWords(mut words) => {
+                while pending
+                    .peek()
+                    .is_some_and(|submission| !submission.is_xbus() && submission.start == end)
+                {
+                    let next = pending.next().expect("peeked RDRAM submission disappeared");
+                    let (_, next_end, next_source) = next.into_parts();
+                    let RspDpCommandSource::RdramWords(next_words) = next_source else {
+                        unreachable!("RDRAM predicate and owned command source diverged")
+                    };
+                    words.extend(next_words);
+                    end = next_end;
+                }
+                (false, words)
             }
-            let storage = unsafe { renderer_rdram_slice(rdram) };
-            let words = storage[start as usize..end as usize]
-                .chunks_exact(4)
-                .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
-                .collect::<Vec<_>>();
-            (start, end, false, words)
         };
         if let Some(limit) = trace_limit {
-            let traced = words.iter().copied().take(limit).collect::<Vec<_>>();
+            let traced = &words[..words.len().min(limit)];
             eprintln!(
                 "[fn64-rsp-dpc] range [{start:#010x}, {end:#010x}) xbus={xbus} words={traced:08x?}"
             );

@@ -4922,3 +4922,36 @@ rows; release evidence is not cropped. The rebuilt live shell reported a
 `320x237` surface backed by `320x240` capture storage on every launch in the
 fresh exact-ten cadence/audio series. A direct visual eye-check remains separate
 from this geometry and byte-boundary evidence.
+
+## Hot diagnostic and DPC ownership cleanup (2026-08-14)
+
+The five retained dispatch samples (`dispatch_deep_1/2/3` and
+`dispatch_fresh_1/2`) contain 17,314 leaf samples. `__findenv_locked` accounts
+for 2.1% of them, principally below RSP CP0 writes and DMA tracing. This was
+real disabled-path work: each CP0 write queried `RSP_TRACE_CP0`; each DMA
+queried its trace variables; and every DMA constructed a complete source FNV
+checksum before the trace function discovered `RSP_TRACE_DMA` was absent.
+
+RSP CP0/DMA and message-send debug settings are now typed, process-lifetime
+configuration. The disabled CP0/DMA paths perform a cached branch without an
+environment lock, dependent limits are not read when their parent trace is
+off, and DMA trace payload construction is lazy after both the enable and
+sequence-limit checks. The same shared `DebugSendDiagnostics` value is used by
+the ABI shim and executor, removing repeated environment scans from queue
+delivery without allowing the two sides to disagree about configuration.
+
+The same pass removes duplicate ownership at the RSP/DPC seam.
+`RspDpSubmission` previously retained XBUS commands as both `Vec<u8>` and
+`Vec<u32>`. Dispatch then copied the byte vectors into a third aggregate buffer
+and converted that buffer into another word vector; RDRAM submissions ignored
+their captured word vector and reread the live range. `RspDpCommandSource` now
+owns exactly one variant (`XbusBytes` or `RdramWords`). Dispatch consumes the
+first allocation while coalescing ranges, converts XBUS bytes only once for the
+renderer, and moves captured RDRAM words without rereading guest memory.
+
+These are structurally eliminated calls, walks, and allocations, not a new
+frame-time result. The saved 2.1% environment share is motivation from the old
+binary; a fresh interleaved render-route A/B is still required before assigning
+an end-to-end speedup to this change. The affected runtime diagnostics, complete
+audio library, and raw/XBUS ABI renderer seam passed ten consecutive clean test
+runs; the full audio suite and all 382 ABI nextest cases also passed once.

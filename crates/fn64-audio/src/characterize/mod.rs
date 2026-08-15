@@ -24,7 +24,9 @@ use crate::hle_outcome::{
 };
 use crate::hle_rspboot::{execute_audio_rspboot_to_entry, AudioRspbootError, AudioRspbootInput};
 use crate::hle_snapshot::AudioHleSnapshotError;
-use crate::rsp::runtime::{RspDmaDirection, RspDmaJournalEntry, RspMachine, RspMachineState};
+use crate::rsp::runtime::{
+    RspDmaDirection, RspDmaJournalEntry, RspDpCommandSource, RspMachine, RspMachineState,
+};
 
 pub const REQUEST_SCHEMA: &str = "fn64.audio-abi-characterization-request.v2";
 pub const REPORT_SCHEMA: &str = "fn64.audio-abi-characterization-report.v2";
@@ -1462,12 +1464,24 @@ fn architecture_digest(state: &RspMachineState) -> Sha256Digest {
     for submission in state.dp_submissions() {
         wire.extend_from_slice(&submission.start.to_be_bytes());
         wire.extend_from_slice(&submission.end.to_be_bytes());
-        wire.push(u8::from(submission.xbus));
-        push_wire_len(&mut wire, submission.payload.len());
-        wire.extend_from_slice(&submission.payload);
-        push_wire_len(&mut wire, submission.words.len());
-        for word in &submission.words {
-            wire.extend_from_slice(&word.to_be_bytes());
+        match submission.source() {
+            RspDpCommandSource::RdramWords(words) => {
+                wire.push(0);
+                push_wire_len(&mut wire, 0);
+                push_wire_len(&mut wire, words.len());
+                for word in words {
+                    wire.extend_from_slice(&word.to_be_bytes());
+                }
+            }
+            RspDpCommandSource::XbusBytes(bytes) => {
+                wire.push(1);
+                push_wire_len(&mut wire, bytes.len());
+                wire.extend_from_slice(bytes);
+                push_wire_len(&mut wire, bytes.len() / core::mem::size_of::<u32>());
+                for word in bytes.chunks_exact(core::mem::size_of::<u32>()) {
+                    wire.extend_from_slice(word);
+                }
+            }
         }
     }
     Sha256Digest::hash(&wire)

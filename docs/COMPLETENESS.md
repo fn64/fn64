@@ -269,10 +269,10 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | thread scheduler | `osGetThreadPri_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:203` |
 | thread scheduler | `osGetThreadId_recomp` | **implemented** | `crates/fn64-abi/src/thread.rs:255` |
 | message queue | `osCreateMesgQueue_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:14` |
-| message queue | `osRecvMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:100` |
+| message queue | `osRecvMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:98` |
 | message queue | `osSendMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:33` |
-| message queue | `osJamMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:206` |
-| message queue | `osSetEventMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:171` |
+| message queue | `osJamMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:204` |
+| message queue | `osSetEventMesg_recomp` | **implemented** | `crates/fn64-abi/src/mesgqueue.rs:169` |
 | timer | `osGetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:127` |
 | timer | `osSetTime_recomp` | **implemented** | `crates/fn64-abi/src/system.rs:198` |
 | timer | `osSetTimer_recomp` | **implemented** | `crates/fn64-abi/src/timer.rs:30` |
@@ -338,7 +338,7 @@ Live headline: **116/116 canonical shims are exported** — 116 implemented, 0 p
 | RSP/SP | `osSpTaskLoad_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1359` |
 | RSP/SP | `osSpTaskStartGo_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1469` |
 | RSP/SP | `osSpTaskYield_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/lifecycle.rs:1847` |
-| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1486` |
+| RSP/SP | `osSpTaskYielded_recomp` | **implemented** | `crates/fn64-abi/src/task_dispatch/rsp_commit.rs:1491` |
 | RSP/SP | `__osSpSetPc_recomp` | **implemented** | `crates/fn64-abi/src/sp_dp.rs:12` |
 | Voice/ISV | `osVoiceSetWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:233` |
 | Voice/ISV | `osVoiceCheckWord_recomp` | **implemented** | `crates/fn64-abi/src/voice.rs:200` |
