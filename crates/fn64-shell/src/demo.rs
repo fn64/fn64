@@ -137,6 +137,7 @@ impl ApplicationHandler for Demo {
         let surface = SurfaceTexture::new(win_size.width, win_size.height, Arc::clone(&window));
         match Pixels::new(FB_WIDTH as u32, FB_HEIGHT as u32, surface) {
             Ok(px) => {
+                self.overlay.prepare(&px);
                 self.pixels = Some(px);
                 window.request_redraw();
                 self.window = Some(window);

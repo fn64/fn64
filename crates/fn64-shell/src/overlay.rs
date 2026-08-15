@@ -49,8 +49,9 @@ pub struct Overlay {
     /// Last cursor position in egui points.
     cursor: Pos2,
     started: std::time::Instant,
-    /// Set by any UI change; triggers a config save after the frame.
-    dirty: bool,
+    /// Reset is deliberately two-step: a stray click must not replace every
+    /// binding in a persistent user config.
+    reset_armed: bool,
 }
 
 impl Overlay {
@@ -71,13 +72,23 @@ impl Overlay {
             events: Vec::new(),
             cursor: Pos2::ZERO,
             started: std::time::Instant::now(),
-            dirty: false,
+            reset_armed: false,
         }
+    }
+
+    /// Create the egui GPU pipeline while the window is still being set up.
+    /// `Renderer::new` is a one-time host cost; deferring it until F1 makes
+    /// opening settings the frame that pays for shader/pipeline creation.
+    pub fn prepare(&mut self, pixels: &pixels::Pixels<'static>) {
+        self.renderer.get_or_insert_with(|| {
+            egui_wgpu::Renderer::new(pixels.device(), pixels.surface_texture_format(), None, 1)
+        });
     }
 
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.capture = None;
+        self.reset_armed = false;
         // Undrained mouse events from the closing frame would replay into
         // the next open.
         self.events.clear();
@@ -128,16 +139,24 @@ impl Overlay {
         }
     }
 
-    /// A keyboard key arrived while a keyboard capture was armed. Returns
-    /// true if it was consumed as a binding.
+    /// A keyboard key arrived while a capture was armed. Delete/Backspace
+    /// clears either kind of slot; any other key binds a keyboard slot.
+    /// Returns true when the event changed the active capture.
     pub fn apply_key_capture(&mut self, config: &mut InputConfig, key: KeyCode) -> bool {
-        let Some(Capture::Key(target)) = self.capture else {
-            return false;
-        };
-        config.bind_key(target, key);
+        let clear = matches!(key, KeyCode::Delete | KeyCode::Backspace);
+        match self.capture {
+            Some(Capture::Key(target)) if clear => config.unbind_key(target),
+            Some(Capture::Pad(target)) if clear => config.unbind_pad(target),
+            Some(Capture::Key(target)) => config.bind_key(target, key),
+            Some(Capture::Pad(_)) | None => return false,
+        }
         config.save();
         self.capture = None;
-        println!("[fn64-shell] input: bound {key:?} via settings overlay");
+        if clear {
+            println!("[fn64-shell] input: cleared binding via settings overlay");
+        } else {
+            println!("[fn64-shell] input: bound {key:?} via settings overlay");
+        }
         true
     }
 
@@ -178,11 +197,27 @@ impl Overlay {
             .native_pixels_per_point = Some(scale_factor);
 
         let mut capture = self.capture;
+        let mut reset_armed = self.reset_armed;
         let mut dirty = false;
+        let mut close_requested = false;
         let full_output = self.ctx.clone().run(raw, |ctx| {
-            draw_ui(ctx, config, gamepads, &mut capture, &mut dirty);
+            draw_ui(
+                ctx,
+                config,
+                gamepads,
+                &mut capture,
+                &mut reset_armed,
+                &mut dirty,
+                &mut close_requested,
+            );
         });
         self.capture = capture;
+        self.reset_armed = reset_armed;
+        if close_requested {
+            self.open = false;
+            self.capture = None;
+            self.reset_armed = false;
+        }
         if dirty {
             config.save();
         }
@@ -264,7 +299,9 @@ fn draw_ui(
     config: &mut InputConfig,
     gamepads: &Gamepads,
     capture: &mut Option<Capture>,
+    reset_armed: &mut bool,
     dirty: &mut bool,
+    close_requested: &mut bool,
 ) {
     // Dim the game underneath so the panel reads as a modal layer.
     egui::Area::new(egui::Id::new("fn64-dim"))
@@ -287,7 +324,7 @@ fn draw_ui(
     // left.
     let screen = ctx.screen_rect();
     // Room for the title bar, the hint row, and the window frame's padding.
-    let chrome = 96.0;
+    let chrome = 142.0;
     // NO lower floor here: a `.max(160.0)` would win whenever the viewport is
     // under 256px tall and hand the ScrollArea more height than the screen
     // has, reintroducing the clipped-title bug it exists to fix. Both the game
@@ -295,21 +332,33 @@ fn draw_ui(
     // reachable by dragging the window down. Clamp to something still usable
     // instead, and let the ScrollArea scroll.
     let body_max_height = (screen.height() - chrome).clamp(48.0, screen.height());
-    egui::Window::new(RichText::new("CONTROLLER").strong().color(INK))
+    egui::Window::new(RichText::new("INPUT SETTINGS").strong().color(INK))
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
         .max_height(screen.height() - 24.0)
         .max_width(screen.width() - 24.0)
         .show(ctx, |ui| {
-            match gamepads.active_name() {
-                Some(name) => ui.label(RichText::new(name).color(MUTED).small()),
-                None => ui.label(
-                    RichText::new("no gamepad detected — keyboard only")
-                        .color(MUTED)
-                        .small(),
-                ),
-            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("PLAYER 1").color(MUTED).small().strong());
+                ui.separator();
+                match gamepads.active_name() {
+                    Some(name) => {
+                        ui.label(RichText::new("CONNECTED").color(B_GREEN).small().strong());
+                        ui.label(RichText::new(name).color(INK).small())
+                    }
+                    None => ui.label(
+                        RichText::new("Keyboard only — connect a controller at any time")
+                            .color(MUTED)
+                            .small(),
+                    ),
+                };
+            });
+            ui.label(
+                RichText::new("Select a slot, then press the key or controller button you want.")
+                    .color(MUTED)
+                    .small(),
+            );
             ui.add_space(6.0);
 
             // ONE scroll area around BOTH columns, bounded by the viewport.
@@ -332,13 +381,50 @@ fn draw_ui(
                             stick_scope(ui, config, gamepads, dirty);
                         });
                     });
-            });
+                });
 
             ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if *reset_armed {
+                    ui.label(
+                        RichText::new("Replace every binding?")
+                            .color(START_RED)
+                            .small(),
+                    );
+                    if ui
+                        .button(RichText::new("Confirm reset").color(START_RED))
+                        .clicked()
+                    {
+                        config.restore_defaults();
+                        *capture = None;
+                        *reset_armed = false;
+                        *dirty = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        *reset_armed = false;
+                    }
+                } else if ui.button("Restore defaults").clicked() {
+                    *capture = None;
+                    *reset_armed = true;
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(RichText::new("Done").strong()).clicked() {
+                        *close_requested = true;
+                    }
+                    ui.label(
+                        RichText::new("Changes save automatically")
+                            .color(MUTED)
+                            .small(),
+                    );
+                });
+            });
+            ui.add_space(3.0);
             let hint = match capture {
-                Some(Capture::Key(_)) => "press a key to bind — Esc cancels",
-                Some(Capture::Pad(_)) => "press a gamepad button to bind — Esc cancels",
-                None => "F1 close · F11 fullscreen · changes saved automatically",
+                Some(Capture::Key(_)) => "press a key to bind · Delete clears · Esc cancels",
+                Some(Capture::Pad(_)) => "press a controller button · Delete clears · Esc cancels",
+                None => "F1 or Esc closes · F11 toggles fullscreen",
             };
             ui.label(RichText::new(hint).color(MUTED).small());
         });
@@ -371,6 +457,10 @@ fn bindings_grid(ui: &mut egui::Ui, config: &mut InputConfig, capture: &mut Opti
     // Stick section first: it's the control players touch most.
     ui.label(RichText::new("STICK").color(MUTED).small());
     egui::Grid::new("stick-grid").num_columns(3).show(ui, |ui| {
+        ui.label(RichText::new("CONTROL").color(MUTED).small());
+        ui.label(RichText::new("KEYBOARD").color(MUTED).small());
+        ui.label(RichText::new("GAMEPAD").color(MUTED).small());
+        ui.end_row();
         for dir in StickDir::ALL {
             ui.label(RichText::new(dir.label()).color(MUTED));
             let armed = *capture == Some(Capture::Key(BindTarget::Stick(dir)));
@@ -383,7 +473,11 @@ fn bindings_grid(ui: &mut egui::Ui, config: &mut InputConfig, capture: &mut Opti
                     .map(|&k| key_label(k))
                     .unwrap_or_else(|| "—".to_string())
             };
-            if ui.button(RichText::new(text).monospace()).clicked() {
+            if ui
+                .button(RichText::new(text).monospace())
+                .on_hover_text("Click, then press a keyboard key")
+                .clicked()
+            {
                 *capture = Some(Capture::Key(BindTarget::Stick(dir)));
             }
             // Gamepad column: the stick is always the physical left stick.
@@ -409,7 +503,11 @@ fn bindings_grid(ui: &mut egui::Ui, config: &mut InputConfig, capture: &mut Opti
                         .map(|&k| key_label(k))
                         .unwrap_or_else(|| "—".to_string())
                 };
-                if ui.button(RichText::new(key_text).monospace()).clicked() {
+                if ui
+                    .button(RichText::new(key_text).monospace())
+                    .on_hover_text("Click, then press a keyboard key")
+                    .clicked()
+                {
                     *capture = Some(Capture::Key(BindTarget::Button(button)));
                 }
 
@@ -435,7 +533,11 @@ fn bindings_grid(ui: &mut egui::Ui, config: &mut InputConfig, capture: &mut Opti
                             }
                         })
                 };
-                if ui.button(RichText::new(pad_text).monospace()).clicked() {
+                if ui
+                    .button(RichText::new(pad_text).monospace())
+                    .on_hover_text("Click, then press a controller button")
+                    .clicked()
+                {
                     *capture = Some(Capture::Pad(button));
                 }
                 ui.end_row();
@@ -486,5 +588,59 @@ fn stick_scope(ui: &mut egui::Ui, config: &mut InputConfig, gamepads: &Gamepads,
     // Save when the drag ends, not on every tick of the drag.
     if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
         *dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_config() -> InputConfig {
+        InputConfig {
+            persist: false,
+            ..InputConfig::default()
+        }
+    }
+
+    #[test]
+    fn armed_keyboard_capture_rebinds_once_and_disarms() {
+        let mut overlay = Overlay::new();
+        let mut config = scratch_config();
+        overlay.capture = Some(Capture::Key(BindTarget::Button(N64Button::A)));
+
+        assert!(overlay.apply_key_capture(&mut config, KeyCode::F12));
+        assert_eq!(config.keyboard.get(&N64Button::A), Some(&KeyCode::F12));
+        assert_eq!(overlay.capture, None);
+        assert!(!overlay.apply_key_capture(&mut config, KeyCode::F11));
+        assert_eq!(config.keyboard.get(&N64Button::A), Some(&KeyCode::F12));
+    }
+
+    #[test]
+    fn delete_clears_keyboard_or_gamepad_capture_and_disarms() {
+        let mut overlay = Overlay::new();
+        let mut config = scratch_config();
+
+        overlay.capture = Some(Capture::Key(BindTarget::Stick(StickDir::Up)));
+        assert!(overlay.apply_key_capture(&mut config, KeyCode::Delete));
+        assert!(!config.keyboard_stick.contains_key(&StickDir::Up));
+        assert_eq!(overlay.capture, None);
+
+        overlay.capture = Some(Capture::Pad(N64Button::Start));
+        assert!(overlay.apply_key_capture(&mut config, KeyCode::Backspace));
+        assert!(!config.gamepad.contains_key(&N64Button::Start));
+        assert_eq!(overlay.capture, None);
+    }
+
+    #[test]
+    fn toggle_clears_transient_capture_and_reset_state() {
+        let mut overlay = Overlay::new();
+        overlay.capture = Some(Capture::Pad(N64Button::Start));
+        overlay.reset_armed = true;
+
+        overlay.toggle();
+
+        assert!(overlay.open);
+        assert_eq!(overlay.capture, None);
+        assert!(!overlay.reset_armed);
     }
 }

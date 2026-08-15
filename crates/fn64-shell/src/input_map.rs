@@ -329,12 +329,41 @@ impl InputConfig {
         }
     }
 
+    /// Remove the keyboard binding for one exact UI slot.
+    pub fn unbind_key(&mut self, target: BindTarget) {
+        match target {
+            BindTarget::Button(button) => {
+                self.keyboard.remove(&button);
+            }
+            BindTarget::Stick(direction) => {
+                self.keyboard_stick.remove(&direction);
+            }
+        }
+    }
+
     /// Bind a gamepad button to an N64 button, clearing any other N64
     /// button it was bound to. (The analog stick isn't a gamepad-bind
     /// target: it's always the physical left stick.)
     pub fn bind_pad(&mut self, target: N64Button, button: gilrs::Button) {
         self.gamepad.retain(|_, &mut b| b != button);
         self.gamepad.insert(target, button);
+    }
+
+    /// Remove the gamepad binding for one exact N64 button.
+    pub fn unbind_pad(&mut self, target: N64Button) {
+        self.gamepad.remove(&target);
+    }
+
+    /// Restore the shipped bindings and tuning without changing whether this
+    /// in-memory config is allowed to persist. The content-free UI demo uses a
+    /// non-persisting config; replacing it with [`Self::default`] directly
+    /// would silently grant it permission to overwrite the user's real file.
+    pub fn restore_defaults(&mut self) {
+        let persist = self.persist;
+        *self = Self {
+            persist,
+            ..Self::default()
+        };
     }
 }
 
@@ -452,6 +481,38 @@ mod tests {
         assert_eq!(c.button_for_key(KeyCode::KeyX), Some(BTN_A));
         assert_eq!(c.button_for_key(KeyCode::KeyZ), Some(BTN_B));
         assert_eq!(c.button_for_key(KeyCode::Enter), Some(BTN_START));
+    }
+
+    #[test]
+    fn restore_defaults_preserves_persistence_authority() {
+        let mut config = InputConfig {
+            persist: false,
+            ..InputConfig::default()
+        };
+        config.bind_key(BindTarget::Button(N64Button::A), KeyCode::F12);
+        config.deadzone = 0.42;
+
+        config.restore_defaults();
+
+        assert!(!config.persist);
+        assert_eq!(config.button_for_key(KeyCode::KeyX), Some(BTN_A));
+        assert_eq!(config.deadzone, 0.15);
+    }
+
+    #[test]
+    fn unbind_targets_only_the_selected_slot() {
+        let mut config = InputConfig::default();
+
+        config.unbind_key(BindTarget::Button(N64Button::A));
+        config.unbind_key(BindTarget::Stick(StickDir::Up));
+        config.unbind_pad(N64Button::Start);
+
+        assert!(!config.keyboard.contains_key(&N64Button::A));
+        assert!(!config.keyboard_stick.contains_key(&StickDir::Up));
+        assert!(!config.gamepad.contains_key(&N64Button::Start));
+        assert!(config.keyboard.contains_key(&N64Button::B));
+        assert!(config.keyboard_stick.contains_key(&StickDir::Down));
+        assert!(config.gamepad.contains_key(&N64Button::A));
     }
 
     #[test]
