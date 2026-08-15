@@ -79,7 +79,7 @@ pub struct GeneratedRunnerBuildIdentityV1 {
 
 /// One named reproducible captured-image group consumed by the WM build.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Wm2000ExecutableImageGroupV1 {
+pub struct ExecutableImageGroupV1 {
     pub environment_name: String,
     pub captures: Vec<PathBuf>,
 }
@@ -88,14 +88,14 @@ pub struct Wm2000ExecutableImageGroupV1 {
 /// Source paths, package, profile, features, Cargo flags, and output target are
 /// implementation-owned below.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Wm2000GeneratedRunnerBuildInputsV1 {
+pub struct GeneratedRunnerBuildInputsV1 {
     pub rom: PathBuf,
     /// Exact black-box header-handoff capture required by the selected
     /// executable's normal boot path. The verifier retains and rehashes this
     /// path privately; generated-runner build evidence exposes only the
     /// aggregate private-input digest.
     pub boot_context: PathBuf,
-    pub executable_image_groups: Vec<Wm2000ExecutableImageGroupV1>,
+    pub executable_image_groups: Vec<ExecutableImageGroupV1>,
     /// Wall-time ceiling for the process-group guard. The measured full graph
     /// takes roughly forty minutes, so accepted values are 40--120 minutes.
     pub max_build_seconds: u64,
@@ -181,7 +181,7 @@ pub struct GeneratedRunnerBuildEvidenceV1 {
 pub struct VerifiedGeneratedRunnerBuildV1 {
     pub(super) evidence: GeneratedRunnerBuildEvidenceV1,
     pub(super) selected_binary: PathBuf,
-    pub(super) private_inputs: Wm2000GeneratedRunnerBuildInputsV1,
+    pub(super) private_inputs: GeneratedRunnerBuildInputsV1,
     pub(super) prepared: PreparedTreeMeasurementV3,
     pub(super) producer: ProducerBuildMeasurementV3,
     pub(super) _scratch: ScratchDirectory,

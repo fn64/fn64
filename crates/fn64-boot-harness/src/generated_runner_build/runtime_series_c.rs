@@ -28,7 +28,7 @@ pub fn parse_generated_runner_rsp_runtime_report_v1(
     Ok(report)
 }
 
-pub fn run_wm2000_generated_runner_rsp_runtime_series_v1(
+pub fn run_generated_runner_rsp_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerRspRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_rsp_runtime_series_evidence_v1(&build)?;
@@ -398,7 +398,7 @@ pub fn parse_generated_runner_si_runtime_report_v1(
 /// staged private inputs. The selected binary and all private inputs are
 /// revalidated before and after every launch. Success returns a move-only
 /// series capability; it does not complete the writer-channel denominator.
-pub fn run_wm2000_generated_runner_si_runtime_series_v1(
+pub fn run_generated_runner_si_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerSiRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_si_runtime_series_evidence_v1(&build)?;
@@ -518,7 +518,7 @@ impl WriterRuntimeAuditProtocol {
 
 pub(super) fn configure_writer_runtime_command(
     command: &mut Command,
-    inputs: &Wm2000GeneratedRunnerBuildInputsV1,
+    inputs: &GeneratedRunnerBuildInputsV1,
     nonce: [u8; 32],
     protocol: WriterRuntimeAuditProtocol,
 ) -> Result<(), GeneratedRunnerBuildError> {
@@ -1080,7 +1080,7 @@ pub fn parse_generated_runner_sp_runtime_report_v1(
 /// Every child receives one fresh OS-random nonce and only retained staged
 /// inputs. Pre/post launch revalidation closes replacement of the executable
 /// or any private input while the bounded child is running.
-pub fn run_wm2000_generated_runner_sp_runtime_series_v1(
+pub fn run_generated_runner_sp_runtime_series_v1(
     build: VerifiedGeneratedRunnerBuildV1,
 ) -> Result<VerifiedGeneratedRunnerSpRuntimeSeriesV1, GeneratedRunnerBuildError> {
     let evidence = run_sp_runtime_series_evidence_v1(&build)?;

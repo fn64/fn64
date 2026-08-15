@@ -249,8 +249,8 @@ fn usage() -> String {
 mod production {
     use super::*;
     use fn64_boot_harness::{
-        build_wm2000_generated_runner_v1, GeneratedRunnerWriterAuditSessionV1,
-        Wm2000ExecutableImageGroupV1, Wm2000GeneratedRunnerBuildInputsV1,
+        build_generated_runner_v1, GeneratedRunnerWriterAuditSessionV1,
+        ExecutableImageGroupV1, GeneratedRunnerBuildInputsV1,
         WRITER_AUDIT_BOOTSTRAP_COMPLETED_V1, WRITER_AUDIT_CPU_COMPLETED_V1,
         WRITER_AUDIT_HOST_ABI_COMPLETED_V1, WRITER_AUDIT_PI_COMPLETED_V1,
         WRITER_AUDIT_RDP_RENDERER_COMPLETED_V1, WRITER_AUDIT_RSP_COMPLETED_V1,
@@ -386,13 +386,13 @@ mod production {
         let output = create_private_output_directory(&inputs.output)?;
         print_progress("phase=build state=start");
         let build_started = Instant::now();
-        let build = build_wm2000_generated_runner_v1(Wm2000GeneratedRunnerBuildInputsV1 {
+        let build = build_generated_runner_v1(GeneratedRunnerBuildInputsV1 {
             rom: inputs.rom,
             boot_context: inputs.boot_context,
             executable_image_groups: inputs
                 .image_groups
                 .into_iter()
-                .map(|group| Wm2000ExecutableImageGroupV1 {
+                .map(|group| ExecutableImageGroupV1 {
                     environment_name: group.name,
                     captures: group.captures,
                 })

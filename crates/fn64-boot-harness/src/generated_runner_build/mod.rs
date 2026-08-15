@@ -137,7 +137,7 @@ const PREPARED_SOURCE_MODE_CONSUMED_V1: &str = "prepared_consumed";
 //
 // This is the one compile-time edge from a crate into `examples/`. It is a
 // data file with no code and no dependencies, and the verifier already binds
-// itself to this exact directory by path at runtime (see `wm_shard_root`), so
+// itself to this exact directory by path at runtime (see `shard_root`), so
 // the coupling is stated rather than new.
 //
 // The directory NAME is a build-time selector, not a fixed literal: `build.rs`
