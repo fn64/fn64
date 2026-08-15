@@ -749,7 +749,22 @@ int fn64_rt64_enable_present_capture(
  * must not block or call back into this shim's registration functions.
  * Calling this twice for the same `context` replaces the previously
  * registered callback/user_data rather than erroring, mirroring
- * `fn64_rt64_enable_present_capture`'s idempotent-enable behavior. */
+ * `fn64_rt64_enable_present_capture`'s idempotent-enable behavior.
+ *
+ * LIFETIME: `user_data` must outlive the last DISPATCH, which unregistering
+ * does not wait for. The present thread copies the registrant list and
+ * releases the registry lock before invoking callbacks -- deliberately, so a
+ * callback cannot deadlock against registration -- so a callback already
+ * selected for the in-flight frame still runs after
+ * `fn64_rt64_unregister_overlay_draw` has returned. Freeing whatever
+ * `user_data` points at immediately after unregistering is a use-after-free.
+ * Keep it alive until no present frame that could have observed the
+ * registration is in flight.
+ *
+ * RUST CALLERS: the invocation site catches C++ exceptions, but a Rust
+ * `panic!` unwinding across this `extern "C"` boundary is undefined behavior
+ * and aborts before any C++ handler sees it. Wrap the callback body in
+ * `std::panic::catch_unwind`. */
 int fn64_rt64_register_overlay_draw(
     Fn64Rt64Context *context,
     void (*callback)(void *command_list, void *framebuffer, void *user_data),
@@ -761,6 +776,13 @@ int fn64_rt64_register_overlay_draw(
  * success if `context` has no registered callback. Also called automatically
  * from the context's own destruction, so an explicit call is only needed to
  * stop drawing an overlay before the context itself goes away. */
+/* Removes a callback registered via fn64_rt64_register_overlay_draw.
+ *
+ * NOT A BARRIER: this returns as soon as the registration is removed, without
+ * waiting for an in-flight present frame that may already have selected the
+ * callback to finish running it. See the LIFETIME note on
+ * `fn64_rt64_register_overlay_draw` before freeing anything `user_data`
+ * points at. */
 int fn64_rt64_unregister_overlay_draw(
     Fn64Rt64Context *context,
     char *error,

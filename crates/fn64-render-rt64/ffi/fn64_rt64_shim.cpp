@@ -1144,6 +1144,19 @@ struct DrawHookRegistrant {
 std::mutex draw_hook_registry_mutex;
 std::vector<DrawHookRegistrant> draw_hook_registrants;
 
+// Guards RT64's PROCESS-GLOBAL hook slot, which both registries share.
+//
+// The two registry mutexes cannot do this job: they do not exclude each other,
+// so a present-capture enable and an overlay register could both observe an
+// empty slot and both call SetRenderHooks, and -- worse -- a teardown that had
+// already decided the slot was unneeded could null it AFTER a concurrent
+// register installed itself, leaving that registrant permanently undispatched.
+//
+// Every read-modify-write of the slot holds THIS mutex across the whole
+// check-and-set. Lock order is always registry-then-slot, never the reverse,
+// and no registry mutex is acquired while this one is held.
+std::mutex render_hook_slot_mutex;
+
 std::mutex vi_filter_registry_mutex;
 std::vector<Fn64Rt64Context *> vi_filter_contexts;
 struct ViHistoryRateEntry {
@@ -2830,12 +2843,17 @@ void unregister_present_capture(Fn64Rt64Context *context) {
         context->present_capture_enabled = false;
         present_capture_now_empty = present_capture_contexts.empty();
     }
-    if (present_capture_now_empty &&
-        !draw_hook_slot_still_needed() &&
-        (RT64::GetRenderHookInit() == nullptr) &&
-        (RT64::GetRenderHookDraw() == draw_hook_dispatch) &&
-        (RT64::GetRenderHookDeinit() == nullptr)) {
-        RT64::SetRenderHooks(nullptr, nullptr, nullptr);
+    if (present_capture_now_empty) {
+        // Slot mutex held ACROSS the check and the clear: without it a
+        // concurrent register can install itself between the two and be
+        // silently un-installed here.
+        std::scoped_lock slot_lock(render_hook_slot_mutex);
+        if (!draw_hook_slot_still_needed() &&
+            (RT64::GetRenderHookInit() == nullptr) &&
+            (RT64::GetRenderHookDraw() == draw_hook_dispatch) &&
+            (RT64::GetRenderHookDeinit() == nullptr)) {
+            RT64::SetRenderHooks(nullptr, nullptr, nullptr);
+        }
     }
 }
 
@@ -2861,6 +2879,7 @@ void unregister_overlay_draw(Fn64Rt64Context *context) {
     }
     if (draw_hook_now_empty) {
         std::scoped_lock present_capture_lock(present_capture_registry_mutex);
+        std::scoped_lock slot_lock(render_hook_slot_mutex);
         if (present_capture_contexts.empty() &&
             (RT64::GetRenderHookInit() == nullptr) &&
             (RT64::GetRenderHookDraw() == draw_hook_dispatch) &&
@@ -4344,11 +4363,16 @@ extern "C" int fn64_rt64_present(
 // Installs draw_hook_dispatch as RT64's single draw hook if the slot is
 // currently empty, or verifies this shim already owns it if not. Shared by
 // both registration entry points (present-capture and the overlay-draw
-// registry) since either may be the first caller to need the slot. Caller
-// must hold the mutex for whichever registry it is registering into; this
-// function does not take any lock itself, it only inspects/installs the
-// global RT64 hook state.
+// registry) since either may be the first caller to need the slot.
+//
+// Takes `render_hook_slot_mutex` ITSELF. The caller's registry mutex cannot
+// serialize this: present-capture and overlay callers hold DIFFERENT mutexes,
+// which do not exclude each other, so both could observe an empty slot and
+// both call SetRenderHooks. Callers may hold their own registry mutex when
+// calling this -- order is registry-then-slot everywhere, and this function
+// never acquires a registry mutex, so the order cannot inverse.
 bool ensure_draw_hook_dispatch_installed(char *error, size_t error_capacity) {
+    std::scoped_lock slot_lock(render_hook_slot_mutex);
     if ((RT64::GetRenderHookInit() == nullptr) &&
         (RT64::GetRenderHookDraw() == nullptr) &&
         (RT64::GetRenderHookDeinit() == nullptr)) {
