@@ -15,6 +15,7 @@
 //! directly keeps this test in the tens-of-milliseconds range rather than
 //! minutes.
 
+use crate::generated_runner_build::stage::game_package_root;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -149,7 +150,10 @@ fn shard_inventory_selector_expresses_a_second_differently_shaped_title() {
     fs::create_dir_all(&scratch).expect("create scratch directory");
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let wm2000_dir = manifest_dir.join("../../examples/wm2000-block-shards");
+    // Resolved, not hardcoded: the game packages may live outside this repo.
+    let wm2000_dir = game_package_root()
+        .expect("resolve game package root")
+        .join("wm2000-block-shards");
     let nomercy_fixture_dir = manifest_dir
         .join("src/generated_runner_build/tests/fixtures/nomercy-shard-topology");
 

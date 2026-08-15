@@ -64,7 +64,9 @@ fn shard_source_graph_uses_hardened_sibling_paths() {
         .parent()
         .and_then(Path::parent)
         .expect("boot-harness crate is under the workspace crates directory");
-    let package_root = repo_root.join("examples/wm2000-block-boot");
+    let package_root = game_package_root()
+        .expect("resolve game package root")
+        .join("wm2000-block-boot");
     let shard_root = shard_root(&package_root).expect("derive shard sibling");
     assert!(
         !shard_root
@@ -1285,7 +1287,9 @@ fn cargo_progress_counts_completed_shard_libraries_without_content() {
 fn selected_build_command_binds_two_jobs_and_the_exact_process_group_guard() {
     let workspace = repository_workspace().unwrap();
     let guard = workspace.join("scripts/memory-guard.zsh");
-    let manifest = workspace.join("examples/wm2000-block-boot/Cargo.toml");
+    let manifest = game_package_root()
+        .expect("resolve game package root")
+        .join("wm2000-block-boot/Cargo.toml");
     let staged_boot_context =
         PathBuf::from("/private/tmp/fn64-command-policy/private-inputs/boot-context.json");
     let inputs = GeneratedRunnerBuildInputsV1 {
