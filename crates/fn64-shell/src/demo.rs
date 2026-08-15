@@ -118,6 +118,8 @@ impl ApplicationHandler for Demo {
         if self.window.is_some() {
             return;
         }
+        // Same 2x as the game path, deliberately: the demo mirrors production
+        // window geometry so a layout problem seen here is a real one there.
         let size = LogicalSize::new((FB_WIDTH * 2) as f64, (FB_HEIGHT * 2) as f64);
         let attrs = Window::default_attributes()
             .with_title("fn64 -- UI demo (no game linked)")
