@@ -250,7 +250,7 @@ fn source_tree_sha256(domain: &[u8], files: &[PathBuf]) -> [u8; 32] {
 
 fn cargo_source_receipts() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     let root_adapter_source_sha256 = source_tree_sha256(
-        b"fn64:wm2000-root-adapter-source:v1:",
+        b"fn64:block-boot-root-adapter-source:v1:",
         &[
             PathBuf::from("Cargo.toml"),
             PathBuf::from("Cargo.lock"),
@@ -288,7 +288,7 @@ fn cargo_source_receipts() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     );
     shard_sources.extend(manifests);
     let shard_cargo_source_tree_sha256 =
-        source_tree_sha256(b"fn64:wm2000-shard-cargo-source-tree:v1:", &shard_sources);
+        source_tree_sha256(b"fn64:block-boot-shard-cargo-source-tree:v1:", &shard_sources);
     let emitter_source_sha256 =
         fn64_recomp_rs_codegen::generated_runner_emitter_source_receipt_v2().source_sha256();
     let runtime_source_sha256 =
@@ -569,7 +569,7 @@ fn main() {
     // derives for the same generation.
     let resident_tail_generation_id =
         fn64_discover::generation_topology::resident_tail_generation_id_v1(
-            b"fn64:wm2000-resident-tail-generation:v1:",
+            b"fn64:block-boot-resident-tail-generation:v1:",
             &rom.sha256,
             resident_image_start,
             resident_tail_image_end,
@@ -601,7 +601,7 @@ fn main() {
         &rom,
         &combined_dense_pack,
         fn64_discover::banks::BOOT_BANK,
-        b"fn64:wm2000-resident-tail-generation:v1:",
+        b"fn64:block-boot-resident-tail-generation:v1:",
         &overlay_recipes,
     )
     .expect("wm2000-block-boot build.rs: building dense generation topology");
@@ -1479,7 +1479,7 @@ fn main() {
     let _ = writeln!(pack, "];");
 
     let mut dispatch_identity = Sha256::new();
-    dispatch_identity.update(b"fn64:wm2000-production-dispatch-input:v1:");
+    dispatch_identity.update(b"fn64:block-boot-production-dispatch-input:v1:");
     dispatch_identity.update((dispatch_source.len() as u64).to_be_bytes());
     dispatch_identity.update(&dispatch_source);
     dispatch_identity.update(external_runner_source_sha256);
