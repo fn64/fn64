@@ -66,7 +66,7 @@ metadata_sha256 <lowercase nonzero SHA-256>
 ```
 
 The 35 artifact lines use the exact sorted package inventory in
-`examples/wm2000-block-shards/materializer.rs`. Extra, missing, duplicated, or
+`recomps/wm2000/packages/wm2000-block-shards/materializer.rs`. Extra, missing, duplicated, or
 reordered lines fail closed. Each root artifact line cross-binds the exact
 sidecar and both files; the sidecar repeats the two artifact digests and denies
 extra or reordered fields. The manifest and sidecars contain identities only.

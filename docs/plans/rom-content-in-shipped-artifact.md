@@ -63,7 +63,7 @@ from guest memory before executing it, to catch self-modifying writes
 (`emit/mod.rs:567-574`, `:601-613`).
 
 **This is already gated.** `emit_live_word_verification()`
-(`examples/wm2000-block-shards/build.rs:161-170`) reads
+(`recomps/wm2000/packages/wm2000-block-shards/build.rs:161-170`) reads
 `FN64_WM_SHARD_VERIFY_LIVE_WORDS`; when off, the emitter is passed
 `verify_live_words: false` (`build.rs:392`) and the `if verify_live_words`
 guard at `emit/mod.rs:593` skips the array entirely. The whole detector
@@ -94,7 +94,7 @@ modified `build.rs`), but the mechanism is complete.
 
 This is the channel that is not solved, and it is the same bytes again.
 
-`examples/wm2000-block-shards/build.rs:449-453` emits, per shard:
+`recomps/wm2000/packages/wm2000-block-shards/build.rs:449-453` emits, per shard:
 
 ```rust
 let _ = write!(metadata, "pub static WORDS: &[u32] = &[");
@@ -103,7 +103,7 @@ for word in words {
 }
 ```
 
-`examples/wm2000-block-shards/lib.rs:10` `include!`s that into every shard
+`recomps/wm2000/packages/wm2000-block-shards/lib.rs:10` `include!`s that into every shard
 crate, and `lib.rs:12-15` exposes it:
 
 ```rust
@@ -113,7 +113,7 @@ pub fn code_bank() -> CodeBank {
 ```
 
 **It is linked and called in the shipped binary.**
-`examples/wm2000-block-boot/src/dense_aot.rs:6-...` registers all 32 shards'
+`recomps/wm2000/packages/wm2000-block-boot/src/dense_aot.rs:6-...` registers all 32 shards'
 `code_bank` function pointers, and `block_program.rs:96` and `:154` invoke them
 during program construction. So this is not dead weight the linker strips.
 
@@ -192,7 +192,7 @@ falsification for the check that would settle it against the actual binary.
 
 ### 1f. External executable images — verbatim, small, and capture-derived
 
-`examples/wm2000-block-boot/build.rs:1124-1133` emits
+`recomps/wm2000/packages/wm2000-block-boot/build.rs:1124-1133` emits
 `EXTERNAL_IMAGE_NN_WORDS` arrays, linked via `EXTERNAL_EXECUTABLE_IMAGES`
 (`:1136-1160`) and printed at startup (`shell.rs:606`).
 
@@ -384,7 +384,7 @@ equivalence test (`crates/fn64-recomp-rs/tests/interp_differential.rs`).
 It is **excluded from the shipping build by compile error**:
 `crates/fn64-recomp-rs/src/lib.rs:33-34` makes `production-aot` and
 `dev-interpreter` mutually exclusive, and
-`examples/wm2000-block-boot/Cargo.toml:46` selects `production-aot`.
+`recomps/wm2000/packages/wm2000-block-boot/Cargo.toml:46` selects `production-aot`.
 `dev_interpreter_artifact.rs:8` exists so a byte scan can *prove* a shipped
 binary contains no interpreter.
 
@@ -417,7 +417,7 @@ release configuration by itself.
 
 ## What was built
 
-`examples/wm2000-block-boot`, `--release --features rt64`, both lanes, separate
+`recomps/wm2000/packages/wm2000-block-boot`, `--release --features rt64`, both lanes, separate
 `CARGO_TARGET_DIR`s so neither clobbers the other. Script:
 `scripts/rom-content-audit-build.zsh`. Both exit 0.
 
@@ -790,7 +790,7 @@ this same program known to carry ROM words proves it works *on this shape*.
 
 ## MEASURED RESULT
 
-Built `examples/wm2000-block-boot`, `--release --features rt64`, geometry
+Built `recomps/wm2000/packages/wm2000-block-boot`, `--release --features rt64`, geometry
 substitution plus `FN64_WM_SHARD_VERIFY_LIVE_WORDS=0`.
 
 ### The search: zero ROM words
@@ -1159,7 +1159,7 @@ reports zero ROM-word hits with its controls passing.
 **Guest byte-identity** (the emulated program must be unchanged):
 
 ```
-reference/wm2000-routes/render-benchmark.zsh \
+recomps/wm2000/reference/wm2000-routes/render-benchmark.zsh \
   --binary target-audit-geometry/release/wm2000-block-boot --steps 1500000
 python3 scripts/check-byte-identity.py scripts/byte-identity-1p5M.txt \
   /tmp/fn64-render-benchmark-<pid>-<stamp>.log

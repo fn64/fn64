@@ -57,7 +57,7 @@ claims makes all the greens beneath it worth less.
   a hash in a doc is either load-bearing (a test owns it) or prose (don't cite
   it as evidence).
 - [ ] **V2 the only integration gate asserts liveness, not correctness.**
-  `examples/oot-boot/tests/boot_depth.rs:27,91` asserts only
+  `recomps/wm2000/packages/oot-boot/tests/boot_depth.rs:27,91` asserts only
   `swaps >= MIN_EXPECTED_SWAPS` (200). OoT could render pure garbage for 200
   swaps and pass. It is a floor against regression-to-dead, nothing more —
   which is fine, but nothing else covers correctness end-to-end, so the gate's
@@ -231,7 +231,7 @@ and scope limits that make an open item meaningful.
 
   **TOOLING — what exists, and the gap (answer this before iterating).**
   - EXISTS: `OOT_SWAP_TIMING=1` prints `SWAP_TIMING swap=N dt_ms=X` per swap
-    (`examples/oot-boot/src/main.rs:588,643`). But the headless harness runs
+    (`recomps/wm2000/packages/oot-boot/src/main.rs:588,643`). But the headless harness runs
     flat out, so this measures COMPUTE COST, not delivery cadence. Useful as a
     budget check (rs gameplay is ~3.8 ms median, far inside 16.67), useless as
     a rate check.

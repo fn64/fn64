@@ -27,7 +27,7 @@ No code changed. The finding is the deliverable, plus one new tool.
 
 Every one of those rows came from **self time alone**. Self time says what is
 executing; it does not say *why it was called*, and for these four frames the
-"why" is the whole answer. `scripts/wm2000_callers.py` (added by this wave)
+"why" is the whole answer. `recomps/wm2000/scripts/wm2000_callers.py` (added by this wave)
 resolves the frame above the leaf and settles it.
 
 ## Target by target
@@ -195,7 +195,7 @@ hardened goal, and it is a harness gap, not an optimization gap.
 
 ## Tooling added
 
-`scripts/wm2000_callers.py` — caller attribution for an `xctrace` cpu-profile
+`recomps/wm2000/scripts/wm2000_callers.py` — caller attribution for an `xctrace` cpu-profile
 export. Same two hard-won rules as `wm2000_self_time.py` (leaf is the innermost
 frame; each run is slid with its own `load-addr`), plus a `--selftest` that
 pins the caller rule on a synthetic export. `--leaves` reproduces the self-time

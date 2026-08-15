@@ -94,7 +94,7 @@ Discovered while reading; each one would have broken a naive implementation.
    (`frame_census.rs:599`) registers an `atexit` hook from *inside* `fn64-abi`,
    reached from `host::advance_virtual_time` (`host.rs:50`) — the one seam both
    the headless and windowed lanes cross. This was done deliberately so that
-   `examples/wm2000-block-boot/src/main.rs`, hashed into
+   `recomps/wm2000/packages/wm2000-block-boot/src/main.rs`, hashed into
    `DISPATCH_SOURCE_SHA256`, never needs editing. **The profile report hooks the
    same seam and inherits that property**: no hashed file is touched, and the
    emulated program is unchanged.
@@ -198,7 +198,7 @@ printed without its distribution beside it.**
 
 ### 5. One command
 
-`reference/wm2000-routes/render-benchmark.zsh --profile` exports the whole set
+`recomps/wm2000/reference/wm2000-routes/render-benchmark.zsh --profile` exports the whole set
 correctly (it currently exports *none* of the five). One documented command,
 runnable without reading 32 rules first.
 

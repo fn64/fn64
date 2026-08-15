@@ -64,7 +64,7 @@ read `"vpw2-block"`, not the templated WM2000 value.
 
 ## Step 3 — create the boot example
 
-Copy `examples/nomercy-block-boot/` to `examples/vpw2-block-boot/` — it is the
+Copy `recomps/wm2000/packages/nomercy-block-boot/` to `examples/vpw2-block-boot/` — it is the
 closest template because its Cargo.toml already carries the three edits WM2000's
 needs and No Mercy's had to make. Then, per the `09155dd` commit message, verify
 all three are present and retargeted:

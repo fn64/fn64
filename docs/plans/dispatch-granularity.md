@@ -5,7 +5,7 @@ Investigation record. Answers the question left open by
 run would still be ~5,700x slower than hardware, because a dispatch advances
 only 3 guest cycles. This document establishes what actually ends a dispatch.
 
-Measured 2026-08-06 on WM2000, `examples/wm2000-block-boot`, Apple Silicon,
+Measured 2026-08-06 on WM2000, `recomps/wm2000/packages/wm2000-block-boot`, Apple Silicon,
 branch `fix/overlay-stride-aliases`.
 
 ## Headline
@@ -440,7 +440,7 @@ The census is gated on `FN64_DISPATCH_CENSUS` and is observation-only —
 `sim_time` is byte-identical with and without it.
 
 ```
-cd examples/wm2000-block-boot
+cd recomps/wm2000/packages/wm2000-block-boot
 source ../../.claude/local.env
 export ROM="$FN64_DISCOVER_NWXE_ROM"
 C=~/Code/aki-recomp/captures; G="$C/wm-general-exception-images"
@@ -481,7 +481,7 @@ was reverted.
 The default benchmark runs the **static** catalog path
 (`run_catalog_block_program`, `runners.rs:1006`). The dynamic mapped lane is
 behind the non-default `dynamic-withheld` feature
-(`examples/wm2000-block-boot/Cargo.toml:29-32`) and was not exercised here.
+(`recomps/wm2000/packages/wm2000-block-boot/Cargo.toml:29-32`) and was not exercised here.
 
 Worth recording for whoever touches that lane: its unit is far smaller still.
 `DynamicMappedUnitCatalogV1::activate_and_run_with_memory_port`

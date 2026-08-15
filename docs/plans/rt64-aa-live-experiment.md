@@ -39,7 +39,7 @@ after each transition before comparing `pump_ms`, frame cadence, and audio
 starvation; a window spanning two modes is not an A/B observation.
 
 For arbitrary live values, copy
-`examples/wm2000-block-boot/rt64-aa.example.toml` outside the repository and
+`recomps/wm2000/packages/wm2000-block-boot/rt64-aa.example.toml` outside the repository and
 launch with:
 
 ```text

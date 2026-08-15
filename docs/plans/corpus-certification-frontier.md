@@ -444,7 +444,7 @@ depends on, so it is left standing and recorded here instead.
 ## WM2000 gameplay: the blocker is self-modifying code, under-declared
 
 The playable binary now builds and boots (121 MB), and running the committed
-route at `reference/wm2000-routes/entrance-to-match.schedule` fails with:
+route at `recomps/wm2000/reference/wm2000-routes/entrance-to-match.schedule` fails with:
 
 ```
 executable mutation changed physical RDRAM [0x0009b0b3, 0x0009b0b4)
@@ -660,7 +660,7 @@ exposes those three functions, in place of the out-of-tree
 `oot-recompiled = { path = "recompiled" }` it links today.
 
 WM2000's emitted code already exists as the 35 dense-AOT shards the block lane
-builds and certifies, but `examples/wm2000-block-shards/lib.rs` exports only
+builds and certifies, but `recomps/wm2000/packages/wm2000-block-shards/lib.rs` exports only
 `code_bank`. Bridging that to the three-function interface -- entry lookup,
 thread bootstrap, and entrypoint -- is the whole of Blocker B.
 
@@ -997,7 +997,7 @@ investment in iteration speed.
 Worth separating, because the two numbers look contradictory and only one is
 about pacing.
 
-`docs/BOOT-NOTES-WM2000.md:1681` measured **22.027 s executor time against
+`recomps/wm2000/docs/BOOT-NOTES-WM2000.md:1681` measured **22.027 s executor time against
 ~6.39 s of guest time** on a 100,000-step route -- about 3.4x slower than
 realtime, with the guest actually retiring instructions.
 
@@ -1600,7 +1600,7 @@ length (`0x27230`) nor overlay D's (`0x72380`), so the question can never be
 answered yes by correctly-loaded memory.
 
 And the mystery extent is now identified. It is not an overlay at all: it is
-the RESIDENT TAIL generation, built at `examples/wm2000-block-boot/build.rs:496-509`:
+the RESIDENT TAIL generation, built at `recomps/wm2000/packages/wm2000-block-boot/build.rs:496-509`:
 
     resident_image_start = min(recipe.load_start)          = 0x800e1b90
     resident_image_end   = va_start + bank_bytes.len()
@@ -1768,7 +1768,7 @@ configuration, and `gate_rom_recompile` -- the generic gate, which takes only
 `FN64_DISCOVER_ROM` -- reports `unsupported=0` for Revenge and World Tour,
 matching the other three. That half of the pipeline is genuinely general.
 
-The runtime lane is not. `examples/wm2000-block-boot` names WM2000 in 63
+The runtime lane is not. `recomps/wm2000/packages/wm2000-block-boot` names WM2000 in 63
 places, its 35 dense-AOT shard packages are all `wm2000-block-*`, and the only
 captures on disk are `wm2000-boot-context.json` and one WM2000 exception-image
 group. So the other four titles have never been booted, not because they fail,
@@ -1790,7 +1790,7 @@ for every title, so solving it once on WM2000 should carry.
 
 ## Title-generic boot lane: three of five reach it, one wall remains
 
-Generalizing `examples/wm2000-block-boot/build.rs` removed the assertions that
+Generalizing `recomps/wm2000/packages/wm2000-block-boot/build.rs` removed the assertions that
 pinned it to WM2000, all of which were unnecessary -- every geometry it needs
 was already DERIVED from discovery:
 
@@ -1831,7 +1831,7 @@ misdiagnoses World Tour.
 ### The remaining wall: the shard package inventory is fixed
 
 `PREPARED_PACKAGES` is a 35-entry array encoding WM2000's shard distribution.
-Shard COUNT is derived per generation (`examples/wm2000-block-shards/build.rs:312`),
+Shard COUNT is derived per generation (`recomps/wm2000/packages/wm2000-block-shards/build.rs:312`),
 but the package LIST is not, so a title whose overlays tile differently cannot
 be expressed:
 
@@ -1858,7 +1858,7 @@ each eliminated by direct inspection rather than by argument:
   i.e. `len=0x27230`. Discovery reports exactly that. The game's table says the
   overlay is `0x27230` bytes.
 - **(b) publication stops short -- DEAD.** The lane publishes only the IPL3
-  1 MiB boot copy (`examples/wm2000-block-boot/src/main.rs:944`); overlays are
+  1 MiB boot copy (`recomps/wm2000/packages/wm2000-block-boot/src/main.rs:944`); overlays are
   never published, so publication cannot truncate one.
 - **the pack clipped the generation -- DEAD.** The generated `pack.rs` carries
   overlay A as `image_start: 0x800E1B90, image_end: 0x80108DC0`, the full

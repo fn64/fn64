@@ -46,7 +46,7 @@ crate's own transplant integration test (deleted 2026-07-17; see this file's hea
 
 ## 2. Real-bug localization: OoT boot, Main-resume SIGBUS
 
-Ran the REAL OoT boot harness (`examples/oot-boot`, standalone workspace) against the
+Ran the REAL OoT boot harness (`recomps/wm2000/packages/oot-boot`, standalone workspace) against the
 real out-of-tree corpus:
 
 ```
@@ -101,5 +101,5 @@ fixing it is a follow-up task against `fn64-runtime::executor`/`mesgqueue`/`thre
 ## 3. Gate status
 
 `cargo build/test/clippy -D warnings/fmt --check` all green in `crates/fn64-diff` at
-this commit (see workspace CI); the standalone `examples/oot-boot` workspace builds and
+this commit (see workspace CI); the standalone `recomps/wm2000/packages/oot-boot` workspace builds and
 runs (not part of the gated workspace, per its own `Cargo.toml` isolation policy).

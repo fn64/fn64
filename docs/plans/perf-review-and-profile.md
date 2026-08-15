@@ -2,7 +2,7 @@
 
 Adversarial review of the seven correctness-sensitive changes in
 `git diff 61a6adf..HEAD`, plus the first working self-time profile of
-`examples/wm2000-block-boot`.
+`recomps/wm2000/packages/wm2000-block-boot`.
 
 Reviewed 2026-08-07 on Apple Silicon, branch `fix/overlay-stride-aliases`.
 Each of the seven was written and verified by a different agent in isolation;
@@ -335,7 +335,7 @@ One permissive default out of six, and it is S1.
 ### Method
 
 Added `[profile.release.package.wm2000-block-boot] debug = 1` to
-`examples/wm2000-block-boot/Cargo.toml`. The `debug = false` at `:94-99` is
+`recomps/wm2000/packages/wm2000-block-boot/Cargo.toml`. The `debug = false` at `:94-99` is
 about the *generated shard crates* and stays false for them; the root package
 inheriting it is why `sample` attributed 99.99% to `wm2000_block_boot::main`.
 Cost of the change: the relink took **10.2s** and the binary grew 53 KB
@@ -601,7 +601,7 @@ changes. Items 1-3 are strictly better uses of the same time.
 ## Reproducing
 
 ```
-cd examples/wm2000-block-boot
+cd recomps/wm2000/packages/wm2000-block-boot
 source ../../.claude/local.env
 export ROM="$FN64_DISCOVER_NWXE_ROM"
 C=~/Code/aki-recomp/captures; G="$C/wm-general-exception-images"

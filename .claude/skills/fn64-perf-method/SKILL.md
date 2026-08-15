@@ -117,7 +117,7 @@ dirty tree says nothing about HEAD.
 
 **2. Self time = count minus immediate children.** A sampling profiler
 attributes samples to every frame on the stack. Use
-`scripts/wm2000_self_time.py`. Corollary: **`executor_ns` is INCLUSIVE** —
+`recomps/wm2000/scripts/wm2000_self_time.py`. Corollary: **`executor_ns` is INCLUSIVE** —
 reading it as a peer of `gfx_ns` rather than its parent concealed 21.72 ms of a
 35.84 ms field.
 

@@ -1248,7 +1248,7 @@ exact logical byte length, and SHA-256 in the
 The emitted crate is out-of-tree, game-derived material, and per `AGENTS.md`
 it must never enter git or the main workspace graph. That constraint — not
 taste — is why the rs lane builds through **standalone manifests carrying
-their own `[workspace]`** (`examples/oot-boot/rs/Cargo.toml`,
+their own `[workspace]`** (`recomps/wm2000/packages/oot-boot/rs/Cargo.toml`,
 `crates/fn64-shell/rs/Cargo.toml`) that reuse the sibling `src/main.rs` and
 `build.rs` rather than duplicating them. A gitignored `recompiled` symlink is
 refreshed from `RECOMP_RS_DIR` before Cargo resolves the graph. A standalone
@@ -2398,7 +2398,7 @@ the one `Yield`/`Resume` closes — not a residual instance of the same one.**
   type to govern. `fn64-abi/src/lib.rs`'s
   `a_running_threads_own_body_can_call_os_create_thread_recomp_without_reentrancy_panic`
   test is the regression test for exactly this shape, reproducing what
-  `examples/wm2000-boot`'s boot harness hit for real on its very first
+  `recomps/wm2000/packages/wm2000-boot`'s boot harness hit for real on its very first
   `osCreateThread` call.
 - **Why this is memory-safe despite looking like `&mut` aliasing**: the
   outer `with_executor` closure does not read or write `Executor` state
@@ -2437,7 +2437,7 @@ the one `Yield`/`Resume` closes — not a residual instance of the same one.**
 shape at all, given the design this project already committed to (single
 executor, stackful coroutines, synchronous shim calls). Removing it would
 not be "relying on the type system instead" — it would just reintroduce the
-exact panic `examples/wm2000-boot` hit, with no compile-time replacement
+exact panic `recomps/wm2000/packages/wm2000-boot` hit, with no compile-time replacement
 available under this architecture.
 
 ## 3. Memory model
@@ -2969,10 +2969,10 @@ display backend exists yet), which is sufficient for THIS gate (a clean
 *link*, not a clean *boot to idle* — that's M1's "boot-to-idle parity"
 milestone in §4, separate and not yet attempted).
 
-**M1 boot-host attempt (2026-07-14): `examples/wm2000-boot`, first real boot
+**M1 boot-host attempt (2026-07-14): `recomps/wm2000/packages/wm2000-boot`, first real boot
 run against the linked archive.** Per the task's own scope (a headless boot
 host taking `RECOMPILED_DIR`/`RECOMP_H_DIR`/`ROM` env vars, zero game content
-in-repo — `examples/wm2000-boot/build.rs` and the shared
+in-repo — `recomps/wm2000/packages/wm2000-boot/build.rs` and the shared
 `crates/fn64-boot-harness/bridge/section_bridge.c`): this is
 the FIRST time the M1-linked archive was actually RUN, not just linked, and
 it surfaced four real, load-bearing bugs the trial-link gate above could not

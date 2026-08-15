@@ -17,6 +17,7 @@ ponytail: five greps and a file-exists check, no schema, no deps. If this ever
 needs a real graph model, the answer is `keel` (github.com/jer/keel), not a
 bigger script.
 """
+import os
 import re
 import subprocess
 import sys
@@ -174,6 +175,23 @@ def check_env_vars() -> None:
         cwd=ROOT, capture_output=True, text=True,
     ).stdout
     live = set(src.split())
+    # The game harnesses were extracted to their own repository, but fn64's docs
+    # still cite the variables those harnesses consume -- and correctly so: the
+    # variables are real, they just are not in this tree any more. Scanning the
+    # extracted repo when it is present keeps the drift rule honest instead of
+    # flagging 61 live variables as absent.
+    #
+    # `FN64_SHARD_ROOT` points at the game packages (see fn64-boot-harness's
+    # build.rs). Unset or missing, this is a no-op: an absent game repo simply
+    # means those citations cannot be checked, not that they are wrong.
+    shard_root = os.environ.get("FN64_SHARD_ROOT")
+    if shard_root:
+        game_repo = Path(shard_root).parent
+        if game_repo.is_dir():
+            live |= set(subprocess.run(
+                ["grep", "-rhoE", r"(FN64|OOT|RECOMP)_[A-Z0-9_]+", str(game_repo)],
+                capture_output=True, text=True,
+            ).stdout.split())
     for doc in docs():
         text = doc.read_text()
         if superseded(text):

@@ -42,8 +42,8 @@ ports and fn64. When this document says "they," it means **jessetbh's shipped
 ports**, the actual comparison target.
 
 Background framing (relevant but not the body): fn64 also consumes
-N64Recomp-generated C as an oracle lane in `examples/oot-boot`,
-`examples/sm64-boot`, and `examples/wm2000-boot`. The general N64Recomp
+N64Recomp-generated C as an oracle lane in `recomps/wm2000/packages/oot-boot`,
+`recomps/wm2000/packages/sm64-boot`, and `recomps/wm2000/packages/wm2000-boot`. The general N64Recomp
 lineage's constraint — it requires an ELF from a decompilation project
 ([README](https://github.com/N64Recomp/N64Recomp#how-to-use)) — is the backdrop
 against which the AKI work is impressive, because **no public decomp of these
@@ -72,7 +72,7 @@ fn64's five AKI titles pass *CPU recompilation only*, which
 `docs/plans/aki-recompile-certification.md:12-16` is explicit does **not**
 prove a booting game: "RSP audio and RDP graphics are separate subsystems and
 the gate never consults host bindings." WM2000 boots and renders but is not
-playable — `docs/plans/wm2000-playable-blocker-ledger.md:1-5` frames playability
+playable — `recomps/wm2000/docs/wm2000-playable-blocker-ledger.md:1-5` frames playability
 as the *goal*, with a live journal blocker still open.
 
 **The uncomfortable part:** the per-title manual effort we are trying to
@@ -100,7 +100,7 @@ From each README's own status line and Known Issues.
 
 fn64 column verified at `docs/plans/aki-recompile-certification.md:18-24` (all
 five PASS, WM2000 43,032 blocks / VPW2 49,329 / No Mercy 57,284 / Revenge
-25,057 / World Tour 25,375) and `docs/plans/wm2000-playable-blocker-ledger.md`.
+25,057 / World Tour 25,375) and `recomps/wm2000/docs/wm2000-playable-blocker-ledger.md`.
 
 ### Their known-broken subsystems
 
@@ -265,7 +265,7 @@ composed matrices." This defeats RT64's interpolation heuristics and blocks
 high-framerate support family-wide, needing "game-side matrix-group patches."
 
 fn64 has not reached this problem — WM2000 renders (1,707 graphics submits on
-a 420k-step route, `docs/plans/wm2000-playable-blocker-ledger.md:14-18`) but
+a 420k-step route, `recomps/wm2000/docs/wm2000-playable-blocker-ledger.md:14-18`) but
 has no interpolation work. **Their documented failure is a preview of ours.**
 
 ### 3e. Save media differs per title
@@ -305,12 +305,12 @@ it from ROM bytes where they hand-declared it in a splat yaml.**
   multiplayer, a 20 KB controller DB, and AKI-tailored default mappings. Our
   controller input is a scheduled replay file — without
   `FN64_CONTROLLER_SCHEDULE` "every controller read returned
-  `ContInput::default()`" (`docs/plans/wm2000-playable-blocker-ledger.md:11-14`).
+  `ContInput::default()`" (`recomps/wm2000/docs/wm2000-playable-blocker-ledger.md:11-14`).
   That is a test harness, not player input.
 - **Saves**: they persist cart/flash/SRAM/Controller Pak per title. fn64 has
   no shipped save persistence for these titles.
 - **Audio**: they ship music and SFX in full matches. fn64's
-  `docs/WM2000-AUDIO-STATUS.md:1-4` is a live status doc, with the RSP audio
+  `recomps/wm2000/docs/WM2000-AUDIO-STATUS.md:1-4` is a live status doc, with the RSP audio
   stack working end-to-end in `fn64-shell` but not certified in a playable game.
 - **Distribution**: SHA256-verified releases, a launcher, ROM intake
   validation, RetroAchievements integration in No Mercy. We have gates.
@@ -331,7 +331,7 @@ it from ROM bytes where they hand-declared it in a splat yaml.**
   to watched executable ranges fail the next dispatch
   (`crates/fn64-runtime/src/executor/mod.rs:193-195`). It caught a real bug:
   `mirror_queue_to_rdram` writing an `OSMesgQueue` field undeclared at step
-  ~1,183,304 (`docs/plans/wm2000-playable-blocker-ledger.md:41-45`). **No
+  ~1,183,304 (`recomps/wm2000/docs/wm2000-playable-blocker-ledger.md:41-45`). **No
   equivalent exists in their stack** — I searched READMEs, configs, and issues
   and found none. *Inference, labeled:* an unjournaled executable write in
   their model would silently run stale translated code.
@@ -353,7 +353,7 @@ it from ROM bytes where they hand-declared it in a splat yaml.**
   (§3a/§3b). **PARITY**, with a caveat we should verify.
 - **RSP audio microcode**: both recompile it (their `rsp/*_audio.toml`; our
   `crates/fn64-audio/src/rsp/`). Ours is clean-room MIT by necessity
-  (`docs/WM2000-AUDIO-STATUS.md:7-11`) since we cannot depend on GPL-3.0
+  (`recomps/wm2000/docs/WM2000-AUDIO-STATUS.md:7-11`) since we cannot depend on GPL-3.0
   `librecomp/rsp.hpp`. **PARITY on capability, N/A on approach.**
 - **Frame interpolation / HFR**: neither has it. **PARITY, both absent.**
 - **Mod support**: planned by them, not attempted by us. **N/A.**

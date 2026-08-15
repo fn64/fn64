@@ -122,7 +122,7 @@ Every claim below carries `file:line` from this worktree.
 - **AI.** `crates/fn64-abi/src/ai.rs:47/105/131/173`.
 - **RSP audio, LLE, clean-room.** `crates/fn64-audio/src/rsp/` — scalar+VU
   interpreter, MIT by necessity since the GPL `librecomp/rsp.hpp` cannot be
-  depended on (`docs/WM2000-AUDIO-STATUS.md:7-11`). The AKI family ships one
+  depended on (`recomps/wm2000/docs/WM2000-AUDIO-STATUS.md:7-11`). The AKI family ships one
   shared 3,156-byte audio ucode, byte-identical across all five titles
   (`WM2000-AUDIO-STATUS.md`, "WM2000 audio execution"). A guarded run completed
   **985 audio tasks**, delivered 984 buffers / 1,031,872 samples with 459,481
@@ -160,10 +160,10 @@ Every claim below carries `file:line` from this worktree.
   through #480) that only the shell's post-present path can emit.
 
 **Two harnesses, and the distinction matters below.** `crates/fn64-shell` is the
-general shell above; `examples/wm2000-block-boot` is a separate WM2000-specific
-headless/windowed harness — it is what `run-wm2000.sh:21` launches, it owns
+general shell above; `recomps/wm2000/packages/wm2000-block-boot` is a separate WM2000-specific
+headless/windowed harness — it is what `recomps/wm2000/run.sh:21` launches, it owns
 `FN64_CONTROLLER_SCHEDULE`, and it uses `InMemorySaveStorage`
-(`examples/wm2000-block-boot/src/main.rs:793`). Nearly every recorded WM2000
+(`recomps/wm2000/packages/wm2000-block-boot/src/main.rs:793`). Nearly every recorded WM2000
 number comes from that lane, not from `fn64-shell`.
 
 ### Deliberate, documented no-ops (correct, not gaps)
@@ -186,7 +186,7 @@ hazards. Both have moved since it was written.
   preempts on an instruction budget (`Yield::InstructionCheckpoint`,
   `crates/fn64-runtime/src/executor/mod.rs:1637`) rather than relying on
   voluntary yields, and WM2000 routes report `idle_steps=0` throughout
-  (`docs/plans/wm2000-playable-blocker-ledger.md:1730`) while taking 4,477
+  (`recomps/wm2000/docs/wm2000-playable-blocker-ledger.md:1730`) while taking 4,477
   controller reads. **Not a gap.**
 - **The music-sequence assert that parks a thread forever.** The prior doc
   called this unmitigated in fn64. It is no longer. `dispatch.rs:15-22` records
@@ -212,12 +212,12 @@ lanes.
 **In the headless route harness, WM2000 draws the game.** It renders its **match
 setup screen** — Exhibition / Single Match / 1P VS 2P / New Belt / Non Title
 Match / Controller Pak — captured at frame 1,599 of a 1.5M-step scheduled route
-and committed at `reference/wm2000-frames/match-setup-screen.png`
-(`docs/plans/wm2000-playable-blocker-ledger.md:1717-1733`). 2,239 frames dumped
+and committed at `recomps/wm2000/reference/wm2000-frames/match-setup-screen.png`
+(`recomps/wm2000/docs/wm2000-playable-blocker-ledger.md:1717-1733`). 2,239 frames dumped
 in one run, `idle_steps=0`, `render_error=None`. A live, textured, layered game
 UI drawn by the recompiled program.
 
-**In `fn64-shell`, it has never presented.** `docs/BOOT-NOTES-WM2000.md:945-951`
+**In `fn64-shell`, it has never presented.** `recomps/wm2000/docs/BOOT-NOTES-WM2000.md:945-951`
 records a 100-second probed shell run in which `current_vi_framebuffer()` never
 became `Some`, the `[fn64-shell] presenting VI framebuffer (swap #N)` line never
 appeared, and zero raw SP-register writes were observed — the white window was
@@ -226,7 +226,7 @@ retracts earlier optimism. So `vi_swaps=0` **is** true and current for
 WM2000-in-shell, even though it is false for the shell generally (OoT: 4,200+
 swaps) and false for WM2000 in the route lane (2,239 frames).
 
-The shell-lane frontier is documented at `docs/BOOT-NOTES-WM2000.md:952-955`:
+The shell-lane frontier is documented at `recomps/wm2000/docs/BOOT-NOTES-WM2000.md:952-955`:
 boot reaches the steady 60 Hz retrace loop, threads 0/1 return cleanly, and
 threads 3 and 6 sit on a queue/retrace cascade.
 
@@ -247,7 +247,7 @@ This is what converts "surface parity" into "parity."
 
 The machinery is complete but the *selection* is not. Every call site hardcodes
 `SaveType::SramBanked`: `crates/fn64-shell/src/main.rs:147` and `:162`,
-`examples/wm2000-block-boot/src/main.rs:794` and `shell.rs:445`. There is **no
+`recomps/wm2000/packages/wm2000-block-boot/src/main.rs:794` and `shell.rs:445`. There is **no
 save-type autodetection** from the ROM anywhere — no header field, heuristic, or
 database.
 
@@ -266,7 +266,7 @@ repo-wide. The backend is a compile-time choice plus a hardcoded
 (`crates/fn64-shell/src/main.rs:123-132`).
 
 Two related notes. First, only `fn64-shell` installs `FileSaveStorage` at all;
-every example harness uses `InMemorySaveStorage`, and `examples/oot-boot/src/main.rs:322`
+every example harness uses `InMemorySaveStorage`, and `recomps/wm2000/packages/oot-boot/src/main.rs:322`
 states the intent — "a persisted `FileSaveStorage` is a shell concern, not this
 bring-up's." So every run that has ever reported a `save_ops` figure was
 in-memory-backed. Second, SRAM has **no** high-level shim family: it is reachable
@@ -291,12 +291,12 @@ Controller Pak state.
 
 This is directly visible in the game: WM2000's match setup screen renders a
 **Controller Pak** option, and the run reports `save_ops=0` for its whole
-duration (`docs/plans/wm2000-playable-blocker-ledger.md:825`).
+duration (`recomps/wm2000/docs/wm2000-playable-blocker-ledger.md:825`).
 
 **Read `save_ops=0` carefully** — it counts save-device operations the *guest
 performed*, not fn64's ability to service them (`copy_save_operations`,
 `crates/fn64-abi/src/lib.rs:1521`, emitted at
-`examples/wm2000-block-boot/src/telemetry.rs:353`). The guest has not asked yet.
+`recomps/wm2000/packages/wm2000-block-boot/src/telemetry.rs:353`). The guest has not asked yet.
 It is evidence the path is **unexercised**, not that it is missing — an
 important distinction, because three of the four AKI titles save to Controller
 Pak.
@@ -392,7 +392,7 @@ AKI; each is a candidate cause if a specific title misbehaves.
 - **Absent symbols outside the 116 denominator:** `osYieldThread`, `osPfsChecker`,
   `osDriveRomInit`, `osPfsNumFiles`, `osPfsRepairId`, `osAfterPreNMI`. None is in
   `reimplemented_funcs`; jessetbh's WM2000 config routes `osDriveRomInit` to a
-  runtime shim and it is meaningless on cart (`docs/BOOT-NOTES-WM2000.md:341`).
+  runtime shim and it is meaningless on cart (`recomps/wm2000/docs/BOOT-NOTES-WM2000.md:341`).
   Cheap to add if a title ever calls one.
 
 ### Gap 6 — No end-to-end differential against a reference runtime
@@ -417,7 +417,7 @@ general claim and true in one specific lane**. Three distinct readings:
   250-swap release probes (`:149-158`) and a live heartbeat series
   (`docs/ROADMAP.md:254-258`). The window, blit, audio, and pacing are proven.
 - **WM2000 in `fn64-shell`: true, and current.**
-  `docs/BOOT-NOTES-WM2000.md:945-951` — that is Gap 1.
+  `recomps/wm2000/docs/BOOT-NOTES-WM2000.md:945-951` — that is Gap 1.
 - **WM2000 in the route harness: false.** 2,239 frames,
   `render_error=None` (`wm2000-playable-blocker-ledger.md:1717-1733`).
 
@@ -486,9 +486,9 @@ outputs.
 ai, save, pfs, gbpak, cache, task_dispatch), `crates/fn64-runtime/src/`
 (executor, si, save, pfs, peripherals), `crates/fn64-audio/src/rsp/`,
 `crates/fn64-render-reference/`, `crates/fn64-shell/src/`,
-`docs/plans/wm2000-playable-blocker-ledger.md`,
-`docs/plans/aki-recompile-certification.md`, `docs/WM2000-AUDIO-STATUS.md`,
-`docs/plans/n64recomp-comparison.md`, `reference/wm2000-frames/match-setup-screen.png`.
+`recomps/wm2000/docs/wm2000-playable-blocker-ledger.md`,
+`docs/plans/aki-recompile-certification.md`, `recomps/wm2000/docs/WM2000-AUDIO-STATUS.md`,
+`docs/plans/n64recomp-comparison.md`, `recomps/wm2000/reference/wm2000-frames/match-setup-screen.png`.
 
 **External (documentation and symbol lists only, no implementation read).**
 [N64Recomp](https://github.com/N64Recomp/N64Recomp),

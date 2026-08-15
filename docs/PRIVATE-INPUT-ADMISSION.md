@@ -506,7 +506,7 @@ regenerated `RECOMP_RS_DIR` used to build the exact child:
 FN64_GAME_DIR=/absolute/private/game-workspace \
 RECOMP_RS_DIR=/absolute/private/generated-rust-crate \
 FN64_RECOMP=rs FN64_RS_EXECUTION=function \
-  examples/oot-boot/oot identity-wire \
+  recomps/wm2000/packages/oot-boot/oot identity-wire \
   /private/tmp/oot-function-identity.wire
 
 cargo run -p fn64-boot-harness \

@@ -20,13 +20,13 @@ Decision document. Records what was measured, why the obvious fix is not
 available as a performance change, and what a migration would have to cover.
 It does not recommend acting — the choice is a certification decision.
 
-Measured 2026-08-06 on WM2000, `examples/wm2000-block-boot`, Apple Silicon.
+Measured 2026-08-06 on WM2000, `recomps/wm2000/packages/wm2000-block-boot`, Apple Silicon.
 
 ## The measurement
 
 Release build with `-C force-frame-pointers=yes` and `debug = 1` scoped to the
 three handwritten crates (`fn64-abi`, `fn64-runtime`, `fn64-recomp-rs`) in
-`examples/wm2000-block-boot/Cargo.toml`, leaving the generated shards at
+`recomps/wm2000/packages/wm2000-block-boot/Cargo.toml`, leaving the generated shards at
 `debug = false`. Without those line tables `run_one_step` inlines its whole
 callee tree and a sampler attributes ~92% of self time to one frame that
 cannot be broken down.
@@ -803,7 +803,7 @@ directional, never as a magnitude.
 
 ### The digest share did NOT fall, and that is the real finding
 
-Profiled with `scripts/profile-wm2000-self-time.zsh`, 5 runs per lane, same
+Profiled with `recomps/wm2000/scripts/profile-wm2000-self-time.zsh`, 5 runs per lane, same
 quiet machine, same session:
 
 | lane | `sha2::compress` SELF | total weighted cycles |
@@ -906,8 +906,8 @@ receipt values and gate expectations. As with v2, **that work did not exist.**
 An exhaustive search for 64-hex-character literals finds **zero** hardcoded
 digest expectations over watched executable memory anywhere in
 `crates/fn64-abi`. The hits elsewhere in the tree are ROM image content hashes
-(`examples/wm2000-block-boot`, unchanged by this migration), a NIST SHA-256 test
-vector in `examples/wm2000-block-shards/materializer.rs`, and discovery-gate
+(`recomps/wm2000/packages/wm2000-block-boot`, unchanged by this migration), a NIST SHA-256 test
+vector in `recomps/wm2000/packages/wm2000-block-shards/materializer.rs`, and discovery-gate
 JSON digests in `scripts/gate-determinism.sh`, none of which concern watched
 memory. `scripts/grade-all.sh` grades `fn64-discover` symbol recovery and
 contains no digest expectation.
