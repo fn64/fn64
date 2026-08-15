@@ -170,6 +170,21 @@ pub struct InputConfig {
     /// Radial deadzone on the gamepad left stick, as a fraction of full
     /// deflection (0.0..=0.5).
     pub deadzone: f32,
+    /// When false, [`InputConfig::save`] is a no-op. Not persisted: it is a
+    /// property of THIS in-memory copy, not of the user's settings.
+    ///
+    /// Exists because the overlay saves whenever a widget marks the config
+    /// dirty, and a throwaway config (the `--demo` mode's `default()`) would
+    /// otherwise serialize shipped defaults over a real user's `input.toml`
+    /// the moment someone dragged the deadzone slider.
+    #[serde(skip, default = "crate::input_map::persist_default")]
+    pub persist: bool,
+}
+
+/// Configs that come from disk or `default()` persist; only an explicitly
+/// scratch copy opts out.
+pub(crate) fn persist_default() -> bool {
+    true
 }
 
 impl Default for InputConfig {
@@ -219,6 +234,7 @@ impl Default for InputConfig {
             keyboard_stick,
             gamepad,
             deadzone: 0.15,
+            persist: true,
         }
     }
 }
@@ -261,6 +277,9 @@ impl InputConfig {
     /// Persist to disk. Failures are logged, never fatal -- the in-memory
     /// config stays live for this session either way.
     pub fn save(&self) {
+        if !self.persist {
+            return;
+        }
         let Some(path) = Self::path() else {
             eprintln!(
                 "[fn64-shell] no config directory on this platform -- input config not saved"

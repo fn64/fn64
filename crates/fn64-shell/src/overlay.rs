@@ -286,8 +286,15 @@ fn draw_ui(
     // hint row, and frame padding, then let the body scroll inside what is
     // left.
     let screen = ctx.screen_rect();
+    // Room for the title bar, the hint row, and the window frame's padding.
     let chrome = 96.0;
-    let body_max_height = (screen.height() - chrome).max(160.0);
+    // NO lower floor here: a `.max(160.0)` would win whenever the viewport is
+    // under 256px tall and hand the ScrollArea more height than the screen
+    // has, reintroducing the clipped-title bug it exists to fix. Both the game
+    // path and the demo set a 320x240 minimum inner size, so that range is
+    // reachable by dragging the window down. Clamp to something still usable
+    // instead, and let the ScrollArea scroll.
+    let body_max_height = (screen.height() - chrome).clamp(48.0, screen.height());
     egui::Window::new(RichText::new("CONTROLLER").strong().color(INK))
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
