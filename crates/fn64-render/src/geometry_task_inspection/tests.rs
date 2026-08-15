@@ -470,6 +470,28 @@
     }
 
     #[test]
+    fn moveword_g_mw_matrix_is_a_named_unsupported_frontier() {
+        let (mut rdram, rsp, task, catalog) = fixture();
+        write_command(
+            &mut rdram,
+            DL,
+            (u32::from(G_MOVEWORD) << 24) | (u32::from(G_MW_MATRIX) << 16),
+            0,
+        );
+        let error = inspect_geometry_task(
+            &rdram,
+            &rsp,
+            &task,
+            &catalog,
+            GeometryTaskInspectionPolicy::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("G_MW_MATRIX"));
+        assert!(error.to_string().contains("fixed-point matrix patch"));
+    }
+
+    #[test]
     fn f3dzex2_branch_w_rejects_an_invalid_taken_target_immediately() {
         const SLOT: usize = 4;
         let error = walk_direct(
