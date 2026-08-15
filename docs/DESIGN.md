@@ -1712,6 +1712,9 @@ task calls out:
   or canonical RDRAM words captured at CMD_END, never independently mutable
   copies of both. Deferred dispatch consumes and coalesces those owned images;
   it does not reread a command range after later RSP writes can change it.
+  The release-evidence encoder derives the historical XBUS word image directly
+  from those owned logical bytes while serializing, preserving its established
+  wire schema without retaining a second mutable command representation.
   Every renderer task and DRAM-backed
   raw-DPC entry receives an 8 MiB physical-RDRAM
   view. Registration must cover that complete device, including its final
