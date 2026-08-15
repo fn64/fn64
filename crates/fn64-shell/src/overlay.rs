@@ -278,10 +278,22 @@ fn draw_ui(
             );
         });
 
+    // The bindings list grows with the binding count while the viewport does
+    // not, so the panel must be BOUNDED by the screen rather than sized by its
+    // content: an unbounded CENTER_CENTER window overflows symmetrically and
+    // clips its own title off the top edge (measured 752.5px of content in a
+    // 720px viewport, panel top at y=-16.5). Reserve room for the title bar,
+    // hint row, and frame padding, then let the body scroll inside what is
+    // left.
+    let screen = ctx.screen_rect();
+    let chrome = 96.0;
+    let body_max_height = (screen.height() - chrome).max(160.0);
     egui::Window::new(RichText::new("CONTROLLER").strong().color(INK))
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
+        .max_height(screen.height() - 24.0)
+        .max_width(screen.width() - 24.0)
         .show(ctx, |ui| {
             match gamepads.active_name() {
                 Some(name) => ui.label(RichText::new(name).color(MUTED).small()),
@@ -293,21 +305,26 @@ fn draw_ui(
             };
             ui.add_space(6.0);
 
-            ui.horizontal_top(|ui| {
-                // Left: bindings, grouped by the controller's physical
-                // regions (structure = the real hardware, not a flat list).
-                ui.vertical(|ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(320.0)
-                        .show(ui, |ui| {
+            // ONE scroll area around BOTH columns, bounded by the viewport.
+            // Previously each column sized itself freely and the window grew to
+            // fit their max, so the panel could exceed the screen height and
+            // clip its own title bar off the top.
+            egui::ScrollArea::vertical()
+                .max_height(body_max_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        // Left: bindings, grouped by the controller's physical
+                        // regions (structure = the real hardware, not a flat list).
+                        ui.vertical(|ui| {
                             bindings_grid(ui, config, capture);
                         });
-                });
-                ui.separator();
-                // Right: the analog column — deadzone + live scope.
-                ui.vertical(|ui| {
-                    stick_scope(ui, config, gamepads, dirty);
-                });
+                        ui.separator();
+                        // Right: the analog column — deadzone + live scope.
+                        ui.vertical(|ui| {
+                            stick_scope(ui, config, gamepads, dirty);
+                        });
+                    });
             });
 
             ui.add_space(6.0);
