@@ -12,7 +12,7 @@
 
     const BOOT: u32 = 0x8000_0400;
     const OVERLAY: u32 = 0x8000_1400;
-    const RESIDENT_ID_DOMAIN: &[u8] = b"fn64:wm2000-resident-tail-generation:v1:";
+    const RESIDENT_ID_DOMAIN: &[u8] = b"fn64:block-boot-resident-tail-generation:v1:";
 
     fn fixture() -> (NormalizedRom, DenseAotPackV1, Vec<OverlayLoadRecipeV1>) {
         let mut raw = vec![0u8; 0x5000];
@@ -1050,7 +1050,7 @@
             &rom,
             &dense,
             BOOT_BANK,
-            b"fn64:wm2000-resident-tail-generation:v1:",
+            b"fn64:block-boot-resident-tail-generation:v1:",
             &recipes,
         )
         .unwrap();
