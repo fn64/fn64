@@ -11,6 +11,7 @@
 
 pub mod boot_globals;
 pub mod device;
+pub mod diagnostics;
 pub mod dpc_schedule;
 pub mod executor;
 pub mod mesgqueue;
@@ -53,6 +54,7 @@ pub use device::{
     SP_STATUS_INTERRUPT_ON_BREAK, SP_STATUS_SIGNAL_0, SP_STATUS_SIGNAL_1, SP_STATUS_SINGLE_STEP,
     SP_STATUS_YIELD, SP_STATUS_YIELDED,
 };
+pub use diagnostics::{debug_send_diagnostics, DebugSendDiagnostics};
 pub use dpc_schedule::{
     DpcAdvance, DpcBackendQuantumAck, DpcBackendQuantumRequest, DpcBackendQuantumStatus, DpcCursor,
     DpcQuantumId, DpcQuantumPlan, DpcScheduleError, DpcScheduledExecution, DpcScheduledPhase,

@@ -75,6 +75,7 @@ jobs:
       # lint-docs.py shells out to `rg`, which isn't on the runner image.
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: python3 scripts/lint-docs.py
+      - run: python3 scripts/lint-hot-path-env.py
       # Owns the frame digests the docs cite, so lint-docs.py's "a hash needs a
       # test" rule has a test to point at.
       - run: python3 scripts/check-reference-frame-digests.py

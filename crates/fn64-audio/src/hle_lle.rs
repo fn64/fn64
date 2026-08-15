@@ -26,7 +26,9 @@ use crate::hle_outcome::{
     RspDpcRegisterState, RspVisibleState, RspVisibleStateError,
 };
 use crate::hle_snapshot::AudioLleLaneParts;
-use crate::rsp::runtime::{RspDmaJournalEntry, RspDpSubmission, RspMachine, RspMachineState};
+use crate::rsp::runtime::{
+    RspDmaJournalEntry, RspDpCommandSource, RspDpSubmission, RspMachine, RspMachineState,
+};
 use crate::rsp::{run_imem, RspExitReason, DMEM_SIZE};
 
 const INTERPRETER_CHUNK_STEPS: u64 = 1 << 20;
@@ -495,46 +497,16 @@ fn logical_imem_words(imem: &[u8; DMEM_SIZE]) -> Vec<u32> {
 fn canonicalize_dpc_submission(
     raw: RspDpSubmission,
 ) -> Result<DeferredDpcSubmission, SpeculativeAudioLleError> {
-    let RspDpSubmission {
-        start,
-        end,
-        xbus,
-        payload,
-        words,
-    } = raw;
-    if xbus {
-        let deferred = DeferredDpcSubmission::from_dmem_payload(start, end, payload)
-            .map_err(SpeculativeAudioLleError::DeferredDpcSubmission)?;
-        let payload_words = deferred.command_words();
-        if payload_words.len() != words.len() {
-            return Err(SpeculativeAudioLleError::XbusCommandWordCount {
-                expected: payload_words.len(),
-                actual: words.len(),
-            });
+    let (start, end, source) = raw.into_parts();
+    match source {
+        RspDpCommandSource::XbusBytes(payload) => {
+            DeferredDpcSubmission::from_dmem_payload(start, end, payload)
+                .map_err(SpeculativeAudioLleError::DeferredDpcSubmission)
         }
-        for (index, (payload_word, raw_word)) in payload_words
-            .iter()
-            .copied()
-            .zip(words.iter().copied())
-            .enumerate()
-        {
-            if payload_word != raw_word {
-                return Err(SpeculativeAudioLleError::XbusCommandWordMismatch {
-                    index,
-                    payload_word,
-                    raw_word,
-                });
-            }
+        RspDpCommandSource::RdramWords(words) => {
+            DeferredDpcSubmission::from_rdram_words(start, end, words)
+                .map_err(SpeculativeAudioLleError::DeferredDpcSubmission)
         }
-        Ok(deferred)
-    } else {
-        if !payload.is_empty() {
-            return Err(SpeculativeAudioLleError::RdramSubmissionHasXbusPayload {
-                byte_len: payload.len(),
-            });
-        }
-        DeferredDpcSubmission::from_rdram_words(start, end, words)
-            .map_err(SpeculativeAudioLleError::DeferredDpcSubmission)
     }
 }
 
@@ -939,34 +911,17 @@ mod tests {
     }
 
     #[test]
-    fn inconsistent_raw_xbus_words_are_rejected_before_duplicate_is_discarded() {
-        let raw = RspDpSubmission {
-            start: 0x100,
-            end: 0x108,
-            xbus: true,
-            payload: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            words: vec![0x0102_0304, 0x0506_0709],
-        };
+    fn raw_xbus_submission_has_only_one_owned_command_representation() {
+        let raw = RspDpSubmission::from_xbus_bytes(0x100, 0x108, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
-        assert_eq!(
-            canonicalize_dpc_submission(raw),
-            Err(SpeculativeAudioLleError::XbusCommandWordMismatch {
-                index: 1,
-                payload_word: 0x0506_0708,
-                raw_word: 0x0506_0709,
-            })
-        );
+        let deferred = canonicalize_dpc_submission(raw).unwrap();
+        assert_eq!(deferred.source(), DpcSubmissionSource::Dmem);
+        assert_eq!(deferred.command_words(), [0x0102_0304, 0x0506_0708]);
     }
 
     #[test]
     fn raw_rdram_submission_retains_captured_canonical_words() {
-        let raw = RspDpSubmission {
-            start: 0x200,
-            end: 0x208,
-            xbus: false,
-            payload: Vec::new(),
-            words: vec![0x1122_3344, 0xaabb_ccdd],
-        };
+        let raw = RspDpSubmission::from_rdram_words(0x200, 0x208, vec![0x1122_3344, 0xaabb_ccdd]);
 
         let deferred = canonicalize_dpc_submission(raw).unwrap();
         assert_eq!(deferred.source(), DpcSubmissionSource::Rdram);

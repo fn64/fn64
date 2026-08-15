@@ -4922,3 +4922,193 @@ rows; release evidence is not cropped. The rebuilt live shell reported a
 `320x237` surface backed by `320x240` capture storage on every launch in the
 fresh exact-ten cadence/audio series. A direct visual eye-check remains separate
 from this geometry and byte-boundary evidence.
+
+## Hot diagnostic and DPC ownership cleanup (2026-08-14)
+
+The five retained dispatch samples (`dispatch_deep_1/2/3` and
+`dispatch_fresh_1/2`) contain 17,314 leaf samples. `__findenv_locked` accounts
+for 2.1% of them, principally below RSP CP0 writes and DMA tracing. This was
+real disabled-path work: each CP0 write queried `RSP_TRACE_CP0`; each DMA
+queried its trace variables; and every DMA constructed a complete source FNV
+checksum before the trace function discovered `RSP_TRACE_DMA` was absent.
+
+RSP CP0/DMA and message-send debug settings are now typed, process-lifetime
+configuration. The disabled CP0/DMA paths perform a cached branch without an
+environment lock, dependent limits are not read when their parent trace is
+off, and DMA trace payload construction is lazy after both the enable and
+sequence-limit checks. The same shared `DebugSendDiagnostics` value is used by
+the ABI shim and executor, removing repeated environment scans from queue
+delivery without allowing the two sides to disagree about configuration.
+
+The same pass removes duplicate ownership at the RSP/DPC seam.
+`RspDpSubmission` previously retained XBUS commands as both `Vec<u8>` and
+`Vec<u32>`. Dispatch then copied the byte vectors into a third aggregate buffer
+and converted that buffer into another word vector; RDRAM submissions ignored
+their captured word vector and reread the live range. `RspDpCommandSource` now
+owns exactly one variant (`XbusBytes` or `RdramWords`). Dispatch consumes the
+first allocation while coalescing ranges, converts XBUS bytes only once for the
+renderer, and moves captured RDRAM words without rereading guest memory.
+
+These are structurally eliminated calls, walks, and allocations, not a new
+frame-time result. The saved 2.1% environment share is motivation from the old
+binary; a fresh interleaved render-route A/B is still required before assigning
+an end-to-end speedup to this change. The affected runtime diagnostics, complete
+audio library, and raw/XBUS ABI renderer seam passed ten consecutive clean test
+runs; the full audio suite and all 382 ABI nextest cases also passed once.
+
+### Follow-up: finish the registered hot seams and reuse transaction storage
+
+The same retained stacks also place direct environment reads below
+`run_imem`, the generated-C shim adapter, and periodic controller/audio
+boundaries. Those switches now use typed process-lifetime configurations;
+dependent execution-trace settings are not parsed while their parent trace is
+off. A CI sweep registers the interpreter, CP0/DMA, shim, controller, AI, and
+captured raw-DPC functions and rejects a direct `env::var*` call inside them.
+This is a regression mechanism for the bug class, not another one-off list of
+cached booleans.
+
+Two allocation owners are now reused without changing their byte contracts.
+AI delivery retains its guest-order `Vec<i16>` after the synchronous backend
+call. Captured raw DPC dispatch retains the synthetic full-RDRAM transaction
+image after copyback; every subsequent use overwrites the complete physical
+prefix and command suffix before renderer admission. The existing DPC census
+measured its allocation/zero phase at about 0.115 ms per render field. Reuse
+removes that repeated allocation and zeroing, but does not remove the required
+full-RDRAM copy-in, copyback, rollback authority, or RT64 work. Consecutive
+submission tests pin allocation identity and unchanged renderer/evidence
+results. No fresh render-route A/B has yet assigned an end-to-end delta to this
+follow-up.
+
+The execution-trace parser and both storage-reuse behaviors passed ten
+consecutive focused runs. The complete `fn64-audio` suite passed with 353 unit
+tests plus its integration and documentation tests, all 383 `fn64-abi`
+nextest cases passed, and the documentation, NMR-surface, hot-path environment,
+and whitespace sweeps were clean.
+
+### Measured result: retain both cleanup commits
+
+Measured 2026-08-15 on the RT64 headless `render-benchmark.zsh` route at its
+default 1.5M steps. Each binary was frozen before measurement and run three
+times on the same route. Every run passed the eight-field byte-identity check;
+all six endpoint runs ended at the same guest `sim_time`. The control was
+`71303ac`; the endpoint was `d24020c` (the two performance commits plus the
+release-evidence encoder compatibility fix).
+
+| binary | mean ms/field | p50 | p95 | p99 | budget misses |
+|---|---:|---:|---:|---:|---:|
+| control `71303ac` | 14.690 | 9.873 | 22.133 | 22.633 | 3319.0 |
+| after first cleanup `b928e13` | 14.190 | 9.903 | 20.870 | 21.357 | 3277.3 |
+| endpoint `d24020c` | 14.087 | 9.803 | 20.833 | 21.340 | 3268.7 |
+
+The endpoint reduces mean field time by 0.603 ms, or 4.11%. Its p95 and p99
+are both about 1.3 ms lower. The three paired mean deltas are -0.65, -0.53,
+and -0.63 ms/field, and the endpoint and control ranges do not overlap.
+
+The first cleanup contributes 0.500 ms/field (3.40%) and essentially the whole
+tail improvement. The storage-reuse follow-up contributes another 0.103
+ms/field (0.73%); its three-run mean range, 14.08--14.10, does not overlap the
+first cleanup's 14.15--14.23 range, but it does not materially improve p95 or
+p99. Both changes are therefore retained, with different claims: the first is
+a mean-and-tail win, while the second is a smaller mean/allocator-churn win.
+
+An instrumented 300k-step pair confirms the follow-up's registered mechanism
+without treating the instrumented absolute frame times as authoritative. Raw
+DPC staging allocation fell from about 14,189 ns to 13 ns per fast field and
+from about 104,360 ns to 470 ns per slow field, more than 99% in both classes.
+The profile mode's own perturbation is unmeasured, so these counters establish
+phase elimination rather than an additional end-to-end speedup claim.
+
+### Windowed presentation attribution
+
+The shell heartbeat splits every successful RT64 visible present into four
+bounded timing windows: total `rt64_present_ms`, synchronous GPU capture and
+readback `capture_ms`, BGRA-to-RGBA conversion/upload-buffer preparation
+`convert_ms`, and the final Pixels/wgpu submission in `display_ms`. These use
+the same nearest-rank p50/p95/p99/max representation as the pump and frame
+interval windows, so a cadence miss can be assigned to guest work or a named
+presentation seam in the same heartbeat. The total is measured independently;
+it is not reconstructed by adding rounded percentiles from different samples.
+
+`FN64_SHELL_EXIT_AFTER_PRESENTS=<nonzero frames>` ends the event loop after the
+named number of successful window blits. This is a diagnostic measurement
+bound, not guest time: failed or not-yet-ready captures do not count. It lets
+windowed A/B runs use identical frame populations and terminate through the
+shell's ordinary process-exit preparation instead of depending on a manual
+signal.
+
+The first 600-present RT64 run makes the prioritization boundary clear. After
+startup, `rt64_present_ms` was about 0.2 ms at p50 and at most 0.5 ms at p99;
+conversion and the Rust capture accessor were below 0.05 ms at p50, and the
+Pixels/wgpu display call accounted for nearly all of the small total. Busy
+heartbeat windows instead reported 15--20 ms pump medians and 23--35 ms pump
+tails. Steady-state audio starvation was zero. The visible CPU/upload/display
+path is therefore not a credible source of the observed frame-time tail.
+
+The native capture hook was then tested separately because its Metal blit is
+encoded inside RT64's present and is consequently billed to `pump_ms`, not the
+later Rust accessor. One binary selected capture-on versus capture-off before
+backend registration and ran three interleaved 1,200-field headless-shell
+pairs with audio disabled. After the first cold capture-off outlier, capture-on
+wall times were 13.47/13.47/13.39 seconds and capture-off was 13.45/13.44
+seconds. Every run ended at `sim_time=1876275557`; all three capture-on images
+had the same SHA-256 value.
+The result is null at 0.01-second wall-clock resolution, bounding any gain to
+roughly 8 microseconds per field in this 320x240 population. The experimental
+capture-selection code was removed. A direct shared-texture/window contract
+could still simplify ownership, but this experiment rejects it as a priority
+performance fix for the current workload.
+
+### Fresh post-cleanup sample and PGO experiment registration
+
+A five-second macOS `sample` capture was taken from frames roughly 300--450 of
+the fixed-length windowed entrance route after the cleanup above. The main
+thread had 1,645 leaf samples below `Executor::run_one_step`. The former large
+RT64 wait is no longer dominant: 54 samples (3.3%) ended in its full-sync
+semaphore wait. The largest identifiable groups were the write barrier's
+signal/mprotect path (about 15% combined), mutation SHA-256 compression (5.3%),
+bulk moves (3.8%), changed-range maintenance (3.4%), and then distributed
+guest/RSP execution. The visible-present telemetry remained about 0.2 ms while
+the sampled busy heartbeat windows had 16--20 ms pump medians.
+
+This is not authority to delete the barrier or mutation digests. Barrier-off
+already loses badly in the full-route A/B, while the watched-page tree and
+digests select executable generations rather than merely decorating a report.
+It does justify a profile-guided optimization experiment: the remaining Rust
+cost is spread across branches, inlining decisions, and code layout instead of
+one removable loop. The experiment is pre-registered to retain PGO only if
+three interleaved full-route endpoint pairs remain byte-identical and improve
+mean field time by at least 1% with non-overlapping run ranges. A smaller or
+overlapping result does not justify a profile-training release workflow.
+
+### PGO result: retain the release workflow
+
+The pre-registered PGO experiment cleared every retention bar. LLVM IR
+instrumentation was built from `d24020c`, trained once on the complete 1.5M
+entrance route and once on a 1,200-field headless shell route, then merged into
+one 28 MiB profile. The control and profile-use binaries were frozen before
+measurement and run in three interleaved full-route pairs. Each run began at a
+reported one-minute load no greater than 3.0 and passed the anchored eight-field
+byte-identity check.
+
+| binary | mean ms/field | p50 | p95 | p99 | budget misses |
+|---|---:|---:|---:|---:|---:|
+| ordinary release | 14.213 | 9.847 | 21.120 | 21.863 | 3286.3 |
+| profile-use release | 12.953 | 9.657 | 18.380 | 18.900 | 2790.0 |
+
+The PGO build reduces mean field time by 1.260 ms, or 8.86%. Its p95 is 2.74
+ms lower, its p99 is 2.96 ms lower, and it misses the 16.667 ms budget about
+496 fewer times per run. No run range overlaps: ordinary-release means were
+14.20--14.23 ms and profile-use means were 12.88--13.01 ms; the corresponding
+p95 ranges were 20.97--21.30 and 18.17--18.50 ms. All six runs ended at
+`sim_time=13112786076` with the same graphics, audio, RSP-task, VI-interrupt,
+controller, render-error, and steady-field values.
+
+The instrumentation build warned that LLVM exhausted some per-site static
+value-profile counters. Edge-frequency counters remained available, and the
+profile-use build explicitly reported untrained cold/generic functions. Those
+limitations bound the claim: this establishes a large whole-program win for
+the trained WM2000 routes, not optimal value profiling or a universal gain for
+untrained games. The 111 MiB ordinary binary also grew to 129 MiB with this
+profile. A retained workflow must therefore make the training corpus and
+profile identity explicit, rather than silently enabling a machine-local
+profile in the default release build.

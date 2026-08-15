@@ -1,4 +1,52 @@
 use super::*;
+use fn64_audio::rsp::runtime::RspDpCommandSource;
+
+struct XbusStreamDump {
+    directory: std::path::PathBuf,
+    skip: u64,
+    rdram_index: Option<u64>,
+}
+
+struct XbusDiagnostics {
+    stream_dump: Option<XbusStreamDump>,
+    diff_trace: bool,
+}
+
+fn xbus_diagnostics() -> &'static XbusDiagnostics {
+    static CONFIG: std::sync::OnceLock<XbusDiagnostics> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let stream_dump = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR").map(|directory| {
+            let parse_index = |name: &str, default: Option<u64>| {
+                std::env::var(name).ok().map_or(default, |raw| {
+                    Some(
+                        raw.parse::<u64>()
+                            .unwrap_or_else(|_| panic!("{name} must be a u64, got {raw:?}")),
+                    )
+                })
+            };
+            XbusStreamDump {
+                directory: directory.into(),
+                skip: parse_index("FN64_XBUS_STREAM_DUMP_SKIP", Some(0))
+                    .expect("XBUS dump skip has a default"),
+                rdram_index: parse_index("FN64_XBUS_STREAM_DUMP_RDRAM", None),
+            }
+        });
+        XbusDiagnostics {
+            stream_dump,
+            diff_trace: std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some(),
+        }
+    })
+}
+
+fn rsp_trace_dpc_words_limit() -> Option<usize> {
+    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|_| panic!("RSP_TRACE_DPC_WORDS must be decimal, got {raw:?}"))
+        })
+    })
+}
 
 pub(crate) fn commit_rsp_memory_state(
     dmem: &[u8; fn64_runtime::RSP_MEMORY_BANK_SIZE],
@@ -241,57 +289,51 @@ pub(crate) unsafe fn dispatch_lle_task(
 
     let mut dp_full_sync = fn64_render::DpFullSyncStatus::NotReached;
     let mut dpc_observations = Vec::with_capacity(dp_submissions.len());
-    let trace_limit = std::env::var("RSP_TRACE_DPC_WORDS").ok().map(|raw| {
-        raw.parse::<usize>()
-            .unwrap_or_else(|_| panic!("RSP_TRACE_DPC_WORDS must be decimal, got {raw:?}"))
-    });
+    let trace_limit = rsp_trace_dpc_words_limit();
     // Consecutive END extensions are one hardware command stream. A 16-byte
     // command can straddle two 8-byte END writes, so decoding each submission
     // separately creates a false truncated-command trap.
-    let mut index = 0;
-    while index < dp_submissions.len() {
-        let (start, end, xbus, words) = if dp_submissions[index].xbus {
-            let start = dp_submissions[index].start;
-            let mut end = dp_submissions[index].end;
-            let mut stream = Vec::new();
-            while index < dp_submissions.len() && dp_submissions[index].xbus {
-                let submission = &dp_submissions[index];
-                assert_eq!(
-                    submission.payload.len(),
-                    submission.end.wrapping_sub(submission.start) as usize,
-                    "RSP XBUS DPC range [{:#010x}, {:#010x}) payload was not captured at submission time",
-                    submission.start,
-                    submission.end
-                );
-                stream.extend_from_slice(&submission.payload);
-                end = submission.end;
-                index += 1;
+    let mut pending = dp_submissions.into_iter().peekable();
+    while let Some(first) = pending.next() {
+        let (start, mut end, source) = first.into_parts();
+        let (xbus, words) = match source {
+            RspDpCommandSource::XbusBytes(mut stream) => {
+                while pending
+                    .peek()
+                    .is_some_and(|submission| submission.is_xbus())
+                {
+                    let next = pending.next().expect("peeked XBUS submission disappeared");
+                    let (_, next_end, next_source) = next.into_parts();
+                    let RspDpCommandSource::XbusBytes(bytes) = next_source else {
+                        unreachable!("XBUS predicate and owned command source diverged")
+                    };
+                    stream.extend_from_slice(&bytes);
+                    end = next_end;
+                }
+                let words = stream
+                    .chunks_exact(4)
+                    .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
+                    .collect::<Vec<_>>();
+                (true, words)
             }
-            let words = stream
-                .chunks_exact(4)
-                .map(|word| u32::from_be_bytes(word.try_into().expect("four XBUS bytes")))
-                .collect::<Vec<_>>();
-            (start, end, true, words)
-        } else {
-            let start = dp_submissions[index].start;
-            let mut end = dp_submissions[index].end;
-            index += 1;
-            while index < dp_submissions.len()
-                && !dp_submissions[index].xbus
-                && dp_submissions[index].start == end
-            {
-                end = dp_submissions[index].end;
-                index += 1;
+            RspDpCommandSource::RdramWords(mut words) => {
+                while pending
+                    .peek()
+                    .is_some_and(|submission| !submission.is_xbus() && submission.start == end)
+                {
+                    let next = pending.next().expect("peeked RDRAM submission disappeared");
+                    let (_, next_end, next_source) = next.into_parts();
+                    let RspDpCommandSource::RdramWords(next_words) = next_source else {
+                        unreachable!("RDRAM predicate and owned command source diverged")
+                    };
+                    words.extend(next_words);
+                    end = next_end;
+                }
+                (false, words)
             }
-            let storage = unsafe { renderer_rdram_slice(rdram) };
-            let words = storage[start as usize..end as usize]
-                .chunks_exact(4)
-                .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
-                .collect::<Vec<_>>();
-            (start, end, false, words)
         };
         if let Some(limit) = trace_limit {
-            let traced = words.iter().copied().take(limit).collect::<Vec<_>>();
+            let traced = &words[..words.len().min(limit)];
             eprintln!(
                 "[fn64-rsp-dpc] range [{start:#010x}, {end:#010x}) xbus={xbus} words={traced:08x?}"
             );
@@ -1083,8 +1125,9 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     }
     let real = unsafe { renderer_rdram_slice(rdram) };
     let physical_len = real.len();
+    let xbus_diagnostics = xbus_diagnostics();
     if xbus {
-        if let Some(dir) = std::env::var_os("FN64_XBUS_STREAM_DUMP_DIR") {
+        if let Some(dump) = xbus_diagnostics.stream_dump.as_ref() {
             thread_local! {
                 static XBUS_DUMP_INDEX: Cell<u64> = const { Cell::new(0) };
             }
@@ -1093,22 +1136,18 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
                 cell.set(index + 1);
                 index
             });
-            let skip = std::env::var("FN64_XBUS_STREAM_DUMP_SKIP")
-                .ok()
-                .map_or(0, |raw| {
-                    raw.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("FN64_XBUS_STREAM_DUMP_SKIP must be a u64, got {raw:?}")
-                    })
+            if index >= dump.skip && index < dump.skip.saturating_add(16) {
+                std::fs::create_dir_all(&dump.directory).unwrap_or_else(|error| {
+                    panic!(
+                        "FN64_XBUS_STREAM_DUMP_DIR {:?}: {error}",
+                        dump.directory
+                    )
                 });
-            if index >= skip && index < skip.saturating_add(16) {
-                let dir = std::path::PathBuf::from(dir);
-                std::fs::create_dir_all(&dir)
-                    .unwrap_or_else(|error| panic!("FN64_XBUS_STREAM_DUMP_DIR {dir:?}: {error}"));
                 let stream = words
                     .iter()
                     .flat_map(|word| word.to_be_bytes())
                     .collect::<Vec<_>>();
-                let path = dir.join(format!("xbus-{index:04}.bin"));
+                let path = dump.directory.join(format!("xbus-{index:04}.bin"));
                 std::fs::write(&path, stream)
                     .unwrap_or_else(|error| panic!("writing XBUS stream dump {path:?}: {error}"));
                 eprintln!(
@@ -1116,15 +1155,8 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
                     words.len() * 4,
                     path.display()
                 );
-                let dump_rdram = std::env::var("FN64_XBUS_STREAM_DUMP_RDRAM")
-                    .ok()
-                    .map(|raw| {
-                        raw.parse::<u64>().unwrap_or_else(|_| {
-                            panic!("FN64_XBUS_STREAM_DUMP_RDRAM must be a u64, got {raw:?}")
-                        })
-                    });
-                if dump_rdram == Some(index) {
-                    let rdram_path = dir.join(format!("rdram-{index:04}.bin"));
+                if dump.rdram_index == Some(index) {
+                    let rdram_path = dump.directory.join(format!("rdram-{index:04}.bin"));
                     std::fs::write(&rdram_path, &*real).unwrap_or_else(|error| {
                         panic!("writing RDRAM dump {rdram_path:?}: {error}")
                     });
@@ -1143,10 +1175,11 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
         "captured RSP DPC staging range [{staging_start:#010x}, {staged_end:#010x}) exceeds the 24-bit RDP address space"
     );
     crate::dpc_copy_census::note_call();
-    let mut image = crate::dpc_copy_census::timed(
+    let mut image = RAW_DPC_STAGING_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    crate::dpc_copy_census::timed(
         crate::dpc_copy_census::Phase::Alloc,
         staged_end as u64,
-        || vec![0u8; staged_end],
+        || image.resize(staged_end, 0),
     );
     crate::dpc_copy_census::timed(
         crate::dpc_copy_census::Phase::CopyIn,
@@ -1180,7 +1213,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
     let full_sync =
         require_matching_raw_dpc_completion(inspected, rendered, "dispatch_captured_raw_rdp");
     transaction.validate_atomic_completion();
-    if xbus && std::env::var_os("FN64_XBUS_DIFF_TRACE").is_some() {
+    if xbus && xbus_diagnostics.diff_trace {
         let mut offset = 0usize;
         while offset < physical_len {
             if image[offset] != real[offset] {
@@ -1216,10 +1249,9 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             || real.copy_from_slice(&image[..physical_len]),
         )
     });
-    (
-        full_sync,
-        dpc_observation(xbus, source_start, source_end, words),
-    )
+    let observation = dpc_observation(xbus, source_start, source_end, words);
+    RAW_DPC_STAGING_SCRATCH.with(|cell| *cell.borrow_mut() = image);
+    (full_sync, observation)
 }
 
 pub(crate) fn require_committed_full_sync_evidence(

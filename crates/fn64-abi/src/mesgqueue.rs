@@ -15,7 +15,7 @@ pub unsafe extern "C" fn osCreateMesgQueue_recomp(_rdram: *mut u8, ctx: *mut Rec
     let ctx = unsafe { &*ctx };
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let count = ctx.r6 as usize;
-    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+    if debug_boot_enabled() {
         let tid = ACTIVE_THREAD_ID.with(|c| c.get());
         eprintln!(
             "[DEBUG osCreateMesgQueue] thread={tid:?} mq={:#x} count={count}",
@@ -36,7 +36,8 @@ pub unsafe extern "C" fn osSendMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
     let mq_addr = RdramAddr::from_gpr(ctx.r4);
     let msg: Mesg = ctx.r5 as u32;
     let may_block = ctx.r6 == OS_MESG_BLOCK;
-    if std::env::var("FN64_DEBUG_SEND").is_ok() {
+    let debug_send = fn64_runtime::debug_send_diagnostics();
+    if debug_send.enabled() {
         let tid = ACTIVE_THREAD_ID.with(|c| c.get());
         eprintln!(
             "[DEBUG osSendMesg_recomp] active_thread={tid:?} mq_offset={:#x} msg={msg:#x} \
@@ -44,10 +45,7 @@ pub unsafe extern "C" fn osSendMesg_recomp(rdram: *mut u8, ctx: *mut RecompConte
             mq_addr.offset(),
             ctx.r29
         );
-        if let Ok(raw_count) = std::env::var("FN64_DEBUG_SEND_WORDS") {
-            let count = raw_count.parse::<usize>().unwrap_or_else(|_| {
-                panic!("FN64_DEBUG_SEND_WORDS must be an integer, got {raw_count:?}")
-            });
+        if let Some(count) = debug_send.message_words() {
             let offset = RdramAddr::from_gpr(u64::from(msg)).offset() as usize;
             let byte_len = count
                 .checked_mul(4)
@@ -179,7 +177,7 @@ pub unsafe extern "C" fn osSetEventMesg_recomp(_rdram: *mut u8, ctx: *mut Recomp
     let event = ctx.r4 as u32;
     let mq_addr = RdramAddr::from_gpr(ctx.r5);
     let msg: Mesg = ctx.r6 as u32;
-    if std::env::var("FN64_DEBUG_BOOT").is_ok() {
+    if debug_boot_enabled() {
         let tid = ACTIVE_THREAD_ID.with(|c| c.get());
         eprintln!(
             "[DEBUG osSetEventMesg] thread={tid:?} event={event} mq={:#x} msg={msg:#x}",

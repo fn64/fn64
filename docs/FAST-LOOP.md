@@ -837,7 +837,17 @@ DMA stream to its first `N` operations. `RSP_TRACE_DMA_WORDS=N` adds the first
 `N` native-storage words from each read source; keep it bounded because command
 buffers are game data and the diagnostic can be large.
 
-`RSP_TRACE_EXEC=1` logs every interpreter PC and raw instruction word.
+RSP DMA/CP0 trace settings are launch-time configuration: set them before the
+process starts, because each setting is parsed once on first use. Disabled or
+limit-exhausted DMA tracing neither constructs the source checksum nor formats
+the source-word payload. Message-delivery diagnostics (`FN64_DEBUG_SEND` and
+optional `FN64_DEBUG_SEND_WORDS=N`) follow the same launch-time rule so normal
+queue operations never lock or scan the process environment. The legacy
+bootstrap queue trace (`FN64_DEBUG_BOOT`) is likewise fixed on first use.
+
+`RSP_TRACE_EXEC=1` logs every interpreter PC and raw instruction word. Like
+the DMA/CP0 settings above, execution tracing is parsed once on first use;
+when it is disabled, its dependent limit/register settings are not read.
 `RSP_TRACE_EXEC_LIMIT=N` bounds that process-wide stream to the first `N`
 instructions. The trace is intentionally verbose and disabled by default.
 `RSP_TRACE_EXEC_GPRS=9,11,13` adds the named scalar-register values to each
@@ -845,7 +855,17 @@ emitted instruction record; indices are decimal and comma-separated.
 `RSP_TRACE_CP0=1` logs RSP-side CP0 writes, including the scalar values which
 program SP DMA and DPC registers.
 `RSP_TRACE_DPC_WORDS=N` prints the first `N` logical command words from each
-completed LLE DPC range before it is submitted to the renderer.
+completed LLE DPC range before it is submitted to the renderer. Its limit is
+also launch-time configuration, and tracing a prefix borrows the owned command
+buffer without allocating a second vector.
+
+Other runtime trace switches at high-frequency seams are launch-time settings
+for the same reason: `FN64_RECOMP_RS_SHIM_TRACE`, `FN64_TRACE_CONT`,
+`FN64_TRACE_AI_BUFFERS`, `FN64_DUMP_AUDIO_STREAM_PCM`,
+`FN64_DUMP_AUDIO_PCM`, and the XBUS dump/diff family. The CI hot-path-env lint
+rejects direct environment reads from the registered interpreter, C-shim,
+controller, AI-buffer, and raw-DPC functions; new diagnostics must parse
+through a typed `OnceLock`-backed helper outside the repeated operation.
 `RSP_TRACE_RDRAM_WORDS=OFFSET:COUNT` prints native-storage words from one
 hexadecimal RDRAM offset when an LLE task begins; `COUNT` is decimal.
 `RSP_TRACE_DMEM_WORDS=OFFSET:COUNT` prints big-endian logical DMEM words at

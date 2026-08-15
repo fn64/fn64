@@ -408,6 +408,13 @@ pub(crate) fn boot_probe_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("FN64_BOOT_PROBE").is_some())
 }
 
+/// Launch-time queue/bootstrap debug gate. Queue receive is a guest hot path,
+/// so it must not take the process environment lock for every operation.
+pub(crate) fn debug_boot_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FN64_DEBUG_BOOT").is_ok())
+}
+
 /// Generated-C word-MMIO proxy entry points. The proxy header calls these
 /// only for KSEG1 RCP addresses; ordinary RDRAM accesses stay inline.
 #[no_mangle]

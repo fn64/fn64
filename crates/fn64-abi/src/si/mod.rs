@@ -1119,7 +1119,7 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
     // Diagnostic (opt-in via FN64_TRACE_CONT): proves PadMgr actually polls
     // input, and echoes what port-0 state the game is about to see -- the
     // observable evidence a scripted press reaches the game.
-    if std::env::var_os("FN64_TRACE_CONT").is_some() {
+    if controller_trace_enabled() {
         if let Some(p0) = channels.first() {
             eprintln!(
                 "[fn64-abi] osContGetReadData(pad@{base_addr:#x}): port0 button={:#06x} stick=({},{})",
@@ -1161,6 +1161,11 @@ pub unsafe extern "C" fn osContGetReadData_recomp(rdram: *mut u8, ctx: *mut Reco
         }
     }
     // osContGetReadData returns void; leave $v0 as the decomp does (unset).
+}
+
+fn controller_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FN64_TRACE_CONT").is_some())
 }
 
 /// `osContInit(OSMesgQueue *mq, u8 *bitpattern, OSContStatus *data) -> s32`

@@ -823,6 +823,37 @@ pub(super) fn encode_rsp_task_data_identity(
     }
 }
 
+fn encode_rsp_dp_submission(
+    out: &mut Vec<u8>,
+    submission: &fn64_audio::rsp::runtime::RspDpSubmission,
+) {
+    use fn64_audio::rsp::runtime::RspDpCommandSource;
+
+    push_u32(out, submission.start);
+    push_u32(out, submission.end);
+    match submission.source() {
+        RspDpCommandSource::XbusBytes(bytes) => {
+            out.push(1);
+            push_bytes(out, bytes);
+            push_u64(out, (bytes.len() / core::mem::size_of::<u32>()) as u64);
+            for bytes in bytes.chunks_exact(4) {
+                push_u32(
+                    out,
+                    u32::from_be_bytes(bytes.try_into().expect("four XBUS command bytes")),
+                );
+            }
+        }
+        RspDpCommandSource::RdramWords(words) => {
+            out.push(0);
+            push_bytes(out, &[]);
+            push_u64(out, words.len() as u64);
+            for word in words {
+                push_u32(out, *word);
+            }
+        }
+    }
+}
+
 macro_rules! encode_rsp_architectural_state {
     ($out:expr, $state:expr) => {{
         let out = $out;
@@ -875,14 +906,7 @@ macro_rules! encode_rsp_architectural_state {
         }
         push_u64(out, state.dp_submissions().len() as u64);
         for submission in state.dp_submissions() {
-            push_u32(out, submission.start);
-            push_u32(out, submission.end);
-            out.push(submission.xbus as u8);
-            push_bytes(out, &submission.payload);
-            push_u64(out, submission.words.len() as u64);
-            for word in &submission.words {
-                push_u32(out, *word);
-            }
+            encode_rsp_dp_submission(out, submission);
         }
     }};
 }
@@ -1346,4 +1370,58 @@ pub fn operational_state_component_digests_v1(
         executor_sha256: operational_component_sha256(b"executor", &executor),
         abi_host_sha256: operational_component_sha256(b"abi-host", &abi_host),
     })
+}
+
+#[cfg(test)]
+mod rsp_dp_submission_tests {
+    use super::*;
+    use fn64_audio::rsp::runtime::RspDpSubmission;
+
+    fn encode_legacy_shape(
+        start: u32,
+        end: u32,
+        xbus: bool,
+        payload: &[u8],
+        words: &[u32],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, start);
+        push_u32(&mut out, end);
+        out.push(xbus as u8);
+        push_bytes(&mut out, payload);
+        push_u64(&mut out, words.len() as u64);
+        for word in words {
+            push_u32(&mut out, *word);
+        }
+        out
+    }
+
+    #[test]
+    fn typed_dpc_sources_preserve_the_release_evidence_wire_shape() {
+        let xbus_bytes = vec![
+            0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd,
+        ];
+        let xbus = RspDpSubmission::from_xbus_bytes(0x100, 0x108, xbus_bytes.clone());
+        let mut encoded = Vec::new();
+        encode_rsp_dp_submission(&mut encoded, &xbus);
+        assert_eq!(
+            encoded,
+            encode_legacy_shape(
+                0x100,
+                0x108,
+                true,
+                &xbus_bytes,
+                &[0x1122_3344, 0xaabb_ccdd],
+            )
+        );
+
+        let words = vec![0x0123_4567, 0x89ab_cdef];
+        let rdram = RspDpSubmission::from_rdram_words(0x200, 0x208, words.clone());
+        encoded.clear();
+        encode_rsp_dp_submission(&mut encoded, &rdram);
+        assert_eq!(
+            encoded,
+            encode_legacy_shape(0x200, 0x208, false, &[], &words)
+        );
+    }
 }
