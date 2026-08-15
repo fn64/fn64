@@ -18,6 +18,9 @@ fn hex(bytes: &[u8]) -> String {
 // proof for every change this selector makes possible.
 const DEFAULT_WM_SHARD_DIR: &str = "wm2000-block-shards";
 const WM_SHARD_TITLE_ENV: &str = "FN64_WM_SHARD_TITLE";
+/// Directory CONTAINING the per-title shard directories. Absolute. Unset =
+/// the in-repo `examples/`, so the default build is unchanged.
+const SHARD_ROOT_ENV: &str = "FN64_SHARD_ROOT";
 
 /// Validate the selector is a bare directory name: no path separators, no
 /// `..` traversal, non-empty. `SHARD_INVENTORY`'s `include!` and every
@@ -74,4 +77,46 @@ fn main() {
     let shard_dir = env::var(WM_SHARD_TITLE_ENV).unwrap_or_else(|_| DEFAULT_WM_SHARD_DIR.to_owned());
     validate_shard_title(&shard_dir);
     println!("cargo:rustc-env=FN64_WM_SHARD_DIR={shard_dir}");
+
+    // Stage the shard inventory into OUT_DIR so `SHARD_INVENTORY`'s `include!`
+    // does NOT reach into a sibling directory at compile time.
+    //
+    // That reach is what made the game harnesses inextricable: a core crate
+    // that `include!`s `../../../../examples/<title>/shard_inventory.in`
+    // cannot compile once those packages live in another repository. Resolving
+    // the file here — absolute, overridable, copied into OUT_DIR — moves the
+    // dependency from "a path baked into fn64's source tree" to "an input this
+    // build was given".
+    //
+    // `FN64_SHARD_ROOT` names the directory CONTAINING the per-title shard
+    // directories. Unset, it is the in-repo `examples/`, so today's build is
+    // reproduced byte-for-byte and nothing downstream changes yet.
+    println!("cargo:rerun-if-env-changed={SHARD_ROOT_ENV}");
+    let shard_root = match env::var_os(SHARD_ROOT_ENV) {
+        Some(root) => PathBuf::from(root),
+        None => {
+            let manifest = PathBuf::from(
+                env::var_os("CARGO_MANIFEST_DIR").expect("Cargo must set CARGO_MANIFEST_DIR"),
+            );
+            manifest
+                .parent()
+                .and_then(|crates| crates.parent())
+                .expect("crates/<pkg> must have a repository root")
+                .join("examples")
+        }
+    };
+    assert!(
+        shard_root.is_absolute(),
+        "{SHARD_ROOT_ENV} must be an absolute path, got {shard_root:?}"
+    );
+    let inventory = shard_root.join(&shard_dir).join("shard_inventory.in");
+    println!("cargo:rerun-if-changed={}", inventory.display());
+    let staged = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"))
+        .join("shard_inventory.in");
+    let bytes = fs::read(&inventory).unwrap_or_else(|error| {
+        panic!("read shard inventory {}: {error}", inventory.display());
+    });
+    fs::write(&staged, &bytes).unwrap_or_else(|error| {
+        panic!("stage shard inventory to {}: {error}", staged.display());
+    });
 }
