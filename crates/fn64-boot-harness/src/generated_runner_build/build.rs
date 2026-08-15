@@ -127,7 +127,7 @@ pub fn build_generated_runner_v1(
 ) -> Result<VerifiedGeneratedRunnerBuildV1, GeneratedRunnerBuildError> {
     validate_inputs(&inputs)?;
     let workspace = repository_workspace()?;
-    let package_root = workspace.join("examples/wm2000-block-boot");
+    let package_root = game_package_root()?.join("wm2000-block-boot");
     let manifest = package_root.join("Cargo.toml");
     let lock = package_root.join("Cargo.lock");
     let manifest_sha256 = sha256_file(&manifest, "WM generated-runner manifest")?;
@@ -1083,7 +1083,7 @@ pub(super) fn collect_package_files(
 pub(super) fn prepared_source_claims_v3(
     workspace: &Path,
 ) -> Result<PreparedSourceClaimsV3, GeneratedRunnerBuildError> {
-    let shard_root = workspace.join("examples").join(env!("FN64_WM_SHARD_DIR"));
+    let shard_root = game_package_root()?.join(env!("FN64_WM_SHARD_DIR"));
     Ok(PreparedSourceClaimsV3 {
         generator_source_sha256: source_tree_sha256(
             &shard_root,
@@ -1159,7 +1159,7 @@ pub(super) fn producer_cargo_source_sha256_v3(
     workspace: &Path,
 ) -> Result<String, GeneratedRunnerBuildError> {
     let external_sources = source_tree_sha256(
-        &workspace.join("examples").join(env!("FN64_WM_SHARD_DIR")),
+        &game_package_root()?.join(env!("FN64_WM_SHARD_DIR")),
         b"fn64.wm-prepared-producer-external-sources.v1\0",
         &["build.rs", "prepared_tree.rs", "producer.rs"],
     )?;
@@ -1466,7 +1466,7 @@ pub(super) fn build_prepared_producer_v3(
     scratch: &Path,
     max_build_seconds: u64,
 ) -> Result<ProducerBuildMeasurementV3, GeneratedRunnerBuildError> {
-    let package_root = workspace.join("examples/wm2000-prepared-shard-producer");
+    let package_root = game_package_root()?.join("wm2000-prepared-shard-producer");
     let manifest = package_root.join("Cargo.toml");
     let lock = package_root.join("Cargo.lock");
     let manifest_sha256 = sha256_file(&manifest, "prepared producer manifest")?;
@@ -1615,7 +1615,7 @@ pub(super) fn revalidate_prepared_producer_v3(
     workspace: &Path,
     scratch: &Path,
 ) -> Result<(), GeneratedRunnerBuildError> {
-    let package_root = workspace.join("examples/wm2000-prepared-shard-producer");
+    let package_root = game_package_root()?.join("wm2000-prepared-shard-producer");
     let manifest = package_root.join("Cargo.toml");
     let lock = package_root.join("Cargo.lock");
     let metadata = run_cargo_metadata(cargo, environment, &manifest, scratch)?;

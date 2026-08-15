@@ -217,6 +217,34 @@ pub(super) fn repository_workspace() -> Result<PathBuf, GeneratedRunnerBuildErro
         .map_err(|source| error(format!("resolve fn64 workspace: {source}")))
 }
 
+/// Directory containing the per-title game packages.
+///
+/// The runtime counterpart of `build.rs`'s `FN64_SHARD_ROOT`: the compile-time
+/// `include!` no longer reaches into `examples/`, but these gates still open
+/// the game packages by path at run time. Reading the same variable keeps one
+/// answer to "where do the games live" instead of two that can disagree.
+///
+/// Unset, it resolves to the in-repo `examples/`, so existing invocations are
+/// unchanged. Set, the games may live in another repository entirely.
+pub(super) fn game_package_root() -> Result<PathBuf, GeneratedRunnerBuildError> {
+    if let Some(root) = std::env::var_os("FN64_SHARD_ROOT") {
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err(error(format!(
+                "FN64_SHARD_ROOT must be an absolute path, got {}",
+                root.display()
+            )));
+        }
+        return root.canonicalize().map_err(|source| {
+            error(format!(
+                "resolve FN64_SHARD_ROOT {}: {source}",
+                root.display()
+            ))
+        });
+    }
+    Ok(repository_workspace()?.join("examples"))
+}
+
 pub(super) fn wait_with_watchdog(
     child: &mut std::process::Child,
     timeout: Duration,
