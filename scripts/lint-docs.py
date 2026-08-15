@@ -136,6 +136,51 @@ def check_readme_crates() -> None:
 
 # --- 3. every documented env var exists in code ------------------------------
 # A doc naming a var the code never reads is an instruction that silently no-ops.
+# Env vars owned by the extracted game harnesses (recomps/wm2000), verified
+# present there at extraction time. See check_env_vars for why this list
+# exists rather than a live scan.
+GAME_HARNESS_ENV = {
+    "FN64_AUDIO_VALIDATION_SKIP_GRAPHICS",
+    "FN64_BLOCK_CONTINUE_AFTER_OVERLAY",
+    "FN64_BLOCK_DEVICE_TRACE",
+    "FN64_BLOCK_EXPECT_GUEST_INSTRUCTIONS",
+    "FN64_BLOCK_HOST_TRACE",
+    "FN64_BLOCK_INSTRUCTION_BUDGET",
+    "FN64_BLOCK_MIN_GUEST_INSTRUCTIONS",
+    "FN64_BLOCK_PC_TRACE",
+    "FN64_BLOCK_PROGRESS_ONLY",
+    "FN64_BLOCK_WATCHDOG",
+    "FN64_DENSE_MANIFEST_ONLY",
+    "FN64_DYNAMIC_WITHHOLD_CANONICAL_ENTRY",
+    "FN64_FRAME_PACE_MS",
+    "FN64_PRESENT_MODE",
+    "FN64_PROFILE_AOT_BANKS",
+    "FN64_PROFILE_AOT_RECENT",
+    "FN64_PROFILE_BUILD",
+    "FN64_PROFILE_HOST_RECENT",
+    "FN64_PROFILE_STOP_AT_GENERATION",
+    "FN64_PROFILE_STOP_AT_PC",
+    "FN64_RENDER_DUMP_DIR",
+    "FN64_RS_EXECUTION",
+    "FN64_RT64_SETTINGS_FILE",
+    "FN64_SHELL_HEADLESS_FRAMES",
+    "FN64_SHELL_SPIKE_MS",
+    "FN64_WM2000_FRONTIER_BIN",
+    "FN64_WM_AOT_BINARY",
+    "FN64_WM_DYNAMIC_BINARY",
+    "FN64_WM_PAIR_CARGO_CACHE_ROOT",
+    "FN64_WM_PAIR_CARGO_CACHE_SEED",
+    "FN64_WM_PAIR_RECEIPT",
+    "OOT_ASPMAIN",
+    "OOT_MAX_STEPS",
+    "OOT_PERF_NO_CAPTURE",
+    "OOT_RENDER_DUMP_START",
+    "OOT_SCRIPT_INTERACTIVE",
+    "OOT_STATE_TRACE",
+    "OOT_STOP_ON_FRAME",
+    "OOT_TRACE",
+}
+
 ENV = re.compile(r"\b((?:FN64|OOT|RECOMP)_[A-Z0-9_]+)\b")
 
 
@@ -192,6 +237,17 @@ def check_env_vars() -> None:
                 ["grep", "-rhoE", r"(FN64|OOT|RECOMP)_[A-Z0-9_]+", str(game_repo)],
                 capture_output=True, text=True,
             ).stdout.split())
+    # Variables OWNED by the extracted game harnesses. The scan above only
+    # helps when a game checkout happens to be present, which it is not on CI
+    # or in a plain clone -- so without this list the drift rule fails for
+    # everyone but the one developer who has the repo beside fn64.
+    #
+    # These are still real and still documented here on purpose: fn64's design
+    # and status docs describe how the harnesses drive the runtime. The check
+    # this file exists to make -- "a documented variable is not a silent
+    # no-op" -- is satisfied by the harness that reads them, which lives in
+    # recomps/wm2000. Anything NOT on this list must still exist in fn64.
+    live |= GAME_HARNESS_ENV
     for doc in docs():
         text = doc.read_text()
         if superseded(text):

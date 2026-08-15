@@ -113,7 +113,26 @@ fn main() {
     println!("cargo:rerun-if-changed={}", inventory.display());
     let staged = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"))
         .join("shard_inventory.in");
+    // A MISSING inventory is the ordinary case now, not an error: the game
+    // packages live in their own repository, so a plain `git clone` of fn64
+    // has no `examples/` at all. Requiring the file would make fn64
+    // unbuildable standalone -- exactly the coupling this extraction removed,
+    // reintroduced through the back door. CI proved the point by failing here.
+    //
+    // An empty inventory yields SHARD_COUNT == 0, so the generated-runner
+    // build paths that need shards fail loudly at RUN time with a real message
+    // instead of blocking compilation for everyone. Set FN64_SHARD_ROOT to
+    // build against a real game checkout.
     let bytes = fs::read(&inventory).unwrap_or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            println!(
+                "cargo:warning=fn64-boot-harness: no shard inventory at {} -- \
+                 building with an EMPTY shard set. Set FN64_SHARD_ROOT to a \
+                 directory containing the game packages to build against one.",
+                inventory.display()
+            );
+            return b"[]".to_vec();
+        }
         panic!("read shard inventory {}: {error}", inventory.display());
     });
     fs::write(&staged, &bytes).unwrap_or_else(|error| {
