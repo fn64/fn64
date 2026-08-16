@@ -13,14 +13,15 @@
 //! effect before later overlaps, and publishes one final generation only after
 //! exact GPU-effect and guest-commit lifecycle evidence. Physical lane bytes
 //! can be asserted only inside this crate, carry an explicit eight-lane
-//! defined mask, and are move-only/exact-load-bound; M4.2b owns captured-source
-//! mapping.
-//! M4.2b executes one exact checked LoadTile from the submitted packet's
-//! owned guest-read set into that M4.2a transaction. Preparation binds every
+//! defined mask, and are move-only/exact-load-bound; M4.2b and M4.2c own the
+//! captured-source mapping for LoadTile and LoadBlock respectively.
+//! M4.2b executes one exact checked LoadTile and M4.2c executes one exact
+//! checked LoadBlock from the submitted packet's owned guest-read set into
+//! that M4.2a transaction. Preparation binds every
 //! global source access index, operation, range, and byte count; execution is
-//! row-major in complete 64-bit words, never spills a row tail, exchanges
-//! linear odd-row halves, and maps RGBA32 texel channels into the low/high
-//! 2 KiB banks. It returns only transaction-local state and ordered physical
+//! complete 64-bit words, never spills a source tail, exchanges linear
+//! odd-row halves, and maps RGBA32 texel channels into the low/high 2 KiB
+//! banks. Each executor returns only transaction-local state and ordered physical
 //! fragment descriptors. Durable publication and backend reports remain
 //! later owners.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
@@ -229,10 +230,11 @@ pub use targets::{
     UninitializedNativeRaster,
 };
 pub use tmem::{
-    prepare_load_tile, CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, ExecutedLoadTile,
-    GpuBoundTmemTransaction, LoadTileExecutionError, PendingTmemTransaction, PhysicalTmemBinding,
-    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority,
-    PhysicalTmemState, PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity,
+    prepare_load_block, prepare_load_tile, CommittedTmemTransaction, DefinedPhysicalTmemWordBytes,
+    ExecutedLoadBlock, ExecutedLoadTile, GpuBoundTmemTransaction, LoadBlockExecutionError,
+    LoadTileExecutionError, PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
+    PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, PreparedLoadBlock,
     PreparedLoadTile, StagedTmemTransaction, TextureImage, TileAddressMode, TileCoordinate,
     TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TmemDxt, TmemLoad,
     TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity,
