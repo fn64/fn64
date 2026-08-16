@@ -1553,10 +1553,22 @@ dispatches by pixel size: `Bits4`/`Bits8` are no-ops, `Bits16` calls
 `endian_swap_uint16`, `Bits32` calls `endian_swap_uint32`. `siz` reuses the
 already-landed `crate::state::PixelSize` enum rather than a raw
 `G_IM_SIZ_*` integer, so it is an exhaustive four-variant match with no
-wildcard/default arm -- RT64's own `EndianSwapUINT` has an unreachable
+wildcard/default arm -- RT64's own `EndianSwapUINT` has an explicit
 `default: return 0` case for a `siz` value outside the four known
-`G_IM_SIZ_*` encodings, which has no counterpart to port here since
-`PixelSize` cannot represent an out-of-range size in the first place.
+`G_IM_SIZ_*` encodings, which has no counterpart to port on the **Rust
+side** since `PixelSize` cannot represent an out-of-range size in the first
+place: a stronger, compile-time guarantee than RT64's own runtime check, not
+a divergence from it.
+
+That does not extend to the WGSL companion. `shaders/endian_swap.wgsl`'s
+`endian_swap_uint(i: u32, siz: u32)` takes an unrestricted `u32`, exactly
+like RT64's HLSL, so an out-of-range `siz` is representable there at
+runtime -- the WGSL function replicates RT64's `default: return 0` branch
+literally rather than inheriting the Rust side's type-level exhaustiveness.
+The two sides reject invalid input for different reasons: the Rust API
+rejects it at compile time by construction (there is no way to construct an
+invalid `PixelSize`), the WGSL function rejects it at runtime with the same
+explicit fallback branch RT64 itself uses.
 
 An independently-derived Rust oracle is matched by an owned, Naga-validated
 WGSL transcription (`shaders/endian_swap.wgsl`, `ENDIAN_SWAP_WGSL`, entry
@@ -1571,9 +1583,16 @@ four-byte reversals, cross-check against Rust's own unrelated
 `u32::swap_bytes`, self-inverse property, and a byte-placement grid);
 `endian_swap_uint`'s four-way size dispatch checked against
 `endian_swap_uint16`/`endian_swap_uint32` directly plus a mutation-shaped
-test proving the four sizes are observably distinct dispatch outcomes; and
-the same naga parse/validation/structural-guard/hostile-mutation WGSL
-pattern used by `rgb_dither.wgsl`/`random.wgsl`/`formats_dither.wgsl`.
+test proving the four sizes are observably distinct dispatch outcomes; the
+same naga parse/validation/structural-guard/hostile-mutation WGSL pattern
+used by `rgb_dither.wgsl`/`random.wgsl`/`formats_dither.wgsl`; a source-text
+guard confirming the WGSL `endian_swap_uint` body's final branch is a bare
+`return 0u;` (not a `return i;` no-op) so the default fallback can't
+silently regress; and a parser-independent grid differential over a hostile
+`siz` set including `4`, `5`, and `u32::MAX` -- values `PixelSize` cannot
+represent -- proving the WGSL source's documented branch semantics return
+`0` for every one of them, cross-checked against the Rust
+`PixelSize`-typed API for every in-range `siz`.
 
 **Scope.** This module characterizes `FbCommon.hlsli`'s three named
 endian-swap primitives in isolation. It does not wire into `combiner`,
