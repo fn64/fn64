@@ -19,7 +19,7 @@
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:1, RUNNING:1 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:2, RUNNING:1 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:2, READY:1, RUNNING:1 |
 | `M3` | `PLANNED` | Raw-DPC vertical slice | none |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
@@ -305,6 +305,29 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Programmable hardware sample locations are unavailable through public wgpu, so exact N64 coverage is a shader-compute correctness path while fixed hardware MSAA remains an optional non-authoritative enhancement.
 
 **Next action:** Execute Cards D and F with configuration-bound receipts, 20 submission processes, 10 coverage processes, and independent review.
+
+### `M2.4` -- Qualify a licensed reproducible HLSL-to-SPIR-V artifact producer for the complete admitted RT64 shader corpus without adding DXC, CMake, or project-owned C++ to fn64's runtime or ordinary build graph.
+
+| field | value |
+|---|---|
+| milestone | `M2` |
+| state | `READY` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | shader artifact provenance writer |
+| branch | `port/rt64-shader-artifacts` -> `main` |
+| dependencies | `M2.1` |
+| writable paths | `tools/rt64_shader_artifacts.py`, `docs/rt64-shader-artifact-schema.json`, `docs/RT64-SHADER-ARTIFACTS.md`, `crates/fn64-render-wgpu/shaders` |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- Official DXC supports HLSL-to-SPIR-V with explicit entry point, target, defines, include paths, optimization, target environment, validation, and output controls; official stable v1.9.2607 at 0d3ee6b is the current pin candidate.
+- DXC carries a permissive license and ThirdPartyNotices in its official source tree, while RT64's retained dxc-bin bundle lacks the provenance/notices required by M0.1 and remains excluded.
+- The producer must run in an isolated regeneration environment and emit canonical source, include-graph, compiler, flags, preprocessed-input, validation, and artifact digests. Ordinary fn64 builds consume only reviewed artifacts through wgpu.
+- This tooling decision does not block a minimal handwritten M3 vertical-slice shader, but the complete M4 shader corpus and parity claim require the qualified producer. WGSL source modernization remains a post-parity step.
+
+**Next action:** Audit and pin the complete official DXC source/dependency/license closure, define the canonical receipt, compile every admitted HLSL entry point with exact RT64 include/macro settings, validate artifacts through wgpu 30, and prove mutations fail closed.
 
 ## Regenerating
 
