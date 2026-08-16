@@ -59,7 +59,7 @@
 <p>
   <span class="badge state-running">IN PROGRESS</span>
   <code>main</code> &rarr; <code>origin/main</code>
-  &middot; updated <code>2026-08-16T09:54:30Z</code>
+  &middot; updated <code>2026-08-16T09:58:00Z</code>
 </p>
 
 <h2>Milestones</h2>
@@ -548,16 +548,16 @@
     <dt>Branch</dt><dd><code>port/m4-owned-guest-reads</code> &rarr; <code>main</code></dd>
     <dt>Dependencies</dt><dd><code>M3.3.3</code></dd>
     <dt>Writable paths</dt><dd><code>crates/fn64-render-ir/src/guest_read.rs</code>, <code>crates/fn64-render/src/guest_read.rs</code>, <code>crates/fn64-abi/src/guest_read_capture.rs</code>, <code>docs/DESIGN.md</code>, <code>docs/RENDER-WGPU-PORT-PLAN.md</code></dd>
-    <dt>Elapsed</dt><dd>54m (started 2026-08-16T09:00:00Z, updated 2026-08-16T09:54:30Z)</dd>
-    <dt>Verification bar met</dt><dd>3/3 runs</dd>
+    <dt>Elapsed</dt><dd>58m (started 2026-08-16T09:00:00Z, updated 2026-08-16T09:58:00Z)</dd>
+    <dt>Verification bar met</dt><dd>4/4 runs</dd>
   </dl>
   <p><strong>Next action:</strong> Use the owned read mechanism in M4.1&#x27;s typed texture/TMEM command-state path, then migrate production dispatch only after separately reviewed execution and guest-publication ordering exists.</p>
-  <details open><summary>Findings</summary><ul><li>Commit d8c0d4b1 adds a real callable ABI capture API plus renderer-neutral plan, owned capture, packet finalization, and v3 record/replay types.</li><li>Admission is capture-independent and precedes ABI read-plan exposure; the ABI owns only bounds and N64Recomp byte-lane translation while the renderer owns semantic read selection.</li><li>The accepted path retains no RDRAM pointer or borrow and allocates only declared reads, not a full memory snapshot. Record v3 intentionally rejects v2.</li><li>This is a synthetic cross-crate mechanism proof, not production DPC dispatch migration, TMEM population, GPU upload, RT64 parity, or performance evidence.</li></ul></details>
+  <details open><summary>Findings</summary><ul><li>Commit d8c0d4b1 adds a real callable ABI capture API plus renderer-neutral plan, owned capture, packet finalization, and v3 record/replay types.</li><li>Admission is capture-independent and precedes ABI read-plan exposure; the ABI owns only bounds and N64Recomp byte-lane translation while the renderer owns semantic read selection.</li><li>The accepted path retains no RDRAM pointer or borrow and allocates only declared reads, not a full memory snapshot. Record v3 intentionally rejects v2.</li><li>This is a synthetic cross-crate mechanism proof, not production DPC dispatch migration, TMEM population, GPU upload, RT64 parity, or performance evidence.</li><li>The first downstream wgpu baseline exposed a stale pre-v3 workload golden outside M4.0&#x27;s original test matrix. The v3 identity is now frozen at 08dc8fbe and the full 81-unit/nine-doctest consumer suite passed 10/10.</li></ul></details>
   <details><summary>Verification runs</summary>
     <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
-    <tbody><tr><td><code>cargo test -p fn64-render-ir -p fn64-render -p fn64-abi --lib --no-fail-fast</code></td><td>10</td><td>10</td><td>deterministic</td></tr><tr><td><code>cargo test -p fn64-render-ir --doc &amp;&amp; python3 -m unittest tools.test_check_rt64_port_parity</code></td><td>10</td><td>10</td><td>deterministic</td></tr><tr><td><code>cargo nextest run -p fn64-abi</code></td><td>1</td><td>1</td><td>single</td></tr></tbody></table>
+    <tbody><tr><td><code>cargo test -p fn64-render-ir -p fn64-render -p fn64-abi --lib --no-fail-fast</code></td><td>10</td><td>10</td><td>deterministic</td></tr><tr><td><code>cargo test -p fn64-render-ir --doc &amp;&amp; python3 -m unittest tools.test_check_rt64_port_parity</code></td><td>10</td><td>10</td><td>deterministic</td></tr><tr><td><code>cargo nextest run -p fn64-abi</code></td><td>1</td><td>1</td><td>single</td></tr><tr><td><code>cargo test -p fn64-render-wgpu</code></td><td>10</td><td>10</td><td>deterministic</td></tr></tbody></table>
   </details>
-  <details><summary>Retrospective</summary><ul><li><strong>Friction:</strong> A broad rustfmt invocation on a dirty module root recursively reformatted unrelated legacy modules and created roughly 36,000 lines of noise before testing.</li><li><strong>Cause:</strong> The formatter was aimed at a module root instead of the explicit owned files, and changed-path scope was audited after the command rather than before tests.</li><li><strong>Prevention:</strong> Format only explicit owned files in dirty legacy trees, stage new modules before linting, and require a git-status plus changed-path audit before any test loop.</li><li><strong>Est. minutes saved:</strong> 35</li></ul></details>
+  <details><summary>Retrospective</summary><ul><li><strong>Friction:</strong> A broad rustfmt invocation on a dirty module root recursively reformatted unrelated legacy modules and created roughly 36,000 lines of noise before testing.</li><li><strong>Cause:</strong> The formatter was aimed at a module root instead of the explicit owned files, and changed-path scope was audited after the command rather than before tests.</li><li><strong>Prevention:</strong> Format only explicit owned files in dirty legacy trees, stage new modules before linting, audit changed paths before tests, and run direct downstream identity consumers whenever a shared record schema changes.</li><li><strong>Est. minutes saved:</strong> 35</li></ul></details>
 </article>
 <article class="ticket" data-state="RUNNING" data-milestone="M4">
   <header>

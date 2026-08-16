@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T09:54:30Z` |
+| updated | `2026-08-16T09:58:00Z` |
 
 ## Milestones
 
@@ -731,8 +731,8 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | branch | `port/m4-owned-guest-reads` -> `main` |
 | dependencies | `M3.3.3` |
 | writable paths | `crates/fn64-render-ir/src/guest_read.rs`, `crates/fn64-render/src/guest_read.rs`, `crates/fn64-abi/src/guest_read_capture.rs`, `docs/DESIGN.md`, `docs/RENDER-WGPU-PORT-PLAN.md` |
-| started / updated | `2026-08-16T09:00:00Z` / `2026-08-16T09:54:30Z` (elapsed 54m) |
-| verification runs meeting bar | 3/3 |
+| started / updated | `2026-08-16T09:00:00Z` / `2026-08-16T09:58:00Z` (elapsed 58m) |
+| verification runs meeting bar | 4/4 |
 
 **Findings:**
 
@@ -740,6 +740,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Admission is capture-independent and precedes ABI read-plan exposure; the ABI owns only bounds and N64Recomp byte-lane translation while the renderer owns semantic read selection.
 - The accepted path retains no RDRAM pointer or borrow and allocates only declared reads, not a full memory snapshot. Record v3 intentionally rejects v2.
 - This is a synthetic cross-crate mechanism proof, not production DPC dispatch migration, TMEM population, GPU upload, RT64 parity, or performance evidence.
+- The first downstream wgpu baseline exposed a stale pre-v3 workload golden outside M4.0's original test matrix. The v3 identity is now frozen at 08dc8fbe and the full 81-unit/nine-doctest consumer suite passed 10/10.
 
 **Verification:**
 
@@ -748,6 +749,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | `cargo test -p fn64-render-ir -p fn64-render -p fn64-abi --lib --no-fail-fast` | 10 | 10 | deterministic |
 | `cargo test -p fn64-render-ir --doc && python3 -m unittest tools.test_check_rt64_port_parity` | 10 | 10 | deterministic |
 | `cargo nextest run -p fn64-abi` | 1 | 1 | single |
+| `cargo test -p fn64-render-wgpu` | 10 | 10 | deterministic |
 
 **Next action:** Use the owned read mechanism in M4.1's typed texture/TMEM command-state path, then migrate production dispatch only after separately reviewed execution and guest-publication ordering exists.
 
@@ -755,7 +757,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 
 - Friction: A broad rustfmt invocation on a dirty module root recursively reformatted unrelated legacy modules and created roughly 36,000 lines of noise before testing.
 - Cause: The formatter was aimed at a module root instead of the explicit owned files, and changed-path scope was audited after the command rather than before tests.
-- Prevention: Format only explicit owned files in dirty legacy trees, stage new modules before linting, and require a git-status plus changed-path audit before any test loop.
+- Prevention: Format only explicit owned files in dirty legacy trees, stage new modules before linting, audit changed paths before tests, and run direct downstream identity consumers whenever a shared record schema changes.
 - Estimated minutes saved: 35
 
 ### `M4.1` -- Decode and transactionally stage typed texture-image, tile, tile-size, synchronization, block, tile, and TLUT load commands with exact TMEM-source read plans.
