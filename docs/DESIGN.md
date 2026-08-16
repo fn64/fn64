@@ -38,11 +38,46 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     │                                                    ^
     └──────────────────depends on───────────────────────┘
     └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
-    ├──depends on──> fn64-render-reference ──depends on──> fn64-render ──depends on──> fn64-runtime
+    ├──depends on──> fn64-render-reference ──depends on──> fn64-render ──depends on──> fn64-runtime + fn64-render-ir
     └──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
 fn64-certification ──depends on──> fn64-render + fn64-render-reference + fn64-render-rt64 + fn64-runtime
-fn64-render-ir (GPU/runtime independent; currently has no workspace dependencies or consumers)
+fn64-render-ir (GPU/runtime independent; has no workspace dependencies)
 ```
+
+The first render-IR consumer is intentionally a synthetic raw-DPC integration
+test, not a replacement for production DPC dispatch. After the ABI-side test
+owner validates an exact owned DRAM command capture, `fn64-render` translates
+it into one ephemeral `WorkloadPacket`/`DecodedTicket`. Three different owners
+then hold the `SubmissionQueue`, reference-renderer
+`BackendCompletionAuthority`, and ABI-side `GuestCommitAuthority`. The ABI
+guest owner captures an exact-submission preimage while retaining an exclusive
+borrow of that live allocation; moving its one immutable snapshot produces a
+distinct transaction state that alone can commit. The reference adapter
+installs each immutable stream only into that call's shadow image, executes
+under transaction-local diagnostic isolation, receipts the exact declared
+RDRAM effects, and discards its cloned backend even on success because this
+first slice does not yet receipt persistent RDP/TMEM/hidden-bit state. Only a
+completion matching the queue, submitted identity and ordinal, transaction
+ordinal, byte length, and full live-memory preimage can obtain the guest
+receipt and copy bytes back. Rejection or a dropped completion therefore
+leaves live RDRAM, the backend template, process-global observations, and
+diagnostic files unchanged.
+
+`WorkloadRecord` is content-silent replay data and may be derived before
+commit; that construction is not an architectural publication claim. Durable
+semantic publication uses `CommittedSemanticWorkloadRecord`, whose private
+construction requires a `GuestCommittedTicket`. Architectural raw-DPC
+observation publication remains outside this synthetic slice and must acquire
+the same committed authority when it is added. The IR ticket API currently
+represents cancellation by consuming and dropping the ticket; it does not yet
+have an explicit cancellation outcome type.
+
+Production `dispatch_dpc_submission` remains on the compatible
+`RenderBackend` atomic path. Its eventual migration order is renderer-staged
+completion, `LiveDpcTransaction::commit`, committed semantic publication and
+guest-effect application, then DP completion scheduling. The synthetic test
+proves the authority placement and rollback mechanism only; it does not yet
+prove that production scheduling order.
 
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
 Rust: the scheduler, message-queue semantics, timer wheel, rdram buffer

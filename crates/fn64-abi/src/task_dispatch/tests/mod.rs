@@ -631,3 +631,4 @@
 mod dispatch_a;
 mod dispatch_b;
 mod dispatch_c;
+mod render_ir_integration;
