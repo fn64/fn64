@@ -3,6 +3,8 @@
 mod production_adapter;
 mod texture_rectangle;
 mod triangle;
+#[cfg(test)]
+mod triangle_composition;
 mod triangle_vertices;
 
 pub use production_adapter::{push_decoded_raw_dpc, UnadmittedRawDpcCommand};
