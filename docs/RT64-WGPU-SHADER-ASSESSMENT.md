@@ -61,11 +61,24 @@ ingestible result. The former row-11 baseline-limit diagnostic is deliberately
 not a blocker class: its derived immediate profile must pass or match another
 independently preserved exact blocker. Any near-match, other diagnostic, exit
 code, output, profile mismatch, missing or changed witness, row mutation, or
-incomplete denominator aborts without a complete receipt. Each blocked-known
-row carries exactly one matching witness among the four closed classes; an
-ingestible row carries none. Relaxed capabilities, disabling Naga
-`STRUCT_LAYOUTS`, SPIR-V passthrough, decoration stripping, skip flags, and
-unchecked shader-module creation are not admitted alternatives.
+incomplete denominator aborts without a complete receipt.
+
+`ShaderNonUniform`'s evidence is the row's `semantic_inventory` (already
+serialized independently); it has no `*_witness` field of its own. The other
+three classes each carry the exact structural witness matching the row's
+selected `reason_code`. Real accepted SPIR-V bytes are not exclusive to one
+class's structural shape — the same fragment shader can name
+`instanceRDPParams` and export `out.var.SV_TARGET0` regardless of which
+diagnostic actually blocked it. The producer derives every witness class
+privately to classify the row, but serializes only the witness matching the
+selected reason (none, for `ShaderNonUniform`); it never lets an unselected
+class's structural match leak onto the row. `scalar_layout_witness`,
+`sampled_buffer_witness`, and `fragment_interface_witness` are therefore
+mutually exclusive: every blocked-known row has exactly one of the three set
+(zero for `ShaderNonUniform`) and the other two null; an ingestible row has
+all three null. Relaxed capabilities, disabling Naga `STRUCT_LAYOUTS`, SPIR-V
+passthrough, decoration stripping, skip flags, and unchecked shader-module
+creation are not admitted alternatives.
 
 ## Commands
 
