@@ -96,6 +96,13 @@ def check_refs() -> None:
         if superseded(text):
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
+            # The generated workflow dashboard deliberately reserves exact
+            # destination paths before a writer creates them. Its source
+            # manifest separately enforces bounded repo-relative paths and the
+            # dashboard checker rejects malformed state. Treat only that
+            # machine-owned table row as a reservation, not a live file claim.
+            if doc.name == "RT64-PORT-DASHBOARD.md" and line.startswith("| writable paths |"):
+                continue
             # A path inside ANOTHER repository is that repo's, not ours.
             # n64recomp-comparison.md:493 lists ~/Code/aki-recomp's own
             # README/AGENTS/docs -- naming them is the comparison's whole
@@ -500,6 +507,21 @@ def check_base_renderer_matrix() -> None:
         print("  base-renderer behavior matrix and generated report agree")
 
 
+# --- 4d. RT64 port workflow status and generated views agree ----------------
+def check_rt64_port_dashboard() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/rt64_port_dashboard.py"), "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("RT64-PORT-DASHBOARD.md", detail)
+    elif VERBOSE:
+        print("  RT64 port ticket manifest and generated dashboards agree")
+
+
 # --- 5. no doc may cite a scripts/ entry point that isn't executable ---------
 def check_scripts() -> None:
     for doc in docs():
@@ -571,6 +593,7 @@ def main() -> int:
                check_rt64_platform_certification,
                check_private_input_admission,
                check_base_renderer_matrix,
+               check_rt64_port_dashboard,
                check_generated_validators,
                check_scripts):
         fn()

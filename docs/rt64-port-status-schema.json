@@ -1,0 +1,113 @@
+{
+  "schema": "fn64.rt64-port-status-schema.v1",
+  "reviewed_on": "2026-08-15",
+  "maintained_by": "integration lead; validated by tools/rt64_port_dashboard.py",
+  "source_docs": [
+    "docs/RENDER-WGPU-PORT-PLAN.md",
+    "docs/RT64-PORT-ORCHESTRATION.md"
+  ],
+  "allowed_ticket_states": [
+    "READY",
+    "RUNNING",
+    "READY_FOR_REVIEW",
+    "BLOCKED",
+    "REJECTED",
+    "INTEGRATED"
+  ],
+  "allowed_milestone_states": [
+    "PLANNED",
+    "READY",
+    "IN PROGRESS",
+    "BLOCKED",
+    "COMPLETE"
+  ],
+  "required_program_fields": [
+    "goal",
+    "updated_utc",
+    "program_state",
+    "branch",
+    "base_branch"
+  ],
+  "required_milestone_fields": [
+    "id",
+    "title",
+    "state",
+    "exit_headline"
+  ],
+  "required_ticket_fields": [
+    "id",
+    "milestone",
+    "objective",
+    "profile",
+    "model",
+    "effort",
+    "owner",
+    "branch",
+    "base_branch",
+    "writable_paths",
+    "dependencies",
+    "state",
+    "findings",
+    "verification_runs",
+    "blocker",
+    "next_action",
+    "started_utc",
+    "updated_utc"
+  ],
+  "optional_ticket_fields": [
+    "retrospective",
+    "external_issue"
+  ],
+  "required_retrospective_fields": [
+    "friction",
+    "cause",
+    "prevention",
+    "estimated_minutes_saved"
+  ],
+  "bounds": {
+    "max_goal_chars": 600,
+    "max_text_field_chars": 400,
+    "max_array_items": 40,
+    "max_findings_items": 20,
+    "max_verification_runs_items": 20,
+    "max_writable_paths_items": 20,
+    "max_dependencies_items": 20,
+    "min_ticket_id_len": 2,
+    "max_ticket_id_len": 24
+  },
+  "id_pattern": "^[A-Z][A-Z0-9]*(?:\\.[0-9]+)*$",
+  "milestone_id_pattern": "^M(?:0(?:\\.[1-9][0-9]*)?|[1-9][0-9]*)$",
+  "timestamp_pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+  "path_privacy": {
+    "forbidden_prefixes": [
+      "/Users/",
+      "/home/",
+      "~/",
+      "C:\\\\",
+      "D:\\\\"
+    ],
+    "forbidden_substrings": [
+      "@",
+      "ssh://",
+      "private"
+    ]
+  },
+  "profile_enum": ["F", "I", "P", "M"],
+  "effort_enum": ["low", "medium", "high", "xhigh"],
+  "verification_run_fields": [
+    "command",
+    "clean_run_count",
+    "required_run_count",
+    "kind"
+  ],
+  "verification_run_kind_enum": ["deterministic", "concurrency", "single"],
+  "notes": [
+    "state values must exactly match allowed_ticket_states / allowed_milestone_states; no synonyms.",
+    "a ticket state of INTEGRATED may only be set by the integration lead after independent review; the generator does not infer it.",
+    "dependencies reference other ticket ids in the same manifest and must not cycle.",
+    "owner and model fields must name an exact model/profile/effort, never a placeholder like 'TBD'.",
+    "writable_paths must be repo-relative and must not use machine-local absolute paths or private identities.",
+    "verification_runs record actual executed commands and counts; READY_FOR_REVIEW and INTEGRATED require every declared reliability bar to be met.",
+    "external_issue, when present, is a canonical GitHub issue URL and must be closed or superseded in the integration loop."
+  ]
+}
