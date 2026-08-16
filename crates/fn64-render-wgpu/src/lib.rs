@@ -246,6 +246,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+mod alpha_compare;
 mod depth_strict_less;
 mod device;
 mod lifecycle;
@@ -258,6 +259,11 @@ mod targets;
 mod tmem;
 mod vi;
 
+pub use alpha_compare::{
+    alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value,
+    require_supported_alpha_compare, AlphaCompareNoise, CopyCycleSourceFormat,
+    ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_WGSL,
+};
 pub use depth_strict_less::{
     strict_less_depth_test, strict_less_depth_write, StrictLessDepthOutcome, StrictLessDepthSample,
     StrictLessDepthWrite, STRICT_LESS_DEPTH_ENTRY_POINT, STRICT_LESS_DEPTH_WGSL,
