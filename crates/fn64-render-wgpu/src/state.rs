@@ -27,6 +27,7 @@
 
 use fn64_render_ir::{PhysicalAddress, QueueIdentity};
 
+use crate::combiner::CombineParams;
 use crate::tmem::TmemState;
 
 /// Texture lookup-table interpretation selected by `SetOtherModes` high bits
@@ -632,6 +633,7 @@ pub struct RdpState {
     blend_color: Option<Color4>,
     fog_color: Option<Color4>,
     prim_depth: Option<PrimDepth>,
+    combine: Option<CombineParams>,
     tmem: TmemState,
 }
 
@@ -668,6 +670,10 @@ impl RdpState {
         self.prim_depth
     }
 
+    pub const fn combine(&self) -> Option<CombineParams> {
+        self.combine
+    }
+
     pub const fn tmem(&self) -> &TmemState {
         &self.tmem
     }
@@ -686,6 +692,7 @@ impl RdpState {
             blend_color: self.blend_color,
             fog_color: self.fog_color,
             prim_depth: self.prim_depth,
+            combine: self.combine,
             tmem: self.tmem.clone(),
         }
     }
@@ -715,6 +722,9 @@ impl RdpState {
         if let Some(value) = delta.prim_depth {
             self.prim_depth = Some(value);
         }
+        if let Some(value) = delta.combine {
+            self.combine = Some(value);
+        }
         if let Some(value) = &delta.tmem {
             self.tmem = value.clone();
         }
@@ -731,6 +741,7 @@ pub struct RdpStateDelta {
     blend_color: Option<Color4>,
     fog_color: Option<Color4>,
     prim_depth: Option<PrimDepth>,
+    combine: Option<CombineParams>,
     tmem: Option<TmemState>,
 }
 
@@ -767,6 +778,10 @@ impl RdpStateDelta {
         self.prim_depth
     }
 
+    pub const fn combine(&self) -> Option<CombineParams> {
+        self.combine
+    }
+
     pub const fn tmem(&self) -> Option<&TmemState> {
         self.tmem.as_ref()
     }
@@ -801,6 +816,10 @@ impl RdpStateDelta {
 
     pub(crate) fn set_prim_depth(&mut self, value: PrimDepth) {
         self.prim_depth = Some(value);
+    }
+
+    pub(crate) fn set_combine(&mut self, value: CombineParams) {
+        self.combine = Some(value);
     }
 
     pub(crate) fn set_tmem(&mut self, value: TmemState) {
@@ -849,6 +868,10 @@ impl StagedRdpState {
 
     pub const fn prim_depth(&self) -> Option<PrimDepth> {
         self.state.prim_depth()
+    }
+
+    pub const fn combine(&self) -> Option<CombineParams> {
+        self.state.combine()
     }
 
     pub const fn tmem(&self) -> &TmemState {

@@ -9,10 +9,10 @@
 //! `SetTextureImage`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut` are pushed;
 //! every other decoded command kind (`NoOp`, `SetOtherMode`,
 //! `SetColorImage`, `SetFillColor`, `SetEnvColor`, `SetPrimColor`,
-//! `SetBlendColor`, `SetFogColor`, `SetPrimDepth`, `FillRectangle`,
-//! `FullSync`, `RawTriangle`) is outside the admitted zero-guest-write
-//! TMEM/state subset and is rejected loudly -- never silently dropped -- the
-//! instant one is encountered.
+//! `SetBlendColor`, `SetFogColor`, `SetPrimDepth`, `SetCombine`,
+//! `FillRectangle`, `FullSync`, `RawTriangle`) is outside the admitted
+//! zero-guest-write TMEM/state subset and is rejected loudly -- never
+//! silently dropped -- the instant one is encountered.
 
 use fn64_render::{
     ExactRawDpcPlanWriter, NeutralImageFormat, NeutralPixelSize, NeutralTextureImage,
@@ -68,6 +68,7 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         RawDpcCommandKind::SetBlendColor(_) => "SetBlendColor",
         RawDpcCommandKind::SetFogColor(_) => "SetFogColor",
         RawDpcCommandKind::SetPrimDepth(_) => "SetPrimDepth",
+        RawDpcCommandKind::SetCombine(_) => "SetCombine",
         RawDpcCommandKind::FillRectangle(_) => "FillRectangle",
         RawDpcCommandKind::FullSync(_) => "FullSync",
         RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
@@ -407,6 +408,7 @@ pub fn push_decoded_raw_dpc(
             | RawDpcCommandKind::SetBlendColor(_)
             | RawDpcCommandKind::SetFogColor(_)
             | RawDpcCommandKind::SetPrimDepth(_)
+            | RawDpcCommandKind::SetCombine(_)
             | RawDpcCommandKind::FillRectangle(_)
             | RawDpcCommandKind::FullSync(_)
             | RawDpcCommandKind::RawTriangle(_)) => {

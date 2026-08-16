@@ -67,9 +67,13 @@
 //!   regardless of cycle count — this is a separate mechanism from the
 //!   cross-cycle carry wrap above (see [`wrap_clamp`]'s doc).
 //!
-//! Explicitly not in this port: copy mode, `SetCombine` decode/`RdpState`
-//! tracking, real NOISE/LOD generation, shader-keying, draw-path wiring,
-//! and any GPU execution. RT64's `!inputs.alphaOnly` gate around the RGB
+//! Explicitly not in this port: copy mode, real NOISE/LOD generation,
+//! shader-keying, draw-path wiring, and any GPU execution. `SetCombine`'s
+//! raw-DPC opcode decode and its durable `RdpState` retention live in
+//! `raw_dpc::mod`/`state.rs` (`RawDpcCommandKind::SetCombine`,
+//! `RdpState::combine`), which construct and store [`CombineParams`] via
+//! `from_wire` but do not change its arithmetic. RT64's `!inputs.alphaOnly`
+//! gate around the RGB
 //! combine (`runCycle` line 589) is transcribed as [`run_cycle`]'s
 //! `alpha_only` parameter for structural fidelity, but this port's
 //! [`CombinerInputs`] has no `alphaOnly` field to set it from — RT64's own
@@ -153,10 +157,12 @@ pub struct CombineParams {
 }
 
 impl CombineParams {
-    // No `SetCombine` opcode handler exists yet (Slice 4, `RdpState`
-    // integration, is out of this slice's scope) — only tests construct
-    // `CombineParams` for now.
-    #[allow(dead_code)]
+    /// `RDP::setCombine`'s wire split (`src/hle/rt64_rdp.cpp:295-302`, pinned
+    /// commit `5473732a822a4423b5696e7cb18fecc425a59875`): `low` is exactly
+    /// the command's first wire word (`w0`, unmasked — RT64 never strips its
+    /// top opcode byte before storing `combineL`), `high` is exactly the
+    /// second wire word (`w1`, `combineH`). The `raw_dpc` module's
+    /// `SET_COMBINE` decode arm is this constructor's opcode handler.
     pub(crate) const fn from_wire(low: u32, high: u32) -> Self {
         Self { low, high }
     }
