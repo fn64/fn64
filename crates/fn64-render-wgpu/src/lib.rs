@@ -261,6 +261,7 @@
 
 mod alpha_compare;
 mod combiner;
+mod coverage;
 mod depth_strict_less;
 mod device;
 mod lifecycle;
@@ -281,6 +282,11 @@ pub use alpha_compare::{
 pub use combiner::{
     run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams,
     CombinerInputError, CombinerInputs, COLOR_COMBINER_WGSL,
+};
+pub use coverage::{
+    apply_coverage_alpha, attribute_sample, coverage_result, AttributeSamplePoint, Coverage,
+    CoverageMask, CoverageModeBits, CoverageResult, CoveredAttributeSample, COVERAGE_ENTRY_POINT,
+    COVERAGE_SAMPLES, COVERAGE_WGSL,
 };
 pub use depth_strict_less::{
     strict_less_depth_test, strict_less_depth_write, StrictLessDepthOutcome, StrictLessDepthSample,
