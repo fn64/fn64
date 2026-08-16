@@ -395,9 +395,10 @@ pub use shader_manifest::{
     THREE_NEAREST_FILTER_WGSL, THREE_NEAREST_FILTER_WORKGROUPS,
 };
 pub use state::{
-    AlphaCompare, AlphaDither, BlenderCycle, ColorImage, CoverageDestination, CycleType, DepthMode,
-    FillColor, ImageFormat, OtherMode, PixelSize, RdpState, RdpStateDelta, RgbDither,
-    StagedRdpState, TextureFilter, TextureLutMode, TextureLutModeError,
+    AlphaCompare, AlphaDither, BlenderCycle, Color4, ColorImage, CoverageDestination, CycleType,
+    DepthMode, FillColor, ImageFormat, OtherMode, PixelSize, PrimColor, PrimDepth, PrimLod,
+    RdpState, RdpStateDelta, RgbDither, StagedRdpState, TextureFilter, TextureLutMode,
+    TextureLutModeError,
 };
 pub use targets::{
     decode_fill_cycle_pixel, execute_fill_rectangle, pack_device_pixels,
