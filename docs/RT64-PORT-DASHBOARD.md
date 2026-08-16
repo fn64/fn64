@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T09:58:00Z` |
+| updated | `2026-08-16T10:37:19Z` |
 
 ## Milestones
 
@@ -21,7 +21,7 @@
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:4, READY:1, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
-| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | INTEGRATED:1, RUNNING:1 |
+| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:1, INTEGRATED:1, RUNNING:1 |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
 | `M7` | `PLANNED` | Base-renderer certification | none |
@@ -780,6 +780,31 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Actual-crate wiring, tracked source, exact expected test counts, explicit-file formatting, and independent review are required before its deterministic bar.
 
 **Next action:** Implement the bounded command/state path, obtain independent adversarial review, then run ten consecutive actual-crate test processes before integration.
+
+### `M4.2` -- Execute LoadTile and LoadBlock into typed 4 KiB physical TMEM state with exact source reads, destination effects, validity epochs, rollback, and post-commit publication.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `BLOCKED` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | integration lead |
+| branch | `port/m4-tmem-load-execution` -> `main` |
+| dependencies | `M4.1` |
+| writable paths | `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/lib.rs` |
+| started / updated | `2026-08-16T10:37:19Z` / `2026-08-16T10:37:19Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- M4.2.0 must first freeze ordered TmemLoadSource accesses plus canonical physical TmemLoadDestination fragments; source-only journal plans are insufficient for effect receipts.
+- Public RDP authority requires complete 64-bit transfer words, modular 4 KiB addressing, odd-row XOR4, DXT 1.11 carries, and RGBA32 low/high 2 KiB bank splitting.
+- TextureImage supplies source format, size, width, and address. RT64's tile-size substitution, zero starting-row XOR, silent invalid-coordinate returns, and host-layout correction remain divergence candidates rather than fn64 authority.
+- The implementation can split after the core state engine: LoadTile and LoadBlock executors own disjoint modules, then a frontier integration lane validates exact read/effect identities and publishes atomically after guest commit.
+
+**Blocker:** M4.1 is not yet reviewed/integrated, and M4.2.0 has not frozen destination-journal fragments or the stronger-authority full-word and starting-row fixtures.
+
+**Next action:** After M4.1 integrates, land the M4.2.0 contract, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.
 
 ### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
 
