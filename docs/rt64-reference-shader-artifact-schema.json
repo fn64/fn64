@@ -6,6 +6,8 @@
   ],
   "receipt_schema": "fn64.rt64-reference-shader-receipt.v1",
   "spirv_val_build_receipt_schema": "fn64.spirv-val-source-build.v1",
+  "spirv_val_smoke_receipt_schema": "fn64.spirv-val-single-artifact-smoke.v1",
+  "spirv_val_smoke_claim_boundary": "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
   "artifact_producer": {
     "path": "tools/rt64_shader_artifacts.py",
     "sha256": "b8db5cbcaa0caef60ec3c84a966917d246e25df882ae44951541e65720630d33"
@@ -95,12 +97,12 @@
       "SOURCE_DATE_EPOCH"
     ],
     "generated_authority_files": [
-      "build/source/core_tables_body.inc",
-      "build/source/core_tables_header.inc",
-      "build/source/DebugInfo.h",
-      "build/source/OpenCLDebugInfo100.h",
-      "build/source/generators.inc",
-      "build/source/build-version.inc"
+      "build/core_tables_body.inc",
+      "build/core_tables_header.inc",
+      "build/DebugInfo.h",
+      "build/OpenCLDebugInfo100.h",
+      "build/generators.inc",
+      "build/build-version.inc"
     ],
     "candidate_paths": [
       "build/tools/spirv-val",
@@ -114,6 +116,7 @@
     ],
     "maximum_binary_bytes": 67108864,
     "maximum_build_manifest_bytes": 16777216,
+    "maximum_smoke_inventory_rows": 65536,
     "darwin_runtime_closure": {
       "inspector": "/usr/bin/otool",
       "format": "otool-L-v1",
