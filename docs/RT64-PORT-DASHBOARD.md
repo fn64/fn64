@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T09:32:45Z` |
+| updated | `2026-08-16T09:54:30Z` |
 
 ## Milestones
 
@@ -19,9 +19,9 @@
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:4, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:4, RUNNING:1 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:4, READY:1, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
-| `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
+| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | INTEGRATED:1, RUNNING:1 |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
 | `M7` | `PLANNED` | Base-renderer certification | none |
@@ -407,30 +407,107 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Prevention: Reuse M2.4's controlled-environment and complete-audit matrix at every external source-build boundary before implementation review.
 - Estimated minutes saved: 30
 
-### `M2.5` -- Execute the accepted M2.4 mechanism against complete official DXC source and qualify all 56 admitted SPIR-V artifacts with independently reviewed source-build, compiler, dependency, validation, and corpus receipts.
+### `M2.5` -- Coordinate the split shader program: retain exact DXC reference artifacts, grade wgpu ingestion honestly, and produce a separately checked runtime-ready Rust shader corpus.
 
 | field | value |
 |---|---|
 | milestone | `M2` |
-| state | `RUNNING` |
+| state | `BLOCKED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | shader corpus execution lead |
 | branch | `port/rt64-shader-corpus` -> `main` |
 | dependencies | `M2.4` |
 | writable paths | `docs/rt64-shader-artifacts.json`, `docs/RT64-SHADER-ARTIFACTS.md` |
-| started / updated | `2026-08-16T07:46:09Z` / `2026-08-16T09:00:00Z` (elapsed 1h13m) |
+| started / updated | `2026-08-16T07:46:09Z` / `2026-08-16T09:54:30Z` (elapsed 2h8m) |
 | verification runs meeting bar | 0/0 |
 
 **Findings:**
 
 - M2.4 qualified the fail-closed mechanism and denominator, not an official DXC compiler build or shader corpus.
 - The build requires a complete clean checkout of official DXC v1.9.2607 at 0d3ee6b with its exact initialized DirectX-Headers, SPIRV-Headers, and SPIRV-Tools gitlinks; the sparse audit checkout is correctly rejected.
-- All 56 SPIR-V rows and both DXC built-in and standalone wgpu validators must close before M3.3 or M4 may claim admission of the full RT64 shader corpus.
+- All 56 reference rows and all runtime rows must close their own validators before M4 may claim admission of the full RT64 shader corpus.
 - A complete exact-byte official DXC checkout built successfully, and independently reviewed receipt schema v2 now binds the official dxc symlink, its retained libdxcompiler.dylib implementation, the exact macOS loader denominator, and private descriptor-stable execution.
 - The rebuilt official compiler and standalone wgpu validator receipts verified. Corpus production then failed closed on row one because DXC -P emits the preprocessed file but does not emit the requested -MD/-MF dependency file.
-- An executable probe confirmed DXC's explicit -M/-MF dependency-only phase emits the active include closure. The producer repair is separating dependency observation, preprocessing, and retained-preprocessed compilation while receipting all three phases; its producer identity change requires rebuilding both receipts before corpus qualification.
+- The reviewed three-phase producer repair separates dependency observation, preprocessing, and retained-preprocessed compilation and rejects phase confusion.
+- The rebuilt DXC and wgpu-validator receipts verified, but row one failed closed because its semantically required ShaderNonUniform SPIR-V capability is unsupported by Naga 30's strict SPIR-V frontend.
+- Relaxing strict validation or stripping NonUniform decoration would discard semantics. The umbrella is therefore split into reference-valid, ingestion-assessment, and runtime-ready artifact tickets.
 
-**Next action:** Independently review and integrate the explicit -M/-MF dependency-phase repair, rebuild the exact DXC and validator receipts under the new producer identity, then produce and verify all 56 shader rows before the deterministic bar.
+**Blocker:** The original single-corpus exit condition is impossible with the admitted DXC output and Naga 30: row one requires ShaderNonUniform, which the strict SPIR-V frontend rejects. M2.5.1 through M2.5.3 replace the conflated gate.
+
+**Next action:** Complete M2.5.1 reference-valid corpus evidence, then use M2.5.2's typed assessment and M2.5.3's owned WGSL/runtime artifacts without treating reference validity as wgpu ingestibility.
+
+**Retrospective:**
+
+- Friction: The first full-corpus attempt reached row one only after rebuilding the qualified compiler and validator closure.
+- Cause: The mechanism gate conflated DXC/SPIR-V semantic validity with Naga/wgpu ingestibility and lacked a one-shader capability smoke before corpus execution.
+- Prevention: Every external shader toolchain now runs one capability-inventory smoke first, and reference-valid, ingestible, and runtime-ready are separate typed claims.
+- Estimated minutes saved: 45
+
+### `M2.5.1` -- Produce the complete 56-row reference-valid RT64 SPIR-V corpus with exact DXC phases, external spirv-val validation, and capability/extension/decoration inventories.
+
+| field | value |
+|---|---|
+| milestone | `M2` |
+| state | `RUNNING` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | /root/m2_5_depfile_repair |
+| branch | `m2-5a-reference-corpus` -> `main` |
+| dependencies | `M2.5` |
+| writable paths | `tools/rt64_reference_shader_artifacts.py`, `tools/test_rt64_reference_shader_artifacts.py`, `docs/rt64-reference-shader-artifact-schema.json`, `docs/RT64-REFERENCE-SHADER-ARTIFACTS.md` |
+| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- This ticket preserves the already-qualified DXC producer identity by adding a separate orchestration and receipt layer rather than editing the accepted producer.
+- Reference-valid means DXC and exact source-built spirv-val accept the artifact; it does not imply Naga or wgpu ingestion, runtime readiness, renderer parity, or performance.
+- Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.
+
+**Next action:** Finish the additive mechanism, obtain independent adversarial review, pass its deterministic bar, then execute and independently review all 56 rows.
+
+### `M2.5.2` -- Assess every reference-valid shader through the exact Naga/wgpu ingestion boundary with typed ingestible or blocked-known outcomes and a separate fail-closed runtime-ready gate.
+
+| field | value |
+|---|---|
+| milestone | `M2` |
+| state | `READY` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | integration lead |
+| branch | `port/rt64-wgpu-ingestion-assessment` -> `main` |
+| dependencies | `M2.5.1` |
+| writable paths | `tools/rt64_wgpu_shader_assessment.py`, `docs/rt64-wgpu-shader-assessment-schema.json`, `docs/RT64-WGPU-SHADER-ASSESSMENT.md` |
+| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- The first row is already a known typed blocker: Naga 30's strict SPIR-V frontend rejects ShaderNonUniform while the source requires NonUniformResourceIndex semantics.
+- A complete assessment may close with blocked-known rows; its distinct runtime-ready command must remain red while any required row is not ingestible.
+
+**Next action:** Dispatch after M2.5.1 freezes the complete reference corpus and per-row capability inventory.
+
+### `M2.5.3` -- Produce the all-56 runtime-ready shader corpus, using checked reference artifacts where ingestible and owned WGSL/Naga-IR ports with semantic differential bindings where they are not.
+
+| field | value |
+|---|---|
+| milestone | `M2` |
+| state | `BLOCKED` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | integration lead |
+| branch | `port/rt64-runtime-shader-corpus` -> `main` |
+| dependencies | `M2.5.1`, `M2.5.2` |
+| writable paths | `crates/fn64-render-wgpu/src/shaders`, `crates/fn64-render-wgpu/src/shader_manifest.rs`, `docs/RT64-RUNTIME-SHADER-CORPUS.md` |
+| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- Owned WGSL binding arrays are the portable checked path for nonuniform resource selection; unsafe backend passthrough remains outside the baseline authority.
+- Adapters without the required binding-array features or limits need an exact bounded remap, batching, or atlas fallback that cannot silently omit resources.
+
+**Blocker:** The complete reference corpus and per-row wgpu assessment do not yet exist; runtime shader promotion also requires semantic differential fixtures.
+
+**Next action:** Begin bounded owned WGSL vertical slices in parallel where authority fixtures exist, but do not claim a complete runtime corpus until both upstream tickets close.
 
 ### `M3.1` -- Create fn64-render-wgpu and execute one receipt-bearing synthetic fill plus FullSync packet through the merged IR and exact wgpu submission lifecycle, without ABI or shell policy.
 
@@ -642,6 +719,65 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Cause: Exclusive-path isolation deferred crate-root wiring, and the reliability loop began before checking that Cargo compiled tracked source and reported the expected test count.
 - Prevention: Before any 10-run bar, wire the module in an actual crate worktree, stage or otherwise prove the source is tracked, and require the exact expected test count; scratch harnesses may supplement but never replace that check.
 - Estimated minutes saved: 20
+
+### `M4.0` -- Establish an owned deferred guest-read boundary from renderer preflight through ABI capture, packet finalization, and content-silent replay without retaining guest-memory borrows or copying all RDRAM.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `INTEGRATED` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | /root/m4_0_owned_reads_impl |
+| branch | `port/m4-owned-guest-reads` -> `main` |
+| dependencies | `M3.3.3` |
+| writable paths | `crates/fn64-render-ir/src/guest_read.rs`, `crates/fn64-render/src/guest_read.rs`, `crates/fn64-abi/src/guest_read_capture.rs`, `docs/DESIGN.md`, `docs/RENDER-WGPU-PORT-PLAN.md` |
+| started / updated | `2026-08-16T09:00:00Z` / `2026-08-16T09:54:30Z` (elapsed 54m) |
+| verification runs meeting bar | 3/3 |
+
+**Findings:**
+
+- Commit d8c0d4b1 adds a real callable ABI capture API plus renderer-neutral plan, owned capture, packet finalization, and v3 record/replay types.
+- Admission is capture-independent and precedes ABI read-plan exposure; the ABI owns only bounds and N64Recomp byte-lane translation while the renderer owns semantic read selection.
+- The accepted path retains no RDRAM pointer or borrow and allocates only declared reads, not a full memory snapshot. Record v3 intentionally rejects v2.
+- This is a synthetic cross-crate mechanism proof, not production DPC dispatch migration, TMEM population, GPU upload, RT64 parity, or performance evidence.
+
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-ir -p fn64-render -p fn64-abi --lib --no-fail-fast` | 10 | 10 | deterministic |
+| `cargo test -p fn64-render-ir --doc && python3 -m unittest tools.test_check_rt64_port_parity` | 10 | 10 | deterministic |
+| `cargo nextest run -p fn64-abi` | 1 | 1 | single |
+
+**Next action:** Use the owned read mechanism in M4.1's typed texture/TMEM command-state path, then migrate production dispatch only after separately reviewed execution and guest-publication ordering exists.
+
+**Retrospective:**
+
+- Friction: A broad rustfmt invocation on a dirty module root recursively reformatted unrelated legacy modules and created roughly 36,000 lines of noise before testing.
+- Cause: The formatter was aimed at a module root instead of the explicit owned files, and changed-path scope was audited after the command rather than before tests.
+- Prevention: Format only explicit owned files in dirty legacy trees, stage new modules before linting, and require a git-status plus changed-path audit before any test loop.
+- Estimated minutes saved: 35
+
+### `M4.1` -- Decode and transactionally stage typed texture-image, tile, tile-size, synchronization, block, tile, and TLUT load commands with exact TMEM-source read plans.
+
+| field | value |
+|---|---|
+| milestone | `M4` |
+| state | `RUNNING` |
+| profile / effort / model | `F` / `high` / GPT-5.6 Sol |
+| owner | /root/m4_1_tmem_wire_state |
+| branch | `port/m4-tmem-wire-state` -> `main` |
+| dependencies | `M4.0` |
+| writable paths | `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
+| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- This slice owns command/state/read-plan semantics only; TMEM byte movement, texture decode, GPU upload, framebuffer hazards, parity, and performance remain later gates.
+- Actual-crate wiring, tracked source, exact expected test counts, explicit-file formatting, and independent review are required before its deterministic bar.
+
+**Next action:** Implement the bounded command/state path, obtain independent adversarial review, then run ten consecutive actual-crate test processes before integration.
 
 ### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
 

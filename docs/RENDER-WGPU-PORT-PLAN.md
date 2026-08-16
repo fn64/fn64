@@ -41,13 +41,13 @@ reserving authority, parity, performance, and integration claims for the lead.
 | updated | 2026-08-16 |
 | program state | **IN PROGRESS** |
 | execution wave | **ACCEL-A -- port spine and evidence in parallel** |
-| active milestones | **M0 authority/baseline, M2 GPU feasibility, and M3 raw-DPC vertical slice (all IN PROGRESS)** |
-| active slices | M0.3 native baseline; A0.3 remains blocked and A0.4 is READY to produce its first RT64-owned observable; M2.5 official DXC build/corpus execution; M3.3 native-target/VI slice definition |
-| active ownership | `F/xhigh` integration lead; `F/xhigh` RT64 oracle-runner lead; shader corpus execution and native-target owners require fresh exclusive task cards before writing |
-| last completed result | local `main` contains M2.4's reviewed shader-artifact qualification mechanism (`2458be28`) and M3.2's reviewed typed raw-DPC decoder/state slice (`92ea1d2d`) |
-| next concrete decision | run and independently review M2.5's complete official DXC build and 56-artifact corpus while A0.4 qualifies its first RT64-owned observable, then dispatch M3.3 without crossing ABI or surface ownership early |
-| evidence blockers | no matched private-game RT64 baseline exists; public RT64 does not provide a usable tracing implementation; no complete official DXC build or 56-artifact corpus has run; these block their corresponding parity/platform claims, not dependency-safe port work |
-| verification claim | M2.4's producer/validator mechanism passed its 10/10 bar but produced no qualified corpus; M3.2 passed 10/10 runs of its 30-test CPU decoder suite but proves no GPU, parity, ABI, VI/surface, TMEM, persistent-target, or performance behavior |
+| active milestones | **M0 authority/baseline, M2 shader/tool feasibility, M3 raw-DPC vertical slice, and M4 base RDP/TMEM correctness (all IN PROGRESS)** |
+| active slices | M0.3 matched native baseline; M2.5.1 reference-valid shader corpus mechanism; M4.1 typed texture/TMEM command and state decoding |
+| active ownership | `F/xhigh` integration lead; `F/xhigh` M2.5.1 source/tool authority owner; `F/high` M4.1 TMEM wire/state owner; independent reviewers remain serialized from writers |
+| last completed result | local `main` contains M4.0's owned deferred guest-read mechanism (`d8c0d4b1`) after M3.3's bounded real-wgpu raster/VI/guest-commit slice (`35116c76`) |
+| next concrete decision | independently review and integrate M2.5.1 and M4.1, then execute the complete reference-valid shader corpus while starting bounded TMEM load/decode execution |
+| evidence blockers | no matched private-game RT64 performance baseline exists; the original M2.5 gate is split because required ShaderNonUniform SPIR-V semantics are rejected by Naga 30; production DPC dispatch still does not consume the new owned-read path |
+| verification claim | M4.0 passed 10/10 full render-IR/render/ABI suites and real C smoke but is a synthetic mechanism, not production dispatch/TMEM/GPU/parity evidence; M2.5 has no complete corpus claim |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
 counts are in [`RT64-PORT-DASHBOARD.md`](RT64-PORT-DASHBOARD.md), generated
@@ -936,13 +936,18 @@ The accelerated wave keeps dependency-safe work active in parallel:
     plan plus staged state delta. Its 30-test CPU suite passed 10/10; it makes
     no GPU, parity, ABI, TMEM, persistent-target, VI/surface, or performance
     claim.
-15. **M2.5 -- execute the official shader corpus (READY).** Build complete
-    official DXC source at the frozen pin through M2.4's accepted mechanism,
-    produce all 56 SPIR-V artifacts, verify both DXC and standalone-wgpu
-    receipts, and obtain independent receipt/corpus review. Until this closes,
-    M3.3 may use only a separately reviewed minimal mechanism shader and no
-    full RT64 shader-corpus or renderer-parity claim may advance.
-16. **M4.0 -- own deferred guest reads (IMPLEMENTED, REVIEW ACCEPTED; 10/10 VALIDATED).** The
+15. **M2.5 -- split the official shader corpus gate (BLOCKED UMBRELLA; CHILDREN RUNNING/READY).**
+    The complete official DXC and wgpu-validator builds succeeded, but the
+    first artifact failed closed because RT64's required nonuniform descriptor
+    indexing emits `ShaderNonUniform`, which Naga 30's strict SPIR-V frontend
+    does not support. Weakening validation or stripping the decoration would
+    lose semantics. M2.5.1 therefore owns the DXC-plus-`spirv-val`
+    reference-valid corpus and capability inventory; M2.5.2 owns an exact
+    typed wgpu-ingestion assessment; M2.5.3 owns the separately checked
+    runtime corpus, using owned WGSL/Naga IR and bounded feature fallbacks
+    where reference SPIR-V is not ingestible. None of these claims substitutes
+    for another.
+16. **M4.0 -- own deferred guest reads (INTEGRATED, `d8c0d4b1`; 10/10 VALIDATED).** The
     renderer preflights an exact ordered plan from RDRAM `TmemLoadSource`
     journal operations; the ABI captures only those ranges in N64 logical byte
     order; packet finalization and content-silent v3 record/replay bind the
@@ -956,6 +961,12 @@ The accelerated wave keeps dependency-safe work active in parallel:
     `fn64-render-ir`/`fn64-render`/`fn64-abi` library suites (541 passed, 7
     ignored), four move-only doctests, and the cross-language replay golden
     passed together in 10/10 consecutive runs after independent rereview.
+17. **M4.1 -- decode typed texture/TMEM wire state (RUNNING).** Decode and
+    transactionally stage `SetTextureImage`, `SetTile`, `SetTileSize`,
+    `LoadSync`, `LoadBlock`, `LoadTile`, and `LoadTLUT` with exact command and
+    source identities plus M4.0 `TmemLoadSource` read plans. This slice does
+    not move TMEM bytes, decode textures, upload to a GPU, migrate production
+    dispatch, or claim parity/performance.
 
 ### M0 evidence ledger
 
