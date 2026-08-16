@@ -26,6 +26,14 @@ POLICY_PATH = ROOT / "docs/rt64-reference-shader-artifact-schema.json"
 RECEIPT_PATH = "reference-receipt.json"
 BUILD_RECEIPT_PATH = "spirv-val-build-receipt.json"
 BUILD_MANIFEST_PATH = "compiled-source-manifest.json"
+GENERATED_AUTHORITY_NAMES = (
+    "core_tables_body.inc",
+    "core_tables_header.inc",
+    "DebugInfo.h",
+    "OpenCLDebugInfo100.h",
+    "generators.inc",
+    "build-version.inc",
+)
 
 
 def require_safe_relative(value: object, label: str) -> PurePosixPath:
@@ -39,6 +47,41 @@ def require_safe_relative(value: object, label: str) -> PurePosixPath:
     return path
 
 
+def generated_authority_paths(policy: dict) -> tuple[PurePosixPath, ...]:
+    expected = tuple(PurePosixPath("build", name) for name in GENERATED_AUTHORITY_NAMES)
+    configured = policy["spirv_val"]["generated_authority_files"]
+    base.require(isinstance(configured, list), "generated spirv-val authority policy is not a list")
+    actual = tuple(
+        require_safe_relative(value, f"generated spirv-val authority policy path {index}")
+        for index, value in enumerate(configured)
+    )
+    base.require(actual == expected, "generated spirv-val authority policy denominator changed")
+    return expected
+
+
+def record_generated_authority(output: Path, policy: dict) -> list[dict]:
+    records = []
+    for relative in generated_authority_paths(policy):
+        path = output.joinpath(*relative.parts)
+        base.require(path.is_file() and not path.is_symlink(), f"generated spirv-val authority is missing: {relative}")
+        records.append({"path": relative.as_posix(), "sha256": base.digest_file(path)})
+    return records
+
+
+def validate_generated_authority(record: object, build_dir: Path, policy: dict) -> None:
+    expected = generated_authority_paths(policy)
+    base.require(isinstance(record, list) and len(record) == len(expected), "generated spirv-val authority denominator changed")
+    for index, (row, relative) in enumerate(zip(record, expected, strict=True)):
+        base.require_keys(row, {"path", "sha256"}, f"generated spirv-val authority {index}")
+        base.require(row["path"] == relative.as_posix(), "generated spirv-val authority denominator changed")
+        path = build_dir.joinpath(*relative.parts)
+        base.require(path.is_file() and not path.is_symlink(), f"generated spirv-val authority is missing: {relative}")
+        base.require(
+            base.digest_file(path) == require_sha(row["sha256"], f"generated spirv-val authority {index}"),
+            f"generated spirv-val authority changed: {relative}",
+        )
+
+
 def load_policy() -> dict:
     policy = base.load_json(POLICY_PATH)
     base.require_keys(
@@ -48,6 +91,8 @@ def load_policy() -> dict:
             "direct_consumers",
             "receipt_schema",
             "spirv_val_build_receipt_schema",
+            "spirv_val_smoke_receipt_schema",
+            "spirv_val_smoke_claim_boundary",
             "artifact_producer",
             "artifact_policy",
             "dxc",
@@ -107,6 +152,7 @@ def load_policy() -> dict:
             "validation_arguments",
             "maximum_binary_bytes",
             "maximum_build_manifest_bytes",
+            "maximum_smoke_inventory_rows",
             "darwin_runtime_closure",
         },
         "spirv-val policy",
@@ -133,6 +179,11 @@ def load_policy() -> dict:
             "SOURCE_DATE_EPOCH",
         ],
         "spirv-val controlled environment denominator changed",
+    )
+    generated_authority_paths(policy)
+    base.require(
+        policy["spirv_val"]["maximum_smoke_inventory_rows"] == 65536,
+        "SPIR-V smoke inventory row denominator changed",
     )
     for record, expected_path, label in (
         (policy["artifact_producer"], base.TOOL_PATH, "artifact producer"),
@@ -164,6 +215,15 @@ def load_policy() -> dict:
         "SPIRV-Tools license pin drift",
     )
     base.require(policy["claim_boundary"] == "reference-valid-only-not-wgpu-runtime-or-parity", "reference claim boundary drift")
+    base.require(
+        policy["spirv_val_smoke_receipt_schema"] == "fn64.spirv-val-single-artifact-smoke.v1",
+        "unsupported SPIR-V smoke receipt schema",
+    )
+    base.require(
+        policy["spirv_val_smoke_claim_boundary"]
+        == "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
+        "SPIR-V smoke claim boundary drift",
+    )
     base.require(
         policy["required_validation"]
         == [
@@ -415,12 +475,7 @@ def build_spirv_val(args: argparse.Namespace) -> dict:
     )
     manifest_path = output / BUILD_MANIFEST_PATH
     manifest_path.write_bytes(base.pretty_json(manifest))
-    generated_authority = []
-    for relative_text in policy["spirv_val"]["generated_authority_files"]:
-        relative = require_safe_relative(relative_text, "generated spirv-val authority path")
-        path = output.joinpath(*relative.parts)
-        base.require(path.is_file() and not path.is_symlink(), f"generated spirv-val authority is missing: {relative}")
-        generated_authority.append({"path": relative.as_posix(), "sha256": base.digest_file(path)})
+    generated_authority = record_generated_authority(output, policy)
     with staged_spirv_val(closure, output) as (validator, _):
         validator_record = base.tool_record(
             validator,
@@ -595,20 +650,7 @@ def validate_spirv_val_build(build_dir: Path, source: Path) -> tuple[dict, Spirv
     base.require(manifest_record["source_set_sha256"] == manifest["source_set_sha256"], "spirv-val source-set mismatch")
     base.require(manifest_record["translation_units"] == len(manifest["translation_units"]), "spirv-val translation-unit count mismatch")
     base.require(manifest_record["counts_by_component"] == manifest["counts_by_component"], "spirv-val component counts mismatch")
-    generated_rows = receipt["generated_authority"]
-    base.require(isinstance(generated_rows, list), "generated spirv-val authority is not a list")
-    base.require(
-        [row.get("path") for row in generated_rows] == policy["spirv_val"]["generated_authority_files"],
-        "generated spirv-val authority denominator changed",
-    )
-    for index, row in enumerate(generated_rows):
-        base.require_keys(row, {"path", "sha256"}, f"generated spirv-val authority {index}")
-        relative = require_safe_relative(row["path"], f"generated spirv-val authority {index} path")
-        base.require(
-            base.digest_file(build_dir.joinpath(*relative.parts))
-            == require_sha(row["sha256"], f"generated spirv-val authority {index}"),
-            f"generated spirv-val authority changed: {relative}",
-        )
+    validate_generated_authority(receipt["generated_authority"], build_dir, policy)
     closure = qualify_spirv_val_closure(build_dir, source, policy)
     base.require(receipt["validator_closure"] == closure.receipt_record, "spirv-val runtime closure changed")
     base.require(receipt["validator_sha256"] == closure.binary.receipt_record["target_sha256"], "spirv-val binary identity changed")
@@ -679,7 +721,11 @@ def grammar_tables(grammar_bytes: bytes) -> dict:
     return {"opcodes": opcodes, "enums": enums}
 
 
-def inventory_spirv(artifact_bytes: bytes, grammar_bytes: bytes) -> dict:
+def inventory_spirv(artifact_bytes: bytes, grammar_bytes: bytes, maximum_rows: int | None = None) -> dict:
+    base.require(
+        maximum_rows is None or isinstance(maximum_rows, int) and not isinstance(maximum_rows, bool) and maximum_rows > 0,
+        "SPIR-V inventory row limit is invalid",
+    )
     base.require(len(artifact_bytes) >= 20 and len(artifact_bytes) % 4 == 0, "SPIR-V module has an invalid byte extent")
     words = list(struct.unpack(f"<{len(artifact_bytes) // 4}I", artifact_bytes))
     base.require(words[0] == 0x07230203, "SPIR-V magic mismatch")
@@ -691,6 +737,14 @@ def inventory_spirv(artifact_bytes: bytes, grammar_bytes: bytes) -> dict:
     capabilities = []
     extensions = []
     non_uniform = []
+
+    def enforce_row_budget() -> None:
+        if maximum_rows is not None:
+            base.require(
+                len(capabilities) + len(extensions) + len(non_uniform) <= maximum_rows,
+                "SPIR-V semantic inventory exceeds the smoke row budget",
+            )
+
     offset = 5
     while offset < len(words):
         first = words[offset]
@@ -706,9 +760,11 @@ def inventory_spirv(artifact_bytes: bytes, grammar_bytes: bytes) -> dict:
             name = tables["enums"]["Capability"].get(value)
             base.require(name is not None, f"unknown SPIR-V capability {value} at word {offset}")
             capabilities.append({"name": name, "value": value, "word_offset": offset})
+            enforce_row_budget()
         elif opcode == opcodes["OpExtension"]:
             base.require(word_count >= 2, f"malformed OpExtension at word {offset}")
             extensions.append({"name": decode_literal_string(operands, f"OpExtension at word {offset}"), "word_offset": offset})
+            enforce_row_budget()
         elif opcode == opcodes["OpDecorate"]:
             base.require(word_count >= 3, f"malformed OpDecorate at word {offset}")
             base.require(0 < operands[0] < bound, f"OpDecorate target id is outside the module bound at word {offset}")
@@ -717,6 +773,7 @@ def inventory_spirv(artifact_bytes: bytes, grammar_bytes: bytes) -> dict:
             if decoration == "NonUniform":
                 base.require(word_count == 3, f"NonUniform decoration has operands at word {offset}")
                 non_uniform.append({"target_id": operands[0], "word_offset": offset})
+                enforce_row_budget()
         elif opcode == opcodes["OpMemberDecorate"]:
             base.require(word_count >= 4, f"malformed OpMemberDecorate at word {offset}")
             base.require(0 < operands[0] < bound, f"OpMemberDecorate target id is outside the module bound at word {offset}")
@@ -763,6 +820,154 @@ def run_spirv_val(validator: Path, artifact: Path, expected: dict, output: Path,
         "stdout_sha256": base.digest_bytes(result.stdout),
         "stderr_sha256": base.digest_bytes(result.stderr),
     }
+
+
+@dataclass(frozen=True)
+class QualifiedExternalSpirv:
+    artifact_bytes: bytes
+    directory: Path
+    directory_identity: tuple[int, int, int, int, int, int, int]
+    parent_identities: tuple[tuple[Path, tuple[int, int, int, int, int, int, int]], ...]
+
+
+def read_external_spirv(path_text: object) -> QualifiedExternalSpirv:
+    base.require(isinstance(path_text, str) and path_text, "SPIR-V smoke artifact path is empty")
+    path = Path(path_text)
+    base.require(path.is_absolute() and ".." not in path.parts, "SPIR-V smoke artifact path must be absolute without traversal")
+    resolved = path.resolve(strict=True)
+    base.require(ROOT != resolved and ROOT not in resolved.parents, "SPIR-V smoke artifact must stay outside fn64")
+    parents = base.contained_parent_identities(Path(path.anchor), path, "SPIR-V smoke artifact")
+    artifact_bytes, artifact_info = base.stable_regular_bytes(
+        path,
+        base.load_policy()["spirv"]["maximum_artifact_bytes"],
+        "SPIR-V smoke artifact",
+    )
+    base.require(artifact_info.st_nlink == 1, "SPIR-V smoke artifact has another hardlink")
+    base.verify_parent_identities(parents, "SPIR-V smoke artifact")
+    base.require(path.resolve(strict=True) == resolved, "SPIR-V smoke artifact target changed while it was qualified")
+    base.require(parents[-1][0] == path.parent, "SPIR-V smoke artifact directory was not qualified")
+    return QualifiedExternalSpirv(
+        artifact_bytes,
+        resolved.parent,
+        parents[-1][1],
+        tuple(parents),
+    )
+
+
+def verify_identity_rows(
+    rows: tuple[tuple[Path, tuple[int, int, int, int, int, int, int]], ...],
+    label: str,
+) -> None:
+    try:
+        for path, expected in rows:
+            info = path.lstat()
+            base.require(
+                stat.S_ISDIR(info.st_mode)
+                and not path.is_symlink()
+                and (info.st_dev, info.st_ino) == expected[:2],
+                f"{label} parent directory identity changed while it was qualified",
+            )
+    except OSError as error:
+        raise base.ArtifactError(f"{label} parent path disappeared while it was qualified: {error}") from error
+
+
+def qualify_smoke_staging_root(private_root: Path, artifact: QualifiedExternalSpirv) -> tuple:
+    staging_rows = tuple(
+        base.contained_parent_identities(
+            Path(private_root.anchor),
+            private_root / ".fn64-stage-boundary",
+            "SPIR-V smoke staging",
+        )
+    )
+    artifact_object = artifact.directory_identity[:2]
+    base.require(
+        all(identity[:2] != artifact_object for _, identity in staging_rows),
+        "SPIR-V smoke staging contains the qualified artifact directory identity",
+    )
+    verify_identity_rows(artifact.parent_identities, "SPIR-V smoke artifact")
+    verify_identity_rows(staging_rows, "SPIR-V smoke staging")
+    return staging_rows
+
+
+def smoke_spirv_val(args: argparse.Namespace) -> dict:
+    policy = load_policy()
+    source = Path(args.dxc_dir).resolve()
+    build_dir = Path(args.build_dir).resolve()
+    build_receipt, closure = validate_spirv_val_build(build_dir, source)
+    artifact = read_external_spirv(args.artifact)
+    with tempfile.TemporaryDirectory(prefix="fn64-spirv-val-smoke-") as temporary:
+        private_root = Path(temporary).resolve(strict=True)
+        base.require(
+            private_root != ROOT and ROOT not in private_root.parents,
+            "SPIR-V smoke staging overlaps fn64",
+        )
+        base.require(
+            private_root != artifact.directory
+            and artifact.directory not in private_root.parents
+            and private_root not in artifact.directory.parents,
+            "SPIR-V smoke staging overlaps the artifact directory tree",
+        )
+        qualify_smoke_staging_root(private_root, artifact)
+        private_root.chmod(0o700)
+        staging_rows = qualify_smoke_staging_root(private_root, artifact)
+        base.require(stat.S_IMODE(private_root.stat().st_mode) == 0o700, "SPIR-V smoke staging root is not private")
+        verify_identity_rows(artifact.parent_identities, "SPIR-V smoke artifact")
+        verify_identity_rows(staging_rows, "SPIR-V smoke staging")
+        input_snapshot = private_root / "input.spv"
+        base.write_new_private_file(input_snapshot, artifact.artifact_bytes)
+        with staged_spirv_val(closure, private_root) as (validator, grammar_path):
+            grammar_bytes = base.stable_file_bytes(
+                grammar_path,
+                base.load_policy()["git_checkout_maximum_file_bytes"],
+                "staged SPIR-V smoke grammar",
+            )
+            base.require(base.digest_bytes(grammar_bytes) == closure.grammar_sha256, "staged SPIR-V smoke grammar changed")
+            validation = run_spirv_val(validator, input_snapshot, {"id": "explicit-witness"}, private_root, policy)
+            base.require(
+                validation["input_sha256"] == base.digest_bytes(artifact.artifact_bytes)
+                and validation["input_bytes"] == len(artifact.artifact_bytes),
+                "SPIR-V smoke validation input changed",
+            )
+            inventory = inventory_spirv(
+                artifact.artifact_bytes,
+                grammar_bytes,
+                maximum_rows=policy["spirv_val"]["maximum_smoke_inventory_rows"],
+            )
+    shader_non_uniform = sum(row["name"] == "ShaderNonUniform" for row in inventory["capabilities"])
+    non_uniform = len(inventory["non_uniform_decorations"])
+    required = bool(args.require_shader_nonuniform)
+    satisfied = shader_non_uniform > 0 and non_uniform > 0
+    if required:
+        base.require(shader_non_uniform > 0, "SPIR-V smoke artifact lacks ShaderNonUniform capability")
+        base.require(non_uniform > 0, "SPIR-V smoke artifact lacks a NonUniform decoration")
+    result = base.add_receipt_hash(
+        {
+            "schema": policy["spirv_val_smoke_receipt_schema"],
+            "status": "passed",
+            "orchestration_producer_sha256": base.digest_file(TOOL_PATH),
+            "reference_policy_sha256": base.digest_file(POLICY_PATH),
+            "spirv_val_build_receipt_sha256": build_receipt["receipt_sha256"],
+            "validator_sha256": build_receipt["validator_sha256"],
+            "grammar_sha256": closure.grammar_sha256,
+            "artifact_sha256": base.digest_bytes(artifact.artifact_bytes),
+            "artifact_bytes": len(artifact.artifact_bytes),
+            "validation": validation,
+            "semantic_inventory": inventory,
+            "shader_nonuniform_witness": {
+                "required": required,
+                "capability_count": shader_non_uniform,
+                "decoration_count": non_uniform,
+                "satisfied": satisfied,
+            },
+            "claim_boundary": policy["spirv_val_smoke_claim_boundary"],
+        }
+    )
+    base.require(not base.LOCAL_PATH_RE.search(json.dumps(result)), "SPIR-V smoke result leaked a machine-local path")
+    base.require(
+        len(base.pretty_json(result)) <= policy["maximum_receipt_bytes"],
+        "SPIR-V smoke receipt exceeds the maximum canonical receipt size",
+    )
+    return result
 
 
 def produce(args: argparse.Namespace) -> dict:
@@ -1116,6 +1321,11 @@ def parser() -> argparse.ArgumentParser:
     verify_build = sub.add_parser("verify-spirv-val-build")
     verify_build.add_argument("--dxc-dir", required=True)
     verify_build.add_argument("--build-dir", required=True)
+    smoke = sub.add_parser("smoke-spirv-val")
+    smoke.add_argument("--dxc-dir", required=True)
+    smoke.add_argument("--build-dir", required=True)
+    smoke.add_argument("--artifact", required=True)
+    smoke.add_argument("--require-shader-nonuniform", action="store_true")
     produce_parser = sub.add_parser("produce")
     produce_parser.add_argument("--port-dir", required=True)
     produce_parser.add_argument("--oracle-dir")
@@ -1150,6 +1360,8 @@ def main() -> int:
         elif args.command == "verify-spirv-val-build":
             receipt, _ = validate_spirv_val_build(Path(args.build_dir).resolve(), Path(args.dxc_dir).resolve())
             print(f"spirv-val source build verified: {receipt['receipt_sha256']}")
+        elif args.command == "smoke-spirv-val":
+            print(base.pretty_json(smoke_spirv_val(args)).decode(), end="")
         elif args.command == "produce":
             receipt = produce(args)
             print(f"RT64 reference shader receipt: {receipt['receipt_sha256']}")

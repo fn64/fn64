@@ -116,12 +116,68 @@ class PolicyTests(unittest.TestCase):
         ):
             self.assertIn(flag, flags)
 
+    def test_generated_authority_policy_paths_are_exact_and_hostile_to_drift(self) -> None:
+        expected = [f"build/{name}" for name in reference.GENERATED_AUTHORITY_NAMES]
+        self.assertEqual(
+            [path.as_posix() for path in reference.generated_authority_paths(reference.load_policy())],
+            expected,
+        )
+        original_load_json = base.load_json
+        original = original_load_json(reference.POLICY_PATH)
+        mutations = []
+        added = copy.deepcopy(original)
+        added["spirv_val"]["generated_authority_files"].append("build/extra.inc")
+        mutations.append(("add", added))
+        dropped = copy.deepcopy(original)
+        dropped["spirv_val"]["generated_authority_files"].pop()
+        mutations.append(("drop", dropped))
+        reordered = copy.deepcopy(original)
+        reordered["spirv_val"]["generated_authority_files"][0:2] = reversed(
+            reordered["spirv_val"]["generated_authority_files"][0:2]
+        )
+        mutations.append(("reorder", reordered))
+        renamed = copy.deepcopy(original)
+        renamed["spirv_val"]["generated_authority_files"][0] = "build/renamed.inc"
+        mutations.append(("rename", renamed))
+        old_layout = copy.deepcopy(original)
+        old_layout["spirv_val"]["generated_authority_files"] = [
+            value.replace("build/", "build/source/", 1) for value in expected
+        ]
+        mutations.append(("old-layout", old_layout))
+        for label, mutation in mutations:
+            with self.subTest(label=label), mock.patch.object(
+                base,
+                "load_json",
+                side_effect=lambda path, value=mutation: value
+                if path == reference.POLICY_PATH
+                else original_load_json(path),
+            ), self.assertRaisesRegex(base.ArtifactError, "authority policy denominator changed"):
+                reference.load_policy()
+
     def test_claim_boundary_never_mentions_runtime_or_parity_success(self) -> None:
-        self.assertEqual(reference.load_policy()["claim_boundary"], "reference-valid-only-not-wgpu-runtime-or-parity")
+        policy = reference.load_policy()
+        self.assertEqual(policy["claim_boundary"], "reference-valid-only-not-wgpu-runtime-or-parity")
+        self.assertEqual(
+            policy["spirv_val_smoke_claim_boundary"],
+            "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
+        )
 
     def test_parser_exposes_additive_commands_only(self) -> None:
         parser = reference.parser()
         self.assertEqual(parser.parse_args(["selftest"]).command, "selftest")
+        smoke = parser.parse_args(
+            [
+                "smoke-spirv-val",
+                "--dxc-dir",
+                "/d",
+                "--build-dir",
+                "/b",
+                "--artifact",
+                "/a.spv",
+                "--require-shader-nonuniform",
+            ]
+        )
+        self.assertTrue(smoke.require_shader_nonuniform)
         args = parser.parse_args(
             [
                 "verify",
@@ -353,12 +409,328 @@ class SpirvValInvocationTests(unittest.TestCase):
                 reference.run_spirv_val(validator, artifact, expected, artifact.parent, policy)
 
 
+class SpirvValSmokeTests(unittest.TestCase):
+    def invoke(self, artifact: Path, require: bool = True, observed: dict | None = None) -> dict:
+        policy = reference.load_policy()
+        grammar = grammar_bytes()
+        closure = mock.Mock(grammar_sha256=base.digest_bytes(grammar))
+        build_receipt = {
+            "receipt_sha256": "1" * 64,
+            "validator_sha256": "2" * 64,
+        }
+        state = observed if observed is not None else {}
+
+        @contextmanager
+        def fake_staged(_closure: object, parent: Path):
+            state["staged"] = True
+            state["parent"] = parent
+            state["mode"] = stat.S_IMODE(parent.stat().st_mode)
+            validator = parent / "spirv-val"
+            validator.write_text("#!/usr/bin/python3\nimport sys\nsys.stdin.buffer.read()\n")
+            validator.chmod(0o700)
+            grammar_path = parent / "grammar.json"
+            grammar_path.write_bytes(grammar)
+            yield validator, grammar_path
+
+        args = argparse.Namespace(
+            dxc_dir=str(artifact.parent / "dxc"),
+            build_dir=str(artifact.parent / "build"),
+            artifact=str(artifact),
+            require_shader_nonuniform=require,
+        )
+        with (
+            mock.patch.object(reference, "validate_spirv_val_build", return_value=(build_receipt, closure)) as verified,
+            mock.patch.object(reference, "staged_spirv_val", fake_staged),
+        ):
+            result = reference.smoke_spirv_val(args)
+        verified.assert_called_once()
+        return result
+
+    def test_smoke_verifies_build_validates_stdin_inventories_and_emits_no_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary).resolve() / "witness.spv"
+            artifact.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            observed = {}
+            result = self.invoke(artifact, observed=observed)
+            base.validate_receipt_hash(result)
+            self.assertEqual(
+                set(result),
+                {
+                    "schema",
+                    "status",
+                    "orchestration_producer_sha256",
+                    "reference_policy_sha256",
+                    "spirv_val_build_receipt_sha256",
+                    "validator_sha256",
+                    "grammar_sha256",
+                    "artifact_sha256",
+                    "artifact_bytes",
+                    "validation",
+                    "semantic_inventory",
+                    "shader_nonuniform_witness",
+                    "claim_boundary",
+                    "receipt_sha256",
+                },
+            )
+            self.assertEqual(
+                set(result["shader_nonuniform_witness"]),
+                {"required", "capability_count", "decoration_count", "satisfied"},
+            )
+            self.assertEqual(result["artifact_sha256"], base.digest_file(artifact))
+            self.assertEqual(result["validation"]["input_sha256"], result["artifact_sha256"])
+            self.assertEqual(result["shader_nonuniform_witness"]["capability_count"], 1)
+            self.assertEqual(result["shader_nonuniform_witness"]["decoration_count"], 1)
+            self.assertEqual(observed["mode"], 0o700)
+            self.assertNotIn(str(artifact), json.dumps(result))
+            self.assertIsNone(base.LOCAL_PATH_RE.search(json.dumps(result)))
+
+    def test_smoke_rejects_symlink_and_hardlink_before_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target = root / "target.spv"
+            target.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            symlink = root / "symlink.spv"
+            symlink.symlink_to(target)
+            observed = {}
+            with self.assertRaisesRegex(base.ArtifactError, "not a regular file"):
+                self.invoke(symlink, observed=observed)
+            self.assertNotIn("staged", observed)
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            parent_target = real_parent / "parent-target.spv"
+            parent_target.write_bytes(target.read_bytes())
+            parent_link = root / "parent-link"
+            parent_link.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(base.ArtifactError, "symlinked parent"):
+                self.invoke(parent_link / parent_target.name, observed=observed)
+            self.assertNotIn("staged", observed)
+            hardlink = root / "hardlink.spv"
+            os.link(target, hardlink)
+            with self.assertRaisesRegex(base.ArtifactError, "another hardlink"):
+                self.invoke(target, observed=observed)
+            self.assertNotIn("staged", observed)
+
+    def test_smoke_rejects_artifact_inside_fn64_before_staging(self) -> None:
+        policy = reference.load_policy()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            artifact = root / "inside.spv"
+            artifact.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            args = argparse.Namespace(
+                dxc_dir=str(root / "dxc"),
+                build_dir=str(root / "build"),
+                artifact=str(artifact),
+                require_shader_nonuniform=True,
+            )
+            with (
+                mock.patch.object(reference, "ROOT", root),
+                mock.patch.object(reference, "load_policy", return_value=policy),
+                mock.patch.object(reference, "validate_spirv_val_build", return_value=({}, object())),
+                mock.patch.object(reference, "staged_spirv_val") as staged,
+                self.assertRaisesRegex(base.ArtifactError, "must stay outside fn64"),
+            ):
+                reference.smoke_spirv_val(args)
+            staged.assert_not_called()
+
+    def test_required_shader_nonuniform_witness_rejects_missing_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary).resolve() / "witness.spv"
+            cases = (
+                (module(instruction(17, 1), instruction(71, 7, 5300)), "lacks ShaderNonUniform"),
+                (module(instruction(17, 5301)), "lacks a NonUniform decoration"),
+            )
+            for payload, diagnostic in cases:
+                artifact.write_bytes(payload)
+                with self.subTest(diagnostic=diagnostic), self.assertRaisesRegex(base.ArtifactError, diagnostic):
+                    self.invoke(artifact)
+
+    def test_optional_shader_nonuniform_witness_reports_unsatisfied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary).resolve() / "ordinary.spv"
+            artifact.write_bytes(module(instruction(17, 1)))
+            result = self.invoke(artifact, require=False)
+            self.assertEqual(
+                result["claim_boundary"],
+                "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
+            )
+            self.assertFalse(result["shader_nonuniform_witness"]["required"])
+            self.assertFalse(result["shader_nonuniform_witness"]["satisfied"])
+
+    def test_build_receipt_failure_prevents_artifact_access_and_staging(self) -> None:
+        args = argparse.Namespace(
+            dxc_dir="/does-not-matter",
+            build_dir="/does-not-matter",
+            artifact="relative.spv",
+            require_shader_nonuniform=True,
+        )
+        with (
+            mock.patch.object(reference, "validate_spirv_val_build", side_effect=base.ArtifactError("receipt rejected")),
+            mock.patch.object(reference, "read_external_spirv") as read_artifact,
+            mock.patch.object(reference, "staged_spirv_val") as staged,
+            self.assertRaisesRegex(base.ArtifactError, "receipt rejected"),
+        ):
+            reference.smoke_spirv_val(args)
+        read_artifact.assert_not_called()
+        staged.assert_not_called()
+
+    def test_smoke_rejects_symlinked_temp_parent_inside_fn64_before_staging(self) -> None:
+        policy = reference.load_policy()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            artifact = root / "witness.spv"
+            artifact.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            fake_repo = root / "repo"
+            fake_repo.mkdir()
+            temp_link = root / "temp-link"
+            temp_link.symlink_to(fake_repo, target_is_directory=True)
+            closure = mock.Mock(grammar_sha256=base.digest_bytes(grammar_bytes()))
+            build_receipt = {"receipt_sha256": "1" * 64, "validator_sha256": "2" * 64}
+            args = argparse.Namespace(
+                dxc_dir=str(root / "dxc"),
+                build_dir=str(root / "build"),
+                artifact=str(artifact),
+                require_shader_nonuniform=True,
+            )
+            temporary_directory = tempfile.TemporaryDirectory
+
+            def inside_repo(**kwargs: object):
+                return temporary_directory(dir=temp_link, **kwargs)
+
+            with (
+                mock.patch.object(reference, "ROOT", fake_repo),
+                mock.patch.object(reference, "load_policy", return_value=policy),
+                mock.patch.object(reference, "validate_spirv_val_build", return_value=(build_receipt, closure)),
+                mock.patch.object(reference.tempfile, "TemporaryDirectory", side_effect=inside_repo),
+                mock.patch.object(reference, "staged_spirv_val") as staged,
+                self.assertRaisesRegex(base.ArtifactError, "staging overlaps fn64"),
+            ):
+                reference.smoke_spirv_val(args)
+            staged.assert_not_called()
+            self.assertEqual(list(fake_repo.iterdir()), [])
+
+    def test_smoke_rejects_direct_and_symlinked_temp_parent_inside_artifact_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            artifact_directory = root / "artifacts"
+            artifact_directory.mkdir()
+            artifact = artifact_directory / "witness.spv"
+            artifact.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            temp_link = root / "temp-link"
+            temp_link.symlink_to(artifact_directory, target_is_directory=True)
+            temporary_directory = tempfile.TemporaryDirectory
+            for label, temp_parent in (("direct", artifact_directory), ("symlink", temp_link)):
+                observed = {}
+
+                def inside_artifacts(parent: Path = temp_parent, **kwargs: object):
+                    return temporary_directory(dir=parent, **kwargs)
+
+                with self.subTest(label=label), mock.patch.object(
+                    reference.tempfile,
+                    "TemporaryDirectory",
+                    side_effect=inside_artifacts,
+                ), self.assertRaisesRegex(base.ArtifactError, "staging overlaps the artifact directory tree"):
+                    self.invoke(artifact, observed=observed)
+                self.assertNotIn("staged", observed)
+            self.assertEqual(list(artifact_directory.iterdir()), [artifact])
+
+    def test_smoke_rejects_renamed_artifact_directory_inode_via_symlinked_temp_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            artifact_directory = root / "artifacts"
+            artifact_directory.mkdir()
+            artifact = artifact_directory / "witness.spv"
+            artifact.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            moved_directory = root / "moved-artifacts"
+            temp_link = root / "temp-link"
+            temporary_directory = tempfile.TemporaryDirectory
+            observed = {}
+
+            def rename_then_redirect(**kwargs: object):
+                artifact_directory.rename(moved_directory)
+                temp_link.symlink_to(moved_directory, target_is_directory=True)
+                return temporary_directory(dir=temp_link, **kwargs)
+
+            with mock.patch.object(
+                reference.tempfile,
+                "TemporaryDirectory",
+                side_effect=rename_then_redirect,
+            ), self.assertRaisesRegex(base.ArtifactError, "qualified artifact directory identity"):
+                self.invoke(artifact, observed=observed)
+            self.assertNotIn("staged", observed)
+            self.assertTrue((moved_directory / artifact.name).is_file())
+            self.assertEqual(
+                [path.name for path in moved_directory.iterdir()],
+                [artifact.name],
+            )
+
+    def test_smoke_rejects_semantic_inventory_amplification_before_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary).resolve() / "amplified.spv"
+            words = [0x07230203, 0x00010000, 0, 100, 0]
+            words.extend(instruction(17, 5301) * 100_000)
+            words.extend(instruction(71, 7, 5300) * 100_000)
+            artifact.write_bytes(struct.pack(f"<{len(words)}I", *words))
+            self.assertEqual(artifact.stat().st_size, 2_000_020)
+            with self.assertRaisesRegex(base.ArtifactError, "inventory exceeds the smoke row budget"):
+                self.invoke(artifact)
+
+    def test_smoke_rejects_canonical_receipt_over_policy_limit(self) -> None:
+        policy = reference.load_policy()
+        policy["maximum_receipt_bytes"] = 512
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary).resolve() / "witness.spv"
+            artifact.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            with mock.patch.object(reference, "load_policy", return_value=policy), self.assertRaisesRegex(
+                base.ArtifactError,
+                "receipt exceeds the maximum canonical receipt size",
+            ):
+                self.invoke(artifact)
+
+    def test_external_spirv_requires_absolute_path_without_traversal(self) -> None:
+        for path in ("relative.spv", "/private/tmp/../tmp/witness.spv"):
+            with self.subTest(path=path), self.assertRaisesRegex(base.ArtifactError, "absolute without traversal"):
+                reference.read_external_spirv(path)
+
+
 class ReceiptPrimitiveTests(unittest.TestCase):
     def test_receipt_hash_mutation_is_rejected(self) -> None:
         receipt = base.add_receipt_hash({"schema": "x", "claim_boundary": reference.load_policy()["claim_boundary"]})
         receipt["claim_boundary"] = "wgpu-valid"
         with self.assertRaisesRegex(base.ArtifactError, "identity mismatch"):
             base.validate_receipt_hash(receipt)
+
+    def test_generated_authority_receipt_rejects_path_and_digest_mutation(self) -> None:
+        policy = reference.load_policy()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, relative in enumerate(reference.generated_authority_paths(policy)):
+                path = root.joinpath(*relative.parts)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"authority-{index}".encode())
+            record = reference.record_generated_authority(root, policy)
+            reference.validate_generated_authority(record, root, policy)
+            mutations = []
+            added = copy.deepcopy(record)
+            added.append(copy.deepcopy(record[0]))
+            mutations.append(("add", added))
+            mutations.append(("drop", copy.deepcopy(record[:-1])))
+            reordered = copy.deepcopy(record)
+            reordered[0], reordered[1] = reordered[1], reordered[0]
+            mutations.append(("reorder", reordered))
+            renamed = copy.deepcopy(record)
+            renamed[0]["path"] = "build/renamed.inc"
+            mutations.append(("rename", renamed))
+            old_layout = copy.deepcopy(record)
+            for row in old_layout:
+                row["path"] = row["path"].replace("build/", "build/source/", 1)
+            mutations.append(("old-layout", old_layout))
+            for label, mutation in mutations:
+                with self.subTest(label=label), self.assertRaisesRegex(base.ArtifactError, "denominator changed"):
+                    reference.validate_generated_authority(mutation, root, policy)
+            changed_digest = copy.deepcopy(record)
+            changed_digest[0]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(base.ArtifactError, "authority changed"):
+                reference.validate_generated_authority(changed_digest, root, policy)
 
     def test_safe_relative_rejects_escape_absolute_and_normalization(self) -> None:
         for value in ("../x", "/x", "a/../x", "a//x"):

@@ -52,6 +52,14 @@ Darwin loader denominator. Darwin admits only `/usr/lib/libc++.1.dylib` and
 library, duplicate load, or changed load descriptor fails closed. Linux and
 Windows require separately reviewed loader policies.
 
+The six generated authorities have an exact ordered path denominator:
+`build/core_tables_body.inc`, `build/core_tables_header.inc`,
+`build/DebugInfo.h`, `build/OpenCLDebugInfo100.h`, `build/generators.inc`, and
+`build/build-version.inc`. These paths come from SPIRV-Tools' explicit
+`${spirv-tools_BINARY_DIR}` CMake outputs under the directly configured build
+root; the mechanism neither searches by basename nor infers paths from the
+generator.
+
 The controlled build environment has an exact ordered denominator: `PATH`,
 `LC_ALL`, `LANG`, `CC`, `CXX`, `GIT_CONFIG_GLOBAL`,
 `GIT_CONFIG_NOSYSTEM`, `GIT_NO_REPLACE_OBJECTS`, `GIT_OPTIONAL_LOCKS`,
@@ -117,6 +125,12 @@ python3 tools/rt64_reference_shader_artifacts.py verify-spirv-val-build \
   --dxc-dir /absolute/path/to/DirectXShaderCompiler \
   --build-dir /outside/repo/spirv-val-build
 
+python3 tools/rt64_reference_shader_artifacts.py smoke-spirv-val \
+  --dxc-dir /absolute/path/to/DirectXShaderCompiler \
+  --build-dir /outside/repo/spirv-val-build \
+  --artifact /outside/repo/one-retained-witness.spv \
+  --require-shader-nonuniform
+
 python3 tools/rt64_reference_shader_artifacts.py produce \
   --port-dir /absolute/path/to/rt64-port \
   --oracle-dir /absolute/path/to/rt64-oracle \
@@ -139,11 +153,29 @@ The first executable gate after mechanism review is one retained
 before paying for all 56 rows. This is the continuous-improvement loop learned
 from the earlier depfile and Naga failures: prove external tool semantics with
 one representative artifact, record the finding, then expand the denominator.
+`smoke-spirv-val` first verifies the complete validator build receipt, then
+descriptor-stably reads one explicit outside-repository regular file with one
+link, qualifies its canonical parent tree, privately stages the validator and
+grammar outside both fn64 and that artifact tree, validates the exact bytes
+through stdin, and emits a path-free receipt containing the semantic
+inventory. Containment is bound to parent-chain device/inode identities as
+well as canonical paths, so renaming the qualified directory and redirecting
+the temporary root to that same directory object fails closed before staging.
+The smoke inventory is bounded at 65,536 semantic rows before JSON
+amplification, and the final canonical pretty-JSON receipt must fit the policy's
+8 MiB receipt limit. `--require-shader-nonuniform` additionally requires both the
+`ShaderNonUniform` capability and at least one direct `NonUniform` decoration.
+Because the input is an arbitrary explicit outside-repository file, this
+smoke receipt proves neither its DXC provenance nor corpus membership. Its
+claim is limited to one qualified-validator reference-valid result and
+inventory; it makes no corpus, wgpu, runtime, or parity claim.
 
 ## M2.5 status handoff
 
-- **M2.5a — reference-valid corpus:** mechanism implemented in this additive
-  branch; focused hostiles and independent mechanism review are next. No
+- **M2.5a — reference-valid corpus:** the additive mechanism is integrated.
+  Its first source-build diagnostic correctly failed closed on a generated
+  authority path-contract error and produced no receipt; the exact path and
+  single-artifact smoke repairs require review before a fresh build. No
   spirv-val source-build or corpus qualification claim exists yet.
 - **M2.5b — wgpu-ingestible owned shaders:** separately port the required
   shaders to checked WGSL/Naga IR with exact feature/limit gates. M2.5a cannot
