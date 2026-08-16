@@ -43,6 +43,13 @@
 //! quadricated TLUT subset; partial/unequal sample-lane behavior remains a
 //! hardware-measurement frontier. It adds no coordinate normalization,
 //! sampling, filtering, LOD, cache, WGSL/GPU, or production path.
+//! M4.3.3d composes that reader with an integer-only CPU point-addressing
+//! layer. It accepts already-quantized signed S10.5 coordinates, applies the
+//! public tile shift and S10.2 origin, then clamp-before-mirror/mask addressing.
+//! First-row parity remains explicit caller input. Float/perspective
+//! quantization, copy addressing, filter selection and lanes, unequal TLUT
+//! banks, cache, GPU, raster integration, parity, and performance remain out
+//! of scope.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -257,21 +264,23 @@ pub use targets::{
     UninitializedNativeRaster,
 };
 pub use tmem::{
-    decode_direct_texel, decode_tlut_entry, execute_ordered_tmem_loads, prepare_load_block,
-    prepare_load_tile, prepare_load_tlut, read_committed_texel, resolve_indexed_texel,
-    unpack_ci4_texel, AddressedTmemTexel, Ci4Palette, Ci4PaletteError, Ci4UnpackError,
-    CommittedTmemTransaction, DecodedPhysicalTexel, DecodedTexel, DefinedPhysicalTmemWordBytes,
-    DirectTexelDecodeError, ExecutedLoadBlock, ExecutedLoadTile, ExecutedLoadTlut,
-    GpuBoundTmemTransaction, IndexedTexelResolveError, LoadBlockExecutionError,
-    LoadTileExecutionError, LoadTlutExecutionError, PendingTmemTransaction, PhysicalTexelReadError,
-    PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,
-    PhysicalTmemPublicationAuthority, PhysicalTmemSnapshotIdentity, PhysicalTmemState,
-    PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, PreparedLoadBlock,
-    PreparedLoadTile, PreparedLoadTlut, RawTexel, RawTexelError, ResolvedIndexedTexel,
-    StagedTmemTransaction, TexelColumnParity, TextureImage, TileAddressMode, TileCoordinate,
-    TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TlutEntryDecodeError,
-    TlutLookup, TmemDxt, TmemFirstRowParity, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan,
-    TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan,
-    TmemPacketExecutionError, TmemState, TmemTransferLayout, TmemTransferPhysicalWord,
-    TmemTransferPlan, TmemTransferWord, TmemWordAddress,
+    address_point_texel, decode_direct_texel, decode_tlut_entry, execute_ordered_tmem_loads,
+    prepare_load_block, prepare_load_tile, prepare_load_tlut, read_committed_texel,
+    resolve_indexed_texel, sample_committed_point, unpack_ci4_texel, AddressedTmemTexel,
+    Ci4Palette, Ci4PaletteError, Ci4UnpackError, CommittedTmemTransaction, DecodedPhysicalTexel,
+    DecodedTexel, DefinedPhysicalTmemWordBytes, DirectTexelDecodeError, ExecutedLoadBlock,
+    ExecutedLoadTile, ExecutedLoadTlut, GpuBoundTmemTransaction, IndexedTexelResolveError,
+    LoadBlockExecutionError, LoadTileExecutionError, LoadTlutExecutionError,
+    PendingTmemTransaction, PhysicalTexelReadError, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemSnapshotIdentity,
+    PhysicalTmemState, PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity,
+    PointAddressError, PointSampleCoordinates, PointSampleError, PointSampleRequest,
+    PreparedLoadBlock, PreparedLoadTile, PreparedLoadTlut, RawTexel, RawTexelError,
+    ResolvedIndexedTexel, StagedTmemTransaction, TexelColumnParity, TextureAxis,
+    TextureCoordinateS10_5, TextureImage, TileAddressMode, TileCoordinate, TileDescriptor,
+    TileIndex, TileSize, TileState, TlutEntryCount, TlutEntryDecodeError, TlutLookup, TmemDxt,
+    TmemFirstRowParity, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch,
+    TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemPacketExecutionError, TmemState,
+    TmemTransferLayout, TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord,
+    TmemWordAddress,
 };

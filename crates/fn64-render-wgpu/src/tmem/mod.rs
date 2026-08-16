@@ -35,12 +35,16 @@
 //! snapshot, and the conservative canonical all-eight-valid/equal TLUT
 //! subset. Partial/unequal sample-lane behavior remains deferred to hardware
 //! measurement. It performs no coordinate normalization, sampling, filtering,
-//! cache, GPU, or production work. RT64 is not hardware authority for this
-//! module.
+//! cache, GPU, or production work. M4.3.3d's [`sample`] module adds the
+//! integer-only point path from already-quantized signed S10.5 coordinates to
+//! that reader. It preserves explicit caller-owned first-row parity and does
+//! not select filter lanes, relax unequal TLUT banks, or enter a raster/GPU
+//! path. RT64 is not hardware authority for this module.
 
 mod execute;
 mod physical;
 mod read;
+mod sample;
 mod state;
 mod texel;
 mod types;
@@ -61,6 +65,10 @@ pub use physical::{
 pub use read::{
     read_committed_texel, AddressedTmemTexel, DecodedPhysicalTexel, PhysicalTexelReadError,
     PhysicalTmemSnapshotIdentity, TmemFirstRowParity,
+};
+pub use sample::{
+    address_point_texel, sample_committed_point, PointAddressError, PointSampleCoordinates,
+    PointSampleError, PointSampleRequest, TextureAxis, TextureCoordinateS10_5,
 };
 pub use state::{TileState, TmemState};
 pub use texel::{

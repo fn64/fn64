@@ -313,6 +313,27 @@ This is a CPU-only read/decode mechanism over already-published durable state.
 It does not add YUV, CI16/CI32, cache identity/publication, WGSL, GPU upload,
 sampling, production dispatch, visual parity, or performance evidence.
 
+M4.3.3d adds `address_point_texel` and `sample_committed_point` as a typed,
+allocation-free CPU point path over that reader. Its input coordinates are
+already-quantized signed S10.5 values: each axis applies the tile's public
+shift encoding, subtracts the exact S10.2 low endpoint in five-fraction-bit
+integer space, selects the containing texel with Euclidean division, and
+applies clamp before mirror/mask. Mask zero implies clamp. A required reversed
+clamp extent is a typed error; a nonzero-mask axis with clamp clear does not
+consult that unused extent. The sampler then delegates all physical address,
+validity, format, CI, and TLUT behavior to `read_committed_texel`, preserving
+its state/generation snapshot identity and errors.
+
+`PointSampleRequest` still requires explicit `TmemFirstRowParity`. The
+reference lane derives parity from the render tile's ULT while pinned RT64's
+raw-TMEM shader uses the relative row, and neither settles load/render-tile
+aliasing on hardware; this layer therefore derives neither and has no default.
+Partial or unequal TLUT banks remain the reader's named errors. This point-only
+slice does not convert float or perspective coordinates, decode filter state,
+select filtered neighbours or lanes, implement copy-cycle clamp bypass, add
+LOD/YUV/cache/WGSL/GPU work, connect a raster path, or claim visual/silicon
+parity or performance.
+
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
 commands at `0x100..0x128`, color writeback at `0x400..0x410`, transaction

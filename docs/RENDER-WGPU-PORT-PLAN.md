@@ -943,8 +943,8 @@ The accelerated wave keeps dependency-safe work active in parallel:
     after guest commit. Public hardware authority overrides RT64's known
     source-size, starting-row, invalid-command, and host-layout shortcuts.
 19. **M4.3 -- load TLUT and decode committed textures (RUNNING; M4.3.2,
-    M4.3.3a, and M4.3.3b INTEGRATED, `aec0ae1b`/`1f0a3213`/`fcd2b16a`;
-    M4.3.3c THIS CHANGE).**
+    M4.3.3a, M4.3.3b, and M4.3.3c INTEGRATED,
+    `aec0ae1b`/`1f0a3213`/`fcd2b16a`/`94e16f4e`; M4.3.3d THIS CHANGE).**
     Keep load semantics, physical TMEM, packed texture decode, sampling, and
     cache identity separate. `LoadTLUT` writes quadricated 16-bit entries into
     high-half TMEM; the CPU oracle and owned WGSL then cover RGBA16/32,
@@ -982,6 +982,20 @@ The accelerated wave keeps dependency-safe work active in parallel:
     measurement. This slice adds no coordinate normalization,
     sampling/filtering/LOD, YUV, CI16/CI32, cache, WGSL/GPU, production
     dispatch, parity, or performance claim.
+    M4.3.3d adds an allocation-free typed CPU point-addressing layer over that
+    reader. An already-quantized signed S10.5 coordinate is shifted using the
+    tile's four-bit encoding, reduced by the exact S10.2 low endpoint in
+    integer five-fraction-bit space, floored with Euclidean division, and
+    addressed clamp-before-mirror/mask; mask zero implies clamp and a required
+    reversed clamp extent rejects before any physical read. Composition with
+    `read_committed_texel` preserves its exact state/generation identity and
+    typed failures. First-row parity remains explicit caller input: the
+    reference lane's render-ULT derivation and pinned RT64 raw-TMEM shader's
+    relative-row derivation do not settle load/render-tile aliasing on
+    hardware. Partial/unequal TLUT banks remain rejected, and float/perspective
+    coordinate conversion, copy-cycle addressing, filter selection/lane
+    behavior, LOD, YUV, cache, WGSL/GPU, raster integration, production
+    dispatch, parity, and performance remain outside this slice.
 
 ### M0 evidence ledger
 
