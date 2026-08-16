@@ -3,7 +3,7 @@
   "maintained_by": "integration lead; rendered by tools/rt64_port_dashboard.py",
   "program": {
     "goal": "Complete the full RT64-to-Rust port: remove fn64's project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.",
-    "updated_utc": "2026-08-16T07:46:09Z",
+    "updated_utc": "2026-08-16T09:00:00Z",
     "program_state": "IN PROGRESS",
     "branch": "main",
     "base_branch": "origin/main",
@@ -330,7 +330,7 @@
         "docs/RT64-PORT-PARITY.md"
       ],
       "dependencies": ["A0.1"],
-      "state": "BLOCKED",
+      "state": "INTEGRATED",
       "findings": [
         "RT64 is an executable compatibility delegate, not universal correctness authority; known defects use hardware or permitted reference authority.",
         "Ordinary CI must execute every closed row and protect the pending denominator, while port-progress remains nonzero until every required Rust row passes.",
@@ -341,9 +341,9 @@
         "The checker launches ten fresh isolated subprocesses with unpredictable challenges, captures stdout and PID itself, rechecks retained artifacts after every run, and binds the exact runner executable to a pinned build receipt covering source inputs, build inputs, toolchain, and the RT64 source identity when applicable.",
         "The verifier/evaluation protocol is binary-private rather than a public fn64-render-conformance library API. The exact reviewed runner source/build/binary is the cross-process trust root for its internal GuestCommittedTicket lifecycle; JSON hashing alone is explicitly not Rust type provenance.",
         "Guest proof carries only independently checkable workload, backend-effect, guest-effect, and fresh-challenge identities. Unverifiable queue, ordinal, and submission decorations were removed.",
-        "Synthetic test runners are marked test-only, their source receipt is required in the test lane, and production registration rejects them mechanically. The production runner registry remains empty.",
+        "Synthetic test runners are marked test-only, their source receipt is required in the test lane, and production registration rejects them mechanically. A0.4 subsequently registered the first independently reviewed production RT64 runner.",
         "The negative suite rejects expectation echoing, invalid records, missing or altered payloads, arbitrary effects, fake or stale-challenge guest proofs, synthetic production registration, mutated source/build closure, caller-authored private authority, caller-authored process series, and one execution cloned across ten launches.",
-        "No RT64 pass or divergence is accepted: the available raw-DPC attempt exposes fn64 preflight FullSync rather than an RT64-produced observable, and the native RT64 path stops at SDL display initialization without a display."
+        "A0.4 closed the infrastructure frontier with a privacy-clean hidden-Metal runner whose RT64-owned deferred Workload observation passed ten fresh challenged processes. That later ticket promotes exactly one RT64 row; the conformance ladder itself remains backend-neutral."
       ],
       "verification_runs": [
         {
@@ -365,10 +365,10 @@
           "kind": "deterministic"
         }
       ],
-      "blocker": "No qualified headless RT64 delegate currently exposes a backend-produced contract observable: raw-DPC reports only fn64 preflight FullSync, while native RT64 stops at SDL display initialization. A0.3 cannot honestly supply its required RT64 pass/divergence case yet.",
-      "next_action": "Add a separately reviewed, display-independent RT64 runner that exposes a genuinely RT64-produced observable and bind its exact source/build/binary receipt before promoting any RT64 row.",
+      "blocker": null,
+      "next_action": "Reuse the sealed fixture, runner, verifier, and receipt protocol for each subsequent RT64 and Rust delegate row without weakening the all-pending denominator or treating RT64 as universal hardware authority.",
       "started_utc": "2026-08-16T00:00:00Z",
-      "updated_utc": "2026-08-16T00:00:00Z"
+      "updated_utc": "2026-08-16T09:00:00Z"
     },
     {
       "id": "M1.2",
@@ -637,17 +637,20 @@
       "dependencies": [
         "M2.4"
       ],
-      "state": "READY",
+      "state": "RUNNING",
       "findings": [
         "M2.4 qualified the fail-closed mechanism and denominator, not an official DXC compiler build or shader corpus.",
         "The build requires a complete clean checkout of official DXC v1.9.2607 at 0d3ee6b with its exact initialized DirectX-Headers, SPIRV-Headers, and SPIRV-Tools gitlinks; the sparse audit checkout is correctly rejected.",
-        "All 56 SPIR-V rows and both DXC built-in and standalone wgpu validators must close before M3.3 or M4 may claim admission of the full RT64 shader corpus."
+        "All 56 SPIR-V rows and both DXC built-in and standalone wgpu validators must close before M3.3 or M4 may claim admission of the full RT64 shader corpus.",
+        "A complete exact-byte official DXC checkout built successfully, and independently reviewed receipt schema v2 now binds the official dxc symlink, its retained libdxcompiler.dylib implementation, the exact macOS loader denominator, and private descriptor-stable execution.",
+        "The rebuilt official compiler and standalone wgpu validator receipts verified. Corpus production then failed closed on row one because DXC -P emits the preprocessed file but does not emit the requested -MD/-MF dependency file.",
+        "An executable probe confirmed DXC's explicit -M/-MF dependency-only phase emits the active include closure. The producer repair is separating dependency observation, preprocessing, and retained-preprocessed compilation while receipting all three phases; its producer identity change requires rebuilding both receipts before corpus qualification."
       ],
       "verification_runs": [],
       "blocker": null,
-      "next_action": "Provision a complete clean official-DXC checkout and isolated build space, run build-dxc/build-validator/produce/verify, then independently review the complete receipts and 56-row denominator before the 10-process bar.",
+      "next_action": "Independently review and integrate the explicit -M/-MF dependency-phase repair, rebuild the exact DXC and validator receipts under the new producer identity, then produce and verify all 56 shader rows before the deterministic bar.",
       "started_utc": "2026-08-16T07:46:09Z",
-      "updated_utc": "2026-08-16T07:46:09Z"
+      "updated_utc": "2026-08-16T09:00:00Z"
     },
     {
       "id": "M3.1",
@@ -775,7 +778,7 @@
         "docs/rt64-port-status.json"
       ],
       "dependencies": ["A0.3"],
-      "state": "READY_FOR_REVIEW",
+      "state": "INTEGRATED",
       "findings": [
         "RT64's FullSync handler advances and enqueues an RT64-owned Workload with its own workload ID; the existing shim snapshots that completed Workload under the queue mutex before worker consumption.",
         "The first target row is feature::deferred-frame-history. Public FrameStatus and fn64 preflight FullSync are excluded from evidence; the observation projects only fieldwise RT64 workload history plus actual RDRAM effects.",
@@ -818,9 +821,15 @@
         }
       ],
       "blocker": null,
-      "next_action": "Review the exact retained closure and 10-process qualification report, then integrate this uncommitted branch without promoting any Rust-port row or another RT64 row.",
+      "next_action": "Use the retained deferred-history oracle to close its Rust-port counterpart, then add subsequent RT64 rows only through separately reviewed runner/build/effect authority without promoting unrelated pending rows.",
       "started_utc": "2026-08-16T00:00:00Z",
-      "updated_utc": "2026-08-16T08:44:12Z"
+      "updated_utc": "2026-08-16T09:00:00Z",
+      "retrospective": {
+        "friction": "The first successful 10-process series was invalidated by machine-local source paths embedded in retained debug executables.",
+        "cause": "Artifact privacy was audited after qualification rather than as a preflight property of the exact release build profile.",
+        "prevention": "Every retained native runner now uses stripped, path-remapped builds and must pass binary/source/privacy scans before the authoritative fresh-process series begins.",
+        "estimated_minutes_saved": 25
+      }
     }
   ]
 }

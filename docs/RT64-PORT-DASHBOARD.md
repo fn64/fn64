@@ -11,15 +11,15 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T07:46:09Z` |
+| updated | `2026-08-16T09:00:00Z` |
 
 ## Milestones
 
 | ID | state | title | tickets |
 |---|---|---|---|
-| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, READY_FOR_REVIEW:1, RUNNING:1 |
+| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:4, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:4, READY:1 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:4, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:2 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
@@ -207,13 +207,13 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M0` |
-| state | `BLOCKED` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `high` / GPT-5.6 Sol |
 | owner | /root/a0_3_independent_review repair implementer |
 | branch | `port/rt64-conformance-spine` -> `main` |
 | dependencies | `A0.1` |
 | writable paths | `Cargo.toml`, `Cargo.lock`, `README.md`, `crates/fn64-render-conformance`, `docs/DESIGN.md`, `docs/RENDER-WGPU-PORT-PLAN.md`, `docs/rt64-port-status.json`, `docs/RT64-PORT-DASHBOARD.md`, `docs/rt64-port-dashboard.html`, `scripts/lint-docs.py`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T09:00:00Z` (elapsed 9h0m) |
 | verification runs meeting bar | 3/3 |
 
 **Findings:**
@@ -227,9 +227,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - The checker launches ten fresh isolated subprocesses with unpredictable challenges, captures stdout and PID itself, rechecks retained artifacts after every run, and binds the exact runner executable to a pinned build receipt covering source inputs, build inputs, toolchain, and the RT64 source identity when applicable.
 - The verifier/evaluation protocol is binary-private rather than a public fn64-render-conformance library API. The exact reviewed runner source/build/binary is the cross-process trust root for its internal GuestCommittedTicket lifecycle; JSON hashing alone is explicitly not Rust type provenance.
 - Guest proof carries only independently checkable workload, backend-effect, guest-effect, and fresh-challenge identities. Unverifiable queue, ordinal, and submission decorations were removed.
-- Synthetic test runners are marked test-only, their source receipt is required in the test lane, and production registration rejects them mechanically. The production runner registry remains empty.
+- Synthetic test runners are marked test-only, their source receipt is required in the test lane, and production registration rejects them mechanically. A0.4 subsequently registered the first independently reviewed production RT64 runner.
 - The negative suite rejects expectation echoing, invalid records, missing or altered payloads, arbitrary effects, fake or stale-challenge guest proofs, synthetic production registration, mutated source/build closure, caller-authored private authority, caller-authored process series, and one execution cloned across ten launches.
-- No RT64 pass or divergence is accepted: the available raw-DPC attempt exposes fn64 preflight FullSync rather than an RT64-produced observable, and the native RT64 path stops at SDL display initialization without a display.
+- A0.4 closed the infrastructure frontier with a privacy-clean hidden-Metal runner whose RT64-owned deferred Workload observation passed ten fresh challenged processes. That later ticket promotes exactly one RT64 row; the conformance ladder itself remains backend-neutral.
 
 **Verification:**
 
@@ -239,9 +239,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | `python3 -m unittest tools/test_check_rt64_port_parity.py` | 10 | 10 | deterministic |
 | `python3 tools/check_rt64_port_parity.py` | 10 | 10 | deterministic |
 
-**Blocker:** No qualified headless RT64 delegate currently exposes a backend-produced contract observable: raw-DPC reports only fn64 preflight FullSync, while native RT64 stops at SDL display initialization. A0.3 cannot honestly supply its required RT64 pass/divergence case yet.
-
-**Next action:** Add a separately reviewed, display-independent RT64 runner that exposes a genuinely RT64-produced observable and bind its exact source/build/binary receipt before promoting any RT64 row.
+**Next action:** Reuse the sealed fixture, runner, verifier, and receipt protocol for each subsequent RT64 and Rust delegate row without weakening the all-pending denominator or treating RT64 as universal hardware authority.
 
 ### `M1.2` -- Place IR authority at real crate boundaries: validated ABI capture, distinct queue submission, backend-owned effect completion, and guest-memory-owner commit with rejection leaving no architectural publication.
 
@@ -414,13 +412,13 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M2` |
-| state | `READY` |
+| state | `RUNNING` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | shader corpus execution lead |
 | branch | `port/rt64-shader-corpus` -> `main` |
 | dependencies | `M2.4` |
 | writable paths | `docs/rt64-shader-artifacts.json`, `docs/RT64-SHADER-ARTIFACTS.md` |
-| started / updated | `2026-08-16T07:46:09Z` / `2026-08-16T07:46:09Z` (elapsed 0m) |
+| started / updated | `2026-08-16T07:46:09Z` / `2026-08-16T09:00:00Z` (elapsed 1h13m) |
 | verification runs meeting bar | 0/0 |
 
 **Findings:**
@@ -428,8 +426,11 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - M2.4 qualified the fail-closed mechanism and denominator, not an official DXC compiler build or shader corpus.
 - The build requires a complete clean checkout of official DXC v1.9.2607 at 0d3ee6b with its exact initialized DirectX-Headers, SPIRV-Headers, and SPIRV-Tools gitlinks; the sparse audit checkout is correctly rejected.
 - All 56 SPIR-V rows and both DXC built-in and standalone wgpu validators must close before M3.3 or M4 may claim admission of the full RT64 shader corpus.
+- A complete exact-byte official DXC checkout built successfully, and independently reviewed receipt schema v2 now binds the official dxc symlink, its retained libdxcompiler.dylib implementation, the exact macOS loader denominator, and private descriptor-stable execution.
+- The rebuilt official compiler and standalone wgpu validator receipts verified. Corpus production then failed closed on row one because DXC -P emits the preprocessed file but does not emit the requested -MD/-MF dependency file.
+- An executable probe confirmed DXC's explicit -M/-MF dependency-only phase emits the active include closure. The producer repair is separating dependency observation, preprocessing, and retained-preprocessed compilation while receipting all three phases; its producer identity change requires rebuilding both receipts before corpus qualification.
 
-**Next action:** Provision a complete clean official-DXC checkout and isolated build space, run build-dxc/build-validator/produce/verify, then independently review the complete receipts and 56-row denominator before the 10-process bar.
+**Next action:** Independently review and integrate the explicit -M/-MF dependency-phase repair, rebuild the exact DXC and validator receipts under the new producer identity, then produce and verify all 56 shader rows before the deterministic bar.
 
 ### `M3.1` -- Create fn64-render-wgpu and execute one receipt-bearing synthetic fill plus FullSync packet through the merged IR and exact wgpu submission lifecycle, without ABI or shell policy.
 
@@ -512,13 +513,13 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M0` |
-| state | `READY_FOR_REVIEW` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/a0_4_rt64_runner_impl |
 | branch | `port/rt64-deferred-history-runner` -> `main` |
 | dependencies | `A0.3` |
 | writable paths | `crates/fn64-render-conformance`, `crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md`, `docs/rt64-port-status.json` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T08:44:12Z` (elapsed 8h44m) |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T09:00:00Z` (elapsed 9h0m) |
 | verification runs meeting bar | 4/4 |
 
 **Findings:**
@@ -546,7 +547,14 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | `env -i target/debug/fn64-render-conformance-rt64-deferred-history-runner run < /private/tmp/fn64-a0-4-request-final.json > /private/tmp/fn64-a0-4-result-final.json 2> /private/tmp/fn64-a0-4-native-final.stderr (approved WindowServer access; pre-registration diagnostic)` | 1 | 1 | single |
 | `python3 tools/check_rt64_port_parity.py --qualification-output evidence/rt64-port/artifacts/deferred-frame-history/qualification-report.json (approved WindowServer access)` | 10 | 10 | deterministic |
 
-**Next action:** Review the exact retained closure and 10-process qualification report, then integrate this uncommitted branch without promoting any Rust-port row or another RT64 row.
+**Next action:** Use the retained deferred-history oracle to close its Rust-port counterpart, then add subsequent RT64 rows only through separately reviewed runner/build/effect authority without promoting unrelated pending rows.
+
+**Retrospective:**
+
+- Friction: The first successful 10-process series was invalidated by machine-local source paths embedded in retained debug executables.
+- Cause: Artifact privacy was audited after qualification rather than as a preflight property of the exact release build profile.
+- Prevention: Every retained native runner now uses stripped, path-remapped builds and must pass binary/source/privacy scans before the authoritative fresh-process series begins.
+- Estimated minutes saved: 25
 
 ## Regenerating
 
