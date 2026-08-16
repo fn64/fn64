@@ -677,14 +677,17 @@
         "docs/RT64-REFERENCE-SHADER-ARTIFACTS.md"
       ],
       "dependencies": ["M2.5"],
-      "state": "RUNNING",
+      "state": "INTEGRATED",
       "findings": [
         "This ticket preserves the already-qualified DXC producer identity by adding a separate orchestration and receipt layer rather than editing the accepted producer.",
         "Reference-valid means DXC and exact source-built spirv-val accept the artifact; it does not imply Naga or wgpu ingestion, runtime readiness, renderer parity, or performance.",
         "Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.",
         "Commit 8765d9b0 integrates the independently reviewed additive mechanism with exact source/build/runtime receipts, strict SPIR-V inventory parsing, private verifier staging, and protected producer identities unchanged.",
         "The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result.",
-        "Commit f967d32f freezes the exact Vulkan 1.0 scalar-block-layout validator contract after the prior first-row policy mismatch; a fresh external v3 build and one-row smoke remain candidate evidence until independent review."
+        "Commit f967d32f freezes the exact Vulkan 1.0 scalar-block-layout validator contract after the prior first-row policy mismatch.",
+        "The independently reviewed v3 validator receipt binds 83/83 SPIRV-Tools-only translation units, the exact binary and generated authorities, and one strict scalar-layout ShaderNonUniform smoke.",
+        "The fresh complete corpus contains the exact 56-row denominator and 225 regular files; all rows passed DXC built-in validation plus external spirv-val with the sole scalar-layout argv, and independent review rehashed every row, source snapshot, phase transcript, inventory, and receipt.",
+        "The corpus inventories six descriptor-indexing ShaderNonUniform rows and 504 direct NonUniform decorations; its canonical receipt and artifact-set identities were independently rehashed and remain retained with the external evidence rather than copied into an ungated dashboard assertion."
       ],
       "verification_runs": [
         {
@@ -692,12 +695,18 @@
           "clean_run_count": 10,
           "required_run_count": 10,
           "kind": "deterministic"
+        },
+        {
+          "command": "python3 tools/rt64_reference_shader_artifacts.py verify --artifact-dir <fresh-corpus> --port-dir <exact-port-pin> --oracle-dir <exact-oracle-pin> --dxc-source <exact-dxc-pin> --dxc-build <qualified-dxc-build> --spirv-val-build <qualified-v3-build>",
+          "clean_run_count": 1,
+          "required_run_count": 1,
+          "kind": "single"
         }
       ],
       "blocker": null,
-      "next_action": "Independently review the fresh v3 standalone spirv-val receipt and one-row scalar-layout smoke; only an accepted result may authorize a fresh all-56 reference corpus run.",
+      "next_action": "Preserve the frozen reference corpus and consume its exact per-row inventories in M2.5.2 without treating reference validity as wgpu ingestibility or runtime readiness.",
       "started_utc": "2026-08-16T09:54:30Z",
-      "updated_utc": "2026-08-16T12:37:27Z"
+      "updated_utc": "2026-08-16T12:49:54Z"
     },
     {
       "id": "M2.5.2",

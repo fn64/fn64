@@ -42,12 +42,12 @@ reserving authority, parity, performance, and integration claims for the lead.
 | program state | **IN PROGRESS** |
 | execution wave | **ACCEL-A -- port spine and evidence in parallel** |
 | active milestones | **M0 authority/baseline, M2 shader/tool feasibility, M3 raw-DPC vertical slice, and M4 base RDP/TMEM correctness (all IN PROGRESS)** |
-| active slices | M2.5.1 external reference-valid shader qualification; M4.2a transactional physical TMEM state; A0 workflow frontier maintenance |
-| active ownership | `F/xhigh` integration lead; `F/xhigh` M2.5.1 evidence reviewer/producer; `F/xhigh` M4.2a physical-state owner; independent reviewers remain serialized from writers |
-| last completed result | local `main` contains M4.2.0's typed transfer contract (`75e9025f`), the scalar-layout validator contract (`f967d32f`), and A0.5's deterministic workflow frontier (`05c7c88b`) |
-| next concrete decision | independently accept or reject the fresh M2.5.1 validator receipt before any 56-row corpus run, and independently review M4.2a before parallel LoadTile/LoadBlock execution |
+| active slices | M2.5.2 typed wgpu-ingestion assessment; M4.2a transactional physical TMEM state; A0 workflow frontier maintenance |
+| active ownership | `F/xhigh` integration lead; `F/xhigh` M2.5.2 assessment owner; `F/xhigh` M4.2a physical-state owner; independent reviewers remain serialized from writers |
+| last completed result | the independently reviewed M2.5.1 corpus contains all 56 reference-valid rows; remote `main` contains M4.2.0 (`75e9025f`), the scalar-layout contract (`f967d32f`), and A0.5 (`05c7c88b`) |
+| next concrete decision | consume the frozen M2.5.1 inventories in a typed all-56 wgpu-ingestion assessment, and repair/review M4.2a before parallel LoadTile/LoadBlock execution |
 | evidence blockers | no matched private-game RT64 performance baseline exists; the original M2.5 gate is split because required ShaderNonUniform SPIR-V semantics are rejected by Naga 30; production DPC dispatch still does not consume the new owned-read path |
-| verification claim | M4.2.0 passed 10/10 full renderer suites and freezes plans only; M2.5.1 has one unaccepted external validator/smoke candidate and no complete corpus claim; A0.5 passed its final-source 10/10 dashboard gate |
+| verification claim | M4.2.0 passed 10/10 full renderer suites and freezes plans only; M2.5.1 has an independently verified 56/56 conditional reference-valid corpus but no wgpu/runtime/parity claim; A0.5 passed its final-source 10/10 dashboard gate |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
 counts are in [`RT64-PORT-DASHBOARD.md`](RT64-PORT-DASHBOARD.md), generated
@@ -947,8 +947,10 @@ The accelerated wave keeps dependency-safe work active in parallel:
     runtime corpus, using owned WGSL/Naga IR and bounded feature fallbacks
     where reference SPIR-V is not ingestible. None of these claims substitutes
     for another. M2.5.1's additive receipt/validator mechanism is integrated
-    at `8765d9b0` after independent review and a 10/10 hostile gate; the exact
-    external `spirv-val` source build and 56-row corpus remain open.
+    at `8765d9b0` after independent review and a 10/10 hostile gate. The exact
+    v3 `spirv-val` build/smoke and all 56 reference rows are now independently
+    verified; M2.5.2 still must grade wgpu ingestion, and this reference-valid
+    result makes no adapter, pipeline, runtime, parity, or performance claim.
 16. **M4.0 -- own deferred guest reads (INTEGRATED, `d8c0d4b1`; 10/10 VALIDATED).** The
     renderer preflights an exact ordered plan from RDRAM `TmemLoadSource`
     journal operations; the ABI captures only those ranges in N64 logical byte
