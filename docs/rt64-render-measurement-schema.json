@@ -1,0 +1,233 @@
+{
+  "schema": "fn64.rt64-render-measurement-report.v1",
+  "description": "Path-free wire contract for one future RT64 renderer measurement report. This repository does not yet contain the Rust raw-sample ABI or shell JSON emitter required to produce one.",
+  "availability": {
+    "report_emitter": "unavailable",
+    "cohort_validator": "deferred",
+    "missing": [
+      "fn64-abi raw per-advance measurement snapshot",
+      "post-warmup measurement-window rebase",
+      "fn64-shell path-free JSON report emitter",
+      "native metric instruments and presentation-capable route"
+    ],
+    "run_command": null
+  },
+  "tiers": {
+    "development": {
+      "meaning": "Structurally valid, but at least one comparison precondition is unavailable or not reached.",
+      "may_compare": false
+    },
+    "comparison_ready": {
+      "meaning": "All comparison preconditions and every metric are armed on a route that can observe physical presentation.",
+      "may_compare": true
+    }
+  },
+  "metric_value_shapes": {
+    "armed": {
+      "exact_keys": ["state", "value"],
+      "value_minimum": 0
+    },
+    "unavailable": {
+      "exact_keys": ["state", "reason"],
+      "reason_pattern": "^[A-Za-z0-9][A-Za-z0-9 .,_:()'-]{0,255}$"
+    },
+    "armed_not_reached": {
+      "exact_keys": ["state", "value"],
+      "value_const": 0
+    }
+  },
+  "required_top_level_fields": [
+    "schema",
+    "tier",
+    "scenario",
+    "process_role",
+    "route",
+    "identity",
+    "horizon",
+    "census",
+    "metrics"
+  ],
+  "fields": {
+    "schema": {
+      "type": "string",
+      "const": "fn64.rt64-render-measurement-report.v1"
+    },
+    "tier": {
+      "type": "string",
+      "enum": ["development", "comparison_ready"]
+    },
+    "scenario": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "process_role": {
+      "type": "string",
+      "enum": ["control", "instrumented"]
+    },
+    "route": {
+      "type": "string",
+      "enum": ["headless_pump_one_frame"]
+    },
+    "identity": {
+      "type": "object",
+      "exact_keys": ["program", "build", "host", "gpu_query"],
+      "properties": {
+        "program": {
+          "type": "object",
+          "exact_keys": [
+            "source_state",
+            "generated_code_archive_sha256",
+            "section_bridge_archive_sha256",
+            "dispatch_source_sha256"
+          ]
+        },
+        "build": {
+          "type": "object",
+          "exact_keys": [
+            "cargo_profile",
+            "cargo_features",
+            "rustc_vv_sha256",
+            "git_head",
+            "git_clean"
+          ]
+        },
+        "host": {
+          "type": "object",
+          "exact_keys": ["os", "arch", "cpu_model"]
+        },
+        "gpu_query": {
+          "type": "object",
+          "exact_keys": ["state", "graphics_api", "adapter_name", "driver_version"]
+        }
+      }
+    },
+    "horizon": {
+      "type": "object",
+      "exact_keys": [
+        "warmup_gfx_submits",
+        "steady_began_at_field",
+        "steady_began_at_gfx_submits",
+        "rebased"
+      ],
+      "integer_minimum": 0
+    },
+    "census": {
+      "type": "object",
+      "exact_keys": [
+        "total_fields",
+        "transient_fields",
+        "truncated_advances",
+        "warmup_gfx",
+        "steady_began_at_field",
+        "steady_began_at_gfx",
+        "counters_armed",
+        "samples"
+      ],
+      "sample_exact_keys": [
+        "advance_index",
+        "wall_ns",
+        "committed_vi_fields",
+        "guest_cycles",
+        "gfx_submits",
+        "counters"
+      ],
+      "counter_exact_keys": [
+        "present_count",
+        "executor_ns",
+        "gfx_total_ns",
+        "rsp_ns",
+        "rdp_submit_ns",
+        "vi_present_ns",
+        "dpc_alloc_ns",
+        "dpc_copy_in_ns",
+        "dpc_copy_back_ns"
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "exact_keys": [
+        "sample_count",
+        "cpu_field_latency",
+        "gpu_interval",
+        "copy_upload_readback_bytes",
+        "queue_wait",
+        "allocation_bytes",
+        "shader_pso_compile",
+        "full_gpu_pass",
+        "total_vram_bytes",
+        "physical_presentation"
+      ],
+      "properties": {
+        "sample_count": {
+          "value_type": "integer",
+          "unit": "samples",
+          "allowed_states": ["armed"]
+        },
+        "cpu_field_latency": {
+          "value_type": "distribution",
+          "unit": "milliseconds_per_committed_vi_field",
+          "allowed_states": ["armed"],
+          "exact_keys": ["state", "p50_ms", "p95_ms", "p99_ms", "max_ms", "mean_ms"]
+        },
+        "gpu_interval": {
+          "value_type": "number",
+          "unit": "nanoseconds",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        },
+        "copy_upload_readback_bytes": {
+          "value_type": "integer",
+          "unit": "bytes",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        },
+        "queue_wait": {
+          "value_type": "number",
+          "unit": "nanoseconds",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        },
+        "allocation_bytes": {
+          "value_type": "integer",
+          "unit": "bytes",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        },
+        "shader_pso_compile": {
+          "value_type": "integer",
+          "unit": "compile_events",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        },
+        "full_gpu_pass": {
+          "value_type": "number",
+          "unit": "nanoseconds",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        },
+        "total_vram_bytes": {
+          "value_type": "integer",
+          "unit": "bytes",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        },
+        "physical_presentation": {
+          "value_type": "integer",
+          "unit": "present_events",
+          "allowed_states": ["armed", "unavailable", "armed_not_reached"]
+        }
+      }
+    }
+  },
+  "cross_field_rules": [
+    "horizon values equal their census counterparts",
+    "control reports have counters_armed false; instrumented reports have counters_armed true",
+    "sample advance_index values are contiguous from zero",
+    "sample_count equals the sample array length",
+    "cpu_field_latency percentiles use each advance wall_ns divided by committed_vi_fields",
+    "cpu_field_latency mean_ms equals sum wall_ns divided by sum committed_vi_fields",
+    "total_fields covers transient plus every retained committed VI field",
+    "headless_pump_one_frame requires physical_presentation unavailable",
+    "comparison_ready requires a receipt, clean build, queried GPU, rebased horizon, no truncation, and every metric armed"
+  ],
+  "cohort_rules": [
+    "v1 cohort acceptance is deferred because reports do not encode the required pair and boundary fields",
+    "a future cohort schema must require exactly five control/instrumented pairs",
+    "a future cohort schema must encode explicit pair and repetition ordinals",
+    "a future cohort schema must encode alternating control then instrumented and instrumented then control pair order",
+    "a future cohort schema must require equal identity and requested and observed horizon and workload boundaries within each pair"
+  ]
+}

@@ -435,6 +435,21 @@ def check_rt64_port_authority() -> None:
         print("  RT64 port source, license, and overlay authority agree")
 
 
+# --- 4baa. RT64 measurement contract and generated doc remain identical ---
+def check_rt64_render_measurement() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/run_rt64_render_baseline.py"), "--check-doc"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("RT64-RENDER-MEASUREMENT.md", detail)
+    elif VERBOSE:
+        print("  RT64 render-measurement schema and generated document agree")
+
+
 # --- 4bab. RT64 port work inventory must remain a reproducible denominator -
 def check_rt64_port_inventory() -> None:
     tool = str(ROOT / "tools/rt64_port_inventory.py")
@@ -623,7 +638,8 @@ def main() -> int:
     for fn in (check_refs, check_readme_crates, check_env_vars,
                check_closed_roadmap_items, check_doc_hashes_are_tested,
                check_completeness_recipe, check_rt64_feature_inventory,
-               check_rt64_port_authority, check_rt64_port_inventory,
+               check_rt64_port_authority, check_rt64_render_measurement,
+               check_rt64_port_inventory,
                check_rt64_port_parity,
                check_rt64_platform_certification,
                check_private_input_admission,
