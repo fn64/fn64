@@ -332,22 +332,72 @@ def milestone_progress(milestones: dict[str, dict], tickets: list[dict]) -> dict
     return progress
 
 
-def elapsed_seconds(ticket: dict) -> float:
-    started = datetime.strptime(ticket["started_utc"], "%Y-%m-%dT%H:%M:%SZ")
-    updated = datetime.strptime(ticket["updated_utc"], "%Y-%m-%dT%H:%M:%SZ")
-    return max(0.0, (updated - started).total_seconds())
+WORKFLOW_QUEUE_STATES = ("RUNNING", "READY_FOR_REVIEW", "READY", "BLOCKED")
 
 
-def format_elapsed(seconds: float) -> str:
-    seconds = int(seconds)
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes, _ = divmod(seconds, 60)
-    if days:
-        return f"{days}d{hours}h"
-    if hours:
-        return f"{hours}h{minutes}m"
-    return f"{minutes}m"
+def reliability_status(ticket: dict) -> str:
+    """Return a receipt status without promoting a ticket's declared state."""
+    runs = ticket["verification_runs"]
+    if not runs or any(run["required_run_count"] == 0 for run in runs):
+        return "NOT RECORDED"
+    if all(run["clean_run_count"] >= run["required_run_count"] for run in runs):
+        return "MET"
+    return "NOT MET"
+
+
+def reliability_bars(ticket: dict) -> str:
+    runs = ticket["verification_runs"]
+    if not runs:
+        return "NOT RECORDED"
+    bars = ", ".join(
+        f"{run['command']}: {run['clean_run_count']}/{run['required_run_count']} {run['kind']}"
+        for run in runs
+    )
+    return f"{reliability_status(ticket)} ({bars})"
+
+
+def dependency_states(ticket: dict, tickets_by_id: dict[str, dict]) -> str:
+    if not ticket["dependencies"]:
+        return "none"
+    return ", ".join(
+        f"{dependency}={tickets_by_id[dependency]['state']}"
+        for dependency in ticket["dependencies"]
+    )
+
+
+def workflow_frontier(milestones: dict[str, dict], tickets: list[dict]) -> dict[str, Any]:
+    """Build a deterministic workflow summary from declared manifest facts only."""
+    tickets_by_id = {ticket["id"]: ticket for ticket in tickets}
+    return {
+        "complete_milestone_count": sum(entry["state"] == "COMPLETE" for entry in milestones.values()),
+        "milestone_count": len(milestones),
+        "integrated_ticket_count": sum(ticket["state"] == "INTEGRATED" for ticket in tickets),
+        "ticket_count": len(tickets),
+        "no_ticket_milestones": [
+            milestone_id
+            for milestone_id in milestones
+            if not any(ticket["milestone"] == milestone_id for ticket in tickets)
+        ],
+        "queues": {
+            state: [ticket for ticket in tickets if ticket["state"] == state]
+            for state in WORKFLOW_QUEUE_STATES
+        },
+        "tickets_by_id": tickets_by_id,
+        "retrospective_ticket_count": sum("retrospective" in ticket for ticket in tickets),
+        "missing_retrospective_ids": [ticket["id"] for ticket in tickets if "retrospective" not in ticket],
+    }
+
+
+def workflow_ticket_line(ticket: dict, tickets_by_id: dict[str, dict]) -> str:
+    line = (
+        f"{ticket['id']} [{ticket['state']}] owner={ticket['owner']} "
+        f"branch={ticket['branch']} -> {ticket['base_branch']} "
+        f"deps={dependency_states(ticket, tickets_by_id)} "
+        f"reliability={reliability_bars(ticket)} next={ticket['next_action']}"
+    )
+    if ticket["blocker"]:
+        line += f" blocker={ticket['blocker']}"
+    return line
 
 
 # --------------------------------------------------------------------------
@@ -359,7 +409,28 @@ def render_terminal(program: dict, milestones: dict[str, dict], tickets: list[di
     lines: list[str] = []
     lines.append("RT64 PORT DASHBOARD")
     lines.append(f"goal: {program['goal']}")
-    lines.append(f"state: {program['program_state']}  branch: {program['branch']} -> {program['base_branch']}  updated: {program['updated_utc']}")
+    lines.append(f"program state: {program['program_state']}  branch: {program['branch']} -> {program['base_branch']}")
+    lines.append("")
+    frontier = workflow_frontier(milestones, tickets)
+    lines.append("WORKFLOW FRONTIER")
+    lines.append(f"  COMPLETE milestones: {frontier['complete_milestone_count']}/{frontier['milestone_count']}")
+    lines.append(
+        f"  INTEGRATED / recorded tickets: {frontier['integrated_ticket_count']}/{frontier['ticket_count']} "
+        "(recorded ticket scope, not a percent-to-goal)"
+    )
+    no_tickets = ", ".join(frontier["no_ticket_milestones"]) or "none"
+    lines.append(f"  milestones with no tickets: {no_tickets}")
+    missing = ", ".join(frontier["missing_retrospective_ids"]) or "none"
+    lines.append(
+        f"  retrospective coverage: {frontier['retrospective_ticket_count']}/{frontier['ticket_count']}; "
+        f"missing: {missing}"
+    )
+    for state in WORKFLOW_QUEUE_STATES:
+        label = "READY_FOR_REVIEW (awaiting independent review only)" if state == "READY_FOR_REVIEW" else state
+        queue = frontier["queues"][state]
+        lines.append(f"  {label}: {len(queue)}")
+        for ticket in queue:
+            lines.append(f"    {workflow_ticket_line(ticket, frontier['tickets_by_id'])}")
     lines.append("")
     lines.append("MILESTONES")
     progress = milestone_progress(milestones, tickets)
@@ -371,14 +442,12 @@ def render_terminal(program: dict, milestones: dict[str, dict], tickets: list[di
     lines.append("")
     lines.append("TICKETS")
     for ticket in tickets:
-        verified = sum(1 for run in ticket["verification_runs"] if run["clean_run_count"] >= run["required_run_count"] and run["required_run_count"] > 0)
-        total_runs = len(ticket["verification_runs"])
         lines.append(
             f"  {ticket['id']:8} [{ticket['state']:16}] {ticket['milestone']:5} "
             f"{ticket['profile']}/{ticket['effort']:6} {ticket['model']}  owner={ticket['owner']}"
         )
         lines.append(f"           {ticket['objective']}")
-        lines.append(f"           deps={ticket['dependencies'] or 'none'}  verified_runs={verified}/{total_runs}  elapsed={format_elapsed(elapsed_seconds(ticket))}")
+        lines.append(f"           deps={dependency_states(ticket, frontier['tickets_by_id'])}  reliability={reliability_bars(ticket)}")
         if ticket["blocker"]:
             lines.append(f"           BLOCKER: {ticket['blocker']}")
         lines.append(f"           next: {ticket['next_action']}")
@@ -391,6 +460,7 @@ def render_terminal(program: dict, milestones: dict[str, dict], tickets: list[di
 
 
 def render_markdown(program: dict, milestones: dict[str, dict], tickets: list[dict]) -> str:
+    frontier = workflow_frontier(milestones, tickets)
     lines: list[str] = [
         "# RT64 port workflow dashboard",
         "",
@@ -405,13 +475,33 @@ def render_markdown(program: dict, milestones: dict[str, dict], tickets: list[di
         f"|---|---|",
         f"| state | `{program['program_state']}` |",
         f"| branch | `{program['branch']}` -> `{program['base_branch']}` |",
-        f"| updated | `{program['updated_utc']}` |",
         "",
+        "## Workflow frontier",
+        "",
+        f"- **COMPLETE milestones:** {frontier['complete_milestone_count']}/{frontier['milestone_count']}",
+        f"- **INTEGRATED / recorded tickets:** {frontier['integrated_ticket_count']}/{frontier['ticket_count']} — recorded ticket scope, **not a percent-to-goal**.",
+        f"- **Milestones with no tickets:** {', '.join(f'`{milestone_id}`' for milestone_id in frontier['no_ticket_milestones']) or 'none'}",
+        f"- **Retrospective coverage:** {frontier['retrospective_ticket_count']}/{frontier['ticket_count']}; missing: {', '.join(f'`{ticket_id}`' for ticket_id in frontier['missing_retrospective_ids']) or 'none'}",
+        "",
+    ]
+    for state in WORKFLOW_QUEUE_STATES:
+        label = "READY_FOR_REVIEW — awaiting independent review only" if state == "READY_FOR_REVIEW" else state
+        lines.extend([f"### {label} ({len(frontier['queues'][state])})", ""])
+        if not frontier["queues"][state]:
+            lines.extend(["None.", ""])
+            continue
+        for ticket in frontier["queues"][state]:
+            blocker = f"; blocker: {ticket['blocker']}" if ticket["blocker"] else ""
+            lines.extend([
+                f"- `{ticket['id']}` — owner: {ticket['owner']}; branch: `{ticket['branch']}` -> `{ticket['base_branch']}`; dependencies: {dependency_states(ticket, frontier['tickets_by_id'])}; reliability: **{reliability_bars(ticket)}**; next: {ticket['next_action']}{blocker}",
+                "",
+            ])
+    lines.extend([
         "## Milestones",
         "",
         "| ID | state | title | tickets |",
         "|---|---|---|---|",
-    ]
+    ])
     progress = milestone_progress(milestones, tickets)
     for milestone_id, entry in milestones.items():
         p = progress[milestone_id]
@@ -422,8 +512,6 @@ def render_markdown(program: dict, milestones: dict[str, dict], tickets: list[di
         lines.append(f"- **{milestone_id}:** {entry['exit_headline']}")
     lines.extend(["", "## Tickets", ""])
     for ticket in tickets:
-        verified = sum(1 for run in ticket["verification_runs"] if run["clean_run_count"] >= run["required_run_count"] and run["required_run_count"] > 0)
-        total_runs = len(ticket["verification_runs"])
         lines.extend([
             f"### `{ticket['id']}` -- {ticket['objective']}",
             "",
@@ -434,10 +522,9 @@ def render_markdown(program: dict, milestones: dict[str, dict], tickets: list[di
             f"| profile / effort / model | `{ticket['profile']}` / `{ticket['effort']}` / {ticket['model']} |",
             f"| owner | {ticket['owner']} |",
             f"| branch | `{ticket['branch']}` -> `{ticket['base_branch']}` |",
-            f"| dependencies | {', '.join(f'`{d}`' for d in ticket['dependencies']) or 'none'} |",
+            f"| dependencies | {dependency_states(ticket, frontier['tickets_by_id'])} |",
             f"| writable paths | {', '.join(f'`{p}`' for p in ticket['writable_paths'])} |",
-            f"| started / updated | `{ticket['started_utc']}` / `{ticket['updated_utc']}` (elapsed {format_elapsed(elapsed_seconds(ticket))}) |",
-            f"| verification runs meeting bar | {verified}/{total_runs} |",
+            f"| reliability | **{reliability_bars(ticket)}** |",
             "",
         ])
         if ticket["findings"]:
@@ -513,6 +600,7 @@ def _e(value: Any) -> str:
 
 def render_html(program: dict, milestones: dict[str, dict], tickets: list[dict]) -> str:
     progress = milestone_progress(milestones, tickets)
+    frontier = workflow_frontier(milestones, tickets)
 
     milestone_rows = []
     for milestone_id, entry in milestones.items():
@@ -529,8 +617,6 @@ def render_html(program: dict, milestones: dict[str, dict], tickets: list[dict])
 
     ticket_cards = []
     for ticket in tickets:
-        verified = sum(1 for run in ticket["verification_runs"] if run["clean_run_count"] >= run["required_run_count"] and run["required_run_count"] > 0)
-        total_runs = len(ticket["verification_runs"])
         state_class = _STATE_CLASS.get(ticket["state"], "")
         findings_html = "".join(f"<li>{_e(f)}</li>" for f in ticket["findings"]) or "<li class=\"muted\">none recorded</li>"
         runs_rows = "".join(
@@ -538,7 +624,7 @@ def render_html(program: dict, milestones: dict[str, dict], tickets: list[dict])
             f"<td>{run['required_run_count']}</td><td>{_e(run['kind'])}</td></tr>"
             for run in ticket["verification_runs"]
         ) or "<tr><td colspan=\"4\" class=\"muted\">no verification runs recorded</td></tr>"
-        deps_html = ", ".join(f"<code>{_e(d)}</code>" for d in ticket["dependencies"]) or "none"
+        deps_html = _e(dependency_states(ticket, frontier["tickets_by_id"]))
         paths_html = ", ".join(f"<code>{_e(p)}</code>" for p in ticket["writable_paths"])
         blocker_html = (
             f"  <p class=\"blocker\"><strong>Blocker:</strong> {_e(ticket['blocker'])}</p>\n"
@@ -568,8 +654,7 @@ def render_html(program: dict, milestones: dict[str, dict], tickets: list[dict])
     <dt>Branch</dt><dd><code>{_e(ticket['branch'])}</code> &rarr; <code>{_e(ticket['base_branch'])}</code></dd>
     <dt>Dependencies</dt><dd>{deps_html}</dd>
     <dt>Writable paths</dt><dd>{paths_html}</dd>
-    <dt>Elapsed</dt><dd>{_e(format_elapsed(elapsed_seconds(ticket)))} (started {_e(ticket['started_utc'])}, updated {_e(ticket['updated_utc'])})</dd>
-    <dt>Verification bar met</dt><dd>{verified}/{total_runs} runs</dd>
+    <dt>Reliability</dt><dd>{_e(reliability_bars(ticket))}</dd>
   </dl>
 {blocker_html}\
   <p><strong>Next action:</strong> {_e(ticket['next_action'])}</p>
@@ -580,6 +665,25 @@ def render_html(program: dict, milestones: dict[str, dict], tickets: list[dict])
   </details>
 {retrospective_html}\
 </article>""")
+
+    queue_sections = []
+    for state in WORKFLOW_QUEUE_STATES:
+        label = "READY_FOR_REVIEW — awaiting independent review only" if state == "READY_FOR_REVIEW" else state
+        queue_entries = "".join(
+            f"<li><code>{_e(ticket['id'])}</code> — owner: {_e(ticket['owner'])}; "
+            f"branch: <code>{_e(ticket['branch'])}</code> &rarr; <code>{_e(ticket['base_branch'])}</code>; "
+            f"dependencies: {_e(dependency_states(ticket, frontier['tickets_by_id']))}; "
+            f"reliability: <strong>{_e(reliability_bars(ticket))}</strong>; "
+            f"next: {_e(ticket['next_action'])}"
+            f"{'; blocker: ' + _e(ticket['blocker']) if ticket['blocker'] else ''}</li>"
+            for ticket in frontier["queues"][state]
+        ) or '<li class="muted">none</li>'
+        queue_sections.append(
+            f"<section class=\"queue\"><h3>{_e(label)} ({len(frontier['queues'][state])})</h3>"
+            f"<ul>{queue_entries}</ul></section>"
+        )
+    no_ticket_milestones = ", ".join(frontier["no_ticket_milestones"]) or "none"
+    missing_retrospectives = ", ".join(frontier["missing_retrospective_ids"]) or "none"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -599,6 +703,12 @@ def render_html(program: dict, milestones: dict[str, dict], tickets: list[dict])
   h2 {{ font-size: 1.15rem; margin-top: 2rem; }}
   code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }}
   .goal {{ max-width: 70ch; opacity: 0.85; }}
+  .frontier {{ border: 1px solid light-dark(#ddd, #333); border-radius: 8px; padding: 0.9rem 1rem; background: light-dark(#fff, #1c1f24); }}
+  .frontier p {{ margin: 0.3rem 0; }}
+  .warning {{ color: #9a6700; font-weight: 600; }}
+  .queues {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 0.75rem; }}
+  .queue {{ border-top: 1px solid light-dark(#ddd, #333); }}
+  .queue h3 {{ font-size: 0.95rem; margin: 0.6rem 0 0.2rem; }}
   .badge {{
     display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
     font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em;
@@ -642,8 +752,19 @@ def render_html(program: dict, milestones: dict[str, dict], tickets: list[dict])
 <p>
   <span class="badge {_STATE_CLASS.get(program['program_state'], '')}">{_e(program['program_state'])}</span>
   <code>{_e(program['branch'])}</code> &rarr; <code>{_e(program['base_branch'])}</code>
-  &middot; updated <code>{_e(program['updated_utc'])}</code>
 </p>
+
+<section class="frontier">
+<h2>Workflow frontier</h2>
+<p><strong>COMPLETE milestones:</strong> {frontier['complete_milestone_count']}/{frontier['milestone_count']}</p>
+<p><strong>INTEGRATED / recorded tickets:</strong> {frontier['integrated_ticket_count']}/{frontier['ticket_count']}</p>
+<p class="warning">Recorded ticket scope, not a percent-to-goal.</p>
+<p><strong>Milestones with no tickets:</strong> {_e(no_ticket_milestones)}</p>
+<p><strong>Retrospective coverage:</strong> {frontier['retrospective_ticket_count']}/{frontier['ticket_count']}; missing: {_e(missing_retrospectives)}</p>
+<div class="queues">
+{"".join(queue_sections)}
+</div>
+</section>
 
 <h2>Milestones</h2>
 <table>
