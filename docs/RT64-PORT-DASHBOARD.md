@@ -15,15 +15,13 @@
 ## Workflow frontier
 
 - **COMPLETE milestones:** 0/13
-- **INTEGRATED / recorded tickets:** 19/26 — recorded ticket scope, **not a percent-to-goal**.
+- **INTEGRATED / recorded tickets:** 20/26 — recorded ticket scope, **not a percent-to-goal**.
 - **Milestones with no tickets:** `M5`, `M6`, `M7`, `M8`, `M9`, `M10`, `M11`, `M12`
 - **Retrospective coverage:** 12/26; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`
 
-### RUNNING (3)
+### RUNNING (2)
 
 - `M0.3` — owner: integration lead; branch: `feat/egui-settings-drawer-hud` -> `main`; dependencies: none; reliability: **NOT MET (cargo nextest run -p fn64-abi --no-default-features: 1/10 deterministic, tools/check_rt64_render_measurement.py: 10/10 deterministic)**; next: Exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, then run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.
-
-- `M2.5.1` — owner: /root/m2_5_depfile_repair; branch: `m2-5a-reference-corpus` -> `main`; dependencies: M2.5=BLOCKED; reliability: **MET (python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose: 10/10 deterministic)**; next: Independently review the fresh v3 standalone spirv-val receipt and one-row scalar-layout smoke; only an accepted result may authorize a fresh all-56 reference corpus run.
 
 - `M4.2` — owner: /root/m4_2a_physical_state_impl; branch: `port/m4-2a-physical-state` -> `main`; dependencies: M4.1=INTEGRATED; reliability: **MET (scripts/guarded-cargo-test.zsh -p fn64-render-wgpu: 10/10 deterministic)**; next: Complete and independently review M4.2a's packet-transaction physical state, backend-effect co-binding, rollback, and post-guest-commit publication before dispatching parallel LoadTile and LoadBlock executors.
 
@@ -33,13 +31,13 @@ None.
 
 ### READY (1)
 
-- `M2.5.2` — owner: integration lead; branch: `port/rt64-wgpu-ingestion-assessment` -> `main`; dependencies: M2.5.1=RUNNING; reliability: **NOT RECORDED**; next: Dispatch after M2.5.1 freezes the complete reference corpus and per-row capability inventory.
+- `M2.5.2` — owner: integration lead; branch: `port/rt64-wgpu-ingestion-assessment` -> `main`; dependencies: M2.5.1=INTEGRATED; reliability: **NOT RECORDED**; next: Dispatch after M2.5.1 freezes the complete reference corpus and per-row capability inventory.
 
 ### BLOCKED (3)
 
 - `M2.5` — owner: shader corpus execution lead; branch: `port/rt64-shader-corpus` -> `main`; dependencies: M2.4=INTEGRATED; reliability: **NOT RECORDED**; next: Complete M2.5.1 reference-valid corpus evidence, then use M2.5.2's typed assessment and M2.5.3's owned WGSL/runtime artifacts without treating reference validity as wgpu ingestibility.; blocker: The original single-corpus exit condition is impossible with the admitted DXC output and Naga 30: row one requires ShaderNonUniform, which the strict SPIR-V frontend rejects. M2.5.1 through M2.5.3 replace the conflated gate.
 
-- `M2.5.3` — owner: integration lead; branch: `port/rt64-runtime-shader-corpus` -> `main`; dependencies: M2.5.1=RUNNING, M2.5.2=READY; reliability: **NOT RECORDED**; next: Begin bounded owned WGSL vertical slices in parallel where authority fixtures exist, but do not claim a complete runtime corpus until both upstream tickets close.; blocker: The complete reference corpus and per-row wgpu assessment do not yet exist; runtime shader promotion also requires semantic differential fixtures.
+- `M2.5.3` — owner: integration lead; branch: `port/rt64-runtime-shader-corpus` -> `main`; dependencies: M2.5.1=INTEGRATED, M2.5.2=READY; reliability: **NOT RECORDED**; next: Begin bounded owned WGSL vertical slices in parallel where authority fixtures exist, but do not claim a complete runtime corpus until both upstream tickets close.; blocker: The complete reference corpus and per-row wgpu assessment do not yet exist; runtime shader promotion also requires semantic differential fixtures.
 
 - `M4.3` — owner: integration lead; branch: `port/m4-texture-decode` -> `main`; dependencies: M4.2=RUNNING; reliability: **NOT RECORDED**; next: After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.; blocker: M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.
 
@@ -49,7 +47,7 @@ None.
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:5, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:4, READY:1, RUNNING:1 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:5, READY:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
 | `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:1, INTEGRATED:2, RUNNING:1 |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
@@ -467,13 +465,13 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M2` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m2_5_depfile_repair |
 | branch | `m2-5a-reference-corpus` -> `main` |
 | dependencies | M2.5=BLOCKED |
 | writable paths | `tools/rt64_reference_shader_artifacts.py`, `tools/test_rt64_reference_shader_artifacts.py`, `docs/rt64-reference-shader-artifact-schema.json`, `docs/RT64-REFERENCE-SHADER-ARTIFACTS.md` |
-| reliability | **MET (python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose: 10/10 deterministic)** |
+| reliability | **MET (python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose: 10/10 deterministic, python3 tools/rt64_reference_shader_artifacts.py verify --artifact-dir <fresh-corpus> --port-dir <exact-port-pin> --oracle-dir <exact-oracle-pin> --dxc-source <exact-dxc-pin> --dxc-build <qualified-dxc-build> --spirv-val-build <qualified-v3-build>: 1/1 single)** |
 
 **Findings:**
 
@@ -482,15 +480,19 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.
 - Commit 8765d9b0 integrates the independently reviewed additive mechanism with exact source/build/runtime receipts, strict SPIR-V inventory parsing, private verifier staging, and protected producer identities unchanged.
 - The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result.
-- Commit f967d32f freezes the exact Vulkan 1.0 scalar-block-layout validator contract after the prior first-row policy mismatch; a fresh external v3 build and one-row smoke remain candidate evidence until independent review.
+- Commit f967d32f freezes the exact Vulkan 1.0 scalar-block-layout validator contract after the prior first-row policy mismatch.
+- The independently reviewed v3 validator receipt binds 83/83 SPIRV-Tools-only translation units, the exact binary and generated authorities, and one strict scalar-layout ShaderNonUniform smoke.
+- The fresh complete corpus contains the exact 56-row denominator and 225 regular files; all rows passed DXC built-in validation plus external spirv-val with the sole scalar-layout argv, and independent review rehashed every row, source snapshot, phase transcript, inventory, and receipt.
+- The corpus inventories six descriptor-indexing ShaderNonUniform rows and 504 direct NonUniform decorations; its canonical receipt and artifact-set identities were independently rehashed and remain retained with the external evidence rather than copied into an ungated dashboard assertion.
 
 **Verification:**
 
 | command | clean runs | required | kind |
 |---|---|---|---|
 | `python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose` | 10 | 10 | deterministic |
+| `python3 tools/rt64_reference_shader_artifacts.py verify --artifact-dir <fresh-corpus> --port-dir <exact-port-pin> --oracle-dir <exact-oracle-pin> --dxc-source <exact-dxc-pin> --dxc-build <qualified-dxc-build> --spirv-val-build <qualified-v3-build>` | 1 | 1 | single |
 
-**Next action:** Independently review the fresh v3 standalone spirv-val receipt and one-row scalar-layout smoke; only an accepted result may authorize a fresh all-56 reference corpus run.
+**Next action:** Preserve the frozen reference corpus and consume its exact per-row inventories in M2.5.2 without treating reference validity as wgpu ingestibility or runtime readiness.
 
 ### `M2.5.2` -- Assess every reference-valid shader through the exact Naga/wgpu ingestion boundary with typed ingestible or blocked-known outcomes and a separate fail-closed runtime-ready gate.
 
@@ -501,7 +503,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | integration lead |
 | branch | `port/rt64-wgpu-ingestion-assessment` -> `main` |
-| dependencies | M2.5.1=RUNNING |
+| dependencies | M2.5.1=INTEGRATED |
 | writable paths | `tools/rt64_wgpu_shader_assessment.py`, `docs/rt64-wgpu-shader-assessment-schema.json`, `docs/RT64-WGPU-SHADER-ASSESSMENT.md` |
 | reliability | **NOT RECORDED** |
 
@@ -521,7 +523,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | integration lead |
 | branch | `port/rt64-runtime-shader-corpus` -> `main` |
-| dependencies | M2.5.1=RUNNING, M2.5.2=READY |
+| dependencies | M2.5.1=INTEGRATED, M2.5.2=READY |
 | writable paths | `crates/fn64-render-wgpu/src/shaders`, `crates/fn64-render-wgpu/src/shader_manifest.rs`, `docs/RT64-RUNTIME-SHADER-CORPUS.md` |
 | reliability | **NOT RECORDED** |
 
