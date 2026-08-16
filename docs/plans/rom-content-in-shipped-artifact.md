@@ -48,7 +48,7 @@ instead. That is a contained change to one validation path, not a redesign.
 
 ### 1a. `EXPECTED_WORDS` — verbatim, in the executed source, ALREADY SOLVED
 
-`crates/fn64-recomp-rs-codegen/src/emit/mod.rs:594-598` writes each shard's ROM
+`crates/fn64-cpu-runtime-codegen/src/emit/mod.rs:594-598` writes each shard's ROM
 words as a literal array into the runner:
 
 ```rust

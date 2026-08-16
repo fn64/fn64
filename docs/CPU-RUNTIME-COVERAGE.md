@@ -6,7 +6,7 @@ what the *remaining* gap actually is. It answers "how done is the runtime
 replacement" with numbers from live ROM data, not prose.
 
 The measurement is produced by the whole-ROM driver
-`crates/fn64-recomp-rs-codegen/src/bin/recompile_rom.rs`, which runs the recompiler
+`crates/fn64-cpu-runtime-codegen/src/bin/recompile_rom.rs`, which runs the recompiler
 over EVERY function in a ROM without bailing on the first bad one, classifies
 each function, emits the clean bodies as a standalone Rust crate, and writes a
 `gap-report.md`. ROMs and their N64Recomp configs are game-derived content and
@@ -63,7 +63,7 @@ heavily), the whole-function lane omits real code.
 The arbitrary-PC block/interpreter lane is where these cases belong: its AOT
 emitter renders `break`/`syscall`/traps as architectural exceptions and `eret`
 as a typed control transfer (see `crates/fn64-cpu-runtime/src/execution/mod.rs`,
-`crates/fn64-recomp-rs-codegen/src/emit/mod.rs`, and the `ISA-COVERAGE.md` C/P/T/R audit).
+`crates/fn64-cpu-runtime-codegen/src/emit/mod.rs`, and the `ISA-COVERAGE.md` C/P/T/R audit).
 Promoting that lane to the default whole-ROM execution path — not retrofitting
 an exception-return ABI into the whole-function lane — is the work that turns
 "recompiles OoT" into "runs arbitrary N64 ROMs."

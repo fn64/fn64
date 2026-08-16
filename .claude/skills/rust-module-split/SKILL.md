@@ -17,7 +17,7 @@ as the reviewer's gate).
 
 1. **Self-hashing manifests**: `grep -rn 'include_bytes!\|include_str!\|include!(' <crate>/src/`
    Some crates embed their own sources for build receipts
-   (fn64-cpu-runtime and fn64-recomp-rs-codegen lib.rs). Splitting a listed
+   (fn64-cpu-runtime and fn64-cpu-runtime-codegen lib.rs). Splitting a listed
    file REQUIRES enumerating the new paths in the manifest in the same
    commit. Also: coverage TESTS may hardcode path lists
    (rt64 `adapter_source_identity`) even when the hash walker recurses.

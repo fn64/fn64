@@ -4,7 +4,7 @@ use std::process::Command;
 const DEV_INTERPRETER_ARTIFACT_MARKER: &[u8] = b"fn64-cpu-runtime:dev-interpreter:artifact";
 
 /// A symbol only `#[cfg(feature = "dev-interpreter")]` code defines. Several
-/// workspace members (`fn64-abi`, `fn64-recomp-rs-codegen`, the `aot-runtime`
+/// workspace members (`fn64-abi`, `fn64-cpu-runtime-codegen`, the `aot-runtime`
 /// example crates) depend on `fn64-cpu-runtime` with `default-features = false,
 /// features = ["aot-runtime"]`, so `target/debug/deps` routinely holds *both*
 /// a dev-interpreter rlib and one or more aot-runtime-only rlibs side by

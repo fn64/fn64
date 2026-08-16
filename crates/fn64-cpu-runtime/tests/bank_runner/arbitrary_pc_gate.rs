@@ -20,7 +20,7 @@ fn emitted_bank_runner_compiles_and_executes_from_arbitrary_pcs() {
         words: &leaf_words,
     });
     let emitted_leaf_function =
-        fn64_recomp_rs_codegen::emit_function(&fn64_recomp_rs_codegen::FuncInput {
+        fn64_cpu_runtime_codegen::emit_function(&fn64_cpu_runtime_codegen::FuncInput {
             name: "run_leaf_function",
             vram: 0x8000_3000,
             words: &leaf_words,

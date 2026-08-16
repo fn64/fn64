@@ -6,7 +6,7 @@
 //! delay-slot VA is backed by a nonadjacent physical page.
 
 use fn64_cpu_runtime::BankId;
-use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
+use fn64_cpu_runtime_codegen::{emit_bank_runner, BankInput};
 use std::path::PathBuf;
 use std::process::Command;
 

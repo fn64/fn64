@@ -60,7 +60,7 @@
 //!    sweep of actor floats and halfword inputs.
 
 use fn64_cpu_runtime::{decode, Instruction, Rdram, RecompContext};
-use fn64_recomp_rs_codegen::{emit_function_resolved, FuncInput, SymbolTable};
+use fn64_cpu_runtime_codegen::{emit_function_resolved, FuncInput, SymbolTable};
 
 /// Real ROM words of `BgBreakwall_LavaCoverMove` (big-endian, assembled with
 /// `mips-linux-gnu-as -mips64 -EB` and matched to the C disassembly comments).

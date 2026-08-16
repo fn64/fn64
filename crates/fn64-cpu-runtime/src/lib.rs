@@ -1,5 +1,5 @@
 //! `fn64-cpu-runtime`: the linked, all-Rust execution runtime for generated
-//! N64 VR4300 (MIPS III) runners. The separate `fn64-recomp-rs-codegen` crate
+//! N64 VR4300 (MIPS III) runners. The separate `fn64-cpu-runtime-codegen` crate
 //! owns decoding ROM inputs and emitting typed Rust; generated Cargo packages
 //! depend on this crate for architectural state, memory, dispatch, and shared
 //! semantic helpers.
@@ -21,7 +21,7 @@
 //! [`runtime`] generated functions execute against, arbitrary-PC execution,
 //! executable-generation catalogs, and the experimental static micro-op
 //! executor. Whole-ROM drivers, Rust source emission, and emitter-side source
-//! receipts live in `fn64-recomp-rs-codegen`; they are intentionally absent
+//! receipts live in `fn64-cpu-runtime-codegen`; they are intentionally absent
 //! from a generated runner's normal runtime dependency graph.
 //!
 //! The byte-cited distinction between encoding coverage and full architectural

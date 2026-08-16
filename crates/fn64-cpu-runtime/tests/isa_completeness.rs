@@ -3,7 +3,7 @@
 //! 6.3.2 (FCR0/FCR31), 10.8 (LL/SC), and appendix D.2 (division by zero).
 
 use fn64_cpu_runtime::{decode, Instruction, Rdram, RecompContext, RDRAM_VBASE};
-use fn64_recomp_rs_codegen::{emit_function, FuncInput};
+use fn64_cpu_runtime_codegen::{emit_function, FuncInput};
 
 #[test]
 fn decode_missing_primary_slots() {

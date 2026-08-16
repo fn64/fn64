@@ -7,7 +7,7 @@
 
 use fn64_discover::normalize;
 use fn64_cpu_runtime::BankId;
-use fn64_recomp_rs_codegen::{
+use fn64_cpu_runtime_codegen::{
     classify_bank_words, emit_bank_runner, BankInput, BankWordCatalog, BankWordKind,
 };
 use sha2::{Digest, Sha256};

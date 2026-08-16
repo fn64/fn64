@@ -37,7 +37,7 @@ use std::path::PathBuf;
 
 use fn64_recomp::{load_config, Function, RecompConfig, Section};
 use fn64_cpu_runtime::{decode, Instruction};
-use fn64_recomp_rs_codegen::{
+use fn64_cpu_runtime_codegen::{
     emit_function_resolved, emit_lookup_dispatcher, module::SymbolTable, FuncInput,
 };
 
@@ -1059,7 +1059,7 @@ mod tests {
         assert!(manifest.contains("name = \"oot-recompiled\""));
         assert!(manifest.contains("fn64-cpu-runtime = { path = "));
         assert!(manifest.contains("/crates/fn64-cpu-runtime\" }"));
-        assert!(!manifest.contains("fn64-recomp-rs-codegen\" }"));
+        assert!(!manifest.contains("fn64-cpu-runtime-codegen\" }"));
         let lib = report
             .crate_files
             .iter()

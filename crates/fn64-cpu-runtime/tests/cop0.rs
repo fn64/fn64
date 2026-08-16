@@ -37,7 +37,7 @@ use fn64_cpu_runtime::{
     decode, run_bank, BankId, BlockExit, CodeBank, CodeCatalog, ExecutionKey, GuestPc, Instruction,
     InstructionBudget, Rdram, RecompContext,
 };
-use fn64_recomp_rs_codegen::{
+use fn64_cpu_runtime_codegen::{
     emit_bank_runner, emit_function, emit_sparse_bank_runner, BankBlockInput, BankInput, FuncInput,
     SparseBankInput,
 };

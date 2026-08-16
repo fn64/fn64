@@ -20,7 +20,7 @@ fn64-render-reference deterministic pure-Rust ReferenceBackend
 fn64-render-rt64 FFI bridge to RT64 (C++)
 fn64-certification executable behavioral evidence gates over the public renderer seams
 fn64-cpu-runtime  linked typed execution runtime for generated VR4300 Rust runners
-fn64-recomp-rs-codegen  build-side Rust emitter and whole-ROM driver (§1.1's `rs` lane)
+fn64-cpu-runtime-codegen  build-side Rust emitter and whole-ROM driver (§1.1's `rs` lane)
 fn64-recomp  N64Recomp adapter for the comparison lane
 fn64-audio     RSP audio ucode execution
 fn64-diff      the first-divergence comparator, pure/no-I/O (§4's comparator lane)
@@ -186,7 +186,7 @@ already cites RT64's MIT `shared/rt64_color_combiner.h` as its algorithm
 source; reading MIT RT64 is an allowed source under AGENTS.md, GPL runtime
 internals are not.
 
-No longer planned-only: `fn64-recomp-rs-codegen` emits typed Rust against the
+No longer planned-only: `fn64-cpu-runtime-codegen` emits typed Rust against the
 linked `fn64-cpu-runtime` execution runtime. Generated shard crates depend only
 on that runtime package, so an emitter-only edit cannot invalidate their
 normal Cargo dependency edge. `fn64-recomp` remains the N64Recomp comparison
@@ -706,7 +706,7 @@ Generated-runner source identity has a deliberately weaker boundary. The WM
 Cargo build now hashes the exact checked-in root manifest/lock/build/adapter
 sources, the shared shard build/lib sources and all 35 shard manifests. Each
 linked bank binds its complete code words/geometry, generated composite-source
-digest, subrunner count, and adapter role. `fn64-recomp-rs-codegen` issues the
+digest, subrunner count, and adapter role. `fn64-cpu-runtime-codegen` issues the
 exact emitter-source receipt, while `fn64-cpu-runtime` separately issues the
 linked execution/runtime receipt plus its feature receipt. That runtime
 receipt includes `generated_support.rs`, the documented typed cold boundary

@@ -27,7 +27,7 @@ mod support;
 use support::dev_interpreter_rlib;
 
 use fn64_cpu_runtime::BankId;
-use fn64_recomp_rs_codegen::{emit_bank_runner, BankInput};
+use fn64_cpu_runtime_codegen::{emit_bank_runner, BankInput};
 
 const A_VA: u32 = 0x8000_1000;
 const B_VA: u32 = 0x8000_2000;

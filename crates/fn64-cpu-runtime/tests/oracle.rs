@@ -26,7 +26,7 @@
 //! test — this is the strong check, not a bbox/fuzzy one.
 
 use fn64_cpu_runtime::{decode, Instruction, Rdram, RecompContext};
-use fn64_recomp_rs_codegen::{emit_function, FuncInput};
+use fn64_cpu_runtime_codegen::{emit_function, FuncInput};
 
 /// Real ROM bytes of `DynaPoly_IsBgIdBgActor` (big-endian words).
 const DYNAPOLY_WORDS: [u32; 8] = [

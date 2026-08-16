@@ -57,7 +57,7 @@ use support::dev_interpreter_rlib;
 use fn64_cpu_runtime::{
     decode, fpu, round_ties_even_f32, round_ties_even_f64, Instruction, Rdram, RecompContext,
 };
-use fn64_recomp_rs_codegen::{emit_function, FuncInput};
+use fn64_cpu_runtime_codegen::{emit_function, FuncInput};
 
 fn compile_and_run_whole_function(emitted: &str, main_body: &str) -> String {
     let source = format!(

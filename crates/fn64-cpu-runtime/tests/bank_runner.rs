@@ -7,7 +7,7 @@ mod support;
 use support::dev_interpreter_rlib;
 
 use fn64_cpu_runtime::{BankId, BankWordKind};
-use fn64_recomp_rs_codegen::{
+use fn64_cpu_runtime_codegen::{
     classify_bank_words, emit_bank_runner, emit_bank_runner_with_host_calls,
     emit_dense_bank_shard_runner_function, emit_sparse_bank_runner, BankBlockInput, BankInput,
     BankWordCatalog, DenseBankShardInput, DenseEmitError, SparseBankInput,
@@ -926,7 +926,7 @@ println!("in-bank-jalr-resolve-call-ok");
 
 #[test]
 fn legacy_function_runner_snapshots_computed_jr_before_delay_slot() {
-    let emitted = fn64_recomp_rs_codegen::emit_function(&fn64_recomp_rs_codegen::FuncInput {
+    let emitted = fn64_cpu_runtime_codegen::emit_function(&fn64_cpu_runtime_codegen::FuncInput {
         name: "jr_snapshot",
         vram: BASE,
         words: &[0x0100_0008, 0x2408_1234],
