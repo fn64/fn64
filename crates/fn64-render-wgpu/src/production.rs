@@ -561,11 +561,35 @@ fn finalize_with_zero_reads(
 /// attempt whose sole purpose is reading back the real access list via
 /// `JournalMismatch::expected`. Mirrors
 /// `crate::raw_dpc::production_adapter::tests::journal_for`.
+///
+/// The command-decode access's region kind must match `submission.source()`
+/// exactly (`fn64_render_ir::workload::validate_one_to_one_command_reads`
+/// keys a stream's expected read by `RawStreamKind`, not by byte range
+/// alone): `RawDpcSource::Rdram` needs `ResourceRegion::Rdram { resource:
+/// RdramResource::RawCommands, .. }`; `RawDpcSource::XbusDmem` needs
+/// `ResourceRegion::RspDmem(DmemRange)`, the same 4 KiB DMEM-relative
+/// address space `submission.start()`/`end()` are already expressed in for
+/// an XBUS submission (`OwnedRawDpcSubmission::validate_range` bounds XBUS
+/// ranges to `RSP_DMEM_BYTES`, never the RDP's 24-bit physical space).
+///
+/// The TMEM-source access stays `ResourceRegion::Rdram { resource:
+/// RdramResource::Buffer, .. }` for both sources: every admitted TMEM
+/// load's source bytes are RDP-physical RDRAM addresses regardless of which
+/// bus carried the command stream (`crate::raw_dpc::production_adapter`'s
+/// push loop; XBUS changes only where the *command words* come from). For
+/// an XBUS submission this probe access intentionally does NOT reuse
+/// `submission.start()`/`end()` (DMEM-relative, wrong address space for an
+/// RDRAM buffer read) -- it covers the same-sized span at RDRAM offset 0
+/// instead. This is only a self-consistent probe (its own doc comment: read
+/// back the real access list via the deliberate `JournalMismatch` it
+/// causes), never the real journal `plan_raw_dpc_inner` submits for
+/// execution, so its exact placement is arbitrary as long as it lies in
+/// bounds and is internally consistent.
 fn single_source_probe_journal(
     submission: &fn64_render::OwnedRawDpcSubmission,
     layout: fn64_render_ir::PhysicalMemoryLayout,
 ) -> Result<ResourceJournal, ValidationError> {
-    use fn64_render_ir::{OperationId, RdramResource, ResourceRegion};
+    use fn64_render_ir::{DmemRange, OperationId, RdramResource, ResourceRegion};
     let start = submission.start();
     let end = submission.end();
     let command_bytes = u32::try_from(submission.command_words().len() * 4)
@@ -574,18 +598,27 @@ fn single_source_probe_journal(
         OperationId::new(0),
         AccessMode::Read,
         AccessPurpose::CommandDecode,
-        ResourceRegion::Rdram {
-            resource: RdramResource::RawCommands,
-            range: layout.range(start, start + command_bytes)?,
+        match submission.source() {
+            fn64_render::RawDpcSource::Rdram => ResourceRegion::Rdram {
+                resource: RdramResource::RawCommands,
+                range: layout.range(start, start + command_bytes)?,
+            },
+            fn64_render::RawDpcSource::XbusDmem => {
+                ResourceRegion::RspDmem(DmemRange::try_new(start, start + command_bytes)?)
+            }
         },
     )?;
+    let source_bytes = end.saturating_sub(start).max(1);
     let source_access = ResourceAccess::try_new(
         OperationId::new(1),
         AccessMode::Read,
         AccessPurpose::TmemLoadSource,
         ResourceRegion::Rdram {
             resource: RdramResource::Buffer,
-            range: layout.range(start, end)?,
+            range: match submission.source() {
+                fn64_render::RawDpcSource::Rdram => layout.range(start, end)?,
+                fn64_render::RawDpcSource::XbusDmem => layout.range(0, source_bytes)?,
+            },
         },
     )?;
     let accesses = vec![command_access, source_access];
@@ -820,6 +853,25 @@ mod tests {
         )
     }
 
+    /// Same fixture shape as `capture`, but sourced from XBUS/DMEM instead
+    /// of RDRAM -- T4's second ABI producer shape (MMIO XBUS, RSP XBUS).
+    /// `RawDpcSource::XbusDmem` bounds ranges to the 4 KiB DMEM bank
+    /// (`OwnedRawDpcSubmission::validate_range`), unlike the RDRAM-bounded
+    /// `capture` helper above, so this starts at DMEM offset 0.
+    fn xbus_capture(words: Vec<u32>) -> fn64_render::OwnedRawDpcCapture {
+        let layout = fn64_render_ir::PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let start = 0u32;
+        let end = u32::try_from(words.len() * 4).unwrap();
+        let payload: Vec<u8> = words.iter().flat_map(|word| word.to_be_bytes()).collect();
+        let submission = OwnedRawDpcSubmission::from_xbus_payload(start, end, payload).unwrap();
+        fn64_render::OwnedRawDpcCapture::new(
+            submission,
+            layout,
+            7,
+            TemporalBoundary::new(1, DpInterruptState::Clear),
+        )
+    }
+
     /// Drives `backend.plan_raw_dpc` for real (through the two-pass probe
     /// internal to `plan_raw_dpc_inner`), fills the plan's own deferred
     /// guest-read plan with deterministic bytes, and returns the sealed
@@ -975,6 +1027,30 @@ mod tests {
         assert!(
             result.is_err(),
             "FullSync must be rejected, not silently admitted into the plan"
+        );
+    }
+
+    /// T4 characterization: `plan_raw_dpc` must accept a genuinely
+    /// XBUS-sourced capture (`RawDpcSource::XbusDmem`), not only the
+    /// RDRAM-sourced captures every other fixture in this module exercises.
+    /// Regression coverage for the bug this task found and fixed:
+    /// `single_source_probe_journal`'s command-decode access previously
+    /// always declared an RDRAM `RawCommands` region, which
+    /// `validate_one_to_one_command_reads` (fn64-render-ir) rejects for an
+    /// XBUS-sourced stream with `MissingCommandReadDeclaration` -- meaning
+    /// every ABI XBUS producer (MMIO XBUS, RSP XBUS) would have panicked on
+    /// its first `plan_raw_dpc` call the moment a T4 session was
+    /// registered, despite `WgpuBackend`'s own capability advertising
+    /// `TransactionalTmemNoFullSync` with no source-kind carve-out.
+    #[test]
+    fn plan_raw_dpc_accepts_a_genuinely_xbus_sourced_capture() {
+        let (mut backend, session) = WgpuBackend::try_new().unwrap();
+        let request = session.plan_request(xbus_capture(one_load_block_words()));
+        let planned = backend.plan_raw_dpc(request);
+        assert!(
+            planned.is_ok(),
+            "an admitted TMEM-only XBUS capture must plan cleanly: {:?}",
+            planned.err()
         );
     }
 
