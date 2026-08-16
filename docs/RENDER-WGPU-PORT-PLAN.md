@@ -912,7 +912,7 @@ The accelerated wave keeps dependency-safe work active in parallel:
     source/tool/flags/include/output receipts. The fn64 runtime and ordinary
     build consume only accepted artifacts through wgpu; they do not acquire
     DXC, CMake, or the upstream unqualified `dxc-bin`.
-13. **M3.1 -- build the first raw-DPC replay spine (READY).** Drive the
+13. **M3.1 -- build the first raw-DPC replay spine (INTEGRATED).** Drive the
     smallest decode-to-headless-frame path before broad opcode or
     feature-family ports, consuming the accepted M1.2 lifecycle and M2.3
     submission evidence.

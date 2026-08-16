@@ -20,7 +20,7 @@
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, RUNNING:1 |
-| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | RUNNING:1 |
+| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
@@ -373,14 +373,14 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M3` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | wgpu renderer-spine writer |
 | branch | `port/render-wgpu-spine` -> `main` |
 | dependencies | `M1.2`, `M2.3` |
 | writable paths | `crates/fn64-render-wgpu`, `crates/fn64-render-ir/src/ticket.rs`, `crates/fn64-render/src/render_ir.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/DESIGN.md` |
 | started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| verification runs meeting bar | 3/3 |
 
 **Findings:**
 
@@ -388,9 +388,20 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - One small reviewed WGSL fixture may unblock the lifecycle spine while M2.4 independently qualifies the full RT64 HLSL artifact producer; synthetic success cannot close M3 parity.
 - Unknown command/state forms must reject loudly, and no backend completion or staged guest effect may exist before the exact wgpu SubmissionIndex completes and readback is validated.
 - Independent review rejected the first candidate because it accepted and ignored extra declared read inputs instead of enforcing the exact two-access fixture journal.
-- The first candidate also used a wgpu-specific effect-byte hash domain, so identical staged bytes could not satisfy M1.2's backend-neutral guest-commit receipt. Canonical effect content must be owned by fn64-render-ir and shared by both paths.
+- The first candidate also used a wgpu-specific effect-byte hash domain, so identical staged bytes could not satisfy M1.2's backend-neutral guest-commit receipt. Canonical effect content is now owned by fn64-render-ir and shared by both paths.
+- The accepted decoder requires exact ordered equality with one command read and one framebuffer write; extra, reordered, and renumbered journal accesses reject loudly.
+- The accepted typestate retains the submitted ticket, paired completion authority, and exclusive renderer borrow until the exact native SubmissionIndex wait, callback observation, bounded map/readback, byte check, and IR receipt issuance complete.
+- Independent final review accepted the repaired source. This remains a 2x2 synthetic lifecycle mechanism, not RT64 parity, broad RDP decoding, VI, surface presentation, or performance evidence.
 
-**Next action:** Repair the exact ordered journal denominator and canonicalize effect-byte identity in fn64-render-ir, prove the cross-layer M1.2 completion path, then repeat 10 CPU and 20 required-Metal runs plus independent rereview.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-wgpu --lib` | 10 | 10 | deterministic |
+| `cargo test -p fn64-render-wgpu --features host-gpu-tests --lib` | 20 | 20 | concurrency |
+| `cargo test -p fn64-render-ir -p fn64-render-wgpu -p fn64-render --lib --no-fail-fast` | 1 | 1 | single |
+
+**Next action:** Extend the admitted raw-DPC slice toward real native framebuffer and VI/surface presentation while preserving the exact IR journal, completion, and guest-effect ownership boundaries.
 
 ## Regenerating
 
