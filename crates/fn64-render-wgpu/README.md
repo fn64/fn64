@@ -566,6 +566,85 @@ M3.3d's VI register/scale and RGBA5551 sources are recorded beside its code;
 its 256-byte row pitch is explicitly a wgpu mechanism rather than console
 behavior.
 
+## Blender: full selector/cycle semantics (port-card §1)
+
+`blend` is a characterization-first, selective literal port of
+`fn64-render-reference`'s `blend_fragment`/`blend_color`/`blend_a`/`blend_b`
+(`crates/fn64-render-reference/src/raster/blend.rs:157-292`), per
+`/private/tmp/rt64-blender-depth-port-card.md` §1 ("Blender"). It covers the
+full RDP blender: `P`/`M`/`A`/`B` selector semantics for both cycles
+(`BlendColorInput`/`BlendAlphaInput`/`BlendBInput`, resolved from the
+already-landed `state::BlenderCycle` raw 2-bit wire fields rather than a
+duplicate decode), sequential cycle handoff (`Combined` reads the raw source
+on cycle 0 and the running composite on cycle 1), the no-`FORCE_BL`
+last-cycle bypass, the zero-factor (`a==0`/`b==0`) divisor collapse, and the
+`Framebuffer`/`FramebufferAlpha` selectors' hard dependency on a caller-supplied
+memory sample.
+
+Like `depth_strict_less` and `alpha_compare`, `fn64-render-wgpu` has no crate
+dependency on `fn64-render-reference`, so this is a self-contained literal
+re-expression citing the reference's line numbers. `blend_fragment` reuses
+`state::OtherMode`'s `cycle_type`/`force_blend`/`blender_cycle_1`/
+`blender_cycle_2` accessors directly rather than re-decoding those bitfields
+or introducing a second `CycleType`/`BlenderCycle` type.
+
+**Loud rejection, not fallback.** `blend_fragment` returns
+`Result<BlendedFragment, BlendImageReadError>`. Any fragment that reaches a
+`Framebuffer`-color or `FramebufferAlpha` selector without a supplied
+`BlendFramebufferSample` errors with the exact selector name
+(`"framebuffer color"` / `"framebuffer coverage alpha"`), matching the
+reference's `read_framebuffer_memory` panic. This includes a load-bearing,
+non-obvious fact this port's exhaustive test suite caught and pins explicitly
+(`p_selects_framebuffer_still_requires_memory_to_resolve_ps_own_discarded_value`):
+`blend_color` is evaluated for **both** `P` and `M` before the
+`Framebuffer`-dispatch branch runs, exactly mirroring the reference's own
+unconditional `blend.rs:191-192` evaluation order — so a `Framebuffer`
+selector on either input requires a memory sample even when that particular
+input's resolved value is then discarded by the taken branch. This is not a
+simplification introduced by the port; it is a literal, faithful
+reproduction of the reference's evaluation order, verified against it.
+
+**Dual-source WGSL/Rust seam.** The port card poses an open design choice
+between reproducing RT64's actual fixed-function dual-source blend mechanism
+and computing the full software composite in-shader. This module reuses the
+exact contract the already-accepted M2.2 Metal-execution evidence
+(`docs/RT64-PORT-DASHBOARD.md` `M2.2`, `probes/m2-wgpu-metal-headless`) proved
+executable on real wgpu/Metal, rather than inventing a third model:
+`DualSourceBlendOutput` carries the `source`/`source1` pair a real
+`@blend_src(0)`/`@blend_src(1)` fragment shader would emit for
+`wgpu::BlendFactor::Src1`/`OneMinusSrc1` (and `Src1Alpha`/`OneMinusSrc1Alpha`)
+fixed-function blend state, and `manual_blend_composite` performs the exact
+integer fallback arithmetic `(src*factor + dst*(255-factor) + 127) / 255`
+that M2.2's `execute_manual_blend` proved for adapters without
+`wgpu::Features::DUAL_SOURCE_BLENDING`. Neither function reads or writes an
+actual render target, submits a GPU draw call, or claims production
+integration — this is the pre-blend output contract and downstream
+pipeline-state seam, not a claim of current render-target read or draw path.
+
+The retained `shaders/blend.wgsl` is a Naga-validated compute-shader oracle
+over the general A/B divide arithmetic (including the exact zero-factor
+collapse branches), not a compiled render pipeline; it is not wired into any
+draw path, bind group layout, or pipeline used elsewhere in this crate,
+matching `alpha_compare.wgsl`/`depth_strict_less.wgsl`'s precedent.
+
+**Characterization.** The one-cycle selector space (`P`×`M`×`A`×`B` = 256
+combinations) is exhaustively enumerated against an independently-derived
+Rust oracle, crossed with both `force_blend` and `image_read_enabled` (1024
+total cases). Two-cycle mode is covered by curated sequential-handoff cases
+(including the reference's own documented "fog then pass" pattern) rather
+than the full 256² space, per the port card's sampling guidance. Boundary
+alpha/divisor-collapse values, the no-`FORCE_BL` bypass, `IM_RD` legality
+gating, and the dual-source/manual-fallback contract each have dedicated
+tests.
+
+**Nonclaims.** No framebuffer resource binding/readback, raster
+primitive/triangle execution, target storage, coverage/depth ordering
+integration, presentation, native adapter qualification, full-ROM/pixel
+parity, or performance claim. Combiner evaluation, coverage accumulation
+(the `blend_enabled` derivation is caller-supplied, matching the reference's
+own `blend_fragment` signature), alpha compare, depth test, and dither are
+upstream/sibling concerns this module does not implement.
+
 ## Depth: strict-less compare/update (port-card slice 1)
 
 `depth_strict_less` is the smallest fragment-pipeline slice from the
