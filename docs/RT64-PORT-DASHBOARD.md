@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T00:00:00Z` |
+| updated | `2026-08-16T07:46:09Z` |
 
 ## Milestones
 
@@ -19,8 +19,8 @@
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, READY:1, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, RUNNING:1 |
-| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1, RUNNING:1 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:4, READY:1 |
+| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:2 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
@@ -361,32 +361,75 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Prevention: Every probe classifier now starts from exhaustive positive predicates and table-tests all variant/advertisement combinations; timestamp queries use a typed three-submission producer, completion, then resolve lifecycle.
 - Estimated minutes saved: 30
 
-### `M2.4` -- Qualify a licensed reproducible HLSL-to-SPIR-V artifact producer for the complete admitted RT64 shader corpus without adding DXC, CMake, or project-owned C++ to fn64's runtime or ordinary build graph.
+### `M2.4` -- Qualify the licensed, reproducible HLSL-to-SPIR-V source-build, producer, receipt, and validator mechanism for the complete admitted RT64 shader denominator without adding DXC, CMake, or project-owned C++ to fn64's ordinary build graph.
 
 | field | value |
 |---|---|
 | milestone | `M2` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | shader artifact provenance writer |
 | branch | `port/rt64-shader-artifacts` -> `main` |
 | dependencies | `M2.1` |
-| writable paths | `tools/rt64_shader_artifacts.py`, `docs/rt64-shader-artifact-schema.json`, `docs/RT64-SHADER-ARTIFACTS.md`, `docs/rt64-shader-artifacts.json`, `probes/m2-dxc-artifacts` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| writable paths | `tools/rt64_shader_artifacts.py`, `tools/test_rt64_shader_artifacts.py`, `docs/rt64-shader-artifact-schema.json`, `docs/RT64-SHADER-ARTIFACTS.md`, `docs/rt64-shader-source-denominator.json`, `probes/m2-dxc-artifacts`, `scripts/lint-docs.py` |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T07:46:09Z` (elapsed 7h46m) |
+| verification runs meeting bar | 5/5 |
 
 **Findings:**
 
-- Official DXC supports HLSL-to-SPIR-V with explicit entry point, target, defines, include paths, optimization, target environment, validation, and output controls; official stable v1.9.2607 at 0d3ee6b is the current pin candidate.
+- Official DXC supports HLSL-to-SPIR-V with explicit entry point, target, defines, include paths, optimization, target environment, validation, and output controls; official stable v1.9.2607 at 0d3ee6b is the frozen source-build pin.
 - DXC carries a permissive license and ThirdPartyNotices in its official source tree, while RT64's retained dxc-bin bundle lacks the provenance/notices required by M0.1 and remains excluded.
-- The producer must run in an isolated regeneration environment and emit canonical source, include-graph, compiler, flags, preprocessed-input, validation, and artifact digests. Ordinary fn64 builds consume only reviewed artifacts through wgpu.
-- This tooling decision does not block a minimal handwritten M3 vertical-slice shader, but the complete M4 shader corpus and parity claim require the qualified producer. WGSL source modernization remains a post-parity step.
+- The producer must run in an isolated regeneration environment and emit canonical source, include-graph, compiler, flags, preprocessed-input, validation, and artifact digests. Ordinary fn64 builds must consume only reviewed artifacts through wgpu.
+- This tooling decision does not block a minimal handwritten M3 vertical-slice shader, but the complete M4 shader corpus and parity claim require M2.5's qualified artifacts. WGSL source modernization remains a post-parity step.
 - Independent review rejected the first mechanism because its nested validator build inherited unreceipted ancestor Cargo/linker configuration, so the claimed isolated source-build closure was incomplete.
 - The first producer also validated source once and copied denominator hashes into dependency records while invoking preprocess/compile separately, leaving an include/source TOCTOU window. Production must use an immutable hash-verified staged snapshot or equivalent descriptor-stable checks.
 - Rereview rejected the initial repair because ordinary Git object resolution honored replacement refs: a requested pin could resolve a different tree while HEAD still appeared pinned.
 - Rereview also found complete materialized byte/mode/index-mask verification only before configure/build; receipt verification allowed the weaker non-complete audit. Exact source authority must be rechecked after build and again while verifying the receipt.
+- The accepted mechanism disables Git replacement objects, rejects replacement refs/grafts/index masks, and repeats complete materialized byte/mode audits before and after build and during receipt verification.
+- The generated denominator binds 60 calls: 56 SPIR-V variants from 36 HLSL entry sources, three DXIL-only libraries, and one preprocess-only source; its reachable closure contains 86 source files and 137 include edges.
+- Controlled Cargo state and a receipt-bound path remap made two independent standalone-validator builds byte-identical; the local receipt retains the exact digest.
+- Independent final review accepted the mechanism only. No complete official DXC build or 56-artifact corpus was produced, validated, or accepted; M2.5 owns that still-open evidence gate.
 
-**Next action:** Disable and reject Git replacement-object resolution, require complete materialized source audits before and after DXC build and during receipt verification, add hostile replacement/post-build drift tests, then repeat independent review before the 10-run bar.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `python3 -m unittest tools/test_rt64_shader_artifacts.py` | 10 | 10 | deterministic |
+| `cargo test --locked --manifest-path probes/m2-dxc-artifacts/Cargo.toml` | 10 | 10 | deterministic |
+| `python3 tools/rt64_shader_artifacts.py selftest` | 10 | 10 | deterministic |
+| `python3 tools/rt64_shader_artifacts.py check --port-dir <clean port pin> --oracle-dir <clean oracle pin>` | 10 | 10 | deterministic |
+| `python3 tools/rt64_shader_artifacts.py verify-validator-build --build-dir <isolated validator build>` | 10 | 10 | deterministic |
+
+**Next action:** Execute M2.5: build complete official DXC source at the frozen pin, produce and validate all 56 SPIR-V artifacts, and obtain independent receipt/corpus review before any full RT64 shader-corpus claim.
+
+**Retrospective:**
+
+- Friction: Ambient Cargo configuration, Git replacement refs, and source-audit timing each surfaced only in successive review rounds.
+- Cause: The initial task card did not enumerate hostile source-resolution, build-environment, and pre/post-build authority transitions as one review matrix.
+- Prevention: Reuse M2.4's controlled-environment and complete-audit matrix at every external source-build boundary before implementation review.
+- Estimated minutes saved: 30
+
+### `M2.5` -- Execute the accepted M2.4 mechanism against complete official DXC source and qualify all 56 admitted SPIR-V artifacts with independently reviewed source-build, compiler, dependency, validation, and corpus receipts.
+
+| field | value |
+|---|---|
+| milestone | `M2` |
+| state | `READY` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | shader corpus execution lead |
+| branch | `port/rt64-shader-corpus` -> `main` |
+| dependencies | `M2.4` |
+| writable paths | `docs/rt64-shader-artifacts.json`, `docs/RT64-SHADER-ARTIFACTS.md` |
+| started / updated | `2026-08-16T07:46:09Z` / `2026-08-16T07:46:09Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- M2.4 qualified the fail-closed mechanism and denominator, not an official DXC compiler build or shader corpus.
+- The build requires a complete clean checkout of official DXC v1.9.2607 at 0d3ee6b with its exact initialized DirectX-Headers, SPIRV-Headers, and SPIRV-Tools gitlinks; the sparse audit checkout is correctly rejected.
+- All 56 SPIR-V rows and both DXC built-in and standalone wgpu validators must close before M3.3 or M4 may claim admission of the full RT64 shader corpus.
+
+**Next action:** Provision a complete clean official-DXC checkout and isolated build space, run build-dxc/build-validator/produce/verify, then independently review the complete receipts and 56-row denominator before the 10-process bar.
 
 ### `M3.1` -- Create fn64-render-wgpu and execute one receipt-bearing synthetic fill plus FullSync packet through the merged IR and exact wgpu submission lifecycle, without ABI or shell policy.
 
@@ -405,7 +448,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 **Findings:**
 
 - This ticket owns only the bounded headless device, pipeline-prewarm, exact-submission, readback, and backend-effect lifecycle. ABI dispatch, shell policy, surface presentation, VI, and broad RDP decoding remain outside its boundary.
-- One small reviewed WGSL fixture may unblock the lifecycle spine while M2.4 independently qualifies the full RT64 HLSL artifact producer; synthetic success cannot close M3 parity.
+- One small reviewed WGSL fixture may unblock the lifecycle spine while M2.5 independently qualifies the full RT64 HLSL artifact corpus; synthetic success cannot close M3 parity.
 - Unknown command/state forms must reject loudly, and no backend completion or staged guest effect may exist before the exact wgpu SubmissionIndex completes and readback is validated.
 - Independent review rejected the first candidate because it accepted and ignored extra declared read inputs instead of enforcing the exact two-access fixture journal.
 - The first candidate also used a wgpu-specific effect-byte hash domain, so identical staged bytes could not satisfy M1.2's backend-neutral guest-commit receipt. Canonical effect content is now owned by fn64-render-ir and shared by both paths.
@@ -428,25 +471,41 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M3` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | raw-DPC decoder/state writer |
 | branch | `port/m3-raw-dpc-decoder` -> `main` |
 | dependencies | `M3.1` |
 | writable paths | `crates/fn64-render-wgpu/Cargo.toml`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/src/lifecycle.rs`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T07:46:09Z` (elapsed 7h46m) |
+| verification runs meeting bar | 1/1 |
 
 **Findings:**
 
 - The next slice is headless decode/state, not production ABI dispatch or VI/surface: exact framebuffer and TMEM semantics must exist before either boundary can be crossed honestly.
 - Admit only no-op variants, fill-cycle SetOtherMode, SetColorImage, SetFillColor, FillRectangle, and FullSync; unknown, truncated, unsupported, or state-invalid commands reject with workload/stream/chunk/source-offset/opcode context.
 - Use fn64-render's public raw-RDP command-width authority and accept all equivalent two-bit opcode-prefix spellings. RT64 remains candidate semantic evidence rather than parity authority.
-- The decoder and staged persistent state belong to fn64-render-wgpu; fn64-render-ir retains neutral packets/journals/receipts, and fn64-abi must not decode commands or select targets.
+- The decoder and staged transaction-local state belong to fn64-render-wgpu; fn64-render-ir retains neutral packets/journals/receipts, and fn64-abi must not decode commands or select targets.
 - Independent review rejected borrowed-ticket decoding because one submission could mint duplicate move-only staged states; decoding needs a one-use authority.
 - The first candidate accepted raw transaction gaps, incorrectly rejected FullSync's unassigned payload bits, and changed M3.1's exact 8-word bridge into a different 10-word partially checked fixture.
+- The accepted repair consumes SubmittedTicket as one-use decode authority, enforces exact queue/submission and checked transaction succession, accepts FullSync's unassigned payload bits, and restores exact equality for M3.1's four-command/eight-word fixture.
+- The integrated 30-test CPU decoder emits ordered typed commands, a move-only transaction-local staged state delta, and exact resource plans for the bounded no-op/fill/FullSync subset; it does not mutate durable renderer state.
+- Independent review accepted the repaired type/state/fixture contracts. This slice proves no GPU execution, RT64 parity, ABI wiring, TMEM behavior, persistent target ownership, VI/surface presentation, or performance.
 
-**Next action:** Add one-use decode authority, require exact transaction succession, restore general FullSync payload tolerance, preserve M3.1's exact 8-word wire fixture, and repeat independent review before the 10-process bar.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-wgpu --lib` | 10 | 10 | deterministic |
+
+**Next action:** Define and dispatch M3.3's native color/depth, bounded writeback, minimal VI, and headless-capture slice without moving guest-memory/scheduling policy into the renderer or claiming the still-unqualified full shader corpus.
+
+**Retrospective:**
+
+- Friction: The first review had to rediscover linear ticket issuance, exact transaction succession, and frozen-fixture invariants after implementation.
+- Cause: The decoder task card described outputs and errors but did not enumerate one-use capability and predecessor/successor obligations as compile-fail and mutation cases.
+- Prevention: Future lifecycle task cards must list every capability mint, exact successor relation, and frozen predecessor fixture before a writer begins.
+- Estimated minutes saved: 20
 
 ### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
 
