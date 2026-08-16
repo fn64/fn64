@@ -882,7 +882,11 @@ dependencies = [
 name = "fn64-render-conformance"
 version = "0.0.0"
 dependencies = [
+ "fn64-render",
  "fn64-render-ir",
+ "fn64-render-rt64",
+ "fn64-runtime",
+ "libc",
  "serde",
  "serde_json",
 ]

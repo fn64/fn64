@@ -17,9 +17,9 @@ use fn64_render_ir::{
 };
 
 pub const FIXTURE_SCHEMA: &str = "fn64.render-conformance.semantic-fixture.v2";
-pub const RECEIPT_SCHEMA: &str = "fn64.render-conformance.receipt.v5";
-pub const RUN_SERIES_SCHEMA: &str = "fn64.render-conformance.run-series.v4";
-pub const PROCESS_RESULT_SCHEMA: &str = "fn64.render-conformance.process-result.v3";
+pub const RECEIPT_SCHEMA: &str = "fn64.render-conformance.receipt.v6";
+pub const RUN_SERIES_SCHEMA: &str = "fn64.render-conformance.run-series.v5";
+pub const PROCESS_RESULT_SCHEMA: &str = "fn64.render-conformance.process-result.v4";
 pub const REQUIRED_CLEAN_RUNS: usize = 10;
 pub const MAX_OBSERVABLE_BYTES: usize = 256 * 1024;
 pub const MAX_ROW_ID_BYTES: usize = 96;

@@ -17,7 +17,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 #[path = "../wire.rs"]
-#[allow(dead_code)] // Shared binary-private protocol; this test binary owns issuance, not evaluation.
+#[allow(dead_code)]
+// Shared binary-private protocol; this test binary owns issuance, not evaluation.
 mod wire;
 
 use wire::*;
@@ -274,6 +275,7 @@ fn fixture_bundle(options: FixtureOptions) -> Result<Value, Box<dyn std::error::
         "expected_backend_effects": expected_backend_effects,
         "expected_guest_effects": expected_guest_effects,
         "expected_guest_effect_identity": expected_guest_effect_identity,
+        "expected_delegate_identity": null,
     });
     Ok(json!({"replay": replay, "authority": authority}))
 }
@@ -282,12 +284,16 @@ fn run(request: RunnerRequest, behavior: &str) -> Result<Value, Box<dyn std::err
     if request.schema != REQUEST_SCHEMA {
         return Err("wrong runner request schema".into());
     }
+    if behavior == "environment-sentinel" && env::var_os("FN64_CONFORMANCE_ENV_SENTINEL").is_some()
+    {
+        return Err("checker leaked its ambient environment into the runner".into());
+    }
     let validated = validate_replay(&request.replay)?;
     let mut observation = deterministic_observation(&validated);
     let mut effects = deterministic_effects(&validated);
     let mut guest = guest_proof(validated, &effects, &request.challenge)?;
     match behavior {
-        "honest" => {}
+        "honest" | "wrong-pid" | "stdout-hostile" | "environment-sentinel" => {}
         "echo" => observation.bytes_hex = request.replay.record_hex,
         "arbitrary-effects" => {
             if let Some(effect) = effects.first_mut() {
@@ -303,7 +309,9 @@ fn run(request: RunnerRequest, behavior: &str) -> Result<Value, Box<dyn std::err
             if let Some(proof) = guest.as_mut() {
                 let stale = "00".repeat(32);
                 let workload = decode_hex(
-                    proof["workload_identity"].as_str().ok_or("missing workload")?,
+                    proof["workload_identity"]
+                        .as_str()
+                        .ok_or("missing workload")?,
                     "workload",
                 )?;
                 let backend = decode_hex(
@@ -336,9 +344,11 @@ fn run(request: RunnerRequest, behavior: &str) -> Result<Value, Box<dyn std::err
         _ => return Err("unknown runner behavior".into()),
     }
     Ok(json!({
-        "schema": RESULT_SCHEMA, "challenge": request.challenge, "pid": process::id(),
+        "schema": RESULT_SCHEMA, "challenge": request.challenge,
+        "pid": if behavior == "wrong-pid" { process::id().wrapping_add(1) } else { process::id() },
         "execution_status": "completed", "observation": observation,
         "backend_effects": effects, "guest_commit_proof": guest,
+        "delegate_identity": null,
     }))
 }
 
@@ -362,6 +372,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("{}", String::from_utf8(encoded)?);
                 }
             } else {
+                if behavior == "stdout-hostile" {
+                    print!("native diagnostic before JSON\n");
+                }
                 print!("{}", serde_json::to_string(&run(request, behavior)?)?);
             }
         }

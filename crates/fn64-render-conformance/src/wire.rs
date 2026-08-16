@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use fn64_render_conformance::{ContractError, ObservableLayer, RowId, MAX_OBSERVABLE_BYTES};
 
 pub const REPLAY_SCHEMA: &str = "fn64.render-conformance.replay.v1";
-pub const AUTHORITY_SCHEMA: &str = "fn64.render-conformance.private-authority.v1";
+pub const AUTHORITY_SCHEMA: &str = "fn64.render-conformance.private-authority.v2";
 pub const REQUEST_SCHEMA: &str = "fn64.render-conformance.runner-request.v2";
-pub const RESULT_SCHEMA: &str = "fn64.render-conformance.process-result.v3";
+pub const RESULT_SCHEMA: &str = "fn64.render-conformance.process-result.v4";
 pub const INSPECTION_SCHEMA: &str = "fn64.render-conformance.replay-inspection.v1";
 pub const EVALUATION_SCHEMA: &str = "fn64.render-conformance.evaluation.v1";
 pub const GUEST_PROOF_SCHEMA: &str = "fn64.render-conformance.guest-commit-proof.v2";
@@ -35,6 +35,7 @@ pub enum WireError {
     EffectSlot,
     ObservationLayer,
     GuestProof,
+    DelegateIdentity,
     ExecutionStatus,
     Ir(fn64_render_ir::ValidationError),
 }
@@ -87,6 +88,19 @@ pub struct EffectWire {
     pub bytes_hex: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateIdentityWire {
+    pub delegate_kind: String,
+    pub adapter: String,
+    pub adapter_source_sha256: String,
+    pub source_id: String,
+    pub source_provenance: String,
+    pub source_overlay_id: String,
+    pub post_vi_api: String,
+    pub enabled_features: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateAuthority {
@@ -97,6 +111,7 @@ pub struct PrivateAuthority {
     expected_backend_effects: Vec<EffectWire>,
     expected_guest_effects: Vec<EffectWire>,
     expected_guest_effect_identity: Option<String>,
+    expected_delegate_identity: Option<DelegateIdentityWire>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -129,6 +144,7 @@ pub struct ProcessResult {
     pub observation: ObservationWire,
     pub backend_effects: Vec<EffectWire>,
     pub guest_commit_proof: Option<serde_json::Value>,
+    pub delegate_identity: Option<DelegateIdentityWire>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -166,6 +182,7 @@ pub struct Evaluation {
     observation_identity: String,
     backend_effect_identity: String,
     guest_effect_identity: Option<String>,
+    delegate_identity: Option<String>,
 }
 
 pub struct ValidatedReplay {
@@ -406,6 +423,49 @@ fn guest_proof_identity(proof: &GuestCommitProof) -> Result<String, WireError> {
     )))
 }
 
+fn delegate_identity(value: &DelegateIdentityWire) -> Result<ContentDigest, WireError> {
+    if value.delegate_kind.is_empty()
+        || value.adapter.is_empty()
+        || !is_digest(&value.adapter_source_sha256)
+        || value.source_id.is_empty()
+        || value.source_provenance.is_empty()
+        || value.source_overlay_id.is_empty()
+        || value.post_vi_api.is_empty()
+        || value.enabled_features.is_empty()
+        || value
+            .enabled_features
+            .iter()
+            .any(|feature| feature.is_empty())
+        || !value
+            .enabled_features
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(WireError::DelegateIdentity);
+    }
+    let mut fields = vec![
+        value.delegate_kind.as_bytes(),
+        value.adapter.as_bytes(),
+        value.adapter_source_sha256.as_bytes(),
+        value.source_id.as_bytes(),
+        value.source_provenance.as_bytes(),
+        value.source_overlay_id.as_bytes(),
+        value.post_vi_api.as_bytes(),
+    ];
+    fields.extend(value.enabled_features.iter().map(String::as_bytes));
+    Ok(ContentDigest::hash(
+        b"fn64.render-conformance.delegate-identity.v1\0",
+        &fields,
+    ))
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 pub fn evaluate(request: &EvaluationRequest) -> Result<Evaluation, WireError> {
     let replay = validate_replay(&request.replay)?;
     let authority = &request.authority;
@@ -418,6 +478,15 @@ pub fn evaluate(request: &EvaluationRequest) -> Result<Evaluation, WireError> {
     if request.result.schema != RESULT_SCHEMA || request.result.execution_status != "completed" {
         return Err(WireError::ExecutionStatus);
     }
+    if request.result.delegate_identity != authority.expected_delegate_identity {
+        return Err(WireError::DelegateIdentity);
+    }
+    let delegate_identity = request
+        .result
+        .delegate_identity
+        .as_ref()
+        .map(delegate_identity)
+        .transpose()?;
     if request.result.observation.layer != replay.capture_layer.wire_name()
         || authority.expected_observation.layer != replay.capture_layer.wire_name()
     {
@@ -490,6 +559,10 @@ pub fn evaluate(request: &EvaluationRequest) -> Result<Evaluation, WireError> {
         &[&[replay.capture_layer as u8], &observed],
     );
     let guest_tag = guest_identity.as_deref().unwrap_or("");
+    let delegate_tag: &[u8] = delegate_identity
+        .as_ref()
+        .map(|identity| identity.as_ref().as_slice())
+        .unwrap_or(&[]);
     let semantic = ContentDigest::hash(
         b"fn64.render-conformance.semantic-result.v1\0",
         &[
@@ -499,6 +572,7 @@ pub fn evaluate(request: &EvaluationRequest) -> Result<Evaluation, WireError> {
             observation_identity.as_ref(),
             actual_backend.identity().digest().as_ref(),
             guest_tag.as_bytes(),
+            delegate_tag,
         ],
     );
     Ok(Evaluation {
@@ -508,5 +582,6 @@ pub fn evaluate(request: &EvaluationRequest) -> Result<Evaluation, WireError> {
         observation_identity: digest_hex(observation_identity),
         backend_effect_identity: digest_hex(actual_backend.identity().digest()),
         guest_effect_identity: guest_identity,
+        delegate_identity: delegate_identity.map(digest_hex),
     })
 }

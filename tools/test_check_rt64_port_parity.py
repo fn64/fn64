@@ -88,6 +88,62 @@ class ArtifactAuthorityTests(unittest.TestCase):
             registry.load(alias, prefix=("evidence", "rt64-port", "artifacts"))
 
 
+class ProductionControlTests(unittest.TestCase):
+    def test_structural_cli_does_not_execute_registered_evidence(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(CHECKER_PATH), "--structural-only"],
+            cwd=CHECKER_PATH.parent.parent,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        self.assertIn("structurally clean", completed.stdout)
+
+    def test_rejection_guards_are_structural_only(self) -> None:
+        root = CHECKER_PATH.parent.parent
+        manifest = CHECKER.load_json(root / "docs/rt64-port-parity.json")
+        real_validate = CHECKER.validate_manifest
+        calls = 0
+
+        def structural(candidate, candidate_root, *, execute_evidence=True):
+            nonlocal calls
+            calls += 1
+            self.assertFalse(execute_evidence)
+            return real_validate(
+                candidate,
+                candidate_root,
+                execute_evidence=False,
+            )
+
+        with mock.patch.object(CHECKER, "validate_manifest", side_effect=structural):
+            CHECKER.rejection_guards(manifest, root)
+        self.assertGreater(calls, 50)
+
+    def test_qualification_report_retains_fresh_process_evidence(self) -> None:
+        root = CHECKER_PATH.parent.parent
+        manifest = CHECKER.load_json(root / "docs/rt64-port-parity.json")
+        row = next(
+            row
+            for row in manifest["rows"]
+            if row["id"] == "feature::deferred-frame-history"
+        )
+        series = CHECKER.ExecutedSeries(
+            semantic_identity="1" * 64,
+            process_identities=tuple(f"{value:064x}" for value in range(10)),
+            run_identities=tuple(f"{value + 10:064x}" for value in range(10)),
+            series_identity="2" * 64,
+            child_pids=tuple(range(100, 110)),
+            challenges=tuple(f"{value + 20:064x}" for value in range(10)),
+        )
+        report = CHECKER.qualification_report([(row, "RT64_PASS", series)])
+        retained = report["rows"][0]
+        self.assertEqual(report["schema"], "fn64.render-conformance.qualification-report.v1")
+        self.assertEqual(retained["required_run_count"], 10)
+        self.assertEqual(len(set(retained["child_pids"])), 10)
+        self.assertEqual(len(set(retained["challenges"])), 10)
+
+
 class ClosedEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -161,13 +217,17 @@ class ClosedEvidenceTests(unittest.TestCase):
         authority = self.artifact("authority.json", CHECKER.canonical_bytes(authority_value))
         toolchain = subprocess.run(["rustc", "-vV"], text=True, stdout=subprocess.PIPE, check=True).stdout
         closure = {
-            "runner_sha256": runner["sha256"], "source_inputs": sources, "build_inputs": build_inputs,
-            "toolchain": {"rustc_vv": toolchain}, "rt64_source_identity": None,
+            "runner_sha256": runner["sha256"], "verifier_sha256": verifier["sha256"],
+            "source_inputs": sources, "build_inputs": build_inputs,
+            "toolchain": {"rustc_vv": toolchain}, "enabled_features": [],
+            "rt64_source_identity": None,
         }
         receipt_value = {
-            "schema": "fn64.render-conformance.build-receipt.v1", "runner": runner,
+            "schema": "fn64.render-conformance.build-receipt.v2", "runner": runner,
+            "verifier": verifier,
             "source_inputs": sources, "build_inputs": build_inputs, "toolchain": {"rustc_vv": toolchain},
-            "rt64_source_identity": None, "closure_identity": CHECKER.canonical_digest(closure),
+            "enabled_features": [], "rt64_source_identity": None,
+            "closure_identity": CHECKER.canonical_digest(closure),
         }
         receipt = self.artifact("build-receipt.json", CHECKER.canonical_bytes(receipt_value))
         evidence = {
@@ -200,6 +260,136 @@ class ClosedEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(len(set(series.process_identities)), CHECKER.REQUIRED_RUNS)
         self.assertEqual(len(set(series.run_identities)), CHECKER.REQUIRED_RUNS)
+
+    def test_wrong_pid_is_rejected(self) -> None:
+        row, evidence, policies, _, _ = self.execution("wrong-pid")
+        with self.assertRaisesRegex(CHECKER.ParityError, "launched child PID"):
+            CHECKER.execute_qualified(
+                self.root, evidence, row, "rust_port", "RUST_PASS",
+                runner_registry=policies,
+            )
+
+    def test_stdout_hostility_is_rejected(self) -> None:
+        row, evidence, policies, _, _ = self.execution("stdout-hostile")
+        with self.assertRaisesRegex(CHECKER.ParityError, "runner emitted invalid JSON"):
+            CHECKER.execute_qualified(
+                self.root, evidence, row, "rust_port", "RUST_PASS",
+                runner_registry=policies,
+            )
+
+    def test_ambient_loader_interpreter_and_plugin_injection_is_rejected(self) -> None:
+        row, evidence, policies, _, _ = self.execution()
+        for name in (
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "QT_PLUGIN_PATH",
+            "VK_LAYER_PATH",
+            "SDL_DYNAMIC_API",
+            "dyld_insert_libraries",
+        ):
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ, {name: "/tmp/fn64-injection-sentinel"}
+            ):
+                with self.assertRaisesRegex(
+                    CHECKER.ParityError,
+                    "ambient loader/interpreter/plugin injection environment",
+                ):
+                    CHECKER.execute_qualified(
+                        self.root, evidence, row, "rust_port", "RUST_PASS",
+                        runner_registry=policies,
+                    )
+
+    def test_runner_and_verifier_receive_an_empty_environment(self) -> None:
+        row, evidence, policies, _, _ = self.execution("environment-sentinel")
+        real_run = CHECKER.subprocess.run
+        real_popen = CHECKER.subprocess.Popen
+        verifier_calls = 0
+        runner_calls = 0
+
+        def checked_run(*args, **kwargs):
+            nonlocal verifier_calls
+            command = args[0]
+            if Path(command[0]).name == "verifier":
+                verifier_calls += 1
+                self.assertEqual(kwargs.get("env"), {})
+            return real_run(*args, **kwargs)
+
+        def checked_popen(*args, **kwargs):
+            nonlocal runner_calls
+            command = args[0]
+            if Path(command[0]).name in {"runner", "verifier"}:
+                self.assertEqual(kwargs.get("env"), {})
+            if Path(command[0]).name == "runner":
+                runner_calls += 1
+            return real_popen(*args, **kwargs)
+
+        with mock.patch.dict(
+            os.environ, {"FN64_CONFORMANCE_ENV_SENTINEL": "must-not-propagate"}
+        ), mock.patch.object(
+            CHECKER.subprocess, "run", side_effect=checked_run
+        ), mock.patch.object(
+            CHECKER.subprocess, "Popen", side_effect=checked_popen
+        ):
+            CHECKER.execute_qualified(
+                self.root, evidence, row, "rust_port", "RUST_PASS",
+                runner_registry=policies,
+            )
+        self.assertEqual(verifier_calls, CHECKER.REQUIRED_RUNS + 1)
+        self.assertEqual(runner_calls, CHECKER.REQUIRED_RUNS)
+
+    def test_reviewed_cooldown_applies_only_between_runs(self) -> None:
+        row, evidence, policies, _, _ = self.execution()
+        policy = policies["reviewed-runner"]
+        policies["reviewed-runner"] = CHECKER.RunnerPolicy(
+            policy.delegate_kind,
+            policy.runner_path,
+            policy.runner_sha256,
+            policy.build_receipt_path,
+            policy.build_receipt_sha256,
+            policy.verifier_path,
+            policy.verifier_sha256,
+            policy.authority_path,
+            policy.authority_sha256,
+            policy.runner_args,
+            test_only=True,
+            cooldown_milliseconds=1,
+        )
+        with mock.patch.object(CHECKER.time, "sleep") as sleep:
+            CHECKER.execute_qualified(
+                self.root, evidence, row, "rust_port", "RUST_PASS",
+                runner_registry=policies,
+            )
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(0.001)] * (CHECKER.REQUIRED_RUNS - 1),
+        )
+
+    def test_unreviewed_cooldown_is_rejected(self) -> None:
+        row, evidence, policies, _, _ = self.execution()
+        policy = policies["reviewed-runner"]
+        policies["reviewed-runner"] = CHECKER.RunnerPolicy(
+            policy.delegate_kind,
+            policy.runner_path,
+            policy.runner_sha256,
+            policy.build_receipt_path,
+            policy.build_receipt_sha256,
+            policy.verifier_path,
+            policy.verifier_sha256,
+            policy.authority_path,
+            policy.authority_sha256,
+            policy.runner_args,
+            test_only=True,
+            cooldown_milliseconds=CHECKER.MAX_RUNNER_COOLDOWN_MILLISECONDS + 1,
+        )
+        with self.assertRaisesRegex(CHECKER.ParityError, "cooldown is outside"):
+            CHECKER.execute_qualified(
+                self.root, evidence, row, "rust_port", "RUST_PASS",
+                runner_registry=policies,
+            )
 
     def test_synthetic_runner_cannot_enter_production_registry(self) -> None:
         row, evidence, policies, _, _ = self.execution()

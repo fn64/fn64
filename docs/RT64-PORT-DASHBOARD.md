@@ -17,7 +17,7 @@
 
 | ID | state | title | tickets |
 |---|---|---|---|
-| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, READY:1, RUNNING:1 |
+| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, READY_FOR_REVIEW:1, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:4, READY:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:2 |
@@ -512,23 +512,41 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M0` |
-| state | `READY` |
+| state | `READY_FOR_REVIEW` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
-| owner | RT64 oracle-runner writer |
+| owner | /root/a0_4_rt64_runner_impl |
 | branch | `port/rt64-deferred-history-runner` -> `main` |
 | dependencies | `A0.3` |
 | writable paths | `crates/fn64-render-conformance`, `crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md`, `docs/rt64-port-status.json` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T08:44:12Z` (elapsed 8h44m) |
+| verification runs meeting bar | 4/4 |
 
 **Findings:**
 
 - RT64's FullSync handler advances and enqueues an RT64-owned Workload with its own workload ID; the existing shim snapshots that completed Workload under the queue mutex before worker consumption.
 - The first target row is feature::deferred-frame-history. Public FrameStatus and fn64 preflight FullSync are excluded from evidence; the observation projects only fieldwise RT64 workload history plus actual RDRAM effects.
-- Pinned RT64 has no device-free Application setup. Qualification requires a fresh main-thread macOS process, active WindowServer, hidden SDL Metal surface, and no VI/present call.
+- Pinned RT64 has no device-free Application setup. Qualification requires a fresh main-thread macOS process, active WindowServer, and hidden SDL Metal surface. It performs no VI presentation/filter or present call; raw-DPC ingress still refreshes VI register aliases through Context::update_vi.
 - The runner's exact source/build/binary is the trust root and must bind the pinned RT64 source identity, ordinary rt64 feature set, replay, private authority, fresh challenge, child PID, structural workload digest, and guest effects.
+- The production runner accepts only the exact 0x100..0x158 replay and obtains two complete snapshots from the RT64 FullSync/advanceWorkload evidence hook. It validates every field of both snapshots internally and emits the reviewed 104-byte fieldwise-big-endian pre-submission authority projection.
+- The runner never enables present capture or calls present/updateScreen or VI presentation/filter entry points. Raw-DPC ingress still calls Context::update_vi to refresh VI register aliases; that register refresh is not presentation evidence.
+- One final-byte hidden-Metal diagnostic on Apple M5 Pro produced workload 1, present 0, submission frame 0, audited content/identity digests, 2/2/3/6 pair/projection/call/triangle counts, and two 153600-byte guest framebuffer effects with all four guards preserved. Native stdout was isolated on stderr; stdout contained one process-result JSON object, which the Rust verifier classified pass.
+- The checker now binds runner, Rust verifier, private authority, source/build inputs, toolchain, enabled features, pinned RT64 source identity, and runtime delegate identity. Its per-run cooldown is explicit in the reviewed policy, bounded to 5000 ms, and applied only between fresh processes.
+- Independent review found that inherited loader/interpreter/plugin variables could modify a hash-identified child. The checker now rejects dangerous ambient variables and launches both retained runner and retained verifier with an empty environment; hostile tests cover DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, LD_PRELOAD, LD_LIBRARY_PATH, interpreter, plugin, and lowercase aliases.
+- release_environment derives its graphics API from completed present-capture metadata and therefore remains intentionally unusable on this prohibited no-present path; A0.4 does not weaken that authority contract or call it.
+- The reviewed renderer seam exposes Application::chosenGraphicsAPI from the successfully created RT64 device without capture, present, VI presentation/filter, or GPU work. After create with exact NTSC 320x240 config, the runner requires the live observation to be Metal, derives release_identity_for_api from it, and requires the complete active configured policy with no replacement packs.
+- The privacy-clean release closure binds runner 6d0f3a84, verifier 0ad7cb57, 80 source artifacts, four build inputs including the stripped/path-remapped profile, the exact two-feature set, clean pinned RT64 f0728a2, and adapter identity b9978c88. The checker rehashed all 89 consumed artifacts before and after execution.
+- The source-frozen checker qualification completed 10/10 fresh hidden-Metal processes with ten distinct PIDs, challenges, process identities, and run identities. Its semantic identity is 2eed6c8d, series identity d9390eab, and report digest 649e3bec; only feature::deferred-frame-history is RT64_PASS, while its Rust row and the other 49 RT64 observations remain pending.
 
-**Next action:** Implement the production RT64 deferred-history runner and checker cooldown/stdout isolation, prove PipeSync/no-arm/double-FullSync/mutation cases reject, then execute ten fresh checker-owned hidden-Metal processes before promoting only that RT64 row.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-conformance --features conformance-test-runner --all-targets && python3 -m unittest tools/test_check_rt64_port_parity.py` | 1 | 1 | single |
+| `FN64_RT64_DIR=/Users/jer/Code/no-mercy-recompiled/third_party/rt64 cargo test -p fn64-render-conformance --features rt64-deferred-history-runner --bin fn64-render-conformance-rt64-deferred-history-runner` | 1 | 1 | single |
+| `env -i target/debug/fn64-render-conformance-rt64-deferred-history-runner run < /private/tmp/fn64-a0-4-request-final.json > /private/tmp/fn64-a0-4-result-final.json 2> /private/tmp/fn64-a0-4-native-final.stderr (approved WindowServer access; pre-registration diagnostic)` | 1 | 1 | single |
+| `python3 tools/check_rt64_port_parity.py --qualification-output evidence/rt64-port/artifacts/deferred-frame-history/qualification-report.json (approved WindowServer access)` | 10 | 10 | deterministic |
+
+**Next action:** Review the exact retained closure and 10-process qualification report, then integrate this uncommitted branch without promoting any Rust-port row or another RT64 row.
 
 ## Regenerating
 
