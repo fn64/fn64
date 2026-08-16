@@ -41,6 +41,16 @@ def require_sha(value: object, label: str) -> str:
     return value
 
 
+def load_exact_pretty_json_bytes(value: bytes, label: str) -> dict:
+    try:
+        result = json.loads(value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise base.ArtifactError(f"{label} is malformed: {error}") from error
+    base.require(isinstance(result, dict), f"{label} must contain a JSON object")
+    base.require(base.pretty_json(result) == value, f"{label} is not exact pretty JSON")
+    return result
+
+
 def load_policy() -> dict:
     policy = base.load_json(POLICY_PATH)
     base.require_keys(policy, {
@@ -140,11 +150,7 @@ def verify_reference_inputs(args: argparse.Namespace, policy: dict) -> dict:
     receipt_bytes, info = base.stable_regular_bytes(receipt_path, policy["limits"]["maximum_receipt_bytes"], "accepted reference receipt")
     base.require(info.st_nlink == 1, "accepted reference receipt has another hardlink")
     base.require(base.digest_bytes(receipt_bytes) == policy["reference_corpus"]["receipt_file_sha256"], "accepted reference receipt file identity changed")
-    try:
-        receipt = json.loads(receipt_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise base.ArtifactError(f"accepted reference receipt is malformed: {error}") from error
-    base.require(base.canonical_json(receipt) == receipt_bytes, "accepted reference receipt is not canonical")
+    receipt = load_exact_pretty_json_bytes(receipt_bytes, "accepted reference receipt")
     expected = policy["reference_corpus"]
     base.require(receipt.get("schema") == expected["receipt_schema"], "accepted reference receipt schema changed")
     base.require(receipt.get("receipt_sha256") == expected["receipt_sha256"], "accepted reference receipt identity changed")

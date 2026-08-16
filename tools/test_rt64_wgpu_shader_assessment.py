@@ -80,6 +80,29 @@ class PolicyTests(unittest.TestCase):
             subject.load_policy()
 
 
+class ReferenceReceiptSerializationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.value = {"schema": "fixture.v1", "nested": {"b": 2, "a": 1}}
+
+    def test_accepts_exact_pretty_json(self) -> None:
+        self.assertEqual(subject.load_exact_pretty_json_bytes(base.pretty_json(self.value), "fixture"), self.value)
+
+    def test_rejects_compact_canonical_json(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "not exact pretty JSON"):
+            subject.load_exact_pretty_json_bytes(base.canonical_json(self.value), "fixture")
+
+    def test_rejects_whitespace_mutation(self) -> None:
+        mutated = base.pretty_json(self.value).replace(b"  ", b"    ", 1)
+        with self.assertRaisesRegex(base.ArtifactError, "not exact pretty JSON"):
+            subject.load_exact_pretty_json_bytes(mutated, "fixture")
+
+    def test_rejects_field_order_mutation(self) -> None:
+        mutated = (json.dumps(self.value, indent=2, sort_keys=False) + "\n").encode()
+        self.assertNotEqual(mutated, base.pretty_json(self.value))
+        with self.assertRaisesRegex(base.ArtifactError, "not exact pretty JSON"):
+            subject.load_exact_pretty_json_bytes(mutated, "fixture")
+
+
 class ClassificationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = subject.load_policy()
