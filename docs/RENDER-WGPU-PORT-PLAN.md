@@ -205,13 +205,14 @@ selected adapter's integer/TMEM, binding-array, fractional blend, explicit
 format-I/O, and invalid-reinterpretation behavior. Exact submission ownership,
 timestamp validity, and the shader-compute N64 coverage path remain M2.3 work.
 
-**Outcome:** M0.3 is in progress on an unintegrated measurement slice. Its
-proposed schema permits an honest `development` report with explicit
-unavailable metrics while reserving summaries and comparisons for
-`comparison_ready` reports. That slice is not an authority on `main` until its
-checker, bounded JSONL trace, headless route, and baseline cohort pass review
-and merge. Raw advances must retain committed VI fields and guest cycles
-instead of pretending every advance is one field.
+**Outcome:** M0.3 remains open. An unintegrated schema/checker slice defines an
+honest `development` report with explicit unavailable metrics and exact
+cross-field validation. It does not implement a bounded JSONL trace, raw
+sample ABI, shell emitter, headless executor, or baseline collector. The only
+declared route cannot observe physical presentation, so the checker must reject
+every current attempt to claim `comparison_ready`. Raw advances will need to
+retain committed VI fields and guest cycles instead of pretending every
+advance is one field.
 
 **Inventory decision:** existing fn64 CPU/frame-census observations are
 usable only with their exact boundaries. The native RT64 rolling timer names
@@ -221,11 +222,13 @@ queue-wait, allocation, shader/PSO, full GPU-pass, total VRAM, and physical
 presentation observations remain partial or missing and are the M0.3 work
 queue. Missing and unarmed channels cannot appear as zero-cost work.
 
-**Route decision:** the M0.3 benchmark route is a new headless branch in
-`fn64-shell`, immediately after `Shell::boot` and before the `EventLoop`, using
-`Shell::pump_one_frame`. It reuses the established RT64 device and excludes a
-second `pixels`/wgpu compositor. The route owns a deterministic neutral
-boot/title-v2 identity: boot-complete start, the already-admitted owned ROM,
+**Route decision:** the first M0.3 benchmark route is specified as a future
+headless branch in `fn64-shell`, immediately after `Shell::boot` and before the
+`EventLoop`, using `Shell::pump_one_frame`. No such measurement branch or JSON
+emitter exists in the current tree. The proposed route reuses the established
+RT64 device and excludes a second `pixels`/wgpu compositor. It must own a
+deterministic neutral boot/title-v2 identity: boot-complete start, the
+already-admitted owned ROM,
 blank in-memory SRAM, literal neutral controller state, no ambient frontend,
 an empty controller-command stream, a graphics-submit warmup threshold, and
 an exact retained VI-advance horizon. All inherited `FN64_`, `OOT_`, and
@@ -237,63 +240,23 @@ and outside the measured horizon because its readback/wait perturbs timing.
 Each final repetition is a fresh process; five counterbalanced control/
 instrumented pairs are required.
 
-**Implemented route, not yet an honest comparison:** `fn64-abi` exposes an
-owned raw frame-census measurement snapshot. `fn64-certification` can build a
-typed control report and an explicit-partial instrumented development report.
-The RT64 adapter queries its active graphics API without present capture. The
-headless shell path executes `Shell::pump_one_frame` outside the winit/pixels
-compositor, and `tools/run_rt64_render_baseline.py` launches five
-counterbalanced control/instrumented pairs as fresh processes. Semantic and
-command-level FullSync roots now accumulate at committed ABI boundaries;
-native-framebuffer and post-VI hashes come from one capture-only VI advance
-after the timed horizon. Its move-only token unregisters native capture work on
-take, failure, explicit cancellation, or drop. Program/build/host/GPU/display
-identity is now build-issued or observed. A control run can become
-`comparison_ready` only after the post-create verifier
-completes and both horizon endpoint observations are available and unchanged.
-The window begins only after warmup and atomically rebases wall, guest,
-counter, graphics, and sample state. Instrumented runs remain `development`
-until all required native
-channels and trace evidence exist. No real matched baseline has been recorded.
+**Implementation frontier:** `fn64-abi` currently exposes only its aggregate
+frame-census snapshot; there is no raw per-advance snapshot, post-warmup rebase,
+or report-emission ABI. No shell or certification path emits this schema and
+`tools/run_rt64_render_baseline.py` deliberately has no `--run` mode. The
+checker validates exact nested keys and types, finite minima, sample order,
+horizon/census and derived-latency equality, metric state/value shapes,
+and path-free strings. V1 deliberately defers cohort acceptance because it
+does not encode pair/repetition ordinals or requested/observed horizon and
+workload boundaries; a false two-report gate is not retained. It does not
+create a synthetic `comparison_ready` fixture. No private linked build was
+exercised and no real matched baseline has been recorded.
 
-The C-RecompiledFuncs shell build now emits a path-free receipt over the exact
-generated-code and section-bridge archives, a separately domain-separated
-dispatch-source closure, Cargo target/profile/features, the effective
-`rustc -vV`, and fn64 Git HEAD/clean state. Those fields replace request
-placeholders before publication. The content-free build emits no receipt, and
-the Rust-recompiled lane fails measurement admission until its generator issues
-canonical native-program and dispatch identities; hashing an arbitrary source-
-tree walk would not be an honest substitute. This mechanism passed content-free
-unit tests but has not been exercised with private linked game inputs in this
-session.
-
-**Verification frontier:** the full no-feature `fn64-abi` library suite passed
-once after the post-warmup observation and per-call FullSync corrections (388
-passed, 7 ignored). The focused renderer-measurement group passed 10/10 clean
-process runs; the correctness-root and resumable-FullSync groups also passed
-10/10 before the final measurement-only overflow guard. RT64 feature tests
-passed earlier (67/67).
-The complete 60-test shell binary suite passed 10/10 consecutive runs. The
-one-shot census tests passed 20/20 consecutive runs and name the closed
-two-caller erase interleaving at the transition. The current 38-case
-measurement checker passed 10/10 separate processes. The eight-test runner
-suite passed 10/10; every run includes a self-test that launches ten unique,
-counterbalanced child processes. The forced linked-route compile passed once,
-but used content-free build inputs and is syntax/integration evidence only.
-This closes the current deterministic schema/runner and local route receipt,
-not the private linked-build or real matched-baseline gates.
-
-**Closed correctness review:** the post-VI digest includes renderer-owned
-extension rows, observed device atoms are revalidated, and the runner requires
-all five controls to form one correctness/identity cohort. The typed boot
-consumes the admitted ROM bytes once, uses blank in-memory SRAM and fixed route
-policy, never constructs host input/config/overlay state, and cannot fall back
-to the reference renderer. Pre/post one-minute load and thermal/power
-conditions are collector-observed immediately around the rebased horizon;
-unavailable coarse conditions force development tier. The independent Python
-validator mirrors positive-field, nonzero-graphics, classification, ordinal,
-bounded atom, condition-enum, and metric-state rules. `armed_not_reached`
-metrics are accepted only with zero values.
+The next implementation slice must add the Rust raw-sample ABI and shell JSON
+emitter together, issue canonical program/build/GPU identity rather than
+accepting request placeholders, and add a presentation-capable route before a
+comparison cohort can exist. The runner and native measurement gates remain
+separate work after that seam is reviewed.
 
 **Delegation:** the integration lead/reviewer is `F/xhigh` (currently GPT-5.6
 Sol, with an Opus-class equivalent acceptable). Active writers are `I/high`
@@ -308,11 +271,10 @@ implementation and independent-review lanes when the session's orchestration
 interface exposes it; no Claude worker is active in this session's currently
 advertised GPT-only collaborator pool.
 
-**Next action:** review and integrate the trace wire, generated port inventory,
-and semantic-IR spine. Then dispatch disjoint raw decode/TMEM, framebuffer/VI,
-and GPU capability slices. In parallel, exercise the C-program receipt, native
-identity query, and v2 neutral route when a clean private linked build is
-available; do not label RT64 GUI timer rings as the new spans.
+**Next action:** independently review and integrate the closed M0.3 schema and
+checker, then implement its raw-sample ABI and shell emitter as a distinct
+ticket before authoring a native runner. Renderer implementation proceeds in
+parallel; do not label RT64 GUI timer rings as the new spans.
 
 **Worktree note:** at plan creation, unrelated shell/frontend/example changes
 were already present. They were not modified by this planning work and remain
@@ -873,14 +835,12 @@ The accelerated wave keeps dependency-safe work active in parallel:
 2. **M0.2 -- define the trace and benchmark schema (COMPLETE).** Includes semantic events,
    memory effects, GPU timestamps, allocations, bytes, waits, shader keys,
    queue depth, VRAM, present provenance, and all environment identities.
-3. **M0.3 -- capture the matched baseline (IN PROGRESS).** The route and
-   snapshot/report/API-identity seams and fresh-process runner are present.
-   Observation-derived correctness, workload, program/build, host, GPU, and
-   display identities, typed neutral boot, exact horizon boundary, and
-   post-horizon capture are present; validate them in a clean linked private
-   route, then run five independent unprofiled repetitions plus
-   counterbalanced instrumented controls on the declared route. No matched
-   baseline exists.
+3. **M0.3 -- capture the matched baseline (IN PROGRESS).** The unintegrated
+   schema/checker mechanism is under review. Raw snapshot, rebase, emitter,
+   native runner, presentation-capable route, and all matched measurements are
+   absent. Implement those seams before running five independent unprofiled
+   repetitions plus counterbalanced instrumented controls. No matched baseline
+   exists.
 4. **A0.1 -- generate the source/task denominator (INTEGRATED).** The dual-pin
    inventory covers 276 admitted files / 48.065 KLOC and every authority gate.
 5. **A0.2 -- workflow dashboard (INTEGRATED).** The strict canonical
@@ -1017,13 +977,10 @@ candidate's required native evidence remains open in the authority report.
 - `git diff --check`: clean.
 
 M0.2 establishes measurement comparability, not a speed result. Its historical
-10/10 receipt predates M0.3's corrected development/comparison-ready handling;
-the amended 38-case checker subsequently passed a fresh 10/10 separate-process
-receipt during M0.3. The current 60-test shell route passed 10/10, the exact
-one-shot census boundary passed 20/20 for its named race interleaving, and the
-eight-test runner suite passed 10/10 with ten unique child processes per run.
-M0.3 still owns all matched native baseline numbers and the missing
-instrumentation.
+10/10 receipt predates M0.3's development/comparison-ready distinction and
+does not prove a raw-sample ABI, shell emitter, native runner, or baseline.
+Those mechanisms are absent from the current tree. M0.3 still owns all matched
+native baseline numbers and the missing instrumentation.
 
 ## End-of-session handoff template
 
