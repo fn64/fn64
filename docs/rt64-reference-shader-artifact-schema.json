@@ -1,13 +1,34 @@
 {
-  "schema": "fn64.rt64-reference-shader-policy.v1",
+  "schema": "fn64.rt64-reference-shader-policy.v2",
   "direct_consumers": [
     "tools/rt64_reference_shader_artifacts.py",
     "tools/test_rt64_reference_shader_artifacts.py"
   ],
-  "receipt_schema": "fn64.rt64-reference-shader-receipt.v1",
+  "receipt_schema": "fn64.rt64-reference-shader-receipt.v2",
   "spirv_val_build_receipt_schema": "fn64.spirv-val-source-build.v1",
-  "spirv_val_smoke_receipt_schema": "fn64.spirv-val-single-artifact-smoke.v1",
-  "spirv_val_smoke_claim_boundary": "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
+  "spirv_val_smoke_receipt_schema": "fn64.spirv-val-single-artifact-smoke.v2",
+  "spirv_val_smoke_claim_boundary": "conditionally-reference-valid-with-scalar-layout-contract-and-inventoried-not-artifact-provenance-corpus-adapter-wgpu-pipeline-runtime-parity-or-performance",
+  "device_contract": {
+    "schema": "fn64.vulkan-scalar-block-layout-device-contract.v1",
+    "api": "Vulkan",
+    "target_environment": "vulkan1.0",
+    "required_extensions": [
+      "VK_EXT_scalar_block_layout"
+    ],
+    "required_features": [
+      {
+        "name": "scalarBlockLayout",
+        "value": true
+      }
+    ],
+    "validator_mode": "vulkan1.0-scalar-block-layout",
+    "validator_argv": [
+      "--target-env",
+      "vulkan1.0",
+      "--scalar-block-layout",
+      "-"
+    ]
+  },
   "artifact_producer": {
     "path": "tools/rt64_shader_artifacts.py",
     "sha256": "b8db5cbcaa0caef60ec3c84a966917d246e25df882ae44951541e65720630d33"
@@ -110,10 +131,6 @@
       "build/Debug/tools/spirv-val.exe",
       "build/Release/tools/spirv-val.exe"
     ],
-    "validation_arguments": [
-      "--target-env",
-      "vulkan1.0"
-    ],
     "maximum_binary_bytes": 67108864,
     "maximum_build_manifest_bytes": 16777216,
     "maximum_smoke_inventory_rows": 65536,
@@ -128,9 +145,9 @@
   },
   "required_validation": [
     "dxc-built-in-spirv-validation",
-    "spirv-tools-spirv-val-vulkan1.0",
+    "spirv-tools-spirv-val-vulkan1.0-scalar-block-layout-device-contract",
     "grammar-bound-capability-extension-nonuniform-inventory"
   ],
   "maximum_receipt_bytes": 8388608,
-  "claim_boundary": "reference-valid-only-not-wgpu-runtime-or-parity"
+  "claim_boundary": "conditionally-reference-valid-with-scalar-layout-contract-not-adapter-wgpu-pipeline-runtime-parity-or-performance"
 }
