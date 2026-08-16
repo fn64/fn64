@@ -1022,6 +1022,14 @@ target_include_directories(rt64 PRIVATE
 # checks keep the overlay tied visibly to the reviewed pinned MIT source.
 set(FN64_RT64_RASTER_SHADER_CACHE_SOURCE
     "${FN64_RT64_SOURCE_DIR}/src/render/rt64_raster_shader_cache.cpp")
+file(SHA256
+    "${FN64_RT64_RASTER_SHADER_CACHE_SOURCE}"
+    FN64_RT64_RASTER_SHADER_CACHE_SHA256)
+if(NOT FN64_RT64_RASTER_SHADER_CACHE_SHA256 STREQUAL
+   "0d8ea6d1d24fc3aaf4ebdbf2afaeea9e477d413330e913c34831baabc6bdee83")
+    message(FATAL_ERROR
+        "RT64 raster-shader cache changed; review the fn64 predicate overlay")
+endif()
 file(READ
     "${FN64_RT64_RASTER_SHADER_CACHE_SOURCE}"
     FN64_RT64_RASTER_SHADER_CACHE_CONTENTS)
@@ -1225,6 +1233,14 @@ endif()
 if(APPLE)
     set(FN64_PLUME_METAL_SOURCE
         "${FN64_RT64_SOURCE_DIR}/src/contrib/plume/plume_metal.cpp")
+    file(SHA256
+        "${FN64_PLUME_METAL_SOURCE}"
+        FN64_PLUME_METAL_SHA256)
+    if(NOT FN64_PLUME_METAL_SHA256 STREQUAL
+       "73d8405d19623329e0bdc9dc4a6c1f07dd79f8c46e7488da32978bd4e17e3e6d")
+        message(FATAL_ERROR
+            "plume Metal source changed; review whether the fn64 lifetime overlay is still required")
+    endif()
     file(READ "${FN64_PLUME_METAL_SOURCE}" FN64_PLUME_METAL_CONTENTS)
     set(FN64_PLUME_COMMAND_BUFFER_ACQUIRE
         "        mtl = queue->mtl->commandBufferWithUnretainedReferences();\n        mtl->setLabel(MTLSTR(\"RT64 Command List\"));")

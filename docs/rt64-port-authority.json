@@ -1,0 +1,351 @@
+{
+  "schema_version": 1,
+  "reviewed_on": "2026-08-15",
+  "repository": "https://github.com/rt64/rt64",
+  "oracle": {
+    "commit": "f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "source_id": "git:f0728a2520d5aa735886240de3fee75cc805f6d6",
+    "status": "active-gated",
+    "license": "MIT",
+    "license_path": "LICENSE",
+    "license_sha256": "03d52856ed09784f7f57694f690ab0093d3cd40db69f9a318d45062f130f7116",
+    "gitmodules_sha256": "74ea60dd0d82be7798fc5eab917dfc1251e4d30ae0a28ea1a55672b5bb680c84"
+  },
+  "port_source": {
+    "commit": "5473732a822a4423b5696e7cb18fecc425a59875",
+    "status": "reviewed-not-runtime-qualified",
+    "commits_ahead_of_oracle": 9,
+    "main_checked_on": "2026-08-15",
+    "disposition": "accepted-port-input-retain-old-oracle",
+    "reason": "The candidate contains merged TMEM/framebuffer synchronization and viewport-aware draw-region fixes plus an upstream Plume lifetime redesign. It is the intended semantic source for the Rust port, but it changes source-bound behavior and invalidates every retained native RT64 receipt. The old pin remains the executable oracle until the candidate-specific overlay removal, build, repeated Metal matrix, focused new fixtures, and private full-ROM exact-ten series pass."
+  },
+  "overlays": {
+    "default_id": "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3",
+    "hfr_id": "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3+hfr-post-present-call:v1",
+    "source_gates": [
+      {
+        "path": "src/gbi/rt64_gbi_s2dex.cpp",
+        "sha256": "7c8e779092eb7e2ddc8794694c0c04176a3e29958dc288952d577750673acc3f",
+        "mechanisms": ["s2dex-object-rect:v3"],
+        "port_milestone": "M5"
+      },
+      {
+        "path": "src/shaders/RasterPS.hlsl",
+        "sha256": "957b283411550457573421015580f84ca750c68a050981dbc1a4fe2634507820",
+        "mechanisms": ["rdp-alpha-dither:v1", "rdp-shared-fragment-noise:v1"],
+        "port_milestone": "M4"
+      },
+      {
+        "path": "src/render/rt64_raster_shader.cpp",
+        "sha256": "5e5de4bbd8a22192e857c277bae5af033b8606a6464aa73863d2efe0fd0a0d4d",
+        "mechanisms": ["rdp-alpha-dither:v1", "rdp-shared-fragment-noise:v1"],
+        "port_milestone": "M4"
+      },
+      {
+        "path": "src/render/rt64_shader_library.cpp",
+        "sha256": "72421375b232d5449f2f90f153c8452420084f43809c3234bc9727eddfde6ffd",
+        "mechanisms": ["vi-gamma-dither:v1", "vi-dither-filter:v1", "vi-divot:v1", "vi-silhouette-aa:v1"],
+        "port_milestone": "M4"
+      },
+      {
+        "path": "src/render/rt64_vi_renderer.cpp",
+        "sha256": "0159b441fd4872ef30a49d7603f4570d8858084004c20dd6646f51039241fa7b",
+        "mechanisms": ["vi-gamma-dither:v1", "vi-dither-filter:v1", "vi-divot:v1", "vi-silhouette-aa:v1"],
+        "port_milestone": "M4"
+      },
+      {
+        "path": "src/hle/rt64_state.cpp",
+        "sha256": "07d3a7c1e2fa455aedff045d0ec19d52cea9616e1e4d41e99dad833b61a4cda2",
+        "mechanisms": ["vi-retrace-cadence:v1"],
+        "port_milestone": "M3"
+      },
+      {
+        "path": "src/hle/rt64_interpreter.cpp",
+        "sha256": "cd91e76019205296b0ff9a52d4b477d45959243302c218c3c047d9328e66a7d2",
+        "mechanisms": ["ucode-generation-admission:v1"],
+        "port_milestone": "M5"
+      },
+      {
+        "path": "src/render/rt64_raster_shader_cache.cpp",
+        "sha256": "0d8ea6d1d24fc3aaf4ebdbf2afaeea9e477d413330e913c34831baabc6bdee83",
+        "mechanisms": ["raster-shader-start-stop:v1"],
+        "port_milestone": "M6"
+      },
+      {
+        "path": "src/hle/rt64_vi.cpp",
+        "sha256": "9b3cf39bb15fc0c7d52085566197042f4960cc410b241e38457bb817f2501e5b",
+        "mechanisms": ["vi-region-rate:v1"],
+        "port_milestone": "M8"
+      },
+      {
+        "path": "src/hle/rt64_present_queue.cpp",
+        "sha256": "023dc3f4bc74bf6863e37ad1781fb32eaa543a7713bd8b9a3757b2262a1a1e52",
+        "mechanisms": ["hfr-post-present-call:v1"],
+        "port_milestone": "M8"
+      },
+      {
+        "path": "src/contrib/plume/plume_metal.cpp",
+        "sha256": "73d8405d19623329e0bdc9dc4a6c1f07dd79f8c46e7488da32978bd4e17e3e6d",
+        "mechanisms": ["plume-metal-lifetime:v1"],
+        "port_milestone": "M10"
+      }
+    ]
+  },
+  "submodules": [
+    {
+      "path": "src/contrib/ddspp",
+      "oracle_revision": "21ca0c4319dfd5a161c5f2a0c406e8f60194ea6c",
+      "port_revision": "21ca0c4319dfd5a161c5f2a0c406e8f60194ea6c",
+      "license": "MIT",
+      "license_path": "src/contrib/ddspp/LICENSE",
+      "license_sha256": "bec2b85d3040e8f9de15f52e26b29311959d978bfb03ff941b699d7642a17868",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/dxc",
+      "oracle_revision": "cc15e715ee378a4f675b335bd1071ff105873fc8",
+      "port_revision": "cc15e715ee378a4f675b335bd1071ff105873fc8",
+      "license": "NOASSERTION",
+      "license_path": null,
+      "license_sha256": null,
+      "admission": "blocked-windows",
+      "note": "The binary bundle has no retained LICENSE or NOTICE. Windows links dxcompiler.lib and copies DXC DLLs; source-build provenance or notices are required before distribution certification."
+    },
+    {
+      "path": "src/contrib/hlslpp",
+      "oracle_revision": "6f5274c66132e8f951c400103d897582b8f21491",
+      "port_revision": "6f5274c66132e8f951c400103d897582b8f21491",
+      "license": "MIT",
+      "license_path": "src/contrib/hlslpp/LICENSE",
+      "license_sha256": "296a74cb0ec3974aa74fc77f547663e0a0c1a8e803d177ece3ce82a94188aa23",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/im3d",
+      "oracle_revision": "d03941725fd0bd08c78c46e3e5b0265526e9d060",
+      "port_revision": "d03941725fd0bd08c78c46e3e5b0265526e9d060",
+      "license": "MIT",
+      "license_path": "src/contrib/im3d/LICENSE",
+      "license_sha256": "1f19ce7ee7da440b1ba52c753f299d76ff87052b219ef535c8aa40fbe9f04900",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/imgui",
+      "oracle_revision": "277ae93c41314ba5f4c7444f37c4319cdf07e8cf",
+      "port_revision": "277ae93c41314ba5f4c7444f37c4319cdf07e8cf",
+      "license": "MIT",
+      "license_path": "src/contrib/imgui/LICENSE.txt",
+      "license_sha256": "0ebf8feb061536bdebd7c6a365b64808ae3479048b1c44113e19037680c5f2be",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/implot",
+      "oracle_revision": "f156599faefe316f7dd20fe6c783bf87c8bb6fd9",
+      "port_revision": "f156599faefe316f7dd20fe6c783bf87c8bb6fd9",
+      "license": "MIT",
+      "license_path": "src/contrib/implot/LICENSE",
+      "license_sha256": "38bd30c2111fe7e3d8fb86d8607491239659eff1df1b1004b9a8349e20a91967",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/mupen64plus-core",
+      "oracle_revision": "860fac3fbae94194a392c1d9857e185eda6d083e",
+      "port_revision": "860fac3fbae94194a392c1d9857e185eda6d083e",
+      "license": "GPL-2.0-only",
+      "license_path": "src/contrib/mupen64plus-core/LICENSES",
+      "license_sha256": "9965cd2096de0bf94290b9004c27760c7e738202313b32137ba909686e3aa86a",
+      "admission": "excluded",
+      "note": "Only API include paths exist in upstream configuration. No source is compiled or linked into fn64_rt64_shim; the emulator plugin target must remain disabled."
+    },
+    {
+      "path": "src/contrib/mupen64plus-win32-deps",
+      "oracle_revision": "de8111fdcb89144abc16c85650ce4e21e028bfb5",
+      "port_revision": "de8111fdcb89144abc16c85650ce4e21e028bfb5",
+      "license": "Zlib",
+      "license_path": "src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/COPYING.txt",
+      "license_sha256": "7a771248ca372e2dff4887c921543699847ae44c56d7558692f5860237f1f914",
+      "admission": "blocked-windows",
+      "note": "Only the bundled SDL2 path is relevant to the reviewed target; Windows packaging is not certified by M0.1."
+    },
+    {
+      "path": "src/contrib/nativefiledialog-extended",
+      "oracle_revision": "17b6e8ce219c0677f94b63636abb9296b28841ca",
+      "port_revision": "17b6e8ce219c0677f94b63636abb9296b28841ca",
+      "license": "Zlib",
+      "license_path": "src/contrib/nativefiledialog-extended/LICENSE",
+      "license_sha256": "b332d6f507142c66a0e904838b6437e6273734589c22a16b57392b89bfdccb2a",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/plume",
+      "oracle_revision": "51b1ad443b9f202c5cfc930ae25345d3f2ba7716",
+      "port_revision": "d890ac899e505fb30040e037a4037cdeca68f033",
+      "license": "MIT",
+      "license_path": "src/contrib/plume/LICENSE",
+      "license_sha256": "761ecab744d5ed0528b5b794239abaa6f62bd5bd36fc1980b3cb98c48ce32868",
+      "admission": "allowed",
+      "note": "The candidate upstream lifetime redesign supersedes the fn64 old-pin textual Metal retain patch; do not apply both."
+    },
+    {
+      "path": "src/contrib/re-spirv",
+      "oracle_revision": "5d6b756ee62760f71b65d37e41a0b5a3dab90507",
+      "port_revision": "5d6b756ee62760f71b65d37e41a0b5a3dab90507",
+      "license": "MIT",
+      "license_path": "src/contrib/re-spirv/LICENSE",
+      "license_sha256": "761ecab744d5ed0528b5b794239abaa6f62bd5bd36fc1980b3cb98c48ce32868",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/spirv-cross",
+      "oracle_revision": "6173e24b31f09a0c3217103a130e74c4ddec14a6",
+      "port_revision": "6173e24b31f09a0c3217103a130e74c4ddec14a6",
+      "license": "Apache-2.0",
+      "license_path": "src/contrib/spirv-cross/LICENSE",
+      "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/stb",
+      "oracle_revision": "ae721c50eaf761660b4f90cc590453cdb0c2acd0",
+      "port_revision": "ae721c50eaf761660b4f90cc590453cdb0c2acd0",
+      "license": "MIT OR Unlicense",
+      "license_path": "src/contrib/stb/LICENSE",
+      "license_sha256": "bebfe904b14301657e4e5d655c811d51fd31b97c455b9cc2d8600d6bac6cff63",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/xxHash",
+      "oracle_revision": "1864a50c9b5cf8500d8e9e61ed92aa0dd3772750",
+      "port_revision": "1864a50c9b5cf8500d8e9e61ed92aa0dd3772750",
+      "license": "BSD-2-Clause",
+      "license_path": "src/contrib/xxHash/LICENSE",
+      "license_sha256": "6ffedbc0f7878612d2b23589f1ff2ab15633e1df7963a5d9fc750ec5500c7e7a",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/zstd",
+      "oracle_revision": "0ff651dd876823b99fa5c5f53292be28381aee9b",
+      "port_revision": "0ff651dd876823b99fa5c5f53292be28381aee9b",
+      "license": "BSD-3-Clause",
+      "license_path": "src/contrib/zstd/LICENSE",
+      "license_sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8",
+      "admission": "allowed"
+    }
+  ],
+  "nested_submodules": [
+    {
+      "path": "src/contrib/plume/contrib/D3D12MemoryAllocator",
+      "revision": "9ef66bc14edd10dee0de3a545b98578363552f66",
+      "license": "MIT",
+      "license_path": "src/contrib/plume/contrib/D3D12MemoryAllocator/LICENSE.txt",
+      "license_sha256": "9dab190f56ec64bd4dbad25c349b4a381436d54fc908c312ffa3bbf7d1608fa0",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/plume/contrib/Vulkan-Headers",
+      "revision": "2fa203425eb4af9dfc6b03f97ef72b0b5bcb8350",
+      "license": "Apache-2.0 OR MIT",
+      "license_path": "src/contrib/plume/contrib/Vulkan-Headers/LICENSE.md",
+      "license_sha256": "ac24e5ea920e4318e4d02c4086ae51f53cfb03feed06c18df1019e7ada1ec7bc",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/plume/contrib/VulkanMemoryAllocator",
+      "revision": "29b35ea4232688c0f42cdff0c10848290760a417",
+      "license": "MIT",
+      "license_path": "src/contrib/plume/contrib/VulkanMemoryAllocator/LICENSE.txt",
+      "license_sha256": "8d70e4cf2a9941f6454da71cd60e38484dd3e34810c824760d550e982af6d97a",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/plume/contrib/volk",
+      "revision": "be3dbd49bf77052665e96b6c7484af855e7e5f67",
+      "license": "MIT",
+      "license_path": "src/contrib/plume/contrib/volk/LICENSE.md",
+      "license_sha256": "33c831f76b79501665e66c23ac8f876020457c216d44526a8f747da897999b35",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/re-spirv/external/SPIRV-Headers",
+      "revision": "f013f08e4455bcc1f0eed8e3dd5e2009682656d9",
+      "license": "MIT",
+      "license_path": "src/contrib/re-spirv/external/SPIRV-Headers/LICENSE",
+      "license_sha256": "ff04ae7e6a468587fe59434fee2e67c0e2a749b592c794b764ff80f30b94a084",
+      "admission": "allowed"
+    }
+  ],
+  "embedded_components": [
+    {
+      "path": "src/contrib/json/json.hpp",
+      "identity": "nlohmann-json-3.12.0",
+      "license": "MIT",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/miniz",
+      "identity": "vendored-tree",
+      "license": "MIT",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/plainargs/plainargs.h",
+      "identity": "vendored-tree",
+      "license": "Unlicense",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/plume/contrib/metal-cpp",
+      "identity": "vendored-tree",
+      "license": "Apache-2.0",
+      "admission": "allowed"
+    },
+    {
+      "path": "src/contrib/utf8conv",
+      "identity": "vendored-tree",
+      "license": "NOASSERTION",
+      "admission": "blocked-windows",
+      "note": "Compiled by the Windows path; retained headers have copyright notices but no located license grant."
+    }
+  ],
+  "excluded_or_stale": [
+    {
+      "path": "src/tools/texture_hasher",
+      "reason": "Standalone tool excluded from fn64's target; its Rice algorithm is GPL-derived and is not Rust-port authority."
+    },
+    {
+      "path": "src/contrib/project64",
+      "reason": "Unused API headers with no located file-local license grant."
+    },
+    {
+      "path": "src/contrib/xess",
+      "reason": "Stale .gitmodules declaration; neither reviewed root commit has a gitlink at this path."
+    }
+  ],
+  "system_dependencies": [
+    {
+      "name": "SDL2",
+      "platform": "macOS/Linux",
+      "status": "environment-captured-in-M0.3"
+    },
+    {
+      "name": "X11/Xrandr",
+      "platform": "Linux",
+      "status": "environment-captured-in-M0.3"
+    },
+    {
+      "name": "Metal/QuartzCore/Foundation",
+      "platform": "macOS",
+      "status": "system-framework"
+    }
+  ],
+  "qualification_required_for_port_source": [
+    "remove the old-pin Plume textual retain overlay; candidate Plume already owns those lifetimes",
+    "review and update the rt64_state.cpp full-file gate without weakening its exact replacement contexts",
+    "add focused #259 TMEM/TLUT/RGBA32 synchronization fixtures",
+    "add focused #262 viewport/scissor draw-region fixtures",
+    "run every Metal platform case in 20 fresh processes because Plume synchronization, residency, and teardown changed",
+    "rerun every additional source-pinned native feature gate",
+    "run the private schema-v29 full-ROM exact-ten series",
+    "resolve or remove the dxc-bin and utf8conv Windows distribution blockers before claiming Windows closure"
+  ]
+}

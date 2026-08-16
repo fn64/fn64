@@ -2,14 +2,48 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
 #[path = "adapter_source_identity.rs"]
 mod adapter_source_identity;
 
 #[path = "../fn64-boot-harness/native_program_identity.rs"]
 mod native_program_identity;
 
-const RT64_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3";
-const RT64_HFR_SOURCE_OVERLAY_ID: &str = "fn64:raster-shader-start-stop:v1+vi-region-rate:v1+ucode-generation-admission:v1+vi-gamma-dither:v1+vi-dither-filter:v1+vi-divot:v1+vi-silhouette-aa:v1+vi-retrace-cadence:v1+rdp-alpha-dither:v1+rdp-shared-fragment-noise:v1+s2dex-object-rect:v3+hfr-post-present-call:v1";
+const RT64_AUTHORITY_MANIFEST: &str = "../../docs/rt64-port-authority.json";
+
+#[derive(Deserialize)]
+struct Rt64AuthorityManifest {
+    schema_version: u32,
+    repository: String,
+    oracle: Rt64OracleAuthority,
+    overlays: Rt64OverlayAuthority,
+}
+
+#[derive(Deserialize)]
+struct Rt64OracleAuthority {
+    commit: String,
+    source_id: String,
+    status: String,
+    license: String,
+    license_path: String,
+    license_sha256: String,
+    gitmodules_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct Rt64OverlayAuthority {
+    default_id: String,
+    hfr_id: String,
+    source_gates: Vec<Rt64SourceGate>,
+}
+
+#[derive(Deserialize)]
+struct Rt64SourceGate {
+    path: String,
+    sha256: String,
+}
 
 fn run(command: &mut Command, description: &str) {
     let status = command
@@ -42,19 +76,10 @@ fn find_archives(root: &Path, names: &[&str]) -> Vec<PathBuf> {
     found
 }
 
-fn rt64_source_identity(rt64_dir: &Path) -> (String, &'static str) {
-    if let Some(declared) = env::var_os("FN64_RT64_SOURCE_ID") {
-        let declared = declared.to_string_lossy();
-        assert!(
-            !declared.is_empty()
-                && declared
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-._:+/".contains(&byte)),
-            "FN64_RT64_SOURCE_ID must be a nonempty stable identifier using ASCII letters, digits, or -._:+/"
-        );
-        return (format!("declared:{declared}"), "declared");
-    }
-
+fn rt64_source_identity(
+    rt64_dir: &Path,
+    authority: &Rt64AuthorityManifest,
+) -> (String, &'static str) {
     let revision = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(rt64_dir)
@@ -66,23 +91,73 @@ fn rt64_source_identity(rt64_dir: &Path) -> (String, &'static str) {
         .filter(|revision| {
             revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "RT64 source identity is unavailable; use a Git checkout or set FN64_RT64_SOURCE_ID"
-            )
-        });
+        .unwrap_or_else(|| panic!("RT64 source identity is unavailable; use the exact Git checkout named by {RT64_AUTHORITY_MANIFEST}"));
+    assert_eq!(
+        revision, authority.oracle.commit,
+        "RT64 HEAD does not match the active gated oracle in {RT64_AUTHORITY_MANIFEST}"
+    );
     let status = Command::new("git")
         .args(["status", "--porcelain", "--", "."])
         .current_dir(rt64_dir)
         .output()
         .unwrap_or_else(|error| panic!("failed to inspect RT64 source status: {error}"));
     assert!(status.status.success(), "git status failed for RT64 source");
-    let provenance = if status.stdout.is_empty() {
-        "git-clean"
-    } else {
-        "git-dirty"
-    };
-    (format!("git:{revision}"), provenance)
+    assert!(
+        status.stdout.is_empty(),
+        "RT64 source or submodule is dirty; the native oracle requires the exact clean tree named by {RT64_AUTHORITY_MANIFEST}"
+    );
+    assert_eq!(
+        authority.oracle.source_id,
+        format!("git:{revision}"),
+        "RT64 authority source_id does not match its commit"
+    );
+    (authority.oracle.source_id.clone(), "git-clean")
+}
+
+fn sha256_file(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_else(|error| {
+        panic!("failed to read authority input {}: {error}", path.display())
+    });
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    lowercase_hex(digest.finalize().into())
+}
+
+fn load_rt64_authority(manifest_dir: &Path) -> Rt64AuthorityManifest {
+    let path = manifest_dir.join(RT64_AUTHORITY_MANIFEST);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let authority: Rt64AuthorityManifest = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    assert_eq!(
+        authority.schema_version, 1,
+        "unsupported RT64 authority schema"
+    );
+    assert_eq!(authority.repository, "https://github.com/rt64/rt64");
+    assert_eq!(authority.oracle.status, "active-gated");
+    assert_eq!(authority.oracle.license, "MIT");
+    authority
+}
+
+fn verify_rt64_authority(rt64_dir: &Path, authority: &Rt64AuthorityManifest) {
+    assert_eq!(
+        sha256_file(&rt64_dir.join(&authority.oracle.license_path)),
+        authority.oracle.license_sha256,
+        "RT64 root license digest does not match {RT64_AUTHORITY_MANIFEST}"
+    );
+    assert_eq!(
+        sha256_file(&rt64_dir.join(".gitmodules")),
+        authority.oracle.gitmodules_sha256,
+        "RT64 submodule manifest digest does not match {RT64_AUTHORITY_MANIFEST}"
+    );
+    for gate in &authority.overlays.source_gates {
+        assert_eq!(
+            sha256_file(&rt64_dir.join(&gate.path)),
+            gate.sha256,
+            "RT64 overlay source {} does not match {RT64_AUTHORITY_MANIFEST}",
+            gate.path
+        );
+    }
 }
 
 fn produced_archive(out_dir: &Path, name: &str) -> PathBuf {
@@ -158,12 +233,15 @@ fn build_synthetic_native_archives(manifest_dir: &Path) {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=FN64_RT64_DIR");
-    println!("cargo:rerun-if-env-changed=FN64_RT64_SOURCE_ID");
     println!("cargo:rerun-if-changed=ffi/CMakeLists.txt");
     println!("cargo:rerun-if-changed=ffi/fn64_rt64_shim.cpp");
     println!("cargo:rerun-if-changed=ffi/fn64_rt64_shim.h");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join(RT64_AUTHORITY_MANIFEST).display()
+    );
     for path in adapter_source_identity::adapter_source_paths(&manifest_dir)
         .expect("enumerate fn64 RT64 adapter source inputs")
     {
@@ -199,21 +277,15 @@ fn main() {
         .unwrap_or_else(|e| {
             panic!("RT64 source checkout not found ({e}); set FN64_RT64_DIR to its MIT source tree")
         });
-    let license = rt64_dir.join("LICENSE");
-    let license_text = std::fs::read_to_string(&license)
-        .unwrap_or_else(|e| panic!("failed to read RT64 license {}: {e}", license.display()));
-    assert!(
-        license_text.contains("MIT License"),
-        "RT64 source at {} does not carry the expected MIT license",
-        rt64_dir.display()
-    );
-    let (source_id, source_provenance) = rt64_source_identity(&rt64_dir);
+    let authority = load_rt64_authority(&manifest_dir);
+    let (source_id, source_provenance) = rt64_source_identity(&rt64_dir, &authority);
+    verify_rt64_authority(&rt64_dir, &authority);
     println!("cargo:rustc-env=FN64_RT64_SOURCE_ID={source_id}");
     println!("cargo:rustc-env=FN64_RT64_SOURCE_PROVENANCE={source_provenance}");
     let source_overlay_id = if env::var_os("CARGO_FEATURE_HFR_EVIDENCE").is_some() {
-        RT64_HFR_SOURCE_OVERLAY_ID
+        &authority.overlays.hfr_id
     } else {
-        RT64_SOURCE_OVERLAY_ID
+        &authority.overlays.default_id
     };
     println!("cargo:rustc-env=FN64_RT64_SOURCE_OVERLAY_ID={source_overlay_id}");
 
