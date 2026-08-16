@@ -39,10 +39,15 @@ padding as defined texture content or invent zeroes. Texture Image alone owns
 source format, size, width, and address even when Set Tile declares another
 size. Direct four-bit loads fail loudly because the public guidance requires a
 16-bit load form. RGBA32 plans use low/high 2 KiB bank fragments and reject a
-load base outside low TMEM. YUV and Load TLUT retain their exact owned sources
-but have no physical destination contract in this slice: YUV pairing and
-descriptor constraints still require a public-authority contract, while M4.3
-owns TLUT's high-bank/quadrication boundary.
+load base outside low TMEM. YUV retains its exact owned sources but has no
+physical destination contract in this slice: YUV pairing and descriptor
+constraints still require a public-authority contract. Load TLUT does have a
+destination contract: its starting destination tile must be in high TMEM
+(`tmem >= 256`, admission-gated), and once admitted, M4.3.1c wraps the
+running destination word across the full 512-word TMEM domain (word 511's
+successor is word 0) rather than staying inside the high half -- an explicit
+RT64/reference (`write_tlut`) parity policy, not a proven silicon fact; see
+`crates/fn64-render-wgpu/src/tmem/types.rs`'s `project_tlut_full_domain_word`.
 
 `RawDpcResourcePlan::bind_tmem_transfer` returns an immutable checked view. It
 revalidates workload, journal, submission, memory layout, source slice,
