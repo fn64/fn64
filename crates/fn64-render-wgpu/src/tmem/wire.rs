@@ -1248,6 +1248,22 @@ mod tlut_transfer_plan_tests {
     }
 
     #[test]
+    fn destination_mask_is_0xff_while_source_mask_stays_0x03() {
+        // M4.3.1b: the plan-level source/destination mask split this task
+        // adds. `defined_source_byte_mask` names captured source bytes only
+        // (0x03, unchanged by this task); `defined_destination_byte_mask` is
+        // the new, distinct fact that every one of the 8 destination bytes is
+        // defined quadricated content (0xff) -- not the 2-bit source prefix a
+        // naive "destination follows source" assumption would report.
+        let load = decode_tlut(256, 3, (0x300, 0x306)).unwrap();
+        let plan = load.transfer_plan().unwrap();
+        for word in 0..3u16 {
+            assert_eq!(plan.defined_source_byte_mask(word).unwrap(), 0x03);
+            assert_eq!(plan.defined_destination_byte_mask(word).unwrap(), 0xff);
+        }
+    }
+
+    #[test]
     fn logical_source_offset_is_sequential_two_bytes_per_entry() {
         let load = decode_tlut(256, 4, (0x300, 0x308)).unwrap();
         let plan = load.transfer_plan().unwrap();
