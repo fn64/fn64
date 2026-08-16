@@ -24,6 +24,11 @@
 //! banks. Each executor returns only transaction-local state and ordered physical
 //! fragment descriptors. Durable publication and backend reports remain
 //! later owners.
+//! M4.3.3a adds `RawTexel`, a format-neutral raw-value carrier reusable by
+//! later CI/TLUT and YUV layers, and `decode_direct_texel`, a pure,
+//! allocation-free RGBA8888 decoder for the seven direct texel pairs (RGBA16,
+//! RGBA32, IA4, IA8, IA16, I4, I8); it does not read TMEM, resolve a CI
+//! palette, convert YUV, or touch a GPU.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -238,16 +243,17 @@ pub use targets::{
     UninitializedNativeRaster,
 };
 pub use tmem::{
-    execute_ordered_tmem_loads, prepare_load_block, prepare_load_tile, prepare_load_tlut,
-    CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, ExecutedLoadBlock, ExecutedLoadTile,
-    ExecutedLoadTlut, GpuBoundTmemTransaction, LoadBlockExecutionError, LoadTileExecutionError,
+    decode_direct_texel, execute_ordered_tmem_loads, prepare_load_block, prepare_load_tile,
+    prepare_load_tlut, CommittedTmemTransaction, DecodedTexel, DefinedPhysicalTmemWordBytes,
+    DirectTexelDecodeError, ExecutedLoadBlock, ExecutedLoadTile, ExecutedLoadTlut,
+    GpuBoundTmemTransaction, LoadBlockExecutionError, LoadTileExecutionError,
     LoadTlutExecutionError, PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
     PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemState,
     PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, PreparedLoadBlock,
-    PreparedLoadTile, PreparedLoadTlut, StagedTmemTransaction, TextureImage, TileAddressMode,
-    TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TmemDxt,
-    TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch, TmemLoadKind,
-    TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemPacketExecutionError, TmemState,
+    PreparedLoadTile, PreparedLoadTlut, RawTexel, RawTexelError, StagedTmemTransaction,
+    TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState,
+    TlutEntryCount, TmemDxt, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch,
+    TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemPacketExecutionError, TmemState,
     TmemTransferLayout, TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord,
     TmemWordAddress,
 };

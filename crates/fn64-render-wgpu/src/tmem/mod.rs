@@ -22,12 +22,17 @@
 //! remains the only refused load kind. M4.2a consumes those exact plans into
 //! one packet-local physical-state transaction, retaining intermediate load
 //! effects across overlaps and publishing durable state only after exact GPU
-//! and guest lifecycle evidence. RT64 is not hardware authority for this
+//! and guest lifecycle evidence. M4.3.3a's [`texel`] module adds a
+//! format-neutral raw texel carrier reusable by later CI/TLUT and YUV
+//! layers, plus a pure, allocation-free decoder for the seven direct-format
+//! texel pairs (RGBA16, RGBA32, IA4, IA8, IA16, I4, I8); it makes no TMEM,
+//! CI/TLUT, YUV, or GPU claim. RT64 is not hardware authority for this
 //! module.
 
 mod execute;
 mod physical;
 mod state;
+mod texel;
 mod types;
 mod wire;
 
@@ -44,6 +49,9 @@ pub use physical::{
     PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };
 pub use state::{TileState, TmemState};
+pub use texel::{
+    decode_direct_texel, DecodedTexel, DirectTexelDecodeError, RawTexel, RawTexelError,
+};
 pub use types::{
     TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize,
     TlutEntryCount, TmemDxt, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch,
