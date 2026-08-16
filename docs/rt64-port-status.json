@@ -35,7 +35,7 @@
     {
       "id": "M3",
       "title": "Raw-DPC vertical slice",
-      "state": "PLANNED",
+      "state": "IN PROGRESS",
       "exit_headline": "Real LLE commands reach native target, FullSync, VI, and visible surface."
     },
     {
@@ -519,10 +519,11 @@
         "tools/rt64_shader_artifacts.py",
         "docs/rt64-shader-artifact-schema.json",
         "docs/RT64-SHADER-ARTIFACTS.md",
-        "crates/fn64-render-wgpu/shaders"
+        "docs/rt64-shader-artifacts.json",
+        "probes/m2-dxc-artifacts"
       ],
       "dependencies": ["M2.1"],
-      "state": "READY",
+      "state": "RUNNING",
       "findings": [
         "Official DXC supports HLSL-to-SPIR-V with explicit entry point, target, defines, include paths, optimization, target environment, validation, and output controls; official stable v1.9.2607 at 0d3ee6b is the current pin candidate.",
         "DXC carries a permissive license and ThirdPartyNotices in its official source tree, while RT64's retained dxc-bin bundle lacks the provenance/notices required by M0.1 and remains excluded.",
@@ -531,7 +532,37 @@
       ],
       "verification_runs": [],
       "blocker": null,
-      "next_action": "Audit and pin the complete official DXC source/dependency/license closure, define the canonical receipt, compile every admitted HLSL entry point with exact RT64 include/macro settings, validate artifacts through wgpu 30, and prove mutations fail closed.",
+      "next_action": "Audit and pin the complete official DXC source/dependency/license closure and build the fail-closed source/include/tool/flags/artifact receipt lane without overlapping M3.1's renderer crate. Corpus compilation remains required before M4 closure.",
+      "started_utc": "2026-08-16T00:00:00Z",
+      "updated_utc": "2026-08-16T00:00:00Z"
+    },
+    {
+      "id": "M3.1",
+      "milestone": "M3",
+      "objective": "Create fn64-render-wgpu and execute one receipt-bearing synthetic fill plus FullSync packet through the merged IR and exact wgpu submission lifecycle, without ABI or shell policy.",
+      "profile": "F",
+      "model": "GPT-5.6 Sol",
+      "effort": "xhigh",
+      "owner": "wgpu renderer-spine writer",
+      "branch": "port/render-wgpu-spine",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu",
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "docs/DESIGN.md"
+      ],
+      "dependencies": ["M1.2", "M2.3"],
+      "state": "RUNNING",
+      "findings": [
+        "This ticket owns only the bounded headless device, pipeline-prewarm, exact-submission, readback, and backend-effect lifecycle. ABI dispatch, shell policy, surface presentation, VI, and broad RDP decoding remain outside its boundary.",
+        "One small reviewed WGSL fixture may unblock the lifecycle spine while M2.4 independently qualifies the full RT64 HLSL artifact producer; synthetic success cannot close M3 parity.",
+        "Unknown command/state forms must reject loudly, and no backend completion or staged guest effect may exist before the exact wgpu SubmissionIndex completes and readback is validated."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Implement the move-only device/prewarm/in-flight/completed states and exact fill/FullSync fixture, then run hostile type/lifecycle tests, opt-in Metal execution, and independent review.",
       "started_utc": "2026-08-16T00:00:00Z",
       "updated_utc": "2026-08-16T00:00:00Z"
     }

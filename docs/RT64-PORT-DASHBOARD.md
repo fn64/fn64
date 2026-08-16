@@ -19,8 +19,8 @@
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, READY:1 |
-| `M3` | `PLANNED` | Raw-DPC vertical slice | none |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, RUNNING:1 |
+| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | RUNNING:1 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
@@ -348,12 +348,12 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M2` |
-| state | `READY` |
+| state | `RUNNING` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | shader artifact provenance writer |
 | branch | `port/rt64-shader-artifacts` -> `main` |
 | dependencies | `M2.1` |
-| writable paths | `tools/rt64_shader_artifacts.py`, `docs/rt64-shader-artifact-schema.json`, `docs/RT64-SHADER-ARTIFACTS.md`, `crates/fn64-render-wgpu/shaders` |
+| writable paths | `tools/rt64_shader_artifacts.py`, `docs/rt64-shader-artifact-schema.json`, `docs/RT64-SHADER-ARTIFACTS.md`, `docs/rt64-shader-artifacts.json`, `probes/m2-dxc-artifacts` |
 | started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
 | verification runs meeting bar | 0/0 |
 
@@ -364,7 +364,29 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - The producer must run in an isolated regeneration environment and emit canonical source, include-graph, compiler, flags, preprocessed-input, validation, and artifact digests. Ordinary fn64 builds consume only reviewed artifacts through wgpu.
 - This tooling decision does not block a minimal handwritten M3 vertical-slice shader, but the complete M4 shader corpus and parity claim require the qualified producer. WGSL source modernization remains a post-parity step.
 
-**Next action:** Audit and pin the complete official DXC source/dependency/license closure, define the canonical receipt, compile every admitted HLSL entry point with exact RT64 include/macro settings, validate artifacts through wgpu 30, and prove mutations fail closed.
+**Next action:** Audit and pin the complete official DXC source/dependency/license closure and build the fail-closed source/include/tool/flags/artifact receipt lane without overlapping M3.1's renderer crate. Corpus compilation remains required before M4 closure.
+
+### `M3.1` -- Create fn64-render-wgpu and execute one receipt-bearing synthetic fill plus FullSync packet through the merged IR and exact wgpu submission lifecycle, without ABI or shell policy.
+
+| field | value |
+|---|---|
+| milestone | `M3` |
+| state | `RUNNING` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | wgpu renderer-spine writer |
+| branch | `port/render-wgpu-spine` -> `main` |
+| dependencies | `M1.2`, `M2.3` |
+| writable paths | `crates/fn64-render-wgpu`, `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/DESIGN.md` |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- This ticket owns only the bounded headless device, pipeline-prewarm, exact-submission, readback, and backend-effect lifecycle. ABI dispatch, shell policy, surface presentation, VI, and broad RDP decoding remain outside its boundary.
+- One small reviewed WGSL fixture may unblock the lifecycle spine while M2.4 independently qualifies the full RT64 HLSL artifact producer; synthetic success cannot close M3 parity.
+- Unknown command/state forms must reject loudly, and no backend completion or staged guest effect may exist before the exact wgpu SubmissionIndex completes and readback is validated.
+
+**Next action:** Implement the move-only device/prewarm/in-flight/completed states and exact fill/FullSync fixture, then run hostile type/lifecycle tests, opt-in Metal execution, and independent review.
 
 ## Regenerating
 
