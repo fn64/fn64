@@ -1,0 +1,101 @@
+{
+  "schema": "fn64.rt64-wgpu-shader-assessment-policy.v1",
+  "direct_consumers": [
+    "tools/rt64_wgpu_shader_assessment.py",
+    "tools/test_rt64_wgpu_shader_assessment.py"
+  ],
+  "receipt_schema": "fn64.rt64-wgpu-shader-assessment.v1",
+  "receipt_path": "assessment-receipt.json",
+  "producer": {
+    "path": "tools/rt64_wgpu_shader_assessment.py",
+    "sha256": "b24ff293b4fe9d0defaa8bd33ca3fdc80014e6a2263a1b90d5cc1d4c210bff34"
+  },
+  "reference_corpus": {
+    "receipt_schema": "fn64.rt64-reference-shader-receipt.v2",
+    "receipt_sha256": "aa45109a13795d0146eed1ab07bf4b5fd4a4663b67ea4b53619c7e8d3104e661",
+    "receipt_file_sha256": "70e29d3c25f0c888a3800c00a2d928ca642a9fc7c4ae81cce039417c2cf48d4f",
+    "artifact_set_sha256": "2515bba4d4c5149043b96eb094b2e8175175184aeff42ec1b1e88541ef336d0e",
+    "denominator_sha256": "cae8956fff3258bf5c21bb5cea7ffb550ab726118840a16db69764d3507d3ebe",
+    "source_snapshot_set_sha256": "446b5f27ef2df359abf083267cc51449db4da46cb6725aaaca07c8d89153e9bd",
+    "orchestration_producer_sha256": "a0692cdcc60352d6bb799ac771da41b32e3aa45208dbc5534fb11a02160dc548",
+    "artifact_producer_sha256": "b8db5cbcaa0caef60ec3c84a966917d246e25df882ae44951541e65720630d33",
+    "reference_policy_sha256": "e6f9ee59989d7e4b049e0ff8a223b06de09914385be6d24024c05677982126cc",
+    "artifact_policy_sha256": "7879607c7c6767da68747a882c6c8aa38efd074a11f955ecffbb85534d96ffd9",
+    "dxc_build_receipt_sha256": "285e108be347e97d45c82e3264df0106b2c1b3930e28bcdfb2c28b192958a592",
+    "dxc_compiler_sha256": "3f45006aca29842b8f22915777ded9040403e6ab95432a56dfb0b2aec137b58a",
+    "spirv_val_build_receipt_sha256": "cde0b1411b7edb3023e0e11f4d6c5ef8667660c5dc432c3db28dbefc3bbed93c",
+    "spirv_grammar_sha256": "fc328b3a978cf6128617c679f1932717fb9a5fdbc9049c4124c2cc5f2f35cb4b",
+    "entry_order_sha256": "ee863043e1f24854f5ff85cc2affc1fd223e1a90742ad8500e6819faeb59b3e5",
+    "row_count": 56
+  },
+  "wgpu_validator": {
+    "build_receipt_schema": "fn64.wgpu-shader-validator-build.v1",
+    "build_receipt_sha256": "b5b275495057e3985526b4ae7f672762d98dd54f1708d3fa4ebd25828f2f474a",
+    "binary_sha256": "7d45954419353e4df742cc6725b2a9f07922d1ecc2f1c1c7a0becb500897187e",
+    "source_set_sha256": "3448f9342092fa5843c8aaea548d639a58bae8f5912a4f4873726630851a1563",
+    "cargo_lock_sha256": "733fa211c5dd777a3be2e264de61716d319aa65d5b0ebf38a0a316e380e5610c",
+    "dependency_set_sha256": "7f68906e37340e8e9a5091f7d4d6d5c8055ee973fb6a24cc1e83866476320141",
+    "identity": {
+      "schema": "fn64.wgpu-shader-validator.v1",
+      "wgpu_major": 30,
+      "wgpu_version": "30.0.0",
+      "naga_version": "30.0.0",
+      "backend": "noop",
+      "validation": "wgpu-30-baseline-naga-validation-plus-checked-api"
+    },
+    "arguments": [
+      "--shader",
+      "<private-staged-spv>",
+      "--stage",
+      "<stage>",
+      "--entry",
+      "<entry>"
+    ],
+    "controlled_environment": {
+      "HOME": "<private-staging-root>",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PATH": "/usr/bin:/bin"
+    }
+  },
+  "outcomes": {
+    "order": [
+      "ingestible",
+      "blocked-known"
+    ],
+    "ingestible": {
+      "exit_code": 0,
+      "stdout_schema": "fn64.wgpu-shader-validation.v1",
+      "stdout_status": "passed",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "blocked_known": {
+      "reason_code": "naga30-strict-spv-unsupported-capability-shader-nonuniform",
+      "exit_code": 2,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "1b79e4b102bba46736130479ebfe90c96e7ec2b330c07213103b5cd4e00f9614",
+      "required_capability": {
+        "name": "ShaderNonUniform",
+        "value": 5301
+      },
+      "required_extension": "SPV_EXT_descriptor_indexing",
+      "required_direct_decoration": "NonUniform"
+    }
+  },
+  "runtime_readiness": {
+    "runtime_ready": false,
+    "reason_order": [
+      "blocked-known-ingestion-row",
+      "native-adapter-contract-not-recorded",
+      "native-shader-module-not-executed",
+      "pipeline-and-semantic-evidence-not-recorded"
+    ]
+  },
+  "limits": {
+    "maximum_receipt_bytes": 16777216,
+    "maximum_artifact_bytes": 67108864,
+    "maximum_process_output_bytes": 65536,
+    "validator_timeout_seconds": 30
+  },
+  "claim_boundary": "wgpu30-typed-ingestion-assessment-only-not-adapter-device-pipeline-runtime-parity-or-performance"
+}
