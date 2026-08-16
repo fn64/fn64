@@ -1243,7 +1243,9 @@ const fn mask_is_low_prefix(mask: u8) -> bool {
 
 /// Converts only the accepted word's defined-lane shape. Actual logical
 /// source bytes are never inspected or rearranged here; M4.2b owns that
-/// source-to-physical payload mapping. Split-bank lane order is low[0..4]
+/// source-to-physical payload mapping. Linear odd rows exchange their two
+/// four-byte halves, so an odd-row two-byte tail occupies mask `0x30` rather
+/// than the logical-prefix mask `0x03`. Split-bank lane order is low[0..4]
 /// followed by high[0..4], so one four-byte RGBA32 texel occupies mask 0x33.
 fn physical_defined_lane_mask(word: TmemTransferWord) -> Result<u8, PhysicalTmemError> {
     let source_mask = word.defined_source_byte_mask();
@@ -1251,7 +1253,11 @@ fn physical_defined_lane_mask(word: TmemTransferWord) -> Result<u8, PhysicalTmem
         return Err(PhysicalTmemError::DestinationPlanMismatch);
     }
     match word.physical() {
-        TmemTransferPhysicalWord::Linear(_) => Ok(source_mask),
+        TmemTransferPhysicalWord::Linear(_) => Ok(if word.odd_row_exchange() {
+            source_mask.rotate_left(4)
+        } else {
+            source_mask
+        }),
         TmemTransferPhysicalWord::SplitBanks { .. } => {
             const SOURCE_TO_PHYSICAL_LANE: [u8; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
             let mut physical_mask = 0_u8;
@@ -2002,6 +2008,59 @@ mod tests {
             .proposed_effects()
             .iter()
             .all(|effect| effect.byte_count() == 4));
+    }
+
+    #[test]
+    fn linear_partial_tail_masks_follow_even_and_odd_row_lane_exchange() {
+        let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
+        let even_masks = [0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff];
+        let odd_masks = [0x10, 0x30, 0x70, 0xf0, 0xf1, 0xf3, 0xf7, 0xff];
+        for (defined_bytes, (even, odd)) in even_masks.into_iter().zip(odd_masks).enumerate() {
+            let source_mask = if defined_bytes == 7 {
+                u8::MAX
+            } else {
+                ((1_u16 << (defined_bytes + 1)) - 1) as u8
+            };
+            for (odd_row_exchange, expected) in [(false, even), (true, odd)] {
+                let word = TmemTransferWord::new(
+                    0,
+                    0,
+                    0,
+                    0,
+                    source_mask,
+                    0,
+                    0,
+                    odd_row_exchange,
+                    TmemTransferPhysicalWord::Linear(range),
+                );
+                assert_eq!(physical_defined_lane_mask(word).unwrap(), expected);
+            }
+        }
+
+        let fixture = fixture(1);
+        let transfer = fixture
+            .decoded
+            .resource_plan()
+            .bind_tmem_transfer(load(&fixture.decoded, 0))
+            .unwrap();
+        let odd_tail = transfer.words()[1];
+        assert!(odd_tail.odd_row_exchange());
+        assert_eq!(odd_tail.defined_source_byte_mask(), 0x03);
+        assert_eq!(physical_defined_lane_mask(odd_tail).unwrap(), 0x30);
+
+        let state = PhysicalTmemState::try_new().unwrap();
+        let staged = state
+            .stage_transfer(fixture.decoded.submitted(), &transfer)
+            .unwrap();
+        let logical_prefix = [Some(0x10), Some(0x11), None, None, None, None, None, None];
+        assert!(matches!(
+            staged.physical_word_payload(odd_tail, logical_prefix),
+            Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
+                expected: 0x30,
+                actual: 0x03,
+                ..
+            })
+        ));
     }
 
     #[test]

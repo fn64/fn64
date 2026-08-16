@@ -98,10 +98,24 @@ transactions A and B stage from generation N, B publishes N+1, and A is then
 rejected. It does not run publication concurrently across threads, so
 concurrent publication remains explicitly unverified in M4.2a.
 
-This physical-state slice does not perform guest reads or source-byte mapping,
-execute Load Tile/Load Block on a GPU, aggregate unrelated backend effects,
-handle YUV or Load TLUT destinations, migrate runtime/shell dispatch, or claim
-visual parity or performance. Its transfer rules come from the public SGI
+M4.2b consumes one checked M4.2.0 LoadTile together with the exact submitted
+packet's M4.0-owned guest reads. The preparation boundary matches every global
+access index, operation, RDRAM range, layout, and submission before it retains
+source bytes. Execution consumes that one-use operation and M4.2a's staged
+transaction, maps row-local complete 64-bit words in command order, exchanges
+the two four-byte halves for odd linear rows, and maps RGBA32 channel pairs
+into low/high 2 KiB banks. A partial row never borrows bytes from the next row;
+its undefined physical lanes are still touched and invalidated by M4.2a. The
+result carries the transaction-local candidate plus ordered physical fragment
+descriptors only. It does not construct a backend report, issue a lifecycle
+receipt, publish durable state, execute LoadBlock/LoadTLUT/YUV, upload to a GPU,
+or establish parity or performance.
+
+M4.2a itself does not perform guest reads or source-byte mapping. The combined
+M4.2a/M4.2b slice does not execute Load Tile/Load Block on a GPU, aggregate
+unrelated backend effects, handle YUV or Load TLUT destinations, migrate
+runtime/shell dispatch, or claim visual parity or performance. Its transfer
+rules come from the public SGI
 *Nintendo 64 RDP Command Summary* and Programming Manual section 13.9; its
 move-only commit sequencing is the repository design mechanism. RT64 is not
 hardware authority for this state.
