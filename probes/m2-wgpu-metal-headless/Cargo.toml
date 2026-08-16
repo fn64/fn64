@@ -22,6 +22,14 @@ path = "src/bin/metal_semantics.rs"
 name = "metal_formats_io"
 path = "src/bin/metal_formats_io.rs"
 
+[[bin]]
+name = "metal_submission"
+path = "src/bin/metal_submission.rs"
+
+[[bin]]
+name = "metal_coverage_fallback"
+path = "src/bin/metal_coverage_fallback.rs"
+
 [dependencies]
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"

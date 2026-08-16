@@ -5,7 +5,7 @@ gate. It is a standalone workspace and intentionally does not share the
 shell's `pixels`/wgpu 0.19 dependency graph. This probe pins wgpu 30.0.0 with
 only its `metal` and `wgsl` crate features.
 
-The same locked standalone workspace also contains two execution probes. They
+The same locked standalone workspace also contains four execution probes. They
 remain separate binaries because an adapter advertisement is not evidence that
 the corresponding shader or format path executed:
 
@@ -28,6 +28,41 @@ the corresponding shader or format path executed:
   only in a typed `passed` outcome after copy, map, padded-row extraction, and
   logical-byte validation complete; unsupported or failed native paths cannot
   fabricate successful staging evidence.
+- `metal_submission` prewarms one raster ubershader, two finite raster PSOs,
+  and one compute pipeline before moving the device behind an armed execution
+  interface that exposes no pipeline-construction operation. The consumed
+  pipeline factory issues the typed arm witness; its zero is scoped to
+  application-level pipeline creation through the probe owner and says nothing
+  about hidden driver compilation. The probe submits three command buffers to
+  the one device queue. Each command buffer owns its callback, each returned
+  `SubmissionIndex` is waited exactly, and a nonblocking receive observes
+  callback delivery after that wait. Separately, the native wgpu-core contract
+  for [`wgpu-types` 30.0.0 `PollType::Wait`](https://docs.rs/wgpu-types/30.0.0/wgpu_types/enum.PollType.html#variant.Wait),
+  also present in the pinned crate's `src/lib.rs`, guarantees callback
+  invocation before the wait returns. Submission two is not enqueued until
+  callback one is observed ready. The second command buffer
+  executes compute, render, texture-to-buffer copy, and—when the base
+  `TIMESTAMP_QUERY` feature is advertised—four descriptor-bound pass
+  timestamps. Only after its exact wait and callback-ready check does the third
+  command buffer resolve and copy those queries, following wgpu's documented
+  portable query-availability ordering. Exact output bytes, callback/wait
+  order, zero post-arm application pipeline creation, nonzero ordered
+  timestamp ticks, and a positive timestamp period are separate typed receipt
+  fields. This is lifecycle and execution evidence, not a frame-time or
+  throughput measurement.
+- `metal_coverage_fallback` evaluates the public eight N64 checkerboard sample
+  positions `(1,1), (5,1), (3,3), (7,3), (1,5), (5,5), (3,7), (7,7)` in
+  eighth-pixel units in a compute shader. Twelve all/none, axis, single-corner,
+  and complementary-diagonal edge fixtures are graded against independently
+  fixed masks. The positions and checkerboard topology follow Ultra64
+  Programming Manual Chapter 15, “Coverage Values,” as recorded in
+  [`docs/RDP-SILICON-VECTORS.md`](../../docs/RDP-SILICON-VECTORS.md) and the
+  existing reference-renderer contract. This is only the documented
+  sample-mask primitive; it does not claim the full top-left/coverage pipeline
+  or unpublished silicon edge-accumulator arithmetic.
+  A separate four-sample hardware-MSAA render/resolve arm is always labeled
+  `executed_non_exact` (or typed optional unsupported): host MSAA positions are
+  never substituted for the exact documented sample-mask primitive.
 
 Run an observational probe:
 
@@ -40,6 +75,13 @@ Run the semantic and format execution probes:
 ```sh
 cargo run --locked --bin metal_semantics
 cargo run --locked --bin metal_formats_io
+```
+
+Run the submission/timestamp and coverage-fallback probes:
+
+```sh
+cargo run --locked --bin metal_submission
+cargo run --locked --bin metal_coverage_fallback
 ```
 
 Require the whole candidate RT64 hard-capability matrix:
@@ -75,13 +117,30 @@ fallbacks succeeded. Native support is decided from the adapter's advertised
 features/usages first and then separately proven by execution; advertisement
 alone never produces a passing arm.
 
-Each binary writes one typed, compact, canonical JSON receipt. The new receipt
+For `metal_submission`, 0 means an exhaustive positive predicate accepted the
+exact prewarm counts, exact lifecycle events, compute/render/copy bytes, zero
+errors, and `Passed` timestamps paired with an advertised timestamp feature.
+Exit 78 means that same core predicate passed while the feature was not
+advertised and the timestamp arm was explicitly `Unsupported`. Every
+`NotRun`, failure, mismatch, inexact passed receipt, or advertisement/outcome
+contradiction exits 2. `metal_coverage_fallback` exits 0 only when an exact
+`CoverageArm::Passed`, zero errors, and either
+`HardwareMsaaArm::ExecutedNonExact` or its typed optional unsupported outcome
+all satisfy their positive predicates. Every other arm exits 2. Missing
+optional hardware MSAA does not weaken or mark unsupported the exact compute
+fallback. Both binaries use exit 69 for no Metal adapter.
+
+Each binary writes one typed, compact, canonical JSON receipt. The execution
 schemas include only canonical command/probe identity, source and executable
 digests, path-free adapter/device/driver identity, target and exact rustc
 release/commit identity, boolean advertisements, typed arm outcomes, and byte
-counts/digests. They exclude paths, user/home/host names, ambient arguments,
-and raw backend error text. Receipts and Cargo target output are machine
-evidence and must not be committed.
+counts/digests. The submission and coverage receipts additionally serialize
+their complete static probe configuration. Hostile tests mutate that
+configuration, callback order, timestamp values, coverage masks, and readback
+geometry to prove those changes cannot retain a passing receipt. Receipts
+exclude paths, user/home/host names, ambient arguments, and raw backend error
+text. Receipts and Cargo target output are machine evidence and must not be
+committed.
 
 ## wgpu 30 API audit and result boundaries
 
