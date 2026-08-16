@@ -1322,3 +1322,92 @@ use super::*;
         assert!(error_string(&error, "missing S2DEX diagnostic").contains("not initialized"));
         assert_eq!(s2dex, RawS2dexFastPathEvidence::default());
     }
+
+    #[test]
+    fn live_device_graphics_api_tags_are_typed_and_unknown_tags_fail_loudly() {
+        for (tag, expected) in [
+            (1, ActiveRenderGraphicsApi::D3d12),
+            (2, ActiveRenderGraphicsApi::Vulkan),
+            (3, ActiveRenderGraphicsApi::Metal),
+        ] {
+            assert_eq!(
+                active_graphics_api_from_tag(tag, "live-device").unwrap(),
+                expected
+            );
+        }
+        for tag in [0, 4, u32::MAX] {
+            let error = active_graphics_api_from_tag(tag, "live-device").unwrap_err();
+            assert!(error.contains("unknown live-device graphics API"));
+            assert!(error.contains(&tag.to_string()));
+        }
+    }
+
+    #[test]
+    fn live_device_graphics_api_query_rejects_null_inputs_without_writing_output() {
+        let mut graphics_api = 0xa5a5_5a5a;
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the C ABI explicitly validates the deliberately null
+        // context before dereferencing it and retains neither output pointer.
+        let queried = unsafe {
+            fn64_rt64_read_live_device_graphics_api(
+                std::ptr::null(),
+                &mut graphics_api,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(queried, 0);
+        assert_eq!(graphics_api, 0xa5a5_5a5a);
+        assert!(error_string(&error, "missing setup diagnostic").contains("completed setup"));
+
+        error.fill(0);
+        // SAFETY: the C ABI validates the deliberately null output before it
+        // considers or dereferences the deliberately null context.
+        let queried = unsafe {
+            fn64_rt64_read_live_device_graphics_api(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(queried, 0);
+        assert!(error_string(&error, "missing output diagnostic").contains("null"));
+    }
+
+    #[test]
+    fn live_device_graphics_api_query_is_identity_only() {
+        let shim = include_str!("../../ffi/fn64_rt64_shim.cpp");
+        let start = shim
+            .find("extern \"C\" int fn64_rt64_read_live_device_graphics_api(")
+            .expect("live-device graphics API query exists");
+        let end = start
+            + shim[start..]
+                .find("extern \"C\" int fn64_rt64_apply_user_config(")
+                .expect("settings apply follows live-device query");
+        let query = &shim[start..end];
+
+        for required in [
+            "setup_complete",
+            "application->renderInterface",
+            "application->device",
+            "application->chosenGraphicsAPI",
+            "default:",
+            "non-concrete graphics API",
+        ] {
+            assert!(query.contains(required), "identity query lost {required}");
+        }
+        for forbidden in [
+            "present_capture",
+            "enable_present_capture",
+            "read_present_capture",
+            "fn64_rt64_present(",
+            "vi_state",
+            "update_vi(",
+        ] {
+            assert!(
+                !query.contains(forbidden),
+                "identity query crossed into {forbidden}"
+            );
+        }
+    }

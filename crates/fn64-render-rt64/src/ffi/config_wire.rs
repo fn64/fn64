@@ -456,6 +456,12 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> *mut RawContext;
+    pub(super) fn fn64_rt64_read_live_device_graphics_api(
+        context: *const RawContext,
+        graphics_api: *mut u32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     pub(super) fn fn64_rt64_apply_user_config(
         context: *mut RawContext,
         user_config: *const RawUserConfig,
@@ -880,4 +886,3 @@ pub(crate) fn inspect_replacement_pack(
     }
     Ok((replacement_identity_from_raw(config)?, database))
 }
-

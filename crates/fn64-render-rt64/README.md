@@ -70,6 +70,12 @@ The GPL mupen64plus
 subtree is neither compiled nor linked. On macOS the adapter owns the hidden
 SDL/Metal surface currently required by RT64 initialization.
 
+After successful setup, `Rt64Backend::live_device_graphics_api_for_evidence`
+reads RT64's concrete `Application::chosenGraphicsAPI` only after confirming
+that the application owns a live render interface and device. The C ABI
+returns a typed scalar tag: it exposes no native handle, submits no GPU work,
+and neither enables capture nor requires a present or VI operation.
+
 ## Runtime behavior
 
 `RenderRuntimePolicy` composes typed user, enhancement, emulator, and texture

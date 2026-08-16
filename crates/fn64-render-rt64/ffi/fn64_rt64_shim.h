@@ -148,9 +148,15 @@ enum {
 };
 
 enum {
-    FN64_RT64_PRESENT_GRAPHICS_API_D3D12 = 1,
-    FN64_RT64_PRESENT_GRAPHICS_API_VULKAN = 2,
-    FN64_RT64_PRESENT_GRAPHICS_API_METAL = 3
+    FN64_RT64_GRAPHICS_API_D3D12 = 1,
+    FN64_RT64_GRAPHICS_API_VULKAN = 2,
+    FN64_RT64_GRAPHICS_API_METAL = 3
+};
+
+enum {
+    FN64_RT64_PRESENT_GRAPHICS_API_D3D12 = FN64_RT64_GRAPHICS_API_D3D12,
+    FN64_RT64_PRESENT_GRAPHICS_API_VULKAN = FN64_RT64_GRAPHICS_API_VULKAN,
+    FN64_RT64_PRESENT_GRAPHICS_API_METAL = FN64_RT64_GRAPHICS_API_METAL
 };
 
 typedef struct Fn64Rt64PresentCapture {
@@ -622,6 +628,15 @@ Fn64Rt64Context *fn64_rt64_create(
     const Fn64Rt64UserConfig *user_config,
     const Fn64Rt64EnhancementConfig *enhancement_config,
     const Fn64Rt64EmulatorConfig *emulator_config,
+    char *error,
+    size_t error_capacity);
+
+/* Read the concrete graphics API owned by an already-created RT64 device.
+ * This scalar-only query submits no GPU work and does not enable capture,
+ * present a frame, or inspect VI state. */
+int fn64_rt64_read_live_device_graphics_api(
+    const Fn64Rt64Context *context,
+    uint32_t *graphics_api,
     char *error,
     size_t error_capacity);
 

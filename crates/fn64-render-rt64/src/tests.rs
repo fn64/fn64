@@ -333,6 +333,26 @@ use super::*;
 
     #[test]
     #[cfg(feature = "rt64")]
+    fn live_device_graphics_api_evidence_requires_create() {
+        let backend = Rt64Backend::new();
+        assert!(matches!(
+            backend.live_device_graphics_api_for_evidence(),
+            Err(RenderError::NotReady("Rt64Backend::create() not called"))
+        ));
+    }
+
+    #[test]
+    #[cfg(not(feature = "rt64"))]
+    fn live_device_graphics_api_evidence_rejects_non_native_build() {
+        let error = Rt64Backend::new()
+            .live_device_graphics_api_for_evidence()
+            .unwrap_err();
+        assert!(matches!(error, RenderError::Backend { .. }));
+        assert!(error.to_string().contains("without the opt-in `rt64`"));
+    }
+
+    #[test]
+    #[cfg(feature = "rt64")]
     fn replacement_pack_inspection_is_ordered_typed_and_staged_without_active_evidence() {
         let first = SyntheticPack::new("first", "rt64", "preload");
         let second = SyntheticPack::new("second", "rice", "stall");
