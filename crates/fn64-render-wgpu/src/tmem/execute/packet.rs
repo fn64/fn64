@@ -306,7 +306,11 @@ mod tests {
     use super::*;
     use crate::raw_dpc::{decode_raw_dpc, RawDpcCommandKind, RawDpcDecodeError};
     use crate::tmem::{LOAD_BLOCK, LOAD_SYNC, LOAD_TILE, LOAD_TLUT, SET_TEXTURE_IMAGE, SET_TILE};
-    use crate::{PhysicalTmemState, RdpState};
+    use crate::{
+        decode_direct_texel, read_committed_texel, AddressedTmemTexel, ImageFormat,
+        PhysicalTexelReadError, PhysicalTmemState, PixelSize, RawTexel, RdpState, TextureLutMode,
+        TileAddressMode, TileDescriptor, TmemFirstRowParity, TmemWordAddress,
+    };
 
     const LAYOUT_BYTES: u32 = 0x4000;
     const COMMAND_START: u32 = 0x1000;
@@ -431,11 +435,19 @@ mod tests {
     }
 
     fn fixture(words: Vec<u32>, source_ranges: &[(u32, u32)]) -> Fixture {
+        fixture_with_state(words, source_ranges, &RdpState::default())
+    }
+
+    fn fixture_with_state(
+        words: Vec<u32>,
+        source_ranges: &[(u32, u32)],
+        state: &RdpState,
+    ) -> Fixture {
         let (mut queue, backend, guest) = TicketAuthoritySet::try_new().unwrap().into_roles();
         let packet = packet_from_words(words, source_ranges);
         let submitted = queue.submit(DecodedTicket::new(packet)).unwrap();
         Fixture {
-            decoded: decode_raw_dpc(submitted, &RdpState::default()).unwrap(),
+            decoded: decode_raw_dpc(submitted, state).unwrap(),
             backend,
             guest,
         }
@@ -642,6 +654,148 @@ mod tests {
             .unwrap()
     }
 
+    fn reader_tile(
+        format: ImageFormat,
+        size: PixelSize,
+        line_words: u16,
+        tmem: u16,
+        palette: u8,
+    ) -> TileDescriptor {
+        TileDescriptor::from_wire(
+            format,
+            size,
+            line_words,
+            TmemWordAddress::try_new(tmem).unwrap(),
+            palette,
+            TileAddressMode::default(),
+            0,
+            0,
+            TileAddressMode::default(),
+            0,
+            0,
+        )
+    }
+
+    fn direct_reader_words() -> (Vec<u32>, Vec<(u32, u32)>) {
+        let linear_address = 0x201;
+        let rgba32_address = 0x220;
+        let odd_rows_address = 0x400;
+        (
+            vec![
+                word(SET_TEXTURE_IMAGE, 4 << 21 | 1 << 19 | 7),
+                linear_address,
+                word(SET_TILE, 4 << 21 | 1 << 19 | 1 << 9 | 8),
+                7 << 24,
+                word(LOAD_SYNC, 0),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 28 << 12,
+                word(SET_TEXTURE_IMAGE, 3 << 19 | 1),
+                rgba32_address,
+                word(SET_TILE, 3 << 19 | 1 << 9 | 16),
+                7 << 24,
+                word(LOAD_SYNC, 1),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 4 << 12,
+                word(SET_TEXTURE_IMAGE, 4 << 21 | 1 << 19 | 7),
+                odd_rows_address,
+                word(SET_TILE, 4 << 21 | 1 << 19 | 1 << 9 | 511),
+                7 << 24,
+                word(LOAD_SYNC, 2),
+                0,
+                word(LOAD_TILE, 4),
+                7 << 24 | 28 << 12 | 8,
+            ],
+            vec![
+                (linear_address, linear_address + 8),
+                (rgba32_address, rgba32_address + 8),
+                (odd_rows_address + 8, odd_rows_address + 24),
+            ],
+        )
+    }
+
+    fn ci_and_offset_tlut_reader_words() -> (Vec<u32>, Vec<(u32, u32)>) {
+        let ci8_address = 0x128;
+        let ci4_address = 0x189;
+        let unloaded_index_address = 0x100;
+        let tlut_address = 0x300;
+        (
+            vec![
+                word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | 7),
+                ci8_address,
+                word(SET_TILE, 2 << 21 | 1 << 19 | 1 << 9),
+                7 << 24,
+                word(LOAD_SYNC, 0),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 28 << 12,
+                word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | 7),
+                ci4_address,
+                word(SET_TILE, 2 << 21 | 1 << 19 | 1 << 9 | 1),
+                7 << 24,
+                word(LOAD_SYNC, 1),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 28 << 12,
+                word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | 7),
+                unloaded_index_address,
+                word(SET_TILE, 2 << 21 | 1 << 19 | 1 << 9 | 2),
+                7 << 24,
+                word(LOAD_SYNC, 2),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 28 << 12,
+                word(SET_TEXTURE_IMAGE, 2 << 19),
+                tlut_address,
+                word(SET_TILE, 2 << 19 | 7 << 9 | 296),
+                7 << 24,
+                word(LOAD_SYNC, 3),
+                0,
+                word(LOAD_TLUT, 0),
+                7 << 24 | 29 << 14,
+            ],
+            vec![
+                (ci8_address, ci8_address + 8),
+                (ci4_address, ci4_address + 8),
+                (unloaded_index_address, unloaded_index_address + 8),
+                (tlut_address, tlut_address + 60),
+            ],
+        )
+    }
+
+    fn ci_and_hostile_tlut_word_words(high_texels: u16) -> (Vec<u32>, Vec<(u32, u32)>) {
+        let index_address = 0x200;
+        let high_address = 0x300;
+        (
+            vec![
+                word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | 7),
+                index_address,
+                word(SET_TILE, 2 << 21 | 1 << 19 | 1 << 9),
+                7 << 24,
+                word(LOAD_SYNC, 0),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 28 << 12,
+                word(
+                    SET_TEXTURE_IMAGE,
+                    4 << 21 | 1 << 19 | u32::from(high_texels - 1),
+                ),
+                high_address,
+                word(SET_TILE, 4 << 21 | 1 << 19 | 1 << 9 | 256),
+                7 << 24,
+                word(LOAD_SYNC, 1),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | u32::from((high_texels - 1) * 4) << 12,
+            ],
+            vec![
+                (index_address, index_address + 8),
+                (high_address, high_address + u32::from(high_texels)),
+            ],
+        )
+    }
+
     #[test]
     fn single_load_tile_packet_reduces_to_the_n_equals_one_case() {
         let (words, ranges) = single_tile_words(0x200);
@@ -670,6 +824,220 @@ mod tests {
         let committed = publish(&mut state, fixture, pending);
         assert_eq!(committed.completed_loads(), 1);
         assert_eq!(state.generation(), 1);
+    }
+
+    #[test]
+    fn committed_reader_decodes_all_seven_direct_pairs_with_explicit_row_parity() {
+        let (words, ranges) = direct_reader_words();
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        let mut state = state;
+        publish(&mut state, fixture, pending);
+
+        // Advance the durable snapshot and overwrite only RGBA32's low bank.
+        // The resulting texel deliberately combines generation-2 RG with
+        // still-valid generation-1 BA; the reader binds the returned color
+        // to snapshot generation 2 rather than requiring uniform touch ages.
+        let mut decode_predecessor = RdpState::default();
+        for _ in 0..3 {
+            decode_predecessor.tmem_mut().load_sync().unwrap();
+        }
+        let later_address = 0x500;
+        let later_words = vec![
+            word(SET_TEXTURE_IMAGE, 4 << 21 | 1 << 19 | 7),
+            later_address,
+            word(SET_TILE, 4 << 21 | 1 << 19 | 1 << 9 | 16),
+            7 << 24,
+            word(LOAD_SYNC, 0),
+            0,
+            word(LOAD_TILE, 0),
+            7 << 24 | 28 << 12,
+        ];
+        let later = fixture_with_state(
+            later_words,
+            &[(later_address, later_address + 8)],
+            &decode_predecessor,
+        );
+        let pending =
+            execute_ordered_tmem_loads(&state, later.decoded.submitted(), &later.decoded).unwrap();
+        publish(&mut state, later, pending);
+        assert_eq!(state.generation(), 2);
+        assert_eq!(state.last_touched_generation(8 * 8), Some(1));
+        assert_eq!(state.last_touched_generation(16 * 8), Some(2));
+        assert_eq!(state.last_touched_generation(16 * 8 + 0x800), Some(1));
+
+        let addressed = |column| AddressedTmemTexel::new(column, 0, TmemFirstRowParity::Even);
+        let cases = [
+            (ImageFormat::Rgba, PixelSize::Bits16, 0, 0x0102),
+            (ImageFormat::IntensityAlpha, PixelSize::Bits4, 1, 0x1),
+            (ImageFormat::IntensityAlpha, PixelSize::Bits8, 1, 0x02),
+            (ImageFormat::IntensityAlpha, PixelSize::Bits16, 1, 0x0304),
+            (ImageFormat::Intensity, PixelSize::Bits4, 1, 0x1),
+            (ImageFormat::Intensity, PixelSize::Bits8, 4, 0x05),
+        ];
+        for (format, size, column, raw) in cases {
+            let actual = read_committed_texel(
+                &state,
+                reader_tile(format, size, 1, 8, 0),
+                addressed(column),
+                TextureLutMode::Disabled,
+            )
+            .unwrap();
+            let expected =
+                decode_direct_texel(format, RawTexel::try_new(size, raw).unwrap()).unwrap();
+            assert_eq!(actual.texel(), expected);
+            assert_eq!(actual.snapshot().state(), state.identity());
+            assert_eq!(actual.snapshot().generation(), 2);
+        }
+
+        let rgba32 = read_committed_texel(
+            &state,
+            reader_tile(ImageFormat::Rgba, PixelSize::Bits32, 1, 16, 0),
+            addressed(0),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(
+            rgba32.texel(),
+            decode_direct_texel(
+                ImageFormat::Rgba,
+                RawTexel::try_new(PixelSize::Bits32, 0x0001_2223).unwrap(),
+            )
+            .unwrap()
+        );
+
+        let wrapped_odd_first_row = read_committed_texel(
+            &state,
+            reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 511, 0),
+            AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Odd),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(wrapped_odd_first_row.texel().rgba8888(), [0x08; 4]);
+        let wrapped_even_second_row = read_committed_texel(
+            &state,
+            reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 511, 0),
+            AddressedTmemTexel::new(0, 1, TmemFirstRowParity::Odd),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(wrapped_even_second_row.texel().rgba8888(), [0x10; 4]);
+    }
+
+    #[test]
+    fn committed_reader_resolves_absolute_offset_tlut_for_ci4_and_ci8() {
+        // Programming Manual section 13.8's partial-CI8 pattern: palette
+        // indices 40..=69 occupy absolute TMEM words 256+40 through 256+69.
+        // Nothing is loaded into the lower TLUT words.
+        let (words, ranges) = ci_and_offset_tlut_reader_words();
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        let mut state = state;
+        publish(&mut state, fixture, pending);
+
+        let ci4 = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits4, 1, 1, 2);
+        let ci8 = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 15);
+        let unloaded_ci8 = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 2, 0);
+        let even = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+        let odd = AddressedTmemTexel::new(1, 0, TmemFirstRowParity::Even);
+
+        assert_eq!(
+            read_committed_texel(&state, ci4, even, TextureLutMode::Disabled)
+                .unwrap()
+                .texel()
+                .rgba8888(),
+            [0x28; 4]
+        );
+        assert_eq!(
+            read_committed_texel(&state, ci4, odd, TextureLutMode::Disabled)
+                .unwrap()
+                .texel()
+                .rgba8888(),
+            [0x29; 4]
+        );
+        assert_eq!(
+            read_committed_texel(&state, ci8, even, TextureLutMode::Disabled)
+                .unwrap()
+                .texel()
+                .rgba8888(),
+            [0x28; 4],
+            "CI8 must ignore the tile palette"
+        );
+
+        for (tile, addressed, raw_entry) in
+            [(ci4, even, 0x0001), (ci4, odd, 0x0203), (ci8, even, 0x0001)]
+        {
+            for (mode, entry_format) in [
+                (TextureLutMode::Rgba16, ImageFormat::Rgba),
+                (TextureLutMode::Ia16, ImageFormat::IntensityAlpha),
+            ] {
+                let actual = read_committed_texel(&state, tile, addressed, mode).unwrap();
+                let expected = decode_direct_texel(
+                    entry_format,
+                    RawTexel::try_new(PixelSize::Bits16, raw_entry).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(actual.texel(), expected);
+                assert_eq!(actual.snapshot().state(), state.identity());
+                assert_eq!(actual.snapshot().generation(), 1);
+            }
+        }
+
+        assert_eq!(
+            read_committed_texel(&state, unloaded_ci8, even, TextureLutMode::Rgba16),
+            Err(PhysicalTexelReadError::IncompleteTlutEntry {
+                byte_address: 0x800,
+                valid_mask: 0,
+            }),
+            "an offset partial palette must not be rebased onto lower indices"
+        );
+    }
+
+    #[test]
+    fn committed_reader_rejects_partial_and_unequal_tlut_words() {
+        let ci8 = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 0);
+        let addressed = AddressedTmemTexel::new(0, 0, TmemFirstRowParity::Even);
+
+        let (words, ranges) = ci_and_hostile_tlut_word_words(2);
+        let partial_fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending = execute_ordered_tmem_loads(
+            &state,
+            partial_fixture.decoded.submitted(),
+            &partial_fixture.decoded,
+        )
+        .unwrap();
+        let mut partial = state;
+        publish(&mut partial, partial_fixture, pending);
+        assert_eq!(
+            read_committed_texel(&partial, ci8, addressed, TextureLutMode::Rgba16),
+            Err(PhysicalTexelReadError::IncompleteTlutEntry {
+                byte_address: 0x800,
+                valid_mask: 0x03,
+            })
+        );
+
+        let (words, ranges) = ci_and_hostile_tlut_word_words(8);
+        let fixture = fixture(words, &ranges);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        let mut unequal = state;
+        publish(&mut unequal, fixture, pending);
+        assert_eq!(
+            read_committed_texel(&unequal, ci8, addressed, TextureLutMode::Ia16),
+            Err(PhysicalTexelReadError::NonCanonicalTlutEntry {
+                byte_address: 0x800,
+                lanes: [0x0001, 0x0203, 0x0405, 0x0607],
+            })
+        );
     }
 
     #[test]

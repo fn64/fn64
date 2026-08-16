@@ -942,8 +942,9 @@ The accelerated wave keeps dependency-safe work active in parallel:
     reads, receipts every device-local effect, and publishes durable state only
     after guest commit. Public hardware authority overrides RT64's known
     source-size, starting-row, invalid-command, and host-layout shortcuts.
-19. **M4.3 -- load TLUT and decode committed textures (RUNNING; M4.3.2 and
-    M4.3.3a INTEGRATED, `aec0ae1b`/`1f0a3213`; M4.3.3b THIS CHANGE).**
+19. **M4.3 -- load TLUT and decode committed textures (RUNNING; M4.3.2,
+    M4.3.3a, and M4.3.3b INTEGRATED, `aec0ae1b`/`1f0a3213`/`fcd2b16a`;
+    M4.3.3c THIS CHANGE).**
     Keep load semantics, physical TMEM, packed texture decode, sampling, and
     cache identity separate. `LoadTLUT` writes quadricated 16-bit entries into
     high-half TMEM; the CPU oracle and owned WGSL then cover RGBA16/32,
@@ -958,10 +959,29 @@ The accelerated wave keeps dependency-safe work active in parallel:
     lookups at `0x800 + index * 8`. A caller-supplied big-endian 16-bit entry
     reuses M4.3.3a's RGBA16/IA16 conversion. This slice does not read physical
     TMEM or claim validity/epoch/generation/snapshot, footprint, addressing,
-    sampling/filtering, cache, GPU, production, parity, or performance. The
-    later physical reader must bind index and entry to one immutable state
-    identity/generation; the exact quadricated validity footprint remains an
-    authority blocker.
+    sampling/filtering, cache, GPU, production, parity, or performance. This
+    pure-value slice leaves state/generation binding and the exact
+    quadricated validity footprint to the physical reader below.
+    M4.3.3c adds that physical reader over durable `PhysicalTmemState` only.
+    The caller supplies an already-addressed integer column/row plus explicit
+    first-row parity; the reader applies line stride, wrapping, odd-row XOR4,
+    packed CI4 nibble selection, big-endian direct values, and RGBA32 low/high
+    bank reads without inferring parity or performing sampling. It preflights
+    through the M4.3.3a/b pure decoders before any read, requires complete
+    validity while allowing byte touch generations to predate the current
+    durable generation, and returns the decoded color with one captured state
+    identity/generation. Enabled CI4/CI8 is restricted to canonical low-half
+    sources and absolute `0x800 + index * 8` lookup. The Programming Manual
+    section 13.8 partial-CI8 example places indices 40..=69 at absolute TMEM
+    words 296..=325 (`256 + index`), rather than rebasing index 40 onto word
+    256; the committed fixture exercises that same placement. Requiring all
+    eight quadricated bytes to be valid and their four big-endian 16-bit lanes
+    equal is this reader's admitted conservative canonical subset, not a claim
+    that partial or unequal words are unsampleable on hardware. Which lane the
+    RDP samples in those cases remains deferred to a sample-lane hardware
+    measurement. This slice adds no coordinate normalization,
+    sampling/filtering/LOD, YUV, CI16/CI32, cache, WGSL/GPU, production
+    dispatch, parity, or performance claim.
 
 ### M0 evidence ledger
 

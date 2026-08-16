@@ -29,11 +29,18 @@
 //! CI/TLUT, YUV, or GPU claim. M4.3.3b adds pure CI4/CI8 index normalization,
 //! typed disabled/RGBA16/IA16 TLUT resolution, canonical lookup values, and
 //! caller-supplied 16-bit entry decode; it deliberately performs no physical
-//! TMEM read or validity/generation check. RT64 is not hardware authority for
-//! this module.
+//! TMEM read or validity/generation check. M4.3.3c's [`read`] module binds
+//! those pure decoders to durable physical TMEM, explicit caller-owned
+//! first-row parity, complete validity footprints, one state/generation
+//! snapshot, and the conservative canonical all-eight-valid/equal TLUT
+//! subset. Partial/unequal sample-lane behavior remains deferred to hardware
+//! measurement. It performs no coordinate normalization, sampling, filtering,
+//! cache, GPU, or production work. RT64 is not hardware authority for this
+//! module.
 
 mod execute;
 mod physical;
+mod read;
 mod state;
 mod texel;
 mod types;
@@ -50,6 +57,10 @@ pub use physical::{
     PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,
     PhysicalTmemPublicationAuthority, PhysicalTmemState, PhysicalTmemStateIdentity,
     PhysicalTmemTransactionIdentity, StagedTmemTransaction,
+};
+pub use read::{
+    read_committed_texel, AddressedTmemTexel, DecodedPhysicalTexel, PhysicalTexelReadError,
+    PhysicalTmemSnapshotIdentity, TmemFirstRowParity,
 };
 pub use state::{TileState, TmemState};
 pub use texel::{
