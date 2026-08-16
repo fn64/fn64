@@ -17,6 +17,7 @@ mod error;
 mod guest_read;
 mod journal;
 mod record;
+mod rsp_math;
 mod ticket;
 mod workload;
 
@@ -46,6 +47,11 @@ pub use journal::{
 };
 pub use record::{
     RawStreamRecord, WorkloadRecord, MAX_WORKLOAD_RECORD_BYTES, WORKLOAD_RECORD_SCHEMA,
+};
+pub use rsp_math::{
+    compute_attenuation, compute_dir_light, compute_length, compute_n_dot_l, compute_pos_light,
+    Mat4, RspFog, RspLight, RspLookAt, RspVertexTestZCb, RspViewport, Vec3, Vec4,
+    RSP_LOOKAT_INDEX_ENABLED, RSP_LOOKAT_INDEX_LINEAR, RSP_LOOKAT_INDEX_SHIFT,
 };
 pub use ticket::{
     effect_content_digest, BackendCompletionAuthority, BackendEffectReport, CompletedWrite,
