@@ -34,6 +34,22 @@ KNOWN_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 SPIR-V parse failed: unsupp
 SCALAR_LAYOUT_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 naga validation failed: Global variable [0] 'instanceRDPParams' is invalid\n"
 SAMPLED_BUFFER_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 SPIR-V parse failed: unsupported capability SampledBuffer\n"
 FRAGMENT_INTERFACE_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 naga validation failed: Entry point PSMain at Fragment is invalid\n"
+# SPIR-V Decoration enum (pinned SPIRV-Headers commit 29981f65241605e08b0ede4cfeb999fe3b723c6a,
+# spirv.core.grammar.json sha256 fc328b3a978cf6128617c679f1932717fb9a5fdbc9049c4124c2cc5f2f35cb4b,
+# same pin accepted for the validator closure grammar in docs/rt64-reference-shader-artifact-schema.json).
+# Index=32 is the dual-source-blend output index; InputAttachmentIndex=43 is a distinct decoration
+# (Vulkan subpass inputs) and must never be substituted here.
+SPIRV_DECORATION_LOCATION = 30
+SPIRV_DECORATION_INDEX = 32
+SPIRV_DECORATION_INPUT_ATTACHMENT_INDEX = 43  # distinct decoration; never read as Index
+# base.require (not `assert`) so this pin survives `python -O`, where bare asserts are
+# stripped. Pins the complete tuple, not just pairwise distinctness, so a future edit
+# cannot swap in a different wrong Location/Index/InputAttachmentIndex triple that
+# still happens to be pairwise distinct.
+base.require(
+    (SPIRV_DECORATION_LOCATION, SPIRV_DECORATION_INDEX, SPIRV_DECORATION_INPUT_ATTACHMENT_INDEX) == (30, 32, 43),
+    "SPIR-V Decoration constants do not match the pinned Location/Index/InputAttachmentIndex values",
+)
 RUNTIME_NOT_READY_EXIT = 78
 PROFILE_EXTENTS = (4, 8, 16, 20, 24, 32, 40, 56)
 PROFILE_NAMES = ("baseline", *(f"immediates-{extent}" for extent in PROFILE_EXTENTS))
@@ -915,8 +931,8 @@ def fragment_interface_witness(artifact_bytes: bytes, stage: str, entry: str, po
     value_type = pointer[1]
     component_id, vector_length = vector_types.get(value_type, (None, None))
     base.require(component_id is not None and vector_length == 4 and float_types.get(component_id) == 32, "fragment-interface witness member type changed")
-    base.require(decorations.get((variable_id, 30)) == (expected["location"],), "fragment-interface witness location changed")
-    base.require(decorations.get((variable_id, 43)) == (expected["index"],), "fragment-interface witness index changed")
+    base.require(decorations.get((variable_id, SPIRV_DECORATION_LOCATION)) == (expected["location"],), "fragment-interface witness location changed")
+    base.require(decorations.get((variable_id, SPIRV_DECORATION_INDEX)) == (expected["index"],), "fragment-interface witness index changed")
     fields = {
         "schema": "fn64.spirv-fragment-blend-src-index-output-witness.v1",
         "stage": stage, "entry": entry, "variable_name": names[variable_id],

@@ -114,6 +114,7 @@ def fragment_interface_fixture(
     index: int = 0,
     missing_location: bool = False,
     missing_index: bool = False,
+    index_decoration_kind: int = subject.SPIRV_DECORATION_INDEX,
     execution_model: int = 4,
 ) -> bytes:
     words = [0x07230203, 0x00010000, 0, 10, 0]
@@ -131,9 +132,9 @@ def fragment_interface_fixture(
     instruction(15, execution_model, 8, *literal(entry), *interface_ids)  # OpEntryPoint
     instruction(5, 9, *literal(variable_name))  # OpName
     if not missing_location:
-        instruction(71, 9, 30, location)  # Decorate Location
+        instruction(71, 9, subject.SPIRV_DECORATION_LOCATION, location)  # Decorate Location
     if not missing_index:
-        instruction(71, 9, 43, index)  # Decorate Index
+        instruction(71, 9, index_decoration_kind, index)  # Decorate Index (or a hostile substitute kind)
     type_ids = {"float": 1, "uint": 2, "int": 3}
     instruction(22, 1, 32)  # OpTypeFloat 32-bit
     instruction(21, 2, 32, 0)  # OpTypeInt uint
@@ -261,6 +262,42 @@ class PolicyTests(unittest.TestCase):
         policy["wgpu_validator"]["binary_sha256"] = "0" * 64
         with mock.patch.object(base, "load_json", return_value=policy), self.assertRaisesRegex(base.ArtifactError, "guessed hashes"):
             subject.load_policy()
+
+
+class DecorationConstantImportGuardTests(unittest.TestCase):
+    """Proves the Location/Index/InputAttachmentIndex pin fires at import time and
+    survives `python -O`, where a bare `assert` would silently vanish."""
+
+    def run_tampered_import(self, replacement_index: int, *, optimized: bool) -> subprocess.CompletedProcess[bytes]:
+        source = subject.__file__
+        original = Path(source).read_text()
+        # Tamper with a value that is still pairwise-distinct from the other two, so a
+        # weaker pairwise-only guard (the pre-repair form) would have let this through.
+        self.assertNotEqual(replacement_index, subject.SPIRV_DECORATION_INPUT_ATTACHMENT_INDEX)
+        self.assertNotEqual(replacement_index, subject.SPIRV_DECORATION_LOCATION)
+        tampered = original.replace(
+            "SPIRV_DECORATION_INDEX = 32", f"SPIRV_DECORATION_INDEX = {replacement_index}", 1,
+        )
+        self.assertNotEqual(tampered, original, "tamper target line not found")
+        with tempfile.TemporaryDirectory() as tmp:
+            tampered_path = Path(tmp) / "rt64_wgpu_shader_assessment.py"
+            tampered_path.write_text(tampered)
+            args = [sys.executable]
+            if optimized:
+                args.append("-O")
+            args += ["-c", "import rt64_wgpu_shader_assessment"]
+            env = {**os.environ, "PYTHONPATH": f"{tmp}:{Path(source).resolve().parent}"}
+            return subprocess.run(args, env=env, capture_output=True)
+
+    def test_tampered_index_constant_fails_import_normally(self) -> None:
+        result = self.run_tampered_import(33, optimized=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"pinned Location/Index/InputAttachmentIndex", result.stderr)
+
+    def test_tampered_index_constant_fails_import_under_dash_o(self) -> None:
+        result = self.run_tampered_import(33, optimized=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"pinned Location/Index/InputAttachmentIndex", result.stderr)
 
 
 class ReferenceReceiptSerializationTests(unittest.TestCase):
@@ -749,6 +786,29 @@ class FragmentInterfaceClassificationTests(unittest.TestCase):
     def test_fragment_interface_witness_rejects_wrong_index(self) -> None:
         with self.assertRaisesRegex(base.ArtifactError, "index"):
             subject.fragment_interface_witness(fragment_interface_fixture(index=1), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_accepts_exact_decoration_index_value(self) -> None:
+        # Literal 32, not subject.SPIRV_DECORATION_INDEX: if the subject constant were
+        # itself wrong, referencing it here would make accept and reject correlated-wrong
+        # again, exactly the bug this test exists to catch.
+        self.assertEqual(subject.SPIRV_DECORATION_INDEX, 32)
+        module = fragment_interface_fixture(index_decoration_kind=32)
+        witness = subject.fragment_interface_witness(module, "fragment", "PSMain", self.policy)
+        self.assertEqual(witness["index"], 0)
+
+    def test_fragment_interface_witness_rejects_input_attachment_index_decoration(self) -> None:
+        self.assertEqual(subject.SPIRV_DECORATION_INPUT_ATTACHMENT_INDEX, 43)
+        module = fragment_interface_fixture(index_decoration_kind=43)
+        with self.assertRaisesRegex(base.ArtifactError, "index"):
+            subject.fragment_interface_witness(module, "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_duplicate_index_decoration(self) -> None:
+        module = fragment_interface_fixture()
+        words = list(struct.unpack(f"<{len(module) // 4}I", module))
+        extra = [(4 << 16) | 71, 9, subject.SPIRV_DECORATION_INDEX, 0]  # duplicate Decorate Index
+        mutated = struct.pack(f"<{len(words) + len(extra)}I", *(words + extra))
+        with self.assertRaisesRegex(base.ArtifactError, "duplicate OpDecorate"):
+            subject.fragment_interface_witness(mutated, "fragment", "PSMain", self.policy)
 
     def test_fragment_interface_witness_rejects_group_decoration(self) -> None:
         module = fragment_interface_fixture()
