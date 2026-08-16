@@ -50,6 +50,11 @@
 //! quantization, copy addressing, filter selection and lanes, unequal TLUT
 //! banks, cache, GPU, raster integration, parity, and performance remain out
 //! of scope.
+//! M2.5.3a adds one repository-owned WGSL component for M4.3.3a's exact
+//! seven direct texel conversions. Its closed manifest, baseline device
+//! profile, Naga validation, and CPU oracle establish candidate mechanics.
+//! The component remains `NotQualified` and `NativeUnverified`; no complete
+//! RT64 shader-denominator row is promoted.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -218,6 +223,7 @@ mod device;
 mod lifecycle;
 mod native_contract;
 mod raw_dpc;
+mod shader_manifest;
 mod state;
 mod targets;
 mod tmem;
@@ -249,6 +255,22 @@ pub use raw_dpc::{
     decode_raw_dpc, decode_raw_dpc_after, BoundTmemTransfer, DecodedRawDpc, DecodedRawDpcCommand,
     FillRectangle, RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError, RawDpcResourcePlan,
     TmemLoadSourcePlanError,
+};
+pub use shader_manifest::{
+    DirectTexelDecodeDeviceProfile, DirectTexelDecodeNativeError, DirectTexelDecodeNativeReceipt,
+    DirectTexelDecodeProfileError, DirectTexelShaderInput, DirectTexelShaderStatus,
+    RuntimeShaderComponentId, RuntimeShaderComponentManifest, RuntimeShaderNativeState,
+    RuntimeShaderPromotion, RuntimeShaderStage, ValidatedDirectTexelDecodeProfile,
+    DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS, DIRECT_TEXEL_DECODE_CASES,
+    DIRECT_TEXEL_DECODE_DENOMINATOR_PATH, DIRECT_TEXEL_DECODE_DENOMINATOR_SHA256,
+    DIRECT_TEXEL_DECODE_DEPENDENCY_SOURCES, DIRECT_TEXEL_DECODE_ENTRY_POINT,
+    DIRECT_TEXEL_DECODE_EXPECTED_SHA256, DIRECT_TEXEL_DECODE_FIXTURE_SCHEMA,
+    DIRECT_TEXEL_DECODE_FIXTURE_SHA256, DIRECT_TEXEL_DECODE_FORMATS_SHA256,
+    DIRECT_TEXEL_DECODE_INPUT_BYTES, DIRECT_TEXEL_DECODE_INPUT_SHA256,
+    DIRECT_TEXEL_DECODE_MANIFEST, DIRECT_TEXEL_DECODE_OUTPUT_BYTES,
+    DIRECT_TEXEL_DECODE_RT64_SOURCE_COMMIT, DIRECT_TEXEL_DECODE_SOURCE_SHA256,
+    DIRECT_TEXEL_DECODE_TEXTURE_DECODER_SHA256, DIRECT_TEXEL_DECODE_WGSL,
+    DIRECT_TEXEL_DECODE_WORKGROUPS,
 };
 pub use state::{
     ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, RdpState, RdpStateDelta,

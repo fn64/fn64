@@ -465,6 +465,23 @@ A machine with no selected native adapter returns the typed `NoAdapter`
 outcome; that is unsupported host evidence, not a skipped or passing GPU
 claim.
 
+M2.5.3a retains a separate repository-owned compute shader for the seven
+direct texel conversions already implemented by `tmem::decode_direct_texel`:
+RGBA16, RGBA32, IA4, IA8, IA16, I4, and I8. Its closed manifest exposes no raw
+feature or limit selection, requests no optional wgpu feature, and labels the
+21 denominator rows whose source closure contains the shared format helper as
+candidate consumers only. The manifest state is explicitly `NotQualified` and
+`NativeUnverified`. Naga validation plus the deterministic 131,710-case CPU
+oracle fixture establish candidate mechanics; they qualify no component and
+promote zero complete shader rows. The available host had no native adapter,
+so no native receipt exists. A future opt-in host run requires a named native
+adapter, exact frozen source/entry/fixture/input/expected identities, the exact
+typed device contract, checked module/pipeline creation, exact submission
+completion, callback observation, bounded readback, and exact output bytes.
+Qualification requires 10 consecutive clean native runs of one frozen source;
+a missing adapter, one run, or CPU/Naga evidence cannot satisfy that gate. See
+[`../../docs/RT64-RUNTIME-SHADER-CORPUS.md`](../../docs/RT64-RUNTIME-SHADER-CORPUS.md).
+
 Provenance: command fields, load-word layout, DXT, and fill-cycle rules use the
 public SGI *RDP Command Summary* and the public Nintendo 64 Programming
 Manual section 13.9, plus public libultra `gDPSetCycleType`, `gDPSetColorImage`,

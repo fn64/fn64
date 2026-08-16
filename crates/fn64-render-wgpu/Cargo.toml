@@ -17,4 +17,5 @@ wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "met
 
 [dev-dependencies]
 fn64-runtime = { path = "../fn64-runtime" }
+naga = { version = "=30.0.0", default-features = false, features = ["wgsl-in"] }
 sha2 = "0.10"
