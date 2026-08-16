@@ -619,6 +619,90 @@ compare, dither, `Interpenetrating`-mode coverage-wrap adjustment (an
 unresolved gap in the reference itself), framebuffer read, draw-call
 integration, or native GPU execution is claimed or exercised by this slice.
 
+## Coverage: pure `cvg_dst` semantics (port-card slice 5)
+
+`coverage` is the fifth characterization-first slice from the same RT64
+blender/coverage/alpha-compare/depth/render-target port card the depth slice
+above draws from (a read-only planning artifact, §2 "Coverage" — not a
+file committed to this repository): a literal, self-contained re-expression
+of `fn64-render-reference`'s coverage
+model (`crates/fn64-render-reference/src/raster/{mod,coverage}.rs`) as plain
+value-in/value-out Rust functions plus a matching WGSL compute-shader seam.
+As with the depth slice, `fn64-render-wgpu` has no crate dependency on
+`fn64-render-reference`; every arithmetic fact here is inherited from that
+crate's existing citations, ported as literal Rust, not rederived, and no
+RT64 source byte is read or cited directly by this module.
+
+The module carries: `Coverage`, an invariant-carrying newtype for the RDP's
+0..=8 subpixel population count (`Coverage::new` panics rather than clamps
+above eight, matching the reference's loud-trap convention), its RDRAM
+3-bit `stored`/`from_stored` round-trip (`count - 1`, only the low three
+bits consulted on decode), and its two blender-facing encodings —
+`alpha()` (`(count*255 + 4) / 8`, an explicitly documented open frontier for
+the RDP's unpublished internal encoding, not a hardware fact) and
+`times_alpha()` (`(count*alpha + 127) / 255`, likewise an open rounding
+frontier). `coverage_result` is the `cvg_dst` accumulation itself: given a
+`pixel`/`memory` coverage pair and four independently-decoded `OtherMode`
+bits (`image_read_enabled`, `force_blend`, `antialias_enabled`, and the
+`CoverageDestination` selector reused from `crate::state` rather than
+duplicated — see below), it derives `sum`, the `wraps` boundary
+(`image_read_enabled && sum > 8`), the three-input `blend_enabled` truth
+table (`force_blend || (antialias_enabled && !wraps)`), and the
+`destination` coverage under each of the four `CoverageDestination` modes:
+**Clamp** (`min(sum, 8)` when image-read and blend are both live, else the
+raw pixel count), **Wrap** (`sum - 8` once wrapped, else `sum`, only under
+image-read), **Full** (always `Coverage::FULL`), and **Save** (memory
+passed through unchanged, no accumulation at all). `apply_coverage_alpha`
+is the separate coverage-to-alpha interaction: `coverage_times_alpha`
+multiplies coverage by the fragment's current alpha channel first;
+`alpha_coverage_select` then independently overwrites that alpha channel
+with the (possibly multiplied) coverage's `alpha()` encoding — the two bits
+compose, and either, both, or neither may be set. `CoverageMask` carries the
+eight public subpixel sample positions (`COVERAGE_SAMPLES`, in eighth-pixel
+units) as an 8-bit population bitmask, and `attribute_sample` selects one
+on-primitive attribute-correction point from a partial mask via the
+reference's `NearestToPixelCenterStableOrder` policy — explicitly an fn64
+policy choice for an unpublished silicon lookup, not a discovered hardware
+centroid rule, carried into this module verbatim rather than re-derived.
+
+`state::CoverageDestination` (added by the OtherMode bitfield-decode slice
+that landed as this module's dependency) is imported and reused verbatim
+here rather than duplicated — `coverage.rs` does not define its own
+`CoverageDestination` enum or a `from_wire` decoder; that decode, and its
+own exhaustive four-encoding test, live solely in `state.rs`'s
+`OtherMode::coverage_destination`. This module still does not read
+`OtherMode` itself: callers extract the four plain mode-bit values from
+their own `OtherMode` and pass them in via `CoverageModeBits`, preserving
+the pure value-in/value-out seam every other slice in this file follows.
+
+The WGSL seam (`COVERAGE_WGSL`, entry point `COVERAGE_ENTRY_POINT`) mirrors
+`coverage_result` and `apply_coverage_alpha`'s arithmetic in one closed
+compute shader over a `CoverageInput`/`CoverageOutput` storage-buffer pair,
+not wired into any draw path, bind group layout, or pipeline used elsewhere
+in this crate. `naga` validates the retained source under an empty
+capability set. Every branch — the four `CoverageDestination` modes, the
+`wraps`/`blend_enabled` derivation, and the alpha-composition block
+(`coverage_times_alpha`/`alpha_coverage_select`'s sequencing, where
+`alpha_coverage_select` must read the *already* times-alpha-adjusted
+coverage, not the raw destination) — has both a textual/structural
+guard (pinning the exact source line so a semantic mutation that still
+parses/validates under naga fails at the Rust level instead) and a
+differential oracle interpreting that frozen WGSL text in Rust against the
+Rust implementation across the exhaustive fixture matrices.
+
+Explicitly out of scope, matching the port card's own step ordering
+(coverage is step 5 of 10, framebuffer reads are step 8): the
+framebuffer-read mechanism that supplies `memory: Coverage` in the first
+place (no storage-texture read-write binding, no "read old value" pass, no
+GPU-side old-coverage sampling of any kind), any draw-path wiring, RHI,
+bind groups, or global/mutable state. `CoverageMask::from_samples` (the
+reference's rasterizer-integration closure that samples real triangle/line
+geometry) is likewise out of scope; this module's `CoverageMask` is
+constructed only from a raw 8-bit mask (`CoverageMask::from_bits`), since
+this slice owns no rasterizer to sample against. This slice cites, reads,
+and claims no RT64 source byte, no framebuffer-read GPU mechanism, no
+native/GPU-verified execution, and no parity of any kind.
+
 ## T3 Phase A/B: the production raw-DPC `WgpuBackend`
 
 Separately from the M-numbered lineage above (a different migration track:
