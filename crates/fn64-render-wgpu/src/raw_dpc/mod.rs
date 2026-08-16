@@ -143,10 +143,12 @@ impl RawDpcResourcePlan {
 #[derive(Debug)]
 pub struct DecodedRawDpc {
     submitted: SubmittedTicket,
+    base_state: RdpState,
     commands: Box<[DecodedRawDpcCommand]>,
     state_delta: RdpStateDelta,
     staged_state: StagedRdpState,
     resource_plan: RawDpcResourcePlan,
+    origin: RawDpcDecodeOrigin,
 }
 
 impl DecodedRawDpc {
@@ -173,6 +175,34 @@ impl DecodedRawDpc {
     pub fn into_staged_state(self) -> StagedRdpState {
         self.staged_state
     }
+
+    pub(crate) fn into_contract_parts(self) -> DecodedRawDpcParts {
+        DecodedRawDpcParts {
+            submitted: self.submitted,
+            base_state: self.base_state,
+            commands: self.commands,
+            state_delta: self.state_delta,
+            staged_state: self.staged_state,
+            resource_plan: self.resource_plan,
+            origin: self.origin,
+        }
+    }
+}
+
+pub(crate) struct DecodedRawDpcParts {
+    pub(crate) submitted: SubmittedTicket,
+    pub(crate) base_state: RdpState,
+    pub(crate) commands: Box<[DecodedRawDpcCommand]>,
+    pub(crate) state_delta: RdpStateDelta,
+    pub(crate) staged_state: StagedRdpState,
+    pub(crate) resource_plan: RawDpcResourcePlan,
+    pub(crate) origin: RawDpcDecodeOrigin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawDpcDecodeOrigin {
+    Durable,
+    SpeculativeStaged,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -273,7 +303,11 @@ pub fn decode_raw_dpc(
     submitted: SubmittedTicket,
     durable_state: &RdpState,
 ) -> Result<DecodedRawDpc, RawDpcDecodeError> {
-    decode_from_state(submitted, durable_state.fork_for_decode())
+    decode_from_state(
+        submitted,
+        durable_state.fork_for_decode(),
+        RawDpcDecodeOrigin::Durable,
+    )
 }
 
 pub fn decode_raw_dpc_after(
@@ -306,13 +340,19 @@ pub fn decode_raw_dpc_after(
             reason: "raw-DPC transaction sequence is not the immediate successor",
         });
     }
-    decode_from_state(submitted, state)
+    decode_from_state(submitted, state, RawDpcDecodeOrigin::SpeculativeStaged)
 }
 
 fn decode_from_state(
     submitted: SubmittedTicket,
     mut state: RdpState,
+    origin: RawDpcDecodeOrigin,
 ) -> Result<DecodedRawDpc, RawDpcDecodeError> {
+    // The contract layer compares this immutable predecessor with its
+    // exclusively borrowed durable state before it admits GPU work. Keeping
+    // the proof inside the move-only decoded value closes the otherwise-safe
+    // but incorrect possibility of preparing a decode against another state.
+    let base_state = state.fork_for_decode();
     let packet = submitted.packet();
     let workload = packet.identity();
     let WorkloadAdmission::RawDpc {
@@ -371,12 +411,14 @@ fn decode_from_state(
 
     Ok(DecodedRawDpc {
         submitted,
+        base_state,
         commands: commands.into_boxed_slice(),
         state_delta: delta,
         staged_state,
         resource_plan: RawDpcResourcePlan {
             accesses: resource_accesses,
         },
+        origin,
     })
 }
 
