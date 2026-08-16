@@ -1,6 +1,6 @@
 {
   "schema": "fn64.rt64-shader-artifact-policy.v1",
-  "receipt_schema": "fn64.rt64-shader-artifact-receipt.v1",
+  "receipt_schema": "fn64.rt64-shader-artifact-receipt.v2",
   "source_denominator_schema": "fn64.rt64-shader-source-denominator.v1",
   "build_receipt_schema": "fn64.dxc-source-build.v2",
   "git_checkout_maximum_file_bytes": 268435456,
@@ -224,6 +224,7 @@
     ],
     "maximum_source_bytes": 1048576,
     "maximum_preprocessed_bytes": 8388608,
+    "maximum_dependency_output_bytes": 1048576,
     "maximum_dependency_manifest_bytes": 1048576,
     "maximum_artifact_bytes": 4194304,
     "maximum_receipt_bytes": 4194304
