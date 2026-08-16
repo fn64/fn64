@@ -1305,3 +1305,75 @@ GPU, parity, or performance claim of any kind. `RDP::updateCallTexcoords`'s
 tracked-tile texcoord bookkeeping and the scissor-intersected `intU1`/
 `intV1`/`intU2`/`intV2` branch are workload/tile-tracking side effects this
 pure conversion has no state to attach to and does not reproduce.
+
+## RT64 fragment PRNG (`random`)
+
+`random` is a characterization-first literal port of the permitted MIT RT64
+Rust-port source pinned at commit `5473732a822a4423b5696e7cb18fecc425a59875`
+(`docs/RT64-PORT-AUTHORITY.md`), `src/shaders/Random.hlsli` (SHA-256
+`6ce04cebcd02f7269464684f60c1448e8fb2d0d172d93b8860ff1cca5a114fb9`): `initRand`,
+`nextRandUint`, and `nextRand`. Its permitted call sites were read directly
+from the same pinned local checkout (SHA-256-verified against
+`RasterPS.hlsl`'s already-pinned `957b2834…` digest in
+`docs/RT64-PORT-AUTHORITY.md`): `src/shaders/RasterPS.hlsl`,
+`PostBlendDitherNoisePS.hlsl`, `FbReinterpretCS.hlsl`, `FbWriteColorCS.hlsl`,
+and `DebugPS.hlsl` — every one uses the `backoff` default of `16` explicitly,
+never a different literal. Like `depth_strict_less`, `alpha_compare`, and
+`rgb_dither`, `fn64-render-wgpu` has no crate dependency on
+`fn64-render-reference`, so this is a self-contained literal re-expression
+citing RT64's source directly.
+
+**API.** [`RandomState`] wraps its `u32` generator word in a private field —
+a caller cannot construct one from an arbitrary integer, and a produced
+sample (`f32`, `next_unit_float`'s bare return type) can never be confused
+with a state. The only public constructors are `init_with_backoff(val0,
+val1, backoff)` (the literal three-argument `initRand`) and `init(val0,
+val1)` (the observed-default `backoff = 16` convenience form every named
+call site actually uses — HLSL default arguments have no Rust equivalent).
+`next_uint(&mut self)` is `nextRandUint`'s in-place `s = 1664525u * s +
+1013904223u`. `next_unit_float(&mut self) -> f32` is `nextRand`: advances via
+`next_uint` first, then returns `float(s & 0x00FFFFFF) / float(0x01000000)`
+from the *already-advanced* state — both the 24-bit mask and the exact
+`0x01000000` f32 divisor are ported as RT64's own literals, not simplified to
+an equivalent shift or a different power-of-two false economy. `raw(self) ->
+u32` is a read-only accessor matching the permitted overlay's own
+`Fn64RdpTakeFragmentNoiseSample`'s `sample.raw = fragmentRandomState`
+(`crates/fn64-render-rt64/ffi/fn64_rt64_raster_ps_overlay.hlsli:16-19`); there
+is no `from_raw` constructor, since no surveyed call site ever reads a
+generator word without first producing it through `init`/`init_with_backoff`.
+
+All arithmetic is wrapping `u32`, matching HLSL `uint`'s defined
+modular-add/multiply/shift semantics exactly — `backoff == 0` performs the
+loop's zero iterations and returns `val0` unmodified, and `nextRandUint`'s
+multiply-add wraps at the `u32` boundary rather than panicking or saturating.
+
+**Tests.** Independent literal characterization (every expected value
+hand-derived by a from-scratch reference implementation outside this crate,
+never by calling `RandomState`'s own methods): `backoff` 0/1/16 at zero, max,
+and mixed seeds; `u32` wrap boundaries for both `initRand`'s internal
+arithmetic and `nextRandUint`'s multiply-add; first and multi-step
+`nextRandUint`/`nextRand` sequences; the exact masked numerator and its f32
+quotient. Caller-shaped fixtures reproduce each named call site's exact seed
+composition (`RasterPS`'s `frameCount`/pixel-product seed with sequential
+combiner-then-alpha-compare draws proving order-sensitivity; three-channel
+sequential draws for `PostBlendDitherNoisePS` and `DebugPS`; the distinct
+flat-index vs. coordinate-product seed shapes for `FbWriteColorCS` and
+`FbReinterpretCS`). Mutation-shaped tests target swapped `v0`/`v1` update
+constants, wrong shift direction, non-wrapping arithmetic, wrong update
+order, mask/denominator drift, and return-before-advance. A bounded
+Rust-vs-WGSL differential parses the retained `random.wgsl` into Naga IR and
+cross-checks its literal hex/decimal constants and exposed function names
+against the Rust side, plus a small deterministic seed×backoff grid run
+against a from-scratch reference formula — this crate has no native-adapter
+execution path for WGSL (matching `rgb_dither.rs`'s precedent), so this is a
+structural/textual differential, not a GPU-executed one.
+
+**Scope.** This module characterizes `Random.hlsli` in isolation. It does
+not wire into `combiner`, `alpha_compare`, `rgb_dither`, any
+shader-pipeline/draw-path, `raw_dpc`, `state.rs`, `tmem`, the ABI/runtime, or
+any native GPU execution. It makes no randomness-quality claim (this is
+RT64's own PRNG, transcribed exactly, not evaluated), no silicon/hardware
+claim (the RDP's real noise generator remains unpublished, per
+`docs/RDP-SILICON-VECTORS.md`), and no parity or performance claim. This
+module does not modify `state.rs`, `combiner.rs`, `alpha_compare.rs`,
+`rgb_dither.rs`, or any other existing file.

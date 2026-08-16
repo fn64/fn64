@@ -298,6 +298,7 @@ mod device;
 mod lifecycle;
 mod native_contract;
 mod production;
+mod random;
 mod raw_dpc;
 mod rgb_dither;
 mod shader_manifest;
@@ -357,6 +358,7 @@ pub use native_contract::{
     NATIVE_FILL_WORKLOAD_SHA256,
 };
 pub use production::{WgpuBackend, WgpuBackendConstructionError, WgpuRawDpcExecutionError};
+pub use random::{RandomState, RANDOM_ENTRY_POINT, RANDOM_WGSL};
 pub use raw_dpc::{
     decode_raw_dpc, decode_raw_dpc_after, decode_triangle_vertices, push_decoded_raw_dpc,
     texture_rectangle_vertices, triangle_word_count, BoundTmemTransfer, CoefficientWords,
