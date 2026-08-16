@@ -10,15 +10,20 @@
 //! Programming Manual section 13.9; undefined word padding is never promoted
 //! to defined texture content. YUV retains a source-only deferred contract
 //! until its destination rules are frozen. TLUT's destination transfer-plan
-//! geometry (M4.3.1) and physical-lane mask (M4.3.1b) are frozen; TLUT's own
-//! destination execution is still deferred. Each transfer word's defined
-//! destination-byte mask is a distinct, checked fact from its defined
-//! source-byte mask -- equal by construction for Block/Tile, but not for
-//! TLUT, whose 2 captured source bytes quadricate into 8 defined destination
-//! bytes. M4.2a consumes those exact plans into one packet-local
-//! physical-state transaction, retaining intermediate load effects across
-//! overlaps and publishing durable state only after exact GPU and guest
-//! lifecycle evidence. RT64 is not hardware authority for this module.
+//! geometry (M4.3.1) and physical-lane mask (M4.3.1b) are frozen. Each
+//! transfer word's defined destination-byte mask is a distinct, checked fact
+//! from its defined source-byte mask -- equal by construction for Block/Tile,
+//! but not for TLUT, whose 2 captured source bytes quadricate into 8 defined
+//! destination bytes. M4.3.2's LoadTLUT executor (`execute::load_tlut`) maps
+//! that quadrication into M4.2a's physical TMEM lanes the same way M4.2b/c's
+//! LoadTile/LoadBlock executors already do, and `execute::packet`'s
+//! packet-level outer loop now dispatches `LoadTlut` alongside
+//! `LoadTile`/`LoadBlock` in decode order; a YUV-deferred Tile/Block contract
+//! remains the only refused load kind. M4.2a consumes those exact plans into
+//! one packet-local physical-state transaction, retaining intermediate load
+//! effects across overlaps and publishing durable state only after exact GPU
+//! and guest lifecycle evidence. RT64 is not hardware authority for this
+//! module.
 
 mod execute;
 mod physical;
@@ -27,9 +32,10 @@ mod types;
 mod wire;
 
 pub use execute::{
-    execute_ordered_tmem_loads, prepare_load_block, prepare_load_tile, ExecutedLoadBlock,
-    ExecutedLoadTile, LoadBlockExecutionError, LoadTileExecutionError, PreparedLoadBlock,
-    PreparedLoadTile, TmemPacketExecutionError,
+    execute_ordered_tmem_loads, prepare_load_block, prepare_load_tile, prepare_load_tlut,
+    ExecutedLoadBlock, ExecutedLoadTile, ExecutedLoadTlut, LoadBlockExecutionError,
+    LoadTileExecutionError, LoadTlutExecutionError, PreparedLoadBlock, PreparedLoadTile,
+    PreparedLoadTlut, TmemPacketExecutionError,
 };
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,

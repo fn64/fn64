@@ -158,40 +158,50 @@ Manual section 13.9 for hardware fields and transfer rules; project design
 docs for move-only commit sequencing. RT64 is not hardware authority for this
 state.
 
-Neither executor constructs a `BackendEffectReport`, issues a lifecycle
-receipt, or publishes durable state — that remains M4.2a's publication
-authority after an exact `GpuCompleteTicket`/`GuestCommittedTicket` pair.
-Neither executor uploads to a GPU or issues a GPU dispatch; both are
-CPU-only, transaction-local byte mapping. Neither handles TLUT or YUV
-destinations. Neither this slice nor its combination with M4.2a establishes
-visual parity or performance; no such claim is made anywhere in this
-document.
+Neither the LoadTile nor LoadBlock executor constructs a `BackendEffectReport`,
+issues a lifecycle receipt, or publishes durable state — that remains M4.2a's
+publication authority after an exact `GpuCompleteTicket`/`GuestCommittedTicket`
+pair. Neither executor uploads to a GPU or issues a GPU dispatch; both are
+CPU-only, transaction-local byte mapping. Neither this slice nor its
+combination with M4.2a establishes visual parity or performance; no such claim
+is made anywhere in this document.
+
+M4.3.2 adds a third executor, `prepare_load_tlut`/`PreparedLoadTlut::execute`
+(`tmem/execute/load_tlut.rs`), that maps one checked LoadTLUT transfer's exact
+packet-owned guest reads into M4.2a's physical TMEM the same way M4.2b's
+LoadTile and M4.2c's LoadBlock already do. TLUT's mapping is a different
+shape from Block/Tile's one-source-byte-per-destination-byte copy: each
+entry's 2 captured source bytes (a big-endian 16-bit palette value) are
+quadricated into all four 16-bit lanes of that entry's 8-byte high-bank
+destination word — `[hi, lo, hi, lo, hi, lo, hi, lo]` — never split-bank and
+never odd-row-exchanged, matching M4.3.1's frozen `Linear64` transfer-plan
+geometry (row advance equals the entry index directly, with no row/DXT
+accumulation grouping — unlike Block/Tile's row-grouped advance) and
+M4.3.1b's `defined_destination_byte_mask() == 0xff` fact. Like its siblings, this executor constructs no
+`BackendEffectReport`, issues no lifecycle receipt, publishes no durable
+state, and returns only transaction-local state plus ordered physical
+fragment descriptors.
 
 `tmem::execute_ordered_tmem_loads` (`tmem/execute/packet.rs`) is the packet-level
-outer loop neither executor nor M4.2a itself owns: it validates a decoded
-raw-DPC command stream in one pass, then — only if every command in it clears
-validation — walks it again in order, dispatches each `LoadTile`/`LoadBlock`
-to its executor, and chains the resulting packet transactions into one sealed
-`PendingTmemTransaction` — the N-load generalization of each executor's
-single-load case. The validation pass first checks the caller-supplied
-`SubmittedTicket` is exactly the decoded packet's own ticket (queue,
-submission ordinal/identity, workload, journal, and memory-layout identity),
-rejecting a foreign or reordered ticket with a named `SubmissionMismatch`
-error before any other exit; it then rejects a `LoadTlut` command or a
-YUV-deferred Tile/Block contract before any load in the packet stages. Since
-M4.3.1, `bind_tmem_transfer` returns a valid, bindable transfer plan for TLUT
-loads (the destination transfer-plan is closed), but no physical executor
-(`prepare_load_tlut`, M4.3.2) exists yet to write TMEM from it, so this loop
-refuses it as an explicit scope boundary rather than executing a load it
-cannot back — the same treatment a YUV-deferred Tile/Block contract already
-receives. Because rejection is decided by a validation pass that runs to
-completion before the execution pass stages anything, a later TLUT/YUV
-command can never be preceded by an already-staged earlier Tile/Block load.
-Like the executors it chains, this function stops at `PendingTmemTransaction`:
-it holds neither `BackendCompletionAuthority` nor `GuestCommitAuthority`, so
-the caller assembles the packet-wide `BackendEffectReport` (TMEM proposals
-from `pending.proposed_effects()` plus any other declared writes from the
-same packet) and drives the remaining ticket/publication steps itself.
+outer loop none of the three executors nor M4.2a itself owns: it validates a
+decoded raw-DPC command stream in one pass, then — only if every command in
+it clears validation — walks it again in order, dispatches each
+`LoadTile`/`LoadBlock`/`LoadTlut` to its executor, and chains the resulting
+packet transactions into one sealed `PendingTmemTransaction` — the N-load
+generalization of each executor's single-load case. The validation pass first
+checks the caller-supplied `SubmittedTicket` is exactly the decoded packet's
+own ticket (queue, submission ordinal/identity, workload, journal, and
+memory-layout identity), rejecting a foreign or reordered ticket with a named
+`SubmissionMismatch` error before any other exit; it then rejects a
+YUV-deferred Tile/Block contract before any load in the packet stages.
+Because rejection is decided by a validation pass that runs to completion
+before the execution pass stages anything, a later YUV command can never be
+preceded by an already-staged earlier Tile/Block/TLUT load. Like the
+executors it chains, this function stops at `PendingTmemTransaction`: it
+holds neither `BackendCompletionAuthority` nor `GuestCommitAuthority`, so the
+caller assembles the packet-wide `BackendEffectReport` (TMEM proposals from
+`pending.proposed_effects()` plus any other declared writes from the same
+packet) and drives the remaining ticket/publication steps itself.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,

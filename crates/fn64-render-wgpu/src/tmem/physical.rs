@@ -401,10 +401,10 @@ impl StagedTmemTransaction {
         &self.words
     }
 
-    /// Asserts bytes that M4.2b's LoadTile or M4.2c's LoadBlock executor has
-    /// already arranged into this active load's physical fragment lanes. The
-    /// returned payload cannot be rebound to an equal-looking word in another
-    /// load or packet transaction.
+    /// Asserts bytes that M4.2b's LoadTile, M4.2c's LoadBlock, or M4.3.2's
+    /// LoadTLUT executor has already arranged into this active load's
+    /// physical fragment lanes. The returned payload cannot be rebound to an
+    /// equal-looking word in another load or packet transaction.
     pub(crate) fn physical_word_payload(
         &self,
         word: TmemTransferWord,
@@ -511,10 +511,10 @@ impl StagedTmemTransaction {
     }
 }
 
-// M4.2b's LoadTile and M4.2c's LoadBlock executors are the production
-// callers of this crate-private assertion seam. Retain its exact type in
-// ordinary builds without making raw physical-byte assertion reachable to
-// downstream crates beyond those owners.
+// M4.2b's LoadTile, M4.2c's LoadBlock, and M4.3.2's LoadTLUT executors are
+// the production callers of this crate-private assertion seam. Retain its
+// exact type in ordinary builds without making raw physical-byte assertion
+// reachable to downstream crates beyond those owners.
 type PhysicalWordPayloadMint = fn(
     &StagedTmemTransaction,
     TmemTransferWord,
@@ -822,7 +822,7 @@ impl fmt::Display for PhysicalTmemError {
                 formatter.write_str("physical TMEM load identity authority exhausted")
             }
             Self::DeferredTransfer => formatter.write_str(
-                "physical TMEM state accepts only an exact M4.2.0 LoadBlock/LoadTile transfer",
+                "physical TMEM state accepts only an exact closed LoadBlock/LoadTile/LoadTLUT transfer plan, never a still-deferred contract",
             ),
             Self::SubmissionMismatch { field } => {
                 write!(

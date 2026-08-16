@@ -1320,6 +1320,28 @@ mod tlut_transfer_plan_tests {
     }
 
     #[test]
+    fn a_source_descriptor_whose_declared_entry_count_reads_past_installed_rdram_is_rejected() {
+        // `decode_load_tlut` derives its source range purely from
+        // `image.address() .. image.address() + entries * 2` -- it never
+        // cross-checks `entries` against `SetTextureImage`'s own declared
+        // `width` (unlike `decode_load_tile`'s explicit `high_s >=
+        // image.width()` check). The only remaining backstop against a
+        // source-descriptor/entry-count combination that reads past what
+        // was actually captured is `PhysicalMemoryLayout::range`'s installed-
+        // RDRAM bounds check. This proves that backstop actually holds: the
+        // maximum *valid* entry count (256, `TlutEntryCount`'s own cap) at
+        // an address near the installed-layout boundary must still be
+        // rejected on its source range, rather than silently producing an
+        // out-of-bounds captured-range claim.
+        let mut words = Vec::new();
+        words.extend(set_texture_image(1, LAYOUT_BYTES - 0x100));
+        words.extend(set_tile(7, 256));
+        words.extend(load_sync());
+        words.extend(load_tlut(7, 255));
+        assert!(decode_raw_dpc(submit(hostile_packet(words)), &RdpState::default()).is_err());
+    }
+
+    #[test]
     fn destination_below_high_tmem_stays_rejected_before_this_tasks_code_runs() {
         let mut words = Vec::new();
         words.extend(set_texture_image(1, 0x300));
