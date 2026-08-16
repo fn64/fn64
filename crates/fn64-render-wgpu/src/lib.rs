@@ -321,6 +321,7 @@ mod coverage;
 mod depth_mode;
 mod depth_strict_less;
 mod device;
+mod endian_swap;
 mod formats_dither;
 mod lifecycle;
 mod native_contract;
@@ -367,6 +368,10 @@ pub use depth_strict_less::{
 pub use device::{
     HeadlessBackend, HeadlessDeviceOutcome, InFlightFill, NoAdapter, PrewarmedRenderer,
     UninitializedRenderer,
+};
+pub use endian_swap::{
+    endian_swap_uint, endian_swap_uint16, endian_swap_uint32, ENDIAN_SWAP_ENTRY_POINT,
+    ENDIAN_SWAP_WGSL,
 };
 pub use formats_dither::{
     alpha_dither_value, float4_to_rgba32, float_to_uint8, Rgba32Packed,

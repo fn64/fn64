@@ -1532,3 +1532,54 @@ ABI/runtime, or any native GPU execution. It makes no parity or performance
 claim. This module does not modify `state.rs`, `combiner.rs`,
 `alpha_compare.rs`, `rgb_dither.rs`, `random.rs`, or any other existing file
 besides `lib.rs`'s module registration and re-exports.
+
+## `EndianSwapUINT16`/`EndianSwapUINT32`/`EndianSwapUINT` (`endian_swap`)
+
+`endian_swap` is a characterization-first literal port of the permitted MIT
+RT64 Rust-port source pinned at commit
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`src/shaders/FbCommon.hlsli:9-33`: `EndianSwapUINT16` (line 10),
+`EndianSwapUINT32` (line 19), and `EndianSwapUINT` (lines 23-36). Like
+`depth_strict_less`, `alpha_compare`, `rgb_dither`, `random`, and
+`formats_dither`, `fn64-render-wgpu` has no crate dependency on
+`fn64-render-reference`, so this is a self-contained literal re-expression
+citing RT64's source directly.
+
+**API.** `endian_swap_uint16(u32) -> u32` swaps the low two bytes:
+`((i << 8) & 0xFF00) | ((i >> 8) & 0xFF)`. `endian_swap_uint32(u32) -> u32`
+reverses all four bytes: `((i << 24) & 0xFF000000) | ((i << 8) & 0xFF0000) |
+((i >> 8) & 0xFF00) | ((i >> 24) & 0xFF)`. `endian_swap_uint(i, siz) -> u32`
+dispatches by pixel size: `Bits4`/`Bits8` are no-ops, `Bits16` calls
+`endian_swap_uint16`, `Bits32` calls `endian_swap_uint32`. `siz` reuses the
+already-landed `crate::state::PixelSize` enum rather than a raw
+`G_IM_SIZ_*` integer, so it is an exhaustive four-variant match with no
+wildcard/default arm -- RT64's own `EndianSwapUINT` has an unreachable
+`default: return 0` case for a `siz` value outside the four known
+`G_IM_SIZ_*` encodings, which has no counterpart to port here since
+`PixelSize` cannot represent an out-of-range size in the first place.
+
+An independently-derived Rust oracle is matched by an owned, Naga-validated
+WGSL transcription (`shaders/endian_swap.wgsl`, `ENDIAN_SWAP_WGSL`, entry
+point `ENDIAN_SWAP_ENTRY_POINT`); neither is compiled into any pipeline or
+wired to a draw path, matching `rgb_dither.wgsl`/`random.wgsl`/
+`formats_dither.wgsl`'s precedent.
+
+**Tests.** Independent hand-derivation for `endian_swap_uint16` (zero,
+known byte-pair swaps, high-bit masking, self-inverse property, and an
+exhaustive low/high-byte grid) and `endian_swap_uint32` (zero, known
+four-byte reversals, cross-check against Rust's own unrelated
+`u32::swap_bytes`, self-inverse property, and a byte-placement grid);
+`endian_swap_uint`'s four-way size dispatch checked against
+`endian_swap_uint16`/`endian_swap_uint32` directly plus a mutation-shaped
+test proving the four sizes are observably distinct dispatch outcomes; and
+the same naga parse/validation/structural-guard/hostile-mutation WGSL
+pattern used by `rgb_dither.wgsl`/`random.wgsl`/`formats_dither.wgsl`.
+
+**Scope.** This module characterizes `FbCommon.hlsli`'s three named
+endian-swap primitives in isolation. It does not wire into `combiner`,
+`formats_dither`, `rgb_dither`, `random`, `raster_vs`, `texture_gen`, any
+shader-pipeline/draw-path, `raw_dpc`, `state.rs`, `tmem`, the ABI/runtime, or
+any native GPU execution. It makes no RT64 parity or performance claim. This
+module does not modify `state.rs`, `combiner.rs`, `formats_dither.rs`,
+`rgb_dither.rs`, `random.rs`, `raster_vs.rs`, `texture_gen.rs`, or any other
+existing file besides `lib.rs`'s module registration and re-exports.
