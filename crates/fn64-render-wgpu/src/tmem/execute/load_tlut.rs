@@ -400,7 +400,7 @@ fn validate_word(
 /// odd-row exchange (`validate_word` above already proves both facts for
 /// this word before this function runs), so there is exactly one physical
 /// shape to map into.
-fn map_physical_lanes(
+pub(crate) fn map_physical_lanes(
     word: TmemTransferWord,
     source: &[u8],
 ) -> Result<[Option<u8>; 8], LoadTlutExecutionError> {
