@@ -67,7 +67,7 @@ pub fn decode_raw_dpc_capture(
 /// Shared content identity for bytes produced by a renderer and rechecked by
 /// the guest-memory owner before copyback.
 pub fn ir_effect_content_digest(bytes: &[u8]) -> ContentDigest {
-    ContentDigest::hash(b"fn64.render.ir-effect-bytes.v1\0", &[bytes])
+    fn64_render_ir::effect_content_digest(bytes)
 }
 
 /// Exact ABI-owned live-memory transaction preimage bound to one submitted workload.
@@ -267,12 +267,8 @@ impl StagedIrRdramWrite {
     }
 
     pub fn completed_write(&self) -> CompletedWrite {
-        CompletedWrite::try_new(
-            self.access,
-            self.access.region().declared_bytes(),
-            ir_effect_content_digest(&self.bytes),
-        )
-        .expect("staged RDRAM write construction proved its access and exact byte count")
+        CompletedWrite::try_from_bytes(self.access, &self.bytes)
+            .expect("staged RDRAM write construction proved its access and exact byte count")
     }
 }
 

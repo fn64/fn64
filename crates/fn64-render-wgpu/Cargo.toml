@@ -1,0 +1,18 @@
+[package]
+name = "fn64-render-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust wgpu renderer backend for fn64."
+
+[features]
+default = []
+host-gpu-tests = []
+
+[dependencies]
+fn64-render-ir = { path = "../fn64-render-ir" }
+wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl"] }
+
+[dev-dependencies]
+fn64-render = { path = "../fn64-render" }
