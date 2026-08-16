@@ -683,7 +683,8 @@
         "Reference-valid means DXC and exact source-built spirv-val accept the artifact; it does not imply Naga or wgpu ingestion, runtime readiness, renderer parity, or performance.",
         "Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.",
         "Commit 8765d9b0 integrates the independently reviewed additive mechanism with exact source/build/runtime receipts, strict SPIR-V inventory parsing, private verifier staging, and protected producer identities unchanged.",
-        "The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result."
+        "The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result.",
+        "Commit f967d32f freezes the exact Vulkan 1.0 scalar-block-layout validator contract after the prior first-row policy mismatch; a fresh external v3 build and one-row smoke remain candidate evidence until independent review."
       ],
       "verification_runs": [
         {
@@ -694,9 +695,9 @@
         }
       ],
       "blocker": null,
-      "next_action": "Source-build and independently review the exact standalone spirv-val receipt, then execute and independently review all 56 reference-valid rows before closing this ticket.",
+      "next_action": "Independently review the fresh v3 standalone spirv-val receipt and one-row scalar-layout smoke; only an accepted result may authorize a fresh all-56 reference corpus run.",
       "started_utc": "2026-08-16T09:54:30Z",
-      "updated_utc": "2026-08-16T11:03:34Z"
+      "updated_utc": "2026-08-16T12:37:27Z"
     },
     {
       "id": "M2.5.2",
@@ -1157,8 +1158,8 @@
       "profile": "F",
       "model": "GPT-5.6 Sol",
       "effort": "xhigh",
-      "owner": "/root/m4_2_0_transfer_contract",
-      "branch": "port/m4-2-0-transfer-contract",
+      "owner": "/root/m4_2a_physical_state_impl",
+      "branch": "port/m4-2a-physical-state",
       "base_branch": "main",
       "writable_paths": [
         "crates/fn64-render-wgpu/src/tmem",
@@ -1173,13 +1174,22 @@
         "M4.2.0 must first freeze ordered TmemLoadSource accesses plus canonical physical TmemLoadDestination fragments; source-only journal plans are insufficient for effect receipts.",
         "Public RDP authority requires complete 64-bit transfer words, modular 4 KiB addressing, odd-row XOR4, DXT 1.11 carries, and RGBA32 low/high 2 KiB bank splitting.",
         "TextureImage supplies source format, size, width, and address. RT64's tile-size substitution, zero starting-row XOR, silent invalid-coordinate returns, and host-layout correction remain divergence candidates rather than fn64 authority.",
-        "The implementation can split after the core state engine: LoadTile and LoadBlock executors own disjoint modules, then a frontier integration lane validates exact read/effect identities and publishes atomically after guest commit."
+        "The implementation can split after the core state engine: LoadTile and LoadBlock executors own disjoint modules, then a frontier integration lane validates exact read/effect identities and publishes atomically after guest commit.",
+        "Commit 75e9025f integrates M4.2.0's shared checked geometry projection, ordered transfer words, canonical destination union, and loud source-only deferrals for unresolved direct-4b, YUV, and TLUT execution.",
+        "The accepted M4.2.0 source passed 101 unit tests plus nine compile-fail doctests in 10/10 consecutive guarded processes; it is a plan contract and makes no TMEM-mutation or execution claim."
       ],
-      "verification_runs": [],
+      "verification_runs": [
+        {
+          "command": "scripts/guarded-cargo-test.zsh -p fn64-render-wgpu",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        }
+      ],
       "blocker": null,
-      "next_action": "Review and integrate M4.2.0, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.",
+      "next_action": "Complete and independently review M4.2a's packet-transaction physical state, backend-effect co-binding, rollback, and post-guest-commit publication before dispatching parallel LoadTile and LoadBlock executors.",
       "started_utc": "2026-08-16T10:37:19Z",
-      "updated_utc": "2026-08-16T11:18:56Z"
+      "updated_utc": "2026-08-16T12:37:27Z"
     },
     {
       "id": "M4.3",
@@ -1303,14 +1313,15 @@
         "docs/rt64-port-dashboard.html"
       ],
       "dependencies": ["A0.2"],
-      "state": "READY_FOR_REVIEW",
+      "state": "INTEGRATED",
       "findings": [
         "The prior dashboard rendered ticket detail before the operational frontier and exposed recorded timestamps and elapsed duration, which are not a durable workflow-state signal.",
         "One focused test invocation failed only because its Markdown assertion omitted deliberate backtick formatting around missing IDs; that pre-fix result is excluded from the clean count.",
         "The repaired full diagnostic passed: 52 dashboard tests, generated-output freshness check, documentation lint, and a scope audit containing only the five assigned dashboard paths.",
         "Independent review found that BLOCKED queue entries omitted their exact blocker text before detail; all three frontier views now render it conditionally, and the focused test slices the frontier before detail to require the fixture's first failing invariant.",
         "The restarted authoritative final-source series completed 10/10 clean dashboard test, generated-output check, and documentation-lint processes; scope remained exactly the five assigned files and the schema identity was independently checked.",
-        "The ticket is awaiting independent review only; no integration claim is recorded."
+        "Independent final rereview reproduced the exact five-file scope, unchanged schema and pre-existing tickets, deterministic queue ordering, bounded blocker text, and a clean 52-test post-promotion diagnostic.",
+        "Commit 05c7c88b integrates the deterministic workflow frontier into main."
       ],
       "verification_runs": [
         {
@@ -1339,9 +1350,9 @@
         }
       ],
       "blocker": null,
-      "next_action": "Await independent review of the frontier semantics, generated views, and final-source receipts before any integration decision.",
+      "next_action": "Use the integrated frontier for every subsequent ticket transition, and record future reliability receipts from final-source runs without counting pre-fix or pre-promotion evidence.",
       "started_utc": "2026-08-16T11:18:56Z",
-      "updated_utc": "2026-08-16T12:32:47Z",
+      "updated_utc": "2026-08-16T12:37:27Z",
       "retrospective": {
         "friction": "A whole-document frontier test let ticket detail mask a missing BLOCKED queue fact.",
         "cause": "The assertion did not delimit the frontier before milestone and ticket detail.",

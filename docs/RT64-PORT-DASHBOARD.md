@@ -15,7 +15,7 @@
 ## Workflow frontier
 
 - **COMPLETE milestones:** 0/13
-- **INTEGRATED / recorded tickets:** 18/26 — recorded ticket scope, **not a percent-to-goal**.
+- **INTEGRATED / recorded tickets:** 19/26 — recorded ticket scope, **not a percent-to-goal**.
 - **Milestones with no tickets:** `M5`, `M6`, `M7`, `M8`, `M9`, `M10`, `M11`, `M12`
 - **Retrospective coverage:** 12/26; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`
 
@@ -23,13 +23,13 @@
 
 - `M0.3` — owner: integration lead; branch: `feat/egui-settings-drawer-hud` -> `main`; dependencies: none; reliability: **NOT MET (cargo nextest run -p fn64-abi --no-default-features: 1/10 deterministic, tools/check_rt64_render_measurement.py: 10/10 deterministic)**; next: Exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, then run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.
 
-- `M2.5.1` — owner: /root/m2_5_depfile_repair; branch: `m2-5a-reference-corpus` -> `main`; dependencies: M2.5=BLOCKED; reliability: **MET (python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose: 10/10 deterministic)**; next: Source-build and independently review the exact standalone spirv-val receipt, then execute and independently review all 56 reference-valid rows before closing this ticket.
+- `M2.5.1` — owner: /root/m2_5_depfile_repair; branch: `m2-5a-reference-corpus` -> `main`; dependencies: M2.5=BLOCKED; reliability: **MET (python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose: 10/10 deterministic)**; next: Independently review the fresh v3 standalone spirv-val receipt and one-row scalar-layout smoke; only an accepted result may authorize a fresh all-56 reference corpus run.
 
-- `M4.2` — owner: /root/m4_2_0_transfer_contract; branch: `port/m4-2-0-transfer-contract` -> `main`; dependencies: M4.1=INTEGRATED; reliability: **NOT RECORDED**; next: Review and integrate M4.2.0, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.
+- `M4.2` — owner: /root/m4_2a_physical_state_impl; branch: `port/m4-2a-physical-state` -> `main`; dependencies: M4.1=INTEGRATED; reliability: **MET (scripts/guarded-cargo-test.zsh -p fn64-render-wgpu: 10/10 deterministic)**; next: Complete and independently review M4.2a's packet-transaction physical state, backend-effect co-binding, rollback, and post-guest-commit publication before dispatching parallel LoadTile and LoadBlock executors.
 
-### READY_FOR_REVIEW — awaiting independent review only (1)
+### READY_FOR_REVIEW — awaiting independent review only (0)
 
-- `A0.5` — owner: workflow dashboard implementer; branch: `workflow-frontier-a05` -> `main`; dependencies: A0.2=INTEGRATED; reliability: **MET (python3 tools/test_rt64_port_dashboard.py: 10/10 deterministic, python3 tools/rt64_port_dashboard.py --check: 10/10 deterministic, python3 scripts/lint-docs.py: 10/10 deterministic, git diff --check && git diff --name-only: 1/1 single)**; next: Await independent review of the frontier semantics, generated views, and final-source receipts before any integration decision.
+None.
 
 ### READY (1)
 
@@ -47,7 +47,7 @@
 
 | ID | state | title | tickets |
 |---|---|---|---|
-| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:4, READY_FOR_REVIEW:1, RUNNING:1 |
+| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:5, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:4, READY:1, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
@@ -482,6 +482,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Capability, extension, and direct NonUniform decoration inventories are required per row so the M2.5.2 assessment cannot hide a semantic frontend gap.
 - Commit 8765d9b0 integrates the independently reviewed additive mechanism with exact source/build/runtime receipts, strict SPIR-V inventory parsing, private verifier staging, and protected producer identities unchanged.
 - The 43-test hostile suite, selftest, Python compilation, docs lint, scope/protected-hash checks, and unchanged-byte gate passed together 10/10. No spirv-val build or corpus was part of that result.
+- Commit f967d32f freezes the exact Vulkan 1.0 scalar-block-layout validator contract after the prior first-row policy mismatch; a fresh external v3 build and one-row smoke remain candidate evidence until independent review.
 
 **Verification:**
 
@@ -489,7 +490,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 |---|---|---|---|
 | `python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose` | 10 | 10 | deterministic |
 
-**Next action:** Source-build and independently review the exact standalone spirv-val receipt, then execute and independently review all 56 reference-valid rows before closing this ticket.
+**Next action:** Independently review the fresh v3 standalone spirv-val receipt and one-row scalar-layout smoke; only an accepted result may authorize a fresh all-56 reference corpus run.
 
 ### `M2.5.2` -- Assess every reference-valid shader through the exact Naga/wgpu ingestion boundary with typed ingestible or blocked-known outcomes and a separate fail-closed runtime-ready gate.
 
@@ -814,11 +815,11 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | milestone | `M4` |
 | state | `RUNNING` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
-| owner | /root/m4_2_0_transfer_contract |
-| branch | `port/m4-2-0-transfer-contract` -> `main` |
+| owner | /root/m4_2a_physical_state_impl |
+| branch | `port/m4-2a-physical-state` -> `main` |
 | dependencies | M4.1=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/lib.rs` |
-| reliability | **NOT RECORDED** |
+| reliability | **MET (scripts/guarded-cargo-test.zsh -p fn64-render-wgpu: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -826,8 +827,16 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Public RDP authority requires complete 64-bit transfer words, modular 4 KiB addressing, odd-row XOR4, DXT 1.11 carries, and RGBA32 low/high 2 KiB bank splitting.
 - TextureImage supplies source format, size, width, and address. RT64's tile-size substitution, zero starting-row XOR, silent invalid-coordinate returns, and host-layout correction remain divergence candidates rather than fn64 authority.
 - The implementation can split after the core state engine: LoadTile and LoadBlock executors own disjoint modules, then a frontier integration lane validates exact read/effect identities and publishes atomically after guest commit.
+- Commit 75e9025f integrates M4.2.0's shared checked geometry projection, ordered transfer words, canonical destination union, and loud source-only deferrals for unresolved direct-4b, YUV, and TLUT execution.
+- The accepted M4.2.0 source passed 101 unit tests plus nine compile-fail doctests in 10/10 consecutive guarded processes; it is a plan contract and makes no TMEM-mutation or execution claim.
 
-**Next action:** Review and integrate M4.2.0, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `scripts/guarded-cargo-test.zsh -p fn64-render-wgpu` | 10 | 10 | deterministic |
+
+**Next action:** Complete and independently review M4.2a's packet-transaction physical state, backend-effect co-binding, rollback, and post-guest-commit publication before dispatching parallel LoadTile and LoadBlock executors.
 
 ### `M4.3` -- Execute TLUT loads and decode committed, validity-checked TMEM into exact CPU and owned-WGSL texture representations without conflating load, decode, sampling, or cache state.
 
@@ -905,7 +914,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M0` |
-| state | `READY_FOR_REVIEW` |
+| state | `INTEGRATED` |
 | profile / effort / model | `I` / `high` / GPT-5.6 Terra |
 | owner | workflow dashboard implementer |
 | branch | `workflow-frontier-a05` -> `main` |
@@ -920,7 +929,8 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - The repaired full diagnostic passed: 52 dashboard tests, generated-output freshness check, documentation lint, and a scope audit containing only the five assigned dashboard paths.
 - Independent review found that BLOCKED queue entries omitted their exact blocker text before detail; all three frontier views now render it conditionally, and the focused test slices the frontier before detail to require the fixture's first failing invariant.
 - The restarted authoritative final-source series completed 10/10 clean dashboard test, generated-output check, and documentation-lint processes; scope remained exactly the five assigned files and the schema identity was independently checked.
-- The ticket is awaiting independent review only; no integration claim is recorded.
+- Independent final rereview reproduced the exact five-file scope, unchanged schema and pre-existing tickets, deterministic queue ordering, bounded blocker text, and a clean 52-test post-promotion diagnostic.
+- Commit 05c7c88b integrates the deterministic workflow frontier into main.
 
 **Verification:**
 
@@ -931,7 +941,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | `python3 scripts/lint-docs.py` | 10 | 10 | deterministic |
 | `git diff --check && git diff --name-only` | 1 | 1 | single |
 
-**Next action:** Await independent review of the frontier semantics, generated views, and final-source receipts before any integration decision.
+**Next action:** Use the integrated frontier for every subsequent ticket transition, and record future reliability receipts from final-source runs without counting pre-fix or pre-promotion evidence.
 
 **Retrospective:**
 
