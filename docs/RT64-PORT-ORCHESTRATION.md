@@ -123,6 +123,17 @@ unlisted consumer blocks the transplant before files are copied; the lead then
 either widens the coherent ticket once or creates an explicit prerequisite.
 This prevents repeated one-file-at-a-time scope expansion during integration.
 
+Any shared wire/schema/identity change must also name and run its direct
+downstream consumers before the writer starts a reliability loop. A green
+owner-crate suite is insufficient when a frozen digest, decoder, generated
+golden, or receipt lives in another crate or tool.
+
+In a dirty legacy module tree, formatting is restricted to explicit owned
+files. Do not point `rustfmt` at a module root or the workspace until a
+changed-path audit proves recursive formatting cannot cross the ticket. Stage
+new modules before doc/hash linting, and require both the expected test count
+and `git status --short` scope before counting any repeated run.
+
 Every behavior ticket also names its parity-ladder row IDs. The implementation
 delegate may add fixtures and backend adapters, but only the lead may promote a
 row from `RUST_PENDING` after confirming the test executed the declared
