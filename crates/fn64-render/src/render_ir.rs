@@ -17,14 +17,14 @@ use crate::{OwnedRawDpcSubmission, RawDpcSource};
 
 pub use production::{
     new_raw_dpc_roles, BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome,
-    ExactRawDpcPlanVisitor, ExactValidatedRawDpcPlan, GuestCommittedRawDpc, NeutralImageFormat,
-    NeutralPixelSize, NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor,
-    NeutralTileSize, NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord,
-    PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation,
-    RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest,
-    RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome,
-    ReadyPublication, ReadyRawDpcCommitCapsule, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
-    TmemLoadShape, TmemStateCommand, TmemTransferLayout,
+    ExactRawDpcPlanVisitor, ExactRawDpcPlanWriter, ExactValidatedRawDpcPlan, GuestCommittedRawDpc,
+    NeutralImageFormat, NeutralPixelSize, NeutralTextureImage, NeutralTileAddressMode,
+    NeutralTileDescriptor, NeutralTileSize, NeutralTmemTransferPhysicalWord,
+    NeutralTmemTransferWord, PlannedRawDpcSubmission, RawDpcAbiSession, RawDpcBackendAuthority,
+    RawDpcCommandLocation, RawDpcCoordinator, RawDpcExecutionView, RawDpcIrCapability,
+    RawDpcPlanRequest, RawDpcRetirementHandle, RawDpcRetirementStage, RawDpcSemanticCommandRef,
+    RawDpcTerminalOutcome, ReadyPublication, ReadyRawDpcCommitCapsule, TmemLoadEpoch, TmemLoadKind,
+    TmemLoadSemantics, TmemLoadShape, TmemStateCommand, TmemStateIdentity, TmemTransferLayout,
 };
 
 /// Convert one exact owned raw-DPC capture into the move-only IR decode state.

@@ -70,16 +70,16 @@ pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use render_ir::{
     decode_raw_dpc_capture, ir_effect_content_digest, new_raw_dpc_roles, preflight_raw_dpc_capture,
     BackendPreparedRawDpc, BoundSubmittedRawDpc, CommittedRawDpcOutcome,
-    CommittedSemanticWorkloadRecord, ExactRawDpcPlanVisitor, ExactValidatedRawDpcPlan,
-    GuestCommittedRawDpc, IrGuestMemoryPreimage, IrGuestMemorySnapshot, IrRawDpcBackendCompletion,
-    IrRawDpcPacketPreflight, NeutralImageFormat, NeutralPixelSize, NeutralTextureImage,
-    NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
+    CommittedSemanticWorkloadRecord, ExactRawDpcPlanVisitor, ExactRawDpcPlanWriter,
+    ExactValidatedRawDpcPlan, GuestCommittedRawDpc, IrGuestMemoryPreimage, IrGuestMemorySnapshot,
+    IrRawDpcBackendCompletion, IrRawDpcPacketPreflight, NeutralImageFormat, NeutralPixelSize,
+    NeutralTextureImage, NeutralTileAddressMode, NeutralTileDescriptor, NeutralTileSize,
     NeutralTmemTransferPhysicalWord, NeutralTmemTransferWord, PlannedRawDpcSubmission,
     RawDpcAbiSession, RawDpcBackendAuthority, RawDpcCommandLocation, RawDpcCoordinator,
     RawDpcExecutionView, RawDpcIrCapability, RawDpcPlanRequest, RawDpcRetirementHandle,
     RawDpcRetirementStage, RawDpcSemanticCommandRef, RawDpcTerminalOutcome, ReadyPublication,
     ReadyRawDpcCommitCapsule, StagedIrRdramWrite, TmemLoadEpoch, TmemLoadKind, TmemLoadSemantics,
-    TmemLoadShape, TmemStateCommand, TmemTransferLayout,
+    TmemLoadShape, TmemStateCommand, TmemStateIdentity, TmemTransferLayout,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,

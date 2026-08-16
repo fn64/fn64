@@ -266,9 +266,9 @@ pub use native_contract::{
     NATIVE_FILL_WORKLOAD_SHA256,
 };
 pub use raw_dpc::{
-    decode_raw_dpc, decode_raw_dpc_after, BoundTmemTransfer, DecodedRawDpc, DecodedRawDpcCommand,
-    FillRectangle, RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError, RawDpcResourcePlan,
-    TmemLoadSourcePlanError,
+    decode_raw_dpc, decode_raw_dpc_after, push_decoded_raw_dpc, BoundTmemTransfer, DecodedRawDpc,
+    DecodedRawDpcCommand, FillRectangle, RawDpcCommandKind, RawDpcCommandLocation,
+    RawDpcDecodeError, RawDpcResourcePlan, TmemLoadSourcePlanError, UnadmittedRawDpcCommand,
 };
 pub use shader_manifest::{
     DirectTexelDecodeDeviceProfile, DirectTexelDecodeNativeError, DirectTexelDecodeNativeReceipt,

@@ -1,5 +1,9 @@
 //! Bounded decoding for the first admitted raw-DPC command subset.
 
+mod production_adapter;
+
+pub use production_adapter::{push_decoded_raw_dpc, UnadmittedRawDpcCommand};
+
 use core::fmt;
 
 use fn64_render::raw_rdp_command_width;
