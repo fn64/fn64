@@ -749,6 +749,100 @@ impl LiveDpcTransaction {
             .unwrap_or_else(|error| panic!("committing rendered DPC transaction: {error}"));
         self.token.take();
     }
+
+    /// Route this transaction's terminal fabric commit through the
+    /// nonmutating-prepare / infallible-consume `ReadyDpcFabricCommit`
+    /// typestate (`fn64_runtime::device::fabric_ops`), handing the live
+    /// `ReadyDpcFabricCommit` to a caller-supplied closure INSIDE the
+    /// `with_host` borrow rather than committing it immediately.
+    ///
+    /// This is the seam a future T0 capsule-assembly call needs: the v11
+    /// migration card's `ReadyRawDpcCommitCapsule` must own the ready fabric
+    /// state across its OWN joint physical/fabric publication (device fabric
+    /// prepares, wgpu does its fallible physical-readiness work, THEN one
+    /// atomic body commits both). A method that prepares and immediately
+    /// calls `.commit()` before any capsule exists cannot serve that: there
+    /// is nothing left for a capsule to receive. `with_ready_commit` instead
+    /// hands the ready value, live, to `f` -- which is where a future caller
+    /// builds `ReadyRawDpcCommitCapsule` from it (combined with the
+    /// guest-committed wrapper) and either commits or lets it drop-cancel,
+    /// all still inside the one `with_host` borrow this fabric requires.
+    ///
+    /// `f`'s return value `R` is NOT permitted to retain the
+    /// `ReadyDpcFabricCommit<'_>` borrow -- `with_host`'s own signature
+    /// (`impl FnOnce(&mut HostState) -> R`) already forbids that, so the
+    /// compiler enforces it structurally, not by convention.
+    ///
+    /// **Disarms this transaction's own cancel guard (`self.token`) only
+    /// AFTER a `ReadyDpcFabricCommit` has been successfully constructed, not
+    /// before.** `LiveDpcTransaction::drop` and `ReadyDpcFabricCommit::drop`
+    /// are two independent cancellation paths over the same underlying
+    /// fabric state (`LiveDpcTransaction` via `cancel_dpc_submission(token)`
+    /// on the fabric as a whole; `ReadyDpcFabricCommit` via direct field
+    /// writes to the same `dpc`/`pending_dpc` fields `prepare_dpc_commit`
+    /// borrowed). Exactly one of the two must be the live cancellation owner
+    /// at every point in this method's body -- disarming too early leaks the
+    /// pending fabric transaction; disarming too late double-cancels it:
+    ///
+    /// - While the acknowledgment-phase check and `prepare_dpc_commit`'s own
+    ///   fallible validation are still running, NO `ReadyDpcFabricCommit`
+    ///   exists yet, so `LiveDpcTransaction` must remain the armed owner: if
+    ///   either fails (an assertion panic, or `prepare_dpc_commit` returning
+    ///   `Err`), `LiveDpcTransaction::drop` is what cancels the still-pending
+    ///   fabric transaction. `prepare_dpc_commit` itself restores the owned
+    ///   `PendingDpc` on any rejection (see its own doc comment), so the
+    ///   fabric's `pending_dpc` is exactly as it was when
+    ///   `LiveDpcTransaction::drop` runs `cancel_dpc_submission`.
+    /// - The token is read (`self.token`), not taken, for this whole
+    ///   validate-then-prepare span, so `self` stays armed throughout it.
+    /// - Only once `prepare_dpc_commit` has returned `Ok` -- meaning a
+    ///   `ReadyDpcFabricCommit` now exists and holds its own independent
+    ///   cancellation path -- does this method assign `self.token = None`,
+    ///   disarming `LiveDpcTransaction::drop`, immediately before calling
+    ///   `f(ready)`. From that point on, `ReadyDpcFabricCommit` is the sole
+    ///   cancellation owner: if `f` panics, `ReadyDpcFabricCommit::drop`
+    ///   cancels (it unwinds before `LiveDpcTransaction::drop`, which is
+    ///   already a no-op by then); `LiveDpcTransaction::drop` cannot also
+    ///   fire a second `cancel_dpc_submission` against fabric state
+    ///   `ReadyDpcFabricCommit::drop` may have already rolled back or
+    ///   cleared, which is what would otherwise panic from inside an unwind
+    ///   already in progress and abort the process.
+    pub(crate) fn with_ready_commit<R>(
+        mut self,
+        f: impl FnOnce(fn64_runtime::device::ReadyDpcFabricCommit<'_>) -> R,
+    ) -> R {
+        let token = self.token.expect("DPC transaction committed twice");
+        assert_eq!(
+            self.acknowledgment
+                .as_ref()
+                .expect("atomic DPC transaction has no acknowledgment owner")
+                .phase(),
+            fn64_runtime::DpcScheduledPhase::Complete,
+            "atomic DPC transaction committed before acknowledgment validation"
+        );
+        // `self.token` is still `Some` here: `LiveDpcTransaction::drop`
+        // remains the armed cancellation owner through every fallible step
+        // below, up to and including `prepare_dpc_commit` itself.
+        with_host(|host| {
+            let ready = host
+                .device_fabric
+                .prepare_dpc_commit(token)
+                .unwrap_or_else(|error| panic!("preparing ready DPC fabric commit: {error}"));
+            // A `ReadyDpcFabricCommit` now exists and owns its own
+            // cancellation path. Disarm `LiveDpcTransaction` here, and not
+            // one line earlier, so there is no window where neither guard is
+            // armed, and no OBSERVABLE OR FALLIBLE window where both can
+            // act: both guards are briefly simultaneously armed across this
+            // one nonpanicking assignment (`ready` already exists the moment
+            // this comment is reached), but nothing between `ready`'s
+            // construction and this line can panic, return `Result`, invoke
+            // a callback, or otherwise give either guard's `Drop` a chance to
+            // run -- so the two-armed span has no reachable exit that could
+            // let both actually cancel.
+            self.token = None;
+            f(ready)
+        })
+    }
 }
 
 impl Drop for LiveDpcTransaction {
@@ -1138,10 +1232,7 @@ pub(crate) unsafe fn dispatch_captured_raw_rdp(
             });
             if index >= dump.skip && index < dump.skip.saturating_add(16) {
                 std::fs::create_dir_all(&dump.directory).unwrap_or_else(|error| {
-                    panic!(
-                        "FN64_XBUS_STREAM_DUMP_DIR {:?}: {error}",
-                        dump.directory
-                    )
+                    panic!("FN64_XBUS_STREAM_DUMP_DIR {:?}: {error}", dump.directory)
                 });
                 let stream = words
                     .iter()

@@ -985,6 +985,7 @@ pub struct DeviceEvidenceSnapshot {
 mod fabric;
 mod fabric_ops;
 pub use fabric::*;
+pub use fabric_ops::ReadyDpcFabricCommit;
 
 #[cfg(test)]
 #[allow(unused_must_use)]

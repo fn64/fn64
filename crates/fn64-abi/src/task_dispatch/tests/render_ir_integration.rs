@@ -654,3 +654,457 @@ fn speculative_rejection_does_not_publish_global_observations_or_files() {
     assert!(!dump_dir.exists());
     assert_eq!(transaction.live_rdram_for_intervening_write_test(), before);
 }
+
+// -- LiveDpcTransaction -> ReadyDpcFabricCommit typestate --------------------
+
+#[test]
+fn with_ready_commit_advances_current_like_direct_commit() {
+    crate::load_rom(Vec::new());
+    let before_device = with_host(|host| host.device_fabric.snapshot());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let mut transaction = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion();
+    transaction.with_ready_commit(|ready| ready.commit());
+
+    let after_device = with_host(|host| host.device_fabric.snapshot());
+    assert_ne!(
+        after_device, before_device,
+        "commit must advance CURRENT past the admitted range"
+    );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+#[test]
+fn with_ready_commit_succeeds_through_a_real_interleaved_xbus_mode_command() {
+    // ABI-level companion to
+    // `fn64_runtime::device::fabric_ops::ready_dpc_fabric_commit_tests::
+    // prepare_and_commit_survive_an_interleaved_xbus_mode_command`, driven
+    // through the actual production seam (`LiveDpcTransaction::with_ready_commit`,
+    // not a direct `prepare_dpc_commit` call). After RDRAM admission and the
+    // transaction's atomic-completion acknowledgment, the guest issues a
+    // real, publicly reachable `write_mmio` STATUS mode command --
+    // `DeviceFault`-free, not private-field corruption -- setting
+    // `DPC_STATUS_XBUS_DMEM_DMA` while this RDRAM-source submission is still
+    // pending. `with_ready_commit` must not treat that as stale/corrupted
+    // state: `commit_dpc_submission` never reads the XBUS bit, and
+    // `cancel_dpc_submission` is separately proven (device_b.rs's
+    // `dpc_status_mode_commands_during_renderer_admission_survive_cancellation`)
+    // to preserve exactly this interleaving through cancellation. This test
+    // proves the same tolerance holds through the commit path.
+    crate::load_rom(Vec::new());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let mut transaction = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion();
+
+    // Command `0x02` sets DPC_STATUS_XBUS_DMEM_DMA (bit 0 clears it, bit 1
+    // sets it -- see `apply_dpc_status_mode_commands`'s clear/set pairing).
+    // `MmioAddr::new(0xA410_000C)` is the real DPC_STATUS MMIO address; this
+    // is the exact public write a guest CPU issues, reached the same way
+    // production code would reach it.
+    let dpc_status_reg = fn64_runtime::MmioAddr::new(0xA410_000C);
+    let _ = with_host(|host| host.device_fabric.write_mmio(dpc_status_reg, 0x02))
+        .expect("a real STATUS mode command must not itself be rejected");
+    assert_eq!(
+        with_host(|host| host.device_fabric.read_mmio(dpc_status_reg)).unwrap()
+            & fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA,
+        fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA,
+        "the interleaved mode command must have taken effect before with_ready_commit runs"
+    );
+
+    transaction.with_ready_commit(|ready| ready.commit());
+
+    assert_eq!(
+        with_host(|host| host.device_fabric.read_mmio(dpc_status_reg)).unwrap()
+            & fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA,
+        fn64_runtime::DPC_STATUS_XBUS_DMEM_DMA,
+        "commit must not silently revert the interleaved mode command"
+    );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+#[test]
+fn with_ready_commit_cancels_exactly_once_when_acknowledgment_is_not_yet_complete() {
+    // Regression for the leak hazard: `with_ready_commit` must NOT disarm
+    // `LiveDpcTransaction`'s own cancel guard until a `ReadyDpcFabricCommit`
+    // actually exists. This test calls `with_ready_commit` WITHOUT first
+    // calling `validate_atomic_completion`, so the acknowledgment-phase
+    // `assert_eq!` inside `with_ready_commit` panics before
+    // `prepare_dpc_commit` ever runs -- no `ReadyDpcFabricCommit` is
+    // constructed. If `self.token` had already been taken before that
+    // assertion (the earlier, buggy ordering), `LiveDpcTransaction::drop`
+    // would find `None` and silently no-op, leaking the admitted fabric
+    // range as permanently busy with no owner left to cancel it. With the
+    // corrected ordering, `self.token` is still `Some` when the assertion
+    // panics, so `LiveDpcTransaction::drop` is the one live cancellation
+    // owner and rolls the fabric back exactly once.
+    crate::load_rom(Vec::new());
+    let before_device = with_host(|host| host.device_fabric.snapshot());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let transaction = LiveDpcTransaction::new(submission);
+    // Deliberately skip `validate_atomic_completion()`.
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        transaction.with_ready_commit(|_ready| {
+            panic!("with_ready_commit's own acknowledgment assertion should have already panicked")
+        });
+    }));
+    assert!(
+        result.is_err(),
+        "the acknowledgment-phase assertion must panic (not silently proceed) with no ack"
+    );
+
+    // Exactly one cancellation ran: `LiveDpcTransaction::drop`'s, because no
+    // `ReadyDpcFabricCommit` was ever constructed to own a second one.
+    assert_eq!(
+        with_host(|host| host.device_fabric.snapshot()),
+        before_device,
+        "the pending fabric transaction must not leak when readiness is never reached"
+    );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+// A third `with_ready_commit` hostile -- "`prepare_dpc_commit` itself
+// rejects while `token` still legitimately owns the pending slot, and the
+// OUTER `LiveDpcTransaction::drop` then cancels that same still-matching
+// slot cleanly" -- was believed to have no ABI-reachable trigger. That
+// belief was WRONG once: `prepare_dpc_commit` used to also check that
+// `self.dpc.status`'s `DPC_STATUS_XBUS_DMEM_DMA` bit still matched the
+// submission's source, and a real, publicly reachable
+// `write_mmio(DPC_STATUS_REG, ..)` STATUS mode command -- issued by the
+// guest CPU while an RDRAM-source submission was pending -- could flip that
+// exact bit and trigger that exact rejection while `token` still legitimately
+// owned the slot. Rather than add a hostile proving that rejection cancels
+// cleanly, the check itself was removed as a false positive:
+// `commit_dpc_submission` never reads the XBUS bit, and
+// `cancel_dpc_submission` is separately, deliberately designed to preserve
+// (not discard) this exact interleaving -- see
+// `dpc_status_mode_commands_during_renderer_admission_survive_cancellation`
+// in `fn64-runtime`'s `device/tests/device_b.rs`. The commit-path proof that
+// this interleaving now survives cleanly, instead of rejecting, is
+// `with_ready_commit_succeeds_through_a_real_interleaved_xbus_mode_command`
+// above.
+//
+// Every OTHER `DeviceFault` `prepare_dpc_commit` can return while `token` no
+// longer matches the pending slot (`NoPendingDpcSubmission`,
+// token-mismatched `StaleDpcSubmission`) implies the fabric already has
+// nothing left for `LiveDpcTransaction::drop`'s own subsequent
+// `cancel_dpc_submission(token)` to cancel either -- both panics would then
+// be separately honest reports of the same real state, and Rust aborts the
+// process when a second panic unwinds through an already-panicking `Drop`
+// (general Rust behavior, not specific to this code). The remaining
+// rejections that leave `token`'s slot correctly restored and still
+// cancellable (`InvalidDpcRange`, rollback-consistency `StaleDpcSubmission`)
+// are individually reachability-audited as unreachable through the real
+// admission path (see `prepare_dpc_commit`'s own doc comment in
+// `fabric_ops.rs` for the audit of each) and are exercised instead at the
+// runtime level, where `PendingDpc` can be hand-corrupted directly:
+// `fn64_runtime::device::fabric_ops::ready_dpc_fabric_commit_tests::
+// prepare_rejects_an_inconsistent_rollback_image_and_leaves_it_cancellable`.
+
+#[test]
+fn with_ready_commit_disarms_transaction_before_assemble_so_panic_cancels_exactly_once() {
+    // Regression for the double-cancel hazard: `LiveDpcTransaction::drop`
+    // and `ReadyDpcFabricCommit::drop` are two independent cancellation
+    // paths over the same fabric state. If `LiveDpcTransaction` still owned
+    // its token when `assemble` panicked, BOTH would try to cancel --
+    // `ReadyDpcFabricCommit::drop` runs first (constructed later, unwinds
+    // first) and clears `pending_dpc`, then `LiveDpcTransaction::drop` would
+    // call `cancel_dpc_submission` again, find `pending_dpc` already `None`,
+    // and panic on `DeviceFault::NoPendingDpcSubmission` from inside an
+    // unwind already in progress -- which aborts the process rather than
+    // propagating one clean panic (an abort cannot be caught by
+    // `catch_unwind`, so if this regressed, this test itself would not
+    // report a failure -- it would kill the test process outright).
+    crate::load_rom(Vec::new());
+    let before_device = with_host(|host| host.device_fabric.snapshot());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let mut transaction = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        transaction.with_ready_commit(|_ready| {
+            panic!("synthetic panic while assembling a capsule from the ready value");
+        });
+    }));
+    assert!(
+        result.is_err(),
+        "the synthetic panic must propagate as exactly one panic, not an abort"
+    );
+
+    // Exactly one cancellation ran (ReadyDpcFabricCommit's, via field
+    // writes): registers are back to their pre-admission state, and the
+    // pending submission is gone. If LiveDpcTransaction's OWN drop had also
+    // fired a second cancel, this process would already have aborted above
+    // instead of reaching this assertion.
+    assert_eq!(
+        with_host(|host| host.device_fabric.snapshot()),
+        before_device
+    );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+#[test]
+fn with_ready_commit_lets_a_caller_assemble_then_commit_from_inside_the_closure() {
+    // The CPS seam's actual purpose: a caller builds something (standing in
+    // for a future T0 capsule) from the live `ReadyDpcFabricCommit` and
+    // decides what to do with it, all inside one `with_host` borrow, rather
+    // than the value being committed before the caller ever sees it.
+    crate::load_rom(Vec::new());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let mut transaction = LiveDpcTransaction::new(submission);
+    transaction.validate_atomic_completion();
+
+    // `assemble` stands in for a future capsule-construction call: it
+    // receives the live `ReadyDpcFabricCommit`, does its own work (here,
+    // nothing -- a real caller would combine it with a guest-committed
+    // wrapper into a sealed capsule), and only THEN commits it, all inside
+    // the one `with_host` borrow `with_ready_commit` provides.
+    let assembled_before_commit = std::cell::Cell::new(false);
+    transaction.with_ready_commit(|ready| {
+        assembled_before_commit.set(true);
+        ready.commit();
+    });
+    assert!(
+        assembled_before_commit.get(),
+        "assemble must run with a live ReadyDpcFabricCommit before any commit happens"
+    );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+#[test]
+fn dropping_live_dpc_transaction_before_with_ready_commit_cancels() {
+    crate::load_rom(Vec::new());
+    let before_device = with_host(|host| host.device_fabric.snapshot());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    let transaction = LiveDpcTransaction::new(submission);
+    // No `commit`/`with_ready_commit` call: this is the early-
+    // rejection path, same as an ordinary backend error would take.
+    drop(transaction);
+
+    let after_device = with_host(|host| host.device_fabric.snapshot());
+    assert_eq!(
+        after_device, before_device,
+        "an uncommitted transaction's drop must roll back exactly like cancel_dpc_submission"
+    );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+// -- ReadyDpcFabricCommit at the ABI seam: wrong-token / drop / unwind /
+// field-isolation, driven through `with_host` exactly as production code
+// reaches it (not through the runtime-crate-internal hostile constructor
+// `fabric_ops`'s own tests use). These are the tests requested when the
+// generic `ReadyDpcFabricCommit<'a, R, T>` was replaced with the concrete,
+// field-only `ReadyDpcFabricCommit<'a>` -- they exercise the type from the
+// ABI side of the boundary the redesign exists to serve.
+
+#[test]
+fn abi_seam_wrong_token_is_rejected_before_any_mutation() {
+    crate::load_rom(Vec::new());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    // Baseline captured AFTER admission: admission itself mutates
+    // dpc.start/end/current/status, so a pre-admission snapshot would make
+    // this assertion compare against the wrong state.
+    let after_admission = with_host(|host| host.device_fabric.snapshot());
+    let error = with_host(|host| {
+        host.device_fabric
+            .prepare_dpc_commit(submission.token.wrapping_add(1))
+            .err()
+    })
+    .expect("a mismatched token must be rejected, not silently accepted");
+    assert_eq!(
+        error,
+        fn64_runtime::DeviceFault::StaleDpcSubmission {
+            pending_token: submission.token,
+            received_token: submission.token.wrapping_add(1),
+        }
+    );
+    // Rejection is nonmutating: the real pending submission is untouched, and
+    // a correct-token prepare afterward still succeeds against it.
+    assert_eq!(
+        with_host(|host| host.device_fabric.snapshot()),
+        after_admission
+    );
+    with_host(|host| {
+        host.device_fabric
+            .prepare_dpc_commit(submission.token)
+            .expect("the real token must still prepare after a wrong-token rejection")
+            .commit();
+    });
+}
+
+#[test]
+fn abi_seam_drop_without_commit_cancels_exactly_once() {
+    crate::load_rom(Vec::new());
+    let before_device = with_host(|host| host.device_fabric.snapshot());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    with_host(|host| {
+        let ready = host
+            .device_fabric
+            .prepare_dpc_commit(submission.token)
+            .unwrap();
+        drop(ready);
+    });
+    assert_eq!(
+        with_host(|host| host.device_fabric.snapshot()),
+        before_device,
+        "drop-cancel at the ABI seam must roll back exactly like a direct cancel"
+    );
+    // Never retried: the pending submission is gone, so the same token
+    // cannot prepare a second time.
+    let retry = with_host(|host| {
+        host.device_fabric
+            .prepare_dpc_commit(submission.token)
+            .err()
+    });
+    assert_eq!(
+        retry,
+        Some(fn64_runtime::DeviceFault::NoPendingDpcSubmission)
+    );
+}
+
+#[test]
+fn abi_seam_panic_mid_with_host_unwinds_through_drop_and_cancels() {
+    crate::load_rom(Vec::new());
+    let before_device = with_host(|host| host.device_fabric.snapshot());
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_host(|host| {
+            let _ready = host
+                .device_fabric
+                .prepare_dpc_commit(submission.token)
+                .unwrap();
+            panic!("synthetic panic while a ReadyDpcFabricCommit is live inside with_host");
+        });
+    }));
+    assert!(result.is_err());
+
+    // The panic unwound through `ReadyDpcFabricCommit`'s `Drop` before
+    // `with_host`'s own `RefCell::borrow_mut()` guard dropped, so `HOST` is
+    // not left borrowed and the fabric shows a clean cancel -- both an
+    // unwind-safety property and the retirement-style exact-once-terminal
+    // property this typestate is built to guarantee.
+    assert_eq!(
+        with_host(|host| host.device_fabric.snapshot()),
+        before_device
+    );
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
+
+#[test]
+fn abi_seam_field_isolation_render_backend_and_host_are_independent_refcells() {
+    // The redesign's motivating property, proven at the actual ABI seam: a
+    // `ReadyDpcFabricCommit` prepared from inside one `with_host` closure
+    // coexists with a completely independent `RENDER_BACKEND` borrow. This
+    // was already true before the redesign (the two are separate
+    // `thread_local!` `RefCell`s, not fields of the same struct), but the
+    // redesign is what makes it possible for the SAME property to hold if a
+    // future `fn64-render` sealed capsule wants to hold a `ReadyDpcFabricCommit`
+    // while also invoking a `Box<dyn RenderBackend>` method through
+    // `RENDER_BACKEND` -- that capsule cannot exist at all if
+    // `ReadyDpcFabricCommit` remains generic over `fn64-runtime`'s private
+    // `R, T` (see this file's `with_ready_commit` doc comment).
+    crate::load_rom(Vec::new());
+    set_render_backend(
+        Box::new(StatusRenderBackend(fn64_render::FrameStatus::Complete)),
+        0x1000,
+    );
+    let submission = with_host(|host| {
+        host.device_fabric.request_dpc_submission(
+            fn64_runtime::DpcSubmissionSource::Rdram,
+            0x100,
+            0x180,
+        )
+    })
+    .unwrap()
+    .expect("unfrozen DPC submission must publish");
+    with_host(|host| {
+        let ready = host
+            .device_fabric
+            .prepare_dpc_commit(submission.token)
+            .unwrap();
+        // `RENDER_BACKEND` is borrowed here, independently of `HOST`/`ready`,
+        // exactly as `with_ready_commit`'s doc comment claims.
+        RENDER_BACKEND.with(|cell| {
+            let mut backend = cell.borrow_mut();
+            let backend = backend.as_mut().expect("backend was just registered");
+            backend
+                .create(&fn64_render::RenderConfig::ntsc(4, 2))
+                .unwrap();
+        });
+        ready.commit();
+    });
+    assert!(with_host(|host| host.device_fabric.pending_dpc_submission()).is_none());
+}
