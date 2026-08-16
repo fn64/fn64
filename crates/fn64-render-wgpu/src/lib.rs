@@ -69,6 +69,19 @@
 //! profile, Naga validation, and CPU oracle establish candidate mechanics.
 //! The component remains `NotQualified` and `NativeUnverified`; no complete
 //! RT64 shader-denominator row is promoted.
+//! Color combiner Slice 1 (characterization-first port of
+//! `/private/tmp/rt64-combiner-characterization-card.md`) adds typed
+//! `ColorInput`/`AlphaInput`/`CombineParams` selector decode, exact and
+//! complete for every wire-legal index (matching RT64 bit-for-bit,
+//! including selectors whose arithmetic is not yet implemented), plus
+//! one-cycle `(A-B)*C+D` arithmetic that evaluates only COMBINED/TEXEL0/
+//! TEXEL1/PRIMITIVE/SHADE/ENVIRONMENT/ONE/ZERO and loudly rejects any other
+//! decoded selector rather than substituting a silent default. An
+//! independently-derived Rust oracle ([`run_one_cycle`]) with a matching
+//! owned WGSL transcription (`shaders/color_combiner.wgsl`, Naga-validated).
+//! It adds no NOISE/KEY_CENTER/etc. arithmetic, two-cycle mode, copy mode,
+//! shader-keying, `RdpState` wiring, draw-path integration, or
+//! native/GPU-verified behavior.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -247,6 +260,7 @@
 #![forbid(unsafe_code)]
 
 mod alpha_compare;
+mod combiner;
 mod depth_strict_less;
 mod device;
 mod lifecycle;
@@ -263,6 +277,10 @@ pub use alpha_compare::{
     alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value,
     require_supported_alpha_compare, AlphaCompareNoise, CopyCycleSourceFormat,
     ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_WGSL,
+};
+pub use combiner::{
+    run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams,
+    CombinerInputError, CombinerInputs, COLOR_COMBINER_WGSL,
 };
 pub use depth_strict_less::{
     strict_less_depth_test, strict_less_depth_write, StrictLessDepthOutcome, StrictLessDepthSample,
