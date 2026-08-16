@@ -26,8 +26,11 @@
 //! format-neutral raw texel carrier reusable by later CI/TLUT and YUV
 //! layers, plus a pure, allocation-free decoder for the seven direct-format
 //! texel pairs (RGBA16, RGBA32, IA4, IA8, IA16, I4, I8); it makes no TMEM,
-//! CI/TLUT, YUV, or GPU claim. RT64 is not hardware authority for this
-//! module.
+//! CI/TLUT, YUV, or GPU claim. M4.3.3b adds pure CI4/CI8 index normalization,
+//! typed disabled/RGBA16/IA16 TLUT resolution, canonical lookup values, and
+//! caller-supplied 16-bit entry decode; it deliberately performs no physical
+//! TMEM read or validity/generation check. RT64 is not hardware authority for
+//! this module.
 
 mod execute;
 mod physical;
@@ -50,7 +53,10 @@ pub use physical::{
 };
 pub use state::{TileState, TmemState};
 pub use texel::{
-    decode_direct_texel, DecodedTexel, DirectTexelDecodeError, RawTexel, RawTexelError,
+    decode_direct_texel, decode_tlut_entry, resolve_indexed_texel, unpack_ci4_texel, Ci4Palette,
+    Ci4PaletteError, Ci4UnpackError, DecodedTexel, DirectTexelDecodeError,
+    IndexedTexelResolveError, RawTexel, RawTexelError, ResolvedIndexedTexel, TexelColumnParity,
+    TlutEntryDecodeError, TlutLookup,
 };
 pub use types::{
     TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize,

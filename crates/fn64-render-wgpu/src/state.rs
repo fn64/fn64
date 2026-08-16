@@ -4,6 +4,40 @@ use fn64_render_ir::{PhysicalAddress, QueueIdentity};
 
 use crate::tmem::TmemState;
 
+/// Texture lookup-table interpretation selected by `SetOtherModes` high bits
+/// 15:14 (`G_MDSFT_TEXTLUT`).
+///
+/// The encodings follow the permitted MIT RT64 source pinned by
+/// `docs/RT64-PORT-AUTHORITY.md` (`shared/rt64_f3d_defines.h` and
+/// `shared/rt64_other_mode.h`): zero disables the TLUT, two selects RGBA16,
+/// and three selects IA16. Encoding one is reserved and is rejected rather
+/// than treated as a disabled table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureLutMode {
+    Disabled,
+    Rgba16,
+    Ia16,
+}
+
+/// Why `SetOtherModes`' texture-LUT field could not be decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureLutModeError {
+    ReservedEncoding { encoding: u8 },
+}
+
+impl core::fmt::Display for TextureLutModeError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ReservedEncoding { encoding } => write!(
+                formatter,
+                "SetOtherModes texture-LUT field uses reserved encoding {encoding}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TextureLutModeError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CycleType {
     OneCycle,
@@ -37,6 +71,18 @@ impl OtherMode {
             1 => CycleType::TwoCycle,
             2 => CycleType::Copy,
             _ => CycleType::Fill,
+        }
+    }
+
+    /// Decodes the two-bit texture-LUT selector without normalizing its
+    /// reserved encoding into a supported mode.
+    pub const fn texture_lut_mode(self) -> Result<TextureLutMode, TextureLutModeError> {
+        let encoding = ((self.high >> 14) & 0x3) as u8;
+        match encoding {
+            0 => Ok(TextureLutMode::Disabled),
+            2 => Ok(TextureLutMode::Rgba16),
+            3 => Ok(TextureLutMode::Ia16),
+            _ => Err(TextureLutModeError::ReservedEncoding { encoding }),
         }
     }
 }
@@ -284,5 +330,49 @@ impl StagedRdpState {
             self.submission_ordinal,
             self.transaction_sequence,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_lut_mode_decodes_all_four_wire_encodings_without_normalization() {
+        assert_eq!(
+            OtherMode::from_wire(0 << 14, u32::MAX).texture_lut_mode(),
+            Ok(TextureLutMode::Disabled)
+        );
+        assert_eq!(
+            OtherMode::from_wire(1 << 14, 0).texture_lut_mode(),
+            Err(TextureLutModeError::ReservedEncoding { encoding: 1 })
+        );
+        assert_eq!(
+            OtherMode::from_wire(2 << 14, 0).texture_lut_mode(),
+            Ok(TextureLutMode::Rgba16)
+        );
+        assert_eq!(
+            OtherMode::from_wire(3 << 14, 0).texture_lut_mode(),
+            Ok(TextureLutMode::Ia16)
+        );
+    }
+
+    #[test]
+    fn texture_lut_mode_ignores_unrelated_other_mode_bits() {
+        let high = 0x00ff_ffff & !(0x3 << 14);
+        assert_eq!(
+            OtherMode::from_wire(high | (2 << 14), u32::MAX).texture_lut_mode(),
+            Ok(TextureLutMode::Rgba16)
+        );
+    }
+
+    #[test]
+    fn reserved_texture_lut_encoding_is_a_public_typed_error() {
+        let error = OtherMode::from_wire(1 << 14, 0)
+            .texture_lut_mode()
+            .unwrap_err();
+        assert_eq!(error, TextureLutModeError::ReservedEncoding { encoding: 1 });
+        assert!(!error.to_string().is_empty());
+        let _: &dyn std::error::Error = &error;
     }
 }
