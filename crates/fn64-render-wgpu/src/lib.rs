@@ -317,6 +317,7 @@ mod lifecycle;
 mod native_contract;
 mod production;
 mod random;
+mod raster_vs;
 mod raw_dpc;
 mod rgb_dither;
 mod shader_manifest;
@@ -378,6 +379,10 @@ pub use native_contract::{
 };
 pub use production::{WgpuBackend, WgpuBackendConstructionError, WgpuRawDpcExecutionError};
 pub use random::{RandomState, RANDOM_ENTRY_POINT, RANDOM_WGSL};
+pub use raster_vs::{
+    raster_vs, RasterVsParams, RasterVsPosition, Resolution, ScreenTransform,
+    RASTER_VS_ENTRY_POINT, RASTER_VS_WGSL,
+};
 pub use raw_dpc::{
     decode_raw_dpc, decode_raw_dpc_after, decode_triangle_vertices, push_decoded_raw_dpc,
     texture_rectangle_vertices, triangle_word_count, BoundTmemTransfer, CoefficientWords,
