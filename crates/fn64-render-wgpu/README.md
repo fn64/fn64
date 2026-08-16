@@ -530,6 +530,30 @@ Qualification requires 10 consecutive clean native runs of one frozen source;
 a missing adapter, one run, or CPU/Naga evidence cannot satisfy that gate. See
 [`../../docs/RT64-RUNTIME-SHADER-CORPUS.md`](../../docs/RT64-RUNTIME-SHADER-CORPUS.md).
 
+M2.5.3b adds a second repository-owned compute shader, `three_nearest_filter`,
+implementing the RDP three-nearest triangular interpolation formula over four
+caller-supplied RGBA8888 corners and 5-bit S/T fractions. Its oracle is
+`fn64-render-reference::filter_three_nearest_s10_5` directly; because that
+function is `pub(super)` and its visibility is out of this component's scope,
+the deterministic 262,144-case fixture duplicates the reference sweep's exact
+seed/formula logic (`fn64-render-reference/src/gbi/tests/group4.rs`) rather
+than calling it cross-crate. The struct fields use the reference formula's own
+corner names (`c00`/`c10`/`c01`/`c11` = upper-left/upper-right/lower-left/
+lower-right), not `CommittedTextureCell`'s `[UL, LL, UR, LR]` order; a future
+caller wiring gathered corners into this component must remap by name. The
+per-channel accumulator is `i32` rather than the reference's `i64`; a range
+proof (checked exhaustively by a dedicated test) shows the accumulated value
+is always non-negative for valid byte-range corners and in-range fractions, so
+WGSL's toward-zero integer division never diverges from the reference's. The
+manifest state is `NotQualified` and `NativeUnverified`, matching M2.5.3a's own
+zero-row-promotion precedent. This component does not wire itself to
+`CommittedTextureCell`/`gather_committed_texture_cell`, select filter mode, or
+perform TMEM read/decode/addressing; it claims no RT64 visual/pixel parity and
+no hardware-accuracy verdict on the accumulator width. No RT64 upstream source
+exists for this formula — its sole provenance is this repository's own
+reference lane and its citation to the public Nintendo 64 Programming Manual,
+"TF: Texture Filter" and "Sampling Overview".
+
 Provenance: command fields, load-word layout, DXT, and fill-cycle rules use the
 public SGI *RDP Command Summary* and the public Nintendo 64 Programming
 Manual section 13.9, plus public libultra `gDPSetCycleType`, `gDPSetColorImage`,

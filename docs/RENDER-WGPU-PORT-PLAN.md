@@ -1030,6 +1030,14 @@ The accelerated wave keeps dependency-safe work active in parallel:
     mode applies, wire the filtered texel into a combiner (none exists in
     this crate), drive per-pixel UV/gather from a rasterizer, or claim RT64
     pixel/visual/silicon parity or performance.
+    M2.5.3b adds a second owned WGSL component, `three_nearest_filter`,
+    differentially gated directly against
+    `fn64-render-reference::filter_three_nearest_s10_5` over a duplicated
+    262,144-case fixture (crate visibility keeps the reference function out
+    of a cross-crate call); it is independent of both M4.3.3e and M4.3.3f's
+    CPU port (each differentials against the same reference oracle rather
+    than against each other), adds no raster integration, and remains
+    `NotQualified`/`NativeUnverified`. See `crates/fn64-render-wgpu/README.md`.
 20. **T0 -- production raw-DPC sealed session/authority seam, v11 interface
     freeze (INTEGRATED).** The production-dispatch migration card's first
     ticket, rebuilt to the v11 interface freeze's minimal sealed/session

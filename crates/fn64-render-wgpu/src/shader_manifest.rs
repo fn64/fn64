@@ -50,6 +50,51 @@ pub const DIRECT_TEXEL_DECODE_EXPECTED_SHA256: [u8; 32] = [
     0x94, 0x65, 0x36, 0x89, 0x68, 0xff, 0x84, 0x4e, 0xd0, 0xe4, 0x2e, 0x40, 0x7c, 0x17, 0x11, 0x4f,
 ];
 
+pub const THREE_NEAREST_FILTER_WGSL: &str = include_str!("shaders/three_nearest_filter.wgsl");
+pub const THREE_NEAREST_FILTER_ENTRY_POINT: &str = "filter_three_nearest";
+pub const THREE_NEAREST_FILTER_FIXTURE_SCHEMA: &str =
+    "fn64.render-wgpu.three-nearest-filter-fixture.v1";
+pub const THREE_NEAREST_FILTER_CASES: u32 = 262_144;
+pub const THREE_NEAREST_FILTER_INPUT_BYTES: u64 = THREE_NEAREST_FILTER_CASES as u64 * 32;
+pub const THREE_NEAREST_FILTER_OUTPUT_BYTES: u64 = THREE_NEAREST_FILTER_CASES as u64 * 8;
+pub const THREE_NEAREST_FILTER_WORKGROUPS: u32 = THREE_NEAREST_FILTER_CASES.div_ceil(64);
+// No RT64 upstream source exists for this formula: the reference lane cites
+// only the public Nintendo Programming Manual, "TF: Texture Filter" and
+// "Sampling Overview" (fn64-render-reference/src/gbi/types.rs:1109-1112).
+// This component's provenance field carries that citation string rather than
+// an RT64 commit hash; the manifest struct's field names stay RT64-shaped
+// (see M2.5.3a) pending the provenance-kind design question this card left
+// open (§3/§9). No RT64 dependency source or candidate consumer exists for
+// this component, so those lists are empty, not fabricated.
+pub const THREE_NEAREST_FILTER_RT64_SOURCE_COMMIT: &str =
+    "Nintendo 64 Programming Manual: \"TF: Texture Filter\", \"Sampling Overview\"";
+pub const THREE_NEAREST_FILTER_FORMATS_SHA256: &str = "";
+pub const THREE_NEAREST_FILTER_TEXTURE_DECODER_SHA256: &str = "";
+pub const THREE_NEAREST_FILTER_DENOMINATOR_SHA256: &str = "";
+pub const THREE_NEAREST_FILTER_DENOMINATOR_PATH: &str = "";
+pub const THREE_NEAREST_FILTER_DEPENDENCY_SOURCES: [&str; 0] = [];
+
+// Filled only after the final owned source and deterministic fixture bytes
+// are generated. Tests independently recompute both.
+pub const THREE_NEAREST_FILTER_SOURCE_SHA256: [u8; 32] = [
+    0xf6, 0xec, 0x47, 0xb5, 0xb3, 0xa5, 0x3e, 0xbc, 0xbb, 0x65, 0x3c, 0x28, 0x66, 0x8d, 0xe6, 0xa3,
+    0x55, 0xee, 0xb6, 0x8f, 0x65, 0xe7, 0xfa, 0x60, 0x82, 0x0f, 0xad, 0xa1, 0x0f, 0x10, 0xe6, 0x5e,
+];
+pub const THREE_NEAREST_FILTER_FIXTURE_SHA256: [u8; 32] = [
+    0x71, 0xc2, 0xc9, 0xa1, 0x8a, 0xfb, 0xe5, 0x93, 0x55, 0xeb, 0xc9, 0x8a, 0x63, 0x28, 0xfc, 0x1e,
+    0xb4, 0x88, 0x10, 0xd5, 0xe1, 0x06, 0x3c, 0x88, 0xca, 0x8b, 0xeb, 0x48, 0x17, 0x4d, 0x93, 0x38,
+];
+pub const THREE_NEAREST_FILTER_INPUT_SHA256: [u8; 32] = [
+    0x78, 0xc8, 0x4a, 0xa9, 0x77, 0xdb, 0x90, 0x23, 0x19, 0x96, 0xa6, 0xf6, 0x27, 0xf7, 0x73, 0x57,
+    0xf2, 0x4b, 0xa5, 0x8a, 0xce, 0x6e, 0x7b, 0x30, 0x88, 0xb4, 0xaf, 0xcc, 0x8f, 0x3b, 0x5c, 0xc5,
+];
+pub const THREE_NEAREST_FILTER_EXPECTED_SHA256: [u8; 32] = [
+    0x26, 0x9f, 0x60, 0x4e, 0x46, 0x52, 0xe2, 0xd2, 0x07, 0x84, 0x85, 0x27, 0x61, 0xc7, 0x24, 0x1b,
+    0xb6, 0x5f, 0x1a, 0xfc, 0x38, 0x13, 0x15, 0x6f, 0xb0, 0xaf, 0x81, 0xa8, 0x64, 0x35, 0x77, 0x00,
+];
+
+pub const THREE_NEAREST_FILTER_CANDIDATE_CONSUMERS: [&str; 0] = [];
+
 pub const DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS: [&str; 21] = [
     "src-shaders-rasterpsdynamic",
     "src-shaders-rasterpsdynamicms",
@@ -77,6 +122,7 @@ pub const DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS: [&str; 21] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeShaderComponentId {
     DirectTexelDecodeV1,
+    ThreeNearestFilterV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +244,26 @@ pub const DIRECT_TEXEL_DECODE_MANIFEST: RuntimeShaderComponentManifest =
         denominator_sha256: DIRECT_TEXEL_DECODE_DENOMINATOR_SHA256,
         dependency_sources: &DIRECT_TEXEL_DECODE_DEPENDENCY_SOURCES,
         candidate_consumers: &DIRECT_TEXEL_DECODE_CANDIDATE_CONSUMERS,
+    };
+
+pub const THREE_NEAREST_FILTER_MANIFEST: RuntimeShaderComponentManifest =
+    RuntimeShaderComponentManifest {
+        component: RuntimeShaderComponentId::ThreeNearestFilterV1,
+        stage: RuntimeShaderStage::Compute,
+        entry_point: THREE_NEAREST_FILTER_ENTRY_POINT,
+        source_bytes: THREE_NEAREST_FILTER_WGSL.len() as u32,
+        source_sha256: THREE_NEAREST_FILTER_SOURCE_SHA256,
+        fixture_schema: THREE_NEAREST_FILTER_FIXTURE_SCHEMA,
+        fixture_sha256: THREE_NEAREST_FILTER_FIXTURE_SHA256,
+        promotion: RuntimeShaderPromotion::NotQualified,
+        native_state: RuntimeShaderNativeState::NativeUnverified,
+        rt64_source_commit: THREE_NEAREST_FILTER_RT64_SOURCE_COMMIT,
+        formats_sha256: THREE_NEAREST_FILTER_FORMATS_SHA256,
+        texture_decoder_sha256: THREE_NEAREST_FILTER_TEXTURE_DECODER_SHA256,
+        denominator_path: THREE_NEAREST_FILTER_DENOMINATOR_PATH,
+        denominator_sha256: THREE_NEAREST_FILTER_DENOMINATOR_SHA256,
+        dependency_sources: &THREE_NEAREST_FILTER_DEPENDENCY_SOURCES,
+        candidate_consumers: &THREE_NEAREST_FILTER_CANDIDATE_CONSUMERS,
     };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1268,5 +1334,358 @@ mod tests {
                 Poll::Pending => std::thread::park(),
             }
         }
+    }
+
+    // M2.5.3b: three-nearest triangular filter, ported verbatim from
+    // fn64-render-reference/src/gbi/types.rs:954-972. filter_three_nearest_s10_5
+    // is pub(super) to fn64-render-reference::gbi, not pub -- widening its
+    // visibility is out of this card's scope, so this oracle duplicates the
+    // reference sweep's literal seed/formula logic (group4.rs:467-501)
+    // rather than cross-crate-calling it, matching this crate's existing
+    // self-contained-fixture convention.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ThreeNearestFilterShaderInput {
+        c00: u32,
+        c10: u32,
+        c01: u32,
+        c11: u32,
+        sf: u32,
+        tf: u32,
+    }
+
+    impl ThreeNearestFilterShaderInput {
+        fn encode(self, bytes: &mut Vec<u8>) {
+            bytes.extend_from_slice(&self.c00.to_le_bytes());
+            bytes.extend_from_slice(&self.c10.to_le_bytes());
+            bytes.extend_from_slice(&self.c01.to_le_bytes());
+            bytes.extend_from_slice(&self.c11.to_le_bytes());
+            bytes.extend_from_slice(&self.sf.to_le_bytes());
+            bytes.extend_from_slice(&self.tf.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+        }
+    }
+
+    const THREE_NEAREST_STATUS_OK: u32 = 0;
+    const THREE_NEAREST_STATUS_INVALID_FRACTION: u32 = 1;
+
+    fn monochrome_rgba8888(value: u8) -> u32 {
+        u32::from_be_bytes([value; 4])
+    }
+
+    // Oracle: same round-to-nearest/clamp policy as
+    // fn64-render-reference::filter_three_nearest_s10_5, applied per channel;
+    // every fixture corner here is monochrome ([value; 4]) so a single
+    // channel oracle covers all four channels identically, matching
+    // group4.rs's own sweep shape.
+    fn oracle_three_nearest(samples: [u8; 4], sf: i64, tf: i64) -> Option<u32> {
+        if !(0..32).contains(&sf) || !(0..32).contains(&tf) {
+            return None;
+        }
+        let [c00, c10, c01, c11] = samples.map(i64::from);
+        let value = if sf + tf <= 32 {
+            c00 * 32 + sf * (c10 - c00) + tf * (c01 - c00)
+        } else {
+            c11 * 32 + (32 - sf) * (c01 - c11) + (32 - tf) * (c10 - c11)
+        };
+        let channel = ((value + 16) / 32).clamp(0, 255) as u8;
+        Some(monochrome_rgba8888(channel))
+    }
+
+    #[derive(Clone)]
+    struct ThreeNearestFixture {
+        inputs: Vec<ThreeNearestFilterShaderInput>,
+        input_bytes: Vec<u8>,
+        expected_bytes: Vec<u8>,
+        identity: [u8; 32],
+    }
+
+    fn three_nearest_fixture() -> ThreeNearestFixture {
+        let mut inputs = Vec::with_capacity(THREE_NEAREST_FILTER_CASES as usize);
+        for seed in 0..=255u16 {
+            let values = [
+                seed as u8,
+                seed.wrapping_mul(73).wrapping_add(19) as u8,
+                seed.wrapping_mul(151).wrapping_add(41) as u8,
+                seed.wrapping_mul(211).wrapping_add(97) as u8,
+            ];
+            for sf in 0..32u32 {
+                for tf in 0..32u32 {
+                    inputs.push(ThreeNearestFilterShaderInput {
+                        c00: monochrome_rgba8888(values[0]),
+                        c10: monochrome_rgba8888(values[1]),
+                        c01: monochrome_rgba8888(values[2]),
+                        c11: monochrome_rgba8888(values[3]),
+                        sf,
+                        tf,
+                    });
+                }
+            }
+        }
+        assert_eq!(inputs.len(), THREE_NEAREST_FILTER_CASES as usize);
+
+        let mut input_bytes = Vec::with_capacity(inputs.len() * 32);
+        let mut expected_bytes = Vec::with_capacity(inputs.len() * 8);
+        for &value in &inputs {
+            value.encode(&mut input_bytes);
+            let samples = [
+                (value.c00 & 0xff) as u8,
+                (value.c10 & 0xff) as u8,
+                (value.c01 & 0xff) as u8,
+                (value.c11 & 0xff) as u8,
+            ];
+            match oracle_three_nearest(samples, i64::from(value.sf), i64::from(value.tf)) {
+                Some(rgba) => {
+                    expected_bytes.extend_from_slice(&THREE_NEAREST_STATUS_OK.to_le_bytes());
+                    expected_bytes.extend_from_slice(&rgba.to_le_bytes());
+                }
+                None => {
+                    expected_bytes
+                        .extend_from_slice(&THREE_NEAREST_STATUS_INVALID_FRACTION.to_le_bytes());
+                    expected_bytes.extend_from_slice(&0_u32.to_le_bytes());
+                }
+            }
+        }
+        assert_eq!(input_bytes.len() as u64, THREE_NEAREST_FILTER_INPUT_BYTES);
+        assert_eq!(
+            expected_bytes.len() as u64,
+            THREE_NEAREST_FILTER_OUTPUT_BYTES
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(THREE_NEAREST_FILTER_FIXTURE_SCHEMA.as_bytes());
+        hasher.update([0]);
+        hasher.update((input_bytes.len() as u64).to_be_bytes());
+        hasher.update(&input_bytes);
+        hasher.update((expected_bytes.len() as u64).to_be_bytes());
+        hasher.update(&expected_bytes);
+        let identity = hasher.finalize().into();
+        ThreeNearestFixture {
+            inputs,
+            input_bytes,
+            expected_bytes,
+            identity,
+        }
+    }
+
+    #[test]
+    fn three_nearest_hand_worked_cases_match_reference_arithmetic() {
+        // Both cases reused verbatim from the card's worked example (§4),
+        // using the reference formula's own corner-name order.
+        assert_eq!(
+            oracle_three_nearest([100, 150, 50, 200], 8, 8),
+            Some(monochrome_rgba8888(100))
+        );
+        assert_eq!(
+            oracle_three_nearest([100, 150, 50, 200], 24, 24),
+            Some(monochrome_rgba8888(150))
+        );
+    }
+
+    #[test]
+    fn three_nearest_value_is_never_negative_for_valid_inputs() {
+        // §4's own conclusion, checked exhaustively over the byte/fraction
+        // domain rather than argued by hand: value = c00*(32-sf-tf) +
+        // sf*c10 + tf*c01 (lower branch) is a sum of non-negative terms, and
+        // the symmetric substitution holds for the upper branch, so
+        // toward-zero vs toward-negative-infinity rounding never diverges.
+        for c00 in [0u8, 1, 127, 255] {
+            for c10 in [0u8, 1, 127, 255] {
+                for c01 in [0u8, 1, 127, 255] {
+                    for c11 in [0u8, 1, 127, 255] {
+                        for sf in 0..32i64 {
+                            for tf in 0..32i64 {
+                                let [c00, c10, c01, c11] = [c00, c10, c01, c11].map(i64::from);
+                                let value = if sf + tf <= 32 {
+                                    c00 * 32 + sf * (c10 - c00) + tf * (c01 - c00)
+                                } else {
+                                    c11 * 32 + (32 - sf) * (c01 - c11) + (32 - tf) * (c10 - c11)
+                                };
+                                assert!(value >= 0, "negative value: {value}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn three_nearest_manifest_retains_zero_row_promotion() {
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.promotion(),
+            RuntimeShaderPromotion::NotQualified
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.native_state(),
+            RuntimeShaderNativeState::NativeUnverified
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.rt64_source_commit(),
+            THREE_NEAREST_FILTER_RT64_SOURCE_COMMIT
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.formats_sha256(),
+            THREE_NEAREST_FILTER_FORMATS_SHA256
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.texture_decoder_sha256(),
+            THREE_NEAREST_FILTER_TEXTURE_DECODER_SHA256
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.denominator_path(),
+            THREE_NEAREST_FILTER_DENOMINATOR_PATH
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.denominator_sha256(),
+            THREE_NEAREST_FILTER_DENOMINATOR_SHA256
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.dependency_sources(),
+            &THREE_NEAREST_FILTER_DEPENDENCY_SOURCES
+        );
+        assert_eq!(
+            THREE_NEAREST_FILTER_MANIFEST.candidate_consumers(),
+            &THREE_NEAREST_FILTER_CANDIDATE_CONSUMERS
+        );
+        assert_eq!(THREE_NEAREST_FILTER_CANDIDATE_CONSUMERS.len(), 0);
+        assert_eq!(THREE_NEAREST_FILTER_WORKGROUPS, 4_096);
+    }
+
+    #[test]
+    fn three_nearest_wgsl_parses_and_validates_under_closed_naga_profile() {
+        let module = naga::front::wgsl::parse_str(THREE_NEAREST_FILTER_WGSL).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+
+        let duplicate_binding = THREE_NEAREST_FILTER_WGSL.replacen("@binding(1)", "@binding(0)", 1);
+        let module = naga::front::wgsl::parse_str(&duplicate_binding).unwrap();
+        assert!(naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .is_err());
+    }
+
+    fn three_nearest_verify_pre_submission(
+        source: &str,
+        entry_point: &str,
+        fixture: &ThreeNearestFixture,
+    ) -> Result<(), DirectTexelDecodeNativeError> {
+        for (field, actual, expected) in [
+            (
+                "source",
+                digest(source.as_bytes()),
+                THREE_NEAREST_FILTER_SOURCE_SHA256,
+            ),
+            (
+                "fixture",
+                fixture.identity,
+                THREE_NEAREST_FILTER_FIXTURE_SHA256,
+            ),
+            (
+                "input",
+                digest(&fixture.input_bytes),
+                THREE_NEAREST_FILTER_INPUT_SHA256,
+            ),
+            (
+                "expected output",
+                digest(&fixture.expected_bytes),
+                THREE_NEAREST_FILTER_EXPECTED_SHA256,
+            ),
+        ] {
+            if actual != expected {
+                return Err(DirectTexelDecodeNativeError::FrozenIdentityMismatch { field });
+            }
+        }
+        if entry_point != THREE_NEAREST_FILTER_ENTRY_POINT {
+            return Err(DirectTexelDecodeNativeError::FrozenIdentityMismatch {
+                field: "entry point",
+            });
+        }
+        if fixture.inputs.len() != THREE_NEAREST_FILTER_CASES as usize
+            || fixture.input_bytes.len() as u64 != THREE_NEAREST_FILTER_INPUT_BYTES
+            || fixture.expected_bytes.len() as u64 != THREE_NEAREST_FILTER_OUTPUT_BYTES
+        {
+            return Err(DirectTexelDecodeNativeError::FrozenIdentityMismatch {
+                field: "fixture shape",
+            });
+        }
+        Ok(())
+    }
+
+    fn three_nearest_verify_observed(
+        expected: &[u8],
+        observed: &[u8],
+    ) -> Result<(), DirectTexelDecodeNativeError> {
+        if observed == expected {
+            return Ok(());
+        }
+        Err(DirectTexelDecodeNativeError::SemanticMismatch {
+            first_byte: observed
+                .iter()
+                .zip(expected)
+                .position(|(observed, expected)| observed != expected),
+        })
+    }
+
+    #[test]
+    fn three_nearest_deterministic_fixture_is_exact_and_oracle_derived() {
+        let fixture = three_nearest_fixture();
+        assert_eq!(fixture.inputs.len(), THREE_NEAREST_FILTER_CASES as usize);
+        assert_eq!(
+            fixture.input_bytes.len() as u64,
+            THREE_NEAREST_FILTER_INPUT_BYTES
+        );
+        assert_eq!(
+            fixture.expected_bytes.len() as u64,
+            THREE_NEAREST_FILTER_OUTPUT_BYTES
+        );
+        assert_eq!(
+            digest(THREE_NEAREST_FILTER_WGSL.as_bytes()),
+            THREE_NEAREST_FILTER_SOURCE_SHA256
+        );
+        assert_eq!(fixture.identity, THREE_NEAREST_FILTER_FIXTURE_SHA256);
+        assert_eq!(
+            digest(&fixture.input_bytes),
+            THREE_NEAREST_FILTER_INPUT_SHA256
+        );
+        assert_eq!(
+            digest(&fixture.expected_bytes),
+            THREE_NEAREST_FILTER_EXPECTED_SHA256
+        );
+        three_nearest_verify_pre_submission(
+            THREE_NEAREST_FILTER_WGSL,
+            THREE_NEAREST_FILTER_ENTRY_POINT,
+            &fixture,
+        )
+        .unwrap();
+        assert!(
+            three_nearest_verify_observed(&fixture.expected_bytes, &fixture.expected_bytes).is_ok()
+        );
+        let mut mutated = fixture.expected_bytes.clone();
+        mutated[0] ^= 1;
+        assert!(three_nearest_verify_observed(&fixture.expected_bytes, &mutated).is_err());
+    }
+
+    // #[ignore]: prints the exact digests to paste into the
+    // THREE_NEAREST_FILTER_*_SHA256 constants above. Not part of the default
+    // 10x loop -- this is a one-time freeze step, matching M2.5.3a's own
+    // history (frozen by the PR that introduced the component, not before).
+    #[test]
+    #[ignore]
+    fn three_nearest_filter_fixture_freeze_prints_digests() {
+        let fixture = three_nearest_fixture();
+        println!(
+            "source: {:02x?}",
+            digest(THREE_NEAREST_FILTER_WGSL.as_bytes())
+        );
+        println!("fixture: {:02x?}", fixture.identity);
+        println!("input: {:02x?}", digest(&fixture.input_bytes));
+        println!("expected: {:02x?}", digest(&fixture.expected_bytes));
     }
 }
