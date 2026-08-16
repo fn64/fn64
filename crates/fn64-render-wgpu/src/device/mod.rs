@@ -25,7 +25,7 @@ pub enum HeadlessBackend {
 }
 
 impl HeadlessBackend {
-    fn wgpu_backends(self) -> wgpu::Backends {
+    pub(crate) fn wgpu_backends(self) -> wgpu::Backends {
         match self {
             Self::AnyNative => {
                 wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12
@@ -43,6 +43,10 @@ pub struct NoAdapter {
 }
 
 impl NoAdapter {
+    pub(crate) const fn new(requested: HeadlessBackend) -> Self {
+        Self { requested }
+    }
+
     pub const fn requested(self) -> HeadlessBackend {
         self.requested
     }
@@ -86,9 +90,9 @@ impl UninitializedRenderer {
         {
             Ok(adapter) => adapter,
             Err(wgpu::RequestAdapterError::NotFound { .. }) => {
-                return Ok(HeadlessDeviceOutcome::NoAdapter(NoAdapter {
-                    requested: self.backend,
-                }));
+                return Ok(HeadlessDeviceOutcome::NoAdapter(NoAdapter::new(
+                    self.backend,
+                )));
             }
             Err(error) => return Err(WgpuRenderError::RequestAdapter(error.to_string())),
         };

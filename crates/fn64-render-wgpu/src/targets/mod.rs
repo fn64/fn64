@@ -1,9 +1,10 @@
 //! Typed ownership for native color-target generations.
 //!
-//! This CPU-only module plans exact device-byte rows and admits a resident
-//! generation only after the complete target range is structurally covered.
-//! It does not allocate GPU resources, attest GPU execution, write guest
-//! memory, run VI, or establish renderer parity or performance.
+//! The base types plan exact device-byte rows and admit a resident generation
+//! only after the complete target range is structurally covered. M3.3c's
+//! bounded raster child is the sole production constructor of that completed
+//! write: it requires exact GPU wait/callback/readback authority. This module
+//! does not establish general raster, VI, parity, or performance behavior.
 //!
 //! Format and image-width semantics follow the public SGI *RDP Command
 //! Summary* and libultra `gDPSetColorImage` documentation. RGBA5551 component
@@ -19,8 +20,13 @@ use fn64_render_ir::{PhysicalAddress, PhysicalMemoryLayout, PhysicalRange, Valid
 use crate::{ColorImage, ImageFormat, PixelSize};
 
 mod oracle;
+mod raster;
 
 pub use oracle::{pack_device_pixels, unpack_device_pixels, DeviceColorBytes, Rgba8};
+pub use raster::{
+    CommittedNativeRasterFrame, InFlightNativeRasterFill, NativeRasterDeviceOutcome,
+    NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, UninitializedNativeRaster,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorTargetFormat {
@@ -419,9 +425,9 @@ impl CandidateColorTarget {
 }
 
 /// Opaque evidence that the raster owner completed every named device-byte
-/// write. This slice intentionally provides no production constructor: M3.3c
-/// must add one under `targets/**` which consumes its exact GPU-completion
-/// authority. A row plan by itself therefore cannot publish a resident.
+/// write. Its only production constructor is private to the M3.3c raster
+/// owner and consumes exact GPU-completion authority. A row plan by itself
+/// therefore cannot publish a resident.
 ///
 /// ```compile_fail
 /// use fn64_render_wgpu::{CompletedColorTargetWrite, ExactRowPlan};
@@ -486,6 +492,43 @@ pub struct InitializedCandidateColorTarget {
     candidate: CandidateColorTarget,
     proof: InitializedRegionProof,
     device_bytes: DeviceColorBytes,
+}
+
+/// A prevalidated, move-only resident publication which exclusively borrows
+/// the registry until it is either dropped or published.
+///
+/// The raster owner prepares this capability before transferring the guest
+/// commit ticket. That makes target publication after a successful guest
+/// commit structurally infallible: no competing candidate can change the
+/// predecessor, alias set, or capacity while this capability exists.
+pub(crate) struct ResidentPublication<'registry> {
+    registry: &'registry mut ColorTargetRegistry,
+    initialized: InitializedCandidateColorTarget,
+}
+
+impl<'registry> ResidentPublication<'registry> {
+    pub(crate) fn publish(self) -> &'registry ResidentColorTarget {
+        let key = self.initialized.candidate.key;
+        let next = ResidentColorTarget {
+            key,
+            generation: self.initialized.candidate.generation,
+            initialized: self.initialized.proof,
+            device_bytes: self.initialized.device_bytes,
+        };
+        if let Some(index) = self
+            .registry
+            .residents
+            .iter()
+            .position(|resident| resident.key == key)
+        {
+            self.registry.residents[index] = next;
+            return &self.registry.residents[index];
+        }
+
+        let index = self.registry.residents.len();
+        self.registry.residents.push(next);
+        &self.registry.residents[index]
+    }
 }
 
 impl InitializedCandidateColorTarget {
@@ -604,6 +647,13 @@ impl ColorTargetRegistry {
         &mut self,
         initialized: InitializedCandidateColorTarget,
     ) -> Result<&ResidentColorTarget, TargetError> {
+        Ok(self.prepare_publication(initialized)?.publish())
+    }
+
+    pub(crate) fn prepare_publication(
+        &mut self,
+        initialized: InitializedCandidateColorTarget,
+    ) -> Result<ResidentPublication<'_>, TargetError> {
         let key = initialized.candidate.key;
         let predecessor = initialized.candidate.predecessor;
         let actual = self
@@ -619,19 +669,11 @@ impl ColorTargetRegistry {
             });
         }
 
-        let next = ResidentColorTarget {
-            key,
-            generation: initialized.candidate.generation,
-            initialized: initialized.proof,
-            device_bytes: initialized.device_bytes,
-        };
-        if let Some(index) = self
-            .residents
-            .iter()
-            .position(|resident| resident.key == key)
-        {
-            self.residents[index] = next;
-            return Ok(&self.residents[index]);
+        if self.residents.iter().any(|resident| resident.key == key) {
+            return Ok(ResidentPublication {
+                registry: self,
+                initialized,
+            });
         }
 
         if let Some(resident) = self
@@ -650,11 +692,10 @@ impl ColorTargetRegistry {
                 candidate: key,
             });
         }
-        self.residents.push(next);
-        Ok(self
-            .residents
-            .last()
-            .expect("the just-pushed resident target exists"))
+        Ok(ResidentPublication {
+            registry: self,
+            initialized,
+        })
     }
 }
 

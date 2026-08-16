@@ -3,13 +3,15 @@
 //! This module deliberately accepts one exact, complete presentation image:
 //! the synthetic M3.3a 4x2 RGBA16 target, progressive field, 1:1 scale, and
 //! VI replicate mode with every optional filter disabled. It owns neither the
-//! live VI register latch nor guest memory. The future crate-root integration
-//! must translate one `fn64_render::ViPresentation` into this value while the
+//! live VI register latch nor guest memory. A future live adapter must
+//! translate one `fn64_render::ViPresentation` into this value while the
 //! upstream retrace-scoped memory capability is live.
 //!
 //! The CPU oracle and padded-row extractor are executable without a GPU. The
-//! repository-owned WGSL is retained beside this module, but this isolated
-//! slice does not wire or qualify a wgpu pipeline.
+//! repository-owned WGSL is retained beside this module. M3.3c composes it
+//! after one exact 4x2 native fill and validates its GPU bytes against the CPU
+//! oracle. That is bounded live mechanism evidence, not a general VI, live
+//! register-latch, surface, parity, or performance claim.
 //!
 //! Provenance: the complete register names and `OSViMode` field split come
 //! from the public libultra VI interface and *N64 Programming Manual*, Video
