@@ -360,6 +360,28 @@ parity. It claims neither visual/silicon parity nor performance. A later
 three-nearest path must choose its corners before reading them so an unused
 fourth corner cannot create a false validity failure.
 
+M4.3.3f ports the RDP's "three nearest" triangular bilerp as a pure function
+over `CommittedTextureCell`: `filter_three_nearest_committed_cell` remaps the
+cell's stored `[UpperLeft, LowerLeft, UpperRight, LowerRight]` corner order to
+`fn64-render-reference`'s `filter_three_nearest_s10_5` formula order
+(`[c00, c10, c01, c11]` = `[UpperLeft, UpperRight, LowerLeft, LowerRight]`)
+before applying the same fixed-point arithmetic, selecting the lower-left or
+upper-right triangle by `sf + tf <= 32` and rounding-to-nearest with a
+clamp-to-`u8` output policy carried unchanged from the reference lane. Public
+documentation does not establish the silicon filter accumulator width or its
+tie-break rule; this is a preserved convention, not a verified hardware fact.
+The formula and its Programming Manual "TF: Texture Filter"/"Sampling
+Overview" citation are ported from the already-tested
+`crates/fn64-render-reference/src/gbi/types.rs:954-972`; a same-repo
+Rust-to-Rust differential drives the pure arithmetic against the reference
+lane's own literal 262,144-case sweep (all `sf, tf` in `0..32` across 256
+pseudo-random four-corner seeds), plus a TMEM-address-grounded fixture at the
+`sf + tf == 32` boundary reading real committed RGBA16 bytes. This slice does
+not select which filter mode applies (point vs. bilerp vs. box-average vs.
+copy), wire the filtered texel into a color combiner (none exists in this
+crate yet), drive per-pixel UV/gather from a triangle rasterizer, or claim
+RT64 pixel/visual/silicon parity or performance.
+
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
 commands at `0x100..0x128`, color writeback at `0x400..0x410`, transaction

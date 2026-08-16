@@ -70,10 +70,11 @@ pub use read::{
     PhysicalTmemSnapshotIdentity, TmemFirstRowParity,
 };
 pub use sample::{
-    address_point_texel, address_texture_cell, gather_committed_texture_cell,
-    sample_committed_point, AddressedTextureCell, CommittedTextureCell, PointAddressError,
-    PointSampleCoordinates, PointSampleError, PointSampleRequest, TextureAxis, TextureCellCorner,
-    TextureCellFractions, TextureCellSampleError, TextureCoordinateS10_5,
+    address_point_texel, address_texture_cell, filter_three_nearest_committed_cell,
+    gather_committed_texture_cell, sample_committed_point, AddressedTextureCell,
+    CommittedTextureCell, PointAddressError, PointSampleCoordinates, PointSampleError,
+    PointSampleRequest, TextureAxis, TextureCellCorner, TextureCellFractions,
+    TextureCellSampleError, TextureCoordinateS10_5,
 };
 pub use state::{TileState, TmemState};
 pub use texel::{

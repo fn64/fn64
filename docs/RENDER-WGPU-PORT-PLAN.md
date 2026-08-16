@@ -1016,6 +1016,20 @@ The accelerated wave keeps dependency-safe work active in parallel:
     qualification; or RT64 pixel parity. It claims no visual/silicon parity.
     M2.5.3a's direct-texel WGSL mechanism and runtime shader-corpus
     documentation at `7e13b87c` remain unchanged.
+    M4.3.3f ports the RDP three-nearest triangular bilerp as a pure function
+    over `CommittedTextureCell`: `filter_three_nearest_committed_cell` remaps
+    the cell's stored `[UpperLeft, LowerLeft, UpperRight, LowerRight]` order
+    to `fn64-render-reference`'s `filter_three_nearest_s10_5` formula order
+    before applying the same fixed-point arithmetic (lower-left triangle when
+    `sf + tf <= 32`, otherwise upper-right; round-to-nearest, clamp to `u8`).
+    The accumulator width and tie-break rule remain a preserved convention,
+    not a verified hardware fact, per the reference lane's own comment. A
+    same-repo Rust-to-Rust differential drives the arithmetic against the
+    reference lane's literal 262,144-case sweep plus a TMEM-address-grounded
+    fixture at the `sf + tf == 32` boundary. It does not select which filter
+    mode applies, wire the filtered texel into a combiner (none exists in
+    this crate), drive per-pixel UV/gather from a rasterizer, or claim RT64
+    pixel/visual/silicon parity or performance.
 20. **T0 -- production raw-DPC sealed session/authority seam, v11 interface
     freeze (INTEGRATED).** The production-dispatch migration card's first
     ticket, rebuilt to the v11 interface freeze's minimal sealed/session

@@ -424,6 +424,73 @@ pub fn gather_committed_texture_cell(
     Ok(CommittedTextureCell { addressed, texels })
 }
 
+const TEXEL_FRACTION_HALF_SCALE: i64 = TEXEL_FRACTION_SCALE / 2;
+
+/// The RDP's "three nearest" triangular interpolation of a committed 2x2
+/// texture cell, selected by which half of the cell's diagonal the sample
+/// falls in. Not a 4-tap/box average — see `TextureFilter::Average` in
+/// `fn64-render-reference` for that separate, unported mode.
+///
+/// Nintendo's Programming Manual, "TF: Texture Filter" and "Sampling
+/// Overview," define this triangular selection; the fixed-point formula
+/// below ports `fn64-render-reference`'s already-tested
+/// `filter_three_nearest_s10_5`
+/// (`crates/fn64-render-reference/src/gbi/types.rs:954-972`). That
+/// function's corner order is `[c00, c10, c01, c11]` = `[UpperLeft,
+/// UpperRight, LowerLeft, LowerRight]`; `CommittedTextureCell`'s stored order
+/// is `[UpperLeft, LowerLeft, UpperRight, LowerRight]`, so this remaps by
+/// named corner rather than reusing the reference array literally.
+///
+/// The round-to-nearest, clamp-to-`u8` output policy matches the reference
+/// lane exactly. Public documentation does not establish the silicon filter
+/// accumulator width or its tie-break rule; this is a preserved convention,
+/// not a verified hardware fact.
+pub fn filter_three_nearest_committed_cell(cell: CommittedTextureCell) -> [u8; 4] {
+    let fractions = cell.addressed().fractions();
+    let c00 = cell.corner(TextureCellCorner::UpperLeft).texel().rgba8888();
+    let c10 = cell
+        .corner(TextureCellCorner::UpperRight)
+        .texel()
+        .rgba8888();
+    let c01 = cell.corner(TextureCellCorner::LowerLeft).texel().rgba8888();
+    let c11 = cell
+        .corner(TextureCellCorner::LowerRight)
+        .texel()
+        .rgba8888();
+    filter_three_nearest(
+        [c00, c10, c01, c11],
+        i64::from(fractions.s_five_bit()),
+        i64::from(fractions.t_five_bit()),
+    )
+}
+
+/// Pure fixed-point arithmetic behind [`filter_three_nearest_committed_cell`],
+/// taking the four corners pre-remapped to `[c00, c10, c01, c11]` = `[UpperLeft,
+/// UpperRight, LowerLeft, LowerRight]` (`fn64-render-reference`'s
+/// `filter_three_nearest_s10_5` order) and 5-bit `sf`/`tf` fractions in
+/// `0..32`. Split out so the exhaustive differential below can drive it
+/// directly against synthetic corner values, without a physical TMEM commit
+/// per case.
+fn filter_three_nearest(corners: [[u8; 4]; 4], sf: i64, tf: i64) -> [u8; 4] {
+    debug_assert!((0..TEXEL_FRACTION_SCALE).contains(&sf));
+    debug_assert!((0..TEXEL_FRACTION_SCALE).contains(&tf));
+    let [c00, c10, c01, c11] = corners;
+    std::array::from_fn(|channel| {
+        let c00 = i64::from(c00[channel]);
+        let c10 = i64::from(c10[channel]);
+        let c01 = i64::from(c01[channel]);
+        let c11 = i64::from(c11[channel]);
+        let value = if sf + tf <= TEXEL_FRACTION_SCALE {
+            c00 * TEXEL_FRACTION_SCALE + sf * (c10 - c00) + tf * (c01 - c00)
+        } else {
+            c11 * TEXEL_FRACTION_SCALE
+                + (TEXEL_FRACTION_SCALE - sf) * (c01 - c11)
+                + (TEXEL_FRACTION_SCALE - tf) * (c10 - c11)
+        };
+        ((value + TEXEL_FRACTION_HALF_SCALE) / TEXEL_FRACTION_SCALE).clamp(0, 255) as u8
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RelativeAxisCoordinate {
     base_texel: i64,
@@ -1141,5 +1208,71 @@ mod tests {
             "physical TMEM texel byte 0x004 is invalid"
         );
         assert_eq!(observe(&state), before);
+    }
+
+    #[test]
+    fn three_nearest_filter_selects_lower_left_and_upper_right_triangles() {
+        let corners = |value: u8| [value; 4];
+        let c_ul = corners(100);
+        let c_ur = corners(150);
+        let c_ll = corners(50);
+        let c_lr = corners(200);
+
+        // sf+tf=16 <= 32 selects the lower-left triangle:
+        // value = 100*32 + 8*(150-100) + 8*(50-100) = 3200 + 400 - 400 = 3200
+        // result = round(3200/32) = 100
+        assert_eq!(
+            filter_three_nearest([c_ul, c_ur, c_ll, c_lr], 8, 8),
+            corners(100)
+        );
+
+        // sf+tf=48 > 32 selects the upper-right triangle:
+        // value = 200*32 + 8*(50-200) + 8*(150-200) = 6400 - 1200 - 400 = 4800
+        // result = round(4800/32) = 150
+        assert_eq!(
+            filter_three_nearest([c_ul, c_ur, c_ll, c_lr], 24, 24),
+            corners(150)
+        );
+    }
+
+    #[test]
+    fn three_nearest_filter_matches_the_reference_lane_across_every_fraction_and_seed() {
+        let mut lower_half = 0usize;
+        let mut upper_half = 0usize;
+        for seed in 0..=255u16 {
+            let values = [
+                seed as u8,
+                seed.wrapping_mul(73).wrapping_add(19) as u8,
+                seed.wrapping_mul(151).wrapping_add(41) as u8,
+                seed.wrapping_mul(211).wrapping_add(97) as u8,
+            ];
+            // fn64-render-reference's `[c00, c10, c01, c11]` order: this
+            // sweep drives `filter_three_nearest` directly in that already-
+            // remapped order, matching filter_three_nearest_committed_cell's
+            // own corner remap under test elsewhere.
+            let [c00, c10, c01, c11] = values.map(|value| [value; 4]);
+            for sf in 0..32i64 {
+                for tf in 0..32i64 {
+                    let [c00f, c10f, c01f, c11f] = values.map(f32::from);
+                    let sf_float = sf as f32 / 32.0;
+                    let tf_float = tf as f32 / 32.0;
+                    let expected = if sf + tf <= 32 {
+                        lower_half += 1;
+                        c00f + sf_float * (c10f - c00f) + tf_float * (c01f - c00f)
+                    } else {
+                        upper_half += 1;
+                        c11f + (1.0 - sf_float) * (c01f - c11f) + (1.0 - tf_float) * (c10f - c11f)
+                    }
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                    assert_eq!(
+                        filter_three_nearest([c00, c10, c01, c11], sf, tf),
+                        [expected; 4],
+                        "seed={seed} sf={sf}/32 tf={tf}/32"
+                    );
+                }
+            }
+        }
+        assert_eq!((lower_half, upper_half), (143_104, 119_040));
     }
 }

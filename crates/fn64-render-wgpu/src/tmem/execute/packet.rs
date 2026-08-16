@@ -307,12 +307,13 @@ mod tests {
     use crate::raw_dpc::{decode_raw_dpc, RawDpcCommandKind, RawDpcDecodeError};
     use crate::tmem::{LOAD_BLOCK, LOAD_SYNC, LOAD_TILE, LOAD_TLUT, SET_TEXTURE_IMAGE, SET_TILE};
     use crate::{
-        decode_direct_texel, gather_committed_texture_cell, read_committed_texel,
-        sample_committed_point, AddressedTmemTexel, ImageFormat, PhysicalTexelReadError,
-        PhysicalTmemState, PhysicalTmemStateIdentity, PixelSize, PointSampleCoordinates,
-        PointSampleRequest, RawTexel, RdpState, TextureCellCorner, TextureCellSampleError,
-        TextureCoordinateS10_5, TextureLutMode, TileAddressMode, TileCoordinate, TileDescriptor,
-        TileSize, TmemFirstRowParity, TmemLoadEpoch, TmemWordAddress,
+        decode_direct_texel, filter_three_nearest_committed_cell, gather_committed_texture_cell,
+        read_committed_texel, sample_committed_point, AddressedTmemTexel, ImageFormat,
+        PhysicalTexelReadError, PhysicalTmemState, PhysicalTmemStateIdentity, PixelSize,
+        PointSampleCoordinates, PointSampleRequest, RawTexel, RdpState, TextureCellCorner,
+        TextureCellSampleError, TextureCoordinateS10_5, TextureLutMode, TileAddressMode,
+        TileCoordinate, TileDescriptor, TileSize, TmemFirstRowParity, TmemLoadEpoch,
+        TmemWordAddress,
     };
 
     const LAYOUT_BYTES: u32 = 0x4000;
@@ -1361,6 +1362,48 @@ mod tests {
             assert_eq!(texel.snapshot().generation(), before.generation);
         }
         assert_eq!(observe_durable(&rgba32), before);
+    }
+
+    #[test]
+    fn three_nearest_filter_reads_the_sf_plus_tf_equals_scale_boundary_from_real_tmem_bytes() {
+        // Reuses `centered_cell_exposes_literal_fractions_corners_and_parity`'s
+        // exact addressing (`cell_request` = raw S10.5 16, `reader_size(0, 0,
+        // 4, 4)`, zero shift/mask) to produce `sf=16, tf=16`: the formula's
+        // `<=` boundary, which the `<=` puts in the lower-left branch.
+        let rgba16_source = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
+        let (words, ranges) = rgba_cell_words(0x200, PixelSize::Bits16, 32);
+        let rgba16 = publish_sources(words, &ranges, &[(0x200, &rgba16_source)]);
+        let cell = gather_committed_texture_cell(
+            &rgba16,
+            reader_tile(ImageFormat::Rgba, PixelSize::Bits16, 1, 32, 0),
+            reader_size(0, 0, 4, 4),
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(cell.addressed().fractions().s_five_bit(), 16);
+        assert_eq!(cell.addressed().fractions().t_five_bit(), 16);
+        assert_eq!(
+            cell_colors(cell),
+            [
+                [255, 0, 0, 255],
+                [0, 0, 255, 255],
+                [0, 255, 0, 255],
+                [255, 255, 255, 255],
+            ]
+        );
+
+        // c00=UpperLeft=[255,0,0,255], c10=UpperRight=[0,255,0,255],
+        // c01=LowerLeft=[0,0,255,255], sf=tf=16, sf+tf=32<=32 (lower-left
+        // branch): R = round((255*32 + 16*(0-255) + 16*(0-255)) / 32)
+        //            = round((8160 - 4080 - 4080) / 32) = round(0/32) = 0
+        // G = round((0*32 + 16*(255-0) + 16*(0-0)) / 32) = round(4080/32) = 128 (rounds to nearest, .5 up)
+        // B = round((0*32 + 16*(0-0) + 16*(255-0)) / 32) = round(4080/32) = 128 (mirror of G)
+        // A stays 255 (all four corners agree).
+        assert_eq!(
+            filter_three_nearest_committed_cell(cell),
+            [0, 128, 128, 255]
+        );
     }
 
     #[test]
