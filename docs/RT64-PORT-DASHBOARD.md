@@ -20,7 +20,7 @@
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, RUNNING:1 |
-| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1 |
+| `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1, READY:1 |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
@@ -418,6 +418,29 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | `cargo test -p fn64-render-ir -p fn64-render-wgpu -p fn64-render --lib --no-fail-fast` | 1 | 1 | single |
 
 **Next action:** Extend the admitted raw-DPC slice toward real native framebuffer and VI/surface presentation while preserving the exact IR journal, completion, and guest-effect ownership boundaries.
+
+### `M3.2` -- Replace M3.1's fixed eight-word parser with a bounded raw-DPC decoder that produces a typed transaction-local RDP state delta and exact resource plan without mutating durable renderer state.
+
+| field | value |
+|---|---|
+| milestone | `M3` |
+| state | `READY` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | raw-DPC decoder/state writer |
+| branch | `port/m3-raw-dpc-decoder` -> `main` |
+| dependencies | `M3.1` |
+| writable paths | `crates/fn64-render-wgpu/Cargo.toml`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/src/lifecycle.rs`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/README.md` |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- The next slice is headless decode/state, not production ABI dispatch or VI/surface: exact framebuffer and TMEM semantics must exist before either boundary can be crossed honestly.
+- Admit only no-op variants, fill-cycle SetOtherMode, SetColorImage, SetFillColor, FillRectangle, and FullSync; unknown, truncated, unsupported, or state-invalid commands reject with workload/stream/chunk/source-offset/opcode context.
+- Use fn64-render's public raw-RDP command-width authority and accept all equivalent two-bit opcode-prefix spellings. RT64 remains candidate semantic evidence rather than parity authority.
+- The decoder and staged persistent state belong to fn64-render-wgpu; fn64-render-ir retains neutral packets/journals/receipts, and fn64-abi must not decode commands or select targets.
+
+**Next action:** Implement the bounded decoder and transaction-local state delta with exact journal equality, hostile command tables, and two-packet staged-state tests; run the 10-process CPU bar before independent review.
 
 ## Regenerating
 
