@@ -839,6 +839,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-render-ir"
+version = "0.0.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "fn64-render-reference"
 version = "0.0.0"
 dependencies = [
