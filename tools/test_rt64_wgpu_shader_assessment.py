@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import subprocess
 import struct
 import sys
@@ -43,12 +44,8 @@ def reference_row(blocked: bool = False, index: int = 0) -> dict:
     }
 
 
-def success_bytes(row: dict, module_bytes: int = 20) -> bytes:
-    return (
-        '{"schema":"fn64.wgpu-shader-validation.v1","status":"passed",'
-        f'"wgpu_major":30,"stage":"{row["stage"]}","entry":"{row["entry"]}",'
-        f'"module_bytes":{module_bytes}}}\n'
-    ).encode()
+def success_bytes(row: dict, module_bytes: int = 20, profile: str = "baseline") -> bytes:
+    return subject.validator_success_bytes(profile, row["stage"], row["entry"], module_bytes)
 
 
 def spirv_fixture(*, descriptor_set: int = 0, binding: int = 2, member_index: int = 7,
@@ -89,14 +86,89 @@ def spirv_fixture(*, descriptor_set: int = 0, binding: int = 2, member_index: in
 EMPTY_SPIRV = struct.pack("<5I", 0x07230203, 0x00010000, 0, 1, 0)
 
 
+def push_constant_fixture(
+    member_types: tuple[str, ...] = ("f32",),
+    offsets: tuple[int, ...] = (0,),
+    *,
+    block: bool = True,
+    missing_offset: int | None = None,
+    duplicate_offset: int | None = None,
+    multiple_globals: bool = False,
+    group_decoration: bool = False,
+    missing_variable_name: bool = False,
+    missing_struct_name: bool = False,
+    missing_member_name: int | None = None,
+) -> bytes:
+    words = [0x07230203, 0x00010000, 0, 32, 0]
+
+    def instruction(opcode: int, *operands: int) -> None:
+        words.append(((len(operands) + 1) << 16) | opcode)
+        words.extend(operands)
+
+    def literal(value: str) -> list[int]:
+        data = value.encode() + b"\0"
+        data += b"\0" * (-len(data) % 4)
+        return list(struct.unpack(f"<{len(data) // 4}I", data))
+
+    type_ids = {
+        "f32": 1, "u32": 2, "i32": 3, "vec2f": 4, "vec3f": 5, "vec4u": 6,
+        "bool": 10, "f64": 11, "vec1f": 12, "vec5f": 13, "matrix": 14,
+        "array": 15, "runtime-array": 16, "nested": 17, "unknown": 18,
+        "recursive": 7,
+    }
+    if not missing_variable_name:
+        instruction(5, 9, *literal("pc"))
+    if not missing_struct_name:
+        instruction(5, 7, *literal("PushConstants"))
+    for index in range(len(member_types)):
+        if index != missing_member_name:
+            instruction(6, 7, index, *literal(f"member{index}"))
+    if block:
+        instruction(71, 7, 2)
+    for index, member_offset in enumerate(offsets):
+        if index != missing_offset:
+            instruction(72, 7, index, 35, member_offset)
+        if index == duplicate_offset:
+            instruction(72, 7, index, 35, member_offset)
+    if group_decoration:
+        instruction(73, 19)
+    instruction(22, 1, 32)
+    instruction(21, 2, 32, 0)
+    instruction(21, 3, 32, 1)
+    instruction(23, 4, 1, 2)
+    instruction(23, 5, 1, 3)
+    instruction(23, 6, 2, 4)
+    instruction(20, 10)
+    instruction(22, 11, 64)
+    instruction(23, 12, 1, 1)
+    instruction(23, 13, 1, 5)
+    instruction(24, 14, 4, 2)
+    instruction(28, 15, 1, 20)
+    instruction(29, 16, 1)
+    instruction(30, 17, 1)
+    instruction(30, 7, *(type_ids[name] for name in member_types))
+    instruction(32, 8, 9, 7)
+    instruction(59, 8, 9, 9)
+    if multiple_globals:
+        instruction(59, 8, 19, 9)
+    return struct.pack(f"<{len(words)}I", *words)
+
+
 class PolicyTests(unittest.TestCase):
     def test_policy_is_exact_and_selftest_passes(self) -> None:
         self.assertEqual(subject.load_policy()["reference_corpus"]["row_count"], 56)
         subject.selftest()
 
-    def test_parser_has_four_commands(self) -> None:
+    def test_parser_has_five_commands(self) -> None:
         parser = subject.parser()
         self.assertEqual(parser.parse_args(["selftest"]).command, "selftest")
+        census = parser.parse_args([
+            "diagnostic-census", "--reference-artifact-dir", "/corpus",
+            "--wgpu-validator-build-dir", "/validator",
+        ])
+        self.assertEqual(census.command, "diagnostic-census")
+        self.assertFalse(hasattr(census, "output_dir"))
+        self.assertFalse(hasattr(census, "assessment_dir"))
         with self.assertRaises(SystemExit):
             parser.parse_args(["assess"])
 
@@ -116,6 +188,20 @@ class PolicyTests(unittest.TestCase):
         policy = base.load_json(subject.POLICY_PATH)
         policy["runtime_readiness"]["runtime_ready"] = True
         with mock.patch.object(base, "load_json", return_value=policy), self.assertRaises(base.ArtifactError):
+            subject.load_policy()
+
+    def test_policy_rejects_guessed_validator_hash_while_pending(self) -> None:
+        policy = base.load_json(subject.POLICY_PATH)
+        policy["wgpu_validator"].update({
+            "build_receipt_sha256": None,
+            "binary_sha256": None,
+            "source_set_sha256": None,
+            "cargo_lock_sha256": None,
+            "dependency_set_sha256": None,
+            "artifact_identity_status": "pending-m2.4-v2-integration",
+        })
+        policy["wgpu_validator"]["binary_sha256"] = "0" * 64
+        with mock.patch.object(base, "load_json", return_value=policy), self.assertRaisesRegex(base.ArtifactError, "guessed hashes"):
             subject.load_policy()
 
 
@@ -140,6 +226,109 @@ class ReferenceReceiptSerializationTests(unittest.TestCase):
         self.assertNotEqual(mutated, base.pretty_json(self.value))
         with self.assertRaisesRegex(base.ArtifactError, "not exact pretty JSON"):
             subject.load_exact_pretty_json_bytes(mutated, "fixture")
+
+
+class ValidatorProfileDerivationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = subject.load_policy()
+
+    def derive(self, value: bytes) -> dict:
+        return subject.derive_validator_profile(value, self.policy)
+
+    def test_baseline_requires_exact_absence_witness(self) -> None:
+        derived = self.derive(EMPTY_SPIRV)
+        self.assertIsNone(derived["immediate_witness"])
+        self.assertEqual(derived["profile"], subject.validator_profile("baseline"))
+        subject.validate_profile_derivation_record(derived, "fixture")
+
+    def test_every_closed_extent_selects_exact_minimum_profile(self) -> None:
+        cases = {
+            4: (("f32",), (0,)),
+            8: (("vec2f",), (0,)),
+            16: (("vec3f",), (0,)),
+            20: (("f32",) * 5, (0, 4, 8, 12, 16)),
+            24: (("vec2f", "f32", "f32", "f32"), (0, 8, 12, 16)),
+            32: (("vec4u", "vec4u"), (0, 16)),
+            40: (("vec2f",) + ("f32",) * 7, (0, 8, 12, 16, 20, 24, 28, 32)),
+            56: (("vec2f",) + ("f32",) * 11, (0, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48)),
+        }
+        for extent, (types, offsets) in cases.items():
+            with self.subTest(extent=extent):
+                derived = self.derive(push_constant_fixture(types, offsets))
+                self.assertEqual(derived["immediate_witness"]["required_max_immediate_size"], extent)
+                self.assertEqual(derived["profile"], subject.validator_profile(f"immediates-{extent}"))
+                subject.validate_profile_derivation_record(derived, "fixture")
+
+    def test_witness_binds_ids_names_types_offsets_and_sizes(self) -> None:
+        derived = self.derive(push_constant_fixture(("u32", "vec3f"), (0, 4)))
+        witness = derived["immediate_witness"]
+        self.assertEqual(witness["variable_id"], 9)
+        self.assertEqual(witness["pointer_type_id"], 8)
+        self.assertEqual(witness["struct_type_id"], 7)
+        self.assertEqual(witness["members"], [
+            {"index": 0, "name": "member0", "type": "uint", "offset": 0, "size": 4},
+            {"index": 1, "name": "member1", "type": "float3", "offset": 4, "size": 12},
+        ])
+        mutated = copy.deepcopy(derived)
+        mutated["immediate_witness"]["members"][0]["offset"] = 4
+        with self.assertRaisesRegex(base.ArtifactError, "overlap"):
+            subject.validate_profile_derivation_record(mutated, "fixture")
+
+    def test_mixed_alignment_rounds_raw_content_extent_like_naga(self) -> None:
+        cases = (
+            (("vec2f", "vec2f", "f32"), (0, 8, 16), 20, 24),
+            (("vec2f",) + ("f32",) * 7, (0, 8, 12, 16, 20, 24, 28, 32), 36, 40),
+            (("vec2f",) + ("f32",) * 11, (0, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48), 52, 56),
+            (("vec3f", "f32", "f32"), (0, 12, 16), 20, 32),
+        )
+        for types, offsets, raw_extent, rounded_span in cases:
+            with self.subTest(raw_extent=raw_extent, rounded_span=rounded_span):
+                derived = self.derive(push_constant_fixture(types, offsets))
+                self.assertEqual(offsets[-1] + derived["immediate_witness"]["members"][-1]["size"], raw_extent)
+                self.assertEqual(derived["immediate_witness"]["required_max_immediate_size"], rounded_span)
+                self.assertEqual(derived["profile"], subject.validator_profile(f"immediates-{rounded_span}"))
+
+    def test_rejects_multiple_push_constant_globals(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "multiple PushConstant"):
+            self.derive(push_constant_fixture(multiple_globals=True))
+
+    def test_rejects_group_decorations(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "group decoration"):
+            self.derive(push_constant_fixture(group_decoration=True))
+
+    def test_rejects_missing_or_duplicate_offsets(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "lacks one exact Offset"):
+            self.derive(push_constant_fixture(missing_offset=0))
+        with self.assertRaisesRegex(base.ArtifactError, "duplicate profile OpMemberDecorate"):
+            self.derive(push_constant_fixture(duplicate_offset=0))
+
+    def test_rejects_missing_names_or_block(self) -> None:
+        for kwargs, message in (
+            ({"missing_variable_name": True}, "variable name"),
+            ({"missing_struct_name": True}, "struct name"),
+            ({"missing_member_name": 0}, "member 0 name"),
+            ({"block": False}, "Block decoration"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(base.ArtifactError, message):
+                self.derive(push_constant_fixture(**kwargs))
+
+    def test_rejects_unsupported_widths_shapes_and_composites(self) -> None:
+        for kind in ("bool", "f64", "vec1f", "vec5f", "matrix", "array", "runtime-array", "nested", "recursive", "unknown"):
+            with self.subTest(kind=kind), self.assertRaises(base.ArtifactError):
+                self.derive(push_constant_fixture((kind,), (0,)))
+
+    def test_rejects_overlap_overflow_and_unreviewed_extent(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "overlap"):
+            self.derive(push_constant_fixture(("vec4u", "f32"), (0, 12)))
+        with self.assertRaisesRegex(base.ArtifactError, "overflows"):
+            self.derive(push_constant_fixture(("vec2f",), (0xFFFFFFFC,)))
+        with self.assertRaisesRegex(base.ArtifactError, "round-up overflows"):
+            self.derive(push_constant_fixture(("vec4u",), (0xFFFFFFEC,)))
+        with self.assertRaisesRegex(base.ArtifactError, "unreviewed"):
+            self.derive(push_constant_fixture(("f32",), (8,)))
+        for raw_size in (36, 52):
+            with self.subTest(raw_size=raw_size), self.assertRaisesRegex(base.ArtifactError, "unreviewed"):
+                self.derive(push_constant_fixture(("f32",) * (raw_size // 4), tuple(range(0, raw_size, 4))))
 
 
 class ClassificationTests(unittest.TestCase):
@@ -317,12 +506,17 @@ class ReceiptTests(unittest.TestCase):
         self.policy["reference_corpus"]["entry_order_sha256"] = base.digest_bytes(
             base.canonical_json([f"shader-{index}" for index in range(56)])
         )
+        self.policy["profile_derivation"]["expected_corpus_profile_counts"] = {
+            name: 56 if name == "baseline" else 0 for name in subject.PROFILE_NAMES
+        }
 
     def make_entry(self, index: int, blocked: bool) -> dict:
         row = reference_row(blocked, index)
+        profile_derivation = subject.derive_validator_profile(EMPTY_SPIRV, self.policy)
+        selected_profile = profile_derivation["profile"]
         if blocked:
             validation = {
-                "arguments": ["--shader", "<private-staged-spv>", "--stage", "compute", "--entry", "CSMain"],
+                "arguments": subject.validator_arguments("baseline", "compute", "CSMain"),
                 "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
                 "stderr_sha256": base.digest_bytes(subject.KNOWN_STDERR), "stderr_bytes": len(subject.KNOWN_STDERR),
             }
@@ -331,14 +525,15 @@ class ReceiptTests(unittest.TestCase):
         else:
             output = success_bytes(row)
             validation = {
-                "arguments": ["--shader", "<private-staged-spv>", "--stage", "compute", "--entry", "CSMain"],
+                "arguments": subject.validator_arguments("baseline", "compute", "CSMain"),
                 "exit_code": 0, "stdout_sha256": base.digest_bytes(output), "stdout_bytes": len(output),
                 "stderr_sha256": subject.EMPTY_SHA256, "stderr_bytes": 0,
             }
-            result = {"schema": "fn64.wgpu-shader-validation.v1", "status": "passed", "wgpu_major": 30, "stage": "compute", "entry": "CSMain", "module_bytes": 20}
+            result = subject.validator_success_record("baseline", "compute", "CSMain", 20)
             reason = None
         return {
-            **row, "scalar_layout_witness": None,
+            **row, "immediate_witness": profile_derivation["immediate_witness"], "selected_profile": selected_profile,
+            "scalar_layout_witness": None,
             "outcome": "blocked-known" if blocked else "ingestible", "reason_code": reason,
             "validation": validation, "validation_record": result,
         }
@@ -358,10 +553,13 @@ class ReceiptTests(unittest.TestCase):
             },
             "assessment_contract": {
                 "strict_capabilities": True, "noop_checked_shader_module": True,
-                "arguments": validator["arguments"], "controlled_environment": validator["controlled_environment"],
+                "arguments": validator["arguments"], "profiles": validator["identity"]["profiles"],
+                "profile_derivation": self.policy["profile_derivation"],
+                "controlled_environment": validator["controlled_environment"],
                 "outcome_order": self.policy["outcomes"]["order"],
             },
             "entries": entries, "outcome_counts": {"ingestible": 55, "blocked-known": 1},
+            "profile_counts": self.policy["profile_derivation"]["expected_corpus_profile_counts"],
             "assessment_set_sha256": base.digest_bytes(base.canonical_json(entries)),
             "runtime_readiness": subject.runtime_readiness(entries, self.policy),
             "claim_boundary": self.policy["claim_boundary"],
@@ -386,6 +584,29 @@ class ReceiptTests(unittest.TestCase):
         })
         receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
         subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_valid_immediate_profile_receipt(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][1]
+        derived = subject.derive_validator_profile(push_constant_fixture(("f32",) * 5, (0, 4, 8, 12, 16)), self.policy)
+        row["immediate_witness"] = derived["immediate_witness"]
+        row["selected_profile"] = derived["profile"]
+        row["validation"]["arguments"] = subject.validator_arguments("immediates-20", "compute", "CSMain")
+        output = success_bytes(row, profile="immediates-20")
+        row["validation"].update({"stdout_sha256": base.digest_bytes(output), "stdout_bytes": len(output)})
+        row["validation_record"] = subject.validator_success_record("immediates-20", "compute", "CSMain", 20)
+        self.policy["profile_derivation"]["expected_corpus_profile_counts"].update({"baseline": 55, "immediates-20": 1})
+        receipt["profile_counts"] = self.policy["profile_derivation"]["expected_corpus_profile_counts"]
+        receipt["assessment_contract"]["profile_derivation"] = self.policy["profile_derivation"]
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_selected_profile_witness_mismatch(self) -> None:
+        receipt = self.make_receipt()
+        receipt["entries"][1]["selected_profile"] = subject.validator_profile("immediates-4")
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "profile changed"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
 
     def test_receipt_hash_mutation(self) -> None:
         receipt = self.make_receipt()
@@ -444,6 +665,208 @@ class ReceiptTests(unittest.TestCase):
         receipt["reference_corpus"]["receipt_file_sha256"] = "0" * 64
         with self.assertRaises(base.ArtifactError):
             subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+
+class HistoricalCorpusAuthenticationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.policy = copy.deepcopy(subject.load_policy())
+        self.policy["reference_corpus"]["row_count"] = 1
+        self.policy["reference_corpus"]["file_count"] = 5
+        self.files = {
+            "dependency_output_artifact": ("dependency/a.d", b"d"),
+            "dependency_manifest_artifact": ("dependency/a.json", b"m"),
+            "preprocessed_artifact": ("preprocessed/a.hlsl", b"p"),
+            "spirv_artifact": ("spirv/a.spv", b"s"),
+        }
+        row = {
+            "id": "shader-0", "source": "src/shader0.hlsl", "stage": "compute", "entry": "CSMain",
+            "semantic_inventory": inventory(False),
+        }
+        keys = {
+            "dependency_output_artifact": ("dependency_output_sha256", "dependency_output_bytes"),
+            "dependency_manifest_artifact": ("dependency_manifest_sha256", "dependency_manifest_bytes"),
+            "preprocessed_artifact": ("preprocessed_sha256", "preprocessed_bytes"),
+            "spirv_artifact": ("spirv_sha256", "spirv_bytes"),
+        }
+        for path_key, (relative, data) in self.files.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            digest_key, length_key = keys[path_key]
+            row.update({path_key: relative, digest_key: base.digest_bytes(data), length_key: len(data)})
+        artifact_set = [{"path": row["spirv_artifact"], "sha256": row["spirv_sha256"]}]
+        ref = self.policy["reference_corpus"]
+        receipt = base.add_receipt_hash({
+            "schema": ref["receipt_schema"], "status": "complete",
+            "orchestration_producer_sha256": ref["orchestration_producer_sha256"],
+            "artifact_producer_sha256": ref["artifact_producer_sha256"],
+            "reference_policy_sha256": ref["reference_policy_sha256"],
+            "artifact_policy_sha256": ref["artifact_policy_sha256"],
+            "denominator_sha256": ref["denominator_sha256"],
+            "source_snapshot": {"source_set_sha256": ref["source_snapshot_set_sha256"]},
+            "dxc_build_receipt_sha256": ref["dxc_build_receipt_sha256"],
+            "dxc_compiler_sha256": ref["dxc_compiler_sha256"],
+            "spirv_val_build_receipt_sha256": ref["spirv_val_build_receipt_sha256"],
+            "spirv_grammar": {"sha256": ref["spirv_grammar_sha256"]},
+            "entries": [row],
+            "artifact_set_sha256": base.digest_bytes(base.canonical_json(artifact_set)),
+        })
+        self.receipt = receipt
+        self.receipt_path = self.root / subject.reference.RECEIPT_PATH
+        self.receipt_path.write_bytes(base.pretty_json(receipt))
+        self.repin()
+        self.args = argparse.Namespace(reference_artifact_dir=str(self.root))
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def repin(self, *, pretty: bool = True) -> None:
+        self.receipt = base.add_receipt_hash(self.receipt)
+        encoded = base.pretty_json(self.receipt) if pretty else base.canonical_json(self.receipt)
+        self.receipt_path.write_bytes(encoded)
+        ref = self.policy["reference_corpus"]
+        ref["receipt_sha256"] = self.receipt["receipt_sha256"]
+        ref["receipt_file_sha256"] = base.digest_bytes(encoded)
+        ref["artifact_set_sha256"] = self.receipt["artifact_set_sha256"]
+        ref["entry_order_sha256"] = base.digest_bytes(base.canonical_json([row["id"] for row in self.receipt["entries"]]))
+
+    def verify(self) -> dict:
+        return subject.verify_reference_inputs(self.args, self.policy)
+
+    def test_accepts_exact_historical_corpus_without_current_producers(self) -> None:
+        self.assertEqual(self.verify(), self.receipt)
+
+    def test_rejects_non_pretty_receipt_even_when_file_digest_is_rebound(self) -> None:
+        self.repin(pretty=False)
+        with self.assertRaisesRegex(base.ArtifactError, "not exact pretty JSON"):
+            self.verify()
+
+    def test_rejects_extra_file(self) -> None:
+        (self.root / "extra").write_bytes(b"x")
+        with self.assertRaisesRegex(base.ArtifactError, "file denominator"):
+            self.verify()
+
+    def test_rejects_artifact_hardlink(self) -> None:
+        target = self.root / self.files["spirv_artifact"][0]
+        target.unlink()
+        os.link(self.root / self.files["preprocessed_artifact"][0], target)
+        with self.assertRaisesRegex(base.ArtifactError, "linked or reused"):
+            self.verify()
+
+    def test_rejects_artifact_symlink(self) -> None:
+        target = self.root / self.files["spirv_artifact"][0]
+        target.unlink()
+        target.symlink_to(self.root / self.files["preprocessed_artifact"][0])
+        with self.assertRaises(base.ArtifactError):
+            self.verify()
+
+    def test_rejects_traversal_even_when_receipt_is_rebound(self) -> None:
+        self.receipt["entries"][0]["spirv_artifact"] = "../escape.spv"
+        self.receipt["artifact_set_sha256"] = base.digest_bytes(base.canonical_json([{
+            "path": "../escape.spv", "sha256": self.receipt["entries"][0]["spirv_sha256"],
+        }]))
+        self.repin()
+        with self.assertRaisesRegex(base.ArtifactError, "unsafe"):
+            self.verify()
+
+    def test_rejects_rebound_length_or_digest_lie(self) -> None:
+        for key in ("spirv_bytes", "spirv_sha256"):
+            with self.subTest(key=key):
+                original = self.receipt["entries"][0][key]
+                self.receipt["entries"][0][key] = original + 1 if key.endswith("bytes") else "0" * 64
+                if key == "spirv_sha256":
+                    self.receipt["artifact_set_sha256"] = base.digest_bytes(base.canonical_json([{
+                        "path": self.receipt["entries"][0]["spirv_artifact"], "sha256": "0" * 64,
+                    }]))
+                self.repin()
+                with self.assertRaisesRegex(base.ArtifactError, "length changed|digest changed"):
+                    self.verify()
+                self.receipt["entries"][0][key] = original
+                if key == "spirv_sha256":
+                    self.receipt["artifact_set_sha256"] = base.digest_bytes(base.canonical_json([{
+                        "path": self.receipt["entries"][0]["spirv_artifact"], "sha256": original,
+                    }]))
+
+
+class DiagnosticCensusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = subject.load_policy()
+
+    def test_collects_all_rows_past_multiple_unknown_outcomes_in_order(self) -> None:
+        rows = [{"id": f"shader-{index}"} for index in range(56)]
+        called = []
+        policy = copy.deepcopy(self.policy)
+        policy["profile_derivation"]["expected_corpus_profile_counts"] = {
+            name: 56 if name == "baseline" else 0 for name in subject.PROFILE_NAMES
+        }
+
+        def runner(row: dict) -> dict:
+            called.append(row["id"])
+            index = int(row["id"].split("-")[1])
+            exit_code = {7: 17, 11: 23}.get(index, 0)
+            return {
+                "id": row["id"],
+                "selected_profile": subject.validator_profile("baseline"),
+                "immediate_witness": None,
+                "validation": {
+                    "exit_code": exit_code,
+                    "stdout_bytes": 1,
+                    "stderr_bytes": 2 if exit_code else 0,
+                },
+            }
+
+        entries, totals = subject.collect_diagnostic_rows(rows, runner, policy)
+        self.assertEqual(called, [row["id"] for row in rows])
+        self.assertEqual([row["id"] for row in entries], called)
+        self.assertEqual(totals["rows"], 56)
+        self.assertEqual(totals["exit_code_counts"], {"0": 54, "17": 1, "23": 1})
+
+    def test_collect_rejects_row_and_total_cap_drift(self) -> None:
+        rows = [{"id": f"shader-{index}"} for index in range(56)]
+        policy = copy.deepcopy(self.policy)
+        policy["profile_derivation"]["expected_corpus_profile_counts"] = {
+            name: 56 if name == "baseline" else 0 for name in subject.PROFILE_NAMES
+        }
+
+        def oversized(row: dict) -> dict:
+            return {
+                "id": row["id"], "selected_profile": subject.validator_profile("baseline"),
+                "immediate_witness": None,
+                "validation": {"exit_code": 1, "stdout_bytes": 4096, "stderr_bytes": 4097},
+            }
+
+        with self.assertRaisesRegex(base.ArtifactError, "stream cap"):
+            subject.collect_diagnostic_rows(rows, oversized, policy)
+        constrained = copy.deepcopy(policy)
+        constrained["diagnostic_census"]["maximum_total_output_bytes"] = 55
+
+        def one_byte(row: dict) -> dict:
+            return {
+                "id": row["id"], "selected_profile": subject.validator_profile("baseline"),
+                "immediate_witness": None,
+                "validation": {"exit_code": 1, "stdout_bytes": 1, "stderr_bytes": 0},
+            }
+
+        with self.assertRaisesRegex(base.ArtifactError, "total output cap"):
+            subject.collect_diagnostic_rows(rows, one_byte, constrained)
+
+    def test_bounded_text_rejects_success_binary_paths_and_oversize(self) -> None:
+        self.assertIsNone(subject.diagnostic_text(b"ok\n", 0, self.policy))
+        self.assertIsNone(subject.diagnostic_text(b"\xff", 2, self.policy))
+        self.assertIsNone(subject.diagnostic_text(b"failed at /private/tmp/input.spv\n", 2, self.policy))
+        self.assertIsNone(subject.diagnostic_text(b"x" * 1025, 2, self.policy))
+        self.assertEqual(subject.diagnostic_text(b"bounded diagnostic\n", 2, self.policy), "bounded diagnostic\n")
+
+    def test_census_schema_cannot_validate_as_assessment_receipt(self) -> None:
+        census = {
+            "schema": subject.DIAGNOSTIC_CENSUS_SCHEMA,
+            "authority": "non-authoritative-diagnostic-only",
+            "runtime_ready": False,
+        }
+        with self.assertRaises(base.ArtifactError):
+            subject.validate_assessment_receipt(census, self.policy)
 
 
 class OutputTests(unittest.TestCase):

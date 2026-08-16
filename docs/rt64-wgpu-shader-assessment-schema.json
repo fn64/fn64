@@ -1,14 +1,14 @@
 {
-  "schema": "fn64.rt64-wgpu-shader-assessment-policy.v2",
+  "schema": "fn64.rt64-wgpu-shader-assessment-policy.v3",
   "direct_consumers": [
     "tools/rt64_wgpu_shader_assessment.py",
     "tools/test_rt64_wgpu_shader_assessment.py"
   ],
-  "receipt_schema": "fn64.rt64-wgpu-shader-assessment.v2",
+  "receipt_schema": "fn64.rt64-wgpu-shader-assessment.v3",
   "receipt_path": "assessment-receipt.json",
   "producer": {
     "path": "tools/rt64_wgpu_shader_assessment.py",
-    "sha256": "aad9faea8e0cdf0d9eba7849be2c39bf18685a9f0d382de6465bff31e3a035b7"
+    "sha256": "19a51e391a0eda17375ef4b0c1557b408393822b02e636e6544ef44ac3cc7192"
   },
   "reference_corpus": {
     "receipt_schema": "fn64.rt64-reference-shader-receipt.v2",
@@ -26,24 +26,39 @@
     "spirv_val_build_receipt_sha256": "cde0b1411b7edb3023e0e11f4d6c5ef8667660c5dc432c3db28dbefc3bbed93c",
     "spirv_grammar_sha256": "fc328b3a978cf6128617c679f1932717fb9a5fdbc9049c4124c2cc5f2f35cb4b",
     "entry_order_sha256": "ee863043e1f24854f5ff85cc2affc1fd223e1a90742ad8500e6819faeb59b3e5",
-    "row_count": 56
+    "row_count": 56,
+    "file_count": 225
   },
   "wgpu_validator": {
-    "build_receipt_schema": "fn64.wgpu-shader-validator-build.v1",
-    "build_receipt_sha256": "b5b275495057e3985526b4ae7f672762d98dd54f1708d3fa4ebd25828f2f474a",
-    "binary_sha256": "7d45954419353e4df742cc6725b2a9f07922d1ecc2f1c1c7a0becb500897187e",
-    "source_set_sha256": "3448f9342092fa5843c8aaea548d639a58bae8f5912a4f4873726630851a1563",
+    "build_receipt_schema": "fn64.wgpu-shader-validator-build.v2",
+    "build_receipt_sha256": "4c9c3dcc31d0972339f48c0523795d21a3dc74c910247c3339d717777d9f7030",
+    "binary_sha256": "ea038b379aac6af1420f1639aef47f04870f227bb30fba845b697f3d8777b571",
+    "source_set_sha256": "ac941f8e8e84c53501673488f927dd69be4489737a072bea015ce4da2ed0fcdd",
     "cargo_lock_sha256": "733fa211c5dd777a3be2e264de61716d319aa65d5b0ebf38a0a316e380e5610c",
     "dependency_set_sha256": "7f68906e37340e8e9a5091f7d4d6d5c8055ee973fb6a24cc1e83866476320141",
+    "artifact_identity_status": "frozen",
     "identity": {
-      "schema": "fn64.wgpu-shader-validator.v1",
+      "schema": "fn64.wgpu-shader-validator.v2",
       "wgpu_major": 30,
       "wgpu_version": "30.0.0",
       "naga_version": "30.0.0",
       "backend": "noop",
-      "validation": "wgpu-30-baseline-naga-validation-plus-checked-api"
+      "validation": "wgpu-30-closed-profile-naga-validation-plus-checked-api",
+      "profiles": [
+        {"name": "baseline", "required_features": [], "required_limits": {"max_immediate_size": 0}},
+        {"name": "immediates-4", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 4}},
+        {"name": "immediates-8", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 8}},
+        {"name": "immediates-16", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 16}},
+        {"name": "immediates-20", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 20}},
+        {"name": "immediates-24", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 24}},
+        {"name": "immediates-32", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 32}},
+        {"name": "immediates-40", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 40}},
+        {"name": "immediates-56", "required_features": ["IMMEDIATES"], "required_limits": {"max_immediate_size": 56}}
+      ]
     },
     "arguments": [
+      "--profile",
+      "<derived-profile>",
       "--shader",
       "<private-staged-spv>",
       "--stage",
@@ -58,6 +73,27 @@
       "PATH": "/usr/bin:/bin"
     }
   },
+  "profile_derivation": {
+    "witness_schema": "fn64.spirv-immediate-profile-witness.v1",
+    "push_constant_storage_class": 9,
+    "block_decoration": 2,
+    "offset_decoration": 35,
+    "scalar_alignment": 4,
+    "vector_alignments": {"2": 8, "3": 16, "4": 16},
+    "closed_profiles": ["baseline", "immediates-4", "immediates-8", "immediates-16", "immediates-20", "immediates-24", "immediates-32", "immediates-40", "immediates-56"],
+    "rounded_spans": [4, 8, 16, 20, 24, 32, 40, 56],
+    "expected_corpus_profile_counts": {
+      "baseline": 13,
+      "immediates-4": 6,
+      "immediates-8": 3,
+      "immediates-16": 9,
+      "immediates-20": 1,
+      "immediates-24": 5,
+      "immediates-32": 13,
+      "immediates-40": 5,
+      "immediates-56": 1
+    }
+  },
   "outcomes": {
     "order": [
       "ingestible",
@@ -65,7 +101,7 @@
     ],
     "ingestible": {
       "exit_code": 0,
-      "stdout_schema": "fn64.wgpu-shader-validation.v1",
+      "stdout_schema": "fn64.wgpu-shader-validation.v2",
       "stdout_status": "passed",
       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
@@ -105,6 +141,17 @@
         "offset_aligned": false
       }
     }
+  },
+  "diagnostic_census": {
+    "schema": "fn64.rt64-wgpu-shader-diagnostic-census.v1",
+    "authority": "non-authoritative-diagnostic-only",
+    "row_count": 56,
+    "maximum_stream_bytes": 4096,
+    "maximum_row_output_bytes": 8192,
+    "maximum_total_output_bytes": 458752,
+    "maximum_text_bytes": 1024,
+    "maximum_census_bytes": 4194304,
+    "claim_boundary": "diagnostic-census-only-not-assessment-receipt-ingestion-runtime-readiness-or-parity"
   },
   "runtime_readiness": {
     "runtime_ready": false,
