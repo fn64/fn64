@@ -257,9 +257,27 @@
 //! let second = in_flight.complete();
 //! # let _: (Result<_, NativeRasterError>, Result<_, NativeRasterError>) = (first, second);
 //! ```
+//!
+//! Blender (port card §1, characterization-first port of
+//! `/private/tmp/rt64-blender-depth-port-card.md`) adds full one-cycle/
+//! two-cycle selector and cycle semantics: [`blend::BlendColorInput`]/
+//! [`blend::BlendAlphaInput`]/[`blend::BlendBInput`] selector resolution over
+//! the already-landed `state::BlenderCycle` wire decode, sequential cycle
+//! handoff, the no-`FORCE_BL` last-cycle bypass, the zero-factor divisor
+//! collapse, and a loud [`blend::BlendImageReadError`] rather than a silent
+//! fallback when a fragment reaches a framebuffer-dependent selector without
+//! a supplied memory sample. [`blend::DualSourceBlendOutput`]/
+//! [`blend::manual_blend_composite`] reuse the exact native-dual-source and
+//! manual-fallback contract the accepted M2.2 Metal-execution evidence
+//! proved executable (`probes/m2-wgpu-metal-headless`), rather than
+//! inventing a third blend model. It adds no combiner, coverage, alpha
+//! compare, depth, framebuffer resource binding/readback, raster primitive
+//! execution, target storage, presentation, native adapter qualification,
+//! full-ROM/pixel parity, or performance claim.
 #![forbid(unsafe_code)]
 
 mod alpha_compare;
+mod blend;
 mod combiner;
 mod coverage;
 mod depth_mode;
@@ -279,6 +297,12 @@ pub use alpha_compare::{
     alpha_compare_value, apply_alpha_dither, copy_alpha_compare_value,
     require_supported_alpha_compare, AlphaCompareNoise, CopyCycleSourceFormat,
     ALPHA_COMPARE_ENTRY_POINT, ALPHA_COMPARE_WGSL,
+};
+pub use blend::{
+    blend_a, blend_b, blend_color, blend_fragment, dual_source_blend_output,
+    manual_blend_composite, BlendAlphaInput, BlendBInput, BlendColorInput, BlendFramebufferSample,
+    BlendImageReadError, BlendModeState, BlendedFragment, DualSourceBlendOutput,
+    ResolvedBlendCycle, BLEND_ENTRY_POINT, BLEND_WGSL,
 };
 pub use combiner::{
     run_one_cycle, AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams,
