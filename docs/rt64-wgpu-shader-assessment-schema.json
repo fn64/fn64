@@ -8,7 +8,7 @@
   "receipt_path": "assessment-receipt.json",
   "producer": {
     "path": "tools/rt64_wgpu_shader_assessment.py",
-    "sha256": "31fb4185de8bb9e2fbbabfa152bc6a82ea584fa9e09c2dfb8b76c02380acd59e"
+    "sha256": "cdd1146bb34c3a82ae30807b92de915b0fa57781a9e1f33daab08eb651feed3c"
   },
   "reference_corpus": {
     "receipt_schema": "fn64.rt64-reference-shader-receipt.v2",

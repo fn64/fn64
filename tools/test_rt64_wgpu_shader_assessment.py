@@ -86,6 +86,54 @@ def spirv_fixture(*, descriptor_set: int = 0, binding: int = 2, member_index: in
 EMPTY_SPIRV = struct.pack("<5I", 0x07230203, 0x00010000, 0, 1, 0)
 
 
+def combined_scalar_and_fragment_fixture() -> bytes:
+    """A single module that structurally matches both the scalar-layout and
+    fragment-interface witness shapes at once, reproducing the real M2.5a
+    ShaderNonUniform rows: both `instanceRDPParams` and a direct `PSMain`
+    `SV_TARGET0` interface member exist in the same shader regardless of
+    which diagnostic actually blocked it."""
+    scalar_words = list(struct.unpack("<{}I".format(len(spirv_fixture()) // 4), spirv_fixture()))
+    fragment_words = list(struct.unpack("<{}I".format(len(fragment_interface_fixture()) // 4), fragment_interface_fixture()))
+    # scalar_fixture uses result ids 1-7; shift the fragment fixture's 1-9 by +100 to avoid collision.
+    shift = 100
+
+    def remap_fragment_stream(words: list[int]) -> list[int]:
+        offset = 5
+        out = list(words[:5])
+        while offset < len(words):
+            first = words[offset]
+            word_count = first >> 16
+            opcode = first & 0xFFFF
+            operands = list(words[offset + 1: offset + word_count])
+            if opcode == 15:  # OpEntryPoint: execution_model, entry_id, name..., interface...
+                operands[1] += shift
+                # name is nul-terminated ASCII words; interface ids follow, but here it's exactly one word (id 9).
+                operands[-1] += shift
+            elif opcode in (5, 71):  # OpName / OpDecorate: target is operands[0]; other operands are literals.
+                operands[0] += shift
+            elif opcode in (22, 21):  # OpTypeFloat/OpTypeInt: operands[0] is the result id; rest are width/sign literals.
+                operands[0] += shift
+            elif opcode == 23:  # OpTypeVector: result id, component type id, literal count.
+                operands[0] += shift
+                operands[1] += shift
+            elif opcode == 32:  # OpTypePointer: result id, storage class literal, pointee type id.
+                operands[0] += shift
+                operands[2] += shift
+            elif opcode == 59:  # OpVariable: result type id, result id, storage class literal.
+                operands[0] += shift
+                operands[1] += shift
+            out.append(((len(operands) + 1) << 16) | opcode)
+            out.extend(operands)
+            offset += word_count
+        return out
+
+    merged = list(scalar_words[:4]) + [0]
+    merged[3] = max(scalar_words[3], shift + fragment_words[3])
+    merged += scalar_words[5:]
+    merged += remap_fragment_stream(fragment_words)[5:]
+    return struct.pack(f"<{len(merged)}I", *merged)
+
+
 def sampled_buffer_fixture(*, capability: int = 46, duplicate: bool = False, extra_capability: int | None = None) -> bytes:
     words = [0x07230203, 0x00010000, 0, 2, 0]
 
@@ -498,6 +546,48 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(base.ArtifactError):
             subject.classify_result(self.completed(1, b"", b"unknown\n"), reference_row(), EMPTY_SPIRV, self.policy)
 
+    def test_shader_nonuniform_serializes_no_witness_when_module_also_matches_scalar_layout(self) -> None:
+        # Regression for the v5 receipt bug: a ShaderNonUniform-blocked row whose SPIR-V
+        # also structurally matches the scalar-layout witness must not leak that witness.
+        row = reference_row(True)
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        module = spirv_fixture()
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
+            self.completed(2, b"", subject.KNOWN_STDERR), row, module, self.policy
+        )
+        self.assertEqual(
+            (outcome, reason, record, scalar_witness, buffer_witness, fragment_witness),
+            ("blocked-known", self.policy["outcomes"]["blocked_known_shader_nonuniform"]["reason_code"], None, None, None, None),
+        )
+
+    def test_shader_nonuniform_serializes_no_witness_when_module_also_matches_fragment_interface(self) -> None:
+        row = reference_row(True)
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        module = fragment_interface_fixture()
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
+            self.completed(2, b"", subject.KNOWN_STDERR), row, module, self.policy
+        )
+        self.assertEqual(
+            (outcome, reason, record, scalar_witness, buffer_witness, fragment_witness),
+            ("blocked-known", self.policy["outcomes"]["blocked_known_shader_nonuniform"]["reason_code"], None, None, None, None),
+        )
+
+    def test_shader_nonuniform_serializes_no_witness_when_module_matches_both_scalar_and_fragment(self) -> None:
+        # Exact reproduction shape of all six real M2.5a ShaderNonUniform rows
+        # (RasterPSDynamic, RasterPSDynamicMS, RasterPSSpecConstant,
+        # RasterPSSpecConstantMS, RasterPSSpecConstantFlat, RasterPSSpecConstantFlatMS):
+        # instanceRDPParams and a direct PSMain SV_TARGET0 interface member both present.
+        row = reference_row(True)
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        module = combined_scalar_and_fragment_fixture()
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
+            self.completed(2, b"", subject.KNOWN_STDERR), row, module, self.policy
+        )
+        self.assertEqual(
+            (outcome, reason, record, scalar_witness, buffer_witness, fragment_witness),
+            ("blocked-known", self.policy["outcomes"]["blocked_known_shader_nonuniform"]["reason_code"], None, None, None, None),
+        )
+
 
 class ScalarLayoutClassificationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -515,6 +605,21 @@ class ScalarLayoutClassificationTests(unittest.TestCase):
         self.assertEqual(outcome, "blocked-known")
         self.assertEqual(reason, self.policy["outcomes"]["blocked_known_scalar_layout"]["reason_code"])
         self.assertIsNone(record)
+        self.assertIsNone(buffer_witness)
+        self.assertIsNone(fragment_witness)
+        subject.validate_scalar_witness_record(scalar_witness, self.policy, "fixture")
+
+    def test_scalar_layout_row_drops_coincidental_fragment_interface_match(self) -> None:
+        # A scalar-layout-blocked row whose module also structurally matches the
+        # fragment-interface shape must serialize only its own witness.
+        row = reference_row(False)
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        module = combined_scalar_and_fragment_fixture()
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
+            self.completed(2, b"", subject.SCALAR_LAYOUT_STDERR), row, module, self.policy
+        )
+        self.assertEqual(outcome, "blocked-known")
+        self.assertEqual(reason, self.policy["outcomes"]["blocked_known_scalar_layout"]["reason_code"])
         self.assertIsNone(buffer_witness)
         self.assertIsNone(fragment_witness)
         subject.validate_scalar_witness_record(scalar_witness, self.policy, "fixture")
@@ -696,6 +801,19 @@ class FragmentInterfaceClassificationTests(unittest.TestCase):
         self.assertEqual(outcome, "blocked-known")
         self.assertEqual(reason, self.policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]["reason_code"])
         self.assertIsNone(record)
+        self.assertIsNone(scalar_witness)
+        self.assertIsNone(buffer_witness)
+        subject.validate_fragment_interface_witness_record(fragment_witness, self.policy, "fixture")
+
+    def test_fragment_interface_row_drops_coincidental_scalar_layout_match(self) -> None:
+        # A fragment-interface-blocked row whose module also structurally matches
+        # the scalar-layout shape must serialize only its own witness.
+        module = combined_scalar_and_fragment_fixture()
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
+            self.completed(2, b"", subject.FRAGMENT_INTERFACE_STDERR), self.row, module, self.policy
+        )
+        self.assertEqual(outcome, "blocked-known")
+        self.assertEqual(reason, self.policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]["reason_code"])
         self.assertIsNone(scalar_witness)
         self.assertIsNone(buffer_witness)
         subject.validate_fragment_interface_witness_record(fragment_witness, self.policy, "fixture")
@@ -1037,6 +1155,97 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(base.ArtifactError, "lacks its exact witness"):
             subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
 
+    def test_receipt_rejects_shader_nonuniform_row_retaining_stale_scalar_witness(self) -> None:
+        # Direct regression for the v5 receipt bug: a ShaderNonUniform row must not
+        # retain a scalar-layout witness even though it derives cleanly from the bytes.
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["scalar_layout_witness"] = subject.scalar_layout_witness(spirv_fixture(), self.policy)
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "retains a nonselected witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_shader_nonuniform_row_retaining_stale_fragment_witness(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        row["validation"]["arguments"] = subject.validator_arguments("baseline", "fragment", "PSMain")
+        row["fragment_interface_witness"] = subject.fragment_interface_witness(fragment_interface_fixture(), "fragment", "PSMain", self.policy)
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "retains a nonselected witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_shader_nonuniform_row_retaining_both_stale_witnesses(self) -> None:
+        # Exact receipt-level shape of the six real v5 ShaderNonUniform rows: both a
+        # stale scalar_layout_witness and a stale fragment_interface_witness present.
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        row["validation"]["arguments"] = subject.validator_arguments("baseline", "fragment", "PSMain")
+        module = combined_scalar_and_fragment_fixture()
+        row["scalar_layout_witness"] = subject.scalar_layout_witness(module, self.policy)
+        row["fragment_interface_witness"] = subject.fragment_interface_witness(module, "fragment", "PSMain", self.policy)
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "more than one matching witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_scalar_layout_row_with_two_matching_witnesses(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        row["validation"]["arguments"] = subject.validator_arguments("baseline", "fragment", "PSMain")
+        scalar = self.policy["outcomes"]["blocked_known_scalar_layout"]
+        row["reason_code"] = scalar["reason_code"]
+        module = combined_scalar_and_fragment_fixture()
+        row["scalar_layout_witness"] = subject.scalar_layout_witness(module, self.policy)
+        row["fragment_interface_witness"] = subject.fragment_interface_witness(module, "fragment", "PSMain", self.policy)
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.SCALAR_LAYOUT_STDERR),
+            "stderr_bytes": len(subject.SCALAR_LAYOUT_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "more than one matching witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_blocked_known_row_with_three_matching_witnesses(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        row["validation"]["arguments"] = subject.validator_arguments("baseline", "fragment", "PSMain")
+        sampled_buffer = self.policy["outcomes"]["blocked_known_sampled_buffer"]
+        row["reason_code"] = sampled_buffer["reason_code"]
+        module = combined_scalar_and_fragment_fixture()
+        row["scalar_layout_witness"] = subject.scalar_layout_witness(module, self.policy)
+        row["fragment_interface_witness"] = subject.fragment_interface_witness(module, "fragment", "PSMain", self.policy)
+        row["sampled_buffer_witness"] = subject.sampled_buffer_witness(sampled_buffer_fixture(), self.policy)
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.SAMPLED_BUFFER_STDERR),
+            "stderr_bytes": len(subject.SAMPLED_BUFFER_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "more than one matching witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_scalar_layout_row_reason_mismatched_against_fragment_witness(self) -> None:
+        # reason_code says scalar-layout but the only witness attached is fragment-interface.
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        row["validation"]["arguments"] = subject.validator_arguments("baseline", "fragment", "PSMain")
+        scalar = self.policy["outcomes"]["blocked_known_scalar_layout"]
+        row["reason_code"] = scalar["reason_code"]
+        row["fragment_interface_witness"] = subject.fragment_interface_witness(fragment_interface_fixture(), "fragment", "PSMain", self.policy)
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.SCALAR_LAYOUT_STDERR),
+            "stderr_bytes": len(subject.SCALAR_LAYOUT_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "lacks its exact witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
     def test_receipt_rejects_pass_shaped_blocked_known_row(self) -> None:
         receipt = self.make_receipt()
         row = receipt["entries"][0]
@@ -1131,6 +1340,137 @@ class ReceiptTests(unittest.TestCase):
         receipt["reference_corpus"]["receipt_file_sha256"] = "0" * 64
         with self.assertRaises(base.ArtifactError):
             subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+
+# The exact six accepted M2.5a rows that were ShaderNonUniform-blocked in the
+# real (buggy) v5 receipt. Each retained a stale scalar_layout_witness and
+# fragment_interface_witness in that receipt, which this repair removes.
+SIX_ACTUAL_SHADER_NONUNIFORM_ROW_IDS = (
+    "src-shaders-rasterpsdynamic",
+    "src-shaders-rasterpsdynamicms",
+    "src-shaders-rasterpsspecconstant",
+    "src-shaders-rasterpsspecconstantms",
+    "src-shaders-rasterpsspecconstantflat",
+    "src-shaders-rasterpsspecconstantflatms",
+)
+
+
+class SixActualShaderNonUniformRowsTests(unittest.TestCase):
+    """Regression coverage for the v5 receipt bug using the exact six accepted
+    M2.5a row identities that exhibited it, not a synthetic stand-in. The
+    denominator stays 56 rows (the six real rows plus 50 ingestible filler
+    rows) so the policy's fixed row_count/profile-count invariants still hold."""
+
+    FILLER_COUNT = 50
+
+    def setUp(self) -> None:
+        self.policy = copy.deepcopy(subject.load_policy())
+        all_ids = list(SIX_ACTUAL_SHADER_NONUNIFORM_ROW_IDS) + [f"filler-{index}" for index in range(self.FILLER_COUNT)]
+        self.policy["reference_corpus"]["entry_order_sha256"] = base.digest_bytes(base.canonical_json(all_ids))
+        self.policy["profile_derivation"]["expected_corpus_profile_counts"] = {
+            name: 56 if name == "baseline" else 0 for name in subject.PROFILE_NAMES
+        }
+
+    def blocked_entry(self, row_id: str) -> dict:
+        row = {
+            "id": row_id, "source": "src/shaders/RasterPS.hlsl", "stage": "fragment",
+            "entry": "PSMain", "spirv_artifact": f"spirv/{row_id}.spv",
+            "spirv_sha256": "a" * 64, "spirv_bytes": 20,
+            "semantic_inventory": inventory(True),
+        }
+        profile_derivation = subject.derive_validator_profile(EMPTY_SPIRV, self.policy)
+        return {
+            **row, "immediate_witness": profile_derivation["immediate_witness"], "selected_profile": profile_derivation["profile"],
+            "scalar_layout_witness": None, "sampled_buffer_witness": None, "fragment_interface_witness": None,
+            "outcome": "blocked-known", "reason_code": self.policy["outcomes"]["blocked_known_shader_nonuniform"]["reason_code"],
+            "validation": {
+                "arguments": subject.validator_arguments("baseline", "fragment", "PSMain"),
+                "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+                "stderr_sha256": base.digest_bytes(subject.KNOWN_STDERR), "stderr_bytes": len(subject.KNOWN_STDERR),
+            },
+            "validation_record": None,
+        }
+
+    def filler_entry(self, row_id: str) -> dict:
+        row = reference_row(False, 0)
+        row["id"] = row_id
+        row["spirv_artifact"] = f"spirv/{row_id}.spv"
+        profile_derivation = subject.derive_validator_profile(EMPTY_SPIRV, self.policy)
+        output = success_bytes(row)
+        return {
+            **row, "immediate_witness": profile_derivation["immediate_witness"], "selected_profile": profile_derivation["profile"],
+            "scalar_layout_witness": None, "sampled_buffer_witness": None, "fragment_interface_witness": None,
+            "outcome": "ingestible", "reason_code": None,
+            "validation": {
+                "arguments": subject.validator_arguments("baseline", "compute", "CSMain"),
+                "exit_code": 0, "stdout_sha256": base.digest_bytes(output), "stdout_bytes": len(output),
+                "stderr_sha256": subject.EMPTY_SHA256, "stderr_bytes": 0,
+            },
+            "validation_record": subject.validator_success_record("baseline", "compute", "CSMain", 20),
+        }
+
+    def all_entries(self) -> list[dict]:
+        blocked = [self.blocked_entry(row_id) for row_id in SIX_ACTUAL_SHADER_NONUNIFORM_ROW_IDS]
+        filler = [self.filler_entry(f"filler-{index}") for index in range(self.FILLER_COUNT)]
+        return blocked + filler
+
+    def make_receipt(self, entries: list[dict]) -> dict:
+        ref = self.policy["reference_corpus"]
+        validator = self.policy["wgpu_validator"]
+        return base.add_receipt_hash({
+            "schema": self.policy["receipt_schema"], "status": "complete",
+            "producer_sha256": base.digest_file(subject.TOOL_PATH), "policy_sha256": base.digest_file(subject.POLICY_PATH),
+            "reference_corpus": {key: value for key, value in ref.items() if key not in {"receipt_schema"}},
+            "wgpu_validator": {
+                "build_receipt_sha256": validator["build_receipt_sha256"], "binary_sha256": validator["binary_sha256"],
+                "source_set_sha256": validator["source_set_sha256"], "cargo_lock_sha256": validator["cargo_lock_sha256"],
+                "dependency_set_sha256": validator["dependency_set_sha256"], "identity": validator["identity"],
+            },
+            "assessment_contract": {
+                "strict_capabilities": True, "noop_checked_shader_module": True,
+                "arguments": validator["arguments"], "profiles": validator["identity"]["profiles"],
+                "profile_derivation": self.policy["profile_derivation"],
+                "controlled_environment": validator["controlled_environment"],
+                "outcome_order": self.policy["outcomes"]["order"],
+            },
+            "entries": entries, "outcome_counts": {"ingestible": self.FILLER_COUNT, "blocked-known": 6},
+            "profile_counts": self.policy["profile_derivation"]["expected_corpus_profile_counts"],
+            "assessment_set_sha256": base.digest_bytes(base.canonical_json(entries)),
+            "runtime_readiness": subject.runtime_readiness(entries, self.policy),
+            "claim_boundary": self.policy["claim_boundary"],
+        })
+
+    def test_all_six_rows_pass_with_no_witnesses(self) -> None:
+        subject.validate_assessment_receipt(self.make_receipt(self.all_entries()), self.policy)
+
+    def test_all_six_rows_fail_with_the_v5_stale_witness_shape(self) -> None:
+        # Reproduces the exact v5 defect: every one of the six rows carries both a
+        # stale scalar_layout_witness and a stale fragment_interface_witness.
+        module = combined_scalar_and_fragment_fixture()
+        stale_scalar = subject.scalar_layout_witness(module, self.policy)
+        stale_fragment = subject.fragment_interface_witness(module, "fragment", "PSMain", self.policy)
+        entries = self.all_entries()
+        for entry in entries:
+            if entry["id"] in SIX_ACTUAL_SHADER_NONUNIFORM_ROW_IDS:
+                entry["scalar_layout_witness"] = stale_scalar
+                entry["fragment_interface_witness"] = stale_fragment
+        receipt = self.make_receipt(entries)
+        with self.assertRaisesRegex(base.ArtifactError, "more than one matching witness"):
+            subject.validate_assessment_receipt(receipt, self.policy)
+
+    def test_each_individual_row_rejects_its_own_stale_witness_pair(self) -> None:
+        module = combined_scalar_and_fragment_fixture()
+        stale_scalar = subject.scalar_layout_witness(module, self.policy)
+        stale_fragment = subject.fragment_interface_witness(module, "fragment", "PSMain", self.policy)
+        for target in SIX_ACTUAL_SHADER_NONUNIFORM_ROW_IDS:
+            with self.subTest(row_id=target):
+                entries = self.all_entries()
+                row = next(entry for entry in entries if entry["id"] == target)
+                row["scalar_layout_witness"] = stale_scalar
+                row["fragment_interface_witness"] = stale_fragment
+                receipt = self.make_receipt(entries)
+                with self.assertRaisesRegex(base.ArtifactError, "more than one matching witness"):
+                    subject.validate_assessment_receipt(receipt, self.policy)
 
 
 class HistoricalCorpusAuthenticationTests(unittest.TestCase):

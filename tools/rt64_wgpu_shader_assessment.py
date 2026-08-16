@@ -1033,22 +1033,25 @@ def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artif
     if result.returncode == blocked["exit_code"] and stdout_sha == blocked["stdout_sha256"] and stderr_sha == blocked["stderr_sha256"]:
         base.require(result.stderr == KNOWN_STDERR, f"blocked-known stderr bytes changed: {row['id']}")
         inventory_supports_known_blocker(row.get("semantic_inventory"), policy)
-        return "blocked-known", blocked["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
+        # ShaderNonUniform's evidence is the semantic inventory, already serialized on the
+        # row separately; any scalar/sampled-buffer/fragment-interface shape the same SPIR-V
+        # also happens to match is classification noise, not this row's selected witness.
+        return "blocked-known", blocked["reason_code"], None, None, None, None
     scalar = policy["outcomes"]["blocked_known_scalar_layout"]
     if result.returncode == scalar["exit_code"] and stdout_sha == scalar["stdout_sha256"] and stderr_sha == scalar["stderr_sha256"]:
         base.require(result.stderr == SCALAR_LAYOUT_STDERR, f"blocked-known scalar-layout stderr bytes changed: {row['id']}")
         base.require(scalar_witness is not None, f"blocked-known scalar-layout row lacks its exact structural witness: {row['id']}")
-        return "blocked-known", scalar["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
+        return "blocked-known", scalar["reason_code"], None, scalar_witness, None, None
     sampled_buffer = policy["outcomes"]["blocked_known_sampled_buffer"]
     if result.returncode == sampled_buffer["exit_code"] and stdout_sha == sampled_buffer["stdout_sha256"] and stderr_sha == sampled_buffer["stderr_sha256"]:
         base.require(result.stderr == SAMPLED_BUFFER_STDERR, f"blocked-known sampled-buffer stderr bytes changed: {row['id']}")
         base.require(buffer_witness is not None, f"blocked-known sampled-buffer row lacks its exact structural witness: {row['id']}")
-        return "blocked-known", sampled_buffer["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
+        return "blocked-known", sampled_buffer["reason_code"], None, None, buffer_witness, None
     fragment_interface = policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]
     if result.returncode == fragment_interface["exit_code"] and stdout_sha == fragment_interface["stdout_sha256"] and stderr_sha == fragment_interface["stderr_sha256"]:
         base.require(result.stderr == FRAGMENT_INTERFACE_STDERR, f"blocked-known fragment-interface stderr bytes changed: {row['id']}")
         base.require(fragment_witness is not None, f"blocked-known fragment-interface row lacks its exact structural witness: {row['id']}")
-        return "blocked-known", fragment_interface["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
+        return "blocked-known", fragment_interface["reason_code"], None, None, None, fragment_witness
     raise base.ArtifactError(
         f"unclassified wgpu validator outcome for {row['id']}: exit={result.returncode} stdout_sha256={stdout_sha} stderr_sha256={stderr_sha}"
     )
@@ -1464,9 +1467,7 @@ def validate_assessment_receipt(receipt: object, policy: dict) -> None:
                 base.require(row["validation"]["exit_code"] == shader["exit_code"] and row["validation"]["stdout_sha256"] == shader["stdout_sha256"] and row["validation"]["stderr_sha256"] == shader["stderr_sha256"], "blocked-known ShaderNonUniform row transcript changed")
                 base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(KNOWN_STDERR), "blocked-known ShaderNonUniform row output lengths changed")
                 inventory_supports_known_blocker(row["semantic_inventory"], policy)
-                base.require(matching_witnesses in ([], ["scalar_layout_witness"]), f"blocked-known ShaderNonUniform row witness mismatch: {row['id']}")
-                if row["scalar_layout_witness"] is not None:
-                    validate_scalar_witness_record(row["scalar_layout_witness"], policy, f"wgpu assessment scalar witness {index}")
+                base.require(matching_witnesses == [], f"blocked-known ShaderNonUniform row retains a nonselected witness: {row['id']}")
             elif row["reason_code"] == scalar["reason_code"]:
                 base.require(row["validation"]["exit_code"] == scalar["exit_code"] and row["validation"]["stdout_sha256"] == scalar["stdout_sha256"] and row["validation"]["stderr_sha256"] == scalar["stderr_sha256"], "blocked-known scalar-layout row transcript changed")
                 base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(SCALAR_LAYOUT_STDERR), "blocked-known scalar-layout row output lengths changed")
