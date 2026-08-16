@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -33,14 +34,15 @@ DENOMINATOR_PATH = ROOT / "docs/rt64-shader-source-denominator.json"
 REPORT_PATH = ROOT / "docs/RT64-SHADER-ARTIFACTS.md"
 TOOL_PATH = Path(__file__).resolve()
 
-POLICY_SCHEMA = "fn64.rt64-shader-artifact-policy.v1"
+POLICY_SCHEMA = "fn64.rt64-shader-artifact-policy.v2"
 DENOMINATOR_SCHEMA = "fn64.rt64-shader-source-denominator.v1"
 BUILD_SCHEMA = "fn64.dxc-source-build.v2"
-VALIDATOR_BUILD_SCHEMA = "fn64.wgpu-shader-validator-build.v1"
-RECEIPT_SCHEMA = "fn64.rt64-shader-artifact-receipt.v2"
-VALIDATOR_SCHEMA = "fn64.wgpu-shader-validator.v1"
+VALIDATOR_BUILD_SCHEMA = "fn64.wgpu-shader-validator-build.v2"
+RECEIPT_SCHEMA = "fn64.rt64-shader-artifact-receipt.v3"
+VALIDATOR_SCHEMA = "fn64.wgpu-shader-validator.v2"
 DEPENDENCY_SCHEMA = "fn64.dxc-active-include-closure.v2"
 SPIRV_MAGIC = b"\x03\x02\x23\x07"
+VALIDATION_PROFILE_SIZES = (0, 4, 8, 16, 20, 24, 32, 40, 56)
 
 CALL_NAMES = {
     "preprocess_shader",
@@ -494,9 +496,23 @@ def validate_complete_pinned_git_worktree(
 def load_policy() -> dict:
     policy = load_json(POLICY_PATH)
     require(policy.get("schema") == POLICY_SCHEMA, "unsupported shader artifact policy")
+    require(policy.get("direct_consumers") == [
+        "tools/rt64_shader_artifacts.py",
+        "tools/test_rt64_shader_artifacts.py",
+        "tools/rt64_reference_shader_artifacts.py",
+        "tools/test_rt64_reference_shader_artifacts.py",
+        "tools/rt64_wgpu_shader_assessment.py",
+        "tools/test_rt64_wgpu_shader_assessment.py",
+    ], "shader artifact policy consumer denominator changed")
     require(policy.get("receipt_schema") == RECEIPT_SCHEMA, "receipt schema drift")
     require(policy.get("source_denominator_schema") == DENOMINATOR_SCHEMA, "denominator schema drift")
     require(policy.get("build_receipt_schema") == BUILD_SCHEMA, "build schema drift")
+    require(policy.get("validator_build_receipt_schema") == VALIDATOR_BUILD_SCHEMA, "validator build schema drift")
+    validator = policy.get("validator")
+    require(isinstance(validator, dict), "validator policy is absent")
+    require(validator.get("protocol_schema") == VALIDATOR_SCHEMA, "validator protocol schema drift")
+    require(validator.get("result_schema") == "fn64.wgpu-shader-validation.v2", "validator result schema drift")
+    require(validator.get("profiles") == [validation_profile_contract(size) for size in VALIDATION_PROFILE_SIZES], "validator profile policy changed")
     return policy
 
 
@@ -889,9 +905,9 @@ def render_report(denominator: dict, dxc_audit: dict | None = None) -> str:
         "`build-dxc` accepts only a clean, complete, non-sparse official source commit with its exact initialized gitlinks and license bytes. All authority Git commands disable replacement objects and global/system configuration; replacement refs and legacy grafts are rejected. The build rejects index/tree blob or mode disagreement, skip/assume index masks, transformed working-tree bytes, and unreviewed nested gitlinks before invoking the official CMake graph in a new isolated output directory, then repeats the complete materialized audit after configure/build. Receipt verification repeats that same complete audit. Its receipt binds source, dependencies, every retained license, CMake cache/flags, tool binaries and version transcripts, configure/build logs, compile commands, Ninja execution log, the exact digested translation-unit manifest actually executed for the `dxc` target grouped by license component, and the resulting compiler closure. On macOS, the official graph makes `bin/dxc` a relative symlink to its versioned launcher and that launcher loads the retained `libdxcompiler.dylib`; the receipt preserves the invocation edge, binds exact link text and descriptor-stable bytes for both non-system files, and admits only an exact system-library load-name denominator. Absolute, escaping, multi-hop, nonregular, swapped, hardlinked, multiply emitted, or unclassified non-system paths are rejected. Version inspection executes only a private create-new/no-link snapshot with the launcher's `@rpath` layout preserved.",
         "Receipt finalization currently fails closed on non-macOS hosts. A Linux or Windows source-build receipt needs its own reviewed loader format, system-library denominator, retained dependency paths, and hostile tests before this policy will admit it.",
         "",
-        "`build-validator` separately stages the locked standalone Rust validator outside fn64's Cargo-config ancestry, invokes Cargo from the configuration-checked filesystem root with a new controlled Cargo home/target, remaps the isolated build root to a stable virtual source path, uses direct cargo/rustc toolchain binaries, and builds wgpu 30.0.0's deterministic noop backend. Because noop does not itself surface shader errors, the validator explicitly runs the same pinned naga parser, all-flags validator, and wgpu-naga-bridge baseline feature capability mapping used by wgpu-core 30 before invoking checked `Device::create_shader_module`. Its receipt binds the reviewed and staged source, Cargo.lock, complete Cargo package/license closure, toolchain, build transcript, binary, and stable protocol identity. This workspace is not in fn64's ordinary Cargo graph.",
+        "`build-validator` separately stages the locked standalone Rust validator outside fn64's Cargo-config ancestry, invokes Cargo from the configuration-checked filesystem root with a new controlled Cargo home/target, remaps the isolated build root to a stable virtual source path, uses direct cargo/rustc toolchain binaries, and builds wgpu 30.0.0's deterministic noop backend. Because noop does not itself surface shader errors, the validator explicitly runs the same pinned naga parser, all-flags validator, and wgpu-naga-bridge feature capability mapping used by wgpu-core 30 before invoking checked `Device::create_shader_module`. The exact closed profile is derived from authenticated SPIR-V using Naga's alignment-rounded push-constant struct span: `baseline`, or `immediates-{4,8,16,20,24,32,40,56}` with exactly wgpu `IMMEDIATES` and the matching `max_immediate_size`. One typed contract feeds both Naga and the noop device, and the validator rejects underprivileged, overprivileged, raw-feature, raw-limit, reordered, or unreviewed selections. Its receipt binds the reviewed and staged source, Cargo.lock, complete Cargo package/license closure, toolchain, build transcript, binary, ordered profile denominator, and stable v2 protocol identity. Noop evidence is not native-adapter feature or limit evidence. This workspace is not in fn64's ordinary Cargo graph.",
         "",
-        "`produce` accepts only both source-build receipts. Every receipt also binds the exact artifact-tool source. It descriptor-stably copies the complete admitted RT64 source set and the qualified DXC runtime closure into separate private create-new/no-link snapshots. Each row uses three explicit, non-overlapping compiler phases through that one closure: dependency-only `-M -MF` over the admitted source, preprocess-only `-P -Fi` over the same source, then SPIR-V compilation from only the retained preprocessed bytes. The producer validates the dependency target as the exact relative entry source, retains and hashes DXC's raw depfile plus its normalized active-dependency manifest, checks all declared source bytes after both source-reading phases, and rejects missing, reused, malformed, or unexpected phase outputs. Any `#include` directive left in the retained preprocessed bytes, including a macro-form operand, is rejected because the final compiler flags still carry an include search path. For each denominator row it also retains exact canonical flags, preprocessed-input digest, all phase transcript digests, SPIR-V bytes and digest, DXC's mandatory built-in SPIR-V validation result, and an independently bound wgpu-30 shader-module validation result. `verify` reparses the raw depfile and reruns wgpu validation. One missing row, unexpected row, failed validator, changed byte, changed flag, changed compiler, changed producer, phase confusion, or reused path rejects the set.",
+        "`produce` accepts only both source-build receipts. Every receipt also binds the exact artifact-tool source. It descriptor-stably copies the complete admitted RT64 source set and the qualified DXC runtime closure into separate private create-new/no-link snapshots. Each row uses three explicit, non-overlapping compiler phases through that one closure: dependency-only `-M -MF` over the admitted source, preprocess-only `-P -Fi` over the same source, then SPIR-V compilation from only the retained preprocessed bytes. The producer validates the dependency target as the exact relative entry source, retains and hashes DXC's raw depfile plus its normalized active-dependency manifest, checks all declared source bytes after both source-reading phases, and rejects missing, reused, malformed, or unexpected phase outputs. Any `#include` directive left in the retained preprocessed bytes, including a macro-form operand, is rejected because the final compiler flags still carry an include search path. For each denominator row it also retains exact canonical flags, preprocessed-input digest, all phase transcript digests, SPIR-V bytes and digest, DXC's mandatory built-in SPIR-V validation result, and an independently bound wgpu-30 shader-module validation result with its derived minimum profile and typed Immediate witness. `verify` reparses the raw depfile, re-derives the profile from authenticated SPIR-V, and reruns wgpu validation. One missing row, unexpected row, failed validator, changed profile or witness, changed byte, changed flag, changed compiler, changed producer, phase confusion, or reused path rejects the set.",
         "",
         "A receipt is local integrity evidence, not a transferable signature or proof against a malicious same-UID process. Release provenance still needs a trusted CI/code-signing root if artifacts are distributed as independently attested builds.",
         "",
@@ -914,7 +930,7 @@ def render_report(denominator: dict, dxc_audit: dict | None = None) -> str:
         "",
         "## Current blocker",
         "",
-        "An official DXC source build and standalone validator build completed under the previous producer. The first corpus attempt failed closed on row one because official DXC v1.9.2607 accepts the combined `-P -MD -MF` invocation but emits the preprocessed file without a depfile. This repair separates dependency-only and preprocess-only phases. Because both build receipts bind the exact producer SHA, this source change invalidates those prior receipts by design: rebuild and reverify DXC and the validator, run `smoke-dxc-phases`, then execute all 56 rows. No corpus qualification claim exists until that sequence and independent receipt review pass.",
+        "The validator-profile repair versions the artifact policy to v2, artifact receipt to v3, validator build receipt to v2, and validator identity/result protocols to v2. The DXC build schema remains v2, but DXC and validator receipts bind the exact shared producer and policy SHA, so every receipt produced before this change is historical evidence and does not qualify under the new mechanism. Rebuild and reverify both source-build receipts, run `smoke-dxc-phases`, independently review the new validator receipt and baseline/Immediate semantics smokes, then execute all 56 rows. No new corpus qualification or native-adapter readiness claim exists until that sequence passes.",
         "",
         "## Primary-source audit",
         "",
@@ -2060,15 +2076,25 @@ def validator_identity(validator: Path) -> dict:
         version = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise ArtifactError("wgpu validator did not return its JSON identity") from error
-    require_keys(version, {"schema", "wgpu_major", "wgpu_version", "naga_version", "backend", "validation"}, "wgpu validator identity")
-    require(version.get("schema") == VALIDATOR_SCHEMA, "wrong wgpu validator protocol")
+    require_keys(version, {"schema", "wgpu_major", "wgpu_version", "naga_version", "backend", "validation", "profiles"}, "wgpu validator identity")
+    require(version.get("schema") == load_policy()["validator"]["protocol_schema"] == VALIDATOR_SCHEMA, "wrong wgpu validator protocol")
     require(version.get("wgpu_major") == 30, "shader validator is not wgpu 30")
+    require(version.get("profiles") == load_policy()["validator"]["profiles"], "wgpu validator profile denominator changed")
     return {
         "binary_name": validator.name,
         "binary_sha256": digest_file(validator),
         "identity": version,
         "stdout_sha256": digest_bytes(result.stdout),
         "stderr_sha256": digest_bytes(result.stderr),
+    }
+
+
+def validation_profile_contract(immediate_size: int) -> dict:
+    require(type(immediate_size) is int and immediate_size in VALIDATION_PROFILE_SIZES, "unreviewed wgpu immediate size")
+    return {
+        "name": "baseline" if immediate_size == 0 else f"immediates-{immediate_size}",
+        "required_features": [] if immediate_size == 0 else ["IMMEDIATES"],
+        "required_limits": {"max_immediate_size": immediate_size},
     }
 
 
@@ -2372,9 +2398,190 @@ def compile_dxc_shader(
     }
 
 
+def decode_spirv_string(operands: list[int], label: str) -> str:
+    require(operands, f"{label} is empty")
+    raw = bytearray()
+    for index, word in enumerate(operands):
+        encoded = word.to_bytes(4, "little")
+        if 0 in encoded:
+            terminator = encoded.index(0)
+            require(index == len(operands) - 1, f"{label} has trailing words")
+            require(not any(encoded[terminator + 1:]), f"{label} has nonzero padding")
+            raw.extend(encoded[:terminator])
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ArtifactError(f"{label} is not UTF-8") from error
+        raw.extend(encoded)
+    raise ArtifactError(f"{label} is unterminated")
+
+
+def derive_validation_profile(artifact_bytes: bytes) -> dict:
+    require(len(artifact_bytes) >= 20 and len(artifact_bytes) % 4 == 0, "validation-profile SPIR-V extent is invalid")
+    words = list(struct.unpack(f"<{len(artifact_bytes) // 4}I", artifact_bytes))
+    require(words[0] == 0x07230203 and words[3] >= 1 and words[4] == 0, "validation-profile SPIR-V header is invalid")
+    bound = words[3]
+    names: dict[int, str] = {}
+    member_names: dict[tuple[int, int], str] = {}
+    decorations: dict[tuple[int, int], tuple[int, ...]] = {}
+    member_decorations: dict[tuple[int, int, int], tuple[int, ...]] = {}
+    types: dict[int, tuple] = {}
+    variables: dict[int, tuple[int, int]] = {}
+
+    def valid_id(value: int, label: str) -> int:
+        require(0 < value < bound, f"{label} is outside the SPIR-V id bound")
+        return value
+
+    def put_unique(table: dict, key: object, value: object, label: str) -> None:
+        require(key not in table, f"duplicate {label}")
+        table[key] = value
+
+    offset = 5
+    while offset < len(words):
+        first = words[offset]
+        word_count = first >> 16
+        opcode = first & 0xFFFF
+        require(word_count > 0 and offset + word_count <= len(words), f"malformed validation-profile SPIR-V instruction at word {offset}")
+        operands = words[offset + 1:offset + word_count]
+        if opcode in {73, 74, 75}:
+            raise ArtifactError(f"validation-profile group decoration is not implemented at word {offset}")
+        if opcode == 5:  # OpName
+            require(word_count >= 3, f"malformed OpName at word {offset}")
+            target = valid_id(operands[0], "OpName target")
+            put_unique(names, target, decode_spirv_string(operands[1:], f"OpName at word {offset}"), "OpName target")
+        elif opcode == 6:  # OpMemberName
+            require(word_count >= 4, f"malformed OpMemberName at word {offset}")
+            target = valid_id(operands[0], "OpMemberName target")
+            put_unique(member_names, (target, operands[1]), decode_spirv_string(operands[2:], f"OpMemberName at word {offset}"), "OpMemberName target")
+        elif opcode == 71:  # OpDecorate
+            require(word_count >= 3, f"malformed OpDecorate at word {offset}")
+            target = valid_id(operands[0], "OpDecorate target")
+            put_unique(decorations, (target, operands[1]), tuple(operands[2:]), "OpDecorate target and kind")
+        elif opcode == 72:  # OpMemberDecorate
+            require(word_count >= 4, f"malformed OpMemberDecorate at word {offset}")
+            target = valid_id(operands[0], "OpMemberDecorate target")
+            put_unique(member_decorations, (target, operands[1], operands[2]), tuple(operands[3:]), "OpMemberDecorate target, member, and kind")
+        elif opcode == 21:  # OpTypeInt
+            require(word_count == 4 and operands[1] > 0 and operands[2] in {0, 1}, f"malformed OpTypeInt at word {offset}")
+            result_id = valid_id(operands[0], "OpTypeInt result")
+            put_unique(types, result_id, ("int", operands[1], operands[2]), "type result")
+        elif opcode == 22:  # OpTypeFloat
+            require(word_count == 3 and operands[1] > 0, f"malformed OpTypeFloat at word {offset}")
+            result_id = valid_id(operands[0], "OpTypeFloat result")
+            put_unique(types, result_id, ("float", operands[1]), "type result")
+        elif opcode == 23:  # OpTypeVector
+            require(word_count == 4 and operands[2] in {2, 3, 4}, f"malformed OpTypeVector at word {offset}")
+            result_id = valid_id(operands[0], "OpTypeVector result")
+            component = valid_id(operands[1], "OpTypeVector component")
+            put_unique(types, result_id, ("vector", component, operands[2]), "type result")
+        elif opcode == 30:  # OpTypeStruct
+            require(word_count >= 2, f"malformed OpTypeStruct at word {offset}")
+            result_id = valid_id(operands[0], "OpTypeStruct result")
+            members = tuple(valid_id(value, "OpTypeStruct member") for value in operands[1:])
+            put_unique(types, result_id, ("struct", members), "type result")
+        elif opcode == 32:  # OpTypePointer
+            require(word_count == 4, f"malformed OpTypePointer at word {offset}")
+            result_id = valid_id(operands[0], "OpTypePointer result")
+            pointee = valid_id(operands[2], "OpTypePointer pointee")
+            put_unique(types, result_id, ("pointer", operands[1], pointee), "type result")
+        elif opcode == 59:  # OpVariable
+            require(word_count in {4, 5}, f"malformed OpVariable at word {offset}")
+            result_type = valid_id(operands[0], "OpVariable result type")
+            result_id = valid_id(operands[1], "OpVariable result")
+            put_unique(variables, result_id, (result_type, operands[2]), "OpVariable result")
+        offset += word_count
+
+    immediate_variables = [(variable_id, value) for variable_id, value in variables.items() if value[1] == 9]
+    require(len(immediate_variables) <= 1, "SPIR-V declares more than one PushConstant variable")
+    if not immediate_variables:
+        return {"profile": validation_profile_contract(0), "immediate_witness": None}
+
+    variable_id, (pointer_id, _) = immediate_variables[0]
+    pointer = types.get(pointer_id)
+    require(pointer is not None and pointer[0] == "pointer" and pointer[1] == 9, "PushConstant variable type is not a PushConstant pointer")
+    struct_id = pointer[2]
+    struct_type = types.get(struct_id)
+    require(struct_type is not None and struct_type[0] == "struct" and struct_type[1], "PushConstant pointer target is not a nonempty struct")
+    require(decorations.get((struct_id, 2)) == (), "PushConstant struct lacks exact Block decoration")
+    require((struct_id, 3) not in decorations, "PushConstant struct also has BufferBlock decoration")
+    require(variable_id in names and names[variable_id], "PushConstant variable name is absent")
+    require(struct_id in names and names[struct_id], "PushConstant struct name is absent")
+
+    def scalar_type(type_id: int) -> tuple[str, int, int]:
+        value = types.get(type_id)
+        require(value is not None, "PushConstant member type is undefined")
+        if value[0] == "int":
+            require(value[1] == 32, "PushConstant integer member is not 32-bit")
+            return ("int" if value[2] else "uint", 4, 4)
+        if value[0] == "float":
+            require(value[1] == 32, "PushConstant float member is not 32-bit")
+            return ("float", 4, 4)
+        raise ArtifactError("PushConstant member scalar type is not reviewed")
+
+    def member_type(type_id: int) -> tuple[str, int, int]:
+        value = types.get(type_id)
+        require(value is not None, "PushConstant member type is undefined")
+        if value[0] in {"int", "float"}:
+            return scalar_type(type_id)
+        require(value[0] == "vector", "PushConstant member type is not a reviewed scalar or vector")
+        scalar_name, scalar_bytes, _ = scalar_type(value[1])
+        component_count = value[2]
+        vector_alignment_components = 2 if component_count == 2 else 4
+        return (
+            f"{scalar_name}{component_count}",
+            scalar_bytes * component_count,
+            scalar_bytes * vector_alignment_components,
+        )
+
+    members = []
+    previous_end = 0
+    content_extent = 0
+    struct_alignment = 1
+    for index, type_id in enumerate(struct_type[1]):
+        require((struct_id, index) in member_names and member_names[(struct_id, index)], "PushConstant member name is absent")
+        offset_operands = member_decorations.get((struct_id, index, 35))
+        require(offset_operands is not None and len(offset_operands) == 1, "PushConstant member lacks exact Offset decoration")
+        member_offset = offset_operands[0]
+        type_name, member_size, member_alignment = member_type(type_id)
+        member_end = member_offset + member_size
+        require(member_end <= 0xFFFF_FFFF and member_offset >= previous_end, "PushConstant members overlap or overflow")
+        members.append({
+            "index": index,
+            "name": member_names[(struct_id, index)],
+            "type": type_name,
+            "offset": member_offset,
+            "size": member_size,
+        })
+        previous_end = member_end
+        content_extent = max(content_extent, member_end)
+        struct_alignment = max(struct_alignment, member_alignment)
+    rounded_extent = content_extent + struct_alignment - 1
+    require(rounded_extent <= 0xFFFF_FFFF, "PushConstant struct alignment round-up overflows")
+    struct_span = (rounded_extent // struct_alignment) * struct_alignment
+    profile = validation_profile_contract(struct_span)
+    return {
+        "profile": profile,
+        "immediate_witness": {
+            "schema": "fn64.spirv-immediate-profile-witness.v1",
+            "storage_class": "PushConstant",
+            "variable_id": variable_id,
+            "variable_name": names[variable_id],
+            "pointer_type_id": pointer_id,
+            "struct_type_id": struct_id,
+            "struct_name": names[struct_id],
+            "block": True,
+            "members": members,
+            "required_max_immediate_size": struct_span,
+        },
+    }
+
+
 def run_wgpu_validation(validator: Path, artifact: Path, expected: dict) -> dict:
+    artifact_bytes = stable_file_bytes(artifact, load_policy()["spirv"]["maximum_artifact_bytes"], f"SPIR-V validation input {expected['id']}")
+    derived = derive_validation_profile(artifact_bytes)
+    profile = derived["profile"]
     validation = subprocess.run(
-        [str(validator), "--shader", str(artifact), "--stage", expected["stage"], "--entry", expected["entry"]],
+        [str(validator), "--profile", profile["name"], "--shader", str(artifact), "--stage", expected["stage"], "--entry", expected["entry"]],
         capture_output=True,
         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
     )
@@ -2384,15 +2591,19 @@ def run_wgpu_validation(validator: Path, artifact: Path, expected: dict) -> dict
     except json.JSONDecodeError as error:
         raise ArtifactError(f"wgpu validation result was not JSON for {expected['id']}") from error
     require(result == {
-        "schema": "fn64.wgpu-shader-validation.v1",
+        "schema": load_policy()["validator"]["result_schema"],
         "status": "passed",
         "wgpu_major": 30,
+        "profile": profile,
         "stage": expected["stage"],
         "entry": expected["entry"],
-        "module_bytes": artifact.stat().st_size,
+        "module_bytes": len(artifact_bytes),
     }, f"wgpu validation result changed for {expected['id']}")
     return {
         "status": "passed",
+        "required_validation_profile": profile,
+        "immediate_witness": derived["immediate_witness"],
+        "arguments": ["--profile", profile["name"], "--shader", "<private-staged-spv>", "--stage", expected["stage"], "--entry", expected["entry"]],
         "result": result,
         "stdout_sha256": digest_bytes(validation.stdout),
         "stderr_sha256": digest_bytes(validation.stderr),
@@ -2611,7 +2822,8 @@ def validate_artifact_receipt(
             "compile_stdout_sha256", "compile_stderr_sha256", "built_in_spirv_validation",
         }, f"compiler receipt {expected['id']}")
         require_keys(row.get("wgpu_validation"), {
-            "status", "result", "stdout_sha256", "stderr_sha256",
+            "status", "required_validation_profile", "immediate_witness", "arguments",
+            "result", "stdout_sha256", "stderr_sha256",
         }, f"wgpu receipt {expected['id']}")
         for transcript_name in (
             "dependency_stdout_sha256",
@@ -2645,6 +2857,12 @@ def validate_artifact_receipt(
         )
         require(row.get("compiler", {}).get("built_in_spirv_validation") == "passed", f"DXC validation absent: {expected['id']}")
         require(row.get("wgpu_validation", {}).get("status") == "passed", f"wgpu validation absent: {expected['id']}")
+        validation_profile = row["wgpu_validation"].get("required_validation_profile")
+        require(validation_profile in policy["validator"]["profiles"], f"wgpu validation profile is not reviewed: {expected['id']}")
+        require(row["wgpu_validation"].get("arguments") == [
+            "--profile", validation_profile["name"], "--shader", "<private-staged-spv>",
+            "--stage", expected["stage"], "--entry", expected["entry"],
+        ], f"wgpu validation argv changed: {expected['id']}")
         require(row.get("source_sha256") == source_by_path[expected["source"]]["port_sha256"], f"entry source identity mismatch: {expected['id']}")
         compiler_dependencies = row.get("compiler_dependency_files")
         require(isinstance(compiler_dependencies, list) and compiler_dependencies, f"compiler dependency closure absent: {expected['id']}")

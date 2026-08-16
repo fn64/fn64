@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1310,6 +1311,177 @@ class GitPinTests(unittest.TestCase):
                 )
 
 
+class ValidationProfileTests(unittest.TestCase):
+    @staticmethod
+    def instruction(opcode: int, *operands: int) -> list[int]:
+        return [((len(operands) + 1) << 16) | opcode, *operands]
+
+    @staticmethod
+    def literal(value: str) -> list[int]:
+        encoded = value.encode() + b"\0"
+        encoded += b"\0" * (-len(encoded) % 4)
+        return [int.from_bytes(encoded[index:index + 4], "little") for index in range(0, len(encoded), 4)]
+
+    def module(self, size: int, *, block: bool = True, offsets: list[int] | None = None, variables: int = 1) -> bytes:
+        member_count = max(1, size // 4)
+        offsets = offsets if offsets is not None else [index * 4 for index in range(member_count)]
+        words = [0x07230203, 0x00010000, 0, 16, 0]
+        words += self.instruction(5, 5, *self.literal("gConstants"))
+        words += self.instruction(5, 3, *self.literal("type.ConstantBuffer.Test"))
+        for index in range(member_count):
+            words += self.instruction(6, 3, index, *self.literal(f"member{index}"))
+        if block:
+            words += self.instruction(71, 3, 2)
+        for index, member_offset in enumerate(offsets):
+            words += self.instruction(72, 3, index, 35, member_offset)
+        words += self.instruction(21, 1, 32, 0)
+        words += self.instruction(30, 3, *([1] * member_count))
+        words += self.instruction(32, 4, 9, 3)
+        for index in range(variables):
+            variable_id = 5 + index
+            if index:
+                words += self.instruction(5, variable_id, *self.literal(f"gConstants{index}"))
+            words += self.instruction(59, 4, variable_id, 9)
+        return struct.pack(f"<{len(words)}I", *words)
+
+    def mixed_module(self, members: list[tuple[str, int]], offsets: list[int]) -> bytes:
+        self.assertEqual(len(members), len(offsets))
+        struct_id = 3
+        pointer_id = 4
+        variable_id = 5
+        next_type_id = 6
+        type_ids = []
+        type_instructions = []
+        scalar_ids: dict[str, int] = {}
+        vector_ids: dict[tuple[str, int], int] = {}
+        for scalar, count in members:
+            if scalar not in scalar_ids:
+                scalar_ids[scalar] = next_type_id
+                if scalar == "float":
+                    type_instructions += self.instruction(22, next_type_id, 32)
+                elif scalar == "uint":
+                    type_instructions += self.instruction(21, next_type_id, 32, 0)
+                else:
+                    raise AssertionError(f"unsupported fixture scalar {scalar}")
+                next_type_id += 1
+            if count == 1:
+                type_ids.append(scalar_ids[scalar])
+                continue
+            key = (scalar, count)
+            if key not in vector_ids:
+                vector_ids[key] = next_type_id
+                type_instructions += self.instruction(23, next_type_id, scalar_ids[scalar], count)
+                next_type_id += 1
+            type_ids.append(vector_ids[key])
+        words = [0x07230203, 0x00010000, 0, 32, 0]
+        words += self.instruction(5, variable_id, *self.literal("gConstants"))
+        words += self.instruction(5, struct_id, *self.literal("type.ConstantBuffer.Mixed"))
+        for index in range(len(members)):
+            words += self.instruction(6, struct_id, index, *self.literal(f"member{index}"))
+        words += self.instruction(71, struct_id, 2)
+        for index, member_offset in enumerate(offsets):
+            words += self.instruction(72, struct_id, index, 35, member_offset)
+        words += type_instructions
+        words += self.instruction(30, struct_id, *type_ids)
+        words += self.instruction(32, pointer_id, 9, struct_id)
+        words += self.instruction(59, pointer_id, variable_id, 9)
+        return struct.pack(f"<{len(words)}I", *words)
+
+    def test_exact_profile_denominator(self) -> None:
+        baseline = struct.pack("<5I", 0x07230203, 0x00010000, 0, 1, 0)
+        self.assertEqual(
+            artifacts.derive_validation_profile(baseline),
+            {"profile": artifacts.validation_profile_contract(0), "immediate_witness": None},
+        )
+        for size in (4, 8, 16, 20, 24, 32, 40, 56):
+            derived = artifacts.derive_validation_profile(self.module(size))
+            self.assertEqual(derived["profile"], artifacts.validation_profile_contract(size))
+            self.assertEqual(derived["immediate_witness"]["required_max_immediate_size"], size)
+            self.assertEqual(len(derived["immediate_witness"]["members"]), size // 4)
+
+    def test_unreviewed_sizes_fail(self) -> None:
+        for size in (12, 36, 52, 60):
+            with self.assertRaisesRegex(artifacts.ArtifactError, "unreviewed wgpu immediate size"):
+                artifacts.derive_validation_profile(self.module(size))
+
+    def test_mixed_vector_alignment_matches_naga_struct_span(self) -> None:
+        fixtures = [
+            ([('float', 2), ('float', 2), ('float', 1)], [0, 8, 16], 24),
+            ([('uint', 2), *([('uint', 1)] * 7)], [0, *range(8, 36, 4)], 40),
+            ([('float', 3), ('float', 1), ('float', 1)], [0, 12, 16], 32),
+            ([('float', 4), ('float', 1)], [0, 16], 32),
+        ]
+        for members, offsets, expected_span in fixtures:
+            derived = artifacts.derive_validation_profile(self.mixed_module(members, offsets))
+            self.assertEqual(derived["profile"], artifacts.validation_profile_contract(expected_span))
+            self.assertEqual(
+                derived["immediate_witness"]["required_max_immediate_size"],
+                expected_span,
+            )
+
+    def test_mixed_vector_overlap_and_round_up_overflow_fail(self) -> None:
+        fixtures = [
+            self.mixed_module([('float', 2), ('float', 1)], [0, 4]),
+            self.mixed_module([('float', 2), ('float', 1)], [0, 0xFFFF_FFF8]),
+        ]
+        for fixture in fixtures:
+            with self.assertRaisesRegex(artifacts.ArtifactError, "overlap|overflow"):
+                artifacts.derive_validation_profile(fixture)
+
+    def test_push_constant_shape_hostiles_fail(self) -> None:
+        fixtures = [
+            self.module(8, block=False),
+            self.module(8, offsets=[0]),
+            self.module(8, offsets=[0, 0]),
+            self.module(8, variables=2),
+        ]
+        for fixture in fixtures:
+            with self.assertRaises(artifacts.ArtifactError):
+                artifacts.derive_validation_profile(fixture)
+
+    def test_group_decoration_and_malformed_string_fail(self) -> None:
+        fixture = bytearray(self.module(8))
+        words = list(struct.unpack(f"<{len(fixture) // 4}I", fixture))
+        words[5:5] = self.instruction(73, 6)
+        with self.assertRaisesRegex(artifacts.ArtifactError, "group decoration"):
+            artifacts.derive_validation_profile(struct.pack(f"<{len(words)}I", *words))
+        with self.assertRaisesRegex(artifacts.ArtifactError, "trailing words"):
+            artifacts.decode_spirv_string([int.from_bytes(b"A\0\0\0", "little"), 0], "hostile string")
+
+    def test_policy_profiles_are_exact_and_ordered(self) -> None:
+        self.assertEqual(
+            artifacts.load_policy()["validator"]["profiles"],
+            [artifacts.validation_profile_contract(size) for size in artifacts.VALIDATION_PROFILE_SIZES],
+        )
+
+    def test_validator_identity_rejects_profile_denominator_mutations(self) -> None:
+        policy = artifacts.load_policy()["validator"]
+        identity = {
+            "schema": artifacts.VALIDATOR_SCHEMA,
+            "wgpu_major": 30,
+            "wgpu_version": policy["wgpu_version"],
+            "naga_version": policy["naga_version"],
+            "backend": policy["backend"],
+            "validation": policy["validation"],
+            "profiles": copy.deepcopy(policy["profiles"]),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            validator = Path(temporary) / "validator"
+            validator.write_bytes(b"validator")
+            for mutate in (
+                lambda value: value["profiles"].reverse(),
+                lambda value: value["profiles"].pop(),
+                lambda value: value["profiles"].append(copy.deepcopy(value["profiles"][-1])),
+                lambda value: value["profiles"][1]["required_limits"].update({"max_immediate_size": 8}),
+            ):
+                candidate = copy.deepcopy(identity)
+                mutate(candidate)
+                result = subprocess.CompletedProcess([str(validator), "--fn64-version"], 0, artifacts.canonical_json(candidate), b"")
+                with self.subTest(candidate=candidate), mock.patch.object(artifacts.subprocess, "run", return_value=result):
+                    with self.assertRaisesRegex(artifacts.ArtifactError, "profile denominator"):
+                        artifacts.validator_identity(validator)
+
+
 class ReceiptMutationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -1320,10 +1492,15 @@ class ReceiptMutationTests(unittest.TestCase):
             """#!/usr/bin/env python3
 import json, pathlib, sys
 arguments = sys.argv[1:]
-shader = pathlib.Path(arguments[arguments.index('--shader') + 1])
-stage = arguments[arguments.index('--stage') + 1]
-entry = arguments[arguments.index('--entry') + 1]
-print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','wgpu_major':30,'stage':stage,'entry':entry,'module_bytes':shader.stat().st_size}, separators=(',', ':')))
+if len(arguments) != 8 or arguments[0] != '--profile' or arguments[2] != '--shader' or arguments[4] != '--stage' or arguments[6] != '--entry':
+    raise SystemExit(2)
+token, shader, stage, entry = arguments[1], pathlib.Path(arguments[3]), arguments[5], arguments[7]
+if arguments[8:]:
+    raise SystemExit(2)
+sizes = {'baseline': 0, 'immediates-4': 4, 'immediates-8': 8, 'immediates-16': 16, 'immediates-20': 20, 'immediates-24': 24, 'immediates-32': 32, 'immediates-40': 40, 'immediates-56': 56}
+size = sizes[token]
+profile = {'name':token,'required_features':[] if size == 0 else ['IMMEDIATES'],'required_limits':{'max_immediate_size':size}}
+print(json.dumps({'schema':'fn64.wgpu-shader-validation.v2','status':'passed','wgpu_major':30,'profile':profile,'stage':stage,'entry':entry,'module_bytes':shader.stat().st_size}, separators=(',', ':')))
 """,
             encoding="utf-8",
         )
@@ -1380,7 +1557,7 @@ print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','w
             "files": dependency_files,
             "dependency_set_sha256": dependency_set_sha256,
         }))
-        self.spirv.write_bytes(artifacts.SPIRV_MAGIC + b"\0" * 16)
+        self.spirv.write_bytes(artifacts.SPIRV_MAGIC + b"\0" * 8 + b"\1\0\0\0" + b"\0" * 4)
         validation = artifacts.run_wgpu_validation(self.validator, self.spirv, self.expected)
         row = {
             **self.expected,
@@ -1461,7 +1638,7 @@ print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','w
             self.verify(receipt)
 
     def test_spirv_byte_mutation_fails(self) -> None:
-        self.spirv.write_bytes(artifacts.SPIRV_MAGIC + b"\1" + b"\0" * 15)
+        self.spirv.write_bytes(artifacts.SPIRV_MAGIC + b"\0" * 8 + b"\1\0\0\0" + b"\1" + b"\0" * 3)
         with self.assertRaises(artifacts.ArtifactError):
             self.verify()
 
@@ -1500,6 +1677,21 @@ print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','w
         receipt = self.mutated(lambda value: value["entries"][0]["wgpu_validation"].update({"status": "failed"}))
         with self.assertRaises(artifacts.ArtifactError):
             self.verify(receipt)
+
+    def test_validator_profile_mutations_fail(self) -> None:
+        mutations = [
+            lambda value: value["entries"][0]["wgpu_validation"]["required_validation_profile"].update({"name": "immediates-4"}),
+            lambda value: value["entries"][0]["wgpu_validation"]["required_validation_profile"]["required_features"].append("IMMEDIATES"),
+            lambda value: value["entries"][0]["wgpu_validation"]["required_validation_profile"]["required_limits"].update({"max_immediate_size": 4}),
+            lambda value: value["entries"][0]["wgpu_validation"]["arguments"].reverse(),
+            lambda value: value["entries"][0]["wgpu_validation"]["result"].update({"schema": "fn64.wgpu-shader-validation.v1"}),
+            lambda value: value["entries"][0]["wgpu_validation"]["result"]["profile"].update({"name": "immediates-4"}),
+            lambda value: value["entries"][0]["wgpu_validation"].update({"immediate_witness": {"unreviewed": True}}),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                with self.assertRaises(artifacts.ArtifactError):
+                    self.verify(self.mutated(mutate))
 
     def test_unknown_receipt_field_fails(self) -> None:
         receipt = self.mutated(lambda value: value.update({"future_unreviewed_field": True}))
