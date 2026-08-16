@@ -465,16 +465,45 @@
         "probes/m2-wgpu-metal-headless"
       ],
       "dependencies": ["M2.2"],
-      "state": "RUNNING",
+      "state": "INTEGRATED",
       "findings": [
         "Current public wgpu exposes one physical queue; this ticket proves exact serialized completion and keeps semantic queue identities separate from native multi-queue claims.",
-        "Programmable hardware sample locations are unavailable through public wgpu, so exact N64 coverage is a shader-compute correctness path while fixed hardware MSAA remains an optional non-authoritative enhancement."
+        "Programmable hardware sample locations are unavailable through public wgpu, so exact N64 coverage is a shader-compute correctness path while fixed hardware MSAA remains an optional non-authoritative enhancement.",
+        "Independent review rejected the first classifier because NotRun and timestamp-advertisement contradictions could fall through to success. The accepted implementation uses exhaustive positive predicates: every NotRun, failure, mismatch, malformed pass, or contradiction exits 2; only a genuinely unadvertised timestamp feature can produce typed unsupported exit 78.",
+        "The accepted submission receipt proves application-owned pipeline precreation, exact one-queue completion, host observation of callback readiness after each exact wait, and ordered nonzero timestamps. It does not prove hidden driver compilation or performance.",
+        "The accepted coverage receipt proves only the public eight-sample mask primitive. It does not prove top-left rules, edge arithmetic, coverage accumulation, or full RDP raster parity; 4x hardware MSAA remains explicitly non-authoritative.",
+        "Shared probe support can serialize a null binary digest if executable hashing fails. This cohort required one stable non-null digest in its external validator; future unattended receipt consumers must make that invariant fail closed."
       ],
-      "verification_runs": [],
+      "verification_runs": [
+        {
+          "command": "metal_submission final-source host process",
+          "clean_run_count": 20,
+          "required_run_count": 20,
+          "kind": "concurrency"
+        },
+        {
+          "command": "metal_coverage_fallback final-source host process",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "cargo test --locked --all-targets",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        }
+      ],
       "blocker": null,
-      "next_action": "Execute Cards D and F with configuration-bound receipts, 20 submission processes, 10 coverage processes, and independent review.",
+      "next_action": "Use the exact submission lifecycle and shader-compute coverage primitive in M3.1's bounded wgpu renderer spine; keep full raster coverage parity in M4 and require non-null executable identity from any unattended receipt consumer.",
       "started_utc": "2026-08-16T00:00:00Z",
-      "updated_utc": "2026-08-16T00:00:00Z"
+      "updated_utc": "2026-08-16T00:00:00Z",
+      "retrospective": {
+        "friction": "Several successful GPU runs hid a fail-open receipt classifier and an intermittent zero timestamp when queries were resolved in the producer submission.",
+        "cause": "Negative outcome variants were added without enumerating the only accepted positive states, and query availability was assumed before exact producer completion.",
+        "prevention": "Every probe classifier now starts from exhaustive positive predicates and table-tests all variant/advertisement combinations; timestamp queries use a typed three-submission producer, completion, then resolve lifecycle.",
+        "estimated_minutes_saved": 30
+      }
     },
     {
       "id": "M2.4",
