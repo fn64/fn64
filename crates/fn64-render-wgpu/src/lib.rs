@@ -299,6 +299,7 @@ mod lifecycle;
 mod native_contract;
 mod production;
 mod raw_dpc;
+mod rgb_dither;
 mod shader_manifest;
 mod state;
 mod targets;
@@ -362,6 +363,11 @@ pub use raw_dpc::{
     FillRectangle, RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError,
     RawDpcResourcePlan, RawTriangle, RawWord, TmemLoadSourcePlanError, TriangleDecodeError,
     TriangleFlags, UnadmittedRawDpcCommand,
+};
+pub use rgb_dither::{
+    dither_pattern_index, dither_pattern_value, quantize_post_float_rgba16_non_hdr,
+    CoverageModulo8, CoverageModulo8Error, DitherNoiseByte, DitherThreshold, DitherThresholdError,
+    Rgba16Packed, Rgba16QuantizeInput, RGB_DITHER_ENTRY_POINT, RGB_DITHER_WGSL,
 };
 pub use shader_manifest::{
     DirectTexelDecodeDeviceProfile, DirectTexelDecodeNativeError, DirectTexelDecodeNativeReceipt,

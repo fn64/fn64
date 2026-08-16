@@ -905,3 +905,122 @@ depth/target write, no GPU pipeline, no production-dispatch wiring (the T1
 `SetOtherMode`/`FillRectangle`/`FullSync` -- loudly, as `UnadmittedRawDpcCommand`,
 never silently dropped), and no RT64 parity or performance claim of any
 kind.
+
+## RGB dither and RGBA16 quantization (`rgb_dither`)
+
+`rgb_dither` is a characterization-first literal port of the permitted MIT
+RT64 Rust-port source pinned at commit
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`src/shaders/Formats.hlsli`: `DitherPatternBayer`, `DitherPatternMagicSquare`,
+`DitherPatternIndex`, `DitherPatternValue`, and the non-HDR integer tail of
+`Float4ToRGBA16`. Like `depth_strict_less` and `alpha_compare`,
+`fn64-render-wgpu` has no crate dependency on `fn64-render-reference`, so this
+is a self-contained re-expression citing RT64's source directly, not a
+re-derivation of the reference's own `apply_rgb_dither`/
+`ordered_rgb_dither_threshold` (`crates/fn64-render-reference/src/raster/blend.rs:24-69`).
+It is not wired into any draw path, `state.rs`, or the blender/depth/coverage/
+alpha-compare modules.
+
+**Selector and threshold lookup.** `dither_pattern_value(pattern, x, y,
+noise)` selects a `DitherThreshold` (an invariant-carrying `0..=7` newtype,
+private field, only constructible via its own checked `try_new` or this
+module's own exhaustive-by-construction branches) under
+`crate::state::RgbDither`'s four wire-decoded variants, reused directly
+rather than redefined: `MagicSquare`/`Bayer` read a literal 4x4 ordered tile
+at `dither_pattern_index(x, y)` (RT64's own `((coord.y & 3) << 2) + (coord.x &
+3)`, row-major); `Noise` returns the caller-supplied `DitherNoiseByte`'s low
+three bits; `Disabled` returns zero. RT64's `coord` is an unsigned `uint2`
+with no negative representation; this port's `x`/`y` are `i32` and wrap
+negative screen coordinates with `i32::rem_euclid` before indexing (matching
+this crate's own `alpha_compare.rs`/`ordered_dither_threshold` and the
+admitted reference's `x.rem_euclid(4)` precedent) rather than reproducing
+HLSL's unsigned-cast reinterpretation, which is not itself RT64-observed
+behavior since RT64's shader never receives a negative coordinate at the type
+level — this is a documented, honestly-labeled extension beyond the ported
+source, not an inherited RT64 fact. The WGSL companion mirrors this with an
+explicit `euclid_rem4` helper, since WGSL's `%` truncates toward zero like C
+(not Rust's `rem_euclid`) and would otherwise wrap negative coordinates
+incorrectly.
+
+**Matrix cross-check against the existing reference oracle (a characterized
+frontier, not a resolved one).** This module independently transcribes RT64's
+flat 16-element tables and compares them cell-by-cell against
+`fn64-render-reference`'s existing `[[u8;4];4]` `MAGIC_SQUARE`/`BAYER`
+tables (`blend.rs:29-30`, duplicated at `alpha_compare.rs:161-162`):
+**MagicSquare is byte-identical** at every cell; **Bayer disagrees at rows 1
+and 2** (RT64 row 1 `[4,0,5,1]` vs. the reference's `[6,2,7,3]`; RT64 row 2
+`[3,7,2,6]` vs. the reference's `[1,5,0,4]`; rows 0 and 3 agree). Both tables
+remain valid Bayer-shaped tiles — each covers every threshold `0..=7` exactly
+twice — so this is a phase/arrangement difference, not a malformed table on
+either side. This module ports RT64's literal tables (the supplied authority)
+rather than silently reconciling the two, and pins the exact disagreeing
+cells with an exhaustive test
+(`bayer_matrix_disagrees_with_reference_oracle_at_documented_cells`) so a
+future change to either table fails loudly here instead of silently drifting
+further apart. Which table (if either) matches real hardware is unresolved by
+either this module or the reference's own citation — no silicon measurement
+is claimed.
+
+**Quantization: `quantize_post_float_rgba16_non_hdr`.** This function is
+deliberately *not* named or shaped like a complete `Float4ToRGBA16` port: it
+takes no `float4` and performs none of RT64's float rounding. RT64's real
+signature is `Float4ToRGBA16(float4 i, uint dither, bool usesHDR)`, and three
+float-facing steps precede the integer tail this module actually covers:
+
+1. `r/g/b = round(clamp(i.r * 255.0f, 0.0f, 255.0f))` — a no-op identity for
+   any value that already started as a `u8` RGBA8888 working channel (this
+   crate's existing convention, matching `alpha_compare.rs`/`coverage.rs`);
+   this module's `Rgba16QuantizeInput.r/g/b: u8` fields assume that identity
+   rather than re-deriving it from a float.
+2. `cvgModulo = round(i.a * cvgRange) % 8`, where `cvgRange` is
+   `usesHDR ? 65535.0f : 255.0f` — **the HDR branch (`usesHDR == true`) is
+   out of scope.** This crate has no HDR target format yet
+   (`crate::state::ColorImage`/`PixelSize` do not encode one), and porting
+   `65535.0f` would require inventing HDR coverage semantics this slice has
+   no authority for. The function instead takes an already-checked
+   `CoverageModulo8` (an invariant-carrying `0..=7` newtype, same
+   private-field/`try_new` shape as `DitherThreshold`) rather than a raw
+   alpha float or an unchecked byte — RT64's `cvgModulo` for the
+   `usesHDR == false` case only, where `round(i.a * 255.0) % 8` is exactly an
+   8-bit alpha channel's low three bits when `i.a` is an exact `u8/255.0`
+   value. A future HDR-target slice must port the `usesHDR == true` branch
+   separately; this module does not stub, approximate, or silently normalize
+   it.
+3. `int cvgModulo = ... % 8` is a signed-`int` HLSL modulo; `CoverageModulo8`
+   sidesteps the signed/unsigned distinction entirely rather than
+   re-deriving it, and its private field statically excludes values a
+   `% 8` result could never produce.
+
+From `cvgModulo` onward the ported arithmetic is exact bounded-integer, no
+float rounding: `a = (cvgModulo & 0x4) ? 1 : 0`; each channel
+`min(channel + dither, 255) >> 3` (saturate at 255, then truncate — not
+round — to 5 bits); pack as `(r << 11) | (g << 6) | (b << 1) | a`
+(`Formats.hlsli:95-106`). Both `DitherThreshold` and `CoverageModulo8` are
+opaque outside this module: a caller cannot construct an out-of-range value
+and feed it to the packer, and `try_new` rejects `>= 8` loudly rather than
+masking or saturating (AGENTS.md "loud traps, no silent shrugs") — exercised
+by hostile-input tests at the exact `7`/`8` boundary for both types.
+
+**Tests.** Exhaustive/literal coverage includes: independent transcription
+checks pinning both flat tables against the pinned source; the matrix
+cross-check above; every `RgbDither` selector mode including noise-byte and
+coordinate independence checks; index periodicity and negative-coordinate
+wrapping (including `i32::MIN`/`i32::MAX` boundaries); every 8-bit channel
+value against every `0..=7` threshold (256×8 exhaustive); saturation-at-255
+(not wraparound) and truncation-not-rounding cases; full RGBA16 packing
+including the R11/G6/B1/A0 bit-layout, all-ones/all-zero boundaries, and
+independent per-channel dither application; `DitherThreshold`/
+`CoverageModulo8` boundary and hostile-rejection tests at `7` (accepted) and
+`8` (rejected); and a naga-validated WGSL companion (`rgb_dither.wgsl`) with
+the same structural-guard/mutation-detection pattern as `alpha_compare.wgsl`.
+
+**Scope.** This slice covers literal RGB-dither selection and the
+`Float4ToRGBA16` non-HDR post-float integer tail only. Out of scope: the
+HDR coverage-range branch; RGBA32/other target-format packing; where in the
+fragment pipeline RGB dither is actually applied (this crate has no
+combiner→blend→dither pipeline ordering yet — see the port card's own
+step-10-of-10 placement, `alpha_compare.rs`'s module doc); triangle/rectangle
+rasterization; fragment ordering; framebuffer ownership; production DPC
+integration; depth/coverage/blend/combiner composition; VI; and native GPU
+execution. This module does not modify `state.rs`, `blend.rs`, or any other
+existing blender/depth/coverage/alpha-compare/triangle file.
