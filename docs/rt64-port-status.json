@@ -346,19 +346,57 @@
       "writable_paths": [
         "crates/fn64-abi",
         "crates/fn64-render",
-        "crates/fn64-render-ir"
+        "crates/fn64-render-ir",
+        "crates/fn64-render-reference",
+        "Cargo.lock",
+        "docs/BASE-RENDERER-BEHAVIOR-MATRIX.md",
+        "docs/COMPLETENESS.md",
+        "docs/DESIGN.md"
       ],
       "dependencies": ["M1.1"],
-      "state": "RUNNING",
+      "state": "INTEGRATED",
       "findings": [
         "An ephemeral packet or digest may exist as backend input before success; the prohibited state is a retained receipt, trace record, guest mutation, or architectural observation for rejected or uncommitted work.",
-        "The first slice is an executable synthetic mechanism proof around the permitted ReferenceBackend, not a claim that production raw-DPC dispatch has already migrated."
+        "The first slice is an executable synthetic mechanism proof around the permitted ReferenceBackend, not a claim that production raw-DPC dispatch has already migrated.",
+        "Independent review rejected early stream installation, hidden persistent renderer state, process-global diagnostic leakage, unbound guest snapshots, and precommit semantic records; the accepted repair closes each class with immutable per-call staging, a disposable backend, transaction-local loud rejection, exact submission/preimage binding, and a GuestCommittedTicket-gated semantic wrapper.",
+        "The integrated slice is intentionally DRAM/RDRAM-only and stateless between packets. XBUS, TMEM/device-local effects, persistent renderer-state receipts, production scheduling, cancellation typing, and architectural publication remain explicit later work."
       ],
-      "verification_runs": [],
+      "verification_runs": [
+        {
+          "command": "cargo test -p fn64-abi render_ir --lib",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "cargo test -p fn64-render-reference --lib",
+          "clean_run_count": 1,
+          "required_run_count": 1,
+          "kind": "single"
+        },
+        {
+          "command": "cargo test -p fn64-render-ir --no-fail-fast",
+          "clean_run_count": 1,
+          "required_run_count": 1,
+          "kind": "single"
+        },
+        {
+          "command": "cargo test -p fn64-abi --test c_smoke",
+          "clean_run_count": 1,
+          "required_run_count": 1,
+          "kind": "single"
+        }
+      ],
       "blocker": null,
-      "next_action": "Prove success and rejection through distinct owners, then independently review whether the types prevent early completion, cross-authority reuse, duplicate commit, and publication on failure.",
+      "next_action": "Consume these owners from M3.1's bounded wgpu spine, then extend the journal/receipt model before migrating production dispatch, persistent renderer state, XBUS, or TMEM effects.",
       "started_utc": "2026-08-16T00:00:00Z",
-      "updated_utc": "2026-08-16T00:00:00Z"
+      "updated_utc": "2026-08-16T00:00:00Z",
+      "retrospective": {
+        "friction": "The first integration draft treated speculative backend cloning as transactional while command staging, hidden persistent state, global diagnostics, and live-memory identity still escaped the declared effect receipt.",
+        "cause": "The initial ticket described owner placement but did not enumerate every state channel that could survive rejection or bind the guest snapshot to one exact submission.",
+        "prevention": "Future backend slices must inventory persistent, guest-memory, global-observation, file, and diagnostic effects before implementation; completion types must bind queue, submission, transaction ordinal, byte length, and full preimage before any copyback.",
+        "estimated_minutes_saved": 30
+      }
     },
     {
       "id": "M2.2",

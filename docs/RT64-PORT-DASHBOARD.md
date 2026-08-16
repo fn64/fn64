@@ -18,7 +18,7 @@
 | ID | state | title | tickets |
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
-| `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:1, RUNNING:1 |
+| `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:2, READY:1, RUNNING:1 |
 | `M3` | `PLANNED` | Raw-DPC vertical slice | none |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
@@ -230,21 +230,39 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M1` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | cross-crate IR integration writer |
 | branch | `port/render-ir-integration` -> `main` |
 | dependencies | `M1.1` |
-| writable paths | `crates/fn64-abi`, `crates/fn64-render`, `crates/fn64-render-ir` |
+| writable paths | `crates/fn64-abi`, `crates/fn64-render`, `crates/fn64-render-ir`, `crates/fn64-render-reference`, `Cargo.lock`, `docs/BASE-RENDERER-BEHAVIOR-MATRIX.md`, `docs/COMPLETENESS.md`, `docs/DESIGN.md` |
 | started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| verification runs meeting bar | 4/4 |
 
 **Findings:**
 
 - An ephemeral packet or digest may exist as backend input before success; the prohibited state is a retained receipt, trace record, guest mutation, or architectural observation for rejected or uncommitted work.
 - The first slice is an executable synthetic mechanism proof around the permitted ReferenceBackend, not a claim that production raw-DPC dispatch has already migrated.
+- Independent review rejected early stream installation, hidden persistent renderer state, process-global diagnostic leakage, unbound guest snapshots, and precommit semantic records; the accepted repair closes each class with immutable per-call staging, a disposable backend, transaction-local loud rejection, exact submission/preimage binding, and a GuestCommittedTicket-gated semantic wrapper.
+- The integrated slice is intentionally DRAM/RDRAM-only and stateless between packets. XBUS, TMEM/device-local effects, persistent renderer-state receipts, production scheduling, cancellation typing, and architectural publication remain explicit later work.
 
-**Next action:** Prove success and rejection through distinct owners, then independently review whether the types prevent early completion, cross-authority reuse, duplicate commit, and publication on failure.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-abi render_ir --lib` | 10 | 10 | deterministic |
+| `cargo test -p fn64-render-reference --lib` | 1 | 1 | single |
+| `cargo test -p fn64-render-ir --no-fail-fast` | 1 | 1 | single |
+| `cargo test -p fn64-abi --test c_smoke` | 1 | 1 | single |
+
+**Next action:** Consume these owners from M3.1's bounded wgpu spine, then extend the journal/receipt model before migrating production dispatch, persistent renderer state, XBUS, or TMEM effects.
+
+**Retrospective:**
+
+- Friction: The first integration draft treated speculative backend cloning as transactional while command staging, hidden persistent state, global diagnostics, and live-memory identity still escaped the declared effect receipt.
+- Cause: The initial ticket described owner placement but did not enumerate every state channel that could survive rejection or bind the guest snapshot to one exact submission.
+- Prevention: Future backend slices must inventory persistent, guest-memory, global-observation, file, and diagnostic effects before implementation; completion types must bind queue, submission, transaction ordinal, byte length, and full preimage before any copyback.
+- Estimated minutes saved: 30
 
 ### `M2.2` -- Execute Metal hard-feature semantics and format-I/O fixtures so adapter advertisements become exact behavioral evidence or explicit bounded fallback findings.
 
