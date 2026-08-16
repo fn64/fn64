@@ -896,11 +896,12 @@ against the caller-supplied exact width, before any word is interpreted.
 
 What is explicitly not yet done: no float conversion of any coefficient
 (shade/texcoord/depth base+slope math stays RT64's job, ported separately
-and named distinctly if it lands), no edge walk, no scanline/coverage
-generation, no rasterization, no RDP state-machine transition (the base
-Edge command carries no `RdpState` field any neighbor command already
-models), no clipping/scissor, no texture sampling, no combiner/blender/
-depth/target write, no GPU pipeline, no production-dispatch wiring (the T1
+and named distinctly if it lands -- see the next section, which is exactly
+that follow-on), no edge walk, no scanline/coverage generation, no
+rasterization, no RDP state-machine transition (the base Edge command
+carries no `RdpState` field any neighbor command already models), no
+clipping/scissor, no texture sampling, no combiner/blender/depth/target
+write, no GPU pipeline, no production-dispatch wiring (the T1
 `production_adapter` seam rejects `RawTriangle` exactly like `NoOp`/
 `SetOtherMode`/`FillRectangle`/`FullSync` -- loudly, as `UnadmittedRawDpcCommand`,
 never silently dropped), and no RT64 parity or performance claim of any
@@ -1024,3 +1025,66 @@ rasterization; fragment ordering; framebuffer ownership; production DPC
 integration; depth/coverage/blend/combiner composition; VI; and native GPU
 execution. This module does not modify `state.rs`, `blend.rs`, or any other
 existing blender/depth/coverage/alpha-compare/triangle file.
+## Raw RDP triangle decoded-to-three-vertices conversion
+
+`raw_dpc::triangle_vertices` (re-exported as `decode_triangle_vertices`/
+`TriangleVertices`/`TriangleVertex`) is the literal, characterization-first
+Rust port of RT64's `decodeTriangles` fixed-point-to-vertex conversion --
+the part of that function between its edge/coefficient reads and its
+`state->rdp->drawTris(...)` call. It consumes one already-decoded
+`RawTriangle` (the previous section's decoder) and a caller-supplied
+`texture_perspective` boolean (RT64's `G_TP_PERSP` OtherMode read, decoded
+by the caller -- this module performs no OtherMode decode of its own) and
+returns exactly three `TriangleVertex` values, in RT64's exact
+`workBufferIndex + 0/1/2` write order: vertex 0 is `(x1, y1 = yh)`, vertex 1
+is `(x2, y2 = yl)`, vertex 2 is `(x3 = xl, y3 = ym)`. Source:
+`src/gbi/rt64_gbi_rdp.cpp`'s `decodeTriangles`, permitted MIT RT64 pinned by
+`docs/RT64-PORT-AUTHORITY.md` at commit
+`5473732a822a4423b5696e7cb18fecc425a59875`.
+
+What is reproduced bit-for-bit: RT64's `int16_t v = (w & 0x0000FFFF) << 2
+>> 2;` for each wire YL/YM/YH half before dividing by `4.0f`. `w` is
+`DisplayList::w0`/`w1`, a `uint32_t`, so both shifts are unsigned logical
+shifts on the masked `uint32_t` value; `>>2` exactly undoes `<<2` (nothing
+is shifted out, since the masked value never exceeds `0xFFFF`), so the
+expression reduces to `w & 0xFFFF` before its narrowing conversion to
+`int16_t` -- a plain 16-bit reinterpret, bit-identical to
+`RawTriangle::yl()`/`ym()`/`yh()`'s existing `i16` accessors, and *not* the
+14-bit sign extension an initial reading of the shift amounts might
+suggest (a dedicated hostile test proves the two disagree across every
+case where bits 14:15 matter, and that this module takes the 16-bit path);
+the Q16.16 `/65536.0f` conversion for XL/XH/XM and their slopes; the
+`floorf(yh)` y-floor and the H/M-line x-intercepts (RT64 computes but never
+reads `mIntercept`/`l_intercept` again -- this module computes and discards
+them identically, for the same reason: literal characterization, not a
+functional dependency); the shared `dy_1`/`dy_2`/`dy_3`/`dx_3` coefficients
+every optional block's math is built from; the shade/texture half-word
+coefficient reconstruction (`((a>>16)<<16)|(b>>16)` / `((a&0xFFFF)<<16)|
+(b&0xFFFF)` per RT64 word pair, words 0/2 for base, 1/3 for dx, 4/6 for de --
+words 5/7, RT64's commented-out "dy" lane, are provably dead and covered by
+a test that mutates them and asserts no change); shaded color normalized by
+`1/255.0f`; textured coordinates for both perspective (divide by W, scale by
+`1024.0f`, with W itself `65536000.0f / w`) and non-perspective (`*1024.0f /
+16384.0f`, W fixed at `1.0f`) modes; and depth's `1/65536.0f/32768.0f`
+scale. Optional-block absence reproduces RT64's exact defaults: zero color,
+zero texcoord with W = `1.0`, and zero depth.
+
+IEEE f32 results -- including the `+infinity` a zero-W perspective divide
+produces, and any NaN a degenerate input can produce -- are preserved
+exactly as RT64's own division produces them; no defensive fallback,
+clamp, or NaN guard is added anywhere RT64 does not have one. The module's
+test suite includes an oracle deliberately written as a second, independent
+implementation (a flat `(u32, u32)` word array and hand-rolled bit tests
+rather than the typed `RawWord`/`CoefficientWords` API or any of this
+module's own helper functions) so a bug shared between the port and its
+test would have to appear independently in both.
+
+What is explicitly not yet done: no OtherMode/`RdpState` integration of any
+kind (the `texture_perspective` bit is caller-supplied, not decoded here),
+no rasterization, no edge walk, no clipping/scissor, no draw call, no GPU
+buffer or pipeline, no combiner/blender/depth-compare/coverage/target
+write, no batching beyond the one `RawTriangle` supplied, and no RT64
+parity or performance claim. RT64's own `// TODO do more than 1 tri at a
+time` is observed behavior in the source, not authority to silently drop
+triangles here -- this function converts exactly the one triangle it is
+given.

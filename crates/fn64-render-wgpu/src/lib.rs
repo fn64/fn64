@@ -358,11 +358,11 @@ pub use native_contract::{
 };
 pub use production::{WgpuBackend, WgpuBackendConstructionError, WgpuRawDpcExecutionError};
 pub use raw_dpc::{
-    decode_raw_dpc, decode_raw_dpc_after, push_decoded_raw_dpc, triangle_word_count,
-    BoundTmemTransfer, CoefficientWords, DecodedRawDpc, DecodedRawDpcCommand, DepthWords,
-    FillRectangle, RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError,
+    decode_raw_dpc, decode_raw_dpc_after, decode_triangle_vertices, push_decoded_raw_dpc,
+    triangle_word_count, BoundTmemTransfer, CoefficientWords, DecodedRawDpc, DecodedRawDpcCommand,
+    DepthWords, FillRectangle, RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError,
     RawDpcResourcePlan, RawTriangle, RawWord, TmemLoadSourcePlanError, TriangleDecodeError,
-    TriangleFlags, UnadmittedRawDpcCommand,
+    TriangleFlags, TriangleVertex, TriangleVertices, UnadmittedRawDpcCommand,
 };
 pub use rgb_dither::{
     dither_pattern_index, dither_pattern_value, quantize_post_float_rgba16_non_hdr,
