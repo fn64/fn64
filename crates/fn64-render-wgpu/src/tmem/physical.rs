@@ -582,6 +582,68 @@ impl PendingTmemTransaction {
             backend_effect_identity: complete.backend_effect_identity(),
         })
     }
+
+    /// Produces a complete, inactive [`PhysicalTmemState`] successor to
+    /// `base` for [`fn64_render::RawDpcCoordinator::complete_execution`]'s
+    /// `next_physical` slot -- without touching `base` itself. `base` is the
+    /// coordinator's currently-*active* `P`; the returned value is a fresh,
+    /// independent state carrying this transaction's postimage, exactly as
+    /// [`PhysicalTmemPublicationAuthority::publish`] would durably become,
+    /// but never written into `base` and never exposed until a later
+    /// `commit` flips a coordinator's active slot to it.
+    ///
+    /// Runs the identical three base-state checks `publish` runs, in the
+    /// same order, against the same fields
+    /// (`CrossStatePublication`/`StaleBaseGeneration`/`StaleLoadEpoch`),
+    /// then an exact match between `effects`' declared writes and this
+    /// transaction's own proposed effects -- same access, same order, no
+    /// extra or missing write (`BackendEffectMismatch`) -- then
+    /// self-consistency (`validate_proposal`) last, exactly as `publish`
+    /// orders its own final check. No `GuestCommittedTicket`/
+    /// `GpuCompleteTicket` receipt is consulted or required: this method
+    /// exists to hand a backend a durable-shaped candidate before any guest
+    /// commit exists, not to publish one.
+    pub fn into_physical_successor(
+        self,
+        base: &PhysicalTmemState,
+        effects: &fn64_render_ir::BackendEffectReport,
+    ) -> Result<PhysicalTmemState, PhysicalTmemError> {
+        if base.identity != self.binding.state {
+            return Err(PhysicalTmemError::CrossStatePublication {
+                expected: self.binding.state,
+                actual: base.identity,
+            });
+        }
+        if base.generation != self.binding.base_generation {
+            return Err(PhysicalTmemError::StaleBaseGeneration {
+                expected: self.binding.base_generation,
+                actual: base.generation,
+            });
+        }
+        if base.last_load_epoch != self.binding.base_last_load_epoch {
+            return Err(PhysicalTmemError::StaleLoadEpoch {
+                expected: self.binding.base_last_load_epoch,
+                actual: base.last_load_epoch,
+            });
+        }
+        validate_backend_effects(effects.writes(), &self.effects)?;
+        validate_proposal(&self)?;
+
+        let identity = NEXT_PHYSICAL_TMEM_STATE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(PhysicalTmemStateIdentity)
+            .map_err(|_| PhysicalTmemError::StateIdentityExhausted)?;
+        Ok(PhysicalTmemState {
+            identity,
+            bytes: self.bytes,
+            valid: self.valid,
+            last_touched_generation: self.last_touched_generation,
+            generation: self.binding.next_generation,
+            last_load_epoch: self.last_load_epoch,
+        })
+    }
 }
 
 /// Move-only candidate bound to the exact backend report that completed it.
@@ -805,6 +867,9 @@ pub enum PhysicalTmemError {
     GpuCompletionMismatch {
         field: &'static str,
     },
+    BackendEffectMismatch {
+        field: &'static str,
+    },
     ProposalMismatch,
     Ir(ValidationError),
 }
@@ -904,6 +969,9 @@ impl fmt::Display for PhysicalTmemError {
             }
             Self::GpuCompletionMismatch { field } => {
                 write!(formatter, "TMEM GPU-complete ticket differs at {field}")
+            }
+            Self::BackendEffectMismatch { field } => {
+                write!(formatter, "TMEM backend effect report differs at {field}")
             }
             Self::ProposalMismatch => {
                 formatter.write_str("TMEM proposed effects differ at publication")
@@ -1548,6 +1616,35 @@ fn validate_gpu(
             });
         }
         backend_cursor = matching + 1;
+    }
+    Ok(())
+}
+
+/// Every proposed write must appear in `reported` at the same position with
+/// identical content -- no reorder, no substitution, no extra or missing
+/// write. `BackendEffectReport` exposes no queue/submission/workload
+/// identity to cross-check here; its own `try_new` already proved `reported`
+/// is exactly the write set its packet's journal declares.
+fn validate_backend_effects(
+    reported: &[CompletedWrite],
+    proposed: &[CompletedWrite],
+) -> Result<(), PhysicalTmemError> {
+    if reported.len() != proposed.len() {
+        return Err(PhysicalTmemError::BackendEffectMismatch {
+            field: "write count",
+        });
+    }
+    for (actual, expected) in reported.iter().zip(proposed) {
+        if actual.access() != expected.access() {
+            return Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write access",
+            });
+        }
+        if actual != expected {
+            return Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write content",
+            });
+        }
     }
     Ok(())
 }
@@ -2553,6 +2650,213 @@ mod tests {
             Err(PhysicalTmemError::StaleBaseGeneration {
                 expected: 0,
                 actual: 1
+            })
+        ));
+    }
+
+    fn backend_report(
+        decoded: &crate::DecodedRawDpc,
+        writes: Vec<CompletedWrite>,
+    ) -> BackendEffectReport {
+        BackendEffectReport::try_new(decoded.submitted().packet(), writes).unwrap()
+    }
+
+    #[test]
+    fn successor_is_independent_and_matches_publish_postimage() {
+        let mut state = PhysicalTmemState::try_new().unwrap();
+        state.bytes.fill(0xaa);
+        let base_identity = state.identity();
+        let fixture = fixture(1);
+        let pending = stage_all(&state, &fixture.decoded, &[0x20]);
+        let proposed = pending.proposed_effects().to_vec();
+        let report = backend_report(&fixture.decoded, proposed.clone());
+
+        let successor = pending
+            .into_physical_successor(&state, &report)
+            .expect("successor must validate against the untouched base state");
+
+        // Non-mutation: `state` (the coordinator's active slot analogue) is
+        // byte-for-byte unchanged -- identity, generation, epoch, and every
+        // TMEM byte/validity/touch-generation entry.
+        assert_eq!(state.identity(), base_identity);
+        assert_eq!(state.generation(), 0);
+        assert_eq!(state.last_load_epoch(), None);
+        assert!(state.valid_byte(0).is_none());
+        assert_eq!(state.bytes.as_ref(), &[0xaa; TMEM_LEN]);
+
+        // The successor is a genuinely distinct state, not an alias.
+        assert_ne!(successor.identity(), state.identity());
+        assert_eq!(successor.generation(), 1);
+        assert!(successor.last_load_epoch().is_some());
+
+        assert_eq!(successor.bytes.len(), TMEM_LEN);
+    }
+
+    #[test]
+    fn successor_generation_epoch_and_bytes_match_what_publish_would_durably_write() {
+        let mut state_direct = PhysicalTmemState::try_new().unwrap();
+        let state_via_successor = PhysicalTmemState::try_new().unwrap();
+
+        let fixture_a = fixture(1);
+        let pending_a = stage_all(&state_direct, &fixture_a.decoded, &[0x40]);
+        let proposed_a = pending_a.proposed_effects().to_vec();
+        let complete_a = gpu_complete(fixture_a.decoded, fixture_a.backend, proposed_a.clone());
+        let gpu_a = pending_a.bind_gpu(&complete_a).unwrap();
+        let guest_a = guest_commit(complete_a, fixture_a.guest);
+        state_direct
+            .publication_authority()
+            .publish(gpu_a, guest_a)
+            .unwrap();
+
+        let fixture_b = fixture(1);
+        let pending_b = stage_all(&state_via_successor, &fixture_b.decoded, &[0x40]);
+        let report_b = backend_report(&fixture_b.decoded, pending_b.proposed_effects().to_vec());
+        let successor = pending_b
+            .into_physical_successor(&state_via_successor, &report_b)
+            .unwrap();
+
+        assert_eq!(successor.generation(), state_direct.generation());
+        assert_eq!(successor.last_load_epoch(), state_direct.last_load_epoch());
+        assert_eq!(successor.bytes, state_direct.bytes);
+        assert_eq!(successor.valid, state_direct.valid);
+        assert_eq!(
+            successor.last_touched_generation,
+            state_direct.last_touched_generation
+        );
+        // The unpublished base is provably untouched.
+        assert_eq!(state_via_successor.generation(), 0);
+    }
+
+    #[test]
+    fn successor_rejects_cross_state_and_stale_generation() {
+        let state_a = PhysicalTmemState::try_new().unwrap();
+        let mut state_b = PhysicalTmemState::try_new().unwrap();
+
+        let cross_fixture = fixture(1);
+        let pending = stage_all(&state_a, &cross_fixture.decoded, &[0x20]);
+        let report = backend_report(&cross_fixture.decoded, pending.proposed_effects().to_vec());
+        assert!(matches!(
+            pending.into_physical_successor(&state_b, &report),
+            Err(PhysicalTmemError::CrossStatePublication { .. })
+        ));
+        assert_eq!(state_b.generation(), 0);
+
+        let fixture_a = fixture(1);
+        let fixture_c = fixture(1);
+        let pending_a = stage_all(&state_b, &fixture_a.decoded, &[0x20]);
+        let pending_c = stage_all(&state_b, &fixture_c.decoded, &[0x80]);
+        let complete_c = gpu_complete(
+            fixture_c.decoded,
+            fixture_c.backend,
+            pending_c.proposed_effects().to_vec(),
+        );
+        // Publish `pending_c` through the legacy path to advance `state_b`
+        // so the stale-generation check below observes a real advance.
+        let gpu_bound_c = pending_c.bind_gpu(&complete_c).unwrap();
+        let guest_c = guest_commit(complete_c, fixture_c.guest);
+        state_b
+            .publication_authority()
+            .publish(gpu_bound_c, guest_c)
+            .unwrap();
+
+        let report_a = backend_report(&fixture_a.decoded, pending_a.proposed_effects().to_vec());
+        assert!(matches!(
+            pending_a.into_physical_successor(&state_b, &report_a),
+            Err(PhysicalTmemError::StaleBaseGeneration {
+                expected: 0,
+                actual: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn successor_rejects_stale_load_epoch_with_matching_generation() {
+        // `base_generation`/`base_last_load_epoch` normally advance in
+        // lockstep, so a forged binding is the only way to exercise
+        // `StaleLoadEpoch` in isolation from `StaleBaseGeneration` -- the
+        // same reachability gap `publish`'s own test suite leaves untested.
+        let state = PhysicalTmemState::try_new().unwrap();
+        let fixture = fixture(1);
+        let mut pending = stage_all(&state, &fixture.decoded, &[0x20]);
+        let report = backend_report(&fixture.decoded, pending.proposed_effects().to_vec());
+        pending.binding.base_last_load_epoch =
+            Some(TmemLoadEpoch::new(core::num::NonZeroU64::new(1).unwrap()));
+
+        assert!(matches!(
+            pending.into_physical_successor(&state, &report),
+            Err(PhysicalTmemError::StaleLoadEpoch {
+                expected: Some(_),
+                actual: None,
+            })
+        ));
+        assert_eq!(state.generation(), 0);
+    }
+
+    #[test]
+    fn successor_rejects_mismatched_backend_write_content() {
+        let state = PhysicalTmemState::try_new().unwrap();
+        let changed_fixture = fixture(1);
+        let pending = stage_all(&state, &changed_fixture.decoded, &[0x20]);
+        let mut changed = pending.proposed_effects().to_vec();
+        changed[0] = CompletedWrite::try_new(
+            changed[0].access(),
+            changed[0].byte_count(),
+            ContentDigest::hash(b"hostile-wrong-TMEM-content", &[]),
+        )
+        .unwrap();
+        let report = backend_report(&changed_fixture.decoded, changed);
+        assert!(matches!(
+            pending.into_physical_successor(&state, &report),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write content"
+            })
+        ));
+    }
+
+    fn single_write_journal_packet(access: ResourceAccess) -> WorkloadPacket {
+        let words = load_tile_words(1);
+        let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
+        let byte_count = u32::try_from(words.len() * 4).unwrap();
+        finalize_packet(&words, vec![command_access(layout, byte_count, 0), access])
+    }
+
+    #[test]
+    fn successor_rejects_a_report_bound_to_a_different_transaction() {
+        // `BackendEffectReport::try_new` already proves `writes` is exactly
+        // the write set its own packet's journal declares, so a same-packet
+        // reorder/omission cannot reach this method as a legitimately
+        // constructed report -- that guarantee lives in `fn64-render-ir` and
+        // is out of `into_physical_successor`'s scope to re-check. What it
+        // must still catch is a report honestly built for a genuinely
+        // different transaction, whose declared writes diverge from this
+        // pending transaction's own proposed effects.
+        let state = PhysicalTmemState::try_new().unwrap();
+        let target_fixture = fixture(1);
+        let pending = stage_all(&state, &target_fixture.decoded, &[0x20]);
+
+        let foreign_access = ResourceAccess::try_new(
+            OperationId::new(41),
+            AccessMode::Write,
+            AccessPurpose::TmemLoadDestination,
+            ResourceRegion::Tmem(TmemRange::try_new(0, 8).unwrap()),
+        )
+        .unwrap();
+        let foreign_packet = single_write_journal_packet(foreign_access);
+        let (mut queue, _, _) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        let foreign_submitted = queue.submit(DecodedTicket::new(foreign_packet)).unwrap();
+        let foreign_write = CompletedWrite::try_new(
+            foreign_access,
+            8,
+            ContentDigest::hash(b"hostile-foreign-transaction", &[]),
+        )
+        .unwrap();
+        let foreign_report =
+            BackendEffectReport::try_new(foreign_submitted.packet(), vec![foreign_write]).unwrap();
+
+        assert!(matches!(
+            pending.into_physical_successor(&state, &foreign_report),
+            Err(PhysicalTmemError::BackendEffectMismatch {
+                field: "write count"
             })
         ));
     }
