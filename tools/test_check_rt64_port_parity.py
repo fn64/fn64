@@ -537,7 +537,7 @@ class ClosedEvidenceTests(unittest.TestCase):
         fields.extend(bytes.fromhex(value) for value in replay["payload_streams_hex"])
         python_identity = CHECKER.framed_digest(b"fn64.render-conformance.replay.v1\0", fields)
         self.assertEqual(inspection["replay_identity"], python_identity)
-        self.assertEqual(python_identity, "27b168d7b7fc45fac91ba5673e19d46a2f27946b661a989e5ebb120e1bcc3187")
+        self.assertEqual(python_identity, "af47594d05af27126fbc9b8936b6c8f2ce555490293eee41d3530efe8983deea")
 
     def test_rt64_source_identity_changes_receipt_hash(self) -> None:
         common = [b"row", bytes.fromhex("1" * 64)]

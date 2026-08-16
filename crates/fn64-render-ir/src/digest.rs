@@ -83,3 +83,5 @@ identity!(JournalIdentity);
 identity!(WorkloadIdentity);
 identity!(RecordIdentity);
 identity!(EffectIdentity);
+identity!(GuestReadPlanIdentity);
+identity!(GuestReadSetIdentity);

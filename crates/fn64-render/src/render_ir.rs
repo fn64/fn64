@@ -5,11 +5,12 @@
 //! those remain ABI/runtime-owner responsibilities.
 
 use fn64_render_ir::{
-    AccessMode, CompletedWrite, ContentDigest, DecodedTicket, DmemRange, DramCommandChunk,
-    DramCommandStream, EffectIdentity, FullSyncBoundary, GpuCompleteTicket, GuestCommittedTicket,
-    QueueIdentity, RawCommandStream, ResourceAccess, ResourceJournal, ResourceRegion,
-    SubmissionIdentity, TemporalBoundary, ValidationError, WorkloadAdmission, WorkloadPacket,
-    WorkloadRecord, XbusCommandChunk, XbusCommandStream,
+    AccessMode, CompletedWrite, ContentDigest, DecodedTicket, DeferredGuestReadCapture,
+    DeferredGuestReadPlan, DmemRange, DramCommandChunk, DramCommandStream, EffectIdentity,
+    FullSyncBoundary, GpuCompleteTicket, GuestCommittedTicket, QueueIdentity, RawCommandStream,
+    ResourceAccess, ResourceJournal, ResourceRegion, SubmissionIdentity, TemporalBoundary,
+    ValidationError, WorkloadAdmission, WorkloadPacketPreflight, WorkloadRecord, XbusCommandChunk,
+    XbusCommandStream,
 };
 
 use crate::{OwnedRawDpcSubmission, RawDpcSource};
@@ -31,6 +32,50 @@ pub fn decode_raw_dpc_capture(
     full_sync_boundaries: Vec<FullSyncBoundary>,
     journal: ResourceJournal,
 ) -> Result<DecodedTicket, ValidationError> {
+    preflight_raw_dpc_capture(
+        memory_layout,
+        transaction_sequence,
+        capture,
+        cmd_end,
+        full_sync_boundaries,
+        journal,
+    )?
+    .finalize(DeferredGuestReadCapture::empty())
+}
+
+/// Packet state before the ABI/memory owner captures renderer-selected guest
+/// reads. It owns commands and semantic metadata but is not an admitted
+/// packet, ticket, or replay record.
+#[derive(Debug)]
+pub struct IrRawDpcPacketPreflight {
+    packet: WorkloadPacketPreflight,
+}
+
+impl IrRawDpcPacketPreflight {
+    pub const fn guest_read_plan(&self) -> &DeferredGuestReadPlan {
+        self.packet.guest_read_plan()
+    }
+
+    /// Consume preflight plus one owned ABI capture. This is the only step
+    /// that can produce the retained packet/ticket.
+    pub fn finalize(
+        self,
+        capture: DeferredGuestReadCapture,
+    ) -> Result<DecodedTicket, ValidationError> {
+        Ok(DecodedTicket::new(self.packet.finalize(capture)?))
+    }
+}
+
+/// Decode and own command bytes, then derive the exact renderer-neutral guest
+/// read plan without retaining or reading guest memory.
+pub fn preflight_raw_dpc_capture(
+    memory_layout: fn64_render_ir::PhysicalMemoryLayout,
+    transaction_sequence: u64,
+    capture: OwnedRawDpcSubmission,
+    cmd_end: TemporalBoundary,
+    full_sync_boundaries: Vec<FullSyncBoundary>,
+    journal: ResourceJournal,
+) -> Result<IrRawDpcPacketPreflight, ValidationError> {
     let start = capture.start();
     let end = capture.end();
     let stream = match capture.source() {
@@ -54,14 +99,15 @@ pub fn decode_raw_dpc_capture(
             )?,
         ])?),
     };
-    Ok(DecodedTicket::new(WorkloadPacket::try_new(
+    let packet = WorkloadPacketPreflight::try_new(
         memory_layout,
         WorkloadAdmission::RawDpc {
             transaction_sequence,
         },
         vec![stream],
         journal,
-    )?))
+    )?;
+    Ok(IrRawDpcPacketPreflight { packet })
 }
 
 /// Shared content identity for bytes produced by a renderer and rechecked by
@@ -391,6 +437,41 @@ mod tests {
             decoded.packet().admission(),
             WorkloadAdmission::RawDpc {
                 transaction_sequence: 7
+            }
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_missing_command_ownership_before_exposing_a_read_plan() {
+        let layout = PhysicalMemoryLayout::try_new(0x1000).unwrap();
+        let journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(1, 8).unwrap(),
+            vec![ResourceAccess::try_new(
+                OperationId::new(7),
+                AccessMode::Read,
+                AccessPurpose::TmemLoadSource,
+                ResourceRegion::Rdram {
+                    resource: RdramResource::Buffer,
+                    range: layout.range(0x200, 0x208).unwrap(),
+                },
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            preflight_raw_dpc_capture(
+                layout,
+                7,
+                OwnedRawDpcSubmission::from_rdram_words(0x100, 0x108, vec![0, 0]).unwrap(),
+                TemporalBoundary::new(11, DpInterruptState::Clear),
+                Vec::new(),
+                journal,
+            )
+            .unwrap_err(),
+            ValidationError::MissingCommandReadDeclaration {
+                source: fn64_render_ir::RawStreamKind::Dram,
+                start: 0x100,
+                end: 0x108,
             }
         );
     }

@@ -580,7 +580,10 @@ M3.4 removes the second presentation stack.
 **Deliverables:** triangle, rectangle, fill, and copy cycles; combiner, blender,
 coverage, depth, dither, TLUT, filtering, tile/TMEM semantics; framebuffer
 identity, overlap, copy, reinterpretation, hidden bits, and native writeback;
-resumable raw chunks and bounded guest commits.
+resumable raw chunks and bounded guest commits. M4.0 first establishes the
+two-phase deferred guest-read contract: a renderer-selected exact
+`TmemLoadSource` plan, ABI-owned bounded logical-byte capture, and packet/
+record/replay identity binding without a full-RDRAM snapshot.
 
 **Exit gate:** the base RDP and framebuffer matrices close with exact or
 explicitly bounded evidence; known RT64 divergences have separate hardware/
@@ -939,6 +942,20 @@ The accelerated wave keeps dependency-safe work active in parallel:
     receipts, and obtain independent receipt/corpus review. Until this closes,
     M3.3 may use only a separately reviewed minimal mechanism shader and no
     full RT64 shader-corpus or renderer-parity claim may advance.
+16. **M4.0 -- own deferred guest reads (IMPLEMENTED, REVIEW ACCEPTED; 10/10 VALIDATED).** The
+    renderer preflights an exact ordered plan from RDRAM `TmemLoadSource`
+    journal operations; the ABI captures only those ranges in N64 logical byte
+    order; packet finalization and content-silent v3 record/replay bind the
+    exact read-set identity. The synthetic cross-crate proof retains no RDRAM
+    pointer or borrow and performs no full-memory snapshot. This does not yet
+    migrate production dispatch, populate TMEM, upload to a GPU, or advance a
+    parity/performance row. Record v3 is an intentional wire break: v2 magic,
+    version, workload identity, and integrity-domain records are rejected, and
+    the cross-language replay golden is rebound to the v3 encoding. Retained
+    v2 evidence requires its pinned v2 verifier. On base `e150ff70`, the full
+    `fn64-render-ir`/`fn64-render`/`fn64-abi` library suites (541 passed, 7
+    ignored), four move-only doctests, and the cross-language replay golden
+    passed together in 10/10 consecutive runs after independent rereview.
 
 ### M0 evidence ledger
 
