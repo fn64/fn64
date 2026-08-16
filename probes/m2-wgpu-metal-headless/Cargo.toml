@@ -6,12 +6,21 @@ rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Headless wgpu Metal capability probe for fn64 renderer-port M2"
+default-run = "metal_caps"
 
 [workspace]
 
 [[bin]]
 name = "metal_caps"
 path = "src/main.rs"
+
+[[bin]]
+name = "metal_semantics"
+path = "src/bin/metal_semantics.rs"
+
+[[bin]]
+name = "metal_formats_io"
+path = "src/bin/metal_formats_io.rs"
 
 [dependencies]
 serde = { version = "=1.0.228", features = ["derive"] }
