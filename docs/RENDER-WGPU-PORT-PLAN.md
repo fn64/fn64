@@ -42,12 +42,12 @@ reserving authority, parity, performance, and integration claims for the lead.
 | program state | **IN PROGRESS** |
 | execution wave | **ACCEL-A -- port spine and evidence in parallel** |
 | active milestones | **M0 authority/baseline, M2 GPU feasibility, and M3 raw-DPC vertical slice (all IN PROGRESS)** |
-| active slices | M0.3 native baseline; A0.3 is infrastructure-ready but blocked on an RT64-produced observable; M2.4 shader-artifact qualification; M3.2 bounded raw-DPC decode/state planning |
-| active ownership | `F/xhigh` integration lead; `F/xhigh` shader provenance/review; `F/xhigh` raw-DPC decoder/state lead; lower-cost fixture and repetition lanes only after typed interfaces freeze |
-| last completed result | local `main` contains M1.2's cross-crate effect ownership, M2.3's executed Metal submission/coverage evidence, and M3.1's reviewed typed wgpu submission spine (`39ea1cbc`) |
-| next concrete decision | accept or repair M2.4's source-build/validator mechanism, then dispatch M3.2a bounded raw-DPC decoding before TMEM, production ABI wiring, VI, or surface ownership |
-| evidence blockers | no matched private-game RT64 baseline exists; public RT64 does not provide a usable tracing implementation; HLSL artifact provenance and Windows DXC/utf8conv closure remain unresolved; these block claims or platform closure, not independent port work |
-| verification claim | authority/inventory, render IR, M1.2, M2.1-M2.3, and M3.1 retain their recorded bars; A0.3's all-pending evidence mechanism passed 10/10 but closes no parity row; broad RDP, VI/surface, renderer parity, and performance remain unproven |
+| active slices | M0.3 native baseline; A0.3 remains blocked and A0.4 is READY to produce its first RT64-owned observable; M2.5 official DXC build/corpus execution; M3.3 native-target/VI slice definition |
+| active ownership | `F/xhigh` integration lead; `F/xhigh` RT64 oracle-runner lead; shader corpus execution and native-target owners require fresh exclusive task cards before writing |
+| last completed result | local `main` contains M2.4's reviewed shader-artifact qualification mechanism (`2458be28`) and M3.2's reviewed typed raw-DPC decoder/state slice (`92ea1d2d`) |
+| next concrete decision | run and independently review M2.5's complete official DXC build and 56-artifact corpus while A0.4 qualifies its first RT64-owned observable, then dispatch M3.3 without crossing ABI or surface ownership early |
+| evidence blockers | no matched private-game RT64 baseline exists; public RT64 does not provide a usable tracing implementation; no complete official DXC build or 56-artifact corpus has run; these block their corresponding parity/platform claims, not dependency-safe port work |
+| verification claim | M2.4's producer/validator mechanism passed its 10/10 bar but produced no qualified corpus; M3.2 passed 10/10 runs of its 30-test CPU decoder suite but proves no GPU, parity, ABI, VI/surface, TMEM, persistent-target, or performance behavior |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
 counts are in [`RT64-PORT-DASHBOARD.md`](RT64-PORT-DASHBOARD.md), generated
@@ -484,7 +484,7 @@ path has an audited observation mechanism.
 | M0 | authority, evidence, and baseline | **IN PROGRESS** | `F/xhigh`; `M`/`P` only behind a deterministic oracle | immutable port manifest and matched correctness/performance baseline |
 | M1 | semantic IR and renderer seam v2 | **IN PROGRESS** | `F/xhigh`; `P` contract/fixture audits | owned packets/tickets work through the reference and compatibility paths |
 | M2 | cross-backend wgpu feasibility | **IN PROGRESS** | `F/high`; three independent `P/high` probes | hard GPU requirements proven or a bounded fallback decision recorded |
-| M3 | raw-DPC vertical slice | PLANNED | `F/xhigh`; isolated `I/high` modules | real LLE commands reach native target, FullSync, VI, and visible surface |
+| M3 | raw-DPC vertical slice | **IN PROGRESS** | `F/xhigh`; isolated `I/high` modules | real LLE commands reach native target, FullSync, VI, and visible surface |
 | M4 | base RDP and framebuffer correctness | PLANNED | `F/xhigh`; isolated `I/high` opcode families | full native RDP/framebuffer matrix closes |
 | M5 | GBI and deferred RSP | PLANNED | `F/xhigh`; isolated `I/high` ucode families | admitted HLE families match their declared authorities |
 | M6 | allocation-free asynchronous performance spine | PLANNED | `F/xhigh`; isolated `I/high` modules and `M` receipts | hot-path structural budgets hold and matched A/B is faster |
@@ -562,13 +562,14 @@ branch:
 | slice | exclusive outcome | writable owner |
 |---|---|---|
 | M3.1 | create `fn64-render-wgpu`, consume the merged render IR and exact submission completion, prewarm a bounded headless wgpu device, and execute one receipt-bearing fill/FullSync fixture without ABI or shell policy | crate root plus `src/device`, `src/lifecycle` |
-| M3.2 | decode the first admitted raw-DPC command subset into persistent typed RDP/TMEM state and upload only journal-declared ranges; unknown commands trap with stream/offset identity | `src/raw_dpc`, `src/state`, decoder fixtures |
+| M3.2 | **INTEGRATED:** consume one submission ticket to decode the first bounded raw-DPC command subset into a transaction-local typed RDP state delta and exact resource plan; preserve M3.1 wire identity and trap unsupported/state-invalid input with full source identity; no durable state, upload, GPU, ABI, VI, parity, or performance claim | `src/raw_dpc`, `src/state`, decoder fixtures |
 | M3.3 | own native color/depth resources, exact shader-compute coverage, bounded guest writeback, minimal VI, and headless capture for the first real captured workload | `src/targets`, `src/raster`, `src/vi`, shaders |
 | M3.4 | replace the shell's CPU-RGBA/pixels path with direct surface and overlay composition, including resize/loss handling, while leaving ABI scheduling and guest-memory authority unchanged | shell/backend integration paths, serialized after M3.3 |
 
-M3.1 may use one small reviewed WGSL fixture so M2.4 does not idle the spine.
-M3.3's admitted RT64 shader corpus, and every broader M4 shader claim, require
-M2.4's source/tool/artifact receipts. Synthetic success advances mechanism
+M3.1 may use one small reviewed WGSL fixture so shader qualification does not
+idle the spine. M3.3's admitted RT64 shader corpus, and every broader M4 shader
+claim, require M2.5's complete source/tool/artifact receipts. Synthetic success
+advances mechanism
 only; the milestone remains open until M3.3 replays a captured workload and
 M3.4 removes the second presentation stack.
 
@@ -910,23 +911,34 @@ The accelerated wave keeps dependency-safe work active in parallel:
     application pipeline prewarm, and the shader-compute eight-sample mask
     primitive. Hardware MSAA stays a separately labeled, non-authoritative
     enhancement, and full RDP coverage remains M4 work.
-12. **M2.4 -- qualify the HLSL artifact producer (READY).** Use an isolated,
+12. **M2.4 -- qualify the HLSL artifact mechanism (INTEGRATED,
+    `2458be28`).** Use an isolated,
     pinned [official DXC source](https://github.com/microsoft/DirectXShaderCompiler)
     build and its documented
     [SPIR-V path](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/SPIR-V.rst)
-    to compile the admitted RT64 HLSL corpus to checked artifacts plus
-    source/tool/flags/include/output receipts. The fn64 runtime and ordinary
-    build consume only accepted artifacts through wgpu; they do not acquire
-    DXC, CMake, or the upstream unqualified `dxc-bin`.
+    to define the checked 60-call/56-SPIR-V denominator, source/license/build
+    receipts, immutable shader snapshot, and strict standalone wgpu validator.
+    The mechanism passed its 10/10 reliability bar and independent review. No
+    complete official DXC build or 56-artifact corpus was produced, so this
+    integration closes mechanism review only.
 13. **M3.1 -- build the first raw-DPC replay spine (INTEGRATED).** Drive the
     smallest decode-to-headless-frame path before broad opcode or
     feature-family ports, consuming the accepted M1.2 lifecycle and M2.3
     submission evidence.
-14. **M3.2 -- decode bounded raw-DPC state (READY).** Replace the fixed M3.1
-    fixture parser with a transaction-local decoder for no-op, fill-cycle
-    other-mode, color-image, fill-color, rectangle, and FullSync commands.
-    Produce an exact resource plan and staged state delta without publishing
-    durable renderer state or crossing into ABI, VI, or surface policy.
+14. **M3.2 -- decode bounded raw-DPC state (INTEGRATED, `92ea1d2d`).** The
+    transaction-local decoder consumes one submission ticket and admits the
+    bounded no-op, fill-cycle other-mode, color-image, fill-color, rectangle,
+    and FullSync subset. It enforces exact queue/transaction succession,
+    preserves M3.1's exact eight-word fixture, and produces an exact resource
+    plan plus staged state delta. Its 30-test CPU suite passed 10/10; it makes
+    no GPU, parity, ABI, TMEM, persistent-target, VI/surface, or performance
+    claim.
+15. **M2.5 -- execute the official shader corpus (READY).** Build complete
+    official DXC source at the frozen pin through M2.4's accepted mechanism,
+    produce all 56 SPIR-V artifacts, verify both DXC and standalone-wgpu
+    receipts, and obtain independent receipt/corpus review. Until this closes,
+    M3.3 may use only a separately reviewed minimal mechanism shader and no
+    full RT64 shader-corpus or renderer-parity claim may advance.
 
 ### M0 evidence ledger
 
