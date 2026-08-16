@@ -886,7 +886,15 @@ The accelerated wave keeps dependency-safe work active in parallel:
     single-queue completion and timestamp validity after pipeline prewarm, plus
     the shader-compute eight-sample N64 coverage fallback. Hardware MSAA stays
     a separately labeled, non-authoritative enhancement.
-12. **M3.1 -- build the first raw-DPC replay spine (READY AFTER M1.2/M2.3
+12. **M2.4 -- qualify the HLSL artifact producer (READY).** Use an isolated,
+    pinned [official DXC source](https://github.com/microsoft/DirectXShaderCompiler)
+    build and its documented
+    [SPIR-V path](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/SPIR-V.rst)
+    to compile the admitted RT64 HLSL corpus to checked artifacts plus
+    source/tool/flags/include/output receipts. The fn64 runtime and ordinary
+    build consume only accepted artifacts through wgpu; they do not acquire
+    DXC, CMake, or the upstream unqualified `dxc-bin`.
+13. **M3.1 -- build the first raw-DPC replay spine (READY AFTER M1.2/M2.3
     REVIEW).** Drive the smallest decode-to-headless-frame path before broad
     opcode or feature-family ports.
 
