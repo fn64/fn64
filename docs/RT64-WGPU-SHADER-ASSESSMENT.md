@@ -17,16 +17,24 @@ order:
 - `ingestible`: the exact staged wgpu validator exits 0, writes no stderr, and
   writes the exact canonical pass record for the row's stage, entry point, and
   byte length.
-- `blocked-known`: the validator exits 2 with empty stdout and the exact pinned
-  Naga diagnostic for unsupported `ShaderNonUniform`; the authenticated semantic
-  inventory must also contain capability `ShaderNonUniform` (5301), extension
-  `SPV_EXT_descriptor_indexing`, and a direct `NonUniform` decoration.
+- `blocked-known`: the validator exits 2 with empty stdout and matches one exact
+  typed blocker class:
+  - `ShaderNonUniform`: the exact pinned unsupported-capability diagnostic plus
+    authenticated capability `ShaderNonUniform` (5301), extension
+    `SPV_EXT_descriptor_indexing`, and a direct `NonUniform` decoration.
+  - scalar storage layout: the exact pinned `instanceRDPParams` Naga validation
+    diagnostic plus a witness derived from the authenticated SPIR-V bytes. The
+    witness requires legacy `Uniform` + `BufferBlock`, descriptor set 0/binding
+    2, a 128-byte runtime array of `RDPParams`, and member 7 `keyScale` as
+    `float3` at offset 92. Naga's standard layout requires 16-byte alignment, so
+    the offset is deliberately recorded as unaligned.
 
-An unexpected success for a `ShaderNonUniform` witness is contract drift, not an
-ingestible result. Any near-match, other diagnostic, exit code, output, missing
-witness, row mutation, or incomplete denominator aborts without a complete
-receipt. Relaxed capabilities, SPIR-V passthrough, decoration stripping, skip
-flags, and unchecked shader-module creation are not admitted alternatives.
+An unexpected success for either witness is contract drift, not an ingestible
+result. Any near-match, other diagnostic, exit code, output, missing or changed
+set/binding/member/type/offset/alignment witness, row mutation, or incomplete
+denominator aborts without a complete receipt. Relaxed capabilities, disabling
+Naga `STRUCT_LAYOUTS`, SPIR-V passthrough, decoration stripping, skip flags, and
+unchecked shader-module creation are not admitted alternatives.
 
 ## Commands
 
@@ -60,12 +68,12 @@ python3 tools/rt64_wgpu_shader_assessment.py runtime-ready \
 `assess` creates only `assessment-receipt.json`, and only after all 56 rows are
 classified. `verify` repeats the complete external verification and assessment
 without writing. `runtime-ready` also performs that full verification, prints a
-path-free readiness record, and exits 78 because schema v1 cannot establish
+path-free readiness record, and exits 78 because schema v2 cannot establish
 runtime readiness.
 
 ## Runtime boundary
 
-`runtime_ready` is unconditionally false in this schema. A blocked row adds
+`runtime_ready` is unconditionally false in schema v2. A blocked row adds
 `blocked-known-ingestion-row`; the following gaps always remain:
 
 1. `native-adapter-contract-not-recorded`
@@ -77,6 +85,13 @@ native receipt must bind a real adapter/device contract, checked module creation
 pipeline execution, and semantic evidence. This receipt makes no claim about an
 adapter, device, WGSL production, pipeline behavior, runtime integration, parity,
 or performance.
+
+The scalar-layout class is a bounded wgpu 30/Naga 30 ingestion gap. wgpu's
+shader-module path invokes Naga with all validation flags, while Naga's standard
+storage-layout model has no scalar-block-layout mode. M2.5a's Vulkan reference
+contract remains conditional on `VK_EXT_scalar_block_layout` and
+`scalarBlockLayout == VK_TRUE`; recognizing the exact Naga rejection does not
+weaken or replace either contract.
 
 ## Process improvement
 
