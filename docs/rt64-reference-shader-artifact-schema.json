@@ -1,0 +1,133 @@
+{
+  "schema": "fn64.rt64-reference-shader-policy.v1",
+  "direct_consumers": [
+    "tools/rt64_reference_shader_artifacts.py",
+    "tools/test_rt64_reference_shader_artifacts.py"
+  ],
+  "receipt_schema": "fn64.rt64-reference-shader-receipt.v1",
+  "spirv_val_build_receipt_schema": "fn64.spirv-val-source-build.v1",
+  "artifact_producer": {
+    "path": "tools/rt64_shader_artifacts.py",
+    "sha256": "b8db5cbcaa0caef60ec3c84a966917d246e25df882ae44951541e65720630d33"
+  },
+  "artifact_policy": {
+    "path": "docs/rt64-shader-artifact-schema.json",
+    "sha256": "7879607c7c6767da68747a882c6c8aa38efd074a11f955ecffbb85534d96ffd9"
+  },
+  "dxc": {
+    "commit": "0d3ee6b551b8fa768fbf825300ebab81047ef6a8",
+    "spirv_tools_path": "external/SPIRV-Tools",
+    "spirv_tools_commit": "b707790a898e44038547df54580022fc1cf89c3d",
+    "spirv_tools_license": "Apache-2.0",
+    "spirv_tools_license_path": "external/SPIRV-Tools/LICENSE",
+    "spirv_tools_license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "spirv_headers_path": "external/SPIRV-Headers",
+    "spirv_headers_commit": "29981f65241605e08b0ede4cfeb999fe3b723c6a",
+    "inventory_grammar_path": "external/SPIRV-Headers/include/spirv/unified1/spirv.core.grammar.json",
+    "inventory_grammar_sha256": "fc328b3a978cf6128617c679f1932717fb9a5fdbc9049c4124c2cc5f2f35cb4b",
+    "grammar_files": [
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/spirv.core.grammar.json", "sha256": "fc328b3a978cf6128617c679f1932717fb9a5fdbc9049c4124c2cc5f2f35cb4b"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.debuginfo.grammar.json", "sha256": "3f6b26f7e930ebf27524991c15366a278d7f0a73a8eb70b9e9503375c4a341b6"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.opencl.debuginfo.100.grammar.json", "sha256": "a0e0d510c7206ae98fc76b42756009991d56d2caa84f151165002806cdc9b222"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.glsl.std.450.grammar.json", "sha256": "5d72e48247569f9b77a17a849db624350abc9d26f7f72b153bbcf15c37238239"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.opencl.std.100.grammar.json", "sha256": "44b752999f78f8161ee52a9d305b14576ad7ed0a81a10d28870b7cd0ba5788a4"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.spv-amd-shader-explicit-vertex-parameter.grammar.json", "sha256": "c022b2c0b337d20951b9076ac0b6ec1ea512b2964051fc3ade04cbb70146ac8b"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.spv-amd-shader-trinary-minmax.grammar.json", "sha256": "7702f8d593e435f4f294d7a98cd9672b13efaa433a34a037698a285adfd84158"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.spv-amd-gcn-shader.grammar.json", "sha256": "ffb7b0f755f774c1fefd92ffc46a4790ac5bce3b1bc366676637186fd1ddfeb6"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.spv-amd-shader-ballot.grammar.json", "sha256": "823b90a85ba6a516def3db45c6b37ecdaba56263f9f7867c8c5432a0d2597395"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.nonsemantic.shader.debuginfo.grammar.json", "sha256": "2259d8a845a96cf897974ba5c638fb6054cc3ef27ceb9a70e42075ce4ccb9ea2"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.nonsemantic.clspvreflection.grammar.json", "sha256": "425414766ed0b387f05e30a57b74cfcc6288d07b23d61b86befa118c1d73d4d8"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.nonsemantic.vkspreflection.grammar.json", "sha256": "5479df05d87a80d84031fe8837908fb66b02b8f07f5cdb43b06005534d749200"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.tosa.001000.1.grammar.json", "sha256": "fb028a301e201afb61387b331a664b30790ffb2d2d2ecf81e09f2b63301e607c"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.arm.motion-engine.100.grammar.json", "sha256": "86fb7c418bc660338068ebe43409371e10cb78ecca83f9347c601b0b68ab8695"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.nonsemantic.graph.debuginfo.grammar.json", "sha256": "f91d9bceb574202017d9094ef64f89f5621ee7880069d0980f857697fd4072ed"},
+      {"path": "external/SPIRV-Headers/include/spirv/unified1/extinst.arm.experimental-ml-operations.grammar.json", "sha256": "23235b7fb0b37b29d92a02381e468dd2e081ce3da7035307b854a731b4c62046"}
+    ],
+    "registry_file": {
+      "path": "external/SPIRV-Headers/include/spirv/spir-v.xml",
+      "sha256": "204a1c88c736a8d41a7e8249e46dec8384c06ec34be23f223641eef71963501d"
+    }
+  },
+  "spirv_val": {
+    "source_subdirectory": "external/SPIRV-Tools",
+    "header_subdirectory": "external/SPIRV-Headers",
+    "generator": "Ninja",
+    "flags": [
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+      "-DCMAKE_CXX_STANDARD=17",
+      "-DBUILD_SHARED_LIBS=OFF",
+      "-DSPIRV_TOOLS_BUILD_STATIC=ON",
+      "-DSPIRV_SKIP_EXECUTABLES=OFF",
+      "-DSPIRV_SKIP_TESTS=ON",
+      "-DSPIRV_TOOLS_USE_MIMALLOC=OFF",
+      "-DSPIRV_TOOLS_USE_MIMALLOC_IN_STATIC_BUILD=OFF",
+      "-DSPIRV_BUILD_FUZZER=OFF",
+      "-DSPIRV_BUILD_LIBFUZZER_TARGETS=OFF",
+      "-DSPIRV_BUILD_COMPRESSION=OFF",
+      "-DSPIRV_ALLOW_TIMERS=OFF",
+      "-DSPIRV_COLOR_TERMINAL=OFF",
+      "-DSKIP_SPIRV_TOOLS_INSTALL=ON",
+      "-DENABLE_SPIRV_TOOLS_INSTALL=OFF",
+      "-DSPIRV_WERROR=ON"
+    ],
+    "dynamic_tool_bindings": [
+      "Python3_EXECUTABLE",
+      "SPIRV-Headers_SOURCE_DIR"
+    ],
+    "target": "spirv-val",
+    "parallel": 1,
+    "forced_build_version_description": "b707790a898e44038547df54580022fc1cf89c3d",
+    "source_date_epoch": "1783540007",
+    "version_prefix": "SPIRV-Tools v2026.3 b707790a898e44038547df54580022fc1cf89c3d",
+    "controlled_environment_names": [
+      "PATH",
+      "LC_ALL",
+      "LANG",
+      "CC",
+      "CXX",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+      "GIT_NO_REPLACE_OBJECTS",
+      "GIT_OPTIONAL_LOCKS",
+      "GIT_TERMINAL_PROMPT",
+      "FORCED_BUILD_VERSION_DESCRIPTION",
+      "SOURCE_DATE_EPOCH"
+    ],
+    "generated_authority_files": [
+      "build/source/core_tables_body.inc",
+      "build/source/core_tables_header.inc",
+      "build/source/DebugInfo.h",
+      "build/source/OpenCLDebugInfo100.h",
+      "build/source/generators.inc",
+      "build/source/build-version.inc"
+    ],
+    "candidate_paths": [
+      "build/tools/spirv-val",
+      "build/tools/spirv-val.exe",
+      "build/Debug/tools/spirv-val.exe",
+      "build/Release/tools/spirv-val.exe"
+    ],
+    "validation_arguments": [
+      "--target-env",
+      "vulkan1.0"
+    ],
+    "maximum_binary_bytes": 67108864,
+    "maximum_build_manifest_bytes": 16777216,
+    "darwin_runtime_closure": {
+      "inspector": "/usr/bin/otool",
+      "format": "otool-L-v1",
+      "system_load_names": [
+        "/usr/lib/libSystem.B.dylib",
+        "/usr/lib/libc++.1.dylib"
+      ]
+    }
+  },
+  "required_validation": [
+    "dxc-built-in-spirv-validation",
+    "spirv-tools-spirv-val-vulkan1.0",
+    "grammar-bound-capability-extension-nonuniform-inventory"
+  ],
+  "maximum_receipt_bytes": 8388608,
+  "claim_boundary": "reference-valid-only-not-wgpu-runtime-or-parity"
+}
