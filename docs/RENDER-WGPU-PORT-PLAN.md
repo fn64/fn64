@@ -879,7 +879,7 @@ The accelerated wave keeps dependency-safe work active in parallel:
    baseline exists.
 4. **A0.1 -- generate the source/task denominator (INTEGRATED).** The dual-pin
    inventory covers 276 admitted files / 48.065 KLOC and every authority gate.
-5. **A0.2 -- workflow dashboard (READY FOR REVIEW).** The strict canonical
+5. **A0.2 -- workflow dashboard (INTEGRATED).** The strict canonical
    ticket ledger and deterministic terminal/Markdown/HTML renderer passed its
    final 50-test suite in 10/10 clean processes.
 6. **A0.3 -- backend-neutral parity ladder (IN PROGRESS).** Land proof-bearing
@@ -888,9 +888,10 @@ The accelerated wave keeps dependency-safe work active in parallel:
 7. **M1.1 -- land the seam-v2 ownership spine (INTEGRATED).** The bounded,
    GPU-independent types and records are merged; this does not place runtime
    authorities or execute a backend.
-8. **M1.2 -- place and exercise IR authorities (IN PROGRESS).** Wire only
-   committed ABI facts through a real reference-backend effect/guest-commit
-   path without moving scheduler or memory authority across boundaries.
+8. **M1.2 -- place and exercise IR authorities (INTEGRATED).** The synthetic
+   DRAM/RDRAM slice now carries a validated capture through distinct queue,
+   disposable reference-backend effect, and ABI guest-commit owners. It does
+   not yet migrate production dispatch or receipt persistent/XBUS/TMEM state.
 9. **M2.1 -- pin the Metal capability baseline (INTEGRATED).** wgpu 30 on the
    M5 Pro advertised the candidate hard set and passed exact GPU copy/readback;
    advertisements are not semantic proof.
