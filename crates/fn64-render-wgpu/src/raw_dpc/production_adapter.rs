@@ -8,9 +8,10 @@
 //! scope for this seam is TMEM-only: `SetTile`/`SetTileSize`/
 //! `SetTextureImage`/`LoadSync`/`LoadBlock`/`LoadTile`/`LoadTlut` are pushed;
 //! every other decoded command kind (`NoOp`, `SetOtherMode`,
-//! `SetColorImage`, `SetFillColor`, `FillRectangle`, `FullSync`) is outside
-//! the admitted zero-guest-write TMEM/state subset and is rejected loudly --
-//! never silently dropped -- the instant one is encountered.
+//! `SetColorImage`, `SetFillColor`, `FillRectangle`, `FullSync`,
+//! `RawTriangle`) is outside the admitted zero-guest-write TMEM/state subset
+//! and is rejected loudly -- never silently dropped -- the instant one is
+//! encountered.
 
 use fn64_render::{
     ExactRawDpcPlanWriter, NeutralImageFormat, NeutralPixelSize, NeutralTextureImage,
@@ -63,6 +64,7 @@ fn opcode_name(kind: &RawDpcCommandKind) -> &'static str {
         RawDpcCommandKind::SetFillColor(_) => "SetFillColor",
         RawDpcCommandKind::FillRectangle(_) => "FillRectangle",
         RawDpcCommandKind::FullSync(_) => "FullSync",
+        RawDpcCommandKind::RawTriangle(_) => "RawTriangle",
         RawDpcCommandKind::SetTextureImage(_)
         | RawDpcCommandKind::SetTile { .. }
         | RawDpcCommandKind::SetTileSize { .. }
@@ -395,7 +397,8 @@ pub fn push_decoded_raw_dpc(
             | RawDpcCommandKind::SetColorImage(_)
             | RawDpcCommandKind::SetFillColor(_)
             | RawDpcCommandKind::FillRectangle(_)
-            | RawDpcCommandKind::FullSync(_)) => {
+            | RawDpcCommandKind::FullSync(_)
+            | RawDpcCommandKind::RawTriangle(_)) => {
                 return Err(UnadmittedRawDpcCommand {
                     command_index,
                     location: old_location,

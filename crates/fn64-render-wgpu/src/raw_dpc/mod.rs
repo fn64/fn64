@@ -1,8 +1,13 @@
 //! Bounded decoding for the first admitted raw-DPC command subset.
 
 mod production_adapter;
+mod triangle;
 
 pub use production_adapter::{push_decoded_raw_dpc, UnadmittedRawDpcCommand};
+pub use triangle::{
+    triangle_word_count, CoefficientWords, DepthWords, RawTriangle, RawWord, TriangleDecodeError,
+    TriangleFlags,
+};
 
 use core::fmt;
 
@@ -152,6 +157,7 @@ pub enum RawDpcCommandKind {
     LoadTile(TmemLoad),
     LoadTlut(TmemLoad),
     FullSync(FullSyncOccurrence),
+    RawTriangle(RawTriangle),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1010,6 +1016,17 @@ fn decode_stream(
                 }
                 RawDpcCommandKind::FullSync(sync)
             }
+            0x08..=0x0f => {
+                // `command` is already sliced to exactly `width` bytes above,
+                // and `width` came from `raw_rdp_command_width(opcode)`,
+                // which the module-level test
+                // `word_counts_match_raw_rdp_command_width_table` proves
+                // equals `triangle::triangle_word_count` for every triangle
+                // opcode -- so this length can never actually mismatch here.
+                let triangle = triangle::RawTriangle::decode(opcode, command)
+                    .expect("command slice length was already proven exact above");
+                RawDpcCommandKind::RawTriangle(triangle)
+            }
             _ => {
                 return Err(RawDpcDecodeError::UnsupportedCommand {
                     location,
@@ -1573,19 +1590,7 @@ mod tests {
 
     #[test]
     fn every_public_width_is_used_before_subset_rejection() {
-        for (opcode, width) in [
-            (0x08, 32),
-            (0x09, 48),
-            (0x0a, 96),
-            (0x0b, 112),
-            (0x0c, 96),
-            (0x0d, 112),
-            (0x0e, 160),
-            (0x0f, 176),
-            (0x24, 16),
-            (0x25, 16),
-            (0x3e, 8),
-        ] {
+        for (opcode, width) in [(0x24, 16), (0x25, 16), (0x3e, 8)] {
             let mut words = vec![0; width / 4];
             words[0] = word(0x80, opcode, 0);
             let error = decode(words).unwrap_err();
@@ -1598,6 +1603,34 @@ mod tests {
                 } if location.wire_opcode() == 0x80 | opcode
                     && decoded_opcode == opcode
                     && actual == width as u32
+            ));
+        }
+    }
+
+    /// The eight triangle opcodes are no longer part of the "still
+    /// unsupported" table above -- they decode. This proves each one's full
+    /// public width is consumed successfully rather than rejected.
+    #[test]
+    fn every_triangle_width_decodes_successfully_before_subset_rejection_table() {
+        for (opcode, width) in [
+            (0x08, 32),
+            (0x09, 48),
+            (0x0a, 96),
+            (0x0b, 112),
+            (0x0c, 96),
+            (0x0d, 112),
+            (0x0e, 160),
+            (0x0f, 176),
+        ] {
+            let mut words = vec![0; width / 4];
+            words[0] = word(0x80, opcode, 0);
+            let decoded = decode(words).unwrap_or_else(|error| {
+                panic!("opcode {opcode:#04x} width {width} must decode: {error}")
+            });
+            assert_eq!(decoded.commands().len(), 1);
+            assert!(matches!(
+                decoded.commands()[0].kind(),
+                RawDpcCommandKind::RawTriangle(_)
             ));
         }
     }
@@ -1716,7 +1749,7 @@ mod tests {
                     second_range,
                     {
                         let mut words = vec![0; 8];
-                        words[0] = word(0x80, 0x08, 0);
+                        words[0] = word(0x80, 0x24, 0);
                         words
                     },
                     TemporalBoundary::new(2, DpInterruptState::Clear),
@@ -1759,7 +1792,7 @@ mod tests {
         assert_eq!(location.chunk_index(), 1);
         assert_eq!(location.stream_byte_offset(), 8);
         assert_eq!(location.source_byte_offset(), COMMAND_START + 8);
-        assert_eq!(location.wire_opcode(), 0x88);
+        assert_eq!(location.wire_opcode(), 0xa4);
     }
 
     #[test]
@@ -3323,5 +3356,111 @@ mod tests {
             }
         );
         assert_eq!(durable, RdpState::default());
+    }
+
+    // --- triangle decode wired into the real command stream ---
+
+    fn triangle_base_word0(prefix: u8, opcode: u8, tile: u32, level: u32, yl: u16) -> u32 {
+        word(
+            prefix,
+            opcode,
+            (tile & 0x7) << 16 | (level & 0x7) << 19 | u32::from(yl),
+        )
+    }
+
+    /// A base-edge (0x08) triangle decoded from a real command stream, with
+    /// a `FullSync` immediately following, proves the decoder proves the
+    /// exact 32-byte boundary rather than guessing a stride: if triangle
+    /// decode consumed the wrong width, the following command would either
+    /// re-read triangle payload as an opcode (desync) or fail to reach
+    /// `FullSync` at all.
+    #[test]
+    fn base_edge_triangle_frames_exactly_against_a_following_full_sync() {
+        let prefix = 0;
+        let mut words = state_words(prefix);
+        words.extend([
+            triangle_base_word0(prefix, 0x08, 3, 2, 0x1234),
+            (0x5678u32) << 16 | 0x9abc,
+            0x0011_2233,
+            0xffbb_ccdd,
+            0x0044_5566,
+            0xff99_8877,
+            0x0077_8899,
+            0xff11_2233,
+        ]);
+        words.extend([word(prefix, FULL_SYNC, 0), 0]);
+
+        let submitted = submit(packet(9, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+
+        assert_eq!(decoded.commands().len(), 5);
+        let RawDpcCommandKind::RawTriangle(triangle) = decoded.commands()[3].kind() else {
+            panic!("fourth command must decode as RawTriangle");
+        };
+        assert_eq!(triangle.tile().get(), 3);
+        assert_eq!(triangle.level(), 2);
+        assert_eq!(triangle.yl(), 0x1234);
+        assert_eq!(triangle.ym(), 0x5678u16 as i16);
+        assert_eq!(triangle.yh(), 0x9abcu16 as i16);
+        assert!(triangle.shade().is_none());
+        assert!(triangle.texture().is_none());
+        assert!(triangle.depth().is_none());
+        assert!(matches!(
+            decoded.commands()[4].kind(),
+            RawDpcCommandKind::FullSync(_)
+        ));
+        // The next command's decoded source offset must be exactly 32 bytes
+        // (4 words) past the triangle's own offset -- the base-edge width,
+        // proving no coefficient byte was misread as part of the boundary.
+        assert_eq!(
+            decoded.commands()[4].location().stream_byte_offset()
+                - decoded.commands()[3].location().stream_byte_offset(),
+            32
+        );
+    }
+
+    /// A fully-populated (0x0f) triangle decoded from a real command stream
+    /// consumes exactly 176 bytes before a following `FullSync` is reached,
+    /// exercising the full base+shade+texture+depth block order end to end.
+    #[test]
+    fn fully_populated_triangle_frames_exactly_against_a_following_full_sync() {
+        let prefix = 0;
+        let mut words = state_words(prefix);
+        let mut triangle_words = vec![
+            triangle_base_word0(prefix, 0x0f, 1, 0, 10),
+            (20u32) << 16 | 30,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+        ];
+        // 8 shade words + 8 texture words + 2 depth words = 18 more 64-bit
+        // words (36 more u32 halves), for 22 words / 44 halves total.
+        triangle_words.extend((0..36u32).map(|index| 0x1000_0000 + index));
+        assert_eq!(triangle_words.len(), 44);
+        words.extend(triangle_words);
+        words.extend([word(prefix, FULL_SYNC, 0), 0]);
+
+        let submitted = submit(packet(9, words, &[]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+
+        assert_eq!(decoded.commands().len(), 5);
+        let RawDpcCommandKind::RawTriangle(triangle) = decoded.commands()[3].kind() else {
+            panic!("fourth command must decode as RawTriangle");
+        };
+        assert!(triangle.shade().is_some());
+        assert!(triangle.texture().is_some());
+        assert!(triangle.depth().is_some());
+        assert_eq!(
+            decoded.commands()[4].location().stream_byte_offset()
+                - decoded.commands()[3].location().stream_byte_offset(),
+            176
+        );
+        assert!(matches!(
+            decoded.commands()[4].kind(),
+            RawDpcCommandKind::FullSync(_)
+        ));
     }
 }
