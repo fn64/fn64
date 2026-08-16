@@ -1602,3 +1602,76 @@ any native GPU execution. It makes no RT64 parity or performance claim. This
 module does not modify `state.rs`, `combiner.rs`, `formats_dither.rs`,
 `rgb_dither.rs`, `random.rs`, `raster_vs.rs`, `texture_gen.rs`, or any other
 existing file besides `lib.rs`'s module registration and re-exports.
+## Fragment-register-to-combiner-input wiring (`combiner_inputs_from_fragment_registers`)
+
+`combiner.rs` gains one pure conversion function,
+`combiner_inputs_from_fragment_registers`, closing the gap the [Fragment
+constant registers](#fragment-constant-registers-setenvcolorsetprimcolorsetblendcolorsetfogcolorsetprimdepth)
+section above flagged as a nonclaim ("no combiner ... consumer reads these
+five registers yet"): it is the first site in this crate that ever
+constructs a [`CombinerInputs`] from real decoded fragment-register state
+rather than a raw test literal (verified by grepping every existing
+`CombinerInputs { .. }` construction site before writing this function --
+each one was a hand-picked test fixture).
+
+The exact field mapping is read directly from RT64's own combiner-input
+assembly, `RasterPS.hlsl:169-183` (pinned commit
+`5473732a822a4423b5696e7cb18fecc425a59875`, `docs/RT64-PORT-AUTHORITY.md`):
+
+```text
+ccInputs.primColor   = instanceRDPParams[instanceIndex].primColor;
+ccInputs.envColor    = instanceRDPParams[instanceIndex].envColor;
+ccInputs.primLodFrac = instanceRDPParams[instanceIndex].primLOD.x;
+```
+
+Cross-checked against where those three right-hand-side values are actually
+staged (`RDP::setEnvColor`/`setPrimColor`, `src/hle/rt64_rdp.cpp:838-842,
+861-871`): `primColor`/`envColor` are the already-`/255.0`-normalized
+`float4` this crate's own [`Color4::normalized`] reproduces exactly, and
+`primLOD.x` is `lodFrac / 256.0f`, exactly this crate's
+[`PrimLod::lod_frac_normalized`] (reached through
+[`PrimColor::lod`]/[`PrimColor::color`]). `env_color`, `prim_color`, and
+`prim_lod_frac` are the only three [`CombinerInputs`] fields this mapping
+touches; every other field (`tex_val0`/`tex_val1`/`shade_color`/
+`key_center`/`key_scale`/`lod_fraction`/`noise`/`k4`/`k5`) is sourced from
+texture sampling, vertex interpolation, separate host-tracked RDP state, a
+per-pixel GPU LOD derivative, a PRNG draw, and a separate `convertK` table
+respectively -- none of them read `env_color`/`prim_color`/`prim_lod_frac`/
+`PrimDepth` in RT64's own assembly, so `combiner_inputs_from_fragment_registers`
+takes a caller-supplied `base: CombinerInputs` for those fields and only
+overrides the three it can actually derive, rather than inventing values for
+fields this seam has no authority over.
+
+**Nonclaims.** [`PrimDepth`] is not read here: `rt64_color_combiner.h`'s
+`Inputs` struct (the type `ccInputs` is) has no `primDepth` field at all --
+`instanceRDPParams[...].primDepth` is read elsewhere in the same shader
+(`RasterPS.hlsl:100`, depth testing), a different consumer entirely. This
+was verified by grep, not inferred from field-name absence alone.
+`PrimLod::lod_min_normalized` (`primLOD.y`) is likewise decoded by this
+crate but never read by this specific assembly block, and a dedicated test
+proves varying `lod_min` alone leaves the result unchanged. As with every
+other module in this crate, there is no `OtherMode` field folded into this
+mapping: `RasterPS.hlsl` sets `ccInputs.otherMode` separately, and
+`rt64_color_combiner.h`'s own `Inputs.otherMode` field is consulted only for
+`cycleType()` cycle-mode dispatch (`runCycle`/`run`), which this crate's
+`run_combiner` already takes as an explicit `CombinerCycleMode` parameter,
+not a `CombinerInputs` field -- so no `OtherMode` field is reachable from
+this mapping's three target fields, and none is threaded through. No
+cycle-mode selection, no NOISE/LOD real generation, no texture-fetch
+integration, no draw-path or production-dispatch wiring, and no RT64
+parity/performance claim.
+
+**Tests.** An independent-oracle test constructs distinct, non-zero
+per-byte wire words for `env_color`/`prim_color`/`prim_lod_frac`, computes
+the expected normalized floats by hand from those raw bytes
+(`byte / 255.0`, `lodFrac / 256.0`) rather than by calling this crate's own
+`Color4::normalized`/`PrimLod::lod_frac_normalized` and asserting against
+their output, and separately confirms every other `CombinerInputs` field
+passes through the caller-supplied `base` untouched. A boundary test covers
+the all-zero and all-`0xFF` wire-word extremes, including the `0xFF / 256.0`
+corner that never reaches exactly `1.0` (unlike the `/255.0` fields, which
+do at `0xFF`). A `lod_min`-invariance test proves varying only `lodMin`
+leaves the result identical. A final test exercises `PrimDepth::from_wire`
+directly (independent of this function, since it takes no `PrimDepth`
+parameter at all) to make the 15-bit-mask omission from this function's
+signature a documented, tested API fact rather than a silent gap.
