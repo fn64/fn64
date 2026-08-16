@@ -886,6 +886,11 @@ The accelerated wave keeps dependency-safe work active in parallel:
    24+26 denominator and Rust-owned fail-closed verifier are implemented; a
    display-independent RT64-produced observable is still required before any
    RT64 row can be promoted to pass or divergence.
+   **A0.4 is READY:** qualify `feature::deferred-frame-history` first using
+   RT64's retained completed-Workload snapshot on a controlled hidden Metal
+   surface. Ignore fn64 preflight FullSync, perform no present/VI call, and
+   bind the exact oracle runner/source/build plus actual RDRAM effects across
+   ten checker-owned fresh processes.
 7. **M1.1 -- land the seam-v2 ownership spine (INTEGRATED).** The bounded,
    GPU-independent types and records are merged; this does not place runtime
    authorities or execute a backend.

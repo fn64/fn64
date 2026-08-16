@@ -17,7 +17,7 @@
 
 | ID | state | title | tickets |
 |---|---|---|---|
-| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, RUNNING:1 |
+| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, READY:1, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1, READY:1 |
@@ -443,6 +443,29 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - The decoder and staged persistent state belong to fn64-render-wgpu; fn64-render-ir retains neutral packets/journals/receipts, and fn64-abi must not decode commands or select targets.
 
 **Next action:** Implement the bounded decoder and transaction-local state delta with exact journal equality, hostile command tables, and two-packet staged-state tests; run the 10-process CPU bar before independent review.
+
+### `A0.4` -- Qualify the first genuinely RT64-produced conformance observation by running the deferred-frame-history fixture through pinned RT64 on a controlled hidden Metal surface.
+
+| field | value |
+|---|---|
+| milestone | `M0` |
+| state | `READY` |
+| profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
+| owner | RT64 oracle-runner writer |
+| branch | `port/rt64-deferred-history-runner` -> `main` |
+| dependencies | `A0.3` |
+| writable paths | `crates/fn64-render-conformance`, `crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md`, `docs/rt64-port-status.json` |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- RT64's FullSync handler advances and enqueues an RT64-owned Workload with its own workload ID; the existing shim snapshots that completed Workload under the queue mutex before worker consumption.
+- The first target row is feature::deferred-frame-history. Public FrameStatus and fn64 preflight FullSync are excluded from evidence; the observation projects only fieldwise RT64 workload history plus actual RDRAM effects.
+- Pinned RT64 has no device-free Application setup. Qualification requires a fresh main-thread macOS process, active WindowServer, hidden SDL Metal surface, and no VI/present call.
+- The runner's exact source/build/binary is the trust root and must bind the pinned RT64 source identity, ordinary rt64 feature set, replay, private authority, fresh challenge, child PID, structural workload digest, and guest effects.
+
+**Next action:** Implement the production RT64 deferred-history runner and checker cooldown/stdout isolation, prove PipeSync/no-arm/double-FullSync/mutation cases reject, then execute ten fresh checker-owned hidden-Metal processes before promoting only that RT64 row.
 
 ## Regenerating
 
