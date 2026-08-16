@@ -86,6 +86,7 @@ const LEGACY_G_MW_POINTS: u32 = 0x0c;
 const G_MV_VIEWPORT: u8 = 0x08;
 const G_MV_LIGHT: u8 = 0x0a;
 const G_MV_MATRIX: u8 = 0x0e;
+const G_MW_MATRIX: u16 = 0x00;
 const G_MW_NUMLIGHT: u16 = 0x02;
 const G_MW_CLIP: u16 = 0x04;
 const G_MW_SEGMENT: u16 = 0x06;
@@ -859,6 +860,19 @@ fn apply_moveword(
             state.persp_normalize = Some(w1 as u16);
         }
         G_MW_NUMLIGHT | G_MW_CLIP | G_MW_FOG | G_MW_LIGHTCOL => {}
+        // Public gbi.h's G_MW_MATRIX (index 0x00) writes raw fixed-point bytes
+        // directly into the RSP's retained model/proj/MVP matrix triple at an
+        // implementation-defined byte offset (pinned MIT RT64
+        // `rt64_rsp.cpp::insertMatrix`). This inspector's `Mat4` holds resolved
+        // f32 values, not the RSP's split integer/fraction fixed-point layout,
+        // so a byte patch cannot be represented losslessly here. Named
+        // separately from the generic unsupported-index frontier because it is
+        // a real, documented index this inspector deliberately cannot track.
+        G_MW_MATRIX => {
+            return Err(reject_unsupported(format!(
+                "G_MOVEWORD G_MW_MATRIX raw fixed-point matrix patch at offset {offset:#06x} is outside this inspector's f32 matrix model"
+            )))
+        }
         _ => {
             return Err(reject_unsupported(format!(
                 "unsupported {} G_MOVEWORD index {index:#04x} offset {offset:#06x}",

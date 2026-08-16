@@ -155,6 +155,18 @@ pub struct LeoDiskConfig {
     pub pulse_width: u8,
 }
 
+// Public os_pi.h defines four device types: CART=0, BULK=1 ("ROM bulk", used
+// by osDriveRomInit's N64DD Drive-ROM handle), 64DD=2, SRAM=3 -- N64
+// Programming Manual Chapter 27's os_pi.h listing documents "values 0 through
+// 3" as the supported range. BULK has no named constant or constructor here:
+// like the 64DD register window traced in `abi.pi.absent-domain1-device`
+// (pi/timing.rs), Drive-ROM access is 64DD accessory territory this crate
+// does not model, so no code path ever builds a handle carrying it. The
+// `<= DEVICE_TYPE_SRAM` bound below is deliberately inclusive of the BULK
+// value for that reason: a handle claiming it still decodes and then falls
+// through `resolve_epi_device_address`'s final match to the same loud
+// "no backing device" trap an unbacked 64DD handle already hits, not a
+// silent gap.
 pub(crate) const DEVICE_TYPE_CART: u8 = 0;
 pub(crate) const DEVICE_TYPE_64DD: u8 = 2;
 pub(crate) const DEVICE_TYPE_SRAM: u8 = 3;
