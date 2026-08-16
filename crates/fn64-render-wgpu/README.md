@@ -1,7 +1,7 @@
 # fn64-render-wgpu
 
 `fn64-render-wgpu` is the pure-Rust GPU backend being built to replace the
-quarantined RT64 C++ adapter. The current M3.2 surface is intentionally small:
+quarantined RT64 C++ adapter. The current raw-DPC surface is intentionally small:
 it decodes a bounded raw-DPC subset into ordered typed commands, a
 transaction-local RDP state delta, and an exact resource plan. M3.1's headless
 wgpu 30 fixture remains byte-for-byte frozen as a separate lifecycle bridge.
@@ -19,6 +19,37 @@ RGBA16/32 row ranges are planned exactly. The input journal must equal the
 entire ordered plan, including operation identities. No durable state is
 mutated: decode consumes the submitted ticket, and staged state is move-only,
 queue-bound, submission-ordinal-bound, and exact-successor-sequence-bound.
+
+M4.1 additionally stages the public Set Texture Image, Set Tile, Set Tile
+Size, Load Sync, Load Block, Load Tile, and strict public-macro Load TLUT
+forms. M4.2.0 binds each admitted Load Block/Load Tile to two distinct views:
+an ordered immutable list of complete 64-bit transfer words, and a canonical
+sorted/disjoint union of physical TMEM bytes touched by those words. Each word
+retains its exact source-access/offset, defined-source-byte mask, destination
+word, DXT or tile-row advance, starting-TL-aware odd-row exchange, and linear
+or split-bank physical fragments. The union is the resource-journal effect;
+it deliberately deduplicates repeated destinations while the ordered list
+does not. Thus a wrapped, overwritten, or differently ordered transfer cannot
+borrow another transfer's checked plan merely because it touches the same bytes.
+
+Public RDP documentation defines row padding to complete 64-bit transfers but
+does not define padding values. The contract therefore distinguishes logical
+defined-content masks from whole-word effect coverage; it does not mark
+padding as defined texture content or invent zeroes. Texture Image alone owns
+source format, size, width, and address even when Set Tile declares another
+size. Direct four-bit loads fail loudly because the public guidance requires a
+16-bit load form. RGBA32 plans use low/high 2 KiB bank fragments and reject a
+load base outside low TMEM. YUV and Load TLUT retain their exact owned sources
+but have no physical destination contract in this slice: YUV pairing and
+descriptor constraints still require a public-authority contract, while M4.3
+owns TLUT's high-bank/quadrication boundary.
+
+`RawDpcResourcePlan::bind_tmem_transfer` returns an immutable checked view. It
+revalidates workload, journal, submission, memory layout, source slice,
+canonical destination slice, operations, counts, byte totals, and both slice
+identities before exposing ordered words. It is deliberately not a consuming
+execution capability: no byte execution or persistent 4 KiB TMEM state exists
+yet.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
@@ -151,8 +182,9 @@ A machine with no selected native adapter returns the typed `NoAdapter`
 outcome; that is unsupported host evidence, not a skipped or passing GPU
 claim.
 
-Provenance: command fields and fill-cycle rules use the public SGI *RDP Command
-Summary* and the public libultra `gDPSetCycleType`, `gDPSetColorImage`,
+Provenance: command fields, load-word layout, DXT, and fill-cycle rules use the
+public SGI *RDP Command Summary* and the public Nintendo 64 Programming
+Manual section 13.9, plus public libultra `gDPSetCycleType`, `gDPSetColorImage`,
 `gDPSetFillColor`, `gDPFillRectangle`, and `gDPFullSync` descriptions. State
 field interpretation follows the permitted MIT RT64 semantic source pinned by
 the port plan; no RT64 code is copied. The shader is a repository-owned

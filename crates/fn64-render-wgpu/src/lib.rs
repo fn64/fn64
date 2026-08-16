@@ -2,10 +2,16 @@
 //!
 //! M4.1 adds typed, transaction-local texture-image, tile, tile-size, sync,
 //! block, tile, and TLUT load decoding with exact M4.0-owned source-read
-//! identities. Its hardware fields are sourced from the public SGI *Nintendo
-//! 64 RDP Command Summary*, Tables 1, 3, and 6–10, plus the public libultra
-//! `gbi.h` `gDPLoadTLUTCmd` macro. RT64 is not hardware authority for this
-//! slice. M4.1 does not move TMEM bytes, execute GPU work, migrate production
+//! identities. M4.2.0 binds LoadBlock and LoadTile to ordered 64-bit transfer
+//! words plus a separate canonical sorted/disjoint physical-TMEM destination
+//! union. Undefined word padding remains distinct from defined source bytes;
+//! direct four-bit loads, YUV destination planning, and LoadTLUT destination
+//! execution stay loud gaps.
+//! Hardware fields and transfer rules come from the public SGI *Nintendo 64
+//! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
+//! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
+//! is not hardware authority for this slice. M4.2.0 does not move TMEM bytes,
+//! create persistent physical state, execute GPU work, migrate production
 //! dispatch, or establish parity or performance.
 //!
 //! M3.3c executes M3.3a's exact native 4x2 RGBA16 fill through a prewarmed
@@ -142,8 +148,8 @@ pub use native_contract::{
     NATIVE_FILL_WORKLOAD_SHA256,
 };
 pub use raw_dpc::{
-    decode_raw_dpc, decode_raw_dpc_after, DecodedRawDpc, DecodedRawDpcCommand, FillRectangle,
-    RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError, RawDpcResourcePlan,
+    decode_raw_dpc, decode_raw_dpc_after, BoundTmemTransfer, DecodedRawDpc, DecodedRawDpcCommand,
+    FillRectangle, RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError, RawDpcResourcePlan,
     TmemLoadSourcePlanError,
 };
 pub use state::{
@@ -161,6 +167,7 @@ pub use targets::{
 };
 pub use tmem::{
     TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState,
-    TlutEntryCount, TmemDxt, TmemLoad, TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity,
-    TmemLoadSourcePlan, TmemState, TmemWordAddress,
+    TlutEntryCount, TmemDxt, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch,
+    TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemState, TmemTransferLayout,
+    TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord, TmemWordAddress,
 };
