@@ -556,6 +556,22 @@ reference/RT64/Rust observations; native framebuffer and post-VI hashes satisfy
 the declared authority; ordinary presentation performs no CPU RGBA conversion
 or GPU readback; no full-RDRAM staging copy occurs on the normal route.
 
+M3 is dispatched as dependency-safe vertical slices, not one renderer-sized
+branch:
+
+| slice | exclusive outcome | writable owner |
+|---|---|---|
+| M3.1 | create `fn64-render-wgpu`, consume the merged render IR and exact submission completion, prewarm a bounded headless wgpu device, and execute one receipt-bearing fill/FullSync fixture without ABI or shell policy | crate root plus `src/device`, `src/lifecycle` |
+| M3.2 | decode the first admitted raw-DPC command subset into persistent typed RDP/TMEM state and upload only journal-declared ranges; unknown commands trap with stream/offset identity | `src/raw_dpc`, `src/state`, decoder fixtures |
+| M3.3 | own native color/depth resources, exact shader-compute coverage, bounded guest writeback, minimal VI, and headless capture for the first real captured workload | `src/targets`, `src/raster`, `src/vi`, shaders |
+| M3.4 | replace the shell's CPU-RGBA/pixels path with direct surface and overlay composition, including resize/loss handling, while leaving ABI scheduling and guest-memory authority unchanged | shell/backend integration paths, serialized after M3.3 |
+
+M3.1 may use one small reviewed WGSL fixture so M2.4 does not idle the spine.
+M3.3's admitted RT64 shader corpus, and every broader M4 shader claim, require
+M2.4's source/tool/artifact receipts. Synthetic success advances mechanism
+only; the milestone remains open until M3.3 replays a captured workload and
+M3.4 removes the second presentation stack.
+
 ### M4 -- base RDP and framebuffer correctness
 
 **Goal:** close the native-resolution console pixel and memory contract.
