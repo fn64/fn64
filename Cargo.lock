@@ -879,6 +879,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fn64-render-conformance"
+version = "0.0.0"
+dependencies = [
+ "fn64-render-ir",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fn64-render-ir"
 version = "0.0.0"
 dependencies = [

@@ -17,7 +17,7 @@
 
 | ID | state | title | tickets |
 |---|---|---|---|
-| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
+| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | BLOCKED:1, INTEGRATED:2, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:1 |
@@ -207,14 +207,14 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M0` |
-| state | `RUNNING` |
+| state | `BLOCKED` |
 | profile / effort / model | `F` / `high` / GPT-5.6 Sol |
-| owner | conformance-spine writer |
+| owner | /root/a0_3_independent_review repair implementer |
 | branch | `port/rt64-conformance-spine` -> `main` |
 | dependencies | `A0.1` |
-| writable paths | `crates/fn64-render-conformance`, `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/DESIGN.md`, `scripts/lint-docs.py`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md` |
+| writable paths | `Cargo.toml`, `Cargo.lock`, `README.md`, `crates/fn64-render-conformance`, `docs/DESIGN.md`, `docs/RENDER-WGPU-PORT-PLAN.md`, `docs/rt64-port-status.json`, `docs/RT64-PORT-DASHBOARD.md`, `docs/rt64-port-dashboard.html`, `scripts/lint-docs.py`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md` |
 | started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| verification runs meeting bar | 3/3 |
 
 **Findings:**
 
@@ -223,9 +223,25 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Independent review rejected the first candidate: its RT64 pass observed only fn64 preflight FullSync, its divergence was synthetic, receipt authority was caller-forgeable, and it duplicated the stronger merged fn64-render-ir lifecycle.
 - Independent review rejected the second candidate even though it launched fresh challenged processes: the child received the expected answer, the test runner echoed it, effect and guest-commit evidence was fabricable JSON, the build artifact was decorative, and the source pin was not causally tied to the executed binary.
 - The second candidate also split Rust fixture-v2 from Python fixture-v3, never decoded its alleged WorkloadRecord through Rust, supplied no raw payload for content-silent replay, and blessed an invalid synthetic record in its positive test.
-- The repair must use one Rust-owned fixture codec, keep expectations verifier-private, supply exact replay payloads, derive classification in the verifier, require actual typed guest commit, and bind the executed static runner to its source/build receipt while retaining all 50 required rows. No RT64 pass or divergence is currently accepted.
+- The repaired protocol separates public replay input from a statically registered verifier-private authority artifact. A Rust verifier decodes WorkloadRecord, reconstructs exact payload-bound fn64-render-ir packets, validates effect slots, and derives pass/divergence after each child exits.
+- The checker launches ten fresh isolated subprocesses with unpredictable challenges, captures stdout and PID itself, rechecks retained artifacts after every run, and binds the exact runner executable to a pinned build receipt covering source inputs, build inputs, toolchain, and the RT64 source identity when applicable.
+- The verifier/evaluation protocol is binary-private rather than a public fn64-render-conformance library API. The exact reviewed runner source/build/binary is the cross-process trust root for its internal GuestCommittedTicket lifecycle; JSON hashing alone is explicitly not Rust type provenance.
+- Guest proof carries only independently checkable workload, backend-effect, guest-effect, and fresh-challenge identities. Unverifiable queue, ordinal, and submission decorations were removed.
+- Synthetic test runners are marked test-only, their source receipt is required in the test lane, and production registration rejects them mechanically. The production runner registry remains empty.
+- The negative suite rejects expectation echoing, invalid records, missing or altered payloads, arbitrary effects, fake or stale-challenge guest proofs, synthetic production registration, mutated source/build closure, caller-authored private authority, caller-authored process series, and one execution cloned across ten launches.
+- No RT64 pass or divergence is accepted: the available raw-DPC attempt exposes fn64 preflight FullSync rather than an RT64-produced observable, and the native RT64 path stops at SDL display initialization without a display.
 
-**Next action:** Replace the expectation-echo protocol with one Rust-decoded input-only fixture and verifier-private authority, bind the exact executable to source/build, prove the known forgeries fail, then repeat independent review before promoting any row.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test -p fn64-render-conformance --features conformance-test-runner --all-targets && cargo test -p fn64-render-conformance --doc` | 10 | 10 | deterministic |
+| `python3 -m unittest tools/test_check_rt64_port_parity.py` | 10 | 10 | deterministic |
+| `python3 tools/check_rt64_port_parity.py` | 10 | 10 | deterministic |
+
+**Blocker:** No qualified headless RT64 delegate currently exposes a backend-produced contract observable: raw-DPC reports only fn64 preflight FullSync, while native RT64 stops at SDL display initialization. A0.3 cannot honestly supply its required RT64 pass/divergence case yet.
+
+**Next action:** Add a separately reviewed, display-independent RT64 runner that exposes a genuinely RT64-produced observable and bind its exact source/build/binary receipt before promoting any RT64 row.
 
 ### `M1.2` -- Place IR authority at real crate boundaries: validated ABI capture, distinct queue submission, backend-owned effect completion, and guest-memory-owner commit with rejection leaving no architectural publication.
 
