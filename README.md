@@ -105,6 +105,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-render` | Backend-neutral render seam, content-addressed ordered microcode admission, and raw-DPC completion inspection |
 | `fn64-render-reference` | Deterministic pure-Rust `ReferenceBackend`, geometry/object decoders, software rasterizer, and VI reference path |
 | `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); all C++ interop remains quarantined here |
+| `fn64-render-wgpu` | Pure-Rust wgpu backend; currently the bounded M3.1 headless submission/readback lifecycle fixture |
 | `fn64-certification` | Executable cross-backend and native RT64 behavioral evidence gates |
 | `fn64-cpu-runtime` | Linked typed execution runtime for generated VR4300 Rust runners |
 | `fn64-cpu-runtime-codegen` | Build-side typed-Rust emitter and whole-ROM driver; absent from generated runners' runtime dependency graph |
@@ -145,6 +146,13 @@ The Rust replacement is tracked as a proof-driven program in
 in `docs/RT64-PORT-AUTHORITY.md`. The plan keeps performance evidence as a
 separate milestone; removal of the C++ FFI boundary by itself is neither a
 parity result nor a speed result.
+
+The first production `fn64-render-wgpu` crate is intentionally narrower than
+that destination: it proves a headless wgpu device, prewarmed repository-owned
+WGSL, an exact indexed submission wait, readback, and render-IR completion
+receipt for one synthetic 2x2 fill/FullSync packet. It is not connected to ABI,
+runtime, shell, VI, or general RDP decoding and does not advance parity or
+performance claims by itself.
 
 ### Discovery corpus
 

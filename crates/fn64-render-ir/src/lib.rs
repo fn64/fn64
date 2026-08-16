@@ -43,10 +43,10 @@ pub use record::{
     RawStreamRecord, WorkloadRecord, MAX_WORKLOAD_RECORD_BYTES, WORKLOAD_RECORD_SCHEMA,
 };
 pub use ticket::{
-    BackendCompletionAuthority, BackendEffectReport, CompletedWrite, DecodedTicket,
-    GpuCompleteTicket, GpuCompletionReceipt, GuestCommitAuthority, GuestCommitEffectReport,
-    GuestCommitReceipt, GuestCommittedTicket, QueueIdentity, SubmissionIdentity, SubmissionQueue,
-    SubmittedTicket, TicketAuthoritySet,
+    effect_content_digest, BackendCompletionAuthority, BackendEffectReport, CompletedWrite,
+    DecodedTicket, GpuCompleteTicket, GpuCompletionReceipt, GuestCommitAuthority,
+    GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket, QueueIdentity,
+    SubmissionIdentity, SubmissionQueue, SubmittedTicket, TicketAuthoritySet,
 };
 pub use workload::{
     MicrocodeAdmissionIdentity, WorkloadAdmission, WorkloadPacket, MAX_PACKET_COMMAND_BYTES,

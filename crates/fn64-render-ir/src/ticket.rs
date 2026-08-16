@@ -191,6 +191,14 @@ pub struct CompletedWrite {
     content: ContentDigest,
 }
 
+/// Canonical identity for exact renderer-produced effect bytes.
+///
+/// Backends and guest-commit adapters share this domain so the same staged
+/// bytes cannot acquire backend-specific identities at the ownership seam.
+pub fn effect_content_digest(bytes: &[u8]) -> ContentDigest {
+    ContentDigest::hash(b"fn64.render.ir-effect-bytes.v1\0", &[bytes])
+}
+
 impl CompletedWrite {
     pub fn try_new(
         access: ResourceAccess,
@@ -212,6 +220,14 @@ impl CompletedWrite {
             byte_count,
             content,
         })
+    }
+
+    pub fn try_from_bytes(access: ResourceAccess, bytes: &[u8]) -> Result<Self, ValidationError> {
+        let byte_count =
+            u32::try_from(bytes.len()).map_err(|_| ValidationError::NumericOverflow {
+                field: "completed effect byte length",
+            })?;
+        Self::try_new(access, byte_count, effect_content_digest(bytes))
     }
 
     pub const fn access(self) -> ResourceAccess {
@@ -681,6 +697,22 @@ mod tests {
                 .unwrap()
                 .identity()
         );
+    }
+
+    #[test]
+    fn exact_effect_bytes_have_one_canonical_identity() {
+        let packet = packet(0xe9, 1);
+        let access = packet.journal().write_accesses().next().unwrap();
+        let bytes = vec![0x21; access.region().declared_bytes() as usize];
+        let effect = CompletedWrite::try_from_bytes(access, &bytes).unwrap();
+        assert_eq!(effect.byte_count(), bytes.len() as u32);
+        assert_eq!(effect.content(), effect_content_digest(&bytes));
+
+        let short = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            CompletedWrite::try_from_bytes(access, short),
+            Err(ValidationError::EffectByteCountMismatch { .. })
+        ));
     }
 
     #[test]

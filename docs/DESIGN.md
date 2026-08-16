@@ -19,6 +19,7 @@ fn64-render-ir GPU/runtime-independent render semantics, bounded replay records,
 fn64-render    backend-neutral render seam, exact microcode admission, and diagnostic raw-DPC inspection
 fn64-render-reference deterministic pure-Rust ReferenceBackend
 fn64-render-rt64 FFI bridge to RT64 (C++)
+fn64-render-wgpu pure-Rust wgpu backend; bounded M3.1 lifecycle fixture today
 fn64-certification executable behavioral evidence gates over the public renderer seams
 fn64-cpu-runtime  linked typed execution runtime for generated VR4300 Rust runners
 fn64-cpu-runtime-codegen  build-side Rust emitter and whole-ROM driver (§1.1's `rs` lane)
@@ -40,6 +41,7 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     └──depends on──> fn64-boot-harness ──depends on──> fn64-abi + fn64-runtime
     ├──depends on──> fn64-render-reference ──depends on──> fn64-render ──depends on──> fn64-runtime + fn64-render-ir
     └──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
+fn64-render-wgpu ──depends on──> fn64-render-ir + wgpu
 fn64-certification ──depends on──> fn64-render + fn64-render-reference + fn64-render-rt64 + fn64-runtime
 fn64-render-ir (GPU/runtime independent; has no workspace dependencies)
 ```
@@ -78,6 +80,24 @@ completion, `LiveDpcTransaction::commit`, committed semantic publication and
 guest-effect application, then DP completion scheduling. The synthetic test
 proves the authority placement and rollback mechanism only; it does not yet
 prove that production scheduling order.
+
+M3.1 adds `fn64-render-wgpu` as the first native GPU consumer of that ownership
+model (`docs/RENDER-WGPU-PORT-PLAN.md`, M3.1). It is not wired into production
+dispatch. Its only admitted packet is one synthetic 2x2 RGBA fill with an exact
+`CMD_END -> FullSync -> DP interrupt` observation sequence and one 16-byte
+journal-declared color-framebuffer effect. Its journal is exactly ordered as
+operation-zero command read then operation-one framebuffer write; additional,
+reordered, or renumbered accesses are not part of this fixture. Render-IR owns
+the canonical effect-byte digest used by both the pre-existing M1.2 guest
+staging adapter and wgpu, so identical bytes cannot acquire backend-specific
+receipt identities. The backend exclusively borrows its prewarmed headless
+device while one move-only `SubmittedTicket` is in flight, binds that semantic
+identity to wgpu's opaque `SubmissionIndex`, and retains its paired
+`BackendCompletionAuthority`. It issues a receipt only after the exact indexed
+wait shape characterized by the M2.3 native probe, callback observation,
+bounded map/readback, and exact byte comparison. This is lifecycle mechanism
+evidence only: it does not claim general RDP decode, VI, presentation, RT64
+parity, or performance.
 
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
 Rust: the scheduler, message-queue semantics, timer wheel, rdram buffer
