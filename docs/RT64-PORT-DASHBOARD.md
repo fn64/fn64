@@ -19,7 +19,7 @@
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:1, RUNNING:1 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:1, RUNNING:1 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:2 |
 | `M3` | `PLANNED` | Raw-DPC vertical slice | none |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
@@ -251,23 +251,39 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M2` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `P` / `high` / GPT-5.6 Sol |
 | owner | Metal semantics writer |
 | branch | `port/m2-metal-semantics` -> `main` |
 | dependencies | `M2.1` |
 | writable paths | `probes/m2-wgpu-metal-headless` |
 | started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| verification runs meeting bar | 3/3 |
 
 **Findings:**
 
 - Capability bits alone do not close a renderer requirement; each native and fallback path must execute and read back exact bytes.
 - This ticket owns masks and wrapping arithmetic, TMEM-like addressing, nonuniform arrays, dual-source/manual blending, explicit format conversions, and rejection of unsupported reinterpretation.
 - Independent review rejected the first receipt shape because it omitted adapter/driver/toolchain identity, used only selector-like 0/255 blend factors, and could report staging geometry before a successful readback.
-- The active repair adds configuration-bound receipts, fractional independently expected blending, and typed NotRun/Failed/Passed staging evidence before repeating the host run bar.
+- The accepted repair binds adapter and toolchain identity, proves fractional native/manual blending against the independently fixed [64,60,89,94] vector, and exposes staging geometry only after successful copy/map/extraction.
+- This closes M2.2 on Apple M5 Pro Metal only; it does not prove RT64 parity, performance, other adapters, submission-ticket ownership, coverage fallback, or surface presentation.
 
-**Next action:** Complete the three review repairs, rerun focused review, then repeat 10 final-source host processes for both binaries.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `cargo test --locked --all-targets` | 1 | 1 | single |
+| `metal_semantics final-source host process` | 10 | 10 | deterministic |
+| `metal_formats_io final-source host process` | 10 | 10 | deterministic |
+
+**Next action:** Dispatch submission/timestamp ownership, coverage fallback, and direct-surface probes while the HLSL artifact-provenance decision proceeds independently.
+
+**Retrospective:**
+
+- Friction: Initial capability receipts omitted execution identity, binary blend vectors exercised selectors rather than rounding, and staging geometry was populated before success was known.
+- Cause: The first card implementation optimized for getting real GPU execution before its evidence schema and discriminating vectors were adversarially reviewed.
+- Prevention: Future GPU cards start from configuration-bound typed receipts and independently fixed fractional or edge-case vectors, with outcome payloads that cannot represent success-only fields in failure states.
+- Estimated minutes saved: 25
 
 ## Regenerating
 

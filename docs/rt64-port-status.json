@@ -374,18 +374,44 @@
         "probes/m2-wgpu-metal-headless"
       ],
       "dependencies": ["M2.1"],
-      "state": "RUNNING",
+      "state": "INTEGRATED",
       "findings": [
         "Capability bits alone do not close a renderer requirement; each native and fallback path must execute and read back exact bytes.",
         "This ticket owns masks and wrapping arithmetic, TMEM-like addressing, nonuniform arrays, dual-source/manual blending, explicit format conversions, and rejection of unsupported reinterpretation.",
         "Independent review rejected the first receipt shape because it omitted adapter/driver/toolchain identity, used only selector-like 0/255 blend factors, and could report staging geometry before a successful readback.",
-        "The active repair adds configuration-bound receipts, fractional independently expected blending, and typed NotRun/Failed/Passed staging evidence before repeating the host run bar."
+        "The accepted repair binds adapter and toolchain identity, proves fractional native/manual blending against the independently fixed [64,60,89,94] vector, and exposes staging geometry only after successful copy/map/extraction.",
+        "This closes M2.2 on Apple M5 Pro Metal only; it does not prove RT64 parity, performance, other adapters, submission-ticket ownership, coverage fallback, or surface presentation."
       ],
-      "verification_runs": [],
+      "verification_runs": [
+        {
+          "command": "cargo test --locked --all-targets",
+          "clean_run_count": 1,
+          "required_run_count": 1,
+          "kind": "single"
+        },
+        {
+          "command": "metal_semantics final-source host process",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "metal_formats_io final-source host process",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        }
+      ],
       "blocker": null,
-      "next_action": "Complete the three review repairs, rerun focused review, then repeat 10 final-source host processes for both binaries.",
+      "next_action": "Dispatch submission/timestamp ownership, coverage fallback, and direct-surface probes while the HLSL artifact-provenance decision proceeds independently.",
       "started_utc": "2026-08-16T00:00:00Z",
-      "updated_utc": "2026-08-16T00:00:00Z"
+      "updated_utc": "2026-08-16T00:00:00Z",
+      "retrospective": {
+        "friction": "Initial capability receipts omitted execution identity, binary blend vectors exercised selectors rather than rounding, and staging geometry was populated before success was known.",
+        "cause": "The first card implementation optimized for getting real GPU execution before its evidence schema and discriminating vectors were adversarially reviewed.",
+        "prevention": "Future GPU cards start from configuration-bound typed receipts and independently fixed fractional or edge-case vectors, with outcome payloads that cannot represent success-only fields in failure states.",
+        "estimated_minutes_saved": 25
+      }
     }
   ]
 }
