@@ -140,6 +140,12 @@ evidence cannot silently close an enhancement claim. The exact host-control
 families and their live/recreate/game-cooperation boundaries are recorded in
 `docs/RT64-RUNTIME-CONTROLS.md`.
 
+The Rust replacement is tracked as a proof-driven program in
+`docs/RENDER-WGPU-PORT-PLAN.md`. Its exact dual-pin source authority is generated
+in `docs/RT64-PORT-AUTHORITY.md`. The plan keeps performance evidence as a
+separate milestone; removal of the C++ FFI boundary by itself is neither a
+parity result nor a speed result.
+
 ### Discovery corpus
 
 Function-boundary discovery is graded against decomp answer keys under a strict

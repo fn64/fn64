@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RT64 port workflow dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    margin: 0; padding: 1.25rem; line-height: 1.5;
+    background: light-dark(#f7f7f8, #14161a); color: light-dark(#1a1a1a, #e8e8e8);
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.15rem; margin-top: 2rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+  .goal { max-width: 70ch; opacity: 0.85; }
+  .badge {
+    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em;
+    border: 1px solid currentColor;
+  }
+  .state-ready { color: #0969da; }
+  .state-running { color: #9a6700; }
+  .state-review { color: #8250df; }
+  .state-blocked { color: #cf222e; }
+  .state-rejected { color: #6e7781; }
+  .state-integrated { color: #1a7f37; }
+  .state-planned { color: #6e7781; }
+  table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1rem; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid light-dark(#ddd, #333); vertical-align: top; }
+  th { font-size: 0.8rem; text-transform: uppercase; opacity: 0.7; }
+  .muted { opacity: 0.6; font-style: italic; }
+  .tickets { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1rem; }
+  .ticket {
+    border: 1px solid light-dark(#ddd, #333); border-radius: 8px; padding: 0.9rem 1rem;
+    background: light-dark(#fff, #1c1f24);
+  }
+  .ticket header h3 { margin: 0 0 0.25rem; font-size: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+  .objective { margin: 0 0 0.5rem; }
+  dl.meta { display: grid; grid-template-columns: auto 1fr; gap: 0.15rem 0.6rem; margin: 0.5rem 0; font-size: 0.9rem; }
+  dl.meta dt { opacity: 0.65; }
+  dl.meta dd { margin: 0; }
+  .blocker { color: #cf222e; }
+  details summary { cursor: pointer; font-weight: 600; margin-top: 0.5rem; }
+  ul { margin: 0.3rem 0; padding-left: 1.2rem; }
+  .filters { margin: 0.75rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .filters select { padding: 0.3rem 0.5rem; }
+  @media (max-width: 480px) {
+    .tickets { grid-template-columns: 1fr; }
+    dl.meta { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<h1>RT64 port workflow dashboard</h1>
+<p class="goal">Complete the full RT64-to-Rust port: remove fn64&#x27;s project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.</p>
+<p>
+  <span class="badge state-running">IN PROGRESS</span>
+  <code>main</code> &rarr; <code>origin/main</code>
+  &middot; updated <code>2026-08-16T00:00:00Z</code>
+</p>
+
+<h2>Milestones</h2>
+<table>
+  <thead><tr><th>ID</th><th>state</th><th>title</th><th>exit headline</th><th>tickets</th></tr></thead>
+  <tbody><tr><td><code>M0</code></td><td><span class="badge state-running">IN PROGRESS</span></td><td>Authority, evidence, and baseline</td><td>Immutable port manifest and matched correctness/performance baseline.</td><td>INTEGRATED:2, RUNNING:2</td></tr><tr><td><code>M1</code></td><td><span class="badge state-running">IN PROGRESS</span></td><td>Semantic IR and renderer seam v2</td><td>Owned packets/tickets work through the reference and compatibility paths.</td><td>INTEGRATED:1, RUNNING:1</td></tr><tr><td><code>M2</code></td><td><span class="badge state-running">IN PROGRESS</span></td><td>Cross-backend wgpu feasibility</td><td>Hard GPU requirements proven portable, bounded-fallback, or blocked, with captures and adapter/driver identity.</td><td>INTEGRATED:1, RUNNING:1</td></tr><tr><td><code>M3</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Raw-DPC vertical slice</td><td>Real LLE commands reach native target, FullSync, VI, and visible surface.</td><td>no tickets</td></tr><tr><td><code>M4</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Base RDP and framebuffer correctness</td><td>Full native RDP/framebuffer matrix closes.</td><td>no tickets</td></tr><tr><td><code>M5</code></td><td><span class="badge state-planned">PLANNED</span></td><td>GBI and deferred RSP</td><td>Admitted HLE families match their declared authorities.</td><td>no tickets</td></tr><tr><td><code>M6</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Allocation-free asynchronous performance spine</td><td>Hot-path structural budgets hold and matched A/B is faster.</td><td>no tickets</td></tr><tr><td><code>M7</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Base-renderer certification</td><td>Behavior matrix and private full-ROM gates close without broadened admission.</td><td>no tickets</td></tr><tr><td><code>M8</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Complete RT64 feature parity</td><td>Every required public feature-inventory row closes for Rust.</td><td>no tickets</td></tr><tr><td><code>M9</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Typed CPU/GPU coherence optimization</td><td>Deferred bounded readback is proven for all guest observers.</td><td>no tickets</td></tr><tr><td><code>M10</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Platform certification and cutover</td><td>Rust is default; C++ is certification-only, then removable.</td><td>no tickets</td></tr><tr><td><code>M11</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Post-parity modernization</td><td>Extensions ship without weakening reference behavior.</td><td>no tickets</td></tr><tr><td><code>M12</code></td><td><span class="badge state-planned">PLANNED</span></td><td>Hybrid ray tracing and authored path tracing</td><td>Capable 3D workloads gain optional traced lighting with exact raster fallback.</td><td>no tickets</td></tr></tbody>
+</table>
+
+<h2>Tickets</h2>
+<div class="filters">
+  <label>State
+    <select id="state-filter">
+      <option value="">all</option>
+      <option value="INTEGRATED">INTEGRATED</option><option value="RUNNING">RUNNING</option>
+    </select>
+  </label>
+  <label>Milestone
+    <select id="milestone-filter">
+      <option value="">all</option>
+      <option value="M0">M0</option><option value="M1">M1</option><option value="M2">M2</option><option value="M3">M3</option><option value="M4">M4</option><option value="M5">M5</option><option value="M6">M6</option><option value="M7">M7</option><option value="M8">M8</option><option value="M9">M9</option><option value="M10">M10</option><option value="M11">M11</option><option value="M12">M12</option>
+    </select>
+  </label>
+</div>
+<div class="tickets" id="ticket-list">
+
+<article class="ticket" data-state="RUNNING" data-milestone="M0">
+  <header>
+    <h3><code>M0.3</code> <span class="badge state-running">RUNNING</span></h3>
+    <p class="objective">Capture the matched RT64 CPU/GPU render baseline: route, snapshot/report/API-identity seams, and a fresh-process five-pair counterbalanced runner.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M0</code></dd>
+    <dt>Profile / effort / model</dt><dd>F / xhigh / GPT-5.6 Sol</dd>
+    <dt>Owner</dt><dd>integration lead</dd>
+    <dt>Branch</dt><dd><code>feat/egui-settings-drawer-hud</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd>none</dd>
+    <dt>Writable paths</dt><dd><code>crates/fn64-abi/src/frame_census.rs</code>, <code>crates/fn64-certification</code>, <code>crates/fn64-shell</code>, <code>tools/run_rt64_render_baseline.py</code>, <code>docs/RT64-RENDER-MEASUREMENT.md</code>, <code>docs/rt64-render-measurement-schema.json</code></dd>
+    <dt>Elapsed</dt><dd>1d0h (started 2026-08-15T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>1/2 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, then run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.</p>
+  <details open><summary>Findings</summary><ul><li>fn64-abi exposes an owned raw frame-census measurement snapshot; fn64-certification builds typed control and explicit-partial development reports.</li><li>The headless route runs Shell::pump_one_frame outside the winit/pixels compositor; five counterbalanced control/instrumented pairs launch as fresh processes.</li><li>A control run can become comparison_ready only after the post-create verifier completes and both horizon endpoint observations are available and unchanged.</li><li>No real matched baseline has been recorded; the private linked-build and native-identity gates remain open.</li><li>This is an open evidence gap, not a stall: the C-program receipt and native device query have no linked private-game validation, so no real matched baseline exists yet. It blocks the performance/parity claim, not independent implementation, so the ticket remains RUNNING rather than BLOCKED.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td><code>cargo nextest run -p fn64-abi --no-default-features</code></td><td>1</td><td>10</td><td>deterministic</td></tr><tr><td><code>tools/check_rt64_render_measurement.py</code></td><td>10</td><td>10</td><td>deterministic</td></tr></tbody></table>
+  </details>
+</article>
+<article class="ticket" data-state="INTEGRATED" data-milestone="M0">
+  <header>
+    <h3><code>A0.1</code> <span class="badge state-integrated">INTEGRATED</span></h3>
+    <p class="objective">Generate the machine-checked RT64 source/task denominator: assign every allowed project-owned host/shader module a milestone, workstream, port state, evidence state, and exclusive task-card owner.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M0</code></dd>
+    <dt>Profile / effort / model</dt><dd>M / medium / GPT-5.6 Luna</dd>
+    <dt>Owner</dt><dd>inventory/tooling writer</dd>
+    <dt>Branch</dt><dd><code>port/rt64-inventory-v2</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd>none</dd>
+    <dt>Writable paths</dt><dd><code>docs/rt64-port-inventory.json</code>, <code>docs/RT64-PORT-INVENTORY.md</code>, <code>tools/rt64_port_inventory.py</code></dd>
+    <dt>Elapsed</dt><dd>1d0h (started 2026-08-15T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>2/2 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Dispatch disjoint decode, TMEM, framebuffer, and GPU-probe task cards from the merged checked denominator.</p>
+  <details open><summary>Findings</summary><ul><li>The dual-pin inventory schema fn64.rt64-port-inventory.v2 records 276 files across the included prefixes with per-file oracle/port digests, include edges, and non-exhaustive declaration/definition hints.</li><li>6 files are modified between the oracle and accepted port-source commits; 270 are unchanged; 0 added or removed.</li><li>Every file carries a task_card with id/outcome/authority/owner_lane/recommended_profile/writable_paths/non_goals/baseline_command/exit_gate/evidence_state/claim_status.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td><code>tools/rt64_port_inventory.py --self-test</code></td><td>10</td><td>10</td><td>deterministic</td></tr><tr><td><code>tools/rt64_port_inventory.py --check</code></td><td>10</td><td>10</td><td>deterministic</td></tr></tbody></table>
+  </details>
+</article>
+<article class="ticket" data-state="INTEGRATED" data-milestone="M1">
+  <header>
+    <h3><code>M1.1</code> <span class="badge state-integrated">INTEGRATED</span></h3>
+    <p class="objective">Land the fn64-render-ir ownership spine: owned lifetime, FullSync ordering, DRAM/XBUS raw-command separation, resource journals, and move-only decode/submission/completion/commit transitions.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M1</code></dd>
+    <dt>Profile / effort / model</dt><dd>I / xhigh / GPT-5.6 Sol</dd>
+    <dt>Owner</dt><dd>semantic-IR writer</dd>
+    <dt>Branch</dt><dd><code>port/render-ir-spine</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd>none</dd>
+    <dt>Writable paths</dt><dd><code>crates/fn64-render-ir</code></dd>
+    <dt>Elapsed</dt><dd>1d0h (started 2026-08-15T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>1/1 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Place the three capabilities with their real queue/backend/guest-memory owners and exercise the cross-crate lifecycle in M1.2.</p>
+  <details open><summary>Findings</summary><ul><li>The first candidate was rejected because tickets self-issued completion/commit authority, CMD_END/FullSync/interrupt order was lossy, installed memory bounds were erased, aggregate bounds were unsafe, journal effects were contradictory, and hostile records could allocate before validation.</li><li>The accepted crate separates queue/completion/guest-commit capabilities, uses effect-bearing receipts, preserves exact command and DP observation sequences and installed memory layout, enforces aggregate bounds and a strict resource-purpose matrix, and preflights hostile record geometry before allocation.</li><li>Independent review, strict clippy, documentation lint, compile-fail tests, and the 10-run deterministic bar are closed. Cross-crate placement of those authorities is intentionally tracked by M1.2 rather than hidden inside this crate.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td><code>cargo test -p fn64-render-ir --no-fail-fast</code></td><td>10</td><td>10</td><td>deterministic</td></tr></tbody></table>
+  </details>
+</article>
+<article class="ticket" data-state="INTEGRATED" data-milestone="M2">
+  <header>
+    <h3><code>M2.1</code> <span class="badge state-integrated">INTEGRATED</span></h3>
+    <p class="objective">Run the primary-platform Metal hard-feature probe on pinned wgpu 30: adapter identity, dual-source blending, texture-array access, required formats, timestamps, submission ordering, and bounded fallback classification.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M2</code></dd>
+    <dt>Profile / effort / model</dt><dd>P / high / GPT-5.6 Terra</dd>
+    <dt>Owner</dt><dd>GPU/render audit lane</dd>
+    <dt>Branch</dt><dd><code>port/m2-metal-caps</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd>none</dd>
+    <dt>Writable paths</dt><dd><code>probes/m2-wgpu-metal-headless</code></dd>
+    <dt>Elapsed</dt><dd>1d0h (started 2026-08-15T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>2/2 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Execute the advertised capability-specific semantic, format-I/O, submission, coverage, and surface cards before classifying portability or fallback policy.</p>
+  <details open><summary>Findings</summary><ul><li>The selected probe baseline is direct wgpu 30.0.0 rather than the shell&#x27;s transitive wgpu 0.19 stack.</li><li>Raw capability and semantics probes are independent of M1; only the later submission-ticket lifecycle integration depends on M1.1.</li><li>The Apple M5 Pro runtime receipt advertises every required hard-feature row, including partially-bound binding arrays, while optional timestamp writes inside encoders and passes are absent. These are adapter advertisements plus a basic copy/readback execution, not semantic parity claims.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td><code>cargo test --locked --all-targets</code></td><td>1</td><td>1</td><td>single</td></tr><tr><td><code>./target/debug/metal_caps --require --iterations 1</code></td><td>10</td><td>10</td><td>deterministic</td></tr></tbody></table>
+  </details>
+</article>
+<article class="ticket" data-state="INTEGRATED" data-milestone="M0">
+  <header>
+    <h3><code>A0.2</code> <span class="badge state-integrated">INTEGRATED</span></h3>
+    <p class="objective">Build the canonical strict status/ticket manifest and a dependency-free Python generator/validator rendering a terminal view, generated Markdown, and a self-contained responsive local HTML workflow dashboard.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M0</code></dd>
+    <dt>Profile / effort / model</dt><dd>M / high / Claude Sonnet 5</dd>
+    <dt>Owner</dt><dd>dashboard writer</dd>
+    <dt>Branch</dt><dd><code>port/rt64-dashboard</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd>none</dd>
+    <dt>Writable paths</dt><dd><code>docs/rt64-port-status-schema.json</code>, <code>docs/rt64-port-status.json</code>, <code>tools/rt64_port_dashboard.py</code>, <code>tools/test_rt64_port_dashboard.py</code>, <code>docs/RT64-PORT-DASHBOARD.md</code>, <code>docs/rt64-port-dashboard.html</code></dd>
+    <dt>Elapsed</dt><dd>1d0h (started 2026-08-15T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>2/2 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Keep ticket states, blockers, run counts, and retrospectives current as each reviewed branch merges or rebases.</p>
+  <details open><summary>Findings</summary><ul><li>The manifest and schema are new and separate from docs/rt64-port-inventory.json (per-file source denominator) and docs/rt64-port-authority.json (license/source pin); this ticket adds the missing per-ticket workflow layer the plan&#x27;s status capsule currently only carries as prose.</li><li>States are restricted to the exact orchestration-doc vocabulary (READY/RUNNING/READY_FOR_REVIEW/BLOCKED/REJECTED/INTEGRATED for tickets; PLANNED/READY/IN PROGRESS/BLOCKED/COMPLETE for milestones); the generator never infers a state from code presence.</li><li>--serve binds 127.0.0.1 only, refuses any other bind host, and serves only the generated dashboard directory read-only.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td><code>python3 tools/test_rt64_port_dashboard.py</code></td><td>10</td><td>10</td><td>deterministic</td></tr><tr><td><code>python3 tools/rt64_port_dashboard.py --check</code></td><td>10</td><td>10</td><td>deterministic</td></tr></tbody></table>
+  </details>
+  <details><summary>Retrospective</summary><ul><li><strong>Friction:</strong> The plan/orchestration docs carry per-ticket fields (id, profile, model, dependencies, writable_paths, state) only as prose in a status capsule and handoff template, so a session must re-read the whole plan file to reconstruct current ticket state.</li><li><strong>Cause:</strong> No single machine-checked file previously owned the ticket-level denominator; docs/rt64-port-inventory.json owns per-source-file task cards, not per-ticket workflow state.</li><li><strong>Prevention:</strong> This manifest and its --check validator give future sessions one strict, mechanically checked ticket table instead of re-deriving it from prose; validation now rejects review-ready claims before every declared run bar is met.</li><li><strong>Est. minutes saved:</strong> 15</li></ul></details>
+</article>
+<article class="ticket" data-state="RUNNING" data-milestone="M0">
+  <header>
+    <h3><code>A0.3</code> <span class="badge state-running">RUNNING</span></h3>
+    <p class="objective">Land the backend-neutral conformance ladder: one typed fixture contract, RT64 FFI and Rust delegates, proof-bearing receipts, exact row-state denominator, mutation tests, and a deliberately failing port-progress gate.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M0</code></dd>
+    <dt>Profile / effort / model</dt><dd>F / high / GPT-5.6 Sol</dd>
+    <dt>Owner</dt><dd>conformance-spine writer</dd>
+    <dt>Branch</dt><dd><code>port/rt64-conformance-spine</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd><code>A0.1</code></dd>
+    <dt>Writable paths</dt><dd><code>crates/fn64-render-conformance</code>, <code>tools/check_rt64_port_parity.py</code>, <code>docs/rt64-port-parity.json</code>, <code>docs/RT64-PORT-PARITY.md</code></dd>
+    <dt>Elapsed</dt><dd>0m (started 2026-08-16T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>0/0 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Prove one RT64 pass, one explicit divergence/unavailable row, one Rust-pending row, and negative receipt mutations end to end on the active clean branch.</p>
+  <details open><summary>Findings</summary><ul><li>RT64 is an executable compatibility delegate, not universal correctness authority; known defects use hardware or permitted reference authority.</li><li>Ordinary CI must execute every closed row and protect the pending denominator, while port-progress remains nonzero until every required Rust row passes.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td colspan="4" class="muted">no verification runs recorded</td></tr></tbody></table>
+  </details>
+</article>
+<article class="ticket" data-state="RUNNING" data-milestone="M1">
+  <header>
+    <h3><code>M1.2</code> <span class="badge state-running">RUNNING</span></h3>
+    <p class="objective">Place IR authority at real crate boundaries: validated ABI capture, distinct queue submission, backend-owned effect completion, and guest-memory-owner commit with rejection leaving no architectural publication.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M1</code></dd>
+    <dt>Profile / effort / model</dt><dd>F / xhigh / GPT-5.6 Sol</dd>
+    <dt>Owner</dt><dd>cross-crate IR integration writer</dd>
+    <dt>Branch</dt><dd><code>port/render-ir-integration</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd><code>M1.1</code></dd>
+    <dt>Writable paths</dt><dd><code>crates/fn64-abi</code>, <code>crates/fn64-render</code>, <code>crates/fn64-render-ir</code></dd>
+    <dt>Elapsed</dt><dd>0m (started 2026-08-16T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>0/0 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Prove success and rejection through distinct owners, then independently review whether the types prevent early completion, cross-authority reuse, duplicate commit, and publication on failure.</p>
+  <details open><summary>Findings</summary><ul><li>An ephemeral packet or digest may exist as backend input before success; the prohibited state is a retained receipt, trace record, guest mutation, or architectural observation for rejected or uncommitted work.</li><li>The first slice is an executable synthetic mechanism proof around the permitted ReferenceBackend, not a claim that production raw-DPC dispatch has already migrated.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td colspan="4" class="muted">no verification runs recorded</td></tr></tbody></table>
+  </details>
+</article>
+<article class="ticket" data-state="RUNNING" data-milestone="M2">
+  <header>
+    <h3><code>M2.2</code> <span class="badge state-running">RUNNING</span></h3>
+    <p class="objective">Execute Metal hard-feature semantics and format-I/O fixtures so adapter advertisements become exact behavioral evidence or explicit bounded fallback findings.</p>
+  </header>
+  <dl class="meta">
+    <dt>Milestone</dt><dd><code>M2</code></dd>
+    <dt>Profile / effort / model</dt><dd>P / high / GPT-5.6 Sol</dd>
+    <dt>Owner</dt><dd>Metal semantics writer</dd>
+    <dt>Branch</dt><dd><code>port/m2-metal-semantics</code> &rarr; <code>main</code></dd>
+    <dt>Dependencies</dt><dd><code>M2.1</code></dd>
+    <dt>Writable paths</dt><dd><code>probes/m2-wgpu-metal-headless</code></dd>
+    <dt>Elapsed</dt><dd>0m (started 2026-08-16T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
+    <dt>Verification bar met</dt><dd>0/0 runs</dd>
+  </dl>
+  <p><strong>Next action:</strong> Run exact native and fallback fixtures for 10 host processes and report unsupported features distinctly from semantic mismatches.</p>
+  <details open><summary>Findings</summary><ul><li>Capability bits alone do not close a renderer requirement; each native and fallback path must execute and read back exact bytes.</li><li>This ticket owns masks and wrapping arithmetic, TMEM-like addressing, nonuniform arrays, dual-source/manual blending, explicit format conversions, and rejection of unsupported reinterpretation.</li></ul></details>
+  <details><summary>Verification runs</summary>
+    <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
+    <tbody><tr><td colspan="4" class="muted">no verification runs recorded</td></tr></tbody></table>
+  </details>
+</article>
+</div>
+
+<script>
+  const stateFilter = document.getElementById("state-filter");
+  const milestoneFilter = document.getElementById("milestone-filter");
+  const cards = Array.from(document.querySelectorAll(".ticket"));
+  function applyFilters() {
+    const s = stateFilter.value;
+    const m = milestoneFilter.value;
+    for (const card of cards) {
+      const showState = !s || card.dataset.state === s;
+      const showMilestone = !m || card.dataset.milestone === m;
+      card.style.display = (showState && showMilestone) ? "" : "none";
+    }
+  }
+  stateFilter.addEventListener("change", applyFilters);
+  milestoneFilter.addEventListener("change", applyFilters);
+</script>
+</body>
+</html>

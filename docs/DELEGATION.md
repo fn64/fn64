@@ -57,6 +57,13 @@ and verifies expensively is correct; the reverse is how V1a-class errors ship.
   citations. Anything where the gate is `scripts/lint-docs.py` or
   `check-nmr-surface.py` and the answer is objectively right or wrong.
 
+Every delegated slice completes the same four-step loop: the writer reports a
+typed ticket status and exact evidence; an independent agent reviews the
+invariants and negative cases; the lead reruns the authoritative gate on the
+clean branch; then the accepted commit is merged and dependent branches rebase
+before taking new work. A pull request is optional, but review and
+synchronization are not.
+
 **Never delegate to any tier:** eye-gates (the user's, batched — an agent
 never self-certifies render or audio output), and the sourcing/capture
 blockers in `UNIVERSAL-RUNTIME-PLAN.md` §4.0, which are not model-shaped work
