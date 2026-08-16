@@ -15,14 +15,16 @@
 //! after exact GPU and guest lifecycle evidence. RT64 is not hardware authority
 //! for this module.
 
+mod execute;
 mod physical;
 mod state;
 mod types;
 mod wire;
 
+pub use execute::{prepare_load_tile, ExecutedLoadTile, LoadTileExecutionError, PreparedLoadTile};
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
-    PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
+    PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,
     PhysicalTmemPublicationAuthority, PhysicalTmemState, PhysicalTmemStateIdentity,
     PhysicalTmemTransactionIdentity, StagedTmemTransaction,
 };

@@ -15,6 +15,14 @@
 //! can be asserted only inside this crate, carry an explicit eight-lane
 //! defined mask, and are move-only/exact-load-bound; M4.2b owns captured-source
 //! mapping.
+//! M4.2b executes one exact checked LoadTile from the submitted packet's
+//! owned guest-read set into that M4.2a transaction. Preparation binds every
+//! global source access index, operation, range, and byte count; execution is
+//! row-major in complete 64-bit words, never spills a row tail, exchanges
+//! linear odd-row halves, and maps RGBA32 texel channels into the low/high
+//! 2 KiB banks. It returns only transaction-local state and ordered physical
+//! fragment descriptors. Durable publication and backend reports remain
+//! later owners.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -44,6 +52,18 @@
 //! let physical = physical();
 //! let first = staged.stage_word(physical);
 //! let second = staged.stage_word(physical);
+//! # drop((first, second));
+//! ```
+//!
+//! A prepared LoadTile is one-use operation authority:
+//!
+//! ```compile_fail
+//! use fn64_render_wgpu::{PreparedLoadTile, StagedTmemTransaction};
+//! # fn prepared() -> PreparedLoadTile { unimplemented!() }
+//! # fn staged() -> StagedTmemTransaction { unimplemented!() }
+//! let prepared = prepared();
+//! let first = prepared.execute(staged());
+//! let second = prepared.execute(staged());
 //! # drop((first, second));
 //! ```
 //!
@@ -209,12 +229,13 @@ pub use targets::{
     UninitializedNativeRaster,
 };
 pub use tmem::{
-    CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
-    PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
-    PhysicalTmemPublicationAuthority, PhysicalTmemState, PhysicalTmemStateIdentity,
-    PhysicalTmemTransactionIdentity, StagedTmemTransaction, TextureImage, TileAddressMode,
-    TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TmemDxt,
-    TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch, TmemLoadKind,
-    TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemState, TmemTransferLayout,
-    TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord, TmemWordAddress,
+    prepare_load_tile, CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, ExecutedLoadTile,
+    GpuBoundTmemTransaction, LoadTileExecutionError, PendingTmemTransaction, PhysicalTmemBinding,
+    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority,
+    PhysicalTmemState, PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity,
+    PreparedLoadTile, StagedTmemTransaction, TextureImage, TileAddressMode, TileCoordinate,
+    TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TmemDxt, TmemLoad,
+    TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity,
+    TmemLoadSourcePlan, TmemState, TmemTransferLayout, TmemTransferPhysicalWord, TmemTransferPlan,
+    TmemTransferWord, TmemWordAddress,
 };
