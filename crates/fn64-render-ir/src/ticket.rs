@@ -410,6 +410,15 @@ pub struct GuestCommitAuthority {
 }
 
 impl GuestCommitAuthority {
+    /// Queue identity this role is authorized to complete.
+    ///
+    /// Integration owners use this value to bind a live-memory transaction
+    /// to the same lifecycle before any renderer work begins. It exposes an
+    /// identity, not receipt-issuing authority.
+    pub const fn queue_identity(&self) -> QueueIdentity {
+        self.queue
+    }
+
     pub fn issue(
         &mut self,
         complete: &GpuCompleteTicket,

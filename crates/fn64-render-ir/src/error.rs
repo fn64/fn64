@@ -147,6 +147,7 @@ pub enum ValidationError {
     },
     ReceiptAuthorityMismatch,
     ReceiptEffectMismatch,
+    GuestMemoryPreimageMismatch,
     EffectForReadOnlyAccess,
     EffectByteCountMismatch {
         expected: u32,
@@ -338,6 +339,7 @@ impl fmt::Display for ValidationError {
             Self::SubmissionOrdinalExhausted { queue } => write!(formatter, "submission ordinal space is exhausted for queue {queue}"),
             Self::ReceiptAuthorityMismatch => formatter.write_str("receipt was issued by a different lifecycle role authority"),
             Self::ReceiptEffectMismatch => formatter.write_str("receipt effects do not match the active workload or backend effects"),
+            Self::GuestMemoryPreimageMismatch => formatter.write_str("guest memory no longer matches the exact captured transaction preimage"),
             Self::EffectForReadOnlyAccess => formatter.write_str("a completed write cannot name a read-only resource access"),
             Self::EffectByteCountMismatch { expected, actual } => write!(formatter, "completed write reports {actual} bytes; declared region requires {expected}"),
             Self::EffectCountMismatch { field, expected, actual } => write!(formatter, "{field} count is {actual}; exact journal requires {expected}"),

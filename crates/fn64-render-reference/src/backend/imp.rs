@@ -47,6 +47,7 @@ impl ReferenceBackend {
             continuation: None,
             next_continuation_token: 1,
             raw_rdp_scratch: Vec::new(),
+            ir_rdram_write_trace: None,
         }
     }
 
@@ -747,12 +748,22 @@ impl ReferenceBackend {
                                 fb,
                                 &mut self.rdram_hidden_bits,
                             )?;
+                            trace_ir_depth_image_write(
+                                &mut self.ir_rdram_write_trace,
+                                depth_target,
+                                fb,
+                            );
                         }
                         state.depth_dirty = false;
                     }
                     if state.dirty {
                         if let Some(previous) = state.active_target {
                             commit_color_image(rdram, previous, fb, &mut self.rdram_hidden_bits);
+                            trace_ir_color_image_write(
+                                &mut self.ir_rdram_write_trace,
+                                previous,
+                                fb,
+                            );
                         }
                     }
                     // Only a target with a known layout can be loaded into the
@@ -782,6 +793,11 @@ impl ReferenceBackend {
                                 fb,
                                 &mut self.rdram_hidden_bits,
                             )?;
+                            trace_ir_depth_image_write(
+                                &mut self.ir_rdram_write_trace,
+                                previous,
+                                fb,
+                            );
                         }
                         state.depth_dirty = false;
                     }
@@ -917,12 +933,22 @@ impl ReferenceBackend {
                         state.active_target.filter(|t| t.layout().is_some() && !t.is_unbacked_rdram(rdram.len()))
                     {
                         commit_color_image(rdram, target, fb, &mut self.rdram_hidden_bits);
+                        trace_ir_color_image_write(
+                            &mut self.ir_rdram_write_trace,
+                            target,
+                            fb,
+                        );
                     }
                     state.dirty = false;
                 }
                 if state.depth_dirty {
                     if let Some(target) = state.active_depth_image {
                         commit_rdp_depth_image(rdram, target, fb, &mut self.rdram_hidden_bits)?;
+                        trace_ir_depth_image_write(
+                            &mut self.ir_rdram_write_trace,
+                            target,
+                            fb,
+                        );
                     }
                     state.depth_dirty = false;
                 }
@@ -946,11 +972,13 @@ impl ReferenceBackend {
             // latched target is rejected before it can dirty anything.
             if let Some(target) = state.active_target.filter(|t| t.layout().is_some() && !t.is_unbacked_rdram(rdram.len())) {
                 commit_color_image(rdram, target, fb, &mut self.rdram_hidden_bits);
+                trace_ir_color_image_write(&mut self.ir_rdram_write_trace, target, fb);
             }
         }
         if state.depth_dirty {
             if let Some(target) = state.active_depth_image {
                 commit_rdp_depth_image(rdram, target, fb, &mut self.rdram_hidden_bits)?;
+                trace_ir_depth_image_write(&mut self.ir_rdram_write_trace, target, fb);
             }
         }
         Ok(())

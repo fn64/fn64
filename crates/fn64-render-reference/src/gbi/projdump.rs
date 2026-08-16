@@ -23,6 +23,9 @@ pub fn note_pz(pz: f32) {
 }
 
 pub fn on() -> bool {
+    if crate::speculative_observations_suppressed() {
+        return false;
+    }
     if !INIT.swap(true, Ordering::Relaxed) {
         ENABLED.store(crate::debug_flag("FN64_DUMP_PROJ"), Ordering::Relaxed);
     }

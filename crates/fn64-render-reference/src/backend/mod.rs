@@ -112,6 +112,11 @@ pub struct ReferenceBackend {
     /// tasks/route reuses one allocation's capacity instead of `to_vec()`ing
     /// a fresh 8 MiB RDRAM copy from scratch.
     raw_rdp_scratch: Vec<u8>,
+    /// Exact visible RDRAM byte ranges written by a synthetic IR execution.
+    /// `None` on every production path. The adapter enables it only on its
+    /// disposable backend clone so command staging and equal-value renderer
+    /// writes remain distinguishable without any process-global observer.
+    ir_rdram_write_trace: Option<Vec<(usize, usize)>>,
 }
 
 #[derive(Clone)]
@@ -168,9 +173,12 @@ impl Default for ReferenceBackend {
 mod hidden_bits;
 mod vi_source;
 mod imp;
+mod ir_adapter;
 mod render_backend;
 mod validate;
 mod framebuffer_io;
+
+pub use ir_adapter::ReferenceIrRawDpcAdapter;
 
 use hidden_bits::*;
 

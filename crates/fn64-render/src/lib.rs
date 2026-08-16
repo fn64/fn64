@@ -37,6 +37,7 @@ mod microcode;
 mod microcode_identity;
 mod raw_dpc_batch;
 mod rdp_completion;
+mod render_ir;
 mod settings;
 pub mod vi_public_filters;
 mod vi_source;
@@ -46,6 +47,7 @@ use std::{
     num::{NonZeroU32, NonZeroU64},
 };
 
+pub use fn64_render_ir as ir;
 pub use geometry_task_inspection::{
     inspect_geometry_task, GeometryTaskInspection, GeometryTaskInspectionPolicy,
     TaskAdmissionRawWindow, TaskAdmissionRawWindowSize,
@@ -65,6 +67,11 @@ pub use raw_dpc_batch::{
     RawDpcSubmissionError, RawDpcSubmissionIdentity,
 };
 pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
+pub use render_ir::{
+    decode_raw_dpc_capture, ir_effect_content_digest, CommittedSemanticWorkloadRecord,
+    IrGuestMemoryPreimage, IrGuestMemorySnapshot, IrRawDpcBackendCompletion,
+    StagedIrRdramWrite,
+};
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,
     RenderDisplayBuffering, RenderEmulatorSettings, RenderEnhancementSettings, RenderFiltering,

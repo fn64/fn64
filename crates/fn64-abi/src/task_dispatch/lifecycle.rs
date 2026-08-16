@@ -1,5 +1,194 @@
 use super::*;
 
+/// Queue publication owner for the synthetic raw-DPC render-IR integration
+/// path. Production DPC scheduling still uses [`LiveDpcTransaction`].
+#[cfg(test)]
+pub(crate) struct RawDpcIrSubmissionOwner {
+    queue: fn64_render::ir::SubmissionQueue,
+}
+
+#[cfg(test)]
+impl RawDpcIrSubmissionOwner {
+    pub(crate) const fn new(queue: fn64_render::ir::SubmissionQueue) -> Self {
+        Self { queue }
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        decoded: fn64_render::ir::DecodedTicket,
+    ) -> Result<fn64_render::ir::SubmittedTicket, fn64_render::ir::ValidationError> {
+        self.queue.submit(decoded)
+    }
+}
+
+/// Guest-memory owner for the synthetic raw-DPC render-IR integration path.
+///
+/// The renderer supplies only staged bytes plus a backend-complete ticket.
+/// Every range and content digest is checked before the matching guest receipt
+/// is consumed. Copyback then has no fallible operation left, so live memory
+/// cannot change on any receipt or effect mismatch.
+#[cfg(test)]
+pub(crate) struct RawDpcIrGuestCommitOwner {
+    authority: fn64_render::ir::GuestCommitAuthority,
+    next_transaction_ordinal: u64,
+}
+
+#[cfg(test)]
+impl RawDpcIrGuestCommitOwner {
+    pub(crate) const fn new(authority: fn64_render::ir::GuestCommitAuthority) -> Self {
+        Self {
+            authority,
+            next_transaction_ordinal: 0,
+        }
+    }
+
+    pub(crate) fn begin<'owner, 'memory>(
+        &'owner mut self,
+        live_rdram: &'memory mut [u8],
+        submitted: &fn64_render::ir::SubmittedTicket,
+    ) -> Result<
+        RawDpcIrCapturedLiveMemoryTransaction<'owner, 'memory>,
+        fn64_render::ir::ValidationError,
+    > {
+        if submitted.queue() != self.authority.queue_identity() {
+            return Err(fn64_render::ir::ValidationError::ReceiptAuthorityMismatch);
+        }
+        let ordinal = self.next_transaction_ordinal;
+        let next = ordinal.checked_add(1).ok_or(
+            fn64_render::ir::ValidationError::NumericOverflow {
+                field: "ABI raw-DPC IR live-memory transaction ordinal",
+            },
+        )?;
+        let snapshot = fn64_render::IrGuestMemorySnapshot::try_capture(
+            self.authority.queue_identity(),
+            ordinal,
+            submitted.identity(),
+            submitted.ordinal(),
+            live_rdram,
+        )?;
+        self.next_transaction_ordinal = next;
+        Ok(RawDpcIrCapturedLiveMemoryTransaction {
+            authority: &mut self.authority,
+            live_rdram,
+            preimage: snapshot.preimage(),
+            snapshot,
+        })
+    }
+}
+
+/// Move-only ABI ownership of one exact live allocation from capture through
+/// guest commit. The exclusive borrow makes allocation substitution
+/// impossible in safe code; the transaction/preimage binding also rejects a
+/// stale completion after the transaction is dropped or memory is changed by
+/// an ABI-owned device path.
+#[cfg(test)]
+pub(crate) struct RawDpcIrCapturedLiveMemoryTransaction<'owner, 'memory> {
+    authority: &'owner mut fn64_render::ir::GuestCommitAuthority,
+    live_rdram: &'memory mut [u8],
+    preimage: fn64_render::IrGuestMemoryPreimage,
+    snapshot: fn64_render::IrGuestMemorySnapshot,
+}
+
+#[cfg(test)]
+impl<'owner, 'memory> RawDpcIrCapturedLiveMemoryTransaction<'owner, 'memory> {
+    pub(crate) fn transfer_snapshot(
+        self,
+    ) -> (
+        RawDpcIrSnapshotTransferredTransaction<'owner, 'memory>,
+        fn64_render::IrGuestMemorySnapshot,
+    ) {
+        (
+            RawDpcIrSnapshotTransferredTransaction {
+                authority: self.authority,
+                live_rdram: self.live_rdram,
+                preimage: self.preimage,
+            },
+            self.snapshot,
+        )
+    }
+}
+
+/// ABI transaction state after its one immutable snapshot has moved to the
+/// renderer. Only this state can consume a matching completion and commit.
+#[cfg(test)]
+pub(crate) struct RawDpcIrSnapshotTransferredTransaction<'owner, 'memory> {
+    authority: &'owner mut fn64_render::ir::GuestCommitAuthority,
+    live_rdram: &'memory mut [u8],
+    preimage: fn64_render::IrGuestMemoryPreimage,
+}
+
+#[cfg(test)]
+impl RawDpcIrSnapshotTransferredTransaction<'_, '_> {
+    pub(crate) fn live_rdram_for_intervening_write_test(&mut self) -> &mut [u8] {
+        self.live_rdram
+    }
+
+    pub(crate) fn commit(
+        self,
+        completion: fn64_render::IrRawDpcBackendCompletion,
+    ) -> Result<fn64_render::ir::GuestCommittedTicket, fn64_render::ir::ValidationError> {
+        if completion.guest_preimage() != self.preimage
+            || fn64_render::IrGuestMemoryPreimage::try_capture(
+                self.preimage.queue(),
+                self.preimage.transaction_ordinal(),
+                self.preimage.submission(),
+                self.preimage.submission_ordinal(),
+                self.live_rdram,
+            )? != self.preimage
+        {
+            return Err(fn64_render::ir::ValidationError::GuestMemoryPreimageMismatch);
+        }
+
+        let (complete, completion_preimage, staged) = completion.into_parts();
+        debug_assert_eq!(completion_preimage, self.preimage);
+        let expected_layout = complete.packet().memory_layout().bytes();
+        if self.live_rdram.len() != expected_layout as usize {
+            return Err(fn64_render::ir::ValidationError::MemoryLayoutMismatch {
+                expected: expected_layout,
+            });
+        }
+
+        let mut completed_writes = Vec::with_capacity(staged.len());
+        for write in &staged {
+            let fn64_render::ir::ResourceRegion::Rdram { range, .. } = write.access().region()
+            else {
+                return Err(fn64_render::ir::ValidationError::EffectAccessMismatch {
+                    field: "guest RDRAM copyback",
+                    index: completed_writes.len(),
+                });
+            };
+            let start = range.start().get() as usize;
+            let end = range.end() as usize;
+            if end > self.live_rdram.len() || write.bytes().len() != end - start {
+                return Err(fn64_render::ir::ValidationError::EffectByteCountMismatch {
+                    expected: range.len(),
+                    actual: u32::try_from(write.bytes().len()).unwrap_or(u32::MAX),
+                });
+            }
+            completed_writes.push(write.completed_write());
+        }
+
+        let effects =
+            fn64_render::ir::GuestCommitEffectReport::try_new(&complete, completed_writes)?;
+        let receipt = self.authority.issue(&complete, effects)?;
+        let committed = complete.commit_guest(receipt)?;
+
+        // Interleaving closed here: only the matching backend-effect receipt
+        // can reach this point. `committed` remains local until the copyback
+        // loop finishes, the exclusive `&mut [u8]` prevents a guest observer,
+        // and the preflight above leaves no fallible copy operation.
+        for write in staged {
+            let fn64_render::ir::ResourceRegion::Rdram { range, .. } = write.access().region()
+            else {
+                unreachable!("copyback regions were preflighted above")
+            };
+            self.live_rdram[range.start().get() as usize..range.end() as usize]
+                .copy_from_slice(write.bytes());
+        }
+        Ok(committed)
+    }
+}
+
 thread_local! {
     /// The single registered graphics backend, if the shell/harness has
     /// called `set_render_backend`. `RefCell` (not `Cell`, unlike

@@ -224,6 +224,29 @@ pub(super) fn commit_color_image(
     }
 }
 
+pub(super) fn trace_ir_color_image_write(
+    trace: &mut Option<Vec<(usize, usize)>>,
+    target: gbi::ColorImage,
+    fb: &Framebuffer,
+) {
+    let Some(trace) = trace.as_mut() else {
+        return;
+    };
+    let bytes = usize::from(target.width)
+        .checked_mul(fb.height as usize)
+        .and_then(|pixels| {
+            pixels.checked_mul(
+                target
+                    .layout()
+                    .expect("committed color target has a validated layout")
+                    .bytes_per_pixel(),
+            )
+        })
+        .expect("validated color-image write range overflowed host usize");
+    let start = target.address as usize;
+    trace.push((start, start + bytes));
+}
+
 /// Commit the color pipeline's intensity component to the public one-byte
 /// color-image layout. The RDP exposes no palette for this target; callers
 /// program equal RGB components when the intermediate image is meaningful,
@@ -388,4 +411,20 @@ pub(super) fn commit_rdp_depth_image(
         );
     }
     Ok(())
+}
+
+pub(super) fn trace_ir_depth_image_write(
+    trace: &mut Option<Vec<(usize, usize)>>,
+    target: gbi::DepthImage,
+    fb: &Framebuffer,
+) {
+    let Some(trace) = trace.as_mut() else {
+        return;
+    };
+    for (index, encoded) in fb.encoded_depth.iter().enumerate() {
+        if encoded.is_some() {
+            let start = target.address as usize + index * 2;
+            trace.push((start, start + 2));
+        }
+    }
 }

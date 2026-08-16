@@ -210,7 +210,6 @@ use blend::*;
 /// doing occlusion work (rejecting farther fragments) rather than being a
 /// no-op. Gated entirely behind the env var; call `zstat::summary()` after a
 /// frame to print + reset. Remove/keep behind the flag.
-#[cfg(not(test))]
 pub mod zstat {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -218,9 +217,18 @@ pub mod zstat {
     static PASS: AtomicU64 = AtomicU64::new(0);
     static REJECT: AtomicU64 = AtomicU64::new(0);
     fn on() -> bool {
+        if crate::speculative_observations_suppressed() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            return ENABLED.load(Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
         if !INIT.swap(true, Ordering::Relaxed) {
             ENABLED.store(crate::debug_flag("FN64_DUMP_PROJ"), Ordering::Relaxed);
         }
+        #[cfg(not(test))]
         ENABLED.load(Ordering::Relaxed)
     }
     pub fn note_pass() {
@@ -247,6 +255,22 @@ pub mod zstat {
                  doing real occlusion, not a no-op"
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enable_and_reset() {
+        ENABLED.store(true, Ordering::Relaxed);
+        INIT.store(true, Ordering::Relaxed);
+        PASS.store(0, Ordering::Relaxed);
+        REJECT.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_counts() -> (u64, u64) {
+        (
+            PASS.load(Ordering::Relaxed),
+            REJECT.load(Ordering::Relaxed),
+        )
     }
 }
 
