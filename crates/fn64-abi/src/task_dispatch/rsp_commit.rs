@@ -351,8 +351,55 @@ pub(crate) unsafe fn dispatch_lle_task(
         let Some(submission) = submission else {
             continue;
         };
-        let mut transaction = LiveDpcTransaction::new(submission);
         let rdp_started = gfx_started.map(|_| std::time::Instant::now());
+
+        // T4: the real RSP-driven producer (this loop, not a Dmem-arm
+        // surrogate). Same routing decision as `dispatch_dpc_submission`'s
+        // top-level guard, made BEFORE `LiveDpcTransaction::new` -- see
+        // that function's own comment for why (constructing then dropping
+        // a `LiveDpcTransaction` cancels a still-wanted fabric submission).
+        // `WgpuBackend`'s raw-DPC seam is a synchronous, non-GPU CPU-side
+        // coordinator with no async completion concept, so the "always
+        // defer the GPU-completion wait" rationale below (specific to
+        // RT64's real async GPU queue) does not apply here: routing
+        // through `with_ready_commit` (an immediate, synchronous publish)
+        // costs nothing extra this loop did not already pay by calling
+        // `dispatch_captured_raw_rdp` with `wait_for_completion: false`
+        // against a backend that has no deferred completion to defer.
+        let session_registered = RAW_DPC_SESSION.with(|cell| cell.borrow().is_some());
+        if session_registered {
+            let owned_submission = if xbus {
+                fn64_render::OwnedRawDpcSubmission::from_xbus_payload(
+                    start,
+                    end,
+                    words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+                )
+            } else {
+                fn64_render::OwnedRawDpcSubmission::from_rdram_words(start, end, words.clone())
+            }
+            .unwrap_or_else(|error| {
+                panic!("RSP DPC submission does not admit a T4 capture: {error:?}")
+            });
+            let transaction = LiveDpcTransaction::new(submission);
+            let (full_sync, observation) = try_dispatch_raw_dpc_via_session(
+                rdram,
+                SessionRawDpcSource {
+                    submission: owned_submission,
+                },
+                transaction,
+            )
+            .expect("session_registered was already checked true under the same borrow");
+            if let Some(started) = rdp_started {
+                raw_rdp_ns = raw_rdp_ns.saturating_add(started.elapsed().as_nanos() as u64);
+            }
+            dpc_observations.push(observation);
+            if full_sync == fn64_render::DpFullSyncStatus::Reached {
+                dp_full_sync = fn64_render::DpFullSyncStatus::Reached;
+            }
+            continue;
+        }
+
+        let mut transaction = LiveDpcTransaction::new(submission);
         // Always defer the GPU-completion wait here. RT64's queue is a
         // monotonic counter (`waitId <= workloadId`, rt64_workload_queue.cpp
         // :93), so waiting for a later submission's id also waits for every
@@ -855,6 +902,203 @@ impl Drop for LiveDpcTransaction {
     }
 }
 
+/// One captured raw-DPC source ready for the T4 plan/execute/publish
+/// production seam: the exact original command words and their exact
+/// source range/kind. Preserves the real capture source and ranges --
+/// unlike the legacy `dispatch_captured_raw_rdp` staging path, this never
+/// manufactures a synthetic RDRAM suffix.
+///
+/// Every admitted TMEM load's *source* bytes are declared as
+/// `RdramResource::Buffer` regardless of `submission.source()`
+/// (`crate::raw_dpc::production_adapter`'s push loop, mirroring real RDP
+/// hardware: XBUS changes only where the RDP *command words* come from --
+/// DMEM vs. DRAM -- never where `LoadBlock`/`LoadTile`/`LoadTLUT` read their
+/// texel data, which is always the RDP's 24-bit physical RDRAM address
+/// space). So there is exactly one guest-read byte source, live RDRAM, for
+/// both producers; no separate DMEM byte source is needed or correct here.
+struct SessionRawDpcSource {
+    submission: fn64_render::OwnedRawDpcSubmission,
+}
+
+/// Attempt the T4 production plan/execute/publish routing for one raw-DPC
+/// submission. Returns `None` (never partially attempted) when no
+/// `RawDpcAbiSession` is registered, so callers fall back to the legacy
+/// atomic `process_rdp_commands` path unconditionally -- required for
+/// `Rt64Backend` and any other backend that never implements
+/// `plan_raw_dpc`/`execute_raw_dpc`/`publish_raw_dpc`.
+///
+/// `plan_raw_dpc` (`fn64-render-wgpu`'s `WgpuBackend`) already rejects a
+/// `FullSync` command or any command outside the admitted TMEM/state subset
+/// as a loud `RenderError`; `commit_zero_guest_writes` independently
+/// re-rejects any guest-visible write with `EffectCountMismatch`. Neither
+/// rejection is caught here -- both `.unwrap_or_else(|error| panic!(...))`
+/// through, matching this card's "TMEM-only, reject FullSync and all
+/// guest-write journals loudly" requirement and AGENTS.md's loud-trap rule.
+/// A submission this backend cannot admit is a hard stop, not a silent
+/// fallback to the legacy path: falling back would let a T4-registered
+/// session quietly downgrade capture fidelity for exactly the submissions
+/// its own admission rules were built to catch.
+fn try_dispatch_raw_dpc_via_session(
+    rdram: *mut u8,
+    source: SessionRawDpcSource,
+    mut transaction: LiveDpcTransaction,
+) -> Option<(fn64_render::DpFullSyncStatus, RspRdpObservationKind)> {
+    let registered = RAW_DPC_SESSION.with(|cell| cell.borrow().is_some());
+    if !registered {
+        return None;
+    }
+
+    // The live RDRAM allocation is the sole guest-read byte source for both
+    // producers -- see `SessionRawDpcSource`'s doc comment -- and also the
+    // sole memory-layout proof: XBUS command words are bounded separately
+    // (`DmemRange`, the 4 KiB DMEM bank) inside `preflight_raw_dpc_capture`,
+    // never through this `memory_layout`.
+    let real = unsafe { renderer_rdram_slice(rdram) };
+    let memory_layout = fn64_render::ir::PhysicalMemoryLayout::try_new(
+        u32::try_from(real.len()).expect("registered RDRAM allocation fits a u32 byte length"),
+    )
+    .unwrap_or_else(|error| panic!("try_dispatch_raw_dpc_via_session: {error}"));
+    // T4 v11 scope is TMEM-only, no-FullSync: no admitted command in this
+    // slice can legitimately observe the DP interrupt line, so a fixed
+    // `Clear` snapshot is exact for every submission this backend accepts --
+    // `plan_raw_dpc`'s own FullSync rejection is what makes that true, not
+    // an assumption made here. `transaction_sequence` reuses this exact
+    // transaction's own fabric-issued token: real per-submission fabric
+    // identity, not a fabricated counter, matching the requirement to
+    // preserve the existing fabric token lifecycle through this new path.
+    let token = transaction
+        .token
+        .expect("try_dispatch_raw_dpc_via_session: transaction committed twice");
+    let xbus = source.submission.source() == fn64_render::RawDpcSource::XbusDmem;
+    let observation_start = source.submission.start();
+    let observation_end = source.submission.end();
+    let observation_words = source.submission.command_words();
+    let capture = fn64_render::OwnedRawDpcCapture::new(
+        source.submission,
+        memory_layout,
+        token,
+        fn64_render::ir::TemporalBoundary::new(token, fn64_render::ir::DpInterruptState::Clear),
+    );
+
+    let observation = dpc_observation(xbus, observation_start, observation_end, &observation_words);
+
+    let planned = RENDER_BACKEND.with(|backend_cell| {
+        RAW_DPC_SESSION.with(|session_cell| {
+            let mut backend = backend_cell.borrow_mut();
+            let backend = backend
+                .as_mut()
+                .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
+            let session = session_cell.borrow();
+            let session = session
+                .as_ref()
+                .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
+            let request = session.plan_request(capture);
+            backend
+                .plan_raw_dpc(request)
+                .unwrap_or_else(|error| panic!("plan_raw_dpc: {error}"))
+        })
+    });
+
+    let guest_capture = fn64_render::ir::DeferredGuestReadCapture::new(
+        planned
+            .guest_read_plan()
+            .reads()
+            .iter()
+            .map(|read| {
+                let range = read.range();
+                let start = range.start().get() as usize;
+                let end = range.end() as usize;
+                let bytes = real
+                    .get(start..end)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "plan_raw_dpc declared guest read [{start:#x}, {end:#x}) outside \
+                             the captured source"
+                        )
+                    })
+                    .to_vec();
+                fn64_render::ir::CapturedGuestRead::try_new(*read, bytes)
+                    .unwrap_or_else(|error| panic!("CapturedGuestRead::try_new: {error}"))
+            })
+            .collect(),
+    );
+
+    let bound = RAW_DPC_SESSION.with(|cell| {
+        let mut session = cell.borrow_mut();
+        let session = session
+            .as_mut()
+            .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
+        session
+            .finalize_and_submit(planned, guest_capture)
+            .unwrap_or_else(|error| panic!("finalize_and_submit: {error}"))
+    });
+
+    let prepared = RENDER_BACKEND.with(|cell| {
+        let mut backend = cell.borrow_mut();
+        let backend = backend
+            .as_mut()
+            .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
+        backend
+            .execute_raw_dpc(bound)
+            .unwrap_or_else(|error| panic!("execute_raw_dpc: {error}"))
+    });
+
+    let committed = RAW_DPC_SESSION.with(|cell| {
+        let mut session = cell.borrow_mut();
+        let session = session
+            .as_mut()
+            .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
+        session
+            .commit_zero_guest_writes(prepared)
+            .unwrap_or_else(|error| panic!("commit_zero_guest_writes: {error}"))
+    });
+
+    // Mirrors the legacy path's own `transaction.validate_atomic_completion()`
+    // call (see `dispatch_dpc_submission`'s `Rdram` arm and
+    // `dispatch_captured_raw_rdp`): the compatibility acknowledgment this
+    // transaction opened at `LiveDpcTransaction::new` must be driven to
+    // `Complete` before `with_ready_commit` will accept it -- required by
+    // `with_ready_commit`'s own precondition assertion, independent of
+    // which path (legacy or T4 session) produced the completed backend
+    // result.
+    transaction.validate_atomic_completion();
+
+    // `with_ready_commit` hands the live `ReadyDpcFabricCommit` to this
+    // closure INSIDE its one `with_host` borrow (see its own doc comment);
+    // `seal_publication`/`publish_raw_dpc` run here, not after, so the fabric
+    // token's prepare -> seal -> publish sequence stays exactly as ordered
+    // as the legacy path's own prepare-then-commit, just carrying a capsule
+    // through the middle instead of committing immediately.
+    let outcome = transaction.with_ready_commit(|ready| {
+        RAW_DPC_SESSION.with(|session_cell| {
+            let mut session = session_cell.borrow_mut();
+            let session = session
+                .as_mut()
+                .expect("try_dispatch_raw_dpc_via_session: session vanished under this borrow");
+            let capsule = session
+                .seal_publication(committed, ready)
+                .unwrap_or_else(|error| panic!("seal_publication: {error}"));
+            RENDER_BACKEND.with(|backend_cell| {
+                let mut backend = backend_cell.borrow_mut();
+                let backend = backend
+                    .as_mut()
+                    .expect("try_dispatch_raw_dpc_via_session: no render backend registered");
+                backend.publish_raw_dpc(capsule)
+            })
+        })
+    });
+    let _ = outcome;
+
+    record_rsp_rdp_observations(vec![observation.clone()]);
+    record_rdp_renderer_publication_v1();
+    // v11 TMEM-only scope admits no FullSync command, and `plan_raw_dpc`
+    // already rejects one loudly before this point is ever reached -- so
+    // every submission that reaches here completes with FullSync NotReached,
+    // exactly like `preflight_raw_dpc_completion`'s own inspection would
+    // report for a command stream with none.
+    Some((fn64_render::DpFullSyncStatus::NotReached, observation))
+}
+
 /// Own the ABI side of an explicitly scheduled raw-DPC renderer transaction.
 ///
 /// The renderer receives only a shadow image. Once it has been called, any
@@ -1054,6 +1298,77 @@ pub(crate) unsafe fn dispatch_dpc_submission(
 ) {
     let start = submission.start;
     let end = submission.end;
+    // T4 routing decision, made BEFORE `LiveDpcTransaction::new` ever runs:
+    // whether a production raw-DPC session is registered is read once, up
+    // front, so there is exactly one fabric-owning `LiveDpcTransaction` for
+    // this submission either way -- never one constructed, probed, dropped
+    // (which would cancel the still-wanted fabric submission), and rebuilt.
+    let session_registered = RAW_DPC_SESSION.with(|cell| cell.borrow().is_some());
+    if session_registered {
+        let owned_submission = match submission.source {
+            fn64_runtime::DpcSubmissionSource::Rdram => {
+                let real_len = unsafe { renderer_rdram_slice(rdram) }.len();
+                let start_usize = start as usize;
+                let end_usize = end as usize;
+                assert!(
+                    start_usize < end_usize
+                        && start_usize.is_multiple_of(8)
+                        && end_usize.is_multiple_of(8),
+                    "DRAM DPC range [{start:#010x}, {end:#010x}) must be nonempty and 8-byte aligned"
+                );
+                assert!(
+                    end_usize <= real_len,
+                    "DRAM DPC range end {end:#010x} exceeds registered RDRAM length {real_len:#x}"
+                );
+                let words = unsafe { renderer_rdram_slice(rdram) }[start_usize..end_usize]
+                    .chunks_exact(4)
+                    .map(|word| u32::from_ne_bytes(word.try_into().expect("four RDRAM bytes")))
+                    .collect::<Vec<_>>();
+                fn64_render::OwnedRawDpcSubmission::from_rdram_words(start, end, words)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "dispatch_raw_rdp: fabric-admitted DRAM range does not admit a T4 \
+                             capture: {error:?}"
+                        )
+                    })
+            }
+            fn64_runtime::DpcSubmissionSource::Dmem => {
+                let dmem = with_host(|host| {
+                    *host
+                        .device_fabric
+                        .rsp_memory()
+                        .bank(fn64_runtime::RspMemoryBank::Dmem)
+                });
+                let payload = dmem[start as usize..end as usize].to_vec();
+                fn64_render::OwnedRawDpcSubmission::from_xbus_payload(start, end, payload)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "dispatch_raw_rdp_xbus: fabric-admitted XBUS range does not admit a \
+                             T4 capture: {error:?}"
+                        )
+                    })
+            }
+        };
+        let transaction = LiveDpcTransaction::new(submission);
+        // `try_dispatch_raw_dpc_via_session` already commits the fabric
+        // transaction (through `with_ready_commit`/`publish_raw_dpc`) and
+        // records observations internally, exactly like
+        // `complete_committed_dpc` does for the legacy path below -- there
+        // is nothing left to do here for this submission. `full_sync` is
+        // always `NotReached` in this v11 TMEM-only slice (see that
+        // function's own doc comment), so no `start_live_dp_full_sync` call
+        // is needed either.
+        let _ = try_dispatch_raw_dpc_via_session(
+            rdram,
+            SessionRawDpcSource {
+                submission: owned_submission,
+            },
+            transaction,
+        )
+        .expect("session_registered was already checked true under the same borrow");
+        return;
+    }
+
     let mut transaction = LiveDpcTransaction::new(submission);
     let (full_sync, observation, operation) = match submission.source {
         fn64_runtime::DpcSubmissionSource::Rdram => {

@@ -1306,6 +1306,58 @@ The accelerated wave keeps dependency-safe work active in parallel:
     adapter, T3's `PendingTmemTransaction::into_physical_successor`, and the
     M4.3.3f three-nearest filter are all unchanged.
 
+22. **T4 -- real ABI raw-DPC ingress (INTEGRATED).** Wires all three concrete
+    production raw-DPC producers in `fn64-abi` -- sp_dp DRAM (`sp_dp.rs`),
+    MMIO DRAM/XBUS (`pi/mmio.rs`, both sources, via the shared
+    `dispatch_dpc_submission` seam), and RSP XBUS (the coalesced
+    pending-submission loop inside `dispatch_lle_task`,
+    `task_dispatch/rsp_commit.rs`) -- through T3 Phase B's
+    `plan_raw_dpc -> finalize_and_submit -> execute_raw_dpc ->
+    commit_zero_guest_writes -> seal_publication -> publish_raw_dpc`
+    conveyor, conditionally on a registered `RawDpcAbiSession`
+    (`fn64_abi::set_raw_dpc_session`/`clear_raw_dpc_session`, a new
+    thread-local slot alongside the pre-existing `RENDER_BACKEND` one). No
+    session registered -- the default, and what `Rt64Backend` always uses --
+    is the byte-for-byte unchanged legacy atomic `process_rdp_commands`
+    path; the routing decision is made once, before
+    `LiveDpcTransaction::new` runs, at all three call sites, so a submission
+    is never claimed by one path and abandoned to the other. See
+    `docs/DESIGN.md`'s "T4 -- real ABI raw-DPC ingress" section (right after
+    T3 Phase A/B) for the full type-level narrative, including the guest-
+    read-byte-sourcing argument (live RDRAM for both DRAM and XBUS captures)
+    and the `single_source_probe_journal` fix this slice made to already-
+    shipped T3 Phase B code (its command-decode probe access previously
+    always declared an RDRAM region regardless of submission source, which
+    made `plan_raw_dpc` reject every genuinely XBUS-sourced capture).
+    `fn64-abi` never depends on a concrete backend crate to do this --
+    `RawDpcAbiSession` is a `fn64-render` type -- so `fn64-render-wgpu` is a
+    dev-dependency only, mirroring the existing `fn64-render-reference`
+    dev-dependency pattern; no shell in this workspace constructs a
+    `WgpuBackend` or calls `set_raw_dpc_session` in production. Tests:
+    `crates/fn64-abi/src/task_dispatch/tests/raw_dpc_session_integration.rs`
+    (10 tests) drive the real producer entry points end to end against a
+    real 8 MiB RDRAM allocation and a real `DeviceFabric` admission --
+    including a real, hand-encoded tiny RSP interpreter program (COP0
+    `mtc0` writes to DPC_START/DPC_STATUS/DPC_END) that reaches the actual
+    `dispatch_lle_task` pending-loop for the RSP-XBUS producer, not a
+    `dispatch_dpc_submission(Dmem)` surrogate -- covering: per-producer
+    session routing and legacy fallback when no session is registered,
+    FullSync rejection through the real producer seam, drop/cancel leaving
+    no pending fabric transaction, joint ordinal/fabric-state publication
+    across two independent submissions through the same session, exact
+    XBUS source-byte preservation (submission identity SHA-256), and a
+    mismatched backend/session registration (two independently constructed
+    `WgpuBackend::try_new()` pairs, backend from one and session from the
+    other) trapping loudly via `RawDpcBackendAuthority::begin_plan`'s own
+    paired-queue assertion before any fabric mutation. Plus one new
+    `fn64-render-wgpu` characterization test
+    (`plan_raw_dpc_accepts_a_genuinely_xbus_sourced_capture`) proving the
+    probe-journal fix directly. Scope, nonclaims unchanged from T3 Phase B:
+    TMEM-only, no-FullSync, no-guest-write, headless only; no visible
+    presentation, no raster/combiner/blend parity, no native GPU testing, no
+    `Rt64Backend` migration (it keeps the legacy path unconditionally, since
+    it never implements the three object-safe raw-DPC production methods).
+
 ### M0 evidence ledger
 
 **M0.1 -- COMPLETE, 2026-08-15.**

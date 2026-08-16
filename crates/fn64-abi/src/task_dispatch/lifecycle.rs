@@ -196,6 +196,20 @@ thread_local! {
     /// and needs `&mut` access across calls to drive its own internal
     /// state (`create`/`process_task`/`present`).
     pub(crate) static RENDER_BACKEND: RefCell<Option<Box<dyn RenderBackend>>> = const { RefCell::new(None) };
+    /// The ABI-owned half of the T4 production raw-DPC session pair, present
+    /// only when the registered `RENDER_BACKEND` was constructed alongside
+    /// one (`fn64_render::new_raw_dpc_roles`) and the caller registered it
+    /// through `set_raw_dpc_session`. `fn64-abi` never constructs this
+    /// itself and never names the concrete backend type that produced it
+    /// (`RawDpcAbiSession` is a `fn64-render` type, not a backend-crate
+    /// type) -- doing so would break the backend-agnostic dependency rule
+    /// `docs/DECOUPLING.md` states for this crate. Its presence is exactly
+    /// what selects the plan/execute/publish production routing in
+    /// `task_dispatch::dispatch_dpc_submission`/`dispatch_captured_raw_rdp`
+    /// over the legacy atomic `process_rdp_commands` path; `None` (no
+    /// session registered, e.g. `Rt64Backend`) always keeps the legacy path.
+    pub(crate) static RAW_DPC_SESSION: RefCell<Option<fn64_render::RawDpcAbiSession>> =
+        const { RefCell::new(None) };
     /// Graphics microcode execution is a host policy, not a renderer
     /// capability guess. Compatibility callers retain the optimized default;
     /// accuracy/release harnesses opt into LLE at registration.
@@ -1040,6 +1054,37 @@ pub fn last_render_error() -> Option<String> {
     RENDER_LAST_ERROR.with(|cell| cell.borrow().clone())
 }
 
+/// Register the ABI-owned half of a T4 production raw-DPC session, paired at
+/// construction (`fn64_render::new_raw_dpc_roles`) with the currently
+/// registered `RENDER_BACKEND`'s own `RawDpcBackendAuthority`. The caller
+/// (a shell or test harness, never `fn64-abi` itself) is responsible for
+/// constructing both halves from the same role split and registering the
+/// backend half through `set_render_backend`/`set_render_backend_with_policy`
+/// first or in the same setup step; this crate has no way to check that the
+/// two halves it holds actually came from the same split, because doing so
+/// would require naming a concrete backend constructor here.
+///
+/// While a session is registered, `task_dispatch::dispatch_dpc_submission`/
+/// `dispatch_captured_raw_rdp` route raw-DPC ingress through the
+/// plan/execute/publish production seam (`RenderBackend::plan_raw_dpc` ->
+/// `RawDpcAbiSession::finalize_and_submit` -> `RenderBackend::execute_raw_dpc`
+/// -> `RawDpcAbiSession::commit_zero_guest_writes` ->
+/// `RawDpcAbiSession::seal_publication` -> `RenderBackend::publish_raw_dpc`)
+/// instead of the legacy atomic `process_rdp_commands` call. Registering
+/// `None` (the default) or calling `clear_raw_dpc_session` restores the
+/// legacy path unconditionally -- required for `Rt64Backend` and any other
+/// backend that never implements the plan/execute/publish trio.
+pub fn set_raw_dpc_session(session: fn64_render::RawDpcAbiSession) {
+    RAW_DPC_SESSION.with(|cell| cell.replace(Some(session)));
+}
+
+/// Drop a registered raw-DPC session, restoring the legacy atomic
+/// `process_rdp_commands` routing for subsequent raw-DPC ingress. A no-op if
+/// none is registered.
+pub fn clear_raw_dpc_session() {
+    RAW_DPC_SESSION.with(|cell| cell.replace(None));
+}
+
 /// Apply one complete typed runtime-settings image to the registered renderer.
 ///
 /// Interactive hosts call this only between guest/frame pumps. An HLE task
@@ -1080,12 +1125,14 @@ pub fn apply_render_runtime_settings(
 pub(crate) fn drop_backends_for_process_exit() {
     HLE_RENDER_CONTINUATION.with(|cell| cell.borrow_mut().take());
     let render_backend = RENDER_BACKEND.with(|cell| cell.borrow_mut().take());
+    let raw_dpc_session = RAW_DPC_SESSION.with(|cell| cell.borrow_mut().take());
     let audio_backend = AUDIO_BACKEND.with(|cell| cell.borrow_mut().take());
     let audio_stream_dump = AUDIO_PCM_STREAM_DUMP.with(|cell| cell.borrow_mut().take());
     RDRAM_LEN.with(|cell| cell.set(0));
     AUDIO_RDRAM_LEN.with(|cell| cell.set(0));
     drop(audio_stream_dump);
     drop(audio_backend);
+    drop(raw_dpc_session);
     drop(render_backend);
 }
 

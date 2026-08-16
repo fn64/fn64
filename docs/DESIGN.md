@@ -437,11 +437,62 @@ physical slot, commits the concrete fabric transition, and records
 
 Scope, matching the T3 ticket DAG and card v11 exactly: TMEM-only,
 no-FullSync, no-guest-write raw-DPC execution/publication, headless only. No
-ABI/T4 ingress, no visible presentation, no raster parity, no native GPU
-testing. `WgpuBackend::process_task`/`present` are honest, named
-`RenderError` rejections rather than invented gfx-task/presentation
-behavior -- the landed `RenderBackend` trait requires both as non-defaulted
-methods, but this slice proves only the raw-DPC production seam.
+visible presentation, no raster parity, no native GPU testing.
+`WgpuBackend::process_task`/`present` are honest, named `RenderError`
+rejections rather than invented gfx-task/presentation behavior -- the landed
+`RenderBackend` trait requires both as non-defaulted methods, but this slice
+proves only the raw-DPC production seam. T3 Phase B does not itself wire any
+ABI producer to this seam; that is T4, below.
+
+**T4 -- real ABI raw-DPC ingress (`fn64-abi`).** Wires all three concrete
+production raw-DPC producers -- sp_dp DRAM (`sp_dp.rs`), MMIO DRAM/XBUS
+(`pi/mmio.rs`, both sources), and RSP XBUS (the coalesced pending-submission
+loop inside `dispatch_lle_task`, `task_dispatch/rsp_commit.rs`) -- through
+the T3 `plan_raw_dpc -> finalize_and_submit -> execute_raw_dpc ->
+commit_zero_guest_writes -> seal_publication -> publish_raw_dpc` conveyor,
+conditionally: only when a `RawDpcAbiSession` is registered
+(`set_raw_dpc_session`, paired at construction with a concrete backend via
+`fn64_render::new_raw_dpc_roles`, exactly as `RawDpcBackendAuthority::
+into_coordinator`'s own doc comment requires). No session registered (the
+default, and what `Rt64Backend` always uses) is byte-for-byte the pre-T4
+legacy atomic `process_rdp_commands` path, unchanged.
+
+`fn64-abi` never depends on a concrete backend crate to do this --
+`RawDpcAbiSession` is a `fn64-render` type, so the ABI layer stays
+backend-agnostic per this document's crate-layout rule; only a shell or test
+harness ever names `WgpuBackend` and registers the paired session. The
+routing decision (`session_registered`) is checked before
+`LiveDpcTransaction::new` runs at every one of the three call sites, so a
+submission is never claimed by the T4 path and then abandoned back to the
+legacy path -- either it is taken by the session path in full (through to
+`publish_raw_dpc`) or the legacy path owns it from the start, never both.
+
+Guest-read bytes are sourced from live RDRAM for both DRAM- and
+XBUS-sourced captures: every admitted TMEM load's source access is
+`RdramResource::Buffer` regardless of which bus carried the command stream
+(`raw_dpc::production_adapter`'s push loop; XBUS changes only where RDP
+*command words* come from, never where `LoadBlock`/`LoadTile`/`LoadTLUT`
+read texel data). `OwnedRawDpcCapture` preserves the exact original
+source/range/bytes with no synthetic staging suffix, unlike the legacy
+`dispatch_captured_raw_rdp` path. `plan_raw_dpc` rejects `FullSync` and any
+command outside the admitted TMEM/state subset loudly (a named panic, never
+a silent downgrade to the legacy path); `commit_zero_guest_writes`
+independently re-rejects any guest-visible write. Fixed this slice: T3
+Phase B's `single_source_probe_journal` always declared its command-decode
+access as an RDRAM `RawCommands` region, which `fn64-render-ir`'s
+one-to-one command-read validation rejects for a genuinely XBUS-sourced
+stream -- every XBUS producer would have panicked on its first
+`plan_raw_dpc` call once a T4 session was registered. Now branches on
+`submission.source()` (`ResourceRegion::RspDmem(DmemRange)` for XBUS).
+
+Nonclaims, unchanged from T3 Phase B: TMEM-only (no raster/combiner/blend),
+no visible presentation, no native GPU testing, no RT64/Rt64Backend
+migration (that backend keeps the legacy path unconditionally, since it
+never implements `plan_raw_dpc`/`execute_raw_dpc`/`publish_raw_dpc`), and
+no shell wiring -- no shell in this workspace constructs a `WgpuBackend` or
+calls `set_raw_dpc_session` in production; that registration is exercised
+only by `fn64-abi`'s own dev-dependency test suite
+(`task_dispatch::tests::raw_dpc_session_integration`).
 
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
 Rust: the scheduler, message-queue semantics, timer wheel, rdram buffer

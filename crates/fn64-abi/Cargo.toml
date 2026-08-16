@@ -56,3 +56,10 @@ sha2 = { version = "0.10", features = ["asm"] }
 # docs/DECOUPLING.md.
 fn64-render-reference = { path = "../fn64-render-reference" }
 fn64-cpu-runtime = { path = "../fn64-cpu-runtime", features = ["dev-interpreter"] }
+# Only for tests proving the T4 raw-DPC session routing
+# (`set_raw_dpc_session`/`try_dispatch_raw_dpc_via_session`) actually reaches
+# a real plan/execute/publish backend end-to-end. Same rule as
+# fn64-render-reference above: never a non-test dependency. `WgpuBackend`'s
+# raw-DPC seam is pure Rust (`RawDpcCoordinator`/`PhysicalTmemState`, no GPU
+# device), so no `host-gpu-tests` feature or real adapter is needed here.
+fn64-render-wgpu = { path = "../fn64-render-wgpu" }

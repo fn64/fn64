@@ -768,6 +768,7 @@ dependencies = [
  "fn64-cpu-runtime",
  "fn64-render",
  "fn64-render-reference",
+ "fn64-render-wgpu",
  "fn64-runtime",
  "sha2",
 ]
