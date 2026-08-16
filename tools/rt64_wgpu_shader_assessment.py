@@ -32,6 +32,8 @@ RECEIPT_NAME = "assessment-receipt.json"
 EMPTY_SHA256 = base.digest_bytes(b"")
 KNOWN_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 SPIR-V parse failed: unsupported capability ShaderNonUniform\n"
 SCALAR_LAYOUT_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 naga validation failed: Global variable [0] 'instanceRDPParams' is invalid\n"
+SAMPLED_BUFFER_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 SPIR-V parse failed: unsupported capability SampledBuffer\n"
+FRAGMENT_INTERFACE_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 naga validation failed: Entry point PSMain at Fragment is invalid\n"
 RUNTIME_NOT_READY_EXIT = 78
 PROFILE_EXTENTS = (4, 8, 16, 20, 24, 32, 40, 56)
 PROFILE_NAMES = ("baseline", *(f"immediates-{extent}" for extent in PROFILE_EXTENTS))
@@ -187,7 +189,10 @@ def load_policy() -> dict:
         },
     }, "validator profile derivation changed")
     outcomes = policy["outcomes"]
-    base.require_keys(outcomes, {"order", "ingestible", "blocked_known_shader_nonuniform", "blocked_known_scalar_layout"}, "wgpu outcome policy")
+    base.require_keys(outcomes, {
+        "order", "ingestible", "blocked_known_shader_nonuniform", "blocked_known_scalar_layout",
+        "blocked_known_sampled_buffer", "blocked_known_fragment_direct_blend_src_index_output",
+    }, "wgpu outcome policy")
     base.require(outcomes["order"] == ["ingestible", "blocked-known"], "wgpu outcome order changed")
     base.require_keys(outcomes["ingestible"], {"exit_code", "stdout_schema", "stdout_status", "stderr_sha256"}, "ingestible outcome")
     base.require(outcomes["ingestible"] == {
@@ -228,6 +233,32 @@ def load_policy() -> dict:
             "offset_aligned": False,
         },
     }, "blocked-known scalar-layout outcome changed")
+    sampled_buffer = outcomes["blocked_known_sampled_buffer"]
+    base.require_keys(sampled_buffer, {"reason_code", "exit_code", "stdout_sha256", "stderr_sha256", "required_capability"}, "blocked-known sampled-buffer outcome")
+    base.require_keys(sampled_buffer["required_capability"], {"name", "value"}, "blocked-known sampled-buffer capability")
+    base.require(sampled_buffer == {
+        "reason_code": "naga30-strict-spv-unsupported-capability-sampled-buffer",
+        "exit_code": 2, "stdout_sha256": EMPTY_SHA256,
+        "stderr_sha256": base.digest_bytes(SAMPLED_BUFFER_STDERR),
+        "required_capability": {"name": "SampledBuffer", "value": 46},
+    }, "blocked-known sampled-buffer outcome changed")
+    fragment_interface = outcomes["blocked_known_fragment_direct_blend_src_index_output"]
+    base.require_keys(fragment_interface, {"reason_code", "exit_code", "stdout_sha256", "stderr_sha256", "witness"}, "blocked-known fragment-interface outcome")
+    base.require_keys(fragment_interface["witness"], {
+        "schema", "stage", "entry", "variable_name", "storage_class", "type",
+        "direct_interface_member", "location", "index",
+    }, "blocked-known fragment-interface witness policy")
+    base.require(fragment_interface == {
+        "reason_code": "naga30-fragment-direct-blend-src-index-output",
+        "exit_code": 2, "stdout_sha256": EMPTY_SHA256,
+        "stderr_sha256": base.digest_bytes(FRAGMENT_INTERFACE_STDERR),
+        "witness": {
+            "schema": "fn64.spirv-fragment-blend-src-index-output-witness.v1",
+            "stage": "fragment", "entry": "PSMain", "variable_name": "out.var.SV_TARGET0",
+            "storage_class": "Output", "type": "float4", "direct_interface_member": True,
+            "location": 0, "index": 0,
+        },
+    }, "blocked-known fragment-interface outcome changed")
     census = policy["diagnostic_census"]
     base.require_keys(census, {
         "schema", "authority", "row_count", "maximum_stream_bytes",
@@ -746,6 +777,166 @@ def scalar_layout_witness(artifact_bytes: bytes, policy: dict) -> dict | None:
     return fields
 
 
+def sampled_buffer_witness(artifact_bytes: bytes, policy: dict) -> dict | None:
+    base.require(len(artifact_bytes) >= 20 and len(artifact_bytes) % 4 == 0, "sampled-buffer SPIR-V extent is invalid")
+    words = list(struct.unpack(f"<{len(artifact_bytes) // 4}I", artifact_bytes))
+    base.require(words[0] == 0x07230203 and words[3] >= 1 and words[4] == 0, "sampled-buffer SPIR-V header is invalid")
+    expected = policy["outcomes"]["blocked_known_sampled_buffer"]["required_capability"]
+    matches: list[int] = []
+    offset = 5
+    while offset < len(words):
+        first = words[offset]
+        word_count = first >> 16
+        opcode = first & 0xFFFF
+        base.require(word_count > 0 and offset + word_count <= len(words), f"malformed sampled-buffer SPIR-V instruction at word {offset}")
+        operands = words[offset + 1 : offset + word_count]
+        if opcode in {73, 74, 75}:
+            raise base.ArtifactError(f"sampled-buffer group decoration is not implemented at word {offset}")
+        if opcode == 17:  # OpCapability
+            base.require(word_count == 2, f"malformed OpCapability at word {offset}")
+            if operands[0] == expected["value"]:
+                matches.append(offset)
+        offset += word_count
+    base.require(offset == len(words), "sampled-buffer SPIR-V stream did not terminate exactly")
+    if not matches:
+        return None
+    base.require(len(matches) == 1, "sampled-buffer witness capability is not declared exactly once")
+    fields = {
+        "schema": "fn64.spirv-sampled-buffer-witness.v1",
+        "capability": {"name": expected["name"], "value": expected["value"]},
+        "word_offset": matches[0],
+    }
+    fields["witness_sha256"] = base.digest_bytes(base.canonical_json(fields))
+    return fields
+
+
+def validate_sampled_buffer_witness_record(witness: object, policy: dict, label: str) -> None:
+    expected = policy["outcomes"]["blocked_known_sampled_buffer"]["required_capability"]
+    base.require_keys(witness, {"schema", "capability", "word_offset", "witness_sha256"}, label)
+    unhashed = copy.deepcopy(witness)
+    digest = require_sha(unhashed.pop("witness_sha256", None), f"{label} identity")
+    base.require(unhashed["schema"] == "fn64.spirv-sampled-buffer-witness.v1", f"{label} schema changed")
+    base.require(unhashed["capability"] == expected, f"{label} capability changed")
+    base.require(isinstance(unhashed["word_offset"], int) and not isinstance(unhashed["word_offset"], bool) and unhashed["word_offset"] >= 5, f"{label} word offset is invalid")
+    base.require(digest == base.digest_bytes(base.canonical_json(unhashed)), f"{label} identity changed")
+
+
+def fragment_interface_witness(artifact_bytes: bytes, stage: str, entry: str, policy: dict) -> dict | None:
+    base.require(len(artifact_bytes) >= 20 and len(artifact_bytes) % 4 == 0, "fragment-interface SPIR-V extent is invalid")
+    words = list(struct.unpack(f"<{len(artifact_bytes) // 4}I", artifact_bytes))
+    base.require(words[0] == 0x07230203 and words[3] >= 1 and words[4] == 0, "fragment-interface SPIR-V header is invalid")
+    bound = words[3]
+    expected = policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]["witness"]
+    if stage != expected["stage"] or entry != expected["entry"]:
+        return None
+
+    def valid_id(value: int, label: str) -> int:
+        base.require(0 < value < bound, f"{label} is outside the SPIR-V id bound")
+        return value
+
+    def put_unique(table: dict, key: object, value: object, label: str) -> None:
+        base.require(key not in table, f"duplicate {label}")
+        table[key] = value
+
+    def decode_string(operand_words: tuple[int, ...], label: str) -> str:
+        return reference.decode_literal_string(operand_words, label)
+
+    names: dict[int, str] = {}
+    decorations: dict[tuple[int, int], tuple[int, ...]] = {}
+    float_types: dict[int, int] = {}
+    vector_types: dict[int, tuple[int, int]] = {}
+    pointer_types: dict[int, tuple[int, int]] = {}
+    variables: dict[int, tuple[int, int]] = {}
+    entry_points: list[tuple[int, str, tuple[int, ...]]] = []
+
+    offset = 5
+    while offset < len(words):
+        first = words[offset]
+        word_count = first >> 16
+        opcode = first & 0xFFFF
+        base.require(word_count > 0 and offset + word_count <= len(words), f"malformed fragment-interface SPIR-V instruction at word {offset}")
+        operands = words[offset + 1 : offset + word_count]
+        if opcode in {73, 74, 75}:
+            raise base.ArtifactError(f"fragment-interface group decoration is not implemented at word {offset}")
+        if opcode == 15:  # OpEntryPoint
+            base.require(word_count >= 3, f"malformed OpEntryPoint at word {offset}")
+            execution_model = operands[0]
+            entry_id = valid_id(operands[1], "OpEntryPoint function")
+            rest = operands[2:]
+            name_words: list[int] = []
+            for word in rest:
+                name_words.append(word)
+                if any(byte == 0 for byte in word.to_bytes(4, "little")):
+                    break
+            entry_name = decode_string(tuple(name_words), f"OpEntryPoint at word {offset}")
+            consumed = len(name_words)
+            interface = tuple(valid_id(value, "OpEntryPoint interface") for value in rest[consumed:])
+            if execution_model == 4 and entry_name == entry:
+                entry_points.append((entry_id, entry_name, interface))
+        elif opcode == 5:  # OpName
+            base.require(word_count >= 3, f"malformed OpName at word {offset}")
+            target = valid_id(operands[0], "OpName target")
+            put_unique(names, target, decode_string(operands[1:], f"OpName at word {offset}"), "OpName target")
+        elif opcode == 71:  # OpDecorate
+            base.require(word_count >= 3, f"malformed OpDecorate at word {offset}")
+            target = valid_id(operands[0], "OpDecorate target")
+            put_unique(decorations, (target, operands[1]), tuple(operands[2:]), "OpDecorate target and kind")
+        elif opcode == 22:  # OpTypeFloat
+            base.require(word_count == 3, f"malformed OpTypeFloat at word {offset}")
+            put_unique(float_types, valid_id(operands[0], "OpTypeFloat result"), operands[1], "OpTypeFloat result")
+        elif opcode == 23:  # OpTypeVector
+            base.require(word_count == 4, f"malformed OpTypeVector at word {offset}")
+            put_unique(vector_types, valid_id(operands[0], "OpTypeVector result"), (valid_id(operands[1], "OpTypeVector component"), operands[2]), "OpTypeVector result")
+        elif opcode == 32:  # OpTypePointer
+            base.require(word_count == 4, f"malformed OpTypePointer at word {offset}")
+            put_unique(pointer_types, valid_id(operands[0], "OpTypePointer result"), (operands[1], valid_id(operands[2], "OpTypePointer pointee")), "OpTypePointer result")
+        elif opcode == 59:  # OpVariable
+            base.require(word_count in {4, 5}, f"malformed OpVariable at word {offset}")
+            put_unique(variables, valid_id(operands[1], "OpVariable result"), (valid_id(operands[0], "OpVariable type"), operands[2]), "OpVariable result")
+        offset += word_count
+    base.require(offset == len(words), "fragment-interface SPIR-V stream did not terminate exactly")
+
+    if not entry_points:
+        return None
+    base.require(len(entry_points) == 1, "fragment-interface witness entry point is ambiguous")
+    _, _, interface = entry_points[0]
+
+    matching = [identifier for identifier, name in names.items() if name == expected["variable_name"]]
+    if not matching:
+        return None
+    base.require(len(matching) == 1, "fragment-interface witness variable name is ambiguous")
+    variable_id = matching[0]
+    base.require(variable_id in interface, "fragment-interface witness variable is not a direct entry-point interface member")
+    base.require(variable_id in variables, "fragment-interface witness name does not identify a variable")
+    pointer_id, storage_class = variables[variable_id]
+    base.require(storage_class == 3, "fragment-interface witness storage class changed")  # StorageClass Output
+    pointer = pointer_types.get(pointer_id)
+    base.require(pointer is not None and pointer[0] == 3, "fragment-interface witness pointer storage class changed")
+    value_type = pointer[1]
+    component_id, vector_length = vector_types.get(value_type, (None, None))
+    base.require(component_id is not None and vector_length == 4 and float_types.get(component_id) == 32, "fragment-interface witness member type changed")
+    base.require(decorations.get((variable_id, 30)) == (expected["location"],), "fragment-interface witness location changed")
+    base.require(decorations.get((variable_id, 43)) == (expected["index"],), "fragment-interface witness index changed")
+    fields = {
+        "schema": "fn64.spirv-fragment-blend-src-index-output-witness.v1",
+        "stage": stage, "entry": entry, "variable_name": names[variable_id],
+        "storage_class": "Output", "type": "float4", "direct_interface_member": True,
+        "location": expected["location"], "index": expected["index"],
+    }
+    base.require(fields == expected, "fragment-interface witness contract changed")
+    fields["witness_sha256"] = base.digest_bytes(base.canonical_json(fields))
+    return fields
+
+
+def validate_fragment_interface_witness_record(witness: object, policy: dict, label: str) -> None:
+    expected = policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]["witness"]
+    base.require_keys(witness, set(expected) | {"witness_sha256"}, label)
+    unhashed = copy.deepcopy(witness)
+    digest = require_sha(unhashed.pop("witness_sha256", None), f"{label} identity")
+    base.require(unhashed == expected, f"{label} fields changed")
+    base.require(digest == base.digest_bytes(base.canonical_json(unhashed)), f"{label} identity changed")
+
+
 def inventory_supports_known_blocker(inventory: object, policy: dict) -> None:
     base.require(isinstance(inventory, dict), "blocked-known row has no semantic inventory")
     blocked = policy["outcomes"]["blocked_known_shader_nonuniform"]
@@ -793,7 +984,7 @@ def validate_scalar_witness_record(witness: object, policy: dict, label: str) ->
     base.require(digest == base.digest_bytes(base.canonical_json(unhashed)), f"{label} identity changed")
 
 
-def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artifact_bytes: bytes, policy: dict) -> tuple[str, str | None, dict | None, dict | None]:
+def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artifact_bytes: bytes, policy: dict) -> tuple[str, str | None, dict | None, dict | None, dict | None, dict | None]:
     stdout_sha = base.digest_bytes(result.stdout)
     stderr_sha = base.digest_bytes(result.stderr)
     inventory = row.get("semantic_inventory")
@@ -804,10 +995,14 @@ def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artif
     profile_derivation = derive_validator_profile(artifact_bytes, policy)
     profile_name = profile_derivation["profile"]["name"]
     scalar_witness = scalar_layout_witness(artifact_bytes, policy)
+    buffer_witness = sampled_buffer_witness(artifact_bytes, policy)
+    fragment_witness = fragment_interface_witness(artifact_bytes, row["stage"], row["entry"], policy)
     ingestible = policy["outcomes"]["ingestible"]
     if result.returncode == ingestible["exit_code"] and stderr_sha == ingestible["stderr_sha256"]:
         base.require(not has_shader_nonuniform, f"ShaderNonUniform witness unexpectedly passed strict wgpu ingestion: {row['id']}")
         base.require(scalar_witness is None, f"scalar-layout witness unexpectedly passed strict wgpu ingestion: {row['id']}")
+        base.require(buffer_witness is None, f"sampled-buffer witness unexpectedly passed strict wgpu ingestion: {row['id']}")
+        base.require(fragment_witness is None, f"fragment-interface witness unexpectedly passed strict wgpu ingestion: {row['id']}")
         try:
             record = json.loads(result.stdout)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -817,17 +1012,27 @@ def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artif
         base.require(record == expected_record, f"ingestible stdout changed: {row['id']}")
         expected_bytes = validator_success_bytes(profile_name, row["stage"], row["entry"], len(artifact_bytes))
         base.require(result.stdout == expected_bytes, f"ingestible stdout bytes changed: {row['id']}")
-        return "ingestible", None, record, None
+        return "ingestible", None, record, None, None, None
     blocked = policy["outcomes"]["blocked_known_shader_nonuniform"]
     if result.returncode == blocked["exit_code"] and stdout_sha == blocked["stdout_sha256"] and stderr_sha == blocked["stderr_sha256"]:
         base.require(result.stderr == KNOWN_STDERR, f"blocked-known stderr bytes changed: {row['id']}")
         inventory_supports_known_blocker(row.get("semantic_inventory"), policy)
-        return "blocked-known", blocked["reason_code"], None, scalar_witness
+        return "blocked-known", blocked["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
     scalar = policy["outcomes"]["blocked_known_scalar_layout"]
     if result.returncode == scalar["exit_code"] and stdout_sha == scalar["stdout_sha256"] and stderr_sha == scalar["stderr_sha256"]:
         base.require(result.stderr == SCALAR_LAYOUT_STDERR, f"blocked-known scalar-layout stderr bytes changed: {row['id']}")
         base.require(scalar_witness is not None, f"blocked-known scalar-layout row lacks its exact structural witness: {row['id']}")
-        return "blocked-known", scalar["reason_code"], None, scalar_witness
+        return "blocked-known", scalar["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
+    sampled_buffer = policy["outcomes"]["blocked_known_sampled_buffer"]
+    if result.returncode == sampled_buffer["exit_code"] and stdout_sha == sampled_buffer["stdout_sha256"] and stderr_sha == sampled_buffer["stderr_sha256"]:
+        base.require(result.stderr == SAMPLED_BUFFER_STDERR, f"blocked-known sampled-buffer stderr bytes changed: {row['id']}")
+        base.require(buffer_witness is not None, f"blocked-known sampled-buffer row lacks its exact structural witness: {row['id']}")
+        return "blocked-known", sampled_buffer["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
+    fragment_interface = policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]
+    if result.returncode == fragment_interface["exit_code"] and stdout_sha == fragment_interface["stdout_sha256"] and stderr_sha == fragment_interface["stderr_sha256"]:
+        base.require(result.stderr == FRAGMENT_INTERFACE_STDERR, f"blocked-known fragment-interface stderr bytes changed: {row['id']}")
+        base.require(fragment_witness is not None, f"blocked-known fragment-interface row lacks its exact structural witness: {row['id']}")
+        return "blocked-known", fragment_interface["reason_code"], None, scalar_witness, buffer_witness, fragment_witness
     raise base.ArtifactError(
         f"unclassified wgpu validator outcome for {row['id']}: exit={result.returncode} stdout_sha256={stdout_sha} stderr_sha256={stderr_sha}"
     )
@@ -865,7 +1070,7 @@ def assess_row(validator: Path, corpus_dir: Path, private_root: Path, row: dict,
     after_files = sorted(path.relative_to(private_root).as_posix() for path in private_root.rglob("*") if path.is_file() or path.is_symlink())
     base.require(before_files == after_files, f"wgpu validator changed the private file set: {row['id']}")
     base.require(base.digest_file(snapshot) == digest and base.digest_file(validator) == policy["wgpu_validator"]["binary_sha256"], f"wgpu validator changed qualified bytes: {row['id']}")
-    outcome, reason, stdout_record, scalar_witness = classify_result(result, row, artifact_bytes, policy)
+    outcome, reason, stdout_record, scalar_witness, buffer_witness, fragment_witness = classify_result(result, row, artifact_bytes, policy)
     transcript = {
         "arguments": validator_arguments(selected_profile["name"], row["stage"], row["entry"]),
         "exit_code": result.returncode, "stdout_sha256": base.digest_bytes(result.stdout),
@@ -878,7 +1083,8 @@ def assess_row(validator: Path, corpus_dir: Path, private_root: Path, row: dict,
         "semantic_inventory": copy.deepcopy(row["semantic_inventory"]),
         "immediate_witness": profile_derivation["immediate_witness"], "selected_profile": selected_profile,
         "outcome": outcome,
-        "scalar_layout_witness": scalar_witness, "reason_code": reason,
+        "scalar_layout_witness": scalar_witness, "sampled_buffer_witness": buffer_witness,
+        "fragment_interface_witness": fragment_witness, "reason_code": reason,
         "validation": transcript, "validation_record": stdout_record,
     }
 
@@ -1211,7 +1417,8 @@ def validate_assessment_receipt(receipt: object, policy: dict) -> None:
         base.require_keys(row, {
             "id", "source", "stage", "entry", "spirv_artifact", "spirv_sha256", "spirv_bytes",
             "semantic_inventory", "immediate_witness", "selected_profile",
-            "scalar_layout_witness", "outcome", "reason_code", "validation", "validation_record",
+            "scalar_layout_witness", "sampled_buffer_witness", "fragment_interface_witness",
+            "outcome", "reason_code", "validation", "validation_record",
         }, f"wgpu assessment row {index}")
         base.require(isinstance(row["id"], str) and row["id"] and row["id"] not in ids, "wgpu assessment row id repeated")
         ids.append(row["id"])
@@ -1228,24 +1435,44 @@ def validate_assessment_receipt(receipt: object, policy: dict) -> None:
         require_sha(row["validation"]["stderr_sha256"], f"wgpu assessment stderr {index}")
         expected_args = validator_arguments(row["selected_profile"]["name"], row["stage"], row["entry"])
         base.require(row["validation"]["arguments"] == expected_args, "wgpu assessment row argv changed")
+        witness_fields = ("scalar_layout_witness", "sampled_buffer_witness", "fragment_interface_witness")
         if row["outcome"] == "blocked-known":
             base.require(row["validation_record"] is None, "blocked-known row has a success record")
             shader = policy["outcomes"]["blocked_known_shader_nonuniform"]
             scalar = policy["outcomes"]["blocked_known_scalar_layout"]
+            sampled_buffer = policy["outcomes"]["blocked_known_sampled_buffer"]
+            fragment_interface = policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]
+            matching_witnesses = [name for name in witness_fields if row[name] is not None]
+            base.require(len(matching_witnesses) <= 1, f"blocked-known row has more than one matching witness: {row['id']}")
             if row["reason_code"] == shader["reason_code"]:
                 base.require(row["validation"]["exit_code"] == shader["exit_code"] and row["validation"]["stdout_sha256"] == shader["stdout_sha256"] and row["validation"]["stderr_sha256"] == shader["stderr_sha256"], "blocked-known ShaderNonUniform row transcript changed")
                 base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(KNOWN_STDERR), "blocked-known ShaderNonUniform row output lengths changed")
                 inventory_supports_known_blocker(row["semantic_inventory"], policy)
+                base.require(matching_witnesses in ([], ["scalar_layout_witness"]), f"blocked-known ShaderNonUniform row witness mismatch: {row['id']}")
                 if row["scalar_layout_witness"] is not None:
                     validate_scalar_witness_record(row["scalar_layout_witness"], policy, f"wgpu assessment scalar witness {index}")
             elif row["reason_code"] == scalar["reason_code"]:
                 base.require(row["validation"]["exit_code"] == scalar["exit_code"] and row["validation"]["stdout_sha256"] == scalar["stdout_sha256"] and row["validation"]["stderr_sha256"] == scalar["stderr_sha256"], "blocked-known scalar-layout row transcript changed")
                 base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(SCALAR_LAYOUT_STDERR), "blocked-known scalar-layout row output lengths changed")
+                base.require(matching_witnesses == ["scalar_layout_witness"], f"blocked-known scalar-layout row lacks its exact witness: {row['id']}")
                 validate_scalar_witness_record(row["scalar_layout_witness"], policy, f"wgpu assessment scalar witness {index}")
+            elif row["reason_code"] == sampled_buffer["reason_code"]:
+                base.require(row["validation"]["exit_code"] == sampled_buffer["exit_code"] and row["validation"]["stdout_sha256"] == sampled_buffer["stdout_sha256"] and row["validation"]["stderr_sha256"] == sampled_buffer["stderr_sha256"], "blocked-known sampled-buffer row transcript changed")
+                base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(SAMPLED_BUFFER_STDERR), "blocked-known sampled-buffer row output lengths changed")
+                base.require(matching_witnesses == ["sampled_buffer_witness"], f"blocked-known sampled-buffer row lacks its exact witness: {row['id']}")
+                validate_sampled_buffer_witness_record(row["sampled_buffer_witness"], policy, f"wgpu assessment sampled-buffer witness {index}")
+            elif row["reason_code"] == fragment_interface["reason_code"]:
+                base.require(row["validation"]["exit_code"] == fragment_interface["exit_code"] and row["validation"]["stdout_sha256"] == fragment_interface["stdout_sha256"] and row["validation"]["stderr_sha256"] == fragment_interface["stderr_sha256"], "blocked-known fragment-interface row transcript changed")
+                base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(FRAGMENT_INTERFACE_STDERR), "blocked-known fragment-interface row output lengths changed")
+                base.require(matching_witnesses == ["fragment_interface_witness"], f"blocked-known fragment-interface row lacks its exact witness: {row['id']}")
+                validate_fragment_interface_witness_record(row["fragment_interface_witness"], policy, f"wgpu assessment fragment-interface witness {index}")
             else:
                 raise base.ArtifactError("blocked-known row reason changed")
         else:
-            base.require(row["reason_code"] is None and row["scalar_layout_witness"] is None and isinstance(row["validation_record"], dict), "ingestible row record changed")
+            base.require(
+                row["reason_code"] is None and all(row[name] is None for name in witness_fields) and isinstance(row["validation_record"], dict),
+                "ingestible row record changed",
+            )
             base.require(row["validation"]["exit_code"] == 0 and row["validation"]["stderr_sha256"] == EMPTY_SHA256, "ingestible row transcript changed")
             base.require(row["validation"]["stderr_bytes"] == 0 and row["validation"]["stdout_bytes"] > 0, "ingestible row output lengths changed")
             expected_record = validator_success_record(
@@ -1305,6 +1532,8 @@ def selftest() -> None:
     policy = load_policy()
     base.require(base.digest_bytes(KNOWN_STDERR) == policy["outcomes"]["blocked_known_shader_nonuniform"]["stderr_sha256"], "known ShaderNonUniform blocker transcript drift")
     base.require(base.digest_bytes(SCALAR_LAYOUT_STDERR) == policy["outcomes"]["blocked_known_scalar_layout"]["stderr_sha256"], "known scalar-layout blocker transcript drift")
+    base.require(base.digest_bytes(SAMPLED_BUFFER_STDERR) == policy["outcomes"]["blocked_known_sampled_buffer"]["stderr_sha256"], "known sampled-buffer blocker transcript drift")
+    base.require(base.digest_bytes(FRAGMENT_INTERFACE_STDERR) == policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]["stderr_sha256"], "known fragment-interface blocker transcript drift")
     base.require(runtime_readiness([], policy)["runtime_ready"] is False, "M2.5b runtime readiness changed")
     base.require(policy["diagnostic_census"]["authority"] == "non-authoritative-diagnostic-only", "diagnostic census authority changed")
 

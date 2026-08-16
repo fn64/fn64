@@ -86,6 +86,64 @@ def spirv_fixture(*, descriptor_set: int = 0, binding: int = 2, member_index: in
 EMPTY_SPIRV = struct.pack("<5I", 0x07230203, 0x00010000, 0, 1, 0)
 
 
+def sampled_buffer_fixture(*, capability: int = 46, duplicate: bool = False, extra_capability: int | None = None) -> bytes:
+    words = [0x07230203, 0x00010000, 0, 2, 0]
+
+    def instruction(opcode: int, *operands: int) -> None:
+        words.append(((len(operands) + 1) << 16) | opcode)
+        words.extend(operands)
+
+    instruction(17, capability)  # OpCapability
+    if duplicate:
+        instruction(17, capability)
+    if extra_capability is not None:
+        instruction(17, extra_capability)
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+def fragment_interface_fixture(
+    *,
+    stage: str = "fragment",
+    entry: str = "PSMain",
+    variable_name: str = "out.var.SV_TARGET0",
+    storage_class: int = 3,
+    direct_interface: bool = True,
+    vector_length: int = 4,
+    component_type: str = "float",
+    location: int = 0,
+    index: int = 0,
+    missing_location: bool = False,
+    missing_index: bool = False,
+    execution_model: int = 4,
+) -> bytes:
+    words = [0x07230203, 0x00010000, 0, 10, 0]
+
+    def instruction(opcode: int, *operands: int) -> None:
+        words.append(((len(operands) + 1) << 16) | opcode)
+        words.extend(operands)
+
+    def literal(value: str) -> list[int]:
+        data = value.encode() + b"\0"
+        data += b"\0" * (-len(data) % 4)
+        return list(struct.unpack(f"<{len(data) // 4}I", data))
+
+    interface_ids = [9] if direct_interface else []
+    instruction(15, execution_model, 8, *literal(entry), *interface_ids)  # OpEntryPoint
+    instruction(5, 9, *literal(variable_name))  # OpName
+    if not missing_location:
+        instruction(71, 9, 30, location)  # Decorate Location
+    if not missing_index:
+        instruction(71, 9, 43, index)  # Decorate Index
+    type_ids = {"float": 1, "uint": 2, "int": 3}
+    instruction(22, 1, 32)  # OpTypeFloat 32-bit
+    instruction(21, 2, 32, 0)  # OpTypeInt uint
+    instruction(21, 3, 32, 1)  # OpTypeInt int
+    instruction(23, 4, type_ids[component_type], vector_length)  # OpTypeVector
+    instruction(32, 5, storage_class, 4)  # OpTypePointer
+    instruction(59, 5, 9, storage_class)  # OpVariable
+    return struct.pack(f"<{len(words)}I", *words)
+
+
 def push_constant_fixture(
     member_types: tuple[str, ...] = ("f32",),
     offsets: tuple[int, ...] = (0,),
@@ -366,8 +424,11 @@ class ClassificationTests(unittest.TestCase):
 
     def test_blocked_known_requires_complete_exact_witness(self) -> None:
         row = reference_row(True)
-        outcome, reason, record, witness = subject.classify_result(self.completed(2, b"", subject.KNOWN_STDERR), row, EMPTY_SPIRV, self.policy)
-        self.assertEqual((outcome, reason, record, witness), ("blocked-known", self.policy["outcomes"]["blocked_known_shader_nonuniform"]["reason_code"], None, None))
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(self.completed(2, b"", subject.KNOWN_STDERR), row, EMPTY_SPIRV, self.policy)
+        self.assertEqual(
+            (outcome, reason, record, scalar_witness, buffer_witness, fragment_witness),
+            ("blocked-known", self.policy["outcomes"]["blocked_known_shader_nonuniform"]["reason_code"], None, None, None, None),
+        )
 
     def test_blocked_known_rejects_stderr_prefix(self) -> None:
         row = reference_row(True)
@@ -411,13 +472,15 @@ class ScalarLayoutClassificationTests(unittest.TestCase):
 
     def test_exact_scalar_layout_witness_and_error_are_blocked_known(self) -> None:
         module = spirv_fixture()
-        outcome, reason, record, witness = subject.classify_result(
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
             self.completed(2, b"", subject.SCALAR_LAYOUT_STDERR), self.row, module, self.policy
         )
         self.assertEqual(outcome, "blocked-known")
         self.assertEqual(reason, self.policy["outcomes"]["blocked_known_scalar_layout"]["reason_code"])
         self.assertIsNone(record)
-        subject.validate_scalar_witness_record(witness, self.policy, "fixture")
+        self.assertIsNone(buffer_witness)
+        self.assertIsNone(fragment_witness)
+        subject.validate_scalar_witness_record(scalar_witness, self.policy, "fixture")
 
     def test_scalar_layout_witness_unexpected_success_is_fatal(self) -> None:
         module = spirv_fixture()
@@ -472,6 +535,260 @@ class ScalarLayoutClassificationTests(unittest.TestCase):
         witness["witness_sha256"] = base.digest_bytes(base.canonical_json(unhashed))
         with self.assertRaisesRegex(base.ArtifactError, "fields changed"):
             subject.validate_scalar_witness_record(witness, self.policy, "fixture")
+
+
+class SampledBufferClassificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = subject.load_policy()
+        self.row = reference_row(False)
+
+    def completed(self, code: int, stdout: bytes, stderr: bytes) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(["validator"], code, stdout, stderr)
+
+    def test_exact_sampled_buffer_witness_and_error_are_blocked_known(self) -> None:
+        module = sampled_buffer_fixture()
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
+            self.completed(2, b"", subject.SAMPLED_BUFFER_STDERR), self.row, module, self.policy
+        )
+        self.assertEqual(outcome, "blocked-known")
+        self.assertEqual(reason, self.policy["outcomes"]["blocked_known_sampled_buffer"]["reason_code"])
+        self.assertIsNone(record)
+        self.assertIsNone(scalar_witness)
+        self.assertIsNone(fragment_witness)
+        subject.validate_sampled_buffer_witness_record(buffer_witness, self.policy, "fixture")
+
+    def test_sampled_buffer_witness_unexpected_success_is_fatal(self) -> None:
+        module = sampled_buffer_fixture()
+        with self.assertRaisesRegex(base.ArtifactError, "unexpectedly passed"):
+            subject.classify_result(
+                self.completed(0, success_bytes(self.row, len(module)), b""), self.row, module, self.policy
+            )
+
+    def test_sampled_buffer_stderr_near_match_is_fatal(self) -> None:
+        with self.assertRaises(base.ArtifactError):
+            subject.classify_result(
+                self.completed(2, b"", subject.SAMPLED_BUFFER_STDERR[:-1]),
+                self.row, sampled_buffer_fixture(), self.policy,
+            )
+
+    def test_sampled_buffer_requires_empty_stdout(self) -> None:
+        with self.assertRaises(base.ArtifactError):
+            subject.classify_result(
+                self.completed(2, b"{}\n", subject.SAMPLED_BUFFER_STDERR),
+                self.row, sampled_buffer_fixture(), self.policy,
+            )
+
+    def test_sampled_buffer_requires_exact_exit_code(self) -> None:
+        with self.assertRaises(base.ArtifactError):
+            subject.classify_result(
+                self.completed(1, b"", subject.SAMPLED_BUFFER_STDERR),
+                self.row, sampled_buffer_fixture(), self.policy,
+            )
+
+    def test_sampled_buffer_pass_shaped_result_without_witness_is_fatal(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "unexpectedly passed|unclassified"):
+            subject.classify_result(
+                self.completed(0, success_bytes(self.row), b""),
+                self.row, sampled_buffer_fixture(), self.policy,
+            )
+
+    def test_sampled_buffer_witness_is_none_when_capability_absent(self) -> None:
+        self.assertIsNone(subject.sampled_buffer_witness(EMPTY_SPIRV, self.policy))
+
+    def test_sampled_buffer_witness_rejects_wrong_capability_value(self) -> None:
+        self.assertIsNone(subject.sampled_buffer_witness(sampled_buffer_fixture(capability=45), self.policy))
+
+    def test_sampled_buffer_witness_rejects_duplicate_capability(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "exactly once"):
+            subject.sampled_buffer_witness(sampled_buffer_fixture(duplicate=True), self.policy)
+
+    def test_sampled_buffer_witness_ignores_unrelated_extra_capability(self) -> None:
+        witness = subject.sampled_buffer_witness(sampled_buffer_fixture(extra_capability=1), self.policy)
+        self.assertIsNotNone(witness)
+        self.assertEqual(witness["capability"], {"name": "SampledBuffer", "value": 46})
+
+    def test_sampled_buffer_witness_records_exact_word_offset(self) -> None:
+        module = sampled_buffer_fixture(extra_capability=1)
+        witness = subject.sampled_buffer_witness(module, self.policy)
+        self.assertEqual(witness["word_offset"], 5)
+
+    def test_sampled_buffer_witness_rejects_group_decoration(self) -> None:
+        words = [0x07230203, 0x00010000, 0, 20, 0, (2 << 16) | 17, 46, (2 << 16) | 73, 19]
+        module = struct.pack(f"<{len(words)}I", *words)
+        with self.assertRaisesRegex(base.ArtifactError, "not implemented"):
+            subject.sampled_buffer_witness(module, self.policy)
+
+    def test_validate_sampled_buffer_witness_record_rejects_field_mutation(self) -> None:
+        witness = subject.sampled_buffer_witness(sampled_buffer_fixture(), self.policy)
+        for key, value in (("capability", {"name": "SampledBuffer", "value": 47}), ("word_offset", 9999)):
+            with self.subTest(key=key):
+                mutated = copy.deepcopy(witness)
+                mutated[key] = value
+                with self.assertRaises(base.ArtifactError):
+                    subject.validate_sampled_buffer_witness_record(mutated, self.policy, "fixture")
+
+    def test_validate_sampled_buffer_witness_record_rejects_hash_mutation(self) -> None:
+        witness = subject.sampled_buffer_witness(sampled_buffer_fixture(), self.policy)
+        witness["witness_sha256"] = "0" * 64
+        with self.assertRaisesRegex(base.ArtifactError, "identity changed"):
+            subject.validate_sampled_buffer_witness_record(witness, self.policy, "fixture")
+
+    def test_validate_sampled_buffer_witness_record_rejects_extra_key(self) -> None:
+        witness = subject.sampled_buffer_witness(sampled_buffer_fixture(), self.policy)
+        witness["extra"] = True
+        unhashed = copy.deepcopy(witness)
+        unhashed.pop("witness_sha256")
+        witness["witness_sha256"] = base.digest_bytes(base.canonical_json(unhashed))
+        with self.assertRaises(base.ArtifactError):
+            subject.validate_sampled_buffer_witness_record(witness, self.policy, "fixture")
+
+
+class FragmentInterfaceClassificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = subject.load_policy()
+        self.row = {**reference_row(False), "stage": "fragment", "entry": "PSMain"}
+
+    def completed(self, code: int, stdout: bytes, stderr: bytes) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(["validator"], code, stdout, stderr)
+
+    def test_exact_fragment_interface_witness_and_error_are_blocked_known(self) -> None:
+        module = fragment_interface_fixture()
+        outcome, reason, record, scalar_witness, buffer_witness, fragment_witness = subject.classify_result(
+            self.completed(2, b"", subject.FRAGMENT_INTERFACE_STDERR), self.row, module, self.policy
+        )
+        self.assertEqual(outcome, "blocked-known")
+        self.assertEqual(reason, self.policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]["reason_code"])
+        self.assertIsNone(record)
+        self.assertIsNone(scalar_witness)
+        self.assertIsNone(buffer_witness)
+        subject.validate_fragment_interface_witness_record(fragment_witness, self.policy, "fixture")
+
+    def test_fragment_interface_witness_unexpected_success_is_fatal(self) -> None:
+        module = fragment_interface_fixture()
+        with self.assertRaisesRegex(base.ArtifactError, "unexpectedly passed"):
+            subject.classify_result(
+                self.completed(0, success_bytes(self.row, len(module)), b""), self.row, module, self.policy
+            )
+
+    def test_fragment_interface_stderr_near_match_is_fatal(self) -> None:
+        with self.assertRaises(base.ArtifactError):
+            subject.classify_result(
+                self.completed(2, b"", subject.FRAGMENT_INTERFACE_STDERR[:-1]),
+                self.row, fragment_interface_fixture(), self.policy,
+            )
+
+    def test_fragment_interface_requires_empty_stdout(self) -> None:
+        with self.assertRaises(base.ArtifactError):
+            subject.classify_result(
+                self.completed(2, b"{}\n", subject.FRAGMENT_INTERFACE_STDERR),
+                self.row, fragment_interface_fixture(), self.policy,
+            )
+
+    def test_fragment_interface_requires_exact_exit_code(self) -> None:
+        with self.assertRaises(base.ArtifactError):
+            subject.classify_result(
+                self.completed(1, b"", subject.FRAGMENT_INTERFACE_STDERR),
+                self.row, fragment_interface_fixture(), self.policy,
+            )
+
+    def test_fragment_interface_pass_shaped_result_without_witness_is_fatal(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "unexpectedly passed|unclassified"):
+            subject.classify_result(
+                self.completed(0, success_bytes(self.row), b""),
+                self.row, fragment_interface_fixture(), self.policy,
+            )
+
+    def test_fragment_interface_witness_none_for_wrong_stage(self) -> None:
+        self.assertIsNone(subject.fragment_interface_witness(fragment_interface_fixture(), "vertex", "PSMain", self.policy))
+
+    def test_fragment_interface_witness_none_for_wrong_entry_name(self) -> None:
+        self.assertIsNone(subject.fragment_interface_witness(fragment_interface_fixture(entry="VSMain"), "fragment", "VSMain", self.policy))
+
+    def test_fragment_interface_witness_none_when_variable_name_absent(self) -> None:
+        self.assertIsNone(subject.fragment_interface_witness(fragment_interface_fixture(variable_name="out.var.OTHER"), "fragment", "PSMain", self.policy))
+
+    def test_fragment_interface_witness_rejects_when_not_direct_interface_member(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "interface member"):
+            subject.fragment_interface_witness(fragment_interface_fixture(direct_interface=False), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_wrong_storage_class(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "storage class"):
+            subject.fragment_interface_witness(fragment_interface_fixture(storage_class=1), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_pointer_storage_mismatch(self) -> None:
+        module = fragment_interface_fixture()
+        words = list(struct.unpack(f"<{len(module) // 4}I", module))
+        for index in range(len(words) - 3):
+            if words[index] == ((4 << 16) | 32) and words[index + 2] == 3:
+                words[index + 2] = 1
+                break
+        else:
+            self.fail("OpTypePointer instruction not found in fixture")
+        mutated = struct.pack(f"<{len(words)}I", *words)
+        with self.assertRaisesRegex(base.ArtifactError, "pointer storage class"):
+            subject.fragment_interface_witness(mutated, "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_non_float4(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "member type"):
+            subject.fragment_interface_witness(fragment_interface_fixture(vector_length=3), "fragment", "PSMain", self.policy)
+        with self.assertRaisesRegex(base.ArtifactError, "member type"):
+            subject.fragment_interface_witness(fragment_interface_fixture(component_type="uint"), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_missing_location(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "location"):
+            subject.fragment_interface_witness(fragment_interface_fixture(missing_location=True), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_missing_index(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "index"):
+            subject.fragment_interface_witness(fragment_interface_fixture(missing_index=True), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_wrong_location(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "location"):
+            subject.fragment_interface_witness(fragment_interface_fixture(location=1), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_wrong_index(self) -> None:
+        with self.assertRaisesRegex(base.ArtifactError, "index"):
+            subject.fragment_interface_witness(fragment_interface_fixture(index=1), "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_group_decoration(self) -> None:
+        module = fragment_interface_fixture()
+        words = list(struct.unpack(f"<{len(module) // 4}I", module)) + [(2 << 16) | 73, 19]
+        words[3] = 20
+        mutated = struct.pack(f"<{len(words)}I", *words)
+        with self.assertRaisesRegex(base.ArtifactError, "not implemented"):
+            subject.fragment_interface_witness(mutated, "fragment", "PSMain", self.policy)
+
+    def test_fragment_interface_witness_rejects_ambiguous_entry_point(self) -> None:
+        module = fragment_interface_fixture()
+        words = list(struct.unpack(f"<{len(module) // 4}I", module))
+
+        def literal(value: str) -> list[int]:
+            data = value.encode() + b"\0"
+            data += b"\0" * (-len(data) % 4)
+            return list(struct.unpack(f"<{len(data) // 4}I", data))
+
+        name_words = literal("PSMain")
+        extra = [((3 + len(name_words)) << 16) | 15, 4, 8] + name_words
+        words[3] = 12
+        combined = words + extra
+        mutated = struct.pack(f"<{len(combined)}I", *combined)
+        with self.assertRaisesRegex(base.ArtifactError, "ambiguous"):
+            subject.fragment_interface_witness(mutated, "fragment", "PSMain", self.policy)
+
+    def test_validate_fragment_interface_witness_record_rejects_field_mutation(self) -> None:
+        witness = subject.fragment_interface_witness(fragment_interface_fixture(), "fragment", "PSMain", self.policy)
+        for key, value in (("location", 1), ("index", 1), ("type", "float3"), ("storage_class", "Input"), ("variable_name", "other")):
+            with self.subTest(key=key):
+                mutated = copy.deepcopy(witness)
+                mutated[key] = value
+                with self.assertRaisesRegex(base.ArtifactError, "fields changed"):
+                    subject.validate_fragment_interface_witness_record(mutated, self.policy, "fixture")
+
+    def test_validate_fragment_interface_witness_record_rejects_hash_mutation(self) -> None:
+        witness = subject.fragment_interface_witness(fragment_interface_fixture(), "fragment", "PSMain", self.policy)
+        witness["witness_sha256"] = "0" * 64
+        with self.assertRaisesRegex(base.ArtifactError, "identity changed"):
+            subject.validate_fragment_interface_witness_record(witness, self.policy, "fixture")
 
 
 class InventoryTests(unittest.TestCase):
@@ -533,7 +850,7 @@ class ReceiptTests(unittest.TestCase):
             reason = None
         return {
             **row, "immediate_witness": profile_derivation["immediate_witness"], "selected_profile": selected_profile,
-            "scalar_layout_witness": None,
+            "scalar_layout_witness": None, "sampled_buffer_witness": None, "fragment_interface_witness": None,
             "outcome": "blocked-known" if blocked else "ingestible", "reason_code": reason,
             "validation": validation, "validation_record": result,
         }
@@ -584,6 +901,95 @@ class ReceiptTests(unittest.TestCase):
         })
         receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
         subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_valid_sampled_buffer_blocked_receipt(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        sampled_buffer = self.policy["outcomes"]["blocked_known_sampled_buffer"]
+        row["reason_code"] = sampled_buffer["reason_code"]
+        row["sampled_buffer_witness"] = subject.sampled_buffer_witness(sampled_buffer_fixture(), self.policy)
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.SAMPLED_BUFFER_STDERR),
+            "stderr_bytes": len(subject.SAMPLED_BUFFER_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_valid_fragment_interface_blocked_receipt(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        row["validation"]["arguments"] = subject.validator_arguments("baseline", "fragment", "PSMain")
+        fragment_interface = self.policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]
+        row["reason_code"] = fragment_interface["reason_code"]
+        row["fragment_interface_witness"] = subject.fragment_interface_witness(fragment_interface_fixture(), "fragment", "PSMain", self.policy)
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.FRAGMENT_INTERFACE_STDERR),
+            "stderr_bytes": len(subject.FRAGMENT_INTERFACE_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_sampled_buffer_row_missing_witness(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        sampled_buffer = self.policy["outcomes"]["blocked_known_sampled_buffer"]
+        row["reason_code"] = sampled_buffer["reason_code"]
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.SAMPLED_BUFFER_STDERR),
+            "stderr_bytes": len(subject.SAMPLED_BUFFER_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "lacks its exact witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_fragment_interface_row_missing_witness(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        row["stage"], row["entry"] = "fragment", "PSMain"
+        row["validation"]["arguments"] = subject.validator_arguments("baseline", "fragment", "PSMain")
+        fragment_interface = self.policy["outcomes"]["blocked_known_fragment_direct_blend_src_index_output"]
+        row["reason_code"] = fragment_interface["reason_code"]
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.FRAGMENT_INTERFACE_STDERR),
+            "stderr_bytes": len(subject.FRAGMENT_INTERFACE_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "lacks its exact witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_wrong_witness_attached_to_reason(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        sampled_buffer = self.policy["outcomes"]["blocked_known_sampled_buffer"]
+        row["reason_code"] = sampled_buffer["reason_code"]
+        row["scalar_layout_witness"] = subject.scalar_layout_witness(spirv_fixture(), self.policy)
+        row["validation"].update({
+            "exit_code": 2, "stdout_sha256": subject.EMPTY_SHA256, "stdout_bytes": 0,
+            "stderr_sha256": base.digest_bytes(subject.SAMPLED_BUFFER_STDERR),
+            "stderr_bytes": len(subject.SAMPLED_BUFFER_STDERR),
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaisesRegex(base.ArtifactError, "lacks its exact witness"):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
+
+    def test_receipt_rejects_pass_shaped_blocked_known_row(self) -> None:
+        receipt = self.make_receipt()
+        row = receipt["entries"][0]
+        sampled_buffer = self.policy["outcomes"]["blocked_known_sampled_buffer"]
+        row["reason_code"] = sampled_buffer["reason_code"]
+        row["sampled_buffer_witness"] = subject.sampled_buffer_witness(sampled_buffer_fixture(), self.policy)
+        row["validation"].update({
+            "exit_code": 0, "stdout_sha256": base.digest_bytes(success_bytes(row)), "stdout_bytes": len(success_bytes(row)),
+            "stderr_sha256": subject.EMPTY_SHA256, "stderr_bytes": 0,
+        })
+        receipt["assessment_set_sha256"] = base.digest_bytes(base.canonical_json(receipt["entries"]))
+        with self.assertRaises(base.ArtifactError):
+            subject.validate_assessment_receipt(self.rehash(receipt), self.policy)
 
     def test_valid_immediate_profile_receipt(self) -> None:
         receipt = self.make_receipt()

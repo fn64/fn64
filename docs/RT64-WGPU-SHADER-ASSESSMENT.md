@@ -46,15 +46,26 @@ Every row then receives exactly one outcome, in reference-receipt order:
     2, a 128-byte runtime array of `RDPParams`, and member 7 `keyScale` as
     `float3` at offset 92. Naga's standard layout requires 16-byte alignment, so
     the offset is deliberately recorded as unaligned.
+  - `SampledBuffer`: the exact pinned unsupported-capability diagnostic plus
+    authenticated capability `SampledBuffer` (46), declared exactly once at its
+    exact word offset.
+  - fragment direct blend-source-index output: the exact pinned `PSMain` entry-
+    point-invalid Naga validation diagnostic plus a witness derived from the
+    authenticated SPIR-V bytes. The witness requires a `fragment`-stage
+    `PSMain` entry point whose interface directly (not through a struct member)
+    lists an `Output`-storage-class `float4` variable named
+    `out.var.SV_TARGET0`, decorated with exact `Location` 0 and `Index` 0.
 
-An unexpected success for either blocker witness is contract drift, not an
+An unexpected success for any blocker witness is contract drift, not an
 ingestible result. The former row-11 baseline-limit diagnostic is deliberately
 not a blocker class: its derived immediate profile must pass or match another
 independently preserved exact blocker. Any near-match, other diagnostic, exit
 code, output, profile mismatch, missing or changed witness, row mutation, or
-incomplete denominator aborts without a complete receipt. Relaxed capabilities,
-disabling Naga `STRUCT_LAYOUTS`, SPIR-V passthrough, decoration stripping, skip
-flags, and unchecked shader-module creation are not admitted alternatives.
+incomplete denominator aborts without a complete receipt. Each blocked-known
+row carries exactly one matching witness among the four closed classes; an
+ingestible row carries none. Relaxed capabilities, disabling Naga
+`STRUCT_LAYOUTS`, SPIR-V passthrough, decoration stripping, skip flags, and
+unchecked shader-module creation are not admitted alternatives.
 
 ## Commands
 

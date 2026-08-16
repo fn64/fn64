@@ -8,7 +8,7 @@
   "receipt_path": "assessment-receipt.json",
   "producer": {
     "path": "tools/rt64_wgpu_shader_assessment.py",
-    "sha256": "19a51e391a0eda17375ef4b0c1557b408393822b02e636e6544ef44ac3cc7192"
+    "sha256": "603e2f4888e0475dea97be826ec2f3a7df7d0b2a05a8728ecd18ad5cbb0283e2"
   },
   "reference_corpus": {
     "receipt_schema": "fn64.rt64-reference-shader-receipt.v2",
@@ -139,6 +139,33 @@
         "member_offset": 92,
         "required_alignment": 16,
         "offset_aligned": false
+      }
+    },
+    "blocked_known_sampled_buffer": {
+      "reason_code": "naga30-strict-spv-unsupported-capability-sampled-buffer",
+      "exit_code": 2,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "2e23aab00f7d899c3a4370317fd382300c99a52965d0dc91e9c673e4cb5c311e",
+      "required_capability": {
+        "name": "SampledBuffer",
+        "value": 46
+      }
+    },
+    "blocked_known_fragment_direct_blend_src_index_output": {
+      "reason_code": "naga30-fragment-direct-blend-src-index-output",
+      "exit_code": 2,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "f70f2a2f56d21c128934400211b10ad4782d2f89275799a72971b7ea6e3b62c9",
+      "witness": {
+        "schema": "fn64.spirv-fragment-blend-src-index-output-witness.v1",
+        "stage": "fragment",
+        "entry": "PSMain",
+        "variable_name": "out.var.SV_TARGET0",
+        "storage_class": "Output",
+        "type": "float4",
+        "direct_interface_member": true,
+        "location": 0,
+        "index": 0
       }
     }
   },
