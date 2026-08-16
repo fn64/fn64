@@ -2,12 +2,14 @@
 
 mod production_adapter;
 mod triangle;
+mod triangle_vertices;
 
 pub use production_adapter::{push_decoded_raw_dpc, UnadmittedRawDpcCommand};
 pub use triangle::{
     triangle_word_count, CoefficientWords, DepthWords, RawTriangle, RawWord, TriangleDecodeError,
     TriangleFlags,
 };
+pub use triangle_vertices::{decode_triangle_vertices, TriangleVertex, TriangleVertices};
 
 use core::fmt;
 
