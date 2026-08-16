@@ -1,6 +1,6 @@
 //! RT64 color combiner: selector decode and one-cycle arithmetic.
 //!
-//! Characterization-first port, Slice 1 of
+//! Characterization-first port, Slice 2 of
 //! `/private/tmp/rt64-combiner-characterization-card.md`
 //! (sha256 `e67751ff975eaf970b8179b2b62bd0093ccddac3d73c3dc0539b611006b345a`).
 //! Source: MIT RT64, pinned commit `5473732a822a4423b5696e7cb18fecc425a59875`,
@@ -11,30 +11,37 @@
 //!
 //! Decode is exact and complete for every wire-legal `(slot, index,
 //! second_cycle)` triple: [`CombineParams::decode_color`]/[`decode_alpha`]
-//! reproduce RT64's `decodeColorInput`/`decodeAlphaInput` bit-for-bit,
-//! including selectors this slice's arithmetic does not yet implement
-//! (NOISE, KEY_CENTER/KEY_SCALE, K4/K5, LOD_FRACTION/PRIM_LOD_FRAC,
-//! `*_ALPHA` cross-reads, `COMBINED_ALPHA`). Only genuine RT64 out-of-range
-//! indices alias `ZERO`/`Combined`-adjacent fallthroughs (`default:` arms
-//! in the pinned source) — this port never substitutes `Zero` for a
-//! selector RT64 itself would decode to something else. Scope narrowing
-//! happens one layer later, in the *arithmetic*: [`run_one_cycle`] (via
-//! `resolve_color_input`/`resolve_alpha_input`) only evaluates `COMBINED`,
-//! `TEXEL0`, `TEXEL1`, `PRIMITIVE`, `SHADE`, `ENVIRONMENT`, `ONE`, `ZERO` —
-//! any other *decoded* selector returns a loud [`CombinerInputError`]
-//! rather than a silently wrong number, since this slice has no PRNG,
-//! derivative, or cross-channel-read implementation to evaluate it
-//! correctly yet.
+//! reproduce RT64's `decodeColorInput`/`decodeAlphaInput` bit-for-bit. Only
+//! genuine RT64 out-of-range indices alias `ZERO` (`default:` arms in the
+//! pinned source) — this port never substitutes `Zero` for a selector RT64
+//! itself would decode to something else.
 //!
-//! One-cycle mode only. Explicitly not in this slice (RT64 source read,
-//! not characterized here): NOISE's arithmetic (needs `Random.hlsli`'s
-//! PRNG, uncharacterized), KEY_CENTER/KEY_SCALE/K4/K5's arithmetic
-//! (deferred to Slice 2), LOD_FRACTION/PRIM_LOD_FRAC's arithmetic (needs
-//! `computeLOD`, uncharacterized), `*_ALPHA`/`COMBINED_ALPHA`'s arithmetic
-//! (Slice 2), two-cycle mode and its wrap/carry arithmetic (Slice 3,
-//! `wrap`/`wrapInputC`/`wrapInputABD`), copy mode, draw-path/shader-keying
-//! wiring, and any GPU execution. See [`CombinerInputError`] for the exact
-//! rejection behavior when a decoded selector's arithmetic is deferred.
+//! Slice 2 adds full one-cycle arithmetic for every selector reachable in
+//! one-cycle mode: [`run_one_cycle`] (via `resolve_color_input`/
+//! `resolve_alpha_input`, transcribed directly from RT64's `fromColorInput`/
+//! `fromAlphaInput`, `rt64_color_combiner.h:468-540`) now evaluates
+//! `COMBINED`, `TEXEL0`, `TEXEL1`, `PRIMITIVE`, `SHADE`, `ENVIRONMENT`,
+//! `KEY_CENTER`, `KEY_SCALE`, `COMBINED_ALPHA`, `TEXEL0_ALPHA`,
+//! `TEXEL1_ALPHA`, `PRIMITIVE_ALPHA`, `SHADE_ALPHA`, `ENV_ALPHA`,
+//! `LOD_FRACTION`, `PRIM_LOD_FRAC`, `NOISE`, `K4`, `K5`, `ONE`, `ZERO` for
+//! color, and `COMBINED`, `TEXEL0`, `TEXEL1`, `PRIMITIVE`, `SHADE`,
+//! `ENVIRONMENT`, `LOD_FRACTION`, `PRIM_LOD_FRAC`, `ONE`, `ZERO` for alpha —
+//! every variant either enum can hold. There is therefore no longer a
+//! deferred-selector rejection path in one-cycle mode; [`CombinerInputs`]
+//! carries every field RT64's `Inputs` struct has that a one-cycle formula
+//! can reach (`keyCenter`, `keyScale`, `lodFraction`, `primLodFrac`,
+//! `noise`, `K4`, `K5`), all caller-supplied — NOISE and the LOD fractions
+//! are explicit typed inputs at this seam, not a PRNG or a derivative
+//! computed here (RT64's own `initRand`/`nextRand`/`computeLOD` remain
+//! uncharacterized per the port card's §13 nonclaims; this slice does not
+//! invent them).
+//!
+//! One-cycle mode only. Explicitly not in this slice: two-cycle mode and
+//! its wrap/carry arithmetic (Slice 3, `wrap`/`wrapInputC`/`wrapInputABD`
+//! as a *cross-cycle carry* mechanism — the always-on final `wrapClamp`
+//! below is unrelated and already implemented), copy mode, `SetCombine`
+//! decode/`RdpState` tracking (Slice 4), real NOISE/LOD generation (Slices
+//! 5-6), shader-keying, draw-path wiring, and any GPU execution.
 //!
 //! The final `wrapClamp` (RT64 `rt64_color_combiner.h:562-565`, called
 //! unconditionally by `run` regardless of cycle count) still applies here:
@@ -43,6 +50,20 @@
 //! wrap used for cross-cycle carry. One-cycle mode never triggers the
 //! *carry* wrap (RT64's `secondCycle` flag is `twoCycle && secondCycleInputs`
 //! = `false && true` = `false`), but it still runs the final `wrapClamp`.
+//! `wrapClamp` is a per-scalar-channel clamp: extreme/out-of-range caller
+//! inputs (e.g. `NOISE`/`K4`/`K5` far outside `[0,1]`, or an intermediate
+//! `(A-B)*C+D` product that overshoots) still hit the same wrap-then-clamp
+//! boundary this module already tests at `WRAP_LOW`/`WRAP_HIGH`.
+//!
+//! `fromColorInput`/`fromAlphaInput` take a `secondCycle` bool distinct from
+//! `runCycle`'s `secondCycleInputs` (which selects the bitfield slice):
+//! `secondCycle = twoCycle && secondCycleInputs` (`rt64_color_combiner.h:577`).
+//! One-cycle mode always has `twoCycle = false`, so `secondCycle` is always
+//! `false` here — RT64's `TEXEL0`/`TEXEL1` swap-on-`secondCycle` branch
+//! (`fromColorInput`/`fromAlphaInput`'s `secondCycle ? texVal1 : texVal0`)
+//! never triggers in this slice, matching Slice 1's behavior exactly; this
+//! is verified directly against the pinned source for this task, not only
+//! inferred from the port card.
 
 /// Owned WGSL transcription of this module's decode tables and one-cycle
 /// arithmetic (`shaders/color_combiner.wgsl`). Naga-validated in this
@@ -109,47 +130,6 @@ pub enum AlphaInputSlot {
     C,
     D,
 }
-
-/// A *decoded* selector's arithmetic is not yet implemented by this slice
-/// (COMBINED/TEXEL0/TEXEL1/PRIMITIVE/SHADE/ENVIRONMENT/ONE/ZERO are the only
-/// ones [`run_one_cycle`] evaluates). This is strictly an arithmetic-layer
-/// concern — decode itself is always exact (see module docs): a color-A
-/// index of 7 always decodes to `ColorInput::Noise`, never `Zero`, exactly
-/// matching RT64. This error exists only because this port slice has not
-/// yet implemented the arithmetic those other selectors need (NOISE's PRNG,
-/// KEY_CENTER/KEY_SCALE, LOD_FRACTION's derivative, K4/K5, alpha cross-reads)
-/// — silently treating them as ZERO would misrepresent RT64's behavior, so
-/// this slice loudly refuses instead. AGENTS.md: "Unimplemented ABI surface
-/// panics with the symbol name and call context... a fallback that masks a
-/// missing feature" is exactly what a silent substitution here would be.
-///
-/// An enum, not a `{color: Option<_>, alpha: Option<_>}` struct: a color
-/// rejection and an alpha rejection are mutually exclusive by construction
-/// (one `resolve_*_input` call rejects at most one selector), so the type
-/// makes the `(Some, Some)`/`(None, None)` states that struct shape would
-/// allow unrepresentable instead of merely unconstructed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CombinerInputError {
-    Color(ColorInput),
-    Alpha(AlphaInput),
-}
-
-impl core::fmt::Display for CombinerInputError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Color(color) => write!(
-                formatter,
-                "combiner color selector {color:?} decoded exactly per RT64, but Slice 1 does not yet implement its arithmetic (evaluates COMBINED/TEXEL0/TEXEL1/PRIMITIVE/SHADE/ENVIRONMENT/ONE/ZERO only)"
-            ),
-            Self::Alpha(alpha) => write!(
-                formatter,
-                "combiner alpha selector {alpha:?} decoded exactly per RT64, but Slice 1 does not yet implement its arithmetic (evaluates COMBINED/TEXEL0/TEXEL1/PRIMITIVE/SHADE/ENVIRONMENT/ONE/ZERO only)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CombinerInputError {}
 
 /// Raw 64-bit `SetCombine` payload, split into low/high 32-bit halves per
 /// RT64's own field naming (`rt64_color_combiner.h`'s `L`/`H`).
@@ -261,12 +241,6 @@ impl CombineParams {
     /// `colorInputA` (`rt64_color_combiner.h`), decoded exactly: 0-5
     /// common, 6=ONE, 7=NOISE, 8-15=ZERO (the wire-legal-but-undecoded
     /// upper half of the 4-bit field, matching RT64's `default:` arm).
-    /// NOISE's *arithmetic* is deferred (Slice 2, no PRNG characterized
-    /// yet), but its *decode* is not — [`Self::color_input_a`] returns
-    /// `ColorInput::Noise` for index 7 exactly as RT64 does; only
-    /// `resolve_color_input` (the arithmetic layer) may reject it. Decoding
-    /// a valid RT64 selector to `Zero` here would be a silent behavior
-    /// change this port does not make.
     const fn color_input_a(index: u32) -> ColorInput {
         match index {
             0..=5 => Self::color_input_common(index),
@@ -277,8 +251,7 @@ impl CombineParams {
     }
 
     /// `colorInputB`, decoded exactly: 0-5 common, 6=KEY_CENTER, 7=K4,
-    /// 8-15=ZERO. See [`Self::color_input_a`]'s doc: decode is exact even
-    /// though KEY_CENTER/K4's arithmetic is deferred to Slice 2.
+    /// 8-15=ZERO.
     const fn color_input_b(index: u32) -> ColorInput {
         match index {
             0..=5 => Self::color_input_common(index),
@@ -290,9 +263,7 @@ impl CombineParams {
 
     /// `colorInputC`, decoded exactly: 0-5 common, 6-15 the extended
     /// KEY_SCALE/`*_ALPHA`/LOD_FRACTION/PRIM_LOD_FRAC/K5 table, 16-31=ZERO
-    /// (RT64's own upper-half-of-the-5-bit-field collapse). See
-    /// [`Self::color_input_a`]'s doc: decode is exact even though most of
-    /// this table's arithmetic is deferred to Slice 2.
+    /// (RT64's own upper-half-of-the-5-bit-field collapse).
     const fn color_input_c(index: u32) -> ColorInput {
         match index {
             0..=5 => Self::color_input_common(index),
@@ -311,8 +282,7 @@ impl CombineParams {
     }
 
     /// `colorInputD`, decoded exactly: 0-5 common, 6=ONE, 7=ZERO (RT64's
-    /// own table for D has no NOISE/KEY_CENTER/etc. entries to begin with,
-    /// so this matches RT64 exactly with no Slice 1/2 distinction to draw).
+    /// own table for D has no NOISE/KEY_CENTER/etc. entries to begin with).
     const fn color_input_d(index: u32) -> ColorInput {
         match index {
             0..=5 => Self::color_input_common(index),
@@ -322,8 +292,7 @@ impl CombineParams {
     }
 
     /// `alphaInputABD`: shared table for alpha slots A, B, D, decoded
-    /// exactly. RT64's own table has no entries outside Slice 1's
-    /// arithmetic scope in the first place, so there is nothing to defer.
+    /// exactly.
     const fn alpha_input_abd(index: u32) -> AlphaInput {
         match index {
             0 => AlphaInput::Combined,
@@ -341,9 +310,7 @@ impl CombineParams {
     /// 0=LOD_FRACTION, 1-5 common, 6=PRIM_LOD_FRAC, 7=ZERO. Note this
     /// table's own index-to-selector mapping is shifted from
     /// `alphaInputABD`'s (index 1 is TEXEL0 here, not COMBINED — RT64 has
-    /// no `A_COMBINED` reachable from alpha-C at all). See
-    /// [`Self::color_input_a`]'s doc: decode is exact even though
-    /// LOD_FRACTION/PRIM_LOD_FRAC's arithmetic is deferred to Slice 2.
+    /// no `A_COMBINED` reachable from alpha-C at all).
     const fn alpha_input_c(index: u32) -> AlphaInput {
         match index {
             0 => AlphaInput::LodFraction,
@@ -382,12 +349,18 @@ impl CombineParams {
     }
 }
 
-/// Per-pixel combiner inputs restricted to Slice 1's selector set. Mirrors
-/// the fields of RT64's `Inputs` struct (`rt64_color_combiner.h`) that
-/// COMBINED/TEXEL0/TEXEL1/PRIMITIVE/SHADE/ENVIRONMENT/ONE/ZERO can reach;
-/// NOISE/KEY_CENTER/KEY_SCALE/LOD_FRACTION/PRIM_LOD_FRAC/K4/K5 fields are
-/// intentionally absent — Slice 1 cannot consume them, so there is nowhere
-/// to plumb them through yet.
+/// Per-pixel combiner inputs. Mirrors RT64's `Inputs` struct
+/// (`rt64_color_combiner.h:451-466`) restricted to the fields a one-cycle
+/// formula can reach (`otherMode`/`alphaOnly` are two-cycle/copy-mode-only
+/// concerns, Slice 3+). `key_center`/`key_scale`/`lod_fraction`/
+/// `prim_lod_frac`/`noise`/`k4`/`k5` are caller-supplied typed values, not
+/// computed here: RT64's own `keyCenter`/`keyScale` are host-tracked
+/// (`rt64_rdp.h:129-131`), `lodFraction` is a per-pixel GPU derivative
+/// (`computeLOD`, uncharacterized), `primLodFrac` is a host-set per-draw
+/// uniform, and `noise` is a per-pixel PRNG draw (`initRand`/`nextRand`,
+/// uncharacterized) — this module has no PRNG or derivative implementation
+/// and does not invent one; it only proves the arithmetic that consumes
+/// whatever value the caller supplies at this seam.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CombinerInputs {
     pub tex_val0: [f32; 4],
@@ -395,69 +368,94 @@ pub struct CombinerInputs {
     pub prim_color: [f32; 4],
     pub shade_color: [f32; 4],
     pub env_color: [f32; 4],
+    pub key_center: [f32; 3],
+    pub key_scale: [f32; 3],
+    pub lod_fraction: f32,
+    pub prim_lod_frac: f32,
+    pub noise: f32,
+    pub k4: f32,
+    pub k5: f32,
 }
 
 /// Resolves one color selector to its RGB value, per `fromColorInput`
-/// (`rt64_color_combiner.h`). `combiner_color` stands in for RT64's
+/// (`rt64_color_combiner.h:468-514`). `combiner_color` stands in for RT64's
 /// `combinerColor.rgb` accumulator — in one-cycle mode this is always
 /// `[0.0, 0.0, 0.0]` (RT64 `run`'s zero-init, never written before the
 /// single `runCycle` call), so [`run_one_cycle`] passes that fixed value
 /// rather than exposing a caller-settable carry (which only exists for
 /// two-cycle mode, Slice 3).
 ///
-/// One-cycle mode's `secondCycle` local (`twoCycle && secondCycleInputs`) is
-/// always `false` (`twoCycle` is `false`), so `fromColorInput`'s TEXEL0/
-/// TEXEL1 swap-on-`secondCycle` branch never triggers — this always reads
-/// the un-swapped texel, matching RT64 exactly for one-cycle mode
-/// specifically (see module docs).
+/// `secondCycle` here is `fromColorInput`'s own parameter, distinct from
+/// `decodeColorInput`'s bitfield-slice `secondCycle` — RT64 calls it as
+/// `secondCycle = twoCycle && secondCycleInputs` (`runCycle`,
+/// `rt64_color_combiner.h:577`), always `false` in one-cycle mode
+/// (`twoCycle` is `false`), so the TEXEL0/TEXEL1 swap-on-`secondCycle`
+/// branch never triggers here — this always reads the un-swapped texel,
+/// matching RT64 exactly for one-cycle mode specifically (see module docs).
+/// `C_COMBINED_ALPHA`/`*_ALPHA` selectors read the *alpha* channel of the
+/// same named input, replicated into all three RGB lanes — exactly RT64's
+/// `return combinerColor.a;` / `return inputs.texVal0.a;` etc., an HLSL
+/// scalar-to-`float3` return that implicitly broadcasts.
 fn resolve_color_input(
     inputs: CombinerInputs,
     combiner_color: [f32; 3],
+    combiner_alpha: f32,
     selector: ColorInput,
-) -> Result<[f32; 3], CombinerInputError> {
+) -> [f32; 3] {
     match selector {
-        ColorInput::Combined => Ok(combiner_color),
-        ColorInput::Texel0 => Ok([inputs.tex_val0[0], inputs.tex_val0[1], inputs.tex_val0[2]]),
-        ColorInput::Texel1 => Ok([inputs.tex_val1[0], inputs.tex_val1[1], inputs.tex_val1[2]]),
-        ColorInput::Primitive => Ok([
+        ColorInput::Combined => combiner_color,
+        ColorInput::Texel0 => [inputs.tex_val0[0], inputs.tex_val0[1], inputs.tex_val0[2]],
+        ColorInput::Texel1 => [inputs.tex_val1[0], inputs.tex_val1[1], inputs.tex_val1[2]],
+        ColorInput::Primitive => [
             inputs.prim_color[0],
             inputs.prim_color[1],
             inputs.prim_color[2],
-        ]),
-        ColorInput::Shade => Ok([
+        ],
+        ColorInput::Shade => [
             inputs.shade_color[0],
             inputs.shade_color[1],
             inputs.shade_color[2],
-        ]),
-        ColorInput::Environment => Ok([
+        ],
+        ColorInput::Environment => [
             inputs.env_color[0],
             inputs.env_color[1],
             inputs.env_color[2],
-        ]),
-        ColorInput::One => Ok([1.0, 1.0, 1.0]),
-        ColorInput::Zero => Ok([0.0, 0.0, 0.0]),
-        other => Err(CombinerInputError::Color(other)),
+        ],
+        ColorInput::KeyCenter => inputs.key_center,
+        ColorInput::KeyScale => inputs.key_scale,
+        ColorInput::CombinedAlpha => [combiner_alpha; 3],
+        ColorInput::Texel0Alpha => [inputs.tex_val0[3]; 3],
+        ColorInput::Texel1Alpha => [inputs.tex_val1[3]; 3],
+        ColorInput::PrimitiveAlpha => [inputs.prim_color[3]; 3],
+        ColorInput::ShadeAlpha => [inputs.shade_color[3]; 3],
+        ColorInput::EnvAlpha => [inputs.env_color[3]; 3],
+        ColorInput::LodFraction => [inputs.lod_fraction; 3],
+        ColorInput::PrimLodFrac => [inputs.prim_lod_frac; 3],
+        ColorInput::Noise => [inputs.noise; 3],
+        ColorInput::K4 => [inputs.k4; 3],
+        ColorInput::K5 => [inputs.k5; 3],
+        ColorInput::One => [1.0, 1.0, 1.0],
+        ColorInput::Zero => [0.0, 0.0, 0.0],
     }
 }
 
-/// Resolves one alpha selector, per `fromAlphaInput`. `combiner_alpha`
-/// stands in for RT64's `combinerColor.a` accumulator — see
-/// [`resolve_color_input`]'s doc for why one-cycle mode fixes it at `0.0`.
-fn resolve_alpha_input(
-    inputs: CombinerInputs,
-    combiner_alpha: f32,
-    selector: AlphaInput,
-) -> Result<f32, CombinerInputError> {
+/// Resolves one alpha selector, per `fromAlphaInput`
+/// (`rt64_color_combiner.h:516-540`). `combiner_alpha` stands in for RT64's
+/// `combinerColor.a` accumulator — see [`resolve_color_input`]'s doc for why
+/// one-cycle mode fixes it at `0.0`, and for the `secondCycle` TEXEL0/TEXEL1
+/// swap note (identical here: always `false` in one-cycle mode).
+fn resolve_alpha_input(inputs: CombinerInputs, combiner_alpha: f32, selector: AlphaInput) -> f32 {
     match selector {
-        AlphaInput::Combined => Ok(combiner_alpha),
-        AlphaInput::Texel0 => Ok(inputs.tex_val0[3]),
-        AlphaInput::Texel1 => Ok(inputs.tex_val1[3]),
-        AlphaInput::Primitive => Ok(inputs.prim_color[3]),
-        AlphaInput::Shade => Ok(inputs.shade_color[3]),
-        AlphaInput::Environment => Ok(inputs.env_color[3]),
-        AlphaInput::One => Ok(1.0),
-        AlphaInput::Zero => Ok(0.0),
-        other => Err(CombinerInputError::Alpha(other)),
+        AlphaInput::Combined => combiner_alpha,
+        AlphaInput::Texel0 => inputs.tex_val0[3],
+        AlphaInput::Texel1 => inputs.tex_val1[3],
+        AlphaInput::Primitive => inputs.prim_color[3],
+        AlphaInput::Shade => inputs.shade_color[3],
+        AlphaInput::Environment => inputs.env_color[3],
+        AlphaInput::LodFraction => inputs.lod_fraction,
+        AlphaInput::PrimLodFrac => inputs.prim_lod_frac,
+        AlphaInput::One => 1.0,
+        AlphaInput::Zero => 0.0,
     }
 }
 
@@ -469,16 +467,17 @@ fn resolve_alpha_input(
 /// `false` here) — this is the separate, always-on final clamp, not that
 /// carry mechanism.
 ///
-/// `wrapInputABD`'s range is `[-0.5 - 1/255, 1.5 + 1/255]`; for any `i`
-/// already within `[0.0, 1.0]` — true for every one-cycle-mode result this
-/// slice can produce, since every Slice 1 input is itself `[0,1]`-normalized
-/// and the formula is `(A-B)*C+D` with no selector able to push arbitrarily
-/// far outside that band from in-range inputs alone — `wrap`'s two `step`
-/// adjustments are both no-ops (`step(i, Low)` and `step(High, i)` are both
-/// `0.0`), so this reduces to the plain `clamp(i, 0.0, 1.0)` RT64 itself
-/// would also produce for these inputs. Implemented as the full two-step
-/// formula anyway (not the reduced form) so it stays correct if a future
-/// slice widens the input range.
+/// `wrapInputABD`'s range is `[-0.5 - 1/255, 1.5 + 1/255]`. For a texel/prim/
+/// shade/env/key input (always `[0,1]`-normalized) this is a plain no-op
+/// `clamp(i, 0.0, 1.0)`, since `(A-B)*C+D` cannot push arbitrarily far
+/// outside that band from in-range inputs alone. Slice 2's caller-supplied
+/// `NOISE`/`K4`/`K5`/`LOD_FRACTION`/`PRIM_LOD_FRAC` fields carry no such
+/// guarantee (RT64 itself performs no range check on them either — see
+/// [`CombinerInputs`]'s doc), so an out-of-range value here genuinely
+/// exercises the wrap `step` branches this doc describes, not only the
+/// reduced clamp form — see `wrap_clamp_low_branch_triggers_below_low_bound`/
+/// `wrap_clamp_high_branch_triggers_at_or_above_high_bound` in this file's
+/// tests.
 fn wrap_clamp(i: f32) -> f32 {
     const ROUNDING: f32 = 1.0 / 255.0;
     const LOW: f32 = -0.5 - ROUNDING;
@@ -507,14 +506,14 @@ fn wrap_clamp(i: f32) -> f32 {
 /// (only) cycle's final alpha, since RT64 snapshots it immediately after
 /// the single `runCycle` call and no second cycle can overwrite it.
 ///
-/// Returns [`CombinerInputError`] if `params` decodes any selector outside
-/// this slice's scope (NOISE, KEY_CENTER/KEY_SCALE, K4/K5, LOD_FRACTION/
-/// PRIM_LOD_FRAC, or any `*_ALPHA`/`COMBINED_ALPHA` cross-read) rather than
-/// silently substituting a value RT64 would not produce.
-pub fn run_one_cycle(
-    params: CombineParams,
-    inputs: CombinerInputs,
-) -> Result<([f32; 4], f32), CombinerInputError> {
+/// Every selector [`ColorInput`]/[`AlphaInput`] can hold is evaluated —
+/// there is no remaining decoded-but-unimplemented selector in one-cycle
+/// mode, so this is infallible. `NOISE`/`LOD_FRACTION`/`PRIM_LOD_FRAC`/K4/K5
+/// use whatever value `inputs` supplies (see [`CombinerInputs`]'s doc); this
+/// function does not generate or validate them, matching RT64's own
+/// `fromColorInput`/`fromAlphaInput`, which take them as given struct
+/// fields with no range check either.
+pub fn run_one_cycle(params: CombineParams, inputs: CombinerInputs) -> ([f32; 4], f32) {
     const SECOND_CYCLE: bool = true;
 
     let ca = params.decode_color(ColorInputSlot::A, SECOND_CYCLE);
@@ -531,20 +530,20 @@ pub fn run_one_cycle(
     let combiner_color_in = [0.0f32; 3];
     let combiner_alpha_in = 0.0f32;
 
-    let a = resolve_color_input(inputs, combiner_color_in, ca)?;
-    let b = resolve_color_input(inputs, combiner_color_in, cb)?;
-    let c = resolve_color_input(inputs, combiner_color_in, cc)?;
-    let d = resolve_color_input(inputs, combiner_color_in, cd)?;
+    let a = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, ca);
+    let b = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cb);
+    let c = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cc);
+    let d = resolve_color_input(inputs, combiner_color_in, combiner_alpha_in, cd);
     let rgb = [
         (a[0] - b[0]) * c[0] + d[0],
         (a[1] - b[1]) * c[1] + d[1],
         (a[2] - b[2]) * c[2] + d[2],
     ];
 
-    let aa_v = resolve_alpha_input(inputs, combiner_alpha_in, aa)?;
-    let ab_v = resolve_alpha_input(inputs, combiner_alpha_in, ab)?;
-    let ac_v = resolve_alpha_input(inputs, combiner_alpha_in, ac)?;
-    let ad_v = resolve_alpha_input(inputs, combiner_alpha_in, ad)?;
+    let aa_v = resolve_alpha_input(inputs, combiner_alpha_in, aa);
+    let ab_v = resolve_alpha_input(inputs, combiner_alpha_in, ab);
+    let ac_v = resolve_alpha_input(inputs, combiner_alpha_in, ac);
+    let ad_v = resolve_alpha_input(inputs, combiner_alpha_in, ad);
     let alpha = (aa_v - ab_v) * ac_v + ad_v;
 
     // RT64 `run`: `alphaCompareValue = combinerColor.a` snapshotted right
@@ -558,7 +557,7 @@ pub fn run_one_cycle(
         wrap_clamp(alpha),
     ];
 
-    Ok((combiner_color, alpha_compare_value))
+    (combiner_color, alpha_compare_value)
 }
 
 #[cfg(test)]
@@ -571,15 +570,19 @@ mod tests {
         prim_color: [0.05, 0.15, 0.25, 0.35],
         shade_color: [0.11, 0.22, 0.33, 0.44],
         env_color: [0.66, 0.77, 0.88, 0.99],
+        key_center: [0.12, 0.34, 0.56],
+        key_scale: [0.21, 0.43, 0.65],
+        lod_fraction: 0.37,
+        prim_lod_frac: 0.58,
+        noise: 0.73,
+        k4: 0.19,
+        k5: 0.81,
     };
 
     // -- §9a: exhaustive decode-table sweep over every wire-legal index,
-    // asserting exact RT64 decode (not a Slice-1-narrowed one) — decode is
-    // never restricted in this port; only the arithmetic layer defers
-    // unimplemented selectors (see module docs / `CombinerInputError`).
-    // Cross-checked directly against the pinned
-    // `src/shared/rt64_color_combiner.h` source read for this task, not
-    // solely against the characterization card's transcription of it.
+    // asserting exact RT64 decode. Cross-checked directly against the
+    // pinned `src/shared/rt64_color_combiner.h` source read for this task,
+    // not solely against the characterization card's transcription of it.
 
     /// Exhaustive over color-A's full 4-bit wire range (0-15): every index
     /// this table can ever see, not a spot sample. 0-5 common, 6=ONE,
@@ -831,9 +834,9 @@ mod tests {
     #[test]
     fn identity_passthrough() {
         let inputs = ALL_INPUTS;
-        let a = resolve_color_input(inputs, [0.0; 3], ColorInput::Texel0).unwrap();
-        let zero = resolve_color_input(inputs, [0.0; 3], ColorInput::Zero).unwrap();
-        let one = resolve_color_input(inputs, [0.0; 3], ColorInput::One).unwrap();
+        let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0);
+        let zero = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Zero);
+        let one = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::One);
         let rgb = [
             (a[0] - zero[0]) * one[0] + zero[0],
             (a[1] - zero[1]) * one[1] + zero[1],
@@ -841,9 +844,9 @@ mod tests {
         ];
         assert_eq!(rgb, inputs.tex_val0[..3]);
 
-        let alpha_a = resolve_alpha_input(inputs, 0.0, AlphaInput::Texel0).unwrap();
-        let alpha_zero = resolve_alpha_input(inputs, 0.0, AlphaInput::Zero).unwrap();
-        let alpha_one = resolve_alpha_input(inputs, 0.0, AlphaInput::One).unwrap();
+        let alpha_a = resolve_alpha_input(inputs, 0.0, AlphaInput::Texel0);
+        let alpha_zero = resolve_alpha_input(inputs, 0.0, AlphaInput::Zero);
+        let alpha_one = resolve_alpha_input(inputs, 0.0, AlphaInput::One);
         let alpha = (alpha_a - alpha_zero) * alpha_one + alpha_zero;
         assert_eq!(alpha, inputs.tex_val0[3]);
     }
@@ -861,8 +864,8 @@ mod tests {
             texel0[2] * shade[2],
         ];
         for (channel, expected) in expected.into_iter().enumerate() {
-            let a = resolve_color_input(inputs, [0.0; 3], ColorInput::Texel0).unwrap()[channel];
-            let c = resolve_color_input(inputs, [0.0; 3], ColorInput::Shade).unwrap()[channel];
+            let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0)[channel];
+            let c = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Shade)[channel];
             assert!((a * c - expected).abs() < f32::EPSILON);
         }
     }
@@ -950,9 +953,9 @@ mod tests {
     #[test]
     fn combined_reads_zero_init_in_one_cycle_mode() {
         let inputs = ALL_INPUTS;
-        let combined = resolve_color_input(inputs, [0.0; 3], ColorInput::Combined).unwrap();
+        let combined = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Combined);
         assert_eq!(combined, [0.0, 0.0, 0.0]);
-        let combined_alpha = resolve_alpha_input(inputs, 0.0, AlphaInput::Combined).unwrap();
+        let combined_alpha = resolve_alpha_input(inputs, 0.0, AlphaInput::Combined);
         assert_eq!(combined_alpha, 0.0);
     }
 
@@ -1009,7 +1012,7 @@ mod tests {
         );
 
         let inputs = ALL_INPUTS;
-        let (color, alpha_compare) = run_one_cycle(params, inputs).unwrap();
+        let (color, alpha_compare) = run_one_cycle(params, inputs);
 
         let expected_rgb = [
             (inputs.tex_val0[0] - inputs.prim_color[0]) * inputs.shade_color[0]
@@ -1032,47 +1035,272 @@ mod tests {
         assert_eq!(alpha_compare, color[3]);
     }
 
-    /// Loud typed rejection at the arithmetic layer: a selector this
-    /// slice's arithmetic does not implement (e.g. NOISE, LOD_FRACTION)
-    /// must return `CombinerInputError`, never a silent ZERO substitution —
-    /// the AGENTS.md "loud traps, no silent shrugs" rule. Decode itself is
-    /// exact (see the `*_decode_table_exhaustive` tests above and
-    /// `noise_is_reachable_only_from_color_a_decode`) — this test is
-    /// specifically about [`resolve_color_input`]/[`resolve_alpha_input`],
-    /// the layer that actually narrows scope in this port.
-    #[test]
-    fn out_of_scope_selector_is_loudly_rejected() {
-        let inputs = ALL_INPUTS;
-        let error = resolve_color_input(inputs, [0.0; 3], ColorInput::Noise).unwrap_err();
-        assert_eq!(error, CombinerInputError::Color(ColorInput::Noise));
+    // -- Slice 2: every newly supported selector resolves to a real value
+    // (no `CombinerInputError`/rejection path remains in one-cycle mode —
+    // every `ColorInput`/`AlphaInput` variant is now evaluated, see
+    // `resolve_color_input`/`resolve_alpha_input`). Each test below mutates
+    // exactly one `CombinerInputs` field (holding a fixed identity-shaped
+    // formula around it) and confirms the output tracks that one field,
+    // proving the new selector actually participates rather than merely
+    // type-checking.
 
-        let error = resolve_alpha_input(inputs, 0.0, AlphaInput::LodFraction).unwrap_err();
-        assert_eq!(error, CombinerInputError::Alpha(AlphaInput::LodFraction));
+    /// `C_KEY_CENTER` (color-B only, §2): `(KEY_CENTER - ZERO) * ONE + ZERO`
+    /// must equal `key_center` exactly, and must change when `key_center`
+    /// changes while every other field stays fixed.
+    #[test]
+    fn key_center_participates_in_color_b() {
+        let base = ALL_INPUTS;
+        let mutated = CombinerInputs {
+            key_center: [0.91, 0.92, 0.93],
+            ..base
+        };
+        for inputs in [base, mutated] {
+            let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::KeyCenter);
+            assert_eq!(a, inputs.key_center);
+        }
+        assert_ne!(base.key_center, mutated.key_center);
     }
 
-    /// End-to-end deferred-selector rejection through `run_one_cycle`,
-    /// driven by real wire bits (not a hand-constructed enum value): a
-    /// `SetCombine` word whose color-A cycle-1 field is exactly 7 decodes
-    /// to `ColorInput::Noise` (per RT64, exactly — see
-    /// `color_slot_a_decode_table_exhaustive`), and `run_one_cycle` must
-    /// reject that decode with `CombinerInputError::Color(Noise)` rather
-    /// than silently treating it as ZERO or any other value. This is the
-    /// invariant a `CombineParams`-widening future slice depends on:
-    /// decode staying exact while arithmetic gates what it can evaluate.
+    /// `C_KEY_SCALE` (color-C only, §2), same shape as `key_center`.
     #[test]
-    fn run_one_cycle_rejects_a_wire_encoded_deferred_selector() {
+    fn key_scale_participates_in_color_c() {
+        let base = ALL_INPUTS;
+        let mutated = CombinerInputs {
+            key_scale: [0.01, 0.02, 0.03],
+            ..base
+        };
+        for inputs in [base, mutated] {
+            let c = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::KeyScale);
+            assert_eq!(c, inputs.key_scale);
+        }
+        assert_ne!(base.key_scale, mutated.key_scale);
+    }
+
+    /// `C_K4`/`C_K5` (color-B/color-C only, §2): scalar inputs replicated
+    /// into all three RGB lanes, exactly RT64's `return inputs.K4;` (an
+    /// HLSL scalar-to-`float3` implicit broadcast, not a per-channel value).
+    #[test]
+    fn k4_and_k5_scalars_replicate_across_rgb_and_participate() {
+        let base = ALL_INPUTS;
+        let mutated = CombinerInputs {
+            k4: 0.44,
+            k5: 0.55,
+            ..base
+        };
+        for inputs in [base, mutated] {
+            assert_eq!(
+                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::K4),
+                [inputs.k4; 3]
+            );
+            assert_eq!(
+                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::K5),
+                [inputs.k5; 3]
+            );
+        }
+        assert_ne!(base.k4, mutated.k4);
+        assert_ne!(base.k5, mutated.k5);
+    }
+
+    /// `C_LOD_FRACTION`/`C_PRIM_LOD_FRAC` (color-C only) and their alpha-C
+    /// counterparts `A_LOD_FRACTION`/`A_PRIM_LOD_FRAC` all read the same two
+    /// caller-supplied scalars — this is the RGB-vs-alpha cross-shape §2
+    /// calls out (color-C reaches them via the extended table; alpha-C via
+    /// its own distinct table), not two independent values.
+    #[test]
+    fn lod_fraction_and_prim_lod_frac_participate_color_and_alpha() {
+        let base = ALL_INPUTS;
+        let mutated = CombinerInputs {
+            lod_fraction: 0.05,
+            prim_lod_frac: 0.95,
+            ..base
+        };
+        for inputs in [base, mutated] {
+            assert_eq!(
+                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::LodFraction),
+                [inputs.lod_fraction; 3]
+            );
+            assert_eq!(
+                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::PrimLodFrac),
+                [inputs.prim_lod_frac; 3]
+            );
+            assert_eq!(
+                resolve_alpha_input(inputs, 0.0, AlphaInput::LodFraction),
+                inputs.lod_fraction
+            );
+            assert_eq!(
+                resolve_alpha_input(inputs, 0.0, AlphaInput::PrimLodFrac),
+                inputs.prim_lod_frac
+            );
+        }
+        assert_ne!(base.lod_fraction, mutated.lod_fraction);
+        assert_ne!(base.prim_lod_frac, mutated.prim_lod_frac);
+    }
+
+    /// `C_NOISE` (color-A only, §2, §5): a caller-supplied scalar, not a
+    /// PRNG draw — this module does not generate NOISE, only proves it
+    /// participates in the formula once supplied.
+    #[test]
+    fn noise_participates_in_color_a() {
+        let base = ALL_INPUTS;
+        let mutated = CombinerInputs {
+            noise: 0.02,
+            ..base
+        };
+        for inputs in [base, mutated] {
+            assert_eq!(
+                resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Noise),
+                [inputs.noise; 3]
+            );
+        }
+        assert_ne!(base.noise, mutated.noise);
+    }
+
+    /// `C_COMBINED_ALPHA`/`*_ALPHA` (color-C only, §2): a color slot reading
+    /// the *alpha* channel of the same named input, replicated across RGB —
+    /// the exact cross-read shape §2/§9b flag as needing its own case,
+    /// distinct from every other color selector (which reads `.rgb`).
+    #[test]
+    fn alpha_cross_reads_replicate_the_alpha_channel_not_rgb() {
         let inputs = ALL_INPUTS;
-        // color A cycle-1 bits are (low >> 5) & 0xF; 7 = NOISE.
-        let low = 7u32 << 5;
+        let combiner_alpha = 0.42;
+        assert_eq!(
+            resolve_color_input(inputs, [0.0; 3], combiner_alpha, ColorInput::CombinedAlpha),
+            [combiner_alpha; 3]
+        );
+        assert_eq!(
+            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0Alpha),
+            [inputs.tex_val0[3]; 3]
+        );
+        assert_eq!(
+            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel1Alpha),
+            [inputs.tex_val1[3]; 3]
+        );
+        assert_eq!(
+            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::PrimitiveAlpha),
+            [inputs.prim_color[3]; 3]
+        );
+        assert_eq!(
+            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::ShadeAlpha),
+            [inputs.shade_color[3]; 3]
+        );
+        assert_eq!(
+            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::EnvAlpha),
+            [inputs.env_color[3]; 3]
+        );
+        // Distinct from the RGB-reading counterpart for the same named
+        // input (proves this is genuinely a different read, not a typo
+        // that happens to match by construction).
+        assert_ne!(
+            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0Alpha),
+            resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Texel0)
+        );
+    }
+
+    /// `run_one_cycle` end-to-end with a KEY_CENTER/KEY_SCALE combine mode
+    /// (§9b's "environment-key composite" idiom): `(TEXEL0 - KEY_CENTER) *
+    /// KEY_SCALE + ZERO`, validating the restricted-slot table (KEY_CENTER
+    /// only from B, KEY_SCALE only from C) is honored end-to-end through
+    /// real wire bits, not just the unit-level resolver.
+    #[test]
+    fn run_one_cycle_key_center_key_scale_composite() {
+        // color A=TEXEL0(1) at cycle-1 bits (low>>5).
+        let low_color = 1u32 << 5;
+        // color B=KEY_CENTER(6) at (high>>24); D=ZERO(7) at (high>>6), since
+        // D's cycle-1 index 0 decodes to COMBINED, not ZERO — must be set
+        // explicitly, not left at the field's default.
+        let high_color = (6u32 << 24) | (7u32 << 6);
+        let low = low_color | 6u32; // color C cycle-1 bits = low & 0x1F = 6 = KEY_SCALE.
+
+        let params = CombineParams::from_wire(low, high_color);
+        assert_eq!(
+            params.decode_color(ColorInputSlot::A, true),
+            ColorInput::Texel0
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::B, true),
+            ColorInput::KeyCenter
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::C, true),
+            ColorInput::KeyScale
+        );
+        assert_eq!(
+            params.decode_color(ColorInputSlot::D, true),
+            ColorInput::Zero
+        );
+
+        let inputs = ALL_INPUTS;
+        let (color, _alpha_compare) = run_one_cycle(params, inputs);
+
+        let expected_rgb = [
+            (inputs.tex_val0[0] - inputs.key_center[0]) * inputs.key_scale[0],
+            (inputs.tex_val0[1] - inputs.key_center[1]) * inputs.key_scale[1],
+            (inputs.tex_val0[2] - inputs.key_center[2]) * inputs.key_scale[2],
+        ];
+        for (observed, expected) in color[..3].iter().zip(expected_rgb) {
+            assert!((observed - expected.clamp(0.0, 1.0)).abs() < 1e-6);
+        }
+    }
+
+    /// `run_one_cycle` end-to-end with `C_COMBINED_ALPHA` as the color-C
+    /// selector (§9b's "combined-alpha cross-read" idiom):
+    /// `(TEXEL0 - ZERO) * COMBINED_ALPHA + ZERO`. In one-cycle mode
+    /// `COMBINED_ALPHA` reads the zero-initialized alpha accumulator (RT64
+    /// `run`'s zero-init, same reasoning as
+    /// `combined_reads_zero_init_in_one_cycle_mode`), so the expected color
+    /// is exactly zero — this pins that `COMBINED_ALPHA` shares the *same*
+    /// accumulator zero-init as plain `COMBINED`, not a separate
+    /// always-nonzero path.
+    #[test]
+    fn run_one_cycle_combined_alpha_cross_read_reads_zero_init() {
+        // color A=TEXEL0(1) at cycle-1 bits (low>>5); color C=COMBINED_ALPHA(7) at (low & 0x1F).
+        let low = (1u32 << 5) | 7u32;
         let params = CombineParams::from_wire(low, 0);
         assert_eq!(
             params.decode_color(ColorInputSlot::A, true),
-            ColorInput::Noise
+            ColorInput::Texel0
         );
         assert_eq!(
-            run_one_cycle(params, inputs),
-            Err(CombinerInputError::Color(ColorInput::Noise))
+            params.decode_color(ColorInputSlot::C, true),
+            ColorInput::CombinedAlpha
         );
+
+        let inputs = ALL_INPUTS;
+        let (color, _alpha_compare) = run_one_cycle(params, inputs);
+        assert_eq!(color[..3], [0.0, 0.0, 0.0]);
+    }
+
+    /// Extreme/out-of-range caller-supplied values (§9b boundary sweep,
+    /// extended to Slice 2's new scalar inputs): NOISE/K4/K5 far outside
+    /// `[0,1]` must still land through the real `wrap`/`wrapInputABD`/
+    /// `wrapClamp` boundary this module already tests in isolation
+    /// (`wrap_clamp_low_branch_triggers_below_low_bound`/
+    /// `..._high_branch...`), not merely a plain `clamp` — this is the case
+    /// `wrap_clamp`'s doc flags as now reachable in Slice 2 (unlike Slice
+    /// 1's always-in-range inputs).
+    #[test]
+    fn extreme_scalar_inputs_hit_the_real_wrap_boundary() {
+        let inputs = CombinerInputs {
+            noise: 1_000.0,
+            k4: -1_000.0,
+            k5: f32::MAX,
+            ..ALL_INPUTS
+        };
+
+        // (NOISE - ZERO) * ONE + ZERO = NOISE, then wrap_clamp(NOISE).
+        let a = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Noise);
+        let zero = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::Zero);
+        let one = resolve_color_input(inputs, [0.0; 3], 0.0, ColorInput::One);
+        let rgb0 = (a[0] - zero[0]) * one[0] + zero[0];
+        assert_eq!(rgb0, inputs.noise);
+        assert_eq!(wrap_clamp(rgb0), wrap_clamp_reference(inputs.noise));
+        // 1000.0 is far outside both wrap ranges: after one wrap step it is
+        // still outside [0,1] pre-clamp, so the final clamp dominates — but
+        // it must go through the same wrap arithmetic RT64 does, which
+        // `wrap_clamp_reference` (an independent transcription) models.
+        assert_eq!(wrap_clamp(inputs.noise), 1.0);
+        assert_eq!(wrap_clamp(inputs.k4), 0.0);
+        assert_eq!(wrap_clamp(inputs.k5), 1.0);
     }
 
     /// NOISE is reachable *only* from color-A's decode table (§2: no other
@@ -1113,9 +1341,9 @@ mod tests {
         assert_eq!(
             digest,
             [
-                0x84, 0x77, 0xe5, 0xd0, 0x1a, 0x13, 0x96, 0xfd, 0xc1, 0x62, 0x75, 0xe8, 0x71,
-                0x4e, 0xc5, 0x10, 0x97, 0x5a, 0x60, 0x33, 0x2b, 0xca, 0xa5, 0xb8, 0x56, 0x0b,
-                0x49, 0x0e, 0x9c, 0x08, 0x32, 0x72,
+                0x5e, 0x96, 0x81, 0x82, 0x45, 0xff, 0xcf, 0xf9, 0x6e, 0x78, 0x55, 0xb4, 0xab,
+                0xa7, 0x4a, 0xc1, 0x8b, 0x91, 0x1d, 0x17, 0x88, 0x5f, 0x88, 0x6b, 0xf5, 0x73,
+                0xe1, 0x59, 0x55, 0xed, 0x21, 0x49,
             ],
             "color_combiner.wgsl changed; recompute and update this frozen digest in the same commit"
         );
@@ -1136,11 +1364,10 @@ mod tests {
     /// Hostile structural guard: asserts `color_combiner.wgsl`'s
     /// `color_input_a/b/c/d`/`alpha_input_abd/c` functions literally
     /// contain a `case` arm returning every RT64 selector reachable from
-    /// that table (not just the eight this slice's arithmetic evaluates).
-    /// A future edit that re-narrows decode back to a Slice-1-only ZERO
-    /// collapse — the exact regression this test module was rewritten to
-    /// catch — would delete one of these `case` lines and fail here, even
-    /// though `wgsl_parses_and_validates_under_naga` would still pass
+    /// that table. A future edit that re-narrows decode back to a
+    /// ZERO collapse — the exact regression this test module was rewritten
+    /// to catch — would delete one of these `case` lines and fail here,
+    /// even though `wgsl_parses_and_validates_under_naga` would still pass
     /// (removing a case arm is syntactically valid WGSL).
     #[test]
     fn wgsl_decode_tables_contain_every_rt64_selector_case() {
@@ -1165,7 +1392,40 @@ mod tests {
         ] {
             assert!(
                 source.contains(needle),
-                "color_combiner.wgsl is missing exact-decode case {needle:?} — decode must stay exact per RT64, only the arithmetic layer (resolve_color_input/resolve_alpha_input) may narrow scope"
+                "color_combiner.wgsl is missing exact-decode case {needle:?} — decode must stay exact per RT64"
+            );
+        }
+    }
+
+    /// Slice 2 companion to the decode-table guard above: asserts
+    /// `resolve_color_input`/`resolve_alpha_input` literally contain a
+    /// `case` arm evaluating every newly-supported selector's real
+    /// arithmetic (not merely decoding to it) — a future edit that reverts
+    /// arithmetic support back to a bare fallthrough would delete one of
+    /// these `case` lines and fail here.
+    #[test]
+    fn wgsl_arithmetic_evaluates_every_slice_2_selector_case() {
+        let source = COLOR_COMBINER_WGSL;
+        for needle in [
+            "case COLOR_KEY_CENTER: { return inputs.key_center; }",
+            "case COLOR_KEY_SCALE: { return inputs.key_scale; }",
+            "case COLOR_COMBINED_ALPHA: { return vec3<f32>(combiner_alpha, combiner_alpha, combiner_alpha); }",
+            "case COLOR_TEXEL0_ALPHA: { return vec3<f32>(inputs.tex_val0.a, inputs.tex_val0.a, inputs.tex_val0.a); }",
+            "case COLOR_TEXEL1_ALPHA: { return vec3<f32>(inputs.tex_val1.a, inputs.tex_val1.a, inputs.tex_val1.a); }",
+            "case COLOR_PRIMITIVE_ALPHA: { return vec3<f32>(inputs.prim_color.a, inputs.prim_color.a, inputs.prim_color.a); }",
+            "case COLOR_SHADE_ALPHA: { return vec3<f32>(inputs.shade_color.a, inputs.shade_color.a, inputs.shade_color.a); }",
+            "case COLOR_ENV_ALPHA: { return vec3<f32>(inputs.env_color.a, inputs.env_color.a, inputs.env_color.a); }",
+            "case COLOR_LOD_FRACTION: { return vec3<f32>(inputs.lod_fraction, inputs.lod_fraction, inputs.lod_fraction); }",
+            "case COLOR_PRIM_LOD_FRAC: { return vec3<f32>(inputs.prim_lod_frac, inputs.prim_lod_frac, inputs.prim_lod_frac); }",
+            "case COLOR_NOISE: { return vec3<f32>(inputs.noise, inputs.noise, inputs.noise); }",
+            "case COLOR_K4: { return vec3<f32>(inputs.k4, inputs.k4, inputs.k4); }",
+            "case COLOR_K5: { return vec3<f32>(inputs.k5, inputs.k5, inputs.k5); }",
+            "case ALPHA_LOD_FRACTION: { return inputs.lod_fraction; }",
+            "case ALPHA_PRIM_LOD_FRAC: { return inputs.prim_lod_frac; }",
+        ] {
+            assert!(
+                source.contains(needle),
+                "color_combiner.wgsl is missing Slice 2 arithmetic case {needle:?}"
             );
         }
     }
