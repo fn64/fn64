@@ -3,7 +3,7 @@
   "maintained_by": "integration lead; rendered by tools/rt64_port_dashboard.py",
   "program": {
     "goal": "Complete the full RT64-to-Rust port: remove fn64's project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.",
-    "updated_utc": "2026-08-16T09:54:30Z",
+    "updated_utc": "2026-08-16T09:58:00Z",
     "program_state": "IN PROGRESS",
     "branch": "main",
     "base_branch": "origin/main",
@@ -1056,7 +1056,8 @@
         "Commit d8c0d4b1 adds a real callable ABI capture API plus renderer-neutral plan, owned capture, packet finalization, and v3 record/replay types.",
         "Admission is capture-independent and precedes ABI read-plan exposure; the ABI owns only bounds and N64Recomp byte-lane translation while the renderer owns semantic read selection.",
         "The accepted path retains no RDRAM pointer or borrow and allocates only declared reads, not a full memory snapshot. Record v3 intentionally rejects v2.",
-        "This is a synthetic cross-crate mechanism proof, not production DPC dispatch migration, TMEM population, GPU upload, RT64 parity, or performance evidence."
+        "This is a synthetic cross-crate mechanism proof, not production DPC dispatch migration, TMEM population, GPU upload, RT64 parity, or performance evidence.",
+        "The first downstream wgpu baseline exposed a stale pre-v3 workload golden outside M4.0's original test matrix. The v3 identity is now frozen at 08dc8fbe and the full 81-unit/nine-doctest consumer suite passed 10/10."
       ],
       "verification_runs": [
         {
@@ -1076,16 +1077,22 @@
           "clean_run_count": 1,
           "required_run_count": 1,
           "kind": "single"
+        },
+        {
+          "command": "cargo test -p fn64-render-wgpu",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
         }
       ],
       "blocker": null,
       "next_action": "Use the owned read mechanism in M4.1's typed texture/TMEM command-state path, then migrate production dispatch only after separately reviewed execution and guest-publication ordering exists.",
       "started_utc": "2026-08-16T09:00:00Z",
-      "updated_utc": "2026-08-16T09:54:30Z",
+      "updated_utc": "2026-08-16T09:58:00Z",
       "retrospective": {
         "friction": "A broad rustfmt invocation on a dirty module root recursively reformatted unrelated legacy modules and created roughly 36,000 lines of noise before testing.",
         "cause": "The formatter was aimed at a module root instead of the explicit owned files, and changed-path scope was audited after the command rather than before tests.",
-        "prevention": "Format only explicit owned files in dirty legacy trees, stage new modules before linting, and require a git-status plus changed-path audit before any test loop.",
+        "prevention": "Format only explicit owned files in dirty legacy trees, stage new modules before linting, audit changed paths before tests, and run direct downstream identity consumers whenever a shared record schema changes.",
         "estimated_minutes_saved": 35
       }
     },

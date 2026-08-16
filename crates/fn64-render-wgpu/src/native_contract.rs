@@ -73,7 +73,7 @@ pub const NATIVE_FILL_NATIVE_RGBA8_SHA256: &str =
 pub const NATIVE_FILL_POST_VI_BGRA8_SHA256: &str =
     "f9d2bc2ea8345a97d8a514eae7f50c165175355a80ca805309429d83748f7ee2";
 pub const NATIVE_FILL_WORKLOAD_SHA256: &str =
-    "3d079907c20080a277ccee1344e6af9332828b3c520dd12d31f502bbf8d63c2c";
+    "08dc8fbed0143100b556b7b8bce27a31b78ff5e7bb1f0c914e29963275eb22d0";
 pub const NATIVE_FILL_STREAM_SHA256: &str =
     "057b789d4989fe90faf753f8f6802db8aa64b94249dadffdda8e3a70ff4753d1";
 pub const NATIVE_FILL_JOURNAL_SHA256: &str =
@@ -1029,11 +1029,11 @@ mod tests {
         let (decoded, mut backend, mut guest) = lifecycle();
         assert_eq!(
             NATIVE_FILL_WORKLOAD_SHA256,
-            "3d079907c20080a277ccee1344e6af9332828b3c520dd12d31f502bbf8d63c2c"
+            "08dc8fbed0143100b556b7b8bce27a31b78ff5e7bb1f0c914e29963275eb22d0"
         );
         assert_eq!(
             decoded.submitted().packet().identity().to_string(),
-            "3d079907c20080a277ccee1344e6af9332828b3c520dd12d31f502bbf8d63c2c"
+            "08dc8fbed0143100b556b7b8bce27a31b78ff5e7bb1f0c914e29963275eb22d0"
         );
         assert_eq!(
             NATIVE_FILL_STREAM_SHA256,
