@@ -1123,17 +1123,20 @@ mod tlut_transfer_plan_tests {
     }
 
     #[test]
-    fn destination_word_near_tmem_top_wraps_within_the_high_bank_only() {
-        // tmem=511, entries=2: 511 + 1 exceeds the 512-word space, but a
-        // TLUT destination must never wrap into low-half TMEM (words
-        // 0-255). It wraps through `project_tlut_high_bank_word`'s
-        // dedicated `0x100 | ((base + entry) & 0xff)` projection, landing
-        // back at word 256 -- not word 0, which the shared 512-word
-        // `& 0x01ff` linear mask Block/Tile use would (wrongly) produce.
+    fn destination_word_near_tmem_top_wraps_to_word_zero() {
+        // tmem=511, entries=2: 511 + 1 exceeds the 512-word space.
+        // M4.3.1c: the destination wraps across the full 512-word TMEM
+        // domain (`project_tlut_full_domain_word`'s `& 0x01ff` mask,
+        // matching this repository's own `write_tlut` full-4-KiB-byte-mask
+        // precedent and the pinned RT64 reference), landing at word 0 --
+        // not word 256, which M4.3.1b's now-superseded high-bank-only
+        // projection produced. See `project_tlut_full_domain_word`'s doc
+        // comment: this is RT64/reference parity policy, not a proven
+        // silicon fact.
         let load = decode_tlut(511, 2, (0x300, 0x304)).unwrap();
         let plan = load.transfer_plan().unwrap();
         assert_eq!(plan.destination_word(0).unwrap(), 511);
-        assert_eq!(plan.destination_word(1).unwrap(), 256);
+        assert_eq!(plan.destination_word(1).unwrap(), 0);
     }
 
     #[test]
@@ -1144,18 +1147,22 @@ mod tlut_transfer_plan_tests {
     }
 
     #[test]
-    fn destination_base_511_plus_one_entry_wraps_to_256_not_zero() {
+    fn destination_base_511_plus_one_entry_wraps_to_word_zero() {
+        // M4.3.1c: base 511 followed by one more entry wraps to word 0
+        // (full 512-word domain wrap), not word 256 (M4.3.1b's superseded
+        // high-bank-only wrap). See `project_tlut_full_domain_word`.
         let load = decode_tlut(511, 1, (0x300, 0x302)).unwrap();
         let plan = load.transfer_plan().unwrap();
         assert_eq!(plan.destination_word(0).unwrap(), 511);
 
         let load = decode_tlut(511, 2, (0x300, 0x304)).unwrap();
         let plan = load.transfer_plan().unwrap();
-        assert_eq!(plan.destination_word(1).unwrap(), 256);
+        assert_eq!(plan.destination_word(0).unwrap(), 511);
+        assert_eq!(plan.destination_word(1).unwrap(), 0);
     }
 
     #[test]
-    fn full_256_entry_high_bank_coverage_never_touches_low_half() {
+    fn full_256_entry_high_bank_coverage_never_wraps_within_capacity() {
         let load = decode_tlut(256, 256, (0x300, 0x500)).unwrap();
         let plan = load.transfer_plan().unwrap();
         for word in 0..256u16 {
@@ -1166,28 +1173,25 @@ mod tlut_transfer_plan_tests {
             );
         }
         // Base 256 with 256 entries exactly fills 256..512: entry 255 (the
-        // last real entry in this load) lands at word 511, the top of the
-        // high bank, with no wrap. A 256th entry beyond this load's declared
-        // count would be the one that wraps, back to word 256 -- not entry
-        // 255 itself.
+        // last real entry in this load) lands at word 511, the top of TMEM,
+        // with no wrap -- a 256th entry beyond this load's declared count
+        // would be the one that wraps, back to word 0 under the full-domain
+        // projection (see `destination_base_511_plus_one_entry_wraps_to_word_zero`).
         assert_eq!(plan.destination_word(0).unwrap(), 256);
         assert_eq!(plan.destination_word(255).unwrap(), 511);
     }
 
     #[test]
-    fn every_entry_of_a_511_base_load_stays_in_the_high_bank() {
-        // Regression for the exact bug this task repairs: a full 256-entry
-        // load based at the top of TMEM must still project every word into
-        // 256..512, never spilling into low-half TMEM at any entry index.
-        let load = decode_tlut(511, 256, (0x300, 0x500)).unwrap();
+    fn base_511_word_511_then_word_0_boundary_is_literal() {
+        // Regression for the exact bug this task repairs: base=511 with 2
+        // entries must produce destination word 511 for entry 0 and word 0
+        // for entry 1 -- the literal 511-then-0 boundary crossing, per the
+        // RT64/`write_tlut` full-4096-byte-domain wrap policy this task
+        // adopts (see `project_tlut_full_domain_word`'s doc comment).
+        let load = decode_tlut(511, 2, (0x300, 0x304)).unwrap();
         let plan = load.transfer_plan().unwrap();
-        for word in 0..256u16 {
-            let destination = plan.destination_word(word).unwrap();
-            assert!(
-                (256..512).contains(&destination),
-                "TLUT destination word {destination} at entry {word} escaped the high bank"
-            );
-        }
+        assert_eq!(plan.destination_word(0).unwrap(), 511);
+        assert_eq!(plan.destination_word(1).unwrap(), 0);
     }
 
     #[test]
@@ -1202,7 +1206,7 @@ mod tlut_transfer_plan_tests {
                     assert_eq!(range.end(), expected_start + 8);
                 }
                 TmemTransferPhysicalWord::SplitBanks { .. } => {
-                    panic!("LoadTLUT destination is always the linear high bank")
+                    panic!("LoadTLUT destination is always linear, never split-banks")
                 }
             }
         }

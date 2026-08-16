@@ -444,30 +444,30 @@ impl TmemTransferGeometry {
     }
 }
 
-/// Projects a LoadTLUT destination word into the high TMEM bank (words
-/// 256-511), never wrapping into the low half. SGI RDP Command Summary
-/// Table 9 / libultra `gbi.h` `gDPLoadTLUTCmd` require the palette
-/// destination tile's `tmem` field to already be `>= 256` (enforced by
-/// `decode_load_tlut`'s pre-existing gate before this arm runs); once
-/// admitted, every subsequent entry word must stay inside that same
-/// 256-word high bank -- this is public hardware/project projection
-/// authority (SGI Table 9 / `gDPLoadTLUTCmd`), not a claim this
-/// repository's `write_tlut` (`fn64-render-reference/src/gbi/state.rs`)
-/// establishes. `write_tlut` is cited elsewhere for the quadrication/
-/// stride fact only (one entry per 8-byte word, value quadricated into
-/// it); it is HLE F3DEX2 authority for that fact and is explicitly
-/// **not** authority for high-bank wrap: its own `physical_byte` masks
-/// against the *full* 4 KiB TMEM byte domain
-/// (`fn64-render-reference/src/gbi/state.rs`'s `TMEM_BYTES - 1` mask),
-/// so a `write_tlut(511, 1, _)` call would wrap into low-half TMEM --
-/// the same noncanonical behavior this function exists to avoid, not a
-/// precedent for avoiding it. Wrapping through the shared 512-word
-/// `& 0x01ff` mask Block/Tile use would likewise let `base=511, entry=1`
-/// land on low-half word 0 -- a destination LoadTLUT can never target on
-/// real hardware.
-const fn project_tlut_high_bank_word(base_word: u16, entry_index: u64) -> u16 {
-    let projected = (base_word as u64 + entry_index) & 0xff;
-    0x100 | projected as u16
+/// Projects a LoadTLUT destination word by wrapping across the full
+/// 512-word (4096-byte) TMEM domain, matching this repository's own prior
+/// `write_tlut` precedent (`fn64-render-reference/src/gbi/state.rs`):
+/// `write_tlut`'s `physical_byte`/`write_byte` path masks the destination
+/// byte offset against the *full* TMEM byte domain (`TMEM_BYTES - 1`,
+/// i.e. `& 4095`), so word 511's successor is word 0, not word 256. The
+/// allowed MIT RT64 reference (pinned commit 5473732,
+/// `src/hle/rt64_rdp.cpp` lines 400-437) projects LoadTLUT destination
+/// words the same way, through its `RDP_TMEM_MASK8` (`4095`) full-domain
+/// byte mask.
+///
+/// This is an explicit RT64/reference-precedent parity policy, not a
+/// proven silicon fact: SGI RDP Command Summary Table 10 requires the
+/// starting destination tile's `tmem` field to already name a high-half
+/// word (`>= 256`, enforced by `decode_load_tlut`'s pre-existing gate
+/// before this arm runs, and retained unchanged here) and describes the
+/// quadrication stride; libultra `gbi.h`'s `gDPLoadTLUTCmd` is cited
+/// elsewhere only for the command's wire shape (field layout), not as
+/// authority for either the high-half requirement or overflow behavior.
+/// Neither source defines what happens once `base + entry` advances past
+/// word 511. Real-hardware measurement of that overflow behavior remains
+/// the frontier this function does not close.
+const fn project_tlut_full_domain_word(base_word: u16, entry_index: u64) -> u16 {
+    ((base_word as u64 + entry_index) & 0x01ff) as u16
 }
 
 pub(crate) fn project_tmem_transfer_word(
@@ -527,7 +527,7 @@ pub(crate) fn project_tmem_transfer_word(
             )
         }
         TmemLoadKind::Tlut { .. } => {
-            // SGI RDP Command Summary Table 9 / libultra `gbi.h`
+            // SGI RDP Command Summary Table 10 / libultra `gbi.h`
             // `gDPLoadTLUTCmd`: LoadTLUT's destination is `entries`
             // consecutive TMEM word slots starting at the tile descriptor's
             // `tmem` word, one 8-byte word per palette entry (the entry's
@@ -538,17 +538,13 @@ pub(crate) fn project_tmem_transfer_word(
             // `base_word + index` addressing and regression fixture
             // `ci4_samples_quadricated_tlut_at_palette_bank_address`
             // establish this exact stride as fn64's own cited behavioral
-            // spec -- for quadrication/stride only. `write_tlut` is not
-            // cited for destination wrap: see `project_tlut_high_bank_word`'s
-            // doc comment for why its own full-4-KiB `physical_byte` mask
-            // makes it the opposite of high-bank-wrap authority. There is
-            // no row/DXT accumulation, so word advance is a direct index and
-            // there is no odd-row bank exchange. The destination projects
-            // through `project_tlut_high_bank_word`, never the shared
-            // 512-word linear mask below -- a TLUT destination must stay in
-            // the high bank even when `base + entry` would otherwise wrap
-            // into low TMEM.
-            let destination_word = project_tlut_high_bank_word(descriptor.tmem().get(), word);
+            // spec. There is no row/DXT accumulation, so word advance is a
+            // direct index and there is no odd-row bank exchange. The
+            // destination projects through `project_tlut_full_domain_word`,
+            // which wraps across the full 512-word TMEM domain -- see that
+            // function's doc comment for why (RT64/`write_tlut` reference
+            // parity, not a proven silicon fact).
+            let destination_word = project_tlut_full_domain_word(descriptor.tmem().get(), word);
             (destination_word, word, false)
         }
     };
