@@ -286,6 +286,24 @@
 //! compare, depth, framebuffer resource binding/readback, raster primitive
 //! execution, target storage, presentation, native adapter qualification,
 //! full-ROM/pixel parity, or performance claim.
+//!
+//! `texture_gen` is a characterization-first literal port of RT64's
+//! `normalizeSafe`/`computeTextureGen` (`src/shaders/TextureGen.hlsli:9-34`,
+//! pinned commit `5473732a822a4423b5696e7cb18fecc425a59875`,
+//! `docs/RT64-PORT-AUTHORITY.md`): safe vector normalization, the
+//! row-vector-form `mul(lookAt-axis, worldMatrix)` transform (preserved
+//! exactly as the pinned source calls it, not reconciled with the opposite
+//! matrix-first convention used elsewhere in the same RT64 source tree), the
+//! unconditional pre-branch `[-1,1]` clamp, both the linear
+//! (`acos(-x) * 325.94932`) and non-linear (`(x+1) * 512`) modes, and the
+//! final `(inputUV / 65536) * texgenUV` scale. An independently-derived Rust
+//! oracle (`compute_texture_gen`) is matched by an owned, Naga-validated
+//! WGSL transcription (`shaders/texture_gen.wgsl`); neither is compiled into
+//! any pipeline or wired to a draw path. It adds no RSP lookat-matrix
+//! derivation, world-matrix upload/storage-buffer plumbing, vertex-shader
+//! integration, combiner/texture-sample consumption of the returned UV,
+//! draw-path or production-DPC wiring, or RT64 visual/pixel/silicon parity
+//! or performance claim.
 #![forbid(unsafe_code)]
 
 mod alpha_compare;
@@ -304,6 +322,7 @@ mod rgb_dither;
 mod shader_manifest;
 mod state;
 mod targets;
+mod texture_gen;
 mod tmem;
 mod vi;
 
@@ -414,6 +433,10 @@ pub use targets::{
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, ResidentColorTarget, Rgba8,
     TargetError, TargetGeneration, TargetRectangle, TargetRowRange, TargetRows,
     UninitializedNativeRaster,
+};
+pub use texture_gen::{
+    compute_texture_gen, normalize_safe, RspLookAt, WorldMatrix, TEXTURE_GEN_ENTRY_POINT,
+    TEXTURE_GEN_WGSL,
 };
 pub use tmem::{
     address_point_texel, address_texture_cell, decode_direct_texel, decode_tlut_entry,
