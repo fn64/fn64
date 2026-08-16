@@ -1,14 +1,14 @@
 {
-  "schema": "fn64.rt64-wgpu-shader-assessment-policy.v1",
+  "schema": "fn64.rt64-wgpu-shader-assessment-policy.v2",
   "direct_consumers": [
     "tools/rt64_wgpu_shader_assessment.py",
     "tools/test_rt64_wgpu_shader_assessment.py"
   ],
-  "receipt_schema": "fn64.rt64-wgpu-shader-assessment.v1",
+  "receipt_schema": "fn64.rt64-wgpu-shader-assessment.v2",
   "receipt_path": "assessment-receipt.json",
   "producer": {
     "path": "tools/rt64_wgpu_shader_assessment.py",
-    "sha256": "f29cb65427b81da174f57c81f2736548b28316caabff497669e2f070bb2d5d64"
+    "sha256": "aad9faea8e0cdf0d9eba7849be2c39bf18685a9f0d382de6465bff31e3a035b7"
   },
   "reference_corpus": {
     "receipt_schema": "fn64.rt64-reference-shader-receipt.v2",
@@ -69,7 +69,7 @@
       "stdout_status": "passed",
       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
-    "blocked_known": {
+    "blocked_known_shader_nonuniform": {
       "reason_code": "naga30-strict-spv-unsupported-capability-shader-nonuniform",
       "exit_code": 2,
       "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -80,6 +80,30 @@
       },
       "required_extension": "SPV_EXT_descriptor_indexing",
       "required_direct_decoration": "NonUniform"
+    },
+    "blocked_known_scalar_layout": {
+      "reason_code": "naga30-standard-storage-layout-rejects-dxc-scalar-layout-rdpparams-keyscale",
+      "exit_code": 2,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr": "fn64-wgpu-shader-validator: wgpu 30 naga validation failed: Global variable [0] 'instanceRDPParams' is invalid\n",
+      "stderr_sha256": "8eb59befb8e49ad4fec7ede5bb510fbb579c1bebcf02080c2c7c657e83edace4",
+      "witness": {
+        "schema": "fn64.spirv-scalar-layout-witness.v1",
+        "variable_name": "instanceRDPParams",
+        "storage_class": "Uniform",
+        "buffer_block": true,
+        "descriptor_set": 0,
+        "binding": 2,
+        "container_name": "type.StructuredBuffer.RDPParams",
+        "runtime_array_stride": 128,
+        "struct_name": "RDPParams",
+        "member_index": 7,
+        "member_name": "keyScale",
+        "member_type": "float3",
+        "member_offset": 92,
+        "required_alignment": 16,
+        "offset_aligned": false
+      }
     }
   },
   "runtime_readiness": {

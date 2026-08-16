@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ POLICY_PATH = ROOT / "docs/rt64-wgpu-shader-assessment-schema.json"
 RECEIPT_NAME = "assessment-receipt.json"
 EMPTY_SHA256 = base.digest_bytes(b"")
 KNOWN_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 SPIR-V parse failed: unsupported capability ShaderNonUniform\n"
+SCALAR_LAYOUT_STDERR = b"fn64-wgpu-shader-validator: wgpu 30 naga validation failed: Global variable [0] 'instanceRDPParams' is invalid\n"
 RUNTIME_NOT_READY_EXIT = 78
 
 
@@ -57,12 +59,12 @@ def load_policy() -> dict:
         "schema", "direct_consumers", "receipt_schema", "receipt_path", "producer", "reference_corpus",
         "wgpu_validator", "outcomes", "runtime_readiness", "limits", "claim_boundary",
     }, "wgpu assessment policy")
-    base.require(policy["schema"] == "fn64.rt64-wgpu-shader-assessment-policy.v1", "unsupported wgpu assessment policy")
+    base.require(policy["schema"] == "fn64.rt64-wgpu-shader-assessment-policy.v2", "unsupported wgpu assessment policy")
     base.require(policy["direct_consumers"] == [
         "tools/rt64_wgpu_shader_assessment.py",
         "tools/test_rt64_wgpu_shader_assessment.py",
     ], "wgpu assessment policy consumer denominator changed")
-    base.require(policy["receipt_schema"] == "fn64.rt64-wgpu-shader-assessment.v1", "unsupported wgpu assessment receipt schema")
+    base.require(policy["receipt_schema"] == "fn64.rt64-wgpu-shader-assessment.v2", "unsupported wgpu assessment receipt schema")
     base.require(policy["receipt_path"] == RECEIPT_NAME, "wgpu assessment receipt path changed")
     base.require_keys(policy["producer"], {"path", "sha256"}, "wgpu assessment producer")
     base.require(policy["producer"]["path"] == "tools/rt64_wgpu_shader_assessment.py", "wgpu assessment producer path changed")
@@ -103,14 +105,14 @@ def load_policy() -> dict:
         "HOME": "<private-staging-root>", "LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin",
     }, "wgpu validator environment changed")
     outcomes = policy["outcomes"]
-    base.require_keys(outcomes, {"order", "ingestible", "blocked_known"}, "wgpu outcome policy")
+    base.require_keys(outcomes, {"order", "ingestible", "blocked_known_shader_nonuniform", "blocked_known_scalar_layout"}, "wgpu outcome policy")
     base.require(outcomes["order"] == ["ingestible", "blocked-known"], "wgpu outcome order changed")
     base.require_keys(outcomes["ingestible"], {"exit_code", "stdout_schema", "stdout_status", "stderr_sha256"}, "ingestible outcome")
     base.require(outcomes["ingestible"] == {
         "exit_code": 0, "stdout_schema": "fn64.wgpu-shader-validation.v1",
         "stdout_status": "passed", "stderr_sha256": EMPTY_SHA256,
     }, "ingestible outcome changed")
-    blocked = outcomes["blocked_known"]
+    blocked = outcomes["blocked_known_shader_nonuniform"]
     base.require_keys(blocked, {
         "reason_code", "exit_code", "stdout_sha256", "stderr_sha256", "required_capability",
         "required_extension", "required_direct_decoration",
@@ -124,6 +126,26 @@ def load_policy() -> dict:
         "required_extension": "SPV_EXT_descriptor_indexing",
         "required_direct_decoration": "NonUniform",
     }, "blocked-known outcome changed")
+    scalar = outcomes["blocked_known_scalar_layout"]
+    base.require_keys(scalar, {"reason_code", "exit_code", "stdout_sha256", "stderr", "stderr_sha256", "witness"}, "blocked-known scalar-layout outcome")
+    base.require_keys(scalar["witness"], {
+        "schema", "variable_name", "storage_class", "buffer_block", "descriptor_set", "binding",
+        "container_name", "runtime_array_stride", "struct_name", "member_index", "member_name",
+        "member_type", "member_offset", "required_alignment", "offset_aligned",
+    }, "scalar-layout witness policy")
+    base.require(scalar == {
+        "reason_code": "naga30-standard-storage-layout-rejects-dxc-scalar-layout-rdpparams-keyscale",
+        "exit_code": 2, "stdout_sha256": EMPTY_SHA256,
+        "stderr": SCALAR_LAYOUT_STDERR.decode(), "stderr_sha256": base.digest_bytes(SCALAR_LAYOUT_STDERR),
+        "witness": {
+            "schema": "fn64.spirv-scalar-layout-witness.v1", "variable_name": "instanceRDPParams",
+            "storage_class": "Uniform", "buffer_block": True, "descriptor_set": 0, "binding": 2,
+            "container_name": "type.StructuredBuffer.RDPParams", "runtime_array_stride": 128,
+            "struct_name": "RDPParams", "member_index": 7, "member_name": "keyScale",
+            "member_type": "float3", "member_offset": 92, "required_alignment": 16,
+            "offset_aligned": False,
+        },
+    }, "blocked-known scalar-layout outcome changed")
     readiness = policy["runtime_readiness"]
     base.require_keys(readiness, {"runtime_ready", "reason_order"}, "runtime readiness policy")
     base.require(readiness == {
@@ -240,9 +262,130 @@ def stage_validator(binary: Path, private_root: Path, policy: dict) -> Path:
     return staged
 
 
+def scalar_layout_witness(artifact_bytes: bytes, policy: dict) -> dict | None:
+    base.require(len(artifact_bytes) >= 20 and len(artifact_bytes) % 4 == 0, "scalar-layout SPIR-V extent is invalid")
+    words = list(struct.unpack(f"<{len(artifact_bytes) // 4}I", artifact_bytes))
+    base.require(words[0] == 0x07230203 and words[3] >= 1 and words[4] == 0, "scalar-layout SPIR-V header is invalid")
+    bound = words[3]
+    names: dict[int, str] = {}
+    member_names: dict[tuple[int, int], str] = {}
+    decorations: dict[tuple[int, int], tuple[int, ...]] = {}
+    member_decorations: dict[tuple[int, int, int], tuple[int, ...]] = {}
+    float_types: dict[int, int] = {}
+    vector_types: dict[int, tuple[int, int]] = {}
+    runtime_arrays: dict[int, int] = {}
+    struct_types: dict[int, tuple[int, ...]] = {}
+    pointer_types: dict[int, tuple[int, int]] = {}
+    variables: dict[int, tuple[int, int]] = {}
+
+    def put_unique(table: dict, key: object, value: object, label: str) -> None:
+        base.require(key not in table, f"duplicate {label}")
+        table[key] = value
+
+    def valid_id(value: int, label: str) -> int:
+        base.require(0 < value < bound, f"{label} is outside the SPIR-V id bound")
+        return value
+
+    offset = 5
+    while offset < len(words):
+        first = words[offset]
+        word_count = first >> 16
+        opcode = first & 0xFFFF
+        base.require(word_count > 0 and offset + word_count <= len(words), f"malformed scalar-layout SPIR-V instruction at word {offset}")
+        operands = words[offset + 1 : offset + word_count]
+        if opcode in {73, 74, 75}:
+            raise base.ArtifactError(f"scalar-layout group decoration is not implemented at word {offset}")
+        if opcode == 5:  # OpName
+            base.require(word_count >= 3, f"malformed OpName at word {offset}")
+            target = valid_id(operands[0], "OpName target")
+            put_unique(names, target, reference.decode_literal_string(operands[1:], f"OpName at word {offset}"), "OpName target")
+        elif opcode == 6:  # OpMemberName
+            base.require(word_count >= 4, f"malformed OpMemberName at word {offset}")
+            target = valid_id(operands[0], "OpMemberName target")
+            put_unique(member_names, (target, operands[1]), reference.decode_literal_string(operands[2:], f"OpMemberName at word {offset}"), "OpMemberName target")
+        elif opcode == 71:  # OpDecorate
+            base.require(word_count >= 3, f"malformed scalar-layout OpDecorate at word {offset}")
+            target = valid_id(operands[0], "OpDecorate target")
+            put_unique(decorations, (target, operands[1]), tuple(operands[2:]), "OpDecorate target and kind")
+        elif opcode == 72:  # OpMemberDecorate
+            base.require(word_count >= 4, f"malformed scalar-layout OpMemberDecorate at word {offset}")
+            target = valid_id(operands[0], "OpMemberDecorate target")
+            put_unique(member_decorations, (target, operands[1], operands[2]), tuple(operands[3:]), "OpMemberDecorate target, member, and kind")
+        elif opcode == 22:  # OpTypeFloat
+            base.require(word_count == 3, f"malformed OpTypeFloat at word {offset}")
+            put_unique(float_types, valid_id(operands[0], "OpTypeFloat result"), operands[1], "OpTypeFloat result")
+        elif opcode == 23:  # OpTypeVector
+            base.require(word_count == 4, f"malformed OpTypeVector at word {offset}")
+            put_unique(vector_types, valid_id(operands[0], "OpTypeVector result"), (valid_id(operands[1], "OpTypeVector component"), operands[2]), "OpTypeVector result")
+        elif opcode == 29:  # OpTypeRuntimeArray
+            base.require(word_count == 3, f"malformed OpTypeRuntimeArray at word {offset}")
+            put_unique(runtime_arrays, valid_id(operands[0], "OpTypeRuntimeArray result"), valid_id(operands[1], "OpTypeRuntimeArray element"), "OpTypeRuntimeArray result")
+        elif opcode == 30:  # OpTypeStruct
+            base.require(word_count >= 2, f"malformed OpTypeStruct at word {offset}")
+            put_unique(struct_types, valid_id(operands[0], "OpTypeStruct result"), tuple(valid_id(value, "OpTypeStruct member") for value in operands[1:]), "OpTypeStruct result")
+        elif opcode == 32:  # OpTypePointer
+            base.require(word_count == 4, f"malformed OpTypePointer at word {offset}")
+            put_unique(pointer_types, valid_id(operands[0], "OpTypePointer result"), (operands[1], valid_id(operands[2], "OpTypePointer pointee")), "OpTypePointer result")
+        elif opcode == 59:  # OpVariable
+            base.require(word_count in {4, 5}, f"malformed OpVariable at word {offset}")
+            put_unique(variables, valid_id(operands[1], "OpVariable result"), (valid_id(operands[0], "OpVariable type"), operands[2]), "OpVariable result")
+        offset += word_count
+    base.require(offset == len(words), "scalar-layout SPIR-V stream did not terminate exactly")
+
+    matching = [identifier for identifier, name in names.items() if name == "instanceRDPParams"]
+    if not matching:
+        return None
+    base.require(len(matching) == 1, "scalar-layout witness variable name is ambiguous")
+    variable_id = matching[0]
+    base.require(variable_id in variables, "scalar-layout witness name does not identify a variable")
+    pointer_id, storage_class = variables[variable_id]
+    base.require(storage_class == 2, "scalar-layout witness storage class changed")
+    base.require(pointer_types.get(pointer_id, (None, None))[0] == 2, "scalar-layout witness pointer storage class changed")
+    container_id = pointer_types[pointer_id][1]
+    base.require(names.get(container_id) == "type.StructuredBuffer.RDPParams", "scalar-layout witness container name changed")
+    base.require(struct_types.get(container_id) is not None and len(struct_types[container_id]) == 1, "scalar-layout witness container shape changed")
+    runtime_array_id = struct_types[container_id][0]
+    rdp_params_id = runtime_arrays.get(runtime_array_id)
+    base.require(rdp_params_id is not None, "scalar-layout witness runtime array changed")
+    base.require(names.get(rdp_params_id) == "RDPParams", "scalar-layout witness struct name changed")
+    members = struct_types.get(rdp_params_id)
+    base.require(members is not None and len(members) > 7, "scalar-layout witness member denominator changed")
+    key_scale_type = members[7]
+    float_type, vector_length = vector_types.get(key_scale_type, (None, None))
+    base.require(vector_length == 3 and float_types.get(float_type) == 32, "scalar-layout witness member type changed")
+
+    def exact_decoration(target: int, decoration: int, expected: tuple[int, ...], label: str) -> None:
+        base.require(decorations.get((target, decoration)) == expected, f"scalar-layout witness {label} changed")
+
+    def exact_member_decoration(target: int, member: int, decoration: int, expected: tuple[int, ...], label: str) -> None:
+        base.require(member_decorations.get((target, member, decoration)) == expected, f"scalar-layout witness {label} changed")
+
+    exact_decoration(variable_id, 34, (0,), "descriptor set")
+    exact_decoration(variable_id, 33, (2,), "binding")
+    exact_decoration(container_id, 3, (), "BufferBlock decoration")
+    exact_decoration(runtime_array_id, 6, (128,), "runtime-array stride")
+    exact_member_decoration(container_id, 0, 35, (0,), "container member offset")
+    exact_member_decoration(container_id, 0, 24, (), "container member read-only decoration")
+    exact_member_decoration(rdp_params_id, 7, 35, (92,), "keyScale member offset")
+    base.require(member_names.get((rdp_params_id, 7)) == "keyScale", "scalar-layout witness member name changed")
+    required_alignment = 4 * (float_types[float_type] // 8)
+    fields = {
+        "schema": "fn64.spirv-scalar-layout-witness.v1", "variable_name": names[variable_id],
+        "storage_class": "Uniform", "buffer_block": True, "descriptor_set": 0, "binding": 2,
+        "container_name": names[container_id], "runtime_array_stride": 128,
+        "struct_name": names[rdp_params_id], "member_index": 7,
+        "member_name": member_names[(rdp_params_id, 7)], "member_type": "float3",
+        "member_offset": 92, "required_alignment": required_alignment,
+        "offset_aligned": 92 % required_alignment == 0,
+    }
+    base.require(fields == policy["outcomes"]["blocked_known_scalar_layout"]["witness"], "scalar-layout witness contract changed")
+    fields["witness_sha256"] = base.digest_bytes(base.canonical_json(fields))
+    return fields
+
+
 def inventory_supports_known_blocker(inventory: object, policy: dict) -> None:
     base.require(isinstance(inventory, dict), "blocked-known row has no semantic inventory")
-    blocked = policy["outcomes"]["blocked_known"]
+    blocked = policy["outcomes"]["blocked_known_shader_nonuniform"]
     capabilities = inventory.get("capabilities")
     extensions = inventory.get("extensions")
     decorations = inventory.get("non_uniform_decorations")
@@ -278,17 +421,28 @@ def validate_inventory_record(inventory: object, label: str) -> None:
     base.require(digest == base.digest_bytes(base.canonical_json(unhashed)), f"{label} identity changed")
 
 
-def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artifact_bytes: bytes, policy: dict) -> tuple[str, str | None, dict | None]:
+def validate_scalar_witness_record(witness: object, policy: dict, label: str) -> None:
+    expected = policy["outcomes"]["blocked_known_scalar_layout"]["witness"]
+    base.require_keys(witness, set(expected) | {"witness_sha256"}, label)
+    unhashed = copy.deepcopy(witness)
+    digest = require_sha(unhashed.pop("witness_sha256", None), f"{label} identity")
+    base.require(unhashed == expected, f"{label} fields changed")
+    base.require(digest == base.digest_bytes(base.canonical_json(unhashed)), f"{label} identity changed")
+
+
+def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artifact_bytes: bytes, policy: dict) -> tuple[str, str | None, dict | None, dict | None]:
     stdout_sha = base.digest_bytes(result.stdout)
     stderr_sha = base.digest_bytes(result.stderr)
     inventory = row.get("semantic_inventory")
-    has_shader_nonuniform = isinstance(inventory, dict) and policy["outcomes"]["blocked_known"]["required_capability"] in [
+    has_shader_nonuniform = isinstance(inventory, dict) and policy["outcomes"]["blocked_known_shader_nonuniform"]["required_capability"] in [
         {"name": item.get("name"), "value": item.get("value")}
         for item in inventory.get("capabilities", []) if isinstance(item, dict)
     ]
+    scalar_witness = scalar_layout_witness(artifact_bytes, policy)
     ingestible = policy["outcomes"]["ingestible"]
     if result.returncode == ingestible["exit_code"] and stderr_sha == ingestible["stderr_sha256"]:
         base.require(not has_shader_nonuniform, f"ShaderNonUniform witness unexpectedly passed strict wgpu ingestion: {row['id']}")
+        base.require(scalar_witness is None, f"scalar-layout witness unexpectedly passed strict wgpu ingestion: {row['id']}")
         try:
             record = json.loads(result.stdout)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -306,12 +460,17 @@ def classify_result(result: subprocess.CompletedProcess[bytes], row: dict, artif
             f'"module_bytes":{len(artifact_bytes)}}}\n'
         ).encode()
         base.require(result.stdout == expected_bytes, f"ingestible stdout bytes changed: {row['id']}")
-        return "ingestible", None, record
-    blocked = policy["outcomes"]["blocked_known"]
+        return "ingestible", None, record, None
+    blocked = policy["outcomes"]["blocked_known_shader_nonuniform"]
     if result.returncode == blocked["exit_code"] and stdout_sha == blocked["stdout_sha256"] and stderr_sha == blocked["stderr_sha256"]:
         base.require(result.stderr == KNOWN_STDERR, f"blocked-known stderr bytes changed: {row['id']}")
         inventory_supports_known_blocker(row.get("semantic_inventory"), policy)
-        return "blocked-known", blocked["reason_code"], None
+        return "blocked-known", blocked["reason_code"], None, scalar_witness
+    scalar = policy["outcomes"]["blocked_known_scalar_layout"]
+    if result.returncode == scalar["exit_code"] and stdout_sha == scalar["stdout_sha256"] and stderr_sha == scalar["stderr_sha256"]:
+        base.require(result.stderr == SCALAR_LAYOUT_STDERR, f"blocked-known scalar-layout stderr bytes changed: {row['id']}")
+        base.require(scalar_witness is not None, f"blocked-known scalar-layout row lacks its exact structural witness: {row['id']}")
+        return "blocked-known", scalar["reason_code"], None, scalar_witness
     raise base.ArtifactError(
         f"unclassified wgpu validator outcome for {row['id']}: exit={result.returncode} stdout_sha256={stdout_sha} stderr_sha256={stderr_sha}"
     )
@@ -344,7 +503,7 @@ def assess_row(validator: Path, corpus_dir: Path, private_root: Path, row: dict,
     after_files = sorted(path.relative_to(private_root).as_posix() for path in private_root.rglob("*") if path.is_file() or path.is_symlink())
     base.require(before_files == after_files, f"wgpu validator changed the private file set: {row['id']}")
     base.require(base.digest_file(snapshot) == digest and base.digest_file(validator) == policy["wgpu_validator"]["binary_sha256"], f"wgpu validator changed qualified bytes: {row['id']}")
-    outcome, reason, stdout_record = classify_result(result, row, artifact_bytes, policy)
+    outcome, reason, stdout_record, scalar_witness = classify_result(result, row, artifact_bytes, policy)
     transcript = {
         "arguments": ["--shader", "<private-staged-spv>", "--stage", row["stage"], "--entry", row["entry"]],
         "exit_code": result.returncode, "stdout_sha256": base.digest_bytes(result.stdout),
@@ -355,7 +514,8 @@ def assess_row(validator: Path, corpus_dir: Path, private_root: Path, row: dict,
         "id": row["id"], "source": row["source"], "stage": row["stage"], "entry": row["entry"],
         "spirv_artifact": row["spirv_artifact"], "spirv_sha256": digest, "spirv_bytes": len(artifact_bytes),
         "semantic_inventory": copy.deepcopy(row["semantic_inventory"]), "outcome": outcome,
-        "reason_code": reason, "validation": transcript, "validation_record": stdout_record,
+        "scalar_layout_witness": scalar_witness, "reason_code": reason,
+        "validation": transcript, "validation_record": stdout_record,
     }
 
 
@@ -489,7 +649,7 @@ def validate_assessment_receipt(receipt: object, policy: dict) -> None:
     for index, row in enumerate(entries):
         base.require_keys(row, {
             "id", "source", "stage", "entry", "spirv_artifact", "spirv_sha256", "spirv_bytes",
-            "semantic_inventory", "outcome", "reason_code", "validation", "validation_record",
+            "semantic_inventory", "scalar_layout_witness", "outcome", "reason_code", "validation", "validation_record",
         }, f"wgpu assessment row {index}")
         base.require(isinstance(row["id"], str) and row["id"] and row["id"] not in ids, "wgpu assessment row id repeated")
         ids.append(row["id"])
@@ -504,13 +664,23 @@ def validate_assessment_receipt(receipt: object, policy: dict) -> None:
         expected_args = ["--shader", "<private-staged-spv>", "--stage", row["stage"], "--entry", row["entry"]]
         base.require(row["validation"]["arguments"] == expected_args, "wgpu assessment row argv changed")
         if row["outcome"] == "blocked-known":
-            blocked = policy["outcomes"]["blocked_known"]
-            base.require(row["reason_code"] == blocked["reason_code"] and row["validation_record"] is None, "blocked-known row reason changed")
-            base.require(row["validation"]["exit_code"] == blocked["exit_code"] and row["validation"]["stdout_sha256"] == blocked["stdout_sha256"] and row["validation"]["stderr_sha256"] == blocked["stderr_sha256"], "blocked-known row transcript changed")
-            base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(KNOWN_STDERR), "blocked-known row output lengths changed")
-            inventory_supports_known_blocker(row["semantic_inventory"], policy)
+            base.require(row["validation_record"] is None, "blocked-known row has a success record")
+            shader = policy["outcomes"]["blocked_known_shader_nonuniform"]
+            scalar = policy["outcomes"]["blocked_known_scalar_layout"]
+            if row["reason_code"] == shader["reason_code"]:
+                base.require(row["validation"]["exit_code"] == shader["exit_code"] and row["validation"]["stdout_sha256"] == shader["stdout_sha256"] and row["validation"]["stderr_sha256"] == shader["stderr_sha256"], "blocked-known ShaderNonUniform row transcript changed")
+                base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(KNOWN_STDERR), "blocked-known ShaderNonUniform row output lengths changed")
+                inventory_supports_known_blocker(row["semantic_inventory"], policy)
+                if row["scalar_layout_witness"] is not None:
+                    validate_scalar_witness_record(row["scalar_layout_witness"], policy, f"wgpu assessment scalar witness {index}")
+            elif row["reason_code"] == scalar["reason_code"]:
+                base.require(row["validation"]["exit_code"] == scalar["exit_code"] and row["validation"]["stdout_sha256"] == scalar["stdout_sha256"] and row["validation"]["stderr_sha256"] == scalar["stderr_sha256"], "blocked-known scalar-layout row transcript changed")
+                base.require(row["validation"]["stdout_bytes"] == 0 and row["validation"]["stderr_bytes"] == len(SCALAR_LAYOUT_STDERR), "blocked-known scalar-layout row output lengths changed")
+                validate_scalar_witness_record(row["scalar_layout_witness"], policy, f"wgpu assessment scalar witness {index}")
+            else:
+                raise base.ArtifactError("blocked-known row reason changed")
         else:
-            base.require(row["reason_code"] is None and isinstance(row["validation_record"], dict), "ingestible row record changed")
+            base.require(row["reason_code"] is None and row["scalar_layout_witness"] is None and isinstance(row["validation_record"], dict), "ingestible row record changed")
             base.require(row["validation"]["exit_code"] == 0 and row["validation"]["stderr_sha256"] == EMPTY_SHA256, "ingestible row transcript changed")
             base.require(row["validation"]["stderr_bytes"] == 0 and row["validation"]["stdout_bytes"] > 0, "ingestible row output lengths changed")
             expected_record = {
@@ -574,7 +744,8 @@ def parser() -> argparse.ArgumentParser:
 
 def selftest() -> None:
     policy = load_policy()
-    base.require(base.digest_bytes(KNOWN_STDERR) == policy["outcomes"]["blocked_known"]["stderr_sha256"], "known blocker transcript drift")
+    base.require(base.digest_bytes(KNOWN_STDERR) == policy["outcomes"]["blocked_known_shader_nonuniform"]["stderr_sha256"], "known ShaderNonUniform blocker transcript drift")
+    base.require(base.digest_bytes(SCALAR_LAYOUT_STDERR) == policy["outcomes"]["blocked_known_scalar_layout"]["stderr_sha256"], "known scalar-layout blocker transcript drift")
     base.require(runtime_readiness([], policy)["runtime_ready"] is False, "M2.5b runtime readiness changed")
 
 
