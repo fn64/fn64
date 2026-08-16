@@ -58,8 +58,9 @@ struct PhysicalTmemLoadIdentity(u64);
 /// word, lanes 0..4 ascend through the low-bank fragment and lanes 4..8 ascend
 /// through the high-bank fragment. `None` is required for every undefined
 /// lane. The crate-private constructor validates the physical lane mask but
-/// does not accept or map a captured logical source read: M4.2b must perform
-/// the source-to-physical-lane mapping.
+/// does not accept or map a captured logical source read: M4.2b's LoadTile
+/// and M4.2c's LoadBlock executors must perform the source-to-physical-lane
+/// mapping.
 ///
 /// The payload is move-only and bound to the exact uncaller-chosen packet and
 /// load transaction that created it. Equal word geometry cannot rebind it to
@@ -400,9 +401,10 @@ impl StagedTmemTransaction {
         &self.words
     }
 
-    /// Asserts bytes that M4.2b has already arranged into this active load's
-    /// physical fragment lanes. The returned payload cannot be rebound to an
-    /// equal-looking word in another load or packet transaction.
+    /// Asserts bytes that M4.2b's LoadTile or M4.2c's LoadBlock executor has
+    /// already arranged into this active load's physical fragment lanes. The
+    /// returned payload cannot be rebound to an equal-looking word in another
+    /// load or packet transaction.
     pub(crate) fn physical_word_payload(
         &self,
         word: TmemTransferWord,
@@ -509,9 +511,10 @@ impl StagedTmemTransaction {
     }
 }
 
-// M4.2b is the first production caller of this crate-private assertion seam.
-// Retain its exact type in ordinary builds without making raw physical-byte
-// assertion reachable to downstream crates before that owner exists.
+// M4.2b's LoadTile and M4.2c's LoadBlock executors are the production
+// callers of this crate-private assertion seam. Retain its exact type in
+// ordinary builds without making raw physical-byte assertion reachable to
+// downstream crates beyond those owners.
 type PhysicalWordPayloadMint = fn(
     &StagedTmemTransaction,
     TmemTransferWord,
@@ -1242,8 +1245,9 @@ const fn mask_is_low_prefix(mask: u8) -> bool {
 }
 
 /// Converts only the accepted word's defined-lane shape. Actual logical
-/// source bytes are never inspected or rearranged here; M4.2b owns that
-/// source-to-physical payload mapping. Linear odd rows exchange their two
+/// source bytes are never inspected or rearranged here; M4.2b's LoadTile and
+/// M4.2c's LoadBlock executors own that source-to-physical payload mapping.
+/// Linear odd rows exchange their two
 /// four-byte halves, so an odd-row two-byte tail occupies mask `0x30` rather
 /// than the logical-prefix mask `0x03`. Split-bank lane order is low[0..4]
 /// followed by high[0..4], so one four-byte RGBA32 texel occupies mask 0x33.

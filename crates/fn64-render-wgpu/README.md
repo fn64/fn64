@@ -56,8 +56,8 @@ published load epoch. One move-only packet transaction clones the durable
 candidate once, chains every accepted Load Block/Load Tile in command order,
 and consumes only M4.2.0's exact word/fragments. The state layer never
 recalculates DXT carries, odd-row XOR4 placement, or RGBA32 bank mapping.
-M4.2b is the sole intended owner of the crate-private logical-source to
-physical-lane assertion. That assertion carries eight explicit optional
+M4.2b's LoadTile and M4.2c's LoadBlock executors jointly own the
+crate-private logical-source to physical-lane assertion. That assertion carries eight explicit optional
 physical lanes and validates the accepted physical defined-lane mask: in a
 split-bank word, lanes 0..4 are the low fragment and lanes 4..8 are the high
 fragment, so a four-source-byte RGBA32 tail has physical mask `0x33`, not the
@@ -98,27 +98,69 @@ transactions A and B stage from generation N, B publishes N+1, and A is then
 rejected. It does not run publication concurrently across threads, so
 concurrent publication remains explicitly unverified in M4.2a.
 
-M4.2b consumes one checked M4.2.0 LoadTile together with the exact submitted
-packet's M4.0-owned guest reads. The preparation boundary matches every global
-access index, operation, RDRAM range, layout, and submission before it retains
-source bytes. Execution consumes that one-use operation and M4.2a's staged
-transaction, maps row-local complete 64-bit words in command order, exchanges
-the two four-byte halves for odd linear rows, and maps RGBA32 channel pairs
-into low/high 2 KiB banks. A partial row never borrows bytes from the next row;
-its undefined physical lanes are still touched and invalidated by M4.2a. The
-result carries the transaction-local candidate plus ordered physical fragment
-descriptors only. It does not construct a backend report, issue a lifecycle
-receipt, publish durable state, execute LoadBlock/LoadTLUT/YUV, upload to a GPU,
-or establish parity or performance.
+M4.2b and M4.2c jointly own mapping one checked M4.2.0 transfer's source bytes
+into M4.2a's physical TMEM lanes: M4.2b for LoadTile
+(`tmem/execute/load_tile.rs`), M4.2c for LoadBlock (`tmem/execute/load_block.rs`).
+Each executor consumes one checked transfer together with the exact submitted
+packet's M4.0-owned guest reads. Preparation (`prepare_load_tile` /
+`prepare_load_block`) matches every global access index, operation, RDRAM
+range, layout, and submission before it retains source bytes, returning a
+one-use `PreparedLoadTile` / `PreparedLoadBlock`. Execution consumes that
+prepared operation and an already-`StagedTmemTransaction` (freshly staged for
+a first load, or chained onto a packet an earlier load already staged) — the
+submitted/captured-read binding is exact: source identity, queue identity,
+submission ordinal, load epoch, and every ordered transfer word must match
+the staged transaction bit-for-bit, or execution fails closed with a typed
+`StagedBindingMismatch` before touching any physical byte.
 
-M4.2a itself does not perform guest reads or source-byte mapping. The combined
-M4.2a/M4.2b slice does not execute Load Tile/Load Block on a GPU, aggregate
-unrelated backend effects, handle YUV or Load TLUT destinations, migrate
-runtime/shell dispatch, or claim visual parity or performance. Its transfer
-rules come from the public SGI
-*Nintendo 64 RDP Command Summary* and Programming Manual section 13.9; its
-move-only commit sequencing is the repository design mechanism. RT64 is not
-hardware authority for this state.
+Both executors map row-local complete 64-bit words in command order and never
+spill a partial row's bytes into the next row; a row's undefined physical
+lanes are still touched (their generation advances) and invalidated by M4.2a,
+never zero-filled or marked valid. Two source layouts are mapped, identically
+between the two executors:
+
+- **Linear, DXT/starting-TL-aware odd-row XOR4.** When a word's
+  `odd_row_exchange()` bit is set (starting-`T`-relative odd row, driven by
+  DXT row advance), the two 4-byte halves of that 64-bit word swap physical
+  lanes — source byte `n` lands at physical lane `n ^ 4`. This holds for a
+  **full** word (all 8 lanes defined, mask `0xff`: both 4-byte halves swap)
+  and for a **partial** tail word (e.g. a 2-byte RGBA8 remainder, mask
+  `0x03`): the exchange still applies, so the payload lands at physical lanes
+  4-5, not the unexchanged logical-prefix lanes 0-1. `physical.rs`'s own
+  `physical_defined_lane_mask` independently derives the same rotated mask
+  (`rotate_left(4)`), so a correctly-exchanged payload is cross-checked by an
+  independently-derived authority rather than trusted once.
+- **RGBA32 split.** A 32-bit-per-texel word's four source byte pairs
+  interleave into TMEM's low/high 2 KiB banks: lanes 0-1 and 4-5 land in the
+  low bank, lanes 2-3 and 6-7 in the high bank (`TmemTransferPhysicalWord::SplitBanks`),
+  independent of the Linear odd-row path above.
+
+Each executor's result carries only the transaction-local candidate plus
+ordered physical fragment descriptors. A packet transaction chains any number
+of LoadTile/LoadBlock executions in command order; the chain is move-only —
+each `execute` call consumes its `PreparedLoadTile`/`PreparedLoadBlock` and
+the current `StagedTmemTransaction`. A wrong-kind preparation fails before
+staging and leaves the packet transaction caller-owned and untouched. An
+execute-time binding mismatch or rejected/poisoned word payload drops the
+consumed chained candidate and leaves the packet's durable generation,
+last-published load epoch, and every physical byte's validity exactly as they
+were before that load began — never partially applied. This holds however many
+loads completed transaction-locally earlier in the same chain.
+
+Provenance for this mapping is unchanged from M4.2a/M4.2b: the public SGI
+*Nintendo 64 RDP Command Summary*, Tables 1, 3, and 6-10, and Programming
+Manual section 13.9 for hardware fields and transfer rules; project design
+docs for move-only commit sequencing. RT64 is not hardware authority for this
+state.
+
+Neither executor constructs a `BackendEffectReport`, issues a lifecycle
+receipt, or publishes durable state — that remains M4.2a's publication
+authority after an exact `GpuCompleteTicket`/`GuestCommittedTicket` pair.
+Neither executor uploads to a GPU or issues a GPU dispatch; both are
+CPU-only, transaction-local byte mapping. Neither handles TLUT or YUV
+destinations. Neither this slice nor its combination with M4.2a establishes
+visual parity or performance; no such claim is made anywhere in this
+document.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
