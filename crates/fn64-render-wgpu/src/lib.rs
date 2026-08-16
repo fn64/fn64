@@ -321,6 +321,7 @@ mod coverage;
 mod depth_mode;
 mod depth_strict_less;
 mod device;
+mod formats_dither;
 mod lifecycle;
 mod native_contract;
 mod production;
@@ -366,6 +367,10 @@ pub use depth_strict_less::{
 pub use device::{
     HeadlessBackend, HeadlessDeviceOutcome, InFlightFill, NoAdapter, PrewarmedRenderer,
     UninitializedRenderer,
+};
+pub use formats_dither::{
+    alpha_dither_value, float4_to_rgba32, float_to_uint8, Rgba32Packed,
+    FORMATS_DITHER_ENTRY_POINT, FORMATS_DITHER_WGSL,
 };
 pub use lifecycle::{
     NativeCompletionIdentity, StagedWgpuEffect, WgpuBackendCompletion, WgpuRenderError,

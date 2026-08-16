@@ -1462,3 +1462,73 @@ combiner/texture-sample consumption of the returned UV, no draw-path or
 production-DPC wiring, and no RT64 visual/pixel/silicon parity or
 performance claim. This module does not modify `state.rs` or any other
 existing file besides `lib.rs`'s module registration and re-exports.
+
+## `FloatToUINT8`/`Float4ToRGBA32`/`AlphaDitherValue` (`formats_dither`)
+
+`formats_dither` is a characterization-first literal port of the permitted
+MIT RT64 Rust-port source pinned at commit
+`5473732a822a4423b5696e7cb18fecc425a59875` (`docs/RT64-PORT-AUTHORITY.md`),
+`src/shaders/Formats.hlsli`'s three remaining unported primitives:
+`FloatToUINT8` (line 67), `Float4ToRGBA32` (lines 122-127), and
+`AlphaDitherValue` (lines 41-54). Like `depth_strict_less`, `alpha_compare`,
+`rgb_dither`, and `random`, `fn64-render-wgpu` has no crate dependency on
+`fn64-render-reference`, so this is a self-contained literal re-expression
+citing RT64's source directly.
+
+**API.** `float_to_uint8(f32) -> u8` is `round(clamp(i, 0.0f, 1.0f) *
+255.0f)`: clamp first, scale, then round-half-to-even (`f32::round_ties_even`,
+matching HLSL `round`'s tie-breaking, not `f32::round`'s round-half-away-from-
+zero). `float4_to_rgba32(r, g, b, a) -> Rgba32Packed` packs four independently
+quantized channels into one `u32`, `r` in the high byte and `a` in the low
+byte -- no cross-channel coupling, unlike `Float4ToRGBA16`'s
+alpha-as-coverage-modulo special case. `alpha_dither_value(color_dither_bit,
+alpha_dither, x, y, noise) -> u8` selects a `0..=7` alpha-dither threshold: it
+reuses `crate::rgb_dither::dither_pattern_value`/`RgbDither` for the
+`Pattern`/`InversePattern` ordered-tile lookup (RT64's own
+`AlphaDitherValue` calls `DitherPatternValue` internally) rather than
+re-transcribing the Bayer/MagicSquare tables a third time, and reuses
+`crate::state::AlphaDither` for the mode selector (its wire encoding --
+`0=Pattern,1=InversePattern,2=Noise,3=Disabled` -- is byte-identical to
+`Formats.hlsli`'s own `PATTERN`/`NOTPATTERN`/`NOISE`/`DISABLE` switch cases).
+`InversePattern` is the literal bitwise `(~DitherPatternValue(...)) & 7`, not
+a `7 - threshold` rewrite, even though both forms agree for every in-range
+3-bit input.
+
+`AlphaDitherValue` (this module's `alpha_dither_value`) is distinct from the
+already-landed `crate::alpha_compare::apply_alpha_dither`: the latter ports a
+different, higher-level RT64 function (`RasterPS.hlsl`'s alpha-dither
+reduction, sourced from `fn64-render-reference`'s `blend.rs:75-103`) that
+rounds a full eight-bit alpha down to a five-bit blender input; this module's
+function is the lower-level `Formats.hlsli` primitive that selects a raw
+`0..=7` threshold, structurally parallel to `DitherPatternValue`
+(`crate::rgb_dither::dither_pattern_value`) rather than a duplicate of
+`apply_alpha_dither`.
+
+An independently-derived Rust oracle is matched by an owned, Naga-validated
+WGSL transcription (`shaders/formats_dither.wgsl`, `FORMATS_DITHER_WGSL`,
+entry point `FORMATS_DITHER_ENTRY_POINT`); neither is compiled into any
+pipeline or wired to a draw path, matching `rgb_dither.wgsl`/`random.wgsl`'s
+precedent.
+
+**Tests.** Independent hand-derivation of `float_to_uint8` at every
+representable byte (exhaustive round-trip), clamp boundaries (including `NaN`,
+`+-infinity`), and explicit round-half-to-even fixtures; `float4_to_rgba32`
+channel-placement, saturation, and full-word packing cases matched against an
+independently composed expected `u32`; `alpha_dither_value`'s four modes each
+checked against an independently derived oracle (`Pattern`/`InversePattern`
+cross-checked directly against `dither_pattern_value`, `InversePattern`'s
+bitwise-not-and-mask independently re-derived via `u32` arithmetic and
+separately proven equal to `7 - threshold` for the `0..=7` domain, `Noise`
+against `byte & 7`, `Disabled` against a constant `0`); mutation-shaped tests
+distinguishing `Pattern` from `InversePattern`, `Disabled` from `Pattern`, and
+proving `color_dither_bit` truly switches tables; and the same naga
+parse/validation/structural-guard/hostile-mutation WGSL pattern used by
+`rgb_dither.wgsl`/`random.wgsl`.
+
+**Scope.** This module characterizes `Formats.hlsli`'s three named primitives
+in isolation. It does not wire into `combiner`, `alpha_compare`, `rgb_dither`,
+`random`, any shader-pipeline/draw-path, `raw_dpc`, `state.rs`, `tmem`, the
+ABI/runtime, or any native GPU execution. It makes no parity or performance
+claim. This module does not modify `state.rs`, `combiner.rs`,
+`alpha_compare.rs`, `rgb_dither.rs`, `random.rs`, or any other existing file
+besides `lib.rs`'s module registration and re-exports.
