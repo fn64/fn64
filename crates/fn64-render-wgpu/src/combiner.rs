@@ -76,6 +76,8 @@
 //! only observed call site (`RasterPS.hlsl:171`) always sets it `false` —
 //! so every public entry point always passes `false`.
 
+use crate::state::{Color4, PrimColor};
+
 /// Owned WGSL transcription of this module's decode tables and one-cycle
 /// arithmetic (`shaders/color_combiner.wgsl`). Naga-validated in this
 /// module's tests; not compiled into any pipeline or wired to a draw path.
@@ -877,6 +879,58 @@ pub fn run_combiner(
 /// convention rather than forcing every caller through the enum-taking form.
 pub fn run_two_cycle(params: CombineParams, inputs: CombinerInputs) -> ([f32; 4], f32) {
     run_combiner(params, inputs, CombinerCycleMode::TwoCycle)
+}
+
+/// Overrides `base`'s `env_color`, `prim_color`, and `prim_lod_frac` fields
+/// with values derived from this crate's already-decoded fragment constant
+/// registers, per `RasterPS.hlsl`'s combiner-input assembly
+/// (`src/shaders/RasterPS.hlsl:169-183`, pinned commit
+/// `5473732a822a4423b5696e7cb18fecc425a59875`):
+///
+/// ```text
+/// ccInputs.primColor   = instanceRDPParams[instanceIndex].primColor;
+/// ccInputs.envColor    = instanceRDPParams[instanceIndex].envColor;
+/// ccInputs.primLodFrac = instanceRDPParams[instanceIndex].primLOD.x;
+/// ```
+///
+/// `primColor`/`envColor` there are the already-normalized `float4` staged
+/// by `RDP::setPrimColor`/`setEnvColor` (`src/hle/rt64_rdp.cpp:838-842,
+/// 865-871`) — exactly this crate's [`Color4::normalized`] — and
+/// `primLOD.x` is `lodFrac / 256.0f` (`rt64_rdp.cpp:862`) — exactly
+/// [`PrimLod::lod_frac_normalized`] (`primLOD.y`, `lod_min`, is not read by
+/// this assembly at all; see this function's nonclaims below).
+///
+/// `base` supplies every other [`CombinerInputs`] field unchanged
+/// (`tex_val0`/`tex_val1`/`shade_color`/`key_center`/`key_scale`/
+/// `lod_fraction`/`noise`/`k4`/`k5`) — none of those are sourced from
+/// `env_color`/`prim_color`/`prim_lod_frac`/`PrimDepth` in RT64's own
+/// assembly (`tex_val0`/`tex_val1` come from texture sampling, `shade_color`
+/// from vertex interpolation, `key_center`/`key_scale` from separate
+/// host-tracked RDP state, `lod_fraction` from `computeLOD`, `noise` from
+/// `nextRand`, and `K4`/`K5` from a separate `convertK` table — all
+/// uncharacterized at this seam per [`CombinerInputs`]'s own doc), so this
+/// function does not invent values for them.
+///
+/// Nonclaims: [`PrimDepth`](crate::state::PrimDepth) is not read here —
+/// grepping `rt64_color_combiner.h`'s `Inputs` struct and `RasterPS.hlsl`'s
+/// `ccInputs` assembly confirms RT64's combiner-input struct has no
+/// `primDepth` field at all (`primDepth` feeds depth testing elsewhere in
+/// the same shader, a different consumer); `PrimLod::lod_min_normalized`
+/// (`primLOD.y`) is likewise never read by this assembly. No cycle-mode
+/// selection, no NOISE/LOD real generation, no texture-fetch integration, no
+/// draw-path or production-dispatch wiring, and no RT64 parity/performance
+/// claim.
+pub fn combiner_inputs_from_fragment_registers(
+    base: CombinerInputs,
+    env_color: Color4,
+    prim_color: PrimColor,
+) -> CombinerInputs {
+    CombinerInputs {
+        env_color: env_color.normalized(),
+        prim_color: prim_color.color().normalized(),
+        prim_lod_frac: prim_color.lod().lod_frac_normalized(),
+        ..base
+    }
 }
 
 #[cfg(test)]
@@ -2998,5 +3052,126 @@ mod tests {
             result[0], reassociated,
             "run_cycle must NOT match an algebraically-reassociated grouping"
         );
+    }
+
+    // -- combiner_inputs_from_fragment_registers: independent-oracle tests.
+    // Expected values below are computed by hand from the raw wire words
+    // per RT64's own `RDP::setEnvColor`/`setPrimColor` arithmetic
+    // (`byte / 255.0`, `lodFrac / 256.0`), not by calling this crate's own
+    // `Color4::normalized`/`PrimLod::lod_frac_normalized` and asserting
+    // against their output.
+
+    /// `env_color`/`prim_color`/`prim_lod_frac` are overwritten from the
+    /// fragment registers; every other field passes through `base`
+    /// untouched. Wire words chosen so every byte is distinct and non-zero,
+    /// ruling out a transposed-channel or copy-paste-from-wrong-field bug.
+    #[test]
+    fn combiner_inputs_from_fragment_registers_overrides_exactly_three_fields() {
+        // env_color wire word: R=0x10 G=0x20 B=0x30 A=0x40.
+        let env = Color4::from_wire(0x1020_3040);
+        // prim_color w0 (lodFrac/lodMin): lodFrac=0x50 (bits 0:7), lodMin
+        // bits 8:12 = 0b10101 = 21 (0x50_15 -> low byte 0x50, next nibble+1
+        // bit from 0x15 masked to 5 bits = 0x15 & 0x1f = 0x15 = 21).
+        // prim_color w1 (color): R=0x60 G=0x70 B=0x80 A=0x90.
+        let prim = PrimColor::from_wire(0x0000_1550, 0x6070_8090);
+
+        let base = ALL_INPUTS;
+        let result = combiner_inputs_from_fragment_registers(base, env, prim);
+
+        // Independent oracle: byte / 255.0, computed from the raw wire bytes
+        // above, not by calling Color4::normalized.
+        let env_expected = [
+            0x10 as f32 / 255.0,
+            0x20 as f32 / 255.0,
+            0x30 as f32 / 255.0,
+            0x40 as f32 / 255.0,
+        ];
+        let prim_expected = [
+            0x60 as f32 / 255.0,
+            0x70 as f32 / 255.0,
+            0x80 as f32 / 255.0,
+            0x90 as f32 / 255.0,
+        ];
+        let prim_lod_frac_expected = 0x50 as f32 / 256.0;
+
+        assert_eq!(result.env_color, env_expected);
+        assert_eq!(result.prim_color, prim_expected);
+        assert_eq!(result.prim_lod_frac, prim_lod_frac_expected);
+
+        // Every other field is `base` untouched, proving this is a targeted
+        // three-field override, not a from-scratch reconstruction that
+        // happens to also carry `base`'s other values by coincidence.
+        assert_eq!(result.tex_val0, base.tex_val0);
+        assert_eq!(result.tex_val1, base.tex_val1);
+        assert_eq!(result.shade_color, base.shade_color);
+        assert_eq!(result.key_center, base.key_center);
+        assert_eq!(result.key_scale, base.key_scale);
+        assert_eq!(result.lod_fraction, base.lod_fraction);
+        assert_eq!(result.noise, base.noise);
+        assert_eq!(result.k4, base.k4);
+        assert_eq!(result.k5, base.k5);
+    }
+
+    /// All-zero and all-`0xFF` wire words hit both ends of the byte range,
+    /// including the `lodFrac = 0xFF` corner RT64's own `/ 256.0` divisor
+    /// (not `/ 255.0`) never reaches exactly `1.0` for.
+    #[test]
+    fn combiner_inputs_from_fragment_registers_boundary_wire_words() {
+        let env_zero = Color4::from_wire(0x0000_0000);
+        let prim_zero = PrimColor::from_wire(0x0000_0000, 0x0000_0000);
+        let zeroed = combiner_inputs_from_fragment_registers(ALL_INPUTS, env_zero, prim_zero);
+        assert_eq!(zeroed.env_color, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(zeroed.prim_color, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(zeroed.prim_lod_frac, 0.0);
+
+        let env_max = Color4::from_wire(0xFFFF_FFFF);
+        let prim_max = PrimColor::from_wire(0xFFFF_FFFF, 0xFFFF_FFFF);
+        let maxed = combiner_inputs_from_fragment_registers(ALL_INPUTS, env_max, prim_max);
+        let max_expected = 0xFF as f32 / 255.0;
+        assert_eq!(maxed.env_color, [max_expected; 4]);
+        assert_eq!(maxed.prim_color, [max_expected; 4]);
+        // Independent oracle: 0xFF / 256.0 = 0.99609375 exactly (power-of-two
+        // divisor, no rounding), distinct from env/prim's 0xFF / 255.0.
+        assert_eq!(maxed.prim_lod_frac, 0xFF as f32 / 256.0);
+        assert_ne!(maxed.prim_lod_frac, max_expected);
+    }
+
+    /// `lodMin` (`primLOD.y`) is decoded by `PrimLod` but never read by
+    /// `RasterPS.hlsl`'s combiner-input assembly (see this function's doc) —
+    /// varying it alone must not change the result at all.
+    #[test]
+    fn combiner_inputs_from_fragment_registers_ignores_lod_min() {
+        let env = Color4::from_wire(0x1122_3344);
+        let prim_lod_min_zero = PrimColor::from_wire(0x0000_0050, 0x6070_8090);
+        let prim_lod_min_max = PrimColor::from_wire(0x0000_1f50, 0x6070_8090);
+        assert_ne!(
+            prim_lod_min_zero.lod().lod_min(),
+            prim_lod_min_max.lod().lod_min(),
+            "fixture premise: the two PrimColor values must actually differ in lod_min"
+        );
+
+        let result_zero =
+            combiner_inputs_from_fragment_registers(ALL_INPUTS, env, prim_lod_min_zero);
+        let result_max = combiner_inputs_from_fragment_registers(ALL_INPUTS, env, prim_lod_min_max);
+        assert_eq!(result_zero, result_max);
+    }
+
+    /// `PrimDepth` has no field on this function's signature at all — the
+    /// RT64 combiner-input assembly this ports never reads it (see this
+    /// function's doc's nonclaim). This test exists to make that omission a
+    /// visible, intentional API shape rather than a silent gap: it directly
+    /// exercises the crate's already-decoded `PrimDepth` type to prove it
+    /// compiles and decodes independently of this function, underscoring
+    /// that this function's signature omitting it is a mapping fact, not an
+    /// oversight.
+    #[test]
+    fn prim_depth_decodes_independently_and_is_not_a_fragment_register_input() {
+        use crate::state::PrimDepth;
+        let depth = PrimDepth::from_wire(0xFFFF_0000);
+        // 15-bit mask: bit 31 (the sign/unused bit RT64 discards) is clear
+        // in the decoded value even though the wire word's top 16 bits are
+        // all set.
+        assert_eq!(depth.z(), 0x7FFF);
+        assert_eq!(depth.dz(), 0x0000);
     }
 }

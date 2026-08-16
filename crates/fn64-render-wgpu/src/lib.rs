@@ -349,8 +349,9 @@ pub use blend::{
     ResolvedBlendCycle, BLEND_ENTRY_POINT, BLEND_WGSL,
 };
 pub use combiner::{
-    run_combiner, run_one_cycle, run_two_cycle, AlphaInput, AlphaInputSlot, ColorInput,
-    ColorInputSlot, CombineParams, CombinerCycleMode, CombinerInputs, COLOR_COMBINER_WGSL,
+    combiner_inputs_from_fragment_registers, run_combiner, run_one_cycle, run_two_cycle,
+    AlphaInput, AlphaInputSlot, ColorInput, ColorInputSlot, CombineParams, CombinerCycleMode,
+    CombinerInputs, COLOR_COMBINER_WGSL,
 };
 pub use coverage::{
     apply_coverage_alpha, attribute_sample, coverage_result, AttributeSamplePoint, Coverage,
