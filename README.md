@@ -101,6 +101,7 @@ One workspace, separate crates, each publishable alone:
 | `fn64-abi` | The `extern "C"` surface recompiled code links against |
 | `fn64-boot-harness` | Shared generated-section bridge, registration callback, and RDRAM allocation for boot hosts |
 | `fn64-shell` | The executable: window, input, audio out, ROM intake |
+| `fn64-render-ir` | GPU/runtime-independent render semantics: bounded command streams, resource effects, replay records, and move-only completion ownership |
 | `fn64-render` | Backend-neutral render seam, content-addressed ordered microcode admission, and raw-DPC completion inspection |
 | `fn64-render-reference` | Deterministic pure-Rust `ReferenceBackend`, geometry/object decoders, software rasterizer, and VI reference path |
 | `fn64-render-rt64` | FFI bridge to [RT64](https://github.com/rt64/rt64) (MIT, C++); all C++ interop remains quarantined here |

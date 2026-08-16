@@ -15,6 +15,7 @@ fn64-runtime   core: scheduler, OSMesgQueue, timers, PI/SI/VI/AI plumbing, rdram
 fn64-abi       the extern "C" surface recompiled code links against
 fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdram allocation
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
+fn64-render-ir GPU/runtime-independent render semantics, bounded replay records, and move-only effect ownership
 fn64-render    backend-neutral render seam, exact microcode admission, and diagnostic raw-DPC inspection
 fn64-render-reference deterministic pure-Rust ReferenceBackend
 fn64-render-rt64 FFI bridge to RT64 (C++)
@@ -40,6 +41,7 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
     ├──depends on──> fn64-render-reference ──depends on──> fn64-render ──depends on──> fn64-runtime
     └──depends on──> fn64-render-rt64 ────────depends on──> fn64-render
 fn64-certification ──depends on──> fn64-render + fn64-render-reference + fn64-render-rt64 + fn64-runtime
+fn64-render-ir (GPU/runtime independent; currently has no workspace dependencies or consumers)
 ```
 
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
