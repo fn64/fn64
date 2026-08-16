@@ -64,9 +64,9 @@ def audit(sources: dict[Path, str]) -> list[str]:
             )
 
     mappings = {
-        "Pi": "fn64_recomp_rs::notify_pi_dma_write",
-        "Si": "fn64_recomp_rs::notify_si_dma_write",
-        "Sp": "fn64_recomp_rs::notify_sp_dma_write",
+        "Pi": "fn64_cpu_runtime::notify_pi_dma_write",
+        "Si": "fn64_cpu_runtime::notify_si_dma_write",
+        "Sp": "fn64_cpu_runtime::notify_sp_dma_write",
     }
     for channel, notification in mappings.items():
         arm = f"fn64_runtime::DmaWriterChannel::{channel} => {notification}"
@@ -92,9 +92,9 @@ def selftest() -> int:
         DEVICE: "DmaWriterChannel::Si\nDmaWriterChannel::Sp",
         PI: "\n".join(
             (
-                "fn64_runtime::DmaWriterChannel::Pi => fn64_recomp_rs::notify_pi_dma_write",
-                "fn64_runtime::DmaWriterChannel::Si => fn64_recomp_rs::notify_si_dma_write",
-                "fn64_runtime::DmaWriterChannel::Sp => fn64_recomp_rs::notify_sp_dma_write",
+                "fn64_runtime::DmaWriterChannel::Pi => fn64_cpu_runtime::notify_pi_dma_write",
+                "fn64_runtime::DmaWriterChannel::Si => fn64_cpu_runtime::notify_si_dma_write",
+                "fn64_runtime::DmaWriterChannel::Sp => fn64_cpu_runtime::notify_sp_dma_write",
                 "fn64_runtime::ProcessDmaMemory::from_raw_parts(",
                 "fn64_runtime::ProcessDmaMemory::from_raw_parts(",
             )
@@ -106,8 +106,8 @@ def selftest() -> int:
     assert audit(escaped), "a new DmaMemory implementation must fail"
     erased = dict(good)
     erased[PI] = erased[PI].replace(
-        "fn64_runtime::DmaWriterChannel::Si => fn64_recomp_rs::notify_si_dma_write",
-        "fn64_runtime::DmaWriterChannel::Si => fn64_recomp_rs::notify_pi_dma_write",
+        "fn64_runtime::DmaWriterChannel::Si => fn64_cpu_runtime::notify_si_dma_write",
+        "fn64_runtime::DmaWriterChannel::Si => fn64_cpu_runtime::notify_pi_dma_write",
     )
     assert audit(erased), "producer erasure must fail"
     bypass = dict(good)

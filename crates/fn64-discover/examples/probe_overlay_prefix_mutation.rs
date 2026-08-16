@@ -8,7 +8,7 @@
 //! expected 5066618c... observed 2fb3f01e...
 //! ```
 //!
-//! `activate_for_fetch_with_digest` (`fn64-recomp-rs/src/generation/mod.rs:723`)
+//! `activate_for_fetch_with_digest` (`fn64-cpu-runtime/src/generation/mod.rs:723`)
 //! digests EVERY generation containing the PC and admits the one that matches,
 //! so two overlays sharing a base is already handled. `matches` came back
 //! EMPTY, meaning no compiled generation matched the bytes in RAM -- including

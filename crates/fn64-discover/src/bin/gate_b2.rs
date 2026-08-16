@@ -42,7 +42,7 @@ use fn64_discover::snapshot::{
     MaterializedBankInput, ProgramSnapshotV1,
 };
 use fn64_discover::{run_discovery, DescriptorTableInput};
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -665,7 +665,7 @@ fn run_nwxe_function_gate() -> Result<(), String> {
         ));
     }
     let catalog_id = code_bank.id();
-    let mut catalog = fn64_recomp_rs::CodeCatalog::new();
+    let mut catalog = fn64_cpu_runtime::CodeCatalog::new();
     catalog
         .register(code_bank)
         .map_err(|error| format!("registering NWXE sparse code bank: {error}"))?;
@@ -673,9 +673,9 @@ fn run_nwxe_function_gate() -> Result<(), String> {
         for (index, expected) in block.words.iter().copied().enumerate() {
             let pc = block.start_va + index as u32 * 4;
             let resolved = catalog
-                .resolve(fn64_recomp_rs::ExecutionKey::new(
+                .resolve(fn64_cpu_runtime::ExecutionKey::new(
                     catalog_id,
-                    fn64_recomp_rs::GuestPc::new(pc),
+                    fn64_cpu_runtime::GuestPc::new(pc),
                 ))
                 .map_err(|error| format!("resolving packed NWXE word at {pc:#010x}: {error}"))?;
             if resolved.word != expected {
@@ -692,12 +692,12 @@ fn run_nwxe_function_gate() -> Result<(), String> {
     });
     let hole = first_hole.ok_or("NWXE sparse pack unexpectedly has no gap to validate")?;
     if !matches!(
-        catalog.resolve(fn64_recomp_rs::ExecutionKey::new(
+        catalog.resolve(fn64_cpu_runtime::ExecutionKey::new(
             catalog_id,
-            fn64_recomp_rs::GuestPc::new(hole),
+            fn64_cpu_runtime::GuestPc::new(hole),
         )),
-        Err(fn64_recomp_rs::CpuFault {
-            kind: fn64_recomp_rs::CpuFaultKind::UnmappedPc { .. },
+        Err(fn64_cpu_runtime::CpuFault {
+            kind: fn64_cpu_runtime::CpuFaultKind::UnmappedPc { .. },
             ..
         })
     ) {
@@ -869,7 +869,7 @@ fn run_nwxe_function_gate() -> Result<(), String> {
 /// Conservative "register-only" word predicate: true only when `word`
 /// decodes and its execution can touch nothing outside GPR/HI/LO state.
 /// Excluded by major-opcode/function field (public MIPS-III opcode map,
-/// same provenance as `fn64_recomp_rs::decode`):
+/// same provenance as `fn64_cpu_runtime::decode`):
 ///
 /// - `0x10..=0x13`: every COP0-3 op (moves, cache control, CP branches);
 /// - `0x1A`/`0x1B` and `0x20..=0x3F`: every load/store shape, CACHE,
@@ -1010,7 +1010,7 @@ fn execute_sparse_runner_harness(
     }
     let source = format!(
         r#"#![allow(clippy::all, unused)]
-use fn64_recomp_rs::{{
+use fn64_cpu_runtime::{{
     BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuFault,
     CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget,
     ProgramError, Rdram, RecompContext,
@@ -1225,7 +1225,7 @@ fn main() {{
         .arg("--crate-type=bin")
         .arg(&source_path)
         .arg("--extern")
-        .arg(format!("fn64_recomp_rs={}", rlib.display()))
+        .arg(format!("fn64_cpu_runtime={}", rlib.display()))
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("-o")
@@ -1270,7 +1270,7 @@ fn compile_sparse_runner(runner: &str) -> Result<(), String> {
     let source_path = temp.join("runner.rs");
     let metadata_path = temp.join("runner.rmeta");
     let source = format!(
-        "#![allow(clippy::all, unused)]\nuse fn64_recomp_rs::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext}};\n\n{runner}"
+        "#![allow(clippy::all, unused)]\nuse fn64_cpu_runtime::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext}};\n\n{runner}"
     );
     std::fs::write(&source_path, source)
         .map_err(|error| format!("writing sparse-runner gate source: {error}"))?;
@@ -1279,7 +1279,7 @@ fn compile_sparse_runner(runner: &str) -> Result<(), String> {
         .arg("--crate-type=lib")
         .arg(&source_path)
         .arg("--extern")
-        .arg(format!("fn64_recomp_rs={}", rlib.display()))
+        .arg(format!("fn64_cpu_runtime={}", rlib.display()))
         .arg("-L")
         .arg(format!("dependency={}", deps.display()))
         .arg("--emit=metadata")
@@ -1306,7 +1306,7 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
+                    name.starts_with("libfn64_cpu_runtime-") && name.ends_with(".rlib")
                 })
         })
         .max_by_key(|path| {
@@ -1314,5 +1314,5 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
                 .and_then(|metadata| metadata.modified())
                 .ok()
         })
-        .ok_or_else(|| "fn64_recomp_rs rlib is missing beside B2 gate".to_string())
+        .ok_or_else(|| "fn64_cpu_runtime rlib is missing beside B2 gate".to_string())
 }

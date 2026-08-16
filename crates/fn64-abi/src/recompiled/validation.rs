@@ -486,7 +486,7 @@ pub(super) fn validate_bootstrap_binding(
             view.read_u8(fn64_runtime::RdramAddr::from_offset(physical))
         })
         .map_err(|error| match error {
-            fn64_recomp_rs::InitialGenerationImageErrorV1::UnrecognizedNonzeroByte {
+            fn64_cpu_runtime::InitialGenerationImageErrorV1::UnrecognizedNonzeroByte {
                 physical_address,
                 actual,
             } => BootstrapImportErrorV1::UnrecognizedInitialGenerationImage {
@@ -695,7 +695,7 @@ pub(super) fn validate_cpu_writer_runtime_state_v1(
         len == 0
             || start
                 .checked_add(len)
-                .is_none_or(|end| end > fn64_recomp_rs::RDRAM_LEN as u32)
+                .is_none_or(|end| end > fn64_cpu_runtime::RDRAM_LEN as u32)
     }) {
         return Err(CpuWriterRuntimeStateErrorV1::InvalidCpuStoreRange);
     }
@@ -1454,7 +1454,7 @@ pub(super) fn validate_rsp_writer_runtime_state_v1(
     trace_hasher.update((trace.commits.len() as u64).to_be_bytes());
     for observation in &trace.commits {
         if observation.physical_start >= observation.physical_end
-            || observation.physical_end > fn64_recomp_rs::RDRAM_LEN as u32
+            || observation.physical_end > fn64_cpu_runtime::RDRAM_LEN as u32
         {
             return Err(RspWriterRuntimeStateErrorV1::InvalidRspWritebackRange);
         }

@@ -20,9 +20,9 @@ The audit found **three structurally distinct attribution mechanisms**, not one.
 Understanding which one covers a given writer is what decides whether it is a
 real hole:
 
-1. **Point declaration** — the writer calls `fn64_recomp_rs::notify_*_write`
+1. **Point declaration** — the writer calls `fn64_cpu_runtime::notify_*_write`
    itself, immediately after its bytes commit
-   (`crates/fn64-recomp-rs/src/runtime/host.rs:464-512`). Used by the CPU store
+   (`crates/fn64-cpu-runtime/src/runtime/host.rs:464-512`). Used by the CPU store
    path, PI DMA completion, and the two raw mirrors.
 2. **Enclosing-transaction diff** — the writer declares nothing, but runs inside
    `invoke_catalog_block_host`
@@ -74,7 +74,7 @@ test/example only, or provably cannot reach a watched range.
 | 12 | `crates/fn64-render-reference/src/backend/render_backend.rs:140` (`rdram.copy_from_slice(&image[..rdram.len()])` in `process_rdp_commands`) | whole-buffer overwrite | **No point declaration** — but every fn64-abi entry into the renderer goes through `track_rdp_renderer_mutation` (`crates/fn64-abi/src/task_dispatch/rsp_commit.rs:897`, `:1117`; `task_dispatch/rsp_phase.rs:721`; `task_dispatch/setup.rs:436`), which diffs the watched set and declares `RdpRenderer` (`crates/fn64-abi/src/recompiled/snapshots.rs:1003-1084`). | Yes — a whole-buffer copy covers every watched byte | **P2** (covered) |
 | 13 | `crates/fn64-render-reference/src/backend/render_backend.rs:200` (`process_raw_dpc_batch`) | whole-buffer overwrite | Same as #12. Additionally gated: `raw_dpc_batch_capability()` returns `DiagnosticOnly` (`:145-147`), and the fn64-abi publication path traps by name rather than publishing (`crates/fn64-abi/src/task_dispatch/rsp_phase.rs:617-626`). | Yes structurally, but unreachable in a certifying route | **P3** |
 | 14 | `crates/fn64-render-reference/src/backend/imp.rs:345` (`rdram.copy_from_slice(&speculative_rdram)` after HLE geometry decode) | whole-buffer overwrite | Same as #12 — reached only under `track_rdp_renderer_mutation`. | Yes | **P2** (covered) |
-| 15 | `crates/fn64-recomp-rs/src/runtime/host.rs:605` `Rdram::as_mut_slice()` | hands out `&mut [u8]` over the live allocation | **No** — documented in-tree as "an UNATTRIBUTED write path" (`:589-603`). Sole non-test caller `crates/fn64-abi/src/recompiled/runners.rs:1331` (`call_c`) uses it only to obtain `as_mut_ptr()` for the FR-stable C shim ABI. Those shims are reached from `invoke_catalog_block_host`, so mechanism 2 covers them. | Yes — a C shim writes wherever the guest points it | **P1** |
+| 15 | `crates/fn64-cpu-runtime/src/runtime/host.rs:605` `Rdram::as_mut_slice()` | hands out `&mut [u8]` over the live allocation | **No** — documented in-tree as "an UNATTRIBUTED write path" (`:589-603`). Sole non-test caller `crates/fn64-abi/src/recompiled/runners.rs:1331` (`call_c`) uses it only to obtain `as_mut_ptr()` for the FR-stable C shim ABI. Those shims are reached from `invoke_catalog_block_host`, so mechanism 2 covers them. | Yes — a C shim writes wherever the guest points it | **P1** |
 | 16 | `crates/fn64-abi/src/host.rs:144-145` scheduler running-thread mirror **fallback** | `RdramPtr::write_u32` | **No.** Only reached when `commit_scheduler_running_thread_mirror` returns `false` (no live canonical program) or `recomp-rs` is off. The primary path at `crates/fn64-abi/src/recompiled/execution.rs:697-708` declares correctly. | Yes, but only when there is no journal to violate | **P3** |
 | 17 | `crates/fn64-abi/src/pi/mmio.rs:1037` `sync_live_ai_dpc_mmio_into_rdram` | `RdramPtr::write_u32` at `0xA4xx_xxxx` | **No.** Structurally confined to the sparse MMIO window (`RdramAddr::from_gpr(0xA450_000C).offset() == 0x2450_000C`, asserted at `crates/fn64-runtime/src/rdram.rs:865-869`), far above the 8 MiB physical device. | **No** — cannot alias RDRAM | **P3** |
 | 18 | `crates/fn64-runtime/src/mmio.rs:505-512` `MmioSpace::sync_into_rdram` | `copy_nonoverlapping` at `RDRAM_MMIO_WINDOW_START + offset` | **No.** Same confinement as #17. | **No** | **P3** (already ruled out) |
@@ -83,7 +83,7 @@ test/example only, or provably cannot reach a watched range.
 | 21 | `crates/fn64-runtime/src/rom.rs:145-162` `impl DmaMemory for ProcessDmaMemory` | `RdramPtr::write_u8` per byte | **Yes** — invokes the `committed_write` callback at `:159`, wired to `notify_committed_dma_write` (`crates/fn64-abi/src/pi/mmio.rs:6-13`, installed at `pi/mmio.rs:901` and `pi/timing.rs:371`) which dispatches to the Pi/Si/Sp notify. | Yes, and declared | **P3** (verified covered) |
 | 22 | `crates/fn64-runtime/src/rom.rs:69-77` `impl DmaMemory for Rdram` and `:81-89` `for RdramViewMut` | `dma_write_bytes`, **channel argument discarded** (`_channel`) | **No.** These two impls silently drop the `DmaWriterChannel` they are handed. *(Newly found.)* No production caller — the fabric is only ever handed `ProcessDmaMemory` (`crates/fn64-abi/src/pi/mmio.rs:903`, `crates/fn64-abi/src/pi/timing.rs:373`). | Only if a future caller passes one to the fabric | **P2** (latent trap, not a live bug) |
 | 23 | `crates/fn64-abi/src/recompiled/receipts.rs:1009-1010` bootstrap import publication | `RdramViewMut::write_logical_bytes` | **No point declaration**, and none needed: this writes into the importer's own `self.storage` **before the journal is sealed** (`crates/fn64-abi/src/recompiled/live_program.rs:224-231` validates the watched digest at seal time). | Pre-seal only | **P3** |
-| 24 | `crates/fn64-recomp-rs/src/runtime/host.rs` CPU store path: `store_backed_word` `:725-731`, `store_h` `:924-934`, `store_b` `:939-948`, `store_d` `:1040-1053` | direct `self.mem[..]` writes | **Yes** — every `self.mem[..]` write in the file is followed by `notify_cpu_instruction_store`/`store16`. `store_wl`/`store_wr`/`store_dl`/`store_dr` delegate to `store_w`/`store_d`. Audited exhaustively: the only `self.mem[` write sites are `:727`, `:930`, `:944`, `:1048`, `:1049`. | Yes, and declared | **P3** (verified covered) |
+| 24 | `crates/fn64-cpu-runtime/src/runtime/host.rs` CPU store path: `store_backed_word` `:725-731`, `store_h` `:924-934`, `store_b` `:939-948`, `store_d` `:1040-1053` | direct `self.mem[..]` writes | **Yes** — every `self.mem[..]` write in the file is followed by `notify_cpu_instruction_store`/`store16`. `store_wl`/`store_wr`/`store_dl`/`store_dr` delegate to `store_w`/`store_d`. Audited exhaustively: the only `self.mem[` write sites are `:727`, `:930`, `:944`, `:1048`, `:1049`. | Yes, and declared | **P3** (verified covered) |
 | 25 | `crates/fn64-abi/src/thread.rs:502` | `copy_nonoverlapping` | `#[cfg(test)]` fixture (`test_stack_writing_entry`) | n/a | **P3** |
 | 26 | `crates/fn64-render-rt64/examples/synthetic_fixed_cycle_release.rs:519` | `copy_nonoverlapping` | Example binary | n/a | **P3** |
 
@@ -127,7 +127,7 @@ let transaction = CatalogNestedWriterTransactionV1 {
     committed: false,
 };
 unsafe { storage.write_u32(origin.global, origin.handle) };
-fn64_recomp_rs::notify_host_abi_write(physical_start, 4);
+fn64_cpu_runtime::notify_host_abi_write(physical_start, 4);
 transaction
     .commit_with(|physical| unsafe { storage.read_u8(RdramAddr::from_offset(physical)) });
 ```
@@ -267,7 +267,7 @@ Concretely:
    7, 16, 19, and 22 from "depends on an enclosing transaction" to
    "declared at the point of write", and it is a **type error** to add a new
    undeclared writer.
-2. **Delete `Rdram::as_mut_slice`** (`crates/fn64-recomp-rs/src/runtime/host.rs:605`).
+2. **Delete `Rdram::as_mut_slice`** (`crates/fn64-cpu-runtime/src/runtime/host.rs:605`).
    Its own doc comment already calls it "an UNATTRIBUTED write path" and names
    its single legitimate caller. Replace that caller
    (`crates/fn64-abi/src/recompiled/runners.rs:1331`) with a
@@ -285,14 +285,14 @@ Concretely:
 
 - *Churn:* ~60 call sites across `fn64-abi` (`pfs`, `gbpak`, `voice`, `si`,
   `pi`, `task_dispatch`, `vi`, `mesgqueue`) plus `fn64-runtime` and
-  `fn64-recomp-rs`. Nearly all are mechanical — thread a channel constant
+  `fn64-cpu-runtime`. Nearly all are mechanical — thread a channel constant
   through construction. The `#[cfg(test)]` and example call sites
   (`fn64-certification` has ~20, `fn64-render-reference` tests ~30) need a
   `WriterChannel::BootstrapOrImport` or a test-only unattributed constructor,
   or the churn triples.
 - *Runtime:* the point-declaration form is **cheaper** than what it replaces,
   not more expensive. `notify_attributed_guest_write`
-  (`crates/fn64-recomp-rs/src/runtime/host.rs:464-479`) is a page-mark plus two
+  (`crates/fn64-cpu-runtime/src/runtime/host.rs:464-479`) is a page-mark plus two
   thread-local observer calls, and it early-returns on `len == 0`. Today's
   coverage comes from diffing a 1 MiB watched region per host call; replacing
   that with per-write declarations should *remove* the dominant profile cost

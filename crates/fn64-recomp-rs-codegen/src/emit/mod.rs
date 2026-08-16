@@ -33,8 +33,8 @@
 //! `RecompContext`/`Rdram` method calls. That is the property `-rs` exists
 //! to guarantee.
 
-use fn64_recomp_rs::decoder::{decode, Instruction, Reg};
-use fn64_recomp_rs::execution::{BankId, BankWordKind};
+use fn64_cpu_runtime::decoder::{decode, Instruction, Reg};
+use fn64_cpu_runtime::execution::{BankId, BankWordKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -327,7 +327,7 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
         base,
         words.len()
     );
-    let _ = writeln!(out, "// Emitted by fn64-recomp-rs (typed Rust, no unsafe).");
+    let _ = writeln!(out, "// Emitted by fn64-cpu-runtime (typed Rust, no unsafe).");
     // A leaf function may not touch memory (or, degenerately, registers); the
     // fixed ABI signature keeps both params, so allow the unused-var lint per
     // function rather than second-guessing which params a body references.
@@ -339,7 +339,7 @@ pub fn emit_function_resolved(func: &FuncInput, resolver: &dyn CallResolver) -> 
     );
     let _ = writeln!(
         out,
-        "    fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new({base:#010X}, {:?}));",
+        "    fn64_cpu_runtime::notify_function_entry(fn64_cpu_runtime::TranslatedFunctionIdentity::new({base:#010X}, {:?}));",
         func.name
     );
     let _ = writeln!(out, "    let mut pc: u32 = {:#010X};", base);
@@ -556,11 +556,11 @@ fn emit_dense_bank_runner_inner(
         name
     );
     let _ = writeln!(out, "    let mut executed = 0u32;");
-    let _ = writeln!(out, "    use fn64_recomp_rs::{{generated_support::{{address_error, finish_data_access_error, ArchitecturalFaultSite as FaultSite}}, DataAccessKind}};");
+    let _ = writeln!(out, "    use fn64_cpu_runtime::{{generated_support::{{address_error, finish_data_access_error, ArchitecturalFaultSite as FaultSite}}, DataAccessKind}};");
     let _ = writeln!(out, "    macro_rules! finish {{");
     let _ = writeln!(
         out,
-        "        ($exit:expr) => {{ return BlockRun::new(fn64_recomp_rs::finalize_executable_write_exit(BankId::new({:#018X}), $exit), executed) }};",
+        "        ($exit:expr) => {{ return BlockRun::new(fn64_cpu_runtime::finalize_executable_write_exit(BankId::new({:#018X}), $exit), executed) }};",
         bank.get()
     );
     let _ = writeln!(out, "    }}");
@@ -568,7 +568,7 @@ fn emit_dense_bank_runner_inner(
         let _ = writeln!(out, "    macro_rules! verify_live_word {{");
         let _ = writeln!(
             out,
-            "        ($bank:expr, $mem:expr, $pc:expr, $expected:expr, $fault_at:expr) => {{ if let Err(miss) = fn64_recomp_rs::verify_precompiled_instruction_word($bank, GuestPc::new($pc), $expected, $mem) {{ finish!(BlockExit::ImageChanged {{ at: ExecutionKey::new($bank, GuestPc::new($fault_at)), miss }}); }} }};"
+            "        ($bank:expr, $mem:expr, $pc:expr, $expected:expr, $fault_at:expr) => {{ if let Err(miss) = fn64_cpu_runtime::verify_precompiled_instruction_word($bank, GuestPc::new($pc), $expected, $mem) {{ finish!(BlockExit::ImageChanged {{ at: ExecutionKey::new($bank, GuestPc::new($fault_at)), miss }}); }} }};"
         );
         let _ = writeln!(out, "    }}");
     }
@@ -682,7 +682,7 @@ fn emit_dense_bank_runner_inner(
             let may_continue_locally = next < bank_end;
             let _ = writeln!(
                 out,
-                "            if let Some(exit) = fn64_recomp_rs::post_straight_instruction_exit(expected_bank, GuestPc::new({next:#010X}), executed, budget, {may_continue_locally}) {{ finish!(exit); }}"
+                "            if let Some(exit) = fn64_cpu_runtime::post_straight_instruction_exit(expected_bank, GuestPc::new({next:#010X}), executed, budget, {may_continue_locally}) {{ finish!(exit); }}"
             );
             if may_continue_locally {
                 let _ = writeln!(out, "            pc = {next:#010X}; continue 'run;");
@@ -857,11 +857,11 @@ fn emit_sparse_bank_runner_inner(
         bank.name
     );
     let _ = writeln!(out, "    let mut executed = 0u32;");
-    let _ = writeln!(out, "    use fn64_recomp_rs::{{generated_support::{{address_error, finish_data_access_error, ArchitecturalFaultSite as FaultSite}}, DataAccessKind}};");
+    let _ = writeln!(out, "    use fn64_cpu_runtime::{{generated_support::{{address_error, finish_data_access_error, ArchitecturalFaultSite as FaultSite}}, DataAccessKind}};");
     let _ = writeln!(out, "    macro_rules! finish {{");
     let _ = writeln!(
         out,
-        "        ($exit:expr) => {{ return BlockRun::new(fn64_recomp_rs::finalize_executable_write_exit(BankId::new({:#018X}), $exit), executed) }};",
+        "        ($exit:expr) => {{ return BlockRun::new(fn64_cpu_runtime::finalize_executable_write_exit(BankId::new({:#018X}), $exit), executed) }};",
         bank.bank.get()
     );
     let _ = writeln!(out, "    }}");
@@ -956,7 +956,7 @@ fn emit_sparse_bank_runner_inner(
             let may_continue_locally = domain.contains(next);
             let _ = writeln!(
                 out,
-                "            if let Some(exit) = fn64_recomp_rs::post_straight_instruction_exit(expected_bank, GuestPc::new({next:#010X}), executed, budget, {may_continue_locally}) {{ finish!(exit); }}"
+                "            if let Some(exit) = fn64_cpu_runtime::post_straight_instruction_exit(expected_bank, GuestPc::new({next:#010X}), executed, budget, {may_continue_locally}) {{ finish!(exit); }}"
             );
             if may_continue_locally {
                 let _ = writeln!(out, "            pc = {next:#010X}; continue 'run;");

@@ -6,7 +6,7 @@
     };
     use crate::materialized_image::evaluate_materialized_image_v1;
     use flate2::{write::DeflateEncoder, Compression};
-    use fn64_recomp_rs::{BankId, CpuFaultKind, ExecutionKey, GuestPc, InstructionBudget};
+    use fn64_cpu_runtime::{BankId, CpuFaultKind, ExecutionKey, GuestPc, InstructionBudget};
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -476,7 +476,7 @@
         };
         assert!(matches!(
             emit_block_program_source(&pack, &rom, config),
-            Err(BlockProgramSourceError::EntryFault(fn64_recomp_rs::CpuFault {
+            Err(BlockProgramSourceError::EntryFault(fn64_cpu_runtime::CpuFault {
                 at,
                 kind: CpuFaultKind::UnmappedPc {
                     bank_start: ENTRY_PC,
@@ -597,7 +597,7 @@ fn main() {{
         }}) if at == ExecutionKey::new(BankId::new({BANK_A}), GuestPc::new({HOLE_PC}))
     ));
 
-    let mut backing = vec![0u8; fn64_recomp_rs::RDRAM_LEN];
+    let mut backing = vec![0u8; fn64_cpu_runtime::RDRAM_LEN];
     let mut mem = Rdram::new(&mut backing);
     let mut ctx = RecompContext::default();
     let run = program.run(entry(), instruction_budget(), &mut ctx, &mut mem);
@@ -635,7 +635,7 @@ fn main() {{
             .arg("--edition=2021")
             .arg(&source_path)
             .arg("--extern")
-            .arg(format!("fn64_recomp_rs={}", rlib.display()))
+            .arg(format!("fn64_cpu_runtime={}", rlib.display()))
             .arg("-L")
             .arg(format!("dependency={}", deps.display()))
             .arg("-o")
@@ -676,7 +676,7 @@ fn main() {{
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
-                        name.starts_with("libfn64_recomp_rs-") && name.ends_with(".rlib")
+                        name.starts_with("libfn64_cpu_runtime-") && name.ends_with(".rlib")
                     })
             })
             .max_by_key(|path| {
@@ -684,5 +684,5 @@ fn main() {{
                     .and_then(|metadata| metadata.modified())
                     .ok()
             })
-            .expect("fn64-recomp-rs rlib is beside fn64-discover test executable")
+            .expect("fn64-cpu-runtime rlib is beside fn64-discover test executable")
     }

@@ -97,7 +97,7 @@ fn identity() -> GeneratedRunnerBuildIdentityV1 {
         manifest_sha256: "11".repeat(32),
         lock_sha256: "22".repeat(32),
         source_attestation_schema:
-            fn64_recomp_rs::GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2.to_owned(),
+            fn64_cpu_runtime::GENERATED_RUNNER_SOURCE_ATTESTATION_SCHEMA_V2.to_owned(),
         cargo_source_fields_validated: true,
         program_identity_sha256: "33".repeat(32),
         root_adapter_source_sha256: "44".repeat(32),

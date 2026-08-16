@@ -69,10 +69,10 @@ fn owner<'a>(bank: &'a str, bank_id: u64, start: u32, end: u32) -> TransferOwner
 }
 
 fn complete_policy() -> CatalogResolverPolicyEvidenceV1 {
-    fn64_recomp_rs::catalog_resolver_policy_evidence_v1()
+    fn64_cpu_runtime::catalog_resolver_policy_evidence_v1()
 }
 
-/// Whether the linked `fn64-recomp-rs` artifact can grant catalog-total
+/// Whether the linked `fn64-cpu-runtime` artifact can grant catalog-total
 /// authority at all.
 ///
 /// `validate_catalog_total_transfer_authority_v1` refuses a build whose
@@ -91,7 +91,7 @@ fn complete_policy() -> CatalogResolverPolicyEvidenceV1 {
 /// the rule working, not a regression. Tests asserting a refusal stay
 /// unconditional, because refusal holds in both configurations.
 fn catalog_total_authority_is_grantable() -> bool {
-    !fn64_recomp_rs::static_execution_build_receipt().dev_interpreter
+    !fn64_cpu_runtime::static_execution_build_receipt().dev_interpreter
 }
 
 #[test]

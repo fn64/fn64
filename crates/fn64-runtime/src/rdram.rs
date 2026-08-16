@@ -475,7 +475,7 @@ pub struct RdramPtr(std::ptr::NonNull<u8>);
 
 /// Report every raw RDRAM write touching a watched physical address.
 ///
-/// The attributed observers (`fn64_recomp_rs::set_write_observer`) only fire on
+/// The attributed observers (`fn64_cpu_runtime::set_write_observer`) only fire on
 /// declared writes, so they cannot see a writer that fails to declare -- which
 /// is exactly what WM2000's `0x0009b0b3` failure requires. This sits on the raw
 /// store path instead, below attribution, so nothing can bypass it.

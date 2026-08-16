@@ -247,7 +247,7 @@ pub enum BootstrapWriterChannelV1 {
 impl BootstrapWriterChannelV1 {
     pub(super) const fn tag(self) -> u8 {
         match self {
-            Self::BootstrapOrImport => fn64_recomp_rs::WriterChannel::BootstrapOrImport as u8,
+            Self::BootstrapOrImport => fn64_cpu_runtime::WriterChannel::BootstrapOrImport as u8,
         }
     }
 }

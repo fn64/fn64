@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::Path;
 
-use fn64_recomp_rs::{BootContext, BootTvStandard, Sha256Digest};
+use fn64_cpu_runtime::{BootContext, BootTvStandard, Sha256Digest};
 use sha2::{Digest, Sha256};
 
 use crate::TvType;
@@ -59,7 +59,7 @@ pub enum BootContextLoadError {
         source: std::io::Error,
     },
     Parse(serde_json::Error),
-    Invalid(fn64_recomp_rs::BootContextError),
+    Invalid(fn64_cpu_runtime::BootContextError),
     RomIdentityMismatch {
         context: Sha256Digest,
         supplied: Sha256Digest,
@@ -95,7 +95,7 @@ impl std::error::Error for BootContextLoadError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fn64_recomp_rs::{BootCicIdentity, BootCop0Context, BootRegion, BOOT_CONTEXT_SCHEMA_V1};
+    use fn64_cpu_runtime::{BootCicIdentity, BootCop0Context, BootRegion, BOOT_CONTEXT_SCHEMA_V1};
 
     fn context(rom: &[u8]) -> BootContext {
         let mut cp0 = [0u64; 32];

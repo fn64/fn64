@@ -70,7 +70,7 @@ pub(crate) fn commit_rsp_rdram_writes(source: RspWriterCommitSourceV1, written: 
     }
     record_rsp_writer_commits_v1(source, written);
     for &(start, end) in written {
-        fn64_recomp_rs::notify_rsp_execution_or_hle_writeback(start as u32, (end - start) as u32);
+        fn64_cpu_runtime::notify_rsp_execution_or_hle_writeback(start as u32, (end - start) as u32);
     }
     // Raw SP_STATUS and host-call task starts execute inside
     // BlockProgram::dispatch, which still owns the program borrow. The write

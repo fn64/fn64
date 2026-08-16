@@ -114,7 +114,7 @@ fn only_resident_backing_forces_a_block_boundary() {
 /// rejected as `AotMiss` rather than executing stale translated code.
 ///
 /// This is the half that makes skipping the boundary sound.
-/// `activate_for_fetch_with_digest` (`fn64-recomp-rs` `generation/mod.rs:771`)
+/// `activate_for_fetch_with_digest` (`fn64-cpu-runtime` `generation/mod.rs:771`)
 /// digests LIVE memory for every containing candidate before it consults
 /// `self.active`, so the changed bytes are seen at activation time even though
 /// no boundary was raised when they were written.

@@ -301,9 +301,9 @@ controls — steps or wall clock — never on an event the input script controls
 `FN64_HEARTBEAT=<steps>` does this. This is rule 6 (prove the lanes differ)
 pointed at runs instead of lanes.
 
-### 8. Editing `fn64-recomp-rs` costs 32 crate rebuilds
+### 8. Editing `fn64-cpu-runtime` costs 32 crate rebuilds
 ~9-11 minutes, versus ~25 s for `fn64-abi`. Every file in
-`crates/fn64-recomp-rs/src` is also a certified source, so an edit changes an
+`crates/fn64-cpu-runtime/src` is also a certified source, so an edit changes an
 identity digest. Prefer `fn64-abi`; when you must cross, say so in the commit.
 
 ### 9. Never run a rebuild-triggering agent beside a benchmarking one
@@ -721,7 +721,7 @@ will not be until that 2.86% grows.
 ### `fn64-audio` at codegen-units=256: a real defect, an overstated cure
 
 `recomps/wm2000/packages/wm2000-block-boot/Cargo.toml` sets `[profile.release] codegen-units =
-256` (:116) and overrides three packages to `1` — `fn64-recomp-rs` (:139),
+256` (:116) and overrides three packages to `1` — `fn64-cpu-runtime` (:139),
 `fn64-runtime` (:142), `fn64-abi` (:145). **`fn64-audio` has no override**, so
 the crate interpreting **4.13B RSP instructions** builds at 256.
 
@@ -1478,7 +1478,7 @@ The `sim_time=18776001537` byte-identity gate is what confirms no undeclared
 writer is being relied on in practice.
 
 The existing `verify_precompiled_instruction_word` dead end does **not** cover
-this: it is about fixing the check *inside* `fn64-recomp-rs`, and its stated
+this: it is about fixing the check *inside* `fn64-cpu-runtime`, and its stated
 reason — that crate "cannot see the barrier" — is precisely why the gate belongs
 at the `build.rs` call site.
 
@@ -1530,7 +1530,7 @@ thirds, and it is **codegen quality, not a correctness tax**: the guard is 24%
 of the field, the barrier pays for itself, and the RSP interpreter is
 large-not-slow at a defect-free 11.25 ns.
 
-**Cost of fixing it is the real obstacle.** Every file in `fn64-recomp-rs/src`
+**Cost of fixing it is the real obstacle.** Every file in `fn64-cpu-runtime/src`
 is a certified source, so a codegen change moves identity digests, and rule 8
 prices it at 32 crate rebuilds. This is a program, not a patch.
 
@@ -4451,7 +4451,7 @@ so the set was folklore passed between sessions — and on 2026-08-07 that cost 
 red release gate. Run all of these:
 
 ```
-cargo nextest run -p fn64-abi -p fn64-runtime -p fn64-recomp-rs   # 987
+cargo nextest run -p fn64-abi -p fn64-runtime -p fn64-cpu-runtime   # 987
 cargo nextest run -p fn64-boot-harness                            # 231
 cargo nextest run -p fn64-discover                                # 1069
 cargo nextest run -p fn64-render-reference                        # 464
@@ -4566,7 +4566,7 @@ verdict. For that, use a real `git worktree` checkout.
 - **Narrowing the watched region.** Four falsified attempts. WM2000 zeroes its
   own loaded code image; compiled shards live inside the memset destination.
 - **`verify_precompiled_instruction_word`.** Unfixable at that layer:
-  `fn64-recomp-rs` does not depend on `fn64-abi`, so it cannot see the barrier,
+  `fn64-cpu-runtime` does not depend on `fn64-abi`, so it cannot see the barrier,
   and `verify_live_words` is baked in at shard generation.
 - **Auto-vectorization-friendly restructuring of `vmacf` (RSP VU interpreter).**
   2026-08-14. `fn64_audio::rsp::interpreter::run_imem`'s own subtree showed

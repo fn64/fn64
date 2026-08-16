@@ -306,11 +306,11 @@ fn emit_block_program(
         rom,
         Some(facts),
         BlockProgramSourceConfig {
-            entry: fn64_recomp_rs::ExecutionKey::new(
-                fn64_recomp_rs::BankId::new(entry_bank.bank_id),
-                fn64_recomp_rs::GuestPc::new(entry_pc),
+            entry: fn64_cpu_runtime::ExecutionKey::new(
+                fn64_cpu_runtime::BankId::new(entry_bank.bank_id),
+                fn64_cpu_runtime::GuestPc::new(entry_pc),
             ),
-            instruction_budget: fn64_recomp_rs::InstructionBudget::new(1024)
+            instruction_budget: fn64_cpu_runtime::InstructionBudget::new(1024)
                 .ok_or_else(|| "invalid instruction budget".to_string())?,
         },
     )

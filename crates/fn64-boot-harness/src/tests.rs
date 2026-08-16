@@ -462,10 +462,10 @@ fn committed_vi_boundary_expires_after_native_destination_entry() {
 }
 
 #[cfg(feature = "recomp-rs")]
-fn observed_function_lookup(_vram: u32) -> fn64_recomp_rs::RecompFunc {
+fn observed_function_lookup(_vram: u32) -> fn64_cpu_runtime::RecompFunc {
     fn observed_function(
-        _ctx: &mut fn64_recomp_rs::RecompContext,
-        _rdram: &mut fn64_recomp_rs::Rdram<'_>,
+        _ctx: &mut fn64_cpu_runtime::RecompContext,
+        _rdram: &mut fn64_cpu_runtime::Rdram<'_>,
     ) {
     }
     observed_function
@@ -475,7 +475,7 @@ fn observed_function_lookup(_vram: u32) -> fn64_recomp_rs::RecompFunc {
 #[test]
 fn committed_vi_boundary_freezes_observed_function_destinations() {
     std::thread::spawn(|| {
-        use fn64_recomp_rs::{
+        use fn64_cpu_runtime::{
             ProgramArtifactIdentity, TranslatedFunctionIdentity,
             FUNCTION_ENTRY_OBSERVATION_SCHEMA,
         };
@@ -487,7 +487,7 @@ fn committed_vi_boundary_freezes_observed_function_destinations() {
             ProgramArtifactIdentity::new([0x5a; 32]),
             FUNCTION_ENTRY_OBSERVATION_SCHEMA,
         );
-        fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(
+        fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
             0x8000_1000,
             "entry",
         ));
@@ -498,7 +498,7 @@ fn committed_vi_boundary_freezes_observed_function_destinations() {
         assert_eq!(boundary.function_execution_destinations.len(), 1);
         assert_eq!(boundary.validate_unconsumed(), Ok(()));
 
-        fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(
+        fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
             0x8000_2000,
             "callee",
         ));
@@ -519,7 +519,7 @@ fn committed_vi_boundary_rejects_identity_only_function_lane() {
         fn64_abi::recompiled::set_entry_lookup_with_artifact_identity(
             observed_function_lookup,
             0x100,
-            fn64_recomp_rs::ProgramArtifactIdentity::new([0x5b; 32]),
+            fn64_cpu_runtime::ProgramArtifactIdentity::new([0x5b; 32]),
         );
         fn64_abi::configure_tv_type(fn64_runtime::TvType::Ntsc);
         let scheduled = fn64_abi::next_vi_deadline().unwrap();

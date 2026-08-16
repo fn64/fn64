@@ -25,7 +25,7 @@ Measured 2026-08-06 on WM2000, `recomps/wm2000/packages/wm2000-block-boot`, Appl
 ## The measurement
 
 Release build with `-C force-frame-pointers=yes` and `debug = 1` scoped to the
-three handwritten crates (`fn64-abi`, `fn64-runtime`, `fn64-recomp-rs`) in
+three handwritten crates (`fn64-abi`, `fn64-runtime`, `fn64-cpu-runtime`) in
 `recomps/wm2000/packages/wm2000-block-boot/Cargo.toml`, leaving the generated shards at
 `debug = false`. Without those line tables `run_one_step` inlines its whole
 callee tree and a sampler attributes ~92% of self time to one frame that
@@ -455,7 +455,7 @@ range decomposition was reverted, and the boundary map was never written,
 because the derivation it depends on does not exist on this program.
 
 Verification for this entry: 691/691 `fn64-abi`+`fn64-runtime`, 401/401
-`fn64-recomp-rs`, `grade-all.sh` wrong=0 on all five, 60k benchmark
+`fn64-cpu-runtime`, `grade-all.sh` wrong=0 on all five, 60k benchmark
 `sim_time=180000` at 36.16s (baseline ~36.5s). The probe was reverted; no
 source change is carried. (`fn64-discover` shows 1068/1069 — the OoT
 `auto_strategy_corpus` failure is pre-existing on this branch and unrelated:
@@ -680,7 +680,7 @@ the 60k benchmark has gone **32.71s -> 4.60s (7.1x)**.
 
 - `cargo nextest run -p fn64-abi --features recomp-rs -p fn64-runtime`:
   **696/696** (694 pre-existing + 2 new equivalence tests).
-- `cargo nextest run -p fn64-recomp-rs`: **401/401**.
+- `cargo nextest run -p fn64-cpu-runtime`: **401/401**.
 - `cargo nextest run -p fn64-discover`: **1069/1069** -- the OoT
   `auto_strategy_corpus` failure noted above did not reproduce on this run.
 - `scripts/grade-all.sh`: wrong=0 on all five (nw4e-donor 925, nw4e-solo 873,
@@ -690,7 +690,7 @@ the 60k benchmark has gone **32.71s -> 4.60s (7.1x)**.
 
 - `cargo nextest run -p fn64-abi --features recomp-rs -p fn64-runtime`:
   **694/694** (691 pre-existing + 3 new).
-- `cargo nextest run -p fn64-recomp-rs`: **401/401**.
+- `cargo nextest run -p fn64-cpu-runtime`: **401/401**.
 - `cargo nextest run -p fn64-discover`: 1068/1069 -- the OoT
   `auto_strategy_corpus` failure is pre-existing, confirmed by reverting this
   change and re-running that test alone.
@@ -941,7 +941,7 @@ them.
 
 - `cargo nextest run -p fn64-abi --features recomp-rs -p fn64-runtime`:
   **712/712** (708 pre-existing + 4 new).
-- `cargo nextest run -p fn64-recomp-rs`: **401/401**.
+- `cargo nextest run -p fn64-cpu-runtime`: **401/401**.
 - `cargo nextest run -p fn64-discover`: **1069/1069**.
 - `scripts/grade-all.sh`: wrong=0 on all five (nw4e-donor 925, nw4e-solo 873,
   nwxe-donor 779, nwxe-solo 725, revenge-solo 597).

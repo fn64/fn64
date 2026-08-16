@@ -103,7 +103,7 @@ it, don't read it. Every design claim states which allowed source it came from.
     `docs/PARITY-METHOD.md`.
   - `cargo nextest run -p fn64-abi` — `c_smoke` links a real C caller against
     the staticlib, so the ABI shape is proven by a test, not by prose.
-  - `crates/fn64-recomp-rs/tests/oracle.rs` + friends — per-instruction
+  - `crates/fn64-cpu-runtime/tests/oracle.rs` + friends — per-instruction
     differential of fn64's emitted bodies against N64Recomp's C. Note its
     blind spot: it compares CODEGEN, so anything applied above codegen (a
     config stub, a patch) is invisible to it.

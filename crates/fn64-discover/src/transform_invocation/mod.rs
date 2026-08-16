@@ -12,7 +12,7 @@ use crate::banks::materialize_rom_range_bounded;
 use crate::facts::{evaluated_image_receipt_sha256_v1, EvaluatedImageReceiptV1, FactDb};
 use crate::materialized_image::{rederive_materialized_image_v1, MaterializedImageLimitsV1};
 use crate::NormalizedRom;
-use fn64_recomp_rs::{
+use fn64_cpu_runtime::{
     decode, dynamic_mapped_execution_build_receipt_v1, set_read_observer, set_write_observer,
     BankId, BlockExit, DynamicMappedUnitCatalogV1, ExecutionKey, GuestPc, GuestReadEvent,
     GuestWriteEvent, Instruction, InstructionBudget, Rdram, RecompContext, WriterChannel,
@@ -1333,7 +1333,7 @@ fn validate_code_pc(
 
 fn words_for_run(
     code: &KnownTransformCodeImageV1<'_>,
-    instructions: &[fn64_recomp_rs::InstructionWordIdentity],
+    instructions: &[fn64_cpu_runtime::InstructionWordIdentity],
 ) -> Result<Vec<u32>, TransformInvocationErrorV1> {
     instructions
         .iter()

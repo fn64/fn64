@@ -570,7 +570,7 @@ pub extern "C" fn fn64_c_rdram_write(vaddr: u64, width: u32, value: u64) {
         "generated-C RDRAM write at {vaddr:#018x} has invalid aligned physical range {physical_offset:#x}..{end:#x} for width {width}"
     );
     #[cfg(feature = "recomp-rs")]
-    fn64_recomp_rs::notify_cpu_instruction_store(physical_offset, width);
+    fn64_cpu_runtime::notify_cpu_instruction_store(physical_offset, width);
     if width == 2 {
         task_dispatch::observe_non_rdp_write16(physical_offset, value as u16);
     }
@@ -1085,7 +1085,7 @@ struct HostState {
     /// this table and owns an rs-lane `RecompContext` inside the SAME executor
     /// coroutine used by the C path.
     #[cfg(feature = "recomp-rs")]
-    recompiled_lookup: Option<fn(u32) -> fn64_recomp_rs::RecompFunc>,
+    recompiled_lookup: Option<fn(u32) -> fn64_cpu_runtime::RecompFunc>,
     /// Bank-qualified arbitrary-PC program installed by the universal rs
     /// lane. This is mutually exclusive with `recompiled_lookup`: spawned
     /// OSThreads enter through its explicit PC-to-bank resolver and retain

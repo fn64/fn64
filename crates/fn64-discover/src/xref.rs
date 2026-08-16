@@ -14,7 +14,7 @@
 //! basic-block join. It never proves executable permission, reachability, or
 //! a complete stored-value set. Callers own promotion; this module only
 //! reports what the bytes say under MIPS-III decoding by the shared
-//! `fn64-recomp-rs` decoder (the same ISA authority the CFG pass uses).
+//! `fn64-cpu-runtime` decoder (the same ISA authority the CFG pass uses).
 //!
 //! # Delay-slot handling
 //!
@@ -25,7 +25,7 @@
 //! stay candidates.
 
 use crate::cfg::{classify_control, ControlOp};
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use serde::{Deserialize, Serialize};
 
 /// How the value a store writes was established, along the linear

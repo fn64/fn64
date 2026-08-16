@@ -497,7 +497,7 @@ impl MmioSpace {
     ///
     /// Deliberately one-directional (model -> rdram bytes only, no
     /// `sync_from_rdram` counterpart). Typed-Rust recompiled `lw/sw` now call
-    /// `read_w`/`write_w` directly through `fn64-recomp-rs`'s MMIO hooks, so
+    /// `read_w`/`write_w` directly through `fn64-cpu-runtime`'s MMIO hooks, so
     /// their side effects cannot be re-derived or double-applied from bytes.
     /// The byte mirror remains the compatibility path for generated C, whose
     /// raw pointer macros cannot be intercepted; retiring that one-directional

@@ -377,12 +377,12 @@ change the conclusion.
 
 Investigated under the original framing and kept only because it is one line
 of relevance. There **is** a complete R4300i MIPS-III interpreter in-tree —
-`crates/fn64-recomp-rs/src/semantic/mod.rs`, 1,877 lines, sharing the AOT
+`crates/fn64-cpu-runtime/src/semantic/mod.rs`, 1,877 lines, sharing the AOT
 decoder and honoring the same `BlockExit` contract, with a differential
-equivalence test (`crates/fn64-recomp-rs/tests/interp_differential.rs`).
+equivalence test (`crates/fn64-cpu-runtime/tests/interp_differential.rs`).
 
 It is **excluded from the shipping build by compile error**:
-`crates/fn64-recomp-rs/src/lib.rs:33-34` makes `production-aot` and
+`crates/fn64-cpu-runtime/src/lib.rs:33-34` makes `production-aot` and
 `dev-interpreter` mutually exclusive, and
 `recomps/wm2000/packages/wm2000-block-boot/Cargo.toml:46` selects `production-aot`.
 `dev_interpreter_artifact.rs:8` exists so a byte scan can *prove* a shipped
@@ -679,7 +679,7 @@ equal**. That is why this is a substitution rather than a gate.
 
 Each shard emits `ROM_START`/`ROM_END` beside the existing `VA_START`/`BYTE_LEN`
 instead of a literal array. `code_bank()` recovers the words from the user's ROM
-via `fn64_recomp_rs::shard_words`.
+via `fn64_cpu_runtime::shard_words`.
 
 **Why it matches by construction, not by luck:** the build-time decode at
 `wm2000-block-shards/build.rs:488-491` is literally

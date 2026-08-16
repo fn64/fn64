@@ -50,11 +50,11 @@ backings
 ```
 
 The doc comment states this "mirrors `invalidate_physical_write`
-(`fn64-recomp-rs` `generation/mod.rs:1292`)". It does not mirror it in the
+(`fn64-cpu-runtime` `generation/mod.rs:1292`)". It does not mirror it in the
 one case that matters. That function treats a missing backing as an invariant
 violation:
 
-`crates/fn64-recomp-rs/src/generation/mod.rs:1307-1310`
+`crates/fn64-cpu-runtime/src/generation/mod.rs:1307-1310`
 ```rust
 let backing = &self.backings[self
     .backings
@@ -379,7 +379,7 @@ switch it shipped with is what made this measurable.
 | SELF% | n | category |
 |---|---|---|
 | **57.56%** | 1560 | **`memcmp` — mutation-guard region scans** |
-| 8.52% | 231 | fn64-recomp-rs (dispatch, store, translate) |
+| 8.52% | 231 | fn64-cpu-runtime (dispatch, store, translate) |
 | 6.72% | 182 | fn64-abi (HLE, pi, task dispatch) |
 | 5.39% | 146 | mutation-guard logic (non-`memcmp`) |
 | 4.87% | 132 | `memmove`/`memset` (snapshot + mirror copies) |

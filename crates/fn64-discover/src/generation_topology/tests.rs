@@ -5,7 +5,7 @@
         ProloguePattern, ProofState, RomAddressSpace,
     };
     use crate::snapshot::{compose_materialized_banks_catalog_bound_v1, MaterializedBankInput};
-    use fn64_recomp_rs::{
+    use fn64_cpu_runtime::{
         BackedExecutableSpanV1, BankId, GuestPc, PrecompiledGenerationBackingEvidenceV1,
         PrecompiledGenerationEvidenceV1, PrecompiledShard,
     };
@@ -203,7 +203,7 @@
             .iter()
             .enumerate()
             .map(|(index, generation)| PrecompiledGenerationEvidenceV1 {
-                generation: fn64_recomp_rs::GenerationId::new(generation.generation_id),
+                generation: fn64_cpu_runtime::GenerationId::new(generation.generation_id),
                 image_start: GuestPc::new(generation.image_start),
                 image_end: GuestPc::new(generation.image_end),
                 invalidation_start: GuestPc::new(generation.invalidation_start),
@@ -222,7 +222,7 @@
             .generations
             .iter()
             .map(|generation| PrecompiledGenerationBackingEvidenceV1 {
-                generation: fn64_recomp_rs::GenerationId::new(generation.generation_id),
+                generation: fn64_cpu_runtime::GenerationId::new(generation.generation_id),
                 spans: vec![BackedExecutableSpanV1::new(
                     GuestPc::new(generation.invalidation_start),
                     generation.invalidation_start & 0x007f_ffff,
@@ -700,7 +700,7 @@
         let (rom, pack, topology, mut catalog, digest, request) = transfer_fixture(0);
         catalog
             .active_segments
-            .push(fn64_recomp_rs::ActiveGenerationSegment {
+            .push(fn64_cpu_runtime::ActiveGenerationSegment {
                 start: GuestPc::new(OVERLAY),
                 end: GuestPc::new(OVERLAY + 4),
                 generation: catalog.generations[0].generation,
@@ -1091,7 +1091,7 @@
                     })
                     .collect();
                 PrecompiledGenerationEvidenceV1 {
-                    generation: fn64_recomp_rs::GenerationId::new(generation.generation_id),
+                    generation: fn64_cpu_runtime::GenerationId::new(generation.generation_id),
                     image_start: GuestPc::new(generation.image_start),
                     image_end: GuestPc::new(generation.image_end),
                     invalidation_start: GuestPc::new(generation.invalidation_start),
@@ -1106,7 +1106,7 @@
             .generations
             .iter()
             .map(|generation| PrecompiledGenerationBackingEvidenceV1 {
-                generation: fn64_recomp_rs::GenerationId::new(generation.generation_id),
+                generation: fn64_cpu_runtime::GenerationId::new(generation.generation_id),
                 spans: vec![BackedExecutableSpanV1::new(
                     GuestPc::new(generation.invalidation_start),
                     generation.invalidation_start & 0x1fff_ffff,

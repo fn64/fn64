@@ -20,4 +20,4 @@ static_assertions = "1.1"
 # Test-only: the executor-drives-the-fallback-lane integration proof lives in
 # tests/executor_fallback.rs. Production dependency direction remains one-way;
 # the recompiler lane is linked only into fn64-runtime test binaries.
-fn64-recomp-rs = { path = "../fn64-recomp-rs" }
+fn64-cpu-runtime = { path = "../fn64-cpu-runtime" }

@@ -13,7 +13,7 @@ callable functions with no translated instructions, while the Rust driver
 recovers many of those functions from the same ROM.
 
 `scripts/lane-parity.sh` therefore audits the generated artifacts before it
-builds either boot binary. `crates/fn64-recomp-rs/tests/lane_authority.rs`:
+builds either boot binary. `crates/fn64-cpu-runtime/tests/lane_authority.rs`:
 
 1. extracts every `RECOMP_FUNC` C body and every emitted Rust function body;
 2. classifies a generated body by the instruction PCs recorded by each
@@ -27,7 +27,7 @@ The check is name- and instruction-address-based, not a source-text or binary
 hash comparison: C and Rust deliberately spell the same operation differently.
 An equal PC set proves that both code generators cover the same source
 instructions for that function. It does not prove each emitted operation has
-the same semantics; `fn64-recomp-rs`'s instruction/oracle suites own that
+the same semantics; `fn64-cpu-runtime`'s instruction/oracle suites own that
 separate layer.
 
 With the current private OoT NTSC 1.0 artifacts, the audit measures 13,203 C

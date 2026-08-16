@@ -6,7 +6,7 @@
 use crate::dense_aot_pack::{dense_aot_artifact_bank_id, DenseAotPackV1, DENSE_AOT_SHARD_BYTES};
 use crate::generation_topology::{CatalogGenerationRoleV1, GenerationTopologyV1};
 use crate::NormalizedRom;
-use fn64_recomp_rs::{
+use fn64_cpu_runtime::{
     BackedExecutableSpanV1, BackedPrecompiledGenerationCatalogV1, BankId, GenerationId, GuestPc,
     PrecompiledGeneration, PrecompiledGenerationBackingV1, PrecompiledGenerationCatalog,
     PrecompiledShard,

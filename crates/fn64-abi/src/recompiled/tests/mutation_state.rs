@@ -474,14 +474,14 @@ use super::*;
     fn renderer_transaction_attributes_exact_changed_executable_bytes() {
         let _state = scoped_test_executable_write_preflight_state(vec![(0x40, 0x48)], Vec::new());
         let previous =
-            fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
+            fn64_cpu_runtime::set_write_observer(Some(record_executable_and_renderer_write));
         let mut storage = [0u8; 0x80];
         track_rdp_renderer_mutation(&mut storage, |storage| {
             storage[0x41 ^ 3] = 0xaa;
             storage[0x42 ^ 3] = 0xbb;
             storage[0x70 ^ 3] = 0xcc;
         });
-        fn64_recomp_rs::set_write_observer(previous);
+        fn64_cpu_runtime::set_write_observer(previous);
 
         assert_eq!(
             PENDING_ATTRIBUTED_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone()),
@@ -757,7 +757,7 @@ use super::*;
             fn64_runtime::RdramPtr::from_storage_ptr(rdram)
                 .write_u8(fn64_runtime::RdramAddr::from_offset(0x7000), 2);
         }
-        fn64_recomp_rs::notify_pi_dma_write(0x7000, 1);
+        fn64_cpu_runtime::notify_pi_dma_write(0x7000, 1);
         process_live_executable_writes_from_host();
 
         assert!(crate::run_one_step());

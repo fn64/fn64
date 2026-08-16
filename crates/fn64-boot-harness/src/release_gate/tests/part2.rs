@@ -1374,7 +1374,7 @@ fn device_state_v16_wire_binds_typed_program_identity_and_dynamic_state() {
         LiveExecutableRegionEvidenceSnapshot, PendingExecutableWriteEvidenceSnapshot,
         RecompiledProgramEvidenceSnapshot,
     };
-    use fn64_recomp_rs::{
+    use fn64_cpu_runtime::{
         BankId, BlockProgramEvidenceSnapshot, CodeBankEvidenceSnapshot,
         CodeSpanEvidenceSnapshot, ExecutionKey, GuestPc, InstructionWordIdentity,
         MappedAotEvidenceSnapshot, PhysicalCodeBankEvidenceSnapshot,

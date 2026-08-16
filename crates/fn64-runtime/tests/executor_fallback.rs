@@ -4,7 +4,7 @@
 //! the AOT and interpreter lanes indistinguishable to the executor.
 //!
 //! This is the `fn64-runtime` half of the executor-drive proof (the pure
-//! action-mapping half lives in `fn64-recomp-rs`'s `tests/executor_drive.rs`).
+//! action-mapping half lives in `fn64-cpu-runtime`'s `tests/executor_drive.rs`).
 //! It proves the three load-bearing properties against the REAL executor:
 //!
 //!  1. AOT -> interpreted -> exit: a coroutine body drives a `FallbackProgram`
@@ -22,14 +22,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use fn64_recomp_rs::drive::ExecutorAction;
-use fn64_recomp_rs::execution::{
+use fn64_cpu_runtime::drive::ExecutorAction;
+use fn64_cpu_runtime::execution::{
     dispatch_until_boundary, BankId, BlockExit, BlockRun, CpuFault, CpuFaultKind, ExecutionKey,
     GuestPc, InstructionBudget,
 };
-use fn64_recomp_rs::fallback::FallbackProgram;
-use fn64_recomp_rs::runtime::{Rdram, RecompContext};
-use fn64_recomp_rs::{CodeBank, GeneratedBankRunner};
+use fn64_cpu_runtime::fallback::FallbackProgram;
+use fn64_cpu_runtime::runtime::{Rdram, RecompContext};
+use fn64_cpu_runtime::{CodeBank, GeneratedBankRunner};
 
 use fn64_runtime::{Executor, Yield};
 
@@ -159,7 +159,7 @@ fn executor_drives_a_fallback_program_across_both_lanes_to_completion() {
 
 #[test]
 fn hole_dispatched_through_the_executor_surfaces_a_typed_fault_not_a_panic() {
-    use fn64_recomp_rs::execution::CodeSpan;
+    use fn64_cpu_runtime::execution::CodeSpan;
 
     // The fault the coroutine observed, surfaced back out through the executor
     // (the body records it and yields; the test reads it after idle).

@@ -46,7 +46,7 @@ Add `rustc_apfloat` (MIT/Apache-2.0, Rust-native, no C, used by rustc itself —
 clean provenance, fits fn64's `wrong==0`/MIT discipline). It is IEEE-754-exact:
 every op takes a rounding mode and returns a `StatusAnd<T>` carrying the exact
 exception flags (invalid/divByZero/overflow/underflow/inexact). Emit arithmetic
-as calls into a small `fn64_recomp_rs::fpu` shim that:
+as calls into a small `fn64_cpu_runtime::fpu` shim that:
 1. reads FCSR.RM, maps to the apfloat rounding mode,
 2. performs the op via apfloat,
 3. feeds the returned status flags through the existing `raise_fpu` (Cause/Flags
@@ -90,7 +90,7 @@ and has a clean escape hatch if ever needed.
 
 ## Scope of the build (Option A)
 
-1. **`fn64-recomp-rs/src/fpu.rs` (new)**: the shared soft-float shim —
+1. **`fn64-cpu-runtime/src/fpu.rs` (new)**: the shared soft-float shim —
    `add/sub/mul/div/sqrt/abs/neg` for S and D, each taking FCSR.RM, returning
    `(bits, ieee_flags)`; canonical-NaN materialization; SNaN→QNaN quieting;
    denormal-flush per VR4300 (flush-to-zero with the Unimplemented-Operation
@@ -115,8 +115,8 @@ right flags/NaN/denormal). Acceptance oracle, in priority order:
 2. **MIPS/VR4300-specific behavior** (canonical NaN bit pattern, denormal→
    Unimplemented-Operation trap, FCSR cause/flag exact bits, enabled-exception
    vectoring) needs the **hardware/ares vector set** — extend the existing
-   `crates/fn64-recomp-rs/tests/fpu_oracle.rs` with hand-transcribed
-   architectural vectors from the VR4300 manual + ares' FPU (`fn64-recomp-rs`
+   `crates/fn64-cpu-runtime/tests/fpu_oracle.rs` with hand-transcribed
+   architectural vectors from the VR4300 manual + ares' FPU (`fn64-cpu-runtime`
    tests already establish this pattern for CVT/compare).
 3. **The live corpus (SM64)** is the integration oracle — SM64 is FPU/collision-
    math-heavy; it running with correct physics is the end-to-end proof. C2

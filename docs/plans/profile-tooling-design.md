@@ -83,7 +83,7 @@ Discovered while reading; each one would have broken a naive implementation.
    canonical program identity**, so a before/after comparison would be running a
    different program and would read exactly like a perf change (rule 11a). This
    is the decisive argument for landing in `fn64-abi`: ~25 s rebuild, no digest
-   movement. (`fn64-recomp-rs` would be 32 crates, ~9-11 min, *and* move
+   movement. (`fn64-cpu-runtime` would be 32 crates, ~9-11 min, *and* move
    identity digests — rule 8.)
 
 3. **The gates are `thread_local!` `Cell`s initialized at first touch.** Arming
@@ -407,7 +407,7 @@ plumbing, and the owner's memcpy fix is unmeasurable without them.
 
 **Net cost of the whole change:** two new files (~640 lines including tests) plus
 ~140 lines wired into `frame_census.rs`, `dpc_copy_census.rs`, `host.rs`,
-`lib.rs`, and the benchmark script. No file in `fn64-recomp-rs` touched, no
+`lib.rs`, and the benchmark script. No file in `fn64-cpu-runtime` touched, no
 certified source, no identity digest moved.
 
 ## Proving each check can fail (rule 6a)

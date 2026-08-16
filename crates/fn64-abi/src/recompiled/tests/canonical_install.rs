@@ -1,5 +1,5 @@
 use super::*;
-use fn64_recomp_rs::CodeSpan;
+use fn64_cpu_runtime::CodeSpan;
 
     #[test]
     fn validated_boot_owns_rdram_and_starts_journal_with_bootstrap_batch() {
@@ -1467,7 +1467,7 @@ use fn64_recomp_rs::CodeSpan;
             })
         ));
 
-        let previous = fn64_recomp_rs::set_host_lookup(Some(install_test_legacy_host_lookup));
+        let previous = fn64_cpu_runtime::set_host_lookup(Some(install_test_legacy_host_lookup));
         assert!(matches!(
             install.resolve_call(first, sparse_hole),
             Err(CpuFault {
@@ -1475,7 +1475,7 @@ use fn64_recomp_rs::CodeSpan;
                 ..
             })
         ));
-        fn64_recomp_rs::set_host_lookup(previous);
+        fn64_cpu_runtime::set_host_lookup(previous);
         assert_eq!(install.evidence(), &evidence);
     }
 

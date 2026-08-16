@@ -337,7 +337,7 @@ pub const EXECUTABLE_WRITER_CHANNEL_DENOMINATOR_SCHEMA_V2: &str =
 ///
 /// Address aliases, cache state, exception destinations, and PI analysis gaps
 /// belong to the separate frontier matrix above.
-pub use fn64_recomp_rs::WriterChannel as WriterChannelV2;
+pub use fn64_cpu_runtime::WriterChannel as WriterChannelV2;
 
 pub const WRITER_CHANNELS_V2: [WriterChannelV2; 8] = [
     WriterChannelV2::CpuInstructionStore,

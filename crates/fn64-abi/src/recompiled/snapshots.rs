@@ -19,7 +19,7 @@ impl TransferResolver for LiveTransferResolver {
         target_pc: GuestPc,
         _resume: ExecutionKey,
     ) -> Result<CallResolution, CpuFault> {
-        if fn64_recomp_rs::resolve_host_function(target_pc.get()).is_some() {
+        if fn64_cpu_runtime::resolve_host_function(target_pc.get()).is_some() {
             Ok(CallResolution::Host)
         } else {
             self.resolve(source_bank, target_pc)
@@ -774,7 +774,7 @@ pub fn copy_dynamic_mapped_execution_telemetry_v1() -> DynamicMappedExecutionTel
     DynamicMappedExecutionTelemetryV1 {
         resolver_install_sha256: resolver_install_definition_sha256(&live.install),
         program_identity: live.install.evidence().program_identity,
-        dynamic_source_sha256: fn64_recomp_rs::dynamic_mapped_execution_build_receipt_v1()
+        dynamic_source_sha256: fn64_cpu_runtime::dynamic_mapped_execution_build_receipt_v1()
             .source_sha256(),
         rom_sha256: live
             .bootstrap_evidence
@@ -1127,7 +1127,7 @@ pub mod activation_census {
         *ENABLED.get_or_init(|| std::env::var_os("FN64_ACTIVATION_CENSUS").is_some())
     }
 
-    fn observe(observation: &fn64_recomp_rs::BackedGenerationActivationObservationV1) {
+    fn observe(observation: &fn64_cpu_runtime::BackedGenerationActivationObservationV1) {
         let mut guard = TOTALS.lock().expect("activation census poisoned");
         let totals = guard.get_or_insert_with(std::collections::BTreeMap::new);
         let slot = totals.entry(observation.generation.get()).or_insert([0; 4]);
@@ -1162,7 +1162,7 @@ pub mod activation_census {
         if !enabled() {
             return;
         }
-        fn64_recomp_rs::set_backed_generation_activation_observer_v1(Some(observe));
+        fn64_cpu_runtime::set_backed_generation_activation_observer_v1(Some(observe));
         extern "C" fn at_exit() {
             print!("{}", report());
             use std::io::Write as _;
@@ -1266,7 +1266,7 @@ pub(super) fn record_executable_and_renderer_write(event: GuestWriteEvent) {
 /// The obvious counterexample -- write bytes while nothing is resident, then
 /// activate a generation over them and execute stale code -- cannot happen.
 /// `activate_for_fetch_with_digest`
-/// (`fn64-recomp-rs` `generation/mod.rs:771`) computes `live_digest` from LIVE
+/// (`fn64-cpu-runtime` `generation/mod.rs:771`) computes `live_digest` from LIVE
 /// memory and compares it against `expected_sha256` for every containing
 /// candidate **unconditionally and before** consulting `self.active`; the
 /// `already_active` short-circuit happens after that loop. So a later
@@ -1423,7 +1423,7 @@ pub(crate) fn track_rdp_renderer_mutation<R>(
     rdram: &mut [u8],
     operation: impl FnOnce(&mut [u8]) -> R,
 ) -> R {
-    track_catalog_nested_mutation(rdram, operation, fn64_recomp_rs::notify_rdp_renderer_write)
+    track_catalog_nested_mutation(rdram, operation, fn64_cpu_runtime::notify_rdp_renderer_write)
 }
 
 /// Record one renderer operation whose backend contract has crossed a commit
@@ -1497,7 +1497,7 @@ pub(crate) fn track_rsp_execution_or_hle_mutation<R>(
     let result = track_catalog_nested_mutation(
         rdram,
         operation,
-        fn64_recomp_rs::notify_rsp_execution_or_hle_writeback,
+        fn64_cpu_runtime::notify_rsp_execution_or_hle_writeback,
     );
     let journal_sequences = state.borrow().entries[initial_entry_count..]
         .iter()
