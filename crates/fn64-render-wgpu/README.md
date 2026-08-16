@@ -87,12 +87,33 @@ exact presentation/capture identity and strips two 256-byte padded GPU-copy
 rows without admitting padding as visible pixels. Every fixed register,
 manager control, identity component, extent, pitch, and byte length has hostile
 mutation coverage. A repository-owned WGSL implementation parses and validates
-under Naga 30, but is not wired to a GPU pipeline or executed here.
+under Naga 30; M3.3d alone does not wire or execute it.
 
-The combined contract is deliberately not an implementation of native target
-allocation, raster, RGBA16 packing, guest writes, a live `ViPresentation`
-adapter, GPU VI/filter execution, ordinary headless capture, or surface
-presentation. It admits no depth image or depth write, no TMEM, textures,
+M3.3c wires the exact M3.3a transaction through one real wgpu queue. Device
+creation prewarms a repository-owned 4x2 RGBA16 fill pipeline and M3.3d's
+bounded replicate pipeline; submission creates no pipeline. One in-flight
+owner binds the decoded workload, queue/submission/transaction identity,
+target key, target generation, physical range, native ordinal, and wgpu
+`SubmissionIndex`. It can mint target-completion authority only after the
+exact indexed wait, that encoder's completion callback, a 48-byte bounded
+readback, and byte validation. The first 16 readback bytes remain the typed
+logical/device RGBA16 domain. N64Recomp storage bytes are produced only by the
+explicit adjacent-byte conversion, while native RGBA8 comes from the typed
+RGBA5551 oracle. The final 32 bytes are checked against both M3.3d's typed CPU
+oracle and its frozen BGRA8 fixture.
+
+Target publication is prepared before the guest ticket moves. Its move-only
+capability retains an exclusive registry borrow, so no predecessor, alias, or
+capacity mutation can make publication fail after a successful guest commit.
+Dropping or rejecting any earlier state publishes neither the target registry
+nor `NativeDurableState`. A required host with no native adapter fails the GPU
+test through the typed `NoAdapter` outcome; it is never counted as a skip.
+
+The combined contract is deliberately not a general implementation of raster,
+guest dispatch, a live `ViPresentation` adapter, ordinary headless capture, or
+surface presentation. M3.3c proves only the exact synthetic target allocation,
+RGBA16 fill, guest writeback, and fixed GPU VI mechanism described above. It
+admits no depth image or depth write, no TMEM, textures,
 blending, coverage, multisampling, ray tracing, interlacing, resampling,
 optional VI filters, surface path, or performance/parity claim. Its byte-exact
 synthetic fixture is mechanism evidence, not the required real captured

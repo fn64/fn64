@@ -1,11 +1,11 @@
 //! Pure-Rust wgpu renderer ownership for fn64.
 //!
-//! M3.3b adds CPU-only typed color-target planning and rollback-safe generation
-//! ownership to M3.3a's exact native 4x2 RGBA16 fill contract. M3.3d adds one
-//! CPU-only progressive, replicate-mode VI oracle and padded capture extractor
-//! for that exact fill. There is no production target-completion constructor,
-//! GPU allocation/raster/VI execution, guest write, live VI adapter, RT64
-//! parity, or performance claim.
+//! M3.3c executes M3.3a's exact native 4x2 RGBA16 fill through a prewarmed
+//! wgpu pipeline, M3.3b's typed target generations, and M3.3d's separately
+//! typed bounded VI mechanism. The target and RDP state publish only after the
+//! guest owner commits the exact backing-storage bytes. This remains one
+//! synthetic mechanism: it is not a general raster/VI implementation, live VI
+//! adapter, surface path, RT64 parity result, or performance claim.
 //!
 //! Submission and completion are type states. An in-flight operation has no
 //! early receipt conversion:
@@ -88,6 +88,18 @@
 //! # fn assemble_native_output(_: DeviceRgba16Bytes, _: N64RecompRdramStorageBytes) {}
 //! assemble_native_output(abi_storage(), device_pixels());
 //! ```
+//!
+//! Native completion is move-only, so one GPU observation cannot publish two
+//! target generations:
+//!
+//! ```compile_fail
+//! use fn64_render_wgpu::{InFlightNativeRasterFill, NativeRasterError};
+//! # fn in_flight() -> InFlightNativeRasterFill<'static, 'static> { unimplemented!() }
+//! let in_flight = in_flight();
+//! let first = in_flight.complete();
+//! let second = in_flight.complete();
+//! # let _: (Result<_, NativeRasterError>, Result<_, NativeRasterError>) = (first, second);
+//! ```
 #![forbid(unsafe_code)]
 
 mod device;
@@ -130,8 +142,10 @@ pub use state::{
 };
 pub use targets::{
     pack_device_pixels, unpack_device_pixels, CandidateColorTarget, ColorTargetExtent,
-    ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CompletedColorTargetWrite,
-    DeviceColorBytes, ExactRowPlan, InitializedCandidateColorTarget, InitializedRegionProof,
-    ResidentColorTarget, Rgba8, TargetError, TargetGeneration, TargetRectangle, TargetRowRange,
-    TargetRows,
+    ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CommittedNativeRasterFrame,
+    CompletedColorTargetWrite, DeviceColorBytes, ExactRowPlan, InFlightNativeRasterFill,
+    InitializedCandidateColorTarget, InitializedRegionProof, NativeRasterDeviceOutcome,
+    NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, ResidentColorTarget, Rgba8,
+    TargetError, TargetGeneration, TargetRectangle, TargetRowRange, TargetRows,
+    UninitializedNativeRaster,
 };
