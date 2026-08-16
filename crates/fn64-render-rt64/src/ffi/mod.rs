@@ -450,6 +450,20 @@ struct RawPresentCapture {
 
 const _: [(); 48] = [(); std::mem::size_of::<RawPresentCapture>()];
 
+fn active_graphics_api_from_tag(
+    tag: u32,
+    evidence_source: &str,
+) -> Result<ActiveRenderGraphicsApi, String> {
+    match tag {
+        1 => Ok(ActiveRenderGraphicsApi::D3d12),
+        2 => Ok(ActiveRenderGraphicsApi::Vulkan),
+        3 => Ok(ActiveRenderGraphicsApi::Metal),
+        value => Err(format!(
+            "RT64 returned unknown {evidence_source} graphics API {value}"
+        )),
+    }
+}
+
 fn validate_present_capture_metadata(
     metadata: RawPresentCapture,
 ) -> Result<
@@ -489,16 +503,7 @@ fn validate_present_capture_metadata(
             ));
         }
     };
-    let graphics_api = match metadata.graphics_api {
-        1 => ActiveRenderGraphicsApi::D3d12,
-        2 => ActiveRenderGraphicsApi::Vulkan,
-        3 => ActiveRenderGraphicsApi::Metal,
-        value => {
-            return Err(format!(
-                "RT64 returned unknown present graphics API {value}"
-            ));
-        }
-    };
+    let graphics_api = active_graphics_api_from_tag(metadata.graphics_api, "present")?;
     Ok((host_len, format, graphics_api))
 }
 

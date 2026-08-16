@@ -3215,6 +3215,59 @@ extern "C" Fn64Rt64Context *fn64_rt64_create(
     }
 }
 
+extern "C" int fn64_rt64_read_live_device_graphics_api(
+    const Fn64Rt64Context *context,
+    uint32_t *graphics_api,
+    char *error,
+    size_t error_capacity) {
+    try {
+        if (graphics_api == nullptr) {
+            set_error(error, error_capacity, "null RT64 live-device graphics API output");
+            return 0;
+        }
+        if ((context == nullptr) || !context->setup_complete ||
+            !context->application) {
+            set_error(error, error_capacity,
+                      "RT64 live-device graphics API requires a completed setup");
+            return 0;
+        }
+        if (!context->application->renderInterface ||
+            !context->application->device) {
+            set_error(error, error_capacity,
+                      "RT64 completed setup has no live graphics device or interface");
+            return 0;
+        }
+
+        uint32_t observed_graphics_api = 0;
+        switch (context->application->chosenGraphicsAPI) {
+        case RT64::UserConfiguration::GraphicsAPI::D3D12:
+            observed_graphics_api = FN64_RT64_GRAPHICS_API_D3D12;
+            break;
+        case RT64::UserConfiguration::GraphicsAPI::Vulkan:
+            observed_graphics_api = FN64_RT64_GRAPHICS_API_VULKAN;
+            break;
+        case RT64::UserConfiguration::GraphicsAPI::Metal:
+            observed_graphics_api = FN64_RT64_GRAPHICS_API_METAL;
+            break;
+        default:
+            set_error(error, error_capacity,
+                      "RT64 live device returned a non-concrete graphics API");
+            return 0;
+        }
+
+        *graphics_api = observed_graphics_api;
+        return 1;
+    } catch (const std::exception &exception) {
+        set_error(error, error_capacity,
+                  std::string("RT64 live-device graphics API query threw: ") + exception.what());
+        return 0;
+    } catch (...) {
+        set_error(error, error_capacity,
+                  "RT64 live-device graphics API query failed with an unknown C++ exception");
+        return 0;
+    }
+}
+
 extern "C" int fn64_rt64_apply_user_config(
     Fn64Rt64Context *context,
     const Fn64Rt64UserConfig *user_config,

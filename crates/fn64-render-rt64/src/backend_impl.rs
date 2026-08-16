@@ -113,6 +113,34 @@ impl Rt64Backend {
         Self::release_identity_with_post_vi_api(post_vi_api_for_graphics_api(api))
     }
 
+    /// Read the concrete graphics API owned by the successfully created RT64
+    /// device. This evidence seam does no GPU work and requires no capture,
+    /// present, or VI operation.
+    pub fn live_device_graphics_api_for_evidence(
+        &self,
+    ) -> Result<ActiveRenderGraphicsApi, RenderError> {
+        #[cfg(feature = "rt64")]
+        {
+            self.context
+                .as_ref()
+                .ok_or(RenderError::NotReady("Rt64Backend::create() not called"))?
+                .live_device_graphics_api()
+                .map_err(|reason| RenderError::Backend {
+                    backend: "rt64-live-device-api-evidence",
+                    reason,
+                })
+        }
+
+        #[cfg(not(feature = "rt64"))]
+        {
+            Err(RenderError::Backend {
+                backend: "rt64-live-device-api-evidence",
+                reason: "fn64-render-rt64 was built without the opt-in `rt64` Cargo feature"
+                    .to_string(),
+            })
+        }
+    }
+
     #[cfg(feature = "rt64")]
     fn release_identity_with_post_vi_api(post_vi_api: &'static str) -> Rt64BackendIdentity {
         let source_provenance = match env!("FN64_RT64_SOURCE_PROVENANCE") {

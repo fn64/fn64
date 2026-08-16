@@ -59,6 +59,32 @@ impl Context {
             .ok_or_else(|| error_string(&error, "RT64 create failed without a diagnostic"))
     }
 
+    /// Concrete API selected by the live RT64 application during successful
+    /// setup. This queries device identity only; it neither submits work nor
+    /// touches the present-capture or VI paths.
+    pub(crate) fn live_device_graphics_api(&self) -> Result<ActiveRenderGraphicsApi, String> {
+        let mut graphics_api = 0;
+        let mut error = [0; ERROR_CAPACITY];
+        // SAFETY: the opaque context remains alive for this synchronous,
+        // read-only query, and both output buffers are writable for their
+        // advertised sizes. The C++ boundary retains no pointers.
+        let queried = unsafe {
+            fn64_rt64_read_live_device_graphics_api(
+                self.0.as_ptr(),
+                &mut graphics_api,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if queried == 0 {
+            return Err(error_string(
+                &error,
+                "RT64 live-device graphics API query failed without a diagnostic",
+            ));
+        }
+        active_graphics_api_from_tag(graphics_api, "live-device")
+    }
+
     pub(crate) fn apply_user_config(
         &mut self,
         settings: &RenderRuntimeSettings,
