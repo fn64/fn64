@@ -17,7 +17,7 @@ fn encode_device_snapshot(
 }
 
 #[cfg(feature = "recomp-rs")]
-fn publication_cpu_snapshot(seed: u64) -> fn64_recomp_rs::RecompContextEvidenceSnapshotV1 {
+fn publication_cpu_snapshot(seed: u64) -> fn64_cpu_runtime::RecompContextEvidenceSnapshotV1 {
     let mut gprs = [0_u64; 32];
     let mut physical_fgrs = [0_u64; 32];
     for (index, value) in gprs.iter_mut().enumerate() {
@@ -26,20 +26,20 @@ fn publication_cpu_snapshot(seed: u64) -> fn64_recomp_rs::RecompContextEvidenceS
     for (index, value) in physical_fgrs.iter_mut().enumerate() {
         *value = seed.wrapping_mul(3).wrapping_add(index as u64);
     }
-    let mut tlb_entries = [fn64_recomp_rs::TlbEntryRaw::default(); 32];
-    tlb_entries[0] = fn64_recomp_rs::TlbEntryRaw {
+    let mut tlb_entries = [fn64_cpu_runtime::TlbEntryRaw::default(); 32];
+    tlb_entries[0] = fn64_cpu_runtime::TlbEntryRaw {
         page_mask: seed as u32 ^ 0x0000_6000,
         entry_hi: seed ^ 0x1234_5678_9abc_def0,
         entry_lo0: seed as u32 ^ 0x1357_2468,
         entry_lo1: seed as u32 ^ 0x2468_1357,
     };
-    tlb_entries[31] = fn64_recomp_rs::TlbEntryRaw {
+    tlb_entries[31] = fn64_cpu_runtime::TlbEntryRaw {
         page_mask: 0x01ff_e000,
         entry_hi: seed.rotate_left(17),
         entry_lo0: 0x1234,
         entry_lo1: 0x5678,
     };
-    fn64_recomp_rs::RecompContextEvidenceSnapshotV1 {
+    fn64_cpu_runtime::RecompContextEvidenceSnapshotV1 {
         gprs,
         hi: seed ^ 0x1111,
         lo: seed ^ 0x2222,
@@ -77,7 +77,7 @@ fn publication_cpu_snapshot(seed: u64) -> fn64_recomp_rs::RecompContextEvidenceS
 #[cfg(feature = "recomp-rs")]
 fn publication_cpu_snapshot_without_pending_timing(
     seed: u64,
-) -> fn64_recomp_rs::RecompContextEvidenceSnapshotV1 {
+) -> fn64_cpu_runtime::RecompContextEvidenceSnapshotV1 {
     let mut snapshot = publication_cpu_snapshot(seed);
     snapshot.cop0_count_write = None;
     snapshot.cop0_compare_write = None;
@@ -85,10 +85,10 @@ fn publication_cpu_snapshot_without_pending_timing(
 }
 
 #[cfg(feature = "recomp-rs")]
-fn publication_key(bank: u64, pc: u32) -> fn64_recomp_rs::ExecutionKey {
-    fn64_recomp_rs::ExecutionKey::new(
-        fn64_recomp_rs::BankId::new(bank),
-        fn64_recomp_rs::GuestPc::new(pc),
+fn publication_key(bank: u64, pc: u32) -> fn64_cpu_runtime::ExecutionKey {
+    fn64_cpu_runtime::ExecutionKey::new(
+        fn64_cpu_runtime::BankId::new(bank),
+        fn64_cpu_runtime::GuestPc::new(pc),
     )
 }
 
@@ -336,7 +336,7 @@ fn native_destination_event(
 #[cfg(feature = "recomp-rs")]
 fn typed_block_program() -> crate::ProgramEvidenceSnapshot {
     use fn64_abi::recompiled::RecompiledProgramEvidenceSnapshot;
-    use fn64_recomp_rs::{
+    use fn64_cpu_runtime::{
         BankId, BlockProgramEvidenceSnapshot, CodeBankEvidenceSnapshot,
         CodeSpanEvidenceSnapshot, GuestPc, ProgramArtifactIdentity,
         ProgramIdentityEvidenceSnapshot, ProgramIdentitySource,

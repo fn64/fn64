@@ -656,7 +656,7 @@ bounded/open-indirect sites remain serialized as typed `catalog_guarded`
 diagnostics while the runtime-resolved transfer inventory can become
 `CatalogTotal`; the ordinary `ProvenFactRoots` path is unchanged. Production
 now obtains private-field `CatalogResolverPolicyEvidenceV1` only from the
-linked `fn64-recomp-rs` implementation. It binds aligned sparse-PC admission,
+linked `fn64-cpu-runtime` implementation. It binds aligned sparse-PC admission,
 exact active/source-owner lookup, the explicit thread-return boundary,
 mapping/alignment faults, and the shared six-vector exception resolver to the
 same build receipt and vector constant used by execution. The WM producer
@@ -668,7 +668,7 @@ on this path; a WM ROM was not available in the current environment to
 regenerate its receipt.
 
 The first canonical-install substrates now exist below that seam. In
-`fn64-recomp-rs`, `CatalogBlockProgramV1` owns the `BlockProgram`, admitted
+`fn64-cpu-runtime`, `CatalogBlockProgramV1` owns the `BlockProgram`, admitted
 entry, and instruction budget, captures the canonical program/runner evidence
 plus the existing linked-feature receipt, and exposes only fixed-entry run,
 validated entry changes, and atomic whole-program replacement. It accepts no
@@ -1040,7 +1040,7 @@ state but does not remove historical profile/feature generations already on
 disk.
 
 The first source-compaction mechanism moves the ordered straight-instruction
-boundary decision into `fn64-recomp-rs::post_straight_instruction_exit`.
+boundary decision into `fn64-cpu-runtime::post_straight_instruction_exit`.
 Every generated straight arm retains its architectural operation, CP0 Random
 advance, retirement count, and transfer; only the repeated
 executable-write-before-checkpoint choice is shared. The source profiler
@@ -1079,7 +1079,7 @@ required; the failed identity validation is evidence for build feasibility and
 the caught verifier bug, not writer-channel completion.
 
 The third compaction moves aligned-address and checked-memory failure
-continuations into `fn64_recomp_rs::generated_support`. Its typed
+continuations into `fn64_cpu_runtime::generated_support`. Its typed
 `ArchitecturalFaultSite` constructors make straight versus delay-slot EPC/BD
 state explicit; `finish_data_access_error` retains the distinct guest-
 exception and host-admission retirement rules and still passes through the

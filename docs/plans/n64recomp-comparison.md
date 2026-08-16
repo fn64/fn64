@@ -327,7 +327,7 @@ it from ROM bytes where they hand-declared it in a splat yaml.**
   `recompile_rom.rs:538`. They hand-maintain the exception list
   ("NEVER stub osGetCount"); we detect and recover mechanically.
 - **The mutation journal.** Eight closed writer channels at
-  `crates/fn64-recomp-rs/src/runtime/host.rs:141-152`, where undeclared writes
+  `crates/fn64-cpu-runtime/src/runtime/host.rs:141-152`, where undeclared writes
   to watched executable ranges fail the next dispatch
   (`crates/fn64-runtime/src/executor/mod.rs:193-195`). It caught a real bug:
   `mirror_queue_to_rdram` writing an `OSMesgQueue` field undeclared at step

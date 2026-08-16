@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Typed-Rust VR4300 source emitter for fn64-recomp-rs."
+description = "Typed-Rust VR4300 source emitter for fn64-cpu-runtime."
 
 [dependencies]
 fn64-recomp = { path = "../fn64-recomp" }
-fn64-recomp-rs = { path = "../fn64-recomp-rs", default-features = false, features = ["aot-runtime"] }
+fn64-cpu-runtime = { path = "../fn64-cpu-runtime", default-features = false, features = ["aot-runtime"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"

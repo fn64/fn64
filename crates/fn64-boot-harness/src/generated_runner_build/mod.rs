@@ -1,6 +1,6 @@
 //! Verifier-owned build authority for the repository's generated WM runner.
 //!
-//! The source attestation emitted by `fn64-recomp-rs` is intentionally not
+//! The source attestation emitted by `fn64-cpu-runtime` is intentionally not
 //! authority: safe Rust cannot recover a function body's source from a
 //! function pointer. This module closes that outer relation by owning one
 //! frozen Cargo build, selecting the exact compiler artifact, launching only

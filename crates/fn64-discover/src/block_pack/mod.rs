@@ -255,8 +255,8 @@ pub enum BlockPackError {
 /// generated-source artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockProgramSourceConfig {
-    pub entry: fn64_recomp_rs::ExecutionKey,
-    pub instruction_budget: fn64_recomp_rs::InstructionBudget,
+    pub entry: fn64_cpu_runtime::ExecutionKey,
+    pub instruction_budget: fn64_cpu_runtime::InstructionBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,12 +264,12 @@ pub enum BlockProgramSourceError {
     Pack(BlockPackError),
     InvalidBank {
         bank: String,
-        error: fn64_recomp_rs::BankError,
+        error: fn64_cpu_runtime::BankError,
     },
     DuplicateBankId {
-        bank: fn64_recomp_rs::BankId,
+        bank: fn64_cpu_runtime::BankId,
     },
-    EntryFault(fn64_recomp_rs::CpuFault),
+    EntryFault(fn64_cpu_runtime::CpuFault),
     TooManyBanks {
         count: usize,
     },
@@ -720,7 +720,7 @@ pub fn augment_with_observed_execution(
             .get(start..start + 4)
             .ok_or(ObservedExecutionAugmentError::RomWordOutsideImage { pc, rom_offset })?;
         let word = u32::from_be_bytes(bytes.try_into().expect("four-byte ROM word"));
-        if fn64_recomp_rs::decode(word).has_delay_slot() {
+        if fn64_cpu_runtime::decode(word).has_delay_slot() {
             let delay_pc = pc
                 .checked_add(4)
                 .ok_or(ObservedExecutionAugmentError::MappingAddressOverflow)?;
@@ -818,10 +818,10 @@ pub fn emit_block_program_source_with_facts(
     }
     banks.sort_by_key(|bank| bank.bank_id);
 
-    let mut catalog = fn64_recomp_rs::CodeCatalog::new();
+    let mut catalog = fn64_cpu_runtime::CodeCatalog::new();
     let mut ids = BTreeSet::new();
     for bank in &banks {
-        let id = fn64_recomp_rs::BankId::new(bank.bank_id);
+        let id = fn64_cpu_runtime::BankId::new(bank.bank_id);
         if !ids.insert(id) {
             return Err(BlockProgramSourceError::DuplicateBankId { bank: id });
         }
@@ -860,7 +860,7 @@ pub fn emit_block_program_source_with_facts(
     .unwrap();
     writeln!(
         source,
-        "use fn64_recomp_rs::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramArtifactIdentity, Rdram, RecompContext}};\n"
+        "use fn64_cpu_runtime::{{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramArtifactIdentity, Rdram, RecompContext}};\n"
     )
     .unwrap();
 
@@ -877,7 +877,7 @@ pub fn emit_block_program_source_with_facts(
         source.push_str(&fn64_recomp_rs_codegen::emit_sparse_bank_runner_function(
             &fn64_recomp_rs_codegen::SparseBankInput {
                 name: &name,
-                bank: fn64_recomp_rs::BankId::new(bank.bank_id),
+                bank: fn64_cpu_runtime::BankId::new(bank.bank_id),
                 blocks: &blocks,
             },
         ));
@@ -919,7 +919,7 @@ pub fn emit_materialized_bank_runner_with_host_calls(
     fn64_recomp_rs_codegen::emit_sparse_bank_runner_with_host_calls(
         &fn64_recomp_rs_codegen::SparseBankInput {
             name,
-            bank: fn64_recomp_rs::BankId::new(bank.bank_id),
+            bank: fn64_cpu_runtime::BankId::new(bank.bank_id),
             blocks: &blocks,
         },
         host_calls,
@@ -930,20 +930,20 @@ pub fn emit_materialized_bank_runner_with_host_calls(
 /// type without flattening gaps.
 pub fn materialized_code_bank(
     bank: &MaterializedPackedBank,
-) -> Result<fn64_recomp_rs::CodeBank, fn64_recomp_rs::BankError> {
-    let id = fn64_recomp_rs::BankId::new(bank.bank_id);
+) -> Result<fn64_cpu_runtime::CodeBank, fn64_cpu_runtime::BankError> {
+    let id = fn64_cpu_runtime::BankId::new(bank.bank_id);
     let spans = bank
         .blocks
         .iter()
         .map(|block| {
-            fn64_recomp_rs::CodeSpan::new(
+            fn64_cpu_runtime::CodeSpan::new(
                 id,
-                fn64_recomp_rs::GuestPc::new(block.start_va),
+                fn64_cpu_runtime::GuestPc::new(block.start_va),
                 block.words.clone(),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    fn64_recomp_rs::CodeBank::from_spans(id, spans)
+    fn64_cpu_runtime::CodeBank::from_spans(id, spans)
 }
 
 fn emit_source_catalog_helpers(
@@ -1324,7 +1324,7 @@ fn complete_severed_delay_slots(
                         start_va: block.start_va,
                     })?;
             let last_word_control =
-                fn64_recomp_rs::decode(u32::from_be_bytes(last_word)).has_delay_slot();
+                fn64_cpu_runtime::decode(u32::from_be_bytes(last_word)).has_delay_slot();
             if last_word_control
                 && word_class.get(&delay_slot_va) == Some(&WordClass::ProvenCode)
                 && !admitted.contains(&delay_slot_va)

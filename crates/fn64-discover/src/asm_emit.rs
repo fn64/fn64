@@ -3,7 +3,7 @@
 //!
 //! This module does not discover boundaries, classify words, or decode the
 //! ISA. Its only authoritative geometry is [`ExactFunctionOwner`], and every
-//! typed input is checked against [`fn64_recomp_rs::decode`] before emission.
+//! typed input is checked against [`fn64_cpu_runtime::decode`] before emission.
 //! Emission consumes caller-supplied words and is therefore independent of
 //! whether the exact owner's bytes came from an affine ROM span or a
 //! materialized output span.
@@ -14,7 +14,7 @@
 use crate::cfg::region_target;
 use crate::facts::BankAddr;
 use crate::owner_proof::ExactFunctionOwner;
-use fn64_recomp_rs::{decode, Instruction};
+use fn64_cpu_runtime::{decode, Instruction};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 

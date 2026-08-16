@@ -48,7 +48,7 @@ and `BootstrapImportTransactionV1::commit` are bootstrap validation. **Not one
 significant caller is a guest load.** The brief described this frame as "guest
 memory reads through a lane-XOR-3 swizzle; every guest load pays it" — that is
 not what the profile says. Guest loads go through
-`fn64_recomp_rs::runtime::host::Rdram`, which appears separately and far lower
+`fn64_cpu_runtime::runtime::host::Rdram`, which appears separately and far lower
 (`backing_offset` 1.39%, `try_store_w_translated` 0.97%).
 
 Optimizing the swizzle would therefore have optimized the guard, been measured

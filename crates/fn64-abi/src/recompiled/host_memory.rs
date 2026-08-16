@@ -60,7 +60,7 @@ pub fn read_guest_physical(physical_start: u32, len: u32) -> Option<Vec<u8>> {
 /// Returns `false` when no recompiled program is live or the interval leaves
 /// registered RDRAM; in neither case is anything written.
 ///
-/// [`WriterChannel::HostAbi`]: fn64_recomp_rs::WriterChannel::HostAbi
+/// [`WriterChannel::HostAbi`]: fn64_cpu_runtime::WriterChannel::HostAbi
 pub fn write_guest_physical(physical_start: u32, bytes: &[u8]) -> bool {
     let len = match u32::try_from(bytes.len()) {
         Ok(len) => len,
@@ -106,7 +106,7 @@ pub fn write_guest_physical(physical_start: u32, bytes: &[u8]) -> bool {
     for (index, &byte) in bytes.iter().enumerate() {
         unsafe { storage.write_u8(RdramAddr::from_offset(physical_start + index as u32), byte) };
     }
-    fn64_recomp_rs::notify_host_abi_write(physical_start, len);
+    fn64_cpu_runtime::notify_host_abi_write(physical_start, len);
     // Commit against the view, not just the byte reader: the view lets the
     // changed-byte scan run one `memcmp` per watched range instead of
     // rebuilding the whole watched region a byte at a time. See
@@ -169,7 +169,7 @@ pub fn declare_guest_physical_write(physical_start: u32, len: u32) -> bool {
         }
         None => CatalogNestedWriterTransactionV1::inert(),
     };
-    fn64_recomp_rs::notify_host_abi_write(physical_start, len);
+    fn64_cpu_runtime::notify_host_abi_write(physical_start, len);
     // SAFETY: `rdram` is non-null and `rdram_len` is the registered length of
     // that one allocation, both checked above; neither borrow outlives this
     // call. Same contract as `write_guest_physical`.

@@ -364,7 +364,7 @@ use super::*;
             Rdram::new(&mut bytes).load_w(0xffff_ffff_8000_0010),
             0x0000_beef
         );
-        fn64_recomp_rs::notify_host_abi_write(0x80, 4);
+        fn64_cpu_runtime::notify_host_abi_write(0x80, 4);
         process_live_executable_writes_from_host();
         let after_host_write = catalog_generation_install_evidence_snapshot().unwrap();
         assert!(
@@ -393,8 +393,8 @@ use super::*;
         REWRITE_BUILDS.with(|builds| builds.borrow_mut().clear());
         REWRITE_B_ENTRIES.with(|entries| entries.borrow_mut().clear());
         let mut bytes = vec![0u8; 0x200];
-        fn64_recomp_rs::set_write_observer(None);
-        fn64_recomp_rs::set_guest_write_boundary_observer(None);
+        fn64_cpu_runtime::set_write_observer(None);
+        fn64_cpu_runtime::set_guest_write_boundary_observer(None);
         {
             let mut mem = Rdram::new(&mut bytes);
             for (index, word) in REWRITE_A_WORDS.into_iter().enumerate() {

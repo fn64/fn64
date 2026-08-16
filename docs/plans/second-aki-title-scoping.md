@@ -304,7 +304,7 @@ a regression guard, not an input.
 
 The gate names these as separate subsystems, which is true, but they are **not
 per-title costs**. I found 114 title mentions across `crates/fn64-abi/src/` and
-`crates/fn64-recomp-rs/src/` and **every one is a test name or a comment** — zero
+`crates/fn64-cpu-runtime/src/` and **every one is a test name or a comment** — zero
 title-specific runtime logic. `crates/fn64-audio/src/rsp/` is a complete MIT-clean
 RSP audio stack (verified end-to-end for OoT, per `recomps/wm2000/docs/WM2000-AUDIO-STATUS.md`).
 

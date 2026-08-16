@@ -287,7 +287,7 @@ pub(super) fn validate_bootstrap_ranges(
     let mut previous_end = None;
     for range in ranges {
         if range.physical_start >= range.physical_end
-            || usize::try_from(range.physical_end).unwrap() > fn64_recomp_rs::RDRAM_LEN
+            || usize::try_from(range.physical_end).unwrap() > fn64_cpu_runtime::RDRAM_LEN
             || previous_end.is_some_and(|end| range.physical_start <= end)
         {
             return Err(error(format!("{field} is not canonical physical backing")));
@@ -364,7 +364,7 @@ pub(super) fn validate_bootstrap_runtime_prerequisite(
         .collect::<Vec<_>>();
     if declared.iter().any(|range| {
         range.physical_start >= range.physical_end
-            || usize::try_from(range.physical_end).unwrap() > fn64_recomp_rs::RDRAM_LEN
+            || usize::try_from(range.physical_end).unwrap() > fn64_cpu_runtime::RDRAM_LEN
     }) {
         return Err(error(
             "bootstrap declared writes contain an invalid physical range",
@@ -823,7 +823,7 @@ pub(super) fn validate_cpu_runtime_prerequisite(
     let mut previous_end = None;
     for range in &prerequisite.watched_ranges {
         if range.physical_start >= range.physical_end
-            || usize::try_from(range.physical_end).unwrap() > fn64_recomp_rs::RDRAM_LEN
+            || usize::try_from(range.physical_end).unwrap() > fn64_cpu_runtime::RDRAM_LEN
             || previous_end.is_some_and(|end| range.physical_start <= end)
         {
             return Err(error(

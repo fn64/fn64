@@ -1163,8 +1163,8 @@
         assert!(restored.is_some());
     }
 
-    fn executable_changed(_: GuestWriteEvent) -> fn64_recomp_rs::GuestWriteBoundary {
-        fn64_recomp_rs::GuestWriteBoundary::ExecutableChanged
+    fn executable_changed(_: GuestWriteEvent) -> fn64_cpu_runtime::GuestWriteBoundary {
+        fn64_cpu_runtime::GuestWriteBoundary::ExecutableChanged
     }
 
     #[test]
@@ -1174,10 +1174,10 @@
         let zeros = vec![0; payload.len()];
         let request = request(&code, &zeros);
         assert!(
-            fn64_recomp_rs::set_guest_write_boundary_observer(Some(executable_changed)).is_none()
+            fn64_cpu_runtime::set_guest_write_boundary_observer(Some(executable_changed)).is_none()
         );
-        fn64_recomp_rs::notify_cpu_instruction_store(0x4000, 4);
-        let token_before = fn64_recomp_rs::guest_write_token(0x4000, 4);
+        fn64_cpu_runtime::notify_cpu_instruction_store(0x4000, 4);
+        let token_before = fn64_cpu_runtime::guest_write_token(0x4000, 4);
 
         let result = certify_transform_wrapper_invocation_v1(
             &rom,
@@ -1188,7 +1188,7 @@
         );
 
         assert!(result.is_ok());
-        assert_eq!(fn64_recomp_rs::guest_write_token(0x4000, 4), token_before);
-        assert!(fn64_recomp_rs::take_executable_write_boundary());
-        assert!(fn64_recomp_rs::set_guest_write_boundary_observer(None).is_some());
+        assert_eq!(fn64_cpu_runtime::guest_write_token(0x4000, 4), token_before);
+        assert!(fn64_cpu_runtime::take_executable_write_boundary());
+        assert!(fn64_cpu_runtime::set_guest_write_boundary_observer(None).is_some());
     }

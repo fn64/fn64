@@ -1,5 +1,5 @@
 use super::*;
-use fn64_recomp_rs::CodeSpan;
+use fn64_cpu_runtime::CodeSpan;
 
     #[test]
     fn translated_cpu_unsupported_gap_records_the_typed_release_event() {
@@ -60,15 +60,15 @@ use fn64_recomp_rs::CodeSpan;
             evidence_lookup,
             0x100,
             identity,
-            fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+            fn64_cpu_runtime::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
         );
         with_executor(|executor| executor.set_sim_time(37));
-        fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(
+        fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
             0x8000_1000,
             "entry",
         ));
         with_executor(|executor| executor.set_sim_time(41));
-        fn64_recomp_rs::notify_function_entry(TranslatedFunctionIdentity::new(
+        fn64_cpu_runtime::notify_function_entry(TranslatedFunctionIdentity::new(
             0x8000_2000,
             "callee",
         ));
@@ -369,10 +369,10 @@ use fn64_recomp_rs::CodeSpan;
         let renderer_calls = Rc::new(Cell::new(0));
         crate::set_render_backend(Box::new(CountBackend(renderer_calls.clone())), 0x100);
         let previous =
-            fn64_recomp_rs::set_write_observer(Some(record_executable_and_renderer_write));
+            fn64_cpu_runtime::set_write_observer(Some(record_executable_and_renderer_write));
         let mut bytes = [0u8; 0x100];
         Rdram::new(&mut bytes).store_h(0xffff_ffff_a000_0040, 0x1235);
-        fn64_recomp_rs::set_write_observer(previous);
+        fn64_cpu_runtime::set_write_observer(previous);
 
         assert_eq!(
             PENDING_EXECUTABLE_WRITES.with(|pending| pending.borrow().clone()),
@@ -400,7 +400,7 @@ use fn64_recomp_rs::CodeSpan;
             )
             .unwrap();
         let thread_id = 0xB10C;
-        let previous_host_lookup = fn64_recomp_rs::set_host_lookup(Some(live_host_lookup));
+        let previous_host_lookup = fn64_cpu_runtime::set_host_lookup(Some(live_host_lookup));
 
         // SAFETY: `bytes` remains live until the installed thread has
         // returned and the executor marks it dead below.
@@ -439,7 +439,7 @@ use fn64_recomp_rs::CodeSpan;
         assert!(crate::is_thread_dead(thread_id));
         let mem = Rdram::new(&mut bytes);
         assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000), 0x1234);
-        fn64_recomp_rs::set_host_lookup(previous_host_lookup);
+        fn64_cpu_runtime::set_host_lookup(previous_host_lookup);
     }
 
 
@@ -471,7 +471,7 @@ use fn64_recomp_rs::CodeSpan;
         );
         let expected_evidence = install.evidence().clone();
         let previous_host_lookup =
-            fn64_recomp_rs::set_host_lookup(Some(forbidden_catalog_legacy_lookup));
+            fn64_cpu_runtime::set_host_lookup(Some(forbidden_catalog_legacy_lookup));
         let thread_id = 0xca70;
 
         // SAFETY: `bytes` remains live until the installed thread returns.
@@ -491,7 +491,7 @@ use fn64_recomp_rs::CodeSpan;
             Some(expected_evidence)
         );
         assert!(copy_canonical_thread_publications_v1().is_empty());
-        assert!(fn64_recomp_rs::resolve_host_function(LIVE_HOST.get()).is_none());
+        assert!(fn64_cpu_runtime::resolve_host_function(LIVE_HOST.get()).is_none());
         assert!(crate::run_one_step());
         assert_eq!(crate::host::sim_time(), 3);
         let publications = copy_canonical_thread_publications_v1();
@@ -529,7 +529,7 @@ use fn64_recomp_rs::CodeSpan;
         assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000), 0x1234);
         assert_eq!(copy_block_host_boundaries().len(), 2);
         assert_eq!(copy_block_execution_destinations().len(), 2);
-        fn64_recomp_rs::set_host_lookup(previous_host_lookup);
+        fn64_cpu_runtime::set_host_lookup(previous_host_lookup);
     }
 
 
@@ -703,7 +703,7 @@ use fn64_recomp_rs::CodeSpan;
         unsafe {
             storage.write_u8(fn64_runtime::RdramAddr::from_offset(0x7100), 2);
         }
-        fn64_recomp_rs::notify_pi_dma_write(0x7100, 1);
+        fn64_cpu_runtime::notify_pi_dma_write(0x7100, 1);
         process_live_executable_writes_from_host();
 
         assert!(crate::run_one_step());
@@ -1002,7 +1002,7 @@ use fn64_recomp_rs::CodeSpan;
         let inactive_evidence = generation_install.evidence_snapshot();
         assert!(inactive_evidence.generations.active_segments.is_empty());
         let previous_host_lookup =
-            fn64_recomp_rs::set_host_lookup(Some(forbidden_catalog_legacy_lookup));
+            fn64_cpu_runtime::set_host_lookup(Some(forbidden_catalog_legacy_lookup));
         let thread_id = 0xca76;
 
         // SAFETY: `bytes` remains live until the installed thread returns.
@@ -1027,5 +1027,5 @@ use fn64_recomp_rs::CodeSpan;
         assert!(crate::is_thread_dead(thread_id));
         let mem = Rdram::new(&mut bytes);
         assert_eq!(mem.load_w(0xFFFF_FFFF_8000_0000), 0x1234);
-        fn64_recomp_rs::set_host_lookup(previous_host_lookup);
+        fn64_cpu_runtime::set_host_lookup(previous_host_lookup);
     }

@@ -152,7 +152,7 @@ if [ "$OBSERVE" -eq 1 ]; then
 fi
 echo "lane-parity: auditing generated callable bodies (mode=$AUTHORITY_MODE)..."
 if ! FN64_LANE_AUTHORITY_MODE="$AUTHORITY_MODE" \
-  "$guard" cargo test -j1 -q -p fn64-recomp-rs --test lane_authority \
+  "$guard" cargo test -j1 -q -p fn64-cpu-runtime --test lane_authority \
     generated_lane_authority -- --ignored --nocapture --test-threads=1; then
   echo "lane-parity: AUTHORITY REJECTED -- the legacy C callable-body set is not aligned with the rs lane." >&2
   echo "lane-parity: use --observe only for a labeled framebuffer observation; it is not semantic parity." >&2

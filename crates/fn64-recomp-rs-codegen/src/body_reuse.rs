@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use fn64_recomp_rs::decoder::decode;
+use fn64_cpu_runtime::decoder::decode;
 
 /// Exact-body reuse available when sharing is confined to one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

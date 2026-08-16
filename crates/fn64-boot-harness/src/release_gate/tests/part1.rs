@@ -94,9 +94,9 @@ fn operational_thread_publication_digests_have_stable_golden_wire() {
             cpu: publication_cpu_snapshot(0x1020_3040_5060_7080),
             charged_instructions: 7,
             canonical_charged_instructions_at_publication: 0x0102_0304_0506_0708,
-            pending_exit: fn64_recomp_rs::BlockExit::ResolveCall {
-                source_bank: fn64_recomp_rs::BankId::new(0x1122_3344_5566_7788),
-                target_pc: fn64_recomp_rs::GuestPc::new(0x8000_1000),
+            pending_exit: fn64_cpu_runtime::BlockExit::ResolveCall {
+                source_bank: fn64_cpu_runtime::BankId::new(0x1122_3344_5566_7788),
+                target_pc: fn64_cpu_runtime::GuestPc::new(0x8000_1000),
                 resume: publication_key(9, 0x8000_1008),
             },
             prepared_continuation: None,
@@ -106,11 +106,11 @@ fn operational_thread_publication_digests_have_stable_golden_wire() {
             cpu: publication_cpu_snapshot(0x2030_4050_6070_8090),
             charged_instructions: 3,
             canonical_charged_instructions_at_publication: 0x1112_1314_1516_1718,
-            pending_exit: fn64_recomp_rs::BlockExit::ImageChanged {
+            pending_exit: fn64_cpu_runtime::BlockExit::ImageChanged {
                 at: publication_key(11, 0x8000_1800),
-                miss: fn64_recomp_rs::AotMiss {
-                    expected_bank: fn64_recomp_rs::BankId::new(11),
-                    va_start: fn64_recomp_rs::GuestPc::new(0x8000_1800),
+                miss: fn64_cpu_runtime::AotMiss {
+                    expected_bank: fn64_cpu_runtime::BankId::new(11),
+                    va_start: fn64_cpu_runtime::GuestPc::new(0x8000_1800),
                     byte_len: 4,
                     expected_sha256: [0x21; 32],
                     actual_sha256: [0x22; 32],
@@ -128,9 +128,9 @@ fn operational_thread_publication_digests_have_stable_golden_wire() {
             cpu: publication_cpu_snapshot(0x3040_5060_7080_90a0),
             charged_instructions: 5,
             canonical_charged_instructions_at_publication: 0x2122_2324_2526_2728,
-            pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+            pending_exit: fn64_cpu_runtime::BlockExit::Fault(fn64_cpu_runtime::CpuFault {
                 at: publication_key(13, 0x8000_1a00),
-                kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                kind: fn64_cpu_runtime::CpuFaultKind::NoActiveGeneration,
             }),
             prepared_continuation: Some(
                 fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
@@ -140,17 +140,17 @@ fn operational_thread_publication_digests_have_stable_golden_wire() {
         }),
         CanonicalThreadPublicationV1::OpaqueHostInFlight {
             thread: 4,
-            target: fn64_recomp_rs::GuestPc::new(0x8000_2000),
+            target: fn64_cpu_runtime::GuestPc::new(0x8000_2000),
             resume: publication_key(10, 0x8000_2008),
         },
         CanonicalThreadPublicationV1::ParkedFaultOpaque {
             thread: 7,
             post_exception_cpu: publication_cpu_snapshot(0x7080_90a0_b0c0_d0e0),
-            fault: fn64_recomp_rs::CpuFault {
+            fault: fn64_cpu_runtime::CpuFault {
                 at: publication_key(15, 0x8000_2800),
-                kind: fn64_recomp_rs::CpuFaultKind::Exception {
-                    exception: fn64_recomp_rs::CpuException::Breakpoint,
-                    epc: fn64_recomp_rs::GuestPc::new(0x8000_2800),
+                kind: fn64_cpu_runtime::CpuFaultKind::Exception {
+                    exception: fn64_cpu_runtime::CpuException::Breakpoint,
+                    epc: fn64_cpu_runtime::GuestPc::new(0x8000_2800),
                     branch_delay: false,
                     instruction_code: 0x1020_3040,
                     bad_vaddr: None,
@@ -195,7 +195,7 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
             cpu: publication_cpu_snapshot(11),
             charged_instructions: 2,
             canonical_charged_instructions_at_publication: 101,
-            pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+            pending_exit: fn64_cpu_runtime::BlockExit::Checkpoint(publication_key(
                 5,
                 0x8000_3000,
             )),
@@ -222,7 +222,7 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
     };
     checkpoint.charged_instructions += 1;
     checkpoint.canonical_charged_instructions_at_publication += 1;
-    checkpoint.pending_exit = fn64_recomp_rs::BlockExit::Yield(publication_key(5, 0x8000_3004));
+    checkpoint.pending_exit = fn64_cpu_runtime::BlockExit::Yield(publication_key(5, 0x8000_3004));
     let changed_continuation =
         operational_thread_publication_digests_v1(&changed_continuation).unwrap();
     assert_eq!(changed_continuation.cpu_sha256, baseline.cpu_sha256);
@@ -249,11 +249,11 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
     else {
         unreachable!();
     };
-    checkpoint.pending_exit = fn64_recomp_rs::BlockExit::ImageChanged {
+    checkpoint.pending_exit = fn64_cpu_runtime::BlockExit::ImageChanged {
         at: publication_key(7, 0x8000_3800),
-        miss: fn64_recomp_rs::AotMiss {
-            expected_bank: fn64_recomp_rs::BankId::new(7),
-            va_start: fn64_recomp_rs::GuestPc::new(0x8000_3800),
+        miss: fn64_cpu_runtime::AotMiss {
+            expected_bank: fn64_cpu_runtime::BankId::new(7),
+            va_start: fn64_cpu_runtime::GuestPc::new(0x8000_3800),
             byte_len: 4,
             expected_sha256: [0x31; 32],
             actual_sha256: [0x32; 32],
@@ -289,9 +289,9 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
     else {
         unreachable!();
     };
-    checkpoint.pending_exit = fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+    checkpoint.pending_exit = fn64_cpu_runtime::BlockExit::Fault(fn64_cpu_runtime::CpuFault {
         at: publication_key(7, 0x8000_3800),
-        kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+        kind: fn64_cpu_runtime::CpuFaultKind::NoActiveGeneration,
     });
     checkpoint.prepared_continuation = Some(
         fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
@@ -323,12 +323,12 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
 
     let opaque_a = [CanonicalThreadPublicationV1::OpaqueHostInFlight {
         thread: 3,
-        target: fn64_recomp_rs::GuestPc::new(0x8000_4000),
+        target: fn64_cpu_runtime::GuestPc::new(0x8000_4000),
         resume: publication_key(6, 0x8000_4008),
     }];
     let opaque_b = [CanonicalThreadPublicationV1::OpaqueHostInFlight {
         thread: 3,
-        target: fn64_recomp_rs::GuestPc::new(0x8000_5000),
+        target: fn64_cpu_runtime::GuestPc::new(0x8000_5000),
         resume: publication_key(6, 0x8000_5008),
     }];
     let opaque_a = operational_thread_publication_digests_v1(&opaque_a).unwrap();
@@ -339,11 +339,11 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
     let parked = [CanonicalThreadPublicationV1::ParkedFaultOpaque {
         thread: 3,
         post_exception_cpu: publication_cpu_snapshot(41),
-        fault: fn64_recomp_rs::CpuFault {
+        fault: fn64_cpu_runtime::CpuFault {
             at: publication_key(8, 0x8000_6000),
-            kind: fn64_recomp_rs::CpuFaultKind::Exception {
-                exception: fn64_recomp_rs::CpuException::Breakpoint,
-                epc: fn64_recomp_rs::GuestPc::new(0x8000_6000),
+            kind: fn64_cpu_runtime::CpuFaultKind::Exception {
+                exception: fn64_cpu_runtime::CpuException::Breakpoint,
+                epc: fn64_cpu_runtime::GuestPc::new(0x8000_6000),
                 branch_delay: false,
                 instruction_code: 0x1234,
                 bad_vaddr: None,
@@ -380,7 +380,7 @@ fn operational_thread_publication_digests_isolate_cpu_and_continuation() {
     else {
         unreachable!();
     };
-    let fn64_recomp_rs::CpuFaultKind::Exception {
+    let fn64_cpu_runtime::CpuFaultKind::Exception {
         instruction_code, ..
     } = &mut fault.kind
     else {
@@ -430,7 +430,7 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
             cpu: publication_cpu_snapshot_without_pending_timing(11),
             charged_instructions: 2,
             canonical_charged_instructions_at_publication: 101,
-            pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+            pending_exit: fn64_cpu_runtime::BlockExit::Checkpoint(publication_key(
                 5,
                 0x8000_3000,
             )),
@@ -446,8 +446,8 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
     checkpoint.charged_instructions = 3;
     checkpoint.cpu.cop0_count ^= 0x0102_0304;
     checkpoint.cpu.cop0_compare ^= 0x1020_3040;
-    checkpoint.cpu.cop0_cause ^= fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
-        | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit();
+    checkpoint.cpu.cop0_cause ^= fn64_cpu_runtime::CpuInterruptLine::RCP.cause_bit()
+        | fn64_cpu_runtime::CpuInterruptLine::TIMER.cause_bit();
     assert_eq!(
         operational_thread_publication_digests_v2(&changed_slice).unwrap(),
         baseline
@@ -494,10 +494,10 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
         baseline.continuation_sha256
     );
 
-    let owned_cpu_changes: [fn(&mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1); 3] = [
-        |cpu: &mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1| cpu.cop0_status ^= 1,
-        |cpu: &mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1| cpu.cop0_random_phase ^= 1,
-        |cpu: &mut fn64_recomp_rs::RecompContextEvidenceSnapshotV1| cpu.cop0_cause ^= 1 << 8,
+    let owned_cpu_changes: [fn(&mut fn64_cpu_runtime::RecompContextEvidenceSnapshotV1); 3] = [
+        |cpu: &mut fn64_cpu_runtime::RecompContextEvidenceSnapshotV1| cpu.cop0_status ^= 1,
+        |cpu: &mut fn64_cpu_runtime::RecompContextEvidenceSnapshotV1| cpu.cop0_random_phase ^= 1,
+        |cpu: &mut fn64_cpu_runtime::RecompContextEvidenceSnapshotV1| cpu.cop0_cause ^= 1 << 8,
     ];
     for change in owned_cpu_changes {
         let mut changed_owned_cpu = baseline_publications.clone();
@@ -538,7 +538,7 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
         unreachable!();
     };
     checkpoint.pending_exit =
-        fn64_recomp_rs::BlockExit::Checkpoint(publication_key(5, 0x8000_3004));
+        fn64_cpu_runtime::BlockExit::Checkpoint(publication_key(5, 0x8000_3004));
     let changed_pending_pc =
         operational_thread_publication_digests_v2(&changed_pending_pc).unwrap();
     assert_eq!(changed_pending_pc.cpu_sha256, baseline.cpu_sha256);
@@ -551,11 +551,11 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
     let CanonicalThreadPublicationV1::Exact(checkpoint) = &mut image_publications[0] else {
         unreachable!();
     };
-    checkpoint.pending_exit = fn64_recomp_rs::BlockExit::ImageChanged {
+    checkpoint.pending_exit = fn64_cpu_runtime::BlockExit::ImageChanged {
         at: publication_key(7, 0x8000_3800),
-        miss: fn64_recomp_rs::AotMiss {
-            expected_bank: fn64_recomp_rs::BankId::new(7),
-            va_start: fn64_recomp_rs::GuestPc::new(0x8000_3800),
+        miss: fn64_cpu_runtime::AotMiss {
+            expected_bank: fn64_cpu_runtime::BankId::new(7),
+            va_start: fn64_cpu_runtime::GuestPc::new(0x8000_3800),
             byte_len: 4,
             expected_sha256: [0x31; 32],
             actual_sha256: [0x32; 32],
@@ -606,8 +606,8 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
     if let CanonicalThreadPublicationV1::Returned { cpu, .. } = &mut returned_mirrors[0] {
         cpu.cop0_count ^= 1;
         cpu.cop0_compare ^= 1;
-        cpu.cop0_cause ^= fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
-            | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit();
+        cpu.cop0_cause ^= fn64_cpu_runtime::CpuInterruptLine::RCP.cause_bit()
+            | fn64_cpu_runtime::CpuInterruptLine::TIMER.cause_bit();
     } else {
         unreachable!();
     }
@@ -627,11 +627,11 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
     let parked = [CanonicalThreadPublicationV1::ParkedFaultOpaque {
         thread: 3,
         post_exception_cpu: publication_cpu_snapshot_without_pending_timing(19),
-        fault: fn64_recomp_rs::CpuFault {
+        fault: fn64_cpu_runtime::CpuFault {
             at: publication_key(8, 0x8000_6000),
-            kind: fn64_recomp_rs::CpuFaultKind::Exception {
-                exception: fn64_recomp_rs::CpuException::Breakpoint,
-                epc: fn64_recomp_rs::GuestPc::new(0x8000_6000),
+            kind: fn64_cpu_runtime::CpuFaultKind::Exception {
+                exception: fn64_cpu_runtime::CpuException::Breakpoint,
+                epc: fn64_cpu_runtime::GuestPc::new(0x8000_6000),
                 branch_delay: false,
                 instruction_code: 0x1234,
                 bad_vaddr: None,
@@ -648,8 +648,8 @@ fn operational_thread_publication_digests_v2_ignore_only_valid_slice_partitionin
     {
         post_exception_cpu.cop0_count ^= 1;
         post_exception_cpu.cop0_compare ^= 1;
-        post_exception_cpu.cop0_cause ^= fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
-            | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit();
+        post_exception_cpu.cop0_cause ^= fn64_cpu_runtime::CpuInterruptLine::RCP.cause_bit()
+            | fn64_cpu_runtime::CpuInterruptLine::TIMER.cause_bit();
     } else {
         unreachable!();
     }
@@ -684,7 +684,7 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
             cpu: publication_cpu_snapshot(3),
             charged_instructions: 1,
             canonical_charged_instructions_at_publication: 1,
-            pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+            pending_exit: fn64_cpu_runtime::BlockExit::Checkpoint(publication_key(
                 3,
                 0x8000_3000,
             )),
@@ -708,11 +708,11 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
             cpu: publication_cpu_snapshot(3),
             charged_instructions: 1,
             canonical_charged_instructions_at_publication: 1,
-            pending_exit: fn64_recomp_rs::BlockExit::ImageChanged {
+            pending_exit: fn64_cpu_runtime::BlockExit::ImageChanged {
                 at: publication_key(3, 0x8000_3000),
-                miss: fn64_recomp_rs::AotMiss {
-                    expected_bank: fn64_recomp_rs::BankId::new(3),
-                    va_start: fn64_recomp_rs::GuestPc::new(0x8000_3000),
+                miss: fn64_cpu_runtime::AotMiss {
+                    expected_bank: fn64_cpu_runtime::BankId::new(3),
+                    va_start: fn64_cpu_runtime::GuestPc::new(0x8000_3000),
                     byte_len: 4,
                     expected_sha256: [0x31; 32],
                     actual_sha256: [0x32; 32],
@@ -737,9 +737,9 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
             cpu: publication_cpu_snapshot(3),
             charged_instructions: 1,
             canonical_charged_instructions_at_publication: 1,
-            pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+            pending_exit: fn64_cpu_runtime::BlockExit::Fault(fn64_cpu_runtime::CpuFault {
                 at: publication_key(3, 0x8000_3000),
-                kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                kind: fn64_cpu_runtime::CpuFaultKind::NoActiveGeneration,
             }),
             prepared_continuation: None,
         },
@@ -759,9 +759,9 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
             cpu: publication_cpu_snapshot(3),
             charged_instructions: 1,
             canonical_charged_instructions_at_publication: 1,
-            pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+            pending_exit: fn64_cpu_runtime::BlockExit::Fault(fn64_cpu_runtime::CpuFault {
                 at: publication_key(3, 0x8000_3000),
-                kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                kind: fn64_cpu_runtime::CpuFaultKind::NoActiveGeneration,
             }),
             prepared_continuation: Some(CanonicalPreparedContinuationV1::InactiveGeneration {
                 entry: publication_key(4, 0x8000_3004),
@@ -783,9 +783,9 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
             cpu: publication_cpu_snapshot(3),
             charged_instructions: 1,
             canonical_charged_instructions_at_publication: 1,
-            pending_exit: fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+            pending_exit: fn64_cpu_runtime::BlockExit::Fault(fn64_cpu_runtime::CpuFault {
                 at: publication_key(3, 0x8000_3000),
-                kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                kind: fn64_cpu_runtime::CpuFaultKind::NoActiveGeneration,
             }),
             prepared_continuation: Some(CanonicalPreparedContinuationV1::ImageChanged {
                 entry: publication_key(4, 0x8000_3000),
@@ -808,7 +808,7 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
                 cpu: publication_cpu_snapshot(3),
                 charged_instructions,
                 canonical_charged_instructions_at_publication: cumulative,
-                pending_exit: fn64_recomp_rs::BlockExit::Checkpoint(publication_key(
+                pending_exit: fn64_cpu_runtime::BlockExit::Checkpoint(publication_key(
                     3,
                     0x8000_3000,
                 )),
@@ -828,9 +828,9 @@ fn operational_thread_publication_digests_reject_incoherent_native_continuations
     let non_exception_parked = [CanonicalThreadPublicationV1::ParkedFaultOpaque {
         thread: 4,
         post_exception_cpu: publication_cpu_snapshot(4),
-        fault: fn64_recomp_rs::CpuFault {
+        fault: fn64_cpu_runtime::CpuFault {
             at: publication_key(4, 0x8000_4000),
-            kind: fn64_recomp_rs::CpuFaultKind::UnsupportedInstruction { word: 0 },
+            kind: fn64_cpu_runtime::CpuFaultKind::UnsupportedInstruction { word: 0 },
         },
         canonical_charged_instructions_at_publication: 2,
     }];
@@ -1109,7 +1109,7 @@ fn execution_destination_capture_rejects_future_and_cross_lane_evidence() {
 #[cfg(feature = "recomp-rs")]
 #[test]
 fn typed_block_destination_requires_runner_identity_and_rejects_native_mix() {
-    use fn64_recomp_rs::{
+    use fn64_cpu_runtime::{
         BankId, ExecutionDestinationObservation, ExecutionKey, GuestPc, ProgramArtifactIdentity,
     };
     let destination = ExecutionKey::new(BankId::new(0x32), GuestPc::new(0x8000_1000));
@@ -1174,7 +1174,7 @@ fn typed_function_destination_binds_identity_cycle_symbol_order_and_counts() {
     use fn64_abi::recompiled::{
         FunctionExecutionDestinationObservation, RecompiledProgramEvidenceSnapshot,
     };
-    use fn64_recomp_rs::{
+    use fn64_cpu_runtime::{
         ProgramArtifactIdentity, ProgramIdentityEvidenceSnapshot, ProgramIdentitySource,
         TranslatedFunctionIdentity,
     };
@@ -1333,10 +1333,10 @@ fn live_gate_rejects_native_execution_destination_before_arm() {
 #[cfg(feature = "recomp-rs")]
 #[test]
 fn live_gate_rejects_function_execution_destination_before_arm() {
-    fn lookup(_vram: u32) -> fn64_recomp_rs::RecompFunc {
+    fn lookup(_vram: u32) -> fn64_cpu_runtime::RecompFunc {
         fn body(
-            _ctx: &mut fn64_recomp_rs::RecompContext,
-            _rdram: &mut fn64_recomp_rs::Rdram<'_>,
+            _ctx: &mut fn64_cpu_runtime::RecompContext,
+            _rdram: &mut fn64_cpu_runtime::Rdram<'_>,
         ) {
         }
         body
@@ -1347,10 +1347,10 @@ fn live_gate_rejects_function_execution_destination_before_arm() {
         fn64_abi::recompiled::set_entry_lookup_with_execution_observation(
             lookup,
             0x100,
-            fn64_recomp_rs::ProgramArtifactIdentity::new([0x5c; 32]),
-            fn64_recomp_rs::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
+            fn64_cpu_runtime::ProgramArtifactIdentity::new([0x5c; 32]),
+            fn64_cpu_runtime::FUNCTION_ENTRY_OBSERVATION_SCHEMA,
         );
-        fn64_recomp_rs::notify_function_entry(fn64_recomp_rs::TranslatedFunctionIdentity::new(
+        fn64_cpu_runtime::notify_function_entry(fn64_cpu_runtime::TranslatedFunctionIdentity::new(
             0x8000_1000,
             "entry",
         ));

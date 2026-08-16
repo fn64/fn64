@@ -137,7 +137,7 @@ impl CanonicalExecutableMutationStateV1 {
         for &(physical_start, physical_end) in ranges {
             assert!(
                 physical_start < physical_end
-                    && physical_end <= fn64_recomp_rs::RDRAM_LEN as u32
+                    && physical_end <= fn64_cpu_runtime::RDRAM_LEN as u32
                     && (watched.is_empty() || physical_start > previous_end),
                 "canonical executable mutation range is invalid or non-canonical: [{physical_start:#010x}, {physical_end:#010x})"
             );
@@ -1258,7 +1258,7 @@ impl CanonicalLiveBlockProgramV1 {
             dynamic.is_none(),
             "dynamic mapped execution is already installed"
         );
-        *dynamic = Some(fn64_recomp_rs::DynamicMappedUnitCatalogV1::new_linked());
+        *dynamic = Some(fn64_cpu_runtime::DynamicMappedUnitCatalogV1::new_linked());
     }
 
     #[cfg(feature = "dynamic-mapped-runtime")]
@@ -1300,7 +1300,7 @@ impl CanonicalLiveBlockProgramV1 {
     pub(super) fn record_dynamic_execution(
         &self,
         attempted_entry: ExecutionKey,
-        run: &fn64_recomp_rs::DynamicMappedRunV1,
+        run: &fn64_cpu_runtime::DynamicMappedRunV1,
     ) {
         let charged_instructions = u64::from(run.run.instructions);
         let unsupported_exit = matches!(
@@ -2139,7 +2139,7 @@ impl CanonicalLiveBlockProgramV1 {
         budget: InstructionBudget,
         ctx: &mut RsContext,
         mem: &mut Rdram<'_>,
-    ) -> Result<fn64_recomp_rs::DispatchRun, fn64_recomp_rs::DispatchError> {
+    ) -> Result<fn64_cpu_runtime::DispatchRun, fn64_cpu_runtime::DispatchError> {
         if let Some(generations) = &self.generations {
             return self
                 .install
@@ -2233,7 +2233,7 @@ impl CanonicalLiveBlockProgramV1 {
             }
         }
         for (start, end) in changed {
-            fn64_recomp_rs::notify_host_abi_write(start, end - start);
+            fn64_cpu_runtime::notify_host_abi_write(start, end - start);
         }
     }
 
@@ -2444,7 +2444,7 @@ impl CanonicalLiveBlockProgramV1 {
             };
         let first_new_entry = state.borrow().entries.len();
         for (physical_start, physical_end) in changed {
-            fn64_recomp_rs::notify_host_abi_write(physical_start, physical_end - physical_start);
+            fn64_cpu_runtime::notify_host_abi_write(physical_start, physical_end - physical_start);
         }
         match view {
             Some(view) => {
@@ -2461,7 +2461,7 @@ impl CanonicalLiveBlockProgramV1 {
                 // between the two scans. The only thing that runs in between is
                 // the `notify_host_abi_write` loop above, and that writes no
                 // guest memory: it is `notify_attributed_guest_write`
-                // (`fn64-recomp-rs` `runtime/host.rs:464`), whose entire body is
+                // (`fn64-cpu-runtime` `runtime/host.rs:464`), whose entire body is
                 // `mark_guest_write_pages` (a page-epoch counter),
                 // `WRITE_OBSERVER` (pushes onto the pending queues), and
                 // `request_guest_write_boundary` (sets a thread-local flag).
@@ -2871,7 +2871,7 @@ impl CanonicalLiveBlockProgramV1 {
     /// of any generation that is CURRENTLY RESIDENT.
     ///
     /// This is the same scan `invalidate_physical_write` performs
-    /// (`fn64-recomp-rs` `generation/mod.rs:1292`): for each active segment,
+    /// (`fn64-cpu-runtime` `generation/mod.rs:1292`): for each active segment,
     /// test the owning generation's backing spans for intersection. `active`
     /// holds segments rather than generations, so this is a handful of interval
     /// tests per store.
@@ -2902,7 +2902,7 @@ impl CanonicalLiveBlockProgramV1 {
 
 /// The resident-backing scan itself, over a borrowed catalog.
 ///
-/// This mirrors `invalidate_physical_write` (`fn64-recomp-rs`
+/// This mirrors `invalidate_physical_write` (`fn64-cpu-runtime`
 /// `generation/mod.rs`): for each ACTIVE generation, test that generation's
 /// DIGESTED IMAGE for intersection. `active` holds segments rather than
 /// generations, and a generation's backing is typically one or two spans, so
@@ -2926,7 +2926,7 @@ pub(super) fn resident_backing_intersects_catalog(
         // `map_or(true, ..)`, not `is_ok_and`, in BOTH lookups. A missing
         // backing or a missing generation means the catalog disagrees with its
         // own lists -- a construction invariant enforced over in
-        // `fn64-recomp-rs`, a different crate from this caller. `is_ok_and`
+        // `fn64-cpu-runtime`, a different crate from this caller. `is_ok_and`
         // answers "not resident" there, the PERMISSIVE direction: a false
         // negative lets the write skip its block boundary and stale translated
         // code executes. Every other unanswerable case in this predicate

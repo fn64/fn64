@@ -587,7 +587,7 @@ impl MemFault {
 
     fn fpu_exception_finish(self) -> String {
         match self {
-            Self::Panic => "fn64_recomp_rs::trap_unsupported(\"enabled FCSR cause written by CTC1 in whole-function lane\");".to_string(),
+            Self::Panic => "fn64_cpu_runtime::trap_unsupported(\"enabled FCSR cause written by CTC1 in whole-function lane\");".to_string(),
             Self::Fault {
                 pc,
                 epc,
@@ -689,7 +689,7 @@ pub(super) fn emit_sc(out: &mut String, mem_fault: MemFault, rt: Reg, base: Reg,
 /// The bank lane never reaches here for these ops — it short-circuits with
 /// [`emit_bank_fpu_trap`] to produce a typed `BlockExit::Fault` instead.
 pub(super) fn emit_fpu_arith_call(call: &str) -> String {
-    format!("if {call} {{ fn64_recomp_rs::trap_unsupported(\"enabled COP1 exception\"); }}")
+    format!("if {call} {{ fn64_cpu_runtime::trap_unsupported(\"enabled COP1 exception\"); }}")
 }
 
 /// If `instr` is a COP1 arithmetic op that can raise an enabled FP exception,
@@ -760,7 +760,7 @@ pub(super) fn emit_straight(out: &mut String, instr: Instruction, _vram: u32, me
     let unsupported = |out: &mut String, context: String| {
         line(
             out,
-            format!("fn64_recomp_rs::trap_unsupported({context:?});"),
+            format!("fn64_cpu_runtime::trap_unsupported({context:?});"),
         );
     };
     match instr {

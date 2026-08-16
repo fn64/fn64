@@ -4,7 +4,7 @@ use super::*;
 #[cfg(feature = "recomp-rs")]
 pub(super) fn encode_publication_cpu_snapshot(
     out: &mut Vec<u8>,
-    snapshot: &fn64_recomp_rs::RecompContextEvidenceSnapshotV1,
+    snapshot: &fn64_cpu_runtime::RecompContextEvidenceSnapshotV1,
     thread: fn64_runtime::ThreadId,
     include_executor_mirrors: bool,
 ) -> Result<(), OperationalThreadPublicationDigestErrorV1> {
@@ -40,8 +40,8 @@ pub(super) fn encode_publication_cpu_snapshot(
         snapshot.cop0_cause
     } else {
         snapshot.cop0_cause
-            & !(fn64_recomp_rs::CpuInterruptLine::RCP.cause_bit()
-                | fn64_recomp_rs::CpuInterruptLine::TIMER.cause_bit())
+            & !(fn64_cpu_runtime::CpuInterruptLine::RCP.cause_bit()
+                | fn64_cpu_runtime::CpuInterruptLine::TIMER.cause_bit())
     };
     push_u32(out, cop0_cause);
     push_u32(out, snapshot.cop0_epc);
@@ -86,7 +86,7 @@ pub(super) fn publication_thread_v1(
 }
 
 #[cfg(feature = "recomp-rs")]
-pub(super) fn encode_execution_key_v1(out: &mut Vec<u8>, key: fn64_recomp_rs::ExecutionKey) {
+pub(super) fn encode_execution_key_v1(out: &mut Vec<u8>, key: fn64_cpu_runtime::ExecutionKey) {
     push_u64(out, key.bank.get());
     push_u32(out, key.pc.get());
 }
@@ -94,15 +94,15 @@ pub(super) fn encode_execution_key_v1(out: &mut Vec<u8>, key: fn64_recomp_rs::Ex
 #[cfg(feature = "recomp-rs")]
 pub(super) fn encode_instruction_identity_v1(
     out: &mut Vec<u8>,
-    identity: fn64_recomp_rs::InstructionWordIdentity,
+    identity: fn64_cpu_runtime::InstructionWordIdentity,
 ) {
     push_u64(out, identity.bank.get());
     push_u32(out, identity.physical_address);
 }
 
 #[cfg(feature = "recomp-rs")]
-pub(super) fn cpu_exception_tag_v1(exception: fn64_recomp_rs::CpuException) -> u8 {
-    use fn64_recomp_rs::CpuException;
+pub(super) fn cpu_exception_tag_v1(exception: fn64_cpu_runtime::CpuException) -> u8 {
+    use fn64_cpu_runtime::CpuException;
     match exception {
         CpuException::TlbModified => 0,
         CpuException::TlbRefillLoad => 1,
@@ -124,8 +124,8 @@ pub(super) fn cpu_exception_tag_v1(exception: fn64_recomp_rs::CpuException) -> u
 }
 
 #[cfg(feature = "recomp-rs")]
-pub(super) fn encode_cpu_fault_v1(out: &mut Vec<u8>, fault: fn64_recomp_rs::CpuFault) {
-    use fn64_recomp_rs::CpuFaultKind;
+pub(super) fn encode_cpu_fault_v1(out: &mut Vec<u8>, fault: fn64_cpu_runtime::CpuFault) {
+    use fn64_cpu_runtime::CpuFaultKind;
     encode_execution_key_v1(out, fault.at);
     match fault.kind {
         CpuFaultKind::UnalignedPc => out.push(0),
@@ -199,8 +199,8 @@ pub(super) fn encode_cpu_fault_v1(out: &mut Vec<u8>, fault: fn64_recomp_rs::CpuF
 }
 
 #[cfg(feature = "recomp-rs")]
-pub(super) fn encode_block_exit_v1(out: &mut Vec<u8>, exit: fn64_recomp_rs::BlockExit) {
-    use fn64_recomp_rs::BlockExit;
+pub(super) fn encode_block_exit_v1(out: &mut Vec<u8>, exit: fn64_cpu_runtime::BlockExit) {
+    use fn64_cpu_runtime::BlockExit;
     match exit {
         BlockExit::Transfer(key) => {
             out.push(0);
@@ -384,9 +384,9 @@ pub(super) fn operational_thread_publication_digests(
                 let prepared_is_coherent = match checkpoint.prepared_continuation {
                     None => !matches!(
                         checkpoint.pending_exit,
-                        fn64_recomp_rs::BlockExit::ImageChanged { .. }
-                            | fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
-                                kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                        fn64_cpu_runtime::BlockExit::ImageChanged { .. }
+                            | fn64_cpu_runtime::BlockExit::Fault(fn64_cpu_runtime::CpuFault {
+                                kind: fn64_cpu_runtime::CpuFaultKind::NoActiveGeneration,
                                 ..
                             })
                     ),
@@ -394,7 +394,7 @@ pub(super) fn operational_thread_publication_digests(
                         entry,
                     }) => matches!(
                         checkpoint.pending_exit,
-                        fn64_recomp_rs::BlockExit::ImageChanged { at, .. } if entry.pc == at.pc
+                        fn64_cpu_runtime::BlockExit::ImageChanged { at, .. } if entry.pc == at.pc
                     ),
                     Some(
                         fn64_abi::recompiled::CanonicalPreparedContinuationV1::InactiveGeneration {
@@ -402,9 +402,9 @@ pub(super) fn operational_thread_publication_digests(
                         },
                     ) => matches!(
                         checkpoint.pending_exit,
-                        fn64_recomp_rs::BlockExit::Fault(fn64_recomp_rs::CpuFault {
+                        fn64_cpu_runtime::BlockExit::Fault(fn64_cpu_runtime::CpuFault {
                             at,
-                            kind: fn64_recomp_rs::CpuFaultKind::NoActiveGeneration,
+                            kind: fn64_cpu_runtime::CpuFaultKind::NoActiveGeneration,
                             ..
                         }) if entry.pc == at.pc
                     ),
@@ -465,7 +465,7 @@ pub(super) fn operational_thread_publication_digests(
                 canonical_charged_instructions_at_publication,
                 ..
             } => {
-                if !matches!(fault.kind, fn64_recomp_rs::CpuFaultKind::Exception { .. }) {
+                if !matches!(fault.kind, fn64_cpu_runtime::CpuFaultKind::Exception { .. }) {
                     return Err(
                         OperationalThreadPublicationDigestErrorV1::ParkedFaultIsNotArchitecturalException {
                             thread,

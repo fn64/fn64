@@ -19,7 +19,7 @@ fn64-render    backend-neutral render seam, exact microcode admission, and diagn
 fn64-render-reference deterministic pure-Rust ReferenceBackend
 fn64-render-rt64 FFI bridge to RT64 (C++)
 fn64-certification executable behavioral evidence gates over the public renderer seams
-fn64-recomp-rs  linked typed execution runtime for generated VR4300 Rust runners
+fn64-cpu-runtime  linked typed execution runtime for generated VR4300 Rust runners
 fn64-recomp-rs-codegen  build-side Rust emitter and whole-ROM driver (§1.1's `rs` lane)
 fn64-recomp  N64Recomp adapter for the comparison lane
 fn64-audio     RSP audio ucode execution
@@ -187,7 +187,7 @@ source; reading MIT RT64 is an allowed source under AGENTS.md, GPL runtime
 internals are not.
 
 No longer planned-only: `fn64-recomp-rs-codegen` emits typed Rust against the
-linked `fn64-recomp-rs` execution runtime. Generated shard crates depend only
+linked `fn64-cpu-runtime` execution runtime. Generated shard crates depend only
 on that runtime package, so an emitter-only edit cannot invalidate their
 normal Cargo dependency edge. `fn64-recomp` remains the N64Recomp comparison
 adapter. Together they provide the second lane below.
@@ -588,7 +588,7 @@ successful-TLBWI/TLBWR-since-power mask was `0x00000000`. All 32
 captured values therefore came from ares's zero-reset policy and cannot supply
 hardware authority. Production translation still traps loudly on invalid
 PageMask encodings and undefined multiple matches.
-`fn64-recomp-rs` keeps the interpreter and `dynamic_mips` fallback behind the
+`fn64-cpu-runtime` keeps the interpreter and `dynamic_mips` fallback behind the
 `dev-interpreter` feature. The final WM host selects `production-aot`, which
 implies `aot-runtime` and is compile-time incompatible with `dev-interpreter`;
 its standalone workspace explicitly uses Cargo resolver 2 so build-tool
@@ -707,7 +707,7 @@ Cargo build now hashes the exact checked-in root manifest/lock/build/adapter
 sources, the shared shard build/lib sources and all 35 shard manifests. Each
 linked bank binds its complete code words/geometry, generated composite-source
 digest, subrunner count, and adapter role. `fn64-recomp-rs-codegen` issues the
-exact emitter-source receipt, while `fn64-recomp-rs` separately issues the
+exact emitter-source receipt, while `fn64-cpu-runtime` separately issues the
 linked execution/runtime receipt plus its feature receipt. That runtime
 receipt includes `generated_support.rs`, the documented typed cold boundary
 used by emitted runners for shared synchronous-fault construction and
@@ -1187,7 +1187,7 @@ same visual artifact means different things in each.
 
 - `c` (default): N64Recomp's emitted `RecompiledFuncs/*.c`, compiled and
   linked as before.
-- `rs`: `fn64-recomp-rs` emits the whole ROM as a typed-Rust crate
+- `rs`: `fn64-cpu-runtime` emits the whole ROM as a typed-Rust crate
   (`recompile_rom`), linked directly.
 
 The intended experiment is the same recompiled semantics in two forms, but
@@ -1419,7 +1419,7 @@ rdram with no lock the scheduler can see" — **unrepresentable**: there is no
 second thread.
 
 The Rust recompiler lane uses the same model. Generated functions own
-a safe `fn(&mut fn64_recomp_rs::RecompContext, &mut Rdram)` ABI, while
+a safe `fn(&mut fn64_cpu_runtime::RecompContext, &mut Rdram)` ABI, while
 `fn64-abi::recompiled` is the single adapter at the already-unsafe C host-shim
 boundary. It marshals GPR/HI/LO/COP0 status into the legacy host context,
 calls the existing queue/DMA/VI/thread shim, then copies architectural state

@@ -53,7 +53,7 @@ use fn64_discover::{
     required_env_path, run_discovery_with_recovered_overlay_regions, DiscoveryStrategy, Fact,
     FactDb, RecoveredOverlayInput, RomAddressSpace,
 };
-use fn64_recomp_rs::execution::BankId;
+use fn64_cpu_runtime::execution::BankId;
 use fn64_recomp_rs_codegen::{emit_dense_bank_shard_runner_function, DenseBankShardInput};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -937,7 +937,7 @@ fn plan_compile_units(shards: &[BankShard]) -> Vec<CompileUnit> {
 // writes bare `CpuException::Variant` paths for trap/break/cop-unusable
 // exception exits, so any compile unit containing such a block needs the
 // import.
-const GENERATED_PRELUDE: &str = "#![allow(clippy::all, unused)]\nuse fn64_recomp_rs::{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext};\n\n";
+const GENERATED_PRELUDE: &str = "#![allow(clippy::all, unused)]\nuse fn64_cpu_runtime::{BankId, BlockExit, BlockProgram, BlockRun, CodeBank, CodeSpan, CpuException, CpuFault, CpuFaultKind, ExecutionKey, GeneratedBankRunner, GuestPc, InstructionBudget, ProgramError, Rdram, RecompContext};\n\n";
 
 /// Render one compile unit's source: this unit's shard runner functions,
 /// `pub` so the driver crate (compiled and linked separately) can call them
@@ -1148,7 +1148,7 @@ fn compile_and_run_harness(
         let shard_source_path = temp.join(format!("shard_{unit_index}.rs"));
         std::fs::write(&shard_source_path, &shard_source)
             .map_err(|error| format!("writing shard {unit_index} source: {error}"))?;
-        // Each shard only references `fn64_recomp_rs` (the emitted bank
+        // Each shard only references `fn64_cpu_runtime` (the emitted bank
         // runners and CodeBank constructors are self-contained); shards
         // never call into one another, so only the driver links them all.
         let shard_rlib_path = temp.join(format!("libshard_{unit_index}.rlib"));
@@ -1160,7 +1160,7 @@ fn compile_and_run_harness(
             .arg("--crate-name")
             .arg(format!("shard_{unit_index}"))
             .arg("--extern")
-            .arg(format!("fn64_recomp_rs={}", rlib.display()))
+            .arg(format!("fn64_cpu_runtime={}", rlib.display()))
             .arg("-L")
             .arg(&deps)
             .arg("-o")
@@ -1193,7 +1193,7 @@ fn compile_and_run_harness(
         .arg("--edition=2021")
         .arg("-O")
         .arg("--extern")
-        .arg(format!("fn64_recomp_rs={}", rlib.display()));
+        .arg(format!("fn64_cpu_runtime={}", rlib.display()));
     for (unit_index, shard_rlib_path) in shard_rlibs.iter().enumerate() {
         command
             .arg("--extern")
@@ -1244,14 +1244,14 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // "libfn64_recomp_rs" alone also matches
+        // "libfn64_cpu_runtime" alone also matches
         // "libfn64_recomp_rs_codegen-*.rlib" (a sibling crate in the same
         // deps directory); require the hyphen that starts the hash suffix
         // so the codegen crate's rlib is never mistaken for the runtime
         // crate's, which -- because both can share a build-batch mtime --
         // was a nondeterministic wrong-crate pick depending on directory
         // iteration order.
-        if !name.starts_with("libfn64_recomp_rs-") || !name.ends_with(".rlib") {
+        if !name.starts_with("libfn64_cpu_runtime-") || !name.ends_with(".rlib") {
             continue;
         }
         let modified = entry
@@ -1267,7 +1267,7 @@ fn current_recomp_rlib(deps: &Path) -> Result<PathBuf, String> {
     }
     newest
         .map(|(_, path)| path)
-        .ok_or_else(|| format!("no libfn64_recomp_rs rlib in {}", deps.display()))
+        .ok_or_else(|| format!("no libfn64_cpu_runtime rlib in {}", deps.display()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

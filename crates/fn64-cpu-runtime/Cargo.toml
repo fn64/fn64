@@ -1,0 +1,25 @@
+[package]
+name = "fn64-cpu-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Linked typed execution runtime for fn64's generated VR4300 Rust runners."
+
+[features]
+default = ["dev-interpreter"]
+aot-runtime = []
+production-aot = ["aot-runtime"]
+dynamic-mapped-runtime = ["aot-runtime"]
+dev-interpreter = ["dynamic-mapped-runtime"]
+
+[dependencies]
+rustc_apfloat = "0.2.3"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+fn64-recomp = { path = "../fn64-recomp" }
+fn64-recomp-rs-codegen = { path = "../fn64-recomp-rs-codegen" }
+serde_json = "1"
