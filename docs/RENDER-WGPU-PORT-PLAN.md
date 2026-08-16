@@ -42,12 +42,12 @@ reserving authority, parity, performance, and integration claims for the lead.
 | program state | **IN PROGRESS** |
 | execution wave | **ACCEL-A -- port spine and evidence in parallel** |
 | active milestones | **M0.3 evidence, M1 renderer seam v2, and M2 GPU feasibility (all IN PROGRESS)** |
-| active slices | A0.3 conformance spine; M1.2 ABI-to-IR authority placement; M2.2 Metal semantic/format execution; M0.3 native baseline remains an independent evidence lane |
-| active ownership | `F/xhigh` integration lead; `F/high` conformance writer; `F/xhigh` serialized ABI/IR integration writer; `I/high` Metal semantic writer; external Claude Sonnet 5 read-only audits remain candidate evidence only |
-| last completed result | local `main` contains the dual-pin 276-file authority/inventory gate (`0f76db1f`), pinned wgpu 30 Metal capability baseline (`6b36fe56`), and repaired bounded render-IR ownership spine (`99aa1d0a`) after independent review |
-| next concrete decision | review and merge A0.3, then accept or reject the M1.2 real authority placement and M2.2 executable Metal semantics before dispatching raw-DPC/TMEM vertical-slice writers |
+| active slices | A0.3 conformance trust-boundary repair; M1.2 ABI-to-IR authority repair; M2.3 Metal submission/timestamp and coverage execution; M0.3 native baseline remains an independent evidence lane |
+| active ownership | `F/xhigh` integration lead; `F/xhigh` conformance repair/review; `F/xhigh` serialized ABI/IR integration repair/review; `I/high` Metal probe writer; external Claude Sonnet 5 read-only audits remain candidate evidence only |
+| last completed result | local `main` contains the dual-pin authority/inventory gate (`34e00cf5`), wgpu 30 Metal capability baseline (`978981b2`), render-IR spine (`9879c7e0`), workflow dashboard (`9411f490`), and executed Metal semantics/format-I/O probes (`9c41f5df`) |
+| next concrete decision | accept or reject the repaired A0.3 and M1.2 trust boundaries, then use M2.3 submission/coverage evidence to unlock the first raw-DPC/TMEM vertical slice |
 | evidence blockers | no matched private-game RT64 baseline exists; public RT64 does not provide a usable tracing implementation; HLSL artifact provenance and Windows DXC/utf8conv closure remain unresolved; these block claims or platform closure, not independent port work |
-| verification claim | authority/inventory passed 10/10 source rederivations; render IR passed 27 unit + 3 compile-fail tests in 10/10 processes; the M5 Pro capability probe passed 10/10 host processes and one lead rerun, but capability-specific semantics, renderer parity, and performance remain unproven |
+| verification claim | authority/inventory and render IR retain their 10-run bars; M5 Pro capability, integer/TMEM, binding-array, fractional dual-source/manual blend, explicit format conversion/readback, and invalid reinterpretation probes passed their recorded host bars; submission, coverage, renderer parity, and performance remain unproven |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
 counts are in [`RT64-PORT-DASHBOARD.md`](RT64-PORT-DASHBOARD.md), generated
@@ -198,11 +198,12 @@ here; the lead must review each diff and execute its stated gate.
 
 **Integrated since that handoff:** the dual-pin authority/inventory gate,
 wgpu 30 Metal capability baseline, and repaired render-IR ownership spine are
-on local `main` as `0f76db1f`, `6b36fe56`, and `99aa1d0a`. M1 is not complete:
+on local `main` as `34e00cf5`, `978981b2`, and `9879c7e0`. M1 is not complete:
 ABI-issued provenance, backend-held completion evidence, and guest-memory
-commit authority are the active M1.2 frontier. The Metal probe proves adapter
-advertisements and exact copy/readback only; feature-specific semantic probes
-remain M2.2 work.
+commit authority are the active M1.2 frontier. Metal M2.2 now proves the
+selected adapter's integer/TMEM, binding-array, fractional blend, explicit
+format-I/O, and invalid-reinterpretation behavior. Exact submission ownership,
+timestamp validity, and the shader-compute N64 coverage path remain M2.3 work.
 
 **Outcome:** M0.3 is in progress on an unintegrated measurement slice. Its
 proposed schema permits an honest `development` report with explicit
@@ -877,10 +878,15 @@ The accelerated wave keeps dependency-safe work active in parallel:
 9. **M2.1 -- pin the Metal capability baseline (INTEGRATED).** wgpu 30 on the
    M5 Pro advertised the candidate hard set and passed exact GPU copy/readback;
    advertisements are not semantic proof.
-10. **M2.2 -- execute Metal semantics/formats (IN PROGRESS).** Exercise integer
-    and TMEM-like operations, binding-array indexing, dual-source/manual blend,
-    explicit format conversion/I/O, and invalid reinterpret rejection.
-11. **M3.1 -- build the first raw-DPC replay spine (READY AFTER M1.2/M2.2
+10. **M2.2 -- execute Metal semantics/formats (INTEGRATED).** Exact host runs
+    cover integer and TMEM-like operations, binding-array indexing,
+    fractional dual-source/manual blend, explicit format conversion/I/O, and
+    invalid reinterpret rejection.
+11. **M2.3 -- execute Metal submission/coverage (IN PROGRESS).** Prove exact
+    single-queue completion and timestamp validity after pipeline prewarm, plus
+    the shader-compute eight-sample N64 coverage fallback. Hardware MSAA stays
+    a separately labeled, non-authoritative enhancement.
+12. **M3.1 -- build the first raw-DPC replay spine (READY AFTER M1.2/M2.3
     REVIEW).** Drive the smallest decode-to-headless-frame path before broad
     opcode or feature-family ports.
 

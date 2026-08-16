@@ -412,6 +412,31 @@
         "prevention": "Future GPU cards start from configuration-bound typed receipts and independently fixed fractional or edge-case vectors, with outcome payloads that cannot represent success-only fields in failure states.",
         "estimated_minutes_saved": 25
       }
+    },
+    {
+      "id": "M2.3",
+      "milestone": "M2",
+      "objective": "Prove exact one-queue submission, timestamp, and prewarm behavior plus the shader-compute eight-sample N64 coverage fallback on the primary Metal host.",
+      "profile": "P",
+      "model": "GPT-5.6 Sol",
+      "effort": "high",
+      "owner": "Metal submission and coverage writer",
+      "branch": "port/m2-metal-submission",
+      "base_branch": "main",
+      "writable_paths": [
+        "probes/m2-wgpu-metal-headless"
+      ],
+      "dependencies": ["M2.2"],
+      "state": "RUNNING",
+      "findings": [
+        "Current public wgpu exposes one physical queue; this ticket proves exact serialized completion and keeps semantic queue identities separate from native multi-queue claims.",
+        "Programmable hardware sample locations are unavailable through public wgpu, so exact N64 coverage is a shader-compute correctness path while fixed hardware MSAA remains an optional non-authoritative enhancement."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Execute Cards D and F with configuration-bound receipts, 20 submission processes, 10 coverage processes, and independent review.",
+      "started_utc": "2026-08-16T00:00:00Z",
+      "updated_utc": "2026-08-16T00:00:00Z"
     }
   ]
 }
