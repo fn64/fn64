@@ -1,0 +1,155 @@
+[package]
+name = "fn64-render-rt64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin RenderBackend adapter over the pinned MIT RT64 renderer, with all C++ interop quarantined here."
+
+[features]
+default = []
+# Builds the sibling RT64 checkout's static `rt64` core/HLE target and the
+# crate-local C ABI shim. The default remains pure Rust for CI/no-GPU hosts.
+rt64 = []
+# Non-default, private-input characterization transport for exact pinned
+# F3DZEX2 variants. This executes only through an explicitly evidence-named
+# API and does not add F3DZEX2 to production HLE admission.
+f3dzex2-characterization-evidence = ["rt64"]
+# Non-default, synthetic-only HLE transport used by live renderer evidence.
+# Production builds must not bypass RT64's recognized-microcode admission.
+synthetic-f3dex2-evidence = ["rt64"]
+# Non-default live context/workload evidence for PAL/NTSC/MPAL VI rate
+# derivation. It shares the synthetic GBI-identity transport only.
+region-rate-evidence = ["synthetic-f3dex2-evidence"]
+# Non-default, synthetic-only S2DEX2 transport used to isolate the two public
+# S2DEX enhancement controls without admitting a fake production ucode hash.
+synthetic-s2dex-evidence = ["rt64"]
+# HFR additionally observes the pinned post-sleep swapchain-present boundary.
+hfr-evidence = ["synthetic-f3dex2-evidence"]
+# Non-default Extended-GBI dispatch fixture. It shares the synthetic F3DEX2
+# transport above while production process_task keeps hash recognition.
+extended-gbi-evidence = ["synthetic-f3dex2-evidence"]
+# Repository-owned native/C archive fixture for schema-v10 release evidence.
+# This does not enable or build RT64.
+synthetic-native-archive-evidence = []
+
+[dependencies]
+fn64-runtime = { path = "../fn64-runtime" }
+fn64-render = { path = "../fn64-render" }
+sha2 = "0.10"
+
+[dev-dependencies]
+fn64-abi = { path = "../fn64-abi" }
+fn64-boot-harness = { path = "../fn64-boot-harness" }
+fn64-render-reference = { path = "../fn64-render-reference" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[example]]
+name = "synthetic_fixed_cycle_release"
+
+[[example]]
+name = "rt64_pixel_differential"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_texture_replacement_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_framebuffer_rdram_region_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_framebuffer_enhancement_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_latency_skip_buffering_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_latency_present_early_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_deferred_debugger_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_ubershader_pipeline_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_metal_backend_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_vi_filter_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_vi_aa_selector_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_resolution_downsample_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_user_controls_rebuild_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_enhancement_emulator_controls_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_extended_gbi_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_extended_gbi_synthetic_behavior"
+required-features = ["rt64", "extended-gbi-evidence"]
+
+[[example]]
+name = "rt64_extended_gbi_enhancement_behavior"
+required-features = ["rt64", "extended-gbi-evidence"]
+
+[[example]]
+name = "rt64_aspect_ratio_behavior"
+required-features = ["rt64"]
+
+[[example]]
+name = "rt64_hle_aspect_behavior"
+required-features = ["rt64", "extended-gbi-evidence"]
+
+[[example]]
+name = "rt64_hfr_interpolation_behavior"
+required-features = ["rt64", "hfr-evidence"]
+
+[[example]]
+name = "rt64_region_rate_behavior"
+required-features = ["rt64", "region-rate-evidence"]
+
+[[example]]
+name = "rt64_force_branch_behavior"
+required-features = ["rt64", "synthetic-f3dex2-evidence"]
+
+[[example]]
+name = "rt64_texture_lod_scale_behavior"
+required-features = ["rt64", "synthetic-f3dex2-evidence"]
+
+[[example]]
+name = "rt64_s2dex_enhancement_behavior"
+required-features = ["rt64", "synthetic-s2dex-evidence"]
+
+[[example]]
+name = "rt64_s2dex_object_rect_behavior"
+required-features = ["rt64", "synthetic-s2dex-evidence"]

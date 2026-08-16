@@ -21,14 +21,26 @@ from pathlib import Path
 
 SCHEMA = "fn64.rt64-port-parity.v2"
 FIXTURE_SCHEMA = "fn64.render-conformance.replay.v1"
-RECEIPT_SCHEMA = "fn64.render-conformance.receipt.v5"
-RUN_SERIES_SCHEMA = "fn64.render-conformance.run-series.v4"
-PROCESS_RESULT_SCHEMA = "fn64.render-conformance.process-result.v3"
+RECEIPT_SCHEMA = "fn64.render-conformance.receipt.v6"
+RUN_SERIES_SCHEMA = "fn64.render-conformance.run-series.v5"
+PROCESS_RESULT_SCHEMA = "fn64.render-conformance.process-result.v4"
 RUN_REQUEST_SCHEMA = "fn64.render-conformance.runner-request.v2"
 REQUIRED_RUNS = 10
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_PROCESS_OUTPUT_BYTES = 4 * 1024 * 1024
 RUNNER_TIMEOUT_SECONDS = 30
+MAX_RUNNER_COOLDOWN_MILLISECONDS = 5_000
+FORBIDDEN_AMBIENT_ENV_PREFIXES = (
+    "LD_", "DYLD_", "PYTHON", "PERL", "RUBY", "LUA_", "TCL_", "DOTNET_",
+    "MONO_", "POWERSHELL_", "GTK_", "QT_", "VK_", "LIBGL_", "MESA_",
+    "__GL_", "D3D12SDK", "DXVK_", "VKD3D_", "SDL_", "METAL_", "MTL_",
+)
+FORBIDDEN_AMBIENT_ENV_NAMES = {
+    "BASH_ENV", "ENV", "SHELLOPTS", "ZDOTDIR", "GCONV_PATH", "LOCPATH",
+    "NLSPATH", "CLASSPATH", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS",
+    "_JAVA_OPTIONS", "SSLKEYLOGFILE", "NODE_OPTIONS", "NODE_PATH",
+    "GBM_BACKEND", "GALLIUM_DRIVER", "EGL_PLATFORM",
+}
 OBSERVABLES = [
     "admitted_commands_state", "full_sync_timeline", "tmem_bytes",
     "resource_journal_guest_memory_effects", "shader_parameters",
@@ -43,7 +55,7 @@ RUST_STATES = {"RUST_PENDING", "RUST_PASS", "RUST_BOUNDED_QUALIFICATION"}
 AUTHORITIES = {"hardware_reference", "admitted_full_rom", "base_renderer_matrix", "pinned_rt64"}
 AVAILABILITY = {"qualified", "unexercised", "build_not_enabled", "platform_unavailable"}
 CONTRACT_DIGEST = "7556031949f3093d616f75724e5be091beda5152140c489127213917ef382da0"
-STATE_DIGEST = "361f5e59e61f85ead5620b9aeb695db6bdc0f986c72d91f9fe0c5fcc7da6671d"
+STATE_DIGEST = "65f6438686713767b135ae74def03001679a93ae27c5f245dc2049be987ef9d5"
 
 
 class ParityError(Exception):
@@ -74,6 +86,18 @@ def framed_digest(domain: bytes, fields: list[bytes]) -> str:
 
 def is_digest(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def reject_ambient_code_injection_environment(row_id: str) -> None:
+    dangerous = sorted(
+        name for name in os.environ
+        if name.upper() in FORBIDDEN_AMBIENT_ENV_NAMES
+        or name.upper().startswith(FORBIDDEN_AMBIENT_ENV_PREFIXES)
+    )
+    require(
+        not dangerous,
+        f"{row_id}: ambient loader/interpreter/plugin injection environment is forbidden: {', '.join(dangerous)}",
+    )
 
 
 def load_json(path: Path) -> dict:
@@ -193,11 +217,31 @@ class RunnerPolicy:
     authority_sha256: str
     runner_args: tuple[str, ...] = ("run", "honest")
     test_only: bool = False
+    enabled_features: tuple[str, ...] = ()
+    cooldown_milliseconds: int = 0
 
 
-# Fail closed. A future backend ticket must add a reviewed concrete runner and
-# its exact retained executable identity in the same change as its verifier.
-REGISTERED_RUNNERS: dict[str, RunnerPolicy] = {}
+# Fail closed. Every production entry binds a separately reviewed executable,
+# verifier, private authority, build closure, feature set, and process policy.
+REGISTERED_RUNNERS: dict[str, RunnerPolicy] = {
+    "rt64-deferred-history-macos-metal-v1": RunnerPolicy(
+        delegate_kind="rt64",
+        runner_path="evidence/rt64-port/artifacts/deferred-frame-history/bin/runner",
+        runner_sha256="6d0f3a84b7487fe478566b7c20b319f6628d31d1f19d2392733a61379a65c690",
+        build_receipt_path="evidence/rt64-port/artifacts/deferred-frame-history/build-receipt.json",
+        build_receipt_sha256="034f1ab2007dd1728dfe7cfca652639c21b35fc4e7a1f0d8d9f16c420db686b3",
+        verifier_path="evidence/rt64-port/artifacts/deferred-frame-history/bin/verifier",
+        verifier_sha256="0ad7cb57c5fa45056f111e6ef695ecff737de65c384847e5e7fe9497a49917ae",
+        authority_path="evidence/rt64-port/artifacts/deferred-frame-history/private-authority.json",
+        authority_sha256="96c7fd42c05867b26809bd7a646397f53b48f9550f4dce96d9af71afb1b0abbd",
+        runner_args=("run",),
+        enabled_features=(
+            "fn64-render-conformance/rt64-deferred-history-runner",
+            "fn64-render-rt64/rt64",
+        ),
+        cooldown_milliseconds=1_000,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -206,6 +250,8 @@ class ExecutedSeries:
     process_identities: tuple[str, ...]
     run_identities: tuple[str, ...]
     series_identity: str
+    child_pids: tuple[int, ...]
+    challenges: tuple[str, ...]
 
 
 def source_denominator(root: Path) -> tuple[list[tuple[str, str]], dict[tuple[str, str], dict]]:
@@ -247,12 +293,17 @@ def optional_digest_fields(value: object, field: str) -> tuple[bytes, bytes]:
 
 
 def rt64_source_identity(root: Path) -> str:
-    source_id = load_json(root / "docs/rt64-port-authority.json")["oracle"]["source_id"]
-    require(isinstance(source_id, str) and source_id.startswith("git:"), "gated RT64 oracle source ID is invalid")
+    source_id = rt64_source_id(root)
     return framed_digest(
         b"fn64.render-conformance.rt64-source.v1\0",
         [source_id.encode()],
     )
+
+
+def rt64_source_id(root: Path) -> str:
+    source_id = load_json(root / "docs/rt64-port-authority.json")["oracle"]["source_id"]
+    require(isinstance(source_id, str) and source_id.startswith("git:"), "gated RT64 oracle source ID is invalid")
+    return source_id
 
 
 def hex_bytes(value: object, field: str, maximum: int = MAX_ARTIFACT_BYTES) -> bytes:
@@ -267,7 +318,7 @@ def invoke_verifier(executable: Path, arguments: tuple[str, ...], value: dict, r
     try:
         completed = subprocess.run(
             [str(executable), *arguments], input=canonical_bytes(value), stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=RUNNER_TIMEOUT_SECONDS, check=False,
+            stderr=subprocess.PIPE, timeout=RUNNER_TIMEOUT_SECONDS, check=False, env={},
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise ParityError(f"{row_id}: Rust verifier launch failed: {error}") from error
@@ -282,12 +333,13 @@ def invoke_verifier(executable: Path, arguments: tuple[str, ...], value: dict, r
 
 def validate_build_receipt(
     root: Path, registry: ArtifactRegistry, receipt_artifact: RetainedArtifact,
-    runner: RetainedArtifact, policy: RunnerPolicy, delegate_kind: str,
+    runner: RetainedArtifact, verifier: RetainedArtifact, policy: RunnerPolicy, delegate_kind: str,
 ) -> tuple[dict, str | None]:
     receipt = parse_json_artifact(receipt_artifact)
-    require(set(receipt) == {"schema", "runner", "source_inputs", "build_inputs", "toolchain", "rt64_source_identity", "closure_identity"}, "build receipt fields drifted")
-    require(receipt["schema"] == "fn64.render-conformance.build-receipt.v1", "wrong build receipt schema")
+    require(set(receipt) == {"schema", "runner", "verifier", "source_inputs", "build_inputs", "toolchain", "enabled_features", "rt64_source_identity", "closure_identity"}, "build receipt fields drifted")
+    require(receipt["schema"] == "fn64.render-conformance.build-receipt.v2", "wrong build receipt schema")
     require(receipt["runner"] == artifact_reference(runner.path, runner.sha256), "build receipt does not identify the executed artifact")
+    require(receipt["verifier"] == artifact_reference(verifier.path, verifier.sha256), "build receipt does not identify the executed verifier")
     for field in ("source_inputs", "build_inputs"):
         references = receipt[field]
         require(isinstance(references, list) and references, f"build receipt {field} must be nonempty")
@@ -308,14 +360,24 @@ def validate_build_receipt(
     except (OSError, subprocess.SubprocessError) as error:
         raise ParityError(f"cannot verify build toolchain: {error}") from error
     require(toolchain["rustc_vv"] == actual_rustc, "build receipt toolchain does not match verifier host")
+    features = receipt["enabled_features"]
+    require(
+        isinstance(features, list)
+        and features == sorted(set(features))
+        and all(isinstance(feature, str) and feature for feature in features),
+        "build receipt enabled features must be sorted unique nonempty strings",
+    )
+    require(features == list(policy.enabled_features), "build receipt enabled feature set is not the registered runner policy")
     source_identity = receipt["rt64_source_identity"]
     if delegate_kind == "rt64":
         require(source_identity == rt64_source_identity(root), "build receipt RT64 source pin mismatch")
     else:
         require(source_identity is None, "non-RT64 build receipt invented an RT64 source pin")
     closure = {
-        "runner_sha256": runner.sha256, "source_inputs": receipt["source_inputs"],
+        "runner_sha256": runner.sha256, "verifier_sha256": verifier.sha256,
+        "source_inputs": receipt["source_inputs"],
         "build_inputs": receipt["build_inputs"], "toolchain": toolchain,
+        "enabled_features": features,
         "rt64_source_identity": source_identity,
     }
     require(receipt["closure_identity"] == canonical_digest(closure), "build receipt closure identity mismatch")
@@ -333,6 +395,7 @@ def _execute_qualified(
     runner_copy_directory: Path,
     runner_registry: dict[str, RunnerPolicy] | None = None,
 ) -> ExecutedSeries:
+    reject_ambient_code_injection_environment(row["id"])
     require(set(evidence) == {"availability", "execution"}, f"{row['id']}: closed evidence fields drifted")
     require(evidence["availability"] == "qualified", f"{row['id']}: closed evidence must be qualified")
     execution = evidence["execution"]
@@ -347,6 +410,19 @@ def _execute_qualified(
         f"{row['id']}: synthetic test runner cannot enter the production registry",
     )
     require(policy.delegate_kind == delegate_kind, f"{row['id']}: runner delegate policy mismatch")
+    require(
+        isinstance(policy.cooldown_milliseconds, int)
+        and not isinstance(policy.cooldown_milliseconds, bool)
+        and 0 <= policy.cooldown_milliseconds <= MAX_RUNNER_COOLDOWN_MILLISECONDS,
+        f"{row['id']}: registered runner cooldown is outside the reviewed bound",
+    )
+    require(
+        policy.enabled_features == tuple(sorted(set(policy.enabled_features)))
+        and all(isinstance(feature, str) and feature for feature in policy.enabled_features),
+        f"{row['id']}: registered runner feature set is not sorted and unique",
+    )
+    if delegate_kind == "rt64":
+        require(policy.enabled_features, f"{row['id']}: RT64 runner policy omitted its exact feature set")
 
     registry = ArtifactRegistry(root)
     runner = registry.load(execution["runner_artifact"], prefix=("evidence", "rt64-port", "artifacts"))
@@ -365,7 +441,7 @@ def _execute_qualified(
     verifier_path = runner_copy_directory / "verifier"
     verifier_path.write_bytes(verifier.bytes)
     verifier_path.chmod(0o700)
-    _, source_identity = validate_build_receipt(root, registry, build_receipt, runner, policy, delegate_kind)
+    _, source_identity = validate_build_receipt(root, registry, build_receipt, runner, verifier, policy, delegate_kind)
     replay = parse_json_artifact(replay_artifact)
     authority = parse_json_artifact(authority_artifact)
     inspection = invoke_verifier(verifier_path, ("inspect",), replay, row["id"])
@@ -380,10 +456,13 @@ def _execute_qualified(
     process_identities: list[str] = []
     run_identities: list[str] = []
     challenges: set[str] = set()
+    ordered_challenges: list[str] = []
+    child_pids: list[int] = []
     for ordinal in range(REQUIRED_RUNS):
         challenge = secrets.token_hex(32)
         require(challenge not in challenges, f"{row['id']}: verifier challenge collision")
         challenges.add(challenge)
+        ordered_challenges.append(challenge)
         request = {
             "schema": RUN_REQUEST_SCHEMA,
             "ordinal": ordinal,
@@ -394,7 +473,7 @@ def _execute_qualified(
         try:
             process = subprocess.Popen(
                 [str(runner_path), *policy.runner_args], cwd=runner_copy_directory, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={},
             )
             stdout, stderr = process.communicate(
                 canonical_bytes(request) + b"\n", timeout=RUNNER_TIMEOUT_SECONDS,
@@ -415,21 +494,45 @@ def _execute_qualified(
         require(result.get("schema") == PROCESS_RESULT_SCHEMA, f"{row['id']}: wrong process-result schema")
         require(result.get("challenge") == challenge, f"{row['id']}: runner did not answer this verifier challenge")
         require(result.get("pid") == process.pid, f"{row['id']}: runner result is not from the launched child PID")
+        child_pids.append(process.pid)
+        delegate_identity = result.get("delegate_identity")
+        if delegate_kind == "rt64":
+            require(
+                isinstance(delegate_identity, dict)
+                and set(delegate_identity) == {
+                    "delegate_kind", "adapter", "adapter_source_sha256", "source_id",
+                    "source_provenance", "source_overlay_id", "post_vi_api", "enabled_features",
+                },
+                f"{row['id']}: RT64 runner omitted its exact delegate identity",
+            )
+            require(delegate_identity["delegate_kind"] == "rt64", f"{row['id']}: RT64 delegate kind drifted")
+            require(delegate_identity["adapter"] == "fn64-render-rt64/rt64", f"{row['id']}: RT64 adapter identity drifted")
+            require(is_digest(delegate_identity["adapter_source_sha256"]), f"{row['id']}: RT64 adapter source digest is invalid")
+            require(delegate_identity["source_id"] == rt64_source_id(root), f"{row['id']}: executed RT64 source pin drifted")
+            require(delegate_identity["source_provenance"] == "git-clean", f"{row['id']}: executed RT64 source is not a clean Git checkout")
+            require(isinstance(delegate_identity["source_overlay_id"], str) and delegate_identity["source_overlay_id"], f"{row['id']}: RT64 source overlay identity is empty")
+            require(delegate_identity["post_vi_api"] == "metal-bgra8-unorm", f"{row['id']}: deferred-history runner did not use Metal")
+            require(delegate_identity["enabled_features"] == list(policy.enabled_features), f"{row['id']}: executed RT64 feature set drifted")
+        else:
+            require(delegate_identity is None, f"{row['id']}: non-RT64 runner invented a delegate identity")
         evaluation = invoke_verifier(verifier_path, ("evaluate",), {
             "replay": replay, "authority": authority, "result": result,
         }, row["id"])
         registry.assert_all_unchanged()
         required_classification = "diverges" if expected_outcome == "RT64_DIVERGES" else "pass"
         require(evaluation.get("classification") == required_classification, f"{row['id']}: backend result does not satisfy {expected_outcome}")
-        semantic = framed_digest(b"fn64.render-conformance.receipt.v5\0", [
+        semantic = framed_digest(b"fn64.render-conformance.receipt.v6\0", [
             row["id"].encode(), bytes.fromhex(evaluation["semantic_identity"]),
-            bytes.fromhex(runner.sha256), bytes.fromhex(build_receipt.sha256),
+            bytes.fromhex(runner.sha256), bytes.fromhex(verifier.sha256),
+            bytes.fromhex(build_receipt.sha256), bytes.fromhex(replay_artifact.sha256),
+            bytes.fromhex(authority_artifact.sha256), canonical_bytes(list(policy.enabled_features)),
             (source_identity or "").encode(), delegate_kind.encode(), expected_outcome.encode(),
         ])
         process_identity = framed_digest(
-            b"fn64.render-conformance.fresh-process.v3\0",
+            b"fn64.render-conformance.fresh-process.v4\0",
             [
-                bytes.fromhex(runner.sha256), bytes.fromhex(build_receipt.sha256),
+                bytes.fromhex(runner.sha256), bytes.fromhex(verifier.sha256),
+                bytes.fromhex(build_receipt.sha256),
                 bytes.fromhex(replay_artifact.sha256), bytes.fromhex(authority_artifact.sha256), bytes.fromhex(challenge),
                 process.pid.to_bytes(8, "big", signed=False),
                 launch_start_ns.to_bytes(16, "big", signed=False),
@@ -442,15 +545,24 @@ def _execute_qualified(
         semantic_identities.append(semantic)
         process_identities.append(process_identity)
         run_identities.append(run_identity)
+        if ordinal + 1 < REQUIRED_RUNS and policy.cooldown_milliseconds:
+            time.sleep(policy.cooldown_milliseconds / 1_000)
     require(len(set(semantic_identities)) == 1, f"{row['id']}: backend semantic result changed across fresh processes")
     require(len(set(process_identities)) == REQUIRED_RUNS, f"{row['id']}: fresh-process identities were reused")
     require(len(set(run_identities)) == REQUIRED_RUNS, f"{row['id']}: process results were cloned")
     semantic = semantic_identities[0]
     series = framed_digest(
-        b"fn64.render-conformance.run-series.v4\0",
+        b"fn64.render-conformance.run-series.v5\0",
         [item for run in run_identities for item in (bytes.fromhex(run), bytes.fromhex(semantic))],
     )
-    return ExecutedSeries(semantic, tuple(process_identities), tuple(run_identities), series)
+    return ExecutedSeries(
+        semantic,
+        tuple(process_identities),
+        tuple(run_identities),
+        series,
+        tuple(child_pids),
+        tuple(ordered_challenges),
+    )
 
 
 def execute_qualified(
@@ -474,7 +586,13 @@ def execute_qualified(
         )
 
 
-def validate_rt64_evidence(root: Path, row: dict, state: str | None) -> None:
+def validate_rt64_evidence(
+    root: Path,
+    row: dict,
+    state: str | None,
+    *,
+    execute_evidence: bool,
+) -> ExecutedSeries | None:
     evidence = row["rt64_evidence"]
     require(isinstance(evidence, dict), f"{row['id']}.rt64_evidence must be an object")
     require(evidence.get("availability") in AVAILABILITY, f"{row['id']}: invalid RT64 availability")
@@ -482,15 +600,27 @@ def validate_rt64_evidence(root: Path, row: dict, state: str | None) -> None:
         require(evidence["availability"] in {"unexercised", "build_not_enabled", "platform_unavailable"}, f"{row['id']}: qualified evidence requires a state")
         require(set(evidence) == {"availability", "reason"}, f"{row['id']}: open RT64 evidence fields drifted")
         require(isinstance(evidence["reason"], str) and evidence["reason"].strip(), f"{row['id']}: empty RT64 blocker")
-        return
+        return None
     require(state != "RT64_PUBLICLY_UNAVAILABLE", f"{row['id']}: every denominator row is publicly advertised; public-unavailable is forbidden")
     require(state in {"RT64_PASS", "RT64_DIVERGES"}, f"{row['id']}: invalid RT64 state")
     if state == "RT64_DIVERGES":
         require(row["authority"] != "pinned_rt64", f"{row['id']}: RT64 cannot authorize divergence from itself")
-    execute_qualified(root, evidence, row, "rt64", state)
+    if not execute_evidence:
+        require(
+            set(evidence) == {"availability", "execution"},
+            f"{row['id']}: closed evidence fields drifted",
+        )
+        return None
+    return execute_qualified(root, evidence, row, "rt64", state)
 
 
-def validate_rust_evidence(root: Path, row: dict, state: str) -> None:
+def validate_rust_evidence(
+    root: Path,
+    row: dict,
+    state: str,
+    *,
+    execute_evidence: bool,
+) -> None:
     evidence = row["rust_evidence"]
     require(isinstance(evidence, dict), f"{row['id']}.rust_evidence must be an object")
     if state == "RUST_PENDING":
@@ -498,10 +628,21 @@ def validate_rust_evidence(root: Path, row: dict, state: str) -> None:
         require(evidence["availability"] == "unimplemented", f"{row['id']}: pending Rust row must remain explicit")
         require(isinstance(evidence["reason"], str) and evidence["reason"].strip(), f"{row['id']}: empty Rust blocker")
         return
+    if not execute_evidence:
+        require(
+            set(evidence) == {"availability", "execution"},
+            f"{row['id']}: closed Rust evidence fields drifted",
+        )
+        return
     execute_qualified(root, evidence, row, "rust_port", state)
 
 
-def validate_manifest(manifest: dict, root: Path) -> tuple[list[dict], dict[tuple[str, str], dict]]:
+def validate_manifest(
+    manifest: dict,
+    root: Path,
+    *,
+    execute_evidence: bool = True,
+) -> tuple[list[dict], dict[tuple[str, str], dict], list[tuple[dict, str, ExecutedSeries]]]:
     require(manifest.get("schema") == SCHEMA, f"schema must be {SCHEMA!r}")
     require(set(manifest) == {"schema", "contract", "rows"}, "manifest root fields drifted")
     contract = manifest["contract"]
@@ -523,6 +664,7 @@ def validate_manifest(manifest: dict, root: Path) -> tuple[list[dict], dict[tupl
     require(isinstance(rows, list) and len(rows) == 50, "parity denominator must contain exactly 50 rows")
     seen_ids: set[str] = set()
     seen_sources: set[tuple[str, str]] = set()
+    qualified_series: list[tuple[dict, str, ExecutedSeries]] = []
     for index, row in enumerate(rows):
         where = f"rows[{index}]"
         require(isinstance(row, dict) and set(row) == {"id", "source", "required", "authority", "observable_layers", "earliest_observable", "states", "rt64_evidence", "rust_evidence"}, f"{where}: unknown or missing fields")
@@ -548,15 +690,28 @@ def validate_manifest(manifest: dict, root: Path) -> tuple[list[dict], dict[tupl
         rt64 = [state for state in states if state in RT64_STATES]
         rust = [state for state in states if state in RUST_STATES]
         require(len(rt64) <= 1 and len(rust) == 1, f"{row_id}: exactly one Rust and at most one RT64 state required during development")
-        validate_rt64_evidence(root, row, rt64[0] if rt64 else None)
-        validate_rust_evidence(root, row, rust[0])
+        rt64_state = rt64[0] if rt64 else None
+        series = validate_rt64_evidence(
+            root,
+            row,
+            rt64_state,
+            execute_evidence=execute_evidence,
+        )
+        if series is not None:
+            qualified_series.append((row, rt64_state, series))
+        validate_rust_evidence(
+            root,
+            row,
+            rust[0],
+            execute_evidence=execute_evidence,
+        )
     require(seen_sources == expected_sources, "source denominator drifted")
 
     frozen = [{"id": row["id"], "authority": row["authority"], "observable_layers": row["observable_layers"], "earliest_observable": row["earliest_observable"]} for row in rows]
     require(canonical_digest(frozen) == CONTRACT_DIGEST, "one or more frozen row authority/observable contracts drifted")
     frozen_states = [{"id": row["id"], "states": row["states"]} for row in rows]
     require(canonical_digest(frozen_states) == STATE_DIGEST, "row state ledger drifted; closure or reopening requires an explicit reviewed ledger update")
-    return rows, metadata
+    return rows, metadata, qualified_series
 
 
 def rejection_guards(manifest: dict, root: Path) -> None:
@@ -564,7 +719,7 @@ def rejection_guards(manifest: dict, root: Path) -> None:
         candidate = copy.deepcopy(manifest)
         mutate(candidate)
         try:
-            validate_manifest(candidate, root)
+            validate_manifest(candidate, root, execute_evidence=False)
         except ParityError:
             return
         raise ParityError(f"validator rejection guard failed: {label}")
@@ -621,8 +776,8 @@ def render_doc(rows: list[dict], metadata: dict[tuple[str, str], dict]) -> str:
         "The ordinary checker keeps a structurally sound development backlog green. The",
         "separate `--progress` gate remains red until every required row has both a",
         "qualified RT64 observation/classification and a qualified Rust result.", "",
-        "No concrete backend runner is registered today. Closed evidence is therefore",
-        "fail-closed: the checker itself launches every fresh process and owns each random",
+        "The first concrete backend runner is registered only for deferred frame history.",
+        "Closed evidence remains fail-closed: the checker launches every fresh process and owns each random",
         "challenge. A public replay artifact contains only the Rust-decoded record, exact raw",
         "payload streams, and capture control; a separately registered verifier-private authority",
         "contains expected observations/effects and is never sent to the child.", "", "## Summary", "",
@@ -649,13 +804,13 @@ def render_doc(rows: list[dict], metadata: dict[tuple[str, str], dict]) -> str:
         "Deliberately-red completion gate:", "", "```sh",
         "python3 tools/check_rt64_port_parity.py --progress", "```", "",
         "## Open concrete-runner frontier", "",
-        "No qualified headless RT64 delegate exposes a backend-produced observable for this",
-        "contract, and the Rust renderer has only a synthetic lifecycle spine. The previous raw-DPC attempt",
-        "reported fn64 preflight FullSync rather than an RT64-produced observation and the",
-        "headless host stopped at SDL display initialization. Those facts are blockers, not",
-        "passes, divergences, or public-source unavailability.", "",
-        "A future runner registration must land with exact retained runner, Rust verifier, private",
-        "authority, and build-receipt identities. The build receipt binds the executed artifact to",
+        "The registered macOS RT64 deferred-history runner obtains both complete Workload snapshots",
+        "from the FullSync/advanceWorkload queue slot, emits the reviewed 104-byte pre-submission",
+        "projection, and verifies its two actual guest framebuffer effects without presenting.",
+        "Its checker-owned ten-fresh-process Metal series qualifies only",
+        "`feature::deferred-frame-history`; every other RT64 observation remains pending.", "",
+        "Registration binds the exact retained runner, Rust verifier, private authority,",
+        "and build-receipt identities. The build receipt binds the executed artifact to",
         "its source inputs, build inputs, active Rust toolchain, and (for RT64) the gated source pin.",
         "The verifier Rust-decodes every WorkloadRecord, reconstructs exact payload-bound IR, and",
         "derives pass/divergence from backend output. For guest-visible rows, the exact reviewed",
@@ -663,9 +818,38 @@ def render_doc(rows: list[dict], metadata: dict[tuple[str, str], dict]) -> str:
         "lifecycle; the verifier independently binds the emitted proof to the replay, exact effects,",
         "and fresh challenge. JSON hashing alone is not Rust type provenance.",
         "The checker rejects symlinks, hard-link aliases, post-read mutation, cloned process output,",
-        "and any caller-authored authority or run series.", "",
+        "and any caller-authored authority or run series. It rejects ambient loader/interpreter/",
+        "plugin injection variables and launches both retained executables with an empty environment.", "",
     ])
     return "\n".join(lines)
+
+
+def qualification_report(
+    qualified_series: list[tuple[dict, str, ExecutedSeries]],
+) -> dict:
+    rows = []
+    for row, expected_outcome, series in qualified_series:
+        execution = row["rt64_evidence"]["execution"]
+        policy = REGISTERED_RUNNERS[execution["runner_id"]]
+        rows.append({
+            "row_id": row["id"],
+            "expected_outcome": expected_outcome,
+            "runner_id": execution["runner_id"],
+            "execution": execution,
+            "required_run_count": REQUIRED_RUNS,
+            "cooldown_milliseconds": policy.cooldown_milliseconds,
+            "enabled_features": list(policy.enabled_features),
+            "semantic_identity": series.semantic_identity,
+            "process_identities": list(series.process_identities),
+            "run_identities": list(series.run_identities),
+            "series_identity": series.series_identity,
+            "child_pids": list(series.child_pids),
+            "challenges": list(series.challenges),
+        })
+    return {
+        "schema": "fn64.render-conformance.qualification-report.v1",
+        "rows": rows,
+    }
 
 
 def main() -> int:
@@ -675,12 +859,28 @@ def main() -> int:
     parser.add_argument("--write-doc", action="store_true")
     parser.add_argument("--print-doc", action="store_true")
     parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--qualification-output", type=Path)
+    parser.add_argument("--structural-only", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     try:
         require(not (args.write_doc and args.print_doc), "--write-doc and --print-doc are mutually exclusive")
+        require(
+            args.qualification_output is None or not (args.write_doc or args.print_doc),
+            "--qualification-output cannot be combined with doc rendering",
+        )
+        require(
+            not (args.structural_only and args.qualification_output is not None),
+            "--structural-only cannot publish a qualification report",
+        )
         manifest = load_json(args.manifest)
-        rows, metadata = validate_manifest(manifest, root)
+        rows, metadata, qualified_series = validate_manifest(
+            manifest,
+            root,
+            execute_evidence=not (
+                args.write_doc or args.print_doc or args.structural_only
+            ),
+        )
         rejection_guards(manifest, root)
         rendered = render_doc(rows, metadata)
         if args.print_doc:
@@ -691,6 +891,11 @@ def main() -> int:
             print(f"rt64-port-parity: wrote {args.doc}")
             return 0
         require(args.doc.read_text(encoding="utf-8") == rendered, f"generated doc is stale: {args.doc}; regenerate with --write-doc")
+        if args.qualification_output is not None:
+            require(qualified_series, "no qualified series was executed")
+            args.qualification_output.write_bytes(
+                canonical_bytes(qualification_report(qualified_series))
+            )
         rust_pending = [row["id"] for row in rows if "RUST_PENDING" in row["states"]]
         rt64_pending = [row["id"] for row in rows if not any(state in RT64_STATES for state in row["states"])]
         if args.progress and (rust_pending or rt64_pending):
@@ -699,7 +904,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        print(f"rt64-port-parity: clean ({len(rows)} required rows; {len(rust_pending)} Rust pending; {len(rt64_pending)} RT64 observations pending)")
+        mode = "structurally clean" if args.structural_only else "clean"
+        print(f"rt64-port-parity: {mode} ({len(rows)} required rows; {len(rust_pending)} Rust pending; {len(rt64_pending)} RT64 observations pending)")
         return 0
     except (OSError, ParityError) as error:
         print(f"rt64-port-parity: {error}", file=sys.stderr)

@@ -480,7 +480,11 @@ def check_rt64_port_parity() -> None:
         fail("RT64-PORT-PARITY.md", detail)
         return
     result = subprocess.run(
-        [sys.executable, str(ROOT / "tools/check_rt64_port_parity.py")],
+        [
+            sys.executable,
+            str(ROOT / "tools/check_rt64_port_parity.py"),
+            "--structural-only",
+        ],
         cwd=ROOT,
         capture_output=True,
         text=True,

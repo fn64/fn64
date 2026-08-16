@@ -7,8 +7,8 @@ The ordinary checker keeps a structurally sound development backlog green. The
 separate `--progress` gate remains red until every required row has both a
 qualified RT64 observation/classification and a qualified Rust result.
 
-No concrete backend runner is registered today. Closed evidence is therefore
-fail-closed: the checker itself launches every fresh process and owns each random
+The first concrete backend runner is registered only for deferred frame history.
+Closed evidence remains fail-closed: the checker launches every fresh process and owns each random
 challenge. A public replay artifact contains only the Rust-decoded record, exact raw
 payload streams, and capture control; a separately registered verifier-private authority
 contains expected observations/effects and is never sent to the child.
@@ -17,14 +17,14 @@ contains expected observations/effects and is never sent to the child.
 
 | State | Rows |
 |---|---:|
-| `RT64_PASS` | 0 |
+| `RT64_PASS` | 1 |
 | `RT64_DIVERGES` | 0 |
 | `RT64_PUBLICLY_UNAVAILABLE` | 0 |
 | `RUST_PENDING` | 50 |
 | `RUST_PASS` | 0 |
 | `RUST_BOUNDED_QUALIFICATION` | 0 |
 
-Exact denominator: **50 required rows** (24 base-renderer + 26 publicly advertised RT64 features); **50 Rust rows pending** and **50 RT64 observations pending**.
+Exact denominator: **50 required rows** (24 base-renderer + 26 publicly advertised RT64 features); **50 Rust rows pending** and **49 RT64 observations pending**.
 
 ## Rows
 
@@ -75,7 +75,7 @@ Exact denominator: **50 required rows** (24 base-renderer + 26 publicly advertis
 | `feature::framebuffer-upscaling` | [RT64 feature](rt64-public-feature-inventory.json) / `framebuffer-upscaling` — Upscale framebuffer effects and associated region copies | `pinned_rt64` | `resource_journal_guest_memory_effects` → `framebuffer_high` | `RUST_PENDING` | `unexercised` |
 | `feature::framebuffer-reinterpretation` | [RT64 feature](rt64-public-feature-inventory.json) / `framebuffer-reinterpretation` — High-resolution per-pixel framebuffer reinterpretation | `pinned_rt64` | `resource_journal_guest_memory_effects` → `framebuffer_native` → `framebuffer_high` | `RUST_PENDING` | `unexercised` |
 | `feature::debugger-frame-inspection` | [RT64 feature](rt64-public-feature-inventory.json) / `debugger-frame-inspection` — In-game debugger inspects recorded frame contents | `pinned_rt64` | `resource_journal_guest_memory_effects` | `RUST_PENDING` | `unexercised` |
-| `feature::deferred-frame-history` | [RT64 feature](rt64-public-feature-inventory.json) / `deferred-frame-history` — Deferred frame records complete draw-call history before GPU submission | `pinned_rt64` | `full_sync_timeline` → `resource_journal_guest_memory_effects` | `RUST_PENDING` | `unexercised` |
+| `feature::deferred-frame-history` | [RT64 feature](rt64-public-feature-inventory.json) / `deferred-frame-history` — Deferred frame records complete draw-call history before GPU submission | `pinned_rt64` | `full_sync_timeline` → `resource_journal_guest_memory_effects` | `RT64_PASS`, `RUST_PENDING` | `qualified` |
 | `feature::platform-windows-10` | [RT64 feature](rt64-public-feature-inventory.json) / `platform-windows-10` — Windows 10 support | `pinned_rt64` | `admitted_commands_state` → `post_vi_pixels` | `RUST_PENDING` | `platform_unavailable` |
 | `feature::platform-windows-11` | [RT64 feature](rt64-public-feature-inventory.json) / `platform-windows-11` — Windows 11 support | `pinned_rt64` | `admitted_commands_state` → `post_vi_pixels` | `RUST_PENDING` | `platform_unavailable` |
 | `feature::platform-linux` | [RT64 feature](rt64-public-feature-inventory.json) / `platform-linux` — Linux support | `pinned_rt64` | `admitted_commands_state` → `post_vi_pixels` | `RUST_PENDING` | `platform_unavailable` |
@@ -98,14 +98,14 @@ python3 tools/check_rt64_port_parity.py --progress
 
 ## Open concrete-runner frontier
 
-No qualified headless RT64 delegate exposes a backend-produced observable for this
-contract, and the Rust renderer has only a synthetic lifecycle spine. The previous raw-DPC attempt
-reported fn64 preflight FullSync rather than an RT64-produced observation and the
-headless host stopped at SDL display initialization. Those facts are blockers, not
-passes, divergences, or public-source unavailability.
+The registered macOS RT64 deferred-history runner obtains both complete Workload snapshots
+from the FullSync/advanceWorkload queue slot, emits the reviewed 104-byte pre-submission
+projection, and verifies its two actual guest framebuffer effects without presenting.
+Its checker-owned ten-fresh-process Metal series qualifies only
+`feature::deferred-frame-history`; every other RT64 observation remains pending.
 
-A future runner registration must land with exact retained runner, Rust verifier, private
-authority, and build-receipt identities. The build receipt binds the executed artifact to
+Registration binds the exact retained runner, Rust verifier, private authority,
+and build-receipt identities. The build receipt binds the executed artifact to
 its source inputs, build inputs, active Rust toolchain, and (for RT64) the gated source pin.
 The verifier Rust-decodes every WorkloadRecord, reconstructs exact payload-bound IR, and
 derives pass/divergence from backend output. For guest-visible rows, the exact reviewed
@@ -113,4 +113,5 @@ runner source/build/binary is the trust root for its internal GuestCommittedTick
 lifecycle; the verifier independently binds the emitted proof to the replay, exact effects,
 and fresh challenge. JSON hashing alone is not Rust type provenance.
 The checker rejects symlinks, hard-link aliases, post-read mutation, cloned process output,
-and any caller-authored authority or run series.
+and any caller-authored authority or run series. It rejects ambient loader/interpreter/
+plugin injection variables and launches both retained executables with an empty environment.
