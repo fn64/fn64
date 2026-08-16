@@ -51,7 +51,7 @@ pub use ticket::{
     effect_content_digest, BackendCompletionAuthority, BackendEffectReport, CompletedWrite,
     DecodedTicket, GpuCompleteTicket, GpuCompletionReceipt, GuestCommitAuthority,
     GuestCommitEffectReport, GuestCommitReceipt, GuestCommittedTicket, QueueIdentity,
-    SubmissionIdentity, SubmissionQueue, SubmittedTicket, TicketAuthoritySet,
+    ReadySubmissionQueue, SubmissionIdentity, SubmissionQueue, SubmittedTicket, TicketAuthoritySet,
 };
 pub use workload::{
     MicrocodeAdmissionIdentity, WorkloadAdmission, WorkloadPacket, WorkloadPacketPreflight,

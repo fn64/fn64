@@ -8,6 +8,8 @@
 
 use sha2::{Digest, Sha256};
 
+use fn64_render_ir::{PhysicalMemoryLayout, TemporalBoundary};
+
 use crate::{inspect_raw_rdp_full_sync, DpFullSyncStatus, RenderError};
 
 const DPC_ALIGNMENT: u32 = 8;
@@ -194,6 +196,70 @@ pub struct RawDpcSubmissionIdentity {
     pub start: u32,
     pub end: u32,
     pub command_sha256: [u8; 32],
+}
+
+/// One owned exact-source DPC submission captured at CMD_END, bound to the
+/// physical memory layout and transaction identity it belongs to.
+///
+/// This is the sole entry point into the production raw-DPC seam
+/// (`docs/RENDER-WGPU-PORT-PLAN.md`'s TMEM-only vertical slice): unlike
+/// [`RawDpcBatch`], it never creates a synthetic RDRAM suffix and it retains
+/// exactly one submission's original DRAM/XBUS source, range, and payload for
+/// production planning rather than diagnostic staging.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedRawDpcCapture {
+    submission: OwnedRawDpcSubmission,
+    memory_layout: PhysicalMemoryLayout,
+    transaction_sequence: u64,
+    cmd_end: TemporalBoundary,
+}
+
+impl OwnedRawDpcCapture {
+    pub const fn new(
+        submission: OwnedRawDpcSubmission,
+        memory_layout: PhysicalMemoryLayout,
+        transaction_sequence: u64,
+        cmd_end: TemporalBoundary,
+    ) -> Self {
+        Self {
+            submission,
+            memory_layout,
+            transaction_sequence,
+            cmd_end,
+        }
+    }
+
+    pub const fn submission(&self) -> &OwnedRawDpcSubmission {
+        &self.submission
+    }
+
+    pub const fn memory_layout(&self) -> PhysicalMemoryLayout {
+        self.memory_layout
+    }
+
+    pub const fn transaction_sequence(&self) -> u64 {
+        self.transaction_sequence
+    }
+
+    pub const fn cmd_end(&self) -> TemporalBoundary {
+        self.cmd_end
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        OwnedRawDpcSubmission,
+        PhysicalMemoryLayout,
+        u64,
+        TemporalBoundary,
+    ) {
+        (
+            self.submission,
+            self.memory_layout,
+            self.transaction_sequence,
+            self.cmd_end,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -456,9 +522,30 @@ pub struct RawDpcBatchOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fn64_render_ir::DpInterruptState;
 
     fn words(opcode: u8) -> Vec<u32> {
         vec![u32::from(opcode) << 24, 0]
+    }
+
+    #[test]
+    fn owned_capture_retains_exact_source_layout_and_transaction_identity() {
+        let submission =
+            OwnedRawDpcSubmission::from_rdram_words(0x100, 0x108, words(0xe6)).unwrap();
+        let layout = PhysicalMemoryLayout::try_new(0x1000).unwrap();
+        let cmd_end = TemporalBoundary::new(11, DpInterruptState::Clear);
+        let capture = OwnedRawDpcCapture::new(submission.clone(), layout, 7, cmd_end);
+
+        assert_eq!(capture.submission(), &submission);
+        assert_eq!(capture.memory_layout(), layout);
+        assert_eq!(capture.transaction_sequence(), 7);
+        assert_eq!(capture.cmd_end(), cmd_end);
+
+        let (parts_submission, parts_layout, parts_sequence, parts_cmd_end) = capture.into_parts();
+        assert_eq!(parts_submission, submission);
+        assert_eq!(parts_layout, layout);
+        assert_eq!(parts_sequence, 7);
+        assert_eq!(parts_cmd_end, cmd_end);
     }
 
     #[test]
