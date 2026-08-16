@@ -3,7 +3,7 @@
   "maintained_by": "integration lead; rendered by tools/rt64_port_dashboard.py",
   "program": {
     "goal": "Complete the full RT64-to-Rust port: remove fn64's project-owned C++/FFI render boundary; preserve every permitted public RT64 capability; exceed it through measured optimization, modernization, and optional hybrid ray/path tracing; retain exact raster fallback and cross-platform certification.",
-    "updated_utc": "2026-08-16T11:15:26Z",
+    "updated_utc": "2026-08-16T11:18:56Z",
     "program_state": "IN PROGRESS",
     "branch": "main",
     "base_branch": "origin/main",
@@ -1157,8 +1157,8 @@
       "profile": "F",
       "model": "GPT-5.6 Sol",
       "effort": "xhigh",
-      "owner": "integration lead",
-      "branch": "port/m4-tmem-load-execution",
+      "owner": "/root/m4_2_0_transfer_contract",
+      "branch": "port/m4-2-0-transfer-contract",
       "base_branch": "main",
       "writable_paths": [
         "crates/fn64-render-wgpu/src/tmem",
@@ -1168,7 +1168,7 @@
         "crates/fn64-render-wgpu/src/lib.rs"
       ],
       "dependencies": ["M4.1"],
-      "state": "BLOCKED",
+      "state": "RUNNING",
       "findings": [
         "M4.2.0 must first freeze ordered TmemLoadSource accesses plus canonical physical TmemLoadDestination fragments; source-only journal plans are insufficient for effect receipts.",
         "Public RDP authority requires complete 64-bit transfer words, modular 4 KiB addressing, odd-row XOR4, DXT 1.11 carries, and RGBA32 low/high 2 KiB bank splitting.",
@@ -1176,10 +1176,10 @@
         "The implementation can split after the core state engine: LoadTile and LoadBlock executors own disjoint modules, then a frontier integration lane validates exact read/effect identities and publishes atomically after guest commit."
       ],
       "verification_runs": [],
-      "blocker": "M4.1 is not yet reviewed/integrated, and M4.2.0 has not frozen destination-journal fragments or the stronger-authority full-word and starting-row fixtures.",
-      "next_action": "After M4.1 integrates, land the M4.2.0 contract, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.",
+      "blocker": null,
+      "next_action": "Review and integrate M4.2.0, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.",
       "started_utc": "2026-08-16T10:37:19Z",
-      "updated_utc": "2026-08-16T10:37:19Z"
+      "updated_utc": "2026-08-16T11:18:56Z"
     },
     {
       "id": "M4.3",
