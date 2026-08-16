@@ -211,8 +211,8 @@
     <dt>Elapsed</dt><dd>0m (started 2026-08-16T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
     <dt>Verification bar met</dt><dd>0/0 runs</dd>
   </dl>
-  <p><strong>Next action:</strong> Prove one RT64 pass, one explicit divergence/unavailable row, one Rust-pending row, and negative receipt mutations end to end on the active clean branch.</p>
-  <details open><summary>Findings</summary><ul><li>RT64 is an executable compatibility delegate, not universal correctness authority; known defects use hardware or permitted reference authority.</li><li>Ordinary CI must execute every closed row and protect the pending denominator, while port-progress remains nonzero until every required Rust row passes.</li></ul></details>
+  <p><strong>Next action:</strong> Repair the rejected trust boundaries, then repeat independent review before any conformance state or native run count is promoted.</p>
+  <details open><summary>Findings</summary><ul><li>RT64 is an executable compatibility delegate, not universal correctness authority; known defects use hardware or permitted reference authority.</li><li>Ordinary CI must execute every closed row and protect the pending denominator, while port-progress remains nonzero until every required Rust row passes.</li><li>Independent review rejected the first candidate: its RT64 pass observed only fn64 preflight FullSync, its divergence was synthetic, receipt authority was caller-forgeable, and it duplicated the stronger merged fn64-render-ir lifecycle.</li><li>The repair must bind sealed execution-issued evidence and durable run-series receipts to fn64-render-ir identities while retaining all 50 required rows; no RT64 pass or divergence is currently accepted.</li></ul></details>
   <details><summary>Verification runs</summary>
     <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
     <tbody><tr><td colspan="4" class="muted">no verification runs recorded</td></tr></tbody></table>
@@ -255,8 +255,8 @@
     <dt>Elapsed</dt><dd>0m (started 2026-08-16T00:00:00Z, updated 2026-08-16T00:00:00Z)</dd>
     <dt>Verification bar met</dt><dd>0/0 runs</dd>
   </dl>
-  <p><strong>Next action:</strong> Run exact native and fallback fixtures for 10 host processes and report unsupported features distinctly from semantic mismatches.</p>
-  <details open><summary>Findings</summary><ul><li>Capability bits alone do not close a renderer requirement; each native and fallback path must execute and read back exact bytes.</li><li>This ticket owns masks and wrapping arithmetic, TMEM-like addressing, nonuniform arrays, dual-source/manual blending, explicit format conversions, and rejection of unsupported reinterpretation.</li></ul></details>
+  <p><strong>Next action:</strong> Complete the three review repairs, rerun focused review, then repeat 10 final-source host processes for both binaries.</p>
+  <details open><summary>Findings</summary><ul><li>Capability bits alone do not close a renderer requirement; each native and fallback path must execute and read back exact bytes.</li><li>This ticket owns masks and wrapping arithmetic, TMEM-like addressing, nonuniform arrays, dual-source/manual blending, explicit format conversions, and rejection of unsupported reinterpretation.</li><li>Independent review rejected the first receipt shape because it omitted adapter/driver/toolchain identity, used only selector-like 0/255 blend factors, and could report staging geometry before a successful readback.</li><li>The active repair adds configuration-bound receipts, fractional independently expected blending, and typed NotRun/Failed/Passed staging evidence before repeating the host run bar.</li></ul></details>
   <details><summary>Verification runs</summary>
     <table><thead><tr><th>command</th><th>clean</th><th>required</th><th>kind</th></tr></thead>
     <tbody><tr><td colspan="4" class="muted">no verification runs recorded</td></tr></tbody></table>

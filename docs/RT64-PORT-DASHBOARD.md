@@ -220,8 +220,10 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 
 - RT64 is an executable compatibility delegate, not universal correctness authority; known defects use hardware or permitted reference authority.
 - Ordinary CI must execute every closed row and protect the pending denominator, while port-progress remains nonzero until every required Rust row passes.
+- Independent review rejected the first candidate: its RT64 pass observed only fn64 preflight FullSync, its divergence was synthetic, receipt authority was caller-forgeable, and it duplicated the stronger merged fn64-render-ir lifecycle.
+- The repair must bind sealed execution-issued evidence and durable run-series receipts to fn64-render-ir identities while retaining all 50 required rows; no RT64 pass or divergence is currently accepted.
 
-**Next action:** Prove one RT64 pass, one explicit divergence/unavailable row, one Rust-pending row, and negative receipt mutations end to end on the active clean branch.
+**Next action:** Repair the rejected trust boundaries, then repeat independent review before any conformance state or native run count is promoted.
 
 ### `M1.2` -- Place IR authority at real crate boundaries: validated ABI capture, distinct queue submission, backend-owned effect completion, and guest-memory-owner commit with rejection leaving no architectural publication.
 
@@ -262,8 +264,10 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 
 - Capability bits alone do not close a renderer requirement; each native and fallback path must execute and read back exact bytes.
 - This ticket owns masks and wrapping arithmetic, TMEM-like addressing, nonuniform arrays, dual-source/manual blending, explicit format conversions, and rejection of unsupported reinterpretation.
+- Independent review rejected the first receipt shape because it omitted adapter/driver/toolchain identity, used only selector-like 0/255 blend factors, and could report staging geometry before a successful readback.
+- The active repair adds configuration-bound receipts, fractional independently expected blending, and typed NotRun/Failed/Passed staging evidence before repeating the host run bar.
 
-**Next action:** Run exact native and fallback fixtures for 10 host processes and report unsupported features distinctly from semantic mismatches.
+**Next action:** Complete the three review repairs, rerun focused review, then repeat 10 final-source host processes for both binaries.
 
 ## Regenerating
 
