@@ -3,8 +3,9 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ContentDigest, PhysicalMemoryLayout, RawCommandStream, RawStreamKind, RdramResource,
-    ResourceJournal, ResourceRegion, ValidationError, WorkloadIdentity,
+    ContentDigest, DeferredGuestReadCapture, DeferredGuestReadPlan, OwnedGuestReadSet,
+    PhysicalMemoryLayout, RawCommandStream, RawStreamKind, RdramResource, ResourceJournal,
+    ResourceRegion, ValidationError, WorkloadIdentity,
 };
 
 pub const MAX_PACKET_STREAMS: usize = 256;
@@ -62,6 +63,139 @@ pub enum WorkloadAdmission {
     GraphicsTask(MicrocodeAdmissionIdentity),
 }
 
+/// Capture-independent packet admission. Construction validates stream
+/// bounds, temporal order, journal ownership, and the exact deferred read
+/// plan before a memory owner is asked to copy any guest bytes.
+pub struct WorkloadPacketPreflight {
+    memory_layout: PhysicalMemoryLayout,
+    admission: WorkloadAdmission,
+    streams: Vec<RawCommandStream>,
+    journal: ResourceJournal,
+    guest_read_plan: DeferredGuestReadPlan,
+    owned_bytes: usize,
+    chunk_count: usize,
+    timeline_event_count: usize,
+}
+
+impl WorkloadPacketPreflight {
+    pub fn try_new(
+        memory_layout: PhysicalMemoryLayout,
+        admission: WorkloadAdmission,
+        streams: Vec<RawCommandStream>,
+        journal: ResourceJournal,
+    ) -> Result<Self, ValidationError> {
+        let guest_read_plan = DeferredGuestReadPlan::try_from_journal(memory_layout, &journal)?;
+        Self::try_new_with_plan(memory_layout, admission, streams, journal, guest_read_plan)
+    }
+
+    fn try_new_with_plan(
+        memory_layout: PhysicalMemoryLayout,
+        admission: WorkloadAdmission,
+        streams: Vec<RawCommandStream>,
+        journal: ResourceJournal,
+        guest_read_plan: DeferredGuestReadPlan,
+    ) -> Result<Self, ValidationError> {
+        if streams.is_empty() {
+            return Err(ValidationError::EmptyWorkload);
+        }
+        if streams.len() > MAX_PACKET_STREAMS {
+            return Err(ValidationError::TooManyPacketStreams {
+                actual: streams.len(),
+                maximum: MAX_PACKET_STREAMS,
+            });
+        }
+        if !streams
+            .iter()
+            .all(|stream| stream.matches_memory_layout(memory_layout))
+            || !journal.matches_memory_layout(memory_layout)
+        {
+            return Err(ValidationError::MemoryLayoutMismatch {
+                expected: memory_layout.bytes(),
+            });
+        }
+        if guest_read_plan.memory_layout() != memory_layout
+            || guest_read_plan.journal_identity() != journal.identity()
+        {
+            return Err(ValidationError::GuestReadPlanMismatch);
+        }
+
+        let owned_bytes = bounded_sum(
+            streams.iter().map(|stream| stream.byte_len() as usize),
+            MAX_PACKET_COMMAND_BYTES,
+            |actual, maximum| ValidationError::PacketCommandBytesExceeded { actual, maximum },
+        )?;
+        let chunk_count = bounded_sum(
+            streams.iter().map(RawCommandStream::chunk_count),
+            MAX_PACKET_COMMAND_CHUNKS,
+            |actual, maximum| ValidationError::PacketCommandChunksExceeded { actual, maximum },
+        )?;
+        let timeline_event_count = bounded_sum(
+            streams.iter().map(RawCommandStream::timeline_event_count),
+            MAX_PACKET_TIMELINE_EVENTS,
+            |actual, maximum| ValidationError::PacketTimelineEventsExceeded { actual, maximum },
+        )?;
+
+        validate_global_temporal_order(&streams)?;
+        validate_one_to_one_command_reads(&streams, &journal)?;
+        Ok(Self {
+            memory_layout,
+            admission,
+            streams,
+            journal,
+            guest_read_plan,
+            owned_bytes,
+            chunk_count,
+            timeline_event_count,
+        })
+    }
+
+    pub const fn guest_read_plan(&self) -> &DeferredGuestReadPlan {
+        &self.guest_read_plan
+    }
+
+    pub fn finalize(
+        self,
+        guest_read_capture: DeferredGuestReadCapture,
+    ) -> Result<WorkloadPacket, ValidationError> {
+        let guest_reads =
+            OwnedGuestReadSet::try_finalize(self.guest_read_plan, guest_read_capture)?;
+        let identity = identity(
+            self.memory_layout,
+            self.admission,
+            &self.streams,
+            &self.journal,
+            &guest_reads,
+        );
+        Ok(WorkloadPacket {
+            identity,
+            memory_layout: self.memory_layout,
+            admission: self.admission,
+            streams: self.streams.into_boxed_slice(),
+            journal: self.journal,
+            guest_reads,
+            owned_bytes: self.owned_bytes,
+            chunk_count: self.chunk_count,
+            timeline_event_count: self.timeline_event_count,
+        })
+    }
+}
+
+impl fmt::Debug for WorkloadPacketPreflight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkloadPacketPreflight")
+            .field("memory_layout", &self.memory_layout)
+            .field("admission", &self.admission)
+            .field("stream_count", &self.streams.len())
+            .field("journal", &self.journal)
+            .field("guest_read_plan", &self.guest_read_plan)
+            .field("owned_command_bytes", &self.owned_bytes)
+            .field("command_chunk_count", &self.chunk_count)
+            .field("timeline_event_count", &self.timeline_event_count)
+            .finish()
+    }
+}
+
 impl WorkloadAdmission {
     pub(crate) const fn tag(self) -> u8 {
         match self {
@@ -89,6 +223,7 @@ pub struct WorkloadPacket {
     admission: WorkloadAdmission,
     streams: Box<[RawCommandStream]>,
     journal: ResourceJournal,
+    guest_reads: OwnedGuestReadSet,
     owned_bytes: usize,
     chunk_count: usize,
     timeline_event_count: usize,
@@ -101,55 +236,29 @@ impl WorkloadPacket {
         streams: Vec<RawCommandStream>,
         journal: ResourceJournal,
     ) -> Result<Self, ValidationError> {
-        if streams.is_empty() {
-            return Err(ValidationError::EmptyWorkload);
-        }
-        if streams.len() > MAX_PACKET_STREAMS {
-            return Err(ValidationError::TooManyPacketStreams {
-                actual: streams.len(),
-                maximum: MAX_PACKET_STREAMS,
-            });
-        }
-        if !streams
-            .iter()
-            .all(|stream| stream.matches_memory_layout(memory_layout))
-            || !journal.matches_memory_layout(memory_layout)
-        {
-            return Err(ValidationError::MemoryLayoutMismatch {
-                expected: memory_layout.bytes(),
-            });
-        }
+        WorkloadPacketPreflight::try_new(memory_layout, admission, streams, journal)?
+            .finalize(DeferredGuestReadCapture::empty())
+    }
 
-        let owned_bytes = bounded_sum(
-            streams.iter().map(|stream| stream.byte_len() as usize),
-            MAX_PACKET_COMMAND_BYTES,
-            |actual, maximum| ValidationError::PacketCommandBytesExceeded { actual, maximum },
-        )?;
-        let chunk_count = bounded_sum(
-            streams.iter().map(RawCommandStream::chunk_count),
-            MAX_PACKET_COMMAND_CHUNKS,
-            |actual, maximum| ValidationError::PacketCommandChunksExceeded { actual, maximum },
-        )?;
-        let timeline_event_count = bounded_sum(
-            streams.iter().map(RawCommandStream::timeline_event_count),
-            MAX_PACKET_TIMELINE_EVENTS,
-            |actual, maximum| ValidationError::PacketTimelineEventsExceeded { actual, maximum },
-        )?;
-
-        validate_global_temporal_order(&streams)?;
-        validate_one_to_one_command_reads(&streams, &journal)?;
-
-        let identity = identity(memory_layout, admission, &streams, &journal);
-        Ok(Self {
-            identity,
+    /// Finalize one packet after the guest-memory owner captured the exact
+    /// renderer-selected deferred read plan. No retained packet exists on a
+    /// plan, ordering, range, byte-count, or digest mismatch.
+    pub fn try_new_with_guest_reads(
+        memory_layout: PhysicalMemoryLayout,
+        admission: WorkloadAdmission,
+        streams: Vec<RawCommandStream>,
+        journal: ResourceJournal,
+        guest_read_plan: DeferredGuestReadPlan,
+        guest_read_capture: DeferredGuestReadCapture,
+    ) -> Result<Self, ValidationError> {
+        WorkloadPacketPreflight::try_new_with_plan(
             memory_layout,
             admission,
-            streams: streams.into_boxed_slice(),
+            streams,
             journal,
-            owned_bytes,
-            chunk_count,
-            timeline_event_count,
-        })
+            guest_read_plan,
+        )?
+        .finalize(guest_read_capture)
     }
 
     pub const fn identity(&self) -> WorkloadIdentity {
@@ -182,6 +291,14 @@ impl WorkloadPacket {
         &self.journal
     }
 
+    pub const fn guest_reads(&self) -> &OwnedGuestReadSet {
+        &self.guest_reads
+    }
+
+    pub const fn owned_guest_read_bytes(&self) -> usize {
+        self.guest_reads.total_bytes()
+    }
+
     pub const fn owned_command_bytes(&self) -> usize {
         self.owned_bytes
     }
@@ -212,6 +329,7 @@ impl fmt::Debug for WorkloadPacket {
                     .collect::<Vec<_>>(),
             )
             .field("journal", &self.journal)
+            .field("guest_reads", &self.guest_reads)
             .field("owned_command_bytes", &self.owned_bytes)
             .field("command_chunk_count", &self.chunk_count)
             .field("timeline_event_count", &self.timeline_event_count)
@@ -224,9 +342,10 @@ fn identity(
     admission: WorkloadAdmission,
     streams: &[RawCommandStream],
     journal: &ResourceJournal,
+    guest_reads: &OwnedGuestReadSet,
 ) -> WorkloadIdentity {
     let mut hash = Sha256::new();
-    hash.update(b"fn64.render-ir.workload.v2\0");
+    hash.update(b"fn64.render-ir.workload.v3\0");
     hash.update(memory_layout.bytes().to_be_bytes());
     hash.update([admission.tag()]);
     match admission {
@@ -248,6 +367,8 @@ fn identity(
         hash.update((stream.full_sync_occurrences().len() as u32).to_be_bytes());
     }
     hash.update(journal.identity().as_bytes());
+    hash.update(guest_reads.plan_identity().as_bytes());
+    hash.update(guest_reads.identity().as_bytes());
     WorkloadIdentity::new(ContentDigest::from_bytes(hash.finalize().into()))
 }
 

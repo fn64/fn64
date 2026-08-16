@@ -68,9 +68,9 @@ pub use raw_dpc_batch::{
 };
 pub use rdp_completion::{inspect_raw_rdp_full_sync, raw_rdp_command_width};
 pub use render_ir::{
-    decode_raw_dpc_capture, ir_effect_content_digest, CommittedSemanticWorkloadRecord,
-    IrGuestMemoryPreimage, IrGuestMemorySnapshot, IrRawDpcBackendCompletion,
-    StagedIrRdramWrite,
+    decode_raw_dpc_capture, ir_effect_content_digest, preflight_raw_dpc_capture,
+    CommittedSemanticWorkloadRecord, IrGuestMemoryPreimage, IrGuestMemorySnapshot,
+    IrRawDpcBackendCompletion, IrRawDpcPacketPreflight, StagedIrRdramWrite,
 };
 pub use settings::{
     AspectTarget, DownsampleMultiplier, RefreshRateTarget, RenderAntialiasing, RenderAspectRatio,

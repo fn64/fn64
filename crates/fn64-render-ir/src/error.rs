@@ -141,6 +141,38 @@ pub enum ValidationError {
         start: u32,
         end: u32,
     },
+    DeferredGuestReadUnsupportedRegion {
+        access_index: usize,
+        operation: u32,
+    },
+    GuestReadStorageLayoutUnaligned {
+        bytes: u32,
+        alignment: u32,
+    },
+    GuestReadPlanMismatch,
+    GuestReadCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    GuestReadDescriptorMismatch {
+        index: usize,
+    },
+    GuestReadByteCountMismatch {
+        index: usize,
+        expected: u32,
+        actual: u32,
+    },
+    GuestReadAggregateByteCountMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    GuestReadDigestMismatch {
+        index: usize,
+    },
+    ReplayGuestReadCaptureRequired {
+        count: usize,
+    },
+    ReplayGuestReadSetMismatch,
     TicketAuthorityExhausted,
     SubmissionOrdinalExhausted {
         queue: u64,
@@ -335,6 +367,44 @@ impl fmt::Display for ValidationError {
                 formatter,
                 "workload journal CommandDecode access {access_index} for {source:?} [{start:#010x}, {end:#010x}) has no one-to-one stream owner"
             ),
+            Self::DeferredGuestReadUnsupportedRegion { access_index, operation } => write!(
+                formatter,
+                "journal TmemLoadSource access {access_index} (operation {operation}) is not an RDRAM range and cannot cross the ABI guest-memory boundary"
+            ),
+            Self::GuestReadStorageLayoutUnaligned { bytes, alignment } => write!(
+                formatter,
+                "deferred guest-read storage layout length {bytes} is not aligned to its {alignment}-byte native word mapping"
+            ),
+            Self::GuestReadPlanMismatch => formatter.write_str(
+                "deferred guest-read plan does not belong to the packet's exact memory layout and resource journal",
+            ),
+            Self::GuestReadCountMismatch { expected, actual } => write!(
+                formatter,
+                "deferred guest-read capture contains {actual} entries; exact plan requires {expected}"
+            ),
+            Self::GuestReadDescriptorMismatch { index } => write!(
+                formatter,
+                "deferred guest-read capture entry {index} does not match the exact ordered plan operation/range"
+            ),
+            Self::GuestReadByteCountMismatch { index, expected, actual } => write!(
+                formatter,
+                "deferred guest-read capture entry {index} owns {actual} bytes; exact range requires {expected}"
+            ),
+            Self::GuestReadAggregateByteCountMismatch { expected, actual } => write!(
+                formatter,
+                "deferred guest-read capture owns {actual} aggregate bytes; exact plan requires {expected}"
+            ),
+            Self::GuestReadDigestMismatch { index } => write!(
+                formatter,
+                "deferred guest-read capture entry {index} content digest does not match its owned bytes"
+            ),
+            Self::ReplayGuestReadCaptureRequired { count } => write!(
+                formatter,
+                "workload replay requires an owned deferred guest-read capture with {count} entries"
+            ),
+            Self::ReplayGuestReadSetMismatch => formatter.write_str(
+                "replayed deferred guest-read set does not match the record identity/content digests",
+            ),
             Self::TicketAuthorityExhausted => formatter.write_str("ticket role authority identity space is exhausted"),
             Self::SubmissionOrdinalExhausted { queue } => write!(formatter, "submission ordinal space is exhausted for queue {queue}"),
             Self::ReceiptAuthorityMismatch => formatter.write_str("receipt was issued by a different lifecycle role authority"),
@@ -350,7 +420,7 @@ impl fmt::Display for ValidationError {
             ),
             Self::ReceiptSubmissionMismatch => formatter.write_str("completion receipt names a different submission"),
             Self::ReceiptJournalMismatch => formatter.write_str("receipt resource journal identity does not match the active workload"),
-            Self::RecordMagic => formatter.write_str("workload record magic is not fn64.render-ir.record.v2"),
+            Self::RecordMagic => formatter.write_str("workload record magic is not fn64.render-ir.record.v3"),
             Self::RecordVersion { actual } => write!(formatter, "workload record version {actual} is unsupported"),
             Self::RecordTruncated { field } => write!(formatter, "workload record ended while decoding {field}"),
             Self::RecordInvalidTag { field, tag } => write!(formatter, "workload record {field} has invalid tag {tag}"),

@@ -14,6 +14,7 @@ mod address;
 mod command;
 mod digest;
 mod error;
+mod guest_read;
 mod journal;
 mod record;
 mod ticket;
@@ -30,10 +31,14 @@ pub use command::{
     MAX_RAW_STREAM_BYTES,
 };
 pub use digest::{
-    ContentDigest, EffectIdentity, JournalIdentity, RawStreamIdentity, RecordIdentity,
-    WorkloadIdentity,
+    ContentDigest, EffectIdentity, GuestReadPlanIdentity, GuestReadSetIdentity, JournalIdentity,
+    RawStreamIdentity, RecordIdentity, WorkloadIdentity,
 };
 pub use error::ValidationError;
+pub use guest_read::{
+    CapturedGuestRead, DeferredGuestRead, DeferredGuestReadCapture, DeferredGuestReadPlan,
+    OwnedGuestReadSet,
+};
 pub use journal::{
     AccessMode, AccessPurpose, HostResource, OperationId, RdramResource, ResourceAccess,
     ResourceJournal, ResourceJournalLimits, ResourceRegion, MAX_DECLARED_RESOURCE_BYTES,
@@ -49,6 +54,7 @@ pub use ticket::{
     SubmissionIdentity, SubmissionQueue, SubmittedTicket, TicketAuthoritySet,
 };
 pub use workload::{
-    MicrocodeAdmissionIdentity, WorkloadAdmission, WorkloadPacket, MAX_PACKET_COMMAND_BYTES,
-    MAX_PACKET_COMMAND_CHUNKS, MAX_PACKET_STREAMS, MAX_PACKET_TIMELINE_EVENTS,
+    MicrocodeAdmissionIdentity, WorkloadAdmission, WorkloadPacket, WorkloadPacketPreflight,
+    MAX_PACKET_COMMAND_BYTES, MAX_PACKET_COMMAND_CHUNKS, MAX_PACKET_STREAMS,
+    MAX_PACKET_TIMELINE_EVENTS,
 };

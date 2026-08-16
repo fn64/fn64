@@ -2317,6 +2317,7 @@ mod dpc_copy_census;
 /// frame-budget ratio and the wall-versus-virtual ratio are always reported.
 pub mod frame_census;
 mod gbpak;
+mod guest_read_capture;
 mod host;
 mod mesgqueue;
 mod pfs;
@@ -2342,6 +2343,9 @@ pub use cache::*;
 pub use debug::*;
 pub use dispatch::*;
 pub use gbpak::*;
+pub use guest_read_capture::{
+    capture_deferred_guest_reads_from_storage, capture_registered_deferred_guest_reads,
+};
 pub use host::*;
 pub use mesgqueue::*;
 pub use pfs::*;

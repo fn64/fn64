@@ -4,16 +4,17 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AccessMode, AccessPurpose, CmdEndOccurrence, ContentDigest, DmemRange, DpInterruptState,
-    FullSyncOccurrence, HostResource, JournalIdentity, MicrocodeAdmissionIdentity, OperationId,
-    PhysicalMemoryLayout, RawCommandStream, RawStreamIdentity, RawStreamKind, RdramResource,
-    RecordIdentity, ResourceAccess, ResourceJournal, ResourceJournalLimits, ResourceRegion,
-    TmemRange, ValidationError, WorkloadAdmission, WorkloadIdentity, WorkloadPacket,
+    FullSyncOccurrence, GuestReadPlanIdentity, GuestReadSetIdentity, HostResource, JournalIdentity,
+    MicrocodeAdmissionIdentity, OperationId, PhysicalMemoryLayout, RawCommandStream,
+    RawStreamIdentity, RawStreamKind, RdramResource, RecordIdentity, ResourceAccess,
+    ResourceJournal, ResourceJournalLimits, ResourceRegion, TmemRange, ValidationError,
+    WorkloadAdmission, WorkloadIdentity, WorkloadPacket,
 };
 
-pub const WORKLOAD_RECORD_SCHEMA: &str = "fn64.render-ir.record.v2";
+pub const WORKLOAD_RECORD_SCHEMA: &str = "fn64.render-ir.record.v3";
 pub const MAX_WORKLOAD_RECORD_BYTES: usize = 8 * 1024 * 1024;
-const MAGIC: &[u8; 8] = b"F64RIR02";
-const VERSION: u16 = 2;
+const MAGIC: &[u8; 8] = b"F64RIR03";
+const VERSION: u16 = 3;
 const INTEGRITY_BYTES: usize = 32;
 const CMD_END_RECORD_BYTES: usize = 4 + 8 + 4 + 1;
 const FULL_SYNC_RECORD_BYTES: usize = 5 * 4 + 2 * 8 + 2;
@@ -223,6 +224,9 @@ pub struct WorkloadRecord {
     admission: WorkloadAdmission,
     streams: Box<[RawStreamRecord]>,
     journal: ResourceJournal,
+    guest_read_plan: GuestReadPlanIdentity,
+    guest_read_set: GuestReadSetIdentity,
+    guest_read_contents: Box<[ContentDigest]>,
 }
 
 impl WorkloadRecord {
@@ -237,6 +241,14 @@ impl WorkloadRecord {
                 .map(RawStreamRecord::from_stream)
                 .collect(),
             journal: packet.journal().clone(),
+            guest_read_plan: packet.guest_reads().plan_identity(),
+            guest_read_set: packet.guest_reads().identity(),
+            guest_read_contents: packet
+                .guest_reads()
+                .reads()
+                .iter()
+                .map(|read| read.content())
+                .collect(),
         }
     }
 
@@ -258,6 +270,18 @@ impl WorkloadRecord {
 
     pub const fn journal(&self) -> &ResourceJournal {
         &self.journal
+    }
+
+    pub const fn guest_read_plan_identity(&self) -> GuestReadPlanIdentity {
+        self.guest_read_plan
+    }
+
+    pub const fn guest_read_set_identity(&self) -> GuestReadSetIdentity {
+        self.guest_read_set
+    }
+
+    pub fn guest_read_content_digests(&self) -> &[ContentDigest] {
+        &self.guest_read_contents
     }
 
     /// Encode no command bytes: only source geometry, temporal boundaries,
@@ -297,6 +321,12 @@ impl WorkloadRecord {
             }
         }
         encode_journal(&mut body, &self.journal);
+        body.extend_from_slice(&self.guest_read_plan.as_bytes());
+        body.extend_from_slice(&self.guest_read_set.as_bytes());
+        put_u32(&mut body, self.guest_read_contents.len() as u32);
+        for digest in &self.guest_read_contents {
+            body.extend_from_slice(digest.as_ref());
+        }
         let integrity = record_digest(&body);
         body.extend_from_slice(&integrity.as_bytes());
         body
@@ -439,6 +469,44 @@ impl WorkloadRecord {
             streams.push(stream);
         }
         let journal = decode_journal(&mut reader, memory_layout)?;
+        let guest_read_plan = GuestReadPlanIdentity::new(ContentDigest::from_bytes(
+            reader.array("deferred guest-read plan identity")?,
+        ));
+        let guest_read_set = GuestReadSetIdentity::new(ContentDigest::from_bytes(
+            reader.array("owned guest-read set identity")?,
+        ));
+        let guest_read_count = reader.count_sized(
+            "deferred guest-read content digest count",
+            crate::MAX_RESOURCE_ACCESSES,
+            32,
+        )?;
+        let mut guest_read_contents = Vec::with_capacity(guest_read_count);
+        for _ in 0..guest_read_count {
+            guest_read_contents.push(ContentDigest::from_bytes(
+                reader.array("deferred guest-read content digest")?,
+            ));
+        }
+        let plan = crate::DeferredGuestReadPlan::try_from_journal(memory_layout, &journal)?;
+        if guest_read_plan != plan.identity() {
+            return Err(ValidationError::GuestReadPlanMismatch);
+        }
+        if guest_read_contents.len() != plan.reads().len() {
+            return Err(ValidationError::GuestReadCountMismatch {
+                expected: plan.reads().len(),
+                actual: guest_read_contents.len(),
+            });
+        }
+        let derived_set = crate::guest_read::set_identity_from_digests(
+            guest_read_plan,
+            journal.identity(),
+            plan.reads()
+                .iter()
+                .copied()
+                .zip(guest_read_contents.iter().copied()),
+        );
+        if guest_read_set != derived_set {
+            return Err(ValidationError::ReplayGuestReadSetMismatch);
+        }
         if reader.remaining() != 0 {
             return Err(ValidationError::RecordTrailingBytes {
                 bytes: reader.remaining(),
@@ -450,6 +518,9 @@ impl WorkloadRecord {
             admission,
             streams: streams.into_boxed_slice(),
             journal,
+            guest_read_plan,
+            guest_read_set,
+            guest_read_contents: guest_read_contents.into_boxed_slice(),
         })
     }
 
@@ -459,6 +530,19 @@ impl WorkloadRecord {
     pub fn replay(
         &self,
         streams: Vec<RawCommandStream>,
+    ) -> Result<WorkloadPacket, ValidationError> {
+        if !self.guest_read_contents.is_empty() {
+            return Err(ValidationError::ReplayGuestReadCaptureRequired {
+                count: self.guest_read_contents.len(),
+            });
+        }
+        self.replay_with_guest_reads(streams, crate::DeferredGuestReadCapture::empty())
+    }
+
+    pub fn replay_with_guest_reads(
+        &self,
+        streams: Vec<RawCommandStream>,
+        guest_read_capture: crate::DeferredGuestReadCapture,
     ) -> Result<WorkloadPacket, ValidationError> {
         if streams.len() != self.streams.len() {
             return Err(ValidationError::ReplayStreamCount {
@@ -471,12 +555,27 @@ impl WorkloadRecord {
                 return Err(ValidationError::ReplayStreamMismatch { index });
             }
         }
-        let packet = WorkloadPacket::try_new(
+        let plan =
+            crate::DeferredGuestReadPlan::try_from_journal(self.memory_layout, &self.journal)?;
+        let packet = WorkloadPacket::try_new_with_guest_reads(
             self.memory_layout,
             self.admission,
             streams,
             self.journal.clone(),
+            plan,
+            guest_read_capture,
         )?;
+        if packet.guest_reads().plan_identity() != self.guest_read_plan
+            || packet.guest_reads().identity() != self.guest_read_set
+            || packet
+                .guest_reads()
+                .reads()
+                .iter()
+                .map(|read| read.content())
+                .ne(self.guest_read_contents.iter().copied())
+        {
+            return Err(ValidationError::ReplayGuestReadSetMismatch);
+        }
         if packet.identity() != self.workload {
             return Err(ValidationError::RecordIdentityMismatch {
                 expected: self.workload,
@@ -659,7 +758,7 @@ fn decode_region(
 
 fn record_digest(body: &[u8]) -> ContentDigest {
     let mut hash = Sha256::new();
-    hash.update(b"fn64.render-ir.record-integrity.v2\0");
+    hash.update(b"fn64.render-ir.record-integrity.v3\0");
     hash.update(body);
     ContentDigest::from_bytes(hash.finalize().into())
 }
@@ -822,7 +921,7 @@ mod tests {
         assert_eq!(decoded.record_identity(), record.record_identity());
         assert_eq!(
             record.record_identity().to_string(),
-            "4e6c0e4f444e2215e526dbf50925834ff2efd01687084aa5acf63f179c5845d9"
+            "97d61c482d51989810b9420669f6195f44d9f783155606299a2e56f6fc5229c8"
         );
         let replayed = decoded.replay(packet.streams().to_vec()).unwrap();
         assert_eq!(replayed.identity(), packet.identity());
@@ -843,6 +942,20 @@ mod tests {
     fn record_corruption_is_loud_before_metadata_is_used() {
         let mut encoded = WorkloadRecord::from_packet(&packet(0xe9, 77)).encode();
         encoded[20] ^= 0x80;
+        assert_eq!(
+            WorkloadRecord::decode(&encoded).unwrap_err(),
+            ValidationError::RecordIntegrityMismatch
+        );
+    }
+
+    #[test]
+    fn v2_integrity_domain_cannot_authenticate_a_v3_record() {
+        let mut encoded = WorkloadRecord::from_packet(&packet(0xe9, 77)).encode();
+        let body_len = encoded.len() - INTEGRITY_BYTES;
+        let mut hash = Sha256::new();
+        hash.update(b"fn64.render-ir.record-integrity.v2\0");
+        hash.update(&encoded[..body_len]);
+        encoded[body_len..].copy_from_slice(&hash.finalize());
         assert_eq!(
             WorkloadRecord::decode(&encoded).unwrap_err(),
             ValidationError::RecordIntegrityMismatch

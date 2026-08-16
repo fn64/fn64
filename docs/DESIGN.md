@@ -101,6 +101,39 @@ bounded map/readback, and exact byte comparison. This is lifecycle mechanism
 evidence only: it does not claim general RDP decode, VI, presentation, RT64
 parity, or performance.
 
+M4.0 replaces the next whole-memory temptation with an owned deferred-read
+boundary before broader TMEM work begins. Renderer preflight projects every
+RDRAM `TmemLoadSource` access from the exact ordered `ResourceJournal` into a
+move-only, renderer-neutral plan; it neither borrows nor reads RDRAM. The ABI
+memory owner then bounds that plan against the installed physical layout and
+copies only the named half-open ranges through fn64's canonical N64Recomp
+byte-lane mapping into N64-logical-order owned bytes. Finalization consumes
+the plan and capture and requires exact access index, operation ID, resource,
+range, order, byte length, and content digest before it can construct a
+`WorkloadPacket`. The packet identity and content-silent v3 replay record bind
+the resulting read-set identity and per-read digests; replay must supply the
+same owned bytes again. A missing, extra, reordered, overlapping substitute,
+layout alias, short/long capture, or digest mutation therefore fails before a
+packet or record can be retained. No renderer type retains an RDRAM pointer or
+borrow, and the normal capture path allocates only the sum of declared reads,
+not an eight-MiB snapshot.
+
+Version 3 is an intentional wire break: its magic, version, workload identity,
+and integrity domain all changed together, and the decoder rejects v2 records
+rather than treating a record without a guest-read identity as an empty plan.
+The cross-language replay golden is mechanically rebound to the v3 bytes;
+retained v2 evidence remains interpretable only through its pinned v2
+verifier, never through this decoder.
+
+This first slice is an executable synthetic cross-crate mechanism proof. It
+does not migrate production DPC dispatch, decode texture commands, populate
+TMEM, prove a GPU upload, change guest scheduling, or establish RT64 parity or
+performance. `fn64-abi` owns only bounds, byte-lane translation, and capture;
+the renderer remains the sole owner of which semantic reads are required.
+Provenance: fn64's resource-journal contract above and the N64Recomp-generated
+`MEM_*` storage mapping documented in this file's RDRAM section; no reference
+runtime implementation was consulted.
+
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
 Rust: the scheduler, message-queue semantics, timer wheel, rdram buffer
 ownership, and the diagnostic/watch hooks. It has no knowledge that it is
