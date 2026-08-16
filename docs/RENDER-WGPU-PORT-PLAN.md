@@ -42,12 +42,12 @@ reserving authority, parity, performance, and integration claims for the lead.
 | program state | **IN PROGRESS** |
 | execution wave | **ACCEL-A -- port spine and evidence in parallel** |
 | active milestones | **M0 authority/baseline, M2 shader/tool feasibility, M3 raw-DPC vertical slice, and M4 base RDP/TMEM correctness (all IN PROGRESS)** |
-| active slices | M0.3 matched native baseline; M2.5.1 reference-valid shader corpus mechanism; M4.1 typed texture/TMEM command and state decoding |
-| active ownership | `F/xhigh` integration lead; `F/xhigh` M2.5.1 source/tool authority owner; `F/high` M4.1 TMEM wire/state owner; independent reviewers remain serialized from writers |
-| last completed result | local `main` contains M4.0's owned deferred guest-read mechanism (`d8c0d4b1`) after M3.3's bounded real-wgpu raster/VI/guest-commit slice (`35116c76`) |
-| next concrete decision | independently review and integrate M2.5.1 and M4.1, then execute the complete reference-valid shader corpus while starting bounded TMEM load/decode execution |
+| active slices | M2.5.1 external reference-valid shader qualification; M4.2a transactional physical TMEM state; A0 workflow frontier maintenance |
+| active ownership | `F/xhigh` integration lead; `F/xhigh` M2.5.1 evidence reviewer/producer; `F/xhigh` M4.2a physical-state owner; independent reviewers remain serialized from writers |
+| last completed result | local `main` contains M4.2.0's typed transfer contract (`75e9025f`), the scalar-layout validator contract (`f967d32f`), and A0.5's deterministic workflow frontier (`05c7c88b`) |
+| next concrete decision | independently accept or reject the fresh M2.5.1 validator receipt before any 56-row corpus run, and independently review M4.2a before parallel LoadTile/LoadBlock execution |
 | evidence blockers | no matched private-game RT64 performance baseline exists; the original M2.5 gate is split because required ShaderNonUniform SPIR-V semantics are rejected by Naga 30; production DPC dispatch still does not consume the new owned-read path |
-| verification claim | M4.0 passed 10/10 full render-IR/render/ABI suites and real C smoke but is a synthetic mechanism, not production dispatch/TMEM/GPU/parity evidence; M2.5 has no complete corpus claim |
+| verification claim | M4.2.0 passed 10/10 full renderer suites and freezes plans only; M2.5.1 has one unaccepted external validator/smoke candidate and no complete corpus claim; A0.5 passed its final-source 10/10 dashboard gate |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
 counts are in [`RT64-PORT-DASHBOARD.md`](RT64-PORT-DASHBOARD.md), generated
@@ -971,10 +971,11 @@ The accelerated wave keeps dependency-safe work active in parallel:
     dispatch, or claim parity/performance. Independent review closed address
     width, provenance, cross-layout latch, detached-plan, LoadBlock-bound, and
     TLUT-admission defects; the 95-unit/nine-doctest suite passed 10/10.
-18. **M4.2 -- execute physical TMEM loads (BLOCKED ON M4.1/M4.2.0).** First
-    freeze exact source and canonical physical-destination journal fragments,
-    full 64-bit transfer-word validity, and starting-row fixtures. Then land a
-    4 KiB typed byte/validity/epoch state engine, parallel `LoadTile` and
+18. **M4.2 -- execute physical TMEM loads (RUNNING; M4.2.0 INTEGRATED, `75e9025f`).**
+    Exact source and canonical physical-destination journal fragments, full
+    64-bit transfer-word validity, and starting-row fixtures are frozen. The
+    active M4.2a lane now owns a 4 KiB typed byte/validity/epoch state engine;
+    after its review, parallel `LoadTile` and
     `LoadBlock` executors, and one frontier integration that consumes M4.0
     reads, receipts every device-local effect, and publishes durable state only
     after guest commit. Public hardware authority overrides RT64's known
