@@ -110,6 +110,18 @@
 //! general gfx-task/presentation support. See `docs/DESIGN.md`'s "T3 Phase
 //! A/B" section for the full account.
 //!
+//! `raw_dpc::triangle` decodes all eight raw RDP triangle opcodes
+//! (`0x08..=0x0f`) into `RawTriangle`: tile/level/flip, signed YL/YM/YH,
+//! signed Q16.16 XL/XH/XM and their three edge slopes, and every present raw
+//! shade/texture/depth coefficient word (opaque `RawWord` pairs, no float
+//! conversion). `RawDpcCommandKind::RawTriangle` wires it into
+//! `decode_raw_dpc`; the T1 production adapter rejects it exactly like every
+//! other command kind outside its TMEM/state subset -- loudly, never
+//! silently. It adds no edge walk, rasterization, RDP state-machine
+//! transition, clipping/scissor, texture sampling, combiner/blender/depth/
+//! target write, GPU pipeline, production dispatch, or parity/performance
+//! claim. See the crate README's "Raw RDP triangle command decode" section.
+//!
 //! Downstream callers cannot relabel logical source bytes as physical TMEM
 //! lanes; the bounded assertion constructor is crate-private:
 //!
@@ -345,9 +357,11 @@ pub use native_contract::{
 };
 pub use production::{WgpuBackend, WgpuBackendConstructionError, WgpuRawDpcExecutionError};
 pub use raw_dpc::{
-    decode_raw_dpc, decode_raw_dpc_after, push_decoded_raw_dpc, BoundTmemTransfer, DecodedRawDpc,
-    DecodedRawDpcCommand, FillRectangle, RawDpcCommandKind, RawDpcCommandLocation,
-    RawDpcDecodeError, RawDpcResourcePlan, TmemLoadSourcePlanError, UnadmittedRawDpcCommand,
+    decode_raw_dpc, decode_raw_dpc_after, push_decoded_raw_dpc, triangle_word_count,
+    BoundTmemTransfer, CoefficientWords, DecodedRawDpc, DecodedRawDpcCommand, DepthWords,
+    FillRectangle, RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError,
+    RawDpcResourcePlan, RawTriangle, RawWord, TmemLoadSourcePlanError, TriangleDecodeError,
+    TriangleFlags, UnadmittedRawDpcCommand,
 };
 pub use shader_manifest::{
     DirectTexelDecodeDeviceProfile, DirectTexelDecodeNativeError, DirectTexelDecodeNativeReceipt,

@@ -868,3 +868,40 @@ framebuffer-read problem, draw-call integration, and native GPU execution are
 out of scope — this module only decides `Pass`/`Reject`/`Unsupported`, never
 a byte write. It consumes `crate::state::DepthMode` as its mode parameter
 without redefining or re-exporting it, and does not modify `state.rs`.
+
+## Raw RDP triangle command decode
+
+`raw_dpc::triangle` (re-exported as `RawTriangle`/`TriangleFlags`/
+`RawWord`/`CoefficientWords`/`DepthWords`/`triangle_word_count`/
+`TriangleDecodeError`) decodes all eight raw RDP triangle opcodes
+(`0x08..=0x0f`), and `RawDpcCommandKind` gained a `RawTriangle(RawTriangle)`
+variant so `decode_raw_dpc` admits them like every other command kind. Field
+layout, block order, and the base(4)/shade(8)/texture(8)/depth(2) 64-bit
+word counts come from the permitted MIT RT64 source (`src/hle/rt64_rdp.h`'s
+`RDPTriangle` enum and `triangleBaseWords`/`triangleShadeWords`/
+`triangleTexWords`/`triangleDepthWords`; `src/gbi/rt64_gbi_rdp.cpp`'s
+`getTrianglePointers`/`decodeTriangles`) and the public SGI *RDP Command
+Summary* triangle command sections; `fn64-render::raw_rdp_command_width`
+already proved the exact eight stride values this decoder decodes against,
+and a colocated test cross-checks the two tables agree for every opcode.
+
+What is decoded: the low three opcode bits (Depth/Textured/Shaded, RT64's
+`RDPTriangle` bit layout); tile index and mip level; the right-major (flip)
+bit; signed YL/YM/YH; signed Q16.16 XL/XH/XM and their three edge slopes
+(dXL/dY, dXH/dY, dXM/dY); every present raw shade, texture, and depth
+coefficient word, retained as opaque `RawWord` pairs (no float conversion,
+no per-channel/per-axis field splitting). A truncated command slice is
+rejected before any optional block is read -- the length is checked once,
+against the caller-supplied exact width, before any word is interpreted.
+
+What is explicitly not yet done: no float conversion of any coefficient
+(shade/texcoord/depth base+slope math stays RT64's job, ported separately
+and named distinctly if it lands), no edge walk, no scanline/coverage
+generation, no rasterization, no RDP state-machine transition (the base
+Edge command carries no `RdpState` field any neighbor command already
+models), no clipping/scissor, no texture sampling, no combiner/blender/
+depth/target write, no GPU pipeline, no production-dispatch wiring (the T1
+`production_adapter` seam rejects `RawTriangle` exactly like `NoOp`/
+`SetOtherMode`/`FillRectangle`/`FullSync` -- loudly, as `UnadmittedRawDpcCommand`,
+never silently dropped), and no RT64 parity or performance claim of any
+kind.
