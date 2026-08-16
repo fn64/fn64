@@ -899,10 +899,11 @@ The accelerated wave keeps dependency-safe work active in parallel:
     cover integer and TMEM-like operations, binding-array indexing,
     fractional dual-source/manual blend, explicit format conversion/I/O, and
     invalid reinterpret rejection.
-11. **M2.3 -- execute Metal submission/coverage (IN PROGRESS).** Prove exact
-    single-queue completion and timestamp validity after pipeline prewarm, plus
-    the shader-compute eight-sample N64 coverage fallback. Hardware MSAA stays
-    a separately labeled, non-authoritative enhancement.
+11. **M2.3 -- execute Metal submission/coverage (INTEGRATED).** Exact host
+    receipts prove single-queue completion, timestamp validity after
+    application pipeline prewarm, and the shader-compute eight-sample mask
+    primitive. Hardware MSAA stays a separately labeled, non-authoritative
+    enhancement, and full RDP coverage remains M4 work.
 12. **M2.4 -- qualify the HLSL artifact producer (READY).** Use an isolated,
     pinned [official DXC source](https://github.com/microsoft/DirectXShaderCompiler)
     build and its documented
@@ -911,9 +912,10 @@ The accelerated wave keeps dependency-safe work active in parallel:
     source/tool/flags/include/output receipts. The fn64 runtime and ordinary
     build consume only accepted artifacts through wgpu; they do not acquire
     DXC, CMake, or the upstream unqualified `dxc-bin`.
-13. **M3.1 -- build the first raw-DPC replay spine (READY AFTER M1.2/M2.3
-    REVIEW).** Drive the smallest decode-to-headless-frame path before broad
-    opcode or feature-family ports.
+13. **M3.1 -- build the first raw-DPC replay spine (READY).** Drive the
+    smallest decode-to-headless-frame path before broad opcode or
+    feature-family ports, consuming the accepted M1.2 lifecycle and M2.3
+    submission evidence.
 
 ### M0 evidence ledger
 

@@ -19,7 +19,7 @@
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:2, READY:1, RUNNING:1 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:3, READY:1 |
 | `M3` | `PLANNED` | Raw-DPC vertical slice | none |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
@@ -308,21 +308,40 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M2` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `P` / `high` / GPT-5.6 Sol |
 | owner | Metal submission and coverage writer |
 | branch | `port/m2-metal-submission` -> `main` |
 | dependencies | `M2.2` |
 | writable paths | `probes/m2-wgpu-metal-headless` |
 | started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| verification runs meeting bar | 3/3 |
 
 **Findings:**
 
 - Current public wgpu exposes one physical queue; this ticket proves exact serialized completion and keeps semantic queue identities separate from native multi-queue claims.
 - Programmable hardware sample locations are unavailable through public wgpu, so exact N64 coverage is a shader-compute correctness path while fixed hardware MSAA remains an optional non-authoritative enhancement.
+- Independent review rejected the first classifier because NotRun and timestamp-advertisement contradictions could fall through to success. The accepted implementation uses exhaustive positive predicates: every NotRun, failure, mismatch, malformed pass, or contradiction exits 2; only a genuinely unadvertised timestamp feature can produce typed unsupported exit 78.
+- The accepted submission receipt proves application-owned pipeline precreation, exact one-queue completion, host observation of callback readiness after each exact wait, and ordered nonzero timestamps. It does not prove hidden driver compilation or performance.
+- The accepted coverage receipt proves only the public eight-sample mask primitive. It does not prove top-left rules, edge arithmetic, coverage accumulation, or full RDP raster parity; 4x hardware MSAA remains explicitly non-authoritative.
+- Shared probe support can serialize a null binary digest if executable hashing fails. This cohort required one stable non-null digest in its external validator; future unattended receipt consumers must make that invariant fail closed.
 
-**Next action:** Execute Cards D and F with configuration-bound receipts, 20 submission processes, 10 coverage processes, and independent review.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `metal_submission final-source host process` | 20 | 20 | concurrency |
+| `metal_coverage_fallback final-source host process` | 10 | 10 | deterministic |
+| `cargo test --locked --all-targets` | 10 | 10 | deterministic |
+
+**Next action:** Use the exact submission lifecycle and shader-compute coverage primitive in M3.1's bounded wgpu renderer spine; keep full raster coverage parity in M4 and require non-null executable identity from any unattended receipt consumer.
+
+**Retrospective:**
+
+- Friction: Several successful GPU runs hid a fail-open receipt classifier and an intermittent zero timestamp when queries were resolved in the producer submission.
+- Cause: Negative outcome variants were added without enumerating the only accepted positive states, and query availability was assumed before exact producer completion.
+- Prevention: Every probe classifier now starts from exhaustive positive predicates and table-tests all variant/advertisement combinations; timestamp queries use a typed three-submission producer, completion, then resolve lifecycle.
+- Estimated minutes saved: 30
 
 ### `M2.4` -- Qualify a licensed reproducible HLSL-to-SPIR-V artifact producer for the complete admitted RT64 shader corpus without adding DXC, CMake, or project-owned C++ to fn64's runtime or ordinary build graph.
 
