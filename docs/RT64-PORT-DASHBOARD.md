@@ -383,8 +383,10 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - This tooling decision does not block a minimal handwritten M3 vertical-slice shader, but the complete M4 shader corpus and parity claim require the qualified producer. WGSL source modernization remains a post-parity step.
 - Independent review rejected the first mechanism because its nested validator build inherited unreceipted ancestor Cargo/linker configuration, so the claimed isolated source-build closure was incomplete.
 - The first producer also validated source once and copied denominator hashes into dependency records while invoking preprocess/compile separately, leaving an include/source TOCTOU window. Production must use an immutable hash-verified staged snapshot or equivalent descriptor-stable checks.
+- Rereview rejected the initial repair because ordinary Git object resolution honored replacement refs: a requested pin could resolve a different tree while HEAD still appeared pinned.
+- Rereview also found complete materialized byte/mode/index-mask verification only before configure/build; receipt verification allowed the weaker non-complete audit. Exact source authority must be rechecked after build and again while verifying the receipt.
 
-**Next action:** Repair validator build isolation and compile every row from an immutable hash-verified staged shader snapshot, add hostile ambient-config and source-mutation tests, then repeat independent review before the 10-run bar.
+**Next action:** Disable and reject Git replacement-object resolution, require complete materialized source audits before and after DXC build and during receipt verification, add hostile replacement/post-build drift tests, then repeat independent review before the 10-run bar.
 
 ### `M3.1` -- Create fn64-render-wgpu and execute one receipt-bearing synthetic fill plus FullSync packet through the merged IR and exact wgpu submission lifecycle, without ABI or shell policy.
 
