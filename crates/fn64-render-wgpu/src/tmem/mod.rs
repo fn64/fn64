@@ -8,12 +8,17 @@
 //! [`docs/RENDER-WGPU-PORT-PLAN.md`](../../../../docs/RENDER-WGPU-PORT-PLAN.md)
 //! M4.1 scope. M4.2.0's transfer-word/effect-union split follows public
 //! Programming Manual section 13.9; undefined word padding is never promoted
-//! to defined texture content. YUV and TLUT retain source-only deferred
-//! contracts until their destination rules are frozen. M4.2a consumes those
-//! exact plans into one packet-local physical-state transaction, retaining
-//! intermediate load effects across overlaps and publishing durable state only
-//! after exact GPU and guest lifecycle evidence. RT64 is not hardware authority
-//! for this module.
+//! to defined texture content. YUV retains a source-only deferred contract
+//! until its destination rules are frozen. TLUT's destination transfer-plan
+//! geometry (M4.3.1) and physical-lane mask (M4.3.1b) are frozen; TLUT's own
+//! destination execution is still deferred. Each transfer word's defined
+//! destination-byte mask is a distinct, checked fact from its defined
+//! source-byte mask -- equal by construction for Block/Tile, but not for
+//! TLUT, whose 2 captured source bytes quadricate into 8 defined destination
+//! bytes. M4.2a consumes those exact plans into one packet-local
+//! physical-state transaction, retaining intermediate load effects across
+//! overlaps and publishing durable state only after exact GPU and guest
+//! lifecycle evidence. RT64 is not hardware authority for this module.
 
 mod execute;
 mod physical;

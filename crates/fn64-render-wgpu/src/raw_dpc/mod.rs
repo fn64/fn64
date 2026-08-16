@@ -404,6 +404,8 @@ fn transfer_record(
             source_access_byte_offset,
             plan.defined_source_byte_mask(index)
                 .map_err(|_| TmemLoadSourcePlanError::AccessDescriptorsDiffer)?,
+            plan.defined_destination_byte_mask(index)
+                .map_err(|_| TmemLoadSourcePlanError::AccessDescriptorsDiffer)?,
             geometry.destination_word(),
             geometry.row_advance(),
             geometry.odd_row_exchange(),

@@ -763,6 +763,26 @@ impl TmemTransferPlan {
         })
     }
 
+    /// Reports which of the destination word's 8 bytes hold defined TMEM
+    /// content after this transfer -- distinct from
+    /// [`defined_source_byte_mask`](Self::defined_source_byte_mask), which
+    /// names captured *source* bytes. For Block/Tile the two masks are equal:
+    /// every defined destination byte is copied from its own captured source
+    /// byte, one-for-one. TLUT is the one kind where they diverge: only 2
+    /// source bytes are captured per entry (`defined_source_byte_mask` stays
+    /// `0x03`), but hardware quadricates them into all 8 destination bytes
+    /// (`undefined_padding_bytes` is 0 for `Tlut`), so every lane is real,
+    /// defined content.
+    pub fn defined_destination_byte_mask(self, word: u16) -> Result<u8, &'static str> {
+        if word >= self.transfer_words {
+            return Err("TMEM transfer word index is outside the declared plan");
+        }
+        if matches!(self.kind, TmemLoadKind::Tlut { .. }) {
+            return Ok(0xff);
+        }
+        self.defined_source_byte_mask(word)
+    }
+
     /// Returns the public odd-row exchange selector for one complete 64-bit
     /// transfer word. LoadBlock's DXT accumulator starts at the command's TL;
     /// rebasing every block to row zero loses that first-row parity.
@@ -795,6 +815,7 @@ pub struct TmemTransferWord {
     source_access_index: u32,
     source_access_byte_offset: u32,
     defined_source_byte_mask: u8,
+    defined_destination_byte_mask: u8,
     destination_word: u16,
     row_advance: u16,
     odd_row_exchange: bool,
@@ -802,24 +823,45 @@ pub struct TmemTransferWord {
 }
 
 impl TmemTransferWord {
+    /// Mints one checked transfer word. `defined_destination_byte_mask` must
+    /// be a nonzero low-bit-prefix mask (see
+    /// [`TmemTransferPlan::defined_destination_byte_mask`]) whose popcount is
+    /// at least `defined_source_byte_mask`'s -- a destination can never claim
+    /// fewer defined bytes than the source bytes it was built from. Both
+    /// masks are minted exclusively from
+    /// [`TmemTransferPlan`](TmemTransferPlan)'s own
+    /// `defined_source_byte_mask`/`defined_destination_byte_mask`; no caller
+    /// chooses either independently.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) const fn new(
+    pub(crate) fn new(
         index: u16,
         logical_source_offset: u32,
         source_access_index: u32,
         source_access_byte_offset: u32,
         defined_source_byte_mask: u8,
+        defined_destination_byte_mask: u8,
         destination_word: u16,
         row_advance: u16,
         odd_row_exchange: bool,
         physical: TmemTransferPhysicalWord,
     ) -> Self {
+        debug_assert!(
+            defined_destination_byte_mask != 0
+                && (defined_destination_byte_mask & defined_destination_byte_mask.wrapping_add(1))
+                    == 0,
+            "defined_destination_byte_mask must be a nonzero low-bit prefix"
+        );
+        debug_assert!(
+            defined_source_byte_mask.count_ones() <= defined_destination_byte_mask.count_ones(),
+            "a TMEM transfer word cannot claim fewer defined destination bytes than captured source bytes"
+        );
         Self {
             index,
             logical_source_offset,
             source_access_index,
             source_access_byte_offset,
             defined_source_byte_mask,
+            defined_destination_byte_mask,
             destination_word,
             row_advance,
             odd_row_exchange,
@@ -845,6 +887,10 @@ impl TmemTransferWord {
 
     pub const fn defined_source_byte_mask(self) -> u8 {
         self.defined_source_byte_mask
+    }
+
+    pub const fn defined_destination_byte_mask(self) -> u8 {
+        self.defined_destination_byte_mask
     }
 
     pub const fn destination_word(self) -> u16 {

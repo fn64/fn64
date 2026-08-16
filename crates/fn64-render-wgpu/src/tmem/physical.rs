@@ -1247,26 +1247,39 @@ const fn mask_is_low_prefix(mask: u8) -> bool {
 /// Converts only the accepted word's defined-lane shape. Actual logical
 /// source bytes are never inspected or rearranged here; M4.2b's LoadTile and
 /// M4.2c's LoadBlock executors own that source-to-physical payload mapping.
-/// Linear odd rows exchange their two
-/// four-byte halves, so an odd-row two-byte tail occupies mask `0x30` rather
-/// than the logical-prefix mask `0x03`. Split-bank lane order is low[0..4]
-/// followed by high[0..4], so one four-byte RGBA32 texel occupies mask 0x33.
+///
+/// The physical lane mask is derived from `defined_destination_byte_mask`,
+/// not `defined_source_byte_mask`: those two coincide for Block/Tile (every
+/// defined destination byte is copied one-for-one from its own captured
+/// source byte) but diverge for TLUT, where 2 captured source bytes are
+/// quadricated into 8 defined destination bytes. Using the source mask here
+/// for TLUT would falsely reject its correct 8-lane payload and, if the check
+/// were loosened to accept a 2-lane payload instead, would mark 6 of 8 real
+/// destination bytes invalid -- contradicting `undefined_padding_bytes() ==
+/// 0` for `Tlut`. Linear odd rows exchange their two four-byte halves, so an
+/// odd-row two-byte tail occupies mask `0x30` rather than the logical-prefix
+/// mask `0x03`. Split-bank lane order is low[0..4] followed by high[0..4], so
+/// one four-byte RGBA32 texel occupies mask 0x33.
 fn physical_defined_lane_mask(word: TmemTransferWord) -> Result<u8, PhysicalTmemError> {
     let source_mask = word.defined_source_byte_mask();
-    if !mask_is_low_prefix(source_mask) {
+    let destination_mask = word.defined_destination_byte_mask();
+    if !mask_is_low_prefix(source_mask) || !mask_is_low_prefix(destination_mask) {
+        return Err(PhysicalTmemError::DestinationPlanMismatch);
+    }
+    if destination_mask.count_ones() < source_mask.count_ones() {
         return Err(PhysicalTmemError::DestinationPlanMismatch);
     }
     match word.physical() {
         TmemTransferPhysicalWord::Linear(_) => Ok(if word.odd_row_exchange() {
-            source_mask.rotate_left(4)
+            destination_mask.rotate_left(4)
         } else {
-            source_mask
+            destination_mask
         }),
         TmemTransferPhysicalWord::SplitBanks { .. } => {
             const SOURCE_TO_PHYSICAL_LANE: [u8; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
             let mut physical_mask = 0_u8;
             for (source_lane, physical_lane) in SOURCE_TO_PHYSICAL_LANE.into_iter().enumerate() {
-                if source_mask & (1 << source_lane) != 0 {
+                if destination_mask & (1 << source_lane) != 0 {
                     physical_mask |= 1 << physical_lane;
                 }
             }
@@ -1623,7 +1636,7 @@ mod tests {
         MAX_RESOURCE_ACCESSES,
     };
 
-    use super::super::{LOAD_SYNC, LOAD_TILE, SET_TEXTURE_IMAGE, SET_TILE};
+    use super::super::{LOAD_SYNC, LOAD_TILE, LOAD_TLUT, SET_TEXTURE_IMAGE, SET_TILE};
     use super::*;
     use crate::{decode_raw_dpc, RawDpcCommandKind, RawDpcDecodeError, RdpState};
 
@@ -2031,6 +2044,7 @@ mod tests {
                     0,
                     0,
                     0,
+                    source_mask,
                     source_mask,
                     0,
                     0,
@@ -2562,5 +2576,193 @@ mod tests {
         let packet = [first, destination];
         assert!(validate_packet_slice(&packet, 1, &[destination], "hostile slice").is_ok());
         assert!(validate_packet_slice(&packet, 77, &[destination], "hostile slice").is_err());
+    }
+
+    // M4.3.1b: LoadTLUT's destination-mask goldens/hostiles. TLUT captures 2
+    // source bytes per entry (`defined_source_byte_mask` == 0x03) but
+    // quadricates them into all 8 destination bytes
+    // (`defined_destination_byte_mask` == 0xff); `physical_defined_lane_mask`
+    // must key off the destination mask, not the source mask, or it either
+    // wrongly rejects the correct 8-lane payload or wrongly accepts a 2-lane
+    // payload that would mark 6 real destination bytes invalid.
+    mod tlut_destination_mask {
+        use super::*;
+
+        fn tlut_words(tmem_base: u32, entries_minus_one: u32) -> Vec<u32> {
+            vec![
+                word(SET_TEXTURE_IMAGE, 2 << 19),
+                0x200,
+                word(SET_TILE, 2 << 19 | tmem_base),
+                7 << 24,
+                word(LOAD_SYNC, 0),
+                0,
+                word(LOAD_TLUT, 0),
+                7 << 24 | entries_minus_one << 14,
+            ]
+        }
+
+        fn tlut_fixture(entries: u16) -> Fixture {
+            let (mut queue, backend, guest) = TicketAuthoritySet::try_new().unwrap().into_roles();
+            let words = tlut_words(256, u32::from(entries) - 1);
+            let source_end = 0x200 + u32::from(entries) * 2;
+            let packet = planned_packet_with_sources(words, &[(0x200, source_end)]);
+            Fixture {
+                decoded: decode_with(&mut queue, packet),
+                backend,
+                guest,
+            }
+        }
+
+        fn tlut_load(decoded: &crate::DecodedRawDpc) -> super::super::super::TmemLoad {
+            match decoded.commands()[3].kind() {
+                RawDpcCommandKind::LoadTlut(load) => load,
+                other => panic!("expected LoadTLUT, found {other:?}"),
+            }
+        }
+
+        #[test]
+        fn tlut_word_reports_source_0x03_destination_0xff() {
+            let fixture = tlut_fixture(1);
+            let transfer = fixture
+                .decoded
+                .resource_plan()
+                .bind_tmem_transfer(tlut_load(&fixture.decoded))
+                .unwrap();
+            assert_eq!(transfer.words().len(), 1);
+            let word = transfer.words()[0];
+            assert_eq!(word.defined_source_byte_mask(), 0x03);
+            assert_eq!(word.defined_destination_byte_mask(), 0xff);
+            assert_eq!(physical_defined_lane_mask(word).unwrap(), 0xff);
+        }
+
+        #[test]
+        fn all_eight_some_tlut_payload_is_accepted() {
+            let fixture = tlut_fixture(1);
+            let transfer = fixture
+                .decoded
+                .resource_plan()
+                .bind_tmem_transfer(tlut_load(&fixture.decoded))
+                .unwrap();
+            let word = transfer.words()[0];
+            let state = PhysicalTmemState::try_new().unwrap();
+            let mut staged = state
+                .stage_transfer(fixture.decoded.submitted(), &transfer)
+                .unwrap();
+            // One quadricated TLUT entry: two real source bytes (0x10, 0x11)
+            // repeated across all four 16-bit lanes of the 8-byte word.
+            let quadricated = [
+                Some(0x10),
+                Some(0x11),
+                Some(0x10),
+                Some(0x11),
+                Some(0x10),
+                Some(0x11),
+                Some(0x10),
+                Some(0x11),
+            ];
+            let payload = staged.physical_word_payload(word, quadricated).unwrap();
+            staged.stage_word(payload).unwrap();
+            let candidate = staged.finish_load().unwrap();
+            let lanes = fragment_lanes(word.physical()).unwrap();
+            for (lane, address) in lanes.into_iter().enumerate() {
+                assert!(candidate.valid[address]);
+                assert_eq!(candidate.bytes[address], quadricated[lane].unwrap());
+            }
+        }
+
+        #[test]
+        fn only_two_some_tlut_payload_is_rejected() {
+            let fixture = tlut_fixture(1);
+            let transfer = fixture
+                .decoded
+                .resource_plan()
+                .bind_tmem_transfer(tlut_load(&fixture.decoded))
+                .unwrap();
+            let word = transfer.words()[0];
+            let state = PhysicalTmemState::try_new().unwrap();
+            let staged = state
+                .stage_transfer(fixture.decoded.submitted(), &transfer)
+                .unwrap();
+            let two_lane = [Some(0x10), Some(0x11), None, None, None, None, None, None];
+            assert!(matches!(
+                staged.physical_word_payload(word, two_lane),
+                Err(PhysicalTmemError::PhysicalLaneMaskMismatch {
+                    expected: 0xff,
+                    actual: 0x03,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn direct_tile_masks_are_unchanged_by_the_destination_mask_split() {
+            // Block/Tile: source and destination masks coincide, including
+            // the odd-row partial tail and the split-bank RGBA32 case
+            // already covered by `linear_partial_tail_masks_follow_even_and_odd_row_lane_exchange`
+            // and `odd_width_rgba32_tail_uses_split_bank_physical_mask`. This
+            // is a targeted regression that word minting itself (via
+            // `raw_dpc::transfer_record`) still produces `source ==
+            // destination` for a non-TLUT kind, now that both masks are
+            // minted independently.
+            let fixture = fixture(1);
+            let transfer = fixture
+                .decoded
+                .resource_plan()
+                .bind_tmem_transfer(load(&fixture.decoded, 0))
+                .unwrap();
+            for word in transfer.words() {
+                assert_eq!(
+                    word.defined_source_byte_mask(),
+                    word.defined_destination_byte_mask()
+                );
+            }
+        }
+
+        #[test]
+        #[should_panic(expected = "cannot claim fewer defined destination bytes")]
+        fn forged_mismatched_masks_are_rejected_by_the_private_constructor() {
+            // Production code cannot mint a `TmemTransferWord` at all except
+            // through `raw_dpc::transfer_record`, which always sources both
+            // masks from the same `TmemTransferPlan`. This forged combination
+            // is reachable only through this crate-private constructor, and
+            // its own `debug_assert!` invariant check catches it at mint
+            // time -- stronger than a runtime `Result`, and exactly why the
+            // check lives in the constructor rather than only in
+            // `physical_defined_lane_mask`.
+            let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
+            // destination mask (0x01) claims fewer defined bytes than source
+            // (0x03) -- forbidden for every current load kind.
+            let _ = TmemTransferWord::new(
+                0,
+                0,
+                0,
+                0,
+                0x03,
+                0x01,
+                0,
+                0,
+                false,
+                TmemTransferPhysicalWord::Linear(range),
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "must be a nonzero low-bit prefix")]
+        fn non_prefix_destination_mask_is_rejected() {
+            let range = fn64_render_ir::TmemRange::try_new(0, 8).unwrap();
+            // 0x05 (bits 0 and 2) is not a contiguous low-bit prefix.
+            let _ = TmemTransferWord::new(
+                0,
+                0,
+                0,
+                0,
+                0x01,
+                0x05,
+                0,
+                0,
+                false,
+                TmemTransferPhysicalWord::Linear(range),
+            );
+        }
     }
 }
