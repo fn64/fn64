@@ -628,6 +628,38 @@
       "next_action": "Extend the admitted raw-DPC slice toward real native framebuffer and VI/surface presentation while preserving the exact IR journal, completion, and guest-effect ownership boundaries.",
       "started_utc": "2026-08-16T00:00:00Z",
       "updated_utc": "2026-08-16T00:00:00Z"
+    },
+    {
+      "id": "M3.2",
+      "milestone": "M3",
+      "objective": "Replace M3.1's fixed eight-word parser with a bounded raw-DPC decoder that produces a typed transaction-local RDP state delta and exact resource plan without mutating durable renderer state.",
+      "profile": "F",
+      "model": "GPT-5.6 Sol",
+      "effort": "xhigh",
+      "owner": "raw-DPC decoder/state writer",
+      "branch": "port/m3-raw-dpc-decoder",
+      "base_branch": "main",
+      "writable_paths": [
+        "crates/fn64-render-wgpu/Cargo.toml",
+        "crates/fn64-render-wgpu/src/lib.rs",
+        "crates/fn64-render-wgpu/src/lifecycle.rs",
+        "crates/fn64-render-wgpu/src/raw_dpc",
+        "crates/fn64-render-wgpu/src/state.rs",
+        "crates/fn64-render-wgpu/README.md"
+      ],
+      "dependencies": ["M3.1"],
+      "state": "READY",
+      "findings": [
+        "The next slice is headless decode/state, not production ABI dispatch or VI/surface: exact framebuffer and TMEM semantics must exist before either boundary can be crossed honestly.",
+        "Admit only no-op variants, fill-cycle SetOtherMode, SetColorImage, SetFillColor, FillRectangle, and FullSync; unknown, truncated, unsupported, or state-invalid commands reject with workload/stream/chunk/source-offset/opcode context.",
+        "Use fn64-render's public raw-RDP command-width authority and accept all equivalent two-bit opcode-prefix spellings. RT64 remains candidate semantic evidence rather than parity authority.",
+        "The decoder and staged persistent state belong to fn64-render-wgpu; fn64-render-ir retains neutral packets/journals/receipts, and fn64-abi must not decode commands or select targets."
+      ],
+      "verification_runs": [],
+      "blocker": null,
+      "next_action": "Implement the bounded decoder and transaction-local state delta with exact journal equality, hostile command tables, and two-packet staged-state tests; run the 10-process CPU bar before independent review.",
+      "started_utc": "2026-08-16T00:00:00Z",
+      "updated_utc": "2026-08-16T00:00:00Z"
     }
   ]
 }

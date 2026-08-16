@@ -917,6 +917,11 @@ The accelerated wave keeps dependency-safe work active in parallel:
     smallest decode-to-headless-frame path before broad opcode or
     feature-family ports, consuming the accepted M1.2 lifecycle and M2.3
     submission evidence.
+14. **M3.2 -- decode bounded raw-DPC state (READY).** Replace the fixed M3.1
+    fixture parser with a transaction-local decoder for no-op, fill-cycle
+    other-mode, color-image, fill-color, rectangle, and FullSync commands.
+    Produce an exact resource plan and staged state delta without publishing
+    durable renderer state or crossing into ABI, VI, or surface policy.
 
 ### M0 evidence ledger
 
