@@ -564,17 +564,39 @@
         "docs/DESIGN.md"
       ],
       "dependencies": ["M1.2", "M2.3"],
-      "state": "RUNNING",
+      "state": "INTEGRATED",
       "findings": [
         "This ticket owns only the bounded headless device, pipeline-prewarm, exact-submission, readback, and backend-effect lifecycle. ABI dispatch, shell policy, surface presentation, VI, and broad RDP decoding remain outside its boundary.",
         "One small reviewed WGSL fixture may unblock the lifecycle spine while M2.4 independently qualifies the full RT64 HLSL artifact producer; synthetic success cannot close M3 parity.",
         "Unknown command/state forms must reject loudly, and no backend completion or staged guest effect may exist before the exact wgpu SubmissionIndex completes and readback is validated.",
         "Independent review rejected the first candidate because it accepted and ignored extra declared read inputs instead of enforcing the exact two-access fixture journal.",
-        "The first candidate also used a wgpu-specific effect-byte hash domain, so identical staged bytes could not satisfy M1.2's backend-neutral guest-commit receipt. Canonical effect content must be owned by fn64-render-ir and shared by both paths."
+        "The first candidate also used a wgpu-specific effect-byte hash domain, so identical staged bytes could not satisfy M1.2's backend-neutral guest-commit receipt. Canonical effect content is now owned by fn64-render-ir and shared by both paths.",
+        "The accepted decoder requires exact ordered equality with one command read and one framebuffer write; extra, reordered, and renumbered journal accesses reject loudly.",
+        "The accepted typestate retains the submitted ticket, paired completion authority, and exclusive renderer borrow until the exact native SubmissionIndex wait, callback observation, bounded map/readback, byte check, and IR receipt issuance complete.",
+        "Independent final review accepted the repaired source. This remains a 2x2 synthetic lifecycle mechanism, not RT64 parity, broad RDP decoding, VI, surface presentation, or performance evidence."
       ],
-      "verification_runs": [],
+      "verification_runs": [
+        {
+          "command": "cargo test -p fn64-render-wgpu --lib",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "cargo test -p fn64-render-wgpu --features host-gpu-tests --lib",
+          "clean_run_count": 20,
+          "required_run_count": 20,
+          "kind": "concurrency"
+        },
+        {
+          "command": "cargo test -p fn64-render-ir -p fn64-render-wgpu -p fn64-render --lib --no-fail-fast",
+          "clean_run_count": 1,
+          "required_run_count": 1,
+          "kind": "single"
+        }
+      ],
       "blocker": null,
-      "next_action": "Repair the exact ordered journal denominator and canonicalize effect-byte identity in fn64-render-ir, prove the cross-layer M1.2 completion path, then repeat 10 CPU and 20 required-Metal runs plus independent rereview.",
+      "next_action": "Extend the admitted raw-DPC slice toward real native framebuffer and VI/surface presentation while preserving the exact IR journal, completion, and guest-effect ownership boundaries.",
       "started_utc": "2026-08-16T00:00:00Z",
       "updated_utc": "2026-08-16T00:00:00Z"
     }
