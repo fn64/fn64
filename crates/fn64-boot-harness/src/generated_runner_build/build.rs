@@ -1112,7 +1112,7 @@ pub(super) fn prepared_source_claims_v3(
 }
 
 pub(super) fn emitter_source_sha256(workspace: &Path) -> Result<String, GeneratedRunnerBuildError> {
-    let root = workspace.join("crates/fn64-recomp-rs-codegen");
+    let root = workspace.join("crates/fn64-cpu-runtime-codegen");
     let mut digest = Sha256::new();
     digest.update(b"fn64:generated-runner-emitter-source:v2:");
     // This order is part of GeneratedRunnerEmitterSourceReceiptV2's wire.

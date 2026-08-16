@@ -869,13 +869,13 @@ pub fn emit_block_program_source_with_facts(
         let blocks = bank
             .blocks
             .iter()
-            .map(|block| fn64_recomp_rs_codegen::BankBlockInput {
+            .map(|block| fn64_cpu_runtime_codegen::BankBlockInput {
                 vram: block.start_va,
                 words: &block.words,
             })
             .collect::<Vec<_>>();
-        source.push_str(&fn64_recomp_rs_codegen::emit_sparse_bank_runner_function(
-            &fn64_recomp_rs_codegen::SparseBankInput {
+        source.push_str(&fn64_cpu_runtime_codegen::emit_sparse_bank_runner_function(
+            &fn64_cpu_runtime_codegen::SparseBankInput {
                 name: &name,
                 bank: fn64_cpu_runtime::BankId::new(bank.bank_id),
                 blocks: &blocks,
@@ -908,16 +908,16 @@ pub fn emit_materialized_bank_runner_with_host_calls(
     name: &str,
     host_calls: &[u32],
 ) -> String {
-    let blocks: Vec<fn64_recomp_rs_codegen::BankBlockInput<'_>> = bank
+    let blocks: Vec<fn64_cpu_runtime_codegen::BankBlockInput<'_>> = bank
         .blocks
         .iter()
-        .map(|block| fn64_recomp_rs_codegen::BankBlockInput {
+        .map(|block| fn64_cpu_runtime_codegen::BankBlockInput {
             vram: block.start_va,
             words: &block.words,
         })
         .collect();
-    fn64_recomp_rs_codegen::emit_sparse_bank_runner_with_host_calls(
-        &fn64_recomp_rs_codegen::SparseBankInput {
+    fn64_cpu_runtime_codegen::emit_sparse_bank_runner_with_host_calls(
+        &fn64_cpu_runtime_codegen::SparseBankInput {
             name,
             bank: fn64_cpu_runtime::BankId::new(bank.bank_id),
             blocks: &blocks,

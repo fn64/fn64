@@ -171,7 +171,7 @@ fn independent_emitter_source_measurement_matches_the_linked_receipt() {
         .expect("boot-harness crate is under the workspace crates directory");
     let measured = emitter_source_sha256(repo_root).expect("measure emitter source");
     let linked = hex(
-        &fn64_recomp_rs_codegen::generated_runner_emitter_source_receipt_v2().source_sha256(),
+        &fn64_cpu_runtime_codegen::generated_runner_emitter_source_receipt_v2().source_sha256(),
     );
     assert_eq!(measured, linked);
 }

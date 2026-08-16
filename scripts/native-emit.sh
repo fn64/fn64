@@ -65,7 +65,7 @@ CACHE_ROOT="${FN64_EMIT_CACHE:-/tmp/fn64-emit-cache}"
 
 # Build the driver once (cheap, cached by cargo) and hash it into the key so a
 # recompiler change invalidates the cache.
-"$guard" cargo build -j1 --release -q -p fn64-recomp-rs-codegen --bin recompile_rom \
+"$guard" cargo build -j1 --release -q -p fn64-cpu-runtime-codegen --bin recompile_rom \
   >/dev/null || { echo "native-emit: guarded recompile_rom build failed" >&2; exit 3; }
 # Ask cargo where it put the binary rather than assuming repo-local target/:
 # FAST-LOOP.md tells every rs-lane job to export CARGO_TARGET_DIR, which moves

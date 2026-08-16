@@ -751,7 +751,7 @@ dependencies = [
  "fn64-abi",
  "fn64-audio",
  "fn64-cpu-runtime",
- "fn64-recomp-rs-codegen",
+ "fn64-cpu-runtime-codegen",
  "fn64-render",
  "fn64-runtime",
  "getrandom 0.3.4",
@@ -778,11 +778,22 @@ dependencies = [
 name = "fn64-cpu-runtime"
 version = "0.0.0"
 dependencies = [
+ "fn64-cpu-runtime-codegen",
  "fn64-recomp",
- "fn64-recomp-rs-codegen",
  "rustc_apfloat",
  "serde",
  "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
+name = "fn64-cpu-runtime-codegen"
+version = "0.0.0"
+dependencies = [
+ "fn64-cpu-runtime",
+ "fn64-recomp",
+ "serde",
  "sha2",
  "toml",
 ]
@@ -799,7 +810,7 @@ dependencies = [
  "flate2",
  "fn64-boot-harness",
  "fn64-cpu-runtime",
- "fn64-recomp-rs-codegen",
+ "fn64-cpu-runtime-codegen",
  "fn64-runtime",
  "libc",
  "md-5",
@@ -815,17 +826,6 @@ name = "fn64-recomp"
 version = "0.0.0"
 dependencies = [
  "serde",
- "toml",
-]
-
-[[package]]
-name = "fn64-recomp-rs-codegen"
-version = "0.0.0"
-dependencies = [
- "fn64-cpu-runtime",
- "fn64-recomp",
- "serde",
- "sha2",
  "toml",
 ]
 

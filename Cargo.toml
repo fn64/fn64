@@ -12,7 +12,7 @@ members = [
     "crates/fn64-audio",
     "crates/fn64-recomp",
     "crates/fn64-cpu-runtime",
-    "crates/fn64-recomp-rs-codegen",
+    "crates/fn64-cpu-runtime-codegen",
     "crates/fn64-diff",
     "crates/fn64-discover",
 ]

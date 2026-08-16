@@ -1,5 +1,5 @@
 [package]
-name = "fn64-recomp-rs-codegen"
+name = "fn64-cpu-runtime-codegen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

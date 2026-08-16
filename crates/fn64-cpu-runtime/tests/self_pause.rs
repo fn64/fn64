@@ -1,6 +1,6 @@
 //! Regression coverage for N64Recomp's cooperative self-loop rule.
 
-use fn64_recomp_rs_codegen::{emit_function, FuncInput};
+use fn64_cpu_runtime_codegen::{emit_function, FuncInput};
 
 #[test]
 fn unconditional_branch_to_self_yields_before_repeating() {

@@ -1487,7 +1487,7 @@ at the `build.rs` call site.
 The question was whether fn64 misses optimizations the original hardware or its
 1999 compiler had. **It does, and it is basic-block compilation itself.**
 
-`crates/fn64-recomp-rs-codegen/src/emit/mod.rs:14-20` documents the emitted
+`crates/fn64-cpu-runtime-codegen/src/emit/mod.rs:14-20` documents the emitted
 shape in its own words:
 
 ```

@@ -8,7 +8,7 @@ use fn64_cpu_runtime::{
     AdmittedStaticMicroOpProgramV1, BankId, BlockExit, CpuFault, CpuFaultKind, ExecutionKey,
     GuestPc, InstructionBudget, Rdram, RecompContext,
 };
-use fn64_recomp_rs_codegen::{
+use fn64_cpu_runtime_codegen::{
     emit_dense_bank_shard_runner_function, pack_static_micro_ops_v1, pack_static_micro_ops_v2,
     DenseBankShardInput, StaticMicroOpSpanInput, StaticMicroOpSpanInputV2,
 };
