@@ -432,12 +432,6 @@ class StaleOutputTests(unittest.TestCase):
 
 
 class TerminalViewTests(unittest.TestCase):
-    def test_elapsed_uses_recorded_endpoints(self) -> None:
-        ticket = minimal_manifest()["tickets"][0]
-        ticket["updated_utc"] = "2026-08-15T01:02:00Z"
-        self.assertEqual(dashboard.elapsed_seconds(ticket), 3720.0)
-        self.assertEqual(dashboard.format_elapsed(dashboard.elapsed_seconds(ticket)), "1h2m")
-
     def test_terminal_view_contains_goal_and_ticket_ids(self) -> None:
         schema, program, milestones, tickets = dashboard.load_and_validate()
         text = dashboard.render_terminal(program, milestones, tickets)
@@ -449,6 +443,102 @@ class TerminalViewTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(TOOL)], cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RT64 PORT DASHBOARD", result.stdout)
+
+
+class WorkflowFrontierTests(unittest.TestCase):
+    def frontier_fixture(self) -> tuple[dict, dict[str, dict], list[dict]]:
+        manifest = minimal_manifest()
+        tickets = manifest["tickets"]
+        tickets[0]["id"] = "T1"
+        tickets[0]["state"] = "RUNNING"
+        tickets[0]["next_action"] = "run the diagnostic"
+
+        review = copy.deepcopy(tickets[0])
+        review.update({
+            "id": "T2",
+            "state": "READY_FOR_REVIEW",
+            "next_action": "await independent review",
+            "verification_runs": [
+                {"command": "python3 review.py", "clean_run_count": 1, "required_run_count": 1, "kind": "single"}
+            ],
+            "retrospective": {
+                "friction": "fixture friction",
+                "cause": "fixture cause",
+                "prevention": "fixture prevention",
+                "estimated_minutes_saved": 1,
+            },
+        })
+        ready = copy.deepcopy(tickets[0])
+        ready.update({
+            "id": "T3",
+            "state": "READY",
+            "verification_runs": [
+                {"command": "python3 unrecorded.py", "clean_run_count": 0, "required_run_count": 0, "kind": "single"}
+            ],
+        })
+        blocked = copy.deepcopy(tickets[0])
+        blocked.update({"id": "T4", "state": "BLOCKED", "blocker": "first failing invariant"})
+        integrated = copy.deepcopy(tickets[0])
+        integrated.update({
+            "id": "T5",
+            "state": "INTEGRATED",
+            "verification_runs": [
+                {"command": "python3 closed.py", "clean_run_count": 2, "required_run_count": 2, "kind": "deterministic"}
+            ],
+        })
+        tickets.extend([review, ready, blocked, integrated])
+        _, milestones, validated = dashboard.validate_manifest(base_schema(), manifest)
+        return manifest["program"], milestones, validated
+
+    def test_frontier_counts_queues_and_retrospectives_are_manifest_facts(self) -> None:
+        _, milestones, tickets = self.frontier_fixture()
+        frontier = dashboard.workflow_frontier(milestones, tickets)
+        self.assertEqual(frontier["complete_milestone_count"], 0)
+        self.assertEqual(frontier["milestone_count"], 2)
+        self.assertEqual(frontier["integrated_ticket_count"], 1)
+        self.assertEqual(frontier["ticket_count"], 5)
+        self.assertEqual(frontier["no_ticket_milestones"], ["M1"])
+        self.assertEqual([ticket["id"] for ticket in frontier["queues"]["RUNNING"]], ["T1"])
+        self.assertEqual([ticket["id"] for ticket in frontier["queues"]["READY_FOR_REVIEW"]], ["T2"])
+        self.assertEqual([ticket["id"] for ticket in frontier["queues"]["READY"]], ["T3"])
+        self.assertEqual([ticket["id"] for ticket in frontier["queues"]["BLOCKED"]], ["T4"])
+        self.assertEqual(frontier["retrospective_ticket_count"], 1)
+        self.assertEqual(frontier["missing_retrospective_ids"], ["T1", "T3", "T4", "T5"])
+
+    def test_reliability_met_requires_nonempty_all_met_bars(self) -> None:
+        ticket = minimal_manifest()["tickets"][0]
+        self.assertEqual(dashboard.reliability_status(ticket), "NOT RECORDED")
+        ticket["verification_runs"] = [
+            {"command": "zero", "clean_run_count": 0, "required_run_count": 0, "kind": "single"}
+        ]
+        self.assertEqual(dashboard.reliability_status(ticket), "NOT RECORDED")
+        ticket["verification_runs"] = [
+            {"command": "short", "clean_run_count": 1, "required_run_count": 2, "kind": "deterministic"}
+        ]
+        self.assertEqual(dashboard.reliability_status(ticket), "NOT MET")
+        ticket["verification_runs"][0]["clean_run_count"] = 2
+        self.assertEqual(dashboard.reliability_status(ticket), "MET")
+
+    def test_all_views_put_workflow_frontier_before_detail_without_wall_clock_status(self) -> None:
+        program, milestones, tickets = self.frontier_fixture()
+        views = {
+            "terminal": (dashboard.render_terminal(program, milestones, tickets), "WORKFLOW FRONTIER", "MILESTONES"),
+            "markdown": (dashboard.render_markdown(program, milestones, tickets), "## Workflow frontier", "## Milestones"),
+            "html": (dashboard.render_html(program, milestones, tickets), '<section class="frontier">', "<h2>Milestones</h2>"),
+        }
+        for name, (rendered, frontier_marker, detail_marker) in views.items():
+            with self.subTest(view=name):
+                self.assertLess(rendered.index(frontier_marker), rendered.index(detail_marker))
+                frontier = rendered[rendered.index(frontier_marker):rendered.index(detail_marker)]
+                self.assertIn("not a percent-to-goal", frontier)
+                self.assertIn("READY_FOR_REVIEW", frontier)
+                self.assertIn("awaiting independent review only", frontier)
+                self.assertIn("NOT RECORDED", frontier)
+                self.assertIn("first failing invariant", frontier)
+                for ticket_id in ("T1", "T3", "T4", "T5"):
+                    self.assertIn(ticket_id, frontier)
+                self.assertNotIn("elapsed", frontier.lower())
+                self.assertNotIn("updated", frontier.lower())
 
 
 class ServeLoopbackTests(unittest.TestCase):

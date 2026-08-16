@@ -11,13 +11,43 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T11:18:56Z` |
+
+## Workflow frontier
+
+- **COMPLETE milestones:** 0/13
+- **INTEGRATED / recorded tickets:** 18/26 — recorded ticket scope, **not a percent-to-goal**.
+- **Milestones with no tickets:** `M5`, `M6`, `M7`, `M8`, `M9`, `M10`, `M11`, `M12`
+- **Retrospective coverage:** 12/26; missing: `M0.3`, `A0.1`, `M1.1`, `M2.1`, `A0.3`, `M2.5.1`, `M2.5.2`, `M2.5.3`, `M3.1`, `M3.3.1`, `M3.3.2`, `M4.1`, `M4.2`, `M4.3`
+
+### RUNNING (3)
+
+- `M0.3` — owner: integration lead; branch: `feat/egui-settings-drawer-hud` -> `main`; dependencies: none; reliability: **NOT MET (cargo nextest run -p fn64-abi --no-default-features: 1/10 deterministic, tools/check_rt64_render_measurement.py: 10/10 deterministic)**; next: Exercise the C-RecompiledFuncs receipt and native identity query against a clean private linked build, then run five independent unprofiled repetitions plus counterbalanced instrumented controls on the declared route.
+
+- `M2.5.1` — owner: /root/m2_5_depfile_repair; branch: `m2-5a-reference-corpus` -> `main`; dependencies: M2.5=BLOCKED; reliability: **MET (python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose: 10/10 deterministic)**; next: Source-build and independently review the exact standalone spirv-val receipt, then execute and independently review all 56 reference-valid rows before closing this ticket.
+
+- `M4.2` — owner: /root/m4_2_0_transfer_contract; branch: `port/m4-2-0-transfer-contract` -> `main`; dependencies: M4.1=INTEGRATED; reliability: **NOT RECORDED**; next: Review and integrate M4.2.0, then implement the physical state engine before parallel LoadTile and LoadBlock executors and final transaction integration.
+
+### READY_FOR_REVIEW — awaiting independent review only (1)
+
+- `A0.5` — owner: workflow dashboard implementer; branch: `workflow-frontier-a05` -> `main`; dependencies: A0.2=INTEGRATED; reliability: **MET (python3 tools/test_rt64_port_dashboard.py: 10/10 deterministic, python3 tools/rt64_port_dashboard.py --check: 10/10 deterministic, python3 scripts/lint-docs.py: 10/10 deterministic, git diff --check && git diff --name-only: 1/1 single)**; next: Await independent review of the frontier semantics, generated views, and final-source receipts before any integration decision.
+
+### READY (1)
+
+- `M2.5.2` — owner: integration lead; branch: `port/rt64-wgpu-ingestion-assessment` -> `main`; dependencies: M2.5.1=RUNNING; reliability: **NOT RECORDED**; next: Dispatch after M2.5.1 freezes the complete reference corpus and per-row capability inventory.
+
+### BLOCKED (3)
+
+- `M2.5` — owner: shader corpus execution lead; branch: `port/rt64-shader-corpus` -> `main`; dependencies: M2.4=INTEGRATED; reliability: **NOT RECORDED**; next: Complete M2.5.1 reference-valid corpus evidence, then use M2.5.2's typed assessment and M2.5.3's owned WGSL/runtime artifacts without treating reference validity as wgpu ingestibility.; blocker: The original single-corpus exit condition is impossible with the admitted DXC output and Naga 30: row one requires ShaderNonUniform, which the strict SPIR-V frontend rejects. M2.5.1 through M2.5.3 replace the conflated gate.
+
+- `M2.5.3` — owner: integration lead; branch: `port/rt64-runtime-shader-corpus` -> `main`; dependencies: M2.5.1=RUNNING, M2.5.2=READY; reliability: **NOT RECORDED**; next: Begin bounded owned WGSL vertical slices in parallel where authority fixtures exist, but do not claim a complete runtime corpus until both upstream tickets close.; blocker: The complete reference corpus and per-row wgpu assessment do not yet exist; runtime shader promotion also requires semantic differential fixtures.
+
+- `M4.3` — owner: integration lead; branch: `port/m4-texture-decode` -> `main`; dependencies: M4.2=RUNNING; reliability: **NOT RECORDED**; next: After M4.2.0 freezes physical state, land the decode/TLUT contract, then implement LoadTLUT, the CPU oracle, bounded cache ownership, and owned WGSL differential in separately reviewed cards.; blocker: M4.1 and M4.2 are not integrated, and first-row parity plus noncanonical TLUT-bank behavior still require explicit authority fixtures before the frozen decode contract.
 
 ## Milestones
 
 | ID | state | title | tickets |
 |---|---|---|---|
-| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:4, RUNNING:1 |
+| `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:4, READY_FOR_REVIEW:1, RUNNING:1 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:4, READY:1, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
@@ -60,8 +90,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | branch | `feat/egui-settings-drawer-hud` -> `main` |
 | dependencies | none |
 | writable paths | `crates/fn64-abi/src/frame_census.rs`, `crates/fn64-certification`, `crates/fn64-shell`, `tools/run_rt64_render_baseline.py`, `docs/RT64-RENDER-MEASUREMENT.md`, `docs/rt64-render-measurement-schema.json` |
-| started / updated | `2026-08-15T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 1d0h) |
-| verification runs meeting bar | 1/2 |
+| reliability | **NOT MET (cargo nextest run -p fn64-abi --no-default-features: 1/10 deterministic, tools/check_rt64_render_measurement.py: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -91,8 +120,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | branch | `port/rt64-inventory-v2` -> `main` |
 | dependencies | none |
 | writable paths | `docs/rt64-port-inventory.json`, `docs/RT64-PORT-INVENTORY.md`, `tools/rt64_port_inventory.py` |
-| started / updated | `2026-08-15T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 1d0h) |
-| verification runs meeting bar | 2/2 |
+| reliability | **MET (tools/rt64_port_inventory.py --self-test: 10/10 deterministic, tools/rt64_port_inventory.py --check: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -120,8 +148,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | branch | `port/render-ir-spine` -> `main` |
 | dependencies | none |
 | writable paths | `crates/fn64-render-ir` |
-| started / updated | `2026-08-15T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 1d0h) |
-| verification runs meeting bar | 1/1 |
+| reliability | **MET (cargo test -p fn64-render-ir --no-fail-fast: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -148,8 +175,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | branch | `port/m2-metal-caps` -> `main` |
 | dependencies | none |
 | writable paths | `probes/m2-wgpu-metal-headless` |
-| started / updated | `2026-08-15T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 1d0h) |
-| verification runs meeting bar | 2/2 |
+| reliability | **MET (cargo test --locked --all-targets: 1/1 single, ./target/debug/metal_caps --require --iterations 1: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -177,8 +203,7 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | branch | `port/rt64-dashboard` -> `main` |
 | dependencies | none |
 | writable paths | `docs/rt64-port-status-schema.json`, `docs/rt64-port-status.json`, `tools/rt64_port_dashboard.py`, `tools/test_rt64_port_dashboard.py`, `docs/RT64-PORT-DASHBOARD.md`, `docs/rt64-port-dashboard.html` |
-| started / updated | `2026-08-15T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 1d0h) |
-| verification runs meeting bar | 2/2 |
+| reliability | **MET (python3 tools/test_rt64_port_dashboard.py: 10/10 deterministic, python3 tools/rt64_port_dashboard.py --check: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -211,10 +236,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `high` / GPT-5.6 Sol |
 | owner | /root/a0_3_independent_review repair implementer |
 | branch | `port/rt64-conformance-spine` -> `main` |
-| dependencies | `A0.1` |
+| dependencies | A0.1=INTEGRATED |
 | writable paths | `Cargo.toml`, `Cargo.lock`, `README.md`, `crates/fn64-render-conformance`, `docs/DESIGN.md`, `docs/RENDER-WGPU-PORT-PLAN.md`, `docs/rt64-port-status.json`, `docs/RT64-PORT-DASHBOARD.md`, `docs/rt64-port-dashboard.html`, `scripts/lint-docs.py`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T09:00:00Z` (elapsed 9h0m) |
-| verification runs meeting bar | 3/3 |
+| reliability | **MET (cargo test -p fn64-render-conformance --features conformance-test-runner --all-targets && cargo test -p fn64-render-conformance --doc: 10/10 deterministic, python3 -m unittest tools/test_check_rt64_port_parity.py: 10/10 deterministic, python3 tools/check_rt64_port_parity.py: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -250,10 +274,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | cross-crate IR integration writer |
 | branch | `port/render-ir-integration` -> `main` |
-| dependencies | `M1.1` |
+| dependencies | M1.1=INTEGRATED |
 | writable paths | `crates/fn64-abi`, `crates/fn64-render`, `crates/fn64-render-ir`, `crates/fn64-render-reference`, `Cargo.lock`, `docs/BASE-RENDERER-BEHAVIOR-MATRIX.md`, `docs/COMPLETENESS.md`, `docs/DESIGN.md` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 4/4 |
+| reliability | **MET (cargo test -p fn64-abi render_ir --lib: 10/10 deterministic, cargo test -p fn64-render-reference --lib: 1/1 single, cargo test -p fn64-render-ir --no-fail-fast: 1/1 single, cargo test -p fn64-abi --test c_smoke: 1/1 single)** |
 
 **Findings:**
 
@@ -289,10 +312,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `P` / `high` / GPT-5.6 Sol |
 | owner | Metal semantics writer |
 | branch | `port/m2-metal-semantics` -> `main` |
-| dependencies | `M2.1` |
+| dependencies | M2.1=INTEGRATED |
 | writable paths | `probes/m2-wgpu-metal-headless` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 3/3 |
+| reliability | **MET (cargo test --locked --all-targets: 1/1 single, metal_semantics final-source host process: 10/10 deterministic, metal_formats_io final-source host process: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -328,10 +350,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `P` / `high` / GPT-5.6 Sol |
 | owner | Metal submission and coverage writer |
 | branch | `port/m2-metal-submission` -> `main` |
-| dependencies | `M2.2` |
+| dependencies | M2.2=INTEGRATED |
 | writable paths | `probes/m2-wgpu-metal-headless` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 3/3 |
+| reliability | **MET (metal_submission final-source host process: 20/20 concurrency, metal_coverage_fallback final-source host process: 10/10 deterministic, cargo test --locked --all-targets: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -368,10 +389,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | shader artifact provenance writer |
 | branch | `port/rt64-shader-artifacts` -> `main` |
-| dependencies | `M2.1` |
+| dependencies | M2.1=INTEGRATED |
 | writable paths | `tools/rt64_shader_artifacts.py`, `tools/test_rt64_shader_artifacts.py`, `docs/rt64-shader-artifact-schema.json`, `docs/RT64-SHADER-ARTIFACTS.md`, `docs/rt64-shader-source-denominator.json`, `probes/m2-dxc-artifacts`, `scripts/lint-docs.py` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T07:46:09Z` (elapsed 7h46m) |
-| verification runs meeting bar | 5/5 |
+| reliability | **MET (python3 -m unittest tools/test_rt64_shader_artifacts.py: 10/10 deterministic, cargo test --locked --manifest-path probes/m2-dxc-artifacts/Cargo.toml: 10/10 deterministic, python3 tools/rt64_shader_artifacts.py selftest: 10/10 deterministic, python3 tools/rt64_shader_artifacts.py check --port-dir <clean port pin> --oracle-dir <clean oracle pin>: 10/10 deterministic, python3 tools/rt64_shader_artifacts.py verify-validator-build --build-dir <isolated validator build>: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -416,10 +436,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | shader corpus execution lead |
 | branch | `port/rt64-shader-corpus` -> `main` |
-| dependencies | `M2.4` |
+| dependencies | M2.4=INTEGRATED |
 | writable paths | `docs/rt64-shader-artifacts.json`, `docs/RT64-SHADER-ARTIFACTS.md` |
-| started / updated | `2026-08-16T07:46:09Z` / `2026-08-16T09:54:30Z` (elapsed 2h8m) |
-| verification runs meeting bar | 0/0 |
+| reliability | **NOT RECORDED** |
 
 **Findings:**
 
@@ -452,10 +471,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m2_5_depfile_repair |
 | branch | `m2-5a-reference-corpus` -> `main` |
-| dependencies | `M2.5` |
+| dependencies | M2.5=BLOCKED |
 | writable paths | `tools/rt64_reference_shader_artifacts.py`, `tools/test_rt64_reference_shader_artifacts.py`, `docs/rt64-reference-shader-artifact-schema.json`, `docs/RT64-REFERENCE-SHADER-ARTIFACTS.md` |
-| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T11:03:34Z` (elapsed 1h9m) |
-| verification runs meeting bar | 1/1 |
+| reliability | **MET (python3 -m unittest tools/test_rt64_reference_shader_artifacts.py && python3 tools/rt64_reference_shader_artifacts.py selftest && python3 scripts/lint-docs.py --verbose: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -482,10 +500,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | integration lead |
 | branch | `port/rt64-wgpu-ingestion-assessment` -> `main` |
-| dependencies | `M2.5.1` |
+| dependencies | M2.5.1=RUNNING |
 | writable paths | `tools/rt64_wgpu_shader_assessment.py`, `docs/rt64-wgpu-shader-assessment-schema.json`, `docs/RT64-WGPU-SHADER-ASSESSMENT.md` |
-| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| reliability | **NOT RECORDED** |
 
 **Findings:**
 
@@ -503,10 +520,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | integration lead |
 | branch | `port/rt64-runtime-shader-corpus` -> `main` |
-| dependencies | `M2.5.1`, `M2.5.2` |
+| dependencies | M2.5.1=RUNNING, M2.5.2=READY |
 | writable paths | `crates/fn64-render-wgpu/src/shaders`, `crates/fn64-render-wgpu/src/shader_manifest.rs`, `docs/RT64-RUNTIME-SHADER-CORPUS.md` |
-| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| reliability | **NOT RECORDED** |
 
 **Findings:**
 
@@ -526,10 +542,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | wgpu renderer-spine writer |
 | branch | `port/render-wgpu-spine` -> `main` |
-| dependencies | `M1.2`, `M2.3` |
+| dependencies | M1.2=INTEGRATED, M2.3=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu`, `crates/fn64-render-ir/src/ticket.rs`, `crates/fn64-render/src/render_ir.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/DESIGN.md` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
-| verification runs meeting bar | 3/3 |
+| reliability | **MET (cargo test -p fn64-render-wgpu --lib: 10/10 deterministic, cargo test -p fn64-render-wgpu --features host-gpu-tests --lib: 20/20 concurrency, cargo test -p fn64-render-ir -p fn64-render-wgpu -p fn64-render --lib --no-fail-fast: 1/1 single)** |
 
 **Findings:**
 
@@ -561,10 +576,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | raw-DPC decoder/state writer |
 | branch | `port/m3-raw-dpc-decoder` -> `main` |
-| dependencies | `M3.1` |
+| dependencies | M3.1=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/Cargo.toml`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/src/lifecycle.rs`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T07:46:09Z` (elapsed 7h46m) |
-| verification runs meeting bar | 1/1 |
+| reliability | **MET (cargo test -p fn64-render-wgpu --lib: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -602,10 +616,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | native fill contract writer |
 | branch | `port/m3-native-contract` -> `main` |
-| dependencies | `M3.2` |
+| dependencies | M3.2=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/raw_dpc/mod.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T08:00:00Z` / `2026-08-16T08:35:41Z` (elapsed 35m) |
-| verification runs meeting bar | 1/1 |
+| reliability | **MET (cargo test -p fn64-render-wgpu --lib && cargo test -p fn64-render-wgpu --doc: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -631,10 +644,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m3_3b_targets_impl |
 | branch | `port/m3-3b-targets` -> `main` |
-| dependencies | `M3.3.1` |
+| dependencies | M3.3.1=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/src/targets`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T08:35:41Z` / `2026-08-16T09:04:42Z` (elapsed 29m) |
-| verification runs meeting bar | 2/2 |
+| reliability | **MET (cargo test -p fn64-render-wgpu --lib: 10/10 deterministic, cargo test -p fn64-render-wgpu --doc: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -661,10 +673,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m3_3c_raster_impl |
 | branch | `port/m3-3c-native-raster` -> `main` |
-| dependencies | `M3.3.1`, `M3.3.2` |
+| dependencies | M3.3.1=INTEGRATED, M3.3.2=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/src/raster`, `crates/fn64-render-wgpu/src/device`, `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T09:04:42Z` / `2026-08-16T09:31:17Z` (elapsed 26m) |
-| verification runs meeting bar | 2/2 |
+| reliability | **MET (cargo test -p fn64-render-wgpu --no-default-features: 10/10 deterministic, cargo test -p fn64-render-wgpu --features host-gpu-tests: 20/20 concurrency)** |
 
 **Findings:**
 
@@ -698,10 +709,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m3_3d_vi_impl |
 | branch | `port/m3-3d-vi-capture` -> `main` |
-| dependencies | `M3.3.1` |
+| dependencies | M3.3.1=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/src/vi`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T08:35:41Z` / `2026-08-16T09:08:08Z` (elapsed 32m) |
-| verification runs meeting bar | 3/3 |
+| reliability | **MET (cargo test -p fn64-render-wgpu --lib 'vi::tests': 10/10 deterministic, cargo test -p fn64-render-wgpu --lib: 1/1 single, cargo test -p fn64-render-wgpu --doc: 1/1 single)** |
 
 **Findings:**
 
@@ -737,10 +747,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m4_0_owned_reads_impl |
 | branch | `port/m4-owned-guest-reads` -> `main` |
-| dependencies | `M3.3.3` |
+| dependencies | M3.3.3=INTEGRATED |
 | writable paths | `crates/fn64-render-ir/src/guest_read.rs`, `crates/fn64-render/src/guest_read.rs`, `crates/fn64-abi/src/guest_read_capture.rs`, `docs/DESIGN.md`, `docs/RENDER-WGPU-PORT-PLAN.md` |
-| started / updated | `2026-08-16T09:00:00Z` / `2026-08-16T09:58:00Z` (elapsed 58m) |
-| verification runs meeting bar | 4/4 |
+| reliability | **MET (cargo test -p fn64-render-ir -p fn64-render -p fn64-abi --lib --no-fail-fast: 10/10 deterministic, cargo test -p fn64-render-ir --doc && python3 -m unittest tools.test_check_rt64_port_parity: 10/10 deterministic, cargo nextest run -p fn64-abi: 1/1 single, cargo test -p fn64-render-wgpu: 10/10 deterministic)** |
 
 **Findings:**
 
@@ -777,10 +786,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `high` / GPT-5.6 Sol |
 | owner | /root/m4_1_tmem_wire_state |
 | branch | `port/m4-tmem-wire-state` -> `main` |
-| dependencies | `M4.0` |
+| dependencies | M4.0=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T11:15:26Z` (elapsed 1h20m) |
-| verification runs meeting bar | 2/2 |
+| reliability | **MET (scripts/guarded-cargo-test.zsh -p fn64-render-wgpu: 10/10 deterministic, cargo clippy -p fn64-render-wgpu --all-targets --no-deps -- -D warnings: 1/1 single)** |
 
 **Findings:**
 
@@ -808,10 +816,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/m4_2_0_transfer_contract |
 | branch | `port/m4-2-0-transfer-contract` -> `main` |
-| dependencies | `M4.1` |
+| dependencies | M4.1=INTEGRATED |
 | writable paths | `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/src/native_contract.rs`, `crates/fn64-render-wgpu/src/lib.rs` |
-| started / updated | `2026-08-16T10:37:19Z` / `2026-08-16T11:18:56Z` (elapsed 41m) |
-| verification runs meeting bar | 0/0 |
+| reliability | **NOT RECORDED** |
 
 **Findings:**
 
@@ -831,10 +838,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | integration lead |
 | branch | `port/m4-texture-decode` -> `main` |
-| dependencies | `M4.2` |
+| dependencies | M4.2=RUNNING |
 | writable paths | `crates/fn64-render-ir/src/tmem`, `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/texture`, `crates/fn64-render-wgpu/src/shaders/tmem_decode.wgsl`, `crates/fn64-render-reference/src/tmem_decode.rs` |
-| started / updated | `2026-08-16T10:46:00Z` / `2026-08-16T10:46:00Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| reliability | **NOT RECORDED** |
 
 **Findings:**
 
@@ -856,10 +862,9 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | profile / effort / model | `F` / `xhigh` / GPT-5.6 Sol |
 | owner | /root/a0_4_rt64_runner_impl |
 | branch | `port/rt64-deferred-history-runner` -> `main` |
-| dependencies | `A0.3` |
+| dependencies | A0.3=INTEGRATED |
 | writable paths | `crates/fn64-render-conformance`, `crates/fn64-certification/examples/rt64_deferred_debugger_behavior.rs`, `tools/check_rt64_port_parity.py`, `tools/test_check_rt64_port_parity.py`, `docs/rt64-port-parity.json`, `docs/RT64-PORT-PARITY.md`, `docs/rt64-port-status.json` |
-| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T09:00:00Z` (elapsed 9h0m) |
-| verification runs meeting bar | 4/4 |
+| reliability | **MET (cargo test -p fn64-render-conformance --features conformance-test-runner --all-targets && python3 -m unittest tools/test_check_rt64_port_parity.py: 1/1 single, cargo test -p fn64-render-conformance --features rt64-deferred-history-runner --bin fn64-render-conformance-rt64-deferred-history-runner (FN64_RT64_DIR set to the clean pinned RT64 checkout): 1/1 single, env -i target/debug/fn64-render-conformance-rt64-deferred-history-runner run with retained request/result/stderr artifacts (approved WindowServer access; pre-registration diagnostic): 1/1 single, python3 tools/check_rt64_port_parity.py --qualification-output evidence/rt64-port/artifacts/deferred-frame-history/qualification-report.json (approved WindowServer access): 10/10 deterministic)** |
 
 **Findings:**
 
@@ -894,6 +899,46 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Cause: Artifact privacy was audited after qualification rather than as a preflight property of the exact release build profile.
 - Prevention: Every retained native runner now uses stripped, path-remapped builds and must pass binary/source/privacy scans before the authoritative fresh-process series begins.
 - Estimated minutes saved: 25
+
+### `A0.5` -- Render a deterministic workflow frontier before dashboard detail so integration state, queues, reliability receipts, and retrospective gaps are visible without inferring progress.
+
+| field | value |
+|---|---|
+| milestone | `M0` |
+| state | `READY_FOR_REVIEW` |
+| profile / effort / model | `I` / `high` / GPT-5.6 Terra |
+| owner | workflow dashboard implementer |
+| branch | `workflow-frontier-a05` -> `main` |
+| dependencies | A0.2=INTEGRATED |
+| writable paths | `tools/rt64_port_dashboard.py`, `tools/test_rt64_port_dashboard.py`, `docs/rt64-port-status.json`, `docs/RT64-PORT-DASHBOARD.md`, `docs/rt64-port-dashboard.html` |
+| reliability | **MET (python3 tools/test_rt64_port_dashboard.py: 10/10 deterministic, python3 tools/rt64_port_dashboard.py --check: 10/10 deterministic, python3 scripts/lint-docs.py: 10/10 deterministic, git diff --check && git diff --name-only: 1/1 single)** |
+
+**Findings:**
+
+- The prior dashboard rendered ticket detail before the operational frontier and exposed recorded timestamps and elapsed duration, which are not a durable workflow-state signal.
+- One focused test invocation failed only because its Markdown assertion omitted deliberate backtick formatting around missing IDs; that pre-fix result is excluded from the clean count.
+- The repaired full diagnostic passed: 52 dashboard tests, generated-output freshness check, documentation lint, and a scope audit containing only the five assigned dashboard paths.
+- Independent review found that BLOCKED queue entries omitted their exact blocker text before detail; all three frontier views now render it conditionally, and the focused test slices the frontier before detail to require the fixture's first failing invariant.
+- The restarted authoritative final-source series completed 10/10 clean dashboard test, generated-output check, and documentation-lint processes; scope remained exactly the five assigned files and the schema identity was independently checked.
+- The ticket is awaiting independent review only; no integration claim is recorded.
+
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `python3 tools/test_rt64_port_dashboard.py` | 10 | 10 | deterministic |
+| `python3 tools/rt64_port_dashboard.py --check` | 10 | 10 | deterministic |
+| `python3 scripts/lint-docs.py` | 10 | 10 | deterministic |
+| `git diff --check && git diff --name-only` | 1 | 1 | single |
+
+**Next action:** Await independent review of the frontier semantics, generated views, and final-source receipts before any integration decision.
+
+**Retrospective:**
+
+- Friction: A whole-document frontier test let ticket detail mask a missing BLOCKED queue fact.
+- Cause: The assertion did not delimit the frontier before milestone and ticket detail.
+- Prevention: Frontier tests now slice before detail and assert queue facts in that bounded region.
+- Estimated minutes saved: 10
 
 ## Regenerating
 

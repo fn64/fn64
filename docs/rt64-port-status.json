@@ -1284,6 +1284,70 @@
         "prevention": "Every retained native runner now uses stripped, path-remapped builds and must pass binary/source/privacy scans before the authoritative fresh-process series begins.",
         "estimated_minutes_saved": 25
       }
+    },
+    {
+      "id": "A0.5",
+      "milestone": "M0",
+      "objective": "Render a deterministic workflow frontier before dashboard detail so integration state, queues, reliability receipts, and retrospective gaps are visible without inferring progress.",
+      "profile": "I",
+      "model": "GPT-5.6 Terra",
+      "effort": "high",
+      "owner": "workflow dashboard implementer",
+      "branch": "workflow-frontier-a05",
+      "base_branch": "main",
+      "writable_paths": [
+        "tools/rt64_port_dashboard.py",
+        "tools/test_rt64_port_dashboard.py",
+        "docs/rt64-port-status.json",
+        "docs/RT64-PORT-DASHBOARD.md",
+        "docs/rt64-port-dashboard.html"
+      ],
+      "dependencies": ["A0.2"],
+      "state": "READY_FOR_REVIEW",
+      "findings": [
+        "The prior dashboard rendered ticket detail before the operational frontier and exposed recorded timestamps and elapsed duration, which are not a durable workflow-state signal.",
+        "One focused test invocation failed only because its Markdown assertion omitted deliberate backtick formatting around missing IDs; that pre-fix result is excluded from the clean count.",
+        "The repaired full diagnostic passed: 52 dashboard tests, generated-output freshness check, documentation lint, and a scope audit containing only the five assigned dashboard paths.",
+        "Independent review found that BLOCKED queue entries omitted their exact blocker text before detail; all three frontier views now render it conditionally, and the focused test slices the frontier before detail to require the fixture's first failing invariant.",
+        "The restarted authoritative final-source series completed 10/10 clean dashboard test, generated-output check, and documentation-lint processes; scope remained exactly the five assigned files and the schema identity was independently checked.",
+        "The ticket is awaiting independent review only; no integration claim is recorded."
+      ],
+      "verification_runs": [
+        {
+          "command": "python3 tools/test_rt64_port_dashboard.py",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "python3 tools/rt64_port_dashboard.py --check",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "python3 scripts/lint-docs.py",
+          "clean_run_count": 10,
+          "required_run_count": 10,
+          "kind": "deterministic"
+        },
+        {
+          "command": "git diff --check && git diff --name-only",
+          "clean_run_count": 1,
+          "required_run_count": 1,
+          "kind": "single"
+        }
+      ],
+      "blocker": null,
+      "next_action": "Await independent review of the frontier semantics, generated views, and final-source receipts before any integration decision.",
+      "started_utc": "2026-08-16T11:18:56Z",
+      "updated_utc": "2026-08-16T12:32:47Z",
+      "retrospective": {
+        "friction": "A whole-document frontier test let ticket detail mask a missing BLOCKED queue fact.",
+        "cause": "The assertion did not delimit the frontier before milestone and ticket detail.",
+        "prevention": "Frontier tests now slice before detail and assert queue facts in that bounded region.",
+        "estimated_minutes_saved": 10
+      }
     }
   ]
 }
