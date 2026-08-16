@@ -315,7 +315,13 @@
       "base_branch": "main",
       "writable_paths": [
         "crates/fn64-render-conformance",
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "docs/DESIGN.md",
+        "scripts/lint-docs.py",
         "tools/check_rt64_port_parity.py",
+        "tools/test_check_rt64_port_parity.py",
         "docs/rt64-port-parity.json",
         "docs/RT64-PORT-PARITY.md"
       ],
@@ -325,11 +331,13 @@
         "RT64 is an executable compatibility delegate, not universal correctness authority; known defects use hardware or permitted reference authority.",
         "Ordinary CI must execute every closed row and protect the pending denominator, while port-progress remains nonzero until every required Rust row passes.",
         "Independent review rejected the first candidate: its RT64 pass observed only fn64 preflight FullSync, its divergence was synthetic, receipt authority was caller-forgeable, and it duplicated the stronger merged fn64-render-ir lifecycle.",
-        "The repair must bind sealed execution-issued evidence and durable run-series receipts to fn64-render-ir identities while retaining all 50 required rows; no RT64 pass or divergence is currently accepted."
+        "Independent review rejected the second candidate even though it launched fresh challenged processes: the child received the expected answer, the test runner echoed it, effect and guest-commit evidence was fabricable JSON, the build artifact was decorative, and the source pin was not causally tied to the executed binary.",
+        "The second candidate also split Rust fixture-v2 from Python fixture-v3, never decoded its alleged WorkloadRecord through Rust, supplied no raw payload for content-silent replay, and blessed an invalid synthetic record in its positive test.",
+        "The repair must use one Rust-owned fixture codec, keep expectations verifier-private, supply exact replay payloads, derive classification in the verifier, require actual typed guest commit, and bind the executed static runner to its source/build receipt while retaining all 50 required rows. No RT64 pass or divergence is currently accepted."
       ],
       "verification_runs": [],
       "blocker": null,
-      "next_action": "Repair the rejected trust boundaries, then repeat independent review before any conformance state or native run count is promoted.",
+      "next_action": "Replace the expectation-echo protocol with one Rust-decoded input-only fixture and verifier-private authority, bind the exact executable to source/build, prove the known forgeries fail, then repeat independent review before promoting any row.",
       "started_utc": "2026-08-16T00:00:00Z",
       "updated_utc": "2026-08-16T00:00:00Z"
     },
