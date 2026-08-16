@@ -943,8 +943,9 @@ The accelerated wave keeps dependency-safe work active in parallel:
     after guest commit. Public hardware authority overrides RT64's known
     source-size, starting-row, invalid-command, and host-layout shortcuts.
 19. **M4.3 -- load TLUT and decode committed textures (RUNNING; M4.3.2,
-    M4.3.3a, M4.3.3b, and M4.3.3c INTEGRATED,
-    `aec0ae1b`/`1f0a3213`/`fcd2b16a`/`94e16f4e`; M4.3.3d THIS CHANGE).**
+    M4.3.3a, M4.3.3b, M4.3.3c, and M4.3.3d INTEGRATED,
+    `aec0ae1b`/`1f0a3213`/`fcd2b16a`/`94e16f4e`/`b07fc375`;
+    M4.3.3e THIS CHANGE).**
     Keep load semantics, physical TMEM, packed texture decode, sampling, and
     cache identity separate. `LoadTLUT` writes quadricated 16-bit entries into
     high-half TMEM; the CPU oracle and owned WGSL then cover RGBA16/32,
@@ -996,6 +997,25 @@ The accelerated wave keeps dependency-safe work active in parallel:
     coordinate conversion, copy-cycle addressing, filter selection/lane
     behavior, LOD, YUV, cache, WGSL/GPU, raster integration, production
     dispatch, parity, and performance remain outside this slice.
+    M4.3.3e reuses M4.3.3d's exact integer decomposition to expose the 2x2
+    cell containing a point: post-shift/post-origin five-bit fractions plus
+    independently clamp/mirror/mask-addressed upper-left, lower-left,
+    upper-right, and lower-right corners. An optional all-four committed
+    gather delegates every corner to `read_committed_texel`, preserving
+    explicit parity, per-corner TLUT resolution/errors, and equal immutable
+    snapshot identities. The cell geometry follows the public Programming
+    Manual sections “TF: Texture Filter” and “Sampling Overview”; Chapter
+    13.7 “Texture Level of Detail” supplies the five-fraction-bit grid.
+    This is not a filtered-color result: three-nearest corner selection and
+    its validity footprint, diagonal/tie behavior, average triggering/output
+    rounding, filter accumulator width, reciprocal quantization, copy mode,
+    LOD/YUV/cache/WGSL/GPU work, and performance remain outside the slice. It
+    adds no production-DPC integration; primitive, rectangle, or triangle
+    decode; combiner, coverage, depth, blend, target, or VI behavior;
+    derivatives, detail/sharpen, or two-cycle selection; full-ROM
+    qualification; or RT64 pixel parity. It claims no visual/silicon parity.
+    M2.5.3a's direct-texel WGSL mechanism and runtime shader-corpus
+    documentation at `7e13b87c` remain unchanged.
 
 ### M0 evidence ledger
 

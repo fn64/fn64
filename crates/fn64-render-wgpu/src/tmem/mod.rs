@@ -37,9 +37,12 @@
 //! measurement. It performs no coordinate normalization, sampling, filtering,
 //! cache, GPU, or production work. M4.3.3d's [`sample`] module adds the
 //! integer-only point path from already-quantized signed S10.5 coordinates to
-//! that reader. It preserves explicit caller-owned first-row parity and does
-//! not select filter lanes, relax unequal TLUT banks, or enter a raster/GPU
-//! path. RT64 is not hardware authority for this module.
+//! that reader. M4.3.3e exposes the containing cell's exact five-bit fractions,
+//! independently addresses its four semantic corners, and can gather all four
+//! through the same committed reader. Both slices preserve explicit
+//! caller-owned first-row parity and do not select filter lanes, combine
+//! colors, relax unequal TLUT banks, or enter a raster/GPU path. RT64 is not
+//! hardware authority for this module.
 
 mod execute;
 mod physical;
@@ -67,8 +70,10 @@ pub use read::{
     PhysicalTmemSnapshotIdentity, TmemFirstRowParity,
 };
 pub use sample::{
-    address_point_texel, sample_committed_point, PointAddressError, PointSampleCoordinates,
-    PointSampleError, PointSampleRequest, TextureAxis, TextureCoordinateS10_5,
+    address_point_texel, address_texture_cell, gather_committed_texture_cell,
+    sample_committed_point, AddressedTextureCell, CommittedTextureCell, PointAddressError,
+    PointSampleCoordinates, PointSampleError, PointSampleRequest, TextureAxis, TextureCellCorner,
+    TextureCellFractions, TextureCellSampleError, TextureCoordinateS10_5,
 };
 pub use state::{TileState, TmemState};
 pub use texel::{

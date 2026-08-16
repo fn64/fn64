@@ -50,6 +50,20 @@
 //! quantization, copy addressing, filter selection and lanes, unequal TLUT
 //! banks, cache, GPU, raster integration, parity, and performance remain out
 //! of scope.
+//! M4.3.3e extends the same integer path to the containing texture cell. It
+//! exposes exact post-shift/post-origin five-bit fractions, addresses all four
+//! semantic corners independently, and can gather four committed decoded
+//! texels with corner-located failures and unchanged snapshot identity. It
+//! does not select three-nearest corners or their exact validity footprint,
+//! settle diagonal/tie behavior, trigger or round an average, interpolate
+//! colors, fix filter accumulator width or reciprocal quantization, decode
+//! filter state, implement copy mode, convert float/perspective coordinates,
+//! infer first-row parity, relax unequal TLUT lanes, or add LOD, YUV, cache,
+//! WGSL, or GPU work. It adds no production-DPC integration; primitive,
+//! rectangle, or triangle decode; combiner, coverage, depth, blend, target,
+//! or VI behavior; derivatives, detail/sharpen, or two-cycle selection;
+//! full-ROM qualification; RT64 pixel parity; visual/silicon parity; or
+//! performance claim.
 //! M2.5.3a adds one repository-owned WGSL component for M4.3.3a's exact
 //! seven direct texel conversions. Its closed manifest, baseline device
 //! profile, Naga validation, and CPU oracle establish candidate mechanics.
@@ -286,23 +300,24 @@ pub use targets::{
     UninitializedNativeRaster,
 };
 pub use tmem::{
-    address_point_texel, decode_direct_texel, decode_tlut_entry, execute_ordered_tmem_loads,
-    prepare_load_block, prepare_load_tile, prepare_load_tlut, read_committed_texel,
-    resolve_indexed_texel, sample_committed_point, unpack_ci4_texel, AddressedTmemTexel,
-    Ci4Palette, Ci4PaletteError, Ci4UnpackError, CommittedTmemTransaction, DecodedPhysicalTexel,
-    DecodedTexel, DefinedPhysicalTmemWordBytes, DirectTexelDecodeError, ExecutedLoadBlock,
-    ExecutedLoadTile, ExecutedLoadTlut, GpuBoundTmemTransaction, IndexedTexelResolveError,
-    LoadBlockExecutionError, LoadTileExecutionError, LoadTlutExecutionError,
-    PendingTmemTransaction, PhysicalTexelReadError, PhysicalTmemBinding, PhysicalTmemError,
-    PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority, PhysicalTmemSnapshotIdentity,
-    PhysicalTmemState, PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity,
-    PointAddressError, PointSampleCoordinates, PointSampleError, PointSampleRequest,
-    PreparedLoadBlock, PreparedLoadTile, PreparedLoadTlut, RawTexel, RawTexelError,
-    ResolvedIndexedTexel, StagedTmemTransaction, TexelColumnParity, TextureAxis,
-    TextureCoordinateS10_5, TextureImage, TileAddressMode, TileCoordinate, TileDescriptor,
-    TileIndex, TileSize, TileState, TlutEntryCount, TlutEntryDecodeError, TlutLookup, TmemDxt,
-    TmemFirstRowParity, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch,
-    TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemPacketExecutionError, TmemState,
-    TmemTransferLayout, TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord,
-    TmemWordAddress,
+    address_point_texel, address_texture_cell, decode_direct_texel, decode_tlut_entry,
+    execute_ordered_tmem_loads, gather_committed_texture_cell, prepare_load_block,
+    prepare_load_tile, prepare_load_tlut, read_committed_texel, resolve_indexed_texel,
+    sample_committed_point, unpack_ci4_texel, AddressedTextureCell, AddressedTmemTexel, Ci4Palette,
+    Ci4PaletteError, Ci4UnpackError, CommittedTextureCell, CommittedTmemTransaction,
+    DecodedPhysicalTexel, DecodedTexel, DefinedPhysicalTmemWordBytes, DirectTexelDecodeError,
+    ExecutedLoadBlock, ExecutedLoadTile, ExecutedLoadTlut, GpuBoundTmemTransaction,
+    IndexedTexelResolveError, LoadBlockExecutionError, LoadTileExecutionError,
+    LoadTlutExecutionError, PendingTmemTransaction, PhysicalTexelReadError, PhysicalTmemBinding,
+    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority,
+    PhysicalTmemSnapshotIdentity, PhysicalTmemState, PhysicalTmemStateIdentity,
+    PhysicalTmemTransactionIdentity, PointAddressError, PointSampleCoordinates, PointSampleError,
+    PointSampleRequest, PreparedLoadBlock, PreparedLoadTile, PreparedLoadTlut, RawTexel,
+    RawTexelError, ResolvedIndexedTexel, StagedTmemTransaction, TexelColumnParity, TextureAxis,
+    TextureCellCorner, TextureCellFractions, TextureCellSampleError, TextureCoordinateS10_5,
+    TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState,
+    TlutEntryCount, TlutEntryDecodeError, TlutLookup, TmemDxt, TmemFirstRowParity, TmemLoad,
+    TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity,
+    TmemLoadSourcePlan, TmemPacketExecutionError, TmemState, TmemTransferLayout,
+    TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord, TmemWordAddress,
 };

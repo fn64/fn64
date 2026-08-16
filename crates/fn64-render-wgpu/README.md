@@ -334,6 +334,32 @@ select filtered neighbours or lanes, implement copy-cycle clamp bypass, add
 LOD/YUV/cache/WGSL/GPU work, connect a raster path, or claim visual/silicon
 parity or performance.
 
+M4.3.3e reuses that exact integer path to expose the 2x2 cell containing the
+point. `address_texture_cell` returns the post-shift/post-origin five-bit S/T
+fractions and independently clamp/mirror/mask-addresses the semantic
+upper-left, lower-left, upper-right, and lower-right corners.
+`gather_committed_texture_cell` then reads those four corners in that fixed
+order through `read_committed_texel`, preserving explicit first-row parity,
+per-corner CI/TLUT lookup and errors, and one equal committed snapshot
+identity. Clamp or mirror may make semantic corners address the same texel;
+they remain four named entries rather than being deduplicated. This cell shape
+follows the public Programming Manual sections “TF: Texture Filter” and
+“Sampling Overview”; Chapter 13.7 “Texture Level of Detail” supplies the
+five-fraction-bit coordinate grid.
+
+The all-four gather is a diagnostic and average-filter candidate, not a
+bilerp result. It does not select the three nearest corners, require the exact
+three-corner validity footprint, average or interpolate colors, decode filter
+state, settle diagonal/tie/output rounding or accumulator width, convert
+float/perspective coordinates, infer first-row parity, relax unequal TLUT
+lanes, or implement copy addressing, LOD, YUV, cache, WGSL, or GPU work. It
+adds no production-DPC integration; primitive, rectangle, or triangle decode;
+combiner, coverage, depth, blend, target, or VI behavior; derivatives,
+detail/sharpen, or two-cycle selection; full-ROM qualification; or RT64 pixel
+parity. It claims neither visual/silicon parity nor performance. A later
+three-nearest path must choose its corners before reading them so an unused
+fourth corner cannot create a false validity failure.
+
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
 commands at `0x100..0x128`, color writeback at `0x400..0x410`, transaction

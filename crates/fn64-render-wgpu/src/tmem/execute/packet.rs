@@ -307,11 +307,12 @@ mod tests {
     use crate::raw_dpc::{decode_raw_dpc, RawDpcCommandKind, RawDpcDecodeError};
     use crate::tmem::{LOAD_BLOCK, LOAD_SYNC, LOAD_TILE, LOAD_TLUT, SET_TEXTURE_IMAGE, SET_TILE};
     use crate::{
-        decode_direct_texel, read_committed_texel, sample_committed_point, AddressedTmemTexel,
-        ImageFormat, PhysicalTexelReadError, PhysicalTmemState, PixelSize, PointSampleCoordinates,
-        PointSampleRequest, RawTexel, RdpState, TextureCoordinateS10_5, TextureLutMode,
-        TileAddressMode, TileCoordinate, TileDescriptor, TileSize, TmemFirstRowParity,
-        TmemLoadEpoch, TmemWordAddress,
+        decode_direct_texel, gather_committed_texture_cell, read_committed_texel,
+        sample_committed_point, AddressedTmemTexel, ImageFormat, PhysicalTexelReadError,
+        PhysicalTmemState, PhysicalTmemStateIdentity, PixelSize, PointSampleCoordinates,
+        PointSampleRequest, RawTexel, RdpState, TextureCellCorner, TextureCellSampleError,
+        TextureCoordinateS10_5, TextureLutMode, TileAddressMode, TileCoordinate, TileDescriptor,
+        TileSize, TmemFirstRowParity, TmemLoadEpoch, TmemWordAddress,
     };
 
     const LAYOUT_BYTES: u32 = 0x4000;
@@ -328,6 +329,7 @@ mod tests {
         valid_bytes: Vec<Option<u8>>,
         validity: Vec<bool>,
         touch_generations: Vec<Option<u64>>,
+        identity: PhysicalTmemStateIdentity,
         generation: u64,
         epoch: Option<TmemLoadEpoch>,
     }
@@ -346,6 +348,7 @@ mod tests {
             touch_generations: addresses
                 .map(|address| state.last_touched_generation(address))
                 .collect(),
+            identity: state.identity(),
             generation: state.generation(),
             epoch: state.last_load_epoch(),
         }
@@ -392,7 +395,11 @@ mod tests {
         .unwrap()
     }
 
-    fn finalize_packet(words: &[u32], accesses: Vec<ResourceAccess>) -> WorkloadPacket {
+    fn finalize_packet_with_sources(
+        words: &[u32],
+        accesses: Vec<ResourceAccess>,
+        sources: &[(u32, &[u8])],
+    ) -> WorkloadPacket {
         let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
         let byte_count = u32::try_from(words.len() * 4).unwrap();
         let stream = RawCommandStream::Dram(
@@ -431,9 +438,21 @@ mod tests {
                 .reads()
                 .iter()
                 .map(|read| {
-                    let bytes = (read.range().start().get()..read.range().end())
-                        .map(|address| address as u8)
-                        .collect();
+                    let start = read.range().start().get();
+                    let end = read.range().end();
+                    let bytes = sources
+                        .iter()
+                        .find_map(|(source_start, bytes)| {
+                            let source_end =
+                                source_start.checked_add(u32::try_from(bytes.len()).unwrap())?;
+                            if start < *source_start || end > source_end {
+                                return None;
+                            }
+                            let first = usize::try_from(start - *source_start).unwrap();
+                            let last = usize::try_from(end - *source_start).unwrap();
+                            Some(bytes[first..last].to_vec())
+                        })
+                        .unwrap_or_else(|| (start..end).map(|address| address as u8).collect());
                     CapturedGuestRead::try_new(*read, bytes).unwrap()
                 })
                 .collect(),
@@ -441,7 +460,19 @@ mod tests {
         preflight.finalize(capture).unwrap()
     }
 
+    fn finalize_packet(words: &[u32], accesses: Vec<ResourceAccess>) -> WorkloadPacket {
+        finalize_packet_with_sources(words, accesses, &[])
+    }
+
     fn packet_from_words(words: Vec<u32>, source_ranges: &[(u32, u32)]) -> WorkloadPacket {
+        packet_from_words_with_sources(words, source_ranges, &[])
+    }
+
+    fn packet_from_words_with_sources(
+        words: Vec<u32>,
+        source_ranges: &[(u32, u32)],
+        sources: &[(u32, &[u8])],
+    ) -> WorkloadPacket {
         let layout = PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap();
         let byte_count = u32::try_from(words.len() * 4).unwrap();
         let mut probe_accesses = vec![command_access(layout, byte_count, 0)];
@@ -461,11 +492,26 @@ mod tests {
             Err(RawDpcDecodeError::JournalMismatch { expected, .. }) => expected.into_vec(),
             other => panic!("planning probe did not request exact effects: {other:?}"),
         };
-        finalize_packet(&words, expected)
+        finalize_packet_with_sources(&words, expected, sources)
     }
 
     fn fixture(words: Vec<u32>, source_ranges: &[(u32, u32)]) -> Fixture {
         fixture_with_state(words, source_ranges, &RdpState::default())
+    }
+
+    fn fixture_with_sources(
+        words: Vec<u32>,
+        source_ranges: &[(u32, u32)],
+        sources: &[(u32, &[u8])],
+    ) -> Fixture {
+        let (mut queue, backend, guest) = TicketAuthoritySet::try_new().unwrap().into_roles();
+        let packet = packet_from_words_with_sources(words, source_ranges, sources);
+        let submitted = queue.submit(DecodedTicket::new(packet)).unwrap();
+        Fixture {
+            decoded: decode_raw_dpc(submitted, &RdpState::default()).unwrap(),
+            backend,
+            guest,
+        }
     }
 
     fn fixture_with_state(
@@ -754,6 +800,94 @@ mod tests {
         )
     }
 
+    fn rgba_cell_words(
+        image_address: u32,
+        size: PixelSize,
+        tmem: u16,
+    ) -> (Vec<u32>, Vec<(u32, u32)>) {
+        let size_wire = match size {
+            PixelSize::Bits16 => 2,
+            PixelSize::Bits32 => 3,
+            _ => unreachable!("RGBA cell fixture is 16-bit or 32-bit"),
+        };
+        let byte_count = if size == PixelSize::Bits16 { 8 } else { 16 };
+        (
+            vec![
+                word(SET_TEXTURE_IMAGE, size_wire << 19 | 1),
+                image_address,
+                word(SET_TILE, size_wire << 19 | 1 << 9 | u32::from(tmem)),
+                7 << 24,
+                word(LOAD_SYNC, 0),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 4 << 12 | 4,
+            ],
+            vec![(image_address, image_address + byte_count)],
+        )
+    }
+
+    fn ci_cell_tlut_words(
+        index_address: u32,
+        index_width: u32,
+        index_tmem: u16,
+        tlut_address: u32,
+    ) -> (Vec<u32>, Vec<(u32, u32)>) {
+        let index_bytes = index_width * 2;
+        (
+            vec![
+                word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | (index_width - 1)),
+                index_address,
+                word(SET_TILE, 2 << 21 | 1 << 19 | 1 << 9 | u32::from(index_tmem)),
+                7 << 24,
+                word(LOAD_SYNC, 0),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | ((index_width - 1) * 4) << 12 | 4,
+                word(SET_TEXTURE_IMAGE, 2 << 19 | 3),
+                tlut_address,
+                word(SET_TILE, 2 << 19 | 7 << 9 | 257),
+                7 << 24,
+                word(LOAD_SYNC, 1),
+                0,
+                word(LOAD_TLUT, 0),
+                7 << 24 | 3 << 14,
+            ],
+            vec![
+                (index_address, index_address + index_bytes),
+                (tlut_address, tlut_address + 8),
+            ],
+        )
+    }
+
+    fn publish_sources(
+        words: Vec<u32>,
+        ranges: &[(u32, u32)],
+        sources: &[(u32, &[u8])],
+    ) -> PhysicalTmemState {
+        let fixture = fixture_with_sources(words, ranges, sources);
+        let state = PhysicalTmemState::try_new().unwrap();
+        let pending =
+            execute_ordered_tmem_loads(&state, fixture.decoded.submitted(), &fixture.decoded)
+                .unwrap();
+        let mut state = state;
+        publish(&mut state, fixture, pending);
+        state
+    }
+
+    fn cell_request(parity: TmemFirstRowParity) -> PointSampleRequest {
+        PointSampleRequest::new(
+            PointSampleCoordinates::new(
+                TextureCoordinateS10_5::from_raw(16),
+                TextureCoordinateS10_5::from_raw(16),
+            ),
+            parity,
+        )
+    }
+
+    fn cell_colors(cell: crate::CommittedTextureCell) -> [[u8; 4]; 4] {
+        cell.texels().map(|texel| texel.texel().rgba8888())
+    }
+
     fn ci_and_offset_tlut_reader_words() -> (Vec<u32>, Vec<(u32, u32)>) {
         let ci8_address = 0x128;
         let ci4_address = 0x189;
@@ -831,6 +965,48 @@ mod tests {
             vec![
                 (index_address, index_address + 8),
                 (high_address, high_address + u32::from(high_texels)),
+            ],
+        )
+    }
+
+    fn ci_cell_with_hostile_second_tlut_words(high_texels: u16) -> (Vec<u32>, Vec<(u32, u32)>) {
+        let index_address = 0x200;
+        let canonical_address = 0x300;
+        let hostile_address = 0x400;
+        (
+            vec![
+                word(SET_TEXTURE_IMAGE, 2 << 21 | 1 << 19 | 1),
+                index_address,
+                word(SET_TILE, 2 << 21 | 1 << 19 | 1 << 9),
+                7 << 24,
+                word(LOAD_SYNC, 0),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | 4 << 12,
+                word(SET_TEXTURE_IMAGE, 2 << 19),
+                canonical_address,
+                word(SET_TILE, 2 << 19 | 7 << 9 | 256),
+                7 << 24,
+                word(LOAD_SYNC, 1),
+                0,
+                word(LOAD_TLUT, 0),
+                7 << 24,
+                word(
+                    SET_TEXTURE_IMAGE,
+                    4 << 21 | 1 << 19 | u32::from(high_texels - 1),
+                ),
+                hostile_address,
+                word(SET_TILE, 4 << 21 | 1 << 19 | 1 << 9 | 257),
+                7 << 24,
+                word(LOAD_SYNC, 2),
+                0,
+                word(LOAD_TILE, 0),
+                7 << 24 | u32::from((high_texels - 1) * 4) << 12,
+            ],
+            vec![
+                (index_address, index_address + 2),
+                (canonical_address, canonical_address + 2),
+                (hostile_address, hostile_address + u32::from(high_texels)),
             ],
         )
     }
@@ -1007,6 +1183,46 @@ mod tests {
         assert_eq!(even.snapshot(), odd.snapshot());
         assert_eq!(even.snapshot().state(), state.identity());
         assert_eq!(even.snapshot().generation(), before.generation);
+
+        let even_cell = gather_committed_texture_cell(
+            &state,
+            tile,
+            size,
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        let odd_cell = gather_committed_texture_cell(
+            &state,
+            tile,
+            size,
+            cell_request(TmemFirstRowParity::Odd),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(
+            cell_colors(even_cell),
+            [[0x0c; 4], [0x14; 4], [0x0d; 4], [0x15; 4]]
+        );
+        assert_eq!(
+            cell_colors(odd_cell),
+            [[0x08; 4], [0x10; 4], [0x09; 4], [0x11; 4]]
+        );
+        for corner in [
+            TextureCellCorner::UpperLeft,
+            TextureCellCorner::LowerLeft,
+            TextureCellCorner::UpperRight,
+            TextureCellCorner::LowerRight,
+        ] {
+            assert_eq!(
+                even_cell.addressed().corner(corner).first_row_parity(),
+                TmemFirstRowParity::Even
+            );
+            assert_eq!(
+                odd_cell.addressed().corner(corner).first_row_parity(),
+                TmemFirstRowParity::Odd
+            );
+        }
         assert_eq!(observe_durable(&state), before);
     }
 
@@ -1084,6 +1300,166 @@ mod tests {
         assert_eq!(rgba32.texel().rgba8888(), [32, 33, 34, 35]);
         assert_eq!(rgba32.snapshot().state(), state.identity());
         assert_eq!(rgba32.snapshot().generation(), before.generation);
+        assert_eq!(observe_durable(&state), before);
+    }
+
+    #[test]
+    fn committed_texture_cell_gathers_literal_rgba16_and_rgba32_corners() {
+        let rgba16_source = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
+        let (words, ranges) = rgba_cell_words(0x200, PixelSize::Bits16, 32);
+        let rgba16 = publish_sources(words, &ranges, &[(0x200, &rgba16_source)]);
+        let before = observe_durable(&rgba16);
+        let cell = gather_committed_texture_cell(
+            &rgba16,
+            reader_tile(ImageFormat::Rgba, PixelSize::Bits16, 1, 32, 0),
+            reader_size(0, 0, 4, 4),
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(
+            cell_colors(cell),
+            [
+                [255, 0, 0, 255],
+                [0, 0, 255, 255],
+                [0, 255, 0, 255],
+                [255, 255, 255, 255],
+            ]
+        );
+        for texel in cell.texels() {
+            assert_eq!(texel.snapshot().state(), rgba16.identity());
+            assert_eq!(texel.snapshot().generation(), before.generation);
+        }
+        assert_eq!(observe_durable(&rgba16), before);
+
+        let rgba32_source = [
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+            0xf0, 0xff,
+        ];
+        let (words, ranges) = rgba_cell_words(0x300, PixelSize::Bits32, 64);
+        let rgba32 = publish_sources(words, &ranges, &[(0x300, &rgba32_source)]);
+        let before = observe_durable(&rgba32);
+        let cell = gather_committed_texture_cell(
+            &rgba32,
+            reader_tile(ImageFormat::Rgba, PixelSize::Bits32, 1, 64, 0),
+            reader_size(0, 0, 4, 4),
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Disabled,
+        )
+        .unwrap();
+        assert_eq!(
+            cell_colors(cell),
+            [
+                [0x10, 0x20, 0x30, 0x40],
+                [0x90, 0xa0, 0xb0, 0xc0],
+                [0x50, 0x60, 0x70, 0x80],
+                [0xd0, 0xe0, 0xf0, 0xff],
+            ]
+        );
+        for texel in cell.texels() {
+            assert_eq!(texel.snapshot().state(), rgba32.identity());
+            assert_eq!(texel.snapshot().generation(), before.generation);
+        }
+        assert_eq!(observe_durable(&rgba32), before);
+    }
+
+    #[test]
+    fn committed_texture_cell_resolves_each_ci_corner_through_its_tlut_entry() {
+        let ci4_indices = [0x12, 0x34];
+        let rgba16_entries = [0xf8, 0x01, 0x07, 0xc1, 0x00, 0x3f, 0xff, 0xff];
+        let (words, ranges) = ci_cell_tlut_words(0x200, 1, 8, 0x300);
+        let ci4 = publish_sources(
+            words,
+            &ranges,
+            &[(0x200, &ci4_indices), (0x300, &rgba16_entries)],
+        );
+        let before = observe_durable(&ci4);
+        let cell = gather_committed_texture_cell(
+            &ci4,
+            reader_tile(ImageFormat::ColorIndex, PixelSize::Bits4, 1, 8, 0),
+            reader_size(0, 0, 4, 4),
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Rgba16,
+        )
+        .unwrap();
+        assert_eq!(
+            cell_colors(cell),
+            [
+                [255, 0, 0, 255],
+                [0, 0, 255, 255],
+                [0, 255, 0, 255],
+                [255, 255, 255, 255],
+            ]
+        );
+        assert!(cell
+            .texels()
+            .iter()
+            .all(|texel| texel.snapshot() == cell.texels()[0].snapshot()));
+        assert_eq!(observe_durable(&ci4), before);
+
+        let ci8_indices = [0x01, 0x02, 0x03, 0x04];
+        let ia16_entries = [0x10, 0x01, 0x20, 0x40, 0x80, 0xff, 0xff, 0x00];
+        let (words, ranges) = ci_cell_tlut_words(0x400, 2, 16, 0x500);
+        let ci8 = publish_sources(
+            words,
+            &ranges,
+            &[(0x400, &ci8_indices), (0x500, &ia16_entries)],
+        );
+        let before = observe_durable(&ci8);
+        let cell = gather_committed_texture_cell(
+            &ci8,
+            reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 16, 0),
+            reader_size(0, 0, 4, 4),
+            cell_request(TmemFirstRowParity::Even),
+            TextureLutMode::Ia16,
+        )
+        .unwrap();
+        assert_eq!(
+            cell_colors(cell),
+            [
+                [16, 16, 16, 1],
+                [128, 128, 128, 255],
+                [32, 32, 32, 64],
+                [255, 255, 255, 0],
+            ]
+        );
+        assert!(cell
+            .texels()
+            .iter()
+            .all(|texel| texel.snapshot() == cell.texels()[0].snapshot()));
+        assert_eq!(observe_durable(&ci8), before);
+    }
+
+    #[test]
+    fn committed_texture_cell_reports_the_first_invalid_semantic_corner() {
+        let image_address = 0x200;
+        let source = [0x11, 0x22];
+        let words = vec![
+            word(SET_TEXTURE_IMAGE, 4 << 21 | 1 << 19),
+            image_address,
+            word(SET_TILE, 4 << 21 | 1 << 19 | 1 << 9),
+            7 << 24,
+            word(LOAD_SYNC, 0),
+            0,
+            word(LOAD_TILE, 0),
+            7 << 24 | 4,
+        ];
+        let ranges = [(image_address, image_address + 2)];
+        let state = publish_sources(words, &ranges, &[(image_address, &source)]);
+        let before = observe_durable(&state);
+        assert_eq!(
+            gather_committed_texture_cell(
+                &state,
+                reader_tile(ImageFormat::Intensity, PixelSize::Bits8, 1, 0, 0),
+                reader_size(0, 0, 4, 4),
+                cell_request(TmemFirstRowParity::Even),
+                TextureLutMode::Disabled,
+            ),
+            Err(TextureCellSampleError::Read {
+                corner: TextureCellCorner::UpperRight,
+                source: PhysicalTexelReadError::InvalidTexelByte { address: 0x001 },
+            })
+        );
         assert_eq!(observe_durable(&state), before);
     }
 
@@ -1257,6 +1633,69 @@ mod tests {
             ))
         );
         assert_eq!(observe_durable(&unequal), unequal_before);
+    }
+
+    #[test]
+    fn committed_texture_cell_locates_nonfirst_partial_and_unequal_tlut_errors() {
+        let indices = [0x00, 0x01];
+        let canonical = [0xf8, 0x01];
+        let request = PointSampleRequest::new(
+            PointSampleCoordinates::new(
+                TextureCoordinateS10_5::from_raw(16),
+                TextureCoordinateS10_5::from_raw(0),
+            ),
+            TmemFirstRowParity::Even,
+        );
+        let tile = reader_tile(ImageFormat::ColorIndex, PixelSize::Bits8, 1, 0, 0);
+        let size = reader_size(0, 0, 4, 0);
+
+        let hostile_partial = [0xaa, 0xbb];
+        let (words, ranges) = ci_cell_with_hostile_second_tlut_words(2);
+        let partial = publish_sources(
+            words,
+            &ranges,
+            &[
+                (0x200, &indices),
+                (0x300, &canonical),
+                (0x400, &hostile_partial),
+            ],
+        );
+        let before = observe_durable(&partial);
+        assert_eq!(
+            gather_committed_texture_cell(&partial, tile, size, request, TextureLutMode::Rgba16,),
+            Err(TextureCellSampleError::Read {
+                corner: TextureCellCorner::UpperRight,
+                source: PhysicalTexelReadError::IncompleteTlutEntry {
+                    byte_address: 0x808,
+                    valid_mask: 0x03,
+                },
+            })
+        );
+        assert_eq!(observe_durable(&partial), before);
+
+        let hostile_unequal = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let (words, ranges) = ci_cell_with_hostile_second_tlut_words(8);
+        let unequal = publish_sources(
+            words,
+            &ranges,
+            &[
+                (0x200, &indices),
+                (0x300, &canonical),
+                (0x400, &hostile_unequal),
+            ],
+        );
+        let before = observe_durable(&unequal);
+        assert_eq!(
+            gather_committed_texture_cell(&unequal, tile, size, request, TextureLutMode::Ia16),
+            Err(TextureCellSampleError::Read {
+                corner: TextureCellCorner::UpperRight,
+                source: PhysicalTexelReadError::NonCanonicalTlutEntry {
+                    byte_address: 0x808,
+                    lanes: [0x0001, 0x0203, 0x0405, 0x0607],
+                },
+            })
+        );
+        assert_eq!(observe_durable(&unequal), before);
     }
 
     #[test]
