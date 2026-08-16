@@ -276,9 +276,42 @@ masquerading as a direct color.
 M4.3.3b makes no physical TMEM address/read, validity, epoch, generation,
 snapshot, first-row, odd-row, footprint, sampling, filtering, bilerp, LOD,
 cache, WGSL/GPU/upload, production-dispatch, YUV, non-CI TLUT-mode, parity, or
-performance claim. A later reader must bind the index and palette entry to one
-immutable `(PhysicalTmemStateIdentity, generation)` snapshot and resolve the
-still-open quadricated validity footprint before calling these pure functions.
+performance claim. On its own it leaves snapshot binding and the quadricated
+validity footprint to the physical reader below.
+
+M4.3.3c supplies that bounded physical reader as
+`read_committed_texel(&PhysicalTmemState, TileDescriptor,
+AddressedTmemTexel, TextureLutMode)`. `AddressedTmemTexel` contains only an
+already-normalized integer column/row and explicit caller-supplied first-row
+parity; the reader never infers parity or performs shift, mask, mirror, clamp,
+sampling, filtering, bilerp, or LOD. It preflights the format/size/mode through
+M4.3.3a/b's pure decoders before reading any byte, then applies the tile's
+64-bit line stride, 12-bit linear wrapping, and first-row-parity XOR row-parity
+XOR4 exchange. Four-bit texels use high-nibble-first packed bytes, eight-bit
+texels use one byte each, 16-bit values combine big-endian, and RGBA32 requires
+a low-half tile base and reads RG from the low 2 KiB bank plus BA from the
+corresponding high-bank address.
+
+Every physical byte in a selected texel must be valid. Valid bytes may have
+different touch generations or predate the durable state's current generation:
+the result is instead bound to one `PhysicalTmemSnapshotIdentity` containing
+the state allocation's uncaller-chosen identity and the generation captured
+once for the immutable read. Enabled CI4/CI8 sources must resolve inside
+canonical low-half TMEM. Their lookup always uses the absolute M4.3.3b address
+`0x800 + index * 8`, never a tile-relative or rebased palette location, and
+accepts an entry only when all eight quadricated bytes are valid and all four
+big-endian 16-bit lanes are equal. The Programming Manual section 13.8
+partial-CI8 example places indices 40..=69 at absolute TMEM words 296..=325
+(`256 + index`); the committed fixture uses that placement and proves an
+unloaded lower index is not silently rebased. The all-eight-valid/equal rule is
+an admitted conservative canonical subset, not a hardware claim about partial
+or unequal words: both remain distinct typed errors here while their actual
+sample-lane behavior awaits hardware measurement. Disabled CI remains
+M4.3.3b's I8 alias and CI8 still ignores the tile palette.
+
+This is a CPU-only read/decode mechanism over already-published durable state.
+It does not add YUV, CI16/CI32, cache identity/publication, WGSL, GPU upload,
+sampling, production dispatch, visual parity, or performance evidence.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,

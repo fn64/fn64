@@ -34,6 +34,15 @@
 //! RGBA16/IA16 modes return a lookup value consumed with one caller-supplied
 //! big-endian 16-bit entry. It performs no physical TMEM read, validity,
 //! generation, sampling, cache, shader, or production-dispatch work.
+//! M4.3.3c adds `read_committed_texel`, a CPU-only reader over durable
+//! `PhysicalTmemState`. It preflights through the pure decoders, takes
+//! explicit first-row parity, requires every direct/index/TLUT footprint byte
+//! to be valid, accepts valid bytes touched by earlier generations, and binds
+//! the result to one captured state identity/generation. Enabled CI accepts
+//! only canonical low-half sources and a conservative all-eight-valid/equal
+//! quadricated TLUT subset; partial/unequal sample-lane behavior remains a
+//! hardware-measurement frontier. It adds no coordinate normalization,
+//! sampling, filtering, LOD, cache, WGSL/GPU, or production path.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
@@ -249,17 +258,19 @@ pub use targets::{
 };
 pub use tmem::{
     decode_direct_texel, decode_tlut_entry, execute_ordered_tmem_loads, prepare_load_block,
-    prepare_load_tile, prepare_load_tlut, resolve_indexed_texel, unpack_ci4_texel, Ci4Palette,
-    Ci4PaletteError, Ci4UnpackError, CommittedTmemTransaction, DecodedTexel,
-    DefinedPhysicalTmemWordBytes, DirectTexelDecodeError, ExecutedLoadBlock, ExecutedLoadTile,
-    ExecutedLoadTlut, GpuBoundTmemTransaction, IndexedTexelResolveError, LoadBlockExecutionError,
-    LoadTileExecutionError, LoadTlutExecutionError, PendingTmemTransaction, PhysicalTmemBinding,
-    PhysicalTmemError, PhysicalTmemPacketTransaction, PhysicalTmemPublicationAuthority,
-    PhysicalTmemState, PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity,
-    PreparedLoadBlock, PreparedLoadTile, PreparedLoadTlut, RawTexel, RawTexelError,
-    ResolvedIndexedTexel, StagedTmemTransaction, TexelColumnParity, TextureImage, TileAddressMode,
-    TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount,
-    TlutEntryDecodeError, TlutLookup, TmemDxt, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan,
+    prepare_load_tile, prepare_load_tlut, read_committed_texel, resolve_indexed_texel,
+    unpack_ci4_texel, AddressedTmemTexel, Ci4Palette, Ci4PaletteError, Ci4UnpackError,
+    CommittedTmemTransaction, DecodedPhysicalTexel, DecodedTexel, DefinedPhysicalTmemWordBytes,
+    DirectTexelDecodeError, ExecutedLoadBlock, ExecutedLoadTile, ExecutedLoadTlut,
+    GpuBoundTmemTransaction, IndexedTexelResolveError, LoadBlockExecutionError,
+    LoadTileExecutionError, LoadTlutExecutionError, PendingTmemTransaction, PhysicalTexelReadError,
+    PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,
+    PhysicalTmemPublicationAuthority, PhysicalTmemSnapshotIdentity, PhysicalTmemState,
+    PhysicalTmemStateIdentity, PhysicalTmemTransactionIdentity, PreparedLoadBlock,
+    PreparedLoadTile, PreparedLoadTlut, RawTexel, RawTexelError, ResolvedIndexedTexel,
+    StagedTmemTransaction, TexelColumnParity, TextureImage, TileAddressMode, TileCoordinate,
+    TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TlutEntryDecodeError,
+    TlutLookup, TmemDxt, TmemFirstRowParity, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan,
     TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan,
     TmemPacketExecutionError, TmemState, TmemTransferLayout, TmemTransferPhysicalWord,
     TmemTransferPlan, TmemTransferWord, TmemWordAddress,
