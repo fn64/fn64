@@ -2,7 +2,7 @@
   "schema": "fn64.rt64-shader-artifact-policy.v1",
   "receipt_schema": "fn64.rt64-shader-artifact-receipt.v1",
   "source_denominator_schema": "fn64.rt64-shader-source-denominator.v1",
-  "build_receipt_schema": "fn64.dxc-source-build.v1",
+  "build_receipt_schema": "fn64.dxc-source-build.v2",
   "git_checkout_maximum_file_bytes": 268435456,
   "rt64": {
     "repository": "https://github.com/rt64/rt64",
@@ -136,6 +136,25 @@
       "-DLLVM_TARGETS_TO_BUILD=None"
     ],
     "build_target": "dxc",
+    "maximum_compiler_bytes": 536870912,
+    "maximum_runtime_dependency_bytes": 536870912,
+    "darwin_runtime_closure": {
+      "inspector": "/usr/bin/otool",
+      "format": "otool-L-v1",
+      "system_load_names": [
+        "/usr/lib/libSystem.B.dylib",
+        "/usr/lib/libz.1.dylib",
+        "/usr/lib/libc++.1.dylib"
+      ],
+      "retained": [
+        {
+          "load_name": "@rpath/libdxcompiler.dylib",
+          "relative_path": "build/lib/libdxcompiler.dylib",
+          "snapshot_relative_path": "lib/libdxcompiler.dylib",
+          "install_name": "@rpath/libdxcompiler.dylib"
+        }
+      ]
+    },
     "maximum_compiled_source_manifest_bytes": 33554432
   },
   "validator": {

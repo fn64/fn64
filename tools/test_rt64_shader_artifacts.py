@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rt64_shader_artifacts as artifacts
@@ -295,6 +296,269 @@ class DxcBuildManifestTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(artifacts.ArtifactError, "lack compile-command"):
                 artifacts.compiled_source_manifest(source, build, compile_commands, ninja_log)
+
+
+class DxcCompilerArtifactTests(unittest.TestCase):
+    def fixture(self, temporary: str) -> tuple[Path, Path, Path]:
+        root = Path(temporary)
+        target = root / "build/bin/dxc-3.7"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"#!/bin/sh\nexit 0\n")
+        target.chmod(0o700)
+        alias = target.with_name("dxc")
+        alias.symlink_to("dxc-3.7")
+        return root, alias, target
+
+    def qualify(self, root: Path, alias: Path) -> artifacts.ContainedExecutable:
+        return artifacts.qualify_contained_executable(root, alias, 1024, "fixture compiler")
+
+    def closure_fixture(self, temporary: str) -> tuple[artifacts.DxcCompilerClosure, Path, Path]:
+        root, alias, target = self.fixture(temporary)
+        target.write_bytes(b"#!/bin/sh\nprintf 'GOOD\\n'\n")
+        target.chmod(0o700)
+        library = root / "build/lib/libdxcompiler.dylib"
+        library.parent.mkdir(parents=True)
+        library.write_bytes(b"GOOD LIBRARY\n")
+        library.chmod(0o700)
+        compiler = self.qualify(root, alias)
+        runtime = artifacts.qualify_contained_executable(root, library, 1024, "fixture runtime")
+        closure = artifacts.DxcCompilerClosure(
+            root=root,
+            compiler=compiler,
+            runtime_files=((runtime, "lib/libdxcompiler.dylib"),),
+            inspector=Path("/usr/bin/false"),
+            receipt_record={"fixture": True},
+        )
+        return closure, target, library
+
+    def test_official_relative_symlink_binds_alias_text_and_target_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, target = self.fixture(temporary)
+            qualified = self.qualify(root, alias)
+            self.assertEqual(qualified.invocation_path, alias)
+            self.assertEqual(qualified.target_path, target)
+            self.assertEqual(qualified.receipt_record, {
+                "kind": "relative-contained-symlink",
+                "invocation_relative_path": "build/bin/dxc",
+                "link_text": "dxc-3.7",
+                "target_relative_path": "build/bin/dxc-3.7",
+                "target_bytes": target.stat().st_size,
+                "target_sha256": artifacts.digest_bytes(target.read_bytes()),
+            })
+
+    def test_regular_compiler_path_is_bound_without_a_link_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, target = self.fixture(temporary)
+            alias.unlink()
+            target.rename(alias)
+            qualified = self.qualify(root, alias)
+            self.assertEqual(qualified.target_path, alias)
+            self.assertEqual(qualified.receipt_record["kind"], "regular")
+            self.assertNotIn("link_text", qualified.receipt_record)
+
+    def test_symlinked_admitted_root_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            storage = Path(temporary) / "storage"
+            root, alias, _ = self.fixture(str(storage))
+            root_alias = Path(temporary) / "root-alias"
+            root_alias.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(artifacts.ArtifactError, "root is not a regular directory"):
+                self.qualify(root_alias, root_alias / alias.relative_to(root))
+
+    def test_absolute_symlink_target_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, target = self.fixture(temporary)
+            alias.unlink()
+            alias.symlink_to(target)
+            with self.assertRaisesRegex(artifacts.ArtifactError, "must be relative"):
+                self.qualify(root, alias)
+
+    def test_parent_escape_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, _ = self.fixture(temporary)
+            alias.unlink()
+            alias.symlink_to("../../../outside-dxc")
+            with self.assertRaisesRegex(artifacts.ArtifactError, "may not escape"):
+                self.qualify(root, alias)
+
+    def test_multi_hop_symlink_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, target = self.fixture(temporary)
+            intermediate = target.with_name("intermediate")
+            intermediate.symlink_to(target.name)
+            alias.unlink()
+            alias.symlink_to(intermediate.name)
+            with self.assertRaisesRegex(artifacts.ArtifactError, "another symlink"):
+                self.qualify(root, alias)
+
+    def test_nonregular_target_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, _ = self.fixture(temporary)
+            directory = alias.parent / "directory"
+            directory.mkdir()
+            alias.unlink()
+            alias.symlink_to(directory.name)
+            with self.assertRaisesRegex(artifacts.ArtifactError, "not a regular file"):
+                self.qualify(root, alias)
+
+    @unittest.skipUnless(hasattr(os, "link"), "hardlinks unavailable")
+    def test_hardlinked_target_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, target = self.fixture(temporary)
+            os.link(target, target.with_name("reused-target"))
+            with self.assertRaisesRegex(artifacts.ArtifactError, "another hardlink"):
+                self.qualify(root, alias)
+
+    def test_link_swap_during_target_read_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, _ = self.fixture(temporary)
+            original = artifacts.stable_file_bytes
+
+            def swap(path: Path, maximum: int, label: str) -> bytes:
+                data = original(path, maximum, label)
+                alias.unlink()
+                alias.symlink_to("different-target")
+                return data
+
+            with mock.patch.object(artifacts, "stable_file_bytes", side_effect=swap):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "symlink changed"):
+                    self.qualify(root, alias)
+
+    def test_target_swap_during_descriptor_read_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, target = self.fixture(temporary)
+            replacement = target.with_name("replacement")
+            replacement.write_bytes(b"#!/bin/sh\nexit 1\n")
+            replacement.chmod(0o700)
+            original = artifacts.stable_file_bytes
+
+            def swap(path: Path, maximum: int, label: str) -> bytes:
+                data = original(path, maximum, label)
+                target.unlink()
+                replacement.rename(target)
+                return data
+
+            with mock.patch.object(artifacts, "stable_file_bytes", side_effect=swap):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "path changed"):
+                    self.qualify(root, alias)
+
+    def test_version_executes_private_closure_during_source_swap_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            closure, target, library = self.closure_fixture(temporary)
+            original_run = subprocess.run
+            good_target = target.read_bytes()
+            good_library = library.read_bytes()
+
+            def swap(command, **kwargs) -> subprocess.CompletedProcess:
+                self.assertNotEqual(Path(command[0]), closure.compiler.invocation_path)
+                self.assertEqual(Path(command[0]).read_bytes(), good_target)
+                self.assertEqual(Path(command[0]).parent.parent.joinpath("lib/libdxcompiler.dylib").read_bytes(), good_library)
+                target.write_bytes(b"#!/bin/sh\nprintf 'EVIL\\n'\n")
+                library.write_bytes(b"EVIL LIBRARY\n")
+                try:
+                    return original_run(command, **kwargs)
+                finally:
+                    target.write_bytes(good_target)
+                    library.write_bytes(good_library)
+
+            with mock.patch.object(artifacts.subprocess, "run", side_effect=swap):
+                record = artifacts.dxc_closure_tool_record(closure, ["--version"], closure.root)
+            self.assertEqual(record["version_stdout"], "GOOD")
+            self.assertEqual(target.read_bytes(), good_target)
+            self.assertEqual(library.read_bytes(), good_library)
+
+    def test_produce_path_uses_one_private_closure_during_source_swap_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            closure, target, library = self.closure_fixture(temporary)
+            good_target = target.read_bytes()
+            good_library = library.read_bytes()
+            with artifacts.staged_dxc_compiler(closure, closure.root) as compiler:
+                self.assertNotEqual(compiler, closure.compiler.invocation_path)
+                target.write_bytes(b"#!/bin/sh\nprintf 'EVIL\\n'\n")
+                library.write_bytes(b"EVIL LIBRARY\n")
+                first = artifacts.run_dxc([str(compiler), "preprocess"], closure.root)
+                target.write_bytes(good_target)
+                library.write_bytes(good_library)
+                target.write_bytes(b"#!/bin/sh\nprintf 'EVIL AGAIN\\n'\n")
+                library.write_bytes(b"EVIL LIBRARY AGAIN\n")
+                second = artifacts.run_dxc([str(compiler), "compile"], closure.root)
+                target.write_bytes(good_target)
+                library.write_bytes(good_library)
+            self.assertEqual(first["stdout_sha256"], artifacts.digest_bytes(b"GOOD\n"))
+            self.assertEqual(second["stdout_sha256"], artifacts.digest_bytes(b"GOOD\n"))
+            self.assertEqual(target.read_bytes(), good_target)
+            self.assertEqual(library.read_bytes(), good_library)
+
+    def test_unclassified_non_system_runtime_dependency_fails_closed(self) -> None:
+        with self.assertRaisesRegex(artifacts.ArtifactError, "unclassified non-system"):
+            artifacts.classify_macho_loads(
+                [{"load_name": "@rpath/evil.dylib", "descriptor": "@rpath/evil.dylib (compatibility version 1.0.0)"}],
+                {},
+                {"/usr/lib/libSystem.B.dylib"},
+                "fixture",
+            )
+
+    def test_runtime_inspector_reads_the_private_closure_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, target = self.fixture(temporary)
+            library = root / "build/lib/libdxcompiler.dylib"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"GOOD LIBRARY\n")
+            library.chmod(0o700)
+            good_target = target.read_bytes()
+            good_library = library.read_bytes()
+            policy = {
+                "maximum_compiler_bytes": 1024,
+                "maximum_runtime_dependency_bytes": 1024,
+                "darwin_runtime_closure": {
+                    "inspector": "/usr/bin/true",
+                    "format": "otool-L-v1",
+                    "system_load_names": ["/usr/lib/system.dylib"],
+                    "retained": [{
+                        "load_name": "@rpath/libdxcompiler.dylib",
+                        "relative_path": "build/lib/libdxcompiler.dylib",
+                        "snapshot_relative_path": "lib/libdxcompiler.dylib",
+                        "install_name": "@rpath/libdxcompiler.dylib",
+                    }],
+                },
+            }
+
+            def inspect(_inspector: Path, path: Path, _label: str) -> tuple[list[dict], dict]:
+                self.assertIn(".fn64-dxc-runtime-", str(path))
+                self.assertNotIn(path, (target, library))
+                if path.name == "dxc":
+                    self.assertEqual(path.read_bytes(), good_target)
+                    rows = [
+                        {"load_name": "@rpath/libdxcompiler.dylib", "descriptor": "retained"},
+                        {"load_name": "/usr/lib/system.dylib", "descriptor": "system"},
+                    ]
+                else:
+                    self.assertEqual(path.read_bytes(), good_library)
+                    rows = [
+                        {"load_name": "@rpath/libdxcompiler.dylib", "descriptor": "install"},
+                        {"load_name": "/usr/lib/system.dylib", "descriptor": "system"},
+                    ]
+                target.write_bytes(b"EVIL COMPILER\n")
+                library.write_bytes(b"EVIL LIBRARY\n")
+                target.write_bytes(good_target)
+                library.write_bytes(good_library)
+                return rows, {"loads_sha256": artifacts.digest_bytes(artifacts.canonical_json(rows)), "stderr_sha256": "0" * 64}
+
+            with mock.patch.object(artifacts, "inspect_otool_loads", side_effect=inspect):
+                closure = artifacts.qualify_dxc_runtime_closure(root, [alias], policy)
+            self.assertEqual(closure.compiler.receipt_record["target_sha256"], artifacts.digest_bytes(good_target))
+            self.assertEqual(
+                closure.runtime_files[0][0].receipt_record["target_sha256"],
+                artifacts.digest_bytes(good_library),
+            )
+
+    def test_multiple_reviewed_aliases_reusing_one_target_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, alias, _ = self.fixture(temporary)
+            second = alias.with_name("dxc.exe")
+            second.symlink_to("dxc-3.7")
+            with self.assertRaisesRegex(artifacts.ArtifactError, "multiple dxc invocation paths"):
+                artifacts.select_dxc_compiler(root, [alias, second], 1024)
 
 
 class ValidatorIsolationTests(unittest.TestCase):

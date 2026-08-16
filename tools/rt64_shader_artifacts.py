@@ -21,6 +21,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
@@ -33,7 +35,7 @@ TOOL_PATH = Path(__file__).resolve()
 
 POLICY_SCHEMA = "fn64.rt64-shader-artifact-policy.v1"
 DENOMINATOR_SCHEMA = "fn64.rt64-shader-source-denominator.v1"
-BUILD_SCHEMA = "fn64.dxc-source-build.v1"
+BUILD_SCHEMA = "fn64.dxc-source-build.v2"
 VALIDATOR_BUILD_SCHEMA = "fn64.wgpu-shader-validator-build.v1"
 RECEIPT_SCHEMA = "fn64.rt64-shader-artifact-receipt.v1"
 VALIDATOR_SCHEMA = "fn64.wgpu-shader-validator.v1"
@@ -131,6 +133,121 @@ def stable_file_bytes(path: Path, maximum: int, label: str) -> bytes:
         return data
     finally:
         os.close(descriptor)
+
+
+def file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def stable_regular_bytes(path: Path, maximum: int, label: str) -> tuple[bytes, os.stat_result]:
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and not path.is_symlink(), f"{label} is not a regular file")
+    data = stable_file_bytes(path, maximum, label)
+    after = path.lstat()
+    require(file_identity(before) == file_identity(after), f"{label} path changed while it was read")
+    return data, after
+
+
+def contained_parent_identities(root: Path, path: Path, label: str) -> list[tuple[Path, tuple[int, int, int, int, int, int, int]]]:
+    require(root.is_absolute() and path.is_absolute(), f"{label} containment requires absolute paths")
+    relative = relative_to(path, root)
+    require(relative is not None and relative.parts, f"{label} escaped its admitted root")
+    root_info = root.lstat()
+    require(stat.S_ISDIR(root_info.st_mode) and not root.is_symlink(), f"{label} root is not a regular directory")
+    rows = [(root, file_identity(root_info))]
+    current = root
+    for part in relative.parts[:-1]:
+        current /= part
+        info = current.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not current.is_symlink(), f"{label} has a non-directory or symlinked parent")
+        rows.append((current, file_identity(info)))
+    return rows
+
+
+def verify_parent_identities(
+    rows: list[tuple[Path, tuple[int, int, int, int, int, int, int]]],
+    label: str,
+) -> None:
+    for path, expected in rows:
+        info = path.lstat()
+        require(
+            stat.S_ISDIR(info.st_mode)
+            and not path.is_symlink()
+            and file_identity(info) == expected,
+            f"{label} parent path changed while it was qualified",
+        )
+
+
+@dataclass(frozen=True)
+class ContainedExecutable:
+    root: Path
+    invocation_path: Path
+    target_path: Path
+    receipt_record: dict
+
+
+def qualify_contained_executable(root: Path, invocation: Path, maximum: int, label: str) -> ContainedExecutable:
+    """Qualify one executable leaf without resolving away an admitted symlink edge."""
+    root = root.absolute()
+    invocation = invocation.absolute()
+    parents = contained_parent_identities(root, invocation, label)
+    alias_before = invocation.lstat()
+    require(alias_before.st_nlink == 1, f"{label} invocation path has another hardlink")
+
+    if stat.S_ISLNK(alias_before.st_mode):
+        link_text = os.readlink(invocation)
+        require(link_text and not os.path.isabs(link_text), f"{label} symlink target must be relative")
+        link_parts = Path(link_text).parts
+        require(".." not in link_parts, f"{label} symlink target may not escape with '..'")
+        target = invocation.parent.joinpath(*link_parts).absolute()
+        require(relative_to(target, root) is not None and target != invocation, f"{label} symlink target escaped its admitted root")
+        target_parents = contained_parent_identities(root, target, f"{label} target")
+        target_before = target.lstat()
+        require(not stat.S_ISLNK(target_before.st_mode), f"{label} symlink target is another symlink")
+        require(stat.S_ISREG(target_before.st_mode), f"{label} symlink target is not a regular file")
+        require(target_before.st_nlink == 1, f"{label} target has another hardlink")
+        require(bool(target_before.st_mode & 0o111), f"{label} target is not executable")
+        data, target_after = stable_regular_bytes(target, maximum, f"{label} target")
+        alias_after = invocation.lstat()
+        require(
+            file_identity(alias_before) == file_identity(alias_after)
+            and stat.S_ISLNK(alias_after.st_mode)
+            and os.readlink(invocation) == link_text,
+            f"{label} symlink changed while its target was read",
+        )
+        require(file_identity(target_before) == file_identity(target_after), f"{label} target path changed while it was read")
+        verify_parent_identities(parents, label)
+        verify_parent_identities(target_parents, f"{label} target")
+        record = {
+            "kind": "relative-contained-symlink",
+            "invocation_relative_path": invocation.relative_to(root).as_posix(),
+            "link_text": link_text,
+            "target_relative_path": target.relative_to(root).as_posix(),
+            "target_bytes": len(data),
+            "target_sha256": digest_bytes(data),
+        }
+        return ContainedExecutable(root, invocation, target, record)
+
+    require(stat.S_ISREG(alias_before.st_mode), f"{label} invocation path is not a regular file or symlink")
+    require(bool(alias_before.st_mode & 0o111), f"{label} invocation path is not executable")
+    data, alias_after = stable_regular_bytes(invocation, maximum, label)
+    require(file_identity(alias_before) == file_identity(alias_after), f"{label} path changed while it was read")
+    verify_parent_identities(parents, label)
+    record = {
+        "kind": "regular",
+        "invocation_relative_path": invocation.relative_to(root).as_posix(),
+        "target_bytes": len(data),
+        "target_sha256": digest_bytes(data),
+    }
+    return ContainedExecutable(root, invocation, invocation, record)
 
 
 def write_new_private_file(path: Path, data: bytes) -> None:
@@ -767,11 +884,12 @@ def render_report(denominator: dict, dxc_audit: dict | None = None) -> str:
         "",
         "## Qualification contract",
         "",
-        "`build-dxc` accepts only a clean, complete, non-sparse official source commit with its exact initialized gitlinks and license bytes. All authority Git commands disable replacement objects and global/system configuration; replacement refs and legacy grafts are rejected. The build rejects index/tree blob or mode disagreement, skip/assume index masks, transformed working-tree bytes, and unreviewed nested gitlinks before invoking the official CMake graph in a new isolated output directory, then repeats the complete materialized audit after configure/build. Receipt verification repeats that same complete audit. Its receipt binds source, dependencies, every retained license, CMake cache/flags, tool binaries and version transcripts, configure/build logs, compile commands, Ninja execution log, the exact digested translation-unit manifest actually executed for the `dxc` target grouped by license component, and the resulting compiler binary.",
+        "`build-dxc` accepts only a clean, complete, non-sparse official source commit with its exact initialized gitlinks and license bytes. All authority Git commands disable replacement objects and global/system configuration; replacement refs and legacy grafts are rejected. The build rejects index/tree blob or mode disagreement, skip/assume index masks, transformed working-tree bytes, and unreviewed nested gitlinks before invoking the official CMake graph in a new isolated output directory, then repeats the complete materialized audit after configure/build. Receipt verification repeats that same complete audit. Its receipt binds source, dependencies, every retained license, CMake cache/flags, tool binaries and version transcripts, configure/build logs, compile commands, Ninja execution log, the exact digested translation-unit manifest actually executed for the `dxc` target grouped by license component, and the resulting compiler closure. On macOS, the official graph makes `bin/dxc` a relative symlink to its versioned launcher and that launcher loads the retained `libdxcompiler.dylib`; the receipt preserves the invocation edge, binds exact link text and descriptor-stable bytes for both non-system files, and admits only an exact system-library load-name denominator. Absolute, escaping, multi-hop, nonregular, swapped, hardlinked, multiply emitted, or unclassified non-system paths are rejected. Version inspection executes only a private create-new/no-link snapshot with the launcher's `@rpath` layout preserved.",
+        "Receipt finalization currently fails closed on non-macOS hosts. A Linux or Windows source-build receipt needs its own reviewed loader format, system-library denominator, retained dependency paths, and hostile tests before this policy will admit it.",
         "",
         "`build-validator` separately stages the locked standalone Rust validator outside fn64's Cargo-config ancestry, invokes Cargo from the configuration-checked filesystem root with a new controlled Cargo home/target, remaps the isolated build root to a stable virtual source path, uses direct cargo/rustc toolchain binaries, and builds wgpu 30.0.0's deterministic noop backend. Because noop does not itself surface shader errors, the validator explicitly runs the same pinned naga parser, all-flags validator, and wgpu-naga-bridge baseline feature capability mapping used by wgpu-core 30 before invoking checked `Device::create_shader_module`. Its receipt binds the reviewed and staged source, Cargo.lock, complete Cargo package/license closure, toolchain, build transcript, binary, and stable protocol identity. This workspace is not in fn64's ordinary Cargo graph.",
         "",
-        "`produce` accepts only both source-build receipts. Every receipt also binds the exact artifact-tool source. It descriptor-stably copies the complete admitted RT64 source set into a private create-new/no-link snapshot, hashes the actual compiler-observed dependencies before and after preprocessing, and compiles the retained preprocessed bytes rather than reopening the checkout. For each denominator row it retains exact canonical flags, the complete declared source graph, the compiler-observed active dependency manifest, preprocessed-input digest, compiler transcript digests, SPIR-V bytes and digest, DXC's mandatory built-in SPIR-V validation result, and an independently bound wgpu-30 shader-module validation result. `verify` reruns wgpu validation. One missing row, unexpected row, failed validator, changed byte, changed flag, changed compiler, changed producer, or reused path rejects the set.",
+        "`produce` accepts only both source-build receipts. Every receipt also binds the exact artifact-tool source. It descriptor-stably copies the complete admitted RT64 source set and the qualified DXC runtime closure into separate private create-new/no-link snapshots, runs all preprocessing and compilation through that one staged compiler closure, hashes the actual compiler-observed source dependencies before and after preprocessing, and compiles the retained preprocessed bytes rather than reopening the checkout. For each denominator row it retains exact canonical flags, the complete declared source graph, the compiler-observed active dependency manifest, preprocessed-input digest, compiler transcript digests, SPIR-V bytes and digest, DXC's mandatory built-in SPIR-V validation result, and an independently bound wgpu-30 shader-module validation result. `verify` reruns wgpu validation. One missing row, unexpected row, failed validator, changed byte, changed flag, changed compiler, changed producer, or reused path rejects the set.",
         "",
         "A receipt is local integrity evidence, not a transferable signature or proof against a malicious same-UID process. Release provenance still needs a trusted CI/code-signing root if artifacts are distributed as independently attested builds.",
         "",
@@ -924,12 +1042,220 @@ def executable(path_text: str) -> Path:
     return path
 
 
-def tool_record(path: Path, version_arguments: list[str]) -> dict:
-    result = subprocess.run([str(path), *version_arguments], capture_output=True)
+def tool_record(path: Path, version_arguments: list[str], env: dict[str, str] | None = None) -> dict:
+    result = subprocess.run([str(path), *version_arguments], capture_output=True, env=env)
     require(result.returncode == 0, f"tool version command failed: {path.name}")
     return {
         "name": path.name,
         "sha256": digest_file(path.resolve()),
+        "version_arguments": version_arguments,
+        "version_stdout_sha256": digest_bytes(result.stdout),
+        "version_stderr_sha256": digest_bytes(result.stderr),
+        "version_stdout": result.stdout.decode(errors="replace").strip(),
+        "version_stderr": result.stderr.decode(errors="replace").strip(),
+    }
+
+
+def select_dxc_compiler(output: Path, candidates: list[Path], maximum: int) -> ContainedExecutable:
+    present = [path for path in candidates if os.path.lexists(path)]
+    require(present, "official DXC build completed without a dxc executable at a reviewed location")
+    require(len(present) == 1, "official DXC build emitted multiple dxc invocation paths at reviewed locations")
+    return qualify_contained_executable(output, present[0], maximum, "DXC compiler")
+
+
+@dataclass(frozen=True)
+class DxcCompilerClosure:
+    root: Path
+    compiler: ContainedExecutable
+    runtime_files: tuple[tuple[ContainedExecutable, str], ...]
+    inspector: Path
+    receipt_record: dict
+
+
+def inspect_otool_loads(inspector: Path, path: Path, label: str) -> tuple[list[dict], dict]:
+    result = subprocess.run(
+        [str(inspector), "-L", str(path)],
+        capture_output=True,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+    )
+    require(result.returncode == 0, f"runtime dependency inspection failed for {label}")
+    try:
+        lines = result.stdout.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ArtifactError(f"runtime dependency inspection was not UTF-8 for {label}") from error
+    require(lines and lines[0].endswith(":"), f"runtime dependency inspection had no header for {label}")
+    rows = []
+    for line in lines[1:]:
+        descriptor = line.strip()
+        require(descriptor, f"runtime dependency inspection had an empty row for {label}")
+        marker = " (compatibility version "
+        require(marker in descriptor and descriptor.endswith(")"), f"runtime dependency row changed shape for {label}")
+        load_name = descriptor.split(marker, 1)[0]
+        require(load_name, f"runtime dependency row had no load name for {label}")
+        rows.append({"load_name": load_name, "descriptor": descriptor})
+    require(rows, f"runtime dependency inspection found no load commands for {label}")
+    transcript = {
+        "loads_sha256": digest_bytes(canonical_json(rows)),
+        "stderr_sha256": digest_bytes(result.stderr),
+    }
+    return rows, transcript
+
+
+def classify_macho_loads(rows: list[dict], retained: dict[str, dict], system_names: set[str], label: str) -> list[dict]:
+    classified = []
+    seen_retained: set[str] = set()
+    seen_system: set[str] = set()
+    for row in rows:
+        name = row["load_name"]
+        value = dict(row)
+        if name in retained:
+            require(name not in seen_retained, f"duplicate retained runtime dependency for {label}: {name}")
+            seen_retained.add(name)
+            value["classification"] = "retained-build-artifact"
+            value["relative_path"] = retained[name]["relative_path"]
+        elif name in system_names:
+            require(name not in seen_system, f"duplicate system runtime dependency for {label}: {name}")
+            seen_system.add(name)
+            value["classification"] = "admitted-system-library"
+        else:
+            raise ArtifactError(f"unclassified non-system runtime dependency for {label}: {name}")
+        classified.append(value)
+    require(seen_retained == set(retained), f"retained runtime dependency denominator changed for {label}")
+    require(seen_system == system_names, f"system runtime dependency denominator changed for {label}")
+    return classified
+
+
+def qualify_dxc_runtime_closure(output: Path, candidates: list[Path], policy: dict) -> DxcCompilerClosure:
+    require(sys.platform == "darwin", "DXC runtime dependency qualification is currently implemented only for macOS")
+    runtime_policy = policy["darwin_runtime_closure"]
+    require(runtime_policy.get("format") == "otool-L-v1", "DXC runtime dependency inspection format changed")
+    inspector = executable(runtime_policy["inspector"])
+    compiler = select_dxc_compiler(output, candidates, policy["maximum_compiler_bytes"])
+    retained_rows = runtime_policy.get("retained")
+    require(isinstance(retained_rows, list) and retained_rows, "DXC retained runtime dependency policy is empty")
+    retained = {row["load_name"]: row for row in retained_rows}
+    require(len(retained) == len(retained_rows), "DXC retained runtime dependency policy repeats a load name")
+    system_names = set(runtime_policy.get("system_load_names", []))
+    require(system_names, "DXC system runtime dependency policy is empty")
+
+    runtime_files = []
+    qualified_retained = []
+    seen_paths: set[str] = set()
+    seen_snapshot_paths: set[str] = set()
+    for row in retained_rows:
+        relative = PurePosixPath(row.get("relative_path", ""))
+        snapshot_relative = PurePosixPath(row.get("snapshot_relative_path", ""))
+        require(
+            relative.parts and not relative.is_absolute() and ".." not in relative.parts,
+            "unsafe retained DXC runtime dependency path",
+        )
+        require(
+            snapshot_relative.parts and not snapshot_relative.is_absolute() and ".." not in snapshot_relative.parts,
+            "unsafe staged DXC runtime dependency path",
+        )
+        require(relative.as_posix() not in seen_paths, "retained DXC runtime dependency path is reused")
+        require(snapshot_relative.as_posix() not in seen_snapshot_paths, "staged DXC runtime dependency path is reused")
+        seen_paths.add(relative.as_posix())
+        seen_snapshot_paths.add(snapshot_relative.as_posix())
+        artifact = qualify_contained_executable(
+            output,
+            output.joinpath(*relative.parts),
+            policy["maximum_runtime_dependency_bytes"],
+            f"DXC runtime dependency {row['load_name']}",
+        )
+        require(artifact.receipt_record.get("kind") == "regular", f"DXC runtime dependency is not a regular retained file: {row['load_name']}")
+        qualified_retained.append((row, artifact, snapshot_relative.as_posix()))
+        runtime_files.append((artifact, snapshot_relative.as_posix()))
+
+    provisional = DxcCompilerClosure(output, compiler, tuple(runtime_files), inspector, {})
+    retained_records = []
+    with staged_dxc_compiler(provisional, output) as staged_compiler:
+        staged_root = staged_compiler.parent.parent
+        compiler_loads, compiler_transcript = inspect_otool_loads(inspector, staged_compiler, "staged DXC compiler")
+        classified_compiler_loads = classify_macho_loads(compiler_loads, retained, system_names, "DXC compiler")
+        for row, artifact, snapshot_relative_text in qualified_retained:
+            snapshot_relative = PurePosixPath(snapshot_relative_text)
+            staged_dependency = staged_root.joinpath(*snapshot_relative.parts)
+            dependency_loads, dependency_transcript = inspect_otool_loads(inspector, staged_dependency, row["load_name"])
+            require(
+                dependency_loads[0]["load_name"] == row.get("install_name"),
+                f"DXC runtime dependency install name changed: {row['load_name']}",
+            )
+            classified_dependency_loads = classify_macho_loads(
+                dependency_loads[1:],
+                {},
+                system_names,
+                row["load_name"],
+            )
+            retained_records.append({
+                "load_name": row["load_name"],
+                "snapshot_relative_path": snapshot_relative.as_posix(),
+                "install_name": dependency_loads[0],
+                "artifact": artifact.receipt_record,
+                "loads": classified_dependency_loads,
+                "inspection": dependency_transcript,
+            })
+    record = {
+        "platform": "darwin",
+        "format": runtime_policy["format"],
+        "compiler_artifact": compiler.receipt_record,
+        "compiler_loads": classified_compiler_loads,
+        "compiler_inspection": compiler_transcript,
+        "retained": retained_records,
+    }
+    record["closure_sha256"] = digest_bytes(canonical_json(record))
+    return DxcCompilerClosure(output, compiler, tuple(runtime_files), inspector, record)
+
+
+def stage_qualified_file(source: Path, expected_sha256: str, destination: Path, maximum: int, mode: int, label: str) -> None:
+    data, source_info = stable_regular_bytes(source, maximum, label)
+    require(source_info.st_nlink == 1, f"{label} gained another hardlink")
+    require(digest_bytes(data) == expected_sha256, f"{label} bytes differ from the qualified closure")
+    write_new_private_file(destination, data)
+    os.chmod(destination, mode)
+    staged, staged_info = stable_regular_bytes(destination, maximum, f"staged {label}")
+    require(staged_info.st_nlink == 1, f"staged {label} gained another hardlink")
+    require(staged == data, f"staged {label} bytes differ from the qualified closure")
+
+
+@contextmanager
+def staged_dxc_compiler(closure: DxcCompilerClosure, parent: Path):
+    with tempfile.TemporaryDirectory(prefix=".fn64-dxc-runtime-", dir=parent) as temporary:
+        root = Path(temporary)
+        root.chmod(0o700)
+        compiler = root / "bin/dxc"
+        stage_qualified_file(
+            closure.compiler.target_path,
+            closure.compiler.receipt_record["target_sha256"],
+            compiler,
+            load_policy()["dxc"]["maximum_compiler_bytes"],
+            0o500,
+            "DXC compiler",
+        )
+        for artifact, relative_text in closure.runtime_files:
+            relative = PurePosixPath(relative_text)
+            stage_qualified_file(
+                artifact.target_path,
+                artifact.receipt_record["target_sha256"],
+                root.joinpath(*relative.parts),
+                load_policy()["dxc"]["maximum_runtime_dependency_bytes"],
+                0o400,
+                f"DXC runtime dependency {relative.name}",
+            )
+        yield compiler
+
+
+def dxc_closure_tool_record(closure: DxcCompilerClosure, version_arguments: list[str], parent: Path) -> dict:
+    with staged_dxc_compiler(closure, parent) as compiler:
+        result = subprocess.run(
+            [str(compiler), *version_arguments],
+            capture_output=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+        )
+    require(result.returncode == 0, "staged DXC version command failed")
+    return {
+        "name": "dxc",
+        "sha256": closure.compiler.receipt_record["target_sha256"],
         "version_arguments": version_arguments,
         "version_stdout_sha256": digest_bytes(result.stdout),
         "version_stderr_sha256": digest_bytes(result.stderr),
@@ -1211,9 +1537,7 @@ def build_dxc(args: argparse.Namespace) -> dict:
     post_source_audit = validate_dxc_source(source, require_complete=True)
     require(post_source_audit == source_audit, "DXC source authority changed during configure/build")
     candidates = [build / "bin/dxc", build / "bin/dxc.exe", build / "Debug/bin/dxc.exe", build / "Release/bin/dxc.exe"]
-    compiler = next((path for path in candidates if path.is_file()), None)
-    require(compiler is not None, "official DXC build completed without a dxc executable at a reviewed location")
-    compiler_relative = compiler.relative_to(output).as_posix()
+    compiler = qualify_dxc_runtime_closure(output, candidates, dxc_policy)
     compile_commands = build / "compile_commands.json"
     cmake_cache = build / "CMakeCache.txt"
     build_ninja = build / "build.ninja"
@@ -1232,7 +1556,12 @@ def build_dxc(args: argparse.Namespace) -> dict:
         "git": tool_record(git_tool, ["--version"]),
         "cc": tool_record(cc, ["--version"]),
         "cxx": tool_record(cxx, ["--version"]),
-        "dxc": tool_record(compiler, ["--version"]),
+        "runtime_dependency_inspector": tool_record(
+            compiler.inspector,
+            ["--version"],
+            {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+        ),
+        "dxc": dxc_closure_tool_record(compiler, ["--version"], output),
     }
     receipt = add_receipt_hash({
         "schema": BUILD_SCHEMA,
@@ -1267,8 +1596,8 @@ def build_dxc(args: argparse.Namespace) -> dict:
             "translation_units": len(manifest["translation_units"]),
             "counts_by_component": manifest["counts_by_component"],
         },
-        "compiler_relative_path": compiler_relative,
-        "compiler_sha256": digest_file(compiler),
+        "compiler_closure": compiler.receipt_record,
+        "compiler_sha256": compiler.compiler.receipt_record["target_sha256"],
         "claim_boundary": "local-source-build-integrity-not-transferable-process-attestation",
     })
     require(not LOCAL_PATH_RE.search(json.dumps(receipt)), "DXC build receipt leaked a machine-local path")
@@ -1276,12 +1605,12 @@ def build_dxc(args: argparse.Namespace) -> dict:
     return receipt
 
 
-def validate_build_receipt(build_dir: Path, dxc_source: Path) -> tuple[dict, Path]:
+def validate_build_receipt(build_dir: Path, dxc_source: Path) -> tuple[dict, DxcCompilerClosure]:
     receipt = load_canonical_json(build_dir / "dxc-build-receipt.json", load_policy()["spirv"]["maximum_receipt_bytes"], "DXC build receipt")
     require_keys(receipt, {
         "schema", "status", "producer_sha256", "source", "policy_sha256", "configuration", "tools",
         "configure", "build", "command_graph", "cmake_cache_sha256", "build_ninja_sha256",
-        "ninja_log_sha256", "compile_commands_sha256", "compiled_source_manifest", "compiler_relative_path",
+        "ninja_log_sha256", "compile_commands_sha256", "compiled_source_manifest", "compiler_closure",
         "compiler_sha256", "claim_boundary", "receipt_sha256",
     }, "DXC build receipt")
     require(receipt.get("schema") == BUILD_SCHEMA and receipt.get("status") == "complete", "DXC build receipt is incomplete")
@@ -1293,7 +1622,11 @@ def validate_build_receipt(build_dir: Path, dxc_source: Path) -> tuple[dict, Pat
     )
     require(receipt.get("policy_sha256") == digest_file(POLICY_PATH), "DXC build used a different artifact policy")
     require(receipt.get("claim_boundary") == "local-source-build-integrity-not-transferable-process-attestation", "DXC claim boundary changed")
-    require_keys(receipt.get("tools"), {"cmake", "ninja", "python", "git", "cc", "cxx", "dxc"}, "DXC tool closure")
+    require_keys(
+        receipt.get("tools"),
+        {"cmake", "ninja", "python", "git", "cc", "cxx", "runtime_dependency_inspector", "dxc"},
+        "DXC tool closure",
+    )
     for name, record in receipt["tools"].items():
         validate_tool_record(record, f"DXC {name} tool record")
     for name in ("configure", "build", "command_graph"):
@@ -1346,11 +1679,32 @@ def validate_build_receipt(build_dir: Path, dxc_source: Path) -> tuple[dict, Pat
     )
     require(manifest == reconstructed_manifest, "DXC compiled-source manifest does not match executed target outputs")
     validate_compiled_source_files(manifest, dxc_source, build_dir / "build")
-    relative = PurePosixPath(receipt.get("compiler_relative_path", ""))
-    require(relative.parts and not relative.is_absolute() and ".." not in relative.parts, "unsafe compiler path in DXC receipt")
-    compiler = build_dir.joinpath(*relative.parts)
-    require(digest_file(compiler) == receipt.get("compiler_sha256"), "DXC compiler artifact changed after the source build")
-    require(receipt["tools"]["dxc"] == tool_record(compiler, ["--version"]), "DXC compiler tool identity changed")
+    candidates = [
+        build_dir / "build/bin/dxc",
+        build_dir / "build/bin/dxc.exe",
+        build_dir / "build/Debug/bin/dxc.exe",
+        build_dir / "build/Release/bin/dxc.exe",
+    ]
+    compiler = qualify_dxc_runtime_closure(build_dir, candidates, policy)
+    require(compiler.receipt_record == receipt.get("compiler_closure"), "DXC compiler runtime closure changed after the source build")
+    require(
+        compiler.compiler.receipt_record.get("target_sha256") == receipt.get("compiler_sha256"),
+        "DXC compiler digest disagrees with its runtime closure",
+    )
+    require(
+        receipt["tools"]["runtime_dependency_inspector"]
+        == tool_record(
+            compiler.inspector,
+            ["--version"],
+            {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+        ),
+        "DXC runtime dependency inspector identity changed",
+    )
+    require(
+        receipt["tools"]["dxc"]
+        == dxc_closure_tool_record(compiler, ["--version"], build_dir),
+        "DXC compiler tool identity changed",
+    )
     return receipt, compiler
 
 
@@ -1726,13 +2080,16 @@ def produce(args: argparse.Namespace) -> dict:
     denominator = check_denominator(port, oracle)
     dxc_source = Path(args.dxc_dir).resolve()
     build_dir = Path(args.dxc_build_dir).resolve()
-    build_receipt, compiler = validate_build_receipt(build_dir, dxc_source)
+    build_receipt, compiler_closure = validate_build_receipt(build_dir, dxc_source)
     validator_build_receipt, validator, validator_record = validate_validator_build(Path(args.wgpu_validator_build_dir).resolve())
     output = Path(args.output_dir).resolve()
     prepare_output_directory(output)
     policy = load_policy()
     entries = []
-    with tempfile.TemporaryDirectory(prefix=".fn64-rt64-source-", dir=output) as temporary:
+    with (
+        staged_dxc_compiler(compiler_closure, output) as compiler,
+        tempfile.TemporaryDirectory(prefix=".fn64-rt64-source-", dir=output) as temporary,
+    ):
         snapshot = Path(temporary) / "source"
         snapshot_record = stage_rt64_source_snapshot(
             port,
