@@ -41,13 +41,13 @@ reserving authority, parity, performance, and integration claims for the lead.
 | updated | 2026-08-16 |
 | program state | **IN PROGRESS** |
 | execution wave | **ACCEL-A -- port spine and evidence in parallel** |
-| active milestones | **M0.3 evidence, M1 renderer seam v2, and M2 GPU feasibility (all IN PROGRESS)** |
-| active slices | A0.3 conformance trust-boundary repair; M1.2 ABI-to-IR authority repair; M2.3 Metal submission/timestamp and coverage execution; M0.3 native baseline remains an independent evidence lane |
-| active ownership | `F/xhigh` integration lead; `F/xhigh` conformance repair/review; `F/xhigh` serialized ABI/IR integration repair/review; `I/high` Metal probe writer; external Claude Sonnet 5 read-only audits remain candidate evidence only |
-| last completed result | local `main` contains the dual-pin authority/inventory gate (`34e00cf5`), wgpu 30 Metal capability baseline (`978981b2`), render-IR spine (`9879c7e0`), workflow dashboard (`9411f490`), and executed Metal semantics/format-I/O probes (`9c41f5df`) |
-| next concrete decision | accept or reject the repaired A0.3 and M1.2 trust boundaries, then use M2.3 submission/coverage evidence to unlock the first raw-DPC/TMEM vertical slice |
+| active milestones | **M0 authority/baseline, M2 GPU feasibility, and M3 raw-DPC vertical slice (all IN PROGRESS)** |
+| active slices | M0.3 native baseline; A0.3 is infrastructure-ready but blocked on an RT64-produced observable; M2.4 shader-artifact qualification; M3.2 bounded raw-DPC decode/state planning |
+| active ownership | `F/xhigh` integration lead; `F/xhigh` shader provenance/review; `F/xhigh` raw-DPC decoder/state lead; lower-cost fixture and repetition lanes only after typed interfaces freeze |
+| last completed result | local `main` contains M1.2's cross-crate effect ownership, M2.3's executed Metal submission/coverage evidence, and M3.1's reviewed typed wgpu submission spine (`39ea1cbc`) |
+| next concrete decision | accept or repair M2.4's source-build/validator mechanism, then dispatch M3.2a bounded raw-DPC decoding before TMEM, production ABI wiring, VI, or surface ownership |
 | evidence blockers | no matched private-game RT64 baseline exists; public RT64 does not provide a usable tracing implementation; HLSL artifact provenance and Windows DXC/utf8conv closure remain unresolved; these block claims or platform closure, not independent port work |
-| verification claim | authority/inventory and render IR retain their 10-run bars; M5 Pro capability, integer/TMEM, binding-array, fractional dual-source/manual blend, explicit format conversion/readback, and invalid reinterpretation probes passed their recorded host bars; submission, coverage, renderer parity, and performance remain unproven |
+| verification claim | authority/inventory, render IR, M1.2, M2.1-M2.3, and M3.1 retain their recorded bars; A0.3's all-pending evidence mechanism passed 10/10 but closes no parity row; broad RDP, VI/surface, renderer parity, and performance remain unproven |
 
 The canonical per-ticket status, blockers, owners, branches, and verification
 counts are in [`RT64-PORT-DASHBOARD.md`](RT64-PORT-DASHBOARD.md), generated
@@ -882,9 +882,10 @@ The accelerated wave keeps dependency-safe work active in parallel:
 5. **A0.2 -- workflow dashboard (INTEGRATED).** The strict canonical
    ticket ledger and deterministic terminal/Markdown/HTML renderer passed its
    final 50-test suite in 10/10 clean processes.
-6. **A0.3 -- backend-neutral parity ladder (IN PROGRESS).** Land proof-bearing
-   RT64/Rust delegates, anti-shrink row status, mutations, and the separate
-   intentionally nonzero port-progress command.
+6. **A0.3 -- backend-neutral parity ladder (BLOCKED).** The exact all-pending
+   24+26 denominator and Rust-owned fail-closed verifier are implemented; a
+   display-independent RT64-produced observable is still required before any
+   RT64 row can be promoted to pass or divergence.
 7. **M1.1 -- land the seam-v2 ownership spine (INTEGRATED).** The bounded,
    GPU-independent types and records are merged; this does not place runtime
    authorities or execute a backend.

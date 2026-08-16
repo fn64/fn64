@@ -462,6 +462,31 @@ def check_rt64_port_inventory() -> None:
         print(f"  RT64 port inventory schema, mutations, and generated report agree ({suffix})")
 
 
+# --- 4bac. backend-neutral RT64/Rust parity denominator stays closed --------
+def check_rt64_port_parity() -> None:
+    hostile = subprocess.run(
+        [sys.executable, str(ROOT / "tools/test_check_rt64_port_parity.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if hostile.returncode != 0:
+        detail = hostile.stderr.strip() or hostile.stdout.strip() or "hostile tests failed silently"
+        fail("RT64-PORT-PARITY.md", detail)
+        return
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools/check_rt64_port_parity.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "checker failed silently"
+        fail("RT64-PORT-PARITY.md", detail)
+    elif VERBOSE:
+        print("  RT64/Rust conformance denominator and fail-closed evidence guards agree")
+
+
 # --- 4bb. cross-platform RT64 case/blocker matrix must not shrink ----------
 def check_rt64_platform_certification() -> None:
     result = subprocess.run(
@@ -590,6 +615,7 @@ def main() -> int:
                check_closed_roadmap_items, check_doc_hashes_are_tested,
                check_completeness_recipe, check_rt64_feature_inventory,
                check_rt64_port_authority, check_rt64_port_inventory,
+               check_rt64_port_parity,
                check_rt64_platform_certification,
                check_private_input_admission,
                check_base_renderer_matrix,

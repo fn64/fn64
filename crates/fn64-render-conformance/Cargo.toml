@@ -1,0 +1,20 @@
+[package]
+name = "fn64-render-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral bounded renderer fixtures and proof-bearing conformance receipts."
+
+[dependencies]
+fn64-render-ir = { path = "../fn64-render-ir" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+conformance-test-runner = []
+
+[[bin]]
+name = "fn64-render-conformance-test-runner"
+path = "src/bin/fn64-render-conformance-test-runner.rs"
+required-features = ["conformance-test-runner"]

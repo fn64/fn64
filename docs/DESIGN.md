@@ -16,6 +16,7 @@ fn64-abi       the extern "C" surface recompiled code links against
 fn64-boot-harness shared generated-section bridge/registration and ABI-sized rdram allocation
 fn64-shell     the executable: window, input, audio out, ROM/RecompiledFuncs intake
 fn64-render-ir GPU/runtime-independent render semantics, bounded replay records, and move-only effect ownership
+fn64-render-conformance Rust-decoded replay fixtures and private-authority evaluation
 fn64-render    backend-neutral render seam, exact microcode admission, and diagnostic raw-DPC inspection
 fn64-render-reference deterministic pure-Rust ReferenceBackend
 fn64-render-rt64 FFI bridge to RT64 (C++)
@@ -44,6 +45,7 @@ fn64-shell ──depends on──> fn64-abi ──depends on──> fn64-runtime
 fn64-render-wgpu ──depends on──> fn64-render-ir + wgpu
 fn64-certification ──depends on──> fn64-render + fn64-render-reference + fn64-render-rt64 + fn64-runtime
 fn64-render-ir (GPU/runtime independent; has no workspace dependencies)
+fn64-render-conformance ──depends on──> fn64-render-ir
 ```
 
 The first render-IR consumer is intentionally a synthetic raw-DPC integration
