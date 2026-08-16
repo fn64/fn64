@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -358,11 +359,56 @@ class ClosedEvidenceTests(unittest.TestCase):
             test_only=True,
             cooldown_milliseconds=1,
         )
-        with mock.patch.object(CHECKER.time, "sleep") as sleep:
+        with mock.patch.object(CHECKER, "cooldown_sleep") as sleep:
             CHECKER.execute_qualified(
                 self.root, evidence, row, "rust_port", "RUST_PASS",
                 runner_registry=policies,
             )
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(0.001)] * (CHECKER.REQUIRED_RUNS - 1),
+        )
+
+    def test_reviewed_cooldown_ignores_unrelated_concurrent_sleeps(self) -> None:
+        # Hostile: a background thread hammers the real, process-global
+        # time.sleep concurrently with the checker's run loop (simulating
+        # unrelated activity elsewhere in the test process, e.g. docs lint
+        # or other parallel tests). Patching CHECKER.cooldown_sleep — a name
+        # private to this module — must not observe any of that noise: only
+        # calls this module itself makes should ever appear in the mock.
+        row, evidence, policies, _, _ = self.execution()
+        policy = policies["reviewed-runner"]
+        policies["reviewed-runner"] = CHECKER.RunnerPolicy(
+            policy.delegate_kind,
+            policy.runner_path,
+            policy.runner_sha256,
+            policy.build_receipt_path,
+            policy.build_receipt_sha256,
+            policy.verifier_path,
+            policy.verifier_sha256,
+            policy.authority_path,
+            policy.authority_sha256,
+            policy.runner_args,
+            test_only=True,
+            cooldown_milliseconds=1,
+        )
+        stop = threading.Event()
+
+        def hammer_real_sleep() -> None:
+            while not stop.is_set():
+                CHECKER.time.sleep(0.001)
+
+        noise = threading.Thread(target=hammer_real_sleep, daemon=True)
+        noise.start()
+        try:
+            with mock.patch.object(CHECKER, "cooldown_sleep") as sleep:
+                CHECKER.execute_qualified(
+                    self.root, evidence, row, "rust_port", "RUST_PASS",
+                    runner_registry=policies,
+                )
+        finally:
+            stop.set()
+            noise.join(timeout=5)
         self.assertEqual(
             sleep.call_args_list,
             [mock.call(0.001)] * (CHECKER.REQUIRED_RUNS - 1),

@@ -67,6 +67,13 @@ def require(condition: bool, message: str) -> None:
         raise ParityError(message)
 
 
+def cooldown_sleep(seconds: float) -> None:
+    """Narrow seam for the inter-run cooldown. Tests patch this name (not the
+    process-global `time.sleep`) so unrelated sleeps elsewhere in the process
+    can never be counted as cooldown calls."""
+    time.sleep(seconds)
+
+
 def canonical_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
@@ -546,7 +553,7 @@ def _execute_qualified(
         process_identities.append(process_identity)
         run_identities.append(run_identity)
         if ordinal + 1 < REQUIRED_RUNS and policy.cooldown_milliseconds:
-            time.sleep(policy.cooldown_milliseconds / 1_000)
+            cooldown_sleep(policy.cooldown_milliseconds / 1_000)
     require(len(set(semantic_identities)) == 1, f"{row['id']}: backend semantic result changed across fresh processes")
     require(len(set(process_identities)) == REQUIRED_RUNS, f"{row['id']}: fresh-process identities were reused")
     require(len(set(run_identities)) == REQUIRED_RUNS, f"{row['id']}: process results were cloned")
