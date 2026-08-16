@@ -752,6 +752,38 @@ mod tests {
     }
 
     #[test]
+    fn exact_fixture_bridge_rejects_byte_different_state_words() {
+        let base = vec![
+            SET_COLOR_IMAGE_WORD,
+            0,
+            (SET_FILL_COLOR as u32) << 24,
+            0x0102_0304,
+            FILL_RECTANGLE_WORD,
+            0,
+            FULL_SYNC_WORD,
+            0,
+        ];
+        for (name, word_index, replacement) in [
+            ("OtherMode", 0, 0x2f30_0000),
+            ("ColorImage", 0, SET_COLOR_IMAGE_WORD | 0x4000_0000),
+            ("FillColor", 2, ((SET_FILL_COLOR as u32) << 24) | 1),
+            ("rectangle", 4, FILL_RECTANGLE_WORD | 1),
+        ] {
+            let mut words = base.clone();
+            words[word_index] = replacement;
+            let submitted = submit_packet(packet([1, 2, 3, 4], Some(words), true, true));
+            assert!(
+                matches!(
+                    decode_fill_fixture(&submitted),
+                    Err(WgpuRenderError::MalformedFixtureCommand { word, .. })
+                        if word == word_index
+                ),
+                "{name} byte mutation was not rejected at word {word_index}"
+            );
+        }
+    }
+
+    #[test]
     fn undeclared_output_is_loud() {
         let packet = packet([1, 2, 3, 4], None, true, false);
         let (mut queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
