@@ -1,5 +1,13 @@
 //! Pure-Rust wgpu renderer ownership for fn64.
 //!
+//! M4.1 adds typed, transaction-local texture-image, tile, tile-size, sync,
+//! block, tile, and TLUT load decoding with exact M4.0-owned source-read
+//! identities. Its hardware fields are sourced from the public SGI *Nintendo
+//! 64 RDP Command Summary*, Tables 1, 3, and 6–10, plus the public libultra
+//! `gbi.h` `gDPLoadTLUTCmd` macro. RT64 is not hardware authority for this
+//! slice. M4.1 does not move TMEM bytes, execute GPU work, migrate production
+//! dispatch, or establish parity or performance.
+//!
 //! M3.3c executes M3.3a's exact native 4x2 RGBA16 fill through a prewarmed
 //! wgpu pipeline, M3.3b's typed target generations, and M3.3d's separately
 //! typed bounded VI mechanism. The target and RDP state publish only after the
@@ -108,6 +116,7 @@ mod native_contract;
 mod raw_dpc;
 mod state;
 mod targets;
+mod tmem;
 mod vi;
 
 pub use device::{
@@ -135,6 +144,7 @@ pub use native_contract::{
 pub use raw_dpc::{
     decode_raw_dpc, decode_raw_dpc_after, DecodedRawDpc, DecodedRawDpcCommand, FillRectangle,
     RawDpcCommandKind, RawDpcCommandLocation, RawDpcDecodeError, RawDpcResourcePlan,
+    TmemLoadSourcePlanError,
 };
 pub use state::{
     ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, RdpState, RdpStateDelta,
@@ -148,4 +158,9 @@ pub use targets::{
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, ResidentColorTarget, Rgba8,
     TargetError, TargetGeneration, TargetRectangle, TargetRowRange, TargetRows,
     UninitializedNativeRaster,
+};
+pub use tmem::{
+    TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState,
+    TlutEntryCount, TmemDxt, TmemLoad, TmemLoadEpoch, TmemLoadKind, TmemLoadSourceIdentity,
+    TmemLoadSourcePlan, TmemState, TmemWordAddress,
 };

@@ -5,13 +5,19 @@ use core::fmt;
 use fn64_render::raw_rdp_command_width;
 use fn64_render_ir::{
     AccessMode, AccessPurpose, DmemRange, FullSyncOccurrence, OperationId, RawCommandStream,
-    RawStreamIdentity, RdramResource, ResourceAccess, ResourceRegion, SubmittedTicket,
-    ValidationError, WorkloadAdmission, WorkloadIdentity, MAX_RESOURCE_ACCESSES,
+    RawStreamIdentity, RdramResource, ResourceAccess, ResourceJournal, ResourceJournalLimits,
+    ResourceRegion, SubmittedTicket, ValidationError, WorkloadAdmission, WorkloadIdentity,
+    MAX_RESOURCE_ACCESSES,
 };
 
 use crate::state::{
     ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, RdpState, RdpStateDelta,
     StagedRdpState,
+};
+use crate::tmem::{
+    decode_tmem_command, TmemCommand, TmemLoad, TmemLoadEpoch, TmemLoadSourceIdentity,
+    TmemLoadSourcePlan, TmemSourcePlanStart, LOAD_BLOCK, LOAD_SYNC, LOAD_TILE, LOAD_TLUT,
+    SET_TEXTURE_IMAGE, SET_TILE, SET_TILE_SIZE,
 };
 
 const SET_OTHER_MODE: u8 = 0x2f;
@@ -105,11 +111,26 @@ impl FillRectangle {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RawDpcCommandKind {
-    NoOp { variant: u8 },
+    NoOp {
+        variant: u8,
+    },
     SetOtherMode(OtherMode),
     SetColorImage(ColorImage),
     SetFillColor(FillColor),
     FillRectangle(FillRectangle),
+    SetTextureImage(crate::TextureImage),
+    SetTile {
+        tile: crate::TileIndex,
+        descriptor: crate::TileDescriptor,
+    },
+    SetTileSize {
+        tile: crate::TileIndex,
+        size: crate::TileSize,
+    },
+    LoadSync(TmemLoadEpoch),
+    LoadBlock(TmemLoad),
+    LoadTile(TmemLoad),
+    LoadTlut(TmemLoad),
     FullSync(FullSyncOccurrence),
 }
 
@@ -131,13 +152,91 @@ impl DecodedRawDpcCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct RawDpcResourcePlan {
+    tmem_source_identity: TmemLoadSourceIdentity,
     accesses: Box<[ResourceAccess]>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TmemLoadSourcePlanError {
+    DecodeIdentityMismatch,
+    AccessSliceOutOfBounds,
+    AccessDescriptorsDiffer,
+}
+
+impl fmt::Display for TmemLoadSourcePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DecodeIdentityMismatch => {
+                formatter.write_str("TMEM source plan belongs to a different decode")
+            }
+            Self::AccessSliceOutOfBounds => {
+                formatter.write_str("TMEM source plan access slice is out of bounds")
+            }
+            Self::AccessDescriptorsDiffer => formatter
+                .write_str("TMEM source plan differs from the exact ordered source descriptors"),
+        }
+    }
+}
+
+impl std::error::Error for TmemLoadSourcePlanError {}
 
 impl RawDpcResourcePlan {
     pub fn accesses(&self) -> &[ResourceAccess] {
         &self.accesses
     }
+
+    pub fn tmem_load_source_accesses(
+        &self,
+        plan: TmemLoadSourcePlan,
+    ) -> Result<&[ResourceAccess], TmemLoadSourcePlanError> {
+        if plan.identity() != self.tmem_source_identity {
+            return Err(TmemLoadSourcePlanError::DecodeIdentityMismatch);
+        }
+        let start = usize::try_from(plan.first_access_index())
+            .map_err(|_| TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+        let end = start
+            .checked_add(usize::from(plan.access_count()))
+            .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+        let accesses = self
+            .accesses
+            .get(start..end)
+            .ok_or(TmemLoadSourcePlanError::AccessSliceOutOfBounds)?;
+        let exact_descriptors = accesses.iter().enumerate().all(|(offset, access)| {
+            access.operation().get() == plan.first_operation().get() + offset as u32
+                && access.mode() == AccessMode::Read
+                && access.purpose() == AccessPurpose::TmemLoadSource
+                && matches!(
+                    access.region(),
+                    ResourceRegion::Rdram {
+                        resource: RdramResource::Buffer,
+                        range,
+                    } if range.layout() == plan.identity().memory_layout()
+                )
+        }) && accesses.iter().try_fold(0_u32, |total, access| {
+            total.checked_add(access.region().declared_bytes())
+        }) == Some(plan.total_bytes())
+            && source_access_identity(accesses) == plan.source_access_identity();
+        if !exact_descriptors {
+            return Err(TmemLoadSourcePlanError::AccessDescriptorsDiffer);
+        }
+        Ok(accesses)
+    }
+}
+
+fn source_access_identity(accesses: &[ResourceAccess]) -> fn64_render_ir::JournalIdentity {
+    let total_bytes = accesses
+        .iter()
+        .try_fold(0_u32, |total, access| {
+            total.checked_add(access.region().declared_bytes())
+        })
+        .expect("decoder-admitted resource bytes fit u32");
+    ResourceJournal::try_new(
+        ResourceJournalLimits::try_new(accesses.len(), total_bytes)
+            .expect("TMEM source slice is nonempty and bounded"),
+        accesses.to_vec(),
+    )
+    .expect("TMEM source slice came from an admitted resource journal")
+    .identity()
 }
 
 #[derive(Debug)]
@@ -353,6 +452,7 @@ fn decode_from_state(
     // the proof inside the move-only decoded value closes the otherwise-safe
     // but incorrect possibility of preparing a decode against another state.
     let base_state = state.fork_for_decode();
+    let submission = submitted.identity();
     let packet = submitted.packet();
     let workload = packet.identity();
     let WorkloadAdmission::RawDpc {
@@ -363,6 +463,12 @@ fn decode_from_state(
     };
     let queue = submitted.queue();
     let submission_ordinal = submitted.ordinal();
+    let tmem_source_identity = TmemLoadSourceIdentity::new(
+        workload,
+        packet.journal().identity(),
+        submission,
+        packet.memory_layout(),
+    );
 
     let mut planned = Vec::new();
     for stream in packet.streams() {
@@ -391,6 +497,7 @@ fn decode_from_state(
             &flattened,
             packet.memory_layout(),
             &mut state,
+            tmem_source_identity,
             &mut delta,
             &mut planned,
             &mut commands,
@@ -416,6 +523,7 @@ fn decode_from_state(
         state_delta: delta,
         staged_state,
         resource_plan: RawDpcResourcePlan {
+            tmem_source_identity,
             accesses: resource_accesses,
         },
         origin,
@@ -506,6 +614,7 @@ fn decode_stream(
     stream: &FlattenedStream,
     layout: fn64_render_ir::PhysicalMemoryLayout,
     state: &mut RdpState,
+    tmem_source_identity: TmemLoadSourceIdentity,
     delta: &mut RdpStateDelta,
     planned: &mut Vec<ResourceAccess>,
     commands: &mut Vec<DecodedRawDpcCommand>,
@@ -597,6 +706,65 @@ fn decode_stream(
                 };
                 plan_fill(location, rectangle, layout, state, planned)?;
                 RawDpcCommandKind::FillRectangle(rectangle)
+            }
+            LOAD_SYNC | LOAD_TLUT | SET_TILE_SIZE | LOAD_BLOCK | LOAD_TILE | SET_TILE
+            | SET_TEXTURE_IMAGE => {
+                let first_access_index = u32::try_from(planned.len()).map_err(|_| {
+                    RawDpcDecodeError::ResourcePlanOverflow {
+                        workload: location.workload,
+                    }
+                })?;
+                let first_operation = match planned.last() {
+                    Some(access) => access.operation().get().checked_add(1).ok_or(
+                        RawDpcDecodeError::ResourcePlanOverflow {
+                            workload: location.workload,
+                        },
+                    )?,
+                    None => 0,
+                };
+                let (command, accesses) = decode_tmem_command(
+                    opcode,
+                    w0,
+                    w1,
+                    layout,
+                    state.tmem_mut(),
+                    TmemSourcePlanStart::new(
+                        tmem_source_identity,
+                        first_access_index,
+                        OperationId::new(first_operation),
+                    ),
+                )
+                .map_err(|error| RawDpcDecodeError::InvalidCommand {
+                    location,
+                    reason: error.reason(),
+                })?;
+                if planned
+                    .len()
+                    .checked_add(accesses.len())
+                    .is_none_or(|count| count > MAX_RESOURCE_ACCESSES)
+                {
+                    return Err(RawDpcDecodeError::InvalidCommand {
+                        location,
+                        reason: "TMEM load exceeds the bounded resource-plan access count",
+                    });
+                }
+                planned.extend(accesses);
+                delta.set_tmem(state.tmem().clone());
+                match command {
+                    TmemCommand::SetTextureImage(image) => {
+                        RawDpcCommandKind::SetTextureImage(image)
+                    }
+                    TmemCommand::SetTile { tile, descriptor } => {
+                        RawDpcCommandKind::SetTile { tile, descriptor }
+                    }
+                    TmemCommand::SetTileSize { tile, size } => {
+                        RawDpcCommandKind::SetTileSize { tile, size }
+                    }
+                    TmemCommand::LoadSync(epoch) => RawDpcCommandKind::LoadSync(epoch),
+                    TmemCommand::LoadBlock(load) => RawDpcCommandKind::LoadBlock(load),
+                    TmemCommand::LoadTile(load) => RawDpcCommandKind::LoadTile(load),
+                    TmemCommand::LoadTlut(load) => RawDpcCommandKind::LoadTlut(load),
+                }
             }
             FULL_SYNC => {
                 let Some(sync) = stream
@@ -803,13 +971,15 @@ fn push_access(
 #[cfg(test)]
 mod tests {
     use fn64_render_ir::{
-        AccessMode, AccessPurpose, DecodedTicket, DmemRange, DpInterruptState, DramCommandChunk,
-        DramCommandStream, FullSyncBoundary, PhysicalMemoryLayout, RawCommandStream, RdramResource,
-        ResourceAccess, ResourceJournal, ResourceJournalLimits, ResourceRegion, TemporalBoundary,
-        WorkloadAdmission, WorkloadPacket, XbusCommandChunk, XbusCommandStream,
+        AccessMode, AccessPurpose, CapturedGuestRead, DecodedTicket, DeferredGuestReadCapture,
+        DmemRange, DpInterruptState, DramCommandChunk, DramCommandStream, FullSyncBoundary,
+        PhysicalMemoryLayout, RawCommandStream, RdramResource, ResourceAccess, ResourceJournal,
+        ResourceJournalLimits, ResourceRegion, TemporalBoundary, WorkloadAdmission, WorkloadPacket,
+        WorkloadPacketPreflight, XbusCommandChunk, XbusCommandStream,
     };
 
     use super::*;
+    use crate::TmemLoadKind;
 
     const LAYOUT_BYTES: u32 = 0x4000;
     const COMMAND_START: u32 = 0x1000;
@@ -865,6 +1035,24 @@ mod tests {
             AccessPurpose::RenderTarget,
             ResourceRegion::Rdram {
                 resource: RdramResource::ColorFramebuffer,
+                range: layout.range(start, end).unwrap(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn tmem_source_access(
+        layout: PhysicalMemoryLayout,
+        operation: u32,
+        start: u32,
+        end: u32,
+    ) -> ResourceAccess {
+        ResourceAccess::try_new(
+            OperationId::new(operation),
+            AccessMode::Read,
+            AccessPurpose::TmemLoadSource,
+            ResourceRegion::Rdram {
+                resource: RdramResource::Buffer,
                 range: layout.range(start, end).unwrap(),
             },
         )
@@ -933,6 +1121,95 @@ mod tests {
         queue.submit(DecodedTicket::new(packet)).unwrap()
     }
 
+    fn packet_with_tmem_sources(
+        transaction_sequence: u64,
+        words: Vec<u32>,
+        source_ranges: &[(u32, u32)],
+    ) -> WorkloadPacket {
+        packet_with_tmem_sources_in_layout(LAYOUT_BYTES, transaction_sequence, words, source_ranges)
+    }
+
+    fn packet_with_tmem_sources_in_layout(
+        layout_bytes: u32,
+        transaction_sequence: u64,
+        words: Vec<u32>,
+        source_ranges: &[(u32, u32)],
+    ) -> WorkloadPacket {
+        let layout = PhysicalMemoryLayout::try_new(layout_bytes).unwrap();
+        let bytes = u32::try_from(words.len() * 4).unwrap();
+        let command_range = layout.range(COMMAND_START, COMMAND_START + bytes).unwrap();
+        let stream = RawCommandStream::Dram(
+            DramCommandStream::try_new(vec![DramCommandChunk::try_new(
+                command_range,
+                words,
+                TemporalBoundary::new(1, DpInterruptState::Clear),
+                Vec::new(),
+            )
+            .unwrap()])
+            .unwrap(),
+        );
+        let mut accesses = vec![command_access(layout, bytes, 0)];
+        accesses.extend(
+            source_ranges
+                .iter()
+                .enumerate()
+                .map(|(index, &(start, end))| {
+                    tmem_source_access(layout, index as u32 + 1, start, end)
+                }),
+        );
+        let journal = ResourceJournal::try_new(
+            ResourceJournalLimits::try_new(64, layout_bytes).unwrap(),
+            accesses,
+        )
+        .unwrap();
+        let preflight = WorkloadPacketPreflight::try_new(
+            layout,
+            WorkloadAdmission::RawDpc {
+                transaction_sequence,
+            },
+            vec![stream],
+            journal,
+        )
+        .unwrap();
+        let capture = DeferredGuestReadCapture::new(
+            preflight
+                .guest_read_plan()
+                .reads()
+                .iter()
+                .map(|read| {
+                    CapturedGuestRead::try_new(
+                        *read,
+                        vec![read.operation().get() as u8; read.range().len() as usize],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        preflight.finalize(capture).unwrap()
+    }
+
+    fn set_texture_image(prefix: u8, format: u32, size: u32, width: u32, address: u32) -> [u32; 2] {
+        [
+            word(
+                prefix,
+                SET_TEXTURE_IMAGE,
+                format << 21 | size << 19 | (width - 1),
+            ),
+            address,
+        ]
+    }
+
+    fn set_tile(prefix: u8, tile: u32, line: u32, tmem: u32) -> [u32; 2] {
+        [
+            word(prefix, SET_TILE, 2 << 19 | line << 9 | tmem),
+            tile << 24,
+        ]
+    }
+
+    fn load_sync(prefix: u8) -> [u32; 2] {
+        [word(prefix, LOAD_SYNC, 0), 0]
+    }
+
     fn decode(words: Vec<u32>) -> Result<DecodedRawDpc, RawDpcDecodeError> {
         let submitted = submit(packet(7, words, &[]));
         decode_raw_dpc(submitted, &RdpState::default())
@@ -951,7 +1228,6 @@ mod tests {
             (0x0f, 176),
             (0x24, 16),
             (0x25, 16),
-            (0x26, 8),
             (0x3e, 8),
         ] {
             let mut words = vec![0; width / 4];
@@ -973,6 +1249,12 @@ mod tests {
     #[test]
     fn truncation_table_reports_exact_context_for_every_width_class() {
         let submitted = submit(packet(7, vec![0, 0], &[]));
+        let source_identity = TmemLoadSourceIdentity::new(
+            submitted.packet().identity(),
+            submitted.packet().journal().identity(),
+            submitted.identity(),
+            submitted.packet().memory_layout(),
+        );
         let packet = submitted.packet();
         let mut stream = FlattenedStream::new(packet.identity(), 0, &packet.streams()[0]);
         for (opcode, width) in [(0x00, 8), (0x24, 16), (0x08, 32), (0x0f, 176)] {
@@ -986,6 +1268,7 @@ mod tests {
                 &stream,
                 packet.memory_layout(),
                 &mut state,
+                source_identity,
                 &mut delta,
                 &mut planned,
                 &mut commands,
@@ -1011,6 +1294,12 @@ mod tests {
     #[test]
     fn unknown_width_is_loud_with_complete_location() {
         let submitted = submit(packet(7, vec![0, 0], &[]));
+        let source_identity = TmemLoadSourceIdentity::new(
+            submitted.packet().identity(),
+            submitted.packet().journal().identity(),
+            submitted.identity(),
+            submitted.packet().memory_layout(),
+        );
         let packet = submitted.packet();
         let mut stream = FlattenedStream::new(packet.identity(), 0, &packet.streams()[0]);
         stream.bytes[0] = 0x50;
@@ -1018,6 +1307,7 @@ mod tests {
             &stream,
             packet.memory_layout(),
             &mut RdpState::default(),
+            source_identity,
             &mut RdpStateDelta::default(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -1537,5 +1827,576 @@ mod tests {
             Err(RawDpcDecodeError::StagedStateMismatch { reason, .. })
                 if reason.contains("queue")
         ));
+    }
+
+    #[test]
+    fn tmem_state_commands_decode_every_public_field_width_for_all_prefixes() {
+        for prefix in [0x00, 0x40, 0x80, 0xc0] {
+            let words = vec![
+                word(prefix, SET_TEXTURE_IMAGE, 3 << 21 | 3 << 19 | 0x0abc),
+                0xfc00_0200,
+                word(prefix, SET_TILE, 4 << 21 | 3 << 19 | 0x01ab << 9 | 0x01fe),
+                7 << 24
+                    | 0x0f << 20
+                    | 3 << 18
+                    | 0x0a << 14
+                    | 0x0b << 10
+                    | 1 << 8
+                    | 0x0c << 4
+                    | 0x0d,
+                word(prefix, SET_TILE_SIZE, 0x0fed << 12 | 0x0cba),
+                7 << 24 | 0x0abc << 12 | 0x0789,
+            ];
+            let decoded =
+                decode_raw_dpc(submit(packet(7, words, &[])), &RdpState::default()).unwrap();
+            assert_eq!(decoded.commands().len(), 3);
+            let image = decoded.staged_state().tmem().texture_image().unwrap();
+            assert_eq!(image.format(), ImageFormat::IntensityAlpha);
+            assert_eq!(image.size(), PixelSize::Bits32);
+            assert_eq!(image.width(), 0x0abd);
+            assert_eq!(image.address().get(), 0x200);
+            let tile = decoded
+                .staged_state()
+                .tmem()
+                .tile(crate::TileIndex::try_new(7).unwrap());
+            let descriptor = tile.descriptor().unwrap();
+            assert_eq!(descriptor.format(), ImageFormat::Intensity);
+            assert_eq!(descriptor.size(), PixelSize::Bits32);
+            assert_eq!(descriptor.line_words(), 0x01ab);
+            assert_eq!(descriptor.tmem().get(), 0x01fe);
+            assert_eq!(descriptor.palette(), 0x0f);
+            assert!(descriptor.t_mode().mirror());
+            assert!(descriptor.t_mode().clamp());
+            assert_eq!(descriptor.mask_t(), 0x0a);
+            assert_eq!(descriptor.shift_t(), 0x0b);
+            assert!(descriptor.s_mode().mirror());
+            assert!(!descriptor.s_mode().clamp());
+            assert_eq!(descriptor.mask_s(), 0x0c);
+            assert_eq!(descriptor.shift_s(), 0x0d);
+            let size = tile.size().unwrap();
+            assert_eq!(size.low_s().raw(), 0x0fed);
+            assert_eq!(size.low_t().raw(), 0x0cba);
+            assert_eq!(size.high_s().raw(), 0x0abc);
+            assert_eq!(size.high_t().raw(), 0x0789);
+            assert!(decoded
+                .commands()
+                .iter()
+                .all(|command| command.location().wire_opcode() & 0xc0 == prefix));
+        }
+    }
+
+    #[test]
+    fn set_texture_image_decodes_all_26_public_address_bits() {
+        let legal = vec![word(0, SET_TEXTURE_IMAGE, 2 << 19), 0xfc00_0200];
+        let decoded = decode_raw_dpc(submit(packet(7, legal, &[])), &RdpState::default()).unwrap();
+        assert_eq!(
+            decoded
+                .staged_state()
+                .tmem()
+                .texture_image()
+                .unwrap()
+                .address()
+                .get(),
+            0x200
+        );
+
+        for public_address_bit in [1 << 24, 1 << 25] {
+            let words = vec![
+                word(0, SET_TEXTURE_IMAGE, 2 << 19),
+                public_address_bit | 0x200,
+            ];
+            assert!(matches!(
+                decode_raw_dpc(submit(packet(7, words, &[])), &RdpState::default()),
+                Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                    if reason.contains("outside installed RDRAM")
+            ));
+        }
+    }
+
+    #[test]
+    fn set_tile_preserves_an_earlier_tile_size() {
+        let words = vec![
+            word(0, SET_TILE_SIZE, 4 << 12 | 8),
+            3 << 24 | 20 << 12 | 24,
+            word(0, SET_TILE, 2 << 19 | 7 << 9 | 9),
+            3 << 24,
+        ];
+        let decoded = decode_raw_dpc(submit(packet(7, words, &[])), &RdpState::default()).unwrap();
+        let tile = decoded
+            .staged_state()
+            .tmem()
+            .tile(crate::TileIndex::try_new(3).unwrap());
+
+        assert!(tile.descriptor().is_some());
+        assert_eq!(
+            tile.size().unwrap(),
+            crate::TileSize::from_wire(
+                crate::TileCoordinate::try_new(4).unwrap(),
+                crate::TileCoordinate::try_new(8).unwrap(),
+                crate::TileCoordinate::try_new(20).unwrap(),
+                crate::TileCoordinate::try_new(24).unwrap(),
+            )
+        );
+    }
+
+    #[test]
+    fn staged_tmem_state_chains_across_immediate_packets() {
+        let mut first_words = Vec::new();
+        first_words.extend(set_texture_image(0, 0, 2, 8, 0x200));
+        first_words.extend(set_tile(0, 7, 2, 0));
+        first_words.extend(load_sync(0));
+        let second_words = vec![word(0, LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800];
+        let (mut queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
+            .unwrap()
+            .into_roles();
+        let first = queue
+            .submit(DecodedTicket::new(packet(7, first_words, &[])))
+            .unwrap();
+        let second = queue
+            .submit(DecodedTicket::new(packet_with_tmem_sources(
+                8,
+                second_words,
+                &[(0x214, 0x224)],
+            )))
+            .unwrap();
+
+        let staged = decode_raw_dpc(first, &RdpState::default())
+            .unwrap()
+            .into_staged_state();
+        let decoded = decode_raw_dpc_after(second, staged).unwrap();
+        let RawDpcCommandKind::LoadBlock(load) = decoded.commands()[0].kind() else {
+            panic!("expected LoadBlock");
+        };
+        assert_eq!(load.epoch().get(), 1);
+        assert_eq!(load.source_image().address().get(), 0x200);
+        assert_eq!(load.tile().get(), 7);
+        assert_eq!(decoded.staged_state().tmem().last_load(), Some(load));
+    }
+
+    #[test]
+    fn latched_texture_image_rejects_staged_and_durable_cross_layout_loads() {
+        let mut state_words = Vec::new();
+        state_words.extend(set_texture_image(0, 0, 2, 8, 0x200));
+        state_words.extend(set_tile(0, 7, 2, 0));
+        state_words.extend(load_sync(0));
+        let load_words = vec![word(0, LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800];
+
+        let (mut queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
+            .unwrap()
+            .into_roles();
+        let first = queue
+            .submit(DecodedTicket::new(packet_with_tmem_sources_in_layout(
+                0x4000,
+                7,
+                state_words.clone(),
+                &[],
+            )))
+            .unwrap();
+        let second = queue
+            .submit(DecodedTicket::new(packet_with_tmem_sources_in_layout(
+                0x5000,
+                8,
+                load_words.clone(),
+                &[(0x214, 0x224)],
+            )))
+            .unwrap();
+        let staged = decode_raw_dpc(first, &RdpState::default())
+            .unwrap()
+            .into_staged_state();
+        assert!(matches!(
+            decode_raw_dpc_after(second, staged),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("layout differs")
+        ));
+
+        let first = decode_raw_dpc(
+            submit(packet_with_tmem_sources_in_layout(
+                0x4000,
+                7,
+                state_words,
+                &[],
+            )),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let mut durable = RdpState::default();
+        durable.apply(first.state_delta());
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet_with_tmem_sources_in_layout(
+                    0x5000,
+                    8,
+                    load_words,
+                    &[(0x214, 0x224)],
+                )),
+                &durable,
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("layout differs")
+        ));
+    }
+
+    #[test]
+    fn load_block_binds_exact_source_access_owned_bytes_and_one_sync_epoch() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 2, 8, 0x200));
+        words.extend(set_tile(0, 7, 2, 0));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x214, 0x224)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        assert_eq!(load.epoch().get(), 1);
+        assert_eq!(load.source_plan().first_operation(), OperationId::new(1));
+        assert_eq!(load.source_plan().access_count(), 1);
+        assert_eq!(load.source_plan().total_bytes(), 16);
+        assert_eq!(
+            decoded
+                .resource_plan()
+                .tmem_load_source_accesses(load.source_plan())
+                .unwrap(),
+            [tmem_source_access(
+                PhysicalMemoryLayout::try_new(LAYOUT_BYTES).unwrap(),
+                1,
+                0x214,
+                0x224,
+            )]
+        );
+        assert_eq!(decoded.submitted().packet().owned_guest_read_bytes(), 16);
+        assert_eq!(
+            decoded.submitted().packet().guest_reads().reads()[0].bytes(),
+            [1; 16]
+        );
+        assert_eq!(decoded.staged_state().tmem().last_load(), Some(load));
+        assert_eq!(decoded.staged_state().tmem().armed_load_sync(), None);
+
+        let mut missing_second_sync = Vec::new();
+        missing_second_sync.extend(set_texture_image(0, 0, 2, 8, 0x200));
+        missing_second_sync.extend(set_tile(0, 7, 2, 0));
+        missing_second_sync.extend(load_sync(0));
+        missing_second_sync.extend([
+            word(0, LOAD_BLOCK, 2 << 12 | 1),
+            7 << 24 | 9 << 12 | 0x0800,
+            word(0, LOAD_BLOCK, 2 << 12 | 1),
+            7 << 24 | 9 << 12 | 0x0800,
+        ]);
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet_with_tmem_sources(
+                    8,
+                    missing_second_sync,
+                    &[(0x214, 0x224), (0x214, 0x224)],
+                )),
+                &RdpState::default(),
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("LoadSync")
+        ));
+    }
+
+    #[test]
+    fn load_block_enforces_tl_and_inclusive_count_boundaries() {
+        let block_words = |width: u32, low_t: u32, high_s: u32| {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, 1, width, 0x200));
+            words.extend(set_tile(0, 7, 1, 0));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_BLOCK, low_t), 7 << 24 | high_s << 12 | 0x0800]);
+            words
+        };
+
+        decode_raw_dpc(
+            submit(packet_with_tmem_sources(
+                7,
+                block_words(1, 1023, 0),
+                &[(0x5ff, 0x600)],
+            )),
+            &RdpState::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet(7, block_words(1, 1024, 0), &[])),
+                &RdpState::default(),
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("ten-bit")
+        ));
+
+        decode_raw_dpc(
+            submit(packet_with_tmem_sources(
+                7,
+                block_words(4096, 0, 2047),
+                &[(0x200, 0xa00)],
+            )),
+            &RdpState::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet(7, block_words(4096, 0, 2048), &[])),
+                &RdpState::default(),
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("exceeds 2048")
+        ));
+    }
+
+    #[test]
+    fn load_block_plans_exact_32_bit_source_bytes() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 3, 4, 0x200));
+        words.extend(set_tile(0, 7, 1, 0));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_BLOCK, 1 << 12 | 1), 7 << 24 | 2 << 12]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x214, 0x21c)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadBlock(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        assert_eq!(load.source_plan().total_bytes(), 8);
+    }
+
+    #[test]
+    fn tmem_source_plans_reject_cross_decode_range_and_layout_aliases() {
+        let decode_block = |layout_bytes: u32, address: u32, range: (u32, u32)| {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, 2, 8, address));
+            words.extend(set_tile(0, 7, 2, 0));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12 | 0x0800]);
+            decode_raw_dpc(
+                submit(packet_with_tmem_sources_in_layout(
+                    layout_bytes,
+                    7,
+                    words,
+                    &[range],
+                )),
+                &RdpState::default(),
+            )
+            .unwrap()
+        };
+
+        let first = decode_block(0x4000, 0x200, (0x214, 0x224));
+        let different_range = decode_block(0x4000, 0x300, (0x314, 0x324));
+        let RawDpcCommandKind::LoadBlock(first_load) = first.commands()[3].kind() else {
+            panic!("expected LoadBlock");
+        };
+        let RawDpcCommandKind::LoadBlock(different_range_load) =
+            different_range.commands()[3].kind()
+        else {
+            panic!("expected LoadBlock");
+        };
+        assert_ne!(
+            first_load.source_plan().source_access_identity(),
+            different_range_load.source_plan().source_access_identity()
+        );
+        assert_eq!(
+            first
+                .resource_plan()
+                .tmem_load_source_accesses(different_range_load.source_plan()),
+            Err(TmemLoadSourcePlanError::DecodeIdentityMismatch)
+        );
+
+        let different_layout = decode_block(0x5000, 0x200, (0x214, 0x224));
+        let RawDpcCommandKind::LoadBlock(different_layout_load) =
+            different_layout.commands()[3].kind()
+        else {
+            panic!("expected LoadBlock");
+        };
+        assert_ne!(
+            first_load.source_plan().source_access_identity(),
+            different_layout_load.source_plan().source_access_identity()
+        );
+        assert_eq!(
+            first
+                .resource_plan()
+                .tmem_load_source_accesses(different_layout_load.source_plan()),
+            Err(TmemLoadSourcePlanError::DecodeIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn load_tile_plans_exact_fractional_subrows_and_collapses_full_rows() {
+        let mut subrows = Vec::new();
+        subrows.extend(set_texture_image(0, 2, 0, 9, 0x200));
+        subrows.extend(set_tile(0, 3, 1, 0));
+        subrows.extend(load_sync(0));
+        subrows.extend([word(0, LOAD_TILE, 5 << 12 | 8), 3 << 24 | 15 << 12 | 15]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(
+                7,
+                subrows,
+                &[(0x209, 0x20b), (0x20e, 0x210)],
+            )),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadTile(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadTile");
+        };
+        assert_eq!(load.source_plan().access_count(), 2);
+        assert_eq!(load.source_plan().total_bytes(), 4);
+        let TmemLoadKind::Tile { bounds } = load.kind() else {
+            panic!("expected tile bounds");
+        };
+        assert_eq!(bounds.low_s().raw(), 5);
+        assert_eq!(bounds.low_t().raw(), 8);
+        assert_eq!(bounds.high_s().raw(), 15);
+        assert_eq!(bounds.high_t().raw(), 15);
+
+        let mut full_rows = Vec::new();
+        full_rows.extend(set_texture_image(0, 3, 1, 4, 0x300));
+        full_rows.extend(set_tile(0, 2, 1, 0));
+        full_rows.extend(load_sync(0));
+        full_rows.extend([word(0, LOAD_TILE, 0), 2 << 24 | 12 << 12 | 4]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, full_rows, &[(0x300, 0x308)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadTile(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadTile");
+        };
+        assert_eq!(load.source_plan().access_count(), 1);
+        assert_eq!(load.source_plan().total_bytes(), 8);
+    }
+
+    #[test]
+    fn load_tlut_uses_all_ten_count_bits_and_rejects_the_257th_entry() {
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 2, 1, 0x300));
+        words.extend(set_tile(0, 7, 0, 256));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_TLUT, 0), 7 << 24 | 255 << 14]);
+        let decoded = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x300, 0x500)])),
+            &RdpState::default(),
+        )
+        .unwrap();
+        let RawDpcCommandKind::LoadTlut(load) = decoded.commands()[3].kind() else {
+            panic!("expected LoadTLUT");
+        };
+        let TmemLoadKind::Tlut { entries, .. } = load.kind() else {
+            panic!("expected TLUT load kind");
+        };
+        assert_eq!(entries.get(), 256);
+        assert_eq!(load.source_plan().total_bytes(), 512);
+
+        let mut too_many = Vec::new();
+        too_many.extend(set_texture_image(0, 0, 2, 1, 0x300));
+        too_many.extend(set_tile(0, 7, 0, 256));
+        too_many.extend(load_sync(0));
+        too_many.extend([word(0, LOAD_TLUT, 0), 7 << 24 | 256 << 14]);
+        assert!(matches!(
+            decode_raw_dpc(
+                submit(packet(7, too_many, &[])),
+                &RdpState::default()
+            ),
+            Err(RawDpcDecodeError::InvalidCommand { reason, .. })
+                if reason.contains("256-entry")
+        ));
+    }
+
+    #[test]
+    fn load_tlut_rejects_every_non_macro_coordinate_field() {
+        for (name, w0_payload, w1_payload, reason) in [
+            ("SL integer", 4 << 12, 0, "zero SL origin"),
+            ("TL integer", 4, 0, "zero TL origin"),
+            ("SL fraction", 1 << 12, 0, "fractional"),
+            ("TL fraction", 1, 0, "fractional"),
+            ("count fraction", 0, 1 << 12, "fractional"),
+            ("TH", 0, 1, "zero TH"),
+        ] {
+            let mut words = Vec::new();
+            words.extend(set_texture_image(0, 0, 2, 1, 0x300));
+            words.extend(set_tile(0, 7, 0, 256));
+            words.extend(load_sync(0));
+            words.extend([word(0, LOAD_TLUT, w0_payload), 7 << 24 | w1_payload]);
+            let error =
+                decode_raw_dpc(submit(packet(7, words, &[])), &RdpState::default()).unwrap_err();
+            assert!(
+                matches!(error, RawDpcDecodeError::InvalidCommand { reason: actual, .. } if actual.contains(reason)),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_missing_tmem_load_precondition_is_loud_without_durable_publication() {
+        let durable = RdpState::default();
+        let cases = [
+            vec![word(0, LOAD_BLOCK, 0), 0],
+            {
+                let mut words = Vec::new();
+                words.extend(load_sync(0));
+                words.extend([word(0, LOAD_BLOCK, 0), 0]);
+                words
+            },
+            {
+                let mut words = Vec::new();
+                words.extend(set_texture_image(0, 0, 2, 1, 0x200));
+                words.extend(load_sync(0));
+                words.extend([word(0, LOAD_BLOCK, 0), 0]);
+                words
+            },
+        ];
+        for words in cases {
+            assert!(matches!(
+                decode_raw_dpc(submit(packet(7, words, &[])), &durable),
+                Err(RawDpcDecodeError::InvalidCommand { .. })
+            ));
+            assert_eq!(durable, RdpState::default());
+        }
+    }
+
+    #[test]
+    fn wrong_tmem_source_range_is_an_exact_journal_rejection() {
+        let durable = RdpState::default();
+        let mut words = Vec::new();
+        words.extend(set_texture_image(0, 0, 2, 8, 0x200));
+        words.extend(set_tile(0, 7, 2, 0));
+        words.extend(load_sync(0));
+        words.extend([word(0, LOAD_BLOCK, 2 << 12 | 1), 7 << 24 | 9 << 12]);
+        let error = decode_raw_dpc(
+            submit(packet_with_tmem_sources(7, words, &[(0x214, 0x222)])),
+            &durable,
+        )
+        .unwrap_err();
+        let RawDpcDecodeError::JournalMismatch {
+            expected, actual, ..
+        } = error
+        else {
+            panic!("expected exact journal mismatch");
+        };
+        assert_eq!(
+            expected[1].region(),
+            ResourceRegion::Rdram {
+                resource: RdramResource::Buffer,
+                range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
+                    .unwrap()
+                    .range(0x214, 0x224)
+                    .unwrap(),
+            }
+        );
+        assert_eq!(
+            actual[1].region(),
+            ResourceRegion::Rdram {
+                resource: RdramResource::Buffer,
+                range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
+                    .unwrap()
+                    .range(0x214, 0x222)
+                    .unwrap(),
+            }
+        );
+        assert_eq!(durable, RdpState::default());
     }
 }
