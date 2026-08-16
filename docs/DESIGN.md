@@ -379,6 +379,70 @@ generic coordinator mechanism, not a backend state payload or its own
 generation-tracking logic); see the migration card's ticket DAG and T0's
 freeze report for the exact scoped boundary.
 
+**T3 Phase A/B -- the concrete `wgpu` backend.** T3 Phase A adds
+`PendingTmemTransaction::into_physical_successor(&self, base: &PhysicalTmemState,
+effects: &fn64_render_ir::BackendEffectReport) -> Result<PhysicalTmemState,
+PhysicalTmemError>`: the exact `next_physical` shape
+`RawDpcCoordinator::complete_execution` needs, produced without touching
+`base` and never durably published until a later `commit` flips a
+coordinator's active slot to it. It runs the identical three ordinal checks
+`PhysicalTmemPublicationAuthority::publish` runs
+(`CrossStatePublication`/`StaleBaseGeneration`/`StaleLoadEpoch`), then a new
+`BackendEffectMismatch` check that the backend report's declared writes
+exactly match this transaction's own proposed effects, then
+`validate_proposal` self-consistency last -- the same order `publish` itself
+uses.
+
+T3 Phase B adds `fn64-render-wgpu`'s `production` module: a concrete
+`WgpuBackend` owning `fn64_render::RawDpcCoordinator<PhysicalTmemState>`,
+obtained exactly once at construction via `RawDpcBackendAuthority::
+into_coordinator`. `plan_raw_dpc` decodes a `RawDpcPlanRequest`'s capture
+through T1's real decoder (`crate::decode_raw_dpc`) and T1's push loop
+(`crate::raw_dpc::push_decoded_raw_dpc`) into a sealed
+`PlannedRawDpcSubmission`, using the same two-pass journal probe T1's own
+tests use (decode once against a throwaway single-source journal, read the
+real access list back off `RawDpcDecodeError::JournalMismatch::expected`,
+decode again for real) since the exact journal `ExactRawDpcPlanWriter::finish`
+requires is not knowable before a first decode attempt. `WgpuBackend` also
+carries a durable `RdpState`, updated via each successful plan's own
+`RdpStateDelta`, so a submission's `SetTile`/`SetTextureImage`/`SyncLoad`
+state depends correctly on what an earlier submission staged rather than
+re-decoding from a fresh default every time.
+
+`execute_raw_dpc` reaches plan contents exclusively through
+`BoundSubmittedRawDpc`'s authority-scoped, nonextracting `execution_view` --
+never a bare `SubmittedTicket` or the private decoder's own
+`BoundTmemTransfer`. This exposed one genuine seam gap: `PhysicalTmemState`'s
+existing `stage_transfer` (and its `PhysicalTmemPacketTransaction` chaining
+counterpart) is hard-typed to that decoder-owned pair, which a production
+`execute_raw_dpc` implementation cannot obtain by design. T3 Phase B adds an
+additive, crate-private neutral counterpart --
+`PhysicalTmemState::stage_neutral_transfer`/`PhysicalTmemPacketTransaction::
+stage_neutral_transfer_next` -- that performs the identical checks
+(destination-access/physical-word coverage via the same
+`validate_physical_plan`, epoch ordering, cross-state/generation binding)
+against `fn64_render::TmemLoadSemantics`'s neutral fields (which mirror the
+private decoder types field-for-field) instead. It reuses
+`PhysicalTmemState`'s existing `stage_word`/`finish_load`/`into_pending`
+unchanged, and reuses (via widened `pub(crate)` visibility, not
+reimplementation) the exact same tested LoadBlock/LoadTile/LoadTLUT
+byte-to-physical-lane mapping functions the decoder-typed executors already
+use -- LoadBlock and LoadTile share one identical mapping (both are pure
+linear/split-bank fragment placement with no quadrication), so only one copy
+is reused for both. `publish_raw_dpc` is implemented as exactly
+`self.coordinator.prepare_publication(publication).commit()`, matching v11's
+frozen shape: one non-`Result`, callback-free terminal path that flips the
+physical slot, commits the concrete fabric transition, and records
+`Published` together.
+
+Scope, matching the T3 ticket DAG and card v11 exactly: TMEM-only,
+no-FullSync, no-guest-write raw-DPC execution/publication, headless only. No
+ABI/T4 ingress, no visible presentation, no raster parity, no native GPU
+testing. `WgpuBackend::process_task`/`present` are honest, named
+`RenderError` rejections rather than invented gfx-task/presentation
+behavior -- the landed `RenderBackend` trait requires both as non-defaulted
+methods, but this slice proves only the raw-DPC production seam.
+
 `fn64-runtime` depends on nothing else in this workspace. It is pure, safe
 Rust: the scheduler, message-queue semantics, timer wheel, rdram buffer
 ownership, and the diagnostic/watch hooks. It has no knowledge that it is

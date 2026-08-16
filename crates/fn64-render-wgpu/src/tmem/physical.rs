@@ -203,6 +203,71 @@ impl PhysicalTmemState {
     pub fn publication_authority(&mut self) -> PhysicalTmemPublicationAuthority<'_> {
         PhysicalTmemPublicationAuthority { durable: self }
     }
+
+    /// T3 Phase B's sole staging entry point for a load reached through
+    /// `fn64_render`'s sealed neutral raw-DPC plan
+    /// (`fn64_render::TmemLoadSemantics`), rather than through
+    /// this crate's own private decoder (`fn64_render_ir::SubmittedTicket` +
+    /// [`crate::raw_dpc::BoundTmemTransfer`], which [`Self::stage_transfer`]
+    /// above requires). A production `RenderBackend::execute_raw_dpc`
+    /// implementation only ever holds a `BoundSubmittedRawDpc`'s
+    /// authority-scoped, nonextracting `execution_view` -- it cannot obtain
+    /// a `SubmittedTicket` or `BoundTmemTransfer` to call `stage_transfer`
+    /// with, by the production seam's own design (see `docs/DESIGN.md`'s T0
+    /// section: "a bare `DecodedTicket`/`SubmittedTicket` never escapes to a
+    /// caller"). This method takes the equivalent facts in their neutral
+    /// (`fn64-render`-owned) shape instead: the workload/journal/submission
+    /// identity a real ABI-side capture would have produced, the queue and
+    /// submission ordinal `BoundSubmittedRawDpc::queue()`/`ordinal()`
+    /// already expose directly, and one load's complete
+    /// `TmemLoadSemantics` plus its exact ordered destination access slice
+    /// (which the caller must have already collected from the plan's own
+    /// `access()` visitor callback, in journal order, starting at
+    /// `load.destination_access_index()` -- exactly the same slice
+    /// [`crate::raw_dpc::push_decoded_raw_dpc`]'s `push_tmem_load` pushed
+    /// for this load).
+    ///
+    /// Performs the identical checks [`Self::stage_transfer`]/
+    /// [`PhysicalTmemPacketTransaction::stage_transfer`] perform against
+    /// their own decoder-typed inputs -- source identity, epoch ordering,
+    /// word/access count agreement, and the destination-access/physical-word
+    /// coverage cross-check ([`validate_physical_plan`]) -- against these
+    /// neutral inputs instead. It does not weaken, skip, or reorder any of
+    /// them.
+    pub(crate) fn stage_neutral_transfer(
+        &self,
+        source: TmemLoadSourceIdentity,
+        queue: QueueIdentity,
+        submission_ordinal: u64,
+        transaction_sequence: u64,
+        load: &fn64_render::TmemLoadSemantics,
+        destination_accesses: &[ResourceAccess],
+    ) -> Result<StagedTmemTransaction, PhysicalTmemError> {
+        let packet = PhysicalTmemPacketTransaction {
+            binding: neutral_packet_binding(
+                self,
+                source,
+                queue,
+                submission_ordinal,
+                transaction_sequence,
+            )?,
+            bytes: self.bytes.clone(),
+            valid: self.valid.clone(),
+            last_touched_generation: self.last_touched_generation.clone(),
+            last_load_epoch: self.last_load_epoch,
+            projections: Vec::new(),
+            effects: Vec::new(),
+            // Seeded empty: `PhysicalTmemPacketTransaction::stage_neutral_transfer`
+            // below is the sole place that appends `destination_accesses`,
+            // called uniformly for the first load (here) and every
+            // second-and-later load (`stage_neutral_transfer_next`). Seeding
+            // this with `destination_accesses` here too would double-count
+            // load one's own destinations once the chained call below
+            // appends them again.
+            expected_destination_accesses: Box::new([]),
+        };
+        packet.stage_neutral_transfer(source, load, destination_accesses)
+    }
 }
 
 /// Exact durable-state and packet lifecycle identity shared by every load in
@@ -322,6 +387,70 @@ impl PhysicalTmemPacketTransaction {
             load_binding,
             destination_accesses: transfer.destination_accesses().to_vec().into_boxed_slice(),
             words: transfer.words().to_vec().into_boxed_slice(),
+            next_word: 0,
+            poisoned: false,
+        })
+    }
+
+    /// Neutral-plan counterpart to [`Self::stage_transfer`] (the chaining,
+    /// second-and-later-load overload): begins the next accepted load
+    /// against this already-in-progress packet transaction, exactly as
+    /// [`Self::stage_transfer`] chains subsequent decoder-typed loads. See
+    /// [`PhysicalTmemState::stage_neutral_transfer`] for why the neutral
+    /// entry point exists.
+    pub(crate) fn stage_neutral_transfer_next(
+        self,
+        expected_source: TmemLoadSourceIdentity,
+        load: &fn64_render::TmemLoadSemantics,
+        destination_accesses: &[ResourceAccess],
+    ) -> Result<StagedTmemTransaction, PhysicalTmemError> {
+        self.stage_neutral_transfer(expected_source, load, destination_accesses)
+    }
+
+    /// Neutral-plan counterpart to [`Self::stage_transfer`]; see
+    /// [`PhysicalTmemState::stage_neutral_transfer`] for why this entry
+    /// point exists and what it accepts instead of a decoder-typed
+    /// `SubmittedTicket`/`BoundTmemTransfer` pair.
+    ///
+    /// The decoder-typed path (`stage_transfer`) seeds
+    /// `expected_destination_accesses` once, from the *whole* submitted
+    /// journal, because a `SubmittedTicket` exposes it up front. The
+    /// neutral path has no such upfront whole-journal object: each call
+    /// only ever carries the destinations for *this one load*
+    /// (`stage_and_report` visits the plan's loads one at a time). So this
+    /// method must extend the running set here, on every second-and-later
+    /// load, or `into_pending`'s coverage check only ever sees load one's
+    /// destinations and rejects any multi-load plan.
+    fn stage_neutral_transfer(
+        mut self,
+        expected_source: TmemLoadSourceIdentity,
+        load: &fn64_render::TmemLoadSemantics,
+        destination_accesses: &[ResourceAccess],
+    ) -> Result<StagedTmemTransaction, PhysicalTmemError> {
+        let load_binding = neutral_validate_transfer(
+            load,
+            destination_accesses,
+            expected_source,
+            self.last_load_epoch,
+        )?;
+        let words: Vec<TmemTransferWord> = load
+            .transfer_words()
+            .iter()
+            .copied()
+            .map(neutral_transfer_word)
+            .collect();
+        self.expected_destination_accesses = self
+            .expected_destination_accesses
+            .iter()
+            .copied()
+            .chain(destination_accesses.iter().copied())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(StagedTmemTransaction {
+            packet: self,
+            load_binding,
+            destination_accesses: destination_accesses.to_vec().into_boxed_slice(),
+            words: words.into_boxed_slice(),
             next_word: 0,
             poisoned: false,
         })
@@ -1113,6 +1242,124 @@ fn validate_transfer(
         destination_access_count: plan.destination().access_count(),
         epoch: load.epoch(),
     })
+}
+
+/// Neutral-plan counterpart to [`packet_binding`]; see
+/// [`PhysicalTmemState::stage_neutral_transfer`] for why this exists.
+/// `transaction_sequence` is the raw-DPC packet's own
+/// `WorkloadAdmission::RawDpc { transaction_sequence }` field, which a
+/// caller reaches through `RawDpcExecutionView::submitted_packet`'s
+/// `&WorkloadPacket` (there is no `admission()` accessor on the neutral
+/// `TmemLoadSemantics` itself, exactly as `packet_binding` reads it from
+/// `submitted.packet().admission()` rather than from `transfer`).
+fn neutral_packet_binding(
+    state: &PhysicalTmemState,
+    source: TmemLoadSourceIdentity,
+    queue: QueueIdentity,
+    submission_ordinal: u64,
+    transaction_sequence: u64,
+) -> Result<PhysicalTmemBinding, PhysicalTmemError> {
+    let next_generation = state
+        .generation
+        .checked_add(1)
+        .ok_or(PhysicalTmemError::GenerationExhausted)?;
+    Ok(PhysicalTmemBinding {
+        state: state.identity,
+        transaction: mint_transaction_identity()?,
+        source,
+        queue,
+        submission_ordinal,
+        transaction_sequence,
+        base_generation: state.generation,
+        next_generation,
+        base_last_load_epoch: state.last_load_epoch,
+    })
+}
+
+/// Neutral-plan counterpart to [`validate_transfer`]; see
+/// [`PhysicalTmemState::stage_neutral_transfer`] for why this exists.
+/// `destination_accesses` is the caller-collected exact ordered slice
+/// (see that method's doc comment); this function still cross-checks it
+/// against `load`'s own `transfer_words()` physical placement via
+/// [`validate_physical_plan`] exactly as the decoder-typed path does via
+/// `transfer.destination_accesses()`/`transfer.words()`.
+fn neutral_validate_transfer(
+    load: &fn64_render::TmemLoadSemantics,
+    destination_accesses: &[ResourceAccess],
+    // Unlike `validate_transfer`'s `expected_source` (checked against a
+    // per-load `TmemLoadSourcePlan::identity()` the decoder path derives
+    // independently per load), the neutral path has exactly one source
+    // identity per submission -- `stage_neutral_transfer`'s own `source`
+    // parameter, threaded through to `neutral_packet_binding` -- and no
+    // second, independently derived per-load neutral source identity
+    // exists to compare it against; `ExactRawDpcPlanWriter::finish` already
+    // proved every pushed command belongs to the one journal this
+    // submission's `source` identity was built from before a plan could
+    // exist at all (see `docs/DESIGN.md`'s T0 section). Kept as a named
+    // parameter (not silently dropped) so a future caller-suppliable
+    // per-load neutral source identity, if one is ever added, has an
+    // obvious place to plug in a real check.
+    _source: TmemLoadSourceIdentity,
+    previous_epoch: Option<TmemLoadEpoch>,
+) -> Result<PhysicalTmemLoadBinding, PhysicalTmemError> {
+    let words: Vec<TmemTransferWord> = load
+        .transfer_words()
+        .iter()
+        .copied()
+        .map(neutral_transfer_word)
+        .collect();
+    validate_physical_plan(destination_accesses, &words)?;
+    let epoch = neutral_load_epoch(load.epoch());
+    if previous_epoch.is_some_and(|previous| epoch.get() <= previous.get()) {
+        return Err(PhysicalTmemError::EpochNotNewer {
+            previous: previous_epoch,
+            actual: epoch,
+        });
+    }
+    let destination_access_identity = access_identity(destination_accesses)?;
+    Ok(PhysicalTmemLoadBinding {
+        identity: mint_load_identity()?,
+        source_access_identity: access_identity(core::slice::from_ref(&load.source()))?,
+        source_first_access_index: load.source_access_index(),
+        source_access_count: 1,
+        destination_access_identity,
+        destination_first_access_index: load.destination_access_index(),
+        destination_access_count: u16::try_from(destination_accesses.len())
+            .map_err(|_| PhysicalTmemError::DestinationPlanMismatch)?,
+        epoch,
+    })
+}
+
+/// Field-for-field conversion from `fn64_render`'s neutral
+/// [`fn64_render::NeutralTmemTransferWord`] to this crate's
+/// private [`TmemTransferWord`] -- the two are documented mirrors of each
+/// other (see `NeutralTmemTransferWord`'s own doc comment in
+/// `fn64-render`), so this conversion is a straight field copy, never a
+/// recomputation.
+fn neutral_transfer_word(word: fn64_render::NeutralTmemTransferWord) -> TmemTransferWord {
+    TmemTransferWord::new(
+        word.index,
+        word.logical_source_offset,
+        word.source_access_index,
+        word.source_access_byte_offset,
+        word.defined_source_byte_mask,
+        word.defined_destination_byte_mask,
+        word.destination_word,
+        word.row_advance,
+        word.odd_row_exchange,
+        match word.physical {
+            fn64_render::NeutralTmemTransferPhysicalWord::Linear(range) => {
+                TmemTransferPhysicalWord::Linear(range)
+            }
+            fn64_render::NeutralTmemTransferPhysicalWord::SplitBanks { low, high } => {
+                TmemTransferPhysicalWord::SplitBanks { low, high }
+            }
+        },
+    )
+}
+
+fn neutral_load_epoch(epoch: fn64_render::TmemLoadEpoch) -> TmemLoadEpoch {
+    TmemLoadEpoch::new(core::num::NonZeroU64::new(epoch.get()).expect("neutral epoch is nonzero"))
 }
 
 fn mint_transaction_identity() -> Result<PhysicalTmemTransactionIdentity, PhysicalTmemError> {

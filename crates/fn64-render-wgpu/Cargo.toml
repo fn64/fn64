@@ -13,9 +13,9 @@ host-gpu-tests = []
 [dependencies]
 fn64-render = { path = "../fn64-render" }
 fn64-render-ir = { path = "../fn64-render-ir" }
+fn64-runtime = { path = "../fn64-runtime" }
 wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl"] }
 
 [dev-dependencies]
-fn64-runtime = { path = "../fn64-runtime" }
 naga = { version = "=30.0.0", default-features = false, features = ["wgsl-in"] }
 sha2 = "0.10"

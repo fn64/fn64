@@ -84,6 +84,19 @@
 //! transaction-local state; it does not publish durable bytes or issue a
 //! lifecycle receipt.
 //!
+//! T3 Phase A adds `PendingTmemTransaction::into_physical_successor`, the
+//! inactive-slot `next_physical` shape `fn64_render::RawDpcCoordinator::
+//! complete_execution` needs. T3 Phase B (`production` module) adds the
+//! concrete `WgpuBackend`: it owns that coordinator, plans through T1's real
+//! decoder/push loop (`raw_dpc::production_adapter`), executes a sealed
+//! `BoundSubmittedRawDpc` using only its authority-scoped `execution_view`
+//! (never the private decoder's own `SubmittedTicket`/`BoundTmemTransfer`),
+//! and publishes as exactly `self.coordinator.prepare_publication(
+//! publication).commit()`. Scope is TMEM-only, no-FullSync, no-guest-write,
+//! headless; `process_task`/`present` are honest named rejections, not
+//! general gfx-task/presentation support. See `docs/DESIGN.md`'s "T3 Phase
+//! A/B" section for the full account.
+//!
 //! Downstream callers cannot relabel logical source bytes as physical TMEM
 //! lanes; the bounded assertion constructor is crate-private:
 //!
@@ -237,6 +250,7 @@ mod depth_strict_less;
 mod device;
 mod lifecycle;
 mod native_contract;
+mod production;
 mod raw_dpc;
 mod shader_manifest;
 mod state;
@@ -270,6 +284,7 @@ pub use native_contract::{
     NATIVE_FILL_TARGET_START, NATIVE_FILL_TRANSACTION_SEQUENCE, NATIVE_FILL_WIDTH,
     NATIVE_FILL_WORKLOAD_SHA256,
 };
+pub use production::{WgpuBackend, WgpuBackendConstructionError, WgpuRawDpcExecutionError};
 pub use raw_dpc::{
     decode_raw_dpc, decode_raw_dpc_after, push_decoded_raw_dpc, BoundTmemTransfer, DecodedRawDpc,
     DecodedRawDpcCommand, FillRectangle, RawDpcCommandKind, RawDpcCommandLocation,

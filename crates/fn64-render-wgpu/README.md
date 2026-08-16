@@ -618,3 +618,25 @@ claims no RT64 source byte. No blend, coverage, alpha
 compare, dither, `Interpenetrating`-mode coverage-wrap adjustment (an
 unresolved gap in the reference itself), framebuffer read, draw-call
 integration, or native GPU execution is claimed or exercised by this slice.
+
+## T3 Phase A/B: the production raw-DPC `WgpuBackend`
+
+Separately from the M-numbered lineage above (a different migration track:
+`docs/DESIGN.md`'s "Production raw-DPC seam" sections), T3 Phase A adds
+`PendingTmemTransaction::into_physical_successor`, and T3 Phase B adds the
+`production` module's concrete `WgpuBackend`, which owns
+`fn64_render::RawDpcCoordinator<PhysicalTmemState>` and implements
+`RenderBackend`'s `plan_raw_dpc`/`execute_raw_dpc`/`publish_raw_dpc` raw-DPC
+production trio. `plan_raw_dpc` drives T1's real decoder/push loop
+(`raw_dpc::production_adapter`); `execute_raw_dpc` reaches plan contents
+exclusively through `BoundSubmittedRawDpc::execution_view` (never a bare
+`SubmittedTicket`) and stages every load through a new, additive
+`PhysicalTmemState::stage_neutral_transfer` counterpart to the existing
+decoder-typed `stage_transfer` -- required because a production caller
+cannot obtain the private `SubmittedTicket`/`BoundTmemTransfer` pair that
+method needs, by the production seam's own design; `publish_raw_dpc` is
+exactly `self.coordinator.prepare_publication(publication).commit()`. Scope
+is TMEM-only, no-FullSync, no-guest-write, headless: no ABI/T4 ingress, no
+visible presentation, no raster parity, no native GPU testing.
+`WgpuBackend::process_task`/`present` are honest named rejections. See
+`docs/DESIGN.md`'s "T3 Phase A/B" section for the full account.

@@ -59,6 +59,7 @@ pub use execute::{
     LoadTileExecutionError, LoadTlutExecutionError, PreparedLoadBlock, PreparedLoadTile,
     PreparedLoadTlut, TmemPacketExecutionError,
 };
+pub(crate) use execute::{map_physical_lanes_block, map_physical_lanes_tlut};
 pub use physical::{
     CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
     PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError, PhysicalTmemPacketTransaction,

@@ -405,7 +405,7 @@ fn validate_word(
 /// function does not decide either mapping; it reproduces the one M4.2a
 /// already froze, so a mismatch here surfaces as a loud
 /// `PhysicalLaneMaskMismatch` rather than a silently wrong texture.
-fn map_physical_lanes(word: TmemTransferWord, source: &[u8]) -> [Option<u8>; 8] {
+pub(crate) fn map_physical_lanes(word: TmemTransferWord, source: &[u8]) -> [Option<u8>; 8] {
     let mut physical = [None; 8];
     match word.physical() {
         TmemTransferPhysicalWord::Linear(_) => {
