@@ -7,12 +7,55 @@
 //! union. Undefined word padding remains distinct from defined source bytes;
 //! direct four-bit loads, YUV destination planning, and LoadTLUT destination
 //! execution stay loud gaps.
+//! M4.2a adds renderer-owned 4 KiB physical TMEM with per-byte validity and
+//! last-touch generation. One move-only packet transaction chains every exact
+//! admitted LoadBlock/LoadTile, snapshots each load's canonical device-local
+//! effect before later overlaps, and publishes one final generation only after
+//! exact GPU-effect and guest-commit lifecycle evidence. Physical lane bytes
+//! can be asserted only inside this crate, carry an explicit eight-lane
+//! defined mask, and are move-only/exact-load-bound; M4.2b owns captured-source
+//! mapping.
 //! Hardware fields and transfer rules come from the public SGI *Nintendo 64
 //! RDP Command Summary*, Tables 1, 3, and 6–10, public Programming Manual
 //! section 13.9, and the public libultra `gbi.h` `gDPLoadTLUTCmd` macro. RT64
-//! is not hardware authority for this slice. M4.2.0 does not move TMEM bytes,
-//! create persistent physical state, execute GPU work, migrate production
-//! dispatch, or establish parity or performance.
+//! is not hardware authority for this slice. M4.2a does not execute guest
+//! reads, assemble backend reports, issue lifecycle receipts, run LoadTLUT,
+//! migrate production dispatch, or establish parity or performance.
+//!
+//! Downstream callers cannot relabel logical source bytes as physical TMEM
+//! lanes; the bounded assertion constructor is crate-private:
+//!
+//! ```compile_fail
+//! use fn64_render_wgpu::{StagedTmemTransaction, TmemTransferWord};
+//! # fn staged() -> StagedTmemTransaction { unimplemented!() }
+//! # fn word() -> TmemTransferWord { unimplemented!() }
+//! let staged = staged();
+//! let physical = staged.physical_word_payload(word(), [None; 8]);
+//! # drop(physical);
+//! ```
+//!
+//! A physical-lane payload cannot be reused for a second load or word:
+//!
+//! ```compile_fail
+//! use fn64_render_wgpu::{DefinedPhysicalTmemWordBytes, StagedTmemTransaction};
+//! # fn staged() -> StagedTmemTransaction { unimplemented!() }
+//! # fn physical() -> DefinedPhysicalTmemWordBytes { unimplemented!() }
+//! let mut staged = staged();
+//! let physical = physical();
+//! let first = staged.stage_word(physical);
+//! let second = staged.stage_word(physical);
+//! # drop((first, second));
+//! ```
+//!
+//! Packet transactions and their pending publication owner are move-only:
+//!
+//! ```compile_fail
+//! use fn64_render_wgpu::PendingTmemTransaction;
+//! # fn pending() -> PendingTmemTransaction { unimplemented!() }
+//! let pending = pending();
+//! let duplicate = pending.clone();
+//! # drop(duplicate);
+//! ```
 //!
 //! M3.3c executes M3.3a's exact native 4x2 RGBA16 fill through a prewarmed
 //! wgpu pipeline, M3.3b's typed target generations, and M3.3d's separately
@@ -166,8 +209,12 @@ pub use targets::{
     UninitializedNativeRaster,
 };
 pub use tmem::{
-    TextureImage, TileAddressMode, TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState,
-    TlutEntryCount, TmemDxt, TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch,
-    TmemLoadKind, TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemState, TmemTransferLayout,
+    CommittedTmemTransaction, DefinedPhysicalTmemWordBytes, GpuBoundTmemTransaction,
+    PendingTmemTransaction, PhysicalTmemBinding, PhysicalTmemError,
+    PhysicalTmemPublicationAuthority, PhysicalTmemState, PhysicalTmemStateIdentity,
+    PhysicalTmemTransactionIdentity, StagedTmemTransaction, TextureImage, TileAddressMode,
+    TileCoordinate, TileDescriptor, TileIndex, TileSize, TileState, TlutEntryCount, TmemDxt,
+    TmemLoad, TmemLoadContract, TmemLoadDestinationPlan, TmemLoadEpoch, TmemLoadKind,
+    TmemLoadSourceIdentity, TmemLoadSourcePlan, TmemState, TmemTransferLayout,
     TmemTransferPhysicalWord, TmemTransferPlan, TmemTransferWord, TmemWordAddress,
 };

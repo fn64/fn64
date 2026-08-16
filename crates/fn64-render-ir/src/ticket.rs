@@ -200,6 +200,46 @@ pub fn effect_content_digest(bytes: &[u8]) -> ContentDigest {
 }
 
 impl CompletedWrite {
+    /// Renderer-neutral domain for canonical physical-TMEM effect content.
+    ///
+    /// Backends must use [`Self::physical_tmem_content_digest`] rather than
+    /// introducing an adapter-specific hash domain for the same projection.
+    pub const PHYSICAL_TMEM_CONTENT_DOMAIN: &'static [u8] =
+        b"fn64.render-ir.physical-tmem-effect-content.v1\0";
+
+    /// Hashes one canonical physical-TMEM effect postimage without lifecycle,
+    /// allocation, workload, journal, submission, or access identity.
+    ///
+    /// `byte_count` is complete declared physical access coverage, including
+    /// invalid lanes. The remaining fields are load epoch, invalid-data-zeroed
+    /// postimage bytes, one-byte validity flags, and per-byte touch generations
+    /// encoded big-endian. Callers retain structural validation of equal field
+    /// lengths and zero normalized bytes for invalid lanes.
+    pub fn physical_tmem_content_digest(
+        byte_count: u32,
+        load_epoch: u64,
+        normalized_bytes: &[u8],
+        validity: &[u8],
+        last_touched_generation: &[u64],
+    ) -> ContentDigest {
+        let byte_count = byte_count.to_be_bytes();
+        let load_epoch = load_epoch.to_be_bytes();
+        let mut touched = Vec::with_capacity(last_touched_generation.len() * 8);
+        for generation in last_touched_generation.iter().copied() {
+            touched.extend_from_slice(&generation.to_be_bytes());
+        }
+        ContentDigest::hash(
+            Self::PHYSICAL_TMEM_CONTENT_DOMAIN,
+            &[
+                &byte_count,
+                &load_epoch,
+                normalized_bytes,
+                validity,
+                &touched,
+            ],
+        )
+    }
+
     pub fn try_new(
         access: ResourceAccess,
         byte_count: u32,
@@ -333,6 +373,18 @@ pub struct GpuCompleteTicket {
 impl GpuCompleteTicket {
     pub const fn packet(&self) -> &WorkloadPacket {
         &self.packet
+    }
+
+    pub const fn queue(&self) -> QueueIdentity {
+        self.queue
+    }
+
+    pub const fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    pub const fn submission(&self) -> SubmissionIdentity {
+        self.submission
     }
 
     pub const fn backend_effect_identity(&self) -> EffectIdentity {
@@ -628,6 +680,9 @@ mod tests {
                 .unwrap();
         let gpu_receipt = backend.issue(&submitted, backend_effects).unwrap();
         let complete = submitted.gpu_complete(gpu_receipt).unwrap();
+        assert_eq!(complete.queue(), queue.identity());
+        assert_eq!(complete.ordinal(), 0);
+        let completion_submission = complete.submission();
         let guest_writes = complete
             .backend_writes()
             .iter()
@@ -646,6 +701,7 @@ mod tests {
         let committed = complete.commit_guest(guest_receipt).unwrap();
         assert_eq!(committed.queue(), queue.identity());
         assert_eq!(committed.ordinal(), 0);
+        assert_eq!(committed.submission(), completion_submission);
         assert_ne!(
             committed.backend_effect_identity(),
             committed.guest_effect_identity()
@@ -713,6 +769,27 @@ mod tests {
             CompletedWrite::try_from_bytes(access, short),
             Err(ValidationError::EffectByteCountMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn physical_tmem_effect_content_has_one_renderer_neutral_frozen_identity() {
+        let normalized = [0x10, 0x11, 0, 0];
+        let validity = [1, 1, 0, 0];
+        let touched = [9, 9, 9, 9];
+        let backend_a =
+            CompletedWrite::physical_tmem_content_digest(4, 7, &normalized, &validity, &touched);
+        let backend_b =
+            CompletedWrite::physical_tmem_content_digest(4, 7, &normalized, &validity, &touched);
+
+        assert_eq!(
+            CompletedWrite::PHYSICAL_TMEM_CONTENT_DOMAIN,
+            b"fn64.render-ir.physical-tmem-effect-content.v1\0"
+        );
+        assert_eq!(backend_a, backend_b);
+        assert_eq!(
+            backend_a.to_string(),
+            "a52cc1514e4e131e59fd4ea3b1e8e0d1c8a65ac9e86878d6a7601646335c1d79"
+        );
     }
 
     #[test]

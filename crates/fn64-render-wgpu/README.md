@@ -48,8 +48,63 @@ owns TLUT's high-bank/quadrication boundary.
 revalidates workload, journal, submission, memory layout, source slice,
 canonical destination slice, operations, counts, byte totals, and both slice
 identities before exposing ordered words. It is deliberately not a consuming
-execution capability: no byte execution or persistent 4 KiB TMEM state exists
-yet.
+execution capability.
+
+M4.2a separately adds renderer-owned 4 KiB physical TMEM storage, per-byte
+validity, per-byte last-touch generation, a durable generation, and the last
+published load epoch. One move-only packet transaction clones the durable
+candidate once, chains every accepted Load Block/Load Tile in command order,
+and consumes only M4.2.0's exact word/fragments. The state layer never
+recalculates DXT carries, odd-row XOR4 placement, or RGBA32 bank mapping.
+M4.2b is the sole intended owner of the crate-private logical-source to
+physical-lane assertion. That assertion carries eight explicit optional
+physical lanes and validates the accepted physical defined-lane mask: in a
+split-bank word, lanes 0..4 are the low fragment and lanes 4..8 are the high
+fragment, so a four-source-byte RGBA32 tail has physical mask `0x33`, not the
+logical prefix `0x0f`. The state engine validates only that physical shape; it
+does not rearrange captured source bytes. Each payload is move-only and bound
+to uncaller-chosen packet/load transaction identities plus the exact state,
+source, queue, submission, generation, epoch, and source/destination access
+plans, so equal geometry cannot rebind bytes across transactions. Defined
+lanes write bytes and become valid;
+undefined complete-word tail lanes preserve unobservable backing bytes, clear
+validity, and still stamp the next generation.
+
+Each completed load immediately snapshots canonical device-local effects, so
+a later overlapping load cannot retroactively change the earlier digest.
+Invalid data is normalized to zero in that projection, while validity, load
+epoch, and touch generation remain digest inputs. A `CompletedWrite` byte count
+is the entire declared physical destination access, including invalid lanes;
+it is not the number of defined source bytes. Its content-digest preimage is
+exactly the big-endian byte count, big-endian load epoch, normalized postimage
+bytes, one-byte validity flags, and big-endian per-byte touch generations.
+Render-IR owns the frozen renderer-neutral domain and helper for that preimage;
+wgpu does not introduce a backend-specific content identity.
+State allocation, packet transaction, workload, journal, queue, submission,
+and access identities are deliberately excluded from that content digest and
+remain bound by the proposal identity, `CompletedWrite` access, and lifecycle
+tickets. Thus identical physical postimages with identical validity/epoch/touch
+semantics have one content digest across state allocations and submissions.
+Sealing requires exact ordered coverage of every `TmemLoadDestination` journal
+write. The pending owner exposes immutable `CompletedWrite` proposals for
+later report assembly, but does not create a `BackendEffectReport` or issue any
+receipt. It becomes publication-ready only after an exact `GpuCompleteTicket`
+report contains those writes; durable bytes publish once, after the matching
+`GuestCommittedTicket`, under an exclusive authority that rejects a different
+state identity or stale base generation.
+
+The stale-publication test exercises the exact sequential interleaving where
+transactions A and B stage from generation N, B publishes N+1, and A is then
+rejected. It does not run publication concurrently across threads, so
+concurrent publication remains explicitly unverified in M4.2a.
+
+This physical-state slice does not perform guest reads or source-byte mapping,
+execute Load Tile/Load Block on a GPU, aggregate unrelated backend effects,
+handle YUV or Load TLUT destinations, migrate runtime/shell dispatch, or claim
+visual parity or performance. Its transfer rules come from the public SGI
+*Nintendo 64 RDP Command Summary* and Programming Manual section 13.9; its
+move-only commit sequencing is the repository design mechanism. RT64 is not
+hardware authority for this state.
 
 M3.3a freezes the contract immediately after that decoder. Its only admitted
 candidate is an exact synthetic 4x2 RGBA16 red fill: 8 MiB installed RDRAM,
