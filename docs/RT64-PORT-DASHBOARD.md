@@ -19,7 +19,7 @@
 |---|---|---|---|
 | `M0` | `IN PROGRESS` | Authority, evidence, and baseline | INTEGRATED:2, RUNNING:2 |
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:1, RUNNING:1 |
-| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:2 |
+| `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | INTEGRATED:2, RUNNING:1 |
 | `M3` | `PLANNED` | Raw-DPC vertical slice | none |
 | `M4` | `PLANNED` | Base RDP and framebuffer correctness | none |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
@@ -284,6 +284,27 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 - Cause: The first card implementation optimized for getting real GPU execution before its evidence schema and discriminating vectors were adversarially reviewed.
 - Prevention: Future GPU cards start from configuration-bound typed receipts and independently fixed fractional or edge-case vectors, with outcome payloads that cannot represent success-only fields in failure states.
 - Estimated minutes saved: 25
+
+### `M2.3` -- Prove exact one-queue submission, timestamp, and prewarm behavior plus the shader-compute eight-sample N64 coverage fallback on the primary Metal host.
+
+| field | value |
+|---|---|
+| milestone | `M2` |
+| state | `RUNNING` |
+| profile / effort / model | `P` / `high` / GPT-5.6 Sol |
+| owner | Metal submission and coverage writer |
+| branch | `port/m2-metal-submission` -> `main` |
+| dependencies | `M2.2` |
+| writable paths | `probes/m2-wgpu-metal-headless` |
+| started / updated | `2026-08-16T00:00:00Z` / `2026-08-16T00:00:00Z` (elapsed 0m) |
+| verification runs meeting bar | 0/0 |
+
+**Findings:**
+
+- Current public wgpu exposes one physical queue; this ticket proves exact serialized completion and keeps semantic queue identities separate from native multi-queue claims.
+- Programmable hardware sample locations are unavailable through public wgpu, so exact N64 coverage is a shader-compute correctness path while fixed hardware MSAA remains an optional non-authoritative enhancement.
+
+**Next action:** Execute Cards D and F with configuration-bound receipts, 20 submission processes, 10 coverage processes, and independent review.
 
 ## Regenerating
 
