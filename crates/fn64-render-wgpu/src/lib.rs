@@ -233,6 +233,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+mod depth_strict_less;
 mod device;
 mod lifecycle;
 mod native_contract;
@@ -243,6 +244,10 @@ mod targets;
 mod tmem;
 mod vi;
 
+pub use depth_strict_less::{
+    strict_less_depth_test, strict_less_depth_write, StrictLessDepthOutcome, StrictLessDepthSample,
+    StrictLessDepthWrite, STRICT_LESS_DEPTH_ENTRY_POINT, STRICT_LESS_DEPTH_WGSL,
+};
 pub use device::{
     HeadlessBackend, HeadlessDeviceOutcome, InFlightFill, NoAdapter, PrewarmedRenderer,
     UninitializedRenderer,

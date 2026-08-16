@@ -565,3 +565,56 @@ implementation, texture hasher, game content, or excluded tool is used here.
 M3.3d's VI register/scale and RGBA5551 sources are recorded beside its code;
 its 256-byte row pitch is explicitly a wgpu mechanism rather than console
 behavior.
+
+## Depth: strict-less compare/update (port-card slice 1)
+
+`depth_strict_less` is the smallest fragment-pipeline slice from the
+characterization-first RT64 blender/coverage/alpha-compare/depth/render-target
+port card: a literal, self-contained re-expression of
+`fn64-render-reference`'s `Framebuffer::set_depth_tested`
+(`crates/fn64-render-reference/src/raster/draw.rs:632-653`) as a typed CPU
+oracle (`StrictLessDepthSample`/`StrictLessDepthOutcome`/`StrictLessDepthWrite`,
+`strict_less_depth_test`, `strict_less_depth_write`) plus a matching WGSL
+compute-shader seam (`STRICT_LESS_DEPTH_WGSL`, entry point
+`STRICT_LESS_DEPTH_ENTRY_POINT`). `fn64-render-wgpu` has no crate dependency on
+`fn64-render-reference`, so the port is a literal re-expression with a citation
+comment, matching this crate's existing convention (see `tmem/sample.rs`).
+
+The comparison is exactly `fragment_z < memory_z`: strictly nearer fragments
+pass and commit both color and depth; anything else (farther, or exactly
+equal) rejects and mutates neither target. There is no `DepthMode` dispatch
+(`mode_passes`'s four-way Opaque/Interpenetrating/Translucent/Decal split is
+out of scope), no DeltaZ/coverage-wrap tightening
+(`depth::relations`/`depth_coverage_decision`), no encoded 18-bit
+exponent/mantissa Z-buffer packing (`depth.rs`'s `EncodedDepth`/`encode_z`/
+`decode_z`), and no blend, coverage, or alpha-compare gating — this is
+`set_depth_tested`'s own deliberately simplified always-write-on-pass
+contract, not `set_depth_controlled_blended`'s full conjunction. Both `f32`
+inputs use plain IEEE-754 `<` semantics, including that any `NaN` operand
+always rejects and that `set_depth_tested` performs no range clamp (unlike
+the full pipeline's `.clamp(0.0, 0x3ffff as f32)` before comparison) — a
+deliberate scope boundary carried into this slice's tests, not an oversight.
+
+The WGSL seam mirrors this arithmetic in a closed compute shader over a
+`(fragment_z, memory_z, fragment_rgba, memory_rgba)` storage-buffer pair, not
+wired into any draw path, bind group layout, or pipeline used elsewhere in
+this crate. `naga` validates the retained source under an empty capability
+set; a differential test cross-checks the Rust oracle's decision against the
+shader source's own frozen comparison text across a representative value
+grid, and a hostile-mutation test confirms a flipped `<=` direction still
+parses/validates (naga cannot catch a semantic direction flip) while a
+separate structural assertion pins the exact `<` text so such a flip fails
+loudly at the Rust level instead.
+
+Provenance correction: `set_depth_tested` itself cites `F3DEX2-CONCEPTS.md`
+§4.3 "Z-buffer compare", not RT64 — that section is sourced entirely from the
+public N64 Programming Manual (Chapters 15-16) and libultra's
+`gDPSetPrimDepth`, with no RT64 attribution. RT64's `Depth.hlsli` (pin
+`5473732a822a4423b5696e7cb18fecc425a59875`) is the *encoded* 18-bit
+exponent/mantissa depth codec this slice explicitly does not port;
+`docs/rt64-port-inventory.json` records its `port_state` as `not-started`,
+targeting a different, not-yet-created file. This slice cites, reads, and
+claims no RT64 source byte. No blend, coverage, alpha
+compare, dither, `Interpenetrating`-mode coverage-wrap adjustment (an
+unresolved gap in the reference itself), framebuffer read, draw-call
+integration, or native GPU execution is claimed or exercised by this slice.
