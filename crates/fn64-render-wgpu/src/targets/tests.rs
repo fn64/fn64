@@ -239,7 +239,15 @@ fn partial_new_target_rejection_is_loud_and_non_publishing() {
 }
 
 #[test]
-fn partial_resident_update_rejection_is_loud_and_preserves_generation() {
+fn partial_resident_update_is_admitted_when_the_byte_buffer_still_covers_the_full_target() {
+    // A resident (predecessor.is_some()) candidate may complete a partial
+    // rectangle, unlike a brand-new target (see
+    // partial_new_target_rejection_is_loud_and_non_publishing above) --
+    // provided its DeviceColorBytes buffer is still full-extent-sized (the
+    // byte-length check earlier in admit_completed_initialization already
+    // enforces that). See targets/fill.rs's execute_fill_rectangle for the
+    // real read-modify-write producer of such a buffer; this test exercises
+    // the lower-level admission API directly.
     let mut registry = ColorTargetRegistry::try_new(layout(), 1).unwrap();
     let key = key_at(FIXTURE_START, 4, 2, ColorTargetFormat::Rgba16);
     registry
@@ -250,16 +258,15 @@ fn partial_resident_update_rejection_is_loud_and_preserves_generation() {
         .plan_rows(TargetRectangle::try_new(0, 1, 4, 1).unwrap())
         .unwrap();
     let completion = completed(&candidate, partial, &[Rgba8::new(0, 255, 0, 255); 8]);
-    assert!(matches!(
-        candidate.admit_completed_initialization(completion),
-        Err(TargetError::PartialResidentUpdateUnsupported {
-            generation: TargetGeneration(2),
-            ..
-        })
-    ));
+    let initialized = candidate
+        .admit_completed_initialization(completion)
+        .unwrap();
+    assert_eq!(initialized.initialized_region().rows(), 1);
+    let resident = registry.commit_initialized(initialized).unwrap();
+    assert_eq!(resident.generation(), TargetGeneration(2));
     assert_eq!(
-        registry.residents()[0].generation(),
-        TargetGeneration::FIRST
+        resident.device_bytes().device_bytes(),
+        [0x07, 0xC1].repeat(8) // full 8-pixel buffer, all green (from `completed`'s fixed pixels)
     );
 }
 

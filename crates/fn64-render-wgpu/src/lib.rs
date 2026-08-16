@@ -305,9 +305,11 @@ pub use state::{
     StagedRdpState, TextureLutMode, TextureLutModeError,
 };
 pub use targets::{
-    pack_device_pixels, unpack_device_pixels, CandidateColorTarget, ColorTargetExtent,
+    decode_fill_cycle_pixel, execute_fill_rectangle, pack_device_pixels,
+    resolve_fill_pixel_rectangle, unpack_device_pixels, CandidateColorTarget, ColorTargetExtent,
     ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CommittedNativeRasterFrame,
-    CompletedColorTargetWrite, DeviceColorBytes, ExactRowPlan, InFlightNativeRasterFill,
+    CompletedColorTargetWrite, DeviceColorBytes, ExactRowPlan, FillCoordinateError,
+    FillCycleBypassHazards, FillExecutionError, FillPixelRectangle, InFlightNativeRasterFill,
     InitializedCandidateColorTarget, InitializedRegionProof, NativeRasterDeviceOutcome,
     NativeRasterError, NativeRasterRenderer, PendingNativeRasterCommit, ResidentColorTarget, Rgba8,
     TargetError, TargetGeneration, TargetRectangle, TargetRowRange, TargetRows,

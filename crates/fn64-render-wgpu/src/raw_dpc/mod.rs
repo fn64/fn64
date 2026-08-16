@@ -97,6 +97,21 @@ pub struct FillRectangle {
 }
 
 impl FillRectangle {
+    #[cfg(test)]
+    pub(crate) const fn from_wire_fields(
+        upper_left_x: u16,
+        upper_left_y: u16,
+        lower_right_x: u16,
+        lower_right_y: u16,
+    ) -> Self {
+        Self {
+            upper_left_x,
+            upper_left_y,
+            lower_right_x,
+            lower_right_y,
+        }
+    }
+
     pub const fn upper_left_x(self) -> u16 {
         self.upper_left_x
     }
@@ -1823,6 +1838,62 @@ mod tests {
                 assert_eq!(command.location().wire_opcode() & 0xc0, prefix);
             }
         }
+    }
+
+    /// M4.3.4 end-to-end: decode a real raw-DPC command stream containing a
+    /// `FillRectangle` and execute the decoded command against a real color
+    /// target, proving `execute_fill_rectangle` is a genuine production
+    /// consumer of `decode_raw_dpc`'s output -- not just of an independently
+    /// hand-built `FillRectangle` value.
+    #[test]
+    fn decoded_fill_rectangle_executes_against_a_real_color_target() {
+        use crate::targets::{
+            execute_fill_rectangle, ColorTargetExtent, ColorTargetFormat, ColorTargetKey,
+            ColorTargetRegistry,
+        };
+
+        let submitted = submit(packet(7, fixture_words(0), &[(0, 16)]));
+        let decoded = decode_raw_dpc(submitted, &RdpState::default()).unwrap();
+        let fill_rectangle_command = decoded
+            .commands()
+            .iter()
+            .find_map(|command| match command.kind() {
+                RawDpcCommandKind::FillRectangle(rectangle) => Some(rectangle),
+                _ => None,
+            })
+            .expect("fixture_words contains exactly one FillRectangle");
+
+        let color_image = decoded.staged_state().color_image().unwrap();
+        let other_mode = decoded.staged_state().other_mode().unwrap();
+        let fill_color = decoded.staged_state().fill_color().unwrap();
+        assert_eq!(color_image.width(), 2);
+
+        let registry = ColorTargetRegistry::try_new(color_image.address().layout(), 1).unwrap();
+        let key = ColorTargetKey::try_new(
+            color_image.address(),
+            ColorTargetExtent::try_new(color_image.width(), 2).unwrap(),
+            ColorTargetFormat::try_from_rdp(color_image.format(), color_image.size()).unwrap(),
+        )
+        .unwrap();
+        let candidate = registry.begin_candidate(key).unwrap();
+
+        let completed = execute_fill_rectangle(
+            &candidate,
+            other_mode,
+            fill_color,
+            fill_rectangle_command,
+            None,
+        )
+        .unwrap();
+        // RGBA32, period 1: every pixel is the fill color's RGB + expanded
+        // low-5-bit alpha-coverage byte. 0x59 & 0x1f = 0x19; expand_five(0x19)
+        // = (0x19<<3)|(0x19>>2) = 0xc8|0x06 = 0xce.
+        assert_eq!(
+            completed.device_bytes().device_bytes(),
+            [0x21, 0x3c, 0x4d, 0xce].repeat(4)
+        );
+        assert_eq!(completed.rectangle().width(), 2);
+        assert_eq!(completed.rectangle().height(), 2);
     }
 
     #[test]

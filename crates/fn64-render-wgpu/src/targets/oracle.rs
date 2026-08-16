@@ -52,6 +52,40 @@ impl DeviceColorBytes {
         self.bytes
     }
 
+    /// Constructs a full-extent device-byte buffer from an already fill-
+    /// executed row patch. The M4.3.4 fill executor's own production
+    /// constructor -- `bytes` must already be the target's complete,
+    /// full-extent byte content (patched with the newly-filled sub-
+    /// rectangle where applicable), matching `pack_device_pixels`'s
+    /// invariant for every other producer of this type.
+    pub(crate) fn new_for_fill(
+        key: ColorTargetKey,
+        generation: TargetGeneration,
+        format: ColorTargetFormat,
+        bytes: Vec<u8>,
+    ) -> Result<Self, TargetError> {
+        let expected = (key.extent().pixels() as usize)
+            .checked_mul(format.bytes_per_pixel() as usize)
+            .ok_or(TargetError::PixelBufferLengthOverflow {
+                pixels: key.extent().pixels() as usize,
+                bytes_per_pixel: format.bytes_per_pixel(),
+            })?;
+        if bytes.len() != expected {
+            return Err(TargetError::CompletedByteLengthMismatch {
+                key,
+                generation,
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self {
+            key,
+            generation,
+            format,
+            bytes: bytes.into_boxed_slice(),
+        })
+    }
+
     /// M3.3a's logical/device-order domain is narrower than this module's
     /// RGBA16/32 oracle. Keep the narrowing explicit at the integration seam.
     #[allow(dead_code)] // Reserved for the M3.3a native-output integration seam.
