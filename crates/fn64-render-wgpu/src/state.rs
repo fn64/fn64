@@ -2,6 +2,8 @@
 
 use fn64_render_ir::{PhysicalAddress, QueueIdentity};
 
+use crate::tmem::TmemState;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CycleType {
     OneCycle,
@@ -39,7 +41,7 @@ impl OtherMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImageFormat {
     Rgba,
     Yuv,
@@ -48,7 +50,7 @@ pub enum ImageFormat {
     Intensity,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PixelSize {
     Bits4,
     Bits8,
@@ -131,6 +133,7 @@ pub struct RdpState {
     other_mode: Option<OtherMode>,
     color_image: Option<ColorImage>,
     fill_color: Option<FillColor>,
+    tmem: TmemState,
 }
 
 impl RdpState {
@@ -146,11 +149,20 @@ impl RdpState {
         self.fill_color
     }
 
-    pub(crate) const fn fork_for_decode(&self) -> Self {
+    pub const fn tmem(&self) -> &TmemState {
+        &self.tmem
+    }
+
+    pub(crate) fn tmem_mut(&mut self) -> &mut TmemState {
+        &mut self.tmem
+    }
+
+    pub(crate) fn fork_for_decode(&self) -> Self {
         Self {
             other_mode: self.other_mode,
             color_image: self.color_image,
             fill_color: self.fill_color,
+            tmem: self.tmem.clone(),
         }
     }
 
@@ -164,6 +176,9 @@ impl RdpState {
         if let Some(value) = delta.fill_color {
             self.fill_color = Some(value);
         }
+        if let Some(value) = &delta.tmem {
+            self.tmem = value.clone();
+        }
     }
 }
 
@@ -172,6 +187,7 @@ pub struct RdpStateDelta {
     other_mode: Option<OtherMode>,
     color_image: Option<ColorImage>,
     fill_color: Option<FillColor>,
+    tmem: Option<TmemState>,
 }
 
 impl RdpStateDelta {
@@ -187,6 +203,10 @@ impl RdpStateDelta {
         self.fill_color
     }
 
+    pub const fn tmem(&self) -> Option<&TmemState> {
+        self.tmem.as_ref()
+    }
+
     pub(crate) fn set_other_mode(&mut self, value: OtherMode) {
         self.other_mode = Some(value);
     }
@@ -197,6 +217,10 @@ impl RdpStateDelta {
 
     pub(crate) fn set_fill_color(&mut self, value: FillColor) {
         self.fill_color = Some(value);
+    }
+
+    pub(crate) fn set_tmem(&mut self, value: TmemState) {
+        self.tmem = Some(value);
     }
 }
 
@@ -221,6 +245,10 @@ impl StagedRdpState {
 
     pub const fn fill_color(&self) -> Option<FillColor> {
         self.state.fill_color()
+    }
+
+    pub const fn tmem(&self) -> &TmemState {
+        self.state.tmem()
     }
 
     pub const fn queue(&self) -> QueueIdentity {
