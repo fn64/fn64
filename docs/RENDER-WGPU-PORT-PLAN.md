@@ -963,12 +963,14 @@ The accelerated wave keeps dependency-safe work active in parallel:
     `fn64-render-ir`/`fn64-render`/`fn64-abi` library suites (541 passed, 7
     ignored), four move-only doctests, and the cross-language replay golden
     passed together in 10/10 consecutive runs after independent rereview.
-17. **M4.1 -- decode typed texture/TMEM wire state (RUNNING).** Decode and
+17. **M4.1 -- decode typed texture/TMEM wire state (INTEGRATED, `71af4c96`).** Decode and
     transactionally stage `SetTextureImage`, `SetTile`, `SetTileSize`,
     `LoadSync`, `LoadBlock`, `LoadTile`, and `LoadTLUT` with exact command and
     source identities plus M4.0 `TmemLoadSource` read plans. This slice does
     not move TMEM bytes, decode textures, upload to a GPU, migrate production
-    dispatch, or claim parity/performance.
+    dispatch, or claim parity/performance. Independent review closed address
+    width, provenance, cross-layout latch, detached-plan, LoadBlock-bound, and
+    TLUT-admission defects; the 95-unit/nine-doctest suite passed 10/10.
 18. **M4.2 -- execute physical TMEM loads (BLOCKED ON M4.1/M4.2.0).** First
     freeze exact source and canonical physical-destination journal fragments,
     full 64-bit transfer-word validity, and starting-row fixtures. Then land a

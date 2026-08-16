@@ -11,7 +11,7 @@
 |---|---|
 | state | `IN PROGRESS` |
 | branch | `main` -> `origin/main` |
-| updated | `2026-08-16T11:03:34Z` |
+| updated | `2026-08-16T11:15:26Z` |
 
 ## Milestones
 
@@ -21,7 +21,7 @@
 | `M1` | `IN PROGRESS` | Semantic IR and renderer seam v2 | INTEGRATED:2 |
 | `M2` | `IN PROGRESS` | Cross-backend wgpu feasibility | BLOCKED:2, INTEGRATED:4, READY:1, RUNNING:1 |
 | `M3` | `IN PROGRESS` | Raw-DPC vertical slice | INTEGRATED:6 |
-| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:2, INTEGRATED:1, RUNNING:1 |
+| `M4` | `IN PROGRESS` | Base RDP and framebuffer correctness | BLOCKED:2, INTEGRATED:2 |
 | `M5` | `PLANNED` | GBI and deferred RSP | none |
 | `M6` | `PLANNED` | Allocation-free asynchronous performance spine | none |
 | `M7` | `PLANNED` | Base-renderer certification | none |
@@ -773,21 +773,31 @@ Each milestone's exit gate (from `docs/RENDER-WGPU-PORT-PLAN.md`):
 | field | value |
 |---|---|
 | milestone | `M4` |
-| state | `RUNNING` |
+| state | `INTEGRATED` |
 | profile / effort / model | `F` / `high` / GPT-5.6 Sol |
 | owner | /root/m4_1_tmem_wire_state |
 | branch | `port/m4-tmem-wire-state` -> `main` |
 | dependencies | `M4.0` |
 | writable paths | `crates/fn64-render-wgpu/src/tmem`, `crates/fn64-render-wgpu/src/raw_dpc`, `crates/fn64-render-wgpu/src/state.rs`, `crates/fn64-render-wgpu/src/lib.rs`, `crates/fn64-render-wgpu/README.md` |
-| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T09:54:30Z` (elapsed 0m) |
-| verification runs meeting bar | 0/0 |
+| started / updated | `2026-08-16T09:54:30Z` / `2026-08-16T11:15:26Z` (elapsed 1h20m) |
+| verification runs meeting bar | 2/2 |
 
 **Findings:**
 
 - This slice owns command/state/read-plan semantics only; TMEM byte movement, texture decode, GPU upload, framebuffer hazards, parity, and performance remain later gates.
-- Actual-crate wiring, tracked source, exact expected test counts, explicit-file formatting, and independent review are required before its deterministic bar.
+- Commit 71af4c96 adds typed SetTextureImage, SetTile, SetTileSize, LoadSync, LoadBlock, LoadTile, and LoadTLUT state plus exact M4.0 TmemLoadSource plans.
+- Independent review required full 26-bit image decode with loud typed-layout rejection, public provenance, cross-layout latch rejection, decode-bound plan identities, LoadBlock public bounds, and strict TLUT macro admission.
+- The accepted source plan binds access index, operation, workload, journal, submission, layout, exact descriptors, count, and byte total, so it cannot be rebound to another decode.
+- The final guarded actual-crate gate passed 95 unit tests and nine compile-fail doctests in 10/10 consecutive processes.
 
-**Next action:** Implement the bounded command/state path, obtain independent adversarial review, then run ten consecutive actual-crate test processes before integration.
+**Verification:**
+
+| command | clean runs | required | kind |
+|---|---|---|---|
+| `scripts/guarded-cargo-test.zsh -p fn64-render-wgpu` | 10 | 10 | deterministic |
+| `cargo clippy -p fn64-render-wgpu --all-targets --no-deps -- -D warnings` | 1 | 1 | single |
+
+**Next action:** Freeze M4.2.0's canonical physical destination fragments, full 64-bit transfer-word validity, and starting-row fixtures before any physical TMEM executor runs.
 
 ### `M4.2` -- Execute LoadTile and LoadBlock into typed 4 KiB physical TMEM state with exact source reads, destination effects, validity epochs, rollback, and post-commit publication.
 
