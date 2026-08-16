@@ -14,3 +14,7 @@ host-gpu-tests = []
 fn64-render = { path = "../fn64-render" }
 fn64-render-ir = { path = "../fn64-render-ir" }
 wgpu = { version = "=30.0.0", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl"] }
+
+[dev-dependencies]
+fn64-runtime = { path = "../fn64-runtime" }
+sha2 = "0.10"
