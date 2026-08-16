@@ -444,6 +444,32 @@ impl TmemTransferGeometry {
     }
 }
 
+/// Projects a LoadTLUT destination word into the high TMEM bank (words
+/// 256-511), never wrapping into the low half. SGI RDP Command Summary
+/// Table 9 / libultra `gbi.h` `gDPLoadTLUTCmd` require the palette
+/// destination tile's `tmem` field to already be `>= 256` (enforced by
+/// `decode_load_tlut`'s pre-existing gate before this arm runs); once
+/// admitted, every subsequent entry word must stay inside that same
+/// 256-word high bank -- this is public hardware/project projection
+/// authority (SGI Table 9 / `gDPLoadTLUTCmd`), not a claim this
+/// repository's `write_tlut` (`fn64-render-reference/src/gbi/state.rs`)
+/// establishes. `write_tlut` is cited elsewhere for the quadrication/
+/// stride fact only (one entry per 8-byte word, value quadricated into
+/// it); it is HLE F3DEX2 authority for that fact and is explicitly
+/// **not** authority for high-bank wrap: its own `physical_byte` masks
+/// against the *full* 4 KiB TMEM byte domain
+/// (`fn64-render-reference/src/gbi/state.rs`'s `TMEM_BYTES - 1` mask),
+/// so a `write_tlut(511, 1, _)` call would wrap into low-half TMEM --
+/// the same noncanonical behavior this function exists to avoid, not a
+/// precedent for avoiding it. Wrapping through the shared 512-word
+/// `& 0x01ff` mask Block/Tile use would likewise let `base=511, entry=1`
+/// land on low-half word 0 -- a destination LoadTLUT can never target on
+/// real hardware.
+const fn project_tlut_high_bank_word(base_word: u16, entry_index: u64) -> u16 {
+    let projected = (base_word as u64 + entry_index) & 0xff;
+    0x100 | projected as u16
+}
+
 pub(crate) fn project_tmem_transfer_word(
     descriptor: TileDescriptor,
     kind: TmemLoadKind,
@@ -457,7 +483,7 @@ pub(crate) fn project_tmem_transfer_word(
     }
     let word = u64::from(word);
     let line = u64::from(descriptor.line_words());
-    let (unwrapped_destination, row_advance, odd_row_exchange) = match kind {
+    let (destination_word, row_advance, odd_row_exchange) = match kind {
         TmemLoadKind::Block { source_t, dxt, .. } => {
             let advance = word
                 .checked_mul(u64::from(dxt.get()))
@@ -467,8 +493,12 @@ pub(crate) fn project_tmem_transfer_word(
                 .checked_add(word)
                 .and_then(|value| value.checked_add(advance.checked_mul(line)?))
                 .ok_or("TMEM LoadBlock destination word overflows")?;
+            let mask = match layout {
+                TmemTransferLayout::Linear64 => 0x01ff,
+                TmemTransferLayout::SplitBanks64 => 0x00ff,
+            };
             (
-                destination,
+                (destination & mask) as u16,
                 advance,
                 (u64::from(source_t.raw()) + advance) & 1 != 0,
             )
@@ -486,23 +516,44 @@ pub(crate) fn project_tmem_transfer_word(
                 )
                 .and_then(|value| value.checked_add(within))
                 .ok_or("TMEM LoadTile destination word overflows")?;
+            let mask = match layout {
+                TmemTransferLayout::Linear64 => 0x01ff,
+                TmemTransferLayout::SplitBanks64 => 0x00ff,
+            };
             (
-                destination,
+                (destination & mask) as u16,
                 row,
                 (u64::from(bounds.low_t().integer()) + row) & 1 != 0,
             )
         }
         TmemLoadKind::Tlut { .. } => {
-            return Err("LoadTLUT destination execution is deferred to M4.3");
+            // SGI RDP Command Summary Table 9 / libultra `gbi.h`
+            // `gDPLoadTLUTCmd`: LoadTLUT's destination is `entries`
+            // consecutive TMEM word slots starting at the tile descriptor's
+            // `tmem` word, one 8-byte word per palette entry (the entry's
+            // 16-bit value is quadricated within that word; see
+            // `destination_ranges`/`transfer_shape` below and this
+            // repository's own already-shipped `write_tlut`
+            // (`fn64-render-reference/src/gbi/state.rs`), whose
+            // `base_word + index` addressing and regression fixture
+            // `ci4_samples_quadricated_tlut_at_palette_bank_address`
+            // establish this exact stride as fn64's own cited behavioral
+            // spec -- for quadrication/stride only. `write_tlut` is not
+            // cited for destination wrap: see `project_tlut_high_bank_word`'s
+            // doc comment for why its own full-4-KiB `physical_byte` mask
+            // makes it the opposite of high-bank-wrap authority. There is
+            // no row/DXT accumulation, so word advance is a direct index and
+            // there is no odd-row bank exchange. The destination projects
+            // through `project_tlut_high_bank_word`, never the shared
+            // 512-word linear mask below -- a TLUT destination must stay in
+            // the high bank even when `base + entry` would otherwise wrap
+            // into low TMEM.
+            let destination_word = project_tlut_high_bank_word(descriptor.tmem().get(), word);
+            (destination_word, word, false)
         }
     };
     let row_advance =
         u16::try_from(row_advance).map_err(|_| "TMEM transfer row advance exceeds u16")?;
-    let mask = match layout {
-        TmemTransferLayout::Linear64 => 0x01ff,
-        TmemTransferLayout::SplitBanks64 => 0x00ff,
-    };
-    let destination_word = (unwrapped_destination & mask) as u16;
     let destination = u32::from(destination_word);
     let physical = match layout {
         TmemTransferLayout::Linear64 => TmemTransferPhysicalWord::Linear(
@@ -663,7 +714,10 @@ impl TmemTransferPlan {
                     .and_then(|offset| offset.checked_add(within * 8))
                     .ok_or("TMEM LoadTile logical source offset overflows")
             }
-            TmemLoadKind::Tlut { .. } => Err("LoadTLUT destination execution is deferred to M4.3"),
+            // One TLUT entry is two source bytes, addressed sequentially
+            // (word index == entry index); there is no 8-bytes-per-word
+            // source stride here, unlike Block/Tile.
+            TmemLoadKind::Tlut { .. } => Ok(u32::from(word) * 2),
         }
     }
 
@@ -678,6 +732,17 @@ impl TmemTransferPlan {
     pub fn defined_source_byte_mask(self, word: u16) -> Result<u8, &'static str> {
         if word >= self.transfer_words {
             return Err("TMEM transfer word index is outside the declared plan");
+        }
+        // TLUT's mask names which of the destination word's 8 bytes are
+        // *captured source* bytes (the entry's 2 real bytes at offsets 0-1,
+        // per `logical_source_offset`'s `word * 2` addressing) -- not which
+        // bytes hold defined destination content. The other 6 bytes are real,
+        // defined TMEM content (quadricated copies, not undefined padding:
+        // `undefined_padding_bytes` stays 0 for Tlut), but the hardware
+        // derives them from the same 2 bytes this mask reports rather than
+        // capturing them independently from the source.
+        if matches!(self.kind, TmemLoadKind::Tlut { .. }) {
+            return Ok(0x03);
         }
         let defined = match self.kind {
             TmemLoadKind::Block { .. } => self
@@ -715,7 +780,6 @@ impl TmemTransferPlan {
 pub enum TmemLoadContract {
     Transfer(TmemTransferPlan),
     DeferredYuv { source: TmemLoadSourcePlan },
-    DeferredTlut { source: TmemLoadSourcePlan },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -890,26 +954,6 @@ impl TmemLoad {
         }
     }
 
-    pub(crate) const fn new_deferred_tlut(
-        epoch: TmemLoadEpoch,
-        tile: TileIndex,
-        source_image: TextureImage,
-        tile_descriptor: TileDescriptor,
-        kind: TmemLoadKind,
-        source_plan: TmemLoadSourcePlan,
-    ) -> Self {
-        Self {
-            epoch,
-            tile,
-            source_image,
-            tile_descriptor,
-            kind,
-            contract: TmemLoadContract::DeferredTlut {
-                source: source_plan,
-            },
-        }
-    }
-
     pub(crate) const fn new_deferred_yuv(
         epoch: TmemLoadEpoch,
         tile: TileIndex,
@@ -954,7 +998,6 @@ impl TmemLoad {
         match self.contract {
             TmemLoadContract::Transfer(plan) => plan.source(),
             TmemLoadContract::DeferredYuv { source } => source,
-            TmemLoadContract::DeferredTlut { source } => source,
         }
     }
 
@@ -967,9 +1010,6 @@ impl TmemLoad {
             TmemLoadContract::Transfer(plan) => Ok(plan),
             TmemLoadContract::DeferredYuv { .. } => {
                 Err("YUV destination execution is deferred pending a public pairing contract")
-            }
-            TmemLoadContract::DeferredTlut { .. } => {
-                Err("LoadTLUT destination execution is deferred to M4.3")
             }
         }
     }

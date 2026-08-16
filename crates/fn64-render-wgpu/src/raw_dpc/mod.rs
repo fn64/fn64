@@ -203,7 +203,6 @@ pub enum TmemLoadSourcePlanError {
     DestinationAccessSliceOutOfBounds,
     DestinationAccessDescriptorsDiffer,
     YuvExecutionDeferred,
-    TlutExecutionDeferred,
 }
 
 impl fmt::Display for TmemLoadSourcePlanError {
@@ -231,9 +230,6 @@ impl fmt::Display for TmemLoadSourcePlanError {
             Self::YuvExecutionDeferred => formatter.write_str(
                 "YUV destination execution is deferred pending a public pairing contract",
             ),
-            Self::TlutExecutionDeferred => {
-                formatter.write_str("LoadTLUT destination execution is deferred to M4.3")
-            }
         }
     }
 }
@@ -290,9 +286,6 @@ impl RawDpcResourcePlan {
             TmemLoadContract::Transfer(plan) => plan,
             TmemLoadContract::DeferredYuv { .. } => {
                 return Err(TmemLoadSourcePlanError::YuvExecutionDeferred);
-            }
-            TmemLoadContract::DeferredTlut { .. } => {
-                return Err(TmemLoadSourcePlanError::TlutExecutionDeferred);
             }
         };
         let record = self
@@ -709,9 +702,9 @@ fn decode_from_state(
     let tmem_transfers = commands
         .iter()
         .filter_map(|command| match command.kind {
-            RawDpcCommandKind::LoadBlock(load) | RawDpcCommandKind::LoadTile(load) => {
-                load.transfer_plan().ok()
-            }
+            RawDpcCommandKind::LoadBlock(load)
+            | RawDpcCommandKind::LoadTile(load)
+            | RawDpcCommandKind::LoadTlut(load) => load.transfer_plan().ok(),
             _ => None,
         })
         .map(|plan| {
@@ -2981,19 +2974,37 @@ mod tests {
         let RawDpcCommandKind::LoadTlut(load) = decoded.commands()[3].kind() else {
             panic!("expected LoadTLUT");
         };
-        assert!(load.transfer_plan().is_err());
+        // M4.3.1 closes LoadTLUT's transfer plan: decode always produces a
+        // real `Transfer`, so binding now succeeds and journals the exact
+        // source accesses plus the high-half `TmemLoadDestination` word
+        // slices -- no physical TMEM byte is claimed as written here, only
+        // the wire-layer transfer geometry (M4.3.2 executes it).
+        let plan = load
+            .transfer_plan()
+            .expect("M4.3.1 closes LoadTLUT's transfer plan");
+        assert_eq!(plan.transfer_words(), 16);
+        assert_eq!(plan.destination_word(0).unwrap(), 256);
+        assert_eq!(plan.destination_word(15).unwrap(), 271);
+        let transfer = decoded.resource_plan().bind_tmem_transfer(load).unwrap();
         assert_eq!(
-            decoded
-                .resource_plan()
-                .bind_tmem_transfer(load)
-                .unwrap_err(),
-            TmemLoadSourcePlanError::TlutExecutionDeferred
+            transfer
+                .source_accesses()
+                .iter()
+                .map(|access| access.region())
+                .collect::<Vec<_>>(),
+            vec![ResourceRegion::Rdram {
+                resource: RdramResource::Buffer,
+                range: PhysicalMemoryLayout::try_new(LAYOUT_BYTES)
+                    .unwrap()
+                    .range(0x300, 0x320)
+                    .unwrap(),
+            }]
         );
-        assert!(decoded
-            .resource_plan()
-            .accesses()
+        assert!(transfer
+            .destination_accesses()
             .iter()
-            .all(|access| { access.purpose() != AccessPurpose::TmemLoadDestination }));
+            .all(|access| access.purpose() == AccessPurpose::TmemLoadDestination));
+        assert_transfer_geometry_matches_destination_union(&decoded, load);
     }
 
     #[test]
