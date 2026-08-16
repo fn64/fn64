@@ -97,10 +97,39 @@ class PolicyTests(unittest.TestCase):
         self.assertIn(dxc["inventory_grammar_path"], {row["path"] for row in dxc["grammar_files"]})
         self.assertEqual(dxc["registry_file"]["sha256"], "204a1c88c736a8d41a7e8249e46dec8384c06ec34be23f223641eef71963501d")
 
-    def test_validation_arguments_are_exact_and_unrelaxed(self) -> None:
-        value = reference.load_policy()["spirv_val"]["validation_arguments"]
-        self.assertEqual(value, ["--target-env", "vulkan1.0"])
+    def test_validation_argv_is_exact_scalar_layout_and_has_one_authority(self) -> None:
+        policy = reference.load_policy()
+        self.assertNotIn("validation_arguments", policy["spirv_val"])
+        value = policy["device_contract"]["validator_argv"]
+        self.assertEqual(value, ["--target-env", "vulkan1.0", "--scalar-block-layout", "-"])
         self.assertFalse(any("relax" in item or "skip" in item for item in value))
+
+    def test_typed_scalar_layout_device_contract_is_exact(self) -> None:
+        policy = reference.load_policy()
+        contract = reference.validated_device_contract(policy)
+        self.assertEqual(contract["schema"], "fn64.vulkan-scalar-block-layout-device-contract.v1")
+        self.assertEqual(contract["required_extensions"], ["VK_EXT_scalar_block_layout"])
+        self.assertEqual(contract["required_features"], [{"name": "scalarBlockLayout", "value": True}])
+        self.assertEqual(contract["validator_mode"], "vulkan1.0-scalar-block-layout")
+        self.assertIs(contract["required_features"][0]["value"], True)
+
+    def test_device_contract_receipt_identity_and_schema_fail_closed(self) -> None:
+        policy = reference.load_policy()
+        record = reference.validated_device_contract(policy)
+        reference.validate_receipt_device_contract(record, policy, "fixture")
+        mutations = []
+        for key, value in (
+            ("schema", "fn64.vulkan-scalar-block-layout-device-contract.v2"),
+            ("required_extensions", []),
+            ("required_features", [{"name": "scalarBlockLayout", "value": False}]),
+            ("validator_mode", "relaxed-block-layout"),
+        ):
+            mutation = copy.deepcopy(record)
+            mutation[key] = value
+            mutations.append((key, mutation))
+        for label, mutation in mutations:
+            with self.subTest(label=label), self.assertRaisesRegex(base.ArtifactError, "device contract changed"):
+                reference.validate_receipt_device_contract(mutation, policy, "fixture")
 
     def test_build_configuration_excludes_shared_tests_fuzzers_and_mimalloc(self) -> None:
         flags = set(reference.load_policy()["spirv_val"]["flags"])
@@ -156,10 +185,16 @@ class PolicyTests(unittest.TestCase):
 
     def test_claim_boundary_never_mentions_runtime_or_parity_success(self) -> None:
         policy = reference.load_policy()
-        self.assertEqual(policy["claim_boundary"], "reference-valid-only-not-wgpu-runtime-or-parity")
+        self.assertEqual(policy["schema"], "fn64.rt64-reference-shader-policy.v2")
+        self.assertEqual(policy["receipt_schema"], "fn64.rt64-reference-shader-receipt.v2")
+        self.assertEqual(policy["spirv_val_smoke_receipt_schema"], "fn64.spirv-val-single-artifact-smoke.v2")
+        self.assertEqual(
+            policy["claim_boundary"],
+            "conditionally-reference-valid-with-scalar-layout-contract-not-adapter-wgpu-pipeline-runtime-parity-or-performance",
+        )
         self.assertEqual(
             policy["spirv_val_smoke_claim_boundary"],
-            "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
+            "conditionally-reference-valid-with-scalar-layout-contract-and-inventoried-not-artifact-provenance-corpus-adapter-wgpu-pipeline-runtime-parity-or-performance",
         )
 
     def test_parser_exposes_additive_commands_only(self) -> None:
@@ -199,7 +234,7 @@ class PolicyTests(unittest.TestCase):
         original_load_json = base.load_json
         original = original_load_json(reference.POLICY_PATH)
         cases = []
-        for section in ("dxc", "spirv_val"):
+        for section in ("dxc", "spirv_val", "device_contract"):
             dropped = copy.deepcopy(original)
             dropped[section].pop(next(iter(dropped[section])))
             cases.append(dropped)
@@ -366,10 +401,13 @@ class SpirvValInvocationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             _, validator, artifact, expected, policy = self.fixture(
                 temporary,
-                "import sys\ndata=sys.stdin.buffer.read()\nsys.exit(0 if sys.argv[1:]==['--target-env','vulkan1.0','-'] and data[:4]==b'\\x03\\x02#\\x07' else 9)\n",
+                "import sys\ndata=sys.stdin.buffer.read()\nsys.exit(0 if sys.argv[1:]==['--target-env','vulkan1.0','--scalar-block-layout','-'] and data[:4]==b'\\x03\\x02#\\x07' else 9)\n",
             )
             result = reference.run_spirv_val(validator, artifact, expected, artifact.parent, policy)
-            self.assertEqual(result["arguments"], ["--target-env", "vulkan1.0", "-"])
+            self.assertEqual(
+                result["arguments"],
+                ["--target-env", "vulkan1.0", "--scalar-block-layout", "-"],
+            )
             self.assertEqual(result["input_sha256"], base.digest_file(artifact))
             self.assertEqual(result["input_bytes"], artifact.stat().st_size)
 
@@ -391,12 +429,29 @@ class SpirvValInvocationTests(unittest.TestCase):
             with self.assertRaisesRegex(base.ArtifactError, "unexpected output"):
                 reference.run_spirv_val(validator, artifact, expected, artifact.parent, policy)
 
-    def test_rejects_argument_policy_drift_before_execution(self) -> None:
+    def test_rejects_all_noncanonical_validator_argv_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _, validator, artifact, expected, policy = self.fixture(temporary, "raise SystemExit(0)\n")
-            policy["spirv_val"]["validation_arguments"] = ["--target-env", "vulkan1.1"]
-            with self.assertRaisesRegex(base.ArtifactError, "noncanonical"):
-                reference.run_spirv_val(validator, artifact, expected, artifact.parent, policy)
+            mutations = (
+                ("omit-scalar", ["--target-env", "vulkan1.0", "-"]),
+                ("relax-substitution", ["--target-env", "vulkan1.0", "--relax-block-layout", "-"]),
+                (
+                    "relax-plus-scalar",
+                    ["--target-env", "vulkan1.0", "--scalar-block-layout", "--relax-block-layout", "-"],
+                ),
+                ("skip", ["--target-env", "vulkan1.0", "--skip-block-layout", "-"]),
+                ("reorder", ["--scalar-block-layout", "--target-env", "vulkan1.0", "-"]),
+                ("extra", ["--target-env", "vulkan1.0", "--scalar-block-layout", "--before-hlsl-legalization", "-"]),
+            )
+            for label, argv in mutations:
+                mutation = copy.deepcopy(policy)
+                mutation["device_contract"]["validator_argv"] = argv
+                with self.subTest(label=label), mock.patch.object(reference.subprocess, "run") as executed, self.assertRaisesRegex(
+                    base.ArtifactError,
+                    "validator argv changed",
+                ):
+                    reference.run_spirv_val(validator, artifact, expected, artifact.parent, mutation)
+                executed.assert_not_called()
 
     def test_rejects_validator_side_effect_in_output_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -463,6 +518,7 @@ class SpirvValSmokeTests(unittest.TestCase):
                     "spirv_val_build_receipt_sha256",
                     "validator_sha256",
                     "grammar_sha256",
+                    "device_contract",
                     "artifact_sha256",
                     "artifact_bytes",
                     "validation",
@@ -472,6 +528,8 @@ class SpirvValSmokeTests(unittest.TestCase):
                     "receipt_sha256",
                 },
             )
+            self.assertEqual(result["schema"], "fn64.spirv-val-single-artifact-smoke.v2")
+            self.assertEqual(result["device_contract"], reference.validated_device_contract(reference.load_policy()))
             self.assertEqual(
                 set(result["shader_nonuniform_witness"]),
                 {"required", "capability_count", "decoration_count", "satisfied"},
@@ -551,7 +609,7 @@ class SpirvValSmokeTests(unittest.TestCase):
             result = self.invoke(artifact, require=False)
             self.assertEqual(
                 result["claim_boundary"],
-                "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
+                "conditionally-reference-valid-with-scalar-layout-contract-and-inventoried-not-artifact-provenance-corpus-adapter-wgpu-pipeline-runtime-parity-or-performance",
             )
             self.assertFalse(result["shader_nonuniform_witness"]["required"])
             self.assertFalse(result["shader_nonuniform_witness"]["satisfied"])
@@ -572,6 +630,19 @@ class SpirvValSmokeTests(unittest.TestCase):
             reference.smoke_spirv_val(args)
         read_artifact.assert_not_called()
         staged.assert_not_called()
+
+    def test_failed_validation_is_receipt_less(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            artifact = root / "witness.spv"
+            artifact.write_bytes(module(instruction(17, 5301), instruction(71, 7, 5300)))
+            failed = mock.Mock(returncode=1, stdout=b"", stderr=b"validation failed")
+            with mock.patch.object(reference.subprocess, "run", return_value=failed), self.assertRaisesRegex(
+                base.ArtifactError,
+                "spirv-val failed",
+            ):
+                self.invoke(artifact)
+            self.assertEqual(list(root.glob("*.json")), [])
 
     def test_smoke_rejects_symlinked_temp_parent_inside_fn64_before_staging(self) -> None:
         policy = reference.load_policy()

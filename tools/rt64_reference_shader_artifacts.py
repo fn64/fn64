@@ -34,6 +34,12 @@ GENERATED_AUTHORITY_NAMES = (
     "generators.inc",
     "build-version.inc",
 )
+SCALAR_LAYOUT_VALIDATOR_ARGV = (
+    "--target-env",
+    "vulkan1.0",
+    "--scalar-block-layout",
+    "-",
+)
 
 
 def require_safe_relative(value: object, label: str) -> PurePosixPath:
@@ -82,6 +88,51 @@ def validate_generated_authority(record: object, build_dir: Path, policy: dict) 
         )
 
 
+def validated_device_contract(policy: dict) -> dict:
+    contract = policy["device_contract"]
+    base.require_keys(
+        contract,
+        {
+            "schema",
+            "api",
+            "target_environment",
+            "required_extensions",
+            "required_features",
+            "validator_mode",
+            "validator_argv",
+        },
+        "reference Vulkan device contract",
+    )
+    base.require(
+        contract["schema"] == "fn64.vulkan-scalar-block-layout-device-contract.v1",
+        "unsupported reference Vulkan device contract schema",
+    )
+    base.require(contract["api"] == "Vulkan", "reference device API changed")
+    base.require(contract["target_environment"] == "vulkan1.0", "reference Vulkan target environment changed")
+    base.require(
+        contract["required_extensions"] == ["VK_EXT_scalar_block_layout"],
+        "reference Vulkan extension denominator changed",
+    )
+    base.require(isinstance(contract["required_features"], list), "reference Vulkan feature denominator is not a list")
+    base.require(len(contract["required_features"]) == 1, "reference Vulkan feature denominator changed")
+    feature = contract["required_features"][0]
+    base.require_keys(feature, {"name", "value"}, "reference Vulkan feature row 0")
+    base.require(
+        feature["name"] == "scalarBlockLayout" and feature["value"] is True,
+        "reference Vulkan scalarBlockLayout feature changed",
+    )
+    base.require(contract["validator_mode"] == "vulkan1.0-scalar-block-layout", "reference validator mode changed")
+    base.require(
+        contract["validator_argv"] == list(SCALAR_LAYOUT_VALIDATOR_ARGV),
+        "reference validator argv changed",
+    )
+    return copy.deepcopy(contract)
+
+
+def validate_receipt_device_contract(record: object, policy: dict, label: str) -> None:
+    base.require(record == validated_device_contract(policy), f"{label} device contract changed")
+
+
 def load_policy() -> dict:
     policy = base.load_json(POLICY_PATH)
     base.require_keys(
@@ -93,6 +144,7 @@ def load_policy() -> dict:
             "spirv_val_build_receipt_schema",
             "spirv_val_smoke_receipt_schema",
             "spirv_val_smoke_claim_boundary",
+            "device_contract",
             "artifact_producer",
             "artifact_policy",
             "dxc",
@@ -104,7 +156,7 @@ def load_policy() -> dict:
         "reference shader policy",
     )
     base.require(
-        policy["schema"] == "fn64.rt64-reference-shader-policy.v1",
+        policy["schema"] == "fn64.rt64-reference-shader-policy.v2",
         "unsupported reference shader policy",
     )
     base.require(
@@ -149,7 +201,6 @@ def load_policy() -> dict:
             "controlled_environment_names",
             "generated_authority_files",
             "candidate_paths",
-            "validation_arguments",
             "maximum_binary_bytes",
             "maximum_build_manifest_bytes",
             "maximum_smoke_inventory_rows",
@@ -181,6 +232,7 @@ def load_policy() -> dict:
         "spirv-val controlled environment denominator changed",
     )
     generated_authority_paths(policy)
+    validated_device_contract(policy)
     base.require(
         policy["spirv_val"]["maximum_smoke_inventory_rows"] == 65536,
         "SPIR-V smoke inventory row denominator changed",
@@ -214,21 +266,29 @@ def load_policy() -> dict:
         == dependencies[dxc["spirv_tools_path"]]["license_files"][0]["sha256"],
         "SPIRV-Tools license pin drift",
     )
-    base.require(policy["claim_boundary"] == "reference-valid-only-not-wgpu-runtime-or-parity", "reference claim boundary drift")
     base.require(
-        policy["spirv_val_smoke_receipt_schema"] == "fn64.spirv-val-single-artifact-smoke.v1",
+        policy["claim_boundary"]
+        == "conditionally-reference-valid-with-scalar-layout-contract-not-adapter-wgpu-pipeline-runtime-parity-or-performance",
+        "reference claim boundary drift",
+    )
+    base.require(
+        policy["spirv_val_smoke_receipt_schema"] == "fn64.spirv-val-single-artifact-smoke.v2",
         "unsupported SPIR-V smoke receipt schema",
     )
     base.require(
+        policy["receipt_schema"] == "fn64.rt64-reference-shader-receipt.v2",
+        "unsupported reference shader receipt schema",
+    )
+    base.require(
         policy["spirv_val_smoke_claim_boundary"]
-        == "qualified-validator-single-artifact-reference-valid-and-inventoried-not-artifact-provenance-corpus-wgpu-runtime-or-parity",
+        == "conditionally-reference-valid-with-scalar-layout-contract-and-inventoried-not-artifact-provenance-corpus-adapter-wgpu-pipeline-runtime-parity-or-performance",
         "SPIR-V smoke claim boundary drift",
     )
     base.require(
         policy["required_validation"]
         == [
             "dxc-built-in-spirv-validation",
-            "spirv-tools-spirv-val-vulkan1.0",
+            "spirv-tools-spirv-val-vulkan1.0-scalar-block-layout-device-contract",
             "grammar-bound-capability-extension-nonuniform-inventory",
         ],
         "reference validation denominator changed",
@@ -795,14 +855,11 @@ def inventory_spirv(artifact_bytes: bytes, grammar_bytes: bytes, maximum_rows: i
 
 
 def run_spirv_val(validator: Path, artifact: Path, expected: dict, output: Path, policy: dict) -> dict:
-    base.require(
-        policy["spirv_val"]["validation_arguments"] == ["--target-env", "vulkan1.0"],
-        "spirv-val invocation admits noncanonical or relaxed arguments",
-    )
+    validator_argv = validated_device_contract(policy)["validator_argv"]
     before_outputs = base.output_entry_set(output)
     before = base.stable_file_bytes(artifact, base.load_policy()["spirv"]["maximum_artifact_bytes"], f"SPIR-V before spirv-val {expected['id']}")
     result = subprocess.run(
-        [str(validator), *policy["spirv_val"]["validation_arguments"], "-"],
+        [str(validator), *validator_argv],
         input=before,
         capture_output=True,
         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
@@ -814,7 +871,7 @@ def run_spirv_val(validator: Path, artifact: Path, expected: dict, output: Path,
     base.require(after == before, f"spirv-val changed SPIR-V bytes: {expected['id']}")
     return {
         "status": "passed",
-        "arguments": [*policy["spirv_val"]["validation_arguments"], "-"],
+        "arguments": validator_argv,
         "input_sha256": base.digest_bytes(before),
         "input_bytes": len(before),
         "stdout_sha256": base.digest_bytes(result.stdout),
@@ -949,6 +1006,7 @@ def smoke_spirv_val(args: argparse.Namespace) -> dict:
             "spirv_val_build_receipt_sha256": build_receipt["receipt_sha256"],
             "validator_sha256": build_receipt["validator_sha256"],
             "grammar_sha256": closure.grammar_sha256,
+            "device_contract": validated_device_contract(policy),
             "artifact_sha256": base.digest_bytes(artifact.artifact_bytes),
             "artifact_bytes": len(artifact.artifact_bytes),
             "validation": validation,
@@ -1055,6 +1113,7 @@ def produce(args: argparse.Namespace) -> dict:
             "spirv_val": validator_record,
             "spirv_grammar": grammar_record,
             "required_validation": policy["required_validation"],
+            "device_contract": validated_device_contract(policy),
             "entries": entries,
             "artifact_set_sha256": base.digest_bytes(base.canonical_json(artifact_set)),
             "claim_boundary": policy["claim_boundary"],
@@ -1118,6 +1177,7 @@ def validate_reference_receipt(
             "spirv_val",
             "spirv_grammar",
             "required_validation",
+            "device_contract",
             "entries",
             "artifact_set_sha256",
             "claim_boundary",
@@ -1141,6 +1201,7 @@ def validate_reference_receipt(
     grammar_record = {"path": policy["dxc"]["inventory_grammar_path"], "sha256": base.digest_file(grammar_path)}
     base.require(receipt["spirv_grammar"] == grammar_record, "reference SPIR-V grammar changed")
     base.require(receipt["required_validation"] == policy["required_validation"], "reference validation denominator changed")
+    validate_receipt_device_contract(receipt["device_contract"], policy, "reference shader receipt")
     base.require(receipt["claim_boundary"] == policy["claim_boundary"], "reference claim boundary changed")
     rows = receipt["entries"]
     base.require(isinstance(rows, list) and len(rows) == len(denominator["entries"]), "reference entry denominator changed")

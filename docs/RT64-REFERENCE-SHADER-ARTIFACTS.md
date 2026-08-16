@@ -1,6 +1,6 @@
 # RT64 reference shader artifacts
 
-Status: **additive mechanism implemented; source build, 56-row corpus, and qualification not yet run.**
+Status: **additive mechanism integrated; v2 source-build receipt verified as historical evidence; scalar-layout validation contract pending review.**
 
 This is M2.5a's additive evidence path for the exact RT64 HLSL denominator. It
 produces reference-valid SPIR-V without weakening or replacing the accepted
@@ -10,13 +10,13 @@ tool imports their qualified source staging, DXC receipt verification, and
 three explicit dependency/preprocess/compile phases, and every new receipt
 binds both producer identities.
 
-The only claim is `reference-valid-only-not-wgpu-runtime-or-parity`.
-Reference validity does not imply that Naga can parse a module, that wgpu can
-create it, that a backend can run it, or that its output is visually or
-behaviorally equal to RT64. In particular, the preserved v3 attempt failed
-closed on row one because Naga 30 rejects the valid `ShaderNonUniform`
-capability deliberately emitted for RT64's non-uniform texture/TMEM binding
-array accesses.
+The claim is conditional reference validity under the typed scalar-block-layout
+device contract below. It is not evidence that an adapter exposes the contract,
+that Naga can parse a module, that wgpu or a pipeline can create it, that a
+backend/runtime can run it, that its output has parity with RT64, or that it
+meets any performance target. In particular, the preserved v3 attempt failed
+closed on row one because Naga 30 rejects the `ShaderNonUniform` capability
+deliberately emitted for RT64's non-uniform texture/TMEM binding array accesses.
 
 ## Direct consumers and ownership
 
@@ -77,6 +77,26 @@ implementation: both validations use the same pinned SPIRV-Tools source. The
 second invocation is still useful process evidence because it consumes the
 retained artifact bytes through a distinct executable boundary.
 
+## Typed Vulkan device contract
+
+Validation has one exact argv denominator:
+`spirv-val --target-env vulkan1.0 --scalar-block-layout -`. No omitted scalar
+mode, reordered or extra option, `--relax-block-layout`, mixed
+scalar-plus-relaxed mode, or skip option is admitted. Receipts bind the typed
+device requirements alongside that validator mode:
+
+- extension `VK_EXT_scalar_block_layout` must be enabled; and
+- feature `scalarBlockLayout` must equal `VK_TRUE`.
+
+DXC is intentionally invoked with `-fvk-use-dx-layout`. That layout contract
+requires scalar block layout; relaxed block layout is not a sufficient or
+interchangeable device contract. The preserved v2 first-row diagnostic made
+the distinction executable: under standard Vulkan 1.0 layout,
+`RDPParams.keyScale` (member 7) at offset 92 failed the required 16-byte
+alignment. The v2 validator build receipt remains valid historical build
+evidence, but its failed smoke emitted no receipt and established no shader
+qualification claim.
+
 ## Corpus production
 
 For every one of the existing 56 denominator rows, the additive producer:
@@ -89,8 +109,9 @@ For every one of the existing 56 denominator rows, the additive producer:
 4. requires that `-Vd` is absent, so successful compilation retains DXC's
    built-in SPIR-V validation;
 5. sends the descriptor-stably read artifact bytes to the private
-   `spirv-val --target-env vulkan1.0 -` process through stdin, with no relaxed
-   validation flags;
+   `spirv-val --target-env vulkan1.0 --scalar-block-layout -` process through
+   stdin, with no relaxed, skipped, reordered, mixed, or extra validation
+   flags;
 6. requires zero exit, empty stdout/stderr, no file-set change, and identical
    artifact bytes after validation; and
 7. parses the same retained bytes with the receipt-bound core grammar to emit
@@ -168,15 +189,18 @@ amplification, and the final canonical pretty-JSON receipt must fit the policy's
 Because the input is an arbitrary explicit outside-repository file, this
 smoke receipt proves neither its DXC provenance nor corpus membership. Its
 claim is limited to one qualified-validator reference-valid result and
-inventory; it makes no corpus, wgpu, runtime, or parity claim.
+inventory conditional on the typed scalar-layout device contract; it makes no
+artifact-provenance, corpus, adapter, wgpu, pipeline, runtime, parity, or
+performance claim.
 
 ## M2.5 status handoff
 
 - **M2.5a — reference-valid corpus:** the additive mechanism is integrated.
-  Its first source-build diagnostic correctly failed closed on a generated
-  authority path-contract error and produced no receipt; the exact path and
-  single-artifact smoke repairs require review before a fresh build. No
-  spirv-val source-build or corpus qualification claim exists yet.
+  The v2 source-build receipt verified successfully and is retained historical
+  evidence. Its first-row smoke correctly failed receipt-less because the old
+  standard-layout validator policy did not model DXC's scalar-layout device
+  requirement. This v2 policy/receipt-contract correction requires review
+  before a fresh v3 build. No corpus qualification claim exists yet.
 - **M2.5b — wgpu-ingestible owned shaders:** separately port the required
   shaders to checked WGSL/Naga IR with exact feature/limit gates. M2.5a cannot
   close this ticket.
