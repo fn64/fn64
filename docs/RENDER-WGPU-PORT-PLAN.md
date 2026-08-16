@@ -967,6 +967,14 @@ The accelerated wave keeps dependency-safe work active in parallel:
     source identities plus M4.0 `TmemLoadSource` read plans. This slice does
     not move TMEM bytes, decode textures, upload to a GPU, migrate production
     dispatch, or claim parity/performance.
+18. **M4.2 -- execute physical TMEM loads (BLOCKED ON M4.1/M4.2.0).** First
+    freeze exact source and canonical physical-destination journal fragments,
+    full 64-bit transfer-word validity, and starting-row fixtures. Then land a
+    4 KiB typed byte/validity/epoch state engine, parallel `LoadTile` and
+    `LoadBlock` executors, and one frontier integration that consumes M4.0
+    reads, receipts every device-local effect, and publishes durable state only
+    after guest commit. Public hardware authority overrides RT64's known
+    source-size, starting-row, invalid-command, and host-layout shortcuts.
 
 ### M0 evidence ledger
 
