@@ -1,8 +1,10 @@
 //! Pure-Rust wgpu renderer ownership for fn64.
 //!
-//! M3.3a adds the ownership contract for one exact native 4x2 RGBA16 fill to
-//! M3.2's bounded raw-DPC decoder. It does not implement targets, raster, guest
-//! writes, VI, capture, RT64 shaders, parity, or performance.
+//! M3.3b adds CPU-only typed color-target planning and rollback-safe generation
+//! ownership to M3.3a's exact native 4x2 RGBA16 fill contract. It has no
+//! production target-completion constructor yet and does not allocate GPU
+//! resources, rasterize, write guest memory, run VI/capture, or establish RT64
+//! parity or performance.
 //!
 //! Submission and completion are type states. An in-flight operation has no
 //! early receipt conversion:
@@ -92,6 +94,7 @@ mod lifecycle;
 mod native_contract;
 mod raw_dpc;
 mod state;
+mod targets;
 
 pub use device::{
     HeadlessBackend, HeadlessDeviceOutcome, InFlightFill, NoAdapter, PrewarmedRenderer,
@@ -110,10 +113,10 @@ pub use native_contract::{
     NATIVE_FILL_DEVICE_RGBA16, NATIVE_FILL_FIXTURE_SCHEMA, NATIVE_FILL_HEIGHT,
     NATIVE_FILL_JOURNAL_SHA256, NATIVE_FILL_N64RECOMP_STORAGE_RGBA16,
     NATIVE_FILL_N64RECOMP_STORAGE_RGBA16_SHA256, NATIVE_FILL_NATIVE_RGBA8,
-    NATIVE_FILL_NATIVE_RGBA8_SHA256, NATIVE_FILL_POST_VI_BGRA8,
-    NATIVE_FILL_POST_VI_BGRA8_SHA256, NATIVE_FILL_RDRAM_BYTES, NATIVE_FILL_STREAM_SHA256,
-    NATIVE_FILL_TARGET_END, NATIVE_FILL_TARGET_START, NATIVE_FILL_TRANSACTION_SEQUENCE,
-    NATIVE_FILL_WIDTH, NATIVE_FILL_WORKLOAD_SHA256,
+    NATIVE_FILL_NATIVE_RGBA8_SHA256, NATIVE_FILL_POST_VI_BGRA8, NATIVE_FILL_POST_VI_BGRA8_SHA256,
+    NATIVE_FILL_RDRAM_BYTES, NATIVE_FILL_STREAM_SHA256, NATIVE_FILL_TARGET_END,
+    NATIVE_FILL_TARGET_START, NATIVE_FILL_TRANSACTION_SEQUENCE, NATIVE_FILL_WIDTH,
+    NATIVE_FILL_WORKLOAD_SHA256,
 };
 pub use raw_dpc::{
     decode_raw_dpc, decode_raw_dpc_after, DecodedRawDpc, DecodedRawDpcCommand, FillRectangle,
@@ -122,4 +125,11 @@ pub use raw_dpc::{
 pub use state::{
     ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, RdpState, RdpStateDelta,
     StagedRdpState,
+};
+pub use targets::{
+    pack_device_pixels, unpack_device_pixels, CandidateColorTarget, ColorTargetExtent,
+    ColorTargetFormat, ColorTargetKey, ColorTargetRegistry, CompletedColorTargetWrite,
+    DeviceColorBytes, ExactRowPlan, InitializedCandidateColorTarget, InitializedRegionProof,
+    ResidentColorTarget, Rgba8, TargetError, TargetGeneration, TargetRectangle, TargetRowRange,
+    TargetRows,
 };

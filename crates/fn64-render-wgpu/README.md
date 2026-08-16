@@ -66,9 +66,19 @@ transaction sequence against the exclusive durable owner. Consequently the
 same submission cannot be sent both to native execution and staged chaining,
 and a staged result cannot become durable before guest commit.
 
-This contract is deliberately not an implementation of native target
-allocation, raster, RGBA16 packing, guest writes, VI filtering, headless
-capture, or presentation. It admits no depth image or depth write, no TMEM,
+M3.3b adds CPU-only native color-target ownership beneath that contract.
+Typed keys bind the installed-memory layout, physical range, extent, and
+RGBA16/32 format. Exact row plans are distinct from move-only completed-write
+capabilities; the latter bind target key, generation, full range, device-byte
+domain, and exact byte count before a resident generation can be published.
+The completed-write type intentionally has no production constructor yet, so
+planning cannot masquerade as raster completion. The RGBA5551/RGBA32 CPU
+pack/unpack oracles and the M3.3a `DeviceRgba16Bytes` narrowing seam are
+executable mechanism evidence only.
+
+This contract is deliberately not an implementation of GPU target allocation,
+raster execution, guest writes, VI filtering, headless capture, or
+presentation. It admits no depth image or depth write, no TMEM,
 textures, blending, coverage, multisampling, ray tracing, surface path, or
 performance/parity claim. Its byte-exact synthetic fixture is mechanism
 evidence, not the required real captured workload. It consumes no M2.5 shader
