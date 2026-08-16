@@ -39,14 +39,25 @@
 //! ## `EndianSwapUINT`'s size dispatch reuses `crate::state::PixelSize`
 //!
 //! RT64's `EndianSwapUINT` switches on a raw `G_IM_SIZ_*` integer with an
-//! unreachable `default: return 0` arm for any value outside the four known
+//! explicit `default: return 0` arm for any value outside the four known
 //! sizes. This crate already has an exhaustive, already-landed encoding of
 //! those exact four sizes -- `crate::state::PixelSize` (`Bits4`/`Bits8`/
 //! `Bits16`/`Bits32`) -- so [`endian_swap_uint`] takes a `PixelSize` directly
 //! rather than a raw integer. A Rust `match` over `PixelSize`'s four variants
-//! is exhaustive without a default/wildcard arm, so RT64's unreachable
-//! out-of-range case has no counterpart to port: the type system rules it out
-//! instead of a runtime branch standing in for it.
+//! is exhaustive without a default/wildcard arm, so on the **Rust side**
+//! RT64's `default` case has no counterpart to port: the type system rules
+//! an out-of-range size out entirely, a stronger guarantee than RT64's own
+//! runtime check, not a divergence from it.
+//!
+//! This does **not** extend to the WGSL companion (`shaders/endian_swap.wgsl`).
+//! WGSL has no enum type, so its `endian_swap_uint(i: u32, siz: u32)` takes a
+//! raw, unrestricted `u32` exactly like RT64's HLSL does -- an out-of-range
+//! `siz` there is representable at runtime, so the WGSL function replicates
+//! RT64's `default: return 0` literally rather than inheriting the Rust
+//! side's type-level exhaustiveness. A reader should not assume both sides
+//! reject invalid input "the same way": the Rust side rejects it at compile
+//! time by construction; the WGSL side rejects it at runtime, by the same
+//! explicit branch RT64 itself uses.
 //!
 //! ## Nonclaims
 //!
@@ -80,9 +91,11 @@ pub const fn endian_swap_uint32(i: u32) -> u32 {
 /// dispatches by pixel size. `Bits4`/`Bits8` are no-ops (RT64's
 /// `G_IM_SIZ_4b`/`G_IM_SIZ_8b` cases both `return i` unchanged), `Bits16`
 /// calls [`endian_swap_uint16`], `Bits32` calls [`endian_swap_uint32`]. See
-/// the module doc for why RT64's unreachable `default: return 0` arm has no
-/// counterpart here: `siz` is a [`PixelSize`], an exhaustive four-variant
-/// enum, not a raw integer that could carry an out-of-range value.
+/// the module doc for why RT64's `default: return 0` arm has no counterpart
+/// *here*: `siz` is a [`PixelSize`], an exhaustive four-variant enum, not a
+/// raw integer that could carry an out-of-range value. This does not apply
+/// to the WGSL companion, which takes an unrestricted `u32` and must (and
+/// does) replicate the `default: return 0` branch at runtime.
 pub const fn endian_swap_uint(i: u32, siz: PixelSize) -> u32 {
     match siz {
         PixelSize::Bits4 => i,
@@ -293,6 +306,27 @@ mod tests {
     }
 
     #[test]
+    fn wgsl_endian_swap_uint_replicates_rt64_default_return_zero_for_invalid_siz() {
+        // Unlike the Rust side's PixelSize match (exhaustive by construction,
+        // no default arm needed), WGSL's endian_swap_uint takes an
+        // unrestricted u32 and must replicate RT64's literal
+        // `default: return 0;` (FbCommon.hlsli:33-34) for any siz outside
+        // 0..=3. Source-text guard: confirm the function body contains a
+        // trailing bare `return 0u;` fallback distinct from the `return i;`
+        // no-op arms, so a future edit can't silently collapse the default
+        // case back into "return i unchanged".
+        let body_start = ENDIAN_SWAP_WGSL.find("fn endian_swap_uint(").unwrap();
+        let body = &ENDIAN_SWAP_WGSL[body_start..];
+        let body_end = body.find("\n}\n").unwrap();
+        let body = &body[..body_end];
+        assert!(
+            body.trim_end().ends_with("return 0u;"),
+            "endian_swap_uint's WGSL body must fall through to `return 0u;` for out-of-range siz, matching RT64's `default: return 0;` -- got:\n{body}"
+        );
+        assert!(!body.trim_end().ends_with("return i;"));
+    }
+
+    #[test]
     fn duplicate_binding_index_fails_naga_validation() {
         let duplicate_binding = ENDIAN_SWAP_WGSL.replacen("@binding(1)", "@binding(0)", 1);
         let module = naga::front::wgsl::parse_str(&duplicate_binding).unwrap();
@@ -367,6 +401,95 @@ mod tests {
                 ENDIAN_SWAP_WGSL.contains(wgsl_token),
                 "WGSL source missing token {wgsl_token} for Rust literal {rust_value:#010x}"
             );
+        }
+    }
+
+    /// Interprets `ENDIAN_SWAP_WGSL`'s `endian_swap_uint` function body
+    /// *from its own source text*, not from a hand-written re-derivation.
+    /// Scans the `if (siz == Nu) { return ...; }` guards in file order and
+    /// evaluates the first one whose condition matches `siz`; if none match,
+    /// returns the function's trailing bare-`return` value (RT64's
+    /// `default` case). This walks the literal text so a regression in the
+    /// `.wgsl` file itself -- e.g. the original bug, where the trailing
+    /// fallback was `return i;` instead of `return 0u;` -- changes this
+    /// interpreter's output, unlike a hand-written oracle that never reads
+    /// the file at all.
+    fn interpret_wgsl_endian_swap_uint(i: u32, siz: u32) -> u32 {
+        let body_start = ENDIAN_SWAP_WGSL.find("fn endian_swap_uint(").unwrap();
+        let body = &ENDIAN_SWAP_WGSL[body_start..];
+        let body_end = body.find("\n}\n").unwrap();
+        let lines: Vec<&str> = body[..body_end].lines().map(str::trim).collect();
+
+        // Fixed layout: repeated `if (siz == Nu) {` / `return X;` / `}`
+        // triples, then a trailing unconditional `return X;`. Walk it
+        // explicitly by index so a non-matching guard's own return line is
+        // skipped along with its guard, rather than being picked up as if
+        // it were the unconditional trailing default.
+        let mut index = 1; // line 0 is the `fn endian_swap_uint(...) {` signature
+        while let Some(line) = lines.get(index) {
+            if let Some(rest) = line.strip_prefix("if (siz == ") {
+                let (cond, _) = rest.split_once(')').unwrap();
+                let guard_siz: u32 = cond.trim_end_matches('u').parse().unwrap();
+                let return_line = lines[index + 1];
+                if guard_siz == siz {
+                    let expr = return_line
+                        .strip_prefix("return ")
+                        .unwrap()
+                        .trim_end_matches(';');
+                    return eval_wgsl_return_expr(expr, i);
+                }
+                index += 3; // skip `if (...) {`, `return X;`, `}`
+            } else if let Some(expr) = line.strip_prefix("return ") {
+                let expr = expr.trim_end_matches(';');
+                return eval_wgsl_return_expr(expr, i);
+            } else {
+                index += 1;
+            }
+        }
+        unreachable!("endian_swap_uint's WGSL body has no unconditional trailing return");
+    }
+
+    fn eval_wgsl_return_expr(expr: &str, i: u32) -> u32 {
+        match expr {
+            "i" => i,
+            "endian_swap_uint16(i)" => endian_swap_uint16(i),
+            "endian_swap_uint32(i)" => endian_swap_uint32(i),
+            "0u" => 0,
+            other => panic!("unrecognized WGSL return expression: {other}"),
+        }
+    }
+
+    #[test]
+    fn wgsl_source_text_dispatch_grid_matches_rt64_switch_semantics_including_default() {
+        // Hostile grid over the WGSL source text itself (via
+        // interpret_wgsl_endian_swap_uint, not a hand-written re-derivation),
+        // covering both the four valid siz values and out-of-range values
+        // PixelSize cannot represent (4, 5, u32::MAX) -- exactly the case
+        // the Rust-side match has no counterpart for. Against the original
+        // bug (trailing `return i;` instead of `return 0u;`) this would have
+        // asserted 0x1234_5678 for siz=4 instead of the expected 0.
+        let sizes: [u32; 7] = [0, 1, 2, 3, 4, 5, u32::MAX];
+        let values: [u32; 4] = [0, 0x1234_5678, 0xDEAD_BEEF, 0xFFFF_FFFF];
+        for siz in sizes {
+            for value in values {
+                let actual = interpret_wgsl_endian_swap_uint(value, siz);
+                if siz <= 3 {
+                    let pixel_size = match siz {
+                        0 => PixelSize::Bits4,
+                        1 => PixelSize::Bits8,
+                        2 => PixelSize::Bits16,
+                        3 => PixelSize::Bits32,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        actual,
+                        endian_swap_uint(value, pixel_size),
+                        "siz={siz} value={value:#010x}"
+                    );
+                } else {
+                    assert_eq!(actual, 0, "siz={siz} value={value:#010x}");
+                }
+            }
         }
     }
 

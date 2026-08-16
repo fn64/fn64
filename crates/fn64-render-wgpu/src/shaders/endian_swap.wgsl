@@ -9,6 +9,12 @@
 // 5473732a822a4423b5696e7cb18fecc425a59875). `siz` selector: 0=Bits4,
 // 1=Bits8, 2=Bits16, 3=Bits32, matching `crate::state::PixelSize`'s
 // declaration order; Bits4/Bits8 are no-ops.
+//
+// Unlike the Rust side, `siz` here is a raw `u32`, not `PixelSize` --
+// WGSL has no enum type to make an out-of-range value unrepresentable, so
+// `endian_swap_uint` below replicates RT64's `switch(siz)`'s explicit
+// `default: return 0;` (`FbCommon.hlsli:33-34`) literally for any `siz`
+// outside `0u..=3u`, rather than falling through to the Bits4/Bits8 no-op.
 
 struct EndianSwapInput {
     value: u32,
@@ -30,13 +36,19 @@ fn endian_swap_uint32(i: u32) -> u32 {
 }
 
 fn endian_swap_uint(i: u32, siz: u32) -> u32 {
+    if (siz == 0u) {
+        return i;
+    }
+    if (siz == 1u) {
+        return i;
+    }
     if (siz == 2u) {
         return endian_swap_uint16(i);
     }
     if (siz == 3u) {
         return endian_swap_uint32(i);
     }
-    return i;
+    return 0u;
 }
 
 @compute @workgroup_size(64)
