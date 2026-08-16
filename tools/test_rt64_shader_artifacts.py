@@ -25,6 +25,39 @@ class DenominatorTests(unittest.TestCase):
         cls.inventory = artifacts.load_inventory(cls.policy)
         cls.denominator = artifacts.load_json(artifacts.DENOMINATOR_PATH)
 
+    def compile_phase_fixture(self, temporary: str) -> tuple[Path, Path, Path, dict, dict]:
+        root = Path(temporary).resolve()
+        snapshot = root / "source"
+        snapshot.mkdir()
+        snapshot_source = snapshot / "src/X.hlsl"
+        snapshot_source.parent.mkdir(parents=True)
+        snapshot_source.write_bytes(b"original snapshot source")
+        output = root / "output"
+        output.mkdir()
+        expected = {
+            "id": "x",
+            "source": "src/X.hlsl",
+            "flags": ["-spirv", "-E", "CSMain", "-T", "cs_6_3", "-I", "src"],
+            "dependency_files": ["src/X.hlsl"],
+            "preprocessed_artifact": "preprocessed/X.hlsl",
+            "dependency_manifest_artifact": "dependencies/X.json",
+            "spirv_artifact": "spirv/X.spv",
+        }
+        dependency = output / artifacts.dependency_output_artifact(expected)
+        preprocessed = output / expected["preprocessed_artifact"]
+        dependency.parent.mkdir(parents=True)
+        preprocessed.parent.mkdir(parents=True)
+        dependency.write_text("src/X.hlsl: src/X.hlsl\n", encoding="utf-8")
+        preprocessed.write_bytes(b"preprocessed")
+        prepared = {
+            "contract": artifacts.dxc_phase_contract(expected),
+            "dependency_path": dependency,
+            "dependency_bytes": dependency.read_bytes(),
+            "preprocessed_path": preprocessed,
+            "preprocessed_bytes": preprocessed.read_bytes(),
+        }
+        return root, snapshot, output, expected, prepared
+
     def test_complete_dual_pin_denominator(self) -> None:
         denominator = self.denominator
         self.assertEqual(denominator["schema"], artifacts.DENOMINATOR_SCHEMA)
@@ -155,7 +188,7 @@ set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_3")
             include.write_bytes(b"include")
             depfile = root / "fixture.d"
             depfile.write_text(
-                "outside.spv: src/shaders/Fixture.hlsl \\\n src/shaders/Fixture.hlsli\n",
+                "src/shaders/Fixture.hlsl: src/shaders/Fixture.hlsl \\\n src/shaders/Fixture.hlsli\n",
                 encoding="utf-8",
             )
             expected = {
@@ -182,7 +215,7 @@ set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_3")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             depfile = root / "fixture.d"
-            depfile.write_text("outside.spv: /etc/hosts\n", encoding="utf-8")
+            depfile.write_text("src/X.hlsl: /etc/hosts\n", encoding="utf-8")
             with self.assertRaisesRegex(artifacts.ArtifactError, "escaped"):
                 artifacts.parse_dxc_dependencies(
                     depfile,
@@ -198,7 +231,7 @@ set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_3")
             source.parent.mkdir(parents=True)
             source.write_bytes(b"changed after denominator")
             depfile = root / "fixture.d"
-            depfile.write_text("fixture.spv: src/shaders/Fixture.hlsl\n", encoding="utf-8")
+            depfile.write_text("src/shaders/Fixture.hlsl: src/shaders/Fixture.hlsl\n", encoding="utf-8")
             expected = {
                 "id": "fixture",
                 "source": "src/shaders/Fixture.hlsl",
@@ -209,6 +242,518 @@ set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_3")
             }
             with self.assertRaisesRegex(artifacts.ArtifactError, "bytes changed"):
                 artifacts.parse_dxc_dependencies(depfile, root, expected, denominator)
+
+    def test_compiler_dependency_target_must_be_exact_source(self) -> None:
+        expected = {
+            "id": "fixture",
+            "source": "src/shaders/Fixture.hlsl",
+            "dependency_files": ["src/shaders/Fixture.hlsl"],
+        }
+        with self.assertRaisesRegex(artifacts.ArtifactError, "target changed"):
+            artifacts.parse_dxc_dependency_rule(
+                b"outside.spv: src/shaders/Fixture.hlsl\n",
+                expected,
+            )
+
+    def test_compiler_dependency_multiple_rules_fail_closed(self) -> None:
+        expected = {
+            "id": "fixture",
+            "source": "src/shaders/Fixture.hlsl",
+            "dependency_files": ["src/shaders/Fixture.hlsl"],
+        }
+        with self.assertRaisesRegex(artifacts.ArtifactError, "multiple or unterminated"):
+            artifacts.parse_dxc_dependency_rule(
+                b"src/shaders/Fixture.hlsl: src/shaders/Fixture.hlsl\nother: other\n",
+                expected,
+            )
+
+    def test_compiler_dependency_malformed_quoting_fails_closed(self) -> None:
+        expected = {
+            "id": "fixture",
+            "source": "src/shaders/Fixture.hlsl",
+            "dependency_files": ["src/shaders/Fixture.hlsl"],
+        }
+        with self.assertRaisesRegex(artifacts.ArtifactError, "malformed"):
+            artifacts.parse_dxc_dependency_rule(
+                b'src/shaders/Fixture.hlsl: "src/shaders/Fixture.hlsl\n',
+                expected,
+            )
+
+    @unittest.skipUnless(hasattr(os, "link"), "hardlinks unavailable")
+    def test_compiler_dependency_reused_file_object_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "src/shaders/Fixture.hlsl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            depfile = root / "fixture.d"
+            depfile.write_text(
+                "src/shaders/Fixture.hlsl: src/shaders/Fixture.hlsl\n",
+                encoding="utf-8",
+            )
+            os.link(depfile, root / "reused.d")
+            with self.assertRaisesRegex(artifacts.ArtifactError, "reused through another hardlink"):
+                artifacts.parse_dxc_dependencies(
+                    depfile,
+                    root,
+                    {
+                        "id": "fixture",
+                        "source": "src/shaders/Fixture.hlsl",
+                        "dependency_files": ["src/shaders/Fixture.hlsl"],
+                    },
+                    {
+                        "source_files": [{
+                            "path": "src/shaders/Fixture.hlsl",
+                            "port_sha256": artifacts.digest_file(source),
+                        }],
+                    },
+                )
+
+    def test_dependency_and_preprocess_are_disjoint_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/shaders/Fixture.hlsl"
+            include = snapshot / "src/shaders/Fixture.hlsli"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b'#include "Fixture.hlsli"\n')
+            include.write_bytes(b"include\n")
+            output = root / "output"
+            output.mkdir()
+            expected = {
+                "id": "fixture",
+                "source": "src/shaders/Fixture.hlsl",
+                "flags": ["-spirv", "-E", "CSMain", "-T", "cs_6_3"],
+                "dependency_files": [
+                    "src/shaders/Fixture.hlsl",
+                    "src/shaders/Fixture.hlsli",
+                ],
+                "preprocessed_artifact": "preprocessed/Fixture.pp.hlsl",
+                "dependency_manifest_artifact": "dependencies/Fixture.json",
+                "spirv_artifact": "spirv/Fixture.spv",
+            }
+            denominator = {
+                "source_files": [
+                    {"path": expected["source"], "port_sha256": artifacts.digest_file(source)},
+                    {"path": "src/shaders/Fixture.hlsli", "port_sha256": artifacts.digest_file(include)},
+                ],
+            }
+            calls = []
+
+            def run(command: list[str], cwd: Path) -> dict:
+                self.assertEqual(cwd, snapshot)
+                calls.append(command)
+                if "-M" in command:
+                    self.assertNotIn("-P", command)
+                    self.assertNotIn("-Fi", command)
+                    Path(command[command.index("-MF") + 1]).write_text(
+                        "src/shaders/Fixture.hlsl: src/shaders/Fixture.hlsl \\\n src/shaders/Fixture.hlsli\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    self.assertIn("-P", command)
+                    self.assertNotIn("-M", command)
+                    self.assertNotIn("-MF", command)
+                    Path(command[command.index("-Fi") + 1]).write_text(
+                        "preprocessed fixture\n",
+                        encoding="utf-8",
+                    )
+                return {
+                    "exit_code": 0,
+                    "stdout_sha256": artifacts.digest_bytes(b""),
+                    "stderr_sha256": artifacts.digest_bytes(b""),
+                }
+
+            with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                prepared = artifacts.prepare_dxc_shader_input(
+                    root / "dxc",
+                    snapshot,
+                    output,
+                    expected,
+                    denominator,
+                    artifacts.load_policy(),
+                )
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(
+                prepared["active_dependencies"]["depfile_target"],
+                expected["source"],
+            )
+            self.assertEqual(
+                prepared["contract"]["compile"]["source_input"],
+                expected["preprocessed_artifact"],
+            )
+
+    def test_dependency_phase_missing_output_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/X.hlsl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            output = root / "output"
+            output.mkdir()
+            expected = {
+                "id": "x",
+                "source": "src/X.hlsl",
+                "flags": ["-spirv"],
+                "dependency_files": ["src/X.hlsl"],
+                "preprocessed_artifact": "preprocessed/X.hlsl",
+                "dependency_manifest_artifact": "dependencies/X.json",
+                "spirv_artifact": "spirv/X.spv",
+            }
+            denominator = {
+                "source_files": [{"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)}],
+            }
+            empty_log = {
+                "exit_code": 0,
+                "stdout_sha256": artifacts.digest_bytes(b""),
+                "stderr_sha256": artifacts.digest_bytes(b""),
+            }
+            with mock.patch.object(artifacts, "run_dxc", return_value=empty_log):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "dependency-only output set changed"):
+                    artifacts.prepare_dxc_shader_input(
+                        root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                    )
+
+    def test_dependency_phase_unexpected_output_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/X.hlsl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            output = root / "output"
+            output.mkdir()
+            expected = {
+                "id": "x",
+                "source": "src/X.hlsl",
+                "flags": ["-spirv"],
+                "dependency_files": ["src/X.hlsl"],
+                "preprocessed_artifact": "preprocessed/X.hlsl",
+                "dependency_manifest_artifact": "dependencies/X.json",
+                "spirv_artifact": "spirv/X.spv",
+            }
+            denominator = {
+                "source_files": [{"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)}],
+            }
+
+            def run(command: list[str], _cwd: Path) -> dict:
+                Path(command[command.index("-MF") + 1]).write_text(
+                    "src/X.hlsl: src/X.hlsl\n", encoding="utf-8"
+                )
+                (output / "unexpected.bin").write_bytes(b"unexpected")
+                return {
+                    "exit_code": 0,
+                    "stdout_sha256": artifacts.digest_bytes(b""),
+                    "stderr_sha256": artifacts.digest_bytes(b""),
+                }
+
+            with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "dependency-only output set changed"):
+                    artifacts.prepare_dxc_shader_input(
+                        root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                    )
+
+    def test_dependency_phase_rejects_preexisting_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/X.hlsl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            output = root / "output"
+            (output / "dependencies").mkdir(parents=True)
+            (output / "dependencies/X.d").write_bytes(b"reused")
+            expected = {
+                "id": "x", "source": "src/X.hlsl", "flags": ["-spirv"],
+                "dependency_files": ["src/X.hlsl"],
+                "preprocessed_artifact": "preprocessed/X.hlsl",
+                "dependency_manifest_artifact": "dependencies/X.json",
+                "spirv_artifact": "spirv/X.spv",
+            }
+            denominator = {
+                "source_files": [{"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)}],
+            }
+            with self.assertRaisesRegex(artifacts.ArtifactError, "output path was reused"):
+                artifacts.prepare_dxc_shader_input(
+                    root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                )
+
+    def test_preprocess_phase_rejects_preexisting_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/X.hlsl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            output = root / "output"
+            (output / "preprocessed").mkdir(parents=True)
+            (output / "preprocessed/X.hlsl").write_bytes(b"reused")
+            expected = {
+                "id": "x", "source": "src/X.hlsl", "flags": ["-spirv"],
+                "dependency_files": ["src/X.hlsl"],
+                "preprocessed_artifact": "preprocessed/X.hlsl",
+                "dependency_manifest_artifact": "dependencies/X.json",
+                "spirv_artifact": "spirv/X.spv",
+            }
+            denominator = {
+                "source_files": [{"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)}],
+            }
+            with self.assertRaisesRegex(artifacts.ArtifactError, "preprocessed output path was reused"):
+                artifacts.prepare_dxc_shader_input(
+                    root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                )
+
+    def test_preprocess_phase_unexpected_output_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/X.hlsl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            output = root / "output"
+            output.mkdir()
+            expected = {
+                "id": "x", "source": "src/X.hlsl", "flags": ["-spirv"],
+                "dependency_files": ["src/X.hlsl"],
+                "preprocessed_artifact": "preprocessed/X.hlsl",
+                "dependency_manifest_artifact": "dependencies/X.json",
+                "spirv_artifact": "spirv/X.spv",
+            }
+            denominator = {
+                "source_files": [{"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)}],
+            }
+
+            def run(command: list[str], _cwd: Path) -> dict:
+                if "-M" in command:
+                    Path(command[command.index("-MF") + 1]).write_text(
+                        "src/X.hlsl: src/X.hlsl\n", encoding="utf-8"
+                    )
+                else:
+                    Path(command[command.index("-Fi") + 1]).write_bytes(b"preprocessed")
+                    (output / "unexpected-preprocess.bin").write_bytes(b"unexpected")
+                return {
+                    "exit_code": 0,
+                    "stdout_sha256": artifacts.digest_bytes(b""),
+                    "stderr_sha256": artifacts.digest_bytes(b""),
+                }
+
+            with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "preprocess-only output set changed"):
+                    artifacts.prepare_dxc_shader_input(
+                        root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                    )
+
+    def test_macro_include_retained_by_preprocess_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/X.hlsl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            output = root / "output"
+            output.mkdir()
+            expected = {
+                "id": "x", "source": "src/X.hlsl", "flags": ["-spirv", "-I", "src"],
+                "dependency_files": ["src/X.hlsl"],
+                "preprocessed_artifact": "preprocessed/X.hlsl",
+                "dependency_manifest_artifact": "dependencies/X.json",
+                "spirv_artifact": "spirv/X.spv",
+            }
+            denominator = {
+                "source_files": [{"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)}],
+            }
+
+            def run(command: list[str], _cwd: Path) -> dict:
+                if "-M" in command:
+                    Path(command[command.index("-MF") + 1]).write_text(
+                        "src/X.hlsl: src/X.hlsl\n", encoding="utf-8"
+                    )
+                else:
+                    Path(command[command.index("-Fi") + 1]).write_bytes(
+                        b"# include HEADER_MACRO\n"
+                    )
+                return {
+                    "exit_code": 0,
+                    "stdout_sha256": artifacts.digest_bytes(b""),
+                    "stderr_sha256": artifacts.digest_bytes(b""),
+                }
+
+            with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "retains an include directive"):
+                    artifacts.prepare_dxc_shader_input(
+                        root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                    )
+
+    def test_compile_phase_uses_only_retained_preprocessed_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, snapshot, output, expected, prepared = self.compile_phase_fixture(temporary)
+
+            def run(command: list[str], cwd: Path) -> dict:
+                self.assertEqual(cwd, snapshot)
+                self.assertEqual(
+                    command[-3:],
+                    [
+                        str(prepared["preprocessed_path"]),
+                        "-Fo",
+                        str(output / expected["spirv_artifact"]),
+                    ],
+                )
+                self.assertNotIn(expected["source"], command)
+                Path(command[-1]).write_bytes(artifacts.SPIRV_MAGIC + b"fixture")
+                return {
+                    "exit_code": 0,
+                    "stdout_sha256": artifacts.digest_bytes(b""),
+                    "stderr_sha256": artifacts.digest_bytes(b""),
+                }
+
+            with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                compiled = artifacts.compile_dxc_shader(
+                    root / "dxc", snapshot, output, expected, prepared, artifacts.load_policy()
+                )
+            self.assertEqual(compiled["artifact_bytes"], artifacts.SPIRV_MAGIC + b"fixture")
+
+    def test_compile_phase_rejects_preexisting_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, snapshot, output, expected, prepared = self.compile_phase_fixture(temporary)
+            artifact = output / expected["spirv_artifact"]
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(artifacts.SPIRV_MAGIC + b"reused")
+            with self.assertRaisesRegex(artifacts.ArtifactError, "SPIR-V output path was reused"):
+                artifacts.compile_dxc_shader(
+                    root / "dxc", snapshot, output, expected, prepared, artifacts.load_policy()
+                )
+
+    def test_compile_phase_rejects_substituted_prepared_paths(self) -> None:
+        for key, message in (
+            ("dependency_path", "prepared dependency path does not match"),
+            ("preprocessed_path", "prepared preprocessed path does not match"),
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                root, snapshot, output, expected, prepared = self.compile_phase_fixture(temporary)
+                prepared[key] = snapshot / expected["source"]
+                with self.assertRaisesRegex(artifacts.ArtifactError, message):
+                    artifacts.compile_dxc_shader(
+                        root / "dxc", snapshot, output, expected, prepared, artifacts.load_policy()
+                    )
+
+    def test_compile_phase_rejects_symlinked_contract_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, snapshot, output, expected, prepared = self.compile_phase_fixture(temporary)
+            preprocessed = prepared["preprocessed_path"]
+            preprocessed.unlink()
+            preprocessed.symlink_to(snapshot / expected["source"])
+            with self.assertRaisesRegex(artifacts.ArtifactError, "not a regular no-link file"):
+                artifacts.compile_dxc_shader(
+                    root / "dxc", snapshot, output, expected, prepared, artifacts.load_policy()
+                )
+
+    def test_compile_phase_unexpected_output_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, snapshot, output, expected, prepared = self.compile_phase_fixture(temporary)
+
+            def run(command: list[str], _cwd: Path) -> dict:
+                Path(command[-1]).write_bytes(artifacts.SPIRV_MAGIC + b"fixture")
+                (output / "unexpected-compile.bin").write_bytes(b"unexpected")
+                return {
+                    "exit_code": 0,
+                    "stdout_sha256": artifacts.digest_bytes(b""),
+                    "stderr_sha256": artifacts.digest_bytes(b""),
+                }
+
+            with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "SPIR-V compile output set changed"):
+                    artifacts.compile_dxc_shader(
+                        root / "dxc", snapshot, output, expected, prepared, artifacts.load_policy()
+                    )
+
+    def test_source_or_include_swap_during_dependency_phase_fails_closed(self) -> None:
+        for mutated_relative in ("src/X.hlsl", "src/X.hlsli"):
+            with self.subTest(mutated_relative=mutated_relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                snapshot = root / "source"
+                source = snapshot / "src/X.hlsl"
+                include = snapshot / "src/X.hlsli"
+                source.parent.mkdir(parents=True)
+                source.write_bytes(b'#include "X.hlsli"\n')
+                include.write_bytes(b"include")
+                output = root / "output"
+                output.mkdir()
+                expected = {
+                    "id": "x", "source": "src/X.hlsl", "flags": ["-spirv"],
+                    "dependency_files": ["src/X.hlsl", "src/X.hlsli"],
+                    "preprocessed_artifact": "preprocessed/X.hlsl",
+                    "dependency_manifest_artifact": "dependencies/X.json",
+                    "spirv_artifact": "spirv/X.spv",
+                }
+                denominator = {
+                    "source_files": [
+                        {"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)},
+                        {"path": "src/X.hlsli", "port_sha256": artifacts.digest_file(include)},
+                    ],
+                }
+
+                def run(command: list[str], _cwd: Path) -> dict:
+                    Path(command[command.index("-MF") + 1]).write_text(
+                        "src/X.hlsl: src/X.hlsl src/X.hlsli\n", encoding="utf-8"
+                    )
+                    (snapshot / mutated_relative).write_bytes(b"swapped")
+                    return {
+                        "exit_code": 0,
+                        "stdout_sha256": artifacts.digest_bytes(b""),
+                        "stderr_sha256": artifacts.digest_bytes(b""),
+                    }
+
+                with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                    with self.assertRaisesRegex(artifacts.ArtifactError, "bytes changed"):
+                        artifacts.prepare_dxc_shader_input(
+                            root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                        )
+
+    def test_include_swap_during_preprocess_phase_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "source"
+            source = snapshot / "src/X.hlsl"
+            include = snapshot / "src/X.hlsli"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b'#include "X.hlsli"\n')
+            include.write_bytes(b"include")
+            output = root / "output"
+            output.mkdir()
+            expected = {
+                "id": "x", "source": "src/X.hlsl", "flags": ["-spirv"],
+                "dependency_files": ["src/X.hlsl", "src/X.hlsli"],
+                "preprocessed_artifact": "preprocessed/X.hlsl",
+                "dependency_manifest_artifact": "dependencies/X.json",
+                "spirv_artifact": "spirv/X.spv",
+            }
+            denominator = {
+                "source_files": [
+                    {"path": "src/X.hlsl", "port_sha256": artifacts.digest_file(source)},
+                    {"path": "src/X.hlsli", "port_sha256": artifacts.digest_file(include)},
+                ],
+            }
+
+            def run(command: list[str], _cwd: Path) -> dict:
+                if "-M" in command:
+                    Path(command[command.index("-MF") + 1]).write_text(
+                        "src/X.hlsl: src/X.hlsl src/X.hlsli\n", encoding="utf-8"
+                    )
+                else:
+                    Path(command[command.index("-Fi") + 1]).write_bytes(b"preprocessed")
+                    include.write_bytes(b"swapped")
+                return {
+                    "exit_code": 0,
+                    "stdout_sha256": artifacts.digest_bytes(b""),
+                    "stderr_sha256": artifacts.digest_bytes(b""),
+                }
+
+            with mock.patch.object(artifacts, "run_dxc", side_effect=run):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "bytes changed"):
+                    artifacts.prepare_dxc_shader_input(
+                        root / "dxc", snapshot, output, expected, denominator, artifacts.load_policy()
+                    )
 
     def test_private_snapshot_is_a_pinned_copy_not_a_link(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -816,16 +1361,22 @@ print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','w
             "source_files": [{"path": self.expected["source"], "port_sha256": source_digest}],
         }
         self.preprocessed = self.root / self.expected["preprocessed_artifact"]
+        self.dependency_output = self.root / artifacts.dependency_output_artifact(self.expected)
         self.dependency_manifest = self.root / self.expected["dependency_manifest_artifact"]
         self.spirv = self.root / self.expected["spirv_artifact"]
-        for path in (self.preprocessed, self.dependency_manifest, self.spirv):
+        for path in (self.preprocessed, self.dependency_output, self.dependency_manifest, self.spirv):
             path.parent.mkdir(parents=True, exist_ok=True)
         self.preprocessed.write_bytes(b"preprocessed fixture\n")
+        self.dependency_output.write_text(
+            "src/shaders/Fixture.hlsl: src/shaders/Fixture.hlsl\n",
+            encoding="utf-8",
+        )
         dependency_files = [{"path": self.expected["source"], "sha256": source_digest}]
         dependency_set_sha256 = artifacts.digest_bytes(artifacts.canonical_json(dependency_files))
         self.dependency_manifest.write_bytes(artifacts.pretty_json({
-            "schema": "fn64.dxc-active-include-closure.v1",
+            "schema": artifacts.DEPENDENCY_SCHEMA,
             "entry": "fixture",
+            "depfile_target": self.expected["source"],
             "files": dependency_files,
             "dependency_set_sha256": dependency_set_sha256,
         }))
@@ -836,15 +1387,21 @@ print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','w
             "source_sha256": source_digest,
             "preprocessed_sha256": artifacts.digest_file(self.preprocessed),
             "preprocessed_bytes": self.preprocessed.stat().st_size,
+            "dependency_output_artifact": artifacts.dependency_output_artifact(self.expected),
+            "dependency_output_sha256": artifacts.digest_file(self.dependency_output),
+            "dependency_output_bytes": self.dependency_output.stat().st_size,
             "dependency_manifest_sha256": artifacts.digest_file(self.dependency_manifest),
             "dependency_manifest_bytes": self.dependency_manifest.stat().st_size,
+            "compiler_dependency_target": self.expected["source"],
             "compiler_dependency_files": dependency_files,
             "compiler_dependency_set_sha256": dependency_set_sha256,
             "spirv_sha256": artifacts.digest_file(self.spirv),
             "spirv_bytes": self.spirv.stat().st_size,
             "compiler": {
-                "flags": self.expected["flags"],
-                "artifact_input": self.expected["preprocessed_artifact"],
+                "base_flags": self.expected["flags"],
+                "phase_contract": artifacts.dxc_phase_contract(self.expected),
+                "dependency_stdout_sha256": "0" * 64,
+                "dependency_stderr_sha256": "9" * 64,
                 "preprocess_stdout_sha256": "1" * 64,
                 "preprocess_stderr_sha256": "2" * 64,
                 "compile_stdout_sha256": "3" * 64,
@@ -913,9 +1470,30 @@ print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','w
         with self.assertRaises(artifacts.ArtifactError):
             self.verify()
 
+    def test_raw_dependency_target_mutation_fails(self) -> None:
+        self.dependency_output.write_text(
+            "wrong-target: src/shaders/Fixture.hlsl\n",
+            encoding="utf-8",
+        )
+        receipt = self.mutated(lambda value: value["entries"][0].update({
+            "dependency_output_sha256": artifacts.digest_file(self.dependency_output),
+            "dependency_output_bytes": self.dependency_output.stat().st_size,
+        }))
+        with self.assertRaisesRegex(artifacts.ArtifactError, "target changed"):
+            self.verify(receipt)
+
     def test_flag_mutation_fails_even_with_new_receipt_hash(self) -> None:
         receipt = self.mutated(lambda value: value["entries"][0]["flags"].append("-Vd"))
         with self.assertRaises(artifacts.ArtifactError):
+            self.verify(receipt)
+
+    def test_phase_confusion_fails_even_with_new_receipt_hash(self) -> None:
+        receipt = self.mutated(
+            lambda value: value["entries"][0]["compiler"]["phase_contract"]["compile"].update({
+                "source_input": self.expected["source"],
+            })
+        )
+        with self.assertRaisesRegex(artifacts.ArtifactError, "phase contract changed"):
             self.verify(receipt)
 
     def test_validator_transcript_mutation_fails(self) -> None:
@@ -940,6 +1518,42 @@ print(json.dumps({'schema':'fn64.wgpu-shader-validation.v1','status':'passed','w
 
         with self.assertRaises(artifacts.ArtifactError):
             self.verify(self.mutated(mutate))
+
+    def test_dependency_row_unknown_field_fails(self) -> None:
+        receipt = self.mutated(
+            lambda value: value["entries"][0]["compiler_dependency_files"][0].update({
+                "unreviewed": True,
+            })
+        )
+        with self.assertRaisesRegex(artifacts.ArtifactError, "fields changed"):
+            self.verify(receipt)
+
+    def test_dependency_row_non_text_path_fails(self) -> None:
+        receipt = self.mutated(
+            lambda value: value["entries"][0]["compiler_dependency_files"][0].update({
+                "path": [self.expected["source"]],
+            })
+        )
+        with self.assertRaisesRegex(artifacts.ArtifactError, "path is not text"):
+            self.verify(receipt)
+
+    def test_dependency_row_noncanonical_digest_fails(self) -> None:
+        receipt = self.mutated(
+            lambda value: value["entries"][0]["compiler_dependency_files"][0].update({
+                "sha256": "A" * 64,
+            })
+        )
+        with self.assertRaisesRegex(artifacts.ArtifactError, "not canonical SHA-256"):
+            self.verify(receipt)
+
+    def test_compiler_transcript_noncanonical_digest_fails(self) -> None:
+        receipt = self.mutated(
+            lambda value: value["entries"][0]["compiler"].update({
+                "dependency_stdout_sha256": "not-a-digest",
+            })
+        )
+        with self.assertRaisesRegex(artifacts.ArtifactError, "transcript digest is not canonical"):
+            self.verify(receipt)
 
     def test_source_identity_mutation_fails(self) -> None:
         receipt = self.mutated(lambda value: value["entries"][0].update({"source_sha256": "0" * 64}))
