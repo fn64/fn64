@@ -1134,3 +1134,74 @@ parity or performance claim. RT64's own `// TODO do more than 1 tri at a
 time` is observed behavior in the source, not authority to silently drop
 triangles here -- this function converts exactly the one triangle it is
 given.
+## Fragment constant registers: SetEnvColor/SetPrimColor/SetBlendColor/SetFogColor/SetPrimDepth
+
+`state.rs` gains five new typed value types -- `Color4` (shared by
+`SetEnvColor`/`SetBlendColor`/`SetFogColor`), `PrimLod` and `PrimColor` (for
+`SetPrimColor`), and `PrimDepth` (for `SetPrimDepth`) -- and `RdpState`/
+`RdpStateDelta`/`StagedRdpState` each gain matching `env_color`/`prim_color`/
+`blend_color`/`fog_color`/`prim_depth` fields and accessors, threaded through
+`fork_for_decode`/`apply` exactly like the pre-existing `other_mode`/
+`color_image`/`fill_color` fields. `raw_dpc::mod` gains five opcode constants
+(`SET_ENV_COLOR`/`SET_PRIM_COLOR`/`SET_BLEND_COLOR`/`SET_FOG_COLOR`/
+`SET_PRIM_DEPTH`) and five matching `RawDpcCommandKind` variants, decoded by
+`decode_stream`'s existing per-command match using the same `w0`/`w1`
+two-32-bit-word extraction every other single-word command already uses; the
+T1 `production_adapter` rejects all five exactly like `NoOp`/`SetOtherMode`/
+`SetColorImage`/`SetFillColor`/`FillRectangle`/`FullSync`/`RawTriangle` --
+loudly, as `UnadmittedRawDpcCommand`, never silently dropped.
+
+This is a literal, characterization-first port of RT64's five setters
+(`RDP::setEnvColor`/`setPrimColor`/`setBlendColor`/`setFogColor`/
+`setPrimDepth`, `src/hle/rt64_rdp.cpp:837-968`) and their wire-word
+extraction (`GBI_RDP::setEnvColor`/`setPrimColor`/`setBlendColor`/
+`setFogColor`/`setPrimDepth`, `src/gbi/rt64_gbi_rdp.cpp:95-133`), pinned
+commit `5473732a822a4423b5696e7cb18fecc425a59875` per
+`docs/RT64-PORT-AUTHORITY.md`. Opcode values (`G_SETENVCOLOR=0xfb`,
+`G_SETPRIMCOLOR=0xfa`, `G_SETBLENDCOLOR=0xf9`, `G_SETFOGCOLOR=0xf8`,
+`G_SETPRIMDEPTH=0xee`, `src/shared/rt64_f3d_defines.h:145-157`) match the
+public SGI *RDP Command Summary*'s "Set Environment Color"/"Set Primitive
+Color"/"Set Blend Color"/"Set Fog Color"/"Set Primitive Depth" command
+spellings; all five mask to the `RDP_SYNC_LOAD..=0x3f` single-64-bit-word
+stride `fn64-render::raw_rdp_command_width` already assigns them, so no
+width-table change was needed.
+
+**Color decode (`Color4`, `SetEnvColor`/`SetBlendColor`/`SetFogColor`).**
+Each of these three commands' second wire word (`w1`) is the entire payload:
+RT64 reads `((color >> 24) & 0xFF)` as red, `>> 16` as green, `>> 8` as
+blue, and `>> 0` as alpha, then divides each by `255.0f`. `Color4::rgba8`
+reproduces the raw big-endian byte order (matching this crate's existing
+`FillColor::rgba32`); `Color4::normalized` reproduces the exact `/255.0`
+division as a separate derived accessor, so the raw wire bytes stay
+mechanically auditable alongside the float RT64 actually consumes.
+
+**`SetPrimColor` (`PrimColor`, `PrimLod`).** Unlike the other three color
+setters, `RDP::setPrimColor` takes three parameters staged together:
+`lodFrac`/`lodMin` (from `w0`) and `color` (from `w1`). RT64's own GBI-layer
+comment is load-bearing and is preserved verbatim in `PrimLod`'s doc
+comment: "While the manual states that lodMin has 8 bits of precision, the
+RDP only uses 5 of them" -- `w0` bits 0:7 are the full `lodFrac` byte
+(`p0(0, 8)`), but `w0` bits 8:12 are the *only* `lodMin` bits consulted
+(`p0(8, 5)`); bits 13:15 of the public 8-bit `lodMin` field are decoded but
+discarded, never folded into the 5-bit value. `PrimLod::lod_frac_normalized`
+and `lod_min_normalized` reproduce RT64's `lodFrac / 256.0f` and
+`lodMin / 32.0f` exactly.
+
+**`SetPrimDepth` (`PrimDepth`).** `w1` bits 16:31 are `z`, bits 0:15 are
+`dz` (`p1(16, 16)`/`p1(0, 16)`), matching this crate's existing
+`FillRectangle`-style split-word convention. `RDP::setPrimDepth` then masks
+`z` to `0x7FFFU` -- **15 bits, not 16** -- before normalizing by
+`1.0f / 32767.0f`; `dz` uses the full `0xFFFFU` 16-bit mask and normalizes
+by `1.0f / 65535.0f`. `PrimDepth::from_wire` reproduces the asymmetric mask
+exactly (`z & 0x7fff`, `dz` unmasked because `p1(0, 16)` is already exactly
+16 bits), and a dedicated test proves the wire word's top bit is discarded
+even when every other bit is clear.
+
+Nonclaims: no combiner, blender, or depth *consumer* reads these five
+registers yet (they are decode/state-storage only, matching this crate's
+existing `OtherMode`/`ColorImage`/`FillColor` precedent); no triangle or
+rasterizer integration; no GPU or native execution of any kind; no
+production-dispatch admission (the T3/T4 seam still rejects all five exactly
+like every other still-unadmitted command kind, so a real ABI-driven
+submission containing any of these five commands cannot reach a backend
+through the production path); and no RT64 parity or performance claim.

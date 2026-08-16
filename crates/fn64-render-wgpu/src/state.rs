@@ -441,6 +441,185 @@ impl FillColor {
     }
 }
 
+/// A fragment constant-register RGBA color, decoded from one raw 32-bit wire
+/// word exactly as RT64's `setEnvColor`/`setPrimColor`/`setBlendColor`/
+/// `setFogColor` do (`src/hle/rt64_rdp.cpp:837-932`, pinned commit
+/// `5473732a822a4423b5696e7cb18fecc425a59875`): byte 3 (bits 31:24) is red,
+/// byte 2 (bits 23:16) is green, byte 1 (bits 15:8) is blue, byte 0 (bits
+/// 7:0) is alpha -- the same big-endian RGBA8888 packing this crate's
+/// existing `FillColor` already uses. RT64 additionally normalizes each byte
+/// to `[0.0, 1.0]` by dividing by `255.0`; `normalized()` reproduces that
+/// exact division while `rgba8()`/`value()` retain the raw byte and word
+/// forms so the wire content stays mechanically auditable alongside the
+/// derived float.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Color4(u32);
+
+impl Color4 {
+    pub(crate) const fn from_wire(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+
+    /// `[red, green, blue, alpha]`, matching `FillColor::rgba32`'s byte
+    /// order.
+    pub const fn rgba8(self) -> [u8; 4] {
+        self.0.to_be_bytes()
+    }
+
+    /// `[red, green, blue, alpha]` each divided by `255.0`, matching RT64's
+    /// `setEnvColor`/`setPrimColor`/`setBlendColor`/`setFogColor` exactly
+    /// (`color.x/y/z/w = ((color >> shift) & 0xFF) / 255.0f`).
+    pub fn normalized(self) -> [f32; 4] {
+        let [r, g, b, a] = self.rgba8();
+        [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            f32::from(a) / 255.0,
+        ]
+    }
+}
+
+/// `SetPrimColor`'s minimum-LOD and primitive-LOD-fraction bytes, decoded
+/// exactly as RT64's `GBI_RDP::setPrimColor` extracts them from the
+/// command's first wire word (`src/gbi/rt64_gbi_rdp.cpp:100-106`, pinned
+/// commit `5473732a822a4423b5696e7cb18fecc425a59875`):
+///
+/// ```text
+/// lodFrac = w0 bits 0:7   (p0(0, 8), full byte)
+/// lodMin  = w0 bits 8:12  (p0(8, 5), only 5 of the public 8 documented bits)
+/// ```
+///
+/// RT64's own comment at that site: "While the manual states that lodMin has
+/// 8 bits of precision, the RDP only uses 5 of them" -- so `lod_min()` is
+/// deliberately a 5-bit narrow type (`0..=31`), not `u8`, and decode masks to
+/// exactly those 5 bits rather than the full byte the command word reserves.
+/// `RDP::setPrimColor` (`src/hle/rt64_rdp.cpp:860-871`) then normalizes:
+/// `lodFrac / 256.0f`, `lodMin / 32.0f`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrimLod {
+    lod_frac: u8,
+    lod_min: u8,
+}
+
+impl PrimLod {
+    pub(crate) const fn from_wire(w0: u32) -> Self {
+        Self {
+            lod_frac: (w0 & 0xff) as u8,
+            lod_min: ((w0 >> 8) & 0x1f) as u8,
+        }
+    }
+
+    /// Raw primitive-LOD-fraction byte (`w0` bits 0:7, the full byte).
+    pub const fn lod_frac(self) -> u8 {
+        self.lod_frac
+    }
+
+    /// Raw minimum-LOD value, already masked to the 5 bits the RDP consults
+    /// (`w0` bits 8:12) -- never the full 8-bit field the public command
+    /// layout reserves.
+    pub const fn lod_min(self) -> u8 {
+        self.lod_min
+    }
+
+    /// `lod_frac() / 256.0`, matching RT64's `primLOD.x = lodFrac / 256.0f`.
+    pub fn lod_frac_normalized(self) -> f32 {
+        f32::from(self.lod_frac) / 256.0
+    }
+
+    /// `lod_min() / 32.0`, matching RT64's `primLOD.y = lodMin / 32.0f`.
+    pub fn lod_min_normalized(self) -> f32 {
+        f32::from(self.lod_min) / 32.0
+    }
+}
+
+/// `SetPrimColor`'s complete decoded payload: RT64 stages this command's
+/// `lodFrac`/`lodMin`/`color` fields together in one call
+/// (`RDP::setPrimColor(uint8_t lodFrac, uint8_t lodMin, uint32_t color)`,
+/// `src/hle/rt64_rdp.cpp:860`), so this type keeps them together rather than
+/// splitting them into two independently-staged registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrimColor {
+    lod: PrimLod,
+    color: Color4,
+}
+
+impl PrimColor {
+    pub(crate) const fn from_wire(w0: u32, w1: u32) -> Self {
+        Self {
+            lod: PrimLod::from_wire(w0),
+            color: Color4::from_wire(w1),
+        }
+    }
+
+    pub const fn lod(self) -> PrimLod {
+        self.lod
+    }
+
+    pub const fn color(self) -> Color4 {
+        self.color
+    }
+}
+
+/// `SetPrimDepth`'s primitive depth and delta-Z, decoded and normalized
+/// exactly as RT64's `RDP::setPrimDepth` (`src/hle/rt64_rdp.cpp:961-968`,
+/// pinned commit `5473732a822a4423b5696e7cb18fecc425a59875`):
+///
+/// ```text
+/// primDepth.x = (z  & 0x7FFFU) * (1.0f / 32767.0f)   // NOTE: 15-bit mask
+/// primDepth.y = (dz & 0xFFFFU) * (1.0f / 65535.0f)   // full 16-bit mask
+/// ```
+///
+/// The `z` mask is deliberately `0x7FFF` (15 bits), not `0xFFFF` -- RT64
+/// discards the wire word's top bit rather than treating it as part of the
+/// depth value, and the normalizing divisor `32767.0` (`2^15 - 1`) matches
+/// that narrower domain exactly. `dz` uses the full 16-bit mask and divisor
+/// `65535.0` (`2^16 - 1`). Both raw fields are retained unmasked-input-proof:
+/// `z()`/`dz()` return the already-masked values actually consulted, so a
+/// caller inspecting this type sees precisely what RT64 saw, not the
+/// command's raw, possibly-hostile wire bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrimDepth {
+    z: u16,
+    dz: u16,
+}
+
+impl PrimDepth {
+    pub(crate) const fn from_wire(w1: u32) -> Self {
+        let raw_z = (w1 >> 16) as u16;
+        let raw_dz = w1 as u16;
+        Self {
+            z: raw_z & 0x7fff,
+            dz: raw_dz,
+        }
+    }
+
+    /// The masked 15-bit primitive depth (`w1` bits 16:30; bit 31 is
+    /// discarded, matching RT64's `z & 0x7FFFU`).
+    pub const fn z(self) -> u16 {
+        self.z
+    }
+
+    /// The full 16-bit delta-Z (`w1` bits 0:15).
+    pub const fn dz(self) -> u16 {
+        self.dz
+    }
+
+    /// `z() / 32767.0`, matching RT64's `(z & 0x7FFFU) * (1.0f / 32767.0f)`.
+    pub fn z_normalized(self) -> f32 {
+        f32::from(self.z) / 32767.0
+    }
+
+    /// `dz() / 65535.0`, matching RT64's `(dz & 0xFFFFU) * (1.0f / 65535.0f)`.
+    pub fn dz_normalized(self) -> f32 {
+        f32::from(self.dz) / 65535.0
+    }
+}
+
 /// Durable renderer state is immutable to the decoder. A caller can publish a
 /// staged result only at a later owner-controlled commit boundary.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -448,6 +627,11 @@ pub struct RdpState {
     other_mode: Option<OtherMode>,
     color_image: Option<ColorImage>,
     fill_color: Option<FillColor>,
+    env_color: Option<Color4>,
+    prim_color: Option<PrimColor>,
+    blend_color: Option<Color4>,
+    fog_color: Option<Color4>,
+    prim_depth: Option<PrimDepth>,
     tmem: TmemState,
 }
 
@@ -464,6 +648,26 @@ impl RdpState {
         self.fill_color
     }
 
+    pub const fn env_color(&self) -> Option<Color4> {
+        self.env_color
+    }
+
+    pub const fn prim_color(&self) -> Option<PrimColor> {
+        self.prim_color
+    }
+
+    pub const fn blend_color(&self) -> Option<Color4> {
+        self.blend_color
+    }
+
+    pub const fn fog_color(&self) -> Option<Color4> {
+        self.fog_color
+    }
+
+    pub const fn prim_depth(&self) -> Option<PrimDepth> {
+        self.prim_depth
+    }
+
     pub const fn tmem(&self) -> &TmemState {
         &self.tmem
     }
@@ -477,6 +681,11 @@ impl RdpState {
             other_mode: self.other_mode,
             color_image: self.color_image,
             fill_color: self.fill_color,
+            env_color: self.env_color,
+            prim_color: self.prim_color,
+            blend_color: self.blend_color,
+            fog_color: self.fog_color,
+            prim_depth: self.prim_depth,
             tmem: self.tmem.clone(),
         }
     }
@@ -491,6 +700,21 @@ impl RdpState {
         if let Some(value) = delta.fill_color {
             self.fill_color = Some(value);
         }
+        if let Some(value) = delta.env_color {
+            self.env_color = Some(value);
+        }
+        if let Some(value) = delta.prim_color {
+            self.prim_color = Some(value);
+        }
+        if let Some(value) = delta.blend_color {
+            self.blend_color = Some(value);
+        }
+        if let Some(value) = delta.fog_color {
+            self.fog_color = Some(value);
+        }
+        if let Some(value) = delta.prim_depth {
+            self.prim_depth = Some(value);
+        }
         if let Some(value) = &delta.tmem {
             self.tmem = value.clone();
         }
@@ -502,6 +726,11 @@ pub struct RdpStateDelta {
     other_mode: Option<OtherMode>,
     color_image: Option<ColorImage>,
     fill_color: Option<FillColor>,
+    env_color: Option<Color4>,
+    prim_color: Option<PrimColor>,
+    blend_color: Option<Color4>,
+    fog_color: Option<Color4>,
+    prim_depth: Option<PrimDepth>,
     tmem: Option<TmemState>,
 }
 
@@ -518,6 +747,26 @@ impl RdpStateDelta {
         self.fill_color
     }
 
+    pub const fn env_color(&self) -> Option<Color4> {
+        self.env_color
+    }
+
+    pub const fn prim_color(&self) -> Option<PrimColor> {
+        self.prim_color
+    }
+
+    pub const fn blend_color(&self) -> Option<Color4> {
+        self.blend_color
+    }
+
+    pub const fn fog_color(&self) -> Option<Color4> {
+        self.fog_color
+    }
+
+    pub const fn prim_depth(&self) -> Option<PrimDepth> {
+        self.prim_depth
+    }
+
     pub const fn tmem(&self) -> Option<&TmemState> {
         self.tmem.as_ref()
     }
@@ -532,6 +781,26 @@ impl RdpStateDelta {
 
     pub(crate) fn set_fill_color(&mut self, value: FillColor) {
         self.fill_color = Some(value);
+    }
+
+    pub(crate) fn set_env_color(&mut self, value: Color4) {
+        self.env_color = Some(value);
+    }
+
+    pub(crate) fn set_prim_color(&mut self, value: PrimColor) {
+        self.prim_color = Some(value);
+    }
+
+    pub(crate) fn set_blend_color(&mut self, value: Color4) {
+        self.blend_color = Some(value);
+    }
+
+    pub(crate) fn set_fog_color(&mut self, value: Color4) {
+        self.fog_color = Some(value);
+    }
+
+    pub(crate) fn set_prim_depth(&mut self, value: PrimDepth) {
+        self.prim_depth = Some(value);
     }
 
     pub(crate) fn set_tmem(&mut self, value: TmemState) {
@@ -560,6 +829,26 @@ impl StagedRdpState {
 
     pub const fn fill_color(&self) -> Option<FillColor> {
         self.state.fill_color()
+    }
+
+    pub const fn env_color(&self) -> Option<Color4> {
+        self.state.env_color()
+    }
+
+    pub const fn prim_color(&self) -> Option<PrimColor> {
+        self.state.prim_color()
+    }
+
+    pub const fn blend_color(&self) -> Option<Color4> {
+        self.state.blend_color()
+    }
+
+    pub const fn fog_color(&self) -> Option<Color4> {
+        self.state.fog_color()
+    }
+
+    pub const fn prim_depth(&self) -> Option<PrimDepth> {
+        self.state.prim_depth()
     }
 
     pub const fn tmem(&self) -> &TmemState {
@@ -1088,5 +1377,150 @@ mod tests {
                 *expected
             );
         }
+    }
+
+    #[test]
+    fn color4_decodes_exact_rgba_byte_order_with_asymmetric_channel_values() {
+        let color = Color4::from_wire(0x11223344);
+        assert_eq!(color.value(), 0x11223344);
+        assert_eq!(color.rgba8(), [0x11, 0x22, 0x33, 0x44]);
+        let normalized = color.normalized();
+        assert_eq!(normalized[0], 0x11 as f32 / 255.0);
+        assert_eq!(normalized[1], 0x22 as f32 / 255.0);
+        assert_eq!(normalized[2], 0x33 as f32 / 255.0);
+        assert_eq!(normalized[3], 0x44 as f32 / 255.0);
+    }
+
+    #[test]
+    fn color4_zero_and_max_boundaries_normalize_exactly() {
+        let zero = Color4::from_wire(0);
+        assert_eq!(zero.rgba8(), [0, 0, 0, 0]);
+        assert_eq!(zero.normalized(), [0.0, 0.0, 0.0, 0.0]);
+
+        let max = Color4::from_wire(u32::MAX);
+        assert_eq!(max.rgba8(), [0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(max.normalized(), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn color4_swapping_word_endianness_changes_channel_assignment() {
+        // A hostile check that the byte order is exactly RT64's
+        // ((color >> 24) & 0xFF) = R .. ((color >> 0) & 0xFF) = A, not some
+        // other permutation: reversing the word's byte order must reverse
+        // the decoded channel order too.
+        let forward = Color4::from_wire(0xAABBCCDD);
+        let reversed = Color4::from_wire(0xDDCCBBAA);
+        assert_eq!(forward.rgba8(), [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(reversed.rgba8(), [0xDD, 0xCC, 0xBB, 0xAA]);
+    }
+
+    #[test]
+    fn prim_lod_reads_lod_frac_from_full_byte_and_lod_min_from_five_bits() {
+        // w0 bits 8:12 = lodMin (5 bits), bits 0:7 = lodFrac (full byte),
+        // matching RT64's `p0(0, 8)` / `p0(8, 5)` exactly
+        // (`src/gbi/rt64_gbi_rdp.cpp:102-103`).
+        let w0 = (0x17 << 8) | 0xab;
+        let lod = PrimLod::from_wire(w0);
+        assert_eq!(lod.lod_frac(), 0xab);
+        assert_eq!(lod.lod_min(), 0x17);
+    }
+
+    #[test]
+    fn prim_lod_min_masks_to_five_bits_discarding_the_public_eighth_bit() {
+        // RT64's own comment: "the RDP only uses 5 of them" -- bit 13 (the
+        // 6th bit of the public 8-bit lodMin field) must be discarded, not
+        // folded into the 5-bit value.
+        let w0 = 0xff << 8;
+        let lod = PrimLod::from_wire(w0);
+        assert_eq!(lod.lod_min(), 0x1f);
+
+        let w0_with_high_bit = 0x20 << 8; // bit 13 set, bits 8:12 clear
+        let lod = PrimLod::from_wire(w0_with_high_bit);
+        assert_eq!(lod.lod_min(), 0);
+    }
+
+    #[test]
+    fn prim_lod_normalizes_by_256_and_32() {
+        let lod = PrimLod::from_wire((16 << 8) | 128);
+        assert_eq!(lod.lod_frac_normalized(), 128.0 / 256.0);
+        assert_eq!(lod.lod_min_normalized(), 16.0 / 32.0);
+    }
+
+    #[test]
+    fn prim_lod_zero_and_max_boundaries() {
+        let zero = PrimLod::from_wire(0);
+        assert_eq!(zero.lod_frac(), 0);
+        assert_eq!(zero.lod_min(), 0);
+        assert_eq!(zero.lod_frac_normalized(), 0.0);
+        assert_eq!(zero.lod_min_normalized(), 0.0);
+
+        let max = PrimLod::from_wire((0x1f << 8) | 0xff);
+        assert_eq!(max.lod_frac(), 0xff);
+        assert_eq!(max.lod_min(), 0x1f);
+        assert_eq!(max.lod_frac_normalized(), 0xff as f32 / 256.0);
+        assert_eq!(max.lod_min_normalized(), 0x1f as f32 / 32.0);
+    }
+
+    #[test]
+    fn prim_color_combines_w0_lod_bytes_and_w1_color_independently() {
+        let w0 = (0x0a << 8) | 0x3c;
+        let w1 = 0x11223344;
+        let prim = PrimColor::from_wire(w0, w1);
+        assert_eq!(prim.lod().lod_frac(), 0x3c);
+        assert_eq!(prim.lod().lod_min(), 0x0a);
+        assert_eq!(prim.color().rgba8(), [0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn prim_color_unrelated_w0_bits_above_lod_min_do_not_leak_into_lod_fields() {
+        // Bits 13:31 of w0 carry no PrimColor semantics; a hostile all-ones
+        // w0 above the 5-bit lodMin field must not perturb lod_frac/lod_min.
+        let hostile_w0 = 0xffff_e000; // bits 13:31 set, bits 0:12 clear
+        let prim = PrimColor::from_wire(hostile_w0, 0);
+        assert_eq!(prim.lod().lod_frac(), 0);
+        assert_eq!(prim.lod().lod_min(), 0);
+    }
+
+    #[test]
+    fn prim_depth_masks_z_to_fifteen_bits_and_dz_to_sixteen_bits() {
+        // w1 bits 16:31 = z, bits 0:15 = dz, matching RT64's
+        // `p1(16, 16)` / `p1(0, 16)` (`src/gbi/rt64_gbi_rdp.cpp:130-131`).
+        // The z mask itself is only 15 bits (`z & 0x7FFFU`); bit 31 of w1
+        // (the wire word's top bit) is discarded even though p1(16,16)
+        // extracts it.
+        let w1 = (0xffffu32 << 16) | 0x1234;
+        let depth = PrimDepth::from_wire(w1);
+        assert_eq!(depth.z(), 0x7fff);
+        assert_eq!(depth.dz(), 0x1234);
+    }
+
+    #[test]
+    fn prim_depth_masked_high_bit_is_hostile_and_must_be_discarded() {
+        // Only the top bit of the 16-bit z field (wire bit 31) set; every
+        // other z bit clear. This must decode to z()==0, not 0x8000.
+        let w1 = 0x8000_0000;
+        let depth = PrimDepth::from_wire(w1);
+        assert_eq!(depth.z(), 0);
+        assert_eq!(depth.dz(), 0);
+    }
+
+    #[test]
+    fn prim_depth_zero_and_max_boundaries_normalize_exactly() {
+        let zero = PrimDepth::from_wire(0);
+        assert_eq!(zero.z(), 0);
+        assert_eq!(zero.dz(), 0);
+        assert_eq!(zero.z_normalized(), 0.0);
+        assert_eq!(zero.dz_normalized(), 0.0);
+
+        // Max representable z is 0x7FFF (15 bits), not 0xFFFF: set every
+        // wire bit and confirm the top bit is discarded.
+        let max_w1 = 0xffff_ffff;
+        let max = PrimDepth::from_wire(max_w1);
+        assert_eq!(max.z(), 0x7fff);
+        assert_eq!(max.dz(), 0xffff);
+        assert_eq!(max.z_normalized(), 0x7fff as f32 / 32767.0);
+        assert_eq!(max.z_normalized(), 1.0);
+        assert_eq!(max.dz_normalized(), 0xffff as f32 / 65535.0);
+        assert_eq!(max.dz_normalized(), 1.0);
     }
 }

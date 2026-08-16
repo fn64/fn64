@@ -22,8 +22,8 @@ use fn64_render_ir::{
 };
 
 use crate::state::{
-    ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, RdpState, RdpStateDelta,
-    StagedRdpState,
+    Color4, ColorImage, CycleType, FillColor, ImageFormat, OtherMode, PixelSize, PrimColor,
+    PrimDepth, RdpState, RdpStateDelta, StagedRdpState,
 };
 use crate::tmem::{
     decode_tmem_command, TmemCommand, TmemLoad, TmemLoadContract, TmemLoadEpoch,
@@ -37,6 +37,22 @@ const SET_COLOR_IMAGE: u8 = 0x3f;
 const SET_FILL_COLOR: u8 = 0x37;
 const FILL_RECTANGLE: u8 = 0x36;
 const FULL_SYNC: u8 = 0x29;
+/// `G_SETPRIMDEPTH` (`src/shared/rt64_f3d_defines.h:157`, pinned commit
+/// `5473732a822a4423b5696e7cb18fecc425a59875`); public SGI *RDP Command
+/// Summary* "Set Primitive Depth".
+const SET_PRIM_DEPTH: u8 = 0xee & 0x3f;
+/// `G_SETFOGCOLOR` (`src/shared/rt64_f3d_defines.h:148`); public SGI *RDP
+/// Command Summary* "Set Fog Color".
+const SET_FOG_COLOR: u8 = 0xf8 & 0x3f;
+/// `G_SETBLENDCOLOR` (`src/shared/rt64_f3d_defines.h:147`); public SGI *RDP
+/// Command Summary* "Set Blend Color".
+const SET_BLEND_COLOR: u8 = 0xf9 & 0x3f;
+/// `G_SETPRIMCOLOR` (`src/shared/rt64_f3d_defines.h:146`); public SGI *RDP
+/// Command Summary* "Set Primitive Color".
+const SET_PRIM_COLOR: u8 = 0xfa & 0x3f;
+/// `G_SETENVCOLOR` (`src/shared/rt64_f3d_defines.h:145`); public SGI *RDP
+/// Command Summary* "Set Environment Color".
+const SET_ENV_COLOR: u8 = 0xfb & 0x3f;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawDpcCommandLocation {
@@ -144,6 +160,11 @@ pub enum RawDpcCommandKind {
     SetOtherMode(OtherMode),
     SetColorImage(ColorImage),
     SetFillColor(FillColor),
+    SetEnvColor(Color4),
+    SetPrimColor(PrimColor),
+    SetBlendColor(Color4),
+    SetFogColor(Color4),
+    SetPrimDepth(PrimDepth),
     FillRectangle(FillRectangle),
     SetTextureImage(crate::TextureImage),
     SetTile {
@@ -926,6 +947,36 @@ fn decode_stream(
                 delta.set_fill_color(value);
                 state.apply(delta);
                 RawDpcCommandKind::SetFillColor(value)
+            }
+            SET_ENV_COLOR => {
+                let value = Color4::from_wire(w1);
+                delta.set_env_color(value);
+                state.apply(delta);
+                RawDpcCommandKind::SetEnvColor(value)
+            }
+            SET_PRIM_COLOR => {
+                let value = PrimColor::from_wire(w0, w1);
+                delta.set_prim_color(value);
+                state.apply(delta);
+                RawDpcCommandKind::SetPrimColor(value)
+            }
+            SET_BLEND_COLOR => {
+                let value = Color4::from_wire(w1);
+                delta.set_blend_color(value);
+                state.apply(delta);
+                RawDpcCommandKind::SetBlendColor(value)
+            }
+            SET_FOG_COLOR => {
+                let value = Color4::from_wire(w1);
+                delta.set_fog_color(value);
+                state.apply(delta);
+                RawDpcCommandKind::SetFogColor(value)
+            }
+            SET_PRIM_DEPTH => {
+                let value = PrimDepth::from_wire(w1);
+                delta.set_prim_depth(value);
+                state.apply(delta);
+                RawDpcCommandKind::SetPrimDepth(value)
             }
             FILL_RECTANGLE => {
                 let rectangle = FillRectangle {
@@ -3464,5 +3515,343 @@ mod tests {
             decoded.commands()[4].kind(),
             RawDpcCommandKind::FullSync(_)
         ));
+    }
+
+    // -- Fragment constant registers (SetEnvColor/SetPrimColor/
+    // SetBlendColor/SetFogColor/SetPrimDepth) --------------------------
+
+    #[test]
+    fn set_env_color_decodes_exact_rgba_byte_order_from_w1_independent_of_w0() {
+        let prefix = 0x80;
+        // w0 carries only the opcode byte for this command (its low 24 bits
+        // are unused by SetEnvColor); set them to a hostile nonzero pattern
+        // to prove they are never consulted.
+        let words = vec![word(prefix, SET_ENV_COLOR, 0x00ab_cdef), 0x11223344];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetEnvColor(color) = decoded.commands()[0].kind() else {
+            panic!("expected SetEnvColor");
+        };
+        assert_eq!(color.rgba8(), [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(decoded.staged_state().env_color(), Some(color));
+    }
+
+    #[test]
+    fn set_env_color_zero_and_max_boundaries() {
+        let prefix = 0x40;
+        let decoded_zero = decode(vec![word(prefix, SET_ENV_COLOR, 0), 0]).unwrap();
+        let RawDpcCommandKind::SetEnvColor(zero) = decoded_zero.commands()[0].kind() else {
+            panic!("expected SetEnvColor");
+        };
+        assert_eq!(zero.rgba8(), [0, 0, 0, 0]);
+
+        let decoded_max = decode(vec![word(prefix, SET_ENV_COLOR, 0), u32::MAX]).unwrap();
+        let RawDpcCommandKind::SetEnvColor(max) = decoded_max.commands()[0].kind() else {
+            panic!("expected SetEnvColor");
+        };
+        assert_eq!(max.rgba8(), [0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn set_blend_color_decodes_exact_rgba_byte_order() {
+        let prefix = 0;
+        let words = vec![word(prefix, SET_BLEND_COLOR, 0), 0xAABBCCDD];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetBlendColor(color) = decoded.commands()[0].kind() else {
+            panic!("expected SetBlendColor");
+        };
+        assert_eq!(color.rgba8(), [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(decoded.staged_state().blend_color(), Some(color));
+    }
+
+    #[test]
+    fn set_fog_color_decodes_exact_rgba_byte_order() {
+        let prefix = 0xc0;
+        let words = vec![word(prefix, SET_FOG_COLOR, 0), 0x01020304];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetFogColor(color) = decoded.commands()[0].kind() else {
+            panic!("expected SetFogColor");
+        };
+        assert_eq!(color.rgba8(), [0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(decoded.staged_state().fog_color(), Some(color));
+    }
+
+    #[test]
+    fn set_prim_color_decodes_lod_bytes_from_w0_and_color_from_w1() {
+        let prefix = 0x80;
+        // w0 low byte = lodFrac (0x3c), next 5 bits = lodMin (0x0a).
+        let w0_payload = (0x0a << 8) | 0x3c;
+        let words = vec![word(prefix, SET_PRIM_COLOR, w0_payload), 0x11223344];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetPrimColor(prim) = decoded.commands()[0].kind() else {
+            panic!("expected SetPrimColor");
+        };
+        assert_eq!(prim.lod().lod_frac(), 0x3c);
+        assert_eq!(prim.lod().lod_min(), 0x0a);
+        assert_eq!(prim.color().rgba8(), [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(decoded.staged_state().prim_color(), Some(prim));
+    }
+
+    #[test]
+    fn set_prim_color_unrelated_w0_bits_above_lod_min_are_isolated() {
+        // Set every w0 bit above the 5-bit lodMin field (bits 13:23 -- w0's
+        // top byte carries the opcode and is excluded from this pattern) to
+        // prove they cannot leak into lod_frac/lod_min.
+        let prefix = 0;
+        let hostile_payload = 0x00ff_e000u32; // bits 13:23 set, bits 0:12 clear
+        let words = vec![word(prefix, SET_PRIM_COLOR, hostile_payload), 0];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetPrimColor(prim) = decoded.commands()[0].kind() else {
+            panic!("expected SetPrimColor");
+        };
+        assert_eq!(prim.lod().lod_frac(), 0);
+        assert_eq!(prim.lod().lod_min(), 0);
+    }
+
+    #[test]
+    fn set_prim_color_lod_min_masks_to_five_bits_on_the_wire() {
+        // lodMin's public field is 8 bits (w0 bits 8:15) but the RDP only
+        // consults 5 of them (w0 bits 8:12). Set the full 8-bit field to
+        // 0xff and confirm lod_min() reports only 0x1f.
+        let prefix = 0;
+        let words = vec![word(prefix, SET_PRIM_COLOR, 0xff << 8), 0];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetPrimColor(prim) = decoded.commands()[0].kind() else {
+            panic!("expected SetPrimColor");
+        };
+        assert_eq!(prim.lod().lod_min(), 0x1f);
+    }
+
+    #[test]
+    fn set_prim_color_zero_and_max_boundaries() {
+        let prefix = 0;
+        let decoded_zero = decode(vec![word(prefix, SET_PRIM_COLOR, 0), 0]).unwrap();
+        let RawDpcCommandKind::SetPrimColor(zero) = decoded_zero.commands()[0].kind() else {
+            panic!("expected SetPrimColor");
+        };
+        assert_eq!(zero.lod().lod_frac(), 0);
+        assert_eq!(zero.lod().lod_min(), 0);
+        assert_eq!(zero.color().rgba8(), [0, 0, 0, 0]);
+
+        let max_w0 = (0x1f << 8) | 0xff;
+        let decoded_max = decode(vec![word(prefix, SET_PRIM_COLOR, max_w0), u32::MAX]).unwrap();
+        let RawDpcCommandKind::SetPrimColor(max) = decoded_max.commands()[0].kind() else {
+            panic!("expected SetPrimColor");
+        };
+        assert_eq!(max.lod().lod_frac(), 0xff);
+        assert_eq!(max.lod().lod_min(), 0x1f);
+        assert_eq!(max.color().rgba8(), [0xff, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn set_prim_depth_decodes_z_from_high_half_and_dz_from_low_half_of_w1() {
+        let prefix = 0;
+        let w1 = (0x1234u32 << 16) | 0x5678;
+        let words = vec![word(prefix, SET_PRIM_DEPTH, 0), w1];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetPrimDepth(depth) = decoded.commands()[0].kind() else {
+            panic!("expected SetPrimDepth");
+        };
+        assert_eq!(depth.z(), 0x1234);
+        assert_eq!(depth.dz(), 0x5678);
+        assert_eq!(decoded.staged_state().prim_depth(), Some(depth));
+    }
+
+    #[test]
+    fn set_prim_depth_z_mask_discards_only_the_top_bit_masked_high_bit_hostile() {
+        // z is masked to 0x7FFF (15 bits): the wire field is 16 bits
+        // (p1(16,16)) but only the low 15 are consulted. A hostile z value
+        // with only the top bit set must decode to zero.
+        let prefix = 0;
+        let hostile_w1 = 0x8000_0000u32;
+        let words = vec![word(prefix, SET_PRIM_DEPTH, 0), hostile_w1];
+        let decoded = decode(words).unwrap();
+        let RawDpcCommandKind::SetPrimDepth(depth) = decoded.commands()[0].kind() else {
+            panic!("expected SetPrimDepth");
+        };
+        assert_eq!(depth.z(), 0);
+        assert_eq!(depth.dz(), 0);
+    }
+
+    #[test]
+    fn set_prim_depth_zero_and_max_boundaries_normalize_to_unity() {
+        let prefix = 0;
+        let decoded_zero = decode(vec![word(prefix, SET_PRIM_DEPTH, 0), 0]).unwrap();
+        let RawDpcCommandKind::SetPrimDepth(zero) = decoded_zero.commands()[0].kind() else {
+            panic!("expected SetPrimDepth");
+        };
+        assert_eq!(zero.z(), 0);
+        assert_eq!(zero.dz(), 0);
+
+        let decoded_max = decode(vec![word(prefix, SET_PRIM_DEPTH, 0), u32::MAX]).unwrap();
+        let RawDpcCommandKind::SetPrimDepth(max) = decoded_max.commands()[0].kind() else {
+            panic!("expected SetPrimDepth");
+        };
+        assert_eq!(max.z(), 0x7fff);
+        assert_eq!(max.dz(), 0xffff);
+        assert_eq!(max.z_normalized(), 1.0);
+        assert_eq!(max.dz_normalized(), 1.0);
+    }
+
+    #[test]
+    fn fragment_registers_sequential_overwrite_last_command_wins_in_one_packet() {
+        let prefix = 0;
+        let words = vec![
+            word(prefix, SET_ENV_COLOR, 0),
+            0x1111_1111,
+            word(prefix, SET_ENV_COLOR, 0),
+            0x2222_2222,
+            word(prefix, SET_PRIM_COLOR, 0x0a3c),
+            0x3333_3333,
+            word(prefix, SET_PRIM_COLOR, 0x0b4d),
+            0x4444_4444,
+            word(prefix, SET_BLEND_COLOR, 0),
+            0x5555_5555,
+            word(prefix, SET_BLEND_COLOR, 0),
+            0x6666_6666,
+            word(prefix, SET_FOG_COLOR, 0),
+            0x7777_7777,
+            word(prefix, SET_FOG_COLOR, 0),
+            0x8888_8888,
+            word(prefix, SET_PRIM_DEPTH, 0),
+            (100u32 << 16) | 200,
+            word(prefix, SET_PRIM_DEPTH, 0),
+            (300u32 << 16) | 400,
+        ];
+        let decoded = decode(words).unwrap();
+        assert_eq!(decoded.commands().len(), 10);
+        let staged = decoded.staged_state();
+        assert_eq!(
+            staged.env_color().unwrap().value(),
+            0x2222_2222,
+            "last SetEnvColor in the packet must win"
+        );
+        let prim = staged.prim_color().unwrap();
+        assert_eq!(prim.color().value(), 0x4444_4444);
+        assert_eq!(prim.lod().lod_min(), 0x0b);
+        assert_eq!(prim.lod().lod_frac(), 0x4d);
+        assert_eq!(staged.blend_color().unwrap().value(), 0x6666_6666);
+        assert_eq!(staged.fog_color().unwrap().value(), 0x8888_8888);
+        let depth = staged.prim_depth().unwrap();
+        assert_eq!(depth.z(), 300);
+        assert_eq!(depth.dz(), 400);
+    }
+
+    #[test]
+    fn fragment_register_state_delta_records_only_the_decoded_command() {
+        let words = vec![word(0, SET_ENV_COLOR, 0), 0xDEAD_BEEF];
+        let decoded = decode(words).unwrap();
+        assert_eq!(
+            decoded.state_delta().env_color().unwrap().value(),
+            0xDEAD_BEEF
+        );
+        assert!(decoded.state_delta().prim_color().is_none());
+        assert!(decoded.state_delta().blend_color().is_none());
+        assert!(decoded.state_delta().fog_color().is_none());
+        assert!(decoded.state_delta().prim_depth().is_none());
+    }
+
+    #[test]
+    fn failed_fragment_register_packet_leaves_durable_state_unchanged() {
+        // A successful SetEnvColor followed by a truncated SetPrimDepth
+        // (only its opcode byte present, matching the module's own
+        // `truncation_table_reports_exact_context_for_every_width_class`
+        // hand-built-stream pattern) must fail the whole decode without
+        // ever producing a `DecodedRawDpc`/`StagedRdpState` value the caller
+        // could go on to publish: decode operates on
+        // `durable_state.fork_for_decode()`, a plain owned copy, and a
+        // failed decode returns only `Err`, never a partially-applied `Ok`.
+        let durable = RdpState::default();
+        let submitted = submit(packet(7, vec![word(0, SET_ENV_COLOR, 0), 0x1122_3344], &[]));
+        let packet = submitted.packet();
+        let source_identity = TmemLoadSourceIdentity::new(
+            packet.identity(),
+            packet.journal().identity(),
+            submitted.identity(),
+            packet.memory_layout(),
+        );
+        let mut stream = FlattenedStream::new(packet.identity(), 0, &packet.streams()[0]);
+        stream.bytes = vec![0xc0 | SET_PRIM_DEPTH];
+        let mut state = durable.fork_for_decode();
+        let mut delta = RdpStateDelta::default();
+        let mut planned = Vec::new();
+        let mut commands = Vec::new();
+        let error = decode_stream(
+            &stream,
+            packet.memory_layout(),
+            &mut state,
+            source_identity,
+            &mut delta,
+            &mut planned,
+            &mut commands,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RawDpcDecodeError::TruncatedCommand { .. }));
+        // The type system already guarantees `decode_raw_dpc`/`decode_stream`
+        // cannot mutate `durable` (it is borrowed `&RdpState`, never `&mut`);
+        // this assertion documents that invariant rather than proving new
+        // behavior a compile error would already catch.
+        assert_eq!(durable, RdpState::default());
+        assert!(durable.env_color().is_none());
+        assert!(durable.prim_color().is_none());
+        assert!(durable.blend_color().is_none());
+        assert!(durable.fog_color().is_none());
+        assert!(durable.prim_depth().is_none());
+    }
+
+    #[test]
+    fn fragment_register_decode_preserves_every_pre_existing_state_field() {
+        // Seed staged state with OtherMode/ColorImage/FillColor/TMEM (via a
+        // real prior decode of `state_words`), then chain one SetEnvColor
+        // decode onto that staged state (`decode_raw_dpc_after`, the same
+        // move-only chaining `two_packet_chaining_is_explicit_move_only_and_
+        // does_not_mutate_baseline` exercises) and confirm every unrelated
+        // field survives fork/delta/apply unchanged.
+        let prefix = 0;
+        let seed_packet = packet(7, state_words(prefix), &[]);
+        let (mut queue, _, _) = fn64_render_ir::TicketAuthoritySet::try_new()
+            .unwrap()
+            .into_roles();
+        let seed_submitted = queue.submit(DecodedTicket::new(seed_packet)).unwrap();
+        let seed = decode_raw_dpc(seed_submitted, &RdpState::default()).unwrap();
+        let expected_other_mode = seed.staged_state().other_mode();
+        let expected_color_image = seed.staged_state().color_image();
+        let expected_fill_color = seed.staged_state().fill_color();
+
+        let next_packet = packet(8, vec![word(prefix, SET_ENV_COLOR, 0), 0x0102_0304], &[]);
+        let next_submitted = queue.submit(DecodedTicket::new(next_packet)).unwrap();
+        let decoded = decode_raw_dpc_after(next_submitted, seed.into_staged_state()).unwrap();
+        let staged = decoded.staged_state();
+        assert_eq!(staged.other_mode(), expected_other_mode);
+        assert_eq!(staged.color_image(), expected_color_image);
+        assert_eq!(staged.fill_color(), expected_fill_color);
+        assert_eq!(staged.env_color().unwrap().value(), 0x0102_0304);
+    }
+
+    #[test]
+    fn fragment_register_commands_report_exact_location_and_opcode_width_agreement() {
+        for (opcode_fn, opcode) in [
+            (SET_ENV_COLOR, 0xfb),
+            (SET_PRIM_COLOR, 0xfa),
+            (SET_BLEND_COLOR, 0xf9),
+            (SET_FOG_COLOR, 0xf8),
+            (SET_PRIM_DEPTH, 0xee),
+        ] {
+            assert_eq!(
+                opcode_fn,
+                opcode & 0x3f,
+                "opcode constant must equal its public spelling masked to 6 bits"
+            );
+            assert_eq!(
+                raw_rdp_command_width(opcode_fn),
+                Some(8),
+                "every fragment constant register is exactly one 64-bit command word"
+            );
+            let words = vec![word(0xc0, opcode_fn, 0), 0];
+            let decoded = decode(words).unwrap();
+            let location = decoded.commands()[0].location();
+            assert_eq!(location.wire_opcode(), 0xc0 | opcode_fn);
+            assert_eq!(location.source_byte_offset(), COMMAND_START);
+            assert_eq!(location.stream_byte_offset(), 0);
+        }
     }
 }
