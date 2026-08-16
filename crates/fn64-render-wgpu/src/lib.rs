@@ -262,6 +262,7 @@
 mod alpha_compare;
 mod combiner;
 mod coverage;
+mod depth_mode;
 mod depth_strict_less;
 mod device;
 mod lifecycle;
@@ -287,6 +288,10 @@ pub use coverage::{
     apply_coverage_alpha, attribute_sample, coverage_result, AttributeSamplePoint, Coverage,
     CoverageMask, CoverageModeBits, CoverageResult, CoveredAttributeSample, COVERAGE_ENTRY_POINT,
     COVERAGE_SAMPLES, COVERAGE_WGSL,
+};
+pub use depth_mode::{
+    depth_mode_decision, mode_passes, relations, DepthModeDecision, DepthRelations,
+    DEPTH_MODE_ENTRY_POINT, DEPTH_MODE_WGSL,
 };
 pub use depth_strict_less::{
     strict_less_depth_test, strict_less_depth_write, StrictLessDepthOutcome, StrictLessDepthSample,
